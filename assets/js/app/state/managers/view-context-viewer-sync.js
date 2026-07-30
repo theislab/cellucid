@@ -11,6 +11,7 @@ import { getFieldRegistry } from '../../utils/field-registry.js';
 import { getPageColor } from '../../utils/page-colors.js';
 import { NEUTRAL_GRAY_UINT8 } from '../core/constants.js';
 import { adoptScientificFieldDescriptors } from './field/descriptor-ownership.js';
+import { POINT_VISIBILITY_THRESHOLD } from '../../../rendering/alpha-visibility.js';
 
 const SYNTHETIC_SCENE_KEYS = Object.freeze([
   'colors',
@@ -160,10 +161,40 @@ export const viewContextViewerSyncMethods = {
     // The updateTransparency/updateAlphas path handles both:
     // - Alpha texture case: just updates texture (fast, ~16x faster than buffer rebuild)
     // - Alpha-buffer case: uses an alpha-only dirty flag for efficient partial updates
-    if (this._isLiveView()) {
-      this.viewer.updateTransparency(this.categoryTransparency);
-    } else if (typeof this.viewer.updateSnapshotAttributes === 'function') {
-      this.viewer.updateSnapshotAttributes(this.activeViewId, { transparency: this.categoryTransparency });
+    try {
+      if (this._isLiveView()) {
+        this.viewer.updateTransparency(this.categoryTransparency);
+      } else if (typeof this.viewer.updateSnapshotAttributes === 'function') {
+        this.viewer.updateSnapshotAttributes(this.activeViewId, { transparency: this.categoryTransparency });
+      }
+    } catch (publicationError) {
+      const restorationFailures = [];
+      try {
+        const accepted = this.viewer.getViewTransparency(
+          this.activeViewId
+        );
+        if (
+          !(accepted instanceof Float32Array) ||
+          !(this.categoryTransparency instanceof Float32Array) ||
+          accepted.length !== this.categoryTransparency.length
+        ) {
+          throw new TypeError(
+            'Visibility rollback requires the exact accepted view transparency.'
+          );
+        }
+        this.categoryTransparency.set(accepted);
+        this._syncColorsAlpha();
+        this._updateActiveCategoryCounts();
+      } catch (restorationError) {
+        restorationFailures.push(restorationError);
+      }
+      if (restorationFailures.length > 0) {
+        throw new AggregateError(
+          [publicationError, ...restorationFailures],
+          'Visibility publication failed with incomplete application-state restoration.'
+        );
+      }
+      throw publicationError;
     }
   },
 
@@ -297,10 +328,29 @@ export const viewContextViewerSyncMethods = {
     this.activePageId = 'page_1';
     this._highlightPageIdCounter = 1;
     this.highlightArray = new Uint8Array(this.pointCount);
+    this._highlightedCellIndices = [];
     this._highlightIdCounter = 0;
     this._cachedHighlightCount = null;
     this._cachedTotalHighlightCount = null;
-    this._cachedHighlightLodLevel = null;
+    this._cachedHighlightLodMembership = null;
+
+    // Publish the new dataset with no active field/filter owner before any
+    // synchronous state notification escapes. A prior categorical selection
+    // can have the same field index in the replacement manifest while its
+    // codes are still intentionally lazy; exposing that stale index lets UI
+    // listeners initialize filter metadata against the wrong generation.
+    this.activeFieldIndex = -1;
+    this.activeVarFieldIndex = -1;
+    this.activeFieldSource = null;
+    this._activeCategoryCounts = null;
+    this._visibilityScratch = null;
+    this._batchMode = false;
+    this._batchDepth = 0;
+    this._batchDirty = {
+      visibility: false,
+      colors: false,
+      affectedFields: new Set()
+    };
 
     this._resetViewContexts();
     this._notifyHighlightPageChange();
@@ -434,10 +484,11 @@ export const viewContextViewerSyncMethods = {
     this.activePageId = 'page_1';
     this._highlightPageIdCounter = 1;
     this.highlightArray = highlights;
+    this._highlightedCellIndices = [];
     this._highlightIdCounter = 0;
     this._cachedHighlightCount = null;
     this._cachedTotalHighlightCount = null;
-    this._cachedHighlightLodLevel = null;
+    this._cachedHighlightLodMembership = null;
 
     this._batchMode = false;
     this._batchDepth = 0;
@@ -486,7 +537,8 @@ export const viewContextViewerSyncMethods = {
 
     const mask = this._visibilityScratch;
     for (let i = 0; i < total; i++) {
-      let visible = (alpha[i] ?? 0) > 0.001;
+      let visible =
+        (alpha[i] ?? 0) >= POINT_VISIBILITY_THRESHOLD;
       if (visible && applyOutlierFilter) {
         const q = (i < outliers.length) ? outliers[i] : -1;
         if (q >= 0 && q > outlierThreshold) visible = false;

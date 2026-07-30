@@ -5,9 +5,40 @@
  */
 
 import { escapeHtml } from '../utils.js';
+import { claimModalDocumentLayer } from './modal-background-owner.js';
 
 let activeKeydownHandler = null;
 let activeDialogCancel = null;
+
+function releaseExactModalDocumentLayer(release) {
+  if (typeof release !== 'function') {
+    throw new TypeError(
+      'Confirm dialog document-layer release owner must be a function'
+    );
+  }
+  try {
+    if (release() !== true) {
+      throw new Error(
+        'Confirm dialog lost its exact document-layer owner'
+      );
+    }
+    return true;
+  } catch (primaryError) {
+    try {
+      if (release() !== true) {
+        throw new Error(
+          'Confirm dialog document-layer retry lost ownership'
+        );
+      }
+      return true;
+    } catch (retryError) {
+      throw new AggregateError(
+        [primaryError, retryError],
+        'Confirm dialog document-layer release failed twice'
+      );
+    }
+  }
+}
 
 function createDomId(prefix = 'id') {
   const p = String(prefix || 'id').trim() || 'id';
@@ -35,7 +66,7 @@ export function showConfirmDialog({
   if (activeDialogCancel !== null) {
     activeDialogCancel();
   } else if (activeKeydownHandler) {
-    document.removeEventListener('keydown', activeKeydownHandler);
+    document.removeEventListener('keydown', activeKeydownHandler, true);
     activeKeydownHandler = null;
   }
 
@@ -48,19 +79,22 @@ export function showConfirmDialog({
   overlay.setAttribute('aria-modal', 'true');
   const prevFocus = document.activeElement;
   const titleId = createDomId('confirm-dialog-title');
+  const inputId = createDomId('confirm-dialog-input');
   overlay.setAttribute('aria-labelledby', titleId);
 
   const wantsInput = Boolean(inputLabel || inputPlaceholder);
   const inputBlock = wantsInput
     ? `
       <div class="confirm-dialog-input">
-        ${inputLabel ? `<div class="confirm-dialog-input-label">${escapeHtml(inputLabel)}</div>` : ''}
+        ${inputLabel ? `<label class="confirm-dialog-input-label" for="${escapeHtml(inputId)}">${escapeHtml(inputLabel)}</label>` : ''}
         <div class="confirm-dialog-textarea-wrap">
           <textarea
+            id="${escapeHtml(inputId)}"
             class="confirm-dialog-textarea"
             rows="3"
             maxlength="${escapeHtml(String(inputMaxLength))}"
             placeholder="${escapeHtml(inputPlaceholder || '')}"
+            ${inputLabel ? '' : `aria-label="${escapeHtml(inputPlaceholder || 'Note')}"`}
           >${escapeHtml(inputDefaultValue || '')}</textarea>
           <div class="confirm-dialog-char-counter confirm-dialog-char-counter--overlay"></div>
         </div>
@@ -85,6 +119,15 @@ export function showConfirmDialog({
   `;
 
   let closed = false;
+  let releaseModalLayer = null;
+  const releaseDocumentOwnership = () => {
+    if (releaseModalLayer === null) return;
+    const exactRelease = releaseModalLayer;
+    releaseExactModalDocumentLayer(exactRelease);
+    if (releaseModalLayer === exactRelease) {
+      releaseModalLayer = null;
+    }
+  };
   const listFocusable = () => {
     const root = overlay.querySelector('.confirm-dialog');
     if (!root) return [];
@@ -111,6 +154,17 @@ export function showConfirmDialog({
   };
 
   const onTrapKeyDown = (e) => {
+    if (e.key === 'Escape') {
+      try {
+        e.preventDefault?.();
+        e.stopPropagation?.();
+        e.stopImmediatePropagation?.();
+      } catch {
+        // The dialog still closes when a synthetic event method throws.
+      }
+      cancel();
+      return;
+    }
     if (e.key !== 'Tab') return;
     const focusables = listFocusable();
     if (!focusables.length) {
@@ -148,29 +202,54 @@ export function showConfirmDialog({
   overlay.addEventListener('keydown', onTrapKeyDown, true);
 
   const close = () => {
-    if (closed) return;
-    closed = true;
-    if (activeDialogCancel === cancel) {
-      activeDialogCancel = null;
+    if (closed) {
+      releaseDocumentOwnership();
+      if (
+        releaseModalLayer === null &&
+        activeDialogCancel === cancel
+      ) {
+        activeDialogCancel = null;
+      }
+      return;
     }
+    closed = true;
     if (activeKeydownHandler === onKeyDown) {
-      document.removeEventListener('keydown', onKeyDown);
+      document.removeEventListener('keydown', onKeyDown, true);
       activeKeydownHandler = null;
     }
-    try {
-      overlay.removeEventListener('keydown', onTrapKeyDown, true);
-    } catch {
-      // ignore
+    const cleanupErrors = [];
+    for (const cleanup of [
+      () => overlay.removeEventListener('keydown', onTrapKeyDown, true),
+      () => overlay.remove(),
+      releaseDocumentOwnership,
+      () => prevFocus?.focus?.()
+    ]) {
+      if (cleanup === null) continue;
+      try {
+        cleanup();
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
     }
-    overlay.remove();
-    try {
-      prevFocus?.focus?.();
-    } catch {
-      // ignore
+    if (
+      releaseModalLayer === null &&
+      activeDialogCancel === cancel
+    ) {
+      activeDialogCancel = null;
+    }
+    if (cleanupErrors.length === 1) throw cleanupErrors[0];
+    if (cleanupErrors.length > 1) {
+      throw new AggregateError(
+        cleanupErrors,
+        `Confirm dialog teardown failed in ${cleanupErrors.length} operations`
+      );
     }
   };
   const cancel = () => {
-    if (closed) return;
+    if (closed) {
+      close();
+      return;
+    }
     close();
     onCancel?.();
   };
@@ -208,14 +287,36 @@ export function showConfirmDialog({
 
   const onKeyDown = (e) => {
     if (e.key !== 'Escape') return;
+    try {
+      e.preventDefault?.();
+      e.stopPropagation?.();
+      e.stopImmediatePropagation?.();
+    } catch {
+      // The dialog still closes when a synthetic event method throws.
+    }
     cancel();
   };
   activeDialogCancel = cancel;
   activeKeydownHandler = onKeyDown;
-  document.addEventListener('keydown', onKeyDown);
+  document.addEventListener('keydown', onKeyDown, true);
 
-  document.body.appendChild(overlay);
-  if (wantsInput) textarea?.focus?.();
-  else confirmBtn?.focus?.();
+  try {
+    releaseModalLayer = claimModalDocumentLayer(overlay);
+    document.body.appendChild(overlay);
+    if (wantsInput) textarea?.focus?.();
+    else confirmBtn?.focus?.();
+  } catch (primaryError) {
+    const rollbackErrors = [primaryError];
+    try {
+      close();
+    } catch (rollbackError) {
+      rollbackErrors.push(rollbackError);
+    }
+    if (rollbackErrors.length === 1) throw primaryError;
+    throw new AggregateError(
+      rollbackErrors,
+      'Confirm dialog creation and rollback failed'
+    );
+  }
   return cancel;
 }

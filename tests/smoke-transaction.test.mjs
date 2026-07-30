@@ -5,6 +5,10 @@ import test from 'node:test';
 import {
   buildDensityTextureGPU,
 } from '../assets/js/rendering/smoke-cloud/smoke-density.js';
+import {
+  MIN_VISIBLE_ALPHA_BYTE,
+  POINT_VISIBILITY_THRESHOLD,
+} from '../assets/js/rendering/alpha-visibility.js';
 import { SmokeRenderer } from '../assets/js/rendering/smoke-cloud/smoke-renderer.js';
 import {
   getResolutionScaleFactor,
@@ -16,6 +20,14 @@ import {
 import {
   viewContextViewerSyncMethods,
 } from '../assets/js/app/state/managers/view-context-viewer-sync.js';
+
+function nextFloat32(value, direction) {
+  const view = new DataView(new ArrayBuffer(4));
+  view.setFloat32(0, value, true);
+  const bits = view.getUint32(0, true);
+  view.setUint32(0, bits + direction, true);
+  return view.getFloat32(0, true);
+}
 
 test('GPU smoke density never synchronizes a volume through product readback', async () => {
   const source = await readFile(
@@ -143,6 +155,81 @@ test('an all-hidden smoke source settles empty before touching WebGL', () => {
     },
   );
   assert.equal(result, null);
+});
+
+test('smoke preparation admits exactly Float32 alpha values encoding to visible R8 bytes', async () => {
+  const byte3Alpha = POINT_VISIBILITY_THRESHOLD;
+  const byte2Alpha = nextFloat32(byte3Alpha, -1);
+  assert.equal(
+    Math.round(byte2Alpha * 255),
+    MIN_VISIBLE_ALPHA_BYTE - 1,
+  );
+  assert.equal(
+    Math.round(byte3Alpha * 255),
+    MIN_VISIBLE_ALPHA_BYTE,
+  );
+
+  const untouchedGl = new Proxy({}, {
+    get(_target, property) {
+      throw new Error(
+        `WebGL must not be touched for R8 byte 2: ${String(property)}`,
+      );
+    },
+  });
+  assert.equal(
+    buildDensityTextureGPU(
+      untouchedGl,
+      new Float32Array([0, 0, 0]),
+      {
+        gridSize: 8,
+        visibility: {
+          alpha: Float32Array.of(byte2Alpha),
+          outlierQuantiles: null,
+          outlierThreshold: null,
+        },
+      },
+    ),
+    null,
+  );
+
+  let contextLossChecks = 0;
+  assert.throws(
+    () => buildDensityTextureGPU(
+      {
+        isContextLost() {
+          contextLossChecks++;
+          return true;
+        },
+      },
+      new Float32Array([0, 0, 0]),
+      {
+        gridSize: 8,
+        visibility: {
+          alpha: Float32Array.of(byte3Alpha),
+          outlierQuantiles: null,
+          outlierThreshold: null,
+        },
+      },
+    ),
+    /cannot build while the WebGL2 context is lost/,
+  );
+  assert.equal(contextLossChecks, 1);
+
+  const source = await readFile(
+    new URL(
+      '../assets/js/rendering/smoke-cloud/smoke-density.js',
+      import.meta.url,
+    ),
+    'utf8',
+  );
+  assert.match(
+    source,
+    /visible = alphaValue >= POINT_VISIBILITY_THRESHOLD;/,
+  );
+  assert.match(
+    source,
+    /if \(alpha\[pointIndex\] < POINT_VISIBILITY_THRESHOLD\) continue;/,
+  );
 });
 
 function createFakeGl() {

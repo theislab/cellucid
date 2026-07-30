@@ -13,6 +13,7 @@
  */
 
 import { OperationType } from './operations.js';
+import { setOwnDataProperty } from '../../../utils/exact-record.js';
 import {
   mean,
   tTwoSidedPValue,
@@ -288,12 +289,12 @@ export function batchExtract(payload) {
   const results = {};
 
   for (const variable of variables) {
-    results[variable.key] = extractValues({
+    setOwnDataProperty(results, variable.key, extractValues({
       cellIndices,
       rawValues: variable.rawValues,
       categories: variable.categories,
       isCategorical: variable.isCategorical
-    });
+    }));
   }
 
   return results;
@@ -683,6 +684,11 @@ export function filterCells(payload) {
     logic: String(condition.logic || 'AND').toUpperCase(),
     negate: !!condition.negate
   }));
+  const conditionFieldValues = normalizedConditions.map(condition => (
+    fieldsData != null && Object.hasOwn(fieldsData, condition.field)
+      ? fieldsData[condition.field]
+      : undefined
+  ));
 
   // Pre-compute percentile thresholds for top/bottom percent operators.
   const thresholds = new Map();
@@ -691,7 +697,7 @@ export function filterCells(payload) {
     const operator = condition.operator;
     if (operator !== 'top_percent' && operator !== 'bottom_percent') continue;
 
-    const fieldValues = fieldsData?.[condition.field];
+    const fieldValues = conditionFieldValues[i];
     if (!fieldValues) continue;
 
     const percent = Number(condition.value);
@@ -726,11 +732,11 @@ export function filterCells(payload) {
 
     for (let c = 0; c < normalizedConditions.length; c++) {
       const condition = normalizedConditions[c];
-      const fieldValues = fieldsData?.[condition.field];
+      const fieldValues = conditionFieldValues[c];
       const value = fieldValues ? fieldValues[cellIdx] : undefined;
 
       let pass = fieldValues ? evaluateCondition(value, condition, thresholds) : false;
-      if (condition.negate) pass = !pass;
+      if (fieldValues && condition.negate) pass = !pass;
 
       if (c === 0) {
         result = pass;

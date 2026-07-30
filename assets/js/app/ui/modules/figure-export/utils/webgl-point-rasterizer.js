@@ -33,7 +33,10 @@
  * @module ui/modules/figure-export/utils/webgl-point-rasterizer
  */
 
-import { createProgram } from '../../../../../rendering/gl-utils.js';
+import {
+  configureStraightAlphaBlending,
+  createProgram,
+} from '../../../../../rendering/gl-utils.js';
 import {
   HP_VS_FULL,
   HP_FS_FULL,
@@ -43,7 +46,12 @@ import {
   HP_VS_HIGHLIGHT,
   HP_FS_HIGHLIGHT,
 } from '../../../../../rendering/shaders/high-perf-shaders.js';
-const DEFAULT_ALPHA_THRESHOLD = 0.01;
+import {
+  assertLodMembership,
+  MIN_VISIBLE_ALPHA_BYTE,
+  POINT_VISIBILITY_THRESHOLD,
+} from './lod-membership.js';
+const DEFAULT_ALPHA_THRESHOLD = POINT_VISIBILITY_THRESHOLD;
 const DEFAULT_HIGHLIGHT_COLOR = [0.4, 0.85, 1.0];
 
 const HIGHLIGHT_STYLE_BY_QUALITY = {
@@ -65,17 +73,25 @@ function buildHighlightOverlayBuffers({
   positions,
   highlightArray,
   transparency,
-  visibilityMask,
+  lodMembership,
   alphaThreshold
 }) {
   if (highlightArray === null) return null;
   const n = positions.length / 3;
+  const admittedIndices = lodMembership?.indices ?? null;
+  const candidateCount = admittedIndices?.length ?? n;
 
   let count = 0;
-  for (let i = 0; i < n; i++) {
+  for (
+    let candidateIndex = 0;
+    candidateIndex < candidateCount;
+    candidateIndex++
+  ) {
+    const i = admittedIndices === null
+      ? candidateIndex
+      : admittedIndices[candidateIndex];
     const aByte = highlightValueToAlphaByte(highlightArray[i]);
-    if (aByte <= 0) continue;
-    if (visibilityMask !== null && visibilityMask[i] <= 0) continue;
+    if (aByte < MIN_VISIBLE_ALPHA_BYTE) continue;
     const baseAlpha = transparency === null ? 1 : transparency[i];
     if (baseAlpha < alphaThreshold) continue;
     count++;
@@ -86,10 +102,16 @@ function buildHighlightOverlayBuffers({
   const outCol = new Uint8Array(count * 4);
 
   let cursor = 0;
-  for (let i = 0; i < n; i++) {
+  for (
+    let candidateIndex = 0;
+    candidateIndex < candidateCount;
+    candidateIndex++
+  ) {
+    const i = admittedIndices === null
+      ? candidateIndex
+      : admittedIndices[candidateIndex];
     const aByte = highlightValueToAlphaByte(highlightArray[i]);
-    if (aByte <= 0) continue;
-    if (visibilityMask !== null && visibilityMask[i] <= 0) continue;
+    if (aByte < MIN_VISIBLE_ALPHA_BYTE) continue;
     const baseAlpha = transparency === null ? 1 : transparency[i];
     if (baseAlpha < alphaThreshold) continue;
 
@@ -124,6 +146,8 @@ function buildHighlightOverlayBuffers({
  * @property {number} sizeAttenuation
  * @property {number} [lightingStrength]
  * @property {number} [fogDensity]
+ * @property {number} fogNear
+ * @property {number} fogFar
  * @property {Float32Array|number[]} [fogColor]
  * @property {Float32Array|number[]} [lightDir]
  * @property {[number, number, number]} [cameraPosition]
@@ -136,17 +160,21 @@ function buildHighlightOverlayBuffers({
  * @param {number} height
  * @returns {HTMLCanvasElement}
  */
-function createRasterCanvas(width, height) {
+function createRasterCanvas() {
   if (typeof document === 'undefined' || typeof document.createElement !== 'function') {
     throw new Error(
       'Figure-export WebGL2 rasterization requires the browser document canvas backend.'
     );
   }
   const canvas = document.createElement('canvas');
-  canvas.width = width;
-  canvas.height = height;
+  // Establish a minimal drawing buffer first so hardware limits can be
+  // checked before attempting the requested export allocation.
+  canvas.width = 1;
+  canvas.height = 1;
   return canvas;
 }
+
+const rasterContextOwners = new WeakMap();
 
 /**
  * @param {HTMLCanvasElement} canvas
@@ -159,7 +187,10 @@ function getWebgl2Context(canvas) {
     gl = canvas.getContext('webgl2', {
       alpha: true,
       antialias: true,
-      premultipliedAlpha: false,
+      // Source-over blending stores premultiplied RGB in transparent pixels.
+      // Publish that exact ownership to canvas compositing and PNG encoding;
+      // declaring the buffer unpremultiplied would apply alpha a second time.
+      premultipliedAlpha: true,
       preserveDrawingBuffer: true,
       powerPreference: 'high-performance'
     });
@@ -172,7 +203,63 @@ function getWebgl2Context(canvas) {
   if (!gl) {
     throw new Error('Figure export requires WebGL2 rasterization support.');
   }
+  rasterContextOwners.set(canvas, gl);
   return gl;
+}
+
+/**
+ * Release a transient raster context after its pixels have been copied.
+ * Idempotence lets every renderer use this from a `finally` boundary.
+ *
+ * @param {HTMLCanvasElement} canvas
+ * @returns {boolean}
+ */
+export function releaseWebglRasterCanvas(canvas) {
+  const gl = rasterContextOwners.get(canvas);
+  if (gl === undefined) return false;
+  rasterContextOwners.delete(canvas);
+  const loseContext = gl.getExtension('WEBGL_lose_context');
+  if (loseContext !== null) {
+    loseContext.loseContext();
+  } else {
+    canvas.width = 1;
+    canvas.height = 1;
+  }
+  return true;
+}
+
+function configureExactDrawingBuffer(gl, canvas, width, height) {
+  const viewportDims = gl.getParameter(gl.MAX_VIEWPORT_DIMS);
+  const maxRenderbufferSize = gl.getParameter(gl.MAX_RENDERBUFFER_SIZE);
+  if (
+    !(viewportDims instanceof Int32Array) ||
+    viewportDims.length < 2 ||
+    !Number.isSafeInteger(maxRenderbufferSize) ||
+    maxRenderbufferSize <= 0
+  ) {
+    throw new Error(
+      'Figure-export WebGL2 hardware limits are unavailable.'
+    );
+  }
+  const maxWidth = Math.min(viewportDims[0], maxRenderbufferSize);
+  const maxHeight = Math.min(viewportDims[1], maxRenderbufferSize);
+  if (width > maxWidth || height > maxHeight) {
+    throw new RangeError(
+      `Figure export ${width}×${height} exceeds this GPU's exact ` +
+      `${maxWidth}×${maxHeight} raster limit.`
+    );
+  }
+  canvas.width = width;
+  canvas.height = height;
+  if (
+    gl.drawingBufferWidth !== width ||
+    gl.drawingBufferHeight !== height
+  ) {
+    throw new RangeError(
+      `Figure export could not allocate the exact ${width}×${height} ` +
+      'WebGL2 drawing buffer.'
+    );
+  }
 }
 
 function pickShaderSources(shaderQuality) {
@@ -191,74 +278,64 @@ function pickShaderSources(shaderQuality) {
 }
 
 /**
- * Compute a bounding sphere from bounds.
- * Matches HighPerfRenderer.autoComputeFogRange() math.
- * @param {{ minX: number; maxX: number; minY: number; maxY: number; minZ: number; maxZ: number }} bounds
- */
-function boundsToSphere(bounds) {
-  const dx = bounds.maxX - bounds.minX;
-  const dy = bounds.maxY - bounds.minY;
-  const dz = bounds.maxZ - bounds.minZ;
-  const radius = Math.sqrt(dx * dx + dy * dy + dz * dz) * 0.5;
-  return {
-    center: [
-      (bounds.minX + bounds.maxX) * 0.5,
-      (bounds.minY + bounds.maxY) * 0.5,
-      (bounds.minZ + bounds.maxZ) * 0.5,
-    ],
-    radius
-  };
-}
-
-/**
  * Pack colors into a new Uint8Array so we can:
  * - inject transparency into alpha channel (viewer often keeps alpha separate)
  * - optionally apply selection emphasis (mute non-selected)
+ * - compact an active LOD membership before GPU upload/draw
  *
- * Also returns bounds for fog range computation (scanned over all points).
+ * Fog is owned by the exact presented render state. Recomputing it here would
+ * add a redundant O(N) scan for every pane, format, and DPI and can disagree
+ * with snapshot bounds used by the interactive renderer.
  *
  * @param {object} options
  * @param {Float32Array} options.positions
  * @param {Uint8Array} options.colors
  * @param {Float32Array|null} options.transparency
- * @param {Float32Array|Uint8Array|null} [options.visibilityMask]
+ * @param {import('./lod-membership.js').LodMembership|null} [options.lodMembership]
  * @param {Uint8Array|Float32Array|null} options.highlightArray
  * @param {boolean} options.emphasizeSelection
  * @param {number} options.selectionMutedOpacity
  * @param {number} [options.alphaThreshold]
- * @returns {{ positions: Float32Array; colors: Uint8Array; count: number; bounds: { minX: number; maxX: number; minY: number; maxY: number; minZ: number; maxZ: number } }}
+ * @returns {{ positions: Float32Array; colors: Uint8Array; count: number }}
  */
 function packBuffers({
   positions,
   colors,
   transparency,
-  visibilityMask,
+  lodMembership,
   highlightArray,
   emphasizeSelection,
   selectionMutedOpacity,
   alphaThreshold,
 }) {
   const n = positions.length / 3;
-  const outColors = new Uint8Array(n * 4);
+  const admittedIndices = lodMembership?.indices ?? null;
+  const admittedCount = admittedIndices?.length ?? n;
 
-  let minX = Infinity, minY = Infinity, minZ = Infinity;
-  let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+  const outPositions = admittedIndices === null
+    ? positions
+    : new Float32Array(admittedCount * 3);
+  const outColors = new Uint8Array(admittedCount * 4);
 
   const mutedAlpha = selectionMutedOpacity;
+  let cursor = 0;
 
-  for (let i = 0; i < n; i++) {
+  for (
+    let candidateIndex = 0;
+    candidateIndex < admittedCount;
+    candidateIndex++
+  ) {
+    const i = admittedIndices === null
+      ? candidateIndex
+      : admittedIndices[candidateIndex];
     const pi = i * 3;
     const x = positions[pi];
     const y = positions[pi + 1];
     const z = positions[pi + 2];
-    if (x < minX) minX = x;
-    if (y < minY) minY = y;
-    if (z < minZ) minZ = z;
-    if (x > maxX) maxX = x;
-    if (y > maxY) maxY = y;
-    if (z > maxZ) maxZ = z;
 
     const ci = i * 4;
+    const outPi = cursor * 3;
+    const outCi = cursor * 4;
     let r = colors[ci];
     let g = colors[ci + 1];
     let b = colors[ci + 2];
@@ -268,11 +345,17 @@ function packBuffers({
       : transparency[i];
     let a = baseAlpha;
 
-    if (visibilityMask !== null && visibilityMask[i] <= 0) {
-      a = 0;
+    if (admittedIndices !== null) {
+      outPositions[outPi] = x;
+      outPositions[outPi + 1] = y;
+      outPositions[outPi + 2] = z;
     }
 
-    if (emphasizeSelection && highlightArray !== null && highlightArray[i] <= 0) {
+    if (
+      emphasizeSelection &&
+      highlightArray !== null &&
+      highlightArray[i] < MIN_VISIBLE_ALPHA_BYTE
+    ) {
       r = 160;
       g = 160;
       b = 160;
@@ -282,17 +365,17 @@ function packBuffers({
     if (a < alphaThreshold) a = 0;
     const ao = Math.round(a * 255);
 
-    outColors[ci] = r;
-    outColors[ci + 1] = g;
-    outColors[ci + 2] = b;
-    outColors[ci + 3] = ao;
+    outColors[outCi] = r;
+    outColors[outCi + 1] = g;
+    outColors[outCi + 2] = b;
+    outColors[outCi + 3] = ao;
+    cursor++;
   }
 
   return {
-    positions,
+    positions: outPositions,
     colors: outColors,
-    count: n,
-    bounds: { minX, maxX, minY, maxY, minZ, maxZ }
+    count: admittedCount
   };
 }
 
@@ -303,12 +386,12 @@ function packBuffers({
  * @param {Float32Array|null} options.positions
  * @param {Uint8Array|null} options.colors
  * @param {Float32Array|null} [options.transparency]
- * @param {Float32Array|Uint8Array|null} [options.visibilityMask]
+ * @param {import('./lod-membership.js').LodMembership|null} [options.lodMembership]
  * @param {RenderStateForWebgl|null} options.renderState
  * @param {number} options.outputWidthPx - target canvas width (pixels)
  * @param {number} options.outputHeightPx - target canvas height (pixels)
  * @param {number} options.pointSizePx - diameter in output pixels
- * @param {{ positions: Float32Array|null; colors: Uint8Array|null; transparency?: Float32Array|null; visibilityMask?: Float32Array|Uint8Array|null; pointSizePx: number; alphaThreshold?: number } | null} [options.overlayPoints]
+ * @param {{ positions: Float32Array|null; colors: Uint8Array|null; transparency?: Float32Array|null; lodMembership?: import('./lod-membership.js').LodMembership|null; pointSizePx: number; alphaThreshold?: number } | null} [options.overlayPoints]
  * @param {Uint8Array|Float32Array|null} [options.highlightArray]
  * @param {boolean} [options.emphasizeSelection=false]
  * @param {number} [options.selectionMutedOpacity=0.15]
@@ -319,7 +402,7 @@ export function rasterizePointsWebgl({
   positions,
   colors,
   transparency = null,
-  visibilityMask = null,
+  lodMembership = null,
   renderState,
   outputWidthPx,
   outputHeightPx,
@@ -335,14 +418,14 @@ export function rasterizePointsWebgl({
   }
   if (
     !(positions instanceof Float32Array) ||
-    positions.length === 0 ||
     positions.length % 3 !== 0
   ) {
     throw new TypeError(
-      'Figure-export positions must be a non-empty Float32Array of XYZ triples.'
+      'Figure-export positions must be a Float32Array of XYZ triples.'
     );
   }
   const pointCount = positions.length / 3;
+  assertLodMembership(lodMembership, { pointCount });
   if (!(colors instanceof Uint8Array) || colors.length !== pointCount * 4) {
     throw new TypeError(
       'Figure-export colors must be a Uint8Array with exactly four values per point.'
@@ -354,17 +437,6 @@ export function rasterizePointsWebgl({
   ) {
     throw new TypeError(
       'Figure-export transparency must be null or one Float32 value per point.'
-    );
-  }
-  if (
-    visibilityMask !== null &&
-    !(
-      (visibilityMask instanceof Float32Array || visibilityMask instanceof Uint8Array) &&
-      visibilityMask.length === pointCount
-    )
-  ) {
-    throw new TypeError(
-      'Figure-export visibilityMask must be null or one typed value per point.'
     );
   }
   if (
@@ -390,13 +462,23 @@ export function rasterizePointsWebgl({
     'pointSize',
     'sizeAttenuation',
     'lightingStrength',
-    'fogDensity'
+    'fogDensity',
+    'fogNear',
+    'fogFar'
   ]) {
     if (!Number.isFinite(renderState[key])) {
       throw new TypeError(
         `Figure-export renderState.${key} must be a finite number.`
       );
     }
+  }
+  if (
+    renderState.fogNear < 0 ||
+    renderState.fogFar < renderState.fogNear
+  ) {
+    throw new RangeError(
+      'Figure-export renderState fog range must satisfy 0 <= fogNear <= fogFar.'
+    );
   }
   for (const key of ['viewportWidth', 'viewportHeight']) {
     if (!Number.isInteger(renderState[key]) || renderState[key] <= 0) {
@@ -449,7 +531,7 @@ export function rasterizePointsWebgl({
     positions,
     colors,
     transparency,
-    visibilityMask,
+    lodMembership,
     highlightArray,
     emphasizeSelection,
     selectionMutedOpacity,
@@ -457,8 +539,21 @@ export function rasterizePointsWebgl({
   });
   const outW = outputWidthPx;
   const outH = outputHeightPx;
-  const canvas = createRasterCanvas(outW, outH);
+  const canvas = createRasterCanvas();
   const gl = getWebgl2Context(canvas);
+  try {
+    configureExactDrawingBuffer(gl, canvas, outW, outH);
+  } catch (error) {
+    try {
+      releaseWebglRasterCanvas(canvas);
+    } catch (releaseError) {
+      throw new AggregateError(
+        [error, releaseError],
+        'Figure-export drawing-buffer allocation and context release failed.'
+      );
+    }
+    throw error;
+  }
 
   const { vs, fs, quality } = pickShaderSources(renderState.shaderQuality);
 
@@ -492,8 +587,7 @@ export function rasterizePointsWebgl({
     // GL state matches HighPerfRenderer defaults.
     gl.enable(gl.DEPTH_TEST);
     gl.depthFunc(gl.LEQUAL);
-    gl.enable(gl.BLEND);
-    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    configureStraightAlphaBlending(gl);
 
     gl.clearColor(0, 0, 0, 0);
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
@@ -602,14 +696,8 @@ export function rasterizePointsWebgl({
     const lodIndexTexLoc = u('u_lodIndexTex');
     if (lodIndexTexLoc) gl.uniform1i(lodIndexTexLoc, 1);
 
-    const cameraPosition = renderState.cameraPosition;
-    const sphere = boundsToSphere(packed.bounds);
-    const dx = cameraPosition[0] - sphere.center[0];
-    const dy = cameraPosition[1] - sphere.center[1];
-    const dz = cameraPosition[2] - sphere.center[2];
-    const distToCenter = Math.sqrt(dx * dx + dy * dy + dz * dz);
-    const fogNear = Math.max(0, distToCenter - sphere.radius);
-    const fogFar = distToCenter + sphere.radius;
+    const fogNear = renderState.fogNear;
+    const fogFar = renderState.fogFar;
     const fogDensity = renderState.fogDensity;
     const fogColor = renderState.fogColor;
     const lightingStrength = renderState.lightingStrength;
@@ -648,11 +736,13 @@ export function rasterizePointsWebgl({
           'Figure-export overlayPoints.pointSizePx must be a finite positive number.'
         );
       }
+      const overlayLodMembership = overlayPoints.lodMembership ?? null;
+      assertLodMembership(overlayLodMembership, { pointCount: overlayCount });
       const overlayPacked = packBuffers({
         positions: overlayPoints.positions,
         colors: overlayPoints.colors,
         transparency: overlayPoints.transparency ?? null,
-        visibilityMask: overlayPoints.visibilityMask ?? null,
+        lodMembership: overlayLodMembership,
         highlightArray: null,
         emphasizeSelection: false,
         selectionMutedOpacity: 1.0,
@@ -686,7 +776,7 @@ export function rasterizePointsWebgl({
       positions,
       highlightArray,
       transparency,
-      visibilityMask,
+      lodMembership,
       alphaThreshold
     });
     if (highlightOverlay?.count) {
@@ -741,10 +831,13 @@ export function rasterizePointsWebgl({
       setHV3(hu('u_lightDir'), lightDir);
 
       gl.enable(gl.DEPTH_TEST);
-      gl.depthMask(false);
-      gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
-      gl.drawArrays(gl.POINTS, 0, highlightOverlay.count);
-      gl.depthMask(true);
+      configureStraightAlphaBlending(gl);
+      try {
+        gl.depthMask(false);
+        gl.drawArrays(gl.POINTS, 0, highlightOverlay.count);
+      } finally {
+        gl.depthMask(true);
+      }
     }
 
     gl.flush();
@@ -785,6 +878,16 @@ export function rasterizePointsWebgl({
     ...(rasterizationError ? [rasterizationError] : []),
     ...cleanupErrors,
   ];
+  if (failures.length > 0) {
+    try {
+      releaseWebglRasterCanvas(canvas);
+    } catch (error) {
+      failures.push(new Error(
+        `Figure-export WebGL2 context release failed: ${error.message}`,
+        { cause: error }
+      ));
+    }
+  }
   if (failures.length === 1) throw failures[0];
   if (failures.length > 1) {
     throw new AggregateError(

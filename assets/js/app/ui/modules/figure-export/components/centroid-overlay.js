@@ -13,6 +13,7 @@
 
 import { escapeHtml } from '../../../../utils/dom-utils.js';
 import { forEachProjectedPoint } from '../utils/point-projector.js';
+import { POINT_VISIBILITY_THRESHOLD } from '../utils/lod-membership.js';
 
 /**
  * @param {any} flags
@@ -80,11 +81,11 @@ export function renderSvgCentroidOverlay({
     renderState,
     plotRect,
     radiusPx: Math.max(0.5, Number(pointRadiusPx) || 0.5),
-    visibilityMask: null,
+    lodMembership: null,
     crop,
     sortByDepth: false,
     onPoint: (x, y, r, g, b, a, radius, index) => {
-      if (a < 0.01) return;
+      if (a < POINT_VISIBILITY_THRESHOLD) return;
 
       if (f.points) {
         const fill = `rgb(${r},${g},${b})`;
@@ -171,11 +172,11 @@ export function drawCanvasCentroidOverlay({
     renderState,
     plotRect,
     radiusPx: Math.max(0.5, Number(pointRadiusPx) || 0.5),
-    visibilityMask: null,
+    lodMembership: null,
     crop,
     sortByDepth: false,
     onPoint: (x, y, r, g, b, a, radius, index) => {
-      if (a < 0.01) return;
+      if (a < POINT_VISIBILITY_THRESHOLD) return;
 
       if (f.points) {
         ctx.fillStyle = `rgba(${r},${g},${b},${a})`;
@@ -202,4 +203,3 @@ export function drawCanvasCentroidOverlay({
 
   ctx.restore();
 }
-

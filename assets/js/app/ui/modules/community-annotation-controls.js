@@ -17,6 +17,7 @@ import { getCommunityAnnotationFileCache } from '../../community-annotations/fil
 import { describeCacheScope, toCacheScopeKey, toSessionStorageKey } from '../../community-annotations/cache-scope.js';
 import { getCommunityAnnotationCacheContext, syncCommunityAnnotationCacheContext } from '../../community-annotations/runtime-context.js';
 import { showConfirmDialog } from '../components/confirm-dialog.js';
+import { claimModalDocumentLayer } from '../components/modal-background-owner.js';
 import { getUrlAnnotationRepo, setUrlAnnotationRepo } from '../../url-state.js';
 import { getGitHubAuthSession, toGitHubUserKey } from '../../community-annotations/github-auth.js';
 import {
@@ -32,17 +33,19 @@ import {
   setAnnotationRepoForDataset
 } from '../../community-annotations/repo-store.js';
 import {
+  buildUpdatedAnnotationConfig,
   CommunityAnnotationGitHubSync,
   getGitHubSyncForDataset,
   parseOwnerRepo,
+  resolveAnnotationRepositoryFromUrlParam,
   selectAnnotationPublicationMode,
   setDatasetAnnotationRepoFromUrlParam,
-  setDatasetAnnotationRepoFromUrlParamAsync
 } from '../../community-annotations/github-sync.js';
 import {
   assertConfigDocument,
   assertMergesDocument,
   assertUserDocument,
+  toAnnotationPublicationBytes,
 } from '../../community-annotations/wire-contract.js';
 import {
   isCanonicalGitHubAccount,
@@ -53,9 +56,11 @@ import {
   assertExactOptionalProfileText,
   assertExactOrcidId,
   isExactOrcidId,
-  parseOrcidExpandedSearch,
-  parseOrcidPersonName,
 } from '../../community-annotations/profile-identifiers.js';
+import {
+  fetchOrcidExpandedSearch,
+  fetchOrcidPerson,
+} from '../../community-annotations/orcid-client.js';
 import {
   AUTO_PULL_INTERVALS_MS,
   DEFAULT_AUTO_PULL_INTERVAL_MS,
@@ -64,8 +69,17 @@ import {
   parseAutoPullPreferences,
   serializeAutoPullPreferences,
 } from '../../community-annotations/auto-pull-preferences.js';
+import {
+  claimCommunityAnnotationModal,
+} from './community-annotation-modal-owner.js';
 
 const CONSENSUS_SNAPSHOT_FILENAME = 'cellucid-consensus.json';
+const AUTO_PULL_STORAGE_KEY =
+  'cellucid:community-annotations:auto-pull:v1';
+const GITHUB_REPOSITORY_DISCOVERY_MAX_ITEMS = 10_000;
+const GITHUB_REPOSITORY_PAGE_SIZE = 100;
+const COMMUNITY_MODAL_LOCAL_CLOSE = Symbol('communityModalLocalClose');
+const COMMUNITY_MODAL_ESCAPE_OWNER = Symbol('communityModalEscapeOwner');
 
 function el(tag, props = {}, children = []) {
   const node = document.createElement(tag);
@@ -88,6 +102,15 @@ function el(tag, props = {}, children = []) {
 
 function toCleanString(value) {
   return String(value ?? '').trim();
+}
+
+function hasAtLeastUnicodeCodePoints(value, minimum) {
+  let count = 0;
+  for (const _codePoint of value) {
+    count += 1;
+    if (count >= minimum) return true;
+  }
+  return false;
 }
 
 function runExactCleanup(context, entries) {
@@ -113,15 +136,43 @@ function runExactCleanup(context, entries) {
   }
 }
 
+function releaseExactModalDocumentLayer(release, label) {
+  if (typeof release !== 'function') {
+    throw new TypeError(`${label} release owner must be a function`);
+  }
+  try {
+    if (release() !== true) {
+      throw new Error(`${label} lost its exact document-layer owner`);
+    }
+    return true;
+  } catch (primaryError) {
+    try {
+      if (release() !== true) {
+        throw new Error(`${label} document-layer retry lost ownership`);
+      }
+      return true;
+    } catch (retryError) {
+      throw new AggregateError(
+        [primaryError, retryError],
+        `${label} document-layer release failed twice`
+      );
+    }
+  }
+}
+
 function removeOwningCommunityModal(content) {
   if (!content || typeof content.closest !== 'function') {
     throw new TypeError('Community annotation modal content must expose closest()');
   }
   const overlay = content.closest('.community-annotation-modal-overlay');
-  if (!overlay || typeof overlay.remove !== 'function') {
+  if (!overlay) {
     throw new Error('Community annotation modal overlay is unavailable');
   }
-  overlay.remove();
+  const close = overlay[COMMUNITY_MODAL_LOCAL_CLOSE];
+  if (typeof close !== 'function') {
+    throw new Error('Community annotation modal close owner is unavailable');
+  }
+  close();
 }
 
 function assertExactGitHubLogin(value, label) {
@@ -263,13 +314,38 @@ function downloadJsonAsFile(filename, json) {
   }, 1500);
 }
 
-  function showClusterModal({ title, buildContent, modalClassName = '' }) {
+  function showClusterModal({
+    title,
+    buildContent,
+    modalClassName = '',
+    returnFocusTo = null,
+    returnFocusResolver = null,
+    onClosed = null
+  }) {
     if (typeof buildContent !== 'function') {
       throw new TypeError('Community annotation modal requires a content builder');
     }
-    const existing = document.querySelector('.community-annotation-modal-overlay');
-    if (existing) existing.remove();
-
+    if (
+      returnFocusTo !== null &&
+      !(returnFocusTo instanceof HTMLElement)
+    ) {
+      throw new TypeError(
+        'Community annotation modal return focus target must be an element or null'
+      );
+    }
+    if (
+      returnFocusResolver !== null &&
+      typeof returnFocusResolver !== 'function'
+    ) {
+      throw new TypeError(
+        'Community annotation modal focus resolver must be a function or null'
+      );
+    }
+    if (onClosed !== null && typeof onClosed !== 'function') {
+      throw new TypeError(
+        'Community annotation modal close settlement must be a function or null'
+      );
+    }
     const overlay = el('div', { className: 'community-annotation-modal-overlay', role: 'dialog', 'aria-modal': 'true' });
     const cls = String(modalClassName || '').trim();
     const modal = el('div', { className: `community-annotation-modal${cls ? ` ${cls}` : ''}`, role: 'document' });
@@ -283,14 +359,50 @@ function downloadJsonAsFile(filename, json) {
     header.appendChild(closeBtn);
 
     const content = el('div', { className: 'community-annotation-modal-body' });
-    buildContent(content);
+    try {
+      buildContent(content);
+    } catch (primaryError) {
+      const errors = [primaryError];
+      try {
+        const cleanup = content.__cellucidCleanup;
+        if (cleanup !== undefined && cleanup !== null) {
+          if (typeof cleanup !== 'function') {
+            throw new TypeError(
+              'Community annotation modal content cleanup must be a function'
+            );
+          }
+          cleanup();
+        }
+      } catch (cleanupError) {
+        errors.push(cleanupError);
+      }
+      if (errors.length === 1) throw primaryError;
+      throw new AggregateError(
+        errors,
+        'Community annotation content creation and cleanup both failed'
+      );
+    }
 
     modal.appendChild(header);
     modal.appendChild(content);
     overlay.appendChild(modal);
 
-    const prevFocus = document.activeElement;
+    const prevFocus = returnFocusTo ?? document.activeElement;
     let closed = false;
+    let closing = false;
+    let releaseClaim = null;
+    let releaseDocumentLayer = null;
+    const releaseDocumentOwnership = () => {
+      if (releaseDocumentLayer === null) return;
+      const exactRelease = releaseDocumentLayer;
+      releaseExactModalDocumentLayer(
+        exactRelease,
+        'Community annotation modal'
+      );
+      if (releaseDocumentLayer === exactRelease) {
+        releaseDocumentLayer = null;
+      }
+    };
     const listFocusable = () => {
       const selectors = [
         'a[href]',
@@ -314,31 +426,107 @@ function downloadJsonAsFile(filename, json) {
       });
     };
 
-    const close = () => {
+    const close = ({ restoreFocus: shouldRestoreFocus = true } = {}) => {
       if (closed) return;
-      closed = true;
-      runExactCleanup('Community annotation modal teardown', [
-        ['modal keydown listener', () => overlay.removeEventListener('keydown', onKeyDown, true)],
-        ['modal overlay', () => overlay.remove()],
-        [
-          'previous focus target',
-          prevFocus === null
-            ? null
-            : () => {
-                if (typeof prevFocus.focus !== 'function') {
-                  throw new TypeError('Previous focus target must expose focus()');
-                }
-                prevFocus.focus();
+      if (closing) return;
+      if (typeof shouldRestoreFocus !== 'boolean') {
+        throw new TypeError(
+          'Community annotation modal focus restoration flag must be boolean'
+        );
+      }
+      closing = true;
+      const restorePreviousFocus = () => {
+        if (!shouldRestoreFocus) return;
+        const previousFocusAvailable =
+          prevFocus instanceof HTMLElement &&
+          prevFocus.isConnected &&
+          !(
+            prevFocus instanceof HTMLButtonElement &&
+            prevFocus.disabled
+          );
+        const target =
+          previousFocusAvailable
+            ? prevFocus
+            : returnFocusResolver?.() ?? null;
+        if (target === null) return;
+        if (
+          !(target instanceof HTMLElement) ||
+          !target.isConnected ||
+          typeof target.focus !== 'function'
+        ) {
+          throw new TypeError(
+            'Previous community annotation focus target must expose focus()'
+          );
+        }
+        target.focus();
+      };
+      try {
+        runExactCleanup('Community annotation modal teardown', [
+          ['modal keydown listener', () => overlay.removeEventListener('keydown', onKeyDown, true)],
+          [
+            'modal content',
+            () => {
+              const cleanup = content.__cellucidCleanup;
+              if (cleanup === undefined || cleanup === null) return;
+              if (typeof cleanup !== 'function') {
+                throw new TypeError(
+                  'Community annotation modal content cleanup must be a function'
+                );
               }
-        ]
+              cleanup();
+            }
+          ],
+          ['modal overlay', () => overlay.remove()],
+          ['modal document layer', releaseDocumentOwnership],
+          ['previous focus target', restorePreviousFocus]
+        ]);
+      } finally {
+        closing = false;
+      }
+      closed = true;
+      runExactCleanup('Community annotation modal close settlement', [
+        ['shared modal owner', () => {
+          if (
+            typeof releaseClaim !== 'function' ||
+            releaseClaim() !== true
+          ) {
+            throw new Error(
+              'Community annotation modal lost its exact owner before teardown'
+            );
+          }
+        }],
+        ['modal close owner', () => {
+          overlay[COMMUNITY_MODAL_LOCAL_CLOSE] = null;
+        }],
+        ['modal close settlement', onClosed]
       ]);
     };
+    const requestClose = () => close();
 
     const onKeyDown = (e) => {
       if (!e || typeof e.preventDefault !== 'function' || typeof e.stopPropagation !== 'function') {
         throw new TypeError('Community annotation modal key events require exact event methods');
       }
       if (e.key === 'Escape') {
+        const escapeOwner = e.target?.[COMMUNITY_MODAL_ESCAPE_OWNER] ?? null;
+        if (escapeOwner !== null) {
+          if (typeof escapeOwner !== 'function') {
+            throw new TypeError(
+              'Community annotation Escape owner must be a function or null'
+            );
+          }
+          const handled = escapeOwner();
+          if (typeof handled !== 'boolean') {
+            throw new TypeError(
+              'Community annotation Escape owner must return a boolean'
+            );
+          }
+          if (handled) {
+            e.preventDefault();
+            e.stopPropagation();
+            return;
+          }
+        }
         e.preventDefault();
         e.stopPropagation();
         close();
@@ -373,27 +561,109 @@ function downloadJsonAsFile(filename, json) {
       }
     };
 
-    closeBtn.addEventListener('click', close);
+    closeBtn.addEventListener('click', requestClose);
     overlay.addEventListener('click', (e) => {
-      if (e.target === overlay) close();
+      if (e.target === overlay) requestClose();
     });
     overlay.addEventListener('keydown', onKeyDown, true);
+    overlay[COMMUNITY_MODAL_LOCAL_CLOSE] = requestClose;
 
-    document.body.appendChild(overlay);
-    closeBtn.focus();
-
-    return { close, overlay, modal, content };
+    let ownerClaimed = false;
+    try {
+      releaseClaim = claimCommunityAnnotationModal(requestClose);
+      ownerClaimed = true;
+      releaseDocumentLayer = claimModalDocumentLayer(overlay);
+      document.body.appendChild(overlay);
+      closeBtn.focus();
+      return { close, overlay, modal, content };
+    } catch (primaryError) {
+      const errors = [primaryError];
+      try {
+        if (ownerClaimed) {
+          close({ restoreFocus: false });
+        } else {
+          runExactCleanup(
+            'Unclaimed community annotation modal rollback',
+            [
+              [
+                'modal keydown listener',
+                () => overlay.removeEventListener(
+                  'keydown',
+                  onKeyDown,
+                  true
+                )
+              ],
+              [
+                'modal content',
+                () => {
+                  const cleanup = content.__cellucidCleanup;
+                  if (cleanup === undefined || cleanup === null) return;
+                  if (typeof cleanup !== 'function') {
+                    throw new TypeError(
+                      'Community annotation modal content cleanup must be a function'
+                    );
+                  }
+                  cleanup();
+                }
+              ],
+              ['modal overlay', () => overlay.remove()],
+              [
+                'modal close owner',
+                () => {
+                  overlay[COMMUNITY_MODAL_LOCAL_CLOSE] = null;
+                }
+              ]
+            ]
+          );
+        }
+      } catch (rollbackError) {
+        errors.push(rollbackError);
+      }
+      if (errors.length === 1) throw primaryError;
+      throw new AggregateError(
+        errors,
+        'Community annotation modal creation and rollback failed'
+      );
+    }
   }
 
-function confirmAsync({ title, message, confirmText }) {
+function confirmAsync({ title, message, confirmText, signal = null }) {
+  if (
+    signal !== null &&
+    (
+      typeof signal !== 'object' ||
+      typeof signal.addEventListener !== 'function' ||
+      typeof signal.removeEventListener !== 'function' ||
+      typeof signal.aborted !== 'boolean'
+    )
+  ) {
+    throw new TypeError(
+      'Community annotation confirmation signal must be an AbortSignal or null'
+    );
+  }
+  if (signal?.aborted) return Promise.resolve(false);
   return new Promise((resolve) => {
-    showConfirmDialog({
+    let settled = false;
+    let cancelDialog = null;
+    const settle = value => {
+      if (settled) return;
+      settled = true;
+      signal?.removeEventListener('abort', onAbort);
+      resolve(value);
+    };
+    const onAbort = () => {
+      if (cancelDialog !== null) cancelDialog();
+      else settle(false);
+    };
+    cancelDialog = showConfirmDialog({
       title,
       message,
       confirmText,
-      onConfirm: () => resolve(true),
-      onCancel: () => resolve(false)
+      onConfirm: () => settle(true),
+      onCancel: () => settle(false)
     });
+    signal?.addEventListener('abort', onAbort, { once: true });
+    if (signal?.aborted) onAbort();
   });
 }
 
@@ -454,10 +724,25 @@ function isWorkerOriginSecurityError(err) {
   return code === 'GITHUB_WORKER_ORIGIN_INVALID' || code === 'GITHUB_WORKER_ORIGIN_UNTRUSTED';
 }
 
+function isWorkerCompatibilityFailure(err) {
+  return String(err?.code || '').trim() === 'GITHUB_WORKER_INCOMPATIBLE';
+}
+
 function isNetworkFetchFailure(err) {
   const msg = String(err?.message || '').trim();
   if (err instanceof TypeError) return true;
   return /failed to fetch|load failed|networkerror/i.test(msg);
+}
+
+function isTransientRoleResolutionFailure(err) {
+  const status = httpStatusOrNull(err);
+  return (
+    isNetworkFetchFailure(err) ||
+    err?.code === 'TIMEOUT' ||
+    status === 408 ||
+    isRateLimitError(err) ||
+    (status !== null && status >= 500)
+  );
 }
 
 function isRepoNotFoundOrNoAccess(err) {
@@ -564,6 +849,33 @@ export function initCommunityAnnotationControls({
     return activeSyncAbort;
   }
 
+  function bindActiveSyncOwnerSignal(controller, signal) {
+    if (
+      !controller ||
+      typeof controller.abort !== 'function' ||
+      !controller.signal
+    ) {
+      throw new TypeError(
+        'Active annotation sync signal binding requires an AbortController'
+      );
+    }
+    if (
+      !signal ||
+      typeof signal !== 'object' ||
+      typeof signal.addEventListener !== 'function' ||
+      typeof signal.removeEventListener !== 'function' ||
+      typeof signal.aborted !== 'boolean'
+    ) {
+      throw new TypeError(
+        'Active annotation sync owner must expose an AbortSignal'
+      );
+    }
+    const abort = () => controller.abort(signal.reason);
+    signal.addEventListener('abort', abort, { once: true });
+    if (signal.aborted) abort();
+    return () => signal.removeEventListener('abort', abort);
+  }
+
   function endActiveSyncAbortScope(controller) {
     if (activeSyncAbort !== controller) return;
     activeSyncAbort = null;
@@ -608,9 +920,28 @@ export function initCommunityAnnotationControls({
       throw err;
     }
   }
+
+  function normalizeActiveSyncError(error, controller) {
+    if (error?.operation?.outcome === 'unknown') return error;
+    if (!controller?.signal?.aborted) return error;
+    try {
+      throwIfActiveSyncAborted(controller);
+    } catch (abortError) {
+      return abortError;
+    }
+    return error;
+  }
+
   /** @type {Record<string, {minAnnotators:number, threshold:number}>} */
-  const annotatableSettingsDraft = {};
+  const annotatableSettingsDraft = Object.create(null);
   const annotatableSettingsDirty = new Set();
+
+  function clearAnnotatableSettingsDraft() {
+    for (const key of Object.keys(annotatableSettingsDraft)) {
+      delete annotatableSettingsDraft[key];
+    }
+    annotatableSettingsDirty.clear();
+  }
 
   const lifecycleAbort = new AbortController();
 
@@ -619,12 +950,49 @@ export function initCommunityAnnotationControls({
   if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') {
     throw new TypeError('Community annotation controls require window.addEventListener()');
   }
+  const reconcileContext = ({ retryRoleIfBusy = false } = {}) => {
+    try {
+      const owner = applySessionCacheContext({ retryRoleIfBusy });
+      render();
+      return owner;
+    } catch (error) {
+      syncError =
+        typeof error?.message === 'string' && error.message
+          ? error.message
+          : 'Unable to apply the community annotation context';
+      notifications.error(syncError, {
+        category: 'annotation',
+        duration: 10_000,
+      });
+      render();
+      return null;
+    }
+  };
+  const reconcileContextEvent = () => reconcileContext({});
+  const reconcileOnlineEvent = () => {
+    reconcileContext({ retryRoleIfBusy: true });
+  };
+  const reconcileOfflineEvent = () => {
+    stopAutoPullScheduler();
+    if (activeSyncAbort !== null) {
+      abortActiveSync('Network connection was lost.');
+    }
+    closeActiveGitHubConnectionModal();
+    render();
+  };
   window.addEventListener(
     ANNOTATION_CONNECTION_CHANGED_EVENT,
-    () => {
-      applySessionCacheContext({});
-      render();
-    },
+    reconcileContextEvent,
+    { signal: lifecycleAbort.signal }
+  );
+  window.addEventListener(
+    'online',
+    reconcileOnlineEvent,
+    { signal: lifecycleAbort.signal }
+  );
+  window.addEventListener(
+    'offline',
+    reconcileOfflineEvent,
     { signal: lifecycleAbort.signal }
   );
 
@@ -691,138 +1059,813 @@ export function initCommunityAnnotationControls({
 
   let lastRoleContext = '';
   let lastNotifiedCacheScope = '';
-  let resolvingConnectedRole = false;
-  let lastRoleResolveContext = '';
+  let contextGeneration = 0;
+  let authenticationGeneration = 0;
+  let publishedContextIdentity = null;
+  /** @type {AbortController|null} */
+  let publishedContextAbort = null;
+  let contextDestroyed = false;
+  let activeRoleResolutionOwner = null;
+  let pendingOnlineRoleRetryOwner = null;
+  let pendingSyncBusyRoleRetryOwner = null;
+  let activeCommunityModalClose = null;
+  let activeGitHubConnectionClose = null;
+  let identityEditButton = null;
+  /** @type {ReturnType<typeof setInterval>|null} */
+  let autoPullTimer = null;
+  let autoPullRuntime = null;
+  let lastAutoPullPreferenceError = null;
 
-  function notifyCacheScopeIfConnected({ datasetId, repoRef, userId } = {}) {
-    const desc = describeCacheScope({ datasetId, repoRef, userId });
-    if (!desc) return;
-    const scopeId = `${desc.datasetId}::${desc.repo}@${desc.branch}::${desc.userId}`;
-    if (scopeId === lastNotifiedCacheScope) return;
-    lastNotifiedCacheScope = scopeId;
-
-    const sessionKey = toSessionStorageKey({ datasetId, repoRef, userId });
-    if (sessionKey === null) {
-      throw new Error('Connected annotation cache scope has no session key');
+  function showOwnedCommunityModal(options) {
+    if (contextDestroyed) return null;
+    if (options?.onClosed !== undefined) {
+      throw new Error(
+        'Owned community annotation modals reserve their close settlement'
+      );
     }
-    if (typeof localStorage === 'undefined') {
-      throw new Error('localStorage is required for annotation cache status');
+    if (activeCommunityModalClose !== null) {
+      const closePrevious = activeCommunityModalClose;
+      closePrevious();
+      if (activeCommunityModalClose === closePrevious) {
+        throw new Error(
+          'Previous community annotation modal did not settle before replacement'
+        );
+      }
     }
-    const raw = localStorage.getItem(sessionKey);
-    const sessionStatus = raw === null ? 'empty' : 'found';
-    const shas = fileCache.getKnownShas({ datasetId, repoRef, userId });
-    const rawFileCount = Object.keys(shas).length;
-
-    const who = getGitHubLogin();
-    const whoLabel = who ? `@${who}` : 'local';
-    const message = [
-      'Annotation repo connected (local cache scope)',
-      `datasetId: ${desc.datasetId}`,
-      `repo: ${desc.repo}`,
-      `branch: ${desc.branch}`,
-      `user: ${whoLabel}`,
-      `local cache: session=${sessionStatus} • raw-files=` +
-        `${rawFileCount} path(s)`
-    ].join('\n');
-
-    notifications.success(message, { category: 'annotation', duration: 8000 });
+    let ownedClose = null;
+    let settled = false;
+    const modalRef = showClusterModal({
+      ...options,
+      onClosed: () => {
+        settled = true;
+        if (activeCommunityModalClose === ownedClose) {
+          activeCommunityModalClose = null;
+        }
+      }
+    });
+    ownedClose = modalRef.close;
+    if (settled) return null;
+    activeCommunityModalClose = ownedClose;
+    if (contextDestroyed) {
+      closeOwnedCommunityModal();
+      return null;
+    }
+    return modalRef;
   }
 
-  function applySessionCacheContext({ datasetId = undefined } = {}) {
-    const ctx = syncCommunityAnnotationCacheContext({ dataSourceManager, datasetId });
-    notifyCacheScopeIfConnected({ datasetId: ctx.datasetId, repoRef: ctx.repoRef, userId: ctx.userId });
+  function closeOwnedCommunityModal() {
+    const close = activeCommunityModalClose;
+    if (close === null) return;
+    if (typeof close !== 'function') {
+      throw new TypeError(
+        'Owned community annotation modal close handle must be a function'
+      );
+    }
+    close({ restoreFocus: false });
+  }
 
-    // Prevent stale role/perms from a different repo/user context.
-    const nextRoleContext = `${ctx.userKey}::${ctx.repoRef ?? ''}`;
+  function closeActiveGitHubConnectionModal() {
+    const close = activeGitHubConnectionClose;
+    if (close === null) return false;
+    if (typeof close !== 'function') {
+      throw new TypeError(
+        'GitHub connection modal close handle must be a function or null'
+      );
+    }
+    close({ restoreFocus: false });
+    if (activeGitHubConnectionClose === close) {
+      activeGitHubConnectionClose = null;
+    }
+    return true;
+  }
+
+  function resolveIdentityModalFocus() {
+    if (contextDestroyed) return null;
+    if (
+      identityEditButton instanceof HTMLButtonElement &&
+      identityEditButton.isConnected &&
+      !identityEditButton.disabled
+    ) {
+      return identityEditButton;
+    }
+    const details = container.closest('details');
+    if (!(details instanceof HTMLDetailsElement)) return null;
+    const summary = [...details.children].find(
+      child => child.tagName === 'SUMMARY'
+    );
+    return summary instanceof HTMLElement && summary.isConnected
+      ? summary
+      : null;
+  }
+  /** @type {{owner:object, attempt:number, timer:ReturnType<typeof setTimeout>|null}|null} */
+  let roleRetryState = null;
+  let suppressActiveSyncContextAbort = false;
+  const roleRetryDelaysMs = Object.freeze([500, 1000, 2000, 4000, 8000]);
+  const maxRetryAfterMs = 30_000;
+
+  function contextIdentity(ctx) {
+    return JSON.stringify([
+      authenticationGeneration,
+      ctx.datasetId,
+      ctx.repoRef,
+      ctx.userKey,
+      ctx.userId,
+      ctx.simulated,
+    ]);
+  }
+
+  function publishContextOwner(ctx) {
+    const identity = contextIdentity(ctx);
+    if (identity !== publishedContextIdentity) {
+      const hadPublishedContext = publishedContextIdentity !== null;
+      if (publishedContextAbort !== null) {
+        publishedContextAbort.abort();
+      }
+      if (typeof AbortController !== 'function') {
+        throw new TypeError(
+          'Community annotation context ownership requires AbortController'
+        );
+      }
+      publishedContextAbort = new AbortController();
+      publishedContextIdentity = identity;
+      contextGeneration += 1;
+      cancelScheduledRoleRetry();
+      pendingOnlineRoleRetryOwner = null;
+      pendingSyncBusyRoleRetryOwner = null;
+      clearAnnotatableSettingsDraft();
+      stopAutoPullScheduler();
+      if (hadPublishedContext) {
+        closeOwnedCommunityModal();
+      }
+      if (
+        hadPublishedContext &&
+        activeSyncAbort !== null &&
+        !suppressActiveSyncContextAbort
+      ) {
+        abortActiveSync(
+          'Annotation dataset, repository, or authenticated user changed.'
+        );
+      }
+    }
+    return Object.freeze({
+      generation: contextGeneration,
+      identity,
+      datasetId: ctx.datasetId,
+      repoRef: ctx.repoRef,
+      userKey: ctx.userKey,
+      userId: ctx.userId,
+      simulated: ctx.simulated,
+      signal: publishedContextAbort.signal,
+    });
+  }
+
+  function commitExpectedActiveSyncRepoTransition(callback) {
+    if (typeof callback !== 'function') {
+      throw new TypeError(
+        'Expected annotation repository transition requires a callback'
+      );
+    }
+    if (suppressActiveSyncContextAbort) {
+      throw new Error(
+        'Expected annotation repository transitions must not be nested'
+      );
+    }
+    suppressActiveSyncContextAbort = true;
+    try {
+      return callback();
+    } finally {
+      suppressActiveSyncContextAbort = false;
+    }
+  }
+
+  function isContextOwnerCurrent(owner) {
+    if (
+      contextDestroyed ||
+      !owner ||
+      typeof owner !== 'object' ||
+      owner.generation !== contextGeneration ||
+      owner.identity !== publishedContextIdentity ||
+      owner.signal !== publishedContextAbort?.signal ||
+      owner.signal.aborted
+    ) {
+      return false;
+    }
+    let current;
+    try {
+      current = getCacheContext({});
+    } catch {
+      return false;
+    }
+    return contextIdentity(current) === owner.identity;
+  }
+
+  function isSameContextOwner(left, right) {
+    return Boolean(
+      left &&
+      right &&
+      left.generation === right.generation &&
+      left.identity === right.identity &&
+      left.signal === right.signal
+    );
+  }
+
+  function stopAutoPullScheduler() {
+    if (autoPullTimer !== null) {
+      clearInterval(autoPullTimer);
+      autoPullTimer = null;
+    }
+    autoPullRuntime = null;
+  }
+
+  function readAutoPullPreferences() {
+    if (typeof localStorage === 'undefined') {
+      throw new Error('Auto-pull preferences require localStorage');
+    }
+    return parseAutoPullPreferences(
+      localStorage.getItem(AUTO_PULL_STORAGE_KEY)
+    );
+  }
+
+  function currentAutoPullRuntime() {
+    if (
+      contextDestroyed ||
+      navigator.onLine === false ||
+      !githubAuth.isAuthenticated?.()
+    ) {
+      return null;
+    }
+    const ctx = getCacheContext({});
+    if (
+      !ctx.datasetId ||
+      !ctx.repoRef ||
+      !Number.isSafeInteger(ctx.userId) ||
+      ctx.userId < 1 ||
+      ctx.userKey !== `ghid_${ctx.userId}` ||
+      ctx.simulated
+    ) {
+      return null;
+    }
+    const scopeKey = toCacheScopeKey({
+      datasetId: ctx.datasetId,
+      repoRef: ctx.repoRef,
+      userId: ctx.userId,
+    });
+    if (scopeKey === null) return null;
+    const preference = readAutoPullPreferences()[scopeKey];
+    if (preference === undefined || preference.enabled !== true) return null;
+    const owner = publishContextOwner(ctx);
+    return Object.freeze({
+      scopeKey,
+      intervalMs: assertAutoPullIntervalMs(preference.intervalMs),
+      owner,
+      repoRef: ctx.repoRef,
+    });
+  }
+
+  async function tickAutoPull(runtime) {
+    if (
+      autoPullRuntime !== runtime ||
+      syncBusy ||
+      navigator.onLine === false ||
+      !isContextOwnerCurrent(runtime.owner)
+    ) {
+      return;
+    }
+    await pullFromGitHub({
+      repoOverride: runtime.repoRef,
+      quiet: true,
+      signal: runtime.owner.signal,
+    });
+  }
+
+  function refreshAutoPullScheduler() {
+    let runtime;
+    try {
+      runtime = currentAutoPullRuntime();
+      lastAutoPullPreferenceError = null;
+    } catch (error) {
+      stopAutoPullScheduler();
+      const message =
+        typeof error?.message === 'string' && error.message
+          ? error.message
+          : 'Unable to load automatic annotation pull preferences';
+      if (message !== lastAutoPullPreferenceError) {
+        lastAutoPullPreferenceError = message;
+        notifications.error(message, {
+          category: 'annotation',
+          duration: 10_000,
+        });
+      }
+      return false;
+    }
+    if (runtime === null) {
+      stopAutoPullScheduler();
+      return false;
+    }
+    if (
+      autoPullTimer !== null &&
+      autoPullRuntime !== null &&
+      autoPullRuntime.scopeKey === runtime.scopeKey &&
+      autoPullRuntime.intervalMs === runtime.intervalMs &&
+      isSameContextOwner(autoPullRuntime.owner, runtime.owner)
+    ) {
+      return true;
+    }
+    const previousTimer = autoPullTimer;
+    const previousRuntime = autoPullRuntime;
+    let replacementTimer = null;
+    try {
+      replacementTimer = setInterval(() => {
+        const task = tickAutoPull(runtime);
+        observeBackgroundTask(task, {
+          label: 'Automatic annotation pull failed',
+          owner: runtime.owner,
+        });
+      }, runtime.intervalMs);
+    } catch (error) {
+      autoPullTimer = previousTimer;
+      autoPullRuntime = previousRuntime;
+      throw error;
+    }
+    if (previousTimer !== null) clearInterval(previousTimer);
+    autoPullTimer = replacementTimer;
+    autoPullRuntime = runtime;
+    return true;
+  }
+
+  function reportBackgroundTaskFailure(label, error, owner = null) {
+    try {
+      if (
+        contextDestroyed ||
+        (owner !== null && !isContextOwnerCurrent(owner))
+      ) {
+        return;
+      }
+      const detail =
+        typeof error?.message === 'string' && error.message
+          ? error.message
+          : 'unknown failure';
+      syncError = `${label}: ${detail}`;
+      notifications.error(syncError, {
+        category: 'annotation',
+        duration: 10_000,
+      });
+      render();
+    } catch (reportError) {
+      try {
+        console.error(
+          'Unable to report a community annotation background failure',
+          reportError,
+          error
+        );
+      } catch (consoleError) {
+        const terminalError = new AggregateError(
+          [reportError, consoleError, error],
+          'Community annotation background failure reporting failed'
+        );
+        syncError = terminalError.message;
+        if (typeof globalThis.reportError === 'function') {
+          globalThis.reportError(terminalError);
+        }
+      }
+    }
+  }
+
+  function observeBackgroundTask(task, { label, owner = null } = {}) {
+    if (
+      typeof label !== 'string' ||
+      !label ||
+      label !== label.trim()
+    ) {
+      throw new TypeError(
+        'Community annotation background task labels must be exact strings'
+      );
+    }
+    try {
+      void Promise.resolve(task).catch((error) => {
+        reportBackgroundTaskFailure(label, error, owner);
+      });
+    } catch (error) {
+      reportBackgroundTaskFailure(label, error, owner);
+    }
+  }
+
+  function startBackgroundTask(taskFactory, options) {
+    try {
+      observeBackgroundTask(taskFactory(), options);
+    } catch (error) {
+      reportBackgroundTaskFailure(
+        options?.label || 'Community annotation background task failed',
+        error,
+        options?.owner ?? null,
+      );
+    }
+  }
+
+  function cancelScheduledRoleRetry(owner = null) {
+    if (
+      roleRetryState === null ||
+      (
+        owner !== null &&
+        !isSameContextOwner(roleRetryState.owner, owner)
+      )
+    ) {
+      return false;
+    }
+    if (roleRetryState.timer !== null) {
+      clearTimeout(roleRetryState.timer);
+    }
+    roleRetryState = null;
+    return true;
+  }
+
+  function roleRetryDelayMs(error, attempt) {
+    const defaultDelayMs =
+      roleRetryDelaysMs[
+        Math.min(attempt, roleRetryDelaysMs.length - 1)
+      ];
+    let retryAfterMs = null;
+    const rawRetryAfter = error?.retryAfter;
+    if (
+      typeof rawRetryAfter === 'string' &&
+      rawRetryAfter &&
+      rawRetryAfter === rawRetryAfter.trim()
+    ) {
+      if (/^(?:0|[1-9][0-9]*)$/.test(rawRetryAfter)) {
+        const seconds = Number(rawRetryAfter);
+        if (Number.isSafeInteger(seconds)) {
+          retryAfterMs = seconds * 1000;
+        }
+      } else {
+        const timestamp = Date.parse(rawRetryAfter);
+        if (Number.isFinite(timestamp)) {
+          retryAfterMs = Math.max(0, timestamp - Date.now());
+        }
+      }
+    } else if (
+      Number.isSafeInteger(error?.rateLimitResetEpochSeconds) &&
+      error.rateLimitResetEpochSeconds >= 0
+    ) {
+      retryAfterMs = Math.max(
+        0,
+        error.rateLimitResetEpochSeconds * 1000 - Date.now(),
+      );
+    }
+    if (!Number.isFinite(retryAfterMs)) return defaultDelayMs;
+    return Math.min(maxRetryAfterMs, retryAfterMs);
+  }
+
+  function scheduleTransientRoleRetry(owner, error) {
+    if (!isContextOwnerCurrent(owner)) {
+      cancelScheduledRoleRetry(owner);
+      return { scheduled: false, exhausted: false, delayMs: null };
+    }
+    const existing =
+      roleRetryState !== null &&
+      isSameContextOwner(roleRetryState.owner, owner)
+        ? roleRetryState
+        : null;
+    if (roleRetryState !== null && existing === null) {
+      cancelScheduledRoleRetry();
+    }
+    const attempt = existing === null ? 0 : existing.attempt + 1;
+    if (attempt >= roleRetryDelaysMs.length) {
+      cancelScheduledRoleRetry(owner);
+      return { scheduled: false, exhausted: true, delayMs: null };
+    }
+    if (existing?.timer !== null && existing?.timer !== undefined) {
+      clearTimeout(existing.timer);
+    }
+    const delayMs = roleRetryDelayMs(error, attempt);
+    const scheduled = {
+      owner,
+      attempt,
+      timer: null,
+    };
+    scheduled.timer = setTimeout(() => {
+      if (roleRetryState !== scheduled) return;
+      scheduled.timer = null;
+      if (!isContextOwnerCurrent(owner)) {
+        roleRetryState = null;
+        return;
+      }
+      scheduleResolveConnectedRole(owner);
+    }, delayMs);
+    roleRetryState = scheduled;
+    return {
+      scheduled: true,
+      exhausted: false,
+      delayMs,
+      attempt: attempt + 1,
+    };
+  }
+
+  function retryConnectedRoleImmediately(owner) {
+    if (!isContextOwnerCurrent(owner)) return false;
+    cancelScheduledRoleRetry(owner);
+    if (
+      activeRoleResolutionOwner !== null &&
+      isSameContextOwner(activeRoleResolutionOwner, owner)
+    ) {
+      pendingOnlineRoleRetryOwner = owner;
+      return true;
+    }
+    scheduleResolveConnectedRole(owner, { retryIfBusy: true });
+    return true;
+  }
+
+  function queueRoleRetryAfterActiveSync(owner) {
+    if (!isContextOwnerCurrent(owner)) return false;
+    pendingSyncBusyRoleRetryOwner = owner;
+    return true;
+  }
+
+  function flushRoleRetryAfterActiveSync() {
+    if (syncBusy || pendingSyncBusyRoleRetryOwner === null) return false;
+    const owner = pendingSyncBusyRoleRetryOwner;
+    pendingSyncBusyRoleRetryOwner = null;
+    if (!isContextOwnerCurrent(owner)) {
+      cancelScheduledRoleRetry(owner);
+      return false;
+    }
+    if (access.getRole() !== 'unknown') {
+      cancelScheduledRoleRetry(owner);
+      return false;
+    }
+    scheduleResolveConnectedRole(owner);
+    return true;
+  }
+
+  function adoptAuthenticatedIdentity(ctx) {
+    if (ctx.userKey === 'local') return;
+    const user = githubAuth.getUser();
+    if (
+      user === null ||
+      user.id !== ctx.userId ||
+      `ghid_${user.id}` !== ctx.userKey
+    ) {
+      throw new Error(
+        'Authenticated GitHub identity changed while applying annotation context'
+      );
+    }
+    const login = assertExactGitHubLogin(
+      user.login,
+      'Authenticated GitHub login'
+    );
+    const current = session.getProfile();
+    const sameGitHubIdentity =
+      current?.githubUserId === user.id;
+    session.setProfile({
+      username: ctx.userKey,
+      login,
+      githubUserId: user.id,
+      displayName: sameGitHubIdentity ? current.displayName : '',
+      title: sameGitHubIdentity ? current.title : '',
+      orcid: sameGitHubIdentity ? current.orcid : '',
+      linkedin: sameGitHubIdentity ? current.linkedin : '',
+    });
+  }
+
+  async function prepareConnectedContext(
+    owner,
+    {
+      resolveRole = true,
+      retryRoleIfBusy = false,
+    } = {},
+  ) {
+    if (
+      typeof resolveRole !== 'boolean' ||
+      typeof retryRoleIfBusy !== 'boolean'
+    ) {
+      throw new TypeError(
+        'Connected annotation context options must be boolean'
+      );
+    }
+    if (!owner.repoRef || owner.simulated) return false;
+    try {
+      await fileCache.init();
+      if (!isContextOwnerCurrent(owner)) return false;
+
+      const desc = describeCacheScope({
+        datasetId: owner.datasetId,
+        repoRef: owner.repoRef,
+        userId: owner.userId,
+      });
+      if (!desc) {
+        throw new Error('Connected annotation cache scope is incomplete');
+      }
+      const sessionKey = toSessionStorageKey({
+        datasetId: owner.datasetId,
+        repoRef: owner.repoRef,
+        userId: owner.userId,
+      });
+      if (sessionKey === null) {
+        throw new Error('Connected annotation cache scope has no session key');
+      }
+      if (typeof localStorage === 'undefined') {
+        throw new Error('localStorage is required for annotation cache status');
+      }
+      const raw = localStorage.getItem(sessionKey);
+      const sessionStatus = raw === null ? 'empty' : 'found';
+      const shas = fileCache.getKnownShas({
+        datasetId: owner.datasetId,
+        repoRef: owner.repoRef,
+        userId: owner.userId,
+      });
+      if (!isContextOwnerCurrent(owner)) return false;
+
+      const notificationScope =
+        `${owner.generation}:${owner.identity}`;
+      if (notificationScope !== lastNotifiedCacheScope) {
+        lastNotifiedCacheScope = notificationScope;
+        const rawFileCount = Object.keys(shas).length;
+        const who = getGitHubLogin();
+        const whoLabel = who ? `@${who}` : 'local';
+        const message = [
+          'Annotation repo connected (local cache scope)',
+          `datasetId: ${desc.datasetId}`,
+          `repo: ${desc.repo}`,
+          `branch: ${desc.branch}`,
+          `user: ${whoLabel}`,
+          `local cache: session=${sessionStatus} • raw-files=` +
+            `${rawFileCount} path(s)`
+        ].join('\n');
+        notifications.success(message, {
+          category: 'annotation',
+          duration: 8000,
+        });
+      }
+    } catch (error) {
+      if (!isContextOwnerCurrent(owner)) return false;
+      const message =
+        typeof error?.message === 'string' && error.message
+          ? error.message
+          : 'Community annotation raw-file cache initialization failed';
+      disconnectAnnotationRepo({
+        datasetId: owner.datasetId,
+        userKey: owner.userKey,
+        message:
+          `${message}\nDisconnected annotation repo to protect the local cache scope.`,
+        notify: 'error',
+        preserveSession: true,
+      });
+      return false;
+    }
+
+    if (!isContextOwnerCurrent(owner)) return false;
+    if (resolveRole) {
+      scheduleResolveConnectedRole(owner, { retryIfBusy: retryRoleIfBusy });
+    }
+    return true;
+  }
+
+  function applySessionCacheContext({
+    datasetId = undefined,
+    resolveRole = true,
+    retryRoleIfBusy = false,
+  } = {}) {
+    if (
+      typeof resolveRole !== 'boolean' ||
+      typeof retryRoleIfBusy !== 'boolean'
+    ) {
+      throw new TypeError(
+        'Annotation cache context options must be boolean'
+      );
+    }
+    const ctx = syncCommunityAnnotationCacheContext({
+      dataSourceManager,
+      datasetId,
+    });
+    adoptAuthenticatedIdentity(ctx);
+    const owner = publishContextOwner(ctx);
+
+    // Prevent stale role/perms from a different dataset/repo/user context.
+    const nextRoleContext =
+      `${ctx.datasetId ?? ''}::${ctx.userKey}::${ctx.repoRef ?? ''}`;
     if (nextRoleContext !== lastRoleContext) {
       lastRoleContext = nextRoleContext;
-      lastRoleResolveContext = '';
       lastRepoInfo = null;
       access.clearRole?.();
     }
 
-    // Role must be known (author/annotator) while connected.
-    // If we just changed cache context to a connected repo and the role is unknown,
-    // attempt to resolve permissions from GitHub immediately; on failure, disconnect.
     if (ctx.repoRef && !ctx.simulated) {
-      scheduleResolveConnectedRole({ datasetId: ctx.datasetId });
+      observeBackgroundTask(
+        prepareConnectedContext(owner, {
+          resolveRole,
+          retryRoleIfBusy,
+        }),
+        {
+          label: 'Unable to prepare the connected annotation context',
+          owner,
+        },
+      );
     }
+    refreshAutoPullScheduler();
+    return owner;
   }
 
-  function scheduleResolveConnectedRole({ datasetId = undefined } = {}) {
-    if (resolvingConnectedRole) return;
-    const did =
-      datasetId === undefined
-        ? dataSourceManager?.getCurrentDatasetId?.()
-        : datasetId;
-    if (!did) return;
+  function scheduleResolveConnectedRole(
+    owner,
+    { retryIfBusy = false } = {},
+  ) {
+    if (typeof retryIfBusy !== 'boolean') {
+      throw new TypeError(
+        'Annotation role retry ownership must be boolean'
+      );
+    }
+    if (!isContextOwnerCurrent(owner)) return;
+    if (!owner.datasetId || !owner.repoRef) return;
     if (!githubAuth.isAuthenticated?.()) return;
-    const userKey = getCacheUserKey();
-    const repoRef = getAnnotationRepoForDataset(did, userKey);
-    if (!repoRef) return;
-    if (!isAnnotationRepoConnected(did, userKey)) return;
-    const role = access.getRole();
-    if (role !== 'unknown') return;
-    const ctx = `${userKey}::${repoRef}`;
-    if (ctx === lastRoleResolveContext) return;
-    lastRoleResolveContext = ctx;
+    if (!isAnnotationRepoConnected(owner.datasetId, owner.userKey)) return;
+    if (retryIfBusy) cancelScheduledRoleRetry(owner);
+    if (access.getRole() !== 'unknown') {
+      cancelScheduledRoleRetry(owner);
+      return;
+    }
+    if (
+      !retryIfBusy &&
+      roleRetryState !== null &&
+      isSameContextOwner(roleRetryState.owner, owner) &&
+      roleRetryState.timer !== null
+    ) {
+      return;
+    }
+    if (
+      activeRoleResolutionOwner !== null &&
+      isSameContextOwner(activeRoleResolutionOwner, owner)
+    ) {
+      if (retryIfBusy) {
+        pendingOnlineRoleRetryOwner = owner;
+      }
+      return;
+    }
     if (typeof queueMicrotask !== 'function') {
       throw new Error('queueMicrotask is required for annotation role resolution');
     }
-    // Defer so we don't re-enter applySessionCacheContext via sync events.
+    activeRoleResolutionOwner = owner;
+    // Defer so repository-map events cannot re-enter their own dispatch.
     queueMicrotask(() => {
-      void resolveConnectedRoleOrDisconnect({ datasetId: did });
+      observeBackgroundTask(
+        resolveConnectedRoleOrDisconnect(owner),
+        {
+          label: 'Unable to settle the connected annotation role',
+          owner,
+        },
+      );
     });
   }
 
-  async function resolveConnectedRoleOrDisconnect({ datasetId = undefined } = {}) {
-    if (resolvingConnectedRole) return false;
-    if (syncBusy) return false;
-    const did =
-      datasetId === undefined
-        ? dataSourceManager?.getCurrentDatasetId?.()
-        : datasetId;
-    if (!did) return false;
-    if (!githubAuth.isAuthenticated?.()) return false;
-    if (isSimulateRepoConnectedEnabled()) return false;
-
-    resolvingConnectedRole = true;
+  async function resolveConnectedRoleOrDisconnect(owner) {
+    const did = owner?.datasetId ?? null;
+    const userId = owner?.userId ?? null;
+    const userKey = owner?.userKey ?? 'local';
+    const repo = owner?.repoRef ?? null;
     try {
-      const userId = getCacheUserId();
-      if (!userId) {
-        disconnectGitHubAndAnnotationRepo({
-          datasetId: did,
-          message: 'GitHub identity unavailable (missing numeric id). Signed out and disconnected. Please sign in again.',
-          notify: 'error'
-        });
+      if (!isContextOwnerCurrent(owner)) return false;
+      if (syncBusy) {
+        queueRoleRetryAfterActiveSync(owner);
         return false;
       }
+      if (
+        !did ||
+        !repo ||
+        !userId ||
+        userKey === 'local' ||
+        owner.simulated
+      ) {
+        return false;
+      }
+      if (
+        getAnnotationRepoForDataset(did, userKey) !== repo ||
+        !isAnnotationRepoConnected(did, userKey)
+      ) {
+        return false;
+      }
+      if (access.getRole() !== 'unknown') return true;
 
-      const userKey = getCacheUserKey();
-      const repo = getAnnotationRepoForDataset(did, userKey);
-      if (!repo) return false;
-      if (!isAnnotationRepoConnected(did, userKey)) return false;
-
-      // If another action already resolved the role, stop.
-      const roleNow = access.getRole();
-      if (roleNow !== 'unknown') return true;
-
+      await githubAuth.ensureWorkerCompatible({ signal: owner.signal });
+      if (!isContextOwnerCurrent(owner)) return false;
       const sync = getGitHubSyncForDataset({ datasetId: did, username: userKey });
       if (!sync) throw new Error('Unable to create GitHub sync session.');
 
       const meta = getAnnotationRepoMetaForDataset(did, userKey);
       const branchMode = requireAnnotationBranchMode(meta);
 
-      const { repoInfo } = await sync.validateAndLoadConfig({ datasetId: did });
-      lastRepoInfo = repoInfo;
-      access.setRoleFromRepoInfo(lastRepoInfo);
+      const { repoInfo } = await sync.validateAndLoadConfig({
+        datasetId: did,
+        signal: owner.signal,
+      });
+      if (!isContextOwnerCurrent(owner)) return false;
+      if (getAnnotationRepoForDataset(did, userKey) !== repo) return false;
 
-      const finalRole = access.getRole();
       const parsed = parseOwnerRepo(repo);
       if (!parsed) {
         throw new Error('Stored annotation repository reference is invalid');
       }
       const repoLabel = parsed.ownerRepo;
+      lastRepoInfo = repoInfo;
+      access.setRoleFromRepoInfo(repoInfo);
+      const finalRole = access.getRole();
       if (finalRole === 'unknown') {
         disconnectAnnotationRepo({
           datasetId: did,
@@ -835,21 +1878,13 @@ export function initCommunityAnnotationControls({
         return false;
       }
 
-      if (!getPublishCapability(repoInfo).canPublish) {
-        disconnectAnnotationRepo({
-          datasetId: did,
-          userKey,
-          message: `${describeCannotPublishMessage(repoLabel)}\nDisconnected annotation repo.`,
-          notify: 'error'
-        });
-        return false;
-      }
-
       // Keep repoRef canonicalized to the resolved branch so cache keys remain stable.
       const branch = requireResolvedAnnotationBranch(sync);
       const canonicalRepoRef = `${repoLabel}@${branch}`;
-      if (canonicalRepoRef && canonicalRepoRef !== repo) {
-        lastRoleContext = `${userKey}::${canonicalRepoRef}`;
+      if (!isContextOwnerCurrent(owner)) return false;
+      if (canonicalRepoRef !== repo) {
+        lastRoleContext =
+          `${did}::${userKey}::${canonicalRepoRef}`;
         setAnnotationRepoForDataset(
           did,
           canonicalRepoRef,
@@ -857,11 +1892,23 @@ export function initCommunityAnnotationControls({
           { branchMode }
         );
         setUrlAnnotationRepo(canonicalRepoRef);
+      } else {
+        session.setCacheContext({
+          datasetId: did,
+          repoRef: canonicalRepoRef,
+          userId,
+        });
       }
-      session.setCacheContext({ datasetId: did, repoRef: canonicalRepoRef, userId });
 
+      cancelScheduledRoleRetry(owner);
+      if (
+        isSameContextOwner(pendingSyncBusyRoleRetryOwner, owner)
+      ) {
+        pendingSyncBusyRoleRetryOwner = null;
+      }
       return true;
     } catch (err) {
+      if (!isContextOwnerCurrent(owner)) return false;
       const msg =
         err instanceof Error &&
         typeof err.message === 'string' &&
@@ -869,25 +1916,81 @@ export function initCommunityAnnotationControls({
         !/^\s|\s$/.test(err.message)
           ? err.message
           : 'Annotation role resolution failed with a non-Error value';
-      const didSafe =
-        datasetId === undefined
-          ? dataSourceManager?.getCurrentDatasetId?.()
-          : datasetId;
-      const userKey = getCacheUserKey();
-      const repo = didSafe
-        ? getAnnotationRepoForDataset(didSafe, userKey)
-        : null;
-      const parsedRepo = repo === null ? null : parseOwnerRepo(repo);
-      const repoLabel = parsedRepo === null ? 'the annotation repository' : parsedRepo.ownerRepo;
+      const parsedRepo = parseOwnerRepo(repo);
+      const repoLabel =
+        parsedRepo === null
+          ? 'the annotation repository'
+          : parsedRepo.ownerRepo;
+      if (isWorkerCompatibilityFailure(err)) {
+        cancelScheduledRoleRetry(owner);
+        access.clearRole();
+        syncError =
+          `${msg}\nThe repository connection was preserved. ` +
+          'Deploy the matching Cellucid Worker, then retry GitHub sync.';
+        notifications.error(syncError, {
+          category: 'annotation',
+          duration: 10_000,
+        });
+        render();
+        return false;
+      }
+      if (isTransientRoleResolutionFailure(err)) {
+        access.clearRole();
+        const retry = scheduleTransientRoleRetry(owner, err);
+        const retryDescription = retry.scheduled
+          ? `Cellucid will retry in ${Math.max(
+            0,
+            Math.ceil(retry.delayMs / 1000)
+          )}s (attempt ${retry.attempt}/${roleRetryDelaysMs.length}).`
+          : (
+            retry.exhausted
+              ? 'Automatic retries are exhausted; reconnect or come online to retry immediately.'
+              : 'Cellucid will retry when this context becomes available.'
+          );
+        syncError =
+          `Unable to verify your role for ${repoLabel} while GitHub is ` +
+          `unreachable.\n${msg}\nThe repository connection was preserved; ` +
+          retryDescription;
+        notifications.warning(syncError, {
+          category: 'annotation',
+          duration: 10_000,
+        });
+        render();
+        return false;
+      }
+      cancelScheduledRoleRetry(owner);
+      if (
+        isSameContextOwner(pendingSyncBusyRoleRetryOwner, owner)
+      ) {
+        pendingSyncBusyRoleRetryOwner = null;
+      }
       disconnectAnnotationRepo({
-        datasetId: didSafe,
+        datasetId: did,
         userKey,
         message: `Unable to determine your role for ${repoLabel}.\n${msg}\nDisconnected annotation repo.`,
         notify: 'error'
       });
       return false;
     } finally {
-      resolvingConnectedRole = false;
+      const retryAfterSettlement =
+        isSameContextOwner(pendingOnlineRoleRetryOwner, owner);
+      if (retryAfterSettlement) {
+        pendingOnlineRoleRetryOwner = null;
+      }
+      if (
+        activeRoleResolutionOwner !== null &&
+        isSameContextOwner(activeRoleResolutionOwner, owner)
+      ) {
+        activeRoleResolutionOwner = null;
+      }
+      if (
+        retryAfterSettlement &&
+        isContextOwnerCurrent(owner) &&
+        access.getRole() === 'unknown'
+      ) {
+        if (syncBusy) queueRoleRetryAfterActiveSync(owner);
+        else retryConnectedRoleImmediately(owner);
+      }
     }
   }
 
@@ -993,89 +2096,95 @@ export function initCommunityAnnotationControls({
     return true;
   }
 
-  async function loadMyProfileFromGitHub({ datasetId } = {}) {
-    const did =
-      datasetId === undefined
-        ? dataSourceManager?.getCurrentDatasetId?.()
-        : datasetId;
-    const userId = getCacheUserId();
-    const key = toGitHubUserKey(githubAuth.getUser());
-    if (key === null) return false;
-    const cacheUser = key;
-    const repo = getAnnotationRepoForDataset(did, cacheUser);
-    if (!repo) return false;
-    if (!githubAuth.isAuthenticated?.()) return false;
-    if (!key || !userId) return false;
+  async function loadMyProfileFromGitHub(owner) {
+    if (!isContextOwnerCurrent(owner)) return false;
+    const did = owner.datasetId;
+    const userId = owner.userId;
+    const cacheUser = owner.userKey;
+    const repo = owner.repoRef;
+    if (
+      !did ||
+      !userId ||
+      cacheUser === 'local' ||
+      !repo ||
+      !githubAuth.isAuthenticated?.()
+    ) {
+      return false;
+    }
+    let currentOwner = owner;
     try {
-	      const sync = getGitHubSyncForDataset({ datasetId: did, username: cacheUser });
-	      if (!sync) return false;
-	      const meta = getAnnotationRepoMetaForDataset(did, cacheUser);
-		      const branchMode = requireAnnotationBranchMode(meta);
-	      const { repoInfo, datasetConfig, config, datasetId: didResolved } = await sync.validateAndLoadConfig({ datasetId: did });
-	      const parsed = parseOwnerRepo(repo);
-		      lastRepoInfo = repoInfo;
-		      access.setRoleFromRepoInfo(lastRepoInfo);
-		      if (access.getRole() === 'unknown') {
-		        if (!parsed) {
-		          throw new Error('Stored annotation repository reference is invalid');
-		        }
-		        const repoLabel = parsed.ownerRepo;
-	        disconnectAnnotationRepo({
-	          datasetId: did,
-	          userKey: cacheUser,
+      await githubAuth.ensureWorkerCompatible({
+        signal: currentOwner.signal,
+      });
+      if (!isContextOwnerCurrent(currentOwner)) return false;
+      const sync = getGitHubSyncForDataset({
+        datasetId: did,
+        username: cacheUser,
+      });
+      if (!sync) return false;
+      const meta = getAnnotationRepoMetaForDataset(did, cacheUser);
+      const branchMode = requireAnnotationBranchMode(meta);
+      const {
+        repoInfo,
+        datasetConfig,
+        config,
+        datasetId: didResolved,
+      } = await sync.validateAndLoadConfig({
+        datasetId: did,
+        signal: currentOwner.signal,
+      });
+      if (!isContextOwnerCurrent(currentOwner)) return false;
+      if (getAnnotationRepoForDataset(did, cacheUser) !== repo) return false;
+
+      const parsed = parseOwnerRepo(repo);
+      lastRepoInfo = repoInfo;
+      access.setRoleFromRepoInfo(repoInfo);
+      if (access.getRole() === 'unknown') {
+        if (!parsed) {
+          throw new Error('Stored annotation repository reference is invalid');
+        }
+        const repoLabel = parsed.ownerRepo;
+        disconnectAnnotationRepo({
+          datasetId: did,
+          userKey: cacheUser,
           message:
             `Cannot determine your role for ${repoLabel}.\n` +
             'GitHub did not return repository permissions for your account. Disconnected annotation repo.',
           notify: 'error'
-	        });
-	        return false;
-		      }
-		      {
-		        if (!parsed) {
-		          throw new Error('Stored annotation repository reference is invalid');
-		        }
-		        const repoLabel = parsed.ownerRepo;
-	        if (!getPublishCapability(repoInfo).canPublish) {
-	          disconnectAnnotationRepo({
-	            datasetId: did,
-	            userKey: cacheUser,
-	            message: `${describeCannotPublishMessage(repoLabel)}\nDisconnected annotation repo.`,
-	            notify: 'error'
-	          });
-	          return false;
-	        }
-	      }
-	      const isDatasetMismatch =
-	        didResolved &&
-	        Array.isArray(config?.supportedDatasets) &&
-	        config.supportedDatasets.length &&
-	        !datasetConfig;
-		      if (isDatasetMismatch && !access.isAuthor()) {
-		        if (!parsed) {
-		          throw new Error('Stored annotation repository reference is invalid');
-		        }
-		        const repoLabel = parsed.ownerRepo;
-	        disconnectAnnotationRepo({
-	          datasetId: did,
-	          userKey: cacheUser,
-	          message:
-	            `Dataset mismatch for ${repoLabel}.\n\n` +
-	            `This repo does not list the current dataset id "${didResolved}" in annotations/config.json.\n\n` +
-		            'Ask an author (maintain/admin) to Publish updated settings, then reconnect.',
-	          notify: 'error'
-	        });
-	        return false;
-	      }
-		      if (!parsed) {
-		        throw new Error('Stored annotation repository reference is invalid');
-		      }
-		      const ownerRepo = parsed.ownerRepo;
+        });
+        return false;
+      }
+      if (!parsed) {
+        throw new Error('Stored annotation repository reference is invalid');
+      }
+      const repoLabel = parsed.ownerRepo;
+      const isDatasetMismatch =
+        didResolved &&
+        Array.isArray(config?.supportedDatasets) &&
+        config.supportedDatasets.length &&
+        !datasetConfig;
+      if (isDatasetMismatch && !access.isAuthor()) {
+        disconnectAnnotationRepo({
+          datasetId: did,
+          userKey: cacheUser,
+          message:
+            `Dataset mismatch for ${repoLabel}.\n\n` +
+            `This repo does not list the current dataset id "${didResolved}" in annotations/config.json.\n\n` +
+            'Ask an author (maintain/admin) to Publish updated settings, then reconnect.',
+          notify: 'error'
+        });
+        return false;
+      }
+
+      const ownerRepo = parsed.ownerRepo;
       const branch = requireResolvedAnnotationBranch(sync);
       const canonicalRepoRef = `${ownerRepo}@${branch}`;
+      if (!isContextOwnerCurrent(currentOwner)) return false;
       if (canonicalRepoRef !== repo) {
         // Avoid wiping the role we just inferred when the repo-map dispatches
         // the connection-changed event (which calls applySessionCacheContext()).
-        lastRoleContext = `${cacheUser}::${canonicalRepoRef}`;
+        lastRoleContext =
+          `${did}::${cacheUser}::${canonicalRepoRef}`;
         setAnnotationRepoForDataset(
           did,
           canonicalRepoRef,
@@ -1083,24 +2192,43 @@ export function initCommunityAnnotationControls({
           { branchMode }
         );
         setUrlAnnotationRepo(canonicalRepoRef);
+        currentOwner = applySessionCacheContext({ datasetId: did });
+      } else {
+        session.setCacheContext({
+          datasetId: did,
+          repoRef: canonicalRepoRef,
+          userId,
+        });
       }
-      session.setCacheContext({ datasetId: did, repoRef: canonicalRepoRef, userId });
-      const mine = await sync.pullUserFile({ userKey: cacheUser });
+      const mine = await sync.pullUserFile({
+        userKey: cacheUser,
+        signal: currentOwner.signal,
+      });
+      if (!isContextOwnerCurrent(currentOwner)) return false;
       if (!mine?.doc) return false;
       session.mergeFromUserFiles([mine.doc], { preferLocalVotes: true });
       if (mine?.path && mine?.sha) session.setRemoteFileSha(mine.path, mine.sha);
       return true;
     } catch (error) {
+      if (!isContextOwnerCurrent(currentOwner)) return false;
       const message = String(error?.message || 'Failed to load your annotation profile');
       syncError = message;
-      notifications.error(message, { category: 'annotation', duration: 10000 });
+      const notify = isTransientRoleResolutionFailure(error)
+        ? notifications.warning
+        : notifications.error;
+      notify.call(notifications, message, {
+        category: 'annotation',
+        duration: 10000,
+      });
       return false;
     }
   }
 
 		  async function editIdentityFlow({
 	    suggestedUsername = null,
-	    reason = null
+	    reason = null,
+      returnFocusTo = null,
+      returnFocusResolver = null
 		  } = {}) {
 		    const current = session.getProfile();
     const authenticatedKey = toGitHubUserKey(githubAuth.getUser());
@@ -1126,9 +2254,11 @@ export function initCommunityAnnotationControls({
 	      let orcidSuggestPopupEl = null;
 	      let orcidSuggestAnchorEl = null;
 
-	      const modalRef = showClusterModal({
+	      const modalRef = showOwnedCommunityModal({
 	        title: 'Your identity',
 	        modalClassName: 'community-annotation-modal--narrow',
+          returnFocusTo,
+          returnFocusResolver,
 	        buildContent: (content) => {
 	          const note = el('div', { className: 'legend-help' });
 	          note.appendChild(document.createTextNode('Saved locally (like votes) until you Publish; Publish writes it into your GitHub user file. '));
@@ -1139,7 +2269,12 @@ export function initCommunityAnnotationControls({
 
           if (reason) content.appendChild(el('div', { className: 'legend-help', text: `⚠ ${String(reason)}` }));
 
-          const status = el('div', { className: 'legend-help', text: '' });
+          const status = el('div', {
+            className: 'legend-help',
+            role: 'status',
+            'aria-live': 'polite',
+            text: '',
+          });
           content.appendChild(status);
 
 	          if (suggested) {
@@ -1151,27 +2286,28 @@ export function initCommunityAnnotationControls({
             }));
           }
 
-          async function lookupOrcidName(orcidId, { signal } = {}) {
-            const id = assertExactOrcidId(orcidId);
-            const url = `https://pub.orcid.org/v3.0/${encodeURIComponent(id)}/person`;
-            const res = await fetch(url, {
-              method: 'GET',
-              headers: { Accept: 'application/vnd.orcid+json' },
-              signal,
-              cache: 'no-store',
-              mode: 'cors'
-            });
-            if (!res.ok) {
-              throw new Error(`ORCID lookup failed (HTTP ${res.status})`);
-            }
-            const data = await res.json();
-            return { name: parseOrcidPersonName(data), orcid: id };
-          }
-
+          const orcidSuggestionListId =
+            `cellucid-orcid-suggestions-${Math.random().toString(36).slice(2)}`;
+          const orcidDisclosureId =
+            `cellucid-orcid-disclosure-${Math.random().toString(36).slice(2)}`;
+          content.appendChild(el('div', {
+            id: orcidDisclosureId,
+            className: 'community-annotation-external-lookup-disclosure',
+            text:
+              'Typing 3 or more characters in Name or ORCID searches the ' +
+              'public ORCID registry. Requests omit credentials and referrer information.',
+          }));
           content.appendChild(el('label', { className: 'legend-help', text: 'Name:' }));
           const nameInput = el('input', {
             type: 'text',
             className: 'community-annotation-text-input',
+              'aria-label': 'Name',
+            'aria-describedby': orcidDisclosureId,
+            role: 'combobox',
+            'aria-autocomplete': 'list',
+            'aria-controls': orcidSuggestionListId,
+            'aria-expanded': 'false',
+            'aria-haspopup': 'listbox',
             name: 'cellucid_identity_display_name',
             autocomplete: 'off',
             placeholder: 'e.g. Alice Smith',
@@ -1183,6 +2319,7 @@ export function initCommunityAnnotationControls({
           const titleInput = el('input', {
             type: 'text',
             className: 'community-annotation-text-input',
+            'aria-label': 'Affiliation / role',
             name: 'cellucid_identity_affiliation',
             autocomplete: 'off',
             placeholder: 'e.g. Theis Lab, Postdoc',
@@ -1194,6 +2331,7 @@ export function initCommunityAnnotationControls({
           const linkedinInput = el('input', {
             type: 'text',
             className: 'community-annotation-text-input',
+            'aria-label': 'LinkedIn',
             name: 'cellucid_identity_linkedin',
             autocomplete: 'off',
             autocorrect: 'off',
@@ -1210,6 +2348,13 @@ export function initCommunityAnnotationControls({
 	          const orcidInput = el('input', {
 	            type: 'text',
 	            className: 'community-annotation-text-input',
+              'aria-label': 'ORCID',
+              'aria-describedby': orcidDisclosureId,
+              role: 'combobox',
+              'aria-autocomplete': 'list',
+              'aria-controls': orcidSuggestionListId,
+              'aria-expanded': 'false',
+              'aria-haspopup': 'listbox',
 	            name: orcidInputName,
 	            autocomplete: 'off',
 	            autocorrect: 'off',
@@ -1222,14 +2367,35 @@ export function initCommunityAnnotationControls({
 	          content.appendChild(orcidInput);
 
 	          const suggestionBox = el('div', {
+              id: orcidSuggestionListId,
 	            className: 'community-annotation-suggest community-annotation-suggest--popup',
-	            role: 'listbox'
+	            role: 'listbox',
+              'aria-label': 'ORCID search suggestions'
 	          });
 	          orcidSuggestPopupEl = suggestionBox;
 	          orcidSuggestAnchorEl = orcidInput;
+            let profileModalClosed = false;
+            let searchTimer = null;
+            let activeSearch = null;
+            let activeSearchTimeout = null;
+            let hideTimer = null;
+            let positionFrame = null;
+            let positionTimer = null;
+            const orcidSearchCache = new Map();
+            const orcidComboboxInputs = [nameInput, orcidInput];
+            let suggestionItems = [];
+            let activeSuggestionIndex = -1;
+            let suggestionOwner = orcidInput;
+            let suggestionsOpen = false;
 
 	          const positionSuggest = () => {
-	            if (!orcidSuggestPopupEl || !orcidSuggestAnchorEl) return;
+	            if (
+                profileModalClosed ||
+                !orcidSuggestPopupEl ||
+                !orcidSuggestAnchorEl
+              ) {
+                return;
+              }
 	            const anchorRect = orcidSuggestAnchorEl.getBoundingClientRect();
 	            const maxH = 180;
 	            const gap = 6;
@@ -1248,9 +2414,115 @@ export function initCommunityAnnotationControls({
 	            }
 	          };
 
-	          const renderSuggestions = (items, { loading = false, emptyMessage = '' } = {}) => {
+            const publishSuggestionState = () => {
+              for (const input of orcidComboboxInputs) {
+                input.setAttribute(
+                  'aria-expanded',
+                  suggestionsOpen && input === suggestionOwner
+                    ? 'true'
+                    : 'false'
+                );
+                input.removeAttribute('aria-activedescendant');
+              }
+              for (let index = 0; index < suggestionItems.length; index += 1) {
+                const selected =
+                  suggestionsOpen && index === activeSuggestionIndex;
+                suggestionItems[index].row.setAttribute(
+                  'aria-selected',
+                  selected ? 'true' : 'false'
+                );
+                if (selected) {
+                  suggestionOwner.setAttribute(
+                    'aria-activedescendant',
+                    suggestionItems[index].row.id
+                  );
+                }
+              }
+            };
+
+            const hideSuggestions = () => {
+              suggestionsOpen = false;
+              activeSuggestionIndex = -1;
+              suggestionBox.style.display = 'none';
+              publishSuggestionState();
+            };
+
+            const cancelPendingSearchTimer = () => {
+              if (searchTimer === null) return false;
+              const timer = searchTimer;
+              clearTimeout(timer);
+              if (searchTimer === timer) searchTimer = null;
+              return true;
+            };
+
+            const abortActiveSearch = () => {
+              if (activeSearch === null) return false;
+              const request = activeSearch;
+              if (typeof request.abort !== 'function') {
+                throw new TypeError(
+                  'ORCID search controller must expose abort()'
+                );
+              }
+              activeSearch = null;
+              if (activeSearchTimeout !== null) {
+                clearTimeout(activeSearchTimeout);
+                activeSearchTimeout = null;
+              }
+              request.abort();
+              return true;
+            };
+
+            const setActiveSuggestion = (index, owner = suggestionOwner) => {
+              if (
+                !Number.isSafeInteger(index) ||
+                index < 0 ||
+                index >= suggestionItems.length
+              ) {
+                throw new RangeError(
+                  'Active ORCID suggestion index is outside the rendered list'
+                );
+              }
+              if (!orcidComboboxInputs.includes(owner)) {
+                throw new TypeError(
+                  'Active ORCID suggestion owner must be an exact combobox'
+                );
+              }
+              suggestionOwner = owner;
+              suggestionsOpen = true;
+              activeSuggestionIndex = index;
+              publishSuggestionState();
+              suggestionItems[index].row.scrollIntoView({
+                block: 'nearest',
+              });
+            };
+
+            const selectSuggestion = (index) => {
+              if (
+                !Number.isSafeInteger(index) ||
+                index < 0 ||
+                index >= suggestionItems.length
+              ) {
+                throw new RangeError(
+                  'Selected ORCID suggestion index is outside the rendered list'
+                );
+              }
+              const item = suggestionItems[index];
+              orcidInput.value = item.orcid;
+              if (item.name) nameInput.value = item.name;
+              hideSuggestions();
+              if (
+                suggestionOwner.isConnected &&
+                typeof suggestionOwner.focus === 'function'
+              ) {
+                suggestionOwner.focus();
+              }
+            };
+
+	          const renderSuggestions = (items, { loading = false } = {}) => {
+              if (profileModalClosed) return;
+              hideSuggestions();
 	            suggestionBox.innerHTML = '';
-	            suggestionBox.style.display = 'none';
+              suggestionItems = [];
 	            if (loading) {
 	              // Keep silent: show nothing while searching.
 	              return;
@@ -1258,28 +2530,53 @@ export function initCommunityAnnotationControls({
 	            if (!Array.isArray(items)) {
 	              throw new Error('ORCID suggestions must be an array');
 	            }
-	            const list = items;
-	            if (!list.length) {
-	              return;
-	            }
-	            for (const item of list) {
-              const orcid = assertExactOrcidId(item?.orcid);
-              const name =
-                item?.name === null
-                  ? ''
-                  : assertExactOptionalProfileText(item?.name, 'ORCID result name', 240);
-              const label = name ? `${name} — ${orcid}` : orcid;
-	              const row = el('div', { className: 'community-annotation-suggest-item', role: 'option', text: label });
-	              row.addEventListener('click', () => {
-	                if (orcid) orcidInput.value = orcid;
-	                if (name) nameInput.value = name;
-	                suggestionBox.style.display = 'none';
-	              });
+	            if (!items.length) return;
+	            for (let index = 0; index < items.length; index += 1) {
+                const item = items[index];
+                const orcid = assertExactOrcidId(item?.orcid);
+                const name =
+                  item?.name === null
+                    ? ''
+                    : assertExactOptionalProfileText(
+                        item?.name,
+                        'ORCID result name',
+                        240
+                      );
+                const label = name ? `${name} — ${orcid}` : orcid;
+	              const row = el('button', {
+                  id: `${orcidSuggestionListId}-option-${index}`,
+                  type: 'button',
+                  className: 'community-annotation-suggest-item',
+                  role: 'option',
+                  'aria-selected': 'false',
+                  tabindex: '-1',
+                  text: label,
+                });
+                row.addEventListener('pointerdown', (event) => {
+                  event.preventDefault();
+                  cancelHide();
+                });
+	              row.addEventListener('click', () => selectSuggestion(index));
+                suggestionItems.push({ name, orcid, row });
 	              suggestionBox.appendChild(row);
 	            }
+              suggestionsOpen = true;
 	            suggestionBox.style.display = 'block';
-	            requestAnimationFrame(positionSuggest);
-	            setTimeout(positionSuggest, 60);
+              publishSuggestionState();
+              if (positionFrame !== null) {
+                cancelAnimationFrame(positionFrame);
+              }
+              if (positionTimer !== null) {
+                clearTimeout(positionTimer);
+              }
+	            positionFrame = requestAnimationFrame(() => {
+                positionFrame = null;
+                positionSuggest();
+              });
+	            positionTimer = setTimeout(() => {
+                positionTimer = null;
+                positionSuggest();
+              }, 60);
 	          };
 
 	          async function searchOrcid(query, { signal } = {}) {
@@ -1292,114 +2589,320 @@ export function initCommunityAnnotationControls({
 	            if (cached && Date.now() - cached.at < 60_000) return cached.items;
 
 	            if (isExactOrcidId(q)) {
-	              const direct = await lookupOrcidName(q, { signal });
+	              const direct = await fetchOrcidPerson(q, { signal });
 	              const items = [{ orcid: direct.orcid, name: direct.name }];
 	              orcidSearchCache.set(key, { at: Date.now(), items });
 	              return items;
 	            }
 
-	            const url =
-	              `https://pub.orcid.org/v3.0/expanded-search/?q=${encodeURIComponent(q)}&rows=8`;
-	            const res = await fetch(url, {
-	              method: 'GET',
-	              headers: { Accept: 'application/vnd.orcid+json' },
-	              signal,
-	              cache: 'no-store',
-	              mode: 'cors'
-	            });
-	            if (!res.ok) {
-	              throw new Error(`ORCID search failed (HTTP ${res.status})`);
-	            }
-	            const out = parseOrcidExpandedSearch(await res.json(), {
-	              maximumResults: 8,
-	            });
-	            orcidSearchCache.set(key, { at: Date.now(), items: out });
+	            const out = await fetchOrcidExpandedSearch(q, { signal });
+              if (out.length > 0) {
+	              orcidSearchCache.set(key, { at: Date.now(), items: out });
+              }
 	            return out;
 	          }
 
-	          let searchTimer = null;
-	          let activeSearch = null;
 	          let lastQuery = '';
-	          const orcidSearchCache = new Map();
-		          const scheduleSearch = (query) => {
+		          const scheduleSearch = (query, owner) => {
+                if (profileModalClosed) return;
+                if (!orcidComboboxInputs.includes(owner)) {
+                  throw new TypeError(
+                    'ORCID search owner must be an exact combobox'
+                  );
+                }
+                suggestionOwner = owner;
+                orcidSuggestAnchorEl = owner;
+                if (suggestionsOpen) {
+                  publishSuggestionState();
+                  positionSuggest();
+                }
 		            const q = query;
-		            if (q === lastQuery) return;
+		            if (
+                  q === lastQuery &&
+                  (
+                    searchTimer !== null ||
+                    activeSearch !== null ||
+                    suggestionsOpen
+                  )
+                ) {
+                  return;
+                }
 		            lastQuery = q;
-            if (searchTimer) clearTimeout(searchTimer);
-            if (activeSearch !== null) {
-              if (typeof activeSearch.abort !== 'function') {
-                throw new TypeError('ORCID search controller must expose abort()');
-              }
-              activeSearch.abort();
-            }
+            cancelPendingSearchTimer();
+            abortActiveSearch();
 
-	            if (typeof q !== 'string' || !q || q.length < 3) {
-	              renderSuggestions([], { loading: false, emptyMessage: '' });
+	            if (
+                typeof q !== 'string' ||
+                !q ||
+                !hasAtLeastUnicodeCodePoints(q, 3)
+              ) {
+	              renderSuggestions([], { loading: false });
 	              return;
 	            }
 
 	            searchTimer = setTimeout(async () => {
+                searchTimer = null;
+                if (
+                  profileModalClosed ||
+                  document.activeElement !== suggestionOwner
+                ) {
+                  return;
+                }
 	              const ctrl = new AbortController();
 	              activeSearch = ctrl;
 	              renderSuggestions([], { loading: true });
-	              const timeout = setTimeout(() => ctrl.abort(), 6500);
+	              const timeout = setTimeout(() => {
+                  const error = new Error(
+                    'ORCID request timed out after 6.5 seconds'
+                  );
+                  error.name = 'TimeoutError';
+                  ctrl.abort(error);
+                }, 6500);
+                activeSearchTimeout = timeout;
 	              try {
 	                const items = await searchOrcid(q, { signal: ctrl.signal });
+                  if (
+                    profileModalClosed ||
+                    activeSearch !== ctrl ||
+                    document.activeElement !== suggestionOwner
+                  ) {
+                    return;
+                  }
 	                if (!items.length) {
-	                  renderSuggestions([], { loading: false, emptyMessage: '' });
+	                  renderSuggestions([], { loading: false });
 	                  status.textContent = 'No ORCID records matched the exact query.';
 	                  return;
 	                }
 	                status.textContent = '';
 	                renderSuggestions(items, { loading: false });
 	              } catch (err) {
+                  if (
+                    profileModalClosed ||
+                    activeSearch !== ctrl ||
+                    document.activeElement !== suggestionOwner
+                  ) {
+                    return;
+                  }
 	                if (err?.name === 'AbortError') {
-	                  renderSuggestions([], { loading: false, emptyMessage: '' });
+	                  renderSuggestions([], { loading: false });
 	                } else {
-	                  renderSuggestions([], { loading: false, emptyMessage: '' });
+	                  renderSuggestions([], { loading: false });
 	                  status.textContent =
 	                    typeof err?.message === 'string' && err.message
 	                      ? err.message
 	                      : 'ORCID lookup failed';
 	                }
 	              } finally {
-	                clearTimeout(timeout);
+                  clearTimeout(timeout);
+                  if (activeSearchTimeout === timeout) {
+                    activeSearchTimeout = null;
+                  }
+                  if (activeSearch === ctrl) {
+                    activeSearch = null;
+                  }
 	              }
 		            }, 250);
 		          };
 
-          const onAnyInput = () => {
-            const qId = orcidInput.value;
-            const qName = nameInput.value;
-            const query = qId.length >= qName.length ? qId : qName;
-            scheduleSearch(query);
+          const onAnyInput = (event) => {
+            const owner = event?.currentTarget;
+            scheduleSearch(owner?.value, owner);
           };
 
           nameInput.addEventListener('input', onAnyInput);
           orcidInput.addEventListener('input', onAnyInput);
-          let hideTimer = null;
+          const handleComboboxKeydown = (event) => {
+            if (
+              !suggestionsOpen ||
+              suggestionItems.length === 0
+            ) {
+              return;
+            }
+            const owner = event.currentTarget;
+            let nextIndex = null;
+            if (event.key === 'ArrowDown') {
+              nextIndex =
+                activeSuggestionIndex < 0
+                  ? 0
+                  : (activeSuggestionIndex + 1) % suggestionItems.length;
+            } else if (event.key === 'ArrowUp') {
+              nextIndex =
+                activeSuggestionIndex < 0
+                  ? suggestionItems.length - 1
+                  : (
+                    activeSuggestionIndex - 1 + suggestionItems.length
+                  ) % suggestionItems.length;
+            } else if (event.key === 'Home') {
+              nextIndex = 0;
+            } else if (event.key === 'End') {
+              nextIndex = suggestionItems.length - 1;
+            } else if (
+              event.key === 'Enter' &&
+              activeSuggestionIndex >= 0
+            ) {
+              event.preventDefault();
+              event.stopPropagation();
+              selectSuggestion(activeSuggestionIndex);
+              return;
+            } else {
+              return;
+            }
+            event.preventDefault();
+            event.stopPropagation();
+            setActiveSuggestion(nextIndex, owner);
+          };
+          nameInput.addEventListener('keydown', handleComboboxKeydown);
+          orcidInput.addEventListener('keydown', handleComboboxKeydown);
           const scheduleHide = () => {
+            if (profileModalClosed) return;
             if (hideTimer) clearTimeout(hideTimer);
             hideTimer = setTimeout(() => {
-              suggestionBox.style.display = 'none';
+              hideTimer = null;
+              cancelPendingSearchTimer();
+              abortActiveSearch();
+              hideSuggestions();
             }, 150);
           };
           const cancelHide = () => {
             if (hideTimer) clearTimeout(hideTimer);
             hideTimer = null;
           };
-	          nameInput.addEventListener('focus', cancelHide);
-	          orcidInput.addEventListener('focus', cancelHide);
+          const focusCombobox = (event) => {
+            cancelHide();
+            suggestionOwner = event.currentTarget;
+            orcidSuggestAnchorEl = event.currentTarget;
+            if (suggestionsOpen) {
+              publishSuggestionState();
+              positionSuggest();
+            } else {
+              scheduleSearch(
+                event.currentTarget.value,
+                event.currentTarget
+              );
+            }
+          };
+	          nameInput.addEventListener('focus', focusCombobox);
+	          orcidInput.addEventListener('focus', focusCombobox);
 	          nameInput.addEventListener('blur', scheduleHide);
 	          orcidInput.addEventListener('blur', scheduleHide);
-	          suggestionBox.addEventListener('pointerdown', cancelHide);
+          suggestionBox.addEventListener('pointerdown', cancelHide);
+          const dismissComboboxSuggestions = () => {
+            const ownsTransientUi =
+              suggestionsOpen ||
+              searchTimer !== null ||
+              activeSearch !== null;
+            if (!ownsTransientUi) return false;
+            cancelPendingSearchTimer();
+            abortActiveSearch();
+            hideSuggestions();
+            return true;
+          };
+          nameInput[COMMUNITY_MODAL_ESCAPE_OWNER] =
+            dismissComboboxSuggestions;
+          orcidInput[COMMUNITY_MODAL_ESCAPE_OWNER] =
+            dismissComboboxSuggestions;
 	          const scroller = content.closest('.community-annotation-modal-body');
-	          scroller.addEventListener('scroll', () => {
-	            if (suggestionBox.style.display !== 'none') positionSuggest();
-	          }, { passive: true });
-	          window.addEventListener('resize', () => {
-	            if (suggestionBox.style.display !== 'none') positionSuggest();
-	          }, { passive: true });
+            const handleScrollerScroll = () => {
+	            if (suggestionsOpen) positionSuggest();
+            };
+            const handleWindowResize = () => {
+	            if (suggestionsOpen) positionSuggest();
+            };
+	          scroller.addEventListener('scroll', handleScrollerScroll, {
+              passive: true
+            });
+            window.addEventListener('resize', handleWindowResize, {
+              passive: true
+            });
+            content.__cellucidCleanup = () => {
+              profileModalClosed = true;
+              runExactCleanup('Community annotation profile teardown', [
+                [
+                  'ORCID debounce timer',
+                  searchTimer === null
+                    ? null
+                    : () => {
+                      const timer = searchTimer;
+                      clearTimeout(timer);
+                      if (searchTimer === timer) searchTimer = null;
+                    }
+                ],
+                [
+                  'ORCID request timeout',
+                  activeSearchTimeout === null
+                    ? null
+                    : () => {
+                      const timer = activeSearchTimeout;
+                      clearTimeout(timer);
+                      if (activeSearchTimeout === timer) {
+                        activeSearchTimeout = null;
+                      }
+                    }
+                ],
+                [
+                  'ORCID suggestion hide timer',
+                  hideTimer === null
+                    ? null
+                    : () => {
+                      const timer = hideTimer;
+                      clearTimeout(timer);
+                      if (hideTimer === timer) hideTimer = null;
+                    }
+                ],
+                [
+                  'ORCID suggestion position frame',
+                  positionFrame === null
+                    ? null
+                    : () => {
+                      const frame = positionFrame;
+                      cancelAnimationFrame(frame);
+                      if (positionFrame === frame) positionFrame = null;
+                    }
+                ],
+                [
+                  'ORCID suggestion position timer',
+                  positionTimer === null
+                    ? null
+                    : () => {
+                      const timer = positionTimer;
+                      clearTimeout(timer);
+                      if (positionTimer === timer) positionTimer = null;
+                    }
+                ],
+                [
+                  'ORCID request',
+                  activeSearch === null
+                    ? null
+                    : () => {
+                      const request = activeSearch;
+                      request.abort();
+                      if (activeSearch === request) activeSearch = null;
+                    }
+                ],
+                [
+                  'ORCID suggestion scroll listener',
+                  () => scroller.removeEventListener(
+                    'scroll',
+                    handleScrollerScroll
+                  )
+                ],
+                [
+                  'ORCID suggestion resize listener',
+                  () => window.removeEventListener(
+                    'resize',
+                    handleWindowResize
+                  )
+                ],
+                [
+                  'ORCID combobox Escape owners',
+                  () => {
+                    nameInput[COMMUNITY_MODAL_ESCAPE_OWNER] = null;
+                    orcidInput[COMMUNITY_MODAL_ESCAPE_OWNER] = null;
+                  }
+                ],
+                ['ORCID suggestion cache', () => orcidSearchCache.clear()]
+              ]);
+            };
 
           const actions = el('div', { className: 'community-annotation-suggestion-actions' });
           const saveBtn = el('button', { type: 'button', className: 'btn-small', text: 'Save' });
@@ -1414,6 +2917,7 @@ export function initCommunityAnnotationControls({
 		          });
 
           saveBtn.addEventListener('click', () => {
+            let savedProfile;
             try {
               const login = assertExactGitHubLogin(
                 suggested,
@@ -1444,20 +2948,28 @@ export function initCommunityAnnotationControls({
                 })
               };
               session.setProfile(nextProfile);
-              removeOwningCommunityModal(content);
-              resolveOnce({ username: userKey, dismissed: false });
+              savedProfile = { username: userKey, dismissed: false };
             } catch (error) {
               status.textContent =
                 typeof error?.message === 'string' && error.message
                   ? error.message
                   : 'Profile validation failed';
+              return;
+            }
+            try {
+              removeOwningCommunityModal(content);
+            } finally {
+              resolveOnce(savedProfile);
             }
           });
 	        }
 	      });
 
 	      const overlay = modalRef?.overlay || null;
-	      if (!overlay) return;
+	      if (!overlay) {
+          resolveOnce(null);
+          return;
+        }
 	      if (orcidSuggestPopupEl) {
 	        overlay.appendChild(orcidSuggestPopupEl);
 	      }
@@ -1525,36 +3037,60 @@ export function initCommunityAnnotationControls({
 
   const setDatasetContextFromManager = () => {
     const datasetId = dataSourceManager?.getCurrentDatasetId?.() || null;
-    applySessionCacheContext({ datasetId });
+    const owner = applySessionCacheContext({ datasetId });
 
     const paramRepo = getUrlAnnotationRepo();
     if (paramRepo && (githubAuth.isAuthenticated?.() || isSimulateRepoConnectedEnabled())) {
-      const username = getCacheUserKey();
+      const username = owner.userKey;
       const parsed = parseOwnerRepo(paramRepo);
       // Resolve a missing branch once before persisting the canonical reference.
       if (parsed && !parsed.ref) {
-        (async () => {
-          const ok = await setDatasetAnnotationRepoFromUrlParamAsync({
-            datasetId,
-            urlParamValue: paramRepo,
-            username,
+        const resolutionTask = (async () => {
+          await githubAuth.ensureWorkerCompatible({
+            signal: owner.signal,
           });
-          if (!ok) {
+          if (!isContextOwnerCurrent(owner)) return;
+          const resolved = await resolveAnnotationRepositoryFromUrlParam({
+            urlParamValue: paramRepo,
+            signal: owner.signal,
+          });
+          if (resolved === null) {
             throw new Error(
               'The annotation_repo URL parameter is not a canonical owner/repo reference'
             );
           }
+          if (resolved === false) {
+            throw new Error(
+              'GitHub sign-in is required to resolve the annotation repository default branch'
+            );
+          }
+          if (
+            !isContextOwnerCurrent(owner) ||
+            getUrlAnnotationRepo() !== paramRepo
+          ) {
+            return;
+          }
+          setAnnotationRepoForDataset(
+            datasetId,
+            resolved.repoRef,
+            username,
+            { branchMode: resolved.branchMode },
+          );
+          setUrlAnnotationRepo(resolved.repoRef);
           applySessionCacheContext({ datasetId });
           render();
         })().catch((error) => {
-          syncError = String(
-            error?.message || 'Unable to apply annotation_repo URL parameter'
-          );
-          notifications.error(syncError, {
-            category: 'annotation',
-            duration: 10_000,
-          });
-          render();
+          if (
+            !isContextOwnerCurrent(owner) ||
+            getUrlAnnotationRepo() !== paramRepo
+          ) {
+            return;
+          }
+          throw error;
+        });
+        observeBackgroundTask(resolutionTask, {
+          label: 'Unable to apply the annotation_repo URL parameter',
+          owner,
         });
       } else {
         try {
@@ -1582,13 +3118,22 @@ export function initCommunityAnnotationControls({
     }
   };
 
-  if (dataSourceManager?.onDatasetChange) {
-    dataSourceManager.onDatasetChange(() => {
-      setDatasetContextFromManager();
-      render();
-    });
-  }
+  const handleDatasetChange = () => {
+    if (contextDestroyed) return;
+    setDatasetContextFromManager();
+    render();
+  };
+  let datasetChangeSubscribed = false;
   setDatasetContextFromManager();
+  if (typeof dataSourceManager?.onDatasetChange === 'function') {
+    if (typeof dataSourceManager.offDatasetChange !== 'function') {
+      throw new TypeError(
+        'Community annotation controls require dataSourceManager.offDatasetChange()'
+      );
+    }
+    dataSourceManager.onDatasetChange(handleDatasetChange);
+    datasetChangeSubscribed = true;
+  }
 
   const unsubscribe = session.on('changed', () => {
     render();
@@ -1643,47 +3188,97 @@ export function initCommunityAnnotationControls({
   }) || null;
 
   const unsubscribeAuth = githubAuth.on?.('changed', () => {
-    // Clear auth-related errors and update identity UI quickly.
+    authenticationGeneration += 1;
     syncError = null;
     if (!githubAuth.isAuthenticated?.()) {
-      const current = session.getProfile();
-      session.setProfile({
-        ...current,
-        username: 'local',
-        login: '',
-        githubUserId: null,
-        displayName: '',
-        title: '',
-        orcid: '',
-        linkedin: '',
-      });
       lastRepoInfo = null;
       access.clearRole?.();
-      applySessionCacheContext({});
-      render();
-      return;
-    }
-    syncIdentityFromAuth({ promptIfMissing: false })
-      .then(() => loadMyProfileFromGitHub({}))
-      .catch((error) => {
+      try {
+        // Move to the local cache scope before publishing a local profile.
+        // Session change listeners render synchronously and enforce that the
+        // profile identity matches the active scope.
+        applySessionCacheContext({});
+        const current = session.getProfile();
+        session.setProfile({
+          ...current,
+          username: 'local',
+          login: '',
+          githubUserId: null,
+          displayName: '',
+          title: '',
+          orcid: '',
+          linkedin: '',
+        });
+      } catch (error) {
         syncError =
           typeof error?.message === 'string' && error.message
             ? error.message
-            : 'Unable to synchronize the authenticated GitHub identity';
+            : 'Unable to apply the signed-out annotation context';
         notifications.error(syncError, {
           category: 'annotation',
-          duration: 10000,
+          duration: 10_000,
         });
-      })
-      .finally(() => {
-        applySessionCacheContext({});
-        render();
+      }
+      render();
+      return;
+    }
+
+    let owner;
+    try {
+      // Synchronize the exact authenticated cache identity before any async
+      // repository work. A restored auth session does not emit "changed", so
+      // startup uses this same path through applySessionCacheContext().
+      owner = applySessionCacheContext({ resolveRole: false });
+    } catch (error) {
+      syncError =
+        typeof error?.message === 'string' && error.message
+          ? error.message
+          : 'Unable to apply the authenticated annotation context';
+      notifications.error(syncError, {
+        category: 'annotation',
+        duration: 10_000,
       });
+      render();
+      return;
+    }
+
+    const authenticationTask = (async () => {
+      if (!owner.repoRef || owner.simulated) return;
+      // Profile/config reads share the raw-file cache scope. Do not begin
+      // network work until IndexedDB is ready for that exact owner.
+      await fileCache.init();
+      if (!isContextOwnerCurrent(owner)) return;
+      await loadMyProfileFromGitHub(owner);
+    })()
+      .finally(() => {
+        if (isContextOwnerCurrent(owner)) render();
+      });
+    observeBackgroundTask(authenticationTask, {
+      label: 'Unable to synchronize the authenticated GitHub identity',
+      owner,
+    });
   }) || null;
   const unsubscribeAccess = access.on?.('changed', () => render()) || null;
 
   function destroy() {
+    contextDestroyed = true;
+    stopAutoPullScheduler();
+    cancelScheduledRoleRetry();
+    publishedContextIdentity = null;
+    if (publishedContextAbort !== null) {
+      publishedContextAbort.abort();
+      publishedContextAbort = null;
+    }
+    contextGeneration += 1;
+    activeRoleResolutionOwner = null;
+    pendingOnlineRoleRetryOwner = null;
+    pendingSyncBusyRoleRetryOwner = null;
+    clearAnnotatableSettingsDraft();
+    if (activeSyncAbort !== null) {
+      abortActiveSync('Community annotation controls were destroyed.');
+    }
     runExactCleanup('Community annotation controls teardown', [
+      ['active community annotation modal', closeOwnedCommunityModal],
       ['session change subscription', unsubscribe],
       ['session lock-lost subscription', unsubscribeSessionLockLost],
       ['session lock-error subscription', unsubscribeSessionLockError],
@@ -1691,6 +3286,15 @@ export function initCommunityAnnotationControls({
       ['session integrity-error subscription', unsubscribeSessionIntegrityError],
       ['authentication subscription', unsubscribeAuth],
       ['access subscription', unsubscribeAccess],
+      [
+        'dataset change subscription',
+        datasetChangeSubscribed
+          ? () => {
+            dataSourceManager.offDatasetChange(handleDatasetChange);
+            datasetChangeSubscribed = false;
+          }
+          : null,
+      ],
       ['annotation connection listener', () => lifecycleAbort.abort()],
       ['information popover', () => infoPopovers.closeWithin(container)]
     ]);
@@ -1843,6 +3447,28 @@ export function initCommunityAnnotationControls({
 
   function describeGitHubAuthReachabilityError(err) {
     const msg = String(err?.message || '').trim();
+    if (msg === 'GitHub installations total_count exceeds 10000') {
+      return (
+        'GitHub returned more than 10,000 installations, which Cellucid ' +
+        'will not truncate. Reduce the Cellucid GitHub App installations ' +
+        'available to this GitHub account, then click Reload.'
+      );
+    }
+    if (msg === 'GitHub repositories total_count exceeds 10000') {
+      return (
+        'GitHub returned more than 10,000 repositories for one Cellucid ' +
+        'GitHub App installation, which Cellucid will not truncate. In ' +
+        'GitHub App settings, select fewer repositories for that ' +
+        'installation, then click Reload.'
+      );
+    }
+    if (msg === 'GitHub repository discovery exceeds 10000 repositories') {
+      return (
+        'Cellucid found more than 10,000 repositories across your GitHub ' +
+        'App installations, which it will not truncate. In GitHub App ' +
+        'settings, select fewer repositories, then click Reload.'
+      );
+    }
     const origin = String(window.location.origin || '').trim();
     const looksLikeCors =
       err instanceof TypeError ||
@@ -1863,6 +3489,9 @@ export function initCommunityAnnotationControls({
   } = {}) {
     const appInstallUrl = 'https://github.com/apps/cellucid-community-annotations/installations/new';
     const settingsUrl = 'https://github.com/settings/installations';
+    const openingOwner = publishContextOwner(
+      getCacheContext({ datasetId: datasetId ?? undefined })
+    );
 
     return new Promise((resolve) => {
       let resolved = false;
@@ -1872,7 +3501,7 @@ export function initCommunityAnnotationControls({
         resolve(value);
       };
 
-      const modalRef = showClusterModal({
+      const modalRef = showOwnedCommunityModal({
         title: 'GitHub sync',
         buildContent: (content) => {
           const modalAbort = new AbortController();
@@ -1894,17 +3523,24 @@ export function initCommunityAnnotationControls({
             return key === null ? initialUserKey : key;
           };
           const initialRepoRef = currentRepo;
+          const isModalOwnerCurrent = () =>
+            !modalAbort.signal.aborted &&
+            isContextOwnerCurrent(openingOwner);
 
           let connectedRepoRef = initialRepoRef;
           let repoListLoaded = false;
           let installationsLoaded = false;
           let isReloadingRepos = false;
-          /** @type {{full_name:string, private?:boolean}[]} */
+          /** @type {{full_name:string, private?:boolean, searchKey:string}[]} */
           let allRepos = [];
           /** @type {{id:number, account:{login:string}}[]} */
           let installations = [];
           /** @type {string} */
           let selectedRepoFullName = '';
+          let repoPageStep2 = 0;
+          let repoPageStep3 = 0;
+          let repoFocusRequestFullName = null;
+          let repoRenderSnapshot = null;
 
           const svgEl = (tag) => document.createElementNS('http://www.w3.org/2000/svg', tag);
           const icon = (d, { viewBox = '0 0 24 24' } = {}) => {
@@ -2022,6 +3658,35 @@ export function initCommunityAnnotationControls({
           step1Panel.appendChild(step1Actions);
           content.appendChild(step1Panel);
 
+          const createRepoPager = (label) => {
+            const previous = el('button', {
+              type: 'button',
+              className: 'btn-small',
+              text: 'Previous',
+              'aria-label': `Previous ${label} page`,
+            });
+            const pageStatus = el('div', {
+              className: 'community-annotation-repo-page-status',
+              'aria-live': 'polite',
+              'aria-atomic': 'true',
+              tabIndex: '-1',
+              text: '',
+            });
+            const next = el('button', {
+              type: 'button',
+              className: 'btn-small',
+              text: 'Next',
+              'aria-label': `Next ${label} page`,
+            });
+            const root = el('div', {
+              className: 'community-annotation-repo-pagination',
+              role: 'group',
+              'aria-label': `${label} pagination`,
+              hidden: true,
+            }, [previous, pageStatus, next]);
+            return { next, pageStatus, previous, root };
+          };
+
           // Step 2: add/refresh repos (no selection).
           const step2Panel = el('div', { className: 'community-annotation-step-panel' });
           const step2Help = el('div', { className: 'legend-help', text: '' });
@@ -2032,8 +3697,13 @@ export function initCommunityAnnotationControls({
           step2Actions.appendChild(addRepoBtn);
           step2Actions.appendChild(reloadReposBtn);
           step2Panel.appendChild(step2Actions);
-          const repoGridStep2 = el('div', { className: 'community-annotation-repo-grid' });
+          const repoGridStep2 = el('div', {
+            className: 'community-annotation-repo-grid',
+            'aria-label': 'Available annotation repositories',
+          });
+          const repoPagerStep2 = createRepoPager('available repositories');
           step2Panel.appendChild(repoGridStep2);
+          step2Panel.appendChild(repoPagerStep2.root);
           content.appendChild(step2Panel);
 
           // Step 3: pick repo (selection + connect).
@@ -2045,17 +3715,29 @@ export function initCommunityAnnotationControls({
           const filterInput = el('input', {
             type: 'text',
             className: 'community-annotation-text-input',
+            'aria-label': 'Filter repositories',
             autocomplete: 'off',
+            maxlength: '256',
             placeholder: 'Filter repositories…',
             value: ''
           });
           filterRow.appendChild(filterInput);
           step3Panel.appendChild(filterRow);
 
-          const repoGridStep3 = el('div', { className: 'community-annotation-repo-grid' });
+          const repoGridStep3 = el('div', {
+            className: 'community-annotation-repo-grid',
+            'aria-label': 'Selectable annotation repositories',
+          });
+          const repoPagerStep3 = createRepoPager('selectable repositories');
           step3Panel.appendChild(repoGridStep3);
+          step3Panel.appendChild(repoPagerStep3.root);
 
-          const step3Selection = el('div', { className: 'legend-help', text: '' });
+          const step3Selection = el('div', {
+            className: 'legend-help',
+            'aria-live': 'polite',
+            'aria-atomic': 'true',
+            text: '',
+          });
           step3Panel.appendChild(step3Selection);
           content.appendChild(step3Panel);
 
@@ -2074,7 +3756,10 @@ export function initCommunityAnnotationControls({
           const autoPullCheckbox = el('input', { type: 'checkbox' });
           autoPullToggle.appendChild(autoPullCheckbox);
           autoPullToggle.appendChild(el('span', { text: 'Auto pull' }));
-	          const autoPullSelect = el('select', { className: 'community-annotation-auto-pull-select' });
+	          const autoPullSelect = el('select', {
+              className: 'community-annotation-auto-pull-select',
+              'aria-label': 'Auto pull interval'
+            });
 	          const autoPullOptions = [
 	            { ms: AUTO_PULL_INTERVALS_MS[0], label: 'Every 10 minutes' },
 	            { ms: AUTO_PULL_INTERVALS_MS[1], label: 'Every 15 minutes' },
@@ -2112,11 +3797,6 @@ export function initCommunityAnnotationControls({
 	          let autoPullIntervalMs = DEFAULT_AUTO_PULL_INTERVAL_MS;
           /** @type {string} */
           let autoPullScopeKey = '';
-          /** @type {ReturnType<typeof setInterval>|null} */
-          let autoPullTimer = null;
-          let autoPullTimerMs = 0;
-
-          const AUTO_PULL_STORAGE_KEY = 'cellucid:community-annotations:auto-pull:v1';
 
           const readAutoPullPrefs = () => {
             if (typeof localStorage === 'undefined') {
@@ -2161,7 +3841,7 @@ export function initCommunityAnnotationControls({
 	            return key;
 	          };
 
-	          const syncAutoPullFromStorage = () => {
+	          const syncAutoPullFromStorage = ({ force = false } = {}) => {
 	            const nextKey = computeAutoPullScopeKey();
 	            if (!nextKey) {
 	              autoPullScopeKey = '';
@@ -2169,7 +3849,7 @@ export function initCommunityAnnotationControls({
 	              autoPullIntervalMs = DEFAULT_AUTO_PULL_INTERVAL_MS;
 	              return;
 	            }
-	            if (nextKey === autoPullScopeKey) return;
+	            if (!force && nextKey === autoPullScopeKey) return;
 	            autoPullScopeKey = nextKey;
 	            const prefs = readAutoPullPrefs();
 	            const entry = prefs[autoPullScopeKey];
@@ -2182,27 +3862,85 @@ export function initCommunityAnnotationControls({
 	            autoPullIntervalMs = assertAutoPullIntervalMs(entry.intervalMs);
 	          };
 
-	          const persistAutoPullToStorage = () => {
+          const ensureAutoPullTimer = () => {
+            const active = refreshAutoPullScheduler();
+            if (lastAutoPullPreferenceError !== null) {
+              throw new Error(lastAutoPullPreferenceError);
+            }
+            if (autoPullEnabled && active !== true) {
+              throw new Error(
+                'Unable to start automatic annotation pulls for the exact current scope'
+              );
+            }
+            return active;
+          };
+
+	          const commitAutoPullPreference = ({
+              enabled,
+              intervalMs,
+            }) => {
+              if (typeof enabled !== 'boolean') {
+                throw new TypeError(
+                  'Auto-pull enabled preference must be a boolean'
+                );
+              }
+              const exactIntervalMs =
+                assertAutoPullIntervalMs(intervalMs);
 	            const key = computeAutoPullScopeKey();
 	            if (key === null || key !== autoPullScopeKey) {
 	              throw new Error(
 	                'Auto-pull preferences require the current exact cache scope'
 	              );
 	            }
-	            const prefs = readAutoPullPrefs();
-	            prefs[key] = {
-	              enabled: autoPullEnabled,
-	              intervalMs: assertAutoPullIntervalMs(autoPullIntervalMs)
+	            const previousPrefs = readAutoPullPrefs();
+              const previousEntry = previousPrefs[key];
+              const previousEnabled = previousEntry?.enabled === true;
+              const previousIntervalMs =
+                previousEntry === undefined
+                  ? DEFAULT_AUTO_PULL_INTERVAL_MS
+                  : assertAutoPullIntervalMs(previousEntry.intervalMs);
+              const nextPrefs = {
+                ...previousPrefs,
+                [key]: {
+                  enabled,
+                  intervalMs: exactIntervalMs,
+                },
 	            };
-	            writeAutoPullPrefs(prefs);
-	          };
+	            writeAutoPullPrefs(nextPrefs);
+              autoPullEnabled = enabled;
+              autoPullIntervalMs = exactIntervalMs;
 
-          const stopAutoPull = () => {
-            if (!autoPullTimer) return;
-            clearInterval(autoPullTimer);
-            autoPullTimer = null;
-            autoPullTimerMs = 0;
-          };
+              try {
+                ensureAutoPullTimer();
+              } catch (primaryError) {
+                const rollbackErrors = [primaryError];
+                let durableStateRolledBack = false;
+                try {
+                  writeAutoPullPrefs(previousPrefs);
+                  durableStateRolledBack = true;
+                } catch (rollbackStorageError) {
+                  rollbackErrors.push(rollbackStorageError);
+                }
+
+                if (durableStateRolledBack) {
+                  autoPullEnabled = previousEnabled;
+                  autoPullIntervalMs = previousIntervalMs;
+                }
+                try {
+                  ensureAutoPullTimer();
+                } catch (rollbackTimerError) {
+                  rollbackErrors.push(rollbackTimerError);
+                }
+
+                if (rollbackErrors.length === 1) throw primaryError;
+                throw new AggregateError(
+                  rollbackErrors,
+                  durableStateRolledBack
+                    ? 'Unable to save auto-pull preference; restoring its live schedule also failed'
+                    : 'Unable to save auto-pull preference and its durable rollback failed'
+                );
+              }
+	          };
 
           const toRepoFullName = (repoRef) => {
             if (repoRef === null) return null;
@@ -2214,59 +3952,6 @@ export function initCommunityAnnotationControls({
             }
             return parsed.ownerRepo;
           };
-
-          const tickAutoPull = async () => {
-            if (!autoPullEnabled) return;
-            if (uiStep !== 4) return;
-            if (syncBusy) return;
-            if (isSigningIn || isConnectingRepo || isReloadingRepos) return;
-            const online = navigator.onLine !== false;
-            if (!online) return;
-            const authed = githubAuth.isAuthenticated();
-            const repoRef =
-              did && authed
-                ? getAnnotationRepoForDataset(did, getEffectiveUserKey())
-                : null;
-            const connectedName = toRepoFullName(repoRef);
-            if (!authed || !connectedName) return;
-            await pullFromGitHub({ repoOverride: repoRef, quiet: true });
-          };
-
-          const ensureAutoPullTimer = () => {
-            const authed = githubAuth.isAuthenticated();
-            const repoRef =
-              did && authed
-                ? getAnnotationRepoForDataset(did, getEffectiveUserKey())
-                : null;
-            const connectedName = toRepoFullName(repoRef);
-            const shouldRun = Boolean(autoPullEnabled && authed && connectedName && uiStep === 4);
-            if (!shouldRun) {
-              stopAutoPull();
-              return;
-            }
-            const desired = assertAutoPullIntervalMs(autoPullIntervalMs);
-            if (autoPullTimer && autoPullTimerMs === desired) return;
-            stopAutoPull();
-            autoPullTimerMs = desired;
-            autoPullTimer = setInterval(() => {
-              void tickAutoPull().catch((error) => {
-                autoPullEnabled = false;
-                autoPullCheckbox.checked = false;
-                stopAutoPull();
-                const message =
-                  typeof error?.message === 'string' && error.message
-                    ? error.message
-                    : 'Automatic annotation pull failed';
-                status.textContent = message;
-                notifications.error(message, {
-                  category: 'annotation',
-                  duration: 10000,
-                });
-              });
-            }, desired);
-          };
-
-          modalAbort.signal.addEventListener('abort', () => stopAutoPull());
 
           const isStepLocked = (step, { authed, connectedName }) => {
             if (step === 1) return false;
@@ -2324,6 +4009,23 @@ export function initCommunityAnnotationControls({
             }
           };
 
+          const resetRepoViewState = () => {
+            repoPageStep2 = 0;
+            repoPageStep3 = 0;
+            repoFocusRequestFullName = null;
+            repoRenderSnapshot = null;
+          };
+
+          const clearRepoView = (grid, pager) => {
+            if (grid.childNodes.length > 0) grid.replaceChildren();
+            pager.root.hidden = true;
+            pager.pageStatus.textContent = '';
+            pager.previous.disabled = true;
+            pager.previous.hidden = true;
+            pager.next.disabled = true;
+            pager.next.hidden = true;
+          };
+
           const disconnectGitHubSession = ({ message, notify = 'error' } = {}) => {
             const msg = String(message || 'GitHub disconnected.').trim() || 'GitHub disconnected.';
             disconnectGitHubAndAnnotationRepo({
@@ -2339,70 +4041,250 @@ export function initCommunityAnnotationControls({
             installations = [];
             allRepos = [];
             selectedRepoFullName = '';
-            repoGridStep2.innerHTML = '';
-            repoGridStep3.innerHTML = '';
+            resetRepoViewState();
             status.textContent = msg;
             uiStep = 1;
             updateUi();
           };
 
           const renderRepoCards = () => {
+            const activeStep =
+              uiStep === 2
+                ? 2
+                : (uiStep === 3 ? 3 : null);
+            if (activeStep === null) {
+              clearRepoView(repoGridStep2, repoPagerStep2);
+              clearRepoView(repoGridStep3, repoPagerStep3);
+              repoRenderSnapshot = null;
+              return;
+            }
+
+            const selectable = activeStep === 3;
+            const grid = selectable ? repoGridStep3 : repoGridStep2;
+            const pager = selectable ? repoPagerStep3 : repoPagerStep2;
+            if (selectable) {
+              clearRepoView(repoGridStep2, repoPagerStep2);
+            } else {
+              clearRepoView(repoGridStep3, repoPagerStep3);
+            }
+
             const base = Array.isArray(allRepos) ? allRepos : [];
             const q = String(filterInput.value || '').trim().toLowerCase();
-            const reposStep2 = base;
-            const reposStep3 = q ? base.filter((r) => String(r.full_name || '').toLowerCase().includes(q)) : base;
-            const connected = toRepoFullName(connectedRepoRef);
+            const source =
+              selectable && q
+                ? base.filter((repo) => repo.searchKey.includes(q))
+                : base;
+            const pageCount = Math.max(
+              1,
+              Math.ceil(source.length / GITHUB_REPOSITORY_PAGE_SIZE)
+            );
+            const requestedPage =
+              selectable ? repoPageStep3 : repoPageStep2;
+            const page = Math.max(
+              0,
+              Math.min(pageCount - 1, requestedPage)
+            );
+            if (selectable) repoPageStep3 = page;
+            else repoPageStep2 = page;
 
-            const renderGrid = (grid, { selectable }) => {
-              grid.innerHTML = '';
-              const source = selectable ? reposStep3 : reposStep2;
-              if (!source.length) {
-                grid.appendChild(el('div', { className: 'legend-help', text: '(no repos found)' }));
-                return;
-              }
-              for (const r of source) {
-                const full = String(r.full_name || '').trim();
-                if (!full) continue;
-                const isConnected = connected && full === connected;
-                const isSelected = selectable && selectedRepoFullName && full === selectedRepoFullName;
+            const connected = toRepoFullName(connectedRepoRef);
+            if (
+              repoRenderSnapshot !== null &&
+              repoRenderSnapshot.step === activeStep &&
+              repoRenderSnapshot.repos === base &&
+              repoRenderSnapshot.query === q &&
+              repoRenderSnapshot.page === page &&
+              repoRenderSnapshot.connected === connected &&
+              repoRenderSnapshot.selected === selectedRepoFullName &&
+              repoRenderSnapshot.loading === isReloadingRepos &&
+              repoRenderSnapshot.loaded === repoListLoaded
+            ) {
+              return;
+            }
+
+            const focusedRepoFullName =
+              repoFocusRequestFullName ??
+              (
+                grid.contains(document.activeElement)
+                  ? document.activeElement?.getAttribute?.(
+                      'data-repo-full-name'
+                    ) ?? null
+                  : null
+              );
+            const fragment = document.createDocumentFragment();
+            const pageStart = page * GITHUB_REPOSITORY_PAGE_SIZE;
+            const pageEnd = Math.min(
+              source.length,
+              pageStart + GITHUB_REPOSITORY_PAGE_SIZE
+            );
+            const visibleRepos = source.slice(pageStart, pageEnd);
+
+            if (visibleRepos.length === 0) {
+              const emptyMessage =
+                isReloadingRepos && !repoListLoaded
+                  ? 'Loading repositories…'
+                  : (
+                    selectable && q
+                      ? 'No repositories match this filter.'
+                      : 'No repositories found.'
+                  );
+              fragment.appendChild(el('div', {
+                className: 'legend-help',
+                text: emptyMessage,
+              }));
+            } else {
+              for (const repo of visibleRepos) {
+                const full = repo.full_name;
+                const isConnected = Boolean(connected && full === connected);
+                const isSelected = Boolean(
+                  selectable &&
+                  selectedRepoFullName &&
+                  full === selectedRepoFullName
+                );
                 const cls = [
                   'community-annotation-repo-card',
-                  selectable ? '' : 'community-annotation-repo-card--static',
-                  isSelected ? 'community-annotation-repo-card--selected' : '',
-                  isConnected ? 'community-annotation-repo-card--connected' : ''
+                  selectable
+                    ? ''
+                    : 'community-annotation-repo-card--static',
+                  isSelected
+                    ? 'community-annotation-repo-card--selected'
+                    : '',
+                  isConnected
+                    ? 'community-annotation-repo-card--connected'
+                    : ''
                 ].filter(Boolean).join(' ');
-
-                const card = el('div', { className: cls, role: selectable ? 'button' : undefined, tabIndex: selectable ? '0' : undefined });
-                const title = el('div', { className: 'community-annotation-repo-title', text: full });
-                const meta = el('div', { className: 'community-annotation-repo-meta' });
-                meta.appendChild(el('span', { className: 'community-annotation-repo-meta-main', text: r.private ? 'Private' : 'Public' }));
-                const pills = el('span', { className: 'community-annotation-repo-meta-pills' });
-                if (isSelected) pills.appendChild(el('span', { className: 'community-annotation-repo-meta-pill', text: 'Selected' }));
-                if (isConnected) pills.appendChild(el('span', { className: 'community-annotation-repo-meta-pill', text: 'Connected' }));
-                if (pills.childNodes.length) meta.appendChild(pills);
+                const card = el(selectable ? 'button' : 'div', {
+                  ...(selectable
+                    ? {
+                        type: 'button',
+                        'aria-pressed': isSelected ? 'true' : 'false',
+                      }
+                    : {}),
+                  className: cls,
+                  'data-repo-full-name': full,
+                });
+                const title = el('span', {
+                  className: 'community-annotation-repo-title',
+                  text: full,
+                });
+                const meta = el('span', {
+                  className: 'community-annotation-repo-meta',
+                });
+                meta.appendChild(el('span', {
+                  className: 'community-annotation-repo-meta-main',
+                  text: repo.private ? 'Private' : 'Public',
+                }));
+                const pills = el('span', {
+                  className: 'community-annotation-repo-meta-pills',
+                });
+                if (isSelected) {
+                  pills.appendChild(el('span', {
+                    className: 'community-annotation-repo-meta-pill',
+                    text: 'Selected',
+                  }));
+                }
+                if (isConnected) {
+                  pills.appendChild(el('span', {
+                    className: 'community-annotation-repo-meta-pill',
+                    text: 'Connected',
+                  }));
+                }
+                if (pills.childNodes.length > 0) meta.appendChild(pills);
                 card.appendChild(title);
                 card.appendChild(meta);
 
                 if (selectable) {
-                  const select = () => {
-                    selectedRepoFullName = (selectedRepoFullName === full) ? '' : full;
+                  card.addEventListener('click', () => {
+                    repoFocusRequestFullName = full;
+                    selectedRepoFullName =
+                      selectedRepoFullName === full ? '' : full;
                     updateUi();
-                  };
-                  card.addEventListener('click', select);
-                  card.addEventListener('keydown', (e) => {
-                    if (e.key !== 'Enter' && e.key !== ' ') return;
-                    e.preventDefault();
-                    select();
                   });
                 }
-
-                grid.appendChild(card);
+                fragment.appendChild(card);
               }
+            }
+
+            grid.replaceChildren(fragment);
+            pager.root.hidden = false;
+            const hasMultiplePages = pageCount > 1;
+            pager.previous.hidden = !hasMultiplePages;
+            pager.next.hidden = !hasMultiplePages;
+            pager.previous.disabled = page === 0;
+            pager.next.disabled = page >= pageCount - 1;
+            pager.pageStatus.textContent =
+              source.length === 0
+                ? 'No repositories to display.'
+                : (
+                  `Showing ${pageStart + 1}–${pageEnd} of ` +
+                  `${source.length} repositories. ` +
+                  `Page ${page + 1} of ${pageCount}.`
+                );
+            repoRenderSnapshot = {
+              connected,
+              loaded: repoListLoaded,
+              loading: isReloadingRepos,
+              page,
+              query: q,
+              repos: base,
+              selected: selectedRepoFullName,
+              step: activeStep,
             };
 
-            renderGrid(repoGridStep2, { selectable: false });
-            renderGrid(repoGridStep3, { selectable: true });
+            if (focusedRepoFullName !== null) {
+              const replacement = Array.from(
+                grid.querySelectorAll('[data-repo-full-name]')
+              ).find(
+                (candidate) =>
+                  candidate.getAttribute('data-repo-full-name') ===
+                  focusedRepoFullName
+              ) ?? null;
+              if (replacement instanceof HTMLElement) {
+                replacement.focus();
+              } else {
+                pager.pageStatus.focus();
+              }
+              if (repoFocusRequestFullName === focusedRepoFullName) {
+                repoFocusRequestFullName = null;
+              }
+            }
           };
+
+          const changeRepoPage = (step, delta, sourceButton) => {
+            if (step === 2) {
+              repoPageStep2 = Math.max(0, repoPageStep2 + delta);
+            } else {
+              repoPageStep3 = Math.max(0, repoPageStep3 + delta);
+            }
+            renderRepoCards();
+            const pager = step === 2 ? repoPagerStep2 : repoPagerStep3;
+            if (sourceButton.disabled) {
+              const alternateControl =
+                sourceButton === pager.next
+                  ? pager.previous
+                  : pager.next;
+              if (
+                !alternateControl.disabled &&
+                !alternateControl.hidden
+              ) {
+                alternateControl.focus();
+              } else {
+                pager.pageStatus.focus();
+              }
+            }
+          };
+          repoPagerStep2.previous.addEventListener('click', () => {
+            changeRepoPage(2, -1, repoPagerStep2.previous);
+          });
+          repoPagerStep2.next.addEventListener('click', () => {
+            changeRepoPage(2, 1, repoPagerStep2.next);
+          });
+          repoPagerStep3.previous.addEventListener('click', () => {
+            changeRepoPage(3, -1, repoPagerStep3.previous);
+          });
+          repoPagerStep3.next.addEventListener('click', () => {
+            changeRepoPage(3, 1, repoPagerStep3.next);
+          });
 
           const updateUi = () => {
             const authed = Boolean(githubAuth.isAuthenticated?.());
@@ -2478,9 +4360,28 @@ export function initCommunityAnnotationControls({
             reloadReposBtn.setAttribute('data-loading', isReloadingRepos ? 'true' : 'false');
             reloadReposBtn.textContent = isReloadingRepos ? 'Reloading…' : 'Reload';
 
-            const canSync = Boolean(authed && connectedName && !syncBusy);
-            pullBtn.disabled = !canSync;
-            publishBtn.disabled = !canSync;
+	            const canSync = Boolean(authed && connectedName && !syncBusy);
+              const publishCapability =
+                lastRepoInfo === null
+                  ? null
+                  : getPublishCapability(lastRepoInfo);
+	            pullBtn.disabled = !canSync;
+	            publishBtn.disabled =
+                !canSync ||
+                publishCapability === null ||
+                !publishCapability.canPublish;
+              publishBtn.title =
+                !canSync
+                  ? 'Connect a repository and wait for active sync to finish.'
+                  : (
+                    publishCapability === null
+                      ? 'Checking GitHub publication permissions…'
+                      : (
+                        publishCapability.canPublish
+                          ? 'Publish local annotation changes to GitHub.'
+                          : describeCannotPublishMessage(connectedName)
+                      )
+                  );
             autoPullCheckbox.checked = autoPullEnabled;
             autoPullCheckbox.disabled = busy || !canSync;
             autoPullSelect.value = `${assertAutoPullIntervalMs(autoPullIntervalMs)}`;
@@ -2504,9 +4405,14 @@ export function initCommunityAnnotationControls({
 
             if (authed && uiStep === 2) {
               const n = allRepos.length;
-              step2Help.textContent = n
-                ? `${n} repos available. Click Next to choose one, or Add repo to enable more.`
-                : 'No repos available yet. Click Add repo, choose repos in GitHub, then come back (or click Reload).';
+              step2Help.textContent =
+                isReloadingRepos && !repoListLoaded
+                  ? 'Loading repositories…'
+                  : (
+                    n
+                      ? `${n} repos available. Click Next to choose one, or Add repo to enable more.`
+                      : 'No repos available yet. Click Add repo, choose repos in GitHub, then come back (or click Reload).'
+                  );
             }
 
             if (authed && uiStep === 3) {
@@ -2520,8 +4426,16 @@ export function initCommunityAnnotationControls({
             }
 
             if (authed && uiStep === 3) {
-              step3Selection.textContent = connectedName ? `Connected: ${connectedName}` : '';
-              step3Selection.style.display = connectedName ? '' : 'none';
+              const selectionParts = [];
+              if (selectedRepoFullName) {
+                selectionParts.push(`Selected: ${selectedRepoFullName}`);
+              }
+              if (connectedName) {
+                selectionParts.push(`Connected: ${connectedName}`);
+              }
+              step3Selection.textContent = selectionParts.join(' · ');
+              step3Selection.style.display =
+                selectionParts.length > 0 ? '' : 'none';
             }
 
             // Step intro content.
@@ -2569,14 +4483,14 @@ export function initCommunityAnnotationControls({
           };
 
           const loadRepoList = async () => {
+            if (!isModalOwnerCurrent() || isReloadingRepos) return;
             if (!githubAuth.isAuthenticated()) {
               repoListLoaded = false;
               installationsLoaded = false;
               installations = [];
               allRepos = [];
               selectedRepoFullName = '';
-              repoGridStep2.innerHTML = '';
-              repoGridStep3.innerHTML = '';
+              resetRepoViewState();
               updateUi();
               return;
             }
@@ -2584,12 +4498,16 @@ export function initCommunityAnnotationControls({
             updateUi();
             status.textContent = uiStep === 3 ? 'Loading repositories…' : '';
             try {
-              const instData = await githubAuth.listInstallations();
+              const instData = await githubAuth.listInstallations({
+                signal: modalAbort.signal,
+              });
+              if (!isModalOwnerCurrent()) return;
               installations = instData.installations;
               installationsLoaded = true;
               if (!installations.length) {
                 repoListLoaded = true;
                 allRepos = [];
+                resetRepoViewState();
                 status.textContent = 'No installations found. Install the app, choose repos, then reload.';
                 return;
               }
@@ -2598,7 +4516,12 @@ export function initCommunityAnnotationControls({
               const seenRepoIds = new Set();
               const seenRepoNames = new Set();
               for (const inst of installations) {
-                const repoData = await githubAuth.listInstallationRepos(inst.id);
+                if (!isModalOwnerCurrent()) return;
+                const repoData = await githubAuth.listInstallationRepos(
+                  inst.id,
+                  { signal: modalAbort.signal },
+                );
+                if (!isModalOwnerCurrent()) return;
                 for (const repo of repoData.repositories) {
                   const nameKey = repo.full_name.toLowerCase();
                   if (
@@ -2609,28 +4532,42 @@ export function initCommunityAnnotationControls({
                       `GitHub returned duplicate repository ${repo.full_name}`
                     );
                   }
+                  if (
+                    repos.length >=
+                    GITHUB_REPOSITORY_DISCOVERY_MAX_ITEMS
+                  ) {
+                    throw new Error(
+                      'GitHub repository discovery exceeds 10000 repositories'
+                    );
+                  }
                   seenRepoIds.add(repo.id);
                   seenRepoNames.add(nameKey);
                   repos.push({
                     id: repo.id,
                     full_name: repo.full_name,
                     private: repo.private,
+                    searchKey: nameKey,
                   });
                 }
               }
 
+              if (!isModalOwnerCurrent()) return;
               allRepos = repos.sort((a, b) => {
                 if (a.full_name < b.full_name) return -1;
                 if (a.full_name > b.full_name) return 1;
                 return 0;
               });
+              resetRepoViewState();
               repoListLoaded = true;
               status.textContent = allRepos.length ? '' : 'No repositories available yet. Install the app and select repos, then reload.';
             } catch (err) {
+              if (!isModalOwnerCurrent()) return;
               repoListLoaded = false;
               installationsLoaded = false;
               installations = [];
               allRepos = [];
+              selectedRepoFullName = '';
+              resetRepoViewState();
               if (isWorkerOriginSecurityError(err)) {
                 disconnectGitHubSession({ message: err?.message || 'Invalid GitHub worker origin.', notify: 'error' });
                 return;
@@ -2642,11 +4579,12 @@ export function initCommunityAnnotationControls({
               status.textContent = describeGitHubAuthReachabilityError(err);
             } finally {
               isReloadingRepos = false;
-              updateUi();
+              if (isModalOwnerCurrent()) updateUi();
             }
           };
 
           const connectSelectedRepo = async () => {
+            if (!isModalOwnerCurrent()) return;
             if (!githubAuth.isAuthenticated?.()) {
               status.textContent = 'Sign in first.';
               updateUi();
@@ -2679,9 +4617,15 @@ export function initCommunityAnnotationControls({
                   promptIfMissing: false
                 });
               }
+              if (!isModalOwnerCurrent()) return;
 
               status.textContent = 'Pulling latest annotations…';
-              const result = await pullFromGitHub({ repoOverride: selected, confirmDatasetMismatch: true });
+              const result = await pullFromGitHub({
+                repoOverride: selected,
+                confirmDatasetMismatch: true,
+                signal: modalAbort.signal,
+              });
+              if (!isModalOwnerCurrent()) return;
               if (result?.ok) {
                 selectedRepoFullName = '';
                 status.textContent = 'Connected and up to date.';
@@ -2693,7 +4637,7 @@ export function initCommunityAnnotationControls({
               }
             } finally {
               isConnectingRepo = false;
-              updateUi();
+              if (isModalOwnerCurrent()) updateUi();
             }
           };
 
@@ -2703,8 +4647,17 @@ export function initCommunityAnnotationControls({
             status.textContent = 'Redirecting to GitHub sign-in…';
             updateUi();
             try {
-              githubAuth.signIn?.();
+              await githubAuth.signIn?.({
+                signal: modalAbort.signal,
+              });
+              if (isModalOwnerCurrent()) {
+                isSigningIn = false;
+                status.textContent =
+                  'GitHub sign-in navigation was requested.';
+                updateUi();
+              }
             } catch (err) {
+              if (modalAbort.signal.aborted) return;
               isSigningIn = false;
               status.textContent = String(err?.message || 'Sign-in failed');
               updateUi();
@@ -2716,84 +4669,61 @@ export function initCommunityAnnotationControls({
           prevBtn.addEventListener('click', () => {
             const step = Number(uiStep) || 1;
             if (step === 3 || step === 4) selectedRepoFullName = '';
-            if (step === 4) {
-              try {
-                const authedUserKey = toGitHubUserKey(githubAuth.getUser?.());
-                if (did && authedUserKey) {
-                  const repoRef = getAnnotationRepoForDataset(did, authedUserKey);
-                  const connectedName = toRepoFullName(repoRef);
-                  if (connectedName) {
-                    clearAnnotationRepoForDataset(did, authedUserKey);
-                    setUrlAnnotationRepo(null);
-                    connectedRepoRef = null;
-                    lastRepoInfo = null;
-                    access.clearRole?.();
-                    session.setCacheContext({ datasetId: did, repoRef: null, userId: getCacheUserId() });
-                    notifications.success('Disconnected annotation repository.', { category: 'annotation', duration: 2200 });
-                    render();
-                  }
-                }
-              } catch (error) {
-                status.textContent =
-                  typeof error?.message === 'string' && error.message
-                    ? error.message
-                    : 'Unable to disconnect the annotation repository.';
-                notifications.error(status.textContent, {
-                  category: 'annotation',
-                  duration: 8_000,
-                });
-                updateUi();
-                return;
-              }
-            }
             clearStatusOnStepChange = true;
             uiStep = Math.max(1, (Number(uiStep) || 1) - 1);
             updateUi();
           });
 
-          nextBtn.addEventListener('click', async () => {
-            const step = Number(uiStep) || 1;
-            const authed = Boolean(githubAuth.isAuthenticated?.());
-            const storedRepoRef = did
-              ? getAnnotationRepoForDataset(did, getEffectiveUserKey())
-              : null;
-            const repoRef =
-              storedRepoRef !== null ? storedRepoRef : connectedRepoRef;
-            const connectedName = toRepoFullName(repoRef);
+          nextBtn.addEventListener('click', () => {
+            startBackgroundTask(async () => {
+              const step = Number(uiStep) || 1;
+              const authed = Boolean(githubAuth.isAuthenticated?.());
+              const storedRepoRef = did
+                ? getAnnotationRepoForDataset(did, getEffectiveUserKey())
+                : null;
+              const repoRef =
+                storedRepoRef !== null ? storedRepoRef : connectedRepoRef;
+              const connectedName = toRepoFullName(repoRef);
 
-            if (step === 1) {
-              if (!authed) return;
-              clearStatusOnStepChange = true;
-              uiStep = 2;
-              updateUi();
-              return;
-            }
-
-            if (step === 2) {
-              selectedRepoFullName = '';
-              clearStatusOnStepChange = true;
-              uiStep = 3;
-              updateUi();
-              return;
-            }
-
-            if (step === 3) {
-              const selected = String(selectedRepoFullName || '').trim();
-              if (connectedName && (!selected || selected === connectedName)) {
-                selectedRepoFullName = '';
+              if (step === 1) {
+                if (!authed) return;
                 clearStatusOnStepChange = true;
-                uiStep = 4;
+                uiStep = 2;
                 updateUi();
                 return;
               }
-              await connectSelectedRepo();
-              return;
-            }
 
-            closeModal();
+              if (step === 2) {
+                selectedRepoFullName = '';
+                clearStatusOnStepChange = true;
+                uiStep = 3;
+                updateUi();
+                return;
+              }
+
+              if (step === 3) {
+                const selected = String(selectedRepoFullName || '').trim();
+                if (connectedName && (!selected || selected === connectedName)) {
+                  selectedRepoFullName = '';
+                  clearStatusOnStepChange = true;
+                  uiStep = 4;
+                  updateUi();
+                  return;
+                }
+                await connectSelectedRepo();
+                return;
+              }
+
+              closeModal();
+            }, { label: 'GitHub annotation setup step failed' });
           });
 
-          step1SignInBtn.addEventListener('click', () => signIn());
+          step1SignInBtn.addEventListener('click', () => {
+            startBackgroundTask(
+              () => signIn(),
+              { label: 'GitHub annotation sign-in failed' },
+            );
+          });
 
           addRepoBtn.addEventListener('click', () => {
             if (!installationsLoaded) {
@@ -2818,73 +4748,112 @@ export function initCommunityAnnotationControls({
               status.textContent = 'Unable to open the GitHub App repository settings.';
             }
           });
-          reloadReposBtn.addEventListener('click', () => loadRepoList());
-          filterInput.addEventListener('input', () => renderRepoCards());
+          reloadReposBtn.addEventListener('click', () => {
+            startBackgroundTask(
+              () => loadRepoList(),
+              { label: 'Unable to reload GitHub annotation repositories' },
+            );
+          });
+          filterInput.addEventListener('input', () => {
+            repoPageStep3 = 0;
+            renderRepoCards();
+          });
+
+          const showAutoPullPreferenceFailure = (primaryError) => {
+            const errors = [primaryError];
+            try {
+              syncAutoPullFromStorage({ force: true });
+            } catch (recoveryError) {
+              errors.push(recoveryError);
+            }
+            autoPullCheckbox.checked = autoPullEnabled;
+            autoPullSelect.value =
+              `${assertAutoPullIntervalMs(autoPullIntervalMs)}`;
+            autoPullSelect.disabled =
+              autoPullCheckbox.disabled || !autoPullEnabled;
+            const error =
+              errors.length === 1
+                ? primaryError
+                : new AggregateError(
+                    errors,
+                    'Unable to save and restore the auto-pull preference'
+                  );
+            status.textContent =
+              typeof error?.message === 'string' && error.message
+                ? error.message
+                : 'Unable to save auto-pull preferences';
+          };
 
           autoPullCheckbox.addEventListener('change', () => {
+            const requestedEnabled = autoPullCheckbox.checked;
             try {
-              syncAutoPullFromStorage();
-              autoPullEnabled = autoPullCheckbox.checked;
-              persistAutoPullToStorage();
+              syncAutoPullFromStorage({ force: true });
+              commitAutoPullPreference({
+                enabled: requestedEnabled,
+                intervalMs: autoPullIntervalMs,
+              });
               status.textContent = '';
-              ensureAutoPullTimer();
               updateUi();
             } catch (error) {
-              autoPullEnabled = false;
-              autoPullCheckbox.checked = false;
-              stopAutoPull();
-              status.textContent =
-                typeof error?.message === 'string' && error.message
-                  ? error.message
-                  : 'Unable to save auto-pull preferences';
+              showAutoPullPreferenceFailure(error);
             }
           });
 
           autoPullSelect.addEventListener('change', () => {
             try {
-              syncAutoPullFromStorage();
-              autoPullIntervalMs =
+              const requestedIntervalMs =
                 autoPullIntervalFromSelectValue(autoPullSelect.value);
-              persistAutoPullToStorage();
+              syncAutoPullFromStorage({ force: true });
+              commitAutoPullPreference({
+                enabled: autoPullEnabled,
+                intervalMs: requestedIntervalMs,
+              });
               status.textContent = '';
-              ensureAutoPullTimer();
               updateUi();
             } catch (error) {
-              autoPullEnabled = false;
-              autoPullCheckbox.checked = false;
-              stopAutoPull();
-              status.textContent =
-                typeof error?.message === 'string' && error.message
-                  ? error.message
-                  : 'Unable to save auto-pull preferences';
+              showAutoPullPreferenceFailure(error);
             }
           });
 
-          pullBtn.addEventListener('click', async () => {
-            pullBtn.disabled = true;
-            status.textContent = 'Pulling latest annotations…';
-            try {
-              const promise = pullFromGitHub({});
-              updateUi();
-              await promise;
-              status.textContent = syncError ? `⚠ ${syncError}` : 'Pulled latest annotations.';
-            } finally {
-              pullBtn.disabled = false;
-              updateUi();
-            }
+          pullBtn.addEventListener('click', () => {
+            startBackgroundTask(async () => {
+              pullBtn.disabled = true;
+              status.textContent = 'Pulling latest annotations…';
+              try {
+                const promise = pullFromGitHub({
+                  signal: modalAbort.signal,
+                });
+                updateUi();
+                await promise;
+                if (!isModalOwnerCurrent()) return;
+                status.textContent = syncError ? `⚠ ${syncError}` : 'Pulled latest annotations.';
+              } finally {
+                if (isModalOwnerCurrent()) {
+                  pullBtn.disabled = false;
+                  updateUi();
+                }
+              }
+            }, { label: 'GitHub annotation pull action failed' });
           });
-          publishBtn.addEventListener('click', async () => {
-            publishBtn.disabled = true;
-            status.textContent = 'Publishing…';
-            try {
-              const promise = pushToGitHub();
-              updateUi();
-              await promise;
-              status.textContent = syncError ? `⚠ ${syncError}` : 'Publish complete.';
-            } finally {
-              publishBtn.disabled = false;
-              updateUi();
-            }
+          publishBtn.addEventListener('click', () => {
+            startBackgroundTask(async () => {
+              publishBtn.disabled = true;
+              status.textContent = 'Publishing…';
+              try {
+                const promise = pushToGitHub({
+                  signal: modalAbort.signal,
+                });
+                updateUi();
+                await promise;
+                if (!isModalOwnerCurrent()) return;
+                status.textContent = syncError ? `⚠ ${syncError}` : 'Publish complete.';
+              } finally {
+                if (isModalOwnerCurrent()) {
+                  publishBtn.disabled = false;
+                  updateUi();
+                }
+              }
+            }, { label: 'GitHub annotation publish action failed' });
           });
 
           githubSettingsBtn.addEventListener('click', () => {
@@ -2924,13 +4893,31 @@ export function initCommunityAnnotationControls({
             if (!githubAuth.isAuthenticated?.()) return;
             if (uiStep !== 2) return;
             if (isReloadingRepos) return;
-            loadRepoList();
+            startBackgroundTask(
+              () => loadRepoList(),
+              { label: 'Unable to refresh GitHub annotation repositories' },
+            );
           }, { signal: modalAbort.signal });
         }
       });
 
+      const setupClose = modalRef?.close ?? null;
+      if (setupClose !== null) {
+        if (typeof setupClose !== 'function') {
+          throw new TypeError(
+            'GitHub connection modal must expose an exact close function'
+          );
+        }
+        activeGitHubConnectionClose = setupClose;
+      }
       const overlay = modalRef?.overlay || null;
-      if (!overlay) return;
+      if (!overlay) {
+        if (activeGitHubConnectionClose === setupClose) {
+          activeGitHubConnectionClose = null;
+        }
+        resolveOnce(null);
+        return;
+      }
       const cleanup = () => {
         modalRef?.content?.__cellucidCleanup?.();
       };
@@ -2943,6 +4930,9 @@ export function initCommunityAnnotationControls({
         if (!document.body.contains(overlay)) {
           observer.disconnect();
           cleanup();
+          if (activeGitHubConnectionClose === setupClose) {
+            activeGitHubConnectionClose = null;
+          }
           resolveOnce(mode === 'auth' ? Boolean(githubAuth.isAuthenticated?.()) : null);
         }
       });
@@ -2967,17 +4957,31 @@ export function initCommunityAnnotationControls({
     });
   }
 
-		  async function pullFromGitHub({ repoOverride = null, quiet = false, confirmDatasetMismatch = false } = {}) {
+		  async function pullFromGitHub({
+        repoOverride = null,
+        quiet = false,
+        confirmDatasetMismatch = false,
+        signal = null,
+      } = {}) {
 		    if (syncBusy) return { ok: false, skipped: true };
+        const entryOwner = publishContextOwner(getCacheContext({}));
 		    syncBusy = true;
 		    syncError = null;
 		    const opAbort = beginActiveSyncAbortScope();
+        const releaseEntryOwnerSignal =
+          bindActiveSyncOwnerSignal(opAbort, entryOwner.signal);
+        const releaseCallerSignal =
+          signal === null
+            ? null
+            : bindActiveSyncOwnerSignal(opAbort, signal);
 		    render();
 
 		    const datasetId = dataSourceManager?.getCurrentDatasetId?.() || null;
 		    if (!datasetId) {
 		      syncBusy = false;
 		      syncError = 'Missing dataset context.';
+          releaseCallerSignal?.();
+          releaseEntryOwnerSignal();
 		      endActiveSyncAbortScope(opAbort);
 		      render();
 		      return { ok: false, error: syncError };
@@ -2994,6 +4998,8 @@ export function initCommunityAnnotationControls({
 		    if (!repoInput) {
 		      syncBusy = false;
 	      syncError = 'No annotation repo connected.';
+        releaseCallerSignal?.();
+        releaseEntryOwnerSignal();
 	      endActiveSyncAbortScope(opAbort);
 	      render();
 	      return { ok: false, error: syncError };
@@ -3002,6 +5008,8 @@ export function initCommunityAnnotationControls({
 	    if (!githubAuth.isAuthenticated?.()) {
 	      syncBusy = false;
 	      syncError = 'Sign in required.';
+        releaseCallerSignal?.();
+        releaseEntryOwnerSignal();
 	      endActiveSyncAbortScope(opAbort);
 	      render();
 	      return { ok: false, error: syncError };
@@ -3032,9 +5040,15 @@ export function initCommunityAnnotationControls({
         (storedRepoRef === null || repoOverride !== storedRepoRef);
 	    /** @type {string|null} */
 	    let canonicalRepoRef = null;
+      /** @type {{datasetId:string,repoRef:string,userId:number}|null} */
+      let resolvedCacheScope = null;
 	    let preserveExisting = Boolean(overrideForDifferentRepo && storedRepoRef);
 
 		    try {
+        await githubAuth.ensureWorkerCompatible({
+          signal: opAbort.signal,
+        });
+        throwIfActiveSyncAborted(opAbort);
 	      // Cache scoping requires the current authenticated GitHub identity.
 		      const userId = getCacheUserId();
 	      if (!userId) throw new Error('Missing GitHub numeric user id. Disconnect GitHub and sign in again.');
@@ -3091,7 +5105,16 @@ export function initCommunityAnnotationControls({
       });
 
       updateProgress(5, { message: `Validating repo: ${parsed.ownerRepo}...` });
-      const { repoInfo, datasetConfig, config, configSha, datasetId: didResolved } = await sync.validateAndLoadConfig({ datasetId });
+      const {
+        repoInfo,
+        datasetConfig,
+        config,
+        configSha,
+        datasetId: didResolved,
+      } = await sync.validateAndLoadConfig({
+        datasetId,
+        signal: opAbort.signal,
+      });
       throwIfActiveSyncAborted(opAbort);
 
 		      lastRepoInfo = repoInfo;
@@ -3120,31 +5143,6 @@ export function initCommunityAnnotationControls({
 	        fail(base);
 	        return { ok: false, error: base };
 	      }
-
-      // Select one publication route before any repository mutation.
-      {
-        const repoLabel = requireGitHubRepositoryFullName(repoInfo);
-        if (!getPublishCapability(repoInfo).canPublish) {
-          const base = describeCannotPublishMessage(repoLabel);
-          if (preserveExisting) {
-            lastRepoInfo = prevRepoInfo;
-            access.setRole(prevRole);
-            lastRoleContext = prevRoleContext;
-            syncError = `${base}\nExisting repo connection preserved.`;
-            notifications.error(syncError, { category: 'annotation', duration: 10000 });
-            fail(base);
-            return { ok: false, error: base, blocked: true, preservedExisting: true };
-          }
-          disconnectAnnotationRepo({
-            datasetId,
-            userKey: cacheUser,
-            message: `${base}\nDisconnected annotation repo.`,
-            notify: 'error'
-          });
-          fail(base);
-          return { ok: false, error: base, blocked: true };
-        }
-      }
 
       const isDatasetMismatch =
         didResolved &&
@@ -3190,8 +5188,10 @@ export function initCommunityAnnotationControls({
             `- Select annotatable obs columns (and consensus thresholds) in the Manage panel\n` +
             `- Click Publish to write a new supportedDatasets entry for "${didLabel}" to annotations/config.json\n\n` +
             `Annotators are blocked until you publish.`,
-          confirmText: 'Connect anyway'
+          confirmText: 'Connect anyway',
+          signal: opAbort.signal,
         });
+        throwIfActiveSyncAborted(opAbort);
         if (!ok) {
           lastRepoInfo = prevRepoInfo;
           access.setRole(prevRole);
@@ -3208,21 +5208,53 @@ export function initCommunityAnnotationControls({
         }
       }
 
+      // Repository field names are exact dataset field keys. Reject a
+      // guaranteed mismatch before selecting the raw-cache scope or downloading
+      // any user/moderation files.
+      const configuredList = datasetConfig?.fieldsToAnnotate || [];
+      const configSettingsRaw = datasetConfig?.annotatableSettings || {};
+      const configClosedRaw = datasetConfig?.closedFields || [];
+      const catFields = (state.getFields?.() || []).filter(
+        (field) => field?.kind === 'category' && field?._isDeleted !== true
+      );
+      const allKeys = catFields.map((field) => field.key).filter(Boolean);
+      const available = new Set(allKeys);
+      const missingConfigured = configuredList.filter(
+        (key) => !available.has(key)
+      );
+      if (missingConfigured.length) {
+        throw new Error(
+          'annotations/config.json references categorical field(s) absent from this dataset: ' +
+          missingConfigured.join(', ')
+        );
+      }
+
       const ownerRepo = requireGitHubRepositoryFullName(repoInfo);
       const branch = requireResolvedAnnotationBranch(sync);
       canonicalRepoRef = `${ownerRepo}@${branch}`;
 
 		      // Ensure local cache key uses (datasetId, repo, branch, user) with the resolved branch.
 		      session.setCacheContext({ datasetId, repoRef: canonicalRepoRef, userId });
+          await ensureIdentityForUserKey({
+            userKey: authUserKey,
+            login: authLogin,
+            githubUserId: userId,
+            promptIfMissing: false,
+          });
 		      throwIfActiveSyncAborted(opAbort);
 
+          resolvedCacheScope = {
+            datasetId,
+            repoRef: canonicalRepoRef,
+            userId,
+          };
 		      await fileCache.init();
 		      throwIfActiveSyncAborted(opAbort);
 
 	      // -------------------------------------------------------------------
 	      // 1) Pull + cache raw user + moderation files (download only changed via SHA)
 	      // -------------------------------------------------------------------
-		      const cacheScope = { datasetId, repoRef: canonicalRepoRef, userId };
+		      const cacheScope = resolvedCacheScope;
 		      const knownUserShas = fileCache.getKnownShas(
 		        cacheScope,
 		        { prefixes: ['annotations/users/'] }
@@ -3233,8 +5265,14 @@ export function initCommunityAnnotationControls({
 		      );
 		      updateProgress(15, { message: 'Checking `annotations/users/` (SHA)…' });
 		      const [pullResult, moderationResult] = await Promise.all([
-		        sync.pullAllUsers({ knownShas: knownUserShas }),
-		        sync.pullModerationMerges({ knownShas: knownMergeShas }),
+		        sync.pullAllUsers({
+              knownShas: knownUserShas,
+              signal: opAbort.signal,
+            }),
+		        sync.pullModerationMerges({
+              knownShas: knownMergeShas,
+              signal: opAbort.signal,
+            }),
 		      ]);
 		      throwIfActiveSyncAborted(opAbort);
 
@@ -3319,36 +5357,31 @@ export function initCommunityAnnotationControls({
       });
 
       // Every fetched record is already contract-validated by the GitHub boundary.
-	      for (const record of fetchedUserRecords) {
-	        const p = record.path;
-	        const sha = record.sha;
-	        await fileCache.setJson({
-            datasetId,
-            repoRef: canonicalRepoRef,
-            userId,
-            path: p,
-            sha,
-            json: record.doc,
-          });
-	      }
-	      throwIfActiveSyncAborted(opAbort);
-
       // Moderation merges (author-maintained, optional).
       const keepPaths = new Set(userPaths);
       updateProgress(60, { message: 'Checking `annotations/moderation/` (SHA)…' });
       if (moderationResult.sha) {
         keepPaths.add(moderationResult.path);
       }
+      const changedCacheRecords = fetchedUserRecords.map(record => ({
+        path: record.path,
+        sha: record.sha,
+        json: record.doc,
+      }));
       if (moderationResult.doc !== null) {
-        await fileCache.setJson({
-          datasetId,
-          repoRef: canonicalRepoRef,
-          userId,
+        changedCacheRecords.push({
           path: moderationResult.path,
           sha: moderationResult.sha,
           json: moderationResult.doc,
         });
       }
+      await fileCache.setManyJson({
+        datasetId,
+        repoRef: canonicalRepoRef,
+        userId,
+        records: changedCacheRecords,
+        signal: opAbort.signal,
+      });
 	      throwIfActiveSyncAborted(opAbort);
 
 	      // Prune cached files that no longer exist remotely.
@@ -3385,32 +5418,10 @@ export function initCommunityAnnotationControls({
         return entry.json;
       });
 
-      // Repository field names are exact dataset field keys. A mismatch is a
-      // contract failure, never an instruction to prune or ignore config data.
-      const configuredList = datasetConfig?.fieldsToAnnotate || [];
-      const configSettingsRaw = datasetConfig?.annotatableSettings || {};
-      const configClosedRaw = datasetConfig?.closedFields || [];
-      const catFields = (state.getFields?.() || []).filter(
-        (field) => field?.kind === 'category' && field?._isDeleted !== true
-      );
-      const allKeys = catFields.map((field) => field.key).filter(Boolean);
-      const available = new Set(allKeys);
-      const missingConfigured = configuredList.filter((key) => !available.has(key));
-      if (missingConfigured.length) {
-        throw new Error(
-          'annotations/config.json references categorical field(s) absent from this dataset: ' +
-          missingConfigured.join(', ')
-        );
-      }
-      const enabled = new Set(configuredList);
-
-      // Apply cached moderation merges first.
-      //
-      // Important: do not clobber local author edits. If the user has local
-      // merges in this session, treat them as authoritative until published.
+      // Resolve the exact cached moderation document before the session
+      // transaction. Local author edits remain authoritative inside that
+      // transaction until they are published.
       const mergesPath = 'annotations/moderation/merges.json';
-      const localMerges = session.getModerationMerges();
-      const hasLocalMerges = Array.isArray(localMerges) && localMerges.length > 0;
       const remoteMergesKnown = keepPaths.has(mergesPath);
       const cachedMergeEntry = remoteMergesKnown ? cached[mergesPath] : null;
 
@@ -3428,41 +5439,37 @@ export function initCommunityAnnotationControls({
           throw error;
         }
         assertMergesDocument(cachedMergeEntry.json, { path: mergesPath });
-        if (!hasLocalMerges) {
-          session.setModerationMergesFromDoc(cachedMergeEntry.json);
-        }
       }
 
-	      // Rebuild deterministically from the complete raw-file set.
-	      session.rebuildMergedViewFromUserFiles(allUserDocsForSession, { preferLocalVotes: true });
-	      throwIfActiveSyncAborted(opAbort);
-
-      // Apply configured fields for this dataset (author-controlled).
-      for (const key of allKeys) {
-        session.setFieldAnnotated(key, enabled.has(key));
+      const pulledFileShas = { ...remoteUserShas };
+      if (configSha) {
+        pulledFileShas['annotations/config.json'] = configSha;
+      }
+      if (moderationResult?.sha) {
+        pulledFileShas[
+          moderationResult.path || 'annotations/moderation/merges.json'
+        ] = moderationResult.sha;
       }
 
-      session.setAnnotatableConsensusSettingsMap(configSettingsRaw);
-      session.setClosedAnnotatableFields(configClosedRaw);
-
-      // Record (informational) which dataset + annotatable fields the user accessed.
-      // This does not affect any behavior; it is just metadata in `annotations/users/ghid_<id>.json`.
-      session.recordDatasetAccess({
+      // This synchronous call is the visible-session commit point. It publishes
+      // moderation, the complete rebuilt view, settings/access metadata, and
+      // remote SHAs through one notification or restores the prior session
+      // without scheduling persistence.
+      throwIfActiveSyncAborted(opAbort);
+      session.applyPulledRepositoryState({
+        remoteUserDocs: allUserDocsForSession,
+        moderationDocument:
+          remoteMergesKnown ? cachedMergeEntry.json : null,
+        categoricalFieldKeys: allKeys,
+        fieldsToAnnotate: configuredList,
+        annotatableSettings: configSettingsRaw,
+        closedFields: configClosedRaw,
         datasetId: didResolved || datasetId,
-        fieldsToAnnotate: session.getAnnotatedFields()
+        remoteFileShas: pulledFileShas,
+        signal: opAbort.signal,
       });
 
-      session.setRemoteFileShas(remoteUserShas);
-      if (configSha) session.setRemoteFileSha('annotations/config.json', configSha);
-      if (moderationResult?.sha) {
-        session.setRemoteFileSha(
-          moderationResult.path || 'annotations/moderation/merges.json',
-          moderationResult.sha
-        );
-      }
-
 	      updateProgress(100, { message: 'Pull complete' });
-	      throwIfActiveSyncAborted(opAbort);
 
 	      // Commit the repo connection only after a successful Pull.
 	      if (canonicalRepoRef) {
@@ -3483,24 +5490,27 @@ export function initCommunityAnnotationControls({
 	        if (!storedRepoRef || storedRepoRef !== canonicalRepoRef) {
 	          // Avoid wiping the role we just inferred when the repo-map dispatches
 	          // the connection-changed event (which calls applySessionCacheContext()).
-	          lastRoleContext = `${assertExactAnnotationUserKey(
+	          lastRoleContext = `${datasetId}::${assertExactAnnotationUserKey(
               cacheUser,
               'Role cache user'
             )}::${canonicalRepoRef}`;
-	          setAnnotationRepoForDataset(
-	            datasetId,
-	            canonicalRepoRef,
-	            cacheUser,
-	            { branchMode }
-	          );
+	          commitExpectedActiveSyncRepoTransition(() => {
+	            setAnnotationRepoForDataset(
+	              datasetId,
+	              canonicalRepoRef,
+	              cacheUser,
+	              { branchMode }
+	            );
+	          });
 	        }
 	        setUrlAnnotationRepo(canonicalRepoRef);
 	      }
 
       complete('Pulled latest annotations');
       return { ok: true, repoRef: canonicalRepoRef };
-	    } catch (err) {
-	      const statusCode = httpStatusOrNull(err);
+	    } catch (caughtError) {
+          const err = normalizeActiveSyncError(caughtError, opAbort);
+		      const statusCode = httpStatusOrNull(err);
 	      const apiPath = gitHubApiPath(err) || workerPath(err);
 	      const msg = String(err?.message || 'Pull failed').trim() || 'Pull failed';
 
@@ -3511,6 +5521,8 @@ export function initCommunityAnnotationControls({
 	      const branchLabel = toCleanString(sync?.branch || '') || null;
 	      const apiSuffix = apiPath ? ` (${apiPath})` : '';
 		      preserveExisting = Boolean(overrideForDifferentRepo && storedRepoRef);
+          const workerCompatibilityFailure =
+            isWorkerCompatibilityFailure(err);
 
 	      if (err?.code === 'ANNOTATION_SYNC_ABORTED') {
 	        syncError = msg;
@@ -3522,19 +5534,121 @@ export function initCommunityAnnotationControls({
 	        err?.code === 'LOCAL_RAW_CACHE_CORRUPT' ||
 	        err?.code === 'LOCAL_RAW_CACHE_UNAVAILABLE'
 	      ) {
+          let cacheRecoveryMessage = msg;
+          let cacheRecoveryError = err;
+          let cacheCleared = false;
+          if (
+            err?.code === 'LOCAL_RAW_CACHE_CORRUPT' &&
+            resolvedCacheScope !== null
+          ) {
+            try {
+              await fileCache.clearRepo(resolvedCacheScope);
+              cacheCleared = true;
+              cacheRecoveryMessage =
+                `${msg}\n\nThe exact local raw-file cache was cleared. ` +
+                'Reconnect and Pull again to download a clean copy.';
+            } catch (clearError) {
+              cacheRecoveryMessage =
+                `${msg}\n\nCellucid could not fully clear the exact local ` +
+                `raw-file cache: ${String(
+                  clearError?.message || clearError
+                )}. Clear local annotation data, then reconnect and Pull again.`;
+              cacheRecoveryError = new AggregateError(
+                [err, clearError],
+                cacheRecoveryMessage,
+                { cause: err }
+              );
+              cacheRecoveryError.code =
+                'LOCAL_RAW_CACHE_RECOVERY_FAILED';
+              cacheRecoveryError.clearError = clearError;
+            }
+          }
+          let ownershipError = null;
+          try {
+            throwIfActiveSyncAborted(opAbort);
+          } catch (error) {
+            ownershipError = error;
+          }
+          if (
+            ownershipError !== null ||
+            !isContextOwnerCurrent(entryOwner)
+          ) {
+            const abortedMessage =
+              ownershipError?.message ||
+              'Annotation context changed while recovering the exact local raw-file cache.';
+            syncError = abortedMessage;
+            fail(abortedMessage);
+            return {
+              ok: false,
+              error: abortedMessage,
+              cause: ownershipError ?? cacheRecoveryError,
+              aborted: true,
+              corruptedCache: true,
+              cacheCleared,
+            };
+          }
+          if (preserveExisting) {
+            if (cacheCleared) {
+              cacheRecoveryMessage =
+                `${msg}\n\nThe exact candidate repository cache was cleared. ` +
+                'The existing repository connection was preserved; retry this ' +
+                'repository switch to download a clean copy.';
+            } else if (cacheRecoveryError !== err) {
+              cacheRecoveryMessage =
+                `${cacheRecoveryMessage}\n\nThe existing repository connection ` +
+                'was preserved. Clear the candidate repository cache before ' +
+                'retrying this switch.';
+            } else {
+              cacheRecoveryMessage =
+                `${msg}\n\nThe existing repository connection was preserved. ` +
+                'Retry this repository switch after local cache storage is available.';
+            }
+            lastRepoInfo = prevRepoInfo;
+            lastRoleContext = prevRoleContext;
+            access.setRole(prevRole);
+            session.setCacheContext({
+              datasetId,
+              repoRef: storedRepoRef,
+              userId: entryOwner.userId,
+            });
+            syncError = cacheRecoveryMessage;
+            fail(cacheRecoveryMessage);
+            return {
+              ok: false,
+              error: cacheRecoveryMessage,
+              cause: cacheRecoveryError,
+              corruptedCache: true,
+              cacheCleared,
+              preservedExisting: true,
+            };
+          }
 	        disconnectAnnotationRepo({
 	          datasetId,
 	          userKey: cacheUser,
-	          message: msg,
-	          notify: 'error',
+	          message: cacheRecoveryMessage,
+	          notify: quiet ? 'error' : 'none',
 	          preserveSession: true
 	        });
-	        fail(msg);
-	        return { ok: false, error: msg, corruptedCache: true };
+	        fail(cacheRecoveryMessage);
+	        return {
+            ok: false,
+            error: cacheRecoveryMessage,
+            cause: cacheRecoveryError,
+            corruptedCache: true,
+            cacheCleared,
+          };
 	      }
 
-	      if (isWorkerOriginSecurityError(err)) {
-	        disconnectGitHubAndAnnotationRepo({
+		      if (workerCompatibilityFailure) {
+            syncError =
+              `${msg}\nThe repository connection was preserved. ` +
+              'Deploy the matching Cellucid Worker, then retry GitHub sync.';
+            notifications.error(syncError, {
+              category: 'annotation',
+              duration: 10_000,
+            });
+          } else if (isWorkerOriginSecurityError(err)) {
+		        disconnectGitHubAndAnnotationRepo({
 	          datasetId,
 	          message: err?.message || `Invalid GitHub worker origin.${apiSuffix}`,
           notify: 'error'
@@ -3616,7 +5730,11 @@ export function initCommunityAnnotationControls({
 
 	      // Never leave a connected repo in an unknown role state.
 	      // If the pull failed before we could resolve permissions, disconnect.
-	      if (!preserveExisting && (access.getRole?.() || 'unknown') === 'unknown') {
+		      if (
+            !preserveExisting &&
+            !workerCompatibilityFailure &&
+            (access.getRole?.() || 'unknown') === 'unknown'
+          ) {
 	        const stillConnected = Boolean(getAnnotationRepoForDataset(datasetId, cacheUser));
 	        if (stillConnected) {
 	          disconnectAnnotationRepo({
@@ -3637,16 +5755,19 @@ export function initCommunityAnnotationControls({
 	        session.setCacheContext({ datasetId, repoRef: storedRepoRef, userId });
 	      }
 
-	      fail(msg);
-	      return { ok: false, error: msg };
-		    } finally {
-		      endActiveSyncAbortScope(opAbort);
-		      syncBusy = false;
-		      render();
+		      fail(syncError || msg);
+		      return { ok: false, error: syncError || msg };
+			    } finally {
+            releaseCallerSignal?.();
+            releaseEntryOwnerSignal();
+			      endActiveSyncAbortScope(opAbort);
+			      syncBusy = false;
+            flushRoleRetryAfterActiveSync();
+			      render();
 	    }
 	  }
 
-  async function pushToGitHub() {
+  async function pushToGitHub({ signal = null } = {}) {
     const datasetId = dataSourceManager?.getCurrentDatasetId?.() || null;
     if (!datasetId) {
       syncError = 'Missing dataset context.';
@@ -3668,14 +5789,27 @@ export function initCommunityAnnotationControls({
     }
 
     if (syncBusy) return;
+    const entryOwner = publishContextOwner(getCacheContext({}));
     syncBusy = true;
     syncError = null;
     const opAbort = beginActiveSyncAbortScope();
+    const releaseEntryOwnerSignal =
+      bindActiveSyncOwnerSignal(opAbort, entryOwner.signal);
+    const releaseCallerSignal =
+      signal === null
+        ? null
+        : bindActiveSyncOwnerSignal(opAbort, signal);
     render();
 
     const trackerId = notifications.loading(`Publishing your annotations to ${repo}...`, { category: 'annotation' });
+    const completedPublicationSteps = [];
+    let activePublicationPath = null;
 
     try {
+      await githubAuth.ensureWorkerCompatible({
+        signal: opAbort.signal,
+      });
+      throwIfActiveSyncAborted(opAbort);
       const parsed = parseOwnerRepo(repo);
       if (!parsed) throw new Error('Invalid annotation repo');
 
@@ -3700,7 +5834,10 @@ export function initCommunityAnnotationControls({
       });
 
 		      // Ensure branch/config resolves early with auth.
-		      const { repoInfo } = await sync.validateAndLoadConfig({ datasetId });
+		      const { config, repoInfo } = await sync.validateAndLoadConfig({
+            datasetId,
+            signal: opAbort.signal,
+          });
 		      throwIfActiveSyncAborted(opAbort);
 		      lastRepoInfo = repoInfo;
 	      access.setRoleFromRepoInfo(lastRepoInfo);
@@ -3725,13 +5862,8 @@ export function initCommunityAnnotationControls({
         const repoLabel = requireGitHubRepositoryFullName(repoInfo);
         if (!publishCapability.canPublish || publicationMode === null) {
           const msg = describeCannotPublishMessage(repoLabel);
-          disconnectAnnotationRepo({
-            datasetId,
-            userKey: cacheUser,
-            message: `${msg}\nDisconnected annotation repo.`,
-            notify: 'none'
-          });
           notifications.fail(trackerId, msg);
+          syncError = msg;
           return;
         }
       }
@@ -3755,16 +5887,18 @@ export function initCommunityAnnotationControls({
 	          }
 	          // Avoid wiping the role we just inferred when the repo-map dispatches
 	          // the connection-changed event (which calls applySessionCacheContext()).
-	          lastRoleContext = `${assertExactAnnotationUserKey(
+	          lastRoleContext = `${datasetId}::${assertExactAnnotationUserKey(
               cacheUser,
               'Role cache user'
             )}::${canonicalRepoRef}`;
-	          setAnnotationRepoForDataset(
-	            datasetId,
-	            canonicalRepoRef,
-	            cacheUser,
-	            { branchMode }
-	          );
+	          commitExpectedActiveSyncRepoTransition(() => {
+	            setAnnotationRepoForDataset(
+	              datasetId,
+	              canonicalRepoRef,
+	              cacheUser,
+	              { branchMode }
+	            );
+	          });
 	        }
 	        setUrlAnnotationRepo(canonicalRepoRef);
 	      };
@@ -3784,6 +5918,38 @@ export function initCommunityAnnotationControls({
       const doc = session.buildUserFileDocument({ githubUserId: userId });
       const userPath = `annotations/users/ghid_${doc.githubUserId}.json`;
       const expectedRemoteUserSha = remoteShas[userPath] ?? null;
+      activePublicationPath = userPath;
+
+      const persistUpstreamPublicationBaseline = (
+        result,
+        expectedPath,
+        label,
+      ) => {
+        if (!result || typeof result !== 'object' || Array.isArray(result)) {
+          throw new Error(`${label} publication result must be an object`);
+        }
+        if (result.mode === 'fork-pull-request') return false;
+        if (result.mode !== 'direct' && result.mode !== 'none') {
+          throw new Error(
+            `${label} publication result mode must equal direct, none, or fork-pull-request`
+          );
+        }
+        if (result.path !== expectedPath) {
+          throw new Error(
+            `${label} publication result path must equal ${expectedPath}`
+          );
+        }
+        if (
+          typeof result.sha !== 'string' ||
+          !/^[0-9a-f]{40}$/.test(result.sha)
+        ) {
+          throw new Error(
+            `${label} publication result must contain a canonical GitHub SHA`
+          );
+        }
+        session.setRemoteFileSha(expectedPath, result.sha);
+        return true;
+      };
 
       let authorPayload = null;
       if (access.isAuthor()) {
@@ -3791,24 +5957,24 @@ export function initCommunityAnnotationControls({
         const annotatableSettings = session.getAnnotatableConsensusSettingsMap();
         const closedFields = session.getClosedAnnotatableFields();
         const datasetName = dataSourceManager?.getCurrentMetadata?.()?.name;
-        assertConfigDocument(
-          {
-            version: 1,
-            supportedDatasets: [
-              {
-                datasetId,
-                name: datasetName,
-                fieldsToAnnotate,
-                annotatableSettings,
-                closedFields,
-              },
-            ],
-          },
-          { path: '$ author config publish payload' }
-        );
+        const { config: proposedConfigDocument } =
+          buildUpdatedAnnotationConfig({
+            currentConfig: config,
+            datasetId,
+            datasetName,
+            fieldsToAnnotate,
+            annotatableSettings,
+            closedFields,
+          });
+        toAnnotationPublicationBytes(proposedConfigDocument, {
+          path: 'annotations/config.json',
+        });
         const mergesDoc = session.buildModerationMergesDocument();
         assertMergesDocument(mergesDoc, {
           path: '$ author merges publish payload',
+        });
+        toAnnotationPublicationBytes(mergesDoc, {
+          path: 'annotations/moderation/merges.json',
         });
         authorPayload = {
           datasetName,
@@ -3840,32 +6006,56 @@ export function initCommunityAnnotationControls({
           closedFields: authorPayload.closedFields,
           conflictIfRemoteShaNotEqual: expectedConfigSha,
           publicationMode,
+          signal: opAbort.signal,
         });
-        if (config.mode === 'direct' && config.changed) {
-          session.setRemoteFileSha(config.path, config.sha);
-        }
+        completedPublicationSteps.push({
+          path: 'annotations/config.json',
+          mode: config.mode,
+        });
+        persistUpstreamPublicationBaseline(
+          config,
+          'annotations/config.json',
+          'Annotation config',
+        );
 
+        activePublicationPath = 'annotations/moderation/merges.json';
         const merges = await sync.pushModerationMerges({
           mergesDoc: authorPayload.mergesDoc,
           conflictIfRemoteShaNotEqual: expectedMergesSha,
           publicationMode,
+          signal: opAbort.signal,
         });
-        if (merges.mode === 'direct' && merges.changed) {
-          session.setRemoteFileSha(merges.path, merges.sha);
-        }
+        completedPublicationSteps.push({
+          path: 'annotations/moderation/merges.json',
+          mode: merges.mode,
+        });
+        persistUpstreamPublicationBaseline(
+          merges,
+          'annotations/moderation/merges.json',
+          'Annotation merges',
+        );
 
         return { config, merges };
       };
 
       const handlePublishResult = async (result) => {
+        completedPublicationSteps.push({
+          path: userPath,
+          mode: result.mode,
+        });
+        activePublicationPath = authorPayload
+          ? 'annotations/config.json'
+          : null;
+        throwIfActiveSyncAborted(opAbort);
+        persistUpstreamPublicationBaseline(
+          result,
+          userPath,
+          'Annotation user file',
+        );
+        const extras = await publishAuthorExtras();
+        activePublicationPath = null;
         throwIfActiveSyncAborted(opAbort);
         session.markSyncedNow();
-        if (result.mode === 'direct') {
-          session.setRemoteFileSha(result.path, result.sha);
-        }
-
-        const extras = await publishAuthorExtras();
-        throwIfActiveSyncAborted(opAbort);
 
         const configPrLabel =
           extras.config.mode === 'fork-pull-request' && extras.config.changed
@@ -3903,14 +6093,44 @@ export function initCommunityAnnotationControls({
           userDoc: doc,
           conflictIfRemoteShaNotEqual: expectedRemoteUserSha,
           publicationMode,
+          signal: opAbort.signal,
         });
         await handlePublishResult(result);
         return;
-    } catch (err) {
+    } catch (caughtError) {
+      const err = normalizeActiveSyncError(caughtError, opAbort);
       const statusCode = httpStatusOrNull(err);
       const apiPath = gitHubApiPath(err) || workerPath(err);
       let msg = String(err?.message || 'Publish failed').trim() || 'Publish failed';
       const apiSuffix = apiPath ? ` (${apiPath})` : '';
+      const workerCompatibilityFailure =
+        isWorkerCompatibilityFailure(err);
+      if (
+        activePublicationPath !== null &&
+        completedPublicationSteps.length > 0
+      ) {
+        const completedPaths = completedPublicationSteps
+          .map(step => step.path)
+          .join(', ');
+        msg =
+          'Publication was only partially completed. GitHub already accepted ' +
+          `or confirmed unchanged: ${completedPaths}. The next step, ` +
+          `${activePublicationPath}, did not complete.\n` +
+          'Pull from the same annotation repository before publishing again. ' +
+          'Completed exact bytes are detected as a no-op, so the retry will ' +
+          `not duplicate them.\n${msg}`;
+      }
+
+      if (err?.operation?.outcome === 'unknown') {
+        msg =
+          `${msg}\n` +
+          'GitHub may already have applied this change. Pull from the same ' +
+          'annotation repository before publishing again; do not retry until ' +
+          'that Pull completes.';
+        syncError = msg;
+        notifications.fail(trackerId, msg);
+        return;
+      }
 
       if (err?.code === 'ANNOTATION_SYNC_ABORTED') {
         syncError = msg;
@@ -3929,7 +6149,12 @@ export function initCommunityAnnotationControls({
         return p?.ownerRepo || String(repo || '').split('@')[0].trim() || 'repo';
       })();
 
-      if (isWorkerOriginSecurityError(err)) {
+      if (workerCompatibilityFailure) {
+        msg =
+          `${msg}\nThe repository connection was preserved. ` +
+          'Deploy the matching Cellucid Worker, then retry GitHub sync.';
+        syncError = msg;
+      } else if (isWorkerOriginSecurityError(err)) {
         disconnectGitHubAndAnnotationRepo({
           datasetId,
           message: err?.message || `Invalid GitHub worker origin.${apiSuffix}`,
@@ -3986,7 +6211,10 @@ export function initCommunityAnnotationControls({
 
 	      // Never leave a connected repo in an unknown role state.
 	      // If publish failed before permissions could be resolved, disconnect.
-	      if ((access.getRole?.() || 'unknown') === 'unknown') {
+		      if (
+            !workerCompatibilityFailure &&
+            (access.getRole?.() || 'unknown') === 'unknown'
+          ) {
 	        const stillConnected = Boolean(getAnnotationRepoForDataset(datasetId, cacheUser));
 	        if (stillConnected) {
 	          const disconnectMsg = `Unable to determine your role for ${repoLabel}.\n${syncError || msg}\nDisconnected annotation repo.`;
@@ -4002,13 +6230,18 @@ export function initCommunityAnnotationControls({
 
       notifications.fail(trackerId, msg);
     } finally {
+      releaseCallerSignal?.();
+      releaseEntryOwnerSignal();
       endActiveSyncAbortScope(opAbort);
       syncBusy = false;
+      flushRoleRetryAfterActiveSync();
       render();
     }
   }
 
   function render() {
+    if (contextDestroyed) return;
+    identityEditButton = null;
     infoPopovers.closeWithin(container);
     container.innerHTML = '';
     infoPopoverSequence = 0;
@@ -4017,6 +6250,10 @@ export function initCommunityAnnotationControls({
     const cacheUsername = getCacheUserKey();
     const repo = getAnnotationRepoForDataset(datasetId, cacheUsername);
     const repoConnectedForGating = isAnnotationRepoConnected(datasetId, cacheUsername);
+    const online =
+      typeof navigator !== 'undefined'
+        ? navigator.onLine !== false
+        : true;
     if (!repoConnectedForGating) {
       const introBlock = el('div', { className: 'control-block relative' });
       const introInfo = createInfoTooltip('About community annotation', [
@@ -4028,8 +6265,24 @@ export function initCommunityAnnotationControls({
       introBlock.appendChild(el('div', { className: 'legend-help', text: 'No annotation repo connected.' }));
 
       const actions = el('div', { className: 'community-annotation-suggestion-actions' });
-      const connectBtn = el('button', { type: 'button', className: 'btn-small', text: 'Connect repo' });
-      connectBtn.addEventListener('click', () => connectRepoFlow({ reason: null, defaultPullNow: true }));
+      if (!online) {
+        introBlock.appendChild(el('div', {
+          className: 'legend-help',
+          text: 'Offline: GitHub actions are disabled.',
+        }));
+      }
+      const connectBtn = el('button', {
+        type: 'button',
+        className: 'btn-small',
+        text: 'Connect repo',
+        disabled: syncBusy || !online,
+      });
+      connectBtn.addEventListener('click', () => {
+        startBackgroundTask(
+          () => connectRepoFlow({ reason: null, defaultPullNow: true }),
+          { label: 'Unable to open GitHub annotation connection' },
+        );
+      });
       actions.appendChild(connectBtn);
       introBlock.appendChild(actions);
       container.appendChild(introBlock);
@@ -4048,7 +6301,6 @@ export function initCommunityAnnotationControls({
     container.appendChild(introBlock);
 
     // GitHub sync
-    const online = typeof navigator !== 'undefined' ? navigator.onLine !== false : true;
     const isAuthed = githubAuth.isAuthenticated();
     const authedUser = githubAuth.getUser();
     const login =
@@ -4116,17 +6368,14 @@ export function initCommunityAnnotationControls({
         'aria-label': 'Copy share link'
       }, [copyIcon]);
       btn.disabled = syncBusy;
-      btn.addEventListener('click', async () => {
-        try {
+      btn.addEventListener('click', () => {
+        startBackgroundTask(async () => {
           const url = new URL(window.location.href);
           url.searchParams.set('annotations', String(repo).trim());
           const ok = await copyTextToClipboard(url.toString());
           if (ok) notifications.success('Share link copied.', { category: 'annotation', duration: 2200 });
           else notifications.error('Unable to copy share link.', { category: 'annotation', duration: 3500 });
-        } catch (error) {
-          notifications.error('Unable to copy share link.', { category: 'annotation', duration: 3500 });
-          throw error;
-        }
+        }, { label: 'Unable to copy the annotation share link' });
       });
       return btn;
     })();
@@ -4169,16 +6418,19 @@ export function initCommunityAnnotationControls({
     const openSyncBtn = el('button', { type: 'button', className: 'btn-small', text: openBtnText });
     openSyncBtn.disabled = syncBusy || !online;
     openSyncBtn.addEventListener('click', () => {
-      openGitHubConnectionFlow({
-        mode: 'repo',
-        focus: 'overview',
-        reason: null,
-        datasetId,
-        cacheUser: cacheUsername,
-        login,
-        currentRepo: repo,
-        defaultPullNow: true
-      });
+      observeBackgroundTask(
+        openGitHubConnectionFlow({
+          mode: 'repo',
+          focus: 'overview',
+          reason: null,
+          datasetId,
+          cacheUser: cacheUsername,
+          login,
+          currentRepo: repo,
+          defaultPullNow: true
+        }),
+        { label: 'Unable to open GitHub annotation sync' },
+      );
     });
     syncActions.appendChild(openSyncBtn);
     syncBlock.appendChild(syncActions);
@@ -4255,7 +6507,10 @@ export function initCommunityAnnotationControls({
     ]);
     srcWrap.appendChild(createInfoLabel('Annotatable column:', consensusInfo));
     srcWrap.appendChild(consensusInfo.tooltip);
-    const srcSelect = el('select', { className: 'obs-select' });
+    const srcSelect = el('select', {
+      className: 'obs-select',
+      'aria-label': 'Annotatable column'
+    });
     if (!annotatableKeysForConsensus.length) {
       srcSelect.appendChild(el('option', { value: '', text: '(no annotatable columns)' }));
       srcSelect.disabled = true;
@@ -4275,6 +6530,7 @@ export function initCommunityAnnotationControls({
     const consensusKeyInput = el('input', {
       type: 'text',
       className: 'community-annotation-text-input community-annotation-input',
+      'aria-label': 'New column key',
       placeholder: 'community_cell_type'
     });
     consensusKeyInput.value = consensusColumnKey;
@@ -4289,6 +6545,7 @@ export function initCommunityAnnotationControls({
     const thresholdLabel = el('label', { text: 'Consensus threshold:' });
     const thresholdInput = el('input', {
       type: 'range',
+      'aria-label': 'Consensus threshold',
       min: '-100',
       max: '100',
       step: '1',
@@ -4307,6 +6564,7 @@ export function initCommunityAnnotationControls({
     const minInput = el('input', {
       type: 'number',
       className: 'obs-select',
+      'aria-label': 'Min annotators',
       value: String(consensusColumnMinAnnotators),
       min: '0',
       max: '50',
@@ -4323,7 +6581,12 @@ export function initCommunityAnnotationControls({
     const applyActions = el('div', { className: 'community-annotation-consensus-actions' });
     const applyBtn = el('button', { type: 'button', className: 'btn-small', text: 'Build derived column' });
     applyBtn.disabled = syncBusy || !consensusSourceFieldKey;
-    applyBtn.addEventListener('click', () => applyConsensusColumn());
+    applyBtn.addEventListener('click', () => {
+      startBackgroundTask(
+        () => applyConsensusColumn(),
+        { label: 'Unable to build the community consensus column' },
+      );
+    });
     applyActions.appendChild(applyBtn);
     content.appendChild(applyActions);
 
@@ -4362,7 +6625,12 @@ export function initCommunityAnnotationControls({
     identityBlock.appendChild(profileBox);
 
     const identityActions = el('div', { className: 'community-annotation-identity-actions' });
-    const editBtn = el('button', { type: 'button', className: 'btn-small', text: 'Edit' });
+    const editBtn = el('button', {
+      type: 'button',
+      className: 'btn-small community-annotation-profile-edit',
+      text: 'Edit'
+    });
+    identityEditButton = editBtn;
     const clearBtn = el('button', { type: 'button', className: 'btn-small', text: 'Clear' });
     identityActions.appendChild(editBtn);
     identityActions.appendChild(clearBtn);
@@ -4373,25 +6641,48 @@ export function initCommunityAnnotationControls({
     editBtn.title = editBtn.disabled ? 'Sign in first.' : 'Edit your attribution info (published in your GitHub user file).';
     clearBtn.title = clearBtn.disabled ? 'Sign in first.' : 'Clear your profile fields (Publish to update GitHub).';
 
-	    editBtn.addEventListener('click', async () => {
-	      if (!canEdit) return;
-	      const loginOrLocal = authedLogin || 'local';
-	      await ensureIdentityForUserKey({ userKey: getCacheUserKey(), login: loginOrLocal, githubUserId: githubAuth.getUser?.()?.id ?? null, promptIfMissing: false });
-	      await editIdentityFlow({ suggestedUsername: loginOrLocal });
-	      render();
+	    editBtn.addEventListener('click', (event) => {
+        const returnFocusTo = event.currentTarget;
+        if (!(returnFocusTo instanceof HTMLButtonElement)) {
+          throw new TypeError(
+            'Community annotation profile edit requires its button owner'
+          );
+        }
+        startBackgroundTask(async () => {
+	        if (!canEdit) return;
+	        const loginOrLocal = authedLogin || 'local';
+	        await ensureIdentityForUserKey({ userKey: getCacheUserKey(), login: loginOrLocal, githubUserId: githubAuth.getUser?.()?.id ?? null, promptIfMissing: false });
+	          await editIdentityFlow({
+            suggestedUsername: loginOrLocal,
+            returnFocusTo,
+            returnFocusResolver: resolveIdentityModalFocus
+          });
+        }, { label: 'Unable to edit the annotation profile' });
 	    });
 
-    clearBtn.addEventListener('click', async () => {
-      if (!canEdit) return;
-      const loginOrLocal = authedLogin || 'local';
-      const ok = await confirmAsync({
-        title: 'Clear profile?',
-        message: `Clear your profile fields for @${loginOrLocal} in this session?\n\nPublish to update your GitHub user file.`,
-        confirmText: 'Clear'
-      });
-      if (!ok) return;
-      session.setProfile({ ...profile, login: loginOrLocal, displayName: '', title: '', orcid: '', linkedin: '' });
-      render();
+	    clearBtn.addEventListener('click', () => {
+      startBackgroundTask(async () => {
+	        if (!canEdit) return;
+        const owner = publishContextOwner(getCacheContext({}));
+	        const loginOrLocal = authedLogin || 'local';
+	        const ok = await confirmAsync({
+	          title: 'Clear profile?',
+	          message: `Clear your profile fields for @${loginOrLocal} in this session?\n\nPublish to update your GitHub user file.`,
+	          confirmText: 'Clear',
+            signal: owner.signal,
+	        });
+	        if (!ok || !isContextOwnerCurrent(owner)) return;
+          const currentProfile = session.getProfile();
+	        session.setProfile({
+            ...currentProfile,
+            login: loginOrLocal,
+            displayName: '',
+            title: '',
+            orcid: '',
+            linkedin: '',
+          });
+        render();
+      }, { label: 'Unable to clear the annotation profile' });
 	    });
 
 	    container.appendChild(identityBlock);
@@ -4455,7 +6746,10 @@ export function initCommunityAnnotationControls({
       // Field selector dropdown
       const fieldSelectWrap = el('div', { className: 'field-select' });
       fieldSelectWrap.appendChild(el('label', { text: 'Categorical obs:' }));
-      const fieldSelect = el('select', { className: 'obs-select' });
+      const fieldSelect = el('select', {
+        className: 'obs-select',
+        'aria-label': 'Categorical obs'
+      });
       fieldSelect.appendChild(el('option', { value: '', text: allKeys.length ? 'None' : '(no categorical obs fields)' }));
       for (const key of allKeys) {
         const enabled = annotated.includes(key);
@@ -4550,7 +6844,10 @@ export function initCommunityAnnotationControls({
             `Missing consensus settings for annotatable field ${JSON.stringify(selectedFieldKey)}`
           );
         }
-        if (!annotatableSettingsDraft[selectedFieldKey]) {
+        if (
+          !annotatableSettingsDirty.has(selectedFieldKey) ||
+          !Object.hasOwn(annotatableSettingsDraft, selectedFieldKey)
+        ) {
           annotatableSettingsDraft[selectedFieldKey] = { ...applied };
         }
         const draft = annotatableSettingsDraft[selectedFieldKey];
@@ -4558,6 +6855,7 @@ export function initCommunityAnnotationControls({
         const thLabel = el('label', { text: 'Threshold:' });
         const thInput = el('input', {
           type: 'range',
+          'aria-label': 'Annotatable consensus threshold',
           min: '-100',
           max: '100',
           step: '1',
@@ -4583,6 +6881,7 @@ export function initCommunityAnnotationControls({
         const minInput = el('input', {
           type: 'number',
           className: 'obs-select',
+          'aria-label': 'Annotatable min annotators',
           value: String(draft.minAnnotators),
           min: '0',
           max: '50',
@@ -4605,7 +6904,12 @@ export function initCommunityAnnotationControls({
         const reset = el('button', { type: 'button', className: 'btn-small', text: 'Reset', disabled: !canEditSettings || !annotatableSettingsDirty.has(selectedFieldKey) });
         apply.addEventListener('click', () => {
           if (!canEditSettings) return;
-          const next = annotatableSettingsDraft[selectedFieldKey] || applied;
+          const next = Object.hasOwn(
+            annotatableSettingsDraft,
+            selectedFieldKey
+          )
+            ? annotatableSettingsDraft[selectedFieldKey]
+            : applied;
           session.setAnnotatableConsensusSettings(selectedFieldKey, next);
           annotatableSettingsDirty.delete(selectedFieldKey);
           notifications.success('Consensus settings applied (local)', { category: 'annotation', duration: 1800 });
@@ -4702,17 +7006,21 @@ export function initCommunityAnnotationControls({
     cacheBlock.appendChild(cacheInfo.tooltip);
 
     const cacheActions = el('div', { className: 'community-annotation-cache-actions', 'aria-label': 'Local cache actions' });
-    const clearSessionBtn = el('button', { type: 'button', className: 'btn-small', text: 'Clear session', disabled: syncBusy });
-    clearSessionBtn.addEventListener('click', async () => {
-      const ok = await confirmAsync({
-        title: 'Clear local session?',
-        message: 'This clears your local session state (votes, suggestions, comments, and annotatable-column selections) for the current dataset/repo/branch in this browser.',
-        confirmText: 'Clear session'
-      });
-      if (!ok) return;
-      session.clearLocalCache({ keepVotingMode: false });
-      notifications.success('Local session cleared', { category: 'annotation', duration: 2200 });
-      render();
+	    const clearSessionBtn = el('button', { type: 'button', className: 'btn-small', text: 'Clear session', disabled: syncBusy });
+	    clearSessionBtn.addEventListener('click', () => {
+	      startBackgroundTask(async () => {
+          const owner = publishContextOwner(getCacheContext({}));
+	        const ok = await confirmAsync({
+	          title: 'Clear local session?',
+	          message: 'This clears your local session state (votes, suggestions, comments, and annotatable-column selections) for the current dataset/repo/branch in this browser.',
+	          confirmText: 'Clear session',
+            signal: owner.signal,
+	        });
+	        if (!ok || !isContextOwnerCurrent(owner)) return;
+        session.clearLocalCache({ keepVotingMode: false });
+        notifications.success('Local session cleared', { category: 'annotation', duration: 2200 });
+        render();
+      }, { label: 'Unable to clear the local annotation session' });
     });
 
     const cacheDatasetId = dataSourceManager?.getCurrentDatasetId?.() || null;
@@ -4725,19 +7033,24 @@ export function initCommunityAnnotationControls({
       text: 'Clear downloads',
       disabled: syncBusy || !(cacheDatasetId && repoRef && cacheUserId)
     });
-    clearFilesBtn.addEventListener('click', async () => {
-      if (!cacheDatasetId || !repoRef || !cacheUserId) return;
-      const ok = await confirmAsync({
-        title: 'Clear downloaded files?',
-        message:
-          `This clears locally cached copies of raw files under annotations/users/ and annotations/moderation/.\n\n` +
-          `Tip: Pull again to re-download what you need.`,
-        confirmText: 'Clear downloads'
-      });
-      if (!ok) return;
-      await fileCache.clearRepo({ datasetId: cacheDatasetId, repoRef, userId: cacheUserId });
-      notifications.success('Downloaded file cache cleared', { category: 'annotation', duration: 2200 });
-      render();
+	    clearFilesBtn.addEventListener('click', () => {
+	      startBackgroundTask(async () => {
+	        if (!cacheDatasetId || !repoRef || !cacheUserId) return;
+          const owner = publishContextOwner(getCacheContext({}));
+	        const ok = await confirmAsync({
+          title: 'Clear downloaded files?',
+          message:
+            `This clears locally cached copies of raw files under annotations/users/ and annotations/moderation/.\n\n` +
+            `Tip: Pull again to re-download what you need.`,
+	          confirmText: 'Clear downloads',
+            signal: owner.signal,
+	        });
+	        if (!ok || !isContextOwnerCurrent(owner)) return;
+	        await fileCache.clearRepo({ datasetId: cacheDatasetId, repoRef, userId: cacheUserId });
+          if (!isContextOwnerCurrent(owner)) return;
+        notifications.success('Downloaded file cache cleared', { category: 'annotation', duration: 2200 });
+        render();
+      }, { label: 'Unable to clear downloaded annotation files' });
     });
 
     cacheActions.appendChild(clearSessionBtn);

@@ -9,6 +9,7 @@ import {
   SPLAT_FS,
   SPLAT_VS,
 } from '../shaders/density-shaders.js';
+import { POINT_VISIBILITY_THRESHOLD } from '../alpha-visibility.js';
 import { MAX_SMOKE_GRID_SIZE } from './smoke-density-contract.js';
 
 const gpuSplatResourcesByContext = new WeakMap();
@@ -566,7 +567,7 @@ function inspectDensitySource(positions, visibility) {
           `GPU smoke density visibility alpha ${pointIndex} must be finite and between 0 and 1.`
         );
       }
-      visible = alphaValue > 0.001;
+      visible = alphaValue >= POINT_VISIBILITY_THRESHOLD;
     }
     if (outlierQuantiles !== null) {
       const quantile = outlierQuantiles[pointIndex];
@@ -906,7 +907,7 @@ export function buildDensityTextureGPU(gl, positions, options = {}) {
       let batchPointCount = 0;
       let submittedPointCount = 0;
       for (let pointIndex = 0; pointIndex < pointCount; pointIndex++) {
-        if (alpha[pointIndex] <= 0.001) continue;
+        if (alpha[pointIndex] < POINT_VISIBILITY_THRESHOLD) continue;
         if (outlierQuantiles !== null) {
           const quantile = outlierQuantiles[pointIndex];
           if (quantile >= 0 && quantile > outlierThreshold) continue;

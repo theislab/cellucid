@@ -705,6 +705,9 @@ test('odd-width multi-row R8 creation and update use alignment 1, neutral unpack
     [0, 64, 128, 191, 255, 255],
   );
   assert.equal(renderer._useAlphaTexture, true);
+  const acceptedAlphaData = renderer._alphaTexData;
+  const acceptedAlphaBytes = Array.from(acceptedAlphaData);
+  const acceptedAlphaTexture = renderer._alphaTexture;
 
   const failureState = Object.freeze({
     ...makeHostileUnpackState('alpha-failure'),
@@ -720,6 +723,13 @@ test('odd-width multi-row R8 creation and update use alignment 1, neutral unpack
     ),
     /WebGL|alpha|publication/i,
   );
+  assert.equal(renderer._alphaTexData, acceptedAlphaData);
+  assert.deepEqual(
+    Array.from(renderer._alphaTexData),
+    acceptedAlphaBytes,
+  );
+  assert.equal(renderer._alphaTexture, acceptedAlphaTexture);
+  assert.equal(renderer._useAlphaTexture, true);
   assertExactUnpackState(gl._state.snapshotUnpack(), failureState);
 });
 

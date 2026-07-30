@@ -231,6 +231,24 @@ test('replacing a confirm dialog synchronously cancels its prior owner', t => {
   const previousDocument = globalThis.document;
   let activeOverlay = null;
 
+  function createBackground(attributes = {}) {
+    const values = new Map(Object.entries(attributes));
+    return {
+      getAttribute(name) {
+        return values.get(name) ?? null;
+      },
+      hasAttribute(name) {
+        return values.has(name);
+      },
+      removeAttribute(name) {
+        values.delete(name);
+      },
+      setAttribute(name, value) {
+        values.set(name, String(value));
+      },
+    };
+  }
+
   function createControl() {
     return {
       addEventListener() {},
@@ -239,6 +257,7 @@ test('replacing a confirm dialog synchronously cancels its prior owner', t => {
   }
 
   function createOverlay() {
+    const attributes = new Map();
     const cancelButton = createControl();
     const confirmButton = createControl();
     const root = {
@@ -263,17 +282,36 @@ test('replacing a confirm dialog synchronously cancels its prior owner', t => {
         if (activeOverlay === overlay) activeOverlay = null;
       },
       removeEventListener() {},
-      setAttribute() {},
+      getAttribute(name) {
+        return attributes.get(name) ?? null;
+      },
+      hasAttribute(name) {
+        return attributes.has(name);
+      },
+      removeAttribute(name) {
+        attributes.delete(name);
+      },
+      setAttribute(name, value) {
+        attributes.set(name, String(value));
+      },
     };
     return overlay;
   }
 
+  const ordinaryBackground = createBackground({
+    'aria-hidden': 'false',
+  });
+  const preOwnedBackground = createBackground({
+    'aria-hidden': 'owned-hidden',
+    inert: 'owned-inert',
+  });
   globalThis.document = {
     activeElement: {
       focus() {},
     },
     addEventListener() {},
     body: {
+      children: [ordinaryBackground, preOwnedBackground],
       appendChild(overlay) {
         activeOverlay = overlay;
       },
@@ -302,6 +340,10 @@ test('replacing a confirm dialog synchronously cancels its prior owner', t => {
       firstCancellations++;
     },
   });
+  assert.equal(ordinaryBackground.getAttribute('aria-hidden'), 'true');
+  assert.equal(ordinaryBackground.getAttribute('inert'), '');
+  assert.equal(preOwnedBackground.getAttribute('aria-hidden'), 'true');
+  assert.equal(preOwnedBackground.getAttribute('inert'), '');
   const closeSecond = showConfirmDialog({
     title: 'Replacement owner',
     message: 'Second dialog',
@@ -310,7 +352,16 @@ test('replacing a confirm dialog synchronously cancels its prior owner', t => {
   });
 
   assert.equal(firstCancellations, 1);
+  assert.equal(ordinaryBackground.getAttribute('aria-hidden'), 'true');
+  assert.equal(ordinaryBackground.getAttribute('inert'), '');
   closeSecond();
+  assert.equal(ordinaryBackground.getAttribute('aria-hidden'), 'false');
+  assert.equal(ordinaryBackground.hasAttribute('inert'), false);
+  assert.equal(
+    preOwnedBackground.getAttribute('aria-hidden'),
+    'owned-hidden',
+  );
+  assert.equal(preOwnedBackground.getAttribute('inert'), 'owned-inert');
 });
 
 test(

@@ -12,6 +12,9 @@ import {
   DataSourceErrorCode,
   loadDatasetMetadata
 } from './data-source.js';
+import {
+  loadMetadataBatchAtomically,
+} from './metadata-load-contract.js';
 
 /**
  * @typedef {import('./data-source.js').DatasetMetadata} DatasetMetadata
@@ -94,6 +97,7 @@ function requireCanonicalPathSegments(pathname, label) {
       segment.length === 0 ||
       decoded === '.' ||
       decoded === '..' ||
+      decoded.includes('%') ||
       decoded.includes('/') ||
       decoded.includes('\\') ||
       /[\u0000-\u001f\u007f]/.test(decoded) ||
@@ -622,6 +626,8 @@ export class RemoteDataSource {
     this._datasetPaths = new Map();
     /** @type {Map<string, DatasetMetadata>} */
     this._datasetCache = new Map();
+    /** @type {Map<string, Object>} */
+    this._metadataInFlight = new Map();
     /** @type {WebSocket|null} */
     this._ws = null;
     this._connectionLostCallbacks = new Set();
@@ -630,6 +636,9 @@ export class RemoteDataSource {
     this._operationId = 0;
     /** @type {AbortController|null} */
     this._pendingController = null;
+    this._catalogRevision = 0;
+    /** @type {AbortController|null} */
+    this._catalogController = null;
     this.type = 'remote';
   }
 
@@ -658,6 +667,24 @@ export class RemoteDataSource {
       'Remote dataset listing'
     );
     return requireDatasetCatalogPayload(payload);
+  }
+
+  _beginCatalogGeneration(reason) {
+    const previousController = this._catalogController;
+    const controller = new AbortController();
+    this._catalogController = controller;
+    const revision = ++this._catalogRevision;
+    this._metadataInFlight = new Map();
+    previousController?.abort(new Error(reason));
+    return { controller, revision };
+  }
+
+  _endCatalogGeneration(reason) {
+    const previousController = this._catalogController;
+    this._catalogController = null;
+    this._catalogRevision += 1;
+    this._metadataInFlight = new Map();
+    previousController?.abort(new Error(reason));
   }
 
   async _openAdvertisedWebSocket(serverUrl, serverInfo, signal) {
@@ -796,6 +823,9 @@ export class RemoteDataSource {
       this._datasetCache = new Map();
       this._ws = stagedSocket;
       this._connected = true;
+      this._beginCatalogGeneration(
+        'Remote catalog was replaced by a new connection'
+      );
       if (stagedSocket) this._adoptWebSocket(stagedSocket);
       stagedSocket = null;
       closeSocket(previousSocket);
@@ -874,6 +904,9 @@ export class RemoteDataSource {
     this._operationId += 1;
     this._ws = null;
     this._connected = false;
+    this._endCatalogGeneration(
+      'Remote catalog was retired after connection loss'
+    );
     closeSocket(socket);
     await this._notifyConnectionLost(error);
   }
@@ -900,6 +933,9 @@ export class RemoteDataSource {
     this._serverInfo = null;
     this._datasetPaths = new Map();
     this._datasetCache = new Map();
+    this._endCatalogGeneration(
+      'Remote catalog was retired by disconnect'
+    );
     closeSocket(socket);
   }
 
@@ -970,38 +1006,50 @@ export class RemoteDataSource {
 
     const operationId = this._operationId;
     const serverUrl = this._serverUrl;
+    const catalogOwner = this._beginCatalogGeneration(
+      'Remote catalog listing was superseded'
+    );
     const catalog = await this._requestDatasetCatalog(
       serverUrl,
-      new AbortController().signal
+      catalogOwner.controller.signal
     );
     const stagedPaths = new Map(
       catalog.map(dataset => [dataset.id, dataset.path])
     );
-    const metadataEntries = await Promise.all(catalog.map(async dataset => {
-      const metadata = await loadDatasetMetadata(
-        `${serverUrl}${dataset.path}`,
-        dataset.id,
-        this.type
-      );
-      if (metadata.name !== dataset.name) {
-        throw new DataSourceError(
-          `Remote catalog name for ${JSON.stringify(dataset.id)} does not match dataset_identity.json`,
-          DataSourceErrorCode.VALIDATION_ERROR,
+    const metadataEntries = await loadMetadataBatchAtomically(
+      catalog,
+      catalogOwner.controller.signal,
+      async (dataset, signal) => {
+        const metadata = await loadDatasetMetadata(
+          `${serverUrl}${dataset.path}`,
+          dataset.id,
           this.type,
-          {
-            datasetId: dataset.id,
-            catalogName: dataset.name,
-            identityName: metadata.name
-          }
+          { signal }
         );
-      }
-      return [dataset.id, metadata];
-    }));
+        if (metadata.name !== dataset.name) {
+          throw new DataSourceError(
+            `Remote catalog name for ${JSON.stringify(dataset.id)} does not match dataset_identity.json`,
+            DataSourceErrorCode.VALIDATION_ERROR,
+            this.type,
+            {
+              datasetId: dataset.id,
+              catalogName: dataset.name,
+              identityName: metadata.name
+            }
+          );
+        }
+        return [dataset.id, metadata];
+      },
+      'Remote catalog metadata loading'
+    );
 
     if (
       !this._connected ||
       this._operationId !== operationId ||
-      this._serverUrl !== serverUrl
+      this._serverUrl !== serverUrl ||
+      this._catalogRevision !== catalogOwner.revision ||
+      this._catalogController !== catalogOwner.controller ||
+      catalogOwner.controller.signal.aborted
     ) {
       throw new DataSourceError(
         'Remote connection changed before dataset listing adoption',
@@ -1009,6 +1057,9 @@ export class RemoteDataSource {
         this.type
       );
     }
+    this._beginCatalogGeneration(
+      'Remote catalog metadata was adopted'
+    );
     this._datasetPaths = stagedPaths;
     this._datasetCache = new Map(metadataEntries);
     return metadataEntries.map(([, metadata]) => metadata);
@@ -1062,24 +1113,67 @@ export class RemoteDataSource {
     const datasetPath = this._requireDeclaredDatasetPath(id);
     const operationId = this._operationId;
     const serverUrl = this._serverUrl;
-    const metadata = await loadDatasetMetadata(
-      `${serverUrl}${datasetPath}`,
-      id,
-      this.type
-    );
-    if (
-      !this._connected ||
-      this._operationId !== operationId ||
-      this._serverUrl !== serverUrl
-    ) {
+    const catalogRevision = this._catalogRevision;
+    const catalogController = this._catalogController;
+    if (catalogController === null) {
       throw new DataSourceError(
-        'Remote connection changed before metadata adoption',
+        'Remote metadata loading requires an active catalog generation',
         DataSourceErrorCode.NETWORK_ERROR,
         this.type
       );
     }
-    this._datasetCache.set(id, metadata);
-    return metadata;
+    const existing = this._metadataInFlight.get(id);
+    if (
+      existing?.operationId === operationId &&
+      existing.serverUrl === serverUrl &&
+      existing.catalogRevision === catalogRevision &&
+      existing.catalogController === catalogController &&
+      existing.datasetPath === datasetPath
+    ) {
+      return existing.promise;
+    }
+
+    const promise = (async () => {
+      const metadata = await loadDatasetMetadata(
+        `${serverUrl}${datasetPath}`,
+        id,
+        this.type,
+        { signal: catalogController.signal }
+      );
+      if (
+        !this._connected ||
+        this._operationId !== operationId ||
+        this._serverUrl !== serverUrl ||
+        this._catalogRevision !== catalogRevision ||
+        this._catalogController !== catalogController ||
+        catalogController.signal.aborted ||
+        this._datasetPaths.get(id) !== datasetPath
+      ) {
+        throw new DataSourceError(
+          'Remote connection changed before metadata adoption',
+          DataSourceErrorCode.NETWORK_ERROR,
+          this.type
+        );
+      }
+      this._datasetCache.set(id, metadata);
+      return metadata;
+    })();
+    const inFlight = {
+      operationId,
+      serverUrl,
+      catalogRevision,
+      catalogController,
+      datasetPath,
+      promise,
+    };
+    this._metadataInFlight.set(id, inFlight);
+    try {
+      return await promise;
+    } finally {
+      if (this._metadataInFlight.get(id) === inFlight) {
+        this._metadataInFlight.delete(id);
+      }
+    }
   }
 
   getBaseUrl(datasetId) {
@@ -1138,6 +1232,26 @@ export class RemoteDataSource {
         { url }
       );
     }
+
+    const serverPrefix =
+      connected.pathname === '/' ? '' : connected.pathname;
+    const belongsToDeclaredDataset = [
+      ...this._datasetPaths.values(),
+    ].some(datasetPath => {
+      const datasetPrefix = `${serverPrefix}${datasetPath}`;
+      return (
+        resolved.pathname === datasetPrefix ||
+        resolved.pathname.startsWith(datasetPrefix)
+      );
+    });
+    if (!belongsToDeclaredDataset) {
+      throw new DataSourceError(
+        'Remote URL does not belong to a currently declared dataset',
+        DataSourceErrorCode.VALIDATION_ERROR,
+        this.type,
+        { url }
+      );
+    }
     return resolved.href;
   }
 
@@ -1146,6 +1260,9 @@ export class RemoteDataSource {
   }
 
   refresh() {
+    this._beginCatalogGeneration(
+      'Remote metadata cache was refreshed'
+    );
     this._datasetCache = new Map();
   }
 

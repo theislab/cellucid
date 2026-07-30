@@ -11,6 +11,11 @@
  * @module state/managers/field/summary
  */
 
+import { isContinuousFilterFullRange } from '../filter-manager.js';
+import {
+  POINT_VISIBILITY_THRESHOLD,
+} from '../../../../rendering/alpha-visibility.js';
+
 export class FieldSummaryMethods {
   /**
    * Get the active field for a specific view (without switching to it).
@@ -58,7 +63,7 @@ export class FieldSummaryMethods {
       if (field.kind === 'continuous' && field._continuousStats && field._continuousFilter) {
         const stats = field._continuousStats;
         const filter = field._continuousFilter;
-        const fullRange = filter.min <= stats.min + 1e-6 && filter.max >= stats.max - 1e-6;
+        const fullRange = isContinuousFilterFullRange(filter, stats);
         if (!fullRange && field._filterEnabled !== false) {
           filters.push(`${fieldKey}: ${filter.min.toFixed(2)} – ${filter.max.toFixed(2)}`);
         }
@@ -109,7 +114,8 @@ export class FieldSummaryMethods {
     const alpha = this.categoryTransparency || [];
     let shown = 0;
     for (let i = 0; i < total; i++) {
-      const visible = (alpha[i] ?? 0) > 0.001;
+      const visible =
+        (alpha[i] ?? 0) >= POINT_VISIBILITY_THRESHOLD;
       if (!visible) continue;
       // Only apply outlier filter when supported by the active field.
       if (applyOutlierFilter) {
@@ -154,7 +160,7 @@ export class FieldSummaryMethods {
       let baseVisible = true;
       for (let f = 0; f < fields.length; f++) {
         const fField = fields[f];
-        if (!fField) continue;
+        if (!fField || fField._isDeleted === true) continue;
         if (f === targetIndex) {
           // Ignore this field's category visibility for "available" counts
           continue;
@@ -181,9 +187,7 @@ export class FieldSummaryMethods {
             const stats = fField._continuousStats;
             const filter = fField._continuousFilter;
             const values = fField.values || [];
-            const fullRange =
-              filter.min <= stats.min + 1e-6 &&
-              filter.max >= stats.max - 1e-6;
+            const fullRange = isContinuousFilterFullRange(filter, stats);
             if (!fullRange) {
               const v = values[i];
               if (v === null || Number.isNaN(v) || v < filter.min || v > filter.max) {
@@ -199,9 +203,7 @@ export class FieldSummaryMethods {
         if (filterEnabled && activeVarField._continuousStats && activeVarField._continuousFilter) {
           const stats = activeVarField._continuousStats;
           const filter = activeVarField._continuousFilter;
-          const fullRange =
-            filter.min <= stats.min + 1e-6 &&
-            filter.max >= stats.max - 1e-6;
+          const fullRange = isContinuousFilterFullRange(filter, stats);
           if (!fullRange) {
             const v = activeVarValues[i];
             if (v === null || Number.isNaN(v) || v < filter.min || v > filter.max) {
@@ -220,7 +222,8 @@ export class FieldSummaryMethods {
       if (baseVisible) available[code]++;
 
       // Current visibility already encoded in alpha + outliers
-      const isVisibleNow = (alpha[i] ?? 0) > 0.001;
+      const isVisibleNow =
+        (alpha[i] ?? 0) >= POINT_VISIBILITY_THRESHOLD;
       if (!isVisibleNow) continue;
       // Only apply outlier filter when supported by the active field.
       if (applyOutlierFilter) {
@@ -256,7 +259,7 @@ export class FieldSummaryMethods {
 
       for (let f = 0; f < obsFields.length; f++) {
         const obsField = obsFields[f];
-        if (!obsField) continue;
+        if (!obsField || obsField._isDeleted === true) continue;
         if (obsField.kind === 'category' && obsField._categoryVisible) {
           const categoryFilterEnabled = obsField._categoryFilterEnabled !== false;
           if (categoryFilterEnabled) {
@@ -276,9 +279,7 @@ export class FieldSummaryMethods {
             const stats = obsField._continuousStats;
             const filter = obsField._continuousFilter;
             const values = obsField.values || [];
-            const fullRange =
-              filter.min <= stats.min + 1e-6 &&
-              filter.max >= stats.max - 1e-6;
+            const fullRange = isContinuousFilterFullRange(filter, stats);
             if (!fullRange) {
               const v = values[i];
               if (v === null || Number.isNaN(v) || v < filter.min || v > filter.max) {
@@ -297,9 +298,7 @@ export class FieldSummaryMethods {
         if (filterEnabled && !(isSelfVar && ignoreSelfFilter)) {
           const stats = activeVarField._continuousStats;
           const filter = activeVarField._continuousFilter;
-          const fullRange =
-            filter.min <= stats.min + 1e-6 &&
-            filter.max >= stats.max - 1e-6;
+          const fullRange = isContinuousFilterFullRange(filter, stats);
           if (!fullRange) {
             const v = activeVarValues[i];
             if (v === null || Number.isNaN(v) || v < filter.min || v > filter.max) {
@@ -326,9 +325,7 @@ export class FieldSummaryMethods {
         }
         const stats = field._continuousStats;
         const filter = field._continuousFilter;
-        const fullRange =
-          filter.min <= stats.min + 1e-6 &&
-          filter.max >= stats.max - 1e-6;
+        const fullRange = isContinuousFilterFullRange(filter, stats);
         if (!fullRange) {
           const v = targetValues[i];
           if (v === null || Number.isNaN(v) || v < filter.min || v > filter.max) {

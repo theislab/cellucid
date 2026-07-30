@@ -231,6 +231,127 @@ test('table codec accepts only its closed current schema and consumes every byte
   );
 });
 
+test('table codec preserves every legal prototype-named column as an ordinary own record', () => {
+  const prototypeNames = Object.getOwnPropertyNames(Object.prototype);
+  const prototypeDescriptors = Object.getOwnPropertyDescriptors(
+    Object.prototype,
+  );
+  const encoded = encodeTable({
+    rowCount: 1,
+    columns: prototypeNames.map((name, index) => ({
+      name,
+      dtype: 'uint8',
+      data: Uint8Array.of(index),
+    })),
+  });
+
+  const decoded = decodeTable(encoded);
+  assert.equal(Object.getPrototypeOf(decoded.columns), Object.prototype);
+  assert.deepEqual(Object.keys(decoded.columns), prototypeNames);
+  for (const [index, name] of prototypeNames.entries()) {
+    assert.equal(Object.hasOwn(decoded.columns, name), true, name);
+    assert.deepEqual(Array.from(decoded.columns[name]), [index], name);
+    assert.deepEqual(
+      Object.getOwnPropertyDescriptor(decoded.columns, name),
+      {
+        configurable: true,
+        enumerable: true,
+        value: decoded.columns[name],
+        writable: true,
+      },
+      name,
+    );
+  }
+  assert.deepEqual(
+    Object.getOwnPropertyDescriptors(Object.prototype),
+    prototypeDescriptors,
+  );
+});
+
+test('table codec boolean decode preserves every prototype-named column and exact descriptor', () => {
+  const prototypeNames = Object.getOwnPropertyNames(Object.prototype);
+  const prototypeDescriptors = Object.getOwnPropertyDescriptors(
+    Object.prototype,
+  );
+  const expectedValues = prototypeNames.map((_, index) => [
+    index % 2 === 0,
+    index % 3 === 0,
+  ]);
+  const decoded = decodeTable(encodeTable({
+    rowCount: 2,
+    columns: prototypeNames.map((name, index) => ({
+      name,
+      dtype: 'bool',
+      data: expectedValues[index],
+    })),
+  }));
+
+  assert.equal(Object.getPrototypeOf(decoded.columns), Object.prototype);
+  assert.deepEqual(Object.keys(decoded.columns), prototypeNames);
+  for (const [index, name] of prototypeNames.entries()) {
+    assert.equal(Object.hasOwn(decoded.columns, name), true, name);
+    assert.deepEqual(
+      Array.from(decoded.columns[name]),
+      expectedValues[index].map(Number),
+      name,
+    );
+    assert.deepEqual(
+      Object.getOwnPropertyDescriptor(decoded.columns, name),
+      {
+        configurable: true,
+        enumerable: true,
+        value: decoded.columns[name],
+        writable: true,
+      },
+      name,
+    );
+  }
+  assert.deepEqual(
+    Object.getOwnPropertyDescriptors(Object.prototype),
+    prototypeDescriptors,
+  );
+});
+
+test('table codec string decode preserves every prototype-named column and exact descriptor', () => {
+  const prototypeNames = Object.getOwnPropertyNames(Object.prototype);
+  const prototypeDescriptors = Object.getOwnPropertyDescriptors(
+    Object.prototype,
+  );
+  const expectedValues = prototypeNames.map((name, index) => [
+    `${name}-${index}-first`,
+    `${name}-${index}-second`,
+  ]);
+  const decoded = decodeTable(encodeTable({
+    rowCount: 2,
+    columns: prototypeNames.map((name, index) => ({
+      name,
+      dtype: 'string',
+      data: expectedValues[index],
+    })),
+  }));
+
+  assert.equal(Object.getPrototypeOf(decoded.columns), Object.prototype);
+  assert.deepEqual(Object.keys(decoded.columns), prototypeNames);
+  for (const [index, name] of prototypeNames.entries()) {
+    assert.equal(Object.hasOwn(decoded.columns, name), true, name);
+    assert.deepEqual(decoded.columns[name], expectedValues[index], name);
+    assert.deepEqual(
+      Object.getOwnPropertyDescriptor(decoded.columns, name),
+      {
+        configurable: true,
+        enumerable: true,
+        value: decoded.columns[name],
+        writable: true,
+      },
+      name,
+    );
+  }
+  assert.deepEqual(
+    Object.getOwnPropertyDescriptors(Object.prototype),
+    prototypeDescriptors,
+  );
+});
+
 test('bundle framing rejects chunk-count mismatches and trailing bytes', async () => {
   const manifest = {
     chunks: [{

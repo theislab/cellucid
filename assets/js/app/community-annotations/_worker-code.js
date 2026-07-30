@@ -5,7 +5,10 @@
  * only the routes consumed by the current Cellucid browser client.
  */
 
-import { parseExactJson } from './wire-contract.js';
+import {
+  ANNOTATION_FILE_MAX_UTF8_BYTES,
+  parseExactJson,
+} from './wire-contract.js';
 import {
   isCanonicalGitHubAccount,
   isCanonicalGitHubBranch,
@@ -16,9 +19,56 @@ import {
 const GITHUB_API_ORIGIN = 'https://api.github.com';
 const GITHUB_AUTH_URL = 'https://github.com/login/oauth/authorize';
 const GITHUB_TOKEN_URL = 'https://github.com/login/oauth/access_token';
+const CAP_GRAPHQL_URL = 'https://celltype.info/graphql';
+const WORKER_CONTRACT_VERSION = 1;
 const GITHUB_API_VERSION = '2026-03-10';
 const GITHUB_PAGE_SIZE = 100;
-const GITHUB_REQUEST_TIMEOUT_MS = 20_000;
+const GITHUB_COLLECTION_MAX_ITEMS = 10_000;
+const GITHUB_COLLECTION_CONCURRENCY = 6;
+const WORKER_REQUEST_DEADLINE_MS = 15_000;
+const WORKER_REQUEST_BODY_MAX_BYTES = 1_400_000;
+const CAP_REQUEST_BODY_MAX_BYTES = 4 * 1024;
+const CAP_RESPONSE_BODY_MAX_BYTES = 8 * 1024 * 1024;
+const CAP_OUTPUT_BODY_MAX_BYTES = 8 * 1024 * 1024;
+const CAP_LOOKUP_LIMIT_MAX = 25;
+const CAP_DATASET_LIMIT_MAX = 10;
+const CAP_PREFLIGHT_MAX_AGE_SECONDS = 600;
+const CAP_TERM_MAX_CODE_POINTS = 256;
+const CAP_MARKER_TERM_MAX_CODE_POINTS = (50 * 64) + 49;
+const CAP_ID_MAX_CODE_POINTS = 64;
+const CAP_TEXT_MAX_CODE_POINTS = 512;
+const CAP_GENE_MAX_CODE_POINTS = 64;
+const CAP_SYNONYM_MAX_ITEMS = 100;
+const CAP_MARKER_MAX_ITEMS = 200;
+const GITHUB_STANDARD_RESPONSE_BODY_MAX_BYTES = 1_500_000;
+const GITHUB_COLLECTION_PAGE_MAX_BYTES = 1_500_000;
+const GITHUB_CONTENT_RESPONSE_MAX_BYTES = 1_500_000;
+const GITHUB_TREE_RESPONSE_MAX_BYTES = 7_500_000;
+const CAP_LOOKUP_APQ_HASH =
+  '7669f4698d1243244b365018dc60a69b61969791659814e0b4ad1b65385ddaab';
+const CAP_DATASET_APQ_HASH =
+  '84226dc93685478baaabbc0687bb8c85fd24ea280c9d1db957d332dc8a9bff57';
+const OPERATION_ID_HEADER = 'X-Cellucid-Operation-Id';
+const OPERATION_OUTCOME_HEADER = 'X-Cellucid-Operation-Outcome';
+const OPERATION_ID =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const GITHUB_MUTATION_KINDS = new Set([
+  'contents-put',
+  'git-refs-post',
+  'forks-post',
+  'pulls-post',
+]);
+const CAP_LOOKUP_KINDS = new Set([
+  'name',
+  'ontology',
+  'marker',
+  'feedback',
+]);
+const CAP_ONTOLOGY_LOOKUP_FIELDS = Object.freeze(['ontologyTermId']);
+const CAP_MARKER_LOOKUP_FIELDS = Object.freeze([
+  'markerGenes',
+  'canonicalMarkerGenes',
+]);
 const GITHUB_SHA = /^[0-9a-f]{40}$/;
 const GITHUB_USER_FILE =
   /^annotations\/users\/ghid_[1-9][0-9]*\.json$/;
@@ -28,10 +78,10 @@ const GITHUB_READ_ONLY_SCHEMA_FILES = new Set([
   'annotations/moderation/merges.schema.json',
 ]);
 
-const OAUTH_STATE_COOKIE = 'cellucid_gh_oauth_state';
-const OAUTH_RETURN_TO_COOKIE = 'cellucid_gh_oauth_return_to';
-const OAUTH_CODE_VERIFIER_COOKIE = 'cellucid_gh_oauth_code_verifier';
+const OAUTH_OWNER_COOKIE_PREFIX = 'cellucid_gh_oauth_owner_';
 const OAUTH_COOKIE_MAX_AGE_S = 10 * 60;
+const OAUTH_COOKIE_MAX_SERIALIZED_BYTES = 4096;
+const OAUTH_RANDOM_HEX_256 = /^[0-9a-f]{64}$/;
 
 const APP_AUTH_FLAG_PARAM = 'cellucid_github_auth';
 const APP_AUTH_TOKEN_PARAM = 'cellucid_github_token';
@@ -46,6 +96,23 @@ const ALLOWED_METHODS = new Set([
 const ALLOWED_REQUEST_HEADERS = new Set([
   'authorization',
   'content-type',
+  OPERATION_ID_HEADER.toLowerCase(),
+]);
+const CAP_ALLOWED_METHODS = new Set(['POST']);
+const CAP_ALLOWED_REQUEST_HEADERS = new Set(['content-type']);
+const CAP_FORBIDDEN_REQUEST_HEADERS = Object.freeze([
+  'Authorization',
+  'Cookie',
+  'Proxy-Authorization',
+  OPERATION_ID_HEADER,
+  OPERATION_OUTCOME_HEADER,
+]);
+const EXPOSED_RESPONSE_HEADERS = Object.freeze([
+  'Retry-After',
+  OPERATION_ID_HEADER,
+  OPERATION_OUTCOME_HEADER,
+  'X-GitHub-Request-Id',
+  'X-RateLimit-Reset',
 ]);
 
 class WorkerHttpError extends Error {
@@ -58,9 +125,527 @@ class WorkerHttpError extends Error {
   }
 }
 
+function createWorkerRequestScope(request) {
+  if (
+    typeof AbortController !== 'function' ||
+    !(request?.signal instanceof AbortSignal)
+  ) {
+    throw new WorkerHttpError(
+      500,
+      'AbortController and Request signals are required by the GitHub worker'
+    );
+  }
+
+  const controller = new AbortController();
+  let firstCause = null;
+  let firstReason = null;
+  let closed = false;
+  let closeRequested = false;
+  let deferredCloseCount = 0;
+
+  const abort = (cause, reason = null) => {
+    if (closed || firstCause !== null) return;
+    firstCause = cause;
+    firstReason = reason;
+    controller.abort(reason);
+  };
+  const onCallerAbort = () => {
+    abort('caller', request.signal.reason);
+  };
+
+  request.signal.addEventListener('abort', onCallerAbort, { once: true });
+  if (request.signal.aborted) onCallerAbort();
+
+  let deadline = null;
+  try {
+    deadline = setTimeout(
+      () => abort('timeout'),
+      WORKER_REQUEST_DEADLINE_MS
+    );
+  } catch (cause) {
+    request.signal.removeEventListener('abort', onCallerAbort);
+    throw new WorkerHttpError(
+      500,
+      'Worker request deadline could not be created',
+      { cause }
+    );
+  }
+
+  const createAbortError = () => {
+    if (firstCause === 'caller') {
+      return new WorkerHttpError(
+        499,
+        'Worker request was cancelled',
+        { cause: firstReason }
+      );
+    }
+    if (firstCause === 'timeout') {
+      return new WorkerHttpError(
+        504,
+        `Worker request timed out after ${WORKER_REQUEST_DEADLINE_MS}ms`
+      );
+    }
+    if (firstCause === 'internal') {
+      return new WorkerHttpError(
+        502,
+        'Worker request stopped after an internal upstream failure',
+        { cause: firstReason }
+      );
+    }
+    return null;
+  };
+
+  const finishClose = () => {
+    if (closed || !closeRequested || deferredCloseCount !== 0) return;
+    closed = true;
+    clearTimeout(deadline);
+    request.signal.removeEventListener('abort', onCallerAbort);
+  };
+
+  return {
+    signal: controller.signal,
+    createAbortError,
+    throwIfAborted() {
+      const error = createAbortError();
+      if (error !== null) throw error;
+    },
+    cancelInternal(reason) {
+      abort('internal', reason);
+    },
+    deferClose() {
+      if (closed || closeRequested) {
+        throw new WorkerHttpError(
+          500,
+          'Worker request ownership is already closed'
+        );
+      }
+      deferredCloseCount += 1;
+      let released = false;
+      return () => {
+        if (released) return;
+        released = true;
+        deferredCloseCount -= 1;
+        finishClose();
+      };
+    },
+    close() {
+      if (closed || closeRequested) return;
+      closeRequested = true;
+      finishClose();
+    },
+  };
+}
+
+function awaitWithinWorkerRequestScope(promise, requestScope) {
+  requestScope.throwIfAborted();
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const settle = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      requestScope.signal.removeEventListener('abort', onAbort);
+      callback(value);
+    };
+    const onAbort = () => {
+      settle(
+        reject,
+        requestScope.createAbortError() ??
+          new WorkerHttpError(502, 'Worker request was interrupted')
+      );
+    };
+
+    requestScope.signal.addEventListener('abort', onAbort, { once: true });
+    if (requestScope.signal.aborted) {
+      onAbort();
+    }
+    Promise.resolve(promise).then(
+      (value) => settle(resolve, value),
+      (error) => settle(reject, error)
+    );
+  });
+}
+
+async function readBoundedUtf8Body(
+  source,
+  label,
+  {
+    maxBytes,
+    readErrorStatus,
+    tooLargeStatus,
+    requestScope,
+  }
+) {
+  if (
+    !Number.isSafeInteger(maxBytes) ||
+    maxBytes < 1 ||
+    !Number.isSafeInteger(readErrorStatus) ||
+    !Number.isSafeInteger(tooLargeStatus)
+  ) {
+    throw new WorkerHttpError(500, 'Invalid Worker body-read contract');
+  }
+  if (
+    typeof TextDecoder !== 'function' ||
+    typeof TextEncoder !== 'function'
+  ) {
+    throw new WorkerHttpError(
+      500,
+      'UTF-8 encoding support is required by the GitHub worker'
+    );
+  }
+
+  requestScope.throwIfAborted();
+  const body = source?.body;
+  if (!body || typeof body.getReader !== 'function') {
+    if (typeof source?.text !== 'function') {
+      throw new WorkerHttpError(
+        readErrorStatus,
+        `${label} body could not be read`
+      );
+    }
+    let text;
+    try {
+      text = await awaitWithinWorkerRequestScope(
+        source.text(),
+        requestScope
+      );
+    } catch (cause) {
+      if (cause instanceof WorkerHttpError) throw cause;
+      const ownedAbort = requestScope.createAbortError();
+      if (ownedAbort !== null) throw ownedAbort;
+      throw new WorkerHttpError(
+        readErrorStatus,
+        `${label} body could not be read`,
+        { cause }
+      );
+    }
+    requestScope.throwIfAborted();
+    if (typeof text !== 'string') {
+      throw new WorkerHttpError(
+        readErrorStatus,
+        `${label} body could not be read`
+      );
+    }
+    if (new TextEncoder().encode(text).byteLength > maxBytes) {
+      throw new WorkerHttpError(
+        tooLargeStatus,
+        `${label} body exceeds ${maxBytes} bytes`
+      );
+    }
+    return text;
+  }
+
+  const reader = body.getReader();
+  // Preserve a UTF-8 BOM so the exact JSON parser rejects it instead of
+  // silently accepting an alternate wire representation.
+  const decoder = new TextDecoder('utf-8', {
+    fatal: true,
+    ignoreBOM: true,
+  });
+  const textParts = [];
+  let totalBytes = 0;
+  let complete = false;
+  try {
+    while (true) {
+      const result = await awaitWithinWorkerRequestScope(
+        reader.read(),
+        requestScope
+      );
+      requestScope.throwIfAborted();
+      if (
+        !result ||
+        typeof result !== 'object' ||
+        typeof result.done !== 'boolean'
+      ) {
+        throw new WorkerHttpError(
+          readErrorStatus,
+          `${label} body could not be read`
+        );
+      }
+      if (result.done) break;
+      if (!(result.value instanceof Uint8Array)) {
+        throw new WorkerHttpError(
+          readErrorStatus,
+          `${label} body could not be read`
+        );
+      }
+      totalBytes += result.value.byteLength;
+      if (totalBytes > maxBytes) {
+        throw new WorkerHttpError(
+          tooLargeStatus,
+          `${label} body exceeds ${maxBytes} bytes`
+        );
+      }
+      try {
+        textParts.push(decoder.decode(result.value, { stream: true }));
+      } catch (cause) {
+        throw new WorkerHttpError(
+          readErrorStatus,
+          `${label} body contains invalid UTF-8`,
+          { cause }
+        );
+      }
+    }
+    try {
+      textParts.push(decoder.decode());
+    } catch (cause) {
+      throw new WorkerHttpError(
+        readErrorStatus,
+        `${label} body contains invalid UTF-8`,
+        { cause }
+      );
+    }
+    requestScope.throwIfAborted();
+    complete = true;
+    return textParts.join('');
+  } catch (cause) {
+    if (cause instanceof WorkerHttpError) throw cause;
+    const ownedAbort = requestScope.createAbortError();
+    if (ownedAbort !== null) throw ownedAbort;
+    throw new WorkerHttpError(
+      readErrorStatus,
+      `${label} body could not be read`,
+      { cause }
+    );
+  } finally {
+    if (!complete) {
+      try {
+        Promise.resolve(reader.cancel()).catch(() => {});
+      } catch {
+        // The primary body-read outcome owns error reporting.
+      }
+    }
+    try {
+      reader.releaseLock();
+    } catch {
+      // A pending platform read is already observed by the owned promise.
+    }
+  }
+}
+
+function parseCanonicalContentLength(response, label) {
+  const raw = response?.headers?.get?.('Content-Length');
+  if (raw === null || raw === undefined) return null;
+  if (!/^(?:0|[1-9][0-9]*)$/.test(raw)) {
+    throw new WorkerHttpError(
+      502,
+      `${label} Content-Length is invalid`
+    );
+  }
+  const length = Number(raw);
+  if (!Number.isSafeInteger(length)) {
+    throw new WorkerHttpError(
+      502,
+      `${label} Content-Length is invalid`
+    );
+  }
+  return length;
+}
+
+function streamBoundedGitHubJsonResponse(
+  response,
+  label,
+  { maxBytes, headers, requestScope }
+) {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) {
+    throw new WorkerHttpError(500, 'Invalid streamed response byte limit');
+  }
+  if (
+    typeof ReadableStream !== 'function' ||
+    typeof TextDecoder !== 'function'
+  ) {
+    throw new WorkerHttpError(
+      500,
+      'Streaming and UTF-8 decoding are required by the GitHub worker'
+    );
+  }
+
+  requestScope.throwIfAborted();
+  const contentLength = parseCanonicalContentLength(response, label);
+  if (contentLength !== null && contentLength > maxBytes) {
+    try {
+      Promise.resolve(response?.body?.cancel?.()).catch(() => {});
+    } catch {
+      // The bounded-response error owns the public outcome.
+    }
+    throw new WorkerHttpError(
+      502,
+      `${label} body exceeds ${maxBytes} bytes`
+    );
+  }
+  const body = response?.body;
+  if (!body || typeof body.getReader !== 'function') {
+    throw new WorkerHttpError(
+      502,
+      `${label} body could not be streamed`
+    );
+  }
+
+  let reader;
+  try {
+    reader = body.getReader();
+  } catch (cause) {
+    throw new WorkerHttpError(
+      502,
+      `${label} body could not be streamed`,
+      { cause }
+    );
+  }
+  const releaseRequestOwnership = requestScope.deferClose();
+  const decoder = new TextDecoder('utf-8', { fatal: true });
+  let downstreamController = null;
+  let totalBytes = 0;
+  let terminalStarted = false;
+  let terminalPromise = null;
+
+  const release = () => {
+    requestScope.signal.removeEventListener('abort', onAbort);
+    try {
+      reader.releaseLock();
+    } catch {
+      // A pending read remains observed by awaitWithinWorkerRequestScope.
+    }
+    releaseRequestOwnership();
+  };
+  const cancelUpstream = (reason) => {
+    if (terminalPromise !== null) return terminalPromise;
+    terminalStarted = true;
+    requestScope.signal.removeEventListener('abort', onAbort);
+    let cancellation;
+    try {
+      cancellation = reader.cancel(reason);
+    } catch (cause) {
+      cancellation = Promise.reject(cause);
+    }
+    terminalPromise = Promise.resolve(cancellation)
+      .catch(() => {})
+      .finally(release);
+    return terminalPromise;
+  };
+  const complete = () => {
+    if (terminalStarted) return;
+    terminalStarted = true;
+    requestScope.signal.removeEventListener('abort', onAbort);
+    release();
+    terminalPromise = Promise.resolve();
+  };
+  const onAbort = () => {
+    if (terminalStarted) return;
+    const error =
+      requestScope.createAbortError() ??
+      new WorkerHttpError(502, 'Worker request was interrupted');
+    try {
+      downstreamController?.error(error);
+    } catch {
+      // Downstream cancellation may have already closed the controller.
+    }
+    void cancelUpstream(error);
+  };
+
+  const stream = new ReadableStream({
+    start(controller) {
+      downstreamController = controller;
+      requestScope.signal.addEventListener('abort', onAbort, { once: true });
+      if (requestScope.signal.aborted) onAbort();
+    },
+    async pull(controller) {
+      if (terminalStarted) {
+        if (terminalPromise !== null) await terminalPromise;
+        return;
+      }
+      try {
+        const result = await awaitWithinWorkerRequestScope(
+          reader.read(),
+          requestScope
+        );
+        requestScope.throwIfAborted();
+        if (
+          !result ||
+          typeof result !== 'object' ||
+          typeof result.done !== 'boolean'
+        ) {
+          throw new WorkerHttpError(
+            502,
+            `${label} body could not be streamed`
+          );
+        }
+        if (result.done) {
+          try {
+            decoder.decode();
+          } catch (cause) {
+            throw new WorkerHttpError(
+              502,
+              `${label} body contains invalid UTF-8`,
+              { cause }
+            );
+          }
+          controller.close();
+          complete();
+          return;
+        }
+        if (!(result.value instanceof Uint8Array)) {
+          throw new WorkerHttpError(
+            502,
+            `${label} body could not be streamed`
+          );
+        }
+        totalBytes += result.value.byteLength;
+        if (totalBytes > maxBytes) {
+          throw new WorkerHttpError(
+            502,
+            `${label} body exceeds ${maxBytes} bytes`
+          );
+        }
+        try {
+          decoder.decode(result.value, { stream: true });
+        } catch (cause) {
+          throw new WorkerHttpError(
+            502,
+            `${label} body contains invalid UTF-8`,
+            { cause }
+          );
+        }
+        controller.enqueue(result.value);
+      } catch (cause) {
+        const error =
+          cause instanceof WorkerHttpError
+            ? cause
+            : requestScope.createAbortError() ??
+              new WorkerHttpError(
+                502,
+                `${label} body could not be streamed`,
+                { cause }
+              );
+        if (!terminalStarted) {
+          try {
+            controller.error(error);
+          } catch {
+            // The downstream may already have cancelled the stream.
+          }
+          await cancelUpstream(error);
+        } else if (terminalPromise !== null) {
+          await terminalPromise;
+        }
+      }
+    },
+    cancel(reason) {
+      return cancelUpstream(reason);
+    },
+  });
+
+  return new Response(stream, {
+    status: response.status,
+    headers: mergeHeaders(headers, {
+      'Cache-Control': 'no-store',
+      'Content-Type': 'application/json; charset=utf-8',
+      'X-Content-Type-Options': 'nosniff',
+    }),
+  });
+}
+
 export default {
   async fetch(request, env) {
     let corsHeaders = new Headers();
+    let requestScope = null;
     try {
       if (!(request instanceof Request)) {
         throw new WorkerHttpError(400, 'Worker request must be a Request');
@@ -74,10 +659,52 @@ export default {
           403
         );
       }
-      corsHeaders = createCorsHeaders(origin);
+      const isCapLookup = url.pathname === '/cap/lookup-cells';
+      const isCapDatasetSearch = url.pathname === '/cap/search-datasets';
+      const isCapRoute = isCapLookup || isCapDatasetSearch;
+      const isCapNamespace =
+        url.pathname === '/cap' || url.pathname.startsWith('/cap/');
+      if (isCapNamespace && !isCapRoute) {
+        throw new WorkerHttpError(404, 'CAP route not found');
+      }
+      if (isCapRoute && origin === null) {
+        throw new WorkerHttpError(403, 'CAP routes require an allowed Origin');
+      }
+      corsHeaders = createCorsHeaders(
+        origin,
+        isCapRoute
+          ? {
+              allowedMethods: CAP_ALLOWED_METHODS,
+              allowedRequestHeaders: CAP_ALLOWED_REQUEST_HEADERS,
+              exposedResponseHeaders: [],
+            }
+          : undefined
+      );
 
       if (request.method === 'OPTIONS') {
-        return handlePreflight(request, corsHeaders);
+        return handlePreflight(
+          request,
+          corsHeaders,
+          isCapRoute
+            ? {
+                allowedMethods: CAP_ALLOWED_METHODS,
+                allowedRequestHeaders: CAP_ALLOWED_REQUEST_HEADERS,
+                maxAgeSeconds: CAP_PREFLIGHT_MAX_AGE_SECONDS,
+              }
+            : undefined
+        );
+      }
+      if (isCapRoute) {
+        requireMethod(request, 'POST');
+        requestScope = createWorkerRequestScope(request);
+        return isCapLookup
+          ? await handleCapLookup(request, url, corsHeaders, requestScope)
+          : await handleCapDatasetSearch(
+              request,
+              url,
+              corsHeaders,
+              requestScope
+            );
       }
       if (!ALLOWED_METHODS.has(request.method)) {
         throw new WorkerHttpError(405, `Method is not allowed: ${request.method}`);
@@ -89,22 +716,40 @@ export default {
       }
       if (url.pathname === '/auth/callback') {
         requireMethod(request, 'GET');
-        return await handleCallback(request, url, env);
+        requestScope = createWorkerRequestScope(request);
+        return await handleCallback(request, url, env, requestScope);
       }
       if (url.pathname === '/auth/user') {
         requireMethod(request, 'GET');
-        return await handleGetUser(request, corsHeaders);
+        requestScope = createWorkerRequestScope(request);
+        return await handleGetUser(request, corsHeaders, requestScope);
       }
       if (url.pathname === '/auth/installations') {
         requireMethod(request, 'GET');
-        return await handleGetInstallations(request, corsHeaders);
+        requestScope = createWorkerRequestScope(request);
+        return await handleGetInstallations(
+          request,
+          corsHeaders,
+          requestScope
+        );
       }
       if (url.pathname === '/auth/installation-repos') {
         requireMethod(request, 'POST');
-        return await handleGetInstallationRepos(request, corsHeaders);
+        requestScope = createWorkerRequestScope(request);
+        return await handleGetInstallationRepos(
+          request,
+          corsHeaders,
+          requestScope
+        );
       }
       if (url.pathname.startsWith('/api/')) {
-        return await handleApiProxy(request, url, corsHeaders);
+        requestScope = createWorkerRequestScope(request);
+        return await handleApiProxy(
+          request,
+          url,
+          corsHeaders,
+          requestScope
+        );
       }
       if (url.pathname === '/') {
         requireMethod(request, 'GET');
@@ -112,12 +757,15 @@ export default {
           {
             status: 'ok',
             service: 'Cellucid GitHub Auth',
+            contractVersion: WORKER_CONTRACT_VERSION,
             endpoints: [
               '/auth/login',
               '/auth/callback',
               '/auth/user',
               '/auth/installations',
               '/auth/installation-repos',
+              '/cap/lookup-cells',
+              '/cap/search-datasets',
               '/api/repos/*',
             ],
           },
@@ -144,9 +792,22 @@ export default {
         error?.responseHeaders
       );
       return jsonResponse({ error: message }, status, headers);
+    } finally {
+      requestScope?.close();
     }
   },
 };
+
+function exceedsCodePointLimit(value, max) {
+  if (value.length <= max) return false;
+  if (value.length > max * 2) return true;
+  let count = 0;
+  for (const _character of value) {
+    count += 1;
+    if (count > max) return true;
+  }
+  return false;
+}
 
 function assertExactString(
   value,
@@ -157,7 +818,7 @@ function assertExactString(
     typeof value !== 'string' ||
     !value ||
     /^\s|\s$/.test(value) ||
-    Array.from(value).length > max
+    exceedsCodePointLimit(value, max)
   ) {
     throw new WorkerHttpError(
       status,
@@ -232,11 +893,20 @@ function requireEnvString(env, key, { max = 16384 } = {}) {
     typeof value !== 'string' ||
     !value ||
     /^\s|\s$/.test(value) ||
-    Array.from(value).length > max
+    exceedsCodePointLimit(value, max)
   ) {
     throw new WorkerHttpError(500, `Missing or invalid worker secret: ${key}`);
   }
   return value;
+}
+
+function isLoopbackHostname(hostname) {
+  return (
+    hostname === 'localhost' ||
+    hostname.endsWith('.localhost') ||
+    hostname === '[::1]' ||
+    /^127\.[0-9]+\.[0-9]+\.[0-9]+$/.test(hostname)
+  );
 }
 
 function parseAllowedOrigins(env) {
@@ -265,13 +935,18 @@ function parseAllowedOrigins(env) {
     }
     if (
       (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') ||
+      (
+        parsed.protocol === 'http:' &&
+        !isLoopbackHostname(parsed.hostname)
+      ) ||
       parsed.username ||
       parsed.password ||
       entry !== parsed.origin
     ) {
       throw new WorkerHttpError(
         500,
-        `ALLOWED_ORIGINS entry must be an exact HTTP(S) origin: ${entry}`
+        'ALLOWED_ORIGINS entries must be exact HTTPS origins or loopback ' +
+        `HTTP development origins: ${entry}`
       );
     }
     if (allowed.has(entry)) {
@@ -292,23 +967,44 @@ function validateWorkerEnvironment(env) {
   return allowedOrigins;
 }
 
-function createCorsHeaders(origin) {
+function createCorsHeaders(
+  origin,
+  {
+    allowedMethods = ALLOWED_METHODS,
+    allowedRequestHeaders = ALLOWED_REQUEST_HEADERS,
+    exposedResponseHeaders = EXPOSED_RESPONSE_HEADERS,
+  } = {}
+) {
   const headers = new Headers({
-    'Access-Control-Allow-Methods': [...ALLOWED_METHODS].join(', '),
-    'Access-Control-Allow-Headers': [...ALLOWED_REQUEST_HEADERS].join(', '),
+    'Access-Control-Allow-Methods': [...allowedMethods].join(', '),
+    'Access-Control-Allow-Headers': [...allowedRequestHeaders].join(', '),
     'Vary': 'Origin',
   });
+  if (exposedResponseHeaders.length !== 0) {
+    headers.set(
+      'Access-Control-Expose-Headers',
+      exposedResponseHeaders.join(', ')
+    );
+  }
   if (origin !== null) {
     headers.set('Access-Control-Allow-Origin', origin);
   }
   return headers;
 }
 
-function handlePreflight(request, corsHeaders) {
+function handlePreflight(
+  request,
+  corsHeaders,
+  {
+    allowedMethods = ALLOWED_METHODS,
+    allowedRequestHeaders = ALLOWED_REQUEST_HEADERS,
+    maxAgeSeconds = null,
+  } = {}
+) {
   const requestedMethod = request.headers.get('Access-Control-Request-Method');
   if (
     requestedMethod === null ||
-    !ALLOWED_METHODS.has(requestedMethod) ||
+    !allowedMethods.has(requestedMethod) ||
     requestedMethod === 'OPTIONS'
   ) {
     throw new WorkerHttpError(400, 'Invalid CORS preflight method');
@@ -320,12 +1016,146 @@ function handlePreflight(request, corsHeaders) {
     : [];
   if (
     requestedHeaders.some(
-      (header) => !header || !ALLOWED_REQUEST_HEADERS.has(header)
+      (header) => !header || !allowedRequestHeaders.has(header)
     )
   ) {
     throw new WorkerHttpError(400, 'Invalid CORS preflight request header');
   }
-  return new Response(null, { status: 204, headers: corsHeaders });
+  const responseHeaders = new Headers(corsHeaders);
+  if (maxAgeSeconds !== null) {
+    if (
+      !Number.isSafeInteger(maxAgeSeconds) ||
+      maxAgeSeconds < 1 ||
+      maxAgeSeconds > 86_400
+    ) {
+      throw new WorkerHttpError(500, 'Invalid CORS preflight max age');
+    }
+    responseHeaders.set('Access-Control-Max-Age', String(maxAgeSeconds));
+  }
+  return new Response(null, { status: 204, headers: responseHeaders });
+}
+
+function createOperationOutcomeHeaders(operationId, outcome) {
+  if (
+    operationId !== null &&
+    (typeof operationId !== 'string' || !OPERATION_ID.test(operationId))
+  ) {
+    throw new WorkerHttpError(500, 'Invalid Worker operation identity');
+  }
+  if (
+    outcome !== 'applied' &&
+    outcome !== 'not-applied' &&
+    outcome !== 'unknown'
+  ) {
+    throw new WorkerHttpError(500, 'Invalid Worker operation outcome');
+  }
+  const headers = new Headers({
+    [OPERATION_OUTCOME_HEADER]: outcome,
+  });
+  if (operationId !== null) {
+    headers.set(OPERATION_ID_HEADER, operationId);
+  }
+  return headers;
+}
+
+function createGitHubMutationContext(request, kind) {
+  const isMutation = GITHUB_MUTATION_KINDS.has(kind);
+  const suppliedOperationId = request.headers.get(OPERATION_ID_HEADER);
+  const suppliedOutcome = request.headers.get(OPERATION_OUTCOME_HEADER);
+
+  if (!isMutation) {
+    if (suppliedOperationId !== null || suppliedOutcome !== null) {
+      throw new WorkerHttpError(
+        400,
+        'GitHub read requests must not contain Cellucid operation headers'
+      );
+    }
+    return null;
+  }
+  if (suppliedOutcome !== null) {
+    const operationId =
+      suppliedOperationId !== null && OPERATION_ID.test(suppliedOperationId)
+        ? suppliedOperationId
+        : null;
+    throw new WorkerHttpError(
+      400,
+      `${OPERATION_OUTCOME_HEADER} is response-only`,
+      {
+        headers: createOperationOutcomeHeaders(
+          operationId,
+          'not-applied'
+        ),
+      }
+    );
+  }
+  if (
+    suppliedOperationId === null ||
+    !OPERATION_ID.test(suppliedOperationId)
+  ) {
+    throw new WorkerHttpError(
+      400,
+      `${OPERATION_ID_HEADER} must be one canonical lowercase UUIDv4`,
+      {
+        headers: createOperationOutcomeHeaders(null, 'not-applied'),
+      }
+    );
+  }
+
+  let forwarded = false;
+  return {
+    id: suppliedOperationId,
+    markForwarded() {
+      forwarded = true;
+    },
+    responseHeaders(outcome) {
+      return createOperationOutcomeHeaders(suppliedOperationId, outcome);
+    },
+    decorateError(error, additionalHeaders = null) {
+      const outcome = forwarded ? 'unknown' : 'not-applied';
+      const responseHeaders = mergeHeaders(
+        error?.responseHeaders,
+        additionalHeaders,
+        createOperationOutcomeHeaders(suppliedOperationId, outcome)
+      );
+      if (error && typeof error === 'object') {
+        error.responseHeaders = responseHeaders;
+        return error;
+      }
+      return new WorkerHttpError(500, 'Internal worker error', {
+        headers: responseHeaders,
+        cause: error,
+      });
+    },
+  };
+}
+
+function createSafeGitHubResponseHeaders(response) {
+  const headers = new Headers();
+  const retryAfter = response?.headers?.get?.('Retry-After');
+  if (
+    typeof retryAfter === 'string' &&
+    retryAfter.length > 0 &&
+    retryAfter.length <= 256 &&
+    retryAfter === retryAfter.trim() &&
+    !/[\u0000-\u001f\u007f]/.test(retryAfter)
+  ) {
+    headers.set('Retry-After', retryAfter);
+  }
+  const rateLimitReset = response?.headers?.get?.('X-RateLimit-Reset');
+  if (
+    typeof rateLimitReset === 'string' &&
+    /^(?:0|[1-9][0-9]{0,15})$/.test(rateLimitReset)
+  ) {
+    headers.set('X-RateLimit-Reset', rateLimitReset);
+  }
+  const requestId = response?.headers?.get?.('X-GitHub-Request-Id');
+  if (
+    typeof requestId === 'string' &&
+    /^[A-Za-z0-9:-]{1,128}$/.test(requestId)
+  ) {
+    headers.set('X-GitHub-Request-Id', requestId);
+  }
+  return headers;
 }
 
 function mergeHeaders(...sources) {
@@ -343,16 +1173,37 @@ function mergeHeaders(...sources) {
   return merged;
 }
 
-function jsonResponse(data, status, headers = null) {
+function jsonTextResponse(text, status, headers = null) {
   const responseHeaders = mergeHeaders(headers, {
     'Cache-Control': 'no-store',
     'Content-Type': 'application/json; charset=utf-8',
     'X-Content-Type-Options': 'nosniff',
   });
-  return new Response(JSON.stringify(data), {
+  return new Response(text, {
     status,
     headers: responseHeaders,
   });
+}
+
+function jsonResponse(data, status, headers = null) {
+  return jsonTextResponse(JSON.stringify(data), status, headers);
+}
+
+function boundedJsonResponse(data, status, headers, maxBytes, label) {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) {
+    throw new WorkerHttpError(500, 'Invalid JSON response byte limit');
+  }
+  if (typeof TextEncoder !== 'function') {
+    throw new WorkerHttpError(
+      500,
+      'UTF-8 encoding support is required by the GitHub worker'
+    );
+  }
+  const text = JSON.stringify(data);
+  if (new TextEncoder().encode(text).byteLength > maxBytes) {
+    throw new WorkerHttpError(502, `${label} exceeds ${maxBytes} bytes`);
+  }
+  return jsonTextResponse(text, status, headers);
 }
 
 function getSingleQueryParam(url, name, { required = false } = {}) {
@@ -448,20 +1299,130 @@ function getCookie(request, name, { required = false } = {}) {
   return matches[0];
 }
 
-function clearOauthCookies(headers) {
-  for (const name of [
-    OAUTH_STATE_COOKIE,
-    OAUTH_RETURN_TO_COOKIE,
-    OAUTH_CODE_VERIFIER_COOKIE,
-  ]) {
-    headers.append(
-      'Set-Cookie',
-      serializeCookie(name, '', {
-        path: '/auth/callback',
-        maxAge: 0,
-      })
+function getOauthOwnerCookieName(state) {
+  if (
+    typeof state !== 'string' ||
+    !OAUTH_RANDOM_HEX_256.test(state)
+  ) {
+    throw new WorkerHttpError(
+      400,
+      'OAuth state must be 64 lowercase hexadecimal characters'
     );
   }
+  return `${OAUTH_OWNER_COOKIE_PREFIX}${state}`;
+}
+
+function clearOauthOwnerCookie(headers, name) {
+  headers.append(
+    'Set-Cookie',
+    serializeCookie(name, '', {
+      path: '/auth/callback',
+      maxAge: 0,
+    })
+  );
+}
+
+function serializeOauthOwnerCookie(state, returnTo, codeVerifier) {
+  const name = getOauthOwnerCookieName(state);
+  const value = JSON.stringify({
+    return_to: returnTo,
+    code_verifier: codeVerifier,
+  });
+  const serialized = serializeCookie(name, value, {
+    path: '/auth/callback',
+    maxAge: OAUTH_COOKIE_MAX_AGE_S,
+  });
+  if (typeof TextEncoder !== 'function') {
+    throw new WorkerHttpError(
+      500,
+      'Web Crypto text encoding support is required'
+    );
+  }
+  if (
+    new TextEncoder().encode(serialized).byteLength >
+    OAUTH_COOKIE_MAX_SERIALIZED_BYTES
+  ) {
+    throw new WorkerHttpError(
+      400,
+      `OAuth owner cookie exceeds ${OAUTH_COOKIE_MAX_SERIALIZED_BYTES} serialized bytes`
+    );
+  }
+  return { name, serialized };
+}
+
+function parseOauthOwnerCookie(rawValue, env) {
+  let document;
+  try {
+    document = parseExactJson(rawValue, {
+      path: 'OAuth owner cookie',
+    });
+  } catch (cause) {
+    throw new WorkerHttpError(
+      400,
+      'OAuth owner cookie contains invalid JSON',
+      { cause }
+    );
+  }
+  assertExactFields(
+    document,
+    ['return_to', 'code_verifier'],
+    'OAuth owner cookie'
+  );
+  const returnTo = validateReturnTo(document.return_to, env);
+  const codeVerifier = assertExactString(
+    document.code_verifier,
+    'OAuth owner code_verifier',
+    { max: 64 }
+  );
+  if (!OAUTH_RANDOM_HEX_256.test(codeVerifier)) {
+    throw new WorkerHttpError(
+      400,
+      'OAuth owner code_verifier must be 64 lowercase hexadecimal characters'
+    );
+  }
+  return { returnTo, codeVerifier };
+}
+
+const APP_AUTH_FRAGMENT_PARAM_NAMES = new Set([
+  APP_AUTH_FLAG_PARAM,
+  APP_AUTH_TOKEN_PARAM,
+  APP_AUTH_ERROR_PARAM,
+]);
+
+function readFragmentParamName(segment, index) {
+  // Decode only the field name. Retaining the raw segment prevents unrelated
+  // fragment bytes and separators from being normalized during auth cleanup.
+  let candidate = segment;
+  if (index === 0 && candidate.startsWith('?')) {
+    candidate = candidate.slice(1);
+  }
+  if (!candidate) return null;
+  const separatorIndex = candidate.indexOf('=');
+  const rawName =
+    separatorIndex === -1
+      ? candidate
+      : candidate.slice(0, separatorIndex);
+  const probe = new URLSearchParams(`__cellucid_probe__=&${rawName}=`);
+  const names = probe.keys();
+  names.next();
+  return names.next().value ?? null;
+}
+
+function scrubAppAuthFragment(hash, { hasFragment }) {
+  const segments = hasFragment ? hash.split('&') : [];
+  const retained = [];
+  for (let index = 0; index < segments.length; index += 1) {
+    const segment = segments[index];
+    const name = readFragmentParamName(segment, index);
+    if (name !== null && APP_AUTH_FRAGMENT_PARAM_NAMES.has(name)) {
+      continue;
+    }
+    retained.push(segment);
+  }
+  return {
+    cleanedHash: retained.join('&'),
+    hasRetainedSegments: retained.length > 0,
+  };
 }
 
 function redirectToApp(returnTo, { token = null, error = null }, headers) {
@@ -472,12 +1433,17 @@ function redirectToApp(returnTo, { token = null, error = null }, headers) {
     );
   }
   const destination = new URL(returnTo);
-  const hashParams = new URLSearchParams(
-    destination.hash.replace(/^#/, '')
+  const fragmentIndex = destination.href.indexOf('#');
+  const {
+    cleanedHash,
+    hasRetainedSegments,
+  } = scrubAppAuthFragment(
+    fragmentIndex === -1
+      ? ''
+      : destination.href.slice(fragmentIndex + 1),
+    { hasFragment: fragmentIndex !== -1 }
   );
-  hashParams.delete(APP_AUTH_FLAG_PARAM);
-  hashParams.delete(APP_AUTH_TOKEN_PARAM);
-  hashParams.delete(APP_AUTH_ERROR_PARAM);
+  const hashParams = new URLSearchParams();
   hashParams.set(APP_AUTH_FLAG_PARAM, '1');
   if (token !== null) {
     hashParams.set(
@@ -491,7 +1457,10 @@ function redirectToApp(returnTo, { token = null, error = null }, headers) {
       assertExactString(error, 'OAuth error')
     );
   }
-  destination.hash = hashParams.toString();
+  const authHash = hashParams.toString();
+  destination.hash = hasRetainedSegments
+    ? `${cleanedHash}&${authHash}`
+    : authHash;
 
   const responseHeaders = mergeHeaders(headers, {
     'Cache-Control': 'no-store',
@@ -500,7 +1469,7 @@ function redirectToApp(returnTo, { token = null, error = null }, headers) {
   return new Response(null, { status: 302, headers: responseHeaders });
 }
 
-function createPkceVerifier() {
+function createRandomHex256() {
   if (typeof crypto?.getRandomValues !== 'function') {
     throw new WorkerHttpError(500, 'Web Crypto random generation is required');
   }
@@ -539,9 +1508,14 @@ async function handleLogin(url, env) {
     env
   );
   const clientId = requireEnvString(env, 'GITHUB_CLIENT_ID');
-  const state = crypto.randomUUID();
-  const codeVerifier = createPkceVerifier();
+  const state = createRandomHex256();
+  const codeVerifier = createRandomHex256();
   const codeChallenge = await createPkceChallenge(codeVerifier);
+  const ownerCookie = serializeOauthOwnerCookie(
+    state,
+    returnTo,
+    codeVerifier
+  );
   const redirectUri = `${url.origin}/auth/callback`;
 
   const authUrl = new URL(GITHUB_AUTH_URL);
@@ -557,50 +1531,40 @@ async function handleLogin(url, env) {
   });
   headers.append(
     'Set-Cookie',
-    serializeCookie(OAUTH_STATE_COOKIE, state, {
-      path: '/auth/callback',
-      maxAge: OAUTH_COOKIE_MAX_AGE_S,
-    })
-  );
-  headers.append(
-    'Set-Cookie',
-    serializeCookie(OAUTH_RETURN_TO_COOKIE, returnTo, {
-      path: '/auth/callback',
-      maxAge: OAUTH_COOKIE_MAX_AGE_S,
-    })
-  );
-  headers.append(
-    'Set-Cookie',
-    serializeCookie(OAUTH_CODE_VERIFIER_COOKIE, codeVerifier, {
-      path: '/auth/callback',
-      maxAge: OAUTH_COOKIE_MAX_AGE_S,
-    })
+    ownerCookie.serialized
   );
   return new Response(null, { status: 302, headers });
 }
 
-async function handleCallback(request, url, env) {
+function oauthCallbackFailureMessage(error, outcomeUnknown) {
+  if (outcomeUnknown) {
+    return (
+      'GitHub sign-in outcome is unknown. ' +
+      'Start a new sign-in; do not retry this callback.'
+    );
+  }
+  if (error instanceof WorkerHttpError && error.status === 400) {
+    return `GitHub sign-in failed: ${error.message}`;
+  }
+  return 'GitHub sign-in could not be completed. Please try again.';
+}
+
+async function handleCallback(request, url, env, requestScope) {
+  const returnedState = getSingleQueryParam(url, 'state', {
+    required: true,
+  });
+  const ownerCookieName = getOauthOwnerCookieName(returnedState);
   const headers = new Headers();
-  clearOauthCookies(headers);
+  clearOauthOwnerCookie(headers, ownerCookieName);
+  let returnTo = null;
+  let tokenExchangeForwarded = false;
   try {
-    const returnTo = validateReturnTo(
-      getCookie(request, OAUTH_RETURN_TO_COOKIE, { required: true }),
+    const owner = parseOauthOwnerCookie(
+      getCookie(request, ownerCookieName, { required: true }),
       env
     );
-    const expectedState = assertExactString(
-      getCookie(request, OAUTH_STATE_COOKIE, { required: true }),
-      'OAuth state cookie'
-    );
-    const codeVerifier = assertExactString(
-      getCookie(request, OAUTH_CODE_VERIFIER_COOKIE, { required: true }),
-      'OAuth PKCE verifier'
-    );
-    const returnedState = getSingleQueryParam(url, 'state', {
-      required: true,
-    });
-    if (returnedState !== expectedState) {
-      throw new WorkerHttpError(400, 'Invalid OAuth state');
-    }
+    returnTo = owner.returnTo;
+    const codeVerifier = owner.codeVerifier;
 
     const code = getSingleQueryParam(url, 'code');
     const oauthError = getSingleQueryParam(url, 'error');
@@ -633,7 +1597,7 @@ async function handleCallback(request, url, env) {
 
     const clientId = requireEnvString(env, 'GITHUB_CLIENT_ID');
     const clientSecret = requireEnvString(env, 'GITHUB_CLIENT_SECRET');
-    const tokenResponse = await fetchGitHub(
+    const tokenResponse = await fetchUpstream(
       GITHUB_TOKEN_URL,
       {
         method: 'POST',
@@ -649,11 +1613,18 @@ async function handleCallback(request, url, env) {
           redirect_uri: `${url.origin}/auth/callback`,
         }),
       },
-      'GitHub OAuth token exchange'
+      'GitHub OAuth token exchange',
+      requestScope,
+      {
+        markForwarded() {
+          tokenExchangeForwarded = true;
+        },
+      }
     );
     const tokenDocument = await parseResponseJson(
       tokenResponse,
-      'GitHub OAuth token response'
+      'GitHub OAuth token response',
+      requestScope
     );
     if (!tokenResponse.ok) {
       assertExactFields(
@@ -688,6 +1659,24 @@ async function handleCallback(request, url, env) {
     );
     return redirectToApp(returnTo, { token }, headers);
   } catch (error) {
+    if (returnTo !== null) {
+      if (!(error instanceof WorkerHttpError)) {
+        console.error('Cellucid GitHub OAuth callback error', {
+          name: error?.name,
+          message: error?.message,
+        });
+      }
+      return redirectToApp(
+        returnTo,
+        {
+          error: oauthCallbackFailureMessage(
+            error,
+            tokenExchangeForwarded
+          ),
+        },
+        headers
+      );
+    }
     if (error && typeof error === 'object') {
       error.responseHeaders = mergeHeaders(
         error.responseHeaders,
@@ -704,20 +1693,28 @@ function getBearerToken(request) {
     throw new WorkerHttpError(401, 'Missing bearer token');
   }
   const match = authorization.match(/^Bearer ([^\s,]+)$/);
-  if (!match || Array.from(match[1]).length > 4096) {
+  if (!match || exceedsCodePointLimit(match[1], 4096)) {
     throw new WorkerHttpError(401, 'Invalid bearer token');
   }
   return match[1];
 }
 
-async function handleGetUser(request, corsHeaders) {
+async function handleGetUser(request, corsHeaders, requestScope) {
   const token = getBearerToken(request);
-  const { response, document } = await githubFetchJson('/user', token);
+  const { response, document } = await githubFetchJson(
+    '/user',
+    token,
+    requestScope
+  );
+  const responseHeaders = mergeHeaders(
+    corsHeaders,
+    createSafeGitHubResponseHeaders(response)
+  );
   if (!response.ok) {
     return jsonResponse(
       { error: upstreamErrorMessage(document, 'GitHub user request failed') },
       response.status,
-      corsHeaders
+      responseHeaders
     );
   }
   const id = document?.id;
@@ -726,15 +1723,66 @@ async function handleGetUser(request, corsHeaders) {
     throw new WorkerHttpError(502, 'GitHub user id is invalid');
   }
   assertCanonicalGitHubAccount(login, 'GitHub user login');
-  return jsonResponse({ id, login }, 200, corsHeaders);
+  return jsonResponse({ id, login }, 200, responseHeaders);
 }
 
-async function handleGetInstallations(request, corsHeaders) {
+function projectInstallationCollectionItem(installation, index) {
+  const id = installation?.id;
+  const login = installation?.account?.login;
+  if (!Number.isSafeInteger(id) || id < 1) {
+    throw new WorkerHttpError(
+      502,
+      `GitHub installation ${index} has an invalid id`
+    );
+  }
+  assertCanonicalGitHubAccount(
+    login,
+    `GitHub installation ${index} account login`
+  );
+  return { id, account: { login } };
+}
+
+function projectRepositoryCollectionItem(repository, index) {
+  const id = repository?.id;
+  const fullName = repository?.full_name;
+  const isPrivate = repository?.private;
+  if (!Number.isSafeInteger(id) || id < 1) {
+    throw new WorkerHttpError(
+      502,
+      `GitHub repository ${index} has an invalid id`
+    );
+  }
+  assertExactString(fullName, `GitHub repository ${index} full_name`, {
+    max: 256,
+    status: 502,
+  });
+  if (!isCanonicalGitHubRepositoryFullName(fullName)) {
+    throw new WorkerHttpError(
+      502,
+      `GitHub repository ${index} full_name is not canonical`
+    );
+  }
+  if (typeof isPrivate !== 'boolean') {
+    throw new WorkerHttpError(
+      502,
+      `GitHub repository ${index} private must be boolean`
+    );
+  }
+  return { id, full_name: fullName, private: isPrivate };
+}
+
+async function handleGetInstallations(request, corsHeaders, requestScope) {
   const token = getBearerToken(request);
   const result = await githubFetchCollection(
     '/user/installations',
     token,
-    'installations'
+    'installations',
+    projectInstallationCollectionItem,
+    requestScope
+  );
+  const responseHeaders = mergeHeaders(
+    corsHeaders,
+    createSafeGitHubResponseHeaders(result.response)
   );
   if (!result.response.ok) {
     return jsonResponse(
@@ -745,24 +1793,14 @@ async function handleGetInstallations(request, corsHeaders) {
         ),
       },
       result.response.status,
-      corsHeaders
+      responseHeaders
     );
   }
   const seenIds = new Set();
   const seenAccounts = new Set();
-  const installations = result.items.map((installation, index) => {
+  for (const installation of result.items) {
     const id = installation?.id;
     const login = installation?.account?.login;
-    if (!Number.isSafeInteger(id) || id < 1) {
-      throw new WorkerHttpError(
-        502,
-        `GitHub installation ${index} has an invalid id`
-      );
-    }
-    assertCanonicalGitHubAccount(
-      login,
-      `GitHub installation ${index} account login`
-    );
     if (seenIds.has(id)) {
       throw new WorkerHttpError(
         502,
@@ -778,17 +1816,31 @@ async function handleGetInstallations(request, corsHeaders) {
     }
     seenIds.add(id);
     seenAccounts.add(accountKey);
-    return { id, account: { login } };
-  });
-  return jsonResponse({ installations }, 200, corsHeaders);
+  }
+  return jsonResponse(
+    { installations: result.items },
+    200,
+    responseHeaders
+  );
 }
 
-async function readExactRequestObject(request, label, allowedKeys = null) {
+async function readExactRequestObject(
+  request,
+  label,
+  allowedKeys = null,
+  requestScope,
+  maxBytes = WORKER_REQUEST_BODY_MAX_BYTES
+) {
   const contentType = request.headers.get('Content-Type') ?? '';
   if (!/^application\/json(?:\s*;\s*charset=utf-8)?$/i.test(contentType)) {
     throw new WorkerHttpError(415, `${label} requires application/json`);
   }
-  const text = await request.text();
+  const text = await readBoundedUtf8Body(request, label, {
+    maxBytes,
+    readErrorStatus: 400,
+    tooLargeStatus: 413,
+    requestScope,
+  });
   if (!text) throw new WorkerHttpError(400, `${label} body is empty`);
   let document;
   try {
@@ -815,12 +1867,436 @@ async function readExactRequestObject(request, label, allowedKeys = null) {
   return document;
 }
 
-async function handleGetInstallationRepos(request, corsHeaders) {
+function assertCapRequestHasNoCredentials(request) {
+  for (const header of CAP_FORBIDDEN_REQUEST_HEADERS) {
+    if (request.headers.has(header)) {
+      throw new WorkerHttpError(
+        400,
+        `CAP requests must not contain ${header}`
+      );
+    }
+  }
+}
+
+function assertCapLimit(value, max, label) {
+  if (!Number.isSafeInteger(value) || value < 1 || value > max) {
+    throw new WorkerHttpError(
+      400,
+      `${label} must be a safe integer from 1 to ${max}`
+    );
+  }
+  return value;
+}
+
+function createCapPersistedQueryDocument(operationName, hash, variables) {
+  return {
+    operationName,
+    variables,
+    extensions: {
+      persistedQuery: {
+        version: 1,
+        sha256Hash: hash,
+      },
+    },
+  };
+}
+
+function isWorkerRequestAbort(error) {
+  return (
+    error instanceof WorkerHttpError &&
+    (error.status === 499 || error.status === 504)
+  );
+}
+
+async function cancelCapResponseBodyPreservingOwnerAbort(
+  response,
+  requestScope
+) {
+  const body = response?.body;
+  if (!body || typeof body.cancel !== 'function') {
+    requestScope.throwIfAborted();
+    return;
+  }
+
+  let cancellation;
+  try {
+    cancellation = body.cancel();
+  } catch {
+    requestScope.throwIfAborted();
+    return;
+  }
+  try {
+    await awaitWithinWorkerRequestScope(cancellation, requestScope);
+  } catch {
+    const ownedAbort = requestScope.createAbortError();
+    if (ownedAbort !== null) throw ownedAbort;
+  }
+  requestScope.throwIfAborted();
+}
+
+async function preflightCapUpstreamResponse(response, requestScope) {
+  requestScope.throwIfAborted();
+  if (response?.ok !== true) {
+    await cancelCapResponseBodyPreservingOwnerAbort(
+      response,
+      requestScope
+    );
+    throw new WorkerHttpError(502, 'CAP upstream request failed');
+  }
+
+  let contentLength;
+  let contentLengthError = null;
+  try {
+    contentLength = parseCanonicalContentLength(
+      response,
+      'CAP GraphQL response'
+    );
+  } catch (error) {
+    contentLengthError = error;
+  }
+  if (
+    contentLengthError !== null ||
+    (
+      contentLength !== null &&
+      contentLength > CAP_RESPONSE_BODY_MAX_BYTES
+    )
+  ) {
+    await cancelCapResponseBodyPreservingOwnerAbort(
+      response,
+      requestScope
+    );
+    throw new WorkerHttpError(502, 'CAP upstream response was invalid', {
+      cause: contentLengthError,
+    });
+  }
+  requestScope.throwIfAborted();
+}
+
+async function executeCapPersistedQuery(
+  operationName,
+  hash,
+  variables,
+  requestScope
+) {
+  let response;
+  try {
+    response = await fetchUpstream(
+      CAP_GRAPHQL_URL,
+      {
+        method: 'POST',
+        headers: new Headers({
+          'Accept': 'application/json',
+          'Content-Type': 'application/json',
+        }),
+        body: JSON.stringify(
+          createCapPersistedQueryDocument(operationName, hash, variables)
+        ),
+        credentials: 'omit',
+        redirect: 'error',
+      },
+      'CAP GraphQL request',
+      requestScope
+    );
+  } catch (error) {
+    if (isWorkerRequestAbort(error)) throw error;
+    throw new WorkerHttpError(502, 'CAP upstream request failed', {
+      cause: error,
+    });
+  }
+
+  await preflightCapUpstreamResponse(response, requestScope);
+  let document;
+  try {
+    document = await parseResponseJson(
+      response,
+      'CAP GraphQL response',
+      requestScope,
+      CAP_RESPONSE_BODY_MAX_BYTES
+    );
+  } catch (error) {
+    if (isWorkerRequestAbort(error)) throw error;
+    throw new WorkerHttpError(502, 'CAP upstream response was invalid', {
+      cause: error,
+    });
+  }
+  return document;
+}
+
+function assertCapString(value, label, max) {
+  return assertExactString(value, label, { max, status: 502 });
+}
+
+function assertNullableCapString(value, label, max) {
+  if (value === null) return null;
+  return assertCapString(value, label, max);
+}
+
+function assertCapNonnegativeSafeInteger(value, label) {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new WorkerHttpError(
+      502,
+      `${label} must be a nonnegative safe integer`
+    );
+  }
+  return value;
+}
+
+function projectCapStringArray(value, label, maxItems, maxCodePoints) {
+  if (!Array.isArray(value) || value.length > maxItems) {
+    throw new WorkerHttpError(
+      502,
+      `${label} must be an array with at most ${maxItems} items`
+    );
+  }
+  return value.map((entry, index) =>
+    assertCapString(entry, `${label}[${index}]`, maxCodePoints)
+  );
+}
+
+function projectCapLookupItem(value, index) {
+  const label = `CAP lookup result[${index}]`;
+  const item = assertUpstreamRecord(value, label);
+  const scores = assertUpstreamRecord(item.scores, `${label}.scores`);
+  const agree = assertCapNonnegativeSafeInteger(
+    scores.agree,
+    `${label}.scores.agree`
+  );
+  const disagree = assertCapNonnegativeSafeInteger(
+    scores.disagree,
+    `${label}.scores.disagree`
+  );
+  const idk = assertCapNonnegativeSafeInteger(
+    scores.idk,
+    `${label}.scores.idk`
+  );
+  if (!Number.isSafeInteger(agree + disagree + idk)) {
+    throw new WorkerHttpError(
+      502,
+      `${label}.scores total must be a nonnegative safe integer`
+    );
+  }
+  return {
+    id: assertCapString(item.id, `${label}.id`, CAP_ID_MAX_CODE_POINTS),
+    name: assertCapString(
+      item.name,
+      `${label}.name`,
+      CAP_TEXT_MAX_CODE_POINTS
+    ),
+    fullName: assertCapString(
+      item.fullName,
+      `${label}.fullName`,
+      CAP_TEXT_MAX_CODE_POINTS
+    ),
+    ontologyTerm: assertNullableCapString(
+      item.ontologyTerm,
+      `${label}.ontologyTerm`,
+      CAP_TEXT_MAX_CODE_POINTS
+    ),
+    ontologyTermId: assertNullableCapString(
+      item.ontologyTermId,
+      `${label}.ontologyTermId`,
+      CAP_ID_MAX_CODE_POINTS
+    ),
+    synonyms: projectCapStringArray(
+      item.synonyms,
+      `${label}.synonyms`,
+      CAP_SYNONYM_MAX_ITEMS,
+      CAP_TEXT_MAX_CODE_POINTS
+    ),
+    markerGenes: projectCapStringArray(
+      item.markerGenes,
+      `${label}.markerGenes`,
+      CAP_MARKER_MAX_ITEMS,
+      CAP_GENE_MAX_CODE_POINTS
+    ),
+    canonicalMarkerGenes: projectCapStringArray(
+      item.canonicalMarkerGenes,
+      `${label}.canonicalMarkerGenes`,
+      CAP_MARKER_MAX_ITEMS,
+      CAP_GENE_MAX_CODE_POINTS
+    ),
+    count: assertCapNonnegativeSafeInteger(item.count, `${label}.count`),
+    scores: { agree, disagree, idk },
+  };
+}
+
+function projectCapDatasetItem(value, index) {
+  const label = `CAP dataset result[${index}]`;
+  const item = assertUpstreamRecord(value, label);
+  return {
+    id: assertCapString(item.id, `${label}.id`, CAP_ID_MAX_CODE_POINTS),
+    name: assertCapString(
+      item.name,
+      `${label}.name`,
+      CAP_TEXT_MAX_CODE_POINTS
+    ),
+    cellCount: assertCapNonnegativeSafeInteger(
+      item.cellCount,
+      `${label}.cellCount`
+    ),
+  };
+}
+
+function projectCapGraphQlResults(document, field, limit, projectItem) {
+  const response = assertUpstreamRecord(document, 'CAP GraphQL response');
+  if (Object.hasOwn(response, 'errors')) {
+    if (!Array.isArray(response.errors) || response.errors.length !== 0) {
+      throw new WorkerHttpError(502, 'CAP GraphQL operation failed');
+    }
+  }
+  const data = assertUpstreamRecord(
+    response.data,
+    'CAP GraphQL response.data'
+  );
+  const rawResults = data[field];
+  if (!Array.isArray(rawResults) || rawResults.length > limit) {
+    throw new WorkerHttpError(
+      502,
+      `CAP GraphQL response.data.${field} is invalid`
+    );
+  }
+
+  const results = [];
+  let omittedInvalidCount = 0;
+  for (let index = 0; index < rawResults.length; index += 1) {
+    try {
+      results.push(projectItem(rawResults[index], index));
+    } catch (error) {
+      if (!(error instanceof WorkerHttpError) || error.status !== 502) {
+        throw error;
+      }
+      omittedInvalidCount += 1;
+    }
+  }
+  return { results, omittedInvalidCount };
+}
+
+function capGatewayResponse(data, corsHeaders) {
+  return boundedJsonResponse(
+    {
+      contractVersion: WORKER_CONTRACT_VERSION,
+      results: data.results,
+      omittedInvalidCount: data.omittedInvalidCount,
+    },
+    200,
+    corsHeaders,
+    CAP_OUTPUT_BODY_MAX_BYTES,
+    'CAP gateway response'
+  );
+}
+
+function capLookupSearch(kind, term) {
+  if (kind === 'ontology') {
+    return { name: term, fields: CAP_ONTOLOGY_LOOKUP_FIELDS };
+  }
+  if (kind === 'marker') {
+    return { name: term, fields: CAP_MARKER_LOOKUP_FIELDS };
+  }
+  return { name: term };
+}
+
+async function handleCapLookup(request, url, corsHeaders, requestScope) {
+  assertNoQuery(url, 'CAP lookup route');
+  assertCapRequestHasNoCredentials(request);
+  const body = await readExactRequestObject(
+    request,
+    'CAP lookup request',
+    ['kind', 'term', 'limit'],
+    requestScope,
+    CAP_REQUEST_BODY_MAX_BYTES
+  );
+  const kind = assertExactString(body.kind, 'CAP lookup kind', { max: 16 });
+  if (!CAP_LOOKUP_KINDS.has(kind)) {
+    throw new WorkerHttpError(
+      400,
+      'CAP lookup kind must be name, ontology, marker, or feedback'
+    );
+  }
+  const term = assertExactString(body.term, 'CAP lookup term', {
+    max:
+      kind === 'marker'
+        ? CAP_MARKER_TERM_MAX_CODE_POINTS
+        : CAP_TERM_MAX_CODE_POINTS,
+  });
+  const limit = assertCapLimit(
+    body.limit,
+    CAP_LOOKUP_LIMIT_MAX,
+    'CAP lookup limit'
+  );
+  const document = await executeCapPersistedQuery(
+    'LookupCells',
+    CAP_LOOKUP_APQ_HASH,
+    { options: { limit }, search: capLookupSearch(kind, term) },
+    requestScope
+  );
+  return capGatewayResponse(
+    projectCapGraphQlResults(
+      document,
+      'lookupCells',
+      limit,
+      projectCapLookupItem
+    ),
+    corsHeaders
+  );
+}
+
+async function handleCapDatasetSearch(
+  request,
+  url,
+  corsHeaders,
+  requestScope
+) {
+  assertNoQuery(url, 'CAP dataset search route');
+  assertCapRequestHasNoCredentials(request);
+  const body = await readExactRequestObject(
+    request,
+    'CAP dataset search request',
+    ['search', 'limit'],
+    requestScope,
+    CAP_REQUEST_BODY_MAX_BYTES
+  );
+  let search = null;
+  if (body.search !== null) {
+    search = assertExactString(body.search, 'CAP dataset search', {
+      max: CAP_TERM_MAX_CODE_POINTS,
+    });
+  }
+  const limit = assertCapLimit(
+    body.limit,
+    CAP_DATASET_LIMIT_MAX,
+    'CAP dataset limit'
+  );
+  const document = await executeCapPersistedQuery(
+    'SearchDatasets',
+    CAP_DATASET_APQ_HASH,
+    {
+      options: { limit },
+      search: search === null ? null : { name: search },
+    },
+    requestScope
+  );
+  return capGatewayResponse(
+    projectCapGraphQlResults(
+      document,
+      'results',
+      limit,
+      projectCapDatasetItem
+    ),
+    corsHeaders
+  );
+}
+
+async function handleGetInstallationRepos(
+  request,
+  corsHeaders,
+  requestScope
+) {
   const token = getBearerToken(request);
   const body = await readExactRequestObject(
     request,
     'installation repositories request',
-    ['installation_id']
+    ['installation_id'],
+    requestScope
   );
   const installationId = body.installation_id;
   if (!Number.isSafeInteger(installationId) || installationId < 1) {
@@ -833,7 +2309,13 @@ async function handleGetInstallationRepos(request, corsHeaders) {
   const result = await githubFetchCollection(
     `/user/installations/${installationId}/repositories`,
     token,
-    'repositories'
+    'repositories',
+    projectRepositoryCollectionItem,
+    requestScope
+  );
+  const responseHeaders = mergeHeaders(
+    corsHeaders,
+    createSafeGitHubResponseHeaders(result.response)
   );
   if (!result.response.ok) {
     return jsonResponse(
@@ -844,37 +2326,14 @@ async function handleGetInstallationRepos(request, corsHeaders) {
         ),
       },
       result.response.status,
-      corsHeaders
+      responseHeaders
     );
   }
   const seenIds = new Set();
   const seenNames = new Set();
-  const repositories = result.items.map((repository, index) => {
+  for (const repository of result.items) {
     const id = repository?.id;
     const fullName = repository?.full_name;
-    const isPrivate = repository?.private;
-    if (!Number.isSafeInteger(id) || id < 1) {
-      throw new WorkerHttpError(
-        502,
-        `GitHub repository ${index} has an invalid id`
-      );
-    }
-    assertExactString(fullName, `GitHub repository ${index} full_name`, {
-      max: 256,
-      status: 502,
-    });
-    if (!isCanonicalGitHubRepositoryFullName(fullName)) {
-      throw new WorkerHttpError(
-        502,
-        `GitHub repository ${index} full_name is not canonical`
-      );
-    }
-    if (typeof isPrivate !== 'boolean') {
-      throw new WorkerHttpError(
-        502,
-        `GitHub repository ${index} private must be boolean`
-      );
-    }
     if (seenIds.has(id)) {
       throw new WorkerHttpError(
         502,
@@ -890,9 +2349,12 @@ async function handleGetInstallationRepos(request, corsHeaders) {
     }
     seenIds.add(id);
     seenNames.add(nameKey);
-    return { id, full_name: fullName, private: isPrivate };
-  });
-  return jsonResponse({ repositories }, 200, corsHeaders);
+  }
+  return jsonResponse(
+    { repositories: result.items },
+    200,
+    responseHeaders
+  );
 }
 
 function decodeCanonicalPathSegment(value, label) {
@@ -1007,8 +2469,24 @@ function assertAllowedGitHubProxyRoute(githubUrl, method) {
 
   if (rest.length === 0) {
     requireProxyMethod(method, ['GET'], 'Repository metadata');
-    assertNoQuery(githubUrl, 'Repository metadata');
-    return { kind: 'repository-metadata' };
+    if (githubUrl.search === '') {
+      return { kind: 'repository-metadata' };
+    }
+    const query = assertExactQuery(
+      githubUrl,
+      { fork_identity: true },
+      'Repository fork identity'
+    );
+    if (query.fork_identity !== '1') {
+      throw new WorkerHttpError(
+        400,
+        'Repository fork identity must equal 1'
+      );
+    }
+    return {
+      kind: 'repository-fork-identity',
+      stripQueryBeforeUpstream: true,
+    };
   }
 
   if (rest[0] === 'contents' && rest.length >= 2) {
@@ -1119,9 +2597,15 @@ function assertAllowedGitHubProxyRoute(githubUrl, method) {
     if (method === 'GET') {
       const query = assertExactQuery(
         githubUrl,
-        { per_page: true, page: true },
+        { sort: true, per_page: true, page: true },
         'Repository forks'
       );
+      if (query.sort !== 'newest') {
+        throw new WorkerHttpError(
+          400,
+          'Repository forks sort must equal newest'
+        );
+      }
       if (query.per_page !== `${GITHUB_PAGE_SIZE}`) {
         throw new WorkerHttpError(
           400,
@@ -1199,14 +2683,73 @@ function assertExactSha(value, label) {
   return value;
 }
 
-function assertCanonicalBase64(value, label) {
-  assertExactString(value, label, { max: 8_000_000 });
+function base64AlphabetValue(code) {
+  if (code >= 65 && code <= 90) return code - 65;
+  if (code >= 97 && code <= 122) return code - 97 + 26;
+  if (code >= 48 && code <= 57) return code - 48 + 52;
+  if (code === 43) return 62;
+  if (code === 47) return 63;
+  return -1;
+}
+
+function inspectCanonicalBase64Payload(value, allowLineFolding) {
+  if (typeof value !== 'string') return null;
+  let payloadLength = 0;
+  let paddingLength = 0;
+  let sawPadding = false;
+  let lastAlphabetValue = -1;
+
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code === 10 || code === 13) {
+      if (!allowLineFolding) return null;
+      if (code === 13) {
+        if (value.charCodeAt(index + 1) !== 10) return null;
+        index += 1;
+      }
+      continue;
+    }
+
+    payloadLength += 1;
+    if (code === 61) {
+      sawPadding = true;
+      paddingLength += 1;
+      if (paddingLength > 2) return null;
+      continue;
+    }
+    const alphabetValue = base64AlphabetValue(code);
+    if (alphabetValue < 0 || sawPadding) return null;
+    lastAlphabetValue = alphabetValue;
+  }
+
+  if (payloadLength === 0 || payloadLength % 4 !== 0) return null;
   if (
-    !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(
-      value
-    )
+    (paddingLength === 1 && (lastAlphabetValue & 0b11) !== 0) ||
+    (paddingLength === 2 && (lastAlphabetValue & 0b1111) !== 0)
   ) {
+    return null;
+  }
+  return {
+    decodedByteLength:
+      (payloadLength / 4) * 3 - paddingLength,
+    paddingLength,
+    payloadLength,
+  };
+}
+
+function assertCanonicalBase64(value, label) {
+  const inspection = inspectCanonicalBase64Payload(value, false);
+  if (inspection === null) {
     throw new WorkerHttpError(400, `${label} must be canonical base64`);
+  }
+  if (
+    inspection.decodedByteLength >
+    ANNOTATION_FILE_MAX_UTF8_BYTES
+  ) {
+    throw new WorkerHttpError(
+      413,
+      `${label} exceeds ${ANNOTATION_FILE_MAX_UTF8_BYTES} decoded bytes`
+    );
   }
   return value;
 }
@@ -1382,64 +2925,53 @@ function projectRepositoryMetadata(document) {
   };
 }
 
-function projectContentGet(document) {
-  const content = assertUpstreamRecord(
+function projectRepositoryForkIdentity(document) {
+  const repository = assertUpstreamRecord(
     document,
-    'GitHub contents response'
+    'GitHub fork identity response'
   );
-  if (content.type !== 'file') {
+  const fullName = repository.full_name;
+  if (!isCanonicalGitHubRepositoryFullName(fullName)) {
     throw new WorkerHttpError(
       502,
-      'GitHub contents response.type must equal file'
+      'GitHub fork identity response.full_name must be canonical'
     );
   }
-  if (content.encoding !== 'base64') {
+  const isFork = assertUpstreamBoolean(
+    repository.fork,
+    'GitHub fork identity response.fork'
+  );
+  if (!isFork) {
+    if (
+      repository.parent !== undefined &&
+      repository.parent !== null
+    ) {
+      throw new WorkerHttpError(
+        502,
+        'GitHub non-fork identity response.parent must be absent or null'
+      );
+    }
+    return {
+      full_name: fullName,
+      fork: false,
+      parent: null,
+    };
+  }
+  const parent = assertUpstreamRecord(
+    repository.parent,
+    'GitHub fork identity response.parent'
+  );
+  if (!isCanonicalGitHubRepositoryFullName(parent.full_name)) {
     throw new WorkerHttpError(
       502,
-      'GitHub contents response.encoding must equal base64'
+      'GitHub fork identity response.parent.full_name must be canonical'
     );
   }
-  assertUpstreamBase64Payload(
-    content.content,
-    'GitHub contents response.content'
-  );
   return {
-    type: 'file',
-    encoding: 'base64',
-    content: content.content,
-    sha: assertExactShaWithStatus(
-      content.sha,
-      'GitHub contents response.sha',
-      502
-    ),
+    full_name: fullName,
+    fork: true,
+    parent: { full_name: parent.full_name },
   };
-}
-
-function assertUpstreamBase64Payload(value, label) {
-  if (
-    typeof value !== 'string' ||
-    !value ||
-    Array.from(value).length > 8_000_000
-  ) {
-    throw new WorkerHttpError(
-      502,
-      `${label} must be a nonempty base64 payload`
-    );
-  }
-  const unfolded = value.replaceAll('\r\n', '').replaceAll('\n', '');
-  if (
-    !unfolded ||
-    unfolded.includes('\r') ||
-    !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(
-      unfolded
-    )
-  ) {
-    throw new WorkerHttpError(
-      502,
-      `${label} must be a valid base64 payload with optional line folding`
-    );
-  }
-  return value;
 }
 
 function assertExactShaWithStatus(value, label, status) {
@@ -1469,75 +3001,6 @@ function projectContentPut(document) {
         502
       ),
     },
-  };
-}
-
-function projectGitTree(document) {
-  const response = assertUpstreamRecord(document, 'GitHub tree response');
-  if (!Array.isArray(response.tree)) {
-    throw new WorkerHttpError(502, 'GitHub tree response.tree must be an array');
-  }
-  if (response.tree.length > 100_000) {
-    throw new WorkerHttpError(
-      502,
-      'GitHub tree response.tree exceeds 100000 entries'
-    );
-  }
-  const tree = response.tree.map((raw, index) => {
-    const entry = assertUpstreamRecord(raw, `GitHub tree entry ${index}`);
-    if (entry.type !== 'blob' && entry.type !== 'tree') {
-      throw new WorkerHttpError(
-        502,
-        `GitHub tree entry ${index}.type must equal blob or tree`
-      );
-    }
-    assertExactString(entry.path, `GitHub tree entry ${index}.path`, {
-      max: 4096,
-      status: 502,
-    });
-    if (
-      entry.path.startsWith('/') ||
-      entry.path.endsWith('/') ||
-      entry.path.split('/').some((segment) => !segment)
-    ) {
-      throw new WorkerHttpError(
-        502,
-        `GitHub tree entry ${index}.path is not canonical`
-      );
-    }
-    return {
-      type: entry.type,
-      path: entry.path,
-      sha: assertExactShaWithStatus(
-        entry.sha,
-        `GitHub tree entry ${index}.sha`,
-        502
-      ),
-    };
-  });
-  return {
-    tree,
-    truncated: assertUpstreamBoolean(
-      response.truncated,
-      'GitHub tree response.truncated'
-    ),
-  };
-}
-
-function projectGitBlob(document) {
-  const response = assertUpstreamRecord(document, 'GitHub blob response');
-  if (response.encoding !== 'base64') {
-    throw new WorkerHttpError(
-      502,
-      'GitHub blob response.encoding must equal base64'
-    );
-  }
-  return {
-    encoding: 'base64',
-    content: assertUpstreamBase64Payload(
-      response.content,
-      'GitHub blob response.content'
-    ),
   };
 }
 
@@ -1648,10 +3111,10 @@ function projectGitHubProxyResponse(kind, document) {
   if (kind === 'repository-metadata') {
     return projectRepositoryMetadata(document);
   }
-  if (kind === 'contents-get') return projectContentGet(document);
+  if (kind === 'repository-fork-identity') {
+    return projectRepositoryForkIdentity(document);
+  }
   if (kind === 'contents-put') return projectContentPut(document);
-  if (kind === 'git-tree-get') return projectGitTree(document);
-  if (kind === 'git-blob-get') return projectGitBlob(document);
   if (kind === 'git-ref-get') return projectGitRef(document);
   if (kind === 'git-refs-post') {
     assertUpstreamRecord(document, 'Git branch creation response');
@@ -1668,7 +3131,7 @@ function projectGitHubProxyResponse(kind, document) {
   throw new WorkerHttpError(500, 'Unknown GitHub proxy response contract');
 }
 
-async function handleApiProxy(request, url, corsHeaders) {
+async function handleApiProxy(request, url, corsHeaders, requestScope) {
   if (
     request.method !== 'GET' &&
     request.method !== 'POST' &&
@@ -1679,7 +3142,6 @@ async function handleApiProxy(request, url, corsHeaders) {
       `GitHub API proxy does not support ${request.method}`
     );
   }
-  const token = getBearerToken(request);
   const githubPath = url.pathname.slice('/api'.length);
   if (!githubPath.startsWith('/repos/')) {
     throw new WorkerHttpError(
@@ -1696,49 +3158,109 @@ async function handleApiProxy(request, url, corsHeaders) {
     throw new WorkerHttpError(400, 'Invalid GitHub repository API path');
   }
   const route = assertAllowedGitHubProxyRoute(githubUrl, request.method);
-
-  const headers = createGitHubHeaders(token);
-  let body;
-  if (request.method !== 'GET') {
-    const document = await readExactRequestObject(
-      request,
-      'GitHub API proxy request'
-    );
-    validateGitHubProxyMutationBody(route.kind, document);
-    body = JSON.stringify(document);
-    headers.set('Content-Type', 'application/json');
+  if (route.stripQueryBeforeUpstream === true) {
+    githubUrl.search = '';
   }
+  const mutationContext = createGitHubMutationContext(
+    request,
+    route.kind
+  );
+  let safeResponseHeaders = null;
 
-  const response = await fetchGitHub(
-    githubUrl,
-    {
-      method: request.method,
-      headers,
-      body,
-    },
-    `GitHub API ${request.method} ${githubPath}`
-  );
-  const document = await parseResponseJson(
-    response,
-    `GitHub API ${request.method} ${githubPath} response`
-  );
-  if (!response.ok) {
-    return jsonResponse(
+  try {
+    const token = getBearerToken(request);
+    const headers = createGitHubHeaders(token);
+    let body;
+    if (request.method !== 'GET') {
+      const document = await readExactRequestObject(
+        request,
+        'GitHub API proxy request',
+        null,
+        requestScope
+      );
+      validateGitHubProxyMutationBody(route.kind, document);
+      body = JSON.stringify(document);
+      headers.set('Content-Type', 'application/json');
+    }
+
+    const response = await fetchUpstream(
+      githubUrl,
       {
-        error: upstreamErrorMessage(
-          document,
-          `GitHub API ${request.method} ${githubPath} failed`
-        ),
+        method: request.method,
+        headers,
+        body,
       },
-      response.status,
-      corsHeaders
+      `GitHub API ${request.method} ${githubPath}`,
+      requestScope,
+      mutationContext
     );
+    safeResponseHeaders = createSafeGitHubResponseHeaders(response);
+    const streamedMaxBytes =
+      route.kind === 'contents-get' ||
+      route.kind === 'git-blob-get'
+        ? GITHUB_CONTENT_RESPONSE_MAX_BYTES
+        : route.kind === 'git-tree-get'
+          ? GITHUB_TREE_RESPONSE_MAX_BYTES
+          : null;
+    if (response.ok && streamedMaxBytes !== null) {
+      return streamBoundedGitHubJsonResponse(
+        response,
+        `GitHub API ${request.method} ${githubPath} response`,
+        {
+          maxBytes: streamedMaxBytes,
+          headers: mergeHeaders(corsHeaders, safeResponseHeaders),
+          requestScope,
+        }
+      );
+    }
+    const document = await parseResponseJson(
+      response,
+      `GitHub API ${request.method} ${githubPath} response`,
+      requestScope
+    );
+    if (!response.ok) {
+      const outcome =
+        response.status === 408 || response.status >= 500
+          ? 'unknown'
+          : 'not-applied';
+      const responseHeaders = mergeHeaders(
+        corsHeaders,
+        safeResponseHeaders,
+        mutationContext?.responseHeaders(outcome)
+      );
+      return jsonResponse(
+        {
+          error: upstreamErrorMessage(
+            document,
+            `GitHub API ${request.method} ${githubPath} failed`
+          ),
+        },
+        response.status,
+        responseHeaders
+      );
+    }
+    const responseHeaders = mergeHeaders(
+      corsHeaders,
+      safeResponseHeaders,
+      mutationContext?.responseHeaders('applied')
+    );
+    return jsonResponse(
+      projectGitHubProxyResponse(route.kind, document),
+      response.status,
+      responseHeaders
+    );
+  } catch (error) {
+    if (mutationContext !== null) {
+      throw mutationContext.decorateError(error, safeResponseHeaders);
+    }
+    if (error && typeof error === 'object') {
+      error.responseHeaders = mergeHeaders(
+        error.responseHeaders,
+        safeResponseHeaders
+      );
+    }
+    throw error;
   }
-  return jsonResponse(
-    projectGitHubProxyResponse(route.kind, document),
-    response.status,
-    corsHeaders
-  );
 }
 
 function createGitHubHeaders(token) {
@@ -1750,33 +3272,54 @@ function createGitHubHeaders(token) {
   });
 }
 
-async function githubFetchJson(path, token) {
-  const response = await fetchGitHub(
+async function githubFetchJson(
+  path,
+  token,
+  requestScope,
+  maxBytes = GITHUB_STANDARD_RESPONSE_BODY_MAX_BYTES
+) {
+  const response = await fetchUpstream(
     `${GITHUB_API_ORIGIN}${path}`,
     { headers: createGitHubHeaders(token) },
-    `GitHub API GET ${path}`
+    `GitHub API GET ${path}`,
+    requestScope
   );
   const document = await parseResponseJson(
     response,
-    `GitHub API GET ${path} response`
+    `GitHub API GET ${path} response`,
+    requestScope,
+    maxBytes
   );
   return { response, document };
 }
 
-async function githubFetchCollection(path, token, field) {
-  let page = 1;
-  let totalCount = null;
-  const items = [];
-
-  while (true) {
+async function githubFetchCollection(
+  path,
+  token,
+  field,
+  projectItem,
+  requestScope
+) {
+  if (typeof projectItem !== 'function') {
+    throw new WorkerHttpError(
+      500,
+      `GitHub ${field} collection projector is invalid`
+    );
+  }
+  const fetchPage = async (page) => {
     const separator = path.includes('?') ? '&' : '?';
     const pagePath =
       `${path}${separator}per_page=${GITHUB_PAGE_SIZE}&page=${page}`;
-    const { response, document } = await githubFetchJson(pagePath, token);
-    if (!response.ok) {
-      return { response, errorDocument: document, items: null };
-    }
+    requestScope.throwIfAborted();
+    return githubFetchJson(
+      pagePath,
+      token,
+      requestScope,
+      GITHUB_COLLECTION_PAGE_MAX_BYTES
+    );
+  };
 
+  const projectPageItems = (document, totalCount, page, pageCount) => {
     const pageTotal = document?.total_count;
     const pageItems = document?.[field];
     if (!Number.isSafeInteger(pageTotal) || pageTotal < 0) {
@@ -1791,78 +3334,164 @@ async function githubFetchCollection(path, token, field) {
         `GitHub ${field} response is missing ${field}`
       );
     }
-    if (totalCount === null) {
-      totalCount = pageTotal;
-    } else if (pageTotal !== totalCount) {
+    if (pageTotal !== totalCount) {
       throw new WorkerHttpError(
         502,
         `GitHub ${field} total_count changed during pagination`
       );
     }
-    if (pageItems.length > GITHUB_PAGE_SIZE) {
+    const expectedLength =
+      page < pageCount
+        ? GITHUB_PAGE_SIZE
+        : totalCount - GITHUB_PAGE_SIZE * (pageCount - 1);
+    if (pageItems.length !== expectedLength) {
       throw new WorkerHttpError(
         502,
-        `GitHub ${field} page exceeds ${GITHUB_PAGE_SIZE} items`
+        `GitHub ${field} page ${page} must contain exactly ${expectedLength} items`
       );
     }
+    const baseIndex = (page - 1) * GITHUB_PAGE_SIZE;
+    return pageItems.map((item, index) =>
+      projectItem(item, baseIndex + index)
+    );
+  };
 
-    items.push(...pageItems);
-    if (items.length > totalCount) {
-      throw new WorkerHttpError(
-        502,
-        `GitHub ${field} response exceeds total_count`
-      );
-    }
-    if (items.length === totalCount) {
-      return { response, errorDocument: null, items };
-    }
-    if (pageItems.length === 0) {
-      throw new WorkerHttpError(
-        502,
-        `GitHub ${field} pagination ended before total_count`
-      );
-    }
-    page += 1;
+  const first = await fetchPage(1);
+  if (!first.response.ok) {
+    return {
+      response: first.response,
+      errorDocument: first.document,
+      items: null,
+    };
   }
-}
-
-async function fetchGitHub(url, options, label) {
-  if (typeof AbortController !== 'function') {
+  const totalCount = first.document?.total_count;
+  if (!Number.isSafeInteger(totalCount) || totalCount < 0) {
     throw new WorkerHttpError(
-      500,
-      'AbortController is required by the GitHub worker'
+      502,
+      `GitHub ${field} response has an invalid total_count`
     );
   }
-  const controller = new AbortController();
-  const timeout = setTimeout(
-    () => controller.abort(),
-    GITHUB_REQUEST_TIMEOUT_MS
+  if (totalCount > GITHUB_COLLECTION_MAX_ITEMS) {
+    throw new WorkerHttpError(
+      502,
+      `GitHub ${field} total_count exceeds ${GITHUB_COLLECTION_MAX_ITEMS}`
+    );
+  }
+  const pageCount = Math.max(
+    1,
+    Math.ceil(totalCount / GITHUB_PAGE_SIZE)
   );
-  try {
-    return await fetch(url, {
-      ...options,
-      signal: controller.signal,
-    });
-  } catch (cause) {
-    if (cause?.name === 'AbortError') {
-      throw new WorkerHttpError(
-        504,
-        `${label} timed out after ${GITHUB_REQUEST_TIMEOUT_MS}ms`,
-        { cause }
-      );
+  const pages = new Array(pageCount);
+  pages[0] = projectPageItems(
+    first.document,
+    totalCount,
+    1,
+    pageCount
+  );
+  let finalResponse =
+    pageCount === 1 ? first.response : null;
+
+  let nextPage = 2;
+  let primaryError = null;
+  let primaryFailure = null;
+  const workerCount = Math.min(
+    GITHUB_COLLECTION_CONCURRENCY,
+    pageCount - 1
+  );
+  const workers = Array.from({ length: workerCount }, async () => {
+    while (primaryError === null && primaryFailure === null) {
+      const page = nextPage;
+      nextPage += 1;
+      if (page > pageCount) return;
+      try {
+        const result = await fetchPage(page);
+        if (!result.response.ok) {
+          if (primaryError === null && primaryFailure === null) {
+            primaryFailure = {
+              response: result.response,
+              errorDocument: result.document,
+              items: null,
+            };
+            requestScope.cancelInternal(
+              new Error(`GitHub ${field} page ${page} failed`)
+            );
+          }
+          return;
+        }
+        pages[page - 1] = projectPageItems(
+          result.document,
+          totalCount,
+          page,
+          pageCount
+        );
+        if (page === pageCount) finalResponse = result.response;
+      } catch (error) {
+        if (primaryError === null && primaryFailure === null) {
+          primaryError = error;
+          requestScope.cancelInternal(error);
+        }
+        return;
+      }
     }
+  });
+  await Promise.all(workers);
+  if (primaryFailure !== null) return primaryFailure;
+  if (primaryError !== null) throw primaryError;
+
+  const items = [];
+  for (const pageItems of pages) {
+    items.push(...pageItems);
+  }
+  return {
+    response: finalResponse ?? first.response,
+    errorDocument: null,
+    items,
+  };
+}
+
+async function fetchUpstream(
+  url,
+  options,
+  label,
+  requestScope,
+  mutationContext = null
+) {
+  requestScope.throwIfAborted();
+  try {
+    mutationContext?.markForwarded();
+    const response = await awaitWithinWorkerRequestScope(
+      fetch(url, {
+        ...options,
+        signal: requestScope.signal,
+      }),
+      requestScope
+    );
+    requestScope.throwIfAborted();
+    return response;
+  } catch (cause) {
+    if (cause instanceof WorkerHttpError) throw cause;
+    const ownedAbort = requestScope.createAbortError();
+    if (ownedAbort !== null) throw ownedAbort;
     throw new WorkerHttpError(
       502,
       `${label} could not be reached`,
       { cause }
     );
-  } finally {
-    clearTimeout(timeout);
   }
 }
 
-async function parseResponseJson(response, label) {
-  const text = await response.text();
+async function parseResponseJson(
+  response,
+  label,
+  requestScope,
+  maxBytes = GITHUB_STANDARD_RESPONSE_BODY_MAX_BYTES
+) {
+  const text = await readBoundedUtf8Body(response, label, {
+    maxBytes,
+    readErrorStatus: 502,
+    tooLargeStatus: 502,
+    requestScope,
+  });
   if (!text) {
     throw new WorkerHttpError(502, `${label} is empty`);
   }

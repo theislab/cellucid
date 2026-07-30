@@ -1,5 +1,12 @@
-import { createProgram } from './gl-utils.js';
+import {
+  configureStraightAlphaBlending,
+  createProgram,
+} from './gl-utils.js';
 import { HP_VS_HIGHLIGHT, HP_FS_HIGHLIGHT } from './shaders/high-perf-shaders.js';
+import {
+  MIN_VISIBLE_ALPHA_BYTE,
+  POINT_VISIBILITY_THRESHOLD,
+} from './alpha-visibility.js';
 
 const HIGHLIGHT_QUALITY_VALUES = Object.freeze(['full', 'light', 'ultralight']);
 const HIGHLIGHT_MODE_VALUES = Object.freeze([
@@ -19,11 +26,6 @@ const HIGHLIGHT_CANVAS_CLASSES = Object.freeze([
   'knn-dragging',
   'knn-mode',
 ]);
-// CPU transparency is Float32Array-backed and GLSL `0.01` is a float. Use the
-// same representable boundary so a point is selectable exactly when the point
-// shader keeps it visible.
-const HIGHLIGHT_VISIBILITY_THRESHOLD = Math.fround(0.01);
-
 function requireHighlightMode(mode) {
   if (!HIGHLIGHT_MODE_VALUES.includes(mode)) {
     throw new RangeError(
@@ -45,6 +47,33 @@ function requireCallback(value, label) {
     throw new TypeError(`${label} must be one function.`);
   }
   return value;
+}
+
+function requireCleanHighlightWebGLState(gl, label) {
+  if (
+    gl === null ||
+    typeof gl !== 'object' ||
+    typeof gl.getError !== 'function' ||
+    !Number.isInteger(gl.NO_ERROR)
+  ) {
+    throw new TypeError(
+      `${label} requires a complete WebGL error boundary.`
+    );
+  }
+  const errorCodes = [];
+  for (let attempt = 0; attempt < 32; attempt++) {
+    const errorCode = gl.getError();
+    if (errorCode === gl.NO_ERROR) break;
+    errorCodes.push(errorCode);
+  }
+  if (errorCodes.length > 0) {
+    throw new Error(
+      `${label} encountered WebGL error${errorCodes.length === 1 ? '' : 's'} ` +
+      errorCodes
+        .map(errorCode => `0x${errorCode.toString(16)}`)
+        .join(', ')
+    );
+  }
 }
 
 function requireHighlightQuality(quality) {
@@ -188,7 +217,7 @@ function requireHighlightDirection(direction, label) {
   return direction;
 }
 
-function requireFiniteHighlightNumber(value, label, { positive = false } = {}) {
+function requireFiniteHighlightNumber(value, label, positive = false) {
   if (!Number.isFinite(value) || (positive && value <= 0)) {
     const qualifier = positive ? 'positive finite' : 'finite';
     throw new TypeError(`${label} must be a ${qualifier} number.`);
@@ -202,9 +231,9 @@ function requireHighlightViewport(viewport, label) {
   }
 
   requireHighlightViewId(viewport.viewId, `${label} viewId`);
-  requireFiniteHighlightNumber(viewport.vpWidth, `${label} width`, { positive: true });
-  requireFiniteHighlightNumber(viewport.vpHeight, `${label} height`, { positive: true });
-  requireFiniteHighlightNumber(viewport.vpAspect, `${label} aspect`, { positive: true });
+  requireFiniteHighlightNumber(viewport.vpWidth, `${label} width`, true);
+  requireFiniteHighlightNumber(viewport.vpHeight, `${label} height`, true);
+  requireFiniteHighlightNumber(viewport.vpAspect, `${label} aspect`, true);
   requireFiniteHighlightNumber(viewport.vpOffsetX, `${label} X offset`);
   requireFiniteHighlightNumber(viewport.vpOffsetY, `${label} Y offset`);
   requireFiniteHighlightNumber(viewport.vpLocalX, `${label} local X`);
@@ -218,7 +247,7 @@ function requireHighlightViewport(viewport, label) {
   requireFiniteHighlightNumber(
     viewport.cameraTargetRadius,
     `${label} camera target radius`,
-    { positive: true }
+    true
   );
   if (viewport.effectiveViewMatrix !== null) {
     requireHighlightMatrix(
@@ -262,17 +291,52 @@ function requireHighlightData(highlightData, pointCount = null) {
   return highlightData;
 }
 
-function requireHighlightVisibility(visibility, pointCount) {
-  if (visibility === null) return null;
-  if (
-    !(visibility instanceof Float32Array) ||
-    visibility.length !== pointCount
-  ) {
-    throw new TypeError(
-      `Highlight LOD visibility must be null or a Float32Array with exactly ${pointCount} entries.`
+function requireHighlightGeometryGeneration(generation) {
+  if (!Number.isSafeInteger(generation) || generation <= 0) {
+    throw new RangeError(
+      'Highlight geometry generation must be a positive safe integer.'
     );
   }
-  return visibility;
+  return generation;
+}
+
+function requireHighlightTransparencyGeneration(generation) {
+  if (!Number.isSafeInteger(generation) || generation < 0) {
+    throw new RangeError(
+      'Highlight transparency generation must be a non-negative safe integer.'
+    );
+  }
+  return generation;
+}
+
+function requireHighlightLodMembership(
+  membership,
+  pointCount,
+  dimensionLevel
+) {
+  if (membership === null) return null;
+  if (
+    typeof membership !== 'object' ||
+    Array.isArray(membership) ||
+    !Object.isFrozen(membership) ||
+    !(membership.admissionLevels instanceof Uint8Array) ||
+    membership.admissionLevels.length !== pointCount ||
+    !(membership.indices instanceof Uint32Array) ||
+    membership.indices.length > pointCount ||
+    membership.pointCount !== pointCount ||
+    membership.dimensionLevel !== dimensionLevel ||
+    !Number.isInteger(membership.lodLevel) ||
+    membership.lodLevel < 0 ||
+    membership.lodLevel >= 0xff ||
+    membership.generationToken === null ||
+    typeof membership.generationToken !== 'object' ||
+    !Object.isFrozen(membership.generationToken)
+  ) {
+    throw new TypeError(
+      'Highlight LOD membership must be null or one exact frozen renderer descriptor.'
+    );
+  }
+  return membership;
 }
 
 export class HighlightRenderer {
@@ -311,10 +375,12 @@ export class HighlightRenderer {
       lightDir: gl.getUniformLocation(this.program, 'u_lightDir'),
     };
 
-    // Per-view GPU buffers + bookkeeping (fixes multi-view race condition)
-    // Map<viewId, { buffer, pointCount, lodSignature, positionsFingerprint }>
+    // Per-view GPU buffer/VAO pairs + bookkeeping (fixes multi-view races and
+    // keeps highlight attributes out of the viewer's shared default VAO).
+    // LOD membership itself is shared by the spatial generation.
     this._viewBuffers = new Map();
     this._pendingBufferDeletes = new Set();
+    this._pendingVertexArrayDeletes = new Set();
     this._pendingProgramDeletes = new Set();
     this._disposeStarted = false;
     this._disposed = false;
@@ -326,7 +392,6 @@ export class HighlightRenderer {
     // This dramatically improves performance when only a small fraction of cells are highlighted
     this._highlightedIndicesCache = null;  // Array of highlighted cell indices
     this._highlightDataRef = null;         // Reference to last highlightData array
-    this._highlightDataFingerprint = 0;    // Content-based fingerprint for in-place modification detection
     this._highlightDataVersion = 0;        // Incremented when cache is invalidated
 
     // Visual style state (defaults mirror previous viewer.js values)
@@ -336,6 +401,7 @@ export class HighlightRenderer {
     this.highlightHaloStrength = 0.7;
     this.highlightHaloShape = 0.0;
     this.highlightRingStyle = 0.0;
+    this._styleGeneration = 0;
 
     this.highlightStylesByQuality = {
       full: { scale: 1.75, ringWidth: 0.42, haloStrength: 0.65, haloShape: 0.0, ringStyle: 0.0 },
@@ -346,79 +412,57 @@ export class HighlightRenderer {
 
   setQuality(quality) {
     const style = this.highlightStylesByQuality[requireHighlightQuality(quality)];
+    const changed =
+      this.highlightScale !== style.scale ||
+      this.highlightRingWidth !== style.ringWidth ||
+      this.highlightHaloStrength !== style.haloStrength ||
+      this.highlightHaloShape !== style.haloShape ||
+      this.highlightRingStyle !== style.ringStyle;
     this.highlightScale = style.scale;
     this.highlightRingWidth = style.ringWidth;
     this.highlightHaloStrength = style.haloStrength;
     this.highlightHaloShape = style.haloShape;
     this.highlightRingStyle = style.ringStyle;
+    if (changed) this._styleGeneration++;
+    return changed;
   }
 
   setStyle(options = {}) {
-    if (options.color) this.highlightColor = options.color;
-    if (options.scale != null) this.highlightScale = options.scale;
-    if (options.ringWidth != null) this.highlightRingWidth = options.ringWidth;
-    if (options.haloStrength != null) this.highlightHaloStrength = options.haloStrength;
-    if (options.haloShape != null) this.highlightHaloShape = options.haloShape;
-  }
-
-  /**
-   * Compute a fingerprint for positions array (for cache invalidation)
-   * @private
-   */
-  _computePositionsFingerprint(positions) {
-    requireHighlightPositions(positions);
-    if (positions.length === 0) return 0;
-    const len = positions.length;
-    // Sample every ~300th triplet and sum for a quick fingerprint
-    const step = Math.max(3, Math.floor(len / 300)) * 3;
-    let sparseSum = 0;
-    for (let i = 0; i < len; i += step) {
-      sparseSum += positions[i] + positions[i + 1] + positions[i + 2];
+    let changed = false;
+    if (options.color && this.highlightColor !== options.color) {
+      this.highlightColor = options.color;
+      changed = true;
     }
-    return len * 31 + sparseSum;
-  }
-
-  /**
-   * Compute a fingerprint for transparency array (for cache invalidation)
-   * Detects filter changes that require highlight buffer rebuild.
-   * @private
-   */
-  _computeTransparencyFingerprint(transparency) {
-    if (!transparency || transparency.length === 0) return 'null';
-    const len = transparency.length;
-    // Sample at multiple positions for better change detection
-    const q1 = Math.floor(len * 0.25);
-    const mid = Math.floor(len * 0.5);
-    const q3 = Math.floor(len * 0.75);
-    // Count zeros (filtered-out cells) with sparse sampling
-    let zeroCount = 0;
-    let sumSample = 0;
-    const step = Math.max(1, Math.floor(len / 500));
-    for (let i = 0; i < len; i += step) {
-      if (transparency[i] <= 0) zeroCount++;
-      sumSample += transparency[i];
+    if (
+      options.scale != null &&
+      this.highlightScale !== options.scale
+    ) {
+      this.highlightScale = options.scale;
+      changed = true;
     }
-    return `${transparency[0]},${transparency[q1]},${transparency[mid]},${transparency[q3]},${transparency[len-1]},${zeroCount},${sumSample.toFixed(2)},${len}`;
-  }
-
-  /**
-   * Compute a fingerprint for highlight data array (for content-based cache invalidation).
-   * Detects in-place modifications to the highlight array.
-   * @private
-   */
-  _computeHighlightDataFingerprint(highlightData) {
-    if (!highlightData || highlightData.length === 0) return 0;
-    const len = highlightData.length;
-    // Count highlighted cells with sparse sampling for quick detection
-    let highlightCount = 0;
-    let sumSample = 0;
-    const step = Math.max(1, Math.floor(len / 500));
-    for (let i = 0; i < len; i += step) {
-      if (highlightData[i] > 0) highlightCount++;
-      sumSample += highlightData[i];
+    if (
+      options.ringWidth != null &&
+      this.highlightRingWidth !== options.ringWidth
+    ) {
+      this.highlightRingWidth = options.ringWidth;
+      changed = true;
     }
-    // Combine length, highlight count estimate, and sum for fingerprint
-    return len * 31 + highlightCount * 17 + sumSample;
+    if (
+      options.haloStrength != null &&
+      this.highlightHaloStrength !== options.haloStrength
+    ) {
+      this.highlightHaloStrength = options.haloStrength;
+      changed = true;
+    }
+    if (
+      options.haloShape != null &&
+      this.highlightHaloShape !== options.haloShape
+    ) {
+      this.highlightHaloShape = options.haloShape;
+      changed = true;
+    }
+    if (changed) this._styleGeneration++;
+    return changed;
   }
 
   /**
@@ -433,24 +477,18 @@ export class HighlightRenderer {
       if (this._highlightedIndicesCache !== null || this._highlightDataRef !== null) {
         this._highlightedIndicesCache = [];
         this._highlightDataRef = null;
-        this._highlightDataFingerprint = 0;
         this._highlightDataVersion++;
       }
       return;
     }
 
-    // Compute fingerprint for content-based invalidation (detects in-place modifications)
-    const newFingerprint = this._computeHighlightDataFingerprint(highlightData);
-
     // Check if we need to rebuild the cache:
     // 1. Force rebuild requested
     // 2. Cache doesn't exist
     // 3. Reference changed (different array)
-    // 4. Content changed (same array, but modified in-place - detected via fingerprint)
     const needsRebuild = forceRebuild ||
-      !this._highlightedIndicesCache ||
-      this._highlightDataRef !== highlightData ||
-      this._highlightDataFingerprint !== newFingerprint;
+      this._highlightedIndicesCache === null ||
+      this._highlightDataRef !== highlightData;
 
     if (!needsRebuild) return;
 
@@ -458,25 +496,24 @@ export class HighlightRenderer {
     const indices = [];
     const len = highlightData.length;
     for (let i = 0; i < len; i++) {
-      if (highlightData[i] > 0) {
+      if (highlightData[i] >= MIN_VISIBLE_ALPHA_BYTE) {
         indices.push(i);
       }
     }
 
     this._highlightedIndicesCache = indices;
     this._highlightDataRef = highlightData;
-    this._highlightDataFingerprint = newFingerprint;
     this._highlightDataVersion++;
   }
 
   /**
    * Invalidate the highlight cache (call when highlight array contents change in-place)
-   * Note: With content-based fingerprinting, this is now rarely needed as in-place
-   * modifications are automatically detected. Still useful for forcing immediate invalidation.
+   * The public updateHighlight lifecycle is the exact mutation boundary for
+   * the caller-owned Uint8Array, so invalidation is generation-based rather
+   * than an inaccurate sampled content hash.
    */
   invalidateHighlightCache() {
     this._highlightedIndicesCache = null;
-    this._highlightDataFingerprint = -1;  // Force mismatch on next update
     this._highlightDataVersion++;
   }
 
@@ -487,36 +524,304 @@ export class HighlightRenderer {
    * @param {Uint8Array} highlightData - Reference to the highlight data array
    */
   setHighlightedIndicesCache(indices, highlightData) {
-    this._highlightedIndicesCache = indices;
+    this._highlightedIndicesCache = indices.slice();
     this._highlightDataRef = highlightData;
-    this._highlightDataFingerprint = this._computeHighlightDataFingerprint(highlightData);
     this._highlightDataVersion++;
   }
 
-  /**
-   * Returns true if the GPU buffer should be rebuilt for the given LOD signature and view.
-   * @param {number} lodSignature - LOD signature for cache validation
-   * @param {string} [viewId='default'] - View ID for per-view buffer lookup
-   * @param {Float32Array} [positions] - Optional positions to check for changes
-   */
-  needsRefresh(lodSignature, viewId, positions) {
-    if (!Number.isInteger(lodSignature) || lodSignature < -1) {
-      throw new RangeError(
-        'Highlight LOD signature must be an integer greater than or equal to -1.'
-      );
+  _createViewBufferRecord() {
+    return {
+      buffer: null,
+      dimensionLevel: 0,
+      drawFailure: null,
+      failedPublication: null,
+      geometryGeneration: 0,
+      highlightGeneration: -1,
+      lodMembership: null,
+      pointCount: 0,
+      published: false,
+      transparencyGeneration: -1,
+      vertexArray: null,
+    };
+  }
+
+  _queueViewResourceHandles(buffer, vertexArray) {
+    if (vertexArray !== null) {
+      this._pendingVertexArrayDeletes.add(vertexArray);
     }
+    if (buffer !== null) {
+      this._pendingBufferDeletes.add(buffer);
+    }
+  }
+
+  _detachViewResources(viewBuffer) {
+    const buffer = viewBuffer.buffer;
+    const vertexArray = viewBuffer.vertexArray;
+    // Detach the complete logical pair before either deletion can fail.
+    viewBuffer.buffer = null;
+    viewBuffer.vertexArray = null;
+    this._queueViewResourceHandles(buffer, vertexArray);
+  }
+
+  _publicationFailureMatches(
+    viewBuffer,
+    lodMembership,
+    geometryGeneration,
+    dimensionLevel,
+    transparencyGeneration
+  ) {
+    const failed = viewBuffer?.failedPublication;
+    return (
+      failed !== null &&
+      failed !== undefined &&
+      failed.highlightGeneration === this._highlightDataVersion &&
+      failed.geometryGeneration === geometryGeneration &&
+      failed.dimensionLevel === dimensionLevel &&
+      failed.lodMembership === lodMembership &&
+      failed.transparencyGeneration === transparencyGeneration
+    );
+  }
+
+  /**
+   * Fence one failed compact-buffer publication until a meaningful semantic
+   * generation changes. Failure records are allocated only on the exceptional
+   * path; successful animation frames compare scalar/reference certificates.
+   */
+  recordPublicationFailure(
+    lodMembership,
+    viewId,
+    geometryGeneration,
+    dimensionLevel,
+    transparencyGeneration
+  ) {
     const vid = requireHighlightViewId(viewId);
-    const exactPositions = requireHighlightPositions(positions);
+    const exactDimensionLevel =
+      requireHighlightDimension(dimensionLevel);
+    const exactGeometryGeneration =
+      requireHighlightGeometryGeneration(geometryGeneration);
+    const exactTransparencyGeneration =
+      requireHighlightTransparencyGeneration(transparencyGeneration);
+    const pointCount = this._highlightDataRef?.length ?? null;
+    const exactMembership = requireHighlightLodMembership(
+      lodMembership,
+      pointCount,
+      exactDimensionLevel
+    );
+    let viewBuffer = this._viewBuffers.get(vid);
+    if (viewBuffer === undefined) {
+      viewBuffer = this._createViewBufferRecord();
+      this._viewBuffers.set(vid, viewBuffer);
+    }
+    viewBuffer.failedPublication = {
+      dimensionLevel: exactDimensionLevel,
+      geometryGeneration: exactGeometryGeneration,
+      highlightGeneration: this._highlightDataVersion,
+      lodMembership: exactMembership,
+      transparencyGeneration: exactTransparencyGeneration,
+    };
+    // Retain the accepted buffer/VAO allocation for a later semantic retry,
+    // but revoke its draw count immediately. Drawing the previous generation
+    // after a failed geometry/LOD/filter publication would present stale cells.
+    viewBuffer.drawFailure = null;
+    viewBuffer.pointCount = 0;
+    this._recomputeTotalHighlightedCount();
+  }
+
+  _commitEmptyViewBuffer(
+    viewBuffer,
+    lodMembership,
+    geometryGeneration,
+    dimensionLevel,
+    transparencyGeneration
+  ) {
+    if (
+      viewBuffer.buffer !== null ||
+      viewBuffer.vertexArray !== null
+    ) {
+      // Commit the non-drawable state before the first fallible GL call. Even
+      // hostile deletion failures must never leave stale highlights dispatchable.
+      this._detachViewResources(viewBuffer);
+    }
+
+    viewBuffer.dimensionLevel = dimensionLevel;
+    viewBuffer.drawFailure = null;
+    viewBuffer.failedPublication = null;
+    viewBuffer.geometryGeneration = geometryGeneration;
+    viewBuffer.highlightGeneration = this._highlightDataVersion;
+    viewBuffer.lodMembership = lodMembership;
+    viewBuffer.pointCount = 0;
+    viewBuffer.published = true;
+    viewBuffer.transparencyGeneration = transparencyGeneration;
+  }
+
+  _publishEmptyViewBuffer(
+    viewBuffer,
+    viewId,
+    lodMembership,
+    geometryGeneration,
+    dimensionLevel,
+    transparencyGeneration
+  ) {
+    this._commitEmptyViewBuffer(
+      viewBuffer,
+      lodMembership,
+      geometryGeneration,
+      dimensionLevel,
+      transparencyGeneration
+    );
+    this._recomputeTotalHighlightedCount();
+
+    // A semantic publication retries any previously retained GPU owner once.
+    // Exact cache-hit frames below do not turn hostile cleanup into a RAF storm.
+    if (
+      this._pendingBufferDeletes.size > 0 ||
+      this._pendingVertexArrayDeletes.size > 0
+    ) {
+      const failures = this._flushPendingResourceDeletes();
+      if (failures.length > 0) {
+        throw new AggregateError(
+          failures,
+          `Empty highlight publication for view "${viewId}" retains ${failures.length} pending GPU retirement failure(s).`
+        );
+      }
+    }
+  }
+
+  /**
+   * Return whether one exact per-view compact buffer generation is stale.
+   */
+  needsRefresh(
+    lodMembership,
+    viewId,
+    geometryGeneration,
+    dimensionLevel,
+    transparencyGeneration
+  ) {
+    const vid = requireHighlightViewId(viewId);
+    const exactDimensionLevel =
+      requireHighlightDimension(dimensionLevel);
+    const exactGeometryGeneration =
+      requireHighlightGeometryGeneration(geometryGeneration);
+    const exactTransparencyGeneration =
+      requireHighlightTransparencyGeneration(transparencyGeneration);
+    const pointCount = this._highlightDataRef?.length ?? null;
+    const exactMembership = requireHighlightLodMembership(
+      lodMembership,
+      pointCount,
+      exactDimensionLevel
+    );
     const viewBuffer = this._viewBuffers.get(vid);
 
-    if (!viewBuffer || !viewBuffer.buffer) return true;
-    if (viewBuffer.lodSignature !== lodSignature) return true;
+    if (
+      this._publicationFailureMatches(
+        viewBuffer,
+        exactMembership,
+        exactGeometryGeneration,
+        exactDimensionLevel,
+        exactTransparencyGeneration
+      )
+    ) {
+      return false;
+    }
 
-    // Check if positions changed (for multi-dimensional views)
-    const currentFingerprint = this._computePositionsFingerprint(exactPositions);
-    if (viewBuffer.positionsFingerprint !== currentFingerprint) return true;
+    return (
+      viewBuffer === undefined ||
+      viewBuffer.published !== true ||
+      viewBuffer.highlightGeneration !== this._highlightDataVersion ||
+      viewBuffer.geometryGeneration !== exactGeometryGeneration ||
+      viewBuffer.dimensionLevel !== exactDimensionLevel ||
+      viewBuffer.lodMembership !== exactMembership ||
+      viewBuffer.transparencyGeneration !==
+        exactTransparencyGeneration ||
+      (
+        viewBuffer.pointCount > 0 &&
+        (
+          viewBuffer.buffer === null ||
+          viewBuffer.vertexArray === null
+        )
+      )
+    );
+  }
 
-    return false;
+  /**
+   * Publish an exact empty highlight generation without consulting LOD or
+   * geometry owners. This retires stale draw counts and remains a cache hit on
+   * subsequent empty frames while allocating no CPU/GPU point storage.
+   */
+  publishEmptyView(viewId) {
+    const vid = requireHighlightViewId(viewId);
+    let viewBuffer = this._viewBuffers.get(vid);
+    if (
+      viewBuffer?.published === true &&
+      viewBuffer.pointCount === 0 &&
+      viewBuffer.highlightGeneration === this._highlightDataVersion &&
+      viewBuffer.dimensionLevel === 0 &&
+      viewBuffer.geometryGeneration === 0 &&
+      viewBuffer.lodMembership === null &&
+      viewBuffer.transparencyGeneration === -1
+    ) {
+      return false;
+    }
+    if (viewBuffer === undefined) {
+      viewBuffer = this._createViewBufferRecord();
+      this._viewBuffers.set(vid, viewBuffer);
+    }
+    this._publishEmptyViewBuffer(
+      viewBuffer,
+      vid,
+      null,
+      0,
+      0,
+      -1
+    );
+    return true;
+  }
+
+  /**
+   * Publish the current empty highlight generation to every existing view.
+   *
+   * Hidden/focused-out panes do not participate in the render loop, so waiting
+   * for their next frame can retain one dataset-sized compact buffer per pane.
+   * Detach every logical owner before attempting any fallible WebGL deletion.
+   */
+  publishEmptyViews() {
+    const pendingPublications = [];
+    for (const [viewId, viewBuffer] of this._viewBuffers) {
+      if (
+        viewBuffer.published === true &&
+        viewBuffer.pointCount === 0 &&
+        viewBuffer.highlightGeneration === this._highlightDataVersion &&
+        viewBuffer.dimensionLevel === 0 &&
+        viewBuffer.geometryGeneration === 0 &&
+        viewBuffer.lodMembership === null &&
+        viewBuffer.transparencyGeneration === -1
+      ) continue;
+      pendingPublications.push([viewId, viewBuffer]);
+    }
+    if (pendingPublications.length === 0) return false;
+
+    // `_publishEmptyViewBuffer` normally flushes after committing one view.
+    // Temporarily detach all buffers first so one hostile delete cannot leave a
+    // later hidden pane drawable under the superseded highlight generation.
+    for (const [viewId, viewBuffer] of pendingPublications) {
+      this._commitEmptyViewBuffer(
+        viewBuffer,
+        null,
+        0,
+        0,
+        -1
+      );
+    }
+    this._recomputeTotalHighlightedCount();
+
+    const failures = this._flushPendingResourceDeletes();
+    if (failures.length > 0) {
+      throw new AggregateError(
+        failures,
+        `Empty highlight publication across ${pendingPublications.length} views retains ${failures.length} pending GPU retirement failure(s).`
+      );
+    }
+    return true;
   }
 
   /**
@@ -530,66 +835,98 @@ export class HighlightRenderer {
    * Now supports per-view buffers for multi-view rendering.
    * @param {Uint8Array} highlightData - Highlight intensity per cell
    * @param {Float32Array} positions - Position data
-   * @param {Float32Array|null} visibility - Combined LOD+frustum visibility mask (1.0 = visible, 0.0 = hidden), or null for all visible
-   * @param {number} [visibilitySignature] - Signature for cache key (LOD level + frustum state)
-   * @param {string} [viewId='default'] - View ID for per-view buffer
-   * @param {Float32Array|null} [viewTransparency=null] - Per-view transparency array (cells with transparency <= 0 are hidden)
+   * @param {Object|null} lodMembership - Shared exact LOD descriptor, or null
+   * @param {string} viewId - Exact view ID
+   * @param {Float32Array} viewTransparency - Exact per-view transparency
+   * @param {number} geometryGeneration - Exact renderer geometry generation
+   * @param {number} dimensionLevel - Exact view dimension
+   * @param {number} transparencyGeneration - Exact filtering generation
    */
   rebuildBuffer(
     highlightData,
     positions,
-    visibility,
-    visibilitySignature,
+    lodMembership,
     viewId,
-    viewTransparency
+    viewTransparency,
+    geometryGeneration,
+    dimensionLevel,
+    transparencyGeneration
   ) {
     const gl = this.gl;
     const vid = requireHighlightViewId(viewId);
     const exactPositions = requireHighlightPositions(positions);
     const pointCount = exactPositions.length / 3;
     const exactHighlightData = requireHighlightData(highlightData, pointCount);
-    const exactVisibility = requireHighlightVisibility(visibility, pointCount);
+    const exactDimensionLevel =
+      requireHighlightDimension(dimensionLevel);
+    const exactMembership = requireHighlightLodMembership(
+      lodMembership,
+      pointCount,
+      exactDimensionLevel
+    );
     const exactTransparency = requireHighlightTransparency(
       viewTransparency,
       pointCount
     );
-    if (!Number.isInteger(visibilitySignature) || visibilitySignature < -1) {
-      throw new RangeError(
-        'Highlight LOD signature must be an integer greater than or equal to -1.'
-      );
-    }
-    const sigValue = visibilitySignature;
-    const positionsFingerprint = this._computePositionsFingerprint(exactPositions);
+    const exactGeometryGeneration =
+      requireHighlightGeometryGeneration(geometryGeneration);
+    const exactTransparencyGeneration =
+      requireHighlightTransparencyGeneration(transparencyGeneration);
 
     // Use cached highlighted indices for fast iteration (avoids scanning all 10M+ cells)
-    // Cache is rebuilt only when highlightData reference changes
+    // Cache is rebuilt only at the exact updateHighlight publication boundary.
     this.updateHighlightCache(exactHighlightData);
     const highlightedIndices = this._highlightedIndicesCache;
+    const admissionLevels =
+      exactMembership?.admissionLevels ?? null;
+    const activeLodLevel =
+      exactMembership?.lodLevel ?? -1;
+    const lodIndices = exactMembership?.indices ?? null;
+    const iterateLodPrefix =
+      lodIndices !== null &&
+      lodIndices.length < highlightedIndices.length;
+    const candidateIndices = iterateLodPrefix
+      ? lodIndices
+      : highlightedIndices;
 
     // Count visible highlighted cells using cached indices
-    // Now respects both LOD+frustum visibility AND per-view transparency (filtering)
+    // Frustum clipping remains GPU-owned; CPU packing applies only the shared
+    // LOD prefix and the exact point-shader alpha boundary.
     let count = 0;
-    for (let j = 0; j < highlightedIndices.length; j++) {
-      const i = highlightedIndices[j];
-      // Skip if culled by LOD+frustum
-      if (exactVisibility && exactVisibility[i] <= 0) continue;
-      // Skip if filtered out in this view (per-view transparency)
-      if (exactTransparency[i] <= 0) continue;
+    for (let j = 0; j < candidateIndices.length; j++) {
+      const i = candidateIndices[j];
+      if (
+        iterateLodPrefix &&
+        exactHighlightData[i] < MIN_VISIBLE_ALPHA_BYTE
+      ) continue;
+      if (
+        !iterateLodPrefix &&
+        admissionLevels !== null &&
+        admissionLevels[i] > activeLodLevel
+      ) continue;
+      if (
+        exactTransparency[i] <
+        POINT_VISIBILITY_THRESHOLD
+      ) continue;
       count++;
     }
 
     // Get or create per-view buffer entry
     let viewBuffer = this._viewBuffers.get(vid);
     if (!viewBuffer) {
-      viewBuffer = { buffer: null, pointCount: 0, lodSignature: -999, positionsFingerprint: 0 };
+      viewBuffer = this._createViewBufferRecord();
       this._viewBuffers.set(vid, viewBuffer);
     }
 
     if (count === 0) {
-      viewBuffer.pointCount = 0;
-      viewBuffer.lodSignature = sigValue;
-      viewBuffer.positionsFingerprint = positionsFingerprint;
-      this._recomputeTotalHighlightedCount();
+      this._publishEmptyViewBuffer(
+        viewBuffer,
+        vid,
+        exactMembership,
+        exactGeometryGeneration,
+        exactDimensionLevel,
+        exactTransparencyGeneration
+      );
       return;
     }
 
@@ -600,12 +937,21 @@ export class HighlightRenderer {
 
     // Pack buffer using cached indices (fast - only iterates over highlighted cells)
     let outIdx = 0;
-    for (let j = 0; j < highlightedIndices.length; j++) {
-      const i = highlightedIndices[j];
-      // Skip if culled by LOD+frustum
-      if (exactVisibility && exactVisibility[i] <= 0) continue;
-      // Skip if filtered out in this view (per-view transparency)
-      if (exactTransparency[i] <= 0) continue;
+    for (let j = 0; j < candidateIndices.length; j++) {
+      const i = candidateIndices[j];
+      if (
+        iterateLodPrefix &&
+        exactHighlightData[i] < MIN_VISIBLE_ALPHA_BYTE
+      ) continue;
+      if (
+        !iterateLodPrefix &&
+        admissionLevels !== null &&
+        admissionLevels[i] > activeLodLevel
+      ) continue;
+      if (
+        exactTransparency[i] <
+        POINT_VISIBILITY_THRESHOLD
+      ) continue;
 
       const posOffset = outIdx * 4;
       const colorOffset = outIdx * BYTES_PER_POINT + 12;
@@ -622,22 +968,137 @@ export class HighlightRenderer {
       outIdx++;
     }
 
-    // Create GPU buffer for this view if needed
-    if (!viewBuffer.buffer) {
-      viewBuffer.buffer = gl.createBuffer();
-      if (!viewBuffer.buffer) {
-        throw new Error(
-          `Unable to allocate the highlight buffer for view "${vid}".`
+    const hasBuffer = viewBuffer.buffer !== null;
+    const hasVertexArray = viewBuffer.vertexArray !== null;
+    if (hasBuffer !== hasVertexArray) {
+      throw new Error(
+        `Highlight view "${vid}" has an incomplete GPU buffer/VAO pair.`
+      );
+    }
+
+    const isInitialPublication = !hasBuffer;
+    let candidateBuffer = viewBuffer.buffer;
+    let candidateVertexArray = viewBuffer.vertexArray;
+    let publicationError = null;
+    const restorationFailures = [];
+    requireCleanHighlightWebGLState(
+      gl,
+      `Highlight buffer publication for view "${vid}" preflight`
+    );
+    try {
+      if (isInitialPublication) {
+        candidateBuffer = gl.createBuffer();
+        if (!candidateBuffer) {
+          requireCleanHighlightWebGLState(
+            gl,
+            `Highlight buffer allocation for view "${vid}"`
+          );
+          throw new Error(
+            `Unable to allocate the highlight buffer for view "${vid}".`
+          );
+        }
+        candidateVertexArray = gl.createVertexArray();
+        if (!candidateVertexArray) {
+          requireCleanHighlightWebGLState(
+            gl,
+            `Highlight vertex-array allocation for view "${vid}"`
+          );
+          throw new Error(
+            `Unable to allocate the highlight vertex array for view "${vid}".`
+          );
+        }
+      }
+
+      gl.bindVertexArray(candidateVertexArray);
+      gl.bindBuffer(gl.ARRAY_BUFFER, candidateBuffer);
+      // Select the WebGL2 ArrayBufferView overload explicitly. Its error
+      // contract preserves the accepted data store, so replacement OOM remains
+      // retryable without retaining a second GPU buffer.
+      gl.bufferData(
+        gl.ARRAY_BUFFER,
+        colorView,
+        gl.DYNAMIC_DRAW,
+        0
+      );
+      if (isInitialPublication) {
+        gl.enableVertexAttribArray(this.attribLocations.position);
+        gl.vertexAttribPointer(
+          this.attribLocations.position,
+          3,
+          gl.FLOAT,
+          false,
+          BYTES_PER_POINT,
+          0
         );
+        gl.enableVertexAttribArray(this.attribLocations.color);
+        gl.vertexAttribPointer(
+          this.attribLocations.color,
+          4,
+          gl.UNSIGNED_BYTE,
+          true,
+          BYTES_PER_POINT,
+          12
+        );
+      }
+      requireCleanHighlightWebGLState(
+        gl,
+        `Highlight buffer publication for view "${vid}"`
+      );
+    } catch (error) {
+      publicationError = error;
+    } finally {
+      try {
+        gl.bindVertexArray(null);
+      } catch (error) {
+        restorationFailures.push(error);
+      }
+      try {
+        gl.bindBuffer(gl.ARRAY_BUFFER, null);
+      } catch (error) {
+        restorationFailures.push(error);
       }
     }
 
-    gl.bindBuffer(gl.ARRAY_BUFFER, viewBuffer.buffer);
-    gl.bufferData(gl.ARRAY_BUFFER, bufferData, gl.DYNAMIC_DRAW);
+    if (
+      publicationError !== null ||
+      restorationFailures.length > 0
+    ) {
+      if (isInitialPublication) {
+        this._queueViewResourceHandles(
+          candidateBuffer,
+          candidateVertexArray
+        );
+      }
+      const cleanupFailures = isInitialPublication
+        ? this._flushPendingResourceDeletes()
+        : [];
+      const failures = [
+        ...(publicationError === null ? [] : [publicationError]),
+        ...restorationFailures,
+        ...cleanupFailures,
+      ];
+      if (failures.length === 1) throw failures[0];
+      throw new AggregateError(
+        failures,
+        `Highlight buffer/VAO publication for view "${vid}" failed with ${failures.length - 1} restoration or retirement failure(s).`
+      );
+    }
 
+    if (isInitialPublication) {
+      viewBuffer.buffer = candidateBuffer;
+      viewBuffer.vertexArray = candidateVertexArray;
+    }
+
+    viewBuffer.dimensionLevel = exactDimensionLevel;
+    viewBuffer.drawFailure = null;
+    viewBuffer.failedPublication = null;
+    viewBuffer.geometryGeneration = exactGeometryGeneration;
+    viewBuffer.highlightGeneration = this._highlightDataVersion;
+    viewBuffer.lodMembership = exactMembership;
     viewBuffer.pointCount = count;
-    viewBuffer.lodSignature = sigValue;
-    viewBuffer.positionsFingerprint = positionsFingerprint;
+    viewBuffer.published = true;
+    viewBuffer.transparencyGeneration =
+      exactTransparencyGeneration;
 
     // Recompute total count across all views for UI feedback
     this._recomputeTotalHighlightedCount();
@@ -676,12 +1137,11 @@ export class HighlightRenderer {
   clearViewBuffer(viewId) {
     const vid = requireHighlightViewId(viewId);
     const viewBuffer = this._viewBuffers.get(vid);
-    // Detach the logical view first. A failed WebGL deletion must never leave a
-    // half-retired buffer dispatchable through the view map.
+    // Detach the logical view and its complete GPU pair first. A failed WebGL
+    // deletion must never leave a half-retired view dispatchable.
     this._viewBuffers.delete(vid);
-    if (viewBuffer?.buffer) {
-      this._pendingBufferDeletes.add(viewBuffer.buffer);
-      viewBuffer.buffer = null;
+    if (viewBuffer !== undefined) {
+      this._detachViewResources(viewBuffer);
     }
     this._recomputeTotalHighlightedCount();
 
@@ -697,6 +1157,21 @@ export class HighlightRenderer {
 
   _flushPendingResourceDeletes({ includePrograms = false } = {}) {
     const failures = [];
+    for (const vertexArray of this._pendingVertexArrayDeletes) {
+      try {
+        this.gl.deleteVertexArray(vertexArray);
+        this._pendingVertexArrayDeletes.delete(vertexArray);
+      } catch (error) {
+        failures.push(
+          error instanceof Error
+            ? error
+            : new Error(
+              'Highlight vertex-array deletion failed with a non-Error value.',
+              { cause: error }
+            )
+        );
+      }
+    }
     for (const buffer of this._pendingBufferDeletes) {
       try {
         this.gl.deleteBuffer(buffer);
@@ -733,7 +1208,29 @@ export class HighlightRenderer {
   }
 
   /**
-   * Dispose all GPU resources
+   * Drop handles invalidated by context loss without issuing WebGL work.
+   */
+  handleContextLost() {
+    if (this._disposed) return false;
+    this._disposeStarted = true;
+    this._viewBuffers.clear();
+    this._pendingBufferDeletes.clear();
+    this._pendingVertexArrayDeletes.clear();
+    this._pendingProgramDeletes.clear();
+    this.program = null;
+    this._totalHighlightedCount = 0;
+    this._highlightedIndicesCache = null;
+    this._highlightDataRef = null;
+    this.attribLocations = null;
+    this.uniformLocations = null;
+    this.hpRenderer = null;
+    this.gl = null;
+    this._disposed = true;
+    return true;
+  }
+
+  /**
+   * Dispose all GPU resources.
    */
   dispose() {
     if (this._disposed) return false;
@@ -744,10 +1241,7 @@ export class HighlightRenderer {
       // Detach the complete live publication before the first fallible GL
       // operation. Pending sets remain authoritative across disposal retries.
       for (const viewBuffer of this._viewBuffers.values()) {
-        if (viewBuffer.buffer) {
-          this._pendingBufferDeletes.add(viewBuffer.buffer);
-          viewBuffer.buffer = null;
-        }
+        this._detachViewResources(viewBuffer);
       }
       this._viewBuffers.clear();
       if (this.program) this._pendingProgramDeletes.add(this.program);
@@ -756,7 +1250,6 @@ export class HighlightRenderer {
       this._totalHighlightedCount = 0;
       this._highlightedIndicesCache = null;
       this._highlightDataRef = null;
-      this._highlightDataFingerprint = 0;
       this.attribLocations = null;
       this.uniformLocations = null;
       this.hpRenderer = null;
@@ -782,6 +1275,83 @@ export class HighlightRenderer {
    * Uses per-view buffers for multi-view rendering with correct LOD sizes.
    * @param {string} viewId - Required view ID for per-view buffer and LOD size lookup
    */
+  _readFrameTimeSeconds() {
+    return performance.now() * 0.001;
+  }
+
+  _drawFailureMatches(
+    viewBuffer,
+    requestedDimensionLevel
+  ) {
+    const failed = viewBuffer.drawFailure;
+    return (
+      failed !== null &&
+      failed !== undefined &&
+      failed.buffer === viewBuffer.buffer &&
+      failed.vertexArray === viewBuffer.vertexArray &&
+      failed.pointCount === viewBuffer.pointCount &&
+      failed.geometryGeneration ===
+        viewBuffer.geometryGeneration &&
+      failed.highlightGeneration ===
+        viewBuffer.highlightGeneration &&
+      failed.lodMembership === viewBuffer.lodMembership &&
+      failed.transparencyGeneration ===
+        viewBuffer.transparencyGeneration &&
+      failed.publishedDimensionLevel ===
+        viewBuffer.dimensionLevel &&
+      failed.requestedDimensionLevel ===
+        requestedDimensionLevel &&
+      failed.program === this.program &&
+      failed.uniformLocations === this.uniformLocations &&
+      failed.hpRenderer === this.hpRenderer &&
+      failed.styleGeneration ===
+        (this._styleGeneration ?? 0) &&
+      failed.highlightColor === this.highlightColor &&
+      failed.highlightColor0 === this.highlightColor?.[0] &&
+      failed.highlightColor1 === this.highlightColor?.[1] &&
+      failed.highlightColor2 === this.highlightColor?.[2] &&
+      failed.highlightScale === this.highlightScale &&
+      failed.highlightRingWidth === this.highlightRingWidth &&
+      failed.highlightHaloStrength ===
+        this.highlightHaloStrength &&
+      failed.highlightHaloShape === this.highlightHaloShape &&
+      failed.highlightRingStyle === this.highlightRingStyle
+    );
+  }
+
+  _recordDrawFailure(
+    viewBuffer,
+    requestedDimensionLevel
+  ) {
+    // Allocated only after an exceptional draw. The exact accepted
+    // publication/style/program certificate prevents one deterministic fault
+    // from becoming an error and driver-call storm on every animation frame.
+    viewBuffer.drawFailure = {
+      buffer: viewBuffer.buffer,
+      geometryGeneration: viewBuffer.geometryGeneration,
+      highlightColor: this.highlightColor,
+      highlightColor0: this.highlightColor?.[0],
+      highlightColor1: this.highlightColor?.[1],
+      highlightColor2: this.highlightColor?.[2],
+      highlightGeneration: viewBuffer.highlightGeneration,
+      highlightHaloShape: this.highlightHaloShape,
+      highlightHaloStrength: this.highlightHaloStrength,
+      highlightRingStyle: this.highlightRingStyle,
+      highlightRingWidth: this.highlightRingWidth,
+      highlightScale: this.highlightScale,
+      hpRenderer: this.hpRenderer,
+      lodMembership: viewBuffer.lodMembership,
+      pointCount: viewBuffer.pointCount,
+      program: this.program,
+      publishedDimensionLevel: viewBuffer.dimensionLevel,
+      requestedDimensionLevel,
+      styleGeneration: this._styleGeneration ?? 0,
+      transparencyGeneration: viewBuffer.transparencyGeneration,
+      uniformLocations: this.uniformLocations,
+      vertexArray: viewBuffer.vertexArray,
+    };
+  }
+
   draw({
     mvpMatrix,
     viewMatrix,
@@ -797,84 +1367,131 @@ export class HighlightRenderer {
     lightDir,
     viewId,  // Required for per-view buffer lookup and LOD size multiplier
     dimensionLevel
-  }) {
+  }, frameTimeSeconds = this._readFrameTimeSeconds()) {
     const gl = this.gl;
     const vid = requireHighlightViewId(viewId);
     const exactDimensionLevel = requireHighlightDimension(dimensionLevel);
 
-    // Get the per-view buffer
+    // Get the exact per-view buffer/VAO pair.
     const viewBuffer = this._viewBuffers.get(vid);
-    if (!viewBuffer || !viewBuffer.buffer || viewBuffer.pointCount === 0) return;
-
-    const buffer = viewBuffer.buffer;
-    const pointCount = viewBuffer.pointCount;
-
-    // Enable depth test and disable depth writes for highlight rendering
-    // Assumes caller (HighPerfRenderer) maintains DEPTH_TEST enabled and depthMask true as defaults
-    // This avoids expensive gl.isEnabled() and gl.getParameter() queries every frame
-    gl.enable(gl.DEPTH_TEST);  // Ensure enabled (usually already is from main renderer)
-    gl.depthMask(false);       // Disable writes so highlights render on top of existing geometry
-
-    gl.useProgram(this.program);
-
-    // Use per-view LOD size multiplier if viewId is provided
-    // Pass dimensionLevel to ensure correct LOD buffer lookup for multi-dimension views
-    const lodSizeMultiplier = this.hpRenderer.getCurrentLODSizeMultiplier(
-      vid,
-      exactDimensionLevel
+    if (!viewBuffer || viewBuffer.pointCount === 0) return;
+    if (this._drawFailureMatches(viewBuffer, exactDimensionLevel)) return;
+    const exactFrameTimeSeconds = requireFiniteHighlightNumber(
+      frameTimeSeconds,
+      'Highlight frame timeSeconds'
     );
-    const highlightPointSize = pointSize * lodSizeMultiplier;
-
-    gl.uniformMatrix4fv(this.uniformLocations.mvpMatrix, false, mvpMatrix);
-    gl.uniformMatrix4fv(this.uniformLocations.viewMatrix, false, viewMatrix);
-    gl.uniformMatrix4fv(this.uniformLocations.modelMatrix, false, modelMatrix);
-    gl.uniformMatrix4fv(this.uniformLocations.projectionMatrix, false, projectionMatrix);
-
-    let effectiveScale = this.highlightScale;
-    let effectiveRingWidth = this.highlightRingWidth;
-    let effectiveHaloStrength = this.highlightHaloStrength;
-    if (this.highlightHaloShape > 0.5) {
-      const haloBoost = Math.min(1.5, Math.max(0, pointSize * (0.01 + sizeAttenuation * 0.02)));
-      effectiveScale = this.highlightScale + haloBoost * 0.5;
-      effectiveRingWidth = Math.min(0.5, this.highlightRingWidth + haloBoost * 0.02);
-      effectiveHaloStrength = Math.min(1.0, this.highlightHaloStrength + haloBoost * 0.1);
+    if (
+      viewBuffer.buffer === null ||
+      viewBuffer.vertexArray === null
+    ) {
+      throw new Error(
+        `Highlight view "${vid}" has no complete drawable GPU pair.`
+      );
     }
 
-    gl.uniform1f(this.uniformLocations.pointSize, highlightPointSize);
-    gl.uniform1f(this.uniformLocations.sizeAttenuation, sizeAttenuation);
-    gl.uniform1f(this.uniformLocations.viewportHeight, viewportHeight);
-    gl.uniform1f(this.uniformLocations.fov, fov);
-    gl.uniform1f(this.uniformLocations.highlightScale, effectiveScale);
-    gl.uniform3fv(this.uniformLocations.highlightColor, this.highlightColor);
-    gl.uniform1f(this.uniformLocations.ringWidth, effectiveRingWidth);
-    gl.uniform1f(this.uniformLocations.haloStrength, effectiveHaloStrength);
-    gl.uniform1f(this.uniformLocations.haloShape, this.highlightHaloShape);
-    gl.uniform1f(this.uniformLocations.ringStyle, this.highlightRingStyle);
+    const vertexArray = viewBuffer.vertexArray;
+    const pointCount = viewBuffer.pointCount;
 
-    const highlightTime = (performance.now() - this.startTime) * 0.001;
-    gl.uniform1f(this.uniformLocations.time, highlightTime);
+    let drawFailure = null;
+    let restorationFailures = null;
+    try {
+      // Enable depth test and disable depth writes for highlight rendering.
+      // These calls are part of the fenced transaction: hostile wrappers may
+      // throw before depthMask(false), and must still be reported only once
+      // for the exact accepted draw generation.
+      gl.enable(gl.DEPTH_TEST);
+      configureStraightAlphaBlending(gl);
 
-    gl.uniform1f(this.uniformLocations.fogDensity, fogDensity);
-    gl.uniform1f(this.uniformLocations.fogNear, this.hpRenderer.getFogNear());
-    gl.uniform1f(this.uniformLocations.fogFar, this.hpRenderer.getFogFar());
-    gl.uniform3fv(this.uniformLocations.fogColor, fogColor);
+      // Keep the publication inside the transaction so an exceptional WebGL
+      // implementation or test double cannot strand depth writes disabled.
+      gl.depthMask(false);
+      gl.useProgram(this.program);
 
-    gl.uniform1f(this.uniformLocations.lightingStrength, lightingStrength);
-    gl.uniform3fv(this.uniformLocations.lightDir, lightDir);
+      // Use per-view LOD size multiplier if viewId is provided.
+      // Pass dimensionLevel for the exact multi-dimension LOD buffer lookup.
+      const lodSizeMultiplier = this.hpRenderer.getCurrentLODSizeMultiplier(
+        vid,
+        exactDimensionLevel
+      );
+      const highlightPointSize = pointSize * lodSizeMultiplier;
 
-    const BYTES_PER_POINT = 16;
-    gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
-    gl.enableVertexAttribArray(this.attribLocations.position);
-    gl.vertexAttribPointer(this.attribLocations.position, 3, gl.FLOAT, false, BYTES_PER_POINT, 0);
-    gl.enableVertexAttribArray(this.attribLocations.color);
-    gl.vertexAttribPointer(this.attribLocations.color, 4, gl.UNSIGNED_BYTE, true, BYTES_PER_POINT, 12);
+      gl.uniformMatrix4fv(this.uniformLocations.mvpMatrix, false, mvpMatrix);
+      gl.uniformMatrix4fv(this.uniformLocations.viewMatrix, false, viewMatrix);
+      gl.uniformMatrix4fv(this.uniformLocations.modelMatrix, false, modelMatrix);
+      gl.uniformMatrix4fv(this.uniformLocations.projectionMatrix, false, projectionMatrix);
 
-    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+      let effectiveScale = this.highlightScale;
+      let effectiveRingWidth = this.highlightRingWidth;
+      let effectiveHaloStrength = this.highlightHaloStrength;
+      if (this.highlightHaloShape > 0.5) {
+        const haloBoost = Math.min(1.5, Math.max(0, pointSize * (0.01 + sizeAttenuation * 0.02)));
+        effectiveScale = this.highlightScale + haloBoost * 0.5;
+        effectiveRingWidth = Math.min(0.5, this.highlightRingWidth + haloBoost * 0.02);
+        effectiveHaloStrength = Math.min(1.0, this.highlightHaloStrength + haloBoost * 0.1);
+      }
 
-    gl.drawArrays(gl.POINTS, 0, pointCount);
+      gl.uniform1f(this.uniformLocations.pointSize, highlightPointSize);
+      gl.uniform1f(this.uniformLocations.sizeAttenuation, sizeAttenuation);
+      gl.uniform1f(this.uniformLocations.viewportHeight, viewportHeight);
+      gl.uniform1f(this.uniformLocations.fov, fov);
+      gl.uniform1f(this.uniformLocations.highlightScale, effectiveScale);
+      gl.uniform3fv(this.uniformLocations.highlightColor, this.highlightColor);
+      gl.uniform1f(this.uniformLocations.ringWidth, effectiveRingWidth);
+      gl.uniform1f(this.uniformLocations.haloStrength, effectiveHaloStrength);
+      gl.uniform1f(this.uniformLocations.haloShape, this.highlightHaloShape);
+      gl.uniform1f(this.uniformLocations.ringStyle, this.highlightRingStyle);
 
-    // Restore depth mask to default (true) - main renderer expects this state
-    gl.depthMask(true);
+      const highlightTime =
+        exactFrameTimeSeconds -
+        this.startTime * 0.001;
+      gl.uniform1f(this.uniformLocations.time, highlightTime);
+
+      gl.uniform1f(this.uniformLocations.fogDensity, fogDensity);
+      gl.uniform1f(this.uniformLocations.fogNear, this.hpRenderer.getFogNear());
+      gl.uniform1f(this.uniformLocations.fogFar, this.hpRenderer.getFogFar());
+      gl.uniform3fv(this.uniformLocations.fogColor, fogColor);
+
+      gl.uniform1f(this.uniformLocations.lightingStrength, lightingStrength);
+      gl.uniform3fv(this.uniformLocations.lightDir, lightDir);
+
+      // Attribute layout is immutable for the lifetime of the resource pair;
+      // each frame needs one VAO bind instead of reconfiguring two attributes.
+      gl.bindVertexArray(vertexArray);
+      gl.drawArrays(gl.POINTS, 0, pointCount);
+    } catch (error) {
+      drawFailure = error;
+    } finally {
+      try {
+        gl.bindVertexArray(null);
+      } catch (error) {
+        (restorationFailures ??= []).push(error);
+      }
+      try {
+        // depthMask(true) is renderer-owned baseline state. Restore it even
+        // when shader state, VAO binding, or drawing fails mid-pass.
+        gl.depthMask(true);
+      } catch (error) {
+        (restorationFailures ??= []).push(error);
+      }
+    }
+    if (drawFailure !== null) {
+      this._recordDrawFailure(viewBuffer, exactDimensionLevel);
+      if (restorationFailures !== null) {
+        throw new AggregateError(
+          [drawFailure, ...restorationFailures],
+          `Highlight draw for view "${vid}" failed with incomplete state restoration.`
+        );
+      }
+      throw drawFailure;
+    }
+    if (restorationFailures !== null) {
+      this._recordDrawFailure(viewBuffer, exactDimensionLevel);
+      throw new AggregateError(
+        restorationFailures,
+        `Highlight draw for view "${vid}" could not restore renderer-owned state.`
+      );
+    }
+    viewBuffer.drawFailure = null;
   }
 }
 
@@ -958,18 +1575,111 @@ export function createLassoOverlay(canvas) {
   const parentPositionLease = acquireLassoParentPosition(parentElement);
   let lassoCtx = null;
   let observer = null;
+  let activeDprRegistration = null;
+  const dprRegistrations = new Set();
   let resizeSubscriptionActive = true;
 
   function syncLassoCanvasSize() {
     if (!resizeSubscriptionActive) return;
     const rect = canvas.getBoundingClientRect();
     const dpr = window.devicePixelRatio || 1;
-    lassoCanvas.width = rect.width * dpr;
-    lassoCanvas.height = rect.height * dpr;
+    lassoCanvas.width = Math.floor(rect.width * dpr);
+    lassoCanvas.height = Math.floor(rect.height * dpr);
     lassoCanvas.style.width = rect.width + 'px';
     lassoCanvas.style.height = rect.height + 'px';
     lassoCtx.setTransform(1, 0, 0, 1, 0, 0);
     lassoCtx.scale(dpr, dpr);
+  }
+
+  function retireDprRegistration(registration) {
+    registration.mediaQuery.removeEventListener(
+      'change',
+      registration.handler
+    );
+    dprRegistrations.delete(registration);
+  }
+
+  function armDprMonitor() {
+    if (!resizeSubscriptionActive) return;
+    const dpr = window.devicePixelRatio || 1;
+    const registration = {
+      handler: null,
+      mediaQuery: window.matchMedia(`(resolution: ${dpr}dppx)`),
+    };
+    registration.handler = () => {
+      if (
+        !resizeSubscriptionActive ||
+        activeDprRegistration !== registration
+      ) {
+        return;
+      }
+      syncLassoCanvasSize();
+      armDprMonitor();
+    };
+    // Record candidate ownership before the fallible external subscription so
+    // a host that attaches and then throws can still be rolled back exactly.
+    dprRegistrations.add(registration);
+    try {
+      registration.mediaQuery.addEventListener(
+        'change',
+        registration.handler
+      );
+    } catch (error) {
+      try {
+        retireDprRegistration(registration);
+      } catch (cleanupError) {
+        throw new AggregateError(
+          [error, cleanupError],
+          'Highlight lasso DPR-listener setup and rollback both failed.'
+        );
+      }
+      throw error;
+    }
+
+    const previousRegistration = activeDprRegistration;
+    activeDprRegistration = registration;
+    if (previousRegistration !== null) {
+      // Retire every stale generation, including an older generation whose
+      // prior external removal failed. Identity fencing keeps all retained
+      // handlers inert until one of these bounded retries succeeds.
+      for (const staleRegistration of dprRegistrations) {
+        if (staleRegistration === registration) continue;
+        try {
+          retireDprRegistration(staleRegistration);
+        } catch {
+          // Explicit disposal owns the final retry if the host remains hostile.
+        }
+      }
+    }
+  }
+
+  function disconnectResizeSources() {
+    // Fence already-queued ResizeObserver and media-query callbacks before
+    // attempting any fallible external cleanup.
+    resizeSubscriptionActive = false;
+    activeDprRegistration = null;
+    const failures = [];
+    if (observer !== null) {
+      try {
+        observer.disconnect();
+        observer = null;
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    for (const registration of dprRegistrations) {
+      try {
+        retireDprRegistration(registration);
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    if (failures.length > 0) {
+      throw new AggregateError(
+        failures,
+        `Highlight lasso resize subscription retains ${failures.length} pending cleanup failure(s).`
+      );
+    }
   }
 
   try {
@@ -981,11 +1691,11 @@ export function createLassoOverlay(canvas) {
     syncLassoCanvasSize();
     observer = new ResizeObserver(syncLassoCanvasSize);
     observer.observe(canvas);
+    armDprMonitor();
   } catch (error) {
-    resizeSubscriptionActive = false;
     const cleanupFailures = [];
     try {
-      observer?.disconnect();
+      disconnectResizeSources();
     } catch (cleanupError) {
       cleanupFailures.push(cleanupError);
     }
@@ -1010,9 +1720,7 @@ export function createLassoOverlay(canvas) {
 
   const resizeSubscription = {
     disconnect() {
-      // Fence an already-queued callback before the fallible observer cleanup.
-      resizeSubscriptionActive = false;
-      observer.disconnect();
+      disconnectResizeSources();
     },
   };
   return {
@@ -1210,7 +1918,7 @@ export function findCellsInProximity({
     examinedPointCount++;
     // Cell is selectable only if visible (not filtered out in this view)
     // Filtered-out cells cannot be interacted with, even if highlighted in another view
-    if (!(alphas[i] >= HIGHLIGHT_VISIBILITY_THRESHOLD)) return;
+    if (!(alphas[i] >= POINT_VISIBILITY_THRESHOLD)) return;
     const dx = positions[i * 3] - centerPos[0];
     const dy = positions[i * 3 + 1] - centerPos[1];
     const dz = positions[i * 3 + 2] - centerPos[2];
@@ -1363,14 +2071,9 @@ export class HighlightTools {
 
     this.altKeyDown = false;
 
-    // Track last used positions per-view for multiview dimension support
-    // Each view may have different positions (e.g., 2D vs 3D), so we track separately
-    this._lastUsedPositionsMap = new Map();      // viewId -> positions reference
-    this._lastPositionFingerprintMap = new Map(); // viewId -> fingerprint string
-
-    // Track transparency fingerprint per-view to detect filter changes
-    // When filters change, highlight buffer must be rebuilt to exclude filtered-out cells
-    this._lastTransparencyFingerprintMap = new Map(); // viewId -> fingerprint string
+    // Filtering changes are explicit viewer publications. One exact scalar
+    // generation per view replaces sampled Float32 fingerprints.
+    this._transparencyGenerations = new Map();
   }
 
   // === Unified candidate set accessors ===
@@ -1481,7 +2184,8 @@ export class HighlightTools {
           (index) =>
             !Number.isInteger(index) ||
             index < 0 ||
-            index >= highlightData.length
+            index >= highlightData.length ||
+            highlightData[index] < MIN_VISIBLE_ALPHA_BYTE
         )
       ) {
         throw new RangeError(
@@ -1493,39 +2197,65 @@ export class HighlightTools {
       this.highlightRenderer.invalidateHighlightCache();
     }
 
-    // Clear all per-view caches to force buffer rebuild during next renderHighlights call.
-    // This ensures each view's buffer is rebuilt with its own transparency (filtering state).
-    // We do NOT pre-build buffers here because we don't have per-view transparency info -
-    // the correct per-view transparency will be passed during renderHighlights.
-    this._lastUsedPositionsMap.clear();
-    this._lastPositionFingerprintMap.clear();
-    this._lastTransparencyFingerprintMap.clear();
-
-    // Also clear all view buffers to ensure they're rebuilt with correct transparency
-    // This prevents stale buffers from showing filtered-out cells
-    for (const vid of this.highlightRenderer._viewBuffers.keys()) {
-      const viewBuffer = this.highlightRenderer._viewBuffers.get(vid);
-      if (viewBuffer) {
-        viewBuffer.lodSignature = -999; // Force rebuild
-      }
+    if (
+      highlightData.length === 0 ||
+      (
+        this.highlightRenderer._highlightedIndicesCache !== null &&
+        this.highlightRenderer._highlightedIndicesCache.length === 0
+      )
+    ) {
+      // Empty publications retire hidden/focused-out pane buffers immediately;
+      // those panes may not receive another render frame for an arbitrary time.
+      this.highlightRenderer.publishEmptyViews();
     }
+    // Non-empty per-view buffers compare the renderer-owned highlight
+    // generation on their next render. No O(view-count) invalidation walk is
+    // required for the normal update path.
+  }
+
+  _getTransparencyGenerations() {
+    if (this._disposed === true) {
+      throw new Error(
+        'HighlightTools cannot access filtering generations after disposal.'
+      );
+    }
+    if (!(this._transparencyGenerations instanceof Map)) {
+      // Upgrade an already-live instance created before exact filtering
+      // generations were introduced. New instances publish this in the
+      // constructor.
+      this._transparencyGenerations = new Map();
+    }
+    return this._transparencyGenerations;
   }
 
   /**
    * Handle transparency changes for any view.
    *
-   * This clears the transparency fingerprint cache so the next renderHighlights call
-   * will rebuild buffers with the new filtering state for all views.
-   *
    * @param {string} viewId - Exact view whose transparency changed.
    */
   handleTransparencyChange(viewId) {
     const vid = requireHighlightViewId(viewId);
-    this._lastTransparencyFingerprintMap.delete(vid);
-    const viewBuffer = this.highlightRenderer._viewBuffers.get(vid);
-    if (viewBuffer) {
-      viewBuffer.lodSignature = -1;
+    const generations = this._getTransparencyGenerations();
+    const previous = generations.get(vid) ?? 0;
+    if (!Number.isSafeInteger(previous) || previous < 0) {
+      throw new Error(
+        `Highlight transparency generation is invalid for view "${vid}".`
+      );
     }
+    const next = previous + 1;
+    if (!Number.isSafeInteger(next)) {
+      throw new RangeError(
+        `Highlight transparency generations are exhausted for view "${vid}".`
+      );
+    }
+    generations.set(vid, next);
+    // KNN expansion retains visited/frontier sets across pointer movement.
+    // Filtering arrays are intentionally updated in place, so their reference
+    // cannot certify that a cached path is still traversable. This explicit
+    // publication boundary invalidates that cache exactly and avoids both
+    // stale paths and a sampled O(500) fingerprint on every drag step.
+    resetKnnCache();
+    return next;
   }
 
   _retireActiveSpatialInteractions(viewId = null) {
@@ -1637,41 +2367,8 @@ export class HighlightTools {
   clearViewState(viewId) {
     const vid = requireHighlightViewId(viewId);
     this._retireActiveSpatialInteractions(vid);
-    this._lastUsedPositionsMap.delete(vid);
-    this._lastPositionFingerprintMap.delete(vid);
-    this._lastTransparencyFingerprintMap.delete(vid);
+    this._getTransparencyGenerations().delete(vid);
     this.highlightRenderer.clearViewBuffer(vid);
-  }
-
-  /**
-   * Compute a quick fingerprint of positions array by sampling multiple positions.
-   * Samples at 5 positions (first, 25%, 50%, 75%, last) plus a sparse sum for better change detection.
-   * @param {Float32Array} positions - Positions array to fingerprint
-   * @returns {string|null} Fingerprint string or null if invalid
-   */
-  _computePositionFingerprint(positions) {
-    requireHighlightPositions(positions);
-    if (positions.length === 0) return 'empty';
-    const len = positions.length;
-    const numPoints = len / 3;
-
-    // Sample at 5 positions: start, 25%, 50%, 75%, end (aligned to XYZ triplets)
-    const q1Idx = Math.floor(numPoints * 0.25) * 3;
-    const midIdx = Math.floor(numPoints * 0.5) * 3;
-    const q3Idx = Math.floor(numPoints * 0.75) * 3;
-    const lastIdx = len - 3;
-
-    // Compute a sparse sum for additional change detection (every 100th point's X value)
-    let sparseSum = 0;
-    const step = Math.max(3, Math.floor(len / 300)) * 3;  // ~100 samples, aligned to triplets
-    for (let i = 0; i < len; i += step) {
-      sparseSum += positions[i];
-    }
-
-    return `${positions[0]},${positions[1]},${positions[2]},` +
-           `${positions[q1Idx]},${positions[midIdx]},${positions[q3Idx]},` +
-           `${positions[lastIdx]},${positions[lastIdx+1]},${positions[lastIdx+2]},` +
-           `${sparseSum.toFixed(2)},${len}`;
   }
 
   /**
@@ -1703,68 +2400,78 @@ export class HighlightTools {
       pointCount
     );
 
-    // LOD owns point inclusion; filtering is owned by this view's exact transparency.
-    const visibility = this.hpRenderer.getLodVisibilityArray(
-      vid,
-      exactDimensionLevel
-    );
-    const lodLevel = this.hpRenderer.getCurrentLODLevel(vid);
-    const visibilitySignature = lodLevel;
+    // Resolve the exact highlighted-index generation before any dataset-sized
+    // LOD owner. Empty highlights retire stale draw counts without allocating
+    // or even constructing the shared membership map.
+    this.highlightRenderer.updateHighlightCache(this.highlightArray);
+    if (this.highlightRenderer._highlightedIndicesCache.length === 0) {
+      this.highlightRenderer.publishEmptyView(vid);
+      return;
+    }
 
-    // Check if positions changed using per-view fingerprint (handles in-place mutations)
-    // Reference check is fast path; fingerprint catches in-place array mutations
-    const currentPositionFingerprint = this._computePositionFingerprint(positions);
-    const lastUsedPositions = this._lastUsedPositionsMap.get(vid);
-    const lastPositionFingerprint = this._lastPositionFingerprintMap.get(vid);
-    const positionsChanged = (
-      positions !== lastUsedPositions ||
-      currentPositionFingerprint !== lastPositionFingerprint
-    );
-
-    // Check if transparency/filtering changed using fingerprint
-    // This ensures highlights are rebuilt when filters change, hiding filtered-out cells
-    const currentTransparencyFingerprint =
-      this.highlightRenderer._computeTransparencyFingerprint(transparency);
-    const lastTransparencyFingerprint = this._lastTransparencyFingerprintMap.get(vid);
-    const transparencyChanged = currentTransparencyFingerprint !== lastTransparencyFingerprint;
-
-    if (this.highlightRenderer.needsRefresh(visibilitySignature, vid, positions) || positionsChanged || transparencyChanged) {
-      // Pass view-specific transparency so highlights respect per-view filtering
-      this.highlightRenderer.rebuildBuffer(
-        this.highlightArray,
-        positions,
-        visibility,
-        visibilitySignature,
+    const geometryGeneration =
+      this.hpRenderer.getViewGeometryGeneration(vid);
+    const lodMembership =
+      this.hpRenderer.getCurrentLodMembership(
         vid,
-        transparency
+        exactDimensionLevel
       );
-      this._lastUsedPositionsMap.set(vid, positions);
-      this._lastPositionFingerprintMap.set(vid, currentPositionFingerprint);
-      this._lastTransparencyFingerprintMap.set(vid, currentTransparencyFingerprint);
+    const transparencyGeneration =
+      this._getTransparencyGenerations().get(vid) ?? 0;
+
+    if (
+      this.highlightRenderer.needsRefresh(
+        lodMembership,
+        vid,
+        geometryGeneration,
+        exactDimensionLevel,
+        transparencyGeneration
+      )
+    ) {
+      try {
+        this.highlightRenderer.rebuildBuffer(
+          this.highlightArray,
+          positions,
+          lodMembership,
+          vid,
+          transparency,
+          geometryGeneration,
+          exactDimensionLevel,
+          transparencyGeneration
+        );
+      } catch (error) {
+        // Keep the last accepted per-view GPU generation drawable, but do not
+        // repeat an impossible allocation on every animation frame. Its GPU
+        // allocation remains reusable, while its stale draw count is revoked
+        // until an exact geometry/LOD/highlight/filter change enables one retry.
+        this.highlightRenderer.recordPublicationFailure(
+          lodMembership,
+          vid,
+          geometryGeneration,
+          exactDimensionLevel,
+          transparencyGeneration
+        );
+        throw error;
+      }
     }
   }
 
-  drawHighlights(drawParams) {
+  drawHighlights(drawParams, timeSeconds = null) {
     if (!drawParams || typeof drawParams !== 'object') {
       throw new TypeError('Highlight draw parameters are required.');
     }
-    const exactParams = {
-      mvpMatrix: drawParams.mvpMatrix,
-      viewMatrix: drawParams.viewMatrix,
-      modelMatrix: drawParams.modelMatrix,
-      projectionMatrix: drawParams.projectionMatrix,
-      viewportHeight: drawParams.viewportHeight,
-      pointSize: drawParams.pointSize,
-      sizeAttenuation: drawParams.sizeAttenuation,
-      fov: drawParams.fov,
-      fogDensity: drawParams.fogDensity,
-      fogColor: drawParams.fogColor,
-      lightingStrength: drawParams.lightingStrength,
-      lightDir: drawParams.lightDir,
-      viewId: drawParams.viewId,  // Pass viewId for per-view LOD size multiplier
-      dimensionLevel: drawParams.dimensionLevel  // Pass dimensionLevel for correct LOD buffer lookup
-    };
-    this.highlightRenderer.draw(exactParams);
+    const frameTimeSeconds = timeSeconds === null
+      ? performance.now() * 0.001
+      : requireFiniteHighlightNumber(
+          timeSeconds,
+          'HighlightTools frame timeSeconds'
+        );
+    // Viewer renderParams are stable per-view records. Forward the exact owner
+    // instead of allocating and copying a draw object for every pane and frame.
+    this.highlightRenderer.draw(
+      drawParams,
+      frameTimeSeconds
+    );
   }
 
   /**
@@ -2992,6 +3699,31 @@ export class HighlightTools {
   }
 
   /**
+   * Fence GPU handles first, then reuse ordinary DOM/CPU retirement.
+   */
+  handleContextLost() {
+    if (this._disposed) return false;
+    const failures = [];
+    try {
+      this.highlightRenderer?.handleContextLost();
+    } catch (error) {
+      failures.push(error);
+    }
+    try {
+      this.dispose();
+    } catch (error) {
+      failures.push(error);
+    }
+    if (failures.length > 0) {
+      throw new AggregateError(
+        failures,
+        'Highlight context-loss retirement was incomplete.'
+      );
+    }
+    return true;
+  }
+
+  /**
    * Release every DOM, callback, CPU, and GPU owner held by the highlight
    * interaction stack. Logical publications are detached before any fallible
    * external cleanup, while the private disposal record retains only failed
@@ -3081,9 +3813,7 @@ export class HighlightTools {
         this[callbackName] = null;
       }
 
-      this._lastUsedPositionsMap = null;
-      this._lastPositionFingerprintMap = null;
-      this._lastTransparencyFingerprintMap = null;
+      this._transparencyGenerations = null;
       this.gl = null;
       this.hpRenderer = null;
       this.mat4 = null;
@@ -3247,46 +3977,18 @@ export function buildKnnAdjacencyList(sources, destinations) {
 let knnDegreesCache = null;
 let knnMaxCachedDegree = -1;
 let knnCachedAlphasRef = null;  // Track alphas reference to invalidate cache on filter change
-let knnCachedAlphasFingerprint = null;  // Track alphas fingerprint to detect in-place mutations
-
-/**
- * Compute a quick fingerprint of alphas array by sampling values.
- * Detects in-place mutations that reference checks would miss.
- * Samples multiple positions and uses finer-grained zero counting for better detection.
- * @param {Uint8Array|Float32Array} alphas - Alpha/transparency values
- * @returns {string|null} Fingerprint string or null if invalid
- */
-function computeAlphasFingerprint(alphas) {
-  if (!alphas || alphas.length < 3) return null;
-  const len = alphas.length;
-  // Sample at 5 positions: start, 25%, 50%, 75%, end (better coverage)
-  const q1 = Math.floor(len * 0.25);
-  const mid = Math.floor(len * 0.5);
-  const q3 = Math.floor(len * 0.75);
-
-  let zeroCount = 0;
-  let sumSample = 0;
-  // Sample every 100th element for better zero detection and value sum
-  // This catches more filter state changes while remaining fast
-  const step = Math.max(1, Math.floor(len / 500));  // ~500 samples max
-  for (let i = 0; i < len; i += step) {
-    if (alphas[i] === 0) zeroCount++;
-    sumSample += alphas[i];
-  }
-  return `${alphas[0]},${alphas[q1]},${alphas[mid]},${alphas[q3]},${alphas[len-1]},${zeroCount},${sumSample},${len}`;
-}
 
 export function resetKnnCache() {
   knnDegreesCache = null;
   knnMaxCachedDegree = -1;
   knnCachedAlphasRef = null;
-  knnCachedAlphasFingerprint = null;
 }
 
 export function findKnnNeighborsUpToDegree(seedCell, maxDegree, adjacency, alphas) {
   // Note: highlightArray parameter removed - cells must be visible (not filtered out) to be selectable
   // Seed cell must be visible (not filtered out in this view)
-  const seedVisible = !alphas || alphas[seedCell] > 0;
+  const seedVisible =
+    !alphas || alphas[seedCell] >= POINT_VISIBILITY_THRESHOLD;
   if (!seedVisible) {
     return { allCells: new Set(), byDegree: new Map(), frontier: [] };
   }
@@ -3295,10 +3997,10 @@ export function findKnnNeighborsUpToDegree(seedCell, maxDegree, adjacency, alpha
     return { allCells: new Set([seedCell]), byDegree: new Map([[0, new Set([seedCell])]]), frontier: [seedCell] };
   }
 
-  // Check if cache is valid: same seed cell, same alphas (reference AND fingerprint), and can extend to requested degree
-  // Fingerprint check catches in-place mutations that reference checks would miss
-  const currentFingerprint = computeAlphasFingerprint(alphas);
-  const alphasMatches = alphas === knnCachedAlphasRef && currentFingerprint === knnCachedAlphasFingerprint;
+  // In-place transparency changes invalidate at the exact
+  // handleTransparencyChange() publication boundary. Reference identity still
+  // prevents a cache from crossing between independent view owners.
+  const alphasMatches = alphas === knnCachedAlphasRef;
 
   if (knnDegreesCache &&
       knnDegreesCache.seedCell === seedCell &&
@@ -3332,7 +4034,9 @@ export function findKnnNeighborsUpToDegree(seedCell, maxDegree, adjacency, alpha
           const neighbor = neighbors[j];
           if (visited.has(neighbor)) continue;
           // Neighbor is traversable only if visible (not filtered out in this view)
-          const neighborVisible = !alphas || alphas[neighbor] > 0;
+          const neighborVisible =
+            !alphas ||
+            alphas[neighbor] >= POINT_VISIBILITY_THRESHOLD;
           if (!neighborVisible) continue;
 
           visited.add(neighbor);
@@ -3367,7 +4071,6 @@ export function findKnnNeighborsUpToDegree(seedCell, maxDegree, adjacency, alpha
   };
   knnMaxCachedDegree = 0;
   knnCachedAlphasRef = alphas;  // Track which alphas array was used for this cache
-  knnCachedAlphasFingerprint = currentFingerprint;  // Track fingerprint to detect in-place mutations
 
   if (maxDegree === 0) {
     return { allCells: visited, byDegree, frontier: [seedCell] };
@@ -3389,7 +4092,9 @@ export function findKnnNeighborsUpToDegree(seedCell, maxDegree, adjacency, alpha
         const neighbor = neighbors[j];
         if (visited.has(neighbor)) continue;
         // Neighbor is traversable only if visible (not filtered out in this view)
-        const neighborVisible = !alphas || alphas[neighbor] > 0;
+        const neighborVisible =
+          !alphas ||
+          alphas[neighbor] >= POINT_VISIBILITY_THRESHOLD;
         if (!neighborVisible) continue;
 
         visited.add(neighbor);
@@ -3648,7 +4353,7 @@ export function findCellsInLasso({
     examinedPointCount++;
     // Cell is selectable only if visible (not filtered out in this view)
     // Filtered-out cells cannot be interacted with, even if highlighted in another view
-    if (!(alphas[i] >= HIGHLIGHT_VISIBILITY_THRESHOLD)) return;
+    if (!(alphas[i] >= POINT_VISIBILITY_THRESHOLD)) return;
 
     const px = positions[i * 3];
     const py = positions[i * 3 + 1];

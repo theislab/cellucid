@@ -301,6 +301,16 @@
   background: var(--color-border-light);
 }
 
+.legend-highlight-btn:disabled,
+.legend-highlight-btn:disabled:hover,
+.legend-highlight-btn:disabled:active {
+  background: var(--color-surface-secondary);
+  color: var(--color-text-secondary);
+  border-color: var(--color-border-default);
+  cursor: not-allowed;
+  opacity: var(--opacity-55);
+}
+
 .legend-highlight-btn--active {
   background: var(--color-accent);
   color: var(--color-text-inverse);

@@ -870,6 +870,17 @@ function createRenderFlowStateFixture() {
       blendSource = source;
       blendDestination = destination;
     },
+    blendFuncSeparate(
+      sourceRgb,
+      destinationRgb,
+      sourceAlpha,
+      destinationAlpha,
+    ) {
+      assert.equal(sourceAlpha, this.ONE);
+      assert.equal(destinationAlpha, this.ONE_MINUS_SRC_ALPHA);
+      blendSource = sourceRgb;
+      blendDestination = destinationRgb;
+    },
     blendEquation(value) {
       blendEquation = value;
     },

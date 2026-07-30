@@ -160,6 +160,34 @@ export class OverlayManager {
     }
   }
 
+  /**
+   * Notify every owned generation, including owners detached into the retry
+   * journal. A failed unregister must not make its invalid WebGL handles
+   * invisible to the terminal context-loss transition.
+   */
+  handleContextLost() {
+    const owned = new Set([
+      ...this._pendingRetirements,
+      ...this._overlays.values(),
+    ]);
+    const failures = [];
+    for (const overlay of owned) {
+      if (typeof overlay.handleContextLost !== 'function') continue;
+      try {
+        overlay.handleContextLost();
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    this.gl = null;
+    if (failures.length > 0) {
+      throw new AggregateError(
+        failures,
+        'OverlayManager context-loss cleanup was incomplete.'
+      );
+    }
+  }
+
   dispose() {
     const retiring = new Set([
       ...this._pendingRetirements,

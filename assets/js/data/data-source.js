@@ -5,6 +5,11 @@
  * to work with different data backends (local demo, user directory, remote server, Jupyter).
  */
 
+import {
+  getMetadataLoadSignal,
+  throwIfMetadataAborted,
+} from './metadata-load-contract.js';
+
 /**
  * @typedef {Object} DatasetStats
  * @property {number} n_cells - Number of cells/points
@@ -86,6 +91,7 @@ function requireCanonicalPathSegments(
       segment.length === 0 ||
       decoded === '.' ||
       decoded === '..' ||
+      decoded.includes('%') ||
       decoded.includes('/') ||
       decoded.includes('\\') ||
       /[\u0000-\u001f\u007f]/.test(decoded) ||
@@ -546,11 +552,18 @@ export async function urlExists(url) {
  * Fetch JSON data from a URL with error handling
  * @param {string} url - URL to fetch
  * @param {string} [sourceType] - Source type for error context
+ * @param {{signal?: AbortSignal|null}} [options] - Exact request owner
  * @returns {Promise<any>}
  */
-export async function fetchJson(url, sourceType) {
+export async function fetchJson(url, sourceType, options = {}) {
+  const signal = getMetadataLoadSignal(options, 'JSON loader');
   try {
-    const response = await fetchSampleArtifact(url);
+    throwIfMetadataAborted(signal, 'JSON loading');
+    const response = await fetchSampleArtifact(
+      url,
+      signal === null ? undefined : { signal }
+    );
+    throwIfMetadataAborted(signal, 'JSON loading');
     if (!response.ok) {
       if (response.status === 404) {
         throw new DataSourceError(
@@ -567,8 +580,11 @@ export async function fetchJson(url, sourceType) {
         { url, status: response.status }
       );
     }
-    return response.json();
+    const payload = await response.json();
+    throwIfMetadataAborted(signal, 'JSON loading');
+    return payload;
   } catch (err) {
+    throwIfMetadataAborted(signal, 'JSON loading');
     if (err instanceof DataSourceError) throw err;
     throw new DataSourceError(
       `Network error: ${err.message}`,
@@ -734,14 +750,44 @@ function requireIdentityPayloadPath(value, label, sourceType) {
     value !== value.trim() ||
     value.startsWith('/') ||
     value.includes('\\') ||
+    value.includes('?') ||
+    value.includes('#') ||
+    /[\u0000-\u001f\u007f]/.test(value) ||
     /^[A-Za-z]:/.test(value) ||
-    value.split('/').some(part => part === '' || part === '.' || part === '..')
+    value.split('/').some(part => part.length === 0)
   ) {
     throw invalidDatasetIdentity(
       `${label} must be a safe relative file path`,
       sourceType,
       { label, value }
     );
+  }
+  for (const part of value.split('/')) {
+    let decoded;
+    try {
+      decoded = decodeURIComponent(part);
+    } catch {
+      throw invalidDatasetIdentity(
+        `${label} must be a safe relative file path`,
+        sourceType,
+        { label, value }
+      );
+    }
+    if (
+      decoded === '.' ||
+      decoded === '..' ||
+      decoded.includes('%') ||
+      decoded.includes('/') ||
+      decoded.includes('\\') ||
+      /[\u0000-\u001f\u007f]/.test(decoded) ||
+      encodeURIComponent(decoded) !== part
+    ) {
+      throw invalidDatasetIdentity(
+        `${label} must be a safe relative file path`,
+        sourceType,
+        { label, value }
+      );
+    }
   }
 }
 
@@ -1215,17 +1261,33 @@ export function validateDatasetIdentity(
  * @param {string} baseUrl - Base URL of the dataset
  * @param {string} datasetId - Dataset identifier
  * @param {string} [sourceType] - Source type for context
+ * @param {{signal?: AbortSignal|null}} [options] - Exact request owner
  * @returns {Promise<DatasetMetadata>}
  */
-export async function loadDatasetMetadata(baseUrl, datasetId, sourceType) {
+export async function loadDatasetMetadata(
+  baseUrl,
+  datasetId,
+  sourceType,
+  options = {}
+) {
+  const signal = getMetadataLoadSignal(
+    options,
+    'Dataset metadata loader'
+  );
   // Try to load dataset_identity.json first
   const identityUrl = resolveUrl(baseUrl, DATA_CONFIG.DATASET_IDENTITY_FILE);
 
   try {
-    const identity = await fetchJson(identityUrl, sourceType);
+    const identity = await fetchJson(
+      identityUrl,
+      sourceType,
+      { signal }
+    );
+    throwIfMetadataAborted(signal, 'Dataset metadata loading');
     validateDatasetIdentity(identity, datasetId, sourceType);
     return { ...identity, id: datasetId };
   } catch (err) {
+    throwIfMetadataAborted(signal, 'Dataset metadata loading');
     if (err instanceof DataSourceError && err.code === DataSourceErrorCode.NOT_FOUND) {
       throw new DataSourceError(
         'Missing required dataset_identity.json',

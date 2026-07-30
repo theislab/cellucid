@@ -231,6 +231,58 @@ test('marker discovery keeps cooperative cancellation out of the shared worker p
   }
 });
 
+test('marker discovery preserves every prototype-named group id as an ordinary own result', async () => {
+  const prototypeNames = Object.getOwnPropertyNames(Object.prototype);
+  const prototypeDescriptors = Object.getOwnPropertyDescriptors(
+    Object.prototype,
+  );
+
+  await withPatchedWorkerPool(
+    readyPoolOverrides({
+      async broadcast() {
+        return [true];
+      },
+      async execute() {
+        return createWorkerMarkerResult();
+      },
+    }),
+    async () => {
+      for (const [index, groupId] of prototypeNames.entries()) {
+        const { engine, options } = createDiscoveryFixture({
+          contextCode: index * 2,
+          gene: `PROTO_GROUP_GENE_${index}`,
+        });
+        options.groups[0].groupId = groupId;
+
+        const result = await engine.discoverMarkers(options);
+        assert.equal(
+          Object.getPrototypeOf(result.groups),
+          Object.prototype,
+          groupId,
+        );
+        assert.equal(Object.hasOwn(result.groups, groupId), true, groupId);
+        assert.deepEqual(
+          Object.getOwnPropertyDescriptor(result.groups, groupId),
+          {
+            configurable: true,
+            enumerable: true,
+            value: result.groups[groupId],
+            writable: true,
+          },
+          groupId,
+        );
+        assert.equal(result.groups[groupId].groupId, groupId);
+        assert.equal(result.groups[groupId].markers[0].groupId, groupId);
+      }
+    },
+  );
+
+  assert.deepEqual(
+    Object.getOwnPropertyDescriptors(Object.prototype),
+    prototypeDescriptors,
+  );
+});
+
 test('marker abort drains a running worker task without publishing stale results or poisoning the pool', async () => {
   const { engine, options } = createDiscoveryFixture();
   const taskStarted = deferred();

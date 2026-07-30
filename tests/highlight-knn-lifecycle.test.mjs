@@ -129,7 +129,12 @@ test('viewer edge teardown releases every dataset-owned GPU edge state', async (
   assert.match(clearSource, /nCellsV2 = 0/);
   assert.match(clearSource, /hasEdgeDataV2 = false/);
   assert.match(clearSource, /useInstancedEdges = false/);
-  assert.match(clearSource, /edgeLodLimit = 0/);
+  assert.match(clearSource, /edgeSourcesV2 = null/);
+  assert.match(clearSource, /edgeDestinationsV2 = null/);
+  assert.match(clearSource, /edgePrefixOwnersV2\.clear\(\)/);
+  assert.match(clearSource, /edgePrefixCheckpointStaging = null/);
+  assert.match(clearSource, /edgeAllVisiblePrefixOwner = null/);
+  assert.match(clearSource, /edgeVisibleTarget = 0/);
   assert.match(
     clearSource,
     /for \(const texture of retiringTextures\) \{\s*queueEdgeTextureRetirement\(texture\)/

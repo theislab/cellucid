@@ -52,17 +52,36 @@ import { forEachProjectedPoint } from '../utils/point-projector.js';
 	import { renderSvgLegend } from '../components/legend-builder.js';
 	import { renderSvgOrientationIndicator } from '../components/orientation-indicator.js';
 	import { renderSvgCentroidOverlay } from '../components/centroid-overlay.js';
-	import { computeVisibleRealBounds } from '../utils/coordinate-mapper.js';
+	import {
+	  computeVisibleCameraBounds,
+	  computeVisibleRealBounds,
+	} from '../utils/coordinate-mapper.js';
 	import { assertCropRect01, cropRect01ToPx } from '../utils/crop.js';
 	import { reducePointsByDensity } from '../utils/density-reducer.js';
-	import { blobToDataUrl } from '../utils/export-helpers.js';
+	import {
+	  blobToDataUrl,
+	  canvasToBlob,
+	} from '../utils/export-helpers.js';
 	import { hashStringToSeed } from '../utils/hash.js';
-import { rasterizePointsWebgl } from '../utils/webgl-point-rasterizer.js';
-import { getEffectivePointDiameterPx, getLodVisibilityMask } from '../utils/point-size.js';
+import {
+  rasterizePointsWebgl,
+  releaseWebglRasterCanvas,
+} from '../utils/webgl-point-rasterizer.js';
+import {
+  MIN_VISIBLE_ALPHA_BYTE,
+  POINT_VISIBILITY_THRESHOLD,
+} from '../utils/lod-membership.js';
 import { hexToRgb01, rgb01ToHex } from '../utils/color-utils.js';
 	import { computeLetterboxedRect } from '../utils/letterbox.js';
 import { assertCameraState } from '../../../../../rendering/camera-state-contract.js';
-import { assertFigureExportPayload } from '../figure-export-contract.js';
+import {
+  assertFigureExportPayload,
+  throwIfFigureExportAborted,
+} from '../figure-export-contract.js';
+import { clamp } from '../../../../utils/number-utils.js';
+import {
+  areLegendModelsSemanticallyEqual,
+} from '../utils/legend-model-equality.js';
 
 function applyExportBackgroundToRenderState(renderState, background, backgroundColor) {
   if (background === 'viewer' || background === 'transparent') return renderState;
@@ -82,84 +101,61 @@ function applyExportBackgroundToRenderState(renderState, background, backgroundC
 const DEFAULT_HIGHLIGHT_RGB = { r: 102, g: 217, b: 255 }; // ~[0.4, 0.85, 1.0]
 const DEFAULT_HIGHLIGHT_SCALE = 1.75;
 
-function highlightValueToAlpha01(value) {
-  const v = Number(value);
-  if (!Number.isFinite(v) || v <= 0) return 0;
-  if (v <= 1.0) return Math.max(0, Math.min(1, v));
-  return Math.max(0, Math.min(1, v / 255));
+function computeGridPaneLayout({
+  cellX,
+  cellY,
+  cellWidth,
+  cellHeight,
+  includeAxes,
+  fontSize,
+}) {
+  const padding = clamp(Math.round(fontSize * 0.65), 6, 12);
+  const innerWidth = Math.max(1, cellWidth - padding * 2);
+  const innerHeight = Math.max(1, cellHeight - padding * 2);
+  const headerHeight = Math.min(
+    Math.max(18, Math.round(fontSize * 1.5)),
+    Math.max(0, innerHeight - 1)
+  );
+  const plotAreaHeight = Math.max(1, innerHeight - headerHeight);
+  const minPlotWidth = Math.min(80, Math.max(1, innerWidth * 0.45));
+  const minPlotHeight = Math.min(64, Math.max(1, plotAreaHeight * 0.45));
+  const axisRight = includeAxes
+    ? Math.min(10, Math.max(0, innerWidth - minPlotWidth))
+    : 0;
+  const axisLeft = includeAxes
+    ? Math.min(62, Math.max(0, innerWidth - axisRight - minPlotWidth))
+    : 0;
+  const axisBottom = includeAxes
+    ? Math.min(62, Math.max(0, plotAreaHeight - minPlotHeight))
+    : 0;
+  const plotRect = {
+    x: cellX + padding + axisLeft,
+    y: cellY + padding + headerHeight,
+    width: Math.max(1, innerWidth - axisLeft - axisRight),
+    height: Math.max(1, plotAreaHeight - axisBottom),
+  };
+
+  return {
+    labelX: plotRect.x,
+    labelY: cellY + padding + Math.min(fontSize, Math.max(1, headerHeight)),
+    panelRect: {
+      x: cellX + 1,
+      y: cellY + 1,
+      width: Math.max(1, cellWidth - 2),
+      height: Math.max(1, cellHeight - 2),
+    },
+    plotRect,
+  };
 }
 
-	function computeVisibleCameraBounds({
-	  positions,
-	  transparency = null,
-	  visibilityMask = null,
-	  mvpMatrix,
-	  viewMatrix,
-	  viewportWidth = 1,
-	  viewportHeight = 1,
-	  crop = null,
-	}) {
-	  if (!positions || !mvpMatrix || !viewMatrix) return null;
-
-	  const n = Math.floor(positions.length / 3);
-	  const m = mvpMatrix;
-	  const v = viewMatrix;
-	  const vw = Math.max(1, Number(viewportWidth) || 1);
-	  const vh = Math.max(1, Number(viewportHeight) || 1);
-	  const crop01 = assertCropRect01(crop);
-	  const cropPx = cropRect01ToPx(crop01, vw, vh);
-	  const hasCrop = Boolean(
-	    cropPx &&
-	      (cropPx.width < vw - 0.5 || cropPx.height < vh - 0.5 || cropPx.x > 0.5 || cropPx.y > 0.5)
-	  );
-
-	  let minX = Infinity;
-	  let maxX = -Infinity;
-	  let minY = Infinity;
-	  let maxY = -Infinity;
-	  let any = false;
-
-	  for (let i = 0; i < n; i++) {
-	    if (visibilityMask && (visibilityMask[i] ?? 0) <= 0) continue;
-	    const rawAlpha = transparency ? (transparency[i] ?? 1.0) : 1.0;
-	    let alpha = Number.isFinite(rawAlpha) ? rawAlpha : 1.0;
-	    if (alpha < 0) alpha = 0;
-	    else if (alpha > 1) alpha = 1;
-	    if (alpha < 0.01) continue;
-
-	    const ix = i * 3;
-	    const x = positions[ix];
-	    const y = positions[ix + 1];
-	    const z = positions[ix + 2];
-
-	    const clipX = m[0] * x + m[4] * y + m[8] * z + m[12];
-	    const clipY = m[1] * x + m[5] * y + m[9] * z + m[13];
-	    const clipW = m[3] * x + m[7] * y + m[11] * z + m[15];
-	    if (!Number.isFinite(clipW) || clipW <= 0) continue;
-
-	    const ndcX = clipX / clipW;
-	    const ndcY = clipY / clipW;
-	    if (ndcX < -1 || ndcX > 1 || ndcY < -1 || ndcY > 1) continue;
-
-	    if (hasCrop && cropPx) {
-	      const vx = (ndcX * 0.5 + 0.5) * vw;
-	      const vy = (-ndcY * 0.5 + 0.5) * vh;
-	      if (vx < cropPx.x || vx > cropPx.x + cropPx.width || vy < cropPx.y || vy > cropPx.y + cropPx.height) continue;
-	    }
-
-	    const camX = v[0] * x + v[4] * y + v[8] * z + v[12];
-	    const camY = v[1] * x + v[5] * y + v[9] * z + v[13];
-	    if (!Number.isFinite(camX) || !Number.isFinite(camY)) continue;
-	    if (camX < minX) minX = camX;
-	    if (camX > maxX) maxX = camX;
-	    if (camY < minY) minY = camY;
-	    if (camY > maxY) maxY = camY;
-	    any = true;
-	  }
-
-	  if (!any) return null;
-	  return { minX, maxX, minY, maxY };
-	}
+function highlightValueToAlpha01(value) {
+  if (!Number.isInteger(value) || value < 0 || value > 255) {
+    throw new RangeError(
+      'SVG highlight values must be exact Uint8 intensities.'
+    );
+  }
+  return value < MIN_VISIBLE_ALPHA_BYTE ? 0 : value / 255;
+}
 
 	function buildSvgMetadata(meta, payload) {
 	  const dataset = meta?.datasetName || meta?.datasetId || '';
@@ -258,7 +254,7 @@ async function rasterizePointsToDataUrl({
   positions,
   colors,
   transparency,
-  visibilityMask = null,
+  lodMembership = null,
   renderState,
   plotRect,
   radiusPx,
@@ -268,8 +264,10 @@ async function rasterizePointsToDataUrl({
   crop = null,
   overlayPositions = null,
   overlayColors = null,
-  overlayPointDiameterViewportPx = null
+  overlayPointDiameterViewportPx = null,
+  signal = null
 }) {
+  throwIfFigureExportAborted(signal);
   if (!positions || !colors) {
     throw new TypeError('SVG Hybrid export requires positions and colors');
   }
@@ -325,7 +323,7 @@ async function rasterizePointsToDataUrl({
     positions,
     colors,
     transparency,
-    visibilityMask,
+    lodMembership,
     renderState,
     outputWidthPx: pxW,
     outputHeightPx: pxH,
@@ -342,47 +340,41 @@ async function rasterizePointsToDataUrl({
     selectionMutedOpacity
   });
 
-  if (!crop01) {
-    const blob = await new Promise((resolve, reject) => {
-      webglCanvas.toBlob(
-        (encoded) => (
-          encoded
-            ? resolve(encoded)
-            : reject(new Error('SVG Hybrid point-pass PNG encoding failed'))
-        ),
-        'image/png'
-      );
-    });
-    return blobToDataUrl(blob);
-  }
+  try {
+    if (!crop01) {
+      const blob = await canvasToBlob(webglCanvas, 'image/png', {
+        signal,
+        failureMessage: 'SVG Hybrid point-pass PNG encoding failed',
+      });
+      throwIfFigureExportAborted(signal);
+      return blobToDataUrl(blob, { signal });
+    }
 
-  if (typeof document === 'undefined') {
-    throw new Error('SVG Hybrid crop encoding requires an HTML document');
+    if (typeof document === 'undefined') {
+      throw new Error('SVG Hybrid crop encoding requires an HTML document');
+    }
+    const canvas = document.createElement('canvas');
+    canvas.width = pxW;
+    canvas.height = pxH;
+    const ctx = canvas.getContext('2d', { alpha: true });
+    if (!ctx) {
+      throw new Error('SVG Hybrid crop encoding requires a Canvas 2D context');
+    }
+    const vp = computeLetterboxedRect({ srcWidth: srcViewportW, srcHeight: srcViewportH, dstWidth: pxW, dstHeight: pxH });
+    const sx = vp.x + crop01.x * vp.width;
+    const sy = vp.y + crop01.y * vp.height;
+    const sw = crop01.width * vp.width;
+    const sh = crop01.height * vp.height;
+    ctx.drawImage(webglCanvas, sx, sy, sw, sh, 0, 0, pxW, pxH);
+    const blob = await canvasToBlob(canvas, 'image/png', {
+      signal,
+      failureMessage: 'SVG Hybrid cropped point-pass PNG encoding failed',
+    });
+    throwIfFigureExportAborted(signal);
+    return blobToDataUrl(blob, { signal });
+  } finally {
+    releaseWebglRasterCanvas(webglCanvas);
   }
-  const canvas = document.createElement('canvas');
-  canvas.width = pxW;
-  canvas.height = pxH;
-  const ctx = canvas.getContext('2d', { alpha: true });
-  if (!ctx) {
-    throw new Error('SVG Hybrid crop encoding requires a Canvas 2D context');
-  }
-  const vp = computeLetterboxedRect({ srcWidth: srcViewportW, srcHeight: srcViewportH, dstWidth: pxW, dstHeight: pxH });
-  const sx = vp.x + crop01.x * vp.width;
-  const sy = vp.y + crop01.y * vp.height;
-  const sw = crop01.width * vp.width;
-  const sh = crop01.height * vp.height;
-  ctx.drawImage(webglCanvas, sx, sy, sw, sh, 0, 0, pxW, pxH);
-  const blob = await new Promise((resolve, reject) => {
-    canvas.toBlob(
-      (encoded) => (
-        encoded
-          ? resolve(encoded)
-          : reject(new Error('SVG Hybrid cropped point-pass PNG encoding failed'))
-      ),
-      'image/png'
-    );
-  });
-  return blobToDataUrl(blob);
 }
 
 /**
@@ -393,12 +385,12 @@ async function rasterizePointsToDataUrl({
  * legend, axes, and title without shrinking the plot area.
  *
  * @param {object} options
- * @param {import('../../../state/core/data-state.js').DataState} options.state
- * @param {object} options.viewer
  * @param {any} options.payload
+ * @param {AbortSignal|null} [options.signal]
  * @returns {Promise<Blob>}
  */
-export async function renderFigureToSvgBlob({ state, viewer, payload }) {
+export async function renderFigureToSvgBlob({ payload, signal = null }) {
+  throwIfFigureExportAborted(signal);
   assertFigureExportPayload(payload);
   if (payload.format !== 'svg') {
     throw new TypeError('SVG renderer requires payload.format exactly "svg".');
@@ -433,22 +425,12 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
   const centroidLabelFontSize = opts.centroidLabelFontSizePx;
   // Point size comes from the interactive viewer (WYSIWYG).
   const selectionMutedOpacity = opts.selectionMutedOpacity;
-  if (
-    typeof state.getTotalHighlightedCellCount !== 'function' ||
-    typeof state.getHighlightedCellCount !== 'function' ||
-    typeof state.getFieldForView !== 'function' ||
-    typeof state.getLegendModel !== 'function' ||
-    typeof state.getViewDimensionLevel !== 'function' ||
-    typeof state.dimensionManager?.getNormTransform !== 'function'
-  ) {
-    throw new TypeError('SVG export state is missing its exact current export methods.');
-  }
-  const totalHighlighted = state.getTotalHighlightedCellCount();
+  const totalHighlighted = payload.selection.totalCount;
   const emphasizeSelection = opts.emphasizeSelection && totalHighlighted > 0;
   const highlightCount = emphasizeSelection
-    ? state.getHighlightedCellCount()
+    ? payload.selection.visibleCount
     : totalHighlighted;
-  const highlightArray = totalHighlighted > 0 ? state.highlightArray : null;
+  const highlightArray = payload.selection.highlightArray;
 
   const viewerBgHex = rgb01ToHex(views[0].renderState.bgColor);
   if (viewerBgHex === null) {
@@ -462,11 +444,14 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
   const singleView = views.length === 1;
   const singleViewId = singleView ? views[0].id : null;
 
-  const singleLegendField = singleView && includeLegend
-    ? state.getFieldForView(singleViewId)
+  const singleScientificState = singleView
+    ? views[0].scientificState
     : null;
-  const singleLegendModel = singleView && singleLegendField
-    ? state.getLegendModel(singleLegendField)
+  const singleLegendFieldKey = singleView && includeLegend
+    ? singleScientificState.fieldKey
+    : null;
+  const singleLegendModel = singleView && includeLegend
+    ? singleScientificState.legendModel
     : null;
 
   // For single view, compute layout first to get the expanded total dimensions
@@ -485,7 +470,7 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
       `SVG camera state for "${singleViewId}"`
     );
     singleNavMode = singleCameraState.navigationMode;
-    singleDim = state.getViewDimensionLevel(singleViewId);
+    singleDim = singleScientificState.dimensionLevel;
     singleAxesEligible = includeAxes;
 
     singleLayout = computeSingleViewLayout({
@@ -535,8 +520,9 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
     const axesEligible = singleAxesEligible;
     const shouldDepthSort = depthSort3d && dim > 2 && navMode !== 'planar';
 
-    const visibilityMask = getLodVisibilityMask({ viewer, viewId, dimensionLevel: dim });
-    const pointDiameterViewportPx = getEffectivePointDiameterPx({ viewer, renderState, viewId, dimensionLevel: dim });
+    const lodMembership = view.scientificState.lodMembership;
+    const pointDiameterViewportPx =
+      renderState.pointSize * view.scientificState.lodSizeMultiplier;
     const pointRadiusViewportPx = pointDiameterViewportPx / 2;
 
     const layout = singleLayout || computeSingleViewLayout({
@@ -561,12 +547,38 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
     const plotRect = layout.plotRect;
     const clipId = `clip_single`;
     parts.push(`<defs><clipPath id="${clipId}"><rect x="${plotRect.x}" y="${plotRect.y}" width="${plotRect.width}" height="${plotRect.height}"/></clipPath></defs>`);
+    const useCameraAxes =
+      dim > 2 &&
+      navMode !== 'planar' &&
+      Boolean(renderState.viewMatrix);
+    const visibleBounds = useCameraAxes
+      ? computeVisibleCameraBounds({
+        positions,
+        transparency,
+        lodMembership,
+        mvpMatrix: renderState.mvpMatrix,
+        viewMatrix: renderState.viewMatrix,
+        viewportWidth: renderState.viewportWidth,
+        viewportHeight: renderState.viewportHeight,
+        crop,
+      })
+      : computeVisibleRealBounds({
+        positions,
+        transparency,
+        lodMembership,
+        mvpMatrix: renderState.mvpMatrix,
+        viewportWidth: renderState.viewportWidth,
+        viewportHeight: renderState.viewportHeight,
+        crop,
+        normTransform: view.scientificState.normTransform,
+      });
+    const hasVisibleCells = visibleBounds !== null;
 
     // Legend (may contribute defs for gradients).
     if (includeLegend && layout.legendRect) {
       const legend = renderSvgLegend({
         legendRect: layout.legendRect,
-        fieldKey: singleLegendField?.key || null,
+        fieldKey: singleLegendFieldKey,
         model: singleLegendModel,
         fontFamily,
         fontSize: legendFontSize,
@@ -581,35 +593,6 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
     const plotFill = background === 'transparent' ? 'none' : escapeHtml(backgroundColor);
     parts.push(`<rect x="${plotRect.x}" y="${plotRect.y}" width="${plotRect.width}" height="${plotRect.height}" fill="${plotFill}" stroke="#e5e7eb" stroke-width="1"/>`);
 
-    if (showOrientation && renderState?.viewMatrix && dim > 2 && navMode !== 'planar') {
-      const orientationFontSize = clamp(Math.round(baseFontSize * 0.9), 11, 22);
-      parts.push(renderSvgOrientationIndicator({
-        plotRect,
-        viewMatrix: renderState.viewMatrix,
-        cameraState,
-        fontFamily,
-        fontSize: orientationFontSize
-      }));
-    }
-
-    if (emphasizeSelection && highlightCount > 0) {
-      const label = `n = ${highlightCount.toLocaleString()} selected`;
-      const boxPad = 6;
-      const boxH = Math.max(16, Math.round(baseFontSize * 1.35));
-      const boxW = Math.min(
-        Math.max(1, plotRect.width - 16),
-        Math.max(90, Math.round(label.length * (baseFontSize * 0.62) + boxPad * 2))
-      );
-      const boxX = plotRect.x + 8;
-      const boxY = plotRect.y + 8;
-      parts.push(
-        `<g font-family="${escapeHtml(fontFamily)}" font-size="${baseFontSize}" fill="#111">` +
-        `<rect x="${boxX}" y="${boxY}" width="${boxW}" height="${boxH}" rx="4" fill="#ffffff" fill-opacity="0.85" stroke="#e5e7eb" stroke-width="1"/>` +
-        `<text x="${boxX + boxPad}" y="${boxY + boxH - boxPad}" stroke="none">${escapeHtml(label)}</text>` +
-        `</g>`
-      );
-    }
-
     // Points + centroid overlay (WYSIWYG).
     parts.push(`<g clip-path="url(#${clipId})">`);
 
@@ -623,6 +606,11 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
     const includeCentroidLabels = typeof opts.includeCentroidLabels === 'boolean'
       ? opts.includeCentroidLabels
       : Boolean(centroidFlags?.labels);
+    const hasCentroidPoints =
+      centroidPositions instanceof Float32Array &&
+      centroidPositions.length > 0 &&
+      centroidColors instanceof Uint8Array &&
+      centroidColors.length === (centroidPositions.length / 3) * 4;
 
     const crop01 = assertCropRect01(crop);
     const srcViewportW = Math.max(1, renderState?.viewportWidth || 1);
@@ -644,7 +632,7 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
         positions,
         colors,
         transparency,
-        visibilityMask,
+        lodMembership,
         renderState: renderStateForPoints,
         plotRect,
         radiusPx: pointRadiusViewportPx,
@@ -652,11 +640,13 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
         emphasizeSelection,
         selectionMutedOpacity,
         crop,
-        overlayPositions: includeCentroidPoints ? centroidPositions : null,
-        overlayColors: includeCentroidPoints ? centroidColors : null,
-        overlayPointDiameterViewportPx: includeCentroidPoints ? centroidDiameterViewportPx : null,
+        overlayPositions: includeCentroidPoints && hasCentroidPoints ? centroidPositions : null,
+        overlayColors: includeCentroidPoints && hasCentroidPoints ? centroidColors : null,
+        overlayPointDiameterViewportPx: includeCentroidPoints && hasCentroidPoints ? centroidDiameterViewportPx : null,
+        signal,
       });
-      centroidPointsRasterized = includeCentroidPoints && Boolean(centroidPositions) && Boolean(centroidColors);
+      throwIfFigureExportAborted(signal);
+      centroidPointsRasterized = includeCentroidPoints && hasCentroidPoints;
       parts.push(
         `<image x="${plotRect.x}" y="${plotRect.y}" width="${plotRect.width}" height="${plotRect.height}" href="${dataUrl}" preserveAspectRatio="none"/>`
       );
@@ -666,7 +656,8 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
         positions,
         colors,
         transparency,
-        visibilityMask,
+        lodMembership,
+        highlightArray,
         renderState,
         targetCount: opts.optimizedTargetCount,
         seed,
@@ -690,13 +681,17 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
         let r = reduced.rgba[j];
         let g = reduced.rgba[j + 1];
         let b = reduced.rgba[j + 2];
-        if (emphasizeSelection && highlightArray && (highlightArray[srcIndex] ?? 0) <= 0) {
+        if (
+          emphasizeSelection &&
+          highlightArray &&
+          (highlightArray[srcIndex] ?? 0) < MIN_VISIBLE_ALPHA_BYTE
+        ) {
           r = 160;
           g = 160;
           b = 160;
           a *= selectionMutedOpacity;
         }
-        if (a < 0.01) continue;
+        if (a < POINT_VISIBILITY_THRESHOLD) continue;
         if (a >= 0.999) {
           parts.push(`<circle cx="${x.toFixed(2)}" cy="${y.toFixed(2)}" r="${pointRadiusPx.toFixed(2)}" fill="rgb(${r},${g},${b})"/>`);
         } else {
@@ -721,7 +716,7 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
         positions,
         colors,
         transparency,
-        visibilityMask,
+        lodMembership,
         renderState,
         plotRect,
         radiusPx: radiusPlot,
@@ -732,13 +727,17 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
           let gg = g;
           let bb = b;
           let aa = a;
-          if (emphasizeSelection && highlightArray && (highlightArray[index] ?? 0) <= 0) {
+          if (
+            emphasizeSelection &&
+            highlightArray &&
+            (highlightArray[index] ?? 0) < MIN_VISIBLE_ALPHA_BYTE
+          ) {
             rr = 160;
             gg = 160;
             bb = 160;
             aa = aa * selectionMutedOpacity;
           }
-          if (aa < 0.01) return;
+          if (aa < POINT_VISIBILITY_THRESHOLD) return;
           if (aa >= 0.999) {
             parts.push(`<circle cx="${x.toFixed(2)}" cy="${y.toFixed(2)}" r="${radius.toFixed(2)}" fill="rgb(${rr},${gg},${bb})"/>`);
           } else {
@@ -781,38 +780,42 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
 
     parts.push(`</g>`);
 
-    // Axes (2D uses embedding coordinates; 3D uses camera-space coordinates).
-    if (axesEligible && renderState) {
-      const useCameraAxes = dim > 2 && navMode !== 'planar' && renderState?.viewMatrix;
-      const bounds = (
-        useCameraAxes
-          ? computeVisibleCameraBounds({
-            positions,
-            transparency,
-            visibilityMask,
-            mvpMatrix: renderState.mvpMatrix,
-            viewMatrix: renderState.viewMatrix,
-            viewportWidth: renderState.viewportWidth,
-            viewportHeight: renderState.viewportHeight,
-            crop,
-          })
-          : computeVisibleRealBounds({
-            positions,
-            transparency,
-            visibilityMask,
-            mvpMatrix: renderState.mvpMatrix,
-            viewportWidth: renderState.viewportWidth,
-            viewportHeight: renderState.viewportHeight,
-            crop,
-            normTransform: state.dimensionManager.getNormTransform(dim)
-          })
+    // Plot annotations are overlays: emit them after the point/centroid pass so
+    // dense point clouds cannot obscure orientation or selection state.
+    if (showOrientation && renderState.viewMatrix && dim > 2 && navMode !== 'planar') {
+      const orientationFontSize = clamp(Math.round(baseFontSize * 0.9), 11, 22);
+      parts.push(renderSvgOrientationIndicator({
+        plotRect,
+        viewMatrix: renderState.viewMatrix,
+        cameraState,
+        fontFamily,
+        fontSize: orientationFontSize
+      }));
+    }
+
+    if (emphasizeSelection && highlightCount > 0) {
+      const label = `n = ${highlightCount.toLocaleString()} selected`;
+      const boxPad = 6;
+      const boxH = Math.max(16, Math.round(baseFontSize * 1.35));
+      const boxW = Math.min(
+        Math.max(1, plotRect.width - 16),
+        Math.max(90, Math.round(label.length * (baseFontSize * 0.62) + boxPad * 2))
       );
-      if (bounds === null) {
-        throw new Error('SVG axes require at least one visible point.');
-      }
+      const boxX = plotRect.x + 8;
+      const boxY = plotRect.y + 8;
+      parts.push(
+        `<g font-family="${escapeHtml(fontFamily)}" font-size="${baseFontSize}" fill="#111">` +
+        `<rect x="${boxX}" y="${boxY}" width="${boxW}" height="${boxH}" rx="4" fill="#ffffff" fill-opacity="0.85" stroke="#e5e7eb" stroke-width="1"/>` +
+        `<text x="${boxX + boxPad}" y="${boxY + boxH - boxPad}" stroke="none">${escapeHtml(label)}</text>` +
+        `</g>`
+      );
+    }
+
+    // Axes (2D uses embedding coordinates; 3D uses camera-space coordinates).
+    if (axesEligible && visibleBounds !== null) {
       parts.push(renderSvgAxes({
         plotRect,
-        bounds,
+        bounds: visibleBounds,
         xLabel: opts.xLabel,
         yLabel: opts.yLabel,
         fontFamily,
@@ -820,6 +823,15 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
         labelFontSize: axisLabelFontSize,
         color: '#111'
       }));
+    }
+    if (!hasVisibleCells) {
+      parts.push(
+        `<g clip-path="url(#${clipId})">` +
+        `<text x="${plotRect.x + plotRect.width / 2}" y="${plotRect.y + plotRect.height / 2}" ` +
+        `text-anchor="middle" dominant-baseline="middle" font-family="${escapeHtml(fontFamily)}" ` +
+        `font-size="${baseFontSize}" fill="#6b7280">No visible cells</text>` +
+        `</g>`
+      );
     }
   } else {
     const outerPadding = 20;
@@ -830,7 +842,6 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
     const contentH = Math.max(1, svgHeight - outerPadding * 2 - titleHeight);
     const { cols, rows } = computeGridDims(views.length || 1);
     const gap = 16;
-    const cellPadding = 10;
 
     if (title) {
       const titleSize = Math.max(14, titleFontSize);
@@ -841,30 +852,63 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
     }
 
     // Shared legend only if all panels use the same active field.
-    let sharedField = null;
+    let sharedLegendModel = null;
     let sharedFieldKey = null;
-    if (includeLegend && typeof state.getFieldForView === 'function') {
+    if (includeLegend) {
       for (const v of views) {
-        const f = state.getFieldForView(String(v?.id || 'live'));
-        if (!f) {
+        const scientificState = v.scientificState;
+        const fieldKey = scientificState.fieldKey;
+        if (fieldKey === null || scientificState.legendModel === null) {
           sharedFieldKey = null;
-          sharedField = null;
+          sharedLegendModel = null;
           break;
         }
         if (sharedFieldKey == null) {
-          sharedFieldKey = f.key || null;
-          sharedField = f;
-        } else if (sharedFieldKey !== (f.key || null)) {
+          sharedFieldKey = fieldKey;
+          sharedLegendModel = scientificState.legendModel;
+        } else if (
+          sharedFieldKey !== fieldKey ||
+          !areLegendModelsSemanticallyEqual(
+            sharedLegendModel,
+            scientificState.legendModel
+          )
+        ) {
           sharedFieldKey = null;
-          sharedField = null;
+          sharedLegendModel = null;
           break;
         }
       }
     }
 
-    const wantsSharedLegend = includeLegend && Boolean(sharedFieldKey) && sharedField;
-    const legendW = wantsSharedLegend && legendPosition === 'right' ? 240 : 0;
-    const legendH = wantsSharedLegend && legendPosition === 'bottom' ? 140 : 0;
+    const wantsSharedLegend =
+      includeLegend &&
+      sharedFieldKey !== null &&
+      sharedLegendModel !== null;
+    const minimumGridWidth = Math.min(
+      contentW,
+      cols * (includeAxes ? 150 : 96)
+    );
+    const minimumGridHeight = Math.min(
+      contentH,
+      rows * (includeAxes ? 150 : 96)
+    );
+    const availableRightLegendWidth =
+      contentW - gap - minimumGridWidth;
+    const availableBottomLegendHeight =
+      contentH - gap - minimumGridHeight;
+    const legendW =
+      wantsSharedLegend &&
+      legendPosition === 'right' &&
+      availableRightLegendWidth >= 96
+        ? Math.min(240, availableRightLegendWidth)
+        : 0;
+    const legendH =
+      wantsSharedLegend &&
+      legendPosition === 'bottom' &&
+      availableBottomLegendHeight >= 72
+        ? Math.min(140, availableBottomLegendHeight)
+        : 0;
+    const rendersSharedLegend = legendW > 0 || legendH > 0;
 
     const gridW = Math.max(1, contentW - (legendW ? (gap + legendW) : 0));
     const gridH = Math.max(1, contentH - (legendH ? (gap + legendH) : 0));
@@ -873,7 +917,7 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
     const cellW = gridW / cols;
     const cellH = gridH / rows;
 
-    const legendRect = wantsSharedLegend
+    const legendRect = rendersSharedLegend
       ? (legendPosition === 'right'
         ? { x: gridX + gridW + gap, y: gridY, width: legendW, height: gridH }
         : { x: gridX, y: gridY + gridH + gap, width: gridW, height: legendH })
@@ -892,15 +936,28 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
       const row = Math.floor(idx / cols);
       const cellX = gridX + col * cellW;
       const cellY = gridY + row * cellH;
-      const plotRect = {
-        x: cellX + cellPadding,
-        y: cellY + cellPadding,
-        width: Math.max(1, cellW - cellPadding * 2),
-        height: Math.max(1, cellH - cellPadding * 2),
-      };
+      const {
+        labelX,
+        labelY,
+        panelRect,
+        plotRect,
+      } = computeGridPaneLayout({
+        cellX,
+        cellY,
+        cellWidth: cellW,
+        cellHeight: cellH,
+        includeAxes,
+        fontSize: baseFontSize,
+      });
 
       const clipId = `clip_${idx}`;
-      parts.push(`<defs><clipPath id="${clipId}"><rect x="${plotRect.x}" y="${plotRect.y}" width="${plotRect.width}" height="${plotRect.height}"/></clipPath></defs>`);
+      const panelClipId = `panel_clip_${idx}`;
+      parts.push(
+        `<defs>` +
+        `<clipPath id="${clipId}"><rect x="${plotRect.x}" y="${plotRect.y}" width="${plotRect.width}" height="${plotRect.height}"/></clipPath>` +
+        `<clipPath id="${panelClipId}"><rect x="${panelRect.x}" y="${panelRect.y}" width="${panelRect.width}" height="${panelRect.height}"/></clipPath>` +
+        `</defs>`
+      );
       const cellFill = background === 'transparent' ? 'none' : escapeHtml(backgroundColor);
       parts.push(`<rect x="${plotRect.x}" y="${plotRect.y}" width="${plotRect.width}" height="${plotRect.height}" fill="${cellFill}" stroke="#e5e7eb" stroke-width="1"/>`);
       parts.push(`<g clip-path="url(#${clipId})">`);
@@ -908,13 +965,41 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
       const renderState = view?.renderState || null;
       if (!renderState?.mvpMatrix) throw new Error('Figure export renderState missing for SVG multiview render');
 
-      const dim = state.getViewDimensionLevel(viewId);
-      const navMode = assertCameraState(
+      const dim = view.scientificState.dimensionLevel;
+      const cameraState = assertCameraState(
         view.cameraState,
         `SVG camera state for "${viewId}"`
-      ).navigationMode;
-      const visibilityMask = getLodVisibilityMask({ viewer, viewId, dimensionLevel: dim });
-      const pointRadiusViewportPx = getEffectivePointDiameterPx({ viewer, renderState, viewId, dimensionLevel: dim }) / 2;
+      );
+      const navMode = cameraState.navigationMode;
+      const lodMembership = view.scientificState.lodMembership;
+      const pointRadiusViewportPx =
+        (renderState.pointSize * view.scientificState.lodSizeMultiplier) / 2;
+      const useCameraAxes =
+        dim > 2 &&
+        navMode !== 'planar' &&
+        Boolean(renderState.viewMatrix);
+      const visibleBounds = useCameraAxes
+        ? computeVisibleCameraBounds({
+          positions,
+          transparency,
+          lodMembership,
+          mvpMatrix: renderState.mvpMatrix,
+          viewMatrix: renderState.viewMatrix,
+          viewportWidth: renderState.viewportWidth,
+          viewportHeight: renderState.viewportHeight,
+          crop,
+        })
+        : computeVisibleRealBounds({
+          positions,
+          transparency,
+          lodMembership,
+          mvpMatrix: renderState.mvpMatrix,
+          viewportWidth: renderState.viewportWidth,
+          viewportHeight: renderState.viewportHeight,
+          crop,
+          normTransform: view.scientificState.normTransform,
+        });
+      const hasVisibleCells = visibleBounds !== null;
 
       const crop01 = assertCropRect01(crop);
       const srcViewportW = Math.max(1, renderState?.viewportWidth || 1);
@@ -934,6 +1019,11 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
       const includeCentroidLabels = typeof opts.includeCentroidLabels === 'boolean'
         ? opts.includeCentroidLabels
         : Boolean(centroidFlags?.labels);
+      const hasCentroidPoints =
+        centroidPositions instanceof Float32Array &&
+        centroidPositions.length > 0 &&
+        centroidColors instanceof Uint8Array &&
+        centroidColors.length === (centroidPositions.length / 3) * 4;
       const centroidDiameterViewportPx = Math.max(1, (Number(renderState?.pointSize || 5) * 4.0));
       const centroidRadiusPlotPx = Math.max(0.5, (centroidDiameterViewportPx / 2) * computeLetterboxedRect({ srcWidth: cropW, srcHeight: cropH, dstWidth: plotRect.width, dstHeight: plotRect.height }).scale);
       let centroidPointsRasterized = false;
@@ -948,7 +1038,7 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
           positions,
           colors,
           transparency,
-          visibilityMask,
+          lodMembership,
           renderState: renderStateForPoints,
           plotRect,
           radiusPx: pointRadiusViewportPx,
@@ -956,14 +1046,13 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
           emphasizeSelection,
           selectionMutedOpacity,
           crop,
-          overlayPositions: includeCentroidPoints ? centroidPositions : null,
-          overlayColors: includeCentroidPoints ? centroidColors : null,
-          overlayPointDiameterViewportPx: includeCentroidPoints ? centroidDiameterViewportPx : null,
+          overlayPositions: includeCentroidPoints && hasCentroidPoints ? centroidPositions : null,
+          overlayColors: includeCentroidPoints && hasCentroidPoints ? centroidColors : null,
+          overlayPointDiameterViewportPx: includeCentroidPoints && hasCentroidPoints ? centroidDiameterViewportPx : null,
+          signal,
         });
-        centroidPointsRasterized =
-          includeCentroidPoints &&
-          Boolean(centroidPositions) &&
-          Boolean(centroidColors);
+        throwIfFigureExportAborted(signal);
+        centroidPointsRasterized = includeCentroidPoints && hasCentroidPoints;
         parts.push(
           `<image x="${plotRect.x}" y="${plotRect.y}" width="${plotRect.width}" height="${plotRect.height}" href="${dataUrl}" preserveAspectRatio="none"/>`
         );
@@ -973,7 +1062,8 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
           positions,
           colors,
           transparency,
-          visibilityMask,
+          lodMembership,
+          highlightArray,
           renderState,
           targetCount: opts.optimizedTargetCount,
           seed,
@@ -996,13 +1086,17 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
           let r = reduced.rgba[j];
           let g = reduced.rgba[j + 1];
           let b = reduced.rgba[j + 2];
-          if (emphasizeSelection && highlightArray && (highlightArray[srcIndex] ?? 0) <= 0) {
+          if (
+            emphasizeSelection &&
+            highlightArray &&
+            (highlightArray[srcIndex] ?? 0) < MIN_VISIBLE_ALPHA_BYTE
+          ) {
             r = 160;
             g = 160;
             b = 160;
             a *= selectionMutedOpacity;
           }
-          if (a < 0.01) continue;
+          if (a < POINT_VISIBILITY_THRESHOLD) continue;
           if (a >= 0.999) {
             parts.push(`<circle cx="${x.toFixed(2)}" cy="${y.toFixed(2)}" r="${pointRadiusPx.toFixed(2)}" fill="rgb(${r},${g},${b})"/>`);
           } else {
@@ -1029,7 +1123,7 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
           renderState,
           plotRect,
           radiusPx: radiusPlot,
-          visibilityMask,
+          lodMembership,
           crop,
           sortByDepth: depthSort3d && dim > 2 && navMode !== 'planar',
           onPoint: (x, y, r, g, b, a, radius, index) => {
@@ -1037,13 +1131,17 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
             let gg = g;
             let bb = b;
             let aa = a;
-            if (emphasizeSelection && highlightArray && (highlightArray[index] ?? 0) <= 0) {
+            if (
+              emphasizeSelection &&
+              highlightArray &&
+              (highlightArray[index] ?? 0) < MIN_VISIBLE_ALPHA_BYTE
+            ) {
               rr = 160;
               gg = 160;
               bb = 160;
               aa *= selectionMutedOpacity;
             }
-            if (aa < 0.01) return;
+            if (aa < POINT_VISIBILITY_THRESHOLD) return;
             if (aa >= 0.999) {
               parts.push(`<circle cx="${x.toFixed(2)}" cy="${y.toFixed(2)}" r="${radius.toFixed(2)}" fill="rgb(${rr},${gg},${bb})"/>`);
             } else {
@@ -1086,17 +1184,70 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
 
       parts.push(`</g>`);
 
+      if (
+        showOrientation &&
+        renderState.viewMatrix &&
+        dim > 2 &&
+        navMode !== 'planar'
+      ) {
+        const orientationFontSize = clamp(
+          Math.round(baseFontSize * 0.9),
+          11,
+          22
+        );
+        parts.push(
+          `<g clip-path="url(#${panelClipId})">` +
+          renderSvgOrientationIndicator({
+            plotRect,
+            viewMatrix: renderState.viewMatrix,
+            cameraState,
+            fontFamily,
+            fontSize: orientationFontSize,
+          }) +
+          `</g>`
+        );
+      }
+
+      if (includeAxes && visibleBounds !== null) {
+        parts.push(
+          `<g clip-path="url(#${panelClipId})">` +
+          renderSvgAxes({
+            plotRect,
+            bounds: visibleBounds,
+            xLabel: opts.xLabel,
+            yLabel: opts.yLabel,
+            fontFamily,
+            tickFontSize,
+            labelFontSize: axisLabelFontSize,
+            color: '#111',
+          }) +
+          `</g>`
+        );
+      }
+
+      if (!hasVisibleCells) {
+        parts.push(
+          `<g clip-path="url(#${clipId})">` +
+          `<text x="${plotRect.x + plotRect.width / 2}" y="${plotRect.y + plotRect.height / 2}" ` +
+          `text-anchor="middle" dominant-baseline="middle" font-family="${escapeHtml(fontFamily)}" ` +
+          `font-size="${baseFontSize}" fill="#6b7280">No visible cells</text>` +
+          `</g>`
+        );
+      }
+
       parts.push(
-        `<text x="${plotRect.x}" y="${plotRect.y - 4}" font-family="${escapeHtml(fontFamily)}" font-size="${baseFontSize}" fill="#111">${escapeHtml(String.fromCharCode(65 + idx))}. ${escapeHtml(viewLabel)}</text>`
+        `<g clip-path="url(#${panelClipId})">` +
+        `<text x="${labelX}" y="${labelY}" font-family="${escapeHtml(fontFamily)}" ` +
+        `font-size="${baseFontSize}" fill="#111">${escapeHtml(String.fromCharCode(65 + idx))}. ${escapeHtml(viewLabel)}</text>` +
+        `</g>`
       );
     }
 
-    if (wantsSharedLegend && legendRect) {
-      const model = sharedField && typeof state.getLegendModel === 'function' ? state.getLegendModel(sharedField) : null;
+    if (rendersSharedLegend && legendRect) {
       const legend = renderSvgLegend({
         legendRect,
         fieldKey: sharedFieldKey,
-        model,
+        model: sharedLegendModel,
         fontFamily,
         fontSize: legendFontSize,
         idPrefix: `legend_${hashStringToSeed(meta?.datasetId || meta?.datasetName || 'cellucid')}`,
@@ -1109,5 +1260,6 @@ export async function renderFigureToSvgBlob({ state, viewer, payload }) {
 
   parts.push(`</svg>`);
   const svg = parts.join('');
+  throwIfFigureExportAborted(signal);
   return new Blob([svg], { type: 'image/svg+xml' });
 }

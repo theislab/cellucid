@@ -77,6 +77,50 @@ test('cross-origin sample artifacts use one direct CORS request and preserve str
   );
 });
 
+test('prepared sample paths decode once and retain no second-decoding escape', async t => {
+  installSampleBrowser(t);
+  const originalFetch = globalThis.fetch;
+  const requested = [];
+  globalThis.fetch = async url => {
+    requested.push(String(url));
+    return new Response(Uint8Array.of(1), {
+      status: 200,
+      headers: { 'content-length': '1' },
+    });
+  };
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  for (const nestedEncoding of [
+    '%252e%252e/escape.bin',
+    'nested/%252fescape.bin',
+    'nested/%255cescape.bin',
+    'nested/%2541.bin',
+  ]) {
+    await assert.rejects(
+      fetchSampleArtifact(`${SAMPLE_ROOT}${nestedEncoding}`),
+      /non-canonical path segment/i,
+      nestedEncoding,
+    );
+  }
+
+  const canonicalPaths = [
+    'cell%20atlas/points.bin',
+    '%E7%BB%86%E8%83%9E/points.bin',
+  ];
+  for (const path of canonicalPaths) {
+    const response = await fetchSampleArtifact(
+      `${SAMPLE_ROOT}${path}`
+    );
+    assert.equal(response.ok, true);
+  }
+  assert.deepEqual(
+    requested,
+    canonicalPaths.map(path => `${SAMPLE_ROOT}${path}`),
+  );
+});
+
 test('manager initialization registers the sample catalog without selecting science', async t => {
   installSampleBrowser(t);
   const originalFetch = globalThis.fetch;

@@ -224,6 +224,10 @@
   cursor: grab;
 }
 
+.legend-label.legend-label-voting {
+  cursor: pointer;
+}
+
 .legend-item.legend-item-dragging .legend-label.legend-label-draggable {
   cursor: grabbing;
   opacity: var(--opacity-80);

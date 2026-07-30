@@ -50,6 +50,16 @@ function identity(id, name, cells) {
   };
 }
 
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, reject, resolve };
+}
+
 function identityWithObsFields() {
   const value = identity('invalid', 'Fields identity', 3);
   value.stats.n_obs_fields = 2;
@@ -149,6 +159,63 @@ test('demo catalog metadata adoption is atomic across every advertised entry', a
   assert.equal(source._datasets, null);
 });
 
+test('concurrent cold demo listings share one complete catalog generation', async t => {
+  const originalFetch = globalThis.fetch;
+  const catalogResponse = deferred();
+  let catalogCalls = 0;
+  let identityCalls = 0;
+  globalThis.fetch = async input => {
+    const url = String(input);
+    if (url.endsWith('/datasets.json')) {
+      catalogCalls += 1;
+      return catalogResponse.promise;
+    }
+    if (url.endsWith('/first/dataset_identity.json')) {
+      identityCalls += 1;
+      return new Response(
+        JSON.stringify(identity('first', 'First identity', 3)),
+        {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        }
+      );
+    }
+    return new Response('', { status: 404 });
+  };
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const source = new LocalDemoDataSource(
+    'https://catalog.cellucid.test/exports/'
+  );
+  const firstListing = source.listDatasets();
+  const secondListing = source.listDatasets();
+  await Promise.resolve();
+
+  assert.equal(catalogCalls, 1);
+  catalogResponse.resolve(new Response(JSON.stringify(manifest({
+    datasets: [{
+      id: 'first',
+      path: 'first/',
+      name: 'First',
+    }],
+  })), {
+    status: 200,
+    headers: { 'Content-Type': 'application/json' },
+  }));
+
+  const [first, second] = await Promise.all([
+    firstListing,
+    secondListing,
+  ]);
+  assert.equal(first, second);
+  assert.equal(first, source._datasets);
+  assert.equal(source._manifest.default, 'first');
+  assert.deepEqual(first.map(dataset => dataset.id), ['first']);
+  assert.equal(identityCalls, 1);
+});
+
 test('demo catalog resolves only explicitly declared dataset paths', () => {
   const source = sourceWithManifest(manifest());
   assert.equal(
@@ -169,6 +236,57 @@ test('demo catalog resolves only explicitly declared dataset paths', () => {
   assert.throws(
     () => fileLikePathSource.getBaseUrl('first'),
     /relative directory ending in '\/'/i
+  );
+});
+
+test('demo catalog paths cannot escape or reinterpret the configured exports root', () => {
+  const unsafePaths = [
+    '%2e%2e/escape/',
+    '%2E%2E/escape/',
+    'nested/%2e%2e/escape/',
+    'nested/%2Fescape/',
+    'nested/%5cescape/',
+    '%252e%252e/escape/',
+    'nested/%252fescape/',
+    'nested/%255cescape/',
+    'nested/%2541/',
+    'safe/?query=/',
+    'safe/#fragment/',
+    'safe path/',
+  ];
+
+  for (const path of unsafePaths) {
+    const source = sourceWithManifest(
+      manifest({
+        default: 'unsafe',
+        datasets: [{ id: 'unsafe', path }],
+      })
+    );
+    assert.throws(
+      () => source.getBaseUrl('unsafe'),
+      /safe relative path|canonical.*directory path/i,
+      path
+    );
+  }
+});
+
+test('demo catalog preserves canonical spaces and single-encoded Unicode', () => {
+  const path =
+    'cell%20atlas/%E7%BB%86%E8%83%9E/';
+  const source = sourceWithManifest(
+    manifest({
+      default: 'encoded',
+      datasets: [{
+        id: 'encoded',
+        path,
+        name: 'Encoded',
+      }],
+    })
+  );
+
+  assert.equal(
+    source.getBaseUrl('encoded'),
+    `https://catalog.cellucid.test/exports/${path}`
   );
 });
 
@@ -447,14 +565,59 @@ test('dataset identity v2 requires exact embedding metadata', async t => {
   });
 
   await t.test('advertised files must be safe relative paths', async t => {
-    const value = identity('invalid', 'Identity', 3);
-    value.embeddings.files['2d'] = '../points_2d.bin';
-    await expectIdentityRejection(
-      t,
-      value,
-      /dataset_identity.*embeddings\.files\.2d.*safe relative/i
-    );
+    for (const path of [
+      '../points_2d.bin',
+      '%2e%2e/points_2d.bin',
+      'nested/%2E%2E/points_2d.bin',
+      'nested/%2fpoints_2d.bin',
+      '%252e%252e/points_2d.bin',
+      'nested/%252fpoints_2d.bin',
+      'nested/%255cpoints_2d.bin',
+      'nested/%2541.bin',
+      'points_2d.bin?download=1',
+      'points_2d.bin#fragment',
+      'points 2d.bin',
+    ]) {
+      const value = identity('invalid', 'Identity', 3);
+      value.embeddings.files['2d'] = path;
+      await expectIdentityRejection(
+        t,
+        value,
+        /dataset_identity.*embeddings\.files\.2d.*safe relative/i
+      );
+    }
   });
+
+  await t.test(
+    'canonical spaces and single-encoded Unicode remain exact',
+    async t => {
+      const value = identity('invalid', 'Identity', 3);
+      const path =
+        'cell%20atlas/%E7%BB%86%E8%83%9E.bin';
+      value.embeddings.files['2d'] = path;
+      const source = sourceWithManifest(
+        manifest({
+          default: 'invalid',
+          datasets: [{
+            id: 'invalid',
+            path: 'invalid/',
+          }],
+        })
+      );
+      installIdentityFetch(t, new Map([
+        [
+          'https://catalog.cellucid.test/exports/invalid/dataset_identity.json',
+          value,
+        ],
+      ]));
+
+      const datasets = await source.listDatasets();
+      assert.equal(
+        datasets[0].embeddings.files['2d'],
+        path
+      );
+    }
+  );
 });
 
 test('dataset identity v2 requires exact observation summaries', async t => {
@@ -656,6 +819,68 @@ test('valid current demo catalog exposes exact metadata and default', async t =>
   assert.equal(Object.hasOwn(firstMetadata, 'created_at'), false);
   assert.equal(Object.hasOwn(firstMetadata, 'export_settings'), false);
   assert.equal(Object.hasOwn(firstMetadata, 'source'), false);
+});
+
+test('refresh aborts a stale sample metadata generation before it can refill caches', async t => {
+  const originalFetch = globalThis.fetch;
+  let phase = 'stale';
+  let staleSignal = null;
+  let releaseStaleIdentity;
+  let markStaleIdentityStarted;
+  const staleIdentityStarted = new Promise(resolve => {
+    markStaleIdentityStarted = resolve;
+  });
+  const staleIdentityResponse = new Promise(resolve => {
+    releaseStaleIdentity = resolve;
+  });
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input);
+    if (url.endsWith('/datasets.json')) {
+      return new Response(JSON.stringify({
+        version: 1,
+        default: 'first',
+        datasets: [{ id: 'first', path: 'first/' }],
+      }), { status: 200 });
+    }
+    if (url.endsWith('/first/dataset_identity.json')) {
+      if (phase === 'stale') {
+        staleSignal = init.signal ?? null;
+        markStaleIdentityStarted();
+        return staleIdentityResponse;
+      }
+      const current = identity('first', 'Current identity', 5);
+      current.description = 'Current catalog generation';
+      return new Response(JSON.stringify(current), { status: 200 });
+    }
+    return new Response('', { status: 404 });
+  };
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const source = new LocalDemoDataSource(
+    'https://catalog.cellucid.test/exports/'
+  );
+  const staleLoad = source.listDatasets();
+  await staleIdentityStarted;
+  source.refresh();
+
+  assert.ok(staleSignal instanceof AbortSignal);
+  assert.equal(staleSignal.aborted, true);
+  phase = 'current';
+  releaseStaleIdentity(
+    new Response(
+      JSON.stringify(identity('first', 'Stale identity', 3)),
+      { status: 200 }
+    )
+  );
+  await assert.rejects(staleLoad, /abort|cancel|supersed/i);
+  assert.equal(source._datasets, null);
+  assert.equal(source._datasetError, null);
+
+  const [current] = await source.listDatasets();
+  assert.equal(current.description, 'Current catalog generation');
+  assert.equal(current.stats.n_cells, 5);
 });
 
 test('an explicit empty bootstrap never adopts a synthetic zero-point scene', async () => {

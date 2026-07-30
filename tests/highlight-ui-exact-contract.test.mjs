@@ -354,16 +354,12 @@ test('highlight synchronization follows exact active-view LOD events and unsubsc
     }
   };
   let lodListener = null;
-  const viewerUpdates = [];
   const viewer = {
     onLodChanged(listener) {
       lodListener = listener;
       return () => {
         unsubscribed.push('lod');
       };
-    },
-    updateHighlight(value) {
-      viewerUpdates.push(value);
     }
   };
   let summaryRenders = 0;
@@ -379,23 +375,42 @@ test('highlight synchronization follows exact active-view LOD events and unsubsc
     }
   });
 
-  lodListener(Object.freeze({ viewId: 'snapshot_1', lodLevel: 2 }));
-  lodListener(Object.freeze({ viewId: 'live', lodLevel: 2 }));
+  lodListener(Object.freeze({
+    dimensionLevel: 2,
+    geometryGeneration: 1,
+    lodLevel: 2,
+    viewId: 'snapshot_1'
+  }));
+  lodListener(Object.freeze({
+    dimensionLevel: 2,
+    geometryGeneration: 1,
+    lodLevel: 2,
+    viewId: 'live'
+  }));
   assert.equal(summaryRenders, 0);
 
   groups = [{ id: 'highlight_1' }];
-  lodListener(Object.freeze({ viewId: 'live', lodLevel: 3 }));
+  lodListener(Object.freeze({
+    dimensionLevel: 3,
+    geometryGeneration: 2,
+    lodLevel: 3,
+    viewId: 'live'
+  }));
   assert.equal(summaryRenders, 1);
 
   assert.throws(
-    () => lodListener({ viewId: 'live', lodLevel: 4 }),
+    () => lodListener({
+      dimensionLevel: 2,
+      geometryGeneration: 3,
+      lodLevel: 4,
+      viewId: 'live'
+    }),
     /LOD change event must be frozen/i
   );
 
   stateListeners.get('highlight:changed')();
   assert.equal(summaryRenders, 2);
   assert.equal(pageRenders, 1);
-  assert.deepEqual(viewerUpdates, [state.highlightArray]);
 
   stateListeners.get('page:changed')();
   assert.equal(summaryRenders, 3);
@@ -433,14 +448,12 @@ test('active-view switches invalidate visible-highlight counts for the new trans
     viewContexts: new Map(),
     dimensionManager: null,
     highlightArray: Uint8Array.from([255, 255, 0, 0]),
+    _highlightedCellIndices: [0, 1],
     _cachedHighlightCount: null,
-    _cachedHighlightLodLevel: null,
+    _cachedHighlightLodMembership: null,
     _cachedTotalHighlightCount: null,
     viewer: {
-      getCurrentLODLevel() {
-        return -1;
-      },
-      getLodVisibilityArray() {
+      getCurrentLodMembership() {
         return null;
       },
       setViewLayout() {}
@@ -520,6 +533,8 @@ test('highlight pages reject alternate page schemas before rebuilding the tab st
     },
     querySelectorAll() {
       return [];
+    },
+    setAttribute() {
     }
   };
   const addButton = {

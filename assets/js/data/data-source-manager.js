@@ -22,6 +22,7 @@ import {
   waitForMetadata,
 } from './metadata-load-contract.js';
 import { debug } from '../utils/debug.js';
+import { setOwnDataProperty } from '../utils/exact-record.js';
 
 const datasetSelectionStages = new WeakMap();
 const datasetSelectionPublications = new WeakMap();
@@ -1191,7 +1192,7 @@ export class DataSourceManager {
     if (!protocol.endsWith('://')) {
       debug.warn(`[DataSourceManager] Protocol should end with '://': ${protocol}`);
     }
-    this._protocolHandlers[protocol] = sourceType;
+    setOwnDataProperty(this._protocolHandlers, protocol, sourceType);
     debug.log('[DataSourceManager] Registered protocol', { protocol, sourceType });
   }
 

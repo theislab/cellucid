@@ -14,6 +14,7 @@
  */
 
 import { getFiniteMinMax, mean, std } from '../../shared/number-utils.js';
+import { setOwnDataProperty } from '../../../../utils/exact-record.js';
 
 // =============================================================================
 // ANALYSIS SETTINGS DEFINITIONS
@@ -361,7 +362,13 @@ export function createAnalysisSettingsPanel(options = {}) {
 
   // Add helper method to update a specific setting
   container.setSetting = (key, value) => {
-    currentSettings[key] = value;
+    if (
+      typeof key !== 'string' ||
+      !Object.hasOwn(ANALYSIS_SETTINGS, key)
+    ) {
+      throw new RangeError(`Unknown analysis setting: ${String(key)}`);
+    }
+    setOwnDataProperty(currentSettings, key, value);
     const select = container.querySelector(`[data-setting-key="${key}"]`);
     if (select) {
       if (select.type === 'checkbox') {

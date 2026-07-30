@@ -13,6 +13,17 @@ import {
   loadAnalysisSubset,
 } from '../assets/js/data/data-loaders.js';
 
+const PROTOTYPE_PROPERTY_NAMES =
+  Object.getOwnPropertyNames(Object.prototype);
+
+function assertExactOrdinaryRecord(record, expectedKeys) {
+  assert.equal(Object.getPrototypeOf(record), Object.prototype);
+  assert.deepEqual(Object.keys(record), expectedKeys);
+  for (const key of expectedKeys) {
+    assert.equal(Object.hasOwn(record, key), true, key);
+  }
+}
+
 function bareDataLayer(state = {}) {
   const layer = Object.create(DataLayer.prototype);
   layer.state = state;
@@ -456,6 +467,117 @@ test('bulk gene loading rejects the original payload failure without partial suc
   );
 });
 
+test('all bulk analysis loaders preserve legal prototype-named variables exactly', async t => {
+  const previousFetch = globalThis.fetch;
+  const prototypeDescriptors = Object.getOwnPropertyDescriptors(
+    Object.prototype,
+  );
+  t.after(() => {
+    globalThis.fetch = previousFetch;
+  });
+
+  globalThis.fetch = async url => {
+    const indexMatch = /-(\d+)\.f32$/u.exec(String(url));
+    const value = indexMatch ? Number(indexMatch[1]) + 0.5 : 0.5;
+    return new Response(Float32Array.of(value).buffer, {
+      status: 200,
+      headers: {
+        'Content-Type': 'application/octet-stream',
+        'Content-Length': '4',
+      },
+    });
+  };
+
+  const varManifest = {
+    fields: PROTOTYPE_PROPERTY_NAMES.map((key, index) => ({
+      key,
+      kind: 'continuous',
+      valuesPath: `gene-${index}.f32`,
+      valuesDtype: 'float32',
+      quantized: false,
+    })),
+  };
+  const obsManifest = {
+    fields: PROTOTYPE_PROPERTY_NAMES.map((key, index) => ({
+      key,
+      kind: 'continuous',
+      valuesPath: `obs-${index}.f32`,
+      valuesDtype: 'float32',
+      quantized: false,
+      centroids: null,
+      outlierQuantilesPath: null,
+    })),
+  };
+
+  await t.test('bulk genes', async () => {
+    const result = await loadAnalysisBulkData({
+      manifestUrl: 'https://example.test/var_manifest.json',
+      varManifest,
+      geneList: PROTOTYPE_PROPERTY_NAMES,
+      batchSize: PROTOTYPE_PROPERTY_NAMES.length,
+      suppressNotifications: true,
+    });
+    assert.equal(result.loadedCount, PROTOTYPE_PROPERTY_NAMES.length);
+    assertExactOrdinaryRecord(result.genes, PROTOTYPE_PROPERTY_NAMES);
+    for (const values of Object.values(result.genes)) {
+      assert.equal(values instanceof Float32Array, true);
+    }
+  });
+
+  await t.test('gene subset', async () => {
+    const result = await loadAnalysisSubset({
+      manifestUrl: 'https://example.test/var_manifest.json',
+      varManifest,
+      geneList: PROTOTYPE_PROPERTY_NAMES,
+      cellIndices: [0],
+      batchSize: PROTOTYPE_PROPERTY_NAMES.length,
+      suppressNotifications: true,
+    });
+    assertExactOrdinaryRecord(result.genes, PROTOTYPE_PROPERTY_NAMES);
+    for (const entry of Object.values(result.genes)) {
+      assert.deepEqual(entry.indices, [0]);
+      assert.equal(entry.values instanceof Float32Array, true);
+    }
+  });
+
+  await t.test('bulk observation fields', async () => {
+    const result = await loadAnalysisBulkObsData({
+      manifestUrl: 'https://example.test/obs_manifest.json',
+      obsManifest,
+      fieldList: PROTOTYPE_PROPERTY_NAMES,
+      batchSize: PROTOTYPE_PROPERTY_NAMES.length,
+      suppressNotifications: true,
+    });
+    assert.equal(result.loadedCount, PROTOTYPE_PROPERTY_NAMES.length);
+    assertExactOrdinaryRecord(result.fields, PROTOTYPE_PROPERTY_NAMES);
+    for (const field of Object.values(result.fields)) {
+      assert.equal(field.kind, 'continuous');
+      assert.equal(field.values instanceof Float32Array, true);
+    }
+  });
+
+  await t.test('DataLayer bulk gene projection', async () => {
+    const layer = bareDataLayer({
+      manifestUrl: 'https://example.test/var_manifest.json',
+      varManifest,
+    });
+    const result = await layer.fetchAnalysisData({
+      pageIds: ['page-1'],
+      genes: PROTOTYPE_PROPERTY_NAMES,
+    });
+    assert.equal(result.stats.genesLoaded, PROTOTYPE_PROPERTY_NAMES.length);
+    assertExactOrdinaryRecord(result.genes, PROTOTYPE_PROPERTY_NAMES);
+    for (const gene of PROTOTYPE_PROPERTY_NAMES) {
+      assertExactOrdinaryRecord(result.genes[gene], ['page-1']);
+    }
+  });
+
+  assert.deepEqual(
+    Object.getOwnPropertyDescriptors(Object.prototype),
+    prototypeDescriptors,
+  );
+});
+
 test('DataLayer rejects unknown variable and page identities', async t => {
   const layer = bareDataLayer();
 
@@ -715,6 +837,285 @@ test('cached bulk gene reads reject a missing requested gene atomically', async 
   );
 });
 
+test('session cache import owns exact gene and page keys without global prototype writes', t => {
+  const layer = new DataLayer({}, {
+    enableNotifications: false,
+    enablePrefetch: false,
+    enableVersionTracking: false,
+  });
+  t.after(() => layer.destroy());
+
+  const pageIds = PROTOTYPE_PROPERTY_NAMES.map(
+    (_name, index) => `page_0453_${index}`,
+  );
+  const pageDescriptors = new Map(
+    pageIds.map(pageId => [
+      pageId,
+      Object.getOwnPropertyDescriptor(Object.prototype, pageId),
+    ]),
+  );
+  const apply = (gene, pageId, index) => layer.importSessionCache({
+    kind: 'bulk-gene',
+    cacheKey: 'exact-cache',
+    gene,
+    pageId,
+    values: Float32Array.of(index + 0.25),
+    cellIndices: Uint32Array.of(0),
+    pageName: pageId,
+    cellCount: 1,
+    timestamp: index + 1,
+    geneCount: PROTOTYPE_PROPERTY_NAMES.length + 1,
+  });
+
+  for (const [index, gene] of PROTOTYPE_PROPERTY_NAMES.entries()) {
+    assert.equal(apply(gene, pageIds[index], index), 1);
+  }
+  for (const [index, pageId] of PROTOTYPE_PROPERTY_NAMES.entries()) {
+    assert.equal(
+      apply('safe-gene', pageId, PROTOTYPE_PROPERTY_NAMES.length + index),
+      1,
+    );
+  }
+
+  const globalWrites = pageIds.filter(
+    pageId => Object.hasOwn(Object.prototype, pageId),
+  );
+  for (const [pageId, descriptor] of pageDescriptors) {
+    if (descriptor === undefined) delete Object.prototype[pageId];
+    else Object.defineProperty(Object.prototype, pageId, descriptor);
+  }
+
+  const entry = layer._bulkGeneCache.get('exact-cache');
+  const safeGenePages = entry?.data?.['safe-gene'];
+  const exported = layer.exportSessionCache();
+  assert.deepEqual(
+    {
+      exportedIdentities: exported.map(
+        artifact => JSON.stringify([artifact.gene, artifact.pageId]),
+      ),
+      globalWrites,
+      geneKeys: Object.keys(entry?.data || {}),
+      geneOwnKeys: PROTOTYPE_PROPERTY_NAMES.filter(
+        key => Object.hasOwn(entry?.data || {}, key),
+      ),
+      geneRecordPrototype: Object.getPrototypeOf(entry?.data || {}),
+      safePageKeys: Object.keys(safeGenePages || {}),
+      safePageOwnKeys: PROTOTYPE_PROPERTY_NAMES.filter(
+        key => Object.hasOwn(safeGenePages || {}, key),
+      ),
+      safePageRecordPrototype: Object.getPrototypeOf(safeGenePages || {}),
+    },
+    {
+      exportedIdentities: [
+        ...PROTOTYPE_PROPERTY_NAMES.map(
+          (gene, index) => JSON.stringify([gene, pageIds[index]]),
+        ),
+        ...PROTOTYPE_PROPERTY_NAMES.map(
+          pageId => JSON.stringify(['safe-gene', pageId]),
+        ),
+      ],
+      globalWrites: [],
+      geneKeys: [...PROTOTYPE_PROPERTY_NAMES, 'safe-gene'],
+      geneOwnKeys: PROTOTYPE_PROPERTY_NAMES,
+      geneRecordPrototype: Object.prototype,
+      safePageKeys: PROTOTYPE_PROPERTY_NAMES,
+      safePageOwnKeys: PROTOTYPE_PROPERTY_NAMES,
+      safePageRecordPrototype: Object.prototype,
+    },
+  );
+});
+
+test('cached subsets never treat inherited prototype names as gene hits', async () => {
+  const layer = bareDataLayer();
+  layer._bulkGeneCacheMaxAge = 60_000;
+  layer._getBulkGeneCacheKey = () => 'exact-cache';
+  layer._getBulkGeneCache = () => ({
+    timestamp: Date.now(),
+    data: {},
+  });
+  let fallbackLoads = 0;
+  layer.getDataForPages = async ({ variableKey }) => {
+    fallbackLoads++;
+    return PROTOTYPE_PROPERTY_NAMES.map((pageId, pageIndex) => ({
+      pageId,
+      pageName: pageId,
+      values: Float32Array.of(
+        PROTOTYPE_PROPERTY_NAMES.indexOf(variableKey) + pageIndex,
+      ),
+      cellIndices: Uint32Array.of(0),
+      cellCount: 1,
+    }));
+  };
+
+  const result = await layer.getGeneExpressionSubset(
+    PROTOTYPE_PROPERTY_NAMES,
+    PROTOTYPE_PROPERTY_NAMES,
+  );
+  assert.equal(fallbackLoads, PROTOTYPE_PROPERTY_NAMES.length);
+  assertExactOrdinaryRecord(result, PROTOTYPE_PROPERTY_NAMES);
+  for (const gene of PROTOTYPE_PROPERTY_NAMES) {
+    assertExactOrdinaryRecord(
+      result[gene],
+      PROTOTYPE_PROPERTY_NAMES,
+    );
+  }
+});
+
+test('fresh and cached bulk gene results preserve prototype-named genes and pages', async t => {
+  const layer = new DataLayer({}, {
+    enableNotifications: false,
+    enablePrefetch: false,
+    enableVersionTracking: false,
+  });
+  t.after(() => layer.destroy());
+  const prototypeDescriptors = Object.getOwnPropertyDescriptors(
+    Object.prototype,
+  );
+
+  layer.refreshPageVersions = () => {};
+  layer.getAvailableVariables = type => {
+    assert.equal(type, 'gene_expression');
+    return PROTOTYPE_PROPERTY_NAMES.map(key => ({ key }));
+  };
+  layer.getDataForPages = async ({ variableKey, pageIds }) => (
+    pageIds.map((pageId, pageIndex) => ({
+      pageId,
+      pageName: pageId,
+      values: Float32Array.of(
+        PROTOTYPE_PROPERTY_NAMES.indexOf(variableKey) + pageIndex,
+      ),
+      cellIndices: Uint32Array.of(0),
+      cellCount: 1,
+    }))
+  );
+
+  const fresh = await layer.fetchBulkGeneExpression({
+    pageIds: PROTOTYPE_PROPERTY_NAMES,
+    geneList: PROTOTYPE_PROPERTY_NAMES,
+    forceReload: true,
+  });
+  assertExactOrdinaryRecord(fresh, PROTOTYPE_PROPERTY_NAMES);
+  for (const gene of PROTOTYPE_PROPERTY_NAMES) {
+    assertExactOrdinaryRecord(fresh[gene], PROTOTYPE_PROPERTY_NAMES);
+  }
+
+  const cached = await layer.fetchBulkGeneExpression({
+    pageIds: PROTOTYPE_PROPERTY_NAMES,
+    geneList: PROTOTYPE_PROPERTY_NAMES,
+  });
+  assertExactOrdinaryRecord(cached, PROTOTYPE_PROPERTY_NAMES);
+  for (const gene of PROTOTYPE_PROPERTY_NAMES) {
+    assert.equal(cached[gene], fresh[gene]);
+  }
+
+  const exported = layer.exportSessionCache();
+  assert.equal(
+    exported.length,
+    PROTOTYPE_PROPERTY_NAMES.length ** 2,
+  );
+  assert.deepEqual(
+    Object.getOwnPropertyDescriptors(Object.prototype),
+    prototypeDescriptors,
+  );
+});
+
+test('all public DataLayer page records preserve prototype-named page identities', async t => {
+  const createLayer = () => {
+    const layer = bareDataLayer();
+    layer.getPages = () => PROTOTYPE_PROPERTY_NAMES.map(id => ({
+      id,
+      name: id,
+    }));
+    layer.getCellIndicesForPage = pageId => Uint32Array.of(
+      PROTOTYPE_PROPERTY_NAMES.indexOf(pageId),
+    );
+    return layer;
+  };
+
+  await t.test('analysis genes and pageData', async () => {
+    const layer = createLayer();
+    layer.getDataForPages = async ({ pageIds }) => pageIds.map(pageId => ({
+      pageId,
+      pageName: pageId,
+      values: Float32Array.of(1),
+      cellIndices: layer.getCellIndicesForPage(pageId),
+      cellCount: 1,
+    }));
+    const result = await layer.fetchAnalysisData({
+      pageIds: PROTOTYPE_PROPERTY_NAMES,
+      genes: ['Gene A'],
+    });
+    assertExactOrdinaryRecord(
+      result.pageData,
+      PROTOTYPE_PROPERTY_NAMES,
+    );
+    assertExactOrdinaryRecord(result.genes, ['Gene A']);
+    assertExactOrdinaryRecord(
+      result.genes['Gene A'],
+      PROTOTYPE_PROPERTY_NAMES,
+    );
+  });
+
+  await t.test('observation field pages and pageData', async () => {
+    const layer = createLayer();
+    layer.getAvailableVariables = type => (
+      type === 'continuous_obs' ? [{ key: 'score' }] : []
+    );
+    layer.ensureObsFieldLoaded = async () => ({
+      fieldIndex: 0,
+      kind: 'continuous',
+      values: Float32Array.from(
+        { length: PROTOTYPE_PROPERTY_NAMES.length },
+        (_value, index) => index,
+      ),
+    });
+    const result = await layer.fetchBulkObsFields({
+      pageIds: PROTOTYPE_PROPERTY_NAMES,
+      obsFields: ['score'],
+    });
+    assertExactOrdinaryRecord(
+      result.pageData,
+      PROTOTYPE_PROPERTY_NAMES,
+    );
+    assertExactOrdinaryRecord(result.fields, ['score']);
+    assertExactOrdinaryRecord(
+      result.fields.score,
+      ['kind', 'categories', ...PROTOTYPE_PROPERTY_NAMES],
+    );
+  });
+
+  await t.test('category-count page records', async () => {
+    const layer = createLayer();
+    layer.getDataForPages = async () => (
+      PROTOTYPE_PROPERTY_NAMES.map((pageId, index) => ({
+        pageId,
+        pageName: pageId,
+        values: [`category-${index}`],
+        cellCount: 1,
+      }))
+    );
+    const result = await layer.getCategoryCountsByPage(
+      'cell_type',
+      PROTOTYPE_PROPERTY_NAMES,
+    );
+    assertExactOrdinaryRecord(
+      result.pages,
+      PROTOTYPE_PROPERTY_NAMES,
+    );
+  });
+
+  await t.test('comprehensive pageData', async () => {
+    const layer = createLayer();
+    const result = await layer.fetchComprehensiveAnalysisData({
+      pageIds: PROTOTYPE_PROPERTY_NAMES,
+    });
+    assertExactOrdinaryRecord(
+      result.pageData,
+      PROTOTYPE_PROPERTY_NAMES,
+    );
+  });
+});
+
 test('analysis subset extraction is exact and rejects invalid membership', async t => {
   const previousFetch = globalThis.fetch;
   t.after(() => {
@@ -812,6 +1213,69 @@ test('sequential observation loading publishes the same raw field contract', asy
     kind: 'continuous',
     categories: null,
     values,
+  });
+});
+
+test('sequential DataLayer analysis preserves prototype-named genes, fields, and categories', async t => {
+  await t.test('genes', async () => {
+    const layer = bareDataLayer();
+    layer.getDataForPages = async ({ variableKey }) => [{
+      pageId: 'page-1',
+      pageName: 'Page 1',
+      values: Float32Array.of(PROTOTYPE_PROPERTY_NAMES.indexOf(variableKey)),
+      cellIndices: Uint32Array.of(0),
+      cellCount: 1,
+    }];
+
+    const result = await layer.fetchAnalysisData({
+      pageIds: ['page-1'],
+      genes: PROTOTYPE_PROPERTY_NAMES,
+    });
+    assert.equal(result.stats.genesLoaded, PROTOTYPE_PROPERTY_NAMES.length);
+    assertExactOrdinaryRecord(result.genes, PROTOTYPE_PROPERTY_NAMES);
+  });
+
+  await t.test('observation fields', async () => {
+    const layer = bareDataLayer();
+    layer.getAvailableVariables = type => (
+      type === 'continuous_obs'
+        ? PROTOTYPE_PROPERTY_NAMES.map(key => ({ key }))
+        : []
+    );
+    layer.ensureObsFieldLoaded = async fieldKey => ({
+      fieldIndex: PROTOTYPE_PROPERTY_NAMES.indexOf(fieldKey),
+      kind: 'continuous',
+      values: Float32Array.of(PROTOTYPE_PROPERTY_NAMES.indexOf(fieldKey)),
+    });
+
+    const result = await layer.fetchBulkObsFields({
+      pageIds: ['page-1'],
+      obsFields: PROTOTYPE_PROPERTY_NAMES,
+      subsetPages: false,
+      includeCategoricalValues: false,
+    });
+    assert.equal(result.stats.fieldsLoaded, PROTOTYPE_PROPERTY_NAMES.length);
+    assertExactOrdinaryRecord(result.fields, PROTOTYPE_PROPERTY_NAMES);
+  });
+
+  await t.test('category counts', async () => {
+    const layer = bareDataLayer();
+    layer.getDataForPages = async () => [{
+      pageId: 'page-1',
+      pageName: 'Page 1',
+      values: PROTOTYPE_PROPERTY_NAMES,
+      cellCount: PROTOTYPE_PROPERTY_NAMES.length,
+    }];
+
+    const result = await layer.getCategoryCountsByPage(
+      'prototype_categories',
+      ['page-1'],
+    );
+    const counts = result.pages['page-1'].counts;
+    assertExactOrdinaryRecord(counts, PROTOTYPE_PROPERTY_NAMES);
+    for (const name of PROTOTYPE_PROPERTY_NAMES) {
+      assert.equal(counts[name], 1, name);
+    }
   });
 });
 

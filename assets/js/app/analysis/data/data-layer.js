@@ -46,6 +46,7 @@ import {
   loadLatentEmbeddings,
   loadAnalysisBulkObsData
 } from '../../../data/data-loaders.js';
+import { setOwnDataProperty } from '../../../utils/exact-record.js';
 import { filterFiniteNumbers } from '../shared/number-utils.js';
 import { debugWarn } from '../shared/debug-utils.js';
 
@@ -1299,16 +1300,16 @@ export class DataLayer {
     for (const pd of pageData) {
       const counts = {};
       for (const cat of allCategories) {
-        counts[cat] = 0;
+        setOwnDataProperty(counts, cat, 0);
       }
       for (const value of pd.values) {
-        counts[value] = (counts[value] || 0) + 1;
+        counts[value] += 1;
       }
-      result.pages[pd.pageId] = {
+      setOwnDataProperty(result.pages, pd.pageId, {
         name: pd.pageName,
         counts,
         total: pd.cellCount
-      };
+      });
     }
 
     return result;
@@ -1900,15 +1901,31 @@ export class DataLayer {
         ? existing
         : { data: {}, timestamp, geneCount };
 
-      if (!entry.data || typeof entry.data !== 'object') entry.data = {};
-      if (!entry.data[gene] || typeof entry.data[gene] !== 'object') entry.data[gene] = {};
+      if (
+        !Object.hasOwn(entry, 'data') ||
+        !entry.data ||
+        typeof entry.data !== 'object'
+      ) {
+        entry.data = {};
+      }
+      let genePages;
+      if (
+        Object.hasOwn(entry.data, gene) &&
+        entry.data[gene] &&
+        typeof entry.data[gene] === 'object'
+      ) {
+        genePages = entry.data[gene];
+      } else {
+        genePages = {};
+        setOwnDataProperty(entry.data, gene, genePages);
+      }
 
-      entry.data[gene][pageId] = {
+      setOwnDataProperty(genePages, pageId, {
         values,
         cellIndices,
         pageName,
         cellCount
-      };
+      });
 
       // Preserve the newest timestamp/geneCount seen for the entry.
       entry.timestamp = Math.max(Number(entry.timestamp ?? 0) || 0, timestamp);
@@ -2053,7 +2070,7 @@ export class DataLayer {
           }
           const filtered = {};
           for (const gene of geneList) {
-            filtered[gene] = cached.data[gene];
+            setOwnDataProperty(filtered, gene, cached.data[gene]);
           }
           return filtered;
         }
@@ -2111,14 +2128,15 @@ export class DataLayer {
           });
           requireCurrentOwnership();
 
-          results[geneInfo.key] = {};
+          const genePages = {};
+          setOwnDataProperty(results, geneInfo.key, genePages);
           for (const pd of geneData) {
-            results[geneInfo.key][pd.pageId] = {
+            setOwnDataProperty(genePages, pd.pageId, {
               values: pd.values,
               cellIndices: pd.cellIndices,
               pageName: pd.pageName,
               cellCount: pd.cellCount
-            };
+            });
           }
         }));
         requireCurrentOwnership();
@@ -2238,8 +2256,8 @@ export class DataLayer {
       const results = {};
       for (const gene of ownedGeneList) {
         requireCurrentOwnership();
-        if (cached.data[gene]) {
-          results[gene] = cached.data[gene];
+        if (Object.hasOwn(cached.data, gene)) {
+          setOwnDataProperty(results, gene, cached.data[gene]);
         } else {
           const geneData = await this.getDataForPages({
             type: 'gene_expression',
@@ -2249,14 +2267,15 @@ export class DataLayer {
           });
           requireCurrentOwnership();
 
-          results[gene] = {};
+          const genePages = {};
+          setOwnDataProperty(results, gene, genePages);
           for (const pd of geneData) {
-            results[gene][pd.pageId] = {
+            setOwnDataProperty(genePages, pd.pageId, {
               values: pd.values,
               cellIndices: pd.cellIndices,
               pageName: pd.pageName,
               cellCount: pd.cellCount
-            };
+            });
           }
         }
       }
@@ -2344,11 +2363,11 @@ export class DataLayer {
     for (const pageId of pageIds) {
       const cellIndices = this.getCellIndicesForPage(pageId);
       const page = this.getPages().find(p => p.id === pageId);
-      result.pageData[pageId] = {
+      setOwnDataProperty(result.pageData, pageId, {
         name: page?.name || pageId,
         cellIndices,
         cellCount: cellIndices.length
-      };
+      });
       result.stats.cellsTotal += cellIndices.length;
     }
 
@@ -2372,7 +2391,8 @@ export class DataLayer {
         });
 
         for (const [geneName, values] of Object.entries(bulkData.genes)) {
-          result.genes[geneName] = {};
+          const genePages = {};
+          setOwnDataProperty(result.genes, geneName, genePages);
 
           for (const pageId of pageIds) {
             const cellIndices = result.pageData[pageId].cellIndices;
@@ -2393,12 +2413,12 @@ export class DataLayer {
               pageValues[i] = values[cellIdx];
             }
 
-            result.genes[geneName][pageId] = {
+            setOwnDataProperty(genePages, pageId, {
               values: pageValues,
               cellIndices,
               pageName: result.pageData[pageId].name,
               cellCount: cellIndices.length
-            };
+            });
           }
 
           result.stats.genesLoaded++;
@@ -2458,10 +2478,10 @@ export class DataLayer {
           }
         }
 
-        result.latent.pages[pageId] = {
+        setOwnDataProperty(result.latent.pages, pageId, {
           coordinates: pageCoords,
           cellCount: cellIndices.length
-        };
+        });
       }
 
       if (onProgress) onProgress(100);
@@ -2495,14 +2515,15 @@ export class DataLayer {
         onProgress(Math.round(((i + 1) / totalGenes) * 100));
       }
 
-      result.genes[gene] = {};
+      const genePages = {};
+      setOwnDataProperty(result.genes, gene, genePages);
       for (const pd of geneData) {
-        result.genes[gene][pd.pageId] = {
+        setOwnDataProperty(genePages, pd.pageId, {
           values: pd.values,
           cellIndices: pd.cellIndices,
           pageName: pd.pageName,
           cellCount: pd.cellCount
-        };
+        });
       }
       result.stats.genesLoaded++;
     }
@@ -2616,7 +2637,7 @@ export class DataLayer {
         } else {
           published.codes = rawFieldValues;
         }
-        result.fields[fieldKey] = published;
+        setOwnDataProperty(result.fields, fieldKey, published);
         result.stats.fieldsLoaded++;
         return;
       }
@@ -2628,10 +2649,10 @@ export class DataLayer {
           for (let i = 0; i < cellIndices.length; i++) {
             pageValues[i] = rawFieldValues[cellIndices[i]];
           }
-          published[pageId] = {
+          setOwnDataProperty(published, pageId, {
             values: pageValues,
             cellCount: cellIndices.length
-          };
+          });
           continue;
         }
 
@@ -2660,10 +2681,10 @@ export class DataLayer {
           }
           pageEntry.values = pageValues;
         }
-        published[pageId] = pageEntry;
+        setOwnDataProperty(published, pageId, pageEntry);
       }
 
-      result.fields[fieldKey] = published;
+      setOwnDataProperty(result.fields, fieldKey, published);
       result.stats.fieldsLoaded++;
     };
 
@@ -2671,11 +2692,11 @@ export class DataLayer {
     for (const pageId of pageIds) {
       const cellIndices = this.getCellIndicesForPage(pageId);
       const page = this.getPages().find(p => p.id === pageId);
-      result.pageData[pageId] = {
+      setOwnDataProperty(result.pageData, pageId, {
         name: page?.name || pageId,
         cellIndices,
         cellCount: cellIndices.length
-      };
+      });
       result.stats.cellsTotal += cellIndices.length;
     }
 
@@ -2828,11 +2849,11 @@ export class DataLayer {
     for (const pageId of pageIds) {
       const cellIndices = this.getCellIndicesForPage(pageId);
       const page = this.getPages().find(p => p.id === pageId);
-      result.pageData[pageId] = {
+      setOwnDataProperty(result.pageData, pageId, {
         name: page?.name || pageId,
         cellIndices,
         cellCount: cellIndices.length
-      };
+      });
       result.stats.cellsTotal += cellIndices.length;
     }
 
@@ -2917,10 +2938,10 @@ export class DataLayer {
           }
         }
 
-        result.latent.pages[pageId] = {
+        setOwnDataProperty(result.latent.pages, pageId, {
           coordinates: pageCoords,
           cellCount: cellIndices.length
-        };
+        });
       }
       completedSteps++;
     }

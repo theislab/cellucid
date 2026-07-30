@@ -210,6 +210,7 @@ export class HighPerfBenchmark {
     });
 
     this.renderer.setQuality(this.config.shaderQuality);
+    this.renderer.setForceLOD(this.config.forceLODLevel);
     this.isActive = true;
 
     console.log('[HighPerfBenchmark] Renderer initialized:', {
@@ -247,16 +248,36 @@ export class HighPerfBenchmark {
    * Configure LOD settings
    */
   setLODEnabled(enabled) {
-    this.config.useLOD = enabled;
+    if (typeof enabled !== 'boolean') {
+      throw new TypeError(
+        'HighPerfBenchmark LOD enabled must be a boolean.'
+      );
+    }
     if (this.renderer) {
       this.renderer.setAdaptiveLOD(enabled);
     }
+    this.config.useLOD = enabled;
   }
   
   /**
    * Force a specific LOD level (-1 = auto)
    */
   setForceLODLevel(level) {
+    if (!Number.isInteger(level)) {
+      throw new TypeError(
+        'HighPerfBenchmark forced LOD level must be an integer.'
+      );
+    }
+    if (level < -1) {
+      throw new RangeError(
+        'HighPerfBenchmark forced LOD level must be -1 or greater.'
+      );
+    }
+    // Renderer acceptance is the publication boundary. A rejected level must
+    // leave the benchmark configuration unchanged.
+    if (this.renderer) {
+      this.renderer.setForceLOD(level);
+    }
     this.config.forceLODLevel = level;
   }
   
@@ -264,20 +285,37 @@ export class HighPerfBenchmark {
    * Configure frustum culling
    */
   setFrustumCullingEnabled(enabled) {
-    this.config.useFrustumCulling = enabled;
+    if (typeof enabled !== 'boolean') {
+      throw new TypeError(
+        'HighPerfBenchmark frustum culling enabled must be a boolean.'
+      );
+    }
     if (this.renderer) {
       this.renderer.setFrustumCulling(enabled);
     }
+    this.config.useFrustumCulling = enabled;
   }
   
   /**
    * Set shader quality level
    */
   setShaderQuality(quality) {
-    this.config.shaderQuality = quality;
+    if (
+      quality !== BenchmarkConfig.QUALITY_FULL &&
+      quality !== BenchmarkConfig.QUALITY_LIGHT &&
+      quality !== BenchmarkConfig.QUALITY_ULTRALIGHT
+    ) {
+      throw new RangeError(
+        'HighPerfBenchmark shader quality must be exactly "full", ' +
+        '"light", or "ultralight".'
+      );
+    }
+    // Renderer acceptance is the publication boundary. Missing programs,
+    // context loss, or any other rejection must leave benchmark state exact.
     if (this.renderer) {
       this.renderer.setQuality(quality);
     }
+    this.config.shaderQuality = quality;
   }
   
   /**
@@ -487,6 +525,9 @@ export class HighPerfBenchmark {
 
       if (this.renderer) {
         this.renderer.setAdaptiveLOD(originalConfig.useLOD);
+        this.renderer.setForceLOD(
+          originalConfig.forceLODLevel
+        );
         this.renderer.setFrustumCulling(originalConfig.useFrustumCulling);
         this.renderer.setQuality(originalConfig.shaderQuality);
       }
@@ -3425,70 +3466,119 @@ export class BottleneckAnalyzer {
     const phases = {};
     const renderParams = this._getDefaultRenderParams();
 
-    // Store original config
-    const originalLOD = this.renderer.adaptiveLOD;
-    const originalFrustum = this.renderer.frustumCullingEnabled;
-
-    // Test 1: Measure with LOD disabled vs enabled
-    console.log('  - Testing LOD overhead...');
-    this.renderer.setAdaptiveLOD(false);
-    const noLODTimes = await this._measureFrameTimes(config.testFrames / 4, renderParams);
-
-    this.renderer.setAdaptiveLOD(true);
-    const withLODTimes = await this._measureFrameTimes(config.testFrames / 4, renderParams);
-
-    phases.lodOverhead = {
-      avgWithout: this._avg(noLODTimes),
-      avgWith: this._avg(withLODTimes),
-      overhead: this._avg(withLODTimes) - this._avg(noLODTimes),
-      percentOfFrame: ((this._avg(withLODTimes) - this._avg(noLODTimes)) / this._avg(withLODTimes)) * 100
-    };
-
-    // Test 2: Measure frustum culling overhead
-    console.log('  - Testing frustum culling overhead...');
-    this.renderer.setFrustumCulling(false);
-    const noFrustumTimes = await this._measureFrameTimes(config.testFrames / 4, renderParams);
-
-    this.renderer.setFrustumCulling(true);
-    const withFrustumTimes = await this._measureFrameTimes(config.testFrames / 4, renderParams);
-
-    phases.frustumCullingOverhead = {
-      avgWithout: this._avg(noFrustumTimes),
-      avgWith: this._avg(withFrustumTimes),
-      overhead: this._avg(withFrustumTimes) - this._avg(noFrustumTimes),
-      percentOfFrame: ((this._avg(withFrustumTimes) - this._avg(noFrustumTimes)) / this._avg(withFrustumTimes)) * 100
-    };
-
-    // Restore original settings
-    this.renderer.setAdaptiveLOD(originalLOD);
-    this.renderer.setFrustumCulling(originalFrustum);
-
-    // Test 3: Shader quality comparison
-    console.log('  - Testing shader complexity overhead...');
-    const shaderTests = {};
-    for (const quality of ['ultralight', 'light', 'full']) {
-      this.renderer.setQuality(quality);
-      const times = await this._measureFrameTimes(config.testFrames / 6, renderParams);
-      shaderTests[quality] = {
-        avg: this._avg(times),
-        min: Math.min(...times),
-        max: Math.max(...times)
-      };
+    // Store the exact public renderer state. The previous property names never
+    // existed and therefore restored `undefined`, silently disabling features.
+    const originalLOD = this.renderer.useAdaptiveLOD;
+    const originalFrustum = this.renderer.useFrustumCulling;
+    const originalQuality = this.renderer.activeQuality;
+    const originalForceLOD = this.renderer.forceLODLevel;
+    if (
+      typeof originalLOD !== 'boolean' ||
+      typeof originalFrustum !== 'boolean' ||
+      !['ultralight', 'light', 'full'].includes(originalQuality) ||
+      !Number.isInteger(originalForceLOD) ||
+      originalForceLOD < -1 ||
+      (
+        originalLOD === false &&
+        originalForceLOD !== -1
+      ) ||
+      typeof this.renderer.setForceLOD !== 'function'
+    ) {
+      throw new Error(
+        'Bottleneck CPU analysis requires exact compatible renderer feature, forced-LOD, and quality state.'
+      );
     }
+    // render() owns the shader selection too. Keep its stable parameter record
+    // synchronized with the explicitly measured renderer quality.
+    renderParams.quality = originalQuality;
 
-    phases.shaderComplexity = {
-      ultralight: shaderTests.ultralight,
-      light: shaderTests.light,
-      full: shaderTests.full,
-      lightVsUltralight: shaderTests.light.avg - shaderTests.ultralight.avg,
-      fullVsLight: shaderTests.full.avg - shaderTests.light.avg,
-      fullVsUltralight: shaderTests.full.avg - shaderTests.ultralight.avg
-    };
+    let analysisFailure = null;
+    try {
+      // Test 1: Measure with LOD disabled vs enabled
+      console.log('  - Testing LOD overhead...');
+      this.renderer.setAdaptiveLOD(false);
+      const noLODTimes = await this._measureFrameTimes(config.testFrames / 4, renderParams);
 
-    // Reset to full quality
-    this.renderer.setQuality('full');
+      this.renderer.setAdaptiveLOD(true);
+      const withLODTimes = await this._measureFrameTimes(config.testFrames / 4, renderParams);
 
-    return phases;
+      phases.lodOverhead = {
+        avgWithout: this._avg(noLODTimes),
+        avgWith: this._avg(withLODTimes),
+        overhead: this._avg(withLODTimes) - this._avg(noLODTimes),
+        percentOfFrame: ((this._avg(withLODTimes) - this._avg(noLODTimes)) / this._avg(withLODTimes)) * 100
+      };
+
+      // Test 2: Measure frustum culling overhead
+      console.log('  - Testing frustum culling overhead...');
+      this.renderer.setFrustumCulling(false);
+      const noFrustumTimes = await this._measureFrameTimes(config.testFrames / 4, renderParams);
+
+      this.renderer.setFrustumCulling(true);
+      const withFrustumTimes = await this._measureFrameTimes(config.testFrames / 4, renderParams);
+
+      phases.frustumCullingOverhead = {
+        avgWithout: this._avg(noFrustumTimes),
+        avgWith: this._avg(withFrustumTimes),
+        overhead: this._avg(withFrustumTimes) - this._avg(noFrustumTimes),
+        percentOfFrame: ((this._avg(withFrustumTimes) - this._avg(noFrustumTimes)) / this._avg(withFrustumTimes)) * 100
+      };
+
+      // Test 3: Shader quality comparison
+      console.log('  - Testing shader complexity overhead...');
+      const shaderTests = {};
+      for (const quality of ['ultralight', 'light', 'full']) {
+        renderParams.quality = quality;
+        this.renderer.setQuality(quality);
+        const times = await this._measureFrameTimes(config.testFrames / 6, renderParams);
+        shaderTests[quality] = {
+          avg: this._avg(times),
+          min: Math.min(...times),
+          max: Math.max(...times)
+        };
+      }
+
+      phases.shaderComplexity = {
+        ultralight: shaderTests.ultralight,
+        light: shaderTests.light,
+        full: shaderTests.full,
+        lightVsUltralight: shaderTests.light.avg - shaderTests.ultralight.avg,
+        fullVsLight: shaderTests.full.avg - shaderTests.light.avg,
+        fullVsUltralight: shaderTests.full.avg - shaderTests.ultralight.avg
+      };
+      return phases;
+    } catch (error) {
+      analysisFailure = error;
+      throw error;
+    } finally {
+      const restorationFailures = [];
+      for (const restore of [
+        () => this.renderer.setAdaptiveLOD(originalLOD),
+        () => {
+          if (
+            this.renderer.forceLODLevel !== originalForceLOD
+          ) {
+            this.renderer.setForceLOD(originalForceLOD);
+          }
+        },
+        () => this.renderer.setFrustumCulling(originalFrustum),
+        () => this.renderer.setQuality(originalQuality),
+      ]) {
+        try {
+          restore();
+        } catch (error) {
+          restorationFailures.push(error);
+        }
+      }
+      if (restorationFailures.length > 0) {
+        throw new AggregateError(
+          analysisFailure === null
+            ? restorationFailures
+            : [analysisFailure, ...restorationFailures],
+          'Bottleneck CPU analysis could not restore exact renderer state.'
+        );
+      }
+    }
   }
 
   /**
@@ -4289,31 +4379,53 @@ export class BottleneckAnalyzer {
   // ========================
 
   async _measureFrameTimes(frames, renderParams) {
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
       const times = [];
       let count = 0;
       let lastTime = performance.now();
+      let settled = false;
 
-      const measure = () => {
-        const now = performance.now();
-        const frameTime = now - lastTime;
-        lastTime = now;
+      const rejectOnce = error => {
+        if (settled) return;
+        settled = true;
+        reject(error);
+      };
 
-        this.renderer.render(renderParams);
-
-        if (count > 0 && frameTime > 0.1 && frameTime < 1000) {
-          times.push(frameTime);
-        }
-
-        count++;
-        if (count < frames + 1) {
+      const scheduleNext = () => {
+        if (settled) return;
+        try {
           requestAnimationFrame(measure);
-        } else {
-          resolve(times);
+        } catch (error) {
+          rejectOnce(error);
         }
       };
 
-      requestAnimationFrame(measure);
+      const measure = () => {
+        if (settled) return;
+        try {
+          const now = performance.now();
+          const frameTime = now - lastTime;
+          lastTime = now;
+
+          this.renderer.render(renderParams);
+
+          if (count > 0 && frameTime > 0.1 && frameTime < 1000) {
+            times.push(frameTime);
+          }
+
+          count++;
+          if (count < frames + 1) {
+            scheduleNext();
+          } else {
+            settled = true;
+            resolve(times);
+          }
+        } catch (error) {
+          rejectOnce(error);
+        }
+      };
+
+      scheduleNext();
     });
   }
 
@@ -4344,8 +4456,12 @@ export class BottleneckAnalyzer {
       cameraPosition: [0, 0, 5],
       cameraDistance: 5.0,
       forceLOD: -1,
-      quality: 'full',
-      dimensionLevel: 3
+      quality: this.renderer.activeQuality,
+      viewId: 'benchmark',
+      dimensionLevel: 3,
+      useAlphaTexture: false,
+      autoFog: true,
+      overrideBounds: null
     };
   }
 

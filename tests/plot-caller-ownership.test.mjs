@@ -576,6 +576,8 @@ test('form plot-option bursts keep one modal render running and coalesce the pen
     const renderGate = deferred();
     const started = [];
     const plotDef = {
+      defaultOptions: {},
+      optionSchema: {},
       async render(_data, options, candidate) {
         started.push(`${candidate.parentNode.id}:${options.mode}`);
         await renderGate.promise;

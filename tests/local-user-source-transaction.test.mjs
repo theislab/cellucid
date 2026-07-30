@@ -1620,6 +1620,46 @@ test('prepared embeddings publish only the exact current identity and advertised
   });
 });
 
+test('prepared identity payload paths decode exactly once', () => {
+  for (const path of [
+    '%252e%252e/points_2d.bin',
+    'nested/%252fpoints_2d.bin',
+    'nested/%255cpoints_2d.bin',
+    'nested/%2541.bin',
+  ]) {
+    const identity = createPreparedIdentity({
+      pointsFilename: path,
+    });
+    assert.throws(
+      () => validateDatasetIdentity(
+        identity,
+        identity.id,
+        'local-user'
+      ),
+      /embeddings\.files\.2d.*safe relative file path/i,
+      path,
+    );
+  }
+
+  const canonicalPath =
+    'cell%20atlas/%E7%BB%86%E8%83%9E.bin';
+  const canonicalIdentity = createPreparedIdentity({
+    pointsFilename: canonicalPath,
+  });
+  assert.strictEqual(
+    validateDatasetIdentity(
+      canonicalIdentity,
+      canonicalIdentity.id,
+      'local-user'
+    ),
+    canonicalIdentity,
+  );
+  assert.equal(
+    canonicalIdentity.embeddings.files['2d'],
+    canonicalPath,
+  );
+});
+
 test('prepared exports reject aliased advertised payload paths', async t => {
   const fixtures = [
     {

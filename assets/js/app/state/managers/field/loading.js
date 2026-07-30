@@ -713,7 +713,6 @@ export class FieldLoadingMethods {
 
     this.updateOutlierQuantiles();
     this._pushColorsToViewer();
-    this._pushTransparencyToViewer();
     this._pushCentroidsToViewer();
     this.computeGlobalVisibility();
     this._syncActiveContext();
@@ -746,7 +745,6 @@ export class FieldLoadingMethods {
 
     this.updateOutlierQuantiles();
     this._pushColorsToViewer();
-    this._pushTransparencyToViewer();
     this._pushCentroidsToViewer();
     this.computeGlobalVisibility();
     this._syncActiveContext();

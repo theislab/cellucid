@@ -231,12 +231,27 @@ test('remote custom URLs use one canonical explicit transport', () => {
       secure: true,
     }
   );
+  assert.deepEqual(
+    parseRemoteUrl(
+      'remotes://example.test/cell%20atlas/%E7%BB%86%E8%83%9E.bin'
+    ),
+    {
+      serverUrl: 'https://example.test',
+      path:
+        'cell%20atlas/%E7%BB%86%E8%83%9E.bin',
+      secure: true,
+    }
+  );
 
   for (const malformed of [
     'remote://example.test',
     'remote://EXAMPLE.test/data/',
     'remote://user@example.test/data/',
     'remote://example.test/a/../data/',
+    'remote://example.test/%252e%252e/data/',
+    'remote://example.test/nested/%252fdata/',
+    'remote://example.test/nested/%255cdata/',
+    'remote://example.test/nested/%2541/',
     'remote://example.test/data/?query=1',
     ' remote://example.test/data/',
   ]) {
@@ -255,6 +270,10 @@ test('remote connection configuration rejects normalization and retired reconnec
     { url: 'HTTP://127.0.0.1:8765' },
     { url: 'http://user:secret@127.0.0.1:8765' },
     { url: 'http://127.0.0.1:8765?mode=remote' },
+    { url: 'http://127.0.0.1:8765/%252e%252e' },
+    { url: 'http://127.0.0.1:8765/nested/%252fdata' },
+    { url: 'http://127.0.0.1:8765/nested/%255cdata' },
+    { url: 'http://127.0.0.1:8765/nested/%2541' },
     { url: 'http://127.0.0.1:8765', timeout: 0 },
     { url: 'http://127.0.0.1:8765', timeout: 5000.5 },
     { url: 'http://127.0.0.1:8765', autoReconnect: true },
@@ -311,6 +330,47 @@ test('connect adopts one complete exported server and exact catalog transaction'
     source.getMetadata('undeclared'),
     /not declared/i
   );
+});
+
+test('remote resolution is confined to current declared dataset paths', async t => {
+  const origin = 'http://127.0.0.1:8765/viewer';
+  installFetch(t, url => {
+    if (url === `${origin}/_cellucid/health`) {
+      return jsonResponse(exportedHealth());
+    }
+    if (url === `${origin}/_cellucid/info`) {
+      return jsonResponse(exportedInfo());
+    }
+    if (url === `${origin}/_cellucid/datasets`) {
+      return jsonResponse(catalog([
+        { id: 'cells', path: '/cells/', name: 'Cells' },
+      ]));
+    }
+    return jsonResponse({}, 404);
+  });
+
+  const source = new RemoteDataSource();
+  await source.connect({ url: origin });
+  assert.equal(
+    source.getBaseUrl('cells'),
+    'remote://127.0.0.1:8765/viewer/cells/'
+  );
+  assert.equal(
+    await source.resolveUrl(
+      'remote://127.0.0.1:8765/viewer/cells/points_2d.bin'
+    ),
+    `${origin}/cells/points_2d.bin`
+  );
+  for (const url of [
+    'remote://127.0.0.1:8765/viewer/retired/private.json',
+    'remote://127.0.0.1:8765/viewer/_cellucid/events',
+  ]) {
+    await assert.rejects(
+      source.resolveUrl(url),
+      /currently declared dataset/i,
+      url
+    );
+  }
 });
 
 test('connect accepts the exact current AnnData health and info pair', async t => {
@@ -490,6 +550,147 @@ test('dataset catalog and identity names must agree exactly', async t => {
   const source = new RemoteDataSource();
   await source.connect({ url: 'http://127.0.0.1:8765' });
   await assert.rejects(source.listDatasets(), /catalog name.*does not match/i);
+});
+
+test('remote listing aborts and drains metadata siblings after one exact failure', async t => {
+  let heldSignal = null;
+  let heldSettled = false;
+  installFetch(t, (url, options) => {
+    if (url.endsWith('/_cellucid/health')) {
+      return jsonResponse(exportedHealth());
+    }
+    if (url.endsWith('/_cellucid/info')) {
+      return jsonResponse(exportedInfo());
+    }
+    if (url.endsWith('/_cellucid/datasets')) {
+      return jsonResponse(catalog([
+        { id: 'invalid', path: '/invalid/', name: 'Invalid' },
+        { id: 'held', path: '/held/', name: 'Held' },
+      ]));
+    }
+    if (url.endsWith('/invalid/dataset_identity.json')) {
+      return jsonResponse({});
+    }
+    if (url.endsWith('/held/dataset_identity.json')) {
+      heldSignal = options.signal ?? null;
+      return new Promise((_resolve, reject) => {
+        heldSignal.addEventListener('abort', () => {
+          heldSettled = true;
+          reject(heldSignal.reason);
+        }, { once: true });
+      });
+    }
+    return jsonResponse({}, 404);
+  });
+
+  const source = new RemoteDataSource();
+  await source.connect({ url: 'http://127.0.0.1:8765' });
+  await assert.rejects(
+    source.listDatasets(),
+    /dataset_identity|missing required field/i
+  );
+  assert.ok(heldSignal instanceof AbortSignal);
+  assert.equal(heldSignal.aborted, true);
+  assert.equal(heldSettled, true);
+});
+
+test('concurrent remote metadata reads coalesce within one catalog owner', async t => {
+  let identityCalls = 0;
+  let releaseIdentity;
+  const identityResponse = new Promise(resolve => {
+    releaseIdentity = resolve;
+  });
+  installFetch(t, url => {
+    if (url.endsWith('/_cellucid/health')) {
+      return jsonResponse(exportedHealth());
+    }
+    if (url.endsWith('/_cellucid/info')) {
+      return jsonResponse(exportedInfo());
+    }
+    if (url.endsWith('/_cellucid/datasets')) {
+      return jsonResponse(catalog());
+    }
+    if (url.endsWith('/dataset_identity.json')) {
+      identityCalls += 1;
+      return identityResponse;
+    }
+    return jsonResponse({}, 404);
+  });
+
+  const source = new RemoteDataSource();
+  await source.connect({ url: 'http://127.0.0.1:8765' });
+  const first = source.getMetadata('cells');
+  const second = source.getMetadata('cells');
+  assert.equal(identityCalls, 1);
+  releaseIdentity(jsonResponse(identity()));
+  const [firstMetadata, secondMetadata] = await Promise.all([
+    first,
+    second,
+  ]);
+  assert.equal(firstMetadata, secondMetadata);
+  assert.equal(await source.getMetadata('cells'), firstMetadata);
+  assert.equal(identityCalls, 1);
+});
+
+test('a newer remote catalog generation aborts and rejects stale metadata work', async t => {
+  let listing = catalog([
+    { id: 'cells', path: '/old/', name: 'Cells' },
+  ]);
+  let oldMetadataSignal = null;
+  let releaseOldMetadata;
+  let markOldMetadataStarted;
+  const oldMetadataStarted = new Promise(resolve => {
+    markOldMetadataStarted = resolve;
+  });
+  const oldMetadataResponse = new Promise(resolve => {
+    releaseOldMetadata = resolve;
+  });
+
+  installFetch(t, (url, options) => {
+    if (url.endsWith('/_cellucid/health')) {
+      return jsonResponse(exportedHealth());
+    }
+    if (url.endsWith('/_cellucid/info')) {
+      return jsonResponse(exportedInfo());
+    }
+    if (url.endsWith('/_cellucid/datasets')) {
+      return jsonResponse(listing);
+    }
+    if (url.endsWith('/old/dataset_identity.json')) {
+      oldMetadataSignal = options.signal ?? null;
+      markOldMetadataStarted();
+      return oldMetadataResponse;
+    }
+    if (url.endsWith('/new/dataset_identity.json')) {
+      const current = identity();
+      current.description = 'Current catalog generation';
+      return jsonResponse(current);
+    }
+    return jsonResponse({}, 404);
+  });
+
+  const source = new RemoteDataSource();
+  await source.connect({ url: 'http://127.0.0.1:8765' });
+
+  const staleMetadata = source.getMetadata('cells');
+  await oldMetadataStarted;
+  listing = catalog([
+    { id: 'cells', path: '/new/', name: 'Cells' },
+  ]);
+  const [currentMetadata] = await source.listDatasets();
+
+  assert.ok(oldMetadataSignal instanceof AbortSignal);
+  assert.equal(oldMetadataSignal.aborted, true);
+  releaseOldMetadata(jsonResponse(identity()));
+  await assert.rejects(staleMetadata, /abort|cancel|supersed/i);
+  assert.equal(
+    (await source.getMetadata('cells')).description,
+    currentMetadata.description
+  );
+  assert.equal(
+    source.getBaseUrl('cells'),
+    'remote://127.0.0.1:8765/new/'
+  );
 });
 
 test('remote JSON endpoints require exact HTTP and media-type success', async t => {

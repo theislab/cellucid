@@ -8,6 +8,7 @@ import { AnalysisWindowManager } from '../assets/js/app/analysis/ui/analysis-win
 import { PlotRenderSlot } from '../assets/js/app/analysis/shared/plot-render-slot.js';
 import { getMemoryMonitor } from '../assets/js/app/analysis/shared/memory-monitor.js';
 import { createDataState } from '../assets/js/app/state/index.js';
+import { EventEmitter } from '../assets/js/app/utils/event-emitter.js';
 import {
   setDockableAccordions,
 } from '../assets/js/app/dockable-accordions-registry.js';
@@ -1064,6 +1065,62 @@ test(
       restoreWindow();
     }
   },
+);
+
+test(
+  'ComparisonModule destroy synchronously detaches its shared state subscriptions',
+  async () => {
+    const state = new EventEmitter();
+    const comparison = Object.create(ComparisonModule.prototype);
+    let highlightChanges = 0;
+    let pageChanges = 0;
+    comparison.state = state;
+    comparison._stateUnsubscribers = [];
+    comparison.onPagesChanged = () => {
+      pageChanges++;
+    };
+    comparison.onHighlightChanged = () => {
+      highlightChanges++;
+    };
+    comparison._subscribeToStateChanges();
+    assert.equal(state.listenerCount('page:changed'), 1);
+    assert.equal(state.listenerCount('highlight:changed'), 1);
+
+    state.emit('page:changed');
+    state.emit('highlight:changed');
+    assert.deepEqual({ highlightChanges, pageChanges }, {
+      highlightChanges: 1,
+      pageChanges: 1
+    });
+
+    comparison._destroyPromise = null;
+    comparison._datasetResetPromise = null;
+    comparison._memoryMonitor = null;
+    comparison._analysisWindowManager = null;
+    comparison._uiManager = null;
+    comparison.dataLayer = null;
+    comparison._hooks = { beforeRender: [], afterRender: [] };
+    comparison.layoutEngine = {};
+    comparison.transformPipeline = {};
+    comparison._multiVariableAnalysis = {};
+    comparison._lastStatResults = [{}];
+    comparison._lastStatResultsTimestamp = 1;
+    comparison._currentPageData = {};
+
+    const destruction = comparison.destroy();
+    assert.equal(state.listenerCount('page:changed'), 0);
+    assert.equal(state.listenerCount('highlight:changed'), 0);
+    assert.doesNotThrow(() => {
+      state.emit('page:changed');
+      state.emit('highlight:changed');
+    });
+    assert.deepEqual({ highlightChanges, pageChanges }, {
+      highlightChanges: 1,
+      pageChanges: 1
+    });
+    assert.equal(comparison.destroy(), destruction);
+    await destruction;
+  }
 );
 
 test(

@@ -376,14 +376,16 @@ export class SmokeRenderer {
   // === VOLUME MANAGEMENT ===
 
   _assertMutableLifecycle(operation) {
-    if (this._disposeStarted || this.disposed) {
-      throw new Error(
-        `SmokeRenderer cannot ${operation} after disposal has started.`
-      );
-    }
+    // Context loss also starts terminal disposal, but it is the authoritative
+    // lifecycle cause and must retain its exact public diagnostic.
     if (this.contextLost) {
       throw new Error(
         `SmokeRenderer cannot ${operation} after WebGL context loss.`
+      );
+    }
+    if (this._disposeStarted || this.disposed) {
+      throw new Error(
+        `SmokeRenderer cannot ${operation} after disposal has started.`
       );
     }
   }
@@ -772,7 +774,22 @@ export class SmokeRenderer {
   }
 
   handleContextLost() {
+    if (this.contextLost) return false;
+    const hadDirectPublication = Boolean(
+      this.textureInfo?.texture ||
+      this.noiseTextures?.shape ||
+      this.noiseTextures?.detail ||
+      this.noiseTextures?.blueNoise ||
+      this.framebuffer ||
+      this.colorTex ||
+      this.quadBuffer ||
+      this.smokeVertexArray ||
+      this.compositeVertexArray ||
+      this.smokeProgram ||
+      this.compositeProgram
+    );
     this.contextLost = true;
+    this._disposeStarted = true;
     this.noiseGenerationToken++;
     this.noiseGenerationInProgress = false;
     this.noiseGenerationError = null;
@@ -785,6 +802,15 @@ export class SmokeRenderer {
     this.colorTex = null;
     this.targetWidth = 0;
     this.targetHeight = 0;
+    this.quadBuffer = null;
+    this.smokeVertexArray = null;
+    this.compositeVertexArray = null;
+    this.smokeProgram = null;
+    this.compositeProgram = null;
+    this.smokeAttribLocations = null;
+    this.compositeAttribLocations = null;
+    this.smokeUniformLocations = null;
+    this.compositeUniformLocations = null;
     this._pendingTextureDeletes?.clear();
     this._pendingFramebufferDeletes?.clear();
     this._pendingBufferDeletes?.clear();
@@ -796,6 +822,8 @@ export class SmokeRenderer {
     const noiseInvalidated =
       invalidatePendingCloudNoiseGeneratorResources(this.gl);
     return (
+      hadDirectPublication
+      ||
       transactionInvalidated
       || densityInvalidated
       || noiseInvalidated
@@ -1240,6 +1268,9 @@ export class SmokeRenderer {
   render({ invViewProjMatrix, eye, lightDir, width, height }) {
     const gl = this.gl;
 
+    if (this.contextLost) {
+      throw new Error('SmokeRenderer cannot render after WebGL context loss.');
+    }
     if (this.disposed) {
       throw new Error('SmokeRenderer cannot render after disposal.');
     }
@@ -1247,9 +1278,6 @@ export class SmokeRenderer {
       throw new Error(
         'SmokeRenderer cannot render after disposal has started.'
       );
-    }
-    if (this.contextLost) {
-      throw new Error('SmokeRenderer cannot render after WebGL context loss.');
     }
     this._convergePendingDirectResources('Smoke rendering');
     this._convergeNoiseGenerationTransaction('Smoke rendering');
@@ -1594,7 +1622,12 @@ export class SmokeRenderer {
     );
     attempt(
       failures,
-      () => gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA),
+      () => gl.blendFuncSeparate(
+        gl.SRC_ALPHA,
+        gl.ONE_MINUS_SRC_ALPHA,
+        gl.ONE,
+        gl.ONE_MINUS_SRC_ALPHA
+      ),
       'Smoke blend-function settlement failed with a non-Error value.'
     );
     if (failures.length > 0) {

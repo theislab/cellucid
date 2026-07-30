@@ -73,6 +73,76 @@ export function throwIfMetadataAborted(signal, label) {
 }
 
 /**
+ * Execute one metadata generation as an atomic, fail-fast batch.
+ *
+ * A child controller lets the first item failure cancel every sibling without
+ * retiring the caller's lifecycle owner. The method still drains every
+ * sibling before rejecting, so no request or parser can continue after the
+ * generation has already reported failure.
+ *
+ * @template T
+ * @template R
+ * @param {T[]} items
+ * @param {AbortSignal|null} ownerSignal
+ * @param {(item: T, signal: AbortSignal, index: number) => Promise<R>|R} loadItem
+ * @param {string} label
+ * @returns {Promise<R[]>}
+ */
+export async function loadMetadataBatchAtomically(
+  items,
+  ownerSignal,
+  loadItem,
+  label
+) {
+  if (!Array.isArray(items)) {
+    throw new TypeError(`${label} items must be an array`);
+  }
+  validateAbortSignalOrNull(ownerSignal, `${label} owner signal`);
+  if (typeof loadItem !== 'function') {
+    throw new TypeError(`${label} loader must be a function`);
+  }
+
+  const controller = new AbortController();
+  const abortFromOwner = () => {
+    controller.abort(ownerSignal?.reason);
+  };
+  if (ownerSignal !== null) {
+    ownerSignal.addEventListener('abort', abortFromOwner, {
+      once: true,
+    });
+    if (ownerSignal.aborted) abortFromOwner();
+  }
+
+  let hasFailure = false;
+  let firstFailure;
+  try {
+    const settled = await Promise.allSettled(
+      items.map(async (item, index) => {
+        try {
+          throwIfMetadataAborted(controller.signal, label);
+          return await loadItem(item, controller.signal, index);
+        } catch (error) {
+          if (!hasFailure && !ownerSignal?.aborted) {
+            hasFailure = true;
+            firstFailure = error;
+            controller.abort(error);
+          }
+          throw error;
+        }
+      })
+    );
+
+    if (ownerSignal?.aborted) {
+      throw createMetadataAbortError(label);
+    }
+    if (hasFailure) throw firstFailure;
+    return settled.map(outcome => outcome.value);
+  } finally {
+    ownerSignal?.removeEventListener('abort', abortFromOwner);
+  }
+}
+
+/**
  * Observe a direct metadata promise while allowing its consumer to cancel.
  * Both result handlers stay attached so late completion is never unhandled.
  *

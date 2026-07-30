@@ -166,6 +166,17 @@ test('GitHub repository inputs select one deterministic branch and path', () => 
       path: 'exports',
     }
   );
+  assert.deepEqual(
+    parseGitHubPath(
+      'owner/repo/cell%20atlas/%E7%BB%86%E8%83%9E'
+    ),
+    {
+      owner: 'owner',
+      repo: 'repo',
+      branch: 'main',
+      path: 'cell atlas/细胞',
+    }
+  );
 
   assert.equal(
     parseGitHubPath('https://example.test/owner/repo/exports'),
@@ -178,6 +189,19 @@ test('GitHub repository inputs select one deterministic branch and path', () => 
     null
   );
   assert.equal(parseGitHubPath('owner/repo@../exports'), null);
+  for (const nestedEncoding of [
+    'owner/repo/%252e%252e/escape',
+    'owner/repo/nested/%252fescape',
+    'owner/repo/nested/%255cescape',
+    'owner/repo/nested/%2541',
+    'https://github.com/owner/repo/tree/main/%252e%252e/escape',
+  ]) {
+    assert.equal(
+      parseGitHubPath(nestedEncoding),
+      null,
+      nestedEncoding,
+    );
+  }
 });
 
 test('GitHub connect never probes branches or reinterprets path segments', async t => {
@@ -340,6 +364,10 @@ test('GitHub catalog paths must be safe relative directories', async t => {
     'https://example.test/dataset/',
     'nested/%2e%2e/escape/',
     'nested/%2Fescape/',
+    '%252e%252e/escape/',
+    'nested/%252fescape/',
+    'nested/%255cescape/',
+    'nested/%2541/',
     'nested\\dataset/',
     'nested/?query/',
     'nested/#fragment/',
@@ -361,6 +389,26 @@ test('GitHub catalog paths must be safe relative directories', async t => {
       ]);
     });
   }
+});
+
+test('GitHub catalog preserves canonical spaces and single-encoded Unicode', async t => {
+  const path =
+    'cell%20atlas/%E7%BB%86%E8%83%9E/';
+  const catalog = manifest({
+    datasets: [{ id: 'first', path }],
+  });
+  const { source, input, requested } =
+    installSingleDatasetRepository(t, { catalog });
+
+  await source.connect(input);
+  assert.equal(
+    source.getBaseUrl('first'),
+    `https://raw.githubusercontent.com/owner/repo/main/exports/${path}`
+  );
+  assert.deepEqual(requested, [
+    'https://raw.githubusercontent.com/owner/repo/main/exports/datasets.json',
+    `https://raw.githubusercontent.com/owner/repo/main/exports/${path}dataset_identity.json`,
+  ]);
 });
 
 test('GitHub catalog adoption rejects every dataset when one identity fails', async t => {
@@ -513,6 +561,120 @@ test('a failed GitHub reconnect preserves the adopted repository', async t => {
   ]);
 });
 
+test('disconnect aborts an in-flight GitHub candidate before it can adopt', async t => {
+  silenceNotifications(t);
+  const originalFetch = globalThis.fetch;
+  let catalogSignal = null;
+  let releaseCatalog;
+  let markCatalogStarted;
+  const catalogStarted = new Promise(resolve => {
+    markCatalogStarted = resolve;
+  });
+  const catalogResponse = new Promise(resolve => {
+    releaseCatalog = resolve;
+  });
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input);
+    if (url.endsWith('/datasets.json')) {
+      catalogSignal = init.signal ?? null;
+      markCatalogStarted();
+      return catalogResponse;
+    }
+    if (url.endsWith('/dataset_identity.json')) {
+      return jsonResponse(identity('first', {
+        name: 'First identity',
+        description: 'First description',
+      }));
+    }
+    return jsonResponse({}, 404);
+  };
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const source = new GitHubDataSource();
+  const pendingConnect = source.connect('owner/repo/exports');
+  await catalogStarted;
+  source.disconnect();
+
+  assert.ok(catalogSignal instanceof AbortSignal);
+  assert.equal(catalogSignal.aborted, true);
+  releaseCatalog(jsonResponse(manifest()));
+  await assert.rejects(pendingConnect, /abort|cancel|supersed/i);
+  assert.equal(await source.isAvailable(), false);
+  assert.deepEqual(await source.listDatasets(), []);
+});
+
+test('disconnect preserves cancellation while a GitHub identity is loading', async t => {
+  const notifications = getNotificationCenter();
+  const originalNotifications = {
+    loading: notifications.loading,
+    complete: notifications.complete,
+    fail: notifications.fail,
+    dismiss: notifications.dismiss,
+  };
+  let failures = 0;
+  let dismissals = 0;
+  notifications.loading = () => 'github-identity-cancellation';
+  notifications.complete = () => {};
+  notifications.fail = () => {
+    failures += 1;
+  };
+  notifications.dismiss = () => {
+    dismissals += 1;
+  };
+  t.after(() => {
+    notifications.loading = originalNotifications.loading;
+    notifications.complete = originalNotifications.complete;
+    notifications.fail = originalNotifications.fail;
+    notifications.dismiss = originalNotifications.dismiss;
+  });
+
+  const originalFetch = globalThis.fetch;
+  let identitySignal = null;
+  let releaseIdentity;
+  let markIdentityStarted;
+  const identityStarted = new Promise(resolve => {
+    markIdentityStarted = resolve;
+  });
+  const identityResponse = new Promise(resolve => {
+    releaseIdentity = resolve;
+  });
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input);
+    if (url.endsWith('/datasets.json')) {
+      return jsonResponse(manifest());
+    }
+    if (url.endsWith('/dataset_identity.json')) {
+      identitySignal = init.signal ?? null;
+      markIdentityStarted();
+      return identityResponse;
+    }
+    return jsonResponse({}, 404);
+  };
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const source = new GitHubDataSource();
+  const pendingConnect = source.connect('owner/repo/exports');
+  await identityStarted;
+  source.disconnect();
+
+  assert.ok(identitySignal instanceof AbortSignal);
+  assert.equal(identitySignal.aborted, true);
+  releaseIdentity(jsonResponse(identity('first', {
+    name: 'First identity',
+    description: 'First description',
+  })));
+  await assert.rejects(
+    pendingConnect,
+    error => error?.name === 'AbortError'
+  );
+  assert.equal(failures, 0);
+  assert.equal(dismissals, 1);
+});
+
 test('GitHub refresh stages and validates a complete generation before swap', async t => {
   silenceNotifications(t);
   let phase = 'initial';
@@ -574,6 +736,75 @@ test('GitHub refresh stages and validates a complete generation before swap', as
   assert.throws(
     () => source.getBaseUrl('first'),
     /first.*not found.*datasets\.json|dataset.*first.*not found/i
+  );
+});
+
+test('clearing GitHub caches aborts an in-flight refresh generation', async t => {
+  silenceNotifications(t);
+  const originalFetch = globalThis.fetch;
+  let phase = 'initial';
+  let refreshIdentitySignal = null;
+  let releaseRefreshIdentity;
+  let markRefreshIdentityStarted;
+  const refreshIdentityStarted = new Promise(resolve => {
+    markRefreshIdentityStarted = resolve;
+  });
+  const refreshIdentityResponse = new Promise(resolve => {
+    releaseRefreshIdentity = resolve;
+  });
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input);
+    if (url.endsWith('/datasets.json')) {
+      return jsonResponse(manifest());
+    }
+    if (url.endsWith('/dataset_identity.json')) {
+      if (phase === 'refresh') {
+        refreshIdentitySignal = init.signal ?? null;
+        markRefreshIdentityStarted();
+        return refreshIdentityResponse;
+      }
+      return jsonResponse(identity('first', {
+        name: 'First identity',
+        description: 'First description',
+      }));
+    }
+    return jsonResponse({}, 404);
+  };
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const source = new GitHubDataSource();
+  await source.connect('owner/repo/exports');
+  const adoptedManifest = source._manifest;
+  const adoptedDatasets = source._datasets;
+  phase = 'refresh';
+  const pendingRefresh = source.refresh();
+  await refreshIdentityStarted;
+  source.clearCaches();
+
+  assert.ok(refreshIdentitySignal instanceof AbortSignal);
+  assert.equal(refreshIdentitySignal.aborted, true);
+  releaseRefreshIdentity(jsonResponse(identity('first', {
+    name: 'First identity',
+    description: 'First description',
+  })));
+  await assert.rejects(
+    pendingRefresh,
+    error => error?.name === 'AbortError'
+  );
+  assert.equal(await source.isAvailable(), true);
+  assert.equal(source._manifest, adoptedManifest);
+  assert.equal(source._datasets, adoptedDatasets);
+  assert.equal(source.requiresManualReconnect(), false);
+  assert.equal(
+    (await source.getMetadata('first')).name,
+    'First identity'
+  );
+  assert.deepEqual(await source.listDatasets(), adoptedDatasets);
+  assert.equal(
+    source.getBaseUrl('first'),
+    'https://raw.githubusercontent.com/owner/repo/main/exports/first/'
   );
 });
 

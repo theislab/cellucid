@@ -8,6 +8,8 @@
  * small getter callbacks so that viewer.js owns camera and data.
  */
 
+import { configureStraightAlphaBlending } from './gl-utils.js';
+
 export function createProjectileSystem({
   gl,
   canvas,
@@ -105,6 +107,7 @@ export function createProjectileSystem({
   let chargeLevel = 0;
   let chargeViewportInfo = null;
   let chargeIndicatorNeedsClear = false;
+  let contextLossChargeIndicatorNeedsClear = false;
 
   // Track total projectile points for draw call
   let projectilePointCount = 0;
@@ -173,7 +176,8 @@ export function createProjectileSystem({
 
     const dimLevel = getCurrentDimensionLevel();
     hpRenderer.ensureSpatialIndex(dimLevel);
-    const spatialIndex = hpRenderer.getSpatialIndex(dimLevel);
+    const spatialIndex =
+      hpRenderer.spatialIndices.get(dimLevel) ?? null;
     if (!spatialIndex) {
       throw new Error(
         `Projectile collision spatial index for ${dimLevel}D data was not published.`
@@ -652,6 +656,7 @@ export function createProjectileSystem({
   }) {
     if (projectilePointCount === 0) return;
 
+    configureStraightAlphaBlending(gl);
     gl.useProgram(centroidProgram);
     gl.uniformMatrix4fv(centroidUniformLocations.mvpMatrix, false, mvpMatrix);
     gl.uniformMatrix4fv(centroidUniformLocations.viewMatrix, false, viewMatrix);
@@ -702,27 +707,48 @@ export function createProjectileSystem({
     gl.uniform1f(centroidUniformLocations.viewportHeight, viewportHeight);
     gl.uniform1f(centroidUniformLocations.fov, fov);
 
-    gl.enable(gl.BLEND);
-    gl.blendFunc(gl.SRC_ALPHA, gl.ONE);
+    let renderFailure;
+    try {
+      gl.enable(gl.BLEND);
+      gl.blendEquation(gl.FUNC_ADD);
+      gl.blendFuncSeparate(
+        gl.SRC_ALPHA,
+        gl.ONE,
+        gl.ONE,
+        gl.ONE_MINUS_SRC_ALPHA
+      );
 
-    gl.bindBuffer(gl.ARRAY_BUFFER, impactPositionBuffer);
-    gl.enableVertexAttribArray(centroidAttribLocations.position);
-    gl.vertexAttribPointer(centroidAttribLocations.position, 3, gl.FLOAT, false, 0, 0);
+      gl.bindBuffer(gl.ARRAY_BUFFER, impactPositionBuffer);
+      gl.enableVertexAttribArray(centroidAttribLocations.position);
+      gl.vertexAttribPointer(centroidAttribLocations.position, 3, gl.FLOAT, false, 0, 0);
 
-    gl.bindBuffer(gl.ARRAY_BUFFER, impactColorBuffer);
-    gl.enableVertexAttribArray(centroidAttribLocations.color);
-    gl.vertexAttribPointer(
-      centroidAttribLocations.color,
-      4,
-      gl.UNSIGNED_BYTE,
-      true,
-      0,
-      0,
-    ); // RGBA uint8 normalized
+      gl.bindBuffer(gl.ARRAY_BUFFER, impactColorBuffer);
+      gl.enableVertexAttribArray(centroidAttribLocations.color);
+      gl.vertexAttribPointer(
+        centroidAttribLocations.color,
+        4,
+        gl.UNSIGNED_BYTE,
+        true,
+        0,
+        0,
+      ); // RGBA uint8 normalized
 
-    gl.drawArrays(gl.POINTS, 0, count);
-
-    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+      gl.drawArrays(gl.POINTS, 0, count);
+    } catch (error) {
+      renderFailure = error;
+    }
+    try {
+      configureStraightAlphaBlending(gl);
+    } catch (settlementFailure) {
+      if (renderFailure !== undefined) {
+        throw new AggregateError(
+          [renderFailure, settlementFailure],
+          'Projectile impact rendering and blend-state settlement both failed.'
+        );
+      }
+      throw settlementFailure;
+    }
+    if (renderFailure !== undefined) throw renderFailure;
   }
 
   // ========== Charge Indicator System ==========
@@ -833,8 +859,8 @@ export function createProjectileSystem({
     }
   }
 
-  function clearChargeIndicator() {
-    if (!chargeIndicatorNeedsClear) return;
+  function clearChargeIndicator(force = false) {
+    if (!force && !chargeIndicatorNeedsClear) return;
     const lassoCtx = getLassoCtx();
     if (!lassoCtx) {
       chargeIndicatorNeedsClear = false;
@@ -936,6 +962,60 @@ export function createProjectileSystem({
       impactFlashes.length = 0;
       projectileBufferDirty = true;
       impactBufferDirty = true;
+    },
+    /**
+     * A lost context invalidates every buffer without an explicit WebGL
+     * deletion. Publish the same terminal CPU/DOM fence as dispose(), while
+     * dropping invalid handles so later viewer disposal remains GL-silent.
+     */
+    handleContextLost() {
+      if (disposed) return false;
+      // Publish all terminal CPU/GPU ownership first. Charge-indicator cleanup
+      // calls user-controlled canvas methods and may re-enter viewer disposal.
+      const needsChargeIndicatorCleanup =
+        isCharging || chargeIndicatorNeedsClear;
+      disposeRequested = true;
+      projectilesEnabled = false;
+      projectilePositionBuffer = null;
+      projectileColorBuffer = null;
+      impactPositionBuffer = null;
+      impactColorBuffer = null;
+      centroidProgram = null;
+      for (const locations of [
+        centroidAttribLocations,
+        centroidUniformLocations,
+      ]) {
+        if (!locations || typeof locations !== 'object') continue;
+        for (const key of Object.keys(locations)) {
+          locations[key] = null;
+        }
+      }
+      isCharging = false;
+      chargeLevel = 0;
+      chargeViewportInfo = null;
+      chargeIndicatorNeedsClear = false;
+      projectiles.length = 0;
+      impactFlashes.length = 0;
+      projectilePositions = new Float32Array();
+      projectileColors = new Uint8Array();
+      impactPositions = new Float32Array();
+      impactColors = new Uint8Array();
+      projectilePointCount = 0;
+      contextLossChargeIndicatorNeedsClear =
+        needsChargeIndicatorCleanup;
+      disposed = true;
+      gl = null;
+      return true;
+    },
+    /**
+     * Retire the 2D charge indicator only after the viewer has terminalized
+     * every GPU owner. Canvas wrappers are user-observable and can re-enter.
+     */
+    retireContextLostUI() {
+      if (!contextLossChargeIndicatorNeedsClear) return false;
+      contextLossChargeIndicatorNeedsClear = false;
+      clearChargeIndicator(true);
+      return true;
     },
     /**
      * Dispose of all WebGL resources to prevent GPU memory leaks.

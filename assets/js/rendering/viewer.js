@@ -8,6 +8,13 @@
 import { GRID_VS_SOURCE, GRID_FS_SOURCE, LINE_INSTANCED_VS_SOURCE, LINE_INSTANCED_FS_SOURCE } from './shaders/edge-grid-shaders.js';
 import { createConnectivityRenderWeights } from './connectivity-weights.js';
 import {
+  buildAllVisibleConnectivityEdgePrefixOwner,
+  buildConnectivityEdgePrefixOwner,
+  resolveConnectivityEdgeRawPrefix,
+  retireConnectivityEdgePrefixOwner
+} from './connectivity-edge-prefix.js';
+import {
+  configureStraightAlphaBlending,
   createProgram,
   createCanvasResizeObserver,
   createRequiredTexture
@@ -32,6 +39,7 @@ import {
   assertNavigationMode,
   cloneCameraState
 } from './camera-state-contract.js';
+import { POINT_VISIBILITY_THRESHOLD } from './alpha-visibility.js';
 import {
   applyHorizontalProjectionCenter,
   computePaneCenterNdcX
@@ -43,13 +51,15 @@ const INITIAL_DIMENSION_LEVEL = 3;
 const VALID_VIEWER_BACKGROUNDS = new Set(['grid', 'grid-dark', 'white', 'black']);
 const VALID_RENDER_MODES = new Set(['points', 'smoke']);
 const VELOCITY_OVERLAY_ID = 'velocity';
+let nextWebglContextOverlayIdentity = 1;
 // Below this size, one direct interaction scan is cheaper than retaining a
 // tree. Large clicked panes build exactly one notified tree lazily so picking,
 // lasso previews, and proximity previews never rescan 10–30M points per move.
 export const INTERACTIVE_SPATIAL_INDEX_POINT_THRESHOLD = 250_000;
-// The raw GL/renderer getters remain available only so cleanup diagnostics can
-// inspect exact owners. Their returned objects are read-only by contract once
-// isDisposed() becomes true; normal renderer work must use a new viewer.
+// The raw GL getter and guarded renderer facade remain available so cleanup
+// diagnostics can inspect exact owners. Renderer methods and property writes
+// are actively fenced at either terminal boundary; the raw GL object is
+// read-only by contract once the viewer is terminal.
 const TERMINAL_SAFE_VIEWER_METHODS = new Set([
   'dispose',
   'getGLContext',
@@ -68,6 +78,54 @@ export {
   assertNavigationMode,
   cloneCameraState
 } from './camera-state-contract.js';
+
+/**
+ * Release dataset-sized owners held by a stable per-frame render descriptor.
+ *
+ * The descriptor identity stays stable so the render loop can reuse it without
+ * allocation, while terminal viewer disposal no longer keeps live typed arrays
+ * or camera state reachable through the closed-over record.
+ *
+ * @param {Object} record
+ * @returns {Object} the same retired record
+ */
+export function retireRenderViewRecord(record) {
+  if (record === null || typeof record !== 'object') {
+    throw new TypeError(
+      'Viewer render-record retirement requires an exact record.'
+    );
+  }
+  record.label = '';
+  record.colors = null;
+  record.transparency = null;
+  record.centroidPositions = null;
+  record.centroidColors = null;
+  record.centroidTransparencies = null;
+  record.centroidCount = 0;
+  record.cameraState = null;
+  return record;
+}
+
+/**
+ * Certify that one centroid VAO was built from the exact immutable snapshot
+ * owners currently published by a view. Identity is the publication boundary:
+ * it is complete, O(1), and detects color-only replacement without sampling
+ * dataset values or allocating a per-frame fingerprint.
+ */
+export function centroidSnapshotBufferOwnsData(
+  record,
+  positions,
+  colors
+) {
+  return (
+    record !== null &&
+    record !== undefined &&
+    record.positionsOwner === positions &&
+    record.colorsOwner === colors &&
+    record.count === positions.length / 3 &&
+    colors.length === record.count * 4
+  );
+}
 
 /**
  * Return the camera default owned by an exact supported embedding dimension.
@@ -109,6 +167,96 @@ export function encodeEdgeVisibilityByte(value, index = -1) {
     );
   }
   return value < 0.5 ? 0 : 255;
+}
+
+function requireViewerLodMembership(membership, pointCount) {
+  if (membership === null) return null;
+  if (
+    typeof membership !== 'object' ||
+    Array.isArray(membership) ||
+    !Object.isFrozen(membership) ||
+    !(membership.admissionLevels instanceof Uint8Array) ||
+    membership.admissionLevels.length !== pointCount ||
+    !(membership.indices instanceof Uint32Array) ||
+    membership.indices.length > pointCount ||
+    membership.pointCount !== pointCount ||
+    !VALID_DIMENSION_LEVELS.has(membership.dimensionLevel) ||
+    !Number.isInteger(membership.lodLevel) ||
+    membership.lodLevel < 0 ||
+    membership.lodLevel >= 0xff ||
+    membership.generationToken === null ||
+    typeof membership.generationToken !== 'object' ||
+    !Object.isFrozen(membership.generationToken)
+  ) {
+    throw new TypeError(
+      'Viewer LOD membership must be null or one exact frozen renderer descriptor.'
+    );
+  }
+  return membership;
+}
+
+function requireViewerSequentialLodMembership(membership, pointCount) {
+  if (membership === null) return null;
+  const exactKeys = [
+    'dimensionLevel',
+    'generationToken',
+    'indices',
+    'lodLevel',
+    'pointCount',
+  ];
+  const ownKeys =
+    typeof membership === 'object' && membership !== null
+      ? Reflect.ownKeys(membership)
+      : [];
+  if (
+    typeof membership !== 'object' ||
+    Array.isArray(membership) ||
+    Object.getPrototypeOf(membership) !== Object.prototype ||
+    !Object.isFrozen(membership) ||
+    ownKeys.length !== exactKeys.length ||
+    ownKeys.some((key) => (
+      typeof key !== 'string' || !exactKeys.includes(key)
+    )) ||
+    !(membership.indices instanceof Uint32Array) ||
+    membership.indices.length > pointCount ||
+    membership.pointCount !== pointCount ||
+    !VALID_DIMENSION_LEVELS.has(membership.dimensionLevel) ||
+    !Number.isInteger(membership.lodLevel) ||
+    membership.lodLevel < 0 ||
+    membership.lodLevel >= 0xff ||
+    membership.generationToken === null ||
+    typeof membership.generationToken !== 'object' ||
+    !Object.isFrozen(membership.generationToken)
+  ) {
+    throw new TypeError(
+      'Viewer sequential LOD membership must be null or one exact frozen compact descriptor.'
+    );
+  }
+  return membership;
+}
+
+function createLodFilteredVisibilityOwner(
+  transparency,
+  membership
+) {
+  if (
+    !(transparency instanceof Float32Array) ||
+    transparency.length === 0
+  ) {
+    throw new TypeError(
+      'LOD-filtered connectivity requires one non-empty Float32 transparency array.'
+    );
+  }
+  const exactMembership = requireViewerLodMembership(
+    membership,
+    transparency.length
+  );
+  return Object.freeze({
+    admissionLevels:
+      exactMembership?.admissionLevels ?? null,
+    lodLevel: exactMembership?.lodLevel ?? -1,
+    transparency,
+  });
 }
 
 /**
@@ -153,6 +301,1226 @@ function createViewerDisposedError(methodName) {
   return error;
 }
 
+function createViewerContextLostError(ownerName) {
+  const error = new Error(
+    `${ownerName} is unavailable after WebGL context loss; ` +
+    'reload Cellucid to create a new renderer.'
+  );
+  error.name = 'ViewerContextLostError';
+  return error;
+}
+
+function createRendererDisposedError(ownerName) {
+  const error = new Error(
+    `${ownerName} is unavailable after viewer dispose(); ` +
+    'create a new viewer instance.'
+  );
+  error.name = 'ViewerDisposedError';
+  return error;
+}
+
+export function createViewerRendererFacade(renderer, getTerminalState) {
+  const methodFacades = new Map();
+  const restorationMethods = new WeakMap();
+  const guardedValues = new WeakMap();
+  const guardedValueTargets = new WeakMap();
+  const guardedValueMethods = new WeakMap();
+  const guardedReadOnlyTargets = new WeakSet();
+  const guardedReadOnlyBufferCopies = new WeakMap();
+  const guardedReadOnlyDetachedCopies = new WeakMap();
+  const guardedLodMembershipCopies = new WeakMap();
+  const READ_ONLY_RENDERER_OWNERS = new Set([
+    'activeProgram',
+    'buffers',
+    'gl',
+    'lodBuffersByDimension',
+    'programs',
+    'snapshotBuffers',
+    'spatialIndices',
+    'stats',
+    'uniformLocations',
+    'vao',
+  ]);
+  const FACADE_MUTATING_METHODS = new Set([
+    'add',
+    'clear',
+    'copyWithin',
+    'delete',
+    'fill',
+    'pop',
+    'push',
+    'reverse',
+    'set',
+    'shift',
+    'sort',
+    'splice',
+    'unshift',
+  ]);
+  const CALLBACK_METHODS = new Set([
+    'every',
+    'filter',
+    'find',
+    'findIndex',
+    'findLast',
+    'findLastIndex',
+    'flatMap',
+    'forEach',
+    'map',
+    'reduce',
+    'reduceRight',
+    'some',
+    'sort',
+  ]);
+  const MAP_SIZE_GETTER =
+    Reflect.getOwnPropertyDescriptor(Map.prototype, 'size').get;
+  const SET_SIZE_GETTER =
+    Reflect.getOwnPropertyDescriptor(Set.prototype, 'size').get;
+  const MAP_READ_INTRINSICS = new Set([
+    Map.prototype.entries,
+    Map.prototype.forEach,
+    Map.prototype.get,
+    Map.prototype.has,
+    Map.prototype.keys,
+    Map.prototype.values,
+    Map.prototype[Symbol.iterator],
+  ]);
+  const MAP_MUTATING_INTRINSICS = new Set([
+    Map.prototype.clear,
+    Map.prototype.delete,
+    Map.prototype.set,
+  ]);
+  const SET_READ_INTRINSICS = new Set([
+    Set.prototype.entries,
+    Set.prototype.forEach,
+    Set.prototype.has,
+    Set.prototype.keys,
+    Set.prototype.values,
+    Set.prototype[Symbol.iterator],
+  ]);
+  const SET_MUTATING_INTRINSICS = new Set([
+    Set.prototype.add,
+    Set.prototype.clear,
+    Set.prototype.delete,
+  ]);
+  const MAP_ITERATOR_PROTOTYPE =
+    Reflect.getPrototypeOf(new Map().entries());
+  const SET_ITERATOR_PROTOTYPE =
+    Reflect.getPrototypeOf(new Set().entries());
+  const MAP_ITERATOR_NEXT = MAP_ITERATOR_PROTOTYPE.next;
+  const SET_ITERATOR_NEXT = SET_ITERATOR_PROTOTYPE.next;
+  const NATIVE_SLOT_READ_POLICY =
+    Object.freeze({ mutates: false, callback: false });
+  const NATIVE_SLOT_CALLBACK_POLICY =
+    Object.freeze({ mutates: false, callback: true });
+  const NATIVE_SLOT_MUTATING_POLICY =
+    Object.freeze({ mutates: true, callback: false });
+  const getNativeSlotMethodPolicy = (target, method) => {
+    if (target instanceof Map) {
+      if (MAP_MUTATING_INTRINSICS.has(method)) {
+        return NATIVE_SLOT_MUTATING_POLICY;
+      }
+      if (MAP_READ_INTRINSICS.has(method)) {
+        return method === Map.prototype.forEach
+          ? NATIVE_SLOT_CALLBACK_POLICY
+          : NATIVE_SLOT_READ_POLICY;
+      }
+      return null;
+    }
+    if (target instanceof Set) {
+      if (SET_MUTATING_INTRINSICS.has(method)) {
+        return NATIVE_SLOT_MUTATING_POLICY;
+      }
+      if (SET_READ_INTRINSICS.has(method)) {
+        return method === Set.prototype.forEach
+          ? NATIVE_SLOT_CALLBACK_POLICY
+          : NATIVE_SLOT_READ_POLICY;
+      }
+      return null;
+    }
+    if (
+      method === MAP_ITERATOR_NEXT &&
+      MAP_ITERATOR_PROTOTYPE.isPrototypeOf(target)
+    ) {
+      return NATIVE_SLOT_READ_POLICY;
+    }
+    if (
+      method === SET_ITERATOR_NEXT &&
+      SET_ITERATOR_PROTOTYPE.isPrototypeOf(target)
+    ) {
+      return NATIVE_SLOT_READ_POLICY;
+    }
+    return null;
+  };
+  const assertMutable = ownerName => {
+    const terminalState = getTerminalState();
+    if (terminalState === 'disposed') {
+      throw createRendererDisposedError(ownerName);
+    }
+    if (terminalState === 'context-lost') {
+      throw createViewerContextLostError(ownerName);
+    }
+  };
+  const isReadOnlyRendererOwner = property => (
+    READ_ONLY_RENDERER_OWNERS.has(property) ||
+    (
+      typeof property === 'string' &&
+      property.startsWith('_')
+    )
+  );
+  const isPrivateRendererProperty = property => (
+    typeof property === 'string' &&
+    property.startsWith('_')
+  );
+  const findPropertyDescriptor = (target, property) => {
+    let owner = target;
+    while (owner !== null) {
+      const descriptor =
+        Reflect.getOwnPropertyDescriptor(owner, property);
+      if (descriptor !== undefined) {
+        return { descriptor, owner };
+      }
+      owner = Reflect.getPrototypeOf(owner);
+    }
+    return null;
+  };
+  const throwPrivateRendererCallable = (
+    ownerName,
+    property
+  ) => {
+    assertMutable(`${ownerName} "${String(property)}"`);
+    throw new TypeError(
+      `Private renderer callable "${String(property)}" is unavailable through the viewer facade.`
+    );
+  };
+  const readWithoutTerminalAccessor = (
+    target,
+    property,
+    receiver,
+    ownerName
+  ) => {
+    const terminalState = getTerminalState();
+    if (
+      terminalState !== 'disposed' &&
+      terminalState !== 'context-lost'
+    ) {
+      return Reflect.get(target, property, receiver);
+    }
+
+    // Terminal diagnostics may still inspect inert data publications, but
+    // they must never execute an accessor installed before loss/disposal.
+    // Walk exact descriptors and return only a data value; unknown or
+    // accessor-backed reads take the same terminal fence as a method call.
+    let descriptorOwner = target;
+    while (descriptorOwner !== null) {
+      const descriptor =
+        Reflect.getOwnPropertyDescriptor(descriptorOwner, property);
+      if (descriptor !== undefined) {
+        if (Object.hasOwn(descriptor, 'value')) {
+          return descriptor.value;
+        }
+        assertMutable(ownerName);
+      }
+      descriptorOwner = Reflect.getPrototypeOf(descriptorOwner);
+    }
+    assertMutable(ownerName);
+    return undefined;
+  };
+
+  const unwrapGuardedValue = value => (
+    (
+      value !== null &&
+      (
+        typeof value === 'object' ||
+        typeof value === 'function'
+      ) &&
+      guardedValueTargets.has(value)
+    )
+      ? guardedValueTargets.get(value)
+      : value
+  );
+
+  const canGuardValue = value => {
+    if (
+      value === null ||
+      (typeof value !== 'object' && typeof value !== 'function')
+    ) {
+      return false;
+    }
+    // BufferSource identities and browser-owned opaque WebGL handles must
+    // remain directly consumable by WebGL. Renderer-owned records,
+    // collections, and class instances are safe to membrane.
+    if (
+      value instanceof ArrayBuffer ||
+      ArrayBuffer.isView(value)
+    ) {
+      return false;
+    }
+    const tag = Object.prototype.toString.call(value);
+    return !tag.startsWith('[object WebGL');
+  };
+
+  const isInertFrozenIdentityToken = value => {
+    if (
+      value === null ||
+      typeof value !== 'object' ||
+      !Object.isFrozen(value) ||
+      Reflect.ownKeys(value).length !== 0
+    ) {
+      return false;
+    }
+    const prototype = Reflect.getPrototypeOf(value);
+    return (
+      prototype === null ||
+      prototype === Object.prototype
+    );
+  };
+
+  const hasReadOnlyProxyInvariantHazard = value => {
+    for (const property of Reflect.ownKeys(value)) {
+      const descriptor =
+        Reflect.getOwnPropertyDescriptor(value, property);
+      if (!descriptor || descriptor.configurable !== false) continue;
+      if (!Object.hasOwn(descriptor, 'value')) {
+        // A non-configurable accessor descriptor cannot be replaced by a
+        // guarded getter in a Proxy descriptor trap. Detach the owner so the
+        // raw getter/setter identity and any closure-owned state cannot escape.
+        return true;
+      }
+      if (
+        descriptor.writable === false &&
+        descriptor.value !== null &&
+        (
+          typeof descriptor.value === 'object' ||
+          typeof descriptor.value === 'function'
+        ) &&
+        (
+          descriptor.value instanceof ArrayBuffer ||
+          ArrayBuffer.isView(descriptor.value) ||
+          canGuardValue(descriptor.value)
+        )
+      ) {
+        // Proxy [[Get]] must return this exact value. A detached owner is the
+        // only way to project mutable data behind a non-writable invariant.
+        return true;
+      }
+    }
+    return false;
+  };
+
+  const guardValue = (value, ownerName, readOnly = false) => {
+    if (value === renderer) {
+      return rendererFacade;
+    }
+    if (
+      guardedValueTargets.has(value) ||
+      value === rendererFacade
+    ) {
+      return value;
+    }
+    if (
+      readOnly &&
+      (
+        value instanceof ArrayBuffer ||
+        ArrayBuffer.isView(value)
+      )
+    ) {
+      let copy = guardedReadOnlyBufferCopies.get(value);
+      if (copy === undefined) {
+        if (value instanceof ArrayBuffer) {
+          copy = value.slice(0);
+        } else if (value instanceof DataView) {
+          copy = new DataView(value.buffer.slice(
+            value.byteOffset,
+            value.byteOffset + value.byteLength
+          ));
+        } else {
+          copy = new value.constructor(value);
+        }
+        guardedReadOnlyBufferCopies.set(value, copy);
+      }
+      return copy;
+    }
+    if (!canGuardValue(value)) return value;
+    if (
+      readOnly &&
+      (
+        (
+          !Reflect.isExtensible(value) &&
+          !isInertFrozenIdentityToken(value)
+        ) ||
+        hasReadOnlyProxyInvariantHazard(value)
+      )
+    ) {
+      const cachedDetached =
+        guardedReadOnlyDetachedCopies.get(value);
+      if (cachedDetached !== undefined) {
+        return cachedDetached;
+      }
+      if (value instanceof Map) {
+        const detachedMap = new Map();
+        const projectedMap = guardValue(
+          detachedMap,
+          ownerName,
+          true
+        );
+        guardedReadOnlyDetachedCopies.set(value, projectedMap);
+        for (const [entryKey, entryValue] of value) {
+          detachedMap.set(
+            guardValue(
+              entryKey,
+              `${ownerName} key`,
+              true
+            ),
+            guardValue(
+              entryValue,
+              `${ownerName} value`,
+              true
+            )
+          );
+        }
+        return projectedMap;
+      }
+      if (value instanceof Set) {
+        const detachedSet = new Set();
+        const projectedSet = guardValue(
+          detachedSet,
+          ownerName,
+          true
+        );
+        guardedReadOnlyDetachedCopies.set(value, projectedSet);
+        for (const entryValue of value) {
+          detachedSet.add(
+            guardValue(
+              entryValue,
+              `${ownerName} value`,
+              true
+            )
+          );
+        }
+        return projectedSet;
+      }
+
+      const detached = Array.isArray(value)
+        ? []
+        : Object.create(null);
+      // Publish the skeleton before recursion so a frozen cyclic record
+      // remains finite and retains exact alias relationships in its detached
+      // diagnostic projection.
+      guardedReadOnlyDetachedCopies.set(value, detached);
+      for (const property of Reflect.ownKeys(value)) {
+        if (Array.isArray(value) && property === 'length') continue;
+        const descriptor =
+          Reflect.getOwnPropertyDescriptor(value, property);
+        if (!descriptor) continue;
+        if (Object.hasOwn(descriptor, 'value')) {
+          const detachedValue = (
+            isPrivateRendererProperty(property) &&
+            typeof descriptor.value === 'function'
+          )
+            ? function unavailableDetachedPrivateRendererMethod() {
+                throwPrivateRendererCallable(
+                  ownerName,
+                  property
+                );
+              }
+            : guardValue(
+                descriptor.value,
+                `${ownerName} property "${String(property)}"`,
+                true
+              );
+          Object.defineProperty(detached, property, {
+            configurable: false,
+            enumerable: descriptor.enumerable,
+            writable: false,
+            value: detachedValue,
+          });
+        } else {
+          const privateAccessor =
+            isPrivateRendererProperty(property);
+          Object.defineProperty(detached, property, {
+            configurable: false,
+            enumerable: descriptor.enumerable,
+            get: typeof descriptor.get === 'function'
+              ? (
+                  privateAccessor
+                    ? function unavailableDetachedPrivateRendererGetter() {
+                        throwPrivateRendererCallable(
+                          ownerName,
+                          property
+                        );
+                      }
+                    : function unavailableDetachedReadOnlyGetter() {
+                        assertMutable(
+                          `${ownerName} property "${String(property)}" getter`
+                        );
+                        throw new TypeError(
+                          `${ownerName} has a non-configurable accessor that ` +
+                          'is unavailable through the read-only renderer facade.'
+                        );
+                      }
+                )
+              : undefined,
+          });
+        }
+      }
+      Object.freeze(detached);
+      return detached;
+    }
+    if (readOnly) guardedReadOnlyTargets.add(value);
+    const existing = guardedValues.get(value);
+    if (existing) return existing;
+
+    let valueProxy = null;
+    valueProxy = new Proxy(value, {
+      get(target, property) {
+        const targetIsReadOnly =
+          guardedReadOnlyTargets.has(target);
+        const resolvedProperty =
+          findPropertyDescriptor(target, property);
+        const resolvedDescriptor = resolvedProperty?.descriptor;
+        if (
+          targetIsReadOnly &&
+          isPrivateRendererProperty(property) &&
+          resolvedDescriptor !== undefined &&
+          !Object.hasOwn(resolvedDescriptor, 'value')
+        ) {
+          throwPrivateRendererCallable(ownerName, property);
+        }
+        const invariantDescriptor =
+          Reflect.getOwnPropertyDescriptor(target, property);
+        if (
+          targetIsReadOnly &&
+          invariantDescriptor?.configurable === false &&
+          (
+            !Object.hasOwn(invariantDescriptor, 'value') ||
+            (
+              invariantDescriptor.writable === false &&
+              invariantDescriptor.value !== null &&
+              (
+                typeof invariantDescriptor.value === 'object' ||
+                typeof invariantDescriptor.value === 'function'
+              ) &&
+              (
+                invariantDescriptor.value instanceof ArrayBuffer ||
+                ArrayBuffer.isView(invariantDescriptor.value) ||
+                canGuardValue(invariantDescriptor.value)
+              )
+            )
+          )
+        ) {
+          // This can occur only if the raw owner acquired a new invariant
+          // after its facade was cached. Throw before executing or disclosing
+          // it; a Proxy is otherwise required to return the exact raw value.
+          throw new TypeError(
+            `${ownerName} acquired an unsafe non-configurable property.`
+          );
+        }
+        let nestedValue;
+        try {
+          // Custom accessors receive the membrane as `this`, so a getter that
+          // returns `this` cannot disclose its raw ownership target.
+          nestedValue = readWithoutTerminalAccessor(
+            target,
+            property,
+            valueProxy,
+            `${ownerName} property "${String(property)}"`
+          );
+        } catch (error) {
+          const exactNativeMapSize = (
+            target instanceof Map &&
+            resolvedProperty?.owner === Map.prototype &&
+            resolvedDescriptor?.get === MAP_SIZE_GETTER
+          );
+          const exactNativeSetSize = (
+            target instanceof Set &&
+            resolvedProperty?.owner === Set.prototype &&
+            resolvedDescriptor?.get === SET_SIZE_GETTER
+          );
+          // Only the exact native collection-size accessors may retry with
+          // their internal-slot owner. A custom accessor on a Map/Set must
+          // retain the membrane receiver even when it deliberately throws.
+          if (!exactNativeMapSize && !exactNativeSetSize) throw error;
+          nestedValue = readWithoutTerminalAccessor(
+            target,
+            property,
+            target,
+            `${ownerName} property "${String(property)}"`
+          );
+        }
+        if (typeof nestedValue === 'function') {
+          let methods = guardedValueMethods.get(target);
+          if (!methods) {
+            methods = new Map();
+            guardedValueMethods.set(target, methods);
+          }
+          const cached = methods.get(property);
+          if (cached?.source === nestedValue) {
+            return cached.facade;
+          }
+          const privateMethod = (
+            targetIsReadOnly &&
+            isPrivateRendererProperty(property)
+          );
+          const methodFacade = privateMethod
+            ? function unavailablePrivateRendererValueMethod() {
+                throwPrivateRendererCallable(
+                  ownerName,
+                  property
+                );
+              }
+            : function guardedRendererValueMethod(...args) {
+                assertMutable(
+                  `${ownerName} method "${String(property)}"`
+                );
+                const nativeSlotPolicy =
+                  targetIsReadOnly
+                    ? getNativeSlotMethodPolicy(target, nestedValue)
+                    : null;
+                if (
+                  targetIsReadOnly &&
+                  (
+                    FACADE_MUTATING_METHODS.has(property) ||
+                    nativeSlotPolicy?.mutates === true
+                  )
+                ) {
+                  throw new TypeError(`${ownerName} is read-only.`);
+                }
+                // Mutable renderer owners and exact native collection
+                // intrinsics consume their underlying identities. User code
+                // reached through a read-only owner must retain guarded
+                // receivers and arguments so it cannot recover raw state.
+                const exactArgs = (
+                  !targetIsReadOnly || nativeSlotPolicy !== null
+                )
+                  ? args.map(unwrapGuardedValue)
+                  : args;
+                if (
+                  (
+                    CALLBACK_METHODS.has(property) ||
+                    nativeSlotPolicy?.callback === true
+                  ) &&
+                  typeof args[0] === 'function'
+                ) {
+                  const callback = args[0];
+                  exactArgs[0] = function guardedCollectionCallback(
+                    ...callbackArgs
+                  ) {
+                    return Reflect.apply(
+                      callback,
+                      guardValue(
+                        this,
+                        `${ownerName} method "${String(property)}" callback this`,
+                        targetIsReadOnly
+                      ),
+                      callbackArgs.map((callbackArg, index) =>
+                        guardValue(
+                          callbackArg,
+                          `${ownerName} method "${String(property)}" callback argument ${index}`,
+                          targetIsReadOnly
+                        )
+                      )
+                    );
+                  };
+                }
+                const methodReceiver = (
+                  targetIsReadOnly && nativeSlotPolicy === null
+                )
+                  ? valueProxy
+                  : target;
+                const result = Reflect.apply(
+                  nestedValue,
+                  methodReceiver,
+                  exactArgs
+                );
+                return guardValue(
+                  result,
+                  `${ownerName} method "${String(property)}" result`,
+                  targetIsReadOnly
+                );
+              };
+          methods.set(property, {
+            source: nestedValue,
+            facade: methodFacade,
+          });
+          return methodFacade;
+        }
+        const descriptor =
+          Reflect.getOwnPropertyDescriptor(target, property);
+        if (
+          descriptor &&
+          descriptor.configurable === false &&
+          Object.hasOwn(descriptor, 'value') &&
+          descriptor.writable === false
+        ) {
+          // Proxy invariants require the exact frozen data-property value.
+          return nestedValue;
+        }
+        return guardValue(
+          nestedValue,
+          `${ownerName} property "${String(property)}"`,
+          targetIsReadOnly
+        );
+      },
+      set(target, property, nestedValue, receiver) {
+        assertMutable(
+          `${ownerName} property "${String(property)}"`
+        );
+        if (guardedReadOnlyTargets.has(target)) {
+          if (receiver === valueProxy || receiver === target) {
+            throw new TypeError(`${ownerName} is read-only.`);
+          }
+          // A read-only projection may legitimately be the prototype of a
+          // newly constructed result. Preserve ordinary inherited writable
+          // data-property semantics by publishing only on that distinct
+          // receiver; never invoke a renderer-owned accessor while doing so.
+          const inherited =
+            findPropertyDescriptor(target, property)?.descriptor;
+          if (
+            inherited !== undefined &&
+            (
+              !Object.hasOwn(inherited, 'value') ||
+              inherited.writable !== true
+            )
+          ) {
+            return false;
+          }
+          return Reflect.defineProperty(receiver, property, {
+            configurable: true,
+            enumerable: true,
+            writable: true,
+            value: nestedValue,
+          });
+        }
+        return Reflect.set(
+          target,
+          property,
+          unwrapGuardedValue(nestedValue),
+          target
+        );
+      },
+      defineProperty(target, property, descriptor) {
+        assertMutable(
+          `${ownerName} property "${String(property)}"`
+        );
+        if (guardedReadOnlyTargets.has(target)) {
+          throw new TypeError(`${ownerName} is read-only.`);
+        }
+        if (descriptor.configurable !== true) {
+          throw new TypeError(
+            `${ownerName} cannot publish a non-configurable facade property.`
+          );
+        }
+        const nextDescriptor = Object.hasOwn(descriptor, 'value')
+          ? {
+              ...descriptor,
+              value: unwrapGuardedValue(descriptor.value),
+            }
+          : descriptor;
+        return Reflect.defineProperty(
+          target,
+          property,
+          nextDescriptor
+        );
+      },
+      deleteProperty(target, property) {
+        assertMutable(
+          `${ownerName} property "${String(property)}"`
+        );
+        if (guardedReadOnlyTargets.has(target)) {
+          throw new TypeError(`${ownerName} is read-only.`);
+        }
+        return Reflect.deleteProperty(target, property);
+      },
+      getOwnPropertyDescriptor(target, property) {
+        const descriptor =
+          Reflect.getOwnPropertyDescriptor(target, property);
+        if (!descriptor) {
+          return descriptor;
+        }
+        const targetIsReadOnly =
+          guardedReadOnlyTargets.has(target);
+        if (descriptor.configurable === false) {
+          if (!targetIsReadOnly) return descriptor;
+          if (
+            !Object.hasOwn(descriptor, 'value') ||
+            descriptor.writable === false
+          ) {
+            // Initial invariant hazards are detached before proxy creation.
+            // A later raw mutation cannot be projected compatibly.
+            throw new TypeError(
+              `${ownerName} acquired an unsafe non-configurable property.`
+            );
+          }
+          return {
+            ...descriptor,
+            value: guardValue(
+              descriptor.value,
+              `${ownerName} property "${String(property)}"`,
+              true
+            ),
+          };
+        }
+        if (!Object.hasOwn(descriptor, 'value')) {
+          if (
+            targetIsReadOnly &&
+            isPrivateRendererProperty(property)
+          ) {
+            return {
+              ...descriptor,
+              get: typeof descriptor.get === 'function'
+                ? function unavailablePrivateRendererValueGetter() {
+                    throwPrivateRendererCallable(
+                      ownerName,
+                      property
+                    );
+                  }
+                : descriptor.get,
+              set: typeof descriptor.set === 'function'
+                ? function unavailablePrivateRendererValueSetter() {
+                    throwPrivateRendererCallable(
+                      ownerName,
+                      property
+                    );
+                  }
+                : descriptor.set,
+            };
+          }
+          return {
+            ...descriptor,
+            get: typeof descriptor.get === 'function'
+              ? function guardedRendererValueGetter() {
+                  assertMutable(
+                    `${ownerName} property "${String(property)}" getter`
+                  );
+                  return guardValue(
+                    Reflect.apply(
+                      descriptor.get,
+                      targetIsReadOnly ? valueProxy : target,
+                      []
+                    ),
+                    `${ownerName} property "${String(property)}" getter result`,
+                    targetIsReadOnly
+                  );
+                }
+              : descriptor.get,
+            set: typeof descriptor.set === 'function'
+              ? function guardedRendererValueSetter(nextValue) {
+                  assertMutable(
+                    `${ownerName} property "${String(property)}" setter`
+                  );
+                  if (targetIsReadOnly) {
+                    throw new TypeError(`${ownerName} is read-only.`);
+                  }
+                  return Reflect.apply(
+                    descriptor.set,
+                    target,
+                    [unwrapGuardedValue(nextValue)]
+                  );
+                }
+              : descriptor.set,
+          };
+        }
+        if (
+          targetIsReadOnly &&
+          isPrivateRendererProperty(property) &&
+          typeof descriptor.value === 'function'
+        ) {
+          return {
+            ...descriptor,
+            value: Reflect.get(valueProxy, property),
+          };
+        }
+        return {
+          ...descriptor,
+          value: guardValue(
+            descriptor.value,
+            `${ownerName} property "${String(property)}"`,
+            targetIsReadOnly
+          ),
+        };
+      },
+      setPrototypeOf(target, prototype) {
+        assertMutable(`${ownerName} prototype`);
+        throw new TypeError(
+          `${ownerName} prototype mutation is unavailable through the renderer facade.`
+        );
+      },
+      getPrototypeOf(target) {
+        if (!Reflect.isExtensible(target)) {
+          return Reflect.getPrototypeOf(target);
+        }
+        return guardValue(
+          Reflect.getPrototypeOf(target),
+          `${ownerName} prototype`,
+          guardedReadOnlyTargets.has(target)
+        );
+      },
+      preventExtensions(target) {
+        assertMutable(`${ownerName} extensibility`);
+        throw new TypeError(
+          `${ownerName} cannot be made non-extensible through the renderer facade.`
+        );
+      },
+      apply(target, thisArg, args) {
+        assertMutable(`${ownerName} call`);
+        const targetIsReadOnly =
+          guardedReadOnlyTargets.has(target);
+        return guardValue(
+          Reflect.apply(
+            target,
+            targetIsReadOnly
+              ? thisArg
+              : unwrapGuardedValue(thisArg),
+            targetIsReadOnly
+              ? args
+              : args.map(unwrapGuardedValue)
+          ),
+          `${ownerName} call result`,
+          targetIsReadOnly
+        );
+      },
+      construct(target, args, newTarget) {
+        assertMutable(`${ownerName} construction`);
+        const targetIsReadOnly =
+          guardedReadOnlyTargets.has(target);
+        return guardValue(
+          Reflect.construct(
+            target,
+            targetIsReadOnly
+              ? args
+              : args.map(unwrapGuardedValue),
+            targetIsReadOnly
+              ? newTarget
+              : unwrapGuardedValue(newTarget)
+          ),
+          `${ownerName} construction result`,
+          targetIsReadOnly
+        );
+      },
+    });
+    guardedValues.set(value, valueProxy);
+    guardedValueTargets.set(valueProxy, value);
+    return valueProxy;
+  };
+
+  const guardRendererMethodResult = (
+    value,
+    property,
+    ownerName
+  ) => {
+    if (
+      value !== null &&
+      (
+        property === 'getCurrentLodMembership' ||
+        property === 'getCurrentLodSequentialMembership'
+      )
+    ) {
+      let detached = guardedLodMembershipCopies.get(value);
+      if (detached === undefined) {
+        detached = Object.freeze({
+          ...value,
+          ...(value.admissionLevels instanceof Uint8Array
+            ? {
+                admissionLevels:
+                  new Uint8Array(value.admissionLevels),
+              }
+            : {}),
+          ...(value.indices instanceof Uint32Array
+            ? { indices: new Uint32Array(value.indices) }
+            : {}),
+          // generationToken is an inert frozen identity certificate. Preserve
+          // it so callers can compare generations without gaining mutable data.
+          generationToken: value.generationToken,
+        });
+        guardedLodMembershipCopies.set(value, detached);
+      }
+      return detached;
+    }
+    return guardValue(value, ownerName, true);
+  };
+
+  const RawRendererConstructor = renderer.constructor;
+  const rendererConstructorFacade = function RendererFacadeConstructor(
+    ...args
+  ) {
+    assertMutable('Renderer constructor');
+    if (new.target === undefined) {
+      return Reflect.apply(RawRendererConstructor, undefined, args);
+    }
+    return Reflect.construct(RawRendererConstructor, args);
+  };
+  Object.defineProperty(
+    rendererConstructorFacade,
+    Symbol.hasInstance,
+    {
+      value(candidate) {
+        return candidate instanceof RawRendererConstructor;
+      },
+    }
+  );
+  Object.freeze(rendererConstructorFacade.prototype);
+  Object.freeze(rendererConstructorFacade);
+
+  let rendererFacade = null;
+  rendererFacade = new Proxy(renderer, {
+    get(target, property) {
+      const resolvedDescriptor =
+        findPropertyDescriptor(target, property)?.descriptor;
+      if (
+        isPrivateRendererProperty(property) &&
+        resolvedDescriptor !== undefined &&
+        !Object.hasOwn(resolvedDescriptor, 'value')
+      ) {
+        throwPrivateRendererCallable('Renderer property', property);
+      }
+      const value = readWithoutTerminalAccessor(
+        target,
+        property,
+        rendererFacade,
+        `Renderer property "${String(property)}"`
+      );
+      if (
+        property === 'constructor'
+      ) {
+        return rendererConstructorFacade;
+      }
+      if (typeof value !== 'function') {
+        return guardValue(
+          value,
+          `Renderer property "${String(property)}"`,
+          isReadOnlyRendererOwner(property)
+        );
+      }
+      const cached = methodFacades.get(property);
+      if (cached?.source !== value) {
+        const isPrivateMethod =
+          isPrivateRendererProperty(property);
+        const methodFacade = isPrivateMethod
+          ? function unavailablePrivateRendererMethod() {
+              assertMutable(`Renderer method "${String(property)}"`);
+              throw new TypeError(
+                `Private renderer method "${String(property)}" is unavailable through the viewer facade.`
+              );
+            }
+          : function guardedRendererMethod(...args) {
+              assertMutable(`Renderer method "${String(property)}"`);
+              return guardRendererMethodResult(
+                Reflect.apply(
+                  value,
+                  target,
+                  args.map(unwrapGuardedValue)
+                ),
+                property,
+                `Renderer method "${String(property)}" result`,
+              );
+            };
+        if (!isPrivateMethod) {
+          restorationMethods.set(methodFacade, value);
+          Object.defineProperty(methodFacade, 'bind', {
+            configurable: true,
+            value(thisArg, ...args) {
+              const boundFacade = Function.prototype.bind.call(
+                methodFacade,
+                thisArg,
+                ...args
+              );
+              restorationMethods.set(boundFacade, value);
+              return boundFacade;
+            },
+          });
+        }
+        methodFacades.set(property, {
+          source: value,
+          facade: methodFacade,
+        });
+      }
+      return methodFacades.get(property).facade;
+    },
+    set(target, property, value) {
+      assertMutable(`Renderer property "${String(property)}"`);
+      if (isReadOnlyRendererOwner(property)) {
+        throw new TypeError(
+          `Renderer property "${String(property)}" is read-only.`
+        );
+      }
+      const nextValue = (
+        typeof value === 'function' &&
+        restorationMethods.has(value)
+      )
+        ? restorationMethods.get(value)
+        : unwrapGuardedValue(value);
+      return Reflect.set(target, property, nextValue, target);
+    },
+    defineProperty(target, property, descriptor) {
+      assertMutable(`Renderer property "${String(property)}"`);
+      if (isReadOnlyRendererOwner(property)) {
+        throw new TypeError(
+          `Renderer property "${String(property)}" is read-only.`
+        );
+      }
+      if (descriptor.configurable !== true) {
+        throw new TypeError(
+          'Renderer cannot publish a non-configurable facade property.'
+        );
+      }
+      if (
+        Object.hasOwn(descriptor, 'get') ||
+        Object.hasOwn(descriptor, 'set')
+      ) {
+        throw new TypeError(
+          'Renderer accessor publication is unavailable through its facade.'
+        );
+      }
+      const nextDescriptor = (
+        Object.hasOwn(descriptor, 'value') &&
+        typeof descriptor.value === 'function' &&
+        restorationMethods.has(descriptor.value)
+      )
+        ? {
+            ...descriptor,
+            value: restorationMethods.get(descriptor.value),
+          }
+        : (
+            Object.hasOwn(descriptor, 'value')
+              ? {
+                  ...descriptor,
+                  value: unwrapGuardedValue(descriptor.value),
+                }
+              : descriptor
+          );
+      return Reflect.defineProperty(target, property, nextDescriptor);
+    },
+    deleteProperty(target, property) {
+      assertMutable(`Renderer property "${String(property)}"`);
+      if (isReadOnlyRendererOwner(property)) {
+        throw new TypeError(
+          `Renderer property "${String(property)}" is read-only.`
+        );
+      }
+      return Reflect.deleteProperty(target, property);
+    },
+    getOwnPropertyDescriptor(target, property) {
+      const descriptor =
+        Reflect.getOwnPropertyDescriptor(target, property);
+      if (!descriptor) {
+        return descriptor;
+      }
+      const privateProperty =
+        isPrivateRendererProperty(property);
+      if (descriptor.configurable === false) {
+        if (
+          privateProperty &&
+          (
+            !Object.hasOwn(descriptor, 'value') ||
+            typeof descriptor.value === 'function'
+          )
+        ) {
+          throwPrivateRendererCallable(
+            'Renderer property',
+            property
+          );
+        }
+        return descriptor;
+      }
+      if (!Object.hasOwn(descriptor, 'value')) {
+        if (privateProperty) {
+          return {
+            ...descriptor,
+            get: typeof descriptor.get === 'function'
+              ? function unavailablePrivateRendererGetter() {
+                  throwPrivateRendererCallable(
+                    'Renderer property',
+                    property
+                  );
+                }
+              : descriptor.get,
+            set: typeof descriptor.set === 'function'
+              ? function unavailablePrivateRendererSetter() {
+                  throwPrivateRendererCallable(
+                    'Renderer property',
+                    property
+                  );
+                }
+              : descriptor.set,
+          };
+        }
+        return {
+          ...descriptor,
+          get: typeof descriptor.get === 'function'
+            ? function guardedRendererGetter() {
+                assertMutable(
+                  `Renderer property "${String(property)}" getter`
+                );
+                return guardValue(
+                  Reflect.apply(descriptor.get, target, []),
+                  `Renderer property "${String(property)}" getter result`,
+                  isReadOnlyRendererOwner(property)
+                );
+              }
+            : descriptor.get,
+          set: typeof descriptor.set === 'function'
+            ? function guardedRendererSetter(nextValue) {
+                assertMutable(
+                  `Renderer property "${String(property)}" setter`
+                );
+                if (isReadOnlyRendererOwner(property)) {
+                  throw new TypeError(
+                    `Renderer property "${String(property)}" is read-only.`
+                  );
+                }
+                return Reflect.apply(
+                  descriptor.set,
+                  target,
+                  [unwrapGuardedValue(nextValue)]
+                );
+              }
+            : descriptor.set,
+        };
+      }
+      if (
+        privateProperty &&
+        typeof descriptor.value === 'function'
+      ) {
+        return {
+          ...descriptor,
+          value: Reflect.get(rendererFacade, property),
+        };
+      }
+      return {
+        ...descriptor,
+        value: guardValue(
+          descriptor.value,
+          `Renderer property "${String(property)}"`,
+          isReadOnlyRendererOwner(property)
+        ),
+      };
+    },
+    setPrototypeOf(target, prototype) {
+      assertMutable('Renderer prototype');
+      throw new TypeError(
+        'Renderer prototype mutation is unavailable through its facade.'
+      );
+    },
+    getPrototypeOf(target) {
+      if (!Reflect.isExtensible(target)) {
+        return Reflect.getPrototypeOf(target);
+      }
+      return guardValue(
+        Reflect.getPrototypeOf(target),
+        'Renderer prototype',
+        true
+      );
+    },
+    preventExtensions(target) {
+      assertMutable('Renderer extensibility');
+      throw new TypeError(
+        'Renderer cannot be made non-extensible through its facade.'
+      );
+    },
+  });
+  return rendererFacade;
+}
+
 function assertExactBoolean(value, label) {
   if (typeof value !== 'boolean') {
     throw new TypeError(`${label} state must be an exact boolean.`);
@@ -185,6 +1553,268 @@ function assertExactFunction(value, label) {
     throw new TypeError(`${label} must be one function.`);
   }
   return value;
+}
+
+/**
+ * Execute one borrowed-data callback inside a strictly synchronous ownership
+ * boundary. The caller-supplied validator runs before any result can escape,
+ * including callback failures and hostile thenable getters.
+ *
+ * @param {Function} callback
+ * @param {Object} payload
+ * @param {Function} validateCurrent
+ * @returns {*}
+ */
+export function runSynchronousBorrowedViewDataCallback(
+  callback,
+  payload,
+  validateCurrent
+) {
+  const exactCallback = assertExactFunction(
+    callback,
+    'Borrowed-view-data callback'
+  );
+  const exactValidator = assertExactFunction(
+    validateCurrent,
+    'Borrowed-view-data validator'
+  );
+  let result;
+  let callbackFailed = false;
+  let callbackError;
+  try {
+    result = exactCallback(payload);
+  } catch (error) {
+    callbackFailed = true;
+    callbackError = error;
+  }
+  if (callbackFailed) {
+    try {
+      exactValidator();
+    } catch (validationError) {
+      throw new AggregateError(
+        [callbackError, validationError],
+        'Borrowed-view-data callback failed while its ownership also changed.'
+      );
+    }
+    throw callbackError;
+  }
+
+  let resultBoundaryError = null;
+  try {
+    const thenable = (
+      result !== null &&
+      (typeof result === 'object' || typeof result === 'function') &&
+      typeof result.then === 'function'
+    );
+    if (thenable) {
+      resultBoundaryError = new TypeError(
+        'Borrowed-view-data callback must complete synchronously and must not return a Promise or thenable.'
+      );
+    }
+  } catch (error) {
+    resultBoundaryError = error;
+  }
+  let validationError = null;
+  try {
+    exactValidator();
+  } catch (error) {
+    validationError = error;
+  }
+  if (resultBoundaryError !== null && validationError !== null) {
+    throw new AggregateError(
+      [resultBoundaryError, validationError],
+      'Borrowed-view-data result failed while its ownership also changed.'
+    );
+  }
+  if (validationError !== null) throw validationError;
+  if (resultBoundaryError !== null) throw resultBoundaryError;
+  return result;
+}
+
+/**
+ * Resolve the exact framebuffer pane currently presenting one view.
+ *
+ * This mirrors the render loop's uniform grid arithmetic, including its
+ * integer framebuffer dimensions and bottom-origin WebGL viewport Y.
+ *
+ * @param {{
+ *   canvasHeight: number,
+ *   canvasWidth: number,
+ *   focusedViewId: string,
+ *   mode: 'single'|'grid',
+ *   viewId: string,
+ *   viewIds: string[]
+ * }} options
+ * @returns {Object}
+ */
+export function resolvePresentedViewLayout(options) {
+  if (
+    options === null ||
+    typeof options !== 'object' ||
+    Array.isArray(options)
+  ) {
+    throw new TypeError(
+      'Presented-view layout requires one exact options object.'
+    );
+  }
+  const {
+    canvasHeight,
+    canvasWidth,
+    focusedViewId,
+    mode,
+    viewId,
+    viewIds
+  } = options;
+  if (
+    !Number.isSafeInteger(canvasWidth) ||
+    canvasWidth <= 0 ||
+    !Number.isSafeInteger(canvasHeight) ||
+    canvasHeight <= 0
+  ) {
+    throw new TypeError(
+      'Presented-view canvas dimensions must be positive safe integers.'
+    );
+  }
+  if (mode !== 'single' && mode !== 'grid') {
+    throw new TypeError(
+      'Presented-view layout mode must be exactly "single" or "grid".'
+    );
+  }
+  const exactViewId = assertViewId(viewId);
+  const exactFocusedViewId = assertViewId(focusedViewId);
+  if (
+    !Array.isArray(viewIds) ||
+    viewIds.length === 0 ||
+    viewIds.some((id) => typeof id !== 'string' || id.length === 0) ||
+    new Set(viewIds).size !== viewIds.length
+  ) {
+    throw new TypeError(
+      'Presented-view inventory must contain unique non-empty view IDs.'
+    );
+  }
+  const viewIndex = viewIds.indexOf(exactViewId);
+  if (viewIndex < 0) {
+    throw new RangeError(
+      `View "${exactViewId}" is absent from the presented render inventory.`
+    );
+  }
+
+  const gridMultiview = mode === 'grid' && viewIds.length > 1;
+  if (
+    !gridMultiview &&
+    viewIds.length > 1 &&
+    exactViewId !== exactFocusedViewId
+  ) {
+    throw new RangeError(
+      `View "${exactViewId}" is not presented in single-view layout.`
+    );
+  }
+  if (!gridMultiview) {
+    return Object.freeze({
+      canvasHeight,
+      canvasWidth,
+      col: 0,
+      cols: 1,
+      gridMultiview: false,
+      layoutMode: mode,
+      paneLeftRatio: 0,
+      paneWidthRatio: 1,
+      row: 0,
+      rows: 1,
+      scissorEnabled: false,
+      viewCount: viewIds.length,
+      viewId: exactViewId,
+      viewIndex,
+      viewportHeight: canvasHeight,
+      viewportWidth: canvasWidth,
+      viewportX: 0,
+      viewportY: 0
+    });
+  }
+
+  const viewCount = viewIds.length;
+  const cols = viewCount <= 3
+    ? viewCount
+    : Math.ceil(Math.sqrt(viewCount));
+  const rows = Math.ceil(viewCount / cols);
+  const viewportWidth = Math.floor(canvasWidth / cols);
+  const viewportHeight = Math.floor(canvasHeight / rows);
+  if (viewportWidth <= 0 || viewportHeight <= 0) {
+    throw new RangeError(
+      'Presented-view grid panes must have positive framebuffer dimensions.'
+    );
+  }
+  const col = viewIndex % cols;
+  const row = Math.floor(viewIndex / cols);
+  return Object.freeze({
+    canvasHeight,
+    canvasWidth,
+    col,
+    cols,
+    gridMultiview: true,
+    layoutMode: mode,
+    paneLeftRatio: col / cols,
+    paneWidthRatio: 1 / cols,
+    row,
+    rows,
+    scissorEnabled: true,
+    viewCount,
+    viewId: exactViewId,
+    viewIndex,
+    viewportHeight,
+    viewportWidth,
+    viewportX: col * viewportWidth,
+    viewportY: (rows - 1 - row) * viewportHeight
+  });
+}
+
+/**
+ * Select the camera owner used by the actual point render for one pane.
+ * Focused and camera-locked panes consume the current global camera; only an
+ * unlocked, non-focused grid pane consumes its stored per-view camera.
+ *
+ * @param {{
+ *   camerasLocked: boolean,
+ *   focusedViewId: string,
+ *   globalCameraState: Object,
+ *   gridMultiview: boolean,
+ *   storedCameraState: Object|null,
+ *   viewId: string
+ * }} options
+ * @returns {Object} caller-owned camera state
+ */
+export function selectPresentedCameraState(options) {
+  if (
+    options === null ||
+    typeof options !== 'object' ||
+    Array.isArray(options)
+  ) {
+    throw new TypeError(
+      'Presented-view camera selection requires one exact options object.'
+    );
+  }
+  const exactViewId = assertViewId(options.viewId);
+  const exactFocusedViewId = assertViewId(options.focusedViewId);
+  const locked = assertExactBoolean(
+    options.camerasLocked,
+    'Presented-view camera lock'
+  );
+  const gridMultiview = assertExactBoolean(
+    options.gridMultiview,
+    'Presented-view grid ownership'
+  );
+  const useStored = (
+    gridMultiview &&
+    !locked &&
+    exactViewId !== exactFocusedViewId
+  );
+  const selected = useStored
+    ? options.storedCameraState
+    : options.globalCameraState;
+  return cloneCameraState(
+    selected,
+    `Presented camera state for view "${exactViewId}"`
+  );
 }
 
 function assertNoWebGLError(gl, label) {
@@ -780,6 +2410,13 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
     USE_FRUSTUM_CULLING: false,
     USE_INTERLEAVED_BUFFERS: true
   });
+  // Terminal cleanup is an internal lifecycle capability, not a replaceable
+  // facade extension point. Capture the exact implementation before callers
+  // can legitimately customize other preterminal renderer methods.
+  const handleHpRendererContextLost =
+    hpRenderer.handleContextLost.bind(hpRenderer);
+  const disposeHpRenderer =
+    hpRenderer.dispose.bind(hpRenderer);
   console.log('[Viewer] HighPerfRenderer initialized');
 
   // === ORBIT ANCHOR RENDERER ===
@@ -792,7 +2429,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
   console.log('[Viewer] SmokeRenderer initialized');
 
   // === INSTANCED LINE PROGRAM (V2 - GPU-optimized) ===
-  const lineInstancedProgram = createProgram(gl, LINE_INSTANCED_VS_SOURCE, LINE_INSTANCED_FS_SOURCE);
+  let lineInstancedProgram = createProgram(gl, LINE_INSTANCED_VS_SOURCE, LINE_INSTANCED_FS_SOURCE);
   const lineInstancedAttribLocations = {
     quadPos: gl.getAttribLocation(lineInstancedProgram, 'a_quadPos'),
   };
@@ -818,7 +2455,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
   };
 
   // === GRID PROGRAM ===
-  const gridProgram = createProgram(gl, GRID_VS_SOURCE, GRID_FS_SOURCE);
+  let gridProgram = createProgram(gl, GRID_VS_SOURCE, GRID_FS_SOURCE);
   const gridAttribLocations = {
     position: gl.getAttribLocation(gridProgram, 'a_position'),
   };
@@ -843,7 +2480,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
   };
 
   // === CENTROID PROGRAM (simple WebGL2 shader for small centroid count) ===
-  const centroidProgram = createProgram(gl, CENTROID_VS, CENTROID_FS);
+  let centroidProgram = createProgram(gl, CENTROID_VS, CENTROID_FS);
   const centroidAttribLocations = {
     position: gl.getAttribLocation(centroidProgram, 'a_position'),
     color: gl.getAttribLocation(centroidProgram, 'a_color'), // RGBA uint8 normalized
@@ -870,6 +2507,33 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
     if (overlayManager) return overlayManager;
     overlayManager = new OverlayManager(gl);
     return overlayManager;
+  }
+
+  function reportHighlightRenderFailure(value, viewId) {
+    const exactError = value instanceof Error
+      ? value
+      : new Error('Highlight rendering failed with a non-Error value.');
+    if (highlightRenderFailureHandler === null) {
+      // Highlight publication is fenced by its exact semantic generation. A
+      // diagnostic here is therefore report-once without terminating the RAF
+      // loop or preventing the remaining panes/passes from rendering.
+      try {
+        console.error(
+          `[Viewer] Highlight rendering failed for view "${viewId}".`,
+          exactError
+        );
+      } catch {
+        // Diagnostics are observational and must not become a render failure.
+      }
+      return;
+    }
+    try {
+      highlightRenderFailureHandler(exactError, viewId);
+    } catch (observerError) {
+      queueMicrotask(() => {
+        throw observerError;
+      });
+    }
   }
 
   function reportVelocityRenderFailure(value) {
@@ -955,7 +2619,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
   // === INSTANCED EDGE RENDERING ===
   // Quad geometry buffer for instanced edges (6 vertices, 2 triangles)
   // Each vertex has (x, y) where x = endpoint (-1=src, +1=dst), y = side (-1=left, +1=right)
-  const edgeQuadBuffer = gl.createBuffer();
+  let edgeQuadBuffer = gl.createBuffer();
   gl.bindBuffer(gl.ARRAY_BUFFER, edgeQuadBuffer);
   gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
     // Triangle 1: src-left, src-right, dst-left
@@ -973,7 +2637,15 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
   let nCellsV2 = 0;
   let hasEdgeDataV2 = false;
   let useInstancedEdges = false;  // Whether to use v2 instanced rendering
-  let edgeLodLimit = 0;  // LOD limit for number of edges to render (0 = all)
+  // Endpoint owners alias the exact shuffled dataset generation. Per-view
+  // sparse prefix indices are certified against the accepted R8 visibility
+  // scratch so every pane can submit its own exact instance count.
+  let edgeSourcesV2 = null;
+  let edgeDestinationsV2 = null;
+  let edgeVisibleTarget = 0;
+  let edgeAllVisiblePrefixOwner = null;
+  const edgePrefixOwnersV2 = new Map();
+  let edgePrefixCheckpointStaging = null;
 
   // Per-view edge textures for multi-view/multi-dimension support
   // Each view can have different positions (embeddings) and visibility (filters/LOD)
@@ -983,6 +2655,12 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
   const edgePositionTexturePoolV2 = new Map(); // generation -> pooled entry
   const edgePositionTexturesV2 = new Map();   // viewId -> pooled entry
   const edgeVisibilityTexturesV2 = new Map(); // viewId -> { texture, dims: [w, h], scratchBuffer, format }
+  const edgeTextureLookupScratch = {
+    posTexture: null,
+    visTexture: null,
+    dims: null
+  };
+  let edgeVisibilityStagingBuffer = null;
   const pendingEdgeTextureRetirements = new Set();
 
   // Debug flag for edge rendering (set to true to enable verbose logging)
@@ -1052,12 +2730,55 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
     ]), gl.STATIC_DRAW);
   }
   initGridPlanes(GRID_SIZE);
+  const gridPlaneDescriptors = Object.freeze([
+    Object.freeze({
+      bufferKey: 'bottom',
+      normalX: 0,
+      normalY: -1,
+      normalZ: 0,
+      type: 1,
+    }),
+    Object.freeze({
+      bufferKey: 'top',
+      normalX: 0,
+      normalY: 1,
+      normalZ: 0,
+      type: 1,
+    }),
+    Object.freeze({
+      bufferKey: 'back',
+      normalX: 0,
+      normalY: 0,
+      normalZ: -1,
+      type: 0,
+    }),
+    Object.freeze({
+      bufferKey: 'front',
+      normalX: 0,
+      normalY: 0,
+      normalZ: 1,
+      type: 0,
+    }),
+    Object.freeze({
+      bufferKey: 'left',
+      normalX: -1,
+      normalY: 0,
+      normalZ: 0,
+      type: 2,
+    }),
+    Object.freeze({
+      bufferKey: 'right',
+      normalX: 1,
+      normalY: 0,
+      normalZ: 0,
+      type: 2,
+    }),
+  ]);
 
   // === GL State ===
   gl.enable(gl.DEPTH_TEST);
   gl.depthFunc(gl.LEQUAL);
-  gl.enable(gl.BLEND);
-  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+  configureStraightAlphaBlending(gl);
 
   // === Scene Variables ===
   let pointCount = 0;
@@ -1066,13 +2787,18 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
   let defaultShowCentroidLabels = false;
   const viewCentroidFlags = new Map();
   const viewCentroidLabels = new Map();
+  const hiddenCentroidLabelViews = new Set();
+  const EMPTY_CENTROID_LABELS = Object.freeze([]);
   const centroidLabelOwners = new WeakMap();
+  const centroidLabelPresentation = new WeakMap();
   const pendingCentroidLabelRetirements = new Map();
 
   // Small-multiples / snapshot views
   const LIVE_VIEW_ID = 'live';
   const MAX_SNAPSHOTS = 3;
   let snapshotViews = [];
+  const snapshotViewsById = new Map();
+  const certifiedCameraStateOwners = new WeakSet();
   const pendingSnapshotCleanupIds = new Set();
   let nextSnapshotId = 1;
   let viewLayoutMode = 'grid';
@@ -1081,6 +2807,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
   let liveViewHidden = false; // Whether to hide live view from grid
   let viewFocusHandler = typeof onViewFocus === 'function' ? onViewFocus : null;
   let navigationModeChangeHandler = null;
+  let highlightRenderFailureHandler = null;
   let smokeRenderFailureHandler = null;
   let velocityRenderFailureHandler = null;
 
@@ -1088,11 +2815,26 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
     const exactViewId = assertViewId(viewId);
     if (
       exactViewId !== LIVE_VIEW_ID &&
-      !snapshotViews.some((snapshot) => snapshot.id === exactViewId)
+      !snapshotViewsById.has(exactViewId)
     ) {
       throw new RangeError(`Unknown renderer view "${exactViewId}".`);
     }
     return exactViewId;
+  }
+
+  function certifyCameraStateOwner(cameraState, boundary) {
+    if (
+      cameraState === null ||
+      (typeof cameraState !== 'object' &&
+        typeof cameraState !== 'function')
+    ) {
+      return assertCameraState(cameraState, boundary);
+    }
+    if (!certifiedCameraStateOwners.has(cameraState)) {
+      assertCameraState(cameraState, boundary);
+      certifiedCameraStateOwners.add(cameraState);
+    }
+    return cameraState;
   }
 
   // Camera lock state for independent view navigation
@@ -1115,25 +2857,344 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
 	  const overlayCtxByView = new Map();     // viewId -> OverlayContext
 	  const overlayCtxOptionsByView = new Map(); // viewId -> stable buildOverlayContext options object
 	  const lodChangeListeners = new Set();
-	  const publishedLodLevels = new Map();
+	  const publishedLodCertificates = new Map();
+	  const presentedViewStateListeners = new Set();
+	  let presentedViewStateGeneration = 0;
+	  const PRESENTED_CAMERA_SETTLE_MS = 120;
+	  const presentedFrameState = {
+	    initialized: false,
+	    pending: false,
+	    lastChangeTime: 0,
+	    canvasHeight: 0,
+	    canvasWidth: 0,
+	    navigationMode: null,
+	    radius: 0,
+	    theta: 0,
+	    phi: 0,
+	    targetX: 0,
+	    targetY: 0,
+	    targetZ: 0,
+	    freeflyX: 0,
+	    freeflyY: 0,
+	    freeflyZ: 0,
+	    freeflyYaw: 0,
+	    freeflyPitch: 0
+	  };
+	  // Point attribute updates can legally reuse the same Uint8/Float32 owner.
+	  // One explicit publication generation therefore complements reference
+	  // and renderer geometry checks at synchronous borrowed-data boundaries.
+	  const viewDataGenerations = new Map();
+	  let nextViewDataGeneration = 1;
+	  const presentedLodGenerationIds = new WeakMap();
+	  let nextPresentedLodGenerationId = 1;
 
-	  function publishLodLevelChange(viewId) {
+	  function reportPresentedObserverFailures(failures) {
+	    if (failures.length === 0) return;
+	    const diagnostic = failures.length === 1
+	      ? failures[0]
+	      : new AggregateError(
+	          failures,
+	          'Multiple presented-state observers failed.'
+	        );
+	    queueMicrotask(() => {
+	      try {
+	        console.error(
+	          '[Viewer] Presented-state observer failed.',
+	          diagnostic
+	        );
+	      } catch {
+	        // Diagnostics cannot invalidate a presented-state publication.
+	      }
+	    });
+	  }
+
+	  function publishPresentedViewStateChange(
+	    reason,
+	    viewId = focusedViewId,
+	    resetFrameBaseline = true
+	  ) {
+	    if (
+	      typeof reason !== 'string' ||
+	      reason.length === 0 ||
+	      reason.trim() !== reason
+	    ) {
+	      throw new TypeError(
+	        'Presented-state change reason must be a non-empty trimmed string.'
+	      );
+	    }
+	    const exactViewId = assertViewId(viewId);
+	    if (typeof resetFrameBaseline !== 'boolean') {
+	      throw new TypeError(
+	        'Presented-state frame-baseline reset must be an exact boolean.'
+	      );
+	    }
+	    // Any explicit semantic publication becomes the new frame baseline;
+	    // camera tracking will initialize from it instead of delivering a
+	    // duplicate trailing event for the same change.
+	    if (resetFrameBaseline) {
+	      presentedFrameState.initialized = false;
+	      presentedFrameState.pending = false;
+	    }
+	    if (presentedViewStateListeners.size === 0) return;
+	    presentedViewStateGeneration =
+	      presentedViewStateGeneration === Number.MAX_SAFE_INTEGER
+	        ? 1
+	        : presentedViewStateGeneration + 1;
+	    const event = Object.freeze({
+	      generation: presentedViewStateGeneration,
+	      reason,
+	      viewId: exactViewId
+	    });
+	    const failures = [];
+	    for (const listener of presentedViewStateListeners) {
+	      try {
+	        listener(event);
+	      } catch (error) {
+	        failures.push(
+	          error instanceof Error
+	            ? error
+	            : new Error(
+	                'Presented-state observer threw a non-Error value.'
+	              )
+	        );
+	      }
+	    }
+	    reportPresentedObserverFailures(failures);
+	  }
+
+	  function trackPresentedFrameState(now, canvasWidth, canvasHeight) {
+	    if (presentedViewStateListeners.size === 0) {
+	      presentedFrameState.initialized = false;
+	      presentedFrameState.pending = false;
+	      return;
+	    }
+	    const state = presentedFrameState;
+	    const changed = (
+	      !state.initialized ||
+	      state.canvasWidth !== canvasWidth ||
+	      state.canvasHeight !== canvasHeight ||
+	      state.navigationMode !== navigationMode ||
+	      state.radius !== radius ||
+	      state.theta !== theta ||
+	      state.phi !== phi ||
+	      state.targetX !== target[0] ||
+	      state.targetY !== target[1] ||
+	      state.targetZ !== target[2] ||
+	      state.freeflyX !== freeflyPosition[0] ||
+	      state.freeflyY !== freeflyPosition[1] ||
+	      state.freeflyZ !== freeflyPosition[2] ||
+	      state.freeflyYaw !== freeflyYaw ||
+	      state.freeflyPitch !== freeflyPitch
+	    );
+	    if (changed) {
+	      const wasInitialized = state.initialized;
+	      state.initialized = true;
+	      state.canvasWidth = canvasWidth;
+	      state.canvasHeight = canvasHeight;
+	      state.navigationMode = navigationMode;
+	      state.radius = radius;
+	      state.theta = theta;
+	      state.phi = phi;
+	      state.targetX = target[0];
+	      state.targetY = target[1];
+	      state.targetZ = target[2];
+	      state.freeflyX = freeflyPosition[0];
+	      state.freeflyY = freeflyPosition[1];
+	      state.freeflyZ = freeflyPosition[2];
+	      state.freeflyYaw = freeflyYaw;
+	      state.freeflyPitch = freeflyPitch;
+	      if (wasInitialized) {
+	        const startsBurst = !state.pending;
+	        state.pending = true;
+	        state.lastChangeTime = now;
+	        if (startsBurst) {
+	          publishPresentedViewStateChange(
+	            'camera-changing',
+	            focusedViewId,
+	            false
+	          );
+	        }
+	      }
+	      return;
+	    }
+	    if (
+	      state.pending &&
+	      now - state.lastChangeTime >=
+	        PRESENTED_CAMERA_SETTLE_MS
+	    ) {
+	      state.pending = false;
+	      publishPresentedViewStateChange(
+	        'camera-settled',
+	        focusedViewId
+	      );
+	    }
+	  }
+
+	  function publishViewDataGeneration(viewId) {
+	    const exactViewId = assertKnownViewId(viewId);
+	    if (
+	      !Number.isSafeInteger(nextViewDataGeneration) ||
+	      nextViewDataGeneration <= 0
+	    ) {
+	      throw new Error(
+	        'Viewer point-data generation space is exhausted.'
+	      );
+	    }
+	    const generation = nextViewDataGeneration;
+	    nextViewDataGeneration += 1;
+	    viewDataGenerations.set(exactViewId, generation);
+	    return generation;
+	  }
+
+	  function getViewDataGeneration(viewId) {
+	    const exactViewId = assertKnownViewId(viewId);
+	    const generation = viewDataGenerations.get(exactViewId);
+	    if (!Number.isSafeInteger(generation) || generation <= 0) {
+	      throw new Error(
+	        `Point data are not published for view "${exactViewId}".`
+	      );
+	    }
+	    return generation;
+	  }
+
+	  function getPresentedLodGenerationId(generationToken) {
+	    if (generationToken === null) return 0;
+	    if (
+	      typeof generationToken !== 'object' ||
+	      !Object.isFrozen(generationToken)
+	    ) {
+	      throw new TypeError(
+	        'Presented LOD generation token must be null or one frozen object.'
+	      );
+	    }
+	    let id = presentedLodGenerationIds.get(generationToken);
+	    if (id !== undefined) return id;
+	    if (
+	      !Number.isSafeInteger(nextPresentedLodGenerationId) ||
+	      nextPresentedLodGenerationId <= 0
+	    ) {
+	      throw new Error(
+	        'Presented LOD generation identity space is exhausted.'
+	      );
+	    }
+	    id = nextPresentedLodGenerationId;
+	    nextPresentedLodGenerationId += 1;
+	    presentedLodGenerationIds.set(generationToken, id);
+	    return id;
+	  }
+
+	  function createLodPublicationCertificate(viewId) {
 	    const exactViewId = assertKnownViewId(viewId);
 	    const lodLevel = hpRenderer.getCurrentLODLevel(exactViewId);
+	    const dimensionLevel = getPublishedDimensionLevel(exactViewId);
+	    const geometryGeneration =
+	      hpRenderer.getViewGeometryGeneration(exactViewId);
+	    const lodOwnerToken = hpRenderer.getCurrentLodOwnerToken(
+	      exactViewId,
+	      dimensionLevel
+	    );
 	    if (!Number.isSafeInteger(lodLevel) || lodLevel < -1) {
 	      throw new Error(
 	        `Renderer published an invalid LOD level for view "${exactViewId}".`
 	      );
 	    }
-	    if (!publishedLodLevels.has(exactViewId)) {
-	      publishedLodLevels.set(exactViewId, lodLevel);
-	      return;
+	    if (
+	      !Number.isSafeInteger(geometryGeneration) ||
+	      geometryGeneration <= 0
+	    ) {
+	      throw new Error(
+	        `Renderer published an invalid geometry generation for view "${exactViewId}".`
+	      );
 	    }
-	    if (publishedLodLevels.get(exactViewId) === lodLevel) return;
-	    publishedLodLevels.set(exactViewId, lodLevel);
-	    const event = Object.freeze({ viewId: exactViewId, lodLevel });
+	    return Object.freeze({
+	      dimensionLevel,
+	      geometryGeneration,
+	      lodLevel,
+	      lodOwnerToken,
+	      viewId: exactViewId,
+	    });
+	  }
+
+	  function publishLodLevelChange(viewId) {
+	    const exactViewId = assertKnownViewId(viewId);
+	    const lodLevel = hpRenderer.getCurrentLODLevel(exactViewId);
+	    const dimensionLevel = getPublishedDimensionLevel(exactViewId);
+	    const geometryGeneration =
+	      hpRenderer.getViewGeometryGeneration(exactViewId);
+	    const lodOwnerToken = hpRenderer.getCurrentLodOwnerToken(
+	      exactViewId,
+	      dimensionLevel
+	    );
+	    if (!Number.isSafeInteger(lodLevel) || lodLevel < -1) {
+	      throw new Error(
+	        `Renderer published an invalid LOD level for view "${exactViewId}".`
+	      );
+	    }
+	    if (
+	      !Number.isSafeInteger(geometryGeneration) ||
+	      geometryGeneration <= 0
+	    ) {
+	      throw new Error(
+	        `Renderer published an invalid geometry generation for view "${exactViewId}".`
+	      );
+	    }
+	    const previous = publishedLodCertificates.get(exactViewId);
+	    if (
+	      previous !== undefined &&
+	      previous.lodLevel === lodLevel &&
+	      previous.dimensionLevel === dimensionLevel &&
+	      previous.geometryGeneration === geometryGeneration &&
+	      previous.lodOwnerToken === lodOwnerToken
+	    ) return;
+	    const nextCertificate = Object.freeze({
+	      dimensionLevel,
+	      geometryGeneration,
+	      lodLevel,
+	      lodOwnerToken,
+	      viewId: exactViewId,
+	    });
+	    publishedLodCertificates.set(
+	      exactViewId,
+	      nextCertificate
+	    );
+	    const next = Object.freeze({
+	      dimensionLevel,
+	      geometryGeneration,
+	      lodLevel,
+	      viewId: exactViewId,
+	    });
+	    publishPresentedViewStateChange('lod', exactViewId);
+	    const observerFailures = [];
 	    for (const listener of lodChangeListeners) {
-	      listener(event);
+	      try {
+	        listener(next);
+	      } catch (error) {
+	        observerFailures.push(
+	          error instanceof Error
+	            ? error
+	            : new Error(
+	                'LOD change observer threw a non-Error value.'
+	              )
+	        );
+	      }
+	    }
+	    if (observerFailures.length > 0) {
+	      const diagnostic = observerFailures.length === 1
+	        ? observerFailures[0]
+	        : new AggregateError(
+	            observerFailures,
+	            'Multiple LOD change observers failed.'
+	          );
+	      queueMicrotask(() => {
+	        try {
+	          console.error(
+	            '[Viewer] LOD change observer failed.',
+	            diagnostic
+	          );
+	        } catch {
+	          // Diagnostics cannot invalidate a published render generation.
+	        }
+	      });
 	    }
 	  }
 
@@ -1162,6 +3223,23 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
 	    return positions;
 	  }
 
+	  function getExactViewColors(viewId) {
+	    const exactViewId = assertKnownViewId(viewId);
+	    if (exactViewId === LIVE_VIEW_ID) {
+	      if (!(colorsArray instanceof Uint8Array)) {
+	        throw new Error('Colors are not published for view "live".');
+	      }
+	      return colorsArray;
+	    }
+	    const snapshot = snapshotViewsById.get(exactViewId);
+	    if (!(snapshot?.colors instanceof Uint8Array)) {
+	      throw new Error(
+	        `Colors are not published for view "${exactViewId}".`
+	      );
+	    }
+	    return snapshot.colors;
+	  }
+
 		  function getExactViewTransparency(viewId) {
 	    if (typeof viewId !== 'string' || viewId.length === 0) {
 	      throw new TypeError('Renderer view id must be a non-empty string.');
@@ -1172,7 +3250,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
 	      }
 	      return transparencyArray;
 	    }
-	    const snapshot = snapshotViews.find((entry) => entry.id === viewId);
+	    const snapshot = snapshotViewsById.get(viewId);
 	    if (!snapshot) {
 	      throw new Error(`View "${viewId}" does not exist.`);
 	    }
@@ -1181,6 +3259,113 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
 	    }
 		    return snapshot.transparency;
 		  }
+
+	  function captureExactViewDataOwnership(viewId) {
+	    const exactViewId = assertKnownViewId(viewId);
+	    const geometryGenerationBefore =
+	      hpRenderer.getViewGeometryGeneration(exactViewId);
+	    const dataGeneration = getViewDataGeneration(exactViewId);
+	    const positions = getExactViewPositions(exactViewId);
+	    const colors = getExactViewColors(exactViewId);
+	    const transparency =
+	      getExactViewTransparency(exactViewId);
+	    const dimensionLevel =
+	      getPublishedDimensionLevel(exactViewId);
+	    const pointCountForView = positions.length / 3;
+	    if (
+	      !Number.isSafeInteger(pointCountForView) ||
+	      pointCountForView !== pointCount ||
+	      colors.length !== pointCountForView * 4 ||
+	      transparency.length !== pointCountForView
+	    ) {
+	      throw new Error(
+	        `Point-data ownership is inconsistent for view "${exactViewId}".`
+	      );
+	    }
+	    const lodLevel =
+	      hpRenderer.getCurrentLODLevel(exactViewId);
+	    const lodMembership = requireViewerSequentialLodMembership(
+	      hpRenderer.getCurrentLodSequentialMembership(
+	        exactViewId,
+	        dimensionLevel
+	      ),
+	      pointCountForView
+	    );
+	    const lodSizeMultiplier =
+	      hpRenderer.getCurrentLODSizeMultiplier(
+	        exactViewId,
+	        dimensionLevel
+	      );
+	    const geometryGenerationAfter =
+	      hpRenderer.getViewGeometryGeneration(exactViewId);
+	    if (
+	      geometryGenerationBefore !== geometryGenerationAfter ||
+	      !Number.isSafeInteger(geometryGenerationAfter) ||
+	      geometryGenerationAfter <= 0
+	    ) {
+	      throw new Error(
+	        `Point-data geometry changed while reading view "${exactViewId}".`
+	      );
+	    }
+	    return Object.freeze({
+	      colors,
+	      dataGeneration,
+	      dimensionLevel,
+	      geometryGeneration: geometryGenerationAfter,
+	      lodLevel,
+	      lodMembership,
+	      lodSizeMultiplier,
+	      pointCount: pointCountForView,
+	      positions,
+	      transparency,
+	      viewId: exactViewId
+	    });
+	  }
+
+	  function assertViewDataOwnershipCurrent(
+	    owner,
+	    boundary = 'Borrowed point data'
+	  ) {
+	    let current;
+	    try {
+	      current = captureExactViewDataOwnership(owner.viewId);
+	    } catch (error) {
+	      throw new Error(
+	        `${boundary} for view "${owner.viewId}" changed during capture.`,
+	        { cause: error }
+	      );
+	    }
+	    if (
+	      current.positions !== owner.positions ||
+	      current.colors !== owner.colors ||
+	      current.transparency !== owner.transparency ||
+	      current.pointCount !== owner.pointCount ||
+	      current.dimensionLevel !== owner.dimensionLevel ||
+	      current.geometryGeneration !== owner.geometryGeneration ||
+	      current.dataGeneration !== owner.dataGeneration ||
+	      current.lodLevel !== owner.lodLevel ||
+	      current.lodMembership !== owner.lodMembership ||
+	      current.lodSizeMultiplier !== owner.lodSizeMultiplier
+	    ) {
+	      throw new Error(
+	        `${boundary} for view "${owner.viewId}" changed during capture.`
+	      );
+	    }
+	  }
+
+	  function createPresentedLodMembership(membership) {
+	    if (membership === null) return null;
+	    // Presentation observers need a freshness certificate, never the
+	    // renderer-owned admitted-index array. The borrowed synchronous
+	    // boundary remains the only route that can clone those data.
+	    return Object.freeze({
+	      admittedCount: membership.indices.length,
+	      dimensionLevel: membership.dimensionLevel,
+	      generationToken: membership.generationToken,
+	      lodLevel: membership.lodLevel,
+	      pointCount: membership.pointCount,
+	    });
+	  }
 
       function getSpatialQueryOwner(
         viewId,
@@ -1199,8 +3384,8 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
         const pointCountForView = publishedPositions.length / 3;
         const resolveIndex = () => (
           exactViewId === LIVE_VIEW_ID
-            ? hpRenderer.getSpatialIndex(dimensionLevel)
-            : hpRenderer.getSnapshotSpatialIndex(
+            ? hpRenderer.spatialIndices.get(dimensionLevel) ?? null
+            : hpRenderer._getSpatialIndexForViewGeneration(
                 exactViewId,
                 dimensionLevel
               )
@@ -1326,7 +3511,6 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
 
   const viewTitleLayerEl = viewTitleLayer || null;
   let viewTitleEntries = [];
-  let lastTitleKey = null;
   // Cache for view title layout to avoid per-frame style updates
   let lastTitleLayoutWidth = 0;
   let lastTitleLayoutHeight = 0;
@@ -1355,6 +3539,11 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
   const _freeflyRight = vec3.create();
   const _freeflyUp = vec3.create();
   const _freeflyWorldUp = vec3.fromValues(0, 1, 0);
+  const _freeflyAxes = {
+    forward: _freeflyForward,
+    right: _freeflyRight,
+    upVec: _freeflyUp
+  };
   // Preallocated scratch matrix for grid rendering to avoid per-frame mat4.clone()
   const _activeViewMatrixScratch = mat4.create();
   // Preallocated scratch vectors for updateFreefly() to avoid per-frame allocations
@@ -1365,6 +3554,60 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
 	  // Preallocated array for render loop view list to avoid per-frame array allocation
 	  const _renderAllViews = [];
 	  const _renderVelocityViewIds = [];
+	  const _smokeRenderParams = {
+	    invViewProjMatrix,
+	    eye: null,
+	    lightDir,
+	    width: 0,
+	    height: 0,
+	  };
+	  const _liveRenderViewRecord = {
+	    id: LIVE_VIEW_ID,
+	    label: '',
+	    colors: null,
+	    transparency: null,
+	    centroidPositions: null,
+	    centroidColors: null,
+	    centroidTransparencies: null,
+	    centroidCount: 0,
+	    cameraState: null
+	  };
+	  // Snapshot objects are stable for their published lifetime. Weak keys
+	  // eliminate per-frame descriptor literals without retaining removed
+	  // snapshots or their potentially large typed arrays.
+	  const _snapshotRenderViewRecordPool = new WeakMap();
+	  function getSnapshotRenderViewRecord(snapshot) {
+	    let record =
+	      _snapshotRenderViewRecordPool.get(snapshot);
+	    if (!record) {
+	      record = {
+	        id: snapshot.id,
+	        label: snapshot.label,
+	        colors: snapshot.colors,
+	        transparency: snapshot.transparency,
+	        centroidPositions: snapshot.centroidPositions,
+	        centroidColors: snapshot.centroidColors,
+	        centroidTransparencies:
+	          snapshot.centroidTransparencies,
+	        centroidCount: 0,
+	        cameraState: snapshot.cameraState
+	      };
+	      _snapshotRenderViewRecordPool.set(snapshot, record);
+	    }
+	    record.id = snapshot.id;
+	    record.label = snapshot.label;
+	    record.colors = snapshot.colors;
+	    record.transparency = snapshot.transparency;
+	    record.centroidPositions = snapshot.centroidPositions;
+	    record.centroidColors = snapshot.centroidColors;
+	    record.centroidTransparencies =
+	      snapshot.centroidTransparencies;
+	    record.centroidCount = snapshot.centroidPositions
+	      ? snapshot.centroidPositions.length / 3
+	      : 0;
+	    record.cameraState = snapshot.cameraState;
+	    return record;
+	  }
 	  // Reused per-frame parameter objects (avoid per-view per-frame allocations in multiview mode)
 	  const _projectileDrawParams = {
 	    viewportHeight: 0,
@@ -1487,6 +3730,9 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
 	  let renderPaused = false;
 	  let disposed = false;
 	  let disposalSettled = false;
+	  let disposalInProgress = false;
+	  let contextLossTransitioning = false;
+	  let disposalRequestedDuringContextLoss = false;
 	  const completedDisposalSteps = new Set();
 
   // Navigation (orbit + free-fly + planar)
@@ -1582,9 +3828,21 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
 
   // === Event Listener Registry (for cleanup/dispose) ===
   const eventCleanupFns = [];
-  function addEventListenerWithCleanup(target, event, handler, options) {
+  const contextEventCleanupFns = [];
+  function addEventListenerWithCleanup(
+    target,
+    event,
+    handler,
+    options,
+    allowAfterContextLoss = false
+  ) {
     const guardedHandler = function viewerEventHandler(...args) {
-      if (disposed) return;
+      if (
+        disposed ||
+        (webglContextLost && !allowAfterContextLoss)
+      ) {
+        return;
+      }
       return Reflect.apply(handler, this, args);
     };
     target.addEventListener(event, guardedHandler, options);
@@ -1593,16 +3851,53 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
     );
   }
 
+  function addContextEventListenerWithCleanup(
+    target,
+    event,
+    handler,
+    options
+  ) {
+    const guardedHandler = function viewerContextEventHandler(...args) {
+      if (disposalSettled) return;
+      return Reflect.apply(handler, this, args);
+    };
+    target.addEventListener(event, guardedHandler, options);
+    contextEventCleanupFns.push(
+      () => target.removeEventListener(event, guardedHandler, options)
+    );
+  }
+
   // === WebGL context loss handling (WebGL2-only policy) ===
   let webglContextLost = false;
   let webglContextOverlay = null;
   let webglContextOverlayMessage = null;
+  let webglContextOverlayAction = null;
+  const webglContextOverlayCleanupFns = [];
+  const hpRendererFacade = createViewerRendererFacade(
+    hpRenderer,
+    () => (
+      disposed
+        ? 'disposed'
+        : webglContextLost
+          ? 'context-lost'
+          : null
+    )
+  );
 
   function ensureWebglContextOverlay() {
     if (webglContextOverlay) return webglContextOverlay;
 
     const overlay = document.createElement('div');
+    const overlayIdentity = nextWebglContextOverlayIdentity++;
+    const titleId =
+      `cellucid-webgl-context-overlay-title-${overlayIdentity}`;
+    const messageId =
+      `cellucid-webgl-context-overlay-message-${overlayIdentity}`;
     overlay.id = 'cellucid-webgl-context-overlay';
+    overlay.setAttribute('role', 'alertdialog');
+    overlay.setAttribute('aria-modal', 'true');
+    overlay.setAttribute('aria-labelledby', titleId);
+    overlay.setAttribute('aria-describedby', messageId);
     overlay.style.cssText = `
       position: fixed;
       inset: 0;
@@ -1629,10 +3924,12 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
     `;
 
     const title = document.createElement('div');
+    title.id = titleId;
     title.style.cssText = 'font-size: 16px; font-weight: 700; margin-bottom: 10px;';
     title.textContent = 'WebGL Context Lost';
 
     const message = document.createElement('div');
+    message.id = messageId;
     message.style.cssText = 'font-size: 13px; line-height: 1.5; opacity: 0.95; margin-bottom: 14px;';
     message.textContent = 'WebGL context lost. Reload required.';
 
@@ -1641,7 +3938,18 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
     btn.className = 'btn-small';
     btn.textContent = 'Reload';
     btn.style.cssText = 'cursor: pointer;';
-    btn.addEventListener('click', () => window.location.reload());
+    const handleReload = () => window.location.reload();
+    const containDialogFocus = event => {
+      if (event.key !== 'Tab') return;
+      event.preventDefault();
+      btn.focus({ preventScroll: true });
+    };
+    btn.addEventListener('click', handleReload);
+    overlay.addEventListener('keydown', containDialogFocus);
+    webglContextOverlayCleanupFns.push(
+      () => btn.removeEventListener('click', handleReload),
+      () => overlay.removeEventListener('keydown', containDialogFocus)
+    );
 
     panel.appendChild(title);
     panel.appendChild(message);
@@ -1651,6 +3959,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
     document.body.appendChild(overlay);
     webglContextOverlay = overlay;
     webglContextOverlayMessage = message;
+    webglContextOverlayAction = btn;
     return overlay;
   }
 
@@ -1660,21 +3969,206 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
       webglContextOverlayMessage.textContent = message;
     }
     overlay.style.display = 'flex';
+    webglContextOverlayAction?.focus({ preventScroll: true });
+  }
+
+  function invalidateViewerWebGLOwnersAfterContextLoss() {
+    const prefixOwners = new Set();
+    for (const owner of edgePrefixOwnersV2.values()) {
+      if (owner.provisional !== true) {
+        prefixOwners.add(owner.prefixOwner);
+      }
+    }
+    if (edgeAllVisiblePrefixOwner !== null) {
+      prefixOwners.add(edgeAllVisiblePrefixOwner);
+    }
+
+    // WebGL has already invalidated every handle. Drop those invalid owners
+    // directly; routing them through ordinary retirement would itself issue
+    // illegal/no-op GL calls on some browser backends.
+    centroidPositionBuffer = null;
+    centroidColorBuffer = null;
+    centroidCount = 0;
+    lineInstancedProgram = null;
+    gridProgram = null;
+    centroidProgram = null;
+    edgeQuadBuffer = null;
+    for (const locations of [
+      lineInstancedUniformLocations,
+      gridUniformLocations,
+      centroidUniformLocations,
+    ]) {
+      for (const key of Object.keys(locations)) {
+        locations[key] = null;
+      }
+    }
+    centroidSnapshotBuffers.clear();
+    pendingCentroidSnapshotRetirements.clear();
+    for (const key of Object.keys(gridPlaneBuffers)) {
+      gridPlaneBuffers[key] = null;
+    }
+
+    edgeTextureV2 = null;
+    edgeWeightTextureV2 = null;
+    edgePositionTexturePoolV2.clear();
+    edgePositionTexturesV2.clear();
+    edgeVisibilityTexturesV2.clear();
+    pendingEdgeTextureRetirements.clear();
+    edgeVisibilityStagingBuffer = null;
+    edgeSourcesV2 = null;
+    edgeDestinationsV2 = null;
+    edgePrefixOwnersV2.clear();
+    edgePrefixCheckpointStaging = null;
+    edgeAllVisiblePrefixOwner = null;
+    edgeVisibleTarget = 0;
+    edgeTexDimsV2 = [0, 0];
+    nEdgesV2 = 0;
+    nCellsV2 = 0;
+    hasEdgeDataV2 = false;
+    useInstancedEdges = false;
+
+    const failures = [];
+    for (const owner of prefixOwners) {
+      try {
+        retireConnectivityEdgePrefixOwner(owner);
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    if (failures.length > 0) {
+      throw new AggregateError(
+        failures,
+        'Connectivity CPU ownership could not be fully retired after context loss.'
+      );
+    }
+  }
+
+  function retireCleanupCallbacks(callbacks, owner) {
+    const retiring = callbacks.splice(0, callbacks.length);
+    const failedCallbacks = [];
+    const failures = [];
+    for (const cleanup of retiring) {
+      try {
+        cleanup();
+      } catch (error) {
+        failedCallbacks.push(cleanup);
+        failures.push(error);
+      }
+    }
+    callbacks.push(...failedCallbacks);
+    if (failures.length > 0) {
+      throw new AggregateError(
+        failures,
+        `${owner} retirement was incomplete.`
+      );
+    }
+  }
+
+  function retireViewTitleOwners() {
+    const failedEntries = [];
+    const failures = [];
+    for (const entry of viewTitleEntries) {
+      try {
+        entry.el?.remove();
+      } catch (error) {
+        failedEntries.push(entry);
+        failures.push(error);
+      }
+    }
+    viewTitleEntries = failedEntries;
+    lastTitleLayoutWidth = 0;
+    lastTitleLayoutHeight = 0;
+    lastTitleLayoutCols = 0;
+    lastTitleLayoutRows = 0;
+    if (failures.length > 0) {
+      throw new AggregateError(
+        failures,
+        'Viewer title-chip retirement was incomplete.'
+      );
+    }
+  }
+
+  function retireCentroidLabelOwners() {
+    const failures = [];
+    const ownedViewIds = new Set([
+      ...viewCentroidLabels.keys(),
+      ...pendingCentroidLabelRetirements.keys(),
+    ]);
+    for (const viewId of ownedViewIds) {
+      try {
+        removeLabelsForView(viewId);
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    if (failures.length > 0) {
+      throw new AggregateError(
+        failures,
+        'Viewer centroid-label retirement was incomplete.'
+      );
+    }
+  }
+
+  function retireViewerCpuCaches() {
+    retireRenderViewRecord(_liveRenderViewRecord);
+    cachedViewMatrices.clear();
+    renderParamsByView.clear();
+    overlayCtxByView.clear();
+    overlayCtxOptionsByView.clear();
+    viewDimensionLevels.clear();
+    viewPositionsCache.clear();
+    viewDataGenerations.clear();
+    viewCentroidFlags.clear();
+    hiddenCentroidLabelViews.clear();
+    publishedLodCertificates.clear();
+    lodChangeListeners.clear();
+    presentedViewStateListeners.clear();
+    presentedFrameState.initialized = false;
+    presentedFrameState.pending = false;
+    cachedGridProjections.clear();
+    activeKeys.clear();
+    _renderAllViews.length = 0;
+    _renderVelocityViewIds.length = 0;
+    snapshotViews.length = 0;
+    snapshotViewsById.clear();
+    pendingSnapshotCleanupIds.clear();
+    positionsArray = null;
+    colorsArray = null;
+    transparencyArray = null;
+    pointCount = 0;
+    centroidCount = 0;
+    navigationModeOwnership.clear();
+    viewFocusHandler = null;
+    navigationModeChangeHandler = null;
+    highlightRenderFailureHandler = null;
+    smokeRenderFailureHandler = null;
+    velocityRenderFailureHandler = null;
+    if (labelLayer) labelLayer.style.display = 'none';
+    if (viewTitleLayerEl) viewTitleLayerEl.style.display = 'none';
   }
 
   // === Event Listeners ===
   const handleContextMenu = (e) => { e.preventDefault(); return false; };
   addEventListenerWithCleanup(canvas, 'contextmenu', handleContextMenu);
 
-  addEventListenerWithCleanup(canvas, 'webglcontextlost', (e) => {
-    // Prevent default so the browser is allowed to attempt restoration; we still require reload.
-    e.preventDefault();
+  addContextEventListenerWithCleanup(canvas, 'webglcontextlost', (e) => {
+    // Do not prevent the default action. Some engines will physically restore
+    // this context, but Cellucid's logical renderer generation remains
+    // terminal and only a reload may construct a coherent replacement.
     if (webglContextLost) return;
     webglContextLost = true;
+    renderPaused = true;
+    contextLossTransitioning = true;
+    if (disposed && !disposalSettled) {
+      disposalRequestedDuringContextLoss = true;
+    }
     const contextLossFailures = [];
-    const attemptContextLossStep = operation => {
+    const attemptContextLossStep = (operation, disposalStep = null) => {
       try {
         operation();
+        if (disposalStep !== null) {
+          completedDisposalSteps.add(disposalStep);
+        }
       } catch (error) {
         contextLossFailures.push(
           error instanceof Error
@@ -1683,56 +4177,157 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
         );
       }
     };
+    let projectileBuildCompletionToPublish = null;
+    try {
+      // Fence asynchronous work first, but defer its external completion
+      // observer until every GPU owner below is terminal.
+      const scheduledAnimationHandle = animationHandle;
+      animationHandle = null;
+      if (scheduledAnimationHandle !== null) {
+        attemptContextLossStep(
+          () => cancelAnimationFrame(scheduledAnimationHandle)
+        );
+      }
+      attemptContextLossStep(() => {
+        projectileBuildCompletionToPublish =
+          detachPendingProjectileBuild();
+      });
 
-    // Fence the scheduled frame before any fallible resource or DOM cleanup.
-    // A notification failure must never leave the RAF owner running against a
-    // lost context.
-    const scheduledAnimationHandle = animationHandle;
-    animationHandle = null;
-    if (scheduledAnimationHandle !== null) {
+      // Terminalize the complete GPU ownership graph before any DOM or
+      // application callback can re-enter viewer.dispose().
+      attemptContextLossStep(handleHpRendererContextLost);
       attemptContextLossStep(
-        () => cancelAnimationFrame(scheduledAnimationHandle)
+        () => projectileSystem.handleContextLost()
       );
-    }
-
-    attemptContextLossStep(() => smokeRenderer.handleContextLost());
-    attemptContextLossStep(
-      () => vectorFieldOverlay?.handleContextLost?.()
-    );
-
-    // Hide DOM overlays that assume a working render loop.
-    if (labelLayer) {
-      attemptContextLossStep(() => {
-        labelLayer.style.display = 'none';
-      });
-    }
-    if (viewTitleLayerEl) {
-      attemptContextLossStep(() => {
-        viewTitleLayerEl.style.display = 'none';
-      });
-    }
-
-    attemptContextLossStep(() => {
-      showWebglContextOverlay(
-        'WebGL context lost. Reload required to continue.'
+      attemptContextLossStep(
+        () => orbitAnchorRenderer.handleContextLost()
       );
-    });
+      attemptContextLossStep(() => smokeRenderer.handleContextLost());
+      attemptContextLossStep(() => {
+        if (overlayManager !== null) {
+          overlayManager.handleContextLost();
+        } else {
+          vectorFieldOverlay?.handleContextLost?.();
+        }
+      });
+      attemptContextLossStep(() => {
+        const owner = highlightTools;
+        if (owner !== null) {
+          owner.handleContextLost?.();
+          highlightTools = null;
+        }
+      });
+      attemptContextLossStep(
+        invalidateViewerWebGLOwnersAfterContextLoss
+      );
+
+      // A context-lost overlay can now be semantically disposed without any
+      // WebGL calls. This also retires detached retry owners.
+      attemptContextLossStep(() => {
+        if (overlayManager !== null) {
+          overlayManager.dispose();
+          overlayManager = null;
+        }
+        vectorFieldOverlay = null;
+      }, 'overlay manager retirement');
+
+      // Remove all ordinary input/application listeners while retaining the
+      // dedicated context pair until disposal has fully settled.
+      attemptContextLossStep(
+        () => retireCleanupCallbacks(
+          eventCleanupFns,
+          'Viewer event-listener'
+        ),
+        'event listener retirement'
+      );
+      attemptContextLossStep(
+        () => canvasResizeObserver.disconnect(),
+        'resize observer retirement'
+      );
+
+      attemptContextLossStep(
+        retireViewTitleOwners,
+        'view-title retirement'
+      );
+      attemptContextLossStep(
+        retireCentroidLabelOwners,
+        'centroid-label retirement'
+      );
+      attemptContextLossStep(
+        () => retirePointerLockLifecycle(null),
+        'pointer-lock retirement'
+      );
+      attemptContextLossStep(
+        () => projectileSystem.retireContextLostUI?.()
+      );
+      attemptContextLossStep(
+        retireViewerCpuCaches,
+        'viewer cache retirement'
+      );
+
+      // All GPU and semantic owners are fenced. Observers and reload UI are
+      // now safe even if they synchronously request disposal.
+      attemptContextLossStep(() => {
+        publishProjectileBuildResult(
+          projectileBuildCompletionToPublish,
+          'cancelled',
+          'Projectile preparation was cancelled because the WebGL context was lost.'
+        );
+        projectileBuildCompletionToPublish = null;
+      }, 'projectile build cancellation');
+      attemptContextLossStep(() => {
+        showWebglContextOverlay(
+          'WebGL context lost. Reload required to continue.'
+        );
+      });
+    } finally {
+      contextLossTransitioning = false;
+      if (disposalRequestedDuringContextLoss) {
+        disposalRequestedDuringContextLoss = false;
+        queueMicrotask(() => publicApi.dispose());
+      }
+    }
     if (contextLossFailures.length > 0) {
       const cleanupError = new AggregateError(
         contextLossFailures,
         'WebGL context loss was fenced, but cleanup was incomplete.'
       );
-      // Context loss is already a terminal viewer lifecycle. Surface cleanup
-      // defects without turning the expected DOM event into an uncaught
-      // pageerror that can obscure the reload recovery UI.
-      console.error('[Viewer] WebGL context-loss cleanup was incomplete.', cleanupError);
+      try {
+        console.error(
+          '[Viewer] WebGL context-loss cleanup was incomplete.',
+          cleanupError
+        );
+      } catch {
+        // Terminal diagnostics cannot reopen the lost generation.
+      }
     }
   });
 
-  addEventListenerWithCleanup(canvas, 'webglcontextrestored', () => {
-    // Resource re-init is complex and high-risk; require a full reload.
-    showWebglContextOverlay('WebGL context restored, but Cellucid requires a reload to reinitialize GPU resources.');
-  });
+  addContextEventListenerWithCleanup(
+    canvas,
+    'webglcontextrestored',
+    () => {
+      // Firefox may physically restore the underlying context. The viewer,
+      // renderer facade, animation loop, and all ownership records deliberately
+      // remain terminal.
+      if (!webglContextLost || disposed) return;
+      renderPaused = true;
+      try {
+        showWebglContextOverlay(
+          'WebGL context restored, but Cellucid requires a reload to reinitialize GPU resources.'
+        );
+      } catch (error) {
+        try {
+          console.error(
+            '[Viewer] WebGL restoration notice could not be displayed.',
+            error
+          );
+        } catch {
+          // Logical context loss remains authoritative.
+        }
+      }
+    }
+  );
 
   addEventListenerWithCleanup(canvas, 'mousedown', (e) => {
     if (highlightTools && highlightTools.handleMouseDown(e)) {
@@ -1760,9 +4355,11 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
         updateViewTitleActiveState();
         // Load new view's camera (only when unlocked)
         if (!camerasLocked) {
-          const newCam = getViewCameraState(focusedViewId);
+          const newCam =
+            getStoredViewCameraState(focusedViewId);
           if (newCam) applyCameraStateTemporarily(newCam);
         }
+        publishPresentedViewStateChange('focus', focusedViewId);
         // Notify UI (always, so dimension buttons target the clicked view)
         if (viewFocusHandler) viewFocusHandler(focusedViewId);
       }
@@ -2087,6 +4684,64 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
     publishPointerLockState(false, errorMessage);
   }
 
+  function retirePointerLockLifecycle(errorMessage = null) {
+    // Detach semantic state and the observer before any user-observable DOM
+    // or browser callback can re-enter the viewer.
+    pointerLockRequestGeneration += 1;
+    pointerLockRequestPending = false;
+    pointerLockActive = false;
+    pointerLockEnabled = false;
+    lookActive = false;
+    pendingShot = false;
+    pendingShotViewportInfo = null;
+    activeKeys.clear();
+    const handler = pointerLockChangeHandler;
+    pointerLockChangeHandler = null;
+
+    const failures = [];
+    const attempt = operation => {
+      try {
+        operation();
+      } catch (error) {
+        failures.push(error);
+      }
+    };
+    attempt(() => projectileSystem.cancelCharging());
+    attempt(() => {
+      canvas.classList.remove('dragging', 'free-nav', 'planar-nav');
+    });
+    attempt(() => {
+      canvas.style.cursor = '';
+    });
+    attempt(() => {
+      if (
+        document.pointerLockElement === canvas &&
+        typeof document.exitPointerLock === 'function'
+      ) {
+        const result = document.exitPointerLock();
+        if (result?.catch) {
+          result.catch((error) => {
+            try {
+              console.error(
+                '[Viewer] Pointer-lock exit failed during terminal cleanup.',
+                error
+              );
+            } catch {
+              // The synchronous lifecycle is already terminal.
+            }
+          });
+        }
+      }
+    });
+    attempt(() => handler?.(false, errorMessage));
+    if (failures.length > 0) {
+      throw new AggregateError(
+        failures,
+        'Pointer-lock retirement was incomplete.'
+      );
+    }
+  }
+
   function requestPointerLockOwned() {
     if (typeof canvas.requestPointerLock !== 'function') {
       clearPointerLockIntent(
@@ -2149,7 +4804,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
     }
   }
 
-  function cancelPendingProjectileBuild(message) {
+  function detachPendingProjectileBuild() {
     projectileBuildGeneration += 1;
     if (projectileBuildTimer !== null) {
       clearTimeout(projectileBuildTimer);
@@ -2157,6 +4812,11 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
     }
     const completion = projectileBuildCompletion;
     projectileBuildCompletion = null;
+    return completion;
+  }
+
+  function cancelPendingProjectileBuild(message) {
+    const completion = detachPendingProjectileBuild();
     publishProjectileBuildResult(completion, 'cancelled', message);
   }
 
@@ -2306,7 +4966,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
     vec3.normalize(_freeflyRight, _freeflyRight);
     vec3.cross(_freeflyUp, _freeflyRight, _freeflyForward);
     vec3.normalize(_freeflyUp, _freeflyUp);
-    return { forward: _freeflyForward, right: _freeflyRight, upVec: _freeflyUp };
+    return _freeflyAxes;
   }
 
   // Extract camera position and axes from a view matrix (for multiview projectile support)
@@ -2708,7 +5368,8 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
     sources,
     destinations,
     renderWeights,
-    nEdges
+    nEdges,
+    nCells
   ) {
     const nextDims = calcTextureDims(nEdges);
     const [width, height] = nextDims;
@@ -2722,8 +5383,20 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
 
     const topologyData = new Uint32Array(texelCount * 2);
     for (let i = 0; i < nEdges; i++) {
-      topologyData[i * 2] = sources[i];
-      topologyData[i * 2 + 1] = destinations[i];
+      const source = sources[i];
+      const destination = destinations[i];
+      if (
+        source >= nCells ||
+        destination >= nCells ||
+        source >= destination
+      ) {
+        throw new RangeError(
+          `Connectivity edge ${i} must reference two cells in [0, ${nCells}) ` +
+          'with source < destination.'
+        );
+      }
+      topologyData[i * 2] = source;
+      topologyData[i * 2 + 1] = destination;
     }
     const weightData = new Float32Array(texelCount);
     weightData.set(renderWeights);
@@ -2781,8 +5454,200 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
     return true;
   }
 
+  function retireEdgePrefixOwner(viewId) {
+    const previous = edgePrefixOwnersV2.get(viewId);
+    edgePrefixOwnersV2.delete(viewId);
+    if (!previous || previous.provisional === true) return;
+    const checkpoints = retireConnectivityEdgePrefixOwner(
+      previous.prefixOwner
+    );
+    if (
+      checkpoints instanceof Uint32Array &&
+      (
+        !(edgePrefixCheckpointStaging instanceof Uint32Array) ||
+        edgePrefixCheckpointStaging.length !== checkpoints.length
+      )
+    ) {
+      edgePrefixCheckpointStaging = checkpoints;
+    }
+  }
+
+  function getCurrentEdgePrefixOwner(viewId) {
+    const visibilityEntry = edgeVisibilityTexturesV2.get(viewId);
+    const owner = edgePrefixOwnersV2.get(viewId);
+    if (
+      !visibilityEntry ||
+      !Number.isSafeInteger(visibilityEntry.revision) ||
+      visibilityEntry.revision <= 0 ||
+      !owner ||
+      owner.visibilityRevision !== visibilityEntry.revision
+    ) {
+      return null;
+    }
+    return owner;
+  }
+
+  function describeEdgePrefixOwner(viewId, owner = null) {
+    const exactOwner = owner ?? getCurrentEdgePrefixOwner(viewId);
+    if (exactOwner === null) return null;
+    return Object.freeze({
+      checkpointBytes:
+        exactOwner.prefixOwner.checkpoints.byteLength,
+      checkpointCount:
+        exactOwner.prefixOwner.checkpoints.length,
+      current:
+        getCurrentEdgePrefixOwner(viewId) === exactOwner,
+      provisional: exactOwner.provisional === true,
+      rawPrefix: exactOwner.rawPrefix,
+      visibleCount: exactOwner.prefixOwner.visibleCount,
+      visibilityRevision: exactOwner.visibilityRevision,
+      viewId,
+    });
+  }
+
+  function refreshEdgePrefixForView(viewId) {
+    const vid = assertViewId(viewId);
+    if (
+      !(edgeSourcesV2 instanceof Uint32Array) ||
+      !(edgeDestinationsV2 instanceof Uint32Array) ||
+      edgeSourcesV2.length !== nEdgesV2 ||
+      edgeDestinationsV2.length !== nEdgesV2
+    ) {
+      throw new Error(
+        'Connectivity edge-prefix refresh requires the accepted endpoint generation.'
+      );
+    }
+    const visibilityEntry = edgeVisibilityTexturesV2.get(vid);
+    if (
+      !visibilityEntry ||
+      !(visibilityEntry.scratchBuffer instanceof Uint8Array) ||
+      !Number.isSafeInteger(visibilityEntry.revision) ||
+      visibilityEntry.revision <= 0
+    ) {
+      throw new Error(
+        `Connectivity edge-prefix refresh requires accepted visibility for view "${vid}".`
+      );
+    }
+
+    const current = getCurrentEdgePrefixOwner(vid);
+    if (current !== null && current.provisional !== true) {
+      return describeEdgePrefixOwner(vid, current);
+    }
+
+    const build = buildConnectivityEdgePrefixOwner(
+      edgeSourcesV2,
+      edgeDestinationsV2,
+      visibilityEntry.scratchBuffer,
+      edgePrefixCheckpointStaging
+    );
+    if (
+      build === null ||
+      typeof build !== 'object' ||
+      Array.isArray(build) ||
+      !build.owner ||
+      !(build.owner.checkpoints instanceof Uint32Array)
+    ) {
+      throw new Error(
+        'Connectivity edge-prefix builder returned an invalid candidate.'
+      );
+    }
+    const prefixOwner = build.owner;
+    let rawPrefix;
+    try {
+      rawPrefix = resolveConnectivityEdgeRawPrefix(
+        prefixOwner,
+        edgeSourcesV2,
+        edgeDestinationsV2,
+        visibilityEntry.scratchBuffer,
+        Math.min(edgeVisibleTarget, prefixOwner.visibleCount)
+      );
+    } catch (error) {
+      edgePrefixCheckpointStaging =
+        retireConnectivityEdgePrefixOwner(prefixOwner);
+      throw error;
+    }
+    const candidate = Object.freeze({
+      prefixOwner,
+      provisional: false,
+      rawPrefix,
+      visibilityRevision: visibilityEntry.revision,
+    });
+
+    // The complete candidate is now non-fallibly publishable. Only after that
+    // boundary may the previous checkpoints become the shared staging owner.
+    const previous = edgePrefixOwnersV2.get(vid);
+    edgePrefixOwnersV2.set(vid, candidate);
+    if (previous && previous.provisional !== true) {
+      edgePrefixCheckpointStaging =
+        retireConnectivityEdgePrefixOwner(previous.prefixOwner);
+    } else if (
+      build.reusableCheckpoints instanceof Uint32Array &&
+      build.reusableCheckpoints !== prefixOwner.checkpoints
+    ) {
+      edgePrefixCheckpointStaging = build.reusableCheckpoints;
+    } else {
+      edgePrefixCheckpointStaging = null;
+    }
+    return describeEdgePrefixOwner(vid, candidate);
+  }
+
+  function setEdgeVisibleTarget(target) {
+    const exactTarget = assertIntegerInRange(
+      target,
+      0,
+      nEdgesV2,
+      'Connectivity visible-edge target'
+    );
+    const stagedOwners = [];
+    for (const [viewId, visibilityEntry] of edgeVisibilityTexturesV2) {
+      const current = getCurrentEdgePrefixOwner(viewId);
+      if (
+        current === null ||
+        current.provisional === true ||
+        current.visibilityRevision !== visibilityEntry.revision
+      ) {
+        throw new Error(
+          `Connectivity visible-edge target requires a current prefix for view "${viewId}".`
+        );
+      }
+      const rawPrefix = resolveConnectivityEdgeRawPrefix(
+        current.prefixOwner,
+        edgeSourcesV2,
+        edgeDestinationsV2,
+        visibilityEntry.scratchBuffer,
+        Math.min(exactTarget, current.prefixOwner.visibleCount)
+      );
+      stagedOwners.push([
+        viewId,
+        Object.freeze({
+          prefixOwner: current.prefixOwner,
+          provisional: false,
+          rawPrefix,
+          visibilityRevision: current.visibilityRevision,
+        })
+      ]);
+    }
+
+    // Resolution and allocation for every pane completed before the shared
+    // visible target or any pane-specific raw prefix changes.
+    edgeVisibleTarget = exactTarget;
+    for (const [viewId, owner] of stagedOwners) {
+      edgePrefixOwnersV2.set(viewId, owner);
+    }
+    return true;
+  }
+
   function detachEdgeResourcesV2() {
     const retiringTextures = new Set(pendingEdgeTextureRetirements);
+    const retiringPrefixOwners = new Set();
+    for (const owner of edgePrefixOwnersV2.values()) {
+      if (owner.provisional !== true) {
+        retiringPrefixOwners.add(owner.prefixOwner);
+      }
+    }
+    if (edgeAllVisiblePrefixOwner !== null) {
+      retiringPrefixOwners.add(edgeAllVisiblePrefixOwner);
+    }
     if (edgeTextureV2 !== null) retiringTextures.add(edgeTextureV2);
     if (edgeWeightTextureV2 !== null) {
       retiringTextures.add(edgeWeightTextureV2);
@@ -2801,16 +5666,29 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
     edgePositionTexturePoolV2.clear();
     edgePositionTexturesV2.clear();
     edgeVisibilityTexturesV2.clear();
+    edgeVisibilityStagingBuffer = null;
+    edgeSourcesV2 = null;
+    edgeDestinationsV2 = null;
+    edgePrefixOwnersV2.clear();
+    edgePrefixCheckpointStaging = null;
+    edgeAllVisiblePrefixOwner = null;
+    edgeVisibleTarget = 0;
     edgeTexDimsV2 = [0, 0];
     nEdgesV2 = 0;
     nCellsV2 = 0;
     hasEdgeDataV2 = false;
     useInstancedEdges = false;
-    edgeLodLimit = 0;
-
-    if (retiringTextures.size === 0) return [];
 
     const failures = [];
+    for (const owner of retiringPrefixOwners) {
+      try {
+        retireConnectivityEdgePrefixOwner(owner);
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    if (retiringTextures.size === 0) return failures;
+
     try {
       const boundTexture = gl.getParameter(gl.TEXTURE_BINDING_2D);
       if (retiringTextures.has(boundTexture)) {
@@ -3087,6 +5965,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
     if (dimsChanged) {
       const visEntry = edgeVisibilityTexturesV2.get(vid);
       edgeVisibilityTexturesV2.delete(vid);
+      retireEdgePrefixOwner(vid);
       if (visEntry?.texture) {
         replacements.set(visEntry.texture, null);
       }
@@ -3114,7 +5993,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
   function updateVisibilityTextureV2ForView(
     viewId,
     visibility,
-    internalByteAt = null
+    internalVisibility = null
   ) {
     if (typeof viewId !== 'string' || viewId.length === 0) {
       return false;
@@ -3122,8 +6001,9 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
     const vid = viewId;
 
     let nCells;
-    let readByte;
-    if (internalByteAt === null) {
+    let readByte = null;
+    let lodVisibility = null;
+    if (internalVisibility === null) {
       if (
         !(visibility instanceof Float32Array) ||
         visibility.length === 0
@@ -3139,15 +6019,39 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
     } else {
       if (
         !Number.isSafeInteger(visibility) ||
-        visibility <= 0 ||
-        typeof internalByteAt !== 'function'
+        visibility <= 0
       ) {
         throw new TypeError(
           'Internal connectivity visibility publication is invalid.'
         );
       }
       nCells = visibility;
-      readByte = internalByteAt;
+      if (typeof internalVisibility === 'function') {
+        readByte = internalVisibility;
+      } else if (
+        internalVisibility !== null &&
+        typeof internalVisibility === 'object' &&
+        !Array.isArray(internalVisibility) &&
+        Object.isFrozen(internalVisibility) &&
+        internalVisibility.transparency instanceof Float32Array &&
+        internalVisibility.transparency.length === nCells &&
+        (
+          internalVisibility.admissionLevels === null ||
+          (
+            internalVisibility.admissionLevels instanceof Uint8Array &&
+            internalVisibility.admissionLevels.length === nCells
+          )
+        ) &&
+        Number.isInteger(internalVisibility.lodLevel) &&
+        internalVisibility.lodLevel >= -1 &&
+        internalVisibility.lodLevel < 0xff
+      ) {
+        lodVisibility = internalVisibility;
+      } else {
+        throw new TypeError(
+          'Internal connectivity visibility publication is invalid.'
+        );
+      }
     }
 
     // Get position texture dims for this view (visibility must match position count)
@@ -3172,6 +6076,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
       const dimsMismatch = visEntry.dims[0] !== width || visEntry.dims[1] !== height;
       if (dimsMismatch) {
         edgeVisibilityTexturesV2.delete(vid);
+        retireEdgePrefixOwner(vid);
         publishEdgeTextureReplacements(
           new Map([[visEntry.texture, null]]),
           `Connectivity mismatched visibility generation for view "${vid}" could not be fully retired.`
@@ -3180,178 +6085,204 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
       }
     }
 
-    // R8 is the exact shader contract: hidden=0, visible=255. The persistent
-    // comparison owner is therefore one byte per texel instead of four.
-    let scratchBuffer = visEntry?.scratchBuffer;
+    // R8 is the exact shader contract: hidden=0, visible=255. Keep the
+    // accepted owner immutable until WebGL accepts the candidate. One shared
+    // staging buffer serves every view synchronously, bounding extra memory
+    // to one byte per texel instead of one candidate per pane.
+    const scratchBuffer = visEntry?.scratchBuffer;
     const hadPreviousBuffer = (
       scratchBuffer instanceof Uint8Array &&
       scratchBuffer.length === texelCount
     );
-    if (!hadPreviousBuffer) {
-      scratchBuffer = new Uint8Array(texelCount);
+    let candidateBuffer = edgeVisibilityStagingBuffer;
+    if (
+      !(candidateBuffer instanceof Uint8Array) ||
+      candidateBuffer.length !== texelCount ||
+      candidateBuffer === scratchBuffer
+    ) {
+      candidateBuffer = new Uint8Array(texelCount);
     }
 
-    // Validate the complete caller array before any GL mutation. Binary
-    // comparison means finite Float32 values on the same side of 0.5 do not
-    // cause redundant uploads.
+    // Validate, encode, and compare in one pass. The LOD path is inlined to
+    // avoid tens of millions of indirect closure calls during filter drags.
     let dirtyRowStart = height;
     let dirtyRowEnd = 0;
     for (let index = 0; index < nCells; index++) {
-      const nextByte = readByte(index);
+      let nextByte;
+      if (lodVisibility !== null) {
+        const alpha = lodVisibility.transparency[index];
+        if (!Number.isFinite(alpha) || alpha < 0 || alpha > 1) {
+          throw new RangeError(
+            `LOD-filtered connectivity transparency at index ${index} must be finite and in [0, 1].`
+          );
+        }
+        nextByte = (
+          alpha >= POINT_VISIBILITY_THRESHOLD &&
+          (
+            lodVisibility.admissionLevels === null ||
+            lodVisibility.admissionLevels[index] <=
+              lodVisibility.lodLevel
+          )
+        ) ? 255 : 0;
+      } else {
+        nextByte = readByte(index);
+      }
       if (nextByte !== 0 && nextByte !== 255) {
         throw new RangeError(
           `Internal connectivity visibility byte at index ${index} must be 0 or 255.`
         );
       }
+      candidateBuffer[index] = nextByte;
       if (!hadPreviousBuffer || scratchBuffer[index] !== nextByte) {
         const row = Math.floor(index / width);
         if (row < dirtyRowStart) dirtyRowStart = row;
         dirtyRowEnd = row + 1;
       }
     }
-    if (hadPreviousBuffer && dirtyRowEnd === 0) return true;
-
-    // Validation is now complete. Mutate only the scratch rows this
-    // publication owns, then upload that same Uint8 owner directly. If an
-    // in-place upload fails, the catch path detaches the texture and this
-    // scratch together, so no rollback copy or conversion staging is needed.
-    const encodeStart = hadPreviousBuffer
-      ? dirtyRowStart * width
-      : 0;
-    const encodeEnd = hadPreviousBuffer
-      ? Math.min(dirtyRowEnd * width, nCells)
-      : nCells;
-    for (let index = encodeStart; index < encodeEnd; index++) {
-      scratchBuffer[index] = readByte(index);
+    candidateBuffer.fill(0, nCells);
+    if (hadPreviousBuffer && dirtyRowEnd === 0) {
+      edgeVisibilityStagingBuffer = candidateBuffer;
+      return true;
     }
 
+    const uploadRows = (buffer, startRow, endRow) => {
+      const completeRowCount = Math.floor(nCells / width);
+      const completeEnd = Math.min(endRow, completeRowCount);
+      if (startRow < completeEnd) {
+        gl.texSubImage2D(
+          gl.TEXTURE_2D,
+          0,
+          0,
+          startRow,
+          width,
+          completeEnd - startRow,
+          gl.RED,
+          gl.UNSIGNED_BYTE,
+          buffer,
+          startRow * width
+        );
+      }
+      const tailLength = nCells % width;
+      const tailRow = completeRowCount;
+      if (
+        tailLength > 0 &&
+        startRow <= tailRow &&
+        endRow > tailRow
+      ) {
+        const tailOffset = tailRow * width;
+        gl.texSubImage2D(
+          gl.TEXTURE_2D,
+          0,
+          0,
+          tailRow,
+          tailLength,
+          1,
+          gl.RED,
+          gl.UNSIGNED_BYTE,
+          buffer,
+          tailOffset
+        );
+      }
+    };
+
     if (!visEntry?.texture) {
-      // First time: create texture
-      const texture = createUploadedEdgeTexture(
-        `weighted connectivity visibility for view "${vid}"`,
-        () => {
-          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-          gl.texImage2D(
-            gl.TEXTURE_2D,
-            0,
-            gl.R8,
-            width,
-            height,
-            0,
-            gl.RED,
-            gl.UNSIGNED_BYTE,
-            null
-          );
-          const completeRows = Math.floor(nCells / width);
-          if (completeRows > 0) {
-            gl.texSubImage2D(
+      let texture;
+      try {
+        texture = createUploadedEdgeTexture(
+          `weighted connectivity visibility for view "${vid}"`,
+          () => {
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+            gl.texImage2D(
               gl.TEXTURE_2D,
               0,
-              0,
-              0,
+              gl.R8,
               width,
-              completeRows,
+              height,
+              0,
               gl.RED,
               gl.UNSIGNED_BYTE,
-              scratchBuffer,
-              0
+              null
             );
+            uploadRows(candidateBuffer, 0, height);
           }
-          const tailLength = nCells - completeRows * width;
-          if (tailLength > 0) {
-            gl.texSubImage2D(
-              gl.TEXTURE_2D,
-              0,
-              0,
-              completeRows,
-              tailLength,
-              1,
-              gl.RED,
-              gl.UNSIGNED_BYTE,
-              scratchBuffer,
-              completeRows * width
-            );
-          }
-        }
-      );
+        );
+      } catch (error) {
+        edgeVisibilityStagingBuffer = candidateBuffer;
+        throw error;
+      }
 
       // Store with format tag for validation
       edgeVisibilityTexturesV2.set(vid, {
         dims: [width, height],
         format: 'R8',
-        scratchBuffer,
+        revision: 1,
+        scratchBuffer: candidateBuffer,
         texture,
       });
+      edgeVisibilityStagingBuffer = null;
     } else {
+      if (
+        !Number.isSafeInteger(visEntry.revision) ||
+        visEntry.revision <= 0 ||
+        visEntry.revision >= Number.MAX_SAFE_INTEGER
+      ) {
+        edgeVisibilityStagingBuffer = candidateBuffer;
+        throw new RangeError(
+          `Connectivity visibility revision for view "${vid}" cannot advance safely.`
+        );
+      }
+      const nextRevision = visEntry.revision + 1;
       // Subsequent updates: use row-based partial upload if fewer than 50% of rows changed
       const dirtyRowCount = dirtyRowEnd - dirtyRowStart;
       const usePartialUpload = dirtyRowCount < height * 0.5 && dirtyRowCount > 0;
 
-      const uploadRows = (startRow, endRow) => {
-        const completeRowCount = Math.floor(nCells / width);
-        const completeEnd = Math.min(endRow, completeRowCount);
-        if (startRow < completeEnd) {
-          gl.texSubImage2D(
-            gl.TEXTURE_2D,
-            0,
-            0,
-            startRow,
-            width,
-            completeEnd - startRow,
-            gl.RED,
-            gl.UNSIGNED_BYTE,
-            scratchBuffer,
-            startRow * width
-          );
-        }
-        const tailLength = nCells % width;
-        const tailRow = completeRowCount;
-        if (
-          tailLength > 0 &&
-          startRow <= tailRow &&
-          endRow > tailRow
-        ) {
-          const tailOffset = tailRow * width;
-          gl.texSubImage2D(
-            gl.TEXTURE_2D,
-            0,
-            0,
-            tailRow,
-            tailLength,
-            1,
-            gl.RED,
-            gl.UNSIGNED_BYTE,
-            scratchBuffer,
-            tailOffset
-          );
-        }
-      };
       try {
         runEdgeTextureUpload(
           visEntry.texture,
           `weighted connectivity visibility update for view "${vid}"`,
           () => {
             if (usePartialUpload) {
-              uploadRows(dirtyRowStart, dirtyRowEnd);
+              uploadRows(
+                candidateBuffer,
+                dirtyRowStart,
+                dirtyRowEnd
+              );
             } else {
-              uploadRows(0, height);
+              uploadRows(candidateBuffer, 0, height);
             }
           }
         );
-      } catch (error) {
-        edgeVisibilityTexturesV2.delete(vid);
-        throwEdgeTexturePublicationFailure(
-          error,
-          [visEntry.texture],
-          `Connectivity visibility update for view "${vid}" failed and cleanup was incomplete.`
-        );
+      } catch (publicationError) {
+        try {
+          runEdgeTextureUpload(
+            visEntry.texture,
+            `weighted connectivity visibility restoration for view "${vid}"`,
+            () => uploadRows(scratchBuffer, 0, height)
+          );
+        } catch (restorationError) {
+          edgeVisibilityTexturesV2.delete(vid);
+          retireEdgePrefixOwner(vid);
+          edgeVisibilityStagingBuffer = candidateBuffer;
+          throwEdgeTexturePublicationFailure(
+            new AggregateError(
+              [publicationError, restorationError],
+              `Connectivity visibility update for view "${vid}" failed with incomplete restoration.`
+            ),
+            [visEntry.texture],
+            `Connectivity visibility update for view "${vid}" failed and cleanup was incomplete.`
+          );
+        }
+        edgeVisibilityStagingBuffer = candidateBuffer;
+        throw publicationError;
       }
 
       // The scratch owner and GPU texture now represent the same generation.
-      visEntry.scratchBuffer = scratchBuffer;
+      visEntry.scratchBuffer = candidateBuffer;
+      visEntry.revision = nextRevision;
+      edgeVisibilityStagingBuffer = scratchBuffer;
     }
 
     return true;
@@ -3373,6 +6304,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
 
     const visEntry = edgeVisibilityTexturesV2.get(vid);
     edgeVisibilityTexturesV2.delete(vid);
+    retireEdgePrefixOwner(vid);
 
     const replacements = new Map();
     releaseEdgePositionPoolEntry(posEntry, null, replacements);
@@ -3433,50 +6365,43 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
       return null;
     }
     const vid = viewId;
-
-    // Helper to validate and return a texture set
-    const validateAndReturn = (posEntry, visEntry, source) => {
-      // Validate both textures exist and have correct formats
-      if (!isValidEdgeTexture(posEntry, 'RGB32F')) {
-        console.warn(`[Viewer] Invalid position texture for ${source}`);
-        return null;
-      }
-      if (!isValidEdgeTexture(visEntry, 'R8')) {
-        console.warn(`[Viewer] Invalid visibility texture for ${source}`);
-        return null;
-      }
-      // Validate dimensions match
-      const posDims = posEntry.dims;
-      const visDims = visEntry.dims;
-      if (!posDims || !visDims || posDims[0] !== visDims[0] || posDims[1] !== visDims[1]) {
-        console.warn(`[Viewer] Dimension mismatch for ${source}: pos=${posDims}, vis=${visDims}`);
-        return null;
-      }
-      return {
-        posTexture: posEntry.texture,
-        visTexture: visEntry.texture,
-        dims: posDims
-      };
-    };
-
-    if (vid === LIVE_VIEW_ID) {
-      return validateAndReturn(
-        edgePositionTexturesV2.get(LIVE_VIEW_ID),
-        edgeVisibilityTexturesV2.get(LIVE_VIEW_ID),
-        'live'
-      );
-    }
-
-    const snapshot = snapshotViews.find(s => s.id === vid);
-    if (!snapshot) {
+    if (
+      vid !== LIVE_VIEW_ID &&
+      !viewDimensionLevels.has(vid)
+    ) {
       return null;
     }
-
-    return validateAndReturn(
-      edgePositionTexturesV2.get(vid),
-      edgeVisibilityTexturesV2.get(vid),
-      `view ${vid}`
-    );
+    const posEntry = edgePositionTexturesV2.get(vid);
+    const visEntry = edgeVisibilityTexturesV2.get(vid);
+    if (!isValidEdgeTexture(posEntry, 'RGB32F')) {
+      console.warn(
+        `[Viewer] Invalid position texture for view "${vid}".`
+      );
+      return null;
+    }
+    if (!isValidEdgeTexture(visEntry, 'R8')) {
+      console.warn(
+        `[Viewer] Invalid visibility texture for view "${vid}".`
+      );
+      return null;
+    }
+    const posDims = posEntry.dims;
+    const visDims = visEntry.dims;
+    if (
+      !posDims ||
+      !visDims ||
+      posDims[0] !== visDims[0] ||
+      posDims[1] !== visDims[1]
+    ) {
+      console.warn(
+        `[Viewer] Dimension mismatch for view "${vid}": pos=${posDims}, vis=${visDims}.`
+      );
+      return null;
+    }
+    edgeTextureLookupScratch.posTexture = posEntry.texture;
+    edgeTextureLookupScratch.visTexture = visEntry.texture;
+    edgeTextureLookupScratch.dims = posDims;
+    return edgeTextureLookupScratch;
   }
 
   /**
@@ -3523,16 +6448,30 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
           cpuBytes: entry.scratchBuffer.byteLength,
           format: entry.format,
           gpuBytes: allocatedTexels,
+          revision: entry.revision,
           viewId,
         });
       }
     );
+    const prefixViews = Array.from(
+      edgePrefixOwnersV2,
+      ([viewId, owner]) => describeEdgePrefixOwner(viewId, owner)
+    );
     return Object.freeze({
+      allVisiblePrefixBytes:
+        edgeAllVisiblePrefixOwner?.checkpoints.byteLength ?? 0,
+      endpointAliasBytes:
+        (edgeSourcesV2?.byteLength ?? 0) +
+        (edgeDestinationsV2?.byteLength ?? 0),
+      prefixStagingBytes:
+        edgePrefixCheckpointStaging?.byteLength ?? 0,
+      prefixViews: Object.freeze(prefixViews),
       pendingRetirements: pendingEdgeTextureRetirements.size,
       positionGenerations: Object.freeze(positionGenerations),
       positionViewGenerations: Object.freeze(
         positionViewGenerations
       ),
+      visibleTarget: edgeVisibleTarget,
       visibilityViews: Object.freeze(visibilityViews),
     });
   }
@@ -3545,8 +6484,16 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
    * @param {number} widthPx - Viewport width in pixels
    * @param {number} heightPx - Viewport height in pixels
    * @param {string} viewId - View ID for exact per-view texture lookup
+   * @param {number} paneFogNear - Fog near range published by this pane's point pass
+   * @param {number} paneFogFar - Fog far range published by this pane's point pass
    */
-  function drawConnectivityInstanced(widthPx, heightPx, viewId) {
+  function drawConnectivityInstanced(
+    widthPx,
+    heightPx,
+    viewId,
+    paneFogNear,
+    paneFogFar
+  ) {
     if (
       !showConnectivity ||
       nEdgesV2 === 0 ||
@@ -3554,6 +6501,27 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
       !edgeWeightTextureV2
     ) {
       return;
+    }
+
+    const prefixOwner = getCurrentEdgePrefixOwner(viewId);
+    if (prefixOwner === null || prefixOwner.rawPrefix === 0) {
+      return;
+    }
+    const maxEdges = assertIntegerInRange(
+      prefixOwner.rawPrefix,
+      1,
+      nEdgesV2,
+      `Connectivity raw edge prefix for view "${viewId}"`
+    );
+    if (
+      !Number.isFinite(paneFogNear) ||
+      paneFogNear < 0 ||
+      !Number.isFinite(paneFogFar) ||
+      paneFogFar < paneFogNear
+    ) {
+      throw new RangeError(
+        `Connectivity fog range for view "${viewId}" is invalid.`
+      );
     }
 
     // Get textures owned by this view.
@@ -3581,6 +6549,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
     }
 
     gl.useProgram(lineInstancedProgram);
+    configureStraightAlphaBlending(gl);
 
     // Set uniforms
     gl.uniformMatrix4fv(lineInstancedUniformLocations.mvpMatrix, false, mvpMatrix);
@@ -3589,10 +6558,8 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
     gl.uniform2f(lineInstancedUniformLocations.viewportSize, widthPx, heightPx);
     gl.uniform1f(lineInstancedUniformLocations.lineWidth, connectivityLineWidth);
 
-    // LOD: limit edges if set - this directly reduces the instance count for actual GPU savings
-    // Previously we passed maxEdges as a uniform and let the shader discard, which still wasted
-    // vertex shader invocations. Now we reduce the draw call itself.
-    const maxEdges = edgeLodLimit > 0 ? Math.min(edgeLodLimit, nEdgesV2) : nEdgesV2;
+    // Every pane owns its exact shuffled raw prefix. Zero returned before any
+    // GL work above, while a full-detail pane explicitly submits nEdgesV2.
     // Keep uniform for shader-side early-out (defensive, in case instance count differs)
     gl.uniform1i(lineInstancedUniformLocations.maxEdges, maxEdges);
 
@@ -3624,8 +6591,8 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
     gl.uniform3fv(lineInstancedUniformLocations.lineColor, connectivityColorVec);
     gl.uniform1f(lineInstancedUniformLocations.lineAlpha, connectivityAlpha);
     gl.uniform1f(lineInstancedUniformLocations.fogDensity, fogDensity);
-    gl.uniform1f(lineInstancedUniformLocations.fogNearMean, fogNearMean);
-    gl.uniform1f(lineInstancedUniformLocations.fogFarMean, fogFarMean);
+    gl.uniform1f(lineInstancedUniformLocations.fogNearMean, paneFogNear);
+    gl.uniform1f(lineInstancedUniformLocations.fogFarMean, paneFogFar);
     gl.uniform3fv(lineInstancedUniformLocations.fogColor, fogColor);
 
     // Bind quad geometry
@@ -3677,57 +6644,62 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
     gl.uniform3fv(gridUniformLocations.axisYColor, axisYColor);
     gl.uniform3fv(gridUniformLocations.axisZColor, axisZColor);
 
-    gl.depthMask(false);
-    gl.enable(gl.BLEND);
-    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    configureStraightAlphaBlending(gl);
 
-    // Extract view direction from view matrix (works correctly in multiview unlocked camera mode)
-    // The view matrix's third row (column-major indices 2, 6, 10) gives the camera's forward axis
-    // This is the direction from camera toward target, which is what we need for plane visibility
-    const viewDir = [
-      -viewMatrix[2],
-      -viewMatrix[6],
-      -viewMatrix[10]
-    ];
-    // The view matrix's rotation part is orthonormal, so viewDir is already normalized
+    try {
+      gl.depthMask(false);
 
-    // Plane normals (outward facing from box center)
-    // We want to show planes that are "behind" the data (facing away from camera)
-    // A plane is visible when dot(viewDir, planeNormal) > 0 (camera looking toward plane)
-    const planes = [
-      { buffer: gridPlaneBuffers.bottom, type: 1, normal: [0, -1, 0] },  // floor y=-s
-      { buffer: gridPlaneBuffers.top,    type: 1, normal: [0, 1, 0] },   // ceiling y=+s
-      { buffer: gridPlaneBuffers.back,   type: 0, normal: [0, 0, -1] },  // back z=-s
-      { buffer: gridPlaneBuffers.front,  type: 0, normal: [0, 0, 1] },   // front z=+s
-      { buffer: gridPlaneBuffers.left,   type: 2, normal: [-1, 0, 0] },  // left x=-s
-      { buffer: gridPlaneBuffers.right,  type: 2, normal: [1, 0, 0] },   // right x=+s
-    ];
+      // Extract view direction from view matrix (works correctly in multiview unlocked camera mode)
+      // The view matrix's third row (column-major indices 2, 6, 10) gives the camera's forward axis
+      // This is the direction from camera toward target, which is what we need for plane visibility
+      const viewDirX = -viewMatrix[2];
+      const viewDirY = -viewMatrix[6];
+      const viewDirZ = -viewMatrix[10];
+      // The view matrix's rotation part is orthonormal, so viewDir is already normalized
 
-    // Render planes with smooth alpha based on viewing angle
-    for (const plane of planes) {
-      // Dot product: positive = camera looking toward this plane (plane is visible)
-      const dot = viewDir[0]*plane.normal[0] + viewDir[1]*plane.normal[1] + viewDir[2]*plane.normal[2];
+      // Plane normals (outward facing from box center) are generation-owned by
+      // gridPlaneDescriptors so multiview frames allocate no transient records.
+      // We want to show planes that are "behind" the data (facing away from camera)
+      // A plane is visible when dot(viewDir, planeNormal) > 0 (camera looking toward plane)
 
-      // Smooth transition: show grid planes as much as possible while behind data.
-      // Only hide when the plane clearly blocks the camera's view of the data.
-      // Negative fadeStart keeps planes visible slightly past perpendicular.
-      const fadeStart = -0.2;  // Keep showing a bit past perpendicular
-      const fadeEnd = 0.05;    // Reach full opacity quickly once facing camera
-      const alpha = smoothstep(fadeStart, fadeEnd, dot);
+      // Render planes with smooth alpha based on viewing angle
+      for (
+        let planeIndex = 0;
+        planeIndex < gridPlaneDescriptors.length;
+        planeIndex++
+      ) {
+        const plane = gridPlaneDescriptors[planeIndex];
+        // Dot product: positive = camera looking toward this plane (plane is visible)
+        const dot =
+          viewDirX * plane.normalX +
+          viewDirY * plane.normalY +
+          viewDirZ * plane.normalZ;
 
-      // Skip fully transparent planes
-      if (alpha < 0.01) continue;
+        // Smooth transition: show grid planes as much as possible while behind data.
+        // Only hide when the plane clearly blocks the camera's view of the data.
+        // Negative fadeStart keeps planes visible slightly past perpendicular.
+        const fadeStart = -0.2;  // Keep showing a bit past perpendicular
+        const fadeEnd = 0.05;    // Reach full opacity quickly once facing camera
+        const alpha = smoothstep(fadeStart, fadeEnd, dot);
 
-      gl.uniform1f(gridUniformLocations.planeAlpha, alpha);
-      gl.uniform1i(gridUniformLocations.planeType, plane.type);
-      gl.bindBuffer(gl.ARRAY_BUFFER, plane.buffer);
-      gl.enableVertexAttribArray(gridAttribLocations.position);
-      gl.vertexAttribPointer(gridAttribLocations.position, 3, gl.FLOAT, false, 0, 0);
-      gl.drawArrays(gl.TRIANGLES, 0, 6);
+        // Skip fully transparent planes
+        if (alpha < 0.01) continue;
+
+        gl.uniform1f(gridUniformLocations.planeAlpha, alpha);
+        gl.uniform1i(gridUniformLocations.planeType, plane.type);
+        gl.bindBuffer(
+          gl.ARRAY_BUFFER,
+          gridPlaneBuffers[plane.bufferKey]
+        );
+        gl.enableVertexAttribArray(gridAttribLocations.position);
+        gl.vertexAttribPointer(gridAttribLocations.position, 3, gl.FLOAT, false, 0, 0);
+        gl.drawArrays(gl.TRIANGLES, 0, 6);
+      }
+    } finally {
+      // Depth writes are a viewer-owned baseline even when a grid uniform,
+      // buffer publication, or draw fails partway through a pane.
+      gl.depthMask(true);
     }
-
-    gl.disable(gl.BLEND);
-    gl.depthMask(true);
   }
 
   // Smoothstep helper for smooth transitions
@@ -3736,8 +6708,20 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
     return t * t * (3 - 2 * t);
   }
 
-  function drawConnectivityLines(widthPx, heightPx, viewId) {
-    drawConnectivityInstanced(widthPx, heightPx, viewId);
+  function drawConnectivityLines(
+    widthPx,
+    heightPx,
+    viewId,
+    paneFogNear,
+    paneFogFar
+  ) {
+    drawConnectivityInstanced(
+      widthPx,
+      heightPx,
+      viewId,
+      paneFogNear,
+      paneFogFar
+    );
   }
 
   function drawCentroids(count, viewportHeight) {
@@ -3761,6 +6745,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
     gl.enableVertexAttribArray(centroidAttribLocations.color);
     gl.vertexAttribPointer(centroidAttribLocations.color, 4, gl.UNSIGNED_BYTE, true, 0, 0); // RGBA uint8 normalized
 
+    configureStraightAlphaBlending(gl);
     gl.drawArrays(gl.POINTS, 0, numPoints);
   }
 
@@ -3811,9 +6796,8 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
    * @param {string} viewId - View identifier
    * @param {Float32Array} positions - Centroid positions
    * @param {Uint8Array} colors - Centroid colors (RGBA)
-   * @param {number} [dimensionLevel] - Optional dimension level for tracking changes
    */
-  function createCentroidSnapshotBuffer(viewId, positions, colors, dimensionLevel = undefined) {
+  function createCentroidSnapshotBuffer(viewId, positions, colors) {
     assertNonEmptyTrimmedString(viewId, 'Centroid snapshot view id');
     if (
       !(positions instanceof Float32Array) ||
@@ -3932,8 +6916,8 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
       vao,
       buffer: glBuffer,
       count,
-      dimensionLevel,
-      posFingerprint: computeCentroidFingerprint(positions)
+      colorsOwner: colors,
+      positionsOwner: positions,
     };
     const previous = centroidSnapshotBuffers.get(vid) || null;
     centroidSnapshotBuffers.set(vid, candidate);
@@ -3949,20 +6933,6 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
       }
     }
     return true;
-  }
-
-  /**
-   * Compute a simple fingerprint of centroid positions to detect changes.
-   * @param {Float32Array} positions - Centroid positions array
-   * @returns {string} Fingerprint string
-   */
-  function computeCentroidFingerprint(positions) {
-    if (!positions || positions.length < 3) return '0';
-    const len = positions.length;
-    const mid = Math.floor(len / 2) - (Math.floor(len / 2) % 3);  // Align to xyz triplet
-    const last = len - 3;
-    // Sample first, middle, last positions and include total length
-    return `${len}:${positions[0].toFixed(4)},${positions[mid].toFixed(4)},${positions[last].toFixed(4)}`;
   }
 
   function deleteCentroidSnapshotBuffer(viewId) {
@@ -3986,34 +6956,20 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
   }
 
   /**
-   * Check if centroid buffer needs recreation (dimension changed, positions changed, or doesn't exist)
+   * Check whether the exact immutable centroid data owners lack a matching VAO.
    * @param {string} viewId - View identifier
-   * @param {number} currentDimensionLevel - Current dimension level for the view
-   * @param {Float32Array} [positions] - Optional positions to check for changes
+   * @param {Float32Array} positions - Exact published position owner
+   * @param {Uint8Array} colors - Exact published color owner
    * @returns {boolean} True if buffer needs to be (re)created
    */
-  function centroidBufferNeedsUpdate(viewId, currentDimensionLevel, positions = null) {
+  function centroidBufferNeedsUpdate(viewId, positions, colors) {
     const vid = String(viewId);
-    getDefaultNavigationMode(currentDimensionLevel);
     const existing = centroidSnapshotBuffers.get(vid);
-    if (!existing) return true;  // Doesn't exist, need to create
-    if (!VALID_DIMENSION_LEVELS.has(existing.dimensionLevel)) {
-      throw new TypeError(
-        `Centroid buffer for view "${vid}" has no exact dimension state.`
-      );
-    }
-    // Check if dimension changed since buffer was created
-    if (existing.dimensionLevel !== currentDimensionLevel) {
-      return true;
-    }
-    // Check if positions changed (detects data reload with same dimension)
-    if (positions && existing.posFingerprint) {
-      const currentFingerprint = computeCentroidFingerprint(positions);
-      if (currentFingerprint !== existing.posFingerprint) {
-        return true;  // Positions changed, need to recreate
-      }
-    }
-    return false;
+    return !centroidSnapshotBufferOwnsData(
+      existing,
+      positions,
+      colors
+    );
   }
 
   function drawCentroidsWithSnapshot(viewId, viewportHeight) {
@@ -4031,6 +6987,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
 
     // Single VAO bind - no per-frame buffer uploads!
     gl.bindVertexArray(snapshot.vao);
+    configureStraightAlphaBlending(gl);
     gl.drawArrays(gl.POINTS, 0, snapshot.count);
     gl.bindVertexArray(null);
   }
@@ -4250,8 +7207,13 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
     // interaction. Small panes retain the lower-overhead direct scan.
     const queryOwner = getSpatialQueryOwner(clickedViewId, true);
     const positions = queryOwner.positions;
+    const lodMembership = hpRenderer.getCurrentLodMembership(
+      clickedViewId,
+      queryOwner.dimensionLevel
+    );
 
     const pick = findRaySamplePick({
+      lodMembership,
       positions,
       transparency: queryOwner.transparency,
       ray,
@@ -4304,17 +7266,45 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
     };
   }
 
+  function shouldShowCentroidPoints(viewId) {
+    const flags = viewCentroidFlags.get(assertViewId(viewId));
+    return flags?.points ?? defaultShowCentroidPoints;
+  }
+
+  function shouldShowCentroidLabels(viewId) {
+    const flags = viewCentroidFlags.get(assertViewId(viewId));
+    return flags?.labels ?? defaultShowCentroidLabels;
+  }
+
   function setViewFlags(viewId, partial) {
     const key = assertKnownViewId(viewId);
     const prev = viewCentroidFlags.get(key) || {};
+    const previousPoints = prev.points ?? defaultShowCentroidPoints;
+    const previousLabels = prev.labels ?? defaultShowCentroidLabels;
+    const nextPoints = partial.points != null
+      ? partial.points
+      : previousPoints;
+    const nextLabels = partial.labels != null
+      ? partial.labels
+      : previousLabels;
+    if (
+      nextPoints === previousPoints &&
+      nextLabels === previousLabels
+    ) {
+      return false;
+    }
     viewCentroidFlags.set(key, {
-      points: partial.points != null ? partial.points : (prev.points ?? defaultShowCentroidPoints),
-      labels: partial.labels != null ? partial.labels : (prev.labels ?? defaultShowCentroidLabels)
+      points: nextPoints,
+      labels: nextLabels
     });
+    return true;
   }
 
   function getLabelsForView(viewId) {
-    return viewCentroidLabels.get(assertViewId(viewId)) || [];
+    return (
+      viewCentroidLabels.get(assertViewId(viewId)) ??
+      EMPTY_CENTROID_LABELS
+    );
   }
 
   function createOwnedCentroidLabel(item) {
@@ -4363,7 +7353,9 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
   }
 
   function viewOwnsCentroidLabelElement(viewId, element) {
-    const labels = viewCentroidLabels.get(assertViewId(viewId)) || [];
+    const labels =
+      viewCentroidLabels.get(assertViewId(viewId)) ??
+      EMPTY_CENTROID_LABELS;
     return labels.some(item => item.el === element);
   }
 
@@ -4429,7 +7421,10 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
 
   function removeLabelsForView(viewId) {
     const key = assertViewId(viewId);
-    const labels = viewCentroidLabels.get(key) || [];
+    hiddenCentroidLabelViews.delete(key);
+    const labels =
+      viewCentroidLabels.get(key) ??
+      EMPTY_CENTROID_LABELS;
     viewCentroidLabels.delete(key);
     queueCentroidLabelRetirements(key, labels);
     const failures = drainCentroidLabelRetirements(key);
@@ -4555,8 +7550,30 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
   }
 
   function hideLabelsForView(viewId) {
-    const labels = getLabelsForView(viewId);
-    for (const item of labels) { if (item?.el) item.el.style.display = 'none'; }
+    const key = assertViewId(viewId);
+    if (hiddenCentroidLabelViews.has(key)) return;
+    const labels = getLabelsForView(key);
+    for (const item of labels) {
+      const element = item?.el;
+      if (!element) continue;
+      let previous = centroidLabelPresentation.get(element);
+      if (!previous) {
+        previous = {
+          visible: null,
+          screenX: Number.NaN,
+          screenY: Number.NaN
+        };
+        centroidLabelPresentation.set(element, previous);
+      }
+      if (
+        previous.visible !== false ||
+        element.style.display !== 'none'
+      ) {
+        element.style.display = 'none';
+      }
+      previous.visible = false;
+    }
+    hiddenCentroidLabelViews.add(key);
   }
 
   function updateLabelLayerVisibility() {
@@ -4564,19 +7581,28 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
     const singleMode = viewLayoutMode === 'single';
     const focusKey = String(focusedViewId || LIVE_VIEW_ID);
     for (const [viewId, labels] of viewCentroidLabels.entries()) {
-      const flags = getViewFlags(viewId);
-      if (!flags.labels || !labels.length) continue;
+      if (!shouldShowCentroidLabels(viewId) || !labels.length) continue;
       const isActiveView = String(viewId) === focusKey;
       if (singleMode && !isActiveView) {
         hideLabelsForView(viewId);
         continue;
       }
-      if (labels.some(item => item?.el && item.el.style.display !== 'none')) {
-        anyVisible = true;
-        if (singleMode) break;
+      for (const item of labels) {
+        if (item?.el && item.el.style.display !== 'none') {
+          anyVisible = true;
+          break;
+        }
+      }
+      if (anyVisible && singleMode) {
+        break;
       }
     }
-    if (labelLayer) labelLayer.style.display = anyVisible ? 'block' : 'none';
+    if (labelLayer) {
+      const display = anyVisible ? 'block' : 'none';
+      if (labelLayer.style.display !== display) {
+        labelLayer.style.display = display;
+      }
+    }
   }
 
   /**
@@ -4588,50 +7614,74 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
   function updateViewTitles(views, cols, rows) {
     if (!viewTitleLayerEl) return;
 
-    // Generate a key to detect if we need to rebuild chips
-    const titleKey = views.map(v => `${v.id}:${v.label}`).join('|') + `|${cols}x${rows}`;
-    if (titleKey === lastTitleKey && viewTitleEntries.length === views.length) {
+    let inventoryMatches =
+      viewTitleEntries.length === views.length;
+    if (inventoryMatches) {
+      for (let index = 0; index < views.length; index++) {
+        const view = views[index];
+        const entry = viewTitleEntries[index];
+        const label = view.label || view.id;
+        if (
+          entry.viewId !== view.id ||
+          entry.label !== label
+        ) {
+          inventoryMatches = false;
+          break;
+        }
+      }
+    }
+    if (inventoryMatches) {
       // Just update positions (in case canvas resized)
       repositionViewTitles(views, cols, rows);
       return;
     }
-    lastTitleKey = titleKey;
 
     // Clear existing chips
-    viewTitleEntries.forEach(entry => entry.el?.remove());
+    for (const entry of viewTitleEntries) {
+      entry.el?.remove();
+    }
     viewTitleEntries = [];
 
     // Create chips for each view
-    const width = canvas.clientWidth;
-    const height = canvas.clientHeight;
+    const canvasSize = canvasResizeObserver.getSize();
+    const width = canvasSize.cssWidth;
+    const height = canvasSize.cssHeight;
 
-    views.forEach((view, i) => {
+    for (let i = 0; i < views.length; i++) {
+      const view = views[i];
+      const viewId = view.id;
+      const label = view.label || viewId;
       const chip = document.createElement('div');
       chip.className = 'view-title-chip';
       // Mark active view
-      if (view.id === focusedViewId) {
+      if (viewId === focusedViewId) {
         chip.classList.add('active');
       }
-      chip.textContent = view.label || view.id;
-      chip.dataset.viewId = view.id;
+      chip.textContent = label;
+      chip.dataset.viewId = viewId;
 
       // Click handler to focus this view
       chip.addEventListener('click', () => {
-        if (view.id !== focusedViewId) {
+        if (viewId !== focusedViewId) {
           // Save current camera to previous view before switching
           if (!camerasLocked) {
             setViewCameraState(focusedViewId, getCurrentCameraStateInternal());
           }
-          focusedViewId = view.id;
+          focusedViewId = viewId;
           // Load new view's camera
           if (!camerasLocked) {
-            const newCam = getViewCameraState(focusedViewId);
+            const newCam =
+              getStoredViewCameraState(focusedViewId);
             if (newCam) applyCameraStateTemporarily(newCam);
           }
           // Update active state on title chips
           updateViewTitleActiveState();
+          publishPresentedViewStateChange(
+            'focus',
+            focusedViewId
+          );
         }
-        if (viewFocusHandler) viewFocusHandler(view.id);
+        if (viewFocusHandler) viewFocusHandler(viewId);
       });
 
       // Calculate position: center-top of each viewport cell
@@ -4646,13 +7696,18 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
       chip.style.top = `${y}px`;
 
       viewTitleLayerEl.appendChild(chip);
-      viewTitleEntries.push({ el: chip, viewId: view.id });
-    });
+      viewTitleEntries.push({
+        el: chip,
+        viewId,
+        label
+      });
+    }
   }
 
   function repositionViewTitles(views, cols, rows) {
-    const width = canvas.clientWidth;
-    const height = canvas.clientHeight;
+    const canvasSize = canvasResizeObserver.getSize();
+    const width = canvasSize.cssWidth;
+    const height = canvasSize.cssHeight;
 
     // Skip style updates if layout dimensions haven't changed
     if (width === lastTitleLayoutWidth &&
@@ -4668,8 +7723,9 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
     lastTitleLayoutCols = cols;
     lastTitleLayoutRows = rows;
 
-    viewTitleEntries.forEach((entry, i) => {
-      if (!entry.el || i >= views.length) return;
+    for (let i = 0; i < viewTitleEntries.length; i++) {
+      const entry = viewTitleEntries[i];
+      if (!entry.el || i >= views.length) continue;
       const col = i % cols;
       const row = Math.floor(i / cols);
       const cellW = width / cols;
@@ -4678,19 +7734,29 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
       const y = row * cellH + 20;
       entry.el.style.left = `${x}px`;
       entry.el.style.top = `${y}px`;
-    });
+    }
   }
 
   function hideViewTitles() {
-    viewTitleEntries.forEach(entry => {
-      if (entry.el) entry.el.style.display = 'none';
-    });
+    for (const entry of viewTitleEntries) {
+      if (
+        entry.el &&
+        entry.el.style.display !== 'none'
+      ) {
+        entry.el.style.display = 'none';
+      }
+    }
   }
 
   function showViewTitles() {
-    viewTitleEntries.forEach(entry => {
-      if (entry.el) entry.el.style.display = '';
-    });
+    for (const entry of viewTitleEntries) {
+      if (
+        entry.el &&
+        entry.el.style.display !== ''
+      ) {
+        entry.el.style.display = '';
+      }
+    }
   }
 
   function updateViewTitleActiveState() {
@@ -4704,44 +7770,100 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
     });
   }
 
-  function updateCentroidLabelPositions(labels, viewportNorm) {
-    // Use CSS pixels (clientWidth/Height) not device pixels (width/height)
-    const width = canvas.clientWidth;
-    const height = canvas.clientHeight;
+  function updateCentroidLabelPositions(
+    labels,
+    viewportNormX,
+    viewportNormY,
+    viewportNormWidth,
+    viewportNormHeight,
+    viewId
+  ) {
+    hiddenCentroidLabelViews.delete(viewId);
+    // ResizeObserver owns the CSS-pixel dimensions; this avoids a synchronous
+    // layout read for every visible label and pane.
+    const canvasSize = canvasResizeObserver.getSize();
+    const width = canvasSize.cssWidth;
+    const height = canvasSize.cssHeight;
     // Viewport bounds in CSS pixels
-    const vpX = viewportNorm.x * width;
-    const vpY = viewportNorm.y * height;
-    const vpW = viewportNorm.w * width;
-    const vpH = viewportNorm.h * height;
+    const vpX = viewportNormX * width;
+    const vpY = viewportNormY * height;
+    const vpW = viewportNormWidth * width;
+    const vpH = viewportNormHeight * height;
     // Small margin to hide labels that are partially outside (avoids text clipping at edges)
     const margin = 5;
 
     for (const item of labels) {
       if (!item?.el || !item.position) continue;
-      if (item.alpha != null && item.alpha < 0.01) {
-        item.el.style.display = 'none';
-        continue;
-      }
-      vec4.set(tempVec4, item.position[0], item.position[1], item.position[2], 1);
-      vec4.transformMat4(tempVec4, tempVec4, mvpMatrix);
-      if (tempVec4[3] <= 0) { item.el.style.display = 'none'; continue; }
-      const ndcX = tempVec4[0] / tempVec4[3];
-      const ndcY = tempVec4[1] / tempVec4[3];
-      // NDC x: -1 = left, +1 = right
-      const screenX = vpX + (ndcX * 0.5 + 0.5) * vpW;
-      // NDC y: -1 = bottom, +1 = top; CSS y: 0 = top, increases downward
-      const screenY = vpY + (0.5 - ndcY * 0.5) * vpH;
-
-      // Clip labels to viewport bounds (prevents bleeding into adjacent views)
-      if (screenX < vpX + margin || screenX > vpX + vpW - margin ||
-          screenY < vpY + margin || screenY > vpY + vpH - margin) {
-        item.el.style.display = 'none';
-        continue;
+      const element = item.el;
+      let previous = centroidLabelPresentation.get(element);
+      if (!previous) {
+        previous = {
+          visible: null,
+          screenX: Number.NaN,
+          screenY: Number.NaN
+        };
+        centroidLabelPresentation.set(element, previous);
       }
 
-      item.el.style.display = 'block';
-      item.el.style.left = `${screenX}px`;
-      item.el.style.top = `${screenY}px`;
+      let visible = !(
+        item.alpha != null &&
+        item.alpha < POINT_VISIBILITY_THRESHOLD
+      );
+      let screenX = previous.screenX;
+      let screenY = previous.screenY;
+      if (visible) {
+        vec4.set(
+          tempVec4,
+          item.position[0],
+          item.position[1],
+          item.position[2],
+          1
+        );
+        vec4.transformMat4(tempVec4, tempVec4, mvpMatrix);
+        visible = tempVec4[3] > 0;
+      }
+      if (visible) {
+        const ndcX = tempVec4[0] / tempVec4[3];
+        const ndcY = tempVec4[1] / tempVec4[3];
+        // NDC x: -1 = left, +1 = right
+        screenX = vpX + (ndcX * 0.5 + 0.5) * vpW;
+        // NDC y: -1 = bottom, +1 = top; CSS y: 0 = top
+        screenY = vpY + (0.5 - ndcY * 0.5) * vpH;
+        visible =
+          Number.isFinite(screenX) &&
+          Number.isFinite(screenY) &&
+          screenX >= vpX + margin &&
+          screenX <= vpX + vpW - margin &&
+          screenY >= vpY + margin &&
+          screenY <= vpY + vpH - margin;
+      }
+
+      if (!visible) {
+        if (
+          previous.visible !== false ||
+          element.style.display !== 'none'
+        ) {
+          element.style.display = 'none';
+        }
+        previous.visible = false;
+        continue;
+      }
+
+      if (
+        previous.visible !== true ||
+        element.style.display !== 'block'
+      ) {
+        element.style.display = 'block';
+        previous.visible = true;
+      }
+      if (previous.screenX !== screenX) {
+        element.style.left = `${screenX}px`;
+        previous.screenX = screenX;
+      }
+      if (previous.screenY !== screenY) {
+        element.style.top = `${screenY}px`;
+        previous.screenY = screenY;
+      }
     }
   }
 
@@ -4782,7 +7904,12 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
       }
     }
 
-    const [width, height] = canvasResizeObserver.getSize();
+    const canvasSize = canvasResizeObserver.getSize();
+    const width = canvasSize.width;
+    const height = canvasSize.height;
+    if (presentedViewStateListeners.size !== 0) {
+      trackPresentedFrameState(now, width, height);
+    }
 
     if (!pointCount) {
       _renderVelocityViewIds.length = 0;
@@ -4811,13 +7938,10 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
       mat4.invert(invViewProjMatrix, viewProjMatrix);
       // Render smoke with alpha blending on top of grid
       try {
-        smokeRenderer.render({
-          invViewProjMatrix,
-          eye,
-          lightDir,
-          width,
-          height
-        });
+        _smokeRenderParams.eye = eye;
+        _smokeRenderParams.width = width;
+        _smokeRenderParams.height = height;
+        smokeRenderer.render(_smokeRenderParams);
       } catch (error) {
         renderMode = 'points';
         const exactError = error instanceof Error
@@ -4843,34 +7967,28 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
     // Determine views to render (include centroid data for each view)
     // Reuse preallocated array to avoid per-frame allocation
     _renderAllViews.length = 0;
+    let focusedRenderView = null;
 
     // Add live view only if not hidden
     if (!liveViewHidden) {
-      _renderAllViews.push({
-        id: LIVE_VIEW_ID,
-        label: liveViewLabel,
-        colors: colorsArray,
-        transparency: transparencyArray,
-        centroidPositions: null, // Use current buffers
-        centroidColors: null,
-        centroidTransparencies: null,
-        centroidCount: centroidCount,
-        cameraState: liveCameraState  // Include camera state directly
-      });
+      _liveRenderViewRecord.label = liveViewLabel;
+      _liveRenderViewRecord.colors = colorsArray;
+      _liveRenderViewRecord.transparency =
+        transparencyArray;
+      _liveRenderViewRecord.centroidCount = centroidCount;
+      _liveRenderViewRecord.cameraState = liveCameraState;
+      _renderAllViews.push(_liveRenderViewRecord);
+      if (focusedViewId === LIVE_VIEW_ID) {
+        focusedRenderView = _liveRenderViewRecord;
+      }
     }
 
     for (const snap of snapshotViews) {
-      _renderAllViews.push({
-        id: snap.id,
-        label: snap.label,
-        colors: snap.colors,
-        transparency: snap.transparency,
-        centroidPositions: snap.centroidPositions,
-        centroidColors: snap.centroidColors,
-        centroidTransparencies: snap.centroidTransparencies,
-        centroidCount: snap.centroidPositions ? snap.centroidPositions.length / 3 : 0,
-        cameraState: snap.cameraState  // Include camera state directly
-      });
+      const renderView = getSnapshotRenderViewRecord(snap);
+      _renderAllViews.push(renderView);
+      if (renderView.id === focusedViewId) {
+        focusedRenderView = renderView;
+      }
     }
 
     // In single mode or only one view, render full screen
@@ -4889,7 +8007,10 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
         renderSingleView(
           width,
           height,
-          { x: 0, y: 0, w: 1, h: 1 },
+          0,
+          0,
+          1,
+          1,
           view.id,
           view.centroidCount,
           snapshotId,
@@ -4902,7 +8023,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
         );
       } else {
         // The focused view must be part of the published render layout.
-        const view = _renderAllViews.find(v => v.id === focusedViewId);
+        const view = focusedRenderView;
         if (!view) {
           throw new Error(
             `Focused view "${focusedViewId}" is absent from the published render layout.`
@@ -4913,16 +8034,30 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
         prepareVelocityFrame(_renderVelocityViewIds);
 
         // Create or recreate centroid snapshot buffer if needed
-        const viewDimLevel = getPublishedDimensionLevel(view.id);
-        if (view.centroidPositions && view.centroidColors && centroidBufferNeedsUpdate(view.id, viewDimLevel, view.centroidPositions)) {
-          createCentroidSnapshotBuffer(view.id, view.centroidPositions, view.centroidColors, viewDimLevel);
+        if (
+          view.centroidPositions?.length > 0 &&
+          view.centroidColors &&
+          centroidBufferNeedsUpdate(
+            view.id,
+            view.centroidPositions,
+            view.centroidColors
+          )
+        ) {
+          createCentroidSnapshotBuffer(
+            view.id,
+            view.centroidPositions,
+            view.centroidColors
+          );
         }
 
 	        const snapshotId = requireSnapshotBufferId(view.id);
 	        renderSingleView(
 	          width,
 	          height,
-	          { x: 0, y: 0, w: 1, h: 1 },
+	          0,
+	          0,
+	          1,
+	          1,
 	          view.id,
 	          view.centroidCount,
 	          snapshotId,
@@ -4970,7 +8105,10 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
     // Frustum culling and LOD work per-view: each renderSingleView call receives
     // the correct mvpMatrix and cameraDistance for that view's camera
 
-    for (let i = 0; i < viewCount; i++) {
+    try {
+      gl.enable(gl.SCISSOR_TEST);
+      try {
+        for (let i = 0; i < viewCount; i++) {
         const view = _renderAllViews[i];
         const col = i % cols;
         const row = Math.floor(i / cols);
@@ -4988,10 +8126,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
           radius = activeRadius;
         } else if (!camerasLocked) {
           const cached = cachedViewMatrices.get(view.id);
-          const cameraState = assertCameraState(
-            getViewCameraState(view.id),
-            `Grid camera state for view "${view.id}"`
-          );
+          const cameraState = getViewCameraState(view.id);
           paneNavigationMode = cameraState.navigationMode;
           if (cached) {
             // Use pre-computed cached viewMatrix directly
@@ -5024,45 +8159,64 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
         mat4.multiply(mvpMatrix, projectionMatrix, viewMatrix);
         mat4.multiply(mvpMatrix, mvpMatrix, modelMatrix);
 
-        // Set viewport and clear depth for this pane
-        gl.viewport(vx, vy, vw, vh);
-        gl.enable(gl.SCISSOR_TEST);
-        gl.scissor(vx, vy, vw, vh);
-        gl.clear(gl.DEPTH_BUFFER_BIT);
+          // Set viewport and clear depth for this pane
+          gl.viewport(vx, vy, vw, vh);
+          gl.scissor(vx, vy, vw, vh);
+          gl.clear(gl.DEPTH_BUFFER_BIT);
 
-        // Create or recreate centroid snapshot buffer if needed (dimension change, position change, or doesn't exist)
-        const viewDimLevel = getPublishedDimensionLevel(view.id);
-        if (view.centroidPositions && view.centroidColors && centroidBufferNeedsUpdate(view.id, viewDimLevel, view.centroidPositions)) {
-          createCentroidSnapshotBuffer(view.id, view.centroidPositions, view.centroidColors, viewDimLevel);
+          // Recreate only when the immutable position/color publication changes.
+          if (
+            view.centroidPositions?.length > 0 &&
+            view.centroidColors &&
+            centroidBufferNeedsUpdate(
+              view.id,
+              view.centroidPositions,
+              view.centroidColors
+            )
+          ) {
+            createCentroidSnapshotBuffer(
+              view.id,
+              view.centroidPositions,
+              view.centroidColors
+            );
+          }
+
+          const snapshotId = requireSnapshotBufferId(view.id);
+          renderSingleView(
+            vw,
+            vh,
+            col / cols,
+            row / rows,
+            1 / cols,
+            1 / rows,
+            view.id,
+            view.centroidCount,
+            snapshotId,
+            dt,
+            timeSeconds,
+            paneNavigationMode,
+            vx,
+            vy,
+            true
+          );
         }
-
-        const snapshotId = requireSnapshotBufferId(view.id);
-        renderSingleView(
-          vw,
-          vh,
-          { x: col / cols, y: row / rows, w: 1 / cols, h: 1 / rows },
-          view.id,
-          view.centroidCount,
-          snapshotId,
-          dt,
-          timeSeconds,
-          paneNavigationMode,
-          vx,
-          vy,
-          true
-        );
-
-        gl.disable(gl.SCISSOR_TEST);
+      } finally {
+          // The next frame clears the full canvas before re-entering grid
+          // panes. A failed pane must never clip that clear or later draws.
+          gl.disable(gl.SCISSOR_TEST);
       }
-
-    // Restore active view's state after grid render
-    mat4.copy(viewMatrix, _activeViewMatrixScratch);
-    radius = activeRadius;
-
-	    // Restore projection matrix for full canvas aspect
-	    configureInteractiveProjection(projectionMatrix, width / height);
-	    mat4.multiply(mvpMatrix, projectionMatrix, viewMatrix);
-	    mat4.multiply(mvpMatrix, mvpMatrix, modelMatrix);
+    } finally {
+      // Restore the active camera/matrix ownership even when one pane throws;
+      // the already-scheduled next frame then starts from coherent state.
+      mat4.copy(viewMatrix, _activeViewMatrixScratch);
+      radius = activeRadius;
+      configureInteractiveProjection(
+        projectionMatrix,
+        width / height
+      );
+      mat4.multiply(mvpMatrix, projectionMatrix, viewMatrix);
+      mat4.multiply(mvpMatrix, mvpMatrix, modelMatrix);
+    }
 
 	    // Aggregate label layer visibility once per frame (after all views render).
 	    updateLabelLayerVisibility();
@@ -5071,7 +8225,10 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
 		  function renderSingleView(
 		    width,
 		    height,
-		    viewport,
+		    viewportNormX,
+		    viewportNormY,
+		    viewportNormWidth,
+		    viewportNormHeight,
 		    viewId,
 		    overrideCentroidCount,
 		    snapshotBufferId = null,
@@ -5086,6 +8243,18 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
 		    const exactPaneNavigationMode = assertNavigationMode(
 		      paneNavigationMode
 		    );
+		    if (
+		      !Number.isFinite(viewportNormX) ||
+		      !Number.isFinite(viewportNormY) ||
+		      !Number.isFinite(viewportNormWidth) ||
+		      viewportNormWidth <= 0 ||
+		      !Number.isFinite(viewportNormHeight) ||
+		      viewportNormHeight <= 0
+		    ) {
+		      throw new TypeError(
+		        `Normalized viewport for view "${vid}" is invalid.`
+		      );
+		    }
 		    if (
 		      !Number.isSafeInteger(viewportX) ||
 		      viewportX < 0 ||
@@ -5115,12 +8284,6 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
 			    // Draw grid first
 			    drawGrid();
 
-	    const snapshot = vid === LIVE_VIEW_ID
-	      ? null
-	      : snapshotViews.find(s => s.id === vid);
-	    if (vid !== LIVE_VIEW_ID && !snapshot) {
-	      throw new Error(`Snapshot view "${vid}" is absent from published viewer state.`);
-	    }
 	    // Render params shared by both render paths
 	    // Get dimension level for this view (used for LOD and frustum culling calculations)
 	    const dimLevel = getPublishedDimensionLevel(vid);
@@ -5182,10 +8345,14 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
 
 	    // Render scatter points - use snapshot buffer if available (no data upload!)
 	    if (snapshotBufferId) {
-	      hpRenderer.renderWithSnapshot(snapshotBufferId, renderParams);
+	      hpRenderer.renderWithSnapshot(snapshotBufferId, renderParams, false);
 	    } else {
-      hpRenderer.render(renderParams);
+      hpRenderer.render(renderParams, false);
     }
+	    // Capture this point pass's exact range before any overlay or later
+	    // pane can reuse the shared HighPerfRenderer fog scalars.
+	    const paneFogNear = hpRenderer.getFogNear();
+	    const paneFogFar = hpRenderer.getFogFar();
 	    publishLodLevelChange(vid);
 
 	    // Render overlays (after main points, before selection highlights).
@@ -5245,14 +8412,38 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
     // Use view-specific positions and transparency for multi-view support
     const viewPos = getExactViewPositions(vid);
     const viewTransp = getExactViewTransparency(vid);
-    highlightTools.renderHighlights(renderParams, viewPos, viewTransp);
+    try {
+      highlightTools.syncHighlightBufferForLod(
+        viewPos,
+        vid,
+        viewTransp,
+        dimLevel
+      );
+    } catch (error) {
+      reportHighlightRenderFailure(error, vid);
+    }
+    try {
+      // A failed replacement upload leaves the last accepted generation
+      // authoritative and drawable. Its draw failure boundary is independent
+      // so connectivity, centroids, projectiles, and later panes still run.
+      highlightTools.drawHighlights(renderParams, timeSeconds);
+    } catch (error) {
+      reportHighlightRenderFailure(error, vid);
+    }
 
     // Draw connectivity lines (pass viewId for per-view position/visibility textures)
-    drawConnectivityLines(width, height, vid);
+    drawConnectivityLines(
+      width,
+      height,
+      vid,
+      paneFogNear,
+      paneFogFar
+    );
 
     // Draw centroids
-    const flags = getViewFlags(vid);
-	    if (flags.points && numCentroids > 0) {
+    const showCentroidPoints = shouldShowCentroidPoints(vid);
+    const showCentroidLabels = shouldShowCentroidLabels(vid);
+	    if (showCentroidPoints && numCentroids > 0) {
 	      // Use snapshot buffer if available (no per-frame upload), otherwise use live buffer
 	      if (hasCentroidSnapshotBuffer(vid)) {
 	        drawCentroidsWithSnapshot(vid, height);
@@ -5274,10 +8465,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
       let viewTarget = target;
       let viewRadius = radius;
       if (!camerasLocked && vid !== focusedViewId) {
-        const camState = assertCameraState(
-          getViewCameraState(vid),
-          `Orbit-anchor camera state for view "${vid}"`
-        );
+        const camState = getViewCameraState(vid);
         viewTheta = camState.orbit.theta;
         viewPhi = camState.orbit.phi;
         viewTarget = camState.orbit.target;
@@ -5299,9 +8487,18 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
 	    }
 
     // Update labels
-	    if (flags.labels) {
-	      const labels = getLabelsForView(vid);
-	      if (labels.length) updateCentroidLabelPositions(labels, viewport);
+		    if (showCentroidLabels) {
+		      const labels = getLabelsForView(vid);
+		      if (labels.length) {
+		        updateCentroidLabelPositions(
+		          labels,
+		          viewportNormX,
+		          viewportNormY,
+		          viewportNormWidth,
+		          viewportNormHeight,
+		          vid
+		        );
+		      }
 	    } else {
 	      hideLabelsForView(vid);
 	    }
@@ -5365,21 +8562,52 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
         gridColor = [0.7, 0.7, 0.7];
         gridFogDensityMultiplier = 1.0;
     }
+    publishPresentedViewStateChange(
+      'background',
+      focusedViewId
+    );
   }
 
   // === Per-view camera helpers ===
-  function getViewCameraState(viewId) {
-    const exactViewId = assertKnownViewId(viewId);
+  function getStoredViewCameraState(
+    exactViewId,
+    boundary = undefined
+  ) {
+    let cameraState;
     if (exactViewId === LIVE_VIEW_ID) {
-      return liveCameraState
+      cameraState = liveCameraState
         ? liveCameraState
         : getCurrentCameraStateInternal();
+    } else {
+      const snap = snapshotViewsById.get(exactViewId);
+      cameraState = snap?.cameraState;
+      if (!cameraState) {
+        throw new TypeError(
+          `Camera state is missing for view "${exactViewId}".`
+        );
+      }
     }
-    const snap = snapshotViews.find(s => s.id === exactViewId);
-    if (!snap.cameraState) {
-      throw new TypeError(`Camera state is missing for view "${exactViewId}".`);
+    if (certifiedCameraStateOwners.has(cameraState)) {
+      return cameraState;
     }
-    return snap.cameraState;
+    return certifyCameraStateOwner(
+      cameraState,
+      boundary ?? `Camera state for view "${exactViewId}"`
+    );
+  }
+
+  function getViewCameraState(viewId, boundary = undefined) {
+    const exactViewId = assertKnownViewId(viewId);
+    // The focused pane and every locked pane are rendered from the live global
+    // camera scalars. Public/session/snapshot capture must observe that same
+    // authoritative state rather than an older stored transition record.
+    if (camerasLocked || exactViewId === focusedViewId) {
+      return certifyCameraStateOwner(
+        getCurrentCameraStateInternal(),
+        boundary ?? `Camera state for view "${exactViewId}"`
+      );
+    }
+    return getStoredViewCameraState(exactViewId, boundary);
   }
 
   function setViewCameraState(viewId, camState) {
@@ -5391,13 +8619,18 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
     if (exactViewId === LIVE_VIEW_ID) {
       liveCameraState = ownedState;
     } else {
-      const snap = snapshotViews.find(s => s.id === exactViewId);
+      const snap = snapshotViewsById.get(exactViewId);
       snap.cameraState = ownedState;
     }
-    // Update cached view matrix for this view (avoids per-frame recalculation)
+    certifiedCameraStateOwners.add(ownedState);
+
+    // Update cached view matrix for this view (avoids per-frame recalculation).
+    // Although the focused pane currently consumes globals, retaining the
+    // cache makes a later focus transition publication-ready.
     if (!camerasLocked) {
       updateCachedViewMatrix(exactViewId, ownedState);
     }
+    return ownedState;
   }
 
   // === Per-view navigation mode helpers ===
@@ -5464,7 +8697,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
       }
     } else {
       // Handle snapshot views
-      const snap = snapshotViews.find(s => s.id === viewId);
+      const snap = snapshotViewsById.get(viewId);
       if (!snap) {
         throw new RangeError(`Unknown camera view "${String(viewId)}".`);
       }
@@ -5885,10 +9118,12 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
       pointCount = nextPointCount;
       positionsArray = positions;
       colorsArray = colors;
-      transparencyArray = transparency;
+      transparencyArray = new Float32Array(transparency);
+      hpRenderer._adoptCurrentAlphasOwner(transparencyArray);
       computePointBoundsFromPositions(positions);
       viewDimensionLevels.set(LIVE_VIEW_ID, dimensionLevel);
       viewPositionsCache.set(LIVE_VIEW_ID, positions);
+      publishViewDataGeneration(LIVE_VIEW_ID);
       applyDimensionNavigationDefault(LIVE_VIEW_ID, dimensionLevel);
       vectorFieldOverlay?.markGeometryDirty?.(LIVE_VIEW_ID);
     },
@@ -5897,23 +9132,129 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
       assertExactUint8Array(colors, pointCount * 4, 'Viewer live colors');
       hpRenderer.updateColors(colors);
       colorsArray = colors;
+      publishViewDataGeneration(LIVE_VIEW_ID);
     },
 
     updateTransparency(alphaArray) {
-      assertTransparencyArray(
+      assertExactFloat32Array(
         alphaArray,
         pointCount,
         'Viewer live transparency'
       );
-      hpRenderer.updateAlphas(alphaArray);
       highlightTools.retireSpatialInteractions(LIVE_VIEW_ID);
-      transparencyArray = alphaArray;
+      if (
+        !(transparencyArray instanceof Float32Array) ||
+        transparencyArray.length !== pointCount
+      ) {
+        throw new Error(
+          'Viewer live transparency has no exact prior publication.'
+        );
+      }
+      let nextEdgeVisibility = null;
+      let previousEdgeVisibility = null;
+      if (edgePositionTexturesV2.has(LIVE_VIEW_ID)) {
+        const lodMembership = hpRenderer.getCurrentLodMembership(
+          LIVE_VIEW_ID,
+          getPublishedDimensionLevel(LIVE_VIEW_ID)
+        );
+        nextEdgeVisibility = createLodFilteredVisibilityOwner(
+          alphaArray,
+          lodMembership
+        );
+        previousEdgeVisibility =
+          createLodFilteredVisibilityOwner(
+            transparencyArray,
+            lodMembership
+          );
+      }
+
+      let rendererPublished = false;
+      let edgeVisibilityAttempted = false;
+      try {
+        hpRenderer.updateAlphas(alphaArray);
+        rendererPublished = true;
+        if (nextEdgeVisibility !== null) {
+          edgeVisibilityAttempted = true;
+          if (
+            !updateVisibilityTextureV2ForView(
+              LIVE_VIEW_ID,
+              pointCount,
+              nextEdgeVisibility
+            )
+          ) {
+            throw new Error(
+              'Live edge visibility was not published.'
+            );
+          }
+          const edgePrefix =
+            refreshEdgePrefixForView(LIVE_VIEW_ID);
+          if (edgePrefix === null || edgePrefix.current !== true) {
+            throw new Error(
+              'Live edge prefix was not published.'
+            );
+          }
+        }
+        highlightTools.handleTransparencyChange(LIVE_VIEW_ID);
+      } catch (publicationError) {
+        const restorationFailures = [];
+        if (rendererPublished) {
+          try {
+            hpRenderer.updateAlphas(transparencyArray);
+          } catch (restorationError) {
+            restorationFailures.push(restorationError);
+          }
+          if (edgeVisibilityAttempted) {
+            try {
+              if (
+                !updateVisibilityTextureV2ForView(
+                  LIVE_VIEW_ID,
+                  pointCount,
+                  previousEdgeVisibility
+                )
+              ) {
+                throw new Error(
+                  'Live edge visibility restoration failed.'
+                );
+              }
+              const restoredEdgePrefix =
+                refreshEdgePrefixForView(LIVE_VIEW_ID);
+              if (
+                restoredEdgePrefix === null ||
+                restoredEdgePrefix.current !== true
+              ) {
+                throw new Error(
+                  'Live edge prefix restoration failed.'
+                );
+              }
+            } catch (restorationError) {
+              restorationFailures.push(restorationError);
+            }
+          }
+        }
+        try {
+          // Application state commonly reuses and mutates its Float32 owner
+          // before calling this method. Restore that caller owner as part of
+          // the same failed publication so state and rendering cannot diverge.
+          alphaArray.set(transparencyArray);
+        } catch (restorationError) {
+          restorationFailures.push(restorationError);
+        }
+        if (restorationFailures.length > 0) {
+          throw new AggregateError(
+            [publicationError, ...restorationFailures],
+            'Live point and connectivity visibility publication failed with incomplete restoration.'
+          );
+        }
+        throw publicationError;
+      }
+
+      transparencyArray.set(alphaArray);
+      hpRenderer._adoptCurrentAlphasOwner(transparencyArray);
+      publishViewDataGeneration(LIVE_VIEW_ID);
       // Let overlays (e.g., vector field particles) rebuild spawn sources lazily when visibility changes.
       if (vectorFieldOverlay?.enabled) {
         vectorFieldOverlay.markVisibilityDirty(LIVE_VIEW_ID);
       }
-
-      highlightTools.handleTransparencyChange(LIVE_VIEW_ID);
     },
 
     /**
@@ -5979,6 +9320,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
       positionsArray = positions;
       viewPositionsCache.set(LIVE_VIEW_ID, positions);
       computePointBoundsFromPositions(positions);
+      publishViewDataGeneration(LIVE_VIEW_ID);
       vectorFieldOverlay?.markGeometryDirty?.(LIVE_VIEW_ID);
     },
 
@@ -6051,7 +9393,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
         );
         projectileSystem.setEnabled(false);
       }
-      const snap = snapshotViews.find(s => s.id === vid);
+      const snap = snapshotViewsById.get(vid);
 
       // Invalidate per-view caches when dimension changes (LOD/frustum calculations differ)
       if (oldLevel !== level && hpRenderer) {
@@ -6207,6 +9549,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
         highlightTools.retireSpatialInteractions(vid);
       }
       viewPositionsCache.set(vid, publishedPositions);
+      publishViewDataGeneration(vid);
       vectorFieldOverlay?.markGeometryDirty?.(vid);
     },
 
@@ -6227,21 +9570,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
      * @returns {Uint8Array|null}
      */
     getViewColors(viewId) {
-      const vid = assertViewId(viewId);
-      if (vid === LIVE_VIEW_ID) {
-        if (!(colorsArray instanceof Uint8Array)) {
-          throw new Error('Colors are not published for view "live".');
-        }
-        return new Uint8Array(colorsArray);
-      }
-      const snapshot = snapshotViews.find(s => s.id === vid);
-      if (!snapshot) {
-        throw new Error(`View "${vid}" does not exist.`);
-      }
-      if (!(snapshot.colors instanceof Uint8Array)) {
-        throw new Error(`Colors are not published for view "${vid}".`);
-      }
-      return new Uint8Array(snapshot.colors);
+      return new Uint8Array(getExactViewColors(viewId));
     },
 
     /**
@@ -6252,6 +9581,35 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
      */
     getViewTransparency(viewId) {
       return getExactViewTransparency(viewId);
+    },
+
+    /**
+     * Borrow the exact renderer-facing point arrays for one synchronous
+     * calculation. The callback must treat all three arrays as read-only and
+     * must not retain them after returning. Any Promise/thenable result, or
+     * any point-data/dimension/LOD publication made from inside the callback,
+     * invalidates the boundary and throws before this method returns.
+     *
+     * @param {string} viewId
+     * @param {Function} callback
+     * @returns {*} the callback's non-thenable result
+     */
+    withBorrowedViewData(viewId, callback) {
+      const owner = captureExactViewDataOwnership(viewId);
+      const payload = Object.freeze({
+        positions: owner.positions,
+        colors: owner.colors,
+        transparency: owner.transparency,
+        pointCount: owner.pointCount,
+        dimensionLevel: owner.dimensionLevel,
+        geometryGeneration: owner.geometryGeneration,
+        lodMembership: owner.lodMembership
+      });
+      return runSynchronousBorrowedViewDataCallback(
+        callback,
+        payload,
+        () => assertViewDataOwnershipCurrent(owner)
+      );
     },
 
     updateHighlight(highlightData, highlightedIndices = null) {
@@ -6619,10 +9977,13 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
         throw error;
       }
 
-      const previousLabels = viewCentroidLabels.get(targetId) || [];
+      const previousLabels =
+        viewCentroidLabels.get(targetId) ??
+        EMPTY_CENTROID_LABELS;
       const ownedEntries = entries.map(createOwnedCentroidLabel);
       cancelCentroidLabelRetirements(targetId, candidateElements);
       viewCentroidLabels.set(targetId, ownedEntries);
+      hiddenCentroidLabelViews.delete(targetId);
       for (const element of candidateElements) {
         centroidLabelOwners.set(element, targetId);
       }
@@ -6631,6 +9992,9 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
         previousLabels,
         candidateElements
       );
+      if (!shouldShowCentroidLabels(targetId)) {
+        hideLabelsForView(targetId);
+      }
 
       const settlementFailures = drainCentroidLabelRetirements(targetId);
       try {
@@ -6653,33 +10017,54 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
     },
 
     setPointSize(size) {
-      basePointSize = assertFiniteNumberInRange(size, 0.25, 200, 'Point size');
+      const next =
+        assertFiniteNumberInRange(size, 0.25, 200, 'Point size');
+      if (next === basePointSize) return;
+      basePointSize = next;
+      publishPresentedViewStateChange('style', focusedViewId);
     },
     setSizeAttenuation(value) {
-      sizeAttenuation = assertFiniteNumberInRange(
+      const next = assertFiniteNumberInRange(
         value,
         0,
         1,
         'Perspective size scaling'
       );
+      if (next === sizeAttenuation) return;
+      sizeAttenuation = next;
+      publishPresentedViewStateChange('style', focusedViewId);
     },
     setLightingStrength(value) {
-      lightingStrength = assertFiniteNumberInRange(value, 0, 1, 'Lighting strength');
+      const next =
+        assertFiniteNumberInRange(value, 0, 1, 'Lighting strength');
+      if (next === lightingStrength) return;
+      lightingStrength = next;
+      publishPresentedViewStateChange('style', focusedViewId);
     },
     setFogDensity(value) {
-      fogDensity = assertFiniteNumberInRange(value, 0, 1, 'Fog density');
+      const next =
+        assertFiniteNumberInRange(value, 0, 1, 'Fog density');
+      if (next === fogDensity) return;
+      fogDensity = next;
+      publishPresentedViewStateChange('style', focusedViewId);
     },
     setShowCentroidPoints(show, viewId) {
       const exactShow = assertExactBoolean(show, 'Centroid point visibility');
-      setViewFlags(viewId, { points: exactShow });
+      const key = assertKnownViewId(viewId);
+      if (setViewFlags(key, { points: exactShow })) {
+        publishPresentedViewStateChange('overlay', key);
+      }
     },
 
     setShowCentroidLabels(show, viewId) {
       const exactShow = assertExactBoolean(show, 'Centroid label visibility');
       const key = assertKnownViewId(viewId);
-      setViewFlags(key, { labels: exactShow });
+      const changed = setViewFlags(key, { labels: exactShow });
       if (!exactShow) hideLabelsForView(key);
       updateLabelLayerVisibility();
+      if (changed) {
+        publishPresentedViewStateChange('overlay', key);
+      }
     },
 
     getCentroidFlags(viewId) { return getViewFlags(viewId); },
@@ -6695,6 +10080,10 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
       viewportLeftOcclusionRatio = exactRatio;
       cachedGridProjections.clear();
       cachedGridProjectionAspect = null;
+      publishPresentedViewStateChange(
+        'viewport',
+        focusedViewId
+      );
     },
     setRenderMode(mode) {
       const exactMode = assertRenderMode(mode);
@@ -6705,6 +10094,12 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
         smokeRenderer.cancelNoiseGeneration();
       }
       renderMode = exactMode;
+    },
+    setHighlightRenderFailureHandler(fn) {
+      highlightRenderFailureHandler = assertExactFunction(
+        fn,
+        'Highlight render failure handler'
+      );
     },
     setSmokeRenderFailureHandler(fn) {
       smokeRenderFailureHandler = assertExactFunction(
@@ -6738,6 +10133,10 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
       if (navigationMode !== previousMode) {
         navigationModeChangeHandler?.(focusedViewId, navigationMode);
       }
+      publishPresentedViewStateChange(
+        'navigation',
+        focusedViewId
+      );
     },
     getNavigationMode() { return navigationMode; },
     setLookSensitivity(value) {
@@ -7002,7 +10401,8 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
           sources,
           destinations,
           renderWeights,
-          nEdges
+          nEdges,
+          nCells
         );
 
         if (
@@ -7020,6 +10420,40 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
           clearEdgeResourcesV2();
           return false;
         }
+
+        edgeSourcesV2 = sources;
+        edgeDestinationsV2 = destinations;
+        edgeVisibleTarget = nEdges;
+        const initialPrefixBuild =
+          buildAllVisibleConnectivityEdgePrefixOwner(
+            nEdges,
+            edgePrefixCheckpointStaging
+          );
+        const liveVisibilityEntry =
+          edgeVisibilityTexturesV2.get(LIVE_VIEW_ID);
+        if (
+          !initialPrefixBuild?.owner ||
+          initialPrefixBuild.owner.visibleCount !== nEdges ||
+          !liveVisibilityEntry ||
+          !Number.isSafeInteger(liveVisibilityEntry.revision) ||
+          liveVisibilityEntry.revision <= 0
+        ) {
+          throw new Error(
+            'Connectivity setup did not produce an exact initial prefix generation.'
+          );
+        }
+        edgeAllVisiblePrefixOwner = initialPrefixBuild.owner;
+        edgePrefixOwnersV2.set(
+          LIVE_VIEW_ID,
+          Object.freeze({
+            prefixOwner: edgeAllVisiblePrefixOwner,
+            provisional: true,
+            rawPrefix: nEdges,
+            visibilityRevision: liveVisibilityEntry.revision,
+          })
+        );
+        edgePrefixCheckpointStaging =
+          initialPrefixBuild.reusableCheckpoints ?? null;
       } catch (error) {
         clearEdgeResourcesV2();
         throw error;
@@ -7027,7 +10461,6 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
 
       hasEdgeDataV2 = true;
       useInstancedEdges = true;
-      edgeLodLimit = 0;
       console.log(`[Viewer] V2 instanced edges enabled: ${nEdges} edges, ${nCells} cells`);
       return true;
     },
@@ -7051,23 +10484,84 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
     },
 
     /**
-     * Set LOD limit for V2 edges (0 = no limit)
-     * @param {number} limit - Maximum edges to render
+     * Publish live connectivity visibility directly from the renderer's
+     * shared LOD membership owner plus the existing transparency generation.
+     * No point-count-sized combined CPU mask is materialized.
+     */
+    updateEdgeVisibilityV2FromLod(transparency, lodMembership) {
+      if (
+        !hasEdgeDataV2 ||
+        !useInstancedEdges ||
+        !edgePositionTexturesV2.has(LIVE_VIEW_ID)
+      ) {
+        return false;
+      }
+      const visibilityOwner = createLodFilteredVisibilityOwner(
+        transparency,
+        lodMembership
+      );
+      return updateVisibilityTextureV2ForView(
+        LIVE_VIEW_ID,
+        transparency.length,
+        visibilityOwner
+      );
+    },
+
+    refreshEdgePrefixForView(viewId) {
+      return refreshEdgePrefixForView(viewId);
+    },
+
+    setEdgeVisibleTarget(target) {
+      return setEdgeVisibleTarget(target);
+    },
+
+    getEdgePrefixStatsForView(viewId) {
+      const vid = assertViewId(viewId);
+      return describeEdgePrefixOwner(vid);
+    },
+
+    /**
+     * Compatibility wrapper for callers that explicitly control the focused
+     * pane's raw shuffled prefix. Product UI uses setEdgeVisibleTarget() so
+     * each pane resolves its own prefix from the shared visible-edge target.
+     * Zero now means exactly zero instances.
      */
     setEdgeLodLimit(limit) {
-      edgeLodLimit = assertIntegerInRange(
+      const exactLimit = assertIntegerInRange(
         limit,
         0,
         nEdgesV2,
         'Connectivity edge LOD limit'
       );
+      if (nEdgesV2 === 0 && exactLimit === 0) return;
+      const viewId = edgePrefixOwnersV2.has(focusedViewId)
+        ? focusedViewId
+        : LIVE_VIEW_ID;
+      const current = getCurrentEdgePrefixOwner(viewId);
+      if (current === null) {
+        throw new Error(
+          `Connectivity raw-prefix override requires a current owner for view "${viewId}".`
+        );
+      }
+      edgePrefixOwnersV2.set(
+        viewId,
+        Object.freeze({
+          prefixOwner: current.prefixOwner,
+          provisional: current.provisional === true,
+          rawPrefix: exactLimit,
+          visibilityRevision: current.visibilityRevision,
+        })
+      );
     },
 
     /**
-     * Get current LOD limit
+     * Get the focused pane's current raw edge prefix.
      */
     getEdgeLodLimit() {
-      return edgeLodLimit;
+      const viewId = edgePrefixOwnersV2.has(focusedViewId)
+        ? focusedViewId
+        : LIVE_VIEW_ID;
+      return getCurrentEdgePrefixOwner(viewId)?.rawPrefix ?? 0;
     },
 
     /**
@@ -7170,6 +10664,29 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
         deleteEdgeTexturesForView(viewId);
         return false;
       }
+      const visibilityEntry =
+        edgeVisibilityTexturesV2.get(viewId);
+      if (
+        edgeAllVisiblePrefixOwner === null ||
+        !visibilityEntry ||
+        !Number.isSafeInteger(visibilityEntry.revision) ||
+        visibilityEntry.revision <= 0
+      ) {
+        deleteEdgeTexturesForView(viewId);
+        throw new Error(
+          `Per-view connectivity setup for "${viewId}" has no exact full prefix generation.`
+        );
+      }
+      retireEdgePrefixOwner(viewId);
+      edgePrefixOwnersV2.set(
+        viewId,
+        Object.freeze({
+          prefixOwner: edgeAllVisiblePrefixOwner,
+          provisional: true,
+          rawPrefix: nEdgesV2,
+          visibilityRevision: visibilityEntry.revision,
+        })
+      );
       return true;
     },
 
@@ -7190,6 +10707,36 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
         return false;
       }
       return updateVisibilityTextureV2ForView(viewId, visibility);
+    },
+
+    /**
+     * Publish one snapshot's connectivity visibility without allocating a
+     * dense combined LOD/filter mask.
+     */
+    updateEdgeVisibilityV2ForViewFromLod(
+      viewId,
+      transparency,
+      lodMembership
+    ) {
+      if (!hasEdgeDataV2 || !useInstancedEdges) {
+        return false;
+      }
+      if (
+        typeof viewId !== 'string' ||
+        viewId.length === 0 ||
+        !edgePositionTexturesV2.has(viewId)
+      ) {
+        return false;
+      }
+      const visibilityOwner = createLodFilteredVisibilityOwner(
+        transparency,
+        lodMembership
+      );
+      return updateVisibilityTextureV2ForView(
+        viewId,
+        transparency.length,
+        visibilityOwner
+      );
     },
 
     /**
@@ -7308,6 +10855,10 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
       if (navigationMode !== previousMode) {
         navigationModeChangeHandler?.(focusedViewId, navigationMode);
       }
+      // Cinematic playback calls setCameraState() at frame cadence. The
+      // allocation-free scalar tracker publishes one camera-changing event
+      // for the whole burst and one camera-settled event after it, rather than
+      // allocating and dispatching an event for every interpolated frame.
     },
 
     stopInertia() {
@@ -7362,6 +10913,12 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
         // Clear cached matrices (not needed in locked mode)
         invalidateAllCachedMatrices();
       }
+      if (wasLocked !== camerasLocked) {
+        publishPresentedViewStateChange(
+          'camera-lock',
+          focusedViewId
+        );
+      }
     },
 
     getCamerasLocked() { return camerasLocked; },
@@ -7378,7 +10935,28 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
       const exactState = assertCameraState(camState, 'View camera state');
       const exactMode = exactState.navigationMode;
       navigationModeOwnership.recordViewUserChoice(exactViewId, exactMode);
-      setViewCameraState(exactViewId, exactState);
+      const ownedState =
+        setViewCameraState(exactViewId, exactState);
+      if (camerasLocked || exactViewId === focusedViewId) {
+        const previousMode = navigationMode;
+        // This explicit external/session publication supersedes active
+        // interaction inertia. Internal focus/mouse persistence continues to
+        // use the store-only helper above and never cancels a release glide.
+        velocityTheta = velocityPhi =
+          velocityPanX = velocityPanY = velocityPanZ = 0;
+        vec3.set(freeflyVelocity, 0, 0, 0);
+        applyCameraStateTemporarily(ownedState);
+        if (navigationMode !== previousMode) {
+          navigationModeChangeHandler?.(
+            exactViewId,
+            navigationMode
+          );
+        }
+      }
+      publishPresentedViewStateChange(
+        'camera',
+        exactViewId
+      );
     },
 
     // Per-view navigation mode (only relevant when cameras are unlocked)
@@ -7392,6 +10970,10 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
       if (navigationMode !== previousMode) {
         navigationModeChangeHandler?.(exactViewId, navigationMode);
       }
+      publishPresentedViewStateChange(
+        'navigation',
+        exactViewId
+      );
     },
 
     setViewFocusHandler(fn) {
@@ -7473,8 +11055,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
           createCentroidSnapshotBuffer(
             id,
             snapshot.centroidPositions,
-            snapshot.centroidColors,
-            initialDimLevel
+            snapshot.centroidColors
           );
         }
 
@@ -7489,11 +11070,18 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
               id,
               nCells,
               index => (
-                snapshot.transparency[index] > 0.01 ? 255 : 0
+                snapshot.transparency[index] >=
+                  POINT_VISIBILITY_THRESHOLD ? 255 : 0
               )
             )
           ) {
             throw new Error(`Snapshot edge visibility was not published for view "${id}".`);
+          }
+          const edgePrefix = refreshEdgePrefixForView(id);
+          if (edgePrefix === null || edgePrefix.current !== true) {
+            throw new Error(
+              `Snapshot edge prefix was not published for view "${id}".`
+            );
           }
         }
 
@@ -7530,9 +11118,12 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
       }
 
       snapshotViews.push(snapshot);
+      snapshotViewsById.set(id, snapshot);
+      certifiedCameraStateOwners.add(snapshot.cameraState);
       viewDimensionLevels.set(id, initialDimLevel);
       viewPositionsCache.set(id, snapshotPositions);
       navigationModeOwnership.recordViewUserChoice(id, inheritedMode);
+      publishViewDataGeneration(id);
       nextSnapshotId += 1;
       return { id, label: snapshot.label };
     },
@@ -7569,7 +11160,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
           'Snapshot attributes must contain only current published snapshot fields.'
         );
       }
-      const snap = snapshotViews.find((entry) => entry.id === exactId);
+      const snap = snapshotViewsById.get(exactId);
       const pointCountForSnapshot = getExactViewPositions(exactId).length / 3;
       const colorsChanged = Object.hasOwn(attrs, 'colors');
       const transparencyChanged = Object.hasOwn(attrs, 'transparency');
@@ -7646,28 +11237,131 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
         ? cloneSnapshotMeta(attrs.meta)
         : snap.meta;
 
-      if (colorsChanged || transparencyChanged) {
-        hpRenderer.updateSnapshotBuffer(
+      let nextEdgeVisibility = null;
+      let previousEdgeVisibility = null;
+      if (
+        transparencyChanged &&
+        edgePositionTexturesV2.has(exactId)
+      ) {
+        const lodMembership = hpRenderer.getCurrentLodMembership(
           exactId,
-          nextColors,
-          nextTransparency,
-          getExactViewPositions(exactId),
           getPublishedDimensionLevel(exactId)
         );
-      }
-
-      if (centroidPositionsChanged) {
-        createCentroidSnapshotBuffer(
-          exactId,
-          nextCentroidPositions,
-          nextCentroidColors,
-          getPublishedDimensionLevel(exactId)
+        nextEdgeVisibility = createLodFilteredVisibilityOwner(
+          nextTransparency,
+          lodMembership
+        );
+        previousEdgeVisibility = createLodFilteredVisibilityOwner(
+          snap.transparency,
+          lodMembership
         );
       }
 
       if (transparencyChanged) {
         highlightTools.retireSpatialInteractions(exactId);
       }
+      if (colorsChanged || transparencyChanged) {
+        const publishSnapshotPointAttributes = (colors, transparency) => {
+          if (colorsChanged && transparencyChanged) {
+            hpRenderer.updateSnapshotBuffer(
+              exactId,
+              colors,
+              transparency,
+              getExactViewPositions(exactId),
+              getPublishedDimensionLevel(exactId)
+            );
+          } else if (colorsChanged) {
+            hpRenderer.updateSnapshotColors(exactId, colors);
+          } else {
+            hpRenderer.updateSnapshotAlphas(exactId, transparency);
+          }
+        };
+        let rendererPublished = false;
+        let edgeVisibilityAttempted = false;
+        try {
+          publishSnapshotPointAttributes(nextColors, nextTransparency);
+          rendererPublished = true;
+          if (nextEdgeVisibility !== null) {
+            edgeVisibilityAttempted = true;
+            if (
+              !updateVisibilityTextureV2ForView(
+                exactId,
+                pointCountForSnapshot,
+                nextEdgeVisibility
+              )
+            ) {
+              throw new Error(
+                `Snapshot edge visibility was not published for view "${exactId}".`
+              );
+            }
+            const edgePrefix =
+              refreshEdgePrefixForView(exactId);
+            if (edgePrefix === null || edgePrefix.current !== true) {
+              throw new Error(
+                `Snapshot edge prefix was not published for view "${exactId}".`
+              );
+            }
+          }
+          if (transparencyChanged) {
+            highlightTools.handleTransparencyChange(exactId);
+          }
+        } catch (publicationError) {
+          if (rendererPublished) {
+            const restorationFailures = [];
+            try {
+              publishSnapshotPointAttributes(
+                snap.colors,
+                snap.transparency
+              );
+            } catch (restorationError) {
+              restorationFailures.push(restorationError);
+            }
+            if (edgeVisibilityAttempted) {
+              try {
+                if (
+                  !updateVisibilityTextureV2ForView(
+                    exactId,
+                    pointCountForSnapshot,
+                    previousEdgeVisibility
+                  )
+                ) {
+                  throw new Error(
+                    `Snapshot edge visibility restoration failed for view "${exactId}".`
+                  );
+                }
+                const restoredEdgePrefix =
+                  refreshEdgePrefixForView(exactId);
+                if (
+                  restoredEdgePrefix === null ||
+                  restoredEdgePrefix.current !== true
+                ) {
+                  throw new Error(
+                    `Snapshot edge prefix restoration failed for view "${exactId}".`
+                  );
+                }
+              } catch (restorationError) {
+                restorationFailures.push(restorationError);
+              }
+            }
+            if (restorationFailures.length > 0) {
+              throw new AggregateError(
+                [publicationError, ...restorationFailures],
+                `Snapshot "${exactId}" point and connectivity publication failed with incomplete restoration.`
+              );
+            }
+          }
+          throw publicationError;
+        }
+      }
+
+      if (centroidPositionsChanged) {
+        createCentroidSnapshotBuffer(
+          exactId,
+          nextCentroidPositions,
+          nextCentroidColors
+        );
+      }
+
       snap.colors = nextColors;
       snap.transparency = nextTransparency;
       snap.centroidPositions = nextCentroidPositions;
@@ -7682,15 +11376,15 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
         snap.centroidCount = nextCentroidPositions.length / 3;
       }
 
+      if (colorsChanged || transparencyChanged) {
+        publishViewDataGeneration(exactId);
+      }
       if (
         transparencyChanged &&
         vectorFieldOverlay !== null &&
         vectorFieldOverlay.enabled
       ) {
         vectorFieldOverlay.markVisibilityDirty(exactId);
-      }
-      if (transparencyChanged) {
-        highlightTools.handleTransparencyChange(exactId);
       }
       return true;
     },
@@ -7734,6 +11428,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
         // detach-first, so a cleanup error must not leave the viewer claiming
         // that a no-longer-renderable snapshot still exists.
         snapshotViews.splice(idx, 1);
+        snapshotViewsById.delete(exactId);
         pendingSnapshotCleanupIds.add(exactId);
         const cleanupFailures = [];
         const cleanup = operation => {
@@ -7757,7 +11452,8 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
         overlayCtxOptionsByView.delete(exactId);
         viewDimensionLevels.delete(exactId);
         viewPositionsCache.delete(exactId);
-        publishedLodLevels.delete(exactId);
+        viewDataGenerations.delete(exactId);
+        publishedLodCertificates.delete(exactId);
         cleanup(() => vectorFieldOverlay?.disposeView?.(exactId));
         cleanup(() => navigationModeOwnership.deleteView(exactId));
         const key = exactId;
@@ -7785,6 +11481,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
         0,
         snapshotViews.length
       );
+      snapshotViewsById.clear();
       for (const snapshot of removedSnapshots) {
         pendingSnapshotCleanupIds.add(snapshot.id);
       }
@@ -7843,7 +11540,8 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
         overlayCtxOptionsByView.delete(viewId);
         viewDimensionLevels.delete(viewId);
         viewPositionsCache.delete(viewId);
-        publishedLodLevels.delete(viewId);
+        viewDataGenerations.delete(viewId);
+        publishedLodCertificates.delete(viewId);
         cleanup(() => vectorFieldOverlay?.disposeView?.(viewId));
         cleanup(() => navigationModeOwnership.deleteView(viewId));
       }
@@ -7888,6 +11586,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
         throw new TypeError('View layout mode must be exactly "single" or "grid".');
       }
       const exactActiveId = assertKnownViewId(activeId);
+      const changesLayout = mode !== viewLayoutMode;
       const changesFocus = exactActiveId !== focusedViewId;
       const nextCamera = changesFocus && !camerasLocked
         ? assertCameraState(
@@ -7918,12 +11617,19 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
         }
       }
       updateLabelLayerVisibility();
+      if (changesLayout || changesFocus) {
+        publishPresentedViewStateChange(
+          'layout',
+          focusedViewId
+        );
+      }
     },
 
     getViewLayout() { return { mode: viewLayoutMode, activeId: focusedViewId, liveViewHidden }; },
 
     setLiveViewHidden(hidden) {
       const exactHidden = assertExactBoolean(hidden, 'Live view visibility');
+      if (exactHidden === liveViewHidden) return;
       if (exactHidden) {
         if (snapshotViews.length === 0) {
           throw new Error(
@@ -7932,7 +11638,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
         }
         if (
           focusedViewId === LIVE_VIEW_ID ||
-          !snapshotViews.some((snapshot) => snapshot.id === focusedViewId)
+          !snapshotViewsById.has(focusedViewId)
         ) {
           throw new Error(
             'The live view can be hidden only while a published snapshot has focus.'
@@ -7940,6 +11646,10 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
         }
       }
       liveViewHidden = exactHidden;
+      publishPresentedViewStateChange(
+        'layout',
+        focusedViewId
+      );
     },
 
     getLiveViewHidden() {
@@ -7947,7 +11657,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
     },
 
     getGLContext() { return gl; },
-    getHPRenderer() { return hpRenderer; },
+    getHPRenderer() { return hpRendererFacade; },
     isWebGL2() { return true; },
 
     // ---------------------------------------------------------------------
@@ -8036,7 +11746,9 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
     },
 
     getRenderState() {
-      const [width, height] = canvasResizeObserver.getSize();
+      const canvasSize = canvasResizeObserver.getSize();
+      const width = canvasSize.width;
+      const height = canvasSize.height;
       updateCamera(width, height);
       mat4.multiply(mvpMatrix, projectionMatrix, viewMatrix);
       mat4.multiply(mvpMatrix, mvpMatrix, modelMatrix);
@@ -8085,7 +11797,9 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
      * @param {{ viewportWidth: number; viewportHeight: number } | null} viewport
      */
     getViewRenderState(viewId, viewport) {
-      const [canvasW, canvasH] = canvasResizeObserver.getSize();
+      const canvasSize = canvasResizeObserver.getSize();
+      const canvasW = canvasSize.width;
+      const canvasH = canvasSize.height;
       let viewportWidth;
       let viewportHeight;
       if (viewport === null) {
@@ -8172,11 +11886,219 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
       };
     },
 
+    /**
+     * Capture the exact state currently presented for one visible pane.
+     *
+     * Unlike getViewRenderState(), this derives the real framebuffer pane,
+     * sidebar-aware projection, and camera owner used by the live render loop.
+     * It is observational: the active camera and HighPerfRenderer fog scalars
+     * are never mutated.
+     *
+     * @param {string} viewId
+     * @returns {{
+     *   renderState: Object,
+     *   cameraState: Object,
+     *   dimensionLevel: number,
+     *   geometryGeneration: number,
+     *   lodMembership: Object|null,
+     *   lodSizeMultiplier: number,
+     *   certificate: Object
+     * }}
+     */
+    getPresentedViewState(viewId) {
+      const owner = captureExactViewDataOwnership(viewId);
+      const canvasSize = canvasResizeObserver.getSize();
+      const viewIds = [];
+      if (!liveViewHidden) viewIds.push(LIVE_VIEW_ID);
+      for (const snapshot of snapshotViews) {
+        viewIds.push(snapshot.id);
+      }
+      const layout = resolvePresentedViewLayout({
+        canvasHeight: canvasSize.height,
+        canvasWidth: canvasSize.width,
+        focusedViewId,
+        mode: viewLayoutMode,
+        viewId: owner.viewId,
+        viewIds
+      });
+
+      const useStoredCamera = (
+        layout.gridMultiview &&
+        !camerasLocked &&
+        owner.viewId !== focusedViewId
+      );
+      const globalCameraState = getCurrentCameraStateInternal();
+      const storedCameraState = useStoredCamera
+        ? getViewCameraState(owner.viewId)
+        : null;
+      const cameraState = selectPresentedCameraState({
+        camerasLocked,
+        focusedViewId,
+        globalCameraState,
+        gridMultiview: layout.gridMultiview,
+        storedCameraState,
+        viewId: owner.viewId
+      });
+
+      const viewMtx = mat4.create();
+      computeViewMatrixFromState(cameraState, viewMtx);
+      const projMtx = mat4.create();
+      const projectionCenterNdcX = configureInteractiveProjection(
+        projMtx,
+        layout.viewportWidth / layout.viewportHeight,
+        layout.paneLeftRatio,
+        layout.paneWidthRatio,
+        cameraState.navigationMode
+      );
+      const mvpMtx = mat4.create();
+      mat4.multiply(mvpMtx, projMtx, viewMtx);
+      mat4.multiply(mvpMtx, mvpMtx, modelMatrix);
+
+      const invView = mat4.create();
+      if (mat4.invert(invView, viewMtx) === null) {
+        throw new Error(
+          `Presented camera matrix for view "${owner.viewId}" is not invertible.`
+        );
+      }
+      const cameraPosition = [
+        invView[12],
+        invView[13],
+        invView[14]
+      ];
+      const cameraDistance =
+        cameraState.navigationMode === 'free'
+          ? Math.sqrt(
+              cameraState.freefly.position[0] ** 2 +
+              cameraState.freefly.position[1] ** 2 +
+              cameraState.freefly.position[2] ** 2
+            )
+          : cameraState.orbit.radius;
+      const fogRange = hpRenderer.getViewFogRange(
+        owner.viewId,
+        cameraPosition
+      );
+
+      // No user callback or await occurs above, but retain the same exact
+      // ownership fence as the borrowed-data path so future helper changes
+      // cannot silently create a mixed presentation snapshot.
+      assertViewDataOwnershipCurrent(
+        owner,
+        'Presented point data'
+      );
+
+      const cameraKey = JSON.stringify({
+        cameraState,
+        viewMatrix: Array.from(viewMtx)
+      });
+      const layoutKey = JSON.stringify({
+        camerasLocked,
+        focusedViewId,
+        layout,
+        projectionCenterNdcX,
+        viewportLeftOcclusionRatio,
+        viewIds
+      });
+      const renderKey = JSON.stringify({
+        background: bgColor,
+        fogColor,
+        fogDensity,
+        fov,
+        lightingStrength,
+        lightDir: Array.from(lightDir),
+        modelMatrix: Array.from(modelMatrix),
+        near,
+        far,
+        pointSize: basePointSize,
+        projectionMatrix: Array.from(projMtx),
+        shaderQuality: currentShaderQuality,
+        sizeAttenuation
+      });
+      const lodGenerationToken =
+        owner.lodMembership?.generationToken ?? null;
+      const presentedLodMembership =
+        createPresentedLodMembership(owner.lodMembership);
+      const lodGenerationId = getPresentedLodGenerationId(
+        lodGenerationToken
+      );
+      const certificate = Object.freeze({
+        cacheKey: [
+          owner.viewId,
+          owner.dataGeneration,
+          owner.dimensionLevel,
+          owner.geometryGeneration,
+          owner.lodLevel,
+          owner.lodSizeMultiplier,
+          lodGenerationId,
+          cameraKey,
+          layoutKey,
+          renderKey
+        ].join('|'),
+        cameraKey,
+        dataGeneration: owner.dataGeneration,
+        dimensionLevel: owner.dimensionLevel,
+        geometryGeneration: owner.geometryGeneration,
+        layoutKey,
+        lodGenerationId,
+        lodGenerationToken,
+        lodLevel: owner.lodLevel,
+        lodSizeMultiplier: owner.lodSizeMultiplier,
+        renderKey,
+        viewId: owner.viewId
+      });
+      const renderState = {
+        bgColor: new Float32Array(bgColor),
+        cameraDistance,
+        cameraPosition,
+        canvasHeight: layout.canvasHeight,
+        canvasWidth: layout.canvasWidth,
+        far,
+        fogColor: new Float32Array(fogColor),
+        fogDensity,
+        fogFar: fogRange.fogFar,
+        fogNear: fogRange.fogNear,
+        fov,
+        lightingStrength,
+        lightDir: new Float32Array(lightDir),
+        modelMatrix: new Float32Array(modelMatrix),
+        mvpMatrix: new Float32Array(mvpMtx),
+        near,
+        paneLeftRatio: layout.paneLeftRatio,
+        paneWidthRatio: layout.paneWidthRatio,
+        pointSize: basePointSize,
+        projectionCenterNdcX,
+        projectionMatrix: new Float32Array(projMtx),
+        scissorEnabled: layout.scissorEnabled,
+        shaderQuality: currentShaderQuality,
+        sizeAttenuation,
+        viewId: owner.viewId,
+        viewMatrix: new Float32Array(viewMtx),
+        viewportHeight: layout.viewportHeight,
+        viewportWidth: layout.viewportWidth,
+        viewportX: layout.viewportX,
+        viewportY: layout.viewportY
+      };
+
+      return Object.freeze({
+        renderState,
+        cameraState,
+        dimensionLevel: owner.dimensionLevel,
+        geometryGeneration: owner.geometryGeneration,
+        lodMembership: presentedLodMembership,
+        lodSizeMultiplier: owner.lodSizeMultiplier,
+        certificate
+      });
+    },
+
     // HP renderer controls
     setShaderQuality(quality) {
+      if (quality === currentShaderQuality) return;
       hpRenderer.setQuality(quality);
       highlightTools.setQuality(quality);
       currentShaderQuality = quality;
+      publishPresentedViewStateChange(
+        'style',
+        focusedViewId
+      );
     },
     setFrustumCulling(enabled) {
       hpRenderer.setFrustumCulling(
@@ -8201,10 +12123,9 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
     },
     debugRendererStatus() { return hpRenderer.debugStatus(); },
 
-    // LOD visibility for edge filtering and highlight rendering
-    // These now support per-view LOD tracking in multiview mode
-    getLodVisibilityArray(viewId, dimensionLevel) {
-      return hpRenderer.getLodVisibilityArray(
+    // Compact shared LOD membership for filtering/highlight/export consumers.
+    getCurrentLodMembership(viewId, dimensionLevel) {
+      return hpRenderer.getCurrentLodMembership(
         assertKnownViewId(viewId),
         dimensionLevel
       );
@@ -8222,10 +12143,12 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
         LIVE_VIEW_ID,
         ...snapshotViews.map((snapshot) => snapshot.id)
       ]) {
-        publishedLodLevels.set(
-          viewId,
-          hpRenderer.getCurrentLODLevel(viewId)
-        );
+        if (
+          !viewPositionsCache.has(viewId) ||
+          publishedLodCertificates.has(viewId)
+        ) continue;
+        const certificate = createLodPublicationCertificate(viewId);
+        publishedLodCertificates.set(viewId, certificate);
       }
       let subscribed = true;
       return () => {
@@ -8234,21 +12157,29 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
         lodChangeListeners.delete(exactListener);
       };
     },
-    // Combined LOD + alpha visibility (preferred for consumers that need filter-aware visibility)
-    getCombinedVisibilityForView(viewId, alphaThreshold, dimensionLevel) {
-      return hpRenderer.getCombinedVisibilityForView(
-        assertKnownViewId(viewId),
-        alphaThreshold,
-        dimensionLevel
+    onPresentedViewStateChanged(listener) {
+      const exactListener = assertExactFunction(
+        listener,
+        'Presented-state change listener'
       );
+      presentedViewStateListeners.add(exactListener);
+      // The next frame establishes a scalar baseline. No initial event is
+      // emitted because subscribers already build their initial state.
+      presentedFrameState.initialized = false;
+      presentedFrameState.pending = false;
+      let subscribed = true;
+      return () => {
+        if (!subscribed) return;
+        subscribed = false;
+        presentedViewStateListeners.delete(exactListener);
+        if (presentedViewStateListeners.size === 0) {
+          presentedFrameState.initialized = false;
+          presentedFrameState.pending = false;
+        }
+      };
     },
-
     start() {
-      if (disposed) return;
-      if (webglContextLost) {
-        showWebglContextOverlay('WebGL context lost. Reload required to continue.');
-        return;
-      }
+      if (disposed || webglContextLost) return;
       if (renderPaused) return;
       if (animationHandle === null) {
         animationHandle = requestAnimationFrame(render);
@@ -8273,12 +12204,8 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
      * Resume after `pause()`.
      */
     resume() {
-      if (disposed) return;
+      if (disposed || webglContextLost) return;
       renderPaused = false;
-      if (webglContextLost) {
-        showWebglContextOverlay('WebGL context lost. Reload required to continue.');
-        return;
-      }
       if (animationHandle === null) {
         animationHandle = requestAnimationFrame(render);
       }
@@ -8302,6 +12229,13 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
      */
 	    dispose() {
 	      if (disposalSettled) return;
+	      if (contextLossTransitioning) {
+	        disposalRequestedDuringContextLoss = true;
+	        return;
+	      }
+	      if (disposalInProgress) return;
+	      disposalInProgress = true;
+	      try {
 	      const failures = [];
 	      const normalizeFailure = (error, owner) => (
 	        error instanceof Error
@@ -8345,136 +12279,57 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
 	        );
 	      });
 	      attempt('pointer-lock retirement', () => {
-	        pointerLockRequestGeneration += 1;
-	        pointerLockRequestPending = false;
-	        pointerLockActive = false;
-	        pointerLockEnabled = false;
-	        lookActive = false;
-	        pendingShot = false;
-	        pendingShotViewportInfo = null;
-	        const pointerFailures = [];
-	        for (const operation of [
-	          () => projectileSystem.cancelCharging(),
-	          () => canvas.classList.remove('dragging', 'free-nav', 'planar-nav'),
-	          () => {
-	            canvas.style.cursor = '';
-	          },
-	          () => {
-	            if (
-	              document.pointerLockElement === canvas &&
-	              typeof document.exitPointerLock === 'function'
-	            ) {
-	              const result = document.exitPointerLock();
-	              if (result?.catch) {
-	                result.catch((error) => {
-	                  try {
-	                    console.error(
-	                      '[Viewer] Pointer-lock exit failed during disposal.',
-	                      error
-	                    );
-	                  } catch {
-	                    // Terminal state is already fenced.
-	                  }
-	                });
-	              }
-	            }
-	          },
-	          () => {
-	            const handler = pointerLockChangeHandler;
-	            pointerLockChangeHandler = null;
-	            handler?.(false, null);
-	          },
-	        ]) {
-	          try {
-	            operation();
-	          } catch (error) {
-	            pointerFailures.push(error);
-	          }
-	        }
-	        if (pointerFailures.length > 0) {
-	          throw new AggregateError(
-	            pointerFailures,
-	            'Pointer-lock retirement was incomplete.'
-	          );
-	        }
+	        retirePointerLockLifecycle(null);
 	      });
 	      attempt('projectile activity fence', () => {
 	        projectileSystem.setEnabled(false);
 	      });
 	      attempt('event listener retirement', () => {
-	        const callbacks = eventCleanupFns.splice(
-	          0,
-	          eventCleanupFns.length
+	        retireCleanupCallbacks(
+	          eventCleanupFns,
+	          'Viewer event-listener'
 	        );
-	        const failedCallbacks = [];
-	        const listenerFailures = [];
-	        for (const cleanup of callbacks) {
-	          try {
-	            cleanup();
-	          } catch (error) {
-	            failedCallbacks.push(cleanup);
-	            listenerFailures.push(error);
-	          }
-	        }
-	        eventCleanupFns.push(...failedCallbacks);
-	        if (listenerFailures.length > 0) {
-	          throw new AggregateError(
-	            listenerFailures,
-	            'Viewer event-listener retirement was incomplete.'
-	          );
-	        }
 	      });
 	      attempt('resize observer retirement', () => {
 	        canvasResizeObserver.disconnect();
 	      });
 	      attempt('context overlay retirement', () => {
-	        if (webglContextOverlay?.parentNode) {
-	          webglContextOverlay.parentNode.removeChild(
-	            webglContextOverlay
+	        const overlayFailures = [];
+	        try {
+	          retireCleanupCallbacks(
+	            webglContextOverlayCleanupFns,
+	            'Viewer WebGL context-overlay listener'
+	          );
+	        } catch (error) {
+	          overlayFailures.push(error);
+	        }
+	        const ownedOverlay = webglContextOverlay;
+	        if (ownedOverlay?.parentNode) {
+	          try {
+	            ownedOverlay.parentNode.removeChild(ownedOverlay);
+	          } catch (error) {
+	            if (ownedOverlay.parentNode !== null) {
+	              overlayFailures.push(error);
+	            }
+	          }
+	        }
+	        if (!ownedOverlay || ownedOverlay.parentNode === null) {
+	          webglContextOverlay = null;
+	          webglContextOverlayMessage = null;
+	          webglContextOverlayAction = null;
+	        }
+	        if (overlayFailures.length > 0) {
+	          throw new AggregateError(
+	            overlayFailures,
+	            'Viewer WebGL context overlay retirement was incomplete.'
 	          );
 	        }
-	        webglContextOverlay = null;
-	        webglContextOverlayMessage = null;
 	      });
 	      attempt('view-title retirement', () => {
-	        const failedEntries = [];
-	        const titleFailures = [];
-	        for (const entry of viewTitleEntries) {
-	          try {
-	            entry.el?.remove();
-	          } catch (error) {
-	            failedEntries.push(entry);
-	            titleFailures.push(error);
-	          }
-	        }
-	        viewTitleEntries = failedEntries;
-	        lastTitleKey = '';
-	        if (titleFailures.length > 0) {
-	          throw new AggregateError(
-	            titleFailures,
-	            'Viewer title-chip retirement was incomplete.'
-	          );
-	        }
+	        retireViewTitleOwners();
 	      });
 	      attempt('centroid-label retirement', () => {
-	        const labelFailures = [];
-	        const ownedViewIds = new Set([
-	          ...viewCentroidLabels.keys(),
-	          ...pendingCentroidLabelRetirements.keys(),
-	        ]);
-	        for (const viewId of ownedViewIds) {
-	          try {
-	            removeLabelsForView(viewId);
-	          } catch (error) {
-	            labelFailures.push(error);
-	          }
-	        }
-	        if (labelFailures.length > 0) {
-	          throw new AggregateError(
-	            labelFailures,
-	            'Viewer centroid-label retirement was incomplete.'
-	          );
-	        }
+	        retireCentroidLabelOwners();
 	      });
 	      attempt('overlay manager retirement', () => {
 	        if (overlayManager !== null) {
@@ -8522,7 +12377,7 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
 	        clearEdgeResourcesV2();
 	      });
 	      attempt('high-performance renderer retirement', () => {
-	        hpRenderer.dispose();
+	        disposeHpRenderer();
 	      });
 	      attempt('highlight tools retirement', () => {
 	        highlightTools?.dispose?.();
@@ -8532,15 +12387,33 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
 	        smokeRenderer.dispose();
 	      });
 
-	      for (const [key, program] of [
-	        ['line program', lineInstancedProgram],
-	        ['grid program', gridProgram],
-	        ['centroid program', centroidProgram],
-	      ]) {
-	        attempt(key, () => {
-	          if (program) gl.deleteProgram(program);
-	        });
-	      }
+	      attempt('line program', () => {
+	        if (!webglContextLost && lineInstancedProgram) {
+	          gl.deleteProgram(lineInstancedProgram);
+	        }
+	        lineInstancedProgram = null;
+	        for (const key of Object.keys(lineInstancedUniformLocations)) {
+	          lineInstancedUniformLocations[key] = null;
+	        }
+	      });
+	      attempt('grid program', () => {
+	        if (!webglContextLost && gridProgram) {
+	          gl.deleteProgram(gridProgram);
+	        }
+	        gridProgram = null;
+	        for (const key of Object.keys(gridUniformLocations)) {
+	          gridUniformLocations[key] = null;
+	        }
+	      });
+	      attempt('centroid program', () => {
+	        if (!webglContextLost && centroidProgram) {
+	          gl.deleteProgram(centroidProgram);
+	        }
+	        centroidProgram = null;
+	        for (const key of Object.keys(centroidUniformLocations)) {
+	          centroidUniformLocations[key] = null;
+	        }
+	      });
 	      attempt('centroid position buffer', () => {
 	        if (centroidPositionBuffer) {
 	          gl.deleteBuffer(centroidPositionBuffer);
@@ -8554,38 +12427,13 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
 	        }
 	      });
 	      attempt('edge quad buffer', () => {
-	        if (edgeQuadBuffer) gl.deleteBuffer(edgeQuadBuffer);
+	        if (!webglContextLost && edgeQuadBuffer) {
+	          gl.deleteBuffer(edgeQuadBuffer);
+	        }
+	        edgeQuadBuffer = null;
 	      });
 	      attempt('viewer cache retirement', () => {
-	        cachedViewMatrices.clear();
-	        renderParamsByView.clear();
-	        overlayCtxByView.clear();
-	        overlayCtxOptionsByView.clear();
-	        viewDimensionLevels.clear();
-	        viewPositionsCache.clear();
-	        viewCentroidFlags.clear();
-	        viewCentroidLabels.clear();
-	        publishedLodLevels.clear();
-	        lodChangeListeners.clear();
-	        cachedGridProjections.clear();
-	        activeKeys.clear();
-	        _renderAllViews.length = 0;
-	        _renderVelocityViewIds.length = 0;
-	        snapshotViews.length = 0;
-	        positionsArray = null;
-	        colorsArray = null;
-	        transparencyArray = null;
-	        pointCount = 0;
-	        centroidCount = 0;
-	        navigationModeOwnership.clear();
-	        viewFocusHandler = null;
-	        navigationModeChangeHandler = null;
-	        smokeRenderFailureHandler = null;
-	        velocityRenderFailureHandler = null;
-	        if (labelLayer) labelLayer.style.display = 'none';
-	        if (viewTitleLayerEl) {
-	          viewTitleLayerEl.style.display = 'none';
-	        }
+	        retireViewerCpuCaches();
 	      });
 
 	      if (failures.length > 0) {
@@ -8595,21 +12443,32 @@ export function createViewer({ canvas, labelLayer, viewTitleLayer, onViewFocus }
 	        );
 	      }
 	      pendingSnapshotCleanupIds.clear();
+	      retireCleanupCallbacks(
+	        contextEventCleanupFns,
+	        'Viewer WebGL context-listener'
+	      );
 	      disposalSettled = true;
-    }
+	      } finally {
+	        disposalInProgress = false;
+	      }
+	    }
   };
 
   // Disposal is a terminal lifecycle boundary. Keep only the explicit
   // diagnostics, retryable disposal, and inert loop controls callable after
-  // the first disposal attempt. Guarding the returned methods here prevents a
-  // stale callback from reaching any GPU/DOM owner, including owners whose
-  // first retirement attempt failed. The wrapper identities are created once
-  // and remain stable for the lifetime of this API object.
+  // either terminal transition. Guarding the returned methods here prevents
+  // a stale callback from reaching any CPU/GPU/DOM owner, including owners
+  // whose first retirement attempt failed. Wrapper identities remain stable.
   for (const [methodName, method] of Object.entries(publicApi)) {
     if (TERMINAL_SAFE_VIEWER_METHODS.has(methodName)) continue;
     publicApi[methodName] = function guardedViewerMethod(...args) {
       if (disposed) {
         throw createViewerDisposedError(methodName);
+      }
+      if (webglContextLost) {
+        throw createViewerContextLostError(
+          `Viewer method "${methodName}"`
+        );
       }
       return Reflect.apply(method, publicApi, args);
     };

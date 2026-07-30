@@ -477,6 +477,9 @@ function createGpuFixture() {
       _alphaTexture: null,
       _colors: colors,
       _dirtyLodDimensions: new Set(),
+      _dummyLodIndexTexture: gl.createTexture(),
+      _dummyLodIndexTextureByteLength:
+        Uint32Array.BYTES_PER_ELEMENT,
       _lodArrayBuffers: null,
       _lodIndexTexturesByDimension: new Map(),
       _pendingDataRetirements: new Set(),
@@ -515,6 +518,21 @@ function createGpuFixture() {
     positions,
     renderer,
     spatialIndex,
+  };
+}
+
+function createSnapshotDrawFixture(gl, pointCount) {
+  const alphaTexData = new Uint8Array(pointCount);
+  alphaTexData.fill(255);
+  return {
+    alphaTexData,
+    alphaTexHeight: 1,
+    alphaTexWidth: pointCount,
+    alphaTexture: gl.createTexture(),
+    alphaTextureByteLength: alphaTexData.byteLength,
+    id: 'snapshot-draw-fixture',
+    pointCount,
+    vao: gl.createVertexArray(),
   };
 }
 
@@ -579,7 +597,10 @@ test('same-level multiview refreshes a replaced borrowed EBO without upload', ()
   const firstBorrowedEbo = firstMetadata[0].originalIndexBuffer;
   const first = createViewState(fixture.gl);
   const second = createViewState(fixture.gl);
-  const snapshot = { vao: fixture.gl.createVertexArray() };
+  const snapshot = createSnapshotDrawFixture(
+    fixture.gl,
+    fixture.renderer.pointCount,
+  );
 
   fixture.renderer._renderSnapshotWithLOD(
     snapshot,
@@ -659,7 +680,10 @@ test('same-level custom snapshot replaces a borrowed EBO with a per-view upload'
     fixture.colors,
   );
   const viewState = createViewState(fixture.gl);
-  const snapshot = { vao: fixture.gl.createVertexArray() };
+  const snapshot = createSnapshotDrawFixture(
+    fixture.gl,
+    fixture.renderer.pointCount,
+  );
 
   fixture.renderer._renderSnapshotWithLOD(
     snapshot,

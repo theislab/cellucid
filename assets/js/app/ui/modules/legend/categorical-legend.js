@@ -35,6 +35,7 @@ const REQUIRED_STATE_METHODS = [
   'getLegendModel',
   'hideAllCategories',
   'mergeCategoriesToNewField',
+  'on',
   'removeHighlightGroup',
   'renameCategory',
   'rgbToCss',
@@ -499,6 +500,82 @@ export function initCategoricalLegend(options) {
   // Guard to prevent re-entry during render
   let isRendering = false;
 
+  const syncCategoryHighlightButton = (
+    highlightBtn,
+    catIdx,
+    hasCells
+  ) => {
+    if (!(highlightBtn instanceof view.HTMLButtonElement)) {
+      throw new TypeError(
+        'Category highlight state requires its exact button'
+      );
+    }
+    requireExactIndex(catIdx, 'Category highlight index');
+    if (typeof hasCells !== 'boolean') {
+      throw new TypeError('Category highlight availability must be boolean');
+    }
+    const fieldIndex = state.activeFieldSource === FieldSource.OBS
+      ? state.activeFieldIndex
+      : -1;
+    requireExactIndex(fieldIndex, 'Active observation field index');
+    const group = state.findHighlightGroupByCategory(
+      fieldIndex,
+      catIdx,
+      'obs'
+    );
+    if (
+      group !== null
+      && (
+        typeof group !== 'object'
+        || typeof group.id !== 'string'
+        || group.id.length === 0
+      )
+    ) {
+      throw new TypeError(
+        'Category highlight lookup returned an invalid group'
+      );
+    }
+    const active = group !== null;
+    highlightBtn.classList.toggle(
+      'legend-highlight-btn--active',
+      active
+    );
+    highlightBtn.setAttribute('aria-pressed', String(active));
+    highlightBtn.disabled = !hasCells && !active;
+    highlightBtn.title = active
+      ? 'Remove highlight from this category'
+      : hasCells
+        ? 'Highlight all cells in this category'
+        : 'No cells available to highlight in this category';
+  };
+
+  const syncCategoryHighlightButtons = () => {
+    if (isRendering) return;
+    if (destroyed) {
+      throw new Error(
+        'Categorical legend received a highlight event after destruction'
+      );
+    }
+    const field = state.getActiveField();
+    if (field === null || field.kind !== FieldKind.CATEGORY) return;
+    const rows = legendEl.querySelectorAll(
+      '.legend-item[data-cat-index]'
+    );
+    rows.forEach((row) => {
+      const highlightBtn = row.querySelector('.legend-highlight-btn');
+      if (highlightBtn === null) return;
+      const catIdx = parseExactIndex(
+        row.dataset.catIndex,
+        'Legend row category index'
+      );
+      syncCategoryHighlightButton(
+        highlightBtn,
+        catIdx,
+        !row.classList.contains('legend-item-disabled')
+      );
+    });
+  };
+
   const rerenderIfActiveCategory = () => {
     if (isRendering) return;
     if (destroyed) {
@@ -512,6 +589,7 @@ export function initCategoricalLegend(options) {
 
   let unsubscribeAnnotation = null;
   let unsubscribeAccess = null;
+  let unsubscribeHighlight = null;
   try {
     // Keep legend UI in sync when voting mode is toggled or votes change.
     unsubscribeAnnotation = annotationSession.on('changed', () => {
@@ -529,6 +607,16 @@ export function initCategoricalLegend(options) {
     if (typeof unsubscribeAnnotation !== 'function') {
       throw new TypeError(
         'Annotation subscription must return an unsubscribe function'
+      );
+    }
+
+    unsubscribeHighlight = state.on(
+      'highlight:changed',
+      syncCategoryHighlightButtons
+    );
+    if (typeof unsubscribeHighlight !== 'function') {
+      throw new TypeError(
+        'Highlight subscription must return an unsubscribe function'
       );
     }
 
@@ -553,7 +641,11 @@ export function initCategoricalLegend(options) {
             'Categorical legend initialization failed with a non-Error value'
           )
     ];
-    for (const unsubscribe of [unsubscribeAccess, unsubscribeAnnotation]) {
+    for (const unsubscribe of [
+      unsubscribeAccess,
+      unsubscribeHighlight,
+      unsubscribeAnnotation
+    ]) {
       if (typeof unsubscribe !== 'function') continue;
       try {
         unsubscribe();
@@ -590,6 +682,7 @@ export function initCategoricalLegend(options) {
     const visibleList = counts.visible;
     const availableList = counts.available;
     const rows = legendEl.querySelectorAll('.legend-item[data-cat-index]');
+    let annotationAvailabilityChanged = false;
     rows.forEach((row) => {
       const idx = parseExactIndex(
         row.dataset.catIndex,
@@ -604,6 +697,12 @@ export function initCategoricalLegend(options) {
       const available = availableList[idx];
       formatCategoryCount(visible, available);
       const hasCells = available > 0;
+      if (
+        row.classList.contains('legend-item-annotating')
+        && row.classList.contains('legend-item-disabled') === hasCells
+      ) {
+        annotationAvailabilityChanged = true;
+      }
       row.classList.toggle('legend-item-disabled', !hasCells);
       row.title = hasCells ? '' : 'No cells available in this category after other filters';
       const checkbox = row.querySelector('.legend-checkbox');
@@ -622,6 +721,10 @@ export function initCategoricalLegend(options) {
       }
       countSpan.textContent = formatCategoryCount(visible, available);
     });
+    if (annotationAvailabilityChanged) {
+      renderCategoricalLegend(activeField, model);
+      return;
+    }
   }
 
   function renderCategoricalLegend(field, model) {
@@ -764,6 +867,7 @@ export function initCategoricalLegend(options) {
       const checkbox = ownerDocument.createElement('input');
       checkbox.type = 'checkbox';
       checkbox.className = 'legend-checkbox';
+      checkbox.setAttribute('aria-label', `Show category ${cat}`);
       checkbox.checked = isVisible;
       checkbox.disabled = !hasCells;
       checkbox.addEventListener('change', (e) => {
@@ -783,6 +887,7 @@ export function initCategoricalLegend(options) {
       const colorInput = ownerDocument.createElement('input');
       colorInput.type = 'color';
       colorInput.className = 'legend-color-input';
+      colorInput.setAttribute('aria-label', `Color for category ${cat}`);
       colorInput.disabled = !hasCells;
 
       const updateColorUI = () => {
@@ -835,26 +940,9 @@ export function initCategoricalLegend(options) {
         highlightBtn.type = 'button';
         highlightBtn.className = 'legend-highlight-btn';
         highlightBtn.textContent = '◉';
+        highlightBtn.setAttribute('aria-label', `Highlight category ${cat}`);
 
-        const syncHighlightBtn = () => {
-          const fIdx = state.activeFieldSource === FieldSource.OBS ? state.activeFieldIndex : -1;
-          requireExactIndex(fIdx, 'Active observation field index');
-          const group = state.findHighlightGroupByCategory(fIdx, catIdx, 'obs');
-          if (
-            group !== null
-            && (
-              typeof group !== 'object'
-              || typeof group.id !== 'string'
-              || group.id.length === 0
-            )
-          ) {
-            throw new TypeError('Category highlight lookup returned an invalid group');
-          }
-          const active = group !== null;
-          highlightBtn.classList.toggle('legend-highlight-btn--active', active);
-          highlightBtn.title = active ? 'Remove highlight from this category' : 'Highlight all cells in this category';
-        };
-        syncHighlightBtn();
+        syncCategoryHighlightButton(highlightBtn, catIdx, hasCells);
 
         highlightBtn.addEventListener('click', (e) => {
           e.stopPropagation();
@@ -891,7 +979,6 @@ export function initCategoricalLegend(options) {
               throw new Error('Category highlight was not created');
             }
           }
-          syncHighlightBtn();
         });
 
         const right = ownerDocument.createElement('span');
@@ -904,16 +991,24 @@ export function initCategoricalLegend(options) {
       }
       if (isRenamed) {
         labelSpan.classList.add('is-renamed');
-        labelSpan.title = `Original: ${originalLabel}`;
+        labelSpan.title = annotating
+          ? `Original: ${originalLabel} • ${
+              hasCells
+                ? 'Voting mode enabled: click to vote (labels are locked).'
+                : 'Voting unavailable because no cells are currently available.'
+            }`
+          : `Original: ${originalLabel}`;
       } else {
         labelSpan.title = annotating
-          ? 'Voting mode enabled: click to vote (labels are locked).'
+          ? hasCells
+            ? 'Voting mode enabled: click to vote (labels are locked).'
+            : 'Voting unavailable because no cells are currently available.'
           : 'Double-click to rename • Drag onto another category to merge';
       }
 
       labelSpan.draggable = !annotating;
-      labelSpan.classList.add('legend-label-draggable');
       if (!annotating) {
+        labelSpan.classList.add('legend-label-draggable');
         labelSpan.addEventListener('dragstart', (e) => {
           row.classList.add('legend-item-dragging');
           if (e.dataTransfer === null) {
@@ -929,10 +1024,64 @@ export function initCategoricalLegend(options) {
             .forEach((el) => el.classList.remove('legend-item-drag-over'));
         });
       } else if (hasCells) {
+        labelSpan.classList.add('legend-label-voting');
+        labelMain.classList.add('legend-vote-trigger');
+        labelMain.setAttribute('role', 'button');
+        labelMain.setAttribute('tabindex', '0');
+        labelMain.setAttribute('aria-label', `Vote on category ${cat}`);
+        const datasetGeneration = readDatasetGeneration();
+        const categoryValue = categories[catIdx];
+        const resolveVoteTrigger = () => {
+          if (
+            destroyed
+            || readDatasetGeneration() !== datasetGeneration
+            || state.activeFieldSource !== FieldSource.OBS
+            || !Number.isSafeInteger(state.activeFieldIndex)
+            || state.activeFieldIndex < 0
+          ) {
+            return null;
+          }
+          const fields = state.getFields();
+          if (!Array.isArray(fields)) {
+            throw new TypeError(
+              'Categorical legend state fields must be an array'
+            );
+          }
+          const currentField = fields[state.activeFieldIndex];
+          if (
+            currentField !== field
+            || !Array.isArray(currentField.categories)
+            || !Object.is(currentField.categories[catIdx], categoryValue)
+          ) {
+            return null;
+          }
+          const currentRow = legendEl.querySelector(
+            `.legend-item[data-cat-index="${catIdx}"]`
+          );
+          const trigger = currentRow?.querySelector('.legend-vote-trigger');
+          return trigger instanceof view.HTMLElement && trigger.isConnected
+            ? trigger
+            : null;
+        };
+        const openVoting = () => {
+          if (!isCommunityAnnotationUiEnabled()) return;
+          openCommunityAnnotationVotingModal({
+            state,
+            defaultFieldKey: fieldKey,
+            defaultCatIdx: catIdx,
+            returnFocusTo: labelMain,
+            returnFocusResolver: resolveVoteTrigger
+          });
+        };
         labelSpan.addEventListener('click', (e) => {
           e.stopPropagation();
-          if (!isCommunityAnnotationUiEnabled()) return;
-          openCommunityAnnotationVotingModal({ state, defaultFieldKey: fieldKey, defaultCatIdx: catIdx });
+          openVoting();
+        });
+        labelMain.addEventListener('keydown', (e) => {
+          if (e.key !== 'Enter' && e.key !== ' ') return;
+          e.preventDefault();
+          e.stopPropagation();
+          openVoting();
         });
       }
 
@@ -1223,6 +1372,7 @@ export function initCategoricalLegend(options) {
         closeTransientInteractions,
         () => lifecycle.abort(),
         unsubscribeAccess,
+        unsubscribeHighlight,
         unsubscribeAnnotation
       ]) {
         try {

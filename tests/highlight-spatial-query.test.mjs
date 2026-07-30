@@ -11,6 +11,9 @@ import {
 import {
   findRaySamplePick,
 } from '../assets/js/rendering/picking.js';
+import {
+  POINT_VISIBILITY_THRESHOLD,
+} from '../assets/js/rendering/alpha-visibility.js';
 
 function identityMatrix() {
   const matrix = new Float32Array(16);
@@ -346,8 +349,8 @@ test('lasso and proximity use the float32 shader visibility boundary', () => {
   ]);
   const transparency = Float32Array.from([
     0,
-    0.01,
-    0.009,
+    POINT_VISIBILITY_THRESHOLD,
+    Math.fround(2.49 / 255),
   ]);
   const spatialIndex = makeSpatialIndex(positions, 3, 1);
 

@@ -87,6 +87,21 @@ test('the page CSP permits only the WebAssembly evaluation needed by h5wasm', ()
   );
 });
 
+test('the page CSP permits local HTTP and WebSocket development transports', () => {
+  const connectSources =
+    contentSecurityPolicyDirectives(indexHtml).get('connect-src');
+
+  assert.ok(connectSources, 'CSP must define connect-src');
+  assert.ok(
+    connectSources.includes('http:'),
+    'connect-src must permit local and IPv6 HTTP data/Worker endpoints'
+  );
+  assert.ok(
+    connectSources.includes('ws:'),
+    'connect-src must permit local and IPv6 WebSocket development traffic'
+  );
+});
+
 test('h5wasm NumPy-style dtype codes map to Cellucid observation kinds', () => {
   const classify = h5adModule.classifyH5WasmDtype;
   assert.equal(typeof classify, 'function');
@@ -868,6 +883,49 @@ test('custom protocol resolution requires one registered exact resolver', async 
     );
     assert.equal(calls, 1);
   });
+});
+
+test('custom protocol registry preserves every prototype-named protocol as an exact own handler', () => {
+  const manager = createDataSourceManager();
+  const prototypeNames = Object.getOwnPropertyNames(Object.prototype);
+  const prototypeDescriptors = Object.getOwnPropertyDescriptors(
+    Object.prototype,
+  );
+
+  for (const [index, protocol] of prototypeNames.entries()) {
+    manager.registerProtocol(protocol, `prototype-source-${index}`);
+  }
+
+  const handlers = manager.getProtocolHandlers();
+  assert.equal(Object.getPrototypeOf(handlers), Object.prototype);
+  for (const [index, protocol] of prototypeNames.entries()) {
+    const sourceType = `prototype-source-${index}`;
+    assert.equal(Object.hasOwn(handlers, protocol), true, protocol);
+    assert.deepEqual(
+      Object.getOwnPropertyDescriptor(handlers, protocol),
+      {
+        configurable: true,
+        enumerable: true,
+        value: sourceType,
+        writable: true,
+      },
+      protocol,
+    );
+    assert.equal(
+      manager.isCustomProtocolUrl(`${protocol}/dataset`),
+      true,
+      protocol,
+    );
+    assert.equal(
+      manager.getSourceTypeForUrl(`${protocol}/dataset`),
+      sourceType,
+      protocol,
+    );
+  }
+  assert.deepEqual(
+    Object.getOwnPropertyDescriptors(Object.prototype),
+    prototypeDescriptors,
+  );
 });
 
 test('field loaders reject incomplete scientific codec metadata before fetching', async t => {

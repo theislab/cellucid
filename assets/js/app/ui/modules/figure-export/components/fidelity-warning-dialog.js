@@ -19,14 +19,32 @@ import { showFigureExportModal } from './modal.js';
  * @param {object} options
  * @param {ExportFidelityWarning[]} options.warnings
  * @param {string} [options.heading]
+ * @param {AbortSignal|null} [options.signal]
  * @returns {Promise<boolean>} True only when there are no fidelity blockers
  */
-export function confirmExportFidelityWarnings({ warnings, heading = 'Export blocked' }) {
+export function confirmExportFidelityWarnings({
+  warnings,
+  heading = 'Export blocked',
+  signal = null,
+}) {
   if (!Array.isArray(warnings)) {
     throw new TypeError('Figure export fidelity warnings must be an array.');
   }
   if (typeof heading !== 'string' || heading.trim().length === 0) {
     throw new TypeError('Figure export fidelity heading must be a non-empty string.');
+  }
+  if (
+    signal !== null &&
+    (
+      typeof signal !== 'object' ||
+      typeof signal.aborted !== 'boolean' ||
+      typeof signal.addEventListener !== 'function' ||
+      typeof signal.removeEventListener !== 'function'
+    )
+  ) {
+    throw new TypeError(
+      'Figure export fidelity signal must be null or an AbortSignal.'
+    );
   }
   warnings.forEach((warning, index) => {
     if (
@@ -45,13 +63,23 @@ export function confirmExportFidelityWarnings({ warnings, heading = 'Export bloc
       );
     }
   });
+  if (signal?.aborted) return Promise.resolve(false);
   if (warnings.length === 0) return Promise.resolve(true);
 
   return new Promise((resolve) => {
     let settled = false;
+    let closeModal = null;
+    const onAbort = () => {
+      if (closeModal === null) {
+        settleBlocked();
+        return;
+      }
+      closeModal();
+    };
     const settleBlocked = () => {
       if (settled) return;
       settled = true;
+      signal?.removeEventListener('abort', onAbort);
       resolve(false);
     };
 
@@ -83,6 +111,12 @@ export function confirmExportFidelityWarnings({ warnings, heading = 'Export bloc
       content: body,
       onClose: settleBlocked
     });
+    closeModal = close;
+    signal?.addEventListener('abort', onAbort, { once: true });
+    if (signal?.aborted) {
+      close();
+      return;
+    }
 
     const [backBtn] = actions.querySelectorAll('button');
     backBtn.addEventListener('click', () => {

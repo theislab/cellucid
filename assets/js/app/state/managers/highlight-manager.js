@@ -9,6 +9,10 @@
 import { BaseManager } from '../core/base-manager.js';
 import { getPageColor } from '../../utils/page-colors.js';
 import { highlightAccessorMethods } from './highlight-accessors.js';
+import {
+  MIN_VISIBLE_ALPHA_BYTE,
+  POINT_VISIBILITY_THRESHOLD,
+} from '../../../rendering/alpha-visibility.js';
 
 function requireFieldSource(source) {
   if (source !== 'obs' && source !== 'var') {
@@ -445,6 +449,7 @@ export const highlightStateMethods = {
       }
     }
 
+    this._highlightedCellIndices = allHighlightedIndices;
     this._pushHighlightToViewer(allHighlightedIndices);
   },
 
@@ -482,7 +487,7 @@ export const highlightStateMethods = {
     for (let i = 0; i < codes.length; i++) {
       if (codes[i] === categoryIndex) {
         // Only include cells that are currently visible (not filtered out in the target view)
-        if (transparency[i] > 0) {
+        if (transparency[i] >= POINT_VISIBILITY_THRESHOLD) {
           indices.push(i);
         }
       }
@@ -528,7 +533,7 @@ export const highlightStateMethods = {
       const v = values[i];
       if (v !== null && !Number.isNaN(v) && v >= minVal && v <= maxVal) {
         // Only include cells that are currently visible (not filtered out in the target view)
-        if (transparency[i] > 0) {
+        if (transparency[i] >= POINT_VISIBILITY_THRESHOLD) {
           indices.push(i);
         }
       }
@@ -575,6 +580,8 @@ export const highlightStateMethods = {
         allHighlightedIndices.push(idx);
       }
     }
+    this._highlightedCellIndices = allHighlightedIndices;
+    this._invalidateHighlightCountCache();
     this._pushHighlightToViewer(allHighlightedIndices);
   },
 
@@ -810,31 +817,55 @@ export const highlightStateMethods = {
   getHighlightedCellCount() {
     // Returns count of highlighted cells that are currently visible (cached)
     if (!this.highlightArray) return 0;
+    let highlightedIndices = this._highlightedCellIndices;
+    if (!Array.isArray(highlightedIndices)) {
+      // Upgrade an already-live state or a minimal test fixture exactly once.
+      highlightedIndices = [];
+      for (let i = 0; i < this.highlightArray.length; i++) {
+        if (this.highlightArray[i] >= MIN_VISIBLE_ALPHA_BYTE) {
+          highlightedIndices.push(i);
+        }
+      }
+      this._highlightedCellIndices = highlightedIndices;
+    }
+    if (highlightedIndices.length === 0) {
+      this._cachedHighlightCount = 0;
+      this._cachedTotalHighlightCount = 0;
+      this._cachedHighlightLodMembership = null;
+      return 0;
+    }
+
     const viewId = this.getActiveViewId();
     const dimensionLevel = this.getViewDimensionLevel(viewId);
-    const lodVisibility = this.viewer.getLodVisibilityArray(
+    const lodMembership = this.viewer.getCurrentLodMembership(
       viewId,
       dimensionLevel
     );
-    const lodLevel = this.viewer.getCurrentLODLevel(viewId);
-    const lodSignature = lodVisibility ? (lodLevel ?? -1) : -1;
 
-    if (this._cachedHighlightCount !== null && this._cachedHighlightLodLevel === lodSignature) {
+    if (
+      this._cachedHighlightCount !== null &&
+      this._cachedHighlightLodMembership === lodMembership
+    ) {
       return this._cachedHighlightCount;
     }
 
+    const admissionLevels =
+      lodMembership?.admissionLevels ?? null;
+    const lodLevel = lodMembership?.lodLevel ?? -1;
     let count = 0;
-    for (let i = 0; i < this.highlightArray.length; i++) {
-      if (this.highlightArray[i] > 0) {
-        // Only count if visible (no transparency = visible, or transparency > 0)
-        const visibleByAlpha = !this.categoryTransparency || this.categoryTransparency[i] > 0;
-        const visibleByLod = !lodVisibility || lodVisibility[i] > 0;
-        const isVisible = visibleByAlpha && visibleByLod;
-        if (isVisible) count++;
-      }
+    for (let cursor = 0; cursor < highlightedIndices.length; cursor++) {
+      const index = highlightedIndices[cursor];
+      const visibleByAlpha =
+        !this.categoryTransparency ||
+        this.categoryTransparency[index] >=
+          POINT_VISIBILITY_THRESHOLD;
+      const visibleByLod =
+        admissionLevels === null ||
+        admissionLevels[index] <= lodLevel;
+      if (visibleByAlpha && visibleByLod) count++;
     }
     this._cachedHighlightCount = count;
-    this._cachedHighlightLodLevel = lodSignature;
+    this._cachedHighlightLodMembership = lodMembership;
     return count;
   },
 
@@ -842,10 +873,15 @@ export const highlightStateMethods = {
     // Returns total count of all highlighted cells, including filtered-out ones (cached)
     if (!this.highlightArray) return 0;
     if (this._cachedTotalHighlightCount !== null) return this._cachedTotalHighlightCount;
-    let count = 0;
-    for (let i = 0; i < this.highlightArray.length; i++) {
-      if (this.highlightArray[i] > 0) count++;
+    if (!Array.isArray(this._highlightedCellIndices)) {
+      this._highlightedCellIndices = [];
+      for (let i = 0; i < this.highlightArray.length; i++) {
+        if (this.highlightArray[i] >= MIN_VISIBLE_ALPHA_BYTE) {
+          this._highlightedCellIndices.push(i);
+        }
+      }
     }
+    const count = this._highlightedCellIndices.length;
     this._cachedTotalHighlightCount = count;
     return count;
   },
@@ -853,7 +889,7 @@ export const highlightStateMethods = {
   // Invalidate highlight count caches (call when highlight array or visibility changes).
   _invalidateHighlightCountCache(visibleOnly = false) {
     this._cachedHighlightCount = null;
-    this._cachedHighlightLodLevel = null;
+    this._cachedHighlightLodMembership = null;
     if (!visibleOnly) this._cachedTotalHighlightCount = null;
   },
 };

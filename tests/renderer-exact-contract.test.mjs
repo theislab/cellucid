@@ -269,7 +269,6 @@ test('high-performance data entry points do not clamp or default dimensions', as
 });
 
 test('an exact empty scene publishes empty alpha state without a synthetic texture', () => {
-  let cacheInvalidations = 0;
   const renderer = Object.assign(Object.create(HighPerfRenderer.prototype), {
     pointCount: 0,
     _alphaTexture: null,
@@ -278,9 +277,6 @@ test('an exact empty scene publishes empty alpha state without a synthetic textu
     _alphaTexHeight: 0,
     _useAlphaTexture: false,
     _currentAlphas: null,
-    invalidateLodVisibilityCache() {
-      cacheInvalidations += 1;
-    },
   });
   const alphas = new Float32Array();
 
@@ -289,7 +285,6 @@ test('an exact empty scene publishes empty alpha state without a synthetic textu
   assert.equal(renderer.getCurrentAlphas(), alphas);
   assert.equal(renderer._useAlphaTexture, false);
   assert.equal(renderer._alphaTexture, null);
-  assert.equal(cacheInvalidations, 1);
 });
 
 test('recoloring preserves the exact alpha generation through a position publication', () => {
@@ -302,7 +297,6 @@ test('recoloring preserves the exact alpha generation through a position publica
     -1, 0, 0,
     1, 0, 0,
   ]);
-  let cacheInvalidations = 0;
   let published = null;
   const renderer = Object.assign(Object.create(HighPerfRenderer.prototype), {
     pointCount: 2,
@@ -318,9 +312,6 @@ test('recoloring preserves the exact alpha generation through a position publica
     _dirtyLodDimensions: new Set(),
     lodBuffersByDimension: new Map(),
     spatialIndices: new Map(),
-    invalidateLodVisibilityCache() {
-      cacheInvalidations += 1;
-    },
     _needsSpatialIndex() {
       return false;
     },
@@ -333,7 +324,6 @@ test('recoloring preserves the exact alpha generation through a position publica
 
   assert.strictEqual(renderer.getCurrentAlphas(), alphas);
   assert.equal(renderer.isAlphaTextureActive(), true);
-  assert.equal(cacheInvalidations, 0);
 
   renderer.updatePositions(nextPositions, 3);
 
@@ -795,7 +785,7 @@ test('high-performance rendering has no legacy alpha or global-view path', async
   );
   assert.doesNotMatch(
     rendererSource,
-    /getLodVisibilityArray\([^)]*viewId\s*=\s*undefined/
+    /getLodVisibilityArray|getCombinedVisibilityForView|cachedLodVisibility/
   );
   assert.doesNotMatch(
     rendererSource,
@@ -812,7 +802,7 @@ test('highlight rendering owns exact view inputs and one visibility API', async 
   );
   assert.doesNotMatch(
     highlightSource,
-    /getCombinedVisibilityForView[\s\S]{0,180}getLodVisibilityArray/
+    /getCombinedVisibilityForView|getLodVisibilityArray|PositionFingerprint/
   );
   assert.doesNotMatch(
     highlightSource,
@@ -824,29 +814,38 @@ test('highlight LOD synchronization calls one exact per-view renderer contract',
   const positions = Float32Array.from([0, 0, 0]);
   const transparency = Float32Array.from([1]);
   const highlightData = Uint8Array.from([255]);
+  const membership = Object.freeze({
+    admissionLevels: Uint8Array.from([0]),
+    dimensionLevel: 2,
+    generationToken: Object.freeze({}),
+    indices: Uint32Array.from([0]),
+    lodLevel: 0,
+    pointCount: 1,
+  });
   const calls = [];
   const tools = Object.assign(Object.create(HighlightTools.prototype), {
     highlightArray: highlightData,
     hpRenderer: {
-      getLodVisibilityArray(viewId, dimensionLevel) {
-        calls.push(['visibility', viewId, dimensionLevel]);
-        return null;
+      getViewGeometryGeneration(viewId) {
+        calls.push(['geometry', viewId]);
+        return 7;
       },
-      getCurrentLODLevel(viewId) {
-        calls.push(['level', viewId]);
-        return -1;
+      getCurrentLodMembership(viewId, dimensionLevel) {
+        calls.push(['membership', viewId, dimensionLevel]);
+        return membership;
       },
     },
     highlightRenderer: {
-      _computeTransparencyFingerprint: () => 'visible',
+      _highlightedIndicesCache: [0],
+      updateHighlightCache(value) {
+        calls.push(['highlight', value]);
+      },
       needsRefresh: () => true,
       rebuildBuffer(...args) {
         calls.push(['rebuild', ...args]);
       },
     },
-    _lastUsedPositionsMap: new Map(),
-    _lastPositionFingerprintMap: new Map(),
-    _lastTransparencyFingerprintMap: new Map(),
+    _transparencyGenerations: new Map([['live', 3]]),
   });
 
   tools.syncHighlightBufferForLod(
@@ -856,11 +855,71 @@ test('highlight LOD synchronization calls one exact per-view renderer contract',
     2
   );
 
-  assert.deepEqual(calls[0], ['visibility', 'live', 2]);
-  assert.deepEqual(calls[1], ['level', 'live']);
-  assert.equal(calls[2][0], 'rebuild');
-  assert.equal(calls[2][5], 'live');
-  assert.equal(calls[2][6], transparency);
+  assert.deepEqual(calls[0], ['highlight', highlightData]);
+  assert.deepEqual(calls[1], ['geometry', 'live']);
+  assert.deepEqual(calls[2], ['membership', 'live', 2]);
+  assert.equal(calls[3][0], 'rebuild');
+  assert.equal(calls[3][3], membership);
+  assert.equal(calls[3][4], 'live');
+  assert.equal(calls[3][5], transparency);
+  assert.equal(calls[3][6], 7);
+  assert.equal(calls[3][7], 2);
+  assert.equal(calls[3][8], 3);
+});
+
+test('highlight drawing forwards the stable per-view render-parameter owner without allocation', () => {
+  const drawParams = {
+    dimensionLevel: 2,
+    mvpMatrix: new Float32Array(16),
+    viewId: 'live',
+  };
+  const calls = [];
+  const tools = Object.assign(Object.create(HighlightTools.prototype), {
+    highlightRenderer: {
+      draw(params) {
+        calls.push(params);
+      },
+    },
+  });
+
+  tools.drawHighlights(drawParams);
+  tools.drawHighlights(drawParams);
+
+  assert.deepEqual(calls, [drawParams, drawParams]);
+  assert.equal(calls[0], drawParams);
+  assert.equal(calls[1], drawParams);
+});
+
+test('viewer isolates highlight synchronization and drawing before later render passes', async () => {
+  const viewerSource = await source('viewer.js');
+  const syncIndex = viewerSource.indexOf(
+    'highlightTools.syncHighlightBufferForLod('
+  );
+  const drawIndex = viewerSource.indexOf(
+    'highlightTools.drawHighlights(renderParams, timeSeconds)'
+  );
+  const laterPassIndex = viewerSource.indexOf(
+    'drawConnectivityLines(\n      width,\n      height,\n      vid,\n      paneFogNear,\n      paneFogFar',
+    drawIndex
+  );
+  const syncBoundaryIndex = viewerSource.indexOf(
+    'reportHighlightRenderFailure(error, vid)',
+    syncIndex
+  );
+  const drawBoundaryIndex = viewerSource.indexOf(
+    'reportHighlightRenderFailure(error, vid)',
+    syncBoundaryIndex + 1
+  );
+
+  assert.ok(syncIndex >= 0);
+  assert.ok(syncBoundaryIndex > syncIndex);
+  assert.ok(drawIndex > syncBoundaryIndex);
+  assert.ok(drawBoundaryIndex > drawIndex);
+  assert.ok(laterPassIndex > drawBoundaryIndex);
+  assert.doesNotMatch(
+    viewerSource,
+    /highlightTools\.renderHighlights\(renderParams/
+  );
 });
 
 test('viewer position access never substitutes another view', async () => {
@@ -1175,6 +1234,7 @@ test('figure export requests publish one complete current contract', () => {
     depthSort3d: true,
     emphasizeSelection: false,
     selectionMutedOpacity: 0.15,
+    signal: new AbortController().signal,
     strategy: null,
     optimizedTargetCount: null,
   };

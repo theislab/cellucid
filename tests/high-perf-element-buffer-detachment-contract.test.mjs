@@ -8,12 +8,23 @@ import {
 function createVaoAwareGl() {
   let currentVao = null;
   let defaultElementBuffer = null;
+  let activeTextureUnit = 0x84c0;
   const vaoElementBuffers = new Map();
   const liveBuffers = new Set();
+  const liveTextures = new Set();
+  const textureBindings = new Map();
   const deletedBuffers = new Set();
   const zombieBuffers = new Set();
   const events = [];
   const draws = [];
+  const cleanupErrors = new Map();
+  let nextDrawError = null;
+  const throwCleanupError = kind => {
+    const error = cleanupErrors.get(kind);
+    if (error === undefined) return;
+    cleanupErrors.delete(kind);
+    throw error;
+  };
 
   const elementBufferForCurrentVao = () => (
     currentVao === null
@@ -46,11 +57,32 @@ function createVaoAwareGl() {
     TEXTURE_2D: 0x0de1,
     UNSIGNED_INT: 0x1405,
 
-    activeTexture() {},
-    bindTexture() {},
+    activeTexture(textureUnit) {
+      assert.ok(
+        textureUnit === this.TEXTURE0 ||
+          textureUnit === this.TEXTURE1,
+      );
+      activeTextureUnit = textureUnit;
+    },
+    bindTexture(target, texture) {
+      assert.equal(target, this.TEXTURE_2D);
+      assert.ok(
+        texture === null || liveTextures.has(texture),
+        'renderer must bind an adopted texture handle',
+      );
+      textureBindings.set(activeTextureUnit, texture);
+      if (texture === null) {
+        throwCleanupError(
+          activeTextureUnit === this.TEXTURE1
+            ? 'texture1'
+            : 'texture0',
+        );
+      }
+    },
     bindVertexArray(vao) {
       events.push({ kind: 'bindVertexArray', vao });
       currentVao = vao;
+      if (vao === null) throwCleanupError('vertex-array');
     },
     bindBuffer(target, buffer) {
       assert.equal(target, this.ELEMENT_ARRAY_BUFFER);
@@ -66,6 +98,7 @@ function createVaoAwareGl() {
         vaoElementBuffers.set(currentVao, buffer);
       }
       if (previous !== buffer) settleDetachedZombie(previous);
+      if (buffer === null) throwCleanupError('element-buffer');
     },
     deleteBuffer(buffer) {
       deletedBuffers.add(buffer);
@@ -92,6 +125,27 @@ function createVaoAwareGl() {
       };
       events.push(draw);
       draws.push(draw);
+      if (nextDrawError !== null) {
+        const error = nextDrawError;
+        nextDrawError = null;
+        throw error;
+      }
+    },
+    drawArrays(mode, first, count) {
+      const draw = {
+        count,
+        first,
+        kind: 'drawArrays',
+        mode,
+        vao: currentVao,
+      };
+      events.push(draw);
+      draws.push(draw);
+      if (nextDrawError !== null) {
+        const error = nextDrawError;
+        nextDrawError = null;
+        throw error;
+      }
     },
     useProgram() {},
 
@@ -103,13 +157,38 @@ function createVaoAwareGl() {
     _adoptVao(id) {
       return Object.freeze({ id, kind: 'vao' });
     },
+    _adoptTexture(id) {
+      const texture = Object.freeze({ id, kind: 'texture' });
+      liveTextures.add(texture);
+      return texture;
+    },
     _state: {
       deletedBuffers,
       draws,
       events,
       liveBuffers,
+      liveTextures,
+      textureBindings,
       vaoElementBuffers,
       zombieBuffers,
+      get activeTextureUnit() {
+        return activeTextureUnit;
+      },
+      get currentVao() {
+        return currentVao;
+      },
+      failNextDraw(error) {
+        nextDrawError = error;
+      },
+      failNextCleanup(kind, error) {
+        assert.ok(
+          kind === 'element-buffer' ||
+            kind === 'vertex-array' ||
+            kind === 'texture1' ||
+            kind === 'texture0',
+        );
+        cleanupErrors.set(kind, error);
+      },
     },
   };
   return gl;
@@ -172,7 +251,7 @@ function makeRenderer(gl) {
       uniformLocations: new Map([['full', makeUniforms()]]),
       stats: { cullPercent: 0, frustumCulled: false },
       spatialIndices: new Map(),
-      _dummyLodIndexTexture: Object.freeze({ id: 'dummy' }),
+      _dummyLodIndexTexture: gl._adoptTexture('dummy'),
       _validatedLodNodeMappings: new WeakMap(),
       _validatedSpatialIndices: new WeakSet(),
       _updateStats() {},
@@ -182,6 +261,19 @@ function makeRenderer(gl) {
       },
     },
   );
+}
+
+function makeSnapshot(gl, vao, id = 'snapshot') {
+  return {
+    alphaTexData: Uint8Array.of(255),
+    alphaTexHeight: 1,
+    alphaTexWidth: 1,
+    alphaTexture: gl._adoptTexture(`${id}-alpha`),
+    alphaTextureByteLength: 1,
+    id,
+    pointCount: 1,
+    vao,
+  };
 }
 
 function makeViewState(indexBuffer) {
@@ -195,6 +287,16 @@ function makeViewState(indexBuffer) {
     indexBuffer,
     indexBufferSize: 1,
     lastVisibleCount: 1,
+    stats: {
+      lastFrameTime: 0,
+      fps: 0,
+      visiblePoints: 0,
+      lodLevel: -1,
+      drawCalls: 0,
+      frustumCulled: false,
+      cullPercent: 0,
+    },
+    statsPublished: false,
     usePreCachedIndexBuffer: false,
     preCachedIndexBuffer: null,
   };
@@ -250,6 +352,8 @@ test('all five indexed renderer paths detach their VAO-local EBO before releasin
         const viewState = makeViewState(ebo);
         viewState.cachedLodLevel = -1;
         viewState.cachedLodIsCulled = false;
+        viewState.cachedLodMappingGeneration = null;
+        viewState.cachedVisibleNodes = [spatialIndex.root];
         viewState.cachedVisibleSpatialOwner = spatialIndex;
         viewState.cachedVisibleSpatialRoot = spatialIndex.root;
         renderer._renderWithFrustumCulling(
@@ -309,10 +413,12 @@ test('all five indexed renderer paths detach their VAO-local EBO before releasin
         const viewState = makeViewState(ebo);
         viewState.cachedLodLevel = -1;
         viewState.cachedLodIsCulled = false;
+        viewState.cachedLodMappingGeneration = null;
+        viewState.cachedVisibleNodes = [spatialIndex.root];
         viewState.cachedVisibleSpatialOwner = spatialIndex;
         viewState.cachedVisibleSpatialRoot = spatialIndex.root;
         renderer._renderSnapshotWithFrustumCulling(
-          { pointCount: 1, vao },
+          makeSnapshot(gl, vao, 'snapshot-full-frustum'),
           makeParams('snapshot-full-frustum'),
           [],
           viewState,
@@ -339,7 +445,7 @@ test('all five indexed renderer paths detach their VAO-local EBO before releasin
         viewState.usePreCachedIndexBuffer = true;
         viewState.preCachedIndexBuffer = ebo;
         renderer._renderSnapshotWithLOD(
-          { vao },
+          makeSnapshot(gl, vao, 'snapshot-lod'),
           0,
           makeParams('snapshot-lod'),
           viewState,
@@ -397,7 +503,7 @@ test('all five indexed renderer paths detach their VAO-local EBO before releasin
         viewState.cachedVisibleSpatialRoot = root;
         viewState.cachedLodMappingGeneration = generationToken;
         renderer._renderSnapshotLODWithFrustumCulling(
-          { vao },
+          makeSnapshot(gl, vao, 'snapshot-lod-frustum'),
           0,
           makeParams('snapshot-lod-frustum'),
           [],
@@ -405,6 +511,7 @@ test('all five indexed renderer paths detach their VAO-local EBO before releasin
           false,
           spatialIndex,
           [],
+          false,
         );
       },
     },
@@ -420,8 +527,243 @@ test('all five indexed renderer paths detach their VAO-local EBO before releasin
       renderCase.run(renderer, gl, vao, ebo);
 
       assertDrawDetached(gl, vao, ebo);
+
+      const alphaTexture =
+        gl._adoptTexture(`${renderCase.name}-live-alpha`);
+      const lodTexture =
+        gl._adoptTexture(`${renderCase.name}-live-lod-index`);
+      renderer._bindAlphaTexture = exactGl => {
+        exactGl.activeTexture(exactGl.TEXTURE0);
+        exactGl.bindTexture(exactGl.TEXTURE_2D, alphaTexture);
+        exactGl.activeTexture(exactGl.TEXTURE1);
+        exactGl.bindTexture(exactGl.TEXTURE_2D, lodTexture);
+      };
+      const drawFailure =
+        new Error(`${renderCase.name} synthetic draw failure`);
+      gl._state.failNextDraw(drawFailure);
+      assert.throws(
+        () => renderCase.run(renderer, gl, vao, ebo),
+        error => error === drawFailure,
+      );
+      assert.equal(gl._state.currentVao, null);
+      assert.equal(
+        gl._state.vaoElementBuffers.get(vao) ?? null,
+        null,
+      );
+      assert.equal(
+        gl._state.textureBindings.get(gl.TEXTURE0) ?? null,
+        null,
+      );
+      assert.equal(
+        gl._state.textureBindings.get(gl.TEXTURE1) ?? null,
+        null,
+      );
+      assert.equal(gl._state.activeTextureUnit, gl.TEXTURE0);
     });
   }
+});
+
+test('failed indexed draws preserve the primary error while completing every later baseline cleanup', async t => {
+  const cases = [
+    {
+      name: 'live full-detail frustum',
+      run(renderer, gl, vao, ebo) {
+        renderer.vao = vao;
+        renderer.pointCount = 1;
+        const spatialIndex = {
+          root: {},
+          validatePointCount() {
+            return { valid: true };
+          },
+        };
+        const viewState = makeViewState(ebo);
+        viewState.cachedLodLevel = -1;
+        viewState.cachedLodIsCulled = false;
+        viewState.cachedLodMappingGeneration = null;
+        viewState.cachedVisibleNodes = [spatialIndex.root];
+        viewState.cachedVisibleSpatialOwner = spatialIndex;
+        viewState.cachedVisibleSpatialRoot = spatialIndex.root;
+        renderer._renderWithFrustumCulling(
+          makeParams('live'),
+          [],
+          viewState,
+          spatialIndex,
+        );
+      },
+    },
+    {
+      name: 'snapshot full-detail frustum',
+      run(renderer, gl, vao, ebo) {
+        const spatialIndex = { root: {} };
+        const viewState = makeViewState(ebo);
+        viewState.cachedLodLevel = -1;
+        viewState.cachedLodIsCulled = false;
+        viewState.cachedLodMappingGeneration = null;
+        viewState.cachedVisibleNodes = [spatialIndex.root];
+        viewState.cachedVisibleSpatialOwner = spatialIndex;
+        viewState.cachedVisibleSpatialRoot = spatialIndex.root;
+        renderer._renderSnapshotWithFrustumCulling(
+          makeSnapshot(gl, vao, 'cleanup-failure-snapshot'),
+          makeParams('cleanup-failure-snapshot'),
+          [],
+          viewState,
+          1,
+          false,
+          spatialIndex,
+        );
+      },
+    },
+  ];
+
+  for (const renderCase of cases) {
+    await t.test(renderCase.name, () => {
+      const gl = createVaoAwareGl();
+      const renderer = makeRenderer(gl);
+      const vao = gl._adoptVao(`${renderCase.name}-vao`);
+      const ebo = gl._adoptBuffer(`${renderCase.name}-ebo`);
+      const alphaTexture =
+        gl._adoptTexture(`${renderCase.name}-live-alpha`);
+      const lodTexture =
+        gl._adoptTexture(`${renderCase.name}-live-lod-index`);
+      renderer._bindAlphaTexture = exactGl => {
+        exactGl.activeTexture(exactGl.TEXTURE0);
+        exactGl.bindTexture(exactGl.TEXTURE_2D, alphaTexture);
+        exactGl.activeTexture(exactGl.TEXTURE1);
+        exactGl.bindTexture(exactGl.TEXTURE_2D, lodTexture);
+      };
+      const primary =
+        new Error(`${renderCase.name} primary draw failure`);
+      const cleanup =
+        new Error(`${renderCase.name} EBO cleanup failure`);
+      gl._state.failNextDraw(primary);
+      gl._state.failNextCleanup('element-buffer', cleanup);
+
+      assert.throws(
+        () => renderCase.run(renderer, gl, vao, ebo),
+        error => (
+          error instanceof AggregateError &&
+          error.errors[0] === primary &&
+          error.errors[1] === cleanup
+        ),
+      );
+      assert.equal(gl._state.currentVao, null);
+      assert.equal(
+        gl._state.vaoElementBuffers.get(vao) ?? null,
+        null,
+      );
+      assert.equal(
+        gl._state.textureBindings.get(gl.TEXTURE0) ?? null,
+        null,
+      );
+      assert.equal(
+        gl._state.textureBindings.get(gl.TEXTURE1) ?? null,
+        null,
+      );
+      assert.equal(gl._state.activeTextureUnit, gl.TEXTURE0);
+    });
+  }
+});
+
+test('direct live full-detail and LOD draw failures restore VAO and both texture units', async t => {
+  const cases = [
+    {
+      name: 'full detail',
+      run(renderer, params, viewState, vao) {
+        renderer.vao = vao;
+        renderer.pointCount = 1;
+        renderer._renderFullDetail(params, viewState);
+      },
+    },
+    {
+      name: 'reduced LOD',
+      run(renderer, params, viewState, vao) {
+        renderer.lodBuffersByDimension = new Map([
+          [2, [{
+            isFullDetail: false,
+            pointCount: 1,
+            sizeMultiplier: 1,
+            vao,
+          }]],
+        ]);
+        renderer._renderLOD(0, params, viewState);
+      },
+    },
+  ];
+
+  for (const renderCase of cases) {
+    await t.test(renderCase.name, () => {
+      const gl = createVaoAwareGl();
+      const renderer = makeRenderer(gl);
+      const vao = gl._adoptVao(`${renderCase.name}-vao`);
+      const alphaTexture =
+        gl._adoptTexture(`${renderCase.name}-alpha`);
+      const lodTexture =
+        gl._adoptTexture(`${renderCase.name}-lod-index`);
+      renderer._bindAlphaTexture = exactGl => {
+        exactGl.activeTexture(exactGl.TEXTURE0);
+        exactGl.bindTexture(exactGl.TEXTURE_2D, alphaTexture);
+        exactGl.activeTexture(exactGl.TEXTURE1);
+        exactGl.bindTexture(exactGl.TEXTURE_2D, lodTexture);
+      };
+      const drawFailure =
+        new Error(`${renderCase.name} synthetic draw failure`);
+      gl._state.failNextDraw(drawFailure);
+
+      assert.throws(
+        () => renderCase.run(
+          renderer,
+          makeParams('live'),
+          makeViewState(gl._adoptBuffer(`${renderCase.name}-unused`)),
+          vao,
+        ),
+        error => error === drawFailure,
+      );
+      assert.equal(gl._state.currentVao, null);
+      assert.equal(
+        gl._state.textureBindings.get(gl.TEXTURE0) ?? null,
+        null,
+      );
+      assert.equal(
+        gl._state.textureBindings.get(gl.TEXTURE1) ?? null,
+        null,
+      );
+      assert.equal(gl._state.activeTextureUnit, gl.TEXTURE0);
+    });
+  }
+});
+
+test('live full-detail frustum rendering rejects unavailable shader state instead of publishing a blank frame', () => {
+  const gl = createVaoAwareGl();
+  const renderer = makeRenderer(gl);
+  const vao = gl._adoptVao('missing-frustum-program-vao');
+  const ebo = gl._adoptBuffer('missing-frustum-program-ebo');
+  const spatialIndex = {
+    root: {},
+    validatePointCount() {
+      return { valid: true };
+    },
+  };
+  const viewState = makeViewState(ebo);
+  viewState.cachedLodLevel = -1;
+  viewState.cachedLodIsCulled = false;
+  viewState.cachedLodMappingGeneration = null;
+  viewState.cachedVisibleNodes = [spatialIndex.root];
+  viewState.cachedVisibleSpatialOwner = spatialIndex;
+  viewState.cachedVisibleSpatialRoot = spatialIndex.root;
+  renderer.vao = vao;
+  renderer.pointCount = 1;
+  renderer.activeProgram = null;
+
+  assert.throws(
+    () => renderer._renderWithFrustumCulling(
+      makeParams('live'),
+      [],
+      viewState,
+      spatialIndex,
+    ),
+    /full-detail\/frustum shader state is unavailable/,
+  );
+  assert.equal(gl._state.draws.length, 0);
 });
 
 test('snapshot borrowed-EBO replacement neither leaves a zombie nor uploads per-view indices', () => {
@@ -440,6 +782,7 @@ test('snapshot borrowed-EBO replacement neither leaves a zombie nor uploads per-
     }],
   };
   renderer.spatialIndices.set(2, spatialIndex);
+  const snapshot = makeSnapshot(gl, snapshotVao);
 
   let perViewUploads = 0;
   renderer._uploadToViewIndexBuffer = () => {
@@ -455,7 +798,7 @@ test('snapshot borrowed-EBO replacement neither leaves a zombie nor uploads per-
     originalIndexCount: 1,
   }];
   renderer._renderSnapshotWithLOD(
-    { vao: snapshotVao },
+    snapshot,
     0,
     makeParams('snapshot'),
     viewState,
@@ -480,7 +823,7 @@ test('snapshot borrowed-EBO replacement neither leaves a zombie nor uploads per-
     originalIndexCount: 1,
   }];
   renderer._renderSnapshotWithLOD(
-    { vao: snapshotVao },
+    snapshot,
     0,
     makeParams('snapshot'),
     viewState,

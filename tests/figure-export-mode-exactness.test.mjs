@@ -47,6 +47,7 @@ function baseRequest(overrides = {}) {
     depthSort3d: true,
     emphasizeSelection: false,
     selectionMutedOpacity: 0.15,
+    signal: new AbortController().signal,
     strategy: null,
     optimizedTargetCount: null,
     ...overrides,
@@ -72,6 +73,28 @@ test('PNG requests carry no invented SVG strategy', () => {
     }),
     /PNG.*strategy|strategy.*PNG/i
   );
+});
+
+test('figure-export requests require one exact AbortSignal owner', () => {
+  const exact = baseRequest({ format: 'png', dpi: 300 });
+  assert.equal(assertFigureExportSingleRequest(exact), exact);
+
+  for (const signal of [
+    null,
+    {},
+    { aborted: false },
+    {
+      aborted: false,
+      addEventListener() {},
+      removeEventListener() {},
+    },
+    undefined,
+  ]) {
+    assert.throws(
+      () => assertFigureExportSingleRequest({ ...exact, signal }),
+      /signal.*AbortSignal|AbortSignal.*signal/i
+    );
+  }
 });
 
 test('SVG requests require one exact, explicit strategy', () => {
@@ -161,7 +184,7 @@ test('engine validates and archives every staged result before one download', as
   assert.doesNotMatch(engineSource, /field === undefined \? null/);
   assert.match(
     engineSource,
-    /if \(stagedDownloads\.length === 1\)[\s\S]+await createFigureExportZip\([\s\S]+downloadBlob\(deliveryBlob, deliveryFilename\)/s
+    /if \(stagedDownloads\.length === 1\)[\s\S]+await createFigureExportZip\([\s\S]+downloadBlob\(deliveryBlob, deliveryFilename, \{\s*signal\s*\}\)/s
   );
   assert.equal(
     engineSource.match(/\bdownloadBlob\(/g)?.length,
@@ -169,7 +192,7 @@ test('engine validates and archives every staged result before one download', as
     'single and batch exports share one browser download call'
   );
   assert.ok(
-    engineSource.indexOf('downloadBlob(deliveryBlob, deliveryFilename)') >
+    engineSource.indexOf('downloadBlob(deliveryBlob, deliveryFilename, { signal })') >
       engineSource.indexOf('await createFigureExportZip('),
     'a batch archive failure must occur before the one download call'
   );
@@ -256,6 +279,32 @@ test('batch ZIP preserves exact entry bytes in deterministic order', async () =>
     parsed[1].bytes,
     Buffer.from([137, 80, 78, 71])
   );
+});
+
+test('batch ZIP cancellation settles while a staged Blob read is pending', async () => {
+  let releaseRead;
+  class DeferredBlob extends Blob {
+    arrayBuffer() {
+      return new Promise((resolve) => {
+        releaseRead = () => resolve(new Uint8Array([1, 2, 3]).buffer);
+      });
+    }
+  }
+
+  const controller = new AbortController();
+  const pending = createFigureExportZip(
+    [
+      { filename: 'deferred.svg', blob: new DeferredBlob(['abc']) },
+      { filename: 'second.png', blob: new Blob(['png']) },
+    ],
+    { signal: controller.signal }
+  );
+  await Promise.resolve();
+  assert.equal(typeof releaseRead, 'function');
+
+  controller.abort();
+  await assert.rejects(pending, { name: 'AbortError' });
+  releaseRead();
 });
 
 test('batch ZIP rejects invalid or unreadable staging atomically', async () => {

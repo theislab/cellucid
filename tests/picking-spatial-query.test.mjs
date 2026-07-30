@@ -7,9 +7,12 @@ import {
 import {
   findRaySamplePick,
 } from '../assets/js/rendering/picking.js';
+import {
+  POINT_VISIBILITY_THRESHOLD,
+} from '../assets/js/rendering/alpha-visibility.js';
 
 const SEARCH_RADIUS = 0.03;
-const VISIBILITY_THRESHOLD = Math.fround(0.01);
+const VISIBILITY_THRESHOLD = POINT_VISIBILITY_THRESHOLD;
 const MIN_SAMPLE_STEP = 0.02;
 const MAX_SAMPLE_COUNT = 500;
 
@@ -139,6 +142,100 @@ function pickBothWays(input) {
   return { direct, indexed, spatialIndex };
 }
 
+test('coarse LOD direct picking ignores a closer excluded source point', () => {
+  const positions = Float32Array.from([
+    0, 0, 0.1,
+    0, 0, 0.2,
+    1, 1, 0.15,
+  ]);
+  const transparency = new Float32Array(3).fill(1);
+  const lodMembership = Object.freeze({
+    admissionLevels: Uint8Array.from([0xff, 0, 0xff]),
+    dimensionLevel: 3,
+    generationToken: Object.freeze({}),
+    indices: Uint32Array.of(1),
+    lodLevel: 0,
+    pointCount: 3,
+  });
+  const input = {
+    positions,
+    transparency,
+    ray: {
+      origin: [0, 0, 0],
+      direction: [0, 0, 1],
+    },
+    maxDistance: 0.5,
+    spatialIndex: null,
+  };
+
+  const fullDetail = findRaySamplePick(input);
+  const coarseLod = findRaySamplePick({
+    ...input,
+    lodMembership,
+  });
+
+  assert.equal(fullDetail.cellIndex, 0);
+  assert.equal(coarseLod.cellIndex, 1);
+  assert.ok(coarseLod.firstSampleIndex > fullDetail.firstSampleIndex);
+  assert.equal(coarseLod.examinedPointCount, 1);
+});
+
+test('coarse LOD direct picking rejects malformed compact membership', () => {
+  const positions = Float32Array.from([
+    0, 0, 0.1,
+    0, 0, 0.2,
+  ]);
+  const input = {
+    positions,
+    transparency: new Float32Array(2).fill(1),
+    ray: {
+      origin: [0, 0, 0],
+      direction: [0, 0, 1],
+    },
+    maxDistance: 0.5,
+    spatialIndex: null,
+  };
+  const makeMembership = ({
+    admissionLevels = Uint8Array.from([0, 0xff]),
+    indices = Uint32Array.of(0),
+    extra = false,
+  } = {}) => Object.freeze({
+    admissionLevels,
+    dimensionLevel: 3,
+    generationToken: Object.freeze({}),
+    indices,
+    lodLevel: 0,
+    pointCount: 2,
+    ...(extra ? { unexpected: true } : {}),
+  });
+
+  assert.throws(
+    () => findRaySamplePick({
+      ...input,
+      lodMembership: makeMembership({ extra: true }),
+    }),
+    /frozen renderer certificate/
+  );
+  assert.throws(
+    () => findRaySamplePick({
+      ...input,
+      lodMembership: makeMembership({
+        indices: Uint32Array.of(2),
+      }),
+    }),
+    /does not name an admitted source point/
+  );
+  assert.throws(
+    () => findRaySamplePick({
+      ...input,
+      lodMembership: makeMembership({
+        admissionLevels: Uint8Array.from([0xff, 0]),
+      }),
+    }),
+    /does not name an admitted source point/
+  );
+});
+
 test('ray picking does not let 32 hidden traversal-first points mask a visible point', () => {
   const pointCount = 40;
   const positions = new Float32Array(pointCount * 3);
@@ -253,7 +350,10 @@ test('ray picking matches the shader alpha threshold', () => {
     0, 0, 0.1,
     0.005, 0, 0.1,
   ]);
-  const transparency = Float32Array.from([0.005, 0.01]);
+  const transparency = Float32Array.from([
+    Math.fround(2.49 / 255),
+    POINT_VISIBILITY_THRESHOLD,
+  ]);
   const input = {
     positions,
     transparency,

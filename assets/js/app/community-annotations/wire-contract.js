@@ -13,6 +13,11 @@ export const ANNOTATION_CONTRACT_IDS = Object.freeze({
   merges: 'https://cellucid.com/contracts/community-annotation/merges-v1.schema.json',
 });
 
+// GitHub's repository Contents API supports its complete JSON/base64 contract
+// only for files whose decoded content is at most 1 MB. Keep this as one shared
+// browser/Worker boundary so publication and remote reconciliation cannot drift.
+export const ANNOTATION_FILE_MAX_UTF8_BYTES = 1_000_000;
+
 export const ANNOTATION_LIMITS = Object.freeze({
   githubUserId: Number.MAX_SAFE_INTEGER,
   username: 64,
@@ -50,6 +55,24 @@ const UTC_DATE_TIME =
 const GHID = /^ghid_[1-9][0-9]*$/;
 const LINKEDIN = /^[a-z0-9-]{3,120}$/;
 
+/**
+ * `fk~<urlencoded>` is the v1 bucket representation for a field key containing
+ * `:`. A colon-free raw field key with the same shape would encode to the same
+ * bucket, so reserve only that exact ambiguous raw-key subset.
+ */
+export function isReservedAnnotationFieldKey(value) {
+  return (
+    typeof value === 'string' &&
+    value.startsWith('fk~') &&
+    !value.includes(':') &&
+    /%3[Aa]/.test(value.slice(3))
+  );
+}
+
+export function hasAnnotationSuggestionIdDelimiter(value) {
+  return typeof value === 'string' && value.includes(':');
+}
+
 export class AnnotationContractError extends Error {
   constructor(path, message) {
     super(`${path}: ${message}`);
@@ -57,6 +80,47 @@ export class AnnotationContractError extends Error {
     this.code = 'COMMUNITY_ANNOTATION_CONTRACT_INVALID';
     this.path = path;
   }
+}
+
+export class AnnotationFileTooLargeError extends Error {
+  constructor(
+    path,
+    actualBytes,
+    { phase = 'publication-preflight' } = {}
+  ) {
+    super(
+      `${path} is ${actualBytes} UTF-8 bytes; GitHub Contents supports at ` +
+      `most ${ANNOTATION_FILE_MAX_UTF8_BYTES} bytes`
+    );
+    this.name = 'AnnotationFileTooLargeError';
+    this.code = 'COMMUNITY_ANNOTATION_FILE_TOO_LARGE';
+    this.path = path;
+    this.phase = phase;
+    this.maxBytes = ANNOTATION_FILE_MAX_UTF8_BYTES;
+    this.actualBytes = actualBytes;
+  }
+}
+
+export function toAnnotationPublicationBytes(value, { path } = {}) {
+  if (
+    typeof path !== 'string' ||
+    !path ||
+    /^\s|\s$/.test(path)
+  ) {
+    throw new Error('Annotation publication path must be an exact nonblank string');
+  }
+  if (typeof TextEncoder === 'undefined') {
+    throw new Error('TextEncoder is required for annotation publication');
+  }
+  const serialized = JSON.stringify(value, null, 2);
+  if (typeof serialized !== 'string') {
+    throw new Error(`${path} must be a JSON document`);
+  }
+  const bytes = new TextEncoder().encode(`${serialized}\n`);
+  if (bytes.byteLength > ANNOTATION_FILE_MAX_UTF8_BYTES) {
+    throw new AnnotationFileTooLargeError(path, bytes.byteLength);
+  }
+  return bytes;
 }
 
 function reject(path, message) {
@@ -111,6 +175,33 @@ function assertNonblankString(value, path, max) {
   if (!/\S/.test(string)) reject(path, 'must be nonblank');
   if (/^\s|\s$/.test(string)) reject(path, 'must not have leading or trailing whitespace');
   return string;
+}
+
+function assertFieldKey(value, path) {
+  const field = assertNonblankString(
+    value,
+    path,
+    ANNOTATION_LIMITS.datasetId
+  );
+  if (isReservedAnnotationFieldKey(field)) {
+    reject(
+      path,
+      'uses the reserved fk~...%3A field-key encoding form'
+    );
+  }
+  return field;
+}
+
+function assertSuggestionId(value, path) {
+  const id = assertNonblankString(
+    value,
+    path,
+    ANNOTATION_LIMITS.suggestionId
+  );
+  if (hasAnnotationSuggestionIdDelimiter(id)) {
+    reject(path, 'suggestion identifiers must not contain the ":" delimiter');
+  }
+  return id;
 }
 
 function assertInteger(value, path, { min, max } = {}) {
@@ -372,11 +463,7 @@ function assertSuggestion(value, path, fileUser, suggestionIds) {
     ['id', 'label', 'proposedBy', 'proposedAt'],
     ['ontologyId', 'evidence', 'markers', 'editedAt']
   );
-  const id = assertNonblankString(
-    suggestion.id,
-    child(path, 'id'),
-    ANNOTATION_LIMITS.suggestionId
-  );
+  const id = assertSuggestionId(suggestion.id, child(path, 'id'));
   if (suggestionIds.has(id)) reject(child(path, 'id'), 'must be globally unique');
   suggestionIds.add(id);
   assertNonblankString(
@@ -460,10 +547,9 @@ function assertDatasetAccessMap(value, path) {
       { max: ANNOTATION_LIMITS.fields }
     );
     fields.forEach((field, index) => {
-      assertNonblankString(
+      assertFieldKey(
         field,
-        `${child(entryPath, 'fieldsToAnnotate')}[${index}]`,
-        ANNOTATION_LIMITS.datasetId
+        `${child(entryPath, 'fieldsToAnnotate')}[${index}]`
       );
     });
     assertUniqueStrings(fields, child(entryPath, 'fieldsToAnnotate'));
@@ -545,11 +631,7 @@ export function assertUserDocument(value, { path = '$', filename = null } = {}) 
     ANNOTATION_LIMITS.votes
   );
   for (const [suggestionId, direction] of Object.entries(votes)) {
-    assertNonblankString(
-      suggestionId,
-      `${child(path, 'votes')} key`,
-      ANNOTATION_LIMITS.suggestionId
-    );
+    assertSuggestionId(suggestionId, `${child(path, 'votes')} key`);
     if (direction !== 'up' && direction !== 'down') {
       reject(child(child(path, 'votes'), suggestionId), 'must equal "up" or "down"');
     }
@@ -562,11 +644,7 @@ export function assertUserDocument(value, { path = '$', filename = null } = {}) 
       ANNOTATION_LIMITS.commentTargets
     );
     for (const [suggestionId, listValue] of Object.entries(comments)) {
-      assertNonblankString(
-        suggestionId,
-        `${child(path, 'comments')} key`,
-        ANNOTATION_LIMITS.suggestionId
-      );
+      assertSuggestionId(suggestionId, `${child(path, 'comments')} key`);
       const listPath = child(child(path, 'comments'), suggestionId);
       const list = assertArray(listValue, listPath, {
         max: ANNOTATION_LIMITS.commentsPerSuggestion,
@@ -623,11 +701,7 @@ export function assertUserDocument(value, { path = '$', filename = null } = {}) 
         max: ANNOTATION_LIMITS.deletedPerBucket,
       });
       ids.forEach((id, index) => {
-        assertNonblankString(
-          id,
-          `${idsPath}[${index}]`,
-          ANNOTATION_LIMITS.suggestionId
-        );
+        assertSuggestionId(id, `${idsPath}[${index}]`);
       });
       assertUniqueStrings(ids, idsPath);
     }
@@ -673,11 +747,7 @@ export function assertConfigDocument(value, { path = '$' } = {}) {
       max: ANNOTATION_LIMITS.fields,
     });
     fields.forEach((field, fieldIndex) => {
-      assertNonblankString(
-        field,
-        `${fieldsPath}[${fieldIndex}]`,
-        ANNOTATION_LIMITS.datasetId
-      );
+      assertFieldKey(field, `${fieldsPath}[${fieldIndex}]`);
     });
     assertUniqueStrings(fields, fieldsPath);
     const fieldSet = new Set(fields);
@@ -694,6 +764,7 @@ export function assertConfigDocument(value, { path = '$' } = {}) {
       }
     }
     for (const [field, raw] of Object.entries(settings)) {
+      assertFieldKey(field, `${settingsPath} key`);
       if (!fieldSet.has(field)) {
         reject(settingsPath, `contains unknown field ${JSON.stringify(field)}`);
       }
@@ -717,11 +788,7 @@ export function assertConfigDocument(value, { path = '$' } = {}) {
       max: ANNOTATION_LIMITS.fields,
     });
     closed.forEach((field, fieldIndex) => {
-      assertNonblankString(
-        field,
-        `${closedPath}[${fieldIndex}]`,
-        ANNOTATION_LIMITS.datasetId
-      );
+      assertFieldKey(field, `${closedPath}[${fieldIndex}]`);
       if (!fieldSet.has(field)) {
         reject(`${closedPath}[${fieldIndex}]`, 'must also appear in fieldsToAnnotate');
       }
@@ -749,15 +816,13 @@ export function assertMergesDocument(value, { path = '$' } = {}) {
       ['note', 'editedAt']
     );
     const bucket = assertBucket(merge.bucket, child(mergePath, 'bucket'));
-    const from = assertNonblankString(
+    const from = assertSuggestionId(
       merge.fromSuggestionId,
-      child(mergePath, 'fromSuggestionId'),
-      ANNOTATION_LIMITS.suggestionId
+      child(mergePath, 'fromSuggestionId')
     );
-    const into = assertNonblankString(
+    const into = assertSuggestionId(
       merge.intoSuggestionId,
-      child(mergePath, 'intoSuggestionId'),
-      ANNOTATION_LIMITS.suggestionId
+      child(mergePath, 'intoSuggestionId')
     );
     if (from === into) {
       reject(mergePath, 'fromSuggestionId and intoSuggestionId must differ');

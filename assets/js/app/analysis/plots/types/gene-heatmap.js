@@ -15,6 +15,7 @@
 
 import { PlotFactory, PlotRegistry, BasePlot, COMMON_HOVER_STYLE } from '../plot-factory.js';
 import { getPlotTheme } from '../../shared/plot-theme.js';
+import { setOwnDataProperty } from '../../../../utils/exact-record.js';
 
 function truncateLabel(label, maxLen) {
   if (typeof label !== 'string') {
@@ -584,7 +585,11 @@ const geneHeatmapDefinition = {
     for (let r = 0; r < nRows; r++) {
       const row = { gene: genes[r] };
       for (let c = 0; c < nCols; c++) {
-        row[groupNames[c]] = values[r * nCols + c].toFixed(4);
+        setOwnDataProperty(
+          row,
+          groupNames[c],
+          values[r * nCols + c].toFixed(4)
+        );
       }
       rows.push(row);
     }

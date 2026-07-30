@@ -335,14 +335,22 @@ export class QueryBuilder {
       return Array.from(cellIndices);
     }
 
+    // Resolve exact field ownership once per condition. Query evaluation is a
+    // cell × condition hot loop, so membership checks must not run per cell.
+    const fieldValues = enabled.map(condition => (
+      Object.hasOwn(fieldsData, condition.field)
+        ? fieldsData[condition.field]
+        : undefined
+    ));
+
     // Pre-compute percentile thresholds if needed
-    const thresholds = await this._computePercentileThresholds(enabled, fieldsData);
+    const thresholds = await this._computePercentileThresholds(enabled, fieldValues);
 
     // Apply filters
     const result = [];
 
     for (const cellIdx of cellIndices) {
-      if (this._evaluateCell(cellIdx, enabled, fieldsData, thresholds)) {
+      if (this._evaluateCell(cellIdx, enabled, fieldValues, thresholds)) {
         result.push(cellIdx);
       }
     }
@@ -353,15 +361,16 @@ export class QueryBuilder {
   /**
    * Pre-compute percentile thresholds for top_percent/bottom_percent operators
    */
-  async _computePercentileThresholds(conditions, fieldsData) {
+  async _computePercentileThresholds(conditions, fieldValues) {
     const thresholds = new Map();
 
-    for (const cond of conditions) {
+    for (let conditionIndex = 0; conditionIndex < conditions.length; conditionIndex++) {
+      const cond = conditions[conditionIndex];
       if (cond.operator === 'top_percent' || cond.operator === 'bottom_percent') {
-        const fieldValues = fieldsData[cond.field];
-        if (!fieldValues) continue;
+        const values = fieldValues[conditionIndex];
+        if (!values) continue;
 
-        const validValues = filterFiniteNumbers(Array.from(fieldValues));
+        const validValues = filterFiniteNumbers(Array.from(values));
 
         if (validValues.length === 0) continue;
 
@@ -390,16 +399,26 @@ export class QueryBuilder {
   /**
    * Evaluate a single cell against all conditions
    */
-  _evaluateCell(cellIdx, conditions, fieldsData, thresholds) {
+  _evaluateCell(cellIdx, conditions, fieldValues, thresholds) {
     if (conditions.length === 0) return true;
 
     // Start with first condition
-    let result = this._evaluateCondition(conditions[0], cellIdx, fieldsData, thresholds);
+    let result = this._evaluateCondition(
+      conditions[0],
+      fieldValues[0],
+      cellIdx,
+      thresholds,
+    );
 
     // Apply remaining conditions with logic
     for (let i = 1; i < conditions.length; i++) {
       const cond = conditions[i];
-      const condResult = this._evaluateCondition(cond, cellIdx, fieldsData, thresholds);
+      const condResult = this._evaluateCondition(
+        cond,
+        fieldValues[i],
+        cellIdx,
+        thresholds,
+      );
 
       if (cond.logic === 'AND') {
         result = result && condResult;
@@ -414,8 +433,7 @@ export class QueryBuilder {
   /**
    * Evaluate a single condition for a cell
    */
-  _evaluateCondition(condition, cellIdx, fieldsData, thresholds) {
-    const fieldValues = fieldsData[condition.field];
+  _evaluateCondition(condition, fieldValues, cellIdx, thresholds) {
     if (!fieldValues) return false;
 
     const value = fieldValues[cellIdx];

@@ -52,6 +52,7 @@ import {
 import { loadPlotly, downloadImage } from '../../../plots/plotly-loader.js';
 import { PlotRegistry } from '../../../shared/plot-registry-utils.js';
 import { PlotlyRenderSlot } from '../../../shared/plotly-render-slot.js';
+import { setOwnDataProperty } from '../../../../../utils/exact-record.js';
 
 function isPlainObject(value) {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
@@ -248,17 +249,19 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
       if (Object.hasOwn(out, name)) {
         throw new TypeError(`Form control name "${name}" is duplicated`);
       }
+      let control;
       if (el instanceof HTMLInputElement && el.type === 'checkbox') {
-        out[name] = { type: 'checkbox', value: el.checked };
+        control = { type: 'checkbox', value: el.checked };
       } else if (el instanceof HTMLInputElement) {
-        out[name] = { type: 'value', value: el.value };
+        control = { type: 'value', value: el.value };
       } else if (el instanceof HTMLSelectElement) {
-        out[name] = { type: 'value', value: el.value };
+        control = { type: 'value', value: el.value };
       } else if (el instanceof HTMLTextAreaElement) {
-        out[name] = { type: 'value', value: el.value };
+        control = { type: 'value', value: el.value };
       } else {
         throw new TypeError(`Form control "${name}" has an unsupported element type`);
       }
+      setOwnDataProperty(out, name, control);
     });
 
     requireFormControlSnapshot(out);

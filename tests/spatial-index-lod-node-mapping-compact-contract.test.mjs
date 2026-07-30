@@ -7,8 +7,9 @@ import {
   SpatialIndex,
 } from '../assets/js/rendering/high-perf-renderer.js';
 
-const UINT32_SENTINEL = 0xffffffff;
 const UNIFORM_NAMES = Object.freeze([
+  'u_alphaTex',
+  'u_alphaTexWidth',
   'u_mvpMatrix',
   'u_viewMatrix',
   'u_modelMatrix',
@@ -23,7 +24,39 @@ const UNIFORM_NAMES = Object.freeze([
   'u_fogFar',
   'u_fogColor',
   'u_lightDir',
+  'u_invAlphaTexWidth',
+  'u_invLodIndexTexWidth',
+  'u_lodIndexTex',
+  'u_lodIndexTexWidth',
+  'u_useAlphaTex',
+  'u_useLodIndexTex',
 ]);
+
+const FAKE_DUMMY_LOD_INDEX_TEXTURE = Object.freeze({
+  format: 'R32UI',
+});
+const FAKE_SNAPSHOT_ALPHA_TEXTURE = Object.freeze({
+  format: 'R8',
+});
+
+function makeSnapshotFixture(
+  pointCount,
+  positions = undefined,
+) {
+  const alphaTexData = new Uint8Array(pointCount);
+  alphaTexData.fill(255);
+  return {
+    alphaTexData,
+    alphaTexHeight: 1,
+    alphaTexWidth: pointCount,
+    alphaTexture: FAKE_SNAPSHOT_ALPHA_TEXTURE,
+    alphaTextureByteLength: alphaTexData.byteLength,
+    id: 'snapshot-fixture',
+    pointCount,
+    positions,
+    vao: {},
+  };
+}
 
 function collectLeaves(root) {
   const leaves = [];
@@ -186,18 +219,21 @@ function buildLodNodeMappingsWithoutNotificationUi(spatialIndex) {
   spatialIndex._lodNodeMappingsBuilt = true;
 }
 
-function legacyCompactIndices(level, visibleLeaves, pointCount) {
-  const compactRankByOriginalId = new Uint32Array(pointCount);
-  compactRankByOriginalId.fill(UINT32_SENTINEL);
-  for (let compactIndex = 0; compactIndex < level.indices.length; compactIndex++) {
-    compactRankByOriginalId[level.indices[compactIndex]] = compactIndex;
-  }
-
-  const result = [];
+function globalCompactRankIndices(level, visibleLeaves) {
+  const visibleOriginalIds = new Set();
   for (const leaf of visibleLeaves) {
     for (const originalId of leaf.indices) {
-      const compactIndex = compactRankByOriginalId[originalId];
-      if (compactIndex !== UINT32_SENTINEL) result.push(compactIndex);
+      visibleOriginalIds.add(originalId);
+    }
+  }
+  const result = [];
+  for (
+    let compactRank = 0;
+    compactRank < level.indices.length;
+    compactRank++
+  ) {
+    if (visibleOriginalIds.has(level.indices[compactRank])) {
+      result.push(compactRank);
     }
   }
   return Uint32Array.from(result);
@@ -238,7 +274,8 @@ function makeRenderHarness() {
       activeQuality: 'full',
       uniformLocations: new Map([['full', uniforms]]),
       stats: {},
-      _dummyLodIndexTexture: {},
+      _dummyLodIndexTexture:
+        FAKE_DUMMY_LOD_INDEX_TEXTURE,
       _lodResourceOwnersByDimension: new Map(),
       _validatedLodNodeMappings: new WeakMap(),
       _validatedSpatialIndices: new WeakSet(),
@@ -273,6 +310,16 @@ function makeViewState(visibleLeaves, spatialIndex = null) {
     indexBuffer: {},
     indexBufferSize: 0,
     indexBufferByteLength: 0,
+    stats: {
+      cullPercent: 0,
+      drawCalls: 0,
+      fps: 0,
+      frustumCulled: false,
+      lastFrameTime: 0,
+      lodLevel: -1,
+      visiblePoints: 0,
+    },
+    statsPublished: false,
   };
 }
 
@@ -345,7 +392,7 @@ function ownStateMatches(snapshot) {
   return true;
 }
 
-test('LOD node mappings retain one maximum-prefix backing store instead of per-level leaf arrays', () => {
+test('LOD node mappings retain one maximum-prefix owner plus small shared leaf marks instead of per-level arrays', () => {
   const {
     leaves,
     reducedCounts,
@@ -359,21 +406,28 @@ test('LOD node mappings retain one maximum-prefix backing store instead of per-l
   const maximumReducedCount = Math.max(...reducedCounts);
   assert.equal(
     addedBuffers.length,
-    1,
-    'all reduced levels must share one newly retained mapping backing store',
+    2,
+    'all reduced levels must share one rank owner and one reusable leaf-mark owner',
   );
-  assert.equal(
-    addedBuffers[0].byteLength,
-    maximumReducedCount * Uint32Array.BYTES_PER_ELEMENT,
-    'mapping storage must be bounded by the largest reduced prefix',
+  assert.deepEqual(
+    addedBuffers
+      .map(buffer => buffer.byteLength)
+      .sort((left, right) => left - right),
+    [
+      leaves.length * Uint32Array.BYTES_PER_ELEMENT,
+      maximumReducedCount * Uint32Array.BYTES_PER_ELEMENT,
+    ].sort((left, right) => left - right),
+    'mapping storage must be bounded by Kmax plus one mark per leaf',
   );
 
-  const addedBuffer = addedBuffers[0];
-  const addedViews = collectReachableTypedViews(spatialIndex)
-    .filter(view => view.buffer === addedBuffer);
-  assert.ok(
-    addedViews.some(view => view.byteLength === addedBuffer.byteLength),
-    'the exact maximum-prefix owner must remain reachable',
+  assert.equal(
+    spatialIndex._lodNodeMapping
+      .leafOrdinalsByCompactRank.byteLength,
+    maximumReducedCount * Uint32Array.BYTES_PER_ELEMENT,
+  );
+  assert.equal(
+    spatialIndex._lodNodeMapping.visibleLeafMarks.byteLength,
+    leaves.length * Uint32Array.BYTES_PER_ELEMENT,
   );
 
   for (const leaf of leaves) {
@@ -387,12 +441,112 @@ test('LOD node mappings retain one maximum-prefix backing store instead of per-l
     assert.deepEqual(
       leafAddedBuffers,
       [],
-      'leaf mapping metadata must be scalar offsets/counts into the shared owner',
+      'leaf mapping metadata must contain only its scalar generation and ordinal',
     );
   }
 });
 
-test('compact LOD node mapping preserves every legacy compact-index order for every level and visible-leaf subset', () => {
+test('degenerate 1D/2D/3D partitions reuse one exact dataset-sized index owner at every unary depth', () => {
+  const pointCount = 4_097;
+  const maxDepth = 6;
+  const fixtures = [1, 2, 3].map(dimensionLevel => ({
+    dimensionLevel,
+    positions: new Float32Array(pointCount * 3),
+  }));
+  const NativeUint32Array = globalThis.Uint32Array;
+  const NativeUint8Array = globalThis.Uint8Array;
+  const datasetSizedUint32Owners = [];
+  const datasetSizedUint8Owners = [];
+  const trackAllocations = (NativeType, owners) => new Proxy(
+    NativeType,
+    {
+      construct(target, argumentsList) {
+        const owner = Reflect.construct(
+          target,
+          argumentsList,
+          target,
+        );
+        if (argumentsList[0] === pointCount) {
+          owners.push(owner);
+        }
+        return owner;
+      },
+    },
+  );
+
+  globalThis.Uint32Array = trackAllocations(
+    NativeUint32Array,
+    datasetSizedUint32Owners,
+  );
+  globalThis.Uint8Array = trackAllocations(
+    NativeUint8Array,
+    datasetSizedUint8Owners,
+  );
+  const spatialIndices = [];
+  try {
+    for (const fixture of fixtures) {
+      spatialIndices.push(new SpatialIndex(
+        fixture.positions,
+        null,
+        fixture.dimensionLevel,
+        64,
+        maxDepth,
+        {
+          buildLOD: false,
+          buildLodNodeMappings: false,
+          computeNodeStats: false,
+        },
+      ));
+    }
+  } finally {
+    globalThis.Uint32Array = NativeUint32Array;
+    globalThis.Uint8Array = NativeUint8Array;
+  }
+
+  assert.equal(
+    datasetSizedUint32Owners.length,
+    fixtures.length,
+    'each tree must allocate only its root source-ID owner',
+  );
+  assert.equal(
+    datasetSizedUint8Owners.length,
+    0,
+    'unary recursion must not allocate an N-byte child-routing owner',
+  );
+
+  for (
+    let fixtureIndex = 0;
+    fixtureIndex < spatialIndices.length;
+    fixtureIndex++
+  ) {
+    const spatialIndex = spatialIndices[fixtureIndex];
+    const rootOwner =
+      datasetSizedUint32Owners[fixtureIndex];
+    let node = spatialIndex.root;
+    let depth = 0;
+    while (node.indices === null) {
+      assert.equal(node.pointCount, pointCount);
+      const occupiedChildren =
+        node.children.filter(Boolean);
+      assert.equal(
+        occupiedChildren.length,
+        1,
+        `${spatialIndex.dimensionLevel}D degenerate nodes must remain unary`,
+      );
+      node = occupiedChildren[0];
+      depth++;
+    }
+    assert.equal(depth, maxDepth);
+    assert.strictEqual(
+      node.indices,
+      rootOwner,
+      `${spatialIndex.dimensionLevel}D recursion must retain the exact root owner`,
+    );
+    assert.equal(node.pointCount, pointCount);
+  }
+});
+
+test('compact LOD node mapping emits exact global compact-rank order for every level and visible-leaf subset', () => {
   const {
     leaves,
     spatialIndex,
@@ -415,10 +569,9 @@ test('compact LOD node mapping preserves every legacy compact-index order for ev
       const visibleLeaves = leaves.filter(
         (_leaf, leafIndex) => (mask & (1 << leafIndex)) !== 0,
       );
-      const expected = legacyCompactIndices(
+      const expected = globalCompactRankIndices(
         level,
         visibleLeaves,
-        spatialIndex.pointCount,
       );
       const viewState =
         makeViewState(visibleLeaves, spatialIndex);
@@ -432,6 +585,7 @@ test('compact LOD node mapping preserves every legacy compact-index order for ev
         viewState,
         spatialIndex,
         lodBuffers,
+        false,
       );
 
       assert.deepEqual(
@@ -453,6 +607,106 @@ test('compact LOD node mapping preserves every legacy compact-index order for ev
   }
 });
 
+test('reversed-Morton wide-frustum mapping examines exactly K ranks instead of adversarial Kmax leaf segments', (t) => {
+  const spatialIndex = makeLargeSpatialIndex(100_001);
+  buildLodNodeMappingsWithoutNotificationUi(spatialIndex);
+  const owner = spatialIndex._lodNodeMapping;
+  const visibleLeaves =
+    collectLeaves(spatialIndex.root).reverse();
+  const lodLevel = 0;
+  const prefixCount =
+    spatialIndex.lodLevels[lodLevel].pointCount;
+  const maximumCount =
+    owner.leafOrdinalsByCompactRank.length;
+
+  const perLeafCount =
+    new Uint32Array(visibleLeaves.length);
+  const perLeafMinimum =
+    new Uint32Array(visibleLeaves.length);
+  const perLeafMaximum =
+    new Uint32Array(visibleLeaves.length);
+  perLeafMinimum.fill(0xffffffff);
+  for (
+    let compactRank = 0;
+    compactRank < maximumCount;
+    compactRank++
+  ) {
+    const ordinal =
+      owner.leafOrdinalsByCompactRank[compactRank];
+    perLeafCount[ordinal]++;
+    if (compactRank < perLeafMinimum[ordinal]) {
+      perLeafMinimum[ordinal] = compactRank;
+    }
+    perLeafMaximum[ordinal] = compactRank;
+  }
+  let legacyPartialLeafScans = 0;
+  for (
+    let ordinal = 0;
+    ordinal < perLeafCount.length;
+    ordinal++
+  ) {
+    if (
+      perLeafMinimum[ordinal] < prefixCount &&
+      perLeafMaximum[ordinal] >= prefixCount
+    ) {
+      legacyPartialLeafScans += perLeafCount[ordinal];
+    }
+  }
+
+  assert.ok(
+    maximumCount / prefixCount > 30,
+    'the deterministic first reversed-Morton LOD must be far below Kmax',
+  );
+  assert.ok(
+    legacyPartialLeafScans / prefixCount > 10,
+    'the prior leaf-segment algorithm must face a deterministic scan amplification',
+  );
+
+  assert.equal(
+    spatialIndex.countLodMappedIndices(
+      visibleLeaves,
+      lodLevel,
+    ),
+    prefixCount,
+  );
+  assert.equal(
+    owner.queryState.lastExaminedRanks,
+    prefixCount,
+    'count must examine exactly the requested prefix',
+  );
+  const target = new Uint32Array(prefixCount);
+  assert.equal(
+    spatialIndex.writeLodMappedIndices(
+      visibleLeaves,
+      lodLevel,
+      target,
+    ),
+    prefixCount,
+  );
+  assert.equal(
+    owner.queryState.lastExaminedRanks,
+    prefixCount,
+    'write must examine exactly the requested prefix',
+  );
+  for (
+    let compactRank = 0;
+    compactRank < prefixCount;
+    compactRank++
+  ) {
+    assert.equal(
+      target[compactRank],
+      compactRank,
+      'output must remain globally compact-rank ordered even when leaves are reversed',
+    );
+  }
+  t.diagnostic(
+    `K=${prefixCount.toLocaleString()}, ` +
+    `Kmax=${maximumCount.toLocaleString()}, ` +
+    `prior partial-leaf scan=${legacyPartialLeafScans.toLocaleString()}, ` +
+    `new examined ranks=${owner.queryState.lastExaminedRanks.toLocaleString()}`,
+  );
+});
+
 test('custom-position snapshots translate the exact live compact order without a visible-ID Set or full-prefix scratch', () => {
   const {
     hierarchicalOrder,
@@ -470,6 +724,10 @@ test('custom-position snapshots translate the exact live compact order without a
     renderer,
     uploads,
   } = makeRenderHarness();
+  const snapshot = makeSnapshotFixture(
+    spatialIndex.pointCount,
+    spatialIndex.positions,
+  );
   const renderSource =
     HighPerfRenderer.prototype
       ._renderSnapshotLODWithFrustumCulling
@@ -489,10 +747,9 @@ test('custom-position snapshots translate the exact live compact order without a
         (_leaf, leafIndex) =>
           (mask & (1 << leafIndex)) !== 0,
       );
-      const compactOrder = legacyCompactIndices(
+      const compactOrder = globalCompactRankIndices(
         level,
         visibleLeaves,
-        spatialIndex.pointCount,
       );
       const expectedOriginalOrder = Uint32Array.from(
         compactOrder,
@@ -504,7 +761,7 @@ test('custom-position snapshots translate the exact live compact order without a
       const drawsBefore = drawCounts.length;
 
       renderer._renderSnapshotLODWithFrustumCulling(
-        { vao: {}, positions: spatialIndex.positions },
+        snapshot,
         lodLevel,
         makeRenderParams(
           `custom-snapshot-${lodLevel}-${mask}`,
@@ -514,6 +771,7 @@ test('custom-position snapshots translate the exact live compact order without a
         false,
         spatialIndex,
         lodBuffers,
+        false,
       );
 
       assert.deepEqual(
@@ -558,6 +816,9 @@ test('snapshot LOD changes reuse unchanged-frustum leaves and retain exact per-v
     vao: {},
   }));
   const { renderer, uploads } = makeRenderHarness();
+  const snapshot = makeSnapshotFixture(
+    spatialIndex.pointCount,
+  );
   const viewA = makeSnapshotViewState(
     spatialIndex,
     [leaves[0], leaves[2]],
@@ -574,10 +835,9 @@ test('snapshot LOD changes reuse unchanged-frustum leaves and retain exact per-v
     new Uint32Array(formerlyWideCapacity);
   viewB.visibleLodIndicesCapacity = formerlyWideCapacity;
   const expectedOriginalOrder = (lodLevel, visibleLeaves) => {
-    const compact = legacyCompactIndices(
+    const compact = globalCompactRankIndices(
       spatialIndex.lodLevels[lodLevel],
       visibleLeaves,
-      spatialIndex.pointCount,
     );
     return Uint32Array.from(
       compact,
@@ -586,7 +846,7 @@ test('snapshot LOD changes reuse unchanged-frustum leaves and retain exact per-v
   };
 
   renderer._renderSnapshotLODWithFrustumCulling(
-    { vao: {} },
+    snapshot,
     3,
     makeRenderParams('snapshot-a'),
     [],
@@ -594,6 +854,7 @@ test('snapshot LOD changes reuse unchanged-frustum leaves and retain exact per-v
     false,
     spatialIndex,
     lodBuffers,
+    false,
   );
   const viewABuffer = viewA.visibleLodIndicesBuffer;
   assert.equal(
@@ -611,7 +872,7 @@ test('snapshot LOD changes reuse unchanged-frustum leaves and retain exact per-v
   );
 
   renderer._renderSnapshotLODWithFrustumCulling(
-    { vao: {} },
+    snapshot,
     2,
     makeRenderParams('snapshot-b'),
     [],
@@ -619,6 +880,7 @@ test('snapshot LOD changes reuse unchanged-frustum leaves and retain exact per-v
     false,
     spatialIndex,
     lodBuffers,
+    false,
   );
   assert.notStrictEqual(
     viewA.visibleLodIndicesBuffer,
@@ -641,7 +903,7 @@ test('snapshot LOD changes reuse unchanged-frustum leaves and retain exact per-v
     );
   };
   renderer._renderSnapshotLODWithFrustumCulling(
-    { vao: {} },
+    snapshot,
     1,
     makeRenderParams('snapshot-a'),
     [],
@@ -649,6 +911,7 @@ test('snapshot LOD changes reuse unchanged-frustum leaves and retain exact per-v
     false,
     spatialIndex,
     lodBuffers,
+    false,
   );
 
   assert.strictEqual(
@@ -683,6 +946,9 @@ test('unchanged-frustum full/reduced transitions rebuild mode data once and then
   const { renderer, uploads } = makeRenderHarness();
   renderer.pointCount = spatialIndex.pointCount;
   renderer.vao = {};
+  const snapshot = makeSnapshotFixture(
+    spatialIndex.pointCount,
+  );
   const originalCollect =
     renderer._collectVisibleNodes.bind(renderer);
 
@@ -697,10 +963,11 @@ test('unchanged-frustum full/reduced transitions rebuild mode data once and then
         viewState,
         spatialIndex,
         lodBuffers,
+        false,
       );
     } else {
       renderer._renderSnapshotLODWithFrustumCulling(
-        { vao: {} },
+        snapshot,
         2,
         makeRenderParams('snapshot-mode-transition'),
         [],
@@ -708,6 +975,7 @@ test('unchanged-frustum full/reduced transitions rebuild mode data once and then
         false,
         spatialIndex,
         lodBuffers,
+        false,
       );
     }
 
@@ -722,16 +990,18 @@ test('unchanged-frustum full/reduced transitions rebuild mode data once and then
         [],
         viewState,
         spatialIndex,
+        false,
       );
     } else {
       renderer._renderSnapshotWithFrustumCulling(
-        { pointCount: spatialIndex.pointCount, vao: {} },
+        snapshot,
         makeRenderParams('snapshot-mode-transition'),
         [],
         viewState,
         1,
         false,
         spatialIndex,
+        false,
       );
     }
     assert.equal(transitionTraversals, 1);
@@ -755,10 +1025,11 @@ test('unchanged-frustum full/reduced transitions rebuild mode data once and then
         viewState,
         spatialIndex,
         lodBuffers,
+        false,
       );
     } else {
       renderer._renderSnapshotLODWithFrustumCulling(
-        { vao: {} },
+        snapshot,
         1,
         makeRenderParams('snapshot-mode-transition'),
         [],
@@ -766,6 +1037,7 @@ test('unchanged-frustum full/reduced transitions rebuild mode data once and then
         false,
         spatialIndex,
         lodBuffers,
+        false,
       );
     }
     assert.equal(viewState.cachedLodLevel, 1);
@@ -790,6 +1062,9 @@ test('snapshot empty visibility stays upload-free and mapping generations force 
     renderer,
     uploads,
   } = harness;
+  const snapshot = makeSnapshotFixture(
+    spatialIndex.pointCount,
+  );
 
   let countCalls = 0;
   let writeCalls = 0;
@@ -812,7 +1087,7 @@ test('snapshot empty visibility stays upload-free and mapping generations force 
     new Uint32Array(400_000);
   emptyView.visibleLodIndicesCapacity = 400_000;
   renderer._renderSnapshotLODWithFrustumCulling(
-    { vao: {} },
+    snapshot,
     1,
     makeRenderParams('snapshot-empty'),
     [],
@@ -820,9 +1095,10 @@ test('snapshot empty visibility stays upload-free and mapping generations force 
     false,
     spatialIndex,
     lodBuffers,
+    false,
   );
   renderer._renderSnapshotLODWithFrustumCulling(
-    { vao: {} },
+    snapshot,
     1,
     makeRenderParams('snapshot-empty'),
     [],
@@ -830,6 +1106,7 @@ test('snapshot empty visibility stays upload-free and mapping generations force 
     false,
     spatialIndex,
     lodBuffers,
+    false,
   );
   assert.equal(countCalls, 0);
   assert.equal(writeCalls, 0);
@@ -856,6 +1133,7 @@ test('snapshot empty visibility stays upload-free and mapping generations force 
     emptyLiveView,
     spatialIndex,
     lodBuffers,
+    false,
   );
   assert.equal(
     emptyLiveView.visibleLodIndicesCapacity,
@@ -868,7 +1146,7 @@ test('snapshot empty visibility stays upload-free and mapping generations force 
     leaves,
   );
   renderer._renderSnapshotLODWithFrustumCulling(
-    { vao: {} },
+    snapshot,
     2,
     makeRenderParams('snapshot-retry'),
     [],
@@ -876,6 +1154,7 @@ test('snapshot empty visibility stays upload-free and mapping generations force 
     false,
     spatialIndex,
     lodBuffers,
+    false,
   );
   const acceptedGeneration =
     retryView.cachedLodMappingGeneration;
@@ -903,7 +1182,7 @@ test('snapshot empty visibility stays upload-free and mapping generations force 
   };
   assert.throws(
     () => renderer._renderSnapshotLODWithFrustumCulling(
-      { vao: {} },
+      snapshot,
       2,
       makeRenderParams('snapshot-retry'),
       [],
@@ -911,6 +1190,7 @@ test('snapshot empty visibility stays upload-free and mapping generations force 
       false,
       spatialIndex,
       lodBuffers,
+      false,
     ),
     /synthetic snapshot EBO upload failure/,
   );
@@ -924,7 +1204,7 @@ test('snapshot empty visibility stays upload-free and mapping generations force 
   assert.equal(retryView.cachedLodMappingGeneration, null);
 
   renderer._renderSnapshotLODWithFrustumCulling(
-    { vao: {} },
+    snapshot,
     2,
     makeRenderParams('snapshot-retry'),
     [],
@@ -932,6 +1212,7 @@ test('snapshot empty visibility stays upload-free and mapping generations force 
     false,
     spatialIndex,
     lodBuffers,
+    false,
   );
   assert.equal(
     retryView.cachedLodMappingGeneration,
@@ -957,13 +1238,16 @@ test('large narrow-frustum snapshot scratch is bounded by mapped visibility, not
     vao: {},
   }));
   const { renderer } = makeRenderHarness();
+  const snapshot = makeSnapshotFixture(
+    spatialIndex.pointCount,
+  );
   const viewState = makeSnapshotViewState(
     spatialIndex,
     visibleLeaves,
   );
 
   renderer._renderSnapshotLODWithFrustumCulling(
-    { vao: {} },
+    snapshot,
     lodLevel,
     makeRenderParams('snapshot-large-narrow'),
     [],
@@ -971,6 +1255,7 @@ test('large narrow-frustum snapshot scratch is bounded by mapped visibility, not
     false,
     spatialIndex,
     lodBuffers,
+    false,
   );
 
   assert.equal(
@@ -999,6 +1284,7 @@ test('large narrow-frustum snapshot scratch is bounded by mapped visibility, not
     liveViewState,
     spatialIndex,
     lodBuffers,
+    false,
   );
   assert.equal(
     liveViewState.visibleLodIndicesCapacity,
@@ -1060,15 +1346,20 @@ test('LOD node mapping publication is atomic and a failed build retries from the
   );
 });
 
-test('large-N LOD node mapping retained bytes stay at the maximum-prefix bound', (t) => {
+test('large-N LOD node mapping retained bytes stay at the maximum-prefix plus leaf-mark bound', (t) => {
   const spatialIndex = makeLargeSpatialIndex(10_001);
   const buffersBefore = collectReachableBuffers(spatialIndex);
   const reducedLevels = spatialIndex.lodLevels.filter(
     level => !level.isFullDetail,
   );
-  const expectedBound = Math.max(
+  const maximumPrefixBytes = Math.max(
     ...reducedLevels.map(level => level.pointCount),
   ) * Uint32Array.BYTES_PER_ELEMENT;
+  const leafMarkBytes =
+    collectLeaves(spatialIndex.root).length *
+    Uint32Array.BYTES_PER_ELEMENT;
+  const expectedBound =
+    maximumPrefixBytes + leafMarkBytes;
   const legacyPerLevelBytes = reducedLevels.reduce(
     (total, level) => total + level.pointCount * Uint32Array.BYTES_PER_ELEMENT,
     0,
@@ -1089,7 +1380,13 @@ test('large-N LOD node mapping retained bytes stay at the maximum-prefix bound',
     `legacy per-level projection ${legacyPerLevelBytes.toLocaleString()} bytes; ` +
     `maximum-prefix bound ${expectedBound.toLocaleString()} bytes`,
   );
-  assert.equal(addedBuffers.length, 1);
+  assert.equal(addedBuffers.length, 2);
   assert.equal(retainedBytes, expectedBound);
-  assert.ok(legacyPerLevelBytes / expectedBound > 4.5);
+  assert.ok(
+    legacyPerLevelBytes / maximumPrefixBytes > 4.5,
+  );
+  assert.ok(
+    leafMarkBytes < maximumPrefixBytes / 4,
+    'the reusable per-leaf marks must remain small relative to Kmax',
+  );
 });

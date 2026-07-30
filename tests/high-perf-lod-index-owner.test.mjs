@@ -5,6 +5,20 @@ import {
   HighPerfRenderer,
 } from '../assets/js/rendering/high-perf-renderer.js';
 
+function makeMembership(indices, dimensionLevel, pointCount) {
+  const admissionLevels = new Uint8Array(pointCount);
+  admissionLevels.fill(0xff);
+  for (const index of indices) admissionLevels[index] = 0;
+  return Object.freeze({
+    admissionLevels,
+    dimensionLevel,
+    generationToken: Object.freeze({}),
+    indices,
+    lodLevel: 0,
+    pointCount,
+  });
+}
+
 function makeRenderer() {
   const mainPositions = Float32Array.from([
     0, 0, 0,
@@ -20,13 +34,19 @@ function makeRenderer() {
   ]);
   const mainIndices = Uint32Array.from([0, 2]);
   const customIndices = Uint32Array.from([1, 3]);
+  const mainMembership = makeMembership(mainIndices, 2, 4);
+  const customMembership = makeMembership(customIndices, 2, 4);
   const mainSpatialIndex = {
     dimensionLevel: 2,
     lodLevels: [{
       indices: mainIndices,
       isFullDetail: false,
+      pointCount: mainIndices.length,
       sizeMultiplier: 1.5,
     }],
+    getLodMembership() {
+      return mainMembership;
+    },
     positions: mainPositions,
   };
   const customSpatialIndex = {
@@ -34,8 +54,12 @@ function makeRenderer() {
     lodLevels: [{
       indices: customIndices,
       isFullDetail: false,
+      pointCount: customIndices.length,
       sizeMultiplier: 2.5,
     }],
+    getLodMembership() {
+      return customMembership;
+    },
     positions: customPositions,
   };
   const renderer = Object.assign(
@@ -68,8 +92,10 @@ function makeRenderer() {
   );
   return {
     customIndices,
+    customMembership,
     customPositions,
     mainIndices,
+    mainMembership,
     mainSpatialIndex,
     renderer,
   };
@@ -157,10 +183,29 @@ test('a new live generation detaches snapshots even when live array identity is 
 test('snapshot picking uses the same generation owner as rendering and LOD', () => {
   const fixture = makeRenderer();
   const shared = fixture.renderer.snapshotBuffers.get('snap_shared');
+  const sharedProjection =
+    fixture.renderer.getSnapshotSpatialIndex('snap_shared', 2);
 
-  assert.equal(
+  assert.notStrictEqual(
+    sharedProjection,
+    fixture.mainSpatialIndex,
+    'public picking access must not expose the mutable renderer owner',
+  );
+  assert.strictEqual(
     fixture.renderer.getSnapshotSpatialIndex('snap_shared', 2),
-    fixture.mainSpatialIndex
+    sharedProjection,
+    'an unchanged spatial generation must retain one stable projection',
+  );
+  assert.equal(sharedProjection.dimensionLevel, 2);
+  assert.deepEqual(
+    sharedProjection.lodLevels[0].indices,
+    fixture.mainIndices,
+  );
+  sharedProjection.lodLevels[0].indices[0] = 3;
+  assert.deepEqual(
+    fixture.mainIndices,
+    Uint32Array.from([0, 2]),
+    'projected query arrays must be detached from accepted topology',
   );
 
   fixture.renderer._liveGeometryGeneration = 11;
@@ -175,22 +220,24 @@ test('snapshot picking uses the same generation owner as rendering and LOD', () 
     positions: shared.positions,
   };
   shared.spatialIndex = snapshotSpatialIndex;
-  assert.equal(
+  const snapshotProjection =
+    fixture.renderer.getSnapshotSpatialIndex('snap_shared', 2);
+  assert.notStrictEqual(snapshotProjection, snapshotSpatialIndex);
+  assert.strictEqual(
     fixture.renderer.getSnapshotSpatialIndex('snap_shared', 2),
-    snapshotSpatialIndex
+    snapshotProjection,
   );
+  assert.equal(snapshotProjection.dimensionLevel, 2);
 });
 
-test('snapshot LOD visibility and size use the exact generation owner', () => {
+test('snapshot LOD membership and size use the exact generation owner', () => {
   const sharedFixture = makeRenderer();
-  assert.deepEqual(
-    Array.from(
-      sharedFixture.renderer.getLodVisibilityArray(
-        'snap_shared',
-        2,
-      ),
+  assert.equal(
+    sharedFixture.renderer.getCurrentLodMembership(
+      'snap_shared',
+      2,
     ),
-    [1, 0, 1, 0],
+    sharedFixture.mainMembership,
   );
   assert.equal(
     sharedFixture.renderer.getCurrentLODSizeMultiplier(
@@ -201,14 +248,12 @@ test('snapshot LOD visibility and size use the exact generation owner', () => {
   );
 
   const customFixture = makeRenderer();
-  assert.deepEqual(
-    Array.from(
-      customFixture.renderer.getLodVisibilityArray(
-        'snap_custom',
-        2,
-      ),
+  assert.equal(
+    customFixture.renderer.getCurrentLodMembership(
+      'snap_custom',
+      2,
     ),
-    [0, 1, 0, 1],
+    customFixture.customMembership,
   );
   assert.equal(
     customFixture.renderer.getCurrentLODSizeMultiplier(

@@ -1,31 +1,586 @@
 /**
- * @fileoverview Cell Annotation Platform (CAP) API client.
+ * @fileoverview Cell Annotation Platform (CAP) proxy client.
  *
- * Provides access to celltype.info GraphQL API for:
- * - Cell type ontology lookups
- * - Marker gene information
- * - Community feedback scores
- * - Synonym detection
+ * The browser never sends GraphQL text or APQ material. It calls the fixed CAP
+ * routes on the trusted Cellucid Worker, which owns the persisted operations
+ * and validates the upstream projection.
  *
- * Privacy: search terms are sent to https://celltype.info/graphql.
+ * Privacy: search terms are relayed by the configured Cellucid Worker to CAP.
  *
  * @module community-annotations/cap-api
- * @see https://celltype.info/docs/python-client-for-cap-api
  */
 
+import { getGitHubWorkerOrigin } from './github-auth.js';
 import { parseExactJson } from './wire-contract.js';
 
-const CAP_GRAPHQL_URL = 'https://celltype.info/graphql';
 const CAP_DEFAULT_TIMEOUT_MS = 12_000;
+const CAP_WORKER_CONTRACT_VERSION = 1;
+const CAP_REQUEST_BODY_MAX_BYTES = 4 * 1024;
+const CAP_RESPONSE_BODY_MAX_BYTES = 8 * 1024 * 1024;
+const CAP_LOOKUP_LIMIT = 25;
+const CAP_DATASET_LIMIT = 10;
+const CAP_TERM_MAX_CODEPOINTS = 256;
+const CAP_MARKER_TERM_MAX_CODEPOINTS = (50 * 64) + 49;
+const CAP_RESULT_TEXT_MAX_CODEPOINTS = 512;
+const CAP_RESULT_ID_MAX_CODEPOINTS = 64;
+const CAP_RESULT_GENE_MAX_CODEPOINTS = 64;
+const CAP_RESULT_SYNONYM_LIMIT = 100;
+const CAP_RESULT_MARKER_LIMIT = 200;
+
+const LOOKUP_KINDS = new Set(['name', 'ontology', 'marker', 'feedback']);
+const LOOKUP_RESULT_KEYS = [
+  'canonicalMarkerGenes',
+  'count',
+  'fullName',
+  'id',
+  'markerGenes',
+  'name',
+  'ontologyTerm',
+  'ontologyTermId',
+  'scores',
+  'synonyms',
+];
+const DATASET_RESULT_KEYS = ['cellCount', 'id', 'name'];
 
 function toCleanString(value) {
   return String(value ?? '').trim();
 }
 
+function exceedsCodePointLimit(value, maximum) {
+  if (value.length <= maximum) return false;
+  if (value.length > maximum * 2) return true;
+  let count = 0;
+  for (const _character of value) {
+    count += 1;
+    if (count > maximum) return true;
+  }
+  return false;
+}
+
+function assertExactObject(value, label, expectedKeys) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(`${label} must be a JSON object`);
+  }
+  const actual = Object.keys(value).sort();
+  const expected = expectedKeys.slice().sort();
+  if (
+    actual.length !== expected.length ||
+    !actual.every((key, index) => key === expected[index])
+  ) {
+    throw new Error(`${label} must contain exactly ${expected.join(', ')}`);
+  }
+  return value;
+}
+
+function assertBoundedString(value, label, maxCodePoints, {
+  nullable = false,
+  nonblank = true,
+} = {}) {
+  if (nullable && value === null) return null;
+  if (typeof value !== 'string') {
+    throw new Error(`${label} must be ${nullable ? 'a string or null' : 'a string'}`);
+  }
+  if (
+    (nonblank && (!value || /^\s|\s$/.test(value) || !/\S/.test(value))) ||
+    exceedsCodePointLimit(value, maxCodePoints)
+  ) {
+    throw new Error(
+      `${label} must be ${nonblank ? 'an exact nonblank ' : 'an exact '}string of at most ` +
+      `${maxCodePoints} Unicode code points`
+    );
+  }
+  return value;
+}
+
+function assertNonnegativeSafeInteger(value, label) {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`${label} must be a nonnegative safe integer`);
+  }
+  return value;
+}
+
+function assertExactStringArray(value, label, {
+  maxItems,
+  maxCodePoints,
+} = {}) {
+  if (!Array.isArray(value) || value.length > maxItems) {
+    throw new Error(`${label} must be an array of at most ${maxItems} strings`);
+  }
+  return value.map((entry, index) => (
+    assertBoundedString(
+      entry,
+      `${label}[${index}]`,
+      maxCodePoints
+    )
+  ));
+}
+
+function assertAbortSignalOrNull(signal) {
+  if (
+    signal !== null &&
+    (
+      typeof signal !== 'object' ||
+      typeof signal.aborted !== 'boolean' ||
+      typeof signal.addEventListener !== 'function' ||
+      typeof signal.removeEventListener !== 'function'
+    )
+  ) {
+    throw new TypeError('CAP request signal must be an AbortSignal or exact null');
+  }
+  return signal;
+}
+
+function assertTimeoutMs(timeoutMs) {
+  if (
+    typeof timeoutMs !== 'number' ||
+    !Number.isSafeInteger(timeoutMs) ||
+    timeoutMs < 0
+  ) {
+    throw new Error('CAP timeoutMs must be a nonnegative safe integer');
+  }
+  return timeoutMs;
+}
+
+function createAbortError(message, cause = undefined) {
+  const error = new Error(message);
+  error.name = 'AbortError';
+  error.code = 'CAP_REQUEST_ABORTED';
+  if (cause !== undefined) error.cause = cause;
+  return error;
+}
+
+function ownerAbortReason(signal, fallbackCause = undefined) {
+  if (signal?.reason instanceof Error) return signal.reason;
+  return createAbortError('CAP request was cancelled', fallbackCause);
+}
+
+function createRequestAbortScope(signal, timeoutMs) {
+  const ownerSignal = assertAbortSignalOrNull(signal);
+  const ms = assertTimeoutMs(timeoutMs);
+  if (typeof AbortController !== 'function') {
+    throw new Error('AbortController is required for CAP requests');
+  }
+  const controller = new AbortController();
+  let abortCause = null;
+  const abort = (cause, reason = undefined) => {
+    if (abortCause !== null) return;
+    abortCause = cause;
+    controller.abort(reason);
+  };
+  const abortFromOwner = () => abort('owner', ownerSignal?.reason);
+  if (ownerSignal !== null) {
+    if (ownerSignal.aborted) abortFromOwner();
+    else ownerSignal.addEventListener('abort', abortFromOwner, { once: true });
+  }
+
+  /** @type {ReturnType<typeof setTimeout>|null} */
+  let timeout = null;
+  if (ms > 0) {
+    try {
+      timeout = setTimeout(() => {
+        abort('timeout', createAbortError(`CAP request timed out after ${ms}ms`));
+      }, ms);
+    } catch (error) {
+      ownerSignal?.removeEventListener('abort', abortFromOwner);
+      throw error;
+    }
+  }
+
+  return {
+    controller,
+    ownerSignal,
+    abortCause: () => abortCause,
+    cleanup() {
+      try {
+        if (timeout !== null) clearTimeout(timeout);
+      } catch {
+        // Request cleanup cannot replace its primary outcome.
+      }
+      try {
+        ownerSignal?.removeEventListener('abort', abortFromOwner);
+      } catch {
+        // Request cleanup cannot replace its primary outcome.
+      }
+    },
+  };
+}
+
+function throwIfAborted(scope, cause = undefined) {
+  const abortCause = scope.abortCause();
+  if (abortCause === 'owner') {
+    throw ownerAbortReason(scope.ownerSignal, cause);
+  }
+  if (abortCause === 'timeout') {
+    const error = new Error('CAP request timed out');
+    error.code = 'CAP_REQUEST_TIMEOUT';
+    if (cause !== undefined) error.cause = cause;
+    throw error;
+  }
+}
+
+function isNetworkError(error) {
+  if (error instanceof TypeError) return true;
+  const message = toCleanString(error?.message);
+  return /failed to fetch|load failed|networkerror|fetch failed/i.test(message);
+}
+
+function workerUrl(path) {
+  if (path !== '/cap/lookup-cells' && path !== '/cap/search-datasets') {
+    throw new Error('CAP proxy path is not an approved persisted operation');
+  }
+  return `${getGitHubWorkerOrigin()}${path}`;
+}
+
+function parseWorkerError(value, status) {
+  if (
+    value &&
+    typeof value === 'object' &&
+    !Array.isArray(value) &&
+    Object.keys(value).length === 1 &&
+    typeof value.error === 'string' &&
+    value.error &&
+    !/^\s|\s$/.test(value.error) &&
+    !exceedsCodePointLimit(
+      value.error,
+      CAP_RESULT_TEXT_MAX_CODEPOINTS
+    )
+  ) {
+    return value.error;
+  }
+  return `HTTP ${status}`;
+}
+
+function createCapError(message, code, cause = undefined) {
+  const error = new Error(message);
+  error.code = code;
+  if (cause !== undefined) error.cause = cause;
+  return error;
+}
+
+async function cancelResponseBodyPreservingOutcome(response) {
+  if (response?.body && typeof response.body.cancel === 'function') {
+    try {
+      await response.body.cancel();
+    } catch {
+      // Preserve the authoritative response-boundary outcome.
+    }
+  }
+}
+
+function assertResponseContentLength(response) {
+  const raw = response?.headers?.get?.('content-length') ?? null;
+  if (raw === null || raw === '') return;
+  if (!/^\d+$/.test(raw)) return;
+  const byteLength = Number(raw);
+  if (
+    !Number.isSafeInteger(byteLength) ||
+    byteLength > CAP_RESPONSE_BODY_MAX_BYTES
+  ) {
+    throw createCapError(
+      `CAP proxy response exceeds ${CAP_RESPONSE_BODY_MAX_BYTES} bytes`,
+      'CAP_RESPONSE_TOO_LARGE'
+    );
+  }
+}
+
+async function readBoundedResponseText(response) {
+  try {
+    assertResponseContentLength(response);
+  } catch (error) {
+    await cancelResponseBodyPreservingOutcome(response);
+    throw error;
+  }
+
+  const body = response?.body;
+  if (body && typeof body.getReader === 'function') {
+    const reader = body.getReader();
+    // Preserve a UTF-8 BOM so the exact JSON boundary rejects it.
+    const decoder = new TextDecoder('utf-8', {
+      fatal: true,
+      ignoreBOM: true,
+    });
+    const chunks = [];
+    let byteLength = 0;
+    let streamDone = false;
+    let readerCancelled = false;
+    const cancelLiveReader = async () => {
+      if (streamDone || readerCancelled) return;
+      readerCancelled = true;
+      try {
+        await reader.cancel();
+      } catch {
+        // Preserve the authoritative response-boundary outcome.
+      }
+    };
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) {
+          streamDone = true;
+          break;
+        }
+        if (!(value instanceof Uint8Array)) {
+          throw createCapError(
+            'CAP proxy response stream returned a non-byte chunk',
+            'CAP_RESPONSE_INVALID'
+          );
+        }
+        byteLength += value.byteLength;
+        if (byteLength > CAP_RESPONSE_BODY_MAX_BYTES) {
+          const sizeError = createCapError(
+            `CAP proxy response exceeds ${CAP_RESPONSE_BODY_MAX_BYTES} bytes`,
+            'CAP_RESPONSE_TOO_LARGE'
+          );
+          await cancelLiveReader();
+          throw sizeError;
+        }
+        try {
+          chunks.push(decoder.decode(value, { stream: true }));
+        } catch (cause) {
+          throw createCapError(
+            'CAP proxy response is not valid UTF-8',
+            'CAP_RESPONSE_INVALID',
+            cause
+          );
+        }
+      }
+      try {
+        chunks.push(decoder.decode());
+      } catch (cause) {
+        throw createCapError(
+          'CAP proxy response is not valid UTF-8',
+          'CAP_RESPONSE_INVALID',
+          cause
+        );
+      }
+      return chunks.join('');
+    } catch (cause) {
+      await cancelLiveReader();
+      throw cause;
+    } finally {
+      try {
+        reader.releaseLock?.();
+      } catch {
+        // Stream cleanup cannot replace its primary outcome.
+      }
+    }
+  }
+
+  // Non-streaming path: the platform allocates response.text() before we can
+  // measure it. Content-Length is still preflighted and the decoded byte count
+  // is enforced, but streaming browsers take the bounded path above.
+  const text = await response.text();
+  const byteLength = new TextEncoder().encode(text).byteLength;
+  if (byteLength > CAP_RESPONSE_BODY_MAX_BYTES) {
+    throw createCapError(
+      `CAP proxy response exceeds ${CAP_RESPONSE_BODY_MAX_BYTES} bytes`,
+      'CAP_RESPONSE_TOO_LARGE'
+    );
+  }
+  return text;
+}
+
+async function executeProxy(path, body, {
+  signal = null,
+  timeoutMs = CAP_DEFAULT_TIMEOUT_MS,
+} = {}) {
+  assertExactObject(
+    body,
+    'CAP proxy request body',
+    path === '/cap/lookup-cells'
+      ? ['kind', 'term', 'limit']
+      : ['search', 'limit']
+  );
+  const scope = createRequestAbortScope(signal, timeoutMs);
+  try {
+    throwIfAborted(scope);
+    const requestBody = JSON.stringify(body);
+    if (
+      new TextEncoder().encode(requestBody).byteLength >
+      CAP_REQUEST_BODY_MAX_BYTES
+    ) {
+      throw createCapError(
+        `CAP proxy request exceeds ${CAP_REQUEST_BODY_MAX_BYTES} bytes`,
+        'CAP_REQUEST_TOO_LARGE'
+      );
+    }
+    const response = await fetch(workerUrl(path), {
+      method: 'POST',
+      credentials: 'omit',
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+      },
+      body: requestBody,
+      signal: scope.controller.signal,
+    });
+    throwIfAborted(scope);
+
+    const text = await readBoundedResponseText(response);
+    throwIfAborted(scope);
+
+    if (!response.ok) {
+      if (response.status === 404) {
+        throw createCapError(
+          'CAP proxy route is unavailable; deploy the matching Cellucid Worker source',
+          'CAP_WORKER_INCOMPATIBLE'
+        );
+      }
+      let detail = `HTTP ${response.status}`;
+      if (text) {
+        try {
+          const errorDocument = parseExactJson(text, {
+            path: `CAP proxy ${path} error response`,
+          });
+          const workerDetail = parseWorkerError(
+            errorDocument,
+            response.status
+          );
+          if (workerDetail !== detail) {
+            detail = `${detail}: ${workerDetail}`;
+          }
+        } catch {
+          // An untrusted non-success body cannot replace its HTTP outcome.
+        }
+      }
+      throw new Error(`CAP proxy error: ${detail}`);
+    }
+
+    let document;
+    try {
+      if (!text) throw new Error('empty response body');
+      document = parseExactJson(text, { path: `CAP proxy ${path} response` });
+    } catch (cause) {
+      throw new Error(`CAP proxy returned invalid JSON: ${cause?.message || cause}`, {
+        cause,
+      });
+    }
+    return assertExactObject(
+      document,
+      `CAP proxy ${path} response`,
+      ['contractVersion', 'results', 'omittedInvalidCount']
+    );
+  } catch (error) {
+    throwIfAborted(scope, error);
+    if (error?.name === 'AbortError') {
+      throw createCapError(
+        'CAP proxy request was independently aborted by fetch',
+        'CAP_FETCH_ABORTED',
+        error
+      );
+    }
+    if (isNetworkError(error)) {
+      throw new Error('CAP proxy unreachable (network error)', { cause: error });
+    }
+    throw error;
+  } finally {
+    scope.cleanup();
+  }
+}
+
+function validateLookupResult(value, index) {
+  const path = `CAP lookup results[${index}]`;
+  const item = assertExactObject(value, path, LOOKUP_RESULT_KEYS);
+  const scores = assertExactObject(
+    item.scores,
+    `${path}.scores`,
+    ['agree', 'disagree', 'idk']
+  );
+  const agree = assertNonnegativeSafeInteger(scores.agree, `${path}.scores.agree`);
+  const disagree = assertNonnegativeSafeInteger(scores.disagree, `${path}.scores.disagree`);
+  const idk = assertNonnegativeSafeInteger(scores.idk, `${path}.scores.idk`);
+  const scoreTotal = agree + disagree + idk;
+  if (!Number.isSafeInteger(scoreTotal)) {
+    throw new Error(`${path}.scores total must be a safe integer`);
+  }
+  return {
+    id: assertBoundedString(item.id, `${path}.id`, CAP_RESULT_ID_MAX_CODEPOINTS),
+    name: assertBoundedString(item.name, `${path}.name`, CAP_RESULT_TEXT_MAX_CODEPOINTS),
+    fullName: assertBoundedString(
+      item.fullName,
+      `${path}.fullName`,
+      CAP_RESULT_TEXT_MAX_CODEPOINTS
+    ),
+    ontologyTerm: assertBoundedString(
+      item.ontologyTerm,
+      `${path}.ontologyTerm`,
+      CAP_RESULT_TEXT_MAX_CODEPOINTS,
+      { nullable: true }
+    ),
+    ontologyTermId: assertBoundedString(
+      item.ontologyTermId,
+      `${path}.ontologyTermId`,
+      CAP_RESULT_ID_MAX_CODEPOINTS,
+      { nullable: true }
+    ),
+    synonyms: assertExactStringArray(item.synonyms, `${path}.synonyms`, {
+      maxItems: CAP_RESULT_SYNONYM_LIMIT,
+      maxCodePoints: CAP_RESULT_TEXT_MAX_CODEPOINTS,
+    }),
+    markerGenes: assertExactStringArray(item.markerGenes, `${path}.markerGenes`, {
+      maxItems: CAP_RESULT_MARKER_LIMIT,
+      maxCodePoints: CAP_RESULT_GENE_MAX_CODEPOINTS,
+    }),
+    canonicalMarkerGenes: assertExactStringArray(
+      item.canonicalMarkerGenes,
+      `${path}.canonicalMarkerGenes`,
+      {
+        maxItems: CAP_RESULT_MARKER_LIMIT,
+        maxCodePoints: CAP_RESULT_GENE_MAX_CODEPOINTS,
+      }
+    ),
+    count: assertNonnegativeSafeInteger(item.count, `${path}.count`),
+    scores: { agree, disagree, idk },
+  };
+}
+
+function validateDatasetResult(value, index) {
+  const path = `CAP dataset results[${index}]`;
+  const item = assertExactObject(value, path, DATASET_RESULT_KEYS);
+  return {
+    id: assertBoundedString(item.id, `${path}.id`, CAP_RESULT_ID_MAX_CODEPOINTS),
+    name: assertBoundedString(item.name, `${path}.name`, CAP_RESULT_TEXT_MAX_CODEPOINTS),
+    cellCount: assertNonnegativeSafeInteger(item.cellCount, `${path}.cellCount`),
+  };
+}
+
+function validateEnvelope(document, validator, label, maxResults) {
+  if (document.contractVersion !== CAP_WORKER_CONTRACT_VERSION) {
+    throw createCapError(
+      `${label}.contractVersion does not match this Cellucid client; ` +
+      'deploy the matching Cellucid Worker source',
+      'CAP_WORKER_INCOMPATIBLE'
+    );
+  }
+  if (
+    !Array.isArray(document.results) ||
+    document.results.length > maxResults
+  ) {
+    throw new Error(`${label}.results must be an array of at most ${maxResults} items`);
+  }
+  const omittedInvalidCount = assertNonnegativeSafeInteger(
+    document.omittedInvalidCount,
+    `${label}.omittedInvalidCount`
+  );
+  const projectedCount = document.results.length + omittedInvalidCount;
+  if (
+    !Number.isSafeInteger(projectedCount) ||
+    projectedCount > maxResults
+  ) {
+    throw new Error(
+      `${label} results plus omittedInvalidCount must not exceed ${maxResults}`
+    );
+  }
+  return {
+    results: document.results.map((entry, index) => validator(entry, index)),
+    omittedInvalidCount,
+  };
+}
+
 function normalizeForSearch(value) {
-  const s = toCleanString(value);
-  if (!s) return '';
-  return s
+  const string = toCleanString(value);
+  if (!string) return '';
+  return string
     .normalize('NFKD')
     .replace(/[\u0300-\u036f]/g, '')
     .toLowerCase()
@@ -35,603 +590,461 @@ function normalizeForSearch(value) {
 }
 
 function tokenizeSearch(value) {
-  const norm = normalizeForSearch(value);
-  if (!norm) return [];
-  const parts = norm.split(' ').filter(Boolean);
+  const normalized = normalizeForSearch(value);
+  if (!normalized) return [];
+  const parts = normalized.split(' ').filter(Boolean);
   const isMulti = parts.length > 1;
-  const out = [];
   const seen = new Set();
-  for (const p of parts) {
-    if (isMulti && p.length < 2) continue;
-    if (seen.has(p)) continue;
-    seen.add(p);
-    out.push(p);
+  const output = [];
+  for (const part of parts) {
+    if (isMulti && part.length < 2) continue;
+    if (seen.has(part)) continue;
+    seen.add(part);
+    output.push(part);
   }
-  return out;
+  return output;
 }
 
-function isAbortError(err) {
-  return err?.name === 'AbortError';
-}
-
-function isNetworkError(err) {
-  // Browser fetch() commonly throws TypeError on network failure / CORS / DNS.
-  if (err instanceof TypeError) return true;
-  const msg = toCleanString(err?.message || '');
-  return /failed to fetch|load failed|networkerror|fetch failed/i.test(msg);
-}
-
-/**
- * Execute a GraphQL query against CAP API.
- * @param {string} query - GraphQL query string
- * @param {Object} [variables={}] - Query variables
- * @param {Object} [options={}]
- * @param {number} [options.timeoutMs=12000] - Request timeout.
- * @returns {Promise<Object>} - Response data
- */
-async function executeQuery(query, variables = {}, options = {}) {
-  const timeoutMs = options.timeoutMs === undefined
-    ? CAP_DEFAULT_TIMEOUT_MS
-    : options.timeoutMs;
-  if (
-    typeof timeoutMs !== 'number' ||
-    !Number.isSafeInteger(timeoutMs) ||
-    timeoutMs < 0
-  ) {
-    throw new Error('CAP timeoutMs must be a nonnegative safe integer');
-  }
-
-  if (typeof AbortController === 'undefined') {
-    throw new Error('AbortController is required for CAP requests');
-  }
-  const controller = new AbortController();
-
-  /** @type {ReturnType<typeof setTimeout> | null} */
-  let timeout = null;
-  if (timeoutMs > 0) {
-    timeout = setTimeout(() => {
-      controller.abort();
-    }, timeoutMs);
-  }
-
-  try {
-    const response = await fetch(CAP_GRAPHQL_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ query, variables }),
-      signal: controller.signal
-    });
-
-    const text = await response.text();
-    let result;
-    try {
-      if (!text) throw new Error('empty response body');
-      result = parseExactJson(text, { path: 'CAP GraphQL response' });
-    } catch (cause) {
-      throw new Error(`CAP API returned invalid JSON: ${cause?.message || cause}`, {
-        cause,
-      });
-    }
-
-    if (!response.ok) {
-      const msg =
-        toCleanString(result?.errors?.[0]?.message) ||
-        toCleanString(result?.message) ||
-        `HTTP ${response.status}`;
-      throw new Error(`CAP API error: ${response.status} ${msg}`);
-    }
-
-    if (!result || typeof result !== 'object' || Array.isArray(result)) {
-      throw new Error('CAP API response must be a JSON object');
-    }
-
-    if (Object.hasOwn(result, 'errors')) {
-      if (!Array.isArray(result.errors)) {
-        throw new Error('CAP GraphQL errors must be an array');
-      }
-      if (result.errors.length) {
-        const message = result.errors[0]?.message;
-        if (typeof message !== 'string' || !message.trim()) {
-          throw new Error('CAP GraphQL error is missing its message');
-        }
-        throw new Error(`CAP GraphQL error: ${message}`);
-      }
-    }
-    if (!result.data || typeof result.data !== 'object' || Array.isArray(result.data)) {
-      throw new Error('CAP GraphQL response data must be a JSON object');
-    }
-
-    return result.data;
-  } catch (err) {
-    if (isAbortError(err)) {
-      throw new Error(`CAP request timed out after ${Math.round(timeoutMs / 1000)}s`);
-    }
-    if (isNetworkError(err)) {
-      throw new Error('CAP unreachable (network error)');
-    }
-    throw err;
-  } finally {
-    if (timeout !== null) clearTimeout(timeout);
-  }
-}
-
-function requireResultArray(data, field) {
-  const value = data?.[field];
-  if (!Array.isArray(value)) {
-    throw new Error(`CAP GraphQL data.${field} must be an array`);
-  }
-  value.forEach((entry, index) => {
-    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
-      throw new Error(`CAP GraphQL data.${field}[${index}] must be an object`);
-    }
-  });
-  return value;
-}
-
-function computeStringMatchScore(value, ctx) {
-  const raw = toCleanString(value);
+function computeStringMatchScore(value, context) {
+  const raw = typeof value === 'string' ? value.trim() : '';
   if (!raw) return 0;
-
   const rawLower = raw.toLowerCase();
-  const norm = normalizeForSearch(raw);
-
-  const searchLower = ctx?.searchLower || '';
-  const searchNorm = ctx?.searchNorm || '';
-  const tokens = Array.isArray(ctx?.tokens) ? ctx.tokens : [];
-
+  const normalized = normalizeForSearch(raw);
+  const searchLower = context.searchLower;
+  const searchNorm = context.searchNorm;
+  const tokens = context.tokens;
   let best = 0;
 
-  if (searchLower && rawLower === searchLower) best = Math.max(best, 1000);
-  if (searchNorm && norm === searchNorm) best = Math.max(best, 950);
-
-  if (searchLower && rawLower.startsWith(searchLower)) {
+  if (rawLower === searchLower) best = Math.max(best, 1000);
+  if (searchNorm && normalized === searchNorm) best = Math.max(best, 950);
+  if (rawLower.startsWith(searchLower)) {
     best = Math.max(best, 900 - Math.min(250, rawLower.length - searchLower.length));
   }
-  if (searchNorm && norm.startsWith(searchNorm)) {
-    best = Math.max(best, 850 - Math.min(250, norm.length - searchNorm.length));
+  if (searchNorm && normalized.startsWith(searchNorm)) {
+    best = Math.max(best, 850 - Math.min(250, normalized.length - searchNorm.length));
   }
-
-  if (searchLower) {
-    const idx = rawLower.indexOf(searchLower);
-    if (idx >= 0) best = Math.max(best, 700 - idx);
-  }
+  const rawIndex = rawLower.indexOf(searchLower);
+  if (rawIndex >= 0) best = Math.max(best, 700 - rawIndex);
   if (searchNorm) {
-    const idx = norm.indexOf(searchNorm);
-    if (idx >= 0) best = Math.max(best, 650 - idx);
+    const normalizedIndex = normalized.indexOf(searchNorm);
+    if (normalizedIndex >= 0) best = Math.max(best, 650 - normalizedIndex);
   }
 
   if (tokens.length) {
-    let matchCount = 0;
-    for (const t of tokens) {
-      if (!t) continue;
-      if (norm.includes(t)) matchCount += 1;
+    let matches = 0;
+    for (const token of tokens) {
+      if (normalized.includes(token)) matches += 1;
     }
-    if (matchCount === tokens.length) best = Math.max(best, 600);
-    else if (matchCount > 0) best = Math.max(best, 420 + Math.round((matchCount / tokens.length) * 120));
+    if (matches === tokens.length) best = Math.max(best, 600);
+    else if (matches > 0) {
+      best = Math.max(best, 420 + Math.round((matches / tokens.length) * 120));
+    }
   }
-
   return best;
 }
 
-function getMarkerGeneMatchCount(result, markerGenes) {
-  const genes = Array.isArray(markerGenes) ? markerGenes : [];
-  if (!genes.length) return 0;
-
-  const wanted = new Set();
-  for (const g of genes.slice(0, 50)) {
-    const key = toCleanString(g).replace(/\s+/g, '').toUpperCase();
-    if (key) wanted.add(key);
-  }
-  if (!wanted.size) return 0;
-
-  const all = [];
-  if (Array.isArray(result?.markerGenes)) all.push(...result.markerGenes);
-  if (Array.isArray(result?.canonicalMarkerGenes)) all.push(...result.canonicalMarkerGenes);
-
-  const matched = new Set();
-  for (const g of all.slice(0, 200)) {
-    const key = toCleanString(g).replace(/\s+/g, '').toUpperCase();
-    if (!key) continue;
-    if (wanted.has(key)) matched.add(key);
-  }
-  return matched.size;
+function normalizeMarkerKey(value) {
+  return value.replace(/\s+/g, '').toUpperCase();
 }
 
-function computeCellTypeRelevance(result, ctx, { markerGenes = null } = {}) {
-  if (!result || typeof result !== 'object') return { score: 0, markerMatchCount: 0 };
+function normalizeMarkerSearchInput(markerGenes) {
+  if (markerGenes === null) return [];
+  if (!Array.isArray(markerGenes)) {
+    throw new Error('CAP markerGenes must be an array or null');
+  }
+  if (markerGenes.length > 50) {
+    throw new Error('CAP markerGenes must contain at most 50 items');
+  }
+  const seen = new Set();
+  const output = [];
+  for (let index = 0; index < markerGenes.length; index++) {
+    const gene = assertBoundedString(
+      markerGenes[index],
+      `CAP markerGenes[${index}]`,
+      CAP_RESULT_GENE_MAX_CODEPOINTS
+    );
+    const key = normalizeMarkerKey(gene);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    output.push(gene);
+  }
+  return output;
+}
 
-  const markerMatchCount = getMarkerGeneMatchCount(result, markerGenes);
+function markerMatchInfo(result, markerGenes) {
+  const wanted = new Set(markerGenes.map(normalizeMarkerKey));
+  if (!wanted.size) return { markerMatchCount: 0, wantedCount: 0 };
+  const available = new Set();
+  for (const gene of result.markerGenes) available.add(normalizeMarkerKey(gene));
+  for (const gene of result.canonicalMarkerGenes) available.add(normalizeMarkerKey(gene));
+  let markerMatchCount = 0;
+  for (const key of wanted) {
+    if (available.has(key)) markerMatchCount += 1;
+  }
+  return { markerMatchCount, wantedCount: wanted.size };
+}
+
+function computeCellTypeRelevance(result, context, markerGenes) {
+  const { markerMatchCount, wantedCount } = markerMatchInfo(result, markerGenes);
   let score = 0;
-
-  score = Math.max(score, computeStringMatchScore(result?.ontologyTermId, ctx) * 1.25);
-  score = Math.max(score, computeStringMatchScore(result?.ontologyTerm, ctx) * 1.05);
-  score = Math.max(score, computeStringMatchScore(result?.fullName, ctx) * 1.0);
-  score = Math.max(score, computeStringMatchScore(result?.name, ctx) * 1.0);
-
-  if (Array.isArray(result?.synonyms)) {
-    for (const syn of result.synonyms.slice(0, 50)) {
-      score = Math.max(score, computeStringMatchScore(syn, ctx) * 0.85);
-    }
+  score = Math.max(score, computeStringMatchScore(result.ontologyTermId, context) * 1.25);
+  score = Math.max(score, computeStringMatchScore(result.ontologyTerm, context) * 1.05);
+  score = Math.max(score, computeStringMatchScore(result.fullName, context));
+  score = Math.max(score, computeStringMatchScore(result.name, context));
+  for (const synonym of result.synonyms) {
+    score = Math.max(score, computeStringMatchScore(synonym, context) * 0.85);
   }
-
-  if (Array.isArray(result?.markerGenes)) {
-    for (const g of result.markerGenes.slice(0, 80)) {
-      score = Math.max(score, computeStringMatchScore(g, ctx) * 0.8);
-    }
+  for (const gene of result.markerGenes) {
+    score = Math.max(score, computeStringMatchScore(gene, context) * 0.8);
   }
-
-  if (Array.isArray(result?.canonicalMarkerGenes)) {
-    for (const g of result.canonicalMarkerGenes.slice(0, 80)) {
-      score = Math.max(score, computeStringMatchScore(g, ctx) * 0.75);
-    }
+  for (const gene of result.canonicalMarkerGenes) {
+    score = Math.max(score, computeStringMatchScore(gene, context) * 0.75);
   }
-
   if (markerMatchCount > 0) {
     score += 140 * markerMatchCount;
-    if (Array.isArray(markerGenes) && markerMatchCount >= markerGenes.length) score += 180;
+    if (wantedCount > 0 && markerMatchCount === wantedCount) score += 180;
   }
-
   return { score, markerMatchCount };
 }
 
-/**
- * Search for cell types by name/term.
- * Returns matching cell labels with ontology info, marker genes, and synonyms.
- *
- * @param {string} searchTerm - Search term (e.g., "macrophage", "T cell")
- * @param {number} [limit=10] - Maximum results to return
- * @param {Object} [options={}]
- * @param {string[]|null} [options.markerGenes=null] - Optional marker gene list (improves marker searches).
- * @returns {Promise<Array<{
- *   name: string,
- *   fullName: string,
- *   ontologyTerm: string | null,
- *   ontologyTermId: string | null,
- *   markerGenes: string[],
- *   canonicalMarkerGenes: string[],
- *   synonyms: string[]
- * }>>}
- */
-export async function searchCellTypes(searchTerm, limit = 10, options = {}) {
-  if (searchTerm === null || searchTerm === undefined || searchTerm === '') return [];
-  if (typeof searchTerm !== 'string') {
-    throw new Error('CAP search term must be a string');
-  }
-  if (!searchTerm.trim()) return [];
-  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200) {
-    throw new Error('CAP result limit must be an integer from 1 to 200');
-  }
-  if (!options || typeof options !== 'object' || Array.isArray(options)) {
-    throw new Error('CAP search options must be an object');
-  }
-  if (
-    Object.hasOwn(options, 'markerGenes') &&
-    options.markerGenes !== null &&
-    !Array.isArray(options.markerGenes)
-  ) {
-    throw new Error('CAP markerGenes must be an array or null');
-  }
+function compareCodeUnits(left, right) {
+  if (left === right) return 0;
+  return left < right ? -1 : 1;
+}
 
+function displayName(result) {
+  return result.fullName || result.ontologyTerm || result.name;
+}
+
+function dedupeKey(result, sourceIndex) {
+  const ontologyId = result.ontologyTermId?.toLowerCase() || '';
+  if (ontologyId) return `ontology:${ontologyId}`;
+  const name = normalizeForSearch(displayName(result));
+  if (name) return `name:${name}`;
+  if (result.id) return `id:${result.id.toLowerCase()}`;
+  return `source:${sourceIndex}`;
+}
+
+function rankAndDedupe(results, searchTerm, markerGenes, limit) {
   const trimmed = searchTerm.trim();
-  const searchLower = trimmed.toLowerCase();
-  const searchNorm = normalizeForSearch(trimmed);
-  const tokens = tokenizeSearch(trimmed);
-  const ctx = { searchLower, searchNorm, tokens };
-  const markerGenes = options.markerGenes ?? null;
+  const context = {
+    searchLower: trimmed.toLowerCase(),
+    searchNorm: normalizeForSearch(trimmed),
+    tokens: tokenizeSearch(trimmed),
+  };
+  const ranked = results.map((result, sourceIndex) => {
+    const relevance = computeCellTypeRelevance(result, context, markerGenes);
+    return { result, sourceIndex, ...relevance };
+  }).filter((entry) => (
+    entry.score > 0 &&
+    (!markerGenes.length || entry.markerMatchCount > 0)
+  ));
 
-  const query = `
-    query SearchCells($limit: Int!, $name: String!) {
-      lookupCells(options: { limit: $limit }, search: { name: $name }) {
-        name
-        fullName
-        ontologyTerm
-        ontologyTermId
-        markerGenes
-        canonicalMarkerGenes
-        synonyms
-        rationale
-      }
+  ranked.sort((left, right) => {
+    if (right.score !== left.score) return right.score - left.score;
+    if (right.markerMatchCount !== left.markerMatchCount) {
+      return right.markerMatchCount - left.markerMatchCount;
     }
-  `;
-
-  // Request more results to re-rank client-side (CAP search ordering can be noisy).
-  const expandedLimit = Math.min(200, Math.max(limit * 10, 80));
-  const data = await executeQuery(query, { limit: expandedLimit, name: trimmed });
-  const results = requireResultArray(data, 'lookupCells');
-
-  const scored = [];
-  const seen = new Set();
-  for (const r of results) {
-    const idKey = toCleanString(r?.ontologyTermId).toLowerCase();
-    const nameKey = normalizeForSearch(r?.fullName || r?.name || '');
-    const key = idKey ? `id:${idKey}` : (nameKey ? `name:${nameKey}` : '');
-    if (key && seen.has(key)) continue;
-    if (key) seen.add(key);
-
-    const { score, markerMatchCount } = computeCellTypeRelevance(r, ctx, { markerGenes });
-    if (!score) continue;
-    if (markerGenes?.length && markerMatchCount <= 0) continue;
-    scored.push({ r, score });
-  }
-
-  scored.sort((a, b) => {
-    if (b.score !== a.score) return b.score - a.score;
-    const aName = toCleanString(a.r?.fullName || a.r?.name).toLowerCase();
-    const bName = toCleanString(b.r?.fullName || b.r?.name).toLowerCase();
-    if (aName && bName && aName !== bName) return aName.localeCompare(bName);
-    const aId = toCleanString(a.r?.ontologyTermId).toLowerCase();
-    const bId = toCleanString(b.r?.ontologyTermId).toLowerCase();
-    if (aId && bId && aId !== bId) return aId.localeCompare(bId);
-    return 0;
+    if (right.result.count !== left.result.count) {
+      return right.result.count - left.result.count;
+    }
+    const byName = compareCodeUnits(
+      displayName(left.result).toLowerCase(),
+      displayName(right.result).toLowerCase()
+    );
+    if (byName !== 0) return byName;
+    const byId = compareCodeUnits(left.result.id.toLowerCase(), right.result.id.toLowerCase());
+    if (byId !== 0) return byId;
+    return left.sourceIndex - right.sourceIndex;
   });
 
-  return scored.slice(0, limit).map((s) => s.r);
+  const seen = new Set();
+  const output = [];
+  for (const entry of ranked) {
+    const key = dedupeKey(entry.result, entry.sourceIndex);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    output.push(entry.result);
+    if (output.length === limit) break;
+  }
+  return output;
+}
+
+function assertLookupKind(kind) {
+  if (!LOOKUP_KINDS.has(kind)) {
+    throw new Error('CAP lookup kind must equal name, ontology, marker, or feedback');
+  }
+  return kind;
+}
+
+function assertSearchTerm(value, kind) {
+  if (typeof value !== 'string') {
+    throw new Error('CAP search term must be a string');
+  }
+  const term = value.trim();
+  if (!term) return '';
+  const maximum = kind === 'marker'
+    ? CAP_MARKER_TERM_MAX_CODEPOINTS
+    : CAP_TERM_MAX_CODEPOINTS;
+  if (exceedsCodePointLimit(term, maximum)) {
+    throw new Error(`CAP ${kind} term must be at most ${maximum} Unicode code points`);
+  }
+  return term;
+}
+
+function assertLimit(value, maximum, label) {
+  if (!Number.isSafeInteger(value) || value < 1 || value > maximum) {
+    throw new Error(`${label} must be an integer from 1 to ${maximum}`);
+  }
+  return value;
+}
+
+function assertOptions(options, allowedKeys, label) {
+  if (!options || typeof options !== 'object' || Array.isArray(options)) {
+    throw new Error(`${label} must be an object`);
+  }
+  const unknown = Object.keys(options).filter((key) => !allowedKeys.includes(key));
+  if (unknown.length) {
+    throw new Error(`${label} contains unknown option ${JSON.stringify(unknown[0])}`);
+  }
+  return options;
 }
 
 /**
- * Look up a specific cell type by ontology ID (e.g., "CL:0000625").
+ * Search CAP cell-label metadata.
  *
- * @param {string} ontologyId - Cell Ontology ID
- * @returns {Promise<{
- *   name: string,
- *   fullName: string,
- *   ontologyTerm: string | null,
- *   ontologyTermId: string | null,
- *   markerGenes: string[],
- *   canonicalMarkerGenes: string[],
- *   synonyms: string[],
- *   rationale: string
- * } | null>}
+ * @returns {Promise<{results:Object[], omittedInvalidCount:number}>}
  */
-export async function lookupByOntologyId(ontologyId) {
-  if (ontologyId === null || ontologyId === undefined || ontologyId === '') return null;
-  if (typeof ontologyId !== 'string') {
-    throw new Error('CAP ontology id must be a string');
-  }
-  if (!ontologyId.trim()) return null;
-
-  // CAP doesn't have a direct ontology ID lookup, so we search by the ID
-  const results = await searchCellTypes(ontologyId.trim(), 5);
-
-  // Find exact match by ontologyTermId
-  const match = results.find(
-    (r) => r.ontologyTermId?.toLowerCase() === ontologyId.trim().toLowerCase()
+export async function searchCellTypes(searchTerm, limit = 10, options = {}) {
+  assertLimit(limit, CAP_LOOKUP_LIMIT, 'CAP result limit');
+  const exactOptions = assertOptions(
+    options,
+    ['kind', 'markerGenes', 'signal', 'timeoutMs'],
+    'CAP search options'
   );
-
-  return match ?? null;
-}
-
-/**
- * Look up a cell type by exact name match.
- *
- * @param {string} name - Cell type name
- * @returns {Promise<Object | null>}
- */
-export async function lookupByName(name) {
-  if (name === null || name === undefined || name === '') return null;
-  if (typeof name !== 'string') {
-    throw new Error('CAP cell type name must be a string');
-  }
-  if (!name.trim()) return null;
-
-  const results = await searchCellTypes(name.trim(), 5);
-
-  // Find best match by fullName or name
-  const normalizedSearch = name.trim().toLowerCase();
-  const match = results.find(
-    (r) =>
-      r.fullName?.toLowerCase() === normalizedSearch ||
-      r.name?.toLowerCase() === normalizedSearch ||
-      r.ontologyTerm?.toLowerCase() === normalizedSearch ||
-      (
-        Array.isArray(r.synonyms) &&
-        r.synonyms.some(
-          (synonym) =>
-            typeof synonym === 'string' &&
-            synonym.toLowerCase() === normalizedSearch
-        )
-      )
-  );
-
-  return match ?? null;
-}
-
-/**
- * Get CAP community feedback for a cell type.
- *
- * @param {string} cellTypeName - Cell type name
- * @returns {Promise<{
- *   name: string,
- *   feedback: { agree: number, disagree: number, idk: number } | null,
- *   total: number,
- *   agreePercent: number
- * } | null>}
- */
-export async function getCommunityFeedback(cellTypeName) {
-  if (cellTypeName === null || cellTypeName === undefined || cellTypeName === '') {
-    return null;
-  }
-  if (typeof cellTypeName !== 'string') {
-    throw new Error('CAP feedback cell type name must be a string');
-  }
-  if (!cellTypeName.trim()) return null;
-
-  const query = `
-    query GetFeedback($limit: Int!, $name: String!) {
-      lookupCells(options: { limit: $limit }, search: { name: $name }) {
-        name
-        fullName
-        scores {
-          agree
-          disagree
-          idk
-          total
-        }
-      }
+  const kind = assertLookupKind(exactOptions.kind ?? 'name');
+  const term = assertSearchTerm(searchTerm, kind);
+  if (!term) return { results: [], omittedInvalidCount: 0 };
+  const markerGenes = normalizeMarkerSearchInput(exactOptions.markerGenes ?? null);
+  const document = await executeProxy(
+    '/cap/lookup-cells',
+    { kind, term, limit: CAP_LOOKUP_LIMIT },
+    {
+      signal: exactOptions.signal ?? null,
+      timeoutMs: exactOptions.timeoutMs ?? CAP_DEFAULT_TIMEOUT_MS,
     }
-  `;
-
-  const data = await executeQuery(query, { limit: 5, name: cellTypeName.trim() });
-  const results = requireResultArray(data, 'lookupCells');
-
-  if (!results.length) return null;
-
-  // Find best match
-  const normalizedSearch = cellTypeName.trim().toLowerCase();
-  const label = results.find(
-    (r) =>
-      r.fullName?.toLowerCase() === normalizedSearch ||
-      r.name?.toLowerCase() === normalizedSearch
   );
-
-  if (!label) return null;
-  if (!label.scores || typeof label.scores !== 'object' || Array.isArray(label.scores)) {
-    throw new Error('CAP exact feedback result is missing scores');
-  }
-
-  const { agree, disagree, idk, total } = label.scores;
-  for (const [field, value] of Object.entries({ agree, disagree, idk, total })) {
-    if (!Number.isSafeInteger(value) || value < 0) {
-      throw new Error(`CAP feedback scores.${field} must be a nonnegative integer`);
-    }
-  }
-  const agreePercent = total > 0 ? Math.round((agree / total) * 100) : 0;
-
+  const envelope = validateEnvelope(
+    document,
+    validateLookupResult,
+    'CAP lookup response',
+    CAP_LOOKUP_LIMIT
+  );
   return {
-    name: label.fullName || label.name,
-    feedback: { agree, disagree, idk },
-    total,
-    agreePercent
+    results: rankAndDedupe(envelope.results, term, markerGenes, limit),
+    omittedInvalidCount: envelope.omittedInvalidCount,
   };
 }
 
-/**
- * Find synonyms for a cell type name.
- * Useful for detecting duplicate suggestions that use different names.
- *
- * @param {string} cellTypeName - Cell type name
- * @returns {Promise<{
- *   name: string,
- *   ontologyTermId: string | null,
- *   synonyms: string[],
- *   allNames: string[]
- * } | null>}
- */
-export async function findSynonyms(cellTypeName) {
-  if (cellTypeName === null || cellTypeName === undefined || cellTypeName === '') {
-    return null;
+export async function lookupByOntologyId(ontologyId, options = {}) {
+  const exactOptions = assertOptions(
+    options,
+    ['signal', 'timeoutMs'],
+    'CAP ontology lookup options'
+  );
+  const term = assertSearchTerm(ontologyId, 'ontology');
+  if (!term) return { results: [], omittedInvalidCount: 0 };
+  const envelope = await searchCellTypes(term, CAP_LOOKUP_LIMIT, {
+    kind: 'ontology',
+    ...exactOptions,
+  });
+  const normalized = term.toLowerCase();
+  const match = envelope.results.find(
+    (result) => result.ontologyTermId?.toLowerCase() === normalized
+  );
+  return {
+    results: match ? [match] : [],
+    omittedInvalidCount: envelope.omittedInvalidCount,
+  };
+}
+
+export async function lookupByName(name, options = {}) {
+  const exactOptions = assertOptions(
+    options,
+    ['signal', 'timeoutMs'],
+    'CAP name lookup options'
+  );
+  const term = assertSearchTerm(name, 'name');
+  if (!term) return { results: [], omittedInvalidCount: 0 };
+  const envelope = await searchCellTypes(term, CAP_LOOKUP_LIMIT, {
+    kind: 'name',
+    ...exactOptions,
+  });
+  const normalized = term.toLowerCase();
+  const match = envelope.results.find((result) => (
+    result.fullName.toLowerCase() === normalized ||
+    result.name.toLowerCase() === normalized ||
+    result.ontologyTerm?.toLowerCase() === normalized ||
+    result.synonyms.some((synonym) => synonym.toLowerCase() === normalized)
+  ));
+  return {
+    results: match ? [match] : [],
+    omittedInvalidCount: envelope.omittedInvalidCount,
+  };
+}
+
+export async function getCommunityFeedback(cellTypeName, options = {}) {
+  const exactOptions = assertOptions(
+    options,
+    ['signal', 'timeoutMs'],
+    'CAP feedback options'
+  );
+  const term = assertSearchTerm(cellTypeName, 'feedback');
+  if (!term) return { results: [], omittedInvalidCount: 0 };
+  const envelope = await searchCellTypes(term, CAP_LOOKUP_LIMIT, {
+    kind: 'feedback',
+    ...exactOptions,
+  });
+  const normalized = term.toLowerCase();
+  const label = envelope.results.find((result) => (
+    result.fullName.toLowerCase() === normalized ||
+    result.name.toLowerCase() === normalized
+  ));
+  if (!label) {
+    return { results: [], omittedInvalidCount: envelope.omittedInvalidCount };
   }
-  if (typeof cellTypeName !== 'string') {
-    throw new Error('CAP synonym cell type name must be a string');
+  const { agree, disagree, idk } = label.scores;
+  const total = agree + disagree + idk;
+  if (!Number.isSafeInteger(total)) {
+    throw new Error('CAP feedback total must be a safe integer');
   }
-  if (!cellTypeName.trim()) return null;
+  return {
+    results: [{
+      name: label.fullName || label.name,
+      feedback: { agree, disagree, idk },
+      total,
+      agreePercent: total > 0 ? Math.round((agree / total) * 100) : 0,
+    }],
+    omittedInvalidCount: envelope.omittedInvalidCount,
+  };
+}
 
-  const label = await lookupByName(cellTypeName);
-
-  if (!label) return null;
-
-  // Combine primary name, fullName, and synonyms
-  const allNames = new Set([label.name]);
-  if (label.fullName) allNames.add(label.fullName);
+export async function findSynonyms(cellTypeName, options = {}) {
+  const envelope = await lookupByName(cellTypeName, options);
+  const label = envelope.results[0] ?? null;
+  if (!label) return envelope;
+  const allNames = new Set([label.name, label.fullName]);
   if (label.ontologyTerm) allNames.add(label.ontologyTerm);
-  if (!Array.isArray(label.synonyms)) {
-    throw new Error('CAP exact cell type result is missing its synonyms array');
-  }
-  if (label.synonyms.length) {
-    label.synonyms.filter((s) => s && s !== 'unknown').forEach((s) => allNames.add(s));
-  }
-
+  const synonyms = label.synonyms.filter((synonym) => synonym !== 'unknown');
+  for (const synonym of synonyms) allNames.add(synonym);
   return {
-    name: label.fullName || label.name,
-    ontologyTermId: label.ontologyTermId,
-    synonyms: label.synonyms.filter((s) => s && s !== 'unknown'),
-    allNames: [...allNames]
+    results: [{
+      name: label.fullName || label.name,
+      ontologyTermId: label.ontologyTermId,
+      synonyms,
+      allNames: [...allNames],
+    }],
+    omittedInvalidCount: envelope.omittedInvalidCount,
   };
 }
 
-/**
- * Check if two cell type names might be synonyms of each other.
- *
- * @param {string} name1 - First cell type name
- * @param {string} name2 - Second cell type name
- * @returns {Promise<{
- *   areSynonyms: boolean,
- *   sharedOntologyId: string | null,
- *   canonicalName: string | null
- * }>}
- */
-export async function checkIfSynonyms(name1, name2) {
-  if (!name1?.trim() || !name2?.trim()) {
-    return { areSynonyms: false, sharedOntologyId: null, canonicalName: null };
+export async function checkIfSynonyms(name1, name2, options = {}) {
+  const exactOptions = assertOptions(
+    options,
+    ['signal', 'timeoutMs'],
+    'CAP synonym comparison options'
+  );
+  const firstName = assertSearchTerm(name1, 'name');
+  const secondName = assertSearchTerm(name2, 'name');
+  if (!firstName || !secondName) {
+    return {
+      results: [{
+        areSynonyms: false,
+        sharedOntologyId: null,
+        canonicalName: null,
+      }],
+      omittedInvalidCount: 0,
+    };
   }
-
-  const n1 = name1.trim().toLowerCase();
-  const n2 = name2.trim().toLowerCase();
-
-  if (n1 === n2) {
-    return { areSynonyms: true, sharedOntologyId: null, canonicalName: name1.trim() };
-  }
-
-  // Look up both names
-  const [result1, result2] = await Promise.all([findSynonyms(name1), findSynonyms(name2)]);
-
-  // Check if they share an ontology ID
-  if (result1?.ontologyTermId && result2?.ontologyTermId) {
-    if (result1.ontologyTermId === result2.ontologyTermId) {
-      return {
+  if (firstName.toLowerCase() === secondName.toLowerCase()) {
+    return {
+      results: [{
         areSynonyms: true,
-        sharedOntologyId: result1.ontologyTermId,
-        canonicalName: result1.name
-      };
-    }
-  }
-
-  // Check if one name appears in the other's synonyms
-  if (result1?.allNames?.some((n) => n.toLowerCase() === n2)) {
-    return {
-      areSynonyms: true,
-      sharedOntologyId: result1.ontologyTermId || null,
-      canonicalName: result1.name
+        sharedOntologyId: null,
+        canonicalName: firstName,
+      }],
+      omittedInvalidCount: 0,
     };
   }
-
-  if (result2?.allNames?.some((n) => n.toLowerCase() === n1)) {
-    return {
+  const [firstEnvelope, secondEnvelope] = await Promise.all([
+    findSynonyms(firstName, exactOptions),
+    findSynonyms(secondName, exactOptions),
+  ]);
+  const omittedInvalidCount =
+    firstEnvelope.omittedInvalidCount + secondEnvelope.omittedInvalidCount;
+  if (!Number.isSafeInteger(omittedInvalidCount)) {
+    throw new Error('CAP combined omittedInvalidCount must be a safe integer');
+  }
+  const first = firstEnvelope.results[0] ?? null;
+  const second = secondEnvelope.results[0] ?? null;
+  const firstLower = firstName.toLowerCase();
+  const secondLower = secondName.toLowerCase();
+  let result = {
+    areSynonyms: false,
+    sharedOntologyId: null,
+    canonicalName: null,
+  };
+  if (
+    first?.ontologyTermId &&
+    second?.ontologyTermId &&
+    first.ontologyTermId === second.ontologyTermId
+  ) {
+    result = {
       areSynonyms: true,
-      sharedOntologyId: result2.ontologyTermId || null,
-      canonicalName: result2.name
+      sharedOntologyId: first.ontologyTermId,
+      canonicalName: first.name,
+    };
+  } else if (first?.allNames.some((name) => name.toLowerCase() === secondLower)) {
+    result = {
+      areSynonyms: true,
+      sharedOntologyId: first.ontologyTermId,
+      canonicalName: first.name,
+    };
+  } else if (second?.allNames.some((name) => name.toLowerCase() === firstLower)) {
+    result = {
+      areSynonyms: true,
+      sharedOntologyId: second.ontologyTermId,
+      canonicalName: second.name,
     };
   }
-
-  return { areSynonyms: false, sharedOntologyId: null, canonicalName: null };
+  return { results: [result], omittedInvalidCount };
 }
 
-/**
- * Search datasets in CAP.
- *
- * @param {Object} [options={}]
- * @param {string} [options.search] - Search term
- * @param {number} [options.limit=20] - Max results
- * @returns {Promise<Array<Object>>}
- */
-export async function searchDatasets({ search, limit = 20 } = {}) {
-  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200) {
-    throw new Error('CAP dataset limit must be an integer from 1 to 200');
+export async function searchDatasets(options = {}) {
+  const exactOptions = assertOptions(
+    options,
+    ['search', 'limit', 'signal', 'timeoutMs'],
+    'CAP dataset options'
+  );
+  const search = exactOptions.search ?? null;
+  const limit = exactOptions.limit ?? CAP_DATASET_LIMIT;
+  const signal = exactOptions.signal ?? null;
+  const timeoutMs = exactOptions.timeoutMs ?? CAP_DEFAULT_TIMEOUT_MS;
+  assertLimit(limit, CAP_DATASET_LIMIT, 'CAP dataset limit');
+  let exactSearch = null;
+  if (search !== null) {
+    exactSearch = assertSearchTerm(search, 'name');
+    if (!exactSearch) exactSearch = null;
   }
-  if (search !== undefined && typeof search !== 'string') {
-    throw new Error('CAP dataset search must be a string when provided');
-  }
-  const query = `
-    query SearchDatasets($limit: Int!, $search: LookupDatasetsSearchInput) {
-      lookupDatasets(options: { limit: $limit }, search: $search) {
-        id
-        name
-        cellCount
-      }
-    }
-  `;
-
-  const searchInput = search ? { name: search } : null;
-  const data = await executeQuery(query, { limit, search: searchInput });
-  return requireResultArray(data, 'lookupDatasets');
+  const document = await executeProxy(
+    '/cap/search-datasets',
+    { search: exactSearch, limit },
+    { signal, timeoutMs }
+  );
+  return validateEnvelope(
+    document,
+    validateDatasetResult,
+    'CAP dataset response',
+    limit
+  );
 }

@@ -420,6 +420,92 @@ test('Genes All mode still filters the matrix with current scientific thresholds
   );
 });
 
+test('Genes threshold rebuild preserves every prototype-named marker group', () => {
+  const ui = createUI();
+  const groupIds = Object.getOwnPropertyNames(Object.prototype);
+  const prototypeDescriptors = Object.getOwnPropertyDescriptors(
+    Object.prototype,
+  );
+  const groups = Object.fromEntries(
+    groupIds.map(groupId => [
+      groupId,
+      {
+        groupId,
+        groupName: `Group ${groupId}`,
+        markers: [],
+      },
+    ]),
+  );
+
+  const rebuilt = ui._rebuildMarkerGroupsFromStats({
+    markers: {
+      groups,
+      stats: {
+        genes: ['GENE'],
+        groupIds,
+        pValuesByGroup: groupIds.map(() => Float64Array.of(0.001)),
+        adjustedPValuesByGroup: groupIds.map(
+          () => Float64Array.of(0.001),
+        ),
+        log2FoldChangeByGroup: groupIds.map(() => Float64Array.of(2)),
+      },
+    },
+    topN: 1,
+    thresholdOptions: {
+      pValueThreshold: 0.05,
+      foldChangeThreshold: 1,
+      useAdjustedPValue: true,
+    },
+  });
+
+  assert.equal(Object.getPrototypeOf(rebuilt), Object.prototype);
+  assert.deepEqual(Object.keys(rebuilt), groupIds);
+  for (const groupId of groupIds) {
+    assert.equal(Object.hasOwn(rebuilt, groupId), true, groupId);
+    assert.equal(rebuilt[groupId].groupId, groupId);
+    assert.equal(rebuilt[groupId].groupName, `Group ${groupId}`);
+    assert.equal(rebuilt[groupId].markers[0].groupId, groupId);
+  }
+  assert.deepEqual(
+    Object.getOwnPropertyDescriptors(Object.prototype),
+    prototypeDescriptors,
+  );
+});
+
+test('Genes modal replaces an inherited-only stale group selection', t => {
+  const priorDocument = globalThis.document;
+  const stopAfterSelection = new Error('stop after exact group selection');
+  globalThis.document = {
+    createElement() {
+      throw stopAfterSelection;
+    },
+  };
+  t.after(() => {
+    if (priorDocument === undefined) delete globalThis.document;
+    else globalThis.document = priorDocument;
+  });
+
+  const ui = createUI();
+  ui._modalAnnotationsRenderRevision = 0;
+  ui._modalSelectedGroupId = 'constructor';
+  ui._lastResult = {
+    markers: {
+      groups: {
+        'group-a': {
+          groupId: 'group-a',
+          markers: [],
+        },
+      },
+    },
+  };
+
+  assert.throws(
+    () => ui._renderModalAnnotations({ innerHTML: '' }),
+    error => error === stopAfterSelection,
+  );
+  assert.equal(ui._modalSelectedGroupId, 'group-a');
+});
+
 test('Genes explicit threshold values are exact and never silently defaulted', () => {
   const ui = createUI();
 

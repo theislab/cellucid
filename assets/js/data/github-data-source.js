@@ -25,6 +25,9 @@ import {
   resolveUrl,
   validateSchemaVersion
 } from './data-source.js';
+import {
+  createMetadataAbortError,
+} from './metadata-load-contract.js';
 import { getNotificationCenter } from '../app/notification-center.js';
 
 /**
@@ -40,6 +43,7 @@ function isSafeGitHubSegment(value) {
     value.length === 0 ||
     value === '.' ||
     value === '..' ||
+    value.includes('%') ||
     value.includes('/') ||
     value.includes('\\') ||
     value.includes('?') ||
@@ -442,7 +446,8 @@ function requireCatalogIdentityAgreement(entry, metadata) {
 async function loadGitHubDatasets(
   manifest,
   baseUrl,
-  sourceType
+  sourceType,
+  signal
 ) {
   validateGitHubCatalog(manifest, baseUrl);
   const datasets = [];
@@ -452,11 +457,15 @@ async function loadGitHubDatasets(
       const metadata = await loadDatasetMetadata(
         datasetBaseUrl,
         entry.id,
-        sourceType
+        sourceType,
+        { signal }
       );
       requireCatalogIdentityAgreement(entry, metadata);
       datasets.push(metadata);
     } catch (error) {
+      if (error?.name === 'AbortError') {
+        throw error;
+      }
       throw new DataSourceError(
         `Dataset '${entry.id}' is invalid: ${error?.message || error}`,
         DataSourceErrorCode.INVALID_FORMAT,
@@ -497,7 +506,36 @@ export class GitHubDataSource {
     /** @type {number} Connection generation for stale refresh rejection */
     this._connectionRevision = 0;
 
+    this._operationRevision = 0;
+    /** @type {AbortController|null} */
+    this._pendingController = null;
+
     this.type = 'github-repo';
+  }
+
+  _beginOperation(reason) {
+    const previousController = this._pendingController;
+    const controller = new AbortController();
+    this._pendingController = controller;
+    const revision = ++this._operationRevision;
+    previousController?.abort(new Error(reason));
+    return { controller, revision };
+  }
+
+  _assertOperation(owner, label) {
+    if (
+      owner.controller.signal.aborted ||
+      owner.controller !== this._pendingController ||
+      owner.revision !== this._operationRevision
+    ) {
+      throw createMetadataAbortError(label);
+    }
+  }
+
+  _finishOperation(owner) {
+    if (this._pendingController === owner.controller) {
+      this._pendingController = null;
+    }
   }
 
   /**
@@ -534,6 +572,9 @@ export class GitHubDataSource {
   async connect(inputPath) {
     const notifications = getNotificationCenter();
     const trackerId = notifications.loading('Connecting to GitHub repository...', { category: 'data' });
+    const owner = this._beginOperation(
+      'GitHub connection was superseded'
+    );
 
     try {
       const parsedPath = parseGitHubPath(inputPath);
@@ -551,12 +592,18 @@ export class GitHubDataSource {
         baseUrl,
         DATA_CONFIG.DATASETS_MANIFEST
       );
-      const manifest = await fetchJson(manifestUrl, this.type);
+      const manifest = await fetchJson(
+        manifestUrl,
+        this.type,
+        { signal: owner.controller.signal }
+      );
       const datasets = await loadGitHubDatasets(
         manifest,
         baseUrl,
-        this.type
+        this.type,
+        owner.controller.signal
       );
+      this._assertOperation(owner, 'GitHub connection');
 
       const repoInfo = {
         owner: parsedPath.owner,
@@ -583,6 +630,10 @@ export class GitHubDataSource {
 
       return { repoInfo, datasets };
     } catch (err) {
+      if (err?.name === 'AbortError') {
+        notifications.dismiss(trackerId);
+        throw err;
+      }
       notifications.fail(trackerId, err.message || 'Failed to connect');
 
       if (err instanceof DataSourceError) {
@@ -595,6 +646,8 @@ export class GitHubDataSource {
         this.type,
         { input: inputPath, originalError: err.message }
       );
+    } finally {
+      this._finishOperation(owner);
     }
   }
 
@@ -611,6 +664,11 @@ export class GitHubDataSource {
    * @private
    */
   _cleanup() {
+    this._operationRevision += 1;
+    this._pendingController?.abort(
+      new Error('GitHub connection was disconnected')
+    );
+    this._pendingController = null;
     this._baseUrl = null;
     this._inputPath = null;
     this._parsedPath = null;
@@ -747,50 +805,89 @@ export class GitHubDataSource {
     const baseUrl = this._baseUrl;
     const inputPath = this._inputPath;
     const connectionRevision = this._connectionRevision;
+    const owner = this._beginOperation(
+      'GitHub refresh was superseded'
+    );
     const manifestUrl = resolveUrl(
       baseUrl,
       DATA_CONFIG.DATASETS_MANIFEST
     );
-    const manifest = await fetchJson(manifestUrl, this.type);
-    const datasets = await loadGitHubDatasets(
-      manifest,
-      baseUrl,
-      this.type
-    );
-
-    if (
-      !this._connected ||
-      this._baseUrl !== baseUrl ||
-      this._inputPath !== inputPath ||
-      this._connectionRevision !== connectionRevision
-    ) {
-      throw new DataSourceError(
-        'GitHub repository connection changed during refresh',
-        DataSourceErrorCode.VALIDATION_ERROR,
-        this.type
+    try {
+      const manifest = await fetchJson(
+        manifestUrl,
+        this.type,
+        { signal: owner.controller.signal }
       );
-    }
+      const datasets = await loadGitHubDatasets(
+        manifest,
+        baseUrl,
+        this.type,
+        owner.controller.signal
+      );
+      this._assertOperation(owner, 'GitHub refresh');
 
-    this._manifest = manifest;
-    this._datasets = datasets;
-    if (
-      this._activeDatasetId !== null &&
-      !manifest.datasets.some(
-        entry => entry.id === this._activeDatasetId
-      )
-    ) {
-      this._activeDatasetId = null;
+      if (
+        !this._connected ||
+        this._baseUrl !== baseUrl ||
+        this._inputPath !== inputPath ||
+        this._connectionRevision !== connectionRevision
+      ) {
+        throw new DataSourceError(
+          'GitHub repository connection changed during refresh',
+          DataSourceErrorCode.VALIDATION_ERROR,
+          this.type
+        );
+      }
+
+      this._manifest = manifest;
+      this._datasets = datasets;
+      if (
+        this._activeDatasetId !== null &&
+        !manifest.datasets.some(
+          entry => entry.id === this._activeDatasetId
+        )
+      ) {
+        this._activeDatasetId = null;
+      }
+    } catch (error) {
+      if (
+        error?.name === 'AbortError' &&
+        (
+          !this._connected ||
+          this._baseUrl !== baseUrl ||
+          this._inputPath !== inputPath ||
+          this._connectionRevision !== connectionRevision
+        )
+      ) {
+        throw new DataSourceError(
+          'GitHub repository connection changed during refresh',
+          DataSourceErrorCode.VALIDATION_ERROR,
+          this.type
+        );
+      }
+      throw error;
+    } finally {
+      this._finishOperation(owner);
     }
   }
 
   /**
-   * Clear cached data to free memory
-   * Keeps connection alive but clears loaded dataset information
+   * Cancel transient catalog work while retaining the adopted connection
+   * snapshot.
+   *
+   * The manifest and identity list are compact connection state, not bulk
+   * dataset buffers. Dropping them while `_connected` remains true makes the
+   * synchronous base-URL contract unusable and cannot be repaired lazily.
    */
   clearCaches() {
-    this._manifest = null;
-    this._datasets = null;
-    console.log('[GitHubDataSource] Cleared caches to free memory');
+    this._operationRevision += 1;
+    this._pendingController?.abort(
+      new Error('GitHub caches were cleared')
+    );
+    this._pendingController = null;
+    console.log(
+      '[GitHubDataSource] Cancelled transient catalog work; retained connection metadata'
+    );
   }
 
   /**

@@ -448,6 +448,34 @@ test('gene heatmap ranges are exact or terminal', () => {
   assert.equal(zScoreTrace.zauto, false);
 });
 
+test('gene heatmap CSV rows preserve every prototype-named group column', () => {
+  const groupNames = Object.getOwnPropertyNames(Object.prototype);
+  const exported = geneHeatmapDefinition.exportCSV({
+    matrix: {
+      genes: ['GENE'],
+      groupNames,
+      values: Float32Array.from(
+        groupNames.map((_, index) => index + 0.25),
+      ),
+      nRows: 1,
+      nCols: groupNames.length,
+      transform: 'none',
+    },
+  });
+
+  assert.deepEqual(exported.columns, ['gene', ...groupNames]);
+  assert.equal(Object.getPrototypeOf(exported.rows[0]), Object.prototype);
+  assert.deepEqual(Object.keys(exported.rows[0]), ['gene', ...groupNames]);
+  for (const [index, groupName] of groupNames.entries()) {
+    assert.equal(Object.hasOwn(exported.rows[0], groupName), true, groupName);
+    assert.equal(
+      exported.rows[0][groupName],
+      (index + 0.25).toFixed(4),
+      groupName,
+    );
+  }
+});
+
 test('requested clustering never becomes an unclustered result', async () => {
   const engine = new ClusteringEngine();
   await assert.rejects(
@@ -673,6 +701,121 @@ test('gene signature median computes the exact per-cell median', async () => {
       max: 10,
       std: Math.sqrt(8),
     },
+  );
+});
+
+test('gene signature scoring preserves prototype-named gene and page cross-products', async () => {
+  const exactNames = Object.getOwnPropertyNames(Object.prototype);
+  const geneData = Object.fromEntries(
+    exactNames.map((gene, geneIndex) => [
+      gene,
+      Object.fromEntries(
+        exactNames.map((pageId, pageIndex) => [
+          pageId,
+          {
+            values: Float32Array.of(geneIndex + pageIndex),
+            cellIndices: Uint32Array.of(0),
+            pageName: `Page ${pageId}`,
+          },
+        ]),
+      ),
+    ]),
+  );
+  const analysis = Object.create(MultiVariableAnalysis.prototype);
+  analysis.dataLayer = {
+    async getGeneExpressionSubset() {
+      return geneData;
+    },
+    clearBulkGeneCache() {},
+    performCacheCleanup() {},
+  };
+  analysis._computeManager = null;
+  analysis._notifications = {
+    loading() { return 'prototype-signature-notification'; },
+    complete() {},
+    fail() {},
+  };
+
+  const result = await analysis.computeSignatureScore({
+    genes: exactNames,
+    pageIds: exactNames,
+    method: 'mean',
+  });
+
+  assert.deepEqual(result.map(page => page.pageId), exactNames);
+  for (const [pageIndex, page] of result.entries()) {
+    assert.equal(page.pageName, `Page ${exactNames[pageIndex]}`);
+    assert.deepEqual(Array.from(page.cellIndices), [0]);
+    assert.deepEqual(Array.from(page.scores), [
+      ((exactNames.length - 1) / 2) + pageIndex,
+    ]);
+    assert.equal(page.genesUsed, exactNames.length);
+  }
+});
+
+test('gene signature scoring rejects an inherited-only gene record', async () => {
+  const pageData = {
+    values: Float32Array.of(1),
+    cellIndices: Uint32Array.of(0),
+    pageName: 'Inherited page',
+  };
+  const analysis = Object.create(MultiVariableAnalysis.prototype);
+  analysis.dataLayer = {
+    async getGeneExpressionSubset() {
+      return Object.create({
+        GENE: Object.fromEntries([['page', pageData]]),
+      });
+    },
+    clearBulkGeneCache() {},
+    performCacheCleanup() {},
+  };
+  analysis._computeManager = null;
+  analysis._notifications = {
+    loading() { return 'inherited-gene-signature-notification'; },
+    complete() {},
+    fail() {},
+  };
+
+  await assert.rejects(
+    analysis.computeSignatureScore({
+      genes: ['GENE'],
+      pageIds: ['page'],
+      method: 'mean',
+    }),
+    /signature data is missing for gene GENE on page page/i,
+  );
+});
+
+test('gene signature scoring rejects an inherited-only page record', async () => {
+  const pageData = {
+    values: Float32Array.of(1),
+    cellIndices: Uint32Array.of(0),
+    pageName: 'Inherited page',
+  };
+  const analysis = Object.create(MultiVariableAnalysis.prototype);
+  analysis.dataLayer = {
+    async getGeneExpressionSubset() {
+      return Object.fromEntries([
+        ['GENE', Object.create({ page: pageData })],
+      ]);
+    },
+    clearBulkGeneCache() {},
+    performCacheCleanup() {},
+  };
+  analysis._computeManager = null;
+  analysis._notifications = {
+    loading() { return 'inherited-page-signature-notification'; },
+    complete() {},
+    fail() {},
+  };
+
+  await assert.rejects(
+    analysis.computeSignatureScore({
+      genes: ['GENE'],
+      pageIds: ['page'],
+      method: 'mean',
+    }),
+    /signature data is missing for gene GENE on page page/i,
   );
 });
 

@@ -30,6 +30,7 @@ import { PageSelectorComponent } from '../shared/page-selector.js';
 import { loadPlotly } from '../../plots/plotly-loader.js';
 import { createLayoutEngine } from '../../plots/layout-engine.js';
 import { PlotlyRenderSlot } from '../../shared/plotly-render-slot.js';
+import { setOwnDataProperty } from '../../../../utils/exact-record.js';
 
 function combineErrors(errors, message) {
   const present = [...new Set(errors.filter(Boolean))];
@@ -391,7 +392,7 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
   }
 
   _handlePlotOptionChange(key, value) {
-    this._currentConfig.plotOptions[key] = value;
+    setOwnDataProperty(this._currentConfig.plotOptions, key, value);
     this._saveOptionsForPlotType(this._currentConfig.plotType, this._currentConfig.plotOptions);
     this._scheduleUpdate();
   }

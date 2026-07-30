@@ -21,6 +21,25 @@ import { isFiniteNumber, mean } from '../shared/number-utils.js';
 import { startMemoryTracking } from '../shared/memory-tracker.js';
 import { cleanupAnalysisResources } from '../shared/resource-cleanup.js';
 
+function getOwnGenePageData(geneData, gene, pageId) {
+  if (
+    geneData === null ||
+    geneData === undefined ||
+    !Object.hasOwn(geneData, gene)
+  ) {
+    return undefined;
+  }
+  const genePages = geneData[gene];
+  if (
+    genePages === null ||
+    genePages === undefined ||
+    !Object.hasOwn(genePages, pageId)
+  ) {
+    return undefined;
+  }
+  return genePages[pageId];
+}
+
 function cleanupPreservingAnalysisFailure(
   operation,
   hasAnalysisFailure,
@@ -1389,7 +1408,11 @@ export class MultiVariableAnalysis {
           memScope.end({ method, stale: true });
           return null;
         }
-        const firstGeneData = geneData?.[ownedGenes[0]]?.[pageId];
+        const firstGeneData = getOwnGenePageData(
+          geneData,
+          ownedGenes[0],
+          pageId
+        );
         if (!firstGeneData || !firstGeneData.values || !firstGeneData.cellIndices) {
           throw new Error(
             `Signature data is missing for gene ${ownedGenes[0]} on page ${pageId}`
@@ -1415,7 +1438,7 @@ export class MultiVariableAnalysis {
               : new Uint16Array(cellCount)
           );
         const pageGeneData = ownedGenes.map(gene => {
-          const genePageData = geneData?.[gene]?.[pageId];
+          const genePageData = getOwnGenePageData(geneData, gene, pageId);
           if (!genePageData || !genePageData.values || !genePageData.cellIndices) {
             throw new Error(`Signature data is missing for gene ${gene} on page ${pageId}`);
           }

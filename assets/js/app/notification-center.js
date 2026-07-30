@@ -20,6 +20,9 @@ import { formatBytes, formatDuration } from './notification-center/formatters.js
 import { downloadTrackingMethods } from './notification-center/download-tracking.js';
 import { benchmarkNotificationMethods } from './notification-center/benchmark-notifications.js';
 import { escapeHtml } from './utils/dom-utils.js';
+import {
+  registerModalDocumentAuxiliary
+} from './ui/components/modal-background-owner.js';
 
 // Singleton instance
 let instance = null;
@@ -195,6 +198,7 @@ class NotificationCenter {
     this.maxNotifications = 5;
     this.defaultDuration = 4000;
     this.initialized = false;
+    this._releaseModalAuxiliary = null;
 
     // Track active downloads for speed calculation
     this.downloadTrackers = new Map();
@@ -232,7 +236,16 @@ class NotificationCenter {
     this.container.setAttribute('aria-label', 'Notifications');
 
     document.body.appendChild(this.container);
-    this.initialized = true;
+    try {
+      this._releaseModalAuxiliary =
+        registerModalDocumentAuxiliary(this.container);
+      this.initialized = true;
+    } catch (error) {
+      this.container.remove();
+      this.container = null;
+      this._releaseModalAuxiliary = null;
+      throw error;
+    }
 
     debug.log('[NotificationCenter] Initialized');
   }

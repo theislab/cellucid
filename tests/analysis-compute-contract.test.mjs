@@ -16,6 +16,9 @@ import {
   WORKER_CAPABLE_OPERATIONS
 } from '../assets/js/app/analysis/compute/operations.js';
 import { WorkerPool } from '../assets/js/app/analysis/compute/worker-pool.js';
+import { QueryBuilder } from '../assets/js/app/analysis/data/query-builder.js';
+import { sampleLargeDataset } from '../assets/js/app/analysis/plots/plotly-loader.js';
+import { toCSV } from '../assets/js/app/analysis/shared/analysis-utils.js';
 
 const COMPUTE_ROOT = new URL('../assets/js/app/analysis/compute/', import.meta.url);
 
@@ -80,6 +83,203 @@ test('numeric mismatches are not advertised as GPU-capable operations', () => {
   assert.equal(cpuHistogram.total, 4);
   assert.equal(gpuHistogram.validCount, 0);
   assert.equal(GPU_CAPABLE_OPERATIONS.has(OperationType.COMPUTE_HISTOGRAM), false);
+});
+
+test('batch extraction preserves every legal prototype-named variable', () => {
+  const variableNames = Object.getOwnPropertyNames(Object.prototype);
+  const result = executeOperation(OperationType.BATCH_EXTRACT, {
+    cellIndices: [0],
+    variables: variableNames.map((key, index) => ({
+      key,
+      rawValues: Float32Array.of(index + 0.5),
+      isCategorical: false,
+    })),
+  });
+
+  assert.equal(Object.getPrototypeOf(result), Object.prototype);
+  assert.deepEqual(Object.keys(result), variableNames);
+  for (const [index, key] of variableNames.entries()) {
+    assert.equal(Object.hasOwn(result, key), true, key);
+    assert.deepEqual(result[key], {
+      values: [index + 0.5],
+      validCount: 1,
+      validIndices: [0],
+    });
+  }
+});
+
+test('cell filtering requires an own field and accepts every own prototype-named field', () => {
+  const fieldNames = Object.getOwnPropertyNames(Object.prototype);
+
+  for (const [index, field] of fieldNames.entries()) {
+    const condition = {
+      field,
+      operator: 'equals',
+      value: undefined,
+    };
+    const inheritedOnly = executeOperation(OperationType.FILTER_CELLS, {
+      cellIndices: [0],
+      conditions: [condition],
+      fieldsData: {},
+    });
+    assert.deepEqual(inheritedOnly.filtered, [], field);
+    const inheritedOnlyNegated = executeOperation(
+      OperationType.FILTER_CELLS,
+      {
+        cellIndices: [0],
+        conditions: [{ ...condition, negate: true }],
+        fieldsData: {},
+      },
+    );
+    assert.deepEqual(inheritedOnlyNegated.filtered, [], field);
+
+    const ownField = executeOperation(OperationType.FILTER_CELLS, {
+      cellIndices: [0],
+      conditions: [{
+        ...condition,
+        value: index,
+      }],
+      fieldsData: Object.fromEntries([[field, [index]]]),
+    });
+    assert.deepEqual(ownField.filtered, [0], field);
+  }
+});
+
+test('QueryBuilder null filtering requires own prototype-named fields', async () => {
+  const fieldNames = Object.getOwnPropertyNames(Object.prototype);
+
+  for (const [index, field] of fieldNames.entries()) {
+    const builder = new QueryBuilder(null);
+    builder.addCondition({
+      id: `prototype-field-${index}`,
+      field,
+      operator: 'is_null',
+    });
+
+    assert.deepEqual(await builder.execute([0], {}), [], field);
+    assert.deepEqual(
+      await builder.execute(
+        [0],
+        Object.fromEntries([[field, [null]]]),
+      ),
+      [0],
+      field,
+    );
+  }
+});
+
+test('QueryBuilder resolves exact field ownership once outside the cell loop', async () => {
+  const cellCount = 10_000;
+  const builder = new QueryBuilder(null);
+  builder.addCondition({
+    id: 'hoisted-own-field',
+    field: 'constructor',
+    operator: 'greater_equal',
+    value: 0,
+  });
+  let ownershipChecks = 0;
+  const fieldsData = new Proxy(
+    Object.fromEntries([
+      ['constructor', new Float32Array(cellCount)],
+    ]),
+    {
+      getOwnPropertyDescriptor(target, key) {
+        if (key === 'constructor') ownershipChecks++;
+        return Reflect.getOwnPropertyDescriptor(target, key);
+      },
+    },
+  );
+
+  const result = await builder.execute(
+    Array.from({ length: cellCount }, (_, index) => index),
+    fieldsData,
+  );
+  assert.equal(result.length, cellCount);
+  assert.equal(ownershipChecks, 1);
+});
+
+test('CSV conversion requires own headers and row cells for prototype-named columns', () => {
+  const columns = Object.getOwnPropertyNames(Object.prototype);
+  const row = Object.fromEntries(
+    columns.map((column, index) => [column, `value-${index}`]),
+  );
+
+  assert.equal(
+    toCSV([row], { columns }),
+    [
+      columns.join(','),
+      columns.map((_, index) => `value-${index}`).join(','),
+    ].join('\n'),
+  );
+  assert.equal(
+    toCSV([{}], { columns }),
+    [
+      columns.join(','),
+      columns.map(() => '').join(','),
+    ].join('\n'),
+  );
+
+  assert.equal(
+    toCSV(
+      [Object.fromEntries([['constructor', 'value']])],
+      {
+        columns: ['constructor', 'toString', 'valueOf', '__proto__'],
+        headers: Object.fromEntries([
+          ['constructor', ''],
+          ['toString', 0],
+          ['valueOf', false],
+          ['__proto__', null],
+        ]),
+      },
+    ),
+    ',0,false,\nvalue,,,',
+  );
+});
+
+test('large-dataset sampling preserves every own prototype-named aligned array', () => {
+  const arrayNames = Object.getOwnPropertyNames(Object.prototype);
+  const additionalArrays = Object.fromEntries(
+    arrayNames.map((name, index) => [name, [index, index + 100]]),
+  );
+  const sampled = sampleLargeDataset([0, 1], [10, 11], additionalArrays, 1);
+
+  assert.equal(Object.getPrototypeOf(sampled), Object.prototype);
+  assert.deepEqual(
+    Object.keys(sampled),
+    [
+      'x',
+      'y',
+      ...arrayNames,
+      'sampled',
+      'originalCount',
+      'sampledCount',
+    ],
+  );
+  for (const [index, name] of arrayNames.entries()) {
+    assert.equal(Object.hasOwn(sampled, name), true, name);
+    assert.deepEqual(sampled[name], [index], name);
+  }
+});
+
+test('large-dataset sampling resolves auxiliary arrays once before its point loop', () => {
+  const cellCount = 10_000;
+  const values = new Float32Array(cellCount);
+  let valueReads = 0;
+  const additionalArrays = new Proxy({ constructor: values }, {
+    get(target, key, receiver) {
+      if (key === 'constructor') valueReads++;
+      return Reflect.get(target, key, receiver);
+    },
+  });
+
+  const sampled = sampleLargeDataset(
+    values,
+    values,
+    additionalArrays,
+    1_000,
+  );
+  assert.equal(sampled.constructor.length, 1_000);
+  assert.equal(valueReads, 1);
 });
 
 test('ComputeManager executes exactly one preselected backend and propagates its error', async t => {

@@ -231,8 +231,19 @@ export class AnalysisUIManager {
       let container;
 
       // Use pre-created container from map if available
-      if (this._containerMap && this._containerMap[id]) {
+      if (Object.hasOwn(this._containerMap, id)) {
         container = this._containerMap[id];
+        if (
+          container === null ||
+          (typeof container !== 'object' && typeof container !== 'function') ||
+          container.classList === null ||
+          typeof container.classList !== 'object' ||
+          typeof container.classList.add !== 'function'
+        ) {
+          throw new TypeError(
+            `Analysis container "${id}" must expose a usable classList`
+          );
+        }
         container.id = `${id}-analysis-container`;
         container.classList.add(`${id}-analysis-panel`, 'analysis-panel');
       } else {

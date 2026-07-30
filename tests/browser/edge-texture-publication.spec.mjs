@@ -462,8 +462,24 @@ test('edge texture pooling, streamed tails, and binary visibility stay exact', a
       const completeRows = Math.floor(nCells / positionWidth);
       const tailLength = nCells % positionWidth;
       const terminalUpload = positionUploads.at(-1);
-      const streamedExactOwner = positionUploads.every(
-        upload => upload.data === exactPositions,
+      const uploadedPositionOwner = positionUploads[0]?.data ?? null;
+      const streamedSinglePrivateOwner = (
+        positionUploads.length > 0 &&
+        uploadedPositionOwner instanceof Float32Array &&
+        uploadedPositionOwner.length === nCells * 3 &&
+        uploadedPositionOwner !== exactPositions &&
+        positionUploads.every(
+          upload => upload.data === uploadedPositionOwner,
+        )
+      );
+      const streamedOwnerMatchesProjection = (
+        uploadedPositionOwner?.length === exactPositions.length &&
+        Array.from(exactPositions).every(
+          (value, index) => Object.is(
+            uploadedPositionOwner[index],
+            value,
+          ),
+        )
       );
       const exactTailShape = (
         tailLength > 0 &&
@@ -678,7 +694,8 @@ test('edge texture pooling, streamed tails, and binary visibility stay exact', a
           sharedStats.positionGenerations.length,
         sharedGenerationRefCount:
           sharedStats.positionGenerations[0].refCount,
-        streamedExactOwner,
+        streamedOwnerMatchesProjection,
+        streamedSinglePrivateOwner,
         tailSample: tailSample.slice(0, 3),
         expectedTail,
         thresholdSamples,
@@ -701,7 +718,8 @@ test('edge texture pooling, streamed tails, and binary visibility stay exact', a
 
   expect(proof.unpackRestored).toBe(true);
   expect(proof.noPaddedPositionAllocation).toBe(true);
-  expect(proof.streamedExactOwner).toBe(true);
+  expect(proof.streamedSinglePrivateOwner).toBe(true);
+  expect(proof.streamedOwnerMatchesProjection).toBe(true);
   expect(proof.exactTailShape).toBe(true);
   expect(proof.tailSample).toEqual(proof.expectedTail);
   expect(proof.wrongOwnerError).toMatch(/differ.*certified renderer owner/i);
@@ -736,6 +754,693 @@ test('edge texture pooling, streamed tails, and binary visibility stay exact', a
   expect(proof.clearThrew).toBe(false);
   expect(proof.clearedPendingRetirements).toBe(0);
   expect(proof.clearedPositionGenerations).toBe(0);
+  expect(proof.glError).toBe(0);
+  expect(pageErrors).toEqual([]);
+  expect(responseFailures).toEqual([]);
+  expect(consoleDiagnostics).toEqual([]);
+});
+
+test('per-view edge prefixes remain exact across focus, R8 failure, and retirement', async ({
+  page,
+}) => {
+  const pageErrors = [];
+  const consoleDiagnostics = [];
+  const responseFailures = [];
+  page.on('pageerror', error => pageErrors.push(error.message));
+  page.on('console', message => {
+    if (message.type() !== 'error' && message.type() !== 'warning') return;
+    const text = `${message.type()}: ${message.text()}`;
+    if (
+      !/GPU stall due to ReadPixels/i.test(text) &&
+      !/WebGL warning: texSubImage: (?:Texture has not been initialized|Tex image .*lazy initialization)/i.test(text)
+    ) {
+      consoleDiagnostics.push(text);
+    }
+  });
+  page.on('response', response => {
+    if (response.status() >= 400) {
+      responseFailures.push(
+        `${response.status()} ${response.request().method()} ${response.url()}`,
+      );
+    }
+  });
+
+  await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
+  await dismissWelcome(page);
+  await expect(page.locator('#dataset-name')).toHaveText(
+    'Current UI prepared fixture',
+  );
+
+  const proof = await page.evaluate(async () => {
+    const viewer = window._cellucidViewer;
+    const state = window._cellucidState;
+    const gl = viewer.getGLContext();
+    const prototype = WebGL2RenderingContext.prototype;
+    const nCells = viewer.getPointCount();
+    const edgeCount = 5000;
+    if (nCells < 4) {
+      throw new Error(
+        'Per-view edge-prefix browser proof requires at least four cells.',
+      );
+    }
+    viewer.pause();
+    viewer.setAdaptiveLOD(false);
+    viewer.setFrustumCulling(false);
+
+    // The raw shuffled stream alternates between two disjoint endpoint
+    // groups. Opposite accepted R8 owners therefore need raw prefixes one
+    // and two, respectively, to admit the first shader-visible edge.
+    const sources = new Uint32Array(edgeCount);
+    const destinations = new Uint32Array(edgeCount);
+    const weights = new Float64Array(edgeCount);
+    for (let edgeIndex = 0; edgeIndex < edgeCount; edgeIndex++) {
+      const liveEndpointGroup = edgeIndex % 2 === 0;
+      sources[edgeIndex] = liveEndpointGroup ? 0 : 2;
+      destinations[edgeIndex] = liveEndpointGroup ? 1 : 3;
+      weights[edgeIndex] = 1;
+    }
+    const liveVisibility = new Float32Array(nCells);
+    liveVisibility[0] = 1;
+    liveVisibility[1] = 1;
+    const snapshotVisibility = new Float32Array(nCells);
+    snapshotVisibility[2] = 1;
+    snapshotVisibility[3] = 1;
+
+    const edgeSetup = viewer.setupEdgesV2({
+      sources,
+      destinations,
+      weights,
+      nEdges: edgeCount,
+      nCells,
+    }, viewer.getViewPositions('live'));
+    const payload = state.getSnapshotPayload();
+    const snapshot = viewer.createSnapshotView({
+      label: 'Opposite edge visibility',
+      fieldKey: payload.fieldKey,
+      fieldKind: payload.fieldKind,
+      colors: payload.colors,
+      transparency: snapshotVisibility,
+      centroidPositions: payload.centroidPositions,
+      centroidColors: payload.centroidColors,
+      dimensionLevel: viewer.getViewDimension('live'),
+      sourceViewId: 'live',
+      meta: { filtersText: payload.filtersText },
+      cameraState: viewer.getViewCameraState('live'),
+    });
+    const liveVisibilitySetup =
+      viewer.updateEdgeVisibilityV2ForView(
+        'live',
+        liveVisibility,
+      );
+    const initialLivePrefix =
+      viewer.refreshEdgePrefixForView('live');
+    const initialSnapshotPrefix =
+      viewer.refreshEdgePrefixForView(snapshot.id);
+    const targetAccepted = viewer.setEdgeVisibleTarget(1);
+    const oppositeLivePrefix =
+      viewer.getEdgePrefixStatsForView('live');
+    const oppositeSnapshotPrefix =
+      viewer.getEdgePrefixStatsForView(snapshot.id);
+    const sparseStats = viewer.getEdgeTextureStatsV2();
+    const sparseCheckpointByteBound =
+      (Math.ceil(edgeCount / 4096) + 1) *
+      Uint32Array.BYTES_PER_ELEMENT;
+
+    const prefixTuple = stats => ({
+      current: stats?.current ?? null,
+      rawPrefix: stats?.rawPrefix ?? null,
+      visibilityRevision: stats?.visibilityRevision ?? null,
+      visibleCount: stats?.visibleCount ?? null,
+    });
+    const beforeFocus = {
+      live: prefixTuple(oppositeLivePrefix),
+      snapshot: prefixTuple(oppositeSnapshotPrefix),
+    };
+    viewer.setViewLayout('grid', snapshot.id);
+    const afterSnapshotFocus = {
+      live: prefixTuple(
+        viewer.getEdgePrefixStatsForView('live'),
+      ),
+      snapshot: prefixTuple(
+        viewer.getEdgePrefixStatsForView(snapshot.id),
+      ),
+    };
+    viewer.setViewLayout('grid', 'live');
+    const afterLiveFocus = {
+      live: prefixTuple(
+        viewer.getEdgePrefixStatsForView('live'),
+      ),
+      snapshot: prefixTuple(
+        viewer.getEdgePrefixStatsForView(snapshot.id),
+      ),
+    };
+
+    const captureConnectivityFrames = async () => {
+      const originalDrawArraysInstanced =
+        prototype.drawArraysInstanced;
+      const submissions = [];
+      prototype.drawArraysInstanced = function (...args) {
+        if (
+          this === gl &&
+          /drawConnectivityInstanced/.test(
+            new Error().stack ?? '',
+          )
+        ) {
+          submissions.push({
+            instances: args[3],
+            viewport: Array.from(
+              this.getParameter(this.VIEWPORT),
+            ),
+          });
+        }
+        return Reflect.apply(
+          originalDrawArraysInstanced,
+          this,
+          args,
+        );
+      };
+      try {
+        viewer.resume();
+        await new Promise(resolve => {
+          requestAnimationFrame(() =>
+            requestAnimationFrame(resolve)
+          );
+        });
+      } finally {
+        viewer.pause();
+        prototype.drawArraysInstanced =
+          originalDrawArraysInstanced;
+      }
+      return submissions;
+    };
+
+    viewer.setShowConnectivity(true);
+    viewer.setEdgeVisibleTarget(0);
+    const zeroTargetPrefixes = {
+      live: viewer.getEdgePrefixStatsForView('live').rawPrefix,
+      snapshot:
+        viewer.getEdgePrefixStatsForView(snapshot.id).rawPrefix,
+    };
+    const zeroTargetSubmissions =
+      await captureConnectivityFrames();
+
+    viewer.setEdgeVisibleTarget(edgeCount);
+    const fullTargetPrefixes = {
+      live: viewer.getEdgePrefixStatsForView('live').rawPrefix,
+      snapshot:
+        viewer.getEdgePrefixStatsForView(snapshot.id).rawPrefix,
+    };
+    const fullTargetSubmissions =
+      await captureConnectivityFrames();
+
+    viewer.setCamerasLocked(false);
+    const liveFogCamera = viewer.getViewCameraState('live');
+    liveFogCamera.navigationMode = 'orbit';
+    liveFogCamera.orbit.radius = 2;
+    liveFogCamera.orbit.targetRadius = 2;
+    liveFogCamera.orbit.theta = 0;
+    liveFogCamera.orbit.phi = Math.PI / 2;
+    liveFogCamera.orbit.target = [0, 0, 0];
+    liveFogCamera.freefly.position = [2, 0, 0];
+    liveFogCamera.freefly.yaw = 0;
+    liveFogCamera.freefly.pitch = 0;
+    const snapshotFogCamera =
+      viewer.getViewCameraState(snapshot.id);
+    snapshotFogCamera.navigationMode = 'orbit';
+    snapshotFogCamera.orbit.radius = 50;
+    snapshotFogCamera.orbit.targetRadius = 50;
+    snapshotFogCamera.orbit.theta = 0;
+    snapshotFogCamera.orbit.phi = Math.PI / 2;
+    snapshotFogCamera.orbit.target = [30, -20, 10];
+    snapshotFogCamera.freefly.position = [80, -20, 10];
+    snapshotFogCamera.freefly.yaw = 0;
+    snapshotFogCamera.freefly.pitch = 0;
+    viewer.setViewCameraState('live', liveFogCamera);
+    viewer.setViewCameraState(snapshot.id, snapshotFogCamera);
+    // The focused view renders from the live global camera variables, while
+    // the other unlocked pane renders from its exact cached camera owner.
+    viewer.setCameraState(liveFogCamera);
+    viewer.stopInertia();
+    viewer.setViewLayout('grid', 'live');
+
+    const capturePaneFogFrames = async () => {
+      const renderer = viewer.getHPRenderer();
+      const originalRender = renderer.render;
+      const originalRenderWithSnapshot =
+        renderer.renderWithSnapshot;
+      const renderDescriptor =
+        Object.getOwnPropertyDescriptor(renderer, 'render');
+      const snapshotRenderDescriptor =
+        Object.getOwnPropertyDescriptor(
+          renderer,
+          'renderWithSnapshot',
+        );
+      const originalDrawArraysInstanced =
+        prototype.drawArraysInstanced;
+      const pointPasses = [];
+      const connectivityPairs = [];
+      let eventOrder = 0;
+      let pendingPointPass = null;
+
+      const recordPointPass = (viewId, exactRenderer) => {
+        const record = {
+          far: exactRenderer.getFogFar(),
+          near: exactRenderer.getFogNear(),
+          order: eventOrder++,
+          viewId,
+          viewport: Array.from(
+            gl.getParameter(gl.VIEWPORT),
+          ),
+        };
+        pointPasses.push(record);
+        pendingPointPass = record;
+      };
+      renderer.render = function (params) {
+        const result = Reflect.apply(
+          originalRender,
+          this,
+          [params],
+        );
+        recordPointPass(params.viewId, this);
+        return result;
+      };
+      renderer.renderWithSnapshot = function (id, params) {
+        const result = Reflect.apply(
+          originalRenderWithSnapshot,
+          this,
+          [id, params],
+        );
+        recordPointPass(id, this);
+        return result;
+      };
+      prototype.drawArraysInstanced = function (...args) {
+        if (
+          this === gl &&
+          /drawConnectivityInstanced/.test(
+            new Error().stack ?? '',
+          )
+        ) {
+          const program = this.getParameter(
+            this.CURRENT_PROGRAM,
+          );
+          const nearLocation = program === null
+            ? null
+            : this.getUniformLocation(
+              program,
+              'u_fogNearMean',
+            );
+          const farLocation = program === null
+            ? null
+            : this.getUniformLocation(
+              program,
+              'u_fogFarMean',
+            );
+          connectivityPairs.push({
+            line: {
+              far: farLocation === null
+                ? null
+                : this.getUniform(program, farLocation),
+              instances: args[3],
+              near: nearLocation === null
+                ? null
+                : this.getUniform(program, nearLocation),
+              order: eventOrder++,
+              viewport: Array.from(
+                this.getParameter(this.VIEWPORT),
+              ),
+            },
+            point: pendingPointPass,
+          });
+          pendingPointPass = null;
+        }
+        return Reflect.apply(
+          originalDrawArraysInstanced,
+          this,
+          args,
+        );
+      };
+
+      try {
+        viewer.resume();
+        await new Promise(resolve => {
+          requestAnimationFrame(() =>
+            requestAnimationFrame(resolve)
+          );
+        });
+      } finally {
+        viewer.pause();
+        prototype.drawArraysInstanced =
+          originalDrawArraysInstanced;
+        if (renderDescriptor === undefined) {
+          delete renderer.render;
+        } else {
+          Object.defineProperty(
+            renderer,
+            'render',
+            renderDescriptor,
+          );
+        }
+        if (snapshotRenderDescriptor === undefined) {
+          delete renderer.renderWithSnapshot;
+        } else {
+          Object.defineProperty(
+            renderer,
+            'renderWithSnapshot',
+            snapshotRenderDescriptor,
+          );
+        }
+      }
+      return {
+        connectivityPairs,
+        pendingPointPass,
+        pointPasses,
+      };
+    };
+    const paneFogProof = await capturePaneFogFrames();
+    const paneFogCameraProof = {
+      camerasLocked: viewer.getCamerasLocked(),
+      live: viewer.getViewCameraState('live'),
+      snapshot: viewer.getViewCameraState(snapshot.id),
+    };
+
+    viewer.setEdgeVisibleTarget(1);
+    const beforeFailedPublication =
+      viewer.getEdgePrefixStatsForView(snapshot.id);
+    const replacementSnapshotVisibility =
+      new Float32Array(liveVisibility);
+    const originalTexSubImage2D = prototype.texSubImage2D;
+    const originalGetError = prototype.getError;
+    let injectedVisibilityErrors = 0;
+    let syntheticVisibilityErrorPending = false;
+    prototype.texSubImage2D = function (...args) {
+      const result = Reflect.apply(
+        originalTexSubImage2D,
+        this,
+        args,
+      );
+      if (
+        this === gl &&
+        injectedVisibilityErrors === 0 &&
+        args[6] === this.RED &&
+        args[7] === this.UNSIGNED_BYTE
+      ) {
+        injectedVisibilityErrors += 1;
+        syntheticVisibilityErrorPending = true;
+      }
+      return result;
+    };
+    prototype.getError = function (...args) {
+      if (
+        this === gl &&
+        syntheticVisibilityErrorPending
+      ) {
+        syntheticVisibilityErrorPending = false;
+        return this.INVALID_OPERATION;
+      }
+      return Reflect.apply(originalGetError, this, args);
+    };
+    let failedVisibilityPublicationError = null;
+    try {
+      viewer.updateEdgeVisibilityV2ForView(
+        snapshot.id,
+        replacementSnapshotVisibility,
+      );
+    } catch (error) {
+      failedVisibilityPublicationError = error.message;
+    } finally {
+      prototype.texSubImage2D = originalTexSubImage2D;
+      prototype.getError = originalGetError;
+    }
+    const afterFailedPublication =
+      viewer.getEdgePrefixStatsForView(snapshot.id);
+
+    const successfulVisibilityPublication =
+      viewer.updateEdgeVisibilityV2ForView(
+        snapshot.id,
+        replacementSnapshotVisibility,
+      );
+    const stalePublicPrefix =
+      viewer.getEdgePrefixStatsForView(snapshot.id);
+    const staleInventory = viewer
+      .getEdgeTextureStatsV2()
+      .prefixViews
+      .find(entry => entry.viewId === snapshot.id);
+    let staleTargetError = null;
+    try {
+      viewer.setEdgeVisibleTarget(1);
+    } catch (error) {
+      staleTargetError = error.message;
+    }
+    viewer.setViewLayout('single', snapshot.id);
+    const staleSubmissions =
+      await captureConnectivityFrames();
+
+    const refreshedSnapshotPrefix =
+      viewer.refreshEdgePrefixForView(snapshot.id);
+    const refreshedSparseStats =
+      viewer.getEdgeTextureStatsV2();
+    const refreshedTargetAccepted =
+      viewer.setEdgeVisibleTarget(1);
+    const refreshedLivePrefix =
+      viewer.getEdgePrefixStatsForView('live');
+    const refreshedSnapshotTargetPrefix =
+      viewer.getEdgePrefixStatsForView(snapshot.id);
+
+    viewer.removeSnapshotView(snapshot.id);
+    const retiredSnapshotPrefix =
+      viewer.getEdgePrefixStatsForView(snapshot.id);
+    const retiredStats = viewer.getEdgeTextureStatsV2();
+
+    return {
+      afterFailedPublication:
+        prefixTuple(afterFailedPublication),
+      afterLiveFocus,
+      afterSnapshotFocus,
+      beforeFailedPublication:
+        prefixTuple(beforeFailedPublication),
+      beforeFocus,
+      edgeCount,
+      edgeSetup,
+      failedVisibilityPublicationError,
+      fullTargetPrefixes,
+      fullTargetSubmissions,
+      glError: gl.getError(),
+      initialLivePrefix,
+      initialSnapshotPrefix,
+      injectedVisibilityErrors,
+      liveVisibilitySetup,
+      oppositeLivePrefix,
+      oppositeSnapshotPrefix,
+      paneFogCameraProof,
+      paneFogProof,
+      refreshedLivePrefix,
+      refreshedSnapshotPrefix,
+      refreshedSnapshotTargetPrefix,
+      refreshedSparseStats,
+      refreshedTargetAccepted,
+      retiredSnapshotPrefix,
+      retiredStats,
+      sparseCheckpointByteBound,
+      sparseStats,
+      staleInventory,
+      stalePublicPrefix,
+      staleSubmissions,
+      staleTargetError,
+      successfulVisibilityPublication,
+      targetAccepted,
+      zeroTargetPrefixes,
+      zeroTargetSubmissions,
+    };
+  });
+
+  expect(proof.edgeSetup).toBe(true);
+  expect(proof.liveVisibilitySetup).toBe(true);
+  expect(proof.initialLivePrefix.current).toBe(true);
+  expect(proof.initialSnapshotPrefix.current).toBe(true);
+  expect(proof.targetAccepted).toBe(true);
+  expect(proof.oppositeLivePrefix).toMatchObject({
+    current: true,
+    rawPrefix: 1,
+    visibleCount: proof.edgeCount / 2,
+  });
+  expect(proof.oppositeSnapshotPrefix).toMatchObject({
+    current: true,
+    rawPrefix: 2,
+    visibleCount: proof.edgeCount / 2,
+  });
+  expect(proof.beforeFocus).toEqual(proof.afterSnapshotFocus);
+  expect(proof.beforeFocus).toEqual(proof.afterLiveFocus);
+
+  expect(proof.zeroTargetPrefixes).toEqual({
+    live: 0,
+    snapshot: 0,
+  });
+  expect(proof.zeroTargetSubmissions).toEqual([]);
+  expect(proof.fullTargetPrefixes).toEqual({
+    live: proof.edgeCount - 1,
+    snapshot: proof.edgeCount,
+  });
+  expect(proof.fullTargetSubmissions.length).toBeGreaterThanOrEqual(2);
+  expect(
+    proof.fullTargetSubmissions.every(
+      submission => (
+        submission.instances === proof.fullTargetPrefixes.live ||
+        submission.instances === proof.fullTargetPrefixes.snapshot
+      ),
+    ),
+  ).toBe(true);
+  expect(
+    new Set(
+      proof.fullTargetSubmissions.map(
+        submission => submission.instances,
+      ),
+    ),
+  ).toEqual(new Set([
+    proof.fullTargetPrefixes.live,
+    proof.fullTargetPrefixes.snapshot,
+  ]));
+  expect(
+    new Set(
+      proof.fullTargetSubmissions.map(
+        submission => submission.viewport.join(','),
+      ),
+    ).size,
+  ).toBe(2);
+
+  expect(proof.paneFogCameraProof).toMatchObject({
+    camerasLocked: false,
+    live: {
+      orbit: {
+        radius: 2,
+        target: [0, 0, 0],
+      },
+    },
+    snapshot: {
+      orbit: {
+        radius: 50,
+        target: [30, -20, 10],
+      },
+      freefly: {
+        position: [80, -20, 10],
+      },
+    },
+  });
+  const liveFreeflyPosition =
+    proof.paneFogCameraProof.live.freefly.position;
+  expect(liveFreeflyPosition).toHaveLength(3);
+  expect(liveFreeflyPosition[0]).toBeCloseTo(2, 12);
+  expect(liveFreeflyPosition[1]).toBeCloseTo(0, 12);
+  expect(liveFreeflyPosition[2]).toBeCloseTo(0, 12);
+  expect(proof.paneFogProof.pendingPointPass).toBeNull();
+  expect(
+    proof.paneFogProof.connectivityPairs.length,
+  ).toBeGreaterThanOrEqual(2);
+  expect(proof.paneFogProof.connectivityPairs).toHaveLength(
+    proof.paneFogProof.pointPasses.length,
+  );
+  const paneFogRanges = new Map();
+  for (const pair of proof.paneFogProof.connectivityPairs) {
+    expect(pair.point).not.toBeNull();
+    expect(pair.line.order).toBe(pair.point.order + 1);
+    expect(pair.line.viewport).toEqual(pair.point.viewport);
+    expect(pair.line.instances).toBe(
+      pair.point.viewId === 'live'
+        ? proof.fullTargetPrefixes.live
+        : proof.fullTargetPrefixes.snapshot,
+    );
+    // WebGL uniform1f stores float32. Exact equality to Math.fround of the
+    // HighPerfRenderer scalar proves the line program received this pane's
+    // immediately preceding point-pass range, not another pane's range.
+    expect(pair.line.near).toBe(Math.fround(pair.point.near));
+    expect(pair.line.far).toBe(Math.fround(pair.point.far));
+    expect(pair.point.far).toBeGreaterThan(pair.point.near);
+    const previous = paneFogRanges.get(pair.point.viewId);
+    const current = {
+      far: pair.point.far,
+      near: pair.point.near,
+      viewport: pair.point.viewport,
+    };
+    if (previous === undefined) {
+      paneFogRanges.set(pair.point.viewId, current);
+    } else {
+      expect(current).toEqual(previous);
+    }
+  }
+  expect(Array.from(paneFogRanges.keys())).toEqual([
+    'live',
+    expect.stringMatching(/^snap_/),
+  ]);
+  const liveFogRange = paneFogRanges.get('live');
+  const snapshotFogRange = Array.from(
+    paneFogRanges.entries(),
+  ).find(([viewId]) => viewId !== 'live')[1];
+  expect(snapshotFogRange.viewport).not.toEqual(
+    liveFogRange.viewport,
+  );
+  expect(
+    Math.abs(snapshotFogRange.near - liveFogRange.near),
+  ).toBeGreaterThan(20);
+  expect(
+    Math.abs(snapshotFogRange.far - liveFogRange.far),
+  ).toBeGreaterThan(20);
+
+  expect(proof.injectedVisibilityErrors).toBe(1);
+  expect(proof.failedVisibilityPublicationError).toMatch(
+    /weighted connectivity visibility update.*WebGL error/i,
+  );
+  expect(proof.afterFailedPublication).toEqual(
+    proof.beforeFailedPublication,
+  );
+  expect(proof.successfulVisibilityPublication).toBe(true);
+  expect(proof.stalePublicPrefix).toBeNull();
+  expect(proof.staleInventory).toMatchObject({
+    current: false,
+    rawPrefix: 2,
+    viewId: expect.stringMatching(/^snap_/),
+  });
+  expect(proof.staleTargetError).toMatch(
+    /current prefix for view "snap_/i,
+  );
+  expect(proof.staleSubmissions).toEqual([]);
+  expect(proof.refreshedSnapshotPrefix).toMatchObject({
+    current: true,
+    rawPrefix: 1,
+    visibilityRevision:
+      proof.beforeFailedPublication.visibilityRevision + 1,
+    visibleCount: proof.edgeCount / 2,
+  });
+  expect(proof.refreshedTargetAccepted).toBe(true);
+  expect(proof.refreshedLivePrefix.rawPrefix).toBe(1);
+  expect(proof.refreshedSnapshotTargetPrefix.rawPrefix).toBe(1);
+
+  for (const stats of [
+    proof.sparseStats,
+    proof.refreshedSparseStats,
+    proof.retiredStats,
+  ]) {
+    expect(stats.prefixStagingBytes)
+      .toBeLessThanOrEqual(proof.sparseCheckpointByteBound);
+    for (const prefix of stats.prefixViews) {
+      expect(prefix.checkpointBytes)
+        .toBeLessThanOrEqual(proof.sparseCheckpointByteBound);
+    }
+  }
+  expect(proof.sparseStats.prefixViews).toHaveLength(2);
+  expect(proof.sparseStats.prefixViews.every(
+    prefix =>
+      prefix.checkpointBytes ===
+      proof.sparseCheckpointByteBound,
+  )).toBe(true);
+  expect(proof.sparseCheckpointByteBound).toBeLessThan(
+    proof.edgeCount * Uint32Array.BYTES_PER_ELEMENT,
+  );
+
+  expect(proof.retiredSnapshotPrefix).toBeNull();
+  expect(
+    proof.retiredStats.prefixViews.some(
+      entry => entry.viewId.startsWith('snap_'),
+    ),
+  ).toBe(false);
   expect(proof.glError).toBe(0);
   expect(pageErrors).toEqual([]);
   expect(responseFailures).toEqual([]);

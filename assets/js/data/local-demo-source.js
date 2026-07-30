@@ -13,6 +13,9 @@ import {
   resolveUrl,
   validateSchemaVersion
 } from './data-source.js';
+import {
+  createMetadataAbortError,
+} from './metadata-load-contract.js';
 
 /**
  * @typedef {import('./data-source.js').DatasetMetadata} DatasetMetadata
@@ -31,8 +34,12 @@ function validateDemoDatasetPath(value, id, source) {
   if (
     typeof value !== 'string' ||
     value.length === 0 ||
+    value !== value.trim() ||
     value.startsWith('/') ||
     value.includes('\\') ||
+    value.includes('?') ||
+    value.includes('#') ||
+    /[\u0000-\u001f\u007f]/.test(value) ||
     /^[A-Za-z]:/.test(value)
   ) {
     throw invalidDemoManifest(
@@ -50,15 +57,39 @@ function validateDemoDatasetPath(value, id, source) {
   }
   const parts = value.split('/');
   if (parts.at(-1) === '') parts.pop();
-  if (
-    parts.length === 0 ||
-    parts.some(part => part === '' || part === '.' || part === '..')
-  ) {
+  if (parts.length === 0 || parts.some(part => part.length === 0)) {
     throw invalidDemoManifest(
       `dataset '${id}' must declare a safe relative path`,
       source,
       { id, path: value }
     );
+  }
+  for (const part of parts) {
+    let decoded;
+    try {
+      decoded = decodeURIComponent(part);
+    } catch {
+      throw invalidDemoManifest(
+        `dataset '${id}' must declare a canonical relative directory path`,
+        source,
+        { id, path: value }
+      );
+    }
+    if (
+      decoded === '.' ||
+      decoded === '..' ||
+      decoded.includes('%') ||
+      decoded.includes('/') ||
+      decoded.includes('\\') ||
+      /[\u0000-\u001f\u007f]/.test(decoded) ||
+      encodeURIComponent(decoded) !== part
+    ) {
+      throw invalidDemoManifest(
+        `dataset '${id}' must declare a canonical relative directory path`,
+        source,
+        { id, path: value }
+      );
+    }
   }
   return value;
 }
@@ -236,6 +267,29 @@ export class LocalDemoDataSource {
     this._availabilityChecked = false;
     this._isAvailable = false;
     this._availabilityError = null;
+    this._catalogRevision = 0;
+    this._catalogController = new AbortController();
+    this._manifestInFlight = null;
+    this._datasetsInFlight = null;
+  }
+
+  _captureCatalogGeneration() {
+    return {
+      controller: this._catalogController,
+      revision: this._catalogRevision,
+    };
+  }
+
+  _assertCatalogGeneration(owner) {
+    if (
+      owner.controller.signal.aborted ||
+      owner.controller !== this._catalogController ||
+      owner.revision !== this._catalogRevision
+    ) {
+      throw createMetadataAbortError(
+        'Sample catalog generation'
+      );
+    }
   }
 
   /**
@@ -269,14 +323,17 @@ export class LocalDemoDataSource {
     }
 
     console.log(`[LocalDemoDataSource] isAvailable() checking manifest: ${this.manifestUrl}`);
+    const owner = this._captureCatalogGeneration();
 
     try {
-      await this._loadManifest();
+      await this._loadManifest(owner);
+      this._assertCatalogGeneration(owner);
       console.log('[LocalDemoDataSource] Manifest loaded and cached, available=true');
       this._availabilityChecked = true;
       this._isAvailable = true;
       return true;
     } catch (err) {
+      this._assertCatalogGeneration(owner);
       this._availabilityChecked = true;
       this._isAvailable = false;
       this._availabilityError = err;
@@ -289,7 +346,8 @@ export class LocalDemoDataSource {
    * @returns {Promise<Object>}
    * @private
    */
-  async _loadManifest() {
+  async _loadManifest(owner = this._captureCatalogGeneration()) {
+    this._assertCatalogGeneration(owner);
     if (this.configurationError !== null) {
       throw new DataSourceError(
         this.configurationError.message,
@@ -311,21 +369,47 @@ export class LocalDemoDataSource {
       return this._manifest;
     }
 
-    const candidateManifest = await fetchJson(
-      this.manifestUrl,
-      this.type
-    );
+    const current = this._manifestInFlight;
+    if (
+      current?.controller === owner.controller &&
+      current.revision === owner.revision
+    ) {
+      return current.promise;
+    }
 
-    validateSchemaVersion(
-      candidateManifest.version,
-      DATA_CONFIG.SUPPORTED_MANIFEST_VERSIONS,
-      'datasets.json'
-    );
-    validateDemoManifestContract(candidateManifest, this.type);
-    this._manifest = candidateManifest;
+    const promise = (async () => {
+      const candidateManifest = await fetchJson(
+        this.manifestUrl,
+        this.type,
+        { signal: owner.controller.signal }
+      );
+      this._assertCatalogGeneration(owner);
 
-    console.log(`[LocalDemoDataSource] Loaded datasets manifest with ${this._manifest.datasets?.length || 0} datasets`);
-    return this._manifest;
+      validateSchemaVersion(
+        candidateManifest.version,
+        DATA_CONFIG.SUPPORTED_MANIFEST_VERSIONS,
+        'datasets.json'
+      );
+      validateDemoManifestContract(candidateManifest, this.type);
+      this._assertCatalogGeneration(owner);
+      this._manifest = candidateManifest;
+
+      console.log(`[LocalDemoDataSource] Loaded datasets manifest with ${this._manifest.datasets?.length || 0} datasets`);
+      return this._manifest;
+    })();
+    const inFlight = {
+      controller: owner.controller,
+      revision: owner.revision,
+      promise,
+    };
+    this._manifestInFlight = inFlight;
+    try {
+      return await promise;
+    } finally {
+      if (this._manifestInFlight === inFlight) {
+        this._manifestInFlight = null;
+      }
+    }
   }
 
   /**
@@ -340,7 +424,34 @@ export class LocalDemoDataSource {
       throw this._datasetError;
     }
 
-    const manifest = await this._loadManifest();
+    const owner = this._captureCatalogGeneration();
+    const current = this._datasetsInFlight;
+    if (
+      current?.controller === owner.controller &&
+      current.revision === owner.revision
+    ) {
+      return current.promise;
+    }
+
+    const promise = this._loadDatasets(owner);
+    const inFlight = {
+      controller: owner.controller,
+      revision: owner.revision,
+      promise,
+    };
+    this._datasetsInFlight = inFlight;
+    try {
+      return await promise;
+    } finally {
+      if (this._datasetsInFlight === inFlight) {
+        this._datasetsInFlight = null;
+      }
+    }
+  }
+
+  async _loadDatasets(owner) {
+    const manifest = await this._loadManifest(owner);
+    this._assertCatalogGeneration(owner);
     validateDemoManifestContract(manifest, this.type);
 
     // Multi-dataset mode: load metadata for each dataset in manifest
@@ -348,7 +459,13 @@ export class LocalDemoDataSource {
     for (const entry of manifest.datasets) {
       try {
         const datasetBaseUrl = resolveUrl(this.baseUrl, entry.path);
-        const metadata = await loadDatasetMetadata(datasetBaseUrl, entry.id, this.type);
+        const metadata = await loadDatasetMetadata(
+          datasetBaseUrl,
+          entry.id,
+          this.type,
+          { signal: owner.controller.signal }
+        );
+        this._assertCatalogGeneration(owner);
 
         // Override name from manifest if provided (allows short names in manifest)
         if (entry.name) {
@@ -377,6 +494,7 @@ export class LocalDemoDataSource {
 
         datasets.push(metadata);
       } catch (err) {
+        this._assertCatalogGeneration(owner);
         this._datasetError = new DataSourceError(
           `Dataset '${entry.id}' is invalid: ${err?.message || err}`,
           DataSourceErrorCode.INVALID_FORMAT,
@@ -387,6 +505,7 @@ export class LocalDemoDataSource {
       }
     }
 
+    this._assertCatalogGeneration(owner);
     this._datasets = datasets;
     return this._datasets;
   }
@@ -483,6 +602,14 @@ export class LocalDemoDataSource {
    * Refresh the datasets list (clear cache)
    */
   refresh() {
+    const previousController = this._catalogController;
+    this._catalogController = new AbortController();
+    this._catalogRevision += 1;
+    previousController.abort(
+      new Error('Sample catalog cache was refreshed')
+    );
+    this._manifestInFlight = null;
+    this._datasetsInFlight = null;
     this._manifest = null;
     this._datasets = null;
     this._datasetError = null;

@@ -87,7 +87,10 @@ export function renderSvgAxes({
   const axisY = y1 + axisGap;
 
   const parts = [];
-  parts.push(`<g font-family="${fontFamily}" font-size="${tickSize}" fill="${axisColor}" stroke="${axisColor}" stroke-width="1">`);
+  parts.push(
+    `<g font-family="${escapeHtml(fontFamily)}" font-size="${tickSize}" ` +
+    `fill="${escapeHtml(axisColor)}" stroke="${escapeHtml(axisColor)}" stroke-width="1">`
+  );
 
   // Axis lines (bottom + left).
   parts.push(`<line x1="${x0}" y1="${axisY}" x2="${x1}" y2="${axisY}"/>`);

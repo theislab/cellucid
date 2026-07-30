@@ -79,10 +79,11 @@ export class DataState extends EventEmitter {
     this.activePageId = null; // Currently active page ID
     this._highlightPageIdCounter = 0;
     this.highlightArray = new Uint8Array(0); // Uint8Array per-point highlight intensity (0-255)
+    this._highlightedCellIndices = [];
     this._highlightIdCounter = 0;
     this._cachedHighlightCount = null; // Cached visible highlight count
     this._cachedTotalHighlightCount = null; // Cached total highlight count
-    this._cachedHighlightLodLevel = null; // LOD level used for cached visible highlight count
+    this._cachedHighlightLodMembership = null; // Exact shared LOD owner used by the cached visible count
 
     // Batch mode: suppresses expensive recomputations during bulk filter restoration
     this._batchMode = false;

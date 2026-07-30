@@ -24,6 +24,8 @@ import {
   assertMergesDocument,
   assertUtcDateTime,
   assertUserDocument,
+  hasAnnotationSuggestionIdDelimiter,
+  isReservedAnnotationFieldKey,
   parseExactJson,
 } from './wire-contract.js';
 import { isExactOrcidId } from './profile-identifiers.js';
@@ -58,6 +60,35 @@ function exactLabelForCompare(value) {
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+function reportSessionListenerFailures(errors) {
+  if (!Array.isArray(errors) || errors.length === 0) return;
+  let failure = errors.length === 1
+    ? errors[0]
+    : new AggregateError(
+      errors,
+      'Multiple community annotation session change listeners failed'
+    );
+  if (typeof globalThis.reportError === 'function') {
+    try {
+      globalThis.reportError(failure);
+      return;
+    } catch (reportingFailure) {
+      failure = new AggregateError(
+        [failure, reportingFailure],
+        'Community annotation listener and error reporting both failed'
+      );
+    }
+  }
+  try {
+    globalThis.console?.error?.(
+      '[Cellucid] Community annotation session change listener failed',
+      failure
+    );
+  } catch {
+    // A diagnostic observer cannot rewrite an already committed Pull.
+  }
 }
 
 function normalizeGitHubUserIdOrNull(userId) {
@@ -113,6 +144,36 @@ function assertOptionalExactNonblankString(
   return assertExactNonblankString(value, maxLen, fieldName);
 }
 
+function assertSessionFieldKey(value, fieldName = 'fieldKey') {
+  const field = assertExactNonblankString(
+    value,
+    ANNOTATION_LIMITS.datasetId,
+    fieldName
+  );
+  if (isReservedAnnotationFieldKey(field)) {
+    throw new Error(
+      `[CommunityAnnotationSession] ${fieldName} uses the reserved ` +
+      'fk~...%3A field-key encoding form'
+    );
+  }
+  return field;
+}
+
+function assertSessionSuggestionId(value, fieldName = 'suggestionId') {
+  const id = assertExactNonblankString(
+    value,
+    ANNOTATION_LIMITS.suggestionId,
+    fieldName
+  );
+  if (hasAnnotationSuggestionIdDelimiter(id)) {
+    throw new Error(
+      `[CommunityAnnotationSession] ${fieldName} must not contain the ":" ` +
+      'suggestion-id delimiter'
+    );
+  }
+  return id;
+}
+
 function exactNonblankStringOrNull(value, maxLen) {
   if (
     typeof value !== 'string' ||
@@ -126,8 +187,7 @@ function exactNonblankStringOrNull(value, maxLen) {
 }
 
 function encodeFieldKeyForKey(fieldKey) {
-  const f = toCleanString(fieldKey);
-  if (!f) return '';
+  const f = assertSessionFieldKey(fieldKey);
   if (!f.includes(':')) return f;
   return `${FIELDKEY_ESCAPE_PREFIX}${encodeURIComponent(f)}`;
 }
@@ -165,6 +225,25 @@ function uniqueStrings(values) {
   return out;
 }
 
+function createExactRecord() {
+  return Object.create(null);
+}
+
+function cloneExactRecord(value, label) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(`[CommunityAnnotationSession] ${label} must be an object`);
+  }
+  const out = createExactRecord();
+  for (const [key, entry] of Object.entries(value)) {
+    out[key] = entry;
+  }
+  return out;
+}
+
+function toPlainOwnRecord(value) {
+  return Object.fromEntries(Object.entries(value));
+}
+
 function parseDateMsOrNull(value) {
   const s = toCleanString(value);
   if (!s) return null;
@@ -176,7 +255,7 @@ function cloneDatasetAccessMap(map) {
   if (!map || typeof map !== 'object' || Array.isArray(map)) {
     throw new Error('[CommunityAnnotationSession] datasets must be an object');
   }
-  const out = {};
+  const out = createExactRecord();
   for (const [datasetId, entry] of Object.entries(map)) {
     if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
       throw new Error(
@@ -211,9 +290,9 @@ function cloneDatasetAccessMap(map) {
 function mergeDatasetAccessMaps(left, right) {
   const a = cloneDatasetAccessMap(left);
   const b = cloneDatasetAccessMap(right);
-  const out = { ...a };
+  const out = cloneExactRecord(a, 'datasets state');
   for (const [datasetId, entry] of Object.entries(b)) {
-    const prev = out[datasetId] || null;
+    const prev = Object.hasOwn(out, datasetId) ? out[datasetId] : null;
     if (!prev) {
       out[datasetId] = entry;
       continue;
@@ -557,7 +636,8 @@ function normalizeCommentArray(comments) {
 }
 
 function suggestionKey(fieldKey, catKey, suggestionId) {
-  return `${encodeFieldKeyForKey(fieldKey)}:${catKey}:${suggestionId}`;
+  const id = assertSessionSuggestionId(suggestionId);
+  return `${encodeFieldKeyForKey(fieldKey)}:${catKey}:${id}`;
 }
 
 function bucketKey(fieldKey, catKey) {
@@ -759,7 +839,7 @@ function cloneWireSuggestion(suggestion) {
     }
   }
   const out = {
-    id: suggestion.id,
+    id: assertSessionSuggestionId(suggestion.id, 'suggestion id'),
     label: suggestion.label,
     proposedBy: suggestion.proposedBy,
     proposedAt: suggestion.proposedAt,
@@ -782,20 +862,49 @@ function defaultState() {
     version: STORAGE_VERSION,
     updatedAt: nowIso(),
     annotationFields: [],
-    annotatableSettings: {}, // { [fieldKey]: { minAnnotators:number, threshold:number } }
-    closedAnnotatableFields: {}, // { [fieldKey]: true }
-    datasets: {}, // { [datasetId]: { fieldsToAnnotate:string[], lastAccessedAt:string } } (informational)
+    annotatableSettings: createExactRecord(), // { [fieldKey]: { minAnnotators:number, threshold:number } }
+    closedAnnotatableFields: createExactRecord(), // { [fieldKey]: true }
+    datasets: createExactRecord(), // { [datasetId]: { fieldsToAnnotate:string[], lastAccessedAt:string } } (informational)
     // Persisted locally so profile edits survive refresh until Publish.
     profile: sanitizeProfile({}),
     suggestions: {}, // { [fieldKey:categoryLabel]: Suggestion[] }
     deletedSuggestions: {}, // { [fieldKey:categoryLabel]: string[] } (only the proposer can delete)
     myVotes: {}, // { [fieldKey:categoryLabel:suggestionId]: 'up'|'down' }
-    myComments: {}, // { [suggestionId]: Comment[] }
+    myComments: createExactRecord(), // { [suggestionId]: Comment[] }
     moderationMerges: [], // { bucket, fromSuggestionId, intoSuggestionId, by, at, note }[]
     // Used to enable incremental GitHub pulls (only fetch files whose sha changed).
     remoteFileShas: {}, // { [path]: sha }
     lastSyncAt: null
   };
+}
+
+function restoreExactIdentityRecords(state) {
+  if (!state || typeof state !== 'object' || Array.isArray(state)) {
+    throw new Error('[CommunityAnnotationSession] state must be an object');
+  }
+  state.annotatableSettings = cloneExactRecord(
+    state.annotatableSettings,
+    'consensus settings state'
+  );
+  state.closedAnnotatableFields = cloneExactRecord(
+    state.closedAnnotatableFields,
+    'closed field state'
+  );
+  state.datasets = cloneExactRecord(
+    state.datasets,
+    'datasets state'
+  );
+  state.myComments = cloneExactRecord(
+    state.myComments,
+    'local comments state'
+  );
+  return state;
+}
+
+function cloneStateForTransaction(state) {
+  return restoreExactIdentityRecords(
+    JSON.parse(JSON.stringify(state))
+  );
 }
 
 const LOCAL_STATE_FIELDS = Object.freeze([
@@ -1010,12 +1119,23 @@ function assertLocalPersistenceDocument(value, { scopeUserId = null } = {}) {
   const validationUsername = `ghid_${validationId}`;
   const suggestions = assertLocalRecord(document.suggestions, '$ local state.suggestions');
   const wireSuggestions = {};
+  const localSuggestionBucketById = new Map();
   for (const [bucket, list] of Object.entries(suggestions)) {
     if (!Array.isArray(list)) {
       throw new Error(
         `$ local state.suggestions[${JSON.stringify(bucket)}]: must be an array`
       );
     }
+    const bucketParts = parseBucketKey(bucket);
+    if (!bucketParts) {
+      throw new Error(
+        `$ local state.suggestions: invalid bucket ${JSON.stringify(bucket)}`
+      );
+    }
+    const canonicalBucket = bucketKey(
+      bucketParts.fieldKey,
+      bucketParts.catKey
+    );
     wireSuggestions[bucket] = list.map((suggestion, index) => {
       if (!suggestion || typeof suggestion !== 'object' || Array.isArray(suggestion)) {
         throw new Error(
@@ -1028,15 +1148,33 @@ function assertLocalPersistenceDocument(value, { scopeUserId = null } = {}) {
           `must equal ${JSON.stringify(localUsername)}`
         );
       }
+      const suggestionId = assertSessionSuggestionId(
+        suggestion.id,
+        `$ local state suggestion id`
+      );
+      if (!localSuggestionBucketById.has(suggestionId)) {
+        localSuggestionBucketById.set(suggestionId, canonicalBucket);
+      }
       return { ...suggestion, proposedBy: validationUsername };
     });
   }
 
   const myVotes = assertLocalRecord(document.myVotes, '$ local state.myVotes');
-  const wireVotes = {};
+  const wireVotes = createExactRecord();
   for (const [key, direction] of Object.entries(myVotes)) {
     const parsed = parseVoteKey(key);
     if (!parsed) throw new Error(`$ local state.myVotes: invalid key ${JSON.stringify(key)}`);
+    const referencedLocalBucket =
+      localSuggestionBucketById.get(parsed.suggestionId) ?? null;
+    if (
+      referencedLocalBucket !== null &&
+      referencedLocalBucket !== bucketKey(parsed.fieldKey, parsed.catKey)
+    ) {
+      throw new Error(
+        `$ local state.myVotes: key ${JSON.stringify(key)} does not reference ` +
+        'its local suggestion in the exact bucket'
+      );
+    }
     if (direction !== 'up' && direction !== 'down') {
       throw new Error(
         `$ local state.myVotes[${JSON.stringify(key)}]: must equal "up" or "down"`
@@ -1054,8 +1192,12 @@ function assertLocalPersistenceDocument(value, { scopeUserId = null } = {}) {
   }
 
   const myComments = assertLocalRecord(document.myComments, '$ local state.myComments');
-  const wireComments = {};
+  const wireComments = createExactRecord();
   for (const [suggestionId, list] of Object.entries(myComments)) {
+    assertSessionSuggestionId(
+      suggestionId,
+      `$ local state.myComments key`
+    );
     if (!Array.isArray(list)) {
       throw new Error(
         `$ local state.myComments[${JSON.stringify(suggestionId)}]: must be an array`
@@ -1129,9 +1271,10 @@ export class CommunityAnnotationSession extends EventEmitter {
     // Public profile metadata from GitHub user files (in-memory only).
     this._knownProfiles = {}; // { [usernameLower]: { displayName?, title?, orcid? } }
     // In-memory category label lookup for stable bucket keys (fieldKey + categoryLabel).
-    this._categoriesByFieldKey = {}; // { [fieldKey]: string[] }
+    this._categoriesByFieldKey = createExactRecord(); // { [fieldKey]: string[] }
     this._saveTimer = null;
     this._loadedForKey = null;
+    this._pullApplicationTransactionActive = false;
     this._scopeLock.on('lost', (evt) => {
       if (!evt || typeof evt !== 'object' || Array.isArray(evt)) {
         throw new Error(
@@ -1170,6 +1313,13 @@ export class CommunityAnnotationSession extends EventEmitter {
     const prevRepoRef = this._repoRef;
     const prevUserId = this._cacheUserId;
     const prevScopeKey = toCacheScopeKey({ datasetId: prevDatasetId, repoRef: prevRepoRef, userId: prevUserId });
+    const prevCategoriesByFieldKey = this._categoriesByFieldKey;
+    const prevLoadedForKey = this._loadedForKey;
+    const prevState = this._state;
+    const prevProfile = this._profile;
+    const prevPersistenceOk = this._persistenceOk;
+    const prevPersistenceErrorEmittedForKey =
+      this._persistenceErrorEmittedForKey;
 
     const nextDatasetId =
       datasetId === undefined
@@ -1226,6 +1376,11 @@ export class CommunityAnnotationSession extends EventEmitter {
         throw error;
       }
       return;
+    }
+
+    if (this._saveTimer !== null) {
+      clearTimeout(this._saveTimer);
+      this._saveTimer = null;
     }
 
     if (this._persistenceOk === false) {
@@ -1299,7 +1454,7 @@ export class CommunityAnnotationSession extends EventEmitter {
     // Category label maps are dataset-specific; clear on dataset changes to avoid
     // transient incorrect bucket canonicalization when datasets share field keys.
     if (nextDatasetId !== prevDatasetId) {
-      this._categoriesByFieldKey = {};
+      this._categoriesByFieldKey = createExactRecord();
     }
 
     this._datasetId = nextDatasetId;
@@ -1307,7 +1462,51 @@ export class CommunityAnnotationSession extends EventEmitter {
     this._cacheUserId = nextUserId;
     this._lockScopeKey = nextScopeKey || null;
     this._persistenceOk = true;
-    this._ensureLoaded();
+    try {
+      this._ensureLoaded();
+    } catch (error) {
+      let restoreResult = null;
+      let restoreThrown = null;
+      try {
+        restoreResult = this._scopeLock.setScopeKey(prevScopeKey);
+      } catch (restoreError) {
+        restoreThrown = restoreError;
+      }
+      const restored = Boolean(
+        restoreThrown === null &&
+        restoreResult &&
+        typeof restoreResult === 'object' &&
+        restoreResult.ok === true &&
+        restoreResult.scopeKey === prevScopeKey
+      );
+      this._datasetId = prevDatasetId;
+      this._repoRef = prevRepoRef;
+      this._cacheUserId = prevUserId;
+      this._categoriesByFieldKey = prevCategoriesByFieldKey;
+      this._loadedForKey = prevLoadedForKey;
+      this._state = prevState;
+      this._profile = prevProfile;
+      this._lockScopeKey = restored ? (prevScopeKey || null) : null;
+      this._persistenceOk = restored ? prevPersistenceOk : false;
+      this._persistenceErrorEmittedForKey =
+        prevPersistenceErrorEmittedForKey;
+      if (!restored) {
+        const restorationFailure = new Error(
+          'Previous annotation cache-scope lock could not be restored after a local-state load failure'
+        );
+        restorationFailure.code =
+          restoreThrown?.code ||
+          restoreResult?.code ||
+          'LOCAL_ANNOTATION_LOCK_RESTORE_FAILED';
+        if (restoreThrown !== null) {
+          restorationFailure.cause = restoreThrown;
+        }
+        restorationFailure.lockResult = restoreResult;
+        if (error?.cause === undefined) error.cause = restorationFailure;
+        else error.restorationFailure = restorationFailure;
+      }
+      throw error;
+    }
     this.emit('context:changed', { datasetId: this._datasetId, repoRef: this._repoRef, userId: this._cacheUserId });
   }
 
@@ -1350,7 +1549,7 @@ export class CommunityAnnotationSession extends EventEmitter {
   }
 
   getDatasetAccessMap() {
-    return cloneDatasetAccessMap(this._state.datasets);
+    return toPlainOwnRecord(cloneDatasetAccessMap(this._state.datasets));
   }
 
   recordDatasetAccess({ datasetId, fieldsToAnnotate = [] } = {}) {
@@ -1368,9 +1567,8 @@ export class CommunityAnnotationSession extends EventEmitter {
       );
     }
     const exactFields = fieldsToAnnotate.map((field, index) => {
-      return assertExactNonblankString(
+      return assertSessionFieldKey(
         field,
-        ANNOTATION_LIMITS.datasetId,
         `fieldsToAnnotate[${index}]`
       );
     });
@@ -1465,29 +1663,15 @@ export class CommunityAnnotationSession extends EventEmitter {
     if (fieldKey === null || fieldKey === undefined || fieldKey === '') {
       return false;
     }
-    const key = assertExactNonblankString(
-      fieldKey,
-      ANNOTATION_LIMITS.datasetId,
-      'fieldKey'
-    );
+    const key = assertSessionFieldKey(fieldKey);
     return this._state.annotationFields.includes(key);
   }
 
   setFieldAnnotated(fieldKey, enabled) {
-    if (
-      typeof fieldKey !== 'string' ||
-      !/\S/.test(fieldKey) ||
-      /^\s|\s$/.test(fieldKey) ||
-      Array.from(fieldKey).length > ANNOTATION_LIMITS.datasetId
-    ) {
-      throw new Error(
-        '[CommunityAnnotationSession] fieldKey must be nonblank without leading or trailing whitespace'
-      );
-    }
+    const key = assertSessionFieldKey(fieldKey);
     if (typeof enabled !== 'boolean') {
       throw new Error('[CommunityAnnotationSession] enabled must be boolean');
     }
-    const key = fieldKey;
     const on = enabled;
     const existing = this._state.annotationFields.includes(key);
     if (on === existing) return true;
@@ -1533,14 +1717,15 @@ export class CommunityAnnotationSession extends EventEmitter {
     if (fieldKey === null || fieldKey === undefined || fieldKey === '') {
       return false;
     }
-    const key = assertExactNonblankString(
-      fieldKey,
-      ANNOTATION_LIMITS.datasetId,
-      'fieldKey'
-    );
+    const key = assertSessionFieldKey(fieldKey);
     if (!this.isFieldAnnotated(key)) return false;
     const map = this._state?.closedAnnotatableFields;
-    return Boolean(map && typeof map === 'object' && map[key] === true);
+    return Boolean(
+      map &&
+      typeof map === 'object' &&
+      Object.hasOwn(map, key) &&
+      map[key] === true
+    );
   }
 
   getClosedAnnotatableFields() {
@@ -1550,11 +1735,7 @@ export class CommunityAnnotationSession extends EventEmitter {
     }
     const out = [];
     for (const [k, v] of Object.entries(map)) {
-      const key = assertExactNonblankString(
-        k,
-        ANNOTATION_LIMITS.datasetId,
-        'closed field state key'
-      );
+      const key = assertSessionFieldKey(k, 'closed field state key');
       if (typeof v !== 'boolean') {
         throw new Error(
           `[CommunityAnnotationSession] closed field ${JSON.stringify(key)} must be boolean`
@@ -1566,11 +1747,7 @@ export class CommunityAnnotationSession extends EventEmitter {
   }
 
   setFieldClosed(fieldKey, closed) {
-    const key = assertExactNonblankString(
-      fieldKey,
-      ANNOTATION_LIMITS.datasetId,
-      'fieldKey'
-    );
+    const key = assertSessionFieldKey(fieldKey);
     if (typeof closed !== 'boolean') {
       throw new Error('[CommunityAnnotationSession] closed must be boolean');
     }
@@ -1585,7 +1762,9 @@ export class CommunityAnnotationSession extends EventEmitter {
       );
     }
     const next = closed;
-    const prev = this._state.closedAnnotatableFields[key] === true;
+    const prev =
+      Object.hasOwn(this._state.closedAnnotatableFields, key) &&
+      this._state.closedAnnotatableFields[key] === true;
     if (prev === next) return true;
     if (next) this._state.closedAnnotatableFields[key] = true;
     else delete this._state.closedAnnotatableFields[key];
@@ -1603,13 +1782,9 @@ export class CommunityAnnotationSession extends EventEmitter {
         `[CommunityAnnotationSession] closed fields must contain at most ${ANNOTATION_LIMITS.fields} items`
       );
     }
-    const next = {};
+    const next = createExactRecord();
     for (const k of list) {
-      const key = assertExactNonblankString(
-        k,
-        ANNOTATION_LIMITS.datasetId,
-        'closed field'
-      );
+      const key = assertSessionFieldKey(k, 'closed field');
       if (!this.isFieldAnnotated(key)) {
         throw new Error(
           `[CommunityAnnotationSession] closed field ${JSON.stringify(key)} is not annotatable`
@@ -1631,13 +1806,14 @@ export class CommunityAnnotationSession extends EventEmitter {
     if (fieldKey === null || fieldKey === undefined || fieldKey === '') {
       return null;
     }
-    const key = assertExactNonblankString(
-      fieldKey,
-      ANNOTATION_LIMITS.datasetId,
-      'fieldKey'
-    );
+    const key = assertSessionFieldKey(fieldKey);
     const map = this._state?.annotatableSettings;
-    const raw = map && typeof map === 'object' ? map[key] : null;
+    const raw =
+      map &&
+      typeof map === 'object' &&
+      Object.hasOwn(map, key)
+        ? map[key]
+        : null;
     return raw ? normalizeConsensusSettings(raw) : null;
   }
 
@@ -1646,24 +1822,16 @@ export class CommunityAnnotationSession extends EventEmitter {
     if (!map || typeof map !== 'object' || Array.isArray(map)) {
       throw new Error('[CommunityAnnotationSession] consensus settings state must be an object');
     }
-    const out = {};
+    const out = createExactRecord();
     for (const [k, v] of Object.entries(map)) {
-      const key = assertExactNonblankString(
-        k,
-        ANNOTATION_LIMITS.datasetId,
-        'settings field key'
-      );
+      const key = assertSessionFieldKey(k, 'settings field key');
       out[key] = normalizeConsensusSettings(v);
     }
-    return out;
+    return toPlainOwnRecord(out);
   }
 
   setAnnotatableConsensusSettings(fieldKey, settings) {
-    const key = assertExactNonblankString(
-      fieldKey,
-      ANNOTATION_LIMITS.datasetId,
-      'settings field key'
-    );
+    const key = assertSessionFieldKey(fieldKey, 'settings field key');
     if (
       !this._state.annotatableSettings ||
       typeof this._state.annotatableSettings !== 'object' ||
@@ -1688,13 +1856,9 @@ export class CommunityAnnotationSession extends EventEmitter {
       throw new Error('[CommunityAnnotationSession] consensus settings map must be an object');
     }
     const input = nextMap;
-    const out = {};
+    const out = createExactRecord();
     for (const [k, v] of Object.entries(input)) {
-      const key = assertExactNonblankString(
-        k,
-        ANNOTATION_LIMITS.datasetId,
-        'settings field key'
-      );
+      const key = assertSessionFieldKey(k, 'settings field key');
       if (!this.isFieldAnnotated(key)) {
         throw new Error(
           `[CommunityAnnotationSession] settings field ${JSON.stringify(key)} is not annotatable`
@@ -1720,11 +1884,20 @@ export class CommunityAnnotationSession extends EventEmitter {
       ANNOTATION_LIMITS.datasetId
     );
     if (!f) return null;
+    if (isReservedAnnotationFieldKey(f)) {
+      throw new Error(
+        '[CommunityAnnotationSession] fieldKey uses the reserved ' +
+        'fk~...%3A field-key encoding form'
+      );
+    }
 
     if (typeof catIdxOrKey === 'number') {
       if (!Number.isSafeInteger(catIdxOrKey) || catIdxOrKey < 0) return null;
       const idx = catIdxOrKey;
-      const categories = this._categoriesByFieldKey?.[f];
+      const categories =
+        Object.hasOwn(this._categoriesByFieldKey, f)
+          ? this._categoriesByFieldKey[f]
+          : undefined;
       const label = Array.isArray(categories) ? categories[idx] : undefined;
       return typeof label === 'string' ? label : null;
     }
@@ -1760,11 +1933,7 @@ export class CommunityAnnotationSession extends EventEmitter {
   }
 
   setFieldCategories(fieldKey, categories) {
-    const f = assertExactNonblankString(
-      fieldKey,
-      ANNOTATION_LIMITS.datasetId,
-      'fieldKey'
-    );
+    const f = assertSessionFieldKey(fieldKey);
     if (!Array.isArray(categories)) {
       throw new Error(
         '[CommunityAnnotationSession] categories must be an array'
@@ -1795,7 +1964,10 @@ export class CommunityAnnotationSession extends EventEmitter {
       cleaned.push(list[i]);
     }
 
-    const prev = this._categoriesByFieldKey?.[f];
+    const prev =
+      Object.hasOwn(this._categoriesByFieldKey, f)
+        ? this._categoriesByFieldKey[f]
+        : undefined;
     const same =
       Array.isArray(prev) &&
       prev.length === cleaned.length &&
@@ -1809,9 +1981,12 @@ export class CommunityAnnotationSession extends EventEmitter {
    * @returns {any[]} suggestions (cloned)
    */
   getSuggestions(fieldKey, catIdx) {
-    const f = toCleanString(fieldKey);
+    if (fieldKey === null || fieldKey === undefined || fieldKey === '') {
+      return [];
+    }
+    const f = assertSessionFieldKey(fieldKey);
     const catKey = this._resolveCategoryKey(f, catIdx);
-    if (!f || !catKey) return [];
+    if (!catKey) return [];
     const key = bucketKey(f, catKey);
     const list = this._state.suggestions[key] || [];
     const merged = this._applyModerationMergesForBucket(key, list);
@@ -1956,11 +2131,7 @@ export class CommunityAnnotationSession extends EventEmitter {
   }
 
   addSuggestion(fieldKey, catIdx, { label, ontologyId = null, evidence = null, markers = null } = {}) {
-    const f = assertExactNonblankString(
-      fieldKey,
-      ANNOTATION_LIMITS.datasetId,
-      'fieldKey'
-    );
+    const f = assertSessionFieldKey(fieldKey);
 
     const catKey = this._resolveCategoryKey(f, catIdx);
     if (!catKey) throw new Error('[CommunityAnnotationSession] category required');
@@ -2001,16 +2172,8 @@ export class CommunityAnnotationSession extends EventEmitter {
   }
 
   editMySuggestion(fieldKey, catIdx, suggestionId, { label, ontologyId, evidence, markers } = {}) {
-    const f = assertExactNonblankString(
-      fieldKey,
-      ANNOTATION_LIMITS.datasetId,
-      'fieldKey'
-    );
-    const id = assertExactNonblankString(
-      suggestionId,
-      ANNOTATION_LIMITS.suggestionId,
-      'suggestionId'
-    );
+    const f = assertSessionFieldKey(fieldKey);
+    const id = assertSessionSuggestionId(suggestionId);
     const my = normalizeUsername(this._getEffectiveUserKey());
     if (!my) throw new Error('[CommunityAnnotationSession] username required');
 
@@ -2098,16 +2261,8 @@ export class CommunityAnnotationSession extends EventEmitter {
   }
 
   deleteMySuggestion(fieldKey, catIdx, suggestionId) {
-    const f = assertExactNonblankString(
-      fieldKey,
-      ANNOTATION_LIMITS.datasetId,
-      'fieldKey'
-    );
-    const id = assertExactNonblankString(
-      suggestionId,
-      ANNOTATION_LIMITS.suggestionId,
-      'suggestionId'
-    );
+    const f = assertSessionFieldKey(fieldKey);
+    const id = assertSessionSuggestionId(suggestionId);
     const my = normalizeUsername(this._getEffectiveUserKey());
     if (!my) return false;
     const catKey = this._resolveCategoryKey(f, catIdx);
@@ -2152,23 +2307,20 @@ export class CommunityAnnotationSession extends EventEmitter {
     // Remove my local vote + comments for this suggestion.
     const voteKey = suggestionKey(f, catKey, id);
     if (this._state.myVotes?.[voteKey]) delete this._state.myVotes[voteKey];
-    if (this._state.myComments?.[id]) delete this._state.myComments[id];
+    if (
+      this._state.myComments &&
+      Object.hasOwn(this._state.myComments, id)
+    ) {
+      delete this._state.myComments[id];
+    }
 
     this._touch();
     return true;
   }
 
   vote(fieldKey, catIdx, suggestionId, direction) {
-    const f = assertExactNonblankString(
-      fieldKey,
-      ANNOTATION_LIMITS.datasetId,
-      'fieldKey'
-    );
-    const id = assertExactNonblankString(
-      suggestionId,
-      ANNOTATION_LIMITS.suggestionId,
-      'suggestionId'
-    );
+    const f = assertSessionFieldKey(fieldKey);
+    const id = assertSessionSuggestionId(suggestionId);
     if (direction !== 'up' && direction !== 'down') {
       throw new Error(
         '[CommunityAnnotationSession] direction must equal "up" or "down"'
@@ -2207,9 +2359,18 @@ export class CommunityAnnotationSession extends EventEmitter {
   }
 
   getMyVoteDirect(fieldKey, catIdx, suggestionId) {
-    const f = toCleanString(fieldKey);
-    const sid = toCleanString(suggestionId);
-    if (!f || !sid) return null;
+    if (
+      fieldKey === null ||
+      fieldKey === undefined ||
+      fieldKey === '' ||
+      suggestionId === null ||
+      suggestionId === undefined ||
+      suggestionId === ''
+    ) {
+      return null;
+    }
+    const f = assertSessionFieldKey(fieldKey);
+    const sid = assertSessionSuggestionId(suggestionId);
     const catKey = this._resolveCategoryKey(f, catIdx);
     if (!catKey) return null;
     const directKey = suggestionKey(f, catKey, sid);
@@ -2226,9 +2387,18 @@ export class CommunityAnnotationSession extends EventEmitter {
    * @returns {{vote: 'up'|'down'|null, source: 'direct'|'delegated'|'none', delegatedUp: number, delegatedDown: number}}
    */
   getMyBundleVoteInfo(fieldKey, catIdx, suggestionId) {
-    const f = toCleanString(fieldKey);
-    const sid = toCleanString(suggestionId);
-    if (!f || !sid) return { vote: null, source: 'none', delegatedUp: 0, delegatedDown: 0 };
+    if (
+      fieldKey === null ||
+      fieldKey === undefined ||
+      fieldKey === '' ||
+      suggestionId === null ||
+      suggestionId === undefined ||
+      suggestionId === ''
+    ) {
+      return { vote: null, source: 'none', delegatedUp: 0, delegatedDown: 0 };
+    }
+    const f = assertSessionFieldKey(fieldKey);
+    const sid = assertSessionSuggestionId(suggestionId);
     const catKey = this._resolveCategoryKey(f, catIdx);
     if (!catKey) return { vote: null, source: 'none', delegatedUp: 0, delegatedDown: 0 };
 
@@ -2272,16 +2442,8 @@ export class CommunityAnnotationSession extends EventEmitter {
   }
 
   addComment(fieldKey, catIdx, suggestionId, text) {
-    const f = assertExactNonblankString(
-      fieldKey,
-      ANNOTATION_LIMITS.datasetId,
-      'fieldKey'
-    );
-    const sid = assertExactNonblankString(
-      suggestionId,
-      ANNOTATION_LIMITS.suggestionId,
-      'suggestionId'
-    );
+    const f = assertSessionFieldKey(fieldKey);
+    const sid = assertSessionSuggestionId(suggestionId);
     const catKey = this._resolveCategoryKey(f, catIdx);
     if (!catKey) {
       throw new Error('[CommunityAnnotationSession] category required');
@@ -2316,8 +2478,21 @@ export class CommunityAnnotationSession extends EventEmitter {
 
     suggestion.comments.push(comment);
 
-    if (!this._state.myComments) this._state.myComments = {};
-    if (!this._state.myComments[storeSid]) this._state.myComments[storeSid] = [];
+    if (
+      !this._state.myComments ||
+      typeof this._state.myComments !== 'object' ||
+      Array.isArray(this._state.myComments)
+    ) {
+      this._state.myComments = createExactRecord();
+    }
+    if (!Object.hasOwn(this._state.myComments, storeSid)) {
+      this._state.myComments[storeSid] = [];
+    }
+    if (!Array.isArray(this._state.myComments[storeSid])) {
+      throw new Error(
+        `[CommunityAnnotationSession] local comments for ${JSON.stringify(storeSid)} must be an array`
+      );
+    }
     this._state.myComments[storeSid].push(comment);
 
     this._touch();
@@ -2325,16 +2500,8 @@ export class CommunityAnnotationSession extends EventEmitter {
   }
 
   editComment(fieldKey, catIdx, suggestionId, commentId, newText) {
-    const f = assertExactNonblankString(
-      fieldKey,
-      ANNOTATION_LIMITS.datasetId,
-      'fieldKey'
-    );
-    const sid = assertExactNonblankString(
-      suggestionId,
-      ANNOTATION_LIMITS.suggestionId,
-      'suggestionId'
-    );
+    const f = assertSessionFieldKey(fieldKey);
+    const sid = assertSessionSuggestionId(suggestionId);
     const cid = assertExactNonblankString(
       commentId,
       ANNOTATION_LIMITS.commentId,
@@ -2377,7 +2544,10 @@ export class CommunityAnnotationSession extends EventEmitter {
     comment.text = nextText;
     comment.editedAt = nowIso();
 
-    if (this._state.myComments?.[owningSid]) {
+    if (
+      this._state.myComments &&
+      Object.hasOwn(this._state.myComments, owningSid)
+    ) {
       const myComment = this._state.myComments[owningSid].find((c) => c?.id === cid);
       if (myComment) {
         myComment.text = comment.text;
@@ -2390,16 +2560,8 @@ export class CommunityAnnotationSession extends EventEmitter {
   }
 
   deleteComment(fieldKey, catIdx, suggestionId, commentId) {
-    const f = assertExactNonblankString(
-      fieldKey,
-      ANNOTATION_LIMITS.datasetId,
-      'fieldKey'
-    );
-    const sid = assertExactNonblankString(
-      suggestionId,
-      ANNOTATION_LIMITS.suggestionId,
-      'suggestionId'
-    );
+    const f = assertSessionFieldKey(fieldKey);
+    const sid = assertSessionSuggestionId(suggestionId);
     const cid = assertExactNonblankString(
       commentId,
       ANNOTATION_LIMITS.commentId,
@@ -2438,7 +2600,10 @@ export class CommunityAnnotationSession extends EventEmitter {
 
     owningSuggestion.comments.splice(commentIndex, 1);
 
-    if (this._state.myComments?.[owningSid]) {
+    if (
+      this._state.myComments &&
+      Object.hasOwn(this._state.myComments, owningSid)
+    ) {
       this._state.myComments[owningSid] = this._state.myComments[owningSid].filter((c) => c?.id !== cid);
       if (this._state.myComments[owningSid].length === 0) delete this._state.myComments[owningSid];
     }
@@ -2448,9 +2613,18 @@ export class CommunityAnnotationSession extends EventEmitter {
   }
 
   getComments(fieldKey, catIdx, suggestionId) {
-    const f = toCleanString(fieldKey);
-    const sid = toCleanString(suggestionId);
-    if (!f || !sid) return [];
+    if (
+      fieldKey === null ||
+      fieldKey === undefined ||
+      fieldKey === '' ||
+      suggestionId === null ||
+      suggestionId === undefined ||
+      suggestionId === ''
+    ) {
+      return [];
+    }
+    const f = assertSessionFieldKey(fieldKey);
+    const sid = assertSessionSuggestionId(suggestionId);
     const catKey = this._resolveCategoryKey(f, catIdx);
     if (!catKey) return [];
 
@@ -2483,10 +2657,14 @@ export class CommunityAnnotationSession extends EventEmitter {
   }
 
   addModerationMerge({ fieldKey, catIdx, fromSuggestionId, intoSuggestionId, note = null } = {}) {
-    const f = assertExactNonblankString(
-      fieldKey,
-      ANNOTATION_LIMITS.datasetId,
-      'fieldKey'
+    const f = assertSessionFieldKey(fieldKey);
+    const from = assertSessionSuggestionId(
+      fromSuggestionId,
+      'fromSuggestionId'
+    );
+    const into = assertSessionSuggestionId(
+      intoSuggestionId,
+      'intoSuggestionId'
     );
     const catKey = this._resolveCategoryKey(f, catIdx);
     if (!catKey) {
@@ -2495,8 +2673,8 @@ export class CommunityAnnotationSession extends EventEmitter {
     const bucket = bucketKey(f, catKey);
     const entry = normalizeModerationMerge({
       bucket,
-      fromSuggestionId,
-      intoSuggestionId,
+      fromSuggestionId: from,
+      intoSuggestionId: into,
       by: this._getEffectiveUserKey(),
       at: nowIso(),
       note
@@ -2524,19 +2702,14 @@ export class CommunityAnnotationSession extends EventEmitter {
   }
 
   editModerationMergeNote({ fieldKey, catIdx, fromSuggestionId, note = null } = {}) {
-    const f = assertExactNonblankString(
-      fieldKey,
-      ANNOTATION_LIMITS.datasetId,
-      'fieldKey'
-    );
+    const f = assertSessionFieldKey(fieldKey);
     const catKey = this._resolveCategoryKey(f, catIdx);
     if (!catKey) {
       throw new Error('[CommunityAnnotationSession] category required');
     }
     const bucket = bucketKey(f, catKey);
-    const from = assertExactNonblankString(
+    const from = assertSessionSuggestionId(
       fromSuggestionId,
-      ANNOTATION_LIMITS.suggestionId,
       'fromSuggestionId'
     );
 
@@ -2583,19 +2756,14 @@ export class CommunityAnnotationSession extends EventEmitter {
   }
 
   detachModerationMerge({ fieldKey, catIdx, fromSuggestionId } = {}) {
-    const f = assertExactNonblankString(
-      fieldKey,
-      ANNOTATION_LIMITS.datasetId,
-      'fieldKey'
-    );
+    const f = assertSessionFieldKey(fieldKey);
     const catKey = this._resolveCategoryKey(f, catIdx);
     if (!catKey) {
       throw new Error('[CommunityAnnotationSession] category required');
     }
     const bucket = bucketKey(f, catKey);
-    const from = assertExactNonblankString(
+    const from = assertSessionSuggestionId(
       fromSuggestionId,
-      ANNOTATION_LIMITS.suggestionId,
       'fromSuggestionId'
     );
     const merges = Array.isArray(this._state.moderationMerges) ? this._state.moderationMerges : [];
@@ -2615,28 +2783,23 @@ export class CommunityAnnotationSession extends EventEmitter {
   }
 
   detachLastModerationMerge({ fieldKey, catIdx, intoSuggestionId = null } = {}) {
-    const f = assertExactNonblankString(
-      fieldKey,
-      ANNOTATION_LIMITS.datasetId,
-      'fieldKey'
-    );
+    const f = assertSessionFieldKey(fieldKey);
     const catKey = this._resolveCategoryKey(f, catIdx);
     if (!catKey) {
       throw new Error('[CommunityAnnotationSession] category required');
     }
     const bucket = bucketKey(f, catKey);
+    const exactIntoSuggestionId =
+      intoSuggestionId === null
+        ? null
+        : assertSessionSuggestionId(
+          intoSuggestionId,
+          'intoSuggestionId'
+        );
     const merges = Array.isArray(this._state.moderationMerges) ? this._state.moderationMerges : [];
     if (!merges.length) return false;
 
     const map = buildEffectiveModerationMergeMapForBucket(merges, bucket);
-    const exactIntoSuggestionId =
-      intoSuggestionId === null
-        ? null
-        : assertExactNonblankString(
-          intoSuggestionId,
-          ANNOTATION_LIMITS.suggestionId,
-          'intoSuggestionId'
-        );
     const target =
       exactIntoSuggestionId === null
         ? null
@@ -2689,11 +2852,7 @@ export class CommunityAnnotationSession extends EventEmitter {
    * @returns {{status:'pending'|'disputed'|'consensus', label:string|null, confidence:number, voters:number, netVotes:number, suggestionId:string|null}}
    */
   computeConsensus(fieldKey, catIdx, { minAnnotators = DEFAULT_MIN_ANNOTATORS, threshold = DEFAULT_CONSENSUS_THRESHOLD } = {}) {
-    const f = assertExactNonblankString(
-      fieldKey,
-      ANNOTATION_LIMITS.datasetId,
-      'fieldKey'
-    );
+    const f = assertSessionFieldKey(fieldKey);
     const settings = normalizeConsensusSettings({
       minAnnotators,
       threshold,
@@ -2723,7 +2882,7 @@ export class CommunityAnnotationSession extends EventEmitter {
         best = { suggestion: s, netVotes: net, up, down };
         bestSuggestions.length = 0;
         bestSuggestions.push(s);
-      } else if (net === bestNet) {
+      } else if (net === bestNet && up === bestUp) {
         bestSuggestions.push(s);
       }
     }
@@ -2736,6 +2895,9 @@ export class CommunityAnnotationSession extends EventEmitter {
       seen.add(label);
       labelParts.push(label);
     }
+    labelParts.sort((left, right) =>
+      left < right ? -1 : (left > right ? 1 : 0)
+    );
     const bestLabel = labelParts.length ? labelParts.join(', ') : (best?.suggestion?.label || null);
     const isTie = bestSuggestions.length > 1;
 
@@ -2818,9 +2980,8 @@ export class CommunityAnnotationSession extends EventEmitter {
           `[CommunityAnnotationSession] invalid consensus bucket ${JSON.stringify(bucket)}`
         );
       }
-      const fieldKey = assertExactNonblankString(
+      const fieldKey = assertSessionFieldKey(
         parts.fieldKey,
-        ANNOTATION_LIMITS.datasetId,
         'consensus fieldKey'
       );
       const catKey = assertExactNonblankString(
@@ -2868,9 +3029,8 @@ export class CommunityAnnotationSession extends EventEmitter {
           );
         }
         const out = {
-          id: assertExactNonblankString(
+          id: assertSessionSuggestionId(
             s.id,
-            ANNOTATION_LIMITS.suggestionId,
             'consensus suggestion id'
           ),
           label: assertExactNonblankString(
@@ -2981,18 +3141,43 @@ export class CommunityAnnotationSession extends EventEmitter {
     }
 
     const suggestionsOut = {};
+    const suggestionBucketById = new Map();
     for (const [bucket, list] of Object.entries(this._state.suggestions)) {
       if (!Array.isArray(list)) {
         throw new Error(
           `[CommunityAnnotationSession] suggestions bucket ${JSON.stringify(bucket)} must be an array`
         );
       }
+      const bucketParts = parseBucketKey(bucket);
+      if (!bucketParts) {
+        throw new Error(
+          `[CommunityAnnotationSession] invalid suggestion bucket ${JSON.stringify(bucket)}`
+        );
+      }
+      const canonicalBucket = bucketKey(
+        bucketParts.fieldKey,
+        bucketParts.catKey
+      );
+      for (const suggestion of list) {
+        const id = assertSessionSuggestionId(
+          suggestion?.id,
+          'suggestion id'
+        );
+        const previousBucket = suggestionBucketById.get(id) ?? null;
+        if (previousBucket !== null && previousBucket !== canonicalBucket) {
+          throw new Error(
+            `[CommunityAnnotationSession] suggestion id ${JSON.stringify(id)} ` +
+            'appears in multiple buckets'
+          );
+        }
+        suggestionBucketById.set(id, canonicalBucket);
+      }
       const mine = list.filter((suggestion) => suggestion?.proposedBy === username);
       if (!mine.length) continue;
       suggestionsOut[bucket] = mine.map(cloneWireSuggestion);
     }
 
-    const votesOut = {};
+    const votesOut = createExactRecord();
     for (const [key, direction] of Object.entries(this._state.myVotes)) {
       const parsed = parseVoteKey(key);
       if (!parsed) {
@@ -3003,6 +3188,16 @@ export class CommunityAnnotationSession extends EventEmitter {
       if (direction !== 'up' && direction !== 'down') {
         throw new Error(
           `[CommunityAnnotationSession] invalid local vote direction for ${JSON.stringify(key)}`
+        );
+      }
+      const targetBucket = suggestionBucketById.get(parsed.suggestionId) ?? null;
+      if (
+        targetBucket !== null &&
+        targetBucket !== bucketKey(parsed.fieldKey, parsed.catKey)
+      ) {
+        throw new Error(
+          `[CommunityAnnotationSession] local vote key ${JSON.stringify(key)} ` +
+          'does not reference an exact suggestion bucket'
         );
       }
       if (
@@ -3016,7 +3211,7 @@ export class CommunityAnnotationSession extends EventEmitter {
       votesOut[parsed.suggestionId] = direction;
     }
 
-    const commentsOut = {};
+    const commentsOut = createExactRecord();
     for (const [suggestionId, comments] of Object.entries(this._state.myComments)) {
       if (!Array.isArray(comments)) {
         throw new Error(
@@ -3036,7 +3231,7 @@ export class CommunityAnnotationSession extends EventEmitter {
       deletedOut[bucket] = [...ids];
     }
 
-    const datasetsOut = {};
+    const datasetsOut = createExactRecord();
     for (const [datasetId, entry] of Object.entries(this._state.datasets)) {
       datasetsOut[datasetId] = {
         fieldsToAnnotate: [...entry.fieldsToAnnotate],
@@ -3049,10 +3244,12 @@ export class CommunityAnnotationSession extends EventEmitter {
       username,
       githubUserId,
       updatedAt: nowIso(),
-      ...(Object.keys(datasetsOut).length ? { datasets: datasetsOut } : {}),
+      ...(Object.keys(datasetsOut).length
+        ? { datasets: toPlainOwnRecord(datasetsOut) }
+        : {}),
       suggestions: suggestionsOut,
-      votes: votesOut,
-      comments: commentsOut,
+      votes: toPlainOwnRecord(votesOut),
+      comments: toPlainOwnRecord(commentsOut),
       deletedSuggestions: deletedOut
     };
     for (const key of ['login', 'displayName', 'title', 'orcid', 'linkedin']) {
@@ -3092,9 +3289,6 @@ export class CommunityAnnotationSession extends EventEmitter {
       assertUserDocument(document, { path: `$ remote user documents[${index}]` });
     });
 
-    const previousState = JSON.parse(JSON.stringify(this._state));
-    const previousProfile = { ...this._profile };
-    const previousKnownProfiles = JSON.parse(JSON.stringify(this._knownProfiles));
     const localUser = this._getEffectiveUserKey();
     const localSuggestions = {};
     for (const [bucket, list] of Object.entries(this._state.suggestions)) {
@@ -3109,6 +3303,17 @@ export class CommunityAnnotationSession extends EventEmitter {
       if (mine.length) localSuggestions[bucket] = mine;
     }
 
+    if (this._pullApplicationTransactionActive) {
+      this._state.suggestions = localSuggestions;
+      this._mergeFromUserFilesExact(remoteUserDocs, { preferLocalVotes });
+      return;
+    }
+
+    const previousState = cloneStateForTransaction(this._state);
+    const previousProfile = { ...this._profile };
+    const previousKnownProfiles = JSON.parse(
+      JSON.stringify(this._knownProfiles)
+    );
     try {
       this._state.suggestions = localSuggestions;
       this.mergeFromUserFiles(remoteUserDocs, { preferLocalVotes });
@@ -3118,6 +3323,169 @@ export class CommunityAnnotationSession extends EventEmitter {
       this._knownProfiles = previousKnownProfiles;
       throw error;
     }
+  }
+
+  _runPulledRepositoryStateTransaction(apply) {
+    if (typeof apply !== 'function') {
+      throw new TypeError(
+        '[CommunityAnnotationSession] Pull application transaction requires a function'
+      );
+    }
+    if (this._pullApplicationTransactionActive) {
+      throw new Error(
+        '[CommunityAnnotationSession] Pull application transactions must not be nested'
+      );
+    }
+
+    const previousState = this._state;
+    const previousProfile = this._profile;
+    const previousKnownProfiles = this._knownProfiles;
+    const candidateState = cloneStateForTransaction(previousState);
+    const candidateProfile = { ...previousProfile };
+    const candidateKnownProfiles = JSON.parse(
+      JSON.stringify(previousKnownProfiles)
+    );
+    this._state = candidateState;
+    this._profile = candidateProfile;
+    this._knownProfiles = candidateKnownProfiles;
+    this._pullApplicationTransactionActive = true;
+
+    let result;
+    try {
+      result = apply();
+      if (
+        result !== null &&
+        typeof result === 'object' &&
+        typeof result.then === 'function'
+      ) {
+        throw new TypeError(
+          '[CommunityAnnotationSession] Pull application transaction must be synchronous'
+        );
+      }
+    } catch (error) {
+      this._state = previousState;
+      this._profile = previousProfile;
+      this._knownProfiles = previousKnownProfiles;
+      this._pullApplicationTransactionActive = false;
+      throw error;
+    }
+
+    this._pullApplicationTransactionActive = false;
+    this._touch({ isolateListenerFailures: true });
+    return result;
+  }
+
+  /**
+   * Atomically publish one fully compiled GitHub Pull into the visible session.
+   * Raw-file caching is owned by the caller and may already be committed; this
+   * boundary covers only the synchronous session application. Local suggestions,
+   * votes, comments, and unpublished moderation merges remain authoritative.
+   *
+   * @param {object} options
+   * @param {object[]} options.remoteUserDocs
+   * @param {object|null} options.moderationDocument
+   * @param {string[]} options.categoricalFieldKeys
+   * @param {string[]} options.fieldsToAnnotate
+   * @param {Record<string, object>} options.annotatableSettings
+   * @param {string[]} options.closedFields
+   * @param {string} options.datasetId
+   * @param {Record<string, string>} options.remoteFileShas
+   * @param {AbortSignal|null} [options.signal]
+   */
+  applyPulledRepositoryState({
+    remoteUserDocs,
+    moderationDocument = null,
+    categoricalFieldKeys,
+    fieldsToAnnotate,
+    annotatableSettings,
+    closedFields,
+    datasetId,
+    remoteFileShas,
+    signal = null,
+  } = {}) {
+    if (
+      signal !== null &&
+      (
+        typeof signal !== 'object' ||
+        typeof signal.aborted !== 'boolean' ||
+        typeof signal.addEventListener !== 'function' ||
+        typeof signal.removeEventListener !== 'function'
+      )
+    ) {
+      throw new TypeError(
+        '[CommunityAnnotationSession] Pull application signal must be an AbortSignal or null'
+      );
+    }
+    if (!Array.isArray(categoricalFieldKeys)) {
+      throw new TypeError(
+        '[CommunityAnnotationSession] categorical field keys must be an array'
+      );
+    }
+    if (!Array.isArray(fieldsToAnnotate)) {
+      throw new TypeError(
+        '[CommunityAnnotationSession] annotatable field keys must be an array'
+      );
+    }
+    const exactCategoricalFieldKeys = categoricalFieldKeys.map(
+      (fieldKey, index) => assertSessionFieldKey(
+        fieldKey,
+        `categoricalFieldKeys[${index}]`
+      )
+    );
+    const exactFieldsToAnnotate = fieldsToAnnotate.map(
+      (fieldKey, index) => assertSessionFieldKey(
+        fieldKey,
+        `fieldsToAnnotate[${index}]`
+      )
+    );
+    if (moderationDocument !== null) {
+      assertMergesDocument(moderationDocument, {
+        path: '$ pulled moderation document',
+      });
+    }
+    const preserveLocalModeration =
+      this.getModerationMerges().length > 0;
+
+    const throwIfAborted = () => {
+      if (signal === null || signal.aborted !== true) return;
+      if (signal.reason instanceof Error) throw signal.reason;
+      const error = new Error(
+        '[CommunityAnnotationSession] Pull application was aborted'
+      );
+      error.name = 'AbortError';
+      if (signal.reason !== undefined) error.cause = signal.reason;
+      throw error;
+    };
+
+    return this._runPulledRepositoryStateTransaction(() => {
+      throwIfAborted();
+
+      if (moderationDocument !== null && !preserveLocalModeration) {
+        this.setModerationMergesFromDoc(moderationDocument);
+      }
+      throwIfAborted();
+
+      this.rebuildMergedViewFromUserFiles(remoteUserDocs, {
+        preferLocalVotes: true,
+      });
+      throwIfAborted();
+
+      const enabled = new Set(exactFieldsToAnnotate);
+      for (const key of exactCategoricalFieldKeys) {
+        this.setFieldAnnotated(key, enabled.has(key));
+      }
+      this.setAnnotatableConsensusSettingsMap(annotatableSettings);
+      this.setClosedAnnotatableFields(closedFields);
+      throwIfAborted();
+
+      this.recordDatasetAccess({
+        datasetId,
+        fieldsToAnnotate: this.getAnnotatedFields(),
+      });
+      this.setRemoteFileShas(remoteFileShas);
+      throwIfAborted();
+      return true;
+    });
   }
 
   markSyncedNow() {
@@ -3140,7 +3508,7 @@ export class CommunityAnnotationSession extends EventEmitter {
    * @param {boolean} [options.preferLocalVotes=true] - Local `myVotes` wins over pulled votes for the current user.
    */
   mergeFromUserFiles(userDocs, options = {}) {
-    const previousState = JSON.parse(JSON.stringify(this._state));
+    const previousState = cloneStateForTransaction(this._state);
     const previousProfile = { ...this._profile };
     const previousKnownProfiles = JSON.parse(JSON.stringify(this._knownProfiles));
     try {
@@ -3256,15 +3624,10 @@ export class CommunityAnnotationSession extends EventEmitter {
     const addDeleted = (bucket, suggestionId, username) => {
       const b = this._canonicalizeBucketKey(bucket);
       if (!b) throw new Error(`Invalid deleted-suggestion bucket ${JSON.stringify(bucket)}`);
-      if (
-        typeof suggestionId !== 'string' ||
-        !/\S/.test(suggestionId) ||
-        /^\s|\s$/.test(suggestionId) ||
-        Array.from(suggestionId).length > ANNOTATION_LIMITS.suggestionId
-      ) {
-        throw new Error('Deleted suggestion id must be an exact nonblank string');
-      }
-      const sid = suggestionId;
+      const sid = assertSessionSuggestionId(
+        suggestionId,
+        'deleted suggestion id'
+      );
       const u = normalizeUsername(username);
       if (!u) throw new Error('Deleted suggestion owner must be an exact user identity');
       if (!deletedByBucketById.has(b)) deletedByBucketById.set(b, new Map());
@@ -3373,6 +3736,16 @@ export class CommunityAnnotationSession extends EventEmitter {
     for (const k of Object.keys(this._state.myVotes)) {
       const parsed = parseVoteKey(k);
       if (!parsed) throw new Error(`Invalid local vote key ${JSON.stringify(k)}`);
+      const referencedBucket = idToBucket.get(parsed.suggestionId) ?? null;
+      if (
+        referencedBucket !== null &&
+        referencedBucket !== bucketKey(parsed.fieldKey, parsed.catKey)
+      ) {
+        throw new Error(
+          `Local vote key ${JSON.stringify(k)} does not reference its ` +
+          'suggestion in the exact bucket'
+        );
+      }
       if (!idToBucket.has(parsed.suggestionId)) delete this._state.myVotes[k];
     }
     if (
@@ -3459,12 +3832,21 @@ export class CommunityAnnotationSession extends EventEmitter {
         // 3) Comments
         const remoteComments = myRemoteDoc.comments && typeof myRemoteDoc.comments === 'object' ? myRemoteDoc.comments : null;
         if (remoteComments) {
-          if (!this._state.myComments || typeof this._state.myComments !== 'object') this._state.myComments = {};
+          if (
+            !this._state.myComments ||
+            typeof this._state.myComments !== 'object' ||
+            Array.isArray(this._state.myComments)
+          ) {
+            this._state.myComments = createExactRecord();
+          }
           for (const [sidRaw, commentList] of Object.entries(remoteComments)) {
             const sid = sidRaw;
             if (!idToBucket.has(sid)) continue; // skip deleted/orphaned ids
 
-            const currentComments = this._state.myComments[sid];
+            const currentComments =
+              Object.hasOwn(this._state.myComments, sid)
+                ? this._state.myComments[sid]
+                : undefined;
             if (currentComments !== undefined && !Array.isArray(currentComments)) {
               throw new Error(`Local comments for ${JSON.stringify(sid)} must be an array`);
             }
@@ -3616,15 +3998,41 @@ export class CommunityAnnotationSession extends EventEmitter {
       error.code = 'LOCAL_ANNOTATION_PERSISTENCE_UNAVAILABLE';
       throw error;
     }
-    const raw = key ? localStorage.getItem(key) : null;
+    let raw = null;
+    if (key) {
+      try {
+        raw = localStorage.getItem(key);
+      } catch (cause) {
+        this._persistenceOk = false;
+        const error = new Error(
+          `Local community annotation persistence read failed for ${key}: ${cause?.message || cause}`
+        );
+        error.code = 'LOCAL_ANNOTATION_PERSISTENCE_FAILED';
+        error.cause = cause;
+        throw error;
+      }
+    }
     let next = defaultState();
+    const scopedUserId = normalizeGitHubUserIdOrNull(this._cacheUserId);
+    if (raw === null && scopedUserId !== null) {
+      // An empty authenticated scope must still be internally valid before
+      // synchronous `changed` listeners observe it. The authoritative GitHub
+      // login is applied by the owning UI immediately afterwards; keeping the
+      // remaining fields empty avoids copying repo-scoped profile metadata.
+      next.profile = sanitizeProfile({
+        username: `ghid_${scopedUserId}`,
+        githubUserId: scopedUserId,
+      });
+    }
     if (raw !== null) {
       try {
         const parsed = parseExactJson(raw, { path: `$ local state ${key}` });
         assertLocalPersistenceDocument(parsed, {
           scopeUserId: normalizeGitHubUserIdOrNull(this._cacheUserId),
         });
-        next = JSON.parse(JSON.stringify(parsed));
+        next = restoreExactIdentityRecords(
+          JSON.parse(JSON.stringify(parsed))
+        );
         next.suggestions = {};
         for (const [bucket, list] of Object.entries(parsed.suggestions)) {
           next.suggestions[bucket] = list.map((suggestion) => ({
@@ -3685,15 +4093,34 @@ export class CommunityAnnotationSession extends EventEmitter {
     this.emit('changed', { reason: 'load' });
   }
 
-  _touch() {
+  _emitChangedSafely(event) {
+    const listeners = this._listeners.get('changed');
+    if (listeners === undefined) return;
+    const errors = [];
+    for (const callback of [...listeners]) {
+      try {
+        callback(event);
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    reportSessionListenerFailures(errors);
+  }
+
+  _touch({ isolateListenerFailures = false } = {}) {
+    if (this._pullApplicationTransactionActive) {
+      return;
+    }
     this._state.updatedAt = nowIso();
     if (this._persistenceOk) this._scheduleSave();
-    this.emit('changed', { reason: 'update' });
+    const event = { reason: 'update' };
+    if (isolateListenerFailures) this._emitChangedSafely(event);
+    else this.emit('changed', event);
   }
 
   _scheduleSave() {
     if (!this._persistenceOk) return;
-    if (this._saveTimer) return;
+    if (this._saveTimer !== null) return;
     this._saveTimer = setTimeout(() => {
       this._saveTimer = null;
       try {

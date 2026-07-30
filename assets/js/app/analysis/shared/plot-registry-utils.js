@@ -25,7 +25,9 @@
  */
 
 import { getPlotRegistry } from '../core/plugin-contract.js';
+import { validateOptionSchema } from '../core/analysis-types.js';
 import { LEGEND_DEFAULT_OPTIONS, LEGEND_POSITION_SCHEMA } from './legend-utils.js';
+import { setOwnDataProperty } from '../../../utils/exact-record.js';
 
 /**
  * PlotRegistry wrapper with user-friendly method names
@@ -92,13 +94,36 @@ export const PlotRegistry = {
     const plotType = getPlotRegistry().get(plotTypeId);
     if (!plotType) return {};
 
+    const optionSchema = plotType.optionSchema;
+    if (
+      optionSchema === null ||
+      typeof optionSchema !== 'object' ||
+      Array.isArray(optionSchema)
+    ) {
+      throw new TypeError('Plot option schema must be an object');
+    }
     const visible = {};
-    for (const [key, def] of Object.entries(plotType.optionSchema || {})) {
+    for (const [key, def] of Object.entries(optionSchema)) {
+      if (
+        def === null ||
+        typeof def !== 'object' ||
+        Array.isArray(def)
+      ) {
+        throw new TypeError(
+          `Plot option ${key} definition must be an object`
+        );
+      }
+      const showWhen = Object.hasOwn(def, 'showWhen')
+        ? def.showWhen
+        : undefined;
       // Skip options with unmet showWhen conditions
-      if (def.showWhen && typeof def.showWhen === 'function' && !def.showWhen(currentOptions)) {
+      if (
+        typeof showWhen === 'function' &&
+        !showWhen.call(def, currentOptions)
+      ) {
         continue;
       }
-      visible[key] = def;
+      setOwnDataProperty(visible, key, def);
     }
     return visible;
   },
@@ -122,45 +147,112 @@ export const PlotRegistry = {
    * @returns {boolean} True if registered successfully
    */
   register: (plotType) => {
-    if (!plotType.id) {
-      console.error('[PlotRegistry] Plot type must have an id');
+    if (
+      plotType === null ||
+      typeof plotType !== 'object' ||
+      Array.isArray(plotType)
+    ) {
+      console.error('[PlotRegistry] Plot type must be an object');
       return false;
     }
-    if (!plotType.render || typeof plotType.render !== 'function') {
+    if (
+      !Object.hasOwn(plotType, 'id') ||
+      typeof plotType.id !== 'string' ||
+      plotType.id.trim().length === 0 ||
+      !/^[a-z][a-z0-9_-]*$/.test(plotType.id)
+    ) {
+      console.error('[PlotRegistry] Plot type must have a valid id');
+      return false;
+    }
+    if (
+      !Object.hasOwn(plotType, 'render') ||
+      typeof plotType.render !== 'function'
+    ) {
       console.error(`[PlotRegistry] Plot type '${plotType.id}' must have a render function`);
       return false;
     }
 
-    const supportsLegend = plotType.supportsLegend !== false;
+    const supportsLegend = (
+      !Object.hasOwn(plotType, 'supportsLegend') ||
+      plotType.supportsLegend !== false
+    );
+    const plotDefaultOptions = Object.hasOwn(plotType, 'defaultOptions')
+      ? plotType.defaultOptions
+      : undefined;
+    const plotOptionSchema = Object.hasOwn(plotType, 'optionSchema')
+      ? plotType.optionSchema
+      : undefined;
+    if (
+      plotDefaultOptions !== undefined &&
+      (
+        plotDefaultOptions === null ||
+        typeof plotDefaultOptions !== 'object' ||
+        Array.isArray(plotDefaultOptions)
+      )
+    ) {
+      console.error(
+        `[PlotRegistry] Plot type '${plotType.id}' default options must be an object`
+      );
+      return false;
+    }
+    if (plotOptionSchema !== undefined) {
+      const schemaErrors = validateOptionSchema(plotOptionSchema);
+      if (schemaErrors.length > 0) {
+        console.error(
+          `[PlotRegistry] Plot type '${plotType.id}' has an invalid option schema:`,
+          schemaErrors
+        );
+        return false;
+      }
+    }
 
     const defaultOptions = supportsLegend
-      ? { ...LEGEND_DEFAULT_OPTIONS, ...(plotType.defaultOptions || {}) }
-      : (plotType.defaultOptions || {});
+      ? { ...LEGEND_DEFAULT_OPTIONS, ...(plotDefaultOptions || {}) }
+      : (plotDefaultOptions || {});
 
     const optionSchema = supportsLegend
-      ? { legendPosition: LEGEND_POSITION_SCHEMA, ...(plotType.optionSchema || {}) }
-      : (plotType.optionSchema || {});
+      ? { legendPosition: LEGEND_POSITION_SCHEMA, ...(plotOptionSchema || {}) }
+      : (plotOptionSchema || {});
 
-    if (!Array.isArray(plotType.supportedTypes) || plotType.supportedTypes.length === 0) {
+    if (
+      !Object.hasOwn(plotType, 'supportedTypes') ||
+      !Array.isArray(plotType.supportedTypes) ||
+      plotType.supportedTypes.length === 0
+    ) {
       console.error(`[PlotRegistry] Plot type '${plotType.id}' must declare supportedTypes`);
       return false;
     }
 
     const plugin = {
       id: plotType.id,
-      name: plotType.name || plotType.id,
-      description: plotType.description || '',
+      name: (
+        Object.hasOwn(plotType, 'name') &&
+        plotType.name
+      ) ? plotType.name : plotType.id,
+      description: (
+        Object.hasOwn(plotType, 'description') &&
+        plotType.description
+      ) ? plotType.description : '',
       supportedTypes: plotType.supportedTypes,
-      supportedLayouts: plotType.supportedLayouts || ['side-by-side', 'grouped'],
+      supportedLayouts: (
+        Object.hasOwn(plotType, 'supportedLayouts') &&
+        plotType.supportedLayouts
+      ) ? plotType.supportedLayouts : ['side-by-side', 'grouped'],
       defaultOptions,
       optionSchema,
       // Core render/update/export functions
       render: plotType.render,
-      update: plotType.update,
-      exportCSV: plotType.exportCSV,
+      update: Object.hasOwn(plotType, 'update') ? plotType.update : undefined,
+      exportCSV: Object.hasOwn(plotType, 'exportCSV')
+        ? plotType.exportCSV
+        : undefined,
       // Plot building methods used by PlotFactory.render() via `this`
-      buildTraces: plotType.buildTraces,
-      buildLayout: plotType.buildLayout
+      buildTraces: Object.hasOwn(plotType, 'buildTraces')
+        ? plotType.buildTraces
+        : undefined,
+      buildLayout: Object.hasOwn(plotType, 'buildLayout')
+        ? plotType.buildLayout
+        : undefined
     };
 
     return getPlotRegistry().register(plugin);
@@ -198,7 +290,10 @@ export const PlotRegistry = {
 
     for (const plugin of all) {
       for (const type of (plugin.supportedTypes || [])) {
-        byType[type] = (byType[type] || 0) + 1;
+        const count = Object.hasOwn(byType, type)
+          ? byType[type]
+          : 0;
+        setOwnDataProperty(byType, type, count + 1);
       }
     }
 

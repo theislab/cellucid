@@ -10,6 +10,26 @@
 import { createElement } from '../../../../utils/dom-utils.js';
 
 let activeKeydownHandler = null;
+const FOCUSABLE_SELECTOR = [
+  'a[href]',
+  'button',
+  'input',
+  'select',
+  'textarea',
+  '[tabindex]',
+  '[contenteditable="true"]',
+].join(',');
+
+function getFocusableElements(owner) {
+  return Array.from(owner.querySelectorAll(FOCUSABLE_SELECTOR)).filter(
+    element => (
+      element instanceof HTMLElement &&
+      element.tabIndex >= 0 &&
+      element.getAttribute('aria-hidden') !== 'true' &&
+      !('disabled' in element && element.disabled)
+    )
+  );
+}
 
 /**
  * @param {object} options
@@ -37,6 +57,10 @@ export function showFigureExportModal({ title, content, onClose }) {
     throw new Error('A figure export modal already exists in the document.');
   }
 
+  const invokingElement =
+    document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null;
   const modal = createElement('div', {
     className: 'figure-export-modal',
     role: 'dialog',
@@ -45,7 +69,11 @@ export function showFigureExportModal({ title, content, onClose }) {
   });
 
   const backdrop = createElement('div', { className: 'figure-export-modal-backdrop' });
-  const contentEl = createElement('div', { className: 'figure-export-modal-content', role: 'document' });
+  const contentEl = createElement('div', {
+    className: 'figure-export-modal-content',
+    role: 'document',
+    tabIndex: -1,
+  });
   const titleEl = createElement('div', { className: 'figure-export-modal-title' }, [title]);
 
   contentEl.appendChild(titleEl);
@@ -54,37 +82,88 @@ export function showFigureExportModal({ title, content, onClose }) {
   modal.appendChild(contentEl);
 
   let closed = false;
+  const backgroundOwners = Array.from(document.body.children)
+    .filter(element => element instanceof HTMLElement)
+    .map(element => ({
+      element,
+      inert: element.inert,
+    }));
+
+  const restoreBackgroundAndFocus = () => {
+    for (const owner of backgroundOwners) {
+      owner.element.inert = owner.inert;
+    }
+    if (
+      invokingElement?.isConnected &&
+      !('disabled' in invokingElement && invokingElement.disabled)
+    ) {
+      invokingElement.focus();
+    }
+  };
 
   const onKeyDown = (e) => {
-    if (e.key !== 'Escape') return;
-    close();
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      close();
+      return;
+    }
+    if (e.key !== 'Tab') return;
+
+    const focusable = getFocusableElements(contentEl);
+    if (focusable.length === 0) {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      contentEl.focus();
+      return;
+    }
+    const activeIndex = focusable.indexOf(document.activeElement);
+    const nextIndex = e.shiftKey
+      ? (activeIndex <= 0 ? focusable.length - 1 : activeIndex - 1)
+      : (
+          activeIndex < 0 || activeIndex === focusable.length - 1
+            ? 0
+            : activeIndex + 1
+        );
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    focusable[nextIndex].focus();
   };
 
   const close = () => {
     if (closed) return;
     closed = true;
 
-    document.removeEventListener('keydown', onKeyDown);
+    document.removeEventListener('keydown', onKeyDown, true);
     if (activeKeydownHandler === onKeyDown) {
       activeKeydownHandler = null;
     }
     modal.remove();
+    restoreBackgroundAndFocus();
     onClose();
   };
 
   backdrop.addEventListener('click', close);
 
   activeKeydownHandler = onKeyDown;
-  document.addEventListener('keydown', onKeyDown);
+  document.addEventListener('keydown', onKeyDown, true);
 
+  for (const owner of backgroundOwners) {
+    owner.element.inert = true;
+  }
   document.body.appendChild(modal);
 
-  const firstButton = contentEl.querySelector('button');
+  const firstButton = getFocusableElements(contentEl).find(
+    element => element instanceof HTMLButtonElement
+  );
   if (!(firstButton instanceof HTMLButtonElement)) {
-    document.removeEventListener('keydown', onKeyDown);
+    document.removeEventListener('keydown', onKeyDown, true);
     activeKeydownHandler = null;
     modal.remove();
-    throw new Error('Figure export modal content must contain a button.');
+    restoreBackgroundAndFocus();
+    throw new Error(
+      'Figure export modal content must contain an enabled focusable button.'
+    );
   }
   firstButton.focus();
 

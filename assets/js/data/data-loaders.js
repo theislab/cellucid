@@ -6,6 +6,7 @@
 import { getDataSourceManager } from './data-source-manager.js';
 import { fetchSampleArtifact, isLocalUserUrl, resolveUrl } from './data-source.js';
 import { getNotificationCenter } from '../app/notification-center.js';
+import { setOwnDataProperty } from '../utils/exact-record.js';
 import {
   QUANTIZATION_BACKEND,
   dequantizeToFloat32InWorker,
@@ -2569,7 +2570,7 @@ export async function loadAnalysisBulkData(options) {
       );
 
       for (const res of batchResults) {
-        result.genes[res.geneName] = res.values;
+        setOwnDataProperty(result.genes, res.geneName, res.values);
         result.loadedCount++;
       }
 
@@ -2805,10 +2806,10 @@ export async function loadAnalysisSubset(options) {
         subsetValues[i] = fullValues[cellIdx];
       }
 
-      result.genes[geneName] = {
+      setOwnDataProperty(result.genes, geneName, {
         values: subsetValues,
         indices: [...indexArray]
-      };
+      });
     }
 
     notifications?.complete(trackerId,
@@ -2945,7 +2946,7 @@ export async function loadAnalysisBulkObsData(options) {
       );
 
       for (const res of batchResults) {
-        result.fields[res.fieldKey] = res.data;
+        setOwnDataProperty(result.fields, res.fieldKey, res.data);
         result.loadedCount++;
       }
 

@@ -13,6 +13,267 @@ test.beforeEach(async ({ page }) => {
   );
 });
 
+test('real WebGL loss is a permanent owner fence with no restoration or disposal GL work', async ({
+  page,
+}) => {
+  const pageErrors = [];
+  page.on('pageerror', error => pageErrors.push(error.message));
+  const proof = await page.evaluate(async () => {
+    const viewer = window._cellucidViewer;
+    const canvas = document.querySelector('#glcanvas');
+    const gl = viewer?.getGLContext();
+    const renderer = viewer?.getHPRenderer();
+    if (
+      !viewer ||
+      !(canvas instanceof HTMLCanvasElement) ||
+      !(gl instanceof WebGL2RenderingContext) ||
+      !renderer
+    ) {
+      throw new Error('Viewer context-loss ownership is unavailable.');
+    }
+    const loseContext = gl.getExtension('WEBGL_lose_context');
+    if (!loseContext) {
+      throw new Error(
+        'Viewer context-loss ownership requires WEBGL_lose_context.',
+      );
+    }
+
+    // Move through the public dimension contract to an as-yet unbuilt tree.
+    // setDimensionLevel is intentionally lazy, so the same task can enqueue
+    // projectile preparation and lose the context before the next frame
+    // builds the 1D index.
+    if (renderer.hasSpatialIndex(1)) {
+      throw new Error(
+        'Terminal projectile fixture unexpectedly prebuilt its 1D index.',
+      );
+    }
+    viewer.setViewDimension('live', 1);
+    const projectileCompletions = [];
+    viewer.setProjectilesEnabled(true, result => {
+      projectileCompletions.push({
+        message: result.message,
+        status: result.status,
+      });
+    });
+
+    const resizePrototype = ResizeObserver.prototype;
+    const originalResizeDisconnect = resizePrototype.disconnect;
+    let resizeDisconnectCalls = 0;
+    resizePrototype.disconnect = function (...args) {
+      resizeDisconnectCalls += 1;
+      return Reflect.apply(originalResizeDisconnect, this, args);
+    };
+
+    const capturedRendererMutation = renderer.setAdaptiveLOD;
+    const viewerMethodIdentities = {
+      setCentroids: viewer.setCentroids,
+      setPointSize: viewer.setPointSize,
+    };
+    let lossDefaultPrevented = null;
+    const lost = new Promise(resolve => {
+      canvas.addEventListener('webglcontextlost', event => {
+        lossDefaultPrevented = event.defaultPrevented;
+        resolve();
+      }, { once: true });
+    });
+    loseContext.loseContext();
+    await lost;
+    const contextLostAfterEvent = gl.isContextLost();
+    const resizeDisconnectCallsAfterLoss = resizeDisconnectCalls;
+
+    const prototype = WebGL2RenderingContext.prototype;
+    const interceptedMethodNames = [
+      'bindBuffer',
+      'bindFramebuffer',
+      'bindTexture',
+      'bindVertexArray',
+      'deleteBuffer',
+      'deleteFramebuffer',
+      'deleteProgram',
+      'deleteRenderbuffer',
+      'deleteShader',
+      'deleteTexture',
+      'deleteTransformFeedback',
+      'deleteVertexArray',
+      'getError',
+      'getParameter',
+      'useProgram',
+    ];
+    const originalMethods = {};
+    const glCalls = Object.fromEntries(
+      interceptedMethodNames.map(name => [name, 0]),
+    );
+    for (const name of interceptedMethodNames) {
+      originalMethods[name] = prototype[name];
+      prototype[name] = function (...args) {
+        if (this === gl) glCalls[name] += 1;
+        return Reflect.apply(originalMethods[name], this, args);
+      };
+    }
+
+    const terminalAttempts = {};
+    const attempt = (name, operation) => {
+      try {
+        operation();
+        terminalAttempts[name] = { message: null, name: null };
+      } catch (error) {
+        terminalAttempts[name] = {
+          message: error.message,
+          name: error.name,
+        };
+      }
+    };
+    attempt('setCentroids', () => {
+      viewer.setCentroids({
+        positions: new Float32Array([0, 0, 0]),
+        colors: new Uint8Array([255, 0, 0, 255]),
+        count: 1,
+      });
+    });
+    attempt('setPointSize', () => {
+      viewer.setPointSize(99);
+    });
+    attempt('capturedRendererMutation', () => {
+      capturedRendererMutation(true);
+    });
+    attempt('rendererPropertyMutation', () => {
+      renderer.forceLODLevel = 2;
+    });
+
+    viewer.start();
+    viewer.resume();
+    viewer.pause();
+    const pausedAfterSafeControls = viewer.isPaused();
+    const stableRendererFacade = viewer.getHPRenderer() === renderer;
+    const stableGlDiagnostic = viewer.getGLContext() === gl;
+    const methodIdentitiesStable =
+      viewer.setCentroids === viewerMethodIdentities.setCentroids &&
+      viewer.setPointSize === viewerMethodIdentities.setPointSize &&
+      renderer.setAdaptiveLOD === capturedRendererMutation;
+
+    const contextMenu = new MouseEvent('contextmenu', {
+      bubbles: true,
+      cancelable: true,
+    });
+    canvas.dispatchEvent(contextMenu);
+    const repeatedLoss = new Event('webglcontextlost', {
+      bubbles: false,
+      cancelable: true,
+    });
+    canvas.dispatchEvent(repeatedLoss);
+
+    await new Promise(resolve => setTimeout(resolve, 40));
+    const overlayCount = document.querySelectorAll(
+      '#cellucid-webgl-context-overlay',
+    ).length;
+    const glCallsBeforeDispose = Object.values(glCalls).reduce(
+      (total, count) => total + count,
+      0,
+    );
+    let disposeError = null;
+    try {
+      viewer.dispose();
+    } catch (error) {
+      disposeError = {
+        message: error.message,
+        name: error.name,
+      };
+    }
+    const glCallsThroughDispose = Object.values(glCalls).reduce(
+      (total, count) => total + count,
+      0,
+    );
+    const lifecycle = {
+      disposed: viewer.isDisposed(),
+      paused: viewer.isPaused(),
+      settled: viewer.isDisposalSettled(),
+    };
+
+    for (const name of interceptedMethodNames) {
+      prototype[name] = originalMethods[name];
+    }
+    resizePrototype.disconnect = originalResizeDisconnect;
+    return {
+      contextLostAfterEvent,
+      contextMenuDefaultPrevented: contextMenu.defaultPrevented,
+      disposeError,
+      glCalls,
+      glCallsBeforeDispose,
+      glCallsThroughDispose,
+      lifecycle,
+      lossDefaultPrevented,
+      methodIdentitiesStable,
+      overlayCount,
+      pausedAfterSafeControls,
+      projectileCompletions,
+      repeatedLossDefaultPrevented: repeatedLoss.defaultPrevented,
+      resizeDisconnectCallsAfterLoss,
+      resizeDisconnectCalls,
+      stableGlDiagnostic,
+      stableRendererFacade,
+      terminalAttempts,
+    };
+  });
+
+  expect(proof.lossDefaultPrevented).toBe(false);
+  expect(proof.contextLostAfterEvent).toBe(true);
+  expect(proof.contextMenuDefaultPrevented).toBe(false);
+  expect(proof.repeatedLossDefaultPrevented).toBe(false);
+  expect(proof.resizeDisconnectCallsAfterLoss).toBeGreaterThanOrEqual(1);
+  expect(proof.resizeDisconnectCalls).toBe(
+    proof.resizeDisconnectCallsAfterLoss,
+  );
+  expect(proof.projectileCompletions).toEqual([{
+    message: 'Projectile preparation was cancelled because the WebGL context was lost.',
+    status: 'cancelled',
+  }]);
+  expect(proof.overlayCount).toBe(1);
+  expect(proof.pausedAfterSafeControls).toBe(true);
+  expect(proof.stableRendererFacade).toBe(true);
+  expect(proof.stableGlDiagnostic).toBe(true);
+  expect(proof.methodIdentitiesStable).toBe(true);
+  expect(Object.keys(proof.terminalAttempts).sort()).toEqual([
+    'capturedRendererMutation',
+    'rendererPropertyMutation',
+    'setCentroids',
+    'setPointSize',
+  ]);
+  for (const [methodName, outcome] of Object.entries(
+    proof.terminalAttempts,
+  )) {
+    expect(outcome.name, methodName).toBe('ViewerContextLostError');
+    expect(outcome.message, methodName).toMatch(
+      /unavailable after WebGL context loss/,
+    );
+  }
+  expect(proof.glCallsBeforeDispose).toBe(0);
+  expect(proof.disposeError).toBe(null);
+  expect(proof.glCallsThroughDispose).toBe(0);
+  expect(proof.glCalls).toEqual({
+    bindBuffer: 0,
+    bindFramebuffer: 0,
+    bindTexture: 0,
+    bindVertexArray: 0,
+    deleteBuffer: 0,
+    deleteFramebuffer: 0,
+    deleteProgram: 0,
+    deleteRenderbuffer: 0,
+    deleteShader: 0,
+    deleteTexture: 0,
+    deleteTransformFeedback: 0,
+    deleteVertexArray: 0,
+    getError: 0,
+    getParameter: 0,
+    useProgram: 0,
+  });
+  expect(proof.lifecycle).toEqual({
+    disposed: true,
+    paused: true,
+    settled: true,
+  });
+  expect(pageErrors).toEqual([]);
+});
+
 test('velocity reset detaches before hostile retirement and recreates the same ID', async ({
   page,
 }) => {

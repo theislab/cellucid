@@ -40,15 +40,75 @@
 	import { drawCanvasLegend } from '../components/legend-builder.js';
 	import { drawCanvasOrientationIndicator } from '../components/orientation-indicator.js';
 	import { drawCanvasCentroidOverlay } from '../components/centroid-overlay.js';
-	import { computeVisibleRealBounds } from '../utils/coordinate-mapper.js';
+	import {
+	  computeVisibleCameraBounds,
+	  computeVisibleRealBounds,
+	} from '../utils/coordinate-mapper.js';
 	import { assertCropRect01, cropRect01ToPx } from '../utils/crop.js';
 	import { embedPngTextChunks } from '../utils/png-metadata.js';
-import { rasterizePointsWebgl } from '../utils/webgl-point-rasterizer.js';
-import { getEffectivePointDiameterPx, getLodVisibilityMask } from '../utils/point-size.js';
+import {
+  rasterizePointsWebgl,
+  releaseWebglRasterCanvas,
+} from '../utils/webgl-point-rasterizer.js';
 import { hexToRgb01, rgb01ToHex } from '../utils/color-utils.js';
 	import { computeLetterboxedRect } from '../utils/letterbox.js';
 import { assertCameraState } from '../../../../../rendering/camera-state-contract.js';
-import { assertFigureExportPayload } from '../figure-export-contract.js';
+import {
+  assertFigureExportPayload,
+  throwIfFigureExportAborted,
+} from '../figure-export-contract.js';
+import { canvasToBlob } from '../utils/export-helpers.js';
+import { clamp } from '../../../../utils/number-utils.js';
+import {
+  areLegendModelsSemanticallyEqual,
+} from '../utils/legend-model-equality.js';
+
+function computeGridPaneLayout({
+  cellX,
+  cellY,
+  cellWidth,
+  cellHeight,
+  includeAxes,
+  fontSize,
+}) {
+  const padding = clamp(Math.round(fontSize * 0.65), 6, 12);
+  const innerWidth = Math.max(1, cellWidth - padding * 2);
+  const innerHeight = Math.max(1, cellHeight - padding * 2);
+  const headerHeight = Math.min(
+    Math.max(18, Math.round(fontSize * 1.5)),
+    Math.max(0, innerHeight - 1)
+  );
+  const plotAreaHeight = Math.max(1, innerHeight - headerHeight);
+  const minPlotWidth = Math.min(80, Math.max(1, innerWidth * 0.45));
+  const minPlotHeight = Math.min(64, Math.max(1, plotAreaHeight * 0.45));
+  const axisRight = includeAxes
+    ? Math.min(10, Math.max(0, innerWidth - minPlotWidth))
+    : 0;
+  const axisLeft = includeAxes
+    ? Math.min(62, Math.max(0, innerWidth - axisRight - minPlotWidth))
+    : 0;
+  const axisBottom = includeAxes
+    ? Math.min(62, Math.max(0, plotAreaHeight - minPlotHeight))
+    : 0;
+  const plotRect = {
+    x: cellX + padding + axisLeft,
+    y: cellY + padding + headerHeight,
+    width: Math.max(1, innerWidth - axisLeft - axisRight),
+    height: Math.max(1, plotAreaHeight - axisBottom),
+  };
+
+  return {
+    labelX: plotRect.x,
+    labelY: cellY + padding + Math.min(fontSize, Math.max(1, headerHeight)),
+    panelRect: {
+      x: cellX + 1,
+      y: cellY + 1,
+      width: Math.max(1, cellWidth - 2),
+      height: Math.max(1, cellHeight - 2),
+    },
+    plotRect,
+  };
+}
 
 function applyExportBackgroundToRenderState(renderState, background, backgroundColor) {
   if (!renderState) return renderState;
@@ -64,78 +124,6 @@ function applyExportBackgroundToRenderState(renderState, background, backgroundC
     bgColor: new Float32Array(rgb),
   };
 }
-
-	function computeVisibleCameraBounds({
-	  positions,
-	  transparency = null,
-	  visibilityMask = null,
-	  mvpMatrix,
-	  viewMatrix,
-	  viewportWidth = 1,
-	  viewportHeight = 1,
-	  crop = null,
-	}) {
-	  if (!positions || !mvpMatrix || !viewMatrix) return null;
-
-	  const n = Math.floor(positions.length / 3);
-	  const m = mvpMatrix;
-	  const v = viewMatrix;
-	  const vw = Math.max(1, Number(viewportWidth) || 1);
-	  const vh = Math.max(1, Number(viewportHeight) || 1);
-	  const crop01 = assertCropRect01(crop);
-	  const cropPx = cropRect01ToPx(crop01, vw, vh);
-	  const hasCrop = Boolean(
-	    cropPx &&
-	      (cropPx.width < vw - 0.5 || cropPx.height < vh - 0.5 || cropPx.x > 0.5 || cropPx.y > 0.5)
-	  );
-
-	  let minX = Infinity;
-	  let maxX = -Infinity;
-	  let minY = Infinity;
-	  let maxY = -Infinity;
-	  let any = false;
-
-	  for (let i = 0; i < n; i++) {
-	    if (visibilityMask && (visibilityMask[i] ?? 0) <= 0) continue;
-	    const rawAlpha = transparency ? (transparency[i] ?? 1.0) : 1.0;
-	    let alpha = Number.isFinite(rawAlpha) ? rawAlpha : 1.0;
-	    if (alpha < 0) alpha = 0;
-	    else if (alpha > 1) alpha = 1;
-	    if (alpha < 0.01) continue;
-
-	    const ix = i * 3;
-	    const x = positions[ix];
-	    const y = positions[ix + 1];
-	    const z = positions[ix + 2];
-
-	    const clipX = m[0] * x + m[4] * y + m[8] * z + m[12];
-	    const clipY = m[1] * x + m[5] * y + m[9] * z + m[13];
-	    const clipW = m[3] * x + m[7] * y + m[11] * z + m[15];
-	    if (!Number.isFinite(clipW) || clipW <= 0) continue;
-
-	    const ndcX = clipX / clipW;
-	    const ndcY = clipY / clipW;
-	    if (ndcX < -1 || ndcX > 1 || ndcY < -1 || ndcY > 1) continue;
-
-	    if (hasCrop && cropPx) {
-	      const vx = (ndcX * 0.5 + 0.5) * vw;
-	      const vy = (-ndcY * 0.5 + 0.5) * vh;
-	      if (vx < cropPx.x || vx > cropPx.x + cropPx.width || vy < cropPx.y || vy > cropPx.y + cropPx.height) continue;
-	    }
-
-	    const camX = v[0] * x + v[4] * y + v[8] * z + v[12];
-	    const camY = v[1] * x + v[5] * y + v[9] * z + v[13];
-	    if (!Number.isFinite(camX) || !Number.isFinite(camY)) continue;
-	    if (camX < minX) minX = camX;
-	    if (camX > maxX) maxX = camX;
-	    if (camY < minY) minY = camY;
-	    if (camY > maxY) maxY = camY;
-	    any = true;
-	  }
-
-	  if (!any) return null;
-	  return { minX, maxX, minY, maxY };
-	}
 
 	function buildPngTextMetadata(meta, payload) {
 	  const dataset = meta?.datasetName || meta?.datasetId || '';
@@ -224,12 +212,12 @@ function applyExportBackgroundToRenderState(renderState, background, backgroundC
  * legend, axes, and title without shrinking the plot area.
  *
  * @param {object} options
- * @param {import('../../../state/core/data-state.js').DataState} options.state
- * @param {object} options.viewer
  * @param {any} options.payload
+ * @param {AbortSignal|null} [options.signal]
  * @returns {Promise<Blob>}
  */
-export async function renderFigureToPngBlob({ state, viewer, payload }) {
+export async function renderFigureToPngBlob({ payload, signal = null }) {
+  throwIfFigureExportAborted(signal);
   assertFigureExportPayload(payload);
   if (payload.format !== 'png') {
     throw new TypeError('PNG renderer requires payload.format exactly "png".');
@@ -269,22 +257,12 @@ export async function renderFigureToPngBlob({ state, viewer, payload }) {
   const crop = opts.crop;
   const crop01 = assertCropRect01(crop);
   const selectionMutedOpacity = opts.selectionMutedOpacity;
-  if (
-    typeof state.getTotalHighlightedCellCount !== 'function' ||
-    typeof state.getHighlightedCellCount !== 'function' ||
-    typeof state.getFieldForView !== 'function' ||
-    typeof state.getLegendModel !== 'function' ||
-    typeof state.getViewDimensionLevel !== 'function' ||
-    typeof state.dimensionManager?.getNormTransform !== 'function'
-  ) {
-    throw new TypeError('PNG export state is missing its exact current export methods.');
-  }
-  const totalHighlighted = state.getTotalHighlightedCellCount();
+  const totalHighlighted = payload.selection.totalCount;
   const emphasizeSelection = opts.emphasizeSelection && totalHighlighted > 0;
   const highlightCount = emphasizeSelection
-    ? state.getHighlightedCellCount()
+    ? payload.selection.visibleCount
     : totalHighlighted;
-  const highlightArray = totalHighlighted > 0 ? state.highlightArray : null;
+  const highlightArray = payload.selection.highlightArray;
 
   const background = opts.background;
   const backgroundColor = background === 'custom'
@@ -293,11 +271,14 @@ export async function renderFigureToPngBlob({ state, viewer, payload }) {
 
   const singleView = views.length === 1;
   const singleViewId = singleView ? views[0].id : null;
-  const singleLegendField = singleView && includeLegend
-    ? state.getFieldForView(singleViewId)
+  const singleScientificState = singleView
+    ? views[0].scientificState
     : null;
-  const singleLegendModel = singleView && singleLegendField
-    ? state.getLegendModel(singleLegendField)
+  const singleLegendFieldKey = singleView && includeLegend
+    ? singleScientificState.fieldKey
+    : null;
+  const singleLegendModel = singleView && includeLegend
+    ? singleScientificState.legendModel
     : null;
 
   // Compute actual output dimensions based on desired plot size and annotations
@@ -316,7 +297,7 @@ export async function renderFigureToPngBlob({ state, viewer, payload }) {
       `PNG camera state for "${singleViewId}"`
     );
     singleNavMode = singleCameraState.navigationMode;
-    singleDim = state.getViewDimensionLevel(singleViewId);
+    singleDim = singleScientificState.dimensionLevel;
     singleAxesEligible = includeAxes;
 
     singleLayout = computeSingleViewLayout({
@@ -381,14 +362,20 @@ export async function renderFigureToPngBlob({ state, viewer, payload }) {
     const cameraState = singleCameraState;
     const navMode = singleNavMode;
     const axesEligible = singleAxesEligible;
-    const visibilityMask = getLodVisibilityMask({ viewer, viewId, dimensionLevel: dim });
-    const pointDiameterViewportPx = getEffectivePointDiameterPx({ viewer, renderState, viewId, dimensionLevel: dim });
+    const lodMembership = view.scientificState.lodMembership;
+    const pointDiameterViewportPx =
+      renderState.pointSize * view.scientificState.lodSizeMultiplier;
     const includeCentroidPoints = typeof opts.includeCentroidPoints === 'boolean'
       ? opts.includeCentroidPoints
       : Boolean(centroidFlags?.points);
     const includeCentroidLabels = typeof opts.includeCentroidLabels === 'boolean'
       ? opts.includeCentroidLabels
       : Boolean(centroidFlags?.labels);
+    const hasCentroidPoints =
+      centroidPositions instanceof Float32Array &&
+      centroidPositions.length > 0 &&
+      centroidColors instanceof Uint8Array &&
+      centroidColors.length === (centroidPositions.length / 3) * 4;
 
     const layout = singleLayout || computeSingleViewLayout({
       width: desiredPlotWidth,
@@ -414,6 +401,32 @@ export async function renderFigureToPngBlob({ state, viewer, payload }) {
     }
 
     const plotRect = layout.plotRect;
+    const useCameraAxes =
+      dim > 2 &&
+      navMode !== 'planar' &&
+      Boolean(renderState.viewMatrix);
+    const visibleBounds = useCameraAxes
+      ? computeVisibleCameraBounds({
+        positions,
+        transparency,
+        lodMembership,
+        mvpMatrix: renderState.mvpMatrix,
+        viewMatrix: renderState.viewMatrix,
+        viewportWidth: renderState.viewportWidth,
+        viewportHeight: renderState.viewportHeight,
+        crop,
+      })
+      : computeVisibleRealBounds({
+        positions,
+        transparency,
+        lodMembership,
+        mvpMatrix: renderState.mvpMatrix,
+        viewportWidth: renderState.viewportWidth,
+        viewportHeight: renderState.viewportHeight,
+        crop,
+        normTransform: view.scientificState.normTransform,
+      });
+    const hasVisibleCells = visibleBounds !== null;
 
     // Plot frame.
     ctx.strokeStyle = '#e5e7eb';
@@ -450,11 +463,11 @@ export async function renderFigureToPngBlob({ state, viewer, payload }) {
       colors,
       transparency,
       renderState: renderStateForPoints,
-      visibilityMask,
+      lodMembership,
       outputWidthPx: outW,
       outputHeightPx: outH,
       pointSizePx: Math.max(1, pointDiameterViewportPx * viewportScale),
-      overlayPoints: (includeCentroidPoints && centroidPositions && centroidColors)
+      overlayPoints: (includeCentroidPoints && hasCentroidPoints)
         ? {
           positions: centroidPositions,
           colors: centroidColors,
@@ -466,39 +479,41 @@ export async function renderFigureToPngBlob({ state, viewer, payload }) {
       selectionMutedOpacity
     });
 
-    centroidPointsRasterized = includeCentroidPoints &&
-      Boolean(centroidPositions) &&
-      Boolean(centroidColors);
-    if (crop01) {
-      const vp = computeLetterboxedRect({
-        srcWidth: renderState.viewportWidth,
-        srcHeight: renderState.viewportHeight,
-        dstWidth: webglCanvas.width,
-        dstHeight: webglCanvas.height
-      });
-      const sx = vp.x + crop01.x * vp.width;
-      const sy = vp.y + crop01.y * vp.height;
-      const sw = crop01.width * vp.width;
-      const sh = crop01.height * vp.height;
-      ctx.drawImage(
-        webglCanvas,
-        sx,
-        sy,
-        sw,
-        sh,
-        plotRect.x,
-        plotRect.y,
-        plotRect.width,
-        plotRect.height
-      );
-    } else {
-      ctx.drawImage(
-        webglCanvas,
-        plotRect.x,
-        plotRect.y,
-        plotRect.width,
-        plotRect.height
-      );
+    centroidPointsRasterized = includeCentroidPoints && hasCentroidPoints;
+    try {
+      if (crop01) {
+        const vp = computeLetterboxedRect({
+          srcWidth: renderState.viewportWidth,
+          srcHeight: renderState.viewportHeight,
+          dstWidth: webglCanvas.width,
+          dstHeight: webglCanvas.height
+        });
+        const sx = vp.x + crop01.x * vp.width;
+        const sy = vp.y + crop01.y * vp.height;
+        const sw = crop01.width * vp.width;
+        const sh = crop01.height * vp.height;
+        ctx.drawImage(
+          webglCanvas,
+          sx,
+          sy,
+          sw,
+          sh,
+          plotRect.x,
+          plotRect.y,
+          plotRect.width,
+          plotRect.height
+        );
+      } else {
+        ctx.drawImage(
+          webglCanvas,
+          plotRect.x,
+          plotRect.y,
+          plotRect.width,
+          plotRect.height
+        );
+      }
+    } finally {
+      releaseWebglRasterCanvas(webglCanvas);
     }
 
     ctx.restore();
@@ -578,7 +593,7 @@ export async function renderFigureToPngBlob({ state, viewer, payload }) {
       drawCanvasLegend({
         ctx,
         legendRect: layout.legendRect,
-        fieldKey: singleLegendField?.key || null,
+        fieldKey: singleLegendFieldKey,
         model: singleLegendModel,
         fontFamily,
         fontSize: legendFontSize,
@@ -587,38 +602,11 @@ export async function renderFigureToPngBlob({ state, viewer, payload }) {
     }
 
     // Axes (2D uses embedding coordinates; 3D uses camera-space coordinates).
-    if (axesEligible && renderState) {
-      const useCameraAxes = dim > 2 && navMode !== 'planar' && renderState?.viewMatrix;
-      const bounds = (
-        useCameraAxes
-          ? computeVisibleCameraBounds({
-            positions,
-            transparency,
-            visibilityMask,
-            mvpMatrix: renderState.mvpMatrix,
-            viewMatrix: renderState.viewMatrix,
-            viewportWidth: renderState.viewportWidth,
-            viewportHeight: renderState.viewportHeight,
-            crop,
-          })
-          : computeVisibleRealBounds({
-            positions,
-            transparency,
-            visibilityMask,
-            mvpMatrix: renderState.mvpMatrix,
-            viewportWidth: renderState.viewportWidth,
-            viewportHeight: renderState.viewportHeight,
-            crop,
-            normTransform: state.dimensionManager.getNormTransform(dim)
-          })
-      );
-      if (bounds === null) {
-        throw new Error('PNG axes require at least one visible point.');
-      }
+    if (axesEligible && visibleBounds !== null) {
       drawCanvasAxes({
         ctx,
         plotRect,
-        bounds,
+        bounds: visibleBounds,
         xLabel: opts.xLabel,
         yLabel: opts.yLabel,
         fontFamily,
@@ -626,6 +614,22 @@ export async function renderFigureToPngBlob({ state, viewer, payload }) {
         labelFontSize: axisLabelFontSize,
         color: '#111'
       });
+    }
+    if (!hasVisibleCells) {
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(plotRect.x, plotRect.y, plotRect.width, plotRect.height);
+      ctx.clip();
+      ctx.fillStyle = '#6b7280';
+      ctx.font = `${baseFontSize}px ${fontFamily}`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(
+        'No visible cells',
+        plotRect.x + plotRect.width / 2,
+        plotRect.y + plotRect.height / 2
+      );
+      ctx.restore();
     }
   } else {
     const outerPadding = 20;
@@ -636,7 +640,6 @@ export async function renderFigureToPngBlob({ state, viewer, payload }) {
     const contentH = Math.max(1, canvasHeight - outerPadding * 2 - titleHeight);
     const { cols, rows } = computeGridDims(views.length || 1);
     const gap = 16;
-    const cellPadding = 10;
 
     if (title) {
       const titleSize = Math.max(14, titleFontSize);
@@ -650,30 +653,63 @@ export async function renderFigureToPngBlob({ state, viewer, payload }) {
     }
 
     // Shared legend only if all panels use the same active field.
-    let sharedField = null;
+    let sharedLegendModel = null;
     let sharedFieldKey = null;
-    if (includeLegend && typeof state.getFieldForView === 'function') {
+    if (includeLegend) {
       for (const v of views) {
-        const f = state.getFieldForView(String(v?.id || 'live'));
-        if (!f) {
+        const scientificState = v.scientificState;
+        const fieldKey = scientificState.fieldKey;
+        if (fieldKey === null || scientificState.legendModel === null) {
           sharedFieldKey = null;
-          sharedField = null;
+          sharedLegendModel = null;
           break;
         }
         if (sharedFieldKey == null) {
-          sharedFieldKey = f.key || null;
-          sharedField = f;
-        } else if (sharedFieldKey !== (f.key || null)) {
+          sharedFieldKey = fieldKey;
+          sharedLegendModel = scientificState.legendModel;
+        } else if (
+          sharedFieldKey !== fieldKey ||
+          !areLegendModelsSemanticallyEqual(
+            sharedLegendModel,
+            scientificState.legendModel
+          )
+        ) {
           sharedFieldKey = null;
-          sharedField = null;
+          sharedLegendModel = null;
           break;
         }
       }
     }
 
-    const wantsSharedLegend = includeLegend && Boolean(sharedFieldKey) && sharedField;
-    const legendW = wantsSharedLegend && legendPosition === 'right' ? 240 : 0;
-    const legendH = wantsSharedLegend && legendPosition === 'bottom' ? 140 : 0;
+    const wantsSharedLegend =
+      includeLegend &&
+      sharedFieldKey !== null &&
+      sharedLegendModel !== null;
+    const minimumGridWidth = Math.min(
+      contentW,
+      cols * (includeAxes ? 150 : 96)
+    );
+    const minimumGridHeight = Math.min(
+      contentH,
+      rows * (includeAxes ? 150 : 96)
+    );
+    const availableRightLegendWidth =
+      contentW - gap - minimumGridWidth;
+    const availableBottomLegendHeight =
+      contentH - gap - minimumGridHeight;
+    const legendW =
+      wantsSharedLegend &&
+      legendPosition === 'right' &&
+      availableRightLegendWidth >= 96
+        ? Math.min(240, availableRightLegendWidth)
+        : 0;
+    const legendH =
+      wantsSharedLegend &&
+      legendPosition === 'bottom' &&
+      availableBottomLegendHeight >= 72
+        ? Math.min(140, availableBottomLegendHeight)
+        : 0;
+    const rendersSharedLegend = legendW > 0 || legendH > 0;
 
     const gridW = Math.max(1, contentW - (legendW ? (gap + legendW) : 0));
     const gridH = Math.max(1, contentH - (legendH ? (gap + legendH) : 0));
@@ -682,7 +718,7 @@ export async function renderFigureToPngBlob({ state, viewer, payload }) {
     const cellW = gridW / cols;
     const cellH = gridH / rows;
 
-    const legendRect = wantsSharedLegend
+    const legendRect = rendersSharedLegend
       ? (legendPosition === 'right'
         ? { x: gridX + gridW + gap, y: gridY, width: legendW, height: gridH }
         : { x: gridX, y: gridY + gridH + gap, width: gridW, height: legendH })
@@ -705,12 +741,19 @@ export async function renderFigureToPngBlob({ state, viewer, payload }) {
       const row = Math.floor(idx / cols);
       const cellX = gridX + col * cellW;
       const cellY = gridY + row * cellH;
-      const plotRect = {
-        x: cellX + cellPadding,
-        y: cellY + cellPadding,
-        width: Math.max(1, cellW - cellPadding * 2),
-        height: Math.max(1, cellH - cellPadding * 2),
-      };
+      const {
+        labelX,
+        labelY,
+        panelRect,
+        plotRect,
+      } = computeGridPaneLayout({
+        cellX,
+        cellY,
+        cellWidth: cellW,
+        cellHeight: cellH,
+        includeAxes,
+        fontSize: baseFontSize,
+      });
 
       ctx.save();
       ctx.beginPath();
@@ -720,19 +763,52 @@ export async function renderFigureToPngBlob({ state, viewer, payload }) {
       const renderState = view?.renderState || null;
       if (!renderState?.mvpMatrix) throw new Error('Figure export renderState missing for PNG multiview render');
 
-      const dim = state.getViewDimensionLevel(viewId);
-      const navMode = assertCameraState(
+      const dim = view.scientificState.dimensionLevel;
+      const cameraState = assertCameraState(
         view.cameraState,
         `PNG camera state for "${viewId}"`
-      ).navigationMode;
-      const visibilityMask = getLodVisibilityMask({ viewer, viewId, dimensionLevel: dim });
-      const pointDiameterViewportPx = getEffectivePointDiameterPx({ viewer, renderState, viewId, dimensionLevel: dim });
+      );
+      const navMode = cameraState.navigationMode;
+      const lodMembership = view.scientificState.lodMembership;
+      const pointDiameterViewportPx =
+        renderState.pointSize * view.scientificState.lodSizeMultiplier;
+      const useCameraAxes =
+        dim > 2 &&
+        navMode !== 'planar' &&
+        Boolean(renderState.viewMatrix);
+      const visibleBounds = useCameraAxes
+        ? computeVisibleCameraBounds({
+          positions,
+          transparency,
+          lodMembership,
+          mvpMatrix: renderState.mvpMatrix,
+          viewMatrix: renderState.viewMatrix,
+          viewportWidth: renderState.viewportWidth,
+          viewportHeight: renderState.viewportHeight,
+          crop,
+        })
+        : computeVisibleRealBounds({
+          positions,
+          transparency,
+          lodMembership,
+          mvpMatrix: renderState.mvpMatrix,
+          viewportWidth: renderState.viewportWidth,
+          viewportHeight: renderState.viewportHeight,
+          crop,
+          normTransform: view.scientificState.normTransform,
+        });
+      const hasVisibleCells = visibleBounds !== null;
       const includeCentroidPoints = typeof opts.includeCentroidPoints === 'boolean'
         ? opts.includeCentroidPoints
         : Boolean(centroidFlags?.points);
       const includeCentroidLabels = typeof opts.includeCentroidLabels === 'boolean'
         ? opts.includeCentroidLabels
         : Boolean(centroidFlags?.labels);
+      const hasCentroidPoints =
+        centroidPositions instanceof Float32Array &&
+        centroidPositions.length > 0 &&
+        centroidColors instanceof Uint8Array &&
+        centroidColors.length === (centroidPositions.length / 3) * 4;
 
       const outW = Math.max(1, Math.round(plotRect.width * scale));
       const outH = Math.max(1, Math.round(plotRect.height * scale));
@@ -753,11 +829,11 @@ export async function renderFigureToPngBlob({ state, viewer, payload }) {
         colors,
         transparency,
         renderState: renderStateForPoints,
-        visibilityMask,
+        lodMembership,
         outputWidthPx: outW,
         outputHeightPx: outH,
         pointSizePx: Math.max(1, pointDiameterViewportPx * viewportScale),
-        overlayPoints: (includeCentroidPoints && centroidPositions && centroidColors)
+        overlayPoints: (includeCentroidPoints && hasCentroidPoints)
           ? {
             positions: centroidPositions,
             colors: centroidColors,
@@ -769,39 +845,41 @@ export async function renderFigureToPngBlob({ state, viewer, payload }) {
         selectionMutedOpacity
       });
 
-      centroidPointsRasterized = includeCentroidPoints &&
-        Boolean(centroidPositions) &&
-        Boolean(centroidColors);
-      if (crop01) {
-        const vp = computeLetterboxedRect({
-          srcWidth: renderState.viewportWidth,
-          srcHeight: renderState.viewportHeight,
-          dstWidth: webglCanvas.width,
-          dstHeight: webglCanvas.height
-        });
-        const sx = vp.x + crop01.x * vp.width;
-        const sy = vp.y + crop01.y * vp.height;
-        const sw = crop01.width * vp.width;
-        const sh = crop01.height * vp.height;
-        ctx.drawImage(
-          webglCanvas,
-          sx,
-          sy,
-          sw,
-          sh,
-          plotRect.x,
-          plotRect.y,
-          plotRect.width,
-          plotRect.height
-        );
-      } else {
-        ctx.drawImage(
-          webglCanvas,
-          plotRect.x,
-          plotRect.y,
-          plotRect.width,
-          plotRect.height
-        );
+      centroidPointsRasterized = includeCentroidPoints && hasCentroidPoints;
+      try {
+        if (crop01) {
+          const vp = computeLetterboxedRect({
+            srcWidth: renderState.viewportWidth,
+            srcHeight: renderState.viewportHeight,
+            dstWidth: webglCanvas.width,
+            dstHeight: webglCanvas.height
+          });
+          const sx = vp.x + crop01.x * vp.width;
+          const sy = vp.y + crop01.y * vp.height;
+          const sw = crop01.width * vp.width;
+          const sh = crop01.height * vp.height;
+          ctx.drawImage(
+            webglCanvas,
+            sx,
+            sy,
+            sw,
+            sh,
+            plotRect.x,
+            plotRect.y,
+            plotRect.width,
+            plotRect.height
+          );
+        } else {
+          ctx.drawImage(
+            webglCanvas,
+            plotRect.x,
+            plotRect.y,
+            plotRect.width,
+            plotRect.height
+          );
+        }
+      } finally {
+        releaseWebglRasterCanvas(webglCanvas);
       }
 
       if (includeCentroidPoints || includeCentroidLabels) {
@@ -832,18 +910,110 @@ export async function renderFigureToPngBlob({ state, viewer, payload }) {
       ctx.lineWidth = 1;
       ctx.strokeRect(plotRect.x, plotRect.y, plotRect.width, plotRect.height);
 
+      if (
+        showOrientation &&
+        renderState.viewMatrix &&
+        dim > 2 &&
+        navMode !== 'planar'
+      ) {
+        const orientationFontSize = clamp(
+          Math.round(baseFontSize * 0.9),
+          11,
+          22
+        );
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(
+          panelRect.x,
+          panelRect.y,
+          panelRect.width,
+          panelRect.height
+        );
+        ctx.clip();
+        drawCanvasOrientationIndicator({
+          ctx,
+          plotRect,
+          viewMatrix: renderState.viewMatrix,
+          cameraState,
+          fontFamily,
+          fontSize: orientationFontSize,
+        });
+        ctx.restore();
+      }
+
+      if (includeAxes && visibleBounds !== null) {
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(
+          panelRect.x,
+          panelRect.y,
+          panelRect.width,
+          panelRect.height
+        );
+        ctx.clip();
+        drawCanvasAxes({
+          ctx,
+          plotRect,
+          bounds: visibleBounds,
+          xLabel: opts.xLabel,
+          yLabel: opts.yLabel,
+          fontFamily,
+          tickFontSize,
+          labelFontSize: axisLabelFontSize,
+          color: '#111',
+        });
+        ctx.restore();
+      }
+
+      if (!hasVisibleCells) {
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(
+          plotRect.x,
+          plotRect.y,
+          plotRect.width,
+          plotRect.height
+        );
+        ctx.clip();
+        ctx.fillStyle = '#6b7280';
+        ctx.font = `${baseFontSize}px ${fontFamily}`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(
+          'No visible cells',
+          plotRect.x + plotRect.width / 2,
+          plotRect.y + plotRect.height / 2
+        );
+        ctx.restore();
+      }
+
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(
+        panelRect.x,
+        panelRect.y,
+        panelRect.width,
+        panelRect.height
+      );
+      ctx.clip();
       ctx.fillStyle = '#111';
       ctx.font = `${baseFontSize}px ${fontFamily}`;
-      ctx.fillText(`${String.fromCharCode(65 + idx)}. ${viewLabel}`, plotRect.x, plotRect.y - 4);
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'alphabetic';
+      ctx.fillText(
+        `${String.fromCharCode(65 + idx)}. ${viewLabel}`,
+        labelX,
+        labelY
+      );
+      ctx.restore();
     }
 
-    if (wantsSharedLegend && legendRect) {
-      const model = sharedField && typeof state.getLegendModel === 'function' ? state.getLegendModel(sharedField) : null;
+    if (rendersSharedLegend && legendRect) {
       drawCanvasLegend({
         ctx,
         legendRect,
         fieldKey: sharedFieldKey,
-        model,
+        model: sharedLegendModel,
         fontFamily,
         fontSize: legendFontSize,
         backgroundFill: background === 'transparent' ? 'transparent' : backgroundColor
@@ -853,18 +1023,16 @@ export async function renderFigureToPngBlob({ state, viewer, payload }) {
 
   ctx.restore();
 
-  const rawBlob = await new Promise((resolve, reject) => {
-    canvas.toBlob((blob) => {
-      if (!blob) {
-        reject(new Error('PNG encoding failed.'));
-        return;
-      }
-      resolve(blob);
-    }, 'image/png');
+  const rawBlob = await canvasToBlob(canvas, 'image/png', {
+    signal,
+    failureMessage: 'PNG encoding failed.',
   });
-
-  return embedPngTextChunks(
+  throwIfFigureExportAborted(signal);
+  const annotatedBlob = await embedPngTextChunks(
     rawBlob,
-    buildPngTextMetadata(payload.meta, payload)
+    buildPngTextMetadata(payload.meta, payload),
+    { signal }
   );
+  throwIfFigureExportAborted(signal);
+  return annotatedBlob;
 }

@@ -16,6 +16,10 @@ test('profile identifiers accept only their exact current representation', () =>
   assert.equal(isExactOrcidId('0000-0002-1825-0097'), true);
   assert.equal(assertExactLinkedInHandle('researcher-42'), 'researcher-42');
   assert.equal(assertExactOptionalProfileText('Alice Smith', 'Name', 120), 'Alice Smith');
+  assert.equal(
+    assertExactOptionalProfileText('🧬'.repeat(120), 'Name', 120),
+    '🧬'.repeat(120)
+  );
 
   for (const alias of [
     'https://orcid.org/0000-0002-1825-0097',
@@ -36,6 +40,10 @@ test('profile identifiers accept only their exact current representation', () =>
   assert.throws(
     () => assertExactOptionalProfileText(' Alice Smith', 'Name', 120),
     /exact string/
+  );
+  assert.throws(
+    () => assertExactOptionalProfileText('🧬'.repeat(121), 'Name', 120),
+    /at most 120 characters/
   );
 });
 
@@ -59,6 +67,15 @@ test('ORCID person lookup uses only the documented current name fields', () => {
       },
     }),
     /given-names/
+  );
+  assert.throws(
+    () => parseOrcidPersonName({
+      name: {
+        'given-names': { value: 'A'.repeat(120) },
+        'family-name': { value: 'B' },
+      },
+    }),
+    /name must be at most 120 characters/
   );
 });
 
@@ -113,5 +130,15 @@ test('ORCID expanded search rejects aliases, duplicates, and excess results', ()
       ],
     }),
     /duplicate/
+  );
+  assert.throws(
+    () => parseOrcidExpandedSearch({
+      'expanded-result': [{
+        'orcid-id': '0000-0002-1825-0097',
+        'given-names': 'A'.repeat(120),
+        'family-names': 'B',
+      }],
+    }),
+    /name must be at most 120 characters/
   );
 });

@@ -36,6 +36,10 @@ jobs:
       - name: Run every web contract
         run: npm test
 
+      - name: Validate the deployable community-annotation Worker bundle
+        if: matrix.os == 'ubuntu-latest' && matrix.node == '24'
+        run: npm run test:worker-bundle
+
   browsers:
     name: ${{ matrix.os }} / ${{ matrix.browser }}
     runs-on: ${{ matrix.os }}

@@ -2644,14 +2644,20 @@ test('recoloring and position changes retain the published filter generation', a
     viewer.updateTransparency(transparency);
 
     const readVisibility = () => {
-      const visibility = viewer.getCombinedVisibilityForView(
+      const alpha = viewer.getViewTransparency('live');
+      const membership = viewer.getCurrentLodMembership(
         'live',
-        0.01,
         2,
       );
-      return visibility === null
-        ? null
-        : [visibility[0], visibility[1]];
+      const admissionLevels = membership?.admissionLevels ?? null;
+      const lodLevel = membership?.lodLevel ?? -1;
+      return [0, 1].map(index => (
+        alpha[index] >= Math.fround(2.5 / 255) &&
+        (
+          admissionLevels === null ||
+          admissionLevels[index] <= lodLevel
+        )
+      ) ? 1 : 0);
     };
 
     const colors = viewer.getColors().slice();

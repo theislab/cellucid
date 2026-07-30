@@ -78,25 +78,61 @@ export function renderPlotOptions(container, plotTypeId, currentOptions = {}, on
   if (!plotType) {
     throw new RangeError(`Unknown plot type: ${plotTypeId}`);
   }
-  if (!plotType.optionSchema || Object.keys(plotType.optionSchema).length === 0) {
+  const optionSchema = Object.hasOwn(plotType, 'optionSchema')
+    ? plotType.optionSchema
+    : undefined;
+  if (
+    optionSchema === null ||
+    typeof optionSchema !== 'object' ||
+    Array.isArray(optionSchema)
+  ) {
+    throw new TypeError(
+      `Plot type ${plotTypeId} optionSchema must be a non-null, non-array object`
+    );
+  }
+  const defaultOptions = Object.hasOwn(plotType, 'defaultOptions')
+    ? plotType.defaultOptions
+    : undefined;
+  if (
+    defaultOptions === null ||
+    typeof defaultOptions !== 'object' ||
+    Array.isArray(defaultOptions)
+  ) {
+    throw new TypeError(
+      `Plot type ${plotTypeId} defaultOptions must be a non-null, non-array object`
+    );
+  }
+  if (Object.keys(optionSchema).length === 0) {
     const empty = document.createElement('div');
     empty.className = 'legend-help';
     empty.textContent = 'No customization options available.';
     container.appendChild(empty);
     return;
   }
-
-  const visibleOptions = PlotRegistry.getVisibleOptions(plotTypeId, currentOptions);
+  const visibleOptions = PlotRegistry.getVisibleOptions(
+    plotTypeId,
+    currentOptions
+  );
 
   for (const [key, def] of Object.entries(visibleOptions)) {
     const inputId = `${idPrefix}-analysis-opt-${key}`;
-    if (!plotType.defaultOptions || typeof plotType.defaultOptions !== 'object') {
-      throw new TypeError(`Plot type ${plotTypeId} must define defaultOptions`);
-    }
-    const value = Object.hasOwn(currentOptions, key)
+    const currentValue = Object.hasOwn(currentOptions, key)
       ? currentOptions[key]
-      : plotType.defaultOptions[key];
-    if (!def || typeof def !== 'object' || typeof def.label !== 'string' || def.label.length === 0) {
+      : undefined;
+    const defaultValue = Object.hasOwn(defaultOptions, key)
+      ? defaultOptions[key]
+      : undefined;
+    const value = currentValue ?? defaultValue;
+    if (!def || typeof def !== 'object') {
+      throw new TypeError(`Plot option ${key} must be an object`);
+    }
+    const type = Object.hasOwn(def, 'type')
+      ? def.type
+      : undefined;
+    const labelText = Object.hasOwn(def, 'label')
+      ? def.label
+      : undefined;
+    if (typeof labelText !== 'string' || labelText.length === 0) {
       throw new TypeError(`Plot option ${key} must define a non-empty label`);
     }
 
@@ -105,41 +141,65 @@ export function renderPlotOptions(container, plotTypeId, currentOptions = {}, on
 
     let input;
 
-    switch (def.type) {
+    switch (type) {
       case 'select': {
         const label = document.createElement('label');
         label.className = 'analysis-option-label';
-        label.textContent = def.label;
+        label.textContent = labelText;
         label.htmlFor = inputId;
         optionRow.appendChild(label);
 
         input = document.createElement('select');
         input.className = 'obs-select analysis-option-select';
         input.id = inputId;
-        if (!Array.isArray(def.options) || def.options.length === 0) {
+        const optionDefinitions = Object.hasOwn(def, 'options')
+          ? def.options
+          : undefined;
+        if (
+          !Array.isArray(optionDefinitions) ||
+          optionDefinitions.length === 0
+        ) {
           throw new TypeError(`Select option ${key} requires a non-empty options array`);
         }
-        const selectedIndex = def.options.findIndex(opt => Object.is(opt.value, value));
+        const choices = optionDefinitions.map(opt => {
+          if (!opt || typeof opt !== 'object') {
+            throw new TypeError(
+              `Select option ${key} contains an invalid choice`
+            );
+          }
+          const choiceLabel = Object.hasOwn(opt, 'label')
+            ? opt.label
+            : undefined;
+          if (typeof choiceLabel !== 'string' || choiceLabel.length === 0) {
+            throw new TypeError(
+              `Select option ${key} contains an invalid choice`
+            );
+          }
+          return {
+            label: choiceLabel,
+            value: Object.hasOwn(opt, 'value') ? opt.value : undefined,
+          };
+        });
+        const selectedIndex = choices.findIndex(
+          choice => Object.is(choice.value, value)
+        );
         if (selectedIndex < 0) {
           throw new RangeError(`Select option ${key} does not define its current value`);
         }
-        for (let optionIndex = 0; optionIndex < def.options.length; optionIndex++) {
-          const opt = def.options[optionIndex];
-          if (!opt || typeof opt.label !== 'string' || opt.label.length === 0) {
-            throw new TypeError(`Select option ${key} contains an invalid choice`);
-          }
+        for (let optionIndex = 0; optionIndex < choices.length; optionIndex++) {
+          const choice = choices[optionIndex];
           const option = document.createElement('option');
           option.value = `${optionIndex}`;
-          option.textContent = opt.label;
+          option.textContent = choice.label;
           input.appendChild(option);
         }
         input.selectedIndex = selectedIndex;
         input.addEventListener('change', () => {
-          const option = def.options[input.selectedIndex];
-          if (!option) {
+          const choice = choices[input.selectedIndex];
+          if (!choice) {
             throw new RangeError(`Select option ${key} has no selected schema value`);
           }
-          onChange(key, option.value);
+          onChange(key, choice.value);
         });
         optionRow.appendChild(input);
         break;
@@ -163,7 +223,7 @@ export function renderPlotOptions(container, plotTypeId, currentOptions = {}, on
         const checkLabel = document.createElement('label');
         checkLabel.className = 'analysis-option-label';
         checkLabel.htmlFor = input.id;
-        checkLabel.textContent = def.label;
+        checkLabel.textContent = labelText;
 
         optionRow.appendChild(input);
         optionRow.appendChild(checkLabel);
@@ -172,35 +232,38 @@ export function renderPlotOptions(container, plotTypeId, currentOptions = {}, on
 
       case 'range':
       case 'number': {
+        const min = Object.hasOwn(def, 'min') ? def.min : undefined;
+        const max = Object.hasOwn(def, 'max') ? def.max : undefined;
+        const step = Object.hasOwn(def, 'step') ? def.step : undefined;
         if (
-          !Number.isFinite(def.min) ||
-          !Number.isFinite(def.max) ||
-          !Number.isFinite(def.step) ||
-          def.min >= def.max ||
-          def.step <= 0
+          !Number.isFinite(min) ||
+          !Number.isFinite(max) ||
+          !Number.isFinite(step) ||
+          min >= max ||
+          step <= 0
         ) {
           throw new RangeError(
             `Numeric option ${key} requires finite min < max and a positive step`
           );
         }
-        if (!Number.isFinite(value) || value < def.min || value > def.max) {
+        if (!Number.isFinite(value) || value < min || value > max) {
           throw new RangeError(`Numeric option ${key} value must be within its declared range`);
         }
         const label = document.createElement('label');
         label.className = 'analysis-option-label';
-        label.textContent = def.label;
+        label.textContent = labelText;
         label.htmlFor = inputId;
         optionRow.appendChild(label);
 
         input = document.createElement('input');
-        input.type = def.type;
-        input.className = def.type === 'range'
+        input.type = type;
+        input.className = type === 'range'
           ? 'analysis-option-range'
           : 'analysis-option-number';
         input.id = inputId;
-        input.min = `${def.min}`;
-        input.max = `${def.max}`;
-        input.step = `${def.step}`;
+        input.min = `${min}`;
+        input.max = `${max}`;
+        input.step = `${step}`;
         input.valueAsNumber = value;
 
         const valueDisplay = document.createElement('span');
@@ -209,7 +272,7 @@ export function renderPlotOptions(container, plotTypeId, currentOptions = {}, on
 
         const commitNumericChange = () => {
           const nextValue = input.valueAsNumber;
-          if (!Number.isFinite(nextValue) || nextValue < def.min || nextValue > def.max) {
+          if (!Number.isFinite(nextValue) || nextValue < min || nextValue > max) {
             throw new RangeError(`Numeric option ${key} produced an out-of-range value`);
           }
           onChange(key, nextValue);
@@ -231,7 +294,7 @@ export function renderPlotOptions(container, plotTypeId, currentOptions = {}, on
       case 'text': {
         const label = document.createElement('label');
         label.className = 'analysis-option-label';
-        label.textContent = def.label;
+        label.textContent = labelText;
         label.htmlFor = inputId;
         optionRow.appendChild(label);
 
@@ -242,11 +305,14 @@ export function renderPlotOptions(container, plotTypeId, currentOptions = {}, on
         if (typeof value !== 'string') {
           throw new TypeError(`Text option ${key} must be a string`);
         }
-        if (def.placeholder !== undefined && typeof def.placeholder !== 'string') {
+        const placeholder = Object.hasOwn(def, 'placeholder')
+          ? def.placeholder
+          : undefined;
+        if (placeholder !== undefined && typeof placeholder !== 'string') {
           throw new TypeError(`Text option ${key} placeholder must be a string`);
         }
         input.value = value;
-        input.placeholder = def.placeholder === undefined ? '' : def.placeholder;
+        input.placeholder = placeholder === undefined ? '' : placeholder;
         input.addEventListener('change', () => {
           onChange(key, input.value);
         });
@@ -255,7 +321,7 @@ export function renderPlotOptions(container, plotTypeId, currentOptions = {}, on
       }
 
       default:
-        throw new RangeError(`Unknown plot option type for ${key}: ${String(def.type)}`);
+        throw new RangeError(`Unknown plot option type for ${key}: ${String(type)}`);
     }
 
     container.appendChild(optionRow);

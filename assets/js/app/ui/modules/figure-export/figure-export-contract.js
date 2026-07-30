@@ -7,6 +7,7 @@
 
 import { assertCameraState } from '../../../../rendering/camera-state-contract.js';
 import { assertCropRect01 } from './utils/crop.js';
+import { assertLodMembership } from './utils/lod-membership.js';
 
 const FORMATS = new Set(['png', 'svg']);
 const STRATEGIES = new Set(['full-vector', 'optimized-vector', 'hybrid']);
@@ -33,6 +34,7 @@ const BASE_REQUEST_KEYS = Object.freeze([
   'optimizedTargetCount',
   'selectionMutedOpacity',
   'showOrientation',
+  'signal',
   'strategy',
   'tickFontSizePx',
   'title',
@@ -54,12 +56,15 @@ const PAYLOAD_KEYS = Object.freeze([
   'height',
   'meta',
   'options',
+  'selection',
   'title',
   'views',
   'width',
 ]);
 const PAYLOAD_OPTION_KEYS = Object.freeze(
-  BASE_REQUEST_KEYS.filter((key) => key !== 'exportAllViews').sort()
+  BASE_REQUEST_KEYS.filter(
+    (key) => key !== 'exportAllViews' && key !== 'signal'
+  ).sort()
 );
 const VIEW_KEYS = Object.freeze([
   'cameraState',
@@ -67,6 +72,7 @@ const VIEW_KEYS = Object.freeze([
   'id',
   'label',
   'renderState',
+  'scientificState',
 ]);
 const VIEW_DATA_KEYS = Object.freeze([
   'centroidColors',
@@ -79,6 +85,22 @@ const VIEW_DATA_KEYS = Object.freeze([
   'transparency',
 ]);
 const CENTROID_FLAG_KEYS = Object.freeze(['labels', 'points']);
+const SELECTION_KEYS = Object.freeze([
+  'highlightArray',
+  'totalCount',
+  'visibleCount',
+]);
+const SCIENTIFIC_STATE_KEYS = Object.freeze([
+  'datasetGeneration',
+  'dimensionLevel',
+  'fieldKey',
+  'geometryGeneration',
+  'legendModel',
+  'lodMembership',
+  'lodSizeMultiplier',
+  'normTransform',
+]);
+const NORM_TRANSFORM_KEYS = Object.freeze(['center', 'scale']);
 const RENDER_STATE_KEYS = Object.freeze([
   'bgColor',
   'cameraDistance',
@@ -86,6 +108,8 @@ const RENDER_STATE_KEYS = Object.freeze([
   'far',
   'fogColor',
   'fogDensity',
+  'fogFar',
+  'fogNear',
   'fov',
   'lightDir',
   'lightingStrength',
@@ -141,6 +165,131 @@ function assertBoolean(value, context) {
   }
 }
 
+function readFigureExportAbortState(signal, context) {
+  const AbortSignalCtor = globalThis.AbortSignal;
+  const abortedGetter = typeof AbortSignalCtor === 'function'
+    ? Object.getOwnPropertyDescriptor(
+        AbortSignalCtor.prototype,
+        'aborted'
+      )?.get
+    : null;
+  if (
+    signal === null ||
+    typeof signal !== 'object' ||
+    typeof abortedGetter !== 'function' ||
+    typeof signal.addEventListener !== 'function' ||
+    typeof signal.removeEventListener !== 'function'
+  ) {
+    throw new TypeError(`${context} must be an AbortSignal.`);
+  }
+  try {
+    return abortedGetter.call(signal);
+  } catch {
+    throw new TypeError(`${context} must be an AbortSignal.`);
+  }
+}
+
+/**
+ * Validate the live cancellation owner without accepting lookalike objects.
+ * Borrowing the current realm's Web-IDL getter performs the AbortSignal brand
+ * check while remaining safe for signals created by another same-origin realm.
+ *
+ * @param {unknown} signal
+ * @param {string} [context]
+ * @returns {AbortSignal}
+ */
+export function assertFigureExportSignal(
+  signal,
+  context = 'Figure export signal'
+) {
+  readFigureExportAbortState(signal, context);
+  return signal;
+}
+
+/**
+ * @param {AbortSignal|null} signal
+ * @returns {boolean}
+ */
+export function isFigureExportSignalAborted(signal) {
+  if (signal === null) return false;
+  return readFigureExportAbortState(signal, 'Figure export signal');
+}
+
+/**
+ * Throw the signal's owned abort reason at every asynchronous publication
+ * boundary. Internal renderer helpers accept null to preserve their standalone
+ * API; exact engine requests always carry a validated AbortSignal.
+ *
+ * @param {AbortSignal|null} signal
+ */
+export function throwIfFigureExportAborted(signal) {
+  if (signal === null) return;
+  if (!readFigureExportAbortState(signal, 'Figure export signal')) return;
+  if (signal.reason !== undefined) throw signal.reason;
+  if (typeof DOMException === 'function') {
+    throw new DOMException('Figure export was aborted.', 'AbortError');
+  }
+  const error = new Error('Figure export was aborted.');
+  error.name = 'AbortError';
+  throw error;
+}
+
+/**
+ * Race one native asynchronous operation against the export's cancellation
+ * owner. Native Blob/canvas work may finish later, but its late result is
+ * ignored and cannot publish a download or notification.
+ *
+ * @template T
+ * @param {AbortSignal|null} signal
+ * @param {PromiseLike<T>|T} operation
+ * @returns {Promise<T>}
+ */
+export function awaitFigureExportAbortable(signal, operation) {
+  if (signal === null) return Promise.resolve(operation);
+  assertFigureExportSignal(signal);
+  throwIfFigureExportAborted(signal);
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => {
+      signal.removeEventListener('abort', onAbort);
+    };
+    const settle = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      callback(value);
+    };
+    const onAbort = () => {
+      try {
+        throwIfFigureExportAborted(signal);
+      } catch (error) {
+        settle(reject, error);
+      }
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    if (isFigureExportSignalAborted(signal)) {
+      onAbort();
+      return;
+    }
+    Promise.resolve(operation).then(
+      (value) => {
+        if (isFigureExportSignalAborted(signal)) {
+          onAbort();
+          return;
+        }
+        settle(resolve, value);
+      },
+      (error) => {
+        if (isFigureExportSignalAborted(signal)) {
+          onAbort();
+          return;
+        }
+        settle(reject, error);
+      }
+    );
+  });
+}
+
 function assertInteger(value, context, minimum, maximum = Infinity) {
   if (
     !Number.isSafeInteger(value) ||
@@ -172,8 +321,7 @@ function assertFormat(value, context) {
   }
 }
 
-function assertBaseRequest(request, expectedKeys, context) {
-  assertExactKeys(request, expectedKeys, context);
+function assertBaseRequestValues(request, context) {
   assertInteger(request.width, `${context}.width`, 10);
   assertInteger(request.height, `${context}.height`, 10);
   assertBoolean(request.exportAllViews, `${context}.exportAllViews`);
@@ -216,6 +364,12 @@ function assertBaseRequest(request, expectedKeys, context) {
     1
   );
   return request;
+}
+
+function assertBaseRequest(request, expectedKeys, context) {
+  assertExactKeys(request, expectedKeys, context);
+  assertFigureExportSignal(request.signal, `${context}.signal`);
+  return assertBaseRequestValues(request, context);
 }
 
 function assertStrategyContract(request, requiresSvg, context) {
@@ -324,6 +478,69 @@ function assertUint8Array(value, length, context) {
   }
 }
 
+function assertOwnedLegendValue(value, context, seen = new Set()) {
+  if (
+    value === null ||
+    typeof value === 'string' ||
+    typeof value === 'boolean'
+  ) {
+    return;
+  }
+  if (typeof value === 'number') {
+    assertFiniteNumber(value, context);
+    return;
+  }
+  if (typeof value !== 'object' || seen.has(value)) {
+    throw new TypeError(
+      `${context} must contain only acyclic, owned legend data.`
+    );
+  }
+  seen.add(value);
+  if (Array.isArray(value)) {
+    const ownKeys = Reflect.ownKeys(value);
+    if (
+      ownKeys.length !== value.length + 1 ||
+      !ownKeys.includes('length')
+    ) {
+      throw new TypeError(
+        `${context} must be one dense array without custom properties.`
+      );
+    }
+    for (let index = 0; index < value.length; index++) {
+      if (!Object.hasOwn(value, index)) {
+        throw new TypeError(`${context} must not contain sparse entries.`);
+      }
+      assertOwnedLegendValue(
+        value[index],
+        `${context}[${index}]`,
+        seen
+      );
+    }
+    seen.delete(value);
+    return;
+  }
+  assertPlainObject(value, context);
+  for (const key of Reflect.ownKeys(value)) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (
+      typeof key !== 'string' ||
+      descriptor === undefined ||
+      descriptor.enumerable !== true ||
+      !Object.hasOwn(descriptor, 'value')
+    ) {
+      throw new TypeError(
+        `${context} must contain only enumerable string data properties.`
+      );
+    }
+    assertOwnedLegendValue(
+      descriptor.value,
+      `${context}.${key}`,
+      seen
+    );
+  }
+  seen.delete(value);
+}
+
 function assertRenderState(renderState, context) {
   assertExactKeys(renderState, RENDER_STATE_KEYS, context);
   for (const key of ['mvpMatrix', 'viewMatrix', 'modelMatrix', 'projectionMatrix']) {
@@ -349,6 +566,8 @@ function assertRenderState(renderState, context) {
     'far',
     'lightingStrength',
     'fogDensity',
+    'fogNear',
+    'fogFar',
     'cameraDistance',
   ]) {
     assertFiniteNumber(renderState[key], `${context}.${key}`);
@@ -357,6 +576,14 @@ function assertRenderState(renderState, context) {
   assertInteger(renderState.viewportHeight, `${context}.viewportHeight`, 1);
   if (!SHADER_QUALITIES.has(renderState.shaderQuality)) {
     throw new TypeError(`${context}.shaderQuality is not a current shader quality.`);
+  }
+  if (
+    renderState.fogNear < 0 ||
+    renderState.fogFar < renderState.fogNear
+  ) {
+    throw new RangeError(
+      `${context} fog range must satisfy 0 <= fogNear <= fogFar.`
+    );
   }
 }
 
@@ -420,14 +647,101 @@ function assertViewData(data, context) {
   }
 }
 
-function assertPayloadOptions(options, context) {
-  const requestShape = { ...options, exportAllViews: false };
-  assertBaseRequest(
-    requestShape,
-    BASE_REQUEST_KEYS,
-    context
+function assertSelectionSnapshot(selection, pointCount, context) {
+  assertExactKeys(selection, SELECTION_KEYS, context);
+  assertInteger(selection.totalCount, `${context}.totalCount`, 0, pointCount);
+  assertInteger(
+    selection.visibleCount,
+    `${context}.visibleCount`,
+    0,
+    selection.totalCount
   );
+  if (selection.totalCount === 0) {
+    if (selection.highlightArray !== null) {
+      throw new TypeError(
+        `${context}.highlightArray must be null when no cells are highlighted.`
+      );
+    }
+    return;
+  }
+  assertUint8Array(
+    selection.highlightArray,
+    pointCount,
+    `${context}.highlightArray`
+  );
+}
+
+function assertScientificState(scientificState, data, context) {
+  assertExactKeys(scientificState, SCIENTIFIC_STATE_KEYS, context);
+  assertInteger(
+    scientificState.datasetGeneration,
+    `${context}.datasetGeneration`,
+    0
+  );
+  assertInteger(
+    scientificState.dimensionLevel,
+    `${context}.dimensionLevel`,
+    1,
+    3
+  );
+  assertInteger(
+    scientificState.geometryGeneration,
+    `${context}.geometryGeneration`,
+    1
+  );
+  if (
+    scientificState.fieldKey !== null &&
+    typeof scientificState.fieldKey !== 'string'
+  ) {
+    throw new TypeError(`${context}.fieldKey must be a string or null.`);
+  }
+  if (scientificState.legendModel !== null) {
+    assertPlainObject(scientificState.legendModel, `${context}.legendModel`);
+    assertOwnedLegendValue(
+      scientificState.legendModel,
+      `${context}.legendModel`
+    );
+  }
+  assertLodMembership(scientificState.lodMembership, {
+    pointCount: data.pointCount,
+    dimensionLevel: scientificState.dimensionLevel,
+    label: `${context}.lodMembership`,
+  });
+  assertFiniteNumber(
+    scientificState.lodSizeMultiplier,
+    `${context}.lodSizeMultiplier`,
+    Number.MIN_VALUE
+  );
+  assertExactKeys(
+    scientificState.normTransform,
+    NORM_TRANSFORM_KEYS,
+    `${context}.normTransform`
+  );
+  if (
+    !Array.isArray(scientificState.normTransform.center) ||
+    scientificState.normTransform.center.length !== 3
+  ) {
+    throw new TypeError(
+      `${context}.normTransform.center must be a three-number array.`
+    );
+  }
+  scientificState.normTransform.center.forEach((value, index) => {
+    assertFiniteNumber(
+      value,
+      `${context}.normTransform.center[${index}]`
+    );
+  });
+  assertFiniteNumber(
+    scientificState.normTransform.scale,
+    `${context}.normTransform.scale`,
+    Number.MIN_VALUE
+  );
+}
+
+function assertPayloadOptions(options, context) {
   assertExactKeys(options, PAYLOAD_OPTION_KEYS, context);
+  const requestShape = { ...options, exportAllViews: false };
+  assertBaseRequestValues(requestShape, context);
 }
 
 export function assertFigureExportPayload(payload) {
@@ -451,6 +765,13 @@ export function assertFigureExportPayload(payload) {
   if (!Array.isArray(payload.views) || payload.views.length === 0) {
     throw new TypeError('Figure export payload.views must be a non-empty array.');
   }
+  const pointCount = payload.views[0]?.data?.pointCount;
+  assertInteger(pointCount, 'Figure export payload point count', 0);
+  assertSelectionSnapshot(
+    payload.selection,
+    pointCount,
+    'Figure export payload.selection'
+  );
   const viewIds = new Set();
   payload.views.forEach((view, index) => {
     const context = `Figure export payload.views[${index}]`;
@@ -462,8 +783,18 @@ export function assertFigureExportPayload(payload) {
     }
     viewIds.add(view.id);
     assertViewData(view.data, `${context}.data`);
+    if (view.data.pointCount !== pointCount) {
+      throw new RangeError(
+        `${context}.data.pointCount must match every exported view.`
+      );
+    }
     assertRenderState(view.renderState, `${context}.renderState`);
     assertCameraState(view.cameraState, `${context}.cameraState`);
+    assertScientificState(
+      view.scientificState,
+      view.data,
+      `${context}.scientificState`
+    );
   });
   return payload;
 }

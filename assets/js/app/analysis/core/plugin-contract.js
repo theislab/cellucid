@@ -21,6 +21,7 @@ import { filterFiniteNumbers, getFiniteMinMax, mean } from '../shared/number-uti
 import { debug, debugWarn, debugError } from '../shared/debug-utils.js';
 import { getPlotTheme } from '../shared/plot-theme.js';
 import { getPageColor, PAGE_COLORS } from '../../utils/page-colors.js';
+import { setOwnDataProperty } from '../../../utils/exact-record.js';
 
 // Re-export validation functions for index.js
 export { validatePluginContract, validateOptionsAgainstSchema, mergeOptions };
@@ -68,7 +69,7 @@ export class BasePluginRegistry {
     const validation = validatePluginContract(plugin, this._pluginType);
 
     if (!validation.valid) {
-      debugError(this._name, `Failed to register '${plugin?.id}':`, validation.errors);
+      debugError(this._name, 'Failed to register plugin:', validation.errors);
       return false;
     }
 
@@ -78,7 +79,10 @@ export class BasePluginRegistry {
 
     // Check required methods
     for (const method of this._requiredMethods) {
-      if (typeof plugin[method] !== 'function') {
+      if (
+        !Object.hasOwn(plugin, method) ||
+        typeof plugin[method] !== 'function'
+      ) {
         debugError(this._name, `Plugin '${plugin.id}' missing required method: ${method}`);
         return false;
       }
@@ -108,9 +112,15 @@ export class BasePluginRegistry {
   _normalizePlugin(plugin) {
     return {
       ...plugin,
-      defaultOptions: plugin.defaultOptions || {},
-      optionSchema: plugin.optionSchema || {},
-      supportedTypes: plugin.supportedTypes || ['any']
+      defaultOptions: (
+        Object.hasOwn(plugin, 'defaultOptions') &&
+        plugin.defaultOptions
+      ) ? plugin.defaultOptions : {},
+      optionSchema: (
+        Object.hasOwn(plugin, 'optionSchema') &&
+        plugin.optionSchema
+      ) ? plugin.optionSchema : {},
+      supportedTypes: plugin.supportedTypes
     };
   }
 
@@ -268,7 +278,10 @@ export class BasePluginRegistry {
     const byType = {};
     for (const plugin of this._plugins.values()) {
       for (const type of plugin.supportedTypes) {
-        byType[type] = (byType[type] || 0) + 1;
+        const count = Object.hasOwn(byType, type)
+          ? byType[type]
+          : 0;
+        setOwnDataProperty(byType, type, count + 1);
       }
     }
 
@@ -302,7 +315,10 @@ export class PlotPluginRegistry extends BasePluginRegistry {
     const normalized = super._normalizePlugin(plugin);
 
     // Add plot-specific defaults
-    normalized.supportedLayouts = plugin.supportedLayouts || ['single'];
+    normalized.supportedLayouts = (
+      Object.hasOwn(plugin, 'supportedLayouts') &&
+      plugin.supportedLayouts
+    ) ? plugin.supportedLayouts : ['single'];
 
     // Ensure update method exists (default to re-render)
     if (!normalized.update) {
@@ -452,8 +468,14 @@ export class TransformPluginRegistry extends BasePluginRegistry {
     const normalized = super._normalizePlugin(plugin);
 
     // Add transform-specific properties
-    normalized.gpuMethod = plugin.gpuMethod || null;
-    normalized.workerMethod = plugin.workerMethod || null;
+    normalized.gpuMethod = (
+      Object.hasOwn(plugin, 'gpuMethod') &&
+      plugin.gpuMethod
+    ) ? plugin.gpuMethod : null;
+    normalized.workerMethod = (
+      Object.hasOwn(plugin, 'workerMethod') &&
+      plugin.workerMethod
+    ) ? plugin.workerMethod : null;
 
     return normalized;
   }
@@ -609,8 +631,14 @@ export class StatPluginRegistry extends BasePluginRegistry {
     const normalized = super._normalizePlugin(plugin);
 
     // Add stat-specific properties
-    normalized.testType = plugin.testType || 'generic'; // 'parametric', 'nonparametric', 'correlation'
-    normalized.assumptions = plugin.assumptions || [];
+    normalized.testType = (
+      Object.hasOwn(plugin, 'testType') &&
+      plugin.testType
+    ) ? plugin.testType : 'generic'; // 'parametric', 'nonparametric', 'correlation'
+    normalized.assumptions = (
+      Object.hasOwn(plugin, 'assumptions') &&
+      plugin.assumptions
+    ) ? plugin.assumptions : [];
 
     return normalized;
   }

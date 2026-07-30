@@ -2644,31 +2644,22 @@ test('connectivity edge publication has one abortable generation owner', async (
     connectivitySource,
     /localAdoptionIdentity: userSource\.getAdoptionIdentity\(\)/
   );
-  assert.match(
-    connectivitySource,
-    /sources: edgeData\.sources\.slice\(\)/
-  );
-  assert.match(
-    connectivitySource,
-    /destinations: edgeData\.destinations\.slice\(\)/
-  );
-  assert.match(
-    connectivitySource,
-    /weights: edgeData\.weights\.slice\(\)/
-  );
-  assert.match(
-    connectivitySource,
-    /shuffleEdges\(\s*renderEdgeData\.sources,\s*renderEdgeData\.destinations,\s*renderEdgeData\.weights\s*\)/s
-  );
-  assert.match(connectivitySource, /loadedEdgeData = edgeData/);
   assert.doesNotMatch(
     connectivitySource,
-    /shuffleEdges\(edgeData\.sources,\s*edgeData\.destinations\)/s
+    /(?:sources|destinations|weights): edgeData\.\w+\.slice\(\)/
   );
-  assert.doesNotMatch(connectivitySource, /ratio-based approximation/i);
   assert.match(
     connectivitySource,
-    /const combinedVisibilityBuffers = new Map\(\)/
+    /shuffleEdges\(\s*edgeData\.sources,\s*edgeData\.destinations,\s*edgeData\.weights\s*\)/s
+  );
+  assert.match(
+    connectivitySource,
+    /loadedEdgeData = publishedEdgeData/
+  );
+  assert.doesNotMatch(connectivitySource, /ratio-based approximation/i);
+  assert.doesNotMatch(
+    connectivitySource,
+    /combinedVisibilityBuffers|cachedCombinedVisibility/
   );
   assert.match(
     connectivitySource,
@@ -2676,15 +2667,45 @@ test('connectivity edge publication has one abortable generation owner', async (
   );
   assert.match(
     connectivitySource,
-    /viewer\.getViewDimension\(snapshot\.id\)/
+    /viewer\.getViewDimension\(viewId\)/
   );
   assert.match(
     connectivitySource,
-    /getCombinedVisibility\(\s*'live',\s*viewer\.getViewDimension\('live'\)\s*\)/s
+    /getConnectivityVisibilityOwner\(\s*'live',\s*viewer\.getViewDimension\('live'\)\s*\)/s
   );
   assert.doesNotMatch(
     connectivitySource,
-    /getCombinedVisibility\(\s*\)/
+    /getCombinedVisibility|getLodVisibilityArray/
+  );
+  assert.match(
+    connectivitySource,
+    /viewer\.getCurrentLodMembership\(viewId,\s*dimensionLevel\)/
+  );
+  assert.match(
+    connectivitySource,
+    /viewer\.updateEdgeVisibilityV2FromLod\(\s*visibility\.transparency,\s*visibility\.lodMembership\s*\)/s
+  );
+  assert.match(
+    connectivitySource,
+    /viewer\.updateEdgeVisibilityV2ForViewFromLod\(\s*viewId,\s*visibility\.transparency,\s*visibility\.lodMembership\s*\)/s
+  );
+  assert.doesNotMatch(mainSource, /POINT_VISIBILITY_THRESHOLD/);
+  assert.match(
+    connectivitySource,
+    /viewer\.refreshEdgePrefixForView\(viewId\)/
+  );
+  assert.match(
+    connectivitySource,
+    /viewer\.setEdgeVisibleTarget\(currentEdgeLimit\)/
+  );
+  assert.match(connectivitySource, /viewer\.onLodChanged\(event =>/);
+  assert.match(
+    connectivitySource,
+    /updateEdgeVisibilityForView\(viewId\)/
+  );
+  assert.doesNotMatch(
+    connectivitySource,
+    /new Float32Array\(n\)/
   );
 
   const ensureStart = connectivitySource.indexOf(
@@ -2748,7 +2769,14 @@ test('connectivity edge publication has one abortable generation owner', async (
   assert.match(failedPublicationCleanupSource, /loadedEdgeData = null/);
   assert.match(failedPublicationCleanupSource, /edgeSources = null/);
   assert.match(failedPublicationCleanupSource, /edgeDestinations = null/);
-  assert.match(failedPublicationCleanupSource, /visibleEdgePrefixSum = null/);
+  assert.match(
+    failedPublicationCleanupSource,
+    /activeConnectivityStatsViewId = null/
+  );
+  assert.doesNotMatch(
+    connectivitySource,
+    /visibleEdgePrefixSum|cachedConnectivityVisibility/
+  );
   assert.match(
     ensureSource,
     /clearPublishedConnectivityEdges\(\)/

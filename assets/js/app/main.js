@@ -2369,22 +2369,15 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
       const getTotalEdges = () =>
         connectivityManifest === null ? 0 : connectivityManifest.n_edges;
       const EDGE_UI_CAP = 100000000;  // 100M edges max in UI
-
-      // Store edge arrays for accurate visible edge counting
+      // Retain the exact shuffled endpoints for KNN publication. Edge-prefix
+      // counting itself belongs to the viewer's accepted per-view R8 owner.
       let edgeSources = null;
       let edgeDestinations = null;
 
-      // Cached visibility state for edge counting
-      let cachedCombinedVisibility = null; // Combined: filter AND LOD visibility
-      let lastLodLevel = -1;               // Track LOD level for change detection
+      // UI statistics describe only the active pane, while every pane owns its
+      // exact raw shuffled prefix inside the viewer.
+      let activeConnectivityStatsViewId = null;
       let actualVisibleEdges = getTotalEdges();
-
-      // Reusable per-view buffers for combined visibility (avoids GC pressure
-      // without allowing one snapshot to overwrite the live-view result).
-      const combinedVisibilityBuffers = new Map();
-
-      // Prefix sum for accurate LOD limit calculation
-      let visibleEdgePrefixSum = null;
 
       /**
        * Fisher-Yates shuffle for edge arrays (in-place, synchronized).
@@ -2396,16 +2389,55 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
       }
 
       /**
-       * Combine filter visibility with LOD visibility.
-       * An edge is visible only if BOTH endpoints pass filters AND are visible at current LOD.
+       * Validate one immutable SpatialIndex-owned LOD admission descriptor.
+       * Null is the exact full-detail contract.
        *
-       * Performance: Reuses buffer, returns filterVis directly when LOD is disabled/full detail.
+       * @param {object|null} membership
+       * @param {number} pointCount
+       * @param {number} dimensionLevel
+       * @returns {object|null}
+       */
+      function requireConnectivityLodMembership(
+        membership,
+        pointCount,
+        dimensionLevel
+      ) {
+        if (membership === null) return null;
+        if (
+          typeof membership !== 'object' ||
+          Array.isArray(membership) ||
+          Object.keys(membership).sort().join(',') !==
+            'admissionLevels,dimensionLevel,generationToken,indices,lodLevel,pointCount' ||
+          !Object.isFrozen(membership) ||
+          !(membership.admissionLevels instanceof Uint8Array) ||
+          membership.admissionLevels.length !== pointCount ||
+          !(membership.indices instanceof Uint32Array) ||
+          membership.indices.length > pointCount ||
+          membership.pointCount !== pointCount ||
+          membership.dimensionLevel !== dimensionLevel ||
+          !Number.isInteger(membership.lodLevel) ||
+          membership.lodLevel < 0 ||
+          membership.lodLevel >= 0xff ||
+          membership.generationToken === null ||
+          typeof membership.generationToken !== 'object'
+        ) {
+          throw new TypeError(
+            'Connectivity LOD requires one exact immutable admission owner.'
+          );
+        }
+        return membership;
+      }
+
+      /**
+       * Resolve one exact compositional visibility owner.
+       * An endpoint is visible only when its per-view Float32 transparency
+       * passes the scatter threshold and its current LOD admits the source ID.
        *
        * @param {string} viewId - Exact live or snapshot view ID.
-       * @param {number} dimensionLevel - Exact dimension level for LOD calculation.
-       * @returns {Float32Array|null} Combined visibility array
+       * @param {number} dimensionLevel - Exact view dimension.
+       * @returns {{transparency: Float32Array, lodMembership: object|null, pointCount: number}}
        */
-      function getCombinedVisibility(viewId, dimensionLevel) {
+      function getConnectivityVisibilityOwner(viewId, dimensionLevel) {
         if (typeof viewId !== 'string' || viewId.length === 0) {
           throw new TypeError(
             'Connectivity visibility requires one exact non-empty view id.'
@@ -2420,65 +2452,39 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
             'Connectivity visibility requires an exact 1D, 2D, or 3D dimension.'
           );
         }
-        // Get filter visibility:
+        // Get filter transparency:
         // - For live view: use state.getVisibilityArray()
         // - For snapshots: use snapshot's transparency if it has its own filters
-        let filterVis;
+        let transparency;
         if (viewId === 'live') {
-          filterVis = state.getVisibilityArray();
+          transparency = state.getVisibilityArray();
         } else {
-          filterVis = viewer.getViewTransparency(viewId);
+          transparency = viewer.getViewTransparency(viewId);
         }
 
-        // Get LOD visibility for this specific view and dimension
-        const lodVis = viewer.getLodVisibilityArray(viewId, dimensionLevel);
-
         if (
-          !(filterVis instanceof Float32Array) ||
+          !(transparency instanceof Float32Array) ||
           connectivityManifest === null ||
-          filterVis.length !== connectivityManifest.n_cells
+          transparency.length !== connectivityManifest.n_cells
         ) {
           throw new TypeError(
             'Connectivity filtering requires one exact Float32 visibility ' +
             'value per cell.'
           );
         }
-        if (lodVis === null) {
-          return filterVis;
-        }
-        if (
-          !(lodVis instanceof Float32Array) ||
-          lodVis.length !== filterVis.length
-        ) {
-          throw new TypeError(
-            'Connectivity LOD requires one exact Float32 visibility value ' +
-            'per cell.'
-          );
-        }
 
-        const n = filterVis.length;
+        const pointCount = transparency.length;
+        const lodMembership = requireConnectivityLodMembership(
+          viewer.getCurrentLodMembership(viewId, dimensionLevel),
+          pointCount,
+          dimensionLevel
+        );
 
-        const bufferKey = viewId;
-        let combinedVisibilityBuffer =
-          combinedVisibilityBuffers.get(bufferKey);
-        if (
-          combinedVisibilityBuffer === undefined ||
-          combinedVisibilityBuffer.length !== n
-        ) {
-          combinedVisibilityBuffer = new Float32Array(n);
-          combinedVisibilityBuffers.set(
-            bufferKey,
-            combinedVisibilityBuffer
-          );
-        }
-
-        // Combined visibility = filter AND LOD
-        // For transparency arrays, use threshold of 0.01 (nearly transparent = hidden)
-        for (let i = 0; i < n; i++) {
-          combinedVisibilityBuffer[i] = (filterVis[i] > 0.01 && lodVis[i] > 0.5) ? 1.0 : 0.0;
-        }
-
-        return combinedVisibilityBuffer;
+        return Object.freeze({
+          transparency,
+          lodMembership,
+          pointCount
+        });
       }
 
       // Format edge count for display (compact)
@@ -2491,93 +2497,6 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
         if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
         if (n >= 1000) return (n / 1000).toFixed(0) + 'k';
         return n.toString();
-      }
-
-      /**
-       * Count visible edges accurately by checking both endpoints.
-       * Builds a prefix sum for exact LOD limit calculation via binary search.
-       * O(nEdges) but uses typed arrays for speed.
-       * @param {Float32Array} visibility - Per-cell visibility (0 or 1)
-       * @returns {{visibleCount: number}}
-       */
-      function countVisibleEdges(visibility) {
-        if (
-          !(edgeSources instanceof Uint32Array) ||
-          !(edgeDestinations instanceof Uint32Array) ||
-          edgeSources.length !== edgeDestinations.length ||
-          !(visibility instanceof Float32Array) ||
-          connectivityManifest === null ||
-          edgeSources.length !== connectivityManifest.n_edges ||
-          visibility.length !== connectivityManifest.n_cells
-        ) {
-          throw new TypeError(
-            'Visible-edge counting requires exact render-owned edge and ' +
-            'visibility arrays.'
-          );
-        }
-        const n = edgeSources.length;
-
-        // Build prefix sum: prefixSum[i] = number of visible edges in [0, i)
-        // Use Uint32Array for memory efficiency (supports up to 4B edges)
-        if (!visibleEdgePrefixSum || visibleEdgePrefixSum.length !== n + 1) {
-          visibleEdgePrefixSum = new Uint32Array(n + 1);
-        }
-
-        visibleEdgePrefixSum[0] = 0;
-        for (let i = 0; i < n; i++) {
-          const src = edgeSources[i];
-          const dst = edgeDestinations[i];
-          const isVisible = (visibility[src] > 0.5 && visibility[dst] > 0.5) ? 1 : 0;
-          visibleEdgePrefixSum[i + 1] = visibleEdgePrefixSum[i] + isVisible;
-        }
-
-        return { visibleCount: visibleEdgePrefixSum[n] };
-      }
-
-      /**
-       * Find exact LOD limit to show targetVisible edges using binary search on prefix sum.
-       * Since edges are shuffled, this gives us exactly targetVisible random edges.
-       * @param {number} targetVisible - Desired number of visible edges
-       * @returns {number} - Exact LOD limit
-       */
-      function findLodLimitFast(targetVisible) {
-        if (
-          !(edgeSources instanceof Uint32Array) ||
-          !(edgeDestinations instanceof Uint32Array) ||
-          edgeSources.length !== edgeDestinations.length
-        ) {
-          throw new Error(
-            'Exact edge LOD requires the current render-owned edge arrays.'
-          );
-        }
-        if (targetVisible >= actualVisibleEdges) {
-          return edgeSources.length;
-        }
-        if (actualVisibleEdges <= 0 || targetVisible <= 0) {
-          return 0;
-        }
-
-        if (
-          !(visibleEdgePrefixSum instanceof Uint32Array) ||
-          visibleEdgePrefixSum.length !== edgeSources.length + 1
-        ) {
-          throw new Error(
-            'Exact edge LOD requires the current visibility prefix sum.'
-          );
-        }
-
-        // Find the smallest prefix containing targetVisible visible edges.
-        let lo = 0;
-        let hi = visibleEdgePrefixSum.length - 1;
-        while (lo < hi) {
-          const mid = (lo + hi) >>> 1;
-          if (visibleEdgePrefixSum[mid] < targetVisible) {
-            lo = mid + 1;
-          } else {
-            hi = mid;
-          }
-        }
-        return lo;
       }
 
       // Track current state - user's preference, NOT auto-adjusted by visibility changes
@@ -2635,18 +2554,34 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
        * Only edges where both endpoints pass filters AND are visible at current LOD are shown.
        */
       function applyEdgeLodLimit() {
-        if (cachedCombinedVisibility === null) {
+        const activeViewId = state.getActiveViewId();
+        const currentStats =
+          viewer.getEdgePrefixStatsForView(activeViewId);
+        if (currentStats === null || currentStats.current !== true) {
           throw new Error(
-            'Exact edge LOD requires current combined visibility.'
+            `Exact edge LOD requires the current active-view prefix owner ` +
+            `for "${activeViewId}".`
           );
         }
 
-        // Calculate the exact render prefix containing currentEdgeLimit
-        // visible edges.
-        const targetVisible = Math.min(currentEdgeLimit, actualVisibleEdges);
-        const lodLimit = findLodLimitFast(targetVisible);
-        viewer.setEdgeLodLimit(lodLimit);
-        updateConnectivityInfo(actualVisibleEdges, targetVisible);
+        // One stable user target is resolved transactionally into a separate
+        // exact raw prefix for every current pane.
+        viewer.setEdgeVisibleTarget(currentEdgeLimit);
+        const acceptedStats =
+          viewer.getEdgePrefixStatsForView(activeViewId);
+        if (
+          acceptedStats === null ||
+          acceptedStats.current !== true ||
+          acceptedStats.visibleCount !== actualVisibleEdges
+        ) {
+          throw new Error(
+            `Connectivity target publication for view "${activeViewId}" was incomplete.`
+          );
+        }
+        updateConnectivityInfo(
+          actualVisibleEdges,
+          Math.min(currentEdgeLimit, actualVisibleEdges)
+        );
       }
 
       // Initial slider setup and info display
@@ -2749,12 +2684,9 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
         loadedEdgeData = null;
         edgeSources = null;
         edgeDestinations = null;
-        cachedCombinedVisibility = null;
-        visibleEdgePrefixSum = null;
-        combinedVisibilityBuffers.clear();
+        activeConnectivityStatsViewId = null;
         actualVisibleEdges = 0;
         currentEdgeLimit = 0;
-        lastLodLevel = -1;
         stopLodTracking();
         if (edgeVisibilityThrottleTimer !== null) {
           clearTimeout(edgeVisibilityThrottleTimer);
@@ -2791,17 +2723,21 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
 
       function publishConnectivityEdges(owner, edgeData) {
         assertCurrentConnectivityLoadOwner(owner);
-        const renderEdgeData = Object.freeze({
-          ...edgeData,
-          sources: edgeData.sources.slice(),
-          destinations: edgeData.destinations.slice(),
-          weights: edgeData.weights.slice()
-        });
+        // The loader result is a private, unpublished generation. Shuffle its
+        // typed owners directly instead of retaining a second 16-byte-per-edge
+        // copy at the 100M-edge ceiling.
         shuffleEdges(
-          renderEdgeData.sources,
-          renderEdgeData.destinations,
-          renderEdgeData.weights
+          edgeData.sources,
+          edgeData.destinations,
+          edgeData.weights
         );
+        const renderEdgeData = Object.freeze({
+          destinations: edgeData.destinations,
+          nCells: edgeData.nCells,
+          nEdges: edgeData.nEdges,
+          sources: edgeData.sources,
+          weights: edgeData.weights,
+        });
         assertCurrentConnectivityLoadOwner(owner);
 
         edgeSources = renderEdgeData.sources;
@@ -2827,59 +2763,79 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
           }
         }
 
-        cachedCombinedVisibility = getCombinedVisibility(
+        const activeViewId = state.getActiveViewId();
+        const liveVisibility = getConnectivityVisibilityOwner(
           'live',
           viewer.getViewDimension('live')
         );
-        if (cachedCombinedVisibility !== null) {
+        if (
+          viewer.updateEdgeVisibilityV2FromLod(
+            liveVisibility.transparency,
+            liveVisibility.lodMembership
+          ) !== true
+        ) {
+          throw new Error(
+            'The viewer rejected live connectivity visibility.'
+          );
+        }
+        const liveStats = viewer.refreshEdgePrefixForView('live');
+        let activeStats =
+          activeViewId === 'live' ? liveStats : null;
+        for (const snapshot of existingSnapshots) {
+          const snapshotDimension = viewer.getViewDimension(
+            snapshot.id
+          );
+          const snapshotVisibility = getConnectivityVisibilityOwner(
+            snapshot.id,
+            snapshotDimension
+          );
           if (
-            viewer.updateEdgeVisibilityV2(
-              cachedCombinedVisibility
+            viewer.updateEdgeVisibilityV2ForViewFromLod(
+              snapshot.id,
+              snapshotVisibility.transparency,
+              snapshotVisibility.lodMembership
             ) !== true
           ) {
             throw new Error(
-              'The viewer rejected live connectivity visibility.'
+              `The viewer rejected connectivity visibility for view ` +
+              `"${snapshot.id}".`
             );
           }
-          for (const snapshot of existingSnapshots) {
-            const snapshotDimension = viewer.getViewDimension(
-              snapshot.id
-            );
-            const snapshotVisibility = getCombinedVisibility(
-              snapshot.id,
-              snapshotDimension
-            );
-            if (snapshotVisibility !== null) {
-              if (
-                viewer.updateEdgeVisibilityV2ForView(
-                  snapshot.id,
-                  snapshotVisibility
-                ) !== true
-              ) {
-                throw new Error(
-                  `The viewer rejected connectivity visibility for view ` +
-                  `"${snapshot.id}".`
-                );
-              }
-            }
+          const snapshotStats =
+            viewer.refreshEdgePrefixForView(snapshot.id);
+          if (snapshot.id === activeViewId) {
+            activeStats = snapshotStats;
           }
-          const { visibleCount } = countVisibleEdges(
-            cachedCombinedVisibility
-          );
-          actualVisibleEdges = visibleCount;
         }
-        lastLodLevel = viewer.getCurrentLODLevel(state.getActiveViewId());
+        if (activeStats === null || activeStats.current !== true) {
+          throw new Error(
+            `Connectivity publication cannot resolve active view ` +
+            `"${activeViewId}".`
+          );
+        }
+        activeConnectivityStatsViewId = activeViewId;
+        actualVisibleEdges = activeStats.visibleCount;
         updateSliderRange(actualVisibleEdges);
         applyEdgeLodLimit();
 
-        loadedEdgeData = edgeData;
+        // Float64 weights are needed only for the one GPU normalization/upload
+        // above. The retained lifecycle/KNN owner aliases the already-shuffled
+        // endpoints and lets the 8-byte-per-edge weight generation be
+        // collected immediately after this publication returns.
+        const publishedEdgeData = Object.freeze({
+          destinations: edgeDestinations,
+          nCells: edgeData.nCells,
+          nEdges: edgeData.nEdges,
+          sources: edgeSources,
+        });
+        loadedEdgeData = publishedEdgeData;
         edgesLoaded = true;
         debug.log(
           `[Main] Connectivity generation published: ` +
           `${edgeData.nEdges} edges, ${edgeData.nCells} cells, ` +
           `${actualVisibleEdges} visible.`
         );
-        return edgeData;
+        return publishedEdgeData;
       }
 
       function clearPublishedConnectivityEdges() {
@@ -2890,12 +2846,9 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
         loadedEdgeData = null;
         edgeSources = null;
         edgeDestinations = null;
-        cachedCombinedVisibility = null;
-        visibleEdgePrefixSum = null;
-        combinedVisibilityBuffers.clear();
+        activeConnectivityStatsViewId = null;
         actualVisibleEdges = getTotalEdges();
         currentEdgeLimit = Math.min(250000, actualVisibleEdges);
-        lastLodLevel = -1;
         stopLodTracking();
         if (edgeVisibilityThrottleTimer !== null) {
           clearTimeout(edgeVisibilityThrottleTimer);
@@ -3002,7 +2955,25 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
             }
           } else if (show && edgesLoaded) {
             // Already loaded - just update combined visibility for all views
-            updateEdgeVisibilityCore();
+            try {
+              updateEdgeVisibilityCore();
+            } catch (error) {
+              console.error(
+                'Failed to refresh connectivity visibility:',
+                error
+              );
+              connectivityCheckbox.checked = false;
+              viewer.setShowConnectivity(false);
+              if (connectivitySliders) {
+                connectivitySliders.style.display = 'none';
+              }
+              stopLodTracking();
+              notifications.error(
+                'Connectivity could not be enabled because GPU visibility upload failed.',
+                { category: 'connectivity' }
+              );
+              return;
+            }
           }
 
           viewer.setShowConnectivity(show);
@@ -3019,74 +2990,104 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
         });
       }
 
-      /**
-       * Update edge visibility with combined filter + LOD visibility.
-       * Called when filters change or LOD level changes.
-       * Updates all views (live + snapshots) for proper multi-view support.
-       */
-      function updateEdgeVisibilityCore() {
+      function updateEdgeVisibilityForView(
+        viewId,
+        publishActive = true
+      ) {
         if (!edgesLoaded) return;
-
-        // Update live view edges
-        cachedCombinedVisibility = getCombinedVisibility(
-          'live',
-          viewer.getViewDimension('live')
+        const visibility = getConnectivityVisibilityOwner(
+          viewId,
+          viewer.getViewDimension(viewId)
         );
-        if (cachedCombinedVisibility === null) {
-          throw new Error(
-            'Connectivity visibility is unavailable for the live view.'
-          );
-        }
-
-        if (
-          viewer.updateEdgeVisibilityV2(
-            cachedCombinedVisibility
-          ) !== true
-        ) {
-          throw new Error(
-            'The viewer rejected live connectivity visibility.'
-          );
-        }
-
-        // Update all snapshot views' edge visibility
-        const snapshots = viewer.getSnapshotViews();
-        for (const snapshot of snapshots) {
-          const snapshotVis = getCombinedVisibility(
-            snapshot.id,
-            viewer.getViewDimension(snapshot.id)
-          );
-          if (snapshotVis === null) {
-            throw new Error(
-              `Connectivity visibility is unavailable for view ` +
-              `"${snapshot.id}".`
-            );
-          }
+        if (viewId === 'live') {
           if (
-            viewer.updateEdgeVisibilityV2ForView(
-              snapshot.id,
-              snapshotVis
+            viewer.updateEdgeVisibilityV2FromLod(
+              visibility.transparency,
+              visibility.lodMembership
             ) !== true
           ) {
             throw new Error(
-              `The viewer rejected connectivity visibility for view ` +
-              `"${snapshot.id}".`
+              'The viewer rejected live connectivity visibility.'
             );
           }
+        } else if (
+          viewer.updateEdgeVisibilityV2ForViewFromLod(
+            viewId,
+            visibility.transparency,
+            visibility.lodMembership
+          ) !== true
+        ) {
+          throw new Error(
+            `The viewer rejected connectivity visibility for view ` +
+            `"${viewId}".`
+          );
         }
+        const stats = viewer.refreshEdgePrefixForView(viewId);
+        if (publishActive) {
+          publishActiveConnectivityCounts(viewId, stats);
+        }
+        return stats;
+      }
 
-        // Count actual visible edges (both endpoints visible) - for live view
-        const { visibleCount } = countVisibleEdges(cachedCombinedVisibility);
-        actualVisibleEdges = visibleCount;
-
-        // Update slider range (dynamic) and apply LOD limit
+      function publishActiveConnectivityCounts(viewId, stats) {
+        if (viewId !== state.getActiveViewId()) return;
+        if (
+          stats === null ||
+          stats.current !== true ||
+          stats.viewId !== viewId
+        ) {
+          throw new Error(
+            `Connectivity UI requires current prefix statistics for view "${viewId}".`
+          );
+        }
+        activeConnectivityStatsViewId = viewId;
+        actualVisibleEdges = stats.visibleCount;
         updateSliderRange(actualVisibleEdges);
         if (connectivityCheckbox?.checked) {
           applyEdgeLodLimit();
         }
       }
 
-      // Throttled version: executes immediately, then ignores calls for 32ms
-      // with a trailing call if any were skipped
+      function updateActiveConnectivityCounts() {
+        if (!edgesLoaded) return;
+        const activeViewId = state.getActiveViewId();
+        const stats = viewer.refreshEdgePrefixForView(activeViewId);
+        publishActiveConnectivityCounts(
+          activeViewId,
+          stats
+        );
+      }
+
+      /**
+       * Update edge visibility with combined filter + LOD visibility.
+       * Re-enabling connectivity may follow hidden LOD changes in any pane, so
+       * that lifecycle refreshes every exact texture. Ordinary filter
+       * publications are already synchronized directly by the viewer and only
+       * need the active view's edge prefix/count below.
+       */
+      function updateEdgeVisibilityCore() {
+        if (!edgesLoaded) return;
+        const activeViewId = state.getActiveViewId();
+        let activeStats = null;
+        const liveStats = updateEdgeVisibilityForView('live', false);
+        if (activeViewId === 'live') activeStats = liveStats;
+        for (const snapshot of viewer.getSnapshotViews()) {
+          const snapshotStats =
+            updateEdgeVisibilityForView(snapshot.id, false);
+          if (snapshot.id === activeViewId) {
+            activeStats = snapshotStats;
+          }
+        }
+        if (activeStats === null) {
+          throw new Error(
+            `Connectivity refresh cannot resolve active view "${activeViewId}".`
+          );
+        }
+        publishActiveConnectivityCounts(activeViewId, activeStats);
+      }
+
+      // Throttled active-view edge counting: executes immediately, then
+      // ignores calls for 32ms with a trailing call if any were skipped.
       let edgeVisibilityThrottleTimer = null;
       let edgeVisibilityPending = false;
       function updateEdgeVisibility() {
@@ -3096,44 +3097,131 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
           return;
         }
         // Execute immediately
-        updateEdgeVisibilityCore();
+        updateActiveConnectivityCounts();
         // Start throttle period
         edgeVisibilityThrottleTimer = setTimeout(() => {
           edgeVisibilityThrottleTimer = null;
           if (edgeVisibilityPending) {
             edgeVisibilityPending = false;
-            updateEdgeVisibilityCore();
+            updateActiveConnectivityCounts();
           }
         }, 32); // ~2 frames at 60fps
       }
 
-      // Update edges when filter visibility changes
+      // Point transparency publication has already updated the active view's
+      // connectivity texture transactionally inside the viewer. Recompute only
+      // the edge-prefix/UI owner here, avoiding a duplicate point-count scan
+      // and upload attempt on every slider event.
       const onVisibilityChange = () => {
+        if (
+          edgesLoaded &&
+          activeConnectivityStatsViewId !== state.getActiveViewId()
+        ) {
+          // Active-view switches are synchronous state transitions. Publish
+          // their exact prefix immediately so a slider event can never consume
+          // the prior view's edge count during the throttle window.
+          updateActiveConnectivityCounts();
+          return;
+        }
         updateEdgeVisibility();
       };
 
-      // Poll for LOD changes (LOD changes during render based on camera distance)
-      let lodCheckInterval = null;
+      // LOD publications occur inside the render stack. Defer connectivity
+      // texture work until that stack has restored its GL baseline, and retain
+      // exact per-view ownership instead of polling only the active view.
+      let lodTrackingActive = false;
+      let lodVisibilityTimer = null;
+      const pendingLodViewIds = new Set();
+      const lodVisibilityRetryCounts = new Map();
+      const MAX_LOD_VISIBILITY_RETRIES = 2;
       function startLodTracking() {
-        if (lodCheckInterval) return;
-        lodCheckInterval = setInterval(() => {
-          if (!edgesLoaded || !connectivityCheckbox?.checked) return;
-
-          const currentLod = viewer.getCurrentLODLevel(state.getActiveViewId());
-          if (currentLod !== lastLodLevel) {
-            debug.log(`[Edges] LOD changed: ${lastLodLevel} → ${currentLod}`);
-            lastLodLevel = currentLod;
-            updateEdgeVisibility();
-          }
-        }, 200); // Check every 200ms
+        lodTrackingActive = true;
       }
 
       function stopLodTracking() {
-        if (lodCheckInterval) {
-          clearInterval(lodCheckInterval);
-          lodCheckInterval = null;
+        lodTrackingActive = false;
+        pendingLodViewIds.clear();
+        lodVisibilityRetryCounts.clear();
+        if (lodVisibilityTimer !== null) {
+          clearTimeout(lodVisibilityTimer);
+          lodVisibilityTimer = null;
         }
       }
+
+      function scheduleLodVisibilityRefresh(delayMs = 0) {
+        if (
+          !lodTrackingActive ||
+          lodVisibilityTimer !== null ||
+          pendingLodViewIds.size === 0
+        ) return;
+        lodVisibilityTimer = setTimeout(() => {
+          lodVisibilityTimer = null;
+          const pendingViews = [...pendingLodViewIds];
+          pendingLodViewIds.clear();
+          const currentSnapshots = new Set(
+            viewer.getSnapshotViews().map(snapshot => snapshot.id)
+          );
+          let terminalError = null;
+          for (const viewId of pendingViews) {
+            if (
+              viewId !== 'live' &&
+              !currentSnapshots.has(viewId)
+            ) {
+              lodVisibilityRetryCounts.delete(viewId);
+              continue;
+            }
+            debug.log(
+              `[Edges] LOD publication for ${viewId}; refreshing connectivity.`
+            );
+            try {
+              updateEdgeVisibilityForView(viewId);
+              lodVisibilityRetryCounts.delete(viewId);
+            } catch (error) {
+              const attempts =
+                (lodVisibilityRetryCounts.get(viewId) ?? 0) + 1;
+              lodVisibilityRetryCounts.set(viewId, attempts);
+              if (
+                attempts <= MAX_LOD_VISIBILITY_RETRIES &&
+                lodTrackingActive &&
+                edgesLoaded &&
+                connectivityCheckbox?.checked
+              ) {
+                pendingLodViewIds.add(viewId);
+              } else if (terminalError === null) {
+                terminalError = error;
+              }
+            }
+          }
+          if (terminalError !== null) {
+            console.error(
+              'Connectivity LOD visibility refresh failed:',
+              terminalError
+            );
+            connectivityCheckbox.checked = false;
+            viewer.setShowConnectivity(false);
+            if (connectivitySliders) {
+              connectivitySliders.style.display = 'none';
+            }
+            stopLodTracking();
+            notifications.error(
+              'Connectivity was disabled after repeated GPU visibility upload failures.',
+              { category: 'connectivity' }
+            );
+            return;
+          }
+          scheduleLodVisibilityRefresh(16);
+        }, delayMs);
+      }
+
+      viewer.onLodChanged(event => {
+        if (
+          !lodTrackingActive ||
+          !edgesLoaded ||
+          !connectivityCheckbox?.checked
+        ) return;
+        pendingLodViewIds.add(event.viewId);
+        scheduleLodVisibilityRefresh();
+      });
       state.on('visibility:changed', onVisibilityChange);
 
       // Wire up color picker
@@ -3305,6 +3393,10 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
     const hpLodForceContainer = document.getElementById('lod-force-container');
     const hpLodForce = document.getElementById('hp-lod-force');
     const hpLodForceLabel = document.getElementById('hp-lod-force-label');
+    let acceptedFrustumEnabled =
+      hpFrustumCulling?.checked ?? false;
+    let acceptedLodEnabled = hpLodEnabled?.checked ?? false;
+    let acceptedForceLodValue = hpLodForce?.value ?? '-1';
 
     // Performance tracker for FPS monitoring (lazy-loaded with benchmark module)
     let perfTracker = null;
@@ -3541,31 +3633,119 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
       });
     }
 
+    const reportRendererControlFailure = (control, error) => {
+      const exactError = error instanceof Error
+        ? error
+        : new Error(String(error));
+      console.error(
+        `[Main] ${control} could not be changed:`,
+        exactError
+      );
+      try {
+        notifications.error(
+          `${control} was not changed: ${exactError.message}`,
+          {
+            category: 'rendering',
+            title: 'Renderer setting unavailable'
+          }
+        );
+      } catch (notificationError) {
+        // Control state is already coherent. Notification delivery is
+        // observational and must not escape the synchronous DOM event.
+        console.error(
+          '[Main] Renderer control failure notification was not delivered:',
+          notificationError
+        );
+      }
+    };
+
     // Frustum culling toggle
     if (hpFrustumCulling) {
       hpFrustumCulling.addEventListener('change', () => {
-        viewer.setFrustumCulling(hpFrustumCulling.checked);
+        const requestedEnabled = hpFrustumCulling.checked;
+        const previousEnabled = acceptedFrustumEnabled;
+        try {
+          viewer.setFrustumCulling(requestedEnabled);
+          acceptedFrustumEnabled = requestedEnabled;
+        } catch (error) {
+          // Renderer feature publication is transactional, so rejection means
+          // its previous semantic value remains authoritative.
+          hpFrustumCulling.checked = previousEnabled;
+          reportRendererControlFailure(
+            'Frustum culling',
+            error
+          );
+        }
       });
     }
 
     // LOD enabled toggle
     if (hpLodEnabled) {
       hpLodEnabled.addEventListener('change', () => {
-        viewer.setAdaptiveLOD(hpLodEnabled.checked);
-        // Show/hide force LOD slider
-        if (hpLodForceContainer) {
-          hpLodForceContainer.style.display = hpLodEnabled.checked ? 'block' : 'none';
-        }
-        // Reset force LOD slider to auto when enabling OR disabling LOD
-        // When disabling: ensures UI stays in sync with renderer (which resets forceLODLevel to -1)
-        // When enabling: starts fresh in auto mode
-        if (hpLodForce) {
-          hpLodForce.value = '-1';
-          if (hpLodForceLabel) hpLodForceLabel.textContent = 'Auto';
-          // Only call setForceLOD when enabling (renderer already resets when disabling)
-          if (hpLodEnabled.checked) {
+        const requestedEnabled = hpLodEnabled.checked;
+        const previousEnabled = acceptedLodEnabled;
+        const previousForceDisplay =
+          hpLodForceContainer?.style.display ?? '';
+        const previousForceValue = acceptedForceLodValue;
+        const previousForceLabel =
+          hpLodForceLabel?.textContent ?? 'Auto';
+        let featurePublished = false;
+        try {
+          viewer.setAdaptiveLOD(requestedEnabled);
+          featurePublished = true;
+          // Enabling starts from adaptive mode. Disabling already resets the
+          // renderer's global force level as part of the atomic toggle.
+          if (requestedEnabled && hpLodForce) {
             viewer.setForceLOD(-1);
           }
+          if (hpLodForceContainer) {
+            hpLodForceContainer.style.display =
+              requestedEnabled ? 'block' : 'none';
+          }
+          if (hpLodForce) {
+            hpLodForce.value = '-1';
+          }
+          if (hpLodForceLabel) {
+            hpLodForceLabel.textContent = 'Auto';
+          }
+          acceptedLodEnabled = requestedEnabled;
+          acceptedForceLodValue = '-1';
+        } catch (error) {
+          const failures = [error];
+          if (featurePublished) {
+            try {
+              viewer.setAdaptiveLOD(previousEnabled);
+              if (previousEnabled && hpLodForce) {
+                const previousForceLevel =
+                  Number.parseInt(previousForceValue, 10);
+                if (Number.isInteger(previousForceLevel)) {
+                  viewer.setForceLOD(previousForceLevel);
+                }
+              }
+            } catch (rollbackError) {
+              failures.push(rollbackError);
+            }
+          }
+          hpLodEnabled.checked = previousEnabled;
+          if (hpLodForceContainer) {
+            hpLodForceContainer.style.display =
+              previousForceDisplay;
+          }
+          if (hpLodForce) {
+            hpLodForce.value = previousForceValue;
+          }
+          if (hpLodForceLabel) {
+            hpLodForceLabel.textContent = previousForceLabel;
+          }
+          reportRendererControlFailure(
+            'Adaptive LOD',
+            failures.length === 1
+              ? error
+              : new AggregateError(
+                  failures,
+                  'Adaptive LOD publication and UI rollback failed.'
+                )
+          );
         }
       });
     }
@@ -3574,10 +3754,29 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
     if (hpLodForce) {
       hpLodForce.addEventListener('input', () => {
         const val = parseInt(hpLodForce.value, 10);
-        if (hpLodForceLabel) {
-          hpLodForceLabel.textContent = val < 0 ? 'Auto' : String(val);
+        const previousForceValue = acceptedForceLodValue;
+        try {
+          viewer.setForceLOD(val);
+          acceptedForceLodValue = String(val);
+          if (hpLodForceLabel) {
+            hpLodForceLabel.textContent =
+              val < 0 ? 'Auto' : String(val);
+          }
+        } catch (error) {
+          hpLodForce.value = previousForceValue;
+          if (hpLodForceLabel) {
+            const previousForceLevel =
+              Number.parseInt(previousForceValue, 10);
+            hpLodForceLabel.textContent =
+              previousForceLevel < 0
+                ? 'Auto'
+                : String(previousForceLevel);
+          }
+          reportRendererControlFailure(
+            'Forced LOD level',
+            error
+          );
         }
-        viewer.setForceLOD(val);
       });
     }
 

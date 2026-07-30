@@ -54,6 +54,7 @@ import { createPageSelectorComponent } from './shared/page-selector.js';
 import { createVariableSelectorComponent } from './shared/variable-selector.js';
 import { createFigureContainer } from './shared/figure-container.js';
 import { createRequestIdTracker } from '../shared/cancellable-operation.js';
+import { setOwnDataProperty } from '../../../utils/exact-record.js';
 
 function cloneSettings(value) {
   return structuredClone(value);
@@ -1061,7 +1062,7 @@ export class BaseAnalysisUI {
    * @param {*} value - Option value
    */
   _onPlotOptionChange(key, value) {
-    this._currentConfig.plotOptions[key] = value;
+    setOwnDataProperty(this._currentConfig.plotOptions, key, value);
     this._scheduleUpdate();
   }
 

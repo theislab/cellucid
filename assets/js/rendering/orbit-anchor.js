@@ -12,6 +12,7 @@ import {
   ORBIT_ANCHOR_2D_VS,
   ORBIT_ANCHOR_2D_FS
 } from './shaders/orbit-anchor-shaders.js';
+import { configureStraightAlphaBlending } from './gl-utils.js';
 
 // === ORBIT ANCHOR RENDERER CLASS ===
 
@@ -35,6 +36,26 @@ export class OrbitAnchorRenderer {
 
     // Get attribute and uniform locations
     this._setupLocations();
+  }
+
+  /**
+   * WebGL context loss invalidates all owned handles atomically. No deletion
+   * is legal or useful on this path; detach CPU publications and make every
+   * later lifecycle call inert.
+   */
+  handleContextLost() {
+    if (this._disposed) return false;
+    this._disposeRequested = true;
+    this.viewStates.clear();
+    this._pendingViewRetirements.clear();
+    this.program3D = null;
+    this.program2D = null;
+    this.attribs3D = null;
+    this.uniforms3D = null;
+    this.attribs2D = null;
+    this.uniforms2D = null;
+    this._disposed = true;
+    return true;
   }
 
   dispose() {
@@ -1174,8 +1195,7 @@ export class OrbitAnchorRenderer {
     const camY = viewTarget[1] + viewRadius * Math.sin(viewPhi);
     const camZ = viewTarget[2] + viewRadius * Math.cos(viewTheta) * Math.cos(viewPhi);
 
-    gl.enable(gl.BLEND);
-    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    configureStraightAlphaBlending(gl);
 
     if (use3D) {
       gl.useProgram(this.program3D);

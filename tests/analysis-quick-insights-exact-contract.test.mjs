@@ -52,6 +52,11 @@ function quickInsightsHarness({
   categoricalFields = [{ key: 'cell_type', name: 'Cell type' }],
   continuousFields = [],
   fetchBulkObsFields,
+  pages = [{
+    id: 'page-1',
+    name: 'Page 1',
+    highlightedGroups: [],
+  }],
 } = {}) {
   const insights = Object.create(QuickInsights.prototype);
   insights._selectedCategoricalObsKeys = categoricalFields.map(field => field.key);
@@ -60,11 +65,7 @@ function quickInsightsHarness({
   insights._hasUserSelectedContinuousObsFields = true;
   insights.dataLayer = {
     getPages() {
-      return [{
-        id: 'page-1',
-        name: 'Page 1',
-        highlightedGroups: [],
-      }];
+      return pages;
     },
     getCellCountForPageId() {
       return 1;
@@ -116,6 +117,68 @@ test('Quick Insights rejects a missing requested field instead of returning part
     insights._computeInsights(['page-1'], new AbortController().signal),
     /requested observation field "cell_type" is missing/i,
   );
+});
+
+test('Quick Insights preserves prototype-named field and page cross-products', async () => {
+  const exactNames = Object.getOwnPropertyNames(Object.prototype);
+  const pages = exactNames.map(id => ({
+    id,
+    name: `Page ${id}`,
+    highlightedGroups: [],
+  }));
+  const continuousFields = exactNames.map(key => ({
+    key,
+    name: `Field ${key}`,
+  }));
+  const fields = Object.fromEntries(
+    exactNames.map((key, fieldIndex) => [
+      key,
+      {
+        values: Float32Array.from(
+          { length: exactNames.length },
+          (_, pageIndex) => fieldIndex * 100 + pageIndex,
+        ),
+      },
+    ]),
+  );
+  const pageData = Object.fromEntries(
+    exactNames.map((pageId, pageIndex) => [
+      pageId,
+      {
+        cellIndices: Uint32Array.of(pageIndex),
+      },
+    ]),
+  );
+  const insights = quickInsightsHarness({
+    categoricalFields: [],
+    continuousFields,
+    fetchBulkObsFields: async () => ({
+      fields,
+      pageData,
+      stats: {
+        cellsTotal: exactNames.length,
+        fieldsLoaded: exactNames.length,
+        loadTimeMs: 1,
+      },
+    }),
+    pages,
+  });
+
+  const result = await insights._computeInsights(
+    exactNames,
+    new AbortController().signal,
+  );
+
+  assert.deepEqual(result.pages.map(page => page.id), exactNames);
+  assert.equal(result.totalCells, exactNames.length);
+  assert.deepEqual(
+    result.continuousSummaries.map(summary => summary.field),
+    exactNames,
+  );
+  for (const summary of result.continuousSummaries) {
+    assert.equal(summary.count, exactNames.length, summary.field);
+    assert.equal(summary.missingCount, 0, summary.field);
+  }
 });
 
 test('Quick Insights categorical summaries require exact raw codes and categories', () => {

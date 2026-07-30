@@ -83,13 +83,30 @@ function createProjectileHarness({ failedBufferIds = [] } = {}) {
     BLEND: 0x0be2,
     DYNAMIC_DRAW: 0x88e8,
     FLOAT: 0x1406,
+    FUNC_ADD: 0x8006,
     ONE: 1,
     ONE_MINUS_SRC_ALPHA: 0x0303,
     POINTS: 0,
     SRC_ALPHA: 0x0302,
     UNSIGNED_BYTE: 0x1401,
     bindBuffer() {},
-    blendFunc() {},
+    blendEquation(value) {
+      assert.equal(value, this.FUNC_ADD);
+    },
+    blendFuncSeparate(
+      sourceRgb,
+      destinationRgb,
+      sourceAlpha,
+      destinationAlpha,
+    ) {
+      assert.equal(sourceRgb, this.SRC_ALPHA);
+      assert.ok(
+        destinationRgb === this.ONE ||
+        destinationRgb === this.ONE_MINUS_SRC_ALPHA,
+      );
+      assert.equal(sourceAlpha, this.ONE);
+      assert.equal(destinationAlpha, this.ONE_MINUS_SRC_ALPHA);
+    },
     bufferData() {
       calls.bufferData += 1;
     },
@@ -348,6 +365,27 @@ test('projectile disposal attempts every buffer and retries only failed handles'
   assert.equal(system.dispose(), false);
 });
 
+test('projectile context loss drops invalid buffers without issuing GL deletion', () => {
+  const {
+    deleteAttempts,
+    drawParams,
+    system,
+  } = createProjectileHarness();
+
+  system.setEnabled(true);
+  assert.equal(system.handleContextLost(), true);
+  assert.equal(system.handleContextLost(), false);
+  assert.equal(deleteAttempts.size, 0);
+  assert.throws(
+    () => system.setEnabled(true),
+    /disposing projectile system cannot be re-enabled/i
+  );
+  system.update(1);
+  system.draw(drawParams);
+  assert.equal(system.dispose(), false);
+  assert.equal(deleteAttempts.size, 0);
+});
+
 test('orbit view retirement detaches first and retries only failed buffers', () => {
   const state = createOrbitState('snap');
   const failedIds = [
@@ -389,6 +427,28 @@ test('orbit view retirement detaches first and retries only failed buffers', () 
     }
   }
   assert.equal(renderer.deleteViewState('snap'), false);
+});
+
+test('orbit context loss drops every invalid handle without GL retirement', () => {
+  const {
+    bufferDeleteAttempts,
+    programDeleteAttempts,
+    renderer,
+  } = createOrbitHarness({
+    states: [['live', createOrbitState('live')]],
+  });
+
+  assert.equal(renderer.handleContextLost(), true);
+  assert.equal(renderer.handleContextLost(), false);
+  assert.equal(renderer.viewStates.size, 0);
+  assert.equal(renderer._pendingViewRetirements.size, 0);
+  assert.equal(renderer.program3D, null);
+  assert.equal(renderer.program2D, null);
+  assert.equal(bufferDeleteAttempts.size, 0);
+  assert.equal(programDeleteAttempts.size, 0);
+  assert.equal(renderer.dispose(), false);
+  assert.equal(bufferDeleteAttempts.size, 0);
+  assert.equal(programDeleteAttempts.size, 0);
 });
 
 test('orbit disposal detaches all views and attempts every program and buffer', () => {

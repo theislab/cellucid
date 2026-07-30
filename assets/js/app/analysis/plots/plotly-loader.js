@@ -74,6 +74,7 @@
 
 import { attachPlotlyHints, hidePlotlyNativeHints } from './plotly-hints.js';
 import { applyThemeToAllPlots, getPlotTheme, invalidatePlotThemeCache } from '../shared/plot-theme.js';
+import { setOwnDataProperty } from '../../../utils/exact-record.js';
 
 // Keep Plotly charts in sync with the active CSS theme.
 if (typeof window !== 'undefined') {
@@ -180,9 +181,14 @@ export function sampleLargeDataset(xData, yData, additionalArrays = {}, maxPoint
   const sampledX = [];
   const sampledY = [];
   const sampledAdditional = {};
+  const additionalKeys = Object.keys(additionalArrays);
+  const additionalValues = additionalKeys.map(key => additionalArrays[key]);
+  const sampledAdditionalValues = [];
 
-  for (const key of Object.keys(additionalArrays)) {
-    sampledAdditional[key] = [];
+  for (const key of additionalKeys) {
+    sampledAdditionalValues.push(
+      setOwnDataProperty(sampledAdditional, key, [])
+    );
   }
 
   for (let i = 0; i < maxPoints; i++) {
@@ -190,9 +196,10 @@ export function sampleLargeDataset(xData, yData, additionalArrays = {}, maxPoint
     sampledX.push(xData[idx]);
     sampledY.push(yData[idx]);
 
-    for (const key of Object.keys(additionalArrays)) {
-      if (additionalArrays[key] && additionalArrays[key][idx] !== undefined) {
-        sampledAdditional[key].push(additionalArrays[key][idx]);
+    for (let arrayIndex = 0; arrayIndex < additionalValues.length; arrayIndex++) {
+      const values = additionalValues[arrayIndex];
+      if (values && values[idx] !== undefined) {
+        sampledAdditionalValues[arrayIndex].push(values[idx]);
       }
     }
   }

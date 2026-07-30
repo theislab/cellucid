@@ -22,7 +22,11 @@
  */
 
 import { OverlayBase } from '../overlay-base.js';
-import { createProgram, createTransformFeedbackProgram } from '../../gl-utils.js';
+import {
+  configureStraightAlphaBlending,
+  createProgram,
+  createTransformFeedbackProgram,
+} from '../../gl-utils.js';
 import { getNotificationCenter } from '../../../app/notification-center.js';
 import { getColormap } from '../../../data/palettes.js';
 import {
@@ -38,6 +42,7 @@ import {
   ANAMORPHIC_BLUR_FS
 } from './velocity-shaders.js';
 import { createOrUpdatePackedFloatTexture, createOrUpdatePackedUintTexture } from '../shared/packed-texture.js';
+import { POINT_VISIBILITY_THRESHOLD } from '../../alpha-visibility.js';
 
 // =============================================================================
 // CONFIGURATION
@@ -122,9 +127,6 @@ export const DEFAULT_VELOCITY_RENDER_TARGET_BYTE_BUDGET =
 const FLOATS_PER_PARTICLE = 8;
 const BYTES_PER_PARTICLE = FLOATS_PER_PARTICLE * 4;
 const TRANSPARENT_BLACK = new Float32Array([0, 0, 0, 0]);
-// Transparency is published as Float32 data; compare against the exact same
-// representable value so alpha authored as 0.01 remains visible on CPU and GPU.
-const VELOCITY_VISIBILITY_THRESHOLD = Math.fround(0.01);
 const SPAWN_BUILD_BATCH_ITEMS = 2_048;
 const SPAWN_BUILD_MIN_ITEMS_PER_SLICE = 4_096;
 const SPAWN_BUILD_MAX_ITEMS_PER_SLICE = 65_536;
@@ -1175,9 +1177,11 @@ export class VelocityOverlay extends OverlayBase {
   }
 
   handleContextLost() {
-    if (this._disposeRequested || this._disposed) return;
     if (this._contextLost) return;
+    if (this._disposed) return;
     this._contextLost = true;
+    this._disposeRequested = true;
+    this.enabled = false;
     const notifications = getNotificationCenter();
     let failures = null;
     for (const state of this._spawnByView.values()) {
@@ -1212,8 +1216,18 @@ export class VelocityOverlay extends OverlayBase {
     this._pendingDerivedTextureDeletes.clear();
     this._colormapTexture = null;
     this._getPendingColormapTextureDeletes().clear();
+    this._fieldsById?.clear();
+    this._spawnByView.clear();
+    this._activeFieldId = null;
+    this._transformFeedback = null;
+    this._fullscreenVAO = null;
+    this._fullscreenAttrib0Buffer = null;
+    for (const name of VELOCITY_PROGRAM_KEYS) this[name] = null;
+    for (const name of VELOCITY_UNIFORM_KEYS) this[name] = null;
+    this._failureHandler = null;
     this._residentParticleBytes = 0n;
     this._residentFBOBytes = 0n;
+    this.gl = null;
     throwCollectedFailures(
       failures,
       'VelocityOverlay context-loss notification cleanup was incomplete.'
@@ -2402,7 +2416,12 @@ export class VelocityOverlay extends OverlayBase {
       failures = appendFailure(failures, error);
     }
     try {
-      gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+      gl.blendFuncSeparate(
+        gl.SRC_ALPHA,
+        gl.ONE_MINUS_SRC_ALPHA,
+        gl.ONE,
+        gl.ONE_MINUS_SRC_ALPHA
+      );
     } catch (error) {
       failures = appendFailure(failures, error);
     }
@@ -2554,8 +2573,6 @@ export class VelocityOverlay extends OverlayBase {
       particleState.activeParticleCount
     );
     gl.bindVertexArray(null);
-
-    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
   }
 
   _passBloom(fbos, trailIdx) {
@@ -2634,9 +2651,7 @@ export class VelocityOverlay extends OverlayBase {
       ctx.viewportWidth,
       ctx.viewportHeight
     );
-    gl.enable(gl.BLEND);
-    gl.blendEquation(gl.FUNC_ADD);
-    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    configureStraightAlphaBlending(gl);
     gl.depthMask(false);
 
     gl.useProgram(this._programComposite);
@@ -4275,7 +4290,7 @@ export class VelocityOverlay extends OverlayBase {
             );
           }
           if (
-            alpha < VELOCITY_VISIBILITY_THRESHOLD
+            alpha < POINT_VISIBILITY_THRESHOLD
           ) {
             continue;
           }
@@ -4773,7 +4788,7 @@ export class VelocityOverlay extends OverlayBase {
           `VelocityOverlay LOD spawn index ${idx} exceeds the ${cellCount}-cell field.`
         );
       }
-      if (transparency[idx] < VELOCITY_VISIBILITY_THRESHOLD) continue;
+      if (transparency[idx] < POINT_VISIBILITY_THRESHOLD) continue;
 
       visibleCount++;
       if (filled < maxSize) {

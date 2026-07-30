@@ -621,6 +621,73 @@ test('mutable state owns a writable copy of immutable loader categories', () => 
   });
 });
 
+test('dataset publication retires stale field and batch owners before notifying UI', () => {
+  const observed = [];
+  const state = {
+    _batchDepth: 2,
+    _batchDirty: {
+      visibility: true,
+      colors: true,
+      affectedFields: new Set([{ key: 'old' }]),
+    },
+    _batchMode: true,
+    _deleteRegistry: { clear() {} },
+    _fieldDataCache: new Map(),
+    _renameRegistry: { clear() {} },
+    _userDefinedFields: { clear() {} },
+    _varFieldDataCache: new Map(),
+    _visibilityScratch: new Float32Array(7),
+    activeDimensionLevel: 2,
+    activeFieldIndex: 0,
+    activeFieldSource: 'obs',
+    activeVarFieldIndex: 3,
+    clearCentroids() {},
+    _notifyHighlightPageChange() {
+      observed.push({
+        activeFieldIndex: this.activeFieldIndex,
+        activeFieldSource: this.activeFieldSource,
+        activeVarFieldIndex: this.activeVarFieldIndex,
+        batchDepth: this._batchDepth,
+        batchMode: this._batchMode,
+      });
+    },
+    _resetViewContexts() {},
+    viewer: {
+      resetVectorFieldOverlay() {},
+      setCentroidLabels() {},
+      setCentroids() {},
+      setData() {},
+    },
+  };
+
+  viewContextViewerSyncMethods.initScene.call(
+    state,
+    new Float32Array(6),
+    {
+      fields: [{
+        categories: ['new-a', 'new-b'],
+        key: 'new-group',
+        kind: 'category',
+      }],
+    },
+  );
+
+  assert.deepEqual(observed, [{
+    activeFieldIndex: -1,
+    activeFieldSource: null,
+    activeVarFieldIndex: -1,
+    batchDepth: 0,
+    batchMode: false,
+  }]);
+  assert.equal(state._activeCategoryCounts, null);
+  assert.equal(state._visibilityScratch, null);
+  assert.deepEqual(state._batchDirty, {
+    visibility: false,
+    colors: false,
+    affectedFields: new Set(),
+  });
+});
+
 async function prepareFalsyCategoryIntegration() {
   const categories = [0, false, 'other'];
   const adapter = new BaseAnnDataAdapter(categoricalLoader({

@@ -10,6 +10,7 @@
  */
 
 import { isFiniteNumber, clamp } from '../../../../utils/number-utils.js';
+import { assertLodMembership } from './lod-membership.js';
 
 function getHPRenderer(viewer) {
   return typeof viewer?.getHPRenderer === 'function' ? viewer.getHPRenderer() : null;
@@ -61,18 +62,26 @@ export function getEffectivePointRadiusPx({ viewer, renderState, viewId, dimensi
 }
 
 /**
- * LOD-only visibility mask (1.0 = visible in current LOD, 0.0 = hidden).
+ * Immutable LOD admission descriptor for the current view.
  *
- * Note: alpha/filter visibility is handled elsewhere (via transparency/alpha threshold).
+ * `null` means full detail. Alpha/filter visibility remains independently owned
+ * by transparency and the alpha threshold.
  *
  * @param {object} options
  * @param {object} options.viewer
  * @param {string|number|null} options.viewId
  * @param {number} [options.dimensionLevel]
- * @returns {Float32Array|null}
+ * @returns {import('./lod-membership.js').LodMembership|null}
  */
-export function getLodVisibilityMask({ viewer, viewId, dimensionLevel }) {
-  if (typeof viewer?.getLodVisibilityArray !== 'function') return null;
-  return viewer.getLodVisibilityArray(viewId != null ? String(viewId) : undefined, dimensionLevel);
+export function getLodMembership({ viewer, viewId, dimensionLevel }) {
+  if (typeof viewer?.getCurrentLodMembership !== 'function') {
+    throw new TypeError(
+      'Figure export requires viewer.getCurrentLodMembership().'
+    );
+  }
+  const membership = viewer.getCurrentLodMembership(
+    viewId != null ? String(viewId) : undefined,
+    dimensionLevel
+  );
+  return assertLodMembership(membership, { dimensionLevel });
 }
-

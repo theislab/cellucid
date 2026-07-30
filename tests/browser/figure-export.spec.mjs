@@ -269,6 +269,224 @@ function assertSvgArtifact(bytes, strategy) {
   }
 }
 
+test('export cancellation settles native canvas work and cleans download staging', async ({
+  page,
+}, testInfo) => {
+  await page.goto(
+    `/?acceptance=${encodeURIComponent(
+      `figure-export-cancellation-${testInfo.project.name}`
+    )}`,
+    { waitUntil: 'domcontentloaded' },
+  );
+
+  const result = await page.evaluate(async () => {
+    const {
+      canvasToBlob,
+      downloadBlob,
+    } = await import(
+      '/assets/js/app/ui/modules/figure-export/utils/export-helpers.js'
+    );
+
+    let lateCanvasCallback = null;
+    const canvasController = new AbortController();
+    const canvasPromise = canvasToBlob(
+      {
+        toBlob(callback, type) {
+          if (type !== 'image/png') {
+            throw new Error(`Unexpected canvas type: ${type}`);
+          }
+          lateCanvasCallback = callback;
+        },
+      },
+      'image/png',
+      {
+        signal: canvasController.signal,
+        failureMessage: 'Browser cancellation fixture failed.',
+      }
+    );
+    canvasController.abort();
+    let canvasAbortName = null;
+    try {
+      await canvasPromise;
+    } catch (error) {
+      canvasAbortName = error?.name ?? null;
+    }
+    lateCanvasCallback(new Blob(['late'], { type: 'image/png' }));
+
+    const downloadController = new AbortController();
+    const originalAppendChild = document.body.appendChild;
+    const originalAnchorClick = HTMLAnchorElement.prototype.click;
+    const originalCreateObjectURL = URL.createObjectURL;
+    const originalRevokeObjectURL = URL.revokeObjectURL;
+    const calls = {
+      clicks: 0,
+      createdUrls: 0,
+      revokedUrls: 0,
+    };
+    document.body.appendChild = function appendAndAbort(node) {
+      const result = originalAppendChild.call(this, node);
+      downloadController.abort();
+      return result;
+    };
+    HTMLAnchorElement.prototype.click = function countClick() {
+      calls.clicks += 1;
+    };
+    URL.createObjectURL = () => {
+      calls.createdUrls += 1;
+      return 'blob:figure-export-cancellation';
+    };
+    URL.revokeObjectURL = (url) => {
+      if (url !== 'blob:figure-export-cancellation') {
+        throw new Error(`Unexpected Object URL: ${url}`);
+      }
+      calls.revokedUrls += 1;
+    };
+
+    let downloadAbortName = null;
+    try {
+      downloadBlob(
+        new Blob(['cancelled'], { type: 'image/svg+xml' }),
+        'cancelled.svg',
+        { signal: downloadController.signal }
+      );
+    } catch (error) {
+      downloadAbortName = error?.name ?? null;
+    } finally {
+      document.body.appendChild = originalAppendChild;
+      HTMLAnchorElement.prototype.click = originalAnchorClick;
+      URL.createObjectURL = originalCreateObjectURL;
+      URL.revokeObjectURL = originalRevokeObjectURL;
+    }
+
+    return {
+      ...calls,
+      canvasAbortName,
+      downloadAbortName,
+      danglingAnchors:
+        document.querySelectorAll('a[download="cancelled.svg"]').length,
+    };
+  });
+
+  expect(result).toEqual({
+    canvasAbortName: 'AbortError',
+    clicks: 0,
+    createdUrls: 1,
+    danglingAnchors: 0,
+    downloadAbortName: 'AbortError',
+    revokedUrls: 1,
+  });
+});
+
+test('figure-export UI teardown aborts a pending renderer without download or terminal toast', async ({
+  page,
+}, testInfo) => {
+  const productErrors = observeProductErrors(page);
+  await openFigureExport(
+    page,
+    `figure-export-teardown-${testInfo.project.name}`,
+  );
+  await page.getByLabel('Download format').selectOption('png');
+
+  const downloads = [];
+  page.on('download', download => {
+    downloads.push(download.suggestedFilename());
+  });
+  await page.evaluate(() => {
+    window.__figureExportNativeToBlob =
+      HTMLCanvasElement.prototype.toBlob;
+    window.__figureExportLateToBlob = null;
+    HTMLCanvasElement.prototype.toBlob = function holdToBlob(callback) {
+      window.__figureExportLateToBlob = callback;
+    };
+  });
+
+  await page.locator('#figure-export-btn').click();
+  await page.waitForFunction(
+    () => typeof window.__figureExportLateToBlob === 'function'
+  );
+  await page.evaluate(() => {
+    const controls = document.querySelector('#figure-export-controls');
+    if (typeof controls?.__cellucidCleanup !== 'function') {
+      throw new Error('Figure-export cleanup owner is unavailable.');
+    }
+    controls.__cellucidCleanup();
+  });
+  await page.evaluate(() => {
+    const callback = window.__figureExportLateToBlob;
+    HTMLCanvasElement.prototype.toBlob =
+      window.__figureExportNativeToBlob;
+    callback(new Blob(['late encoder result'], { type: 'image/png' }));
+    delete window.__figureExportLateToBlob;
+    delete window.__figureExportNativeToBlob;
+  });
+
+  await page.waitForTimeout(500);
+  expect(downloads).toEqual([]);
+  await expect(
+    page.locator('.notification-message').filter({
+      hasText: /Rendering .*PNG|Export complete|Export failed|Exported \d+ file/,
+    })
+  ).toHaveCount(0);
+  expect(productErrors).toEqual([]);
+});
+
+test('teardown during the download click cannot roll back a committed export', async ({
+  page,
+}, testInfo) => {
+  const productErrors = observeProductErrors(page);
+  await openFigureExport(
+    page,
+    `figure-export-download-commit-${testInfo.project.name}`,
+  );
+  await page.getByLabel('Download format').selectOption('svg');
+  await page.getByLabel('SVG point strategy').selectOption('full-vector');
+  await page.evaluate(() => {
+    window.__figureExportNativeAnchorClick =
+      HTMLAnchorElement.prototype.click;
+    window.__figureExportCommitAbortCount = 0;
+    HTMLAnchorElement.prototype.click = function clickAndTearDown() {
+      if (
+        this.download &&
+        window.__figureExportCommitAbortCount === 0
+      ) {
+        window.__figureExportCommitAbortCount += 1;
+        const controls = document.querySelector('#figure-export-controls');
+        if (typeof controls?.__cellucidCleanup !== 'function') {
+          throw new Error('Figure-export cleanup owner is unavailable.');
+        }
+        controls.__cellucidCleanup();
+      }
+      return window.__figureExportNativeAnchorClick.call(this);
+    };
+  });
+
+  const downloadPromise = page.waitForEvent('download');
+  await page.locator('#figure-export-btn').click();
+  const download = await downloadPromise;
+  expect(await download.failure()).toBeNull();
+  expect(path.extname(download.suggestedFilename())).toBe('.svg');
+  await expect(
+    page.locator('.notification-message').filter({
+      hasText: 'Exported 1 file',
+    })
+  ).toHaveCount(1);
+  await expect(
+    page.locator('.notification-message').filter({
+      hasText: 'Export failed',
+    })
+  ).toHaveCount(0);
+  expect(
+    await page.evaluate(() => window.__figureExportCommitAbortCount)
+  ).toBe(1);
+  await page.evaluate(() => {
+    HTMLAnchorElement.prototype.click =
+      window.__figureExportNativeAnchorClick;
+    delete window.__figureExportNativeAnchorClick;
+    delete window.__figureExportCommitAbortCount;
+  });
+  expect(productErrors).toEqual([]);
+});
+
 function crc32(bytes) {
   let value = 0xffff_ffff;
   for (const byte of bytes) {
@@ -379,6 +597,131 @@ test('exports PNG and every explicit SVG strategy through the visible UI', async
     assertSvgArtifact(svg.bytes, strategy);
   }
 
+  expect(productErrors).toEqual([]);
+});
+
+test('framing preview exposes an exact keyboard and toggle lifecycle', async ({
+  page,
+}, testInfo) => {
+  const productErrors = observeProductErrors(page);
+  await openFigureExport(
+    page,
+    `figure-export-framing-accessibility-${testInfo.project.name}`,
+  );
+
+  const previewStatus = page.locator('.figure-export-preview-status');
+  await expect(previewStatus).toHaveAttribute('role', 'status');
+  await expect(previewStatus).toHaveAttribute('aria-live', 'polite');
+  await expect(previewStatus).toHaveAttribute('aria-atomic', 'true');
+
+  // openFigureExport() finishes in the Download sub-accordion.
+  await page.getByRole('button', { name: /^Framing\b/ }).click();
+  await page.getByLabel('Show preview').check();
+  await page.getByLabel('Frame export').check();
+  const previewCanvas = page.locator('canvas.figure-export-preview');
+  await expect(previewCanvas).toHaveAttribute('role', 'img');
+  await expect(previewCanvas).toHaveAttribute('tabindex', '0');
+  await expect(previewCanvas).toHaveAttribute('aria-disabled', 'false');
+  await expect(previewCanvas).toHaveAttribute(
+    'aria-label',
+    /Arrow keys move the frame; Shift plus arrow keys resize it; Home resets it/,
+  );
+
+  await previewCanvas.focus();
+  await previewCanvas.press('Shift+ArrowLeft');
+  await expect(previewCanvas).toHaveAttribute(
+    'aria-label',
+    /with 98 percent width/,
+  );
+  await previewCanvas.press('ArrowRight');
+  await expect(previewCanvas).toHaveAttribute(
+    'aria-label',
+    /starts at 2 percent from the left/,
+  );
+  await previewCanvas.press('Home');
+  await expect(previewCanvas).toHaveAttribute(
+    'aria-label',
+    /with 100 percent width and 100 percent height/,
+  );
+
+  const confirm = page.getByRole('button', { name: 'Confirm' });
+  await expect(confirm).toHaveAttribute('aria-pressed', 'false');
+  await confirm.click();
+  const edit = page.getByRole('button', { name: 'Edit' });
+  await expect(edit).toHaveAttribute('aria-pressed', 'true');
+  await expect(previewCanvas).toHaveAttribute('tabindex', '-1');
+  await expect(previewCanvas).toHaveAttribute('aria-disabled', 'true');
+
+  expect(productErrors).toEqual([]);
+});
+
+test('figure-export modal confines focus and restores its exact invoker', async ({
+  page,
+}, testInfo) => {
+  const productErrors = observeProductErrors(page);
+  await openFigureExport(
+    page,
+    `figure-export-modal-accessibility-${testInfo.project.name}`,
+  );
+
+  const exportButton = page.locator('#figure-export-btn');
+  await exportButton.focus();
+  await page.evaluate(async () => {
+    const { showFigureExportModal } = await import(
+      '/assets/js/app/ui/modules/figure-export/components/modal.js'
+    );
+    window.__figureModalPriorInert = Array.from(document.body.children).map(
+      element => element.inert,
+    );
+    const content = document.createElement('div');
+    for (const label of ['First action', 'Last action']) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.textContent = label;
+      content.appendChild(button);
+    }
+    window.__figureModalClosed = false;
+    showFigureExportModal({
+      title: 'Focus ownership test',
+      content,
+      onClose: () => {
+        window.__figureModalClosed = true;
+      },
+    });
+  });
+
+  const modal = page.getByRole('dialog', { name: 'Focus ownership test' });
+  await expect(modal).toBeVisible();
+  await expect(page.getByRole('button', { name: 'First action' })).toBeFocused();
+  expect(
+    await page.evaluate(() => (
+      Array.from(document.body.children)
+        .filter(element => !element.classList.contains('figure-export-modal'))
+        .every(element => element.inert)
+    )),
+  ).toBe(true);
+
+  await page.keyboard.press('Shift+Tab');
+  await expect(page.getByRole('button', { name: 'Last action' })).toBeFocused();
+  await page.keyboard.press('Tab');
+  await expect(page.getByRole('button', { name: 'First action' })).toBeFocused();
+  await page.locator('#glcanvas').evaluate(canvas => canvas.focus());
+  await expect(page.getByRole('button', { name: 'First action' })).toBeFocused();
+
+  await page.keyboard.press('Escape');
+  await expect(modal).toHaveCount(0);
+  await expect(exportButton).toBeFocused();
+  expect(
+    await page.evaluate(() => ({
+      closed: window.__figureModalClosed,
+      inert: Array.from(document.body.children).map(element => element.inert),
+      priorInert: window.__figureModalPriorInert,
+    })),
+  ).toEqual({
+    closed: true,
+    inert: await page.evaluate(() => window.__figureModalPriorInert),
+    priorInert: await page.evaluate(() => window.__figureModalPriorInert),
+  });
   expect(productErrors).toEqual([]);
 });
 

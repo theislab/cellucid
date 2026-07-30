@@ -622,6 +622,11 @@ test('SmokeRenderer context loss invalidates terminal owners without GL deletion
     },
   );
 
+  assert.equal(
+    renderer.handleContextLost(),
+    true,
+    'the first loss must report that accepted GPU owners were invalidated',
+  );
   assert.equal(renderer.handleContextLost(), false);
   assert.throws(
     () => renderer.setParams({ density: 1 }),

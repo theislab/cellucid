@@ -18,11 +18,14 @@ import {
   setAnnotationRepoForDataset
 } from './repo-store.js';
 import {
+  ANNOTATION_FILE_MAX_UTF8_BYTES,
+  AnnotationFileTooLargeError,
   assertConfigDocument,
   assertMergesDocument,
   assertSchemaIdentity,
   assertUserDocument,
   parseExactJson,
+  toAnnotationPublicationBytes,
 } from './wire-contract.js';
 import {
   isCanonicalGitHubAccount,
@@ -33,10 +36,53 @@ import {
 } from './github-reference.js';
 
 const GITHUB_DEFAULT_TIMEOUT_MS = 20_000;
+const GITHUB_FORK_READINESS_ATTEMPTS = 5;
+const GITHUB_FORK_READINESS_REQUEST_TIMEOUT_MS = 3_000;
+const GITHUB_RENAMED_FORK_LOOKUP_MAX_PAGES = 10;
+const GITHUB_RENAMED_FORK_LOOKUP_MAX_ITEMS =
+  GITHUB_RENAMED_FORK_LOOKUP_MAX_PAGES * 100;
+const GITHUB_RENAMED_FORK_LOOKUP_TIMEOUT_MS = 10_000;
 const DEFAULT_USER_PULL_CONCURRENCY = 8;
 const MAX_TREE_ITEMS = 100_000;
+export const COMMUNITY_ANNOTATION_MAX_PULL_USER_FILES = 10_000;
+export const COMMUNITY_ANNOTATION_MAX_PULL_UTF8_BYTES = 64_000_000;
 const GITHUB_SHA = /^[0-9a-f]{40}$/;
+const ANNOTATION_USERS_DIRECTORY_PATH = 'annotations/users';
+const ANNOTATION_USERS_PATH_PREFIX =
+  `${ANNOTATION_USERS_DIRECTORY_PATH}/`;
+const EMPTY_ANNOTATION_USERS_SENTINEL = Object.freeze({
+  path: `${ANNOTATION_USERS_PATH_PREFIX}.gitkeep`,
+  sha: '8b137891791fe96927ad78e64b0aad7bded08bdc',
+  size: 1,
+});
 const PUBLICATION_MODES = new Set(['direct', 'fork-pull-request']);
+const OPERATION_ID_HEADER = 'X-Cellucid-Operation-Id';
+const OPERATION_OUTCOME_HEADER = 'X-Cellucid-Operation-Outcome';
+const OPERATION_ID =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const OPERATION_OUTCOMES = new Set([
+  'applied',
+  'not-applied',
+  'unknown',
+]);
+
+export class CommunityAnnotationPullLimitError extends Error {
+  constructor(kind, actual, maximum) {
+    const isFiles = kind === 'user-files';
+    const unit = isFiles ? 'user files' : 'decoded UTF-8 bytes';
+    super(
+      `Community annotation Pull contains ${actual} ${unit}; the browser ` +
+      `safety limit is ${maximum}. Archive old user files or split the ` +
+      'annotation repository before pulling again.'
+    );
+    this.name = 'CommunityAnnotationPullLimitError';
+    this.code = 'COMMUNITY_ANNOTATION_PULL_LIMIT';
+    this.phase = 'remote-tree-preflight';
+    this.kind = kind;
+    this.actual = actual;
+    this.maximum = maximum;
+  }
+}
 
 function assertExactNonblankString(value, label, { max = 2048 } = {}) {
   if (
@@ -121,6 +167,125 @@ function assertTimeoutMs(timeoutMs) {
   return timeoutMs;
 }
 
+function assertAbortSignalOrNull(value, label = 'GitHub request signal') {
+  if (
+    value !== null &&
+    (
+      typeof value !== 'object' ||
+      typeof value.aborted !== 'boolean' ||
+      typeof value.addEventListener !== 'function' ||
+      typeof value.removeEventListener !== 'function'
+    )
+  ) {
+    throw new TypeError(`${label} must be an AbortSignal or exact null`);
+  }
+  return value;
+}
+
+function createRequestAbortScope(signal, timeoutMs) {
+  const ownerSignal = assertAbortSignalOrNull(signal);
+  const ms = assertTimeoutMs(timeoutMs);
+  if (typeof AbortController === 'undefined') {
+    throw new Error('AbortController is required for GitHub annotation requests');
+  }
+  const controller = new AbortController();
+  let abortCause = null;
+  const abortWithCause = (cause) => {
+    if (abortCause === null) abortCause = cause;
+    controller.abort();
+  };
+  const abortFromOwner = () => {
+    abortWithCause('owner');
+  };
+  if (ownerSignal !== null) {
+    if (ownerSignal.aborted) abortFromOwner();
+    else ownerSignal.addEventListener('abort', abortFromOwner, { once: true });
+  }
+
+  /** @type {ReturnType<typeof setTimeout> | null} */
+  let timeout = null;
+  if (ms > 0) {
+    timeout = setTimeout(() => {
+      abortWithCause('timeout');
+    }, ms);
+  }
+
+  return {
+    abortCause: () => abortCause,
+    controller,
+    ownerSignal,
+    timeoutMs: ms,
+    cleanup() {
+      if (timeout !== null) clearTimeout(timeout);
+      ownerSignal?.removeEventListener('abort', abortFromOwner);
+    },
+  };
+}
+
+function createOwnedRequestAbortError(label, cause = undefined) {
+  const error = new Error(`${label} was cancelled`);
+  error.name = 'AbortError';
+  error.code = 'GITHUB_REQUEST_ABORTED';
+  if (cause !== undefined) error.cause = cause;
+  return error;
+}
+
+function throwIfRequestAborted(scope, label, cause = undefined) {
+  const abortCause = scope.abortCause();
+  if (abortCause === 'owner') {
+    throw createOwnedRequestAbortError(
+      label,
+      scope.ownerSignal.reason ?? cause
+    );
+  }
+  if (abortCause === 'timeout') {
+    const error = new Error(
+      `${label} timed out after ${Math.max(
+        1,
+        Math.round(scope.timeoutMs / 1000)
+      )}s`
+    );
+    error.code = 'TIMEOUT';
+    if (cause !== undefined) error.cause = cause;
+    throw error;
+  }
+}
+
+function attachRetryAfterHeader(error, response) {
+  if (
+    !error ||
+    typeof error !== 'object' ||
+    !response ||
+    typeof response !== 'object' ||
+    !response.headers ||
+    typeof response.headers.get !== 'function'
+  ) {
+    return error;
+  }
+  const retryAfter = response.headers.get('retry-after');
+  if (retryAfter !== null) {
+    if (
+      typeof retryAfter === 'string' &&
+      retryAfter.length > 0 &&
+      retryAfter === retryAfter.trim()
+    ) {
+      error.retryAfter = retryAfter;
+    }
+    return error;
+  }
+  const rawReset = response.headers.get('x-ratelimit-reset');
+  if (
+    typeof rawReset === 'string' &&
+    /^(?:0|[1-9][0-9]*)$/.test(rawReset)
+  ) {
+    const reset = Number(rawReset);
+    if (Number.isSafeInteger(reset)) {
+      error.rateLimitResetEpochSeconds = reset;
+    }
+  }
+  return error;
+}
+
 function assertPublicationMode(value) {
   if (!PUBLICATION_MODES.has(value)) {
     throw new Error(
@@ -199,6 +364,47 @@ export function selectAnnotationPublicationMode(repoInfo) {
   return null;
 }
 
+export function buildUpdatedAnnotationConfig({
+  currentConfig,
+  datasetId,
+  datasetName,
+  fieldsToAnnotate,
+  annotatableSettings,
+  closedFields,
+} = {}) {
+  assertConfigDocument(currentConfig, {
+    path: 'annotations/config.json',
+  });
+  const did = assertExactNonblankString(
+    datasetId,
+    'datasetId',
+    { max: 256 }
+  );
+  const existing =
+    currentConfig.supportedDatasets.find(
+      entry => entry.datasetId === did
+    ) ?? null;
+  const replacement = {
+    datasetId: did,
+    name: datasetName === undefined ? existing?.name : datasetName,
+    fieldsToAnnotate,
+    annotatableSettings,
+    closedFields,
+  };
+  const config = {
+    version: 1,
+    supportedDatasets: existing
+      ? currentConfig.supportedDatasets.map(entry =>
+        entry.datasetId === did ? replacement : entry
+      )
+      : [...currentConfig.supportedDatasets, replacement],
+  };
+  assertConfigDocument(config, {
+    path: 'annotations/config.json publish payload',
+  });
+  return { config, replacement };
+}
+
 function assertAuthUserResponse(value) {
   if (
     !value ||
@@ -221,6 +427,166 @@ function assertAuthUserResponse(value) {
 
 function isAbortError(err) {
   return err?.name === 'AbortError';
+}
+
+function deriveGitHubMutationKind(method, path) {
+  if (method === 'GET') return null;
+  if (
+    method === 'PUT' &&
+    /^\/repos\/[^/]+\/[^/]+\/contents\/.+$/.test(path)
+  ) {
+    return 'contents-put';
+  }
+  if (
+    method === 'POST' &&
+    /^\/repos\/[^/]+\/[^/]+\/git\/refs$/.test(path)
+  ) {
+    return 'git-refs-post';
+  }
+  if (
+    method === 'POST' &&
+    /^\/repos\/[^/]+\/[^/]+\/forks$/.test(path)
+  ) {
+    return 'forks-post';
+  }
+  if (
+    method === 'POST' &&
+    /^\/repos\/[^/]+\/[^/]+\/pulls$/.test(path)
+  ) {
+    return 'pulls-post';
+  }
+  throw new Error(
+    `GitHub ${method} ${path} has no exact mutation operation contract`
+  );
+}
+
+function createGitHubMutationOperation(method, path) {
+  const kind = deriveGitHubMutationKind(method, path);
+  if (kind === null) return null;
+  if (typeof globalThis.crypto?.randomUUID !== 'function') {
+    throw new Error(
+      'crypto.randomUUID is required for GitHub mutation ownership'
+    );
+  }
+  const id = globalThis.crypto.randomUUID();
+  if (typeof id !== 'string' || !OPERATION_ID.test(id)) {
+    throw new Error(
+      'crypto.randomUUID returned a non-canonical operation identity'
+    );
+  }
+  return Object.freeze({ id, kind });
+}
+
+function mutationOperationRecord(operation, outcome) {
+  if (
+    !operation ||
+    typeof operation !== 'object' ||
+    !OPERATION_ID.test(operation.id) ||
+    typeof operation.kind !== 'string' ||
+    !OPERATION_OUTCOMES.has(outcome)
+  ) {
+    throw new Error('Invalid GitHub mutation outcome record');
+  }
+  return Object.freeze({
+    id: operation.id,
+    kind: operation.kind,
+    outcome,
+  });
+}
+
+function createUnknownMutationOutcomeError(
+  message,
+  operation,
+  cause = undefined
+) {
+  const error = new Error(message);
+  error.code = 'GITHUB_MUTATION_OUTCOME_UNKNOWN';
+  error.operation = mutationOperationRecord(operation, 'unknown');
+  if (cause !== undefined) error.cause = cause;
+  return error;
+}
+
+function readWorkerMutationOutcome(response, operation) {
+  const responseOperationId = response.headers.get(OPERATION_ID_HEADER);
+  if (responseOperationId !== operation.id) {
+    throw createUnknownMutationOutcomeError(
+      'GitHub mutation operation identity mismatch after dispatch',
+      operation
+    );
+  }
+  const outcome = response.headers.get(OPERATION_OUTCOME_HEADER);
+  if (!OPERATION_OUTCOMES.has(outcome)) {
+    throw createUnknownMutationOutcomeError(
+      'GitHub mutation operation outcome is missing or invalid after dispatch',
+      operation
+    );
+  }
+  if (
+    (response.ok && outcome !== 'applied') ||
+    (!response.ok && outcome === 'applied')
+  ) {
+    throw createUnknownMutationOutcomeError(
+      'GitHub mutation operation outcome contradicts its HTTP status',
+      operation
+    );
+  }
+  return outcome;
+}
+
+function attachMutationOutcome(error, operation, outcome) {
+  if (!error || typeof error !== 'object') {
+    return createUnknownMutationOutcomeError(
+      'GitHub mutation failed after dispatch',
+      operation,
+      error
+    );
+  }
+  error.operation = mutationOperationRecord(operation, outcome);
+  return error;
+}
+
+function attachMutationOutcomeToDocument(document, operation, outcome) {
+  if (
+    document === null ||
+    typeof document !== 'object' ||
+    Array.isArray(document)
+  ) {
+    throw createUnknownMutationOutcomeError(
+      'GitHub mutation returned an invalid success document after dispatch',
+      operation
+    );
+  }
+  Object.defineProperty(document, 'operation', {
+    configurable: false,
+    enumerable: false,
+    value: mutationOperationRecord(operation, outcome),
+    writable: false,
+  });
+  return document;
+}
+
+function attachDocumentMutationOutcome(error, document) {
+  if (
+    error &&
+    typeof error === 'object' &&
+    !error.operation &&
+    document &&
+    typeof document === 'object' &&
+    !Array.isArray(document) &&
+    document.operation
+  ) {
+    error.operation = document.operation;
+  }
+  return error;
+}
+
+function observeResponseBodyCancellation(response) {
+  if (typeof response?.body?.cancel !== 'function') return;
+  try {
+    Promise.resolve(response.body.cancel()).catch(() => {});
+  } catch {
+    // The primary protocol error owns the public outcome.
+  }
 }
 
 function parseHttpJson(text, label) {
@@ -261,7 +627,7 @@ function stableStringifyJson(value) {
       ancestors.delete(v);
       return array;
     }
-    const out = {};
+    const out = Object.create(null);
     for (const k of Object.keys(v).sort()) {
       out[k] = walk(v[k]);
     }
@@ -271,33 +637,159 @@ function stableStringifyJson(value) {
   return JSON.stringify(walk(value));
 }
 
-function encodeBase64Utf8(text) {
-  if (typeof text !== 'string') throw new Error('Base64 input must be a string');
-  if (typeof TextEncoder === 'undefined') {
-    throw new Error('TextEncoder is required for GitHub annotation sync');
+function encodeBase64Bytes(bytes) {
+  if (!(bytes instanceof Uint8Array)) {
+    throw new Error('Base64 input must be a Uint8Array');
   }
-  const bytes = new TextEncoder().encode(text);
-  let bin = '';
-  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
-  return btoa(bin);
+  const chunks = [];
+  const chunkSize = 32_768;
+  for (let offset = 0; offset < bytes.byteLength; offset += chunkSize) {
+    chunks.push(
+      String.fromCharCode(
+        ...bytes.subarray(
+          offset,
+          Math.min(bytes.byteLength, offset + chunkSize)
+        )
+      )
+    );
+  }
+  return btoa(chunks.join(''));
 }
 
-function decodeBase64Utf8(b64) {
-  if (typeof b64 !== 'string') {
+function base64AlphabetValue(code) {
+  if (code >= 65 && code <= 90) return code - 65;
+  if (code >= 97 && code <= 122) return code - 97 + 26;
+  if (code >= 48 && code <= 57) return code - 48 + 52;
+  if (code === 43) return 62;
+  if (code === 47) return 63;
+  return -1;
+}
+
+function scanFoldedBase64Payload(
+  value,
+  {
+    compareCanonical = null,
+    path = 'GitHub annotation content',
+    phase = 'remote-read',
+  } = {}
+) {
+  if (typeof value !== 'string') {
     throw new Error('GitHub annotation content must be a base64 string');
   }
-  const base64 = b64.replaceAll('\r\n', '').replaceAll('\n', '');
-  if (
-    !base64 ||
-    base64.includes('\r') ||
-    !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(
-      base64
-    )
-  ) {
+  if (compareCanonical !== null && typeof compareCanonical !== 'string') {
+    throw new Error('Canonical base64 comparison input must be a string');
+  }
+
+  let payloadLength = 0;
+  let padding = 0;
+  let hasFolding = false;
+  let equalsCanonical = compareCanonical === null ? null : true;
+  let lastAlphabetValue = -1;
+
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code === 13) {
+      if (value.charCodeAt(index + 1) !== 10) {
+        throw new Error(
+          'GitHub annotation content must be valid base64 with optional line folding'
+        );
+      }
+      hasFolding = true;
+      index += 1;
+      continue;
+    }
+    if (code === 10) {
+      hasFolding = true;
+      continue;
+    }
+
+    if (code === 61) {
+      padding += 1;
+      if (padding > 2) {
+        throw new Error(
+          'GitHub annotation content must be valid base64 with optional line folding'
+        );
+      }
+    } else {
+      const alphabetValue = base64AlphabetValue(code);
+      if (alphabetValue < 0 || padding !== 0) {
+        throw new Error(
+          'GitHub annotation content must be valid base64 with optional line folding'
+        );
+      }
+      lastAlphabetValue = alphabetValue;
+    }
+
+    if (
+      compareCanonical !== null &&
+      (
+        payloadLength >= compareCanonical.length ||
+        code !== compareCanonical.charCodeAt(payloadLength)
+      )
+    ) {
+      equalsCanonical = false;
+    }
+    payloadLength += 1;
+  }
+
+  if (payloadLength === 0 || payloadLength % 4 !== 0) {
     throw new Error(
       'GitHub annotation content must be valid base64 with optional line folding'
     );
   }
+  if (
+    (padding === 1 && (lastAlphabetValue & 0b11) !== 0) ||
+    (padding === 2 && (lastAlphabetValue & 0b1111) !== 0)
+  ) {
+    throw new Error(
+      'GitHub annotation content must be canonical base64 with zero padding bits'
+    );
+  }
+  if (
+    compareCanonical !== null &&
+    payloadLength !== compareCanonical.length
+  ) {
+    equalsCanonical = false;
+  }
+  const decodedByteLength =
+    (payloadLength / 4) * 3 - padding;
+  if (decodedByteLength > ANNOTATION_FILE_MAX_UTF8_BYTES) {
+    throw new AnnotationFileTooLargeError(
+      path,
+      decodedByteLength,
+      { phase }
+    );
+  }
+  return {
+    decodedByteLength,
+    equalsCanonical,
+    hasFolding,
+    payloadLength,
+  };
+}
+
+function base64PayloadEqualsCanonical(value, canonical, path) {
+  const canonicalInfo = scanFoldedBase64Payload(canonical, {
+    path,
+    phase: 'publication-preflight',
+  });
+  if (canonicalInfo.hasFolding) {
+    throw new Error('Canonical base64 comparison input must not be folded');
+  }
+  return scanFoldedBase64Payload(value, {
+    compareCanonical: canonical,
+    path,
+  }).equalsCanonical === true;
+}
+
+function decodeBase64Utf8(b64, path) {
+  const {
+    decodedByteLength,
+    hasFolding,
+  } = scanFoldedBase64Payload(b64, { path });
+  const base64 = hasFolding
+    ? b64.replaceAll('\r\n', '').replaceAll('\n', '')
+    : b64;
   const bin = atob(base64);
   if (typeof TextDecoder === 'undefined') {
     throw new Error('TextDecoder is required for GitHub annotation sync');
@@ -306,25 +798,91 @@ function decodeBase64Utf8(b64) {
   for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
   // Preserve a UTF-8 BOM so the exact JSON parser rejects it, matching the
   // repository validator instead of silently discarding it.
-  return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
+  return {
+    decoded: new TextDecoder(
+      'utf-8',
+      { fatal: true, ignoreBOM: true }
+    ).decode(bytes),
+    decodedByteLength,
+  };
 }
 
-async function getGitTreeRecursive({ workerOrigin, owner, repo, token = null, ref }) {
+async function getGitTreeRecursive({
+  workerOrigin,
+  owner,
+  repo,
+  token = null,
+  ref,
+  signal = null,
+}) {
   const treeish = assertGitHubBranch(ref, 'Git tree ref');
   const res = await githubRequest(
     workerOrigin,
     `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/trees/${encodeURIComponent(treeish)}`,
-    { token, query: { recursive: 1 } }
+    { token, query: { recursive: 1 }, signal }
   );
   const list = Array.isArray(res?.tree) ? res.tree : null;
   if (!list) throw new Error('Expected git tree listing');
-  if (res?.truncated === true) {
+  if (typeof res?.truncated !== 'boolean') {
+    throw new Error('GitHub git tree response truncated must be boolean');
+  }
+  if (res.truncated) {
     throw new Error('GitHub returned a truncated git tree; annotation Pull is incomplete');
   }
   if (list.length > MAX_TREE_ITEMS) {
     throw new Error(`Git tree contains more than ${MAX_TREE_ITEMS} entries`);
   }
-  return list;
+  return list.map((rawEntry, index) => {
+    if (
+      rawEntry === null ||
+      typeof rawEntry !== 'object' ||
+      Array.isArray(rawEntry)
+    ) {
+      throw new Error(`Git tree entry ${index} must be an object`);
+    }
+    if (
+      rawEntry.type !== 'blob' &&
+      rawEntry.type !== 'tree' &&
+      rawEntry.type !== 'commit'
+    ) {
+      throw new Error(
+        `Git tree entry ${index} type must equal blob, tree, or commit`
+      );
+    }
+    const path = assertExactNonblankString(
+      rawEntry.path,
+      `Git tree entry ${index} path`,
+      { max: 4096 }
+    );
+    if (
+      path.startsWith('/') ||
+      path.endsWith('/') ||
+      path.split('/').some((segment) => !segment)
+    ) {
+      throw new Error(`Git tree entry ${index} path is not canonical`);
+    }
+    let size = null;
+    if (rawEntry.type === 'blob') {
+      if (
+        !Number.isSafeInteger(rawEntry.size) ||
+        rawEntry.size < 0
+      ) {
+        throw new Error(
+          `Git tree blob entry ${index} size must be a nonnegative safe integer`
+        );
+      }
+      size = rawEntry.size;
+    }
+    return {
+      type: rawEntry.type,
+      path,
+      sha: assertGitHubSha(
+        rawEntry.sha,
+        `Git tree entry ${index} SHA`
+      ),
+      size,
+    };
+  });
 }
 
 async function getGitBlobJson({
@@ -334,24 +892,34 @@ async function getGitBlobJson({
   token = null,
   sha,
   path,
+  signal = null,
 }) {
   const s = assertGitHubSha(sha, 'Git blob SHA');
   const res = await githubRequest(
     workerOrigin,
     `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/blobs/${encodeURIComponent(s)}`,
-    { token }
+    { token, signal }
   );
   if (res?.encoding !== 'base64') {
     throw new Error(`GitHub blob ${JSON.stringify(path)} must use base64 encoding`);
   }
-  if (typeof res?.content !== 'string' || !res.content.trim()) {
+  if (typeof res?.content !== 'string' || !res.content) {
     throw new Error(`GitHub blob ${JSON.stringify(path)} has empty content`);
   }
-  const decoded = decodeBase64Utf8(res.content);
-  return parseExactJson(decoded, { path });
+  const { decoded, decodedByteLength } =
+    decodeBase64Utf8(res.content, path);
+  return {
+    decodedByteLength,
+    json: parseExactJson(decoded, { path }),
+  };
 }
 
-async function mapWithConcurrency(items, concurrency, fn) {
+async function mapWithConcurrency(
+  items,
+  concurrency,
+  fn,
+  { signal = null } = {}
+) {
   if (!Array.isArray(items)) {
     throw new Error('Concurrent map items must be an array');
   }
@@ -364,22 +932,53 @@ async function mapWithConcurrency(items, concurrency, fn) {
   if (typeof fn !== 'function') {
     throw new Error('Concurrent map callback must be a function');
   }
+  const ownerSignal = assertAbortSignalOrNull(
+    signal,
+    'Concurrent GitHub request signal'
+  );
   const list = items;
   const limit = concurrency;
   const results = new Array(list.length);
   if (!list.length) return results;
 
+  const abortScope = createRequestAbortScope(ownerSignal, 0);
   let nextIndex = 0;
-  const workers = new Array(Math.min(limit, list.length)).fill(null).map(async () => {
-    while (true) {
-      const idx = nextIndex;
-      nextIndex += 1;
-      if (idx >= list.length) return;
-      results[idx] = await fn(list[idx], idx);
-    }
-  });
-  await Promise.all(workers);
-  return results;
+  let firstError;
+  let hasError = false;
+  try {
+    const workers = new Array(Math.min(limit, list.length))
+      .fill(null)
+      .map(async () => {
+        while (!hasError && !abortScope.controller.signal.aborted) {
+          const idx = nextIndex;
+          nextIndex += 1;
+          if (idx >= list.length) return;
+          try {
+            results[idx] = await fn(
+              list[idx],
+              idx,
+              abortScope.controller.signal
+            );
+          } catch (error) {
+            if (!hasError) {
+              hasError = true;
+              firstError = error;
+              abortScope.controller.abort();
+            }
+            return;
+          }
+        }
+      });
+    await Promise.all(workers);
+    if (hasError) throw firstError;
+    throwIfRequestAborted(
+      abortScope,
+      'Concurrent GitHub requests'
+    );
+    return results;
+  } finally {
+    abortScope.cleanup();
+  }
 }
 
 export function parseOwnerRepo(input) {
@@ -441,7 +1040,14 @@ function toWorkerAuthUrl(workerOrigin, workerPath) {
   return new URL(`${origin}${p}`);
 }
 
-async function githubRequest(workerOrigin, path, { token = null, method = 'GET', query = null, body = null, timeoutMs = GITHUB_DEFAULT_TIMEOUT_MS } = {}) {
+async function githubRequest(workerOrigin, path, {
+  token = null,
+  method = 'GET',
+  query = null,
+  body = null,
+  timeoutMs = GITHUB_DEFAULT_TIMEOUT_MS,
+  signal = null,
+} = {}) {
   const url = toWorkerApiUrl(workerOrigin, path);
   if (
     query !== null &&
@@ -481,33 +1087,43 @@ async function githubRequest(workerOrigin, path, { token = null, method = 'GET',
   const headers = {
     Accept: 'application/vnd.github+json',
   };
+  const mutationOperation = createGitHubMutationOperation(method, path);
   const exactToken = assertOptionalToken(token);
   if (exactToken !== null) headers.Authorization = `Bearer ${exactToken}`;
   if (body != null) headers['Content-Type'] = 'application/json';
-
-  const ms = assertTimeoutMs(timeoutMs);
-  if (typeof AbortController === 'undefined') {
-    throw new Error('AbortController is required for GitHub annotation requests');
+  if (mutationOperation !== null) {
+    headers[OPERATION_ID_HEADER] = mutationOperation.id;
   }
-  const controller = new AbortController();
 
-  /** @type {ReturnType<typeof setTimeout> | null} */
-  let timeout = null;
-  if (ms > 0) {
-    timeout = setTimeout(() => {
-      controller.abort();
-    }, ms);
-  }
+  const abortScope = createRequestAbortScope(signal, timeoutMs);
+  let dispatched = false;
 
   try {
+    throwIfRequestAborted(abortScope, 'GitHub request');
+    dispatched = true;
     const res = await fetch(url.toString(), {
       method,
       headers,
       body: body !== null ? stableStringifyJson(body) : undefined,
-      signal: controller.signal
+      signal: abortScope.controller.signal
     });
+    throwIfRequestAborted(abortScope, 'GitHub request');
+
+    let mutationOutcome = null;
+    if (mutationOperation !== null) {
+      try {
+        mutationOutcome = readWorkerMutationOutcome(
+          res,
+          mutationOperation
+        );
+      } catch (error) {
+        observeResponseBodyCancellation(res);
+        throw error;
+      }
+    }
 
     const text = await res.text();
+    throwIfRequestAborted(abortScope, 'GitHub request');
     let responseJson;
     try {
       responseJson = parseHttpJson(
@@ -521,7 +1137,15 @@ async function githubRequest(workerOrigin, path, { token = null, method = 'GET',
       error.status = res.status;
       error.github = { path, method };
       error.cause = cause;
-      throw error;
+      const exactError = attachRetryAfterHeader(error, res);
+      if (mutationOperation !== null) {
+        throw createUnknownMutationOutcomeError(
+          exactError.message,
+          mutationOperation,
+          exactError
+        );
+      }
+      throw exactError;
     }
 
     if (!res.ok) {
@@ -533,26 +1157,87 @@ async function githubRequest(workerOrigin, path, { token = null, method = 'GET',
       // attach minimal context (no token)
       err.status = res.status;
       err.github = { path, method };
-      throw err;
+      const exactError = attachRetryAfterHeader(err, res);
+      if (mutationOperation !== null) {
+        throw attachMutationOutcome(
+          exactError,
+          mutationOperation,
+          mutationOutcome
+        );
+      }
+      throw exactError;
     }
 
-    return responseJson;
+    return mutationOperation === null
+      ? responseJson
+      : attachMutationOutcomeToDocument(
+          responseJson,
+          mutationOperation,
+          mutationOutcome
+        );
   } catch (err) {
-    if (isAbortError(err)) {
-      const msg = ms > 0 ? `GitHub request timed out after ${Math.max(1, Math.round(ms / 1000))}s` : 'GitHub request aborted';
-      const e = new Error(msg);
-      e.code = 'TIMEOUT';
-      e.github = { path, method };
-      throw e;
+    try {
+      throwIfRequestAborted(
+        abortScope,
+        'GitHub request',
+        err
+      );
+    } catch (ownedError) {
+      ownedError.github = { path, method };
+      if (mutationOperation !== null && dispatched) {
+        const unknown = createUnknownMutationOutcomeError(
+          'GitHub mutation outcome is unknown after request cancellation',
+          mutationOperation,
+          ownedError
+        );
+        unknown.github = { path, method };
+        throw unknown;
+      }
+      throw ownedError;
+    }
+    if (
+      mutationOperation !== null &&
+      dispatched &&
+      !err?.operation
+    ) {
+      const unknown = createUnknownMutationOutcomeError(
+        'GitHub mutation outcome is unknown after a transport failure',
+        mutationOperation,
+        err
+      );
+      unknown.github = { path, method };
+      throw unknown;
+    }
+    if (
+      mutationOperation !== null &&
+      err?.operation &&
+      !err.github
+    ) {
+      err.github = { path, method };
+    }
+    if (isAbortError(err) && mutationOperation === null) {
+      const error = new Error(
+        'GitHub request transport was interrupted independently'
+      );
+      error.code = 'GITHUB_TRANSPORT_FAILED';
+      error.github = { path, method };
+      error.cause = err;
+      throw error;
     }
     if (err && typeof err === 'object' && !err.github) err.github = { path, method };
     throw err;
   } finally {
-    if (timeout !== null) clearTimeout(timeout);
+    abortScope.cleanup();
   }
 }
 
-async function workerAuthRequest(workerOrigin, path, { token = null, method = 'GET', body = null, timeoutMs = GITHUB_DEFAULT_TIMEOUT_MS } = {}) {
+async function workerAuthRequest(workerOrigin, path, {
+  token = null,
+  method = 'GET',
+  body = null,
+  timeoutMs = GITHUB_DEFAULT_TIMEOUT_MS,
+  signal = null,
+} = {}) {
   const url = toWorkerAuthUrl(workerOrigin, path);
   const headers = {};
   const exactToken = assertOptionalToken(token);
@@ -562,29 +1247,20 @@ async function workerAuthRequest(workerOrigin, path, { token = null, method = 'G
     throw new Error('GitHub worker request method must equal GET or POST');
   }
 
-  const ms = assertTimeoutMs(timeoutMs);
-  if (typeof AbortController === 'undefined') {
-    throw new Error('AbortController is required for GitHub worker requests');
-  }
-  const controller = new AbortController();
-
-  /** @type {ReturnType<typeof setTimeout> | null} */
-  let timeout = null;
-  if (ms > 0) {
-    timeout = setTimeout(() => {
-      controller.abort();
-    }, ms);
-  }
+  const abortScope = createRequestAbortScope(signal, timeoutMs);
 
   try {
+    throwIfRequestAborted(abortScope, 'GitHub auth request');
     const res = await fetch(url.toString(), {
       method,
       headers,
       body: body !== null ? stableStringifyJson(body) : undefined,
-      signal: controller.signal
+      signal: abortScope.controller.signal
     });
+    throwIfRequestAborted(abortScope, 'GitHub auth request');
 
     const text = await res.text();
+    throwIfRequestAborted(abortScope, 'GitHub auth request');
     let responseJson;
     try {
       responseJson = parseHttpJson(
@@ -598,7 +1274,7 @@ async function workerAuthRequest(workerOrigin, path, { token = null, method = 'G
       error.status = res.status;
       error.worker = { path, method };
       error.cause = cause;
-      throw error;
+      throw attachRetryAfterHeader(error, res);
     }
     if (!res.ok) {
       const msg = assertWorkerErrorDocument(
@@ -608,29 +1284,115 @@ async function workerAuthRequest(workerOrigin, path, { token = null, method = 'G
       const err = new Error(msg);
       err.status = res.status;
       err.worker = { path, method };
-      throw err;
+      throw attachRetryAfterHeader(err, res);
     }
     return responseJson;
   } catch (err) {
+    try {
+      throwIfRequestAborted(
+        abortScope,
+        'GitHub auth request',
+        err
+      );
+    } catch (ownedError) {
+      ownedError.worker = { path, method };
+      throw ownedError;
+    }
     if (isAbortError(err)) {
-      const msg = ms > 0 ? `Auth request timed out after ${Math.max(1, Math.round(ms / 1000))}s` : 'Auth request aborted';
-      const e = new Error(msg);
-      e.code = 'TIMEOUT';
-      e.worker = { path, method };
-      throw e;
+      const error = new Error(
+        'GitHub auth request transport was interrupted independently'
+      );
+      error.code = 'GITHUB_TRANSPORT_FAILED';
+      error.worker = { path, method };
+      error.cause = err;
+      throw error;
     }
     if (err && typeof err === 'object' && !err.worker) err.worker = { path, method };
     throw err;
   } finally {
-    if (timeout !== null) clearTimeout(timeout);
+    abortScope.cleanup();
   }
 }
 
-async function getRepoInfo({ workerOrigin, owner, repo, token = null }) {
-  return githubRequest(workerOrigin, `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`, { token });
+async function getRepoInfo({
+  workerOrigin,
+  owner,
+  repo,
+  token = null,
+  signal = null,
+}) {
+  return githubRequest(
+    workerOrigin,
+    `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`,
+    { token, signal }
+  );
 }
 
-async function getContent({ workerOrigin, owner, repo, token = null, path, ref = null }) {
+function assertForkRepositoryIdentity(value) {
+  assertExactObjectKeys(
+    value,
+    ['full_name', 'fork', 'parent'],
+    'GitHub fork identity'
+  );
+  const fullName = assertGitHubRepositoryFullName(
+    value.full_name,
+    'GitHub fork identity full_name'
+  );
+  if (typeof value.fork !== 'boolean') {
+    throw new Error('GitHub fork identity fork must be boolean');
+  }
+  if (value.fork === false) {
+    if (value.parent !== null) {
+      throw new Error(
+        'GitHub non-fork identity parent must equal exact null'
+      );
+    }
+    return { fork: false, fullName, parentFullName: null };
+  }
+  assertExactObjectKeys(
+    value.parent,
+    ['full_name'],
+    'GitHub fork identity parent'
+  );
+  return {
+    fork: true,
+    fullName,
+    parentFullName: assertGitHubRepositoryFullName(
+      value.parent.full_name,
+      'GitHub fork identity parent full_name'
+    ),
+  };
+}
+
+async function getForkRepositoryIdentity({
+  workerOrigin,
+  owner,
+  repo,
+  token,
+  signal = null,
+}) {
+  return assertForkRepositoryIdentity(
+    await githubRequest(
+      workerOrigin,
+      `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`,
+      {
+        token,
+        query: { fork_identity: 1 },
+        signal,
+      }
+    )
+  );
+}
+
+async function getContent({
+  workerOrigin,
+  owner,
+  repo,
+  token = null,
+  path,
+  ref = null,
+  signal = null,
+}) {
   const p = assertExactNonblankString(path, 'GitHub content path');
   if (p.startsWith('/') || p.split('/').some((segment) => !segment)) {
     throw new Error('GitHub content path must be a canonical relative path');
@@ -640,11 +1402,61 @@ async function getContent({ workerOrigin, owner, repo, token = null, path, ref =
   return githubRequest(
     workerOrigin,
     `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/${p.split('/').map(encodeURIComponent).join('/')}`,
-    { token, query }
+    { token, query, signal }
   );
 }
 
-async function putContent({ workerOrigin, owner, repo, token, path, branch, message, contentBase64, sha = null }) {
+function assertContentFileRecord(content, path) {
+  if (!content || content.type !== 'file') {
+    throw new Error(`Expected file at ${path}`);
+  }
+  if (content.encoding !== 'base64') {
+    throw new Error(`GitHub file ${JSON.stringify(path)} must use base64 encoding`);
+  }
+  const sha = assertGitHubSha(content.sha, `GitHub file ${JSON.stringify(path)} SHA`);
+  scanFoldedBase64Payload(content.content, { path });
+  return {
+    contentBase64: content.content,
+    sha,
+  };
+}
+
+function shouldReconcileMutation(error, kind) {
+  const operation = error?.operation;
+  if (
+    operation &&
+    operation.kind === kind &&
+    (
+      operation.outcome === 'unknown' ||
+      operation.outcome === 'applied'
+    )
+  ) {
+    return true;
+  }
+  return (
+    (error?.status === 409 || error?.status === 422) &&
+    (
+      !operation ||
+      (
+        operation.kind === kind &&
+        operation.outcome === 'not-applied'
+      )
+    )
+  );
+}
+
+async function putContent({
+  workerOrigin,
+  owner,
+  repo,
+  token,
+  path,
+  branch,
+  message,
+  contentBase64,
+  sha = null,
+  signal = null,
+}) {
   const exactToken = assertExactNonblankString(
     token,
     'GitHub token',
@@ -667,46 +1479,127 @@ async function putContent({ workerOrigin, owner, repo, token, path, branch, mess
     throw new Error('GitHub base64 content must be an exact nonblank string');
   }
   const exactContent = contentBase64;
+  if (
+    scanFoldedBase64Payload(exactContent, {
+      path: p,
+      phase: 'publication-preflight',
+    }).hasFolding
+  ) {
+    throw new Error('GitHub base64 content must be canonical and unfolded');
+  }
   const payload = {
     message: exactMessage,
     content: exactContent,
     branch: assertGitHubBranch(branch),
   };
   if (sha !== null) payload.sha = assertGitHubSha(sha, 'Existing content SHA');
-  return githubRequest(
-    workerOrigin,
-    `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/${p.split('/').map(encodeURIComponent).join('/')}`,
-    { token: exactToken, method: 'PUT', body: payload }
-  );
+  const requestPath =
+    `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/${p.split('/').map(encodeURIComponent).join('/')}`;
+  let response = null;
+  try {
+    response = await githubRequest(
+      workerOrigin,
+      requestPath,
+      {
+        token: exactToken,
+        method: 'PUT',
+        body: payload,
+        signal,
+      }
+    );
+    assertGitHubSha(
+      response?.content?.sha,
+      'Published GitHub content SHA'
+    );
+    return response;
+  } catch (caughtError) {
+    const error = attachDocumentMutationOutcome(caughtError, response);
+    if (
+      !shouldReconcileMutation(error, 'contents-put') ||
+      signal?.aborted === true
+    ) {
+      throw error;
+    }
+    try {
+      const remote = await getContent({
+        workerOrigin,
+        owner,
+        repo,
+        token: exactToken,
+        path: p,
+        ref: payload.branch,
+        signal,
+      });
+      const remoteFile = assertContentFileRecord(remote, p);
+      if (
+        base64PayloadEqualsCanonical(
+          remoteFile.contentBase64,
+          exactContent,
+          p
+        )
+      ) {
+        return { content: { sha: remoteFile.sha } };
+      }
+    } catch {
+      // The original mutation outcome remains authoritative when one bounded
+      // desired-state read cannot prove convergence.
+    }
+    throw error;
+  }
 }
 
 function isContentConflictError(error) {
-  return error?.status === 409;
+  return (
+    error?.status === 409 &&
+    (
+      !error?.operation ||
+      error.operation.outcome === 'not-applied'
+    )
+  );
+}
+
+function inheritMutationErrorContext(error, cause) {
+  error.cause = cause;
+  if (Number.isSafeInteger(cause?.status)) {
+    error.status = cause.status;
+  }
+  if (cause?.operation) {
+    error.operation = cause.operation;
+  }
+  if (cause?.github) {
+    error.github = cause.github;
+  }
+  return error;
 }
 
 function decodeJsonContentFile(content, path) {
-  if (!content || content.type !== 'file') {
-    throw new Error(`Expected file at ${path}`);
-  }
-  if (content.encoding !== 'base64') {
-    throw new Error(`GitHub file ${JSON.stringify(path)} must use base64 encoding`);
-  }
-  if (
-      typeof content.sha !== 'string' ||
-      !content.sha ||
-      !GITHUB_SHA.test(content.sha)
-    ) {
-    throw new Error(`GitHub file ${JSON.stringify(path)} is missing an exact SHA`);
-  }
-  const decoded = decodeBase64Utf8(content.content);
+  const file = assertContentFileRecord(content, path);
+  const { decoded } = decodeBase64Utf8(file.contentBase64, path);
   return {
     json: parseExactJson(decoded, { path }),
-    sha: content.sha,
+    sha: file.sha,
+    contentBase64: file.contentBase64,
   };
 }
 
-async function readJsonFile({ workerOrigin, owner, repo, token = null, path, ref = null }) {
-  const content = await getContent({ workerOrigin, owner, repo, token, path, ref });
+async function readJsonFile({
+  workerOrigin,
+  owner,
+  repo,
+  token = null,
+  path,
+  ref = null,
+  signal = null,
+}) {
+  const content = await getContent({
+    workerOrigin,
+    owner,
+    repo,
+    token,
+    path,
+    ref,
+    signal,
+  });
   return decodeJsonContentFile(content, path);
 }
 
@@ -714,16 +1607,39 @@ function isNotFoundError(err) {
   return err?.status === 404;
 }
 
-async function readJsonFileOrNull({ workerOrigin, owner, repo, token, path, ref }) {
+async function readJsonFileOrNull({
+  workerOrigin,
+  owner,
+  repo,
+  token,
+  path,
+  ref,
+  signal = null,
+}) {
   try {
-    return await readJsonFile({ workerOrigin, owner, repo, token, path, ref });
+    return await readJsonFile({
+      workerOrigin,
+      owner,
+      repo,
+      token,
+      path,
+      ref,
+      signal,
+    });
   } catch (err) {
-    if (isNotFoundError(err)) return { json: null, sha: null };
+    if (isNotFoundError(err)) {
+      return { json: null, sha: null, contentBase64: null };
+    }
     throw err;
   }
 }
 
-function assertForkRecord(value, index, upstreamFullName) {
+function assertForkRecord(
+  value,
+  index,
+  upstreamFullName,
+  { requireParent = false } = {}
+) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     throw new Error(`GitHub fork ${index} must be an object`);
   }
@@ -749,9 +1665,11 @@ function assertForkRecord(value, index, upstreamFullName) {
   if (fullName.toLowerCase() !== `${owner}/${name}`.toLowerCase()) {
     throw new Error(`GitHub fork ${index} identity fields disagree`);
   }
-  if (
-    value.parent !== undefined &&
-    (
+  if (requireParent && value.parent === undefined) {
+    throw new Error(`GitHub fork ${index} is missing its parent repository`);
+  }
+  if (value.parent !== undefined) {
+    if (
       !value.parent ||
       typeof value.parent !== 'object' ||
       Array.isArray(value.parent) ||
@@ -759,75 +1677,411 @@ function assertForkRecord(value, index, upstreamFullName) {
         value.parent.full_name,
         `GitHub fork ${index} parent full_name`
       ).toLowerCase() !== upstreamFullName.toLowerCase()
-    )
-  ) {
-    throw new Error(`GitHub fork ${index} has a different parent repository`);
+    ) {
+      throw new Error(`GitHub fork ${index} has a different parent repository`);
+    }
   }
   return { owner, name, fullName };
+}
+
+function createForkLookupLimitError({
+  forkOwner,
+  upstreamFullName,
+  cause = undefined,
+}) {
+  const error = new Error(
+    `Cellucid could not safely locate a renamed fork of ` +
+    `${upstreamFullName} owned by ${forkOwner} within the newest ` +
+    `${GITHUB_RENAMED_FORK_LOOKUP_MAX_ITEMS.toLocaleString('en-US')} forks ` +
+    `or ${Math.round(GITHUB_RENAMED_FORK_LOOKUP_TIMEOUT_MS / 1000)}s. ` +
+    `Rename the fork to the upstream repository name on GitHub, then publish again.`
+  );
+  error.code = 'GITHUB_FORK_LOOKUP_LIMIT';
+  if (cause !== undefined) error.cause = cause;
+  return error;
+}
+
+function createForkNameConflictError({
+  forkOwner,
+  upstreamFullName,
+  canonicalFullName,
+}) {
+  const error = new Error(
+    `GitHub repository ${canonicalFullName} exists, but it is not a fork of ` +
+    `${upstreamFullName}. Rename that repository or rename the existing ` +
+    `${forkOwner} fork to the upstream repository name, then publish again.`
+  );
+  error.code = 'GITHUB_FORK_NAME_CONFLICT';
+  return error;
+}
+
+async function probeCanonicalOwnedFork({
+  workerOrigin,
+  upstreamRepo,
+  upstreamFullName,
+  token,
+  forkOwner,
+  signal = null,
+}) {
+  const exactForkOwner = assertGitHubLogin(forkOwner, 'Fork owner');
+  const expectedFullName = `${exactForkOwner}/${upstreamRepo}`;
+  let identity;
+  try {
+    identity = await getForkRepositoryIdentity({
+      workerOrigin,
+      owner: exactForkOwner,
+      repo: upstreamRepo,
+      token,
+      signal,
+    });
+  } catch (error) {
+    if (isNotFoundError(error)) return null;
+    throw error;
+  }
+  const separator = identity.fullName.indexOf('/');
+  const actualOwner = identity.fullName.slice(0, separator);
+  const actualName = identity.fullName.slice(separator + 1);
+  if (
+    actualOwner.toLowerCase() === exactForkOwner.toLowerCase() &&
+    identity.fork &&
+    identity.parentFullName.toLowerCase() === upstreamFullName.toLowerCase()
+  ) {
+    return {
+      collision: false,
+      name: actualName,
+    };
+  }
+  return {
+    collision: true,
+    canonicalFullName:
+      actualOwner.toLowerCase() === exactForkOwner.toLowerCase()
+        ? identity.fullName
+        : expectedFullName,
+  };
+}
+
+async function findOwnedForkRepo({
+  workerOrigin,
+  upstreamOwner,
+  upstreamRepo,
+  upstreamFullName,
+  token,
+  forkOwner,
+  signal = null,
+}) {
+  const exactUpstreamFullName = assertGitHubRepositoryFullName(
+    upstreamFullName,
+    'Fork source repository'
+  );
+  const exactForkOwner = assertGitHubLogin(forkOwner, 'Fork owner');
+  const seen = new Set();
+  const abortScope = createRequestAbortScope(
+    signal,
+    GITHUB_RENAMED_FORK_LOOKUP_TIMEOUT_MS
+  );
+  try {
+    for (
+      let page = 1;
+      page <= GITHUB_RENAMED_FORK_LOOKUP_MAX_PAGES;
+      page += 1
+    ) {
+      throwIfRequestAborted(abortScope, 'GitHub renamed fork lookup');
+      const document = await githubRequest(
+        workerOrigin,
+        `/repos/${encodeURIComponent(upstreamOwner)}/${encodeURIComponent(upstreamRepo)}/forks`,
+        {
+          token,
+          query: { sort: 'newest', per_page: 100, page },
+          signal: abortScope.controller.signal,
+          timeoutMs: 0,
+        }
+      );
+      if (!Array.isArray(document)) {
+        throw new Error('GitHub forks response must be an array');
+      }
+      if (document.length > 100) {
+        throw new Error('GitHub forks response page exceeds 100 entries');
+      }
+      let matchingName = null;
+      document.forEach((raw, index) => {
+        const fork = assertForkRecord(
+          raw,
+          (page - 1) * 100 + index,
+          exactUpstreamFullName
+        );
+        const key = fork.fullName.toLowerCase();
+        if (seen.has(key)) {
+          throw new Error(`GitHub forks response repeats ${fork.fullName}`);
+        }
+        seen.add(key);
+        if (fork.owner.toLowerCase() === exactForkOwner.toLowerCase()) {
+          if (matchingName !== null) {
+            throw new Error(
+              `GitHub returned multiple forks owned by ${exactForkOwner}`
+            );
+          }
+          matchingName = fork.name;
+        }
+      });
+      if (matchingName !== null) return matchingName;
+      if (document.length < 100) return null;
+    }
+    throw createForkLookupLimitError({
+      forkOwner: exactForkOwner,
+      upstreamFullName: exactUpstreamFullName,
+    });
+  } catch (error) {
+    try {
+      throwIfRequestAborted(
+        abortScope,
+        'GitHub renamed fork lookup',
+        error
+      );
+    } catch (ownedError) {
+      if (abortScope.abortCause() === 'timeout') {
+        throw createForkLookupLimitError({
+          forkOwner: exactForkOwner,
+          upstreamFullName: exactUpstreamFullName,
+          cause: ownedError,
+        });
+      }
+      throw ownedError;
+    }
+    if (error?.code === 'TIMEOUT') {
+      throw createForkLookupLimitError({
+        forkOwner: exactForkOwner,
+        upstreamFullName: exactUpstreamFullName,
+        cause: error,
+      });
+    }
+    throw error;
+  } finally {
+    abortScope.cleanup();
+  }
 }
 
 async function selectOrCreateForkRepo({
   workerOrigin,
   upstreamOwner,
   upstreamRepo,
+  upstreamFullName,
   token,
   forkOwner,
+  signal = null,
 }) {
-  const upstreamFullName = `${upstreamOwner}/${upstreamRepo}`;
+  const exactUpstreamFullName = assertGitHubRepositoryFullName(
+    upstreamFullName,
+    'Fork source repository'
+  );
   const exactForkOwner = assertGitHubLogin(forkOwner, 'Fork owner');
-  const matching = [];
-  const seen = new Set();
-  for (let page = 1; page <= 10_000; page += 1) {
-    const document = await githubRequest(
+  const canonical = await probeCanonicalOwnedFork({
+    workerOrigin,
+    upstreamRepo,
+    upstreamFullName: exactUpstreamFullName,
+    token,
+    forkOwner: exactForkOwner,
+    signal,
+  });
+  if (canonical !== null && !canonical.collision) {
+    return { name: canonical.name, requiresReadiness: false };
+  }
+  if (canonical?.collision) {
+    const renamed = await findOwnedForkRepo({
+      workerOrigin,
+      upstreamOwner,
+      upstreamRepo,
+      upstreamFullName: exactUpstreamFullName,
+      token,
+      forkOwner: exactForkOwner,
+      signal,
+    });
+    if (renamed !== null) {
+      return { name: renamed, requiresReadiness: false };
+    }
+    throw createForkNameConflictError({
+      forkOwner: exactForkOwner,
+      upstreamFullName: exactUpstreamFullName,
+      canonicalFullName: canonical.canonicalFullName,
+    });
+  }
+
+  let created = null;
+  try {
+    created = await githubRequest(
       workerOrigin,
       `/repos/${encodeURIComponent(upstreamOwner)}/${encodeURIComponent(upstreamRepo)}/forks`,
-      { token, query: { per_page: 100, page } }
+      { token, method: 'POST', body: {}, signal }
     );
-    if (!Array.isArray(document)) {
-      throw new Error('GitHub forks response must be an array');
-    }
-    if (document.length > 100) {
-      throw new Error('GitHub forks response page exceeds 100 entries');
-    }
-    document.forEach((raw, index) => {
-      const fork = assertForkRecord(
-        raw,
-        (page - 1) * 100 + index,
-        upstreamFullName
+    const fork = assertForkRecord(
+      created,
+      'created',
+      exactUpstreamFullName,
+      { requireParent: true }
+    );
+    if (fork.owner.toLowerCase() !== exactForkOwner.toLowerCase()) {
+      throw new Error(
+        `GitHub created the fork for ${fork.owner}, expected ${exactForkOwner}`
       );
-      const key = fork.fullName.toLowerCase();
-      if (seen.has(key)) {
-        throw new Error(`GitHub forks response repeats ${fork.fullName}`);
+    }
+    return { name: fork.name, requiresReadiness: true };
+  } catch (caughtError) {
+    const error = attachDocumentMutationOutcome(caughtError, created);
+    if (
+      !shouldReconcileMutation(error, 'forks-post') ||
+      signal?.aborted === true
+    ) {
+      throw error;
+    }
+    try {
+      const reconciledCanonical = await probeCanonicalOwnedFork({
+        workerOrigin,
+        upstreamRepo,
+        upstreamFullName: exactUpstreamFullName,
+        token,
+        forkOwner: exactForkOwner,
+        signal,
+      });
+      if (
+        reconciledCanonical !== null &&
+        !reconciledCanonical.collision
+      ) {
+        return {
+          name: reconciledCanonical.name,
+          requiresReadiness: true,
+        };
       }
-      seen.add(key);
-      if (fork.owner.toLowerCase() === exactForkOwner.toLowerCase()) {
-        matching.push(fork);
+      const reconciled = await findOwnedForkRepo({
+        workerOrigin,
+        upstreamOwner,
+        upstreamRepo,
+        upstreamFullName: exactUpstreamFullName,
+        token,
+        forkOwner: exactForkOwner,
+        signal,
+      });
+      if (reconciled !== null) {
+        return { name: reconciled, requiresReadiness: true };
       }
-    });
-    if (document.length < 100) break;
-    if (page === 10_000) {
-      throw new Error('GitHub forks response exceeds 1,000,000 entries');
+      if (reconciledCanonical?.collision) {
+        throw createForkNameConflictError({
+          forkOwner: exactForkOwner,
+          upstreamFullName: exactUpstreamFullName,
+          canonicalFullName:
+            reconciledCanonical.canonicalFullName,
+        });
+      }
+    } catch (reconciliationError) {
+      if (
+        error?.operation?.outcome === 'unknown' ||
+        error?.operation?.outcome === 'applied'
+      ) {
+        throw error;
+      }
+      if (
+        reconciliationError?.code === 'GITHUB_FORK_LOOKUP_LIMIT' ||
+        reconciliationError?.code === 'GITHUB_FORK_NAME_CONFLICT' ||
+        reconciliationError?.code === 'GITHUB_REQUEST_ABORTED'
+      ) {
+        throw reconciliationError;
+      }
+      // Preserve the original mutation outcome when the bounded read cannot
+      // prove that the exact fork now exists.
+    }
+    throw error;
+  }
+}
+
+function waitForForkReadinessDelay(delayMs, signal) {
+  if (!Number.isSafeInteger(delayMs) || delayMs < 1) {
+    throw new Error('GitHub fork readiness delay must be a positive integer');
+  }
+  if (signal?.aborted === true) {
+    throw createOwnedRequestAbortError(
+      'GitHub fork readiness',
+      signal.reason
+    );
+  }
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const settle = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+      callback(value);
+    };
+    const onAbort = () => {
+      settle(
+        reject,
+        createOwnedRequestAbortError(
+          'GitHub fork readiness',
+          signal.reason
+        )
+      );
+    };
+    const timer = setTimeout(() => settle(resolve), delayMs);
+    signal?.addEventListener('abort', onAbort, { once: true });
+    if (signal?.aborted === true) onAbort();
+  });
+}
+
+async function waitForForkBaseRef({
+  workerOrigin,
+  owner,
+  repo,
+  token,
+  branch,
+  signal = null,
+}) {
+  const exactOwner = assertGitHubLogin(owner, 'Fork readiness owner');
+  const exactRepo = assertExactNonblankString(
+    repo,
+    'Fork readiness repository',
+    { max: 100 }
+  );
+  if (!isCanonicalGitHubRepositoryName(exactRepo)) {
+    throw new Error('Fork readiness repository is not canonical');
+  }
+  const exactBranch = assertGitHubBranch(
+    branch,
+    'Fork readiness base branch'
+  );
+  let lastNotFound = null;
+  for (
+    let attempt = 1;
+    attempt <= GITHUB_FORK_READINESS_ATTEMPTS;
+    attempt += 1
+  ) {
+    try {
+      await getBranchTipSha({
+        workerOrigin,
+        owner: exactOwner,
+        repo: exactRepo,
+        token,
+        branch: exactBranch,
+        signal,
+        timeoutMs: GITHUB_FORK_READINESS_REQUEST_TIMEOUT_MS,
+      });
+      return;
+    } catch (error) {
+      if (error?.status !== 404) throw error;
+      lastNotFound = error;
+    }
+    if (attempt < GITHUB_FORK_READINESS_ATTEMPTS) {
+      await waitForForkReadinessDelay(
+        Math.min(1_000, 100 * (2 ** (attempt - 1))),
+        signal
+      );
     }
   }
-  if (matching.length > 1) {
-    throw new Error(
-      `GitHub returned multiple forks owned by ${exactForkOwner}`
-    );
-  }
-  if (matching.length === 1) return matching[0].name;
-
-  const created = await githubRequest(
-    workerOrigin,
-    `/repos/${encodeURIComponent(upstreamOwner)}/${encodeURIComponent(upstreamRepo)}/forks`,
-    { token, method: 'POST', body: {} }
+  const error = new Error(
+    `GitHub fork ${exactOwner}/${exactRepo} did not expose base branch ` +
+    `${exactBranch} after ${GITHUB_FORK_READINESS_ATTEMPTS} readiness probes. ` +
+    'Wait for GitHub to finish creating the fork, then try again.'
   );
-  const fork = assertForkRecord(created, 'created', upstreamFullName);
-  if (fork.owner.toLowerCase() !== exactForkOwner.toLowerCase()) {
-    throw new Error(
-      `GitHub created the fork for ${fork.owner}, expected ${exactForkOwner}`
-    );
-  }
-  return fork.name;
+  error.code = 'GITHUB_FORK_NOT_READY';
+  error.cause = lastNotFound;
+  throw error;
 }
 
 function requireBranchTipSha(document, label) {
@@ -844,52 +2098,121 @@ function requireBranchTipSha(document, label) {
   return assertGitHubSha(document.object.sha, `${label} object SHA`);
 }
 
-async function getBranchTipSha({ workerOrigin, owner, repo, token, branch }) {
+async function getBranchTipSha({
+  workerOrigin,
+  owner,
+  repo,
+  token,
+  branch,
+  signal = null,
+  timeoutMs = GITHUB_DEFAULT_TIMEOUT_MS,
+}) {
   const exactBranch = assertGitHubBranch(branch);
   const ref = await githubRequest(
     workerOrigin,
     `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/ref/heads/${encodeGitRefPath(exactBranch)}`,
-    { token }
+    { token, signal, timeoutMs }
   );
   return requireBranchTipSha(ref, 'GitHub branch response');
 }
 
-async function ensureBranchExists({ workerOrigin, owner, repo, token, branch, baseSha }) {
+async function ensureBranchExists({
+  workerOrigin,
+  owner,
+  repo,
+  token,
+  branch,
+  baseSha,
+  signal = null,
+}) {
   const b = assertGitHubBranch(branch, 'Pull Request branch');
   const sha = assertGitHubSha(baseSha, 'Pull Request base SHA');
   try {
     const existing = await githubRequest(
       workerOrigin,
       `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/ref/heads/${encodeGitRefPath(b)}`,
-      { token }
+      { token, signal }
     );
     requireBranchTipSha(existing, 'Existing Pull Request branch response');
     return;
   } catch (err) {
     if (err?.status !== 404) throw err;
   }
-  await githubRequest(
-    workerOrigin,
-    `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/refs`,
-    {
-      token,
-      method: 'POST',
-      body: { ref: `refs/heads/${b}`, sha }
+  try {
+    await githubRequest(
+      workerOrigin,
+      `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/refs`,
+      {
+        token,
+        method: 'POST',
+        body: { ref: `refs/heads/${b}`, sha },
+        signal,
+      }
+    );
+  } catch (error) {
+    if (
+      !shouldReconcileMutation(error, 'git-refs-post') ||
+      signal?.aborted === true
+    ) {
+      throw error;
     }
-  );
+    try {
+      const currentSha = await getBranchTipSha({
+        workerOrigin,
+        owner,
+        repo,
+        token,
+        branch: b,
+        signal,
+      });
+      if (currentSha === sha) return;
+    } catch {
+      // The original mutation outcome remains authoritative when the exact
+      // requested branch tip cannot be proved by one read.
+    }
+    throw error;
+  }
 }
 
-async function upsertFileOnBranch({ workerOrigin, owner, repo, token, branch, path, message, contentBase64 }) {
+async function upsertFileOnBranch({
+  workerOrigin,
+  owner,
+  repo,
+  token,
+  branch,
+  path,
+  message,
+  contentBase64,
+  signal = null,
+}) {
   const b = assertGitHubBranch(branch, 'Pull Request branch');
   const p = assertExactNonblankString(path, 'Pull Request file path');
 
   let sha = null;
   try {
-    const existing = await getContent({ workerOrigin, owner, repo, token, path: p, ref: b });
+    const existing = await getContent({
+      workerOrigin,
+      owner,
+      repo,
+      token,
+      path: p,
+      ref: b,
+      signal,
+    });
     if (!existing || existing.type !== 'file') {
       throw new Error(`Expected file at ${p}`);
     }
-    sha = assertGitHubSha(existing.sha, `Existing ${p} SHA`);
+    const existingFile = assertContentFileRecord(existing, p);
+    sha = existingFile.sha;
+    if (
+      base64PayloadEqualsCanonical(
+        existingFile.contentBase64,
+        contentBase64,
+        p
+      )
+    ) {
+      return;
+    }
   } catch (err) {
     if (err?.status !== 404) throw err;
   }
@@ -904,7 +2227,79 @@ async function upsertFileOnBranch({ workerOrigin, owner, repo, token, branch, pa
     message,
     contentBase64,
     sha,
+    signal,
   });
+}
+
+function assertPullRequestRecord(value, label) {
+  if (
+    !value ||
+    typeof value !== 'object' ||
+    Array.isArray(value) ||
+    !Number.isSafeInteger(value.number) ||
+    value.number < 1
+  ) {
+    throw new Error(`${label} has an invalid number`);
+  }
+  const htmlUrl = assertExactNonblankString(
+    value.html_url,
+    `${label} html_url`,
+    { max: 2048 }
+  );
+  let parsed;
+  try {
+    parsed = new URL(htmlUrl);
+  } catch (cause) {
+    const error = new Error(`${label} html_url must be an HTTPS URL`);
+    error.cause = cause;
+    throw error;
+  }
+  if (parsed.protocol !== 'https:' || parsed.toString() !== htmlUrl) {
+    throw new Error(`${label} html_url must be an exact HTTPS URL`);
+  }
+  return {
+    number: value.number,
+    html_url: htmlUrl,
+  };
+}
+
+async function findOpenPullRequest({
+  workerOrigin,
+  token,
+  upstreamOwner,
+  upstreamRepo,
+  baseBranch,
+  headOwner,
+  headBranch,
+  signal = null,
+}) {
+  const headQuery = `${headOwner}:${headBranch}`;
+  const existing = await githubRequest(
+    workerOrigin,
+    `/repos/${encodeURIComponent(upstreamOwner)}/${encodeURIComponent(upstreamRepo)}/pulls`,
+    {
+      token,
+      query: {
+        state: 'open',
+        head: headQuery,
+        base: baseBranch,
+        per_page: 100,
+      },
+      signal,
+    }
+  );
+  if (!Array.isArray(existing)) {
+    throw new Error('GitHub Pull Request lookup must return an array');
+  }
+  if (existing.length > 1) {
+    throw new Error('GitHub returned multiple open Pull Requests for one head');
+  }
+  return existing.length === 0
+    ? null
+    : assertPullRequestRecord(
+        existing[0],
+        'Existing GitHub Pull Request'
+      );
 }
 
 async function openOrReusePullRequest({
@@ -917,7 +2312,8 @@ async function openOrReusePullRequest({
   headRepo,
   headBranch,
   title,
-  body
+  body,
+  signal = null,
 }) {
   const exactHeadOwner = assertGitHubLogin(headOwner, 'Pull Request head owner');
   const exactHeadBranch = assertGitHubBranch(
@@ -940,45 +2336,71 @@ async function openOrReusePullRequest({
   );
   const headQuery = `${exactHeadOwner}:${exactHeadBranch}`;
 
-  const existing = await githubRequest(
+  const existing = await findOpenPullRequest({
     workerOrigin,
-    `/repos/${encodeURIComponent(upstreamOwner)}/${encodeURIComponent(upstreamRepo)}/pulls`,
-    {
-      token,
-      query: {
-        state: 'open',
-        head: headQuery,
-        base: exactBaseBranch,
-        per_page: 100,
-      }
-    }
-  );
-  if (!Array.isArray(existing)) {
-    throw new Error('GitHub Pull Request lookup must return an array');
-  }
-  if (existing.length > 1) {
-    throw new Error('GitHub returned multiple open Pull Requests for one head');
-  }
-  if (existing.length === 1) {
-    return { pr: existing[0], reused: true };
-  }
+    token,
+    upstreamOwner,
+    upstreamRepo,
+    baseBranch: exactBaseBranch,
+    headOwner: exactHeadOwner,
+    headBranch: exactHeadBranch,
+    signal,
+  });
+  if (existing !== null) return { pr: existing, reused: true };
 
-  const pr = await githubRequest(
-    workerOrigin,
-    `/repos/${encodeURIComponent(upstreamOwner)}/${encodeURIComponent(upstreamRepo)}/pulls`,
-    {
-      token,
-      method: 'POST',
-      body: {
-        title: exactTitle,
-        head: headQuery,
-        base: exactBaseBranch,
-        body: exactBody,
-        maintainer_can_modify: true
-      }
+  let created = null;
+  try {
+    created = await githubRequest(
+      workerOrigin,
+      `/repos/${encodeURIComponent(upstreamOwner)}/${encodeURIComponent(upstreamRepo)}/pulls`,
+      {
+        token,
+        method: 'POST',
+        body: {
+          title: exactTitle,
+          head: headQuery,
+          base: exactBaseBranch,
+          body: exactBody,
+          maintainer_can_modify: true
+        },
+        signal,
+      },
+    );
+    return {
+      pr: assertPullRequestRecord(
+        created,
+        'Created GitHub Pull Request'
+      ),
+      reused: false,
+    };
+  } catch (caughtError) {
+    const error = attachDocumentMutationOutcome(caughtError, created);
+    if (
+      !shouldReconcileMutation(error, 'pulls-post') ||
+      signal?.aborted === true
+    ) {
+      throw error;
     }
-  );
-  return { pr, reused: false };
+    try {
+      const reconciled = await findOpenPullRequest({
+        workerOrigin,
+        token,
+        upstreamOwner,
+        upstreamRepo,
+        baseBranch: exactBaseBranch,
+        headOwner: exactHeadOwner,
+        headBranch: exactHeadBranch,
+        signal,
+      });
+      if (reconciled !== null) {
+        return { pr: reconciled, reused: true };
+      }
+    } catch {
+      // Do not create a second Pull Request when one bounded lookup cannot
+      // prove the outcome of the dispatched creation.
+    }
+    throw error;
+  }
 }
 
 async function publishFileViaPullRequest({
@@ -993,7 +2415,8 @@ async function publishFileViaPullRequest({
   path,
   title,
   body,
-  contentBase64
+  contentBase64,
+  signal = null,
 }) {
   const upstreamSha = await getBranchTipSha({
     workerOrigin,
@@ -1001,6 +2424,7 @@ async function publishFileViaPullRequest({
     repo: upstreamRepo,
     token,
     branch: baseBranch,
+    signal,
   });
 
   await ensureBranchExists({
@@ -1010,6 +2434,7 @@ async function publishFileViaPullRequest({
     token,
     branch: headBranch,
     baseSha: upstreamSha,
+    signal,
   });
   await upsertFileOnBranch({
     workerOrigin,
@@ -1019,7 +2444,8 @@ async function publishFileViaPullRequest({
     branch: headBranch,
     path,
     message: title,
-    contentBase64
+    contentBase64,
+    signal,
   });
 
   const { pr, reused } = await openOrReusePullRequest({
@@ -1032,7 +2458,8 @@ async function publishFileViaPullRequest({
     headRepo,
     headBranch,
     title,
-    body
+    body,
+    signal,
   });
 
   if (
@@ -1078,9 +2505,22 @@ async function publishAnnotationFile({
   body,
   contentBase64,
   sourceSha,
+  signal = null,
 }) {
   const mode = assertPublicationMode(publicationMode);
   const capability = assertRepositoryPublicationInfo(repoInfo);
+  assertGitHubLogin(upstreamOwner, 'Connected repository owner');
+  if (!isCanonicalGitHubRepositoryName(upstreamRepo)) {
+    throw new Error('Connected repository name is not canonical');
+  }
+  const resolvedSource = parseCanonicalGitHubRepositoryReference(
+    repoInfo.full_name
+  );
+  if (resolvedSource === null || resolvedSource.ref !== null) {
+    throw new Error(
+      'GitHub repository metadata did not resolve an exact source repository'
+    );
+  }
   if (mode === 'direct') {
     if (!capability.canDirectPush) {
       throw new Error(
@@ -1089,14 +2529,15 @@ async function publishAnnotationFile({
     }
     const response = await putContent({
       workerOrigin,
-      owner: upstreamOwner,
-      repo: upstreamRepo,
+      owner: resolvedSource.owner,
+      repo: resolvedSource.repo,
       token,
       path,
       branch: baseBranch,
       message: title,
       contentBase64,
       sha: sourceSha,
+      signal,
     });
     const rawSha = response?.content?.sha;
     return {
@@ -1111,7 +2552,10 @@ async function publishAnnotationFile({
     );
   }
   const authUser = assertAuthUserResponse(
-    await workerAuthRequest(workerOrigin, '/auth/user', { token })
+    await workerAuthRequest(workerOrigin, '/auth/user', {
+      token,
+      signal,
+    })
   );
   const expectedFileUser = `ghid_${authUser.id}`;
   if (fileUser !== null && fileUser !== expectedFileUser) {
@@ -1119,13 +2563,25 @@ async function publishAnnotationFile({
       `Pull Request file identity must equal authenticated user ${expectedFileUser}`
     );
   }
-  const forkRepo = await selectOrCreateForkRepo({
+  const fork = await selectOrCreateForkRepo({
     workerOrigin,
-    upstreamOwner,
-    upstreamRepo,
+    upstreamOwner: resolvedSource.owner,
+    upstreamRepo: resolvedSource.repo,
+    upstreamFullName: repoInfo.full_name,
     token,
     forkOwner: authUser.login,
+    signal,
   });
+  if (fork.requiresReadiness) {
+    await waitForForkBaseRef({
+      workerOrigin,
+      owner: authUser.login,
+      repo: fork.name,
+      token,
+      branch: baseBranch,
+      signal,
+    });
+  }
   const headBranch = toDeterministicPrBranch({
     datasetId,
     baseBranch,
@@ -1134,16 +2590,17 @@ async function publishAnnotationFile({
   const result = await publishFileViaPullRequest({
     workerOrigin,
     token,
-    upstreamOwner,
-    upstreamRepo,
+    upstreamOwner: resolvedSource.owner,
+    upstreamRepo: resolvedSource.repo,
     baseBranch,
     headOwner: authUser.login,
-    headRepo: forkRepo,
+    headRepo: fork.name,
     headBranch,
     path,
     title,
     body,
     contentBase64,
+    signal,
   });
   return { mode, ...result };
 }
@@ -1183,11 +2640,21 @@ export class CommunityAnnotationGitHubSync {
     return `${this.owner}/${this.repo}`;
   }
 
-  async validateAndLoadConfig({ datasetId } = {}) {
+  async validateAndLoadConfig({ datasetId, signal = null } = {}) {
+    const requestSignal = assertAbortSignalOrNull(
+      signal,
+      'Annotation config request signal'
+    );
     const token = this.token;
     if (!token) throw new Error('GitHub sign-in required');
     const workerOrigin = this.workerOrigin;
-    const repoInfo = await getRepoInfo({ workerOrigin, owner: this.owner, repo: this.repo, token });
+    const repoInfo = await getRepoInfo({
+      workerOrigin,
+      owner: this.owner,
+      repo: this.repo,
+      token,
+      signal: requestSignal,
+    });
     assertRepositoryPublicationInfo(repoInfo);
     this._repoInfo = repoInfo;
     const branch = this.branch === null
@@ -1215,6 +2682,7 @@ export class CommunityAnnotationGitHubSync {
             token,
             path,
             ref: branch,
+            signal: requestSignal,
           });
           return { kind, path, json };
         })
@@ -1231,7 +2699,8 @@ export class CommunityAnnotationGitHubSync {
       repo: this.repo,
       token,
       path: 'annotations/config.json',
-      ref: branch
+      ref: branch,
+      signal: requestSignal,
     });
     assertConfigDocument(config, { path: 'annotations/config.json' });
 
@@ -1249,7 +2718,11 @@ export class CommunityAnnotationGitHubSync {
     return { repoInfo, branch, config, configSha: configSha || null, datasetId: targetDatasetId, datasetConfig: match };
   }
 
-  async readRepoConfigJson() {
+  async readRepoConfigJson({ signal = null } = {}) {
+    const requestSignal = assertAbortSignalOrNull(
+      signal,
+      'Annotation config read signal'
+    );
     const token = this.token;
     if (!token) throw new Error('GitHub sign-in required');
     const branch = assertGitHubBranch(
@@ -1262,7 +2735,8 @@ export class CommunityAnnotationGitHubSync {
       repo: this.repo,
       token,
       path: 'annotations/config.json',
-      ref: branch
+      ref: branch,
+      signal: requestSignal,
     });
   }
 
@@ -1275,12 +2749,20 @@ export class CommunityAnnotationGitHubSync {
     commitMessage = null,
     conflictIfRemoteShaNotEqual = null,
     publicationMode,
+    signal = null,
   } = {}) {
+    const requestSignal = assertAbortSignalOrNull(
+      signal,
+      'Annotation config publication signal'
+    );
     const mode = assertPublicationMode(publicationMode);
     const token = this.token;
     if (!token) throw new Error('GitHub sign-in required');
 
-    const { repoInfo, branch } = await this.validateAndLoadConfig({ datasetId });
+    const { repoInfo, branch } = await this.validateAndLoadConfig({
+      datasetId,
+      signal: requestSignal,
+    });
     const capability = assertRepositoryPublicationInfo(repoInfo);
     if (!capability.canManage) {
       throw new Error(
@@ -1305,15 +2787,54 @@ export class CommunityAnnotationGitHubSync {
         conflictIfRemoteShaNotEqual,
         'Expected annotation config SHA'
       );
-    const { json: current, sha } = await readJsonFile({
+    const {
+      json: current,
+      sha,
+      contentBase64: remoteContentBase64,
+    } = await readJsonFile({
       workerOrigin: this.workerOrigin,
       owner: this.owner,
       repo: this.repo,
       token,
       path: 'annotations/config.json',
-      ref: branch
+      ref: branch,
+      signal: requestSignal,
     });
     assertConfigDocument(current, { path: 'annotations/config.json' });
+
+    const {
+      config: nextConfig,
+      replacement,
+    } = buildUpdatedAnnotationConfig({
+      currentConfig: current,
+      datasetId: did,
+      datasetName,
+      fieldsToAnnotate,
+      annotatableSettings,
+      closedFields,
+    });
+    const contentBase64 = encodeBase64Bytes(
+      toAnnotationPublicationBytes(nextConfig, {
+        path: 'annotations/config.json',
+      })
+    );
+
+    if (
+      base64PayloadEqualsCanonical(
+        remoteContentBase64,
+        contentBase64,
+        'annotations/config.json'
+      )
+    ) {
+      return {
+        mode: 'none',
+        branch,
+        path: 'annotations/config.json',
+        sha: sha || null,
+        ...replacement,
+        changed: false
+      };
+    }
 
     if (!expectedSha) {
       const err = new Error(
@@ -1338,25 +2859,6 @@ export class CommunityAnnotationGitHubSync {
       throw err;
     }
 
-    const existing = current.supportedDatasets.find((entry) => entry.datasetId === did) || null;
-    const name = datasetName === undefined ? existing?.name : datasetName;
-    const replacement = {
-      datasetId: did,
-      name,
-      fieldsToAnnotate,
-      annotatableSettings,
-      closedFields,
-    };
-    const nextConfig = {
-      version: 1,
-      supportedDatasets: existing
-        ? current.supportedDatasets.map((entry) =>
-          entry.datasetId === did ? replacement : entry
-        )
-        : [...current.supportedDatasets, replacement],
-    };
-    assertConfigDocument(nextConfig, { path: 'annotations/config.json publish payload' });
-
     // Avoid no-op commits: compare semantic JSON ignoring key order.
     const changed = stableStringifyJson(current) !== stableStringifyJson(nextConfig);
     if (!changed) {
@@ -1370,9 +2872,6 @@ export class CommunityAnnotationGitHubSync {
       };
     }
 
-    const contentBase64 = encodeBase64Utf8(
-      JSON.stringify(nextConfig, null, 2) + '\n'
-    );
     try {
       const result = await publishAnnotationFile({
         publicationMode: mode,
@@ -1393,6 +2892,7 @@ export class CommunityAnnotationGitHubSync {
         ].join('\n'),
         contentBase64,
         sourceSha: sha,
+        signal: requestSignal,
       });
       return {
         ...result,
@@ -1409,13 +2909,20 @@ export class CommunityAnnotationGitHubSync {
         );
         conflict.code = 'COMMUNITY_ANNOTATION_CONFLICT';
         conflict.path = 'annotations/config.json';
-        throw conflict;
+        throw inheritMutationErrorContext(conflict, err);
       }
       throw err;
     }
   }
 
-  async pullModerationMerges({ knownShas = null } = {}) {
+  async pullModerationMerges({
+    knownShas = null,
+    signal = null,
+  } = {}) {
+    const requestSignal = assertAbortSignalOrNull(
+      signal,
+      'Annotation moderation pull signal'
+    );
     const token = this.token;
     if (!token) throw new Error('GitHub sign-in required');
     const branch = assertGitHubBranch(
@@ -1444,7 +2951,8 @@ export class CommunityAnnotationGitHubSync {
         repo: this.repo,
         token,
         path,
-        ref: branch
+        ref: branch,
+        signal: requestSignal,
       });
       if (!content || content.type !== 'file') {
         throw new Error(`Expected file at ${path}`);
@@ -1467,7 +2975,12 @@ export class CommunityAnnotationGitHubSync {
     commitMessage = null,
     conflictIfRemoteShaNotEqual = null,
     publicationMode,
+    signal = null,
   } = {}) {
+    const requestSignal = assertAbortSignalOrNull(
+      signal,
+      'Annotation moderation publication signal'
+    );
     const mode = assertPublicationMode(publicationMode);
     const token = this.token;
     if (!token) throw new Error('GitHub sign-in required');
@@ -1479,6 +2992,7 @@ export class CommunityAnnotationGitHubSync {
             owner: this.owner,
             repo: this.repo,
             token,
+            signal: requestSignal,
           })
         : this._repoInfo;
     const capability = assertRepositoryPublicationInfo(repoInfo);
@@ -1516,14 +3030,49 @@ export class CommunityAnnotationGitHubSync {
         'Expected moderation merges SHA'
       );
 
-    const { json: current, sha } = await readJsonFileOrNull({
+    const {
+      json: current,
+      sha,
+      contentBase64: remoteContentBase64,
+    } = await readJsonFileOrNull({
       workerOrigin: this.workerOrigin,
       owner: this.owner,
       repo: this.repo,
       token,
       path: 'annotations/moderation/merges.json',
-      ref: branch
+      ref: branch,
+      signal: requestSignal,
     });
+
+    if (current !== null) {
+      assertMergesDocument(current, { path: 'annotations/moderation/merges.json' });
+    }
+    const currentComparable = current
+      ? { version: current.version, merges: current.merges }
+      : null;
+    const nextComparable = { version: incoming.version, merges: incoming.merges };
+    const contentBase64 = encodeBase64Bytes(
+      toAnnotationPublicationBytes(incoming, {
+        path: 'annotations/moderation/merges.json',
+      })
+    );
+
+    if (
+      remoteContentBase64 !== null &&
+      base64PayloadEqualsCanonical(
+        remoteContentBase64,
+        contentBase64,
+        'annotations/moderation/merges.json'
+      )
+    ) {
+      return {
+        mode: 'none',
+        branch,
+        path: 'annotations/moderation/merges.json',
+        sha: sha || null,
+        changed: false,
+      };
+    }
 
     // If the remote file exists, require a baseline SHA from the last Pull.
     if (!expectedSha && sha) {
@@ -1549,13 +3098,6 @@ export class CommunityAnnotationGitHubSync {
       throw err;
     }
 
-    if (current !== null) {
-      assertMergesDocument(current, { path: 'annotations/moderation/merges.json' });
-    }
-    const currentComparable = current
-      ? { version: current.version, merges: current.merges }
-      : null;
-    const nextComparable = { version: incoming.version, merges: incoming.merges };
     const changed = stableStringifyJson(currentComparable) !== stableStringifyJson(nextComparable);
     if (!changed) {
       return {
@@ -1567,9 +3109,6 @@ export class CommunityAnnotationGitHubSync {
       };
     }
 
-    const contentBase64 = encodeBase64Utf8(
-      JSON.stringify(incoming, null, 2) + '\n'
-    );
     try {
       const result = await publishAnnotationFile({
         publicationMode: mode,
@@ -1590,6 +3129,7 @@ export class CommunityAnnotationGitHubSync {
         ].join('\n'),
         contentBase64,
         sourceSha: sha,
+        signal: requestSignal,
       });
       return {
         ...result,
@@ -1605,21 +3145,32 @@ export class CommunityAnnotationGitHubSync {
         );
         conflict.code = 'COMMUNITY_ANNOTATION_CONFLICT';
         conflict.path = 'annotations/moderation/merges.json';
-        throw conflict;
+        throw inheritMutationErrorContext(conflict, err);
       }
       throw err;
     }
   }
 
-  async getAuthenticatedUser() {
+  async getAuthenticatedUser({ signal = null } = {}) {
+    const requestSignal = assertAbortSignalOrNull(
+      signal,
+      'Authenticated GitHub user request signal'
+    );
     const token = this.token;
     if (!token) return null;
     return assertAuthUserResponse(
-      await workerAuthRequest(this.workerOrigin, '/auth/user', { token })
+      await workerAuthRequest(this.workerOrigin, '/auth/user', {
+        token,
+        signal: requestSignal,
+      })
     );
   }
 
-  async pullAllUsers({ knownShas = null } = {}) {
+  async pullAllUsers({ knownShas = null, signal = null } = {}) {
+    const requestSignal = assertAbortSignalOrNull(
+      signal,
+      'Annotation users pull signal'
+    );
     const token = this.token;
     if (!token) throw new Error('GitHub sign-in required');
     const branch = assertGitHubBranch(
@@ -1628,11 +3179,19 @@ export class CommunityAnnotationGitHubSync {
     );
     const workerOrigin = this.workerOrigin;
 
-    const tree = await getGitTreeRecursive({ workerOrigin, owner: this.owner, repo: this.repo, token, ref: branch });
+    const tree = await getGitTreeRecursive({
+      workerOrigin,
+      owner: this.owner,
+      repo: this.repo,
+      token,
+      ref: branch,
+      signal: requestSignal,
+    });
     if (!Array.isArray(tree)) {
       throw new Error('Git tree response must contain an array');
     }
     const userBlobs = [];
+    let hasUsersInventory = false;
     for (const entry of tree) {
       if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
         throw new Error('Git tree entries must be objects');
@@ -1645,7 +3204,45 @@ export class CommunityAnnotationGitHubSync {
       ) {
         throw new Error('Git tree entry path must be an exact nonblank string');
       }
-      if (!path.startsWith('annotations/users/')) continue;
+
+      if (path === ANNOTATION_USERS_DIRECTORY_PATH) {
+        if (entry.type !== 'tree') {
+          throw new Error(
+            `${ANNOTATION_USERS_DIRECTORY_PATH} must be a Git tree`
+          );
+        }
+        hasUsersInventory = true;
+        continue;
+      }
+
+      if (path === EMPTY_ANNOTATION_USERS_SENTINEL.path) {
+        if (
+          entry.type !== 'blob' ||
+          entry.sha !== EMPTY_ANNOTATION_USERS_SENTINEL.sha ||
+          entry.size !== EMPTY_ANNOTATION_USERS_SENTINEL.size
+        ) {
+          throw new Error(
+            `${EMPTY_ANNOTATION_USERS_SENTINEL.path} must be the exact ` +
+            'one-byte pristine template sentinel'
+          );
+        }
+        hasUsersInventory = true;
+        continue;
+      }
+
+      if (!path.startsWith(ANNOTATION_USERS_PATH_PREFIX)) {
+        const lowerPath = path.toLowerCase();
+        if (
+          lowerPath === ANNOTATION_USERS_DIRECTORY_PATH ||
+          lowerPath.startsWith(ANNOTATION_USERS_PATH_PREFIX)
+        ) {
+          throw new Error(
+            `Invalid annotation users inventory path ${JSON.stringify(path)}; ` +
+            `expected exact lowercase ${ANNOTATION_USERS_DIRECTORY_PATH}`
+          );
+        }
+        continue;
+      }
       if (
         entry.type !== 'blob' ||
         !/^annotations\/users\/ghid_[1-9][0-9]*\.json$/.test(path)
@@ -1655,13 +3252,44 @@ export class CommunityAnnotationGitHubSync {
           'expected annotations/users/ghid_<positive-github-id>.json'
         );
       }
+      hasUsersInventory = true;
       userBlobs.push(entry);
+    }
+    if (!hasUsersInventory) {
+      throw new Error(
+        `Git tree does not contain the required ${ANNOTATION_USERS_DIRECTORY_PATH} inventory`
+      );
+    }
+    if (
+      userBlobs.length >
+      COMMUNITY_ANNOTATION_MAX_PULL_USER_FILES
+    ) {
+      throw new CommunityAnnotationPullLimitError(
+        'user-files',
+        userBlobs.length,
+        COMMUNITY_ANNOTATION_MAX_PULL_USER_FILES
+      );
     }
 
     /** @type {Record<string, string>} */
     const nextShas = {};
+    const userBlobSizes = new Map();
+    let totalDecodedBytes = 0;
     for (const f of userBlobs) {
       const path = f.path;
+      if (!Number.isSafeInteger(f.size) || f.size < 0) {
+        throw new Error(
+          `Git tree is missing the decoded byte size for ${JSON.stringify(path)}`
+        );
+      }
+      if (f.size > ANNOTATION_FILE_MAX_UTF8_BYTES) {
+        throw new AnnotationFileTooLargeError(
+          path,
+          f.size,
+          { phase: 'remote-tree-preflight' }
+        );
+      }
+      totalDecodedBytes += f.size;
       const sha = assertGitHubSha(
         f.sha,
         `Git tree SHA for ${JSON.stringify(path)}`
@@ -1670,6 +3298,17 @@ export class CommunityAnnotationGitHubSync {
         throw new Error(`Git tree contains duplicate path ${JSON.stringify(path)}`);
       }
       nextShas[path] = sha;
+      userBlobSizes.set(path, f.size);
+    }
+    if (
+      totalDecodedBytes >
+      COMMUNITY_ANNOTATION_MAX_PULL_UTF8_BYTES
+    ) {
+      throw new CommunityAnnotationPullLimitError(
+        'decoded-bytes',
+        totalDecodedBytes,
+        COMMUNITY_ANNOTATION_MAX_PULL_UTF8_BYTES
+      );
     }
 
     if (
@@ -1704,20 +3343,34 @@ export class CommunityAnnotationGitHubSync {
     const toFetch = allPaths.filter((path) => needsFetch(path, nextShas[path]));
 
     const concurrency = DEFAULT_USER_PULL_CONCURRENCY;
-    const out = await mapWithConcurrency(toFetch, concurrency, async (path) => {
-      const sha = nextShas[path] || null;
-      const filename = path.split('/').pop();
-      const json = await getGitBlobJson({
-        workerOrigin,
-        owner: this.owner,
-        repo: this.repo,
-        token,
-        sha,
-        path,
-      });
-      assertUserDocument(json, { path, filename });
-      return { path, sha, doc: json };
-    });
+    const out = await mapWithConcurrency(
+      toFetch,
+      concurrency,
+      async (path, _index, batchSignal) => {
+        const sha = nextShas[path] || null;
+        const filename = path.split('/').pop();
+        const { decodedByteLength, json } = await getGitBlobJson({
+          workerOrigin,
+          owner: this.owner,
+          repo: this.repo,
+          token,
+          sha,
+          path,
+          signal: batchSignal,
+        });
+        const expectedDecodedByteLength =
+          userBlobSizes.get(path) ?? null;
+        if (decodedByteLength !== expectedDecodedByteLength) {
+          throw new Error(
+            `Git blob ${JSON.stringify(path)} decoded byte length changed ` +
+            'from the recursive tree; start a new Pull'
+          );
+        }
+        assertUserDocument(json, { path, filename });
+        return { path, sha, doc: json };
+      },
+      { signal: requestSignal }
+    );
 
     return {
       docs: out,
@@ -1728,7 +3381,11 @@ export class CommunityAnnotationGitHubSync {
     };
   }
 
-  async pullUserFile({ userKey = null } = {}) {
+  async pullUserFile({ userKey = null, signal = null } = {}) {
+    const requestSignal = assertAbortSignalOrNull(
+      signal,
+      'Annotation user-file pull signal'
+    );
     const token = this.token;
     if (!token) throw new Error('GitHub sign-in required');
     const branch = assertGitHubBranch(
@@ -1748,7 +3405,8 @@ export class CommunityAnnotationGitHubSync {
         repo: this.repo,
         token,
         path,
-        ref: branch
+        ref: branch,
+        signal: requestSignal,
       });
       assertUserDocument(json, { path, filename: `${key}.json` });
       return { doc: json, sha: sha || null, path };
@@ -1763,7 +3421,12 @@ export class CommunityAnnotationGitHubSync {
     commitMessage = null,
     conflictIfRemoteShaNotEqual = null,
     publicationMode,
+    signal = null,
   } = {}) {
+    const requestSignal = assertAbortSignalOrNull(
+      signal,
+      'Annotation user-file publication signal'
+    );
     const mode = assertPublicationMode(publicationMode);
     const token = this.token;
     if (!token) throw new Error('GitHub token required to push');
@@ -1780,8 +3443,14 @@ export class CommunityAnnotationGitHubSync {
     const fileUser = `ghid_${id}`;
     const path = `annotations/users/${fileUser}.json`;
     assertUserDocument(userDoc, { path, filename: `${fileUser}.json` });
+    const content = encodeBase64Bytes(
+      toAnnotationPublicationBytes(userDoc, { path })
+    );
     const authenticatedUser = assertAuthUserResponse(
-      await workerAuthRequest(workerOrigin, '/auth/user', { token })
+      await workerAuthRequest(workerOrigin, '/auth/user', {
+        token,
+        signal: requestSignal,
+      })
     );
     if (authenticatedUser.id !== id) {
       throw new Error(
@@ -1791,14 +3460,41 @@ export class CommunityAnnotationGitHubSync {
 
     let sha = null;
     let remoteUpdatedAt = null;
+    let remoteContentBase64 = null;
     try {
-      const existing = await getContent({ workerOrigin, owner: this.owner, repo: this.repo, token, path, ref: branch });
-      const { json: parsed, sha: existingSha } = decodeJsonContentFile(existing, path);
+      const existing = await getContent({
+        workerOrigin,
+        owner: this.owner,
+        repo: this.repo,
+        token,
+        path,
+        ref: branch,
+        signal: requestSignal,
+      });
+      const {
+        json: parsed,
+        sha: existingSha,
+        contentBase64: existingContentBase64,
+      } = decodeJsonContentFile(existing, path);
       sha = existingSha;
       assertUserDocument(parsed, { path, filename: `${fileUser}.json` });
       remoteUpdatedAt = parsed.updatedAt;
+      remoteContentBase64 = existingContentBase64;
     } catch (err) {
       if (err?.status !== 404) throw err;
+    }
+
+    if (
+      remoteContentBase64 !== null &&
+      base64PayloadEqualsCanonical(remoteContentBase64, content, path)
+    ) {
+      return {
+        mode: 'none',
+        branch,
+        path,
+        sha,
+        remoteUpdatedAt,
+      };
     }
 
     const expectedSha = conflictIfRemoteShaNotEqual === null
@@ -1839,6 +3535,7 @@ export class CommunityAnnotationGitHubSync {
             owner: this.owner,
             repo: this.repo,
             token,
+            signal: requestSignal,
           })
         : this._repoInfo;
     assertRepositoryPublicationInfo(repoInfo);
@@ -1850,7 +3547,6 @@ export class CommunityAnnotationGitHubSync {
         'Annotation user-file commit message',
         { max: 256 }
       );
-    const content = encodeBase64Utf8(JSON.stringify(userDoc, null, 2) + '\n');
     try {
       const result = await publishAnnotationFile({
         publicationMode: mode,
@@ -1872,6 +3568,7 @@ export class CommunityAnnotationGitHubSync {
         ].join('\n'),
         contentBase64: content,
         sourceSha: sha,
+        signal: requestSignal,
       });
       return { ...result, path, remoteUpdatedAt };
     } catch (err) {
@@ -1883,7 +3580,7 @@ export class CommunityAnnotationGitHubSync {
         conflict.code = 'COMMUNITY_ANNOTATION_CONFLICT';
         conflict.remoteUpdatedAt = remoteUpdatedAt;
         conflict.path = path;
-        throw conflict;
+        throw inheritMutationErrorContext(conflict, err);
       }
       throw err;
     }
@@ -1927,9 +3624,17 @@ export function setDatasetAnnotationRepoFromUrlParam({ datasetId, urlParamValue,
   );
 }
 
-export async function setDatasetAnnotationRepoFromUrlParamAsync({ datasetId, urlParamValue, username = 'local', tokenOverride = null } = {}) {
+export async function resolveAnnotationRepositoryFromUrlParam({
+  urlParamValue,
+  tokenOverride = null,
+  signal = null,
+} = {}) {
+  const requestSignal = assertAbortSignalOrNull(
+    signal,
+    'Annotation repository resolution signal'
+  );
   const parsed = parseOwnerRepo(urlParamValue);
-  if (!parsed) return false;
+  if (!parsed) return null;
 
   // Default-branch ownership is resolved once, before the repository reference
   // becomes persistent state.
@@ -1942,24 +3647,42 @@ export async function setDatasetAnnotationRepoFromUrlParamAsync({ datasetId, url
       workerOrigin: getGitHubWorkerOrigin(),
       owner: parsed.owner,
       repo: parsed.repo,
-      token
+      token,
+      signal: requestSignal,
     });
     const head = assertGitHubBranch(
       repoInfo?.default_branch,
       'GitHub repository default_branch'
     );
-    return setAnnotationRepoForDataset(
-      datasetId,
-      `${parsed.ownerRepo}@${head}`,
-      username,
-      { branchMode: 'default' }
-    );
+    return {
+      repoRef: `${parsed.ownerRepo}@${head}`,
+      branchMode: 'default',
+    };
   }
 
+  return {
+    repoRef: parsed.ownerRepoRef,
+    branchMode: 'explicit',
+  };
+}
+
+export async function setDatasetAnnotationRepoFromUrlParamAsync({
+  datasetId,
+  urlParamValue,
+  username = 'local',
+  tokenOverride = null,
+  signal = null,
+} = {}) {
+  const resolved = await resolveAnnotationRepositoryFromUrlParam({
+    urlParamValue,
+    tokenOverride,
+    signal,
+  });
+  if (resolved === null || resolved === false) return false;
   return setAnnotationRepoForDataset(
     datasetId,
-    parsed.ownerRepoRef,
+    resolved.repoRef,
     username,
-    { branchMode: 'explicit' }
+    { branchMode: resolved.branchMode }
   );
 }

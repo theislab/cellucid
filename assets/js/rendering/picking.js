@@ -1,10 +1,16 @@
-// GLSL float literals and the CPU transparency owner are both float32. Using
-// the same representable threshold keeps an authored 0.01 value interactive
-// exactly when the point shader keeps it visible.
-const PICK_VISIBILITY_THRESHOLD = Math.fround(0.01);
+import { POINT_VISIBILITY_THRESHOLD } from './alpha-visibility.js';
+
 const PICK_SEARCH_RADIUS = 0.03;
 const PICK_MIN_SAMPLE_STEP = 0.02;
 const PICK_MAX_SAMPLE_COUNT = 500;
+const LOD_MEMBERSHIP_KEYS = Object.freeze([
+  'admissionLevels',
+  'dimensionLevel',
+  'generationToken',
+  'indices',
+  'lodLevel',
+  'pointCount',
+]);
 
 function requireFiniteVector3(value, label) {
   if (
@@ -21,6 +27,69 @@ function requireFiniteVector3(value, label) {
   return value;
 }
 
+function requireLodMembership(
+  lodMembership,
+  pointCount,
+  spatialIndex
+) {
+  if (lodMembership === null) return null;
+  if (
+    typeof lodMembership !== 'object' ||
+    Array.isArray(lodMembership) ||
+    Object.getPrototypeOf(lodMembership) !== Object.prototype ||
+    !Object.isFrozen(lodMembership) ||
+    Object.keys(lodMembership).length !== LOD_MEMBERSHIP_KEYS.length ||
+    !LOD_MEMBERSHIP_KEYS.every(key => (
+      Object.prototype.hasOwnProperty.call(lodMembership, key)
+    ))
+  ) {
+    throw new TypeError(
+      'Ray-sample picking lodMembership must be null or one frozen renderer certificate.'
+    );
+  }
+  const {
+    admissionLevels,
+    dimensionLevel,
+    generationToken,
+    indices,
+    lodLevel,
+    pointCount: membershipPointCount,
+  } = lodMembership;
+  if (
+    !(admissionLevels instanceof Uint8Array) ||
+    admissionLevels.length !== pointCount ||
+    !(indices instanceof Uint32Array) ||
+    indices.length > pointCount ||
+    membershipPointCount !== pointCount ||
+    !Number.isInteger(dimensionLevel) ||
+    dimensionLevel < 1 ||
+    dimensionLevel > 3 ||
+    !Number.isInteger(lodLevel) ||
+    lodLevel < 0 ||
+    lodLevel >= 0xff ||
+    generationToken === null ||
+    typeof generationToken !== 'object' ||
+    !Object.isFrozen(generationToken)
+  ) {
+    throw new TypeError(
+      'Ray-sample picking lodMembership must exactly match the point-count, dimension, and reduced-LOD certificate contract.'
+    );
+  }
+  if (
+    spatialIndex !== null &&
+    (
+      spatialIndex.dimensionLevel !== dimensionLevel ||
+      typeof spatialIndex.getLodMembership !== 'function' ||
+      spatialIndex.getLodMembership(lodLevel) !== lodMembership
+    )
+  ) {
+    throw new TypeError(
+      'Ray-sample picking lodMembership must belong to the exact matching spatial owner.'
+    );
+  }
+  return lodMembership;
+}
+
 function requireRaySamplePickInput(input) {
   if (
     input === null ||
@@ -31,6 +100,7 @@ function requireRaySamplePickInput(input) {
     throw new TypeError('Ray-sample picking input must be one plain object.');
   }
   const {
+    lodMembership = null,
     maxDistance,
     positions,
     ray,
@@ -80,7 +150,13 @@ function requireRaySamplePickInput(input) {
       );
     }
   }
+  const exactLodMembership = requireLodMembership(
+    lodMembership,
+    pointCount,
+    spatialIndex
+  );
   return {
+    lodMembership: exactLodMembership,
     maxDistance,
     pointCount,
     positions,
@@ -105,6 +181,14 @@ function requireRaySamplePickInput(input) {
  * @param {{origin: ArrayLike<number>, direction: ArrayLike<number>}} input.ray
  * @param {number} input.maxDistance
  * @param {import('./high-perf-renderer.js').SpatialIndex|null} [input.spatialIndex]
+ * @param {{
+ *   admissionLevels: Uint8Array,
+ *   dimensionLevel: number,
+ *   generationToken: Object,
+ *   indices: Uint32Array,
+ *   lodLevel: number,
+ *   pointCount: number
+ * }|null} [input.lodMembership]
  * @returns {{
  *   cellIndex: number,
  *   examinedPointCount: number,
@@ -114,6 +198,7 @@ function requireRaySamplePickInput(input) {
  */
 export function findRaySamplePick(input) {
   const {
+    lodMembership,
     maxDistance,
     pointCount,
     positions,
@@ -121,6 +206,12 @@ export function findRaySamplePick(input) {
     spatialIndex,
     transparency,
   } = requireRaySamplePickInput(input);
+  const lodAdmissionLevels =
+    lodMembership === null
+      ? null
+      : lodMembership.admissionLevels;
+  const lodLevel =
+    lodMembership === null ? -1 : lodMembership.lodLevel;
 
   const directionLength = Math.hypot(
     ray.direction[0],
@@ -155,7 +246,13 @@ export function findRaySamplePick(input) {
 
   const evaluatePoint = cellIndex => {
     examinedPointCount++;
-    if (!(transparency[cellIndex] >= PICK_VISIBILITY_THRESHOLD)) return;
+    if (
+      lodAdmissionLevels !== null &&
+      lodAdmissionLevels[cellIndex] > lodLevel
+    ) {
+      return;
+    }
+    if (!(transparency[cellIndex] >= POINT_VISIBILITY_THRESHOLD)) return;
 
     const positionOffset = cellIndex * 3;
     const offsetX = positions[positionOffset] - originX;
@@ -241,8 +338,28 @@ export function findRaySamplePick(input) {
   };
 
   if (spatialIndex === null) {
-    for (let cellIndex = 0; cellIndex < pointCount; cellIndex++) {
-      evaluatePoint(cellIndex);
+    if (lodMembership === null) {
+      for (let cellIndex = 0; cellIndex < pointCount; cellIndex++) {
+        evaluatePoint(cellIndex);
+      }
+    } else {
+      const lodIndices = lodMembership.indices;
+      for (
+        let compactIndex = 0;
+        compactIndex < lodIndices.length;
+        compactIndex++
+      ) {
+        const cellIndex = lodIndices[compactIndex];
+        if (
+          cellIndex >= pointCount ||
+          lodAdmissionLevels[cellIndex] > lodLevel
+        ) {
+          throw new RangeError(
+            `Ray-sample picking LOD compact index ${compactIndex} does not name an admitted source point.`
+          );
+        }
+        evaluatePoint(cellIndex);
+      }
     }
   } else {
     spatialIndex.visitRaySegmentCandidates(

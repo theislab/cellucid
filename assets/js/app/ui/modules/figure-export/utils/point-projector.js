@@ -31,6 +31,10 @@
  */
 
 import { assertCropRect01, cropRect01ToPx } from './crop.js';
+import {
+  assertLodMembership,
+  POINT_VISIBILITY_THRESHOLD,
+} from './lod-membership.js';
 
 /**
  * @typedef {object} RenderStateLike
@@ -58,7 +62,7 @@ import { assertCropRect01, cropRect01ToPx } from './crop.js';
  * @param {RenderStateLike} options.renderState
  * @param {PlotRect} options.plotRect
  * @param {number} [options.radiusPx]
- * @param {Float32Array|null} [options.visibilityMask] - optional per-point mask (0..1), e.g. LOD visibility
+ * @param {import('./lod-membership.js').LodMembership|null} [options.lodMembership]
  * @param {{ enabled?: boolean; x?: number; y?: number; width?: number; height?: number } | null} [options.crop] - optional framing crop in normalized viewport coords
  * @param {boolean} [options.sortByDepth] - if true, draw back-to-front using binned depth ordering
  * @param {number} [options.depthBins]
@@ -73,7 +77,7 @@ export function forEachProjectedPoint({
   renderState,
   plotRect,
   radiusPx = 1.5,
-  visibilityMask = null,
+  lodMembership = null,
   crop = null,
   sortByDepth = false,
   depthBins = 256,
@@ -85,6 +89,11 @@ export function forEachProjectedPoint({
   }
 
   const n = Math.min(Math.floor(positions.length / 3), Math.floor(colors.length / 4));
+  assertLodMembership(lodMembership, {
+    pointCount: Math.floor(positions.length / 3),
+  });
+  const admittedIndices = lodMembership?.indices ?? null;
+  const candidateCount = admittedIndices?.length ?? n;
   const mvp = renderState.mvpMatrix;
   const viewportW = Math.max(1, renderState.viewportWidth || 1);
   const viewportH = Math.max(1, renderState.viewportHeight || 1);
@@ -108,9 +117,11 @@ export function forEachProjectedPoint({
   const offsetY = plotRect.y + (plotRect.height - srcH * scale) / 2;
 
   let drawn = 0;
-  let skipped = 0;
+  let skipped = n - candidateCount;
 
-  const wantsDepthSort = Boolean(sortByDepth) && n <= Math.max(1, maxSortedPoints | 0);
+  const wantsDepthSort =
+    Boolean(sortByDepth) &&
+    candidateCount <= Math.max(1, maxSortedPoints | 0);
 
   if (wantsDepthSort) {
     let bins = depthBins | 0;
@@ -120,13 +131,19 @@ export function forEachProjectedPoint({
     let total = 0;
 
     // Pass 1: count visible points per depth bin.
-    for (let i = 0; i < n; i++) {
+    for (
+      let candidateIndex = 0;
+      candidateIndex < candidateCount;
+      candidateIndex++
+    ) {
+      const i = admittedIndices === null
+        ? candidateIndex
+        : admittedIndices[candidateIndex];
       const rawAlpha = transparency ? (transparency[i] ?? 1.0) : (colors[i * 4 + 3] / 255);
       let alpha = Number.isFinite(rawAlpha) ? rawAlpha : 1.0;
       if (alpha < 0) alpha = 0;
       else if (alpha > 1) alpha = 1;
-      if (alpha < 0.01) continue;
-      if (visibilityMask && (visibilityMask[i] ?? 0) <= 0) continue;
+      if (alpha < POINT_VISIBILITY_THRESHOLD) continue;
 
       const ix = i * 3;
       const x = positions[ix];
@@ -137,7 +154,7 @@ export function forEachProjectedPoint({
       const clipY = mvp[1] * x + mvp[5] * y + mvp[9] * z + mvp[13];
       const clipZ = mvp[2] * x + mvp[6] * y + mvp[10] * z + mvp[14];
       const clipW = mvp[3] * x + mvp[7] * y + mvp[11] * z + mvp[15];
-      if (!Number.isFinite(clipW) || clipW === 0) continue;
+      if (!Number.isFinite(clipW) || clipW <= 0) continue;
 
       const ndcX = clipX / clipW;
       const ndcY = clipY / clipW;
@@ -174,13 +191,19 @@ export function forEachProjectedPoint({
     const outIndex = new Uint32Array(total);
 
     // Pass 2: fill packed arrays in bin order.
-    for (let i = 0; i < n; i++) {
+    for (
+      let candidateIndex = 0;
+      candidateIndex < candidateCount;
+      candidateIndex++
+    ) {
+      const i = admittedIndices === null
+        ? candidateIndex
+        : admittedIndices[candidateIndex];
       const rawAlpha = transparency ? (transparency[i] ?? 1.0) : (colors[i * 4 + 3] / 255);
       let alpha = Number.isFinite(rawAlpha) ? rawAlpha : 1.0;
       if (alpha < 0) alpha = 0;
       else if (alpha > 1) alpha = 1;
-      if (alpha < 0.01) continue;
-      if (visibilityMask && (visibilityMask[i] ?? 0) <= 0) continue;
+      if (alpha < POINT_VISIBILITY_THRESHOLD) continue;
 
       const ix = i * 3;
       const x = positions[ix];
@@ -191,24 +214,31 @@ export function forEachProjectedPoint({
       const clipY = mvp[1] * x + mvp[5] * y + mvp[9] * z + mvp[13];
       const clipZ = mvp[2] * x + mvp[6] * y + mvp[10] * z + mvp[14];
       const clipW = mvp[3] * x + mvp[7] * y + mvp[11] * z + mvp[15];
-      if (!Number.isFinite(clipW) || clipW === 0) continue;
+      if (!Number.isFinite(clipW) || clipW <= 0) continue;
 
       const ndcX = clipX / clipW;
       const ndcY = clipY / clipW;
       const ndcZ = clipZ / clipW;
       if (ndcX < -1 || ndcX > 1 || ndcY < -1 || ndcY > 1 || ndcZ < -1 || ndcZ > 1) continue;
+
+      const viewportX = (ndcX * 0.5 + 0.5) * viewportW;
+      const viewportY = (-ndcY * 0.5 + 0.5) * viewportH;
+      if (
+        hasCrop &&
+        (
+          viewportX < srcX0 ||
+          viewportX > srcX0 + srcW ||
+          viewportY < srcY0 ||
+          viewportY > srcY0 + srcH
+        )
+      ) {
+        continue;
+      }
+
       let bin = (((ndcZ + 1) * 0.5) * bins) | 0;
       if (bin < 0) bin = 0;
       else if (bin >= bins) bin = bins - 1;
       const slot = offsets[bin] + counts[bin]++;
-
-      const viewportX = (ndcX * 0.5 + 0.5) * viewportW;
-      const viewportY = (-ndcY * 0.5 + 0.5) * viewportH;
-      if (hasCrop && (viewportX < srcX0 || viewportX > srcX0 + srcW || viewportY < srcY0 || viewportY > srcY0 + srcH)) {
-        // We counted without crop in bin offsets; keep the slot but mark alpha 0.
-        outA[slot] = 0;
-        continue;
-      }
 
       const localX = viewportX - srcX0;
       const localY = viewportY - srcY0;
@@ -231,7 +261,7 @@ export function forEachProjectedPoint({
       const end = start + counts[b];
       for (let s = start; s < end; s++) {
         const a = outA[s];
-        if (a < 0.01) continue;
+        if (a < POINT_VISIBILITY_THRESHOLD) continue;
         const oj = s * 4;
         onPoint(outX[s], outY[s], outRGBA[oj], outRGBA[oj + 1], outRGBA[oj + 2], a, radiusPx, outIndex[s]);
         drawn++;
@@ -242,16 +272,19 @@ export function forEachProjectedPoint({
     return { drawn, skipped };
   }
 
-  for (let i = 0; i < n; i++) {
-    if (visibilityMask && (visibilityMask[i] ?? 0) <= 0) {
-      skipped++;
-      continue;
-    }
+  for (
+    let candidateIndex = 0;
+    candidateIndex < candidateCount;
+    candidateIndex++
+  ) {
+    const i = admittedIndices === null
+      ? candidateIndex
+      : admittedIndices[candidateIndex];
     const rawAlpha = transparency ? (transparency[i] ?? 1.0) : (colors[i * 4 + 3] / 255);
     let alpha = Number.isFinite(rawAlpha) ? rawAlpha : 1.0;
     if (alpha < 0) alpha = 0;
     else if (alpha > 1) alpha = 1;
-    if (alpha < 0.01) {
+    if (alpha < POINT_VISIBILITY_THRESHOLD) {
       skipped++;
       continue;
     }
@@ -266,7 +299,7 @@ export function forEachProjectedPoint({
     const clipY = mvp[1] * x + mvp[5] * y + mvp[9] * z + mvp[13];
     const clipW = mvp[3] * x + mvp[7] * y + mvp[11] * z + mvp[15];
 
-    if (!Number.isFinite(clipW) || clipW === 0) {
+    if (!Number.isFinite(clipW) || clipW <= 0) {
       skipped++;
       continue;
     }

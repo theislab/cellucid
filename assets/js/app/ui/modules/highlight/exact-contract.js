@@ -669,7 +669,12 @@ export function requireUnifiedSelectionState(value) {
 export function requireLodChangeEvent(value) {
   requireExactKeys(
     value,
-    ['viewId', 'lodLevel'],
+    [
+      'dimensionLevel',
+      'geometryGeneration',
+      'lodLevel',
+      'viewId'
+    ],
     'Highlight LOD change event'
   );
   if (!Object.isFrozen(value)) {
@@ -684,6 +689,21 @@ export function requireLodChangeEvent(value) {
       'Highlight LOD change viewId must be a nonempty trimmed string.'
     );
   }
+  requireSafeInteger(
+    value.dimensionLevel,
+    'Highlight LOD change dimension',
+    1
+  );
+  if (value.dimensionLevel > 3) {
+    throw new TypeError(
+      'Highlight LOD change dimension must be 1, 2, or 3.'
+    );
+  }
+  requireSafeInteger(
+    value.geometryGeneration,
+    'Highlight LOD change geometry generation',
+    1
+  );
   requireSafeInteger(value.lodLevel, 'Highlight LOD change level', -1);
   return value;
 }

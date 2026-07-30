@@ -9,11 +9,15 @@
 
 import { createElement, clearElement } from '../../../utils/dom-utils.js';
 import { clamp, parseFiniteNumberInRange } from '../../../utils/number-utils.js';
-import { getNotificationCenter } from '../../../notification-center.js';
 import { confirmExportFidelityWarnings } from './components/fidelity-warning-dialog.js';
-import { computeSingleViewLayout, computeGridDims } from './utils/layout.js';
+import { reportFigureExportFailure } from './figure-export-engine.js';
+import { computeSingleViewLayout } from './utils/layout.js';
 import { reducePointsByDensity } from './utils/density-reducer.js';
-import { getEffectivePointDiameterPx, getLodVisibilityMask } from './utils/point-size.js';
+import {
+  matchesLodMembershipPresentation,
+  MIN_VISIBLE_ALPHA_BYTE,
+  POINT_VISIBILITY_THRESHOLD,
+} from './utils/lod-membership.js';
 import { drawCanvasLegend } from './components/legend-builder.js';
 import { drawCanvasAxes } from './components/axes-builder.js';
 import { drawCanvasCentroidOverlay } from './components/centroid-overlay.js';
@@ -28,6 +32,129 @@ import {
 } from '../../../../rendering/camera-state-contract.js';
 
 const DEFAULT_SIZE = { width: 1600, height: 1200 };
+const PREVIEW_PRESENTATION_SETTLE_MS = 120;
+
+function previewValuesEqual(left, right) {
+  if (Object.is(left, right)) return true;
+  if (
+    left === null ||
+    right === null ||
+    typeof left !== 'object' ||
+    typeof right !== 'object' ||
+    Array.isArray(left) !== Array.isArray(right) ||
+    ArrayBuffer.isView(left) !== ArrayBuffer.isView(right)
+  ) {
+    return false;
+  }
+  if (ArrayBuffer.isView(left)) {
+    if (
+      left.constructor !== right.constructor ||
+      left.length !== right.length
+    ) {
+      return false;
+    }
+    for (let index = 0; index < left.length; index++) {
+      if (!Object.is(left[index], right[index])) return false;
+    }
+    return true;
+  }
+  if (Array.isArray(left)) {
+    if (left.length !== right.length) return false;
+    for (let index = 0; index < left.length; index++) {
+      if (!previewValuesEqual(left[index], right[index])) return false;
+    }
+    return true;
+  }
+  const leftKeys = Reflect.ownKeys(left);
+  const rightKeys = Reflect.ownKeys(right);
+  // Empty frozen objects are commonly opaque generation tokens. Their
+  // identity is the value; two different owners must never compare equal.
+  if (leftKeys.length === 0 || rightKeys.length === 0) return false;
+  if (leftKeys.length !== rightKeys.length) return false;
+  leftKeys.sort((a, b) => String(a).localeCompare(String(b)));
+  rightKeys.sort((a, b) => String(a).localeCompare(String(b)));
+  for (let index = 0; index < leftKeys.length; index++) {
+    const leftKey = leftKeys[index];
+    if (leftKey !== rightKeys[index]) return false;
+    if (!previewValuesEqual(left[leftKey], right[leftKey])) return false;
+  }
+  return true;
+}
+
+export function areFigurePreviewCertificatesEqual(left, right) {
+  return previewValuesEqual(left, right);
+}
+
+export function createFigurePreviewEpochFence() {
+  let epoch = 0;
+  let closed = false;
+  return Object.freeze({
+    get closed() {
+      return closed;
+    },
+    get epoch() {
+      return epoch;
+    },
+    capture(certificate) {
+      return Object.freeze({ certificate, epoch });
+    },
+    accepts(ticket, certificate) {
+      return Boolean(
+        !closed &&
+        ticket?.epoch === epoch &&
+        areFigurePreviewCertificatesEqual(
+          ticket.certificate,
+          certificate
+        )
+      );
+    },
+    invalidate() {
+      if (!closed) epoch++;
+      return epoch;
+    },
+    close() {
+      if (!closed) {
+        closed = true;
+        epoch++;
+      }
+    },
+  });
+}
+
+export function mapFigurePreviewPointToPlot({
+  viewportX,
+  viewportY,
+  sourceOriginX,
+  sourceOriginY,
+  plotOffsetX,
+  plotOffsetY,
+  plotScale,
+}) {
+  for (const [label, value] of Object.entries({
+    viewportX,
+    viewportY,
+    sourceOriginX,
+    sourceOriginY,
+    plotOffsetX,
+    plotOffsetY,
+    plotScale,
+  })) {
+    if (!Number.isFinite(value)) {
+      throw new TypeError(
+        `Figure preview ${label} must be finite.`
+      );
+    }
+  }
+  if (plotScale < 0) {
+    throw new RangeError(
+      'Figure preview plotScale must be non-negative.'
+    );
+  }
+  return Object.freeze({
+    x: plotOffsetX + (viewportX - sourceOriginX) * plotScale,
+    y: plotOffsetY + (viewportY - sourceOriginY) * plotScale,
+  });
+}
 
 /**
  * @param {object} options
@@ -50,6 +177,17 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
       'Figure export engine must publish exportFigure() and exportFigures().'
     );
   }
+  if (
+    viewer === null ||
+    typeof viewer !== 'object' ||
+    typeof viewer.withBorrowedViewData !== 'function' ||
+    typeof viewer.getPresentedViewState !== 'function' ||
+    typeof viewer.onPresentedViewStateChanged !== 'function'
+  ) {
+    throw new TypeError(
+      'Figure export viewer must publish withBorrowedViewData(), getPresentedViewState(), and onPresentedViewStateChanged().'
+    );
+  }
   // Session bundles must NOT persist Figure Export UI state. Mark the entire
   // subtree as opt-out so generic UI control snapshotting ignores it.
   container.setAttribute('data-state-serializer-skip', 'true');
@@ -63,9 +201,33 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   clearElement(container);
   /** @type {Array<() => void>} */
   const cleanupFns = [];
+  let cleanupComplete = false;
+  let previewDisposed = false;
+  let exportInFlight = false;
+  let activeExportAbortController = null;
+  const previewEpochFence = createFigurePreviewEpochFence();
+  cleanupFns.push(() => {
+    activeExportAbortController?.abort();
+    activeExportAbortController = null;
+    exportInFlight = false;
+  });
   container.__cellucidCleanup = () => {
-    for (const fn of cleanupFns) {
-      fn();
+    if (cleanupComplete) return;
+    cleanupComplete = true;
+    container.__cellucidCleanup = () => {};
+    const failures = [];
+    for (const fn of cleanupFns.splice(0)) {
+      try {
+        fn();
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    if (failures.length > 0) {
+      throw new AggregateError(
+        failures,
+        'Figure export cleanup did not release every owner.'
+      );
     }
   };
 
@@ -432,7 +594,12 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     'Shows an export-style preview (required for framing).'
   ]));
 
-  const previewStatus = createElement('div', { className: 'figure-export-preview-status' }, [
+  const previewStatus = createElement('div', {
+    className: 'figure-export-preview-status',
+    role: 'status',
+    ariaLive: 'polite',
+    ariaAtomic: 'true',
+  }, [
     'Preview is off.'
   ]);
   const previewCanvas = createElement('canvas', {
@@ -440,7 +607,8 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     width: '360',
     height: '240',
     role: 'img',
-    ariaLabel: 'Figure export preview'
+    ariaLabel: 'Figure export preview',
+    tabIndex: -1,
   });
   const previewBox = createElement('div', { className: 'figure-export-preview-box' }, [
     previewCanvas,
@@ -561,39 +729,79 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     }
   }
 
+  function reportPreviewFailure(context, error) {
+    if (previewDisposed) return;
+    previewStatus.textContent =
+      'Preview unavailable. Refresh after the view settles.';
+    console.error(`[FigureExport] ${context} failed:`, error);
+  }
+
+  async function runPreviewUiAction(context, action) {
+    try {
+      return await action();
+    } catch (error) {
+      reportPreviewFailure(context, error);
+      return false;
+    }
+  }
+
   backgroundSelect.addEventListener('change', syncFormatDependentUi);
   emphasizeSelectionCheckbox.addEventListener('change', syncFormatDependentUi);
   downloadSelect.addEventListener('change', syncFormatDependentUi);
   dpiSelect.addEventListener('change', syncFormatDependentUi);
   strategySelect.addEventListener('change', syncFormatDependentUi);
-  previewEnabledCheckbox.addEventListener('change', async () => {
-    if (!previewEnabledCheckbox.checked) {
-      previewFramingMode = 'edit';
-      if (cropEnabledCheckbox.checked) {
-        cropEnabled = false;
-        cropEnabledCheckbox.checked = false;
-        previewSampleCrop = null;
-        syncCropUi();
-        schedulePreviewDraw();
+  previewEnabledCheckbox.addEventListener('change', () => {
+    void runPreviewUiAction('Preview toggle', async () => {
+      if (!previewEnabledCheckbox.checked) {
+        previewFramingMode = 'edit';
+        if (cropEnabledCheckbox.checked) {
+          cropEnabled = false;
+          cropEnabledCheckbox.checked = false;
+          previewSampleCrop = null;
+          syncCropUi();
+          schedulePreviewDraw();
+        }
       }
-    }
-    syncFormatDependentUi();
-    syncCropUi();
-    if (!previewEnabledCheckbox.checked) {
-      clearPreview();
-      return;
-    }
-    const needsCropPreview = cropEnabled && previewFramingMode === 'applied';
-    const sample = needsCropPreview ? previewSampleCrop : previewSampleFull;
-    if (!sample) await buildPreviewSample({ mode: needsCropPreview ? 'crop' : 'full' });
-    drawPreview();
+      syncFormatDependentUi();
+      syncCropUi();
+      if (!previewEnabledCheckbox.checked) {
+        invalidatePreviewSamples({ rebuild: false });
+        clearPreview();
+        return false;
+      }
+      const needsCropPreview =
+        cropEnabled && previewFramingMode === 'applied';
+      const sample =
+        needsCropPreview ? previewSampleCrop : previewSampleFull;
+      const currentSample =
+        sample && isPreviewSampleCurrent(sample)
+          ? sample
+          : null;
+      if (sample && currentSample === null) {
+        invalidatePreviewSamples({ rebuild: false });
+      }
+      const committed = currentSample
+        ? true
+        : await buildPreviewSample({
+          mode: needsCropPreview ? 'crop' : 'full',
+        });
+      if (committed && !previewDisposed) drawPreview();
+      return committed;
+    });
   });
 
-  previewRefreshBtn.addEventListener('click', async () => {
-    if (!previewEnabledCheckbox.checked) return;
-    const needsCropPreview = cropEnabled && previewFramingMode === 'applied';
-    await buildPreviewSample({ force: true, mode: needsCropPreview ? 'crop' : 'full' });
-    drawPreview();
+  previewRefreshBtn.addEventListener('click', () => {
+    void runPreviewUiAction('Preview refresh', async () => {
+      if (!previewEnabledCheckbox.checked) return false;
+      const needsCropPreview =
+        cropEnabled && previewFramingMode === 'applied';
+      const committed = await buildPreviewSample({
+        force: true,
+        mode: needsCropPreview ? 'crop' : 'full',
+      });
+      if (committed && !previewDisposed) drawPreview();
+      return committed;
+    });
   });
 
   previewModeSelect.addEventListener('change', schedulePreviewDraw);
@@ -668,26 +876,54 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     schedulePreviewDraw();
   });
 
-  cropConfirmBtn.addEventListener('click', async () => {
-    if (!cropEnabled) return;
-    if (previewFramingMode === 'applied') {
-      previewFramingMode = 'edit';
-      if (previewEnabledCheckbox.checked && !previewSampleFull) {
-        await buildPreviewSample({ mode: 'full' });
+  cropConfirmBtn.addEventListener('click', () => {
+    void runPreviewUiAction('Preview framing', async () => {
+      if (!cropEnabled) return false;
+      if (previewFramingMode === 'applied') {
+        previewFramingMode = 'edit';
+        if (
+          previewEnabledCheckbox.checked &&
+          (
+            !previewSampleFull ||
+            !isPreviewSampleCurrent(previewSampleFull)
+          )
+        ) {
+          const committed =
+            await buildPreviewSample({ mode: 'full' });
+          if (!committed) return false;
+        }
+        if (previewDisposed) return false;
+        syncCropUi();
+        drawPreview();
+        return true;
       }
+      if (!previewEnabledCheckbox.checked) {
+        previewEnabledCheckbox.checked = true;
+        syncFormatDependentUi();
+      }
+      if (
+        !previewSampleFull ||
+        !isPreviewSampleCurrent(previewSampleFull)
+      ) {
+        const committed =
+          await buildPreviewSample({ mode: 'full' });
+        if (!committed) return false;
+      }
+      if (previewDisposed) return false;
+      previewFramingMode = 'applied';
       syncCropUi();
+      if (
+        !previewSampleCrop ||
+        !isPreviewSampleCurrent(previewSampleCrop)
+      ) {
+        const committed =
+          await buildPreviewSample({ mode: 'crop' });
+        if (!committed) return false;
+      }
+      if (previewDisposed) return false;
       drawPreview();
-      return;
-    }
-    if (!previewEnabledCheckbox.checked) {
-      previewEnabledCheckbox.checked = true;
-      syncFormatDependentUi();
-    }
-    if (!previewSampleFull) await buildPreviewSample({ mode: 'full' });
-    previewFramingMode = 'applied';
-    syncCropUi();
-    if (!previewSampleCrop) await buildPreviewSample({ mode: 'crop' });
-    drawPreview();
+      return true;
+    });
   });
 
   cropFitPlotBtn.addEventListener('click', () => {
@@ -782,6 +1018,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     if (cropEnabled) enforceCropAspect();
     syncCropUi();
     syncTextSizingUi();
+    invalidatePreviewSamples();
     schedulePreviewDraw();
   };
   for (const el of aspectInputs) {
@@ -895,7 +1132,13 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     }
     if (!value) {
       titleAutofillEnabled = true;
-      setTimeout(syncAutoTitle, 0);
+      if (previewTitleTimer !== null) {
+        clearTimeout(previewTitleTimer);
+      }
+      previewTitleTimer = setTimeout(() => {
+        previewTitleTimer = null;
+        if (!previewDisposed) syncAutoTitle();
+      }, 0);
       return;
     }
     const auto = buildAutoTitle();
@@ -905,12 +1148,75 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   if (typeof state.on !== 'function') {
     throw new TypeError('Figure export state must publish on().');
   }
-  const fieldCleanup = state.on('field:changed', syncAutoTitle);
-  const visibilityCleanup = state.on('visibility:changed', syncAutoTitle);
-  if (typeof fieldCleanup !== 'function' || typeof visibilityCleanup !== 'function') {
-    throw new TypeError('Figure export state subscriptions must return cleanup functions.');
+  const subscribePreviewInvalidation = (
+    eventName,
+    { title = false } = {}
+  ) => {
+    const unsubscribe = state.on(eventName, () => {
+      if (previewDisposed) return;
+      if (title) syncAutoTitle();
+      invalidatePreviewSamples();
+    });
+    if (typeof unsubscribe !== 'function') {
+      throw new TypeError(
+        `Figure export "${eventName}" subscription must return a cleanup function.`
+      );
+    }
+    cleanupFns.push(unsubscribe);
+  };
+  subscribePreviewInvalidation('field:changed', {
+    title: true,
+  });
+  subscribePreviewInvalidation('visibility:changed', {
+    title: true,
+  });
+  subscribePreviewInvalidation('highlight:changed');
+  subscribePreviewInvalidation('dimension:changed');
+  subscribePreviewInvalidation('view:changed', {
+    title: true,
+  });
+  subscribePreviewInvalidation('page:changed', {
+    title: true,
+  });
+  if (typeof viewer.onLodChanged !== 'function') {
+    throw new TypeError(
+      'Figure export viewer must publish onLodChanged().'
+    );
   }
-  cleanupFns.push(fieldCleanup, visibilityCleanup);
+  const lodCleanup = viewer.onLodChanged(() => {
+    if (!previewDisposed) invalidatePreviewSamples();
+  });
+  if (typeof lodCleanup !== 'function') {
+    throw new TypeError(
+      'Figure export LOD subscription must return a cleanup function.'
+    );
+  }
+  cleanupFns.push(lodCleanup);
+  const presentedCleanup =
+    viewer.onPresentedViewStateChanged((event) => {
+      if (previewDisposed) return;
+      if (event?.reason === 'camera-changing') {
+        // The viewer emits this once per motion burst. Drop the stale sample
+        // immediately and do no preview work while the camera is moving.
+        invalidatePreviewSamples({ rebuild: false });
+        return;
+      }
+      if (event?.reason === 'camera-settled') {
+        // Viewer-side settling is authoritative; rebuild on the next task.
+        invalidatePreviewSamples();
+        return;
+      }
+      // Discrete layout/style publications can arrive in short bursts.
+      invalidatePreviewSamples({
+        rebuildDelayMs: PREVIEW_PRESENTATION_SETTLE_MS,
+      });
+    });
+  if (typeof presentedCleanup !== 'function') {
+    throw new TypeError(
+      'Figure export presented-state subscription must return a cleanup function.'
+    );
+  }
+  cleanupFns.push(presentedCleanup);
   const nameEl = document.getElementById('dataset-name');
   if (nameEl) {
     const observer = new MutationObserver(syncAutoTitle);
@@ -969,16 +1275,18 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   // ---------------------------------------------------------------------------
 
   const PREVIEW_TARGET_POINTS = 15000;
-  const PREVIEW_AUTOBUILD_THRESHOLD = 200000;
   const PREVIEW_MAX_SCAN_POINTS = 250000;
 
-  /** @type {{ viewId: string; positions: Float32Array|null; colors: Uint8Array|null; transparency: Float32Array|null; renderState: any; reduced: any; dim: number; cameraState: any; navMode: string } | null} */
+  /** @type {{ viewId: string; renderState: any; reduced: any; dim: number; cameraState: any; navMode: string; certificate: any; ticket: any; mode: 'full' } | null} */
   let previewSampleFull = null;
-  /** @type {{ viewId: string; positions: Float32Array|null; colors: Uint8Array|null; transparency: Float32Array|null; renderState: any; reduced: any; dim: number; cameraState: any; navMode: string; crop: any } | null} */
+  /** @type {{ viewId: string; renderState: any; reduced: any; dim: number; cameraState: any; navMode: string; certificate: any; ticket: any; mode: 'crop'; crop: any } | null} */
   let previewSampleCrop = null;
   /** @type {'edit'|'applied'} */
   let previewFramingMode = 'edit';
   let previewDrawTimer = /** @type {ReturnType<typeof setTimeout> | null} */ (null);
+  let previewRebuildTimer = /** @type {ReturnType<typeof setTimeout> | null} */ (null);
+  let previewTitleTimer = /** @type {ReturnType<typeof setTimeout> | null} */ (null);
+  let previewPendingFrame = null;
   let previewBuildToken = 0;
 
   /** @type {{ x: number; y: number; width: number; height: number }} */
@@ -988,8 +1296,108 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   /** @type {{ scale: number; ox: number; oy: number; viewportRect: { x: number; y: number; width: number; height: number } | null } | null} */
   let previewGeom = null;
 
-  /** @type {{ mode: 'move'|'resize-nw'|'resize-ne'|'resize-sw'|'resize-se'; startX: number; startY: number; start: any } | null} */
+  /** @type {{ mode: 'move'|'resize-nw'|'resize-ne'|'resize-sw'|'resize-se'; pointerId: number; startX: number; startY: number; start: any } | null} */
   let cropDrag = null;
+
+  function releasePreviewSamples() {
+    previewSampleFull = null;
+    previewSampleCrop = null;
+    previewGeom = null;
+  }
+
+  function cancelPendingPreviewFrame() {
+    const owner = previewPendingFrame;
+    if (owner === null) return;
+    previewPendingFrame = null;
+    cancelAnimationFrame(owner.id);
+    owner.resolve(false);
+  }
+
+  function waitForPreviewFrame() {
+    if (previewDisposed) return Promise.resolve(false);
+    cancelPendingPreviewFrame();
+    return new Promise((resolve) => {
+      const owner = {
+        id: 0,
+        resolve,
+      };
+      owner.id = requestAnimationFrame(() => {
+        if (previewPendingFrame !== owner) {
+          resolve(false);
+          return;
+        }
+        previewPendingFrame = null;
+        resolve(!previewDisposed);
+      });
+      previewPendingFrame = owner;
+    });
+  }
+
+  function queuePreviewRebuild(delayMs = 0) {
+    if (
+      previewDisposed ||
+      !previewEnabledCheckbox.checked
+    ) {
+      return;
+    }
+    if (previewRebuildTimer !== null) {
+      clearTimeout(previewRebuildTimer);
+      previewRebuildTimer = null;
+    }
+    previewRebuildTimer = setTimeout(() => {
+      previewRebuildTimer = null;
+      if (previewDisposed || !previewEnabledCheckbox.checked) return;
+      const mode =
+        cropEnabled && previewFramingMode === 'applied'
+          ? 'crop'
+          : 'full';
+      void runPreviewUiAction(
+        'Automatic preview rebuild',
+        async () => {
+          const committed = await buildPreviewSample({ mode });
+          if (committed && !previewDisposed) drawPreview();
+          return committed;
+        }
+      );
+    }, delayMs);
+  }
+
+  function invalidatePreviewSamples({
+    rebuild = true,
+    rebuildDelayMs = 0,
+  } = {}) {
+    previewEpochFence.invalidate();
+    previewBuildToken++;
+    cancelPendingPreviewFrame();
+    releasePreviewSamples();
+    if (previewRebuildTimer !== null) {
+      clearTimeout(previewRebuildTimer);
+      previewRebuildTimer = null;
+    }
+    if (rebuild) queuePreviewRebuild(rebuildDelayMs);
+  }
+
+  cleanupFns.push(() => {
+    previewDisposed = true;
+    previewEpochFence.close();
+    previewBuildToken++;
+    cancelPendingPreviewFrame();
+    if (previewDrawTimer !== null) {
+      clearTimeout(previewDrawTimer);
+      previewDrawTimer = null;
+    }
+    if (previewRebuildTimer !== null) {
+      clearTimeout(previewRebuildTimer);
+      previewRebuildTimer = null;
+    }
+    if (previewTitleTimer !== null) {
+      clearTimeout(previewTitleTimer);
+      previewTitleTimer = null;
+    }
+    endCropDrag();
+    releasePreviewSamples();
+    lastAutoTitle = '';
+  });
 
   function getExportAspect() {
     const w = Math.max(1, parseInt(widthInput.value, 10) || DEFAULT_SIZE.width);
@@ -1027,7 +1435,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
 
     const isApplied = previewFramingMode === 'applied';
     cropConfirmBtn.textContent = isApplied ? 'Edit' : 'Confirm';
-    cropConfirmBtn.setAttribute('aria-pressed', isApplied ? 'false' : 'true');
+    cropConfirmBtn.setAttribute('aria-pressed', isApplied ? 'true' : 'false');
 
     const exportAspect = getExportAspect();
     const plotLabel = formatAspectLabel(exportAspect);
@@ -1061,7 +1469,33 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
       ? `Plot: ${plotLabel} • Frame: ${frameLabel}${lock}${zoomLabel}`
       : `Plot: ${plotLabel}`;
 
-    if (!cropEnabled || previewFramingMode !== 'edit') {
+    const keyboardEditable =
+      cropEnabled &&
+      previewFramingMode === 'edit' &&
+      previewEnabledCheckbox.checked;
+    previewCanvas.tabIndex = keyboardEditable ? 0 : -1;
+    previewCanvas.setAttribute(
+      'aria-disabled',
+      keyboardEditable ? 'false' : 'true'
+    );
+    if (cropEnabled) {
+      const c = assertCropRect01({ enabled: true, ...cropRect01 });
+      const frameDescription = c === null
+        ? 'Frame unavailable.'
+        : (
+          `Frame starts at ${Math.round(c.x * 100)} percent from the left and ` +
+          `${Math.round(c.y * 100)} percent from the top, with ` +
+          `${Math.round(c.width * 100)} percent width and ` +
+          `${Math.round(c.height * 100)} percent height.`
+        );
+      previewCanvas.ariaLabel =
+        `Figure export framing preview. ${frameDescription} ` +
+        'Arrow keys move the frame; Shift plus arrow keys resize it; Home resets it.';
+    } else {
+      previewCanvas.ariaLabel = 'Figure export preview';
+    }
+
+    if (!keyboardEditable) {
       previewCanvas.style.cursor = 'default';
     }
   }
@@ -1120,42 +1554,143 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   }
 
   function getActiveViewIdForPreview() {
-    return String(state.getActiveViewId());
+    const viewId = String(state.getActiveViewId());
+    if (viewId.length === 0) {
+      throw new Error(
+        'Figure preview requires one non-empty active view ID.'
+      );
+    }
+    return viewId;
+  }
+
+  function getPresentedPreviewState(viewId) {
+    const exactViewId = String(viewId);
+    const presented = viewer.getPresentedViewState(exactViewId);
+    if (
+      presented === null ||
+      typeof presented !== 'object' ||
+      Array.isArray(presented) ||
+      presented.renderState === null ||
+      typeof presented.renderState !== 'object' ||
+      !presented.renderState.mvpMatrix ||
+      !Number.isFinite(presented.renderState.pointSize) ||
+      presented.renderState.pointSize <= 0 ||
+      !Number.isFinite(presented.lodSizeMultiplier) ||
+      presented.lodSizeMultiplier <= 0 ||
+      !Number.isInteger(presented.dimensionLevel) ||
+      presented.dimensionLevel < 1 ||
+      presented.dimensionLevel > 3 ||
+      presented.geometryGeneration === undefined ||
+      presented.certificate === null ||
+      typeof presented.certificate !== 'object' ||
+      !Object.isFrozen(presented.certificate) ||
+      typeof presented.certificate.cacheKey !== 'string'
+    ) {
+      throw new TypeError(
+        `Figure preview has no exact presented state for view "${exactViewId}".`
+      );
+    }
+    assertCameraState(
+      presented.cameraState,
+      `Figure-preview camera state for "${exactViewId}"`
+    );
+    return presented;
   }
 
   function getPreviewRenderStateForView(viewId) {
-    const vid = String(viewId);
-
-    const layout = viewer.getViewLayout();
-    if (layout.mode !== 'grid') {
-      return viewer.getViewRenderState(vid, null);
+    try {
+      return getPresentedPreviewState(viewId).renderState;
+    } catch {
+      return null;
     }
-
-    const snapshots = viewer.getSnapshotViews();
-    const viewCount = (layout.liveViewHidden ? 0 : 1) + snapshots.length;
-    const { cols, rows } = computeGridDims(viewCount || 1);
-    const base = viewer.getRenderState();
-    const viewportWidth = Math.max(1, Math.floor((base?.viewportWidth || 1) / cols));
-    const viewportHeight = Math.max(1, Math.floor((base?.viewportHeight || 1) / rows));
-    return viewer.getViewRenderState(vid, { viewportWidth, viewportHeight });
   }
 
-  function requiresShaderAccuratePoints(viewId) {
-    const vid = String(viewId);
-    const dim = state.getViewDimensionLevel(vid);
-    const cameraState = assertCameraState(
-      viewer.getViewCameraState(vid),
-      `Figure-preview camera state for "${vid}"`
-    );
-    const navMode = cameraState.navigationMode;
-    const rs = getPreviewRenderStateForView(vid);
-    const shaderQuality = rs?.shaderQuality;
-    if (!['full', 'light', 'ultralight'].includes(shaderQuality)) {
-      throw new Error(`Figure preview has no exact shader quality for view "${vid}"`);
+  function capturePreviewCertificate(
+    mode,
+    presented = null
+  ) {
+    if (mode !== 'full' && mode !== 'crop') {
+      throw new TypeError(
+        'Figure preview sample mode must be "full" or "crop".'
+      );
     }
-    const usesSphereShader = shaderQuality === 'full';
-    const is3dProjection = dim > 2 && navMode !== 'planar';
-    return usesSphereShader || is3dProjection;
+    const viewId = getActiveViewIdForPreview();
+    const exactPresented =
+      presented ?? getPresentedPreviewState(viewId);
+    const field =
+      typeof state.getFieldForView === 'function'
+        ? state.getFieldForView(viewId)
+        : (
+            typeof state.getActiveField === 'function'
+              ? state.getActiveField()
+              : null
+          );
+    const crop =
+      mode === 'crop' ? getCropOptionForExport() : null;
+    const filtered =
+      typeof state.getFilteredCount === 'function'
+        ? state.getFilteredCount()
+        : null;
+    const highlighted =
+      typeof state.getTotalHighlightedCellCount === 'function'
+        ? state.getTotalHighlightedCellCount()
+        : 0;
+    return Object.freeze({
+      aspect: Object.freeze({
+        height: Math.max(
+          1,
+          parseInt(heightInput.value, 10) ||
+            DEFAULT_SIZE.height
+        ),
+        width: Math.max(
+          1,
+          parseInt(widthInput.value, 10) ||
+            DEFAULT_SIZE.width
+        ),
+      }),
+      crop: crop === null
+        ? null
+        : Object.freeze({
+            height: crop.height,
+            width: crop.width,
+            x: crop.x,
+            y: crop.y,
+          }),
+      dimensionLevel: exactPresented.dimensionLevel,
+      fieldKey: field?.key ?? null,
+      filteredShown:
+        Number.isSafeInteger(filtered?.shown)
+          ? filtered.shown
+          : null,
+      geometryGeneration:
+        exactPresented.geometryGeneration,
+      highlighted,
+      lodGeneration:
+        exactPresented.lodMembership?.generationToken ?? null,
+      lodLevel:
+        exactPresented.lodMembership?.lodLevel ?? -1,
+      mode,
+      pointCount: state.pointCount,
+      presentedCacheKey:
+        exactPresented.certificate.cacheKey,
+      presentedLodToken:
+        exactPresented.certificate.lodGenerationToken ??
+        null,
+      viewId,
+    });
+  }
+
+  function isPreviewSampleCurrent(sample) {
+    if (!sample || previewDisposed) return false;
+    try {
+      const current = capturePreviewCertificate(sample.mode);
+      return previewEpochFence.accepts(
+        sample.ticket,
+        current
+      );
+    } catch {
+      return false;
+    }
   }
 
   let cachedWebgl2ExportSupport = /** @type {boolean|null} */ (null);
@@ -1168,11 +1703,15 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     const gl = canvas.getContext('webgl2', {
       alpha: true,
       antialias: true,
-      premultipliedAlpha: false,
+      premultipliedAlpha: true,
       preserveDrawingBuffer: true
     });
     if (gl) {
       cachedWebgl2ExportSupport = true;
+      // This is a capability probe, not a retained renderer. Release its
+      // context immediately so repeated UI teardown/reinitialization cannot
+      // consume the browser's finite WebGL context budget.
+      gl.getExtension('WEBGL_lose_context')?.loseContext();
       return true;
     }
 
@@ -1190,6 +1729,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   }
 
   function clearPreview() {
+    previewGeom = null;
     const ctx = /** @type {CanvasRenderingContext2D|null} */ (previewCanvas.getContext('2d'));
     if (ctx) {
       ctx.setTransform(1, 0, 0, 1, 0, 0);
@@ -1200,92 +1740,232 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   /**
    * Build or refresh the preview sample (downsampled point cloud in viewport space).
    * This intentionally avoids any work in the main render loop.
+   *
+   * @returns {Promise<boolean>} Whether this invocation committed the newest sample.
    */
   async function buildPreviewSample({ force = false, mode = 'full' } = {}) {
+    if (previewDisposed) return false;
     const wantsCrop = mode === 'crop';
-    if (!force && (wantsCrop ? previewSampleCrop : previewSampleFull)) return;
-
-    const visibleCount = inferVisiblePointCount();
-    const fastSample = !force && visibleCount >= PREVIEW_AUTOBUILD_THRESHOLD;
-    const maxScanPoints = fastSample ? PREVIEW_MAX_SCAN_POINTS : null;
-    const crop = wantsCrop ? getCropOptionForExport() : null;
-
-    const token = ++previewBuildToken;
-    previewStatus.textContent = (() => {
-      if (fastSample) {
-        const scan = Math.min(visibleCount, PREVIEW_MAX_SCAN_POINTS).toLocaleString();
-        return wantsCrop ? `Building framed preview… (${scan} scan)` : `Building fast preview… (${scan} scan)`;
-      }
-      return wantsCrop ? 'Building framed preview…' : 'Building preview…';
-    })();
-    await new Promise((r) => requestAnimationFrame(r));
-    if (token !== previewBuildToken) return;
-
-    const viewId = getActiveViewIdForPreview();
-    const positions = viewer.getViewPositions(viewId);
-    const colors = viewer.getViewColors(viewId);
-    const transparency = viewer.getViewTransparency(viewId);
-    const renderState = getPreviewRenderStateForView(viewId);
-
-    if (!positions || !colors || !renderState?.mvpMatrix) {
-      if (wantsCrop) previewSampleCrop = null;
-      else previewSampleFull = null;
-      previewStatus.textContent = 'Preview unavailable (missing view buffers).';
-      return;
+    const existing =
+      wantsCrop ? previewSampleCrop : previewSampleFull;
+    if (!force && existing && isPreviewSampleCurrent(existing)) {
+      return true;
+    }
+    if (force || existing) {
+      invalidatePreviewSamples({ rebuild: false });
     }
 
-    const dim = state.getViewDimensionLevel(viewId);
-    const cameraState = assertCameraState(
-      viewer.getViewCameraState(viewId),
-      `Figure-preview camera state for "${viewId}"`
+    const visibleCount = inferVisiblePointCount();
+    // Refresh bypasses cache ownership only. It never removes the bounded scan
+    // contract and therefore cannot turn a preview request into an O(N) pass.
+    const maxScanPoints = PREVIEW_MAX_SCAN_POINTS;
+
+    const token = ++previewBuildToken;
+    previewStatus.textContent = wantsCrop
+      ? 'Building framed preview…'
+      : 'Building preview…';
+    if (!await waitForPreviewFrame()) return false;
+    if (
+      previewDisposed ||
+      token !== previewBuildToken
+    ) {
+      return false;
+    }
+
+    const viewId = getActiveViewIdForPreview();
+    const candidate = viewer.withBorrowedViewData(
+      viewId,
+      ({
+        positions,
+        colors,
+        transparency,
+        pointCount,
+        dimensionLevel,
+        geometryGeneration,
+        lodMembership,
+      }) => {
+        if (
+          !(positions instanceof Float32Array) ||
+          positions.length !== pointCount * 3 ||
+          !(colors instanceof Uint8Array) ||
+          colors.length !== pointCount * 4 ||
+          (
+            transparency !== null &&
+            (
+              !(transparency instanceof Float32Array) ||
+              transparency.length !== pointCount
+            )
+          ) ||
+          !Number.isSafeInteger(pointCount) ||
+          pointCount < 0
+        ) {
+          throw new TypeError(
+            `Figure preview borrowed invalid point data for view "${viewId}".`
+          );
+        }
+        const currentVisibleCount = inferVisiblePointCount();
+        if (pointCount !== state.pointCount) {
+          throw new Error(
+            `Figure preview borrowed ${pointCount} points while state owns ${state.pointCount}.`
+          );
+        }
+        const presented = getPresentedPreviewState(viewId);
+        if (
+          presented.dimensionLevel !== dimensionLevel ||
+          !Object.is(
+            presented.geometryGeneration,
+            geometryGeneration
+          ) ||
+          !matchesLodMembershipPresentation(
+            presented.lodMembership,
+            lodMembership
+          )
+        ) {
+          throw new Error(
+            `Figure preview source ownership changed for view "${viewId}".`
+          );
+        }
+        const certificate =
+          capturePreviewCertificate(mode, presented);
+        const ticket =
+          previewEpochFence.capture(certificate);
+        const targetCount = Math.min(
+          currentVisibleCount,
+          PREVIEW_TARGET_POINTS
+        );
+        const totalHighlighted =
+          typeof state.getTotalHighlightedCellCount ===
+            'function'
+            ? state.getTotalHighlightedCellCount()
+            : 0;
+        const highlightArray =
+          totalHighlighted > 0 ? state.highlightArray : null;
+        const sparseOwner =
+          state._highlightedCellIndices;
+        const highlightedIndices =
+          highlightArray !== null &&
+          totalHighlighted <= targetCount &&
+          (
+            Array.isArray(sparseOwner) ||
+            sparseOwner instanceof Uint32Array
+          ) &&
+          sparseOwner.length === totalHighlighted
+            ? sparseOwner
+            : null;
+        const crop =
+          wantsCrop ? getCropOptionForExport() : null;
+        const reduced = reducePointsByDensity({
+          positions,
+          colors,
+          transparency,
+          lodMembership,
+          highlightArray,
+          highlightedIndices,
+          renderState: presented.renderState,
+          targetCount,
+          maxScanPoints,
+          seed: 1337,
+          crop
+        });
+        const cameraState = presented.cameraState;
+        return {
+          cameraState,
+          certificate,
+          crop,
+          dim: dimensionLevel,
+          mode,
+          navMode: cameraState.navigationMode,
+          pointDiameterViewportPx:
+            presented.renderState.pointSize *
+            presented.lodSizeMultiplier,
+          reduced,
+          renderState: presented.renderState,
+          ticket,
+          viewId,
+        };
+      }
     );
-    const navMode = cameraState.navigationMode;
+    if (
+      candidate === null ||
+      typeof candidate !== 'object' ||
+      typeof candidate.then === 'function'
+    ) {
+      throw new TypeError(
+        'Figure preview borrowed-data callback must return one synchronous sample.'
+      );
+    }
+    if (
+      previewDisposed ||
+      token !== previewBuildToken
+    ) {
+      return false;
+    }
+    const currentCertificate =
+      capturePreviewCertificate(mode);
+    if (
+      !previewEpochFence.accepts(
+        candidate.ticket,
+        currentCertificate
+      )
+    ) {
+      return false;
+    }
 
-    const safeVisibleCount = Number.isFinite(visibleCount) ? visibleCount : 0;
-    const targetCount = clamp(safeVisibleCount, 2000, PREVIEW_TARGET_POINTS);
-    const visibilityMask = getLodVisibilityMask({ viewer, viewId, dimensionLevel: dim });
-    const reduced = reducePointsByDensity({
-      positions,
-      colors,
-      transparency,
-      visibilityMask,
-      renderState,
-      targetCount,
-      maxScanPoints,
-      seed: 1337,
-      crop
-    });
-
-    if (token !== previewBuildToken) return;
-
-    if (wantsCrop) previewSampleCrop = { viewId, positions, colors, transparency, renderState, reduced, dim, cameraState, navMode, crop };
-    else previewSampleFull = { viewId, positions, colors, transparency, renderState, reduced, dim, cameraState, navMode };
+    if (wantsCrop) previewSampleCrop = candidate;
+    else previewSampleFull = candidate;
 
     if (cropEnabled && cropLockCheckbox.checked) enforceCropAspect();
     if (cropEnabled) syncCropUi();
 
-    const note = requiresShaderAccuratePoints(viewId) ? ' • shader-accurate points' : '';
-    const sampleNote = fastSample ? ' • fast sample' : '';
+    const cappedSample =
+      candidate.reduced.scannedSourceCount <
+      candidate.reduced.candidateSourceCount;
+    const sampleNote = cappedSample
+      ? ` • ${candidate.reduced.scannedSourceCount.toLocaleString()} of ${candidate.reduced.candidateSourceCount.toLocaleString()} source IDs scanned`
+      : '';
     const label = wantsCrop ? 'Framed preview' : 'Preview sample';
-    previewStatus.textContent = `${label}: ${reduced?.x?.length?.toLocaleString?.() || 0} points${sampleNote}${note}`;
+    const sampleCount = candidate.reduced.x.length;
+    const emptyNote =
+      sampleCount === 0 ? ' • no visible points' : '';
+    previewStatus.textContent =
+      `${label}: ${sampleCount.toLocaleString()} points` +
+      `${sampleNote}${emptyNote}`;
+    return true;
   }
 
   function schedulePreviewDraw() {
-    if (!previewEnabledCheckbox.checked) return;
-    if (previewDrawTimer) clearTimeout(previewDrawTimer);
+    if (
+      previewDisposed ||
+      !previewEnabledCheckbox.checked
+    ) {
+      return;
+    }
+    if (previewDrawTimer !== null) {
+      clearTimeout(previewDrawTimer);
+    }
     previewDrawTimer = setTimeout(() => {
       previewDrawTimer = null;
-      drawPreview();
+      if (!previewDisposed) drawPreview();
     }, 80);
   }
 
-  function computeApproxBoundsFromSample({ reduced, positions, normTransform, cropPx = null }) {
-    if (!reduced?.index || !positions) return null;
+  function computeApproxBoundsFromSample({
+    reduced,
+    normTransform,
+    cropPx = null,
+  }) {
+    const positions = reduced?.sourcePositions;
+    if (
+      !(positions instanceof Float32Array) ||
+      positions.length !== (reduced?.x?.length ?? -1) * 3
+    ) {
+      return null;
+    }
     let minX = Infinity;
     let maxX = -Infinity;
     let minY = Infinity;
     let maxY = -Infinity;
-    const outN = reduced.index.length;
+    const outN = reduced.x.length;
     for (let i = 0; i < outN; i++) {
       if (cropPx && reduced?.x && reduced?.y) {
         const vx = reduced.x[i];
@@ -1293,9 +1973,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
         if (vx < cropPx.x || vx > cropPx.x + cropPx.width) continue;
         if (vy < cropPx.y || vy > cropPx.y + cropPx.height) continue;
       }
-      const idx = reduced.index[i];
-      const base = idx * 3;
-      if (base + 1 >= positions.length) continue;
+      const base = i * 3;
       const real = denormalizeXY(positions[base], positions[base + 1], normTransform);
       if (!Number.isFinite(real.x) || !Number.isFinite(real.y)) continue;
       if (real.x < minX) minX = real.x;
@@ -1307,13 +1985,24 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     return { minX, maxX, minY, maxY };
   }
 
-  function computeApproxCameraBoundsFromSample({ reduced, positions, viewMatrix, cropPx = null }) {
-    if (!reduced?.index || !positions || !viewMatrix) return null;
+  function computeApproxCameraBoundsFromSample({
+    reduced,
+    viewMatrix,
+    cropPx = null,
+  }) {
+    const positions = reduced?.sourcePositions;
+    if (
+      !(positions instanceof Float32Array) ||
+      positions.length !== (reduced?.x?.length ?? -1) * 3 ||
+      !viewMatrix
+    ) {
+      return null;
+    }
     let minX = Infinity;
     let maxX = -Infinity;
     let minY = Infinity;
     let maxY = -Infinity;
-    const outN = reduced.index.length;
+    const outN = reduced.x.length;
     for (let i = 0; i < outN; i++) {
       if (cropPx && reduced?.x && reduced?.y) {
         const vx = reduced.x[i];
@@ -1321,9 +2010,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
         if (vx < cropPx.x || vx > cropPx.x + cropPx.width) continue;
         if (vy < cropPx.y || vy > cropPx.y + cropPx.height) continue;
       }
-      const idx = reduced.index[i];
-      const base = idx * 3;
-      if (base + 2 >= positions.length) continue;
+      const base = i * 3;
       const x = positions[base];
       const y = positions[base + 1];
       const z = positions[base + 2];
@@ -1340,7 +2027,12 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   }
 
   function drawPreview() {
-    if (!previewEnabledCheckbox.checked) return;
+    if (
+      previewDisposed ||
+      !previewEnabledCheckbox.checked
+    ) {
+      return;
+    }
 
     const ctx = /** @type {CanvasRenderingContext2D|null} */ (previewCanvas.getContext('2d'));
     if (!ctx) return;
@@ -1353,9 +2045,13 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.clearRect(0, 0, canvasW, canvasH);
 
-    const sample = previewFramingMode === 'applied'
+    let sample = previewFramingMode === 'applied'
       ? (previewSampleCrop || previewSampleFull)
       : previewSampleFull;
+    if (sample && !isPreviewSampleCurrent(sample)) {
+      invalidatePreviewSamples();
+      sample = null;
+    }
     const titleText = String(titleInput.value || '').trim();
     const fontFamily = String(fontSelect.value || 'Arial, Helvetica, sans-serif');
     const baseFontSizePx = Math.max(6, parseInt(fontSizeInput.value, 10) || 12);
@@ -1482,12 +2178,8 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     const plotOffsetX = plotRect.x + (plotRect.width - srcW * plotScale) / 2;
     const plotOffsetY = plotRect.y + (plotRect.height - srcH * plotScale) / 2;
 
-    const pointRadiusViewportPx = getEffectivePointDiameterPx({
-      viewer,
-      renderState: rs,
-      viewId: sample?.viewId,
-      dimensionLevel: sample?.dim
-    }) / 2;
+    const pointRadiusViewportPx =
+      sample.pointDiameterViewportPx / 2;
     const rawPointRadiusPx = pointRadiusViewportPx * plotScale;
     // Preview is heavily downscaled; enforce a minimum dot size in *screen pixels*
     // so points remain visible even when the exported figure is large.
@@ -1510,7 +2202,12 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
       1,
       'Non-selected opacity',
     );
-    const highlightArray = emphasizeSelection ? (state?.highlightArray || null) : null;
+    const sampledHighlights =
+      emphasizeSelection &&
+      reduced.highlighted instanceof Uint8Array &&
+      reduced.highlighted.length === reduced.x.length
+        ? reduced.highlighted
+        : null;
 
     const outN = reduced.x.length;
     for (let i = 0; i < outN; i++) {
@@ -1518,19 +2215,22 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
       a = Number.isFinite(a) ? a : 1.0;
       if (a < 0) a = 0;
       else if (a > 1) a = 1;
-      const srcIndex = reduced.index?.[i] ?? i;
       const j = i * 4;
       let r = reduced.rgba[j];
       let g = reduced.rgba[j + 1];
       let b = reduced.rgba[j + 2];
 
-      if (emphasizeSelection && highlightArray && (highlightArray[srcIndex] ?? 0) <= 0) {
+      if (
+        emphasizeSelection &&
+        sampledHighlights &&
+        sampledHighlights[i] < MIN_VISIBLE_ALPHA_BYTE
+      ) {
         r = 160;
         g = 160;
         b = 160;
         a *= mutedAlpha;
       }
-      if (a < 0.01) continue;
+      if (a < POINT_VISIBILITY_THRESHOLD) continue;
 
       const vx = reduced.x[i];
       const vy = reduced.y[i];
@@ -1538,10 +2238,16 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
         if (vx < cropPxForBounds.x || vx > cropPxForBounds.x + cropPxForBounds.width) continue;
         if (vy < cropPxForBounds.y || vy > cropPxForBounds.y + cropPxForBounds.height) continue;
       }
-      const localX = appliedFraming && !usingCropSample && cropPxForBounds ? (vx - cropPxForBounds.x) : vx;
-      const localY = appliedFraming && !usingCropSample && cropPxForBounds ? (vy - cropPxForBounds.y) : vy;
-      const x = plotOffsetX + localX * plotScale;
-      const y = plotOffsetY + localY * plotScale;
+      const mapped = mapFigurePreviewPointToPlot({
+        viewportX: vx,
+        viewportY: vy,
+        sourceOriginX: srcX0,
+        sourceOriginY: srcY0,
+        plotOffsetX,
+        plotOffsetY,
+        plotScale,
+      });
+      const { x, y } = mapped;
       ctx.fillStyle = `rgba(${r},${g},${b},${a})`;
       if (pointRadiusPx <= 1) {
         const sz = pointRadiusPx * 2;
@@ -1641,7 +2347,11 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     }
 
     // Axes (approximate bounds from preview sample).
-    if (axesEligible && sample.positions) {
+    if (
+      axesEligible &&
+      reduced.sourcePositions instanceof Float32Array &&
+      reduced.sourcePositions.length > 0
+    ) {
       const navMode = assertNavigationMode(sample.navMode);
       if (typeof state.dimensionManager?.getNormTransform !== 'function') {
         throw new TypeError(
@@ -1653,31 +2363,28 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
         useCameraAxes
           ? computeApproxCameraBoundsFromSample({
             reduced: sample.reduced,
-            positions: sample.positions,
             viewMatrix: sample.renderState.viewMatrix,
             cropPx: appliedFraming && !usingCropSample ? cropPxForBounds : null
           })
           : computeApproxBoundsFromSample({
             reduced: sample.reduced,
-            positions: sample.positions,
             normTransform: state.dimensionManager.getNormTransform(sample.dim),
             cropPx: appliedFraming && !usingCropSample ? cropPxForBounds : null
           })
       );
-      if (bounds === null) {
-        throw new Error('Figure preview axes require at least one visible point.');
+      if (bounds !== null) {
+        drawCanvasAxes({
+          ctx,
+          plotRect,
+          bounds,
+          xLabel: xLabelInput.value,
+          yLabel: yLabelInput.value,
+          fontFamily,
+          tickFontSize: tickFontSizePx,
+          labelFontSize: axisLabelFontSizePx,
+          color: '#111'
+        });
       }
-      drawCanvasAxes({
-        ctx,
-        plotRect,
-        bounds,
-        xLabel: xLabelInput.value,
-        yLabel: yLabelInput.value,
-        fontFamily,
-        tickFontSize: tickFontSizePx,
-        labelFontSize: axisLabelFontSizePx,
-        color: '#111'
-      });
     }
 
     // Framing overlay (photography-style crop guide).
@@ -1890,11 +2597,77 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     else previewCanvas.style.cursor = 'nwse-resize';
   }
 
+  function resizeCropFromKeyboard(key, step) {
+    const current = assertCropRect01({
+      enabled: true,
+      ...cropRect01,
+    });
+    if (current === null) return false;
+
+    const horizontal = key === 'ArrowLeft' || key === 'ArrowRight';
+    const delta =
+      key === 'ArrowLeft' || key === 'ArrowUp'
+        ? -step
+        : step;
+    let width = current.width;
+    let height = current.height;
+    if (horizontal) width = Math.max(0.05, width + delta);
+    else height = Math.max(0.05, height + delta);
+
+    if (cropLockCheckbox.checked) {
+      const effectiveAspect =
+        getExportAspect() / Math.max(0.0001, getViewportAspect());
+      if (!Number.isFinite(effectiveAspect) || effectiveAspect <= 0) {
+        return false;
+      }
+      if (horizontal) height = width / effectiveAspect;
+      else width = height * effectiveAspect;
+    }
+
+    const centerX = current.x + current.width / 2;
+    const centerY = current.y + current.height / 2;
+    const maxWidthAtCenter = Math.max(
+      0.0001,
+      2 * Math.min(centerX, 1 - centerX)
+    );
+    const maxHeightAtCenter = Math.max(
+      0.0001,
+      2 * Math.min(centerY, 1 - centerY)
+    );
+    const fitScale = Math.min(
+      1,
+      maxWidthAtCenter / Math.max(0.0001, width),
+      maxHeightAtCenter / Math.max(0.0001, height)
+    );
+    width *= fitScale;
+    height *= fitScale;
+    cropRect01 = {
+      x: clamp(centerX - width / 2, 0, 1 - width),
+      y: clamp(centerY - height / 2, 0, 1 - height),
+      width,
+      height,
+    };
+    return true;
+  }
+
   previewCanvas.addEventListener('pointerdown', (evt) => {
     if (!previewEnabledCheckbox.checked || !cropEnabled) return;
     if (previewFramingMode !== 'edit') return;
+    if (
+      cropDrag !== null ||
+      evt.isPrimary === false ||
+      (evt.pointerType === 'mouse' && evt.button !== 0)
+    ) {
+      return;
+    }
     if (!previewGeom?.viewportRect) return;
-    if (!previewSampleFull?.reduced) return; // require a preview sample for meaningful framing
+    if (
+      !previewSampleFull?.reduced ||
+      !isPreviewSampleCurrent(previewSampleFull)
+    ) {
+      if (previewSampleFull) invalidatePreviewSamples();
+      return;
+    }
 
     const p = getCanvasXYFromPointerEvent(evt);
     const logical = canvasXYToLogical(p.x, p.y);
@@ -1906,7 +2679,13 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     const norm = logicalToViewportNorm(logical);
     if (!norm) return;
 
-    cropDrag = { mode, startX: norm.x, startY: norm.y, start: { ...cropRect01 } };
+    cropDrag = {
+      mode,
+      pointerId: evt.pointerId,
+      startX: norm.x,
+      startY: norm.y,
+      start: { ...cropRect01 },
+    };
     previewCanvas.setPointerCapture?.(evt.pointerId);
     updateCropCursor(mode);
     evt.preventDefault();
@@ -1915,8 +2694,26 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   previewCanvas.addEventListener('pointermove', (evt) => {
     if (!previewEnabledCheckbox.checked || !cropEnabled) return;
     if (previewFramingMode !== 'edit') return;
+    if (
+      cropDrag !== null &&
+      evt.pointerId !== cropDrag.pointerId
+    ) {
+      return;
+    }
+    if (
+      cropDrag === null &&
+      evt.pointerType !== 'mouse'
+    ) {
+      return;
+    }
     if (!previewGeom?.viewportRect) return;
-    if (!previewSampleFull?.reduced) return;
+    if (
+      !previewSampleFull?.reduced ||
+      !isPreviewSampleCurrent(previewSampleFull)
+    ) {
+      if (previewSampleFull) invalidatePreviewSamples();
+      return;
+    }
 
     const p = getCanvasXYFromPointerEvent(evt);
     const logical = canvasXYToLogical(p.x, p.y);
@@ -1949,13 +2746,29 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     evt.preventDefault();
   });
 
-  function endCropDrag() {
+  function endCropDrag(event = null) {
+    const owner = cropDrag;
+    if (
+      owner !== null &&
+      event !== null &&
+      event.pointerId !== owner.pointerId
+    ) {
+      return;
+    }
+    const pointerId = owner?.pointerId;
     cropDrag = null;
+    if (
+      Number.isInteger(pointerId) &&
+      previewCanvas.hasPointerCapture?.(pointerId)
+    ) {
+      previewCanvas.releasePointerCapture?.(pointerId);
+    }
     updateCropCursor(null);
   }
 
   previewCanvas.addEventListener('pointerup', endCropDrag);
   previewCanvas.addEventListener('pointercancel', endCropDrag);
+  previewCanvas.addEventListener('lostpointercapture', endCropDrag);
   previewCanvas.addEventListener('dblclick', () => {
     if (!cropEnabled) return;
     previewFramingMode = 'edit';
@@ -1963,6 +2776,49 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     resetCropToDefault();
     syncCropUi();
     schedulePreviewDraw();
+  });
+  previewCanvas.addEventListener('keydown', (evt) => {
+    if (
+      !previewEnabledCheckbox.checked ||
+      !cropEnabled ||
+      previewFramingMode !== 'edit'
+    ) {
+      return;
+    }
+    const isArrow =
+      evt.key === 'ArrowLeft' ||
+      evt.key === 'ArrowRight' ||
+      evt.key === 'ArrowUp' ||
+      evt.key === 'ArrowDown';
+    if (evt.key !== 'Home' && !isArrow) return;
+
+    if (evt.key === 'Home') {
+      previewSampleCrop = null;
+      resetCropToDefault();
+    } else if (evt.shiftKey) {
+      if (!resizeCropFromKeyboard(evt.key, 0.02)) return;
+      previewSampleCrop = null;
+    } else {
+      const moveStep = evt.ctrlKey || evt.metaKey ? 0.05 : 0.01;
+      const dx =
+        evt.key === 'ArrowLeft'
+          ? -moveStep
+          : (evt.key === 'ArrowRight' ? moveStep : 0);
+      const dy =
+        evt.key === 'ArrowUp'
+          ? -moveStep
+          : (evt.key === 'ArrowDown' ? moveStep : 0);
+      cropRect01 = {
+        x: clamp(cropRect01.x + dx, 0, 1 - cropRect01.width),
+        y: clamp(cropRect01.y + dy, 0, 1 - cropRect01.height),
+        width: cropRect01.width,
+        height: cropRect01.height,
+      };
+      previewSampleCrop = null;
+    }
+    syncCropUi();
+    schedulePreviewDraw();
+    evt.preventDefault();
   });
 
   function readExactIntegerInput(input, label, minimum, maximum = Number.MAX_SAFE_INTEGER) {
@@ -2007,7 +2863,35 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     return value;
   }
 
-  exportBtn.addEventListener('click', async () => {
+  exportBtn.addEventListener('click', () => {
+    void handleFigureExportClick();
+  });
+
+  async function handleFigureExportClick() {
+    if (cleanupComplete || exportInFlight) return;
+    exportInFlight = true;
+    const abortController = new AbortController();
+    activeExportAbortController = abortController;
+    setBusy(true);
+    try {
+      await exportFigureFromUi(abortController.signal);
+    } catch (error) {
+      if (!abortController.signal.aborted) {
+        // Engine failures are already marked; UI/request failures enter the
+        // same reporter here. Either path produces one visible notification.
+        reportFigureExportFailure(error);
+      }
+    } finally {
+      abortController.abort();
+      if (activeExportAbortController === abortController) {
+        activeExportAbortController = null;
+      }
+      exportInFlight = false;
+      if (!cleanupComplete) setBusy(false);
+    }
+  }
+
+  async function exportFigureFromUi(signal) {
     const width = readExactIntegerInput(widthInput, 'Width', 100, 20_000);
     if (width === null) return;
     const height = readExactIntegerInput(heightInput, 'Height', 100, 20_000);
@@ -2073,11 +2957,11 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
       });
     }
 
-    const proceed = await confirmExportFidelityWarnings({ warnings });
+    const proceed = await confirmExportFidelityWarnings({
+      warnings,
+      signal,
+    });
     if (!proceed) return;
-
-    setBusy(true);
-    try {
 
       const baseFontSizePx = readExactIntegerInput(fontSizeInput, 'Base font size', 1, 500);
       if (baseFontSizePx === null) return;
@@ -2155,21 +3039,20 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
       if (jobs.length === 1) {
         result = await engine.exportFigure({
           ...baseOptions,
+          signal,
           format: jobs[0].format,
           dpi: jobs[0].dpi,
         });
       } else {
         const results = await engine.exportFigures({
           ...baseOptions,
+          signal,
           jobs
         });
         result = results[0];
       }
 
-    } finally {
-      setBusy(false);
-    }
-  });
+  }
 
   function buildSubAccordionItem({ title, desc, open = false, content = [] }) {
     const safeTitle = String(title || '').trim() || 'Section';

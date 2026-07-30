@@ -197,68 +197,201 @@ export function createTransformFeedbackProgram(
 }
 
 /**
+ * Publish the straight-alpha blend contract shared by Cellucid's translucent
+ * point, grid, highlight, connectivity, and centroid passes.
+ *
+ * Render passes call this at their draw boundary instead of relying on
+ * long-lived ambient WebGL state. The explicit calls are intentionally cheaper
+ * than querying and conditionally restoring driver state in every pane.
+ *
+ * @param {WebGL2RenderingContext} gl
+ */
+export function configureStraightAlphaBlending(gl) {
+  gl.enable(gl.BLEND);
+  gl.blendEquation(gl.FUNC_ADD);
+  // RGB is straight-alpha compositing. Alpha itself must use the unscaled
+  // source coverage; using blendFunc() would multiply source alpha by itself,
+  // corrupting transparent exports and the browser compositing surface.
+  gl.blendFuncSeparate(
+    gl.SRC_ALPHA,
+    gl.ONE_MINUS_SRC_ALPHA,
+    gl.ONE,
+    gl.ONE_MINUS_SRC_ALPHA
+  );
+}
+
+/**
  * Creates a ResizeObserver-based canvas size tracker to avoid per-frame layout reads.
  * Also monitors DPR changes (e.g., moving window between monitors with different scales).
  * Returns an object with a getSize() method that returns cached dimensions.
  */
 export function createCanvasResizeObserver(canvas) {
   let currentDpr = window.devicePixelRatio || 1;
-  let cachedWidth = Math.floor(canvas.clientWidth * currentDpr);
-  let cachedHeight = Math.floor(canvas.clientHeight * currentDpr);
+  let cachedCssWidth = canvas.clientWidth;
+  let cachedCssHeight = canvas.clientHeight;
+  let cachedWidth = Math.floor(cachedCssWidth * currentDpr);
+  let cachedHeight = Math.floor(cachedCssHeight * currentDpr);
+  const cachedSizeView = Object.freeze({
+    get cssHeight() {
+      return cachedCssHeight;
+    },
+    get cssWidth() {
+      return cachedCssWidth;
+    },
+    get height() {
+      return cachedHeight;
+    },
+    get width() {
+      return cachedWidth;
+    },
+  });
+  let observer = null;
+  let activeDprRegistration = null;
+  const dprRegistrations = new Set();
+  let subscriptionActive = true;
 
   // Function to recalculate dimensions with current DPR
   const updateDimensions = () => {
     currentDpr = window.devicePixelRatio || 1;
-    cachedWidth = Math.floor(canvas.clientWidth * currentDpr);
-    cachedHeight = Math.floor(canvas.clientHeight * currentDpr);
+    cachedWidth = Math.floor(cachedCssWidth * currentDpr);
+    cachedHeight = Math.floor(cachedCssHeight * currentDpr);
   };
 
-  const observer = new ResizeObserver(entries => {
+  const handleResize = entries => {
+    if (!subscriptionActive) return;
     const entry = entries[0];
     currentDpr = window.devicePixelRatio || 1;
-    cachedWidth = Math.floor(entry.contentRect.width * currentDpr);
-    cachedHeight = Math.floor(entry.contentRect.height * currentDpr);
-  });
-  observer.observe(canvas);
-
-  // Monitor DPR changes (e.g., dragging window between monitors with different scales)
-  // matchMedia with resolution query fires when DPR changes
-  let dprMediaQuery = null;
-  let dprChangeHandler = null;
-
-  const setupDprMonitor = () => {
-    // Clean up previous listener if any
-    if (dprMediaQuery && dprChangeHandler) {
-      dprMediaQuery.removeEventListener('change', dprChangeHandler);
-    }
-    // Create new media query for current DPR
-    dprMediaQuery = window.matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`);
-    dprChangeHandler = () => {
-      updateDimensions();
-      // Re-setup for the new DPR value
-      setupDprMonitor();
-    };
-    dprMediaQuery.addEventListener('change', dprChangeHandler);
+    cachedCssWidth = entry.contentRect.width;
+    cachedCssHeight = entry.contentRect.height;
+    cachedWidth = Math.floor(cachedCssWidth * currentDpr);
+    cachedHeight = Math.floor(cachedCssHeight * currentDpr);
   };
-  setupDprMonitor();
+
+  const retireDprRegistration = registration => {
+    registration.mediaQuery.removeEventListener(
+      'change',
+      registration.handler
+    );
+    dprRegistrations.delete(registration);
+  };
+
+  // Monitor DPR changes (e.g., dragging window between monitors with different
+  // scales). A candidate listener is fully subscribed before it replaces the
+  // active generation, so a fallible host cannot leave a monitoring gap.
+  const armDprMonitor = () => {
+    if (!subscriptionActive) return;
+    const dpr = window.devicePixelRatio || 1;
+    const registration = {
+      handler: null,
+      mediaQuery: window.matchMedia(`(resolution: ${dpr}dppx)`),
+    };
+    registration.handler = () => {
+      if (
+        !subscriptionActive ||
+        activeDprRegistration !== registration
+      ) {
+        return;
+      }
+      updateDimensions();
+      armDprMonitor();
+    };
+    // Record ownership before the fallible subscription. Some wrappers attach
+    // the listener and then throw, and that retained handle must be removable.
+    dprRegistrations.add(registration);
+    try {
+      registration.mediaQuery.addEventListener(
+        'change',
+        registration.handler
+      );
+    } catch (error) {
+      try {
+        retireDprRegistration(registration);
+      } catch (cleanupError) {
+        throw new AggregateError(
+          [error, cleanupError],
+          'Canvas DPR-listener setup and rollback both failed.'
+        );
+      }
+      throw error;
+    }
+
+    activeDprRegistration = registration;
+    // Identity fencing makes retained stale callbacks inert. Retry every stale
+    // removal opportunistically; explicit disconnect owns the final attempt.
+    for (const staleRegistration of dprRegistrations) {
+      if (staleRegistration === registration) continue;
+      try {
+        retireDprRegistration(staleRegistration);
+      } catch {
+        // Retain exact ownership for a bounded retry.
+      }
+    }
+  };
+
+  const disconnectResizeSources = () => {
+    // Fence callbacks before any fallible host cleanup. A retained queued DPR
+    // callback can therefore neither mutate dimensions nor publish a listener.
+    subscriptionActive = false;
+    activeDprRegistration = null;
+    const failures = [];
+    if (observer !== null) {
+      try {
+        observer.disconnect();
+        observer = null;
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    for (const registration of dprRegistrations) {
+      try {
+        retireDprRegistration(registration);
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    if (failures.length > 0) {
+      throw new AggregateError(
+        failures,
+        `Canvas resize subscription retains ${failures.length} pending cleanup failure(s).`
+      );
+    }
+  };
+
+  try {
+    observer = new ResizeObserver(handleResize);
+    observer.observe(canvas);
+    armDprMonitor();
+  } catch (error) {
+    const cleanupFailures = [];
+    try {
+      disconnectResizeSources();
+    } catch (cleanupError) {
+      cleanupFailures.push(cleanupError);
+    }
+    if (cleanupFailures.length > 0) {
+      throw new AggregateError(
+        [error, ...cleanupFailures],
+        'Canvas resize-observer construction and rollback both failed.'
+      );
+    }
+    throw error;
+  }
 
   return {
     /**
      * Returns current display size and resizes canvas if needed.
-     * No layout read occurs - uses cached values from ResizeObserver.
+     * No layout read or per-call allocation occurs; callers receive one stable,
+     * read-only view over the cached ResizeObserver-owned scalar dimensions.
      */
     getSize() {
       if (canvas.width !== cachedWidth || canvas.height !== cachedHeight) {
         canvas.width = cachedWidth;
         canvas.height = cachedHeight;
       }
-      return [cachedWidth, cachedHeight];
+      return cachedSizeView;
     },
     disconnect() {
-      observer.disconnect();
-      if (dprMediaQuery && dprChangeHandler) {
-        dprMediaQuery.removeEventListener('change', dprChangeHandler);
-      }
+      disconnectResizeSources();
     }
   };
 }

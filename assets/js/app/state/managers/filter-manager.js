@@ -46,7 +46,7 @@ function requireRgb(color) {
   }
 }
 
-function isContinuousFilterFullRange(filter, stats) {
+export function isContinuousFilterFullRange(filter, stats) {
   return (
     filter.min === stats.min
     && filter.max === stats.max
@@ -783,7 +783,6 @@ export class DataStateFilterMethods {
       this.outlierQuantilesArray.fill(-1.0);
     }
     this._pushColorsToViewer();
-    this._pushTransparencyToViewer();
     this.clearCentroids();
     this.computeGlobalVisibility();
     this.updateFilterSummary();

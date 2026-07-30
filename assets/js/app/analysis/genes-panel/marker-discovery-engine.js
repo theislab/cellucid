@@ -23,6 +23,7 @@ import { StreamingGeneLoader } from '../data/streaming-gene-loader.js';
 import { getWorkerPool } from '../compute/worker-pool.js';
 import { waitForAvailableSlot } from '../shared/concurrency-utils.js';
 import { DEFAULTS, ERROR_MESSAGES, formatError, ANALYSIS_PHASES } from './constants.js';
+import { setOwnDataProperty } from '../../../utils/exact-record.js';
 
 // =============================================================================
 // INTERNAL HELPERS
@@ -1270,13 +1271,13 @@ export class MarkerDiscoveryEngine {
         percentOutGroup: m.percentOutGroup
       }));
 
-      out[group.groupId] = {
+      setOwnDataProperty(out, group.groupId, {
         groupId: group.groupId,
         groupName: group.groupName,
         cellCount: group.cellCount,
         color: group.color,
         markers
-      };
+      });
     }
 
     return out;

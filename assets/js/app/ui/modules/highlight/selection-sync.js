@@ -43,7 +43,7 @@ export function initHighlightSelectionSync(options) {
   requireMethods(
     viewer,
     'Highlight synchronization viewer',
-    ['onLodChanged', 'updateHighlight']
+    ['onLodChanged']
   );
   requireCallback(renderHighlightSummary, 'Highlight summary renderer');
   requireCallback(renderHighlightPages, 'Highlight pages renderer');
@@ -58,7 +58,6 @@ export function initHighlightSelectionSync(options) {
       }
       renderHighlightSummary();
       renderHighlightPages();
-      viewer.updateHighlight(state.highlightArray);
     }
   );
   requireCallback(

@@ -475,9 +475,11 @@ test(
       );
       const firstHealth = deferred();
       const secondHealth = deferred();
+      const healthSignals = [];
       let healthCalls = 0;
-      globalThis.fetch = async () => {
+      globalThis.fetch = async (_url, init = {}) => {
         healthCalls += 1;
+        healthSignals.push(init.signal ?? null);
         return healthCalls === 1
           ? firstHealth.promise
           : secondHealth.promise;
@@ -486,6 +488,8 @@ test(
       const first = source.initialize();
       const firstRejection = assert.rejects(first, /superseded/i);
       const second = source.initialize();
+      assert.ok(healthSignals[0] instanceof AbortSignal);
+      assert.equal(healthSignals[0].aborted, true);
 
       secondHealth.resolve(jupyterHealthResponse());
       assert.equal(await second, true);
@@ -500,12 +504,18 @@ test(
         '?jupyter=true&viewerId=viewer-1&viewerToken=secret-1',
       );
       const health = deferred();
-      globalThis.fetch = async () => health.promise;
+      let healthSignal = null;
+      globalThis.fetch = async (_url, init = {}) => {
+        healthSignal = init.signal ?? null;
+        return health.promise;
+      };
       const source = new JupyterBridgeDataSource(getJupyterConfig());
       const initialization = source.initialize();
       const rejection = assert.rejects(initialization, /superseded/i);
 
       source.disconnect();
+      assert.ok(healthSignal instanceof AbortSignal);
+      assert.equal(healthSignal.aborted, true);
       health.resolve(jupyterHealthResponse());
       await rejection;
       assert.equal(source.isConnected(), false);
@@ -684,6 +694,170 @@ test('Jupyter dataset listing publishes one complete exact generation', async ()
     ),
     /viewer id/i,
   );
+  assert.equal(
+    await source.resolveUrl(
+      'jupyter://viewer-1/current-ui-prepared/nested%20artifact.bin',
+    ),
+    'http://127.0.0.1:8765/viewer/current-ui-prepared/nested%20artifact.bin',
+  );
+  for (const url of [
+    'jupyter://viewer-1/%2e%2e/private.json',
+    'jupyter://viewer-1/%252e%252e/private.json',
+    'jupyter://viewer-1/current-ui-prepared/%2fprivate.json',
+    'jupyter://viewer-1/current-ui-prepared/%255cprivate.json',
+    'jupyter://viewer-1/retired/private.json',
+  ]) {
+    await assert.rejects(
+      source.resolveUrl(url),
+      /invalid Jupyter artifact path|currently declared dataset/i,
+      url,
+    );
+  }
+});
+
+test('Jupyter catalog and identity names must agree exactly', async () => {
+  installWindow('?jupyter=true&viewerId=viewer-1&viewerToken=secret-1');
+  const source = new JupyterBridgeDataSource();
+  source._config = getJupyterConfig();
+  source._connected = true;
+  globalThis.fetch = async url => {
+    if (String(url).endsWith('/_cellucid/datasets')) {
+      return new Response(JSON.stringify({
+        datasets: [{
+          id: CURRENT_IDENTITY.id,
+          path: '/current-ui-prepared/',
+          name: 'Contradictory catalog name',
+        }],
+      }), { status: 200 });
+    }
+    return new Response(JSON.stringify(CURRENT_IDENTITY), {
+      status: 200,
+    });
+  };
+
+  await assert.rejects(
+    source.listDatasets(),
+    /catalog name.*does not match.*dataset_identity/i,
+  );
+  assert.deepEqual([...source._datasetPaths], []);
+  assert.deepEqual([...source._datasetCache], []);
+});
+
+test('Jupyter listing aborts and drains metadata siblings after one exact failure', async () => {
+  installWindow('?jupyter=true&viewerId=viewer-1&viewerToken=secret-1');
+  const source = new JupyterBridgeDataSource();
+  source._config = getJupyterConfig();
+  source._connected = true;
+  let heldSignal = null;
+  let heldSettled = false;
+  globalThis.fetch = async (input, options = {}) => {
+    const url = String(input);
+    if (url.endsWith('/_cellucid/datasets')) {
+      return new Response(JSON.stringify({
+        datasets: [
+          { id: 'invalid', path: '/invalid/', name: 'Invalid' },
+          { id: 'held', path: '/held/', name: 'Held' },
+        ],
+      }), { status: 200 });
+    }
+    if (url.endsWith('/invalid/dataset_identity.json')) {
+      return new Response(JSON.stringify({}), { status: 200 });
+    }
+    if (url.endsWith('/held/dataset_identity.json')) {
+      heldSignal = options.signal ?? null;
+      return new Promise((_resolve, reject) => {
+        heldSignal.addEventListener('abort', () => {
+          heldSettled = true;
+          reject(heldSignal.reason);
+        }, { once: true });
+      });
+    }
+    return new Response('', { status: 404 });
+  };
+
+  await assert.rejects(
+    source.listDatasets(),
+    /dataset_identity|missing required field/i,
+  );
+  assert.ok(heldSignal instanceof AbortSignal);
+  assert.equal(heldSignal.aborted, true);
+  assert.equal(heldSettled, true);
+});
+
+test('concurrent Jupyter metadata reads coalesce within one catalog owner', async () => {
+  installWindow('?jupyter=true&viewerId=viewer-1&viewerToken=secret-1');
+  const source = new JupyterBridgeDataSource();
+  source._config = getJupyterConfig();
+  source._connected = true;
+  source._datasetPaths.set(
+    CURRENT_IDENTITY.id,
+    '/current-ui-prepared/',
+  );
+  let identityCalls = 0;
+  let releaseIdentity;
+  const identityResponse = new Promise(resolve => {
+    releaseIdentity = resolve;
+  });
+  globalThis.fetch = async () => {
+    identityCalls += 1;
+    return identityResponse;
+  };
+
+  const first = source.getMetadata(CURRENT_IDENTITY.id);
+  const second = source.getMetadata(CURRENT_IDENTITY.id);
+  assert.equal(identityCalls, 1);
+  releaseIdentity(new Response(JSON.stringify(CURRENT_IDENTITY), {
+    status: 200,
+  }));
+  const [firstMetadata, secondMetadata] = await Promise.all([
+    first,
+    second,
+  ]);
+  assert.equal(firstMetadata, secondMetadata);
+  assert.equal(
+    await source.getMetadata(CURRENT_IDENTITY.id),
+    firstMetadata,
+  );
+  assert.equal(identityCalls, 1);
+});
+
+test('coalesced Jupyter metadata callers share one lifecycle cancellation', async () => {
+  installWindow('?jupyter=true&viewerId=viewer-1&viewerToken=secret-1');
+  const source = new JupyterBridgeDataSource();
+  source._config = getJupyterConfig();
+  source._connected = true;
+  source._datasetPaths.set(
+    CURRENT_IDENTITY.id,
+    '/current-ui-prepared/',
+  );
+  let metadataSignal = null;
+  globalThis.fetch = async (_input, options = {}) => {
+    metadataSignal = options.signal ?? null;
+    return new Promise((_resolve, reject) => {
+      metadataSignal.addEventListener('abort', () => {
+        reject(metadataSignal.reason);
+      }, { once: true });
+    });
+  };
+
+  const first = source.getMetadata(CURRENT_IDENTITY.id);
+  const second = source.getMetadata(CURRENT_IDENTITY.id);
+  assert.ok(metadataSignal instanceof AbortSignal);
+  source.refresh();
+
+  const [firstOutcome, secondOutcome] = await Promise.allSettled([
+    first,
+    second,
+  ]);
+  assert.equal(firstOutcome.status, 'rejected');
+  assert.equal(secondOutcome.status, 'rejected');
+  assert.equal(firstOutcome.reason, secondOutcome.reason);
+  assert.equal(
+    firstOutcome.reason.code,
+    'CELLUCID_JUPYTER_LIFECYCLE_SUPERSEDED',
+  );
+  assert.match(firstOutcome.reason.message, /superseded/i);
+  assert.equal(source._datasetCache.has(CURRENT_IDENTITY.id), false);
 });
 
 test(
@@ -698,8 +872,10 @@ test(
       await source.initialize();
 
       const staleCatalog = deferred();
-      globalThis.fetch = async url => {
+      let staleCatalogSignal = null;
+      globalThis.fetch = async (url, init = {}) => {
         if (String(url).endsWith('/_cellucid/datasets')) {
+          staleCatalogSignal = init.signal ?? null;
           return staleCatalog.promise;
         }
         throw new Error(`Unexpected stale-listing URL: ${String(url)}`);
@@ -711,6 +887,8 @@ test(
       );
 
       source.disconnect();
+      assert.ok(staleCatalogSignal instanceof AbortSignal);
+      assert.equal(staleCatalogSignal.aborted, true);
       globalThis.fetch = async url => {
         if (String(url).endsWith('/_cellucid/health')) {
           return jupyterHealthResponse();
@@ -758,10 +936,12 @@ test(
         name: 'Second',
       };
       let catalogCalls = 0;
-      globalThis.fetch = async url => {
+      const catalogSignals = [];
+      globalThis.fetch = async (url, init = {}) => {
         const href = String(url);
         if (href.endsWith('/_cellucid/datasets')) {
           catalogCalls += 1;
+          catalogSignals.push(init.signal ?? null);
           return catalogCalls === 1
             ? firstCatalog.promise
             : secondCatalog.promise;
@@ -781,6 +961,8 @@ test(
         /superseded/i,
       );
       const secondListing = source.listDatasets();
+      assert.ok(catalogSignals[0] instanceof AbortSignal);
+      assert.equal(catalogSignals[0].aborted, true);
       secondCatalog.resolve(new Response(JSON.stringify({
         datasets: [{
           id: 'second',
@@ -817,10 +999,16 @@ test(
       );
 
       const identity = deferred();
-      globalThis.fetch = async () => identity.promise;
+      let metadataSignal = null;
+      globalThis.fetch = async (_url, init = {}) => {
+        metadataSignal = init.signal ?? null;
+        return identity.promise;
+      };
       const metadata = source.getMetadata(CURRENT_IDENTITY.id);
       const rejection = assert.rejects(metadata, /superseded/i);
       source.refresh();
+      assert.ok(metadataSignal instanceof AbortSignal);
+      assert.equal(metadataSignal.aborted, true);
       identity.resolve(new Response(JSON.stringify(CURRENT_IDENTITY), {
         status: 200,
       }));
@@ -1149,7 +1337,10 @@ test('Jupyter health probes are single-flight and fence late lifecycle failures'
 
   assert.equal(monitor.start(), true);
   assert.equal(monitor.start(), false);
-  await nextTask();
+  await waitFor(
+    () => probes.length === 1,
+    'the initial health probe',
+  );
   assert.equal(probes.length, 1);
   assert.equal(monitor.isProbeInFlight(), true);
   await nextTask();

@@ -70,8 +70,38 @@ async function withControlledTimers(run) {
 }
 
 class FakeStyle {
-  setProperty(name, value) {
-    this[name] = String(value);
+  constructor() {
+    this.priorities = new Map();
+  }
+
+  propertyKey(name) {
+    return String(name).replace(
+      /-([a-z])/g,
+      (_match, letter) => letter.toUpperCase()
+    );
+  }
+
+  getPropertyPriority(name) {
+    return this.priorities.get(String(name)) ?? '';
+  }
+
+  getPropertyValue(name) {
+    return this[this.propertyKey(name)] ?? '';
+  }
+
+  removeProperty(name) {
+    const property = String(name);
+    const key = this.propertyKey(property);
+    const previous = this[key] ?? '';
+    delete this[key];
+    this.priorities.delete(property);
+    return previous;
+  }
+
+  setProperty(name, value, priority = '') {
+    const property = String(name);
+    this[this.propertyKey(property)] = String(value);
+    this.priorities.set(property, String(priority));
   }
 }
 
@@ -115,12 +145,18 @@ class FakeElement {
     this.className = '';
     this.classList = new FakeClassList(this);
     this.style = new FakeStyle();
+    this.attributes = new Map();
+    this.disabled = false;
+    this.hidden = false;
+    this.tabIndex = 0;
     this.listeners = new Map();
     this.offsetHeight = 480;
     this.offsetWidth = 640;
     this.textContent = '';
     this.title = '';
     this.type = '';
+    this.capturedPointers = new Set();
+    this.releasedPointers = [];
   }
 
   get childElementCount() {
@@ -155,6 +191,18 @@ class FakeElement {
     this.listeners.set(type, listeners);
   }
 
+  setAttribute(name, value) {
+    this.attributes.set(String(name), String(value));
+  }
+
+  getAttribute(name) {
+    return this.attributes.get(String(name)) ?? null;
+  }
+
+  removeAttribute(name) {
+    this.attributes.delete(String(name));
+  }
+
   removeEventListener(type, listener) {
     const listeners = this.listeners.get(type) ?? [];
     this.listeners.set(
@@ -181,12 +229,41 @@ class FakeElement {
 
   querySelectorAll(selector) {
     const matches = [];
-    const visit = element => {
-      if (selector.startsWith('.')) {
-        if (element.classList.contains(selector.slice(1))) {
-          matches.push(element);
+    const matchesSelector = element => {
+      for (const rawPart of String(selector).split(',')) {
+        const part = rawPart.trim();
+        if (part.startsWith('.')) {
+          const classes = part.slice(1).split('.');
+          if (classes.every(name => element.classList.contains(name))) {
+            return true;
+          }
+        } else if (part === 'button' && element.tagName === 'BUTTON') {
+          return true;
+        } else if (part === '[href]' && element.getAttribute('href') !== null) {
+          return true;
+        } else if (part === 'input' && element.tagName === 'INPUT') {
+          return true;
+        } else if (part === 'select' && element.tagName === 'SELECT') {
+          return true;
+        } else if (part === 'textarea' && element.tagName === 'TEXTAREA') {
+          return true;
+        } else if (
+          part.startsWith('[tabindex]') &&
+          element.getAttribute('tabindex') !== null &&
+          element.getAttribute('tabindex') !== '-1'
+        ) {
+          return true;
+        } else if (
+          part === '[role="dialog"]' &&
+          element.getAttribute('role') === 'dialog'
+        ) {
+          return true;
         }
       }
+      return false;
+    };
+    const visit = element => {
+      if (matchesSelector(element)) matches.push(element);
       for (const child of element.children) visit(child);
     };
     for (const child of this.children) visit(child);
@@ -199,6 +276,12 @@ class FakeElement {
       if (
         selector.startsWith('.') &&
         current.classList.contains(selector.slice(1))
+      ) {
+        return current;
+      }
+      if (
+        selector === '[role="dialog"]' &&
+        current.getAttribute('role') === 'dialog'
       ) {
         return current;
       }
@@ -218,7 +301,35 @@ class FakeElement {
     };
   }
 
-  focus() {}
+  getClientRects() {
+    return this.isConnected ? [this.getBoundingClientRect()] : [];
+  }
+
+  contains(candidate) {
+    let current = candidate;
+    while (current) {
+      if (current === this) return true;
+      current = current.parentNode;
+    }
+    return false;
+  }
+
+  setPointerCapture(pointerId) {
+    this.capturedPointers.add(pointerId);
+  }
+
+  hasPointerCapture(pointerId) {
+    return this.capturedPointers.has(pointerId);
+  }
+
+  releasePointerCapture(pointerId) {
+    this.capturedPointers.delete(pointerId);
+    this.releasedPointers.push(pointerId);
+  }
+
+  focus() {
+    this.ownerDocument.activeElement = this;
+  }
 }
 
 async function withFakeDOM(run) {
@@ -233,6 +344,7 @@ async function withFakeDOM(run) {
   const documentListeners = new Map();
   const windowListeners = new Map();
   const document = {
+    activeElement: null,
     body: null,
     createElement(tagName) {
       return new FakeElement(tagName, document);
@@ -254,9 +366,23 @@ async function withFakeDOM(run) {
         listener(event);
       }
     },
+    querySelectorAll(selector) {
+      const matches = [];
+      if (
+        selector.startsWith('.') &&
+        selector.slice(1).split('.').every(
+          name => document.body.classList.contains(name)
+        )
+      ) {
+        matches.push(document.body);
+      }
+      matches.push(...document.body.querySelectorAll(selector));
+      return matches;
+    },
   };
   document.body = new FakeElement('body', document);
   document.body._setConnected(true);
+  document.activeElement = document.body;
 
   class FakeResizeObserver {
     observe() {}
@@ -389,6 +515,165 @@ test('button, backdrop, Escape, and direct close share one awaited hook', { conc
       assert.equal(onCloseCalls, 1);
       assert.equal(modal.isConnected, false);
       assert.equal(closeModal(modal), directClose);
+    });
+  });
+});
+
+test('analysis modal publishes dialog semantics, traps Tab, and restores trigger focus', { concurrency: false }, async () => {
+  await withControlledTimers(async ({ runAllTimers }) => {
+    await withFakeDOM(async ({ document }) => {
+      const trigger = document.createElement('button');
+      document.body.appendChild(trigger);
+      trigger.focus();
+
+      const modal = createAnalysisModal();
+      const title = modal.querySelector('.analysis-modal-title');
+      const closeButton = modal.querySelector('.analysis-modal-close');
+      assert.equal(modal.getAttribute('role'), 'dialog');
+      assert.equal(modal.getAttribute('aria-modal'), 'true');
+      assert.equal(modal.getAttribute('aria-labelledby'), title.id);
+      assert.equal(closeButton.getAttribute('aria-label'), 'Close analysis');
+
+      openModal(modal);
+      assert.equal(document.activeElement, closeButton);
+
+      let preventedTabs = 0;
+      document.dispatchEvent({
+        key: 'Tab',
+        preventDefault() {
+          preventedTabs++;
+        },
+        shiftKey: false,
+        type: 'keydown'
+      });
+      document.dispatchEvent({
+        key: 'Tab',
+        preventDefault() {
+          preventedTabs++;
+        },
+        shiftKey: true,
+        type: 'keydown'
+      });
+      assert.equal(preventedTabs, 2);
+      assert.equal(document.activeElement, closeButton);
+
+      const closing = closeModal(modal);
+      runAllTimers();
+      await closing;
+      assert.equal(document.activeElement, trigger);
+      assert.equal(modal.isConnected, false);
+    });
+  });
+});
+
+test('closing during edge resize, panel resize, or header drag restores exact interaction ownership', { concurrency: false }, async () => {
+  await withControlledTimers(async ({ runAllTimers }) => {
+    await withFakeDOM(async ({ document }) => {
+      const scenarios = [
+        {
+          name: 'edge resize',
+          selector: '.analysis-modal-edge-resize-right',
+          start(element) {
+            element.dispatchEvent({
+              clientX: 640,
+              clientY: 240,
+              preventDefault() {},
+              stopPropagation() {},
+              type: 'mousedown'
+            });
+            return null;
+          },
+          expectedCursor: 'ew-resize'
+        },
+        {
+          name: 'panel resize',
+          selector: '.analysis-modal-resizer-vertical',
+          start(element) {
+            element.dispatchEvent({
+              clientX: 400,
+              clientY: 240,
+              pointerId: 17,
+              preventDefault() {},
+              stopPropagation() {},
+              type: 'pointerdown'
+            });
+            return element;
+          },
+          expectedCursor: 'col-resize'
+        },
+        {
+          name: 'header drag',
+          selector: '.analysis-modal-header',
+          start(element) {
+            element.dispatchEvent({
+              clientX: 320,
+              clientY: 40,
+              preventDefault() {},
+              type: 'mousedown'
+            });
+            return null;
+          },
+          expectedCursor: 'move'
+        }
+      ];
+
+      for (const scenario of scenarios) {
+        const trigger = document.createElement('button');
+        document.body.appendChild(trigger);
+        trigger.focus();
+        document.body.style.setProperty('cursor', 'help', 'important');
+        document.body.style.setProperty(
+          'user-select',
+          'text',
+          'important'
+        );
+        document.body.style.setProperty(
+          '-webkit-user-select',
+          'contain',
+          'important'
+        );
+        const modal = createAnalysisModal();
+        openModal(modal);
+        const interactionTarget = modal.querySelector(scenario.selector);
+        const pointerTarget = scenario.start(interactionTarget);
+
+        assert.equal(
+          document.body.style.cursor,
+          scenario.expectedCursor,
+          `${scenario.name} did not acquire the cursor`
+        );
+        assert.equal(document.body.style.userSelect, 'none');
+        assert.equal(document.body.style.WebkitUserSelect, 'none');
+
+        const closing = closeModal(modal);
+        assert.equal(document.body.style.cursor, 'help');
+        assert.equal(document.body.style.userSelect, 'text');
+        assert.equal(document.body.style.WebkitUserSelect, 'contain');
+        assert.equal(
+          document.body.style.getPropertyPriority('cursor'),
+          'important'
+        );
+        assert.equal(
+          document.body.style.getPropertyPriority('user-select'),
+          'important'
+        );
+        assert.equal(
+          document.body.style.getPropertyPriority('-webkit-user-select'),
+          'important'
+        );
+        assert.equal(
+          interactionTarget.classList.contains('resizing'),
+          false
+        );
+        if (pointerTarget !== null) {
+          assert.equal(pointerTarget.hasPointerCapture(17), false);
+          assert.deepEqual(pointerTarget.releasedPointers, [17]);
+        }
+
+        runAllTimers();
+        await closing;
+        assert.equal(document.activeElement, trigger);
+      }
     });
   });
 });

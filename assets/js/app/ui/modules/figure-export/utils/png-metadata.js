@@ -9,6 +9,11 @@
  * @module ui/modules/figure-export/utils/png-metadata
  */
 
+import {
+  awaitFigureExportAbortable,
+  throwIfFigureExportAborted,
+} from '../figure-export-contract.js';
+
 const PNG_SIGNATURE = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
 
 function isPng(bytes) {
@@ -113,9 +118,16 @@ function makeTextChunk(keyword, text) {
  *
  * @param {Blob} blob
  * @param {Record<string, string>} textMap
+ * @param {object} [options]
+ * @param {AbortSignal|null} [options.signal]
  * @returns {Promise<Blob>}
  */
-export async function embedPngTextChunks(blob, textMap) {
+export async function embedPngTextChunks(
+  blob,
+  textMap,
+  { signal = null } = {}
+) {
+  throwIfFigureExportAborted(signal);
   if (!(blob instanceof Blob) || blob.type !== 'image/png') {
     throw new TypeError('PNG metadata input must be an image/png Blob.');
   }
@@ -132,7 +144,12 @@ export async function embedPngTextChunks(blob, textMap) {
     throw new TypeError('PNG metadata must contain at least one entry.');
   }
 
-  const bytes = new Uint8Array(await blob.arrayBuffer());
+  const buffer = await awaitFigureExportAbortable(
+    signal,
+    blob.arrayBuffer()
+  );
+  throwIfFigureExportAborted(signal);
+  const bytes = new Uint8Array(buffer);
   if (!isPng(bytes)) {
     throw new Error('PNG metadata input has an invalid PNG signature.');
   }
@@ -177,5 +194,6 @@ export async function embedPngTextChunks(blob, textMap) {
   }
   out.set(bytes.subarray(iendOffset), cursor);
 
+  throwIfFigureExportAborted(signal);
   return new Blob([out], { type: 'image/png' });
 }

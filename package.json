@@ -3,7 +3,8 @@
   "private": true,
   "scripts": {
     "test": "node scripts/run-web-tests.mjs",
-    "test:browser": "playwright test"
+    "test:browser": "playwright test",
+    "test:worker-bundle": "npx --yes wrangler@4.115.0 deploy --dry-run --config wrangler.community-annotations.jsonc"
   },
   "engines": {
     "node": ">=20"

@@ -12,6 +12,8 @@
  * is for formal AnalysisConfig object validation (e.g., for serialization/persistence).
  */
 
+import { setOwnDataProperty } from '../../../utils/exact-record.js';
+
 // =============================================================================
 // TYPE DEFINITIONS (JSDoc for IDE support)
 // =============================================================================
@@ -133,6 +135,10 @@
 // =============================================================================
 // VALIDATION UTILITIES
 // =============================================================================
+
+function isObjectRecord(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
 
 /**
  * Validation result type
@@ -302,66 +308,101 @@ export function validatePluginContract(plugin, pluginType = 'plugin') {
   const errors = [];
   const warnings = [];
 
-  if (!plugin) {
-    return { valid: false, errors: ['Plugin is null or undefined'], warnings: [] };
+  if (!isObjectRecord(plugin)) {
+    return { valid: false, errors: ['Plugin must be an object'], warnings: [] };
   }
 
   // Required fields for all plugins
-  if (!plugin.id) {
+  if (!Object.hasOwn(plugin, 'id')) {
     errors.push('Missing required field: id');
+  } else if (
+    typeof plugin.id !== 'string' ||
+    plugin.id.trim().length === 0
+  ) {
+    errors.push('id must be a non-empty string');
   } else if (!/^[a-z][a-z0-9_-]*$/.test(plugin.id)) {
     errors.push('id must be lowercase alphanumeric with hyphens/underscores, starting with a letter');
   }
 
-  if (!plugin.name) {
+  if (!Object.hasOwn(plugin, 'name')) {
     errors.push('Missing required field: name');
+  } else if (
+    typeof plugin.name !== 'string' ||
+    plugin.name.trim().length === 0
+  ) {
+    errors.push('name must be a non-empty string');
   }
 
-  if (!plugin.supportedTypes) {
+  if (!Object.hasOwn(plugin, 'supportedTypes')) {
     errors.push('Missing required field: supportedTypes');
   } else if (!Array.isArray(plugin.supportedTypes)) {
     errors.push('supportedTypes must be an array');
+  } else if (plugin.supportedTypes.length === 0) {
+    errors.push('supportedTypes must be a non-empty array');
+  } else if (plugin.supportedTypes.some(
+    type => typeof type !== 'string' || type.trim().length === 0
+  )) {
+    errors.push('supportedTypes entries must be non-empty strings');
   }
 
   // defaultOptions
-  if (plugin.defaultOptions === undefined) {
+  if (
+    !Object.hasOwn(plugin, 'defaultOptions') ||
+    plugin.defaultOptions === undefined
+  ) {
     warnings.push('No defaultOptions defined');
-  } else if (typeof plugin.defaultOptions !== 'object') {
+  } else if (!isObjectRecord(plugin.defaultOptions)) {
     errors.push('defaultOptions must be an object');
   }
 
   // optionSchema
-  if (plugin.optionSchema) {
+  if (
+    !Object.hasOwn(plugin, 'optionSchema') ||
+    plugin.optionSchema === undefined
+  ) {
+    warnings.push('No optionSchema defined - UI will use defaults');
+  } else {
     const schemaErrors = validateOptionSchema(plugin.optionSchema);
     schemaErrors.forEach(e => errors.push(`optionSchema: ${e}`));
-  } else {
-    warnings.push('No optionSchema defined - UI will use defaults');
   }
 
   // validate function
-  if (plugin.validate && typeof plugin.validate !== 'function') {
+  if (
+    Object.hasOwn(plugin, 'validate') &&
+    plugin.validate &&
+    typeof plugin.validate !== 'function'
+  ) {
     errors.push('validate must be a function');
   }
 
   // Type-specific validations
   switch (pluginType) {
     case 'plot':
-      if (!plugin.render || typeof plugin.render !== 'function') {
+      if (
+        !Object.hasOwn(plugin, 'render') ||
+        typeof plugin.render !== 'function'
+      ) {
         errors.push('Plot plugins must have a render function');
       }
       break;
     case 'transform':
-      if (!plugin.execute || typeof plugin.execute !== 'function') {
+      if (
+        !Object.hasOwn(plugin, 'execute') ||
+        typeof plugin.execute !== 'function'
+      ) {
         errors.push('Transform plugins must have an execute function');
       }
       break;
     case 'template':
-      if (!plugin.requiredInputs) {
+      if (!Object.hasOwn(plugin, 'requiredInputs') || !plugin.requiredInputs) {
         errors.push('Template plugins must have requiredInputs');
       }
       break;
     case 'stat':
-      if (!plugin.compute || typeof plugin.compute !== 'function') {
+      if (
+        !Object.hasOwn(plugin, 'compute') ||
+        typeof plugin.compute !== 'function'
+      ) {
         errors.push('Statistical test plugins must have a compute function');
       }
       break;
@@ -383,33 +424,118 @@ export function validateOptionSchema(schema) {
   const errors = [];
   const validTypes = ['select', 'checkbox', 'number', 'range', 'text', 'color', 'multiselect'];
 
-  if (typeof schema !== 'object') {
+  if (!isObjectRecord(schema)) {
     return ['Schema must be an object'];
   }
 
   for (const [key, def] of Object.entries(schema)) {
-    if (!def.type) {
+    if (!isObjectRecord(def)) {
+      errors.push(`${key}: definition must be an object`);
+      continue;
+    }
+
+    const hasType = Object.hasOwn(def, 'type');
+    const type = hasType
+      ? def.type
+      : undefined;
+    const hasLabel = Object.hasOwn(def, 'label');
+    const label = hasLabel
+      ? def.label
+      : undefined;
+
+    if (!hasType) {
       errors.push(`${key}: missing type`);
-    } else if (!validTypes.includes(def.type)) {
-      errors.push(`${key}: invalid type '${def.type}'`);
+    } else if (
+      typeof type !== 'string' ||
+      type.trim().length === 0
+    ) {
+      errors.push(`${key}: type must be a non-empty string`);
+    } else if (!validTypes.includes(type)) {
+      errors.push(`${key}: invalid type '${type}'`);
     }
 
-    if (!def.label) {
+    if (!hasLabel) {
       errors.push(`${key}: missing label`);
+    } else if (
+      typeof label !== 'string' ||
+      label.trim().length === 0
+    ) {
+      errors.push(`${key}: label must be a non-empty string`);
     }
 
-    if (def.type === 'select' && (!def.options || !Array.isArray(def.options))) {
-      errors.push(`${key}: select type requires options array`);
+    const optionValues = Object.hasOwn(def, 'options')
+      ? def.options
+      : undefined;
+    if (type === 'select' || type === 'multiselect') {
+      if (type === 'select' && !Array.isArray(optionValues)) {
+        errors.push(`${key}: select type requires options array`);
+      } else if (
+        optionValues !== undefined &&
+        !Array.isArray(optionValues)
+      ) {
+        errors.push(`${key}: options must be an array`);
+      } else if (Array.isArray(optionValues)) {
+        for (let i = 0; i < optionValues.length; i++) {
+          const option = optionValues[i];
+          if (!isObjectRecord(option)) {
+            errors.push(`${key}: options[${i}] must be an object`);
+            continue;
+          }
+          if (!Object.hasOwn(option, 'value')) {
+            errors.push(`${key}: options[${i}] is missing value`);
+          }
+          const optionLabel = Object.hasOwn(option, 'label')
+            ? option.label
+            : undefined;
+          if (
+            typeof optionLabel !== 'string' ||
+            optionLabel.trim().length === 0
+          ) {
+            errors.push(
+              `${key}: options[${i}].label must be a non-empty string`
+            );
+          }
+        }
+      }
     }
 
-    if ((def.type === 'number' || def.type === 'range')) {
-      if (def.min !== undefined && typeof def.min !== 'number') {
-        errors.push(`${key}: min must be a number`);
+    if (type === 'number' || type === 'range') {
+      const min = Object.hasOwn(def, 'min')
+        ? def.min
+        : undefined;
+      const max = Object.hasOwn(def, 'max')
+        ? def.max
+        : undefined;
+      const step = Object.hasOwn(def, 'step')
+        ? def.step
+        : undefined;
+      const validMin = min === undefined ||
+        (typeof min === 'number' && Number.isFinite(min));
+      const validMax = max === undefined ||
+        (typeof max === 'number' && Number.isFinite(max));
+      if (!validMin) {
+        errors.push(`${key}: min must be a finite number`);
       }
-      if (def.max !== undefined && typeof def.max !== 'number') {
-        errors.push(`${key}: max must be a number`);
+      if (!validMax) {
+        errors.push(`${key}: max must be a finite number`);
       }
-      if (def.min !== undefined && def.max !== undefined && def.min > def.max) {
+      if (
+        step !== undefined &&
+        (
+          typeof step !== 'number' ||
+          !Number.isFinite(step) ||
+          step <= 0
+        )
+      ) {
+        errors.push(`${key}: step must be a positive finite number`);
+      }
+      if (
+        min !== undefined &&
+        max !== undefined &&
+        validMin &&
+        validMax &&
+        min > max
+      ) {
         errors.push(`${key}: min cannot be greater than max`);
       }
     }
@@ -429,71 +555,127 @@ export function validateOptionsAgainstSchema(options, schema, defaults = {}) {
   const errors = [];
   const warnings = [];
 
-  if (!schema) {
+  if (!isObjectRecord(options)) {
+    return {
+      valid: false,
+      errors: ['Options must be an object'],
+      warnings: []
+    };
+  }
+  if (!isObjectRecord(defaults)) {
+    return {
+      valid: false,
+      errors: ['Defaults must be an object'],
+      warnings: []
+    };
+  }
+  if (schema === undefined) {
     return { valid: true, errors: [], warnings: ['No schema provided'] };
+  }
+  if (!isObjectRecord(schema)) {
+    return {
+      valid: false,
+      errors: ['Schema must be an object'],
+      warnings: []
+    };
+  }
+  const schemaErrors = validateOptionSchema(schema);
+  if (schemaErrors.length > 0) {
+    return {
+      valid: false,
+      errors: schemaErrors,
+      warnings: []
+    };
   }
 
   // Check for unknown options
   for (const key of Object.keys(options)) {
-    if (!schema[key]) {
+    if (!Object.hasOwn(schema, key)) {
       warnings.push(`Unknown option: ${key}`);
     }
   }
 
   // Validate each schema field
   for (const [key, def] of Object.entries(schema)) {
-    const value = options[key] ?? defaults[key];
+    const optionValue = Object.hasOwn(options, key)
+      ? options[key]
+      : undefined;
+    const defaultValue = Object.hasOwn(defaults, key)
+      ? defaults[key]
+      : undefined;
+    const value = optionValue ?? defaultValue;
+    const label = Object.hasOwn(def, 'label')
+      ? def.label
+      : undefined;
+    const type = Object.hasOwn(def, 'type')
+      ? def.type
+      : undefined;
+    const optionValues = Object.hasOwn(def, 'options')
+      ? def.options
+      : undefined;
+    const required = Object.hasOwn(def, 'required')
+      ? def.required
+      : undefined;
+    const min = Object.hasOwn(def, 'min')
+      ? def.min
+      : undefined;
+    const max = Object.hasOwn(def, 'max')
+      ? def.max
+      : undefined;
+    const validator = Object.hasOwn(def, 'validate')
+      ? def.validate
+      : undefined;
 
     // Check required
-    if (def.required && value === undefined) {
-      errors.push(`${def.label || key} is required`);
+    if (required && value === undefined) {
+      errors.push(`${label || key} is required`);
       continue;
     }
 
     if (value === undefined) continue;
 
     // Type-specific validation
-    switch (def.type) {
+    switch (type) {
       case 'select':
-        if (def.options && !def.options.some(o => o.value === value)) {
-          errors.push(`${def.label || key}: invalid value '${value}'`);
+        if (optionValues && !optionValues.some(o => o.value === value)) {
+          errors.push(`${label || key}: invalid value`);
         }
         break;
 
       case 'checkbox':
         if (typeof value !== 'boolean') {
-          errors.push(`${def.label || key}: must be boolean`);
+          errors.push(`${label || key}: must be boolean`);
         }
         break;
 
       case 'number':
       case 'range':
         if (typeof value !== 'number' || !Number.isFinite(value)) {
-          errors.push(`${def.label || key}: must be a number`);
+          errors.push(`${label || key}: must be a number`);
         } else {
-          if (def.min !== undefined && value < def.min) {
-            errors.push(`${def.label || key}: must be >= ${def.min}`);
+          if (min !== undefined && value < min) {
+            errors.push(`${label || key}: must be >= ${min}`);
           }
-          if (def.max !== undefined && value > def.max) {
-            errors.push(`${def.label || key}: must be <= ${def.max}`);
+          if (max !== undefined && value > max) {
+            errors.push(`${label || key}: must be <= ${max}`);
           }
         }
         break;
 
       case 'text':
         if (typeof value !== 'string') {
-          errors.push(`${def.label || key}: must be a string`);
+          errors.push(`${label || key}: must be a string`);
         }
         break;
 
       case 'multiselect':
         if (!Array.isArray(value)) {
-          errors.push(`${def.label || key}: must be an array`);
-        } else if (def.options) {
-          const validValues = new Set(def.options.map(o => o.value));
+          errors.push(`${label || key}: must be an array`);
+        } else if (optionValues) {
+          const validValues = new Set(optionValues.map(o => o.value));
           for (const v of value) {
             if (!validValues.has(v)) {
-              errors.push(`${def.label || key}: invalid value '${v}'`);
+              errors.push(`${label || key}: invalid value`);
             }
           }
         }
@@ -501,10 +683,14 @@ export function validateOptionsAgainstSchema(options, schema, defaults = {}) {
     }
 
     // Custom validation
-    if (def.validate && typeof def.validate === 'function') {
-      const customResult = def.validate(value, options);
+    if (typeof validator === 'function') {
+      const customResult = validator.call(def, value, options);
       if (customResult !== true) {
-        errors.push(`${def.label || key}: ${customResult || 'validation failed'}`);
+        const validationMessage = (
+          typeof customResult === 'string' &&
+          customResult.length > 0
+        ) ? customResult : 'validation failed';
+        errors.push(`${label || key}: ${validationMessage}`);
       }
     }
   }
@@ -554,15 +740,29 @@ export function createDefaultConfig(overrides = {}) {
  * @returns {Object} Merged options
  */
 export function mergeOptions(defaults, overrides) {
+  if (!isObjectRecord(defaults)) {
+    throw new TypeError('Defaults must be an object');
+  }
+  if (!isObjectRecord(overrides)) {
+    throw new TypeError('Overrides must be an object');
+  }
   const result = { ...defaults };
 
   for (const [key, value] of Object.entries(overrides)) {
     if (value !== undefined) {
+      const currentValue = Object.hasOwn(result, key)
+        ? result[key]
+        : undefined;
       if (typeof value === 'object' && value !== null && !Array.isArray(value) &&
-          typeof result[key] === 'object' && result[key] !== null && !Array.isArray(result[key])) {
-        result[key] = mergeOptions(result[key], value);
+          typeof currentValue === 'object' && currentValue !== null &&
+          !Array.isArray(currentValue)) {
+        setOwnDataProperty(
+          result,
+          key,
+          mergeOptions(currentValue, value)
+        );
       } else {
-        result[key] = value;
+        setOwnDataProperty(result, key, value);
       }
     }
   }

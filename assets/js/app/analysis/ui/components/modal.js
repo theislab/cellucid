@@ -27,6 +27,84 @@ const MIN_SIZES = {
   modalHeight: 500        // Modal min height
 };
 
+const FOCUSABLE_SELECTOR =
+  'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])';
+let analysisModalIdCounter = 0;
+
+function getFocusableElements(modal) {
+  return [...modal.querySelectorAll(FOCUSABLE_SELECTOR)].filter(element => {
+    if (
+      element.disabled === true ||
+      element.hidden === true ||
+      element.getAttribute?.('aria-hidden') === 'true' ||
+      element.getAttribute?.('tabindex') === '-1'
+    ) {
+      return false;
+    }
+    if (
+      typeof element.getClientRects === 'function' &&
+      element.getClientRects().length === 0
+    ) {
+      return false;
+    }
+    return true;
+  });
+}
+
+function isTopmostOpenAnalysisModal(modal) {
+  if (typeof document.querySelectorAll !== 'function') return true;
+  const openModals = document.querySelectorAll('.analysis-modal.open');
+  return openModals.length === 0 || openModals[openModals.length - 1] === modal;
+}
+
+function restoreModalFocus(modal) {
+  const previous = modal._previouslyFocusedElement ?? null;
+  modal._previouslyFocusedElement = null;
+  if (
+    previous === null ||
+    typeof previous.focus !== 'function' ||
+    previous.isConnected === false
+  ) {
+    return;
+  }
+  try {
+    previous.focus({ preventScroll: true });
+  } catch {
+    previous.focus();
+  }
+}
+
+function captureInlineStyle(style, property) {
+  return {
+    priority: style.getPropertyPriority(property),
+    value: style.getPropertyValue(property)
+  };
+}
+
+function restoreInlineStyle(style, property, snapshot) {
+  style.removeProperty(property);
+  if (snapshot.value !== '') {
+    style.setProperty(property, snapshot.value, snapshot.priority);
+  }
+}
+
+function captureUserSelectStyles(style) {
+  return {
+    standard: captureInlineStyle(style, 'user-select'),
+    webkit: captureInlineStyle(style, '-webkit-user-select')
+  };
+}
+
+function setUserSelect(style, value) {
+  style.setProperty('user-select', value);
+  style.setProperty('-webkit-user-select', value);
+}
+
+function restoreUserSelectStyles(style, snapshots) {
+  restoreInlineStyle(style, 'user-select', snapshots.standard);
+  restoreInlineStyle(style, '-webkit-user-select', snapshots.webkit);
+}
+
 // =============================================================================
 // MODAL CREATION
 // =============================================================================
@@ -68,12 +146,19 @@ export function createAnalysisModal(options = {}) {
   // Create modal backdrop
   const modal = document.createElement('div');
   modal.className = 'analysis-modal';
+  const modalId = ++analysisModalIdCounter;
+  const titleId = `analysis-modal-title-${modalId}`;
+  modal.setAttribute('aria-labelledby', titleId);
+  modal.setAttribute('aria-modal', 'true');
+  modal.setAttribute('role', 'dialog');
+  modal.tabIndex = -1;
   modal._cleanupFns = [];
   modal._cleanupDone = false;
   modal._beforeClose = beforeClose ?? null;
   modal._onClose = onClose ?? null;
   modal._onCloseError = onCloseError ?? null;
   modal._closePromise = null;
+  modal._previouslyFocusedElement = null;
 
   const backdrop = document.createElement('div');
   backdrop.className = 'analysis-modal-backdrop';
@@ -92,6 +177,7 @@ export function createAnalysisModal(options = {}) {
 
   const title = document.createElement('h3');
   title.className = 'analysis-modal-title';
+  title.id = titleId;
   title.textContent = 'Page Analysis';
 
   const closeBtn = document.createElement('button');
@@ -99,6 +185,7 @@ export function createAnalysisModal(options = {}) {
   closeBtn.className = 'analysis-modal-close';
   closeBtn.innerHTML = '×';
   closeBtn.title = 'Close';
+  closeBtn.setAttribute('aria-label', 'Close analysis');
   closeBtn.addEventListener('click', () => {
     requestModalClose(modal);
   });
@@ -263,8 +350,11 @@ function initializeModalResize(content, edgeRight, edgeBottom) {
   let startY = 0;
   let startWidth = 0;
   let startHeight = 0;
+  let previousBodyCursor = null;
+  let previousBodyUserSelect = null;
 
   const startResize = (e, type) => {
+    if (isResizing) return;
     isResizing = true;
     resizeType = type;
     startX = e.clientX;
@@ -272,8 +362,16 @@ function initializeModalResize(content, edgeRight, edgeBottom) {
     startWidth = content.offsetWidth;
     startHeight = content.offsetHeight;
 
-    document.body.style.userSelect = 'none';
-    document.body.style.cursor = type === 'right' ? 'ew-resize' : 'ns-resize';
+    previousBodyCursor = captureInlineStyle(
+      document.body.style,
+      'cursor'
+    );
+    previousBodyUserSelect = captureUserSelectStyles(document.body.style);
+    document.body.style.setProperty(
+      'cursor',
+      type === 'right' ? 'ew-resize' : 'ns-resize'
+    );
+    setUserSelect(document.body.style, 'none');
 
     e.preventDefault();
     e.stopPropagation();
@@ -304,23 +402,34 @@ function initializeModalResize(content, edgeRight, edgeBottom) {
     }
   };
 
-  const handleMouseUp = () => {
-    if (isResizing) {
-      isResizing = false;
-      resizeType = null;
-      document.body.style.cursor = '';
-      document.body.style.userSelect = '';
-    }
+  const finishResize = () => {
+    if (!isResizing) return;
+    isResizing = false;
+    resizeType = null;
+    restoreInlineStyle(
+      document.body.style,
+      'cursor',
+      previousBodyCursor
+    );
+    restoreUserSelectStyles(
+      document.body.style,
+      previousBodyUserSelect
+    );
+    previousBodyCursor = null;
+    previousBodyUserSelect = null;
   };
 
   document.addEventListener('mousemove', handleMouseMove);
-  document.addEventListener('mouseup', handleMouseUp);
+  document.addEventListener('mouseup', finishResize);
+  window.addEventListener('blur', finishResize);
 
   return () => {
+    finishResize();
     edgeRight.removeEventListener('mousedown', onMouseDownRight);
     edgeBottom.removeEventListener('mousedown', onMouseDownBottom);
     document.removeEventListener('mousemove', handleMouseMove);
-    document.removeEventListener('mouseup', handleMouseUp);
+    document.removeEventListener('mouseup', finishResize);
+    window.removeEventListener('blur', finishResize);
   };
 }
 
@@ -348,6 +457,11 @@ function initializeResizers(content, body, footerArea, verticalResizer, horizont
   let startOptionsWidth = 0;
   let startFooterHeight = 0;
   let startStatsWidth = 0;
+  let capturedPointerId = null;
+  let capturedPointerTarget = null;
+  let intersectionFrame = null;
+  let previousBodyCursor = null;
+  let previousBodyUserSelect = null;
 
   // Get elements
   const statsPanel = footerArea.querySelector('.analysis-modal-stats-panel');
@@ -372,10 +486,19 @@ function initializeResizers(content, body, footerArea, verticalResizer, horizont
     intersectionResizer.style.right = 'auto';
   };
 
+  const scheduleIntersectionPosition = () => {
+    if (intersectionFrame !== null) return;
+    intersectionFrame = requestAnimationFrame(() => {
+      intersectionFrame = null;
+      updateIntersectionPosition();
+    });
+  };
+
   // Start resize handler using pointer events
   const startResize = (e, type) => {
     e.preventDefault();
     e.stopPropagation();
+    if (activeResizer !== null) return;
 
     activeResizer = type;
     startX = e.clientX;
@@ -405,11 +528,40 @@ function initializeResizers(content, body, footerArea, verticalResizer, horizont
       footer: 'col-resize',
       intersection: 'nwse-resize'
     };
-    document.body.style.cursor = cursors[type];
-    document.body.style.userSelect = 'none';
+    previousBodyCursor = captureInlineStyle(
+      document.body.style,
+      'cursor'
+    );
+    previousBodyUserSelect = captureUserSelectStyles(document.body.style);
+    document.body.style.setProperty('cursor', cursors[type]);
+    setUserSelect(document.body.style, 'none');
 
     // Capture pointer for reliable tracking
-    e.target.setPointerCapture(e.pointerId);
+    capturedPointerTarget = e.currentTarget ?? e.target;
+    capturedPointerId = e.pointerId;
+    try {
+      capturedPointerTarget.setPointerCapture(capturedPointerId);
+    } catch (error) {
+      activeResizer = null;
+      capturedPointerTarget = null;
+      capturedPointerId = null;
+      verticalResizer.classList.remove('resizing');
+      horizontalResizer.classList.remove('resizing');
+      footerResizer.classList.remove('resizing');
+      intersectionResizer.classList.remove('resizing');
+      restoreInlineStyle(
+        document.body.style,
+        'cursor',
+        previousBodyCursor
+      );
+      restoreUserSelectStyles(
+        document.body.style,
+        previousBodyUserSelect
+      );
+      previousBodyCursor = null;
+      previousBodyUserSelect = null;
+      throw error;
+    }
   };
 
   // Pointer move handler
@@ -464,13 +616,17 @@ function initializeResizers(content, body, footerArea, verticalResizer, horizont
 
     // Update intersection position during resize
     if (activeResizer === 'vertical' || activeResizer === 'horizontal' || activeResizer === 'intersection') {
-      requestAnimationFrame(updateIntersectionPosition);
+      scheduleIntersectionPosition();
     }
   };
 
-  // Pointer up handler
-  const handlePointerUp = (e) => {
-    if (!activeResizer) return;
+  const finishResize = ({ updatePosition = true } = {}) => {
+    if (
+      activeResizer === null &&
+      capturedPointerTarget === null
+    ) {
+      return;
+    }
 
     // Remove resizing classes
     verticalResizer.classList.remove('resizing');
@@ -478,18 +634,41 @@ function initializeResizers(content, body, footerArea, verticalResizer, horizont
     footerResizer.classList.remove('resizing');
     intersectionResizer.classList.remove('resizing');
 
+    const pointerTarget = capturedPointerTarget;
+    const pointerId = capturedPointerId;
     activeResizer = null;
-    document.body.style.cursor = '';
-    document.body.style.userSelect = '';
+    capturedPointerTarget = null;
+    capturedPointerId = null;
+    restoreInlineStyle(
+      document.body.style,
+      'cursor',
+      previousBodyCursor
+    );
+    restoreUserSelectStyles(
+      document.body.style,
+      previousBodyUserSelect
+    );
+    previousBodyCursor = null;
+    previousBodyUserSelect = null;
 
-    // Release pointer capture
-    if (e.target.hasPointerCapture && e.target.hasPointerCapture(e.pointerId)) {
-      e.target.releasePointerCapture(e.pointerId);
+    if (
+      pointerTarget !== null &&
+      pointerId !== null &&
+      typeof pointerTarget.releasePointerCapture === 'function' &&
+      (
+        typeof pointerTarget.hasPointerCapture !== 'function' ||
+        pointerTarget.hasPointerCapture(pointerId)
+      )
+    ) {
+      pointerTarget.releasePointerCapture(pointerId);
     }
 
     // Final position update for intersection
-    updateIntersectionPosition();
+    if (updatePosition) updateIntersectionPosition();
   };
+  const handlePointerUp = () => finishResize();
+  const handlePointerCancel = () => finishResize();
+  const handleWindowBlur = () => finishResize();
 
   // Attach pointer event handlers to resizers
   const onVerticalDown = (e) => startResize(e, 'vertical');
@@ -505,15 +684,17 @@ function initializeResizers(content, body, footerArea, verticalResizer, horizont
   // Global pointer move/up handlers
   document.addEventListener('pointermove', handlePointerMove);
   document.addEventListener('pointerup', handlePointerUp);
+  document.addEventListener('pointercancel', handlePointerCancel);
+  window.addEventListener('blur', handleWindowBlur);
 
   // Update intersection position on window resize
-  const onWindowResize = () => requestAnimationFrame(updateIntersectionPosition);
+  const onWindowResize = scheduleIntersectionPosition;
   window.addEventListener('resize', onWindowResize);
 
   // Create a ResizeObserver to update intersection position when content changes
   // This will also fire when the modal is first added to DOM and laid out
   const resizeObserver = new ResizeObserver(() => {
-    requestAnimationFrame(updateIntersectionPosition);
+    scheduleIntersectionPosition();
   });
   resizeObserver.observe(content);
   resizeObserver.observe(body);
@@ -534,6 +715,7 @@ function initializeResizers(content, body, footerArea, verticalResizer, horizont
       }
     };
 
+    run(() => finishResize({ updatePosition: false }));
     run(() => verticalResizer.removeEventListener('pointerdown', onVerticalDown));
     run(() => horizontalResizer.removeEventListener('pointerdown', onHorizontalDown));
     run(() => footerResizer.removeEventListener('pointerdown', onFooterDown));
@@ -541,6 +723,8 @@ function initializeResizers(content, body, footerArea, verticalResizer, horizont
 
     run(() => document.removeEventListener('pointermove', handlePointerMove));
     run(() => document.removeEventListener('pointerup', handlePointerUp));
+    run(() => document.removeEventListener('pointercancel', handlePointerCancel));
+    run(() => window.removeEventListener('blur', handleWindowBlur));
     run(() => window.removeEventListener('resize', onWindowResize));
 
     if (typeof resizeObserver.disconnect !== 'function') {
@@ -550,6 +734,10 @@ function initializeResizers(content, body, footerArea, verticalResizer, horizont
     }
 
     run(() => clearTimeout(intersectionTimeout));
+    if (intersectionFrame !== null) {
+      run(() => cancelAnimationFrame(intersectionFrame));
+      intersectionFrame = null;
+    }
 
     if (errors.length === 1) throw errors[0];
     if (errors.length > 1) {
@@ -577,10 +765,13 @@ function initializeModalDrag(modal, content, header) {
   let startY = 0;
   let initialLeft = 0;
   let initialTop = 0;
+  let previousBodyCursor = null;
+  let previousBodyUserSelect = null;
 
   const onMouseDownHeader = (e) => {
     // Don't drag if clicking close button
     if (e.target.closest('.analysis-modal-close')) return;
+    if (isDragging) return;
 
     isDragging = true;
 
@@ -591,8 +782,13 @@ function initializeModalDrag(modal, content, header) {
     startX = e.clientX;
     startY = e.clientY;
 
-    document.body.style.cursor = 'move';
-    document.body.style.userSelect = 'none';
+    previousBodyCursor = captureInlineStyle(
+      document.body.style,
+      'cursor'
+    );
+    previousBodyUserSelect = captureUserSelectStyles(document.body.style);
+    document.body.style.setProperty('cursor', 'move');
+    setUserSelect(document.body.style, 'none');
     e.preventDefault();
   };
 
@@ -618,21 +814,32 @@ function initializeModalDrag(modal, content, header) {
     content.style.top = `${Math.max(20, Math.min(newTop, maxTop))}px`;
   };
 
-  const handleMouseUp = () => {
-    if (isDragging) {
-      isDragging = false;
-      document.body.style.cursor = '';
-      document.body.style.userSelect = '';
-    }
+  const finishDrag = () => {
+    if (!isDragging) return;
+    isDragging = false;
+    restoreInlineStyle(
+      document.body.style,
+      'cursor',
+      previousBodyCursor
+    );
+    restoreUserSelectStyles(
+      document.body.style,
+      previousBodyUserSelect
+    );
+    previousBodyCursor = null;
+    previousBodyUserSelect = null;
   };
 
   document.addEventListener('mousemove', handleMouseMove);
-  document.addEventListener('mouseup', handleMouseUp);
+  document.addEventListener('mouseup', finishDrag);
+  window.addEventListener('blur', finishDrag);
 
   return () => {
+    finishDrag();
     header.removeEventListener('mousedown', onMouseDownHeader);
     document.removeEventListener('mousemove', handleMouseMove);
-    document.removeEventListener('mouseup', handleMouseUp);
+    document.removeEventListener('mouseup', finishDrag);
+    window.removeEventListener('blur', finishDrag);
   };
 }
 
@@ -645,6 +852,23 @@ function initializeModalDrag(modal, content, header) {
  * @param {HTMLElement} modal - Modal element to open
  */
 export function openModal(modal) {
+  if (!modal || typeof modal !== 'object') {
+    throw new TypeError('openModal requires a modal element');
+  }
+  if (modal._cleanupDone === true || modal._closePromise != null) {
+    throw new Error('Cannot reopen an analysis modal after close has begun');
+  }
+  if (modal.isConnected === true || modal.classList?.contains?.('open')) {
+    throw new Error('Analysis modal is already open');
+  }
+  const previousFocus = document.activeElement;
+  modal._previouslyFocusedElement =
+    previousFocus &&
+    previousFocus !== document.body &&
+    typeof previousFocus.focus === 'function'
+      ? previousFocus
+      : null;
+
   document.body.appendChild(modal);
   // Force reflow for animation
   modal.offsetHeight;
@@ -666,20 +890,48 @@ export function openModal(modal) {
     }, 200);
   }
 
-  // Trap focus
-  const focusableEls = modal.querySelectorAll('button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])');
-  if (focusableEls.length > 0) {
-    focusableEls[0].focus();
-  }
+  const focusableEls = getFocusableElements(modal);
+  (focusableEls[0] ?? modal).focus();
 
-  // Close on Escape
+  // Own Escape and keyboard focus while this is the topmost analysis dialog.
   const handleEscape = (e) => {
+    if (!isTopmostOpenAnalysisModal(modal)) return;
+    const activeElement = document.activeElement;
+    const activeDialog = activeElement?.closest?.('[role="dialog"]') ?? null;
+    if (activeDialog !== null && activeDialog !== modal) return;
+
     if (e.key === 'Escape') {
+      e.preventDefault?.();
+      e.stopImmediatePropagation?.();
+      e.stopPropagation?.();
       requestModalClose(modal);
+      return;
+    }
+    if (e.key !== 'Tab') return;
+
+    const currentFocusable = getFocusableElements(modal);
+    if (currentFocusable.length === 0) {
+      e.preventDefault?.();
+      modal.focus();
+      return;
+    }
+    const first = currentFocusable[0];
+    const last = currentFocusable[currentFocusable.length - 1];
+    if (!modal.contains(activeElement)) {
+      e.preventDefault?.();
+      (e.shiftKey ? last : first).focus();
+      return;
+    }
+    if (e.shiftKey && activeElement === first) {
+      e.preventDefault?.();
+      last.focus();
+    } else if (!e.shiftKey && activeElement === last) {
+      e.preventDefault?.();
+      first.focus();
     }
   };
   modal._escapeHandler = handleEscape;
-  document.addEventListener('keydown', handleEscape);
+  document.addEventListener('keydown', handleEscape, true);
 }
 
 function combineErrors(errors, message) {
@@ -745,7 +997,7 @@ function beginModalCleanup(modal) {
   // Stop Escape handler (important: openModal doesn't always remove it).
   if (modal._escapeHandler) {
     run(() => {
-      document.removeEventListener('keydown', modal._escapeHandler);
+      document.removeEventListener('keydown', modal._escapeHandler, true);
     });
     modal._escapeHandler = null;
   }
@@ -777,8 +1029,9 @@ function beginModalCleanup(modal) {
   }
 
   run(() => modal.classList.remove('open'));
+  let detachTask = Promise.resolve();
   if (modal.parentNode) {
-    tasks.push(new Promise((resolve, reject) => {
+    detachTask = new Promise((resolve, reject) => {
       modal._detachTimeout = setTimeout(() => {
         modal._detachTimeout = null;
         try {
@@ -790,8 +1043,13 @@ function beginModalCleanup(modal) {
           reject(requireCloseError(error));
         }
       }, 200);
-    }));
+    });
+    tasks.push(detachTask);
   }
+  tasks.push(detachTask.then(
+    () => restoreModalFocus(modal),
+    () => restoreModalFocus(modal)
+  ));
 
   if (typeof modal._onClose === 'function') {
     const onCloseResult = run(() => modal._onClose());

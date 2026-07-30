@@ -587,6 +587,221 @@ test('Orbit and Planar targets follow the sidebar-aware visual center', async ({
   expect(productErrors).toEqual([]);
 });
 
+test('coarse LOD picking follows the rendered live and snapshot prefixes', async ({
+  page,
+}) => {
+  const productErrors = observeProductErrors(page);
+  await installSynthetic3dFixture(page);
+
+  await page.goto(
+    `/?exportsBaseUrl=${encodeURIComponent(SYNTHETIC_3D_ROOT)}` +
+      `&dataset=${DATASET_ID}&acceptance=coarse-lod-picking-prefix`,
+    { waitUntil: 'domcontentloaded' },
+  );
+  await dismissWelcome(page);
+  await expect(page.locator('#dataset-name')).toHaveText(
+    'Deterministic 3-D orbit fixture',
+  );
+
+  const proof = await page.evaluate(async () => {
+    const { createInMemoryDimensionManager } = await import(
+      '/assets/js/data/dimension-manager.js'
+    );
+    const pointCount = 24_000;
+    const positions = new Float32Array(pointCount * 3);
+    const colors = new Uint8Array(pointCount * 4);
+
+    // Both candidates lie on the exact planar-camera ray. Source 0 is almost
+    // one world unit closer, but its Morton priority excludes it from LOD 0;
+    // source 1 is the first member of the actual reduced prefix.
+    positions.set([
+      -0.994, -0.994, 0,
+      -0.994, -0.994, -0.994,
+    ]);
+    for (let cellIndex = 2; cellIndex < pointCount; cellIndex++) {
+      const angle =
+        (cellIndex * 2.399963229728653) % (Math.PI * 2);
+      const positionOffset = cellIndex * 3;
+      positions[positionOffset] = Math.cos(angle);
+      positions[positionOffset + 1] = Math.sin(angle);
+      positions[positionOffset + 2] =
+        (cellIndex & 1) === 0 ? 1 : -1;
+    }
+    for (let cellIndex = 0; cellIndex < pointCount; cellIndex++) {
+      const colorOffset = cellIndex * 4;
+      colors[colorOffset] = 48;
+      colors[colorOffset + 1] = 144;
+      colors[colorOffset + 2] = 240;
+      colors[colorOffset + 3] = 255;
+    }
+
+    const state = window._cellucidState;
+    const viewer = window._cellucidViewer;
+    state.initSyntheticScene({
+      colors,
+      dimensionLevel: 3,
+      dimensionManager: createInMemoryDimensionManager({
+        positions,
+        dimension: 3,
+      }),
+      positions,
+    });
+    viewer.setCamerasLocked(true);
+    viewer.setFrustumCulling(false);
+    viewer.setAdaptiveLOD(false);
+    viewer.setForceLOD(-1);
+    viewer.setCameraState({
+      navigationMode: 'planar',
+      orbit: {
+        radius: 3,
+        targetRadius: 3,
+        theta: Math.PI / 4,
+        phi: Math.PI / 4,
+        target: [-0.994, -0.994, -0.994],
+      },
+      freefly: {
+        position: [-0.994, -0.994, 2.006],
+        yaw: -Math.PI / 2,
+        pitch: 0,
+      },
+    });
+
+    const waitForFrames = () => new Promise(resolve => {
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          requestAnimationFrame(resolve);
+        });
+      });
+    });
+    const getPaneCenters = () => {
+      const canvas = document.getElementById('glcanvas');
+      const sidebar = document.getElementById('sidebar');
+      const canvasRect = canvas.getBoundingClientRect();
+      const sidebarRight = sidebar.offsetLeft + sidebar.offsetWidth;
+      const centerY = (canvasRect.top + canvasRect.bottom) / 2;
+      const paneBoundary = canvasRect.left + canvasRect.width / 2;
+      return {
+        centerY,
+        liveX:
+          (Math.max(canvasRect.left, sidebarRight) + paneBoundary) / 2,
+        singleX:
+          (Math.max(canvasRect.left, sidebarRight) + canvasRect.right) / 2,
+        snapshotX: (paneBoundary + canvasRect.right) / 2,
+      };
+    };
+
+    await waitForFrames();
+    const singlePane = getPaneCenters();
+    const fullDetailRecord = viewer.pickCellRecordAtScreen(
+      singlePane.singleX,
+      singlePane.centerY,
+    );
+
+    const payload = state.getSnapshotPayload();
+    const snapshot = viewer.createSnapshotView({
+      label: 'Coarse LOD picking snapshot',
+      fieldKey: payload.fieldKey,
+      fieldKind: payload.fieldKind,
+      colors: payload.colors,
+      transparency: payload.transparency,
+      centroidPositions: payload.centroidPositions,
+      centroidColors: payload.centroidColors,
+      dimensionLevel: payload.dimensionLevel,
+      sourceViewId: 'live',
+      meta: { filtersText: payload.filtersText },
+      cameraState: viewer.getCameraState(),
+    });
+    viewer.setViewLayout('grid', snapshot.id);
+    viewer.setAdaptiveLOD(true);
+    viewer.setForceLOD(0);
+    await waitForFrames();
+
+    const liveMembership = viewer.getCurrentLodMembership('live', 3);
+    const snapshotMembership = viewer.getCurrentLodMembership(
+      snapshot.id,
+      3,
+    );
+    const paneCenters = getPaneCenters();
+    const liveRecord = viewer.pickCellRecordAtScreen(
+      paneCenters.liveX,
+      paneCenters.centerY,
+    );
+    const snapshotRecord = viewer.pickCellRecordAtScreen(
+      paneCenters.snapshotX,
+      paneCenters.centerY,
+    );
+    const summarizeMembership = membership => ({
+      closerAdmission: membership.admissionLevels[0],
+      fartherAdmission: membership.admissionLevels[1],
+      dimensionLevel: membership.dimensionLevel,
+      indexCount: membership.indices.length,
+      includesCloser: membership.indices.includes(0),
+      includesFarther: membership.indices.includes(1),
+      lodLevel: membership.lodLevel,
+      pointCount: membership.pointCount,
+      frozen: Object.isFrozen(membership),
+    });
+    const summarizeStats = viewId => {
+      const stats = viewer.getRendererStats(viewId);
+      return {
+        lodLevel: stats.lodLevel,
+        visiblePoints: stats.visiblePoints,
+      };
+    };
+
+    return {
+      fullDetail: {
+        cellIndex: fullDetailRecord?.cellIndex ?? -1,
+        viewId: fullDetailRecord?.viewId ?? null,
+      },
+      live: {
+        cellIndex: liveRecord?.cellIndex ?? -1,
+        currentLodLevel: viewer.getCurrentLODLevel('live'),
+        membership: summarizeMembership(liveMembership),
+        stats: summarizeStats('live'),
+        viewId: liveRecord?.viewId ?? null,
+      },
+      snapshot: {
+        cellIndex: snapshotRecord?.cellIndex ?? -1,
+        currentLodLevel: viewer.getCurrentLODLevel(snapshot.id),
+        membership: summarizeMembership(snapshotMembership),
+        stats: summarizeStats(snapshot.id),
+        viewId: snapshotRecord?.viewId ?? null,
+      },
+      snapshotId: snapshot.id,
+      webglError: viewer.getGLContext().getError(),
+    };
+  });
+
+  expect(proof.fullDetail).toEqual({
+    cellIndex: 0,
+    viewId: 'live',
+  });
+  for (const renderedView of [proof.live, proof.snapshot]) {
+    expect(renderedView.cellIndex).toBe(1);
+    expect(renderedView.currentLodLevel).toBe(0);
+    expect(renderedView.membership).toMatchObject({
+      dimensionLevel: 3,
+      indexCount: 1000,
+      includesCloser: false,
+      includesFarther: true,
+      lodLevel: 0,
+      pointCount: 24_000,
+      frozen: true,
+    });
+    expect(renderedView.membership.closerAdmission).toBeGreaterThan(0);
+    expect(renderedView.membership.fartherAdmission).toBe(0);
+    expect(renderedView.stats).toEqual({
+      lodLevel: 0,
+      visiblePoints: 1000,
+    });
+  }
+  expect(proof.live.viewId).toBe('live');
+  expect(proof.snapshot.viewId).toBe(proof.snapshotId);
+  expect(proof.webglError).toBe(0);
+  expect(productErrors).toEqual([]);
+});
+
 test('unlocked mixed-mode panes render orbit anchors only in Orbit panes', async ({
   page,
 }) => {

@@ -9,6 +9,11 @@
  * @module ui/modules/figure-export/utils/zip-archive
  */
 
+import {
+  awaitFigureExportAbortable,
+  throwIfFigureExportAborted,
+} from '../figure-export-contract.js';
+
 const MAX_U16 = 0xffff;
 const MAX_U32 = 0xffff_ffff;
 const UTF8_FLAG = 0x0800;
@@ -144,9 +149,15 @@ function makeEndRecord({ entryCount, centralSize, centralOffset }) {
  * Create one deterministic, uncompressed ZIP32 Blob.
  *
  * @param {{ filename: string; blob: Blob }[]} entries
+ * @param {object} [options]
+ * @param {AbortSignal|null} [options.signal]
  * @returns {Promise<Blob>}
  */
-export async function createFigureExportZip(entries) {
+export async function createFigureExportZip(
+  entries,
+  { signal = null } = {}
+) {
+  throwIfFigureExportAborted(signal);
   if (!Array.isArray(entries) || entries.length < 2) {
     throw new TypeError(
       'Figure export ZIP requires at least two staged artifacts.'
@@ -202,7 +213,13 @@ export async function createFigureExportZip(entries) {
   const centralParts = [];
   let localOffset = 0;
   for (const plan of plans) {
-    const bytes = new Uint8Array(await plan.blob.arrayBuffer());
+    throwIfFigureExportAborted(signal);
+    const buffer = await awaitFigureExportAbortable(
+      signal,
+      plan.blob.arrayBuffer()
+    );
+    throwIfFigureExportAborted(signal);
+    const bytes = new Uint8Array(buffer);
     if (bytes.length !== plan.size) {
       throw new Error('Figure export ZIP Blob size changed during staging.');
     }
@@ -228,6 +245,7 @@ export async function createFigureExportZip(entries) {
     localOffset += LOCAL_HEADER_SIZE + plan.filenameBytes.length + plan.size;
   }
 
+  throwIfFigureExportAborted(signal);
   return new Blob(
     [
       ...localParts,

@@ -25,6 +25,10 @@ import {
   DataSourceErrorCode,
   loadDatasetMetadata
 } from './data-source.js';
+import {
+  loadMetadataBatchAtomically,
+  throwIfMetadataAborted,
+} from './metadata-load-contract.js';
 
 /**
  * @typedef {import('./data-source.js').DatasetMetadata} DatasetMetadata
@@ -128,6 +132,50 @@ export function parseJupyterUrl(url) {
     viewerId: match[1],
     path: (match[2] || '/').substring(1)
   };
+}
+
+function requireCanonicalJupyterArtifactPath(path) {
+  if (typeof path !== 'string') {
+    throw new TypeError('Jupyter artifact path must be a string');
+  }
+  if (path === '') return path;
+  if (
+    path.startsWith('/') ||
+    path.endsWith('/') ||
+    path.includes('\\') ||
+    path.includes('?') ||
+    path.includes('#')
+  ) {
+    throw new TypeError(
+      'Jupyter artifact path must be one canonical relative file path'
+    );
+  }
+
+  for (const segment of path.split('/')) {
+    let decoded;
+    try {
+      decoded = decodeURIComponent(segment);
+    } catch {
+      throw new TypeError(
+        'Jupyter artifact path contains invalid percent encoding'
+      );
+    }
+    if (
+      segment.length === 0 ||
+      decoded === '.' ||
+      decoded === '..' ||
+      decoded.includes('%') ||
+      decoded.includes('/') ||
+      decoded.includes('\\') ||
+      /[\u0000-\u001f\u007f]/.test(decoded) ||
+      encodeURIComponent(decoded) !== segment
+    ) {
+      throw new TypeError(
+        'Jupyter artifact path contains a noncanonical segment'
+      );
+    }
+  }
+  return path;
 }
 
 function requireJupyterRuntimeConfig(config) {
@@ -366,12 +414,17 @@ function requireJupyterHealthPayload(payload) {
   return payload;
 }
 
-async function requestJupyterHealth(config) {
+async function requestJupyterHealth(config, signal = null) {
   const exactConfig = requireJupyterRuntimeConfig(config);
+  throwIfMetadataAborted(signal, 'Jupyter health request');
   const response = await fetch(
     `${exactConfig.serverUrl}/_cellucid/health`,
-    { cache: 'no-store' }
+    {
+      cache: 'no-store',
+      ...(signal === null ? {} : { signal }),
+    }
   );
+  throwIfMetadataAborted(signal, 'Jupyter health request');
   if (!(response instanceof Response)) {
     throw new TypeError('Jupyter health fetch must return a Response');
   }
@@ -380,7 +433,9 @@ async function requestJupyterHealth(config) {
       `Jupyter health request failed with HTTP ${response.status}`
     );
   }
-  return requireJupyterHealthPayload(await response.json());
+  const payload = await response.json();
+  throwIfMetadataAborted(signal, 'Jupyter health request');
+  return requireJupyterHealthPayload(payload);
 }
 
 function requireDatasetCatalogPath(value, label) {
@@ -589,6 +644,8 @@ export class JupyterBridgeDataSource {
 
     /** @type {Map<string, DatasetMetadata>} */
     this._datasetCache = new Map();
+    /** @type {Map<string, Object>} */
+    this._metadataInFlight = new Map();
 
     /** @type {Map<string, string>} Dataset ID -> base path (from /_cellucid/datasets) */
     this._datasetPaths = new Map();
@@ -601,6 +658,10 @@ export class JupyterBridgeDataSource {
 
     this._lifecycleRevision = 0;
     this._catalogRevision = 0;
+    /** @type {AbortController|null} */
+    this._catalogController = null;
+    /** @type {AbortController|null} */
+    this._initializationController = null;
     this._destroyed = false;
     this._listenerInstalled = false;
 
@@ -687,9 +748,31 @@ export class JupyterBridgeDataSource {
 
   _assertCatalog(owner, label) {
     this._assertConnection(owner, label);
-    if (owner.catalogRevision !== this._catalogRevision) {
+    if (
+      owner.catalogRevision !== this._catalogRevision ||
+      owner.catalogController !== this._catalogController ||
+      owner.catalogController?.signal.aborted
+    ) {
       throw createJupyterLifecycleSupersededError(label);
     }
+  }
+
+  _beginCatalogGeneration(reason) {
+    const previousController = this._catalogController;
+    const controller = new AbortController();
+    this._catalogController = controller;
+    const revision = ++this._catalogRevision;
+    this._metadataInFlight = new Map();
+    previousController?.abort(new Error(reason));
+    return { controller, revision };
+  }
+
+  _endCatalogGeneration(reason) {
+    const previousController = this._catalogController;
+    this._catalogController = null;
+    this._catalogRevision += 1;
+    this._metadataInFlight = new Map();
+    previousController?.abort(new Error(reason));
   }
 
   /**
@@ -720,7 +803,15 @@ export class JupyterBridgeDataSource {
     }
 
     const revision = ++this._lifecycleRevision;
-    this._catalogRevision += 1;
+    const previousController = this._initializationController;
+    const controller = new AbortController();
+    this._initializationController = controller;
+    previousController?.abort(
+      new Error('Jupyter initialization was superseded')
+    );
+    this._endCatalogGeneration(
+      'Jupyter catalog was retired by initialization'
+    );
     this._removeMessageListener();
     this._connected = false;
     this._config = null;
@@ -728,13 +819,29 @@ export class JupyterBridgeDataSource {
     this._datasetCache.clear();
     this._datasetPaths.clear();
     try {
-      await requestJupyterHealth(config);
+      await requestJupyterHealth(config, controller.signal);
       this._assertLifecycle(revision, 'Jupyter initialization');
+      if (this._initializationController !== controller) {
+        throw createJupyterLifecycleSupersededError(
+          'Jupyter initialization'
+        );
+      }
       this._config = config;
       this._connected = true;
+      this._beginCatalogGeneration(
+        'Jupyter catalog was initialized'
+      );
       this._installMessageListener();
       return true;
     } catch (error) {
+      if (
+        revision !== this._lifecycleRevision ||
+        this._initializationController !== controller
+      ) {
+        throw createJupyterLifecycleSupersededError(
+          'Jupyter initialization'
+        );
+      }
       if (revision === this._lifecycleRevision) {
         this._removeMessageListener();
         this._connected = false;
@@ -742,6 +849,10 @@ export class JupyterBridgeDataSource {
         this._parentOrigin = null;
       }
       throw error;
+    } finally {
+      if (this._initializationController === controller) {
+        this._initializationController = null;
+      }
     }
   }
 
@@ -1231,49 +1342,88 @@ export class JupyterBridgeDataSource {
         this.type
       );
     }
+    const catalogOwner = this._beginCatalogGeneration(
+      'Jupyter dataset listing was superseded'
+    );
     const owner = {
       config: this._config,
       lifecycleRevision: this._lifecycleRevision,
-      catalogRevision: ++this._catalogRevision
+      catalogRevision: catalogOwner.revision,
+      catalogController: catalogOwner.controller,
     };
 
-    const response = await fetch(
-      `${owner.config.serverUrl}/_cellucid/datasets`
-    );
-    this._assertCatalog(owner, 'Jupyter dataset listing');
-    if (!(response instanceof Response)) {
-      throw new TypeError(
-        'Jupyter dataset listing fetch must return a Response'
+    try {
+      const response = await fetch(
+        `${owner.config.serverUrl}/_cellucid/datasets`,
+        { signal: catalogOwner.controller.signal }
       );
-    }
-    if (!response.ok) {
-      throw new Error(
-        `Jupyter dataset listing failed with HTTP ${response.status}`
-      );
-    }
-
-    const catalogPayload = await response.json();
-    this._assertCatalog(owner, 'Jupyter dataset listing');
-    const datasetList = requireDatasetCatalogPayload(catalogPayload);
-    const stagedPaths = new Map(
-      datasetList.map(dataset => [dataset.id, dataset.path])
-    );
-    const stagedMetadataEntries = await Promise.all(
-      datasetList.map(async dataset => {
-        const metadata = await loadDatasetMetadata(
-          `${owner.config.serverUrl}${dataset.path}`,
-          dataset.id,
-          this.type
+      this._assertCatalog(owner, 'Jupyter dataset listing');
+      if (!(response instanceof Response)) {
+        throw new TypeError(
+          'Jupyter dataset listing fetch must return a Response'
         );
-        return [dataset.id, metadata];
-      })
-    );
-    const stagedCache = new Map(stagedMetadataEntries);
-    this._assertCatalog(owner, 'Jupyter dataset listing');
+      }
+      if (!response.ok) {
+        throw new Error(
+          `Jupyter dataset listing failed with HTTP ${response.status}`
+        );
+      }
 
-    this._datasetPaths = stagedPaths;
-    this._datasetCache = stagedCache;
-    return stagedMetadataEntries.map(([, metadata]) => metadata);
+      const catalogPayload = await response.json();
+      this._assertCatalog(owner, 'Jupyter dataset listing');
+      const datasetList = requireDatasetCatalogPayload(catalogPayload);
+      const stagedPaths = new Map(
+        datasetList.map(dataset => [dataset.id, dataset.path])
+      );
+      const stagedMetadataEntries =
+        await loadMetadataBatchAtomically(
+          datasetList,
+          catalogOwner.controller.signal,
+          async (dataset, signal) => {
+          const metadata = await loadDatasetMetadata(
+            `${owner.config.serverUrl}${dataset.path}`,
+            dataset.id,
+            this.type,
+            { signal }
+          );
+          if (metadata.name !== dataset.name) {
+            throw new DataSourceError(
+              `Jupyter catalog name for ${JSON.stringify(dataset.id)} does not match dataset_identity.json`,
+              DataSourceErrorCode.VALIDATION_ERROR,
+              this.type,
+              {
+                datasetId: dataset.id,
+                catalogName: dataset.name,
+                identityName: metadata.name,
+              }
+            );
+          }
+          return [dataset.id, metadata];
+          },
+          'Jupyter catalog metadata loading'
+        );
+      const stagedCache = new Map(stagedMetadataEntries);
+      this._assertCatalog(owner, 'Jupyter dataset listing');
+
+      this._beginCatalogGeneration(
+        'Jupyter dataset listing was adopted'
+      );
+      this._datasetPaths = stagedPaths;
+      this._datasetCache = stagedCache;
+      return stagedMetadataEntries.map(([, metadata]) => metadata);
+    } catch (error) {
+      if (
+        catalogOwner.controller.signal.aborted ||
+        owner.lifecycleRevision !== this._lifecycleRevision ||
+        owner.catalogRevision !== this._catalogRevision ||
+        owner.catalogController !== this._catalogController
+      ) {
+        throw createJupyterLifecycleSupersededError(
+          'Jupyter dataset listing'
+        );
+      }
+      throw error;
+    }
   }
 
   _requireDatasetId(datasetId) {
@@ -1339,25 +1489,80 @@ export class JupyterBridgeDataSource {
       return this._datasetCache.get(id);
     }
 
+    const catalogOwner = this._catalogController === null
+      ? this._beginCatalogGeneration(
+        'Jupyter catalog generation was initialized'
+      )
+      : {
+        controller: this._catalogController,
+        revision: this._catalogRevision
+      };
     const owner = {
       config: this._config,
       lifecycleRevision: this._lifecycleRevision,
-      catalogRevision: this._catalogRevision
+      catalogRevision: catalogOwner.revision,
+      catalogController: catalogOwner.controller
     };
     const datasetPath = this._requireDeclaredDatasetPath(id);
-    const metadata = await loadDatasetMetadata(
-      `${owner.config.serverUrl}${datasetPath}`,
-      id,
-      this.type
-    );
-    this._assertCatalog(owner, 'Jupyter dataset metadata');
-    if (this._datasetPaths.get(id) !== datasetPath) {
-      throw createJupyterLifecycleSupersededError(
-        'Jupyter dataset metadata'
-      );
+    const existing = this._metadataInFlight.get(id);
+    if (
+      existing?.config === owner.config &&
+      existing.lifecycleRevision === owner.lifecycleRevision &&
+      existing.catalogRevision === owner.catalogRevision &&
+      existing.catalogController === owner.catalogController &&
+      existing.datasetPath === datasetPath
+    ) {
+      return existing.promise;
     }
-    this._datasetCache.set(id, metadata);
-    return metadata;
+
+    const loadPromise = (async () => {
+      const metadata = await loadDatasetMetadata(
+        `${owner.config.serverUrl}${datasetPath}`,
+        id,
+        this.type,
+        { signal: catalogOwner.controller.signal }
+      );
+      this._assertCatalog(owner, 'Jupyter dataset metadata');
+      if (this._datasetPaths.get(id) !== datasetPath) {
+        throw createJupyterLifecycleSupersededError(
+          'Jupyter dataset metadata'
+        );
+      }
+      this._datasetCache.set(id, metadata);
+      return metadata;
+    })();
+    const inFlight = {
+      config: owner.config,
+      lifecycleRevision: owner.lifecycleRevision,
+      catalogRevision: owner.catalogRevision,
+      catalogController: owner.catalogController,
+      datasetPath,
+      promise: null,
+    };
+    const promise = (async () => {
+      try {
+        return await loadPromise;
+      } catch (error) {
+        if (
+          catalogOwner.controller.signal.aborted ||
+          owner.lifecycleRevision !== this._lifecycleRevision ||
+          owner.catalogRevision !== this._catalogRevision ||
+          owner.catalogController !== this._catalogController
+        ) {
+          throw createJupyterLifecycleSupersededError(
+            'Jupyter dataset metadata'
+          );
+        }
+        throw error;
+      } finally {
+        if (this._metadataInFlight.get(id) === inFlight) {
+          this._metadataInFlight.delete(id);
+        }
+      }
+    })();
+    inFlight.promise = promise;
+    this._metadataInFlight.set(id, inFlight);
+    return promise;
   }
 
   /**
@@ -1423,24 +1628,35 @@ export class JupyterBridgeDataSource {
       );
     }
 
-    const path = parsed.path;
+    let path;
+    try {
+      path = requireCanonicalJupyterArtifactPath(parsed.path);
+    } catch (error) {
+      throw new DataSourceError(
+        `Invalid Jupyter artifact path: ${parsed.path}`,
+        DataSourceErrorCode.INVALID_FORMAT,
+        this.type,
+        { cause: error }
+      );
+    }
+
+    const belongsToDeclaredDataset = [
+      ...this._datasetPaths.values(),
+    ].some(datasetPath => {
+      if (datasetPath === '/') return true;
+      return path.startsWith(datasetPath.slice(1));
+    });
+    if (!belongsToDeclaredDataset) {
+      throw new DataSourceError(
+        'Jupyter artifact URL does not belong to a currently declared dataset',
+        DataSourceErrorCode.VALIDATION_ERROR,
+        this.type,
+        { url }
+      );
+    }
+
     if (path === '') {
       return `${this._config.serverUrl}/`;
-    }
-    if (
-      path.startsWith('/') ||
-      path.endsWith('/') ||
-      path.includes('\\') ||
-      path.includes('?') ||
-      path.includes('#') ||
-      /\s/.test(path) ||
-      path.split('/').some(part => part === '' || part === '.' || part === '..')
-    ) {
-      throw new DataSourceError(
-        `Invalid Jupyter artifact path: ${path}`,
-        DataSourceErrorCode.INVALID_FORMAT,
-        this.type
-      );
     }
     return `${this._config.serverUrl}/${path}`;
   }
@@ -1477,7 +1693,9 @@ export class JupyterBridgeDataSource {
    * Refresh cached data
    */
   refresh() {
-    this._catalogRevision += 1;
+    this._beginCatalogGeneration(
+      'Jupyter metadata cache was refreshed'
+    );
     this._datasetCache.clear();
   }
 
@@ -1496,7 +1714,13 @@ export class JupyterBridgeDataSource {
    */
   disconnect() {
     this._lifecycleRevision += 1;
-    this._catalogRevision += 1;
+    this._endCatalogGeneration(
+      'Jupyter catalog was retired by disconnect'
+    );
+    this._initializationController?.abort(
+      new Error('Jupyter initialization was cancelled by disconnect')
+    );
+    this._initializationController = null;
     this._removeMessageListener();
     this._connected = false;
     this._config = null;

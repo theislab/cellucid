@@ -13,6 +13,9 @@ const REQUIRED_RENDERER_METHODS = Object.freeze([
   'getAlphaTexture',
   'getAlphaTextureWidth',
   'isAlphaTextureActive',
+  'getAlphaTextureForView',
+  'getAlphaTextureWidthForView',
+  'isAlphaTextureActiveForView',
   'getFogNear',
   'getFogFar',
   'getCurrentLODLevel',
@@ -257,9 +260,20 @@ export function buildOverlayContext(options) {
   ctx.cameraPosition = renderParams.cameraPosition;
   ctx.cameraDistance = renderParams.cameraDistance;
 
-  const alphaTexture = hpRenderer.getAlphaTexture();
-  const alphaTexWidth = hpRenderer.getAlphaTextureWidth();
-  const alphaActive = hpRenderer.isAlphaTextureActive();
+  // Snapshot points normally draw from their immutable per-view R8 owner.
+  // renderParams.useAlphaTexture is the explicit live-state override that asks a
+  // snapshot to follow the current live alpha publication instead.
+  const useLiveAlphaOwner =
+    !isSnapshot || renderParams.useAlphaTexture;
+  const alphaTexture = useLiveAlphaOwner
+    ? hpRenderer.getAlphaTexture()
+    : hpRenderer.getAlphaTextureForView(viewId);
+  const alphaTexWidth = useLiveAlphaOwner
+    ? hpRenderer.getAlphaTextureWidth()
+    : hpRenderer.getAlphaTextureWidthForView(viewId);
+  const alphaActive = useLiveAlphaOwner
+    ? hpRenderer.isAlphaTextureActive()
+    : hpRenderer.isAlphaTextureActiveForView(viewId);
   if (typeof alphaActive !== 'boolean') {
     throw new TypeError('Overlay context alpha-texture activity must be a boolean.');
   }
@@ -269,14 +283,14 @@ export function buildOverlayContext(options) {
     );
   }
   if (
-    renderParams.useAlphaTexture &&
+    (isSnapshot || renderParams.useAlphaTexture) &&
     (!alphaActive || !alphaTexture || alphaTexWidth === 0)
   ) {
     throw new Error(
       `Overlay context for view "${viewId}" requires the published alpha texture.`
     );
   }
-  ctx.useAlphaTexture = renderParams.useAlphaTexture;
+  ctx.useAlphaTexture = alphaActive;
   ctx.alphaTexture = alphaTexture;
   ctx.alphaTexWidth = alphaTexWidth;
 

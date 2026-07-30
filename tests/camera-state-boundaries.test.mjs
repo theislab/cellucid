@@ -438,7 +438,7 @@ test('session, snapshot, and figure-export boundaries assert exact camera state'
   );
   assert.match(
     byPath.get('../assets/js/app/ui/modules/figure-export/figure-export-engine.js'),
-    /assertCameraState\(\s*viewer\.getViewCameraState/
+    /cloneCameraState\(\s*presented\.cameraState/
   );
   assert.match(
     byPath.get('../assets/js/rendering/viewer.js'),

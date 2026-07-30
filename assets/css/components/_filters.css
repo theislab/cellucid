@@ -283,6 +283,22 @@
   box-shadow: var(--shadow-xs);
 }
 
+.highlight-page-tab-activate {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  flex: 1;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  letter-spacing: inherit;
+  text-align: left;
+}
+
 .highlight-page-color {
   width: 10px;
   height: 10px;
@@ -342,6 +358,7 @@
   opacity: var(--opacity-80);
 }
 
+.highlight-page-tab-combine,
 .highlight-page-tab-delete {
   background: none;
   border: none;
@@ -353,6 +370,22 @@
   padding: 0 2px;
   flex-shrink: 0;
   transition: opacity var(--duration-fast) var(--easing-standard);
+}
+
+.highlight-page-tab-combine:hover {
+  opacity: 1;
+}
+
+.highlight-page-tab-activate:focus-visible,
+.highlight-page-tab-combine:focus-visible,
+.highlight-page-tab-delete:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 2px;
+}
+
+.highlight-page-tab-combine:focus-visible,
+.highlight-page-tab-delete:focus-visible {
+  opacity: 1;
 }
 
 .highlight-page-tab-delete:hover {
@@ -429,6 +462,8 @@
   box-shadow: var(--shadow-soft-lg);
   padding: 4px 0;
   min-width: 140px;
+  max-width: calc(100vw - 16px);
+  overflow-y: auto;
 }
 
 .page-combine-option {
@@ -444,10 +479,12 @@
   font-size: 12px;
   color: var(--color-text-primary);
   text-align: left;
+  overflow-wrap: anywhere;
   transition: background-color var(--duration-fast) var(--easing-standard);
 }
 
-.page-combine-option:hover {
+.page-combine-option:hover,
+.page-combine-option:focus-visible {
   background: var(--color-surface-tertiary);
 }
 

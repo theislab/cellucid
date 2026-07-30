@@ -9,6 +9,10 @@
  */
 
 import { assertCropRect01, cropRect01ToPx } from './crop.js';
+import {
+  assertLodMembership,
+  POINT_VISIBILITY_THRESHOLD,
+} from './lod-membership.js';
 
 /**
  * @typedef {object} NormTransform
@@ -62,7 +66,7 @@ export function denormalizeXY(x, y, transform) {
  * @param {object} options
  * @param {Float32Array|null} options.positions - normalized positions (n*3)
  * @param {Float32Array|null} [options.transparency] - per-point alpha (0..1)
- * @param {Float32Array|null} [options.visibilityMask] - optional LOD visibility mask (1 = visible)
+ * @param {import('./lod-membership.js').LodMembership|null} [options.lodMembership]
  * @param {Float32Array} options.mvpMatrix
  * @param {number} [options.viewportWidth]
  * @param {number} [options.viewportHeight]
@@ -73,7 +77,7 @@ export function denormalizeXY(x, y, transform) {
 export function computeVisibleRealBounds({
   positions,
   transparency = null,
-  visibilityMask = null,
+  lodMembership = null,
   mvpMatrix,
   viewportWidth = 1,
   viewportHeight = 1,
@@ -83,6 +87,9 @@ export function computeVisibleRealBounds({
   if (!positions || !mvpMatrix) return null;
 
   const n = Math.floor(positions.length / 3);
+  assertLodMembership(lodMembership, { pointCount: n });
+  const admittedIndices = lodMembership?.indices ?? null;
+  const candidateCount = admittedIndices?.length ?? n;
   const m = mvpMatrix;
   const vw = Math.max(1, Number(viewportWidth) || 1);
   const vh = Math.max(1, Number(viewportHeight) || 1);
@@ -99,13 +106,19 @@ export function computeVisibleRealBounds({
   let maxY = -Infinity;
   let any = false;
 
-  for (let i = 0; i < n; i++) {
-    if (visibilityMask && (visibilityMask[i] ?? 0) <= 0) continue;
+  for (
+    let candidateIndex = 0;
+    candidateIndex < candidateCount;
+    candidateIndex++
+  ) {
+    const i = admittedIndices === null
+      ? candidateIndex
+      : admittedIndices[candidateIndex];
     const rawAlpha = transparency ? (transparency[i] ?? 1.0) : 1.0;
     let alpha = Number.isFinite(rawAlpha) ? rawAlpha : 1.0;
     if (alpha < 0) alpha = 0;
     else if (alpha > 1) alpha = 1;
-    if (alpha < 0.01) continue;
+    if (alpha < POINT_VISIBILITY_THRESHOLD) continue;
 
     const ix = i * 3;
     const x = positions[ix];
@@ -114,12 +127,23 @@ export function computeVisibleRealBounds({
 
     const clipX = m[0] * x + m[4] * y + m[8] * z + m[12];
     const clipY = m[1] * x + m[5] * y + m[9] * z + m[13];
+    const clipZ = m[2] * x + m[6] * y + m[10] * z + m[14];
     const clipW = m[3] * x + m[7] * y + m[11] * z + m[15];
-    if (!Number.isFinite(clipW) || clipW === 0) continue;
+    if (!Number.isFinite(clipW) || clipW <= 0) continue;
 
     const ndcX = clipX / clipW;
     const ndcY = clipY / clipW;
-    if (ndcX < -1 || ndcX > 1 || ndcY < -1 || ndcY > 1) continue;
+    const ndcZ = clipZ / clipW;
+    if (
+      ndcX < -1 ||
+      ndcX > 1 ||
+      ndcY < -1 ||
+      ndcY > 1 ||
+      ndcZ < -1 ||
+      ndcZ > 1
+    ) {
+      continue;
+    }
 
     if (hasCrop && cropPx) {
       const vx = (ndcX * 0.5 + 0.5) * vw;
@@ -150,7 +174,7 @@ export function computeVisibleRealBounds({
  * @param {object} options
  * @param {Float32Array|null} options.positions - normalized positions (n*3)
  * @param {Float32Array|null} [options.transparency] - per-point alpha (0..1)
- * @param {Float32Array|null} [options.visibilityMask] - optional LOD visibility mask (1 = visible)
+ * @param {import('./lod-membership.js').LodMembership|null} [options.lodMembership]
  * @param {Float32Array} options.mvpMatrix
  * @param {Float32Array} options.viewMatrix
  * @param {number} [options.viewportWidth]
@@ -161,7 +185,7 @@ export function computeVisibleRealBounds({
 export function computeVisibleCameraBounds({
   positions,
   transparency = null,
-  visibilityMask = null,
+  lodMembership = null,
   mvpMatrix,
   viewMatrix,
   viewportWidth = 1,
@@ -171,6 +195,9 @@ export function computeVisibleCameraBounds({
   if (!positions || !mvpMatrix || !viewMatrix) return null;
 
   const n = Math.floor(positions.length / 3);
+  assertLodMembership(lodMembership, { pointCount: n });
+  const admittedIndices = lodMembership?.indices ?? null;
+  const candidateCount = admittedIndices?.length ?? n;
   const m = mvpMatrix;
   const v = viewMatrix;
   const vw = Math.max(1, Number(viewportWidth) || 1);
@@ -188,13 +215,19 @@ export function computeVisibleCameraBounds({
   let maxY = -Infinity;
   let any = false;
 
-  for (let i = 0; i < n; i++) {
-    if (visibilityMask && (visibilityMask[i] ?? 0) <= 0) continue;
+  for (
+    let candidateIndex = 0;
+    candidateIndex < candidateCount;
+    candidateIndex++
+  ) {
+    const i = admittedIndices === null
+      ? candidateIndex
+      : admittedIndices[candidateIndex];
     const rawAlpha = transparency ? (transparency[i] ?? 1.0) : 1.0;
     let alpha = Number.isFinite(rawAlpha) ? rawAlpha : 1.0;
     if (alpha < 0) alpha = 0;
     else if (alpha > 1) alpha = 1;
-    if (alpha < 0.01) continue;
+    if (alpha < POINT_VISIBILITY_THRESHOLD) continue;
 
     const ix = i * 3;
     const x = positions[ix];
@@ -203,12 +236,23 @@ export function computeVisibleCameraBounds({
 
     const clipX = m[0] * x + m[4] * y + m[8] * z + m[12];
     const clipY = m[1] * x + m[5] * y + m[9] * z + m[13];
+    const clipZ = m[2] * x + m[6] * y + m[10] * z + m[14];
     const clipW = m[3] * x + m[7] * y + m[11] * z + m[15];
-    if (!Number.isFinite(clipW) || clipW === 0) continue;
+    if (!Number.isFinite(clipW) || clipW <= 0) continue;
 
     const ndcX = clipX / clipW;
     const ndcY = clipY / clipW;
-    if (ndcX < -1 || ndcX > 1 || ndcY < -1 || ndcY > 1) continue;
+    const ndcZ = clipZ / clipW;
+    if (
+      ndcX < -1 ||
+      ndcX > 1 ||
+      ndcY < -1 ||
+      ndcY > 1 ||
+      ndcZ < -1 ||
+      ndcZ > 1
+    ) {
+      continue;
+    }
 
     if (hasCrop && cropPx) {
       const vx = (ndcX * 0.5 + 0.5) * vw;

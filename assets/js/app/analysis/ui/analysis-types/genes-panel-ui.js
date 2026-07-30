@@ -36,6 +36,7 @@ import {
   MODE_OPTIONS,
   ANALYSIS_PHASES
 } from '../../genes-panel/constants.js';
+import { setOwnDataProperty } from '../../../../utils/exact-record.js';
 
 // =============================================================================
 // GENES PANEL UI
@@ -956,7 +957,9 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
 
     const render = () => {
       const groupId = select.value;
-      const markers = groups[groupId]?.markers || [];
+      const markers = Object.hasOwn(groups, groupId)
+        ? groups[groupId]?.markers || []
+        : [];
 
       const table = document.createElement('table');
       table.className = 'de-genes-table';
@@ -1084,7 +1087,10 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
       return;
     }
 
-    if (!this._modalSelectedGroupId || !groups[this._modalSelectedGroupId]) {
+    if (
+      !this._modalSelectedGroupId ||
+      !Object.hasOwn(groups, this._modalSelectedGroupId)
+    ) {
       this._modalSelectedGroupId = groupIds[0];
     }
 
@@ -1305,12 +1311,19 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
         pValueThreshold,
         foldChangeThreshold
       });
+      const existingGroup = (
+        markers.groups !== null &&
+        markers.groups !== undefined &&
+        Object.hasOwn(markers.groups, groupId)
+      )
+        ? markers.groups[groupId]
+        : undefined;
 
-      nextGroups[groupId] = {
-        ...(markers.groups?.[groupId] || {}),
+      setOwnDataProperty(nextGroups, groupId, {
+        ...(existingGroup || {}),
         groupId,
         markers: picked.map((m, i) => ({ ...m, rank: i + 1 }))
-      };
+      });
     }
 
     return nextGroups;

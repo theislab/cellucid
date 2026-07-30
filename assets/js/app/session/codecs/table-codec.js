@@ -15,6 +15,7 @@
 
 import { bytesToU32LE, u32ToBytesLE } from '../bundle/format.js';
 import { decodeUvarint, pushUvarint } from './varint.js';
+import { setOwnDataProperty } from '../../../utils/exact-record.js';
 import {
   assertArray,
   assertExactKeys,
@@ -382,7 +383,7 @@ export function decodeTable(bytes) {
         const b = payload[(i / 8) | 0];
         arr[i] = (b >> (i & 7)) & 1;
       }
-      out[name] = arr;
+      setOwnDataProperty(out, name, arr);
       continue;
     }
 
@@ -443,7 +444,7 @@ export function decodeTable(bytes) {
       if (nextFirstUseCode !== dict.length) {
         throw new Error(`decodeTable: string column "${name}" contains unused dictionary entries.`);
       }
-      out[name] = values;
+      setOwnDataProperty(out, name, values);
       continue;
     }
 
@@ -451,7 +452,11 @@ export function decodeTable(bytes) {
       if (dtype === 'bool' || dtype === 'string') {
         throw new Error(`decodeTable: dtype "${dtype}" requires its current exact encoding.`);
       }
-      out[name] = decodeNumericLittleEndian(dtype, payload, rowCount);
+      setOwnDataProperty(
+        out,
+        name,
+        decodeNumericLittleEndian(dtype, payload, rowCount)
+      );
       continue;
     }
 

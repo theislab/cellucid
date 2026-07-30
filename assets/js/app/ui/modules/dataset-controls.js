@@ -319,6 +319,23 @@ export function initDatasetControls(options) {
   const datasetOptionsByKey = new Map();
   let noneDatasetOption = null;
   let catalogGeneration = 0;
+  let datasetSelectionIntentGeneration = 0;
+  let activeDatasetSelectionIntent = null;
+
+  function beginDatasetSelectionIntent() {
+    datasetSelectionIntentGeneration =
+      datasetSelectionIntentGeneration === Number.MAX_SAFE_INTEGER
+        ? 1
+        : datasetSelectionIntentGeneration + 1;
+    activeDatasetSelectionIntent = Object.freeze({
+      generation: datasetSelectionIntentGeneration
+    });
+    return activeDatasetSelectionIntent;
+  }
+
+  function ownsDatasetSelectionIntent(owner) {
+    return owner === activeDatasetSelectionIntent;
+  }
 
   function createNoneDatasetOption() {
     const option = ownerDocument.createElement('option');
@@ -468,7 +485,7 @@ async function populateDatasetDropdown() {
       await dataSourceManager.getAllDatasets()
     );
     if (generation !== catalogGeneration) {
-      return false;
+      return Object.freeze({ status: 'superseded' });
     }
 
     debug.log('[UI] getAllDatasets returned:', allSourceDatasets);
@@ -496,7 +513,7 @@ async function populateDatasetDropdown() {
       datasetSelect.value = NONE_DATASET_VALUE;
       datasetSelect.disabled = false;
       updateDatasetInfo(null);
-      return true;
+      return Object.freeze({ status: 'ready' });
     }
 
     // Group by source type if there are multiple sources with data
@@ -614,11 +631,12 @@ async function populateDatasetDropdown() {
  * @param {string} sourceType - The exact source type for the dataset
  * @returns {Promise<boolean>} Whether the requested dataset became ready
  */
-async function handleDatasetChange(
+async function handleDatasetChangeForIntent(
   datasetId,
   sourceType,
   loadMethod = DATA_LOAD_METHODS.DATASET_DROPDOWN,
-  sourceOverride = null
+  sourceOverride = null,
+  intentOwner
 ) {
   requireNonEmptyString(datasetId, 'Selected dataset id');
   requireNonEmptyString(sourceType, 'Selected dataset source type');
@@ -627,6 +645,10 @@ async function handleDatasetChange(
   const currentId = dataSourceManager.getCurrentDatasetId();
   const currentSourceType = dataSourceManager.getCurrentSourceType();
   if (currentId === datasetId && currentSourceType === sourceType) {
+    if (ownsDatasetSelectionIntent(intentOwner)) {
+      synchronizeDatasetSelectToCurrent();
+      showSessionStatus('Dataset loaded', false);
+    }
     return true;
   }
 
@@ -676,6 +698,9 @@ async function handleDatasetChange(
     }
 
     datasetReloaded = true;
+    if (!ownsDatasetSelectionIntent(intentOwner)) {
+      return true;
+    }
     updateDatasetInfo(metadata, sourceType);
     datasetInfo.classList.remove('loading', 'error');
     showSessionStatus('Dataset loaded', false);
@@ -683,6 +708,9 @@ async function handleDatasetChange(
   } catch (error) {
     if (isDatasetReloadSupersededError(error)) {
       throw error;
+    }
+    if (!ownsDatasetSelectionIntent(intentOwner)) {
+      return false;
     }
     const exactError = errorFromUnknown(error, 'Dataset switch');
     datasetInfo.classList.remove('loading');
@@ -711,12 +739,35 @@ async function handleDatasetChange(
   }
 }
 
+async function handleDatasetChange(
+  datasetId,
+  sourceType,
+  loadMethod = DATA_LOAD_METHODS.DATASET_DROPDOWN,
+  sourceOverride = null
+) {
+  requireNonEmptyString(datasetId, 'Selected dataset id');
+  requireNonEmptyString(sourceType, 'Selected dataset source type');
+  if (
+    dataSourceManager.getCurrentDatasetId() === datasetId &&
+    dataSourceManager.getCurrentSourceType() === sourceType
+  ) {
+    return true;
+  }
+  return await handleDatasetChangeForIntent(
+    datasetId,
+    sourceType,
+    loadMethod,
+    sourceOverride,
+    beginDatasetSelectionIntent()
+  );
+}
+
 /**
  * Handle selecting the exact None state.
  *
  * @returns {Promise<boolean>} Whether the dataset and UI were fully cleared
  */
-async function handleNoneDatasetSelection() {
+async function handleNoneDatasetSelectionForIntent(intentOwner) {
   try {
     datasetInfo.classList.remove('error');
     datasetInfo.classList.add('loading');
@@ -738,6 +789,9 @@ async function handleNoneDatasetSelection() {
       );
     }
 
+    if (!ownsDatasetSelectionIntent(intentOwner)) {
+      return true;
+    }
     refreshDatasetUI(null);
     ensureNoneDatasetOption();
     datasetSelect.value = NONE_DATASET_VALUE;
@@ -752,6 +806,9 @@ async function handleNoneDatasetSelection() {
     if (isDatasetReloadSupersededError(error)) {
       throw error;
     }
+    if (!ownsDatasetSelectionIntent(intentOwner)) {
+      return false;
+    }
     const exactError = errorFromUnknown(error, 'Dataset clear');
     datasetInfo.classList.remove('loading');
     datasetInfo.classList.add('error');
@@ -761,6 +818,12 @@ async function handleNoneDatasetSelection() {
     );
     return false;
   }
+}
+
+function handleNoneDatasetSelection() {
+  return handleNoneDatasetSelectionForIntent(
+    beginDatasetSelectionIntent()
+  );
 }
 
 function synchronizeDatasetEvent(rawEvent) {
@@ -803,7 +866,65 @@ function synchronizeDatasetEvent(rawEvent) {
   updateDatasetInfo(event.metadata, event.sourceType);
 }
 
+function synchronizeDatasetSelectToCurrent() {
+  const activeMetadata = dataSourceManager.getCurrentMetadata();
+  const activeSourceType = dataSourceManager.getCurrentSourceType();
+  const activeDatasetId = dataSourceManager.getCurrentDatasetId();
+  const ownsDataset =
+    activeMetadata !== null &&
+    activeSourceType !== null &&
+    activeDatasetId !== null;
+  const ownsNone =
+    activeMetadata === null &&
+    activeSourceType === null &&
+    activeDatasetId === null;
+  if (!ownsDataset && !ownsNone) {
+    throw new Error(
+      'Dataset manager published a partial active selection after reload.'
+    );
+  }
+  if (ownsDataset) {
+    requireDatasetMetadata(
+      activeMetadata,
+      activeSourceType,
+      'Active dataset metadata after selection settlement'
+    );
+    if (activeMetadata.id !== activeDatasetId) {
+      throw new Error(
+        'Active dataset metadata does not match its selected dataset id.'
+      );
+    }
+    const value = datasetSelectionValue(
+      activeSourceType,
+      activeDatasetId
+    );
+    updateDatasetInfo(activeMetadata, activeSourceType);
+    datasetSelect.value = value;
+    if (datasetSelect.value !== value) {
+      throw new Error(
+        'Dataset select cannot represent the active dataset after reload.'
+      );
+    }
+  } else {
+    ensureNoneDatasetOption();
+    updateDatasetInfo(null);
+    datasetSelect.value = NONE_DATASET_VALUE;
+    if (datasetSelect.value !== NONE_DATASET_VALUE) {
+      throw new Error(
+        'Dataset select cannot represent the active None state after reload.'
+      );
+    }
+  }
+  datasetSelect.disabled = false;
+}
+
+function synchronizeTerminalDatasetSelectionFailure() {
+  synchronizeDatasetSelectToCurrent();
+  datasetInfo.classList.add('error');
+}
+
 async function handleDatasetSelectEvent(event) {
+  const intentOwner = beginDatasetSelectionIntent();
   try {
     if (
       event === null ||
@@ -833,7 +954,15 @@ async function handleDatasetSelectEvent(event) {
 
     const selectedValue = selectedOption.value;
     if (selectedValue === NONE_DATASET_VALUE) {
-      await handleNoneDatasetSelection();
+      const cleared = await handleNoneDatasetSelectionForIntent(
+        intentOwner
+      );
+      if (!ownsDatasetSelectionIntent(intentOwner)) {
+        return;
+      }
+      if (cleared !== true) {
+        synchronizeTerminalDatasetSelectionFailure();
+      }
       return;
     }
     if (
@@ -857,28 +986,26 @@ async function handleDatasetSelectEvent(event) {
         'Selected dataset option value does not match its exact source and id.'
       );
     }
-    await handleDatasetChange(datasetId, sourceType);
+    const ready = await handleDatasetChangeForIntent(
+      datasetId,
+      sourceType,
+      DATA_LOAD_METHODS.DATASET_DROPDOWN,
+      null,
+      intentOwner
+    );
+    if (!ownsDatasetSelectionIntent(intentOwner)) {
+      return;
+    }
+    if (ready !== true) {
+      synchronizeTerminalDatasetSelectionFailure();
+    }
   } catch (error) {
+    if (!ownsDatasetSelectionIntent(intentOwner)) {
+      return;
+    }
     if (isDatasetReloadSupersededError(error)) {
       datasetInfo.classList.remove('loading', 'error');
-      const activeMetadata = dataSourceManager.getCurrentMetadata();
-      const activeSourceType = dataSourceManager.getCurrentSourceType();
-      const activeDatasetId = dataSourceManager.getCurrentDatasetId();
-      if (
-        activeMetadata !== null &&
-        activeSourceType !== null &&
-        activeDatasetId !== null
-      ) {
-        updateDatasetInfo(activeMetadata, activeSourceType);
-        datasetSelect.value = datasetSelectionValue(
-          activeSourceType,
-          activeDatasetId
-        );
-      } else {
-        updateDatasetInfo(null);
-        datasetSelect.value = NONE_DATASET_VALUE;
-      }
-      datasetSelect.disabled = false;
+      synchronizeDatasetSelectToCurrent();
       showSessionStatus(
         'A newer dataset selection is now active.',
         false
@@ -888,6 +1015,7 @@ async function handleDatasetSelectEvent(event) {
     const exactError = errorFromUnknown(error, 'Dataset selection event');
     datasetInfo.classList.remove('loading');
     datasetInfo.classList.add('error');
+    synchronizeTerminalDatasetSelectionFailure();
     showSessionStatus(
       `Dataset selection failed: ${exactError.message}`,
       true

@@ -25,6 +25,7 @@ import { PlotRegistry } from './shared/plot-registry-utils.js';
 import { getTransformRegistry } from './core/plugin-contract.js';
 import { debugError } from './shared/debug-utils.js';
 import { closeModal } from './ui/components/modal.js';
+import { setOwnDataProperty } from '../../utils/exact-record.js';
 
 // Import unified UI manager and analysis type factories
 import { createAnalysisUIManager } from './ui/analysis-ui-manager.js';
@@ -94,6 +95,7 @@ export class ComparisonModule {
     this._lastDatasetReloadReset = null;
     this._destroyPromise = null;
     this._datasetResetPromise = null;
+    this._stateUnsubscribers = [];
 
     // Current state (shared across analysis UIs)
     this.currentConfig = {
@@ -332,7 +334,7 @@ export class ComparisonModule {
     // Build container map from accordion content areas
     const containerMap = {};
     this._modeToggleContainer.querySelectorAll('.analysis-accordion-content').forEach(content => {
-      containerMap[content.dataset.mode] = content;
+      setOwnDataProperty(containerMap, content.dataset.mode, content);
     });
 
     // Create unified UI manager with accordion containers
@@ -370,15 +372,55 @@ export class ComparisonModule {
     this._analysisMode = 'simple';
     this._uiManager.switchToMode('simple');
 
-    // Listen for page changes (add/remove/rename/switch)
-    this.state.on?.('page:changed', () => {
-      this.onPagesChanged();
-    });
+    this._subscribeToStateChanges();
+  }
 
-    // Listen for highlight changes (cells added/removed from pages)
-    this.state.on?.('highlight:changed', () => {
-      this.onHighlightChanged();
-    });
+  /**
+   * Subscribe to shared page/highlight state with exact teardown ownership.
+   * @private
+   */
+  _subscribeToStateChanges() {
+    if (typeof this.state?.on !== 'function') return;
+    if (!Array.isArray(this._stateUnsubscribers)) {
+      throw new TypeError(
+        'Comparison state subscription ownership must be an array'
+      );
+    }
+    if (this._stateUnsubscribers.length !== 0) {
+      throw new Error('Comparison state subscriptions are already active');
+    }
+    const subscriptions = [
+      ['page:changed', () => this.onPagesChanged()],
+      ['highlight:changed', () => this.onHighlightChanged()]
+    ];
+    try {
+      for (const [eventName, handler] of subscriptions) {
+        const unsubscribe = this.state.on(eventName, handler);
+        if (typeof unsubscribe !== 'function') {
+          if (typeof this.state.off === 'function') {
+            this.state.off(eventName, handler);
+          }
+          throw new TypeError(
+            `Comparison state subscription "${eventName}" must return an unsubscribe function`
+          );
+        }
+        this._stateUnsubscribers.push(unsubscribe);
+      }
+    } catch (error) {
+      const cleanupErrors = [error];
+      for (const unsubscribe of this._stateUnsubscribers.splice(0)) {
+        try {
+          unsubscribe();
+        } catch (cleanupError) {
+          cleanupErrors.push(cleanupError);
+        }
+      }
+      if (cleanupErrors.length === 1) throw error;
+      throw new AggregateError(
+        cleanupErrors,
+        'Comparison state subscription setup failed'
+      );
+    }
   }
 
   /**
@@ -817,6 +859,34 @@ export class ComparisonModule {
    */
   destroy() {
     if (this._destroyPromise != null) return this._destroyPromise;
+    const stateSubscriptionErrors = [];
+    const stateUnsubscribers = this._stateUnsubscribers;
+    this._stateUnsubscribers = [];
+    if (stateUnsubscribers !== undefined && stateUnsubscribers !== null) {
+      if (!Array.isArray(stateUnsubscribers)) {
+        stateSubscriptionErrors.push(
+          new TypeError(
+            'Comparison state subscription ownership must be an array'
+          )
+        );
+      } else {
+        for (const unsubscribe of stateUnsubscribers) {
+          if (typeof unsubscribe !== 'function') {
+            stateSubscriptionErrors.push(
+              new TypeError(
+                'Comparison state subscription cleanup must be a function'
+              )
+            );
+            continue;
+          }
+          try {
+            unsubscribe();
+          } catch (error) {
+            stateSubscriptionErrors.push(error);
+          }
+        }
+      }
+    }
     const memoryMonitor = this._memoryMonitor;
     const windowManager = this._analysisWindowManager;
     const uiManager = this._uiManager;
@@ -824,7 +894,7 @@ export class ComparisonModule {
     const datasetResetTask = this._datasetResetPromise;
 
     this._destroyPromise = Promise.resolve().then(async () => {
-      const errors = [];
+      const errors = [...stateSubscriptionErrors];
       let memoryHandlerDrain = null;
       if (memoryMonitor !== null && memoryMonitor !== undefined) {
         try {

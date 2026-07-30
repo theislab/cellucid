@@ -14,7 +14,7 @@
     Release validation owns this immutable value and changes it only together
     with the exact web-asset inventory after the complete build is accepted.
   -->
-  <meta name="cellucid-web-build-id" content="2026-07-27.16" />
+  <meta name="cellucid-web-build-id" content="2026-07-27.24" />
 
   <!--
     CELLUCID_EXPORTS_BASE_URL
@@ -50,7 +50,7 @@
     style-src 'self' 'unsafe-inline';
     img-src 'self' data: https:;
     font-src 'self' data:;
-    connect-src 'self' https: wss: blob: http://localhost:* http://127.0.0.1:* ws://localhost:* ws://127.0.0.1:*;
+    connect-src 'self' https: wss: http: ws: blob:;
     worker-src 'self' blob:;
     manifest-src 'self';
   " />
@@ -1522,10 +1522,10 @@
           </div>
           <!-- Page selector tabs -->
           <div id="highlight-pages-container">
-            <div id="highlight-pages-tabs">
+            <div id="highlight-pages-tabs" role="tablist" aria-label="Highlight pages" aria-orientation="horizontal">
               <!-- Page tabs will be added here dynamically -->
             </div>
-            <button type="button" class="highlight-page-add-btn" id="add-highlight-page" title="Add new page">+</button>
+            <button type="button" class="highlight-page-add-btn" id="add-highlight-page" title="Add new page" aria-label="Add highlight page">+</button>
           </div>
           <div id="highlighted-groups" class="highlighted-groups-box">
             <div class="highlighted-groups-header">

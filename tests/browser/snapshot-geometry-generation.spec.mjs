@@ -88,11 +88,11 @@ test('same-reference live publication preserves immutable kept-view geometry', a
     });
 
     const gl = document.querySelector('#glcanvas').getContext('webgl2');
-    const firstLodVisibility = viewer.getLodVisibilityArray(
+    const firstLodMembership = viewer.getCurrentLodMembership(
       first.id,
       viewer.getViewDimension(first.id),
     );
-    const secondLodVisibility = viewer.getLodVisibilityArray(
+    const secondLodMembership = viewer.getCurrentLodMembership(
       second.id,
       viewer.getViewDimension(second.id),
     );
@@ -152,7 +152,7 @@ test('same-reference live publication preserves immutable kept-view geometry', a
         firstColor: firstSnapshot.bufferByteLength,
         secondColor: secondSnapshot.bufferByteLength,
         positions: geometry.positionBufferByteLength,
-        expectedColor: firstSnapshot.pointCount * 4,
+        expectedColor: firstSnapshot.pointCount * 3,
         expectedPositions: firstSnapshot.pointCount * 12,
       },
       generationLifecycle: {
@@ -174,11 +174,17 @@ test('same-reference live publication preserves immutable kept-view geometry', a
       firstLodLevel: viewer.getCurrentLODLevel(first.id),
       secondLodLevel: viewer.getCurrentLODLevel(second.id),
       firstLodIndicesAvailable:
-        firstLodVisibility instanceof Float32Array &&
-        firstLodVisibility.some(value => value === 1),
+        firstLodMembership?.admissionLevels instanceof Uint8Array &&
+        firstLodMembership.admissionLevels.some(
+          level => level <= firstLodMembership.lodLevel,
+        ),
       secondLodIndicesAvailable:
-        secondLodVisibility instanceof Float32Array &&
-        secondLodVisibility.some(value => value === 1),
+        secondLodMembership?.admissionLevels instanceof Uint8Array &&
+        secondLodMembership.admissionLevels.some(
+          level => level <= secondLodMembership.lodLevel,
+        ),
+      lodMembershipShared:
+        firstLodMembership === secondLodMembership,
       glError: gl.getError(),
     };
   });
@@ -188,9 +194,9 @@ test('same-reference live publication preserves immutable kept-view geometry', a
   expect(publication.colorsIndependent).toBe(true);
   expect(publication.splitAttributeLayout).toEqual({
     firstPosition: { offset: 0, stride: 12 },
-    firstColor: { offset: 0, stride: 4 },
+    firstColor: { offset: 0, stride: 3 },
     secondPosition: { offset: 0, stride: 12 },
-    secondColor: { offset: 0, stride: 4 },
+    secondColor: { offset: 0, stride: 3 },
   });
   expect(publication.splitByteOwnership).toEqual({
     firstColor: publication.splitByteOwnership.expectedColor,
@@ -229,6 +235,7 @@ test('same-reference live publication preserves immutable kept-view geometry', a
   expect(publication.secondLodLevel).toBe(0);
   expect(publication.firstLodIndicesAvailable).toBe(true);
   expect(publication.secondLodIndicesAvailable).toBe(true);
+  expect(publication.lodMembershipShared).toBe(true);
   expect(publication.glError).toBe(0);
   expect(browserErrors).toEqual([]);
   expect(consoleDiagnostics).toEqual([]);

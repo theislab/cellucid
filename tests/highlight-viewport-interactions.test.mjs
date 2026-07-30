@@ -385,9 +385,7 @@ test('a stale lasso retires with one empty preview and no selection callback', t
   const canvas = createCanvas(100, 100);
   const previewPayloads = [];
   const tools = Object.assign(Object.create(HighlightTools.prototype), {
-    _lastPositionFingerprintMap: new Map(),
-    _lastTransparencyFingerprintMap: new Map(),
-    _lastUsedPositionsMap: new Map(),
+    _transparencyGenerations: new Map(),
     _unifiedCandidateSet: new Set([7]),
     _unifiedStepCount: 2,
     _lassoPreviewPublished: true,
@@ -475,9 +473,7 @@ test('snapshot proximity remains bound to its pane and retires only with that vi
   });
   let previewPayload = null;
   const tools = Object.assign(Object.create(HighlightTools.prototype), {
-    _lastPositionFingerprintMap: new Map(),
-    _lastTransparencyFingerprintMap: new Map(),
-    _lastUsedPositionsMap: new Map(),
+    _transparencyGenerations: new Map(),
     _unifiedCandidateSet: null,
     _unifiedStepCount: 0,
     altKeyDown: true,

@@ -121,6 +121,27 @@ function assertCacheDocument(path, document) {
   return document;
 }
 
+function assertAbortSignalOrNull(signal) {
+  if (signal === null) return null;
+  if (
+    typeof signal !== 'object' ||
+    typeof signal.addEventListener !== 'function' ||
+    typeof signal.removeEventListener !== 'function' ||
+    typeof signal.aborted !== 'boolean'
+  ) {
+    throw new TypeError(
+      'Community annotation cache signal must be an AbortSignal or null'
+    );
+  }
+  return signal;
+}
+
+function cacheWriteAborted() {
+  const error = new Error('Community annotation cache batch write aborted');
+  error.code = 'LOCAL_RAW_CACHE_WRITE_ABORTED';
+  return error;
+}
+
 function assertCacheRecord(record, { key, scopeKey, path }) {
   if (
     !record ||
@@ -398,39 +419,156 @@ export class CommunityAnnotationFileCache {
   }
 
   async setJson({ datasetId, repoRef, userId, path, sha, json }) {
+    await this.setManyJson({
+      datasetId,
+      repoRef,
+      userId,
+      records: [{ path, sha, json }],
+    });
+    return true;
+  }
+
+  /**
+   * Persist one complete validated batch with one IndexedDB transaction and one
+   * SHA-index read/commit.
+   *
+   * @param {object} params
+   * @param {string} params.datasetId
+   * @param {string} params.repoRef
+   * @param {number} params.userId
+   * @param {{path:string,sha:string,json:any}[]} params.records
+   * @param {AbortSignal|null} [params.signal]
+   */
+  async setManyJson({
+    datasetId,
+    repoRef,
+    userId,
+    records,
+    signal = null,
+  }) {
+    const ownerSignal = assertAbortSignalOrNull(signal);
+    if (ownerSignal?.aborted) throw cacheWriteAborted();
     await this.init();
-    const p = assertCachePath(path);
-    const s = assertCacheSha(sha);
-    const doc = assertCacheDocument(p, json);
+    if (ownerSignal?.aborted) throw cacheWriteAborted();
+    if (!Array.isArray(records)) {
+      throw new TypeError(
+        'Community annotation cache batch records must be an array'
+      );
+    }
     const scope = { datasetId, repoRef, userId };
     const scopeKey = toCacheScopeKey(scope);
-    const key = toFileRecordKey(scope, p);
-    if (!scopeKey || !key) throw new Error('Community annotation cache scope is incomplete');
+    if (!scopeKey) {
+      throw new Error('Community annotation cache scope is incomplete');
+    }
     if (!this._db) throw cacheUnavailable('Community annotation raw-file cache is not initialized');
 
+    const seenPaths = new Set();
+    const storedAt = Date.now();
+    const exactRecords = records.map((record, index) => {
+      if (
+        !record ||
+        typeof record !== 'object' ||
+        Array.isArray(record) ||
+        Object.keys(record).length !== 3 ||
+        !Object.hasOwn(record, 'path') ||
+        !Object.hasOwn(record, 'sha') ||
+        !Object.hasOwn(record, 'json')
+      ) {
+        throw new Error(
+          `Community annotation cache batch record ${index} must contain exactly path, sha, and json`
+        );
+      }
+      const path = assertCachePath(record.path);
+      if (seenPaths.has(path)) {
+        throw new Error(
+          `Community annotation cache batch path ${JSON.stringify(path)} is duplicated`
+        );
+      }
+      seenPaths.add(path);
+      const sha = assertCacheSha(record.sha);
+      const json = assertCacheDocument(path, record.json);
+      const key = toFileRecordKey(scope, path);
+      if (!key) {
+        throw new Error('Community annotation cache scope is incomplete');
+      }
+      return {
+        key,
+        scopeKey,
+        path,
+        sha,
+        json,
+        storedAt,
+      };
+    });
+    if (exactRecords.length === 0) return true;
+
     await new Promise((resolve, reject) => {
+      let settled = false;
+      let tx = null;
+      const settle = (callback, value) => {
+        if (settled) return;
+        settled = true;
+        ownerSignal?.removeEventListener('abort', abort);
+        callback(value);
+      };
+      const abort = () => {
+        if (settled) return;
+        try {
+          if (tx === null || typeof tx.abort !== 'function') {
+            throw new TypeError(
+              'Community annotation cache batch transaction must expose abort()'
+            );
+          }
+          tx.abort();
+        } catch {
+          settle(reject, cacheWriteAborted());
+        }
+      };
       try {
-        const tx = this._db.transaction([STORE_NAME], 'readwrite');
+        tx = this._db.transaction([STORE_NAME], 'readwrite');
         const store = tx.objectStore(STORE_NAME);
-        store.put({
-          key,
-          scopeKey,
-          path: p,
-          sha: s,
-          json: doc,
-          storedAt: Date.now()
-        });
-        tx.oncomplete = () => resolve(true);
-        tx.onerror = () => reject(tx.error || new Error('IndexedDB cache write failed'));
-        tx.onabort = () => reject(tx.error || new Error('IndexedDB cache write aborted'));
+        for (const record of exactRecords) store.put(record);
+        tx.oncomplete = () => settle(resolve, true);
+        tx.onerror = () => {
+          const primary =
+            tx.error || new Error('IndexedDB cache batch write failed');
+          settle(
+            reject,
+            abortTransactionAfterFailure(
+              tx,
+              primary,
+              'Community annotation cache batch write'
+            )
+          );
+        };
+        tx.onabort = () => settle(
+          reject,
+          ownerSignal?.aborted
+            ? cacheWriteAborted()
+            : (tx.error || new Error('IndexedDB cache batch write aborted'))
+        );
+        ownerSignal?.addEventListener('abort', abort, { once: true });
+        if (ownerSignal?.aborted) abort();
       } catch (error) {
-        reject(error);
+        settle(
+          reject,
+          tx === null
+            ? error
+            : abortTransactionAfterFailure(
+              tx,
+              error,
+              'Community annotation cache batch write'
+            )
+        );
       }
     });
 
-    // Update the sha index only after the JSON is safely stored.
+    if (ownerSignal?.aborted) throw cacheWriteAborted();
+    // Update the SHA index only after every JSON record is safely stored.
     const idx = readShaIndex(scope);
-    idx[p] = s;
+    for (const record of exactRecords) {
+      idx[record.path] = record.sha;
+    }
     writeShaIndex(scope, idx);
     return true;
   }
@@ -669,6 +807,10 @@ export class CommunityAnnotationFileCache {
     if (!scopeKey) throw new Error('Community annotation cache scope is incomplete');
     if (!this._db) throw cacheUnavailable('Community annotation raw-file cache is not initialized');
 
+    // Invalidate the SHA advertisement first. If the IndexedDB deletion fails,
+    // the next Pull must still download every remote file instead of trusting
+    // stale records and entering a permanent skip/fail loop.
+    deleteShaIndex(scope);
     await new Promise((resolve, reject) => {
       try {
         const tx = this._db.transaction([STORE_NAME], 'readwrite');
@@ -689,7 +831,6 @@ export class CommunityAnnotationFileCache {
       }
     });
 
-    deleteShaIndex(scope);
     return true;
   }
 }

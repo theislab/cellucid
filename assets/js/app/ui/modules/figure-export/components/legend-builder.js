@@ -107,7 +107,9 @@ export function renderSvgLegend({
   const parts = [];
   const defs = [];
 
-  parts.push(`<g font-family="${fontFamily}" font-size="${fontSize}" fill="#111">`);
+  parts.push(
+    `<g font-family="${escapeHtml(fontFamily)}" font-size="${fontSize}" fill="#111">`
+  );
   const fill = backgroundFill === 'transparent' ? 'none' : backgroundFill;
   parts.push(`<rect x="${x}" y="${y}" width="${w}" height="${h}" fill="${escapeHtml(fill)}" stroke="#e5e7eb" stroke-width="1"/>`);
 

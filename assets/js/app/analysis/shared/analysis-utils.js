@@ -18,6 +18,7 @@ import {
   std as computeStd,
   median as computeMedian
 } from './number-utils.js';
+import { setOwnDataProperty } from '../../../utils/exact-record.js';
 
 // =============================================================================
 // LOADING STATE MANAGEMENT
@@ -327,12 +328,18 @@ export function toCSV(data, options = {}) {
   } = options;
 
   // Header row
-  const headerRow = columns.map(col => toCSVCell(headers[col] || col)).join(',');
+  const headerRow = columns.map(col => (
+    toCSVCell(Object.hasOwn(headers, col) ? headers[col] : col)
+  )).join(',');
 
   // Data rows
   const dataRows = data.map(row =>
     columns.map(col => {
-      const value = formatValue(row[col], col, row);
+      const value = formatValue(
+        Object.hasOwn(row, col) ? row[col] : undefined,
+        col,
+        row
+      );
       return toCSVCell(value);
     }).join(',')
   );
@@ -496,9 +503,9 @@ export function getFormValues(formContainer, fieldNames) {
     const el = formContainer.querySelector(`[name="${name}"]`);
     if (el) {
       if (el.type === 'checkbox') {
-        values[name] = el.checked;
+        setOwnDataProperty(values, name, el.checked);
       } else {
-        values[name] = el.value;
+        setOwnDataProperty(values, name, el.value);
       }
     }
   }
@@ -524,17 +531,30 @@ export function getTypedFormValues(formContainer, fieldConfig) {
   const values = {};
 
   for (const [name, config] of Object.entries(fieldConfig)) {
+    if (
+      config === null ||
+      typeof config !== 'object' ||
+      Array.isArray(config)
+    ) {
+      throw new TypeError(
+        `Field ${name} configuration must be an object`
+      );
+    }
     const el = formContainer.querySelector(`[name="${name}"]`);
-    let value = el?.value ?? config.default;
+    const type = Object.hasOwn(config, 'type') ? config.type : undefined;
+    const defaultValue = Object.hasOwn(config, 'default')
+      ? config.default
+      : undefined;
+    let value = el?.value ?? defaultValue;
 
-    switch (config.type) {
+    switch (type) {
       case 'int':
         value = parseInt(value, 10);
-        if (!Number.isFinite(value)) value = config.default;
+        if (!Number.isFinite(value)) value = defaultValue;
         break;
       case 'float':
         value = parseFloat(value);
-        if (!Number.isFinite(value)) value = config.default;
+        if (!Number.isFinite(value)) value = defaultValue;
         break;
       case 'bool':
       case 'boolean':
@@ -546,7 +566,7 @@ export function getTypedFormValues(formContainer, fieldConfig) {
         break;
     }
 
-    values[name] = value;
+    setOwnDataProperty(values, name, value);
   }
 
   return values;

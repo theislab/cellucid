@@ -675,13 +675,16 @@ test('successful stale getSpatialIndex replacement publishes CPU and GPU candida
     ]),
   );
 
-  const candidate =
+  const candidateProjection =
     fixture.renderer.getSpatialIndexForDimension(CURRENT_DIMENSION);
+  const candidate =
+    fixture.renderer.spatialIndices.get(CURRENT_DIMENSION);
 
-  assert.equal(
-    fixture.renderer.spatialIndices.get(CURRENT_DIMENSION) ===
-      candidate,
-    true,
+  assert.notStrictEqual(candidateProjection, candidate);
+  assert.equal(candidateProjection.pointCount, candidate.pointCount);
+  assert.throws(
+    () => { candidateProjection.pointCount = 0; },
+    /read-only/,
   );
   assert.equal(
     fixture.renderer

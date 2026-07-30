@@ -519,8 +519,6 @@ export class DataStateColorMethods {
       this.colorsArray[j + 3] = Math.round(alpha * 255);
       this.categoryTransparency[i] = alpha;
     }
-    this._pushTransparencyToViewer();
-    this._syncActiveContext();
   }
 
   clearCentroids() {

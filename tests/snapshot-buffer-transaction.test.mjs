@@ -9,24 +9,41 @@ import { HighPerfRenderer } from '../assets/js/rendering/high-perf-renderer.js';
 function createFakeGl() {
   let nextId = 1;
   let arrayBufferBinding = null;
+  let textureBinding = null;
   let vertexArrayBinding = null;
   const buffers = new Set();
+  const textures = new Set();
   const vertexArrays = new Set();
   const deletedBuffers = [];
+  const deletedTextures = [];
   const deletedVertexArrays = [];
   const bufferDeleteAttempts = [];
+  const textureDeleteAttempts = [];
   const vertexArrayDeleteAttempts = [];
   const bufferBytes = new Map();
+  const textureBytes = new Map();
   const vertexAttributes = new Map();
   let bufferCreateCount = 0;
+  let textureCreateCount = 0;
   let vertexArrayCreateCount = 0;
   let vertexAttribPointerCount = 0;
   let uploadCount = 0;
+  let textureUploadCount = 0;
 
   const gl = {
     NO_ERROR: 0,
     ARRAY_BUFFER: 0x8892,
+    CLAMP_TO_EDGE: 0x812f,
+    MAX_TEXTURE_SIZE: 0x0d33,
+    NEAREST: 0x2600,
+    R8: 0x8229,
+    RED: 0x1903,
     STATIC_DRAW: 0x88E4,
+    TEXTURE_2D: 0x0de1,
+    TEXTURE_MAG_FILTER: 0x2800,
+    TEXTURE_MIN_FILTER: 0x2801,
+    TEXTURE_WRAP_S: 0x2802,
+    TEXTURE_WRAP_T: 0x2803,
     FLOAT: 0x1406,
     UNSIGNED_BYTE: 0x1401,
     failUpload: false,
@@ -35,6 +52,7 @@ function createFakeGl() {
     failVertexArrayAllocationAt: -1,
     failVertexAttribPointerAt: -1,
     failDeleteBuffer: false,
+    failDeleteTexture: false,
     failDeleteVertexArray: false,
     createBuffer() {
       bufferCreateCount++;
@@ -44,6 +62,12 @@ function createFakeGl() {
       const buffer = { kind: 'buffer', id: nextId++ };
       buffers.add(buffer);
       return buffer;
+    },
+    createTexture() {
+      textureCreateCount++;
+      const texture = { kind: 'texture', id: nextId++ };
+      textures.add(texture);
+      return texture;
     },
     createVertexArray() {
       vertexArrayCreateCount++;
@@ -61,6 +85,10 @@ function createFakeGl() {
     bindBuffer(target, buffer) {
       assert.equal(target, gl.ARRAY_BUFFER);
       arrayBufferBinding = buffer;
+    },
+    bindTexture(target, texture) {
+      assert.equal(target, gl.TEXTURE_2D);
+      textureBinding = texture;
     },
     bindVertexArray(vertexArray) {
       vertexArrayBinding = vertexArray;
@@ -84,6 +112,57 @@ function createFakeGl() {
         Uint8Array.from(bytes),
       );
     },
+    texImage2D(
+      target,
+      level,
+      internalFormat,
+      width,
+      height,
+      border,
+      format,
+      type,
+      source,
+    ) {
+      assert.equal(target, gl.TEXTURE_2D);
+      assert.equal(level, 0);
+      assert.equal(internalFormat, gl.R8);
+      assert.equal(border, 0);
+      assert.equal(format, gl.RED);
+      assert.equal(type, gl.UNSIGNED_BYTE);
+      assert.ok(textureBinding);
+      assert.equal(source.byteLength, width * height);
+      textureUploadCount++;
+      textureBytes.set(
+        textureBinding,
+        Uint8Array.from(source),
+      );
+    },
+    texSubImage2D(
+      target,
+      level,
+      xOffset,
+      yOffset,
+      width,
+      height,
+      format,
+      type,
+      source,
+    ) {
+      assert.equal(target, gl.TEXTURE_2D);
+      assert.equal(level, 0);
+      assert.equal(xOffset, 0);
+      assert.equal(yOffset, 0);
+      assert.equal(format, gl.RED);
+      assert.equal(type, gl.UNSIGNED_BYTE);
+      assert.ok(textureBinding);
+      assert.equal(source.byteLength, width * height);
+      textureUploadCount++;
+      textureBytes.set(
+        textureBinding,
+        Uint8Array.from(source),
+      );
+    },
+    texParameteri() {},
     enableVertexAttribArray(index) {
       assert.ok(vertexArrayBinding);
       const attributes = vertexAttributes.get(vertexArrayBinding);
@@ -132,6 +211,18 @@ function createFakeGl() {
       deletedBuffers.push(buffer);
       if (arrayBufferBinding === buffer) arrayBufferBinding = null;
     },
+    deleteTexture(texture) {
+      textureDeleteAttempts.push(texture);
+      if (gl.failDeleteTexture) {
+        throw new Error(
+          `synthetic texture retirement failure ${texture.id}`
+        );
+      }
+      textures.delete(texture);
+      textureBytes.delete(texture);
+      deletedTextures.push(texture);
+      if (textureBinding === texture) textureBinding = null;
+    },
     deleteVertexArray(vertexArray) {
       vertexArrayDeleteAttempts.push(vertexArray);
       if (gl.failDeleteVertexArray) {
@@ -147,13 +238,30 @@ function createFakeGl() {
     getError() {
       return gl.NO_ERROR;
     },
+    getParameter(parameter) {
+      assert.equal(parameter, gl.MAX_TEXTURE_SIZE);
+      return 4096;
+    },
+    isBuffer(buffer) {
+      return buffers.has(buffer);
+    },
+    isTexture(texture) {
+      return textures.has(texture);
+    },
+    isVertexArray(vertexArray) {
+      return vertexArrays.has(vertexArray);
+    },
     _state: {
       buffers,
+      textures,
       vertexArrays,
       deletedBuffers,
+      deletedTextures,
       deletedVertexArrays,
       bufferDeleteAttempts,
+      textureDeleteAttempts,
       bufferBytes,
+      textureBytes,
       vertexAttributes,
       vertexArrayDeleteAttempts,
       get bufferCreateCount() {
@@ -161,6 +269,12 @@ function createFakeGl() {
       },
       get uploadCount() {
         return uploadCount;
+      },
+      get textureCreateCount() {
+        return textureCreateCount;
+      },
+      get textureUploadCount() {
+        return textureUploadCount;
       },
       get vertexArrayCreateCount() {
         return vertexArrayCreateCount;
@@ -174,6 +288,9 @@ function createFakeGl() {
       get vertexArrayBinding() {
         return vertexArrayBinding;
       },
+      get textureBinding() {
+        return textureBinding;
+      },
     },
   };
   return gl;
@@ -186,18 +303,33 @@ function createRenderer() {
     -1, 0, 0,
     1, 0, 0,
   ]);
-  const colors = new Uint8Array([
-    255, 0, 0, 255,
-    0, 0, 255, 255,
+  const rgb = new Uint8Array([
+    255, 0, 0,
+    0, 0, 255,
   ]);
+  const alphaTexData = new Uint8Array([255, 255]);
   const positionBuffer = gl.createBuffer();
   const buffer = gl.createBuffer();
+  const alphaTexture = gl.createTexture();
   const vao = gl.createVertexArray();
   const snapshotPositions = positions.slice();
   gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
   gl.bufferData(gl.ARRAY_BUFFER, snapshotPositions, gl.STATIC_DRAW);
   gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
-  gl.bufferData(gl.ARRAY_BUFFER, colors, gl.STATIC_DRAW);
+  gl.bufferData(gl.ARRAY_BUFFER, rgb, gl.STATIC_DRAW);
+  gl.bindTexture(gl.TEXTURE_2D, alphaTexture);
+  gl.texImage2D(
+    gl.TEXTURE_2D,
+    0,
+    gl.R8,
+    2,
+    1,
+    0,
+    gl.RED,
+    gl.UNSIGNED_BYTE,
+    alphaTexData,
+  );
+  gl.bindTexture(gl.TEXTURE_2D, null);
   gl.bindVertexArray(vao);
   gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
   gl.enableVertexAttribArray(0);
@@ -206,10 +338,10 @@ function createRenderer() {
   gl.enableVertexAttribArray(1);
   gl.vertexAttribPointer(
     1,
-    4,
+    3,
     gl.UNSIGNED_BYTE,
     true,
-    4,
+    3,
     0
   );
   gl.bindVertexArray(null);
@@ -224,16 +356,28 @@ function createRenderer() {
   renderer.useFrustumCulling = false;
   renderer.forceLODLevel = -1;
   renderer._perViewState = new Map();
+  renderer._snapshotAlphaStagingData = null;
+  renderer._snapshotColorStagingData = null;
   renderer.snapshotBuffers = new Map([
     ['snap_1', {
+      alphaTexData,
+      alphaTexHeight: 1,
+      alphaTexWidth: 2,
+      alphaTexture,
+      alphaTextureByteLength: alphaTexData.byteLength,
       id: 'snap_1',
       vao,
       buffer,
-      bufferByteLength: colors.byteLength,
+      bufferByteLength: rgb.byteLength,
+      colorOwner: {
+        buffer,
+        byteLength: rgb.byteLength,
+        pointCount: 2,
+        refCount: 1,
+      },
       pointCount: 2,
       positions: snapshotPositions,
       geometryGeneration: 1,
-      colors,
       bounds: HighPerfRenderer.computeBoundsFromPositions(snapshotPositions),
       spatialIndex: null,
       dimensionLevel: 3,
@@ -251,6 +395,37 @@ function createRenderer() {
     }],
   ]);
   return { gl, renderer };
+}
+
+function snapshotRgba(renderer, snapshot) {
+  const rgb = renderer.gl._state.bufferBytes.get(snapshot.buffer);
+  assert.ok(rgb instanceof Uint8Array);
+  assert.ok(snapshot.alphaTexData instanceof Uint8Array);
+  const colors = new Uint8Array(snapshot.pointCount * 4);
+  for (let index = 0; index < snapshot.pointCount; index++) {
+    colors[index * 4] = rgb[index * 3];
+    colors[index * 4 + 1] = rgb[index * 3 + 1];
+    colors[index * 4 + 2] = rgb[index * 3 + 2];
+    colors[index * 4 + 3] = snapshot.alphaTexData[index];
+  }
+  return colors;
+}
+
+function rgbFromRgba(colors) {
+  assert.ok(colors instanceof Uint8Array);
+  assert.equal(colors.length % 4, 0);
+  const rgb = new Uint8Array((colors.length / 4) * 3);
+  for (
+    let pointIndex = 0, rgbIndex = 0;
+    pointIndex < colors.length / 4;
+    pointIndex++, rgbIndex += 3
+  ) {
+    const rgbaIndex = pointIndex * 4;
+    rgb[rgbIndex] = colors[rgbaIndex];
+    rgb[rgbIndex + 1] = colors[rgbaIndex + 1];
+    rgb[rgbIndex + 2] = colors[rgbaIndex + 2];
+  }
+  return rgb;
 }
 
 function copyBytes(view) {
@@ -281,7 +456,7 @@ function replaceCalculationNotifications(overrides) {
 test('snapshots from one live generation share one immutable CPU copy', () => {
   const { gl, renderer } = createRenderer();
   const existing = renderer.snapshotBuffers.get('snap_1');
-  const colors = existing.colors;
+  const colors = snapshotRgba(renderer, existing);
   renderer.deleteSnapshotBuffer('snap_1');
   gl._state.deletedBuffers.length = 0;
   gl._state.deletedVertexArrays.length = 0;
@@ -347,7 +522,7 @@ test('geometry-generation certificates remain exact across live and snapshot rep
 
   renderer.createSnapshotBuffer(
     'snap_2',
-    first.colors,
+    snapshotRgba(renderer, first),
     null,
     renderer._positions,
     3,
@@ -369,7 +544,7 @@ test('geometry-generation certificates remain exact across live and snapshot rep
   const second = renderer.snapshotBuffers.get('snap_2');
   renderer.createSnapshotBuffer(
     'snap_3',
-    second.colors,
+    snapshotRgba(renderer, second),
     null,
     second.positions,
     3,
@@ -416,7 +591,7 @@ test('geometry-generation certificates remain exact across live and snapshot rep
   );
 });
 
-test('same-generation snapshots share positions and color-only replacement uploads exactly 4N bytes', (t) => {
+test('same-generation snapshots share positions and color-only replacement uploads exactly RGB3N bytes', (t) => {
   const { gl, renderer } = createRenderer();
   const scratch = new ArrayBuffer(renderer.pointCount * 16);
   renderer._interleavedArrayBuffer = scratch;
@@ -454,7 +629,11 @@ test('same-generation snapshots share positions and color-only replacement uploa
   );
   assert.deepEqual(
     firstGpuBytes,
-    firstColors,
+    rgbFromRgba(firstColors),
+  );
+  assert.deepEqual(
+    gl._state.textureBytes.get(first.alphaTexture),
+    new Uint8Array([4, 8]),
   );
 
   renderer.createSnapshotBuffer(
@@ -480,7 +659,11 @@ test('same-generation snapshots share positions and color-only replacement uploa
   );
   assert.deepEqual(
     secondGpuBytes,
-    secondColors,
+    rgbFromRgba(secondColors),
+  );
+  assert.deepEqual(
+    gl._state.textureBytes.get(second.alphaTexture),
+    new Uint8Array([14, 18]),
   );
   assert.equal(
     renderer._snapshotGeometryPools.get(
@@ -509,8 +692,8 @@ test('same-generation snapshots share positions and color-only replacement uploa
       enabled: true,
       normalized: true,
       offset: 0,
-      size: 4,
-      stride: 4,
+      size: 3,
+      stride: 3,
       type: gl.UNSIGNED_BYTE,
     });
   }
@@ -524,16 +707,19 @@ test('same-generation snapshots share positions and color-only replacement uploa
 
   const uploadCountBeforeReplacement =
     gl._state.uploadCount;
+  const textureUploadCountBeforeReplacement =
+    gl._state.textureUploadCount;
+  const acceptedAlphaTexture = first.alphaTexture;
+  const acceptedAlphaBytes = Uint8Array.from(
+    first.alphaTexData,
+  );
   const sharedPositionBuffer = geometry.positionBuffer;
   const sharedPositionBytes = Uint8Array.from(
     gl._state.bufferBytes.get(sharedPositionBuffer)
   );
-  renderer.updateSnapshotBuffer(
+  renderer.updateSnapshotColors(
     'snap_2',
     replacementColors,
-    null,
-    first.positions,
-    3,
   );
   assert.strictEqual(
     renderer._interleavedArrayBuffer,
@@ -546,13 +732,20 @@ test('same-generation snapshots share positions and color-only replacement uploa
   );
   assert.deepEqual(
     gl._state.bufferBytes.get(first.buffer),
-    replacementColors,
+    rgbFromRgba(replacementColors),
   );
   assert.equal(
     gl._state.uploadCount,
     uploadCountBeforeReplacement + 1,
     'a same-geometry replacement uploads only its new color store',
   );
+  assert.equal(
+    gl._state.textureUploadCount,
+    textureUploadCountBeforeReplacement,
+    'RGB-only replacement must not upload or replace snapshot R8 state',
+  );
+  assert.equal(first.alphaTexture, acceptedAlphaTexture);
+  assert.deepEqual(first.alphaTexData, acceptedAlphaBytes);
   assert.equal(
     geometry.positionBuffer,
     sharedPositionBuffer,
@@ -579,7 +772,9 @@ test('same-generation snapshots share positions and color-only replacement uploa
   const interleavedEightViewBytes =
     8 * pointCount * 16;
   const splitEightViewBytes =
-    pointCount * 12 + 8 * pointCount * 4;
+    pointCount * 12 +
+    8 * pointCount * 3 +
+    8 * pointCount;
   const avoidedDuplicateBytes =
     interleavedEightViewBytes - splitEightViewBytes;
   assert.equal(avoidedDuplicateBytes, 2_520_000_000);
@@ -619,6 +814,7 @@ test('snapshot deletion retains exact failed handles for retry without releasing
     1,
   );
   assert.equal(gl._state.buffers.has(snapshot.buffer), true);
+  assert.equal(gl._state.textures.has(snapshot.alphaTexture), true);
   assert.equal(gl._state.buffers.has(positionBuffer), true);
   assert.equal(gl._state.vertexArrays.has(snapshot.vao), true);
   assert.equal(renderer._pendingSnapshotRetirements.size, 1);
@@ -653,12 +849,19 @@ test('snapshot deletion retains exact failed handles for retry without releasing
     gl._state.deletedBuffers,
     [snapshot.buffer, positionBuffer]
   );
+  assert.deepEqual(
+    gl._state.deletedTextures,
+    [snapshot.alphaTexture],
+  );
   assert.deepEqual(gl._state.deletedVertexArrays, [snapshot.vao]);
 });
 
 test('delete-all continues detaching snapshots after a retirement failure', () => {
   const { gl, renderer } = createRenderer();
-  const colors = renderer.snapshotBuffers.get('snap_1').colors;
+  const colors = snapshotRgba(
+    renderer,
+    renderer.snapshotBuffers.get('snap_1')
+  );
   renderer.createSnapshotBuffer(
     'snap_2',
     colors,
@@ -680,6 +883,7 @@ test('delete-all continues detaching snapshots after a retirement failure', () =
   assert.equal(renderer._snapshotGeometryPools.size, 0);
   assert.equal(gl._state.vertexArrays.size, 0);
   assert.equal(gl._state.buffers.size, 3);
+  assert.equal(gl._state.textures.size, 0);
   assert.equal(renderer._pendingSnapshotRetirements.size, 2);
 
   gl.failDeleteBuffer = false;
@@ -687,6 +891,7 @@ test('delete-all continues detaching snapshots after a retirement failure', () =
   assert.equal(renderer._pendingSnapshotRetirements.size, 0);
   assert.equal(gl._state.buffers.size, 0);
   assert.equal(gl._state.deletedBuffers.length, 3);
+  assert.equal(gl._state.deletedTextures.length, 2);
   assert.equal(gl._state.deletedVertexArrays.length, 2);
 });
 
@@ -760,6 +965,7 @@ test('dispose retries a failed snapshot VAO without double release or premature 
     geometry,
   );
   assert.equal(gl._state.buffers.has(snapshot.buffer), true);
+  assert.equal(gl._state.textures.has(snapshot.alphaTexture), true);
   assert.equal(gl._state.buffers.has(positionBuffer), true);
 
   gl.failDeleteVertexArray = false;
@@ -767,6 +973,7 @@ test('dispose retries a failed snapshot VAO without double release or premature 
   assert.equal(renderer._pendingSnapshotRetirements.size, 0);
   assert.equal(renderer._snapshotGeometryPools.size, 0);
   assert.equal(gl._state.buffers.size, 0);
+  assert.equal(gl._state.textures.size, 0);
   assert.equal(gl._state.vertexArrays.size, 0);
   assert.equal(
     gl._state.vertexArrayDeleteAttempts.filter(
@@ -833,8 +1040,10 @@ test('rejected split uploads retain zero accepted GPU bytes across cleanup retry
     renderer._lodResourceOwnersByDimension = new Map();
   };
   const assertActiveBytesOnly = renderer => {
+    const snapshot = renderer.snapshotBuffers.get('snap_1');
     const expected =
-      renderer.pointCount * 4 +
+      renderer.pointCount * 3 +
+      snapshot.alphaTextureByteLength +
       renderer.pointCount * 3 * Float32Array.BYTES_PER_ELEMENT;
     assert.equal(
       renderer.stats.gpuMemoryMB * 1024 * 1024,
@@ -885,12 +1094,9 @@ test('rejected split uploads retain zero accepted GPU bytes across cleanup retry
     gl.failDeleteBuffer = true;
 
     assert.throws(
-      () => renderer.updateSnapshotBuffer(
+      () => renderer.updateSnapshotColors(
         'snap_1',
-        snapshot.colors,
-        null,
-        snapshot.positions,
-        3,
+        snapshotRgba(renderer, snapshot),
       ),
       error => (
         error instanceof AggregateError &&
@@ -952,7 +1158,7 @@ test('null position, color, and VAO allocations roll back exact geometry referen
     assert.throws(
       () => renderer.createSnapshotBuffer(
         'snap_2',
-        snapshot.colors,
+        snapshotRgba(renderer, snapshot),
         null,
         renderer._positions,
         3,
@@ -978,7 +1184,7 @@ test('null position, color, and VAO allocations roll back exact geometry referen
     assert.throws(
       () => renderer.createSnapshotBuffer(
         'snap_2',
-        snapshot.colors,
+        snapshotRgba(renderer, snapshot),
         null,
         renderer._positions,
         3,
@@ -1008,7 +1214,7 @@ test('VAO attribute setup failure deletes the staged VAO before releasing split 
   assert.throws(
     () => renderer.createSnapshotBuffer(
       'snap_2',
-      snapshot.colors,
+      snapshotRgba(renderer, snapshot),
       null,
       renderer._positions,
       3,
@@ -1033,7 +1239,9 @@ test('snapshot GPU upload failure preserves the complete published resource set'
     0, 255, 0, 255,
     255, 255, 0, 255,
   ]);
-  const acceptedGpuBytes = copyBytes(before.colors);
+  const acceptedGpuBytes = Uint8Array.from(
+    gl._state.bufferBytes.get(before.buffer)
+  );
   const geometry = renderer._snapshotGeometryPools.get(
     before.geometryGeneration
   );
@@ -1087,7 +1295,8 @@ test('snapshot rollback keeps failed candidate cleanup owned for exact retry', (
     renderer._snapshotGeometryPools.get(
       snapshot.geometryGeneration
     ).positionBuffer;
-  const replacementColors = snapshot.colors.slice();
+  const replacementColors =
+    snapshotRgba(renderer, snapshot);
 
   gl.failUpload = true;
   gl.failDeleteBuffer = true;
@@ -1138,10 +1347,11 @@ test('snapshot rollback keeps failed candidate cleanup owned for exact retry', (
   );
 });
 
-test('snapshot GPU publication swaps both resources exactly once', () => {
+test('combined snapshot publication swaps RGB, R8, and VAO owners exactly once', () => {
   const { gl, renderer } = createRenderer();
   const snapshot = renderer.snapshotBuffers.get('snap_1');
   const previousBuffer = snapshot.buffer;
+  const previousAlphaTexture = snapshot.alphaTexture;
   const previousVao = snapshot.vao;
   const sharedPositionBuffer =
     renderer._snapshotGeometryPools.get(
@@ -1164,12 +1374,31 @@ test('snapshot GPU publication swaps both resources exactly once', () => {
   );
 
   assert.notEqual(snapshot.buffer, previousBuffer);
+  assert.notEqual(snapshot.alphaTexture, previousAlphaTexture);
   assert.notEqual(snapshot.vao, previousVao);
-  assert.deepEqual(snapshot.colors, replacementColors);
-  assert.notEqual(snapshot.colors, replacementColors);
+  assert.equal(Object.hasOwn(snapshot, 'colors'), false);
+  assert.deepEqual(
+    gl._state.bufferBytes.get(snapshot.buffer),
+    new Uint8Array([
+      0, 255, 0,
+      255, 255, 0,
+    ]),
+  );
+  assert.deepEqual(
+    snapshot.alphaTexData.subarray(0, snapshot.pointCount),
+    new Uint8Array([255, 255]),
+  );
   assert.equal(gl._state.buffers.has(previousBuffer), false);
+  assert.equal(
+    gl._state.textures.has(previousAlphaTexture),
+    false,
+  );
   assert.equal(gl._state.vertexArrays.has(previousVao), false);
   assert.deepEqual(gl._state.deletedBuffers, [previousBuffer]);
+  assert.deepEqual(
+    gl._state.deletedTextures,
+    [previousAlphaTexture],
+  );
   assert.deepEqual(gl._state.deletedVertexArrays, [previousVao]);
   assert.equal(gl._state.buffers.size, 2);
   assert.equal(
@@ -1191,12 +1420,9 @@ test('color replacement keeps an extra geometry ref until its old VAO actually r
   gl.failDeleteVertexArray = true;
 
   assert.equal(
-    renderer.updateSnapshotBuffer(
+    renderer.updateSnapshotColors(
       'snap_1',
-      snapshot.colors,
-      null,
-      snapshot.positions,
-      3,
+      snapshotRgba(renderer, snapshot),
     ),
     true,
   );
@@ -1242,6 +1468,10 @@ test('published snapshot updates stay successful while failed old handles remain
   const { gl, renderer } = createRenderer();
   const snapshot = renderer.snapshotBuffers.get('snap_1');
   const previous = { ...snapshot };
+  const previousPositionBuffer =
+    renderer._snapshotGeometryPools.get(
+      previous.geometryGeneration
+    ).positionBuffer;
   gl.failDeleteBuffer = true;
 
   assert.equal(
@@ -1256,7 +1486,9 @@ test('published snapshot updates stay successful while failed old handles remain
   assert.equal(renderer.snapshotBuffers.get('snap_1'), snapshot);
   assert.notEqual(snapshot.geometryGeneration, previous.geometryGeneration);
   assert.notEqual(snapshot.positions, previous.positions);
-  assert.notEqual(snapshot.buffer, previous.buffer);
+  assert.equal(snapshot.buffer, previous.buffer);
+  assert.equal(snapshot.colorOwner, previous.colorOwner);
+  assert.equal(snapshot.alphaTexture, previous.alphaTexture);
   assert.notEqual(snapshot.vao, previous.vao);
   assert.equal(
     renderer._snapshotGeometryPools.has(previous.geometryGeneration),
@@ -1269,16 +1501,27 @@ test('published snapshot updates stay successful while failed old handles remain
     1,
   );
   assert.equal(gl._state.buffers.has(previous.buffer), true);
+  assert.equal(gl._state.buffers.has(previousPositionBuffer), true);
   assert.equal(gl._state.vertexArrays.has(previous.vao), false);
   assert.equal(renderer._pendingSnapshotRetirements.size, 1);
 
   gl.failDeleteBuffer = false;
   assert.deepEqual(renderer._drainSnapshotRetirements('snap_1'), []);
   assert.equal(renderer._pendingSnapshotRetirements.size, 0);
-  assert.equal(gl._state.buffers.has(previous.buffer), false);
+  assert.equal(gl._state.buffers.has(previous.buffer), true);
+  assert.equal(
+    gl._state.buffers.has(previousPositionBuffer),
+    false,
+  );
   assert.equal(
     gl._state.bufferDeleteAttempts.filter(
       handle => handle === previous.buffer
+    ).length,
+    0,
+  );
+  assert.equal(
+    gl._state.bufferDeleteAttempts.filter(
+      handle => handle === previousPositionBuffer
     ).length,
     2,
   );
@@ -1312,11 +1555,11 @@ test('snapshot geometry publication copies even the same input identity', () => 
   assert.notStrictEqual(snapshot.positions, renderer._positions);
   assert.notStrictEqual(snapshot.positions, ownedPositions);
   assert.notStrictEqual(snapshot.bounds, ownedBounds);
-  assert.notStrictEqual(snapshot.buffer, ownedBuffer);
+  assert.strictEqual(snapshot.buffer, ownedBuffer);
   assert.notStrictEqual(snapshot.vao, ownedVao);
   assert.deepEqual(
     gl._state.deletedBuffers,
-    [ownedBuffer, ownedPositionBuffer]
+    [ownedPositionBuffer]
   );
   assert.deepEqual(gl._state.deletedVertexArrays, [ownedVao]);
   assert.equal(gl._state.buffers.size, 2);
@@ -1358,37 +1601,22 @@ test('view-state invalidation resets semantic caches without GPU buffer churn', 
   viewState.cachedLodVisibleIndices = new Uint32Array([1]);
   const visibleOriginalSet = new Set([1]);
   viewState.cachedVisibleOriginalSet = visibleOriginalSet;
-  viewState.cachedLodVisibility = new Float32Array([1, 0]);
-  viewState.cachedLodVisibilityFilterGen = 4;
-  const lodVisibility = viewState.cachedLodVisibility;
-  const lodVisibilityIndices = new Uint32Array([1]);
-  viewState.cachedLodVisibilityIndices = lodVisibilityIndices;
-  viewState.cachedCombinedVisibility = new Float32Array([1, 0]);
-  const combinedVisibility = viewState.cachedCombinedVisibility;
   viewState.indexBufferSize = 17;
   viewState.usePreCachedIndexBuffer = true;
   viewState.preCachedIndexBuffer = { id: 'lod-index' };
   viewState.statsPublished = true;
-  viewState.filterGeneration = 9;
   const bufferCount = gl._state.buffers.size;
 
   assert.equal(renderer.invalidateViewState('live'), true);
 
   assert.equal(viewState.indexBuffer, indexBuffer);
-  assert.equal(viewState.filterGeneration, 9);
   assert.equal(viewState.lastFrustumMVP, null);
   assert.equal(viewState.cachedCulledCount, 0);
   assert.equal(viewState.cachedVisibleIndices, null);
   assert.equal(viewState.cachedLodVisibleIndices, null);
   assert.equal(viewState.cachedVisibleOriginalSet, visibleOriginalSet);
-  assert.equal(viewState.cachedLodVisibility, lodVisibility);
-  assert.equal(viewState.cachedLodVisibilityFilterGen, -1);
-  assert.equal(
-    viewState.cachedLodVisibilityIndices,
-    lodVisibilityIndices,
-  );
-  assert.equal(viewState.cachedCombinedVisibility, combinedVisibility);
-  assert.equal(viewState.cachedCombinedVisDim, -1);
+  assert.equal(Object.hasOwn(viewState, 'cachedLodVisibility'), false);
+  assert.equal(Object.hasOwn(viewState, 'cachedCombinedVisibility'), false);
   assert.equal(viewState.indexBufferSize, 0);
   assert.equal(viewState.usePreCachedIndexBuffer, false);
   assert.equal(viewState.preCachedIndexBuffer, null);
@@ -1487,7 +1715,9 @@ test('snapshot notification completion failure cannot roll back a valid publicat
     restoreNotifications();
   }
 
-  assert.notEqual(snapshot.buffer, previous.buffer);
+  assert.equal(snapshot.buffer, previous.buffer);
+  assert.equal(snapshot.colorOwner, previous.colorOwner);
+  assert.equal(snapshot.alphaTexture, previous.alphaTexture);
   assert.notEqual(snapshot.vao, previous.vao);
   assert.notEqual(
     snapshot.geometryGeneration,
@@ -1497,9 +1727,9 @@ test('snapshot notification completion failure cannot roll back a valid publicat
   assert.equal(failureNotifications, 0);
   assert.equal(gl._state.buffers.size, 2);
   assert.equal(gl._state.vertexArrays.size, 1);
-  assert.equal(gl._state.deletedBuffers.length, 2);
+  assert.equal(gl._state.deletedBuffers.length, 1);
   assert.equal(gl._state.deletedVertexArrays.length, 1);
-  assert.equal(gl._state.deletedBuffers[0], previous.buffer);
+  assert.notEqual(gl._state.deletedBuffers[0], previous.buffer);
   assert.equal(gl._state.deletedVertexArrays[0], previous.vao);
 });
 
@@ -1548,7 +1778,7 @@ test('same-generation snapshots reuse one exact dimension spatial owner', () => 
   const first = renderer.snapshotBuffers.get('snap_1');
   renderer.createSnapshotBuffer(
     'snap_2',
-    first.colors,
+    snapshotRgba(renderer, first),
     null,
     renderer._positions,
     3,

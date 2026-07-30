@@ -7,6 +7,18 @@
 
 const ORCID_ID = /^[0-9]{4}-[0-9]{4}-[0-9]{4}-[0-9]{3}[0-9X]$/;
 const LINKEDIN_HANDLE = /^[a-z0-9-]{3,120}$/;
+const PROFILE_NAME_MAX_CODEPOINTS = 120;
+
+function exceedsCodePointLimit(value, maximum) {
+  if (value.length <= maximum) return false;
+  if (value.length > maximum * 2) return true;
+  let count = 0;
+  for (const _character of value) {
+    count += 1;
+    if (count > maximum) return true;
+  }
+  return false;
+}
 
 function assertRecord(value, label) {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
@@ -15,12 +27,34 @@ function assertRecord(value, label) {
   return value;
 }
 
-function optionalExactString(value, label) {
+function optionalExactString(
+  value,
+  label,
+  maximumLength = PROFILE_NAME_MAX_CODEPOINTS
+) {
   if (value === null || value === undefined) return null;
-  if (typeof value !== 'string' || /^\s|\s$/.test(value)) {
-    throw new Error(`${label} must be null or an exact string`);
+  if (
+    typeof value !== 'string' ||
+    /^\s|\s$/.test(value) ||
+    exceedsCodePointLimit(value, maximumLength)
+  ) {
+    throw new Error(
+      `${label} must be null or an exact string of at most ` +
+      `${maximumLength} characters`
+    );
   }
   return value || null;
+}
+
+function joinOrcidName(parts, label) {
+  if (parts.length === 0) return null;
+  const name = parts.join(' ');
+  if (exceedsCodePointLimit(name, PROFILE_NAME_MAX_CODEPOINTS)) {
+    throw new Error(
+      `${label} must be at most ${PROFILE_NAME_MAX_CODEPOINTS} characters`
+    );
+  }
+  return name;
 }
 
 export function isExactOrcidId(value) {
@@ -55,7 +89,7 @@ export function assertExactOptionalProfileText(value, label, maximumLength) {
   if (
     typeof value !== 'string' ||
     /^\s|\s$/.test(value) ||
-    Array.from(value).length > maximumLength
+    exceedsCodePointLimit(value, maximumLength)
   ) {
     throw new Error(
       `${label} must be an exact string of at most ${maximumLength} characters`
@@ -85,7 +119,7 @@ export function parseOrcidPersonName(document) {
           'ORCID person response.name.family-name.value'
         );
   const parts = [given, family].filter((part) => part !== null);
-  return parts.length === 0 ? null : parts.join(' ');
+  return joinOrcidName(parts, 'ORCID person response name');
 }
 
 export function parseOrcidExpandedSearch(document, { maximumResults = 8 } = {}) {
@@ -121,7 +155,10 @@ export function parseOrcidExpandedSearch(document, { maximumResults = 8 } = {}) 
     const parts = [given, family].filter((part) => part !== null);
     return {
       orcid,
-      name: parts.length === 0 ? null : parts.join(' '),
+      name: joinOrcidName(
+        parts,
+        `ORCID expanded-search response.expanded-result[${index}] name`
+      ),
     };
   });
 }

@@ -12,6 +12,7 @@
 
 import { getTransformRegistry as getUnifiedRegistry } from './plugin-contract.js';
 import { getFiniteMinMax, isFiniteNumber, mean as computeMean, variance as computeVariance } from '../shared/number-utils.js';
+import { setOwnDataProperty } from '../../../utils/exact-record.js';
 
 // =============================================================================
 // BUILT-IN TRANSFORM DEFINITIONS
@@ -769,17 +770,38 @@ export function generateOptionsUI(schema, values = {}, prefix = 'opt') {
   const html = [];
 
   for (const [key, def] of Object.entries(schema)) {
+    if (
+      def === null ||
+      typeof def !== 'object' ||
+      Array.isArray(def)
+    ) {
+      throw new TypeError(
+        `Option ${key} definition must be an object`
+      );
+    }
     const id = `${prefix}-${key}`;
-    const value = values[key] ?? def.default;
-    const showCondition = def.showWhen ? `data-show-when="${key}"` : '';
+    const currentValue = Object.hasOwn(values, key) ? values[key] : undefined;
+    const defaultValue = Object.hasOwn(def, 'default') ? def.default : undefined;
+    const value = currentValue ?? defaultValue;
+    const type = Object.hasOwn(def, 'type') ? def.type : undefined;
+    const label = Object.hasOwn(def, 'label') ? def.label : undefined;
+    const showWhen = Object.hasOwn(def, 'showWhen') ? def.showWhen : undefined;
+    const optionDefinitions = Object.hasOwn(def, 'options') ? def.options : undefined;
+    const min = Object.hasOwn(def, 'min') ? def.min : undefined;
+    const max = Object.hasOwn(def, 'max') ? def.max : undefined;
+    const step = Object.hasOwn(def, 'step') ? def.step : undefined;
+    const description = Object.hasOwn(def, 'description')
+      ? def.description
+      : undefined;
+    const showCondition = showWhen ? `data-show-when="${key}"` : '';
 
     html.push(`<div class="form-group" ${showCondition}>`);
-    html.push(`<label for="${id}">${def.label || key}</label>`);
+    html.push(`<label for="${id}">${label || key}</label>`);
 
-    switch (def.type) {
+    switch (type) {
       case 'select':
         html.push(`<select id="${id}" name="${id}" data-key="${key}">`);
-        for (const opt of (def.options || [])) {
+        for (const opt of (optionDefinitions || [])) {
           const selected = opt.value === value ? 'selected' : '';
           html.push(`<option value="${opt.value}" ${selected}>${opt.label}</option>`);
         }
@@ -793,15 +815,15 @@ export function generateOptionsUI(schema, values = {}, prefix = 'opt') {
       }
 
       case 'number': {
-        const minAttr = def.min !== undefined ? `min="${def.min}"` : '';
-        const maxAttr = def.max !== undefined ? `max="${def.max}"` : '';
-        const step = def.step !== undefined ? `step="${def.step}"` : '';
-        html.push(`<input type="number" id="${id}" name="${id}" data-key="${key}" value="${value || ''}" ${minAttr} ${maxAttr} ${step}>`);
+        const minAttr = min !== undefined ? `min="${min}"` : '';
+        const maxAttr = max !== undefined ? `max="${max}"` : '';
+        const stepAttr = step !== undefined ? `step="${step}"` : '';
+        html.push(`<input type="number" id="${id}" name="${id}" data-key="${key}" value="${value || ''}" ${minAttr} ${maxAttr} ${stepAttr}>`);
         break;
       }
 
       case 'range':
-        html.push(`<input type="range" id="${id}" name="${id}" data-key="${key}" value="${value || 0}" min="${def.min || 0}" max="${def.max || 100}" step="${def.step || 1}">`);
+        html.push(`<input type="range" id="${id}" name="${id}" data-key="${key}" value="${value || 0}" min="${min || 0}" max="${max || 100}" step="${step || 1}">`);
         html.push(`<span class="range-value">${value}</span>`);
         break;
 
@@ -816,7 +838,7 @@ export function generateOptionsUI(schema, values = {}, prefix = 'opt') {
       case 'multiselect': {
         html.push(`<select id="${id}" name="${id}" data-key="${key}" multiple>`);
         const selectedValues = new Set(value || []);
-        for (const opt of (def.options || [])) {
+        for (const opt of (optionDefinitions || [])) {
           const selected = selectedValues.has(opt.value) ? 'selected' : '';
           html.push(`<option value="${opt.value}" ${selected}>${opt.label}</option>`);
         }
@@ -825,8 +847,8 @@ export function generateOptionsUI(schema, values = {}, prefix = 'opt') {
       }
     }
 
-    if (def.description) {
-      html.push(`<small class="form-help">${def.description}</small>`);
+    if (description) {
+      html.push(`<small class="form-help">${description}</small>`);
     }
 
     html.push('</div>');
@@ -845,23 +867,35 @@ export function parseOptionsFromForm(form, schema) {
   const values = {};
 
   for (const [key, def] of Object.entries(schema)) {
+    if (
+      def === null ||
+      typeof def !== 'object' ||
+      Array.isArray(def)
+    ) {
+      throw new TypeError(
+        `Option ${key} definition must be an object`
+      );
+    }
     const input = form.querySelector(`[data-key="${key}"]`);
     if (!input) continue;
 
-    switch (def.type) {
+    const type = Object.hasOwn(def, 'type') ? def.type : undefined;
+    let value;
+    switch (type) {
       case 'checkbox':
-        values[key] = input.checked;
+        value = input.checked;
         break;
       case 'number':
       case 'range':
-        values[key] = input.value !== '' ? parseFloat(input.value) : null;
+        value = input.value !== '' ? parseFloat(input.value) : null;
         break;
       case 'multiselect':
-        values[key] = Array.from(input.selectedOptions).map(o => o.value);
+        value = Array.from(input.selectedOptions).map(o => o.value);
         break;
       default:
-        values[key] = input.value;
+        value = input.value;
     }
+    setOwnDataProperty(values, key, value);
   }
 
   return values;

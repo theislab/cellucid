@@ -58,6 +58,8 @@ function createInitializationGl(overrides = {}) {
     DEPTH_TEST: 0x0b71,
     LEQUAL: 0x0203,
     BLEND: 0x0be2,
+    FUNC_ADD: 0x8006,
+    ONE: 1,
     SRC_ALPHA: 0x0302,
     ONE_MINUS_SRC_ALPHA: 0x0303,
 
@@ -193,10 +195,22 @@ function createInitializationGl(overrides = {}) {
 
     enable() {},
     depthFunc() {},
-    blendFunc() {
+    blendEquation(value) {
+      assert.equal(value, gl.FUNC_ADD);
+    },
+    blendFuncSeparate(
+      sourceRgb,
+      destinationRgb,
+      sourceAlpha,
+      destinationAlpha,
+    ) {
       if (overrides.throwBlendFunc) {
         throw new Error('synthetic blendFunc failure');
       }
+      assert.equal(sourceRgb, gl.SRC_ALPHA);
+      assert.equal(destinationRgb, gl.ONE_MINUS_SRC_ALPHA);
+      assert.equal(sourceAlpha, gl.ONE);
+      assert.equal(destinationAlpha, gl.ONE_MINUS_SRC_ALPHA);
     },
     getError() {
       const error = nextError;
