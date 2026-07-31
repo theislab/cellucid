@@ -8,17 +8,34 @@
   gap: var(--space-1-5);
 }
 
+/* The control box is a full --space-6 (24px) tall so the pointer target matches
+   WCAG 2.2 SC 2.5.8 and, more importantly, actually covers the 14px thumb the
+   user can see. Symmetric negative block margins collapse the margin box back
+   to the 3px track height, so rows keep their painted geometry. The track is
+   painted by the track pseudo-elements, not by the input background. */
 .slider-row input[type="range"] {
   flex: 1;
   -webkit-appearance: none;
   appearance: none;
-  height: 3px;
-  border-radius: var(--radius-full);
-  background: var(--color-border-light);
-  outline: none;
+  height: var(--space-6);
+  margin-block: calc((3px - var(--space-6)) / 2);
+  background: transparent;
+  cursor: pointer;
+}
+
+/* Ring is inset so it brackets the track and thumb instead of spilling into the
+   neighbouring rows that the 24px hit area overlaps. */
+.slider-row input[type="range"]:focus-visible {
+  outline-offset: calc(-1 * var(--space-1));
 }
 
 /* WebKit */
+.slider-row input[type="range"]::-webkit-slider-runnable-track {
+  height: 3px;
+  border-radius: var(--radius-full);
+  background: var(--color-border-light);
+}
+
 .slider-row input[type="range"]::-webkit-slider-thumb {
   -webkit-appearance: none;
   appearance: none;
@@ -29,6 +46,7 @@
   border: var(--border-width-1) solid var(--color-border-strong);
   box-shadow: var(--shadow-xs);
   margin-top: -5.5px;
+  cursor: pointer;
 }
 
 /* Firefox */
@@ -45,6 +63,7 @@
   background: var(--color-text-primary);
   border: var(--border-width-1) solid var(--color-border-strong);
   box-shadow: var(--shadow-xs);
+  cursor: pointer;
 }
 
 /* Slider value readout – monospaced for “instrument” feel */

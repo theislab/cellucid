@@ -11,6 +11,7 @@
 import { escapeHtml } from '../../../../utils/dom-utils.js';
 import { clamp } from '../../../../utils/number-utils.js';
 import { assertCameraState } from '../../../../../rendering/camera-state-contract.js';
+import { LIGHT_INK } from '../utils/figure-ink.js';
 
 /**
  * @typedef {object} PlotRect
@@ -124,8 +125,9 @@ export function renderSvgOrientationIndicator({
   sizePx = null,
   marginPx = null,
   padPx = null,
-  textColor = '#111'
+  ink = LIGHT_INK
 }) {
+  const textColor = ink.surfaceInk;
   if (!plotRect || !viewMatrix) return '';
 
   const fs = clamp(Math.round(Number(fontSize) || 11), 6, 48);
@@ -163,7 +165,7 @@ export function renderSvgOrientationIndicator({
 
   const parts = [];
   parts.push(`<g font-family="${escapeHtml(fontFamily)}" font-size="${fs}" fill="${escapeHtml(textColor)}">`);
-  parts.push(`<rect x="${x}" y="${y}" width="${size}" height="${size}" rx="${cornerR}" fill="rgba(255,255,255,0.85)" stroke="#e5e7eb" stroke-width="1"/>`);
+  parts.push(`<rect x="${x}" y="${y}" width="${size}" height="${size}" rx="${cornerR}" fill="${ink.surface}" fill-opacity="0.85" stroke="${ink.frame}" stroke-width="1"/>`);
 
   for (const axis of axes) {
     const vx = axis.v[0];
@@ -189,7 +191,7 @@ export function renderSvgOrientationIndicator({
     const baseY = y + size - pad;
     for (let i = 0; i < lines.length; i++) {
       const textY = baseY - (lines.length - 1 - i) * lineH;
-      parts.push(`<text x="${x + size / 2}" y="${textY}" text-anchor="middle" fill="#111" stroke="none">${escapeHtml(lines[i])}</text>`);
+      parts.push(`<text x="${x + size / 2}" y="${textY}" text-anchor="middle" fill="${ink.surfaceInk}" stroke="none">${escapeHtml(lines[i])}</text>`);
     }
   }
 
@@ -217,7 +219,8 @@ export function drawCanvasOrientationIndicator({
   fontSize = 11,
   sizePx = null,
   marginPx = null,
-  padPx = null
+  padPx = null,
+  ink = LIGHT_INK
 }) {
   if (!ctx || !plotRect || !viewMatrix) return;
 
@@ -253,11 +256,13 @@ export function drawCanvasOrientationIndicator({
   axes.sort((a, b) => (b.v[2] || 0) - (a.v[2] || 0));
 
   ctx.save();
-  ctx.fillStyle = 'rgba(255,255,255,0.85)';
-  ctx.strokeStyle = '#e5e7eb';
+  ctx.globalAlpha = 0.85;
+  ctx.fillStyle = ink.surface;
+  ctx.strokeStyle = ink.frame;
   ctx.lineWidth = 1;
   beginRoundRectPath(ctx, x, y, size, size, cornerR);
   ctx.fill();
+  ctx.globalAlpha = 1;
   ctx.stroke();
 
   for (const axis of axes) {
@@ -291,7 +296,7 @@ export function drawCanvasOrientationIndicator({
 
   ctx.globalAlpha = 1;
   if (lines.length) {
-    ctx.fillStyle = '#111';
+    ctx.fillStyle = ink.surfaceInk;
     ctx.font = `${fs}px ${fontFamily}`;
     ctx.textAlign = 'center';
     ctx.textBaseline = 'alphabetic';

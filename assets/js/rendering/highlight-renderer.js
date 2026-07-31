@@ -2281,6 +2281,8 @@ export class HighlightTools {
           type: 'lasso-preview',
           cellIndices: [],
           cellCount: 0,
+          newCellCount: 0,
+          mode: this.lassoMode || 'intersect',
           polygon: this.lassoPath.map(point => ({
             x: point.x,
             y: point.y,
@@ -2979,6 +2981,32 @@ export class HighlightTools {
     this.updateCursorForHighlightMode();
   }
 
+  /**
+   * Report an Alt gesture this renderer consumed but turned into no step.
+   *
+   * An input gesture the renderer consumes has to produce an outcome the app
+   * can observe. A pick that finds no cell — points draw around a pixel wide,
+   * so missing is constant — and a release that lands off the view both used
+   * to return without publishing anything, which left no code anywhere able to
+   * tell that a click had even happened. The reason is all the renderer
+   * decides; the wording belongs to the tool that owns the panel.
+   *
+   * @param {'annotation'|'knn'|'proximity'|'lasso'} tool
+   * @param {'no-cell-under-pointer'|'released-off-view'} reason
+   * @returns {boolean} true when a listening tool was told
+   */
+  _publishAbandonedGesture(tool, reason) {
+    const callback = {
+      annotation: this.selectionStepCallback,
+      knn: this.knnStepCallback,
+      proximity: this.proximityStepCallback,
+      lasso: this.lassoStepCallback
+    }[tool];
+    if (!callback) return false;
+    callback({ abandoned: reason, step: 0, candidateCount: 0 });
+    return true;
+  }
+
   // === Event handling ===
   handleMouseDown(e) {
     const ctx = this.getRenderContext();
@@ -3168,6 +3196,7 @@ export class HighlightTools {
         e.preventDefault();
         return true;
       }
+      this._publishAbandonedGesture('proximity', 'no-cell-under-pointer');
     }
 
     if (e.altKey && this.knnEnabled && e.button === 0) {
@@ -3223,6 +3252,7 @@ export class HighlightTools {
         e.preventDefault();
         return true;
       }
+      this._publishAbandonedGesture('knn', 'no-cell-under-pointer');
     }
 
     if (e.altKey && this.cellSelectionEnabled && e.button === 0 && this.highlightMode !== 'none') {
@@ -3255,6 +3285,15 @@ export class HighlightTools {
           this.canvas.style.cursor = 'cell';
           this.canvas.classList.add('selecting');
         }
+      } else if (
+        !this.lassoEnabled
+        && !this.proximityEnabled
+        && !this.knnEnabled
+      ) {
+        // The spatial tools reach this branch too, and each has already
+        // reported its own miss; only the annotation tool owns the panel when
+        // none of them is enabled.
+        this._publishAbandonedGesture('annotation', 'no-cell-under-pointer');
       }
       e.preventDefault();
       return !!this.selectionDragStart;
@@ -3299,11 +3338,36 @@ export class HighlightTools {
             viewPositions: spatialOwner.positions,
             spatialIndex: spatialOwner.spatialIndex
           });
+          // Combine against the accumulated candidates exactly as the KNN and
+          // proximity previews do. Publishing the raw polygon hits made the
+          // existing selection disappear for the length of an add or subtract
+          // gesture, and lit the cells being removed rather than the ones that
+          // would remain.
+          const mode = this.lassoMode || 'intersect';
+          let combinedIndices;
+          if (this.lassoCandidateSet === null) {
+            combinedIndices = mode === 'subtract' ? [] : previewIndices;
+          } else if (this.lassoCandidateSet.size === 0) {
+            combinedIndices = mode === 'union' ? previewIndices : [];
+          } else if (mode === 'union') {
+            const combined = new Set(this.lassoCandidateSet);
+            for (const idx of previewIndices) combined.add(idx);
+            combinedIndices = [...combined];
+          } else if (mode === 'subtract') {
+            const newSet = new Set(previewIndices);
+            combinedIndices = [...this.lassoCandidateSet].filter(idx => !newSet.has(idx));
+          } else {
+            const newSet = new Set(previewIndices);
+            combinedIndices = [...this.lassoCandidateSet].filter(idx => newSet.has(idx));
+          }
+
           this._lassoPreviewPublished = true;
           this.lassoPreviewCallback({
             type: 'lasso-preview',
-            cellIndices: previewIndices,
-            cellCount: previewIndices.length,
+            cellIndices: combinedIndices,
+            cellCount: combinedIndices.length,
+            newCellCount: previewIndices.length,
+            mode: mode,
             polygon: [...this.lassoPath]
           });
         }
@@ -3474,7 +3538,64 @@ export class HighlightTools {
     return false;
   }
 
-  handleMouseUp(_e) {
+  /**
+   * Abandon a gesture that let go of the mouse anywhere but the render canvas.
+   *
+   * The canvas fills the window and the controls float over it, so a drag that
+   * wanders onto the sidebar keeps appending canvas-local points behind the
+   * panel. Committing that release turned a gesture aimed at a button into a
+   * selection of cells the sidebar was covering — cells the user never saw,
+   * let alone enclosed. A release that lands off the render surface belongs to
+   * whatever it landed on, so the gesture is retired and reported rather than
+   * committed.
+   *
+   * @param {MouseEvent} event
+   * @returns {boolean} true when a gesture was abandoned here
+   */
+  _abandonGestureReleasedOffView(event) {
+    // A synthetic release with no target cannot be located, and the window
+    // never dispatches one; treat only a target that is demonstrably elsewhere
+    // as off the view.
+    const target = event === null || event === undefined
+      ? undefined
+      : event.target;
+    if (
+      target === undefined
+      || target === this.canvas
+      || target === this.lassoCanvas
+    ) {
+      return false;
+    }
+    let tool = null;
+    if (this.isLassoing) tool = 'lasso';
+    else if (this.isProximityDragging) tool = 'proximity';
+    else if (this.isKnnDragging) tool = 'knn';
+    else if (this.selectionDragStart) tool = 'annotation';
+    if (tool === null) return false;
+
+    this._retireActiveSpatialInteractions();
+    if (this.isKnnDragging) {
+      this.isKnnDragging = false;
+      this.canvas.classList.remove('knn-dragging');
+      clearKnnOverlay({ canvas: this.canvas, lassoCtx: this.lassoCtx });
+      this.knnSeedCell = null;
+      this.knnCurrentDegree = 0;
+      this.updateCursorForHighlightMode();
+    }
+    if (this.selectionDragStart) {
+      this.selectionDragStart = null;
+      this.selectionDragCurrent = null;
+      this.canvas.classList.remove('selecting');
+      this.canvas.classList.remove('selecting-continuous');
+      this.updateCursorForHighlightMode();
+    }
+    this._publishAbandonedGesture(tool, 'released-off-view');
+    return true;
+  }
+
+  handleMouseUp(e) {
+    if (this._abandonGestureReleasedOffView(e)) return true;
+
     if (this.isLassoing) {
       const spatialOwner = this.lassoViewContext?.spatialOwner;
       if (
@@ -3498,36 +3619,38 @@ export class HighlightTools {
           viewPositions: spatialOwner.positions,
           spatialIndex: spatialOwner.spatialIndex
         });
-        if (selectedIndices.length > 0 || this.lassoMode === 'subtract') {
-          const newSet = new Set(selectedIndices);
+        // Every closed polygon publishes its step, including one that encloses
+        // nothing: intersecting a standing selection down to zero is an
+        // outcome the user drew on purpose, and a subtract with nothing
+        // selected yet is answered by the tool, exactly as proximity already
+        // does. Dropping either left the drag preview's wiped highlight
+        // standing under a panel still reporting the previous step.
+        const newSet = new Set(selectedIndices);
 
-          if (this.lassoCandidateSet === null) {
-            if (this.lassoMode !== 'subtract') {
-              this.lassoCandidateSet = new Set(selectedIndices);
-            }
-          } else if (this.lassoMode === 'union') {
-            for (const idx of selectedIndices) {
-              this.lassoCandidateSet.add(idx);
-            }
-          } else if (this.lassoMode === 'subtract') {
-            for (const idx of selectedIndices) {
-              this.lassoCandidateSet.delete(idx);
-            }
-          } else {
-            this.lassoCandidateSet = new Set([...this.lassoCandidateSet].filter(idx => newSet.has(idx)));
+        if (this.lassoCandidateSet === null) {
+          this.lassoCandidateSet = this.lassoMode === 'subtract'
+            ? new Set()
+            : new Set(selectedIndices);
+        } else if (this.lassoMode === 'union') {
+          for (const idx of selectedIndices) {
+            this.lassoCandidateSet.add(idx);
           }
+        } else if (this.lassoMode === 'subtract') {
+          for (const idx of selectedIndices) {
+            this.lassoCandidateSet.delete(idx);
+          }
+        } else {
+          this.lassoCandidateSet = new Set([...this.lassoCandidateSet].filter(idx => newSet.has(idx)));
+        }
 
-          if (this.lassoCandidateSet) {
-            this.lassoStepCount++;
-            if (this.lassoStepCallback) {
-              this.lassoStepCallback({
-                step: this.lassoStepCount,
-                candidateCount: this.lassoCandidateSet.size,
-                candidates: [...this.lassoCandidateSet],
-                mode: this.lassoMode
-              });
-            }
-          }
+        this.lassoStepCount++;
+        if (this.lassoStepCallback) {
+          this.lassoStepCallback({
+            step: this.lassoStepCount,
+            candidateCount: this.lassoCandidateSet.size,
+            candidates: [...this.lassoCandidateSet],
+            mode: this.lassoMode
+          });
         }
       }
       clearLassoOverlay({ canvas: this.canvas, lassoCtx: this.lassoCtx });
@@ -3626,9 +3749,12 @@ export class HighlightTools {
         const newSet = new Set(selectedIndices);
 
         if (this.knnCandidateSet === null) {
-          if (mode !== 'subtract') {
-            this.knnCandidateSet = new Set(selectedIndices);
-          }
+          // A subtract with nothing selected yet leaves an empty set, exactly
+          // as proximity does, so the release still publishes a step the tool
+          // can answer instead of vanishing under a wiped drag preview.
+          this.knnCandidateSet = mode === 'subtract'
+            ? new Set()
+            : new Set(selectedIndices);
         } else if (mode === 'union') {
           for (const idx of selectedIndices) {
             this.knnCandidateSet.add(idx);
@@ -3641,19 +3767,17 @@ export class HighlightTools {
           this.knnCandidateSet = new Set([...this.knnCandidateSet].filter(idx => newSet.has(idx)));
         }
 
-        if (this.knnCandidateSet) {
-          this.knnStepCount++;
+        this.knnStepCount++;
 
-          if (this.knnStepCallback) {
-            this.knnStepCallback({
-              step: this.knnStepCount,
-              candidateCount: this.knnCandidateSet.size,
-              candidates: [...this.knnCandidateSet],
-              mode: mode,
-              seedCellIndex: this.knnSeedCell.cellIndex,
-              degree: this.knnCurrentDegree
-            });
-          }
+        if (this.knnStepCallback) {
+          this.knnStepCallback({
+            step: this.knnStepCount,
+            candidateCount: this.knnCandidateSet.size,
+            candidates: [...this.knnCandidateSet],
+            mode: mode,
+            seedCellIndex: this.knnSeedCell.cellIndex,
+            degree: this.knnCurrentDegree
+          });
         }
       }
 

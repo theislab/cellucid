@@ -7,6 +7,10 @@
  *
  * States: STOPPED → PLAYING ↔ PAUSED → STOPPED
  *
+ * Under `prefers-reduced-motion: reduce` the loop never runs: the path
+ * completes instantly at its end keyframe instead.  CSS cannot reach a
+ * `requestAnimationFrame` camera path, so the preference is read here.
+ *
  * @module ui/modules/cinematic-camera/playback-controller
  */
 
@@ -21,6 +25,38 @@ import { readCameraBooleanOption } from '../camera-input-contract.js';
 const STOPPED = 'STOPPED';
 const PLAYING = 'PLAYING';
 const PAUSED = 'PAUSED';
+
+const REDUCED_MOTION_QUERY = '(prefers-reduced-motion: reduce)';
+
+/** @type {MediaQueryList|null} */
+let reducedMotionMedia = null;
+
+/**
+ * The user's live "reduce motion" preference.
+ *
+ * A platform without `matchMedia` cannot state a preference, so motion stays
+ * enabled there; that is the only case in which this reports `false` without
+ * having asked the platform.
+ *
+ * @returns {boolean}
+ */
+export function prefersReducedMotion() {
+  if (reducedMotionMedia === null) {
+    if (typeof globalThis.matchMedia !== 'function') return false;
+    const media = globalThis.matchMedia(REDUCED_MOTION_QUERY);
+    if (
+      media === null ||
+      typeof media !== 'object' ||
+      typeof media.matches !== 'boolean'
+    ) {
+      throw new TypeError(
+        'Reduced-motion preference requires an exact MediaQueryList.'
+      );
+    }
+    reducedMotionMedia = media;
+  }
+  return reducedMotionMedia.matches;
+}
 
 /**
  * @param {Object} options
@@ -103,6 +139,25 @@ export function createPlaybackController({ viewer, keyframeStore, getInterpolati
     return durations.reduce((s, d) => s + d, 0);
   }
 
+  // ---- Reduced motion ----
+
+  /**
+   * Settle on the exact end of the path without animating toward it.
+   *
+   * Refusing to move would strand a reduced-motion user short of the viewpoint
+   * the path exists to reach, which is not an accessible outcome for a
+   * scientific viewer. Completing instantly publishes the same final camera
+   * state the animation would have published, and `seekTo()` still reaches
+   * every intermediate viewpoint, so nothing becomes unreachable.
+   */
+  function completeWithoutMotion() {
+    const keyframes = keyframeStore.getAll();
+    const opts = getExactInterpolationOptions();
+    viewer.setCameraState(interpolateCameraState(keyframes, 1, opts));
+    emit('timeUpdate', { globalT: 1, elapsed: totalDuration, totalDuration });
+    stop({ resetCamera: false });
+  }
+
   // ---- Frame tick ----
 
   function tick() {
@@ -111,6 +166,12 @@ export function createPlaybackController({ viewer, keyframeStore, getInterpolati
     const keyframes = keyframeStore.getAll();
     if (!isCameraPathReady(keyframes)) {
       stop({ resetCamera: false });
+      return;
+    }
+
+    if (prefersReducedMotion()) {
+      // The preference turned on mid-flight: finish now rather than animate on.
+      completeWithoutMotion();
       return;
     }
 
@@ -159,6 +220,14 @@ export function createPlaybackController({ viewer, keyframeStore, getInterpolati
     totalDuration = computeTotalDuration();
     if (!Number.isFinite(totalDuration) || totalDuration <= 0) {
       throw new Error('Camera path playback requires a positive finite duration.');
+    }
+
+    if (prefersReducedMotion()) {
+      // A stated reduced-motion preference must never produce an unrequested
+      // animation, so the path completes at its end keyframe instead of
+      // starting a frame loop.
+      completeWithoutMotion();
+      return;
     }
 
     const now = performance.now() / 1000;

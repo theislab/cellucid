@@ -579,3 +579,255 @@ test('highlight viewport interactions reject absent pane camera ownership', t =>
     /camera target radius/
   );
 });
+
+// ---------------------------------------------------------------------------
+// Every Alt gesture the renderer consumes produces an observable outcome
+// ---------------------------------------------------------------------------
+
+/**
+ * A renderer wired to one cell at the origin, with every gesture callback
+ * recorded. `pickCell` decides what the pointer lands on.
+ */
+function createGestureRenderer({ pickCell, enabled = {} }) {
+  const positions = Float32Array.from([0, 0, 0]);
+  const transparency = Float32Array.of(1);
+  const owner = {
+    viewId: 'pane',
+    positions,
+    publishedPositions: positions,
+    transparency,
+    dimensionLevel: 3,
+    spatialIndex: null,
+  };
+  const published = [];
+  const record = tool => event => published.push({ tool, event });
+  const canvas = createCanvas(100, 100);
+  const tools = Object.assign(Object.create(HighlightTools.prototype), {
+    _lassoPreviewPublished: false,
+    _transparencyGenerations: new Map(),
+    _unifiedCandidateSet: null,
+    _unifiedStepCount: 0,
+    altKeyDown: true,
+    canvas,
+    cellSelectionEnabled: true,
+    getNavigationState: () => ({
+      navigationMode: 'orbit',
+      isDragging: false,
+    }),
+    getRenderContext: () => ({
+      viewMatrix: identityMatrix(),
+      modelMatrix: identityMatrix(),
+    }),
+    getSpatialQueryOwner: () => owner,
+    getViewportInfoAtScreen: () => createViewport({
+      viewId: 'pane',
+      width: 100,
+      height: 100,
+      offsetX: 0,
+      projectionShift: 0,
+    }),
+    getViewTransparency: () => transparency,
+    highlightMode: 'categorical',
+    isKnnDragging: false,
+    isLassoing: false,
+    isProximityDragging: false,
+    knnCandidateSet: null,
+    knnEnabled: false,
+    knnStepCallback: record('knn'),
+    knnStepCount: 0,
+    lassoCandidateSet: null,
+    lassoCtx: createDrawingContext(),
+    lassoEnabled: false,
+    lassoMode: 'intersect',
+    lassoPath: [],
+    lassoPreviewCallback: null,
+    lassoStepCallback: record('lasso'),
+    lassoStepCount: 0,
+    lassoViewContext: null,
+    mat4: createExactMat4(),
+    pickCellAtScreen: () => pickCell,
+    proximityCandidateSet: null,
+    proximityEnabled: false,
+    proximityStepCallback: record('proximity'),
+    selectionDragStart: null,
+    selectionStepCallback: record('annotation'),
+    ...enabled,
+  });
+  return { canvas, owner, published, tools };
+}
+
+function altMouseDown() {
+  let prevented = false;
+  return {
+    event: {
+      altKey: true,
+      button: 0,
+      clientX: 50,
+      clientY: 50,
+      ctrlKey: false,
+      metaKey: false,
+      shiftKey: false,
+      preventDefault() {
+        prevented = true;
+      },
+    },
+    wasPrevented: () => prevented,
+  };
+}
+
+test(
+  'an Alt+click that lands on no cell reports the miss instead of returning '
+  + 'without a word',
+  t => {
+    installBrowserPixelRatio(t);
+    const owner = createGestureRenderer({ pickCell: -1 });
+    const down = altMouseDown();
+
+    const handled = owner.tools.handleMouseDown(down.event);
+
+    assert.equal(handled, false, 'a miss still leaves the drag to the camera');
+    assert.equal(down.wasPrevented(), true);
+    assert.equal(owner.tools.selectionDragStart, null);
+    assert.deepEqual(owner.published, [{
+      tool: 'annotation',
+      event: {
+        abandoned: 'no-cell-under-pointer',
+        step: 0,
+        candidateCount: 0,
+      },
+    }]);
+  }
+);
+
+for (const [mode, flag] of [['knn', 'knnEnabled'], ['proximity', 'proximityEnabled']]) {
+  test(
+    `a missed Alt+click in ${mode} mode is reported by ${mode} alone`,
+    t => {
+      installBrowserPixelRatio(t);
+      const owner = createGestureRenderer({
+        pickCell: -1,
+        enabled: { [flag]: true },
+      });
+
+      owner.tools.handleMouseDown(altMouseDown().event);
+
+      assert.deepEqual(
+        owner.published.map(entry => entry.tool),
+        [mode],
+        'the tool that owns the mode owns the panel, so only it may speak'
+      );
+      assert.equal(
+        owner.published[0].event.abandoned,
+        'no-cell-under-pointer'
+      );
+    }
+  );
+}
+
+/** Arm a lasso whose polygon is `path`, ready for release. */
+function armLasso(owner, path) {
+  owner.tools.isLassoing = true;
+  owner.tools.lassoEnabled = true;
+  owner.tools.lassoPath = path;
+  owner.tools.lassoViewContext = {
+    viewId: 'pane',
+    viewport: createViewport({
+      viewId: 'pane',
+      width: 100,
+      height: 100,
+      offsetX: 0,
+      projectionShift: 0,
+    }),
+    viewMatrix: identityMatrix(),
+    modelMatrix: identityMatrix(),
+    spatialOwner: owner.owner,
+  };
+}
+
+test('a lasso that encloses no cells still publishes its step', t => {
+  installBrowserPixelRatio(t);
+  const owner = createGestureRenderer({ pickCell: -1 });
+  // The one cell projects to the canvas centre; this polygon is nowhere near it.
+  armLasso(owner, [
+    { x: 5, y: 5 },
+    { x: 15, y: 5 },
+    { x: 15, y: 15 },
+    { x: 5, y: 15 },
+  ]);
+
+  assert.equal(
+    owner.tools.handleMouseUp({ target: owner.canvas }),
+    true
+  );
+
+  assert.deepEqual(owner.published, [{
+    tool: 'lasso',
+    event: {
+      step: 1,
+      candidateCount: 0,
+      candidates: [],
+      mode: 'intersect',
+    },
+  }]);
+  assert.equal(owner.tools.lassoStepCount, 1);
+});
+
+test(
+  'a drag released off the render canvas is retired rather than committed',
+  t => {
+    installBrowserPixelRatio(t);
+    const owner = createGestureRenderer({ pickCell: -1 });
+    // This polygon does enclose the cell, so a commit here would be visible.
+    armLasso(owner, [
+      { x: 40, y: 40 },
+      { x: 60, y: 40 },
+      { x: 60, y: 60 },
+      { x: 40, y: 60 },
+    ]);
+
+    assert.equal(
+      owner.tools.handleMouseUp({ target: { tagName: 'BUTTON' } }),
+      true
+    );
+
+    assert.deepEqual(owner.published, [{
+      tool: 'lasso',
+      event: {
+        abandoned: 'released-off-view',
+        step: 0,
+        candidateCount: 0,
+      },
+    }]);
+    assert.equal(owner.tools.isLassoing, false);
+    assert.equal(owner.tools.lassoViewContext, null);
+    assert.equal(
+      owner.tools.lassoCandidateSet,
+      null,
+      'nothing may be committed by a release the view never received'
+    );
+    assert.equal(owner.tools.lassoStepCount, 0);
+  }
+);
+
+test('a release inside the render canvas still commits', t => {
+  installBrowserPixelRatio(t);
+  const owner = createGestureRenderer({ pickCell: -1 });
+  armLasso(owner, [
+    { x: 40, y: 40 },
+    { x: 60, y: 40 },
+    { x: 60, y: 60 },
+    { x: 40, y: 60 },
+  ]);
+
+  owner.tools.handleMouseUp({ target: owner.canvas });
+
+  assert.deepEqual(owner.published, [{
+    tool: 'lasso',
+    event: {
+      step: 1,
+      candidateCount: 1,
+      candidates: [0],
+      mode: 'intersect',
+    },
+  }]);
+});

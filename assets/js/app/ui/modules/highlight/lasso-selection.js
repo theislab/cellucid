@@ -8,13 +8,20 @@
  */
 
 import { debug } from '../../../../utils/debug.js';
-import { HIGHLIGHT_MODE_COPY } from './mode-copy.js';
-import { MAX_HISTORY_STEPS } from './selection-state.js';
+import {
+  abandonedGestureNotice,
+  HIGHLIGHT_MODE_COPY,
+  SELECTION_NOTICE,
+  selectionNoticeHtml
+} from './mode-copy.js';
+import { MAX_HISTORY_STEPS, selectionUnchanged } from './selection-state.js';
+import { getStepControls, removeStepControls } from './step-controls.js';
 import {
   deliverSelectionToJupyter,
   showSelectionDeliveryFailure
 } from './selection-notification.js';
 import {
+  requireCombineMode,
   requireCompletedSelectionEvent,
   requireDomElement,
   requireExactKeys,
@@ -22,6 +29,7 @@ import {
   requireHighlightSelectionState,
   requireJupyterSource,
   requireMethods,
+  requireSafeInteger,
   requireSavedHighlightGroup,
   requireSelectionPreviewEvent,
   requireSelectionStepEvent,
@@ -67,7 +75,7 @@ export function initLassoSelection(options) {
     ]
   );
   requireJupyterSource(jupyterSource);
-  requireHighlightSelectionState(selectionState);
+  requireHighlightSelectionState(selectionState, state.pointCount);
   requireExactKeys(ui, ['modeDescriptionEl'], 'Lasso selection UI');
   const highlightModeDescriptionEl = requireDomElement(
     ui.modeDescriptionEl,
@@ -106,7 +114,7 @@ export function initLassoSelection(options) {
 
   function handleLassoSelection(lassoEvent) {
     if (destroyed) return;
-    requireCompletedSelectionEvent(lassoEvent, 'lasso');
+    requireCompletedSelectionEvent(lassoEvent, 'lasso', state.pointCount);
 
     const stepsLabel = lassoEvent.steps > 1 ? ` (${lassoEvent.steps} views)` : '';
     const savedGroup = state.addHighlightDirect({
@@ -117,8 +125,9 @@ export function initLassoSelection(options) {
     requireSavedHighlightGroup(
       savedGroup,
       'lasso',
-      lassoEvent.cellCount,
-      'Saved lasso highlight group'
+      lassoEvent.cellIndices,
+      'Saved lasso highlight group',
+      state.pointCount
     );
 
     debug.log(`[UI] Lasso selected ${lassoEvent.cellCount} cells from ${lassoEvent.steps} view(s)`);
@@ -140,7 +149,7 @@ export function initLassoSelection(options) {
 
   function handleLassoStep(stepEvent) {
     if (destroyed) return;
-    requireSelectionStepEvent(stepEvent, 'lasso');
+    requireSelectionStepEvent(stepEvent, 'lasso', state.pointCount);
     if (stepEvent.cancelled) {
       selectionState.lassoHistory = [];
       selectionState.lassoRedoStack = [];
@@ -150,17 +159,38 @@ export function initLassoSelection(options) {
       state.clearPreviewHighlight();
       return;
     }
-
-    if (selectionState.lastLassoCandidates !== null || selectionState.lastLassoStep > 0) {
-      selectionState.lassoHistory.push({
-        candidates: selectionState.lastLassoCandidates ? [...selectionState.lastLassoCandidates] : null,
-        step: selectionState.lastLassoStep
-      });
-      if (selectionState.lassoHistory.length > MAX_HISTORY_STEPS) {
-        selectionState.lassoHistory.shift();
-      }
-      selectionState.lassoRedoStack = [];
+    if (stepEvent.abandoned !== undefined) {
+      renderLassoState(abandonedGestureNotice(stepEvent.abandoned));
+      return;
     }
+
+    if (
+      selectionUnchanged(
+        selectionState.lastLassoCandidates,
+        stepEvent.candidates
+      )
+    ) {
+      // Roll the renderer's own step counter back, or the next real step is
+      // numbered as if this one had happened.
+      viewer.restoreLassoState(
+        selectionState.lastLassoCandidates,
+        selectionState.lastLassoStep
+      );
+      renderLassoState(SELECTION_NOTICE.unchanged);
+      return;
+    }
+
+    // The empty state before the first step is recorded like any other, so
+    // Undo can reach it — the annotation tool has always done this, and a
+    // greyed-out Undo immediately after drawing reads as a broken control.
+    selectionState.lassoHistory.push({
+      candidates: selectionState.lastLassoCandidates ? [...selectionState.lastLassoCandidates] : null,
+      step: selectionState.lastLassoStep
+    });
+    if (selectionState.lassoHistory.length > MAX_HISTORY_STEPS) {
+      selectionState.lassoHistory.shift();
+    }
+    selectionState.lassoRedoStack = [];
 
     selectionState.lastLassoCandidates = [...stepEvent.candidates];
     selectionState.lastLassoStep = stepEvent.step;
@@ -235,8 +265,15 @@ export function initLassoSelection(options) {
     requireSelectionPreviewEvent(
       previewEvent,
       'lasso',
-      ['polygon']
+      state.pointCount,
+      ['polygon', 'mode', 'newCellCount']
     );
+    requireSafeInteger(
+      previewEvent.newCellCount,
+      'Lasso preview newCellCount',
+      0
+    );
+    requireCombineMode(previewEvent.mode, 'Lasso preview');
     if (!Array.isArray(previewEvent.polygon) || previewEvent.polygon.length < 3) {
       throw new TypeError(
         'Lasso preview polygon must contain at least three points.'
@@ -247,6 +284,9 @@ export function initLassoSelection(options) {
       requireFiniteNumber(point.x, 'Lasso preview polygon x');
       requireFiniteNumber(point.y, 'Lasso preview polygon y');
     }
+    // cellIndices is the combined set the release would commit, exactly as the
+    // KNN and proximity previews publish it; newCellCount is this polygon's own
+    // hit count before combining.
     if (previewEvent.cellIndices.length === 0) {
       state.clearPreviewHighlight();
     } else {
@@ -255,61 +295,63 @@ export function initLassoSelection(options) {
   }
 
   function getLassoControls() {
-    let controls = documentOwner.getElementById('lasso-step-controls');
-    const created = controls === null;
-    if (created) {
-      controls = documentOwner.createElement('div');
-      controls.id = 'lasso-step-controls';
-      controls.className = 'lasso-step-controls';
-      controls.innerHTML = `
-        <button type="button" class="btn-small lasso-confirm" id="lasso-confirm-btn">Confirm</button>
-        <button type="button" class="btn-small btn-undo" id="lasso-undo-btn" title="Undo">↩</button>
-        <button type="button" class="btn-small btn-redo" id="lasso-redo-btn" title="Redo">↪</button>
-        <button type="button" class="btn-small lasso-cancel" id="lasso-cancel-btn">Cancel</button>
-      `;
-      highlightModeDescriptionEl.parentElement.appendChild(controls);
-    }
-
-    const undoButton = requireDomElement(
-      documentOwner.getElementById('lasso-undo-btn'),
-      'Lasso undo button',
-      ['addEventListener']
-    );
-    const redoButton = requireDomElement(
-      documentOwner.getElementById('lasso-redo-btn'),
-      'Lasso redo button',
-      ['addEventListener']
-    );
-    const confirmButton = requireDomElement(
-      documentOwner.getElementById('lasso-confirm-btn'),
-      'Lasso confirm button',
-      ['addEventListener']
-    );
-    const cancelButton = requireDomElement(
-      documentOwner.getElementById('lasso-cancel-btn'),
-      'Lasso cancel button',
-      ['addEventListener']
-    );
-    if (created) {
-      listen(undoButton, 'click', handleLassoUndo);
-      listen(redoButton, 'click', handleLassoRedo);
-      listen(confirmButton, 'click', () => {
-        viewer.confirmLassoSelection();
-        state.clearPreviewHighlight();
-      });
-      listen(cancelButton, 'click', () => {
-        viewer.cancelLassoSelection();
-      });
-    }
-    return { undoButton, redoButton, confirmButton };
+    return getStepControls({
+      documentOwner,
+      tool: 'lasso',
+      parent: highlightModeDescriptionEl.parentElement,
+      listen,
+      handlers: {
+        undo: handleLassoUndo,
+        redo: handleLassoRedo,
+        confirm: () => {
+          viewer.confirmLassoSelection();
+          state.clearPreviewHighlight();
+        },
+        cancel: () => {
+          viewer.cancelLassoSelection();
+        }
+      }
+    });
   }
 
-  function updateLassoUI(stepEvent) {
+  /**
+   * Re-publish what the tool already holds, with one explanatory notice.
+   *
+   * The live preview repaints the highlight while the polygon is being drawn,
+   * so a gesture that commits no step still has to restore the standing
+   * selection the preview painted over.
+   */
+  function renderLassoState(notice) {
+    const candidates = selectionState.lastLassoCandidates;
+    if (candidates === null) {
+      updateLassoUI(null, notice);
+      state.clearPreviewHighlight();
+      return;
+    }
+    if (candidates.length === 0) {
+      updateLassoUI({ step: 0, candidateCount: 0, keepControls: true }, notice);
+      state.clearPreviewHighlight();
+      return;
+    }
+    updateLassoUI({
+      step: selectionState.lastLassoStep,
+      candidateCount: candidates.length,
+      restored: true
+    }, notice);
+    state.setPreviewHighlightFromIndices(candidates);
+  }
+
+  function updateLassoUI(stepEvent, notice = '') {
     if (destroyed) return;
+    const noticeHtml = selectionNoticeHtml(notice);
     if (!stepEvent || (stepEvent.step === 0 && !stepEvent.keepControls)) {
-      highlightModeDescriptionEl.innerHTML = HIGHLIGHT_MODE_COPY.lasso;
-      const existingControls = documentOwner.getElementById('lasso-step-controls');
-      if (existingControls) existingControls.remove();
+      highlightModeDescriptionEl.innerHTML =
+        `${HIGHLIGHT_MODE_COPY.lasso}${noticeHtml}`;
+      removeStepControls(
+        documentOwner,
+        'lasso',
+        highlightModeDescriptionEl.parentElement
+      );
       return;
     }
 
@@ -322,7 +364,7 @@ export function initLassoSelection(options) {
       redoButton.disabled = selectionState.lassoRedoStack.length === 0;
       confirmButton.disabled = true;
 
-      highlightModeDescriptionEl.innerHTML = stepInfo;
+      highlightModeDescriptionEl.innerHTML = `${stepInfo}${noticeHtml}`;
       return;
     }
 
@@ -344,12 +386,12 @@ export function initLassoSelection(options) {
     redoButton.disabled = selectionState.lassoRedoStack.length === 0;
     confirmButton.disabled = stepEvent.candidateCount === 0;
 
-    highlightModeDescriptionEl.innerHTML = stepInfo;
+    highlightModeDescriptionEl.innerHTML = `${stepInfo}${noticeHtml}`;
   }
 
   function restoreLassoSelection(unifiedState) {
     if (destroyed) return;
-    requireUnifiedSelectionState(unifiedState);
+    requireUnifiedSelectionState(unifiedState, state.pointCount);
     selectionState.lassoHistory = [];
     selectionState.lassoRedoStack = [];
     selectionState.lastLassoCandidates = unifiedState.inProgress

@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { getWorkerPool } from '../assets/js/app/analysis/compute/worker-pool.js';
+import { computeCategoryGroupingDigest } from '../assets/js/app/analysis/data/data-layer.js';
 import { GenesPanelController } from '../assets/js/app/analysis/genes-panel/genes-panel-controller.js';
 import { MarkerCache } from '../assets/js/app/analysis/genes-panel/marker-cache.js';
 import { MarkerDiscoveryEngine } from '../assets/js/app/analysis/genes-panel/marker-discovery-engine.js';
@@ -155,7 +156,6 @@ function createWorkerMarkerResult() {
   return {
     nAll: 2,
     pValues: Float64Array.from([0.01, 0.02]),
-    statistics: Float32Array.from([2, -2]),
     log2FoldChange: Float32Array.from([1, -1]),
     meanInGroup: Float32Array.from([2, 1]),
     meanOutGroup: Float32Array.from([1, 2]),
@@ -1277,6 +1277,7 @@ test('marker hot cache isolates mutable result envelopes from UI threshold rebui
     foldChangeThreshold: 1,
     useAdjustedPValue: true,
     minCells: 1,
+    groupingDigest: computeCategoryGroupingDigest(Uint16Array.from([0, 1])),
   };
   const cache = new MarkerCache({
     datasetId: 'cache-ownership-audit',
@@ -1371,4 +1372,512 @@ test('controller marker cache keys own min-cell semantics', async () => {
   } finally {
     await Promise.all([first.close(), second.close()]);
   }
+});
+
+function createMarkerGroupingAuditController(obsCodes, observedParams) {
+  const markers = {
+    obsCategory: 'category',
+    groups: {
+      a: { groupId: 'a', markers: [{ gene: 'GENE' }] },
+      b: { groupId: 'b', markers: [{ gene: 'GENE' }] },
+    },
+  };
+  const controller = new GenesPanelController({
+    dataLayer: {},
+    config: { minCells: 1 },
+  });
+  controller._initialized = true;
+  controller._getDatasetId = () => 'grouping-identity-audit';
+  controller._getGroupsFromCategory = async () => ({
+    groups: [{ groupId: 'a' }, { groupId: 'b' }],
+    obsCodes,
+  });
+  controller._cache = {
+    setDatasetId() {},
+    async get(_category, params) {
+      observedParams.push({ ...params });
+      return markers;
+    },
+    close() {},
+  };
+  controller._matrixBuilder = {
+    async buildMatrix() {
+      return { genes: ['GENE'] };
+    },
+  };
+  return controller;
+}
+
+test('category grouping digest is the exact per-cell code assignment', () => {
+  const base = Uint16Array.from([0, 0, 1, 1, 2, 2]);
+  assert.match(computeCategoryGroupingDigest(base), /^[0-9a-f]{32}$/);
+  assert.equal(
+    computeCategoryGroupingDigest(base),
+    computeCategoryGroupingDigest(Uint16Array.from([0, 0, 1, 1, 2, 2])),
+    'the same grouping must produce the same digest',
+  );
+
+  // One cell moved between groups. Group sizes are unchanged, so any digest
+  // built from cardinality alone would collide here.
+  assert.notEqual(
+    computeCategoryGroupingDigest(base),
+    computeCategoryGroupingDigest(Uint16Array.from([0, 1, 0, 1, 2, 2])),
+    'a single reassigned cell must change the digest',
+  );
+
+  // Merging two categories: every cell coded 2 becomes 1. This is exactly what
+  // an in-place category merge does to a user-defined field.
+  assert.notEqual(
+    computeCategoryGroupingDigest(base),
+    computeCategoryGroupingDigest(Uint16Array.from([0, 0, 1, 1, 1, 1])),
+    'a merged category must change the digest',
+  );
+
+  // Moving a category to "unassigned" (the 65535 missing marker).
+  assert.notEqual(
+    computeCategoryGroupingDigest(base),
+    computeCategoryGroupingDigest(Uint16Array.from([0, 0, 1, 1, 65535, 65535])),
+    'cells moved to unassigned must change the digest',
+  );
+
+  for (const invalid of [null, undefined, new Uint16Array(0), [0, 1], Uint32Array.from([0, 1])]) {
+    assert.throws(
+      () => computeCategoryGroupingDigest(invalid),
+      /non-empty Uint16Array/i,
+    );
+  }
+});
+
+test('marker cache entries are addressed by the grouping they were computed over', async () => {
+  const cache = new MarkerCache({
+    datasetId: 'grouping-identity-audit',
+    maxCategories: 4,
+  });
+  const baseParams = {
+    method: 'wilcox',
+    topNPerGroup: 10,
+    pValueThreshold: 0.05,
+    foldChangeThreshold: 1,
+    useAdjustedPValue: true,
+    minCells: 10,
+  };
+  const beforeEdit = {
+    ...baseParams,
+    groupingDigest: computeCategoryGroupingDigest(
+      Uint16Array.from([0, 0, 1, 1, 2, 2]),
+    ),
+  };
+  const afterMerge = {
+    ...baseParams,
+    groupingDigest: computeCategoryGroupingDigest(
+      Uint16Array.from([0, 0, 1, 1, 1, 1]),
+    ),
+  };
+
+  await cache.set('cell_type', { marker: 'before' }, beforeEdit);
+  assert.deepEqual(await cache.get('cell_type', beforeEdit), { marker: 'before' });
+  assert.equal(
+    await cache.get('cell_type', afterMerge),
+    null,
+    'a rewritten grouping must not read the previous grouping\'s markers',
+  );
+
+  await assert.rejects(
+    async () => cache.get('cell_type', baseParams),
+    /groupingDigest/,
+    'omitting the grouping identity is a caller defect, not a cache miss',
+  );
+  await assert.rejects(
+    async () => cache.set('cell_type', { marker: 'x' }, {
+      ...baseParams,
+      groupingDigest: 'not-a-digest',
+    }),
+    /groupingDigest/,
+  );
+  cache.close();
+});
+
+test('controller marker cache keys own grouping identity', async () => {
+  const beforeObserved = [];
+  const before = createMarkerGroupingAuditController(
+    Uint16Array.from([0, 0, 1, 1, 2, 2]),
+    beforeObserved,
+  );
+  const afterObserved = [];
+  // The same category key after an in-place merge of codes 1 and 2.
+  const after = createMarkerGroupingAuditController(
+    Uint16Array.from([0, 0, 1, 1, 1, 1]),
+    afterObserved,
+  );
+  try {
+    await before.runAnalysis({ obsCategory: 'category', mode: 'ranked' });
+    await after.runAnalysis({ obsCategory: 'category', mode: 'ranked' });
+
+    assert.match(beforeObserved[0].groupingDigest, /^[0-9a-f]{32}$/);
+    assert.notEqual(
+      canonicalCacheParams(beforeObserved[0]),
+      canonicalCacheParams(afterObserved[0]),
+      'markers computed over different groupings must not share a cache key',
+    );
+  } finally {
+    await Promise.all([before.close(), after.close()]);
+  }
+});
+
+// =============================================================================
+// UNTESTABLE MARKER GROUPS
+//
+// A group is compared against the rest one gene at a time, and data-worker.js
+// runs that comparison only when the group and the rest each hold at least
+// max(2, minCells) cells with a measured value for the gene. Otherwise it leaves
+// NaN. Direct AnnData reaches the panel through getGeneExpression, which passes
+// X through without a finiteness check, so a gene with missing values is an
+// ordinary input rather than a corrupt one.
+//
+// Every constant below is the value SciPy 1.16.3 produces on the same fixture:
+//   scipy.stats.mannwhitneyu(group, rest, alternative='two-sided',
+//                            method='asymptotic', use_continuity=True)
+//   scipy.stats.false_discovery_control(tested_p_values, method='bh')
+// with the correction applied to the tested subset only.
+// =============================================================================
+
+const UNTESTABLE_GROUP_CELLS = 12;
+const UNTESTABLE_MIN_CELLS = 10;
+const UNTESTABLE_LOW = [0, 0, 1, 0, 2, 1, 0, 0, 1, 0, 0, 1];
+const UNTESTABLE_HIGH = [3, 4, 3, 5, 4, 3, 4, 6, 5, 4, 3, 4];
+const UNTESTABLE_OTHER = [0, 1, 0, 0, 1, 0, 2, 0, 0, 1, 0, 0];
+const UNTESTABLE_MISSING = new Array(UNTESTABLE_GROUP_CELLS).fill(Number.NaN);
+
+const UNTESTABLE_GENES = {
+  // Measured everywhere: all three groups are compared.
+  GENE_ALL: [...UNTESTABLE_LOW, ...UNTESTABLE_HIGH, ...UNTESTABLE_OTHER],
+  // Missing across the whole third group: groups one and two still compare
+  // 12 against 12, the third has nothing to compare.
+  GENE_PARTIAL: [...UNTESTABLE_LOW, ...UNTESTABLE_HIGH, ...UNTESTABLE_MISSING],
+  // Three measured cells in total: no group clears the min-cell rule, and the
+  // rest of the sample is empty for the one group that has any cells at all.
+  GENE_SPARSE: [
+    1, 2, 3, ...new Array(UNTESTABLE_GROUP_CELLS - 3).fill(Number.NaN),
+    ...UNTESTABLE_MISSING,
+    ...UNTESTABLE_MISSING,
+  ],
+  // Measured nowhere: nAll is zero.
+  GENE_ABSENT: [
+    ...UNTESTABLE_MISSING,
+    ...UNTESTABLE_MISSING,
+    ...UNTESTABLE_MISSING,
+  ],
+};
+
+function assertRelativeValue(actual, expected, label, relativeTolerance = 1e-12) {
+  assert.ok(
+    Math.abs(actual - expected) <= Math.abs(expected) * relativeTolerance,
+    `${label}: ${actual} is not within ${relativeTolerance} relative of ${expected}`,
+  );
+}
+
+function createUntestableMarkerFixture() {
+  const geneKeys = Object.keys(UNTESTABLE_GENES);
+  const totalCells = UNTESTABLE_GROUP_CELLS * 3;
+  const obsCodes = new Uint16Array(totalCells);
+  for (let cell = 0; cell < totalCells; cell++) {
+    obsCodes[cell] = Math.floor(cell / UNTESTABLE_GROUP_CELLS);
+  }
+  const groups = [0, 1, 2].map(groupCode => ({
+    groupId: `group-${groupCode}`,
+    groupName: `Group ${groupCode}`,
+    groupCode,
+    cellIndices: Uint32Array.from(
+      { length: UNTESTABLE_GROUP_CELLS },
+      (_unused, offset) => groupCode * UNTESTABLE_GROUP_CELLS + offset,
+    ),
+    cellCount: UNTESTABLE_GROUP_CELLS,
+    color: '#123456',
+  }));
+
+  const dataLayer = {
+    state: { pointCount: totalCells },
+    getAvailableVariables(kind) {
+      assert.equal(kind, 'gene_expression');
+      return geneKeys.map(key => ({ key, name: key }));
+    },
+    async ensureGeneExpressionLoaded(gene, options) {
+      assert.deepEqual(options, { silent: true });
+      return { values: Float32Array.from(UNTESTABLE_GENES[gene]) };
+    },
+    unloadGeneExpression() {
+      return true;
+    },
+    invalidateVariable() {},
+  };
+
+  const engine = new MarkerDiscoveryEngine({
+    dataLayer,
+    config: {
+      minCells: UNTESTABLE_MIN_CELLS,
+      progressInterval: 1,
+      batchSize: 1,
+      networkConcurrency: 1,
+      memoryBudgetMB: 1,
+    },
+  });
+
+  return {
+    engine,
+    geneKeys,
+    options: {
+      obsCategory: 'untestable-groups',
+      groups,
+      obsCodes,
+      geneList: geneKeys,
+      method: 'wilcox',
+      topNPerGroup: 'all',
+      minCells: UNTESTABLE_MIN_CELLS,
+      pValueThreshold: 1,
+      foldChangeThreshold: 0,
+      useAdjustedPValue: false,
+      parallelism: 1,
+      batchConfig: {
+        preloadCount: 1,
+        networkConcurrency: 1,
+        memoryBudgetMB: 1,
+      },
+    },
+  };
+}
+
+async function withRealMarkerWorkerPool(callback) {
+  const messages = [];
+  globalThis.self = { postMessage: message => messages.push(message) };
+  await import(
+    '../assets/js/app/analysis/compute/data-worker.js?untestable-marker-groups'
+  );
+  let requestCounter = 0;
+  const dispatch = (type, payload) => {
+    const requestId = `untestable-${requestCounter++}`;
+    globalThis.self.onmessage({ data: { type, payload, requestId } });
+    const message = messages.at(-1);
+    assert.equal(message.requestId, requestId);
+    assert.equal(message.success, true, message.error);
+    return message.result;
+  };
+
+  try {
+    return await withPatchedWorkerPool(
+      readyPoolOverrides({
+        async broadcast(type, createPayload) {
+          return [dispatch(type, createPayload(0))];
+        },
+        async execute(type, payload) {
+          return dispatch(type, payload);
+        },
+      }),
+      callback,
+    );
+  } finally {
+    delete globalThis.self;
+  }
+}
+
+test('a group that could not be tested is reported, not treated as a defect', async () => {
+  const { engine, geneKeys, options } = createUntestableMarkerFixture();
+
+  const result = await withRealMarkerWorkerPool(
+    () => engine.discoverMarkers(options),
+  );
+
+  const geneIndex = Object.fromEntries(
+    geneKeys.map((gene, index) => [gene, index]),
+  );
+  assert.deepEqual(result.stats.genes, geneKeys);
+  assert.equal(result.minCellsPerSide, UNTESTABLE_MIN_CELLS);
+
+  // scipy.stats.mannwhitneyu on the same Float32 fixture. `null` marks the
+  // (group, gene) pairs where one side held fewer than 10 measured cells, so no
+  // comparison was run at all.
+  const scipyPValues = {
+    'group-0': {
+      GENE_ALL: 0.020701755492849257,
+      GENE_PARTIAL: 0.00002465264969586051,
+      GENE_SPARSE: null,
+      GENE_ABSENT: null,
+    },
+    'group-1': {
+      GENE_ALL: 4.908663904833548e-7,
+      GENE_PARTIAL: 0.00002465264969586051,
+      GENE_SPARSE: null,
+      GENE_ABSENT: null,
+    },
+    'group-2': {
+      GENE_ALL: 0.006956001858611514,
+      GENE_PARTIAL: null,
+      GENE_SPARSE: null,
+      GENE_ABSENT: null,
+    },
+  };
+
+  // scipy.stats.false_discovery_control over the tested subset of each group.
+  // The denominators are 2, 2 and 1 — never 4. Group 2's single tested gene is
+  // the sharpest case: with the untested genes counted its adjusted value would
+  // be 0.006956 * 4 = 0.0278 instead of the p-value itself.
+  const scipyAdjusted = {
+    'group-0': {
+      GENE_ALL: 0.020701755492849257,
+      GENE_PARTIAL: 0.00004930529939172102,
+    },
+    'group-1': {
+      GENE_ALL: 9.817327809667096e-7,
+      GENE_PARTIAL: 0.00002465264969586051,
+    },
+    'group-2': {
+      GENE_ALL: 0.006956001858611514,
+    },
+  };
+
+  const expectedCounts = {
+    'group-0': { genesTested: 2, genesUntestable: 2 },
+    'group-1': { genesTested: 2, genesUntestable: 2 },
+    'group-2': { genesTested: 1, genesUntestable: 3 },
+  };
+
+  for (let g = 0; g < result.stats.groupIds.length; g++) {
+    const groupId = result.stats.groupIds[g];
+    const rawLane = result.stats.pValuesByGroup[g];
+    const adjustedLane = result.stats.adjustedPValuesByGroup[g];
+    assert.ok(adjustedLane instanceof Float64Array, groupId);
+
+    for (const gene of geneKeys) {
+      const index = geneIndex[gene];
+      const expectedRaw = scipyPValues[groupId][gene];
+      if (expectedRaw === null) {
+        assert.ok(
+          Number.isNaN(rawLane[index]),
+          `${groupId}/${gene} must carry no p-value`,
+        );
+        assert.ok(
+          Number.isNaN(adjustedLane[index]),
+          `${groupId}/${gene} must carry no adjusted p-value`,
+        );
+        continue;
+      }
+      assertRelativeValue(rawLane[index], expectedRaw, `${groupId}/${gene} p`);
+      assertRelativeValue(
+        adjustedLane[index],
+        scipyAdjusted[groupId][gene],
+        `${groupId}/${gene} adjusted`,
+      );
+    }
+
+    const group = result.groups[groupId];
+    assert.equal(group.genesTested, expectedCounts[groupId].genesTested, groupId);
+    assert.equal(
+      group.genesUntestable,
+      expectedCounts[groupId].genesUntestable,
+      groupId,
+    );
+    assert.equal(
+      group.genesTested + group.genesUntestable,
+      geneKeys.length,
+      `${groupId} counts must partition the panel`,
+    );
+
+    // Only tested genes can be ranked. An untested gene has no probability, so
+    // it is absent from the list rather than sorted in at the bottom.
+    for (const marker of group.markers) {
+      assert.notEqual(
+        scipyPValues[groupId][marker.gene],
+        null,
+        `${groupId} ranked "${marker.gene}", which was never tested`,
+      );
+      assert.ok(Number.isFinite(marker.pValue), `${groupId}/${marker.gene}`);
+      assert.ok(
+        Number.isFinite(marker.adjustedPValue),
+        `${groupId}/${marker.gene}`,
+      );
+    }
+    assert.deepEqual(
+      group.markers.map(marker => marker.gene).sort(),
+      Object.keys(scipyAdjusted[groupId]).sort(),
+      groupId,
+    );
+  }
+});
+
+/**
+ * Minimal element stub for the one caption builder under test: it appends text
+ * nodes and <strong> children and reads them back through textContent.
+ */
+class SummaryElementStub {
+  constructor(tagName) {
+    this.tagName = tagName;
+    this.className = '';
+    this.hidden = false;
+    this.childNodes = [];
+    this._text = '';
+  }
+
+  set textContent(value) {
+    this._text = String(value);
+    this.childNodes = [];
+  }
+
+  get textContent() {
+    if (this.childNodes.length === 0) return this._text;
+    return this.childNodes
+      .map(node => (typeof node === 'string' ? node : node.textContent))
+      .join('');
+  }
+
+  append(...nodes) {
+    for (const node of nodes) this.childNodes.push(node);
+  }
+}
+
+function withSummaryDOM(run) {
+  const previous = globalThis.document;
+  globalThis.document = {
+    createElement(tagName) {
+      return new SummaryElementStub(tagName);
+    },
+  };
+  try {
+    return run();
+  } finally {
+    if (previous === undefined) delete globalThis.document;
+    else globalThis.document = previous;
+  }
+}
+
+test('the genes panel states the denominator each marker group was corrected over', () => {
+  withSummaryDOM(() => {
+  const ui = Object.create(GenesPanelUI.prototype);
+
+  const tested = ui._createGroupTestingSummary(
+    { genesTested: 1, genesUntestable: 3 },
+    10,
+  );
+  assert.equal(tested.hidden, false);
+  assert.equal(
+    tested.textContent,
+    '1 genes tested (FDR denominator) · 3 not tested (fewer than 10 cells '
+      + 'with a measured value in this group or in the rest)',
+  );
+
+  const complete = ui._createGroupTestingSummary(
+    { genesTested: 2000, genesUntestable: 0 },
+    10,
+  );
+  assert.equal(
+    complete.textContent,
+    `${(2000).toLocaleString()} genes tested (FDR denominator)`,
+  );
+
+  // Partial emissions have corrected nothing yet and must claim no denominator.
+  const partial = ui._createGroupTestingSummary(
+    { genesTested: null, genesUntestable: null },
+    10,
+  );
+  assert.equal(partial.hidden, true);
+  assert.equal(partial.textContent, '');
+  });
 });

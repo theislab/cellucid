@@ -27,6 +27,25 @@ export const NONE_DATASET_VALUE = '__none__';
 const LOADING_DATASET_VALUE = '__catalog_loading__';
 const EMPTY_CATALOG_VALUE = '__catalog_empty__';
 const CATALOG_ERROR_VALUE = '__catalog_error__';
+const CATALOG_RETRY_LABEL = 'Try again';
+const CATALOG_RETRYING_LABEL = 'Retrying…';
+const CATALOG_TOTAL_FAILURE_MESSAGE =
+  'The dataset list could not be loaded — this is usually a lost or ' +
+  'blocked connection. Check your network, then try again.';
+
+/**
+ * One human name per registered source type, used both for the dropdown's
+ * group headings and for the recovery notice, so a source is called the same
+ * thing wherever the user meets it.
+ */
+const SOURCE_DISPLAY_NAMES = {
+  'github-repo': 'GitHub data',
+  jupyter: 'Jupyter data',
+  'local-demo': 'Sample datasets',
+  'local-user': 'Your data',
+  remote: 'Remote server data'
+};
+
 const DATASET_CONTROL_KEYS = [
   'callbacks',
   'clearDataset',
@@ -73,6 +92,18 @@ function requireNonEmptyString(value, name) {
     throw new TypeError(`${name} must be a non-empty string.`);
   }
   return value;
+}
+
+function sourceDisplayName(sourceType) {
+  requireNonEmptyString(sourceType, 'Dataset source type');
+  return Object.hasOwn(SOURCE_DISPLAY_NAMES, sourceType)
+    ? SOURCE_DISPLAY_NAMES[sourceType]
+    : sourceType;
+}
+
+function formatSourceList(names) {
+  if (names.length === 1) return names[0];
+  return `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`;
 }
 
 function requireExactKeys(value, expectedKeys, name) {
@@ -165,7 +196,7 @@ function requireCatalog(catalog) {
   const records = catalog.map((record, sourceIndex) => {
     requireExactKeys(
       record,
-      ['datasets', 'sourceType'],
+      ['datasets', 'error', 'sourceType'],
       `Dataset catalog source ${sourceIndex}`
     );
     requireNonEmptyString(
@@ -181,6 +212,19 @@ function requireCatalog(catalog) {
     if (!Array.isArray(record.datasets)) {
       throw new TypeError(
         `Dataset catalog source "${record.sourceType}" datasets must be an array.`
+      );
+    }
+    // A source that could not be probed reports its own failure and no
+    // datasets. A source that is merely unavailable is never reported at all,
+    // so these two states are already distinct before the UI sees them.
+    if (record.error !== null && !(record.error instanceof Error)) {
+      throw new TypeError(
+        `Dataset catalog source "${record.sourceType}" error must be an Error or null.`
+      );
+    }
+    if (record.error !== null && record.datasets.length !== 0) {
+      throw new TypeError(
+        `Dataset catalog source "${record.sourceType}" cannot report both datasets and a failure.`
       );
     }
     const datasets = record.datasets.map((metadata, datasetIndex) => {
@@ -201,7 +245,7 @@ function requireCatalog(catalog) {
       seenDatasetKeys.add(datasetKey);
       return metadata;
     });
-    return { sourceType: record.sourceType, datasets };
+    return { sourceType: record.sourceType, datasets, error: record.error };
   });
   return records;
 }
@@ -317,6 +361,13 @@ export function initDatasetControls(options) {
   ) {
     throw new TypeError('Dataset select must provide an ownerDocument.');
   }
+  // The recovery notice explains the selector standing next to it, so it lives
+  // in the selector's own control block rather than in the dataset info panel,
+  // which describes the dataset that is currently loaded.
+  const datasetSelectBlock = datasetSelect.parentNode;
+  requireElement(datasetSelectBlock, 'Dataset select control block', [
+    'appendChild'
+  ]);
   const datasetOptionsByKey = new Map();
   const lifecycleController = new AbortController();
   const activeWork = new Set();
@@ -325,6 +376,7 @@ export function initDatasetControls(options) {
   let datasetSelectionIntentGeneration = 0;
   let activeDatasetSelectionIntent = null;
   let datasetConnections = null;
+  let catalogRetryInFlight = false;
   let destroyed = false;
   let destroyPromise = null;
 
@@ -403,6 +455,95 @@ export function initDatasetControls(options) {
     datasetOptionsByKey.set(value, option);
     return option;
   }
+
+  // =========================================================================
+  // Catalog recovery notice
+  // =========================================================================
+  // A source whose probe failed is reported by the manager as an entry that
+  // carries an error and no datasets. A source that is merely unavailable —
+  // GitHub with no repository connected, a remote server nobody has pointed at
+  // — is not reported at all. Those are already distinct states before the UI
+  // sees them, so the notice speaks only for genuine failures and an
+  // unconfigured source stays silent.
+  //
+  // refreshAll()'s own per-source outcomes are deliberately not surfaced here:
+  // an unconnected GitHub source rejects refresh() while reporting itself
+  // unavailable to a probe, so reporting refresh outcomes would accuse a
+  // source the user never asked for. The probe result is the only authority.
+  const catalogNoticeMessageEl = ownerDocument.createElement('div');
+  const catalogRetryButton = ownerDocument.createElement('button');
+  catalogRetryButton.type = 'button';
+  catalogRetryButton.classList.add('reset-btn', 'mt-1');
+  catalogRetryButton.textContent = CATALOG_RETRY_LABEL;
+  const catalogNotice = ownerDocument.createElement('div');
+  catalogNotice.classList.add('dataset-info');
+  catalogNotice.setAttribute('role', 'status');
+  catalogNotice.setAttribute('aria-live', 'polite');
+  catalogNotice.hidden = true;
+  catalogNotice.appendChild(catalogNoticeMessageEl);
+  catalogNotice.appendChild(catalogRetryButton);
+  datasetSelectBlock.appendChild(catalogNotice);
+
+  function setCatalogNotice(message) {
+    requireNonEmptyString(message, 'Dataset catalog notice message');
+    catalogNoticeMessageEl.textContent = message;
+    catalogRetryButton.disabled = false;
+    catalogRetryButton.textContent = CATALOG_RETRY_LABEL;
+    catalogNotice.hidden = false;
+  }
+
+  function clearCatalogNotice() {
+    catalogNoticeMessageEl.textContent = '';
+    catalogRetryButton.disabled = false;
+    catalogRetryButton.textContent = CATALOG_RETRY_LABEL;
+    catalogNotice.hidden = true;
+  }
+
+  // The retry keeps its own notice on screen while it runs. Hiding it would
+  // pull the affordance out from under the pointer that just used it, and the
+  // disabled label is the only confirmation the click was registered.
+  function markCatalogNoticeRetrying() {
+    if (catalogNotice.hidden) return;
+    catalogRetryButton.disabled = true;
+    catalogRetryButton.textContent = CATALOG_RETRYING_LABEL;
+  }
+
+  /**
+   * One sentence naming every source that failed, in the same words the
+   * dropdown uses for it. Loader Error messages are transport diagnostics, so
+   * they are never shown; the notice names the source and the likely cause.
+   *
+   * @param {{sourceType: string, error: Error|null}[]} records
+   * @returns {string|null}
+   */
+  function describeFailedSources(records) {
+    const failed = records.filter(record => record.error !== null);
+    if (failed.length === 0) return null;
+    const names = formatSourceList(
+      failed.map(record => sourceDisplayName(record.sourceType))
+    );
+    return (
+      `${names} could not be loaded — this is usually a lost or blocked ` +
+      'connection. Check your network, then try again.'
+    );
+  }
+
+  function handleCatalogRetryClick() {
+    if (destroyed || catalogRetryInFlight || catalogNotice.hidden) return;
+    catalogRetryInFlight = true;
+    const settle = () => {
+      catalogRetryInFlight = false;
+    };
+    void invokeTracked(
+      () => populateDatasetDropdown({ refresh: true })
+    ).then(settle, settle);
+  }
+
+  catalogRetryButton.addEventListener(
+    'click',
+    handleCatalogRetryClick,
+    { signal: lifecycleController.signal }
+  );
 
 // =========================================================================
 // Dataset Selector
@@ -499,9 +640,29 @@ function refreshDatasetUI(metadata) {
 
 /**
  * Populate the dataset dropdown with available datasets from all sources
+ *
+ * @param {Object} [options]
+ * @param {boolean} [options.refresh=false] - Run the pass as a user-visible
+ *   retry: cached per-source failures are cleared before the catalogs are
+ *   probed again, and the outcome is confirmed in the session status line.
  */
-async function populateDatasetDropdown() {
+async function populateDatasetDropdown(options = {}) {
   assertAlive();
+  requirePlainObject(options, 'Dataset catalog population options');
+  const unsupportedOptions = Object.keys(options).filter(
+    key => key !== 'refresh'
+  );
+  if (unsupportedOptions.length > 0) {
+    throw new TypeError(
+      'Dataset catalog population options support only: refresh.'
+    );
+  }
+  const refresh = Object.hasOwn(options, 'refresh') ? options.refresh : false;
+  if (typeof refresh !== 'boolean') {
+    throw new TypeError(
+      'Dataset catalog population refresh must be a boolean.'
+    );
+  }
   const generation = ++catalogGeneration;
   debug.log('[UI] populateDatasetDropdown called', { datasetSelect, dataSourceManager });
 
@@ -514,17 +675,33 @@ async function populateDatasetDropdown() {
   datasetOptionsByKey.clear();
   noneDatasetOption = null;
   datasetSelect.disabled = true;
+  if (refresh) {
+    markCatalogNoticeRetrying();
+  } else {
+    clearCatalogNotice();
+  }
 
   try {
     debug.log('[UI] Calling getAllDatasets...');
     const allSourceDatasets = requireCatalog(await trackWork(
-      dataSourceManager.getAllDatasets()
+      dataSourceManager.getAllDatasets({ refresh })
     ));
     if (!ownsCatalogGeneration(generation)) {
       return Object.freeze({ status: 'superseded' });
     }
 
     debug.log('[UI] getAllDatasets returned:', allSourceDatasets);
+
+    // A failed source belongs on screen next to the selector it is missing
+    // from. It never blocks the sources that answered.
+    const failureMessage = describeFailedSources(allSourceDatasets);
+    if (failureMessage === null) {
+      clearCatalogNotice();
+      if (refresh) showSessionStatus('Dataset list reloaded', false);
+    } else {
+      setCatalogNotice(failureMessage);
+      if (refresh) showSessionStatus(failureMessage, true);
+    }
 
     // Flatten and collect all datasets with their source type
     const allDatasets = [];
@@ -560,9 +737,7 @@ async function populateDatasetDropdown() {
       // Create optgroups for each source
       for (const { sourceType, datasets } of sourcesWithData) {
         const group = ownerDocument.createElement('optgroup');
-        group.label = sourceType === 'local-demo' ? 'Demo Datasets' :
-                      sourceType === 'local-user' ? 'Your Data' :
-                      sourceType;
+        group.label = sourceDisplayName(sourceType);
 
         for (const dataset of datasets) {
           const option = createDatasetOption(dataset, sourceType);
@@ -653,6 +828,9 @@ async function populateDatasetDropdown() {
     datasetSelect.disabled = true;
     datasetInfo.classList.remove('loading');
     datasetInfo.classList.add('error');
+    // The whole enumeration failed, so the selector is empty and the only way
+    // back used to be a page reload. The notice carries the retry instead.
+    setCatalogNotice(CATALOG_TOTAL_FAILURE_MESSAGE);
     showSessionStatus(errorOption.textContent, true);
     return Object.freeze({
       error: exactError,
@@ -1134,7 +1312,15 @@ async function handleDatasetSelectEvent(event) {
         ? 1
         : datasetSelectionIntentGeneration + 1;
     activeDatasetSelectionIntent = null;
+    catalogRetryInFlight = false;
     const cleanupErrors = [];
+    try {
+      // A retired controls instance owns no retry, so its notice must not stay
+      // on screen offering one.
+      clearCatalogNotice();
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
     try {
       lifecycleController.abort();
     } catch (error) {

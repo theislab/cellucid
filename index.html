@@ -248,7 +248,27 @@
     </div>
   </div>
 
-  <canvas id="glcanvas" tabindex="0"></canvas>
+  <!-- The plot is the first Tab stop in the document, so it has to say what it
+       is and what its keys do. <canvas> carries no implicit ARIA role, so an
+       explicit role that permits naming is what makes aria-label and
+       aria-describedby well defined here; `group` is used rather than `img`
+       (which contradicts a focusable, keyboard-operable element) or
+       `application` (which changes how a screen reader routes every key).
+
+       The description cannot point into #shortcuts-section: a collapsed
+       <details> hides its content with `content-visibility`, which removes the
+       whole subtree from the accessibility tree, so Chromium computes no
+       description from it at all while the panel is shut. #glcanvas-help is a
+       .sr-only element that is always rendered. It names a subset of the keys
+       on purpose — a description is spoken in full on every focus — and
+       tests/canvas-accessible-name-contract.test.mjs pins every key it names to
+       a <kbd> in the shortcuts panel so the two cannot drift apart. -->
+  <p id="glcanvas-help" class="sr-only">Keyboard: W A S D orbit or pan, = and -
+    zoom, R resets the camera, O P G switch between orbit, planar and free-fly
+    navigation, and ? opens the full shortcut list.</p>
+  <canvas id="glcanvas" tabindex="0" role="group"
+          aria-label="Single-cell embedding plot"
+          aria-describedby="glcanvas-help"></canvas>
 
   <!-- Sidebar toggle button -->
   <button id="sidebar-toggle" class="sidebar-open" title="Toggle sidebar">✕</button>
@@ -737,15 +757,15 @@
             <div class="control-block">
               <label for="smoke-scatter">Light scattering:</label>
               <div class="slider-row">
-                <input id="smoke-scatter" type="range" min="0" max="100" step="1" value="0" />
-                <span id="smoke-scatter-display" class="slider-value">0.0</span>
+                <input id="smoke-scatter" type="range" min="0" max="100" step="1" value="50" />
+                <span id="smoke-scatter-display" class="slider-value">0.8</span>
               </div>
             </div>
             <div class="control-block">
               <label for="smoke-direct-light">Direct lighting:</label>
               <div class="slider-row">
-                <input id="smoke-direct-light" type="range" min="0" max="100" step="1" value="3" />
-                <span id="smoke-direct-light-display" class="slider-value">0.04x</span>
+                <input id="smoke-direct-light" type="range" min="0" max="100" step="1" value="50" />
+                <span id="smoke-direct-light-display" class="slider-value">0.75x</span>
               </div>
             </div>
 
@@ -920,7 +940,7 @@
                   <div class="mt-1">
 
                     <!-- Particle Rendering -->
-                    <div class="legend-help mb-1" style="font-weight: 500; opacity: 0.7;">Particle Rendering</div>
+                    <div class="legend-help font-medium mb-1">Particle Rendering</div>
 
                     <div class="control-block">
                       <label for="velocity-intensity">Intensity:</label>
@@ -955,7 +975,7 @@
                     </div>
 
                     <!-- Trail Settings -->
-                    <div class="legend-help mb-1 mt-2" style="font-weight: 500; opacity: 0.7;">Trail Settings</div>
+                    <div class="legend-help font-medium mb-1 mt-2">Trail Settings</div>
 
                     <div class="control-block">
                       <label for="velocity-trail-fade">Trail persistence:</label>
@@ -982,7 +1002,7 @@
                     </div>
 
                     <!-- HDR & Bloom -->
-                    <div class="legend-help mb-1 mt-2" style="font-weight: 500; opacity: 0.7;">HDR & Bloom</div>
+                    <div class="legend-help font-medium mb-1 mt-2">HDR & Bloom</div>
 
                     <div class="control-block">
                       <label for="velocity-exposure">Exposure:</label>
@@ -1017,7 +1037,7 @@
                     </div>
 
                     <!-- Color Grading -->
-                    <div class="legend-help mb-1 mt-2" style="font-weight: 500; opacity: 0.7;">Color Grading</div>
+                    <div class="legend-help font-medium mb-1 mt-2">Color Grading</div>
 
                     <div class="control-block">
                       <label for="velocity-saturation">Saturation:</label>
@@ -1052,7 +1072,7 @@
                     </div>
 
                     <!-- Cinematic Effects -->
-                    <div class="legend-help mb-1 mt-2" style="font-weight: 500; opacity: 0.7;">Cinematic Effects</div>
+                    <div class="legend-help font-medium mb-1 mt-2">Cinematic Effects</div>
 
                     <div class="control-block">
                       <label for="velocity-vignette">Vignette:</label>
@@ -1335,25 +1355,25 @@
               <label for="categorical-field">Categorical obs:</label>
               <div class="field-selector-row" id="categorical-field-row">
                 <select id="categorical-field" class="obs-select"></select>
-                <div class="field-actions" aria-label="Categorical field actions">
-                  <button type="button" class="field-action-btn" id="copy-categorical-field" title="Duplicate field" disabled>
+                <div class="field-actions" role="group" aria-label="Categorical field actions">
+                  <button type="button" class="field-action-btn" id="copy-categorical-field" title="Duplicate the selected categorical obs field" aria-label="Duplicate the selected categorical obs field" disabled>
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
                       <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
                       <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
                     </svg>
                   </button>
-                  <button type="button" class="field-action-btn" id="rename-categorical-field" title="Rename field" disabled>
+                  <button type="button" class="field-action-btn" id="rename-categorical-field" title="Rename the selected categorical obs field" aria-label="Rename the selected categorical obs field" disabled>
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
                       <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
                       <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
                     </svg>
                   </button>
-                  <button type="button" class="field-action-btn field-delete-btn" id="delete-categorical-field" title="Delete field" disabled>
+                  <button type="button" class="field-action-btn field-delete-btn" id="delete-categorical-field" title="Delete the selected categorical obs field" aria-label="Delete the selected categorical obs field" disabled>
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
                       <path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
                     </svg>
                   </button>
-                  <button type="button" class="field-action-btn" id="clear-categorical-field" title="Clear field selection" disabled>
+                  <button type="button" class="field-action-btn" id="clear-categorical-field" title="Clear the categorical obs selection" aria-label="Clear the categorical obs selection" disabled>
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
                       <path d="M18 6L6 18M6 6l12 12"/>
                     </svg>
@@ -1365,25 +1385,25 @@
               <label for="continuous-field">Continuous obs:</label>
               <div class="field-selector-row" id="continuous-field-row">
                 <select id="continuous-field" class="obs-select"></select>
-                <div class="field-actions" aria-label="Continuous field actions">
-                  <button type="button" class="field-action-btn" id="copy-continuous-field" title="Duplicate field" disabled>
+                <div class="field-actions" role="group" aria-label="Continuous field actions">
+                  <button type="button" class="field-action-btn" id="copy-continuous-field" title="Duplicate the selected continuous obs field" aria-label="Duplicate the selected continuous obs field" disabled>
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
                       <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
                       <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
                     </svg>
                   </button>
-                  <button type="button" class="field-action-btn" id="rename-continuous-field" title="Rename field" disabled>
+                  <button type="button" class="field-action-btn" id="rename-continuous-field" title="Rename the selected continuous obs field" aria-label="Rename the selected continuous obs field" disabled>
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
                       <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
                       <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
                     </svg>
                   </button>
-                  <button type="button" class="field-action-btn field-delete-btn" id="delete-continuous-field" title="Delete field" disabled>
+                  <button type="button" class="field-action-btn field-delete-btn" id="delete-continuous-field" title="Delete the selected continuous obs field" aria-label="Delete the selected continuous obs field" disabled>
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
                       <path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
                     </svg>
                   </button>
-                  <button type="button" class="field-action-btn" id="clear-continuous-field" title="Clear field selection" disabled>
+                  <button type="button" class="field-action-btn" id="clear-continuous-field" title="Clear the continuous obs selection" aria-label="Clear the continuous obs selection" disabled>
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
                       <path d="M18 6L6 18M6 6l12 12"/>
                     </svg>
@@ -1405,25 +1425,25 @@
                   />
                   <div id="gene-expression-dropdown" class="dropdown-list"></div>
                 </div>
-                <div class="field-actions" aria-label="Gene expression actions">
-                  <button type="button" class="field-action-btn" id="copy-gene-expression" title="Duplicate gene expression" disabled>
+                <div class="field-actions" role="group" aria-label="Gene expression actions">
+                  <button type="button" class="field-action-btn" id="copy-gene-expression" title="Duplicate the selected gene expression field" aria-label="Duplicate the selected gene expression field" disabled>
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
                       <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
                       <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
                     </svg>
                   </button>
-                  <button type="button" class="field-action-btn" id="rename-gene-expression" title="Rename gene" disabled>
+                  <button type="button" class="field-action-btn" id="rename-gene-expression" title="Rename the selected gene expression field" aria-label="Rename the selected gene expression field" disabled>
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
                       <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
                       <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
                     </svg>
                   </button>
-                  <button type="button" class="field-action-btn field-delete-btn" id="delete-gene-expression" title="Delete gene" disabled>
+                  <button type="button" class="field-action-btn field-delete-btn" id="delete-gene-expression" title="Delete the selected gene expression field" aria-label="Delete the selected gene expression field" disabled>
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
                       <path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
                     </svg>
                   </button>
-                  <button type="button" class="field-action-btn" id="clear-gene-expression" title="Clear gene selection" disabled>
+                  <button type="button" class="field-action-btn" id="clear-gene-expression" title="Clear the gene expression selection" aria-label="Clear the gene expression selection" disabled>
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
                       <path d="M18 6L6 18M6 6l12 12"/>
                     </svg>
@@ -1649,8 +1669,8 @@
 
           <!-- Save position button -->
           <div class="control-block">
-            <label style="margin-top:0;">Save Keyframe</label>
-            <button id="cinematic-save-btn" class="reset-btn" type="button" style="width:100%;">
+            <label class="mt-0">Save Keyframe</label>
+            <button id="cinematic-save-btn" class="reset-btn w-full" type="button">
               Save Position
             </button>
           </div>
@@ -1658,14 +1678,14 @@
           <!-- Keyframe list + transition timing (unified scrollable box) -->
           <div class="control-block">
             <div class="d-flex items-center cinematic-keyframes-header">
-              <label style="margin:0;">Keyframes</label>
+              <label class="m-0">Keyframes</label>
               <button id="cinematic-clear-btn" class="cinematic-clear-btn" type="button">Clear All</button>
             </div>
             <div id="cinematic-keyframe-list" class="cinematic-keyframe-list">
               <div class="cinematic-empty-state">No keyframes saved yet.</div>
             </div>
             <div id="cinematic-timing-actions" class="cinematic-timing-actions" style="display:none;">
-              <label for="cinematic-set-all-duration" style="margin:0;">Set all:</label>
+              <label for="cinematic-set-all-duration" class="m-0">Set all:</label>
               <input id="cinematic-set-all-duration" type="number" class="cinematic-duration-input"
                      min="0.1" max="60" step="0.1" placeholder="auto" />
               <span class="cinematic-timing-unit">s</span>
@@ -1731,11 +1751,11 @@
               </select>
             </div>
             <div class="control-block">
-              <label style="margin-top:0;display:flex;align-items:center;gap:var(--space-1-5);">
+              <label class="mt-0 d-flex items-center gap-1-5">
                 <input type="checkbox" id="cinematic-loop" />
                 Loop playback
               </label>
-              <label style="margin-top:var(--space-1-5);display:flex;align-items:center;gap:var(--space-1-5);">
+              <label class="mt-1-5 d-flex items-center gap-1-5">
                 <input type="checkbox" id="cinematic-autoplay" />
                 Autoplay
               </label>

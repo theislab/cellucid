@@ -26,6 +26,8 @@ export {
 
   // Multiple testing correction
   benjaminiHochberg,
+  benjaminiHochbergAdjusted,
+  benjaminiHochbergTestable,
   bonferroniCorrection,
   applyMultipleTestingCorrection,
 

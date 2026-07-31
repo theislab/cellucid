@@ -24,6 +24,7 @@ import { MarkerDiscoveryEngine } from './marker-discovery-engine.js';
 import { ExpressionMatrixBuilder } from './expression-matrix-builder.js';
 import { ClusteringEngine } from './clustering-engine.js';
 import { MarkerCache } from './marker-cache.js';
+import { computeCategoryGroupingDigest } from '../data/data-layer.js';
 import { DEFAULTS, ANALYSIS_PHASES, ERROR_MESSAGES, formatError } from './constants.js';
 import { getDataSourceManager } from '../../../data/data-source-manager.js';
 
@@ -316,14 +317,21 @@ export class GenesPanelController {
         return customResult;
       }
 
-      // Check cache for markers
+      // Check cache for markers.
+      //
+      // `groupingDigest` is the cache's identity for *which cells were compared*.
+      // The observation-field key alone is not: an in-place category merge or a
+      // move to "unassigned" rewrites a field's codes while its key is unchanged,
+      // and without the digest the panel would answer the new grouping with the
+      // markers computed for the old one.
       const cacheParams = {
         method,
         topNPerGroup,
         pValueThreshold,
         foldChangeThreshold,
         useAdjustedPValue,
-        minCells: this._config.minCells
+        minCells: this._config.minCells,
+        groupingDigest: computeCategoryGroupingDigest(obsCodes)
       };
       let markers = null;
       let cacheHit = false;

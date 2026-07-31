@@ -23,8 +23,9 @@ import {
   deResultsToCSV,
   downloadCSV
 } from '../../shared/analysis-utils.js';
-// Note: renderStatsGrid and renderDEGenesTable are not used in sidebar
-// Modal rendering uses HTML templates directly for better control
+// Note: the sidebar shows only the volcano plot. Summary statistics and the DE
+// gene table are rendered from HTML templates in the expanded modal view
+// (_renderModalStats, _renderModalAnnotations), which is the only DE result view.
 import { createPageComparisonSelector } from '../components/index.js';
 import { purgePlot } from '../../plots/plotly-loader.js';
 import { isFiniteNumber } from '../../shared/number-utils.js';
@@ -471,11 +472,24 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
   _renderModalStats(container) {
     const result = this._lastResult;
     const results = result?.data?.results;
+    const summary = result?.data?.summary;
     const options = PlotRegistry.mergeOptions('volcanoplot', result?.options || {});
 
     if (!results || results.length === 0) {
       container.innerHTML = '<p class="modal-stats-placeholder">Statistics not available</p>';
       return;
+    }
+    if (
+      summary === null ||
+      typeof summary !== 'object' ||
+      Array.isArray(summary) ||
+      !Number.isSafeInteger(summary.genesTested) ||
+      !Number.isSafeInteger(summary.genesUntestable) ||
+      !Number.isSafeInteger(summary.minCells)
+    ) {
+      throw new TypeError(
+        'Differential-expression summary must report genesTested, genesUntestable and minCells'
+      );
     }
 
     const {
@@ -492,7 +506,7 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
       const pVal = useAdjustedPValue ? row.adjustedPValue : row.pValue;
       if (!isFiniteNumber(pVal) || !isFiniteNumber(row.log2FoldChange)) continue;
 
-      const isSignificant = pVal < pValueThreshold && Math.abs(row.log2FoldChange) >= foldChangeThreshold;
+      const isSignificant = pVal <= pValueThreshold && Math.abs(row.log2FoldChange) >= foldChangeThreshold;
       if (isSignificant) {
         if (row.log2FoldChange > 0) {
           upregulated++;
@@ -505,14 +519,23 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
     const significantTotal = upregulated + downregulated;
     const pLabel = useAdjustedPValue ? 'FDR' : 'p';
 
+    // "Genes tested" must be the multiple-testing denominator, not the panel
+    // size: genes that failed the min-cell check carry no p-value and were
+    // never part of the corrected family. Both the denominator and the skipped
+    // remainder are shown, so the reported FDR can be reconstructed from the
+    // counts in this table alone.
     container.innerHTML = `
       <table class="analysis-stats-table de-modal-stats">
         <tr>
-          <td>Genes Tested</td>
-          <td><strong>${results.length.toLocaleString()}</strong></td>
+          <td>Genes tested (FDR denominator)</td>
+          <td><strong>${summary.genesTested.toLocaleString()}</strong></td>
         </tr>
         <tr>
-          <td>Significant (${pLabel} < ${pValueThreshold}, |log₂FC| ≥ ${foldChangeThreshold})</td>
+          <td title="Genes skipped before testing: one of the two groups had fewer than ${summary.minCells} cells with a measured value for that gene, so no p-value exists and the gene is not part of the FDR correction.">Not tested (&lt; ${summary.minCells.toLocaleString()} cells with a value)</td>
+          <td><strong>${summary.genesUntestable.toLocaleString()}</strong></td>
+        </tr>
+        <tr>
+          <td>Significant (${pLabel} ≤ ${pValueThreshold}, |log₂FC| ≥ ${foldChangeThreshold})</td>
           <td class="significant"><strong>${significantTotal.toLocaleString()}</strong></td>
         </tr>
         <tr>
@@ -566,7 +589,7 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
     const passesThresholds = (row) => {
       const p = getPValue(row);
       if (p === null) return false;
-      if (p >= pValueThreshold) return false;
+      if (p > pValueThreshold) return false;
 
       const fc = row?.log2FoldChange;
       if (!isFiniteNumber(fc)) return false;
@@ -587,7 +610,7 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
     if (genesToShow.length === 0) {
       container.innerHTML = `
         <p class="modal-annotations-placeholder">
-          No genes passed the current thresholds (p &lt; ${pValueThreshold}, |log2FC| ≥ ${foldChangeThreshold}).
+          No genes passed the current thresholds (p ≤ ${pValueThreshold}, |log2FC| ≥ ${foldChangeThreshold}).
         </p>
       `;
       return;

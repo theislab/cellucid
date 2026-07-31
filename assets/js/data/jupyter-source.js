@@ -23,7 +23,8 @@
 import {
   DataSourceError,
   DataSourceErrorCode,
-  loadDatasetMetadata
+  loadDatasetMetadata,
+  readBoundedJson
 } from './data-source.js';
 import {
   loadMetadataBatchAtomically,
@@ -433,7 +434,10 @@ async function requestJupyterHealth(config, signal = null) {
       `Jupyter health request failed with HTTP ${response.status}`
     );
   }
-  const payload = await response.json();
+  const payload = await readBoundedJson(response, {
+    label: 'Jupyter health request',
+    signal,
+  });
   throwIfMetadataAborted(signal, 'Jupyter health request');
   return requireJupyterHealthPayload(payload);
 }
@@ -612,7 +616,7 @@ export async function uploadJupyterSessionBundle(options) {
     );
   }
   requireJupyterSessionUploadPayload(
-    await response.json(),
+    await readBoundedJson(response, { label: 'Jupyter session upload' }),
     blob.size
   );
 }
@@ -1122,7 +1126,9 @@ export class JupyterBridgeDataSource {
         `Jupyter event delivery failed with HTTP ${response.status}`
       );
     }
-    const payload = await response.json();
+    const payload = await readBoundedJson(response, {
+      label: 'Jupyter event delivery',
+    });
     this._assertConnection(owner, 'Jupyter event delivery');
     requireJupyterSuccessPayload(payload, 'Jupyter event delivery');
   }
@@ -1369,7 +1375,9 @@ export class JupyterBridgeDataSource {
         );
       }
 
-      const catalogPayload = await response.json();
+      const catalogPayload = await readBoundedJson(response, {
+        label: 'Jupyter dataset listing',
+      });
       this._assertCatalog(owner, 'Jupyter dataset listing');
       const datasetList = requireDatasetCatalogPayload(catalogPayload);
       const stagedPaths = new Map(

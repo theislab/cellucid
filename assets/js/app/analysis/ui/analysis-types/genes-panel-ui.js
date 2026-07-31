@@ -1145,9 +1145,22 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
 
     container.appendChild(headerRow);
 
-    const markers = groups[this._modalSelectedGroupId]?.markers || [];
+    const selectedGroup = groups[this._modalSelectedGroupId];
+    container.appendChild(
+      this._createGroupTestingSummary(
+        selectedGroup,
+        result?.markers?.minCellsPerSide
+      )
+    );
+
+    const markers = selectedGroup?.markers || [];
     if (markers.length === 0) {
-      container.insertAdjacentHTML('beforeend', '<p class="modal-annotations-placeholder">No markers for selected group.</p>');
+      const empty = document.createElement('p');
+      empty.className = 'modal-annotations-placeholder';
+      empty.textContent = selectedGroup?.genesTested === 0
+        ? 'No gene could be tested for this group, so it has no markers.'
+        : 'No markers for selected group at the current thresholds.';
+      container.appendChild(empty);
       return;
     }
 
@@ -1225,6 +1238,54 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
     renderChunk();
   }
 
+  /**
+   * Caption the marker table with the family the group's FDR was computed over.
+   *
+   * A group is compared against the rest one gene at a time, and a gene where
+   * either side held fewer than `minCellsPerSide` cells with a measured value
+   * was never tested. Such a gene has no p-value, is not in the Benjamini-
+   * Hochberg denominator, and can never appear in the list below - so the list
+   * alone cannot distinguish "nothing was significant" from "most of the panel
+   * was unmeasurable here". Both numbers are stated so it can.
+   *
+   * @param {Object|undefined} group - The selected group's marker result
+   * @param {number|undefined} minCellsPerSide - Cells required on each side
+   * @returns {HTMLElement}
+   */
+  _createGroupTestingSummary(group, minCellsPerSide) {
+    const summary = document.createElement('p');
+    summary.className = 'modal-annotations-placeholder';
+
+    const genesTested = group?.genesTested;
+    const genesUntestable = group?.genesUntestable;
+    if (
+      !Number.isSafeInteger(genesTested) ||
+      !Number.isSafeInteger(genesUntestable)
+    ) {
+      // Partial results have not corrected anything yet, and custom gene sets
+      // never ran a comparison. Neither has a denominator to report.
+      summary.hidden = true;
+      return summary;
+    }
+
+    const tested = document.createElement('strong');
+    tested.textContent = genesTested.toLocaleString();
+    summary.append(tested, ' genes tested (FDR denominator)');
+
+    if (genesUntestable > 0) {
+      const untested = document.createElement('strong');
+      untested.textContent = genesUntestable.toLocaleString();
+      summary.append(' · ', untested, ' not tested');
+      if (Number.isSafeInteger(minCellsPerSide)) {
+        summary.append(
+          ` (fewer than ${minCellsPerSide.toLocaleString()} cells with a measured value in this group or in the rest)`
+        );
+      }
+    }
+
+    return summary;
+  }
+
   _getTopNFromMode(mode) {
     if (mode === 'all') return Infinity;
     if (mode === 'top100') return 100;
@@ -1251,7 +1312,8 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
     for (let i = 0; i < n; i++) {
       const p = pValuesEffective[i];
       const fc = log2FC[i];
-      if (!Number.isFinite(p) || p >= pValueThreshold) continue;
+      // Inclusive, matching the engine and the Benjamini-Hochberg step-up.
+      if (!Number.isFinite(p) || p > pValueThreshold) continue;
       if (!Number.isFinite(fc) || Math.abs(fc) < foldChangeThreshold) continue;
 
       out.push({

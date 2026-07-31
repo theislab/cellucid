@@ -260,9 +260,11 @@ function computeVolcanoCategoryCodes(pre, options) {
     const p = pVals[i];
     const fc = pre.log2FoldChange[i];
 
+    // Inclusive, matching the Benjamini-Hochberg step-up rule and every other
+    // significance decision in the analysis module.
     const significant = isFiniteNumber(p) &&
       isFiniteNumber(fc) &&
-      p < pValueThreshold &&
+      p <= pValueThreshold &&
       Math.abs(fc) >= foldChangeThreshold;
 
     if (!significant) {
@@ -991,7 +993,7 @@ const volcanoPlotDefinition = {
       const isSignificant =
         isFiniteNumber(pVal) &&
         isFiniteNumber(log2FoldChange) &&
-        pVal < pValueThreshold &&
+        pVal <= pValueThreshold &&
         Math.abs(log2FoldChange) >= foldChangeThreshold;
 
       let direction = 'ns';
@@ -1043,6 +1045,7 @@ const volcanoPlotDefinition = {
         upregulated: summary.upregulated,
         downregulated: summary.downregulated,
         notSignificant: summary.notSignificant,
+        untestable: summary.untestable,
         pValueThreshold,
         foldChangeThreshold,
         useAdjustedPValue,
@@ -1053,6 +1056,11 @@ const volcanoPlotDefinition = {
 
   /**
    * Get summary of differential expression results
+   *
+   * A gene with no p-value under the selected column was never tested; it is
+   * counted as `untestable` rather than folded into `notSignificant`, so
+   * `notSignificant` stays a statement about tested genes only. The four
+   * buckets partition `total`.
    */
   getSummary(deResults, options) {
     requireVolcanoOptions(options);
@@ -1062,6 +1070,7 @@ const volcanoPlotDefinition = {
     let upregulated = 0;
     let downregulated = 0;
     let notSignificant = 0;
+    let untestable = 0;
 
     for (let index = 0; index < results.length; index++) {
       const result = results[index];
@@ -1080,12 +1089,16 @@ const volcanoPlotDefinition = {
         result.gene
       );
 
-      if (!isFiniteNumber(pVal) || !isFiniteNumber(foldChange)) {
+      if (!isFiniteNumber(pVal)) {
+        untestable++;
+        continue;
+      }
+      if (!isFiniteNumber(foldChange)) {
         notSignificant++;
         continue;
       }
 
-      const isSignificant = pVal < pValueThreshold;
+      const isSignificant = pVal <= pValueThreshold;
       const hasLargeFoldChange = Math.abs(foldChange) >= foldChangeThreshold;
 
       if (isSignificant && hasLargeFoldChange) {
@@ -1104,6 +1117,7 @@ const volcanoPlotDefinition = {
       upregulated,
       downregulated,
       notSignificant,
+      untestable,
       significantTotal: upregulated + downregulated
     };
   }

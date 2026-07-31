@@ -100,14 +100,86 @@ export function createAccordionInteractions({
     sidebar.classList.toggle('dock-drop-hover', isActive && isHover);
   }
 
+  // Width bounds shared by the pointer drag and the keyboard resize, so both
+  // inputs clamp against exactly the same numbers.
+  function widthBounds(details, state, rect) {
+    const startWidth = rect.width;
+    const minWidth = state.widthConstraints?.min ?? FLOAT_MIN_WIDTH_PX;
+    const maxWidthConstraint = state.widthConstraints?.max;
+    const baseWidth = state.baseFloatSize?.width ?? startWidth;
+    const maxWidthByScale = Math.max(minWidth, baseWidth * FLOAT_MAX_SCALE);
+    const maxWidthByConstraint = isFiniteNumber(maxWidthConstraint)
+      ? Math.max(minWidth, maxWidthConstraint)
+      : maxWidthByScale;
+    const maxWidthByViewport = Math.max(
+      minWidth,
+      window.innerWidth - rect.left - 8
+    );
+    return {
+      minWidth,
+      maxWidth: Math.min(maxWidthByConstraint, maxWidthByViewport),
+    };
+  }
+
+  // A focusable `separator` is the window-splitter role: assistive technology
+  // reads the current width off `aria-valuenow` on every arrow key, so the
+  // keyboard resize needs no announcement of its own.
+  function syncWidthHandleValue(details, widthHandle) {
+    const state = getState(details);
+    if (!state.isFloating) return;
+    const rect = details.getBoundingClientRect();
+    const { minWidth, maxWidth } = widthBounds(details, state, rect);
+    widthHandle.setAttribute('aria-valuemin', String(Math.round(minWidth)));
+    widthHandle.setAttribute('aria-valuemax', String(Math.round(maxWidth)));
+    widthHandle.setAttribute('aria-valuenow', String(Math.round(rect.width)));
+    widthHandle.setAttribute(
+      'aria-valuetext',
+      `${Math.round(rect.width)} pixels wide`
+    );
+  }
+
   // Resize handles (for floating panels)
   function ensureResizeHandles(details) {
     if (details.querySelector('.accordion-width-handle')) return;
 
     const widthHandle = document.createElement('div');
     widthHandle.className = 'accordion-width-handle';
-    widthHandle.setAttribute('aria-hidden', 'true');
+    // The handle used to be `aria-hidden` and pointer-only, which made the
+    // floating panel's only size control unreachable without a mouse.
+    widthHandle.setAttribute('role', 'separator');
+    widthHandle.setAttribute('aria-orientation', 'vertical');
+    widthHandle.setAttribute('aria-label', 'Panel width');
+    widthHandle.setAttribute('aria-keyshortcuts', 'ArrowLeft ArrowRight Home End');
+    widthHandle.tabIndex = 0;
     details.appendChild(widthHandle);
+
+    widthHandle.addEventListener('focus', () => {
+      syncWidthHandleValue(details, widthHandle);
+    });
+
+    widthHandle.addEventListener('keydown', (e) => {
+      if (e.altKey || e.ctrlKey || e.metaKey) return;
+
+      const state = getState(details);
+      if (!state.isFloating) return;
+
+      const rect = details.getBoundingClientRect();
+      const { minWidth, maxWidth } = widthBounds(details, state, rect);
+      const step = e.shiftKey ? 64 : 16;
+      let nextWidth = null;
+      if (e.key === 'ArrowLeft') nextWidth = rect.width - step;
+      else if (e.key === 'ArrowRight') nextWidth = rect.width + step;
+      else if (e.key === 'Home') nextWidth = minWidth;
+      else if (e.key === 'End') nextWidth = maxWidth;
+      if (nextWidth === null) return;
+
+      e.preventDefault();
+      e.stopPropagation();
+      StyleManager.setPosition(details, {
+        width: Math.round(Math.min(Math.max(nextWidth, minWidth), maxWidth)),
+      });
+      syncWidthHandleValue(details, widthHandle);
+    });
 
     widthHandle.addEventListener('pointerdown', (e) => {
       if (e.button !== 0) return;
@@ -122,7 +194,7 @@ export function createAccordionInteractions({
       const startX = e.clientX;
       const rect = details.getBoundingClientRect();
       const startWidth = rect.width;
-      const minWidth = state.widthConstraints?.min ?? FLOAT_MIN_WIDTH_PX;
+      const { minWidth } = widthBounds(details, state, rect);
       const maxWidthConstraint = state.widthConstraints?.max;
       const baseWidth = state.baseFloatSize?.width ?? startWidth;
       const maxWidthByScale = Math.max(minWidth, baseWidth * FLOAT_MAX_SCALE);
@@ -165,6 +237,7 @@ export function createAccordionInteractions({
         try { widthHandle.releasePointerCapture(pointerId); } catch {}
         setGlobalResizeState(false);
         details.classList.remove('resizing');
+        syncWidthHandleValue(details, widthHandle);
       }
 
       widthHandle.addEventListener('pointermove', onMove);
@@ -386,6 +459,17 @@ export function createAccordionInteractions({
     });
   }
 
-  return { ensureResizeHandles, setupDockedDrag, setupFloatingDrag };
+  function syncResizeHandles(details) {
+    const widthHandle = details.querySelector('.accordion-width-handle');
+    if (widthHandle === null) return;
+    syncWidthHandleValue(details, widthHandle);
+  }
+
+  return {
+    ensureResizeHandles,
+    setupDockedDrag,
+    setupFloatingDrag,
+    syncResizeHandles,
+  };
 }
 

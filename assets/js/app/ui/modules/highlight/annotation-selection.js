@@ -9,22 +9,30 @@
  */
 
 import { debug } from '../../../../utils/debug.js';
-import { HIGHLIGHT_MODE_COPY } from './mode-copy.js';
-import { MAX_HISTORY_STEPS } from './selection-state.js';
+import {
+  combineAnnotationCandidates,
+  computeAnnotationGestureCells
+} from './annotation-cells.js';
+import {
+  abandonedGestureNotice,
+  ANNOTATION_NEEDS_FIELD_COPY,
+  HIGHLIGHT_MODE_COPY,
+  SELECTION_NOTICE,
+  selectionNoticeHtml
+} from './mode-copy.js';
+import { MAX_HISTORY_STEPS, selectionUnchanged } from './selection-state.js';
+import { getStepControls, removeStepControls } from './step-controls.js';
 import {
   deliverSelectionToJupyter,
   showSelectionDeliveryFailure
 } from './selection-notification.js';
 import {
   requireAnnotationStepEvent,
-  requireContinuousStatistics,
   requireDomElement,
   requireExactKeys,
-  requireFieldSource,
   requireHighlightSelectionState,
   requireJupyterSource,
   requireMethods,
-  requireSafeInteger,
   requireSavedHighlightGroup,
   requireUnifiedSelectionState
 } from './exact-contract.js';
@@ -58,6 +66,7 @@ export function initAnnotationSelection(options) {
       'getCellIndicesForCategory',
       'getCellIndicesForRange',
       'getValueForCell',
+      'on',
       'setPreviewHighlightFromIndices'
     ]
   );
@@ -73,7 +82,7 @@ export function initAnnotationSelection(options) {
     ]
   );
   requireJupyterSource(jupyterSource);
-  requireHighlightSelectionState(selectionState);
+  requireHighlightSelectionState(selectionState, state.pointCount);
   requireExactKeys(
     ui,
     ['modeDescriptionEl', 'hideRangeLabel'],
@@ -127,91 +136,49 @@ export function initAnnotationSelection(options) {
         'Annotation selection requires an active categorical or continuous field.'
       );
     }
+    return computeAnnotationGestureCells({
+      state,
+      activeField,
+      cellIndex: selectionEvent.cellIndex,
+      gestureType: selectionEvent.type,
+      dragDeltaY: selectionEvent.dragDeltaY,
+      viewTransparency
+    }).cellIndices;
+  }
 
-    const cellIndex = selectionEvent.cellIndex;
-    const source = requireFieldSource(state.activeFieldSource);
-    const fieldIndex = source === 'var'
-      ? state.activeVarFieldIndex
-      : state.activeFieldIndex;
-    requireSafeInteger(fieldIndex, 'Annotation active field index', 0);
-
-    if (activeField.kind === 'category') {
-      const categoryIndex = state.getCategoryForCell(cellIndex, fieldIndex, source);
-      const missingCode = activeField.codes instanceof Uint8Array
-        ? 255
-        : activeField.codes instanceof Uint16Array
-          ? 65_535
-          : null;
-      if (missingCode === null) {
-        throw new TypeError(
-          'Annotation category codes must be Uint8Array or Uint16Array.'
-        );
-      }
-      if (categoryIndex === missingCode) return [];
-      requireSafeInteger(
-        categoryIndex,
-        'Annotation category index',
-        0
-      );
-      if (
-        !Array.isArray(activeField.categories)
-        || categoryIndex >= activeField.categories.length
-      ) {
-        throw new RangeError(
-          'Annotation category index is outside the active categories.'
-        );
-      }
-      return state.getCellIndicesForCategory(fieldIndex, categoryIndex, source, viewTransparency);
-    }
-
-    if (activeField.kind === 'continuous') {
-      const clickedValue = state.getValueForCell(cellIndex, fieldIndex, source);
-      if (Number.isNaN(clickedValue)) return [];
-      if (!Number.isFinite(clickedValue)) {
-        throw new TypeError(
-          'Annotation continuous value must be finite or NaN.'
-        );
-      }
-
-      const stats = requireContinuousStatistics(activeField);
-      const valueRange = stats.max - stats.min;
-
-      let minVal;
-      let maxVal;
-      if (selectionEvent.type === 'range' && selectionEvent.dragDeltaY !== 0) {
-        const dragScale = 0.005;
-        const dragAmount = -selectionEvent.dragDeltaY * dragScale * valueRange;
-        if (dragAmount > 0) {
-          minVal = clickedValue;
-          maxVal = Math.min(stats.max, clickedValue + dragAmount);
-        } else {
-          minVal = Math.max(stats.min, clickedValue + dragAmount);
-          maxVal = clickedValue;
-        }
-      } else {
-        const rangeSize = valueRange * 0.1;
-        minVal = Math.max(stats.min, clickedValue - rangeSize / 2);
-        maxVal = Math.min(stats.max, clickedValue + rangeSize / 2);
-      }
-
-      return state.getCellIndicesForRange(fieldIndex, minVal, maxVal, source, viewTransparency);
-    }
-
-    throw new TypeError(
-      `Unknown annotation field kind: ${activeField.kind}.`
-    );
+  /**
+   * Drop the in-progress candidate set, in the tool and in the renderer.
+   *
+   * The other three tools keep their candidates inside the renderer, so their
+   * own confirm and cancel clear the unified set. The annotation tool keeps
+   * them here and publishes them with `restoreUnifiedState`, so it has to
+   * retract them the same way; otherwise `mode-ui.js` reads the stale unified
+   * state on the next mode switch and hands a cancelled or already-confirmed
+   * selection back to whichever tool the user just picked.
+   */
+  function retireAnnotationCandidates() {
+    selectionState.annotationCandidateSet = null;
+    selectionState.annotationStepCount = 0;
+    selectionState.annotationHistory = [];
+    selectionState.annotationRedoStack = [];
+    viewer.restoreUnifiedState([], 0);
   }
 
   function handleAnnotationStep(stepEvent) {
     if (destroyed) return;
-    requireAnnotationStepEvent(stepEvent);
+    requireAnnotationStepEvent(stepEvent, state.pointCount);
     if (stepEvent.cancelled) {
-      selectionState.annotationCandidateSet = null;
-      selectionState.annotationStepCount = 0;
-      selectionState.annotationHistory = [];
-      selectionState.annotationRedoStack = [];
+      retireAnnotationCandidates();
       updateAnnotationUI(null);
       state.clearPreviewHighlight();
+      return;
+    }
+    if (stepEvent.abandoned !== undefined) {
+      // The gesture reached no cell, so there is nothing to combine — but it
+      // was a real Alt+click, and answering it with nothing at all is what
+      // reads as "Alt+click does not select".
+      hideRangeLabel();
+      renderAnnotationState(abandonedGestureNotice(stepEvent.abandoned));
       return;
     }
 
@@ -229,6 +196,26 @@ export function initAnnotationSelection(options) {
     const newCellIndices = computeAnnotationCellIndices(stepEvent, viewTransparency);
 
     if (newCellIndices.length === 0 && mode !== 'subtract') {
+      // The gesture landed on a cell the active field has no value for. Saying
+      // nothing here is what reads as "the tool does not select".
+      renderAnnotationState(SELECTION_NOTICE.noFieldValue);
+      return;
+    }
+
+    const combined = combineAnnotationCandidates({
+      candidates: selectionState.annotationCandidateSet,
+      cellIndices: newCellIndices,
+      mode,
+      fieldKind: activeField.kind
+    });
+
+    if (
+      selectionUnchanged(
+        selectionState.annotationCandidateSet,
+        combined.candidates
+      )
+    ) {
+      renderAnnotationState(SELECTION_NOTICE.unchanged);
       return;
     }
 
@@ -241,64 +228,24 @@ export function initAnnotationSelection(options) {
     }
     selectionState.annotationRedoStack = [];
 
-    const newSet = new Set(newCellIndices);
-    let effectiveMode = mode;
+    selectionState.annotationCandidateSet = combined.candidates;
+    selectionState.annotationStepCount += 1;
 
-    if (activeField.kind === 'category') {
-      if (mode === 'intersect') {
-        selectionState.annotationCandidateSet = new Set(newCellIndices);
-        effectiveMode = 'replace';
-      } else if (mode === 'union') {
-        if (selectionState.annotationCandidateSet === null) {
-          selectionState.annotationCandidateSet = new Set(newCellIndices);
-        } else {
-          for (const idx of newCellIndices) {
-            selectionState.annotationCandidateSet.add(idx);
-          }
-        }
-      } else if (mode === 'subtract') {
-        if (selectionState.annotationCandidateSet !== null) {
-          for (const idx of newCellIndices) {
-            selectionState.annotationCandidateSet.delete(idx);
-          }
-        }
-      }
+    viewer.restoreUnifiedState(
+      [...selectionState.annotationCandidateSet],
+      selectionState.annotationStepCount
+    );
+
+    updateAnnotationUI({
+      step: selectionState.annotationStepCount,
+      candidateCount: selectionState.annotationCandidateSet.size,
+      mode: combined.effectiveMode
+    });
+
+    if (selectionState.annotationCandidateSet.size > 0) {
+      state.setPreviewHighlightFromIndices([...selectionState.annotationCandidateSet]);
     } else {
-      if (selectionState.annotationCandidateSet === null) {
-        if (mode !== 'subtract') {
-          selectionState.annotationCandidateSet = new Set(newCellIndices);
-        }
-      } else if (mode === 'union') {
-        for (const idx of newCellIndices) {
-          selectionState.annotationCandidateSet.add(idx);
-        }
-      } else if (mode === 'subtract') {
-        for (const idx of newCellIndices) {
-          selectionState.annotationCandidateSet.delete(idx);
-        }
-      } else {
-        selectionState.annotationCandidateSet = new Set(
-          [...selectionState.annotationCandidateSet].filter((idx) => newSet.has(idx))
-        );
-      }
-    }
-
-    if (selectionState.annotationCandidateSet) {
-      selectionState.annotationStepCount += 1;
-
-      viewer.restoreUnifiedState([...selectionState.annotationCandidateSet], selectionState.annotationStepCount);
-
-      updateAnnotationUI({
-        step: selectionState.annotationStepCount,
-        candidateCount: selectionState.annotationCandidateSet.size,
-        mode: effectiveMode
-      });
-
-      if (selectionState.annotationCandidateSet.size > 0) {
-        state.setPreviewHighlightFromIndices([...selectionState.annotationCandidateSet]);
-      } else {
-        state.clearPreviewHighlight();
-      }
+      state.clearPreviewHighlight();
     }
   }
 
@@ -306,10 +253,7 @@ export function initAnnotationSelection(options) {
     if (destroyed) return;
     if (!selectionState.annotationCandidateSet || selectionState.annotationCandidateSet.size === 0) {
       debug.log('[UI] Annotation selection empty');
-      selectionState.annotationCandidateSet = null;
-      selectionState.annotationStepCount = 0;
-      selectionState.annotationHistory = [];
-      selectionState.annotationRedoStack = [];
+      retireAnnotationCandidates();
       updateAnnotationUI(null);
       return;
     }
@@ -325,8 +269,9 @@ export function initAnnotationSelection(options) {
     requireSavedHighlightGroup(
       savedGroup,
       'annotation',
-      cellIndices.length,
-      'Saved annotation highlight group'
+      cellIndices,
+      'Saved annotation highlight group',
+      state.pointCount
     );
 
     trackDelivery(deliverSelectionToJupyter({
@@ -340,10 +285,7 @@ export function initAnnotationSelection(options) {
 
     debug.log(`[UI] Annotation selected ${cellIndices.length} cells from ${selectionState.annotationStepCount} step(s)`);
 
-    selectionState.annotationCandidateSet = null;
-    selectionState.annotationStepCount = 0;
-    selectionState.annotationHistory = [];
-    selectionState.annotationRedoStack = [];
+    retireAnnotationCandidates();
     updateAnnotationUI(null);
 
     state.clearPreviewHighlight();
@@ -431,61 +373,73 @@ export function initAnnotationSelection(options) {
   }
 
   function getAnnotationControls() {
-    let controls = documentOwner.getElementById('annotation-step-controls');
-    const created = controls === null;
-    if (created) {
-      controls = documentOwner.createElement('div');
-      controls.id = 'annotation-step-controls';
-      controls.className = 'lasso-step-controls';
-      controls.innerHTML = `
-        <button type="button" class="btn-small lasso-confirm" id="annotation-confirm-btn">Confirm</button>
-        <button type="button" class="btn-small btn-undo" id="annotation-undo-btn" title="Undo">↩</button>
-        <button type="button" class="btn-small btn-redo" id="annotation-redo-btn" title="Redo">↪</button>
-        <button type="button" class="btn-small lasso-cancel" id="annotation-cancel-btn">Cancel</button>
-      `;
-      highlightModeDescriptionEl.parentElement.appendChild(controls);
-    }
-    const undoButton = requireDomElement(
-      documentOwner.getElementById('annotation-undo-btn'),
-      'Annotation undo button',
-      ['addEventListener']
-    );
-    const redoButton = requireDomElement(
-      documentOwner.getElementById('annotation-redo-btn'),
-      'Annotation redo button',
-      ['addEventListener']
-    );
-    const confirmButton = requireDomElement(
-      documentOwner.getElementById('annotation-confirm-btn'),
-      'Annotation confirm button',
-      ['addEventListener']
-    );
-    const cancelButton = requireDomElement(
-      documentOwner.getElementById('annotation-cancel-btn'),
-      'Annotation cancel button',
-      ['addEventListener']
-    );
-    if (created) {
-      listen(undoButton, 'click', handleAnnotationUndo);
-      listen(redoButton, 'click', handleAnnotationRedo);
-      listen(confirmButton, 'click', handleAnnotationConfirm);
-      listen(cancelButton, 'click', () => {
-        viewer.cancelAnnotationSelection();
-      });
-    }
-    return { undoButton, redoButton, confirmButton };
+    return getStepControls({
+      documentOwner,
+      tool: 'annotation',
+      parent: highlightModeDescriptionEl.parentElement,
+      listen,
+      handlers: {
+        undo: handleAnnotationUndo,
+        redo: handleAnnotationRedo,
+        confirm: handleAnnotationConfirm,
+        cancel: () => {
+          viewer.cancelAnnotationSelection();
+        }
+      }
+    });
   }
 
-  function updateAnnotationUI(stepEvent) {
+  /**
+   * Re-publish what the tool already holds, with one explanatory notice.
+   *
+   * The live preview repaints the highlight on every pointer move, including
+   * the move that ends on nothing, so a gesture that commits no step still has
+   * to restore the standing selection — otherwise the panel keeps saying
+   * "Step 3: 812 cells" over a canvas the preview has already wiped.
+   */
+  function renderAnnotationState(notice) {
+    const candidates = selectionState.annotationCandidateSet;
+    if (candidates === null) {
+      updateAnnotationUI(null, notice);
+      state.clearPreviewHighlight();
+      return;
+    }
+    if (candidates.size === 0) {
+      updateAnnotationUI(
+        { step: 0, candidateCount: 0, keepControls: true },
+        notice
+      );
+      state.clearPreviewHighlight();
+      return;
+    }
+    updateAnnotationUI({
+      step: selectionState.annotationStepCount,
+      candidateCount: candidates.size,
+      restored: true
+    }, notice);
+    state.setPreviewHighlightFromIndices([...candidates]);
+  }
+
+  function updateAnnotationUI(stepEvent, notice = '') {
     if (destroyed) return;
     const activeField = state.getActiveField();
     const isCategorical =
       activeField !== null && activeField.kind === 'category';
+    const noticeHtml = selectionNoticeHtml(notice);
 
     if (!stepEvent || (stepEvent.step === 0 && !stepEvent.keepControls)) {
-      highlightModeDescriptionEl.innerHTML = HIGHLIGHT_MODE_COPY.annotation;
-      const existingControls = documentOwner.getElementById('annotation-step-controls');
-      if (existingControls) existingControls.remove();
+      // Without an active field the viewer never starts an annotation gesture
+      // at all, so the idle copy has to say that instead of inviting a click
+      // that cannot do anything.
+      const idleCopy = activeField === null
+        ? ANNOTATION_NEEDS_FIELD_COPY
+        : HIGHLIGHT_MODE_COPY.annotation;
+      highlightModeDescriptionEl.innerHTML = `${idleCopy}${noticeHtml}`;
+      removeStepControls(
+        documentOwner,
+        'annotation',
+        highlightModeDescriptionEl.parentElement
+      );
       return;
     }
 
@@ -504,7 +458,7 @@ export function initAnnotationSelection(options) {
       redoButton.disabled = selectionState.annotationRedoStack.length === 0;
       confirmButton.disabled = true;
 
-      highlightModeDescriptionEl.innerHTML = stepInfo;
+      highlightModeDescriptionEl.innerHTML = `${stepInfo}${noticeHtml}`;
       return;
     }
 
@@ -538,12 +492,12 @@ export function initAnnotationSelection(options) {
     redoButton.disabled = selectionState.annotationRedoStack.length === 0;
     confirmButton.disabled = stepEvent.candidateCount === 0;
 
-    highlightModeDescriptionEl.innerHTML = stepInfo;
+    highlightModeDescriptionEl.innerHTML = `${stepInfo}${noticeHtml}`;
   }
 
   function restoreAnnotationSelection(unifiedState) {
     if (destroyed) return;
-    requireUnifiedSelectionState(unifiedState);
+    requireUnifiedSelectionState(unifiedState, state.pointCount);
     selectionState.annotationHistory = [];
     selectionState.annotationRedoStack = [];
     selectionState.annotationCandidateSet = unifiedState.inProgress
@@ -569,6 +523,24 @@ export function initAnnotationSelection(options) {
 
   viewer.setSelectionStepCallback(handleAnnotationStep);
 
+  // Whether an annotation gesture can do anything is decided by the active
+  // field, and the app publishes every change to it — and to the filters that
+  // decide which cells a gesture may reach — as `visibility:changed`. Without
+  // this the idle copy would keep whichever precondition was true when the mode
+  // was last entered. Only the idle copy is refreshed: an in-progress selection
+  // owns the panel, and the other three tools own it in their own modes.
+  const unsubscribeVisibility = state.on('visibility:changed', () => {
+    if (destroyed) return;
+    if (selectionState.activeMode !== 'annotation') return;
+    if (selectionState.annotationCandidateSet !== null) return;
+    updateAnnotationUI(null);
+  });
+  if (typeof unsubscribeVisibility !== 'function') {
+    throw new TypeError(
+      'Annotation selection requires a visibility unsubscribe function.'
+    );
+  }
+
   return {
     handleAnnotationStep,
     restoreAnnotationSelection,
@@ -578,6 +550,11 @@ export function initAnnotationSelection(options) {
       const failures = [];
       try {
         lifecycleController.abort();
+      } catch (error) {
+        failures.push(error);
+      }
+      try {
+        unsubscribeVisibility();
       } catch (error) {
         failures.push(error);
       }

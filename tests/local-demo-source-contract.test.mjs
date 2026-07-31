@@ -1118,14 +1118,21 @@ test(
     const failingCatalogManager = createDataSourceManager();
     await failingCatalogManager.initialize();
     assert.equal(invalidIdentityRequests, 0);
-    await assert.rejects(
-      failingCatalogManager.getAllDatasets(),
+    const firstPass = await failingCatalogManager.getAllDatasets();
+    const firstDemoFailure = firstPass.find(
+      entry => entry.sourceType === 'local-demo'
+    );
+    assert.match(
+      firstDemoFailure.error.message,
       /rejected.*dataset_identity.*unsupported field.*_cellucid_version_marker/i
     );
+    assert.deepEqual(firstDemoFailure.datasets, []);
     assert.equal(invalidIdentityRequests, 1);
-    await assert.rejects(
-      failingCatalogManager.getAllDatasets(),
-      /rejected.*dataset_identity.*unsupported field.*_cellucid_version_marker/i
+    const secondPass = await failingCatalogManager.getAllDatasets();
+    assert.equal(
+      secondPass.find(entry => entry.sourceType === 'local-demo').error,
+      firstDemoFailure.error,
+      'the rejected catalog must be republished from cache, never re-fetched'
     );
     assert.equal(invalidIdentityRequests, 1);
     assert.equal(failingCatalogManager.hasActiveDataset(), false);
@@ -1203,19 +1210,28 @@ test(
     await manager.initialize();
     assert.equal(manager.hasActiveDataset(), false);
 
-    let rejectedCatalogError = null;
-    await assert.rejects(manager.getAllDatasets(), error => {
-      assert.match(
-        error.message,
-        /rejected.*dataset_identity.*unsupported field.*_cellucid_version_marker/i
-      );
-      rejectedCatalogError = error;
-      return true;
-    });
+    // A rejected sample catalog is that catalog's failure. Enumerating sources
+    // still succeeds, so every explicit local loader below stays reachable.
+    const catalogPass = await manager.getAllDatasets();
+    const rejectedEntry = catalogPass.find(
+      entry => entry.sourceType === 'local-demo'
+    );
+    assert.match(
+      rejectedEntry.error.message,
+      /rejected.*dataset_identity.*unsupported field.*_cellucid_version_marker/i
+    );
+    const rejectedCatalogError = rejectedEntry.error;
+    assert.equal(
+      catalogPass.some(entry => entry.sourceType === 'local-user'),
+      false,
+      'an unavailable local source stays omitted rather than reported failed'
+    );
     const requestsAfterCatalogRejection = invalidIdentityRequests;
-    await assert.rejects(
-      manager.getAllDatasets(),
-      error => error === rejectedCatalogError
+    assert.equal(
+      (await manager.getAllDatasets()).find(
+        entry => entry.sourceType === 'local-demo'
+      ).error,
+      rejectedCatalogError
     );
     assert.equal(manager.hasActiveDataset(), false);
     assert.equal(manager.getCurrentDatasetId(), null);

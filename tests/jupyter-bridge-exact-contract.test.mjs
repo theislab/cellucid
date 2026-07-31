@@ -1313,6 +1313,7 @@ test('Jupyter mode does not register or enumerate the unrelated demo catalog', a
   assert.deepEqual(await manager.getAllDatasets(), [{
     sourceType: 'jupyter',
     datasets: [{ id: 'python-dataset', name: 'Python dataset' }],
+    error: null,
   }]);
   assert.equal(jupyterAvailabilityCalls, 1);
   assert.equal(jupyterListingCalls, 1);

@@ -193,6 +193,7 @@ export function initHighlightSelectionTools(options) {
   });
 
   const modeUi = initHighlightModeUI({
+    state,
     viewer,
     dom: {
       modeButtons: dom.modeButtons,

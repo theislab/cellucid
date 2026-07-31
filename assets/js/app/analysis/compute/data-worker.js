@@ -220,9 +220,15 @@ function computeGeneMarkers(payload) {
     }
   }
 
-  // Output arrays per group (same order as groups)
+  // Output arrays per group (same order as groups).
+  //
+  // The test statistic itself is deliberately not among them. Marker discovery
+  // reports probabilities, fold changes and expression fractions; nothing on the
+  // way to the panel, the heatmap, the volcano or the cache ever read a U or a
+  // t. Carrying one only invited a silent precision loss: Mann-Whitney U reaches
+  // n1*n2, which is 20,250,000 for two sides of 4,500 cells, and every odd
+  // integer above 2^24 is unrepresentable in Float32.
   const pValues = new Float64Array(groupCount);
-  const statistics = new Float32Array(groupCount);
   const log2FoldChange = new Float32Array(groupCount);
   const meanInGroup = new Float32Array(groupCount);
   const meanOutGroup = new Float32Array(groupCount);
@@ -231,18 +237,24 @@ function computeGeneMarkers(payload) {
   const nOut = new Uint32Array(groupCount);
 
   pValues.fill(NaN);
-  statistics.fill(NaN);
   log2FoldChange.fill(NaN);
   meanInGroup.fill(NaN);
   meanOutGroup.fill(NaN);
   percentInGroup.fill(0);
   percentOutGroup.fill(0);
 
+  // `nIn[g] + nOut[g] === nAll` is an identity over the cells that carry a
+  // measured value for this gene, and it holds whether or not the group can be
+  // tested. It is established for every group before any early return, so a gene
+  // that no group could be tested on still describes how the sample was split.
+  for (let g = 0; g < groupCount; g++) {
+    nOut[g] = nAll - nIn[g];
+  }
+
   if (nAll < 2) {
     return {
       nAll,
       pValues,
-      statistics,
       log2FoldChange,
       meanInGroup,
       meanOutGroup,
@@ -253,14 +265,13 @@ function computeGeneMarkers(payload) {
     };
   }
 
-  // Means and percent-expressing for each group vs rest
+  // Means and percent-expressing for each group vs rest. A group with no
+  // measured cell for this gene has no mean and no fold change; those stay NaN.
   for (let g = 0; g < groupCount; g++) {
     const nA = nIn[g];
     if (nA === 0) continue;
 
-    const nB = nAll - nA;
-    nOut[g] = nB;
-
+    const nB = nOut[g];
     const meanA = nA > 0 ? runningMeanIn[g] : NaN;
     const meanB = nB > 0
       ? (runningMeanAll * nAll - meanA * nA) / nB
@@ -278,7 +289,7 @@ function computeGeneMarkers(payload) {
     percentOutGroup[g] = nB > 0 ? (exprB / nB) * 100 : 0;
   }
 
-  // p-values/statistics
+  // p-values
   if (method === 'ttest') {
     for (let g = 0; g < groupCount; g++) {
       const nA = nIn[g];
@@ -305,13 +316,11 @@ function computeGeneMarkers(payload) {
 
       const test = welchTTestFromMoments(meanA, varA, nA, meanB, varB, nB);
       pValues[g] = Number.isFinite(test.pValue) ? test.pValue : NaN;
-      statistics[g] = Number.isNaN(test.statistic) ? NaN : test.statistic;
     }
 
     return {
       nAll,
       pValues,
-      statistics,
       log2FoldChange,
       meanInGroup,
       meanOutGroup,
@@ -383,14 +392,12 @@ function computeGeneMarkers(payload) {
       allowExact: true
     });
 
-    statistics[g] = Number.isFinite(U) ? U : NaN;
     pValues[g] = Number.isFinite(p) ? p : NaN;
   }
 
   return {
     nAll,
     pValues,
-    statistics,
     log2FoldChange,
     meanInGroup,
     meanOutGroup,

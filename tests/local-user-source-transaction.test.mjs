@@ -1271,6 +1271,7 @@ test(
       `${baseUrl}points_2d.bin`,
       {
         dimension: 2,
+        expectedBytes: obsManifest.n_points * 2 * 4,
         signal,
         stagedSource: candidate,
       }

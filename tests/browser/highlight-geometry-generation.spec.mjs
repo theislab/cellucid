@@ -117,9 +117,13 @@ test('highlight upload follows exact same-reference geometry generations', async
     }
   });
   page.on('requestfailed', request => {
-    requestFailures.push(
-      `${request.method()} ${request.url()} ${request.failure()?.errorText ?? ''}`,
-    );
+    // A superseded dataset load cancels its in-flight manifest fetches through
+    // the loader's own AbortSignal, so net::ERR_ABORTED is the designed
+    // cancellation rather than a load failure. A genuine failure still surfaces
+    // through responseFailures and pageErrors, which are asserted separately.
+    const errorText = request.failure()?.errorText ?? '';
+    if (errorText === 'net::ERR_ABORTED') return;
+    requestFailures.push(`${request.method()} ${request.url()} ${errorText}`);
   });
 
   await installHighlightUploadAudit(page);
@@ -376,9 +380,13 @@ test('highlight OOM is report-once, pane-local, and recovers on a semantic gener
     }
   });
   page.on('requestfailed', request => {
-    requestFailures.push(
-      `${request.method()} ${request.url()} ${request.failure()?.errorText ?? ''}`,
-    );
+    // A superseded dataset load cancels its in-flight manifest fetches through
+    // the loader's own AbortSignal, so net::ERR_ABORTED is the designed
+    // cancellation rather than a load failure. A genuine failure still surfaces
+    // through responseFailures and pageErrors, which are asserted separately.
+    const errorText = request.failure()?.errorText ?? '';
+    if (errorText === 'net::ERR_ABORTED') return;
+    requestFailures.push(`${request.method()} ${request.url()} ${errorText}`);
   });
 
   await installHighlightUploadAudit(page);

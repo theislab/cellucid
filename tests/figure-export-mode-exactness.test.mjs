@@ -50,6 +50,7 @@ function baseRequest(overrides = {}) {
     signal: new AbortController().signal,
     strategy: null,
     optimizedTargetCount: null,
+    referenceGrid: null,
     ...overrides,
   };
 }

@@ -405,6 +405,8 @@ export class VectorFieldManager {
           showProgress,
           displayName: `${dimension}D vector field`,
           dimension,
+          expectedBytes:
+            cellCount * dimension * Float32Array.BYTES_PER_ELEMENT,
           signal: null,
           progressTrackerId: null,
         }

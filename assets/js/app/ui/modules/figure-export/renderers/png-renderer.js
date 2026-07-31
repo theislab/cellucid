@@ -35,11 +35,24 @@
  * @module ui/modules/figure-export/renderers/png-renderer
  */
 
-	import { computeSingleViewLayout, computeGridDims } from '../utils/layout.js';
+	import {
+	  computeSingleViewLayout,
+	  computeGridDims,
+	  computeGridPaneLayout,
+	  LAYOUT_CONSTANTS,
+	} from '../utils/layout.js';
 	import { drawCanvasAxes } from '../components/axes-builder.js';
-	import { drawCanvasLegend } from '../components/legend-builder.js';
+	import {
+	  drawCanvasLegend,
+	  resolveSharedGridLegend,
+	} from '../components/legend-builder.js';
 	import { drawCanvasOrientationIndicator } from '../components/orientation-indicator.js';
 	import { drawCanvasCentroidOverlay } from '../components/centroid-overlay.js';
+	import {
+	  buildReferenceGridModel,
+	  drawCanvasReferenceGrid,
+	  resolveReferenceGridSurfaceRgb,
+	} from '../components/reference-grid.js';
 	import {
 	  computeVisibleCameraBounds,
 	  computeVisibleRealBounds,
@@ -51,6 +64,7 @@ import {
   releaseWebglRasterCanvas,
 } from '../utils/webgl-point-rasterizer.js';
 import { hexToRgb01, rgb01ToHex } from '../utils/color-utils.js';
+import { resolveFigureInk } from '../utils/figure-ink.js';
 	import { computeLetterboxedRect } from '../utils/letterbox.js';
 import { assertCameraState } from '../../../../../rendering/camera-state-contract.js';
 import {
@@ -60,54 +74,33 @@ import {
 import { canvasToBlob } from '../utils/export-helpers.js';
 import { clamp } from '../../../../utils/number-utils.js';
 import {
-  areLegendModelsSemanticallyEqual,
-} from '../utils/legend-model-equality.js';
+  buildProvenanceDescription,
+  buildProvenanceJson,
+  readProvenanceSourceFile,
+  readProvenanceViews,
+  unanimousFieldKey,
+} from '../utils/figure-provenance.js';
+import { panelLetter } from '../utils/panel-label.js';
+import {
+  buildSelectionBadge,
+  countHighlightedVisiblePoints,
+} from '../utils/selection-badge.js';
 
-function computeGridPaneLayout({
-  cellX,
-  cellY,
-  cellWidth,
-  cellHeight,
-  includeAxes,
-  fontSize,
-}) {
-  const padding = clamp(Math.round(fontSize * 0.65), 6, 12);
-  const innerWidth = Math.max(1, cellWidth - padding * 2);
-  const innerHeight = Math.max(1, cellHeight - padding * 2);
-  const headerHeight = Math.min(
-    Math.max(18, Math.round(fontSize * 1.5)),
-    Math.max(0, innerHeight - 1)
-  );
-  const plotAreaHeight = Math.max(1, innerHeight - headerHeight);
-  const minPlotWidth = Math.min(80, Math.max(1, innerWidth * 0.45));
-  const minPlotHeight = Math.min(64, Math.max(1, plotAreaHeight * 0.45));
-  const axisRight = includeAxes
-    ? Math.min(10, Math.max(0, innerWidth - minPlotWidth))
-    : 0;
-  const axisLeft = includeAxes
-    ? Math.min(62, Math.max(0, innerWidth - axisRight - minPlotWidth))
-    : 0;
-  const axisBottom = includeAxes
-    ? Math.min(62, Math.max(0, plotAreaHeight - minPlotHeight))
-    : 0;
-  const plotRect = {
-    x: cellX + padding + axisLeft,
-    y: cellY + padding + headerHeight,
-    width: Math.max(1, innerWidth - axisLeft - axisRight),
-    height: Math.max(1, plotAreaHeight - axisBottom),
-  };
-
-  return {
-    labelX: plotRect.x,
-    labelY: cellY + padding + Math.min(fontSize, Math.max(1, headerHeight)),
-    panelRect: {
-      x: cellX + 1,
-      y: cellY + 1,
-      width: Math.max(1, cellWidth - 2),
-      height: Math.max(1, cellHeight - 2),
-    },
-    plotRect,
-  };
+function drawCanvasSelectionBadge(ctx, badge, fontFamily, fontSize, ink) {
+  ctx.save();
+  ctx.globalAlpha = 0.85;
+  ctx.fillStyle = ink.surface;
+  ctx.fillRect(badge.x, badge.y, badge.width, badge.height);
+  ctx.globalAlpha = 1;
+  ctx.strokeStyle = ink.frame;
+  ctx.lineWidth = 1;
+  ctx.strokeRect(badge.x, badge.y, badge.width, badge.height);
+  ctx.fillStyle = ink.surfaceInk;
+  ctx.font = `${fontSize}px ${fontFamily}`;
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'alphabetic';
+  ctx.fillText(badge.label, badge.textX, badge.textY);
+  ctx.restore();
 }
 
 function applyExportBackgroundToRenderState(renderState, background, backgroundColor) {
@@ -125,71 +118,29 @@ function applyExportBackgroundToRenderState(renderState, background, backgroundC
   };
 }
 
-	function buildPngTextMetadata(meta, payload) {
+	/**
+	 * The exact UTF-8 `iTXt` chunk map embedded into the exported PNG.
+	 *
+	 * Exported because it is the PNG's provenance claim: it can then be checked
+	 * against the SVG's, which is the only way to know the two formats of one
+	 * export say the same thing.
+	 *
+	 * @param {any} meta
+	 * @param {any} payload
+	 * @returns {Record<string, string>}
+	 */
+	export function buildPngTextMetadata(meta, payload) {
 	  const dataset = meta?.datasetName || meta?.datasetId || '';
 	  const exportedAt = String(meta?.exportedAt || new Date().toISOString());
 	  const website = 'https://cellucid.com';
 
-	  const sourceFile = (
-	    meta?.datasetUserPath ||
-	    meta?.datasetSourceUrl ||
-	    meta?.datasetBaseUrl ||
-	    null
-	  );
+	  const sourceFile = readProvenanceSourceFile(meta);
 
-	  const descriptionParts = [];
-	  if (meta?.fieldKey) descriptionParts.push(`Field: ${meta.fieldKey}`);
-	  if (meta?.viewLabel) descriptionParts.push(`View: ${meta.viewLabel}`);
-	  if (sourceFile) descriptionParts.push(`Source: ${sourceFile}`);
-	  if (Array.isArray(meta?.filters) && meta.filters.length) {
-	    const lines = meta.filters.filter((l) => l && !/No filters active/i.test(String(l)));
-	    if (lines.length) descriptionParts.push(`Filters: ${lines.join('; ')}`);
-	  }
-	  const description = descriptionParts.join(' • ');
-
-	  const comment = JSON.stringify(
-	    {
-	      generator: website,
-	      exporter: meta?.exporter || { name: 'Cellucid', website },
-	      exportedAt,
-	      dataset: {
-	        name: meta?.datasetName || null,
-	        id: meta?.datasetId || null,
-	        sourceType: meta?.sourceType || null,
-	        baseUrl: meta?.datasetBaseUrl || null,
-	        userPath: meta?.datasetUserPath || null,
-	        source: {
-	          name: meta?.datasetSourceName || null,
-	          url: meta?.datasetSourceUrl || null,
-	          citation: meta?.datasetSourceCitation || null,
-	        },
-	      },
-	      view: {
-	        id: meta?.viewId || null,
-	        label: meta?.viewLabel || null,
-	      },
-	      field: {
-	        key: meta?.fieldKey || null,
-	        kind: meta?.fieldKind || null,
-	      },
-	      filters: Array.isArray(meta?.filters) ? meta.filters : [],
-	      export: {
-	        format: 'png',
-	        width: Number.isFinite(payload?.width) ? payload.width : null,
-	        height: Number.isFinite(payload?.height) ? payload.height : null,
-	        dpi: Number.isFinite(payload?.dpi) ? payload.dpi : null,
-	        strategy: payload.options.strategy,
-	        includeAxes: payload.options.includeAxes,
-	        includeLegend: payload.options.includeLegend,
-	        legendPosition: payload.options.legendPosition,
-	        background: payload.options.background,
-	        backgroundColor: payload.options.backgroundColor,
-	        crop: payload.options.crop,
-	      }
-	    },
-	    null,
-	    0
-	  );
+	  // Every exported panel is described; `Color Field` is only claimed when all
+	  // of them really carry the same field.
+	  const description = buildProvenanceDescription(meta);
+	  const colorField = unanimousFieldKey(readProvenanceViews(meta));
+	  const comment = buildProvenanceJson(meta, payload, 'png');
 
 	  return {
 	    Software: 'Cellucid (cellucid.com)',
@@ -197,7 +148,7 @@ function applyExportBackgroundToRenderState(renderState, background, backgroundC
 	    'Creation Time': exportedAt,
 	    ...(dataset ? { Dataset: String(dataset) } : {}),
 	    ...(meta?.datasetId ? { 'Dataset ID': String(meta.datasetId) } : {}),
-	    ...(meta?.fieldKey ? { 'Color Field': String(meta.fieldKey) } : {}),
+	    ...(colorField ? { 'Color Field': colorField } : {}),
 	    ...(sourceFile ? { 'Source File': String(sourceFile) } : {}),
 	    ...(description ? { Description: String(description) } : {}),
 	    ...(comment ? { Comment: String(comment) } : {}),
@@ -268,6 +219,19 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
   const backgroundColor = background === 'custom'
     ? opts.backgroundColor
     : (background === 'viewer' ? viewerBgHex : '#ffffff');
+
+  // Annotation ink follows the figure's own paper: a near-black title on a
+  // dark-background export cannot be read.
+  const ink = resolveFigureInk({ background, backgroundColor });
+
+  // The reference grid is a viewer-owned background layer: it sits behind the
+  // points in every panel, exactly as `drawGrid()` does on screen.
+  const referenceGrid = opts.referenceGrid;
+  const referenceGridSurfaceRgb = resolveReferenceGridSurfaceRgb({
+    appearance: referenceGrid,
+    background,
+    backgroundColor,
+  });
 
   const singleView = views.length === 1;
   const singleViewId = singleView ? views[0].id : null;
@@ -392,7 +356,7 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
       const titleSize = Math.max(14, titleFontSize);
       const tx = layout.titleRect ? (layout.titleRect.x + layout.titleRect.width / 2) : (layout.outerPadding + (layout.totalWidth - layout.outerPadding * 2) / 2);
       ctx.save();
-      ctx.fillStyle = '#111';
+      ctx.fillStyle = ink.text;
       ctx.font = `${titleSize}px ${fontFamily}`;
       ctx.textBaseline = 'alphabetic';
       ctx.textAlign = 'center';
@@ -429,7 +393,7 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
     const hasVisibleCells = visibleBounds !== null;
 
     // Plot frame.
-    ctx.strokeStyle = '#e5e7eb';
+    ctx.strokeStyle = ink.frame;
     ctx.lineWidth = 1;
     ctx.strokeRect(plotRect.x, plotRect.y, plotRect.width, plotRect.height);
 
@@ -440,6 +404,17 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
     ctx.beginPath();
     ctx.rect(plotRect.x, plotRect.y, plotRect.width, plotRect.height);
     ctx.clip();
+
+    drawCanvasReferenceGrid({
+      ctx,
+      model: buildReferenceGridModel({
+        appearance: referenceGrid,
+        renderState,
+        plotRect,
+        crop,
+        surfaceRgb: referenceGridSurfaceRgb,
+      }),
+    });
 
     const outW = Math.max(1, Math.round(plotRect.width * scale));
     const outH = Math.max(1, Math.round(plotRect.height * scale));
@@ -544,8 +519,8 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
         crop,
         fontFamily,
         labelFontSizePx: centroidLabelFontSize,
-        labelColor: '#111',
-        haloColor: background === 'transparent' ? 'rgba(255,255,255,0.95)' : backgroundColor,
+        labelColor: ink.text,
+        haloColor: background === 'transparent' ? ink.halo : backgroundColor,
       });
     }
 
@@ -557,35 +532,18 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
         viewMatrix: renderState.viewMatrix,
         cameraState,
         fontFamily,
-        fontSize: orientationFontSize
+        fontSize: orientationFontSize,
+        ink
       });
     }
 
-    if (emphasizeSelection && highlightCount > 0) {
-      const label = `n = ${highlightCount.toLocaleString()} selected`;
-      const boxPad = 6;
-      const boxH = Math.max(16, Math.round(baseFontSize * 1.35));
-      const boxW = Math.min(
-        Math.max(1, plotRect.width - 16),
-        Math.max(90, Math.round(label.length * (baseFontSize * 0.62) + boxPad * 2))
-      );
-      const boxX = plotRect.x + 8;
-      const boxY = plotRect.y + 8;
-
-      ctx.save();
-      ctx.globalAlpha = 0.85;
-      ctx.fillStyle = '#ffffff';
-      ctx.fillRect(boxX, boxY, boxW, boxH);
-      ctx.globalAlpha = 1;
-      ctx.strokeStyle = '#e5e7eb';
-      ctx.lineWidth = 1;
-      ctx.strokeRect(boxX, boxY, boxW, boxH);
-      ctx.fillStyle = '#111';
-      ctx.font = `${baseFontSize}px ${fontFamily}`;
-      ctx.textAlign = 'left';
-      ctx.textBaseline = 'alphabetic';
-      ctx.fillText(label, boxX + boxPad, boxY + boxH - boxPad);
-      ctx.restore();
+    if (emphasizeSelection) {
+      const badge = buildSelectionBadge({
+        count: highlightCount,
+        plotRect,
+        fontSizePx: baseFontSize,
+      });
+      if (badge) drawCanvasSelectionBadge(ctx, badge, fontFamily, baseFontSize, ink);
     }
 
     // Legend.
@@ -597,7 +555,8 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
         model: singleLegendModel,
         fontFamily,
         fontSize: legendFontSize,
-        backgroundFill: background === 'transparent' ? 'transparent' : backgroundColor
+        backgroundFill: background === 'transparent' ? 'transparent' : backgroundColor,
+        ink
       });
     }
 
@@ -612,7 +571,7 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
         fontFamily,
         tickFontSize,
         labelFontSize: axisLabelFontSize,
-        color: '#111'
+        color: ink.text
       });
     }
     if (!hasVisibleCells) {
@@ -620,7 +579,7 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
       ctx.beginPath();
       ctx.rect(plotRect.x, plotRect.y, plotRect.width, plotRect.height);
       ctx.clip();
-      ctx.fillStyle = '#6b7280';
+      ctx.fillStyle = ink.mutedText;
       ctx.font = `${baseFontSize}px ${fontFamily}`;
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
@@ -632,8 +591,8 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
       ctx.restore();
     }
   } else {
-    const outerPadding = 20;
-    const titleHeight = title ? 34 : 0;
+    const outerPadding = LAYOUT_CONSTANTS.OUTER_PADDING;
+    const titleHeight = title ? LAYOUT_CONSTANTS.TITLE_HEIGHT : 0;
     const contentX = outerPadding;
     const contentY = outerPadding + titleHeight;
     const contentW = Math.max(1, canvasWidth - outerPadding * 2);
@@ -644,7 +603,7 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
     if (title) {
       const titleSize = Math.max(14, titleFontSize);
       ctx.save();
-      ctx.fillStyle = '#111';
+      ctx.fillStyle = ink.text;
       ctx.font = `${titleSize}px ${fontFamily}`;
       ctx.textBaseline = 'alphabetic';
       ctx.textAlign = 'center';
@@ -652,39 +611,12 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
       ctx.restore();
     }
 
-    // Shared legend only if all panels use the same active field.
-    let sharedLegendModel = null;
-    let sharedFieldKey = null;
-    if (includeLegend) {
-      for (const v of views) {
-        const scientificState = v.scientificState;
-        const fieldKey = scientificState.fieldKey;
-        if (fieldKey === null || scientificState.legendModel === null) {
-          sharedFieldKey = null;
-          sharedLegendModel = null;
-          break;
-        }
-        if (sharedFieldKey == null) {
-          sharedFieldKey = fieldKey;
-          sharedLegendModel = scientificState.legendModel;
-        } else if (
-          sharedFieldKey !== fieldKey ||
-          !areLegendModelsSemanticallyEqual(
-            sharedLegendModel,
-            scientificState.legendModel
-          )
-        ) {
-          sharedFieldKey = null;
-          sharedLegendModel = null;
-          break;
-        }
-      }
-    }
-
-    const wantsSharedLegend =
-      includeLegend &&
-      sharedFieldKey !== null &&
-      sharedLegendModel !== null;
+    // One legend may stand for the whole grid only when the panels agree; a
+    // panel that disagrees keeps its own legend inside its cell (below).
+    const sharedLegend = includeLegend
+      ? resolveSharedGridLegend(views)
+      : null;
+    const wantsSharedLegend = sharedLegend !== null;
     const minimumGridWidth = Math.min(
       contentW,
       cols * (includeAxes ? 150 : 96)
@@ -710,6 +642,10 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
         ? Math.min(140, availableBottomLegendHeight)
         : 0;
     const rendersSharedLegend = legendW > 0 || legendH > 0;
+    // Whatever the shared legend cannot say — because the panels disagree, or
+    // because the figure has no room for it beside the grid — is said per
+    // panel. A coloured figure without any legend cannot be read at all.
+    const rendersPanelLegends = includeLegend && !rendersSharedLegend;
 
     const gridW = Math.max(1, contentW - (legendW ? (gap + legendW) : 0));
     const gridH = Math.max(1, contentH - (legendH ? (gap + legendH) : 0));
@@ -737,6 +673,13 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
       const centroidLabelTexts = Array.isArray(data.centroidLabelTexts) ? data.centroidLabelTexts : null;
       const centroidFlags = data.centroidFlags || null;
 
+      const panelLegendModel = rendersPanelLegends
+        ? view.scientificState.legendModel
+        : null;
+      const panelLegendFieldKey = rendersPanelLegends
+        ? view.scientificState.fieldKey
+        : null;
+
       const col = idx % cols;
       const row = Math.floor(idx / cols);
       const cellX = gridX + col * cellW;
@@ -746,6 +689,7 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
         labelY,
         panelRect,
         plotRect,
+        legendRect: panelLegendRect,
       } = computeGridPaneLayout({
         cellX,
         cellY,
@@ -753,6 +697,9 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
         cellHeight: cellH,
         includeAxes,
         fontSize: baseFontSize,
+        legendModel: panelLegendModel,
+        legendPosition,
+        legendFontSizePx: legendFontSize,
       });
 
       ctx.save();
@@ -762,6 +709,17 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
 
       const renderState = view?.renderState || null;
       if (!renderState?.mvpMatrix) throw new Error('Figure export renderState missing for PNG multiview render');
+
+      drawCanvasReferenceGrid({
+        ctx,
+        model: buildReferenceGridModel({
+          appearance: referenceGrid,
+          renderState,
+          plotRect,
+          crop,
+          surfaceRgb: referenceGridSurfaceRgb,
+        }),
+      });
 
       const dim = view.scientificState.dimensionLevel;
       const cameraState = assertCameraState(
@@ -898,15 +856,15 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
           crop,
           fontFamily,
           labelFontSizePx: centroidLabelFontSize,
-          labelColor: '#111',
-          haloColor: background === 'transparent' ? 'rgba(255,255,255,0.95)' : backgroundColor,
+          labelColor: ink.text,
+          haloColor: background === 'transparent' ? ink.halo : backgroundColor,
         });
       }
 
       ctx.restore();
 
       // Border.
-      ctx.strokeStyle = '#e5e7eb';
+      ctx.strokeStyle = ink.frame;
       ctx.lineWidth = 1;
       ctx.strokeRect(plotRect.x, plotRect.y, plotRect.width, plotRect.height);
 
@@ -937,6 +895,7 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
           cameraState,
           fontFamily,
           fontSize: orientationFontSize,
+          ink,
         });
         ctx.restore();
       }
@@ -960,7 +919,7 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
           fontFamily,
           tickFontSize,
           labelFontSize: axisLabelFontSize,
-          color: '#111',
+          color: ink.text,
         });
         ctx.restore();
       }
@@ -975,7 +934,7 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
           plotRect.height
         );
         ctx.clip();
-        ctx.fillStyle = '#6b7280';
+        ctx.fillStyle = ink.mutedText;
         ctx.font = `${baseFontSize}px ${fontFamily}`;
         ctx.textAlign = 'center';
         ctx.textBaseline = 'middle';
@@ -987,6 +946,42 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
         ctx.restore();
       }
 
+      // Selection badges are counted from this panel's own snapshot: each
+      // panel carries its own filters, so the active view's count would be a
+      // false claim on every other panel.
+      if (emphasizeSelection) {
+        const badge = buildSelectionBadge({
+          count: countHighlightedVisiblePoints({
+            highlightArray,
+            transparency,
+            lodMembership,
+          }),
+          plotRect,
+          fontSizePx: baseFontSize,
+        });
+        if (badge) {
+          ctx.save();
+          ctx.beginPath();
+          ctx.rect(panelRect.x, panelRect.y, panelRect.width, panelRect.height);
+          ctx.clip();
+          drawCanvasSelectionBadge(ctx, badge, fontFamily, baseFontSize, ink);
+          ctx.restore();
+        }
+      }
+
+      if (panelLegendRect && panelLegendModel) {
+        drawCanvasLegend({
+          ctx,
+          legendRect: panelLegendRect,
+          fieldKey: panelLegendFieldKey,
+          model: panelLegendModel,
+          fontFamily,
+          fontSize: legendFontSize,
+          backgroundFill: background === 'transparent' ? 'transparent' : backgroundColor,
+          ink,
+        });
+      }
+
       ctx.save();
       ctx.beginPath();
       ctx.rect(
@@ -996,12 +991,12 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
         panelRect.height
       );
       ctx.clip();
-      ctx.fillStyle = '#111';
+      ctx.fillStyle = ink.text;
       ctx.font = `${baseFontSize}px ${fontFamily}`;
       ctx.textAlign = 'left';
       ctx.textBaseline = 'alphabetic';
       ctx.fillText(
-        `${String.fromCharCode(65 + idx)}. ${viewLabel}`,
+        `${panelLetter(idx)}. ${viewLabel}`,
         labelX,
         labelY
       );
@@ -1012,11 +1007,12 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
       drawCanvasLegend({
         ctx,
         legendRect,
-        fieldKey: sharedFieldKey,
-        model: sharedLegendModel,
+        fieldKey: sharedLegend.fieldKey,
+        model: sharedLegend.model,
         fontFamily,
         fontSize: legendFontSize,
-        backgroundFill: background === 'transparent' ? 'transparent' : backgroundColor
+        backgroundFill: background === 'transparent' ? 'transparent' : backgroundColor,
+        ink
       });
     }
   }

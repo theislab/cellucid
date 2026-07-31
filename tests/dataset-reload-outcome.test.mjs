@@ -1919,7 +1919,7 @@ test('direct position loading fails before publishing success for malformed byte
   await assert.rejects(
     loadPointsBinary(
       'https://cellucid.test/data/points_2d.bin.gz',
-      { showProgress: true }
+      { expectedBytes: null, showProgress: true }
     ),
     /byte length|multiple of 4|Float32Array/i
   );
@@ -1948,7 +1948,7 @@ test('Fetch-decoded response progress never compares decoded bytes with encoded 
 
   const points = await loadPointsBinary(
     'https://cellucid.test/data/points_2d.bin',
-    { showProgress: true }
+    { expectedBytes: null, showProgress: true }
   );
 
   assert.deepEqual(Array.from(points), Array.from(decoded));
@@ -2000,7 +2000,7 @@ test('gzip loading requires its one native backend before any request', async t 
   await assert.rejects(
     loadPointsBinary(
       'https://cellucid.test/data/points_2d.bin.gz',
-      { showProgress: false }
+      { expectedBytes: null, showProgress: false }
     ),
     /gzip payload.*requires browser DecompressionStream support/i
   );
@@ -2035,10 +2035,19 @@ test('prepared gzip loaders expose one exact decompression backend', async () =>
     progressSource.indexOf('requireGzipDecompressionStream(url)') <
       progressSource.indexOf('resolveAnyUrl(')
   );
+  // Decompression is delegated to the one bounded gzip codec, so the progress
+  // path constructs no decompression stream of its own.
   assert.equal(
-    progressSource.match(/new GzipDecompressionStream\('gzip'\)/g)
-      ?.length,
-    2
+    progressSource.match(/new GzipDecompressionStream\(/g),
+    null
+  );
+  assert.match(
+    dataLoadersSource,
+    /import \{ gzipDecompress \} from '\.\.\/app\/session\/codecs\/gzip\.js';/
+  );
+  assert.equal(
+    dataLoadersSource.match(/new GzipDecompressionStream\(/g),
+    null
   );
   assert.match(
     localUserSource,

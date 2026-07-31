@@ -36,19 +36,6 @@ export const highlightAccessorMethods = {
     const values = field.values || [];
     if (cellIndex < 0 || cellIndex >= values.length) return null;
     return values[cellIndex];
-  },
-
-  // Get all highlighted cell indices (unique, merged from all groups).
-  getAllHighlightedCellIndices() {
-    const set = new Set();
-    for (const group of this.highlightedGroups) {
-      if (group.cellIndices) {
-        for (const idx of group.cellIndices) {
-          set.add(idx);
-        }
-      }
-    }
-    return Array.from(set);
   }
 };
 

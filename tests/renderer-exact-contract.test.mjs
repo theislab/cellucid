@@ -1237,6 +1237,7 @@ test('figure export requests publish one complete current contract', () => {
     signal: new AbortController().signal,
     strategy: null,
     optimizedTargetCount: null,
+    referenceGrid: null,
   };
   const single = { ...base, format: 'png', dpi: 300 };
   assert.equal(assertFigureExportSingleRequest(single), single);

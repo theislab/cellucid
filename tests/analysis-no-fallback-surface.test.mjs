@@ -7,7 +7,7 @@ import { StreamingGeneLoader } from '../assets/js/app/analysis/data/streaming-ge
 import { ComparisonModule } from '../assets/js/app/analysis/comparison-module.js';
 import { ExpressionMatrixBuilder } from '../assets/js/app/analysis/genes-panel/expression-matrix-builder.js';
 import { GenesPanelController } from '../assets/js/app/analysis/genes-panel/genes-panel-controller.js';
-import { benjaminiHochberg } from '../assets/js/app/analysis/genes-panel/marker-discovery-engine.js';
+import { benjaminiHochbergAdjusted } from '../assets/js/app/analysis/stats/statistical-tests.js';
 import { MarkerCache } from '../assets/js/app/analysis/genes-panel/marker-cache.js';
 import { ClusteringEngine } from '../assets/js/app/analysis/genes-panel/clustering-engine.js';
 import { BasePlot } from '../assets/js/app/analysis/plots/plot-base.js';
@@ -205,17 +205,35 @@ test('analysis performance settings use exact dataset-aware values', () => {
 });
 
 test('marker p-value correction rejects malformed scientific values', () => {
-  assert.deepEqual(
-    Array.from(benjaminiHochberg(Float64Array.from([0.01, 0.04, 0.03]))),
-    [0.03, 0.04, 0.04],
-  );
+  const dense = benjaminiHochbergAdjusted(Float64Array.from([0.01, 0.04, 0.03]));
+  assert.ok(dense.adjustedPValues instanceof Float64Array);
+  // scipy.stats.false_discovery_control([0.01, 0.04, 0.03], method='bh')
+  assert.deepEqual(Array.from(dense.adjustedPValues), [0.03, 0.04, 0.04]);
+  assert.equal(dense.testedCount, 3);
+  assert.equal(dense.untestableCount, 0);
+
+  // A probability outside [0, 1] is a defect and still fails loudly.
   assert.throws(
-    () => benjaminiHochberg(Float64Array.from([0.01, 1.2])),
+    () => benjaminiHochbergAdjusted(Float64Array.from([0.01, 1.2])),
     /p-value.*between 0 and 1/i,
   );
-  assert.throws(
-    () => benjaminiHochberg(Float64Array.from([0.01, NaN])),
-    /p-value.*finite/i,
+
+  // NaN is not a defect: it is the marker worker's word for a group that could
+  // not be tested for that gene. Such a gene is not in the family, so it leaves
+  // the denominator alone and comes back NaN rather than fabricated.
+  const partial = benjaminiHochbergAdjusted(
+    Float64Array.from([0.01, NaN, 0.04, NaN, 0.03]),
+  );
+  assert.equal(partial.testedCount, 3);
+  assert.equal(partial.untestableCount, 2);
+  assert.ok(Number.isNaN(partial.adjustedPValues[1]));
+  assert.ok(Number.isNaN(partial.adjustedPValues[3]));
+  // The denominator is 3, not 5:
+  // scipy.stats.false_discovery_control([0.01, 0.04, 0.03], method='bh')
+  //   -> [0.03, 0.04, 0.04]
+  assert.deepEqual(
+    [partial.adjustedPValues[0], partial.adjustedPValues[2], partial.adjustedPValues[4]],
+    [0.03, 0.04, 0.04],
   );
 });
 

@@ -1739,3 +1739,128 @@ test('community annotation GitHub sync controls expose exact accessible identiti
 
   expect(productErrors).toEqual([]);
 });
+
+test('welcome modal owns focus, contains Tab, and returns it on close', async ({
+  page
+}) => {
+  const productErrors = observeProductErrors(page);
+  await page.goto(PREPARED_DATASET_URL, { waitUntil: 'domcontentloaded' });
+
+  const modal = page.locator('#welcome-modal');
+  const exploreButton = page.locator('#welcome-demo-btn');
+  const learnMore = modal.getByRole('link', { name: /Learn More/ });
+  const canvas = page.locator('#glcanvas');
+
+  // The modal is `aria-modal="true"`, so focus must enter it and stay inside.
+  await expect(modal).toBeVisible();
+  await expect(exploreButton).toBeFocused();
+
+  await page.keyboard.press('Tab');
+  await expect(learnMore).toBeFocused();
+  await page.keyboard.press('Tab');
+  await expect(exploreButton).toBeFocused();
+  await page.keyboard.press('Tab');
+  await expect(learnMore).toBeFocused();
+  await expect(canvas).not.toBeFocused();
+
+  await page.keyboard.press('Shift+Tab');
+  await expect(exploreButton).toBeFocused();
+  await page.keyboard.press('Shift+Tab');
+  await expect(learnMore).toBeFocused();
+  await expect(canvas).not.toBeFocused();
+
+  await page.keyboard.press('Escape');
+  await expect(modal).toBeHidden();
+  await expect(page.locator('#dataset-name')).toHaveText(
+    'Current UI prepared fixture'
+  );
+
+  // Reopened from a real invoker, closing must hand focus back to it.
+  const resetCamera = page.locator('#reset-camera-btn');
+  await resetCamera.focus();
+  await page.evaluate(async () => {
+    const { showWelcomeModal } = await import(
+      '/assets/js/app/ui/onboarding/welcome-modal.js'
+    );
+    if (showWelcomeModal() !== true) {
+      throw new Error('Welcome modal did not reopen');
+    }
+  });
+  await expect(modal).toBeVisible();
+  await expect(exploreButton).toBeFocused();
+  await page.keyboard.press('Escape');
+  await expect(modal).toBeHidden();
+  await expect(resetCamera).toBeFocused();
+
+  // The explore action owns focus after it closes the modal, and the restored
+  // return target must not steal it back.
+  await page.evaluate(async () => {
+    const { showWelcomeModal } = await import(
+      '/assets/js/app/ui/onboarding/welcome-modal.js'
+    );
+    if (showWelcomeModal() !== true) {
+      throw new Error('Welcome modal did not reopen');
+    }
+  });
+  await expect(exploreButton).toBeFocused();
+  await exploreButton.click();
+  await expect(modal).toBeHidden();
+  await expect(page.locator('#dataset-select')).toBeFocused();
+
+  expect(productErrors).toEqual([]);
+});
+
+test('licence modal owns focus, contains Tab, and returns it to its link', async ({
+  page
+}) => {
+  const productErrors = observeProductErrors(page);
+  await page.goto(PREPARED_DATASET_URL, { waitUntil: 'domcontentloaded' });
+  await dismissWelcome(page);
+  await expect(page.locator('#dataset-name')).toHaveText(
+    'Current UI prepared fixture'
+  );
+
+  const link = page.locator('#license-link');
+  const modal = page.locator('#license-modal');
+  const closeButton = page.locator('#license-close-btn');
+  const body = modal.locator('.license-body');
+  const canvas = page.locator('#glcanvas');
+
+  // The licence text scrolls, so it is a declared tab stop in every engine.
+  await expect(body).toHaveAttribute('tabindex', '0');
+
+  await link.click();
+  await expect(modal).toBeVisible();
+  await expect(closeButton).toBeFocused();
+
+  await page.keyboard.press('Tab');
+  await expect(body).toBeFocused();
+  await page.keyboard.press('Tab');
+  await expect(closeButton).toBeFocused();
+  await expect(canvas).not.toBeFocused();
+
+  await page.keyboard.press('Shift+Tab');
+  await expect(body).toBeFocused();
+  await page.keyboard.press('Shift+Tab');
+  await expect(closeButton).toBeFocused();
+  await expect(canvas).not.toBeFocused();
+
+  await closeButton.click();
+  await expect(modal).toBeHidden();
+  await expect(link).toBeFocused();
+
+  await link.press('Enter');
+  await expect(modal).toBeVisible();
+  await expect(closeButton).toBeFocused();
+  await page.keyboard.press('Escape');
+  await expect(modal).toBeHidden();
+  await expect(link).toBeFocused();
+
+  await link.press('Enter');
+  await expect(modal).toBeVisible();
+  await modal.locator('.license-backdrop').click({ position: { x: 4, y: 4 } });
+  await expect(modal).toBeHidden();
+  await expect(link).toBeFocused();
+
+  expect(productErrors).toEqual([]);
+});

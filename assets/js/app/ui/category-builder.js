@@ -19,6 +19,11 @@ import { formatCellCount } from '../../data/data-source.js';
 import { Limits, OverlapStrategy } from '../utils/field-constants.js';
 import { renderCategoryBuilderDom } from './category-builder/dom.js';
 import { formatIntersectionLabel, renderIntersectionLabelInputs } from './category-builder/intersections.js';
+import {
+  announceKeyboardMove,
+  createKeyboardMove,
+  getKeyboardMoveInstructionsId
+} from './keyboard-move.js';
 
 const DROP_MIME = 'application/x-highlight-page';
 const STRATEGIES = new Set([
@@ -203,6 +208,9 @@ export class CategoryBuilder {
       this._render();
       this._bind();
       this._syncDatasetAvailability();
+      // The drop zone renders its own contents, including the list of pages
+      // still available to add; nothing else pulls that list on startup.
+      this._renderDroppedItems();
 
       // Keep colors, names, and counts synchronized with page ownership.
       unsubscribe = this._state.on('page:changed', () => {
@@ -412,6 +420,8 @@ export class CategoryBuilder {
       panel,
       item,
       dropzone,
+      pageSelect,
+      addPageBtn,
       uncoveredLabel,
       overlapLabel,
       fieldName,
@@ -430,11 +440,21 @@ export class CategoryBuilder {
       onDrop: dataTransfer => {
         const pageId = dataTransfer.getData(DROP_MIME);
         if (pageId.length === 0) return;
-        this._handlePageDrop(pageId);
+        this._addPage(pageId);
       },
       dragClass: 'dragover',
       signal
     });
+
+    // Dragging a highlight page tab in was the only way to fill this zone, and
+    // a tab is not focusable, so the Create button could never leave its
+    // disabled state without a mouse. Choosing a page and pressing Add is the
+    // same operation, spelled as controls both inputs can reach.
+    addPageBtn.addEventListener('click', () => {
+      const pageId = pageSelect.value;
+      if (pageId.length === 0) return;
+      this._addPage(pageId);
+    }, { signal });
 
     uncoveredLabel.addEventListener('input', () => {
       this._updatePreview(true);
@@ -481,7 +501,7 @@ export class CategoryBuilder {
     );
   }
 
-  _handlePageDrop(pageId) {
+  _addPage(pageId) {
     this._assertInitialized();
     if (this._state.pointCount === 0) {
       throw new Error(
@@ -501,6 +521,82 @@ export class CategoryBuilder {
     this._renderDroppedItems();
     this._updatePreview(true);
     this._updateConfirmState();
+    this._announce(
+      `${page.name} added. The new column now has `
+      + `${this._droppedPages.length} category labels.`
+    );
+  }
+
+  /**
+   * Move one dropped page to another page's position.
+   *
+   * The pointer reorder and the keyboard reorder both land here, so neither
+   * input can drift into a different notion of what a reorder does.
+   */
+  _movePage(fromIndex, toIndex) {
+    this._assertInitialized();
+    if (
+      !Number.isSafeInteger(fromIndex)
+      || !Number.isSafeInteger(toIndex)
+      || fromIndex < 0
+      || toIndex < 0
+      || fromIndex >= this._droppedPages.length
+      || toIndex >= this._droppedPages.length
+    ) {
+      throw new RangeError(
+        'Category builder page move is outside its exact inventory'
+      );
+    }
+    if (fromIndex === toIndex) return;
+    const [moved] = this._droppedPages.splice(fromIndex, 1);
+    requireRecord(moved, 'Dragged page');
+    this._droppedPages.splice(toIndex, 0, moved);
+    this._renderDroppedItems();
+    this._updatePreview(true);
+    this._updateConfirmState();
+    return moved;
+  }
+
+  _announce(message) {
+    announceKeyboardMove(this._document, message);
+  }
+
+  /**
+   * Offer every highlight page that is not already a category label.
+   *
+   * The drop zone's only source used to be a `draggable` page tab, which is not
+   * focusable and publishes nothing a keyboard can act on.
+   */
+  _renderPageSources() {
+    this._assertInitialized();
+    const { pageSelect, addPageBtn } = this._els;
+    const added = new Set(this._droppedPages.map((p) => p.pageId));
+    const available = this._requirePageInventory().filter(
+      page => !added.has(page.id)
+    );
+    const usable = available.length > 0 && this._state.pointCount > 0;
+    const previous = pageSelect.value;
+
+    const options = available.map(page => {
+      const option = this._document.createElement('option');
+      option.value = page.id;
+      option.textContent = page.name;
+      return option;
+    });
+    if (!usable) {
+      const option = this._document.createElement('option');
+      option.value = '';
+      option.textContent = available.length === 0
+        ? 'Every page is already added'
+        : 'No highlight pages available';
+      options.push(option);
+    }
+    pageSelect.replaceChildren(...options);
+    if (usable && available.some(page => page.id === previous)) {
+      pageSelect.value = previous;
+    }
+    pageSelect.disabled = !usable;
+    addPageBtn.disabled = !usable;
   }
 
   _renderDroppedItems() {
@@ -511,6 +607,7 @@ export class CategoryBuilder {
     }
     this._droppedItemsLifecycle = new this._view.AbortController();
     const signal = this._droppedItemsLifecycle.signal;
+    this._renderPageSources();
 
     if (this._droppedPages.length === 0) {
       placeholder.hidden = false;
@@ -547,6 +644,7 @@ export class CategoryBuilder {
       row.className = 'dropzone-item';
       row.draggable = true;
       row.dataset.idx = String(idx);
+      row.setAttribute('role', 'listitem');
 
       const colorIndicator = this._document.createElement('span');
       colorIndicator.className = 'dropzone-item-color';
@@ -573,10 +671,25 @@ export class CategoryBuilder {
       );
       colorIndicator.appendChild(colorInput);
 
+      // The handle carried a `Drag to reorder` tooltip and nothing else: no
+      // role, no tab stop, no keys. It is the pick-up handle for the shared
+      // keyboard move grammar now, and still the pointer drag grip.
       const handle = this._document.createElement('span');
       handle.className = 'dropzone-item-handle';
       handle.title = 'Drag to reorder';
       handle.textContent = '⋮⋮';
+      handle.setAttribute('role', 'button');
+      handle.setAttribute('tabindex', '0');
+      handle.setAttribute('aria-roledescription', 'movable category label');
+      handle.setAttribute(
+        'aria-label',
+        `Move ${p.label.trim().length > 0 ? p.label : p.originalName}`
+      );
+      handle.setAttribute(
+        'aria-describedby',
+        getKeyboardMoveInstructionsId(this._document)
+      );
+      handle.setAttribute('aria-keyshortcuts', 'Enter Space');
 
       const input = this._document.createElement('input');
       input.type = 'text';
@@ -608,10 +721,15 @@ export class CategoryBuilder {
       remove.title = 'Remove';
       remove.textContent = '×';
       remove.addEventListener('click', () => {
+        const removedLabel = this._droppedPages[idx].label;
         this._droppedPages.splice(idx, 1);
         this._renderDroppedItems();
         this._updatePreview(true);
         this._updateConfirmState();
+        this._announce(
+          `${removedLabel} removed. The new column now has `
+          + `${this._droppedPages.length} category labels.`
+        );
       }, { signal });
 
       row.appendChild(colorIndicator);
@@ -638,6 +756,8 @@ export class CategoryBuilder {
     let draggedIdx = null;
 
     container.querySelectorAll('.dropzone-item').forEach((item) => {
+      this._bindHandleKeyboardMove(container, item, signal);
+
       item.addEventListener('dragstart', (e) => {
         draggedIdx = requireCanonicalIndex(
           item.dataset.idx,
@@ -692,15 +812,75 @@ export class CategoryBuilder {
         );
         if (draggedIdx === null || draggedIdx === targetIdx) return;
 
-        const [moved] = this._droppedPages.splice(draggedIdx, 1);
-        requireRecord(moved, 'Dragged page');
-        this._droppedPages.splice(targetIdx, 0, moved);
+        const fromIdx = draggedIdx;
         draggedIdx = null;
-        this._renderDroppedItems();
-        this._updatePreview(true);
-        this._updateConfirmState();
+        this._movePage(fromIdx, targetIdx);
       }, { signal });
     });
+  }
+
+  /**
+   * Give one row's grip the shared pick-up / aim / drop / cancel grammar.
+   *
+   * The aimed row is painted with `drag-over`, the same class the pointer path
+   * applies on `dragenter`, so both inputs show the identical destination.
+   */
+  _bindHandleKeyboardMove(container, item, signal) {
+    const handle = item.querySelector('.dropzone-item-handle');
+    if (!(handle instanceof this._view.HTMLElement)) {
+      throw new TypeError('Category builder row requires one move handle');
+    }
+    const sourceIndex = requireCanonicalIndex(
+      item.dataset.idx,
+      this._droppedPages.length,
+      'Movable page index'
+    );
+
+    const move = createKeyboardMove({
+      ownerDocument: this._document,
+      describeSource: () => this._droppedPages[sourceIndex].label,
+      listTargets: () => Array.from(
+        container.querySelectorAll('.dropzone-item')
+      ).flatMap((candidate) => {
+        const index = requireCanonicalIndex(
+          candidate.dataset.idx,
+          this._droppedPages.length,
+          'Page move destination index'
+        );
+        if (index === sourceIndex) return [];
+        return [{
+          element: candidate,
+          index,
+          label: `position ${index + 1}, ${this._droppedPages[index].label}`
+        }];
+      }),
+      onAim: (aimed, previous) => {
+        previous?.element.classList.remove('drag-over');
+        aimed?.element.classList.add('drag-over');
+      },
+      onCommit: (aimed) => {
+        const moved = this._movePage(sourceIndex, aimed.index);
+        this._announce(
+          `${moved.label} moved to position ${aimed.index + 1} `
+          + `of ${this._droppedPages.length}.`
+        );
+        const nextHandle = container.querySelector(
+          `.dropzone-item[data-idx="${aimed.index}"] .dropzone-item-handle`
+        );
+        nextHandle?.focus();
+      },
+      onPickStateChange: (picked) => {
+        item.classList.toggle('dragging', picked);
+      },
+      emptyMessage: 'There is no other category label to move this one past.'
+    });
+
+    handle.addEventListener(
+      'keydown',
+      (event) => { move.handleKeydown(event); },
+      { signal }
+    );
+    handle.addEventListener('blur', () => move.cancel(), { signal });
   }
 
   _getOverlapStrategy() {

@@ -10,6 +10,7 @@
  */
 
 import { welchTTest } from '../compute/math-utils.js';
+import { benjaminiHochbergTestable } from './statistical-tests.js';
 import {
   isFiniteNumber,
   mean as computeMean,
@@ -233,6 +234,14 @@ export function scoreFieldDifference(pageData) {
 // =============================================================================
 
 /**
+ * Rows are listed only when |Cohen's d| exceeds this. It is a reporting rule,
+ * not part of the test: it is applied after every gene has been tested and
+ * corrected, so it never conditions a probability. 0.2 is the conventional
+ * "negligible" boundary, the same cut `computeEffectSizeWithCI` labels with.
+ */
+const EFFECT_SIZE_REPORTING_THRESHOLD = 0.2;
+
+/**
  * Compute Cohen's d effect size with confidence interval
  * @param {number[]} group1 - First group values
  * @param {number[]} group2 - Second group values
@@ -371,13 +380,35 @@ export function computeCategoricalShifts(group1, group2) {
 }
 
 /**
- * Perform quick differential expression analysis between two pages
- * Uses exact Welch inference for every tested gene
+ * Quick differential expression between two pages.
+ *
+ * Every gene in the family is tested. That ordering matters: Cohen's d and the
+ * Welch t statistic share the numerator `mean1 - mean2`, so filtering on
+ * `|d| > EFFECT_SIZE_REPORTING_THRESHOLD` before testing is filtering on the
+ * test statistic itself, and a nominal p reported after such a selection is not
+ * the probability it appears to be. The correction is therefore applied to the
+ * whole family, and the effect-size rule is applied afterwards, to decide which
+ * rows are worth listing rather than which genes were examined.
+ *
+ * The pre-filter still shapes the interpretation of what comes back: `results`
+ * is a subset chosen by observed effect size, so it is not a random sample of
+ * the family and the listed rows are enriched for large effects by
+ * construction. What it no longer does is condition the probabilities. Each row
+ * carries both numbers - `pValue`, the nominal Welch probability for that gene
+ * alone, and `adjustedPValue`, the Benjamini-Hochberg value over the family of
+ * `genesTested` genes - so neither can be mistaken for the other.
+ *
  * @param {Object} dataLayer - Data layer instance
  * @param {string} pageId1 - First page ID
  * @param {string} pageId2 - Second page ID
- * @param {number} maxGenes - Maximum genes to analyze
- * @returns {Promise<Object[]>} Top differential genes
+ * @param {number} maxGenes - Size of the family to examine
+ * @returns {Promise<{
+ *   genesTested: number,
+ *   genesUntestable: number,
+ *   effectSizeThreshold: number,
+ *   results: Object[]
+ * }>} The correction's denominator, the untestable remainder, the effect-size
+ *   rule the rows were selected by, and the selected rows
  */
 export async function computeQuickDifferentialExpression(dataLayer, pageId1, pageId2, maxGenes = 50) {
   if (
@@ -403,9 +434,16 @@ export async function computeQuickDifferentialExpression(dataLayer, pageId1, pag
   if (!Array.isArray(geneVars)) {
     throw new TypeError('Gene variable discovery must return an array');
   }
-  if (geneVars.length === 0) return [];
+  if (geneVars.length === 0) {
+    return {
+      genesTested: 0,
+      genesUntestable: 0,
+      effectSizeThreshold: EFFECT_SIZE_REPORTING_THRESHOLD,
+      results: []
+    };
+  }
 
-  const results = [];
+  const examined = [];
   const genesToTest = geneVars.slice(0, maxGenes);
 
   for (const gene of genesToTest) {
@@ -438,33 +476,49 @@ export async function computeQuickDifferentialExpression(dataLayer, pageId1, pag
       throw new RangeError(`Gene ${gene.key} requires at least two finite values per page`);
     }
     const effect = computeEffectSizeWithCI(values1, values2);
+    // Tested before any selection, so the probability is not conditioned on the
+    // effect size the row is later chosen by.
+    const { pValue } = welchTTest(values1, values2);
+    examined.push({ gene, effect, pValue });
+  }
 
-    if (Math.abs(effect.effectSize) > 0.2) {
-      if (effect.mean1 < 0 || effect.mean2 < 0) {
-        throw new RangeError(`Gene ${gene.key} has a negative mean and no defined log2 fold change`);
-      }
-      const log2FC = Math.log2(effect.mean1 / effect.mean2);
-      const { pValue } = welchTTest(values1, values2);
+  const {
+    adjustedPValues,
+    testedCount,
+    untestableCount
+  } = benjaminiHochbergTestable(examined.map(entry => entry.pValue));
 
-      results.push({
-        gene: gene.key,
-        geneName: gene.name,
-        log2FC,
-        effectSize: effect.effectSize,
-        effectSizeCiLow: effect.ci95Low,
-        effectSizeCiHigh: effect.ci95High,
-        pValue,
-        mean1: effect.mean1,
-        mean2: effect.mean2,
-        interpretation: effect.interpretation
-      });
+  const results = [];
+  for (const [index, { gene, effect, pValue }] of examined.entries()) {
+    if (Math.abs(effect.effectSize) <= EFFECT_SIZE_REPORTING_THRESHOLD) continue;
+    if (effect.mean1 < 0 || effect.mean2 < 0) {
+      throw new RangeError(`Gene ${gene.key} has a negative mean and no defined log2 fold change`);
     }
+
+    results.push({
+      gene: gene.key,
+      geneName: gene.name,
+      log2FC: Math.log2(effect.mean1 / effect.mean2),
+      effectSize: effect.effectSize,
+      effectSizeCiLow: effect.ci95Low,
+      effectSizeCiHigh: effect.ci95High,
+      pValue,
+      adjustedPValue: adjustedPValues[index],
+      mean1: effect.mean1,
+      mean2: effect.mean2,
+      interpretation: effect.interpretation
+    });
   }
 
   // Sort by absolute effect size
   results.sort((a, b) => Math.abs(b.effectSize) - Math.abs(a.effectSize));
 
-  return results;
+  return {
+    genesTested: testedCount,
+    genesUntestable: untestableCount,
+    effectSizeThreshold: EFFECT_SIZE_REPORTING_THRESHOLD,
+    results
+  };
 }
 
 // =============================================================================

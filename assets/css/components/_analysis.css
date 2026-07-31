@@ -2136,11 +2136,6 @@ details.form-section[open] > summary.section-title::after {
   color: var(--color-text-primary);
 }
 
-.insights-collapsible-header:focus-visible {
-  outline: none;
-  color: var(--color-interactive-primary);
-}
-
 .insights-collapsible-toggle {
   font-size: 8px;
   color: var(--color-text-tertiary);

@@ -216,8 +216,17 @@ function assertCurrentMetadata(metadata, {
   expect(Number.isFinite(Date.parse(metadata.exportedAt))).toBe(true);
   expect(metadata.dataset.name).toBe('Current UI prepared fixture');
   expect(metadata.dataset.id).toBe('current-ui-prepared');
-  expect(metadata.view.id).toBe('live');
-  expect(metadata.filters).toEqual(['No filters active']);
+  // Provenance names every exported panel; a single-view export carries one
+  // record and no panel letter, and the "no filters" placeholder is not a
+  // filter.
+  expect(metadata.views).toHaveLength(1);
+  expect(metadata.views[0]).toMatchObject({
+    panel: null,
+    id: 'live',
+    filters: [],
+  });
+  expect(metadata.view).toBeUndefined();
+  expect(metadata.filters).toBeUndefined();
   expect(metadata.export).toMatchObject({
     format,
     width: 400,

@@ -4,6 +4,7 @@
 import { StyleManager } from '../utils/style-manager.js';
 import { isFiniteNumber } from './utils/number-utils.js';
 import { createAccordionInteractions } from './dockable-accordions/interactions.js';
+import { announceKeyboardMove } from './ui/keyboard-move.js';
 
 const DRAG_THRESHOLD_PX = 6;
 const DETACH_DISTANCE_PX = 30;     // Distance from sidebar right edge to detach
@@ -65,30 +66,104 @@ export function initDockableAccordions({ sidebar } = {}) {
     const state = getState(details);
     state.isFloating = floating;
     details.classList.toggle('accordion-floating', floating);
+    const summary = details.querySelector(':scope > summary');
+    if (summary) syncPanelWindowButtons(summary, details);
+  }
+
+  function panelTitle(summary) {
+    const title = summary.textContent?.trim();
+    return title && title.length > 0 ? title : 'Panel';
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // Dock button
+  // Undock / dock buttons
+  //
+  // Tearing a panel off used to be reachable only by dragging its header with a
+  // mouse, while putting it back was a button — so the affordance existed in
+  // one direction and not the other, and the direction that was missing was the
+  // one you needed first. Both directions are buttons now. That is what makes
+  // the feature reachable by keyboard, by touch, and by anyone who never
+  // discovers that a header can be dragged at all.
+  //
+  // A panel is either docked or floating, so its current state already names
+  // the only place it can go: this is the degenerate case of the shared
+  // "pick up, aim, drop" grammar (see `ui/keyboard-move.js`) where there is one
+  // destination and the control commits on activation.
   // ═══════════════════════════════════════════════════════════════════════════
 
-  function syncDockButton(summary, details) {
-    const state = getState(details);
-    const existing = summary.querySelector('.accordion-dock-btn');
-    if (!state.dockable) {
-      existing?.remove();
-      return;
-    }
-    if (existing) return;
+  function ensurePanelButton(summary, selector, className, label, onActivate) {
+    const existing = summary.querySelector(selector);
+    if (existing) return existing;
     const btn = document.createElement('button');
     btn.type = 'button';
-    btn.className = 'accordion-dock-btn';
-    btn.setAttribute('aria-label', 'Dock panel back into sidebar');
+    btn.className = className;
+    btn.setAttribute('aria-label', label);
+    btn.title = label;
     btn.addEventListener('click', (e) => {
       e.preventDefault();
       e.stopPropagation();
-      dock(details);
+      onActivate();
     });
     summary.appendChild(btn);
+    return btn;
+  }
+
+  function syncPanelWindowButtons(summary, details) {
+    const state = getState(details);
+    if (!state.dockable) {
+      summary.querySelector('.accordion-dock-btn')?.remove();
+      summary.querySelector('.accordion-undock-btn')?.remove();
+      return;
+    }
+
+    // `.accordion-copy-btn` is this app's existing "show this panel as its own
+    // floating window" control — the analysis accordions already use it for
+    // exactly that, and it carries the ⧉ glyph. `.accordion-undock-btn` is the
+    // behavioural hook. Both stylesheet rules hide the button unless its panel
+    // is already floating, which is the state this button exists to leave, so
+    // the module states its own visibility here. The durable home for those two
+    // declarations is `assets/css/components/_accordion.css`.
+    const undockBtn = ensurePanelButton(
+      summary,
+      '.accordion-undock-btn',
+      'accordion-copy-btn accordion-undock-btn',
+      'Undock panel into a floating window',
+      () => undockFromButton(summary, details)
+    );
+    const dockBtn = ensurePanelButton(
+      summary,
+      '.accordion-dock-btn',
+      'accordion-dock-btn',
+      'Dock panel back into sidebar',
+      () => dockFromButton(summary, details)
+    );
+    undockBtn.style.display = state.isFloating ? 'none' : 'inline-flex';
+    dockBtn.style.display = state.isFloating ? 'inline-flex' : 'none';
+  }
+
+  function undockFromButton(summary, details) {
+    const state = getState(details);
+    if (state.isFloating || !state.dockable) return;
+    const rect = details.getBoundingClientRect();
+    const sidebarRect = sidebar.getBoundingClientRect();
+    undock(details, sidebarRect.right + 24, rect.top);
+    summary.querySelector('.accordion-dock-btn')?.focus();
+    announceKeyboardMove(
+      document,
+      `${panelTitle(summary)} is now a floating window. `
+      + 'Use the dock button in its header to put it back in the sidebar.'
+    );
+  }
+
+  function dockFromButton(summary, details) {
+    const state = getState(details);
+    if (!state.isFloating || !state.dockable) return;
+    dock(details);
+    summary.querySelector('.accordion-undock-btn')?.focus();
+    announceKeyboardMove(
+      document,
+      `${panelTitle(summary)} is docked in the sidebar again.`
+    );
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -201,6 +276,8 @@ export function initDockableAccordions({ sidebar } = {}) {
       details.classList.remove('floating-enter');
     }, { once: true });
 
+    interactions.syncResizeHandles(details);
+
     if (createPlaceholder) {
       // Hide placeholder after layout settles
       requestAnimationFrame(() => {
@@ -302,7 +379,7 @@ export function initDockableAccordions({ sidebar } = {}) {
 
     const state = getState(details);
     state.dockable = options.dockable !== false;
-    syncDockButton(summary, details);
+    syncPanelWindowButtons(summary, details);
     interactions.ensureResizeHandles(details);
 
     if (state.registered) return;

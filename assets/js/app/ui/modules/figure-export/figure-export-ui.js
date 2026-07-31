@@ -12,6 +12,7 @@ import { clamp, parseFiniteNumberInRange } from '../../../utils/number-utils.js'
 import { confirmExportFidelityWarnings } from './components/fidelity-warning-dialog.js';
 import { reportFigureExportFailure } from './figure-export-engine.js';
 import { computeSingleViewLayout } from './utils/layout.js';
+import { buildRenderModeFidelityWarnings } from './utils/render-mode.js';
 import { reducePointsByDensity } from './utils/density-reducer.js';
 import {
   matchesLodMembershipPresentation,
@@ -23,9 +24,24 @@ import { drawCanvasAxes } from './components/axes-builder.js';
 import { drawCanvasCentroidOverlay } from './components/centroid-overlay.js';
 import { denormalizeXY } from './utils/coordinate-mapper.js';
 import { drawCanvasOrientationIndicator } from './components/orientation-indicator.js';
+import {
+  buildReferenceGridModel,
+  drawCanvasReferenceGrid,
+  resolveReferenceGridSurfaceRgb,
+} from './components/reference-grid.js';
 import { applyColorblindSimulationToImageData } from './utils/colorblindness.js';
 import { assertCropRect01 } from './utils/crop.js';
 import { rgb01ToHex } from './utils/color-utils.js';
+import { resolveFigureInk } from './utils/figure-ink.js';
+import {
+  buildViewerBackgroundFidelityWarnings,
+  readActiveReferenceGridAppearance,
+  VIEWER_BACKGROUND_LABELS,
+} from './utils/viewer-background.js';
+import {
+  buildOverlayFidelityWarnings,
+  NON_EXPORTED_VIEWER_CHROME,
+} from './utils/overlay-fidelity.js';
 import {
   assertCameraState,
   assertNavigationMode
@@ -520,10 +536,19 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   const includeLegendCheckbox = createElement('input', { type: 'checkbox', id: 'figure-export-legend', checked: true });
   const showOrientationCheckbox = createElement('input', { type: 'checkbox', id: 'figure-export-orientation', checked: true });
   const depthSortCheckbox = createElement('input', { type: 'checkbox', id: 'figure-export-depthsort', checked: true });
+  // Checked by default so the figure matches the viewer; unchecking it is the
+  // user deliberately composing a grid-free figure, not a silent difference.
+  const referenceGridCheckbox = createElement('input', { type: 'checkbox', id: 'figure-export-reference-grid', checked: true });
+  const referenceGridLabel = createElement(
+    'label',
+    { className: 'checkbox-inline', htmlFor: referenceGridCheckbox.id },
+    [referenceGridCheckbox, ' Reference grid']
+  );
 
   const annotationChecks = createElement('div', { className: 'figure-export-checks' }, [
     createElement('label', { className: 'checkbox-inline', htmlFor: includeAxesCheckbox.id }, [includeAxesCheckbox, ' Axes']),
     createElement('label', { className: 'checkbox-inline', htmlFor: includeLegendCheckbox.id }, [includeLegendCheckbox, ' Legend']),
+    referenceGridLabel,
     createElement('label', { className: 'checkbox-inline', htmlFor: showOrientationCheckbox.id }, [showOrientationCheckbox, ' 3D orientation']),
     createElement('label', { className: 'checkbox-inline', htmlFor: depthSortCheckbox.id }, [depthSortCheckbox, ' Depth sort']),
   ]);
@@ -552,19 +577,52 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   const legendSettingsRow = createElement('div', { className: 'figure-export-style-row figure-export-legend-settings' }, [
     legendPosSelect,
   ]);
+  // Interaction chrome is deliberately absent from every figure. Saying so here
+  // means it is never discovered only after the file has been opened.
+  const chromeDisclosure = createElement(
+    'div',
+    { className: 'figure-export-hint figure-export-hint--tight' },
+    [`Never exported: ${NON_EXPORTED_VIEWER_CHROME.join(', ')}.`]
+  );
   const annotationBox = createElement('div', { className: 'figure-export-dashed-box figure-export-annotations-box' }, [
     annotationChecks,
     axisLabelSettings,
     legendSettingsRow,
+    chromeDisclosure,
   ]);
   annotationSection.appendChild(annotationBox);
+
+  /**
+   * The reference-grid appearance the viewer is drawing right now, or null.
+   * Read on every use because the viewer background can change while the
+   * export dialog is open.
+   */
+  function readViewerReferenceGridAppearance() {
+    return readActiveReferenceGridAppearance(
+      typeof document === 'undefined' ? null : document
+    );
+  }
+
+  /** The appearance this export will actually draw: viewer state ∧ user choice. */
+  function resolveExportReferenceGrid() {
+    const appearance = readViewerReferenceGridAppearance();
+    if (appearance === null) return null;
+    return referenceGridCheckbox.checked ? appearance : null;
+  }
 
   function syncAnnotationUi() {
     axisLabelSettings.style.display = includeAxesCheckbox.checked ? 'grid' : 'none';
     legendSettingsRow.style.display = includeLegendCheckbox.checked ? 'flex' : 'none';
+    const appearance = readViewerReferenceGridAppearance();
+    const available = appearance !== null;
+    referenceGridCheckbox.disabled = !available;
+    referenceGridLabel.title = available
+      ? `Include the viewer's ${VIEWER_BACKGROUND_LABELS[appearance.mode]} reference grid.`
+      : 'The viewer background draws no reference grid.';
   }
   listen(includeAxesCheckbox, 'change', syncAnnotationUi);
   listen(includeLegendCheckbox, 'change', syncAnnotationUi);
+  listen(referenceGridCheckbox, 'change', syncAnnotationUi);
   syncAnnotationUi();
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -701,7 +759,9 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     targetGroup,
   ]);
   const densityHint = createElement('div', { className: 'figure-export-hint' }, [
-    'Full Vector writes every point; Optimized Vector writes the exact chosen target count; Hybrid embeds the shader-rendered point pass.'
+    'Full Vector writes every point; Optimized Vector writes the exact chosen target count; Hybrid embeds the shader-rendered point pass. '
+    + 'Vector points carry the viewer’s atmospheric fog but are flat discs: '
+    + 'only Hybrid and PNG reproduce the 3D sphere lighting.'
   ]);
 
   const advancedGrid = createElement('div', { className: 'figure-export-style-row' }, [
@@ -1977,7 +2037,11 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     }
     previewDrawTimer = setTimeout(() => {
       previewDrawTimer = null;
-      if (!cleanupComplete && !previewDisposed) drawPreview();
+      if (cleanupComplete || previewDisposed) return;
+      // The viewer background can change while this panel is open, so the
+      // reference-grid control's availability is re-resolved every draw.
+      syncAnnotationUi();
+      drawPreview();
     }, 80);
   }
 
@@ -2128,6 +2192,8 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     const backgroundColor = background === 'custom'
       ? String(backgroundColorInput.value || '#ffffff')
       : (background === 'viewer' ? viewerBgHex : '#ffffff');
+    // The preview writes in the same ink the exported file will.
+    const ink = resolveFigureInk({ background, backgroundColor });
     if (background !== 'transparent') {
       ctx.fillStyle = backgroundColor;
       ctx.fillRect(0, 0, totalW, totalH);
@@ -2137,7 +2203,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
       const titleSize = Math.max(14, titleFontSizePx);
       const rect = layout.titleRect || { x: layout.outerPadding, y: layout.outerPadding, width: totalW - layout.outerPadding * 2, height: 0 };
       ctx.save();
-      ctx.fillStyle = '#111';
+      ctx.fillStyle = ink.text;
       ctx.font = `${titleSize}px ${fontFamily}`;
       ctx.textAlign = 'center';
       ctx.textBaseline = 'alphabetic';
@@ -2146,7 +2212,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     }
 
     const plotRect = layout.plotRect;
-    ctx.strokeStyle = '#e5e7eb';
+    ctx.strokeStyle = ink.frame;
     ctx.lineWidth = 1;
     ctx.strokeRect(plotRect.x, plotRect.y, plotRect.width, plotRect.height);
 
@@ -2163,6 +2229,36 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
       height: fullViewportH * vpScale
     };
     previewGeom = { scale: s, ox, oy, viewportRect };
+
+    // The reference grid is a background layer, so the preview draws it before
+    // the points and before the "no sample yet" early return: a preview that
+    // omitted it would misdescribe the file the button is about to write.
+    const previewReferenceGrid = resolveExportReferenceGrid();
+    if (previewReferenceGrid !== null && rs?.mvpMatrix && rs?.viewMatrix) {
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(plotRect.x, plotRect.y, plotRect.width, plotRect.height);
+      ctx.clip();
+      drawCanvasReferenceGrid({
+        ctx,
+        model: buildReferenceGridModel({
+          appearance: previewReferenceGrid,
+          renderState: rs,
+          plotRect,
+          // The raw crop input, not a normalized rect: `assertCropRect01()`
+          // returns a four-key rect that is not itself valid crop input.
+          crop: cropEnabled && previewFramingMode === 'applied'
+            ? { enabled: true, ...cropRect01 }
+            : null,
+          surfaceRgb: resolveReferenceGridSurfaceRgb({
+            appearance: previewReferenceGrid,
+            background,
+            backgroundColor,
+          }),
+        }),
+      });
+      ctx.restore();
+    }
 
     if (!reduced) {
       if (!previewStatus.textContent || previewStatus.textContent === 'Preview is off.') {
@@ -2319,8 +2415,8 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
         crop: appliedFraming ? getCropOptionForExport() : null,
         fontFamily,
         labelFontSizePx: centroidLabelFontSizePx,
-        labelColor: '#111',
-        haloColor: background === 'transparent' ? 'rgba(255,255,255,0.95)' : backgroundColor,
+        labelColor: ink.text,
+        haloColor: background === 'transparent' ? ink.halo : backgroundColor,
       });
     }
 
@@ -2332,7 +2428,8 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
         viewMatrix: sample.renderState.viewMatrix,
         cameraState: sample.cameraState,
         fontFamily,
-        fontSize: orientationFontSize
+        fontSize: orientationFontSize,
+        ink
       });
     }
 
@@ -2350,13 +2447,13 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
         const boxY = plotRect.y + 8;
         ctx.save();
         ctx.globalAlpha = 0.85;
-        ctx.fillStyle = '#ffffff';
+        ctx.fillStyle = ink.surface;
         ctx.fillRect(boxX, boxY, boxW, boxH);
         ctx.globalAlpha = 1;
-        ctx.strokeStyle = '#e5e7eb';
+        ctx.strokeStyle = ink.frame;
         ctx.lineWidth = 1;
         ctx.strokeRect(boxX, boxY, boxW, boxH);
-        ctx.fillStyle = '#111';
+        ctx.fillStyle = ink.surfaceInk;
         ctx.font = `${baseFontSizePx}px ${fontFamily}`;
         ctx.textAlign = 'left';
         ctx.textBaseline = 'alphabetic';
@@ -2374,7 +2471,8 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
         model: legendModel,
         fontFamily,
         fontSize: legendFontSizePx,
-        backgroundFill: background === 'transparent' ? 'transparent' : backgroundColor
+        backgroundFill: background === 'transparent' ? 'transparent' : backgroundColor,
+        ink
       });
     }
 
@@ -2414,7 +2512,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
           fontFamily,
           tickFontSize: tickFontSizePx,
           labelFontSize: axisLabelFontSizePx,
-          color: '#111'
+          color: ink.text
         });
       }
     }
@@ -2966,6 +3064,23 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     /** @type {{ title: string; detail: string }[]} */
     const warnings = [];
 
+    // The render mode decides the entire draw pass, so it gates every format:
+    // a volumetric view exported as a point cloud is a different image, not a
+    // degraded one.
+    warnings.push(
+      ...buildRenderModeFidelityWarnings(
+        typeof document === 'undefined' ? null : document
+      )
+    );
+
+    // The background decides the viewer's reference grid. An unreadable
+    // background means the figure cannot know whether to draw one.
+    warnings.push(
+      ...buildViewerBackgroundFidelityWarnings(
+        typeof document === 'undefined' ? null : document
+      )
+    );
+
     const needsShaderAccurateRasterization = needsPng || (needsSvg && strategy === 'hybrid');
     if (needsShaderAccurateRasterization) {
       const rs = getPreviewRenderStateForView(activeViewId);
@@ -2980,14 +3095,15 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
       }
     }
 
-    const showConnectivity = viewer.getShowConnectivity();
-    const hasConnectivity = viewer.hasConnectivityData();
-    if (showConnectivity && hasConnectivity) {
-      warnings.push({
-        title: 'Connectivity overlay not exported',
-        detail: 'Connectivity lines are enabled in the viewer, but figure export currently exports the point layer only (no edges).'
-      });
-    }
+    // Data overlays the export cannot draw: exporting past one would publish a
+    // figure that silently omits measurements the active view shows.
+    warnings.push(
+      ...buildOverlayFidelityWarnings({
+        documentRef: typeof document === 'undefined' ? null : document,
+        connectivityVisible:
+          viewer.getShowConnectivity() && viewer.hasConnectivityData(),
+      })
+    );
 
     const proceed = await confirmExportFidelityWarnings({
       warnings,
@@ -3050,6 +3166,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
         titleFontSizePx,
         centroidLabelFontSizePx,
         crop: getCropOptionForExport(),
+        referenceGrid: resolveExportReferenceGrid(),
         // pointRadiusPx removed - export now uses viewer's pointSize directly (WYSIWYG)
         showOrientation: showOrientationCheckbox.checked,
         depthSort3d: depthSortCheckbox.checked,

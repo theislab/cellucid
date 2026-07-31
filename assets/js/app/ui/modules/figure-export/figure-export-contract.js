@@ -8,6 +8,7 @@
 import { assertCameraState } from '../../../../rendering/camera-state-contract.js';
 import { assertCropRect01 } from './utils/crop.js';
 import { assertLodMembership } from './utils/lod-membership.js';
+import { assertReferenceGridAppearance } from './utils/viewer-background.js';
 
 const FORMATS = new Set(['png', 'svg']);
 const STRATEGIES = new Set(['full-vector', 'optimized-vector', 'hybrid']);
@@ -32,6 +33,7 @@ const BASE_REQUEST_KEYS = Object.freeze([
   'legendFontSizePx',
   'legendPosition',
   'optimizedTargetCount',
+  'referenceGrid',
   'selectionMutedOpacity',
   'showOrientation',
   'signal',
@@ -94,11 +96,20 @@ const SCIENTIFIC_STATE_KEYS = Object.freeze([
   'datasetGeneration',
   'dimensionLevel',
   'fieldKey',
+  'fieldKind',
+  'filters',
   'geometryGeneration',
   'legendModel',
   'lodMembership',
   'lodSizeMultiplier',
   'normTransform',
+]);
+const META_VIEW_KEYS = Object.freeze([
+  'fieldKey',
+  'fieldKind',
+  'filters',
+  'id',
+  'label',
 ]);
 const NORM_TRANSFORM_KEYS = Object.freeze(['center', 'scale']);
 const RENDER_STATE_KEYS = Object.freeze([
@@ -354,6 +365,13 @@ function assertBaseRequestValues(request, context) {
     assertInteger(request[key], `${context}.${key}`, 1);
   }
   assertCropRect01(request.crop);
+  // Null means "this figure carries no reference grid" — either the viewer is
+  // drawing none, or the figure deliberately leaves it out. Anything else must
+  // be one of the appearances the viewer actually publishes.
+  assertReferenceGridAppearance(
+    request.referenceGrid,
+    `${context}.referenceGrid`
+  );
   assertBoolean(request.showOrientation, `${context}.showOrientation`);
   assertBoolean(request.depthSort3d, `${context}.depthSort3d`);
   assertBoolean(request.emphasizeSelection, `${context}.emphasizeSelection`);
@@ -695,6 +713,26 @@ function assertScientificState(scientificState, data, context) {
   ) {
     throw new TypeError(`${context}.fieldKey must be a string or null.`);
   }
+  if (
+    scientificState.fieldKind !== null &&
+    typeof scientificState.fieldKind !== 'string'
+  ) {
+    throw new TypeError(`${context}.fieldKind must be a string or null.`);
+  }
+  if (
+    (scientificState.fieldKey === null) !==
+    (scientificState.fieldKind === null)
+  ) {
+    throw new TypeError(
+      `${context} field key and kind describe one field and must be published together.`
+    );
+  }
+  if (
+    !Array.isArray(scientificState.filters) ||
+    scientificState.filters.some((line) => typeof line !== 'string')
+  ) {
+    throw new TypeError(`${context}.filters must be an array of strings.`);
+  }
   if (scientificState.legendModel !== null) {
     assertPlainObject(scientificState.legendModel, `${context}.legendModel`);
     assertOwnedLegendValue(
@@ -738,6 +776,60 @@ function assertScientificState(scientificState, data, context) {
   );
 }
 
+/**
+ * The embedded provenance must describe exactly the views the figure draws,
+ * in the order it draws them.
+ *
+ * A multi-panel figure carries one metadata record for the whole file, so a
+ * record built from a single view attributes that panel's field and filters to
+ * every other panel. Tying each record to its own view's snapshot makes that
+ * class of false claim unrepresentable rather than merely unlikely.
+ *
+ * @param {any} meta
+ * @param {ReadonlyArray<any>} views
+ */
+function assertMetaProvenance(meta, views) {
+  assertPlainObject(meta, 'Figure export payload.meta');
+  if (
+    !Array.isArray(meta.views) ||
+    meta.views.length !== views.length
+  ) {
+    throw new TypeError(
+      'Figure export payload.meta.views must publish one record per exported view.'
+    );
+  }
+  meta.views.forEach((record, index) => {
+    const context = `Figure export payload.meta.views[${index}]`;
+    assertExactKeys(record, META_VIEW_KEYS, context);
+    const view = views[index];
+    if (record.id !== view.id || record.label !== view.label) {
+      throw new Error(
+        `${context} must describe the exported view "${view.id}".`
+      );
+    }
+    const scientificState = view.scientificState;
+    if (
+      record.fieldKey !== scientificState.fieldKey ||
+      record.fieldKind !== scientificState.fieldKind
+    ) {
+      throw new Error(
+        `${context} must name the field its view was coloured by.`
+      );
+    }
+    if (
+      !Array.isArray(record.filters) ||
+      record.filters.length !== scientificState.filters.length ||
+      record.filters.some(
+        (line, lineIndex) => line !== scientificState.filters[lineIndex]
+      )
+    ) {
+      throw new Error(
+        `${context} must publish exactly its view's filters.`
+      );
+    }
+  });
+}
+
 function assertPayloadOptions(options, context) {
   assertExactKeys(options, PAYLOAD_OPTION_KEYS, context);
   const requestShape = { ...options, exportAllViews: false };
@@ -761,7 +853,6 @@ export function assertFigureExportPayload(payload) {
     payload.format === 'svg',
     'Figure export payload.options'
   );
-  assertPlainObject(payload.meta, 'Figure export payload.meta');
   if (!Array.isArray(payload.views) || payload.views.length === 0) {
     throw new TypeError('Figure export payload.views must be a non-empty array.');
   }
@@ -796,6 +887,7 @@ export function assertFigureExportPayload(payload) {
       `${context}.scientificState`
     );
   });
+  assertMetaProvenance(payload.meta, payload.views);
   return payload;
 }
 

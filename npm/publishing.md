@@ -72,8 +72,10 @@ If either command says "command not found", install Node from
 `"private": true` for running tests — publishing from there would fail, and
 publishing the whole repo is not what you want.
 
+From the root of your `cellucid` checkout:
+
 ```bash
-cd /Users/kemalinecik/git_nosync/master_cellucid/cellucid/npm
+cd npm
 ```
 
 Confirm you are in the right place — this must print `cellucid`:
@@ -222,10 +224,11 @@ Wait about a minute for the registry to propagate, then:
 npm view cellucid
 ```
 
-And try it the way a stranger would — from a directory that is **not** this one:
+And try it the way a stranger would — from a directory that is **not** this one.
+The parentheses run it in a subshell, so your own terminal stays in `npm/`:
 
 ```bash
-cd ~ && npx cellucid@latest
+(cd ~ && npx cellucid@latest)
 ```
 
 Then open **https://www.npmjs.com/package/cellucid** in a browser and check that
@@ -235,10 +238,10 @@ should.
 ### Step 5 — Commit the package to git
 
 The publish and your repository are separate things; publishing does not commit
-anything.
+anything. Step back up to the repository root:
 
 ```bash
-cd /Users/kemalinecik/git_nosync/master_cellucid/cellucid
+cd ..
 git add npm
 git commit -m "Add npm name-reservation package for cellucid"
 ```

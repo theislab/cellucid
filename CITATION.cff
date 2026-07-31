@@ -2,11 +2,16 @@ cff-version: 1.2.0
 message: "If you use Cellucid in your work, please cite this software."
 type: software
 title: "Cellucid: GPU-accelerated single-cell atlas viewer"
+# No `version:` field, by design. The web app is a continuously deployed static
+# site with no released versions; a deployment is identified only by the build
+# id shown in the application footer, which changes on every deploy. The
+# versioned companions are the Python (theislab/cellucid-python) and R
+# (theislab/cellucid-r) packages, whose CITATION.cff files do carry `version:`.
 authors:
   - family-names: Inecik
     given-names: Kemal
     email: k.inecik@gmail.com
 repository-code: "https://github.com/theislab/cellucid"
-url: "https://cellucid.com"
+url: "https://www.cellucid.com"
 license: "BSD-3-Clause"
 

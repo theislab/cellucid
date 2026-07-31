@@ -84,7 +84,7 @@ test('direct CORS catalog startup adopts its explicit default sample', async ({ 
   expect(browserErrors).toEqual([]);
 });
 
-test('a failed direct CORS catalog is visible, terminal, and selects no science', async ({ page }) => {
+test('a failed direct CORS catalog is explained inline and stays recoverable', async ({ page }) => {
   const missingRoot =
     'http://127.0.0.1:4174/tests/browser/fixtures/missing-exports/';
   const catalogRequests = [];
@@ -100,13 +100,24 @@ test('a failed direct CORS catalog is visible, terminal, and selects no science'
   );
   await page.getByRole('button', { name: /Choose a Dataset/ }).click();
 
+  // One unreachable sample catalog is that catalog's failure. The selector
+  // stays usable so a dataset opened from disk still needs no network at all.
   const datasetSelect = page.locator('#dataset-select');
-  await expect(datasetSelect.locator('option')).toHaveText(
-    /Failed to load dataset catalog:.*Resource not found/i,
-  );
-  await expect(page.locator('.notification-error')).toContainText(
-    /Failed to load dataset catalog:.*Resource not found/i,
-  );
+  await expect(datasetSelect).toBeEnabled();
+  await expect(datasetSelect.locator('option')).toHaveText([
+    'None',
+    'No datasets found',
+  ]);
+
+  const notice = page.locator('.dataset-info[role="status"]');
+  await expect(notice).toBeVisible();
+  await expect(notice).toContainText(/Sample datasets could not be loaded/);
+  await expect(notice).toContainText(/Check your network, then try again/);
+  // A transport diagnostic is never put in front of a biologist.
+  await expect(notice).not.toContainText(/Resource not found/i);
+  const retry = notice.getByRole('button', { name: 'Try again' });
+  await expect(retry).toBeEnabled();
+
   await expect(page.locator('#dataset-name')).toHaveText('—');
   await expect(page.locator('#stats')).toHaveText('Points: 0 • Field: None');
   await expect(page.locator('iframe')).toHaveCount(0);
@@ -114,4 +125,12 @@ test('a failed direct CORS catalog is visible, terminal, and selects no science'
     await page.evaluate(() => window._cellucidViewer.getPointCount()),
   ).toBe(0);
   expect(catalogRequests).toHaveLength(1);
+
+  // A cached probe failure is never re-fetched implicitly, so the second
+  // request proves the retry cleared it. Recovery costs no page reload.
+  await retry.click();
+  await expect.poll(() => catalogRequests.length).toBe(2);
+  await expect(notice).toBeVisible();
+  await expect(retry).toBeEnabled();
+  await expect(datasetSelect).toBeEnabled();
 });

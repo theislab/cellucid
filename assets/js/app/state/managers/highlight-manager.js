@@ -166,6 +166,121 @@ function requireCreatedCellIndices(cellIndices, pointCount) {
   return cellIndices;
 }
 
+/**
+ * True when `cellIndex` names a cell of a dataset of `pointCount` cells.
+ *
+ * Highlight membership is scientific data: it decides which cells are marked,
+ * counted, exported and fed to differential expression. An index that does not
+ * name a cell in the current dataset is a violated invariant somewhere
+ * upstream, never something to quietly leave out of the result. Every writer
+ * into a highlight group already bounds its indices by `pointCount` and throws
+ * (`addHighlightDirect`, `addHighlightFromCategory`, the session restore
+ * decoder), so a failure here means one of those bounds was bypassed and the
+ * render, the count and the export would otherwise silently disagree.
+ *
+ * @param {unknown} cellIndex
+ * @param {number} pointCount - Cells in the current dataset.
+ * @returns {boolean}
+ */
+function isHighlightCellIndex(cellIndex, pointCount) {
+  return (
+    Number.isSafeInteger(cellIndex)
+    && cellIndex >= 0
+    && cellIndex < pointCount
+  );
+}
+
+/**
+ * Report an index that does not name a cell. Always throws.
+ *
+ * Kept apart from the membership loops so the message — and the label the
+ * caller composes for it — is built only on the failing index, never once per
+ * cell of an 800k-cell selection.
+ *
+ * @param {unknown} cellIndex
+ * @param {number} pointCount - Cells in the current dataset.
+ * @param {string} label - What produced the index.
+ * @returns {never}
+ */
+function rejectHighlightCellIndex(cellIndex, pointCount, label) {
+  if (!Number.isSafeInteger(cellIndex) || cellIndex < 0) {
+    throw new RangeError(
+      `${label} must be a non-negative safe integer, received ${String(cellIndex)}.`
+    );
+  }
+  throw new RangeError(
+    `${label} ${cellIndex} is outside the current dataset of ${pointCount} cells.`
+  );
+}
+
+/**
+ * The one definition of "the cells of a highlight page".
+ *
+ * A page's cells are the union of the cell indices of its **enabled** groups,
+ * deduplicated, in first-seen order. Every consumer inside this module derives
+ * from this function so that the number the interface displays is by
+ * construction the set the renderer paints — a page cannot be counted one way
+ * and drawn another.
+ *
+ * `membership` doubles as the deduplication structure and as the output
+ * buffer: entries for the page's cells are set to 255 and every other entry is
+ * left untouched, so the caller passes either the live highlight array (active
+ * page) or a scratch buffer it clears afterwards (any other page).
+ *
+ * @param {object|null} page - Highlight page, or null for "no page".
+ * @param {number} pointCount - Cells in the current dataset.
+ * @param {Uint8Array} membership - Buffer of length `pointCount`, zeroed for
+ *   every index this page could claim.
+ * @param {string} label - Page description used in thrown messages.
+ * @returns {number[]} The page's cell indices, unique and in first-seen order.
+ */
+function collectEnabledPageCells(page, pointCount, membership, label) {
+  if (!(membership instanceof Uint8Array) || membership.length !== pointCount) {
+    // The bound proved against `pointCount` is the bound written into
+    // `membership`. If they disagree, an in-bounds index would be dropped by a
+    // silent out-of-range typed-array write -- the exact failure this function
+    // exists to prevent.
+    throw new TypeError(
+      `${label} membership buffer must be a Uint8Array of ${pointCount} entries.`
+    );
+  }
+  if (page === null || page === undefined) return [];
+  const groups = page.highlightedGroups;
+  if (!Array.isArray(groups)) {
+    throw new TypeError(`${label} requires a group inventory.`);
+  }
+  const cells = [];
+  for (let groupIndex = 0; groupIndex < groups.length; groupIndex++) {
+    const group = groups[groupIndex];
+    if (group === null || typeof group !== 'object' || Array.isArray(group)) {
+      throw new TypeError(`${label} group ${groupIndex} must be an object.`);
+    }
+    if (group.enabled === false) continue;
+    const indices = group.cellIndices;
+    if (indices === null || indices === undefined) continue;
+    if (!Array.isArray(indices) && !(indices instanceof Uint32Array)) {
+      throw new TypeError(
+        `${label} group "${group.id}" cellIndices must be an Array or Uint32Array.`
+      );
+    }
+    for (let i = 0; i < indices.length; i++) {
+      const cellIndex = indices[i];
+      if (!isHighlightCellIndex(cellIndex, pointCount)) {
+        rejectHighlightCellIndex(
+          cellIndex,
+          pointCount,
+          `${label} group "${group.id}" cell index`
+        );
+      }
+      if (membership[cellIndex] === 0) {
+        membership[cellIndex] = 255;
+        cells.push(cellIndex);
+      }
+    }
+  }
+  return cells;
+}
+
 function requireSelectionTransparency(transparency, pointCount) {
   if (
     !(transparency instanceof Float32Array)
@@ -234,22 +349,55 @@ export const highlightStateMethods = {
   },
 
   /**
+   * Membership scratch buffer for counting a page that is not the active one.
+   *
+   * Every entry is zero on entry and on exit; callers clear exactly the
+   * indices they set, so the buffer never carries a previous page's cells.
+   * @returns {Uint8Array}
+   */
+  _borrowHighlightMembershipScratch() {
+    if (
+      !(this._highlightMembershipScratch instanceof Uint8Array)
+      || this._highlightMembershipScratch.length !== this.pointCount
+    ) {
+      this._highlightMembershipScratch = new Uint8Array(this.pointCount);
+    }
+    return this._highlightMembershipScratch;
+  },
+
+  /**
    * Get the unique highlighted cell count for a page (enabled groups only).
-   * Used by both the Highlighted Cells UI and analysis selectors.
-   * @param {string} pageId
+   *
+   * Used by both the Highlighted Cells UI and analysis selectors. Derived from
+   * `collectEnabledPageCells`, the same function that paints the highlight
+   * array, so this number is by construction the size of the set the renderer
+   * draws for that page. An out-of-dataset index throws here exactly as it
+   * throws during painting, instead of being counted here and dropped there.
+   *
+   * @param {string} pageId - Id of an existing page; an unknown id counts zero.
    * @returns {number}
    */
   getHighlightedCellCountForPage(pageId) {
     const page = this.highlightPages.find((p) => p.id === pageId);
     if (!page) return 0;
 
-    const indices = new Set();
-    for (const group of (page.highlightedGroups || [])) {
-      if (!group || group.enabled === false) continue;
-      const cells = group.cellIndices || [];
-      for (let i = 0; i < cells.length; i++) indices.add(cells[i]);
+    const membership = this._borrowHighlightMembershipScratch();
+    let cells;
+    try {
+      cells = collectEnabledPageCells(
+        page,
+        this.pointCount,
+        membership,
+        `Highlight page "${pageId}"`
+      );
+    } catch (error) {
+      // The buffer holds a partial page. Retire it rather than hand a dirty
+      // deduplication structure to the next count.
+      this._highlightMembershipScratch = null;
+      throw error;
     }
-    return indices.size;
+    for (let i = 0; i < cells.length; i++) membership[cells[i]] = 0;
+    return cells.length;
   },
 
   createHighlightPage(name = null) {
@@ -360,22 +508,29 @@ export const highlightStateMethods = {
     const page2 = this.highlightPages.find((p) => p.id === pageId2);
     if (!page1 || !page2) return null;
 
-    // Collect all highlighted cell indices from each page
-    const getCellSet = (page) => {
-      const cellSet = new Set();
-      for (const group of page.highlightedGroups) {
-        if (group.enabled === false) continue;
-        if (group.cellIndices) {
-          for (const idx of group.cellIndices) {
-            cellSet.add(idx);
-          }
-        }
+    // Collect all highlighted cell indices from each page, using the one
+    // definition of a page's cells so a combination can never include a cell
+    // the source page does not render.
+    const membership = this._borrowHighlightMembershipScratch();
+    const collect = (page) => {
+      let cells;
+      try {
+        cells = collectEnabledPageCells(
+          page,
+          this.pointCount,
+          membership,
+          `Highlight page "${page.id}"`
+        );
+      } catch (error) {
+        this._highlightMembershipScratch = null;
+        throw error;
       }
-      return cellSet;
+      for (let i = 0; i < cells.length; i++) membership[cells[i]] = 0;
+      return new Set(cells);
     };
 
-    const set1 = getCellSet(page1);
-    const set2 = getCellSet(page2);
+    const set1 = collect(page1);
+    const set2 = collect(page2);
 
     let resultIndices;
     let operationSymbol;
@@ -424,30 +579,25 @@ export const highlightStateMethods = {
     }
   },
 
+  /**
+   * Repaint the highlight array from the active page's enabled groups.
+   *
+   * The painted set is `collectEnabledPageCells` applied to the active page —
+   * the same function `getHighlightedCellCountForPage` counts — so the count
+   * the interface shows for the active page equals the set published here.
+   */
   _recomputeHighlightArray() {
     this._ensureHighlightArray();
     this._invalidateHighlightCountCache(); // Invalidate cached counts
     this.highlightArray.fill(0);
 
     // Collect all highlighted indices as we go (avoids O(n) scan in renderer)
-    const allHighlightedIndices = [];
-
-    for (const group of this.highlightedGroups) {
-      // Skip disabled groups
-      if (group.enabled === false) continue;
-      const indices = group.cellIndices;
-      if (!indices) continue;
-      for (let i = 0; i < indices.length; i++) {
-        const idx = indices[i];
-        if (idx >= 0 && idx < this.pointCount) {
-          // Only add if not already highlighted (avoid duplicates)
-          if (this.highlightArray[idx] === 0) {
-            this.highlightArray[idx] = 255;
-            allHighlightedIndices.push(idx);
-          }
-        }
-      }
-    }
+    const allHighlightedIndices = collectEnabledPageCells(
+      this._getActivePage(),
+      this.pointCount,
+      this.highlightArray,
+      'Active highlight page'
+    );
 
     this._highlightedCellIndices = allHighlightedIndices;
     this._pushHighlightToViewer(allHighlightedIndices);
@@ -546,11 +696,28 @@ export const highlightStateMethods = {
     this._recomputeHighlightArray();
   },
 
-  // Set a preview highlight from an array of cell indices (used for lasso preview).
+  /**
+   * Publish an in-progress selection on top of the active page's highlights.
+   *
+   * The published set is the active page's cells (`collectEnabledPageCells`,
+   * the one definition) united with `cellIndices`. The caller owns the whole
+   * meaning of `cellIndices`: a tool building a multi-step selection must pass
+   * the combined result of its accumulated candidates and the pointer's
+   * current hits, because this method has no way to tell an addition from a
+   * subtraction and will union whatever it is handed.
+   *
+   * @param {number[]|Uint32Array} cellIndices - Cells of the in-progress
+   *   selection. Every index must name a cell in the current dataset.
+   */
   setPreviewHighlightFromIndices(cellIndices) {
     if (!cellIndices || cellIndices.length === 0) {
       this.clearPreviewHighlight();
       return;
+    }
+    if (!Array.isArray(cellIndices) && !(cellIndices instanceof Uint32Array)) {
+      throw new TypeError(
+        'Preview highlight cell indices must be an Array or Uint32Array.'
+      );
     }
 
     this._ensureHighlightArray();
@@ -558,25 +725,27 @@ export const highlightStateMethods = {
     this.highlightArray.fill(0);
 
     // Collect all highlighted indices (avoids O(n) scan in renderer)
-    const allHighlightedIndices = [];
+    const allHighlightedIndices = collectEnabledPageCells(
+      this._getActivePage(),
+      this.pointCount,
+      this.highlightArray,
+      'Active highlight page'
+    );
 
-    for (const group of this.highlightedGroups) {
-      if (group.enabled === false) continue;
-      const indices = group.cellIndices;
-      if (!indices) continue;
-      for (let i = 0; i < indices.length; i++) {
-        const idx = indices[i];
-        if (idx >= 0 && idx < this.pointCount && this.highlightArray[idx] === 0) {
-          this.highlightArray[idx] = 255;
-          allHighlightedIndices.push(idx);
-        }
-      }
-    }
     // Add preview highlights on top
+    const pointCount = this.pointCount;
+    const highlightArray = this.highlightArray;
     for (let i = 0; i < cellIndices.length; i++) {
       const idx = cellIndices[i];
-      if (idx >= 0 && idx < this.pointCount && this.highlightArray[idx] === 0) {
-        this.highlightArray[idx] = 255;
+      if (!isHighlightCellIndex(idx, pointCount)) {
+        rejectHighlightCellIndex(
+          idx,
+          pointCount,
+          'Preview highlight cell index'
+        );
+      }
+      if (highlightArray[idx] === 0) {
+        highlightArray[idx] = 255;
         allHighlightedIndices.push(idx);
       }
     }
@@ -787,10 +956,45 @@ export const highlightStateMethods = {
     return true;
   },
 
+  /**
+   * Remove every highlight group from the **active page only**.
+   *
+   * Pages other than the active one keep their groups. The name predates the
+   * page system and overstates the scope; it is documented rather than
+   * corrected here because the rename spans call sites owned elsewhere
+   * (`main.js`, `jupyter-command-handler.js`, the highlight UI modules), and a
+   * partial rename would not build. Two of the three callers want exactly this
+   * scope: the "Clear" button sits in the active page's group list, and the
+   * dataset-replacement paths in `main.js` run it straight after `initScene`,
+   * which has already reset `highlightPages` to a single empty page.
+   *
+   * The third, the Jupyter `clearHighlights` command, does not: the Python
+   * `viewer.clear_highlights()` docstring promises "Clear all cell highlights
+   * in the viewer", which this does not deliver once a second page exists.
+   *
+   * @returns {number} Groups removed from the active page.
+   */
   clearAllHighlights() {
-    this.highlightedGroups = [];
+    const page = this._getActivePage();
+    if (page === null) {
+      // No page inventory at all means no highlights exist; removing none of
+      // them is the truthful outcome. A named-but-missing active page is a
+      // violated invariant and is not treated as "nothing to do".
+      if (this.highlightPages.length !== 0) {
+        throw new RangeError(
+          `Active highlight page "${this.activePageId}" was not found.`
+        );
+      }
+      return 0;
+    }
+    if (!Array.isArray(page.highlightedGroups)) {
+      throw new TypeError('Active highlight page requires a group inventory.');
+    }
+    const removed = page.highlightedGroups.length;
+    page.highlightedGroups = [];
     this._recomputeHighlightArray();
     this._notifyHighlightChange();
+    return removed;
   },
 
   getHighlightedGroups() {

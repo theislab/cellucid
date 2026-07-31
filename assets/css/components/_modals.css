@@ -742,45 +742,9 @@
   margin: 0;
 }
 
-/* Range/slider styling - matches .slider-row */
-.analysis-option-range {
-  flex: 1;
-  -webkit-appearance: none;
-  appearance: none;
-  height: 3px;
-  border-radius: var(--radius-full);
-  background: var(--color-border-light);
-  outline: none;
-}
-
-.analysis-option-range::-webkit-slider-thumb {
-  -webkit-appearance: none;
-  appearance: none;
-  width: 14px;
-  height: 14px;
-  border-radius: 50%;
-  background: var(--color-text-primary);
-  border: var(--border-width-1) solid var(--color-border-strong);
-  box-shadow: var(--shadow-xs);
-  margin-top: -5.5px;
-  cursor: pointer;
-}
-
-.analysis-option-range::-moz-range-track {
-  height: 3px;
-  border-radius: var(--radius-full);
-  background: var(--color-border-light);
-}
-
-.analysis-option-range::-moz-range-thumb {
-  width: 14px;
-  height: 14px;
-  border-radius: 50%;
-  background: var(--color-text-primary);
-  border: var(--border-width-1) solid var(--color-border-strong);
-  box-shadow: var(--shadow-xs);
-  cursor: pointer;
-}
+/* `.analysis-option-range` is always rendered inside a `.slider-row`
+   (analysis/ui/components/options.js), so the single slider definition in
+   components/_forms.css owns its track, thumb, hit area and focus ring. */
 
 /* Slider value - matches .slider-value */
 .analysis-option-value {

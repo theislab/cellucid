@@ -170,6 +170,8 @@ export {
   runStatisticalTests,
   formatStatisticalResult,
   benjaminiHochberg,
+  benjaminiHochbergAdjusted,
+  benjaminiHochbergTestable,
   bonferroniCorrection,
   applyMultipleTestingCorrection,
   confidenceInterval,

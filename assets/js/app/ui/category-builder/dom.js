@@ -17,13 +17,21 @@ const TEMPLATE = `
 
     <div class="analysis-accordion-content">
       <div class="cat-builder">
-        <p class="cat-builder-hint">Drag highlight pages from above to create category labels.</p>
+        <p class="cat-builder-hint" id="cat-builder-hint">Drag highlight pages from above, or add them with the control below, to create category labels.</p>
 
-        <div class="cat-builder-dropzone" id="cat-builder-dropzone">
+        <div class="cat-builder-dropzone" id="cat-builder-dropzone" role="group" aria-label="Category labels" aria-describedby="cat-builder-hint">
           <div class="dropzone-placeholder" id="dropzone-placeholder">
             <span>Drop pages here</span>
           </div>
-          <div class="dropzone-items" id="dropzone-items"></div>
+          <div class="dropzone-items" id="dropzone-items" role="list" aria-label="Pages in the new column"></div>
+        </div>
+
+        <div class="cat-builder-section">
+          <label for="cat-builder-page-select">Add a highlight page:</label>
+          <div class="cat-builder-actions">
+            <select class="obs-select" id="cat-builder-page-select"></select>
+            <button type="button" class="cat-builder-btn secondary" id="cat-builder-add-page">Add</button>
+          </div>
         </div>
 
         <div class="cat-builder-section cat-builder-conflict" id="conflict-section" hidden>
@@ -121,6 +129,8 @@ export function renderCategoryBuilderDom(containerEl) {
     dropzone: wrapper.querySelector('#cat-builder-dropzone'),
     placeholder: wrapper.querySelector('#dropzone-placeholder'),
     items: wrapper.querySelector('#dropzone-items'),
+    pageSelect: wrapper.querySelector('#cat-builder-page-select'),
+    addPageBtn: wrapper.querySelector('#cat-builder-add-page'),
     conflictSection: wrapper.querySelector('#conflict-section'),
     conflictText: wrapper.querySelector('#conflict-text'),
     overlapLabelSection: wrapper.querySelector('#overlap-label-section'),

@@ -930,6 +930,7 @@ function createSessionSerializer(contributors) {
       getDatasetGeneration: () => 0,
       obsData: { fields: [] },
       pointCount: 3,
+      getViewDimensionLevel: () => 3,
       positionsArray: new Float32Array(9),
       varData: { fields: [] },
     },
@@ -1614,10 +1615,19 @@ test('volcano plots and exports preserve p=0 as exact +infinity significance', a
         total: 4,
         upregulated: 1,
         downregulated: 1,
-        notSignificant: 2,
+        // ADJUSTED_MISSING has no adjusted p-value: it was never tested, so it
+        // is reported as untestable instead of being asserted "not significant".
+        notSignificant: 1,
+        untestable: 1,
         significantTotal: 2,
       },
     );
+    assert.equal(
+      adjustedExport.metadata.notSignificant,
+      1,
+      'exported metadata must not claim an untested gene is not significant',
+    );
+    assert.equal(adjustedExport.metadata.untestable, 1);
 
     const scientificCSV = deResultsToCSV(results);
     assert.match(scientificCSV, /RAW_ZERO,3,1,2,0,0\.5/);

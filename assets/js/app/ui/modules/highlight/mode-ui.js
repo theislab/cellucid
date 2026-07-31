@@ -5,6 +5,7 @@
  */
 
 import { HIGHLIGHT_MODE_COPY } from './mode-copy.js';
+import { STEP_CONTROL_TOOLS, removeStepControls } from './step-controls.js';
 import {
   requireDomElement,
   requireExactKeys,
@@ -29,6 +30,72 @@ const HISTORY_KEYS = Object.freeze({
   lasso: ['lassoHistory', 'lassoRedoStack']
 });
 
+/** The viewer call each mode's Cancel button already makes. */
+const CANCEL_METHOD_NAMES = Object.freeze({
+  annotation: 'cancelAnnotationSelection',
+  knn: 'cancelKnnSelection',
+  proximity: 'cancelProximitySelection',
+  lasso: 'cancelLassoSelection'
+});
+
+/**
+ * Does the given mode currently hold something Escape should abandon?
+ *
+ * Each tool mirrors the renderer's candidate set here while a selection is in
+ * progress and clears it on confirm, cancel, and mode switch, so this is the
+ * same "is there anything to cancel" the step controls' own presence expresses.
+ *
+ * @param {object} selectionState
+ * @param {string} mode
+ * @returns {boolean}
+ */
+function hasSelectionInProgress(selectionState, mode) {
+  if (mode === 'annotation') {
+    return selectionState.annotationCandidateSet !== null;
+  }
+  if (mode === 'knn') {
+    return selectionState.lastKnnCandidates !== null
+      || selectionState.lastKnnStep > 0;
+  }
+  if (mode === 'proximity') {
+    return selectionState.lastProximityCandidates !== null
+      || selectionState.lastProximityStep > 0;
+  }
+  return selectionState.lastLassoCandidates !== null
+    || selectionState.lastLassoStep > 0;
+}
+
+/**
+ * Is this keystroke a plain Escape nobody else has already claimed?
+ *
+ * Modals and popovers in this app own Escape from a capture-phase listener and
+ * stop the event or mark it handled, and inline renames call `preventDefault`
+ * on their own input. Deferring to both keeps one Escape from closing a dialog
+ * and throwing away a selection behind it.
+ *
+ * @param {KeyboardEvent} event
+ * @returns {boolean}
+ */
+function isUnclaimedEscape(event) {
+  if (event.key !== 'Escape') return false;
+  if (event.defaultPrevented === true) return false;
+  if (
+    event.altKey === true
+    || event.ctrlKey === true
+    || event.metaKey === true
+    || event.shiftKey === true
+  ) {
+    return false;
+  }
+  const target = event.target;
+  if (target === null || target === undefined) return true;
+  const tagName = String(target.tagName);
+  if (tagName === 'INPUT' || tagName === 'TEXTAREA' || tagName === 'SELECT') {
+    return false;
+  }
+  return target.isContentEditable !== true;
+}
+
 function requireModeHandlers(modeHandlers) {
   requireExactKeys(
     modeHandlers,
@@ -45,6 +112,7 @@ function requireModeHandlers(modeHandlers) {
 
 /**
  * @param {object} options
+ * @param {import('../../../state/core/data-state.js').DataState} options.state
  * @param {object} options.viewer
  * @param {object} options.dom
  * @param {HTMLElement[]} options.dom.modeButtons
@@ -55,14 +123,15 @@ function requireModeHandlers(modeHandlers) {
 export function initHighlightModeUI(options) {
   requireExactKeys(
     options,
-    ['viewer', 'dom', 'selectionState', 'modeHandlers'],
+    ['state', 'viewer', 'dom', 'selectionState', 'modeHandlers'],
     'Highlight mode UI options'
   );
-  const { viewer, dom, selectionState, modeHandlers } = options;
+  const { state, viewer, dom, selectionState, modeHandlers } = options;
   requireMethods(
     viewer,
     'Highlight mode viewer',
     [
+      ...Object.values(CANCEL_METHOD_NAMES),
       'cancelUnifiedSelection',
       'getUnifiedSelectionState',
       'restoreUnifiedState',
@@ -89,14 +158,14 @@ export function initHighlightModeUI(options) {
     'Highlight mode description parent',
     ['appendChild']
   );
-  requireHighlightSelectionState(selectionState);
+  requireHighlightSelectionState(selectionState, state.pointCount);
   requireModeHandlers(modeHandlers);
 
   const documentOwner = globalThis.document;
   requireMethods(
     documentOwner,
     'Highlight document',
-    ['getElementById']
+    ['addEventListener', 'getElementById']
   );
 
   if (pressedMode !== selectionState.activeMode) {
@@ -115,15 +184,13 @@ export function initHighlightModeUI(options) {
     }, { signal: lifecycleController.signal });
   }
 
-  function removeStepControls() {
-    for (const id of [
-      'lasso-step-controls',
-      'proximity-step-controls',
-      'knn-step-controls',
-      'annotation-step-controls'
-    ]) {
-      const controls = documentOwner.getElementById(id);
-      if (controls !== null) controls.remove();
+  function removeAllStepControls() {
+    for (const tool of STEP_CONTROL_TOOLS) {
+      removeStepControls(
+        documentOwner,
+        tool,
+        highlightModeDescriptionEl.parentElement
+      );
     }
   }
 
@@ -157,7 +224,8 @@ export function initHighlightModeUI(options) {
       }
     }
     const unifiedState = requireUnifiedSelectionState(
-      viewer.getUnifiedSelectionState()
+      viewer.getUnifiedSelectionState(),
+      state.pointCount
     );
 
     viewer.setLassoEnabled(exactMode === 'lasso');
@@ -177,10 +245,29 @@ export function initHighlightModeUI(options) {
       );
     }
 
-    removeStepControls();
+    removeAllStepControls();
     highlightModeDescriptionEl.textContent = HIGHLIGHT_MODE_COPY[exactMode];
     highlightModeDescriptionEl.style.display = 'block';
     restoreModeSelection(exactMode, unifiedState);
+  }
+
+  /**
+   * Abandon the in-progress selection, exactly as the active tool's Cancel
+   * button does.
+   *
+   * Escape means "abandon what I am doing" everywhere else in this app, and
+   * every one of these tools already has a Cancel button that does precisely
+   * that; stepping back a single step instead would only duplicate the Undo
+   * control that sits beside it and would still leave no way to walk away. The
+   * key is only consumed when there is something to abandon, so it keeps
+   * reaching whatever else would have handled it.
+   */
+  function cancelActiveSelection() {
+    if (!hasSelectionInProgress(selectionState, activeHighlightMode)) {
+      return false;
+    }
+    viewer[CANCEL_METHOD_NAMES[activeHighlightMode]]();
+    return true;
   }
 
   for (const button of highlightModeButtonsList) {
@@ -188,6 +275,12 @@ export function initHighlightModeUI(options) {
       setHighlightModeUI(button.dataset.mode);
     });
   }
+  listen(documentOwner, 'keydown', event => {
+    if (!isUnclaimedEscape(event)) return;
+    if (!cancelActiveSelection()) return;
+    event.preventDefault();
+    event.stopPropagation();
+  });
   setHighlightModeUI(pressedMode);
 
   function destroy() {
@@ -196,7 +289,7 @@ export function initHighlightModeUI(options) {
     const failures = [];
     for (const cleanup of [
       () => lifecycleController.abort(),
-      removeStepControls
+      removeAllStepControls
     ]) {
       try {
         cleanup();

@@ -13,6 +13,9 @@ Current constraints:
   other shape; restoration is always all-or-nothing.
 - Sessions are treated as **untrusted input** with exact profiles, bounds,
   single-member gzip preflight, and transactional rollback.
+- Row indices restore only against a proven cell ordering; a bundle whose
+  ordering cannot be proven is refused. See
+  [Dataset Fingerprint (Cell-Order Identity)](#dataset-fingerprint-cell-order-identity).
 
 ---
 
@@ -167,6 +170,75 @@ no cinematic/cache data and is not accepted by generic **Load State**.
 
 ---
 
+## Dataset Fingerprint (Cell-Order Identity)
+
+Every chunk marked `Dataset dependent: yes` above stores **row indices**, not
+cell identifiers. Those indices are only meaningful against one ordering of the
+dataset, so the manifest fingerprint has to pin that ordering, not just the
+dataset.
+
+`datasetFingerprint` has exactly five fields:
+
+| Field | Derived from | Shape |
+|---|---|---|
+| `sourceType` | `dataSourceManager.getCurrentSourceType()` | string or `null` |
+| `datasetId` | `dataSourceManager.getCurrentDatasetId()` | string or `null` |
+| `cellCount` | `state.pointCount` | safe integer |
+| `varCount` | `state.varData.fields.length` | safe integer |
+| `cellOrder` | see below | `{ dimension, digest }` |
+
+`cellOrder.dimension` is `state.getViewDimensionLevel('live')`, exactly 1, 2, or
+3. `cellOrder.digest` is 16 lowercase hex characters produced by
+`digestCellOrder(state.positionsArray)` in
+`cellucid/assets/js/app/session/session-context.js`.
+
+Why the coordinates:
+- The four scalars all survive a row permutation. Re-export a dataset at the
+  same id from re-sorted input and every one of them is unchanged, while every
+  stored row index now denotes a different cell.
+- Observation and variable names are also invariant under a row permutation, so
+  they cannot detect the change either.
+- Positions are the only per-cell payload the viewer always holds in memory, and
+  a re-ordered export permutes them.
+
+Why the dimension travels with the digest:
+- The 1D, 2D, and 3D embeddings are separate exported files, normalized
+  independently, so a digest is comparable only within one of them.
+- Recording the dimension is what lets a mismatch be attributed to the view on
+  screen rather than to the data.
+
+Cost and memoization:
+- 4.3 ms for the digest and 5.6 ms for the complete fingerprint on 842k cells
+  (9.64 MiB of Float32 coordinates).
+- Memoized in a `WeakMap` keyed by the coordinate array. That array is replaced,
+  never rewritten, on every dataset and dimension change, so the per-contributor
+  re-derivations during one capture cost 0.06 ms in total.
+
+Four refusals, four distinct messages surfaced verbatim by the session controls:
+
+| Cause | Where it is raised | What the user is told |
+|---|---|---|
+| Fingerprint with only the four pre-`cellOrder` keys | `assertDatasetFingerprint()`, during manifest validation | the file was saved before Cellucid recorded which cells a selection contains, so its selections can never be confirmed; re-create them and save again |
+| Any of the four scalars differs | `describeDatasetFingerprintMismatch()` | it is a different dataset, with both saved and current cell/gene counts named |
+| `cellOrder.dimension` differs | `describeDatasetFingerprintMismatch()` | both dimensions are named; switching back to the saved one resolves it |
+| `cellOrder.digest` differs, everything else matches | `describeDatasetFingerprintMismatch()` | same name and counts, different cell order, so every saved selection would mark the wrong cells |
+
+Attributing a refusal to the wrong cause is itself an integrity failure: telling
+someone their data was re-ordered when they only switched the view teaches them
+to distrust a sound dataset. Keep the four causes separate when changing this
+code.
+
+A file carrying only the four scalars is refused, not accepted. Accepting it
+would preserve exactly the unverifiable state the record exists to eliminate,
+permanently, for every file already written.
+
+The published-default path is not exempt. `restorePublishedDefaultState()`
+shares `validateManifest()` and the same fingerprint comparison, so an
+advertised `default.cellucid-session` must carry `cellOrder` and must have been
+saved on the dimension the dataset publishes as its default.
+
+---
+
 ## What This Folder (“state-serializer/”) Specifically Does
 
 The **`core/state`** eager chunk uses these helper modules:
@@ -222,6 +294,8 @@ Continuous fields:
 
 Restore behavior:
 - preloads needed fields (`ensureFieldLoaded` / `ensureVarFieldLoaded`)
+- clears every obs/var field back to its load-time defaults first, so a restore
+  reproduces the saved state instead of merging onto whatever is on screen
 - applies changes in a batch (`beginBatch/endBatch`) when available
 
 ### `active-fields.js` — Active Coloring Field (Obs/Var)

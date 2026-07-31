@@ -18,6 +18,7 @@ import { StreamingGeneLoader } from '../data/streaming-gene-loader.js';
 import { PerformanceConfig } from '../shared/performance-config.js';
 import { ProgressTracker } from '../shared/progress-tracker.js';
 import { isFiniteNumber, mean } from '../shared/number-utils.js';
+import { benjaminiHochbergTestable } from './statistical-tests.js';
 import { startMemoryTracking } from '../shared/memory-tracker.js';
 import { cleanupAnalysisResources } from '../shared/resource-cleanup.js';
 
@@ -1183,7 +1184,9 @@ export class MultiVariableAnalysis {
       }
 
       // Apply multiple testing correction (Benjamini-Hochberg)
-      const correctedResults = this._benjaminiHochberg(results);
+      const { testedCount, untestableCount } =
+        this._applyBenjaminiHochberg(results);
+      const correctedResults = results;
 
       // Sort by p-value
       correctedResults.sort((a, b) => {
@@ -1200,9 +1203,12 @@ export class MultiVariableAnalysis {
       let upregulated = 0;
       let downregulated = 0;
 
+      // The Benjamini-Hochberg rejection rule is inclusive: an adjusted value
+      // of exactly alpha is a rejection, which is what `benjaminiHochberg`
+      // reports in `significant` and what the volcano and marker filters use.
       for (const r of correctedResults) {
         const adj = r.adjustedPValue;
-        if (adj === null || !Number.isFinite(adj) || adj >= 0.05) continue;
+        if (adj === null || !Number.isFinite(adj) || adj > 0.05) continue;
 
         significantCount++;
         if (r.log2FoldChange > 0) upregulated++;
@@ -1225,7 +1231,14 @@ export class MultiVariableAnalysis {
       return {
         results: correctedResults,
         summary: {
-          totalGenes: correctedResults.length,
+          // genesTested is the Benjamini-Hochberg denominator; genesUntestable
+          // are the panel genes that never produced a p-value because a group
+          // held fewer than `minCells` cells with a measured value. Reporting
+          // them separately is what makes the FDR reconstructable — see
+          // docs/user_guide/web_app/h_analysis/06_analysis_mode_differential_expression_de.md
+          genesTested: testedCount,
+          genesUntestable: untestableCount,
+          minCells,
           significantGenes: significantCount,
           upregulated,
           downregulated,
@@ -1271,42 +1284,28 @@ export class MultiVariableAnalysis {
   }
 
   /**
-   * Benjamini-Hochberg procedure for FDR correction
+   * Apply Benjamini-Hochberg FDR correction in place.
+   *
+   * Genes that never reached a test (min-cell check) carry `pValue: NaN` and
+   * are excluded from the correction family, so the denominator `m` is the
+   * testable subset rather than the panel size. The returned counts are the
+   * two numbers the UI has to report so a reader can reconstruct the FDR.
+   *
+   * @param {Object[]} results - DE rows, mutated with `adjustedPValue`
+   * @returns {{ testedCount: number, untestableCount: number }}
    */
-  _benjaminiHochberg(results) {
-    // Initialize adjusted p-values (in-place to avoid duplicating large result arrays).
+  _applyBenjaminiHochberg(results) {
+    const {
+      adjustedPValues,
+      testedCount,
+      untestableCount
+    } = benjaminiHochbergTestable(results.map(result => result.pValue));
+
     for (let i = 0; i < results.length; i++) {
-      results[i].adjustedPValue = null;
+      results[i].adjustedPValue = adjustedPValues[i];
     }
 
-    // Collect valid p-values with indices.
-    const valid = [];
-    for (let i = 0; i < results.length; i++) {
-      const pValue = results[i]?.pValue;
-      if (Number.isFinite(pValue)) {
-        valid.push({ index: i, pValue });
-      }
-    }
-
-    if (valid.length === 0) {
-      return results;
-    }
-
-    // Sort by p-value.
-    valid.sort((a, b) => a.pValue - b.pValue);
-
-    // Benjamini-Hochberg procedure (in-place assignment).
-    const m = valid.length;
-    let nextAdj = valid[m - 1].pValue;
-    results[valid[m - 1].index].adjustedPValue = Math.min(nextAdj, 1);
-
-    for (let i = m - 2; i >= 0; i--) {
-      const rawP = valid[i].pValue * m / (i + 1);
-      nextAdj = Math.min(rawP, nextAdj);
-      results[valid[i].index].adjustedPValue = Math.min(nextAdj, 1);
-    }
-
-    return results;
+    return { testedCount, untestableCount };
   }
 
   // =========================================================================

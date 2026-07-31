@@ -9,6 +9,8 @@ import {
   DATA_CONFIG,
   DataSourceError,
   DataSourceErrorCode,
+  MAX_METADATA_JSON_BYTES,
+  MAX_PREPARED_BROWSER_BYTES,
   isLocalUserUrl,
   validateDatasetIdentity
 } from './data-source.js';
@@ -131,8 +133,6 @@ function parsePreparedLocalUrl(url) {
     : null;
 }
 
-const MAX_PREPARED_BROWSER_BYTES = 512 * 1024 * 1024;
-const MAX_PREPARED_METADATA_BYTES = 64 * 1024 * 1024;
 const MAX_EAGER_GENE_VALIDATION_BYTES = 64 * 1024 * 1024;
 const MAX_EAGER_GENE_VALIDATION_FILES = 256;
 const FLOAT32_BYTES = Float32Array.BYTES_PER_ELEMENT;
@@ -1276,19 +1276,19 @@ export class LocalUserDirDataSource {
     if (
       !Number.isSafeInteger(file.size) ||
       file.size < 0 ||
-      file.size > MAX_PREPARED_METADATA_BYTES
+      file.size > MAX_METADATA_JSON_BYTES
     ) {
       throw preparedDataError(
-        `${filename} exceeds the ${MAX_PREPARED_METADATA_BYTES}-byte metadata limit`,
+        `${filename} exceeds the ${MAX_METADATA_JSON_BYTES}-byte metadata limit`,
         this.type,
         { filename, size: file.size }
       );
     }
     const text = await file.text();
     throwIfPreparedAborted(signal);
-    if (text.length > MAX_PREPARED_METADATA_BYTES) {
+    if (text.length > MAX_METADATA_JSON_BYTES) {
       throw preparedDataError(
-        `${filename} exceeds the ${MAX_PREPARED_METADATA_BYTES}-character metadata limit`,
+        `${filename} exceeds the ${MAX_METADATA_JSON_BYTES}-character metadata limit`,
         this.type,
         { filename, length: text.length }
       );

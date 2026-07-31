@@ -735,7 +735,8 @@ test('file edge payloads are exact before rendering or KNN use', async t => {
       manifest: FILE_MANIFEST,
       sources: Uint16Array.from([0, 1, 2]),
       destinations: Uint16Array.from([1, 2]),
-      error: /expected exactly 4 bytes/i,
+      // Refused mid-transfer: an over-long payload never lands in memory.
+      error: /transfer of at least 6 bytes exceeds its 4-byte ceiling/i,
     },
     {
       name: 'short destination bytes',
@@ -750,7 +751,7 @@ test('file edge payloads are exact before rendering or KNN use', async t => {
       sources: Uint16Array.from([0, 1]),
       destinations: Uint16Array.from([1, 2]),
       weights: Float64Array.from([1]),
-      error: /expected exactly 16 bytes.*float64 weights/i,
+      error: /expected exactly 16 bytes, received 8/i,
     },
     {
       name: 'trailing weight bytes',
@@ -758,7 +759,8 @@ test('file edge payloads are exact before rendering or KNN use', async t => {
       sources: Uint16Array.from([0, 1]),
       destinations: Uint16Array.from([1, 2]),
       weights: Float64Array.from([1, 2, 3]),
-      error: /expected exactly 16 bytes.*float64 weights/i,
+      // Refused mid-transfer: an over-long payload never lands in memory.
+      error: /transfer of at least 24 bytes exceeds its 16-byte ceiling/i,
     },
     {
       name: 'zero weight',

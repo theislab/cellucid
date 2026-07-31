@@ -21,6 +21,10 @@ import {
 } from '../../../community-annotations/access-store.js';
 import { ANNOTATION_CONNECTION_CHANGED_EVENT } from '../../../community-annotations/connection-events.js';
 import { openCommunityAnnotationVotingModal } from '../community-annotation-voting-modal.js';
+import {
+  createKeyboardMove,
+  getKeyboardMoveInstructionsId
+} from '../../keyboard-move.js';
 
 const CATEGORY_DRAG_MIME = 'application/x-cellucid-category';
 const INIT_KEYS = new Set(['state', 'legendEl', 'dataSourceManager']);
@@ -823,6 +827,91 @@ export function initCategoricalLegend(options) {
       return { fieldIndex, currentField };
     };
 
+    /**
+     * Confirm and perform one category merge.
+     *
+     * Dropping a label onto a row and dropping it there with the keyboard are
+     * the same operation, so they run the same code: one confirmation, one
+     * staleness check, one notification.
+     */
+    const beginCategoryMerge = (fromIdx, toIdx) => {
+      if (annotating) return;
+      if (fromIdx === toIdx) return;
+
+      const { fieldIndex, currentField } = requireCurrentCategoryField(toIdx);
+
+      StateValidator.validateCategoryIndex(fromIdx, currentField);
+      const fromLabel = formatCategoryLabel(currentField.categories[fromIdx]);
+      const toLabel = formatCategoryLabel(currentField.categories[toIdx]);
+      const inPlace = currentField._isUserDefined === true;
+      const datasetGeneration = readDatasetGeneration();
+      const capturedCategories = [
+        { index: fromIdx, value: currentField.categories[fromIdx] },
+        { index: toIdx, value: currentField.categories[toIdx] }
+      ];
+
+      let releaseTransient = () => {};
+      let retired = false;
+      const closeDialog = showConfirmDialog({
+        title: 'Merge categories',
+        message:
+          `Merge category \"${fromLabel}\" into \"${toLabel}\"?\n\n` +
+          (inPlace
+            ? `This edits the current derived column in place.\n` +
+              `To undo, restore the original column from Deleted Fields.`
+            : `This creates a new categorical column and moves the previous column to Deleted Fields for restore.`),
+        confirmText: 'Merge',
+        onConfirm: () => {
+          const ownsInteraction = retired === false;
+          retired = true;
+          releaseTransient();
+          if (!ownsInteraction || !isCapturedCategoryCurrent({
+            categories: capturedCategories,
+            datasetGeneration,
+            field: currentField,
+            fieldIndex
+          })) {
+            return;
+          }
+          try {
+            const result = state.mergeCategoriesToNewField(
+              fieldIndex,
+              fromIdx,
+              toIdx,
+              { editInPlace: inPlace }
+            );
+            requirePlainRecord(result, 'Category merge result');
+            if (
+              typeof result.updatedInPlace !== 'boolean'
+              || typeof result.mergedCategoryLabel !== 'string'
+              || result.mergedCategoryLabel.length === 0
+            ) {
+              throw new TypeError(
+                'Category merge result requires updatedInPlace and mergedCategoryLabel'
+              );
+            }
+            const mergedLabel = ` → \"${result.mergedCategoryLabel}\"`;
+            const suffix = result.updatedInPlace ? ' (edited in place)' : '';
+            getNotificationCenter().success(
+              `Merged \"${fromLabel}\" into \"${toLabel}\"${mergedLabel}${suffix}`,
+              { category: 'filter', duration: 2400 }
+            );
+          } catch (error) {
+            if (!(error instanceof Error)) throw error;
+            getNotificationCenter().error(error.message, { category: 'filter' });
+          }
+        },
+        onCancel: () => {
+          retired = true;
+          releaseTransient();
+        }
+      });
+      releaseTransient = ownTransient(() => {
+        retired = true;
+        closeDialog();
+      });
+    };
+
     const itemsContainer = ownerDocument.createElement('div');
     itemsContainer.className = 'legend-items-container';
     const needsScroll = sortedIndices.length > 16;
@@ -1003,7 +1092,7 @@ export function initCategoricalLegend(options) {
           ? hasCells
             ? 'Voting mode enabled: click to vote (labels are locked).'
             : 'Voting unavailable because no cells are currently available.'
-          : 'Double-click to rename • Drag onto another category to merge';
+          : 'Double-click to rename • Drag or press Enter to merge into another category';
       }
 
       labelSpan.draggable = !annotating;
@@ -1023,6 +1112,51 @@ export function initCategoricalLegend(options) {
             .querySelectorAll('.legend-item-drag-over')
             .forEach((el) => el.classList.remove('legend-item-drag-over'));
         });
+
+        // The label was `draggable` and nothing else: no role, no tab stop, so
+        // merging one category into another was a pointer-only operation and
+        // the nearest keyboard control, "Delete category", merges into
+        // unassigned instead — a different operation with a different result.
+        // The label is the pick-up handle for the shared move grammar now.
+        labelSpan.setAttribute('role', 'button');
+        labelSpan.setAttribute('tabindex', '0');
+        labelSpan.setAttribute('aria-roledescription', 'movable category');
+        labelSpan.setAttribute(
+          'aria-describedby',
+          getKeyboardMoveInstructionsId(ownerDocument)
+        );
+        labelSpan.setAttribute('aria-keyshortcuts', 'Enter Space');
+
+        const move = createKeyboardMove({
+          ownerDocument,
+          describeSource: () => cat,
+          listTargets: () => Array.from(
+            itemsContainer.querySelectorAll('.legend-item')
+          ).flatMap((candidate) => {
+            const index = Number(candidate.dataset.catIndex);
+            if (!Number.isSafeInteger(index) || index === catIdx) return [];
+            const name = candidate.querySelector('.legend-label-main');
+            if (name === null) return [];
+            return [{ element: candidate, index, label: name.textContent }];
+          }),
+          onAim: (aimed, previous) => {
+            previous?.element.classList.remove('legend-item-drag-over');
+            aimed?.element.classList.add('legend-item-drag-over');
+          },
+          onCommit: (aimed) => beginCategoryMerge(catIdx, aimed.index),
+          onPickStateChange: (picked) => {
+            row.classList.toggle('legend-item-dragging', picked);
+          },
+          emptyMessage: `${cat} has no other category to merge into.`
+        });
+
+        labelSpan.addEventListener('keydown', (e) => {
+          // The inline rename editor replaces the label's contents; its keys
+          // belong to it, not to the move.
+          if (e.target !== labelSpan) return;
+          move.handleKeydown(e);
+        });
+        labelSpan.addEventListener('blur', () => move.cancel());
       } else if (hasCells) {
         labelSpan.classList.add('legend-label-voting');
         labelMain.classList.add('legend-vote-trigger');
@@ -1264,82 +1398,7 @@ export function initCategoricalLegend(options) {
         row.classList.remove('legend-item-drag-over');
 
         const payload = parseCategoryDragPayload(e.dataTransfer);
-        const fromIdx = payload.catIdx;
-        if (fromIdx === catIdx) return;
-
-        const { fieldIndex, currentField } =
-          requireCurrentCategoryField(catIdx);
-
-        StateValidator.validateCategoryIndex(fromIdx, currentField);
-        const fromLabel = formatCategoryLabel(currentField.categories[fromIdx]);
-        const toLabel = formatCategoryLabel(currentField.categories[catIdx]);
-        const inPlace = currentField._isUserDefined === true;
-        const datasetGeneration = readDatasetGeneration();
-        const capturedCategories = [
-          { index: fromIdx, value: currentField.categories[fromIdx] },
-          { index: catIdx, value: currentField.categories[catIdx] }
-        ];
-
-        let releaseTransient = () => {};
-        let retired = false;
-        const closeDialog = showConfirmDialog({
-          title: 'Merge categories',
-          message:
-            `Merge category \"${fromLabel}\" into \"${toLabel}\"?\n\n` +
-            (inPlace
-              ? `This edits the current derived column in place.\n` +
-                `To undo, restore the original column from Deleted Fields.`
-              : `This creates a new categorical column and moves the previous column to Deleted Fields for restore.`),
-          confirmText: 'Merge',
-          onConfirm: () => {
-            const ownsInteraction = retired === false;
-            retired = true;
-            releaseTransient();
-            if (!ownsInteraction || !isCapturedCategoryCurrent({
-              categories: capturedCategories,
-              datasetGeneration,
-              field: currentField,
-              fieldIndex
-            })) {
-              return;
-            }
-            try {
-              const result = state.mergeCategoriesToNewField(
-                fieldIndex,
-                fromIdx,
-                catIdx,
-                { editInPlace: inPlace }
-              );
-              requirePlainRecord(result, 'Category merge result');
-              if (
-                typeof result.updatedInPlace !== 'boolean'
-                || typeof result.mergedCategoryLabel !== 'string'
-                || result.mergedCategoryLabel.length === 0
-              ) {
-                throw new TypeError(
-                  'Category merge result requires updatedInPlace and mergedCategoryLabel'
-                );
-              }
-              const mergedLabel = ` → \"${result.mergedCategoryLabel}\"`;
-              const suffix = result.updatedInPlace ? ' (edited in place)' : '';
-              getNotificationCenter().success(
-                `Merged \"${fromLabel}\" into \"${toLabel}\"${mergedLabel}${suffix}`,
-                { category: 'filter', duration: 2400 }
-              );
-            } catch (error) {
-              if (!(error instanceof Error)) throw error;
-              getNotificationCenter().error(error.message, { category: 'filter' });
-            }
-          },
-          onCancel: () => {
-            retired = true;
-            releaseTransient();
-          }
-        });
-        releaseTransient = ownTransient(() => {
-          retired = true;
-          closeDialog();
-        });
+        beginCategoryMerge(payload.catIdx, catIdx);
       });
 
       const countSpan = ownerDocument.createElement('span');

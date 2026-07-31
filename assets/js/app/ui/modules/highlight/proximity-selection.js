@@ -8,13 +8,20 @@
  */
 
 import { debug } from '../../../../utils/debug.js';
-import { HIGHLIGHT_MODE_COPY } from './mode-copy.js';
-import { MAX_HISTORY_STEPS } from './selection-state.js';
+import {
+  abandonedGestureNotice,
+  HIGHLIGHT_MODE_COPY,
+  SELECTION_NOTICE,
+  selectionNoticeHtml
+} from './mode-copy.js';
+import { MAX_HISTORY_STEPS, selectionUnchanged } from './selection-state.js';
+import { getStepControls, removeStepControls } from './step-controls.js';
 import {
   deliverSelectionToJupyter,
   showSelectionDeliveryFailure
 } from './selection-notification.js';
 import {
+  requireCellIndex,
   requireCombineMode,
   requireCompletedSelectionEvent,
   requireDomElement,
@@ -69,7 +76,7 @@ export function initProximitySelection(options) {
     ]
   );
   requireJupyterSource(jupyterSource);
-  requireHighlightSelectionState(selectionState);
+  requireHighlightSelectionState(selectionState, state.pointCount);
   requireExactKeys(ui, ['modeDescriptionEl'], 'Proximity selection UI');
   const highlightModeDescriptionEl = requireDomElement(
     ui.modeDescriptionEl,
@@ -108,7 +115,11 @@ export function initProximitySelection(options) {
 
   function handleProximitySelection(proximityEvent) {
     if (destroyed) return;
-    requireCompletedSelectionEvent(proximityEvent, 'proximity');
+    requireCompletedSelectionEvent(
+      proximityEvent,
+      'proximity',
+      state.pointCount
+    );
 
     const stepsLabel = proximityEvent.steps > 1 ? ` (${proximityEvent.steps} drags)` : '';
     const savedGroup = state.addHighlightDirect({
@@ -119,8 +130,9 @@ export function initProximitySelection(options) {
     requireSavedHighlightGroup(
       savedGroup,
       'proximity',
-      proximityEvent.cellCount,
-      'Saved proximity highlight group'
+      proximityEvent.cellIndices,
+      'Saved proximity highlight group',
+      state.pointCount
     );
 
     debug.log(`[UI] Proximity selected ${proximityEvent.cellCount} cells from ${proximityEvent.steps} drag(s)`);
@@ -145,14 +157,30 @@ export function initProximitySelection(options) {
     requireSelectionStepEvent(
       stepEvent,
       'proximity',
+      state.pointCount,
       ['centerCellIndex', 'radius']
     );
+    if (stepEvent.abandoned !== undefined) {
+      renderProximityState(abandonedGestureNotice(stepEvent.abandoned));
+      return;
+    }
     if (stepEvent.cancelled !== true) {
+      // A drag that starts on empty space while a selection already exists is
+      // centred on that selection's plane, and the renderer reports -1 for the
+      // cell it did not hit. The preview accepts that; so must the step, or the
+      // add or subtract the user just drew is thrown away at release.
       requireSafeInteger(
         stepEvent.centerCellIndex,
         'Proximity step centerCellIndex',
-        0
+        -1
       );
+      if (stepEvent.centerCellIndex >= 0) {
+        requireCellIndex(
+          stepEvent.centerCellIndex,
+          'Proximity step centerCellIndex',
+          state.pointCount
+        );
+      }
       requireFiniteNumber(stepEvent.radius, 'Proximity step radius');
       if (stepEvent.radius < 0) {
         throw new RangeError('Proximity step radius must not be negative.');
@@ -168,16 +196,33 @@ export function initProximitySelection(options) {
       return;
     }
 
-    if (selectionState.lastProximityCandidates !== null || selectionState.lastProximityStep > 0) {
-      selectionState.proximityHistory.push({
-        candidates: selectionState.lastProximityCandidates ? [...selectionState.lastProximityCandidates] : null,
-        step: selectionState.lastProximityStep
-      });
-      if (selectionState.proximityHistory.length > MAX_HISTORY_STEPS) {
-        selectionState.proximityHistory.shift();
-      }
-      selectionState.proximityRedoStack = [];
+    if (
+      selectionUnchanged(
+        selectionState.lastProximityCandidates,
+        stepEvent.candidates
+      )
+    ) {
+      // Roll the renderer's own step counter back, or the next real step is
+      // numbered as if this one had happened.
+      viewer.restoreProximityState(
+        selectionState.lastProximityCandidates,
+        selectionState.lastProximityStep
+      );
+      renderProximityState(SELECTION_NOTICE.unchanged);
+      return;
     }
+
+    // The empty state before the first step is recorded like any other, so
+    // Undo can reach it — the annotation tool has always done this, and a
+    // greyed-out Undo immediately after dragging reads as a broken control.
+    selectionState.proximityHistory.push({
+      candidates: selectionState.lastProximityCandidates ? [...selectionState.lastProximityCandidates] : null,
+      step: selectionState.lastProximityStep
+    });
+    if (selectionState.proximityHistory.length > MAX_HISTORY_STEPS) {
+      selectionState.proximityHistory.shift();
+    }
+    selectionState.proximityRedoStack = [];
 
     selectionState.lastProximityCandidates = [...stepEvent.candidates];
     selectionState.lastProximityStep = stepEvent.step;
@@ -252,6 +297,7 @@ export function initProximitySelection(options) {
     requireSelectionPreviewEvent(
       previewEvent,
       'proximity',
+      state.pointCount,
       ['newCellCount', 'centerCellIndex', 'radius', 'mode']
     );
     requireSafeInteger(
@@ -264,6 +310,13 @@ export function initProximitySelection(options) {
       'Proximity preview centerCellIndex',
       -1
     );
+    if (previewEvent.centerCellIndex >= 0) {
+      requireCellIndex(
+        previewEvent.centerCellIndex,
+        'Proximity preview centerCellIndex',
+        state.pointCount
+      );
+    }
     requireFiniteNumber(previewEvent.radius, 'Proximity preview radius');
     requireCombineMode(previewEvent.mode, 'Proximity preview');
     if (previewEvent.radius < 0) {
@@ -278,60 +331,66 @@ export function initProximitySelection(options) {
   }
 
   function getProximityControls() {
-    let controls = documentOwner.getElementById('proximity-step-controls');
-    const created = controls === null;
-    if (created) {
-      controls = documentOwner.createElement('div');
-      controls.id = 'proximity-step-controls';
-      controls.className = 'lasso-step-controls';
-      controls.innerHTML = `
-        <button type="button" class="btn-small lasso-confirm" id="proximity-confirm-btn">Confirm</button>
-        <button type="button" class="btn-small btn-undo" id="proximity-undo-btn" title="Undo">↩</button>
-        <button type="button" class="btn-small btn-redo" id="proximity-redo-btn" title="Redo">↪</button>
-        <button type="button" class="btn-small lasso-cancel" id="proximity-cancel-btn">Cancel</button>
-      `;
-      highlightModeDescriptionEl.parentElement.appendChild(controls);
-    }
-    const undoButton = requireDomElement(
-      documentOwner.getElementById('proximity-undo-btn'),
-      'Proximity undo button',
-      ['addEventListener']
-    );
-    const redoButton = requireDomElement(
-      documentOwner.getElementById('proximity-redo-btn'),
-      'Proximity redo button',
-      ['addEventListener']
-    );
-    const confirmButton = requireDomElement(
-      documentOwner.getElementById('proximity-confirm-btn'),
-      'Proximity confirm button',
-      ['addEventListener']
-    );
-    const cancelButton = requireDomElement(
-      documentOwner.getElementById('proximity-cancel-btn'),
-      'Proximity cancel button',
-      ['addEventListener']
-    );
-    if (created) {
-      listen(undoButton, 'click', handleProximityUndo);
-      listen(redoButton, 'click', handleProximityRedo);
-      listen(confirmButton, 'click', () => {
-        viewer.confirmProximitySelection();
-        state.clearPreviewHighlight();
-      });
-      listen(cancelButton, 'click', () => {
-        viewer.cancelProximitySelection();
-      });
-    }
-    return { undoButton, redoButton, confirmButton };
+    return getStepControls({
+      documentOwner,
+      tool: 'proximity',
+      parent: highlightModeDescriptionEl.parentElement,
+      listen,
+      handlers: {
+        undo: handleProximityUndo,
+        redo: handleProximityRedo,
+        confirm: () => {
+          viewer.confirmProximitySelection();
+          state.clearPreviewHighlight();
+        },
+        cancel: () => {
+          viewer.cancelProximitySelection();
+        }
+      }
+    });
   }
 
-  function updateProximityUI(stepEvent) {
+  /**
+   * Re-publish what the tool already holds, with one explanatory notice.
+   *
+   * The live preview repaints the highlight throughout the drag, so a gesture
+   * that commits no step still has to restore the standing selection the
+   * preview painted over.
+   */
+  function renderProximityState(notice) {
+    const candidates = selectionState.lastProximityCandidates;
+    if (candidates === null) {
+      updateProximityUI(null, notice);
+      state.clearPreviewHighlight();
+      return;
+    }
+    if (candidates.length === 0) {
+      updateProximityUI(
+        { step: 0, candidateCount: 0, keepControls: true },
+        notice
+      );
+      state.clearPreviewHighlight();
+      return;
+    }
+    updateProximityUI({
+      step: selectionState.lastProximityStep,
+      candidateCount: candidates.length,
+      restored: true
+    }, notice);
+    state.setPreviewHighlightFromIndices(candidates);
+  }
+
+  function updateProximityUI(stepEvent, notice = '') {
     if (destroyed) return;
+    const noticeHtml = selectionNoticeHtml(notice);
     if (!stepEvent || (stepEvent.step === 0 && !stepEvent.keepControls)) {
-      highlightModeDescriptionEl.innerHTML = HIGHLIGHT_MODE_COPY.proximity;
-      const existingControls = documentOwner.getElementById('proximity-step-controls');
-      if (existingControls) existingControls.remove();
+      highlightModeDescriptionEl.innerHTML =
+        `${HIGHLIGHT_MODE_COPY.proximity}${noticeHtml}`;
+      removeStepControls(
+        documentOwner,
+        'proximity',
+        highlightModeDescriptionEl.parentElement
+      );
       return;
     }
 
@@ -348,7 +407,7 @@ export function initProximitySelection(options) {
       redoButton.disabled = selectionState.proximityRedoStack.length === 0;
       confirmButton.disabled = true;
 
-      highlightModeDescriptionEl.innerHTML = stepInfo;
+      highlightModeDescriptionEl.innerHTML = `${stepInfo}${noticeHtml}`;
       return;
     }
 
@@ -374,12 +433,12 @@ export function initProximitySelection(options) {
     redoButton.disabled = selectionState.proximityRedoStack.length === 0;
     confirmButton.disabled = stepEvent.candidateCount === 0;
 
-    highlightModeDescriptionEl.innerHTML = stepInfo;
+    highlightModeDescriptionEl.innerHTML = `${stepInfo}${noticeHtml}`;
   }
 
   function restoreProximitySelection(unifiedState) {
     if (destroyed) return;
-    requireUnifiedSelectionState(unifiedState);
+    requireUnifiedSelectionState(unifiedState, state.pointCount);
     selectionState.proximityHistory = [];
     selectionState.proximityRedoStack = [];
     selectionState.lastProximityCandidates = unifiedState.inProgress

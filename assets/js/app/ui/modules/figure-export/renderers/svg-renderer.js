@@ -47,11 +47,24 @@
 
 import { escapeHtml } from '../../../../utils/dom-utils.js';
 import { forEachProjectedPoint } from '../utils/point-projector.js';
-	import { computeSingleViewLayout, computeGridDims } from '../utils/layout.js';
+	import {
+	  computeSingleViewLayout,
+	  computeGridDims,
+	  computeGridPaneLayout,
+	  LAYOUT_CONSTANTS,
+	} from '../utils/layout.js';
 	import { renderSvgAxes } from '../components/axes-builder.js';
-	import { renderSvgLegend } from '../components/legend-builder.js';
+	import {
+	  renderSvgLegend,
+	  resolveSharedGridLegend,
+	} from '../components/legend-builder.js';
 	import { renderSvgOrientationIndicator } from '../components/orientation-indicator.js';
 	import { renderSvgCentroidOverlay } from '../components/centroid-overlay.js';
+	import {
+	  buildReferenceGridModel,
+	  renderSvgReferenceGrid,
+	  resolveReferenceGridSurfaceRgb,
+	} from '../components/reference-grid.js';
 	import {
 	  computeVisibleCameraBounds,
 	  computeVisibleRealBounds,
@@ -72,6 +85,12 @@ import {
   POINT_VISIBILITY_THRESHOLD,
 } from '../utils/lod-membership.js';
 import { hexToRgb01, rgb01ToHex } from '../utils/color-utils.js';
+import { resolveFigureInk } from '../utils/figure-ink.js';
+import {
+  applyFogAlpha,
+  applyFogChannel,
+  createFogEvaluator,
+} from '../utils/fog.js';
 	import { computeLetterboxedRect } from '../utils/letterbox.js';
 import { assertCameraState } from '../../../../../rendering/camera-state-contract.js';
 import {
@@ -80,8 +99,17 @@ import {
 } from '../figure-export-contract.js';
 import { clamp } from '../../../../utils/number-utils.js';
 import {
-  areLegendModelsSemanticallyEqual,
-} from '../utils/legend-model-equality.js';
+  buildProvenanceDescription,
+  buildProvenanceJson,
+  readProvenanceSourceFile,
+  readProvenanceViews,
+  unanimousFieldKey,
+} from '../utils/figure-provenance.js';
+import { panelLetter } from '../utils/panel-label.js';
+import {
+  buildSelectionBadge,
+  countHighlightedVisiblePoints,
+} from '../utils/selection-badge.js';
 
 function applyExportBackgroundToRenderState(renderState, background, backgroundColor) {
   if (background === 'viewer' || background === 'transparent') return renderState;
@@ -101,51 +129,72 @@ function applyExportBackgroundToRenderState(renderState, background, backgroundC
 const DEFAULT_HIGHLIGHT_RGB = { r: 102, g: 217, b: 255 }; // ~[0.4, 0.85, 1.0]
 const DEFAULT_HIGHLIGHT_SCALE = 1.75;
 
-function computeGridPaneLayout({
-  cellX,
-  cellY,
-  cellWidth,
-  cellHeight,
-  includeAxes,
-  fontSize,
-}) {
-  const padding = clamp(Math.round(fontSize * 0.65), 6, 12);
-  const innerWidth = Math.max(1, cellWidth - padding * 2);
-  const innerHeight = Math.max(1, cellHeight - padding * 2);
-  const headerHeight = Math.min(
-    Math.max(18, Math.round(fontSize * 1.5)),
-    Math.max(0, innerHeight - 1)
-  );
-  const plotAreaHeight = Math.max(1, innerHeight - headerHeight);
-  const minPlotWidth = Math.min(80, Math.max(1, innerWidth * 0.45));
-  const minPlotHeight = Math.min(64, Math.max(1, plotAreaHeight * 0.45));
-  const axisRight = includeAxes
-    ? Math.min(10, Math.max(0, innerWidth - minPlotWidth))
-    : 0;
-  const axisLeft = includeAxes
-    ? Math.min(62, Math.max(0, innerWidth - axisRight - minPlotWidth))
-    : 0;
-  const axisBottom = includeAxes
-    ? Math.min(62, Math.max(0, plotAreaHeight - minPlotHeight))
-    : 0;
-  const plotRect = {
-    x: cellX + padding + axisLeft,
-    y: cellY + padding + headerHeight,
-    width: Math.max(1, innerWidth - axisLeft - axisRight),
-    height: Math.max(1, plotAreaHeight - axisBottom),
-  };
+/** Selection muting paints non-selected points this flat grey, as `packBuffers` does. */
+const SELECTION_MUTED_RGB = 160;
 
-  return {
-    labelX: plotRect.x,
-    labelY: cellY + padding + Math.min(fontSize, Math.max(1, headerHeight)),
-    panelRect: {
-      x: cellX + 1,
-      y: cellY + 1,
-      width: Math.max(1, cellWidth - 2),
-      height: Math.max(1, cellHeight - 2),
-    },
-    plotRect,
+/**
+ * The colour a vector circle must carry to match the shader.
+ *
+ * Both transformations happen on screen in this order: the export mutes
+ * non-selected points before rasterization, and the shader then fogs whatever
+ * colour reached it. Reversing them would fog the original colour and mute the
+ * result, which is a different image.
+ *
+ * Returns a reused 4-slot buffer so a 200k-point figure allocates nothing.
+ *
+ * @param {object} options
+ * @returns {(index: number, r: number, g: number, b: number, a: number) => Float64Array}
+ */
+function createVectorPointShader({
+  fog,
+  positions,
+  highlightArray,
+  emphasizeSelection,
+  selectionMutedOpacity,
+}) {
+  const shaded = new Float64Array(4);
+  return function shadeVectorPoint(index, r, g, b, a) {
+    let rr = r;
+    let gg = g;
+    let bb = b;
+    let aa = a;
+    if (
+      emphasizeSelection &&
+      highlightArray &&
+      (highlightArray[index] ?? 0) < MIN_VISIBLE_ALPHA_BYTE
+    ) {
+      rr = SELECTION_MUTED_RGB;
+      gg = SELECTION_MUTED_RGB;
+      bb = SELECTION_MUTED_RGB;
+      aa *= selectionMutedOpacity;
+    }
+    if (fog !== null) {
+      const base = index * 3;
+      const transmittance = fog.transmittanceAt(
+        positions[base],
+        positions[base + 1],
+        positions[base + 2]
+      );
+      rr = applyFogChannel(fog.fogR, rr, transmittance);
+      gg = applyFogChannel(fog.fogG, gg, transmittance);
+      bb = applyFogChannel(fog.fogB, bb, transmittance);
+      aa = applyFogAlpha(transmittance, aa);
+    }
+    shaded[0] = rr;
+    shaded[1] = gg;
+    shaded[2] = bb;
+    shaded[3] = aa;
+    return shaded;
   };
+}
+
+function renderSvgSelectionBadge(badge, fontFamily, fontSize, ink) {
+  return (
+    `<g font-family="${escapeHtml(fontFamily)}" font-size="${fontSize}" fill="${ink.surfaceInk}">` +
+    `<rect x="${badge.x}" y="${badge.y}" width="${badge.width}" height="${badge.height}" rx="4" fill="${ink.surface}" fill-opacity="0.85" stroke="${ink.frame}" stroke-width="1"/>` +
+    `<text x="${badge.textX}" y="${badge.textY}" stroke="none">${escapeHtml(badge.label)}</text>` +
+    `</g>`
+  );
 }
 
 function highlightValueToAlpha01(value) {
@@ -161,66 +210,13 @@ function highlightValueToAlpha01(value) {
 	  const dataset = meta?.datasetName || meta?.datasetId || '';
 	  const exportedAt = String(meta?.exportedAt || new Date().toISOString());
 	  const website = 'https://cellucid.com';
-	  const sourceFile = (
-	    meta?.datasetUserPath ||
-	    meta?.datasetSourceUrl ||
-	    meta?.datasetBaseUrl ||
-	    null
-	  );
+	  const sourceFile = readProvenanceSourceFile(meta);
 
-	  const descriptionParts = [];
-	  if (meta?.fieldKey) descriptionParts.push(`Field: ${meta.fieldKey}`);
-	  if (meta?.viewLabel) descriptionParts.push(`View: ${meta.viewLabel}`);
-	  if (sourceFile) descriptionParts.push(`Source: ${sourceFile}`);
-	  if (Array.isArray(meta?.filters) && meta.filters.length) {
-	    const lines = meta.filters.filter((l) => l && !/No filters active/i.test(String(l)));
-	    if (lines.length) descriptionParts.push(`Filters: ${lines.join('; ')}`);
-	  }
-	  const description = descriptionParts.join(' • ');
-
-	  const json = JSON.stringify(
-	    {
-	      generator: website,
-	      exporter: meta?.exporter || { name: 'Cellucid', website },
-	      exportedAt,
-	      dataset: {
-	        name: meta?.datasetName || null,
-	        id: meta?.datasetId || null,
-	        sourceType: meta?.sourceType || null,
-	        baseUrl: meta?.datasetBaseUrl || null,
-	        userPath: meta?.datasetUserPath || null,
-	        source: {
-	          name: meta?.datasetSourceName || null,
-	          url: meta?.datasetSourceUrl || null,
-	          citation: meta?.datasetSourceCitation || null,
-	        },
-	      },
-	      view: {
-	        id: meta?.viewId || null,
-	        label: meta?.viewLabel || null,
-	      },
-	      field: {
-	        key: meta?.fieldKey || null,
-	        kind: meta?.fieldKind || null,
-	      },
-	      filters: Array.isArray(meta?.filters) ? meta.filters : [],
-	      export: {
-	        format: 'svg',
-	        width: Number.isFinite(payload?.width) ? payload.width : null,
-	        height: Number.isFinite(payload?.height) ? payload.height : null,
-	        dpi: Number.isFinite(payload?.dpi) ? payload.dpi : null,
-	        strategy: payload.options.strategy,
-	        includeAxes: payload.options.includeAxes,
-	        includeLegend: payload.options.includeLegend,
-	        legendPosition: payload.options.legendPosition,
-	        background: payload.options.background,
-	        backgroundColor: payload.options.backgroundColor,
-	        crop: payload.options.crop,
-	      }
-	    },
-	    null,
-	    0
-	  );
+	  // Every exported panel is described; `colorField` is only claimed when all
+	  // of them really carry the same field.
+	  const description = buildProvenanceDescription(meta);
+	  const colorField = unanimousFieldKey(readProvenanceViews(meta));
+	  const json = buildProvenanceJson(meta, payload, 'svg');
 
 	  return `<metadata>
   <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
@@ -234,7 +230,7 @@ function highlightValueToAlpha01(value) {
       ${dataset ? `<dc:source>${escapeHtml(dataset)}</dc:source>` : ''}
       ${meta?.datasetId ? `<dc:identifier>${escapeHtml(String(meta.datasetId))}</dc:identifier>` : ''}
       ${description ? `<dc:description>${escapeHtml(description)}</dc:description>` : ''}
-      ${meta?.fieldKey ? `<cellucid:colorField>${escapeHtml(String(meta.fieldKey))}</cellucid:colorField>` : ''}
+      ${colorField ? `<cellucid:colorField>${escapeHtml(colorField)}</cellucid:colorField>` : ''}
       ${sourceFile ? `<cellucid:sourceFile>${escapeHtml(String(sourceFile))}</cellucid:sourceFile>` : ''}
       <cellucid:json>${escapeHtml(json)}</cellucid:json>
     </rdf:Description>
@@ -441,6 +437,19 @@ export async function renderFigureToSvgBlob({ payload, signal = null }) {
     ? opts.backgroundColor
     : (background === 'viewer' ? viewerBgHex : '#ffffff');
 
+  // Annotation ink follows the figure's own paper: a near-black title on a
+  // dark-background export cannot be read.
+  const ink = resolveFigureInk({ background, backgroundColor });
+
+  // The reference grid is a viewer-owned background layer: it sits behind the
+  // points in every panel, exactly as `drawGrid()` does on screen.
+  const referenceGrid = opts.referenceGrid;
+  const referenceGridSurfaceRgb = resolveReferenceGridSurfaceRgb({
+    appearance: referenceGrid,
+    background,
+    backgroundColor,
+  });
+
   const singleView = views.length === 1;
   const singleViewId = singleView ? views[0].id : null;
 
@@ -525,6 +534,18 @@ export async function renderFigureToSvgBlob({ payload, signal = null }) {
       renderState.pointSize * view.scientificState.lodSizeMultiplier;
     const pointRadiusViewportPx = pointDiameterViewportPx / 2;
 
+    // Vector circles carry no shader, so the depth cue the viewer paints with
+    // fog has to be reproduced here or the figure loses its depth axis.
+    const shadeVectorPoint = createVectorPointShader({
+      fog: createFogEvaluator(
+        applyExportBackgroundToRenderState(renderState, background, backgroundColor)
+      ),
+      positions,
+      highlightArray,
+      emphasizeSelection,
+      selectionMutedOpacity,
+    });
+
     const layout = singleLayout || computeSingleViewLayout({
       width: desiredPlotWidth,
       height: desiredPlotHeight,
@@ -540,7 +561,7 @@ export async function renderFigureToSvgBlob({ payload, signal = null }) {
       const titleSize = Math.max(14, titleFontSize);
       const tx = layout.titleRect ? (layout.titleRect.x + layout.titleRect.width / 2) : (layout.outerPadding + (layout.totalWidth - layout.outerPadding * 2) / 2);
       parts.push(
-        `<text x="${tx}" y="${(layout.titleRect?.y ?? layout.outerPadding) + titleSize}" text-anchor="middle" font-family="${escapeHtml(fontFamily)}" font-size="${titleSize}" fill="#111">${escapeHtml(title)}</text>`
+        `<text x="${tx}" y="${(layout.titleRect?.y ?? layout.outerPadding) + titleSize}" text-anchor="middle" font-family="${escapeHtml(fontFamily)}" font-size="${titleSize}" fill="${ink.text}">${escapeHtml(title)}</text>`
       );
     }
 
@@ -583,7 +604,8 @@ export async function renderFigureToSvgBlob({ payload, signal = null }) {
         fontFamily,
         fontSize: legendFontSize,
         idPrefix: `legend_${hashStringToSeed(meta?.datasetId || meta?.datasetName || 'cellucid')}`,
-        backgroundFill: background === 'transparent' ? 'transparent' : backgroundColor
+        backgroundFill: background === 'transparent' ? 'transparent' : backgroundColor,
+        ink
       });
       if (legend.defs) parts.push(legend.defs);
       if (legend.svg) parts.push(legend.svg);
@@ -591,10 +613,18 @@ export async function renderFigureToSvgBlob({ payload, signal = null }) {
 
     // Plot background + frame.
     const plotFill = background === 'transparent' ? 'none' : escapeHtml(backgroundColor);
-    parts.push(`<rect x="${plotRect.x}" y="${plotRect.y}" width="${plotRect.width}" height="${plotRect.height}" fill="${plotFill}" stroke="#e5e7eb" stroke-width="1"/>`);
+    parts.push(`<rect x="${plotRect.x}" y="${plotRect.y}" width="${plotRect.width}" height="${plotRect.height}" fill="${plotFill}" stroke="${ink.frame}" stroke-width="1"/>`);
 
     // Points + centroid overlay (WYSIWYG).
     parts.push(`<g clip-path="url(#${clipId})">`);
+
+    parts.push(renderSvgReferenceGrid(buildReferenceGridModel({
+      appearance: referenceGrid,
+      renderState,
+      plotRect,
+      crop,
+      surfaceRgb: referenceGridSurfaceRgb,
+    })));
 
     const centroidPositions = data?.centroidPositions || null;
     const centroidColors = data?.centroidColors || null;
@@ -673,24 +703,21 @@ export async function renderFigureToSvgBlob({ payload, signal = null }) {
 
       const outN = reduced.x.length;
       for (let i = 0; i < outN; i++) {
-        let a = reduced.alpha[i] ?? 1.0;
         const srcIndex = reduced.index?.[i] ?? i;
         const x = offsetX + reduced.x[i] * scale;
         const y = offsetY + reduced.y[i] * scale;
         const j = i * 4;
-        let r = reduced.rgba[j];
-        let g = reduced.rgba[j + 1];
-        let b = reduced.rgba[j + 2];
-        if (
-          emphasizeSelection &&
-          highlightArray &&
-          (highlightArray[srcIndex] ?? 0) < MIN_VISIBLE_ALPHA_BYTE
-        ) {
-          r = 160;
-          g = 160;
-          b = 160;
-          a *= selectionMutedOpacity;
-        }
+        const shaded = shadeVectorPoint(
+          srcIndex,
+          reduced.rgba[j],
+          reduced.rgba[j + 1],
+          reduced.rgba[j + 2],
+          reduced.alpha[i] ?? 1.0
+        );
+        const r = shaded[0];
+        const g = shaded[1];
+        const b = shaded[2];
+        const a = shaded[3];
         if (a < POINT_VISIBILITY_THRESHOLD) continue;
         if (a >= 0.999) {
           parts.push(`<circle cx="${x.toFixed(2)}" cy="${y.toFixed(2)}" r="${pointRadiusPx.toFixed(2)}" fill="rgb(${r},${g},${b})"/>`);
@@ -723,20 +750,11 @@ export async function renderFigureToSvgBlob({ payload, signal = null }) {
         crop,
         sortByDepth: shouldDepthSort,
         onPoint: (x, y, r, g, b, a, radius, index) => {
-          let rr = r;
-          let gg = g;
-          let bb = b;
-          let aa = a;
-          if (
-            emphasizeSelection &&
-            highlightArray &&
-            (highlightArray[index] ?? 0) < MIN_VISIBLE_ALPHA_BYTE
-          ) {
-            rr = 160;
-            gg = 160;
-            bb = 160;
-            aa = aa * selectionMutedOpacity;
-          }
+          const shaded = shadeVectorPoint(index, r, g, b, a);
+          const rr = shaded[0];
+          const gg = shaded[1];
+          const bb = shaded[2];
+          const aa = shaded[3];
           if (aa < POINT_VISIBILITY_THRESHOLD) return;
           if (aa >= 0.999) {
             parts.push(`<circle cx="${x.toFixed(2)}" cy="${y.toFixed(2)}" r="${radius.toFixed(2)}" fill="rgb(${rr},${gg},${bb})"/>`);
@@ -773,8 +791,8 @@ export async function renderFigureToSvgBlob({ payload, signal = null }) {
       crop,
       fontFamily,
       labelFontSizePx: centroidLabelFontSize,
-      labelColor: '#111',
-      haloColor: background === 'transparent' ? '#ffffff' : backgroundColor,
+      labelColor: ink.text,
+      haloColor: background === 'transparent' ? ink.halo : backgroundColor,
     });
     if (centroidSvg) parts.push(centroidSvg);
 
@@ -789,26 +807,18 @@ export async function renderFigureToSvgBlob({ payload, signal = null }) {
         viewMatrix: renderState.viewMatrix,
         cameraState,
         fontFamily,
-        fontSize: orientationFontSize
+        fontSize: orientationFontSize,
+        ink
       }));
     }
 
-    if (emphasizeSelection && highlightCount > 0) {
-      const label = `n = ${highlightCount.toLocaleString()} selected`;
-      const boxPad = 6;
-      const boxH = Math.max(16, Math.round(baseFontSize * 1.35));
-      const boxW = Math.min(
-        Math.max(1, plotRect.width - 16),
-        Math.max(90, Math.round(label.length * (baseFontSize * 0.62) + boxPad * 2))
-      );
-      const boxX = plotRect.x + 8;
-      const boxY = plotRect.y + 8;
-      parts.push(
-        `<g font-family="${escapeHtml(fontFamily)}" font-size="${baseFontSize}" fill="#111">` +
-        `<rect x="${boxX}" y="${boxY}" width="${boxW}" height="${boxH}" rx="4" fill="#ffffff" fill-opacity="0.85" stroke="#e5e7eb" stroke-width="1"/>` +
-        `<text x="${boxX + boxPad}" y="${boxY + boxH - boxPad}" stroke="none">${escapeHtml(label)}</text>` +
-        `</g>`
-      );
+    if (emphasizeSelection) {
+      const badge = buildSelectionBadge({
+        count: highlightCount,
+        plotRect,
+        fontSizePx: baseFontSize,
+      });
+      if (badge) parts.push(renderSvgSelectionBadge(badge, fontFamily, baseFontSize, ink));
     }
 
     // Axes (2D uses embedding coordinates; 3D uses camera-space coordinates).
@@ -821,7 +831,7 @@ export async function renderFigureToSvgBlob({ payload, signal = null }) {
         fontFamily,
         tickFontSize,
         labelFontSize: axisLabelFontSize,
-        color: '#111'
+        color: ink.text
       }));
     }
     if (!hasVisibleCells) {
@@ -829,13 +839,13 @@ export async function renderFigureToSvgBlob({ payload, signal = null }) {
         `<g clip-path="url(#${clipId})">` +
         `<text x="${plotRect.x + plotRect.width / 2}" y="${plotRect.y + plotRect.height / 2}" ` +
         `text-anchor="middle" dominant-baseline="middle" font-family="${escapeHtml(fontFamily)}" ` +
-        `font-size="${baseFontSize}" fill="#6b7280">No visible cells</text>` +
+        `font-size="${baseFontSize}" fill="${ink.mutedText}">No visible cells</text>` +
         `</g>`
       );
     }
   } else {
-    const outerPadding = 20;
-    const titleHeight = title ? 34 : 0;
+    const outerPadding = LAYOUT_CONSTANTS.OUTER_PADDING;
+    const titleHeight = title ? LAYOUT_CONSTANTS.TITLE_HEIGHT : 0;
     const contentX = outerPadding;
     const contentY = outerPadding + titleHeight;
     const contentW = Math.max(1, svgWidth - outerPadding * 2);
@@ -847,43 +857,16 @@ export async function renderFigureToSvgBlob({ payload, signal = null }) {
       const titleSize = Math.max(14, titleFontSize);
       const tx = outerPadding + contentW / 2;
       parts.push(
-        `<text x="${tx}" y="${outerPadding + titleSize}" text-anchor="middle" font-family="${escapeHtml(fontFamily)}" font-size="${titleSize}" fill="#111">${escapeHtml(title)}</text>`
+        `<text x="${tx}" y="${outerPadding + titleSize}" text-anchor="middle" font-family="${escapeHtml(fontFamily)}" font-size="${titleSize}" fill="${ink.text}">${escapeHtml(title)}</text>`
       );
     }
 
-    // Shared legend only if all panels use the same active field.
-    let sharedLegendModel = null;
-    let sharedFieldKey = null;
-    if (includeLegend) {
-      for (const v of views) {
-        const scientificState = v.scientificState;
-        const fieldKey = scientificState.fieldKey;
-        if (fieldKey === null || scientificState.legendModel === null) {
-          sharedFieldKey = null;
-          sharedLegendModel = null;
-          break;
-        }
-        if (sharedFieldKey == null) {
-          sharedFieldKey = fieldKey;
-          sharedLegendModel = scientificState.legendModel;
-        } else if (
-          sharedFieldKey !== fieldKey ||
-          !areLegendModelsSemanticallyEqual(
-            sharedLegendModel,
-            scientificState.legendModel
-          )
-        ) {
-          sharedFieldKey = null;
-          sharedLegendModel = null;
-          break;
-        }
-      }
-    }
-
-    const wantsSharedLegend =
-      includeLegend &&
-      sharedFieldKey !== null &&
-      sharedLegendModel !== null;
+    // One legend may stand for the whole grid only when the panels agree; a
+    // panel that disagrees keeps its own legend inside its cell (below).
+    const sharedLegend = includeLegend
+      ? resolveSharedGridLegend(views)
+      : null;
+    const wantsSharedLegend = sharedLegend !== null;
     const minimumGridWidth = Math.min(
       contentW,
       cols * (includeAxes ? 150 : 96)
@@ -909,6 +892,10 @@ export async function renderFigureToSvgBlob({ payload, signal = null }) {
         ? Math.min(140, availableBottomLegendHeight)
         : 0;
     const rendersSharedLegend = legendW > 0 || legendH > 0;
+    // Whatever the shared legend cannot say — because the panels disagree, or
+    // because the figure has no room for it beside the grid — is said per
+    // panel. A coloured figure without any legend cannot be read at all.
+    const rendersPanelLegends = includeLegend && !rendersSharedLegend;
 
     const gridW = Math.max(1, contentW - (legendW ? (gap + legendW) : 0));
     const gridH = Math.max(1, contentH - (legendH ? (gap + legendH) : 0));
@@ -932,6 +919,13 @@ export async function renderFigureToSvgBlob({ payload, signal = null }) {
       const colors = data.colors || null;
       const transparency = data.transparency || null;
 
+      const panelLegendModel = rendersPanelLegends
+        ? view.scientificState.legendModel
+        : null;
+      const panelLegendFieldKey = rendersPanelLegends
+        ? view.scientificState.fieldKey
+        : null;
+
       const col = idx % cols;
       const row = Math.floor(idx / cols);
       const cellX = gridX + col * cellW;
@@ -941,6 +935,7 @@ export async function renderFigureToSvgBlob({ payload, signal = null }) {
         labelY,
         panelRect,
         plotRect,
+        legendRect: panelLegendRect,
       } = computeGridPaneLayout({
         cellX,
         cellY,
@@ -948,6 +943,9 @@ export async function renderFigureToSvgBlob({ payload, signal = null }) {
         cellHeight: cellH,
         includeAxes,
         fontSize: baseFontSize,
+        legendModel: panelLegendModel,
+        legendPosition,
+        legendFontSizePx: legendFontSize,
       });
 
       const clipId = `clip_${idx}`;
@@ -959,11 +957,19 @@ export async function renderFigureToSvgBlob({ payload, signal = null }) {
         `</defs>`
       );
       const cellFill = background === 'transparent' ? 'none' : escapeHtml(backgroundColor);
-      parts.push(`<rect x="${plotRect.x}" y="${plotRect.y}" width="${plotRect.width}" height="${plotRect.height}" fill="${cellFill}" stroke="#e5e7eb" stroke-width="1"/>`);
+      parts.push(`<rect x="${plotRect.x}" y="${plotRect.y}" width="${plotRect.width}" height="${plotRect.height}" fill="${cellFill}" stroke="${ink.frame}" stroke-width="1"/>`);
       parts.push(`<g clip-path="url(#${clipId})">`);
 
       const renderState = view?.renderState || null;
       if (!renderState?.mvpMatrix) throw new Error('Figure export renderState missing for SVG multiview render');
+
+      parts.push(renderSvgReferenceGrid(buildReferenceGridModel({
+        appearance: referenceGrid,
+        renderState,
+        plotRect,
+        crop,
+        surfaceRgb: referenceGridSurfaceRgb,
+      })));
 
       const dim = view.scientificState.dimensionLevel;
       const cameraState = assertCameraState(
@@ -974,6 +980,16 @@ export async function renderFigureToSvgBlob({ payload, signal = null }) {
       const lodMembership = view.scientificState.lodMembership;
       const pointRadiusViewportPx =
         (renderState.pointSize * view.scientificState.lodSizeMultiplier) / 2;
+      // Each panel carries its own fog anchors, so the evaluator is per panel.
+      const shadeVectorPoint = createVectorPointShader({
+        fog: createFogEvaluator(
+          applyExportBackgroundToRenderState(renderState, background, backgroundColor)
+        ),
+        positions,
+        highlightArray,
+        emphasizeSelection,
+        selectionMutedOpacity,
+      });
       const useCameraAxes =
         dim > 2 &&
         navMode !== 'planar' &&
@@ -1078,24 +1094,21 @@ export async function renderFigureToSvgBlob({ payload, signal = null }) {
         const pointRadiusPx = pointRadiusViewportPx * scale;
 
         for (let i = 0; i < reduced.x.length; i++) {
-          let a = reduced.alpha[i] ?? 1.0;
           const srcIndex = reduced.index?.[i] ?? i;
           const x = offsetX + reduced.x[i] * scale;
           const y = offsetY + reduced.y[i] * scale;
           const j = i * 4;
-          let r = reduced.rgba[j];
-          let g = reduced.rgba[j + 1];
-          let b = reduced.rgba[j + 2];
-          if (
-            emphasizeSelection &&
-            highlightArray &&
-            (highlightArray[srcIndex] ?? 0) < MIN_VISIBLE_ALPHA_BYTE
-          ) {
-            r = 160;
-            g = 160;
-            b = 160;
-            a *= selectionMutedOpacity;
-          }
+          const shaded = shadeVectorPoint(
+            srcIndex,
+            reduced.rgba[j],
+            reduced.rgba[j + 1],
+            reduced.rgba[j + 2],
+            reduced.alpha[i] ?? 1.0
+          );
+          const r = shaded[0];
+          const g = shaded[1];
+          const b = shaded[2];
+          const a = shaded[3];
           if (a < POINT_VISIBILITY_THRESHOLD) continue;
           if (a >= 0.999) {
             parts.push(`<circle cx="${x.toFixed(2)}" cy="${y.toFixed(2)}" r="${pointRadiusPx.toFixed(2)}" fill="rgb(${r},${g},${b})"/>`);
@@ -1127,20 +1140,11 @@ export async function renderFigureToSvgBlob({ payload, signal = null }) {
           crop,
           sortByDepth: depthSort3d && dim > 2 && navMode !== 'planar',
           onPoint: (x, y, r, g, b, a, radius, index) => {
-            let rr = r;
-            let gg = g;
-            let bb = b;
-            let aa = a;
-            if (
-              emphasizeSelection &&
-              highlightArray &&
-              (highlightArray[index] ?? 0) < MIN_VISIBLE_ALPHA_BYTE
-            ) {
-              rr = 160;
-              gg = 160;
-              bb = 160;
-              aa *= selectionMutedOpacity;
-            }
+            const shaded = shadeVectorPoint(index, r, g, b, a);
+            const rr = shaded[0];
+            const gg = shaded[1];
+            const bb = shaded[2];
+            const aa = shaded[3];
             if (aa < POINT_VISIBILITY_THRESHOLD) return;
             if (aa >= 0.999) {
               parts.push(`<circle cx="${x.toFixed(2)}" cy="${y.toFixed(2)}" r="${radius.toFixed(2)}" fill="rgb(${rr},${gg},${bb})"/>`);
@@ -1177,8 +1181,8 @@ export async function renderFigureToSvgBlob({ payload, signal = null }) {
         crop,
         fontFamily,
         labelFontSizePx: centroidLabelFontSize,
-        labelColor: '#111',
-        haloColor: background === 'transparent' ? '#ffffff' : backgroundColor,
+        labelColor: ink.text,
+        haloColor: background === 'transparent' ? ink.halo : backgroundColor,
       });
       if (centroidSvg) parts.push(centroidSvg);
 
@@ -1203,6 +1207,7 @@ export async function renderFigureToSvgBlob({ payload, signal = null }) {
             cameraState,
             fontFamily,
             fontSize: orientationFontSize,
+            ink,
           }) +
           `</g>`
         );
@@ -1219,7 +1224,7 @@ export async function renderFigureToSvgBlob({ payload, signal = null }) {
             fontFamily,
             tickFontSize,
             labelFontSize: axisLabelFontSize,
-            color: '#111',
+            color: ink.text,
           }) +
           `</g>`
         );
@@ -1230,15 +1235,58 @@ export async function renderFigureToSvgBlob({ payload, signal = null }) {
           `<g clip-path="url(#${clipId})">` +
           `<text x="${plotRect.x + plotRect.width / 2}" y="${plotRect.y + plotRect.height / 2}" ` +
           `text-anchor="middle" dominant-baseline="middle" font-family="${escapeHtml(fontFamily)}" ` +
-          `font-size="${baseFontSize}" fill="#6b7280">No visible cells</text>` +
+          `font-size="${baseFontSize}" fill="${ink.mutedText}">No visible cells</text>` +
           `</g>`
         );
+      }
+
+      // Selection badges are counted from this panel's own snapshot: each
+      // panel carries its own filters, so the active view's count would be a
+      // false claim on every other panel.
+      if (emphasizeSelection) {
+        const badge = buildSelectionBadge({
+          count: countHighlightedVisiblePoints({
+            highlightArray,
+            transparency,
+            lodMembership,
+          }),
+          plotRect,
+          fontSizePx: baseFontSize,
+        });
+        if (badge) {
+          parts.push(
+            `<g clip-path="url(#${panelClipId})">` +
+            renderSvgSelectionBadge(badge, fontFamily, baseFontSize, ink) +
+            `</g>`
+          );
+        }
+      }
+
+      if (panelLegendRect && panelLegendModel) {
+        const legend = renderSvgLegend({
+          legendRect: panelLegendRect,
+          fieldKey: panelLegendFieldKey,
+          model: panelLegendModel,
+          fontFamily,
+          fontSize: legendFontSize,
+          // Gradient ids must stay unique per panel: two panels sharing one id
+          // would silently paint the second colorbar with the first ramp.
+          idPrefix: `legend_${hashStringToSeed(meta?.datasetId || meta?.datasetName || 'cellucid')}_panel${idx}`,
+          backgroundFill: background === 'transparent' ? 'transparent' : backgroundColor,
+          ink,
+        });
+        if (legend.defs) parts.push(legend.defs);
+        if (legend.svg) {
+          parts.push(
+            `<g clip-path="url(#${panelClipId})">${legend.svg}</g>`
+          );
+        }
       }
 
       parts.push(
         `<g clip-path="url(#${panelClipId})">` +
         `<text x="${labelX}" y="${labelY}" font-family="${escapeHtml(fontFamily)}" ` +
-        `font-size="${baseFontSize}" fill="#111">${escapeHtml(String.fromCharCode(65 + idx))}. ${escapeHtml(viewLabel)}</text>` +
+        `font-size="${baseFontSize}" fill="${ink.text}">${escapeHtml(panelLetter(idx))}. ${escapeHtml(viewLabel)}</text>` +
         `</g>`
       );
     }
@@ -1246,12 +1294,13 @@ export async function renderFigureToSvgBlob({ payload, signal = null }) {
     if (rendersSharedLegend && legendRect) {
       const legend = renderSvgLegend({
         legendRect,
-        fieldKey: sharedFieldKey,
-        model: sharedLegendModel,
+        fieldKey: sharedLegend.fieldKey,
+        model: sharedLegend.model,
         fontFamily,
         fontSize: legendFontSize,
         idPrefix: `legend_${hashStringToSeed(meta?.datasetId || meta?.datasetName || 'cellucid')}`,
-        backgroundFill: background === 'transparent' ? 'transparent' : backgroundColor
+        backgroundFill: background === 'transparent' ? 'transparent' : backgroundColor,
+        ink
       });
       if (legend.defs) parts.push(legend.defs);
       if (legend.svg) parts.push(legend.svg);

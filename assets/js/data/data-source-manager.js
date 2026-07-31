@@ -11,6 +11,7 @@
 import {
   DataSourceError,
   DataSourceErrorCode,
+  readBoundedJson,
   validateDatasetId,
   validateDatasetIdentity
 } from './data-source.js';
@@ -272,15 +273,15 @@ export class DataSourceManager {
   }
 
   /**
-   * Get all available datasets from all sources
-   * Uses parallel checks for better performance.
-   * @returns {Promise<{sourceType: string, datasets: DatasetMetadata[]}[]>}
+   * Probe one source without letting its failure escape.
+   *
+   * @param {string} sourceType
+   * @param {Object} source
+   * @returns {Promise<{sourceType: string, datasets: DatasetMetadata[], error: Error|null}|null>}
+   * @private
    */
-  async getAllDatasets() {
-    debug.log('[DataSourceManager] getAllDatasets', { sources: [...this.sources.keys()] });
-
-    const sourceEntries = [...this.sources.entries()];
-    const checkPromises = sourceEntries.map(async ([sourceType, source]) => {
+  async _probeSource(sourceType, source) {
+    try {
       if (
         typeof source?.isAvailable !== 'function' ||
         typeof source?.listDatasets !== 'function'
@@ -302,13 +303,68 @@ export class DataSourceManager {
           `Data source '${sourceType}' listDatasets() must resolve to an array.`
         );
       }
-      return { sourceType, datasets };
+      return { sourceType, datasets, error: null };
+    } catch (error) {
+      debug.log('[DataSourceManager] source probe failed', {
+        sourceType,
+        message: error?.message,
+      });
+      return {
+        sourceType,
+        datasets: [],
+        error: error instanceof Error ? error : new Error(String(error)),
+      };
+    }
+  }
+
+  /**
+   * Get all available datasets from all sources.
+   *
+   * A probe failure belongs to the source that produced it and is reported on
+   * that source's entry. One unreachable catalog must never take the whole
+   * selector down with it: a dataset opened from a local file needs no network
+   * at all, so it must keep listing while a remote catalog is offline.
+   *
+   * Failures stay cached on their source, so a catalog is never re-fetched
+   * implicitly. Pass `{ refresh: true }` — a user-visible retry — to clear
+   * them and probe again.
+   *
+   * @param {Object} [options]
+   * @param {boolean} [options.refresh=false] - Clear cached source state first
+   * @returns {Promise<{sourceType: string, datasets: DatasetMetadata[], error: Error|null}[]>}
+   */
+  async getAllDatasets(options = {}) {
+    requireExactOptionRecord(
+      options,
+      ['refresh'],
+      'DataSourceManager.getAllDatasets options'
+    );
+    const refresh = Object.hasOwn(options, 'refresh')
+      ? options.refresh
+      : false;
+    if (typeof refresh !== 'boolean') {
+      throw new TypeError(
+        'DataSourceManager.getAllDatasets refresh must be a boolean.'
+      );
+    }
+    debug.log('[DataSourceManager] getAllDatasets', {
+      refresh,
+      sources: [...this.sources.keys()],
     });
 
-    const allResults = await Promise.all(checkPromises);
+    if (refresh) await this.refreshAll();
+
+    const allResults = await Promise.all(
+      [...this.sources.entries()].map(
+        ([sourceType, source]) => this._probeSource(sourceType, source)
+      )
+    );
     const results = allResults.filter(result => result !== null);
 
-    debug.log('[DataSourceManager] getAllDatasets complete', { sourceGroups: results.length });
+    debug.log('[DataSourceManager] getAllDatasets complete', {
+      failedSources: results.filter(result => result.error !== null).length,
+      sourceGroups: results.length,
+    });
     return results;
   }
 
@@ -1157,14 +1213,35 @@ export class DataSourceManager {
   }
 
   /**
-   * Refresh all sources (clear caches)
+   * Refresh every source, clearing its cached catalog and cached failure.
+   *
+   * A source that cannot be refreshed — a GitHub source with no connection, a
+   * local directory whose handles have gone stale — reports its own failure
+   * instead of rejecting the pass or escaping as an unhandled rejection.
+   *
+   * @returns {Promise<{sourceType: string, error: Error|null}[]>}
    */
-  refreshAll() {
-    for (const source of this.sources.values()) {
-      if (typeof source.refresh === 'function') {
-        source.refresh();
-      }
-    }
+  async refreshAll() {
+    return Promise.all(
+      [...this.sources.entries()].map(async ([sourceType, source]) => {
+        if (typeof source?.refresh !== 'function') {
+          return { sourceType, error: null };
+        }
+        try {
+          await source.refresh();
+          return { sourceType, error: null };
+        } catch (error) {
+          debug.log('[DataSourceManager] source refresh failed', {
+            sourceType,
+            message: error?.message,
+          });
+          return {
+            sourceType,
+            error: error instanceof Error ? error : new Error(String(error)),
+          };
+        }
+      })
+    );
   }
 
   /**
@@ -1348,7 +1425,7 @@ export class DataSourceManager {
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}: ${response.statusText}`);
     }
-    return response.json();
+    return readBoundedJson(response, { label: `Metadata ${url}` });
   }
 }
 

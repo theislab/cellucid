@@ -1,22 +1,25 @@
 /**
- * @fileoverview Continuous selection range preview.
+ * @fileoverview Live preview for the annotation tool's Alt gesture.
  *
- * While Alt-dragging on a continuous field, the viewer emits preview events
- * with the range being explored. This module mirrors the "combine modes"
- * behavior (intersect/union/subtract) against the current unified candidate
- * set and updates DataState's preview highlight.
+ * The viewer publishes a preview event on every pointer move between Alt+down
+ * and release, for categorical and continuous fields alike. This module answers
+ * each one with the candidate set that releasing right now would commit, so the
+ * highlight updates while the gesture is still in the user's hand, and shows a
+ * range label whenever the active field is continuous.
  *
  * @module ui/modules/highlight/continuous-selection-preview
  */
 
 import {
+  annotationGestureType,
+  combineAnnotationCandidates,
+  computeAnnotationGestureCells
+} from './annotation-cells.js';
+import {
   requireContinuousPreviewEvent,
-  requireContinuousStatistics,
   requireExactKeys,
-  requireFieldSource,
   requireHighlightSelectionState,
-  requireMethods,
-  requireSafeInteger
+  requireMethods
 } from './exact-contract.js';
 
 /**
@@ -41,6 +44,8 @@ export function initContinuousSelectionPreview(options) {
     [
       'clearPreviewHighlight',
       'getActiveField',
+      'getCategoryForCell',
+      'getCellIndicesForCategory',
       'getCellIndicesForRange',
       'getValueForCell',
       'setPreviewHighlightFromIndices'
@@ -61,79 +66,37 @@ export function initContinuousSelectionPreview(options) {
     'Continuous selection preview UI',
     ['showRangeLabel', 'hideRangeLabel']
   );
-  requireHighlightSelectionState(selectionState);
+  requireHighlightSelectionState(selectionState, state.pointCount);
   const { showRangeLabel, hideRangeLabel } = ui;
   let destroyed = false;
 
   function handleSelectionPreview(previewEvent) {
     if (destroyed) return;
-    requireContinuousPreviewEvent(previewEvent);
+    requireContinuousPreviewEvent(previewEvent, state.pointCount);
     const activeField = state.getActiveField();
-    if (activeField === null || activeField.kind !== 'continuous') {
+    if (activeField === null) {
       throw new Error(
-        'Continuous selection preview requires an active continuous field.'
+        'Annotation selection preview requires an active field.'
       );
     }
 
-    const source = requireFieldSource(state.activeFieldSource);
-    const fieldIndex = source === 'var'
-      ? state.activeVarFieldIndex
-      : state.activeFieldIndex;
-    requireSafeInteger(
-      fieldIndex,
-      'Continuous selection preview field index',
-      0
-    );
+    const gestureType = annotationGestureType(previewEvent.dragDeltaY);
+    const { cellIndices, range } = computeAnnotationGestureCells({
+      state,
+      activeField,
+      cellIndex: previewEvent.cellIndex,
+      gestureType,
+      dragDeltaY: previewEvent.dragDeltaY,
+      viewTransparency: viewer.getViewTransparency(previewEvent.viewId)
+    });
 
-    const cellIndex = previewEvent.cellIndex;
-    const clickedValue = state.getValueForCell(cellIndex, fieldIndex, source);
-    if (Number.isNaN(clickedValue)) {
-      hideRangeLabel();
-      return;
-    }
-    if (!Number.isFinite(clickedValue)) {
-      throw new TypeError(
-        'Continuous selection preview clicked value must be finite or NaN.'
-      );
-    }
-
-    const stats = requireContinuousStatistics(activeField);
-    const valueRange = stats.max - stats.min;
-    const dragScale = 0.005;
-    const dragAmount = -previewEvent.dragDeltaY * dragScale * valueRange;
-
-    let minVal;
-    let maxVal;
-    if (dragAmount > 0) {
-      minVal = clickedValue;
-      maxVal = Math.min(stats.max, clickedValue + dragAmount);
-    } else {
-      minVal = Math.max(stats.min, clickedValue + dragAmount);
-      maxVal = clickedValue;
-    }
-
-    const viewTransparency = viewer.getViewTransparency(previewEvent.viewId);
-    const newIndices = state.getCellIndicesForRange(fieldIndex, minVal, maxVal, source, viewTransparency);
-    const mode = previewEvent.mode;
-
-    let combinedIndices;
-    const candidateSet = selectionState.annotationCandidateSet;
-
-    if (candidateSet === null) {
-      combinedIndices = mode === 'subtract' ? [] : newIndices;
-    } else if (candidateSet.size === 0) {
-      combinedIndices = mode === 'union' ? newIndices : [];
-    } else if (mode === 'union') {
-      const combined = new Set(candidateSet);
-      for (const idx of newIndices) combined.add(idx);
-      combinedIndices = [...combined];
-    } else if (mode === 'subtract') {
-      const newSet = new Set(newIndices);
-      combinedIndices = [...candidateSet].filter((idx) => !newSet.has(idx));
-    } else {
-      const newSet = new Set(newIndices);
-      combinedIndices = [...candidateSet].filter((idx) => newSet.has(idx));
-    }
+    const { candidates } = combineAnnotationCandidates({
+      candidates: selectionState.annotationCandidateSet,
+      cellIndices,
+      mode: previewEvent.mode,
+      fieldKind: activeField.kind
+    });
+    const combinedIndices = candidates === null ? [] : [...candidates];
 
     if (combinedIndices.length > 0) {
       state.setPreviewHighlightFromIndices(combinedIndices);
@@ -141,7 +104,16 @@ export function initContinuousSelectionPreview(options) {
       state.clearPreviewHighlight();
     }
 
-    showRangeLabel(previewEvent.endX, previewEvent.endY, minVal, maxVal);
+    if (range === null) {
+      hideRangeLabel();
+      return;
+    }
+    showRangeLabel(
+      previewEvent.endX,
+      previewEvent.endY,
+      range.minVal,
+      range.maxVal
+    );
   }
 
   viewer.setSelectionPreviewCallback(handleSelectionPreview);

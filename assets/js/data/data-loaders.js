@@ -4,8 +4,18 @@
 // Includes progress tracking with download speed for the notification center.
 
 import { getDataSourceManager } from './data-source-manager.js';
-import { fetchSampleArtifact, isLocalUserUrl, resolveUrl } from './data-source.js';
+import {
+  MAX_PREPARED_BROWSER_BYTES,
+  fetchSampleArtifact,
+  isLocalUserUrl,
+  maxGzipTransferBytes,
+  readBoundedBody,
+  readBoundedJson,
+  requirePayloadBudget,
+  resolveUrl,
+} from './data-source.js';
 import { getNotificationCenter } from '../app/notification-center.js';
+import { gzipDecompress } from '../app/session/codecs/gzip.js';
 import { setOwnDataProperty } from '../utils/exact-record.js';
 import {
   QUANTIZATION_BACKEND,
@@ -77,7 +87,10 @@ async function fetchJsonWithProtocol(
   stagedSource = null
 ) {
   const response = await fetchOk(url, init, stagedSource);
-  return response.json();
+  return readBoundedJson(response, {
+    label: `Metadata ${url}`,
+    signal: init?.signal ?? null,
+  });
 }
 
 function getStagedMetadataLoadOwner(options, label) {
@@ -194,6 +207,260 @@ function requireGzipDecompressionStream(url) {
     );
   }
   return GzipDecompressionStream;
+}
+
+// ============================================================================
+// BOUNDED PAYLOAD MATERIALIZATION
+// ============================================================================
+// Every remote payload is untrusted: opening a dataset from somebody else's
+// repository is the same gesture as opening your own. A payload is therefore
+// sized before it is materialized, exactly as the prepared local-directory
+// path does, so a kilobyte of gzip can never expand into an out-of-memory tab.
+
+/** Smallest legal gzip member: ten-byte header, two-byte body, eight-byte trailer. */
+const GZIP_MINIMUM_MEMBER_BYTES = 18;
+
+/**
+ * Resolve the transfer ceiling for one payload.
+ *
+ * @param {number|null} expectedBytes - Manifest-declared decoded length, or
+ *   exact null when no manifest advertises one and only the browser ceiling
+ *   applies.
+ * @param {string} label
+ * @returns {number}
+ */
+function payloadCeiling(expectedBytes, label) {
+  if (expectedBytes === null) return MAX_PREPARED_BROWSER_BYTES;
+  return requirePayloadBudget(expectedBytes, label);
+}
+
+/**
+ * Require an exact declared length seam from a caller.
+ *
+ * @param {unknown} expectedBytes
+ * @param {string} label
+ * @returns {number|null}
+ */
+function requireDeclaredLength(expectedBytes, label) {
+  if (expectedBytes === null) return null;
+  if (!Number.isSafeInteger(expectedBytes) || expectedBytes < 0) {
+    throw new TypeError(
+      `${label} expectedBytes must be a non-negative safe integer or exact null`
+    );
+  }
+  return expectedBytes;
+}
+
+/**
+ * Read the gzip envelope and settle the exact decompressed length before any
+ * inflation happens. Mirrors the prepared local-directory check so the same
+ * payload is judged identically on disk and over the network.
+ *
+ * @param {Uint8Array} compressed
+ * @param {number|null} expectedBytes
+ * @param {string} label
+ * @returns {number} Exact decompressed byte count
+ */
+function requireGzipEnvelope(compressed, expectedBytes, label) {
+  if (compressed.byteLength < GZIP_MINIMUM_MEMBER_BYTES) {
+    throw new Error(`${label}: invalid or truncated gzip payload`);
+  }
+  if (
+    compressed[0] !== 0x1f ||
+    compressed[1] !== 0x8b ||
+    compressed[2] !== 8 ||
+    (compressed[3] & 0xe0) !== 0
+  ) {
+    throw new Error(`${label}: invalid gzip header`);
+  }
+  const trailerOffset = compressed.byteLength - 4;
+  const declaredBytes = (
+    compressed[trailerOffset] |
+    (compressed[trailerOffset + 1] << 8) |
+    (compressed[trailerOffset + 2] << 16) |
+    (compressed[trailerOffset + 3] << 24)
+  ) >>> 0;
+
+  if (expectedBytes === null) {
+    if (declaredBytes > MAX_PREPARED_BROWSER_BYTES) {
+      throw new RangeError(
+        `${label}: gzip declares ${declaredBytes} bytes after decompression, ` +
+        'which exceeds the 512 MiB browser limit'
+      );
+    }
+    return declaredBytes;
+  }
+  if (declaredBytes !== expectedBytes) {
+    throw new Error(
+      `${label}: expected ${expectedBytes} bytes after decompression, ` +
+      `but gzip declares ${declaredBytes} bytes`
+    );
+  }
+  return expectedBytes;
+}
+
+function toExactArrayBuffer(bytes) {
+  if (
+    bytes.byteOffset === 0 &&
+    bytes.byteLength === bytes.buffer.byteLength
+  ) {
+    return bytes.buffer;
+  }
+  return bytes.slice().buffer;
+}
+
+/**
+ * Materialize one binary payload under a hard byte ceiling.
+ *
+ * Compression is determined solely by the advertised filename, exactly as
+ * before. The gzip branch delegates the bounded inflate to the session gzip
+ * codec, whose reader cancels its stream on overflow and asserts the exact
+ * output length.
+ *
+ * @param {Object} options
+ * @param {Response} options.response
+ * @param {string} options.url
+ * @param {number|null} options.expectedBytes
+ * @param {AbortSignal|null} [options.signal]
+ * @param {((loadedBytes: number, totalBytes: number|null) => void)|null} [options.onProgress]
+ * @param {number|null} [options.totalBytes]
+ * @returns {Promise<ArrayBuffer>}
+ */
+async function materializeBinaryPayload(options) {
+  const {
+    response,
+    url,
+    expectedBytes,
+    signal = null,
+    onProgress = null,
+    totalBytes = null,
+  } = options;
+  const label = `Payload ${url}`;
+  const ceiling = payloadCeiling(expectedBytes, label);
+
+  if (!url.endsWith('.gz')) {
+    const bytes = await readBoundedBody(response, {
+      label,
+      maxBytes: ceiling,
+      onProgress,
+      signal,
+      totalBytes,
+    });
+    if (expectedBytes !== null && bytes.byteLength !== expectedBytes) {
+      throw new Error(
+        `${label}: expected exactly ${expectedBytes} bytes, ` +
+        `received ${bytes.byteLength}`
+      );
+    }
+    return toExactArrayBuffer(bytes);
+  }
+
+  requireGzipDecompressionStream(url);
+  const compressed = await readBoundedBody(response, {
+    label,
+    maxBytes: maxGzipTransferBytes(ceiling),
+    onProgress,
+    signal,
+    totalBytes,
+  });
+  const decompressedBytes = requireGzipEnvelope(
+    compressed,
+    expectedBytes,
+    label
+  );
+  const inflated = await gzipDecompress(compressed, {
+    maxOutputBytes: decompressedBytes,
+    signal,
+  });
+  return toExactArrayBuffer(inflated);
+}
+
+/**
+ * Byte width of one prepared scalar element.
+ * @param {string} dtype
+ * @param {string} label
+ * @returns {number}
+ */
+function dtypeByteSize(dtype, label) {
+  switch (dtype) {
+    case 'float64':
+      return 8;
+    case 'float32':
+    case 'uint32':
+      return 4;
+    case 'uint16':
+      return 2;
+    case 'uint8':
+      return 1;
+    default:
+      throw new Error(`Unsupported dtype "${dtype}" for ${label}`);
+  }
+}
+
+/**
+ * Exact observation count advertised by an expanded manifest.
+ *
+ * Manifests produced by `expandObsManifest`/`expandVarManifest` always carry a
+ * validated `n_points`. A manifest that advertises none bounds its payloads by
+ * the browser ceiling alone.
+ *
+ * @param {Object} manifest
+ * @param {string} label
+ * @returns {number|null}
+ */
+function manifestPointCount(manifest, label) {
+  if (!Object.hasOwn(manifest, 'n_points')) return null;
+  const value = manifest.n_points;
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error(
+      `${label}: n_points must be a non-negative safe integer`
+    );
+  }
+  return value;
+}
+
+/**
+ * Exact cell count advertised by a dataset identity.
+ *
+ * @param {Object} identity
+ * @returns {number|null}
+ */
+function identityCellCount(identity) {
+  const stats = identity?.stats;
+  if (
+    stats === null ||
+    typeof stats !== 'object' ||
+    !Object.hasOwn(stats, 'n_cells')
+  ) {
+    return null;
+  }
+  const value = stats.n_cells;
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error(
+      'dataset_identity.json: stats.n_cells must be a non-negative safe integer'
+    );
+  }
+  return value;
+}
+
+/**
+ * Manifest-declared byte length of an element payload.
+ *
+ * @param {number|null} elementCount - Exact element count, or null when no
+ *   manifest advertises one
+ * @param {string} dtype
+ * @param {string} label
+ * @returns {number|null}
+ */
+function declaredPayloadBytes(elementCount, dtype, label) {
+  const elementBytes = dtypeByteSize(dtype, label);
+  if (elementCount === null) return null;
+  if (!Number.isSafeInteger(elementCount) || elementCount < 0) {
+    throw new Error(
+      `${label}: element count must be a non-negative safe integer`
+    );
+  }
+  return elementCount * elementBytes;
 }
 
 /**
@@ -444,23 +711,24 @@ async function fetchOk(url, init, stagedSource = null) {
  *
  * @param {string} url - URL to fetch
  * @param {RequestInit} [init]
+ * @param {number|null} expectedBytes - Manifest-declared decoded length, or
+ *   exact null when no manifest advertises one
  * @returns {Promise<ArrayBuffer>} Decompressed binary data
  */
-async function fetchBinary(url, init, stagedSource = null) {
-  const isGzipped = url.endsWith('.gz');
-  const GzipDecompressionStream = isGzipped
-    ? requireGzipDecompressionStream(url)
-    : null;
+async function fetchBinary(url, init, expectedBytes, stagedSource = null) {
+  const declaredBytes = requireDeclaredLength(
+    expectedBytes,
+    `Binary loader for ${url}`
+  );
+  // Refuse an over-declared payload before it costs any network traffic.
+  payloadCeiling(declaredBytes, `Payload ${url}`);
   const response = await fetchOk(url, init, stagedSource);
-
-  if (isGzipped) {
-    const decompressedStream = response.body.pipeThrough(
-      new GzipDecompressionStream('gzip')
-    );
-    return new Response(decompressedStream).arrayBuffer();
-  }
-
-  return response.arrayBuffer();
+  return materializeBinaryPayload({
+    expectedBytes: declaredBytes,
+    response,
+    signal: init?.signal ?? null,
+    url,
+  });
 }
 
 /**
@@ -470,6 +738,9 @@ async function fetchBinary(url, init, stagedSource = null) {
  *
  * @param {string} url - URL to fetch
  * @param {Object} options - Optional settings
+ * @param {number|null} options.expectedBytes - Required. Manifest-declared
+ *   decoded length (`n_cells * dimension * 4`), or exact null when no manifest
+ *   advertises a cell count yet and only the browser ceiling applies.
  * @param {boolean} options.showProgress - Show progress notification (default: false)
  * @param {string} options.displayName - Display name for notification
  * @param {AbortSignal|null} options.signal - Optional cancellation signal
@@ -485,6 +756,16 @@ export async function loadPointsBinary(url, options = {}) {
     progressTrackerId = null,
     stagedSource = null
   } = options;
+  if (!Object.hasOwn(options, 'expectedBytes')) {
+    throw new TypeError(
+      'Cell position loader requires an explicit expectedBytes: the ' +
+      'manifest-declared decoded length, or exact null when none is known.'
+    );
+  }
+  const expectedBytes = requireDeclaredLength(
+    options.expectedBytes,
+    'Cell position loader'
+  );
   requireStagedOwnerForUrl(
     url,
     candidateAnnDataBinding,
@@ -538,6 +819,7 @@ export async function loadPointsBinary(url, options = {}) {
 
     const arrayBuffer = await fetchBinaryWithProgressInternal(
       url,
+      expectedBytes,
       trackerId,
       notifications,
       signal,
@@ -656,16 +938,16 @@ function finishOwnedTrackerWithError({
  */
 async function fetchBinaryWithProgressInternal(
   url,
+  expectedBytes,
   trackerId,
   notifications,
   signal = null,
   stagedSource = null
 ) {
   throwIfAborted(signal);
-  const isGzipped = url.endsWith('.gz');
-  const GzipDecompressionStream = isGzipped
-    ? requireGzipDecompressionStream(url)
-    : null;
+  if (url.endsWith('.gz')) requireGzipDecompressionStream(url);
+  // Refuse an over-declared payload before it costs any network traffic.
+  payloadCeiling(expectedBytes, `Payload ${url}`);
   const resolvedUrl = await resolveAnyUrl(
     url,
     signal,
@@ -698,53 +980,25 @@ async function fetchBinaryWithProgressInternal(
     );
   }
 
-  if (trackerId && response.body) {
-    const reader = response.body.getReader();
-    let loadedBytes = 0;
-
-    // Stream into a new ReadableStream so we can:
-    // - track progress without buffering all chunks twice
-    // - stream gzip decompression through the selected browser backend
-    const monitoredStream = new ReadableStream({
-      async pull(controller) {
-        throwIfAborted(signal);
-        const { done, value } = await reader.read();
-        throwIfAborted(signal);
-        if (done) {
-          controller.close();
-          return;
+  // The bounded reader owns the transfer, so progress is reported from the
+  // same pass that enforces the ceiling: no chunk is buffered twice and no
+  // byte is decompressed before the payload has been sized.
+  return materializeBinaryPayload({
+    expectedBytes,
+    onProgress: trackerId
+      ? (loadedBytes, declaredTotalBytes) => {
+          notifications.updateDownload(
+            trackerId,
+            loadedBytes,
+            declaredTotalBytes
+          );
         }
-        loadedBytes += value?.byteLength ?? value?.length ?? 0;
-        notifications.updateDownload(trackerId, loadedBytes, totalBytes);
-        controller.enqueue(value);
-      },
-      cancel() {
-        try {
-          reader.cancel(createAbortError());
-        } catch (_err) {
-          // Ignore cancel errors
-        }
-      }
-    });
-
-    if (isGzipped) {
-      const decompressedStream = monitoredStream.pipeThrough(
-        new GzipDecompressionStream('gzip')
-      );
-      return new Response(decompressedStream).arrayBuffer();
-    }
-
-    return new Response(monitoredStream).arrayBuffer();
-  }
-
-  if (isGzipped) {
-    const decompressedStream = response.body.pipeThrough(
-      new GzipDecompressionStream('gzip')
-    );
-    return new Response(decompressedStream).arrayBuffer();
-  }
-
-  return response.arrayBuffer();
+      : null,
+    response,
+    signal,
+    totalBytes,
+    url,
+  });
 }
 
 /**
@@ -1676,7 +1930,10 @@ export async function loadObsManifest(url, options = {}) {
   }
 
   const response = await fetchOk(url, fetchInit, stagedSource);
-  const manifest = await response.json();
+  const manifest = await readBoundedJson(response, {
+    label: `Metadata ${url}`,
+    signal,
+  });
   throwIfMetadataAborted(signal, 'Observation manifest loading');
   return expandObsManifest(manifest);
 }
@@ -1687,6 +1944,7 @@ export async function loadObsManifest(url, options = {}) {
  * 
  * @param {string} manifestUrl - Base URL for resolving paths
  * @param {object} field - Field metadata from manifest
+ * @param {FieldLoaderOptions} [options]
  * @returns {object} Loaded data with declared values, codes, or outlier quantiles
  */
 export async function loadObsFieldData(manifestUrl, field, options = {}) {
@@ -1694,8 +1952,13 @@ export async function loadObsFieldData(manifestUrl, field, options = {}) {
 
   const {
     fetchInit,
+    pointCount = null,
     signal = fetchInit?.signal ?? null
   } = options;
+  const declaredPoints = requireDeclaredLength(
+    pointCount,
+    `Obs field loader for "${field.key}"`
+  );
   throwIfAborted(signal);
   const hasValues = Object.hasOwn(field, 'valuesPath');
   const hasCodes = Object.hasOwn(field, 'codesPath');
@@ -1799,8 +2062,12 @@ export async function loadObsFieldData(manifestUrl, field, options = {}) {
     const quantizationBackend = field.quantized
       ? await selectQuantizationBackend()
       : null;
-    const buffer = await fetchBinary(url, fetchInit);
     const dtype = field.valuesDtype;
+    const buffer = await fetchBinary(
+      url,
+      fetchInit,
+      declaredPayloadBytes(declaredPoints, dtype, url)
+    );
 
     if (field.quantized) {
       outputs.values = await dequantizeToFloat32({
@@ -1820,10 +2087,14 @@ export async function loadObsFieldData(manifestUrl, field, options = {}) {
   // Load categorical codes
   if (hasCodes) {
     const url = resolveUrl(manifestUrl, field.codesPath);
-    const buffer = await fetchBinary(url, fetchInit);
     const dtype = validateCategoricalCodesDtype(
       field.codesDtype,
       field.key
+    );
+    const buffer = await fetchBinary(
+      url,
+      fetchInit,
+      declaredPayloadBytes(declaredPoints, dtype, url)
     );
     const raw = typedArrayFromBuffer(buffer, dtype, url);
     validateCategoricalCodeValues({
@@ -1853,8 +2124,13 @@ export async function loadObsFieldData(manifestUrl, field, options = {}) {
     const quantizationBackend = field.outlierQuantized
       ? await selectQuantizationBackend()
       : null;
-    const buffer = await fetchBinary(url, fetchInit);
     const dtype = field.outlierDtype;
+    // One outlier quantile per observation.
+    const buffer = await fetchBinary(
+      url,
+      fetchInit,
+      declaredPayloadBytes(declaredPoints, dtype, url)
+    );
 
     let decodedOutlierQuantiles;
     if (field.outlierQuantized) {
@@ -1925,7 +2201,10 @@ export async function loadVarManifest(url, options = {}) {
   }
 
   const response = await fetchOk(url, fetchInit, stagedSource);
-  const manifest = await response.json();
+  const manifest = await readBoundedJson(response, {
+    label: `Metadata ${url}`,
+    signal,
+  });
   throwIfMetadataAborted(signal, 'Variable manifest loading');
   return expandVarManifest(manifest);
 }
@@ -1936,6 +2215,7 @@ export async function loadVarManifest(url, options = {}) {
  *
  * @param {string} manifestUrl - Base URL for resolving paths
  * @param {object} field - Field metadata from manifest
+ * @param {FieldLoaderOptions} [options]
  * @returns {object} Loaded data with values as Float32Array
  */
 export async function loadVarFieldData(manifestUrl, field, options = {}) {
@@ -1943,8 +2223,13 @@ export async function loadVarFieldData(manifestUrl, field, options = {}) {
 
   const {
     fetchInit,
+    pointCount = null,
     signal = fetchInit?.signal ?? null
   } = options || {};
+  const declaredPoints = requireDeclaredLength(
+    pointCount,
+    `Var field loader for "${field.key}"`
+  );
   throwIfAborted(signal);
 
   // Handle AnnData source (h5ad or zarr) - unified handling
@@ -1966,8 +2251,12 @@ export async function loadVarFieldData(manifestUrl, field, options = {}) {
   const quantizationBackend = field.quantized
     ? await selectQuantizationBackend()
     : null;
-  const buffer = await fetchBinary(url, fetchInit);
   const dtype = field.valuesDtype;
+  const buffer = await fetchBinary(
+    url,
+    fetchInit,
+    declaredPayloadBytes(declaredPoints, dtype, url)
+  );
 
   if (field.quantized) {
     outputs.values = await dequantizeToFloat32({
@@ -2167,7 +2456,11 @@ async function loadFileConnectivityIndices(
   signal
 ) {
   const url = resolveUrl(manifestUrl, path);
-  const buffer = await fetchBinary(url, { signal });
+  const buffer = await fetchBinary(
+    url,
+    { signal },
+    manifest.n_edges * manifest.index_bytes
+  );
   throwIfMetadataAborted(signal, 'Connectivity edge loading');
   return readFileConnectivityIndices(buffer, manifest, url);
 }
@@ -2178,7 +2471,11 @@ async function loadFileConnectivityWeights(
   signal
 ) {
   const url = resolveUrl(manifestUrl, manifest.weightsPath);
-  const buffer = await fetchBinary(url, { signal });
+  const buffer = await fetchBinary(
+    url,
+    { signal },
+    manifest.n_edges * manifest.weight_bytes
+  );
   throwIfMetadataAborted(signal, 'Connectivity edge loading');
   return readFileConnectivityWeights(buffer, manifest, url);
 }
@@ -2221,7 +2518,10 @@ export async function loadConnectivityManifest(url, options = {}) {
   const fetchInit = signal ? { signal } : undefined;
   const manifest = isLocalUserUrl(url)
     ? await fetchJsonWithProtocol(url, fetchInit, stagedSource)
-    : await (await fetchOk(url, fetchInit, stagedSource)).json();
+    : await readBoundedJson(
+        await fetchOk(url, fetchInit, stagedSource),
+        { label: `Metadata ${url}`, signal }
+      );
   throwIfMetadataAborted(signal, 'Connectivity manifest loading');
   return validateConnectivityManifest(manifest, context);
 }
@@ -2357,7 +2657,10 @@ export async function loadDatasetIdentity(url, options = {}) {
   }
 
   const response = await fetchOk(url, fetchInit, stagedSource);
-  const identity = await response.json();
+  const identity = await readBoundedJson(response, {
+    label: `Metadata ${url}`,
+    signal,
+  });
   throwIfMetadataAborted(signal, 'Dataset identity loading');
   return identity;
 }
@@ -2558,7 +2861,13 @@ export async function loadAnalysisBulkData(options) {
         batch.map(async geneName => {
           const data = await loadVarFieldData(
             manifestUrl,
-            fieldsByKey.get(geneName)
+            fieldsByKey.get(geneName),
+            {
+              pointCount: manifestPointCount(
+                varManifest,
+                'var_manifest.json'
+              ),
+            }
           );
           if (!(data.values instanceof Float32Array)) {
             throw new TypeError(
@@ -2649,6 +2958,7 @@ export async function loadLatentEmbeddings(options) {
     );
   }
 
+  const declaredCells = identityCellCount(identity);
   const notifications = getNotificationCenter();
   const trackerId = notifications.startDownload(`${dimension}D Embeddings`);
   try {
@@ -2657,6 +2967,11 @@ export async function loadLatentEmbeddings(options) {
     // Load the points
     const points = await loadPointsBinary(url, {
       dimension,
+      expectedBytes: declaredPayloadBytes(
+        declaredCells === null ? null : declaredCells * dimension,
+        'float32',
+        url
+      ),
       showProgress: false
     });
 
@@ -2907,7 +3222,12 @@ export async function loadAnalysisBulkObsData(options) {
       const batchResults = await Promise.all(
         batch.map(async fieldKey => {
           const field = fieldsByKey.get(fieldKey);
-          const data = await loadObsFieldData(manifestUrl, field);
+          const data = await loadObsFieldData(manifestUrl, field, {
+            pointCount: manifestPointCount(
+              obsManifest,
+              'obs_manifest.json'
+            ),
+          });
           if (field.kind !== 'continuous' && field.kind !== 'category') {
             throw new TypeError(
               `Observation field "${fieldKey}" must declare its exact kind`

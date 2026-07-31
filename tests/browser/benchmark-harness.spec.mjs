@@ -1,0 +1,355 @@
+/**
+ * Smoke coverage for the render benchmark harness.
+ *
+ * This spec proves the harness works. It is deliberately not a baseline: the
+ * point counts are small, the windows are short, and no result it prints may
+ * be recorded as a performance number. What it must establish is that the
+ * harness can observe the things the previous harness structurally could not:
+ *
+ * - the scripted camera actually crosses LOD levels and moves geometry out of
+ *   the frustum, rather than being assumed to;
+ * - buffer uploads are counted per frame without any change to the renderer;
+ * - the STATIC and ORBIT regimes differ in the way the renderer's guards say
+ *   they must, which is what makes their difference a measurement;
+ * - a dataset can be generated without freezing the main thread.
+ */
+
+import { expect, test } from '@playwright/test';
+import { dismissWelcome } from './helpers/welcome.mjs';
+
+const FIXTURE_URL =
+  '/?exportsBaseUrl=http%3A%2F%2F127.0.0.1%3A4173%2Ftests%2Fbrowser%2Ffixtures%2Fexports%2F' +
+  '&dataset=current-ui-prepared&acceptance=benchmark-harness-ci';
+
+const HARNESS_MODULE = '/assets/js/app/ui/modules/benchmark/index.js';
+
+/** Small enough to stay a smoke test on a busy machine. */
+const SMOKE_POINT_COUNT = 120_000;
+
+async function publishSyntheticDataset(page, pointCount, pattern) {
+  await page.locator('#benchmark-section > summary').click();
+  await expect(page.locator('#benchmark-section')).toHaveAttribute('open', '');
+  await page.locator('#benchmark-count').fill(String(pointCount));
+  await page.locator('#benchmark-pattern').selectOption(pattern);
+  await page.locator('#benchmark-run').click();
+  await expect
+    .poll(() => page.evaluate(() => window._cellucidState.pointCount), {
+      timeout: 120_000
+    })
+    .toBe(pointCount);
+}
+
+test('the harness observes LOD, culling and uploads under scripted motion', async ({
+  page
+}, testInfo) => {
+  test.setTimeout(600_000);
+  const browserErrors = [];
+  page.on('pageerror', error => {
+    browserErrors.push(`page: ${error.stack || error.message}`);
+  });
+  page.on('console', message => {
+    if (message.type() === 'error') {
+      browserErrors.push(`console: ${message.text()}`);
+    }
+  });
+
+  await page.goto(FIXTURE_URL, { waitUntil: 'domcontentloaded' });
+  await dismissWelcome(page);
+  await expect(page.locator('#filter-count')).toHaveText(
+    'Showing all 120 points'
+  );
+  await publishSyntheticDataset(page, SMOKE_POINT_COUNT, 'atlas');
+
+  const outcome = await page.evaluate(
+    async ({ moduleUrl }) => {
+      const harnessModule = await import(moduleUrl);
+      const viewer = window._cellucidViewer;
+      const canvas = document.getElementById('glcanvas');
+      const harness = harnessModule.createBenchmarkHarness({ viewer, canvas });
+      try {
+        const runner = harness.runner;
+        const path = runner.createPathFromCurrentCamera();
+        const windows = {};
+
+        // Culling on is the configuration whose per-frame element-buffer
+        // publication the counters exist to observe.
+        for (const regime of ['static', 'orbit']) {
+          await runner.applyConfiguration({
+            viewCount: 1,
+            lod: true,
+            frustumCulling: true,
+            forceLodLevel: -1,
+            regime
+          });
+          windows[regime] = await runner.runWindow({
+            regime,
+            path,
+            warmupFrames: 30,
+            measureFrames: 180
+          });
+        }
+
+        // A separate probe pass reads the renderer's own per-view statistics.
+        // It allocates, so it is deliberately kept outside a measured window.
+        await runner.applyConfiguration({
+          viewCount: 1,
+          lod: true,
+          frustumCulling: true,
+          forceLodLevel: -1,
+          regime: 'orbit'
+        });
+        const probe = {
+          lodLevels: [],
+          cullPercents: [],
+          visiblePoints: [],
+          drawCalls: []
+        };
+        const cameraState = harnessModule.createMutableCameraState();
+        for (let frameIndex = 0; frameIndex < 240; frameIndex++) {
+          path.sampleInto(cameraState, frameIndex * 3);
+          viewer.setCameraState(cameraState);
+          await new Promise(resolve => requestAnimationFrame(resolve));
+          const stats = viewer.getRendererStats('live');
+          probe.lodLevels.push(stats.lodLevel);
+          probe.cullPercents.push(stats.cullPercent);
+          probe.visiblePoints.push(stats.visiblePoints);
+          probe.drawCalls.push(stats.drawCalls);
+        }
+
+        return {
+          identity: harness.identity,
+          rasterizer: harness.rasterizer,
+          baselineKey: harness.baselineKey(),
+          windows,
+          probe: {
+            distinctLodLevels: [...new Set(probe.lodLevels)].sort(
+              (a, b) => a - b
+            ),
+            minCullPercent: Math.min(...probe.cullPercents),
+            maxCullPercent: Math.max(...probe.cullPercents),
+            framesWithCulledGeometry: probe.cullPercents.filter(
+              value => value > 0
+            ).length,
+            minVisiblePoints: Math.min(...probe.visiblePoints),
+            maxVisiblePoints: Math.max(...probe.visiblePoints),
+            maxDrawCalls: Math.max(...probe.drawCalls)
+          },
+          pathCoverage: path.describeLodCoverage(path.baseRadius)
+        };
+      } finally {
+        harness.dispose();
+      }
+    },
+    { moduleUrl: HARNESS_MODULE }
+  );
+
+  // The rasterizer must be identified and recorded on every run, so a later
+  // cycle cannot record software-rasterized numbers as a hardware baseline.
+  expect(outcome.identity.canvas.backingStorePixels).toBeGreaterThan(0);
+  expect(['hardware', 'software', 'unknown']).toContain(outcome.rasterizer.kind);
+  expect(outcome.baselineKey).toMatch(/^[a-z0-9-]+$/);
+
+  // Proof that the scripted path crosses LOD transitions rather than sitting
+  // on one level, which is what the identity-matrix harness did.
+  expect(outcome.probe.distinctLodLevels.length).toBeGreaterThan(1);
+  expect(outcome.windows.orbit.lod.transitions).toBeGreaterThan(0);
+  expect(outcome.windows.static.lod.transitions).toBe(0);
+
+  // Proof that geometry leaves the frustum rather than merely being tested
+  // against it: the renderer reports a nonzero culled fraction, and the
+  // visible-point count swings across the path.
+  expect(outcome.probe.maxCullPercent).toBeGreaterThan(0);
+  expect(outcome.probe.framesWithCulledGeometry).toBeGreaterThan(0);
+  expect(outcome.probe.minVisiblePoints).toBeLessThan(
+    outcome.probe.maxVisiblePoints
+  );
+  expect(outcome.probe.minVisiblePoints).toBeLessThan(SMOKE_POINT_COUNT);
+
+  // The upload counters must work without any renderer change, and must
+  // separate a moving camera from a still one. The renderer publishes a new
+  // element buffer only when the ordered visible set changes, so a still
+  // camera must produce none.
+  expect(outcome.windows.orbit.uploads.totalElementCalls).toBeGreaterThan(0);
+  expect(outcome.windows.static.uploads.totalElementCalls).toBe(0);
+  expect(outcome.windows.orbit.uploads.totalBytes).toBeGreaterThan(
+    outcome.windows.static.uploads.totalBytes
+  );
+
+  // The synchronous GL points are on the same guard. A still camera must not
+  // stall the pipeline at all; a moving one does, and now that is countable.
+  expect(outcome.windows.static.uploads.totalSyncStallCalls).toBe(0);
+  expect(outcome.windows.orbit.uploads.totalSyncStallCalls).toBeGreaterThan(0);
+
+  // Percentiles are withheld, not invented, when the window is this short.
+  for (const regime of ['static', 'orbit']) {
+    const summary = outcome.windows[regime];
+    expect(summary.samples).toBe(180);
+    expect(summary.percentileSupport.p99.reported).toBe(false);
+    expect(summary.frameTimeMs.p99).toBeNull();
+    expect(summary.frameTimeMs.median).toBeGreaterThan(0);
+  }
+
+  await testInfo.attach('benchmark-harness-smoke.json', {
+    body: JSON.stringify(outcome, null, 2),
+    contentType: 'application/json'
+  });
+  expect(browserErrors).toEqual([]);
+});
+
+test('the view-count axis reaches the viewer snapshot ceiling', async ({
+  page
+}) => {
+  test.setTimeout(600_000);
+  const browserErrors = [];
+  page.on('pageerror', error => {
+    browserErrors.push(`page: ${error.stack || error.message}`);
+  });
+
+  await page.goto(FIXTURE_URL, { waitUntil: 'domcontentloaded' });
+  await dismissWelcome(page);
+  await publishSyntheticDataset(page, SMOKE_POINT_COUNT, 'atlas');
+
+  const measured = await page.evaluate(
+    async ({ moduleUrl }) => {
+      const harnessModule = await import(moduleUrl);
+      const viewer = window._cellucidViewer;
+      const canvas = document.getElementById('glcanvas');
+      const harness = harnessModule.createBenchmarkHarness({ viewer, canvas });
+      try {
+        const runner = harness.runner;
+        const path = runner.createPathFromCurrentCamera();
+        const cells = [];
+        for (const viewCount of [1, 2, 4]) {
+          const layout = await runner.applyConfiguration({
+            viewCount,
+            lod: true,
+            frustumCulling: true,
+            forceLodLevel: -1,
+            regime: 'orbit'
+          });
+          const summary = await runner.runWindow({
+            regime: 'orbit',
+            path,
+            warmupFrames: 20,
+            measureFrames: 90
+          });
+          cells.push({
+            viewCount,
+            layout,
+            elementUploadCalls: summary.uploads.totalElementCalls,
+            syncStallCalls: summary.uploads.totalSyncStallCalls,
+            samples: summary.samples
+          });
+        }
+        let refusedBeyondCeiling = null;
+        try {
+          await runner.ensureViewCount(harnessModule.MAX_BENCHMARK_VIEWS + 1);
+        } catch (error) {
+          refusedBeyondCeiling = error.message;
+        }
+        return { cells, refusedBeyondCeiling };
+      } finally {
+        harness.dispose();
+      }
+    },
+    { moduleUrl: HARNESS_MODULE }
+  );
+
+  // Setting the layout alone leaves the renderer on its single-viewport path;
+  // the axis is real only when the viewer publishes the extra views.
+  expect(measured.cells.map(cell => cell.layout)).toEqual([
+    { viewCount: 1, layoutMode: 'single' },
+    { viewCount: 2, layoutMode: 'grid' },
+    { viewCount: 4, layoutMode: 'grid' }
+  ]);
+  // Per-view work must scale with the number of panes, not stay flat.
+  expect(measured.cells[1].elementUploadCalls).toBeGreaterThan(
+    measured.cells[0].elementUploadCalls
+  );
+  expect(measured.cells[2].elementUploadCalls).toBeGreaterThan(
+    measured.cells[1].elementUploadCalls
+  );
+  expect(measured.refusedBeyondCeiling).toMatch(/exceeds the viewer ceiling/);
+  expect(browserErrors).toEqual([]);
+});
+
+test('synthetic generation runs off the main thread', async ({ page }) => {
+  test.setTimeout(600_000);
+  const browserErrors = [];
+  page.on('pageerror', error => {
+    browserErrors.push(`page: ${error.stack || error.message}`);
+  });
+
+  await page.goto(FIXTURE_URL, { waitUntil: 'domcontentloaded' });
+  await dismissWelcome(page);
+
+  const result = await page.evaluate(
+    async ({ moduleUrl, count }) => {
+      const harnessModule = await import(moduleUrl);
+      // Count animation frames while generation runs. A main-thread generator
+      // freezes the tab and this counter stays at zero; a worker leaves the
+      // frame loop alive, which is what lets an automated run observe progress
+      // instead of timing out against a frozen page.
+      let framesDuringGeneration = 0;
+      let generating = true;
+      const tick = () => {
+        if (!generating) return;
+        framesDuringGeneration++;
+        requestAnimationFrame(tick);
+      };
+      requestAnimationFrame(tick);
+
+      const startedAt = performance.now();
+      const data = await harnessModule.generateSyntheticDataOffThread({
+        pattern: 'atlas',
+        count
+      });
+      generating = false;
+      return {
+        wallMs: performance.now() - startedAt,
+        workerMs: data.elapsedMs,
+        framesDuringGeneration,
+        positions: data.positions.length,
+        colors: data.colors.length,
+        dimensionLevel: data.dimensionLevel,
+        positionsAreFloat32: data.positions instanceof Float32Array,
+        colorsAreUint8: data.colors instanceof Uint8Array
+      };
+    },
+    { moduleUrl: HARNESS_MODULE, count: 1_000_000 }
+  );
+
+  expect(result.positions).toBe(3_000_000);
+  expect(result.colors).toBe(4_000_000);
+  expect(result.dimensionLevel).toBe(3);
+  expect(result.positionsAreFloat32).toBe(true);
+  expect(result.colorsAreUint8).toBe(true);
+  expect(result.workerMs).toBeGreaterThan(0);
+  expect(result.framesDuringGeneration).toBeGreaterThan(0);
+  expect(browserErrors).toEqual([]);
+});
+
+test('an aborted generation terminates its worker', async ({ page }) => {
+  await page.goto(FIXTURE_URL, { waitUntil: 'domcontentloaded' });
+  await dismissWelcome(page);
+
+  const aborted = await page.evaluate(async ({ moduleUrl }) => {
+    const harnessModule = await import(moduleUrl);
+    const controller = new AbortController();
+    const pending = harnessModule.generateSyntheticDataOffThread({
+      pattern: 'atlas',
+      count: 5_000_000,
+      signal: controller.signal
+    });
+    controller.abort();
+    try {
+      await pending;
+      return { rejected: false, name: null };
+    } catch (error) {
+      return { rejected: true, name: error.name };
+    }
+  }, { moduleUrl: HARNESS_MODULE });
+
+  expect(aborted.rejected).toBe(true);
+  expect(aborted.name).toBe('AbortError');
+});

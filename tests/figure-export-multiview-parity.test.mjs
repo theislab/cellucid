@@ -82,6 +82,7 @@ function makeView({
   transparency = 1,
   legendModel = null,
   fieldKey = legendModel === null ? null : 'cluster',
+  filters = [],
 }) {
   return {
     cameraState: cameraState(),
@@ -102,6 +103,8 @@ function makeView({
       datasetGeneration: 7,
       dimensionLevel: 3,
       fieldKey,
+      fieldKind: fieldKey === null ? null : 'category',
+      filters,
       geometryGeneration: 11,
       legendModel,
       lodMembership: null,
@@ -114,12 +117,24 @@ function makeView({
   };
 }
 
+/** The provenance record the engine derives from the exported views. */
+function provenanceViews(views) {
+  return views.map((view) => ({
+    fieldKey: view.scientificState.fieldKey,
+    fieldKind: view.scientificState.fieldKind,
+    filters: [...view.scientificState.filters],
+    id: view.id,
+    label: view.label,
+  }));
+}
+
 function payload({
   crop = null,
   depthSort3d = false,
   fontFamily = 'Arial, sans-serif',
   includeAxes = true,
   includeLegend = false,
+  referenceGrid = null,
   showOrientation = true,
   strategy = 'full-vector',
   views,
@@ -130,7 +145,7 @@ function payload({
     dpi: null,
     format: 'svg',
     height,
-    meta: {},
+    meta: { views: provenanceViews(views) },
     options: {
       axisLabelFontSizePx: 12,
       background: 'viewer',
@@ -147,6 +162,7 @@ function payload({
       legendFontSizePx: 12,
       legendPosition: 'right',
       optimizedTargetCount: strategy === 'optimized-vector' ? 1000 : null,
+      referenceGrid,
       selectionMutedOpacity: 0.15,
       showOrientation,
       strategy,
@@ -231,6 +247,7 @@ test('multiview SVG shares only separately owned, semantically equal legends', a
     ],
   });
   const equalSvg = await (await renderFigureToSvgBlob({ payload: equal })).text();
+  // Panels that genuinely agree are explained once, not once per panel.
   assert.equal(
     occurrences(equalSvg, /font-weight="600">cluster<\/text>/g),
     1
@@ -254,7 +271,14 @@ test('multiview SVG shares only separately owned, semantically equal legends', a
   const differentSvg = await (
     await renderFigureToSvgBlob({ payload: different })
   ).text();
-  assert.doesNotMatch(differentSvg, /font-weight="600">cluster<\/text>/);
+  // Panels that disagree are never merged into one legend, and are never left
+  // without one either: each panel explains its own colors.
+  assert.equal(
+    occurrences(differentSvg, /font-weight="600">cluster<\/text>/g),
+    2
+  );
+  assert.match(differentSvg, /fill="rgb\(0,255,0\)"/);
+  assert.match(differentSvg, /fill="rgb\(0,255,64\)"/);
 
   const missing = payload({
     includeAxes: false,
@@ -273,7 +297,12 @@ test('multiview SVG shares only separately owned, semantically equal legends', a
   const missingSvg = await (
     await renderFigureToSvgBlob({ payload: missing })
   ).text();
-  assert.doesNotMatch(missingSvg, /font-weight="600">cluster<\/text>/);
+  // The coloured panel keeps its legend; the panel with no active field has
+  // nothing to explain.
+  assert.equal(
+    occurrences(missingSvg, /font-weight="600">cluster<\/text>/g),
+    1
+  );
 });
 
 test('Times-family axes and legends remain well-formed escaped SVG attributes', async () => {

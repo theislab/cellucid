@@ -3,7 +3,9 @@
  *
  * Every entry is a closed record of explicit changes from the freshly loaded
  * dataset. Restore validates the complete candidate before loading or mutating
- * any field.
+ * any field, then clears every field back to its load-time defaults before
+ * applying the candidate, so a restored session is the exact saved state and
+ * never a merge with whatever happened to be on screen.
  *
  * @module state-serializer/filters
  */
@@ -43,6 +45,52 @@ const CONTINUOUS_KEYS = [
   'outlierThreshold',
   'colormapId'
 ];
+
+/**
+ * Every field property that carries user filter/colour intent.
+ *
+ * This is the exact complement of what the two serializers above read from a
+ * field, and the exact set that `ensureCategoryMetadata()` and
+ * `ensureContinuousMetadata()` in `state/managers/color-manager.js` lazily
+ * default-initialize. Removing a property returns the field to the shape it had
+ * when the dataset loaded, so the next `ensure*Metadata()` call re-derives the
+ * documented default from the field values.
+ *
+ * Deliberately absent: `_continuousStats`, `_positiveStats` and
+ * `_categoryCounts` are derived from the field values rather than from user
+ * intent, and `_continuousStats` is the baseline the writer measures its range
+ * deltas against. `_isDeleted`, `_isPurged`, `_originalKey`,
+ * `_originalCategories`, `_sourceField`, `_operation`, `_loadingPromise` and
+ * `_loadingSignal` are field identity and lifecycle, owned by other session
+ * contributors.
+ */
+const RESET_FIELD_FILTER_PROPERTIES = [
+  '_categoryColors',
+  '_categoryFilterEnabled',
+  '_categoryVisible',
+  '_colormapId',
+  '_continuousColorRange',
+  '_continuousFilter',
+  '_filterEnabled',
+  '_outlierFilterEnabled',
+  '_outlierThreshold',
+  '_useFilterColorRange',
+  '_useLogScale'
+];
+
+/**
+ * Return one field to its load-time filter and colour defaults.
+ *
+ * The load-time default is the absence of the property, not a value copied from
+ * a sibling default table: every one of these properties is materialized lazily
+ * by the colour manager, which stays the single owner of what each default is.
+ * @param {object} field
+ */
+function resetFieldFilterState(field) {
+  for (const property of RESET_FIELD_FILTER_PROPERTIES) {
+    delete field[property];
+  }
+}
 
 function requireRestoreSignal(options) {
   assertExactKeys(options, ['signal'], 'Filter restore options');
@@ -218,6 +266,12 @@ function serializeContinuousFilter(field) {
     if (threshold < 0.9999) outlierThreshold = threshold;
   }
 
+  const filter = changedRange(
+    field._continuousFilter,
+    field._continuousStats,
+    `Continuous filter for "${field.key}"`
+  );
+
   const entry = {
     kind: 'continuous',
     filterEnabled: explicitBooleanChange(
@@ -225,14 +279,18 @@ function serializeContinuousFilter(field) {
       false,
       `Continuous filterEnabled for "${field.key}"`
     ),
-    filter: changedRange(
-      field._continuousFilter,
-      field._continuousStats,
-      `Continuous filter for "${field.key}"`
-    ),
+    filter,
+    // Restore clears the field to its load-time defaults and then replays this
+    // entry, so an omitted color range means "whatever the colour manager
+    // derives next". That derivation is the effective filter range
+    // (`ensureContinuousMetadata()` defaults `_continuousColorRange` to
+    // `_continuousFilter`, not to `_continuousStats`), so the color range has to
+    // be measured against the same baseline. Measuring it against the field
+    // statistics would omit the color range for a field whose filter was
+    // narrowed, and the restored colour scale would silently follow the filter.
     colorRange: changedRange(
       field._continuousColorRange,
-      field._continuousStats,
+      filter ?? field._continuousStats,
       `Continuous colorRange for "${field.key}"`
     ),
     useLogScale: explicitBooleanChange(
@@ -524,8 +582,14 @@ export function createFilterSerializer({ state }) {
         'Filter field preloads failed.'
       );
     }
-    const currentObsFields = state.getFields();
-    const currentVarFields = state.getVarFields();
+    const currentObsFields = assertFieldInventory(
+      state.getFields(),
+      'Current obs field inventory'
+    );
+    const currentVarFields = assertFieldInventory(
+      state.getVarFields(),
+      'Current var field inventory'
+    );
     for (const action of actions) {
       const currentFields = action.source === 'obs'
         ? currentObsFields
@@ -545,6 +609,18 @@ export function createFilterSerializer({ state }) {
 
     state.beginBatch();
     try {
+      // A session bundle is the complete field-filter state, not a patch: every
+      // field it omits was at its defaults when the session was saved. Clear
+      // every current field first so nothing left on screen survives the
+      // restore. Deleted fields are skipped for the same reason the writer skips
+      // them — they carry no session-visible state.
+      for (const fields of [currentObsFields, currentVarFields]) {
+        for (const field of fields) {
+          if (field._isDeleted === true) continue;
+          resetFieldFilterState(field);
+        }
+      }
+
       for (const { field, entry } of actions) {
         throwIfAborted(signal);
         if (entry.kind === 'category') {

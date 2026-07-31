@@ -493,7 +493,7 @@ test('direct dispatch requires the exact protocol and adopted dataset id', async
       );
       const points = await loadPointsBinary(
         `${baseUrl}points_2d.bin`,
-        { dimension: 2 }
+        { dimension: 2, expectedBytes: 24 }
       );
       assert.equal(points.length, 6);
 
@@ -716,6 +716,7 @@ test(
         {
           candidateAnnDataBinding: binding,
           dimension: 2,
+          expectedBytes: 24,
           signal,
         }
       );
@@ -871,6 +872,7 @@ test('progress-tracked cross-origin points use one direct streaming CORS request
       'https://datasets.example/exports/demo/points_2d.bin',
       {
         dimension: 2,
+        expectedBytes: 16,
         showProgress: true,
       }
     );

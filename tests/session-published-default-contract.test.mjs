@@ -96,6 +96,7 @@ function makeSerializer(contributors) {
       getDatasetGeneration: () => 0,
       obsData: { fields: [] },
       pointCount: 3,
+      getViewDimensionLevel: () => 3,
       positionsArray: new Float32Array(9),
       varData: { fields: [] },
     },
@@ -165,6 +166,7 @@ function createOverlayState(initialPayload) {
     },
     obsData: { fields: [] },
     pointCount: 3,
+    getViewDimensionLevel: () => 3,
     positionsArray: new Float32Array(9),
     varData: { fields: [] },
     applyFieldOverlays() {

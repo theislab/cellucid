@@ -96,6 +96,8 @@ test('grid PNG and Hybrid SVG own per-pane scientific adornments', async ({
         datasetGeneration: 7,
         dimensionLevel: 3,
         fieldKey: 'cluster',
+        fieldKind: 'category',
+        filters: [],
         geometryGeneration: 11,
         legendModel,
         lodMembership: null,
@@ -114,11 +116,33 @@ test('grid PNG and Hybrid SVG own per-pane scientific adornments', async ({
       const secondLegend = categoryLegend();
       if (legendDifference) secondLegend.colors[1][2] = 0.25;
       const strategy = format === 'svg' ? 'hybrid' : null;
+      const views = [
+        makeView({
+          id: 'visible',
+          label: 'Visible',
+          transparency: 1,
+          legendModel: categoryLegend(),
+        }),
+        makeView({
+          id: 'filtered',
+          label: 'Filtered',
+          transparency: 0,
+          legendModel: secondLegend,
+        }),
+      ];
       return {
         dpi: format === 'png' ? 96 : null,
         format,
         height: 520,
-        meta: {},
+        meta: {
+          views: views.map((view) => ({
+            fieldKey: view.scientificState.fieldKey,
+            fieldKind: view.scientificState.fieldKind,
+            filters: [...view.scientificState.filters],
+            id: view.id,
+            label: view.label,
+          })),
+        },
         options: {
           axisLabelFontSizePx: 12,
           background: 'viewer',
@@ -135,6 +159,7 @@ test('grid PNG and Hybrid SVG own per-pane scientific adornments', async ({
           legendFontSizePx: 12,
           legendPosition: 'right',
           optimizedTargetCount: null,
+          referenceGrid: null,
           selectionMutedOpacity: 0.15,
           showOrientation: true,
           strategy,
@@ -151,20 +176,7 @@ test('grid PNG and Hybrid SVG own per-pane scientific adornments', async ({
           visibleCount: 0,
         },
         title: '',
-        views: [
-          makeView({
-            id: 'visible',
-            label: 'Visible',
-            transparency: 1,
-            legendModel: categoryLegend(),
-          }),
-          makeView({
-            id: 'filtered',
-            label: 'Filtered',
-            transparency: 0,
-            legendModel: secondLegend,
-          }),
-        ],
+        views,
         width: 900,
       };
     };
@@ -249,11 +261,22 @@ test('grid PNG and Hybrid SVG own per-pane scientific adornments', async ({
   expect(paneLabels.every(call => call.y > 20 && call.y < 80)).toBe(true);
 
   const differentText = result.differentCalls.map(call => call.text);
-  expect(differentText.filter(text => text === 'cluster')).toHaveLength(0);
+  // Panels whose legend models differ can no longer share one legend, so each
+  // panel draws its own instead of the grid drawing none.
+  expect(differentText.filter(text => text === 'cluster')).toHaveLength(2);
+  expect(differentText.filter(text => text === 'Alpha')).toHaveLength(2);
+  expect(differentText.filter(text => text === 'Beta')).toHaveLength(2);
   expect(
     differentText.filter(text => text === 'No visible cells')
   ).toHaveLength(1);
   expect(differentText.filter(text => text === 'UMAP 1')).toHaveLength(0);
+
+  // The two panel legends sit in different panels, to the right of each plot.
+  const panelLegendTitles = result.differentCalls.filter(
+    call => call.text === 'cluster'
+  );
+  expect(panelLegendTitles[1].x).toBeGreaterThan(panelLegendTitles[0].x + 300);
+  expect(panelLegendTitles.every(call => call.y > 20)).toBe(true);
 
   expect(result.hybridSvg).toEqual({
     emptyCount: 1,

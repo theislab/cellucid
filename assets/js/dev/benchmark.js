@@ -5259,6 +5259,10 @@ export class BenchmarkReporter {
         scrollX: window.scrollX,
         scrollY: window.scrollY
       } : null,
+      // Drawing surface. A fill-rate result cannot be compared against any
+      // other result without the pixel count it was drawn at, and the device
+      // pixel ratio alone does not give it: the backing store may be clamped.
+      canvas: this._collectCanvasBackingStore(),
       // Input devices
       input: {
         maxTouchPoints: nav.maxTouchPoints || 0,
@@ -5270,6 +5274,32 @@ export class BenchmarkReporter {
     };
 
     return hardware;
+  }
+
+  /**
+   * Collect the canvas backing-store geometry the report is measured at.
+   *
+   * @returns {Object|null} Backing-store record, or null with no canvas.
+   */
+  _collectCanvasBackingStore() {
+    const canvas = this.canvas ?? null;
+    if (canvas === null) return null;
+    const width = Number.isFinite(canvas.width) ? canvas.width : null;
+    const height = Number.isFinite(canvas.height) ? canvas.height : null;
+    const clientWidth = Number.isFinite(canvas.clientWidth)
+      ? canvas.clientWidth
+      : null;
+    const clientHeight = Number.isFinite(canvas.clientHeight)
+      ? canvas.clientHeight
+      : null;
+    return {
+      width,
+      height,
+      clientWidth,
+      clientHeight,
+      backingStorePixels:
+        width !== null && height !== null ? width * height : null
+    };
   }
 
   /**

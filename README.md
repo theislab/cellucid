@@ -4,7 +4,7 @@
 
 # Cellucid
 
-**See every cell. Query any gene. Fly through millions.**
+**See every cell. Query any gene. Explore in 2D and 3D.**
 
 Cellucid is a browser-first, GPU-accelerated workspace for exploring large
 single-cell datasets in real time. Move naturally through 1D, 2D, and 3D

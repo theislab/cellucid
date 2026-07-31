@@ -8,6 +8,9 @@
  * NOTE: Legend size is computed dynamically from the legend model so exports
  * can show all legend entries (no “+N more” truncation).
  *
+ * Both the single-view layout and the multi-panel grid cell layout live here,
+ * so the SVG and PNG renderers place identical rectangles from one source.
+ *
  * KEY DESIGN DECISION:
  * The user-specified dimensions (width x height) represent the desired PLOT content size.
  * Legend, axes, and title are added as ADDITIONAL space around the plot, expanding
@@ -16,6 +19,12 @@
  *
  * @module ui/modules/figure-export/utils/layout
  */
+
+import {
+  HIDDEN_LEGEND_ENTRY_SUFFIX,
+  isCategoryHidden
+} from '../components/legend-builder.js';
+import { clamp } from '../../../../utils/number-utils.js';
 
 // ============================================================================
 // Layout Constants
@@ -45,6 +54,15 @@ const LEGEND_SWATCH = 10;
 /** Gap between swatch and text (px) */
 const LEGEND_SWATCH_GAP = 6;
 
+/**
+ * Right-hand margin the legend builder keeps free inside every entry column.
+ *
+ * It has to be part of the width estimate: without it the panel is sized to
+ * the bare text and the builder then truncates the longest entry — which, for
+ * a hidden category, is exactly the entry whose marker must survive.
+ */
+const LEGEND_LABEL_MARGIN = 2;
+
 /** Approximate average character width in pixels (multiplier × fontSize) */
 const LEGEND_CHAR_WIDTH = 0.62;
 
@@ -63,11 +81,51 @@ const AXIS_RIGHT_SPACE = 10;
 /** Minimal padding when axes are disabled (px) */
 const NO_AXIS_PADDING = 10;
 
-function estimateLegendWidthRight({ model, fontSizePx, plotHeight }) {
-  if (!model) return LEGEND_WIDTH_RIGHT;
-  if (model.kind !== 'category') return LEGEND_WIDTH_RIGHT;
+/**
+ * Panel-legend geometry for grid (multi-panel) exports.
+ *
+ * A panel legend is only drawn when the panels disagree, so it competes with
+ * the plot for room inside one cell. The floor is the width below which a
+ * legend stops being readable at all; the ceiling matches the single-view
+ * legend so a panel legend never dwarfs the data it explains. Between them the
+ * panel may never surrender more than half its inner width (or body height) to
+ * the legend.
+ */
+const PANEL_LEGEND_GAP = 8;
+const PANEL_LEGEND_MIN_WIDTH = 96;
+const PANEL_LEGEND_MIN_HEIGHT = 44;
+const PANEL_LEGEND_MAX_SHARE = 0.5;
+
+/**
+ * Longest rendered legend entry, in characters.
+ *
+ * Hidden categories keep their entry and carry the hidden marker, so the marker
+ * has to be reserved here too; otherwise the panel is sized for the bare names
+ * and the legend builder truncates the very entries that need to stay readable.
+ *
+ * @param {any} model
+ */
+function longestCategoryEntryLength(model) {
   const categories = model.categories || [];
-  if (!categories.length) return LEGEND_WIDTH_RIGHT;
+  let maxLen = 0;
+  for (let index = 0; index < categories.length; index++) {
+    const length = String(categories[index] ?? '').length
+      + (isCategoryHidden(model, index) ? HIDDEN_LEGEND_ENTRY_SUFFIX.length : 0);
+    if (length > maxLen) maxLen = length;
+  }
+  return maxLen;
+}
+
+function estimateLegendWidthRight({
+  model,
+  fontSizePx,
+  plotHeight,
+  minimumWidth = LEGEND_WIDTH_RIGHT
+}) {
+  if (!model) return minimumWidth;
+  if (model.kind !== 'category') return minimumWidth;
+  const categories = model.categories || [];
+  if (!categories.length) return minimumWidth;
 
   const lineH = Math.max(14, Math.round(fontSizePx * 1.2));
   const headerSpace = LEGEND_PADDING + fontSizePx + 8;
@@ -75,24 +133,25 @@ function estimateLegendWidthRight({ model, fontSizePx, plotHeight }) {
   const rowsPerCol = Math.max(1, Math.floor(availH / lineH));
   const cols = Math.max(1, Math.ceil(categories.length / rowsPerCol));
 
-  let maxLen = 0;
-  for (const c of categories) maxLen = Math.max(maxLen, String(c ?? '').length);
-  const textW = maxLen * fontSizePx * LEGEND_CHAR_WIDTH;
-  const colW = LEGEND_SWATCH + LEGEND_SWATCH_GAP + textW;
+  const textW = longestCategoryEntryLength(model) * fontSizePx * LEGEND_CHAR_WIDTH;
+  const colW = LEGEND_SWATCH + LEGEND_SWATCH_GAP + textW + LEGEND_LABEL_MARGIN;
   const width = Math.ceil(LEGEND_PADDING * 2 + cols * colW);
-  return Math.max(LEGEND_WIDTH_RIGHT, width);
+  return Math.max(minimumWidth, width);
 }
 
-function estimateLegendHeightBottom({ model, fontSizePx, plotWidth }) {
-  if (!model) return LEGEND_HEIGHT_BOTTOM;
-  if (model.kind !== 'category') return LEGEND_HEIGHT_BOTTOM;
+function estimateLegendHeightBottom({
+  model,
+  fontSizePx,
+  plotWidth,
+  minimumHeight = LEGEND_HEIGHT_BOTTOM
+}) {
+  if (!model) return minimumHeight;
+  if (model.kind !== 'category') return minimumHeight;
   const categories = model.categories || [];
-  if (!categories.length) return LEGEND_HEIGHT_BOTTOM;
+  if (!categories.length) return minimumHeight;
 
-  let maxLen = 0;
-  for (const c of categories) maxLen = Math.max(maxLen, String(c ?? '').length);
-  const textW = maxLen * fontSizePx * LEGEND_CHAR_WIDTH;
-  const colW = LEGEND_SWATCH + LEGEND_SWATCH_GAP + textW;
+  const textW = longestCategoryEntryLength(model) * fontSizePx * LEGEND_CHAR_WIDTH;
+  const colW = LEGEND_SWATCH + LEGEND_SWATCH_GAP + textW + LEGEND_LABEL_MARGIN;
 
   const lineH = Math.max(14, Math.round(fontSizePx * 1.2));
   const headerSpace = LEGEND_PADDING + fontSizePx + 8;
@@ -100,7 +159,7 @@ function estimateLegendHeightBottom({ model, fontSizePx, plotWidth }) {
   const cols = Math.max(1, Math.floor(availW / Math.max(1, colW)));
   const rows = Math.max(1, Math.ceil(categories.length / cols));
   const height = Math.ceil(headerSpace + rows * lineH + LEGEND_PADDING);
-  return Math.max(LEGEND_HEIGHT_BOTTOM, height);
+  return Math.max(minimumHeight, height);
 }
 
 // ============================================================================
@@ -306,6 +365,159 @@ export function computeSingleViewLayout({
 // ============================================================================
 
 /**
+ * Compute the layout of one grid cell: panel label, plot area, and — when the
+ * panels cannot share one legend — that panel's own legend.
+ *
+ * WHERE THE PANEL LEGEND GOES, AND WHY:
+ * The cell is divided top-to-bottom into a header row (the "A. Live" label)
+ * and a body. The legend is carved out of the body on the side the user chose
+ * for the figure legend (`legendPosition`), so it can never overlap the plot,
+ * the axes, or the panel label — every rectangle this function returns is
+ * disjoint from the others. Axis space is then allocated from what is left,
+ * which is why the plot shrinks rather than the legend overlapping it: a panel
+ * a reader cannot decode is worse than a slightly smaller panel.
+ *
+ * The axis margins reuse the single-view constants (AXIS_LEFT_SPACE,
+ * AXIS_RIGHT_SPACE, AXIS_BOTTOM_SPACE); they hold ticks and axis labels and so
+ * cannot host a legend themselves.
+ *
+ * A cell too small to carry a readable legend (see PANEL_LEGEND_MIN_WIDTH /
+ * PANEL_LEGEND_MIN_HEIGHT) returns `legendRect: null`; at that size no legend
+ * text would be legible either.
+ *
+ * @param {object} options
+ * @param {number} options.cellX
+ * @param {number} options.cellY
+ * @param {number} options.cellWidth
+ * @param {number} options.cellHeight
+ * @param {boolean} options.includeAxes
+ * @param {number} options.fontSize        - Panel label font size (px)
+ * @param {any} [options.legendModel=null] - Panel legend model, or null for none
+ * @param {LegendPosition} [options.legendPosition='right']
+ * @param {number} [options.legendFontSizePx=12]
+ * @returns {{
+ *   labelX: number;
+ *   labelY: number;
+ *   panelRect: Rect;
+ *   plotRect: Rect;
+ *   legendRect: Rect|null;
+ * }}
+ */
+export function computeGridPaneLayout({
+  cellX,
+  cellY,
+  cellWidth,
+  cellHeight,
+  includeAxes,
+  fontSize,
+  legendModel = null,
+  legendPosition = 'right',
+  legendFontSizePx = 12
+}) {
+  const padding = clamp(Math.round(fontSize * 0.65), 6, 12);
+  const innerWidth = Math.max(1, cellWidth - padding * 2);
+  const innerHeight = Math.max(1, cellHeight - padding * 2);
+  const headerHeight = Math.min(
+    Math.max(18, Math.round(fontSize * 1.5)),
+    Math.max(0, innerHeight - 1)
+  );
+  const bodyHeight = Math.max(1, innerHeight - headerHeight);
+  const legendFontPx = Math.max(6, Math.round(Number(legendFontSizePx) || 12));
+
+  let legendRect = null;
+  let legendReserveWidth = 0;
+  let legendReserveHeight = 0;
+
+  if (legendModel !== null) {
+    if (legendPosition === 'right') {
+      const affordable =
+        Math.floor(innerWidth * PANEL_LEGEND_MAX_SHARE) - PANEL_LEGEND_GAP;
+      if (affordable >= PANEL_LEGEND_MIN_WIDTH) {
+        const width = Math.min(
+          affordable,
+          Math.min(
+            LEGEND_WIDTH_RIGHT,
+            estimateLegendWidthRight({
+              model: legendModel,
+              fontSizePx: legendFontPx,
+              plotHeight: bodyHeight,
+              minimumWidth: PANEL_LEGEND_MIN_WIDTH
+            })
+          )
+        );
+        legendReserveWidth = width + PANEL_LEGEND_GAP;
+        legendRect = {
+          x: cellX + padding + innerWidth - width,
+          y: cellY + padding + headerHeight,
+          width,
+          height: bodyHeight
+        };
+      }
+    } else {
+      const affordable =
+        Math.floor(bodyHeight * PANEL_LEGEND_MAX_SHARE) - PANEL_LEGEND_GAP;
+      if (affordable >= PANEL_LEGEND_MIN_HEIGHT) {
+        const height = Math.min(
+          affordable,
+          Math.min(
+            LEGEND_HEIGHT_BOTTOM,
+            estimateLegendHeightBottom({
+              model: legendModel,
+              fontSizePx: legendFontPx,
+              plotWidth: innerWidth,
+              minimumHeight: PANEL_LEGEND_MIN_HEIGHT
+            })
+          )
+        );
+        legendReserveHeight = height + PANEL_LEGEND_GAP;
+        legendRect = {
+          x: cellX + padding,
+          y: cellY + padding + innerHeight - height,
+          width: innerWidth,
+          height
+        };
+      }
+    }
+  }
+
+  const plotAreaWidth = Math.max(1, innerWidth - legendReserveWidth);
+  const plotAreaHeight = Math.max(1, bodyHeight - legendReserveHeight);
+  const minPlotWidth = Math.min(80, Math.max(1, plotAreaWidth * 0.45));
+  const minPlotHeight = Math.min(64, Math.max(1, plotAreaHeight * 0.45));
+  const axisRight = includeAxes
+    ? Math.min(AXIS_RIGHT_SPACE, Math.max(0, plotAreaWidth - minPlotWidth))
+    : 0;
+  const axisLeft = includeAxes
+    ? Math.min(
+      AXIS_LEFT_SPACE,
+      Math.max(0, plotAreaWidth - axisRight - minPlotWidth)
+    )
+    : 0;
+  const axisBottom = includeAxes
+    ? Math.min(AXIS_BOTTOM_SPACE, Math.max(0, plotAreaHeight - minPlotHeight))
+    : 0;
+  const plotRect = {
+    x: cellX + padding + axisLeft,
+    y: cellY + padding + headerHeight,
+    width: Math.max(1, plotAreaWidth - axisLeft - axisRight),
+    height: Math.max(1, plotAreaHeight - axisBottom),
+  };
+
+  return {
+    labelX: plotRect.x,
+    labelY: cellY + padding + Math.min(fontSize, Math.max(1, headerHeight)),
+    panelRect: {
+      x: cellX + 1,
+      y: cellY + 1,
+      width: Math.max(1, cellWidth - 2),
+      height: Math.max(1, cellHeight - 2),
+    },
+    plotRect,
+    legendRect,
+  };
+}
+
+/**
  * Compute optimal grid dimensions (columns × rows) for multi-panel layouts.
  *
  * Uses a square-ish layout that slightly favors more columns than rows
@@ -349,5 +561,9 @@ export const LAYOUT_CONSTANTS = {
   AXIS_BOTTOM_SPACE,
   AXIS_TOP_SPACE,
   AXIS_RIGHT_SPACE,
-  NO_AXIS_PADDING
+  NO_AXIS_PADDING,
+  PANEL_LEGEND_GAP,
+  PANEL_LEGEND_MIN_WIDTH,
+  PANEL_LEGEND_MIN_HEIGHT,
+  PANEL_LEGEND_MAX_SHARE
 };

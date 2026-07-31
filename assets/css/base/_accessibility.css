@@ -2,7 +2,15 @@
    Accessibility helpers and reduced-motion handling.
 */
 
-/* Focus ring defaults (components may override as needed). */
+/* Focus ring default for every focusable element.
+
+   A component may retune this ring (colour, width, offset) or replace it with a
+   different indicator that is at least as visible — a ring drawn with
+   `box-shadow`, a border-colour change, a `:focus-within` outline on a wrapper.
+   A component must never declare `outline: none` on `:focus-visible` without
+   painting such a replacement: that leaves keyboard focus with no visual
+   position at all (WCAG 2.4.7 Focus Visible). `:focus:not(:focus-visible)`
+   below is the supported way to suppress the ring for pointer interaction. */
 :focus-visible {
   outline: 2px solid var(--color-border-focus);
   outline-offset: 2px;

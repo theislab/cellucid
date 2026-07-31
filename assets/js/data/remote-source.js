@@ -10,7 +10,8 @@
 import {
   DataSourceError,
   DataSourceErrorCode,
-  loadDatasetMetadata
+  loadDatasetMetadata,
+  readBoundedJson
 } from './data-source.js';
 import {
   loadMetadataBatchAtomically,
@@ -506,7 +507,7 @@ async function requestJson(url, signal, label) {
     );
   }
   try {
-    return await response.json();
+    return await readBoundedJson(response, { label });
   } catch (error) {
     throw new DataSourceError(
       `${label} response must contain valid JSON`,

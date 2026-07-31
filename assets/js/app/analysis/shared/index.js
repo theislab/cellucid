@@ -194,15 +194,11 @@ export {
 // =============================================================================
 
 export {
-  renderStatsGrid,
-  renderDESummaryStats,
   renderSignatureSummaryStats,
   renderDataTable,
-  renderDEGenesTable,
   renderResultSection,
   createPlotContainer,
   renderGeneChips,
-  renderDEResults,
   renderSignatureResults
 } from './result-renderer.js';
 

@@ -14,6 +14,7 @@
 import { escapeHtml } from '../../../../utils/dom-utils.js';
 import { forEachProjectedPoint } from '../utils/point-projector.js';
 import { POINT_VISIBILITY_THRESHOLD } from '../utils/lod-membership.js';
+import { hexToRgb01 } from '../utils/color-utils.js';
 
 /**
  * @param {any} flags
@@ -71,6 +72,10 @@ export function renderSvgCentroidOverlay({
   const haloW = Math.max(1.5, Math.round(labelSize * 0.28));
   const strokeW = Math.max(0.5, Math.min(2.5, Number(pointRadiusPx || 1) * 0.18));
 
+  // The centroid disc outline is the label ink: on a dark figure a near-black
+  // ring around a coloured disc disappears entirely.
+  const outline = escapeHtml(labelColor);
+
   const parts = [];
   parts.push(`<g font-family="${escapeHtml(fontFamily)}" fill="${escapeHtml(labelColor)}">`);
 
@@ -91,11 +96,11 @@ export function renderSvgCentroidOverlay({
         const fill = `rgb(${r},${g},${b})`;
         if (a >= 0.999) {
           parts.push(
-            `<circle cx="${x.toFixed(2)}" cy="${y.toFixed(2)}" r="${radius.toFixed(2)}" fill="${fill}" stroke="#111" stroke-width="${strokeW.toFixed(2)}"/>`
+            `<circle cx="${x.toFixed(2)}" cy="${y.toFixed(2)}" r="${radius.toFixed(2)}" fill="${fill}" stroke="${outline}" stroke-width="${strokeW.toFixed(2)}"/>`
           );
         } else {
           parts.push(
-            `<circle cx="${x.toFixed(2)}" cy="${y.toFixed(2)}" r="${radius.toFixed(2)}" fill="${fill}" fill-opacity="${a.toFixed(3)}" stroke="#111" stroke-width="${strokeW.toFixed(2)}" stroke-opacity="${a.toFixed(3)}"/>`
+            `<circle cx="${x.toFixed(2)}" cy="${y.toFixed(2)}" r="${radius.toFixed(2)}" fill="${fill}" fill-opacity="${a.toFixed(3)}" stroke="${outline}" stroke-width="${strokeW.toFixed(2)}" stroke-opacity="${a.toFixed(3)}"/>`
           );
         }
       }
@@ -159,6 +164,10 @@ export function drawCanvasCentroidOverlay({
 
   const labelSize = Math.max(6, Math.round(Number(labelFontSizePx) || 12));
   const strokeW = Math.max(1, Math.round(labelSize * 0.28));
+  const outlineRgb = hexToRgb01(labelColor);
+  const outline255 = outlineRgb === null
+    ? [17, 17, 17]
+    : outlineRgb.map((channel) => Math.round(channel * 255));
 
   ctx.save();
   ctx.font = `${labelSize}px ${fontFamily}`;
@@ -183,7 +192,7 @@ export function drawCanvasCentroidOverlay({
         ctx.beginPath();
         ctx.arc(x, y, radius, 0, Math.PI * 2);
         ctx.fill();
-        ctx.strokeStyle = `rgba(17,17,17,${a})`;
+        ctx.strokeStyle = `rgba(${outline255[0]},${outline255[1]},${outline255[2]},${a})`;
         ctx.lineWidth = Math.max(0.5, Math.min(2.5, radius * 0.18));
         ctx.stroke();
       }

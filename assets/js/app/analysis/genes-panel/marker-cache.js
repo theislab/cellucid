@@ -110,6 +110,12 @@ function cloneMarkerCacheData(data) {
  *
  * Provides tiered caching for marker discovery results.
  *
+ * Every entry is addressed by the analysis parameters *and* by
+ * `groupingDigest`, the digest of the exact per-cell category codes the
+ * markers were computed over — see `computeCategoryGroupingDigest` in
+ * `data/data-layer.js`. The field key is not an identity: a user-defined
+ * categorical field can have its codes rewritten in place under the same key.
+ *
  * @example
  * const cache = new MarkerCache({
  *   maxCategories: 3,
@@ -119,11 +125,17 @@ function cloneMarkerCacheData(data) {
  * });
  * await cache.init();
  *
+ * const params = {
+ *   method: 'wilcox',
+ *   minCells: 10,
+ *   groupingDigest: computeCategoryGroupingDigest(obsCodes)
+ * };
+ *
  * // Store results
- * await cache.set('cell_type', markers);
+ * await cache.set('cell_type', markers, params);
  *
  * // Retrieve results
- * const cached = await cache.get('cell_type');
+ * const cached = await cache.get('cell_type', params);
  */
 export class MarkerCache {
   /**
@@ -205,10 +217,11 @@ export class MarkerCache {
    * Get cached markers for a category
    *
    * @param {string} category - Observation category (e.g., 'cell_type')
-   * @param {Object} [params] - Additional parameters for cache key
+   * @param {Object} params - Cache key parameters; must include
+   *   `groupingDigest` (32 lowercase hex characters)
    * @returns {Promise<any|null>} Cached data or null
    */
-  async get(category, params = {}) {
+  async get(category, params) {
     const cacheKey = this._buildCacheKey(category, params);
 
     // Check hot cache first
@@ -239,10 +252,11 @@ export class MarkerCache {
    *
    * @param {string} category - Observation category
    * @param {any} data - Data to cache
-   * @param {Object} [params] - Additional parameters for cache key
+   * @param {Object} params - Cache key parameters; must include
+   *   `groupingDigest` (32 lowercase hex characters)
    * @returns {Promise<void>}
    */
-  async set(category, data, params = {}) {
+  async set(category, data, params) {
     if (data === undefined) {
       throw new TypeError('MarkerCache data must be defined');
     }
@@ -262,10 +276,11 @@ export class MarkerCache {
    * Check if category is cached
    *
    * @param {string} category - Observation category
-   * @param {Object} [params] - Additional parameters for cache key
+   * @param {Object} params - Cache key parameters; must include
+   *   `groupingDigest` (32 lowercase hex characters)
    * @returns {Promise<boolean>}
    */
-  async has(category, params = {}) {
+  async has(category, params) {
     const cacheKey = this._buildCacheKey(category, params);
 
     if (this._hotCache.has(cacheKey)) {
@@ -284,10 +299,11 @@ export class MarkerCache {
    * Invalidate cache for a category
    *
    * @param {string} category - Observation category
-   * @param {Object} [params] - Additional parameters for cache key
+   * @param {Object} params - Cache key parameters; must include
+   *   `groupingDigest` (32 lowercase hex characters)
    * @returns {Promise<void>}
    */
-  async invalidate(category, params = {}) {
+  async invalidate(category, params) {
     const cacheKey = this._buildCacheKey(category, params);
 
     // Remove from hot cache
@@ -343,12 +359,25 @@ export class MarkerCache {
    * Build a cache key from category and parameters
    * @private
    */
-  _buildCacheKey(category, params = {}) {
+  _buildCacheKey(category, params) {
     if (typeof category !== 'string' || category.length === 0 || category.trim().length === 0) {
       throw new TypeError('MarkerCache category must be non-empty text');
     }
     if (!params || typeof params !== 'object' || Array.isArray(params)) {
       throw new TypeError('MarkerCache parameters must be an object');
+    }
+    // The category key names the field; it does not identify the grouping. A
+    // user-defined field's codes can be rewritten in place under an unchanged
+    // key, so every entry must carry the digest of the exact per-cell code
+    // assignment it was computed over. Missing it is a defect in the caller, not
+    // a cache miss, so it fails here rather than silently sharing a key.
+    if (
+      typeof params.groupingDigest !== 'string' ||
+      !/^[0-9a-f]{32}$/.test(params.groupingDigest)
+    ) {
+      throw new TypeError(
+        'MarkerCache parameters must carry a groupingDigest of 32 lowercase hex characters'
+      );
     }
     const entries = Object.keys(params).sort().map(key => {
       const value = params[key];

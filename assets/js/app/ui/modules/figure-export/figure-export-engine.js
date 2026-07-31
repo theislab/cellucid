@@ -407,6 +407,7 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
     if (
       typeof state.getViewDimensionLevel !== 'function' ||
       typeof state.getFieldForView !== 'function' ||
+      typeof state.getFilterSummaryForView !== 'function' ||
       typeof state.getLegendModel !== 'function' ||
       typeof state.dimensionManager?.getNormTransform !== 'function'
     ) {
@@ -431,6 +432,24 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
     if (fieldKey !== null && typeof fieldKey !== 'string') {
       throw new TypeError(
         `Figure export field key for view "${vid}" must be a string or null.`
+      );
+    }
+    const fieldKind = field === null ? null : field.kind;
+    if (fieldKind !== null && typeof fieldKind !== 'string') {
+      throw new TypeError(
+        `Figure export field kind for view "${vid}" must be a string or null.`
+      );
+    }
+    // Each view owns its filters: a grid export must be able to say which
+    // panel a restriction applies to, and only this per-view read can.
+    const filters = state.getFilterSummaryForView(vid);
+    throwIfFigureExportAborted(signal);
+    if (
+      !Array.isArray(filters) ||
+      filters.some((line) => typeof line !== 'string')
+    ) {
+      throw new TypeError(
+        `Figure export filters for view "${vid}" must be an array of strings.`
       );
     }
     let legendModel = null;
@@ -567,6 +586,8 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
           datasetGeneration,
           dimensionLevel: stateDimensionLevel,
           fieldKey,
+          fieldKind,
+          filters: [...filters],
           geometryGeneration: borrowed.geometryGeneration,
           legendModel,
           lodMembership,
@@ -691,32 +712,6 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
       ? liveViewLabel
       : activeSnapshot.label;
 
-    if (
-      typeof state.getFieldForView !== 'function' ||
-      typeof state.getFilterSummaryForView !== 'function'
-    ) {
-      throw new TypeError(
-        'Figure export state must publish getFieldForView() and getFilterSummaryForView().'
-      );
-    }
-    const field = state.getFieldForView(viewId);
-    throwIfFigureExportAborted(signal);
-    if (
-      field !== null &&
-      (typeof field !== 'object' || Array.isArray(field))
-    ) {
-      throw new TypeError(
-        `Figure export field for view "${viewId}" must be an object or null.`
-      );
-    }
-    const fieldKey = field === null ? null : field.key;
-    const fieldKind = field === null ? null : field.kind;
-    const filters = state.getFilterSummaryForView(viewId);
-    throwIfFigureExportAborted(signal);
-    if (!Array.isArray(filters) || filters.some((line) => typeof line !== 'string')) {
-      throw new TypeError('Figure export filters must be an array of strings.');
-    }
-
     const viewLayout = viewer.getViewLayout();
     throwIfFigureExportAborted(signal);
     const wantsGrid = exportAllViews && viewLayout.mode === 'grid';
@@ -812,6 +807,27 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
       );
     }
 
+    // Provenance describes every exported panel, not the active one. A grid
+    // stamped with one view's field and filters attributes that panel's
+    // scientific state to the whole figure, which is a false claim in a
+    // published figure. Each record is read out of the panel's own atomic
+    // snapshot, so the metadata cannot describe a view the figure does not
+    // draw.
+    const provenanceViews = payloadViews.map((view) => ({
+      id: view.id,
+      label: view.label,
+      fieldKey: view.scientificState.fieldKey,
+      fieldKind: view.scientificState.fieldKind,
+      filters: [...view.scientificState.filters],
+    }));
+    // The filename may name a colour field only when every panel carries it.
+    const exportedFieldKeys = new Set(
+      provenanceViews.map((view) => view.fieldKey)
+    );
+    const filenameFieldKey = exportedFieldKeys.size === 1
+      ? provenanceViews[0].fieldKey
+      : null;
+
     const payloadBase = {
       width,
       height,
@@ -830,11 +846,7 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
         datasetSourceUrl,
         datasetSourceCitation,
         datasetUserPath,
-        fieldKey,
-        fieldKind,
-        viewId,
-        viewLabel,
-        filters
+        views: provenanceViews,
       },
       selection: {
         highlightArray,
@@ -904,7 +916,7 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
           }
           const filename = buildExportFilename({
             datasetName,
-            fieldKey,
+            fieldKey: filenameFieldKey,
             viewLabel: wantsGrid ? 'multiview' : views[0].label,
             variant: null,
             ext: 'svg',
@@ -936,7 +948,7 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
           const variant = needsMultiplePng ? `dpi${dpi}` : null;
           const filename = buildExportFilename({
             datasetName,
-            fieldKey,
+            fieldKey: filenameFieldKey,
             viewLabel: wantsGrid ? 'multiview' : views[0].label,
             variant,
             ext: 'png',
@@ -971,7 +983,7 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
         }
         deliveryFilename = buildExportFilename({
           datasetName,
-          fieldKey,
+          fieldKey: filenameFieldKey,
           viewLabel: wantsGrid ? 'multiview' : views[0].label,
           variant: 'batch',
           ext: 'zip',

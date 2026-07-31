@@ -18,7 +18,10 @@ import {
   MAX_KEYFRAMES,
   MAX_TRANSITION_DURATION_SECONDS
 } from './keyframe-store.js';
-import { createPlaybackController } from './playback-controller.js';
+import {
+  createPlaybackController,
+  prefersReducedMotion
+} from './playback-controller.js';
 import { createTransportBar } from './transport-bar.js';
 import { assertCameraPathOptions } from './interpolation-engine.js';
 import { getNotificationCenter } from '../../../notification-center.js';
@@ -604,7 +607,10 @@ export function initCinematicCamera({
     if (destroyed) return;
     const exact = assertCameraPathPlaybackSnapshot(snapshot);
     stopAutoplay();
-    if (exact.state !== 'STOPPED') {
+    // A reduced-motion preference completes a path instead of animating it, so
+    // playback is never live and there is no transport state to resume. The
+    // exact saved camera is still published below.
+    if (exact.state !== 'STOPPED' && !prefersReducedMotion()) {
       if (!isCameraPathReady(keyframeStore.getAll())) {
         throw new Error(
           'Camera Path playback restore requires a complete path.'

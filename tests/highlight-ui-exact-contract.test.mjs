@@ -35,6 +35,7 @@ const HIGHLIGHT_MODULE_ROOT = new URL(
 function createDocumentStub() {
   const elements = new Map();
   return {
+    addEventListener() {},
     body: {
       appendChild(element) {
         elements.set(element.id, element);
@@ -125,6 +126,9 @@ function createEventElement() {
 function createModeViewer() {
   return {
     cancelAnnotationSelection() {},
+    cancelKnnSelection() {},
+    cancelLassoSelection() {},
+    cancelProximitySelection() {},
     cancelUnifiedSelection() {},
     getUnifiedSelectionState() {
       return {
@@ -217,9 +221,12 @@ test('highlight modules expose one exact current UI contract without probes, tim
     'highlight-summary-ui.js',
     'knn-selection.js',
     'lasso-selection.js',
+    'mode-copy.js',
     'mode-ui.js',
     'proximity-selection.js',
-    'selection-sync.js'
+    'selection-state.js',
+    'selection-sync.js',
+    'step-controls.js'
   ];
   const source = (
     await Promise.all(
@@ -450,6 +457,7 @@ test('selection-tool destruction retires subscriptions and fences retained callb
   const unsubscribeCalls = [];
   const mutations = [];
   const state = {
+    pointCount: 8,
     activeFieldIndex: -1,
     activeFieldSource: null,
     activeVarFieldIndex: -1,
@@ -619,7 +627,7 @@ test('selection-tool destruction retires subscriptions and fences retained callb
 
     assert.deepEqual(
       unsubscribeCalls.sort(),
-      ['highlight:changed', 'lod', 'page:changed']
+      ['highlight:changed', 'lod', 'page:changed', 'visibility:changed']
     );
     assert.equal(buttons[1].listeners('click').length, 0);
 
@@ -825,6 +833,7 @@ test('highlight summary rejects state-operation no-ops instead of accepting them
     cellCount: 1
   };
   const state = {
+    pointCount: 4,
     clearAllHighlights() {},
     getHighlightedCellCount() {
       return 1;
@@ -886,6 +895,7 @@ test('highlight summary rejects alternate group schemas before mutating the DOM'
     legacySource: 'lasso'
   };
   const state = {
+    pointCount: 4,
     clearAllHighlights() {},
     getHighlightedCellCount() {
       return 1;
@@ -991,6 +1001,7 @@ test('highlight mode rejects an unknown mode before mutating selection state', (
 
   withDocument(createDocumentStub(), () => {
     const modeUi = initHighlightModeUI({
+      state: { pointCount: 0 },
       viewer: createModeViewer(),
       dom: {
         modeButtons: buttons,
@@ -1030,6 +1041,7 @@ test('highlight mode requires exactly one explicitly pressed current-mode button
   withDocument(createDocumentStub(), () => {
     assert.throws(
       () => initHighlightModeUI({
+        state: { pointCount: 0 },
         viewer: createModeViewer(),
         dom: {
           modeButtons: buttons,
@@ -1063,6 +1075,7 @@ test('malformed lasso events fail before history or permanent highlight mutation
     setLassoStepCallback() {}
   };
   const state = {
+    pointCount: 8,
     addHighlightDirect() {
       calls.push('add');
       return {};
@@ -1141,6 +1154,7 @@ test('selection destruction drains Jupyter delivery and suppresses late failure 
     setLassoStepCallback() {}
   };
   const state = {
+    pointCount: 8,
     addHighlightDirect({ cellIndices }) {
       return {
         id: 'highlight_1',
@@ -1230,6 +1244,7 @@ test('annotation undo republishes the exact candidate state to the unified rende
     }
   };
   const documentStub = {
+    addEventListener() {},
     createElement() {
       const element = createEventElement();
       element.remove = () => {
@@ -1247,6 +1262,7 @@ test('annotation undo republishes the exact candidate state to the unified rende
     categories: ['A', 'B']
   };
   const state = {
+    pointCount: 4,
     activeFieldIndex: 0,
     activeFieldSource: 'obs',
     activeVarFieldIndex: -1,
@@ -1269,6 +1285,9 @@ test('annotation undo republishes the exact candidate state to the unified rende
     },
     getValueForCell() {
       return Number.NaN;
+    },
+    on() {
+      return () => {};
     },
     setPreviewHighlightFromIndices() {}
   };
@@ -1339,12 +1358,19 @@ test('continuous preview rejects missing published statistics before querying ce
   let rangeCalls = 0;
   initContinuousSelectionPreview({
     state: {
+      pointCount: 4,
       activeFieldIndex: 0,
       activeFieldSource: 'obs',
       activeVarFieldIndex: null,
       clearPreviewHighlight() {},
       getActiveField() {
         return { kind: 'continuous' };
+      },
+      getCategoryForCell() {
+        return 0;
+      },
+      getCellIndicesForCategory() {
+        return [];
       },
       getCellIndicesForRange() {
         rangeCalls += 1;
@@ -1392,9 +1418,16 @@ test('continuous preview preflights the exact shared selection state before call
   assert.throws(
     () => initContinuousSelectionPreview({
       state: {
+        pointCount: 0,
         clearPreviewHighlight() {},
         getActiveField() {
           return null;
+        },
+        getCategoryForCell() {
+          return 0;
+        },
+        getCellIndicesForCategory() {
+          return [];
         },
         getCellIndicesForRange() {
           return [];

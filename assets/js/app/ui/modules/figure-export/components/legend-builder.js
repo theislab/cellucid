@@ -11,7 +11,11 @@
  */
 
 import { formatTick } from '../utils/tick-calculator.js';
+import { LIGHT_INK } from '../utils/figure-ink.js';
 import { escapeHtml } from '../../../../utils/dom-utils.js';
+import {
+  areLegendModelsSemanticallyEqual,
+} from '../utils/legend-model-equality.js';
 
 /**
  * @typedef {object} Rect
@@ -20,6 +24,26 @@ import { escapeHtml } from '../../../../utils/dom-utils.js';
  * @property {number} width
  * @property {number} height
  */
+
+/**
+ * Suffix marking a category that is not drawn in the exported figure.
+ *
+ * Hidden categories are marked rather than dropped. Dropping them would make a
+ * filtered view indistinguishable from a complete one: a reader seeing nine of
+ * twelve cell types with no trace of the other three concludes the panel shows
+ * the whole composition of the tissue. Marking keeps the fact of the filtering
+ * inside the figure, where a reader who never saw the app can find it.
+ */
+export const HIDDEN_LEGEND_ENTRY_SUFFIX = ' (hidden)';
+
+/**
+ * Legend ink follows the figure's paper, not a fixed near-black: a legend
+ * written in `#111` on a dark-background figure cannot be read at all.
+ * `utils/figure-ink.js` owns both palettes.
+ */
+
+/** Gap between the colorbar endpoint row and the scale note. */
+const SCALE_NOTE_GAP = 4;
 
 function rgb01ToCss(color01) {
   const r = Math.round((color01?.[0] ?? 0) * 255);
@@ -75,6 +99,119 @@ function truncateCanvasTextToWidth(ctx, text, maxWidthPx) {
 }
 
 /**
+ * Is this category excluded from the drawn points?
+ *
+ * @param {any} model
+ * @param {number} index
+ */
+export function isCategoryHidden(model, index) {
+  const visible = model?.visible;
+  if (visible === null || typeof visible !== 'object') return false;
+  return visible[index] === false;
+}
+
+/**
+ * Compose one category legend label.
+ *
+ * The hidden marker is reserved out of the available width before the name is
+ * shortened, so a narrow column can never truncate away the one word that says
+ * the entry is not in the figure. SVG and Canvas pass their own measurement,
+ * so the text is identical while the fitting stays exact for each medium.
+ *
+ * @param {object} options
+ * @param {unknown} options.name
+ * @param {boolean} options.hidden
+ * @param {number} options.maxWidthPx
+ * @param {(text: string, maxWidthPx: number) => string} options.fit
+ * @param {(text: string) => number} options.measure
+ */
+export function composeCategoryLabel({ name, hidden, maxWidthPx, fit, measure }) {
+  const text = String(name ?? '');
+  if (!hidden) return fit(text, maxWidthPx);
+  const nameWidth = maxWidthPx - measure(HIDDEN_LEGEND_ENTRY_SUFFIX);
+  return `${fit(text, nameWidth)}${HIDDEN_LEGEND_ENTRY_SUFFIX}`;
+}
+
+/**
+ * Is this continuous model colored on a logarithmic ramp?
+ *
+ * `logEnabled` and the two `scale` fields are produced together by
+ * `DataState.getLegendModel`; any of them reporting a log ramp is enough to
+ * annotate one, because failing to annotate is the harmful direction.
+ *
+ * @param {any} model
+ */
+export function isLogColorScale(model) {
+  return model?.logEnabled === true
+    || model?.scale === 'log'
+    || model?.colorbar?.scale === 'log';
+}
+
+/**
+ * Build the note that keeps a logarithmic colorbar from being read linearly.
+ *
+ * Endpoints alone invite a reader to interpolate a mid-bar color and quote a
+ * value that is wrong by orders of magnitude. Naming the scale and giving the
+ * true midpoint (the geometric mean, since color position tracks log10(value))
+ * removes both halves of that mistake.
+ *
+ * @param {any} model
+ * @param {unknown} min
+ * @param {unknown} max
+ * @returns {string|null} Null when the scale is linear.
+ */
+export function buildColorScaleNote(model, min, max) {
+  if (!isLogColorScale(model)) return null;
+  const lo = Number(min);
+  const hi = Number(max);
+  if (Number.isFinite(lo) && Number.isFinite(hi) && lo > 0 && hi > 0) {
+    return `Log10 color scale (midpoint ${formatTick(Math.sqrt(lo * hi))})`;
+  }
+  return 'Log10 color scale';
+}
+
+/**
+ * May one legend stand for every panel of a grid export?
+ *
+ * Only when each panel is coloured by the same field *and* publishes a legend
+ * model equal to the others in every respect — including which categories are
+ * hidden. Two panels coloured by `cell_type` with different categories filtered
+ * out need two legends: one legend would tell the reader that both panels draw
+ * the same set of categories, which is exactly the claim the hidden-entry
+ * marking exists to prevent.
+ *
+ * Panels that fail this test are drawn with their own legend instead; nothing
+ * is dropped either way.
+ *
+ * @param {ReadonlyArray<{ scientificState: { fieldKey: string|null; legendModel: any } }>} views
+ * @returns {{ fieldKey: string; model: any }|null}
+ */
+export function resolveSharedGridLegend(views) {
+  let sharedFieldKey = null;
+  let sharedModel = null;
+
+  for (const view of views) {
+    const fieldKey = view.scientificState.fieldKey;
+    const model = view.scientificState.legendModel;
+    if (fieldKey === null || model === null) return null;
+    if (sharedFieldKey === null) {
+      sharedFieldKey = fieldKey;
+      sharedModel = model;
+      continue;
+    }
+    if (
+      sharedFieldKey !== fieldKey ||
+      !areLegendModelsSemanticallyEqual(sharedModel, model)
+    ) {
+      return null;
+    }
+  }
+
+  if (sharedFieldKey === null || sharedModel === null) return null;
+  return { fieldKey: sharedFieldKey, model: sharedModel };
+}
+
+/**
  * Render an SVG legend. Returns `{ svg, defs }` where defs may include gradients.
  *
  * @param {object} options
@@ -92,8 +229,12 @@ export function renderSvgLegend({
   fontFamily = 'Arial, Helvetica, sans-serif',
   fontSize = 12,
   idPrefix = 'legend',
-  backgroundFill = '#ffffff'
+  backgroundFill = '#ffffff',
+  ink = LIGHT_INK
 }) {
+  const HIDDEN_ENTRY_INK = ink.mutedText;
+  const ENTRY_INK = ink.text;
+  const SCALE_NOTE_INK = ink.mutedText;
   if (!legendRect || !model) return { svg: '', defs: '' };
 
   const x = legendRect.x;
@@ -108,10 +249,10 @@ export function renderSvgLegend({
   const defs = [];
 
   parts.push(
-    `<g font-family="${escapeHtml(fontFamily)}" font-size="${fontSize}" fill="#111">`
+    `<g font-family="${escapeHtml(fontFamily)}" font-size="${fontSize}" fill="${ink.text}">`
   );
   const fill = backgroundFill === 'transparent' ? 'none' : backgroundFill;
-  parts.push(`<rect x="${x}" y="${y}" width="${w}" height="${h}" fill="${escapeHtml(fill)}" stroke="#e5e7eb" stroke-width="1"/>`);
+  parts.push(`<rect x="${x}" y="${y}" width="${w}" height="${h}" fill="${escapeHtml(fill)}" stroke="${ink.frame}" stroke-width="1"/>`);
 
   const title = fieldKey ? String(fieldKey) : (model.kind === 'continuous' ? 'Color scale' : 'Legend');
   parts.push(`<text x="${x + padding}" y="${y + padding + fontSize}" font-weight="600">${escapeHtml(title)}</text>`);
@@ -139,10 +280,23 @@ export function renderSvgLegend({
       const colRight = x + padding + (col + 1) * colW;
       const maxLabelW = Math.max(0, colRight - labelX - 2);
 
-      const label = truncateTextApprox(String(categories[i] ?? ''), maxLabelW, fontSize);
-      const colorCss = rgb01ToCss(colors[i]);
-      parts.push(`<rect x="${itemX}" y="${itemY}" width="${swatch}" height="${swatch}" fill="${colorCss}" stroke="#111" stroke-width="0.25"/>`);
-      parts.push(`<text x="${labelX}" y="${itemY + swatch}" dominant-baseline="ideographic">${escapeHtml(label)}</text>`);
+      const hidden = isCategoryHidden(model, i);
+      const label = composeCategoryLabel({
+        name: categories[i],
+        hidden,
+        maxWidthPx: maxLabelW,
+        fit: (text, width) => truncateTextApprox(text, width, fontSize),
+        measure: (text) => estimateTextWidthPxApprox(text, fontSize)
+      });
+      // A hidden category gets a hollow swatch: its color is absent from the
+      // figure, so showing it would send the reader hunting for points that
+      // were never drawn.
+      if (hidden) {
+        parts.push(`<rect x="${itemX}" y="${itemY}" width="${swatch}" height="${swatch}" fill="none" stroke="${HIDDEN_ENTRY_INK}" stroke-width="1"/>`);
+      } else {
+        parts.push(`<rect x="${itemX}" y="${itemY}" width="${swatch}" height="${swatch}" fill="${rgb01ToCss(colors[i])}" stroke="${ENTRY_INK}" stroke-width="0.25"/>`);
+      }
+      parts.push(`<text x="${labelX}" y="${itemY + swatch}" fill="${hidden ? HIDDEN_ENTRY_INK : ENTRY_INK}" dominant-baseline="ideographic">${escapeHtml(label)}</text>`);
     }
   } else if (model.kind === 'continuous') {
     const gradId = `${idPrefix}_grad`;
@@ -155,15 +309,21 @@ export function renderSvgLegend({
 
     const barH = 12;
     const barW = Math.max(40, w - padding * 2);
-    parts.push(`<rect x="${x + padding}" y="${cursorY}" width="${barW}" height="${barH}" fill="url(#${gradId})" stroke="#111" stroke-width="0.5"/>`);
+    parts.push(`<rect x="${x + padding}" y="${cursorY}" width="${barW}" height="${barH}" fill="url(#${gradId})" stroke="${ink.text}" stroke-width="0.5"/>`);
     cursorY += barH + 6;
 
     const min = model.colorbar?.min ?? model.stats?.min;
     const max = model.colorbar?.max ?? model.stats?.max;
     const minText = formatTick(Number(min));
     const maxText = formatTick(Number(max));
-    parts.push(`<text x="${x + padding}" y="${cursorY + fontSize}" fill="#555">${minText}</text>`);
-    parts.push(`<text x="${x + padding + barW}" y="${cursorY + fontSize}" text-anchor="end" fill="#555">${maxText}</text>`);
+    parts.push(`<text x="${x + padding}" y="${cursorY + fontSize}" fill="${SCALE_NOTE_INK}">${minText}</text>`);
+    parts.push(`<text x="${x + padding + barW}" y="${cursorY + fontSize}" text-anchor="end" fill="${SCALE_NOTE_INK}">${maxText}</text>`);
+
+    const note = buildColorScaleNote(model, min, max);
+    if (note !== null) {
+      const noteBaseline = cursorY + fontSize * 2 + SCALE_NOTE_GAP;
+      parts.push(`<text x="${x + padding}" y="${noteBaseline}" fill="${SCALE_NOTE_INK}">${escapeHtml(note)}</text>`);
+    }
   }
 
   parts.push(`</g>`);
@@ -189,8 +349,12 @@ export function drawCanvasLegend({
   model,
   fontFamily = 'Arial, Helvetica, sans-serif',
   fontSize = 12,
-  backgroundFill = '#ffffff'
+  backgroundFill = '#ffffff',
+  ink = LIGHT_INK
 }) {
+  const HIDDEN_ENTRY_INK = ink.mutedText;
+  const ENTRY_INK = ink.text;
+  const SCALE_NOTE_INK = ink.mutedText;
   if (!ctx || !legendRect || !model) return;
 
   const x = legendRect.x;
@@ -206,11 +370,11 @@ export function drawCanvasLegend({
     ctx.fillStyle = backgroundFill;
     ctx.fillRect(x, y, w, h);
   }
-  ctx.strokeStyle = '#e5e7eb';
+  ctx.strokeStyle = ink.frame;
   ctx.lineWidth = 1;
   ctx.strokeRect(x, y, w, h);
 
-  ctx.fillStyle = '#111';
+  ctx.fillStyle = ink.text;
   ctx.font = `600 ${fontSize}px ${fontFamily}`;
   ctx.textAlign = 'left';
   ctx.textBaseline = 'alphabetic';
@@ -246,14 +410,30 @@ export function drawCanvasLegend({
       const colRight = x + padding + (col + 1) * colW;
       const maxLabelW = Math.max(0, colRight - labelX - 2);
 
-      ctx.fillStyle = rgb01ToCss(colors[i]);
-      ctx.fillRect(itemX, itemY, swatch, swatch);
-      ctx.strokeStyle = '#111';
-      ctx.lineWidth = 0.5;
-      ctx.strokeRect(itemX, itemY, swatch, swatch);
+      const hidden = isCategoryHidden(model, i);
+      // A hidden category gets a hollow swatch: its color is absent from the
+      // figure, so showing it would send the reader hunting for points that
+      // were never drawn.
+      if (hidden) {
+        ctx.strokeStyle = HIDDEN_ENTRY_INK;
+        ctx.lineWidth = 1;
+        ctx.strokeRect(itemX, itemY, swatch, swatch);
+      } else {
+        ctx.fillStyle = rgb01ToCss(colors[i]);
+        ctx.fillRect(itemX, itemY, swatch, swatch);
+        ctx.strokeStyle = ENTRY_INK;
+        ctx.lineWidth = 0.5;
+        ctx.strokeRect(itemX, itemY, swatch, swatch);
+      }
 
-      ctx.fillStyle = '#111';
-      const label = truncateCanvasTextToWidth(ctx, String(categories[i] ?? ''), maxLabelW);
+      ctx.fillStyle = hidden ? HIDDEN_ENTRY_INK : ENTRY_INK;
+      const label = composeCategoryLabel({
+        name: categories[i],
+        hidden,
+        maxWidthPx: maxLabelW,
+        fit: (text, width) => truncateCanvasTextToWidth(ctx, text, width),
+        measure: (text) => ctx.measureText(text).width
+      });
       ctx.fillText(label, labelX, itemY + swatch);
     }
     ctx.restore();
@@ -268,18 +448,24 @@ export function drawCanvasLegend({
     }
     ctx.fillStyle = grad;
     ctx.fillRect(x + padding, cursorY, barW, barH);
-    ctx.strokeStyle = '#111';
+    ctx.strokeStyle = ink.text;
     ctx.lineWidth = 0.5;
     ctx.strokeRect(x + padding, cursorY, barW, barH);
     cursorY += barH + 6;
 
     const min = model.colorbar?.min ?? model.stats?.min;
     const max = model.colorbar?.max ?? model.stats?.max;
-    ctx.fillStyle = '#555';
+    ctx.fillStyle = SCALE_NOTE_INK;
     ctx.textAlign = 'left';
     ctx.fillText(formatTick(Number(min)), x + padding, cursorY + fontSize);
     ctx.textAlign = 'right';
     ctx.fillText(formatTick(Number(max)), x + padding + barW, cursorY + fontSize);
+
+    const note = buildColorScaleNote(model, min, max);
+    if (note !== null) {
+      ctx.textAlign = 'left';
+      ctx.fillText(note, x + padding, cursorY + fontSize * 2 + SCALE_NOTE_GAP);
+    }
   }
 
   ctx.restore();

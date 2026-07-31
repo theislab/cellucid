@@ -1193,6 +1193,7 @@ function createSessionSerializer(contributor) {
       getDatasetGeneration: () => 0,
       obsData: { fields: [] },
       pointCount: 0,
+      getViewDimensionLevel: () => 3,
       positionsArray: new Float32Array(0),
       varData: { fields: [] },
     },
@@ -1274,6 +1275,7 @@ test(
       getDatasetGeneration: () => generation,
       obsData: { fields: [] },
       pointCount: 2,
+      getViewDimensionLevel: () => 3,
       positionsArray: new Float32Array(6),
       varData: { fields: [{ key: 'GENE_A' }] },
     };

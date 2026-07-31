@@ -24,9 +24,11 @@ import {
   ANALYSIS_CACHE_INVENTORY_CHUNK_PROFILE
 } from './contributors/analysis-artifacts.js';
 import {
+  assertDatasetFingerprint,
   buildSessionContext,
   createSessionRestoreTransaction,
   datasetFingerprintMatches,
+  describeDatasetFingerprintMismatch,
   getDatasetFingerprint,
   registerSessionRestoreSnapshots
 } from './session-context.js';
@@ -326,9 +328,9 @@ function validateManifest(manifest, contributorById, manifestProfile) {
   ) {
     throw new TypeError('Session manifest createdAt must be a canonical ISO timestamp.');
   }
-  datasetFingerprintMatches(
+  assertDatasetFingerprint(
     manifest.datasetFingerprint,
-    manifest.datasetFingerprint
+    'Session manifest datasetFingerprint'
   );
   assertArray(manifest.chunks, 'Session manifest chunks');
   const chunkIds = new Set();
@@ -1567,10 +1569,9 @@ export class SessionSerializer {
 
       const currentFp = getDatasetFingerprint(ctx);
       const fileFp = manifest.datasetFingerprint;
-      if (!datasetFingerprintMatches(fileFp, currentFp)) {
-        throw new RangeError(
-          'Session dataset mismatch: the complete saved dataset identity does not match the current dataset.'
-        );
+      const mismatch = describeDatasetFingerprintMismatch(fileFp, currentFp);
+      if (mismatch !== null) {
+        throw new RangeError(mismatch);
       }
       const capturedSnapshots = await captureRestoreSnapshots(
         ctx,

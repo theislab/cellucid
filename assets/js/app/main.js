@@ -980,6 +980,42 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
       return expectedPublication;
     }
 
+    // An unconfirmed highlight selection is owned by the renderer (one unified
+    // candidate set shared by the lasso, proximity, and KNN tools) and by the
+    // highlight UI (the annotation candidate set plus every undo/redo stack).
+    // Neither belongs to DataState, so `state.initScene()` cannot clear them:
+    // a selection started on the outgoing dataset would survive replacement and
+    // be intersected with candidates from the incoming one, saving a highlight
+    // group of rows nobody ever selected. Every dataset replacement retires the
+    // selection first. The per-tool cancels publish their exact cancelled-step
+    // events, which is what resets the highlight UI's selection state, its step
+    // controls, and the preview highlight; the unified cancel clears the shared
+    // candidate set for the tool that is not currently active.
+    function retireInProgressHighlightSelection() {
+      const failures = [];
+      for (const retire of [
+        () => viewer.cancelAnnotationSelection(),
+        () => viewer.cancelLassoSelection(),
+        () => viewer.cancelProximitySelection(),
+        () => viewer.cancelKnnSelection(),
+        () => viewer.cancelUnifiedSelection()
+      ]) {
+        try {
+          retire();
+        } catch (error) {
+          failures.push(error);
+        }
+      }
+      const exactFailures = [...new Set(failures)];
+      if (exactFailures.length === 1) throw exactFailures[0];
+      if (exactFailures.length > 1) {
+        throw new AggregateError(
+          exactFailures,
+          'Dataset replacement failed to retire every in-progress highlight selection.'
+        );
+      }
+    }
+
     function publishEmptyDatasetRuntime({
       clearViews,
       restorationPublication = null
@@ -998,6 +1034,7 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
       if (restorationPublication !== null) {
         requireRestorablePublication(restorationPublication);
       }
+      retireInProgressHighlightSelection();
       ui?.prepareDatasetReplacement?.();
       EXPORT_BASE_URL = '';
       dimensionManager = createDimensionManager({ baseUrl: '' });
@@ -1104,6 +1141,15 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
         });
         const embeddingsMetadata = getEmbeddingsMetadata(generation.identity);
         candidateDimensionManager.initFromMetadata(embeddingsMetadata);
+        // The canonical cell axis has to be published after initFromMetadata,
+        // never at construction: initFromMetadata clears the cache and a cache
+        // clear resets nCells to 0. Without this the manager only learns the
+        // cell count from the first embedding it decodes, so that first payload
+        // is bounded by the 512 MiB browser ceiling while every later dimension
+        // is bounded exactly. loadDatasetGeneration has already proved this
+        // count against obs_manifest.json, var_manifest.json, and
+        // connectivity_manifest.json, so it is the dataset's exact cell axis.
+        candidateDimensionManager.nCells = generation.identity.stats.n_cells;
         const positionStage = await stageDatasetPositionPayload({
           generation,
           dimensionManager: candidateDimensionManager,
@@ -1111,14 +1157,24 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
           signal
         });
 
+        // Every obs and var payload is one value per cell, and the generation
+        // contract has already proved both manifests declare exactly
+        // stats.n_cells points. Passing that count turns each field fetch into
+        // an exact-length transport check instead of a 512 MiB ceiling.
         const fieldLoader = createObsFieldLoader(
           getObsManifestUrl(baseUrl),
-          { fetchInit: FAST_BINARY_FETCH_INIT }
+          {
+            fetchInit: FAST_BINARY_FETCH_INIT,
+            pointCount: generation.obsManifest.n_points
+          }
         );
         const varFieldLoader = generation.varManifest
           ? createVarFieldLoader(
               getVarManifestUrl(baseUrl),
-              { fetchInit: FAST_BINARY_FETCH_INIT }
+              {
+                fetchInit: FAST_BINARY_FETCH_INIT,
+                pointCount: generation.varManifest.n_points
+              }
             )
           : null;
         const vectorFieldManager = createVectorFieldManager({
@@ -1202,6 +1258,7 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
       // This function is intentionally synchronous. The reload transaction is
       // checked immediately before this sole publication call, so no newer
       // selection can interleave with the dataset-owned state replacement.
+      retireInProgressHighlightSelection();
       ui?.prepareDatasetReplacement?.();
       EXPORT_BASE_URL = stage.baseUrl;
       dimensionManager = stage.dimensionManager;
@@ -1261,6 +1318,7 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
       }
       const previousDimensionManager = dimensionManager;
       const previousRuntimeStage = activeRuntimeStage;
+      retireInProgressHighlightSelection();
       ui?.prepareDatasetReplacement?.();
       state.initSyntheticScene({
         positions: stage.positions,
@@ -3289,17 +3347,34 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
         });
       }
 
+      // Whether a dataset ships a neighbour graph is fixed for the whole life
+      // of its publication, so it is worth saying exactly once. The renderer
+      // asks for KNN edges when the mode is entered and again on every
+      // Alt+drag, so announcing the absence per call stacks identical toasts
+      // over one unchanged fact. This records the generation the absence was
+      // announced for; the next publication carries a different generation and
+      // therefore arms the announcement again, including for a dataset that
+      // still has no neighbour graph.
+      let announcedMissingConnectivityGeneration = null;
+
       // Set up KNN edge load callback - triggers when KNN mode needs edges
       // This loads edges on-demand when user first tries to use KNN drag
       viewer.setKnnEdgeLoadCallback(() => {
         if (connectivityManifest === null) {
-          console.warn(
-            '[Main] KNN mode requested but no connectivity manifest available'
-          );
-          notifications.warning(
-            'No neighbor graph available for this dataset',
-            { category: 'connectivity' }
-          );
+          if (
+            announcedMissingConnectivityGeneration !==
+            datasetPublicationGeneration
+          ) {
+            announcedMissingConnectivityGeneration =
+              datasetPublicationGeneration;
+            console.warn(
+              '[Main] KNN mode requested but no connectivity manifest available'
+            );
+            notifications.warning(
+              'No neighbor graph available for this dataset',
+              { category: 'connectivity' }
+            );
+          }
           return;
         }
         if (edgesLoaded && viewer.isKnnEdgesLoaded()) {
@@ -3425,6 +3500,19 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
           BenchmarkReporter = benchmarkModule.BenchmarkReporter;
           const PerformanceTrackerClass = benchmarkModule.PerformanceTracker;
           perfTracker = new PerformanceTrackerClass();
+          // The configuration-matrix harness is the only thing that can sweep
+          // LOD, culling and view count with per-frame upload counters, and it
+          // had no entry point in the running app at all: the page is served
+          // under `script-src 'self'` with a single hashed inline block, so an
+          // inline bootstrap is blocked and a console `import()` of a relative
+          // path has no base to resolve against. Publishing the loaded module
+          // namespace next to _cellucidViewer / _cellucidState is what makes
+          // `createBenchmarkHarness({ viewer, canvas })` reachable. Nothing in
+          // the module runs on import; the harness instruments the GL context
+          // only when it is explicitly created, so opening this panel does not
+          // put counters on the product's render path.
+          window._cellucidBenchmarkHarness =
+            await import('./ui/modules/benchmark/index.js');
           benchmarkModuleLoaded = true;
           debug.log('[Main] Benchmark module lazy-loaded');
           return true;

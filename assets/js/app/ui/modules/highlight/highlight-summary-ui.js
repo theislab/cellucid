@@ -104,7 +104,7 @@ export function initHighlightSummaryUI(options) {
     }
     const seenIds = new Set();
     for (const group of groups) {
-      requireHighlightGroup(group, 'Highlight group');
+      requireHighlightGroup(group, 'Highlight group', state.pointCount);
       if (seenIds.has(group.id)) {
         throw new TypeError(
           'Highlight group ids must be unique.'

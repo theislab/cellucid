@@ -8,13 +8,20 @@
  */
 
 import { debug } from '../../../../utils/debug.js';
-import { HIGHLIGHT_MODE_COPY } from './mode-copy.js';
-import { MAX_HISTORY_STEPS } from './selection-state.js';
+import {
+  abandonedGestureNotice,
+  HIGHLIGHT_MODE_COPY,
+  SELECTION_NOTICE,
+  selectionNoticeHtml
+} from './mode-copy.js';
+import { MAX_HISTORY_STEPS, selectionUnchanged } from './selection-state.js';
+import { getStepControls, removeStepControls } from './step-controls.js';
 import {
   deliverSelectionToJupyter,
   showSelectionDeliveryFailure
 } from './selection-notification.js';
 import {
+  requireCellIndex,
   requireCombineMode,
   requireCompletedSelectionEvent,
   requireDomElement,
@@ -68,7 +75,7 @@ export function initKnnSelection(options) {
     ]
   );
   requireJupyterSource(jupyterSource);
-  requireHighlightSelectionState(selectionState);
+  requireHighlightSelectionState(selectionState, state.pointCount);
   requireExactKeys(ui, ['modeDescriptionEl'], 'KNN selection UI');
   const highlightModeDescriptionEl = requireDomElement(
     ui.modeDescriptionEl,
@@ -107,7 +114,7 @@ export function initKnnSelection(options) {
 
   function handleKnnSelection(knnEvent) {
     if (destroyed) return;
-    requireCompletedSelectionEvent(knnEvent, 'knn');
+    requireCompletedSelectionEvent(knnEvent, 'knn', state.pointCount);
 
     const stepsLabel = knnEvent.steps > 1 ? ` (${knnEvent.steps} selections)` : '';
     const savedGroup = state.addHighlightDirect({
@@ -118,8 +125,9 @@ export function initKnnSelection(options) {
     requireSavedHighlightGroup(
       savedGroup,
       'knn',
-      knnEvent.cellCount,
-      'Saved KNN highlight group'
+      knnEvent.cellIndices,
+      'Saved KNN highlight group',
+      state.pointCount
     );
 
     debug.log(`[UI] KNN selected ${knnEvent.cellCount} cells from ${knnEvent.steps} selection(s)`);
@@ -144,13 +152,18 @@ export function initKnnSelection(options) {
     requireSelectionStepEvent(
       stepEvent,
       'knn',
+      state.pointCount,
       ['seedCellIndex', 'degree']
     );
+    if (stepEvent.abandoned !== undefined) {
+      renderKnnState(abandonedGestureNotice(stepEvent.abandoned));
+      return;
+    }
     if (stepEvent.cancelled !== true) {
-      requireSafeInteger(
+      requireCellIndex(
         stepEvent.seedCellIndex,
         'KNN step seedCellIndex',
-        0
+        state.pointCount
       );
       requireSafeInteger(stepEvent.degree, 'KNN step degree', 0);
     }
@@ -164,16 +177,33 @@ export function initKnnSelection(options) {
       return;
     }
 
-    if (selectionState.lastKnnCandidates !== null || selectionState.lastKnnStep > 0) {
-      selectionState.knnHistory.push({
-        candidates: selectionState.lastKnnCandidates ? [...selectionState.lastKnnCandidates] : null,
-        step: selectionState.lastKnnStep
-      });
-      if (selectionState.knnHistory.length > MAX_HISTORY_STEPS) {
-        selectionState.knnHistory.shift();
-      }
-      selectionState.knnRedoStack = [];
+    if (
+      selectionUnchanged(
+        selectionState.lastKnnCandidates,
+        stepEvent.candidates
+      )
+    ) {
+      // Roll the renderer's own step counter back, or the next real step is
+      // numbered as if this one had happened.
+      viewer.restoreKnnState(
+        selectionState.lastKnnCandidates,
+        selectionState.lastKnnStep
+      );
+      renderKnnState(SELECTION_NOTICE.unchanged);
+      return;
     }
+
+    // The empty state before the first step is recorded like any other, so
+    // Undo can reach it — the annotation tool has always done this, and a
+    // greyed-out Undo immediately after dragging reads as a broken control.
+    selectionState.knnHistory.push({
+      candidates: selectionState.lastKnnCandidates ? [...selectionState.lastKnnCandidates] : null,
+      step: selectionState.lastKnnStep
+    });
+    if (selectionState.knnHistory.length > MAX_HISTORY_STEPS) {
+      selectionState.knnHistory.shift();
+    }
+    selectionState.knnRedoStack = [];
 
     selectionState.lastKnnCandidates = [...stepEvent.candidates];
     selectionState.lastKnnStep = stepEvent.step;
@@ -248,6 +278,7 @@ export function initKnnSelection(options) {
     requireSelectionPreviewEvent(
       previewEvent,
       'knn',
+      state.pointCount,
       ['newCellCount', 'seedCellIndex', 'degree', 'mode']
     );
     requireSafeInteger(
@@ -255,10 +286,10 @@ export function initKnnSelection(options) {
       'KNN preview newCellCount',
       0
     );
-    requireSafeInteger(
+    requireCellIndex(
       previewEvent.seedCellIndex,
       'KNN preview seedCellIndex',
-      0
+      state.pointCount
     );
     requireSafeInteger(previewEvent.degree, 'KNN preview degree', 0);
     requireCombineMode(previewEvent.mode, 'KNN preview');
@@ -271,60 +302,63 @@ export function initKnnSelection(options) {
   }
 
   function getKnnControls() {
-    let controls = documentOwner.getElementById('knn-step-controls');
-    const created = controls === null;
-    if (created) {
-      controls = documentOwner.createElement('div');
-      controls.id = 'knn-step-controls';
-      controls.className = 'lasso-step-controls';
-      controls.innerHTML = `
-        <button type="button" class="btn-small lasso-confirm" id="knn-confirm-btn">Confirm</button>
-        <button type="button" class="btn-small btn-undo" id="knn-undo-btn" title="Undo">↩</button>
-        <button type="button" class="btn-small btn-redo" id="knn-redo-btn" title="Redo">↪</button>
-        <button type="button" class="btn-small lasso-cancel" id="knn-cancel-btn">Cancel</button>
-      `;
-      highlightModeDescriptionEl.parentElement.appendChild(controls);
-    }
-    const undoButton = requireDomElement(
-      documentOwner.getElementById('knn-undo-btn'),
-      'KNN undo button',
-      ['addEventListener']
-    );
-    const redoButton = requireDomElement(
-      documentOwner.getElementById('knn-redo-btn'),
-      'KNN redo button',
-      ['addEventListener']
-    );
-    const confirmButton = requireDomElement(
-      documentOwner.getElementById('knn-confirm-btn'),
-      'KNN confirm button',
-      ['addEventListener']
-    );
-    const cancelButton = requireDomElement(
-      documentOwner.getElementById('knn-cancel-btn'),
-      'KNN cancel button',
-      ['addEventListener']
-    );
-    if (created) {
-      listen(undoButton, 'click', handleKnnUndo);
-      listen(redoButton, 'click', handleKnnRedo);
-      listen(confirmButton, 'click', () => {
-        viewer.confirmKnnSelection();
-        state.clearPreviewHighlight();
-      });
-      listen(cancelButton, 'click', () => {
-        viewer.cancelKnnSelection();
-      });
-    }
-    return { undoButton, redoButton, confirmButton };
+    return getStepControls({
+      documentOwner,
+      tool: 'knn',
+      parent: highlightModeDescriptionEl.parentElement,
+      listen,
+      handlers: {
+        undo: handleKnnUndo,
+        redo: handleKnnRedo,
+        confirm: () => {
+          viewer.confirmKnnSelection();
+          state.clearPreviewHighlight();
+        },
+        cancel: () => {
+          viewer.cancelKnnSelection();
+        }
+      }
+    });
   }
 
-  function updateKnnUI(stepEvent) {
+  /**
+   * Re-publish what the tool already holds, with one explanatory notice.
+   *
+   * The live preview repaints the highlight as the degree grows with the drag,
+   * so a gesture that commits no step still has to restore the standing
+   * selection the preview painted over.
+   */
+  function renderKnnState(notice) {
+    const candidates = selectionState.lastKnnCandidates;
+    if (candidates === null) {
+      updateKnnUI(null, notice);
+      state.clearPreviewHighlight();
+      return;
+    }
+    if (candidates.length === 0) {
+      updateKnnUI({ step: 0, candidateCount: 0, keepControls: true }, notice);
+      state.clearPreviewHighlight();
+      return;
+    }
+    updateKnnUI({
+      step: selectionState.lastKnnStep,
+      candidateCount: candidates.length,
+      restored: true
+    }, notice);
+    state.setPreviewHighlightFromIndices(candidates);
+  }
+
+  function updateKnnUI(stepEvent, notice = '') {
     if (destroyed) return;
+    const noticeHtml = selectionNoticeHtml(notice);
     if (!stepEvent || (stepEvent.step === 0 && !stepEvent.keepControls)) {
-      highlightModeDescriptionEl.innerHTML = HIGHLIGHT_MODE_COPY.knn;
-      const existingControls = documentOwner.getElementById('knn-step-controls');
-      if (existingControls) existingControls.remove();
+      highlightModeDescriptionEl.innerHTML =
+        `${HIGHLIGHT_MODE_COPY.knn}${noticeHtml}`;
+      removeStepControls(
+        documentOwner,
+        'knn',
+        highlightModeDescriptionEl.parentElement
+      );
       return;
     }
 
@@ -337,7 +371,7 @@ export function initKnnSelection(options) {
       redoButton.disabled = selectionState.knnRedoStack.length === 0;
       confirmButton.disabled = true;
 
-      highlightModeDescriptionEl.innerHTML = stepInfo;
+      highlightModeDescriptionEl.innerHTML = `${stepInfo}${noticeHtml}`;
       return;
     }
 
@@ -362,12 +396,12 @@ export function initKnnSelection(options) {
     redoButton.disabled = selectionState.knnRedoStack.length === 0;
     confirmButton.disabled = stepEvent.candidateCount === 0;
 
-    highlightModeDescriptionEl.innerHTML = stepInfo;
+    highlightModeDescriptionEl.innerHTML = `${stepInfo}${noticeHtml}`;
   }
 
   function restoreKnnSelection(unifiedState) {
     if (destroyed) return;
-    requireUnifiedSelectionState(unifiedState);
+    requireUnifiedSelectionState(unifiedState, state.pointCount);
     selectionState.knnHistory = [];
     selectionState.knnRedoStack = [];
     selectionState.lastKnnCandidates = unifiedState.inProgress

@@ -489,6 +489,13 @@ export function tTest(group1, group2) {
     df
   } = computeWelchTTest(values1, values2);
 
+  // Both groups being constant does *not* land here: a zero standard error with
+  // equal means reports p = 1 and with unequal means reports p = 0. The only way
+  // `welchTTest` yields a non-finite probability once both groups hold at least
+  // two finite values is a sample moment that is itself not finite — a mean or a
+  // variance that overflowed to Infinity on extreme-magnitude input. Naming the
+  // real condition matters: this string is the interpretation the comparison UI
+  // shows the reader.
   if (!isFiniteNumber(pValue)) {
     return {
       testName: "Welch's t-test",
@@ -498,7 +505,8 @@ export function tTest(group1, group2) {
       effectSize: null,
       effectSizeType: null,
       df,
-      interpretation: 'Welch inference is undefined because both groups are constant'
+      interpretation:
+        'Welch inference is undefined because the sample moments are not finite'
     };
   }
 
@@ -560,25 +568,19 @@ export function mannWhitneyU(group1, group2) {
     };
   }
 
+  // Both samples are non-empty here, so the probability is always finite. A
+  // fully tied pool is the only degenerate case, and it is not undefined: every
+  // arrangement is equally extreme, the statistic equals its null mean, and the
+  // exact permutation probability is 1 — which is what `mannWhitneyU` returns.
+  // The exact branch is a ratio of counts and the asymptotic branch has a
+  // strictly positive tie-corrected variance whenever the pool is not fully
+  // tied, so neither can produce NaN.
   const {
     statistic: U,
     pValue,
     pValueMethod,
     u1
   } = computeMannWhitneyU(values1, values2);
-
-  if (!isFiniteNumber(pValue)) {
-    return {
-      testName: 'Mann-Whitney U',
-      statistic: U,
-      pValue,
-      significance: 'N/A',
-      effectSize: null,
-      effectSizeType: null,
-      pValueMethod: 'Asymptotic (tie/continuity corrected)',
-      interpretation: 'Mann-Whitney inference is undefined because all values are tied'
-    };
-  }
 
   // Effect size: rank-biserial correlation
   const rbc = (2 * u1) / (n1 * n2) - 1;
@@ -1050,84 +1052,189 @@ export function formatStatisticalResult(result) {
 // ============================================================================
 
 /**
+ * Benjamini-Hochberg step-up kernel — the single implementation of the
+ * procedure in the analysis module.
+ *
+ * `entries` must be `{ index, pValue }` records whose p-values are already
+ * known to be finite and in [0, 1]. It is sorted in place by ascending p-value
+ * and then ascending index, so tied p-values resolve deterministically.
+ * `assign(index, adjustedPValue)` is called once per entry.
+ *
+ * The running minimum is carried unclamped and only the emitted value is
+ * clamped to 1, so a saturated large rank can never drag a smaller rank up.
+ * That is what makes the output match R's `p.adjust(method = "BH")`, including
+ * on ties (tied p-values necessarily receive the same adjusted value, because
+ * `p * m / k` is decreasing in `k` for equal `p`).
+ *
+ * Every exported Benjamini-Hochberg wrapper below routes through this kernel;
+ * the wrappers differ only in input validation, in what they do with
+ * non-finite p-values, and in the shape they return.
+ *
+ * @param {{ index: number, pValue: number }[]} entries
+ * @param {(index: number, adjustedPValue: number) => void} assign
+ */
+function benjaminiHochbergStepUp(entries, assign) {
+  const m = entries.length;
+  if (m === 0) return;
+
+  entries.sort((a, b) => a.pValue - b.pValue || a.index - b.index);
+
+  // Start from the largest p-value: its adjusted value is p * m / m = p.
+  let runningMin = entries[m - 1].pValue;
+  assign(entries[m - 1].index, Math.min(runningMin, 1));
+
+  for (let rank = m - 2; rank >= 0; rank--) {
+    const rawAdjusted = entries[rank].pValue * m / (rank + 1);
+    if (rawAdjusted < runningMin) runningMin = rawAdjusted;
+    assign(entries[rank].index, Math.min(runningMin, 1));
+  }
+}
+
+/**
  * Benjamini-Hochberg procedure for FDR correction
  * Controls the false discovery rate at a specified level
  *
+ * Every p-value must be present and testable: a non-finite entry is rejected
+ * rather than skipped, because the caller declares the family it is correcting
+ * by what it passes in.
+ *
  * @param {number[]} pValues - Array of p-values
  * @param {number} [alpha=0.05] - Desired FDR level
- * @returns {Object} { adjustedPValues: number[], significant: boolean[], threshold: number }
+ * @returns {Object} { adjustedPValues: number[], significant: boolean[], threshold: number|null, significantCount: number }
  */
 export function benjaminiHochberg(pValues, alpha = 0.05) {
   requireNumericArrayLike(pValues, 'Benjamini-Hochberg p-values');
   requireAlpha(alpha);
-  for (let index = 0; index < pValues.length; index++) {
+
+  const m = pValues.length;
+  const entries = new Array(m);
+  for (let index = 0; index < m; index++) {
     requireProbability(
       pValues[index],
       `Benjamini-Hochberg p-value ${index + 1}`
     );
-  }
-  if (pValues.length === 0) {
-    return {
-      adjustedPValues: [],
-      significant: [],
-      threshold: null,
-      significantCount: 0
-    };
+    entries[index] = { index, pValue: pValues[index] };
   }
 
-  const n = pValues.length;
+  const adjustedPValues = new Array(m).fill(null);
+  const significant = new Array(m).fill(false);
+  let significantCount = 0;
 
-  // Create indexed array for sorting
-  const indexed = Array.from(pValues, (p, i) => ({
-    pValue: p,
-    originalIndex: i
-  }));
-  const m = indexed.length;
-
-  // Sort p-values
-  indexed.sort((a, b) => a.pValue - b.pValue);
-
-  // Calculate adjusted p-values using step-up procedure
-  const adjustedValid = new Array(m);
-
-  // Start from the largest p-value
-  adjustedValid[m - 1] = indexed[m - 1].pValue;
-
-  for (let i = m - 2; i >= 0; i--) {
-    // Adjusted p = min(p * m / (i+1), previous adjusted p)
-    const rawAdjusted = indexed[i].pValue * m / (i + 1);
-    adjustedValid[i] = Math.min(rawAdjusted, adjustedValid[i + 1]);
-  }
-
-  // Ensure adjusted p-values don't exceed 1
-  for (let i = 0; i < m; i++) {
-    adjustedValid[i] = Math.min(adjustedValid[i], 1);
-  }
-
-  // Find BH threshold
-  let threshold = null;
-  for (let i = 0; i < m; i++) {
-    const criticalValue = (i + 1) * alpha / m;
-    if (indexed[i].pValue <= criticalValue) {
-      threshold = indexed[i].pValue;
+  benjaminiHochbergStepUp(entries, (index, adjusted) => {
+    adjustedPValues[index] = adjusted;
+    if (adjusted <= alpha) {
+      significant[index] = true;
+      significantCount++;
     }
-  }
+  });
 
-  // Map back to original indices
-  const adjustedPValues = new Array(n).fill(null);
-  const significant = new Array(n).fill(false);
-
-  for (let i = 0; i < m; i++) {
-    const origIdx = indexed[i].originalIndex;
-    adjustedPValues[origIdx] = adjustedValid[i];
-    significant[origIdx] = adjustedValid[i] <= alpha;
+  // `entries` is sorted ascending by now: the BH threshold is the largest
+  // ordered p-value that still satisfies p(k) <= k * alpha / m.
+  let threshold = null;
+  for (let rank = 0; rank < m; rank++) {
+    const criticalValue = (rank + 1) * alpha / m;
+    if (entries[rank].pValue <= criticalValue) {
+      threshold = entries[rank].pValue;
+    }
   }
 
   return {
     adjustedPValues,
     significant,
     threshold,
-    significantCount: significant.filter(s => s).length
+    significantCount
+  };
+}
+
+/**
+ * Select the members of the correcting family from a batch of p-values.
+ *
+ * A gene that never reached a test carries `NaN`. It is not a member of the
+ * family being corrected, so it is left out of the entry list and therefore out
+ * of the denominator `m`. A finite p-value outside [0, 1] is a genuinely broken
+ * probability and still throws, so a defect can never be quietly reclassified as
+ * "untestable".
+ *
+ * @param {number[]|Float64Array} pValues
+ * @returns {{ index: number, pValue: number }[]}
+ */
+function benjaminiHochbergFamily(pValues) {
+  const entries = [];
+  for (let index = 0; index < pValues.length; index++) {
+    const pValue = pValues[index];
+    if (!Number.isFinite(pValue)) continue;
+    requireProbability(pValue, `Benjamini-Hochberg p-value ${index + 1}`);
+    entries.push({ index, pValue });
+  }
+  return entries;
+}
+
+/**
+ * Benjamini-Hochberg adjusted p-values in a dense Float64 lane.
+ *
+ * This is the marker-discovery hot path: one lane per group, one slot per gene
+ * in the panel. The container is a `Float64Array` so that finite extreme tails
+ * (p ~ 1e-300) stay distinguishable and no per-gene wrapper object survives the
+ * call — see `benjaminiHochbergTestable` for the same procedure over a boxed
+ * result list.
+ *
+ * A group that held fewer cells with a measured value than the test needs
+ * produces no p-value for that gene. Those slots are `NaN` on the way in and
+ * stay `NaN` on the way out: an untested gene is not a gene with p = 1, it is
+ * not in the family, and it must not inflate `m`. `testedCount` is exactly the
+ * denominator the correction used and `untestableCount` is the remainder, so
+ * the reported FDR can be reconstructed from what the panel shows.
+ *
+ * @param {number[]|Float64Array} pValues
+ * @returns {{ adjustedPValues: Float64Array, testedCount: number, untestableCount: number }}
+ */
+export function benjaminiHochbergAdjusted(pValues) {
+  requireNumericArrayLike(pValues, 'Benjamini-Hochberg p-values');
+
+  const total = pValues.length;
+  const adjustedPValues = new Float64Array(total);
+  adjustedPValues.fill(NaN);
+  const entries = benjaminiHochbergFamily(pValues);
+
+  const testedCount = entries.length;
+  benjaminiHochbergStepUp(entries, (index, adjusted) => {
+    adjustedPValues[index] = adjusted;
+  });
+
+  return {
+    adjustedPValues,
+    testedCount,
+    untestableCount: total - testedCount
+  };
+}
+
+/**
+ * Benjamini-Hochberg over the testable subset of a batch, as a boxed list.
+ *
+ * Differential expression returns a row object per gene, so the adjusted value
+ * travels as `number|null` alongside the row rather than in a typed lane. The
+ * family selection, the denominator and the counts are identical to
+ * `benjaminiHochbergAdjusted`; only the container differs.
+ *
+ * @param {number[]|Float64Array} pValues
+ * @returns {{ adjustedPValues: (number|null)[], testedCount: number, untestableCount: number }}
+ */
+export function benjaminiHochbergTestable(pValues) {
+  requireNumericArrayLike(pValues, 'Benjamini-Hochberg p-values');
+
+  const total = pValues.length;
+  const adjustedPValues = new Array(total).fill(null);
+  const entries = benjaminiHochbergFamily(pValues);
+
+  const testedCount = entries.length;
+  benjaminiHochbergStepUp(entries, (index, adjusted) => {
+    adjustedPValues[index] = adjusted;
+  });
+
+  return {
+    adjustedPValues,
+    testedCount,
+    untestableCount: total - testedCount
   };
 }
 
@@ -1575,6 +1682,8 @@ export default {
   oneWayANOVA,
   kruskalWallis,
   benjaminiHochberg,
+  benjaminiHochbergAdjusted,
+  benjaminiHochbergTestable,
   bonferroniCorrection,
   applyMultipleTestingCorrection,
   confidenceInterval,

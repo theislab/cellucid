@@ -33,13 +33,23 @@ class FakeElement {
     this.children = [];
     this.parentNode = null;
     this.dataset = {};
+    this.attributes = new Map();
     this.classList = new FakeClassList();
     this.listeners = new Map();
     this.disabled = false;
+    this.hidden = false;
     this.selected = false;
     this.textContent = '';
     this.title = '';
     this.value = '';
+  }
+
+  setAttribute(name, value) {
+    this.attributes.set(name, String(value));
+  }
+
+  getAttribute(name) {
+    return this.attributes.has(name) ? this.attributes.get(name) : null;
   }
 
   addEventListener(type, listener, options = {}) {
@@ -188,6 +198,7 @@ async function settleDatasetEvent() {
 class FakeDatasetManager {
   constructor(catalog) {
     this.catalog = catalog;
+    this.catalogCalls = [];
     this.activeDatasetId = null;
     this.activeSourceType = null;
     this.activeMetadata = null;
@@ -196,7 +207,8 @@ class FakeDatasetManager {
     this.switchError = null;
   }
 
-  async getAllDatasets() {
+  async getAllDatasets(options) {
+    this.catalogCalls.push(options === undefined ? null : options);
     if (this.catalog instanceof Error) throw this.catalog;
     return this.catalog;
   }
@@ -328,6 +340,10 @@ function makeHarness(catalog) {
   const fakeDocument = new FakeDocument();
   const browser = installBrowserGlobals(fakeDocument);
   const select = new FakeSelect(fakeDocument);
+  // The real markup wraps the selector in its own control block; the recovery
+  // notice is mounted there, next to the selector it explains.
+  const selectBlock = new FakeElement('div', fakeDocument);
+  selectBlock.appendChild(select);
   const info = new FakeElement('section', fakeDocument);
   const dom = {
     select,
@@ -412,6 +428,20 @@ function makeHarness(catalog) {
     },
     clearCalls,
     select,
+    selectBlock,
+    catalogNotice: () => {
+      const notices = selectBlock.children.filter(
+        child => child !== select
+      );
+      assert.equal(
+        notices.length,
+        1,
+        'the selector block must own exactly one catalog notice'
+      );
+      const [notice] = notices;
+      const [messageEl, retryButton] = notice.children;
+      return { notice, messageEl, retryButton };
+    },
     state,
     stateCalls,
     statuses,
@@ -450,7 +480,8 @@ test('dataset teardown drains a rejected reload without publishing stale UI', as
   const harness = makeHarness([
     {
       sourceType: 'local-user',
-      datasets: [current, target]
+      datasets: [current, target],
+      error: null
     }
   ]);
   t.after(harness.browser.restore);
@@ -521,8 +552,8 @@ test('catalog keeps None explicit and distinguishes equal ids across sources', a
   const first = makeIdentity('shared', 'First', 0);
   const second = makeIdentity('shared', 'Second', 12);
   const harness = makeHarness([
-    { sourceType: 'local-user', datasets: [first] },
-    { sourceType: 'jupyter', datasets: [second] }
+    { sourceType: 'local-user', datasets: [first], error: null },
+    { sourceType: 'jupyter', datasets: [second], error: null }
   ]);
   t.after(harness.browser.restore);
   const { initDatasetControls, NONE_DATASET_VALUE } = await import(moduleUrl);
@@ -588,7 +619,7 @@ test('an empty catalog publishes the exact ready outcome and leaves None usable'
 test('an older catalog request publishes superseded without disturbing the newer catalog', async t => {
   const metadata = makeIdentity('current', 'Current dataset', 12);
   const catalog = [
-    { sourceType: 'local-demo', datasets: [metadata] }
+    { sourceType: 'local-demo', datasets: [metadata], error: null }
   ];
   const harness = makeHarness(catalog);
   t.after(harness.browser.restore);
@@ -658,7 +689,7 @@ test('catalog failure remains visible and disables ambiguous selection', async t
 test('catalog publication replaces an in-flight exact dataset event atomically', async t => {
   const metadata = makeIdentity('in-flight', 'In flight');
   const catalog = [
-    { sourceType: 'local-user', datasets: [metadata] }
+    { sourceType: 'local-user', datasets: [metadata], error: null }
   ];
   const harness = makeHarness(catalog);
   t.after(harness.browser.restore);
@@ -698,7 +729,7 @@ test('catalog publication replaces an in-flight exact dataset event atomically',
 test('selection reloads in place and None clears every exact runtime owner', async t => {
   const metadata = makeIdentity('local', 'Local data', 0);
   const harness = makeHarness([
-    { sourceType: 'local-user', datasets: [metadata] }
+    { sourceType: 'local-user', datasets: [metadata], error: null }
   ]);
   t.after(harness.browser.restore);
   const { initDatasetControls, NONE_DATASET_VALUE } = await import(moduleUrl);
@@ -765,7 +796,7 @@ test('selection reloads in place and None clears every exact runtime owner', asy
 test('a superseded None selection remains owned by the newer dataset intent', async t => {
   const metadata = makeIdentity('current', 'Current');
   const harness = makeHarness([
-    { sourceType: 'local-user', datasets: [metadata] }
+    { sourceType: 'local-user', datasets: [metadata], error: null }
   ]);
   t.after(harness.browser.restore);
   const {
@@ -806,7 +837,8 @@ test('an older DOM selection settlement cannot mutate a newer pending selection'
   const harness = makeHarness([
     {
       sourceType: 'local-user',
-      datasets: [current, first, second]
+      datasets: [current, first, second],
+      error: null
     }
   ]);
   t.after(harness.browser.restore);
@@ -880,7 +912,8 @@ test('selecting the committed dataset retires an older pending DOM intent', asyn
   const harness = makeHarness([
     {
       sourceType: 'local-user',
-      datasets: [current, pendingMetadata]
+      datasets: [current, pendingMetadata],
+      error: null
     }
   ]);
   t.after(harness.browser.restore);
@@ -934,7 +967,7 @@ test('selecting the committed dataset retires an older pending DOM intent', asyn
 test('DOM switch failure rolls back selection and preserves terminal error styling', async t => {
   const metadata = makeIdentity('broken', 'Broken');
   const harness = makeHarness([
-    { sourceType: 'local-user', datasets: [metadata] }
+    { sourceType: 'local-user', datasets: [metadata], error: null }
   ]);
   t.after(harness.browser.restore);
   const { initDatasetControls, NONE_DATASET_VALUE } = await import(moduleUrl);
@@ -966,7 +999,7 @@ test('DOM switch failure rolls back selection and preserves terminal error styli
 test('DOM None and malformed failures preserve rollback error styling', async t => {
   const metadata = makeIdentity('current', 'Current');
   const harness = makeHarness([
-    { sourceType: 'local-user', datasets: [metadata] }
+    { sourceType: 'local-user', datasets: [metadata], error: null }
   ]);
   t.after(harness.browser.restore);
   harness.manager.activeDatasetId = metadata.id;
@@ -1018,7 +1051,7 @@ test('DOM None and malformed failures preserve rollback error styling', async t 
 test('terminal switch and malformed event failures are not guessed or hidden', async t => {
   const metadata = makeIdentity('broken', 'Broken');
   const harness = makeHarness([
-    { sourceType: 'local-user', datasets: [metadata] }
+    { sourceType: 'local-user', datasets: [metadata], error: null }
   ]);
   t.after(harness.browser.restore);
   const { initDatasetControls } = await import(moduleUrl);
@@ -1055,5 +1088,302 @@ test('terminal switch and malformed event failures are not guessed or hidden', a
       legacyDataset: null
     }),
     /must contain exactly/
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Per-source catalog failure and recovery
+// ---------------------------------------------------------------------------
+// getAllDatasets() reports one record per probed source. A source that failed
+// carries an Error and no datasets; a source that is merely unavailable is not
+// reported at all. The selector must keep listing the sources that answered,
+// say plainly which one did not, and offer the retry that clears the cached
+// failure -- without that retry the only recovery is a page reload.
+
+test('a failed source is named next to the selector while healthy sources still list', async t => {
+  const metadata = makeIdentity('local', 'Local dataset', 20);
+  const harness = makeHarness([
+    {
+      sourceType: 'local-demo',
+      datasets: [],
+      error: new Error(
+        'Sample catalog https://catalog.cellucid.test/datasets.json: ' +
+        'CORS owner rejected the request'
+      )
+    },
+    { sourceType: 'local-user', datasets: [metadata], error: null }
+  ]);
+  t.after(harness.browser.restore);
+  const { initDatasetControls } = await import(moduleUrl);
+  const controls = initDatasetControls({
+    dom: harness.dom,
+    dataSourceManager: harness.manager,
+    clearDataset: harness.clearDataset,
+    reloadDataset: harness.reloadDataset,
+    callbacks: harness.callbacks
+  });
+
+  assert.deepEqual(await controls.catalogReady, { status: 'ready' });
+  assert.equal(harness.select.disabled, false);
+  assert.deepEqual(
+    harness.select.options.map(option => option.value),
+    ['__none__', 'dataset:local-user:local'],
+    'one unreachable catalog must not remove the sources that answered'
+  );
+
+  const { notice, messageEl, retryButton } = harness.catalogNotice();
+  assert.equal(notice.hidden, false);
+  assert.equal(notice.getAttribute('role'), 'status');
+  assert.equal(notice.classList.contains('dataset-info'), true);
+  assert.match(messageEl.textContent, /Sample datasets could not be loaded/);
+  assert.doesNotMatch(
+    messageEl.textContent,
+    /CORS|https:|Error/,
+    'the notice must not quote the transport diagnostic at a biologist'
+  );
+  assert.match(messageEl.textContent, /try again/i);
+  assert.equal(retryButton.tagName, 'BUTTON');
+  assert.equal(retryButton.textContent, 'Try again');
+  assert.equal(retryButton.disabled, false);
+  assert.equal(harness.dom.info.classList.contains('error'), false);
+  assert.deepEqual(harness.manager.catalogCalls, [{ refresh: false }]);
+});
+
+test('an unavailable source is never announced as a failure', async t => {
+  const metadata = makeIdentity('local', 'Local dataset', 20);
+  // An unavailable source produces no record at all, so the only entry here is
+  // the healthy one and nothing must be said about anything else.
+  const harness = makeHarness([
+    { sourceType: 'local-user', datasets: [metadata], error: null }
+  ]);
+  t.after(harness.browser.restore);
+  const { initDatasetControls } = await import(moduleUrl);
+  const controls = initDatasetControls({
+    dom: harness.dom,
+    dataSourceManager: harness.manager,
+    clearDataset: harness.clearDataset,
+    reloadDataset: harness.reloadDataset,
+    callbacks: harness.callbacks
+  });
+
+  assert.deepEqual(await controls.catalogReady, { status: 'ready' });
+  const { notice, messageEl } = harness.catalogNotice();
+  assert.equal(notice.hidden, true);
+  assert.equal(messageEl.textContent, '');
+});
+
+test('the notice retry clears the cached failure and reports its outcome', async t => {
+  const metadata = makeIdentity('sample', 'Sample dataset', 44);
+  const failedCatalog = [
+    {
+      sourceType: 'local-demo',
+      datasets: [],
+      error: new Error('catalog host unreachable')
+    }
+  ];
+  const healedCatalog = [
+    { sourceType: 'local-demo', datasets: [metadata], error: null }
+  ];
+  const harness = makeHarness(failedCatalog);
+  t.after(harness.browser.restore);
+  const catalogRequests = [];
+  let pendingCatalog = null;
+  harness.manager.getAllDatasets = options => {
+    catalogRequests.push(options === undefined ? null : options);
+    return new Promise(resolve => {
+      pendingCatalog = resolve;
+    });
+  };
+
+  const { initDatasetControls } = await import(moduleUrl);
+  const controls = initDatasetControls({
+    dom: harness.dom,
+    dataSourceManager: harness.manager,
+    clearDataset: harness.clearDataset,
+    reloadDataset: harness.reloadDataset,
+    callbacks: harness.callbacks
+  });
+  pendingCatalog(failedCatalog);
+  assert.deepEqual(await controls.catalogReady, { status: 'ready' });
+  assert.deepEqual(catalogRequests, [{ refresh: false }]);
+
+  const { notice, messageEl, retryButton } = harness.catalogNotice();
+  assert.equal(notice.hidden, false);
+  assert.match(messageEl.textContent, /Sample datasets could not be loaded/);
+
+  retryButton.listeners.get('click')();
+  assert.deepEqual(
+    catalogRequests,
+    [{ refresh: false }, { refresh: true }],
+    'the retry must be the refreshing pass that clears the cached failure'
+  );
+  assert.equal(
+    notice.hidden,
+    false,
+    'the affordance must stay put while its own retry is in flight'
+  );
+  assert.equal(retryButton.disabled, true);
+  assert.equal(retryButton.textContent, 'Retrying…');
+  assert.equal(harness.select.disabled, true);
+
+  pendingCatalog(healedCatalog);
+  await settleDatasetEvent();
+
+  assert.equal(notice.hidden, true);
+  assert.equal(retryButton.disabled, false);
+  assert.equal(retryButton.textContent, 'Try again');
+  assert.equal(harness.select.disabled, false);
+  assert.deepEqual(
+    harness.select.options.map(option => option.value),
+    ['__none__', 'dataset:local-demo:sample']
+  );
+  assert.deepEqual(harness.statuses.at(-1), {
+    message: 'Dataset list reloaded',
+    isError: false
+  });
+});
+
+test('a retry that fails again says so instead of settling silently', async t => {
+  const failedCatalog = [
+    {
+      sourceType: 'local-demo',
+      datasets: [],
+      error: new Error('catalog host unreachable')
+    },
+    {
+      sourceType: 'github-repo',
+      datasets: [],
+      error: new Error('rate limited')
+    }
+  ];
+  const harness = makeHarness(failedCatalog);
+  t.after(harness.browser.restore);
+  const { initDatasetControls } = await import(moduleUrl);
+  const controls = initDatasetControls({
+    dom: harness.dom,
+    dataSourceManager: harness.manager,
+    clearDataset: harness.clearDataset,
+    reloadDataset: harness.reloadDataset,
+    callbacks: harness.callbacks
+  });
+  assert.deepEqual(await controls.catalogReady, { status: 'ready' });
+
+  const { messageEl, retryButton } = harness.catalogNotice();
+  assert.match(
+    messageEl.textContent,
+    /Sample datasets and GitHub data could not be loaded/,
+    'every failed source must be named, in the words the dropdown uses'
+  );
+  assert.equal(harness.select.value, '__none__');
+  assert.deepEqual(
+    harness.select.options.map(option => option.value),
+    ['__none__', '__catalog_empty__']
+  );
+
+  retryButton.listeners.get('click')();
+  await settleDatasetEvent();
+  assert.deepEqual(
+    harness.manager.catalogCalls,
+    [{ refresh: false }, { refresh: true }]
+  );
+  assert.equal(retryButton.disabled, false);
+  assert.equal(retryButton.textContent, 'Try again');
+  assert.deepEqual(harness.statuses.at(-1), {
+    message: messageEl.textContent,
+    isError: true
+  });
+});
+
+test('a total catalog failure offers the retry instead of a page reload', async t => {
+  const harness = makeHarness(new Error('catalog offline'));
+  t.after(harness.browser.restore);
+  const { initDatasetControls } = await import(moduleUrl);
+  const controls = initDatasetControls({
+    dom: harness.dom,
+    dataSourceManager: harness.manager,
+    clearDataset: harness.clearDataset,
+    reloadDataset: harness.reloadDataset,
+    callbacks: harness.callbacks
+  });
+
+  const catalogOutcome = await controls.catalogReady;
+  assert.equal(catalogOutcome.status, 'failed');
+  const { notice, messageEl, retryButton } = harness.catalogNotice();
+  assert.equal(notice.hidden, false);
+  assert.match(messageEl.textContent, /dataset list could not be loaded/i);
+  assert.doesNotMatch(messageEl.textContent, /catalog offline/);
+  assert.equal(retryButton.disabled, false);
+
+  const metadata = makeIdentity('sample', 'Sample dataset', 9);
+  harness.manager.catalog = [
+    { sourceType: 'local-demo', datasets: [metadata], error: null }
+  ];
+  retryButton.listeners.get('click')();
+  await settleDatasetEvent();
+
+  assert.deepEqual(
+    harness.manager.catalogCalls,
+    [{ refresh: false }, { refresh: true }]
+  );
+  assert.equal(notice.hidden, true);
+  assert.equal(harness.select.disabled, false);
+  assert.deepEqual(
+    harness.select.options.map(option => option.value),
+    ['__none__', 'dataset:local-demo:sample']
+  );
+});
+
+test('destroy retires the notice so no dead retry stays on screen', async t => {
+  const harness = makeHarness([
+    {
+      sourceType: 'local-demo',
+      datasets: [],
+      error: new Error('catalog host unreachable')
+    }
+  ]);
+  t.after(harness.browser.restore);
+  const { initDatasetControls } = await import(moduleUrl);
+  const controls = initDatasetControls({
+    dom: harness.dom,
+    dataSourceManager: harness.manager,
+    clearDataset: harness.clearDataset,
+    reloadDataset: harness.reloadDataset,
+    callbacks: harness.callbacks
+  });
+  await controls.catalogReady;
+  const { notice, retryButton } = harness.catalogNotice();
+  assert.equal(notice.hidden, false);
+
+  await controls.destroy();
+  assert.equal(notice.hidden, true);
+  assert.equal(retryButton.listeners.has('click'), false);
+  retryButton.listeners.set('click', () => {});
+  assert.deepEqual(harness.manager.catalogCalls, [{ refresh: false }]);
+});
+
+test('the catalog contract rejects a source record that reports both datasets and a failure', async t => {
+  const metadata = makeIdentity('sample', 'Sample dataset', 3);
+  const harness = makeHarness([
+    {
+      sourceType: 'local-demo',
+      datasets: [metadata],
+      error: new Error('half-failed')
+    }
+  ]);
+  t.after(harness.browser.restore);
+  const { initDatasetControls } = await import(moduleUrl);
+  const controls = initDatasetControls({
+    dom: harness.dom,
+    dataSourceManager: harness.manager,
+    clearDataset: harness.clearDataset,
+    reloadDataset: harness.reloadDataset,
+    callbacks: harness.callbacks
+  });
+
+  const outcome = await controls.catalogReady;
+  assert.equal(outcome.status, 'failed');
+  assert.match(
+    outcome.error.message,
+    /cannot report both datasets and a failure/
   );
 });

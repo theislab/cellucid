@@ -51,6 +51,141 @@ import { filterFiniteNumbers } from '../shared/number-utils.js';
 import { debugWarn } from '../shared/debug-utils.js';
 
 // =============================================================================
+// PAGE MEMBERSHIP DIGEST
+// =============================================================================
+//
+// A page's cache identity is the *set* of its cell indices — never its
+// cardinality and never a fixed-size sample of it. Two pages that differ by a
+// single cell must produce different digests, so every index is folded in.
+//
+// The digest is emitted as 32 lowercase hex characters (four 32-bit lanes).
+// Hex keeps the digest free of ':', ',', '|' and '@', which are the separators
+// used by the cache key formats and by `invalidatePages()`.
+
+/**
+ * Finalizing 32-bit avalanche mix (MurmurHash3 `fmix32` constants).
+ * @param {number} value
+ * @returns {number} Well-mixed uint32
+ */
+function mixDigestLane(value) {
+  let h = value >>> 0;
+  h ^= h >>> 16;
+  h = Math.imul(h, 0x85ebca6b);
+  h ^= h >>> 13;
+  h = Math.imul(h, 0xc2b2ae35);
+  h ^= h >>> 16;
+  return h >>> 0;
+}
+
+/**
+ * Create the four independent digest lanes with distinct offset bases.
+ * @returns {Uint32Array}
+ */
+function createDigestLanes() {
+  return new Uint32Array([0x811c9dc5, 0x9e3779b9, 0x85ebca6b, 0xc2b2ae35]);
+}
+
+/**
+ * Fold one 32-bit word into every lane.
+ *
+ * The lanes use different constructions (FNV-1a, a position-weighted
+ * polynomial, an avalanche mix, and a shifted multiply) so that a collision
+ * would have to occur in all four simultaneously.
+ *
+ * @param {Uint32Array} lanes
+ * @param {number} word
+ */
+function foldDigestWord(lanes, word) {
+  const w = word >>> 0;
+  lanes[0] = Math.imul(lanes[0] ^ w, 0x01000193);
+  lanes[1] = Math.imul(lanes[1], 0x27220a95) + w + 1;
+  lanes[2] = mixDigestLane(lanes[2] ^ Math.imul(w + 0x9e3779b9, 0x85ebca6b));
+  lanes[3] = Math.imul(lanes[3] ^ w, 0x1b873593) + (lanes[3] >>> 7);
+}
+
+/**
+ * Fold an exact non-negative safe integer (both halves, so nothing is lost).
+ * @param {Uint32Array} lanes
+ * @param {number} value
+ */
+function foldDigestNumber(lanes, value) {
+  foldDigestWord(lanes, value >>> 0);
+  foldDigestWord(lanes, Math.floor(value / 0x100000000) >>> 0);
+}
+
+/**
+ * Fold arbitrary text followed by a field separator.
+ * @param {Uint32Array} lanes
+ * @param {string} text
+ */
+function foldDigestText(lanes, text) {
+  for (let i = 0; i < text.length; i++) {
+    foldDigestWord(lanes, text.charCodeAt(i));
+  }
+  foldDigestWord(lanes, 0xffffffff);
+}
+
+/**
+ * Fold the exact cell index set, then its cardinality as a separate field.
+ * @param {Uint32Array} lanes
+ * @param {ArrayLike<number>} cellIndices - Deduplicated, ascending index set.
+ */
+function foldDigestIndexSet(lanes, cellIndices) {
+  const count = cellIndices.length;
+  foldDigestNumber(lanes, count);
+  for (let i = 0; i < count; i++) {
+    foldDigestNumber(lanes, cellIndices[i]);
+  }
+}
+
+/**
+ * Emit the finalized digest.
+ * @param {Uint32Array} lanes
+ * @returns {string} 32 lowercase hex characters
+ */
+function finalizeDigest(lanes) {
+  let out = '';
+  for (let i = 0; i < lanes.length; i++) {
+    out += mixDigestLane(lanes[i]).toString(16).padStart(8, '0');
+  }
+  return out;
+}
+
+/**
+ * Digest the exact per-cell category-code assignment a grouped analysis was
+ * computed over.
+ *
+ * Grouped analyses — marker discovery is the one that caches — are addressed by
+ * observation-field key, but a field's codes can be rewritten in place while the
+ * key stays the same: merging two categories and moving one to "unassigned" both
+ * do exactly that to a user-defined field. The key therefore does not identify
+ * the grouping, and a cache keyed on it alone would serve results computed for a
+ * different partition of the same cells — a plausible answer to a question
+ * nobody asked.
+ *
+ * Every code is folded, so two groupings differing in a single cell produce
+ * different digests. Cardinality is folded as its own field, so a grouping is
+ * never identified by how many cells it covers. The output is 32 lowercase hex
+ * characters, which keeps it free of the separators the cache key formats use.
+ *
+ * @param {Uint16Array} codes - Per-cell category codes (65535 = missing)
+ * @returns {string} 32 lowercase hex characters
+ */
+export function computeCategoryGroupingDigest(codes) {
+  if (!(codes instanceof Uint16Array) || codes.length === 0) {
+    throw new TypeError(
+      'Category grouping digest requires a non-empty Uint16Array of per-cell codes'
+    );
+  }
+  const lanes = createDigestLanes();
+  foldDigestNumber(lanes, codes.length);
+  for (let index = 0; index < codes.length; index++) {
+    foldDigestWord(lanes, codes[index]);
+  }
+  return finalizeDigest(lanes);
+}
+
+// =============================================================================
 // TYPE DEFINITIONS
 // =============================================================================
 
@@ -1329,17 +1464,35 @@ export class DataLayer {
     const { type, variableKey, pageIds } = options;
     const sortedPageIds = [...pageIds].sort();
 
-    // Include page version hashes for cache correctness
+    // Include page version digests for cache correctness
     if (this._pageVersions) {
-      const versionHashes = sortedPageIds.map(id => this._getPageVersion(id));
-      const versionKey = versionHashes.map(h => {
-        const parts = h.split(':');
-        return `${parts[0]}@${parts[1] || 'e'}`;
-      }).join('|');
-      return `${type}:${variableKey}:${sortedPageIds.join(',')}:v=${versionKey}`;
+      return `${type}:${variableKey}:${sortedPageIds.join(',')}`
+        + `:v=${this._buildVersionKey(sortedPageIds)}`;
     }
 
     return `${type}:${variableKey}:${sortedPageIds.join(',')}`;
+  }
+
+  /**
+   * Build the version component shared by every cache key format.
+   *
+   * Each page contributes its *complete* version digest as `pageId@digest`.
+   * Nothing is sampled and nothing is truncated, so pages whose cell sets
+   * differ can never collapse onto the same component — including cell sets of
+   * identical cardinality.
+   *
+   * @param {string[]} sortedPageIds - Page IDs, already sorted and unique
+   * @returns {string} A ':'-free version component
+   * @private
+   */
+  _buildVersionKey(sortedPageIds) {
+    return sortedPageIds.map(pageId => {
+      const hash = this._getPageVersion(pageId);
+      const separator = hash.indexOf(':');
+      return separator === -1
+        ? `${pageId}@${hash}`
+        : `${hash.slice(0, separator)}@${hash.slice(separator + 1)}`;
+    }).join('|');
   }
 
   /**
@@ -1354,31 +1507,36 @@ export class DataLayer {
   }
 
   /**
-   * Compute a hash for page cell indices
+   * Compute the exact version hash for a page.
+   *
+   * The hash is `pageId:digest`, where the digest covers the page name and
+   * *every* cell index in the page's exact (deduplicated, ascending) index set
+   * — the same set analysis results are computed over. Nothing is sampled, so
+   * a page whose membership changes always changes its hash, even when its
+   * cell count is unchanged.
+   *
    * @param {string} pageId - Page ID
-   * @returns {string} Hash of the page state
+   * @returns {string} `pageId:digest`
    * @private
    */
   _computePageHash(pageId) {
+    const lanes = createDigestLanes();
+
+    if (isRestOfPageId(pageId)) {
+      // A derived "rest of" page is the exact complement of its base page
+      // within the dataset, so its identity is fully determined by the base
+      // page's version and the dataset size. Deriving it keeps the derived
+      // version exact without materialising the complement.
+      const baseId = getBasePageIdFromRestOf(pageId);
+      foldDigestText(lanes, baseId ? this._getPageVersion(baseId) : '');
+      foldDigestNumber(lanes, this.state?.pointCount || 0);
+      return `${pageId}:${finalizeDigest(lanes)}`;
+    }
+
     const pageName = this.getPages().find(p => p.id === pageId)?.name || '';
-    const cellIndices = this.getCellIndicesForPage(pageId);
-    if (!cellIndices || cellIndices.length === 0) {
-      return `${pageId}:empty:${pageName}`;
-    }
-
-    const count = cellIndices.length;
-    const firstFew = cellIndices.slice(0, Math.min(5, count));
-    const lastFew = cellIndices.slice(-Math.min(5, count));
-
-    let middleSample = [];
-    if (count > 100) {
-      const step = Math.floor(count / 10);
-      for (let i = step; i < count - step; i += step) {
-        middleSample.push(cellIndices[i]);
-      }
-    }
-
-    return `${pageId}:${count}:${pageName}:${firstFew.join(',')}:${lastFew.join(',')}:${middleSample.join(',')}`;
+    foldDigestText(lanes, pageName);
+    foldDigestIndexSet(lanes, this.getCellIndicesForPage(pageId));
+    return `${pageId}:${finalizeDigest(lanes)}`;
   }
 
   /**
@@ -1406,13 +1564,10 @@ export class DataLayer {
       return `${pageId}:notrack`;
     }
 
-    // Derived pages are not stored in the version map; derive a stable version cheaply.
+    // Derived pages are not stored in the version map; their exact version is
+    // derived from the base page's version on demand.
     if (isRestOfPageId(pageId)) {
-      const baseId = getBasePageIdFromRestOf(pageId);
-      const total = this.state?.pointCount || 0;
-      const baseCount = baseId ? this.getCellCountForPageId(baseId) : 0;
-      const count = Math.max(0, total - baseCount);
-      return `${pageId}:${count}`;
+      return this._computePageHash(pageId);
     }
 
     if (!this._pageVersions.has(pageId)) {
@@ -1471,23 +1626,19 @@ export class DataLayer {
 
     const pageIdSet = new Set(uniquePageIds);
 
+    // Both cache key formats end with the page IDs, optionally followed by a
+    // ':v=' version component:
+    //   data cache: type:variableKey:page_1,page_2[:v=...]
+    //   bulk genes: bulk_genes:page_1,page_2[:v=...]
     const keyReferencesAnyPage = (key) => {
       if (!key) return false;
 
-      // Bulk gene cache keys look like: bulk_genes:page_1,page_2
-      if (key.startsWith('bulk_genes:')) {
-        const idsPart = key.slice('bulk_genes:'.length);
-        const ids = idsPart.split(',').filter(Boolean);
-        return ids.some(id => pageIdSet.has(id));
-      }
-
-      // Data cache keys look like: type:variableKey:page_1,page_2[:v=...]
       const parts = key.split(':');
-      if (parts.length < 3) return false;
+      if (parts.length < 2) return false;
 
       const last = parts[parts.length - 1];
       const pageIdsPart = last.startsWith('v=') ? parts[parts.length - 2] : last;
-      const ids = pageIdsPart.split(',').filter(Boolean);
+      const ids = (pageIdsPart || '').split(',').filter(Boolean);
       return ids.some(id => pageIdSet.has(id));
     };
 
@@ -1718,13 +1869,24 @@ export class DataLayer {
 
   /**
    * Build a stable bulk-gene cache key without mutating caller-owned arrays.
+   *
+   * Carries the same complete page version component as `_getCacheKey()`, so a
+   * bulk-gene entry can never be served for a page whose cell membership has
+   * changed since it was computed.
+   *
    * @param {string[]} pageIds
    * @returns {string}
    * @private
    */
   _getBulkGeneCacheKey(pageIds) {
     const sortedUnique = Array.from(new Set(pageIds || [])).sort();
-    return `bulk_genes:${sortedUnique.join(',')}`;
+    const idsPart = sortedUnique.join(',');
+
+    if (this._pageVersions) {
+      return `bulk_genes:${idsPart}:v=${this._buildVersionKey(sortedUnique)}`;
+    }
+
+    return `bulk_genes:${idsPart}`;
   }
 
   // ===========================================================================
@@ -2248,6 +2410,12 @@ export class DataLayer {
       });
     }
     requireCurrentOwnership();
+
+    // This path can return cached expression values directly, so its key must
+    // be built from current page versions rather than the last-refreshed ones.
+    this.refreshPageVersions(
+      Array.from(new Set(ownedPageIds)).filter(id => !isRestOfPageId(id))
+    );
 
     const cacheKey = this._getBulkGeneCacheKey(ownedPageIds);
     const cached = this._getBulkGeneCache(cacheKey);

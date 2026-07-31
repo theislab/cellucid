@@ -10,6 +10,27 @@ By participating, you agree to follow the project’s Code of Conduct:
 If you’re reporting a security issue, please follow:
 - `SECURITY.md`
 
+## This file is the authoritative web-app guide
+
+Everything below — repository routing, bug reports, development setup, the code
+map, the coding rules, testing, and pull requests — is specified here, in the
+repository it describes.
+
+The documentation site carries a companion page,
+`cellucid-python/docs/contributing/web_app.md`. It is **not** a copy of this
+file and this file is not generated from it. That page owns only what exists on
+the documentation site: how to write and build the web-app documentation pages,
+and the conventions that span every Cellucid repository (the canonical
+`www.cellucid.com` versus bare-apex URL forms, and the `CELLUCID_VERSION`
+markers). Both of those apply when you change this repository, so read that
+page before touching a URL or a hardcoded version here.
+
+Where the two files reference the same page, they write it differently on
+purpose: this file is read on GitHub, so it uses repository-relative paths with
+their `.md` extension, while the documentation site uses Sphinx `{doc}` roles,
+which do not render on GitHub. That is a rendering difference, not a
+disagreement.
+
 ---
 
 ## Which repo should I contribute to?
@@ -25,7 +46,8 @@ Cellucid is split by responsibility:
 
 If you’re unsure where a bug belongs, open an issue in the repo you’re currently using and include:
 - where the UI ran (hosted app vs local app vs Jupyter iframe),
-- how data was loaded (exports vs `.h5ad`/`.zarr` vs remote server),
+- how data was loaded (Prepared, H5AD, Zarr ZIP, remote server, GitHub, or
+  Jupyter),
 - and the smallest reproduction you can share.
 
 ---
@@ -52,6 +74,11 @@ The main documentation site is built from `cellucid-python/docs/` and includes:
 - developer web app docs: `cellucid-python/docs/user_guide/web_app/p_developer_docs/`
 
 If you change UI/behavior, prefer updating docs there (so users can find it on ReadTheDocs).
+
+A documentation change is therefore a pull request against `cellucid-python`,
+not against this repository. How to write those pages, and how to build the
+site (`-W`, so warnings are errors), is in
+`cellucid-python/docs/contributing/web_app.md`.
 
 ### I want to contribute code
 
@@ -152,17 +179,26 @@ node scripts/validate-tokens.js
 
 ---
 
-## Testing & validation (manual is mandatory)
+## Testing & validation
 
-The web app does not yet have one comprehensive unit suite. Focused Analysis statistics regressions can be run with Node.js 18 or newer:
+Node.js 20 or newer is required (`package.json` sets `engines.node`). Install
+the exact dependencies once, then run the suites:
 
 ```bash
-node --test tests/statistical-tests.test.mjs
+npm ci
+npm test                    # every web contract in tests/*.test.mjs
+npm run test:browser        # Playwright suites in tests/browser/
+npm run test:worker-bundle  # dry-run build of the community-annotation Worker
 ```
 
-These focused tests do not replace manual smoke testing.
+`npm test` runs `scripts/run-web-tests.mjs`, which discovers every
+`tests/*.test.mjs` file and runs them under the Node.js test runner — so a new
+contract file is picked up by adding it, with nothing to register. These are
+the same commands `.github/workflows/test.yml` runs, across Node 20/22/24/26
+and chromium/firefox/webkit, so a green local run is the same check CI applies.
 
-Recommended checklist:
+Automated coverage does not replace manual smoke testing of the interactive
+surface. Run through this checklist for any change a user can see:
 - load a dataset (local-demo or local-user)
 - switch categorical/continuous/gene fields
 - apply filters and confirm visibility updates

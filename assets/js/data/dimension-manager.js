@@ -435,6 +435,12 @@ class DimensionManager {
       candidateAnnDataBinding: this.candidateAnnDataBinding,
       dimension: dim,
       displayName: `${dim}D cell positions`,
+      // Every dimension of one dataset shares its cell count, so the first
+      // loaded embedding fixes the exact byte length of all the others. Before
+      // any embedding has landed the browser byte ceiling is the only bound.
+      expectedBytes: this.nCells === 0
+        ? null
+        : this.nCells * dim * Float32Array.BYTES_PER_ELEMENT,
       progressTrackerId: trackerId,
       showProgress: false,
       signal: controller.signal,

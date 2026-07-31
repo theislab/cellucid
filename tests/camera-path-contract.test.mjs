@@ -5,8 +5,11 @@ import test from 'node:test';
 const keyframeModule = await import(
   '../assets/js/app/ui/modules/cinematic-camera/keyframe-store.js'
 );
-const { createPlaybackController } = await import(
+const { createPlaybackController, prefersReducedMotion } = await import(
   '../assets/js/app/ui/modules/cinematic-camera/playback-controller.js'
+);
+const { interpolateCameraState } = await import(
+  '../assets/js/app/ui/modules/cinematic-camera/interpolation-engine.js'
 );
 
 const cameraModuleSource = await readFile(
@@ -338,6 +341,117 @@ test('playback stops without moving when a path becomes invalid', () => {
       delete globalThis.cancelAnimationFrame;
     } else {
       globalThis.cancelAnimationFrame = originalCancelAnimationFrame;
+    }
+  }
+});
+
+test('a reduced-motion preference completes the path instead of animating it', () => {
+  const originalRequestAnimationFrame = globalThis.requestAnimationFrame;
+  const originalCancelAnimationFrame = globalThis.cancelAnimationFrame;
+  const originalMatchMedia = globalThis.matchMedia;
+  const scheduledFrames = new Map();
+  const mediaQueries = [];
+  // The module keeps the MediaQueryList it is handed and reads `matches` live,
+  // exactly as a browser reports an OS-level preference change.
+  const reducedMotionMedia = { matches: true };
+  let nextFrameId = 1;
+
+  globalThis.requestAnimationFrame = callback => {
+    const id = nextFrameId++;
+    scheduledFrames.set(id, callback);
+    return id;
+  };
+  globalThis.cancelAnimationFrame = id => {
+    scheduledFrames.delete(id);
+  };
+  globalThis.matchMedia = query => {
+    mediaQueries.push(query);
+    return reducedMotionMedia;
+  };
+
+  try {
+    const store = keyframeModule.createKeyframeStore();
+    assert.equal(store.importAll({
+      keyframes: [keyframe('one'), keyframe('two', 1)],
+      nextIndex: 3
+    }), true);
+
+    const options = {
+      positionMethod: 'linear',
+      rotationMethod: 'linear',
+      easing: 'linear',
+      loop: false,
+      autoPaceSpeed: 1
+    };
+    const appliedStates = [];
+    const stateChanges = [];
+    const progress = [];
+    const controller = createPlaybackController({
+      viewer: {
+        setCameraState: state => appliedStates.push(state)
+      },
+      keyframeStore: store,
+      getInterpolationOptions: () => ({ ...options })
+    });
+    controller.on('stateChange', value => stateChanges.push(value));
+    controller.on('timeUpdate', update => progress.push(update.globalT));
+
+    assert.equal(prefersReducedMotion(), true);
+    assert.deepEqual(mediaQueries, ['(prefers-reduced-motion: reduce)']);
+
+    controller.play();
+    assert.equal(
+      scheduledFrames.size,
+      0,
+      'a stated reduced-motion preference must not start an animation loop'
+    );
+    assert.equal(controller.getState(), 'STOPPED');
+    assert.deepEqual(stateChanges, ['STOPPED']);
+    assert.deepEqual(progress, [1, 0]);
+    assert.equal(
+      appliedStates.length,
+      1,
+      'the end of the path must still be published'
+    );
+    assert.deepEqual(
+      appliedStates[0],
+      interpolateCameraState(store.getAll(), 1, { ...options }),
+      'reduced motion must reach the exact camera the animation would have reached'
+    );
+
+    // Every intermediate viewpoint stays reachable, still without animating.
+    controller.seekTo(0.5);
+    assert.equal(scheduledFrames.size, 0);
+    assert.deepEqual(
+      appliedStates[1],
+      interpolateCameraState(store.getAll(), 0.5, { ...options })
+    );
+
+    // Clearing the preference restores the frame loop.
+    reducedMotionMedia.matches = false;
+    controller.play();
+    assert.equal(controller.getState(), 'PLAYING');
+    assert.equal(scheduledFrames.size, 1);
+    controller.stop({ resetCamera: false });
+
+    controller.destroy();
+  } finally {
+    // The cached MediaQueryList outlives the stub, so leave motion enabled.
+    reducedMotionMedia.matches = false;
+    if (originalRequestAnimationFrame === undefined) {
+      delete globalThis.requestAnimationFrame;
+    } else {
+      globalThis.requestAnimationFrame = originalRequestAnimationFrame;
+    }
+    if (originalCancelAnimationFrame === undefined) {
+      delete globalThis.cancelAnimationFrame;
+    } else {
+      globalThis.cancelAnimationFrame = originalCancelAnimationFrame;
+    }
+    if (originalMatchMedia === undefined) {
+      delete globalThis.matchMedia;
+    } else {
+      globalThis.matchMedia = originalMatchMedia;
     }
   }
 });

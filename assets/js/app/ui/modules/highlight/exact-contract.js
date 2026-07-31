@@ -1,3 +1,5 @@
+import { ABANDONED_GESTURE_REASONS } from './mode-copy.js';
+
 const SELECTION_MODES = Object.freeze([
   'annotation',
   'knn',
@@ -139,13 +141,29 @@ export function requireFiniteNumber(value, label) {
   return value;
 }
 
-export function requireCellIndices(value, label, { allowEmpty }) {
+export function requirePointCount(value, label) {
+  return requireSafeInteger(value, `${label} point count`, 0);
+}
+
+export function requireCellIndex(value, label, pointCount) {
+  requireSafeInteger(value, label, 0);
+  requirePointCount(pointCount, label);
+  if (value >= pointCount) {
+    throw new RangeError(
+      `${label} must be inside the current dataset of ${pointCount} cells.`
+    );
+  }
+  return value;
+}
+
+export function requireCellIndices(value, label, { allowEmpty, pointCount }) {
   if (!Array.isArray(value)) {
     throw new TypeError(`${label} must be an array.`);
   }
   if (!allowEmpty && value.length === 0) {
     throw new TypeError(`${label} must not be empty.`);
   }
+  requirePointCount(pointCount, label);
   const seen = new Set();
   for (let index = 0; index < value.length; index++) {
     if (!Object.hasOwn(value, index)) {
@@ -161,26 +179,42 @@ export function requireCellIndices(value, label, { allowEmpty }) {
         `${label} must contain unique non-negative safe integers.`
       );
     }
+    if (cellIndex >= pointCount) {
+      throw new RangeError(
+        `${label} must be inside the current dataset of ${pointCount} cells.`
+      );
+    }
     seen.add(cellIndex);
   }
   return value;
 }
 
-function requireCandidateCollection(value, label, collectionType) {
+function requireCandidateCollection(value, label, collectionType, pointCount) {
   if (value === null) return null;
   if (collectionType === 'set') {
     if (!(value instanceof Set)) {
       throw new TypeError(`${label} must be a Set or null.`);
     }
-    requireCellIndices([...value], label, { allowEmpty: true });
+    requireCellIndices([...value], label, { allowEmpty: true, pointCount });
     return value;
   }
-  requireCellIndices(value, label, { allowEmpty: true });
+  requireCellIndices(value, label, { allowEmpty: true, pointCount });
   return value;
 }
 
-function requireCandidateState(candidates, step, label, collectionType) {
-  requireCandidateCollection(candidates, `${label} candidates`, collectionType);
+function requireCandidateState(
+  candidates,
+  step,
+  label,
+  collectionType,
+  pointCount
+) {
+  requireCandidateCollection(
+    candidates,
+    `${label} candidates`,
+    collectionType,
+    pointCount
+  );
   requireSafeInteger(step, `${label} step`, 0);
   if (candidates === null && step !== 0) {
     throw new TypeError(`${label} without candidates must have step zero.`);
@@ -190,7 +224,7 @@ function requireCandidateState(candidates, step, label, collectionType) {
   }
 }
 
-function requireSelectionHistory(history, label, collectionType) {
+function requireSelectionHistory(history, label, collectionType, pointCount) {
   if (!Array.isArray(history)) {
     throw new TypeError(`${label} must be an array.`);
   }
@@ -208,34 +242,39 @@ function requireSelectionHistory(history, label, collectionType) {
       entry.candidates,
       entry.step,
       `${label} entry`,
-      collectionType
+      collectionType,
+      pointCount
     );
   }
   return history;
 }
 
-export function requireHighlightSelectionState(value) {
+export function requireHighlightSelectionState(value, pointCount) {
   requireExactKeys(
     value,
     HIGHLIGHT_SELECTION_STATE_KEYS,
     'Highlight selection state'
   );
+  requirePointCount(pointCount, 'Highlight selection state');
   requireHighlightSelectionMode(value.activeMode);
   requireCandidateState(
     value.annotationCandidateSet,
     value.annotationStepCount,
     'Annotation selection state',
-    'set'
+    'set',
+    pointCount
   );
   requireSelectionHistory(
     value.annotationHistory,
     'Annotation selection history',
-    'set'
+    'set',
+    pointCount
   );
   requireSelectionHistory(
     value.annotationRedoStack,
     'Annotation selection redo stack',
-    'set'
+    'set',
+    pointCount
   );
   for (const tool of ['Lasso', 'Proximity', 'Knn']) {
     const propertyPrefix = tool === 'Knn' ? 'Knn' : tool;
@@ -244,24 +283,28 @@ export function requireHighlightSelectionState(value) {
       value[`last${propertyPrefix}Candidates`],
       value[`last${propertyPrefix}Step`],
       `${tool.toUpperCase()} selection state`,
-      'array'
+      'array',
+      pointCount
     );
     requireSelectionHistory(
       value[`${lower}History`],
       `${tool.toUpperCase()} selection history`,
-      'array'
+      'array',
+      pointCount
     );
     requireSelectionHistory(
       value[`${lower}RedoStack`],
       `${tool.toUpperCase()} selection redo stack`,
-      'array'
+      'array',
+      pointCount
     );
   }
   return value;
 }
 
-export function requireHighlightGroup(value, label) {
+export function requireHighlightGroup(value, label, pointCount) {
   requirePlainObject(value, label);
+  requirePointCount(pointCount, label);
   const { type } = value;
   let keys;
   if (DIRECT_HIGHLIGHT_GROUP_TYPES.has(type)) {
@@ -323,6 +366,11 @@ export function requireHighlightGroup(value, label) {
         `${label} cellIndices must contain unique non-negative safe integers.`
       );
     }
+    if (cellIndex >= pointCount) {
+      throw new RangeError(
+        `${label} cellIndices must be inside the current dataset of ${pointCount} cells.`
+      );
+    }
     seenCellIndices.add(cellIndex);
   }
   if (type === 'category' || type === 'range') {
@@ -366,10 +414,11 @@ export function requireHighlightGroup(value, label) {
 export function requireSavedHighlightGroup(
   value,
   expectedType,
-  expectedCellCount,
-  label
+  expectedCellIndices,
+  label,
+  pointCount
 ) {
-  requireHighlightGroup(value, label);
+  requireHighlightGroup(value, label, pointCount);
   if (!DIRECT_HIGHLIGHT_GROUP_TYPES.has(expectedType)) {
     throw new TypeError(
       `Saved highlight expected type is unsupported: ${expectedType}.`
@@ -380,20 +429,32 @@ export function requireSavedHighlightGroup(
       `${label} type must be exactly "${expectedType}".`
     );
   }
-  requireSafeInteger(
-    expectedCellCount,
-    `${label} expected cellCount`,
-    1
+  requireCellIndices(
+    expectedCellIndices,
+    `${label} source cellIndices`,
+    { allowEmpty: false, pointCount }
   );
-  if (value.cellCount !== expectedCellCount) {
+  if (value.cellCount !== expectedCellIndices.length) {
     throw new RangeError(
       `${label} cellCount must match the completed selection.`
     );
   }
+  // requireHighlightGroup already proved the saved indices are unique and
+  // exactly cellCount long, so an equal length plus containment is set
+  // equality. A permuted, offset, or substituted index set is rejected here
+  // instead of being saved as a selection nobody made.
+  const expectedCellIndexSet = new Set(expectedCellIndices);
+  for (const cellIndex of value.cellIndices) {
+    if (!expectedCellIndexSet.has(cellIndex)) {
+      throw new RangeError(
+        `${label} cellIndices must be exactly the completed selection.`
+      );
+    }
+  }
   return value;
 }
 
-export function requireCompletedSelectionEvent(event, type) {
+export function requireCompletedSelectionEvent(event, type, pointCount) {
   requireExactKeys(
     event,
     ['type', 'cellIndices', 'cellCount', 'steps'],
@@ -407,7 +468,7 @@ export function requireCompletedSelectionEvent(event, type) {
   requireCellIndices(
     event.cellIndices,
     `${type} selection cellIndices`,
-    { allowEmpty: false }
+    { allowEmpty: false, pointCount }
   );
   requireSafeInteger(event.cellCount, `${type} selection cellCount`, 1);
   if (event.cellCount !== event.cellIndices.length) {
@@ -419,7 +480,7 @@ export function requireCompletedSelectionEvent(event, type) {
   return event;
 }
 
-function requireCancelledStep(event, tool, includeCandidates) {
+function requireCancelledStep(event, tool, includeCandidates, pointCount) {
   const keys = includeCandidates
     ? ['cancelled', 'step', 'candidateCount', 'candidates']
     : ['cancelled', 'step', 'candidateCount'];
@@ -437,7 +498,7 @@ function requireCancelledStep(event, tool, includeCandidates) {
     requireCellIndices(
       event.candidates,
       `${tool} cancelled step candidates`,
-      { allowEmpty: true }
+      { allowEmpty: true, pointCount }
     );
     if (event.candidates.length !== 0) {
       throw new TypeError(`${tool} cancelled step candidates must be empty.`);
@@ -446,13 +507,49 @@ function requireCancelledStep(event, tool, includeCandidates) {
   return event;
 }
 
+/**
+ * An input gesture the renderer consumed and could not turn into a step.
+ *
+ * It is not a cancellation: the standing selection survives it untouched, and
+ * the tool answers by repainting exactly what it already holds with one
+ * explanatory line. The renderer names the cause and never the wording.
+ */
+function requireAbandonedStep(event, tool) {
+  requireExactKeys(
+    event,
+    ['abandoned', 'step', 'candidateCount'],
+    `${tool} abandoned step event`
+  );
+  if (!ABANDONED_GESTURE_REASONS.includes(event.abandoned)) {
+    throw new TypeError(
+      `${tool} abandoned step reason must be exactly `
+      + `${ABANDONED_GESTURE_REASONS.join(' or ')}.`
+    );
+  }
+  if (event.step !== 0 || event.candidateCount !== 0) {
+    throw new TypeError(
+      `${tool} abandoned step must publish zero counts.`
+    );
+  }
+  return event;
+}
+
 export function requireSelectionStepEvent(
   event,
   tool,
+  pointCount,
   extraKeys = []
 ) {
   if (isObject(event) && event.cancelled === true) {
-    return requireCancelledStep(event, tool, tool !== 'annotation');
+    return requireCancelledStep(
+      event,
+      tool,
+      tool !== 'annotation',
+      pointCount
+    );
+  }
+  if (isObject(event) && event.abandoned !== undefined) {
+    return requireAbandonedStep(event, tool);
   }
   requireExactKeys(
     event,
@@ -463,7 +560,7 @@ export function requireSelectionStepEvent(
   requireCellIndices(
     event.candidates,
     `${tool} step candidates`,
-    { allowEmpty: true }
+    { allowEmpty: true, pointCount }
   );
   requireSafeInteger(
     event.candidateCount,
@@ -479,9 +576,12 @@ export function requireSelectionStepEvent(
   return event;
 }
 
-export function requireAnnotationStepEvent(event) {
+export function requireAnnotationStepEvent(event, pointCount) {
   if (isObject(event) && event.cancelled === true) {
-    return requireCancelledStep(event, 'annotation', false);
+    return requireCancelledStep(event, 'annotation', false, pointCount);
+  }
+  if (isObject(event) && event.abandoned !== undefined) {
+    return requireAbandonedStep(event, 'annotation');
   }
   requireExactKeys(
     event,
@@ -503,7 +603,7 @@ export function requireAnnotationStepEvent(event) {
       'Annotation step type must be exactly "click" or "range".'
     );
   }
-  requireSafeInteger(event.cellIndex, 'Annotation step cellIndex', 0);
+  requireCellIndex(event.cellIndex, 'Annotation step cellIndex', pointCount);
   for (const key of [
     'dragDeltaY',
     'startX',
@@ -526,7 +626,7 @@ export function requireAnnotationStepEvent(event) {
   return event;
 }
 
-export function requireContinuousPreviewEvent(event) {
+export function requireContinuousPreviewEvent(event, pointCount) {
   requireExactKeys(
     event,
     [
@@ -547,7 +647,11 @@ export function requireContinuousPreviewEvent(event) {
       'Continuous preview event type must be exactly "preview".'
     );
   }
-  requireSafeInteger(event.cellIndex, 'Continuous preview cellIndex', 0);
+  requireCellIndex(
+    event.cellIndex,
+    'Continuous preview cellIndex',
+    pointCount
+  );
   for (const key of [
     'dragDeltaY',
     'startX',
@@ -570,7 +674,12 @@ export function requireContinuousPreviewEvent(event) {
   return event;
 }
 
-export function requireSelectionPreviewEvent(event, tool, extraKeys) {
+export function requireSelectionPreviewEvent(
+  event,
+  tool,
+  pointCount,
+  extraKeys
+) {
   requireExactKeys(
     event,
     ['type', 'cellIndices', 'cellCount', ...extraKeys],
@@ -584,7 +693,7 @@ export function requireSelectionPreviewEvent(event, tool, extraKeys) {
   requireCellIndices(
     event.cellIndices,
     `${tool} preview cellIndices`,
-    { allowEmpty: true }
+    { allowEmpty: true, pointCount }
   );
   requireSafeInteger(event.cellCount, `${tool} preview cellCount`, 0);
   if (event.cellCount !== event.cellIndices.length) {
@@ -615,12 +724,13 @@ export function requireContinuousStatistics(field) {
   return statistics;
 }
 
-export function requireUnifiedSelectionState(value) {
+export function requireUnifiedSelectionState(value, pointCount) {
   requireExactKeys(
     value,
     ['inProgress', 'stepCount', 'candidateCount', 'candidates'],
     'Unified highlight selection state'
   );
+  requirePointCount(pointCount, 'Unified highlight selection state');
   if (typeof value.inProgress !== 'boolean') {
     throw new TypeError(
       'Unified highlight selection inProgress must be boolean.'
@@ -639,7 +749,7 @@ export function requireUnifiedSelectionState(value) {
   requireCellIndices(
     value.candidates,
     'Unified highlight selection candidates',
-    { allowEmpty: true }
+    { allowEmpty: true, pointCount }
   );
   if (value.candidateCount !== value.candidates.length) {
     throw new RangeError(

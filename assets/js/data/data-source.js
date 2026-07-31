@@ -225,6 +225,182 @@ export const DATA_CONFIG = {
 };
 
 // ============================================================================
+// PAYLOAD BYTE CEILINGS
+// ============================================================================
+// Datasets are untrusted input: a user opens somebody else's GitHub repository
+// the same way they open their own directory. Both paths therefore share one
+// ceiling, so a payload refused on disk is refused over the network too.
+
+/**
+ * Largest single binary payload the browser will materialize from any source.
+ */
+export const MAX_PREPARED_BROWSER_BYTES = 512 * 1024 * 1024;
+
+/**
+ * Largest metadata/manifest JSON document accepted from any source.
+ */
+export const MAX_METADATA_JSON_BYTES = 64 * 1024 * 1024;
+
+/**
+ * Validate a manifest-declared payload length against the browser ceiling.
+ *
+ * Runs before the request is issued, so an over-declared payload costs no
+ * network traffic at all.
+ *
+ * @param {number} expectedBytes - Manifest-declared decoded length
+ * @param {string} label - Payload identity for the error message
+ * @returns {number} The validated length
+ */
+export function requirePayloadBudget(expectedBytes, label) {
+  if (!Number.isSafeInteger(expectedBytes) || expectedBytes < 0) {
+    throw new RangeError(
+      `${label}: declared payload length must be a non-negative safe integer, ` +
+      `received ${String(expectedBytes)}`
+    );
+  }
+  if (expectedBytes > MAX_PREPARED_BROWSER_BYTES) {
+    throw new RangeError(
+      `${label}: declared payload of ${expectedBytes} bytes exceeds the 512 MiB browser limit`
+    );
+  }
+  return expectedBytes;
+}
+
+/**
+ * Largest gzip member that can legally encode `expectedBytes` of output.
+ *
+ * DEFLATE's worst case is a stored block per 65535 input bytes, each costing
+ * five bytes, plus the ten-byte header, the eight-byte trailer, and room for
+ * an optional file name. Anything larger cannot be a faithful encoding of the
+ * declared payload, so the transfer is refused without inflating a byte.
+ *
+ * @param {number} expectedBytes
+ * @returns {number}
+ */
+export function maxGzipTransferBytes(expectedBytes) {
+  const storedBlocks = Math.ceil(expectedBytes / 65535) + 1;
+  return expectedBytes + storedBlocks * 5 + 18 + 1024;
+}
+
+function requireByteCeiling(maxBytes, label) {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) {
+    throw new RangeError(
+      `${label}: byte ceiling must be a non-negative safe integer, ` +
+      `received ${String(maxBytes)}`
+    );
+  }
+  return maxBytes;
+}
+
+/**
+ * Read a response body into one Uint8Array, cancelling the source stream the
+ * moment it grows past `maxBytes`.
+ *
+ * This enforces a *ceiling*, which is deliberately not the same contract as
+ * the exact-output-length reader owned by the session gzip codec
+ * (`app/session/codecs/gzip.js`): a transfer's encoded size is not knowable
+ * from a manifest, so it can only be capped. Exact-length enforcement of
+ * decompressed payloads is delegated to that codec's `gzipDecompress()`.
+ *
+ * @param {Response} response
+ * @param {Object} options
+ * @param {string} options.label - Payload identity for error messages
+ * @param {number} options.maxBytes - Hard ceiling on transferred bytes
+ * @param {AbortSignal|null} [options.signal]
+ * @param {((loadedBytes: number, totalBytes: number|null) => void)|null} [options.onProgress]
+ * @param {number|null} [options.totalBytes] - Declared transfer size for progress
+ * @returns {Promise<Uint8Array>}
+ */
+export async function readBoundedBody(response, options) {
+  const {
+    label,
+    maxBytes,
+    signal = null,
+    onProgress = null,
+    totalBytes = null,
+  } = options;
+  requireByteCeiling(maxBytes, label);
+
+  const body = response.body;
+  if (
+    body === null ||
+    body === undefined ||
+    typeof body.getReader !== 'function'
+  ) {
+    throw new DataSourceError(
+      `${label}: response carried no readable body`,
+      DataSourceErrorCode.INVALID_FORMAT,
+      null,
+      { label }
+    );
+  }
+
+  const chunks = [];
+  let loadedBytes = 0;
+  const reader = body.getReader();
+  try {
+    for (;;) {
+      throwIfMetadataAborted(signal, label);
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = value instanceof Uint8Array
+        ? value
+        : new Uint8Array(value);
+      if (chunk.byteLength === 0) continue;
+      loadedBytes += chunk.byteLength;
+      if (loadedBytes > maxBytes) {
+        // Stop the transfer immediately rather than paying for the rest of it.
+        await reader.cancel(
+          `${label}: transfer exceeded its ${maxBytes}-byte ceiling`
+        );
+        throw new RangeError(
+          `${label}: transfer of at least ${loadedBytes} bytes exceeds ` +
+          `its ${maxBytes}-byte ceiling`
+        );
+      }
+      chunks.push(chunk);
+      if (onProgress !== null) onProgress(loadedBytes, totalBytes);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  throwIfMetadataAborted(signal, label);
+
+  if (chunks.length === 1) return chunks[0];
+  const merged = new Uint8Array(loadedBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return merged;
+}
+
+/**
+ * Read a response body as JSON under a hard byte ceiling.
+ *
+ * @param {Response} response
+ * @param {Object} options
+ * @param {string} options.label - Payload identity for error messages
+ * @param {AbortSignal|null} [options.signal]
+ * @param {number} [options.maxBytes]
+ * @returns {Promise<any>}
+ */
+export async function readBoundedJson(response, options) {
+  const {
+    label,
+    signal = null,
+    maxBytes = MAX_METADATA_JSON_BYTES,
+  } = options;
+  const bytes = await readBoundedBody(response, {
+    label,
+    maxBytes,
+    signal,
+  });
+  return JSON.parse(new TextDecoder().decode(bytes));
+}
+
+// ============================================================================
 // SAMPLE EXPORT TRANSPORT
 // ============================================================================
 
@@ -580,7 +756,10 @@ export async function fetchJson(url, sourceType, options = {}) {
         { url, status: response.status }
       );
     }
-    const payload = await response.json();
+    const payload = await readBoundedJson(response, {
+      label: `Metadata ${url}`,
+      signal,
+    });
     throwIfMetadataAborted(signal, 'JSON loading');
     return payload;
   } catch (err) {

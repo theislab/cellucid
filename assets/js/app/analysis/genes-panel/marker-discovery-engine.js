@@ -23,6 +23,7 @@ import { StreamingGeneLoader } from '../data/streaming-gene-loader.js';
 import { getWorkerPool } from '../compute/worker-pool.js';
 import { waitForAvailableSlot } from '../shared/concurrency-utils.js';
 import { DEFAULTS, ERROR_MESSAGES, formatError, ANALYSIS_PHASES } from './constants.js';
+import { benjaminiHochbergAdjusted } from '../stats/statistical-tests.js';
 import { setOwnDataProperty } from '../../../utils/exact-record.js';
 
 // =============================================================================
@@ -197,61 +198,6 @@ class TopNHeap {
       idx = worst;
     }
   }
-}
-
-/**
- * Benjamini–Hochberg correction for an array of p-values.
- * Returns Float64 values so finite extreme tails remain distinguishable.
- *
- * @param {ArrayLike<number>} pValues
- * @returns {Float64Array}
- */
-export function benjaminiHochberg(pValues) {
-  if (
-    pValues === null ||
-    pValues === undefined ||
-    !Number.isSafeInteger(pValues.length) ||
-    pValues.length < 0
-  ) {
-    throw new TypeError(
-      'Benjamini-Hochberg p-values must be an array-like collection'
-    );
-  }
-  const n = pValues.length;
-  const out = new Float64Array(n);
-
-  /** @type {{ index: number, p: number }[]} */
-  const ordered = [];
-  for (let i = 0; i < n; i++) {
-    const p = pValues[i];
-    if (!Number.isFinite(p)) {
-      throw new TypeError(
-        `Benjamini-Hochberg p-value at index ${i} must be finite`
-      );
-    }
-    if (p < 0 || p > 1) {
-      throw new RangeError(
-        `Benjamini-Hochberg p-value at index ${i} must be between 0 and 1`
-      );
-    }
-    ordered.push({ index: i, p });
-  }
-
-  if (ordered.length === 0) return out;
-
-  ordered.sort((a, b) => a.p - b.p || a.index - b.index);
-
-  const m = ordered.length;
-  let nextAdj = ordered[m - 1].p;
-  out[ordered[m - 1].index] = Math.min(nextAdj, 1);
-
-  for (let i = m - 2; i >= 0; i--) {
-    const raw = (ordered[i].p * m) / (i + 1);
-    nextAdj = Math.min(raw, nextAdj);
-    out[ordered[i].index] = Math.min(nextAdj, 1);
-  }
-
-  return out;
 }
 
 // =============================================================================
@@ -436,6 +382,12 @@ export class MarkerDiscoveryEngine {
         '[MarkerDiscoveryEngine] minCells must be a positive integer'
       );
     }
+    // The rule the worker actually applies: a group is tested for a gene only
+    // when it and the rest each hold this many cells with a measured value. Two
+    // is the floor because neither Welch nor a rank test says anything about a
+    // single observation. It is published with the result so the panel can name
+    // the reason a gene went untested instead of guessing at `minCells`.
+    const minCellsPerSide = Math.max(2, minCells);
     if (
       !Number.isFinite(pValueThreshold) ||
       pValueThreshold <= 0 ||
@@ -809,6 +761,7 @@ export class MarkerDiscoveryEngine {
         markers: {
           obsCategory,
           method,
+          minCellsPerSide,
           computedAt: Date.now(),
           computeDuration: performance.now() - startTime,
           geneCount,
@@ -914,14 +867,25 @@ export class MarkerDiscoveryEngine {
       );
     }
 
-    // BH correction per group
-    const adjustedByGroup = pValuesByGroup.map((arr) => benjaminiHochberg(arr));
+    // Benjamini-Hochberg per group. Each group is its own family: it is one
+    // one-vs-rest comparison run across every gene in the panel. Genes that
+    // could not be tested for that group carry NaN and are excluded from the
+    // denominator `m` — an untested gene is not a gene with p = 1, and counting
+    // it would deflate every adjusted value in the group. The counts travel with
+    // the group so the panel can report the denominator it actually used.
+    const correctionByGroup = pValuesByGroup.map(
+      (arr) => benjaminiHochbergAdjusted(arr)
+    );
+    const adjustedByGroup = correctionByGroup.map(
+      (correction) => correction.adjustedPValues
+    );
 
     // Final groups output
     const finalGroups = this._buildMarkersFromHeaps({
       groups,
       heaps,
       adjustedByGroup,
+      correctionByGroup,
       pValueThreshold,
       foldChangeThreshold,
       useAdjustedPValue
@@ -934,6 +898,7 @@ export class MarkerDiscoveryEngine {
         markers: {
           obsCategory,
           method,
+          minCellsPerSide,
           computedAt: Date.now(),
           computeDuration: duration,
           geneCount,
@@ -949,6 +914,7 @@ export class MarkerDiscoveryEngine {
     return {
       obsCategory,
       method,
+      minCellsPerSide,
       computedAt: Date.now(),
       computeDuration: duration,
       geneCount,
@@ -1119,7 +1085,6 @@ export class MarkerDiscoveryEngine {
     const {
       nAll,
       pValues,
-      statistics,
       log2FoldChange,
       meanInGroup,
       meanOutGroup,
@@ -1131,7 +1096,6 @@ export class MarkerDiscoveryEngine {
     const groupCount = groups.length;
     const requiredArrays = [
       ['pValues', pValues, Float64Array],
-      ['statistics', statistics, Float32Array],
       ['log2FoldChange', log2FoldChange, Float32Array],
       ['meanInGroup', meanInGroup, Float32Array],
       ['meanOutGroup', meanOutGroup, Float32Array],
@@ -1147,9 +1111,12 @@ export class MarkerDiscoveryEngine {
         );
       }
     }
-    if (!Number.isSafeInteger(nAll) || nAll <= 0) {
+    // `nAll` counts the cells that carry a measured value for this gene. It can
+    // be zero: a gene that is missing in every grouped cell was still read, and
+    // it is untested rather than malformed.
+    if (!Number.isSafeInteger(nAll) || nAll < 0) {
       throw new RangeError(
-        `Marker worker nAll for "${gene}" must be a positive integer`
+        `Marker worker nAll for "${gene}" must be a non-negative integer`
       );
     }
     if (
@@ -1164,17 +1131,20 @@ export class MarkerDiscoveryEngine {
     for (let g = 0; g < groups.length; g++) {
       const p = pValues[g];
       const fc = log2FoldChange[g];
-      if (!Number.isFinite(p) || p < 0 || p > 1) {
+
+      // NaN is the worker's word for "this group could not be tested for this
+      // gene": fewer than max(2, minCells) of its cells - or of the rest -
+      // carried a measured value, so no comparison was run. That is a property
+      // of the data, not a backend defect, and it is the state the min-cell rule
+      // in data-worker.js exists to produce. A finite probability outside [0, 1]
+      // is still a defect.
+      const tested = !Number.isNaN(p);
+      if (tested && (!Number.isFinite(p) || p < 0 || p > 1)) {
         throw new RangeError(
           `Marker worker p-value for "${gene}" group "${groups[g].groupId}" must be finite and between 0 and 1`
         );
       }
       if (
-        typeof statistics[g] !== 'number' ||
-        Number.isNaN(statistics[g]) ||
-        !Number.isFinite(fc) ||
-        !Number.isFinite(meanInGroup[g]) ||
-        !Number.isFinite(meanOutGroup[g]) ||
         !Number.isFinite(percentInGroup[g]) ||
         !Number.isFinite(percentOutGroup[g]) ||
         percentInGroup[g] < 0 ||
@@ -1187,8 +1157,26 @@ export class MarkerDiscoveryEngine {
           `Marker worker returned malformed statistics for "${gene}" group "${groups[g].groupId}"`
         );
       }
+      // A tested group compared at least two measured cells against at least two
+      // others, so its means and its fold change exist. Requiring them only for
+      // tested groups keeps the check strict where it can be.
+      if (
+        tested &&
+        (
+          !Number.isFinite(fc) ||
+          !Number.isFinite(meanInGroup[g]) ||
+          !Number.isFinite(meanOutGroup[g])
+        )
+      ) {
+        throw new RangeError(
+          `Marker worker returned a tested group without a fold change for "${gene}" group "${groups[g].groupId}"`
+        );
+      }
       pValuesByGroup[g][geneIndex] = p;
       log2FCByGroup[g][geneIndex] = fc;
+
+      // An untested gene has no rank, so it never competes for a Top-N slot.
+      if (!tested) continue;
 
       heaps[g].push({
         gene,
@@ -1207,8 +1195,13 @@ export class MarkerDiscoveryEngine {
     }
   }
 
-  _buildMarkersFromHeaps({ groups, heaps, adjustedByGroup, pValueThreshold, foldChangeThreshold, useAdjustedPValue }) {
+  _buildMarkersFromHeaps({ groups, heaps, adjustedByGroup, correctionByGroup = null, pValueThreshold, foldChangeThreshold, useAdjustedPValue }) {
     const out = {};
+    if (correctionByGroup !== null && !Array.isArray(correctionByGroup)) {
+      throw new TypeError(
+        'Marker correction counts must be one record per group'
+      );
+    }
 
     for (let g = 0; g < groups.length; g++) {
       const group = groups[g];
@@ -1239,11 +1232,19 @@ export class MarkerDiscoveryEngine {
         );
       }
 
+      // The significance threshold is inclusive: a gene is significant when
+      // p <= threshold. That is the rule the Benjamini-Hochberg step-up itself
+      // uses (reject the k largest ranks with p(k) <= k*alpha/m, so an adjusted
+      // value of exactly alpha is a rejection), and `benjaminiHochberg` reports
+      // `significant` on the same comparison. An exact test on discrete data
+      // reaches the boundary exactly - Fisher and the exact Mann-Whitney both
+      // produce 0.05 on small tables - so the two conventions did not merely
+      // differ in principle.
       const pKey = useAdjustedPValue ? 'adjustedPValue' : 'pValue';
       const filtered = items.filter((m) => {
         const p = m[pKey];
         if (!Number.isFinite(p)) return false;
-        if (p >= pValueThreshold) return false;
+        if (p > pValueThreshold) return false;
         return Math.abs(m.log2FoldChange) >= foldChangeThreshold;
       });
 
@@ -1271,11 +1272,37 @@ export class MarkerDiscoveryEngine {
         percentOutGroup: m.percentOutGroup
       }));
 
+      // `genesTested` is the Benjamini-Hochberg denominator this group's
+      // adjusted p-values were divided by, and `genesUntestable` is the rest of
+      // the panel: genes this group could not be compared on because too few of
+      // its cells - or too few of the others - carried a measured value. They
+      // are reported separately so the FDR can be reconstructed, and so a group
+      // that produced no markers can say whether that was an answer or a
+      // shortage of data. A partial emission has not corrected anything yet, so
+      // it declares neither.
+      const correction = correctionByGroup === null
+        ? null
+        : correctionByGroup[g];
+      if (
+        correction !== null &&
+        (
+          correction === undefined ||
+          !Number.isSafeInteger(correction.testedCount) ||
+          !Number.isSafeInteger(correction.untestableCount)
+        )
+      ) {
+        throw new TypeError(
+          `Marker correction counts are missing for group "${group.groupId}"`
+        );
+      }
+
       setOwnDataProperty(out, group.groupId, {
         groupId: group.groupId,
         groupName: group.groupName,
         cellCount: group.cellCount,
         color: group.color,
+        genesTested: correction === null ? null : correction.testedCount,
+        genesUntestable: correction === null ? null : correction.untestableCount,
         markers
       });
     }

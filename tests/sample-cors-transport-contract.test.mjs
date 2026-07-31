@@ -168,16 +168,27 @@ test('a configured catalog transport failure is surfaced once and never retried 
 
   const manager = createDataSourceManager();
   await manager.initialize();
-  await assert.rejects(
-    manager.getAllDatasets(),
-    /CORS owner rejected the request/,
-  );
-  await assert.rejects(
-    manager.getAllDatasets(),
-    /CORS owner rejected the request/,
+
+  // The failure belongs to the catalog that produced it. Enumerating sources
+  // still succeeds, so an unreachable sample catalog cannot disable the
+  // selector for datasets that need no network at all.
+  const first = await manager.getAllDatasets();
+  const firstDemo = first.find(entry => entry.sourceType === 'local-demo');
+  assert.match(firstDemo.error.message, /CORS owner rejected the request/);
+  assert.deepEqual(firstDemo.datasets, []);
+
+  const second = await manager.getAllDatasets();
+  assert.equal(
+    second.find(entry => entry.sourceType === 'local-demo').error,
+    firstDemo.error,
+    'the cached failure must be republished, not re-fetched',
   );
   assert.equal(fetchCalls, 1);
   assert.equal(manager.hasActiveDataset(), false);
+
+  // Only an explicit retry clears it, and it costs exactly one more request.
+  await manager.getAllDatasets({ refresh: true });
+  assert.equal(fetchCalls, 2);
 });
 
 test('sample catalog UI has no detached timeout race and declares direct HTTP', async () => {

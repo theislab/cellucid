@@ -402,6 +402,7 @@ function makeSessionSerializer(contributors, pointCount = 3) {
       getDatasetGeneration: () => 0,
       obsData: { fields: [] },
       pointCount,
+      getViewDimensionLevel: () => 3,
       positionsArray: new Float32Array(pointCount * 3),
       varData: { fields: [] },
     },
@@ -485,6 +486,7 @@ function categoricalSessionMeta(id, key) {
 function makeHighlightSessionState({ pages, activePageId, events }) {
   const state = Object.create(highlightStateMethods);
   state.getDatasetGeneration = () => 0;
+  state.getViewDimensionLevel = () => 3;
   state.obsData = { fields: [] };
   state.pointCount = 4;
   state.positionsArray = new Float32Array(12);
@@ -736,7 +738,12 @@ test('dataset mismatch rejects atomically before any contributor restore', async
   await withNotificationHarness(async () => {
     await assert.rejects(
       serializer.restoreFromBlob(bundle),
-      /dataset.*mismatch/i,
+      error => {
+        assert.ok(error instanceof RangeError);
+        assert.match(error.message, /different dataset than the one that is open/);
+        assert.match(error.message, /3 cells .* 4 cells/);
+        return true;
+      },
     );
   });
   assert.equal(restoreCalls, 0);
@@ -798,7 +805,12 @@ test('generic Blob and pre-delegation URL cancellation dismiss exactly once', as
     urlEnteredResolve = resolve;
   });
   const urlSerializer = new SessionSerializer({
-    state: { pointCount: 3, varData: { fields: [] } },
+    state: {
+      getViewDimensionLevel: () => 3,
+      pointCount: 3,
+      positionsArray: new Float32Array(9),
+      varData: { fields: [] },
+    },
     viewer: {},
     sidebar: {},
     dataSourceManager: {
@@ -1201,10 +1213,17 @@ test('dataset fingerprints are complete exact identities, never partial matches'
       return 'dataset-a';
     },
   };
+  const positionsArray = new Float32Array([
+    0.5, 0.25, 0.125,
+    -0.5, -0.25, -0.125,
+    0.75, 0.375, 0.1875,
+  ]);
   const fingerprint = getDatasetFingerprint({
     dataSourceManager: manager,
     state: {
+      getViewDimensionLevel: () => 3,
       pointCount: 3,
+      positionsArray,
       varData: { fields: [{}, {}] },
     },
   });
@@ -1213,19 +1232,47 @@ test('dataset fingerprints are complete exact identities, never partial matches'
     datasetId: 'dataset-a',
     cellCount: 3,
     varCount: 2,
+    cellOrder: {
+      dimension: 3,
+      digest: fingerprint.cellOrder.digest,
+    },
   });
+  assert.match(fingerprint.cellOrder.digest, /^[0-9a-f]{16}$/);
   assert.equal(datasetFingerprintMatches(fingerprint, { ...fingerprint }), true);
 
   for (const incomplete of [
     { sourceType: 'local-user', datasetId: 'dataset-a' },
     { ...fingerprint, cellCount: '3' },
     { ...fingerprint, legacyDatasetName: 'A' },
+    { ...fingerprint, cellOrder: { dimension: 3 } },
+    { ...fingerprint, cellOrder: { dimension: 4, digest: fingerprint.cellOrder.digest } },
+    { ...fingerprint, cellOrder: { dimension: 3, digest: 'NOTHEX0123456789' } },
   ]) {
     assert.throws(
       () => datasetFingerprintMatches(fingerprint, incomplete),
-      /fingerprint|exact|cellCount/i,
+      /fingerprint|exact|cellCount|dimension|hexadecimal/i,
     );
   }
+
+  // A record carrying only the four scalars is a session written before cell
+  // identity existed. It cannot be checked against anything, so it is refused
+  // rather than accepted on the strength of its scalars.
+  assert.throws(
+    () => datasetFingerprintMatches(
+      {
+        sourceType: 'local-user',
+        datasetId: 'dataset-a',
+        cellCount: 3,
+        varCount: 2,
+      },
+      fingerprint,
+    ),
+    error => {
+      assert.ok(error instanceof RangeError);
+      assert.match(error.message, /which cells a selection contains/);
+      return true;
+    },
+  );
 });
 
 test('session context uses only explicitly supplied current owners', () => {
@@ -2872,6 +2919,8 @@ test('generic restore rejects reordered same-priority user code chunks and rolls
   });
   const state = {
     pointCount: 3,
+    positionsArray: new Float32Array(9),
+    getViewDimensionLevel: () => 3,
     activeFieldSource: null,
     activeFieldIndex: -1,
     activeVarFieldIndex: -1,
@@ -3029,6 +3078,7 @@ test('generic restore rolls back cinematic state and analysis cache after a late
       getDatasetGeneration: () => 0,
       obsData: { fields: [] },
       pointCount: 3,
+      getViewDimensionLevel: () => 3,
       positionsArray: new Float32Array(9),
       varData: { fields: [] },
     },
@@ -3120,7 +3170,12 @@ test('generic restore rolls back cinematic state and analysis cache after a late
     },
   };
   const destinationSerializer = new SessionSerializer({
-    state: { pointCount: 3, varData: { fields: [] } },
+    state: {
+      getViewDimensionLevel: () => 3,
+      pointCount: 3,
+      positionsArray: new Float32Array(9),
+      varData: { fields: [] },
+    },
     viewer: {},
     sidebar: {},
     dataSourceManager: null,
@@ -3170,6 +3225,7 @@ test('generic empty analysis inventory replaces stale cache and cannot be omitte
       getDatasetGeneration: () => 0,
       obsData: { fields: [] },
       pointCount: 3,
+      getViewDimensionLevel: () => 3,
       positionsArray: new Float32Array(9),
       varData: { fields: [] },
     },
@@ -3221,7 +3277,12 @@ test('generic empty analysis inventory replaces stale cache and cannot be omitte
     },
   };
   const destination = new SessionSerializer({
-    state: { pointCount: 3, varData: { fields: [] } },
+    state: {
+      getViewDimensionLevel: () => 3,
+      pointCount: 3,
+      positionsArray: new Float32Array(9),
+      varData: { fields: [] },
+    },
     viewer: {},
     sidebar: {},
     dataSourceManager: null,
