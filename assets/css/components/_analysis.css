@@ -210,8 +210,25 @@
   margin-bottom: var(--space-1-5);
 }
 
+/* Status glyphs. Only the one matching the verdict status is shown, and it
+   strokes with currentColor so it tracks the theme instead of an emoji's
+   fixed rendering. */
 .bn-verdict-icon {
-  font-size: var(--text-3xl);
+  display: inline-flex;
+  flex-shrink: 0;
+  line-height: 0;
+}
+
+.bn-verdict-glyph {
+  display: none;
+  width: var(--text-3xl);
+  height: var(--text-3xl);
+}
+
+.bn-verdict[data-status="good"] .bn-verdict-glyph[data-status="good"],
+.bn-verdict[data-status="warning"] .bn-verdict-glyph[data-status="warning"],
+.bn-verdict[data-status="danger"] .bn-verdict-glyph[data-status="danger"] {
+  display: block;
 }
 
 .bn-verdict-title {
@@ -225,12 +242,15 @@
   opacity: var(--opacity-90);
 }
 
+/* Same surface and frame as .bn-section below: --color-surface-tertiary is a
+   hover/chip fill, and the label, suffix and value all read as text here. */
 .bn-fps-row {
   display: flex;
   align-items: center;
   justify-content: space-between;
   padding: var(--space-2) var(--space-2-5);
-  background: var(--color-surface-tertiary);
+  background: var(--color-surface-secondary);
+  border: var(--border-width-1) solid var(--color-border-light);
   border-radius: 0;
   margin-bottom: var(--space-2);
 }
@@ -246,22 +266,24 @@
   gap: var(--space-1);
 }
 
+/* Matches .benchmark-stat-value--headline, the headline numeral of the
+   sibling benchmark panel. */
 .bn-fps-value {
-  font-size: calc(var(--text-3xl) + var(--space-0-5));
+  font-size: var(--text-3xl);
   font-weight: var(--font-weight-bold);
   color: var(--color-text-primary);
 }
 
 .bn-fps-value[data-status="good"] {
-  color: var(--color-success);
+  color: var(--color-success-text);
 }
 
 .bn-fps-value[data-status="warning"] {
-  color: var(--color-warning);
+  color: var(--color-warning-text);
 }
 
 .bn-fps-value[data-status="danger"] {
-  color: var(--color-danger);
+  color: var(--color-danger-text);
 }
 
 .bn-fps-suffix {
@@ -441,7 +463,7 @@
 /* Error display */
 .analysis-error {
   padding: var(--space-4);
-  color: var(--color-danger);
+  color: var(--color-danger-text);
   font-size: var(--text-sm);
   text-align: center;
 }
@@ -1679,7 +1701,7 @@ details.form-section[open] > summary.section-title::after {
 .query-remove-btn:hover {
   background: var(--color-danger-soft);
   border-color: var(--color-danger);
-  color: var(--color-danger);
+  color: var(--color-danger-text);
 }
 
 .query-add-btn {
@@ -1751,7 +1773,7 @@ details.form-section[open] > summary.section-title::after {
   background: var(--color-danger-soft);
   border: var(--border-width-1) solid color-mix(in srgb, var(--color-danger) 35%, transparent);
   border-radius: var(--radius-md);
-  color: var(--color-danger);
+  color: var(--color-danger-text);
   font-size: 12px;
   text-align: center;
   padding: 20px;
@@ -1788,7 +1810,7 @@ details.form-section[open] > summary.section-title::after {
 .quick-insights-error {
   background: var(--color-danger-soft);
   border-color: color-mix(in srgb, var(--color-danger) 35%, transparent);
-  color: var(--color-danger);
+  color: var(--color-danger-text);
   font-size: 11px;
 }
 
@@ -3102,11 +3124,11 @@ details.form-section[open] > summary.section-title::after {
 }
 
 .hover-context-tooltip .stat-value.positive {
-  color: var(--color-success);
+  color: var(--color-success-text);
 }
 
 .hover-context-tooltip .stat-value.negative {
-  color: var(--color-danger);
+  color: var(--color-danger-text);
 }
 
 .hover-context-tooltip .divider {

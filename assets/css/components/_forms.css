@@ -208,7 +208,7 @@
 }
 
 .dataset-info.error {
-  color: var(--color-danger);
+  color: var(--color-danger-text);
   background: var(--color-danger-soft);
   border-color: var(--color-danger);
 }
@@ -332,11 +332,11 @@
 }
 
 #user-data-status.error {
-  color: var(--color-danger);
+  color: var(--color-danger-text);
 }
 
 #user-data-status.success {
-  color: var(--color-success);
+  color: var(--color-success-text);
 }
 
 #user-data-status.loading {

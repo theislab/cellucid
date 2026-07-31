@@ -5078,8 +5078,9 @@ test('reads official categorical v0.2 layouts with nullable-string categories', 
   await adapter.initialize();
 
   const categorical = adapter.getObsManifest()._categoricalFields[0];
-  assert.equal(categorical[0], 'label');
-  assert.deepEqual(categorical[1], ['A', 'C']);
+  assert.equal(categorical[0], 0);
+  assert.equal(categorical[1], 'label');
+  assert.deepEqual(categorical[2], ['A', 'C']);
   const field = await adapter.getObsFieldData('label');
   assert.equal(field.kind, 'category');
   assert.deepEqual(field.categories, ['A', 'C']);

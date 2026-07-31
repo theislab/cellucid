@@ -1553,11 +1553,13 @@ export class BaseAnnDataAdapter {
       this._loader.hasExpressionMatrix !== false;
     const obsManifest = this.getObsManifest();
     const obsFields = [
-      ...obsManifest._continuousFields.map(([key]) => ({
+      // Element 0 of every entry is the payload index; the key is element 1.
+      ...obsManifest._continuousFields.map(([, key]) => ({
         key,
         kind: 'continuous',
       })),
       ...obsManifest._categoricalFields.map(([
+        ,
         key,
         categories,
       ]) => {
@@ -1590,7 +1592,7 @@ export class BaseAnnDataAdapter {
             );
           }
           files[key] =
-            `vectors/field_${fieldIndex}_${dimension}d.bin`;
+            `vectors/${fieldIndex}_${dimension}d.bin`;
         }
         fields[fieldId] = {
           label: internalField.label,
@@ -2033,9 +2035,16 @@ export class BaseAnnDataAdapter {
     const continuousFields = [];
     const categoricalFields = [];
 
-    for (const field of this._obsFieldsMetadata) {
+    // obs/ carries both arrays, so one payload-index space spans them, taken
+    // from each field's position in the single served obs field list.
+    for (
+      let payloadIndex = 0;
+      payloadIndex < this._obsFieldsMetadata.length;
+      payloadIndex++
+    ) {
+      const field = this._obsFieldsMetadata[payloadIndex];
       if (field.kind === 'continuous') {
-        continuousFields.push([field.key]);
+        continuousFields.push([payloadIndex, field.key]);
       } else {
         const { dtype, missingValue } = getCellucidCategoryStorage(
           field.categories,
@@ -2043,6 +2052,7 @@ export class BaseAnnDataAdapter {
         );
 
         categoricalFields.push([
+          payloadIndex,
           field.key,
           field.categories,
           dtype,
@@ -2055,7 +2065,7 @@ export class BaseAnnDataAdapter {
     const obsSchemas = {};
     if (continuousFields.length > 0) {
       obsSchemas.continuous = {
-        pathPattern: 'obs/{key}.values.f32',
+        pathPattern: 'obs/{index}.values.f32',
         ext: 'f32',
         dtype: 'float32',
         quantized: false,
@@ -2063,7 +2073,7 @@ export class BaseAnnDataAdapter {
     }
     if (categoricalFields.length > 0) {
       obsSchemas.categorical = {
-        codesPathPattern: 'obs/{key}.codes.{ext}',
+        codesPathPattern: 'obs/{index}.codes.{ext}',
         outlierPathPattern: null,
         outlierExt: null,
         outlierDtype: null,
@@ -2098,7 +2108,7 @@ export class BaseAnnDataAdapter {
     }
     const fields = this._loader.hasExpressionMatrix === false
       ? []
-      : this._loader.varNames.map(name => [name]);
+      : this._loader.varNames.map((name, payloadIndex) => [payloadIndex, name]);
     return {
       _format: 'compact_v1',
       n_points: this._loader.nObs,
@@ -2107,7 +2117,7 @@ export class BaseAnnDataAdapter {
       quantization: null,
       _varSchema: {
         kind: 'continuous',
-        pathPattern: 'var/{key}.values.f32',
+        pathPattern: 'var/{index}.values.f32',
         ext: 'f32',
         dtype: 'float32',
         quantized: false,

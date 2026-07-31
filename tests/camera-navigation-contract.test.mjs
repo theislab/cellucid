@@ -36,6 +36,70 @@ const coreStateSource = await readFile(
   new URL('../assets/js/app/session/contributors/core-state.js', import.meta.url),
   'utf8'
 );
+const domCacheSource = await readFile(
+  new URL('../assets/js/app/ui/core/dom-cache.js', import.meta.url),
+  'utf8'
+);
+const indexHtml = await readFile(new URL('../index.html', import.meta.url), 'utf8');
+
+test('every Camera Path navigation control is cached, required, and read', () => {
+  /* The Camera Path navigation block mirrors the Compare Views block; both
+     drive the same viewer. It has been mistaken for dead markup, so pin the
+     whole chain: markup id -> dom-cache entry -> REQUIRED_DOM_KEYS -> a read
+     in the module body. */
+  const blockStart = indexHtml.indexOf('id="cinematic-navigation-controls"');
+  assert.ok(blockStart > 0, 'the Camera Path navigation block must exist');
+  const blockEnd = indexHtml.indexOf('id="cinematic-save-btn"', blockStart);
+  assert.ok(blockEnd > blockStart);
+  /* The block container and its info popover are owned by the shared
+     info-popovers component, not by the Camera Path DOM cache. */
+  const NOT_DOM_CACHED = new Set([
+    'cinematic-navigation-controls',
+    'cinematic-navigation-info-btn',
+    'cinematic-navigation-info-tooltip',
+  ]);
+  const markupIds = [
+    ...new Set(
+      Array.from(
+        indexHtml.slice(blockStart, blockEnd).matchAll(/\bid="(cinematic-[a-z-]+)"/g),
+        match => match[1],
+      ),
+    ),
+  ].filter(id => !NOT_DOM_CACHED.has(id));
+  assert.ok(
+    markupIds.length >= 18,
+    `expected the full navigation block, found ${markupIds.length} ids`,
+  );
+
+  const cacheStart = domCacheSource.indexOf('    cinematicCamera: {');
+  const cacheEnd = domCacheSource.indexOf('\n    },', cacheStart);
+  assert.ok(cacheStart >= 0 && cacheEnd > cacheStart);
+  const cacheBlock = domCacheSource.slice(cacheStart, cacheEnd);
+
+  const requiredStart = cinematicCameraSource.indexOf('const REQUIRED_DOM_KEYS = [');
+  const requiredEnd = cinematicCameraSource.indexOf('];', requiredStart);
+  assert.ok(requiredStart >= 0 && requiredEnd > requiredStart);
+  const requiredKeys = cinematicCameraSource.slice(requiredStart, requiredEnd);
+
+  const orphans = [];
+  for (const id of markupIds) {
+    const cached = cacheBlock.match(
+      new RegExp(`(\\w+):\\s*byId\\('${id}'\\)`),
+    );
+    if (cached === null) {
+      orphans.push(`${id} is not collected by dom-cache`);
+      continue;
+    }
+    const key = cached[1];
+    if (!new RegExp(`'${key}'`).test(requiredKeys)) {
+      orphans.push(`${key} is not in REQUIRED_DOM_KEYS`);
+    }
+    if (!new RegExp(`\\bdom\\.${key}\\b`).test(cinematicCameraSource)) {
+      orphans.push(`dom.${key} is never read by the Camera Path module`);
+    }
+  }
+  assert.deepEqual(orphans, [], orphans.join('\n'));
+});
 
 test('fresh 1D/2D views use planar navigation and fresh 3D views use orbit', () => {
   assert.equal(getDefaultNavigationMode(1), 'planar');

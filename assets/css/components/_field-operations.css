@@ -77,7 +77,7 @@
 
 .field-action-btn.field-delete-btn:hover {
   background: var(--color-border-light);
-  color: var(--color-danger);
+  color: var(--color-danger-text);
 }
 
 /* ------------------------------------------------------------------------
@@ -205,7 +205,7 @@
 
 .deleted-field-confirm-btn:hover {
   background: var(--color-border-light);
-  color: var(--color-danger);
+  color: var(--color-danger-text);
 }
 
 .deleted-field-confirm-btn:active {
@@ -281,7 +281,7 @@
 
 .legend-delete-btn:hover {
   background: var(--color-border-light);
-  color: var(--color-danger);
+  color: var(--color-danger-text);
 }
 
 .legend-delete-btn:focus-visible {
@@ -569,7 +569,7 @@
 }
 
 .dropzone-item-remove:hover {
-  color: var(--color-danger);
+  color: var(--color-danger-text);
 }
 
 .cat-builder-section {

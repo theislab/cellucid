@@ -131,7 +131,7 @@ test('shared adapter requires unique category labels by exact primitive identity
   }));
   await adapter.initialize();
   assert.deepEqual(
-    adapter.getObsManifest()._categoricalFields[0][1],
+    adapter.getObsManifest()._categoricalFields[0][2],
     distinct
   );
 });
@@ -362,8 +362,8 @@ test('keeps the exact 65,535-category boundary on uint16 without uint32 output',
   await adapter.initialize();
 
   const compactField = adapter.getObsManifest()._categoricalFields[0];
-  assert.equal(compactField[2], 'uint16');
-  assert.equal(compactField[3], 65_535);
+  assert.equal(compactField[3], 'uint16');
+  assert.equal(compactField[4], 65_535);
 
   const field = await adapter.getObsFieldData('group');
   assert.equal(field.dtype, 'uint16');
@@ -386,8 +386,8 @@ test('keeps the exact 255-category boundary on uint8', async () => {
   await adapter.initialize();
 
   const compactField = adapter.getObsManifest()._categoricalFields[0];
-  assert.equal(compactField[2], 'uint8');
-  assert.equal(compactField[3], 255);
+  assert.equal(compactField[3], 'uint8');
+  assert.equal(compactField[4], 255);
 
   const field = await adapter.getObsFieldData('group');
   assert.equal(field.dtype, 'uint8');
@@ -481,8 +481,8 @@ test('rejects unsupported compact categorical code dtypes', () => {
     compression: null,
     _obsSchemas: {
       categorical: {
-        codesPathPattern: 'obs/{key}.codes.{ext}',
-        outlierPathPattern: 'obs/{key}.outliers.f32',
+        codesPathPattern: 'obs/{index}.codes.{ext}',
+        outlierPathPattern: 'obs/{index}.outliers.f32',
         outlierExt: 'f32',
         outlierDtype: 'float32',
         outlierQuantized: false
@@ -490,7 +490,7 @@ test('rejects unsupported compact categorical code dtypes', () => {
     },
     _continuousFields: [],
     _categoricalFields: [
-      ['group', ['A'], 'uint32', 0xffff_ffff, {}]
+      [0, 'group', ['A'], 'uint32', 0xffff_ffff, {}]
     ]
   };
   assert.throws(
@@ -525,7 +525,7 @@ test('rejects unsupported direct AnnData categorical code dtypes', async () => {
         key: 'group',
         kind: 'category',
         categories: ['A', 'B'],
-        codesPath: 'obs/group.codes.u8',
+        codesPath: 'obs/0.codes.u8',
         codesDtype: 'uint8',
         codesMissingValue: 255,
         outlierQuantilesPath: null,
@@ -952,21 +952,22 @@ test('DataState keeps exact field descriptors separate from mutable load state',
       compression: null,
       _obsSchemas: {
         continuous: {
-          pathPattern: 'obs/{key}.values.f32',
+          pathPattern: 'obs/{index}.values.f32',
           ext: 'f32',
           dtype: 'float32',
           quantized: false
         },
         categorical: {
-          codesPathPattern: 'obs/{key}.codes.{ext}',
+          codesPathPattern: 'obs/{index}.codes.{ext}',
           outlierPathPattern: null,
           outlierExt: null,
           outlierDtype: null,
           outlierQuantized: false
         }
       },
-      _continuousFields: [['score']],
+      _continuousFields: [[0, 'score']],
       _categoricalFields: [[
+        1,
         'numeric_category',
         [10, 20],
         'uint8',
@@ -977,13 +978,13 @@ test('DataState keeps exact field descriptors separate from mutable load state',
 
     globalThis.fetch = async url => {
       const path = String(url);
-      if (path.endsWith('/obs/score.values.f32')) {
+      if (path.endsWith('/obs/0.values.f32')) {
         return new Response(Float32Array.from([3.5, 4.75]));
       }
-      if (path.endsWith('/obs/numeric_category.codes.u8')) {
+      if (path.endsWith('/obs/1.codes.u8')) {
         return new Response(Uint8Array.from([1, 0]));
       }
-      if (path.endsWith('/var/Gene_A.values.f32')) {
+      if (path.endsWith('/var/0.values.f32')) {
         return new Response(Float32Array.from([8.25, 9.5]));
       }
       return new Response('not found', { status: 404 });
@@ -1004,12 +1005,12 @@ test('DataState keeps exact field descriptors separate from mutable load state',
       quantization: null,
       _varSchema: {
         kind: 'continuous',
-        pathPattern: 'var/{key}.values.f32',
+        pathPattern: 'var/{index}.values.f32',
         ext: 'f32',
         dtype: 'float32',
         quantized: false
       },
-      fields: [['Gene A']]
+      fields: [[0, 'Gene A']]
     }));
     state.initScene(new Float32Array(6), obs);
 

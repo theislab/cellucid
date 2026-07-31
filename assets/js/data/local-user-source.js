@@ -2296,7 +2296,15 @@ export class LocalUserDirDataSource {
       );
     }
 
-    for (const [fieldId, field] of Object.entries(metadata.fields)) {
+    // A vector payload filename is the field's integer index, so the index is
+    // taken from the declaration order the producer wrote the fields in.
+    const vectorFieldEntries = Object.entries(metadata.fields);
+    for (
+      let payloadIndex = 0;
+      payloadIndex < vectorFieldEntries.length;
+      payloadIndex++
+    ) {
+      const [fieldId, field] = vectorFieldEntries[payloadIndex];
       throwIfPreparedAborted(signal);
       const isUmap = fieldId.endsWith('_umap');
       requirePreparedExactKeys(
@@ -2312,17 +2320,17 @@ export class LocalUserDirDataSource {
         `dataset_identity.json vector field "${fieldId}"`,
         this.type
       );
+      // A vector field id is no longer a path component, so it carries no
+      // filename rule: it only has to name one field exactly.
       if (
-        !/^[A-Za-z0-9-](?:[A-Za-z0-9._-]*[A-Za-z0-9-])?$/.test(
-          fieldId
-        ) ||
+        fieldId.length === 0 ||
         field.label !== fieldId ||
         !Array.isArray(field.available_dimensions) ||
         !isPlainObject(field.files) ||
         (isUmap && field.basis !== 'umap')
       ) {
         throw preparedDataError(
-          `Invalid vector field "${fieldId}" portable id, label, or basis ` +
+          `Invalid vector field "${fieldId}" id, label, or basis ` +
           'in dataset_identity.json.',
           this.type
         );
@@ -2377,7 +2385,7 @@ export class LocalUserDirDataSource {
           this.type
         );
         const expectedFilename =
-          `vectors/${fieldId}_${dimension}d.bin` +
+          `vectors/${payloadIndex}_${dimension}d.bin` +
           (identity.export_settings.compression === null ? '' : '.gz');
         if (filename !== expectedFilename) {
           throw preparedDataError(

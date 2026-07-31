@@ -527,7 +527,7 @@ test(
     });
     let codesRequests = 0;
     await page.route(
-      '**/tests/browser/fixtures/exports/current-ui-prepared/obs/cell_type.codes.u8',
+      '**/tests/browser/fixtures/exports/current-ui-prepared/obs/1.codes.u8',
       async route => {
         codesRequests++;
         await codesGate;
@@ -740,7 +740,7 @@ test('a published no-vector sample replaces a prior vector-field select generati
         available_dimensions: [2],
         default_dimension: 2,
         files: {
-          '2d': 'vectors/velocity_umap_2d.bin',
+          '2d': 'vectors/0_2d.bin',
         },
       },
     },

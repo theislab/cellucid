@@ -39,7 +39,7 @@ function makeOutliers(pointCount = 120) {
   return bytes;
 }
 
-function categoricalEntry(key, categoryCount) {
+function categoricalEntry(payloadIndex, key, categoryCount) {
   const categories = Array.from(
     { length: categoryCount },
     (_value, index) => `${key}-${index + 1}`,
@@ -50,6 +50,7 @@ function categoricalEntry(key, categoryCount) {
     n_points: 120 / categoryCount,
   }));
   return [
+    payloadIndex,
     key,
     categories,
     'uint8',
@@ -74,19 +75,21 @@ async function installDifferentCardinalityFields(page) {
   await page.route('**/current-ui-prepared/obs_manifest.json', async route => {
     const response = await route.fetch();
     const manifest = await response.json();
+    // The fixture already holds obs payload indices 0 and 1, so the added
+     // fields continue that one shared space.
     manifest._categoricalFields.push(
-      categoricalEntry('large_category', 5),
-      categoricalEntry('small_category', 4),
+      categoricalEntry(2, 'large_category', 5),
+      categoricalEntry(3, 'small_category', 4),
     );
     await route.fulfill({ response, json: manifest });
   });
 
-  for (const [key, count] of [
-    ['large_category', 5],
-    ['small_category', 4],
+  for (const [payloadIndex, count] of [
+    [2, 5],
+    [3, 4],
   ]) {
     await page.route(
-      `**/current-ui-prepared/obs/${key}.codes.u8`,
+      `**/current-ui-prepared/obs/${payloadIndex}.codes.u8`,
       route => route.fulfill({
         status: 200,
         contentType: 'application/octet-stream',
@@ -94,7 +97,7 @@ async function installDifferentCardinalityFields(page) {
       }),
     );
     await page.route(
-      `**/current-ui-prepared/obs/${key}.outliers.f32`,
+      `**/current-ui-prepared/obs/${payloadIndex}.outliers.f32`,
       route => route.fulfill({
         status: 200,
         contentType: 'application/octet-stream',

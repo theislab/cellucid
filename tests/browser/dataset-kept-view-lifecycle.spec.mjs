@@ -136,12 +136,12 @@ function buildAlternateObsManifest({
 }) {
   const alternate = structuredClone(manifest);
   const categorical = alternate._categoricalFields.find(
-    field => field[0] === 'cell_type',
+    field => field[1] === 'cell_type',
   );
   if (!categorical) {
     throw new Error('Prepared fixture has no cell_type categorical field.');
   }
-  categorical[1] = [...ALTERNATE_CATEGORY_LABELS];
+  categorical[2] = [...ALTERNATE_CATEGORY_LABELS];
 
   const centroids = ALTERNATE_CATEGORY_LABELS.map((category, code) => {
     let count = 0;
@@ -168,7 +168,7 @@ function buildAlternateObsManifest({
       n_points: count,
     };
   });
-  categorical[4] = { 2: centroids };
+  categorical[5] = { 2: centroids };
   return alternate;
 }
 
@@ -185,12 +185,12 @@ async function createAlternatePreparedArtifacts() {
     readFile(new URL('obs_manifest.json', PREPARED_FIXTURE_ROOT)),
     readFile(new URL('points_2d.bin', PREPARED_FIXTURE_ROOT)),
     readFile(
-      new URL('obs/cell_type.codes.u8', PREPARED_FIXTURE_ROOT),
+      new URL('obs/1.codes.u8', PREPARED_FIXTURE_ROOT),
     ),
     readFile(
-      new URL('obs/cell_type.outliers.f32', PREPARED_FIXTURE_ROOT),
+      new URL('obs/1.outliers.f32', PREPARED_FIXTURE_ROOT),
     ),
-    readFile(new URL('obs/score.values.f32', PREPARED_FIXTURE_ROOT)),
+    readFile(new URL('obs/0.values.f32', PREPARED_FIXTURE_ROOT)),
   ]);
 
   const positions = rotatePreparedPoints(positionsBody);
@@ -237,9 +237,9 @@ async function createAlternatePreparedArtifacts() {
     ['dataset_identity.json', Buffer.from(JSON.stringify(identity))],
     ['obs_manifest.json', Buffer.from(JSON.stringify(manifest))],
     ['points_2d.bin', positions],
-    ['obs/cell_type.codes.u8', codes],
-    ['obs/cell_type.outliers.f32', outliers],
-    ['obs/score.values.f32', score],
+    ['obs/1.codes.u8', codes],
+    ['obs/1.outliers.f32', outliers],
+    ['obs/0.values.f32', score],
   ]);
 }
 
@@ -322,8 +322,8 @@ async function installZeroCellPreparedDataset(page) {
   const obsManifest = JSON.parse(obsManifestBody.toString('utf8'));
   obsManifest.n_points = 0;
   for (const categorical of obsManifest._categoricalFields) {
-    categorical[4] = Object.fromEntries(
-      Object.keys(categorical[4]).map(dimension => [dimension, []]),
+    categorical[5] = Object.fromEntries(
+      Object.keys(categorical[5]).map(dimension => [dimension, []]),
     );
   }
   const varManifest = JSON.parse(varManifestBody.toString('utf8'));

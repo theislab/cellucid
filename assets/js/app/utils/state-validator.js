@@ -9,7 +9,44 @@
 
 import { Limits, FieldKind, OverlapStrategy } from './field-constants.js';
 
+/**
+ * Characters that occupy no glyph, so a key carrying one is stored as
+ * something other than the key the reader sees.
+ *
+ * These two classes are the writers' rule, character for character:
+ * cellucid-python's _CONTROL_CHARACTER_PATTERN / _INVISIBLE_CHARACTER_PATTERN
+ * and cellucid-r's .control_character_pattern / .invisible_character_pattern.
+ * U+200C and U+200D are deliberately absent from the second class: they join
+ * Indic, Persian, and emoji sequences, so banning them would reject real text.
+ */
+const CONTROL_CHARACTER = /[\u0000-\u001f\u007f-\u009f]/;
+const INVISIBLE_CHARACTER = /[\u200b\u2060\ufeff]/;
+
+function describeCodePoint(character) {
+  return `U+${character.codePointAt(0).toString(16).toUpperCase().padStart(4, '0')}`;
+}
+
 export class StateValidator {
+  /**
+   * A field key is an identity, not a path and not a rendered token.
+   *
+   * This is exactly the rule both writers apply to every exported field
+   * identity (cellucid-python's _require_field_identities(), cellucid-r's
+   * .require_field_identities()): a non-empty string with no leading or
+   * trailing whitespace and no character that has no glyph. Anything narrower
+   * rejects a key a producer may legitimately publish, and the manifest reader
+   * accepts it long before the overlay and rename paths reach this check, so
+   * the field loads and then throws when the reader touches it.
+   *
+   * Two narrower rules used to live here and are gone for that reason. ':' is
+   * an ordinary drawable character that ATAC feature names use throughout
+   * ('chr1:100-200'); nothing derived from a field key parses on it, because
+   * the one ':'-delimited derived string -- DataLayer's cache key
+   * `type:variableKey:pageIds[:v=...]` -- reads its page IDs from the tail. A
+   * length cap likewise rejected a name the writers publish and the app must
+   * render regardless; over-long names are a layout question, not a validity
+   * one.
+   */
   static validateFieldKey(key) {
     if (!key || typeof key !== 'string') {
       throw new Error('Field name must be a non-empty string');
@@ -17,11 +54,17 @@ export class StateValidator {
     if (key.trim() !== key) {
       throw new Error('Field name cannot have leading/trailing whitespace');
     }
-    if (key.length > Limits.MAX_FIELD_KEY_LENGTH) {
-      throw new Error(`Field name too long (max ${Limits.MAX_FIELD_KEY_LENGTH} characters)`);
+    const control = CONTROL_CHARACTER.exec(key);
+    if (control !== null) {
+      throw new Error(
+        `Field name cannot contain the control character ${describeCodePoint(control[0])}`
+      );
     }
-    if (key.includes(':')) {
-      throw new Error('Field name cannot contain ":"');
+    const invisible = INVISIBLE_CHARACTER.exec(key);
+    if (invisible !== null) {
+      throw new Error(
+        `Field name cannot contain the zero-width character ${describeCodePoint(invisible[0])}`
+      );
     }
     return true;
   }

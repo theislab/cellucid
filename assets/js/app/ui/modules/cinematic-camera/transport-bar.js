@@ -3,7 +3,9 @@
  *
  * Creates a fixed-position bar at the top of the 3D viewport with play/pause,
  * stop, a scrubable timeline with keyframe markers, and a time readout.
- * Auto-hides after inactivity and reappears on mouse movement.
+ * Auto-hides after inactivity and reappears on any pointer or Tab activity —
+ * including activity inside the sidebar, where the Camera Path accordion that
+ * feeds this bar lives.
  *
  * @module ui/modules/cinematic-camera/transport-bar
  */
@@ -16,7 +18,10 @@ import { isCameraPathReady } from './keyframe-store.js';
 import { readCameraBooleanOption } from '../camera-input-contract.js';
 import { parseIntegerInput } from '../../core/numeric-input-contract.js';
 
-const HIDE_DELAY = 3000; // ms
+/* Idle time before the bar fades out. Long enough to survive a pause while
+   composing a keyframe in the sidebar; playback additionally suppresses the
+   hide entirely (see hide()). */
+const HIDE_DELAY = 10000; // ms
 
 // SVG icon helpers (matches the feather-style 2 px stroke used elsewhere)
 const ICON_PLAY = `<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" stroke="none"><polygon points="8,5 19,12 8,19"/></svg>`;
@@ -61,8 +66,11 @@ export function createTransportBar({ playbackController, keyframeStore, getInter
   let markersEl = null;
   /** @type {HTMLElement|null} */
   let readoutEl = null;
+  /** @type {HTMLElement|null} */
+  let innerEl = null;
 
   let hideTimeout = null;
+  let isPointerOverBar = false;
   let isScrubbing = false;
   let wasPlayingBeforeScrub = false;
   let sidebarObserver = null;
@@ -103,6 +111,7 @@ export function createTransportBar({ playbackController, keyframeStore, getInter
       }
       return element;
     };
+    innerEl = requireElement('.cinematic-transport-inner');
     playBtn = requireElement('.cinematic-play-btn');
     progressEl = requireElement('.cinematic-timeline-progress');
     scrubberEl = requireElement('.cinematic-timeline-scrubber');
@@ -171,9 +180,16 @@ export function createTransportBar({ playbackController, keyframeStore, getInter
     document.addEventListener('pointerdown', onMouseActivity, { passive: true });
     document.addEventListener('keydown', onKeyboardActivity);
 
-    // Keep bar visible while hovering it
-    barEl.addEventListener('mouseenter', () => { clearTimeout(hideTimeout); });
-    barEl.addEventListener('mouseleave', () => { scheduleHide(); });
+    // Keep bar visible while hovering it. The inner element is the pointer
+    // target; the outer track is transparent to the pointer.
+    innerEl.addEventListener('mouseenter', () => {
+      isPointerOverBar = true;
+      clearTimeout(hideTimeout);
+    });
+    innerEl.addEventListener('mouseleave', () => {
+      isPointerOverBar = false;
+      scheduleHide();
+    });
     barEl.addEventListener('focusin', () => { clearTimeout(hideTimeout); });
     barEl.addEventListener('focusout', () => {
       setTimeout(scheduleHide, 0);
@@ -238,16 +254,17 @@ export function createTransportBar({ playbackController, keyframeStore, getInter
     clearTimeout(hideTimeout);
     if (!barEl || !pathIsReady()) return;
     if (barEl.contains(document.activeElement)) return;
+    // A pointer resting on the bar is the strongest "still in use" signal
+    // there is. Clearing the timer on mouseenter alone is not enough: the
+    // mousemove that lands the pointer on the bar re-arms it immediately.
+    if (isPointerOverBar) return;
     hideTimeout = setTimeout(() => hide({ force: false }), HIDE_DELAY);
   }
 
-  function onMouseActivity(e) {
+  function onMouseActivity() {
     if (!barEl) return;
-    // Only react to mouse events over the viewport (not the sidebar)
-    const sidebar = document.getElementById('sidebar');
-    if (sidebar && !sidebar.classList.contains('hidden') && e.clientX < sidebar.getBoundingClientRect().right) {
-      return;
-    }
+    // Sidebar activity counts: the Camera Path accordion that drives this bar
+    // lives there, so saving keyframes must not let the bar time out.
     if (pathIsReady()) {
       show();
     }
@@ -379,6 +396,8 @@ export function createTransportBar({ playbackController, keyframeStore, getInter
       barEl.remove();
       barEl = null;
     }
+    innerEl = null;
+    isPointerOverBar = false;
     playBtn = null;
     progressEl = null;
     scrubberEl = null;

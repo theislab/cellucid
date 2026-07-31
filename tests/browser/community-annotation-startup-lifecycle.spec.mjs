@@ -613,30 +613,17 @@ async function installPrototypeNamedPreparedField(page) {
       const response = await route.fetch();
       const manifest = await response.json();
       const categorical = manifest._categoricalFields.find(
-        field => field[0] === 'cell_type',
+        field => field[1] === 'cell_type',
       );
       if (categorical === undefined) {
         throw new Error('Prepared manifest is missing its categorical field.');
       }
-      categorical[0] = '__proto__';
+      // A field name is no longer part of any path, so renaming it to a
+      // prototype key leaves the payload where the manifest's index says.
+      categorical[1] = '__proto__';
       await route.fulfill({ response, json: manifest });
     },
   );
-  for (const suffix of ['codes.u8', 'outliers.f32']) {
-    await page.route(
-      `**/current-ui-prepared/obs/__proto__.${suffix}`,
-      async route => {
-        const requested = new URL(route.request().url());
-        const source = new URL(requested);
-        source.pathname = source.pathname.replace(
-          `/obs/__proto__.${suffix}`,
-          `/obs/cell_type.${suffix}`,
-        );
-        const response = await route.fetch({ url: source.href });
-        await route.fulfill({ response });
-      },
-    );
-  }
 }
 
 function deepLink(repo = FIRST_REPO, { includeBranch = true } = {}) {

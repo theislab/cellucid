@@ -210,7 +210,7 @@
 .highlight-clear-btn:hover {
   background: var(--color-danger-soft);
   border-color: var(--color-danger);
-  color: var(--color-danger);
+  color: var(--color-danger-text);
 }
 
 /* ========================================================================
@@ -390,7 +390,7 @@
 
 .highlight-page-tab-delete:hover {
   opacity: 1;
-  color: var(--color-danger);
+  color: var(--color-danger-text);
 }
 
 .highlight-page-add-btn {

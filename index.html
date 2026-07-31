@@ -1573,30 +1573,31 @@
         <summary>Camera Path</summary>
         <div class="accordion-content">
 
-          <!-- Navigation controls (mirrors Compare Views block) -->
+          <!-- Navigation controls (the same viewer navigation state as the
+               Compare Views block; either surface drives the active view) -->
           <div class="control-block" id="cinematic-navigation-controls">
             <div class="d-flex items-center gap-1">
               <label>Navigation:</label>
               <button
                 type="button"
-                id="camera-path-info-btn"
+                id="cinematic-navigation-info-btn"
                 class="info-btn"
-                aria-label="About camera paths"
-                aria-controls="camera-path-info-tooltip"
+                aria-label="About camera path navigation modes"
+                aria-controls="cinematic-navigation-info-tooltip"
                 aria-haspopup="dialog"
                 aria-expanded="false"
               ><span aria-hidden="true">i</span></button>
             </div>
             <div
-              id="camera-path-info-tooltip"
+              id="cinematic-navigation-info-tooltip"
               class="info-tooltip"
               role="dialog"
-              aria-labelledby="camera-path-info-btn"
+              aria-labelledby="cinematic-navigation-info-btn"
               tabindex="-1"
               hidden
             >
               <div class="info-tooltip-content">
-                Save at least two positions to enable the top playback bar. Autoplay is opt-in.
+                The same navigation mode as the Compare Views panel. Each keyframe records the mode it was saved in.
               </div>
             </div>
             <div class="control-block">
@@ -1669,7 +1670,30 @@
 
           <!-- Save position button -->
           <div class="control-block">
-            <label class="mt-0">Save Keyframe</label>
+            <div class="d-flex items-center gap-1">
+              <label class="mt-0">Save Keyframe</label>
+              <button
+                type="button"
+                id="camera-path-info-btn"
+                class="info-btn"
+                aria-label="About camera paths"
+                aria-controls="camera-path-info-tooltip"
+                aria-haspopup="dialog"
+                aria-expanded="false"
+              ><span aria-hidden="true">i</span></button>
+            </div>
+            <div
+              id="camera-path-info-tooltip"
+              class="info-tooltip"
+              role="dialog"
+              aria-labelledby="camera-path-info-btn"
+              tabindex="-1"
+              hidden
+            >
+              <div class="info-tooltip-content">
+                Save at least two positions to enable the top playback bar. Autoplay is opt-in.
+              </div>
+            </div>
             <button id="cinematic-save-btn" class="reset-btn w-full" type="button">
               Save Position
             </button>
@@ -1947,7 +1971,14 @@
               <!-- Verdict Box -->
               <div id="bn-verdict-box" class="bn-verdict" data-status="warning">
                 <div class="bn-verdict-header">
-                  <span id="bn-verdict-icon" class="bn-verdict-icon">⚠️</span>
+                  <!-- Decorative: the verdict title carries the meaning. The
+                       glyph for the active data-status is revealed by CSS and
+                       inherits the verdict colour through currentColor. -->
+                  <span class="bn-verdict-icon" aria-hidden="true">
+                    <svg class="bn-verdict-glyph" data-status="good" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><polyline points="8 12.5 11 15.5 16 9"/></svg>
+                    <svg class="bn-verdict-glyph" data-status="warning" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.5 22 20.5H2z"/><line x1="12" y1="10" x2="12" y2="14.5"/><line x1="12" y1="17.5" x2="12" y2="17.6"/></svg>
+                    <svg class="bn-verdict-glyph" data-status="danger" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>
+                  </span>
                   <span id="bn-verdict-title" class="bn-verdict-title">--</span>
                 </div>
                 <div id="bn-verdict-detail" class="bn-verdict-detail">--</div>

@@ -7,7 +7,10 @@
  * @module data/quantization-worker
  */
 
-import { validateQuantizationTask } from './quantization-contract.js';
+import {
+  isConstantQuantizationRange,
+  validateQuantizationTask,
+} from './quantization-contract.js';
 
 /**
  * @typedef {{
@@ -35,8 +38,16 @@ export function dequantizeToFloat32Buffer(payload) {
   const maxQuant = isU8 ? 254 : 65534;
   const nanMarker = isU8 ? 255 : 65535;
 
-  const range = maxValue - minValue;
-  const scale = range / maxQuant;
+  if (isConstantQuantizationRange(minValue, maxValue)) {
+    // compact_v1's constant-field case: equal bounds, every code 0. Return the
+    // constant itself instead of scaling by a range of zero.
+    for (let i = 0; i < n; i++) {
+      out[i] = quantized[i] === nanMarker ? NaN : minValue;
+    }
+    return out.buffer;
+  }
+
+  const scale = (maxValue - minValue) / maxQuant;
 
   for (let i = 0; i < n; i++) {
     const q = quantized[i];

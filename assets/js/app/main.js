@@ -4339,33 +4339,30 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
 
           // Build verdict
           const verdictBox = document.getElementById('bn-verdict-box');
-          const verdictIcon = document.getElementById('bn-verdict-icon');
           const verdictTitle = document.getElementById('bn-verdict-title');
           const verdictDetail = document.getElementById('bn-verdict-detail');
 
-          let verdictText, detailText, icon, status;
+          let verdictText, detailText, status;
 
           if (fps >= 55) {
-            icon = '✅';
             status = 'good';
             verdictText = 'Performance is good';
             detailText = 'Running smoothly at ' + fps.toFixed(0) + ' FPS. No issues detected.';
           } else if (fps >= 30) {
-            icon = '⚠️';
             status = 'warning';
             verdictText = 'Performance could be better';
             detailText = b.primary.type + ' is the main bottleneck. ' + (b.primary.evidence || '');
           } else {
-            icon = '🔴';
             status = 'danger';
             verdictText = 'Serious performance problem';
             detailText = b.primary.type + ' is severely limiting performance. ' + (b.primary.evidence || '');
           }
 
+          // The status drives both the panel tint and which decorative glyph
+          // CSS reveals; no icon character is written from script.
           if (verdictBox) {
             verdictBox.dataset.status = status;
           }
-          if (verdictIcon) verdictIcon.textContent = icon;
           if (verdictTitle) {
             verdictTitle.textContent = verdictText;
           }
@@ -4427,8 +4424,8 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
             if (s.frameStability && s.frameStability.hasJank) {
               const severity = s.frameStability.jankSeverity;
               const stutterStatus = severity === 'mild' ? 'warning' : 'danger';
-              const stutterIcon = stutterStatus === 'danger' ? '🔴' : '⚠️';
-              items.push(createListItem(`• ${stutterIcon} Frame stuttering: ${s.frameStability.diagnosis} (${s.frameStability.jankPercent} janky frames)`, { status: stutterStatus }));
+              // Severity is stated in words, not colour or an icon character.
+              items.push(createListItem(`• Frame stuttering (${severity}): ${s.frameStability.diagnosis} (${s.frameStability.jankPercent} janky frames)`, { status: stutterStatus }));
             }
 
             // Add CPU/JS health issues

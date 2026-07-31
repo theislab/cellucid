@@ -22,7 +22,10 @@ import {
   dequantizeToFloat32InWorker,
   selectQuantizationBackend,
 } from './quantization-worker-pool.js';
-import { validateQuantizationMetadata } from './quantization-contract.js';
+import {
+  isConstantQuantizationRange,
+  validateQuantizationMetadata,
+} from './quantization-contract.js';
 import {
   CONNECTIVITY_MANIFEST_CONTEXT,
   validateConnectivityEdgeData,
@@ -570,13 +573,23 @@ function dequantize(quantized, minValue, maxValue, bits) {
   }, 'Field quantization codec');
   const n = quantized.length;
   const result = new Float32Array(n);
-  
+
   // Determine max quantized value and NaN marker
   const maxQuant = bits === 8 ? 254 : 65534;
   const nanMarker = bits === 8 ? 255 : 65535;
-  const range = maxValue - minValue;
-  const scale = range / maxQuant;
-  
+
+  if (isConstantQuantizationRange(minValue, maxValue)) {
+    // compact_v1's constant-field case: equal bounds, every code 0. Return the
+    // constant itself instead of scaling by a range of zero, so the value the
+    // writer published comes back exactly.
+    for (let i = 0; i < n; i++) {
+      result[i] = quantized[i] === nanMarker ? NaN : minValue;
+    }
+    return result;
+  }
+
+  const scale = (maxValue - minValue) / maxQuant;
+
   for (let i = 0; i < n; i++) {
     const q = quantized[i];
     if (q === nanMarker) {
@@ -585,7 +598,7 @@ function dequantize(quantized, minValue, maxValue, bits) {
       result[i] = minValue + q * scale;
     }
   }
-  
+
   return result;
 }
 
@@ -1001,23 +1014,6 @@ async function fetchBinaryWithProgressInternal(
   });
 }
 
-/**
- * Convert filename to safe version (must match Python _safe_filename_component)
- */
-function safeFilenameComponent(name) {
-  if (typeof name !== 'string' || name.length === 0) {
-    throw new Error('Compact manifest field keys must be non-empty strings');
-  }
-  let safe = name.replace(/[^A-Za-z0-9._-]+/g, '_');
-  safe = safe.replace(/^[._]+|[._]+$/g, '');
-  if (safe.length === 0) {
-    throw new Error(
-      `Compact manifest field key "${name}" has no valid filename characters`
-    );
-  }
-  return safe;
-}
-
 function isRecord(value) {
   return (
     value !== null &&
@@ -1143,10 +1139,20 @@ function validatePathTemplate({
   for (const placeholder of placeholders) {
     concrete = concrete.replace(
       `{${placeholder}}`,
-      placeholder === 'key' ? 'FIELD' : 'u8'
+      placeholder === 'index' ? '0' : 'u8'
     );
   }
   requireRelativePayloadPath(concrete, label);
+}
+
+/**
+ * Expand one payload path pattern against the index its field declares.
+ *
+ * A payload filename is the field's integer index and nothing else, so the
+ * substitution is exactly the decimal the manifest entry carries.
+ */
+function expandPayloadPattern(pattern, payloadIndex) {
+  return pattern.replace('{index}', String(payloadIndex));
 }
 
 function validateContinuousSchema(schema, {
@@ -1198,8 +1204,8 @@ function validateContinuousSchema(schema, {
 
   validatePathTemplate({
     template: schema.pathPattern,
-    placeholders: ['key'],
-    requiredTail: `{key}.values.${schema.ext}`,
+    placeholders: ['index'],
+    requiredTail: `{index}.values.${schema.ext}`,
     compression,
     label: `${label} pathPattern`,
   });
@@ -1246,8 +1252,8 @@ function validateCategoricalSchema(schema, compression) {
 
   validatePathTemplate({
     template: schema.codesPathPattern,
-    placeholders: ['key', 'ext'],
-    requiredTail: '{key}.codes.{ext}',
+    placeholders: ['index', 'ext'],
+    requiredTail: '{index}.codes.{ext}',
     compression,
     label: `${label} codesPathPattern`,
   });
@@ -1276,34 +1282,68 @@ function validateCategoricalSchema(schema, compression) {
 
   validatePathTemplate({
     template: schema.outlierPathPattern,
-    placeholders: ['key'],
-    requiredTail: `{key}.outliers.${schema.outlierExt}`,
+    placeholders: ['index'],
+    requiredTail: `{index}.outliers.${schema.outlierExt}`,
     compression,
     label: `${label} outlierPathPattern`,
   });
 }
 
-function validateFieldKey(key, {
-  rawKeys,
-  safeKeys,
+/**
+ * Validate one field's sole identity: a non-empty name, unique on its axis.
+ *
+ * A name is no longer a path component, so nothing here constrains its
+ * characters. It only has to be exact text the app can draw and match.
+ */
+function validateFieldName(name, {
+  names,
   label,
 }) {
-  const safeKey = safeFilenameComponent(key);
-  if (rawKeys.has(key)) {
+  if (typeof name !== 'string' || name.length === 0) {
     throw new Error(
-      `Invalid compact_v1 ${label}: field key "${key}" is duplicated`
+      `Invalid compact_v1 ${label}: field name must be a non-empty string`
     );
   }
-  const collidingKey = safeKeys.get(safeKey);
-  if (collidingKey !== undefined) {
+  if (names.has(name)) {
     throw new Error(
-      `Invalid compact_v1 ${label}: field keys "${collidingKey}" and ` +
-      `"${key}" collide at payload path component "${safeKey}"`
+      `Invalid compact_v1 ${label}: field name "${name}" is duplicated`
     );
   }
-  rawKeys.add(key);
-  safeKeys.set(safeKey, key);
-  return safeKey;
+  names.add(name);
+  return name;
+}
+
+/**
+ * Validate one field's declared payload index, which is also its filename.
+ */
+function requirePayloadIndex(value, label) {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error(
+      `Invalid compact_v1 ${label}: payload index must be a non-negative ` +
+      'safe integer, declared as element 0 of the field entry'
+    );
+  }
+  return value;
+}
+
+/**
+ * Require one payload directory's indices to be exactly 0..N-1, each used once.
+ *
+ * Two fields sharing an index name one file, so one field's payload would be
+ * read under the other field's name — wrong values drawn under a right-looking
+ * label, with nothing thrown. obs/ is written by both the continuous and the
+ * categorical array, so those two share a single index space.
+ */
+function requireDensePayloadIndices(indices, label) {
+  const sorted = [...indices].sort((left, right) => left - right);
+  for (let position = 0; position < sorted.length; position++) {
+    if (sorted[position] !== position) {
+      throw new Error(
+        `Invalid compact_v1 ${label}: payload indices must be exactly ` +
+        `0..${sorted.length - 1}, each used once`
+      );
+    }
+  }
 }
 
 function requireQuantizedBounds(minValue, maxValue, label) {
@@ -1312,9 +1352,12 @@ function requireQuantizedBounds(minValue, maxValue, label) {
       `Invalid compact_v1 ${label}: quantization bounds must be finite`
     );
   }
-  if (!(minValue < maxValue)) {
+  // Equal bounds are compact_v1's constant-field case: the payload carries one
+  // value, published as every code 0. Rejecting it here would discard the whole
+  // manifest over a gene a lineage subset left undetected.
+  if (!(minValue <= maxValue)) {
     throw new Error(
-      `Invalid compact_v1 ${label}: minValue must be less than maxValue`
+      `Invalid compact_v1 ${label}: minValue must not exceed maxValue`
     );
   }
 }
@@ -1493,7 +1536,8 @@ function validateVarManifestHeader(manifest) {
 
 /**
  * Expand the sole current compact var manifest into the runtime field shape.
- * Compact format uses _varSchema + field tuples [key, minValue, maxValue].
+ * Compact format uses _varSchema + field tuples
+ * [payloadIndex, name] or [payloadIndex, name, minValue, maxValue].
  * @param {Object} manifest - Raw manifest (possibly compact)
  * @returns {Object} Expanded manifest with fields array
  */
@@ -1515,46 +1559,49 @@ export function expandVarManifest(manifest) {
   }
 
   const fields = [];
-  const rawKeys = new Set();
-  const safeKeys = new Map();
+  const names = new Set();
+  const payloadIndices = [];
   for (const fieldTuple of manifest.fields) {
     if (
       !Array.isArray(fieldTuple) ||
-      fieldTuple.length !== (schema.quantized ? 3 : 1)
+      fieldTuple.length !== (schema.quantized ? 4 : 2)
     ) {
       throw new Error(
         `Invalid compact_v1 var field tuple: expected exactly ` +
-        (schema.quantized ? '[key, minValue, maxValue]' : '[key]')
+        (schema.quantized
+          ? '[payloadIndex, name, minValue, maxValue]'
+          : '[payloadIndex, name]')
       );
     }
-    const key = fieldTuple[0];
-    const safeKey = validateFieldKey(key, {
-      rawKeys,
-      safeKeys,
+    const payloadIndex = requirePayloadIndex(fieldTuple[0], 'var manifest');
+    const key = validateFieldName(fieldTuple[1], {
+      names,
       label: 'var manifest',
     });
+    payloadIndices.push(payloadIndex);
 
     const field = {
       key,
       kind: schema.kind,
-      valuesPath: schema.pathPattern.replace('{key}', safeKey),
+      valuesPath: expandPayloadPattern(schema.pathPattern, payloadIndex),
       valuesDtype: schema.dtype,
       quantized: schema.quantized,
     };
 
     if (schema.quantized) {
       requireQuantizedBounds(
-        fieldTuple[1],
         fieldTuple[2],
+        fieldTuple[3],
         `var field "${key}"`
       );
       field.quantizationBits = schema.quantizationBits;
-      field.minValue = fieldTuple[1];
-      field.maxValue = fieldTuple[2];
+      field.minValue = fieldTuple[2];
+      field.maxValue = fieldTuple[3];
     }
 
     fields.push(field);
   }
+  requireDensePayloadIndices(payloadIndices, 'var manifest');
 
   return {
     n_points: manifest.n_points,
@@ -1575,8 +1622,10 @@ export function expandObsManifest(manifest) {
   validateObsManifestHeader(manifest);
   const schemas = manifest._obsSchemas;
   const fields = [];
-  const rawKeys = new Set();
-  const safeKeys = new Map();
+  const names = new Set();
+  // obs/ is written by both manifest arrays, so their payload indices are one
+  // shared space and are checked together once both arrays have been read.
+  const payloadIndices = [];
 
   if (manifest._continuousFields.length > 0) {
     const contSchema = schemas.continuous;
@@ -1588,26 +1637,29 @@ export function expandObsManifest(manifest) {
     for (const fieldTuple of manifest._continuousFields) {
       if (
         !Array.isArray(fieldTuple) ||
-        fieldTuple.length !== (contSchema.quantized ? 3 : 1)
+        fieldTuple.length !== (contSchema.quantized ? 4 : 2)
       ) {
         throw new Error(
           `Invalid compact_v1 continuous field tuple: expected exactly ` +
           (contSchema.quantized
-            ? '[key, minValue, maxValue]'
-            : '[key]')
+            ? '[payloadIndex, key, minValue, maxValue]'
+            : '[payloadIndex, key]')
         );
       }
-      const key = fieldTuple[0];
-      const safeKey = validateFieldKey(key, {
-        rawKeys,
-        safeKeys,
+      const payloadIndex = requirePayloadIndex(
+        fieldTuple[0],
+        'obs continuous manifest'
+      );
+      const key = validateFieldName(fieldTuple[1], {
+        names,
         label: 'obs manifest',
       });
+      payloadIndices.push(payloadIndex);
 
       const field = {
         key,
         kind: 'continuous',
-        valuesPath: contSchema.pathPattern.replace('{key}', safeKey),
+        valuesPath: expandPayloadPattern(contSchema.pathPattern, payloadIndex),
         valuesDtype: contSchema.dtype,
         quantized: contSchema.quantized,
         centroids: null,
@@ -1616,13 +1668,13 @@ export function expandObsManifest(manifest) {
 
       if (contSchema.quantized) {
         requireQuantizedBounds(
-          fieldTuple[1],
           fieldTuple[2],
+          fieldTuple[3],
           `continuous field "${key}"`
         );
         field.quantizationBits = contSchema.quantizationBits;
-        field.minValue = fieldTuple[1];
-        field.maxValue = fieldTuple[2];
+        field.minValue = fieldTuple[2];
+        field.maxValue = fieldTuple[3];
       }
 
       fields.push(field);
@@ -1635,25 +1687,28 @@ export function expandObsManifest(manifest) {
     for (const fieldTuple of manifest._categoricalFields) {
       if (
         !Array.isArray(fieldTuple) ||
-        fieldTuple.length !== (catSchema.outlierQuantized ? 7 : 5)
+        fieldTuple.length !== (catSchema.outlierQuantized ? 8 : 6)
       ) {
         throw new Error(
           `Invalid compact_v1 categorical field tuple: expected exactly ` +
           (catSchema.outlierQuantized
-            ? '[key, categories, codesDtype, codesMissingValue, centroidsByDim, outlierMinValue, outlierMaxValue]'
-            : '[key, categories, codesDtype, codesMissingValue, centroidsByDim]')
+            ? '[payloadIndex, key, categories, codesDtype, codesMissingValue, centroidsByDim, outlierMinValue, outlierMaxValue]'
+            : '[payloadIndex, key, categories, codesDtype, codesMissingValue, centroidsByDim]')
         );
       }
-      const key = fieldTuple[0];
-      const safeKey = validateFieldKey(key, {
-        rawKeys,
-        safeKeys,
+      const payloadIndex = requirePayloadIndex(
+        fieldTuple[0],
+        'obs categorical manifest'
+      );
+      const key = validateFieldName(fieldTuple[1], {
+        names,
         label: 'obs manifest',
       });
-      const categories = fieldTuple[1];
-      const codesDtype = fieldTuple[2];
-      const codesMissingValue = fieldTuple[3];
-      const centroidsData = fieldTuple[4];
+      payloadIndices.push(payloadIndex);
+      const categories = fieldTuple[2];
+      const codesDtype = fieldTuple[3];
+      const codesMissingValue = fieldTuple[4];
+      const centroidsData = fieldTuple[5];
       validateCategoricalStorage({
         categories,
         dtype: codesDtype,
@@ -1673,12 +1728,15 @@ export function expandObsManifest(manifest) {
         key,
         kind: 'category',
         categories,
-        codesPath: catSchema.codesPathPattern.replace('{key}', safeKey).replace('{ext}', codesExt),
+        codesPath: expandPayloadPattern(
+          catSchema.codesPathPattern,
+          payloadIndex
+        ).replace('{ext}', codesExt),
         codesDtype,
         codesMissingValue,
         outlierQuantilesPath: catSchema.outlierPathPattern === null
           ? null
-          : catSchema.outlierPathPattern.replace('{key}', safeKey),
+          : expandPayloadPattern(catSchema.outlierPathPattern, payloadIndex),
         outlierDtype: catSchema.outlierDtype,
         outlierQuantized: catSchema.outlierQuantized,
         centroidsByDim: centroidsData,
@@ -1686,17 +1744,19 @@ export function expandObsManifest(manifest) {
 
       if (catSchema.outlierQuantized) {
         requireQuantizedBounds(
-          fieldTuple[5],
           fieldTuple[6],
+          fieldTuple[7],
           `categorical field "${key}" outliers`
         );
-        field.outlierMinValue = fieldTuple[5];
-        field.outlierMaxValue = fieldTuple[6];
+        field.outlierMinValue = fieldTuple[6];
+        field.outlierMaxValue = fieldTuple[7];
       }
 
       fields.push(field);
     }
   }
+
+  requireDensePayloadIndices(payloadIndices, 'obs manifest');
 
   return {
     n_points: manifest.n_points,

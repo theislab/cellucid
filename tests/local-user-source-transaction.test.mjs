@@ -226,7 +226,7 @@ function createRichCompactPreparedDirectory(directoryName = 'rich-compact') {
           label: 'velocity_umap',
           available_dimensions: [2],
           default_dimension: 2,
-          files: { '2d': 'vectors/velocity_umap_2d.bin' },
+          files: { '2d': 'vectors/0_2d.bin' },
           basis: 'umap',
         },
       },
@@ -240,21 +240,22 @@ function createRichCompactPreparedDirectory(directoryName = 'rich-compact') {
     compression: null,
     _obsSchemas: {
       continuous: {
-        pathPattern: 'obs/{key}.values.f32',
+        pathPattern: 'obs/{index}.values.f32',
         ext: 'f32',
         dtype: 'float32',
         quantized: false,
       },
       categorical: {
-        codesPathPattern: 'obs/{key}.codes.{ext}',
-        outlierPathPattern: 'obs/{key}.outliers.f32',
+        codesPathPattern: 'obs/{index}.codes.{ext}',
+        outlierPathPattern: 'obs/{index}.outliers.f32',
         outlierExt: 'f32',
         outlierDtype: 'float32',
         outlierQuantized: false,
       },
     },
-    _continuousFields: [['score']],
+    _continuousFields: [[0, 'score']],
     _categoricalFields: [[
+      1,
       'cluster',
       ['A', 'B'],
       'uint8',
@@ -270,12 +271,12 @@ function createRichCompactPreparedDirectory(directoryName = 'rich-compact') {
     quantization: null,
     _varSchema: {
       kind: 'continuous',
-      pathPattern: 'var/{key}.values.f32',
+      pathPattern: 'var/{index}.values.f32',
       ext: 'f32',
       dtype: 'float32',
       quantized: false,
     },
-    fields: [['Gene A'], ['Gene/B']],
+    fields: [[0, 'Gene A'], [1, 'Gene/B']],
   };
   const connectivityManifest = {
     format: 'edge_pairs',
@@ -298,18 +299,18 @@ function createRichCompactPreparedDirectory(directoryName = 'rich-compact') {
     obsText: JSON.stringify(obsManifest),
     pointsContents: float32Bytes([0, 0, 1, 0, 0, 1]),
     extraFiles: [
-      ['obs/score.values.f32', float32Bytes([0.25, 0.5, 0.75])],
-      ['obs/cluster.codes.u8', new Uint8Array([0, 1, 255])],
-      ['obs/cluster.outliers.f32', float32Bytes([0.1, 0.2, 0.3])],
+      ['obs/0.values.f32', float32Bytes([0.25, 0.5, 0.75])],
+      ['obs/1.codes.u8', new Uint8Array([0, 1, 255])],
+      ['obs/1.outliers.f32', float32Bytes([0.1, 0.2, 0.3])],
       ['var_manifest.json', JSON.stringify(varManifest)],
-      ['var/Gene_A.values.f32', float32Bytes([1, 2, 3])],
-      ['var/Gene_B.values.f32', float32Bytes([4, 5, 6])],
+      ['var/0.values.f32', float32Bytes([1, 2, 3])],
+      ['var/1.values.f32', float32Bytes([4, 5, 6])],
       ['connectivity_manifest.json', JSON.stringify(connectivityManifest)],
       ['connectivity/edges.src.bin', uint16Bytes([0, 1])],
       ['connectivity/edges.dst.bin', uint16Bytes([1, 2])],
       ['connectivity/edges.weights.f64.bin', float64Bytes([0.25, 2])],
       [
-        'vectors/velocity_umap_2d.bin',
+        'vectors/0_2d.bin',
         float32Bytes([0.1, 0, 0.2, 0, 0.3, 0]),
       ],
     ],
@@ -388,13 +389,13 @@ function createLargePreparedGeneDirectory(
   for (let index = 0; index < nGenes; index++) {
     const key = `Gene_${String(index).padStart(4, '0')}`;
     const defaultPath =
-      `var/${key}.values.f32${gzipAll ? '.gz' : ''}`;
+      `var/${index}.values.f32${gzipAll ? '.gz' : ''}`;
     const payload = payloadForIndex?.({
       index,
       key,
       defaultPath,
     }) ?? {};
-    fields.push([key]);
+    fields.push([index, key]);
     if (payload.omit !== true) {
       const defaultContents = float32Bytes([index, index + 1]);
       extraFiles.push([
@@ -416,7 +417,7 @@ function createLargePreparedGeneDirectory(
       _varSchema: {
         kind: 'continuous',
         pathPattern:
-          `var/{key}.values.f32${gzipAll ? '.gz' : ''}`,
+          `var/{index}.values.f32${gzipAll ? '.gz' : ''}`,
         ext: 'f32',
         dtype: 'float32',
         quantized: false,
@@ -740,7 +741,7 @@ test('valid rich compact_v1 prepared exports retain their full contract', async 
   );
   assert.match(
     await source.resolveUrl(
-      `${source.getBaseUrl(source.datasetId)}var/Gene_A.values.f32`,
+      `${source.getBaseUrl(source.datasetId)}var/0.values.f32`,
       null
     ),
     /^blob:/
@@ -832,7 +833,7 @@ test('prepared lazy payloads stay file-backed across repeated dataset adoption',
   assert.notEqual(adoptedBaseUrls[0], adoptedBaseUrls[1]);
   await assert.rejects(
     manager.resolveUrl(
-      `${adoptedBaseUrls[0]}obs/cluster.codes.u8`,
+      `${adoptedBaseUrls[0]}obs/1.codes.u8`,
       null
     ),
     /dataset|current|prepared-routing-first/i
@@ -863,7 +864,7 @@ test('prepared vector metadata has one exact current shape', async t => {
     [
       'unadvertised file',
       field => {
-        field.files['3d'] = 'vectors/velocity_umap_3d.bin';
+        field.files['3d'] = 'vectors/0_3d.bin';
       },
     ],
   ];
@@ -881,7 +882,7 @@ test('prepared vector metadata has one exact current shape', async t => {
               available_dimensions: [2],
               default_dimension: 2,
               files: {
-                '2d': 'vectors/velocity_umap_2d.bin',
+                '2d': 'vectors/0_2d.bin',
               },
               basis: 'umap',
             },
@@ -895,7 +896,7 @@ test('prepared vector metadata has one exact current shape', async t => {
           createPreparedDirectory(`invalid-vector-${name}`, {
             identityPayload: identity,
             extraFiles: [[
-              'vectors/velocity_umap_2d.bin',
+              'vectors/0_2d.bin',
               float32Bytes([0, 0, 0, 0]),
             ]],
           })
@@ -1397,13 +1398,10 @@ test('prepared vector identity matches the exact producer output', async t => {
       },
     ],
     [
-      'nonportable field id',
+      'empty field id',
       metadata => {
-        metadata.default_field = 'bad field';
-        metadata.fields['bad field'] = {
-          ...metadata.fields.velocity_umap,
-          files: { '2d': 'vectors/bad field_2d.bin' },
-        };
+        metadata.default_field = '';
+        metadata.fields[''] = { ...metadata.fields.velocity_umap };
         delete metadata.fields.velocity_umap;
       },
     ],
@@ -1445,7 +1443,7 @@ test('prepared vector identity matches the exact producer output', async t => {
             available_dimensions: [2],
             default_dimension: 2,
             files: {
-              '2d': 'vectors/velocity_umap_2d.bin',
+              '2d': 'vectors/0_2d.bin',
             },
             basis: 'umap',
           },
@@ -1470,7 +1468,7 @@ test('prepared vector identity matches the exact producer output', async t => {
             }
           )
         ),
-        /vector field|vector_fields|basis|label|path|portable/i
+        /vector field|vector_fields|basis|label|path|id/i
       );
       await assertWorkingPreparedSource(working);
     });
@@ -1542,7 +1540,7 @@ test('prepared manifests require the sole compact_v1 contract', async t => {
               fields: [{
                 key: 'A',
                 kind: 'continuous',
-                valuesPath: 'var/A.values.f32',
+                valuesPath: 'var/0.values.f32',
                 valuesDtype: 'float32',
               }],
             }),
@@ -1664,7 +1662,7 @@ test('prepared identity payload paths decode exactly once', () => {
 test('prepared exports reject aliased advertised payload paths', async t => {
   const fixtures = [
     {
-      name: 'compact obs keys that sanitize to one values path',
+      name: 'compact obs fields that declare one payload index',
       obsManifest: {
         _format: 'compact_v1',
         n_points: 2,
@@ -1673,19 +1671,19 @@ test('prepared exports reject aliased advertised payload paths', async t => {
         compression: null,
         _obsSchemas: {
           continuous: {
-            pathPattern: 'obs/{key}.values.f32',
+            pathPattern: 'obs/{index}.values.f32',
             ext: 'f32',
             dtype: 'float32',
             quantized: false,
           },
         },
-        _continuousFields: [['A B'], ['A/B']],
+        _continuousFields: [[0, 'A B'], [0, 'A/B']],
         _categoricalFields: [],
       },
       extraFiles: [
-        ['obs/A_B.values.f32', float32Bytes([1, 2])],
+        ['obs/0.values.f32', float32Bytes([1, 2])],
       ],
-      expectedError: /field keys.*collide.*A_B/i,
+      expectedError: /payload indices must be exactly 0\.\.1/,
     },
     {
       name: 'categorical fields with one codes path',
@@ -1698,7 +1696,7 @@ test('prepared exports reject aliased advertised payload paths', async t => {
         _obsSchemas: {
           categorical: {
             codesPathPattern: 'obs/shared.codes.{ext}',
-            outlierPathPattern: 'obs/{key}.outliers.f32',
+            outlierPathPattern: 'obs/{index}.outliers.f32',
             outlierExt: 'f32',
             outlierDtype: 'float32',
             outlierQuantized: false,
@@ -1706,14 +1704,14 @@ test('prepared exports reject aliased advertised payload paths', async t => {
         },
         _continuousFields: [],
         _categoricalFields: [
-          ['first', ['A'], 'uint8', 255, { '2': [] }],
-          ['second', ['B'], 'uint8', 255, { '2': [] }],
+          [0, 'first', ['A'], 'uint8', 255, { '2': [] }],
+          [1, 'second', ['B'], 'uint8', 255, { '2': [] }],
         ],
       },
       extraFiles: [
         ['obs/shared.codes.u8', new Uint8Array([0, 0])],
-        ['obs/first.outliers.f32', float32Bytes([0.1, 0.2])],
-        ['obs/second.outliers.f32', float32Bytes([0.3, 0.4])],
+        ['obs/0.outliers.f32', float32Bytes([0.1, 0.2])],
+        ['obs/1.outliers.f32', float32Bytes([0.3, 0.4])],
       ],
       expectedError: /codesPathPattern.*placeholders/i,
     },
@@ -1727,7 +1725,7 @@ test('prepared exports reject aliased advertised payload paths', async t => {
         compression: null,
         _obsSchemas: {
           categorical: {
-            codesPathPattern: 'obs/{key}.codes.{ext}',
+            codesPathPattern: 'obs/{index}.codes.{ext}',
             outlierPathPattern: 'obs/shared.outliers.f32',
             outlierExt: 'f32',
             outlierDtype: 'float32',
@@ -1736,13 +1734,13 @@ test('prepared exports reject aliased advertised payload paths', async t => {
         },
         _continuousFields: [],
         _categoricalFields: [
-          ['first', ['A'], 'uint8', 255, { '2': [] }],
-          ['second', ['B'], 'uint8', 255, { '2': [] }],
+          [0, 'first', ['A'], 'uint8', 255, { '2': [] }],
+          [1, 'second', ['B'], 'uint8', 255, { '2': [] }],
         ],
       },
       extraFiles: [
-        ['obs/first.codes.u8', new Uint8Array([0, 0])],
-        ['obs/second.codes.u8', new Uint8Array([0, 0])],
+        ['obs/0.codes.u8', new Uint8Array([0, 0])],
+        ['obs/1.codes.u8', new Uint8Array([0, 0])],
         ['obs/shared.outliers.f32', float32Bytes([0.1, 0.2])],
       ],
       expectedError: /outlierPathPattern.*placeholders/i,
@@ -1757,28 +1755,28 @@ test('prepared exports reject aliased advertised payload paths', async t => {
         compression: null,
         _obsSchemas: {
           continuous: {
-            pathPattern: 'obs/{key}.values.f32',
+            pathPattern: 'obs/{index}.values.f32',
             ext: 'f32',
             dtype: 'float32',
             quantized: false,
           },
         },
-        _continuousFields: [['position_alias']],
+        _continuousFields: [[0, 'position_alias']],
         _categoricalFields: [],
       },
       extraFiles: [],
-      expectedPath: 'obs/position_alias.values.f32',
+      expectedPath: 'obs/0.values.f32',
       identityPayload: createPreparedIdentity({
         nCells: 2,
-        pointsFilename: 'obs/position_alias.values.f32',
+        pointsFilename: 'obs/0.values.f32',
         name: 'Aliased embedding payload',
         embeddings: {
           available_dimensions: [1],
           default_dimension: 1,
-          files: { '1d': 'obs/position_alias.values.f32' },
+          files: { '1d': 'obs/0.values.f32' },
         },
       }),
-      pointsFilename: 'obs/position_alias.values.f32',
+      pointsFilename: 'obs/0.values.f32',
       pointsContents: float32Bytes([0, 1]),
     },
   ];
@@ -2089,13 +2087,13 @@ test('invalid local replacements leave the working prepared source usable', asyn
       compression: 6,
       _obsSchemas: {
         continuous: {
-          pathPattern: 'obs/{key}.values.f32.gz',
+          pathPattern: 'obs/{index}.values.f32.gz',
           ext: 'f32',
           dtype: 'float32',
           quantized: false,
         },
       },
-      _continuousFields: [['score']],
+      _continuousFields: [[0, 'score']],
       _categoricalFields: [],
     };
     const invalidDirectory = createPreparedDirectory('spoofed-obs-gzip', {
@@ -2116,14 +2114,14 @@ test('invalid local replacements leave the working prepared source usable', asyn
       ),
       obsText: JSON.stringify(obsManifest),
       extraFiles: [[
-        'obs/score.values.f32.gz',
+        'obs/0.values.f32.gz',
         spoofGzipSize(new Uint8Array(1024 * 1024), 8)
       ]],
     });
 
     await assert.rejects(
       working.source.loadFromPreparedDirectory(invalidDirectory),
-      /score\.values\.f32\.gz.*(gzip|compressed|decompress|expected)/i
+      /obs\/0\.values\.f32\.gz.*(gzip|compressed|decompress|expected)/i
     );
     await assertWorkingPreparedSource(working);
   });
@@ -2154,12 +2152,12 @@ test('invalid local replacements leave the working prepared source usable', asyn
       quantization: null,
       _varSchema: {
         kind: 'continuous',
-        pathPattern: 'var/{key}.values.f32',
+        pathPattern: 'var/{index}.values.f32',
         ext: 'f32',
         dtype: 'float32',
         quantized: false,
       },
-      fields: [['A']],
+      fields: [[0, 'A']],
     };
     const invalidDirectory = createPreparedDirectory('missing-gene-values', {
       identityPayload: createPreparedIdentity({
@@ -2205,7 +2203,7 @@ test('invalid local replacements leave the working prepared source usable', asyn
               label: 'velocity_umap',
               available_dimensions: [2],
               default_dimension: 2,
-              files: { '2d': 'vectors/velocity_umap_2d.bin' },
+              files: { '2d': 'vectors/0_2d.bin' },
               basis: 'umap',
             },
           },
@@ -2215,7 +2213,7 @@ test('invalid local replacements leave the working prepared source usable', asyn
 
     await assert.rejects(
       working.source.loadFromPreparedDirectory(invalidDirectory),
-      /vector.*velocity_umap|vectors\/velocity_umap_2d\.bin/i
+      /vector.*velocity_umap|vectors\/0_2d\.bin/i
     );
     await assertWorkingPreparedSource(working);
   });
@@ -2267,13 +2265,13 @@ test('invalid local replacements leave the working prepared source usable', asyn
       compression: null,
       _obsSchemas: {
         continuous: {
-          pathPattern: 'obs/{key}.values.f32',
+          pathPattern: 'obs/{index}.values.f32',
           ext: 'f32',
           dtype: 'float32',
           quantized: false,
         },
       },
-      _continuousFields: [['first'], ['second']],
+      _continuousFields: [[0, 'first'], [1, 'second']],
       _categoricalFields: [],
     };
     const invalidDirectory = createPreparedDirectory('duplicate-obs-summary', {
@@ -2499,7 +2497,7 @@ test('large gene exports reject missing payloads without streaming', async t => 
 
   await assert.rejects(
     source.loadFromPreparedDirectory(directory),
-    /Gene_0256\.values\.f32.*missing advertised payload/i
+    /var\/256\.values\.f32.*missing advertised payload/i
   );
   assert.equal(
     geneStreams,
@@ -2537,7 +2535,7 @@ test('large gene exports reject raw length mismatches without streaming', async 
 
   await assert.rejects(
     source.loadFromPreparedDirectory(directory),
-    /Gene_0256\.values\.f32.*expected 8 bytes.*found 1/i
+    /var\/256\.values\.f32.*expected 8 bytes.*found 1/i
   );
   assert.equal(
     geneStreams,
@@ -2602,10 +2600,10 @@ test('8,234-file gene exports validate gzip integrity lazily on first access', a
   const baseUrl = source.getBaseUrl(source.datasetId);
   await assert.rejects(
     source.resolveUrl(
-      `${baseUrl}var/Gene_8229.values.f32.gz`,
+      `${baseUrl}var/8229.values.f32.gz`,
       null
     ),
-    /Gene_8229\.values\.f32\.gz.*(gzip|compressed|binary|checksum|invalid)/i
+    /var\/8229\.values\.f32\.gz.*(gzip|compressed|binary|checksum|invalid)/i
   );
   assert.equal(
     geneStreams,
@@ -2620,7 +2618,7 @@ test('8,234-file gene exports validate gzip integrity lazily on first access', a
 
   assert.match(
     await source.resolveUrl(
-      `${baseUrl}var/Gene_0000.values.f32.gz`,
+      `${baseUrl}var/0.values.f32.gz`,
       null
     ),
     /^blob:/
@@ -2697,7 +2695,7 @@ test('prepared URL resolution requires and observes its exact owner signal', asy
     'owner-aborted-lazy-file',
     { nGenes: 257 }
   );
-  const targetPath = 'var/Gene_0256.values.f32';
+  const targetPath = 'var/256.values.f32';
   const targetFile = directory.find(
     file => file.webkitRelativePath.endsWith(`/${targetPath}`)
   );

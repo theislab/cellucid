@@ -145,7 +145,7 @@ async function installVelocityFixture(page) {
             available_dimensions: [2],
             default_dimension: 2,
             files: {
-              '2d': 'vectors/velocity_umap_2d.bin',
+              '2d': 'vectors/0_2d.bin',
             },
           },
         },
@@ -154,7 +154,7 @@ async function installVelocityFixture(page) {
     },
   );
   await page.route(
-    `**${CURRENT_UI_DATASET}vectors/velocity_umap_2d.bin`,
+    `**${CURRENT_UI_DATASET}vectors/0_2d.bin`,
     route => route.fulfill({
       status: 200,
       contentType: 'application/octet-stream',

@@ -24,6 +24,28 @@ function requireExactKeys(value, expectedKeys, label) {
 }
 
 /**
+ * Name compact_v1's constant-field case from one payload's published bounds.
+ *
+ * A gene detected in no published cell, or an obs column a subset flattened, is
+ * ordinary scientific data, so the format encodes it rather than dropping it:
+ * equal bounds and every code 0, in an entry whose shape and length are
+ * unchanged. Every decoder here branches on this rather than scaling by a range
+ * of zero, so a constant field yields its exact value in place of the NaN or
+ * Infinity that dividing by the bounds would produce for every cell.
+ *
+ * Sole derivation point on the reader side, and the exact peer of
+ * `_is_constant_continuous_range` in the Python exporter and
+ * `.is_constant_continuous_range` in the R exporter.
+ *
+ * @param {number} minValue
+ * @param {number} maxValue
+ * @returns {boolean}
+ */
+export function isConstantQuantizationRange(minValue, maxValue) {
+  return minValue === maxValue;
+}
+
+/**
  * @param {Object} metadata
  * @param {'uint8'|'uint16'} metadata.dtype
  * @param {8|16} metadata.bits
@@ -49,8 +71,9 @@ export function validateQuantizationMetadata(
   if (!Number.isFinite(minValue) || !Number.isFinite(maxValue)) {
     throw new Error(`${label} bounds must be finite`);
   }
-  if (!(minValue < maxValue)) {
-    throw new Error(`${label} minValue must be less than maxValue`);
+  // Equal bounds are the constant-field case, not a defect.
+  if (!(minValue <= maxValue)) {
+    throw new Error(`${label} minValue must not exceed maxValue`);
   }
   return metadata;
 }

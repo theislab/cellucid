@@ -962,7 +962,9 @@ test('rank inference is invariant to the export quantisation it reads', async ()
 
   // Published exports store expression quantised, and the loader dequantises
   // with `minValue + code * (maxValue - minValue) / maxQuant` — a strictly
-  // increasing affine map, because the format requires minValue < maxValue.
+  // increasing affine map whenever minValue < maxValue. (The format also allows
+  // minValue == maxValue for a constant field, but then every code is 0, so the
+  // codes and the values are equally tied and ranks are unaffected.)
   // A rank test must therefore return the same probability whether it is handed
   // the codes or the dequantised values.
   const dequantize = (codes, minValue, maxValue, bits) => {

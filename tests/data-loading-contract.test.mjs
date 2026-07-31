@@ -224,20 +224,21 @@ test('manifest expansion accepts only compact_v1', () => {
 
 function currentObsManifest({
   continuousSchema = {
-    pathPattern: 'obs/{key}.values.f32',
+    pathPattern: 'obs/{index}.values.f32',
     ext: 'f32',
     dtype: 'float32',
     quantized: false,
   },
   categoricalSchema = {
-    codesPathPattern: 'obs/{key}.codes.{ext}',
-    outlierPathPattern: 'obs/{key}.outliers.f32',
+    codesPathPattern: 'obs/{index}.codes.{ext}',
+    outlierPathPattern: 'obs/{index}.outliers.f32',
     outlierExt: 'f32',
     outlierDtype: 'float32',
     outlierQuantized: false,
   },
-  continuousFields = [['score']],
+  continuousFields = [[0, 'score']],
   categoricalFields = [[
+    continuousFields.length,
     'cluster',
     ['A', 'B'],
     'uint8',
@@ -269,12 +270,12 @@ function currentObsManifest({
 function currentVarManifest({
   schema = {
     kind: 'continuous',
-    pathPattern: 'var/{key}.values.f32',
+    pathPattern: 'var/{index}.values.f32',
     ext: 'f32',
     dtype: 'float32',
     quantized: false,
   },
-  fields = [['Gene A']],
+  fields = [[0, 'Gene A']],
   quantization = null,
   compression = null,
 } = {}) {
@@ -299,7 +300,7 @@ test('compact_v1 expands the one exact unquantized obs and var contract', () => 
     {
       key: 'score',
       kind: 'continuous',
-      valuesPath: 'obs/score.values.f32',
+      valuesPath: 'obs/0.values.f32',
       valuesDtype: 'float32',
       quantized: false,
       centroids: null,
@@ -309,10 +310,10 @@ test('compact_v1 expands the one exact unquantized obs and var contract', () => 
       key: 'cluster',
       kind: 'category',
       categories: ['A', 'B'],
-      codesPath: 'obs/cluster.codes.u8',
+      codesPath: 'obs/1.codes.u8',
       codesDtype: 'uint8',
       codesMissingValue: 255,
-      outlierQuantilesPath: 'obs/cluster.outliers.f32',
+      outlierQuantilesPath: 'obs/1.outliers.f32',
       outlierDtype: 'float32',
       outlierQuantized: false,
       centroidsByDim: {
@@ -328,7 +329,7 @@ test('compact_v1 expands the one exact unquantized obs and var contract', () => 
   assert.deepEqual(variable.fields, [{
     key: 'Gene A',
     kind: 'continuous',
-    valuesPath: 'var/Gene_A.values.f32',
+    valuesPath: 'var/0.values.f32',
     valuesDtype: 'float32',
     quantized: false,
   }]);
@@ -337,21 +338,22 @@ test('compact_v1 expands the one exact unquantized obs and var contract', () => 
 test('compact_v1 quantized schemas require exact codec metadata', () => {
   const obs = expandObsManifest(currentObsManifest({
     continuousSchema: {
-      pathPattern: 'obs/{key}.values.u8.gz',
+      pathPattern: 'obs/{index}.values.u8.gz',
       ext: 'u8',
       dtype: 'uint8',
       quantized: true,
       quantizationBits: 8,
     },
     categoricalSchema: {
-      codesPathPattern: 'obs/{key}.codes.{ext}.gz',
-      outlierPathPattern: 'obs/{key}.outliers.u8.gz',
+      codesPathPattern: 'obs/{index}.codes.{ext}.gz',
+      outlierPathPattern: 'obs/{index}.outliers.u8.gz',
       outlierExt: 'u8',
       outlierDtype: 'uint8',
       outlierQuantized: true,
     },
-    continuousFields: [['score', -2.5, 4.5]],
+    continuousFields: [[0, 'score', -2.5, 4.5]],
     categoricalFields: [[
+      1,
       'cluster',
       ['A'],
       'uint16',
@@ -365,7 +367,7 @@ test('compact_v1 quantized schemas require exact codec metadata', () => {
   assert.deepEqual(obs.fields[0], {
     key: 'score',
     kind: 'continuous',
-    valuesPath: 'obs/score.values.u8.gz',
+    valuesPath: 'obs/0.values.u8.gz',
     valuesDtype: 'uint8',
     quantized: true,
     quantizationBits: 8,
@@ -378,10 +380,10 @@ test('compact_v1 quantized schemas require exact codec metadata', () => {
     key: 'cluster',
     kind: 'category',
     categories: ['A'],
-    codesPath: 'obs/cluster.codes.u16.gz',
+    codesPath: 'obs/1.codes.u16.gz',
     codesDtype: 'uint16',
     codesMissingValue: 65_535,
-    outlierQuantilesPath: 'obs/cluster.outliers.u8.gz',
+    outlierQuantilesPath: 'obs/1.outliers.u8.gz',
     outlierDtype: 'uint8',
     outlierQuantized: true,
     outlierMinValue: 0,
@@ -392,20 +394,20 @@ test('compact_v1 quantized schemas require exact codec metadata', () => {
   const variable = expandVarManifest(currentVarManifest({
     schema: {
       kind: 'continuous',
-      pathPattern: 'var/{key}.values.u16.gz',
+      pathPattern: 'var/{index}.values.u16.gz',
       ext: 'u16',
       dtype: 'uint16',
       quantized: true,
       quantizationBits: 16,
     },
-    fields: [['Gene A', 0, 9]],
+    fields: [[0, 'Gene A', 0, 9]],
     quantization: 16,
     compression: 6,
   }));
   assert.deepEqual(variable.fields[0], {
     key: 'Gene A',
     kind: 'continuous',
-    valuesPath: 'var/Gene_A.values.u16.gz',
+    valuesPath: 'var/0.values.u16.gz',
     valuesDtype: 'uint16',
     quantized: true,
     quantizationBits: 16,
@@ -427,8 +429,9 @@ test('direct AnnData manifests use the exact explicit-absence outlier state', ()
   ];
 
   const rawObs = adapter.getObsManifest();
-  assert.deepEqual(rawObs._continuousFields, [['score']]);
+  assert.deepEqual(rawObs._continuousFields, [[0, 'score']]);
   assert.deepEqual(rawObs._categoricalFields, [[
+    1,
     'cluster',
     ['A', 'B'],
     'uint8',
@@ -438,7 +441,7 @@ test('direct AnnData manifests use the exact explicit-absence outlier state', ()
   assert.equal(rawObs.centroid_outlier_quantile, null);
   assert.equal(rawObs.latent_key, null);
   assert.deepEqual(rawObs._obsSchemas.categorical, {
-    codesPathPattern: 'obs/{key}.codes.{ext}',
+    codesPathPattern: 'obs/{index}.codes.{ext}',
     outlierPathPattern: null,
     outlierExt: null,
     outlierDtype: null,
@@ -460,7 +463,7 @@ test('direct AnnData manifests use the exact explicit-absence outlier state', ()
     [{
       key: 'Gene A',
       kind: 'continuous',
-      valuesPath: 'var/Gene_A.values.f32',
+      valuesPath: 'var/0.values.f32',
       valuesDtype: 'float32',
       quantized: false,
     }]
@@ -471,14 +474,14 @@ test('compact_v1 rejects mixed categorical outlier availability states', () => {
   const mixed = currentObsManifest({
     continuousFields: [],
     categoricalSchema: {
-      codesPathPattern: 'obs/{key}.codes.{ext}',
+      codesPathPattern: 'obs/{index}.codes.{ext}',
       outlierPathPattern: null,
       outlierExt: 'f32',
       outlierDtype: null,
       outlierQuantized: false,
     },
     categoricalFields: [[
-      'cluster', ['A'], 'uint8', 255, {},
+      0, 'cluster', ['A'], 'uint8', 255, {},
     ]],
   });
   assert.throws(
@@ -489,14 +492,14 @@ test('compact_v1 rejects mixed categorical outlier availability states', () => {
   const absentButQuantized = currentObsManifest({
     continuousFields: [],
     categoricalSchema: {
-      codesPathPattern: 'obs/{key}.codes.{ext}',
+      codesPathPattern: 'obs/{index}.codes.{ext}',
       outlierPathPattern: null,
       outlierExt: null,
       outlierDtype: null,
       outlierQuantized: true,
     },
     categoricalFields: [[
-      'cluster', ['A'], 'uint8', 255, {}, 0, 1,
+      0, 'cluster', ['A'], 'uint8', 255, {}, 0, 1,
     ]],
   });
   assert.throws(
@@ -544,7 +547,7 @@ test('compact_v1 rejects missing, extra, or contradictory schema properties', ()
       value: currentObsManifest({ continuousFields: [] }),
       mutate(value) {
         value._obsSchemas.continuous = {
-          pathPattern: 'obs/{key}.values.f32',
+          pathPattern: 'obs/{index}.values.f32',
           ext: 'f32',
           dtype: 'float32',
           quantized: false,
@@ -574,13 +577,13 @@ test('compact_v1 rejects missing, extra, or contradictory schema properties', ()
       value: currentObsManifest(),
       mutate(value) {
         value._obsSchemas.continuous = {
-          pathPattern: 'obs/{key}.values.u8',
+          pathPattern: 'obs/{index}.values.u8',
           ext: 'u8',
           dtype: 'uint8',
           quantized: true,
           quantizationBits: 16,
         };
-        value._continuousFields = [['score', 0, 1]];
+        value._continuousFields = [[0, 'score', 0, 1]];
       },
       expand: expandObsManifest,
     },
@@ -636,19 +639,19 @@ test('compact_v1 validates path templates and compression exactly', () => {
     }],
     ['duplicate key placeholder', value => {
       value._obsSchemas.continuous.pathPattern =
-        'obs/{key}/{key}.values.f32';
+        'obs/{index}/{key}.values.f32';
     }],
     ['unknown placeholder', value => {
       value._obsSchemas.continuous.pathPattern =
-        'obs/{key}.values.{dtype}';
+        'obs/{index}.values.{dtype}';
     }],
     ['absolute path', value => {
       value._obsSchemas.continuous.pathPattern =
-        '/obs/{key}.values.f32';
+        '/obs/{index}.values.f32';
     }],
     ['parent traversal', value => {
       value._obsSchemas.continuous.pathPattern =
-        '../obs/{key}.values.f32';
+        '../obs/{index}.values.f32';
     }],
     ['encoded parent traversal', value => {
       value._obsSchemas.continuous.pathPattern =
@@ -656,11 +659,11 @@ test('compact_v1 validates path templates and compression exactly', () => {
     }],
     ['missing categorical extension placeholder', value => {
       value._obsSchemas.categorical.codesPathPattern =
-        'obs/{key}.codes.u8';
+        'obs/{index}.codes.u8';
     }],
     ['unexpected categorical extension placeholder', value => {
       value._obsSchemas.categorical.outlierPathPattern =
-        'obs/{key}.outliers.{ext}';
+        'obs/{index}.outliers.{ext}';
     }],
     ['compressed metadata without gzip paths', value => {
       value.compression = 6;
@@ -678,27 +681,30 @@ test('compact_v1 validates path templates and compression exactly', () => {
   }
 
   const variable = currentVarManifest();
-  variable._varSchema.pathPattern = 'var/{key}.values.f32.gz';
+  variable._varSchema.pathPattern = 'var/{index}.values.f32.gz';
   assert.throws(
     () => expandVarManifest(variable),
     /compression|gzip|path/i
   );
 });
 
-test('compact_v1 rejects malformed tuple arity, bounds, and field collisions', () => {
+test('compact_v1 rejects malformed tuple arity, bounds, and payload indices', () => {
   const continuousCases = [
-    ['missing quantized bounds', [['score']]],
-    ['partial quantized bounds', [['score', 0]]],
-    ['nonfinite minimum', [['score', Number.NaN, 1]]],
-    ['nonfinite maximum', [['score', 0, Number.POSITIVE_INFINITY]]],
-    ['reversed range', [['score', 2, 1]]],
-    ['zero range', [['score', 1, 1]]],
-    ['non-string key', [[1, 0, 1]]],
+    ['missing quantized bounds', [[0, 'score']]],
+    ['partial quantized bounds', [[0, 'score', 0]]],
+    ['nonfinite minimum', [[0, 'score', Number.NaN, 1]]],
+    ['nonfinite maximum', [[0, 'score', 0, Number.POSITIVE_INFINITY]]],
+    ['reversed range', [[0, 'score', 2, 1]]],
+    ['non-string key', [[0, 1, 0, 1]]],
+    ['missing payload index', [['score', 0, 1, 2]]],
+    ['fractional payload index', [[0.5, 'score', 0, 1]]],
+    ['negative payload index', [[-1, 'score', 0, 1]]],
+    ['payload index above the dense range', [[1, 'score', 0, 1]]],
   ];
   for (const [label, continuousFields] of continuousCases) {
     const candidate = currentObsManifest({
       continuousSchema: {
-        pathPattern: 'obs/{key}.values.u8',
+        pathPattern: 'obs/{index}.values.u8',
         ext: 'u8',
         dtype: 'uint8',
         quantized: true,
@@ -714,38 +720,67 @@ test('compact_v1 rejects malformed tuple arity, bounds, and field collisions', (
     );
   }
 
-  assert.throws(
-    () => expandObsManifest(currentObsManifest({
-      continuousFields: [['A B'], ['A/B']],
-      categoricalFields: [],
-    })),
-    /collision|unique|A_B|path/i
+  // A name is no longer a path component, so text a filename could not hold
+  // is now ordinary: only the declared index decides which file is read.
+  const punctuated = expandObsManifest(currentObsManifest({
+    continuousFields: [[0, 'A B'], [1, 'A/B']],
+    categoricalFields: [],
+  }));
+  assert.deepEqual(
+    punctuated.fields.map(field => [field.key, field.valuesPath]),
+    [['A B', 'obs/0.values.f32'], ['A/B', 'obs/1.values.f32']]
   );
+
   assert.throws(
     () => expandObsManifest(currentObsManifest({
-      continuousFields: [['same']],
+      continuousFields: [[0, 'same']],
       categoricalFields: [[
-        'same', ['A'], 'uint8', 255, {},
+        1, 'same', ['A'], 'uint8', 255, {},
       ]],
     })),
     /duplicate|unique|same/i
   );
+  // obs/ is one shared index space, so a categorical field may not reuse a
+  // continuous field's index -- that would name one file for two payloads.
+  assert.throws(
+    () => expandObsManifest(currentObsManifest({
+      continuousFields: [[0, 'score']],
+      categoricalFields: [[
+        0, 'cluster', ['A'], 'uint8', 255, {},
+      ]],
+    })),
+    /payload indices must be exactly 0\.\.1/
+  );
   assert.throws(
     () => expandVarManifest(currentVarManifest({
-      fields: [['A B'], ['A/B']],
+      fields: [[0, 'Gene A'], [0, 'Gene B']],
     })),
-    /collision|unique|A_B|path/i
+    /payload indices must be exactly 0\.\.1/
+  );
+  assert.throws(
+    () => expandVarManifest(currentVarManifest({
+      fields: [[0, 'Gene A'], [2, 'Gene B']],
+    })),
+    /payload indices must be exactly 0\.\.1/
+  );
+  const punctuatedGenes = expandVarManifest(currentVarManifest({
+    fields: [[0, 'A B'], [1, 'A/B']],
+  }));
+  assert.deepEqual(
+    punctuatedGenes.fields.map(field => [field.key, field.valuesPath]),
+    [['A B', 'var/0.values.f32'], ['A/B', 'var/1.values.f32']]
   );
 });
 
 test('compact_v1 categorical tuples enforce dtype, capacity, and sentinel', () => {
   const cases = [
-    ['wrong uint8 sentinel', ['group', ['A'], 'uint8', 65_535, {}]],
-    ['wrong uint16 sentinel', ['group', ['A'], 'uint16', 255, {}]],
-    ['unsupported dtype', ['group', ['A'], 'uint32', 0xffff_ffff, {}]],
-    ['duplicate categories', ['group', ['A', 'A'], 'uint8', 255, {}]],
-    ['invalid category value', ['group', [{}], 'uint8', 255, {}]],
+    ['wrong uint8 sentinel', [0, 'group', ['A'], 'uint8', 65_535, {}]],
+    ['wrong uint16 sentinel', [0, 'group', ['A'], 'uint16', 255, {}]],
+    ['unsupported dtype', [0, 'group', ['A'], 'uint32', 0xffff_ffff, {}]],
+    ['duplicate categories', [0, 'group', ['A', 'A'], 'uint8', 255, {}]],
+    ['invalid category value', [0, 'group', [{}], 'uint8', 255, {}]],
     ['too many uint8 categories', [
+      0,
       'group',
       Array.from({ length: 256 }, (_, index) => `C${index}`),
       'uint8',
@@ -753,7 +788,13 @@ test('compact_v1 categorical tuples enforce dtype, capacity, and sentinel', () =
       {},
     ]],
     ['unquantized tuple has codec bounds', [
-      'group', ['A'], 'uint8', 255, {}, 0, 1,
+      0, 'group', ['A'], 'uint8', 255, {}, 0, 1,
+    ]],
+    ['missing payload index', [
+      'group', ['A'], 'uint8', 255, {}, 0,
+    ]],
+    ['non-integer payload index', [
+      '0', 'group', ['A'], 'uint8', 255, {},
     ]],
   ];
 
@@ -772,14 +813,14 @@ test('compact_v1 categorical tuples enforce dtype, capacity, and sentinel', () =
     () => expandObsManifest(currentObsManifest({
       continuousFields: [],
       categoricalSchema: {
-        codesPathPattern: 'obs/{key}.codes.{ext}',
-        outlierPathPattern: 'obs/{key}.outliers.u8',
+        codesPathPattern: 'obs/{index}.codes.{ext}',
+        outlierPathPattern: 'obs/{index}.outliers.u8',
         outlierExt: 'u8',
         outlierDtype: 'uint8',
         outlierQuantized: true,
       },
       categoricalFields: [[
-        'group', ['A'], 'uint8', 255, {}, 0,
+        0, 'group', ['A'], 'uint8', 255, {}, 0,
       ]],
     })),
     /tuple|outlier|min|max|bound/i
@@ -818,7 +859,7 @@ test('compact_v1 validates every centroid dimension and category reference', () 
       () => expandObsManifest(currentObsManifest({
         continuousFields: [],
         categoricalFields: [[
-          'group', ['A'], 'uint8', 255, centroids,
+          0, 'group', ['A'], 'uint8', 255, centroids,
         ]],
       })),
       /centroid|dimension|position|category|n_points|property|finite/i,
@@ -958,7 +999,7 @@ test('field loaders reject incomplete scientific codec metadata before fetching'
       field: {
         key: 'score',
         kind: 'continuous',
-        valuesPath: 'obs/score.values.u8',
+        valuesPath: 'obs/0.values.u8',
         valuesDtype: 'uint8',
         quantized: true,
         minValue: 0,
@@ -971,9 +1012,9 @@ test('field loaders reject incomplete scientific codec metadata before fetching'
         key: 'cluster',
         kind: 'category',
         categories: ['A'],
-        codesPath: 'obs/cluster.codes.u8',
+        codesPath: 'obs/1.codes.u8',
         codesDtype: 'uint8',
-        outlierQuantilesPath: 'obs/cluster.outliers.f32',
+        outlierQuantilesPath: 'obs/1.outliers.f32',
         outlierDtype: 'float32',
         outlierQuantized: false,
         centroidsByDim: {},
@@ -984,7 +1025,7 @@ test('field loaders reject incomplete scientific codec metadata before fetching'
       field: {
         key: 'Gene A',
         kind: 'continuous',
-        valuesPath: 'var/Gene_A.values.u16',
+        valuesPath: 'var/0.values.u16',
         valuesDtype: 'uint16',
         quantized: true,
         quantizationBits: 16,
@@ -1017,13 +1058,13 @@ test('field loaders dequantize only the exact declared range and missing marker'
 
   const manifest = currentObsManifest({
     continuousSchema: {
-      pathPattern: 'obs/{key}.values.u8',
+      pathPattern: 'obs/{index}.values.u8',
       ext: 'u8',
       dtype: 'uint8',
       quantized: true,
       quantizationBits: 8,
     },
-    continuousFields: [['score', 10, 20]],
+    continuousFields: [[0, 'score', 10, 20]],
     categoricalFields: [],
   });
   const [field] = expandObsManifest(manifest).fields;
@@ -1057,14 +1098,14 @@ test('prepared categorical outliers adopt the exact runtime missing sentinel', a
     const [field] = expandObsManifest(currentObsManifest({
       continuousFields: [],
       categoricalSchema: {
-        codesPathPattern: 'obs/{key}.codes.{ext}',
-        outlierPathPattern: 'obs/{key}.outliers.u8',
+        codesPathPattern: 'obs/{index}.codes.{ext}',
+        outlierPathPattern: 'obs/{index}.outliers.u8',
         outlierExt: 'u8',
         outlierDtype: 'uint8',
         outlierQuantized: true,
       },
       categoricalFields: [[
-        'cluster', ['A', 'B'], 'uint8', 255, {}, 0, 1,
+        0, 'cluster', ['A', 'B'], 'uint8', 255, {}, 0, 1,
       ]],
     })).fields;
 
@@ -1171,13 +1212,13 @@ test('field quantization selects one backend before fetch and never refetches af
 
   const [field] = expandObsManifest(currentObsManifest({
     continuousSchema: {
-      pathPattern: 'obs/{key}.values.u8',
+      pathPattern: 'obs/{index}.values.u8',
       ext: 'u8',
       dtype: 'uint8',
       quantized: true,
       quantizationBits: 8,
     },
-    continuousFields: [['score', 0, 1]],
+    continuousFields: [[0, 'score', 0, 1]],
     categoricalFields: [],
   })).fields;
 
@@ -1230,7 +1271,7 @@ test('quantization worker boundaries enforce the same exact scientific task', as
     },
     {
       ...validTask(),
-      minValue: 1,
+      minValue: 2,
       maxValue: 1,
     },
     {
@@ -1320,6 +1361,134 @@ test('quantization worker boundaries enforce the same exact scientific task', as
   assert.equal(pool._available, false);
 });
 
+test('a constant quantized field decodes to its exact value, never NaN or Infinity', async t => {
+  // compact_v1 publishes a field carrying one value as equal bounds with every
+  // code 0 -- a gene a lineage subset left undetected, or an obs column the
+  // subset flattened. Scaling by (maxValue - minValue) would divide by zero and
+  // hand every cell of that gene a NaN or an Infinity, so both decoders take an
+  // explicit constant branch instead. The writers assert the same contract in
+  // cellucid-python/tests/test_prepare_data_constant_field_contract.py and
+  // cellucid-r/tests/testthat/test-prepare.R.
+  const constants = [0, 2.5, -12.5, 3.4028234663852886e38];
+  for (const constant of constants) {
+    for (const bits of [8, 16]) {
+      const dtype = bits === 8 ? 'uint8' : 'uint16';
+      const nanMarker = bits === 8 ? 255 : 65535;
+      const codes = bits === 8
+        ? Uint8Array.of(0, 0, 0, nanMarker)
+        : Uint16Array.of(0, 0, 0, nanMarker);
+      const label = `${constant} @ ${bits} bits`;
+
+      const task = {
+        buffer: codes.buffer,
+        dtype,
+        bits,
+        minValue: constant,
+        maxValue: constant,
+      };
+      // Equal bounds are a valid codec, not a malformed one.
+      assert.strictEqual(validateQuantizationTask(task), task, label);
+
+      const decoded = new Float32Array(dequantizeToFloat32Buffer(task));
+      assert.deepEqual(
+        Array.from(decoded.slice(0, 3)),
+        [constant, constant, constant],
+        label
+      );
+      assert.equal(Number.isNaN(decoded[3]), true, label);
+      // Nothing produced an Infinity on the way.
+      assert.equal(
+        decoded.slice(0, 3).every(value => Number.isFinite(value)),
+        true,
+        label
+      );
+    }
+  }
+
+  // The main-thread decoder is the same contract, reached through the loader.
+  const manager = getDataSourceManager();
+  const originalActiveSource = manager.activeSource;
+  const originalFetch = globalThis.fetch;
+  manager.activeSource = null;
+  globalThis.fetch = async () => new Response(Uint8Array.of(0, 0));
+  t.after(() => {
+    manager.activeSource = originalActiveSource;
+    globalThis.fetch = originalFetch;
+  });
+
+  const [geneField] = expandVarManifest(currentVarManifest({
+    schema: {
+      kind: 'continuous',
+      pathPattern: 'var/{index}.values.u8',
+      ext: 'u8',
+      dtype: 'uint8',
+      quantized: true,
+      quantizationBits: 8,
+    },
+    fields: [[0, 'SILENT', 0, 0]],
+    quantization: 8,
+  })).fields;
+  assert.equal(geneField.minValue, 0);
+  assert.equal(geneField.maxValue, 0);
+
+  const loaded = await loadVarFieldData(
+    'https://example.test/var_manifest.json',
+    geneField
+  );
+  assert.deepEqual(Array.from(loaded.values), [0, 0]);
+});
+
+test('a constant field keeps its equal bounds through manifest expansion', () => {
+  const obs = expandObsManifest(currentObsManifest({
+    continuousSchema: {
+      pathPattern: 'obs/{index}.values.u16',
+      ext: 'u16',
+      dtype: 'uint16',
+      quantized: true,
+      quantizationBits: 16,
+    },
+    continuousFields: [[0, 'flat', 1.5, 1.5]],
+    categoricalSchema: {
+      codesPathPattern: 'obs/{index}.codes.{ext}',
+      outlierPathPattern: 'obs/{index}.outliers.u8',
+      outlierExt: 'u8',
+      outlierDtype: 'uint8',
+      outlierQuantized: true,
+    },
+    categoricalFields: [[
+      1,
+      'cluster',
+      ['A'],
+      'uint8',
+      255,
+      {},
+      // A category set with one qualifying category yields one quantile value,
+      // which is the same constant case on the outlier axis.
+      1,
+      1,
+    ]],
+  }));
+  assert.equal(obs.fields[0].minValue, 1.5);
+  assert.equal(obs.fields[0].maxValue, 1.5);
+  assert.equal(obs.fields[1].outlierMinValue, 1);
+  assert.equal(obs.fields[1].outlierMaxValue, 1);
+
+  const variable = expandVarManifest(currentVarManifest({
+    schema: {
+      kind: 'continuous',
+      pathPattern: 'var/{index}.values.u8',
+      ext: 'u8',
+      dtype: 'uint8',
+      quantized: true,
+      quantizationBits: 8,
+    },
+    fields: [[0, 'SILENT', 0, 0]],
+    quantization: 8,
+  }));
+  assert.equal(variable.fields[0].minValue, 0);
+  assert.equal(variable.fields[0].maxValue, 0);
+});
+
 test('categorical field loading rejects codes outside labels or the exact sentinel', async t => {
   const manager = getDataSourceManager();
   const originalActiveSource = manager.activeSource;
@@ -1338,14 +1507,14 @@ test('categorical field loading rejects codes outside labels or the exact sentin
   const manifest = currentObsManifest({
     continuousFields: [],
     categoricalSchema: {
-      codesPathPattern: 'obs/{key}.codes.{ext}',
+      codesPathPattern: 'obs/{index}.codes.{ext}',
       outlierPathPattern: null,
       outlierExt: null,
       outlierDtype: null,
       outlierQuantized: false,
     },
     categoricalFields: [[
-      'cluster', ['A', 'B'], 'uint8', 255, {},
+      0, 'cluster', ['A', 'B'], 'uint8', 255, {},
     ]],
   });
   const [field] = expandObsManifest(manifest).fields;
@@ -1389,14 +1558,14 @@ test('direct AnnData categorical fields do not invent outlier statistics', async
     expandObsManifest(currentObsManifest({
       continuousFields: [],
       categoricalSchema: {
-        codesPathPattern: 'obs/{key}.codes.{ext}',
+        codesPathPattern: 'obs/{index}.codes.{ext}',
         outlierPathPattern: null,
         outlierExt: null,
         outlierDtype: null,
         outlierQuantized: false,
       },
       categoricalFields: [[
-        'label', ['A', 'B'], 'uint8', 255, {},
+        0, 'label', ['A', 'B'], 'uint8', 255, {},
       ]],
     })).fields[0]
   );

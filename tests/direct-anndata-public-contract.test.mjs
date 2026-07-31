@@ -363,8 +363,8 @@ test('H5AD and Zarr publish one exact v2 identity before direct adoption', async
             available_dimensions: [2, 3],
             default_dimension: 3,
             files: {
-              '2d': 'vectors/field_0_2d.bin',
-              '3d': 'vectors/field_0_3d.bin',
+              '2d': 'vectors/0_2d.bin',
+              '3d': 'vectors/0_3d.bin',
             },
           },
         },

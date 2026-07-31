@@ -80,13 +80,13 @@ function obsManifest() {
     compression: null,
     _obsSchemas: {
       continuous: {
-        pathPattern: 'obs/{key}.values.f32',
+        pathPattern: 'obs/{index}.values.f32',
         ext: 'f32',
         dtype: 'float32',
         quantized: false,
       },
     },
-    _continuousFields: [['score']],
+    _continuousFields: [[0, 'score']],
     _categoricalFields: [],
   });
 }
@@ -100,12 +100,12 @@ function varManifest() {
     quantization: null,
     _varSchema: {
       kind: 'continuous',
-      pathPattern: 'var/{key}.values.f32',
+      pathPattern: 'var/{index}.values.f32',
       ext: 'f32',
       dtype: 'float32',
       quantized: false,
     },
-    fields: [['Gene A']],
+    fields: [[0, 'Gene A']],
   });
 }
 
@@ -164,7 +164,7 @@ test('main.js gives the obs field loader the manifest-declared point count', asy
     ),
     'the obs payload must be judged against n_points × float32, not the ceiling'
   );
-  assert.deepEqual(requestedUrls, [`${BASE_URL}obs/score.values.f32`]);
+  assert.deepEqual(requestedUrls, [`${BASE_URL}obs/0.values.f32`]);
 });
 
 test('main.js gives the var field loader the manifest-declared point count', async t => {
@@ -202,7 +202,7 @@ test('main.js gives the var field loader the manifest-declared point count', asy
     ),
     'the var payload must be judged against n_points × float32, not the ceiling'
   );
-  assert.deepEqual(requestedUrls, [`${BASE_URL}var/Gene_A.values.f32`]);
+  assert.deepEqual(requestedUrls, [`${BASE_URL}var/0.values.f32`]);
 });
 
 test('an exactly declared obs payload still loads', async t => {
