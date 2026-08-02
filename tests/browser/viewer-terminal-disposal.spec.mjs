@@ -303,6 +303,53 @@ test('real WebGL loss is a permanent owner fence with no restoration or disposal
   expect(pageErrors).toEqual([]);
 });
 
+test('physical context loss cancels projectile readiness before its event task', async ({
+  page,
+}) => {
+  const completion = await page.evaluate(async () => {
+    const viewer = window._cellucidViewer;
+    const gl = viewer?.getGLContext();
+    const renderer = viewer?.getHPRenderer();
+    if (
+      !viewer ||
+      !(gl instanceof WebGL2RenderingContext) ||
+      !renderer
+    ) {
+      throw new Error('Projectile physical-loss fencing is unavailable.');
+    }
+    if (renderer.hasSpatialIndex(1)) {
+      throw new Error(
+        'Physical-loss projectile fixture unexpectedly prebuilt its 1D index.',
+      );
+    }
+    viewer.setViewDimension('live', 1);
+
+    const prototype = WebGL2RenderingContext.prototype;
+    const originalIsContextLost = prototype.isContextLost;
+    let reportPhysicalLoss = false;
+    prototype.isContextLost = function (...args) {
+      if (this === gl && reportPhysicalLoss) return true;
+      return Reflect.apply(originalIsContextLost, this, args);
+    };
+    try {
+      const settled = new Promise(resolve => {
+        viewer.setProjectilesEnabled(true, resolve);
+      });
+      // Model the engine-visible interval where physical loss is queryable but
+      // webglcontextlost has not yet advanced the viewer's logical generation.
+      reportPhysicalLoss = true;
+      return await settled;
+    } finally {
+      prototype.isContextLost = originalIsContextLost;
+    }
+  });
+
+  expect(completion).toEqual({
+    message: 'Projectile preparation was cancelled because the WebGL context was lost.',
+    status: 'cancelled',
+  });
+});
+
 test('velocity reset detaches before hostile retirement and recreates the same ID', async ({
   page,
 }) => {

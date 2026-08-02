@@ -2878,8 +2878,8 @@
     },
     {
       "path": "assets/js/rendering/viewer.js",
-      "sha256": "4e1ccc5f2423743c1c2fb392c0af28503c82bf00bf97f1ccc76446f126ae96a1",
-      "bytes": 364149,
+      "sha256": "d51a7f3d2ee34eddd70c8cfadfdde117a6a0278d9049f59caeee13390902d8e0",
+      "bytes": 365886,
       "content_type": "application/javascript; charset=utf-8"
     },
     {

@@ -1951,6 +1951,8 @@ export function createViewer({
   let projectileBuildGeneration = 0;
   let projectileBuildTimer = null;
   let projectileBuildCompletion = null;
+  const PROJECTILE_CONTEXT_LOSS_MESSAGE =
+    'Projectile preparation was cancelled because the WebGL context was lost.';
   let lookActive = false;
   let lastFrameTime = performance.now();
   let renderFrameId = 0;
@@ -2457,7 +2459,7 @@ export function createViewer({
         publishProjectileBuildResult(
           projectileBuildCompletionToPublish,
           'cancelled',
-          'Projectile preparation was cancelled because the WebGL context was lost.'
+          PROJECTILE_CONTEXT_LOSS_MESSAGE
         );
         projectileBuildCompletionToPublish = null;
       }, 'projectile build cancellation');
@@ -2988,6 +2990,44 @@ export function createViewer({
         // Optional diagnostics are never authoritative.
       }
     }
+  }
+
+  function isWebGLContextLostForAsyncCommit() {
+    if (webglContextLost) return true;
+    try {
+      return gl.isContextLost() === true;
+    } catch {
+      // A context whose loss state is no longer queryable is not safe for a
+      // new GPU-backed publication. The later context event still owns the
+      // complete terminal cleanup graph.
+      return true;
+    }
+  }
+
+  function publishProjectileContextLossCancellation(completion) {
+    projectileSystem.setEnabled(false);
+    publishProjectileBuildResult(
+      completion,
+      'cancelled',
+      PROJECTILE_CONTEXT_LOSS_MESSAGE
+    );
+  }
+
+  function settleProjectileBuildAsReady(completion) {
+    // Some engines publish physical loss through isContextLost() before they
+    // dispatch webglcontextlost. Fence both sides of the local enable commit so
+    // that pre-event window can never escape as a successful preparation.
+    if (isWebGLContextLostForAsyncCommit()) {
+      publishProjectileContextLossCancellation(completion);
+      return false;
+    }
+    projectileSystem.setEnabled(true);
+    if (isWebGLContextLostForAsyncCommit()) {
+      publishProjectileContextLossCancellation(completion);
+      return false;
+    }
+    publishProjectileBuildResult(completion, 'ready', null);
+    return true;
   }
 
   function detachPendingProjectileBuild() {
@@ -8478,8 +8518,7 @@ export function createViewer({
 
       const dimLevel = getPublishedDimensionLevel(LIVE_VIEW_ID);
       if (hpRenderer.hasSpatialIndex(dimLevel)) {
-        projectileSystem.setEnabled(true);
-        publishProjectileBuildResult(completion, 'ready', null);
+        settleProjectileBuildAsReady(completion);
         return;
       }
 
@@ -8493,6 +8532,12 @@ export function createViewer({
         ) {
           return;
         }
+        if (isWebGLContextLostForAsyncCommit()) {
+          const ownedCompletion = projectileBuildCompletion;
+          projectileBuildCompletion = null;
+          publishProjectileContextLossCancellation(ownedCompletion);
+          return;
+        }
         try {
           hpRenderer.ensureSpatialIndex(dimLevel);
           if (
@@ -8503,13 +8548,20 @@ export function createViewer({
           }
           const ownedCompletion = projectileBuildCompletion;
           projectileBuildCompletion = null;
-          projectileSystem.setEnabled(true);
-          publishProjectileBuildResult(ownedCompletion, 'ready', null);
+          settleProjectileBuildAsReady(ownedCompletion);
         } catch (error) {
           if (generation !== projectileBuildGeneration) return;
           const ownedCompletion = projectileBuildCompletion;
           projectileBuildCompletion = null;
           projectileSystem.setEnabled(false);
+          if (isWebGLContextLostForAsyncCommit()) {
+            publishProjectileBuildResult(
+              ownedCompletion,
+              'cancelled',
+              PROJECTILE_CONTEXT_LOSS_MESSAGE
+            );
+            return;
+          }
           const detail = error instanceof Error && error.message.length > 0
             ? error.message
             : String(error);
