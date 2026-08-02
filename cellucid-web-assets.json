@@ -1486,8 +1486,8 @@
     },
     {
       "path": "assets/js/app/state-serializer/README.md",
-      "sha256": "b6424272f9c011ad7bce37d4129649d07b03fdd5b76258161aa8637fc7249892",
-      "bytes": 22988,
+      "sha256": "16c134779daf17b7a2d2a354398648a945881173f583a12ca58c51ad6d2c10db",
+      "bytes": 23435,
       "content_type": "text/markdown; charset=utf-8"
     },
     {
@@ -1510,8 +1510,8 @@
     },
     {
       "path": "assets/js/app/state-serializer/ui-controls.js",
-      "sha256": "ba17b7790fd1dbd3aab7150649bb20d0f5e95496673cfa3c8bbbc1f1d15b0c4c",
-      "bytes": 19018,
+      "sha256": "638838d026f545ec962f5ed3eb7039dad3f9ce668e3806c2a9930ee718b3d869",
+      "bytes": 20136,
       "content_type": "application/javascript; charset=utf-8"
     },
     {

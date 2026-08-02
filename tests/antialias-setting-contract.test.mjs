@@ -553,21 +553,54 @@ function savedSession(antialiasChecked) {
   };
 }
 
-test('a restored session stores the antialiasing preference', t => {
-  // This is the CEL-0129 shape: the serializer writes the DOM and dispatches
-  // `change`, and only the owner's listener turns that into a stored value. The
-  // owner is `render-controls.js`, built by `initUI` before any restore runs.
+test('a restored session leaves the antialiasing preference alone', t => {
+  // The defect this replaces: a restore dispatched `change`, the owner
+  // persisted it, and a session became the last writer of a device preference.
+  // Every sample publishes an advertised default state, so turning
+  // antialiasing off and reloading re-applied the saved value and stored it -
+  // the setting could never stay off, which is what a user sees as "I switched
+  // it off, refreshed, and it came back".
   const storage = makeStorage();
   t.after(installDocument(storage));
 
+  // This machine has it on, and the incoming session says off.
   const { dom } = bootstrap({ requested: true, storage });
+  storage.setItem(ANTIALIAS_STORAGE_KEY, 'on');
   const serializer = createUiControlSerializer({ sidebar: makeSidebar(dom) });
 
   serializer.restoreUIControls(savedSession(false));
 
+  assert.equal(
+    dom.hpAntialiasCheckbox.checked,
+    true,
+    'the box must keep showing what this machine actually drew with'
+  );
+  assert.equal(
+    storage.getItem(ANTIALIAS_STORAGE_KEY),
+    'on',
+    'a session must not overwrite the preference this machine chose'
+  );
+  assert.equal(
+    dom.hpAntialiasStatus.textContent,
+    '',
+    'nothing changed, so there is nothing pending a reload'
+  );
+});
+
+test('the opposite direction is also left alone', t => {
+  // A machine that chose "off" must keep it when a session says "on", which is
+  // the direction the user actually hit.
+  const storage = makeStorage();
+  t.after(installDocument(storage));
+
+  const { dom } = bootstrap({ requested: false, storage });
+  storage.setItem(ANTIALIAS_STORAGE_KEY, 'off');
+  const serializer = createUiControlSerializer({ sidebar: makeSidebar(dom) });
+
+  serializer.restoreUIControls(savedSession(true));
+
   assert.equal(dom.hpAntialiasCheckbox.checked, false);
   assert.equal(storage.getItem(ANTIALIAS_STORAGE_KEY), 'off');
-  assert.match(dom.hpAntialiasStatus.textContent, /Reload the page to apply/);
 });
 
 test('the control is captured into a session without being listed anywhere', t => {
@@ -599,7 +632,10 @@ test('restoring the value the control already holds stores nothing new', t => {
   assert.equal(dom.hpAntialiasStatus.textContent, '');
 });
 
-test('a restore that cannot be stored fails the session rather than passing', t => {
+test('a restore does not depend on storage it never writes', t => {
+  // Previously a restore wrote this preference, so a full storage failed the
+  // whole session. It writes nothing now, so an unwritable storage is no
+  // longer a reason a session cannot be restored.
   const storage = makeStorage();
   t.after(installDocument(storage));
 
@@ -607,10 +643,8 @@ test('a restore that cannot be stored fails the session rather than passing', t 
   const serializer = createUiControlSerializer({ sidebar: makeSidebar(dom) });
   storage.failWrites = new Error('Storage is full.');
 
-  assert.throws(
-    () => serializer.restoreUIControls(savedSession(false)),
-    /hp-antialias.*rejected/s
-  );
+  assert.doesNotThrow(() => serializer.restoreUIControls(savedSession(false)));
+  assert.equal(dom.hpAntialiasCheckbox.checked, true);
 });
 
 // ---------------------------------------------------------------------------

@@ -414,6 +414,26 @@ function dispatchControlEvent(id, element, type) {
   if (listenerFailure !== null) throw listenerFailure;
 }
 
+/**
+ * Controls that describe the machine, not the session.
+ *
+ * `#hp-antialias` is stored in `localStorage` and read once, before the WebGL
+ * context exists, because `antialias` is a context-creation attribute. Its
+ * owner therefore persists on every `change` event - including the synthetic
+ * one a restore dispatches.
+ *
+ * That made a session the last writer of a device preference. Every sample
+ * publishes an advertised default state, so switching antialiasing off and
+ * reloading re-applied the saved `on` and stored it, and the setting could
+ * never stay off. A shared session did the same to whoever opened it.
+ *
+ * These are still captured, and still required to be present, so the published
+ * presets stay valid and a control that disappears from the markup is still
+ * caught. They are simply not applied: the machine that is drawing keeps its
+ * own answer.
+ */
+const DEVICE_PREFERENCE_CONTROL_IDS = new Set(['hp-antialias']);
+
 function restoreValidatedControl(id, entry, data) {
   const { element, type } = entry;
   if (type === 'checkbox') {
@@ -577,6 +597,9 @@ export function createUiControlSerializer({ sidebar }) {
         for (const [id, staged] of stagedControls) {
           if (staged.entry.type !== type) continue;
           if (deferredIds.has(id) !== restoreDeferred) continue;
+          // Captured and validated, but never applied - see
+          // DEVICE_PREFERENCE_CONTROL_IDS.
+          if (DEVICE_PREFERENCE_CONTROL_IDS.has(id)) continue;
           if (abortSignal?.aborted) {
             throw new DOMException('Aborted', 'AbortError');
           }
