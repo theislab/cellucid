@@ -19,6 +19,15 @@ const SHARD_PATTERN = /^(?<current>[1-9][0-9]*)\/(?<total>[1-9][0-9]*)$/;
 const PROJECT_PATTERN = /^[A-Za-z0-9_-]+$/;
 const MAX_CAPTURE_BYTES = 64 * 1024 * 1024;
 
+// A process per whole shard retained native GPU state long enough to degrade
+// hosted macOS Firefox. A process per file fixed that but exhausted WinSock
+// resources late in 41-file Windows shards. Bound both dimensions: no browser
+// owns more than six files, no shard launches more than eight browsers, and a
+// growing inventory must add another CI shard instead of silently weakening
+// either resource fence.
+export const MAX_FILES_PER_BROWSER_PROCESS = 6;
+export const MAX_BROWSER_PROCESSES_PER_SHARD = 8;
+
 function readOption(argument, name) {
   const prefix = `--${name}=`;
   return argument.startsWith(prefix) ? argument.slice(prefix.length) : null;
@@ -30,7 +39,7 @@ function readOption(argument, name) {
  * @param {string[]} arguments_
  * @returns {Readonly<{project: string, shard: string, headed: boolean}>}
  */
-export function parseIsolatedShardArguments(arguments_) {
+export function parseBoundedShardArguments(arguments_) {
   let project = null;
   let shard = null;
   let headed = false;
@@ -70,7 +79,7 @@ export function parseIsolatedShardArguments(arguments_) {
       index += 1;
       continue;
     }
-    throw new TypeError(`Unknown isolated browser-shard option: ${argument}`);
+    throw new TypeError(`Unknown bounded browser-shard option: ${argument}`);
   }
 
   if (!project || !PROJECT_PATTERN.test(project)) {
@@ -182,7 +191,7 @@ function repositoryRelativeTestFile(testDirectory, file) {
  * @param {string} project
  * @returns {string[]}
  */
-export function extractIsolatedShardFiles(report, project) {
+export function extractBoundedShardFiles(report, project) {
   if (!report || typeof report !== 'object') {
     throw new TypeError('Playwright shard report must be an object.');
   }
@@ -212,23 +221,69 @@ export function extractIsolatedShardFiles(report, project) {
 }
 
 /**
- * Give every child process its own server pair and therefore its own
- * Playwright output directory. A failed file's evidence cannot be overwritten
- * by a later file, and a failed server teardown cannot strand the next batch.
+ * Partition one exact Playwright shard without allowing either process
+ * lifetime or process churn to become unbounded.
+ *
+ * @param {string[]} files
+ * @returns {ReadonlyArray<ReadonlyArray<string>>}
+ */
+export function partitionBrowserShardFiles(files) {
+  if (!Array.isArray(files) || files.length === 0) {
+    throw new TypeError('Bounded browser shard files must be a non-empty array.');
+  }
+  if (files.some(file => typeof file !== 'string' || file === '')) {
+    throw new TypeError('Every bounded browser shard file must be a path.');
+  }
+  if (new Set(files).size !== files.length) {
+    throw new TypeError('Bounded browser shard files must be unique.');
+  }
+
+  const capacity =
+    MAX_FILES_PER_BROWSER_PROCESS * MAX_BROWSER_PROCESSES_PER_SHARD;
+  if (files.length > capacity) {
+    throw new RangeError(
+      `Browser shard assigns ${files.length} files, exceeding the bounded ` +
+        `capacity of ${capacity}; increase the CI shard count.`,
+    );
+  }
+
+  const batches = [];
+  for (
+    let index = 0;
+    index < files.length;
+    index += MAX_FILES_PER_BROWSER_PROCESS
+  ) {
+    batches.push(Object.freeze(
+      files.slice(index, index + MAX_FILES_PER_BROWSER_PROCESS),
+    ));
+  }
+  return Object.freeze(batches);
+}
+
+/**
+ * Give every bounded child process its own server pair and therefore its own
+ * Playwright output directory. A failed batch's evidence cannot be overwritten
+ * by a later batch, and a failed server teardown cannot strand the next one.
  *
  * @param {Record<string, string | undefined>} environment
- * @param {number} fileCount
+ * @param {number} batchCount
  * @returns {ReadonlyArray<Readonly<{port: number, samplePort: number}>>}
  */
-export function planIsolatedShardPorts(environment, fileCount) {
-  if (!Number.isInteger(fileCount) || fileCount < 1) {
-    throw new RangeError('Isolated browser shard fileCount must be positive.');
+export function planBrowserBatchPorts(environment, batchCount) {
+  if (!Number.isInteger(batchCount) || batchCount < 1) {
+    throw new RangeError('Bounded browser shard batchCount must be positive.');
+  }
+  if (batchCount > MAX_BROWSER_PROCESSES_PER_SHARD) {
+    throw new RangeError(
+      `Bounded browser shard cannot launch ${batchCount} processes; maximum ` +
+        `is ${MAX_BROWSER_PROCESSES_PER_SHARD}.`,
+    );
   }
   const { port, samplePort } = resolveBrowserTestPorts(environment);
   const stride = Math.abs(samplePort - port) + 1;
   const plan = [];
   let candidateIndex = 0;
-  while (plan.length < fileCount) {
+  while (plan.length < batchCount) {
     const candidate = Object.freeze({
       port: port + stride * candidateIndex,
       samplePort: samplePort + stride * candidateIndex,
@@ -236,7 +291,7 @@ export function planIsolatedShardPorts(environment, fileCount) {
     candidateIndex += 1;
     if (candidate.port > 65535 || candidate.samplePort > 65535) {
       throw new RangeError(
-        'Isolated browser shard cannot allocate one valid port pair per file.'
+        'Bounded browser shard cannot allocate one valid port pair per batch.'
       );
     }
     // Binding a Fetch-blocked port succeeds, but every browser navigation to
@@ -253,7 +308,7 @@ export function planIsolatedShardPorts(environment, fileCount) {
   return Object.freeze(plan);
 }
 
-function runFile(project, file, ports, headed, environment) {
+function runBatch(project, files, ports, headed, environment) {
   const childEnvironment = {
     ...environmentWithoutForcedColour(environment),
     [BROWSER_TEST_PORT_VARIABLE]: String(ports.port),
@@ -266,7 +321,7 @@ function runFile(project, file, ports, headed, environment) {
       'test',
       `--project=${project}`,
       ...(headed ? ['--headed'] : []),
-      file,
+      ...files,
     ],
     {
       cwd: REPOSITORY_ROOT,
@@ -276,30 +331,35 @@ function runFile(project, file, ports, headed, environment) {
   );
 }
 
-export function runIsolatedBrowserShard(
+export function runBoundedBrowserShard(
   { project, shard, headed },
   environment
 ) {
   const report = listShard(project, shard, headed, environment);
-  const files = extractIsolatedShardFiles(report, project);
-  const portPlan = planIsolatedShardPorts(environment, files.length);
+  const files = extractBoundedShardFiles(report, project);
+  const batches = partitionBrowserShardFiles(files);
+  const portPlan = planBrowserBatchPorts(environment, batches.length);
   const failures = [];
 
   console.log(
-    `Running ${project} shard ${shard} as ${files.length} isolated spec files.`
+    `Running ${project} shard ${shard}: ${files.length} files in ` +
+      `${batches.length} bounded browser processes.`,
   );
-  files.forEach((file, index) => {
-    console.log(`\n[isolated ${index + 1}/${files.length}] ${file}`);
-    const result = runFile(
+  batches.forEach((batch, index) => {
+    console.log(
+      `\n[bounded ${index + 1}/${batches.length}]\n` +
+        batch.map(file => `  ${file}`).join('\n'),
+    );
+    const result = runBatch(
       project,
-      file,
+      batch,
       portPlan[index],
       headed,
       environment
     );
     if (result.error || result.status !== 0) {
       failures.push({
-        file,
+        files: batch,
         termination: result.error?.message ?? result.signal ?? result.status,
       });
     }
@@ -307,20 +367,23 @@ export function runIsolatedBrowserShard(
 
   if (failures.length > 0) {
     const details = failures
-      .map(failure => `  - ${failure.file} (${failure.termination})`)
+      .map(failure =>
+        `  - ${failure.files.join(', ')} (${failure.termination})`
+      )
       .join('\n');
     throw new Error(
-      `${failures.length} isolated browser spec file(s) failed:\n${details}`
+      `${failures.length} bounded browser batch(es) failed:\n${details}`
     );
   }
   console.log(
-    `Completed all ${files.length} isolated files in ${project} shard ${shard}.`
+    `Completed all ${files.length} files in ${project} shard ${shard} ` +
+      `across ${batches.length} bounded browser processes.`,
   );
 }
 
 function main() {
-  const options = parseIsolatedShardArguments(process.argv.slice(2));
-  runIsolatedBrowserShard(options, process.env);
+  const options = parseBoundedShardArguments(process.argv.slice(2));
+  runBoundedBrowserShard(options, process.env);
 }
 
 const invokedPath = process.argv[1]

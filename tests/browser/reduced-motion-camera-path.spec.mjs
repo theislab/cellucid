@@ -80,6 +80,25 @@ async function preparePath(page) {
   await page.locator('#cinematic-save-btn').click();
   await expect(page.locator('.cinematic-keyframe-item')).toHaveCount(2);
 
+  // Compare playback with the actual state captured by the production store,
+  // rather than merely comparing the two preference modes with one another.
+  // That proves both modes reach the saved endpoint even if they were ever to
+  // regress in the same way.
+  const expectedFinalCamera = await page.evaluate(() => {
+    const keyframes = window._cellucidUi.cinematicCamera
+      .getKeyframeStore()
+      .getAll();
+    if (keyframes.length !== 2) {
+      throw new Error('Reduced-motion path must own exactly two keyframes.');
+    }
+    const endpoint = keyframes[1];
+    return {
+      navigationMode: endpoint.navigationMode,
+      orbit: endpoint.orbit,
+      freefly: endpoint.freefly,
+    };
+  });
+
   await page.locator('#cinematic-set-all-duration').fill('2');
   await page.locator('#cinematic-set-all-btn').click();
 
@@ -93,6 +112,7 @@ async function preparePath(page) {
     viewer.setCameraState(state);
   });
   await waitForViewerPaint(page);
+  return expectedFinalCamera;
 }
 
 async function playAndMeasure(page, reducedMotion) {
@@ -136,54 +156,60 @@ async function playAndMeasure(page, reducedMotion) {
   };
 }
 
-test('camera path playback honours a reduced-motion preference', async ({
-  browser
-}) => {
-  // This test deliberately owns custom contexts so it can compare two media
-  // preferences in one browser generation. Its fixture must not materialize
-  // an unused default context alongside them.
-  expect(browser.contexts()).toHaveLength(0);
-  const measurements = {};
-  const errors = {};
+const PREFERENCE_CASES = Object.freeze([
+  Object.freeze({
+    preference: 'no-preference',
+    reducedMotion: false,
+    title: 'camera path animates without a reduced-motion preference',
+  }),
+  Object.freeze({
+    preference: 'reduce',
+    reducedMotion: true,
+    title: 'camera path completes without animation for reduced motion',
+  }),
+]);
 
-  for (const reducedMotion of ['no-preference', 'reduce']) {
+// Each preference owns a full real dataset bootstrap and GPU playback. Keeping
+// them as separate contracts gives each independent operation the repository's
+// normal timeout fence; combining both made the second operation inherit time
+// already consumed by the first on hosted macOS Firefox.
+for (const scenario of PREFERENCE_CASES) {
+  test(scenario.title, async ({ browser }) => {
+    // The browser-only fixture must stay lazy: this contract owns the one
+    // context whose media preference it is proving.
+    expect(browser.contexts()).toHaveLength(0);
     const context = await browser.newContext({
-      reducedMotion,
+      reducedMotion: scenario.preference,
       viewport: VIEWPORT,
     });
     const page = await context.newPage();
-    errors[reducedMotion] = observeProductErrors(page);
     try {
-      await preparePath(page);
+      const errors = observeProductErrors(page);
+      const expectedFinalCamera = await preparePath(page);
       expect(
         await page.evaluate(
           () => window.matchMedia('(prefers-reduced-motion: reduce)').matches
         )
-      ).toBe(reducedMotion === 'reduce');
-      measurements[reducedMotion] = await playAndMeasure(
+      ).toBe(scenario.reducedMotion);
+
+      const measurement = await playAndMeasure(
         page,
-        reducedMotion === 'reduce',
+        scenario.reducedMotion,
       );
+
+      // Idle is still: any distinct frame measured below belongs to playback.
+      expect(measurement.idleFrames).toBe(1);
+      if (scenario.reducedMotion) {
+        expect(measurement.framesWhilePlaying).toBe(1);
+      } else {
+        expect(measurement.framesWhilePlaying).toBeGreaterThan(1);
+      }
+
+      // Both execution paths must land on the exact state saved as keyframe 2.
+      expect(measurement.finalCamera).toEqual(expectedFinalCamera);
+      expect(errors).toEqual([]);
     } finally {
       await closeContextWithApplicationRetirement(context);
     }
-  }
-
-  // Idle is still: any motion measured below belongs to the camera path.
-  expect(measurements['no-preference'].idleFrames).toBe(1);
-  expect(measurements.reduce.idleFrames).toBe(1);
-
-  // Without a stated preference the path animates.
-  expect(measurements['no-preference'].framesWhilePlaying).toBeGreaterThan(1);
-
-  // With one, it does not animate at all...
-  expect(measurements.reduce.framesWhilePlaying).toBe(1);
-
-  // ...and still arrives at the exact camera the animation would have reached.
-  expect(measurements.reduce.finalCamera).toEqual(
-    measurements['no-preference'].finalCamera
-  );
-
-  expect(errors['no-preference']).toEqual([]);
-  expect(errors.reduce).toEqual([]);
-});
+  });
+}

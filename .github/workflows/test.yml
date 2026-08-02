@@ -91,25 +91,24 @@ jobs:
           --project=firefox
           tests/browser/webgl2-runtime.spec.mjs
 
-      # The GPU-heavy inventory otherwise shares one long-lived browser process
-      # per shard. Hosted macOS Firefox eventually reached a native graphics
-      # replay failure, while Windows Chromium accumulated enough latency for a
-      # focus command to arrive after a 250 ms application debounce. Preserve
-      # Playwright's exact shard assignment while giving every spec file a
-      # fresh real browser process and a distinct evidence directory; no test
-      # is retried, skipped, mocked, or given more time.
-      - name: Run the selected headed Firefox shard with per-file isolation
+      # A process per whole shard retained native GPU state long enough to
+      # degrade hosted macOS Firefox. A process per file then exhausted Windows
+      # networking resources late in the larger shards. Preserve Playwright's
+      # exact assignment while bounding both dimensions: each child owns at
+      # most six files and each shard launches at most eight real browsers.
+      # Tests are neither retried nor skipped, mocked, or given more time.
+      - name: Run the selected headed Firefox shard in bounded processes
         if: matrix.browser == 'firefox' && runner.os == 'Linux'
         run: >-
           xvfb-run --auto-servernum --
-          npm run test:browser:isolated --
+          npm run test:browser:bounded --
           --project=firefox
           --headed
           --shard=${{ matrix.shard }}
 
-      - name: Run the selected browser shard with per-file isolation
+      - name: Run the selected browser shard in bounded processes
         if: matrix.browser != 'firefox' || runner.os != 'Linux'
         run: >-
-          npm run test:browser:isolated --
+          npm run test:browser:bounded --
           --project=${{ matrix.browser }}
           --shard=${{ matrix.shard }}

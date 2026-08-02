@@ -4,7 +4,7 @@
   "scripts": {
     "test": "node scripts/run-web-tests.mjs",
     "test:browser": "playwright test",
-    "test:browser:isolated": "node scripts/run-browser-shard-isolated.mjs",
+    "test:browser:bounded": "node scripts/run-browser-shard-bounded.mjs",
     "test:worker-bundle": "npx --yes wrangler@4.115.0 deploy --dry-run --config wrangler.community-annotations.jsonc"
   },
   "engines": {

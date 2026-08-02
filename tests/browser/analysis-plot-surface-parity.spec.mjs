@@ -15,7 +15,11 @@
  * match the plot host's layout box, and the sidebar plot must not paint below
  * its host.
  */
-import { expect, test } from './helpers/test.mjs';
+import {
+  closeContextWithApplicationRetirement,
+  expect,
+  test,
+} from './helpers/test.mjs';
 import { encodedAppUrl } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 
@@ -43,6 +47,8 @@ function panelSelect(page, optionValue) {
 const DATASET_URL =
   `/?exportsBaseUrl=${encodedAppUrl('/tests/browser/fixtures/demo-custom-exports/')}`
   + '&dataset=synthetic-development-3d&acceptance=analysis-plot-surface-parity';
+const VIEWPORT = { width: 1440, height: 1000 };
+const RETIREMENT_CYCLES = 20;
 
 /** Plot type id -> the Plotly trace type its committed render must publish. */
 const CATEGORICAL_PLOTS = Object.freeze([
@@ -227,25 +233,53 @@ test.describe('analysis plot surfaces', () => {
     );
   });
 
-  test('repeated expand and collapse retires every overlay plot', async ({ page }) => {
-    const productErrors = observeProductErrors(page);
+});
+
+test.describe.serial('analysis overlay retirement soak', () => {
+  let context = null;
+  let page = null;
+  let productErrors = null;
+
+  test.beforeAll(async ({ browser }) => {
+    // Keep one real application alive across every cycle: splitting the soak
+    // into test-sized operations must not reset the Plotly ownership whose
+    // accumulation this contract is designed to detect.
+    expect(browser.contexts()).toHaveLength(0);
+    context = await browser.newContext({ viewport: VIEWPORT });
+    page = await context.newPage();
+    productErrors = observeProductErrors(page);
+
     await openDetailedAnalysis(page);
     await selectVariable(page, 'continuous', 'differentiation_score', {
       id: 'boxplot',
       trace: 'box',
     });
 
-    const expandButton = page.locator(
-      `${DETAILED_PANEL} .analysis-expand-btn`,
-    );
-    const overlay = page.locator('.analysis-modal.open');
-
     const baseline = await readSurfaces(page);
     expect(baseline.plotlyGraphs).toBe(1);
+    expect(baseline.openOverlays).toBe(0);
+  });
 
-    for (let cycle = 0; cycle < 20; cycle++) {
+  test.afterAll(async () => {
+    if (context !== null) {
+      await closeContextWithApplicationRetirement(context);
+    }
+  });
+
+  // Hosted macOS Firefox can legitimately spend several seconds creating and
+  // purging each real Plotly surface. Each cycle is independently fenced by
+  // the normal test timeout while all twenty still share one application and
+  // therefore retain the original cumulative leak-detection contract.
+  for (let cycle = 1; cycle <= RETIREMENT_CYCLES; cycle += 1) {
+    test(`cycle ${cycle} retires its exact overlay plot`, async () => {
+      if (page === null || productErrors === null) {
+        throw new Error('Analysis overlay retirement owner was not initialized.');
+      }
+      const expandButton = page.locator(
+        `${DETAILED_PANEL} .analysis-expand-btn`,
+      );
       await expandButton.click();
-      await expect(overlay).toBeVisible();
+      await expect(page.locator('.analysis-modal.open')).toBeVisible();
       await expectSettledPlot(page, 'overlay', 'box');
       await page.keyboard.press('Escape');
       await expect(page.locator('.analysis-modal')).toHaveCount(0);
@@ -253,11 +287,10 @@ test.describe('analysis plot surfaces', () => {
       const settled = await readSurfaces(page);
       expect(
         settled.plotlyGraphs,
-        `cycle ${cycle + 1} must leave exactly the sidebar plot`,
+        `cycle ${cycle} must leave exactly the sidebar plot`,
       ).toBe(1);
       expect(settled.openOverlays).toBe(0);
-    }
-
-    expect(productErrors).toEqual([]);
-  });
+      expect(productErrors).toEqual([]);
+    });
+  }
 });
