@@ -25,17 +25,18 @@ const MAX_CAPTURE_BYTES = 64 * 1024 * 1024;
 // bound: one six-file group can contain 74 tests while another contains 12.
 // Bound every ordinary lifetime dimension: no browser owns more than six files
 // or forty tests. A small number of tests deliberately exercise repeated native
-// GPU allocation/rollback generations; vulnerable hosted native GPU processes
-// must run each containing file in its own process because they retain enough
-// state to crash the next unrelated page. A browser-process boundary alone is
-// not a host-GPU boundary: hosted macOS Firefox can retain degraded GPU-service
-// state after the stressing Firefox process exits. Vulnerable runtimes therefore
-// run all ordinary conformance batches first and quarantine declared stress
-// files in singleton processes at the tail, where retained driver state cannot
-// poison an unrelated test. Even with those declared isolation boundaries, no
-// shard may launch more than nine browsers. A growing inventory must add another
-// CI shard (or split an oversized spec) instead of silently weakening a resource
-// fence.
+// GPU allocation/rollback generations or instrument and drive measured frame
+// windows; vulnerable hosted native GPU processes must run each containing file
+// in its own process because they retain enough state to degrade or crash the
+// next unrelated page. A browser-process boundary alone is not a host-GPU
+// boundary: hosted macOS Firefox can retain degraded GPU-service state after
+// the stressing Firefox process exits. Vulnerable runtimes therefore run all
+// ordinary conformance batches first and quarantine declared stress files in
+// singleton processes at the tail, where retained driver state cannot poison
+// an unrelated test. Even
+// with those declared isolation boundaries, no shard may launch more than nine
+// browsers. A growing inventory must add another CI shard (or split an oversized
+// spec) instead of silently weakening a resource fence.
 export const MAX_FILES_PER_BROWSER_PROCESS = 6;
 export const MAX_TESTS_PER_BROWSER_PROCESS = 40;
 export const MAX_ORDINARY_BROWSER_PROCESSES_PER_SHARD = 8;

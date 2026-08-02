@@ -19,8 +19,16 @@ import { dismissWelcome } from './helpers/welcome.mjs';
 const FIXTURE_URL =
   `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}` +
   '&dataset=current-ui-prepared&acceptance=benchmark-harness-entry-point-ci';
+// This is a reachability test, but it still instruments the live WebGL context
+// and drives a measured frame window. Hosted native GPU services can retain
+// that stressed generation after the browser process exits. Declare the real
+// workload here so vulnerable-runtime schedulers quarantine it after ordinary
+// conformance pages; the declaration stays engine-neutral.
+const PROCESS_INTENSIVE = Object.freeze({
+  tag: '@browser-process-intensive',
+});
 
-test('opening the benchmark panel makes the harness constructible', async ({
+test('opening the benchmark panel makes the harness constructible', PROCESS_INTENSIVE, async ({
   page
 }) => {
   test.setTimeout(300_000);

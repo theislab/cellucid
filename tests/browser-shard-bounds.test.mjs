@@ -194,6 +194,7 @@ test('process-intensive isolation is limited to vulnerable native runtimes', () 
 
 test('native-GPU stress files declare every test process-intensive', async () => {
   for (const filename of [
+    'benchmark-harness-entry-point.spec.mjs',
     'benchmark-harness.spec.mjs',
     'edge-texture-publication.spec.mjs',
   ]) {
@@ -283,10 +284,12 @@ test('browser batches bound file count, test weight, and process churn', () => {
     [...inventory.slice(1), inventory[0]].map(item => item.file),
   );
 
-  // macOS Firefox completed the five benchmark stress tests but retained a
-  // degraded host GPU service after the Firefox process exited, killing the
-  // following runtime-publication page. The benchmark file therefore owns the
-  // final process generation rather than merely a separate middle generation.
+  // macOS Firefox completed the live entry-point measurement and the five
+  // benchmark stress tests but retained a degraded host GPU service after the
+  // Firefox process exited, killing the following runtime-publication page.
+  // Both harness owners therefore run after every ordinary file. The entry
+  // point and full harness remain separate singleton generations because each
+  // independently instruments and drives the native WebGL context.
   const shardOneCounts = [
     8, 1, 7, 22, 1, 3,
     1, 2, 1, 5, 2, 12,
@@ -298,7 +301,7 @@ test('browser batches bound file count, test weight, and process churn', () => {
     (tests, index) => inventoryItem(
       `tests/browser/shard-one-${index}.spec.mjs`,
       tests,
-      index === 9,
+      index === 8 || index === 9,
     ),
   );
   const isolatedBenchmarkBatches = partitionBrowserShardInventory(
@@ -307,20 +310,24 @@ test('browser batches bound file count, test weight, and process churn', () => {
   );
   assert.deepEqual(
     isolatedBenchmarkBatches.map(batch => batch.files.length),
-    [5, 6, 6, 2, 4, 3, 1],
+    [5, 6, 6, 2, 4, 2, 1, 1],
   );
   assert.deepEqual(
     isolatedBenchmarkBatches.map(batch => batch.testCount),
-    [39, 21, 15, 37, 37, 12, 5],
+    [39, 23, 14, 39, 37, 8, 1, 5],
   );
   assert.deepEqual(
-    isolatedBenchmarkBatches.at(-1).files,
-    [isolatedBenchmarkInventory[9].file],
+    isolatedBenchmarkBatches.slice(-2).map(batch => batch.files),
+    [
+      [isolatedBenchmarkInventory[8].file],
+      [isolatedBenchmarkInventory[9].file],
+    ],
   );
   assert.deepEqual(
     isolatedBenchmarkBatches.flatMap(batch => batch.files),
     [
       ...isolatedBenchmarkInventory.filter(item => !item.intensive),
+      isolatedBenchmarkInventory[8],
       isolatedBenchmarkInventory[9],
     ].map(item => item.file),
   );
