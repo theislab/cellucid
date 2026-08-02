@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
-test('browser CI shards every engine and isolates long-lived macOS Firefox processes', async () => {
+test('browser CI shards every engine with per-file process isolation', async () => {
   const [workflow, playwrightConfig, packageJson] = await Promise.all([
     readFile(
       new URL('../.github/workflows/test.yml', import.meta.url),
@@ -36,30 +36,31 @@ test('browser CI shards every engine and isolates long-lived macOS Firefox proce
   ) ?? [];
   assert.equal(
     shardArguments.length,
-    3,
-    'the Linux, macOS-Firefox, and standard execution partitions must all shard',
+    2,
+    'the headed Linux-Firefox and headless browser partitions must both shard',
   );
   assert.match(
     workflow,
-    /if: matrix\.browser == 'firefox' && runner\.os == 'Linux'\n\s+run: >-\n\s+xvfb-run --auto-servernum --\n\s+npm run test:browser --\n\s+--project=firefox\n\s+--headed\n\s+--shard=\$\{\{ matrix\.shard \}\}/,
+    /if: matrix\.browser == 'firefox' && runner\.os == 'Linux'\n\s+run: >-\n\s+xvfb-run --auto-servernum --\n\s+npm run test:browser:isolated --\n\s+--project=firefox\n\s+--headed\n\s+--shard=\$\{\{ matrix\.shard \}\}/,
   );
   assert.match(
     workflow,
-    /if: matrix\.browser == 'firefox' && runner\.os == 'macOS'\n\s+run: >-\n\s+npm run test:browser:isolated --\n\s+--project=firefox\n\s+--shard=\$\{\{ matrix\.shard \}\}/,
+    /if: matrix\.browser != 'firefox' \|\| runner\.os != 'Linux'\n\s+run: >-\n\s+npm run test:browser:isolated --\n\s+--project=\$\{\{ matrix\.browser \}\}\n\s+--shard=\$\{\{ matrix\.shard \}\}/,
   );
-  assert.match(
+  assert.doesNotMatch(
     workflow,
-    /if: matrix\.browser != 'firefox' \|\| runner\.os == 'Windows'\n\s+run: >-\n\s+npm run test:browser --\n\s+--project=\$\{\{ matrix\.browser \}\}\n\s+--shard=\$\{\{ matrix\.shard \}\}/,
+    /npm run test:browser --[\s\S]{0,160}?--shard=/,
+    'no full shard may retain one accumulating browser process',
   );
   assert.equal(
     JSON.parse(packageJson).scripts['test:browser:isolated'],
     'node scripts/run-browser-shard-isolated.mjs',
   );
 
-  // The three full-suite conditions are a complete, disjoint partition:
-  // Linux Firefox is headed, macOS Firefox recycles its browser per file, and
-  // Windows Firefox plus every non-Firefox cell use the standard command. The
-  // explicit WebGL probes run once rather than once per shard.
+  // The two full-suite conditions are a complete, disjoint partition: Linux
+  // Firefox remains headed under Xvfb; every other cell is headless. Both
+  // recycle the browser per file. The explicit WebGL probes run once rather
+  // than once per shard.
   assert.match(
     workflow,
     /if: matrix\.browser == 'firefox' && runner\.os == 'Linux' && matrix\.shard == '1\/2'[\s\S]*?tests\/browser\/webgl2-runtime\.spec\.mjs/,

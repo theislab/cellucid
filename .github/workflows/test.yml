@@ -91,31 +91,25 @@ jobs:
           --project=firefox
           tests/browser/webgl2-runtime.spec.mjs
 
-      - name: Run the selected headed Firefox browser shard on Linux
+      # The GPU-heavy inventory otherwise shares one long-lived browser process
+      # per shard. Hosted macOS Firefox eventually reached a native graphics
+      # replay failure, while Windows Chromium accumulated enough latency for a
+      # focus command to arrive after a 250 ms application debounce. Preserve
+      # Playwright's exact shard assignment while giving every spec file a
+      # fresh real browser process and a distinct evidence directory; no test
+      # is retried, skipped, mocked, or given more time.
+      - name: Run the selected headed Firefox shard with per-file isolation
         if: matrix.browser == 'firefox' && runner.os == 'Linux'
         run: >-
           xvfb-run --auto-servernum --
-          npm run test:browser --
+          npm run test:browser:isolated --
           --project=firefox
           --headed
           --shard=${{ matrix.shard }}
 
-      # WebGL-heavy Firefox files share one browser process by default. On the
-      # macOS hosted image that process progressively degrades across a
-      # 40-minute shard until unrelated, otherwise-fast DOM actions stop being
-      # serviced. Preserve Playwright's exact shard assignment while giving
-      # every spec file a fresh real Firefox process and a distinct evidence
-      # directory; no test is retried, skipped, mocked, or given more time.
-      - name: Run the selected Firefox shard with per-file browser isolation
-        if: matrix.browser == 'firefox' && runner.os == 'macOS'
+      - name: Run the selected browser shard with per-file isolation
+        if: matrix.browser != 'firefox' || runner.os != 'Linux'
         run: >-
           npm run test:browser:isolated --
-          --project=firefox
-          --shard=${{ matrix.shard }}
-
-      - name: Run the selected browser shard
-        if: matrix.browser != 'firefox' || runner.os == 'Windows'
-        run: >-
-          npm run test:browser --
           --project=${{ matrix.browser }}
           --shard=${{ matrix.shard }}

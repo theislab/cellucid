@@ -11,7 +11,16 @@ import {
 test('isolated browser shard arguments accept both CLI forms exactly once', () => {
   assert.deepEqual(
     parseIsolatedShardArguments(['--project=firefox', '--shard', '2/3']),
-    { project: 'firefox', shard: '2/3' },
+    { project: 'firefox', shard: '2/3', headed: false },
+  );
+  assert.deepEqual(
+    parseIsolatedShardArguments([
+      '--headed',
+      '--project',
+      'firefox',
+      '--shard=1/2',
+    ]),
+    { project: 'firefox', shard: '1/2', headed: true },
   );
   assert.throws(
     () => parseIsolatedShardArguments([
@@ -36,6 +45,15 @@ test('isolated browser shard arguments accept both CLI forms exactly once', () =
   assert.throws(
     () => parseIsolatedShardArguments(['--project=firefox', '--retry=1']),
     /Unknown isolated browser-shard option/,
+  );
+  assert.throws(
+    () => parseIsolatedShardArguments([
+      '--project=firefox',
+      '--shard=1/2',
+      '--headed',
+      '--headed',
+    ]),
+    /--headed may be supplied once/,
   );
 });
 

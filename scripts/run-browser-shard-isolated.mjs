@@ -28,11 +28,12 @@ function readOption(argument, name) {
  * Parse the deliberately small public surface used by CI.
  *
  * @param {string[]} arguments_
- * @returns {Readonly<{project: string, shard: string}>}
+ * @returns {Readonly<{project: string, shard: string, headed: boolean}>}
  */
 export function parseIsolatedShardArguments(arguments_) {
   let project = null;
   let shard = null;
+  let headed = false;
 
   for (let index = 0; index < arguments_.length; index += 1) {
     const argument = arguments_[index];
@@ -47,6 +48,11 @@ export function parseIsolatedShardArguments(arguments_) {
     if (shardValue !== null) {
       if (shard !== null) throw new TypeError('--shard may be supplied once.');
       shard = shardValue;
+      continue;
+    }
+    if (argument === '--headed') {
+      if (headed) throw new TypeError('--headed may be supplied once.');
+      headed = true;
       continue;
     }
     if (argument === '--project' || argument === '--shard') {
@@ -87,7 +93,7 @@ export function parseIsolatedShardArguments(arguments_) {
     );
   }
 
-  return Object.freeze({ project, shard: `${current}/${total}` });
+  return Object.freeze({ project, shard: `${current}/${total}`, headed });
 }
 
 function environmentWithoutForcedColour(environment) {
@@ -111,7 +117,7 @@ function describeFailedProcess(result, operation) {
     : `${operation} failed with ${termination}:\n${output}`;
 }
 
-function listShard(project, shard, environment) {
+function listShard(project, shard, headed, environment) {
   const result = spawnSync(
     process.execPath,
     [
@@ -121,6 +127,7 @@ function listShard(project, shard, environment) {
       '--reporter=json',
       `--project=${project}`,
       `--shard=${shard}`,
+      ...(headed ? ['--headed'] : []),
     ],
     {
       cwd: REPOSITORY_ROOT,
@@ -246,7 +253,7 @@ export function planIsolatedShardPorts(environment, fileCount) {
   return Object.freeze(plan);
 }
 
-function runFile(project, file, ports, environment) {
+function runFile(project, file, ports, headed, environment) {
   const childEnvironment = {
     ...environmentWithoutForcedColour(environment),
     [BROWSER_TEST_PORT_VARIABLE]: String(ports.port),
@@ -254,7 +261,13 @@ function runFile(project, file, ports, environment) {
   };
   return spawnSync(
     process.execPath,
-    [PLAYWRIGHT_CLI, 'test', `--project=${project}`, file],
+    [
+      PLAYWRIGHT_CLI,
+      'test',
+      `--project=${project}`,
+      ...(headed ? ['--headed'] : []),
+      file,
+    ],
     {
       cwd: REPOSITORY_ROOT,
       env: childEnvironment,
@@ -263,8 +276,11 @@ function runFile(project, file, ports, environment) {
   );
 }
 
-export function runIsolatedBrowserShard({ project, shard }, environment) {
-  const report = listShard(project, shard, environment);
+export function runIsolatedBrowserShard(
+  { project, shard, headed },
+  environment
+) {
+  const report = listShard(project, shard, headed, environment);
   const files = extractIsolatedShardFiles(report, project);
   const portPlan = planIsolatedShardPorts(environment, files.length);
   const failures = [];
@@ -274,7 +290,13 @@ export function runIsolatedBrowserShard({ project, shard }, environment) {
   );
   files.forEach((file, index) => {
     console.log(`\n[isolated ${index + 1}/${files.length}] ${file}`);
-    const result = runFile(project, file, portPlan[index], environment);
+    const result = runFile(
+      project,
+      file,
+      portPlan[index],
+      headed,
+      environment
+    );
     if (result.error || result.status !== 0) {
       failures.push({
         file,
