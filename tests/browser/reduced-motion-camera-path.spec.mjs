@@ -34,6 +34,15 @@ async function hashCanvas(page) {
   return createHash('sha256').update(buffer).digest('hex');
 }
 
+async function waitForViewerPaint(page) {
+  // Camera publication is synchronous; the viewer consumes it on a later
+  // animation frame. Two boundaries cover both the viewer frame and the
+  // compositor handoff before a screenshot observes the result.
+  await page.evaluate(() => new Promise(resolve => {
+    requestAnimationFrame(() => requestAnimationFrame(resolve));
+  }));
+}
+
 /**
  * Build a two-keyframe path with a known duration, then park the camera away
  * from both keyframes so "reached the end" is distinguishable from "stayed put".
@@ -79,15 +88,10 @@ async function preparePath(page) {
     state.orbit.targetRadius = state.orbit.radius;
     viewer.setCameraState(state);
   });
-  // `setCameraState` is synchronous, while its pixels belong to the next
-  // viewer frame. Wait through two animation boundaries so the first idle
-  // screenshot cannot capture the previous camera on a slower renderer.
-  await page.evaluate(() => new Promise(resolve => {
-    requestAnimationFrame(() => requestAnimationFrame(resolve));
-  }));
+  await waitForViewerPaint(page);
 }
 
-async function playAndMeasure(page) {
+async function playAndMeasure(page, reducedMotion) {
   const idle = new Set();
   idle.add(await hashCanvas(page));
   await page.waitForTimeout(SAMPLE_INTERVAL_MS);
@@ -98,6 +102,15 @@ async function playAndMeasure(page) {
   await page.mouse.move(VIEWPORT.width - 120, VIEWPORT.height / 2);
   await expect(playButton).toBeEnabled();
   await playButton.click();
+  // Reduced motion completes synchronously and never enters the playback
+  // frame loop. Ordinary playback must remain active here. Assert that
+  // semantic state separately from pixels, then wait until the synchronous
+  // endpoint publication has reached the real canvas before sampling it.
+  await expect(playButton).toHaveAttribute(
+    'title',
+    reducedMotion ? 'Play' : 'Pause',
+  );
+  await waitForViewerPaint(page);
 
   const framesWhilePlaying = new Set();
   for (let sample = 0; sample < SAMPLE_COUNT; sample += 1) {
@@ -139,7 +152,10 @@ test('camera path playback honours a reduced-motion preference', async ({
           () => window.matchMedia('(prefers-reduced-motion: reduce)').matches
         )
       ).toBe(reducedMotion === 'reduce');
-      measurements[reducedMotion] = await playAndMeasure(page);
+      measurements[reducedMotion] = await playAndMeasure(
+        page,
+        reducedMotion === 'reduce',
+      );
     } finally {
       await context.close();
     }

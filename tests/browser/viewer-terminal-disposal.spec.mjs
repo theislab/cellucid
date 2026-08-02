@@ -65,6 +65,7 @@ test('real WebGL loss is a permanent owner fence with no restoration or disposal
     const projectileCompletions = [];
     viewer.setProjectilesEnabled(true, result => {
       projectileCompletions.push({
+        contextLostAtCompletion: gl.isContextLost(),
         message: result.message,
         status: result.status,
       });
@@ -237,10 +238,24 @@ test('real WebGL loss is a permanent owner fence with no restoration or disposal
   expect(proof.resizeDisconnectCalls).toBe(
     proof.resizeDisconnectCallsAfterLoss,
   );
-  expect(proof.projectileCompletions).toEqual([{
-    message: 'Projectile preparation was cancelled because the WebGL context was lost.',
-    status: 'cancelled',
-  }]);
+  expect(proof.projectileCompletions).toHaveLength(1);
+  const [projectileCompletion] = proof.projectileCompletions;
+  // WEBGL_lose_context initiates loss, but engines do not promise that the
+  // physical loss or its event beats an already-scheduled timer. A build may
+  // linearize first; it must never publish ready after the context is lost.
+  if (projectileCompletion.status === 'ready') {
+    expect(projectileCompletion).toEqual({
+      contextLostAtCompletion: false,
+      message: null,
+      status: 'ready',
+    });
+  } else {
+    expect(projectileCompletion).toEqual({
+      contextLostAtCompletion: true,
+      message: 'Projectile preparation was cancelled because the WebGL context was lost.',
+      status: 'cancelled',
+    });
+  }
   expect(proof.overlayCount).toBe(1);
   expect(proof.pausedAfterSafeControls).toBe(true);
   expect(proof.stableRendererFacade).toBe(true);

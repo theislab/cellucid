@@ -41,21 +41,21 @@
   /* Accent colors. */
   --color-accent: var(--cyan-400);
   --color-accent-strong: var(--cyan-300);
-  --color-accent-soft: color-mix(in srgb, var(--color-accent) 12%, transparent);
+  --color-accent-soft: color-mix(in srgb, var(--color-accent) 12%, var(--color-surface-elevated));
   --color-accent-text: var(--cyan-200);
 
   /* Status colors. */
   --color-success: var(--green-400);
-  --color-success-soft: color-mix(in srgb, var(--color-success) 12%, transparent);
+  --color-success-soft: color-mix(in srgb, var(--color-success) 12%, var(--color-surface-elevated));
   --color-success-text: var(--green-300);
   --color-warning: var(--yellow-400);
-  --color-warning-soft: color-mix(in srgb, var(--color-warning) 12%, transparent);
+  --color-warning-soft: color-mix(in srgb, var(--color-warning) 12%, var(--color-surface-elevated));
   --color-warning-text: var(--yellow-300);
   --color-danger: var(--red-400);
-  --color-danger-soft: color-mix(in srgb, var(--color-danger) 12%, transparent);
+  --color-danger-soft: color-mix(in srgb, var(--color-danger) 12%, var(--color-surface-elevated));
   --color-danger-text: var(--red-300);
   --color-danger-dark: var(--red-600);
   --color-info: var(--blue-400);
-  --color-info-soft: color-mix(in srgb, var(--color-info) 12%, transparent);
+  --color-info-soft: color-mix(in srgb, var(--color-info) 12%, var(--color-surface-elevated));
   --color-info-text: var(--blue-300);
 }

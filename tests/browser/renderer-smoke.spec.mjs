@@ -2423,7 +2423,12 @@ test('smoke owns an empty filtered view without errors or stale density', async 
     input.value = '0';
     input.dispatchEvent(new Event('input', { bubbles: true }));
   });
+  await page.locator('#noise-resolution').evaluate(input => {
+    input.value = '0';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+  });
   await expect(page.locator('#smoke-grid-display')).toHaveText('32³');
+  await expect(page.locator('#noise-resolution-display')).toHaveText('32³');
   await page.locator('#categorical-field').selectOption({ label: 'cell_type' });
 
   const legend = page.locator('#legend');

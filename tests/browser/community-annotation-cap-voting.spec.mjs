@@ -143,6 +143,11 @@ test.beforeEach(async ({ page }) => {
 test('CAP voting exposes every bounded item and applies current results atomically', async ({
   page,
 }) => {
+  // This is one stateful interaction contract: splitting it would stop
+  // proving that secondary dialogs, CAP requests, edits, and merge ownership
+  // remain coherent across the same session. Give that full lifecycle its own
+  // budget on software-rendered CI browsers.
+  test.setTimeout(180_000);
   const productErrors = observeProductErrors(page);
   let releaseSlow;
   const lookupBodies = [];

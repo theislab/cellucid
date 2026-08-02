@@ -7,21 +7,21 @@ test('GLB benchmark publishes one complete state generation', async ({
 }, testInfo) => {
   const browserErrors = [];
   let benchmarkModulePublications = 0;
-  let publishBenchmarkModuleRequest;
-  const benchmarkModuleRequested = new Promise(resolve => {
-    publishBenchmarkModuleRequest = resolve;
+  let publishWorkerRequest;
+  const workerRequested = new Promise(resolve => {
+    publishWorkerRequest = resolve;
   });
-  let releaseBenchmarkModule;
-  const benchmarkModuleRelease = new Promise(resolve => {
-    releaseBenchmarkModule = resolve;
+  let releaseWorker;
+  const workerRelease = new Promise(resolve => {
+    releaseWorker = resolve;
   });
 
   await page.addInitScript(() => {
     localStorage.setItem('CELLUCID_DEBUG', 'true');
   });
-  await page.route('**/assets/js/dev/benchmark.js', async route => {
-    publishBenchmarkModuleRequest();
-    await benchmarkModuleRelease;
+  await page.route('**/generation-worker.js', async route => {
+    publishWorkerRequest();
+    await workerRelease;
     await route.continue();
   });
   page.on('console', message => {
@@ -68,11 +68,13 @@ test('GLB benchmark publishes one complete state generation', async ({
 
   await page.locator('#benchmark-section > summary').click();
   await expect(page.locator('#benchmark-section')).toHaveAttribute('open', '');
-  await benchmarkModuleRequested;
+  await expect.poll(() => benchmarkModulePublications).toBe(1);
   await page.locator('#benchmark-count').fill('1000');
   await page.locator('#benchmark-pattern').selectOption('glb');
   await page.locator('#benchmark-run').click();
-  releaseBenchmarkModule();
+  await workerRequested;
+  expect(await page.evaluate(() => window._cellucidState.pointCount)).toBe(120);
+  releaseWorker();
 
   await expect.poll(
     () => page.evaluate(() => window._cellucidState.pointCount)

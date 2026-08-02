@@ -42,8 +42,16 @@ test('consensus snapshot downloads once and reports the exact success', async ({
     name: 'CONSENSUS SNAPSHOT + LOCAL CACHE',
   }).click();
 
+  const successNotice = page.getByText(
+    'Downloaded cellucid-consensus.json',
+    { exact: true },
+  );
   const [download] = await Promise.all([
     page.waitForEvent('download'),
+    // The product intentionally retires this success toast after 2.2 s. Own
+    // its visible interval while the browser download is initiated instead of
+    // looking for it after runner-dependent disk I/O has completed.
+    expect(successNotice).toBeVisible(),
     page.getByRole('button', { name: 'Download', exact: true }).click(),
   ]);
   expect(download.suggestedFilename()).toBe('cellucid-consensus.json');
@@ -61,9 +69,6 @@ test('consensus snapshot downloads once and reports the exact success', async ({
   expect(document.suggestions).toEqual({});
   expect(document.consensus).toEqual({});
 
-  await expect(
-    page.getByText('Downloaded cellucid-consensus.json', { exact: true }),
-  ).toBeVisible();
   await expect(page.locator('.notification-error')).toHaveCount(0);
   expect(productErrors).toEqual([]);
 });

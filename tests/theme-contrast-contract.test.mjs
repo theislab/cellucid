@@ -95,6 +95,23 @@ function contrastRatio(foreground, background) {
   return (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05);
 }
 
+function resolveOpaqueColor(value, theme, primitives) {
+  if (/^#[0-9a-f]{6}$/i.test(value.trim())) return toRgb(value);
+
+  const mix = value.match(
+    /^color-mix\(in srgb,\s*var\((--[a-z0-9-]+)\)\s*(\d+(?:\.\d+)?)%,\s*var\((--[a-z0-9-]+)\)\)$/i,
+  );
+  if (mix === null) {
+    throw new Error(`Expected an opaque hex or two-colour mix, received "${value}"`);
+  }
+  const foreground = toRgb(resolve(mix[1], theme, primitives));
+  const background = toRgb(resolve(mix[3], theme, primitives));
+  const amount = Number(mix[2]) / 100;
+  return foreground.map((channel, index) => Math.round(
+    channel * amount + background[index] * (1 - amount),
+  ));
+}
+
 const primitives = parseDeclarations(await readFile(PRIMITIVES_URL, 'utf8'));
 const themes = new Map();
 for (const [name, url] of Object.entries(THEME_URLS)) {
@@ -200,26 +217,14 @@ test('every status text token clears AA on the surfaces status panels use', () =
       const backgrounds = TEXT_SURFACES.map(
         token => [token, toRgb(resolve(token, theme, primitives))],
       );
-      /* Dark declares `-soft` as color-mix(<status> 12%, transparent), so
-         composite it over each panel surface rather than assuming a hex. */
+      /* Dark soft fills are deliberately opaque: semantic panels can appear
+         over the canvas, modals, or neutral surfaces, so their contrast must
+         not depend on whichever ancestor happens to lie underneath. */
       const softValue = resolve(`--color-${status}-soft`, theme, primitives);
-      const softMix = softValue.match(
-        /^color-mix\(in srgb,\s*var\((--[a-z0-9-]+)\)\s*(\d+)%,\s*transparent\)$/i,
-      );
-      if (softMix === null) {
-        backgrounds.push([`--color-${status}-soft`, toRgb(softValue)]);
-      } else {
-        const tint = toRgb(resolve(softMix[1], theme, primitives));
-        const alpha = Number(softMix[2]) / 100;
-        for (const [surfaceToken, surface] of [...backgrounds]) {
-          backgrounds.push([
-            `--color-${status}-soft over ${surfaceToken}`,
-            tint.map((channel, index) => Math.round(
-              channel * alpha + surface[index] * (1 - alpha),
-            )),
-          ]);
-        }
-      }
+      backgrounds.push([
+        `--color-${status}-soft`,
+        resolveOpaqueColor(softValue, theme, primitives),
+      ]);
 
       for (const [label, background] of backgrounds) {
         const ratio = contrastRatio(foreground, background);

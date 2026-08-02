@@ -444,6 +444,7 @@ test('a published starting state reports its field and leaves the dimension rule
   ]);
   const bundle = toPublishedDefault(await readFile(await download.path()));
   expect(bundle.byteLength).toBeGreaterThan(0);
+  await page.close();
 
   // Phase 2 — advertise it as the dataset's starting state and open the
   // dataset the way a first-time visitor does.

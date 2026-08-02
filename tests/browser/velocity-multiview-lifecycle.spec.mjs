@@ -231,6 +231,14 @@ test(
       label: 'cell_type',
     });
     await expect(page.locator('.legend-item')).toHaveCount(3);
+    // This contract measures generation ownership, not particle throughput.
+    // Keep the real transform-feedback and compositor paths while avoiding a
+    // default 15K-particle workload on every deliberately sampled frame.
+    await page.locator('#velocity-density').evaluate(input => {
+      input.value = '1';
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    await expect(page.locator('#velocity-density-display')).toHaveText('1K');
     await page.locator('#velocity-overlay-enabled').check();
     await expect(
       page.getByText('Velocity overlay ready', { exact: true }),
@@ -303,8 +311,8 @@ test(
       ).map(record => record.transformFeedbackBufferId)).size;
     }).toBe(4);
 
-    await resetAudit(page);
-    await advanceFrames(page, 5);
+    // The successful poll already owns a complete multiview audit window;
+    // re-running a second GPU window here adds no ownership evidence.
     const gridRecords = await readAudit(page);
     const gridSimulation = gridRecords.filter(
       record => record.role === 'simulate',

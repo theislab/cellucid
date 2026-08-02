@@ -296,29 +296,35 @@ test('synthetic generation runs off the main thread', async ({ page }) => {
   const result = await page.evaluate(
     async ({ moduleUrl, count }) => {
       const harnessModule = await import(moduleUrl);
-      // Count animation frames while generation runs. A main-thread generator
-      // freezes the tab and this counter stays at zero; a worker leaves the
-      // frame loop alive, which is what lets an automated run observe progress
-      // instead of timing out against a frozen page.
-      let framesDuringGeneration = 0;
-      let generating = true;
-      const tick = () => {
-        if (!generating) return;
-        framesDuringGeneration++;
-        requestAnimationFrame(tick);
-      };
-      requestAnimationFrame(tick);
+      // Audit the runtime boundary itself. Frame delivery is allowed to be
+      // throttled independently from worker scheduling, especially in a
+      // headless background tab, so RAF counts cannot prove thread ownership.
+      const NativeWorker = window.Worker;
+      const workers = [];
+      window.Worker = new Proxy(NativeWorker, {
+        construct(target, args) {
+          workers.push({
+            url: String(args[0]),
+            type: args[1]?.type ?? null,
+          });
+          return Reflect.construct(target, args);
+        },
+      });
 
       const startedAt = performance.now();
-      const data = await harnessModule.generateSyntheticDataOffThread({
-        pattern: 'atlas',
-        count
-      });
-      generating = false;
+      let data;
+      try {
+        data = await harnessModule.generateSyntheticDataOffThread({
+          pattern: 'atlas',
+          count
+        });
+      } finally {
+        window.Worker = NativeWorker;
+      }
       return {
         wallMs: performance.now() - startedAt,
         workerMs: data.elapsedMs,
-        framesDuringGeneration,
+        workers,
         positions: data.positions.length,
         colors: data.colors.length,
         dimensionLevel: data.dimensionLevel,
@@ -335,7 +341,10 @@ test('synthetic generation runs off the main thread', async ({ page }) => {
   expect(result.positionsAreFloat32).toBe(true);
   expect(result.colorsAreUint8).toBe(true);
   expect(result.workerMs).toBeGreaterThan(0);
-  expect(result.framesDuringGeneration).toBeGreaterThan(0);
+  expect(result.workers).toEqual([{
+    url: expect.stringMatching(/\/generation-worker\.js$/),
+    type: 'module',
+  }]);
   expect(browserErrors).toEqual([]);
 });
 

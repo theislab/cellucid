@@ -120,6 +120,9 @@ test('a sidebar panel undocks and docks from the keyboard, and still from the po
     floating: true,
     parentId: 'floating-panels-root',
   });
+  await expect(page.locator('#visualization-section')).not.toHaveClass(
+    /floating-enter/,
+  );
 
   /* The floating panel's only size control was pointer-only and
      `aria-hidden`. It is a focusable window splitter now. */

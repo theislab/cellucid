@@ -140,11 +140,13 @@ async function expectSettledPlot(page, surfaceName, traceType) {
     .toMatch(/^(\d+)x(\d+) in \1x\2$/);
 }
 
-async function selectVariable(page, kind, field) {
+async function selectVariable(page, kind, field, initialPlot) {
   await panelSelect(page, kind).selectOption(kind);
   const fieldSelect = panelSelect(page, field);
   await expect(fieldSelect).toBeVisible();
   await fieldSelect.selectOption(field);
+  await expect(panelSelect(page, initialPlot.id)).toHaveValue(initialPlot.id);
+  await expectSettledPlot(page, 'preview', initialPlot.trace);
   await expect(
     page.locator(`${DETAILED_PANEL} .analysis-expand-btn`),
   ).toBeVisible();
@@ -153,20 +155,39 @@ async function selectVariable(page, kind, field) {
 /**
  * Render each plot type in the sidebar, expand it, and check both surfaces.
  *
- * Each variable kind gets its own page load: the Detailed panel discards the
- * first change of an already-chosen variable type, which is a separate defect
- * in `detailed-analysis-ui.js` and not what these assertions are about.
+ * Each variable kind gets its own page load so its first committed publication
+ * has one unambiguous data and plot-type owner.
  */
 async function checkPlotSurfaces(page, kind, field, plots) {
   const productErrors = observeProductErrors(page);
   await openDetailedAnalysis(page);
-  await selectVariable(page, kind, field);
+  await selectVariable(page, kind, field, plots[0]);
 
   const expandButton = page.locator(`${DETAILED_PANEL} .analysis-expand-btn`);
   const overlay = page.locator('.analysis-modal.open');
 
   for (const plot of plots) {
-    await panelSelect(page, plot.id).selectOption(plot.id);
+    const plotSelect = panelSelect(page, plot.id);
+    if (await plotSelect.inputValue() !== plot.id) {
+      const previousAction = await expandButton.elementHandle();
+      if (previousAction === null) {
+        throw new Error('Committed analysis action disappeared before replacement');
+      }
+      await plotSelect.selectOption(plot.id);
+
+      // A plot candidate is connected while hidden. Its trace can therefore
+      // look settled before it commits. The action button is replaced only by
+      // `_renderActions()` after that commit, so retirement of this exact old
+      // button is the publication fence for the click below.
+      await expect
+        .poll(
+          () => previousAction.evaluate(element => element.isConnected),
+          { message: `${plot.id} publishes a new analysis generation` },
+        )
+        .toBe(false);
+      await previousAction.dispose();
+      await expect(expandButton).toBeVisible();
+    }
     await expectSettledPlot(page, 'preview', plot.trace);
 
     // A plot that draws past its host paints over the actions bar.
@@ -209,8 +230,10 @@ test.describe('analysis plot surfaces', () => {
   test('repeated expand and collapse retires every overlay plot', async ({ page }) => {
     const productErrors = observeProductErrors(page);
     await openDetailedAnalysis(page);
-    await selectVariable(page, 'continuous', 'differentiation_score');
-    await expectSettledPlot(page, 'preview', 'box');
+    await selectVariable(page, 'continuous', 'differentiation_score', {
+      id: 'boxplot',
+      trace: 'box',
+    });
 
     const expandButton = page.locator(
       `${DETAILED_PANEL} .analysis-expand-btn`,
