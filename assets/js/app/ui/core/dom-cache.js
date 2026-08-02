@@ -159,6 +159,15 @@ export function collectDOMReferences(root) {
       sizeAttenuationInput: byId('size-attenuation'),
       sizeAttenuationDisplay: byId('size-attenuation-display'),
 
+      hpShaderQualitySelect: byId('hp-shader-quality'),
+      hpLodEnabledCheckbox: byId('hp-lod-enabled'),
+      hpLodForceInput: byId('hp-lod-force'),
+      hpLodForceContainer: byId('lod-force-container'),
+      hpLodForceDisplay: byId('hp-lod-force-label'),
+      hpFrustumCullingCheckbox: byId('hp-frustum-culling'),
+      hpAntialiasCheckbox: byId('hp-antialias'),
+      hpAntialiasStatus: byId('hp-antialias-status'),
+
       smokeGridInput: byId('smoke-grid'),
       smokeGridDisplay: byId('smoke-grid-display'),
       smokeStepsInput: byId('smoke-steps'),

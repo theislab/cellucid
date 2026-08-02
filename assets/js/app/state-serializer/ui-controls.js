@@ -16,6 +16,25 @@ const SERIALIZABLE_INPUT_TYPES = new Set([
   'search',
 ]);
 
+/**
+ * A toolbelt: several buttons of which exactly one is pressed at a time.
+ *
+ * A group marked with this attribute is one serialized control whose value is
+ * the id of its `aria-pressed="true"` button. Marking it is what puts it in the
+ * inventory — there is no list of group ids here, so a second toolbelt is
+ * carried the day its markup lands.
+ *
+ * The alternative considered and rejected was to inventory every
+ * `role="group"` holding pressed buttons. `index.html` already uses
+ * `role="group"` for the field-action toolbars, whose buttons are momentary
+ * actions with ids, so that rule would have swept in controls that have no
+ * value to save. An explicit marker is also what makes a group visible to
+ * `tests/session-preset-control-inventory-contract.test.mjs`, which reads the
+ * static markup: a group recognized only by a runtime-set attribute would be
+ * invisible there and would read as a preset carrying a key the markup lacks.
+ */
+const PRESSED_GROUP_SELECTOR = '[data-state-serializer-pressed-group]';
+
 // These controls are serialized by their feature owners, never by the generic
 // DOM-control contributor.
 const DOMAIN_OWNED_IDS = new Set([
@@ -102,6 +121,84 @@ function registerInventoryEntry(inventory, key, entry) {
   inventory.set(key, entry);
 }
 
+/**
+ * The identified buttons of one pressed group, in document order.
+ *
+ * @param {object} group
+ * @param {string} id
+ * @returns {object[]}
+ */
+function pressedGroupButtons(group, id) {
+  if (typeof group.querySelectorAll !== 'function') {
+    throw new TypeError(
+      `Session UI pressed group "${id}" must support DOM queries.`,
+    );
+  }
+  const buttons = [...group.querySelectorAll('button[id]')];
+  if (buttons.length === 0) {
+    throw new TypeError(
+      `Session UI pressed group "${id}" has no identified buttons.`,
+    );
+  }
+  const seen = new Set();
+  for (const button of buttons) {
+    const buttonId = assertStableId(
+      button.id,
+      `Every button of session UI pressed group "${id}"`,
+    );
+    if (seen.has(buttonId)) {
+      throw new TypeError(
+        `Session UI pressed group "${id}" button id "${buttonId}" is not unique.`,
+      );
+    }
+    seen.add(buttonId);
+    if (typeof button.getAttribute !== 'function') {
+      throw new TypeError(
+        `Session UI pressed group "${id}" button "${buttonId}" must expose its `
+          + 'attributes.',
+      );
+    }
+  }
+  return buttons;
+}
+
+/**
+ * The id of the one pressed button of a group.
+ *
+ * A group with no pressed button, or with several, is refused rather than
+ * resolved to a guess: the value it would restore is the mode every later
+ * gesture is interpreted in.
+ *
+ * @param {object[]} buttons
+ * @param {string} id
+ * @returns {string}
+ */
+function pressedButtonId(buttons, id) {
+  let pressedId = null;
+  for (const button of buttons) {
+    const pressed = button.getAttribute('aria-pressed');
+    if (pressed !== null && pressed !== 'true' && pressed !== 'false') {
+      throw new TypeError(
+        `Session UI pressed group "${id}" button "${button.id}" aria-pressed `
+          + 'must be "true", "false", or absent.',
+      );
+    }
+    if (pressed !== 'true') continue;
+    if (pressedId !== null) {
+      throw new TypeError(
+        `Session UI pressed group "${id}" has more than one pressed button.`,
+      );
+    }
+    pressedId = button.id;
+  }
+  if (pressedId === null) {
+    throw new TypeError(
+      `Session UI pressed group "${id}" requires exactly one pressed button.`,
+    );
+  }
+  return pressedId;
+}
+
 function buildCurrentInventory(sidebar) {
   const inventory = new Map();
 
@@ -135,6 +232,19 @@ function buildCurrentInventory(sidebar) {
     registerInventoryEntry(inventory, `accordion:${elementId}`, {
       element: details,
       type: 'details',
+    });
+  }
+
+  for (const group of queryAll(sidebar, PRESSED_GROUP_SELECTOR)) {
+    if (isStateSerializerSkipped(group)) continue;
+    const elementId = assertStableId(
+      group.id,
+      'Every serialized pressed group',
+    );
+    if (DOMAIN_OWNED_IDS.has(elementId)) continue;
+    registerInventoryEntry(inventory, elementId, {
+      element: group,
+      type: 'pressed-group',
     });
   }
 
@@ -182,6 +292,29 @@ function validateControlRecord(id, record, inventoryEntry) {
     assertExactKeys(record, ['type', 'open'], `Session UI control "${id}"`);
     if (typeof record.open !== 'boolean') {
       throw new TypeError(`Session UI control "${id}" open must be boolean.`);
+    }
+    return;
+  }
+
+  if (type === 'pressed-group') {
+    assertExactKeys(
+      record,
+      ['type', 'pressedId'],
+      `Session UI control "${id}"`,
+    );
+    assertStableId(
+      record.pressedId,
+      `Session UI control "${id}" pressedId`,
+    );
+    const buttons = pressedGroupButtons(element, id);
+    // Reading the current pressed button here is what makes a malformed group
+    // fail during validation rather than half-way through the restore.
+    pressedButtonId(buttons, id);
+    if (!buttons.some(button => button.id === record.pressedId)) {
+      throw new RangeError(
+        `Session UI pressed group "${id}" button "${record.pressedId}" is not `
+          + 'available in the current interface.',
+      );
     }
     return;
   }
@@ -299,6 +432,28 @@ function restoreValidatedControl(id, entry, data) {
     element.open = data.open;
     return;
   }
+  if (type === 'pressed-group') {
+    const buttons = pressedGroupButtons(element, id);
+    if (pressedButtonId(buttons, id) === data.pressedId) return;
+    const target = buttons.find(button => button.id === data.pressedId);
+    if (target === undefined) {
+      throw new RangeError(
+        `Session UI pressed group "${id}" button "${data.pressedId}" is not `
+          + 'available in the current interface.',
+      );
+    }
+    // Same publication rule as every other control: the owner's own `click`
+    // listener is what tells the viewer which tool is live. Writing
+    // `aria-pressed` here instead would repaint the toolbelt and leave the next
+    // gesture in the previous mode.
+    dispatchControlEvent(id, target, 'click');
+    if (pressedButtonId(pressedGroupButtons(element, id), id) !== data.pressedId) {
+      throw new Error(
+        `Session UI control "${id}" rejected restored button "${data.pressedId}".`,
+      );
+    }
+    return;
+  }
   if (element.value === data.value) return;
   element.value = data.value;
   dispatchControlEvent(
@@ -360,6 +515,11 @@ export function createUiControlSerializer({ sidebar }) {
         controls[id] = { type, checked: element.checked };
       } else if (type === 'details') {
         controls[id] = { type, open: element.open };
+      } else if (type === 'pressed-group') {
+        controls[id] = {
+          type,
+          pressedId: pressedButtonId(pressedGroupButtons(element, id), id),
+        };
       } else {
         controls[id] = { type, value: element.value };
       }
@@ -399,7 +559,19 @@ export function createUiControlSerializer({ sidebar }) {
       });
     }
 
-    const restoreOrder = ['details', 'checkbox', 'select', 'range', 'number', 'color', 'text'];
+    // Pressed groups run last: switching the highlight toolbelt reads the
+    // viewer's unified selection state and republishes the tool flags, so it
+    // belongs after every value control has settled.
+    const restoreOrder = [
+      'details',
+      'checkbox',
+      'select',
+      'range',
+      'number',
+      'color',
+      'text',
+      'pressed-group',
+    ];
     function restoreMatchingControls(restoreDeferred) {
       for (const type of restoreOrder) {
         for (const [id, staged] of stagedControls) {

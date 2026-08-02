@@ -1,5 +1,11 @@
 import { defineConfig, devices } from '@playwright/test';
 
+import { resolveBrowserTestPorts } from './scripts/browser-test-ports.mjs';
+
+// The server this config launches reads the same environment, so both halves of
+// a run agree on the address without the port appearing twice.
+const { origin, port } = resolveBrowserTestPorts();
+
 const firefoxWebGLPreferences = Object.freeze({
   'webgl.disabled': false,
   'webgl.enable-webgl2': true,
@@ -15,11 +21,15 @@ export default defineConfig({
   workers: 1,
   reporter: [['line']],
   timeout: 90_000,
+  // Failure artifacts are keyed by port so concurrent runs cannot delete each
+  // other's evidence: Playwright empties outputDir when a run starts. The path
+  // stays under the git-ignored test-results tree.
+  outputDir: `./test-results/${port}`,
   expect: {
     timeout: 60_000,
   },
   use: {
-    baseURL: 'http://127.0.0.1:4173',
+    baseURL: origin,
     headless: true,
     screenshot: 'only-on-failure',
     trace: 'off',
@@ -47,7 +57,10 @@ export default defineConfig({
   ],
   webServer: {
     command: 'node scripts/serve-browser-tests.mjs',
-    url: 'http://127.0.0.1:4173/',
+    url: `${origin}/`,
+    // A second run must not adopt the first run's server: that server is torn
+    // down when its own run ends, which would strand the adopter mid-suite.
+    // Refusing here reports the collision instead of blocking on the address.
     reuseExistingServer: false,
     timeout: 30_000,
   },

@@ -9,6 +9,7 @@
 import { PlotFactory, PlotRegistry, PlotHelpers, BasePlot, COMMON_HOVER_STYLE } from '../plot-factory.js';
 import { getHeatmapTraceType } from '../plotly-loader.js';
 import { getPlotTheme } from '../../shared/plot-theme.js';
+import { escapeHtml } from '../../../utils/dom-utils.js';
 
 const heatmapDefinition = {
   id: 'heatmap',
@@ -88,9 +89,16 @@ const heatmapDefinition = {
     // annotations are enabled (heatmapgl does not reliably support them).
     const traceType = showValues ? 'heatmap' : getHeatmapTraceType();
 
+    // Axis coordinates double as tick labels and as the `%{x}` / `%{y}` hover
+    // substitutions, both of which Plotly parses for its HTML subset. Page names
+    // and category values are untrusted, so display escaped copies while the raw
+    // lists stay behind for count lookups and CSV export.
     return [{
       type: traceType,
-      z: matrix, x: pageNames, y: categories, text: textMatrix,
+      z: matrix,
+      x: pageNames.map(name => escapeHtml(name)),
+      y: categories.map(cat => escapeHtml(cat)),
+      text: textMatrix,
       texttemplate: showValues ? '%{text}' : '',
       textfont: { family: theme.fontFamily, size: 10 },
       colorscale,

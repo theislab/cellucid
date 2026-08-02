@@ -143,6 +143,9 @@ const scatterPlotDefinition = {
       if (!pageResult.xValues || !pageResult.yValues) continue;
 
       const color = BasePlot.getPageColor(layoutEngine, pageResult.pageId, i);
+      // Trace names reach the legend and hover box, both of which Plotly parses
+      // for its HTML subset. Page names are user/session supplied.
+      const safePageName = escapeHtml(pageResult.pageName ?? '');
       const xVals = pageResult.xValues;
       const yVals = pageResult.yValues;
 
@@ -183,7 +186,7 @@ const scatterPlotDefinition = {
         // Use density plot for large datasets (only when not coloring by category)
             traces.push({
           type: 'histogram2dcontour',
-          name: pageResult.pageName,
+          name: safePageName,
           x: xData,
           y: yData,
           colorscale: [[0, 'rgba(255,255,255,0)'], [1, color]],
@@ -208,7 +211,7 @@ const scatterPlotDefinition = {
         traces.push({
           type: PLOTLY_2D_SCATTER_TRACE_TYPE,
           mode: 'markers',
-          name: pageResult.pageName,
+          name: safePageName,
           x: sampledX,
           y: sampledY,
           showlegend: false,
@@ -240,7 +243,9 @@ const scatterPlotDefinition = {
           traces.push({
             type: PLOTLY_2D_SCATTER_TRACE_TYPE,
             mode: 'markers',
-            name: cat,
+            // Rendered in the legend; `legendgroup` is an internal grouping key
+            // that Plotly never draws, so it keeps the raw value.
+            name: escapeHtml(cat),
             legendgroup: cat,
             x: catX,
             y: catY,
@@ -261,7 +266,7 @@ const scatterPlotDefinition = {
         traces.push({
           type: PLOTLY_2D_SCATTER_TRACE_TYPE,
           mode: 'markers',
-          name: pageResult.pageName,
+          name: safePageName,
           x: xData,
           y: yData,
           marker: {
@@ -270,7 +275,7 @@ const scatterPlotDefinition = {
             opacity: pointOpacity,
             line: { width: 0 }
           },
-          hovertemplate: `${escapeHtml(pageResult.pageName)}<br>` +
+          hovertemplate: `${safePageName}<br>` +
             `${escapeHtml(pageResult.xVariable || 'X')}: %{x:.2f}<br>` +
             `${escapeHtml(pageResult.yVariable || 'Y')}: %{y:.2f}<extra></extra>`,
           hoverlabel: COMMON_HOVER_STYLE
@@ -286,7 +291,7 @@ const scatterPlotDefinition = {
         traces.push({
           type: PLOTLY_2D_SCATTER_TRACE_TYPE,
           mode: 'lines',
-          name: `Trend (${pageResult.pageName})`,
+          name: `Trend (${safePageName})`,
           x: xRange,
           y: yRange,
           showlegend: false,
@@ -333,7 +338,7 @@ const scatterPlotDefinition = {
         const significance = pValue < 0.001 ? '***' : pValue < 0.01 ? '**' : pValue < 0.05 ? '*' : '';
 
         annotations.push({
-          text: `<b>${escapeHtml(pageResult.pageName ?? '')}</b><br>` +
+          text: `<b>${safePageName}</b><br>` +
                 `R² = ${rSquared.toFixed(3)}${significance}<br>` +
                 `r = ${pageResult.r.toFixed(3)}<br>` +
                 `n = ${xData.length}`,
@@ -362,9 +367,10 @@ const scatterPlotDefinition = {
       showLegend: pageResults.length > 1
     });
 
-    // Get variable names from first result
-    const xVariable = pageResults[0]?.xVariable || 'Variable X';
-    const yVariable = pageResults[0]?.yVariable || 'Variable Y';
+    // Get variable names from first result. These are obs/var field names from
+    // the dataset and axis titles are parsed for Plotly's HTML subset.
+    const xVariable = escapeHtml(pageResults[0]?.xVariable || 'Variable X');
+    const yVariable = escapeHtml(pageResults[0]?.yVariable || 'Variable Y');
 
     layout.xaxis = {
       title: {

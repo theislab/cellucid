@@ -72,6 +72,7 @@ export function createTransportBar({ playbackController, keyframeStore, getInter
   let hideTimeout = null;
   let isPointerOverBar = false;
   let isScrubbing = false;
+  let isVisible = false;
   let wasPlayingBeforeScrub = false;
   let sidebarObserver = null;
 
@@ -233,11 +234,22 @@ export function createTransportBar({ playbackController, keyframeStore, getInter
     }
   }
 
+  /**
+   * Reveal the bar and restart its idle countdown.
+   *
+   * A mounted bar always describes a ready path — `updateVisibility()` is the
+   * only mount point, it refuses to mount an incomplete path, and it unmounts
+   * the moment one stops being ready — so the mount is the readiness test.
+   * Re-proving it here would walk every keyframe on every pointer move, which
+   * is precisely when this runs.
+   */
   function show() {
-    if (!pathIsReady()) return;
-    if (!barEl) create();
-    setInteractive(true);
-    barEl.classList.add('visible');
+    if (!barEl) return;
+    if (!isVisible) {
+      setInteractive(true);
+      barEl.classList.add('visible');
+      isVisible = true;
+    }
     scheduleHide();
   }
 
@@ -248,11 +260,12 @@ export function createTransportBar({ playbackController, keyframeStore, getInter
     if (!force && playbackController.getState() === 'PLAYING') return;
     barEl.classList.remove('visible');
     setInteractive(false);
+    isVisible = false;
   }
 
   function scheduleHide() {
     clearTimeout(hideTimeout);
-    if (!barEl || !pathIsReady()) return;
+    if (!barEl) return;
     if (barEl.contains(document.activeElement)) return;
     // A pointer resting on the bar is the strongest "still in use" signal
     // there is. Clearing the timer on mouseenter alone is not enough: the
@@ -262,18 +275,13 @@ export function createTransportBar({ playbackController, keyframeStore, getInter
   }
 
   function onMouseActivity() {
-    if (!barEl) return;
     // Sidebar activity counts: the Camera Path accordion that drives this bar
     // lives there, so saving keyframes must not let the bar time out.
-    if (pathIsReady()) {
-      show();
-    }
+    show();
   }
 
   function onKeyboardActivity(event) {
-    if (event.key === 'Tab' && pathIsReady()) {
-      show();
-    }
+    if (event.key === 'Tab') show();
   }
 
   /** Update availability based on validated path readiness. */
@@ -326,21 +334,32 @@ export function createTransportBar({ playbackController, keyframeStore, getInter
 
   // ---- Progress updates ----
 
+  /*
+   * These run once per animation frame for the whole length of a path, so they
+   * write only when the rendered value actually changed. The scrubber resolves
+   * to 1/1000 and the readout to a whole second, so an unconditional write
+   * re-renders a range control sixty times a second to show the same thumb
+   * position and rewrites the readout sixty times a second to show the same
+   * second.
+   */
   function updateProgress(globalT) {
     if (!Number.isFinite(globalT) || globalT < 0 || globalT > 1) {
       throw new RangeError('Camera transport progress must be a finite number from 0 through 1.');
     }
     if (progressEl) {
-      progressEl.style.width = `${(globalT * 100).toFixed(2)}%`;
+      const width = `${(globalT * 100).toFixed(2)}%`;
+      if (progressEl.style.width !== width) progressEl.style.width = width;
     }
     if (scrubberEl && !isScrubbing) {
-      scrubberEl.value = String(Math.round(globalT * 1000));
+      const position = String(Math.round(globalT * 1000));
+      if (scrubberEl.value !== position) scrubberEl.value = position;
     }
   }
 
   function updateTimeReadout(elapsed, totalDuration) {
     if (!readoutEl) return;
-    readoutEl.textContent = `${formatTime(elapsed)} / ${formatTime(totalDuration)}`;
+    const readout = `${formatTime(elapsed)} / ${formatTime(totalDuration)}`;
+    if (readoutEl.textContent !== readout) readoutEl.textContent = readout;
   }
 
   function formatTime(seconds) {
@@ -398,6 +417,7 @@ export function createTransportBar({ playbackController, keyframeStore, getInter
     }
     innerEl = null;
     isPointerOverBar = false;
+    isVisible = false;
     playBtn = null;
     progressEl = null;
     scrubberEl = null;

@@ -37,6 +37,35 @@ const TERMINAL_NOTIFICATION_TYPES = new Set([
   NotificationType.ERROR
 ]);
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
+/**
+ * How long each type stays on screen when its publisher names no duration.
+ *
+ * The type decides, not the method that published it. `error()` and `fail()`
+ * produce the identical ERROR notification, and used to give it 6000 ms and
+ * 4000 ms purely because one wrote a literal and the other did not — so the
+ * longest, most actionable messages the app produces, the ones routed through
+ * `fail()`, got the shortest time to be read (CEL-0220).
+ *
+ * ERROR is 0: it stays until dismissed. An error names something the user has
+ * to do about it, and a dismissed notification cannot be re-opened, so a timer
+ * can only take the message away before it has been read. That is bounded, not
+ * unbounded: an ERROR is not an active type, so `_evictNonActiveUntil` retires
+ * the oldest one under capacity pressure exactly as it retires a success, and a
+ * repeating failure can never publish more than `maxNotifications` at once.
+ *
+ * LOADING and PROGRESS are 0 because their work owns their lifecycle; `show()`
+ * refuses to schedule a dismissal for them at all.
+ */
+const DEFAULT_DURATIONS_MS = Object.freeze({
+  [NotificationType.INFO]: 4000,
+  [NotificationType.SUCCESS]: 4000,
+  [NotificationType.WARNING]: 5000,
+  [NotificationType.ERROR]: 0,
+  [NotificationType.LOADING]: 0,
+  [NotificationType.PROGRESS]: 0
+});
+
 const NOTIFICATION_OPTION_KEYS = new Set([
   'category',
   'dismissible',
@@ -196,7 +225,6 @@ class NotificationCenter {
     this.notifications = new Map();
     this.notificationId = 0;
     this.maxNotifications = 5;
-    this.defaultDuration = 4000;
     this.initialized = false;
     this._releaseModalAuxiliary = null;
 
@@ -437,16 +465,34 @@ class NotificationCenter {
       }
     });
 
-    // Auto-dismiss for non-persistent types
-    const duration = options.duration ?? this.defaultDuration;
-    if (
-      duration > 0 &&
-      !ACTIVE_NOTIFICATION_TYPES.has(storedOptions.type)
-    ) {
-      this._scheduleDismiss(id, notification, duration);
+    // Active work owns its own lifecycle; everything else gets the duration its
+    // type declares unless the publisher named one. `_scheduleDismiss` treats 0
+    // as "stays until dismissed", so the decision lives in exactly one place.
+    if (!ACTIVE_NOTIFICATION_TYPES.has(storedOptions.type)) {
+      this._scheduleDismiss(
+        id,
+        notification,
+        options.duration ?? this._defaultDuration(storedOptions.type)
+      );
     }
 
     return id;
+  }
+
+  /**
+   * The published lifetime of one notification type.
+   *
+   * @param {string} type
+   * @returns {number} milliseconds, or 0 for "stays until dismissed"
+   */
+  _defaultDuration(type) {
+    const duration = DEFAULT_DURATIONS_MS[type];
+    if (duration === undefined) {
+      throw new TypeError(
+        `Notification type "${type}" declares no default duration.`
+      );
+    }
+    return duration;
   }
 
   /**
@@ -624,9 +670,14 @@ class NotificationCenter {
           element.appendChild(dismissBtn);
         }
 
-        // Auto-dismiss
-        const duration = options.duration ?? this.defaultDuration;
-        this._scheduleDismiss(id, notif, duration);
+        // Auto-dismiss on the same rule `show()` applies, so a failure reported
+        // by completing a loading notification lives exactly as long as one
+        // reported directly.
+        this._scheduleDismiss(
+          id,
+          notif,
+          options.duration ?? this._defaultDuration(nextType)
+        );
       }
     } else if (
       TERMINAL_NOTIFICATION_TYPES.has(nextType) &&
@@ -778,8 +829,7 @@ class NotificationCenter {
     return this.show({
       ...options,
       type: NotificationType.ERROR,
-      message,
-      duration: options.duration ?? 6000
+      message
     });
   }
 
@@ -792,8 +842,7 @@ class NotificationCenter {
     return this.show({
       ...options,
       type: NotificationType.WARNING,
-      message,
-      duration: options.duration ?? 5000
+      message
     });
   }
 

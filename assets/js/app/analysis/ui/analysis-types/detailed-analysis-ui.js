@@ -106,6 +106,7 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
 
     // UI element references (detailed-specific)
     this._variableSelector = null;
+    this._variableBlock = null;
     this._pageSelector = null;
     this._pageSelectContainer = null;
     this._plotTypeContainer = null;
@@ -209,21 +210,30 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
   }
 
   /**
-   * Render variable selectors (two-step selection)
+   * Attach the two-step variable selector, building it exactly once.
+   *
+   * The selector owns a state this panel's config cannot express: a type
+   * chosen while its variable is still unchosen. Changing the type reports
+   * `('', '')`, which this panel read as "selection cleared" — it wiped
+   * `dataSource.type` and rebuilt the selector from that empty config, so the
+   * type the user had just chosen was replaced by "None". The selector is
+   * built once and re-attached across rebuilds instead, so the control that
+   * raises a change is never destroyed by it.
    */
   _renderVariableSelectors() {
+    if (this._variableBlock !== null) {
+      this._syncVariableSelectorToConfig();
+      this._controlsContainer.appendChild(this._variableBlock);
+      return;
+    }
+
     const variableBlock = document.createElement('div');
     variableBlock.className = 'control-block';
+    const selectorContainer = document.createElement('div');
+    variableBlock.appendChild(selectorContainer);
+    this._controlsContainer.appendChild(variableBlock);
 
     try {
-      // Create the variable selector container
-      const selectorContainer = document.createElement('div');
-      variableBlock.appendChild(selectorContainer);
-
-      // Destroy previous selector if exists
-      this._variableSelector?.destroy?.();
-
-      // Create two-step variable selector
       this._variableSelector = createVariableSelectorComponent({
         dataLayer: this.dataLayer,
         container: selectorContainer,
@@ -238,14 +248,31 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
       });
     } catch (err) {
       console.error('[DetailedAnalysisUI] Failed to load variables:', err);
-      variableBlock.innerHTML += `
-        <div class="legend-help text-danger">
-          Some variables could not be loaded.
-        </div>
-      `;
+      const notice = document.createElement('div');
+      notice.className = 'legend-help text-danger';
+      notice.textContent = 'Some variables could not be loaded.';
+      variableBlock.appendChild(notice);
+      // Leave the block unowned so the next render can try again.
+      return;
     }
 
-    this._controlsContainer.appendChild(variableBlock);
+    this._variableBlock = variableBlock;
+  }
+
+  /**
+   * Push a config this panel owns — a restored session, a copied window — into
+   * the live selector.
+   *
+   * A config that already agrees with what the selector reports is left alone:
+   * re-rendering it would discard a type the user has chosen but not yet paired
+   * with a variable, which is exactly the state `dataSource` cannot carry.
+   */
+  _syncVariableSelectorToConfig() {
+    if (this._variableSelector === null) return;
+    const shown = this._variableSelector.getSelectedVariable();
+    const { type, variable } = this._currentConfig.dataSource;
+    if (shown.type === type && shown.variable === variable) return;
+    this._variableSelector.setSelectedVariable(type, variable);
   }
 
   /**
@@ -333,7 +360,13 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
   // ===========================================================================
 
   /**
-   * Handle variable selection change from two-step selector
+   * Handle variable selection change from two-step selector.
+   *
+   * `dataSource` mirrors a *complete* selection only. An incomplete one — the
+   * type chosen, its variable not yet picked — belongs to the selector, and
+   * `_renderVariableSelectors()` keeps that selector alive across the rebuilds
+   * below so the mirror never overwrites it.
+   *
    * @param {string} type - Variable type (categorical_obs, continuous_obs, gene_expression)
    * @param {string} variable - Variable key
    */
@@ -346,18 +379,16 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
       const dataKind = type === 'categorical_obs' ? 'categorical' : 'continuous';
       this._updatePlotTypeForDataKind(dataKind);
 
-      // Only re-render controls when we have a full selection
-      // This ensures plot type selector appears
+      // Re-render so the plot type selector appears for the new data kind.
       this._renderControls();
       this._scheduleUpdate();
     } else if (this._currentConfig.dataSource.variable) {
-      // Only clear if we previously had a selection
+      // The selection became incomplete: drop the plot type selector it fed.
       this._clearDataSource();
       this._renderControls();
       this._scheduleUpdate();
     }
-    // When type is selected but variable is not yet chosen,
-    // don't re-render - let the selector handle its own state
+    // Type chosen without a variable: nothing downstream depends on it yet.
   }
 
   _handlePageChange = (pageIds) => {
@@ -1054,6 +1085,7 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
       }
     }
     this._variableSelector = null;
+    this._variableBlock = null;
     this._pageSelector = null;
     this._pageSelectContainer = null;
 

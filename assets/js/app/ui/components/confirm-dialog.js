@@ -6,6 +6,7 @@
 
 import { escapeHtml } from '../utils.js';
 import { claimModalDocumentLayer } from './modal-background-owner.js';
+import { createDomId } from './dom-id.js';
 
 let activeKeydownHandler = null;
 let activeDialogCancel = null;
@@ -40,17 +41,6 @@ function releaseExactModalDocumentLayer(release) {
   }
 }
 
-function createDomId(prefix = 'id') {
-  const p = String(prefix || 'id').trim() || 'id';
-  try {
-    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
-      return `${p}-${crypto.randomUUID()}`;
-    }
-  } catch {
-    // ignore
-  }
-  return `${p}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
-}
 
 export function showConfirmDialog({
   title,

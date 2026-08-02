@@ -15,6 +15,7 @@ import {
 } from './data-source.js';
 import {
   createMetadataAbortError,
+  loadMetadataBatchAtomically,
 } from './metadata-load-contract.js';
 
 /**
@@ -454,55 +455,72 @@ export class LocalDemoDataSource {
     this._assertCatalogGeneration(owner);
     validateDemoManifestContract(manifest, this.type);
 
-    // Multi-dataset mode: load metadata for each dataset in manifest
-    const datasets = [];
-    for (const entry of manifest.datasets) {
-      try {
-        const datasetBaseUrl = resolveUrl(this.baseUrl, entry.path);
-        const metadata = await loadDatasetMetadata(
-          datasetBaseUrl,
-          entry.id,
-          this.type,
-          { signal: owner.controller.signal }
-        );
-        this._assertCatalogGeneration(owner);
+    // Multi-dataset mode: adopt every advertised identity as one atomic
+    // generation. The entries are independent reads, so they are issued as one
+    // batch rather than one round trip after another — the sample picker costs
+    // one network latency instead of one per dataset. loadMetadataBatchAtomically
+    // owns the exactness: the first failure cancels every sibling, no partial
+    // catalog is ever adopted, and results keep manifest order. Same contract
+    // remote-source.js and jupyter-source.js already use for their catalogs.
+    let datasets;
+    try {
+      datasets = await loadMetadataBatchAtomically(
+        manifest.datasets,
+        owner.controller.signal,
+        async (entry, entrySignal) => {
+          try {
+            const datasetBaseUrl = resolveUrl(this.baseUrl, entry.path);
+            const metadata = await loadDatasetMetadata(
+              datasetBaseUrl,
+              entry.id,
+              this.type,
+              { signal: entrySignal }
+            );
 
-        // Override name from manifest if provided (allows short names in manifest)
-        if (entry.name) {
-          metadata.name = entry.name;
-        }
+            // Override name from manifest if provided (allows short names in manifest)
+            if (entry.name) {
+              metadata.name = entry.name;
+            }
 
-        // Catalog counts are duplicate assertions, never metadata defaults.
-        for (const countKey of ['n_cells', 'n_genes']) {
-          if (
-            Object.hasOwn(entry, countKey) &&
-            entry[countKey] !== metadata.stats[countKey]
-          ) {
+            // Catalog counts are duplicate assertions, never metadata defaults.
+            for (const countKey of ['n_cells', 'n_genes']) {
+              if (
+                Object.hasOwn(entry, countKey) &&
+                entry[countKey] !== metadata.stats[countKey]
+              ) {
+                throw new DataSourceError(
+                  `Dataset '${entry.id}' catalog ${countKey}=${entry[countKey]} does not match dataset_identity.json ${countKey}=${metadata.stats[countKey]}`,
+                  DataSourceErrorCode.INVALID_FORMAT,
+                  this.type,
+                  {
+                    datasetId: entry.id,
+                    key: countKey,
+                    catalogValue: entry[countKey],
+                    identityValue: metadata.stats[countKey],
+                  }
+                );
+              }
+            }
+
+            return metadata;
+          } catch (err) {
+            if (err?.name === 'AbortError') {
+              throw err;
+            }
             throw new DataSourceError(
-              `Dataset '${entry.id}' catalog ${countKey}=${entry[countKey]} does not match dataset_identity.json ${countKey}=${metadata.stats[countKey]}`,
+              `Dataset '${entry.id}' is invalid: ${err?.message || err}`,
               DataSourceErrorCode.INVALID_FORMAT,
               this.type,
-              {
-                datasetId: entry.id,
-                key: countKey,
-                catalogValue: entry[countKey],
-                identityValue: metadata.stats[countKey],
-              }
+              { datasetId: entry.id, cause: err }
             );
           }
-        }
-
-        datasets.push(metadata);
-      } catch (err) {
-        this._assertCatalogGeneration(owner);
-        this._datasetError = new DataSourceError(
-          `Dataset '${entry.id}' is invalid: ${err?.message || err}`,
-          DataSourceErrorCode.INVALID_FORMAT,
-          this.type,
-          { datasetId: entry.id, cause: err }
-        );
-        throw this._datasetError;
-      }
+        },
+        'Sample catalog metadata loading'
+      );
+    } catch (err) {
+      this._assertCatalogGeneration(owner);
+      this._datasetError = err;
+      throw this._datasetError;
     }
 
     this._assertCatalogGeneration(owner);

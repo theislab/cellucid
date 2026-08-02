@@ -13,6 +13,7 @@
  */
 
 import { isFiniteNumber, filterFiniteNumbers } from '../shared/number-utils.js';
+import { createOpaqueId } from '../../utils/opaque-id.js';
 
 /**
  * Operator definitions with metadata
@@ -157,7 +158,7 @@ export function getOperatorsForType(fieldType) {
  */
 export class QueryCondition {
   constructor(options = {}) {
-    this.id = options.id || crypto.randomUUID();
+    this.id = options.id || createOpaqueId();
     this.field = options.field || null;
     this.fieldType = options.fieldType || 'categorical';
     this.fieldSource = options.fieldSource || 'obs'; // 'obs', 'var', 'gene'

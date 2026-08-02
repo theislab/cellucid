@@ -16,8 +16,8 @@
 
 import {
   assertCameraPathOptions,
-  interpolateCameraState,
-  resolveSegmentDurations
+  createCameraPathPlan,
+  interpolatePlannedCameraState
 } from './interpolation-engine.js';
 import { isCameraPathReady } from './keyframe-store.js';
 import { readCameraBooleanOption } from '../camera-input-contract.js';
@@ -82,10 +82,13 @@ export function createPlaybackController({ viewer, keyframeStore, getInterpolati
 
   let state = STOPPED;
   let startTime = 0;       // seconds (performance.now / 1000)
-  let pauseElapsed = 0;    // seconds elapsed at pause
+  let pauseElapsed = 0;    // seconds elapsed at pause or at the last seek
   let totalDuration = 0;   // seconds for full path
   let rafId = null;
   let destroyed = false;
+  /** Validated keyframes + resolved timing for the path currently in flight. */
+  let plan = null;
+  let loopEnabled = false;
 
   // Lightweight event emitter
   const listeners = { stateChange: new Set(), timeUpdate: new Set() };
@@ -130,13 +133,58 @@ export function createPlaybackController({ viewer, keyframeStore, getInterpolati
     }
   }
 
-  // ---- Duration computation ----
+  // ---- Path plan ----
 
-  function computeTotalDuration() {
-    const keyframes = keyframeStore.getAll();
-    const opts = getExactInterpolationOptions();
-    const durations = resolveSegmentDurations(keyframes, opts.autoPaceSpeed);
-    return durations.reduce((s, d) => s + d, 0);
+  /**
+   * The validated path and timing this controller is currently driving.
+   *
+   * Rebuilt only when an input that can change it changes: the keyframes (the
+   * store announces every mutation, which drops the plan below) or a setting
+   * the timing or geometry depends on. `loop` is deliberately excluded, because
+   * it steers the clock rather than the path, and rebuilding for it would make
+   * a mid-playback loop toggle re-derive the whole path for nothing.
+   */
+  function refreshPlan() {
+    const options = getExactInterpolationOptions();
+    loopEnabled = options.loop;
+    if (
+      plan === null ||
+      plan.autoPaceSpeed !== options.autoPaceSpeed ||
+      plan.positionMethod !== options.positionMethod ||
+      plan.rotationMethod !== options.rotationMethod ||
+      plan.easing !== options.easing
+    ) {
+      plan = createCameraPathPlan(keyframeStore.getAll(), options);
+    }
+    return plan;
+  }
+
+  /**
+   * Adopt the current plan's duration without moving the camera.
+   *
+   * The default-speed slider stays live during playback, so the path's total
+   * duration can change under a running clock. Holding the elapsed *fraction*
+   * keeps the transport readout, the scrubber, and the interpolated viewpoint
+   * describing one timeline: retiming changes how fast the rest of the path
+   * plays, never where it currently is.
+   *
+   * @param {number} now  Seconds, from the same clock as startTime.
+   */
+  function adoptPlan(now) {
+    const active = refreshPlan();
+    if (active.totalDuration === totalDuration) return active;
+    const previousTotal = totalDuration;
+    const elapsed = state === PLAYING ? now - startTime : pauseElapsed;
+    const fraction = previousTotal > 0
+      ? Math.max(0, Math.min(1, elapsed / previousTotal))
+      : 0;
+    totalDuration = active.totalDuration;
+    if (state === PLAYING) {
+      startTime = now - fraction * totalDuration;
+    } else {
+      pauseElapsed = fraction * totalDuration;
+    }
+    return active;
   }
 
   // ---- Reduced motion ----
@@ -151,9 +199,9 @@ export function createPlaybackController({ viewer, keyframeStore, getInterpolati
    * every intermediate viewpoint, so nothing becomes unreachable.
    */
   function completeWithoutMotion() {
-    const keyframes = keyframeStore.getAll();
-    const opts = getExactInterpolationOptions();
-    viewer.setCameraState(interpolateCameraState(keyframes, 1, opts));
+    const now = performance.now() / 1000;
+    const active = adoptPlan(now);
+    viewer.setCameraState(interpolatePlannedCameraState(active, 1));
     emit('timeUpdate', { globalT: 1, elapsed: totalDuration, totalDuration });
     stop({ resetCamera: false });
   }
@@ -163,8 +211,9 @@ export function createPlaybackController({ viewer, keyframeStore, getInterpolati
   function tick() {
     if (destroyed || state !== PLAYING) return;
 
-    const keyframes = keyframeStore.getAll();
-    if (!isCameraPathReady(keyframes)) {
+    const now = performance.now() / 1000;
+    const active = adoptPlan(now);
+    if (active.keyframes.length < 2) {
       stop({ resetCamera: false });
       return;
     }
@@ -175,30 +224,25 @@ export function createPlaybackController({ viewer, keyframeStore, getInterpolati
       return;
     }
 
-    const now = performance.now() / 1000;
-    const elapsed = now - startTime;
+    let elapsed = now - startTime;
     let globalT = elapsed / totalDuration;
 
-    const opts = getExactInterpolationOptions();
-
     if (globalT >= 1) {
-      if (opts.loop) {
+      if (loopEnabled) {
         // Seamless loop: reset start time
         startTime = now;
+        elapsed = 0;
         globalT = 0;
       } else {
         // Publish the exact endpoint and finish in place.
-        globalT = 1;
-        const camState = interpolateCameraState(keyframes, 1, opts);
-        viewer.setCameraState(camState);
+        viewer.setCameraState(interpolatePlannedCameraState(active, 1));
         emit('timeUpdate', { globalT: 1, elapsed: totalDuration, totalDuration });
         stop({ resetCamera: false });
         return;
       }
     }
 
-    const camState = interpolateCameraState(keyframes, globalT, opts);
-    viewer.setCameraState(camState);
+    viewer.setCameraState(interpolatePlannedCameraState(active, globalT));
 
     emit('timeUpdate', { globalT, elapsed, totalDuration });
 
@@ -209,15 +253,15 @@ export function createPlaybackController({ viewer, keyframeStore, getInterpolati
 
   function play() {
     requireActive('play');
-    const keyframes = keyframeStore.getAll();
-    if (!isCameraPathReady(keyframes)) {
+    if (!isCameraPathReady(keyframeStore.getAll())) {
       throw new Error('Camera path playback requires at least two valid keyframes.');
     }
     if (state === PLAYING) {
       throw new Error('Camera path playback is already playing.');
     }
 
-    totalDuration = computeTotalDuration();
+    const now = performance.now() / 1000;
+    adoptPlan(now);
     if (!Number.isFinite(totalDuration) || totalDuration <= 0) {
       throw new Error('Camera path playback requires a positive finite duration.');
     }
@@ -230,16 +274,14 @@ export function createPlaybackController({ viewer, keyframeStore, getInterpolati
       return;
     }
 
-    const now = performance.now() / 1000;
-
-    if (state === PAUSED) {
-      // Resume from pause point
-      startTime = now - pauseElapsed;
-    } else {
-      // Start from beginning
-      startTime = now;
-      pauseElapsed = 0;
-    }
+    // Resume from wherever the timeline currently sits. `pauseElapsed` carries
+    // both a pause and a seek, so scrubbing an idle path then pressing Play
+    // continues from the viewpoint the transport is showing instead of
+    // silently discarding it. Only an explicit Stop clears it, and a timeline
+    // already at the end restarts, so Play is never a control that does
+    // nothing.
+    if (pauseElapsed >= totalDuration) pauseElapsed = 0;
+    startTime = now - pauseElapsed;
 
     state = PLAYING;
     emit('stateChange', state);
@@ -273,13 +315,8 @@ export function createPlaybackController({ viewer, keyframeStore, getInterpolati
     pauseElapsed = 0;
 
     // The explicit reset command always honors the transport's reset-to-start label.
-    if (resetCamera) {
-      const keyframes = keyframeStore.getAll();
-      if (isCameraPathReady(keyframes)) {
-        const opts = getExactInterpolationOptions();
-        const camState = interpolateCameraState(keyframes, 0, opts);
-        viewer.setCameraState(camState);
-      }
+    if (resetCamera && isCameraPathReady(keyframeStore.getAll())) {
+      viewer.setCameraState(interpolatePlannedCameraState(refreshPlan(), 0));
     }
 
     emit('stateChange', state);
@@ -292,8 +329,7 @@ export function createPlaybackController({ viewer, keyframeStore, getInterpolati
    */
   function seekTo(globalT) {
     requireActive('seek');
-    const keyframes = keyframeStore.getAll();
-    if (!isCameraPathReady(keyframes)) {
+    if (!isCameraPathReady(keyframeStore.getAll())) {
       throw new Error('Camera path seeking requires at least two valid keyframes.');
     }
     if (!Number.isFinite(globalT) || globalT < 0 || globalT > 1) {
@@ -302,18 +338,17 @@ export function createPlaybackController({ viewer, keyframeStore, getInterpolati
       );
     }
 
-    totalDuration = computeTotalDuration();
+    const now = performance.now() / 1000;
+    const active = adoptPlan(now);
     if (!Number.isFinite(totalDuration) || totalDuration <= 0) {
       throw new Error('Camera path seeking requires a positive finite duration.');
     }
 
-    const opts = getExactInterpolationOptions();
-    const camState = interpolateCameraState(keyframes, globalT, opts);
-    viewer.setCameraState(camState);
+    viewer.setCameraState(interpolatePlannedCameraState(active, globalT));
 
     if (state === PLAYING) {
       // Adjust startTime so play continues from the seek point
-      startTime = performance.now() / 1000 - globalT * totalDuration;
+      startTime = now - globalT * totalDuration;
     } else {
       pauseElapsed = globalT * totalDuration;
     }
@@ -350,7 +385,10 @@ export function createPlaybackController({ viewer, keyframeStore, getInterpolati
   function onKeyframeChange() {
     if (destroyed) return;
     // Any edit invalidates timing/interpolation cached when playback started.
-    // Stop in place so mutations never continue along stale path geometry.
+    // Dropping the plan here is what lets every other path assume it describes
+    // the store; stopping in place keeps mutations from continuing along stale
+    // path geometry.
+    plan = null;
     if (state !== STOPPED) {
       stop({ resetCamera: false });
     }
@@ -371,6 +409,7 @@ export function createPlaybackController({ viewer, keyframeStore, getInterpolati
     }
     rafId = null;
     state = STOPPED;
+    plan = null;
     try {
       keyframeStore.off('changed', onKeyframeChange);
     } catch (error) {

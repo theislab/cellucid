@@ -217,6 +217,90 @@ test('dimension defaults stop applying after an explicit shared or per-view choi
   );
 });
 
+test('releasing navigation ownership hands the view back to the dimension rule', () => {
+  const perView = createNavigationModeOwnership();
+  perView.recordViewUserChoice('live', 'free');
+  perView.recordViewUserChoice('snap_1', 'planar');
+  perView.releaseViewUserChoice('live', 'orbit');
+  assert.equal(perView.hasExplicitUserChoice('live'), false);
+  assert.equal(
+    perView.hasExplicitUserChoice('snap_1'),
+    true,
+    'releasing one view must not release its neighbours'
+  );
+  assert.equal(
+    perView.promoteViewUserChoice('live', 'orbit'),
+    false,
+    'a released view has no choice left to promote'
+  );
+
+  // A locked-camera publication reaches every view, so releasing it clears the
+  // per-view overrides it just overwrote.
+  const shared = createNavigationModeOwnership();
+  shared.recordViewUserChoice('snap_1', 'free');
+  shared.recordSharedUserChoice('planar');
+  shared.releaseSharedUserChoice('orbit');
+  assert.equal(shared.hasExplicitUserChoice('live'), false);
+  assert.equal(shared.hasExplicitUserChoice('snap_1'), false);
+
+  assert.throws(
+    () => perView.releaseViewUserChoice('live', 'teleport'),
+    /navigation mode/i
+  );
+  assert.throws(
+    () => perView.releaseViewUserChoice('', 'orbit'),
+    /view id/i
+  );
+  assert.throws(
+    () => perView.releaseSharedUserChoice('teleport'),
+    /navigation mode/i
+  );
+});
+
+test('every applied navigation mode is weighed against the dimension default', () => {
+  // The viewer cannot see whether a caller is a person or a restore, so it
+  // decides ownership from the mode itself: only a mode that differs from the
+  // view's dimension default takes navigation away from the dimension rule.
+  // Without this, a dataset's advertised starting state — which pins the very
+  // mode the dimension already implies — silently ended the coupling for the
+  // whole session.
+  for (const owner of [
+    'settleViewNavigationOwnership',
+    'settleSharedNavigationOwnership'
+  ]) {
+    const start = viewerSource.indexOf(`  function ${owner}(viewId, mode)`);
+    assert.ok(start >= 0, `viewer must define ${owner}`);
+    const body = viewerSource.slice(start, viewerSource.indexOf('\n  }\n', start));
+    assert.match(body, /getPublishedDimensionLevel\(/);
+    assert.match(body, /mode === getDefaultNavigationMode\(dimensionLevel\)/);
+    assert.match(body, /navigationModeOwnership\.release/);
+    assert.match(body, /navigationModeOwnership\.record/);
+  }
+
+  // Every publication boundary goes through those helpers; none may record
+  // ownership on its own.
+  for (const [label, signature] of [
+    ['setNavigationMode', '    setNavigationMode(mode) {'],
+    ['setViewNavigationMode', '    setViewNavigationMode(viewId, mode) {'],
+    ['setViewCameraState', '    setViewCameraState(viewId, camState) {'],
+    ['createSnapshotView', '    createSnapshotView(config) {']
+  ]) {
+    const start = viewerSource.indexOf(signature);
+    assert.ok(start >= 0, `viewer must define ${label}`);
+    const body = viewerSource.slice(start, viewerSource.indexOf('\n    },', start));
+    assert.match(
+      body,
+      /settle(View|Shared)NavigationOwnership\(/,
+      `${label} must weigh its mode against the dimension default`
+    );
+    assert.doesNotMatch(
+      body,
+      /navigationModeOwnership\.record(Shared|View)UserChoice\(/,
+      `${label} must not claim ownership unconditionally`
+    );
+  }
+});
+
 test('viewer applies dimension-derived defaults only at data/dimension publication boundaries', () => {
   const setDataStart = viewerSource.indexOf('setData(payload)');
   const setDataEnd = viewerSource.indexOf('\n    updateColors(', setDataStart);

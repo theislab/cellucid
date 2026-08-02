@@ -12,6 +12,7 @@ import { ZarrDataSource, ZarrLoader } from '../assets/js/data/zarr.js';
 import { BaseAnnDataAdapter } from '../assets/js/data/base-anndata-adapter.js';
 import { getNotificationCenter } from '../assets/js/app/notification-center.js';
 import {
+  buildCscFromCsr,
   extractConnectivityEdges,
   getSparseColumn
 } from '../assets/js/data/sparse-utils.js';
@@ -2334,6 +2335,72 @@ test('rejects out-of-range sparse columns instead of returning plausible zeros',
       );
     });
   }
+});
+
+test('a sparse coordinate outside its shape is corruption, never a dropped value', () => {
+  // Skipping an out-of-range coordinate publishes 0.0 for that cell, and 0.0 in
+  // an expression vector reads as a genuine non-detection. The reader must
+  // refuse the matrix instead of quietly inventing a measurement.
+  assert.throws(
+    () => buildCscFromCsr({
+      data: new Float32Array([1, 2]),
+      indices: new Int32Array([0, 5]),
+      indptr: new Int32Array([0, 1, 2]),
+      shape: [2, 2]
+    }),
+    /column index 5 at entry 1 is outside its 2-column shape/i
+  );
+
+  assert.throws(
+    () => buildCscFromCsr({
+      data: new Float32Array([1, 2]),
+      indices: new Int32Array([0, -1]),
+      indptr: new Int32Array([0, 1, 2]),
+      shape: [2, 2]
+    }),
+    /column index -1 .* outside its 2-column shape/i
+  );
+
+  assert.throws(
+    () => getSparseColumn({
+      colIndptr: new Int32Array([0, 2]),
+      rowIndices: new Int32Array([0, 7]),
+      colData: new Float32Array([1, 2])
+    }, 0, 2),
+    /row index 7 at entry 1 is outside its 2-row shape/i
+  );
+});
+
+test('a sparse matrix must agree with its own declared shape', () => {
+  assert.throws(
+    () => buildCscFromCsr({
+      data: new Float32Array([1, 2]),
+      indices: new Int32Array([0]),
+      indptr: new Int32Array([0, 1, 2]),
+      shape: [2, 2]
+    }),
+    /declares 2 values but 1 indices/i
+  );
+
+  assert.throws(
+    () => buildCscFromCsr({
+      data: new Float32Array([1, 2]),
+      indices: new Int32Array([0, 1]),
+      indptr: new Int32Array([0, 1]),
+      shape: [2, 2]
+    }),
+    /2 rows requires 3 row pointers/i
+  );
+
+  assert.throws(
+    () => buildCscFromCsr({
+      data: new Float32Array([1, 2]),
+      indices: new Int32Array([0, 1]),
+      indptr: new Int32Array([0, 1, 1]),
+      shape: [2, 2]
+    }),
+    /row pointers end at 1, which is not its 2 stored values/i
+  );
 });
 
 test('rejects a shared sparse column before allocating its output', () => {

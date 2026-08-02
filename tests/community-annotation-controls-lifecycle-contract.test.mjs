@@ -2,24 +2,42 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
-const source = readFileSync(
-  new URL(
-    '../assets/js/app/ui/modules/community-annotation-controls.js',
-    import.meta.url
-  ),
-  'utf8'
+function moduleSource(relativePath) {
+  return readFileSync(
+    new URL(`../assets/js/app/ui/modules/${relativePath}`, import.meta.url),
+    'utf8'
+  );
+}
+
+const source = moduleSource('community-annotation-controls.js');
+const domSource = moduleSource('community-annotation/dom.js');
+const modalShellSource = moduleSource('community-annotation/modal-shell.js');
+const identityProfileModalSource = moduleSource(
+  'community-annotation/identity-profile-modal.js'
+);
+const connectionFlowSource = moduleSource(
+  'community-annotation/github-connection-flow.js'
+);
+const controlsPanelSource = moduleSource(
+  'community-annotation/controls-panel.js'
 );
 
-function functionSlice(name, nextName) {
-  const start = source.indexOf(name);
-  const end = source.indexOf(nextName, start + name.length);
+function slice(text, name, nextName) {
+  const start = text.indexOf(name);
   assert.ok(start >= 0, `${name} must exist`);
+  if (nextName === null) return text.slice(start);
+  const end = text.indexOf(nextName, start + name.length);
   assert.ok(end > start, `${nextName} must follow ${name}`);
-  return source.slice(start, end);
+  return text.slice(start, end);
+}
+
+function functionSlice(name, nextName) {
+  return slice(source, name, nextName);
 }
 
 test('persistent auto-pull belongs to controls context rather than setup modal', () => {
-  const openSetup = functionSlice(
+  const openSetup = slice(
+    connectionFlowSource,
     'async function openGitHubConnectionFlow',
     'async function connectRepoFlow'
   );
@@ -36,7 +54,7 @@ test('persistent auto-pull belongs to controls context rather than setup modal',
     /refreshAutoPullScheduler\(\)/
   );
   assert.match(
-    functionSlice('function destroy()', 'async function applyConsensusColumn'),
+    functionSlice('function destroy()', 'async function pullFromGitHub'),
     /stopAutoPullScheduler\(\)/
   );
 });
@@ -64,12 +82,13 @@ test('setInterval replacement failure preserves the prior timer and runtime', ()
 });
 
 test('auto-pull preference commits storage, runtime, and modal state transactionally', () => {
-  const transaction = functionSlice(
+  const transaction = slice(
+    connectionFlowSource,
     'const commitAutoPullPreference',
     'const toRepoFullName'
   );
   const durableCommit = transaction.indexOf(
-    'writeAutoPullPrefs(nextPrefs)'
+    'writeAutoPullPreferences(nextPrefs)'
   );
   const localCommit = transaction.indexOf(
     'autoPullEnabled = enabled'
@@ -78,7 +97,7 @@ test('auto-pull preference commits storage, runtime, and modal state transaction
     'ensureAutoPullTimer()'
   );
   const durableRollback = transaction.indexOf(
-    'writeAutoPullPrefs(previousPrefs)'
+    'writeAutoPullPreferences(previousPrefs)'
   );
   const localRollback = transaction.indexOf(
     'autoPullEnabled = previousEnabled'
@@ -93,9 +112,10 @@ test('auto-pull preference commits storage, runtime, and modal state transaction
   assert.ok(localRollback > durableRollback);
   assert.ok(timerRollback > localRollback);
 
-  const handlers = source.slice(
-    source.indexOf("autoPullCheckbox.addEventListener('change'"),
-    source.indexOf("pullBtn.addEventListener('click'")
+  const handlers = slice(
+    connectionFlowSource,
+    "autoPullCheckbox.addEventListener('change'",
+    "pullBtn.addEventListener('click'"
   );
   assert.match(
     handlers,
@@ -141,7 +161,8 @@ test('an incompatible Worker preserves repository ownership in role, pull, and p
 });
 
 test('wizard Back preserves a connected repo while the dedicated action disconnects it', () => {
-  const backHandler = functionSlice(
+  const backHandler = slice(
+    connectionFlowSource,
     "prevBtn.addEventListener('click'",
     "nextBtn.addEventListener('click'"
   );
@@ -152,7 +173,8 @@ test('wizard Back preserves a connected repo while the dedicated action disconne
     /uiStep = Math\.max\(1, \(Number\(uiStep\) \|\| 1\) - 1\)/
   );
 
-  const disconnectHandler = functionSlice(
+  const disconnectHandler = slice(
+    connectionFlowSource,
     "disconnectRepoBtn.addEventListener('click'",
     "disconnectGitHubBtn.addEventListener('click'"
   );
@@ -173,7 +195,7 @@ test('offline transition retires network owners and synchronously renders both g
   assert.match(offline, /closeActiveGitHubConnectionModal\(\)/);
   assert.match(offline, /render\(\)/);
 
-  const render = functionSlice('function render()', 'return {');
+  const render = slice(controlsPanelSource, 'function render()', 'return {');
   const gating = render.slice(
     0,
     render.indexOf('// GitHub sync')
@@ -183,19 +205,24 @@ test('offline transition retires network owners and synchronously renders both g
     gating,
     /text: 'Offline: GitHub actions are disabled\.'/
   );
-  assert.match(gating, /disabled: syncBusy \|\| !online/);
+  assert.match(
+    gating,
+    /disabled: controller\.isSyncBusy\(\) \|\| !online/
+  );
 });
 
 test('every async confirmation is physically owned by the exact context signal', () => {
-  const calls = [...source.matchAll(/await confirmAsync\(\{([\s\S]*?)\n\s*\}\);/g)];
+  const calls = [
+    ...source.matchAll(/await confirmAsync\(\{([\s\S]*?)\n\s*\}\);/g),
+    ...controlsPanelSource.matchAll(
+      /await confirmAsync\(\{([\s\S]*?)\n\s*\}\);/g
+    ),
+  ];
   assert.ok(calls.length >= 4);
   for (const call of calls) {
     assert.match(call[1], /signal: (?:opAbort|owner)\.signal/);
   }
-  const confirm = functionSlice(
-    'function confirmAsync',
-    'function httpStatusOrNull'
-  );
+  const confirm = slice(modalShellSource, 'function confirmAsync', null);
   assert.match(confirm, /cancelDialog = showConfirmDialog/);
   assert.match(confirm, /signal\?\.addEventListener\('abort', onAbort/);
   assert.match(confirm, /cancelDialog\(\)/);
@@ -203,16 +230,20 @@ test('every async confirmation is physically owned by the exact context signal',
 
 test('repository discovery stays serial while its active DOM is bounded and memoized', () => {
   assert.match(
-    source,
+    connectionFlowSource,
     /const GITHUB_REPOSITORY_DISCOVERY_MAX_ITEMS = 10_000;/
   );
-  assert.match(source, /const GITHUB_REPOSITORY_PAGE_SIZE = 100;/);
   assert.match(
-    source,
+    connectionFlowSource,
+    /const GITHUB_REPOSITORY_PAGE_SIZE = 100;/
+  );
+  assert.match(
+    connectionFlowSource,
     /className: 'community-annotation-repo-pagination',\s*role: 'group'/
   );
 
-  const rendering = functionSlice(
+  const rendering = slice(
+    connectionFlowSource,
     'const renderRepoCards',
     'const updateUi'
   );
@@ -229,7 +260,8 @@ test('repository discovery stays serial while its active DOM is bounded and memo
   assert.match(rendering, /replacement\.focus\(\)/);
   assert.match(rendering, /'aria-pressed': isSelected \? 'true' : 'false'/);
 
-  const discovery = functionSlice(
+  const discovery = slice(
+    connectionFlowSource,
     'const loadRepoList',
     'const connectSelectedRepo'
   );
@@ -258,9 +290,10 @@ test('repository discovery stays serial while its active DOM is bounded and memo
 });
 
 test('profile visibly discloses the external ORCID lookup to both inputs', () => {
-  const profile = functionSlice(
+  const profile = slice(
+    identityProfileModalSource,
     'async function editIdentityFlow',
-    'async function ensureIdentityForUserKey'
+    null
   );
   assert.match(
     profile,
@@ -270,9 +303,10 @@ test('profile visibly discloses the external ORCID lookup to both inputs', () =>
     profile,
     /const orcidDisclosureId =[\s\S]*?'aria-describedby': orcidDisclosureId,[\s\S]*?'aria-label': 'ORCID',[\s\S]*?'aria-describedby': orcidDisclosureId/
   );
-  const threshold = functionSlice(
+  const threshold = slice(
+    domSource,
     'function hasAtLeastUnicodeCodePoints',
-    'function runExactCleanup'
+    'function downloadJsonAsFile'
   );
   assert.match(threshold, /for \(const _codePoint of value\)/);
   assert.doesNotMatch(threshold, /Array\.from|spread|\[\.\.\./);
@@ -292,17 +326,19 @@ test('author consensus drafts preserve legal prototype-named field identities', 
     /const annotatableSettingsDraft = Object\.create\(null\);/
   );
 
-  const settingsUi = source;
+  const settingsUi = controlsPanelSource;
   assert.match(
     settingsUi,
     /Object\.hasOwn\(annotatableSettingsDraft, selectedFieldKey\)/
   );
-  assert.doesNotMatch(
-    settingsUi,
-    /!annotatableSettingsDraft\[selectedFieldKey\]/
-  );
-  assert.doesNotMatch(
-    settingsUi,
-    /annotatableSettingsDraft\[selectedFieldKey\] \|\| applied/
-  );
+  for (const moduleSource of [source, settingsUi]) {
+    assert.doesNotMatch(
+      moduleSource,
+      /!annotatableSettingsDraft\[selectedFieldKey\]/
+    );
+    assert.doesNotMatch(
+      moduleSource,
+      /annotatableSettingsDraft\[selectedFieldKey\] \|\| applied/
+    );
+  }
 });

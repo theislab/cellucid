@@ -758,6 +758,10 @@ export function initHighlightPagesUI(options) {
         deleteBtn.innerHTML = '×';
         deleteBtn.title = 'Delete this page';
         deleteBtn.setAttribute('aria-label', `Delete ${page.name}`);
+        // The accessible name carries a name the user typed. Declaring the
+        // analytics id keeps the click countable without the tracker having to
+        // read that name to identify the control.
+        deleteBtn.dataset.analyticsId = 'highlight:delete-page';
         listen(deleteBtn, 'click', (e) => {
           e.stopPropagation();
           requirePageOperation(

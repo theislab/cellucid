@@ -1,10 +1,9 @@
 import { readFile } from 'node:fs/promises';
 
 import { expect, test } from '@playwright/test';
+import { EXPORTS_BASE_URL as EXPORTS_ROOT } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 
-const EXPORTS_ROOT =
-  'http://127.0.0.1:4173/tests/browser/fixtures/exports/';
 const PREPARED_FIXTURE_ROOT = new URL(
   './fixtures/exports/current-ui-prepared/',
   import.meta.url,

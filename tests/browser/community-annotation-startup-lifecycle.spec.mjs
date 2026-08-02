@@ -1,8 +1,8 @@
 import { expect, test } from '@playwright/test';
 
+import { APP_ORIGIN } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 
-const APP_ORIGIN = 'http://127.0.0.1:4173';
 const WORKER_ORIGIN = 'https://worker.example';
 const EXPORTS_ROOT =
   `${APP_ORIGIN}/tests/browser/fixtures/exports/`;

@@ -53,6 +53,13 @@ const sessionSerializerSource = await readFile(
   ),
   'utf8'
 );
+const publishedDefaultSource = await readFile(
+  new URL(
+    '../assets/js/app/session/published-default.js',
+    import.meta.url
+  ),
+  'utf8'
+);
 const indexHtml = await readFile(new URL('../index.html', import.meta.url), 'utf8');
 
 function keyframe(id, offset = 0) {
@@ -735,9 +742,17 @@ test('dataset publication restores only an integrity-pinned static sample view',
     datasetStateSource,
     /restorePublishedDefaultState[\s\S]*new Blob\(\[stateBytes\]/
   );
+  // The refusal lives in `published-default.js`, which owns the accepted chunk
+  // profile for both the reader and the publish step, and the serializer's
+  // published-default validation is what runs it. Asserting both is what keeps
+  // "the rule exists" from drifting apart from "the restore path applies it".
+  assert.match(
+    publishedDefaultSource,
+    /Published default session must not contain cinematic camera data\./
+  );
   assert.match(
     sessionSerializerSource,
-    /Published default session must not contain cinematic camera data\./
+    /function validatePublishedDefaultManifest[\s\S]*?assertPublishedDefaultChunkProfile\(/
   );
   assert.match(
     sessionSerializerSource,

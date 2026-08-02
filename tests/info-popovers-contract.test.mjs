@@ -19,6 +19,10 @@ const COMMUNITY_CONTROLS_URL = new URL(
   '../assets/js/app/ui/modules/community-annotation-controls.js',
   import.meta.url
 );
+const COMMUNITY_PANEL_URL = new URL(
+  '../assets/js/app/ui/modules/community-annotation/controls-panel.js',
+  import.meta.url
+);
 const UI_COORDINATOR_URL = new URL(
   '../assets/js/app/ui/core/ui-coordinator.js',
   import.meta.url
@@ -29,12 +33,14 @@ const [
   buttonsCss,
   datasetConnectionsSource,
   communityControlsSource,
+  communityPanelSource,
   uiCoordinatorSource
 ] = await Promise.all([
   readFile(INDEX_URL, 'utf8'),
   readFile(BUTTONS_CSS_URL, 'utf8'),
   readFile(DATASET_CONNECTIONS_URL, 'utf8'),
   readFile(COMMUNITY_CONTROLS_URL, 'utf8'),
+  readFile(COMMUNITY_PANEL_URL, 'utf8'),
   readFile(UI_COORDINATOR_URL, 'utf8')
 ]);
 
@@ -155,17 +161,23 @@ test('one controller owns static and dynamic information popovers', () => {
     /positionTooltip|attachTooltipToggle|userDataInfoTooltip/
   );
   assert.match(
-    communityControlsSource,
+    communityPanelSource,
     /infoPopovers\.configurePair\(btn, tooltip/
+  );
+  assert.match(
+    communityPanelSource,
+    /infoPopovers\.closeWithin\(container\)/
   );
   assert.match(
     communityControlsSource,
     /infoPopovers\.closeWithin\(container\)/
   );
-  assert.doesNotMatch(
-    communityControlsSource,
-    /document\.body\.querySelectorAll\('\.info-tooltip'\)|tooltipPairs/
-  );
+  for (const moduleSource of [communityControlsSource, communityPanelSource]) {
+    assert.doesNotMatch(
+      moduleSource,
+      /document\.body\.querySelectorAll\('\.info-tooltip'\)|tooltipPairs/
+    );
+  }
 });
 
 test('popover geometry chooses the fitting side and clamps horizontal edges', () => {

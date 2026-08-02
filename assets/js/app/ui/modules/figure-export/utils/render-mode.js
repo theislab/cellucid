@@ -74,7 +74,7 @@ export function buildRenderModeFidelityWarnings(documentRef) {
       detail:
         'Figure export reproduces the Points render mode only, and the render-mode '
         + 'control could not be read, so the mode the viewer is drawing with cannot '
-        + 'be confirmed. Restore the rendering controls before exporting.'
+        + 'be confirmed. Reload the page and export again.'
     }];
   }
   const label = RENDER_MODE_LABELS[mode];
@@ -83,6 +83,6 @@ export function buildRenderModeFidelityWarnings(documentRef) {
     detail:
       `The viewer is drawing in ${label} mode, but figure export renders the point `
       + 'layer only, so the exported figure would show different data from the '
-      + 'active view. Switch the render mode to Points before exporting.'
+      + 'active view. Set "Render mode" to Points before exporting.'
   }];
 }

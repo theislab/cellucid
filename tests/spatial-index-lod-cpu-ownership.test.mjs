@@ -3,8 +3,8 @@ import test from 'node:test';
 
 import {
   HighPerfRenderer,
-  SpatialIndex,
 } from '../assets/js/rendering/high-perf-renderer.js';
+import { SpatialIndex } from '../assets/js/rendering/high-perf/spatial-index.js';
 import {
   VelocityOverlay,
 } from '../assets/js/rendering/overlays/velocity/velocity-overlay.js';

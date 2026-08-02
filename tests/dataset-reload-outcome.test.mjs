@@ -94,6 +94,69 @@ test('latent embedding loading uses exactly the advertised file path', async t =
   assert.deepEqual(Array.from(result.points), [1, 2]);
 });
 
+test('a truncated latent embedding is refused, never floored to fewer cells', async t => {
+  // Two peers divide the same payload by the same dimension: DimensionManager
+  // and loadLatentEmbeddings. A partial trailing coordinate must be a refusal in
+  // both, because flooring it hands analysis a cell count that disagrees with
+  // obs_manifest.json while looking entirely normal on screen.
+  captureDownloadNotifications(t);
+  const originalFetch = globalThis.fetch;
+  const truncated = new Float32Array([1, 2, 3]);
+  globalThis.fetch = async () => new Response(
+    truncated.buffer,
+    { status: 200 }
+  );
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  await assert.rejects(
+    loadLatentEmbeddings({
+      baseUrl: 'https://cellucid.test/data/',
+      identity: {
+        embeddings: {
+          available_dimensions: [2],
+          default_dimension: 2,
+          files: { '2d': 'points_2d.bin' },
+        },
+      },
+      dimension: 2,
+    }),
+    /not a whole number of 2-value cell coordinates/i
+  );
+});
+
+test('a latent embedding must carry the declared cell count', async t => {
+  captureDownloadNotifications(t);
+  const originalFetch = globalThis.fetch;
+  const shortPayload = new Float32Array([1, 2, 3, 4]);
+  globalThis.fetch = async () => new Response(
+    shortPayload.buffer,
+    { status: 200 }
+  );
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  // The declared axis is enforced at transport, so the payload is refused before
+  // its length can define a cell count of its own.
+  await assert.rejects(
+    loadLatentEmbeddings({
+      baseUrl: 'https://cellucid.test/data/',
+      identity: {
+        stats: { n_cells: 5 },
+        embeddings: {
+          available_dimensions: [2],
+          default_dimension: 2,
+          files: { '2d': 'points_2d.bin' },
+        },
+      },
+      dimension: 2,
+    }),
+    /expected .*40 bytes|carries 2 cells, but/i
+  );
+});
+
 test('latent embedding loading rejects a missing advertised path before fetch', async t => {
   captureDownloadNotifications(t);
   const originalFetch = globalThis.fetch;
@@ -2490,11 +2553,18 @@ test(
       'await ensureBenchmarkModule()',
       'syntheticTransaction.isCurrent()'
     );
+    // Generation is off-thread for every pattern now, so the one await that
+    // used to belong to the GLB branch alone covers all of them.
     syntheticSearch = requireCheckAfter(
       synthetic,
-      'data = await SyntheticDataGenerator.fromGLBUrl(pointCount)',
+      'data = await generateSyntheticDataOffThread({',
       'syntheticTransaction.isCurrent()',
       syntheticSearch + 1
+    );
+    assert.match(
+      synthetic,
+      /generateSyntheticDataOffThread\(\{[\s\S]*?signal: syntheticTransaction\.signal/,
+      'a superseded run must terminate its generation worker'
     );
     syntheticSearch = requireCheckAfter(
       synthetic,
@@ -2529,6 +2599,45 @@ test(
     assert.match(
       synthetic,
       /const dismissSupersededBenchmark[\s\S]*notifications\.dismiss\(benchNotifId\)/
+    );
+
+    // A superseded run used to exit in silence: `return false` with the run's
+    // own notification already dismissed, so a click that landed while a
+    // dataset change was still settling was indistinguishable from a dead
+    // button. Every superseded exit now names itself to the user.
+    assert.doesNotMatch(
+      synthetic,
+      /if \(!syntheticTransaction\.isCurrent\(\)\) return false;/,
+      'a superseded run must report itself rather than returning in silence'
+    );
+    assert.match(
+      synthetic,
+      /const dismissSupersededBenchmark[\s\S]*?return reportSupersededBenchmark\(\)/
+    );
+    assert.match(
+      slice('function reportSupersededBenchmark', 'async function runBenchmark'),
+      /notifications\.warning\(/
+    );
+
+    // `runBenchmark` rejects on publication failure, so a control that drops
+    // its promise turns that into an unhandled rejection nobody sees.
+    const controls = slice(
+      '// Wire up run button',
+      '// BOTTLENECK ANALYSIS (Single Button)'
+    );
+    assert.equal(
+      [...controls.matchAll(/\brunBenchmark\(/g)].length,
+      0,
+      'controls must start runs through one owner that handles rejection'
+    );
+    assert.equal(
+      [...controls.matchAll(/\bstartBenchmarkRun\(/g)].length,
+      2,
+      'the run button and the presets must both go through that owner'
+    );
+    assert.match(
+      slice('function startBenchmarkRun', '// Wire up run button'),
+      /runBenchmark\([\s\S]*?\)\.catch\(/
     );
   }
 );

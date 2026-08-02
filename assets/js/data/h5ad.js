@@ -7,7 +7,9 @@
  * This module combines:
  * - H5adLoader: Core loader using h5wasm for reading h5ad files
  * - H5adDataSource: Data source providing the standard Cellucid interface
- * - H5adDataProvider: Bridge functions for data source manager integration
+ *
+ * The bridge that routes the application's data requests to this source lives
+ * in `anndata-provider.js`, which serves h5ad:// and zarr:// alike.
  *
  * ═══════════════════════════════════════════════════════════════════════════
  * FEATURES
@@ -32,24 +34,15 @@
  * - prepare() in Python for pre-processed binary files
  * - serve_anndata() Python server which supports true lazy loading via backed mode
  *
- * ═══════════════════════════════════════════════════════════════════════════
- * DATA PROVIDER
- * ═══════════════════════════════════════════════════════════════════════════
- *
- * This module provides a bridge between the standard Cellucid data loaders
- * and the H5AD file loader. When the active data source is an h5ad file,
- * the provider intercepts data requests and fulfills them directly from
- * the h5ad file instead of fetching URLs.
- *
- * This allows the rest of the application to work unchanged while supporting
- * h5ad files as a data source.
  */
 
 import { getNotificationCenter } from '../app/notification-center.js';
 import { buildCscFromCsr, getSparseColumn, toInt32Array, toFloat32Array } from './sparse-utils.js';
 import { DataSourceError, DataSourceErrorCode } from './data-source.js';
 import { BaseAnnDataAdapter } from './base-anndata-adapter.js';
-import { getDataSourceManager } from './data-source-manager.js';
+import {
+  requireCategoricalCategoryCount,
+} from './categorical-storage-contract.js';
 import {
   combineDatasetLifecycleFailures,
   createDatasetReloadSupersededError,
@@ -126,6 +119,26 @@ function isBooleanEnum(metadata) {
  * it does not spell out "float" or "int". HDF5 booleans are two-member enum
  * datasets and therefore require their metadata as well as the dtype string.
  *
+ * The leading NumPy byte-order character is matched and then deliberately
+ * discarded, and callers must not reintroduce it: it describes how the value
+ * is stored in the file, not how it arrives here. HDF5 converts to the host
+ * byte order while reading, so h5wasm hands back host-order data for both
+ * ">f4" and "<f4" — the same is true of `metadata.littleEndian`, which
+ * likewise reports file layout and never the layout of the returned buffer.
+ * A big-endian `.h5ad` therefore yields exactly the numbers a little-endian
+ * one does, and needs no byte swap anywhere downstream. (Zarr is the opposite
+ * case: its chunks are raw stored bytes, so `zarr-codecs.js` records
+ * `bigEndian` and `zarr.js` swaps on it.)
+ *
+ * The same rule makes `metadata.littleEndian` unusable as a validation input:
+ * no reader in this module may accept or reject a value because of it. Doing
+ * so rejects a readable file for a property of its storage that cannot reach
+ * the caller, and reports it as a malformed value.
+ *
+ * `tests/h5ad-byte-order-contract.test.mjs` pins this against a real
+ * big-endian HDF5 file and its little-endian twin, so the guarantee is
+ * measured rather than assumed.
+ *
  * @param {unknown} hdf5Dtype
  * @param {Object|null} [metadata]
  * @returns {'float'|'int'|'uint'|'string'|'bool'|'unknown'}
@@ -150,7 +163,6 @@ const MAX_H5AD_MATERIALIZED_ARRAY_BYTES = 512 * 1024 * 1024;
 const MAX_H5AD_BROWSER_FILE_BYTES = 512 * 1024 * 1024;
 const MAX_REASONABLE_SPARSE_DIMENSION = 50_000_000;
 const MAX_REASONABLE_SPARSE_NNZ = 500_000_000;
-const MAX_CELLUCID_CATEGORIES = 65_535;
 const JS_ARRAY_ELEMENT_BYTES = 8;
 const ESTIMATED_JS_STRING_VALUE_BYTES = 64;
 const HDF5_SIGNATURE = new Uint8Array([
@@ -293,10 +305,26 @@ function h5AttributeValue(node, key) {
     : attribute;
 }
 
+/**
+ * Read one HDF5 boolean attribute written as AnnData writes it.
+ *
+ * Byte order is deliberately absent from these checks. The value is a single
+ * signed byte drawn from a two-member enum whose members are pinned to
+ * `FALSE = 0` and `TRUE = 1`, so `size`, `signed`, the member map and the
+ * `0 | 1` value check already determine it completely; there is no second byte
+ * for an ordering to apply to. `metadata.littleEndian` describes the datatype
+ * recorded in the file, never the layout of what h5wasm returns — see the
+ * byte-order contract on `classifyH5WasmDtype` above. Requiring it here once
+ * rejected a perfectly readable file: an `ordered` attribute built on
+ * `H5T_STD_I8BE` reports `littleEndian: false` while still returning the
+ * correct `1`, and the sibling recogniser `isBooleanEnum` accepts exactly that
+ * attribute, so the two readers disagreed about the same construct.
+ */
 function decodeExactH5BooleanAttribute(node, key, label) {
   const fail = () => {
     throw new Error(
-      `${label} ${key} must be an own boolean attribute encoded as a scalar HDF5 enum`
+      `${label} ${key} must be a scalar HDF5 enum boolean with exactly ` +
+      'FALSE = 0 and TRUE = 1, as AnnData writes it'
     );
   };
   const attrs = node?.attrs;
@@ -324,7 +352,6 @@ function decodeExactH5BooleanAttribute(node, key, label) {
     metadata.type !== 8 ||
     metadata.signed !== true ||
     metadata.vlen !== false ||
-    metadata.littleEndian !== true ||
     metadata.size !== 1 ||
     metadata.total_size !== 1 ||
     !Array.isArray(metadata.shape) ||
@@ -746,16 +773,10 @@ function validateOneDimensionalH5Dataset(
 }
 
 function validateH5CategoryCount(categoryCount, key) {
-  if (categoryCount > MAX_CELLUCID_CATEGORIES) {
-    throw new Error(
-      `Categorical observation field "${key}" has ` +
-      `${categoryCount.toLocaleString('en-US')} categories, but Cellucid ` +
-      `supports at most ` +
-      `${MAX_CELLUCID_CATEGORIES.toLocaleString('en-US')}. ` +
-      'Reduce or merge categories before loading the dataset.'
-    );
-  }
-  return categoryCount;
+  return requireCategoricalCategoryCount(
+    categoryCount,
+    `Categorical observation field "${key}"`
+  );
 }
 
 function isSignedH5IntegerDataset(dataset) {
@@ -3606,9 +3627,15 @@ export class H5adDataSource {
 
   /**
    * Get connectivity edges
+   * @param {{signal?: AbortSignal|null}} [options]
    * @returns {Promise<Object|null>}
    */
-  async getConnectivityEdges() {
+  async getConnectivityEdges(options = {}) {
+    const signal = getMetadataLoadSignal(
+      options,
+      'H5AD connectivity edges'
+    );
+    throwIfMetadataAborted(signal, 'H5AD connectivity edge loading');
     if (!this._adapter) {
       throw new DataSourceError(
         'No h5ad file loaded',
@@ -3616,7 +3643,7 @@ export class H5adDataSource {
         this.type
       );
     }
-    return this._adapter.getConnectivityEdges();
+    return this._adapter.getConnectivityEdges({ signal });
   }
 
   /**
@@ -3761,211 +3788,4 @@ export class H5adDataSource {
  */
 export function createH5adDataSource() {
   return new H5adDataSource();
-}
-
-// ============================================================================
-// H5AD DATA PROVIDER
-// ============================================================================
-
-/**
- * Check if the current data source is an h5ad file
- * @returns {boolean}
- */
-export function isH5adActive() {
-  const manager = getDataSourceManager();
-  const source = manager.activeSource;
-
-  if (!source) return false;
-
-  // Check if source is local-user in h5ad mode
-  if (source.getType?.() === 'local-user') {
-    return source.isH5adMode?.() === true;
-  }
-
-  // Check if source is h5ad type directly
-  return source.getType?.() === 'h5ad';
-}
-
-/**
- * Get the active h5ad source adapter
- * @returns {Object|null} H5AD source or adapter
- */
-export function getH5adAdapter() {
-  const manager = getDataSourceManager();
-  const source = manager.activeSource;
-
-  if (!source) return null;
-
-  // If local-user in h5ad mode
-  if (source.getType?.() === 'local-user' && source.isH5adMode?.()) {
-    return source.getH5adSource?.()?.getAdapter?.() || null;
-  }
-
-  // If h5ad source directly
-  if (source.getType?.() === 'h5ad') {
-    return source.getAdapter?.() || null;
-  }
-
-  return null;
-}
-
-/**
- * Get the active h5ad source
- * @returns {Object|null}
- */
-export function getH5adSource() {
-  const manager = getDataSourceManager();
-  const source = manager.activeSource;
-
-  if (!source) return null;
-
-  // If local-user in h5ad mode
-  if (source.getType?.() === 'local-user' && source.isH5adMode?.()) {
-    return source.getH5adSource?.() || null;
-  }
-
-  // If h5ad source directly
-  if (source.getType?.() === 'h5ad') {
-    return source;
-  }
-
-  return null;
-}
-
-/**
- * Load points (embedding) from h5ad source
- * @param {number} dim - Dimension (1, 2, or 3)
- * @returns {Promise<Float32Array>}
- */
-export async function h5adLoadPoints(dim) {
-  const adapter = getH5adAdapter();
-  if (!adapter) {
-    throw new Error('No h5ad adapter available');
-  }
-
-  return adapter.getEmbedding(dim);
-}
-
-/**
- * Load obs manifest from h5ad source
- * @returns {Object}
- */
-export function h5adGetObsManifest() {
-  const adapter = getH5adAdapter();
-  if (!adapter) {
-    throw new Error('No h5ad adapter available');
-  }
-
-  return adapter.getObsManifest();
-}
-
-/**
- * Load var manifest from h5ad source
- * @returns {Object}
- */
-export function h5adGetVarManifest() {
-  const adapter = getH5adAdapter();
-  if (!adapter) {
-    throw new Error('No h5ad adapter available');
-  }
-
-  return adapter.getVarManifest();
-}
-
-/**
- * Load obs field data from h5ad source
- * @param {string} fieldKey - Field name
- * @returns {Promise<{data: ArrayBuffer, kind: string, categories?: string[]}>}
- */
-export async function h5adLoadObsField(fieldKey) {
-  const adapter = getH5adAdapter();
-  if (!adapter) {
-    throw new Error('No h5ad adapter available');
-  }
-
-  return adapter.getObsFieldData(fieldKey);
-}
-
-/**
- * Load gene expression from h5ad source
- * @param {string} geneName - Gene name
- * @returns {Promise<Float32Array>}
- */
-export async function h5adLoadGeneExpression(geneName) {
-  const adapter = getH5adAdapter();
-  if (!adapter) {
-    throw new Error('No h5ad adapter available');
-  }
-
-  return adapter.getGeneExpression(geneName);
-}
-
-/**
- * Load connectivity edges from h5ad source
- * @returns {Promise<{sources: Uint32Array, destinations: Uint32Array, weights: Float64Array, nEdges: number}|null>}
- */
-export async function h5adLoadConnectivity() {
-  const adapter = getH5adAdapter();
-  if (!adapter) {
-    return null;
-  }
-
-  return adapter.getConnectivityEdges();
-}
-
-/**
- * Get connectivity manifest from h5ad source
- * @param {{signal?: AbortSignal|null}} [options]
- * @returns {Promise<Object|null>}
- */
-export async function h5adGetConnectivityManifest(options = {}) {
-  const source = getH5adSource();
-  if (!source) {
-    throw new Error('No h5ad source available');
-  }
-  return source.getConnectivityManifest(options);
-}
-
-/**
- * Get dataset identity from h5ad source
- * @returns {Object}
- */
-export function h5adGetDatasetIdentity() {
-  const adapter = getH5adAdapter();
-  if (!adapter) {
-    throw new Error('No h5ad adapter available');
-  }
-
-  return adapter.getMetadata();
-}
-
-/**
- * Check if a URL is an h5ad:// URL
- * @param {string} url
- * @returns {boolean}
- */
-export function isH5adUrl(url) {
-  return url?.startsWith('h5ad://');
-}
-
-/**
- * Parse an h5ad:// URL
- * @param {string} url
- * @returns {{datasetId: string, path: string}|null}
- */
-export function parseH5adUrl(url) {
-  if (!isH5adUrl(url)) return null;
-
-  // Format: h5ad://datasetId/path
-  const withoutProtocol = url.substring('h5ad://'.length);
-  const slashIdx = withoutProtocol.indexOf('/');
-
-  if (slashIdx === -1) {
-    return { datasetId: withoutProtocol, path: '' };
-  }
-
-  return {
-    datasetId: withoutProtocol.substring(0, slashIdx),
-    path: withoutProtocol.substring(slashIdx + 1)
-  };
 }

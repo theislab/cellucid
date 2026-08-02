@@ -8,7 +8,6 @@
  * - Modal management
  * - Export functionality (PNG, SVG, CSV)
  * - Cleanup and lifecycle management
- * - Shared component factories (PageSelector, VariableSelector, FigureContainer)
  * - Page requirements validation system
  *
  * All analysis UIs (Detailed, Quick, Advanced, Correlation, DE, Signature)
@@ -31,10 +30,9 @@
  *   }
  *
  *   _render() {
- *     // Use shared components:
- *     this._pageSelector = this._createPageSelector(container);
- *     this._varSelector = this._createVariableSelector(container);
- *     this._figureContainer = this._createFigureContainer(container);
+ *     // Build this mode's own controls and preview containers, then call
+ *     // _renderControls(). Selector components are constructed by the
+ *     // subclass that owns them, not by this base class.
  *   }
  * }
  */
@@ -47,14 +45,11 @@ import {
   downloadCSV
 } from '../shared/analysis-utils.js';
 import { formatCount } from '../shared/formatting.js';
+import { selectablePageIdSet } from '../shared/page-derivation-utils.js';
 import { createAnalysisModal, openModal, closeModal } from './components/modal.js';
-import { loadPlotly, purgePlot, downloadImage } from '../plots/plotly-loader.js';
-import { PlotRegistry } from '../shared/plot-registry-utils.js';
-import { createPageSelectorComponent } from './shared/page-selector.js';
-import { createVariableSelectorComponent } from './shared/variable-selector.js';
-import { createFigureContainer } from './shared/figure-container.js';
+import { createControlScope } from './components/control-accessibility.js';
+import { purgePlot, downloadImage } from '../plots/plotly-loader.js';
 import { createRequestIdTracker } from '../shared/cancellable-operation.js';
-import { setOwnDataProperty } from '../../../utils/exact-record.js';
 
 function cloneSettings(value) {
   return structuredClone(value);
@@ -177,6 +172,14 @@ export class BaseAnalysisUI {
     this.onConfigChange = options.onConfigChange;
     this._instanceId = options.instanceId || '';
 
+    // Every element id this UI generates is prefixed with this scope. The
+    // sidebar panel and each floating copy of the same analysis mode are
+    // separate instances, so without it they emit the same ids and a
+    // `<label for>` in one panel resolves to the control in the other.
+    this._controlScope = createControlScope(
+      this._instanceId.length > 0 ? this._instanceId : 'analysis'
+    );
+
     this._notifications = getNotificationCenter();
 
     // UI containers
@@ -210,10 +213,6 @@ export class BaseAnalysisUI {
 
     // Loading state
     this._isLoading = false;
-
-    // Persistent page colors (shared with Highlighted Cells UI via DataState).
-    // This Map instance is passed through to plotting so updates propagate without rebuilding objects.
-    this._pageColorMap = new Map();
 
     // Debounce timer
     this._updateTimer = null;
@@ -457,18 +456,23 @@ export class BaseAnalysisUI {
   /**
    * Require selected pages to exist in the current UI inventory and contain
    * cells.
+   *
+   * The inventory is the shared selectable domain, not this mode's own view of
+   * it. `AnalysisUIManager` hands the same selection to whichever mode becomes
+   * active, so a mode that answered from its page selector — or, when it owns
+   * none, from the base pages alone — refused a page the manager had already
+   * accepted.
+   *
    * @param {string[]} pageIds
    * @param {string} label
    * @protected
    */
   _requireAvailableSelectedPages(pageIds, label) {
-    const pages = this._pageSelector
-      ? this._pageSelector._getPages()
-      : this.dataLayer.getPages();
+    const pages = this.dataLayer.getPages();
     if (!Array.isArray(pages)) {
       throw new TypeError('Analysis page inventory must be an array');
     }
-    const availablePageIds = new Set(pages.map(page => page.id));
+    const availablePageIds = selectablePageIdSet(pages);
     for (const pageId of pageIds) {
       if (!availablePageIds.has(pageId)) {
         throw new Error(`${label} page "${pageId}" was not found`);
@@ -942,145 +946,6 @@ export class BaseAnalysisUI {
       closeModal(this._modal),
       'Analysis modal close'
     );
-  }
-
-  // ===========================================================================
-  // Shared Component Factories
-  // ===========================================================================
-
-  /**
-   * Create a PageSelectorComponent instance
-   * @param {HTMLElement} container - Container to render into
-   * @param {Object} [options] - Additional options
-   * @returns {Object} PageSelectorComponent instance
-   */
-  _createPageSelector(container, options = {}) {
-    return createPageSelectorComponent({
-      dataLayer: this.dataLayer,
-      container,
-      onSelectionChange: (pageIds) => this._onPageSelectionChange(pageIds),
-      onColorChange: (pageId, color) => this._onPageColorChange(pageId, color),
-      initialSelection: this._selectedPages,
-      ...options
-    });
-  }
-
-  /**
-   * Create a VariableSelectorComponent instance
-   * @param {HTMLElement} container - Container to render into
-   * @param {Object} [options] - Additional options
-   * @returns {Object} VariableSelectorComponent instance
-   */
-  _createVariableSelector(container, options = {}) {
-    return createVariableSelectorComponent({
-      dataLayer: this.dataLayer,
-      container,
-      onVariableChange: (type, variable) => this._onVariableChange(type, variable),
-      initialSelection: this._currentConfig.dataSource,
-      ...options
-    });
-  }
-
-  /**
-   * Create a FigureContainer instance
-   * @param {HTMLElement} container - Container to render into
-   * @param {Object} [options] - Additional options
-   * @returns {Object} FigureContainer instance
-   */
-  _createFigureContainer(container, options = {}) {
-    this._syncPageColorMapFromState();
-    return createFigureContainer({
-      container,
-      onExportPNG: () => this._exportPNG(),
-      onExportSVG: () => this._exportSVG(),
-      onExportCSV: () => this._exportCSV(
-        this._currentPageData,
-        this._currentConfig.dataSource.variable
-      ),
-      onPlotOptionChange: (key, value) => this._onPlotOptionChange(key, value),
-      customColors: this._pageColorMap,
-      ...options
-    });
-  }
-
-  // ===========================================================================
-  // Shared Component Event Handlers (override in subclass if needed)
-  // ===========================================================================
-
-  /**
-   * Handle page selection change from PageSelector
-   * @param {string[]} pageIds - Selected page IDs
-   */
-  _onPageSelectionChange(pageIds) {
-    requirePageIds(pageIds, 'Analysis selectedPages');
-    this._selectedPages = [...pageIds];
-    this._currentConfig.pages = this._selectedPages;
-    this._syncPageColorMapFromState();
-    this._scheduleUpdate();
-
-    if (this.onConfigChange) {
-      this.onConfigChange(this._currentConfig);
-    }
-  }
-
-  /**
-   * Handle page color change from PageSelector
-   * @param {string} pageId - Page ID
-   * @param {string} color - New color
-   */
-  _onPageColorChange(pageId, color) {
-    this.dataLayer?.setPageColor?.(pageId, color);
-    this._syncPageColorMapFromState();
-    this._scheduleUpdate();
-  }
-
-  _syncPageColorMapFromState() {
-    this._pageColorMap.clear();
-    const pages = this.dataLayer?.getPages?.() || [];
-    for (const page of pages) {
-      if (!page?.id) continue;
-      const color = page.color || this.dataLayer?.getPageColor?.(page.id) || null;
-      if (color) this._pageColorMap.set(page.id, color);
-    }
-  }
-
-  /**
-   * Handle variable change from VariableSelector
-   * @param {string} type - Variable type
-   * @param {string} variable - Variable key
-   */
-  _onVariableChange(type, variable) {
-    this._currentConfig.dataSource = { type, variable };
-    this._updatePlotTypeForDataKind(type);
-    this._renderControls();
-    this._scheduleUpdate();
-  }
-
-  /**
-   * Handle plot option change
-   * @param {string} key - Option key
-   * @param {*} value - Option value
-   */
-  _onPlotOptionChange(key, value) {
-    setOwnDataProperty(this._currentConfig.plotOptions, key, value);
-    this._scheduleUpdate();
-  }
-
-  /**
-   * Update plot type for data kind (categorical vs continuous)
-   * @param {string} type - Variable type
-   */
-  _updatePlotTypeForDataKind(type) {
-    const kind = type === 'categorical_obs' ? 'categorical' : 'continuous';
-    const compatiblePlots = PlotRegistry.getForDataType(kind);
-    const currentPlotCompatible = compatiblePlots.find(
-      p => p.id === this._currentConfig.plotType
-    );
-
-    if (!currentPlotCompatible && compatiblePlots.length > 0) {
-      this._currentConfig.plotType = compatiblePlots[0].id;
-      this._currentConfig.plotOptions = {};
-    }
   }
 
   // ===========================================================================

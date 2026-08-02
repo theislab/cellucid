@@ -13,11 +13,13 @@ class FakeElement {
     min = '',
     max = '',
     step = '',
+    checked = null,
   } = {}) {
     this.value = value;
     this.min = min;
     this.max = max;
     this.step = step;
+    if (checked !== null) this.checked = checked;
     this.textContent = '';
     this.style = {};
     this.listeners = new Map();
@@ -104,6 +106,22 @@ function makeDom() {
     rendererControls: new FakeElement(),
     pointsControls: new FakeElement(),
     smokeControls: new FakeElement(),
+    hpShaderQualitySelect: new FakeElement({ value: 'full' }),
+    hpLodEnabledCheckbox: new FakeElement({ checked: false }),
+    hpFrustumCullingCheckbox: new FakeElement({ checked: false }),
+    hpLodForceInput: new FakeElement({
+      value: '-1',
+      min: '-1',
+      max: '17',
+      step: '1',
+    }),
+    hpLodForceContainer: new FakeElement(),
+    hpLodForceDisplay: new FakeElement(),
+    // Antialiasing is owned here too. It publishes to storage rather than to
+    // the viewer because it is a context-creation attribute; its own behaviour
+    // is held by `antialias-setting-contract.test.mjs`.
+    hpAntialiasCheckbox: new FakeElement({ checked: true }),
+    hpAntialiasStatus: new FakeElement(),
   };
   for (const [key, [value, step]] of Object.entries(INPUT_DEFAULTS)) {
     dom[key] = new FakeElement({
@@ -150,6 +168,18 @@ function makeViewer({ hasSnapshots = false } = {}) {
     setNoiseTextureResolution(value) {
       calls.push(['setNoiseTextureResolution', value]);
     },
+    setShaderQuality(value) {
+      calls.push(['setShaderQuality', value]);
+    },
+    setAdaptiveLOD(value) {
+      calls.push(['setAdaptiveLOD', value]);
+    },
+    setForceLOD(value) {
+      calls.push(['setForceLOD', value]);
+    },
+    setFrustumCulling(value) {
+      calls.push(['setFrustumCulling', value]);
+    },
     getAdaptiveScaleFactor() {
       calls.push(['getAdaptiveScaleFactor']);
       return 1;
@@ -157,6 +187,12 @@ function makeViewer({ hasSnapshots = false } = {}) {
     hasSnapshots() {
       calls.push(['hasSnapshots']);
       return hasSnapshots;
+    },
+    getRequestedAntialiasing() {
+      return true;
+    },
+    getGrantedAntialiasing() {
+      return true;
     },
   };
   return viewer;

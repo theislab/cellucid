@@ -89,8 +89,8 @@ test('field overlays preserve valid category-keyed centroid subsets by identity'
         getDisplayKey(_source, originalKey) {
           return originalKey;
         },
-        getDisplayCategory(_source, _fieldKey, categoryIndex, originalLabel) {
-          return categoryRenames.get(categoryIndex) ?? originalLabel;
+        getDisplayCategory(_source, _fieldKey, originalLabel) {
+          return categoryRenames.get(originalLabel) ?? originalLabel;
         },
       },
       _deleteRegistry: {
@@ -112,7 +112,7 @@ test('field overlays preserve valid category-keyed centroid subsets by identity'
     ['alpha', 'gamma'],
   );
 
-  categoryRenames.set(2, 'gamma cells');
+  categoryRenames.set('gamma', 'gamma cells');
   state._applyOverlaysToFields([field], FieldSource.OBS);
   assert.deepEqual(field.categories, ['alpha', 'beta', 'gamma cells']);
   assert.deepEqual(

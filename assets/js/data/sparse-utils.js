@@ -36,6 +36,29 @@ export function buildCscFromCsr(sparse) {
   const nCols = shape[1];
   const nnz = data.length;
 
+  // A coordinate outside the declared shape is corruption, not an instruction
+  // to drop a value: skipping it turns a damaged matrix into an expression
+  // vector that reads as a genuine non-detection for that cell, which is the
+  // one wrong answer a biologist cannot see. This is the same rule
+  // getSparseColumn() already states for an out-of-range column index.
+  if (indices.length !== nnz) {
+    throw new RangeError(
+      `Sparse matrix declares ${nnz} values but ${indices.length} indices`
+    );
+  }
+  if (indptr.length !== nRows + 1) {
+    throw new RangeError(
+      `Sparse matrix with ${nRows} rows requires ${nRows + 1} row pointers, ` +
+      `but declares ${indptr.length}`
+    );
+  }
+  if (indptr[nRows] !== nnz) {
+    throw new RangeError(
+      `Sparse matrix row pointers end at ${indptr[nRows]}, ` +
+      `which is not its ${nnz} stored values`
+    );
+  }
+
   // Edge case: empty matrix
   if (nnz === 0) {
     return {
@@ -50,10 +73,13 @@ export function buildCscFromCsr(sparse) {
   const colCounts = new Int32Array(nCols + 1);
   for (let i = 0; i < nnz; i++) {
     const col = indices[i];
-    // Edge case: validate column index to prevent out-of-bounds
-    if (col >= 0 && col < nCols) {
-      colCounts[col + 1]++;
+    if (col < 0 || col >= nCols) {
+      throw new RangeError(
+        `Sparse matrix column index ${col} at entry ${i} is outside its ` +
+        `${nCols}-column shape`
+      );
     }
+    colCounts[col + 1]++;
   }
 
   // Step 2: Build column indptr (cumulative sum)
@@ -72,13 +98,10 @@ export function buildCscFromCsr(sparse) {
     const end = indptr[row + 1];
     for (let j = start; j < end; j++) {
       const col = indices[j];
-      // Edge case: validate column index
-      if (col >= 0 && col < nCols) {
-        const destIdx = colIndptr[col] + colPos[col];
-        rowIndices[destIdx] = row;
-        colData[destIdx] = data[j];
-        colPos[col]++;
-      }
+      const destIdx = colIndptr[col] + colPos[col];
+      rowIndices[destIdx] = row;
+      colData[destIdx] = data[j];
+      colPos[col]++;
     }
   }
 
@@ -146,16 +169,22 @@ export function getSparseColumn(cscData, colIdx, nRows) {
 
   for (let j = start; j < end; j++) {
     const rowIdx = rowIndices[j];
-    // Edge case: validate row index
-    if (rowIdx >= 0 && rowIdx < nRows) {
-      // Compressed sparse matrices may legally contain duplicate coordinates.
-      result[rowIdx] = addSparseFloat32(
-        result[rowIdx],
-        colData[j],
-        'Sparse column',
-        cscData.exactInteger === true
+    // An out-of-range row is corruption, and dropping it would publish a real
+    // zero for a cell whose value is unknown. Same rule as the column index
+    // above, and as the shape agreement buildCscFromCsr() proves.
+    if (rowIdx < 0 || rowIdx >= nRows) {
+      throw new RangeError(
+        `Sparse column row index ${rowIdx} at entry ${j} is outside its ` +
+        `${nRows}-row shape`
       );
     }
+    // Compressed sparse matrices may legally contain duplicate coordinates.
+    result[rowIdx] = addSparseFloat32(
+      result[rowIdx],
+      colData[j],
+      'Sparse column',
+      cscData.exactInteger === true
+    );
   }
 
   return result;

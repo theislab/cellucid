@@ -1,9 +1,10 @@
 import { expect, test } from '@playwright/test';
 import { dispatchAppDrag } from './helpers/app-drag.mjs';
+import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 
 const DATASET_URL =
-  '/?exportsBaseUrl=http%3A%2F%2F127.0.0.1%3A4173%2Ftests%2Fbrowser%2Ffixtures%2Fexports%2F&dataset=current-ui-prepared&acceptance=dataset-transient-ownership-ci';
+  `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=dataset-transient-ownership-ci`;
 const DATASET_OPTION = 'dataset:local-demo:current-ui-prepared';
 
 function observeProductErrors(page) {

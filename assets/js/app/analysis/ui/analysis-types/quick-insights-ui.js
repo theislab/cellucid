@@ -21,6 +21,8 @@ import { BaseAnalysisUI } from '../base-analysis-ui.js';
 import { debug, debugWarn } from '../../shared/debug-utils.js';
 
 import { createMultiSelectDropdown } from '../components/multi-select-dropdown.js';
+import { MAX_CATEGORICAL_CATEGORIES } from '../../../../data/categorical-storage-contract.js';
+import { createDisclosureHeader } from '../../shared/dom-utils.js';
 import { PageSelectorComponent, PAGE_MODE } from '../shared/page-selector.js';
 
 /**
@@ -840,9 +842,10 @@ export class QuickInsights extends BaseAnalysisUI {
         'Uint16Array codes and categories'
       );
     }
-    if (categories.length > 65_535) {
+    if (categories.length > MAX_CATEGORICAL_CATEGORIES) {
       throw new RangeError(
-        `Quick Insights categorical field "${fieldName}" exceeds 65,535 categories`
+        `Quick Insights categorical field "${fieldName}" exceeds ` +
+        `${MAX_CATEGORICAL_CATEGORIES.toLocaleString('en-US')} categories`
       );
     }
 
@@ -1318,8 +1321,6 @@ export class QuickInsights extends BaseAnalysisUI {
     // Create collapsible header
     const header = document.createElement('div');
     header.className = 'insights-collapsible-header';
-    header.setAttribute('role', 'button');
-    header.setAttribute('tabindex', '0');
 
     const toggleIcon = document.createElement('span');
     toggleIcon.className = 'insights-collapsible-toggle';
@@ -1348,22 +1349,25 @@ export class QuickInsights extends BaseAnalysisUI {
     // Create content container
     const content = document.createElement('div');
     content.className = 'insights-collapsible-content';
-    content.style.display = this._pageSelectorExpanded ? 'block' : 'none';
+
+    // The caret is decoration: it repeats what aria-expanded already carries,
+    // and reading "▶ Page Selection" aloud helps nobody.
+    const announce = createDisclosureHeader({
+      header,
+      content,
+      expanded: this._pageSelectorExpanded,
+      glyph: toggleIcon,
+      contentId: `${this._controlScope}-page-selection`
+    });
 
     // Toggle handler
     const toggleContent = () => {
       this._pageSelectorExpanded = !this._pageSelectorExpanded;
       toggleIcon.textContent = this._pageSelectorExpanded ? '▼' : '▶';
-      content.style.display = this._pageSelectorExpanded ? 'block' : 'none';
+      announce(this._pageSelectorExpanded);
     };
 
     header.addEventListener('click', toggleContent);
-    header.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter' || e.key === ' ') {
-        e.preventDefault();
-        toggleContent();
-      }
-    });
 
     section.appendChild(header);
     section.appendChild(content);

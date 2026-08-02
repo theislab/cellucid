@@ -506,12 +506,41 @@ async function requestJson(url, signal, label) {
       { url, contentType: response.headers.get('Content-Type') }
     );
   }
+  // The body read owns four distinguishable outcomes and they are not
+  // interchangeable: the caller's own cancellation, a payload that exceeded the
+  // metadata byte ceiling, a transfer that broke mid-body, and genuinely
+  // malformed JSON. Reporting all four as "must contain valid JSON" accuses the
+  // server of sending bad data when the user cancelled, when the response was
+  // refused for its size, or when the connection dropped — three lies a user
+  // cannot tell from the truth. The signal is threaded in so a cancelled listing
+  // stops reading rather than draining a body nobody will use.
+  //
+  // The size refusal is not re-labelled here: `readBoundedBody()` owns the
+  // ceiling and already publishes TOO_LARGE, so it arrives as a DataSourceError
+  // and passes straight through. Naming it a second time here is how it came to
+  // be reported as a failed contract validation, which reaches the user as
+  // "re-export it with cellucid prepare" — advice that reproduces the identical
+  // file and meets the identical ceiling (CEL-0219).
   try {
-    return await readBoundedJson(response, { label });
+    return await readBoundedJson(response, { label, signal });
   } catch (error) {
+    if (signal.aborted || error?.name === 'AbortError') {
+      throw error;
+    }
+    if (error instanceof DataSourceError) {
+      throw error;
+    }
+    if (error instanceof SyntaxError) {
+      throw new DataSourceError(
+        `${label} response must contain valid JSON`,
+        DataSourceErrorCode.INVALID_FORMAT,
+        'remote',
+        { url, cause: error.message }
+      );
+    }
     throw new DataSourceError(
-      `${label} response must contain valid JSON`,
-      DataSourceErrorCode.INVALID_FORMAT,
+      `${label} response body transfer failed: ${error instanceof Error ? error.message : String(error)}`,
+      DataSourceErrorCode.NETWORK_ERROR,
       'remote',
       {
         url,
@@ -843,6 +872,11 @@ export class RemoteDataSource {
           { url: exactConfig.url, timeout: exactConfig.timeout }
         );
       }
+      // A cancellation that did not come from this connection's own controller
+      // — a body stream cancelled by the transport, for instance — is still a
+      // cancellation. Relabelling it as a contract validation failure blames the
+      // server for a request that was never allowed to finish.
+      if (error?.name === 'AbortError') throw error;
       if (error instanceof DataSourceError) throw error;
       throw new DataSourceError(
         `Remote server contract validation failed: ${error instanceof Error ? error.message : String(error)}`,

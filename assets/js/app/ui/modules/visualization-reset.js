@@ -8,7 +8,7 @@
  * @module ui/modules/visualization-reset
  */
 
-import { assertNavigationMode } from '../../../rendering/camera-state-contract.js';
+import { getDefaultNavigationMode } from '../../../rendering/viewer/viewer-contracts.js';
 import { parseRangeInput } from '../core/numeric-input-contract.js';
 
 const EXACT_OPTION_KEYS = Object.freeze([
@@ -66,6 +66,8 @@ const CAMERA_CHECKBOX_KEYS = Object.freeze([
 
 const VIEWER_METHODS = Object.freeze([
   'resetCamera',
+  'getFocusedViewId',
+  'getViewDimension',
   'setBackground',
   'setNavigationMode',
   'setInvertLookY',
@@ -385,7 +387,6 @@ export function initVisualizationReset(options) {
         noiseResolutionInput,
         { minimum: 0, maximum: 100, label: 'Noise resolution' }
       ),
-      navigationMode: assertNavigationMode(navigationModeSelect.value),
       lookSensitivity: captureRange(
         lookSensitivityInput,
         { minimum: 1, maximum: 30, label: 'Look sensitivity' }
@@ -432,9 +433,18 @@ export function initVisualizationReset(options) {
     backgroundSelect.value = initialUIState.background;
     viewer.setBackground(initialUIState.background);
 
-    navigationModeSelect.value = initialUIState.navigationMode;
-    viewer.setNavigationMode(initialUIState.navigationMode);
-    cameraControls.toggleNavigationPanels(initialUIState.navigationMode);
+    // Navigation mode has no useful app-init capture: the page starts on Orbit
+    // before any dataset exists, so restoring that value drops a 1-D or 2-D
+    // embedding into Orbit — the disoriented view users are told to press this
+    // button to escape. The initial default for the dataset on screen is the
+    // one its current dimension implies, and applying it also hands navigation
+    // back to the dimension rule.
+    const navigationMode = getDefaultNavigationMode(
+      viewer.getViewDimension(viewer.getFocusedViewId())
+    );
+    navigationModeSelect.value = navigationMode;
+    viewer.setNavigationMode(navigationMode);
+    cameraControls.toggleNavigationPanels(navigationMode);
 
     restoreRange(
       lookSensitivityInput,

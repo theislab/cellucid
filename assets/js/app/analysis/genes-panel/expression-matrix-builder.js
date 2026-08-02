@@ -18,11 +18,26 @@ import { zscoreRows, log1pTransform } from '../shared/matrix-utils.js';
 import { isFiniteNumber } from '../shared/number-utils.js';
 import { DEFAULTS, ANALYSIS_PHASES } from './constants.js';
 
-function encodeGroupName(groupName, groupId) {
+/**
+ * The one rule for turning a group's category into the text a user sees.
+ *
+ * `MarkerDiscoveryEngine` accepts a string, a finite number, or a boolean as a
+ * category name and refuses a group without one before computing a statistic
+ * (`marker-discovery-engine.js:988-1007`), so every group that reaches a display
+ * surface owns an exact primitive here. Three surfaces render it — the heatmap's
+ * column headers, the expanded view's group picker, and the ranked CSV's `group`
+ * column — and they must agree character for character, because two exports of
+ * one analysis that disagree about what a group is called cannot be joined.
+ *
+ * @param {unknown} groupName - The group's exact category name.
+ * @param {string} groupId - The synthetic handle, for the error message only.
+ * @returns {string}
+ */
+export function encodeGroupName(groupName, groupId) {
   if (typeof groupName === 'string') {
     if (groupName.length === 0 || groupName.trim().length === 0) {
       throw new TypeError(
-        `Expression group "${groupId}" name must not be empty`
+        `Group "${groupId}" name must not be empty`
       );
     }
     return groupName;
@@ -30,7 +45,7 @@ function encodeGroupName(groupName, groupId) {
   if (typeof groupName === 'number') {
     if (!Number.isFinite(groupName)) {
       throw new TypeError(
-        `Expression group "${groupId}" numeric name must be finite`
+        `Group "${groupId}" numeric name must be finite`
       );
     }
     return String(groupName);
@@ -39,7 +54,7 @@ function encodeGroupName(groupName, groupId) {
     return String(groupName);
   }
   throw new TypeError(
-    `Expression group "${groupId}" name must be a string, finite number, or boolean`
+    `Group "${groupId}" name must be a string, finite number, or boolean`
   );
 }
 

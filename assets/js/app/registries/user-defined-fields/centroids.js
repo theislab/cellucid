@@ -7,6 +7,10 @@
  * @module registries/user-defined-fields/centroids
  */
 
+import {
+  categoricalStorageForCodes
+} from '../../../data/categorical-storage-contract.js';
+
 function requireCategoryInventory(categories) {
   if (!Array.isArray(categories) || categories.length === 0) {
     throw new TypeError('Centroid categories must be a non-empty array');
@@ -48,7 +52,10 @@ export function computeAllDimensionCentroids(codes, categories, state) {
     throw new TypeError('Centroid category codes must be Uint8Array or Uint16Array');
   }
   requireCategoryInventory(categories);
-  const missingCode = codes instanceof Uint8Array ? 255 : 65_535;
+  const { missingValue: missingCode } = categoricalStorageForCodes(
+    codes,
+    'Centroid category'
+  );
   for (let codeIndex = 0; codeIndex < codes.length; codeIndex++) {
     if (codes[codeIndex] >= categories.length && codes[codeIndex] !== missingCode) {
       throw new RangeError(`Centroid category code ${codeIndex} is outside the category inventory`);
@@ -114,7 +121,10 @@ export function computeCentroidsForDimension(codes, categories, positions, dim) 
   }
 
   const numCategories = categories.length;
-  const missingCode = codes instanceof Uint8Array ? 255 : 65_535;
+  const { missingValue: missingCode } = categoricalStorageForCodes(
+    codes,
+    'Centroid category'
+  );
   const pointCount = codes.length;
 
   const sumsX = new Float64Array(numCategories);

@@ -1,11 +1,8 @@
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
 import { performance } from 'node:perf_hooks';
 import test from 'node:test';
 
-import {
-  SpatialIndex,
-} from '../assets/js/rendering/high-perf-renderer.js';
+import { SpatialIndex } from '../assets/js/rendering/high-perf/spatial-index.js';
 
 const FIXED_BOUNDS = Object.freeze({
   minX: -512,
@@ -314,15 +311,12 @@ test('allocation failures never publish a partial hierarchy and retry succeeds',
   }
 });
 
-test('production hierarchy uses stable typed radix passes without boxed sorting', async () => {
-  const source = await readFile(
-    new URL('../assets/js/rendering/high-perf-renderer.js', import.meta.url),
-    'utf8',
-  );
-  const methodStart = source.indexOf('  _buildHierarchicalOrder() {');
-  const methodEnd = source.indexOf('\n  _stratifiedSample(', methodStart);
-  assert.ok(methodStart >= 0 && methodEnd > methodStart);
-  const methodSource = source.slice(methodStart, methodEnd);
+test('production hierarchy uses stable typed radix passes without boxed sorting', () => {
+  // Read the live function rather than the file text: the assertion is about
+  // the method that actually runs, so it cannot pass on stale source and does
+  // not have to be updated when the method changes file.
+  const methodSource =
+    SpatialIndex.prototype._buildHierarchicalOrder.toString();
 
   assert.doesNotMatch(methodSource, /new Array\s*\(|\.sort\s*\(|ranked|{\s*idx\s*:/);
   assert.match(methodSource, /new Uint32Array\(n\)/);

@@ -54,8 +54,20 @@ const BATCH_DEFAULTS = {
   minPreloadCount: 10,
   /** Maximum genes per batch */
   maxPreloadCount: 500,
-  /** Number of concurrent network requests for gene loading */
-  networkConcurrency: 6,
+  /**
+   * Number of concurrent gene requests.
+   *
+   * One gene is one HTTP request in the prepared export format, so a run's wall
+   * clock on a real connection is round-trips divided by this number. Measured
+   * on a 562k-cell export over HTTP/2 at 120 ms RTT, 120 genes took 2710 ms at
+   * 6, 1573 ms at 12 and 1268 ms at 16; at 250 ms RTT, 5306 ms at 6 and 2134 ms
+   * at 16. Twelve is deliberately short of the knee: it is exactly twice the
+   * browser's HTTP/1.1 six-socket-per-origin limit (so an HTTP/1.1 origin is
+   * unaffected, its sockets simply stay busy), far below any HTTP/2 server's
+   * concurrent-stream setting, and measured to cost nothing on a bandwidth-bound
+   * link — slow-3G took 3043 ms at 6 and 2987 ms at 12 for the same work.
+   */
+  networkConcurrency: 12,
   /** Number of genes to keep ready for compute ahead of current */
   computeAheadBuffer: 50,
   /** Yield to UI every N genes processed */
@@ -88,7 +100,7 @@ const PRESETS = {
     description: 'For devices with limited RAM (< 4GB)',
     preloadCount: 20,
     memoryBudgetMB: 256,
-    networkConcurrency: 4,
+    networkConcurrency: 6,
     maxComputeInFlight: 4
   },
   /** Balanced settings for typical usage */
@@ -97,7 +109,7 @@ const PRESETS = {
     description: 'Good balance of speed and memory (4-8GB RAM)',
     preloadCount: 100,
     memoryBudgetMB: 512,
-    networkConcurrency: 6,
+    networkConcurrency: 12,
     maxComputeInFlight: 6
   },
   /** High performance settings for powerful devices */
@@ -106,7 +118,7 @@ const PRESETS = {
     description: 'Maximum speed on high-end devices (16GB+ RAM)',
     preloadCount: 200,
     memoryBudgetMB: 1024,
-    networkConcurrency: 8,
+    networkConcurrency: 16,
     maxComputeInFlight: 8
   },
   /** Maximum performance (use with caution) */
@@ -115,7 +127,7 @@ const PRESETS = {
     description: 'Aggressive settings (32GB+ RAM, may cause slowdowns)',
     preloadCount: 500,
     memoryBudgetMB: 2048,
-    networkConcurrency: 10,
+    networkConcurrency: 24,
     maxComputeInFlight: 8
   }
 };
@@ -570,7 +582,7 @@ class PerformanceConfigManager {
    * @returns {Array<{value: number, label: string, description: string, selected?: boolean}>}
    */
   getNetworkConcurrencyOptions() {
-    return [2, 4, 6, 8, 10, 20].map(value => ({
+    return [2, 4, 6, 12, 16, 24].map(value => ({
       value,
       label: `${value} parallel`,
       description: `Use exactly ${value} concurrent gene requests.`,

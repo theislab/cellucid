@@ -32,6 +32,8 @@ function bareDataLayer(state = {}) {
   layer._fieldLoadLifecycle = new AbortController();
   layer._destroyed = false;
   layer._notifications = null;
+  layer._pageVersions = null;
+  layer._pageIndexSnapshots = new Map();
   layer.getCellIndicesForPage = () => Uint32Array.of(0);
   layer.getPages = () => [{ id: 'page-1', name: 'Page 1' }];
   return layer;
@@ -293,31 +295,39 @@ test('session cache rollback cannot resurrect an older dataset after reset or de
   }
 });
 
-test('bulk observation loader failure is not converted into a sequential result', async () => {
-  const injected = new Error('injected bulk observation failure');
-  const obsManifest = {};
-  Object.defineProperty(obsManifest, 'fields', {
-    get() {
-      throw injected;
-    },
-  });
+test('observation fields load only through the DataState lease, never a second loader', async () => {
+  // `fetchBulkObsFields` used to branch on `state.obsManifest` and
+  // `state.manifestUrl` and download the fields itself. Nothing in the
+  // application ever set either key, so the branch was unreachable — and had it
+  // been reachable it would have been wrong twice over: it bypassed
+  // `DataState.ensureFieldLoaded`, which is what registers analysis as an
+  // independent lease on a shared field, and it left `field.loaded` false so
+  // every later read re-downloaded the same bytes. A state that carries both
+  // keys must still take the one load path.
+  const loadedThroughLease = [];
   const layer = bareDataLayer({
     manifestUrl: 'https://example.test/obs_manifest.json',
-    obsManifest,
+    obsManifest: {
+      fields: [{ key: 'score', kind: 'continuous', valuesPath: 'score.f32' }],
+    },
   });
-  let sequentialCalls = 0;
-  layer._loadObsFieldsSequentially = async () => {
-    sequentialCalls++;
+  layer.getAvailableVariables = type => (
+    type === 'continuous_obs' ? [{ key: 'score' }] : []
+  );
+  layer.ensureObsFieldLoaded = async fieldKey => {
+    loadedThroughLease.push(fieldKey);
+    return { fieldIndex: 0, kind: 'continuous', values: Float32Array.of(4.5) };
   };
 
-  await assert.rejects(
-    layer.fetchBulkObsFields({
-      pageIds: ['page-1'],
-      obsFields: ['cell_type'],
-    }),
-    error => error === injected,
-  );
-  assert.equal(sequentialCalls, 0);
+  const result = await layer.fetchBulkObsFields({
+    pageIds: ['page-1'],
+    obsFields: ['score'],
+    subsetPages: false,
+    includeCategoricalValues: false,
+  });
+
+  assert.deepEqual(loadedThroughLease, ['score']);
+  assert.equal(result.stats.fieldsLoaded, 1);
 });
 
 test('sequential loaders propagate the first required scientific input failure', async t => {
@@ -356,7 +366,7 @@ test('sequential loaders propagate the first required scientific input failure',
     let publications = 0;
 
     await assert.rejects(
-      layer._loadObsFieldsSequentially(
+      layer._loadObsFieldsConcurrently(
         ['score'],
         undefined,
         () => {
@@ -729,35 +739,15 @@ test('DataLayer rejects scientific index and category-code substitution', async 
 });
 
 test('bulk observation projection rejects out-of-range page membership', async t => {
-  const previousFetch = globalThis.fetch;
-  t.after(() => {
-    globalThis.fetch = previousFetch;
-  });
-
   await t.test('continuous field', async () => {
-    globalThis.fetch = async () => new Response(
-      Float32Array.of(4.5).buffer,
-      {
-        status: 200,
-        headers: {
-          'Content-Type': 'application/octet-stream',
-          'Content-Length': '4',
-        },
-      },
+    const layer = bareDataLayer();
+    layer.getAvailableVariables = type => (
+      type === 'continuous_obs' ? [{ key: 'score' }] : []
     );
-    const layer = bareDataLayer({
-      manifestUrl: 'https://example.test/obs_manifest.json',
-      obsManifest: {
-        fields: [{
-          key: 'score',
-          kind: 'continuous',
-          valuesPath: 'score.f32',
-          valuesDtype: 'float32',
-          quantized: false,
-          centroids: null,
-          outlierQuantilesPath: null,
-        }],
-      },
+    layer.ensureObsFieldLoaded = async () => ({
+      fieldIndex: 0,
+      kind: 'continuous',
+      values: Float32Array.of(4.5),
     });
     layer.getCellIndicesForPage = () => [1];
 
@@ -771,32 +761,16 @@ test('bulk observation projection rejects out-of-range page membership', async t
   });
 
   await t.test('categorical field', async () => {
-    globalThis.fetch = async () => new Response(
-      Uint16Array.of(0).buffer,
-      {
-        status: 200,
-        headers: {
-          'Content-Type': 'application/octet-stream',
-          'Content-Length': '2',
-        },
-      },
+    const layer = bareDataLayer();
+    layer.getAvailableVariables = type => (
+      type === 'categorical_obs' ? [{ key: 'cell_type' }] : []
     );
-    const layer = bareDataLayer({
-      manifestUrl: 'https://example.test/obs_manifest.json',
-      obsManifest: {
-        fields: [{
-          key: 'cell_type',
-          kind: 'category',
-          categories: ['T cell'],
-          codesPath: 'cell-type.u16',
-          codesDtype: 'uint16',
-          codesMissingValue: 65_535,
-          outlierQuantilesPath: null,
-          outlierDtype: null,
-          outlierQuantized: false,
-          centroidsByDim: {},
-        }],
-      },
+    layer.ensureObsFieldLoaded = async () => ({
+      fieldIndex: 0,
+      kind: 'category',
+      codes: Uint16Array.of(0),
+      categories: ['T cell'],
+      colors: {},
     });
     layer.getCellIndicesForPage = () => [1];
 

@@ -49,6 +49,9 @@ function metadata(defaultField = null) {
   };
 }
 
+// Exactly what BaseAnnDataAdapter.finalizeDirectIdentity() publishes: the
+// public direct-AnnData identity declares `files`, never `obsm_keys`, so the
+// runtime metadata shape is identical to a prepared export's.
 function directMetadata() {
   return {
     default_field: 'velocity_umap',
@@ -58,7 +61,7 @@ function directMetadata() {
         basis: 'umap',
         available_dimensions: [2],
         default_dimension: 2,
-        obsm_keys: { '2d': 'velocity_umap_2d' },
+        files: { '2d': 'vectors/0_2d.bin' },
       },
     },
   };
@@ -137,7 +140,53 @@ test('vector manager requires the sole exact constructor and metadata shape', ()
       },
       dimensionManager: dimensionManager(),
     }),
-    /unsupported key "components"/
+    /unsupported field 'components'/
+  );
+  // "files" is the only path map the format has. An `obsm_keys` entry is not a
+  // looser alternative spelling of it: the direct-AnnData adapter keeps its
+  // obsm resolution private and publishes `files` like every other producer.
+  assert.throws(
+    () => new VectorFieldManager({
+      baseUrl: 'h5ad://vector-direct/',
+      vectorFieldsMetadata: {
+        default_field: null,
+        fields: {
+          alpha_umap: {
+            label: 'Alpha',
+            basis: 'umap',
+            available_dimensions: [2],
+            default_dimension: 2,
+            obsm_keys: { '2d': 'alpha_umap_2d' },
+          },
+        },
+      },
+      dimensionManager: dimensionManager(),
+    }),
+    /missing required field 'files'/
+  );
+  // default_dimension is the largest advertised dimension, not merely one of
+  // them, exactly as the local prepared-export reader has always required.
+  assert.throws(
+    () => new VectorFieldManager({
+      baseUrl: 'https://example.test/dataset/',
+      vectorFieldsMetadata: {
+        default_field: null,
+        fields: {
+          alpha_umap: {
+            label: 'Alpha',
+            basis: 'umap',
+            available_dimensions: [2, 3],
+            default_dimension: 2,
+            files: {
+              '2d': 'vectors/0_2d.bin',
+              '3d': 'vectors/0_3d.bin',
+            },
+          },
+        },
+      },
+      dimensionManager: dimensionManager(),
+    }),
+    /default_dimension must be the largest advertised dimension/
   );
 });
 
@@ -220,13 +269,19 @@ test('non-finite vector payloads fail instead of being replaced', async () => {
       vectorFieldsMetadata: metadata(null),
       dimensionManager: dimensionManager(),
     });
+    // A fetched vector payload is now refused at the shared Float32 decode
+    // boundary in data-loaders.js, which every non-AnnData protocol passes
+    // through, so the rejection names the file and the offending flat index
+    // and happens before any component is scaled. The per-component check in
+    // _loadExactField() still owns the direct-AnnData branch, which never
+    // reaches that decode boundary.
     await assert.rejects(
       manager.loadField(
         'alpha_umap',
         2,
         { showProgress: false }
       ),
-      /non-finite value at cell 0, component 0/
+      /alpha_umap_2d\.bin: position 0 is not a finite Float32 value/
     );
   } finally {
     globalThis.fetch = originalFetch;

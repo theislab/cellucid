@@ -4,14 +4,12 @@
  * Core selection components for analysis:
  * - Variable selector (categorical/continuous obs fields)
  * - Gene expression selector (searchable dropdown)
- * - Page selector (multi-select with color customization)
+ * - Page comparison selector (exactly two pages, for DE)
  * - Plot type selector
  */
 
 import { getPageColor } from '../../core/plugin-contract.js';
-import { NONE_VALUE, getCellCountForPage } from '../../shared/dom-utils.js';
-import { formatCount } from '../../shared/formatting.js';
-import { deriveRestOfColor } from '../../shared/color-utils.js';
+import { NONE_VALUE } from '../../shared/dom-utils.js';
 import { expandPagesWithDerived } from '../../shared/page-derivation-utils.js';
 import { StyleManager } from '../../../../utils/style-manager.js';
 
@@ -127,20 +125,34 @@ export function createGeneExpressionSelector(options = {}) {
   const wrapper = document.createElement('div');
   wrapper.className = 'searchable-dropdown';
 
-  // Search input - styled like obs-select
+  // Search input - styled like obs-select.
+  // The list used to be driven by `mousedown` alone: no Enter, no Escape, no
+  // arrow keys and no combobox semantics, so picking a gene for an analysis was
+  // impossible without a pointer.
   const input = document.createElement('input');
   input.type = 'text';
   input.id = `${id}-search`;
   input.className = 'obs-select gene-search-input';
   input.placeholder = 'None';
   input.autocomplete = 'off';
+  input.setAttribute('role', 'combobox');
+  input.setAttribute('aria-autocomplete', 'list');
+  input.setAttribute('aria-expanded', 'false');
+  input.setAttribute('aria-controls', `${id}-dropdown`);
+  if (!label) input.setAttribute('aria-label', 'Gene expression');
 
   // Dropdown list
   const dropdown = document.createElement('div');
   dropdown.id = `${id}-dropdown`;
   dropdown.className = 'dropdown-list';
+  dropdown.setAttribute('role', 'listbox');
+  dropdown.setAttribute('aria-label', 'Gene expression options');
 
   let currentSelectedGene = selectedValue;
+  /** Index into `optionElements` that Enter would commit, or -1. */
+  let activeIndex = -1;
+  /** @type {HTMLElement[]} */
+  let optionElements = [];
 
   const updateSelectedDisplay = () => {
     if (currentSelectedGene) {
@@ -152,23 +164,67 @@ export function createGeneExpressionSelector(options = {}) {
     }
   };
 
+  const isOpen = () => dropdown.style.display === 'block';
+
+  const setActiveIndex = (nextIndex) => {
+    activeIndex = nextIndex;
+    optionElements.forEach((element, index) => {
+      const active = index === activeIndex;
+      element.classList.toggle('selected', active);
+      element.setAttribute('aria-selected', active ? 'true' : 'false');
+    });
+    if (activeIndex < 0) {
+      input.removeAttribute('aria-activedescendant');
+      return;
+    }
+    const active = optionElements[activeIndex];
+    input.setAttribute('aria-activedescendant', active.id);
+    active.scrollIntoView({ block: 'nearest' });
+  };
+
+  const commit = (gene) => {
+    currentSelectedGene = gene;
+    closeDropdown();
+    updateSelectedDisplay();
+    if (onChange) onChange(gene);
+  };
+
+  function closeDropdown() {
+    dropdown.style.display = 'none';
+    input.setAttribute('aria-expanded', 'false');
+    input.removeAttribute('aria-activedescendant');
+    activeIndex = -1;
+  }
+
+  const openDropdown = () => {
+    dropdown.style.display = 'block';
+    input.setAttribute('aria-expanded', 'true');
+  };
+
   const renderOptions = (filter = '') => {
     dropdown.innerHTML = '';
+    optionElements = [];
+    activeIndex = -1;
 
-    // Add "None" option at the top to clear selection
-    const noneItem = document.createElement('div');
-    noneItem.className = 'dropdown-item';
-    noneItem.textContent = 'None';
-    noneItem.classList.add('text-tertiary');
-    noneItem.addEventListener('mousedown', (e) => {
-      e.preventDefault();
-      currentSelectedGene = '';
-      dropdown.style.display = 'none';
-      input.blur();
-      updateSelectedDisplay();
-      if (onChange) onChange('');
-    });
-    dropdown.appendChild(noneItem);
+    const addOption = (key, text, extraClass) => {
+      const item = document.createElement('div');
+      item.className = `dropdown-item${extraClass ? ` ${extraClass}` : ''}`;
+      item.id = `${id}-option-${optionElements.length}`;
+      item.setAttribute('role', 'option');
+      item.setAttribute('aria-selected', 'false');
+      item.dataset.optionKey = key;
+      item.textContent = text;
+      item.addEventListener('mousedown', (e) => {
+        e.preventDefault();
+        commit(key);
+      });
+      dropdown.appendChild(item);
+      optionElements.push(item);
+      return item;
+    };
+
+    // "None" clears the selection.
+    addOption('', 'None', 'text-tertiary');
 
     const lowerFilter = filter.toLowerCase();
     // Don't filter if the input shows the current selection
@@ -183,26 +239,20 @@ export function createGeneExpressionSelector(options = {}) {
       empty.textContent = 'No matches';
       empty.classList.add('text-tertiary');
       empty.style.fontStyle = 'italic';
+      empty.setAttribute('role', 'option');
+      empty.setAttribute('aria-disabled', 'true');
+      empty.setAttribute('aria-selected', 'false');
       dropdown.appendChild(empty);
       return;
     }
 
-    filtered.forEach(g => {
-      const item = document.createElement('div');
-      item.className = 'dropdown-item' + (g.key === currentSelectedGene ? ' selected' : '');
-      item.textContent = g.key;
-
-      item.addEventListener('mousedown', (e) => {
-        e.preventDefault();
-        currentSelectedGene = g.key;
-        dropdown.style.display = 'none';
-        input.blur();
-        updateSelectedDisplay();
-        if (onChange) onChange(g.key);
-      });
-
-      dropdown.appendChild(item);
-    });
+    for (const g of filtered) {
+      addOption(g.key, g.key);
+    }
+    const currentIndex = optionElements.findIndex(
+      item => item.dataset.optionKey === currentSelectedGene
+    );
+    setActiveIndex(currentIndex >= 0 ? currentIndex : 0);
   };
 
   input.addEventListener('focus', () => {
@@ -211,18 +261,57 @@ export function createGeneExpressionSelector(options = {}) {
       input.value = '';
     }
     renderOptions('');
-    dropdown.style.display = 'block';
+    openDropdown();
   });
 
   input.addEventListener('input', () => {
     renderOptions(input.value);
-    dropdown.style.display = 'block';
+    openDropdown();
+  });
+
+  input.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') {
+      if (!isOpen()) return;
+      event.preventDefault();
+      closeDropdown();
+      updateSelectedDisplay();
+      return;
+    }
+    if (event.key === 'Enter') {
+      if (!isOpen() || activeIndex < 0) return;
+      event.preventDefault();
+      commit(optionElements[activeIndex].dataset.optionKey);
+      return;
+    }
+    if (
+      event.key !== 'ArrowDown' &&
+      event.key !== 'ArrowUp' &&
+      event.key !== 'Home' &&
+      event.key !== 'End'
+    ) {
+      return;
+    }
+    event.preventDefault();
+    if (!isOpen()) {
+      renderOptions(input.value);
+      openDropdown();
+      return;
+    }
+    if (optionElements.length === 0) return;
+    const last = optionElements.length - 1;
+    if (event.key === 'Home') setActiveIndex(0);
+    else if (event.key === 'End') setActiveIndex(last);
+    else if (event.key === 'ArrowDown') {
+      setActiveIndex(activeIndex >= last ? 0 : activeIndex + 1);
+    } else {
+      setActiveIndex(activeIndex <= 0 ? last : activeIndex - 1);
+    }
   });
 
   input.addEventListener('blur', () => {
     // Small delay to allow mousedown on items to fire
     requestAnimationFrame(() => {
-      dropdown.style.display = 'none';
+      closeDropdown();
       // Restore selected value display
       updateSelectedDisplay();
     });
@@ -248,195 +337,6 @@ export function createGeneExpressionSelector(options = {}) {
     currentSelectedGene = gene;
     updateSelectedDisplay();
   };
-
-  return container;
-}
-
-// =============================================================================
-// PAGE SELECTOR
-// =============================================================================
-
-/**
- * Create page selector that MATCHES the highlight module tabs style exactly
- * Uses the same .highlight-page-tab styling with colors, names, counts
- * Includes color picker for each page
- * @param {Object} options
- * @param {Object[]} options.pages - Array of page objects { id, name, highlightedGroups }
- * @param {string[]} options.selectedIds - Currently selected page IDs
- * @param {Function} options.onChange - Callback when selection changes
- * @param {Function} options.onColorChange - Callback when color changes (pageId, color)
- * @param {Map} options.customColors - Map of pageId -> custom color
- * @returns {HTMLElement}
- */
-export function createPageSelector(options = {}) {
-  const {
-    pages = [],
-    selectedIds = [],
-    onChange,
-    onColorChange,
-    customColors = new Map(),
-    includeDerivedPages = false,
-    getCellCountForPageId = null
-  } = options;
-
-  const container = document.createElement('div');
-  container.className = 'control-block analysis-page-selector';
-
-  const label = document.createElement('label');
-  label.textContent = 'Compare pages:';
-  container.appendChild(label);
-
-  if (pages.length === 0) {
-    const empty = document.createElement('div');
-    empty.className = 'legend-help';
-    empty.textContent = 'Create highlight pages first using the Highlighted Cells section above.';
-    container.appendChild(empty);
-    return container;
-  }
-
-  const helpText = document.createElement('div');
-  helpText.className = 'legend-help';
-  helpText.textContent = 'Click pages to select. Click color to customize.';
-  container.appendChild(helpText);
-
-  // Create tabs container matching highlight module exactly
-  const tabsContainer = document.createElement('div');
-  tabsContainer.className = 'analysis-page-tabs';
-
-  const baseIndexById = new Map();
-  pages.forEach((p, idx) => {
-    if (p?.id) baseIndexById.set(p.id, idx);
-  });
-
-  const displayPages = includeDerivedPages
-    ? expandPagesWithDerived(pages, { includeRestOf: true })
-    : pages;
-
-  let selected = new Set(selectedIds);
-
-  const renderTabs = () => {
-    tabsContainer.innerHTML = '';
-
-    displayPages.forEach((page, index) => {
-      const isSelected = selected.has(page.id);
-      const derived = page?._derived || null;
-      const baseId = derived?.baseId || page.id;
-      const baseIndex = baseIndexById.get(baseId) ?? index;
-
-      const cellCount = typeof getCellCountForPageId === 'function'
-        ? getCellCountForPageId(page.id)
-        : getCellCountForPage(page);
-
-      const basePage = pages.find((p) => p.id === baseId) || null;
-      const baseColor = basePage?.color || customColors.get(baseId) || getPageColor(baseIndex);
-      const defaultColor = derived?.kind === 'rest_of'
-        ? deriveRestOfColor(baseColor)
-        : baseColor;
-
-      const currentColor = page?.color || customColors.get(page.id) || defaultColor;
-
-      const tab = document.createElement('div');
-      tab.className = 'analysis-page-tab' +
-        (derived ? ' derived' : '') +
-        (isSelected ? ' selected' : '');
-      tab.dataset.pageId = page.id;
-
-      // Color swatch container (rectangular, matching categorical obs legend style)
-      const colorIndicator = document.createElement('span');
-      colorIndicator.className = 'analysis-page-color';
-      StyleManager.setVariable(colorIndicator, '--analysis-page-color', currentColor);
-      colorIndicator.title = 'Click to change color';
-
-      // Color picker input (overlays the swatch)
-      const colorInput = document.createElement('input');
-      colorInput.type = 'color';
-      colorInput.className = 'analysis-page-color-input';
-      colorInput.value = currentColor;
-      colorInput.title = 'Click to change color';
-      colorInput.addEventListener('input', (e) => {
-        const newColor = e.target.value;
-        customColors.set(page.id, newColor);
-        StyleManager.setVariable(colorIndicator, '--analysis-page-color', newColor);
-        if (onColorChange) onColorChange(page.id, newColor);
-      });
-      colorInput.addEventListener('click', (e) => {
-        e.stopPropagation(); // Prevent tab selection toggle
-      });
-
-      // Nest input inside swatch for proper absolute positioning
-      colorIndicator.appendChild(colorInput);
-      tab.appendChild(colorIndicator);
-
-      const nameSpan = document.createElement('span');
-      nameSpan.className = 'analysis-page-name';
-      nameSpan.textContent = page.name;
-      nameSpan.title = page.name;
-      tab.appendChild(nameSpan);
-
-      const countSpan = document.createElement('span');
-      countSpan.className = 'analysis-page-count';
-      countSpan.textContent = cellCount > 0 ? formatCount(cellCount) : '(0)';
-      tab.appendChild(countSpan);
-
-      // Click to toggle selection (but not on color indicator)
-      tab.addEventListener('click', () => {
-        if (selected.has(page.id)) {
-          selected.delete(page.id);
-        } else {
-          // Ensure derived pages get a stable default color for plotting.
-          if (derived && !customColors.has(page.id)) {
-            customColors.set(page.id, currentColor);
-          }
-          selected.add(page.id);
-        }
-        renderTabs();
-        if (onChange) onChange(Array.from(selected));
-      });
-
-      tabsContainer.appendChild(tab);
-    });
-
-    // Add "Select All" / "Clear" buttons
-    const actionsRow = document.createElement('div');
-    actionsRow.className = 'analysis-page-actions';
-
-    if (pages.length > 1) {
-      const selectAllBtn = document.createElement('button');
-      selectAllBtn.type = 'button';
-      selectAllBtn.className = 'btn-small';
-      const baseIds = pages.map(p => p.id);
-      const allBaseSelected = baseIds.length > 0 && baseIds.every(id => selected.has(id));
-      selectAllBtn.textContent = (allBaseSelected && selected.size > 0) ? 'Deselect All' : 'Select All';
-      selectAllBtn.addEventListener('click', (e) => {
-        e.stopPropagation();
-        if (allBaseSelected) {
-          // Clear all (including derived selections) to match user expectations.
-          selected.clear();
-        } else {
-          // Only select base pages to avoid accidentally selecting huge complements.
-          for (const id of baseIds) selected.add(id);
-        }
-        renderTabs();
-        if (onChange) onChange(Array.from(selected));
-      });
-      actionsRow.appendChild(selectAllBtn);
-    }
-
-    tabsContainer.appendChild(actionsRow);
-  };
-
-  renderTabs();
-  container.appendChild(tabsContainer);
-
-  // Store reference for external update
-  container._updateSelection = (newIds) => {
-    selected = new Set(newIds);
-    renderTabs();
-  };
-
-  container._getSelection = () => Array.from(selected);
-
-  container._getCustomColors = () => new Map(customColors);
 
   return container;
 }
@@ -635,6 +535,9 @@ export function createPageComparisonSelector(options = {}) {
 
     const select = document.createElement('select');
     select.className = 'obs-select page-select';
+    // `page-comparison-label` used to be a <span>, which named nothing: both
+    // comparison dropdowns reached the accessibility tree anonymous.
+    select.setAttribute('aria-label', labelText.replace(/:$/, ''));
 
     const addOption = (page, parent) => {
       const option = document.createElement('option');
@@ -795,7 +698,6 @@ export default {
   PlotRegistry,
   createVariableSelector,
   createGeneExpressionSelector,
-  createPageSelector,
   createPageComparisonSelector,
   createPlotTypeSelector
 };

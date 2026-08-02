@@ -33,6 +33,8 @@
  * manager.onPageSelectionChange(pageIds);
  */
 
+import { selectablePageIdSet } from '../shared/page-derivation-utils.js';
+
 function createOwnedOperation(assign, operation) {
   let rejectOperation;
   let resolveOperation;
@@ -238,14 +240,29 @@ export class AnalysisUIManager {
           (typeof container !== 'object' && typeof container !== 'function') ||
           container.classList === null ||
           typeof container.classList !== 'object' ||
-          typeof container.classList.add !== 'function'
+          typeof container.classList.add !== 'function' ||
+          typeof container.setAttribute !== 'function'
         ) {
           throw new TypeError(
-            `Analysis container "${id}" must expose a usable classList`
+            `Analysis container "${id}" must expose a usable classList and setAttribute`
           );
         }
-        container.id = `${id}-analysis-container`;
+        // The host markup owns the container id when it has one, because that
+        // id is the target of the accordion header's `aria-controls`.
+        // Overwriting it left every header pointing at a element that does not
+        // exist.
+        if (typeof container.id !== 'string' || container.id.length === 0) {
+          container.id = `${id}-analysis-container`;
+        }
         container.classList.add(`${id}-analysis-panel`, 'analysis-panel');
+        // Analysis panels are built lazily, so the `id`-bearing controls they
+        // contain appear and disappear with the accordion the user happens to
+        // have open. The session UI-control contributor requires an exact,
+        // stable inventory, so a session captured with one analysis panel open
+        // could not be restored with another open. Analysis settings travel in
+        // the analysis-window contributor instead, which is why the floating
+        // copies already carry this attribute.
+        container.setAttribute('data-state-serializer-skip', 'true');
       } else {
         console.warn(`[AnalysisUIManager] No container available for mode: ${id}`);
         continue;
@@ -373,7 +390,13 @@ export class AnalysisUIManager {
     if (!Array.isArray(pages)) {
       throw new TypeError('Analysis manager page inventory must be an array');
     }
-    const availablePageIds = new Set(pages.map(page => page.id));
+    // Every analysis page selector offers the derived "Rest of X" pages
+    // alongside the base pages, so selecting one has to be a valid selection
+    // here too. Validating against the base pages alone made choosing "Rest of
+    // Page 1" in Detailed analysis throw `page "restof__page_1" was not found`.
+    // This selection is then handed to whichever mode becomes active, so the
+    // per-UI validators resolve the same domain from the same function.
+    const availablePageIds = selectablePageIdSet(pages);
     const nextPages = [];
     const seenPageIds = new Set();
     for (const pageId of pageIds) {

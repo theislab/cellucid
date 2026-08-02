@@ -96,12 +96,34 @@ export function expandPagesWithDerived(pages, options = {}) {
   return expanded;
 }
 
+/**
+ * The page IDs an analysis accepts as a selection.
+ *
+ * `AnalysisUIManager` holds one page selection shared by every analysis mode,
+ * and every page selector offers the derived "Rest of X" pages alongside the
+ * base ones — so a mode that derived a narrower domain of its own rejected a
+ * page the shared selection had already accepted. Differential Expression and
+ * Marker Genes own no page selector at all, so their validators fell back to
+ * the base inventory and threw `page "restof__page_1" was not found` the moment
+ * a rest-of page selected in another mode was handed to them on a mode switch.
+ * There is one domain, and it is this function.
+ *
+ * @param {Array<{id: string, name: string}>} pages - The base page inventory.
+ * @returns {Set<string>}
+ */
+export function selectablePageIdSet(pages) {
+  return new Set(
+    expandPagesWithDerived(pages, { includeRestOf: true }).map(page => page.id)
+  );
+}
+
 export default {
   REST_OF_PAGE_PREFIX,
   createRestOfPageId,
   isRestOfPageId,
   getBasePageIdFromRestOf,
   getRestOfPageName,
-  expandPagesWithDerived
+  expandPagesWithDerived,
+  selectablePageIdSet
 };
 

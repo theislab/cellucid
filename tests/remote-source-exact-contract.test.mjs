@@ -722,6 +722,83 @@ test('remote JSON endpoints require exact HTTP and media-type success', async t 
   );
 });
 
+function streamingResponse(chunks, { failure = null } = {}) {
+  const encoder = new TextEncoder();
+  return new Response(
+    new ReadableStream({
+      start(controller) {
+        for (const chunk of chunks) {
+          controller.enqueue(encoder.encode(chunk));
+        }
+        if (failure === null) {
+          controller.close();
+        } else {
+          controller.error(failure);
+        }
+      },
+    }),
+    { status: 200, headers: { 'Content-Type': 'application/json' } }
+  );
+}
+
+test('a remote body failure is reported by its own cause, never as bad JSON', async t => {
+  // A response body can fail in ways that are not the server sending malformed
+  // data: the reader can be cancelled, the connection can drop mid-transfer, or
+  // the payload can be refused for exceeding its ceiling. Reporting all of them
+  // as "must contain valid JSON" tells the user the server is broken when it is
+  // not, and hides their own cancellation entirely.
+  const cases = [
+    {
+      name: 'malformed JSON is the only INVALID_FORMAT',
+      failure: null,
+      chunks: ['{"status": "ok",'],
+      expect: error => (
+        error.code === 'INVALID_FORMAT' &&
+        /must contain valid JSON/i.test(error.message)
+      ),
+    },
+    {
+      name: 'a dropped transfer is a network error',
+      failure: new TypeError('network connection was lost'),
+      chunks: ['{"status": '],
+      expect: error => (
+        error.code === 'NETWORK_ERROR' &&
+        /body transfer failed/i.test(error.message) &&
+        !/must contain valid JSON/i.test(error.message)
+      ),
+    },
+    {
+      name: 'a cancelled read stays a cancellation',
+      failure: Object.assign(new Error('reader was cancelled'), {
+        name: 'AbortError',
+      }),
+      chunks: ['{"status": '],
+      expect: error => (
+        error.name === 'AbortError' &&
+        !/must contain valid JSON/i.test(error.message)
+      ),
+    },
+  ];
+
+  for (const testCase of cases) {
+    await t.test(testCase.name, async subTest => {
+      installFetch(subTest, url => {
+        if (!url.endsWith('/_cellucid/health')) {
+          return jsonResponse({}, 404);
+        }
+        return streamingResponse(testCase.chunks, {
+          failure: testCase.failure,
+        });
+      });
+      const source = new RemoteDataSource();
+      await assert.rejects(
+        source.connect({ url: 'http://127.0.0.1:8765' }),
+        testCase.expect
+      );
+    });
+  }
+});
+
 test('disconnected dataset operations fail instead of reporting empty success', async () => {
   const source = new RemoteDataSource();
   await assert.rejects(source.listDatasets(), /active connection/i);

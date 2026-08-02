@@ -408,6 +408,29 @@ export class HighlightRenderer {
       light: { scale: 1.70, ringWidth: 0.44, haloStrength: 0.60, haloShape: 0.0, ringStyle: 1.0 },
       ultralight: { scale: 1.65, ringWidth: 0.46, haloStrength: 0.55, haloShape: 0.35, ringStyle: 2.0 }
     };
+
+    // The reported GPU total is only useful if it describes the whole context,
+    // and these per-view buffers are the second largest allocation in it.
+    this._gpuAllocationReporter = (add) => this.collectGpuAllocations(add);
+    hpRenderer?.registerGpuAllocationReporter?.(this._gpuAllocationReporter);
+  }
+
+  _releaseGpuAllocationReporter() {
+    this.hpRenderer?.unregisterGpuAllocationReporter?.(
+      this._gpuAllocationReporter
+    );
+    this._gpuAllocationReporter = null;
+  }
+
+  /**
+   * Tell the memory inventory that this renderer's accepted bytes moved.
+   *
+   * Called from exactly the two places `gpuByteLength` changes, so the figure
+   * the stats display and the benchmark panel read is current without either
+   * recomputing on every read or walking anything dataset-sized.
+   */
+  _publishGpuAllocationChange() {
+    this.hpRenderer?.notifyGpuAllocationsChanged?.();
   }
 
   setQuality(quality) {
@@ -520,11 +543,20 @@ export class HighlightRenderer {
   /**
    * Directly set the highlighted indices cache (avoids O(n) full-array scan).
    * Call this when you already know which indices are highlighted (e.g., from state.js groups).
-   * @param {number[]} indices - Array of highlighted cell indices
+   *
+   * Both the index list and `highlightData` are adopted by reference. That is
+   * the same ownership rule the caller-owned `Uint8Array` has always followed:
+   * `updateHighlight` is the exact mutation boundary, and a publication that
+   * changes the set publishes a new list rather than editing the accepted one.
+   * Copying the list here instead would allocate a second whole-dataset array
+   * on every apply for no additional protection.
+   *
+   * @param {number[]|Uint32Array} indices - Highlighted cell indices, validated
+   *   by the caller and not mutated after publication.
    * @param {Uint8Array} highlightData - Reference to the highlight data array
    */
   setHighlightedIndicesCache(indices, highlightData) {
-    this._highlightedIndicesCache = indices.slice();
+    this._highlightedIndicesCache = indices;
     this._highlightDataRef = highlightData;
     this._highlightDataVersion++;
   }
@@ -536,6 +568,10 @@ export class HighlightRenderer {
       drawFailure: null,
       failedPublication: null,
       geometryGeneration: 0,
+      // Byte length of the accepted GPU data store, tracked separately from
+      // `pointCount` because a failed publication revokes the draw count while
+      // deliberately retaining the allocation for a later retry.
+      gpuByteLength: 0,
       highlightGeneration: -1,
       lodMembership: null,
       pointCount: 0,
@@ -543,6 +579,36 @@ export class HighlightRenderer {
       transparencyGeneration: -1,
       vertexArray: null,
     };
+  }
+
+  /**
+   * Report every GPU data store this renderer owns to a memory inventory.
+   *
+   * The highlight buffers are per view and hold sixteen bytes for every
+   * selected and visible cell, which at whole-dataset selections is the largest
+   * single allocation in the context after the interleaved point buffer. They
+   * are reported here because `HighPerfRenderer._refreshGpuMemoryStats` — which
+   * feeds `stats.gpuMemoryMB`, the stats display and the benchmark panel — can
+   * only inventory handles it owns, and these are not among them.
+   *
+   * Retired buffers are deliberately not reported: every path that detaches one
+   * flushes the deletion inside the same synchronous operation and throws if
+   * WebGL refuses, so there is no steady state in which a retired highlight
+   * buffer is resident but unreported.
+   *
+   * @param {(handle: unknown, byteLength: number) => void} add - Inventory sink
+   *   that deduplicates by WebGL handle.
+   */
+  collectGpuAllocations(add) {
+    if (typeof add !== 'function') {
+      throw new TypeError(
+        'Highlight GPU allocation inventory requires an exact sink function.'
+      );
+    }
+    for (const viewBuffer of this._viewBuffers.values()) {
+      if (viewBuffer.buffer === null) continue;
+      add(viewBuffer.buffer, viewBuffer.gpuByteLength);
+    }
   }
 
   _queueViewResourceHandles(buffer, vertexArray) {
@@ -560,7 +626,9 @@ export class HighlightRenderer {
     // Detach the complete logical pair before either deletion can fail.
     viewBuffer.buffer = null;
     viewBuffer.vertexArray = null;
+    viewBuffer.gpuByteLength = 0;
     this._queueViewResourceHandles(buffer, vertexArray);
+    this._publishGpuAllocationChange();
   }
 
   _publicationFailureMatches(
@@ -1093,6 +1161,11 @@ export class HighlightRenderer {
     viewBuffer.drawFailure = null;
     viewBuffer.failedPublication = null;
     viewBuffer.geometryGeneration = exactGeometryGeneration;
+    // `bufferData` replaces the whole data store, so the accepted allocation is
+    // exactly the bytes just uploaded.
+    const gpuByteLengthChanged =
+      viewBuffer.gpuByteLength !== bufferData.byteLength;
+    viewBuffer.gpuByteLength = bufferData.byteLength;
     viewBuffer.highlightGeneration = this._highlightDataVersion;
     viewBuffer.lodMembership = exactMembership;
     viewBuffer.pointCount = count;
@@ -1102,6 +1175,9 @@ export class HighlightRenderer {
 
     // Recompute total count across all views for UI feedback
     this._recomputeTotalHighlightedCount();
+    // A republication at the same size is the common case during camera motion
+    // and leaves the reported total unchanged, so it is not worth an inventory.
+    if (gpuByteLengthChanged) this._publishGpuAllocationChange();
   }
 
   /**
@@ -1213,6 +1289,7 @@ export class HighlightRenderer {
   handleContextLost() {
     if (this._disposed) return false;
     this._disposeStarted = true;
+    this._releaseGpuAllocationReporter();
     this._viewBuffers.clear();
     this._pendingBufferDeletes.clear();
     this._pendingVertexArrayDeletes.clear();
@@ -1237,6 +1314,7 @@ export class HighlightRenderer {
 
     if (!this._disposeStarted) {
       this._disposeStarted = true;
+      this._releaseGpuAllocationReporter();
 
       // Detach the complete live publication before the first fallible GL
       // operation. Pending sets remain authoritative across disposal retries.
@@ -2168,9 +2246,10 @@ export class HighlightTools {
    * in another view. This ensures consistent behavior across main and snapshot views.
    *
    * @param {Uint8Array} highlightData - Highlight intensity per point (0-255)
-   * @param {number[]} [highlightedIndices] - Optional pre-computed array of highlighted cell indices.
-   *   If provided, skips the expensive O(n) full-array scan. Pass this when you already know
-   *   which cells are highlighted (e.g., from state.js highlight groups).
+   * @param {number[]|Uint32Array} [highlightedIndices] - Optional pre-computed
+   *   list of highlighted cell indices. If provided, skips the expensive O(n)
+   *   full-array scan. Pass this when you already know which cells are
+   *   highlighted (e.g., from state.js highlight groups).
    */
   updateHighlight(highlightData, highlightedIndices = null) {
     this.highlightArray = requireHighlightData(highlightData);
@@ -2178,19 +2257,32 @@ export class HighlightTools {
     // If pre-computed indices provided, set cache directly (avoids O(n) scan)
     // Otherwise, invalidate cache to trigger scan on next rebuildBuffer
     if (highlightedIndices !== null) {
-      if (
-        !Array.isArray(highlightedIndices) ||
-        highlightedIndices.some(
-          (index) =>
-            !Number.isInteger(index) ||
-            index < 0 ||
-            index >= highlightData.length ||
-            highlightData[index] < MIN_VISIBLE_ALPHA_BYTE
-        )
-      ) {
+      // An indexed loop rather than `.some()`: this validates every cell of a
+      // selection that can be the whole dataset, so it must not allocate a
+      // closure result per element, and it must visit array holes rather than
+      // skipping them the way the callback iterators do -- an unset entry
+      // reaches the packer as `undefined` and produces a NaN vertex.
+      const typedIndices = highlightedIndices instanceof Uint32Array;
+      if (!typedIndices && !Array.isArray(highlightedIndices)) {
         throw new RangeError(
           'Highlighted indices must be an array of valid highlight-data indices.'
         );
+      }
+      const dataLength = highlightData.length;
+      for (let i = 0; i < highlightedIndices.length; i++) {
+        const index = highlightedIndices[i];
+        // A Uint32Array entry is a non-negative integer by construction; the
+        // remaining bounds are checked identically for both shapes.
+        if (
+          (!typedIndices && !Number.isInteger(index)) ||
+          index < 0 ||
+          index >= dataLength ||
+          highlightData[index] < MIN_VISIBLE_ALPHA_BYTE
+        ) {
+          throw new RangeError(
+            'Highlighted indices must be an array of valid highlight-data indices.'
+          );
+        }
       }
       this.highlightRenderer.setHighlightedIndicesCache(highlightedIndices, highlightData);
     } else {

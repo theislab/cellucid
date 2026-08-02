@@ -2,10 +2,27 @@
  * @fileoverview Rendering + volumetric smoke controls.
  *
  * Wires visualization controls (background, point size, lighting, fog, size
- * attenuation) and smoke controls (grid/quality/density/etc) to the Viewer.
+ * attenuation), the renderer controls (shader quality, adaptive LOD, forced LOD
+ * level, frustum culling, antialiasing) and smoke controls
+ * (grid/quality/density/etc) to the Viewer.
+ *
+ * Antialiasing is the one control here that does not publish to the viewer at
+ * all. It is a WebGL context-creation attribute, fixed before this module runs,
+ * so the control stores a preference and states on screen that it applies on the
+ * next load. Everything else about it — ownership, restore, rollback — follows
+ * the same rules as its neighbours.
  *
  * Also exposes a `markSmokeDirty()` hook used by the coordinator to trigger
  * debounced smoke rebuilds after visibility changes.
+ *
+ * The renderer controls arrived here late. They were wired inline at the far
+ * end of the `main.js` bootstrap, past the point where a saved session is
+ * restored — and the session serializer publishes a restored control by writing
+ * the DOM and dispatching the event its owner listens for. With no listener
+ * attached yet, every restored renderer setting stopped in the panel and the
+ * viewer never heard about it (CEL-0129). Their owner is this module, which
+ * `initUI` builds before anything is restored, so the restore reaches the
+ * viewer by the same path a click does.
  *
  * @module ui/modules/render-controls
  */
@@ -15,6 +32,7 @@ import {
   parseFiniteNumberInRange
 } from '../../utils/number-utils.js';
 import { getNotificationCenter } from '../../notification-center.js';
+import { writeAntialiasPreference } from '../core/antialias-preference.js';
 import {
   MAX_SMOKE_GRID_SIZE,
   SMOKE_GRID_SIZES,
@@ -74,8 +92,20 @@ const VIEWER_METHODS = Object.freeze([
   'setCloudResolutionScale',
   'setNoiseTextureResolution',
   'getAdaptiveScaleFactor',
-  'hasSnapshots'
+  'hasSnapshots',
+  'setShaderQuality',
+  'setAdaptiveLOD',
+  'setForceLOD',
+  'setFrustumCulling',
+  'getRequestedAntialiasing',
+  'getGrantedAntialiasing'
 ]);
+
+const SHADER_QUALITIES = Object.freeze(['full', 'light', 'ultralight']);
+
+/** The forced-LOD slider range, matching `index.html` and the renderer. */
+const FORCED_LOD_MINIMUM = -1;
+const FORCED_LOD_MAXIMUM = 17;
 
 function assertExactKeys(value, expectedKeys, label) {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
@@ -119,6 +149,56 @@ function assertEventControl(control, label) {
   ) {
     throw new TypeError(`${label} requires one current interactive DOM control.`);
   }
+}
+
+function assertToggleControl(control, label) {
+  if (
+    control === null
+    || typeof control !== 'object'
+    || typeof control.checked !== 'boolean'
+    || typeof control.addEventListener !== 'function'
+  ) {
+    throw new TypeError(`${label} requires one current checkbox control.`);
+  }
+}
+
+function assertShaderQuality(value) {
+  if (!SHADER_QUALITIES.includes(value)) {
+    throw new TypeError(
+      'Shader quality must be exactly "full", "light", or "ultralight".'
+    );
+  }
+  return value;
+}
+
+function assertForcedLodControl(control, label) {
+  assertEventControl(control, label);
+  if (
+    control.min !== String(FORCED_LOD_MINIMUM)
+    || control.max !== String(FORCED_LOD_MAXIMUM)
+    || control.step !== '1'
+  ) {
+    throw new TypeError(
+      `${label} requires exact range attributes min="${FORCED_LOD_MINIMUM}", `
+      + `max="${FORCED_LOD_MAXIMUM}", step="1".`
+    );
+  }
+  return assertForcedLodLevel(control.value, label);
+}
+
+function assertForcedLodLevel(value, label) {
+  const level = Number(value);
+  if (
+    !Number.isInteger(level)
+    || level < FORCED_LOD_MINIMUM
+    || level > FORCED_LOD_MAXIMUM
+  ) {
+    throw new RangeError(
+      `${label} must be an integer from ${FORCED_LOD_MINIMUM} `
+      + `through ${FORCED_LOD_MAXIMUM}.`
+    );
+  }
+  return level;
 }
 
 function assertContainer(control, label) {
@@ -300,7 +380,15 @@ export function initRenderControls(options) {
     cloudResolutionInput,
     cloudResolutionDisplay,
     noiseResolutionInput,
-    noiseResolutionDisplay
+    noiseResolutionDisplay,
+    hpShaderQualitySelect,
+    hpLodEnabledCheckbox,
+    hpLodForceInput,
+    hpLodForceContainer,
+    hpLodForceDisplay,
+    hpFrustumCullingCheckbox,
+    hpAntialiasCheckbox,
+    hpAntialiasStatus
   } = dom;
 
   assertEventControl(backgroundSelect, 'Viewer background selector');
@@ -309,6 +397,15 @@ export function initRenderControls(options) {
   assertContainer(rendererControls, 'Renderer controls');
   assertContainer(pointsControls, 'Point controls');
   assertContainer(smokeControls, 'Smoke controls');
+  assertEventControl(hpShaderQualitySelect, 'Shader quality selector');
+  assertShaderQuality(hpShaderQualitySelect.value);
+  assertToggleControl(hpLodEnabledCheckbox, 'Adaptive LOD toggle');
+  assertToggleControl(hpFrustumCullingCheckbox, 'Frustum culling toggle');
+  assertToggleControl(hpAntialiasCheckbox, 'Antialiasing toggle');
+  assertDisplay(hpAntialiasStatus, 'hpAntialiasStatus');
+  assertContainer(hpLodForceContainer, 'Forced LOD level row');
+  assertDisplay(hpLodForceDisplay, 'hpLodForceDisplay');
+  assertForcedLodControl(hpLodForceInput, 'Forced LOD level slider');
   for (const [key, label, step] of RANGE_CONTROLS) {
     readExactRange(dom[key], label, step);
   }
@@ -852,6 +949,205 @@ export function initRenderControls(options) {
       return;
     }
     applyRenderMode(requested);
+  });
+
+  // ---------------------------------------------------------------------------
+  // Renderer controls: shader quality, adaptive LOD, forced LOD, culling
+  //
+  // Publication is transactional in the viewer: a rejected change leaves the
+  // renderer's previous value authoritative, so the control returns to the last
+  // value the renderer accepted rather than keeping the one it refused. These
+  // baselines are that record, seeded from the markup defaults, which are the
+  // values the renderer is constructed with.
+  // ---------------------------------------------------------------------------
+
+  let acceptedShaderQuality = assertShaderQuality(hpShaderQualitySelect.value);
+  let acceptedFrustumEnabled = hpFrustumCullingCheckbox.checked;
+  let acceptedLodEnabled = hpLodEnabledCheckbox.checked;
+  let acceptedForcedLodValue = hpLodForceInput.value;
+
+  function formatForcedLodLevel(level) {
+    return level < 0 ? 'Auto' : String(level);
+  }
+
+  function syncForcedLodUi() {
+    hpLodForceContainer.style.display = acceptedLodEnabled ? 'block' : 'none';
+    hpLodForceDisplay.textContent = formatForcedLodLevel(
+      assertForcedLodLevel(hpLodForceInput.value, 'Forced LOD level')
+    );
+  }
+
+  function reportRendererControlFailure(control, error) {
+    const exactError = error instanceof Error ? error : new Error(String(error));
+    console.error(`[RenderControls] ${control} could not be changed:`, exactError);
+    try {
+      getNotificationCenter().error(
+        `${control} was not changed: ${exactError.message}`,
+        {
+          category: 'rendering',
+          title: 'Renderer setting unavailable'
+        }
+      );
+    } catch (notificationError) {
+      // Control state is already coherent. Notification delivery is
+      // observational and must not escape the synchronous DOM event.
+      console.error(
+        '[RenderControls] Renderer control failure notification was not delivered:',
+        notificationError
+      );
+    }
+  }
+
+  listen(hpShaderQualitySelect, 'change', () => {
+    const previousQuality = acceptedShaderQuality;
+    let requestedQuality;
+    try {
+      requestedQuality = assertShaderQuality(hpShaderQualitySelect.value);
+      viewer.setShaderQuality(requestedQuality);
+      acceptedShaderQuality = requestedQuality;
+    } catch (error) {
+      hpShaderQualitySelect.value = previousQuality;
+      reportRendererControlFailure('Shader quality', error);
+    }
+  });
+
+  listen(hpFrustumCullingCheckbox, 'change', () => {
+    const requestedEnabled = hpFrustumCullingCheckbox.checked;
+    const previousEnabled = acceptedFrustumEnabled;
+    try {
+      viewer.setFrustumCulling(requestedEnabled);
+      acceptedFrustumEnabled = requestedEnabled;
+    } catch (error) {
+      hpFrustumCullingCheckbox.checked = previousEnabled;
+      reportRendererControlFailure('Frustum culling', error);
+    }
+  });
+
+  listen(hpLodEnabledCheckbox, 'change', () => {
+    const requestedEnabled = hpLodEnabledCheckbox.checked;
+    const previousEnabled = acceptedLodEnabled;
+    const previousForcedValue = acceptedForcedLodValue;
+    let featurePublished = false;
+    try {
+      viewer.setAdaptiveLOD(requestedEnabled);
+      featurePublished = true;
+      // Enabling starts from adaptive mode. Disabling already resets the
+      // renderer's global force level as part of the atomic toggle.
+      if (requestedEnabled) viewer.setForceLOD(FORCED_LOD_MINIMUM);
+      acceptedLodEnabled = requestedEnabled;
+      acceptedForcedLodValue = String(FORCED_LOD_MINIMUM);
+      hpLodForceInput.value = acceptedForcedLodValue;
+      syncForcedLodUi();
+    } catch (error) {
+      const failures = [error];
+      if (featurePublished) {
+        try {
+          viewer.setAdaptiveLOD(previousEnabled);
+          if (previousEnabled) {
+            viewer.setForceLOD(
+              assertForcedLodLevel(previousForcedValue, 'Forced LOD level')
+            );
+          }
+        } catch (rollbackError) {
+          failures.push(rollbackError);
+        }
+      }
+      hpLodEnabledCheckbox.checked = previousEnabled;
+      hpLodForceInput.value = previousForcedValue;
+      syncForcedLodUi();
+      reportRendererControlFailure(
+        'Adaptive LOD',
+        failures.length === 1
+          ? error
+          : new AggregateError(
+            failures,
+            'Adaptive LOD publication and UI rollback failed.'
+          )
+      );
+    }
+  });
+
+  listen(hpLodForceInput, 'input', () => {
+    const previousForcedValue = acceptedForcedLodValue;
+    try {
+      const requestedLevel = assertForcedLodLevel(
+        hpLodForceInput.value,
+        'Forced LOD level'
+      );
+      viewer.setForceLOD(requestedLevel);
+      acceptedForcedLodValue = String(requestedLevel);
+      hpLodForceDisplay.textContent = formatForcedLodLevel(requestedLevel);
+    } catch (error) {
+      hpLodForceInput.value = previousForcedValue;
+      syncForcedLodUi();
+      reportRendererControlFailure('Forced LOD level', error);
+    }
+  });
+
+  // The forced-LOD row is meaningless while adaptive LOD is off — the renderer
+  // ignores the global forced level in that state — and markup cannot express
+  // "hidden unless the checkbox beside me is on".
+  syncForcedLodUi();
+
+  // ---------------------------------------------------------------------------
+  // Antialiasing
+  //
+  // The odd one out, and it says so on screen. `antialias` is a WebGL
+  // context-creation attribute, so there is no setter to call: the viewer's
+  // context already has the value it will keep, and a change reaches the GPU
+  // only through a page load. See `ui/core/antialias-preference.js` for why a
+  // live context swap is not on the table.
+  //
+  // So the control owns exactly two things — the stored preference, and telling
+  // the user the truth about when it takes effect. The comparison is always
+  // against the viewer's own record of what it was built with, never against
+  // storage, so the notice is about this page rather than about a value another
+  // tab may have written.
+  // ---------------------------------------------------------------------------
+
+  const antialiasingInForce = viewer.getRequestedAntialiasing();
+  const antialiasingGranted = viewer.getGrantedAntialiasing();
+
+  function syncAntialiasStatus() {
+    if (antialiasingInForce && !antialiasingGranted) {
+      // Asked for and refused. Saying "reload to apply" here would be a lie:
+      // reloading would ask again and be refused again.
+      hpAntialiasStatus.textContent =
+        'This browser is not providing antialiasing for this view.';
+      return;
+    }
+    hpAntialiasStatus.textContent =
+      hpAntialiasCheckbox.checked === antialiasingInForce
+        ? ''
+        : 'Saved. Reload the page to apply — the browser fixes this when it '
+          + 'creates the drawing buffer.';
+  }
+
+  // The markup default is "on", which is also the preference default, but the
+  // viewer was built from whatever was stored. Seeding from the viewer is what
+  // stops a reloaded page showing a ticked box over an unantialiased canvas.
+  hpAntialiasCheckbox.checked = antialiasingInForce;
+  let acceptedAntialiasPreference = antialiasingInForce;
+  syncAntialiasStatus();
+
+  listen(hpAntialiasCheckbox, 'change', () => {
+    const requested = hpAntialiasCheckbox.checked;
+    const previous = acceptedAntialiasPreference;
+    try {
+      writeAntialiasPreference(localStorage, requested);
+      acceptedAntialiasPreference = requested;
+      syncAntialiasStatus();
+    } catch (error) {
+      // Storing the preference is the only thing this control does. If that
+      // fails the setting would do nothing at all on the next load, so the box
+      // returns to the value that is actually stored rather than showing a
+      // choice that was never recorded. A session restore reads the control
+      // back after dispatching, so this rollback is also what makes a restore
+      // that could not be persisted fail loudly instead of silently.
+      hpAntialiasCheckbox.checked = previous;
+      syncAntialiasStatus();
+      reportRendererControlFailure('Antialiasing', error);
+    }
   });
 
   applyPointSizeFromSlider();

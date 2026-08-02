@@ -18,9 +18,6 @@ import {
   createPlotContainer,
 } from '../assets/js/app/analysis/shared/result-renderer.js';
 import {
-  FigureContainer,
-} from '../assets/js/app/analysis/ui/shared/figure-container.js';
-import {
   PlotRegistry,
 } from '../assets/js/app/analysis/shared/plot-registry-utils.js';
 
@@ -425,57 +422,6 @@ test('plot container shows and propagates the exact renderer failure', async () 
   });
 });
 
-test('FigureContainer public render rejects after publishing its visible error', async () => {
-  const figure = Object.create(FigureContainer.prototype);
-  const observed = [];
-  figure._destroyed = false;
-  figure._renderGeneration = 0;
-  figure._cleanup = () => {};
-  figure.showLoading = () => {};
-  figure.showError = message => {
-    observed.push(message);
-  };
-  const originalGet = PlotRegistry.get;
-  PlotRegistry.get = () => null;
-  try {
-    await assert.rejects(
-      figure.renderPlot('missing-plot', [{ pageId: 'page-a', pageName: 'A' }]),
-      /unknown plot type.*missing-plot/i,
-    );
-  } finally {
-    PlotRegistry.get = originalGet;
-  }
-  assert.deepEqual(observed, ['Failed to render plot: Unknown plot type: missing-plot']);
-});
-
-test('FigureContainer uses canonical category kind and owned layout color map', async () => {
-  const source = await readFile(
-    new URL(
-      '../assets/js/app/analysis/ui/shared/figure-container.js',
-      import.meta.url,
-    ),
-    'utf8',
-  );
-  assert.match(
-    source,
-    /_currentVariableKind === 'category'\s*\?\s*'categorical_obs'/,
-  );
-  assert.doesNotMatch(source, /\.setCustomColors\(/);
-
-  const figure = Object.create(FigureContainer.prototype);
-  figure._destroyed = false;
-  figure.customColors = new Map();
-  figure._layoutEngine = {
-    pageIds: ['page-a'],
-    customColors: new Map(),
-  };
-  figure.setCustomColors(new Map([['page-a', '#123456']]));
-  assert.deepEqual(
-    [...figure._layoutEngine.customColors],
-    [['page-a', '#123456']],
-  );
-});
-
 test('owned notification and analysis files contain no swallowed console failure path', async () => {
   const urls = [
     '../assets/js/app/notification-center.js',
@@ -483,10 +429,53 @@ test('owned notification and analysis files contain no swallowed console failure
     '../assets/js/app/notification-center/benchmark-notifications.js',
     '../assets/js/app/analysis/core/analysis-history.js',
     '../assets/js/app/analysis/shared/result-renderer.js',
-    '../assets/js/app/analysis/ui/shared/figure-container.js',
   ].map(path => new URL(path, import.meta.url));
   const source = (await Promise.all(urls.map(url => readFile(url, 'utf8')))).join('\n');
 
   assert.doesNotMatch(source, /catch\s*(?:\([^)]*\))?\s*\{\s*(?:\/[/*][^\n]*\s*)?\}/);
   assert.doesNotMatch(source, /console\.(?:warn|error)\s*\(/);
+});
+
+test('a notification renders the line breaks its message carries', async () => {
+  // Notification messages are written as several sentences, and two of them are
+  // a key/value list built with `bits.join('\n')`. `escapeHtml` does not touch
+  // `\n` (`assets/js/app/utils/dom-utils.js:23-26`), so the newline reaches the
+  // DOM intact — and with the default `white-space: normal` the browser folds
+  // it into a space, turning a role failure and its status into the run-on
+  // "Unable to determine your role for … . Not Found Disconnected annotation
+  // repo." (CEL-0178). The break belongs to the message, so the rule that
+  // honours it belongs to the element the message is written into, not to the
+  // call sites.
+  const [css, controls] = await Promise.all([
+    readFile(
+      new URL('../assets/css/components/_notifications.css', import.meta.url),
+      'utf8'
+    ),
+    readFile(
+      new URL(
+        '../assets/js/app/ui/modules/community-annotation-controls.js',
+        import.meta.url
+      ),
+      'utf8'
+    ),
+  ]);
+
+  const rule = /\.notification-message \{([^}]*)\}/.exec(css);
+  assert.ok(rule !== null, '.notification-message must still have a rule');
+  assert.match(
+    rule[1],
+    /^\s*white-space: pre-line;$/m,
+    '.notification-message must honour the newlines its messages carry'
+  );
+
+  // The rule is only worth having while messages still carry newlines, so it is
+  // pinned to a message that does. Both are `notifications.info(bits.join(…))`.
+  const joined = [
+    ...controls.matchAll(/notifications\.\w+\(\s*bits\.join\('\\n'\)/g),
+  ];
+  assert.equal(
+    joined.length,
+    2,
+    'the multi-line list messages must still be the reason for the rule'
+  );
 });

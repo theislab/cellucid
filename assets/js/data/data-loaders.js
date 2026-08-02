@@ -15,6 +15,9 @@ import {
   resolveUrl,
 } from './data-source.js';
 import { getNotificationCenter } from '../app/notification-center.js';
+import {
+  categoricalStorageForDtype,
+} from './categorical-storage-contract.js';
 import { gzipDecompress } from '../app/session/codecs/gzip.js';
 import { setOwnDataProperty } from '../utils/exact-record.js';
 import {
@@ -490,6 +493,15 @@ function typedArrayFromBuffer(buffer, dtype, url) {
   }
 }
 
+// Every categorical field is widened to uint16 once it is in memory, so a
+// uint8 field's terminal sentinel has to be remapped to the uint16 one as it
+// loads. Both widths come from the one storage contract so the pair can never
+// drift apart and turn a missing cell into category 255.
+const RUNTIME_CODE_STORAGE = categoricalStorageForDtype(
+  'uint16',
+  'Runtime categorical codes'
+);
+
 function validateCategoricalCodesDtype(dtype, fieldKey) {
   if (dtype !== 'uint8' && dtype !== 'uint16') {
     throw new Error(
@@ -533,18 +545,20 @@ function validateCategoricalStorage({
     seen.add(category);
   }
 
-  const expectedMissingValue = dtype === 'uint8' ? 255 : 65_535;
-  const maxCategories = dtype === 'uint8' ? 255 : 65_535;
-  if (missingValue !== expectedMissingValue) {
+  const storage = categoricalStorageForDtype(
+    dtype,
+    `Categorical field "${fieldKey}"`
+  );
+  if (missingValue !== storage.missingValue) {
     throw new Error(
       `Invalid categorical field "${fieldKey}": ${dtype} codes require ` +
-      `the exact missing sentinel ${expectedMissingValue}`
+      `the exact missing sentinel ${storage.missingValue}`
     );
   }
-  if (categories.length > maxCategories) {
+  if (categories.length > storage.maxCategories) {
     throw new Error(
       `Invalid categorical field "${fieldKey}": ${dtype} has capacity for ` +
-      `at most ${maxCategories} categories`
+      `at most ${storage.maxCategories} categories`
     );
   }
 }
@@ -853,6 +867,28 @@ export async function loadPointsBinary(url, options = {}) {
   }
 }
 
+/**
+ * Decode one fetched coordinate payload into its exact Float32 view.
+ *
+ * This is the single decode boundary every non-AnnData protocol passes on its
+ * way to cell positions, vector fields, and latent embeddings, so it owns the
+ * finiteness invariant for all of them: local-demo, github, `remote://`, and
+ * the prepared `jupyter://` path. The staged `local-user://` transaction, the
+ * direct h5ad/Zarr adapters, and the in-memory DimensionManager each enforce
+ * the same invariant at their own ingest boundary.
+ *
+ * One non-finite coordinate is not a cosmetic defect. `normalizePositions()`
+ * derives a single centre and scale from the whole buffer, so one Infinity
+ * makes `scale` zero and collapses every cell of the embedding onto a
+ * degenerate line, while one NaN removes exactly one cell from the view even
+ * though it still counts in every legend total, category count, and analysis.
+ * Both failures are silent. The payload is therefore refused: a coordinate is
+ * measured data and is never dropped, clamped, or imputed to keep a load alive.
+ *
+ * @param {ArrayBuffer} arrayBuffer - Decoded payload bytes
+ * @param {string} url - URL the payload was read from, for error messages
+ * @returns {Float32Array}
+ */
 function float32PositionsFromBuffer(arrayBuffer, url) {
   if (
     !(arrayBuffer instanceof ArrayBuffer) ||
@@ -862,7 +898,15 @@ function float32PositionsFromBuffer(arrayBuffer, url) {
       `Invalid cell-position payload from ${url}: byte length must be a multiple of 4`
     );
   }
-  return new Float32Array(arrayBuffer);
+  const positions = new Float32Array(arrayBuffer);
+  for (let index = 0; index < positions.length; index++) {
+    if (!Number.isFinite(positions[index])) {
+      throw new Error(
+        `${url}: position ${index} is not a finite Float32 value`
+      );
+    }
+  }
+  return positions;
 }
 
 function createAbortError() {
@@ -1226,6 +1270,14 @@ function validateCategoricalSchema(schema, compression) {
     );
   }
 
+  // The all-null outlier state is not an export state and must never be added
+  // to the output format specification: both writers always emit a concrete
+  // outlierPathPattern/outlierExt/outlierDtype, and they reject an export whose
+  // generated quantiles are entirely missing. It exists because this expander
+  // is shared with the in-browser H5AD/Zarr adapters, which have no precomputed
+  // outlier quantiles at all and declare their absence explicitly rather than
+  // by omitting keys — see BaseAnnDataAdapter.getObsManifest(). Deleting it
+  // breaks every directly opened AnnData file.
   const outlierPayloadMembers = [
     schema.outlierPathPattern,
     schema.outlierExt,
@@ -2096,7 +2148,7 @@ export async function loadObsFieldData(manifestUrl, field, options = {}) {
       if (codesDtype === 'uint8') {
         const u16 = new Uint16Array(raw.length);
         const missingU8 = anndataData.missingValue;
-        const missingU16 = 65_535;
+        const missingU16 = RUNTIME_CODE_STORAGE.missingValue;
         for (let i = 0; i < raw.length; i++) {
           u16[i] = raw[i] === missingU8 ? missingU16 : raw[i];
         }
@@ -2168,7 +2220,7 @@ export async function loadObsFieldData(manifestUrl, field, options = {}) {
     if (dtype === 'uint8') {
       const u16 = new Uint16Array(raw.length);
       const missingU8 = field.codesMissingValue;
-      const missingU16 = 65_535;
+      const missingU16 = RUNTIME_CODE_STORAGE.missingValue;
       for (let i = 0; i < raw.length; i++) {
         u16[i] = raw[i] === missingU8 ? missingU16 : raw[i];
       }
@@ -3035,7 +3087,27 @@ export async function loadLatentEmbeddings(options) {
       showProgress: false
     });
 
-    const cellCount = Math.floor(points.length / dimension);
+    // An embedding is one complete coordinate tuple per cell, so a length that
+    // is not a whole number of tuples is a truncated payload, never a dataset
+    // with a fractional cell. `Math.floor` would absorb the remainder and hand
+    // back a cell count that silently disagrees with obs_manifest.json — every
+    // legend total, category count, and selection index downstream would then be
+    // computed against a different population than the one on screen.
+    // DimensionManager already refuses exactly this; the two peers divide the
+    // same payload and must judge it the same way.
+    if (points.length % dimension !== 0) {
+      throw new Error(
+        `${url}: ${dimension}D embedding has ${points.length} values, ` +
+        `which is not a whole number of ${dimension}-value cell coordinates`
+      );
+    }
+    const cellCount = points.length / dimension;
+    if (declaredCells !== null && cellCount !== declaredCells) {
+      throw new Error(
+        `${url}: ${dimension}D embedding carries ${cellCount} cells, but ` +
+        `dataset_identity.json declares ${declaredCells}`
+      );
+    }
 
     notifications.completeDownload(trackerId);
 

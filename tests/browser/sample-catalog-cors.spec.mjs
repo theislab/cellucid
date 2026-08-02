@@ -1,7 +1,7 @@
 import { expect, test } from '@playwright/test';
+import { sampleUrl } from './helpers/origins.mjs';
 
-const CORS_SAMPLE_ROOT =
-  'http://127.0.0.1:4174/tests/browser/fixtures/exports/';
+const CORS_SAMPLE_ROOT = sampleUrl('/tests/browser/fixtures/exports/');
 const CORS_SAMPLE_SELECTION =
   'dataset:local-demo:current-ui-prepared';
 
@@ -85,8 +85,7 @@ test('direct CORS catalog startup adopts its explicit default sample', async ({ 
 });
 
 test('a failed direct CORS catalog is explained inline and stays recoverable', async ({ page }) => {
-  const missingRoot =
-    'http://127.0.0.1:4174/tests/browser/fixtures/missing-exports/';
+  const missingRoot = sampleUrl('/tests/browser/fixtures/missing-exports/');
   const catalogRequests = [];
   page.on('request', request => {
     if (request.url() === `${missingRoot}datasets.json`) {
@@ -112,7 +111,13 @@ test('a failed direct CORS catalog is explained inline and stays recoverable', a
   const notice = page.locator('.dataset-info[role="status"]');
   await expect(notice).toBeVisible();
   await expect(notice).toContainText(/Sample datasets could not be loaded/);
-  await expect(notice).toContainText(/Check your network, then try again/);
+  // This root is absent rather than blocked, and the notice says so: the 404
+  // the loader reported reaches the user as an address to check, not as a
+  // network problem to wait out.
+  await expect(notice).toContainText(
+    /nothing is published at that address .*Check the address for a typo, then try again/,
+  );
+  await expect(notice).not.toContainText(/Check your network/);
   // A transport diagnostic is never put in front of a biologist.
   await expect(notice).not.toContainText(/Resource not found/i);
   const retry = notice.getByRole('button', { name: 'Try again' });

@@ -127,7 +127,7 @@ const densityplotDefinition = {
           type: PLOTLY_2D_SCATTER_TRACE_TYPE,
           mode: 'lines',
           x, y,
-          name: pd.pageName,
+          name: escapeHtml(pd.pageName),
           line: { color, width: 2, shape: 'spline' },
           fill: 'tozeroy',
           fillcolor: PlotFactory.hexToRgba(color, fillOpacity),
@@ -140,7 +140,8 @@ const densityplotDefinition = {
 
   buildLayout(pageData, options, layoutEngine) {
     const layout = PlotFactory.createLayout({ pageData, options });
-    const variableName = BasePlot.getVariableName(pageData);
+    // Dataset-supplied field name reaching a markup-parsing axis title.
+    const variableName = escapeHtml(BasePlot.getVariableName(pageData));
 
     layout.xaxis = { title: variableName, automargin: true, type: options.logX ? 'log' : 'linear' };
     layout.yaxis = { title: 'Density', zeroline: true, rangemode: 'tozero', type: options.logY ? 'log' : 'linear' };

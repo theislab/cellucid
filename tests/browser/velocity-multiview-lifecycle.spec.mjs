@@ -1,4 +1,5 @@
 import { expect, test } from '@playwright/test';
+import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 
 const CURRENT_UI_DATASET =
@@ -219,7 +220,7 @@ test(
     await installVelocityGlAudit(page);
     await installVelocityFixture(page);
     await page.goto(
-      '/?exportsBaseUrl=http%3A%2F%2F127.0.0.1%3A4173%2Ftests%2Fbrowser%2Ffixtures%2Fexports%2F&dataset=current-ui-prepared&acceptance=velocity-multiview-lifecycle',
+      `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=velocity-multiview-lifecycle`,
       { waitUntil: 'domcontentloaded' },
     );
     await dismissWelcome(page);
@@ -378,7 +379,7 @@ test(
 
     await installVelocityFixture(page);
     await page.goto(
-      '/?exportsBaseUrl=http%3A%2F%2F127.0.0.1%3A4173%2Ftests%2Fbrowser%2Ffixtures%2Fexports%2F&dataset=current-ui-prepared&acceptance=velocity-allocation-failure',
+      `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=velocity-allocation-failure`,
       { waitUntil: 'domcontentloaded' },
     );
     await dismissWelcome(page);
@@ -452,7 +453,7 @@ test(
 
     await installVelocityFixture(page);
     await page.goto(
-      '/?exportsBaseUrl=http%3A%2F%2F127.0.0.1%3A4173%2Ftests%2Fbrowser%2Ffixtures%2Fexports%2F&dataset=current-ui-prepared&acceptance=velocity-init-retry',
+      `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=velocity-init-retry`,
       { waitUntil: 'domcontentloaded' },
     );
     await dismissWelcome(page);

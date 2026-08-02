@@ -170,6 +170,7 @@ function cameraRenderState(eye, overrides = {}) {
   const model = IDENTITY_MAT4;
   const mvp = multiplyMat4(multiplyMat4(projection, view), model);
   return {
+    antialias: true,
     bgColor: Float32Array.from([0.965, 0.965, 0.970]),
     cameraDistance: Math.hypot(eye[0], eye[1], eye[2]),
     cameraPosition: [...eye],

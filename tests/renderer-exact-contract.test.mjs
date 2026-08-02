@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
+import { readdir, readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import {
   HighPerfRenderer,
-  SpatialIndex,
 } from '../assets/js/rendering/high-perf-renderer.js';
+import { SpatialIndex } from '../assets/js/rendering/high-perf/spatial-index.js';
 import {
   HighlightRenderer,
   HighlightTools,
@@ -34,8 +34,8 @@ import {
   assertFigureExportSingleRequest,
 } from '../assets/js/app/ui/modules/figure-export/figure-export-contract.js';
 import {
+  DEFAULT_SYNTHETIC_SEED,
   GPUTimer,
-  HighPerfBenchmark,
   MeshSurfaceSampler,
   PerformanceTracker,
   SyntheticDataGenerator,
@@ -49,6 +49,24 @@ const figureExportRoot = new URL(
 
 async function source(relativeUrl, root = renderingRoot) {
   return readFile(new URL(relativeUrl, root), 'utf8');
+}
+
+/**
+ * Every source file the high-performance renderer is assembled from, so that a
+ * "this pattern must not exist" assertion cannot be evaded by moving the code
+ * into one of the renderer's own modules. Enumerates the directory rather than
+ * naming files, so a module added later is covered without editing this test.
+ */
+async function highPerfRendererSources() {
+  const moduleRoot = new URL('high-perf/', renderingRoot);
+  const names = (await readdir(moduleRoot))
+    .filter(name => name.endsWith('.js'))
+    .sort();
+  const parts = [await source('high-perf-renderer.js')];
+  for (const name of names) {
+    parts.push(await readFile(new URL(name, moduleRoot), 'utf8'));
+  }
+  return parts.join('\n');
 }
 
 test('spatial indices require an exact supported dimension contract', () => {
@@ -256,7 +274,7 @@ test('snapshot buffers publish owned bounds before live position identity can ch
 });
 
 test('high-performance data entry points do not clamp or default dimensions', async () => {
-  const rendererSource = await source('high-perf-renderer.js');
+  const rendererSource = await highPerfRendererSources();
 
   assert.doesNotMatch(
     rendererSource,
@@ -777,7 +795,7 @@ test('lazily created LOD buffers sample the latest renderer color generation', (
 });
 
 test('high-performance rendering has no legacy alpha or global-view path', async () => {
-  const rendererSource = await source('high-perf-renderer.js');
+  const rendererSource = await highPerfRendererSources();
 
   assert.doesNotMatch(
     rendererSource,
@@ -1294,7 +1312,15 @@ test('renderer benchmark consumers request one exact per-view statistics owner',
   );
   assert.doesNotMatch(
     benchmarkSource,
-    /backward compatibility|legacy-compatible|legacy format|fall(?:s)? back|fallback|getExtension\(['"]EXT_disjoint_timer_query['"]\)|window\.(?:SyntheticDataGenerator|PerformanceTracker|HighPerfBenchmark|BenchmarkConfig|BenchmarkReporter|BenchmarkExporter|BottleneckAnalyzer|startLiveMonitor|stopLiveMonitor|analyzeBottleneck|hideMetrics)/i
+    /backward compatibility|legacy-compatible|legacy format|fall(?:s)? back|fallback|getExtension\(['"]EXT_disjoint_timer_query['"]\)|window\.(?:SyntheticDataGenerator|PerformanceTracker|BenchmarkReporter|BenchmarkExporter|BottleneckAnalyzer|startLiveMonitor|stopLiveMonitor|analyzeBottleneck|hideMetrics)/i
+  );
+  assert.doesNotMatch(
+    benchmarkSource,
+    /export\s+(?:class\s+HighPerfBenchmark|const\s+BenchmarkConfig)\b/
+  );
+  assert.doesNotMatch(
+    benchmarkSource,
+    /from '\.\.\/rendering\//
   );
   assert.doesNotMatch(
     benchmarkSource,
@@ -1302,30 +1328,57 @@ test('renderer benchmark consumers request one exact per-view statistics owner',
   );
 });
 
+test('synthetic generation is reproducible and varies only by declared seed', () => {
+  assert.equal(SyntheticDataGenerator.seed, DEFAULT_SYNTHETIC_SEED);
+  try {
+    const first = SyntheticDataGenerator.uniformRandom(64);
+    const second = SyntheticDataGenerator.uniformRandom(64);
+    assert.deepEqual(first.positions, second.positions);
+    assert.deepEqual(first.colors, second.colors);
+
+    // A generator that consumes the stream before its main loop must still
+    // restart it, or the previous call would leak into this one.
+    const firstClusters = SyntheticDataGenerator.gaussianClusters(64);
+    const secondClusters = SyntheticDataGenerator.gaussianClusters(64);
+    assert.deepEqual(firstClusters.positions, secondClusters.positions);
+
+    assert.equal(SyntheticDataGenerator.setSeed(DEFAULT_SYNTHETIC_SEED + 1),
+      DEFAULT_SYNTHETIC_SEED + 1);
+    const varied = SyntheticDataGenerator.uniformRandom(64);
+    assert.notDeepEqual(varied.positions, first.positions);
+
+    SyntheticDataGenerator.setSeed(DEFAULT_SYNTHETIC_SEED);
+    assert.deepEqual(SyntheticDataGenerator.uniformRandom(64).positions,
+      first.positions);
+
+    for (const invalid of [undefined, null, 1.5, '1', NaN, Infinity]) {
+      assert.throws(() => SyntheticDataGenerator.setSeed(invalid), /safe integer/);
+    }
+    assert.equal(SyntheticDataGenerator.seed, DEFAULT_SYNTHETIC_SEED);
+  } finally {
+    SyntheticDataGenerator.setSeed(DEFAULT_SYNTHETIC_SEED);
+  }
+});
+
 test('GLB surface sampling writes exact caller-owned buffers', () => {
+  const values = [0.5, 0.2, 0.3];
   const sampler = new MeshSurfaceSampler(
     Float32Array.from([
       0, 0, 0,
       1, 0, 0,
       0, 1, 0,
     ]),
-    null
+    null,
+    () => values.shift()
   );
   const sampledPosition = new Float32Array(3);
   const sampledNormal = new Float32Array(3);
-  const originalRandom = Math.random;
-  const values = [0.5, 0.2, 0.3];
-  Math.random = () => values.shift();
-  try {
-    sampler.sampleInto(
-      sampledPosition,
-      0,
-      sampledNormal,
-      0
-    );
-  } finally {
-    Math.random = originalRandom;
-  }
+  sampler.sampleInto(
+    sampledPosition,
+    0,
+    sampledNormal,
+    0
+  );
 
   assert.ok(Math.abs(sampledPosition[0] - 0.2) < 1e-6);
   assert.ok(Math.abs(sampledPosition[1] - 0.3) < 1e-6);
@@ -1411,45 +1464,6 @@ test('GLB URL generation shares one exact browser fetch per asset', async () => 
     if (previousFetch === undefined) delete globalThis.fetch;
     else Object.defineProperty(globalThis, 'fetch', previousFetch);
   }
-});
-
-test('benchmark comparisons require current unrounded measurements', () => {
-  const benchmark = new HighPerfBenchmark(null);
-  const current = {
-    results: [{
-      name: 'current-contract',
-      fps: 54,
-      fpsRaw: 54.5,
-      avgFrameTime: 18.35,
-      stdDev: 0.2,
-    }],
-  };
-  const baseline = {
-    results: [{
-      name: 'current-contract',
-      fps: 60,
-      fpsRaw: 60.5,
-      avgFrameTime: 16.53,
-      stdDev: 0.2,
-    }],
-  };
-
-  const result = benchmark.compareBenchmarks(baseline, current);
-  assert.equal(result.comparisons[0].baseline.fpsRaw, 60.5);
-  assert.equal(result.comparisons[0].current.fpsRaw, 54.5);
-
-  assert.throws(
-    () => benchmark.compareBenchmarks({
-      results: [{ ...baseline.results[0], fpsRaw: undefined }],
-    }, current),
-    /baseline benchmark.*fpsRaw/i
-  );
-  assert.throws(
-    () => benchmark.compareBenchmarks(baseline, {
-      results: [{ ...current.results[0], fpsRaw: undefined }],
-    }),
-    /current benchmark.*fpsRaw/i
-  );
 });
 
 test('GPU timing uses only the WebGL2 current extension contract', () => {

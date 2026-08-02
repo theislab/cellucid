@@ -9,6 +9,7 @@
  */
 
 import { isExactCameraState } from '../../../../rendering/camera-state-contract.js';
+import { createOpaqueId } from '../../../utils/opaque-id.js';
 
 export const MAX_KEYFRAMES = 100;
 export const MAX_TRANSITION_DURATION_SECONDS = 60;
@@ -227,7 +228,13 @@ export function createKeyframeStore() {
         'Camera path keyframes require an exact synchronized camera state.'
       );
     }
-    const exactLabel = label === undefined ? `KF ${nextIndex}` : label;
+    // `nextIndex` numbers default labels and nothing else, so a caller that
+    // brings its own label must not consume one. The return-to-start keyframe
+    // is such a caller: letting it advance the counter made every later "KF n"
+    // skip a number, and toggling it repeatedly walked the numbering away from
+    // the list the user is looking at.
+    const usesDefaultLabel = label === undefined;
+    const exactLabel = usesDefaultLabel ? `KF ${nextIndex}` : label;
     if (!isExactKeyframeLabel(exactLabel)) {
       throw new TypeError(
         'Camera path keyframe label must be a trimmed non-empty string of at most 40 characters.'
@@ -237,7 +244,7 @@ export function createKeyframeStore() {
       return null;
     }
 
-    const id = crypto.randomUUID();
+    const id = createOpaqueId();
     keyframes.push(createStoredKeyframe({
       id,
       label: exactLabel,
@@ -246,7 +253,7 @@ export function createKeyframeStore() {
       freefly: cameraState.freefly,
       transitionDuration: null // auto-pace by default
     }));
-    nextIndex++;
+    if (usesDefaultLabel) nextIndex++;
     emit();
     return id;
   }

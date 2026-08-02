@@ -131,11 +131,25 @@ function cloneOwnedLegendValue(value, context, seen = new Map()) {
   return clone;
 }
 
-function cloneRenderState(renderState, context) {
+/**
+ * @param {object} renderState - the presented per-view render state
+ * @param {boolean} antialias - `viewer.getGrantedAntialiasing()`
+ * @param {string} context
+ */
+function cloneRenderState(renderState, antialias, context) {
   if (renderState === null || typeof renderState !== 'object') {
     throw new TypeError(`${context} must be an object.`);
   }
+  if (typeof antialias !== 'boolean') {
+    throw new TypeError(
+      `${context} requires the exact antialiasing the viewer was granted.`
+    );
+  }
   return {
+    // The granted value, not the requested one: a browser may refuse
+    // multisampling, and the screen the figure claims to reproduce is the one
+    // that was actually drawn.
+    antialias,
     bgColor: new Float32Array(renderState.bgColor),
     cameraDistance: renderState.cameraDistance,
     cameraPosition: Array.from(renderState.cameraPosition),
@@ -333,6 +347,7 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
    * @param {number} datasetGeneration
    * @param {boolean} captureLegend
    * @param {object} ownedCopies
+   * @param {boolean} grantedAntialiasing
    * @param {AbortSignal} signal
    */
   function getViewSnapshot(
@@ -340,6 +355,7 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
     datasetGeneration,
     captureLegend,
     ownedCopies,
+    grantedAntialiasing,
     signal
   ) {
     throwIfFigureExportAborted(signal);
@@ -576,6 +592,7 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
         },
         renderState: cloneRenderState(
           presented.renderState,
+          grantedAntialiasing,
           `Figure export render state for "${vid}"`
         ),
         cameraState: cloneCameraState(
@@ -767,6 +784,23 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
       highlightArray = new Uint8Array(highlightOwner);
     }
 
+    // Multisampling is fixed when the browser creates the viewer's drawing
+    // buffer, and the user can turn it off. The figure must be rasterised with
+    // the value the viewer was *granted*, so it travels with the snapshot like
+    // every other renderer input.
+    if (typeof viewer.getGrantedAntialiasing !== 'function') {
+      throw new TypeError(
+        'Figure export requires viewer.getGrantedAntialiasing().'
+      );
+    }
+    const grantedAntialiasing = viewer.getGrantedAntialiasing();
+    throwIfFigureExportAborted(signal);
+    if (typeof grantedAntialiasing !== 'boolean') {
+      throw new TypeError(
+        'Figure export requires an exact granted-antialiasing boolean.'
+      );
+    }
+
     const ownedCopies = {
       colors: new WeakMap(),
       lodMembership: new WeakMap(),
@@ -784,6 +818,7 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
           datasetGeneration,
           options.includeLegend,
           ownedCopies,
+          grantedAntialiasing,
           signal
         ),
       });

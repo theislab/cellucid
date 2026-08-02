@@ -60,6 +60,10 @@ const barplotDefinition = {
   buildTraces(pageData, options, layoutEngine) {
     const { orientation = 'vertical', showValues = false, sortBy = 'count', normalize = false } = options;
     const sortedCategories = PlotFactory.getSortedCategories(pageData, sortBy);
+    // Category names come from the dataset and land on a Plotly category axis,
+    // which parses Plotly's HTML subset. Keep the raw list for count lookups and
+    // escape a parallel copy for display.
+    const displayCategories = sortedCategories.map(cat => escapeHtml(cat));
 
     return PlotFactory.createTraces({
       pageData, options, layoutEngine,
@@ -71,7 +75,7 @@ const barplotDefinition = {
         const safePageName = escapeHtml(String(pd.pageName || ''));
 
         const trace = {
-          name: pd.pageName,
+          name: safePageName,
           type: 'bar',
           marker: { color, line: { color: 'rgba(0,0,0,0.1)', width: 0.5 } },
           hovertemplate: normalize
@@ -81,11 +85,11 @@ const barplotDefinition = {
         };
 
         if (orientation === 'vertical') {
-          trace.x = sortedCategories;
+          trace.x = displayCategories;
           trace.y = displayValues;
         } else {
           trace.x = displayValues;
-          trace.y = sortedCategories;
+          trace.y = displayCategories;
           trace.orientation = 'h';
         }
 

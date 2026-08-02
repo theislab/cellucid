@@ -180,7 +180,7 @@ function requireRaySamplePickInput(input) {
  * @param {Float32Array} input.transparency
  * @param {{origin: ArrayLike<number>, direction: ArrayLike<number>}} input.ray
  * @param {number} input.maxDistance
- * @param {import('./high-perf-renderer.js').SpatialIndex|null} [input.spatialIndex]
+ * @param {import('./high-perf/spatial-index.js').SpatialIndex|null} [input.spatialIndex]
  * @param {{
  *   admissionLevels: Uint8Array,
  *   dimensionLevel: number,

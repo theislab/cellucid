@@ -81,6 +81,7 @@ import {
   unanimousFieldKey,
 } from '../utils/figure-provenance.js';
 import { panelLetter } from '../utils/panel-label.js';
+import { scalePointDiameterToRaster } from '../utils/point-size.js';
 import {
   buildSelectionBadge,
   countHighlightedVisiblePoints,
@@ -441,12 +442,18 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
       lodMembership,
       outputWidthPx: outW,
       outputHeightPx: outH,
-      pointSizePx: Math.max(1, pointDiameterViewportPx * viewportScale),
+      pointSizePx: scalePointDiameterToRaster(
+        pointDiameterViewportPx,
+        viewportScale
+      ),
       overlayPoints: (includeCentroidPoints && hasCentroidPoints)
         ? {
           positions: centroidPositions,
           colors: centroidColors,
-          pointSizePx: Math.max(1, centroidDiameterViewportPx * viewportScale),
+          pointSizePx: scalePointDiameterToRaster(
+            centroidDiameterViewportPx,
+            viewportScale
+          ),
         }
         : null,
       highlightArray,
@@ -790,12 +797,18 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
         lodMembership,
         outputWidthPx: outW,
         outputHeightPx: outH,
-        pointSizePx: Math.max(1, pointDiameterViewportPx * viewportScale),
+        pointSizePx: scalePointDiameterToRaster(
+          pointDiameterViewportPx,
+          viewportScale
+        ),
         overlayPoints: (includeCentroidPoints && hasCentroidPoints)
           ? {
             positions: centroidPositions,
             colors: centroidColors,
-            pointSizePx: Math.max(1, centroidDiameterViewportPx * viewportScale),
+            pointSizePx: scalePointDiameterToRaster(
+              centroidDiameterViewportPx,
+              viewportScale
+            ),
           }
           : null,
         highlightArray,

@@ -57,20 +57,10 @@ export {
 // COMPONENTS (from components/ directory)
 // =============================================================================
 
-// Settings
-export {
-  ANALYSIS_SETTINGS,
-  DEFAULT_ANALYSIS_SETTINGS,
-  SETTINGS_CATEGORIES,
-  createAnalysisSettingsPanel,
-  applyAnalysisSettings
-} from './components/settings.js';
-
 // Selectors
 export {
   createVariableSelector,
   createGeneExpressionSelector,
-  createPageSelector,
   createPlotTypeSelector
 } from './components/selectors.js';
 
@@ -88,19 +78,6 @@ export {
   createExportToolbar,
   createExpandButton
 } from './components/export.js';
-
-// Customization
-export {
-  COLOR_PALETTES,
-  COMMON_PLOT_OPTIONS,
-  getExportScaleFactor,
-  getAxisRotation,
-  createColorPaletteSelector,
-  createAnnotationStyleSelector,
-  createExportResolutionSelector,
-  createAxisRotationSelector,
-  createCustomizationPanel
-} from './components/customization.js';
 
 // Stats Display
 export {
@@ -157,10 +134,7 @@ export {
   DEAnalysisUI,
   createDEAnalysisUI,
   GeneSignatureUI,
-  createGeneSignatureUI,
-  ANALYSIS_TYPES,
-  isAnalysisTypeAvailable,
-  getAvailableAnalysisTypes
+  createGeneSignatureUI
 } from './analysis-types/index.js';
 
 // Cross-highlighting

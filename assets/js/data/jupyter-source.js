@@ -30,6 +30,7 @@ import {
   loadMetadataBatchAtomically,
   throwIfMetadataAborted,
 } from './metadata-load-contract.js';
+import { getNotificationCenter } from '../app/notification-center.js';
 
 /**
  * @typedef {import('./data-source.js').DatasetMetadata} DatasetMetadata
@@ -533,6 +534,105 @@ function deliverCallbacks(callbacks, args) {
 }
 
 /**
+ * Every notebook-initiated command type this bridge accepts.
+ *
+ * A failure is labelled from this exact list rather than from the raw inbound
+ * `type`, so no malformed or hostile message can place arbitrary text in the
+ * viewer's notification surface.
+ */
+const JUPYTER_COMMAND_TYPES = Object.freeze([
+  'ping',
+  'debug_snapshot',
+  'highlight',
+  'setColorBy',
+  'setVisibility',
+  'clearHighlights',
+  'resetCamera',
+  'freeze',
+  'requestSessionBundle',
+]);
+
+const JUPYTER_FAILURE_REASON_LIMIT = 240;
+
+/**
+ * Name the notebook command that one failed message was carrying.
+ *
+ * @param {unknown} data - The raw `MessageEvent.data`.
+ * @returns {string|null} One recognised command type, or null when the
+ *   message never identified itself as a current command.
+ */
+export function describeJupyterCommandType(data) {
+  const type = isPlainRecord(data) ? data.type : undefined;
+  return typeof type === 'string' && JUPYTER_COMMAND_TYPES.includes(type)
+    ? type
+    : null;
+}
+
+function describeJupyterFailureReason(error) {
+  const raw =
+    error instanceof Error && typeof error.message === 'string'
+      ? error.message.replace(/\s+/g, ' ').trim()
+      : '';
+  if (raw.length === 0) {
+    return 'the viewer reported no reason';
+  }
+  return raw.length > JUPYTER_FAILURE_REASON_LIMIT
+    ? `${raw.slice(0, JUPYTER_FAILURE_REASON_LIMIT - 1)}…`
+    : raw;
+}
+
+/**
+ * Build the exact user-facing text for one failed notebook command.
+ *
+ * The viewer is the only place this failure currently becomes visible. The
+ * state-changing commands — `highlight`, `setColorBy`, `setVisibility`,
+ * `clearHighlights`, `resetCamera` and `freeze` — carry no `requestId`, so
+ * `viewer.set_color_by(...)` returns whether the viewer applied it or threw.
+ * Announcing the failure here is what separates "the command failed" from
+ * "the command matched nothing".
+ *
+ * `cellucid-python` now defines an inbound `command_error` event
+ * (`_require_inbound_jupyter_event` in `cellucid/jupyter/_wire.py`) carrying
+ * `command` and `reason`, which is how the notebook is meant to learn this.
+ * **Do not post it from here yet.** A notebook running a `cellucid` without
+ * that event raises `ValueError` in the validator; the event endpoint logs a
+ * traceback to the kernel and answers `500 Viewer callback failed`, which is a
+ * louder and less accurate failure than the silence it replaces. The Python
+ * package fetches this build from `https://www.cellucid.com`, so an older
+ * notebook driving a newer build is the normal case after a deploy.
+ *
+ * Emitting requires positive evidence that the notebook accepts the type, and
+ * no existing handshake field can carry it: `getJupyterConfig`,
+ * `requireJupyterHealthPayload`, `requireJupyterSuccessPayload` and the
+ * per-command `requireExactKeys` calls in this file all validate exact key
+ * sets, so anything added to them breaks builds already deployed rather than
+ * being ignored by them. The gate needs a channel an older build never reads —
+ * an endpoint fetched during `initialize()`, which completes before the
+ * command listener is installed — shipped in the same Python release as the
+ * validator.
+ *
+ * @param {string|null} commandType - A value from {@link describeJupyterCommandType}.
+ * @param {unknown} error
+ * @returns {{title: string, message: string}}
+ */
+export function describeJupyterCommandFailure(commandType, error) {
+  if (commandType !== null && !JUPYTER_COMMAND_TYPES.includes(commandType)) {
+    throw new TypeError(
+      'Jupyter command failure type must be one recognised command or null'
+    );
+  }
+  const subject = commandType === null
+    ? 'A notebook command'
+    : `The notebook "${commandType}" command`;
+  return {
+    title: 'Notebook command failed',
+    message:
+      `${subject} did not run: ${describeJupyterFailureReason(error)}. ` +
+      'The viewer is unchanged; correct the notebook cell and run it again.'
+  };
+}
+
+/**
  * Build and upload one authenticated session bundle for one exact Python request.
  *
  * @param {{
@@ -694,16 +794,50 @@ export class JupyterBridgeDataSource {
     this._listenerInstalled = false;
   }
 
-  _reportMessageFailure(error) {
-    console.error('[JupyterBridge] Authenticated message failed:', error);
+  /**
+   * Announce one failed notebook-initiated command to the person watching.
+   *
+   * A console entry inside an embedded iframe is not a user surface, and the
+   * wire protocol has no way to answer the notebook, so this notification is
+   * the only signal that the command failed rather than matched nothing.
+   * Both reporting steps are guarded: neither may turn the `message` listener
+   * or a promise rejection handler into a thrown failure.
+   *
+   * @param {string|null} commandType
+   * @param {unknown} error
+   */
+  _reportMessageFailure(commandType, error) {
+    const failure = describeJupyterCommandFailure(commandType, error);
+    try {
+      console.error(`[JupyterBridge] ${failure.message}`, error);
+    } catch {
+      // Console reporting is observational only.
+    }
+    try {
+      getNotificationCenter().error(failure.message, {
+        category: 'connectivity',
+        title: failure.title,
+        duration: 0
+      });
+    } catch (notificationError) {
+      try {
+        console.error(
+          '[JupyterBridge] Notebook command failure notice failed:',
+          notificationError
+        );
+      } catch {
+        // Nothing further is available to report through.
+      }
+    }
   }
 
   _observeMessage(event) {
+    const commandType = describeJupyterCommandType(event?.data);
     let result;
     try {
       result = this._handleMessage(event);
     } catch (error) {
-      this._reportMessageFailure(error);
+      this._reportMessageFailure(commandType, error);
       return;
     }
     if (
@@ -715,7 +849,7 @@ export class JupyterBridgeDataSource {
       typeof result.then === 'function'
     ) {
       void Promise.resolve(result).catch(error => {
-        this._reportMessageFailure(error);
+        this._reportMessageFailure(commandType, error);
       });
     }
   }
@@ -1264,37 +1398,6 @@ export class JupyterBridgeDataSource {
       type: 'ready',
       n_cells: info.nCells,
       dimensions: info.dimensions
-    };
-    return this._postEventToPython(event);
-  }
-
-  /**
-   * Send a custom event to Python
-   * Use this for app-specific events not covered by the standard hooks.
-   * @param {string} eventType - Custom event type name
-   * @param {Object} data - Event data
-   */
-  async notifyCustomEvent(eventType, data) {
-    if (!this._connected) {
-      throw new Error('Jupyter event source is not connected');
-    }
-    requireExactText(eventType, 'Jupyter custom event type');
-    if (!isPlainRecord(data)) {
-      throw new TypeError('Jupyter custom event data must be a JSON object');
-    }
-    if (
-      Object.hasOwn(data, 'type') ||
-      Object.hasOwn(data, 'viewerId') ||
-      Object.hasOwn(data, 'viewerToken')
-    ) {
-      throw new TypeError(
-        'Jupyter custom event data must not supply type or routing credentials'
-      );
-    }
-    requireExactJsonValue(data, 'Jupyter custom event data');
-    const event = {
-      type: eventType,
-      ...data
     };
     return this._postEventToPython(event);
   }

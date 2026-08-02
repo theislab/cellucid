@@ -2,6 +2,11 @@
  * @fileoverview Sole visible owner for terminal application-startup failure.
  */
 
+import {
+  hideWelcomeModal,
+  isWelcomeModalVisible
+} from './ui/onboarding/welcome-modal.js';
+
 /**
  * Convert JavaScript's unrestricted thrown-value channel into the sole
  * current Error contract used by startup reporting.
@@ -101,6 +106,12 @@ export function publishStartupFailure(options) {
     );
   }
 
+  // Onboarding invites the user into an application that no longer exists, and
+  // two dialogs claiming the screen at once leaves neither of them credible.
+  // It is retracted through its own owner rather than covered over, so its
+  // `aria-modal` region really does close and its Tab trap really is released.
+  if (isWelcomeModalVisible()) hideWelcomeModal();
+
   const surface = documentOwner.createElement('section');
   surface.id = 'cellucid-startup-failure';
   surface.setAttribute('role', 'alert');
@@ -158,6 +169,16 @@ export function publishStartupFailure(options) {
   card.append(title, message, action);
   surface.appendChild(card);
   documentOwner.body.appendChild(surface);
+  // Retracting onboarding takes focus off a control that no longer exists, so
+  // the alert takes it: leaving focus on `<body>` would strand a keyboard user
+  // behind a full-screen surface with nothing selected.
+  surface.setAttribute('tabindex', '-1');
+  if (typeof surface.focus !== 'function') {
+    throw new TypeError(
+      'Terminal startup failure requires a focusable surface.'
+    );
+  }
+  surface.focus();
   if (statsElement !== null) {
     statsElement.textContent = `Startup failed: ${error.message}`;
   }

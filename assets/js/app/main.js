@@ -92,6 +92,8 @@ import { shuffleConnectivityEdges } from './utils/random-utils.js';
 import { getGitHubAuthSession } from './community-annotations/github-auth.js';
 import { initKeyboardShortcuts, initWelcomeModal, showWelcomeModal } from './ui/onboarding/index.js';
 import { publishWebBuildVersion } from './ui/core/build-version.js';
+import { retireDeferredControls } from './ui/core/deferred-control-readiness.js';
+import { resolveAntialiasPreference } from './ui/core/antialias-preference.js';
 import {
   initAnalytics,
   trackDataLoadMethod,
@@ -188,6 +190,12 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
 
     setDockableAccordions(initDockableAccordions({ sidebar }));
 
+    // The renderer and benchmark controls are wired at the far end of this
+    // bootstrap, past every await below. They are painted and offered long
+    // before that, so they are taken out of service here and admitted at the
+    // one point where their listeners exist.
+    const admitDeferredControls = retireDeferredControls(document);
+
     if (themeSelect instanceof HTMLSelectElement) {
       themeSelect.value = ThemeManager.getTheme();
       themeSelect.addEventListener('change', () => {
@@ -240,7 +248,18 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
     let ui = null;
 
     debug.log('[Main] Creating viewer...');
-    const viewer = createViewer({ canvas, labelLayer, viewTitleLayer });
+    // `antialias` is fixed at context creation and cannot be changed on a live
+    // context, so the stored preference has to be read here, before the viewer
+    // exists. `render-controls.js` owns the control that writes it; this is the
+    // only place that reads it. A value it could not use is reported below,
+    // once the notification centre exists.
+    const antialiasPreference = resolveAntialiasPreference(localStorage);
+    const viewer = createViewer({
+      canvas,
+      labelLayer,
+      viewTitleLayer,
+      antialias: antialiasPreference.enabled
+    });
     debug.log('[Main] Viewer created successfully');
 
     // Expose viewer globally for dev tools (benchmark, debugging)
@@ -257,6 +276,18 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
     // Initialize notification center early
     const notifications = getNotificationCenter();
     notifications.init();
+
+    if (antialiasPreference.discarded !== null) {
+      // Discarded rather than obeyed, and never in silence: the user chose this
+      // setting once and is entitled to know the choice did not survive.
+      notifications.warning(
+        `The stored antialiasing preference `
+        + `${JSON.stringify(antialiasPreference.discarded)} was not recognized `
+        + 'and has been discarded, so antialiasing is on. Set it again in '
+        + 'Visualization if you wanted it off.',
+        { category: 'rendering', title: 'Antialiasing preference reset' }
+      );
+    }
 
     // Construct the optional GitHub annotation session inside the startup
     // boundary so storage/configuration failures cannot leave a blank page.
@@ -1141,15 +1172,12 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
         });
         const embeddingsMetadata = getEmbeddingsMetadata(generation.identity);
         candidateDimensionManager.initFromMetadata(embeddingsMetadata);
-        // The canonical cell axis has to be published after initFromMetadata,
-        // never at construction: initFromMetadata clears the cache and a cache
-        // clear resets nCells to 0. Without this the manager only learns the
-        // cell count from the first embedding it decodes, so that first payload
-        // is bounded by the 512 MiB browser ceiling while every later dimension
-        // is bounded exactly. loadDatasetGeneration has already proved this
-        // count against obs_manifest.json, var_manifest.json, and
-        // connectivity_manifest.json, so it is the dataset's exact cell axis.
-        candidateDimensionManager.nCells = generation.identity.stats.n_cells;
+        // loadDatasetGeneration has already proved this count against
+        // obs_manifest.json, var_manifest.json, and connectivity_manifest.json,
+        // so it is the dataset's exact cell axis. publishCellCount enforces the
+        // ordering rule this used to state in prose: it must follow
+        // initFromMetadata, which clears the cache and zeroes the axis.
+        candidateDimensionManager.publishCellCount(generation.identity.stats.n_cells);
         const positionStage = await stageDatasetPositionPayload({
           generation,
           dimensionManager: candidateDimensionManager,
@@ -3469,22 +3497,20 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
     const benchGenInfoEl = document.getElementById('bench-gen-info');
     const benchGenTimeEl = document.getElementById('bench-gen-time');
 
-    // HP renderer controls (always-on HP renderer)
+    // The renderer controls themselves belong to `ui/modules/render-controls`,
+    // which `initUI` builds before a saved session is restored. The benchmark
+    // report only observes them, so it reads them and never publishes them.
     const hpShaderQuality = document.getElementById('hp-shader-quality');
     const hpFrustumCulling = document.getElementById('hp-frustum-culling');
     const hpLodEnabled = document.getElementById('hp-lod-enabled');
-    const hpLodForceContainer = document.getElementById('lod-force-container');
-    const hpLodForce = document.getElementById('hp-lod-force');
-    const hpLodForceLabel = document.getElementById('hp-lod-force-label');
-    let acceptedFrustumEnabled =
-      hpFrustumCulling?.checked ?? false;
-    let acceptedLodEnabled = hpLodEnabled?.checked ?? false;
-    let acceptedForceLodValue = hpLodForce?.value ?? '-1';
 
     // Performance tracker for FPS monitoring (lazy-loaded with benchmark module)
     let perfTracker = null;
-    let SyntheticDataGenerator = null;  // For synthetic data generation
     let BenchmarkReporter = null;       // For report generation
+    // Off-thread synthetic generation and the one point-count rule, captured
+    // from the lazily loaded harness so the panel keeps its lazy boundary.
+    let generateSyntheticDataOffThread = null;
+    let assertSyntheticCount = null;
     let benchmarkModuleLoaded = false;
     let benchmarkModuleLoadTask = null;
 
@@ -3496,7 +3522,6 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
       benchmarkModuleLoadTask = (async () => {
         try {
           const benchmarkModule = await import('../dev/benchmark.js');
-          SyntheticDataGenerator = benchmarkModule.SyntheticDataGenerator;
           BenchmarkReporter = benchmarkModule.BenchmarkReporter;
           const PerformanceTrackerClass = benchmarkModule.PerformanceTracker;
           perfTracker = new PerformanceTrackerClass();
@@ -3511,8 +3536,12 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
           // the module runs on import; the harness instruments the GL context
           // only when it is explicitly created, so opening this panel does not
           // put counters on the product's render path.
-          window._cellucidBenchmarkHarness =
+          const harnessModule =
             await import('./ui/modules/benchmark/index.js');
+          generateSyntheticDataOffThread =
+            harnessModule.generateSyntheticDataOffThread;
+          assertSyntheticCount = harnessModule.assertSyntheticCount;
+          window._cellucidBenchmarkHarness = harnessModule;
           benchmarkModuleLoaded = true;
           debug.log('[Main] Benchmark module lazy-loaded');
           return true;
@@ -3722,162 +3751,34 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
     activeDatasetMode = 'real';
     syntheticDatasetInfo = null;
 
-    // Shader quality change
-    if (hpShaderQuality) {
-      hpShaderQuality.addEventListener('change', () => {
-        viewer.setShaderQuality(hpShaderQuality.value);
-      });
-    }
-
-    const reportRendererControlFailure = (control, error) => {
-      const exactError = error instanceof Error
-        ? error
-        : new Error(String(error));
-      console.error(
-        `[Main] ${control} could not be changed:`,
-        exactError
-      );
-      try {
-        notifications.error(
-          `${control} was not changed: ${exactError.message}`,
-          {
-            category: 'rendering',
-            title: 'Renderer setting unavailable'
-          }
-        );
-      } catch (notificationError) {
-        // Control state is already coherent. Notification delivery is
-        // observational and must not escape the synchronous DOM event.
-        console.error(
-          '[Main] Renderer control failure notification was not delivered:',
-          notificationError
-        );
-      }
-    };
-
-    // Frustum culling toggle
-    if (hpFrustumCulling) {
-      hpFrustumCulling.addEventListener('change', () => {
-        const requestedEnabled = hpFrustumCulling.checked;
-        const previousEnabled = acceptedFrustumEnabled;
-        try {
-          viewer.setFrustumCulling(requestedEnabled);
-          acceptedFrustumEnabled = requestedEnabled;
-        } catch (error) {
-          // Renderer feature publication is transactional, so rejection means
-          // its previous semantic value remains authoritative.
-          hpFrustumCulling.checked = previousEnabled;
-          reportRendererControlFailure(
-            'Frustum culling',
-            error
-          );
-        }
-      });
-    }
-
-    // LOD enabled toggle
-    if (hpLodEnabled) {
-      hpLodEnabled.addEventListener('change', () => {
-        const requestedEnabled = hpLodEnabled.checked;
-        const previousEnabled = acceptedLodEnabled;
-        const previousForceDisplay =
-          hpLodForceContainer?.style.display ?? '';
-        const previousForceValue = acceptedForceLodValue;
-        const previousForceLabel =
-          hpLodForceLabel?.textContent ?? 'Auto';
-        let featurePublished = false;
-        try {
-          viewer.setAdaptiveLOD(requestedEnabled);
-          featurePublished = true;
-          // Enabling starts from adaptive mode. Disabling already resets the
-          // renderer's global force level as part of the atomic toggle.
-          if (requestedEnabled && hpLodForce) {
-            viewer.setForceLOD(-1);
-          }
-          if (hpLodForceContainer) {
-            hpLodForceContainer.style.display =
-              requestedEnabled ? 'block' : 'none';
-          }
-          if (hpLodForce) {
-            hpLodForce.value = '-1';
-          }
-          if (hpLodForceLabel) {
-            hpLodForceLabel.textContent = 'Auto';
-          }
-          acceptedLodEnabled = requestedEnabled;
-          acceptedForceLodValue = '-1';
-        } catch (error) {
-          const failures = [error];
-          if (featurePublished) {
-            try {
-              viewer.setAdaptiveLOD(previousEnabled);
-              if (previousEnabled && hpLodForce) {
-                const previousForceLevel =
-                  Number.parseInt(previousForceValue, 10);
-                if (Number.isInteger(previousForceLevel)) {
-                  viewer.setForceLOD(previousForceLevel);
-                }
-              }
-            } catch (rollbackError) {
-              failures.push(rollbackError);
-            }
-          }
-          hpLodEnabled.checked = previousEnabled;
-          if (hpLodForceContainer) {
-            hpLodForceContainer.style.display =
-              previousForceDisplay;
-          }
-          if (hpLodForce) {
-            hpLodForce.value = previousForceValue;
-          }
-          if (hpLodForceLabel) {
-            hpLodForceLabel.textContent = previousForceLabel;
-          }
-          reportRendererControlFailure(
-            'Adaptive LOD',
-            failures.length === 1
-              ? error
-              : new AggregateError(
-                  failures,
-                  'Adaptive LOD publication and UI rollback failed.'
-                )
-          );
-        }
-      });
-    }
-
-    // Force LOD slider
-    if (hpLodForce) {
-      hpLodForce.addEventListener('input', () => {
-        const val = parseInt(hpLodForce.value, 10);
-        const previousForceValue = acceptedForceLodValue;
-        try {
-          viewer.setForceLOD(val);
-          acceptedForceLodValue = String(val);
-          if (hpLodForceLabel) {
-            hpLodForceLabel.textContent =
-              val < 0 ? 'Auto' : String(val);
-          }
-        } catch (error) {
-          hpLodForce.value = previousForceValue;
-          if (hpLodForceLabel) {
-            const previousForceLevel =
-              Number.parseInt(previousForceValue, 10);
-            hpLodForceLabel.textContent =
-              previousForceLevel < 0
-                ? 'Auto'
-                : String(previousForceLevel);
-          }
-          reportRendererControlFailure(
-            'Forced LOD level',
-            error
-          );
-        }
-      });
-    }
-
     if (benchmarkSection) {
-      benchmarkSection.addEventListener('toggle', async () => {
+      const reportBenchmarkPanelFailure = error => {
+        const exactError = error instanceof Error
+          ? error
+          : new Error(String(error));
+        console.error(
+          '[Main] Performance benchmark panel could not be changed:',
+          exactError
+        );
+        try {
+          notifications.error(
+            `Performance benchmark panel was not changed: ` +
+            `${exactError.message}`,
+            {
+              category: 'rendering',
+              title: 'Renderer setting unavailable'
+            }
+          );
+        } catch (notificationError) {
+          // Panel state is already coherent. Notification delivery is
+          // observational and must not escape the synchronous DOM event.
+          console.error(
+            '[Main] Benchmark panel failure notification was not delivered:',
+            notificationError
+          );
+        }
+      };
+      const synchronizeBenchmarkPanelWithSection = async () => {
         if (benchmarkSection.open) {
           // Lazy-load benchmark module when section is first opened
           await ensureBenchmarkModule();
@@ -3885,18 +3786,71 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
         } else {
           stopPerfMonitoring();
         }
-      });
+      };
+      const ownBenchmarkPanelSynchronization = () => {
+        synchronizeBenchmarkPanelWithSection().catch(
+          reportBenchmarkPanelFailure
+        );
+      };
+      benchmarkSection.addEventListener(
+        'toggle',
+        ownBenchmarkPanelSynchronization
+      );
+      // A `<details>` opens itself: the browser toggles it on a summary click
+      // with no script involved, and this listener did not exist to see the
+      // ones that happened while the bootstrap above was still running. Left
+      // unreconciled, that click opens an empty panel, the next click closes
+      // it, and only the third loads anything. Reading the state the listener
+      // was attached to is what makes the first click count.
+      ownBenchmarkPanelSynchronization();
+    }
+
+    /**
+     * Tell the user their synthetic data load was overtaken.
+     *
+     * Every superseded exit used to return `false` in silence, so a click that
+     * landed while a dataset change was still settling looked identical to a
+     * dead button: nothing rendered, nothing was logged, and the run's own
+     * notification had already been dismissed.
+     *
+     * @returns {false} Always, so a superseded exit reads as one statement.
+     */
+    function reportSupersededBenchmark() {
+      notifications.warning(
+        'Synthetic data load was superseded by a newer dataset change. ' +
+        'Nothing was replaced — run it again once the current load settles.',
+        { category: 'benchmark', title: 'Benchmark superseded' }
+      );
+      return false;
     }
 
     async function runBenchmark(pointCount, pattern) {
       const syntheticTransaction = datasetReloadCoordinator.begin();
       // Ensure benchmark module is loaded before running
       const moduleLoaded = await ensureBenchmarkModule();
-      if (!syntheticTransaction.isCurrent()) return false;
+      if (!syntheticTransaction.isCurrent()) return reportSupersededBenchmark();
       syntheticTransaction.assertCurrent();
-      if (!moduleLoaded || !SyntheticDataGenerator) {
-        console.error('[Main] Cannot run benchmark: SyntheticDataGenerator not available');
+      if (
+        !moduleLoaded ||
+        !generateSyntheticDataOffThread ||
+        !assertSyntheticCount
+      ) {
+        console.error('[Main] Cannot run benchmark: synthetic generation is not available');
         notifications.error('Benchmark module failed to load', { category: 'benchmark' });
+        return false;
+      }
+
+      // The control's declared range is only advertised until something
+      // enforces it. Check before the run is announced, so an out-of-range
+      // request is refused by name rather than surfacing as a failed
+      // multi-gigabyte allocation.
+      try {
+        assertSyntheticCount(pointCount);
+      } catch (error) {
+        notifications.error(
+          error instanceof Error ? error.message : String(error),
+          { category: 'benchmark', title: 'Point count out of range' }
+        );
         return false;
       }
 
@@ -3917,7 +3871,7 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
         } finally {
           notifications.dismiss(benchNotifId);
         }
-        return false;
+        return reportSupersededBenchmark();
       };
 
       ensureBenchmarkStatsVisible();
@@ -3926,42 +3880,26 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
       if (benchTimingDetailsEl) benchTimingDetailsEl.style.display = 'none';
       if (benchGenInfoEl) benchGenInfoEl.style.display = 'none';
 
-      // Generate synthetic data with timing
+      // Generate off the main thread. Every pattern costs six to twenty-five
+      // transcendental calls per point in one uninterruptible loop, so running
+      // it here froze the tab for the whole of it, in proportion to the point
+      // count: medians of 32 ms at 100k, 186 ms at 1M and 3,481 ms at 20M on
+      // one machine, with no frame drawn, no progress reported and no way to
+      // cancel. The worker builds the same arrays from the same seed and
+      // transfers them back, so the main thread's exposure stops scaling with
+      // the count, and the reload transaction's signal terminates the worker
+      // when a newer dataset change overtakes this run.
       let data;
       const genStart = performance.now();
       try {
-        switch (pattern) {
-          case 'uniform':
-            data = SyntheticDataGenerator.uniformRandom(pointCount);
-            break;
-          case 'atlas':
-            data = SyntheticDataGenerator.atlasLike(pointCount);
-            break;
-          case 'batches':
-            data = SyntheticDataGenerator.batchEffects(pointCount);
-            break;
-          case 'octopus':
-            data = SyntheticDataGenerator.octopus(pointCount);
-            break;
-          case 'spirals':
-            data = SyntheticDataGenerator.spirals(pointCount);
-            break;
-          case 'flatumap':
-            data = SyntheticDataGenerator.flatUMAP(pointCount);
-            break;
-          case 'glb':
-            // Async loading from GLB file - update notification
-            notifications.updateBenchmark(benchNotifId, 10, 'Loading GLB model...');
-            data = await SyntheticDataGenerator.fromGLBUrl(pointCount);
-            if (!syntheticTransaction.isCurrent()) {
-              return dismissSupersededBenchmark();
-            }
-            syntheticTransaction.assertCurrent();
-            break;
-          case 'clusters':
-          default:
-            data = SyntheticDataGenerator.gaussianClusters(pointCount);
+        if (pattern === 'glb') {
+          notifications.updateBenchmark(benchNotifId, 10, 'Loading GLB model...');
         }
+        data = await generateSyntheticDataOffThread({
+          pattern,
+          count: pointCount,
+          signal: syntheticTransaction.signal
+        });
       } catch (err) {
         if (!syntheticTransaction.isCurrent()) {
           return dismissSupersededBenchmark();
@@ -4254,28 +4192,74 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
       notifications.completeReport(reportNotifId, copiedToClipboard);
     }
 
+    /**
+     * Read the requested point count from the control.
+     *
+     * `parseInt` read the field's exponent form — a typed `1e9` became one
+     * point — and accepted a trailing suffix. The field is an exact integer
+     * count, so parse it as one and let `runBenchmark` refuse anything the
+     * declared range excludes.
+     *
+     * @returns {number} The requested count, or NaN when the field is unusable.
+     */
+    function readBenchmarkPointCount() {
+      const raw = (benchmarkCountInput?.value ?? '').trim();
+      // A cleared field means the control's own default, which is declared in
+      // the markup beside its min and max rather than restated here.
+      return Number(raw === '' ? benchmarkCountInput?.defaultValue : raw);
+    }
+
+    /**
+     * Start a run from a control and own its outcome.
+     *
+     * `runBenchmark` can reject — publication failures throw — and a dropped
+     * promise turns that into an unhandled rejection the user never sees. It
+     * reports every `false` outcome itself, so only the rejection needs a home.
+     *
+     * @param {number} count - Requested point count.
+     * @param {string} pattern - Requested synthetic pattern.
+     */
+    function startBenchmarkRun(count, pattern) {
+      runBenchmark(count, pattern).catch(error => {
+        console.error('[Main] Synthetic benchmark failed:', error);
+        notifications.error(
+          `Synthetic data load failed: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+          { category: 'benchmark', title: 'Benchmark failed' }
+        );
+      });
+    }
+
     // Wire up run button
     if (benchmarkRunBtn) {
       benchmarkRunBtn.addEventListener('click', () => {
-        const count = parseInt(benchmarkCountInput?.value || '1000000', 10);
         const pattern = benchmarkPatternSelect?.value || 'clusters';
-        runBenchmark(count, pattern);
+        startBenchmarkRun(readBenchmarkPointCount(), pattern);
       });
     }
 
     if (benchmarkReportBtn) {
       benchmarkReportBtn.addEventListener('click', () => {
-        generateSituationReport();
+        generateSituationReport().catch(error => {
+          console.error('[Main] Situation report failed:', error);
+          notifications.error(
+            `Situation report failed: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+            { category: 'benchmark', title: 'Report failed' }
+          );
+        });
       });
     }
 
     // Wire up preset buttons
     benchPresets.forEach(btn => {
       btn.addEventListener('click', () => {
-        const count = parseInt(btn.dataset.count, 10);
+        const count = Number(btn.dataset.count);
         if (benchmarkCountInput) benchmarkCountInput.value = count;
         const pattern = benchmarkPatternSelect?.value || 'clusters';
-        runBenchmark(count, pattern);
+        startBenchmarkRun(count, pattern);
       });
     });
 
@@ -4414,12 +4398,6 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
               items.push(createListItem(`• ${c.type}: ${c.evidence}`, { status: 'warning' }));
             }
 
-            // Add specific overhead issues
-            const shaderMs = parseFloat(s.overhead.shaderComplexityMs) || 0;
-            if (shaderMs > 3) {
-              items.push(createListItem(`• Shader complexity adds ${shaderMs.toFixed(1)}ms per frame`, { status: 'warning' }));
-            }
-
             // Add jank/stuttering issues
             if (s.frameStability && s.frameStability.hasJank) {
               const severity = s.frameStability.jankSeverity;
@@ -4477,7 +4455,7 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
           const bnP95 = document.getElementById('bn-p95');
           const bnLodOverhead = document.getElementById('bn-lod-overhead');
           const bnFrustumOverhead = document.getElementById('bn-frustum-overhead');
-          const bnShaderOverhead = document.getElementById('bn-shader-overhead');
+          const bnPointSizeResponse = document.getElementById('bn-point-size-response');
 
           if (bnVisiblePoints) bnVisiblePoints.textContent = formatNumShort(s.rendering.visiblePoints);
           if (bnGpuMemory) {
@@ -4493,7 +4471,7 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
           if (bnP95) bnP95.textContent = s.performance.p95FrameTimeMs.toFixed(1) + 'ms';
           if (bnLodOverhead) bnLodOverhead.textContent = s.overhead.lodMs + 'ms';
           if (bnFrustumOverhead) bnFrustumOverhead.textContent = s.overhead.frustumCullingMs + 'ms';
-          if (bnShaderOverhead) bnShaderOverhead.textContent = s.overhead.shaderComplexityMs + 'ms';
+          if (bnPointSizeResponse) bnPointSizeResponse.textContent = s.bottleneck.pointSizeResponse;
 
           // Frame stability and CPU health stats
           const bnFrameStability = document.getElementById('bn-frame-stability');
@@ -4530,6 +4508,11 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
         }
       });
     }
+
+    // Every renderer and benchmark listener above now exists, so the controls
+    // they act on can be offered. Nothing between here and the retirement at
+    // the top of this bootstrap may read those controls as accepted state.
+    admitDeferredControls();
 
     // Define onboarding callback functions now that UI is ready
     toggleSidebarVisibility = () => {

@@ -1,8 +1,12 @@
 import { createHash } from 'node:crypto';
 import { expect, test } from '@playwright/test';
+import {
+  APP_ORIGIN,
+  ENCODED_EXPORTS_BASE_URL,
+} from './helpers/origins.mjs';
 
 const PREPARED_DATASET_URL =
-  'http://127.0.0.1:4173/?exportsBaseUrl=http%3A%2F%2F127.0.0.1%3A4173%2Ftests%2Fbrowser%2Ffixtures%2Fexports%2F&dataset=current-ui-prepared&acceptance=reduced-motion-camera-path-ci';
+  `${APP_ORIGIN}/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=reduced-motion-camera-path-ci`;
 
 const VIEWPORT = { width: 1440, height: 1000 };
 const CANVAS_CLIP = { x: 420, y: 260, width: 480, height: 380 };

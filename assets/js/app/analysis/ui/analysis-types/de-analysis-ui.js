@@ -27,7 +27,6 @@ import {
 // gene table are rendered from HTML templates in the expanded modal view
 // (_renderModalStats, _renderModalAnnotations), which is the only DE result view.
 import { createPageComparisonSelector } from '../components/index.js';
-import { purgePlot } from '../../plots/plotly-loader.js';
 import { isFiniteNumber } from '../../shared/number-utils.js';
 import { ProgressTracker } from '../../shared/progress-tracker.js';
 
@@ -371,9 +370,7 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
       await this._showResult(result, requestId);
       if (!this._isCurrentAnalysisRequest(requestId)) return;
 
-      this._lastResult = result;
-      this._currentPageData = result.data || result;
-      this._requestedPlotOptions = structuredClone(result.options || {});
+      await this._publishAnalysisResult(result, requestId);
       progressTracker.complete('Differential expression complete');
       progressSettled = true;
 
@@ -437,27 +434,14 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
    * @param {Object} result - Analysis result
    */
   async _showResult(result, requestId) {
-    const candidate = await this._renderPreviewPlot({
-      result,
-      requestId,
-      containerId: this._plotContainerIdBase
-    });
-    if (candidate === null || !this._isCurrentAnalysisRequest(requestId)) return;
-    // Expand (modal) action - shows stats and DE genes table in expanded view
-    this._resultContainer
-      .querySelector('.analysis-actions')
-      ?.remove();
-    const actionsContainer = document.createElement('div');
-    actionsContainer.className = 'analysis-actions';
-    actionsContainer.style.display = 'flex';
-
-    const expandBtn = this._createExpandButton();
-    expandBtn.title = 'Open in full view with statistics and export options';
-    actionsContainer.appendChild(expandBtn);
-    this._resultContainer.appendChild(actionsContainer);
-
     // Note: Summary statistics and Top DE genes table are NOT shown in sidebar
     // They are only displayed in the expanded modal view (_renderModalStats and _renderModalAnnotations)
+    return this._renderPreviewPlot({
+      result,
+      requestId,
+      containerId: this._plotContainerIdBase,
+      expandable: true
+    });
   }
 
   // ===========================================================================

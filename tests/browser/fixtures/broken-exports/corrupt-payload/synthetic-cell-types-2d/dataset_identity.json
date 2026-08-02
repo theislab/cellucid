@@ -1,0 +1,56 @@
+{
+  "version": 2,
+  "id": "synthetic-cell-types-2d",
+  "name": "Synthetic cell-type islands \u2014 2D",
+  "description": "Three synthetic 2D populations for learning categorical and continuous coloring, marker genes, filtering, highlighting, and weighted connectivity.",
+  "created_at": "2026-07-27T00:00:00Z",
+  "cellucid_data_version": "0.9.1",
+  "stats": {
+    "n_cells": 72,
+    "n_genes": 8,
+    "n_obs_fields": 4,
+    "n_categorical_fields": 2,
+    "n_continuous_fields": 2,
+    "has_connectivity": true,
+    "n_edges": 144
+  },
+  "embeddings": {
+    "available_dimensions": [
+      2
+    ],
+    "default_dimension": 2,
+    "files": {
+      "2d": "points_2d.bin.gz"
+    }
+  },
+  "obs_fields": [
+    {
+      "key": "quality_score",
+      "kind": "continuous"
+    },
+    {
+      "key": "library_size",
+      "kind": "continuous"
+    },
+    {
+      "key": "cell_type",
+      "kind": "category",
+      "n_categories": 3
+    },
+    {
+      "key": "batch",
+      "kind": "category",
+      "n_categories": 3
+    }
+  ],
+  "export_settings": {
+    "compression": 6,
+    "var_quantization": 8,
+    "obs_continuous_quantization": 8,
+    "obs_categorical_dtype": "uint8"
+  },
+  "source": {
+    "name": "Cellucid deterministic synthetic examples",
+    "url": "https://github.com/theislab/cellucid-demo-custom-datasets"
+  }
+}

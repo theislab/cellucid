@@ -10,8 +10,14 @@
  */
 
 import { loadPointsBinary } from './data-loaders.js';
-import { getActiveAnnDataBinding } from './anndata-provider.js';
-import { resolveUrl } from './data-source.js';
+import {
+  getActiveAnnDataBinding,
+  isAnnDataUrl,
+} from './anndata-provider.js';
+import {
+  resolveUrl,
+  validateVectorFieldsMetadata,
+} from './data-source.js';
 
 const SUPPORTED_DIMENSIONS = Object.freeze([1, 2, 3]);
 const SUPPORTED_DIMENSION_SET = new Set(SUPPORTED_DIMENSIONS);
@@ -55,96 +61,20 @@ function requireDimension(value, label) {
   return value;
 }
 
-function requireDimensions(value, label) {
-  if (!Array.isArray(value) || value.length === 0) {
-    throw new TypeError(`${label} must be a non-empty array.`);
-  }
-  const dimensions = value.map((dimension, index) =>
-    requireDimension(dimension, `${label}[${index}]`)
-  );
-  for (let index = 1; index < dimensions.length; index++) {
-    if (dimensions[index] <= dimensions[index - 1]) {
-      throw new TypeError(
-        `${label} must contain unique dimensions in ascending order.`
-      );
-    }
-  }
-  return Object.freeze(dimensions);
-}
-
-function requireDimensionPathMap(value, dimensions, label) {
-  if (!isPlainRecord(value)) {
-    throw new TypeError(`${label} must be a plain object.`);
-  }
-  const expectedKeys = dimensions.map((dimension) => `${dimension}d`);
-  const actualKeys = Object.keys(value);
-  if (
-    actualKeys.length !== expectedKeys.length ||
-    expectedKeys.some((key) => !Object.hasOwn(value, key))
-  ) {
-    throw new TypeError(
-      `${label} must declare exactly ${expectedKeys.join(', ')}.`
-    );
-  }
-  const result = {};
-  for (const key of expectedKeys) {
-    result[key] = requireNonEmptyString(value[key], `${label}.${key}`);
-  }
-  return Object.freeze(result);
-}
-
-function parseFieldEntry(fieldId, value) {
-  const label = `vector_fields.fields.${fieldId}`;
-  requireExactKeys(
-    value,
-    ['label', 'basis', 'available_dimensions', 'default_dimension'],
-    ['files', 'obsm_keys'],
-    label
-  );
-  const dimensions = requireDimensions(
-    value.available_dimensions,
-    `${label}.available_dimensions`
-  );
-  const defaultDimension = requireDimension(
-    value.default_dimension,
-    `${label}.default_dimension`
-  );
-  if (!dimensions.includes(defaultDimension)) {
-    throw new TypeError(
-      `${label}.default_dimension must be one of its available_dimensions.`
-    );
-  }
-  const hasFiles = Object.hasOwn(value, 'files');
-  const hasObsmKeys = Object.hasOwn(value, 'obsm_keys');
-  if (hasFiles === hasObsmKeys) {
-    throw new TypeError(
-      `${label} must declare exactly one of "files" or "obsm_keys".`
-    );
-  }
-
-  return Object.freeze({
-    label: requireNonEmptyString(value.label, `${label}.label`),
-    basis: requireNonEmptyString(value.basis, `${label}.basis`),
-    available_dimensions: dimensions,
-    default_dimension: defaultDimension,
-    ...(hasFiles
-      ? {
-          files: requireDimensionPathMap(
-            value.files,
-            dimensions,
-            `${label}.files`
-          )
-        }
-      : {
-          obsm_keys: requireDimensionPathMap(
-            value.obsm_keys,
-            dimensions,
-            `${label}.obsm_keys`
-          )
-        }),
-  });
-}
-
+/**
+ * Freeze one already-validated `vector_fields` object into the runtime shape.
+ *
+ * The rule itself lives in exactly one place — validateVectorFieldsMetadata()
+ * in data-source.js — so the runtime manager, the hosted-catalog reader, and
+ * the local prepared-export reader cannot disagree about what a vector field
+ * is. `files` is the only path map the format has: the in-browser H5AD/Zarr
+ * adapters publish `files` too and resolve their own obsm keys privately, so
+ * this module routes a direct-AnnData read by the dataset's protocol, never by
+ * the shape of its metadata.
+ *
+ * @param {unknown} value
+ * @returns {Readonly<{defaultField: string|null, fields: Map<string, Object>}>}
+ */
 function parseMetadata(value) {
   if (value === null) {
     return Object.freeze({
@@ -152,35 +82,28 @@ function parseMetadata(value) {
       fields: new Map(),
     });
   }
-  requireExactKeys(
-    value,
-    ['default_field', 'fields'],
-    [],
-    'vector_fields'
-  );
-  if (!isPlainRecord(value.fields) || Object.keys(value.fields).length === 0) {
-    throw new TypeError('vector_fields.fields must be a non-empty plain object.');
-  }
+  validateVectorFieldsMetadata(value, { sourceType: 'vector-field-manager' });
 
   const fields = new Map();
   for (const [fieldId, field] of Object.entries(value.fields)) {
-    requireNonEmptyString(fieldId, 'vector field id');
-    fields.set(fieldId, parseFieldEntry(fieldId, field));
+    const dimensions = Object.freeze([...field.available_dimensions]);
+    const files = {};
+    for (const dimension of dimensions) {
+      files[`${dimension}d`] = field.files[`${dimension}d`];
+    }
+    fields.set(fieldId, Object.freeze({
+      label: field.label,
+      basis: field.basis,
+      available_dimensions: dimensions,
+      default_dimension: field.default_dimension,
+      files: Object.freeze(files),
+    }));
   }
 
-  let defaultField = null;
-  if (value.default_field !== null) {
-    defaultField = requireNonEmptyString(
-      value.default_field,
-      'vector_fields.default_field'
-    );
-    if (!fields.has(defaultField)) {
-      throw new TypeError(
-        'vector_fields.default_field must be null or name a declared field.'
-      );
-    }
-  }
-  return Object.freeze({ defaultField, fields });
+  return Object.freeze({
+    defaultField: value.default_field,
+    fields,
+  });
 }
 
 function requireManagerOptions(options) {
@@ -371,7 +294,11 @@ export class VectorFieldManager {
     const scale = transform.scale;
 
     let vectors;
-    if (Object.hasOwn(entry, 'obsm_keys')) {
+    if (isAnnDataUrl(this.baseUrl)) {
+      // An h5ad:// or zarr:// dataset publishes declarative `files` paths that
+      // no transport can fetch; the adapter owns the obsm resolution behind
+      // getVectorField(). Routing on the protocol keeps the metadata shape the
+      // same as an on-disk export's.
       const binding = getActiveAnnDataBinding(this.baseUrl);
       if (typeof binding.adapter.getVectorField !== 'function') {
         throw new Error(

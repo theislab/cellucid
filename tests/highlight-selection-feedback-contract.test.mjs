@@ -8,6 +8,7 @@
  */
 
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import { initAnnotationSelection }
@@ -658,6 +659,29 @@ test('repeating an abandoned gesture repaints the same panel, not a second '
 
   assert.equal(tool.modeDescription.innerHTML, afterOne);
 });
+
+test('the miss notice offers only a remedy hit testing actually responds to',
+  async () => {
+    const pickingSource = await readFile(
+      new URL('../assets/js/rendering/picking.js', import.meta.url),
+      'utf8'
+    );
+
+    // The search radius is one module constant with no input that can widen it,
+    // and nothing in the picking path reads a drawn size. A notice that told
+    // the user to raise Point size would be advising a control the code cannot
+    // hear, so the copy and the code are pinned to each other here.
+    assert.match(pickingSource, /^const PICK_SEARCH_RADIUS = [\d.]+;$/m);
+    assert.doesNotMatch(pickingSource, /\bpoint\s*size\b/i);
+    assert.doesNotMatch(pickingSource, /sizeAttenuation|gl_PointSize/);
+    assert.doesNotMatch(SELECTION_NOTICE.noCellUnderPointer, /\bpoint size\b/i);
+
+    // Zoom is the remedy that works: a nearer camera selects a finer LOD level,
+    // and picking rejects every cell the active level has not admitted.
+    assert.match(SELECTION_NOTICE.noCellUnderPointer, /\bZoom in\b/);
+    assert.match(pickingSource, /lodAdmissionLevels\[cellIndex\] > lodLevel/);
+  }
+);
 
 test('the tools reject an abandonment reason they have no wording for', () => {
   assert.throws(

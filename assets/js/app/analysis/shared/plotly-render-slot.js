@@ -7,7 +7,7 @@
  */
 
 import { loadPlotly, purgePlot } from '../plots/plotly-loader.js';
-import { PlotRenderSlot } from './plot-render-slot.js';
+import { PlotRenderSlot, readHostLayoutBox } from './plot-render-slot.js';
 
 function combineErrors(errors, message) {
   const present = [...new Set(errors.filter(Boolean))];
@@ -21,24 +21,19 @@ function requireError(error, context) {
   return new TypeError(`${context} rejected with a non-Error value`);
 }
 
+/**
+ * The host's layout box - the same box `PlotRenderSlot` renders candidates
+ * into, so a commit and a later resize can never disagree about the size.
+ */
 function requirePositiveMeasurement(host) {
-  if (typeof host.getBoundingClientRect !== 'function') {
-    throw new TypeError('Plotly render slot host must be measurable');
-  }
-  const bounds = host.getBoundingClientRect();
-  const width = Number(bounds.width);
-  const height = Number(bounds.height);
-  if (
-    !Number.isFinite(width) ||
-    width < 0 ||
-    !Number.isFinite(height) ||
-    height < 0
-  ) {
+  try {
+    return readHostLayoutBox(host);
+  } catch (error) {
     throw new TypeError(
-      'Plotly render slot host dimensions must be finite and non-negative'
+      `Plotly render slot host must be measurable: ${error.message}`,
+      { cause: error }
     );
   }
-  return { width, height };
 }
 
 function sameMeasurement(left, right) {

@@ -35,12 +35,19 @@ export const OverlapStrategy = Object.freeze({
   INTERSECTIONS: 'intersections'
 });
 
+/**
+ * How many categories one field may hold is not stated here. That ceiling is a
+ * property of the on-disk code width and is derived once, in
+ * `data/categorical-storage-contract.js`, alongside the missing-code sentinel
+ * it is inseparable from. A copy in this file sat at 255 -- the uint8 ceiling
+ * -- and so refused every operation on the uint16 categoricals both exporters
+ * write and every reader accepts.
+ */
 export const Limits = Object.freeze({
   MAX_FIELD_KEY_LENGTH: 256,
   MAX_CATEGORY_LABEL_LENGTH: 256,
   MAX_USER_DEFINED_FIELDS: 20,
-  MAX_INTERSECTION_PAGES: 12,
-  MAX_CATEGORIES_PER_FIELD: 255 // keeps codes in Uint8 for user-defined categoricals
+  MAX_INTERSECTION_PAGES: 12
 });
 
 /**

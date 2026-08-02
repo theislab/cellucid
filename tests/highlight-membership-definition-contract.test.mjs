@@ -255,7 +255,11 @@ test('a preview publishes the active page underneath the in-progress selection',
     [0, 1, 4, 5],
     'the published index list must contain every painted cell exactly once'
   );
-  assert.deepEqual(state._highlightedCellIndices, [0, 1, 4, 5]);
+  assert.ok(
+    state._highlightedCellIndices instanceof Uint32Array,
+    'the published index list is a Uint32Array: a selection can be the whole dataset, and copying it into a plain array costs eight bytes per cell'
+  );
+  assert.deepEqual([...state._highlightedCellIndices], [0, 1, 4, 5]);
 });
 
 test('combining pages reads the same membership the pages render', () => {

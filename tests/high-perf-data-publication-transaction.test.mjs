@@ -26,6 +26,7 @@ function createDataGl() {
   const gl = {
     ARRAY_BUFFER: 0x8892,
     ELEMENT_ARRAY_BUFFER: 0x8893,
+    MAX_TEXTURE_SIZE: 0x0d33,
     NO_ERROR: 0,
     TEXTURE_2D: 0x0de1,
     createBuffer() {
@@ -73,6 +74,10 @@ function createDataGl() {
     },
     getError() {
       return gl.NO_ERROR;
+    },
+    getParameter(parameter) {
+      assert.equal(parameter, gl.MAX_TEXTURE_SIZE);
+      return 16_384;
     },
     _state: {
       buffers,

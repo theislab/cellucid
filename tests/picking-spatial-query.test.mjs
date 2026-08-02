@@ -1,9 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import {
-  SpatialIndex,
-} from '../assets/js/rendering/high-perf-renderer.js';
+import { SpatialIndex } from '../assets/js/rendering/high-perf/spatial-index.js';
 import {
   findRaySamplePick,
 } from '../assets/js/rendering/picking.js';
@@ -141,6 +139,49 @@ function pickBothWays(input) {
   });
   return { direct, indexed, spatialIndex };
 }
+
+test('the ray-sample search radius is fixed in world space and no drawn-size '
+  + 'input reaches it', () => {
+  const input = {
+    positions: Float32Array.from([SEARCH_RADIUS * 1.5, 0, 0.2]),
+    transparency: Float32Array.of(1),
+    ray: {
+      origin: [0, 0, 0],
+      direction: [0, 0, 1],
+    },
+    maxDistance: 0.5,
+    spatialIndex: null,
+  };
+
+  const missed = findRaySamplePick(input);
+  assert.equal(
+    missed.cellIndex,
+    -1,
+    'a cell beyond the fixed world radius is not hittable',
+  );
+
+  // The Visualization "Point size" control ends at the `u_pointSize` shader
+  // uniform. Under full perspective attenuation that draws a world radius of
+  // pointSize * 0.01 / 2, so the slider maximum of 200 draws a dot more than
+  // thirty times wider than the search radius. Hit testing never sees it, so
+  // the abandoned-gesture notice must not offer it as a remedy.
+  for (const pointSize of [0.25, 0.75, 6, 200]) {
+    assert.deepEqual(
+      findRaySamplePick({ ...input, pointSize }),
+      missed,
+      `point size ${pointSize} must not change the hit set`,
+    );
+  }
+
+  assert.equal(
+    findRaySamplePick({
+      ...input,
+      positions: Float32Array.from([SEARCH_RADIUS * 0.5, 0, 0.2]),
+    }).cellIndex,
+    0,
+    'the same cell inside the fixed radius is hittable',
+  );
+});
 
 test('coarse LOD direct picking ignores a closer excluded source point', () => {
   const positions = Float32Array.from([

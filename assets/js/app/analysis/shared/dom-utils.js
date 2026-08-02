@@ -22,6 +22,129 @@ import { PerformanceConfig } from './performance-config.js';
  */
 export const NONE_VALUE = '-1';
 
+/** Elements a `<label for>` can name. */
+const LABELLABLE_TAGS = new Set([
+  'INPUT',
+  'SELECT',
+  'TEXTAREA',
+  'METER',
+  'OUTPUT',
+  'PROGRESS'
+]);
+
+/**
+ * Monotonic counter behind {@link nextElementId}.
+ *
+ * Ids used to be derived from the control's name alone
+ * (`form-checkbox-useCache`), so the sidebar and a copied analysis window
+ * produced the same id twice and `label[for]` resolved to whichever came
+ * first in the document — clicking the copy's label toggled the sidebar's
+ * checkbox.
+ */
+let elementIdSequence = 0;
+
+/**
+ * Mint an id that is unique for the lifetime of the document.
+ *
+ * @param {string} prefix - Readable prefix, kept so ids stay debuggable.
+ * @returns {string}
+ */
+function nextElementId(prefix) {
+  if (typeof prefix !== 'string' || prefix.length === 0) {
+    throw new TypeError('An element id prefix must be non-empty text');
+  }
+  elementIdSequence += 1;
+  return `${prefix}-${elementIdSequence}`;
+}
+
+/**
+ * Every control in `root` that a label can name, `root` itself included.
+ *
+ * @param {HTMLElement} root
+ * @returns {HTMLElement[]}
+ */
+function labellableControls(root) {
+  if (root === null || typeof root !== 'object') return [];
+  const found = LABELLABLE_TAGS.has(root.tagName) ? [root] : [];
+  if (typeof root.querySelectorAll === 'function') {
+    found.push(...root.querySelectorAll(
+      'input, select, textarea, meter, output, progress'
+    ));
+  }
+  return found.filter(control => control.type !== 'hidden');
+}
+
+/**
+ * Name a control well enough to tell it apart from its row-mates.
+ *
+ * The `name` attribute is what the analysis code already uses to identify a
+ * control, so it is the honest source for the distinguishing part of the name.
+ *
+ * @param {HTMLElement} control
+ * @returns {string}
+ */
+function describeControl(control) {
+  const name = control.getAttribute?.('name');
+  if (typeof name === 'string' && name.length > 0) {
+    return name
+      .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+      .replace(/[-_]+/g, ' ')
+      .toLowerCase();
+  }
+  return control.tagName.toLowerCase();
+}
+
+/**
+ * Bind a form row's visible label to the control it names.
+ *
+ * A row that holds more than one control — the Marker Genes "Mode:" row pairs
+ * the mode and method selects — binds the label to the first and gives the rest
+ * an `aria-label` derived from it, so no control is left anonymous. A label
+ * that already wraps or targets a control in the row is left alone.
+ *
+ * @param {HTMLElement} row - The row element.
+ * @param {HTMLElement} [label] - The row's label, when the caller already has it.
+ * @returns {boolean} Whether the row now has a named control.
+ */
+export function associateRowLabel(row, label = null) {
+  const labelEl = label ?? row.querySelector?.('label') ?? null;
+  if (labelEl === null) return false;
+  const labelText = labelEl.textContent.trim();
+  if (labelText.length === 0) return false;
+
+  const controls = labellableControls(row);
+  if (controls.length === 0) return false;
+  // A label that wraps its control already names it.
+  if (controls.some(control => labelEl.contains?.(control))) return true;
+  // A label already pointing at a control in this row is correct.
+  if (
+    labelEl.htmlFor.length > 0 &&
+    controls.some(control => control.id === labelEl.htmlFor)
+  ) {
+    return true;
+  }
+
+  const [primary, ...secondary] = controls;
+  if (primary.id.length === 0) {
+    primary.id = nextElementId(`form-control-${describeControl(primary)}`);
+  }
+  labelEl.htmlFor = primary.id;
+  for (const control of secondary) {
+    if (
+      control.hasAttribute('aria-label') ||
+      control.hasAttribute('aria-labelledby') ||
+      control.labels?.length > 0
+    ) {
+      continue;
+    }
+    control.setAttribute(
+      'aria-label',
+      `${labelText.replace(/:$/, '')} — ${describeControl(control)}`
+    );
+  }
+  return true;
+}
+
 // =============================================================================
 // PAGE DATA UTILITIES
 // =============================================================================
@@ -202,6 +325,12 @@ export function createRangeSlider({ id, min, max, step, value, onChange, onInput
 
 /**
  * Create a form input row with label and input element
+ *
+ * The label names the control it sits beside. It used to be emitted with no
+ * association at all, which left every select built through this row —
+ * "Statistical method", "Scoring method", "Group By", "Distance Metric", every
+ * Performance Settings control — reaching the accessibility tree anonymous.
+ *
  * @param {string} labelText - Label text
  * @param {HTMLElement} inputEl - Input element to include
  * @param {Object} [options] - Additional options
@@ -218,6 +347,7 @@ export function createFormRow(labelText, inputEl, options = {}) {
   row.appendChild(label);
 
   row.appendChild(inputEl);
+  associateRowLabel(row, label);
 
   if (options.description) {
     const desc = document.createElement('div');
@@ -258,6 +388,7 @@ export function createFormSelect(nameOrConfig, options, config = {}) {
   const select = document.createElement('select');
   select.className = config.className || 'obs-select';
   select.name = name;
+  select.id = nextElementId(`form-select-${name}`);
 
   // Build options map for description lookup
   const optionsMap = new Map();
@@ -321,18 +452,20 @@ function _createFormSelectWithLabel({ label, name, options, helpText, className,
   const wrapper = document.createElement('div');
   wrapper.className = `form-select-row ${className || ''}`.trim();
 
+  const selectId = nextElementId(`form-select-${name}`);
+
   // Create label
   const labelEl = document.createElement('label');
   labelEl.className = 'form-select-label';
   labelEl.textContent = label;
-  labelEl.htmlFor = `form-select-${name}`;
+  labelEl.htmlFor = selectId;
   wrapper.appendChild(labelEl);
 
   // Create select
   const select = document.createElement('select');
   select.className = 'obs-select';
   select.name = name;
-  select.id = `form-select-${name}`;
+  select.id = selectId;
 
   for (const opt of options) {
     const option = document.createElement('option');
@@ -469,7 +602,7 @@ export function createFormCheckbox({ label, name, checked = false, helpText, onC
   const checkbox = document.createElement('input');
   checkbox.type = 'checkbox';
   checkbox.name = name;
-  checkbox.id = `form-checkbox-${name}`;
+  checkbox.id = nextElementId(`form-checkbox-${name}`);
   checkbox.checked = checked;
 
   const labelEl = document.createElement('label');
@@ -532,6 +665,144 @@ export function createActionsBar(buttons) {
   }
 
   return bar;
+}
+
+// =============================================================================
+// DISCLOSURE SECTIONS
+// =============================================================================
+
+/**
+ * Turn a collapsible section header into an operable disclosure control.
+ *
+ * Analysis panels used to render these headers as plain `<div>`s with a click
+ * listener, which left "Performance Settings", "Clustering" and the Quick
+ * Insights "Page Selection" section — and every control they hide —
+ * unreachable without a mouse. This matches the `role="button"` +
+ * `tabindex="0"` pattern the surrounding accordions already use, so no new
+ * styling is required.
+ *
+ * @param {Object} options
+ * @param {HTMLElement} options.header - The clickable header element.
+ * @param {HTMLElement} options.content - The region the header shows and hides.
+ * @param {boolean} options.expanded - Current expanded state.
+ * @param {HTMLElement} [options.glyph] - Decorative caret to hide from AT.
+ * @param {string} [options.contentId] - Stable id for the content region.
+ * @returns {(expanded: boolean) => void} Applies a new expanded state.
+ */
+export function createDisclosureHeader({
+  header,
+  content,
+  expanded,
+  glyph,
+  contentId
+}) {
+  if (header === null || typeof header?.setAttribute !== 'function') {
+    throw new TypeError('A disclosure header must be an element');
+  }
+  if (content === null || typeof content?.setAttribute !== 'function') {
+    throw new TypeError('A disclosure region must be an element');
+  }
+  if (typeof expanded !== 'boolean') {
+    throw new TypeError('A disclosure header requires a boolean expanded state');
+  }
+  if (contentId !== undefined &&
+      (typeof contentId !== 'string' || contentId.length === 0)) {
+    throw new TypeError('A disclosure region id must be exact non-empty text');
+  }
+
+  content.id = contentId ?? nextElementId('disclosure-region');
+  header.setAttribute('role', 'button');
+  header.setAttribute('aria-controls', content.id);
+  header.tabIndex = 0;
+  if (glyph) glyph.setAttribute('aria-hidden', 'true');
+
+  // `display` stays the toggle, matching the rest of the analysis panels: the
+  // section stylesheets style these regions by class and never set `display`,
+  // so the `hidden` attribute would be the odd one out here.
+  const apply = isExpanded => {
+    header.setAttribute('aria-expanded', isExpanded ? 'true' : 'false');
+    content.style.display = isExpanded ? 'block' : 'none';
+  };
+  apply(expanded);
+
+  header.addEventListener('keydown', event => {
+    if (event.key !== 'Enter' && event.key !== ' ') return;
+    event.preventDefault();
+    header.click();
+  });
+
+  return apply;
+}
+
+/**
+ * Create a collapsible settings section with an operable header.
+ *
+ * Owns the caret, the expanded state and the announced state together, so a
+ * caller cannot render one without the others.
+ *
+ * @param {Object} options
+ * @param {string} options.title - Header text.
+ * @param {boolean} [options.expanded=false] - Initial expanded state.
+ * @param {string} [options.containerClassName] - Extra class for the wrapper.
+ * @param {string} [options.headerClassName] - Extra class for the header.
+ * @param {string} [options.contentClassName] - Extra class for the region.
+ * @returns {{ container: HTMLElement, header: HTMLElement, content: HTMLElement }}
+ */
+export function createCollapsibleSection({
+  title,
+  expanded = false,
+  containerClassName = '',
+  headerClassName = '',
+  contentClassName = ''
+}) {
+  if (typeof title !== 'string' || title.length === 0) {
+    throw new TypeError('A collapsible section requires exact title text');
+  }
+  if (typeof expanded !== 'boolean') {
+    throw new TypeError('A collapsible section requires a boolean expanded state');
+  }
+
+  const container = document.createElement('div');
+  container.className = containerClassName;
+
+  const header = document.createElement('div');
+  header.className = `${headerClassName} analysis-perf-header`.trim();
+
+  const titleEl = document.createElement('span');
+  titleEl.className = 'analysis-perf-title';
+  titleEl.textContent = title;
+  header.appendChild(titleEl);
+
+  const toggleEl = document.createElement('span');
+  toggleEl.className = 'analysis-perf-toggle';
+  header.appendChild(toggleEl);
+
+  const content = document.createElement('div');
+  content.className = `${contentClassName} analysis-perf-content`.trim();
+
+  const announce = createDisclosureHeader({
+    header,
+    content,
+    expanded,
+    glyph: toggleEl
+  });
+
+  let isExpanded = expanded;
+  const apply = () => {
+    toggleEl.textContent = isExpanded ? '▲' : '▼';
+    announce(isExpanded);
+  };
+  apply();
+
+  header.addEventListener('click', () => {
+    isExpanded = !isExpanded;
+    apply();
+  });
+
+  container.appendChild(header);
+  container.appendChild(content);
+
+  return { container, header, content };
 }
 
 /**
@@ -598,28 +869,13 @@ export function createPerformanceSettings(options) {
     geneCount
   );
 
-  // Create container
-  const container = document.createElement('div');
-  container.className = className;
-
-  // Create header
-  const header = document.createElement('div');
-  header.className = `${className.replace('settings', 'header')} analysis-perf-header`;
-  const titleEl = document.createElement('span');
-  titleEl.className = 'analysis-perf-title';
-  titleEl.textContent = 'Performance Settings';
-
-  const toggleEl = document.createElement('span');
-  toggleEl.className = 'analysis-perf-toggle';
-  toggleEl.textContent = collapsed ? '▼' : '▲';
-
-  header.appendChild(titleEl);
-  header.appendChild(toggleEl);
-
-  // Create content
-  const content = document.createElement('div');
-  content.className = `${className.replace('settings', 'content')} analysis-perf-content`;
-  content.style.display = collapsed ? 'none' : 'block';
+  const { container, content } = createCollapsibleSection({
+    title: 'Performance Settings',
+    expanded: !collapsed,
+    containerClassName: className,
+    headerClassName: className.replace('settings', 'header'),
+    contentClassName: className.replace('settings', 'content')
+  });
 
   // Batch size selector
   const batchOptions = PerformanceConfig.getBatchSizeOptions(
@@ -687,17 +943,6 @@ export function createPerformanceSettings(options) {
     }
   ]);
   content.appendChild(createFormRow('Compute parallelism:', parallelismSelect));
-
-  // Toggle functionality
-  let isExpanded = !collapsed;
-  header.addEventListener('click', () => {
-    isExpanded = !isExpanded;
-    content.style.display = isExpanded ? 'block' : 'none';
-    header.querySelector('.analysis-perf-toggle').textContent = isExpanded ? '▲' : '▼';
-  });
-
-  container.appendChild(header);
-  container.appendChild(content);
 
   return container;
 }

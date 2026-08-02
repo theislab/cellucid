@@ -167,7 +167,7 @@ test('smoke render mode raises one fidelity blocker naming the mode', () => {
   assert.equal(warnings.length, 1);
   assert.match(warnings[0].title, /Volumetric smoke cloud/);
   assert.match(warnings[0].detail, /point layer only/i);
-  assert.match(warnings[0].detail, /Switch the render mode to Points/i);
+  assert.match(warnings[0].detail, /Set "Render mode" to Points/);
 });
 
 test('an unreadable render mode blocks instead of assuming points', () => {
@@ -440,6 +440,7 @@ function gridCameraState() {
 
 function gridRenderState() {
   return {
+    antialias: true,
     bgColor: Float32Array.from([1, 1, 1]),
     cameraDistance: 3,
     cameraPosition: [0, 0, 3],

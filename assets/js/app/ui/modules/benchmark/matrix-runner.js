@@ -1,18 +1,16 @@
 /**
- * @fileoverview Reachable configuration-matrix runner for the render benchmark.
+ * @fileoverview Configuration-matrix runner for the render benchmark.
  *
- * `HighPerfBenchmark` in `dev/benchmark.js` owns the only matrix sweep in the
- * repository and is unreachable from the running application: it builds its own
- * renderer, feeds it identity matrices and a constant camera distance, and is
- * imported only by node tests that never draw. Everything it reports about LOD
- * and frustum culling is therefore a measurement of a renderer configuration no
- * user ever runs.
- *
- * This runner drives the real viewer instead. It toggles the three axes that
+ * Sweeps the render configuration against the application's live viewer and
+ * records one frame-time distribution per cell. It toggles the three axes that
  * decide which code path the renderer takes — adaptive LOD, frustum culling and
  * view count — and runs every cell under both camera regimes, because the
  * STATIC/ORBIT difference is the direct measure of the avoidable per-frame CPU
  * work the axes gate.
+ *
+ * Measuring the viewer the user actually runs is the point: a matrix swept
+ * against a renderer built for the benchmark would report LOD and culling
+ * behaviour for a configuration nobody ever sees.
  *
  * The view-count axis respects the viewer's own mechanics rather than fighting
  * them. Setting the layout to `grid` alone changes nothing: the viewer stays on

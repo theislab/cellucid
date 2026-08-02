@@ -1601,10 +1601,34 @@ test('H5AD categorical ordered is one exact scalar HDF5 boolean and is preserved
       const loader = loaderWithObs({ label: field }, 1);
       await assert.rejects(
         loader.getObsFieldInfo('label'),
-        /ordered.*own boolean/i
+        /ordered must be a scalar HDF5 enum boolean/i
       );
       assert.equal(payloadReads, 0);
     });
+  }
+
+  // Byte order is not a property of a one-byte value. h5py takes the enum's
+  // base type from the writing host, so an `.h5ad` written on a big-endian
+  // machine reports `littleEndian: false` for `ordered` while h5wasm still
+  // returns the correct 0 or 1. Rejecting it read as "this is not a boolean",
+  // which was both wrong and unactionable.
+  for (const ordered of [false, true]) {
+    await t.test(
+      `big-endian ordered=${ordered} is an exact boolean`,
+      async () => {
+        const field = categoricalField(
+          new Int8Array([0, 1]),
+          dataset(['low', 'high'], { dtype: 'S' })
+        );
+        field.attrs.ordered = h5BooleanAttribute(ordered);
+        field.attrs.ordered.metadata.littleEndian = false;
+        const loader = loaderWithObs({ label: field }, 2);
+
+        const info = await loader.getObsFieldInfo('label');
+        assert.equal(info.ordered, ordered);
+        assert.equal((await loader.getObsField('label')).ordered, ordered);
+      }
+    );
   }
 
   await t.test('ordered true survives loader and adapter seams', async () => {

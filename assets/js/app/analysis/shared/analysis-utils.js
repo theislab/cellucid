@@ -12,7 +12,6 @@
  */
 
 import {
-  isFiniteNumber,
   filterFiniteNumbers,
   mean as computeMean,
   std as computeStd,
@@ -663,46 +662,6 @@ export function computeEffectSize(group1, group2) {
 }
 
 // =============================================================================
-// PAGE NAME RESOLUTION
-// =============================================================================
-
-/**
- * Resolve page IDs to page names
- *
- * @param {string[]} pageIds - Array of page IDs
- * @param {Object} dataLayer - Data layer instance
- * @returns {string[]} Array of page names
- */
-export function resolvePageNames(pageIds, dataLayer) {
-  const pages = dataLayer.getPages();
-  return pageIds.map(id => {
-    const page = pages.find(p => p.id === id);
-    return page?.name || id;
-  });
-}
-
-/**
- * Get page info for display
- *
- * @param {string[]} pageIds - Array of page IDs
- * @param {Object} dataLayer - Data layer instance
- * @returns {Object[]} Array of { id, name, cellCount }
- */
-export function getPageInfo(pageIds, dataLayer) {
-  const pages = dataLayer.getPages();
-
-  return pageIds.map(id => {
-    const page = pages.find(p => p.id === id);
-    const cellIndices = dataLayer.getCellIndicesForPage(id);
-    return {
-      id,
-      name: page?.name || id,
-      cellCount: cellIndices.length
-    };
-  });
-}
-
-// =============================================================================
 // DEFAULT EXPORT
 // =============================================================================
 
@@ -724,8 +683,5 @@ export default {
   getTypedFormValues,
   // Statistics
   computeBasicStats,
-  computeEffectSize,
-  // Page utilities
-  resolvePageNames,
-  getPageInfo
+  computeEffectSize
 };

@@ -308,7 +308,7 @@ npm version major     # 0.1.0 → 1.0.0   (breaking changes)
 This rewrites `package.json` and creates a git commit and tag.
 
 > **Note on version numbers:** this package starts at `0.0.1` deliberately,
-> independent of the Python package's version (`0.9.1` at time of writing). A
+> independent of the Python package's version (`0.9.1` at time of writing). A <!-- CELLUCID_VERSION -->
 > placeholder should not imply feature parity with the real distributions. When
 > a functional CLI ships, jumping straight to a matching version (e.g.
 > `npm version 0.10.0`) is fine — npm only requires versions to increase.

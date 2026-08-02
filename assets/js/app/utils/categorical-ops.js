@@ -11,6 +11,11 @@
  * @module categorical-ops
  */
 
+import {
+  categoricalStorageForCodes,
+  categoricalStorageForCount
+} from '../../data/categorical-storage-contract.js';
+
 function requireCategories(categories) {
   if (!Array.isArray(categories) || categories.length === 0) {
     throw new TypeError('Category transform requires a nonempty category array.');
@@ -172,27 +177,30 @@ export function applyCategoryIndexMapping(codes, mapping, newCategoryCount) {
   if (!(mapping instanceof Uint16Array) || mapping.length === 0) {
     throw new TypeError('Category remapping requires a nonempty Uint16Array mapping.');
   }
-  if (
-    !Number.isSafeInteger(newCategoryCount)
-    || newCategoryCount < 1
-    || newCategoryCount > 65_535
-  ) {
-    throw new RangeError('Category remapping requires from 1 through 65,535 categories.');
+  if (!Number.isSafeInteger(newCategoryCount) || newCategoryCount < 1) {
+    throw new RangeError('Category remapping requires at least one category.');
   }
+  const outputStorage = categoricalStorageForCount(
+    newCategoryCount,
+    'Category remapping'
+  );
   for (let index = 0; index < mapping.length; index++) {
     if (mapping[index] >= newCategoryCount) {
       throw new RangeError(`Category mapping ${index} is outside the new category inventory.`);
     }
   }
-  const inputMissingCode = codes instanceof Uint8Array ? 255 : 65_535;
+  const { missingValue: inputMissingCode } = categoricalStorageForCodes(
+    codes,
+    'Category remapping'
+  );
   for (let index = 0; index < codes.length; index++) {
     if (codes[index] >= mapping.length && codes[index] !== inputMissingCode) {
       throw new RangeError(`Category code ${index} is outside the old category inventory.`);
     }
   }
 
-  const ArrayType = newCategoryCount <= 255 ? Uint8Array : Uint16Array;
-  const outputMissingCode = ArrayType === Uint8Array ? 255 : 65_535;
+  const ArrayType = outputStorage.TypedArrayClass;
+  const outputMissingCode = outputStorage.missingValue;
   const out = new ArrayType(codes.length);
   for (let i = 0; i < codes.length; i++) {
     const oldIndex = codes[i];

@@ -134,9 +134,7 @@ export {
   getFormValues,
   getTypedFormValues,
   computeBasicStats,
-  computeEffectSize,
-  resolvePageNames,
-  getPageInfo
+  computeEffectSize
 } from './analysis-utils.js';
 
 // =============================================================================
@@ -207,15 +205,13 @@ export {
 // =============================================================================
 
 export {
-  zscoreRowwise,
+  zscoreRows,
   log1pTransform,
   computeDistanceMatrix,
-  correlationMatrix,
+  correlationDistanceMatrix,
   euclideanDistanceMatrix,
   cosineDistanceMatrix,
   reorderRows,
   reorderCols,
-  transposeMatrix,
-  TRANSFORM_TYPES,
-  DISTANCE_TYPES
+  transposeMatrix
 } from './matrix-utils.js';

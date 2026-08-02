@@ -1030,6 +1030,10 @@ export function initCategoricalLegend(options) {
         highlightBtn.className = 'legend-highlight-btn';
         highlightBtn.textContent = '◉';
         highlightBtn.setAttribute('aria-label', `Highlight category ${cat}`);
+        // The accessible name carries the category, which is dataset content.
+        // Declaring the analytics id keeps the click countable without the
+        // tracker having to read the name to identify the control.
+        highlightBtn.dataset.analyticsId = 'legend:highlight-category';
 
         syncCategoryHighlightButton(highlightBtn, catIdx, hasCells);
 

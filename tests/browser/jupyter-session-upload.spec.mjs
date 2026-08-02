@@ -1,4 +1,5 @@
 import { expect, test } from '@playwright/test';
+import { APP_ORIGIN } from './helpers/origins.mjs';
 
 test('Jupyter bridge owns authenticated parent traffic for its live lifecycle', async ({
   page,
@@ -111,7 +112,7 @@ test('Jupyter session upload invokes the native browser fetch with its valid rec
   let uploadCount = 0;
   let contentType = null;
   await page.route(
-    'http://127.0.0.1:4173/_cellucid/session_bundle?*',
+    `${APP_ORIGIN}/_cellucid/session_bundle?*`,
     async route => {
       uploadCount++;
       contentType = await route.request().headerValue('content-type');
@@ -129,13 +130,15 @@ test('Jupyter session upload invokes the native browser fetch with its valid rec
     waitUntil: 'domcontentloaded',
   });
 
-  await page.evaluate(async () => {
+  // The origin is resolved in Node and handed to the page, because the page has
+  // no access to the test module's bindings.
+  await page.evaluate(async serverUrl => {
     const { uploadJupyterSessionBundle } = await import(
       '/assets/js/data/jupyter-source.js'
     );
     await uploadJupyterSessionBundle({
       config: {
-        serverUrl: 'http://127.0.0.1:4173',
+        serverUrl,
         viewerId: 'viewer-native-fetch',
         viewerToken: 'token-native-fetch',
       },
@@ -149,7 +152,7 @@ test('Jupyter session upload invokes the native browser fetch with its valid rec
         new Blob([Uint8Array.of(1, 2, 3)]),
       fetchImpl: window.fetch,
     });
-  });
+  }, APP_ORIGIN);
 
   expect(uploadCount).toBe(1);
   expect(contentType).toBe('application/octet-stream');

@@ -65,7 +65,7 @@ const histogramDefinition = {
         const safePageName = escapeHtml(String(pd.pageName || ''));
         const trace = {
           type: 'histogram',
-          name: pd.pageName,
+          name: safePageName,
           x: pd.values,
           nbinsx: nbins,
           histnorm,

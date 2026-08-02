@@ -915,18 +915,6 @@ test('prepared vector metadata has one exact current shape', async t => {
 test('prepared identity requires exact producer export metadata', async t => {
   const cases = [
     [
-      'missing created_at',
-      identity => {
-        delete identity.created_at;
-      },
-    ],
-    [
-      'missing export_settings',
-      identity => {
-        delete identity.export_settings;
-      },
-    ],
-    [
       'extra export setting',
       identity => {
         identity.export_settings.codec = 'gzip';
@@ -987,6 +975,63 @@ test('prepared identity requires exact producer export metadata', async t => {
       await assertWorkingPreparedSource(working);
     });
   }
+});
+
+test('prepared identity omits created_at and export_settings without penalty', async t => {
+  // Both keys are optional at the top level of dataset_identity.json, and the
+  // hosted-catalog reader has always treated them that way. A spec-conformant
+  // third-party export that leaves them out must load from a local folder too.
+  const source = new LocalUserDirDataSource();
+  t.after(() => source.clear());
+
+  const identity = createPreparedIdentity({ id: 'optional-export-metadata' });
+  delete identity.created_at;
+  delete identity.export_settings;
+
+  const metadata = await source.loadFromPreparedDirectory(
+    createPreparedDirectory('optional-export-metadata', {
+      identityPayload: identity,
+    })
+  );
+
+  assert.equal(metadata.id, 'local-user:optional-export-metadata');
+  assert.equal(Object.hasOwn(metadata, 'created_at'), false);
+  assert.equal(Object.hasOwn(metadata, 'export_settings'), false);
+});
+
+test('prepared payload paths follow obs_manifest.json compression alone', async t => {
+  // With export_settings absent, obs_manifest.json is the export's compression
+  // declaration, so a .gz mismatch anywhere still fails the whole dataset.
+  const working = await loadWorkingPreparedSource(t);
+  const adoptionIdentity = working.source.getAdoptionIdentity();
+  const identity = createPreparedIdentity({
+    id: 'derived-compression-contradiction',
+  });
+  delete identity.export_settings;
+
+  await assert.rejects(
+    working.source.loadFromPreparedDirectory(
+      createPreparedDirectory('derived-compression-contradiction', {
+        identityPayload: identity,
+        obsText: JSON.stringify({
+          _format: 'compact_v1',
+          n_points: 2,
+          centroid_outlier_quantile: null,
+          latent_key: null,
+          compression: 6,
+          _obsSchemas: {},
+          _continuousFields: [],
+          _categoricalFields: [],
+        }),
+      })
+    ),
+    /must not end in \.gz|must end in \.gz/i
+  );
+  assert.equal(
+    working.source.getAdoptionIdentity(),
+    adoptionIdentity
+  );
+  await assertWorkingPreparedSource(working);
 });
 
 test('prepared export compression must agree across identity and manifests', async t => {
@@ -1809,26 +1854,71 @@ test('prepared exports reject aliased advertised payload paths', async t => {
   }
 });
 
-test('local Zarr selections expose truthful visible folder and ZIP provenance', async t => {
-  const originalDirectoryLoad = ZarrDataSource.prototype.loadFromFileList;
+test('a staged categorical field requires the exact writer missing sentinel', async t => {
+  // Both writers emit the terminal code of the declared width and nothing else
+  // (`_categorical_storage` in cellucid-python, `obs.R` in cellucid-r). The
+  // prepared-directory reader runs two validators over the same field —
+  // manifest expansion and payload staging — and they must state one rule. They
+  // did not: staging accepted any sentinel from 0 through the terminal code, so
+  // its text contradicted both writers and the validator that actually decides.
+  // This asserts the rule itself, whichever layer reaches the field first.
+  const sentinels = [
+    { missing: 200, dtype: 'uint8', required: 255 },
+    { missing: 0, dtype: 'uint8', required: 255 },
+  ];
+
+  for (const sentinel of sentinels) {
+    await t.test(`${sentinel.dtype} sentinel ${sentinel.missing}`, async t => {
+      const source = new LocalUserDirDataSource();
+      t.after(() => source.clear());
+      const directory = createPreparedDirectory(
+        `sentinel-${sentinel.missing}`,
+        {
+          obsText: JSON.stringify({
+            _format: 'compact_v1',
+            n_points: 2,
+            centroid_outlier_quantile: null,
+            latent_key: null,
+            compression: null,
+            _obsSchemas: {
+              categorical: {
+                codesPathPattern: 'obs/{index}.codes.{ext}',
+                outlierPathPattern: 'obs/{index}.outliers.f32',
+                outlierExt: 'f32',
+                outlierDtype: 'float32',
+                outlierQuantized: false,
+              },
+            },
+            _continuousFields: [],
+            _categoricalFields: [
+              [0, 'batch', ['A'], sentinel.dtype, sentinel.missing, { '2': [] }],
+            ],
+          }),
+          extraFiles: [
+            ['obs/0.codes.u8', new Uint8Array([0, 0])],
+            ['obs/0.outliers.f32', float32Bytes([0.1, 0.2])],
+          ],
+        }
+      );
+
+      await assert.rejects(
+        source.loadFromPreparedDirectory(directory),
+        error => {
+          const message = error?.message || '';
+          return (
+            message.includes('batch') &&
+            message.includes(String(sentinel.required)) &&
+            /missing sentinel/i.test(message)
+          );
+        }
+      );
+    });
+  }
+});
+
+test('local Zarr archive selections expose truthful visible folder and ZIP provenance', async t => {
   const originalArchiveLoad = ZarrDataSource.prototype.loadFromArchiveFile;
 
-  ZarrDataSource.prototype.loadFromFileList = async function (
-    selection,
-    options
-  ) {
-    const root = selection[0].webkitRelativePath.split('/')[0];
-    this.dirname = root;
-    this.datasetId = options.datasetId;
-    this._metadata = {
-      id: this.datasetId,
-      name: root.replace(/\.zarr$/i, ''),
-      description: options.description,
-      source: options.source,
-      stats: { n_cells: 2 }
-    };
-    return this._metadata;
-  };
   ZarrDataSource.prototype.loadFromArchiveFile = async function (
     selection,
     options
@@ -1846,7 +1936,6 @@ test('local Zarr selections expose truthful visible folder and ZIP provenance', 
     return this._metadata;
   };
   t.after(() => {
-    ZarrDataSource.prototype.loadFromFileList = originalDirectoryLoad;
     ZarrDataSource.prototype.loadFromArchiveFile = originalArchiveLoad;
   });
 
@@ -1868,32 +1957,19 @@ test('local Zarr selections expose truthful visible folder and ZIP provenance', 
   );
   assert.match(archiveMetadata.description, /Zarr ZIP archive/);
   assert.equal(
+    source.getPath(),
+    'portable.zarr',
+    'the visible folder is the store inside the selected archive'
+  );
+  assert.equal(
     (await source.getZarrSource().getMetadata(source.datasetId)).source.name,
     'Zarr ZIP archive',
     'the adopted inner source and local UI source must expose one identity'
-  );
-
-  const directoryMetadata = await source.loadFromZarrDirectory([
-    createFile('folder.zarr/.zgroup', '{"zarr_format":2}')
-  ]);
-  assert.equal(
-    directoryMetadata.id,
-    'local-user:zarr-directory:zarr_folder'
-  );
-  assert.equal(directoryMetadata.source.name, 'Zarr directory');
-  assert.match(directoryMetadata.description, /Zarr directory/);
-  assert.doesNotMatch(directoryMetadata.description, /ZIP|archive/i);
-  assert.equal(
-    Object.hasOwn(directoryMetadata.source, 'filename'),
-    false,
-    'folder provenance must not retain an archive filename'
   );
 });
 
 test('local AnnData wrapper keeps nested datasource notifications silent', async t => {
   const originalH5adLoad = H5adDataSource.prototype.loadFromFile;
-  const originalZarrDirectoryLoad =
-    ZarrDataSource.prototype.loadFromFileList;
   const originalZarrArchiveLoad =
     ZarrDataSource.prototype.loadFromArchiveFile;
   const nestedOptions = [];
@@ -1906,19 +1982,6 @@ test('local AnnData wrapper keeps nested datasource notifications silent', async
       this._metadata = {
         id: this.datasetId,
         name: 'nested h5ad',
-        stats: { n_cells: 2 },
-      };
-      return this._metadata;
-    };
-  ZarrDataSource.prototype.loadFromFileList =
-    async function (files, options) {
-      nestedOptions.push(['zarr-directory', options]);
-      this.dirname = files[0].webkitRelativePath.split('/')[0];
-      this.datasetId = options.datasetId;
-      this._metadata = {
-        id: this.datasetId,
-        name: 'nested zarr directory',
-        source: {},
         stats: { n_cells: 2 },
       };
       return this._metadata;
@@ -1938,8 +2001,6 @@ test('local AnnData wrapper keeps nested datasource notifications silent', async
     };
   t.after(() => {
     H5adDataSource.prototype.loadFromFile = originalH5adLoad;
-    ZarrDataSource.prototype.loadFromFileList =
-      originalZarrDirectoryLoad;
     ZarrDataSource.prototype.loadFromArchiveFile =
       originalZarrArchiveLoad;
   });
@@ -1949,9 +2010,6 @@ test('local AnnData wrapper keeps nested datasource notifications silent', async
   await source.loadFromH5adFile(
     createFile('nested.h5ad', 'h5ad')
   );
-  await source.loadFromZarrDirectory([
-    createFile('nested.zarr/.zgroup', '{"zarr_format":2}'),
-  ]);
   await source.loadFromZarrArchive(
     createFile('nested.zarr.zip', 'zip')
   );
@@ -1963,7 +2021,6 @@ test('local AnnData wrapper keeps nested datasource notifications silent', async
     ]),
     [
       ['h5ad', false],
-      ['zarr-directory', false],
       ['zarr-archive', false],
     ]
   );
@@ -2427,25 +2484,6 @@ test('invalid local replacements leave the working prepared source usable', asyn
     await assertWorkingPreparedSource(working);
   });
 
-  await t.test('Zarr directory', async t => {
-    const working = await loadWorkingPreparedSource(t);
-    const originalLoad = ZarrDataSource.prototype.loadFromFileList;
-    ZarrDataSource.prototype.loadFromFileList = async function () {
-      throw new Error('synthetic invalid Zarr');
-    };
-    t.after(() => {
-      ZarrDataSource.prototype.loadFromFileList = originalLoad;
-    });
-
-    await assert.rejects(
-      working.source.loadFromZarrDirectory([
-        createFile('broken.zarr/.zgroup', '{}')
-      ]),
-      /synthetic invalid Zarr/
-    );
-    await assertWorkingPreparedSource(working);
-  });
-
   await t.test('Zarr ZIP archive', async t => {
     const working = await loadWorkingPreparedSource(t);
     const originalLoad = ZarrDataSource.prototype.loadFromArchiveFile;
@@ -2774,33 +2812,6 @@ for (const flow of [
     }
   },
   {
-    name: 'Zarr',
-    expectedDatasetId:
-      'local-user:zarr-directory:zarr_newer',
-    prototype: ZarrDataSource.prototype,
-    method: 'loadFromFileList',
-    createSelection(name) {
-      return [createFile(`${name}.zarr/.zgroup`, '{}')];
-    },
-    invoke(source, selection) {
-      return source.loadFromZarrDirectory(selection);
-    },
-    async installCandidate(candidate, selection, options) {
-      const root = selection[0].webkitRelativePath.split('/')[0];
-      candidate.dirname = root;
-      candidate.datasetId = options.datasetId;
-      candidate._metadata = {
-        id: candidate.datasetId,
-        name: root,
-        stats: { n_cells: 2 }
-      };
-      return candidate._metadata;
-    },
-    getActiveCandidate(source) {
-      return source.getZarrSource();
-    }
-  },
-  {
     name: 'Zarr ZIP',
     expectedDatasetId:
       'local-user:zarr-archive:zarr_newer',
@@ -2842,9 +2853,7 @@ for (const flow of [
       candidates.push(this);
       const selectionName = flow.name === 'H5AD'
         ? selection.name.replace(/\.h5ad$/i, '')
-        : flow.name === 'Zarr ZIP'
-          ? selection.name.replace(/\.zarr\.zip$/i, '')
-          : selection[0].webkitRelativePath.split('/')[0].replace(/\.zarr$/i, '');
+        : selection.name.replace(/\.zarr\.zip$/i, '');
       await gates.get(selectionName).promise;
       return flow.installCandidate(this, selection, options);
     };

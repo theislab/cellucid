@@ -1,3 +1,4 @@
+import { clampFloatingPosition } from './geometry.js';
 /**
  * @fileoverview Interaction helpers for dockable accordions.
  *
@@ -70,7 +71,8 @@ export function createAccordionInteractions({
   StyleManager,
   isFiniteNumber,
   getState,
-  bumpZIndex,
+  isFloating,
+  raiseToTop,
   undock,
   dock,
   constants
@@ -124,10 +126,15 @@ export function createAccordionInteractions({
   // A focusable `separator` is the window-splitter role: assistive technology
   // reads the current width off `aria-valuenow` on every arrow key, so the
   // keyboard resize needs no announcement of its own.
-  function syncWidthHandleValue(details, widthHandle) {
+  //
+  // `knownRect` is the geometry a caller has just written. Measuring
+  // immediately after a style write forces a synchronous layout, and the one
+  // caller that does both — laying a panel out as it starts floating — already
+  // holds the numbers it wrote.
+  function syncWidthHandleValue(details, widthHandle, knownRect = null) {
+    if (!isFloating(details)) return;
     const state = getState(details);
-    if (!state.isFloating) return;
-    const rect = details.getBoundingClientRect();
+    const rect = knownRect ?? details.getBoundingClientRect();
     const { minWidth, maxWidth } = widthBounds(details, state, rect);
     widthHandle.setAttribute('aria-valuemin', String(Math.round(minWidth)));
     widthHandle.setAttribute('aria-valuemax', String(Math.round(maxWidth)));
@@ -139,7 +146,7 @@ export function createAccordionInteractions({
   }
 
   // Resize handles (for floating panels)
-  function ensureResizeHandles(details) {
+  function ensureResizeHandles(details, signal) {
     if (details.querySelector('.accordion-width-handle')) return;
 
     const widthHandle = document.createElement('div');
@@ -155,13 +162,13 @@ export function createAccordionInteractions({
 
     widthHandle.addEventListener('focus', () => {
       syncWidthHandleValue(details, widthHandle);
-    });
+    }, { signal });
 
     widthHandle.addEventListener('keydown', (e) => {
       if (e.altKey || e.ctrlKey || e.metaKey) return;
 
+      if (!isFloating(details)) return;
       const state = getState(details);
-      if (!state.isFloating) return;
 
       const rect = details.getBoundingClientRect();
       const { minWidth, maxWidth } = widthBounds(details, state, rect);
@@ -179,7 +186,7 @@ export function createAccordionInteractions({
         width: Math.round(Math.min(Math.max(nextWidth, minWidth), maxWidth)),
       });
       syncWidthHandleValue(details, widthHandle);
-    });
+    }, { signal });
 
     widthHandle.addEventListener('pointerdown', (e) => {
       if (e.button !== 0) return;
@@ -187,8 +194,8 @@ export function createAccordionInteractions({
       e.preventDefault();
       e.stopPropagation();
 
+      if (!isFloating(details)) return;
       const state = getState(details);
-      if (!state.isFloating) return;
 
       const pointerId = e.pointerId;
       const startX = e.clientX;
@@ -206,7 +213,7 @@ export function createAccordionInteractions({
 
       setGlobalResizeState(true);
       details.classList.add('resizing');
-      bumpZIndex(details);
+      raiseToTop(details);
 
       try { widthHandle.setPointerCapture(pointerId); } catch {}
 
@@ -240,21 +247,34 @@ export function createAccordionInteractions({
         syncWidthHandleValue(details, widthHandle);
       }
 
-      widthHandle.addEventListener('pointermove', onMove);
-      widthHandle.addEventListener('pointerup', onUp);
-      widthHandle.addEventListener('pointercancel', onUp);
-    });
+      widthHandle.addEventListener('pointermove', onMove, { signal });
+      widthHandle.addEventListener('pointerup', onUp, { signal });
+      widthHandle.addEventListener('pointercancel', onUp, { signal });
+    }, { signal });
+  }
+
+  /**
+   * Take back the handle this module put on the panel.
+   *
+   * `ensureResizeHandles` builds the handle once and recognises it by its
+   * presence, so a panel unregistered with the handle still attached would be
+   * re-registered with a handle whose listeners had already been aborted.
+   *
+   * @param {HTMLElement} details
+   */
+  function removeResizeHandles(details) {
+    details.querySelector?.('.accordion-width-handle')?.remove();
   }
 
   // Drag handler for DOCKED panels (undocking)
-  function setupDockedDrag(summary, details) {
+  function setupDockedDrag(summary, details, signal) {
     summary.addEventListener('pointerdown', (e) => {
       if (e.button !== 0) return;
       if (e.pointerType === 'touch') return;
       if (isInteractiveTarget(e.target)) return;
 
+      if (isFloating(details)) return;
       const state = getState(details);
-      if (state.isFloating) return;
       if (!state.dockable) return;
 
       e.preventDefault();
@@ -320,21 +340,21 @@ export function createAccordionInteractions({
         }
       }
 
-      summary.addEventListener('pointermove', onMove);
-      summary.addEventListener('pointerup', onUp);
-      summary.addEventListener('pointercancel', onUp);
-    });
+      summary.addEventListener('pointermove', onMove, { signal });
+      summary.addEventListener('pointerup', onUp, { signal });
+      summary.addEventListener('pointercancel', onUp, { signal });
+    }, { signal });
   }
 
   // Drag handler for FLOATING panels (re-docking or repositioning)
-  function setupFloatingDrag(summary, details) {
+  function setupFloatingDrag(summary, details, signal) {
     summary.addEventListener('pointerdown', (e) => {
       if (e.button !== 0) return;
       if (e.pointerType === 'touch') return;
       if (isInteractiveTarget(e.target)) return;
 
+      if (!isFloating(details)) return;
       const state = getState(details);
-      if (!state.isFloating) return;
       const allowDock = !!state.dockable;
 
       e.preventDefault();
@@ -350,9 +370,6 @@ export function createAccordionInteractions({
       const offsetX = startX - preRect.left;
       const offsetY = startY - preRect.top;
 
-      const clampMargin = 8;
-      const maxLeft = Math.max(clampMargin, viewportWidth - preRect.width - clampMargin);
-      const maxTop = Math.max(clampMargin, viewportHeight - preRect.height - clampMargin);
 
       let didDrag = false;
       let baseLeft = state.floatLeft;
@@ -367,10 +384,14 @@ export function createAccordionInteractions({
       try { summary.setPointerCapture(pointerId); } catch {}
 
       function clamp(targetLeft, targetTop) {
-        return {
-          x: Math.min(Math.max(targetLeft, clampMargin), maxLeft),
-          y: Math.min(Math.max(targetTop, clampMargin), maxTop),
-        };
+        return clampFloatingPosition({
+          left: targetLeft,
+          top: targetTop,
+          width: preRect.width,
+          height: preRect.height,
+          viewportWidth,
+          viewportHeight
+        });
       }
 
       function applyTransform() {
@@ -404,7 +425,7 @@ export function createAccordionInteractions({
           didDrag = true;
 
           setGlobalDragState(true);
-          bumpZIndex(details);
+          raiseToTop(details);
           details.classList.add('dragging');
           details.style.willChange = 'transform';
           cachedSidebarRect = sidebar.getBoundingClientRect();
@@ -453,20 +474,21 @@ export function createAccordionInteractions({
         }
       }
 
-      summary.addEventListener('pointermove', onMove);
-      summary.addEventListener('pointerup', onUp);
-      summary.addEventListener('pointercancel', onUp);
-    });
+      summary.addEventListener('pointermove', onMove, { signal });
+      summary.addEventListener('pointerup', onUp, { signal });
+      summary.addEventListener('pointercancel', onUp, { signal });
+    }, { signal });
   }
 
-  function syncResizeHandles(details) {
+  function syncResizeHandles(details, knownRect = null) {
     const widthHandle = details.querySelector('.accordion-width-handle');
     if (widthHandle === null) return;
-    syncWidthHandleValue(details, widthHandle);
+    syncWidthHandleValue(details, widthHandle, knownRect);
   }
 
   return {
     ensureResizeHandles,
+    removeResizeHandles,
     setupDockedDrag,
     setupFloatingDrag,
     syncResizeHandles,

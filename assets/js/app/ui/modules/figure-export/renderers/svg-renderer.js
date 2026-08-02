@@ -80,6 +80,7 @@ import {
   rasterizePointsWebgl,
   releaseWebglRasterCanvas,
 } from '../utils/webgl-point-rasterizer.js';
+import { scalePointDiameterToRaster } from '../utils/point-size.js';
 import {
   MIN_VISIBLE_ALPHA_BYTE,
   POINT_VISIBILITY_THRESHOLD,
@@ -323,12 +324,18 @@ async function rasterizePointsToDataUrl({
     renderState,
     outputWidthPx: pxW,
     outputHeightPx: pxH,
-    pointSizePx: pointDiameterViewportPx * viewportScale,
+    pointSizePx: scalePointDiameterToRaster(
+      pointDiameterViewportPx,
+      viewportScale
+    ),
     overlayPoints: hasAnyOverlayInput
       ? {
         positions: overlayPositions,
         colors: overlayColors,
-        pointSizePx: overlayPointDiameterViewportPx * viewportScale
+        pointSizePx: scalePointDiameterToRaster(
+          overlayPointDiameterViewportPx,
+          viewportScale
+        )
       }
       : null,
     highlightArray,

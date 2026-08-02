@@ -11,6 +11,7 @@ import { initHighlightPagesUI } from './highlight/highlight-pages-ui.js';
 import { initHighlightSelectionTools } from './highlight/highlight-selection-tools.js';
 import { initHighlightSummaryUI } from './highlight/highlight-summary-ui.js';
 import {
+  requireCallback,
   requireDomElement,
   requireExactKeys,
   requireJupyterSource,
@@ -48,6 +49,7 @@ const REQUIRED_STATE_METHODS = Object.freeze([
 ]);
 
 const REQUIRED_VIEWER_METHODS = Object.freeze([
+  'getHighlightMode',
   'setHighlightMode',
   'getViewTransparency',
   'setSelectionStepCallback',
@@ -179,25 +181,60 @@ export function initHighlightControls(options) {
 
   let destroyed = false;
   let destructionPromise = null;
-  function updateHighlightMode() {
-    if (destroyed) return;
+
+  /**
+   * The renderer's highlight mode implied by the field the app is colouring by.
+   *
+   * @returns {'none'|'continuous'|'categorical'}
+   */
+  function highlightModeForActiveField() {
     const activeField = state.getActiveField();
-    if (activeField === null) {
-      viewer.setHighlightMode('none');
-      return;
-    }
-    if (activeField.kind === 'continuous') {
-      viewer.setHighlightMode('continuous');
-      return;
-    }
-    if (activeField.kind === 'category') {
-      viewer.setHighlightMode('categorical');
-      return;
-    }
+    if (activeField === null) return 'none';
+    if (activeField.kind === 'continuous') return 'continuous';
+    if (activeField.kind === 'category') return 'categorical';
     throw new TypeError(
       `Unknown active highlight field kind: ${activeField.kind}.`
     );
   }
+
+  /**
+   * Publish the mode the current active field implies, if it is not already
+   * the one the renderer holds.
+   *
+   * Republishing a mode the renderer already has is not free: `setHighlightMode`
+   * drops `selectionDragStart` and resets the renderer's annotation step
+   * counter, so a gesture in the user's hand would be thrown away by an
+   * unrelated filter change. Comparing first is what makes this safe to run on
+   * every visibility event, and it reads the renderer rather than a local copy
+   * so a divergence from any source is corrected rather than assumed absent.
+   */
+  function updateHighlightMode() {
+    if (destroyed) return;
+    const mode = highlightModeForActiveField();
+    if (viewer.getHighlightMode() === mode) return;
+    viewer.setHighlightMode(mode);
+  }
+
+  // The renderer's highlight mode is a cache of the active field's kind: with
+  // no field, `handleMouseDown` discards every Alt gesture before any tool sees
+  // it. Nothing in DataState announces "the active field changed", but
+  // `setActiveField`, `setActiveVarField` and `clearActiveField` all run
+  // `computeGlobalVisibility()`, which ends in `visibility:changed` — the same
+  // signal `annotation-selection.js` already follows to decide whether the
+  // panel may invite a click. Following it here too is what keeps the invitation
+  // and the renderer from disagreeing: every path that activates a field
+  // reaches this, including the ones that bypass the field selector's change
+  // event (a published dataset's default state, a loaded session, a Jupyter
+  // command), which is where the panel used to promise a gesture the renderer
+  // then dropped in silence.
+  const unsubscribeVisibility = state.on(
+    'visibility:changed',
+    updateHighlightMode
+  );
+  requireCallback(
+    unsubscribeVisibility,
+    'Highlight mode visibility unsubscribe'
+  );
 
   function destroy() {
     if (destructionPromise !== null) return destructionPromise;
@@ -205,6 +242,7 @@ export function initHighlightControls(options) {
     const failures = [];
     const pending = [];
     for (const operation of [
+      () => unsubscribeVisibility(),
       () => selectionTools.destroy(),
       () => pagesUi.destroy(),
       () => summaryUi.destroy()

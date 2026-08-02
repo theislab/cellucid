@@ -16,6 +16,7 @@
 import { PlotFactory, PlotRegistry, BasePlot, COMMON_HOVER_STYLE } from '../plot-factory.js';
 import { getPlotTheme } from '../../shared/plot-theme.js';
 import { setOwnDataProperty } from '../../../../utils/exact-record.js';
+import { escapeHtml } from '../../../utils/dom-utils.js';
 
 function truncateLabel(label, maxLen) {
   if (typeof label !== 'string') {
@@ -32,6 +33,19 @@ function truncateLabel(label, maxLen) {
   return label.slice(0, head) + '…' + label.slice(label.length - tail);
 }
 
+/**
+ * Build the sparse tick configuration for a heatmap axis.
+ *
+ * `labels` are the raw dataset strings. Truncation runs on the raw label so the
+ * visible length stays correct, and every emitted string is escaped afterwards:
+ * `ticktext` is parsed for Plotly's HTML subset, and `tickvals` has to match the
+ * escaped category coordinates the trace publishes.
+ *
+ * @param {string[]} labels
+ * @param {number} maxTicks
+ * @param {number|null} [truncateLen]
+ * @returns {Object} Plotly axis tick configuration
+ */
 function buildSparseTicks(labels, maxTicks, truncateLen = null) {
   if (!Array.isArray(labels) || labels.some(label => typeof label !== 'string')) {
     throw new TypeError('Heatmap tick labels must be an array of strings');
@@ -48,26 +62,30 @@ function buildSparseTicks(labels, maxTicks, truncateLen = null) {
 
   if (n <= maxTicks) {
     return truncateLen
-      ? { tickmode: 'array', tickvals: items, ticktext: items.map((l) => truncateLabel(l, truncateLen)) }
+      ? {
+          tickmode: 'array',
+          tickvals: items.map((l) => escapeHtml(l)),
+          ticktext: items.map((l) => escapeHtml(truncateLabel(l, truncateLen)))
+        }
       : {};
   }
 
   const step = Math.ceil(n / maxTicks);
-  const tickvals = [];
-  const ticktext = [];
+  const selected = [];
   for (let i = 0; i < n; i += step) {
-    const v = items[i];
-    tickvals.push(v);
-    ticktext.push(truncateLen ? truncateLabel(v, truncateLen) : v);
+    selected.push(items[i]);
   }
 
   // Ensure the final label is included for context.
-  if (tickvals[tickvals.length - 1] !== items[n - 1]) {
-    tickvals.push(items[n - 1]);
-    ticktext.push(truncateLen ? truncateLabel(items[n - 1], truncateLen) : items[n - 1]);
+  if (selected[selected.length - 1] !== items[n - 1]) {
+    selected.push(items[n - 1]);
   }
 
-  return { tickmode: 'array', tickvals, ticktext };
+  return {
+    tickmode: 'array',
+    tickvals: selected.map((l) => escapeHtml(l)),
+    ticktext: selected.map((l) => escapeHtml(truncateLen ? truncateLabel(l, truncateLen) : l))
+  };
 }
 
 const geneHeatmapDefinition = {
@@ -281,8 +299,12 @@ const geneHeatmapDefinition = {
     const trace = {
       type: traceType,
       z,
-      x: genes,
-      y: groupNames,
+      // Gene and group names are dataset-supplied. They are the category
+      // coordinates, so they become axis tick labels and the `%{x}` / `%{y}`
+      // hover substitutions, all of which Plotly parses for its HTML subset.
+      // `buildLayout` escapes its tickvals the same way so the two agree.
+      x: genes.map(gene => escapeHtml(gene)),
+      y: groupNames.map(group => escapeHtml(group)),
       colorscale,
       reversescale: reverseColorscale,
       ...colorRange,

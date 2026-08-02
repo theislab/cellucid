@@ -5,13 +5,12 @@
  * - Registration of data sources (local-demo, local-user, remote, jupyter)
  * - Active dataset tracking
  * - Dataset switching with callbacks
- * - State serialization hooks
+ * - State snapshot capture for session serialization and figure export
  */
 
 import {
   DataSourceError,
   DataSourceErrorCode,
-  readBoundedJson,
   validateDatasetId,
   validateDatasetIdentity
 } from './data-source.js';
@@ -1115,39 +1114,6 @@ export class DataSourceManager {
   }
 
   /**
-   * Restore state from a snapshot
-   * @param {DataSourceState} state - State to restore
-   * @param {Object} [options]
-   * @param {boolean} [options.silent=false] - Don't notify listeners
-   * @returns {Promise<boolean>} - True if restoration succeeded
-   */
-  async restoreState(state, options = {}) {
-    if (!state?.sourceType || !state?.datasetId) {
-      return false;
-    }
-
-    const source = this.sources.get(state.sourceType);
-    if (!source) {
-      debug.warn(`[DataSourceManager] Cannot restore: source '${state.sourceType}' not registered`);
-      return false;
-    }
-
-    // Check if this source requires manual reconnection (e.g., user directories, remote servers)
-    if (typeof source.requiresManualReconnect === 'function' && source.requiresManualReconnect()) {
-      debug.warn(`[DataSourceManager] Cannot auto-restore '${state.sourceType}' (requires manual reconnection)`);
-      return false;
-    }
-
-    try {
-      await this.switchToDataset(state.sourceType, state.datasetId, options);
-      return true;
-    } catch (err) {
-      debug.warn(`[DataSourceManager] Failed to restore dataset '${state.datasetId}':`, err);
-      return false;
-    }
-  }
-
-  /**
    * Add a callback for dataset changes
    * @param {Function} callback - Callback function
    */
@@ -1402,7 +1368,14 @@ export class DataSourceManager {
   }
 
   /**
-   * Fetch a URL, handling custom protocols automatically
+   * Fetch a URL, handling custom protocols automatically.
+   *
+   * Reached only through a string-literal method lookup in
+   * `app/session/session-serializer.js` (`requireMethod(ctx.dataSourceManager,
+   * 'fetch', ...)`), which is how session restore-from-URL downloads a bundle
+   * that may live behind a custom protocol. A plain call-site search will not
+   * find that caller.
+   *
    * @param {string} url - URL to fetch (may be custom protocol)
    * @param {RequestInit} [options] - Fetch options
    * @returns {Promise<Response>}
@@ -1413,19 +1386,6 @@ export class DataSourceManager {
       options.signal ?? null
     );
     return fetch(resolvedUrl, options);
-  }
-
-  /**
-   * Fetch a URL as JSON, handling custom protocols automatically
-   * @param {string} url - URL to fetch (may be custom protocol)
-   * @returns {Promise<any>}
-   */
-  async fetchJson(url) {
-    const response = await this.fetch(url);
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-    }
-    return readBoundedJson(response, { label: `Metadata ${url}` });
   }
 }
 

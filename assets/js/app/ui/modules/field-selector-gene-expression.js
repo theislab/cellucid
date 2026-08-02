@@ -53,6 +53,26 @@ const RETURN_KEYS = new Set([
   'updateGeneActionButtons'
 ]);
 
+/* ---------------------------------------------------------------------------
+   Empty-state copy for gene search.
+
+   A dataset's gene panel is decided by whoever prepared the export. Nothing in
+   the export records what the preparation step left behind: there is no
+   original gene count, no dropped-gene list, and no symbol table. The only
+   gene fact the viewer holds is the panel it was handed — `state.varData`,
+   whose exported entries are contractually equal in number to
+   `dataset_identity.json` → `stats.n_genes`.
+
+   So this copy states that count, says the panel is fixed upstream, and stops
+   there. It must never assert that a searched gene was removed, nor guess how
+   many genes are absent: the app cannot know either one.
+   --------------------------------------------------------------------------- */
+const GENE_PANEL_HELP_URL = 'https://cellucid.readthedocs.io/en/latest/'
+  + 'user_guide/web_app/d_fields_coloring_legends/'
+  + '05_troubleshooting_fields_legends.html'
+  + '#symptom-gene-search-returns-nothing-enter-selects-the-wrong-gene';
+const GENE_PANEL_HELP_LABEL = 'Why a gene may be missing';
+
 function requirePlainRecord(value, label) {
   if (
     value === null
@@ -141,6 +161,34 @@ function requireField(field, label) {
   }
   StateValidator.validateFieldKey(field.key);
   return field;
+}
+
+/**
+ * Genes the dataset itself published, excluding every field created inside
+ * Cellucid. Duplicates add entries to the inventory and deletions never remove
+ * them, so this count stays equal to the export's gene axis for the whole
+ * session.
+ *
+ * @param {ReadonlyArray<object>} inventory
+ * @returns {number}
+ */
+function countPublishedGenes(inventory) {
+  let published = 0;
+  for (const field of inventory) {
+    if (field._isUserDefined !== true) published += 1;
+  }
+  return published;
+}
+
+/**
+ * @param {number} publishedGeneCount
+ * @returns {string}
+ */
+function formatGenePanelNote(publishedGeneCount) {
+  const noun = publishedGeneCount === 1 ? 'gene name' : 'gene names';
+  return `This dataset publishes ${publishedGeneCount.toLocaleString()} ${noun}, `
+    + 'chosen when it was prepared and possibly a subset of the source data. '
+    + 'Check for typos too.';
 }
 
 function requireVarInventory(value) {
@@ -321,8 +369,19 @@ export function initGeneExpressionSelector(options) {
   let destroyed = false;
   let hasGeneExpressionFields = false;
   let geneFieldList = [];
+  let publishedGeneCount = 0;
   let selectedGeneOriginalIdx = -1;
   let forceDisabled = false;
+
+  /* The dropdown is rebuilt on every keystroke, so it cannot host the live
+     region itself: a region that arrives with its own text is not reliably
+     announced. This one is mounted once, beside the search box, and only its
+     text changes. */
+  const geneSearchStatus = ownerDocument.createElement('div');
+  geneSearchStatus.className = 'sr-only';
+  geneSearchStatus.setAttribute('role', 'status');
+  geneSearchStatus.setAttribute('aria-live', 'polite');
+  geneContainer.appendChild(geneSearchStatus);
 
   function assertAlive() {
     if (destroyed) {
@@ -391,6 +450,7 @@ export function initGeneExpressionSelector(options) {
       state.getVisibleFields(FieldSource.VAR),
       inventory
     );
+    publishedGeneCount = countPublishedGenes(inventory);
     hasGeneExpressionFields = geneFieldList.length > 0;
     geneContainer.classList.toggle('visible', hasGeneExpressionFields);
     if (
@@ -420,12 +480,41 @@ export function initGeneExpressionSelector(options) {
 
     if (results.length === 0) {
       const noResults = ownerDocument.createElement('div');
-      noResults.className = 'dropdown-no-results';
-      noResults.textContent = normalizedQuery.length > 0
-        ? 'No genes found'
-        : 'Type to search genes...';
+      if (normalizedQuery.length === 0) {
+        noResults.className = 'dropdown-no-results';
+        noResults.textContent = 'Type to search genes...';
+        geneSearchStatus.textContent = '';
+      } else {
+        noResults.className = 'dropdown-no-results text-left';
+        const headline = ownerDocument.createElement('div');
+        headline.className = 'text-secondary font-semibold';
+        headline.textContent = 'No gene matches';
+        /* The query is the reader's own text and can be arbitrarily long, so it
+           gets its own line and the shared truncation primitive rather than
+           being allowed to push the sidebar sideways. */
+        const echo = ownerDocument.createElement('div');
+        echo.className = 'truncate';
+        echo.textContent = `“${query.trim()}”.`;
+        headline.appendChild(echo);
+        const note = ownerDocument.createElement('div');
+        note.className = 'mt-1';
+        note.textContent = formatGenePanelNote(publishedGeneCount);
+        const help = ownerDocument.createElement('a');
+        help.className = 'text-link d-inline-block mt-1';
+        help.href = GENE_PANEL_HELP_URL;
+        help.target = '_blank';
+        help.rel = 'noopener noreferrer';
+        help.textContent = GENE_PANEL_HELP_LABEL;
+        noResults.append(headline, note, help);
+        /* Announced without the query, so extending a query that still finds
+           nothing does not repeat the whole explanation on every keystroke. */
+        geneSearchStatus.textContent = (
+          `No gene matches your search. ${note.textContent}`
+        );
+      }
       fragment.appendChild(noResults);
     } else {
+      geneSearchStatus.textContent = '';
       for (const { field, originalIdx } of results) {
         const item = ownerDocument.createElement('div');
         item.className = 'dropdown-item';
@@ -740,6 +829,7 @@ export function initGeneExpressionSelector(options) {
     destroyed = true;
     lifecycle.abort();
     geneDropdown.replaceChildren();
+    geneSearchStatus.remove();
   }
 
   const api = {

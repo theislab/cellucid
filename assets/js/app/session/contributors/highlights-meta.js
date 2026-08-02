@@ -9,11 +9,13 @@
 import {
   assertArray,
   assertBoolean,
+  assertCategoryPrimitive,
   assertExactKeys,
   assertFiniteNumber,
   assertNonEmptyString,
   assertPlainRecord,
   assertSafeInteger,
+  describeCategory,
   requireMethod
 } from '../schema-contract.js';
 
@@ -53,25 +55,14 @@ const GROUP_TYPES = new Set([
   'proximity',
   'range'
 ]);
+/** The group types that name a field, and so carry a field binding. */
+const FIELD_BOUND_TYPES = new Set(['category', 'range']);
 
 function assertPageColor(value, context) {
   if (typeof value !== 'string' || !/^#[0-9a-fA-F]{6}$/.test(value)) {
     throw new TypeError(`${context} must be a six-digit hex color.`);
   }
   return value;
-}
-
-function assertCategoryPrimitive(value, context) {
-  if (
-    typeof value === 'string'
-    || typeof value === 'boolean'
-    || (typeof value === 'number' && Number.isFinite(value))
-  ) {
-    return value;
-  }
-  throw new TypeError(
-    `${context} must be a string, finite number, or boolean.`
-  );
 }
 
 function numericSuffix(idValue, prefix, context) {
@@ -154,6 +145,136 @@ function assertGroup(group, pointCount, context) {
     assertFiniteNumber(group.rangeMax, `${context} rangeMax`);
     if (group.rangeMin > group.rangeMax) {
       throw new RangeError(`${context} rangeMin must not exceed rangeMax.`);
+    }
+  }
+}
+
+function assertFieldInventory(fields, context) {
+  assertArray(fields, context);
+  const keys = new Set();
+  for (let index = 0; index < fields.length; index++) {
+    const field = fields[index];
+    if (field === null || typeof field !== 'object') {
+      throw new TypeError(`${context} entry ${index} must be an object.`);
+    }
+    const key = assertNonEmptyString(field.key, `${context} entry ${index} key`);
+    if (keys.has(key)) {
+      throw new TypeError(`${context} contains duplicate key "${key}".`);
+    }
+    keys.add(key);
+  }
+  return fields;
+}
+
+/**
+ * Bind one saved field-owned highlight group to the field and category it
+ * names.
+ *
+ * `fieldIndex` and `categoryIndex` are positions in the current dataset, and
+ * nothing pins a position: the dataset fingerprint covers the cells, not the
+ * obs schema, so re-exporting the same cells with one more obs column shifts
+ * every field after it, and adding one category shifts every category after it.
+ * `fieldKey` and `categoryName` are saved in the same record and are the stable
+ * identity, so both positions are re-derived from the names the way
+ * `state-serializer/filters.js` resolves a filter from its field key. A name
+ * that is gone is refused by name; it is never silently re-bound to whatever
+ * now occupies the saved position.
+ *
+ * @param {object} state
+ * @returns {(group: object, context: string) => {
+ *   fieldIndex: number,
+ *   categoryIndex: number|null
+ * }}
+ */
+function createHighlightFieldBinder(state) {
+  const inventories = new Map();
+  const lookups = new Map();
+
+  function inventoryFor(source) {
+    const cached = inventories.get(source);
+    if (cached !== undefined) return cached;
+    const data = source === 'obs' ? state.obsData : state.varData;
+    if (data === null || typeof data !== 'object') {
+      throw new TypeError(
+        `Highlight field binding requires the current ${source} field inventory.`
+      );
+    }
+    const fields = assertFieldInventory(
+      data.fields,
+      `Current ${source} field inventory`
+    );
+    inventories.set(source, fields);
+    lookups.set(
+      source,
+      new Map(fields.map((field, index) => [field.key, index]))
+    );
+    return fields;
+  }
+
+  return function bindHighlightField(group, context) {
+    const source = group.fieldSource;
+    const fields = inventoryFor(source);
+    const fieldIndex = lookups.get(source).get(group.fieldKey);
+    if (fieldIndex === undefined || fields[fieldIndex]._isDeleted === true) {
+      throw new RangeError(
+        `${context} was saved on the ${source} field "${group.fieldKey}", `
+        + 'which the dataset that is open now does not have.'
+      );
+    }
+    const field = fields[fieldIndex];
+    const requiredKind = group.type === 'category' ? 'category' : 'continuous';
+    if (field.kind !== requiredKind) {
+      throw new TypeError(
+        `${context} was saved on the ${source} field "${group.fieldKey}" as a `
+        + `${requiredKind} field, and that field is "${String(field.kind)}" in `
+        + 'the dataset that is open now.'
+      );
+    }
+    if (group.type !== 'category') {
+      return { fieldIndex, categoryIndex: null };
+    }
+    if (!Array.isArray(field.categories)) {
+      throw new TypeError(
+        `${context} requires the category inventory of the ${source} field `
+        + `"${group.fieldKey}".`
+      );
+    }
+    const categoryIndex = field.categories.indexOf(group.categoryName);
+    if (categoryIndex < 0) {
+      throw new RangeError(
+        `${context} was saved on the category `
+        + `${describeCategory(group.categoryName)} of the ${source} field `
+        + `"${group.fieldKey}", which that field no longer has.`
+      );
+    }
+    if (field.categories.lastIndexOf(group.categoryName) !== categoryIndex) {
+      throw new TypeError(
+        `${context} names the category ${describeCategory(group.categoryName)} `
+        + `of the ${source} field "${group.fieldKey}", and that field lists it `
+        + 'more than once.'
+      );
+    }
+    return { fieldIndex, categoryIndex };
+  };
+}
+
+/**
+ * Walk every field-owned group of one validated payload.
+ *
+ * @param {object} payload
+ * @param {(group: object, context: string) => void} visit
+ * @param {string} contextPrefix
+ */
+function forEachFieldBoundGroup(payload, contextPrefix, visit) {
+  for (let pageIndex = 0; pageIndex < payload.pages.length; pageIndex++) {
+    const groups = payload.pages[pageIndex].highlightedGroups;
+    for (let groupIndex = 0; groupIndex < groups.length; groupIndex++) {
+      const group = groups[groupIndex];
+      if (!FIELD_BOUND_TYPES.has(group.type)) continue;
+      visit(
+        group,
+        `${contextPrefix} page ${pageIndex} group ${groupIndex}`
+      );
     }
   }
 }
@@ -265,6 +386,28 @@ export function capture(ctx) {
     activePageId: state.getActivePageId()
   };
   assertPayload(payload, pointCount);
+  // Restore re-derives every position from the names saved beside it, so the
+  // file has to be written with names and positions that already agree.
+  const bindHighlightField = createHighlightFieldBinder(state);
+  forEachFieldBoundGroup(payload, 'Current highlight', (group, context) => {
+    const binding = bindHighlightField(group, context);
+    if (binding.fieldIndex !== group.fieldIndex) {
+      throw new RangeError(
+        `${context} names the ${group.fieldSource} field "${group.fieldKey}" `
+        + 'and points at a different field.'
+      );
+    }
+    if (
+      group.type === 'category'
+      && binding.categoryIndex !== group.categoryIndex
+    ) {
+      throw new RangeError(
+        `${context} names the category `
+        + `${describeCategory(group.categoryName)} and points at a different `
+        + 'category.'
+      );
+    }
+  });
 
   return [{
     id: 'highlights/meta',
@@ -321,6 +464,8 @@ export function restore(ctx, chunkMeta, payload) {
   let maxGroupCounter = 0;
   const groupById = new Map();
   const expectedCellGroupIds = [];
+  const bindHighlightField = createHighlightFieldBinder(state);
+  const stagedFieldBindings = [];
   const restoredPages = payload.pages.map((page, pageIndex) => {
     maxPageCounter = Math.max(
       maxPageCounter,
@@ -343,6 +488,15 @@ export function restore(ctx, chunkMeta, payload) {
           ...group,
           cellIndices: new Uint32Array(0)
         };
+        if (FIELD_BOUND_TYPES.has(group.type)) {
+          const context = `Highlight page ${pageIndex} group ${groupIndex}`;
+          const binding = bindHighlightField(group, context);
+          restoredGroup.fieldIndex = binding.fieldIndex;
+          if (group.type === 'category') {
+            restoredGroup.categoryIndex = binding.categoryIndex;
+          }
+          stagedFieldBindings.push({ group, context, restoredGroup });
+        }
         groupById.set(restoredGroup.id, restoredGroup);
         expectedCellGroupIds.push(restoredGroup.id);
         return restoredGroup;
@@ -394,6 +548,29 @@ export function restore(ctx, chunkMeta, payload) {
             throw new Error(
               `Highlight group "${groupId}" cell membership is incomplete.`
             );
+          }
+        }
+        // The field inventory is rebuilt by the field-overlay contributor
+        // earlier in the same restore. Re-derive every binding against the
+        // inventory as it stands now, so a group can never be committed
+        // pointing at a position that moved after it was staged.
+        if (stagedFieldBindings.length > 0) {
+          const rebind = createHighlightFieldBinder(state);
+          for (const staged of stagedFieldBindings) {
+            const binding = rebind(staged.group, staged.context);
+            if (
+              binding.fieldIndex !== staged.restoredGroup.fieldIndex
+              || binding.categoryIndex !== (
+                staged.group.type === 'category'
+                  ? staged.restoredGroup.categoryIndex
+                  : null
+              )
+            ) {
+              throw new Error(
+                `Highlight group "${staged.restoredGroup.id}" field binding `
+                + 'changed while its session restore was staged.'
+              );
+            }
           }
         }
       },

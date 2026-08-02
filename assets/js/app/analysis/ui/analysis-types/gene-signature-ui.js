@@ -11,7 +11,6 @@
  */
 
 import { FormBasedAnalysisUI } from './base/form-based-analysis.js';
-import { PlotRegistry } from '../../shared/plot-registry-utils.js';
 import {
   createFormRow,
   createFormSelect,
@@ -24,6 +23,7 @@ import {
 // renderGeneChips moved inline to modal annotations
 import { isFiniteNumber } from '../../shared/number-utils.js';
 import { PageSelectorComponent } from '../shared/page-selector.js';
+import { applyFormControlAccessibility } from '../components/control-accessibility.js';
 import { renderSummaryStats, renderStatisticalAnnotations } from '../components/stats-display.js';
 
 /**
@@ -104,9 +104,7 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
       if (result) {
         await this._showResult(result, requestId);
         if (!this._isCurrentAnalysisRequest(requestId)) return;
-        this._lastResult = result;
-        this._currentPageData = result.data || result;
-        this._requestedPlotOptions = structuredClone(result.options || {});
+        await this._publishAnalysisResult(result, requestId);
       }
     } catch (err) {
       if (!this._isCurrentAnalysisRequest(requestId)) return;
@@ -232,6 +230,9 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
    * @override
    */
   _renderControls() {
+    // Rebuilding the form on every accordion reopen must not discard the
+    // choices already made in it.
+    const carriedValues = this._captureFormControlValues();
     this._formContainer.innerHTML = '';
 
     // Validate page requirements
@@ -252,6 +253,12 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
     // Let subclass render form controls
     this._renderFormControls(wrapper);
 
+    // Same form-control accessibility pass the base class runs: scoped ids and
+    // a label bound to every control. Overriding _renderControls to drop the
+    // run button must not also drop that.
+    applyFormControlAccessibility(wrapper, this._controlScope);
+    this._restoreFormControlValues(wrapper, carriedValues);
+
     this._formContainer.appendChild(wrapper);
 
     // Trigger initial calculation if inputs are valid
@@ -263,11 +270,9 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
    * @param {HTMLElement} wrapper - Form wrapper element
    */
   _renderFormControls(wrapper) {
-    // Gene list input
-    const geneListRow = document.createElement('div');
-    geneListRow.className = 'analysis-input-row gene-list-row';
-    geneListRow.innerHTML = `<label>Signature Genes:</label>`;
-
+    // Gene list input. The row comes from the shared factory, which binds the
+    // label to the textarea; the textarea's only accessible name used to be its
+    // placeholder, which vanishes as soon as anything is typed.
     const geneListInput = createFormTextarea({
       name: 'genes',
       className: 'gene-list-input',
@@ -283,8 +288,9 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
       this._savedGeneList = geneListInput.value;
       this._scheduleUpdate();
     });
-    geneListRow.appendChild(geneListInput);
-    wrapper.appendChild(geneListRow);
+    wrapper.appendChild(createFormRow('Signature Genes:', geneListInput, {
+      className: 'gene-list-row'
+    }));
 
     // Page selector (matching Detailed and Correlation analysis modes)
     this._renderPageSelector(wrapper);
@@ -554,25 +560,12 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
    */
   async _showResult(result, requestId) {
     const plotContainerId = this._instanceId ? `${this._instanceId}-signature-analysis-plot` : 'signature-analysis-plot';
-    const candidate = await this._renderPreviewPlot({
+    return this._renderPreviewPlot({
       result,
       requestId,
       containerId: plotContainerId,
-      clickable: true
+      expandable: true
     });
-    if (candidate === null || !this._isCurrentAnalysisRequest(requestId)) return;
-    // Expand (modal) action - consistent with DE mode
-    this._resultContainer
-      .querySelector('.analysis-actions')
-      ?.remove();
-    const actionsContainer = document.createElement('div');
-    actionsContainer.className = 'analysis-actions';
-    actionsContainer.style.display = 'flex';
-
-    const expandBtn = this._createExpandButton();
-    expandBtn.title = 'Open in full view with statistics and export options';
-    actionsContainer.appendChild(expandBtn);
-    this._resultContainer.appendChild(actionsContainer);
   }
 
   // ===========================================================================

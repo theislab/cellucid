@@ -34,6 +34,7 @@ import {
   parseIntegerInput,
   parseRangeInput
 } from '../../core/numeric-input-contract.js';
+import { escapeHtml } from '../../../utils/dom-utils.js';
 
 // SVG icons (12 × 12, 2 px stroke, matching field-action-btn icons)
 const SVG_UP = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="18 15 12 9 6 15"/></svg>`;
@@ -387,6 +388,13 @@ export function initCinematicCamera({
     assertNavigationMode(mode);
     dom.navModeSelect.value = mode;
     toggleNavigationPanels(mode);
+    // The viewer releases pointer lock whenever navigation leaves free-fly, and
+    // Compare Views clears its own copy of this control when that happens. This
+    // mirror has to agree whatever moved the mode — this select, Compare Views,
+    // a Go-to, playback, or a restore — or it goes on claiming a lock the
+    // viewer no longer holds and the next click on it turns pointer lock off
+    // instead of on.
+    if (mode !== 'free') dom.pointerLockCheckbox.checked = false;
   }
 
   // Sync dropdown → viewer on change
@@ -1074,12 +1082,4 @@ export function initCinematicCamera({
     resetCameraPath,
     destroy
   };
-}
-
-// ---- Helpers ----
-
-function escapeHtml(str) {
-  const d = document.createElement('div');
-  d.textContent = str;
-  return d.innerHTML;
 }

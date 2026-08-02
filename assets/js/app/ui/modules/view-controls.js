@@ -357,12 +357,33 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
   const splitViewBadges = dom.badgesList;
   const renderModeSelect = renderDom.renderModeSelect;
 
-  let activeViewId = requireViewId(state.getActiveViewId(), 'Active view id');
-  let viewLayoutMode = requireLayoutMode(viewLayoutModeSelect.value);
-  let liveViewHidden = requireBoolean(
-    viewer.getLiveViewHidden(),
-    'Viewer live-view visibility'
-  );
+  /**
+   * The three pieces of view state this module draws are read from their
+   * owners on every use. None of them is mirrored here.
+   *
+   * Each owner reconciles itself, and none of them can announce it. The
+   * DataState returns the active view to the live view whenever a view context
+   * is retired (`view-context-core.js` `removeView` / `syncSnapshotContexts`);
+   * the viewer returns focus to the live view and un-hides it whenever its
+   * snapshot inventory empties (`viewer.js` `removeSnapshotView` /
+   * `clearSnapshotViews`); the layout selector is the control the user turns.
+   * A session restore empties the inventory as its first act
+   * (`state-serializer/multiview.js`), so a private copy of any of the three
+   * was stale from the next line onwards, and the badge render that the same
+   * rebuild scheduled threw on a view that no longer existed (CEL-0239).
+   */
+  function currentActiveViewId() {
+    return requireViewId(state.getActiveViewId(), 'Active view id');
+  }
+  function currentLayoutMode() {
+    return requireLayoutMode(viewLayoutModeSelect.value);
+  }
+  function isLiveViewHidden() {
+    return requireBoolean(
+      viewer.getLiveViewHidden(),
+      'Viewer live-view visibility'
+    );
+  }
   let destroyed = false;
   let lifecycleGeneration = 0;
   let destructionPromise = null;
@@ -396,6 +417,7 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
 
   function requireCurrentInventory() {
     const snapshots = requireSnapshotInventory(viewer);
+    const activeViewId = currentActiveViewId();
     const validIds = new Set([
       LIVE_VIEW_ID,
       ...snapshots.map(snapshot => snapshot.id),
@@ -405,36 +427,47 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
         `Active view "${activeViewId}" is not in the viewer inventory.`
       );
     }
-    if (liveViewHidden && activeViewId === LIVE_VIEW_ID) {
+    if (isLiveViewHidden() && activeViewId === LIVE_VIEW_ID) {
       throw new RangeError('A hidden live view cannot be the active view.');
     }
     return snapshots;
   }
 
   function pushViewLayoutToViewer() {
-    requireLayoutMode(viewLayoutMode);
+    const layoutMode = currentLayoutMode();
     requireCurrentInventory();
-    viewer.setViewLayout(viewLayoutMode, activeViewId);
+    viewer.setViewLayout(layoutMode, currentActiveViewId());
   }
 
   function syncActiveViewSelectOptions() {
     requireCurrentInventory();
   }
 
-  function syncActiveViewToState(notifyActiveView = true) {
+  /**
+   * Publish one active view to the owner, then draw from the owner.
+   *
+   * Callers used to assign a private mirror and let this push it. Passing the
+   * id is what keeps the owner the only copy: the value this notifies with is
+   * the value the DataState accepted.
+   *
+   * @param {string} viewId
+   * @param {boolean} [notifyActiveView]
+   */
+  function activateView(viewId, notifyActiveView = true) {
+    const exactViewId = requireViewId(viewId, 'Activated view id');
     if (typeof notifyActiveView !== 'boolean') {
       throw new TypeError(
         'Active-view UI notification ownership must be one exact boolean.'
       );
     }
-    const publishedViewId = state.setActiveView(activeViewId);
-    if (publishedViewId !== activeViewId) {
+    const publishedViewId = state.setActiveView(exactViewId);
+    if (publishedViewId !== exactViewId) {
       throw new Error(
-        `State published active view "${String(publishedViewId)}" instead of "${activeViewId}".`
+        `State published active view "${String(publishedViewId)}" instead of "${exactViewId}".`
       );
     }
     if (notifyActiveView) {
-      callbacks.onActiveViewChanged(activeViewId);
+      callbacks.onActiveViewChanged(exactViewId);
     }
   }
 
@@ -465,10 +498,6 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
       }
       throw error;
     }
-    liveViewHidden = requireBoolean(
-      viewer.getLiveViewHidden(),
-      'Viewer live-view visibility'
-    );
     return after;
   }
 
@@ -654,6 +683,10 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
     if (destroyed) return false;
     splitViewBadges.innerHTML = '';
     const snapshots = requireCurrentInventory();
+    // One read of each owner for one render pass. Every handler attached below
+    // reads its own, because it runs long after this pass finished.
+    const activeViewId = currentActiveViewId();
+    const liveViewHidden = isLiveViewHidden();
 
     let badgeIndex = 1;
 
@@ -683,8 +716,7 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
 
       liveBadge.addEventListener('click', () => {
         runUiAction('View selection failed', () => {
-          activeViewId = LIVE_VIEW_ID;
-          syncActiveViewToState();
+          activateView(LIVE_VIEW_ID);
           pushViewLayoutToViewer();
           renderSplitViewBadges();
           callbacks.onNavigationUiSyncRequested(LIVE_VIEW_ID);
@@ -735,17 +767,14 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
 
             if (currentSnapshots.length === 1) {
               removeSnapshot(currentSnapshots[0].id);
-              activeViewId = LIVE_VIEW_ID;
-              syncActiveViewToState();
+              activateView(LIVE_VIEW_ID);
               pushViewLayoutToViewer();
             } else {
-              if (activeViewId === LIVE_VIEW_ID) {
-                activeViewId = currentSnapshots[0].id;
-                syncActiveViewToState();
+              if (currentActiveViewId() === LIVE_VIEW_ID) {
+                activateView(currentSnapshots[0].id);
                 pushViewLayoutToViewer();
               }
               viewer.setLiveViewHidden(true);
-              liveViewHidden = true;
             }
             renderSplitViewBadges();
             updateSplitViewUI();
@@ -792,8 +821,7 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
 
       badge.addEventListener('click', () => {
         runUiAction('View selection failed', () => {
-          activeViewId = snapId;
-          syncActiveViewToState();
+          activateView(snapId);
           pushViewLayoutToViewer();
           renderSplitViewBadges();
           callbacks.onNavigationUiSyncRequested(snapId);
@@ -846,23 +874,25 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
           e.preventDefault();
           e.stopPropagation();
           runUiAction('Snapshot removal failed', () => {
-            const removedActiveView = snapId === activeViewId;
+            const removedActiveView = snapId === currentActiveViewId();
             const remainingSnaps = removeSnapshot(snapId);
+            const remainingActiveViewId = currentActiveViewId();
             const activeStillExists =
-              activeViewId === LIVE_VIEW_ID ||
-              remainingSnaps.some(snapshot => snapshot.id === activeViewId);
+              remainingActiveViewId === LIVE_VIEW_ID ||
+              remainingSnaps.some(
+                snapshot => snapshot.id === remainingActiveViewId
+              );
             if (removedActiveView || !activeStillExists) {
-              if (liveViewHidden) {
+              if (isLiveViewHidden()) {
                 if (remainingSnaps.length === 0) {
                   throw new Error(
                     'Viewer kept the live view hidden without any snapshot.'
                   );
                 }
-                activeViewId = remainingSnaps[0].id;
+                activateView(remainingSnaps[0].id);
               } else {
-                activeViewId = LIVE_VIEW_ID;
+                activateView(LIVE_VIEW_ID);
               }
-              syncActiveViewToState();
               pushViewLayoutToViewer();
             }
             renderSplitViewBadges();
@@ -905,14 +935,13 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
     const modeIsPoints = exactMode === 'points';
     if (!modeIsPoints) {
       if (publishLayout) {
-        if (liveViewHidden || activeViewId !== LIVE_VIEW_ID) {
+        if (isLiveViewHidden() || currentActiveViewId() !== LIVE_VIEW_ID) {
           throw new Error(
             'Smoke render mode requires the visible live view to own focus.'
           );
         }
         viewer.setViewLayout('single', LIVE_VIEW_ID);
       }
-      viewLayoutMode = 'single';
       viewLayoutModeSelect.value = 'single';
     }
     splitKeepViewBtn.disabled = !modeIsPoints;
@@ -924,14 +953,6 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
 
   function syncRenderModeUI(mode) {
     if (destroyed) return false;
-    activeViewId = requireViewId(
-      state.getActiveViewId(),
-      'Render-mode active view id'
-    );
-    liveViewHidden = requireBoolean(
-      viewer.getLiveViewHidden(),
-      'Render-mode live-view visibility'
-    );
     syncRenderModeState(mode, true);
   }
 
@@ -962,20 +983,19 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
     }
 
     if (!modeIsPoints) {
-      viewLayoutMode = 'single';
       viewLayoutModeSelect.value = 'single';
-      if (liveViewHidden) {
-        liveViewHidden = false;
+      if (isLiveViewHidden()) {
         viewer.setLiveViewHidden(false);
       }
-      if (activeViewId !== LIVE_VIEW_ID) {
-        activeViewId = LIVE_VIEW_ID;
-      }
-    } else {
-      viewLayoutMode = requireLayoutMode(viewLayoutModeSelect.value);
     }
 
-    syncActiveViewToState(notifyActiveView);
+    // An unusable layout selection is refused before anything is published,
+    // which is where the copy this used to keep was validated.
+    currentLayoutMode();
+    activateView(
+      modeIsPoints ? currentActiveViewId() : LIVE_VIEW_ID,
+      notifyActiveView
+    );
     pushViewLayoutToViewer();
   }
 
@@ -988,8 +1008,8 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
     if (requireRenderMode(renderModeSelect.value) !== 'points') {
       throw new Error('Kept views are available only in Points render mode.');
     }
-    const sourceViewId = activeViewId;
-    const sourceLayoutMode = viewLayoutMode;
+    const sourceViewId = currentActiveViewId();
+    const sourceLayoutMode = currentLayoutMode();
     const payload = requireSnapshotPayload(state.getSnapshotPayload());
     let createdId = null;
     try {
@@ -1013,11 +1033,9 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
         config: snapshotConfig,
       });
       createdId = requireViewId(created.id, 'Created snapshot id');
-      activeViewId = createdId;
-      viewLayoutMode = 'grid';
       viewLayoutModeSelect.value = 'grid';
 
-      syncActiveViewToState();
+      activateView(createdId);
       renderSplitViewBadges();
       updateSplitViewUI();
       return true;
@@ -1037,8 +1055,6 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
           snapshotId: createdId,
         }));
       }
-      activeViewId = sourceViewId;
-      viewLayoutMode = sourceLayoutMode;
       viewLayoutModeSelect.value = sourceLayoutMode;
       rollback(() => {
         const restoredViewId = state.setActiveView(sourceViewId);
@@ -1075,11 +1091,11 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
       }
       throw error;
     }
-    activeViewId = LIVE_VIEW_ID;
-    liveViewHidden = false;
-    viewLayoutMode = 'grid';
+    // `clearPublishedSnapshotViews()` already returned the DataState's active
+    // view to the live view and the viewer's live view to visible; this only
+    // has to publish the layout the cleared interface uses.
     viewLayoutModeSelect.value = 'grid';
-    syncActiveViewToState();
+    activateView(LIVE_VIEW_ID);
     renderSplitViewBadges();
     updateSplitViewUI();
   }
@@ -1093,11 +1109,10 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
     ) {
       throw new RangeError(`Focused view "${newViewId}" does not exist.`);
     }
-    if (liveViewHidden && newViewId === LIVE_VIEW_ID) {
+    if (isLiveViewHidden() && newViewId === LIVE_VIEW_ID) {
       throw new RangeError('A hidden live view cannot receive focus.');
     }
-    const viewChanged = activeViewId !== newViewId;
-    activeViewId = newViewId;
+    const viewChanged = currentActiveViewId() !== newViewId;
 
     if (viewChanged) {
       const publishedViewId = state.setActiveView(newViewId);
@@ -1141,7 +1156,7 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
       viewer.setCamerasLocked(newLocked);
       updateCameraLockUI();
       renderSplitViewBadges();
-      callbacks.onNavigationUiSyncRequested(activeViewId);
+      callbacks.onNavigationUiSyncRequested(currentActiveViewId());
     });
   };
   splitKeepViewBtn.addEventListener('click', handleKeepViewClick);
@@ -1150,7 +1165,6 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
   updateCameraLockUI();
   const handleLayoutModeChange = () => {
     runUiAction('View layout change failed', () => {
-      viewLayoutMode = requireLayoutMode(viewLayoutModeSelect.value);
       pushViewLayoutToViewer();
       renderSplitViewBadges();
       updateSplitViewUI();
@@ -1173,27 +1187,20 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
         'View reconciliation notification ownership must be one exact boolean.'
       );
     }
-    const previousActiveViewId = activeViewId;
+    const previousActiveViewId = currentActiveViewId();
     const snapshots = requireSnapshotInventory(viewer);
     const snapshotIdSet = new Set(
       snapshots.map(snapshot => snapshot.id)
     );
-    let nextActiveViewId = requireViewId(
-      state.getActiveViewId(),
-      'Active view id'
-    );
-    liveViewHidden = requireBoolean(
-      viewer.getLiveViewHidden(),
-      'Viewer live-view visibility'
-    );
+    const liveViewHidden = isLiveViewHidden();
     const activeViewExists =
-      nextActiveViewId === LIVE_VIEW_ID ||
-      snapshotIdSet.has(nextActiveViewId);
+      previousActiveViewId === LIVE_VIEW_ID ||
+      snapshotIdSet.has(previousActiveViewId);
     if (
       !activeViewExists ||
-      (liveViewHidden && nextActiveViewId === LIVE_VIEW_ID)
+      (liveViewHidden && previousActiveViewId === LIVE_VIEW_ID)
     ) {
-      nextActiveViewId =
+      const nextActiveViewId =
         liveViewHidden && snapshots.length > 0
           ? snapshots[0].id
           : LIVE_VIEW_ID;
@@ -1204,11 +1211,11 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
         );
       }
     }
-    activeViewId = nextActiveViewId;
     reconcileSplitViewUI(false);
     // Reconciliation publishes the corrected focus/layout first so badges
     // cannot retain a camera marker for a snapshot that was just retired.
     renderSplitViewBadges();
+    const activeViewId = currentActiveViewId();
     if (
       forceActiveViewNotification ||
       activeViewId !== previousActiveViewId
@@ -1221,14 +1228,7 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
     renderSplitViewBadges,
     syncRenderModeUI,
     updateSplitViewUI,
-    refreshUIForActiveView: () => {
-      if (destroyed) return false;
-      callbacks.onActiveViewChanged(activeViewId);
-      return true;
-    },
     syncFromStateAndViewer,
-    getActiveViewId: () => activeViewId,
-    getLayoutMode: () => viewLayoutMode,
     destroy() {
       if (destructionPromise !== null) return destructionPromise;
       destroyed = true;

@@ -602,3 +602,118 @@ test('gzip preflight rejects malformed DEFLATE envelopes before native use', asy
     /match distance 32768 exceeds 32767 available output bytes/i,
   );
 });
+
+/**
+ * The DEFLATE preflight names the alphabet it was decoding in every failure it
+ * raises. Those names used to be rebuilt per decoded *bit*, which cost one
+ * discarded string for each bit of every session chunk; they are now built once
+ * per table. The existing envelope tests match on loose fragments
+ * (`/DEFLATE stream is truncated/`), so every one of them still passes when the
+ * alphabet name is dropped, truncated, or attached to the wrong table. These
+ * pin the complete sentence instead, which is the only thing that distinguishes
+ * "the message survived the move" from "the message compiles".
+ */
+test('every DEFLATE alphabet names itself exactly in its decode failures', async () => {
+  // A fixed block that ends mid literal/length code.
+  await expectRejectedBeforeNative(
+    gzipEnvelope(bitBytes([
+      [1, 1], // BFINAL
+      [1, 2], // fixed-Huffman BTYPE
+    ])),
+    0,
+    new Error(
+      'DEFLATE stream is truncated while reading '
+      + 'DEFLATE literal/length stream Huffman code.',
+    ),
+  );
+
+  // A fixed block that ends mid distance code: symbol 269 consumes two extra
+  // length bits, leaving four of the five bits a fixed distance code needs.
+  await expectRejectedBeforeNative(
+    gzipEnvelope(bitBytes([
+      [1, 1], // BFINAL
+      [1, 2], // fixed-Huffman BTYPE
+      [13, 7, true], // length symbol 269
+      [0, 2], // its two extra length bits
+    ])),
+    0,
+    new Error(
+      'DEFLATE stream is truncated while reading '
+      + 'DEFLATE distance stream Huffman code.',
+    ),
+  );
+
+  // A dynamic block that ends mid code-length symbol.
+  await expectRejectedBeforeNative(
+    gzipEnvelope(bitBytes([
+      [1, 1], // BFINAL
+      [2, 2], // dynamic Huffman block
+      [0, 5], // HLIT = 257
+      [0, 5], // HDIST = 1
+      [0, 4], // HCLEN = 4
+      [0, 3], // symbol 16: unused
+      [0, 3], // symbol 17: unused
+      [1, 3], // symbol 18: one bit
+      [1, 3], // symbol 0: one bit
+    ])),
+    0,
+    new Error(
+      'DEFLATE stream is truncated while reading '
+      + 'DEFLATE code-length stream Huffman code.',
+    ),
+  );
+
+  /**
+   * 256 leading zero code lengths, spelled with two long zero-repeats, so the
+   * literal/length alphabet can be given exactly the symbols a case needs.
+   * `entries` supplies the code lengths from index 256 onward.
+   */
+  const dynamicWithSparseLiterals = (hlit, entries) => gzipEnvelope(bitBytes([
+    [1, 1], // BFINAL
+    [2, 2], // dynamic Huffman block
+    [hlit, 5], // HLIT
+    [0, 5], // HDIST = 1
+    [14, 4], // HCLEN = 18, so the code-length alphabet reaches symbol 1
+    // Code-length code lengths in CODE_LENGTH_ORDER:
+    // 16 17 18  0  8  7  9  6 10  5 11  4 12  3 13  2 14  1
+    [0, 3], [0, 3], [1, 3], [2, 3], [0, 3], [0, 3], [0, 3], [0, 3], [0, 3],
+    [0, 3], [0, 3], [0, 3], [0, 3], [0, 3], [0, 3], [0, 3], [0, 3], [2, 3],
+    // symbol 18 (code 0, one bit) + 7 extra bits: 127 + 11 = 138 zeros
+    [0, 1], [127, 7],
+    // symbol 18 again: 107 + 11 = 118 zeros, for 256 in total
+    [0, 1], [107, 7],
+    ...entries,
+  ]));
+  // Canonical code-length codes for this alphabet: 18 -> "0", 0 -> "10",
+  // 1 -> "11".
+  const codeLengthZero = [2, 2, true];
+  const codeLengthOne = [3, 2, true];
+
+  // One literal/length code of one bit leaves the other one-bit code unused,
+  // which DEFLATE permits; reading that unused code is a decode failure.
+  await expectRejectedBeforeNative(
+    dynamicWithSparseLiterals(0, [
+      codeLengthOne, // index 256: end-of-block, one bit
+      codeLengthZero, // index 257: the sole distance code is absent
+      [1, 1], // the unused one-bit literal/length code
+    ]),
+    0,
+    new Error(
+      'DEFLATE literal/length stream contains an invalid Huffman code.',
+    ),
+  );
+
+  // A block whose distance alphabet is empty, reached through a length symbol.
+  await expectRejectedBeforeNative(
+    dynamicWithSparseLiterals(1, [
+      codeLengthOne, // index 256: end-of-block
+      codeLengthOne, // index 257: length symbol 257
+      codeLengthZero, // index 258: the sole distance code is absent
+      [1, 1], // literal/length code "1" -> symbol 257
+    ]),
+    0,
+    new Error(
+      'DEFLATE distance stream Huffman alphabet is empty.',
+    ),
+  );
+});

@@ -27,6 +27,10 @@ function createFakeDocument() {
     style: {},
     attributes: new Map(),
     children: [],
+    focusCalls: 0,
+    focus() {
+      this.focusCalls++;
+    },
     setAttribute(name, value) {
       this.attributes.set(name, value);
     },
@@ -308,6 +312,10 @@ test('terminal startup failure has one persistent accessible visible owner', () 
   assert.equal(surface.id, 'cellucid-startup-failure');
   assert.equal(surface.attributes.get('role'), 'alert');
   assert.equal(surface.attributes.get('aria-live'), 'assertive');
+  // Onboarding is retracted as this surface is published, so focus has to land
+  // somewhere: on the alert itself, not on a control that just disappeared.
+  assert.equal(surface.attributes.get('tabindex'), '-1');
+  assert.equal(surface.focusCalls, 1);
   assert.equal(surface.style.position, 'fixed');
   assert.equal(surface.style.zIndex, '2147483647');
   assert.equal(

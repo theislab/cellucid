@@ -152,12 +152,175 @@ function requireDatasetInventory(value, sourceType) {
   });
 }
 
+/**
+ * The causes a data-source failure can be told apart into, and what each one
+ * asks the user to do next.
+ *
+ * The loader already publishes the difference: `DataSourceError` carries a
+ * `code`, and a transport failure carries the HTTP status the server answered
+ * with. Everything below is read from those fields — nothing is inferred from
+ * an error message, because message text is engine-specific and a UI that
+ * sniffed it would be guessing.
+ *
+ * `unreachable` is deliberately one bucket for two causes. A request that never
+ * completed (offline, DNS, CORS) and a request whose body was not a Cellucid
+ * document both arrive as `NETWORK_ERROR` with no status, and `fetchJson()`
+ * discards which of the two it was. Rather than guess, the sentence names both
+ * possibilities and asks the user to check both.
+ *
+ * `too-large` is the row that must not be folded into `unreadable`. A byte
+ * ceiling fires on a perfectly valid export that is merely bigger than the
+ * browser will take, so "re-export it" is the one action guaranteed to fail:
+ * the user regenerates a byte-identical file and meets the identical wall.
+ * The loader tells the two apart — `TOO_LARGE` is published by whichever
+ * ceiling refused — so the UI does not have to guess (CEL-0219).
+ */
+const DATA_SOURCE_FAILURES = Object.freeze({
+  'not-found': Object.freeze({
+    cause:
+      'nothing is published at that address (the server answered "not '
+      + 'found").',
+    action: 'Check the address for a typo, then try again.'
+  }),
+  refused: Object.freeze({
+    cause: 'the server refused access.',
+    action: 'Check that the data is shared publicly, then try again.'
+  }),
+  rejected: Object.freeze({
+    cause: 'the server rejected the request.',
+    action: 'Check the address, then try again.'
+  }),
+  server: Object.freeze({
+    cause: 'the server reported a problem of its own.',
+    action: 'Wait a moment, then try again.'
+  }),
+  'too-large': Object.freeze({
+    cause: 'what is published there is larger than Cellucid opens in a browser.',
+    action:
+      'Serve it with the Cellucid server, or publish a smaller export, then '
+      + 'try again.'
+  }),
+  unreadable: Object.freeze({
+    cause: 'what is published there is not in a format Cellucid can read.',
+    action: 'Re-export it with cellucid prepare, then try again.'
+  }),
+  unreachable: Object.freeze({
+    cause:
+      'nothing readable came back — the connection may have failed, or that ' +
+      'address may not hold Cellucid data.',
+    action: 'Check your network and the address, then try again.'
+  })
+});
+
+/**
+ * What to say when the loader published no cause at all. Naming one anyway
+ * would be an invention: an error with no code and no status is as likely to be
+ * a broken invariant inside Cellucid as anything on the network.
+ */
+const UNCLASSIFIED_DATA_SOURCE_ACTION =
+  'Try again; if it keeps failing, check the address and your connection.';
+
+/**
+ * Name the cause one loader Error stands for, or null when it published none.
+ *
+ * @param {unknown} error
+ * @returns {string|null}
+ */
+export function classifyDataSourceFailure(error) {
+  if (error instanceof AggregateError && error.errors.length > 0) {
+    return classifyDataSourceFailure(error.errors[0]);
+  }
+  if (!(error instanceof Error)) return null;
+  const code = typeof error.code === 'string' ? error.code : null;
+  if (code === 'NOT_FOUND' || code === 'FILE_NOT_FOUND') return 'not-found';
+  if (code === 'PERMISSION_DENIED') return 'refused';
+  if (code === 'TOO_LARGE') return 'too-large';
+  if (
+    code === 'INVALID_FORMAT' ||
+    code === 'VALIDATION_ERROR' ||
+    code === 'UNSUPPORTED'
+  ) {
+    return 'unreadable';
+  }
+  const details = error.details;
+  const status =
+    details !== null &&
+    typeof details === 'object' &&
+    Number.isInteger(details.status)
+      ? details.status
+      : null;
+  if (status === null) return code === 'NETWORK_ERROR' ? 'unreachable' : null;
+  if (status === 404) return 'not-found';
+  if (status === 401 || status === 403) return 'refused';
+  if (status >= 500) return 'server';
+  if (status >= 400) return 'rejected';
+  return 'unreachable';
+}
+
+/**
+ * One sentence a bench scientist can act on, naming what is wrong and what to
+ * do next without quoting a URL, a status line or a compression term.
+ *
+ * @param {string} subject - Noun phrase for what failed, e.g. `Sample datasets`
+ * @param {string} verb - How it failed, e.g. `could not be loaded`
+ * @param {unknown} error
+ * @returns {string}
+ */
+export function describeDataSourceFailure(subject, verb, error) {
+  if (typeof subject !== 'string' || subject.length === 0) {
+    throw new TypeError(
+      'Data source failure subject must be a non-empty string.'
+    );
+  }
+  if (typeof verb !== 'string' || verb.length === 0) {
+    throw new TypeError('Data source failure verb must be a non-empty string.');
+  }
+  const failure = classifyDataSourceFailure(error);
+  if (failure === null) {
+    return `${subject} ${verb}. ${UNCLASSIFIED_DATA_SOURCE_ACTION}`;
+  }
+  const { cause, action } = DATA_SOURCE_FAILURES[failure];
+  return `${subject} ${verb}: ${cause} ${action}`;
+}
+
 function errorMessage(error) {
   if (error instanceof AggregateError) {
     const causes = error.errors.map(item => errorMessage(item));
     return `${error.message} Causes: ${causes.join('; ')}`;
   }
   return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * The raw text to append to a notification, and nothing at all when the loader
+ * did publish a cause.
+ *
+ * An unclassified failure is as likely to be a broken invariant inside
+ * Cellucid as a transport problem, and then its message is the only evidence
+ * anyone has. Swallowing it would hide a defect, so it is carried through as a
+ * clearly-labelled trailing detail rather than as the whole message.
+ *
+ * @param {unknown} error
+ * @returns {string}
+ */
+export function dataSourceFailureDetail(error) {
+  return classifyDataSourceFailure(error) === null
+    ? ` Details: ${errorMessage(error)}`
+    : '';
+}
+
+/**
+ * The failure as a notification: the readable sentence, plus the raw text
+ * whenever the loader classified nothing.
+ *
+ * @param {string} subject
+ * @param {string} verb
+ * @param {unknown} error
+ * @returns {string}
+ */
+export function reportDataSourceFailure(subject, verb, error) {
+  return describeDataSourceFailure(subject, verb, error)
+    + dataSourceFailureDetail(error);
 }
 
 /**
@@ -262,6 +425,30 @@ export function initDatasetConnections(options) {
     target.addEventListener(eventName, guardedListener, {
       signal: lifecycleController.signal
     });
+  }
+
+  // Every data-source control ships disabled in `index.html`, because until
+  // this module has attached its listeners a click on one is discarded without
+  // a request, a message or a trace. A control is admitted only once the
+  // listener that acts on it exists, and every admitted control is retired
+  // again when those listeners are aborted.
+  const admittedControls = new Set();
+
+  function admitControls(...controls) {
+    for (const control of controls) {
+      if (control === null || typeof control !== 'object') {
+        throw new TypeError(
+          'A wired dataset connection control must be a DOM element.'
+        );
+      }
+      admittedControls.add(control);
+      control.disabled = false;
+    }
+  }
+
+  function retireAdmittedControls() {
+    for (const control of admittedControls) control.disabled = true;
+    admittedControls.clear();
   }
 
   function beginLoadingNotification(message, options) {
@@ -465,6 +652,7 @@ export function initDatasetConnections(options) {
         if (!destroyed) userDataFileInput.value = '';
       }, 'Prepared-directory selection failed');
     });
+    admitControls(userDataBrowseBtn, userDataFileInput);
   }
   if (localH5ad !== null) {
     const { userDataH5adBtn, userDataH5adInput } = localH5ad;
@@ -486,6 +674,7 @@ export function initDatasetConnections(options) {
         if (!destroyed) userDataH5adInput.value = '';
       }, 'H5AD selection failed');
     });
+    admitControls(userDataH5adBtn, userDataH5adInput);
   }
   if (localZarr !== null) {
     const {
@@ -510,6 +699,7 @@ export function initDatasetConnections(options) {
         if (!destroyed) userDataZarrArchiveInput.value = '';
       }, 'Zarr ZIP selection failed');
     });
+    admitControls(userDataZarrArchiveBtn, userDataZarrArchiveInput);
   }
 
   function wireConnection(config) {
@@ -518,6 +708,7 @@ export function initDatasetConnections(options) {
       connectionInput,
       disconnectButton,
       disconnectContainer,
+      failureSubject,
       inputLabel,
       loadMethod,
       sourceType
@@ -952,7 +1143,11 @@ export function initDatasetConnections(options) {
         settleLoadingNotification(
           'fail',
           connectNotifId,
-          `Connection failed: ${errorMessage(exactError)}`
+          reportDataSourceFailure(
+            failureSubject,
+            'could not be reached',
+            exactError
+          )
         );
         debug.error(`[UI] ${inputLabel} connection error:`, exactError);
       } finally {
@@ -1061,6 +1256,9 @@ export function initDatasetConnections(options) {
       connectionInput.value = value;
     }
     updateConnectionUI(initialConnected);
+    // `updateConnectionUI` owns the text input's enabled state; the two buttons
+    // have no other owner until an operation runs, so admission is theirs.
+    admitControls(connectButton, disconnectButton);
   }
 
   const remote = requireControlGroup(
@@ -1079,6 +1277,7 @@ export function initDatasetConnections(options) {
       connectionInput: remote.remoteServerUrl,
       disconnectButton: remote.remoteDisconnectBtn,
       disconnectContainer: remote.remoteDisconnectContainer,
+      failureSubject: 'The remote server',
       inputLabel: 'Remote server',
       loadMethod: DATA_LOAD_METHODS.REMOTE_CONNECT,
       sourceType: 'remote'
@@ -1101,6 +1300,7 @@ export function initDatasetConnections(options) {
       connectionInput: github.githubRepoUrl,
       disconnectButton: github.githubDisconnectBtn,
       disconnectContainer: github.githubDisconnectContainer,
+      failureSubject: 'The GitHub repository',
       inputLabel: 'GitHub repository',
       loadMethod: DATA_LOAD_METHODS.GITHUB_CONNECT,
       sourceType: 'github-repo'
@@ -1113,6 +1313,13 @@ export function initDatasetConnections(options) {
     const cleanupErrors = [];
     try {
       lifecycleController.abort();
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+    try {
+      // The listeners are gone, so the controls must stop offering the actions
+      // those listeners would have carried out.
+      retireAdmittedControls();
     } catch (error) {
       cleanupErrors.push(error);
     }

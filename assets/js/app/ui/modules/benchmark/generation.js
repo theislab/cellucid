@@ -19,6 +19,13 @@ const WORKER_URL = new URL('./generation-worker.js', import.meta.url).href;
 /**
  * Generate a synthetic dataset without blocking the main thread.
  *
+ * The worker evaluates its own instance of the generator module, so the
+ * dataset is built from `DEFAULT_SYNTHETIC_SEED` — the same constant the main
+ * thread would have used, which is what makes the two paths byte-identical.
+ * A `SyntheticDataGenerator.setSeed()` performed on the main thread does not
+ * cross this boundary: the request carries no seed field, so nothing here can
+ * silently observe a different one.
+ *
  * @param {Object} options - Exact request.
  * @param {string} options.pattern - One of `SYNTHETIC_PATTERNS`.
  * @param {number} options.count - Points to generate.

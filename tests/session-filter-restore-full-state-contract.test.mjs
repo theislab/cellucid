@@ -138,8 +138,8 @@ test('restoring a session reproduces its exact state instead of merging onto the
 
   assert.deepEqual(
     sessionA['obs:cell_type'].visibility,
-    [{ categoryIndex: 0, visible: false }],
-    'Session A must record exactly the one hidden category.',
+    [{ categoryName: 'B cell', visible: false }],
+    'Session A must record exactly the one hidden category, by name.',
   );
 
   // --- Same tab, keeps drifting past A.

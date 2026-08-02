@@ -220,8 +220,11 @@ test(
         makeSerializer(destination).restoreFromBlob(bundle),
         error => {
           assert.ok(error instanceof RangeError);
+          assert.match(error.message, /coordinates differ/);
           assert.match(error.message, /different order/);
-          assert.match(error.message, /wrong cells/);
+          // Row order is one of the two things a coordinate difference can
+          // mean, so it is offered, never asserted.
+          assert.match(error.message, /Either the cells are stored/);
           return true;
         },
       );
@@ -302,6 +305,45 @@ test(
           assert.match(error.message, /3D view was shown/);
           assert.match(error.message, /2D view is shown now/);
           assert.doesNotMatch(error.message, /different order|wrong cells/);
+          return true;
+        },
+      );
+    });
+    assert.deepEqual(restoredSelection(destination), []);
+  },
+);
+
+test(
+  'a re-computed embedding at the same dimension is not called a re-ordering',
+  async () => {
+    const { bundle } = await captureSelectionBundle();
+    // Same cells in the same rows: only the embedding was computed again, so
+    // the coordinates moved and the digest changed. Nothing here re-ordered
+    // any row, and the refusal must not say that it did.
+    const destination = makeDatasetState({
+      cellOrder: [0, 1, 2, 3, 4, 5],
+      pages: emptyPages(),
+    });
+    destination.positionsArray = destination.positionsArray.map(
+      value => value + 0.0009765625,
+    );
+
+    await withNotificationHarness(async () => {
+      await assert.rejects(
+        makeSerializer(destination).restoreFromBlob(bundle),
+        error => {
+          assert.ok(error instanceof RangeError);
+          // The one thing the digest establishes.
+          assert.match(error.message, /coordinates differ/);
+          // Both causes it cannot separate, offered as alternatives.
+          assert.match(error.message, /Either the cells are stored in a different order/);
+          assert.match(error.message, /re-computed embedding/);
+          // Never the old claim that a re-ordering is what happened.
+          assert.doesNotMatch(error.message, /would mark the wrong cells/);
+          assert.doesNotMatch(
+            error.message,
+            /but its cells are stored in a different order/,
+          );
           return true;
         },
       );

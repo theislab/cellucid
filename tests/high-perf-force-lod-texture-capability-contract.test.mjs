@@ -7,8 +7,8 @@ import {
 import {
   HighPerfRenderer,
   RendererConfig,
-  SpatialIndex,
 } from '../assets/js/rendering/high-perf-renderer.js';
+import { SpatialIndex } from '../assets/js/rendering/high-perf/spatial-index.js';
 
 const DIMENSION = 2;
 

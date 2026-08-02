@@ -18,6 +18,7 @@
 
 import { FormBasedAnalysisUI } from './base/form-based-analysis.js';
 import {
+  createCollapsibleSection,
   createFormSelect,
   createFormRow,
   createFormCheckbox,
@@ -25,6 +26,7 @@ import {
   getPerformanceFormValues
 } from '../../shared/dom-utils.js';
 import { GenesPanelController } from '../../genes-panel/genes-panel-controller.js';
+import { encodeGroupName } from '../../genes-panel/expression-matrix-builder.js';
 import { HoverContext } from '../components/hover-context.js';
 import { ProgressTracker } from '../../shared/progress-tracker.js';
 import { PlotRegistry } from '../../shared/plot-registry-utils.js';
@@ -94,6 +96,9 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
 
     /** @type {HTMLElement|null} Custom genes textarea */
     this._customGenesInput = null;
+
+    /** @type {HTMLElement|null} The rendered form subtree, before it is attached */
+    this._formRoot = null;
 
     /**
      * Modal-only UI state: which group is selected in the marker table.
@@ -180,6 +185,7 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
   _renderFormControls(wrapper) {
     const form = document.createElement('div');
     form.className = 'analysis-form genes-panel-form';
+    this._formRoot = form;
 
     // Get available categories
     const categories = this._getAvailableCategories();
@@ -216,6 +222,11 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
       { value: 'wilcox', label: 'Wilcoxon', description: 'Rank-based test, robust to outliers and non-normal distributions.', selected: true },
       { value: 'ttest', label: 't-test', description: 'Parametric test, assumes normally distributed expression data.' }
     ]);
+
+    // The row's visible label reads "Mode:", so the second select sharing that
+    // row needs to say what it is on its own.
+    const methodControl = methodSelectEl.querySelector('select') ?? methodSelectEl;
+    methodControl.setAttribute('aria-label', 'Statistical method');
 
     const modeAndMethod = document.createElement('div');
     modeAndMethod.className = 'page-comparison-row';
@@ -295,9 +306,12 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
 
     wrapper.appendChild(form);
 
-    // Initialize visibility based on default mode ('clustered')
-    // Uses setTimeout to ensure DOM is ready
-    setTimeout(() => this._handleModeChange('clustered'), 0);
+    // Initialize section visibility from the mode the form actually shows.
+    // Hard-coding 'clustered' contradicted the select whenever the form was
+    // rebuilt with a carried-over mode.
+    this._handleModeChange(
+      (modeSelectEl.querySelector('select') ?? modeSelectEl).value
+    );
   }
 
   /**
@@ -482,9 +496,7 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
         progressSettled = true;
         this._fullMatrix = fullMatrix;
         this._committedGeneListMode = this._modalGeneListMode;
-        this._lastResult = result;
-        this._currentPageData = result.data || result;
-        this._requestedPlotOptions = structuredClone(result.options || {});
+        await this._publishAnalysisResult(result, requestId);
 
         // Callback
         if (this.onResultChange) {
@@ -740,29 +752,17 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
   async _showResult(result, requestId) {
     if (!this._isCurrentAnalysisRequest(requestId)) return;
 
-    if (!result.plotType) {
-      if (this._previewPlotSlot != null) {
-        await this._previewPlotSlot.destroy();
-        this._previewPlotSlot = null;
-        this._previewPlotHost = null;
-      }
-      if (!this._isCurrentAnalysisRequest(requestId)) return;
-      this._resultContainer.innerHTML = '';
-      this._resultContainer.classList.remove('hidden');
-      this._renderRankedMarkers(result, this._resultContainer);
-      return;
-    }
-
     // Ensure plot type is registered
     await import('../../plots/types/gene-heatmap.js');
     if (!this._isCurrentAnalysisRequest(requestId)) return;
 
     const containerId = this._plotContainerId ||
       `genes-panel-plot-${this._instanceId || 'default'}`;
-    const candidate = await this._renderPreviewPlot({
+    await this._renderPreviewPlot({
       result,
       requestId,
       containerId,
+      expandable: true,
       height: 380,
       onRendered: plotCandidate => this._setupHoverContext(
         plotCandidate,
@@ -770,17 +770,6 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
         { replaceExisting: false }
       )
     });
-    if (candidate === null || !this._isCurrentAnalysisRequest(requestId)) return;
-    // Expand (modal) action
-    const priorActions = this._resultContainer.querySelector(
-      '.analysis-actions'
-    );
-    if (priorActions) priorActions.remove();
-    const actionsContainer = document.createElement('div');
-    actionsContainer.className = 'analysis-actions';
-    actionsContainer.style.display = 'flex';
-    actionsContainer.appendChild(this._createExpandButton());
-    this._resultContainer.appendChild(actionsContainer);
   }
 
   // ===========================================================================
@@ -799,11 +788,6 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
     } = {}
   ) {
     if (!result) return null;
-    if (!result.plotType) {
-      container.innerHTML =
-        '<div class="analysis-empty-message">No plot for Ranked mode.</div>';
-      return null;
-    }
 
     await import('../../plots/types/gene-heatmap.js');
     if (!PlotRegistry.get(result.plotType)) {
@@ -822,34 +806,91 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
   }
 
   /**
-   * Export marker heatmap data as CSV.
+   * Export the current marker result as CSV.
    * @override
    */
   _exportModalCSV() {
     const result = this._lastResult;
     if (!result) return;
 
-    // Heatmap CSV
-    const matrix = result?.data?.matrix;
-    if (matrix) {
-      downloadCSV(
-        this._serializeHeatmapCSV(matrix),
-        'marker_genes_heatmap',
-        this._notifications
-      );
-      return;
-    }
+    const { csv, filename } = this._buildModalCSVExport(result);
+    downloadCSV(csv, filename, this._notifications);
+  }
 
-    // Ranked markers CSV
-    const groups = result?.markers?.groups;
-    if (!groups) return;
+  /**
+   * Choose which CSV a marker result exports, and serialize it.
+   *
+   * The three modes draw the same preview but do not carry the same payload.
+   * Clustered and Custom Genes are *about* the heatmap, so they export the wide
+   * per-group matrix. Ranked Genes is about the per-group ranking shown in the
+   * expanded view, so it exports that table — which also carries the group
+   * means and detection rates the matrix has no column for.
+   *
+   * The mode is read from the result rather than from the form, because the
+   * expanded view can outlive the form values that produced it; exporting the
+   * form's mode would label one run's numbers with another run's shape. A
+   * result that reached here without a mode is a defect upstream, and saying so
+   * is better than silently exporting the wrong one of two valid files.
+   *
+   * @param {Object} result - The result being exported.
+   * @returns {{csv: string, filename: string}}
+   * @private
+   */
+  _buildModalCSVExport(result) {
+    if (result === null || typeof result !== 'object' || Array.isArray(result)) {
+      throw new TypeError('Marker genes CSV export requires a result object');
+    }
+    const mode = result.metadata?.mode;
+    if (mode === 'ranked') {
+      return {
+        csv: this._serializeRankedMarkersCSV(result.markers?.groups),
+        filename: 'marker_genes_ranked'
+      };
+    }
+    if (mode === 'clustered' || mode === 'custom') {
+      return {
+        csv: this._serializeHeatmapCSV(result.data?.matrix),
+        filename: 'marker_genes_heatmap'
+      };
+    }
+    throw new RangeError(
+      `Unknown marker genes display mode: ${JSON.stringify(mode)}`
+    );
+  }
+
+  /**
+   * Serialize the ranked per-group marker table shown in the expanded view.
+   *
+   * The `group` column carries the category the user grouped by, exactly as the
+   * heatmap CSV's column headers and the expanded view's picker carry it, and
+   * for the same reason: `category-code:0` is a synthetic handle that keys
+   * `markers.groups`, the matrix columns and the saved selection, and it means
+   * nothing outside this session. Both exports encode it through the one rule in
+   * `encodeGroupName`, so a ranked table and a heatmap taken from the same
+   * analysis can be joined on the group.
+   *
+   * @param {Object|undefined} groups - `markers.groups`, keyed by group id.
+   * @returns {string}
+   * @private
+   */
+  _serializeRankedMarkersCSV(groups) {
+    if (
+      groups === null ||
+      typeof groups !== 'object' ||
+      Array.isArray(groups)
+    ) {
+      throw new TypeError(
+        'Ranked marker CSV requires the discovered per-group markers'
+      );
+    }
 
     const rows = ['group,gene,rank,log2FoldChange,pValue,adjustedPValue,meanInGroup,meanOutGroup,percentInGroup,percentOutGroup'];
     for (const [groupId, groupData] of Object.entries(groups)) {
+      const groupName = encodeGroupName(groupData?.groupName, groupId);
       for (const m of (groupData?.markers || [])) {
         rows.push([
-          groupId,
-          m.gene ?? '',
+          toCSVCell(groupName),
+          toCSVCell(m.gene ?? ''),
           m.rank ?? '',
           Number.isFinite(m.log2FoldChange) ? m.log2FoldChange : '',
           Number.isFinite(m.pValue) ? m.pValue : '',
@@ -861,8 +902,7 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
         ].join(','));
       }
     }
-
-    downloadCSV(rows.join('\n'), 'marker_genes_ranked', this._notifications);
+    return rows.join('\n');
   }
 
   /**
@@ -915,91 +955,6 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
       lines[r + 1] = row.join(',');
     }
     return lines.join('\n');
-  }
-
-  /**
-   * Render ranked marker table (sidebar).
-   * @private
-   */
-  _renderRankedMarkers(result, container) {
-    const groups = result?.markers?.groups || {};
-    const groupIds = Object.keys(groups);
-
-    if (groupIds.length === 0) {
-      container.innerHTML = '<div class="analysis-empty-message">No markers available.</div>';
-      return;
-    }
-
-    const header = document.createElement('div');
-    header.className = 'analysis-result-header';
-    header.innerHTML = `<h4>Top Marker Genes</h4>`;
-    container.appendChild(header);
-
-    const controls = document.createElement('div');
-    controls.className = 'analysis-actions';
-    controls.style.display = 'flex';
-    controls.style.gap = '8px';
-    container.appendChild(controls);
-
-    const select = document.createElement('select');
-    select.className = 'obs-select';
-    for (const id of groupIds) {
-      const opt = document.createElement('option');
-      opt.value = id;
-      opt.textContent = id;
-      select.appendChild(opt);
-    }
-    controls.appendChild(select);
-    controls.appendChild(this._createExpandButton());
-
-    const tableWrap = document.createElement('div');
-    container.appendChild(tableWrap);
-
-    const render = () => {
-      const groupId = select.value;
-      const markers = Object.hasOwn(groups, groupId)
-        ? groups[groupId]?.markers || []
-        : [];
-
-      const table = document.createElement('table');
-      table.className = 'de-genes-table';
-
-      const thead = document.createElement('thead');
-      thead.innerHTML = '<tr><th>Gene</th><th>log2FC</th><th>p</th><th>FDR</th></tr>';
-      table.appendChild(thead);
-
-      const tbody = document.createElement('tbody');
-      for (const m of markers) {
-        const tr = document.createElement('tr');
-        tr.className = m?.log2FoldChange > 0 ? 'up' : 'down';
-
-        const tdGene = document.createElement('td');
-        tdGene.className = 'gene-name';
-        tdGene.textContent = String(m?.gene ?? '');
-        tr.appendChild(tdGene);
-
-        const tdFc = document.createElement('td');
-        tdFc.textContent = Number.isFinite(m?.log2FoldChange) ? m.log2FoldChange.toFixed(3) : 'N/A';
-        tr.appendChild(tdFc);
-
-        const tdP = document.createElement('td');
-        tdP.textContent = Number.isFinite(m?.pValue) ? m.pValue.toExponential(2) : 'N/A';
-        tr.appendChild(tdP);
-
-        const tdFdr = document.createElement('td');
-        tdFdr.textContent = Number.isFinite(m?.adjustedPValue) ? m.adjustedPValue.toExponential(2) : 'N/A';
-        tr.appendChild(tdFdr);
-
-        tbody.appendChild(tr);
-      }
-      table.appendChild(tbody);
-
-      tableWrap.innerHTML = '';
-      tableWrap.appendChild(table);
-    };
-
-    select.addEventListener('change', render);
-    render();
   }
 
   /**
@@ -1131,9 +1086,16 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
     const groupSelect = document.createElement('select');
     groupSelect.className = 'obs-select';
     for (const id of groupIds) {
+      // The group id is a synthetic handle, `category-code:<code>`, and it is
+      // what `markers.groups`, the heatmap columns, the hover lookup and the
+      // saved `modalSelectedGroupId` all address - so it stays the option's
+      // value. What the user picked is the category, and every group carries
+      // it: MarkerDiscoveryEngine refuses a group without an exact primitive
+      // `groupName` before it computes a single statistic. `encodeGroupName` is
+      // the same rule the heatmap axis and the ranked CSV render through.
       const opt = document.createElement('option');
       opt.value = id;
-      opt.textContent = id;
+      opt.textContent = encodeGroupName(groups[id]?.groupName, id);
       if (id === this._modalSelectedGroupId) opt.selected = true;
       groupSelect.appendChild(opt);
     }
@@ -2138,35 +2100,11 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
    * @returns {{ container: HTMLElement, content: HTMLElement }}
    */
   _createCollapsibleSection({ title, className, expanded = true }) {
-    const container = document.createElement('div');
-    container.className = `form-section ${className}`;
-
-    const header = document.createElement('div');
-    header.className = 'analysis-perf-header';
-    const titleEl = document.createElement('span');
-    titleEl.className = 'analysis-perf-title';
-    titleEl.textContent = String(title ?? '');
-    header.appendChild(titleEl);
-
-    const toggleEl = document.createElement('span');
-    toggleEl.className = 'analysis-perf-toggle';
-    toggleEl.textContent = expanded ? '▲' : '▼';
-    header.appendChild(toggleEl);
-
-    const content = document.createElement('div');
-    content.className = 'analysis-perf-content';
-    content.style.display = expanded ? 'block' : 'none';
-
-    let isExpanded = expanded;
-    header.addEventListener('click', () => {
-      isExpanded = !isExpanded;
-      content.style.display = isExpanded ? 'block' : 'none';
-      toggleEl.textContent = isExpanded ? '▲' : '▼';
+    const { container, content } = createCollapsibleSection({
+      title: String(title ?? ''),
+      expanded,
+      containerClassName: `form-section ${className}`
     });
-
-    container.appendChild(header);
-    container.appendChild(content);
-
     return { container, content };
   }
 
@@ -2185,9 +2123,13 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
     const mode = typeof modeOrEvent === 'string' ? modeOrEvent : modeOrEvent?.target?.value;
     if (!mode) return;
 
-    const customGenesGroup = this._formContainer?.querySelector('.custom-genes-group');
-    const discoverySection = this._formContainer?.querySelector('.discovery-params');
-    const clusterSection = this._formContainer?.querySelector('.cluster-params');
+    // The form subtree is the authority: it exists before the caller attaches
+    // it to the panel, so section visibility can be settled during the render
+    // rather than deferred to a timer.
+    const root = this._formRoot ?? this._formContainer;
+    const customGenesGroup = root?.querySelector('.custom-genes-group');
+    const discoverySection = root?.querySelector('.discovery-params');
+    const clusterSection = root?.querySelector('.cluster-params');
 
     // Custom genes input: only visible in 'custom' mode
     if (customGenesGroup) {

@@ -837,6 +837,15 @@ class WindowTestElement {
     };
   }
 
+  // The plot slot measures the layout box, not the transformed visual box.
+  get clientWidth() {
+    return 320;
+  }
+
+  get clientHeight() {
+    return 240;
+  }
+
   querySelector() {
     return null;
   }
@@ -1750,6 +1759,13 @@ function createPlotHost() {
     },
     getBoundingClientRect() {
       return { ...this.bounds };
+    },
+    // The plot slot measures the layout box, not the transformed visual box.
+    get clientWidth() {
+      return this.bounds.width;
+    },
+    get clientHeight() {
+      return this.bounds.height;
     },
   };
 }

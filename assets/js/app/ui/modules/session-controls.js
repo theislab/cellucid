@@ -8,6 +8,9 @@
  */
 
 import { getNotificationCenter } from '../../notification-center.js';
+import {
+  isSessionRestoreReportedError
+} from '../../session/session-serializer.js';
 
 export function initSessionControls({
   dom,
@@ -87,6 +90,10 @@ export function initSessionControls({
       } catch (err) {
         if (!ownsOperation(operationGeneration)) return;
         console.error('Failed to load state:', err);
+        // A restore that got as far as its own progress notification has
+        // already shown this sentence, prefixed with what it was doing.
+        // Announcing it again puts the identical text on screen twice.
+        if (isSessionRestoreReportedError(err)) return;
         const message = (
           err instanceof Error && err.message.length > 0
         )

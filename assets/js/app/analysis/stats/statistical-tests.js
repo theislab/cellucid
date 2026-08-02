@@ -13,14 +13,14 @@ import { getStatRegistry } from '../core/plugin-contract.js';
 // Import mathematical functions from centralized math-utils (DRY principle)
 import {
   mean,
-  variance,
   std,
+  sampleMoments,
   chiSquaredPValue,
   fDistributionPValue,
   gammaLn,
   computeRanks,
   mannWhitneyU as computeMannWhitneyU,
-  welchTTest as computeWelchTTest
+  welchTTestFromMoments
 } from '../compute/math-utils.js';
 import { isFiniteNumber } from '../shared/number-utils.js';
 
@@ -89,15 +89,27 @@ function requireAlpha(alpha) {
 }
 
 function requireNumericArrayLike(values, label) {
-  const supported = Array.isArray(values) || (
-    ArrayBuffer.isView(values) && !(values instanceof DataView)
-  );
+  const isTypedArray = ArrayBuffer.isView(values) && !(values instanceof DataView);
+  const supported = Array.isArray(values) || isTypedArray;
   if (!supported || !Number.isSafeInteger(values.length)) {
     throw new TypeError(`${label} must be an Array or TypedArray`);
   }
+  if (isTypedArray) {
+    // A numeric TypedArray cannot hold a hole or a non-number: every index in
+    // [0, length) reads back a number by construction. The two views that do
+    // not are the BigInt ones, which read back `bigint`, so they are the only
+    // case that still has to be rejected — and rejecting them by constructor
+    // is exactly as strict as scanning every element, at O(1) instead of O(n).
+    // This matters: the scan ran twice per group on every gene of a
+    // differential-expression run.
+    if (values instanceof BigInt64Array || values instanceof BigUint64Array) {
+      throw new TypeError(`${label} must contain a numeric value at every index`);
+    }
+    return values;
+  }
   for (let index = 0; index < values.length; index++) {
     if (
-      (Array.isArray(values) && !Object.hasOwn(values, index))
+      !Object.hasOwn(values, index)
       || typeof values[index] !== 'number'
     ) {
       throw new TypeError(`${label} must contain a numeric value at every index`);
@@ -478,16 +490,22 @@ export function tTest(group1, group2) {
     };
   }
 
-  const m1 = mean(values1);
-  const m2 = mean(values2);
-  const v1 = variance(values1, 1);
-  const v2 = variance(values2, 1);
+  // One moment pair per group, shared by the test and by Cohen's d. The moments
+  // are accumulated in the order `mean()` and `variance(_, 1)` use, so t, df, p
+  // and d are the same numbers the separate calls produced — with two passes per
+  // group instead of four.
+  const momentsA = sampleMoments(values1);
+  const momentsB = sampleMoments(values2);
+  const m1 = momentsA.mean;
+  const m2 = momentsB.mean;
+  const v1 = momentsA.variance;
+  const v2 = momentsB.variance;
 
   const {
     statistic: t,
     pValue,
     df
-  } = computeWelchTTest(values1, values2);
+  } = welchTTestFromMoments(m1, v1, n1, m2, v2, n2);
 
   // Both groups being constant does *not* land here: a zero standard error with
   // equal means reports p = 1 and with unequal means reports p = 0. The only way
@@ -793,25 +811,32 @@ export function kruskalWallis(groups) {
     };
   }
 
-  // Combine all values with group labels
-  const combined = [];
+  // Pool the values in group order. Concatenation order is what carries the
+  // group label: the first group owns pooled positions [0, n0), the second
+  // [n0, n0+n1), and so on — the same association a per-value `{v, group}`
+  // record carried, without one object per observation.
+  const groupSizes = validGroups.map(g => g.length);
+  let N = 0;
+  for (const size of groupSizes) N += size;
+
+  const values = new Float64Array(N);
+  let write = 0;
   for (let i = 0; i < validGroups.length; i++) {
-    for (const v of validGroups[i]) {
-      combined.push({ v, group: i });
-    }
+    const group = validGroups[i];
+    for (let j = 0; j < group.length; j++) values[write++] = group[j];
   }
 
-  const N = combined.length;
-  const values = combined.map(x => x.v);
   const ranks = computeRanks(values);
 
   // Calculate rank sums for each group
   const rankSums = new Array(validGroups.length).fill(0);
-  for (let i = 0; i < combined.length; i++) {
-    rankSums[combined[i].group] += ranks[i];
+  let read = 0;
+  for (let i = 0; i < validGroups.length; i++) {
+    const size = groupSizes[i];
+    let sum = 0;
+    for (let j = 0; j < size; j++) sum += ranks[read++];
+    rankSums[i] = sum;
   }
-
-  const groupSizes = validGroups.map(g => g.length);
 
   // H statistic
   let H = 0;

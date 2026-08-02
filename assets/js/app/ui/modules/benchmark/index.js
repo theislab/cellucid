@@ -42,6 +42,8 @@ import {
   assertSyntheticCount,
   assertSyntheticPattern,
   FETCHED_PATTERNS,
+  MAX_SYNTHETIC_COUNT,
+  MIN_SYNTHETIC_COUNT,
   SYNTHETIC_PATTERNS
 } from './generation-contract.js';
 import {
@@ -86,6 +88,8 @@ export {
   LOD_FAR_DISTANCE_RATIO,
   LOD_NEAR_DISTANCE_RATIO,
   MAX_BENCHMARK_VIEWS,
+  MAX_SYNTHETIC_COUNT,
+  MIN_SYNTHETIC_COUNT,
   MIN_TAIL_SAMPLES,
   pathFrameForRegime,
   percentileOfSorted,

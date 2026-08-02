@@ -13,7 +13,7 @@
  *
  * @example
  * // Standard usage (Detailed/Correlation mode)
- * const pageSelector = createPageSelectorComponent({
+ * const pageSelector = new PageSelectorComponent({
  *   dataLayer,
  *   container: document.getElementById('page-select'),
  *   onSelectionChange: (pageIds) => console.log('Selected:', pageIds),
@@ -22,7 +22,7 @@
  *
  * @example
  * // With Dynamic mode support (Quick Insights)
- * const pageSelector = createPageSelectorComponent({
+ * const pageSelector = new PageSelectorComponent({
  *   dataLayer,
  *   container: document.getElementById('page-select'),
  *   supportsDynamicMode: true,
@@ -76,6 +76,49 @@ function requireExactKeys(value, expectedKeys, label) {
       `${label} must contain exactly: ${sortedExpected.join(', ')}`
     );
   }
+}
+
+/**
+ * Make a page chip a real, announced toggle control.
+ *
+ * The chips were plain `<div>`s carrying only a click listener, so choosing
+ * which pages an analysis runs over — the first decision every analysis mode
+ * asks for — could not be done without a mouse, and nothing announced a chip's
+ * role, its selected state, or its cell count. They stay `<div>`s because the
+ * chip also hosts the page's colour `<input type="color">`, which cannot live
+ * inside a `<button>`; `role="button"` plus a roving-free tab stop matches the
+ * pattern the surrounding analysis accordions already use and needs no new
+ * styling (the shared `:focus-visible` ring applies to any focusable element).
+ *
+ * @param {HTMLElement} tab
+ * @param {Object} options
+ * @param {Array<string|null>} options.label - Accessible name parts; empty
+ *   parts are dropped.
+ * @param {boolean} options.pressed - Whether the chip is currently selected.
+ * @param {boolean} options.disabled - Whether the chip can be activated.
+ */
+function makeTabOperable(tab, { label, pressed, disabled }) {
+  const name = label.filter(part => typeof part === 'string' && part.length > 0)
+    .join(', ');
+  if (name.length === 0) {
+    throw new TypeError('A page chip requires a non-empty accessible name');
+  }
+  tab.setAttribute('role', 'button');
+  // The chip's own contents include the colour input's value, so the name is
+  // stated explicitly rather than computed from them.
+  tab.setAttribute('aria-label', name);
+  tab.setAttribute('aria-pressed', pressed ? 'true' : 'false');
+  tab.setAttribute('aria-disabled', disabled ? 'true' : 'false');
+  tab.tabIndex = disabled ? -1 : 0;
+  if (disabled) return;
+
+  tab.addEventListener('keydown', event => {
+    // The colour input inside the chip owns its own keys.
+    if (event.target !== tab) return;
+    if (event.key !== 'Enter' && event.key !== ' ') return;
+    event.preventDefault();
+    tab.click();
+  });
 }
 
 /**
@@ -243,6 +286,18 @@ export class PageSelectorComponent {
    * Render page tabs
    */
   _renderTabs(pages) {
+    // Toggling a chip rebuilds every chip, which destroys the element the
+    // keyboard user is standing on. Remember where focus was and put it back on
+    // the equivalent chip, or on the Select All button, once the rebuild is
+    // done.
+    const focused = this._tabsContainer.contains(document.activeElement)
+      ? document.activeElement
+      : null;
+    const focusedPageId = focused?.dataset?.pageId ?? null;
+    const focusWasSelectAll = focused !== null
+      && focusedPageId === null
+      && focused.closest('.analysis-page-actions') !== null;
+
     this._tabsContainer.innerHTML = '';
 
     // Render Dynamic tab first if supported
@@ -261,6 +316,18 @@ export class PageSelectorComponent {
     if (this.showSelectAll && pages.length > 1 && this.allowMultiSelect && !this._isDynamicMode) {
       this._renderSelectAllButton(pages);
     }
+
+    if (focused === null) return;
+    const replacement = focusedPageId !== null
+      ? [...this._tabsContainer.children].find(
+        child => child.dataset?.pageId === focusedPageId
+      ) ?? null
+      : (focusWasSelectAll
+        ? this._tabsContainer.querySelector('.analysis-page-actions button')
+        : null);
+    if (replacement !== null && replacement.tabIndex >= 0) {
+      replacement.focus({ preventScroll: true });
+    }
   }
 
   /**
@@ -276,7 +343,8 @@ export class PageSelectorComponent {
     // Dynamic icon
     const icon = document.createElement('span');
     icon.className = 'insights-dynamic-icon';
-    icon.innerHTML = '⟳'; // Unicode refresh/sync symbol
+    icon.textContent = '⟳'; // Unicode refresh/sync symbol
+    icon.setAttribute('aria-hidden', 'true');
     tab.appendChild(icon);
 
     // Dynamic label with active page name
@@ -292,16 +360,31 @@ export class PageSelectorComponent {
     tab.appendChild(nameSpan);
 
     // Cell count for active page in dynamic mode
+    let dynamicCellCount = null;
     if (this.showCellCounts && this._isDynamicMode) {
       const activePageId = this._getActivePageId();
       if (activePageId) {
-        const cellCount = this._getCellCount(activePageId);
+        dynamicCellCount = this._getCellCount(activePageId);
         const countSpan = document.createElement('span');
         countSpan.className = 'analysis-page-count';
-        countSpan.textContent = cellCount > 0 ? formatCount(cellCount) : '(0)';
+        countSpan.textContent = dynamicCellCount > 0
+          ? formatCount(dynamicCellCount)
+          : '(0)';
         tab.appendChild(countSpan);
       }
     }
+
+    makeTabOperable(tab, {
+      label: [
+        nameSpan.textContent,
+        dynamicCellCount === null
+          ? null
+          : `${dynamicCellCount.toLocaleString()} cells`,
+        this.dynamicHelpText
+      ],
+      pressed: this._isDynamicMode,
+      disabled: false
+    });
 
     // Click to activate dynamic mode
     tab.addEventListener('click', () => {
@@ -346,9 +429,18 @@ export class PageSelectorComponent {
       (!isSelectable ? ' disabled' : '') +
       (isSelected ? ' selected' : '');
     tab.dataset.pageId = page.id;
-    tab.setAttribute('aria-disabled', isSelectable ? 'false' : 'true');
+    makeTabOperable(tab, {
+      label: [
+        page.name,
+        derived ? 'derived page' : null,
+        isSelectable
+          ? `${cellCount.toLocaleString()} cells`
+          : 'no cells, cannot be selected'
+      ],
+      pressed: isSelected,
+      disabled: !isSelectable
+    });
     if (!isSelectable) {
-      tab.tabIndex = -1;
       tab.title = `${page.name} has zero cells and cannot be selected`;
     }
 
@@ -358,14 +450,17 @@ export class PageSelectorComponent {
     StyleManager.setVariable(colorIndicator, '--analysis-page-color', currentColor);
 
     if (this.showColorPicker && isSelectable) {
-      colorIndicator.title = 'Click to change color';
+      colorIndicator.title = `Colour for ${page.name}`;
 
       // Color picker input
       const colorInput = document.createElement('input');
       colorInput.type = 'color';
       colorInput.className = 'analysis-page-color-input';
       colorInput.value = currentColor;
-      colorInput.title = 'Click to change color';
+      // A shared "Click to change color" title told a screen-reader user which
+      // gesture to use but never which page they were about to recolour.
+      colorInput.setAttribute('aria-label', `Colour for ${page.name}`);
+      colorInput.title = `Colour for ${page.name}`;
 
       colorInput.addEventListener('input', (e) => {
         const newColor = e.target.value;
@@ -1089,15 +1184,6 @@ export class PageSelectorComponent {
       this.container.innerHTML = '';
     }
   }
-}
-
-/**
- * Factory function to create PageSelectorComponent
- * @param {Object} options
- * @returns {PageSelectorComponent}
- */
-export function createPageSelectorComponent(options) {
-  return new PageSelectorComponent(options);
 }
 
 export default PageSelectorComponent;

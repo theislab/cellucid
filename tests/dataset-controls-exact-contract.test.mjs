@@ -990,8 +990,12 @@ test('DOM switch failure rolls back selection and preserves terminal error styli
   assert.equal(harness.select.value, NONE_DATASET_VALUE);
   assert.equal(harness.dom.info.classList.contains('loading'), false);
   assert.equal(harness.dom.info.classList.contains('error'), true);
+  // The loader published no cause, so the message names the dataset and what
+  // to do without inventing one, and keeps the raw text as a labelled detail.
   assert.deepEqual(harness.statuses.at(-1), {
-    message: 'Failed to switch dataset: switch rejected',
+    message:
+      '"Broken" could not be opened. Try again; if it keeps failing, check '
+      + 'the address and your connection. Details: switch rejected',
     isError: true
   });
 });
@@ -1071,8 +1075,12 @@ test('terminal switch and malformed event failures are not guessed or hidden', a
   );
   assert.equal(harness.reloads.length, 1);
   assert.equal(harness.dom.info.classList.contains('error'), true);
+  // The loader published no cause, so the message names the dataset and what
+  // to do without inventing one, and keeps the raw text as a labelled detail.
   assert.deepEqual(harness.statuses.at(-1), {
-    message: 'Failed to switch dataset: switch rejected',
+    message:
+      '"Broken" could not be opened. Try again; if it keeps failing, check '
+      + 'the address and your connection. Details: switch rejected',
     isError: true
   });
 

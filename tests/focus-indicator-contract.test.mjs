@@ -28,12 +28,6 @@ const APPROVED_OUTLINE_SUPPRESSIONS = Object.freeze([
       + 'input is removed on blur (highlight-pages-ui.js), so it can never be '
       + 'rendered in an unfocused state.',
   },
-  {
-    file: 'components/_analysis.css',
-    selector: '.palette-selected:focus-visible',
-    replacement:
-      'border-color: var(--color-border-focus) plus a 2px box-shadow ring.',
-  },
 ]);
 
 async function collectCssFiles(directory) {

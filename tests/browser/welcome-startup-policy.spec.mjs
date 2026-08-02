@@ -1,14 +1,19 @@
 import { expect, test } from '@playwright/test';
 import { extname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import {
+  APP_HOST,
+  APP_ORIGIN,
+  APP_PORT,
+  appUrl,
+  EXPORTS_BASE_URL,
+} from './helpers/origins.mjs';
 
 const FIXTURE_ID = 'current-ui-prepared';
 const FIXTURE_NAME = 'Current UI prepared fixture';
 const FIXTURE_ROOT = fileURLToPath(
   new URL('./fixtures/exports/current-ui-prepared/', import.meta.url),
 );
-const LOCAL_EXPORTS_ROOT =
-  'http://127.0.0.1:4173/tests/browser/fixtures/exports/';
 
 function jsonResponse(route, payload) {
   return route.fulfill({
@@ -51,20 +56,20 @@ async function installPreparedFixtureRoute(page, requestPrefix) {
 }
 
 async function installPreparedRemoteServer(page) {
-  await page.route('http://127.0.0.1:4173/_cellucid/health', route =>
+  await page.route(appUrl('/_cellucid/health'), route =>
     jsonResponse(route, {
       status: 'ok',
       type: 'exported',
       version: '0.9.1',
     }));
-  await page.route('http://127.0.0.1:4173/_cellucid/info', route =>
+  await page.route(appUrl('/_cellucid/info'), route =>
     jsonResponse(route, {
       version: '0.9.1',
-      host: '127.0.0.1',
-      port: 4173,
+      host: APP_HOST,
+      port: APP_PORT,
       mode: 'standalone',
     }));
-  await page.route('http://127.0.0.1:4173/_cellucid/datasets', route =>
+  await page.route(appUrl('/_cellucid/datasets'), route =>
     jsonResponse(route, {
       datasets: [{
         id: FIXTURE_ID,
@@ -72,10 +77,7 @@ async function installPreparedRemoteServer(page) {
         name: FIXTURE_NAME,
       }],
     }));
-  await installPreparedFixtureRoute(
-    page,
-    'http://127.0.0.1:4173/remote-fixture/',
-  );
+  await installPreparedFixtureRoute(page, appUrl('/remote-fixture/'));
 }
 
 async function installWelcomePaintProbe(page) {
@@ -147,10 +149,10 @@ test('an exact remote-server URL startup never shows or paints onboarding', asyn
   await installWelcomePaintProbe(page);
   await installPreparedRemoteServer(page);
 
-  const remoteUrl = new URL('/', 'http://127.0.0.1:4173');
-  remoteUrl.searchParams.set('remote', 'http://127.0.0.1:4173');
+  const remoteUrl = new URL('/', APP_ORIGIN);
+  remoteUrl.searchParams.set('remote', APP_ORIGIN);
   remoteUrl.searchParams.set('dataset', FIXTURE_ID);
-  remoteUrl.searchParams.set('exportsBaseUrl', LOCAL_EXPORTS_ROOT);
+  remoteUrl.searchParams.set('exportsBaseUrl', EXPORTS_BASE_URL);
   await page.goto(remoteUrl.toString(), { waitUntil: 'domcontentloaded' });
 
   await expectPreparedDatasetWithoutWelcome(page);
@@ -164,10 +166,10 @@ test('an exact same-origin remote startup never shows or paints onboarding', asy
   await installWelcomePaintProbe(page);
   await installPreparedRemoteServer(page);
 
-  const remoteUrl = new URL('/', 'http://127.0.0.1:4173');
+  const remoteUrl = new URL('/', APP_ORIGIN);
   remoteUrl.searchParams.set('source', 'remote');
   remoteUrl.searchParams.set('dataset', FIXTURE_ID);
-  remoteUrl.searchParams.set('exportsBaseUrl', LOCAL_EXPORTS_ROOT);
+  remoteUrl.searchParams.set('exportsBaseUrl', EXPORTS_BASE_URL);
   await page.goto(remoteUrl.toString(), { waitUntil: 'domcontentloaded' });
 
   await expectPreparedDatasetWithoutWelcome(page);
@@ -198,13 +200,13 @@ test('an exact GitHub URL startup never shows or paints onboarding', async ({
     `${rawPrefix}${FIXTURE_ID}/`,
   );
 
-  const githubUrl = new URL('/', 'http://127.0.0.1:4173');
+  const githubUrl = new URL('/', APP_ORIGIN);
   githubUrl.searchParams.set(
     'github',
     'cellucid-tests/data/exports',
   );
   githubUrl.searchParams.set('dataset', FIXTURE_ID);
-  githubUrl.searchParams.set('exportsBaseUrl', LOCAL_EXPORTS_ROOT);
+  githubUrl.searchParams.set('exportsBaseUrl', EXPORTS_BASE_URL);
   await page.goto(githubUrl.toString(), { waitUntil: 'domcontentloaded' });
 
   await expectPreparedDatasetWithoutWelcome(page);
@@ -216,13 +218,13 @@ test('an exact authenticated Jupyter URL startup never shows or paints onboardin
 }) => {
   const errors = collectBrowserErrors(page);
   await installWelcomePaintProbe(page);
-  await page.route('http://127.0.0.1:4173/_cellucid/health', route =>
+  await page.route(appUrl('/_cellucid/health'), route =>
     jsonResponse(route, {
       status: 'ok',
       type: 'exported',
       version: '0.9.1',
     }));
-  await page.route('http://127.0.0.1:4173/_cellucid/datasets', route =>
+  await page.route(appUrl('/_cellucid/datasets'), route =>
     jsonResponse(route, {
       datasets: [{
         id: FIXTURE_ID,
@@ -230,14 +232,11 @@ test('an exact authenticated Jupyter URL startup never shows or paints onboardin
         name: FIXTURE_NAME,
       }],
     }));
-  await page.route('http://127.0.0.1:4173/_cellucid/events', route =>
+  await page.route(appUrl('/_cellucid/events'), route =>
     jsonResponse(route, { status: 'ok', delivered: true }));
-  await installPreparedFixtureRoute(
-    page,
-    'http://127.0.0.1:4173/jupyter-fixture/',
-  );
+  await installPreparedFixtureRoute(page, appUrl('/jupyter-fixture/'));
 
-  const jupyterUrl = new URL('/', 'http://127.0.0.1:4173');
+  const jupyterUrl = new URL('/', APP_ORIGIN);
   jupyterUrl.searchParams.set('jupyter', 'true');
   jupyterUrl.searchParams.set('viewerId', 'viewer-1');
   jupyterUrl.searchParams.set('viewerToken', 'token-1');
@@ -251,15 +250,15 @@ test('a failed exact remote-server intent keeps onboarding hidden and owns the f
   page,
 }) => {
   await installWelcomePaintProbe(page);
-  await page.route('http://127.0.0.1:4173/_cellucid/health', route =>
+  await page.route(appUrl('/_cellucid/health'), route =>
     route.fulfill({
       status: 503,
       contentType: 'application/json',
       body: JSON.stringify({ error: 'synthetic outage' }),
     }));
 
-  const remoteUrl = new URL('/', 'http://127.0.0.1:4173');
-  remoteUrl.searchParams.set('remote', 'http://127.0.0.1:4173');
+  const remoteUrl = new URL('/', APP_ORIGIN);
+  remoteUrl.searchParams.set('remote', APP_ORIGIN);
   await page.goto(remoteUrl.toString(), { waitUntil: 'domcontentloaded' });
 
   const failure = page.locator('#cellucid-startup-failure');
@@ -281,7 +280,7 @@ test('a failed exact same-origin AnnData intent keeps onboarding hidden', async 
   page,
 }) => {
   await installWelcomePaintProbe(page);
-  await page.route('http://127.0.0.1:4173/_cellucid/health', route =>
+  await page.route(appUrl('/_cellucid/health'), route =>
     route.fulfill({
       status: 503,
       contentType: 'application/json',

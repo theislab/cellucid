@@ -23,9 +23,6 @@ import {
   AnalysisUIManager,
 } from '../assets/js/app/analysis/ui/analysis-ui-manager.js';
 import {
-  BaseAnalysisUI,
-} from '../assets/js/app/analysis/ui/base-analysis-ui.js';
-import {
   DetailedAnalysisUI,
 } from '../assets/js/app/analysis/ui/analysis-types/detailed-analysis-ui.js';
 import {
@@ -34,9 +31,6 @@ import {
 import {
   renderPlotOptions,
 } from '../assets/js/app/analysis/ui/components/options.js';
-import {
-  createAnalysisSettingsPanel,
-} from '../assets/js/app/analysis/ui/components/settings.js';
 
 const PROTOTYPE_PROPERTY_NAMES =
   Object.getOwnPropertyNames(Object.prototype);
@@ -56,6 +50,7 @@ function assertExactOrdinaryRecord(record, expectedKeys) {
 class ExactFakeElement {
   constructor(tagName) {
     this.tagName = String(tagName).toUpperCase();
+    this.attributes = new Map();
     this.children = [];
     this.className = '';
     this.dataset = {};
@@ -71,6 +66,14 @@ class ExactFakeElement {
     this.children.push(child);
     if (child && typeof child === 'object') child.parentNode = this;
     return child;
+  }
+
+  setAttribute(name, value) {
+    this.attributes.set(String(name), String(value));
+  }
+
+  getAttribute(name) {
+    return this.attributes.get(String(name)) ?? null;
   }
 
   addEventListener(type, listener) {
@@ -497,13 +500,6 @@ test('form-control snapshots preserve a prototype-named DOM control', t => {
 
 test('analysis plot-option writers preserve an own __proto__ schema key', () => {
   const value = { exact: true };
-  const base = Object.create(BaseAnalysisUI.prototype);
-  base._currentConfig = { plotOptions: {} };
-  base._scheduleUpdate = () => {};
-  base._onPlotOptionChange('__proto__', value);
-  assertExactOrdinaryRecord(base._currentConfig.plotOptions, ['__proto__']);
-  assert.equal(base._currentConfig.plotOptions.__proto__, value);
-
   const detailed = Object.create(DetailedAnalysisUI.prototype);
   detailed._currentConfig = {
     plotType: 'exact-record-probe',
@@ -517,63 +513,6 @@ test('analysis plot-option writers preserve an own __proto__ schema key', () => 
     ['__proto__'],
   );
   assert.equal(detailed._currentConfig.plotOptions.__proto__, value);
-});
-
-test('analysis settings reject every unknown prototype-named key without mutation', t => {
-  installExactFakeDocument(t);
-  const prototypeDescriptors = Object.getOwnPropertyDescriptors(
-    Object.prototype,
-  );
-
-  const outcomes = PROTOTYPE_PROPERTY_NAMES.map(key => {
-    const currentSettings = { normalization: 'none' };
-    const initialPrototype = Object.getPrototypeOf(currentSettings);
-    const panel = createAnalysisSettingsPanel({ currentSettings });
-    let error = null;
-    try {
-      panel.setSetting(key, { rejected: key });
-    } catch (caught) {
-      error = caught;
-    }
-    return {
-      errorName: error?.name ?? null,
-      message: error?.message ?? null,
-      ownKeys: Object.keys(currentSettings),
-      prototypeUnchanged:
-        Object.getPrototypeOf(currentSettings) === initialPrototype,
-    };
-  });
-
-  assert.deepEqual(
-    outcomes.map(outcome => outcome.errorName),
-    PROTOTYPE_PROPERTY_NAMES.map(() => 'RangeError'),
-  );
-  for (const [index, outcome] of outcomes.entries()) {
-    assert.match(
-      outcome.message,
-      /unknown analysis setting/i,
-      PROTOTYPE_PROPERTY_NAMES[index],
-    );
-    assert.deepEqual(
-      outcome.ownKeys,
-      ['normalization'],
-      PROTOTYPE_PROPERTY_NAMES[index],
-    );
-    assert.equal(
-      outcome.prototypeUnchanged,
-      true,
-      PROTOTYPE_PROPERTY_NAMES[index],
-    );
-  }
-  assert.deepEqual(
-    Object.getOwnPropertyDescriptors(Object.prototype),
-    prototypeDescriptors,
-  );
-
-  const currentSettings = { normalization: 'none' };
-  const panel = createAnalysisSettingsPanel({ currentSettings });
-  panel.setSetting('normalization', 'log1p');
-  assert.deepEqual(currentSettings, { normalization: 'log1p' });
 });
 
 test('plot option rendering reads defaults and definitions only from own fields', t => {
@@ -808,11 +747,15 @@ test('AnalysisUIManager requires own container membership for exact mode IDs', t
   assert.equal(unusableContainer.id, 'unchanged');
 
   const classes = [];
+  const attributes = new Map();
   const container = {
     classList: {
       add(...names) {
         classes.push(...names);
       },
+    },
+    setAttribute(name, value) {
+      attributes.set(String(name), String(value));
     },
   };
   const manager = new AnalysisUIManager({
@@ -833,4 +776,7 @@ test('AnalysisUIManager requires own container membership for exact mode IDs', t
     '__proto__-analysis-panel',
     'analysis-panel',
   ]);
+  // Analysis panels are built lazily, so their controls must stay out of the
+  // exact session UI-control inventory.
+  assert.equal(attributes.get('data-state-serializer-skip'), 'true');
 });

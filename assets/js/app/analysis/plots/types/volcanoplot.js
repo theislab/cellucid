@@ -45,7 +45,83 @@ const VOLCANO_LABEL_HORIZONTAL_GAP = 6;
 const VOLCANO_MIN_PLOT_HEIGHT = 120;
 const VOLCANO_MARGIN_LEFT = 60;
 const VOLCANO_MARGIN_RIGHT = 20;
-const VOLCANO_MARGIN_BOTTOM = 90;
+
+// The band below the x axis, budgeted rather than guessed.
+//
+// Three things want that band: the tick labels, the axis title, and the
+// horizontal legend. Each used to claim it with its own constant — the legend
+// at `y: -0.14`, a fraction of the *plot area's* height, and the axis title
+// wherever Plotly put it inside a fixed 90-pixel margin. Two offsets measured
+// from different origins into one band collide as soon as the box changes size,
+// and they did: `log₂ Fold Change` was drawn across the `Down (n)` legend entry
+// in the sidebar preview and in the expanded overlay alike.
+//
+// The band is now laid out top-down in pixels — tick labels, then the title at
+// a pinned standoff, then the legend below it — and the margin is exactly the
+// total. Nothing is placed by a constant that only holds at one size.
+const VOLCANO_TICK_LABEL_HEIGHT = 14;
+const VOLCANO_AXIS_TITLE_STANDOFF = 6;
+const VOLCANO_AXIS_TITLE_HEIGHT = 16;
+const VOLCANO_LEGEND_GAP = 10;
+const VOLCANO_LEGEND_ROW_HEIGHT = 18;
+const VOLCANO_LEGEND_PADDING = 12;
+const VOLCANO_LEGEND_ENTRY_PADDING = 28;
+const VOLCANO_LEGEND_CHARACTER_WIDTH = 5.5;
+const VOLCANO_AXIS_BAND_HEIGHT = VOLCANO_TICK_LABEL_HEIGHT +
+  VOLCANO_AXIS_TITLE_STANDOFF +
+  VOLCANO_AXIS_TITLE_HEIGHT;
+
+/**
+ * Lay out the band below the x axis for one viewport.
+ *
+ * The axis labels are not optional: an unlabelled axis is unreadable, while a
+ * volcano without its legend is still a volcano drawn in the conventional
+ * red/grey/blue. So when the band the legend needs would squeeze the plot below
+ * `VOLCANO_MIN_PLOT_HEIGHT`, the legend is dropped instead of being drawn on
+ * top of the title — and it is only dropped from the automatic placement, so
+ * choosing a legend position explicitly still shows it.
+ *
+ * @param {{width: number, height: number}} viewport
+ * @param {string[]} legendLabels - The legend entry texts, longest first or not.
+ * @returns {{marginBottom: number, legendOffset: number|null, showLegend: boolean}}
+ */
+function resolveVolcanoAxisBand(viewport, legendLabels) {
+  const legendWidth = viewport.width -
+    VOLCANO_MARGIN_LEFT -
+    VOLCANO_MARGIN_RIGHT;
+
+  let rows = 1;
+  let usedInRow = 0;
+  for (const label of legendLabels) {
+    const entryWidth = (label.length * VOLCANO_LEGEND_CHARACTER_WIDTH) +
+      VOLCANO_LEGEND_ENTRY_PADDING;
+    if (usedInRow > 0 && usedInRow + entryWidth > legendWidth) {
+      rows++;
+      usedInRow = entryWidth;
+      continue;
+    }
+    usedInRow += entryWidth;
+  }
+
+  const legendHeight = (rows * VOLCANO_LEGEND_ROW_HEIGHT) +
+    VOLCANO_LEGEND_PADDING;
+  const legendOffset = VOLCANO_AXIS_BAND_HEIGHT + VOLCANO_LEGEND_GAP;
+  const withLegend = legendOffset + legendHeight;
+
+  // The smallest top margin the gene-label band can occupy: the status line
+  // with no label rows under it. Deciding here rather than after the labels are
+  // placed is what breaks the circle — the label placer needs this band's
+  // height to know how many rows it may use.
+  const smallestMarginTop = VOLCANO_LABEL_STATUS_HEIGHT +
+    VOLCANO_LABEL_TOP_PADDING;
+  const fits = (
+    viewport.height - smallestMarginTop - withLegend >= VOLCANO_MIN_PLOT_HEIGHT
+  );
+
+  return fits
+    ? { marginBottom: withLegend, legendOffset, showLegend: true }
+    : { marginBottom: VOLCANO_AXIS_BAND_HEIGHT, legendOffset: null, showLegend: false };
+}
 
 /**
  * Read the sole current differential-expression result contract.
@@ -310,7 +386,8 @@ function buildVolcanoAnnotations(
   options,
   viewport,
   xRange,
-  yRange
+  yRange,
+  marginBottom
 ) {
   const { labelTopN, highlightGenes } = options;
   const theme = getPlotTheme();
@@ -372,7 +449,7 @@ function buildVolcanoAnnotations(
   }
 
   const availableLabelHeight = viewport.height -
-    VOLCANO_MARGIN_BOTTOM -
+    marginBottom -
     VOLCANO_MIN_PLOT_HEIGHT -
     VOLCANO_LABEL_STATUS_HEIGHT -
     VOLCANO_LABEL_TOP_PADDING;
@@ -428,7 +505,7 @@ function buildVolcanoAnnotations(
   const marginTop = VOLCANO_LABEL_STATUS_HEIGHT +
     (rowCount * VOLCANO_LABEL_ROW_HEIGHT) +
     VOLCANO_LABEL_TOP_PADDING;
-  const plotHeight = viewport.height - marginTop - VOLCANO_MARGIN_BOTTOM;
+  const plotHeight = viewport.height - marginTop - marginBottom;
 
   const annotations = placements.map(({ index, row, centerX }) => {
     const x = pre.log2FoldChange[index];
@@ -527,7 +604,7 @@ function buildVolcanoFigure(deResults, options, viewport) {
       l: VOLCANO_MARGIN_LEFT,
       r: VOLCANO_MARGIN_RIGHT,
       t: 30,
-      b: VOLCANO_MARGIN_BOTTOM
+      b: VOLCANO_AXIS_BAND_HEIGHT
     };
     layout.annotations = [{
       text: 'No differential expression data available',
@@ -631,10 +708,16 @@ function buildVolcanoFigure(deResults, options, viewport) {
 
   // Legend-only traces so users can read the category colors without splitting the main trace.
   const legendMarkerSize = pointSize;
+  const legendLabels = [
+    `Up (${up})`,
+    `Down (${down})`,
+    `Not significant (${ns})`
+  ];
+  const axisBand = resolveVolcanoAxisBand(viewport, legendLabels);
   traces.push({
     type: PLOTLY_2D_SCATTER_TRACE_TYPE,
     mode: 'markers',
-    name: `Up (${up})`,
+    name: legendLabels[0],
     x: [0],
     y: [0],
     marker: { color: colors.up, size: legendMarkerSize, opacity: 0.85, line: { width: 0 } },
@@ -644,7 +727,7 @@ function buildVolcanoFigure(deResults, options, viewport) {
   traces.push({
     type: PLOTLY_2D_SCATTER_TRACE_TYPE,
     mode: 'markers',
-    name: `Down (${down})`,
+    name: legendLabels[1],
     x: [0],
     y: [0],
     marker: { color: colors.down, size: legendMarkerSize, opacity: 0.85, line: { width: 0 } },
@@ -654,7 +737,7 @@ function buildVolcanoFigure(deResults, options, viewport) {
   traces.push({
     type: PLOTLY_2D_SCATTER_TRACE_TYPE,
     mode: 'markers',
-    name: `Not significant (${ns})`,
+    name: legendLabels[2],
     x: [0],
     y: [0],
     marker: { color: colors.ns, size: legendMarkerSize, opacity: 0.85, line: { width: 0 } },
@@ -705,8 +788,14 @@ function buildVolcanoFigure(deResults, options, viewport) {
   layout.xaxis = {
     title: {
       text: 'log₂ Fold Change',
-      font: { family: 'Oswald, system-ui, sans-serif', size: 12, color: theme.text }
+      font: { family: 'Oswald, system-ui, sans-serif', size: 12, color: theme.text },
+      // Pinned so the title sits a known distance under the tick labels rather
+      // than wherever the bottom margin leaves it. `resolveVolcanoAxisBand`
+      // budgets the band from this same number, and the legend is placed below
+      // what the two of them occupy.
+      standoff: VOLCANO_AXIS_TITLE_STANDOFF
     },
+    automargin: false,
     zeroline: true,
     zerolinecolor: theme.axisLine,
     zerolinewidth: 1,
@@ -756,7 +845,8 @@ function buildVolcanoFigure(deResults, options, viewport) {
     { labelTopN, highlightGenes },
     viewport,
     xRange,
-    yRange
+    yRange,
+    axisBand.marginBottom
   );
   layout.annotations = labelLayout.annotations;
   layout.meta = {
@@ -798,24 +888,32 @@ function buildVolcanoFigure(deResults, options, viewport) {
     ];
   }
 
-  // Legend position
-  layout.legend = {
-    x: 0.5,
-    y: -0.14,
-    xanchor: 'center',
-    yanchor: 'top',
-    orientation: 'h',
-    bgcolor: theme.legend.bg,
-    bordercolor: theme.legend.border,
-    borderwidth: 1,
-    font: { size: 10 }
-  };
+  // Legend position, below the axis title rather than across it.
+  //
+  // `legend.y` is in paper units — a fraction of the plot area's height — so
+  // the pixel offset the band reserved is converted with the plot height this
+  // layout actually produces. That is the whole fix: one origin, one budget.
+  const plotHeight = viewport.height - labelLayout.marginTop - axisBand.marginBottom;
+  layout.showlegend = axisBand.showLegend;
+  if (axisBand.showLegend) {
+    layout.legend = {
+      x: 0.5,
+      y: -(axisBand.legendOffset / plotHeight),
+      xanchor: 'center',
+      yanchor: 'top',
+      orientation: 'h',
+      bgcolor: theme.legend.bg,
+      bordercolor: theme.legend.border,
+      borderwidth: 1,
+      font: { size: 10 }
+    };
+  }
 
   layout.margin = {
     l: VOLCANO_MARGIN_LEFT,
     r: VOLCANO_MARGIN_RIGHT,
     t: labelLayout.marginTop,
-    b: VOLCANO_MARGIN_BOTTOM
+    b: axisBand.marginBottom
   };
   applyLegendPosition(layout, options.legendPosition);
 

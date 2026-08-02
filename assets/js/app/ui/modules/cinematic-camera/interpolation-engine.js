@@ -324,15 +324,8 @@ function keyframeDistance(kfA, kfB) {
 // Segment timing resolver
 // ---------------------------------------------------------------------------
 
-/**
- * Compute the duration of each segment.
- * @param {import('./keyframe-store.js').Keyframe[]} keyframes
- * @param {number} autoPaceSpeed  Positive finite units/s for auto-paced segments.
- * @returns {number[]} Array of durations (seconds), length = keyframes.length - 1.
- */
-export function resolveSegmentDurations(keyframes, autoPaceSpeed) {
-  assertKeyframes(keyframes);
-  const speed = assertAutoPaceSpeed(autoPaceSpeed);
+/** Segment timing for an already-validated path. */
+function segmentDurations(keyframes, speed) {
   const n = keyframes.length;
   if (n < 2) return [];
   const durations = [];
@@ -347,6 +340,47 @@ export function resolveSegmentDurations(keyframes, autoPaceSpeed) {
     }
   }
   return durations;
+}
+
+/**
+ * Compute the duration of each segment.
+ * @param {import('./keyframe-store.js').Keyframe[]} keyframes
+ * @param {number} autoPaceSpeed  Positive finite units/s for auto-paced segments.
+ * @returns {number[]} Array of durations (seconds), length = keyframes.length - 1.
+ */
+export function resolveSegmentDurations(keyframes, autoPaceSpeed) {
+  assertKeyframes(keyframes);
+  return segmentDurations(keyframes, assertAutoPaceSpeed(autoPaceSpeed));
+}
+
+/**
+ * Validate a path and its settings once, and resolve its timing table once.
+ *
+ * A playback run walks the same keyframes on every frame: the store freezes
+ * each keyframe and announces every mutation, and the playback controller stops
+ * on that announcement, so the path cannot change under a running loop. Proving
+ * the schema again on each frame therefore costs work proportional to the path
+ * length without being able to reach a different answer — a 100-keyframe path
+ * re-derived 1,200 key arrays per frame. The plan moves that proof to the one
+ * place where the input can actually differ.
+ *
+ * @param {import('./keyframe-store.js').Keyframe[]} keyframes
+ * @param {Object} options  Exact camera-path options; see assertCameraPathOptions.
+ * @returns {Readonly<Object>} Frozen, validated path plan.
+ */
+export function createCameraPathPlan(keyframes, options) {
+  assertKeyframes(keyframes);
+  assertCameraPathOptions(options);
+  const durations = segmentDurations(keyframes, options.autoPaceSpeed);
+  return Object.freeze({
+    keyframes: Object.freeze(keyframes.slice()),
+    durations: Object.freeze(durations),
+    totalDuration: durations.reduce((sum, value) => sum + value, 0),
+    positionMethod: options.positionMethod,
+    rotationMethod: options.rotationMethod,
+    easing: options.easing,
+    autoPaceSpeed: options.autoPaceSpeed
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -366,6 +400,30 @@ export function resolveSegmentDurations(keyframes, autoPaceSpeed) {
  */
 export function interpolateCameraState(keyframes, globalT, options) {
   assertKeyframes(keyframes);
+  if (keyframes.length === 0) return null;
+  if (!Number.isFinite(globalT) || globalT < 0 || globalT > 1) {
+    throw new RangeError(
+      `Camera path progress must be a finite number from 0 through 1; received ${String(globalT)}.`
+    );
+  }
+  return interpolatePlannedCameraState(
+    createCameraPathPlan(keyframes, options),
+    globalT
+  );
+}
+
+/**
+ * Interpolate along an already-validated plan.
+ *
+ * Only the progress is checked here, because it is the one input a frame loop
+ * changes. Everything else was proved when the plan was built.
+ *
+ * @param {Readonly<Object>} plan  A plan from createCameraPathPlan().
+ * @param {number} globalT  0 = start, 1 = end.
+ * @returns {Object|null}
+ */
+export function interpolatePlannedCameraState(plan, globalT) {
+  const keyframes = plan.keyframes;
   const n = keyframes.length;
   if (n === 0) return null;
   if (!Number.isFinite(globalT) || globalT < 0 || globalT > 1) {
@@ -373,20 +431,18 @@ export function interpolateCameraState(keyframes, globalT, options) {
       `Camera path progress must be a finite number from 0 through 1; received ${String(globalT)}.`
     );
   }
-  assertCameraPathOptions(options);
   if (n === 1) return buildCameraState(keyframes[0]);
   if (globalT === 0) return buildCameraState(keyframes[0]);
   if (globalT === 1) return buildCameraState(keyframes[n - 1]);
 
-  const durations = resolveSegmentDurations(keyframes, options.autoPaceSpeed);
-  const totalDuration = durations.reduce((s, d) => s + d, 0);
+  const durations = plan.durations;
 
   // Apply easing to GLOBAL progress so the overall path eases in/out smoothly.
   // Per-segment easing would cause visible stuttering at every keyframe boundary
   // (each segment independently decelerates then re-accelerates).
-  const easingFn = EASING[options.easing];
+  const easingFn = EASING[plan.easing];
   const easedT = easingFn(globalT);
-  const absTime = easedT * totalDuration;
+  const absTime = easedT * plan.totalDuration;
 
   // Find segment
   let cumulative = 0;
@@ -402,8 +458,8 @@ export function interpolateCameraState(keyframes, globalT, options) {
   let localT = (absTime - cumulative) / durations[segIndex];
   localT = Math.max(0, Math.min(1, localT));
 
-  const posMethod = options.positionMethod;
-  const rotMethod = options.rotationMethod;
+  const posMethod = plan.positionMethod;
+  const rotMethod = plan.rotationMethod;
 
   const modeA = keyframes[segIndex].navigationMode;
   const modeB = keyframes[Math.min(segIndex + 1, n - 1)].navigationMode;

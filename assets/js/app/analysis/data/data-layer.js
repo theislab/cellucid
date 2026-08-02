@@ -43,12 +43,53 @@ import {
 } from '../shared/page-derivation-utils.js';
 import {
   loadAnalysisBulkData,
-  loadLatentEmbeddings,
-  loadAnalysisBulkObsData
+  loadLatentEmbeddings
 } from '../../../data/data-loaders.js';
 import { setOwnDataProperty } from '../../../utils/exact-record.js';
 import { filterFiniteNumbers } from '../shared/number-utils.js';
 import { debugWarn } from '../shared/debug-utils.js';
+import { waitForAvailableSlot } from '../shared/concurrency-utils.js';
+import { getPerformanceConfig } from '../shared/performance-config.js';
+
+// =============================================================================
+// BOUNDED PARALLEL LOADING
+// =============================================================================
+//
+// Every field of an export is its own HTTP request, and the requests a single
+// analysis needs are independent of one another. Awaiting each one before
+// starting the next makes the wall clock the *sum* of the round trips instead
+// of the deepest one, which is the difference a user feels on a real link far
+// more than any kernel cost. `networkConcurrency` is the one place that number
+// is owned and justified (`shared/performance-config.js`), so every loader
+// here asks it rather than carrying a literal of its own.
+
+/** @returns {number} The configured ceiling on concurrent field requests. */
+function networkConcurrency() {
+  const configured = getPerformanceConfig().batch.networkConcurrency;
+  if (!Number.isSafeInteger(configured) || configured <= 0) {
+    throw new RangeError(
+      'PerformanceConfig networkConcurrency must be a positive integer'
+    );
+  }
+  return configured;
+}
+
+/**
+ * Register a task with the slot gate without making the gate a second owner of
+ * its rejection.
+ *
+ * `waitForAvailableSlot` races the set, so a rejected member would reject the
+ * race *and* stay unhandled if the caller had already stopped waiting. The
+ * guarded copy settles for the gate; the caller keeps and awaits the original.
+ *
+ * @param {Set<Promise<unknown>>} inFlight
+ * @param {Promise<unknown>} task
+ */
+function trackSettlement(inFlight, task) {
+  const guarded = task.then(() => {}, () => {});
+  inFlight.add(guarded);
+  void guarded.then(() => inFlight.delete(guarded));
+}
 
 // =============================================================================
 // PAGE MEMBERSHIP DIGEST
@@ -372,6 +413,18 @@ export class DataLayer {
     // Page version tracking for cache correctness
     this._pageVersions = enableVersionTracking ? new Map() : null;
 
+    // The exact index set each recorded page version was computed from.
+    //
+    // Computing a page version is already a full pass over that page's cell
+    // indices, and the fetch that follows needs the very same set. Keeping the
+    // set beside its digest means the pass happens once instead of twice, and
+    // — more importantly — it makes the values a cache entry holds provably
+    // the values its key describes: the two used to be built by separate
+    // traversals with an `await` between them, so a membership change in that
+    // window was cached under the version it no longer matched.
+    /** @type {Map<string, {hash: string, indices: number[]}>} */
+    this._pageIndexSnapshots = new Map();
+
     // Notification center reference
     this._notifications = enableNotifications ? getNotificationCenter() : null;
 
@@ -441,6 +494,9 @@ export class DataLayer {
     // Clear bulk gene cache first (largest memory consumer)
     this._bulkGeneCache.clear();
     this._bulkGeneCacheAccessOrder = [];
+    // A retained index set is per page rather than per cached entry, so it is
+    // small — but after a prune it can be the only thing still holding one.
+    this._pageIndexSnapshots.clear();
 
     // Prune data cache (remove oldest entries)
     if (this._dataCache) {
@@ -1222,7 +1278,7 @@ export class DataLayer {
         throw new Error(`Page not found: ${pageId}`);
       }
 
-      const cellIndices = this.getCellIndicesForPage(pageId);
+      const cellIndices = this._getVersionedCellIndices(pageId);
 
       if (cellIndices.length === 0) {
         results.push({
@@ -1236,9 +1292,14 @@ export class DataLayer {
         continue;
       }
 
-      // Extract values for cells in this page
+      // Extract values for cells in this page.
+      //
+      // `cellIndices` is already the exact, deduplicated, ascending index set
+      // this page owns, and the loop below validates every entry before any
+      // result is published, so copying it into a second array of the same
+      // contents bought nothing and cost one full allocation per page per
+      // variable — 60 of them for a 60-gene signature over one page.
       const values = [];
-      const exactIndices = [];
 
       for (const idx of cellIndices) {
         if (
@@ -1274,7 +1335,6 @@ export class DataLayer {
           );
         }
         values.push(value);
-        exactIndices.push(idx);
       }
 
       results.push({
@@ -1285,7 +1345,7 @@ export class DataLayer {
           categories: field.kind === 'category' ? categories : undefined
         },
         values,
-        cellIndices: exactIndices,
+        cellIndices,
         cellCount: values.length
       });
     }
@@ -1534,9 +1594,43 @@ export class DataLayer {
     }
 
     const pageName = this.getPages().find(p => p.id === pageId)?.name || '';
+    const indices = this.getCellIndicesForPage(pageId);
     foldDigestText(lanes, pageName);
-    foldDigestIndexSet(lanes, this.getCellIndicesForPage(pageId));
-    return `${pageId}:${finalizeDigest(lanes)}`;
+    foldDigestIndexSet(lanes, indices);
+    const hash = `${pageId}:${finalizeDigest(lanes)}`;
+    // Keep the set this digest describes, so the fetch that follows reads the
+    // same membership instead of rebuilding it.
+    this._pageIndexSnapshots.set(pageId, { hash, indices });
+    return hash;
+  }
+
+  /**
+   * The exact index set behind a page's *current* recorded version.
+   *
+   * Returns the snapshot only when it still describes the recorded version, so
+   * a caller can never be handed a set the current cache key does not cover.
+   *
+   * @param {string} pageId - Page ID
+   * @returns {number[]} The page's exact, deduplicated, ascending index set
+   * @private
+   */
+  _getVersionedCellIndices(pageId) {
+    if (this._pageVersions === null) {
+      return this.getCellIndicesForPage(pageId);
+    }
+    // A derived "rest of" page never reaches `_computePageHash`'s index branch
+    // — its digest is derived from the base page's version — so it has no
+    // snapshot until the first fetch builds one. Recording it here covers that
+    // case too, and materialising the complement is exactly the work the fetch
+    // is about to do anyway.
+    const version = this._getPageVersion(pageId);
+    const snapshot = this._pageIndexSnapshots.get(pageId);
+    if (snapshot !== undefined && snapshot.hash === version) {
+      return snapshot.indices;
+    }
+    const indices = this.getCellIndicesForPage(pageId);
+    this._pageIndexSnapshots.set(pageId, { hash: version, indices });
+    return indices;
   }
 
   /**
@@ -1625,6 +1719,9 @@ export class DataLayer {
     }
 
     const pageIdSet = new Set(uniquePageIds);
+    for (const pageId of pageIdSet) {
+      this._pageIndexSnapshots.delete(pageId);
+    }
 
     // Both cache key formats end with the page IDs, optionally followed by a
     // ':v=' version component:
@@ -1670,6 +1767,7 @@ export class DataLayer {
     if (this._dataCache) {
       this._dataCache.clear();
     }
+    this._pageIndexSnapshots.clear();
   }
 
   /**
@@ -1695,6 +1793,7 @@ export class DataLayer {
       this._dataCache.clear();
     }
     this.clearBulkGeneCache();
+    this._pageIndexSnapshots.clear();
     this._prefetchQueue = [];
 
     if (this._prefetchTimeout) {
@@ -1729,6 +1828,7 @@ export class DataLayer {
     }
     this._geneFieldIndexByKey = null;
     this._obsFieldIndexByKey = null;
+    this._pageIndexSnapshots.clear();
     if (this._pageVersions !== null) {
       this._pageVersions.clear();
     }
@@ -2261,51 +2361,46 @@ export class DataLayer {
     }
 
     const results = {};
-    const batchSize = 10;
     const startTime = performance.now();
 
+    // Progress starts at zero before any request is issued, so a caller that
+    // draws a bar sees it appear rather than jump in at the first completion.
+    if (onProgress) onProgress(0);
+
     try {
-      for (let i = 0; i < genesToFetch.length; i += batchSize) {
-        const batch = genesToFetch.slice(i, i + batchSize);
-        const progress = Math.round((i / genesToFetch.length) * 100);
-
-        requireCurrentOwnership();
-        if (notifications && notificationId !== null) {
-          notifications.updateProgress(notificationId, progress, {
-            message: `Loading genes ${i + 1}-${Math.min(i + batchSize, genesToFetch.length)} of ${genesToFetch.length}...`
-          });
-        }
-
-        if (onProgress) {
-          onProgress(progress);
-        }
-
-        await Promise.all(batch.map(async (geneInfo) => {
-          requireCurrentOwnership();
-          const geneData = await this.getDataForPages({
-            type: 'gene_expression',
-            variableKey: geneInfo.key,
-            pageIds,
-            silent: true // Suppress individual notifications during bulk load
-          });
-          requireCurrentOwnership();
-
-          const genePages = {};
-          setOwnDataProperty(results, geneInfo.key, genePages);
-          for (const pd of geneData) {
-            setOwnDataProperty(genePages, pd.pageId, {
-              values: pd.values,
-              cellIndices: pd.cellIndices,
-              pageName: pd.pageName,
-              cellCount: pd.cellCount
+      // One gene is one HTTP request, and the requests are independent. This
+      // used to run in fixed batches of ten with a macrotask barrier between
+      // them, so 60 genes cost six *strictly sequential* waves however fast the
+      // link was: measured 60 requests, chain depth 6, never more than 10 in
+      // flight. A sliding window keeps `networkConcurrency` requests in flight
+      // continuously instead, so the depth is set by the slowest request rather
+      // than by the batch boundary — the same shape `StreamingGeneLoader`
+      // already uses for the marker and DE paths.
+      const loadedPages = await this._loadGenePagesConcurrently(
+        genesToFetch.map(geneInfo => geneInfo.key),
+        pageIds,
+        requireCurrentOwnership,
+        progress => {
+          if (notifications && notificationId !== null) {
+            notifications.updateProgress(notificationId, progress, {
+              message:
+                `Loading gene expression: ${progress}% of ` +
+                `${genesToFetch.length} genes...`
             });
           }
-        }));
-        requireCurrentOwnership();
+          if (onProgress) onProgress(progress);
+        }
+      );
+      requireCurrentOwnership();
 
-        // Yield to event loop
-        await new Promise(resolve => setTimeout(resolve, 0));
-        requireCurrentOwnership();
+      // Publication order is the requested order, never completion order: the
+      // result is an ordered record its callers read positionally.
+      for (let index = 0; index < genesToFetch.length; index++) {
+        setOwnDataProperty(
+          results,
+          genesToFetch[index].key,
+          loadedPages[index]
+        );
       }
 
       requireCurrentOwnership();
@@ -2421,31 +2516,37 @@ export class DataLayer {
     const cached = this._getBulkGeneCache(cacheKey);
 
     if (cached && (Date.now() - cached.timestamp) < this._bulkGeneCacheMaxAge) {
+      // The bulk cache is keyed on the page set alone, so a run that asks for
+      // genes an earlier run did not fetch lands here with a partial hit. The
+      // misses used to be awaited one after another, which made a signature
+      // that added N genes cost N round trips in sequence. They are fetched
+      // together instead, under the same ceiling as a cold run.
+      const missingGenes = ownedGeneList.filter(
+        gene => !Object.hasOwn(cached.data, gene)
+      );
+      const fetchedPages = missingGenes.length === 0
+        ? []
+        : await this._loadGenePagesConcurrently(
+          missingGenes,
+          ownedPageIds,
+          requireCurrentOwnership
+        );
+      requireCurrentOwnership();
+
+      const fetchedByGene = new Map();
+      for (let index = 0; index < missingGenes.length; index++) {
+        fetchedByGene.set(missingGenes[index], fetchedPages[index]);
+      }
+
       const results = {};
       for (const gene of ownedGeneList) {
-        requireCurrentOwnership();
-        if (Object.hasOwn(cached.data, gene)) {
-          setOwnDataProperty(results, gene, cached.data[gene]);
-        } else {
-          const geneData = await this.getDataForPages({
-            type: 'gene_expression',
-            variableKey: gene,
-            pageIds: ownedPageIds,
-            silent: true
-          });
-          requireCurrentOwnership();
-
-          const genePages = {};
-          setOwnDataProperty(results, gene, genePages);
-          for (const pd of geneData) {
-            setOwnDataProperty(genePages, pd.pageId, {
-              values: pd.values,
-              cellIndices: pd.cellIndices,
-              pageName: pd.pageName,
-              cellCount: pd.cellCount
-            });
-          }
-        }
+        setOwnDataProperty(
+          results,
+          gene,
+          Object.hasOwn(cached.data, gene)
+            ? cached.data[gene]
+            : fetchedByGene.get(gene)
+        );
       }
       requireCurrentOwnership();
       return results;
@@ -2463,6 +2564,81 @@ export class DataLayer {
     const result = await this.fetchBulkGeneExpression(fetchOptions);
     requireCurrentOwnership();
     return result;
+  }
+
+  /**
+   * Load per-page expression records for a gene list with bounded concurrency.
+   *
+   * Returns one record per requested gene, in the requested order, so a caller
+   * can publish an ordered result without depending on which request finished
+   * first.
+   *
+   * @param {string[]} geneKeys - Gene keys, already deduplicated
+   * @param {string[]} pageIds - Page IDs every gene is subset to
+   * @param {Function} requireCurrentOwnership - Throws when the request is stale
+   * @param {Function} [onProgress] - Receives whole-percent progress
+   * @returns {Promise<Object[]>} One `{ [pageId]: PageRecord }` per gene
+   * @private
+   */
+  async _loadGenePagesConcurrently(
+    geneKeys,
+    pageIds,
+    requireCurrentOwnership,
+    onProgress
+  ) {
+    const total = geneKeys.length;
+    const loaded = new Array(total);
+    const tasks = [];
+    const inFlight = new Set();
+    let completed = 0;
+
+    const maxInFlight = Math.max(1, Math.min(total, networkConcurrency()));
+    const yieldInterval = getPerformanceConfig().batch.uiYieldInterval;
+
+    for (let index = 0; index < total; index++) {
+      requireCurrentOwnership();
+      // Subsetting one gene to its pages is a pass over the cell axis, so a
+      // long gene list must hand the frame back periodically. This pauses the
+      // *scheduling* loop only: the requests already in flight keep running,
+      // which is what distinguishes it from the batch barrier it replaced.
+      if (index > 0 && index % yieldInterval === 0) {
+        await new Promise(resolve => setTimeout(resolve, 0));
+      }
+      await waitForAvailableSlot(inFlight, maxInFlight);
+      requireCurrentOwnership();
+
+      const geneKey = geneKeys[index];
+      const position = index;
+      const task = this.getDataForPages({
+        type: 'gene_expression',
+        variableKey: geneKey,
+        pageIds,
+        silent: true // Suppress individual notifications during bulk load
+      }).then(geneData => {
+        requireCurrentOwnership();
+        const genePages = {};
+        for (const pd of geneData) {
+          setOwnDataProperty(genePages, pd.pageId, {
+            values: pd.values,
+            cellIndices: pd.cellIndices,
+            pageName: pd.pageName,
+            cellCount: pd.cellCount
+          });
+        }
+        loaded[position] = genePages;
+        completed++;
+        if (onProgress) {
+          onProgress(Math.round((completed / total) * 100));
+        }
+      });
+      tasks.push(task);
+      trackSettlement(inFlight, task);
+    }
+
+    // Every started load is awaited here, so an ownership change mid-run can
+    // never leave a rejection unobserved.
+    await Promise.all(tasks);
+    return loaded;
   }
 
   /**
@@ -2717,9 +2893,6 @@ export class DataLayer {
 
     const startTime = performance.now();
 
-    const obsManifest = this.state?.obsManifest || null;
-    const manifestUrl = this.state?.manifestUrl || null;
-
     const result = {
       fields: {},
       pageData: {},
@@ -2896,32 +3069,11 @@ export class DataLayer {
     };
 
     try {
-      if (obsManifest && manifestUrl) {
-        const bulkData = await loadAnalysisBulkObsData({
-            manifestUrl,
-            obsManifest,
-            fieldList: obsFields,
-            batchSize: 10,
-            onProgress: handleProgress,
-            // DataLayer already owns the progress notification for bulk loading.
-            suppressNotifications: true
-        });
-
-        for (const fieldKey of obsFields) {
-          if (!Object.hasOwn(bulkData.fields, fieldKey)) {
-            throw new Error(
-              `Bulk observation loader omitted requested field "${fieldKey}"`
-            );
-          }
-          publishField(fieldKey, bulkData.fields[fieldKey]);
-        }
-      } else {
-        await this._loadObsFieldsSequentially(
-          obsFields,
-          handleProgress,
-          publishField
-        );
-      }
+      await this._loadObsFieldsConcurrently(
+        obsFields,
+        handleProgress,
+        publishField
+      );
 
       // Complete notification
       const duration = performance.now() - startTime;
@@ -2943,17 +3095,39 @@ export class DataLayer {
   }
 
   /**
-   * Load obs fields sequentially when no bulk manifest is available.
+   * Load the requested observation fields with bounded concurrency.
+   *
+   * One observation field is one HTTP request in the prepared export format
+   * (two for a categorical field, which also carries an outlier mask), so
+   * awaiting each field before starting the next made a run's wall clock the
+   * *sum* of its round trips. Quick Insights asks for four fields on first
+   * open; measured at 150 ms emulated latency that was six strictly serial
+   * requests spanning 2.07 s with never more than one in flight. The requests
+   * are independent, so they are issued together under the same
+   * `networkConcurrency` ceiling every other analysis loader uses.
+   *
+   * Fields are still *published* in request order, because `result.fields` is
+   * an ordered record the callers read positionally.
+   *
    * @param {string[]} obsFields - Field keys to load
    * @param {Function} [onProgress] - Progress callback
    * @param {Function} publishField - Exact field publication callback
    * @private
    */
-  async _loadObsFieldsSequentially(obsFields, onProgress, publishField) {
+  async _loadObsFieldsConcurrently(obsFields, onProgress, publishField) {
     const totalFields = obsFields.length;
+    const loaded = new Array(totalFields);
+    const tasks = [];
+    const inFlight = new Set();
+    let completed = 0;
 
-    for (let i = 0; i < obsFields.length; i++) {
-      const fieldKey = obsFields[i];
+    const maxInFlight = Math.max(
+      1,
+      Math.min(totalFields, networkConcurrency())
+    );
+
+    for (let index = 0; index < totalFields; index++) {
+      const fieldKey = obsFields[index];
       const catFields = this.getAvailableVariables('categorical_obs');
       const continuousFields = this.getAvailableVariables('continuous_obs');
       const isCategorical = catFields.some(field => field.key === fieldKey);
@@ -2964,15 +3138,27 @@ export class DataLayer {
           'or continuous declaration'
         );
       }
-      const fieldData = await this.ensureObsFieldLoaded(
-        fieldKey,
-        { silent: true }
-      );
-      publishField(fieldKey, fieldData);
 
-      if (onProgress) {
-        onProgress(Math.round(((i + 1) / totalFields) * 100));
-      }
+      await waitForAvailableSlot(inFlight, maxInFlight);
+
+      const task = this.ensureObsFieldLoaded(fieldKey, { silent: true })
+        .then(fieldData => {
+          loaded[index] = fieldData;
+          completed++;
+          if (onProgress) {
+            onProgress(Math.round((completed / totalFields) * 100));
+          }
+        });
+      tasks.push(task);
+      trackSettlement(inFlight, task);
+    }
+
+    // Every started load is awaited, so a rejection can never outlive this
+    // call as an unhandled rejection, and the first failure is the one thrown.
+    await Promise.all(tasks);
+
+    for (let index = 0; index < totalFields; index++) {
+      publishField(obsFields[index], loaded[index]);
     }
   }
 

@@ -17,6 +17,7 @@ import {
   getCriticalUserDefinedFieldIds,
   USER_DEFINED_CODES_RESTORE_TRANSACTION_ID
 } from './user-defined-code-inventory.js';
+import { requireCategoryCodes } from '../../registries/user-defined-fields.js';
 
 export const id = 'user-defined-codes';
 
@@ -343,6 +344,10 @@ export function capture(ctx) {
       throw new TypeError(`User-defined field id "${fieldId}" is duplicated.`);
     }
     fieldIds.add(fieldId);
+    // A purged field released its codes, and nothing can restore it, so there
+    // is no chunk to write. The id is still registered above, because the
+    // tombstone in the metadata still names it.
+    if (field._isPurged === true) continue;
     if (field.kind === 'continuous') continue;
     if (field.kind !== 'category') {
       throw new TypeError(`User-defined field "${fieldId}" has unsupported kind.`);
@@ -574,6 +579,22 @@ export async function restore(ctx, chunkMeta, payload) {
     expectedCodesType: template._codesTypeHint,
     signal
   });
+
+  // The decode proves the length and the width, which is what the bundle
+  // declared - not that the codes name categories this field actually has.
+  // Without this the array goes straight into the field and every reader after
+  // it indexes past the end of the inventory.
+  if (!Array.isArray(template.categories)) {
+    throw new TypeError(
+      `User-defined field "${fieldId}" has no category inventory to bound its codes.`
+    );
+  }
+  requireCategoryCodes(
+    codes,
+    template.categories,
+    pointCount,
+    `User-defined field "${fieldId}"`
+  );
 
   template.codes = codes;
   template.loaded = true;

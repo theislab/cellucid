@@ -136,6 +136,59 @@ export function createStableTerminalDestroy({
 }
 
 /**
+ * The status line that explains why the data-source controls are inert, and
+ * the two states it publishes.
+ *
+ * `index.html` ships every data-source control disabled and this line visible,
+ * because the listeners that act on those controls are attached by `initUI()`
+ * — which does not run until the initial dataset has finished loading, tens of
+ * seconds on a slow link. A control offered before its listener exists takes a
+ * click and discards it without a request, a message or a record, so no control
+ * is offered until this line says the listeners are there. Saying it through a
+ * live region is what makes the change announced rather than merely drawn.
+ */
+const DATA_SOURCE_STATUS_ID = 'data-source-status';
+const DATA_SOURCE_STATUS_READY =
+  'Data sources are ready. Load your own data, a server, or a GitHub '
+  + 'repository below.';
+
+/**
+ * @param {Document} documentOwner
+ * @returns {HTMLElement}
+ */
+function requireDataSourceStatus(documentOwner) {
+  const status = documentOwner.getElementById(DATA_SOURCE_STATUS_ID);
+  if (status === null) {
+    throw new Error(
+      'The data source controls require their readiness status line.'
+    );
+  }
+  return status;
+}
+
+/**
+ * Announce that the data-source controls now do what they offer.
+ *
+ * The line stays in the accessibility tree as a live region so the change is
+ * spoken, and leaves the layout so a ready sidebar is not carrying a paragraph
+ * about starting up.
+ *
+ * @param {Document} documentOwner
+ * @returns {() => void} Restores the starting state
+ */
+function publishDataSourceReadiness(documentOwner) {
+  const status = requireDataSourceStatus(documentOwner);
+  const startingClassName = status.className;
+  const startingText = status.textContent;
+  status.className = 'sr-only';
+  status.textContent = DATA_SOURCE_STATUS_READY;
+  return () => {
+    status.className = startingClassName;
+    status.textContent = startingText;
+  };
+}
+
+/**
  * Initialize the full app UI.
  *
  * @param {object} options
@@ -231,6 +284,7 @@ export function initUI({
       // Field activation publishes visibility before the selector can commit
       // the replacement legend. Refreshing counts in the same frame keeps the
       // DOM and active model in one completed UI generation.
+      publishStatsLine();
       legend.refreshCategoryCounts?.();
       filterControls.render?.();
       highlightControls.renderHighlightSummary?.();
@@ -240,15 +294,46 @@ export function initUI({
 
   function buildStatsInfoFromState() {
     const field = state.getActiveField();
+    // Count the centroids the way every other reader of them does — from the
+    // position array, as `view-controls.js`, `figure-export-contract.js` and the
+    // renderer all do. `state.centroidCount` is a cached scalar that
+    // `setActiveView` does not carry with the rest of a view's context, so it
+    // reported whatever was last built rather than what this view holds: after
+    // colouring another view by a continuous field it read zero, and the line
+    // dropped the centroid count for a view that still had three.
+    const centroids = state.centroidPositions;
+    const centroidCount = centroids ? centroids.length / 3 : 0;
     const centroidInfo =
-      field && field.kind === 'category' && (state.centroidCount || 0) > 0
-        ? ` • Centroids: ${state.centroidCount}`
+      field && field.kind === 'category' && centroidCount > 0
+        ? ` • Centroids: ${centroidCount}`
         : '';
     return {
       field: field || null,
       pointCount: state.pointCount || 0,
       centroidInfo
     };
+  }
+
+  /**
+   * Publish the statistics line from current state.
+   *
+   * `#stats` is `sr-only`, so a sighted user reads the legend and never sees
+   * it: a stale line misinforms screen-reader users and nobody else notices.
+   * It therefore follows the signals it depends on instead of being republished
+   * from refresh lists, because a list that every caller must remember is what
+   * left it reading "Field: None" over a fully coloured plot.
+   *
+   * DataState announces no "the active field changed", but `setActiveField`,
+   * `setActiveVarField` and `clearActiveField` all end in
+   * `computeGlobalVisibility()` and `setActiveView` ends in
+   * `_notifyVisibilityChange()`, so every activation — a click, a published
+   * dataset's advertised state, Load State, a Jupyter command, a switch to a
+   * kept view — arrives as `visibility:changed`. That is the same signal
+   * `highlight-controls.js` follows for the renderer's highlight mode. A
+   * dimension change is the other input, because it moves the centroid count.
+   */
+  function publishStatsLine() {
+    statsDisplay.updateStats?.(buildStatsInfoFromState());
   }
 
   function syncNavigationUiForView(viewId) {
@@ -273,13 +358,51 @@ export function initUI({
     scheduleVisibilityUiUpdate();
   }
 
+  /**
+   * The single publication of "the active field changed".
+   *
+   * Every surface that draws the active field is refreshed here, and only here.
+   * A second, partial copy of this list is how the sidebar came to disagree
+   * with itself: a state-driven activation (a dataset's advertised starting
+   * state, Load State, a Jupyter command) refreshed the legend and the
+   * selectors but not the rest, and a switch to a kept view — which restores
+   * that view's own active field — refreshed a third, shorter set.
+   *
+   * The statistics line is not in this list. It follows `visibility:changed`
+   * instead (see `publishStatsLine`), which reaches paths that never call this.
+   *
+   * @param {object|null} [fieldInfo] Field info from the activating call, or
+   *   nothing to recompute it from current state.
+   */
   function handleActiveFieldChanged(fieldInfo) {
     const info = fieldInfo || buildStatsInfoFromState();
-    statsDisplay.updateStats?.(info);
     legend.render?.(info.field);
     legend.handleOutlierUI?.(info.field);
     highlightControls.updateHighlightMode?.();
     communityAnnotationControls.render?.();
+  }
+
+  /**
+   * The surfaces that describe whichever view is active.
+   *
+   * Two callers need exactly this sequence and used to carry their own copy of
+   * it, differing by a single line. The comment above `handleActiveFieldChanged`
+   * records what a second, partial copy of a refresh list already cost once.
+   *
+   * The view id is a parameter because the two callers know it differently: the
+   * view-controls callback is told which view it activated, while an outside
+   * caller has to ask the state.
+   *
+   * @param {string} viewId
+   */
+  function refreshViewDependentSurfaces(viewId) {
+    fieldSelector.syncFromState?.();
+    handleActiveFieldChanged();
+    filterControls.render?.();
+    highlightControls.renderHighlightSummary?.();
+    dimensionControls.updateDimensionSelectUI?.();
+    syncNavigationUiForView(viewId);
+    renderControls.markSmokeDirty?.();
   }
 
   const fieldSelector = initFieldSelector({
@@ -313,17 +436,7 @@ export function initUI({
     dom: dom.view,
     renderDom: dom.render,
     callbacks: {
-      onActiveViewChanged: (viewId) => {
-        fieldSelector.syncFromState?.();
-        legend.render?.(state.getActiveField());
-        legend.handleOutlierUI?.(state.getActiveField());
-        highlightControls.updateHighlightMode?.();
-        filterControls.render?.();
-        highlightControls.renderHighlightSummary?.();
-        dimensionControls.updateDimensionSelectUI?.();
-        syncNavigationUiForView(viewId);
-        renderControls.markSmokeDirty?.();
-      },
+      onActiveViewChanged: (viewId) => refreshViewDependentSurfaces(viewId),
       onCycleViewDimension: async (viewId, nextDim) => {
         await dimensionControls.handleDimensionChange(
           nextDim,
@@ -351,12 +464,10 @@ export function initUI({
     fieldSelector.initGeneExpressionDropdown?.();
     fieldSelector.syncFromState?.();
 
-    legend.render?.(state.getActiveField());
-    legend.handleOutlierUI?.(state.getActiveField());
+    handleActiveFieldChanged();
     filterControls.render?.();
     highlightControls.renderHighlightPages?.();
     highlightControls.renderHighlightSummary?.();
-    communityAnnotationControls.render?.();
     dimensionControls.updateDimensionSelectUI?.();
     syncNavigationUiForView(state.getActiveViewId());
   }
@@ -379,16 +490,10 @@ export function initUI({
       initGeneExpressionDropdown: fieldSelector.initGeneExpressionDropdown,
       clearGeneSelection: fieldSelector.clearGeneSelection,
       refreshUIForActiveView: () => {
+        // Only this caller syncs the view controls: the callback above is
+        // invoked *by* them, so doing it there would be re-entrant.
         viewControls?.syncFromStateAndViewer?.();
-        fieldSelector.syncFromState?.();
-        legend.render?.(state.getActiveField());
-        legend.handleOutlierUI?.(state.getActiveField());
-        highlightControls.updateHighlightMode?.();
-        filterControls.render?.();
-        highlightControls.renderHighlightSummary?.();
-        dimensionControls.updateDimensionSelectUI?.();
-        syncNavigationUiForView(state.getActiveViewId());
-        renderControls.markSmokeDirty?.();
+        refreshViewDependentSurfaces(state.getActiveViewId());
       },
       updateDimensionSelectUI: dimensionControls.updateDimensionSelectUI,
       showSessionStatus
@@ -431,10 +536,7 @@ export function initUI({
     fieldSelector.renderDeletedFieldsSection?.();
     fieldSelector.initGeneExpressionDropdown?.();
     fieldSelector.syncFromState?.();
-    legend.render?.(state.getActiveField());
-    legend.handleOutlierUI?.(state.getActiveField());
-    highlightControls.updateHighlightMode?.();
-    communityAnnotationControls.render?.();
+    handleActiveFieldChanged();
     handleVisibilityChange();
   };
   const unsubscribeField = state.on(
@@ -442,7 +544,7 @@ export function initUI({
     handleFieldChanged
   );
   const handleDimensionChanged = () => {
-    statsDisplay.updateStats?.(buildStatsInfoFromState());
+    publishStatsLine();
     viewControls?.renderSplitViewBadges?.();
   };
   const unsubscribeDimension = state.on(
@@ -461,6 +563,10 @@ export function initUI({
   communityAnnotationControls.render?.();
   viewControls?.renderSplitViewBadges?.();
   viewControls?.updateSplitViewUI?.();
+  // The markup ships "Loading data…", and the load that finished before this
+  // module existed published its `visibility:changed` to nobody, so the first
+  // statistics line is written here rather than waiting for the next signal.
+  publishStatsLine();
   handleActiveFieldChanged(buildStatsInfoFromState());
   syncNavigationUiForView(state.getActiveViewId());
 
@@ -554,6 +660,10 @@ export function initUI({
     return remaining;
   }
 
+  // Every module above has attached its listeners, so the controls that were
+  // shipped disabled can now be offered.
+  const retireDataSourceReadiness = publishDataSourceReadiness(document);
+
   const destroy = createStableTerminalDestroy({
     closeAdmission: () => {
       destroyed = true;
@@ -563,6 +673,7 @@ export function initUI({
       }
     },
     getOperations: () => [
+      retireDataSourceReadiness,
       unsubscribeVisibility,
       unsubscribeField,
       unsubscribeDimension,

@@ -4,6 +4,7 @@ import test from 'node:test';
 import { DataLayer } from '../assets/js/app/analysis/data/data-layer.js';
 import { MultiVariableAnalysis } from '../assets/js/app/analysis/stats/multi-variable-analysis.js';
 import { createRestOfPageId } from '../assets/js/app/analysis/shared/page-derivation-utils.js';
+import { PerformanceConfig } from '../assets/js/app/analysis/shared/performance-config.js';
 
 function deferred() {
   let reject;
@@ -419,7 +420,7 @@ test('dataset reset invalidates a partial-cache gene subset instead of returning
   );
 });
 
-test('cooperative bulk-gene invalidation stops later batches and dismisses its data notification once', async t => {
+test('cooperative bulk-gene invalidation stops every later request and dismisses its data notification once', async t => {
   const layer = new DataLayer({}, {
     enableNotifications: false,
     enablePrefetch: false,
@@ -472,11 +473,20 @@ test('cooperative bulk-gene invalidation stops later batches and dismisses its d
     },
   });
 
-  await waitFor(() => startedGenes.length === 10, 'first bulk-gene batch');
+  // The loader keeps a sliding window of `networkConcurrency` requests in
+  // flight rather than issuing fixed batches, so the invariant under test is
+  // not "the second batch never starts" — it is that *no further request* is
+  // issued once cooperative ownership is lost, whatever the window size is.
+  const window = PerformanceConfig.batch.networkConcurrency;
+  await waitFor(
+    () => startedGenes.length >= window,
+    'the bulk-gene concurrency window to fill',
+  );
   current = false;
   invalidationCleanup?.();
   invalidationCleanup?.();
   const terminalAtInvalidation = [...terminal];
+  const startedAtInvalidation = [...startedGenes];
   firstBatchGate.resolve();
 
   const outcome = await run.then(
@@ -492,11 +502,21 @@ test('cooperative bulk-gene invalidation stops later batches and dismisses its d
   );
   assert.deepEqual(
     startedGenes,
+    startedAtInvalidation,
+    'no further gene request may start after cooperative ownership is lost',
+  );
+  assert.equal(
+    startedGenes.length,
+    window,
+    'the loader must never exceed its configured concurrency window',
+  );
+  assert.deepEqual(
+    startedGenes,
     Array.from(
-      { length: 10 },
+      { length: window },
       (_unused, index) => `Gene ${String(index + 1).padStart(2, '0')}`,
     ),
-    'no later batch may start after cooperative ownership is lost',
+    'the window must be filled in requested order',
   );
   assert.equal(outcome.error?.code, 'ANALYSIS_DATA_REQUEST_INVALIDATED');
   assert.deepEqual(terminal, [['dismiss', 'bulk-cooperative']]);

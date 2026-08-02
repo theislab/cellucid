@@ -43,6 +43,8 @@ Cellucid is split by responsibility:
 | `cellucid-python` | Python package + CLI + Sphinx docs | are fixing `prepare`/`serve`/`show_anndata`, server endpoints, Jupyter hooks, or documentation site pages |
 | `cellucid-r` | R package exporter | are changing `cellucid_prepare()` / R export format logic |
 | `cellucid-annotation` | GitHub repo template for annotation | are changing repo schema/validation/workflows |
+| `cellucid-datasets` | The published demo catalog | are correcting a published generation or its catalog entry |
+| `cellucid-demo-custom-datasets` | Worked example of publishing your own datasets | are changing that guide or its synthetic examples |
 
 If you’re unsure where a bug belongs, open an issue in the repo you’re currently using and include:
 - where the UI ran (hosted app vs local app vs Jupyter iframe),
@@ -196,6 +198,28 @@ npm run test:worker-bundle  # dry-run build of the community-annotation Worker
 contract file is picked up by adding it, with nothing to register. These are
 the same commands `.github/workflows/test.yml` runs, across Node 20/22/24/26
 and chromium/firefox/webkit, so a green local run is the same check CI applies.
+
+### Running two browser suites at once
+
+`npm run test:browser` binds two loopback ports: `4173` for the application and
+`4174` for the same tree with permissive CORS. A second run on the same machine
+would collide, so it reports the taken address and stops rather than waiting on
+it. Move it instead:
+
+```bash
+CELLUCID_BROWSER_TEST_PORT=4183 npm run test:browser
+```
+
+`CELLUCID_BROWSER_TEST_SAMPLE_PORT` defaults to `CELLUCID_BROWSER_TEST_PORT + 1`
+and can be set separately. Both the servers and the specs resolve the address
+from `scripts/browser-test-ports.mjs` — the specs through
+`tests/browser/helpers/origins.mjs` — so a moved run also fetches its fixtures
+from the port it was moved to. Failure artifacts go to `test-results/<port>/`,
+so concurrent runs do not overwrite each other's evidence.
+
+A new browser spec must take its origins from `tests/browser/helpers/origins.mjs`
+rather than writing an address down; `tests/browser-test-port-contract.test.mjs`
+fails on a reintroduced literal.
 
 Automated coverage does not replace manual smoke testing of the interactive
 surface. Run through this checklist for any change a user can see:

@@ -12,6 +12,7 @@ import {
 import {
   gzipDecompress,
 } from '../../assets/js/app/session/codecs/gzip.js';
+import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 
 const PUBLISHED_DEFAULT_CHUNK_IDS = Object.freeze([
@@ -176,7 +177,7 @@ test('loads the current H5AD contract with a planar 2-D camera and no playback',
   });
 
   await page.goto(
-    '/?exportsBaseUrl=http%3A%2F%2F127.0.0.1%3A4173%2Ftests%2Fbrowser%2Ffixtures%2Fexports%2F&dataset=current-ui-prepared&acceptance=browser-ci',
+    `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=browser-ci`,
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
@@ -215,7 +216,7 @@ test('replaces prepared, Zarr ZIP, and H5AD datasets through the visible control
   });
 
   await page.goto(
-    '/?exportsBaseUrl=http%3A%2F%2F127.0.0.1%3A4173%2Ftests%2Fbrowser%2Ffixtures%2Fexports%2F&dataset=current-ui-prepared&acceptance=all-local-loaders-ci',
+    `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=all-local-loaders-ci`,
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
@@ -301,7 +302,7 @@ test('saves and restores the exact current UI state through one file-input contr
   });
 
   await page.goto(
-    '/?exportsBaseUrl=http%3A%2F%2F127.0.0.1%3A4173%2Ftests%2Fbrowser%2Ffixtures%2Fexports%2F&dataset=current-ui-prepared&acceptance=session-ci',
+    `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=session-ci`,
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
@@ -357,7 +358,7 @@ test('session restore rebuilds saved smoke once after retiring current snapshots
   });
 
   await page.goto(
-    '/?exportsBaseUrl=http%3A%2F%2F127.0.0.1%3A4173%2Ftests%2Fbrowser%2Ffixtures%2Fexports%2F&dataset=current-ui-prepared&acceptance=session-smoke-replay-ci',
+    `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=session-smoke-replay-ci`,
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
@@ -430,7 +431,7 @@ test('session restore catches a real control-owner failure and rolls back', asyn
   });
 
   await page.goto(
-    '/?exportsBaseUrl=http%3A%2F%2F127.0.0.1%3A4173%2Ftests%2Fbrowser%2Ffixtures%2Fexports%2F&dataset=current-ui-prepared&acceptance=session-control-owner-ci',
+    `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=session-control-owner-ci`,
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
@@ -512,7 +513,7 @@ test(
     });
 
     await page.goto(
-      '/?exportsBaseUrl=http%3A%2F%2F127.0.0.1%3A4173%2Ftests%2Fbrowser%2Ffixtures%2Fexports%2F&dataset=current-ui-prepared&acceptance=session-field-owner-ci',
+      `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=session-field-owner-ci`,
       { waitUntil: 'domcontentloaded' },
     );
     await dismissWelcome(page);
@@ -583,7 +584,7 @@ test('an advertised sample applies one verified static state without camera moti
   });
 
   const applicationUrl =
-    '/?exportsBaseUrl=http%3A%2F%2F127.0.0.1%3A4173%2Ftests%2Fbrowser%2Ffixtures%2Fexports%2F&dataset=current-ui-prepared&acceptance=published-state-ci';
+    `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=published-state-ci`;
   await page.goto(applicationUrl, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await expectPlanarCurrentDataset(page, 'Current UI prepared fixture');
@@ -687,7 +688,7 @@ test('a published no-vector sample replaces a prior vector-field select generati
   });
 
   const applicationUrl =
-    '/?exportsBaseUrl=http%3A%2F%2F127.0.0.1%3A4173%2Ftests%2Fbrowser%2Ffixtures%2Fexports%2F&dataset=current-ui-prepared&acceptance=vector-state-replacement-ci';
+    `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=vector-state-replacement-ci`;
   await page.goto(applicationUrl, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await expectPlanarCurrentDataset(page, 'Current UI prepared fixture');
@@ -848,7 +849,7 @@ test('camera path state round-trips every owned control and commits autoplay', a
   });
 
   await page.goto(
-    '/?exportsBaseUrl=http%3A%2F%2F127.0.0.1%3A4173%2Ftests%2Fbrowser%2Ffixtures%2Fexports%2F&dataset=current-ui-prepared&acceptance=camera-session-ci',
+    `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=camera-session-ci`,
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
@@ -974,7 +975,7 @@ test('viewer controls reject invalid values atomically and persist one exact bac
   });
 
   await page.goto(
-    '/?exportsBaseUrl=http%3A%2F%2F127.0.0.1%3A4173%2Ftests%2Fbrowser%2Ffixtures%2Fexports%2F&dataset=current-ui-prepared&acceptance=viewer-contract-ci',
+    `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=viewer-contract-ci`,
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
@@ -1077,7 +1078,7 @@ test('viewer controls reject invalid values atomically and persist one exact bac
 
 test('viewer owns snapshot atomicity, exact identity, capacity, and smoke exclusion', async ({ page }) => {
   await page.goto(
-    '/?exportsBaseUrl=http%3A%2F%2F127.0.0.1%3A4173%2Ftests%2Fbrowser%2Ffixtures%2Fexports%2F&dataset=current-ui-prepared&acceptance=viewer-snapshot-contract-ci',
+    `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=viewer-snapshot-contract-ci`,
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);

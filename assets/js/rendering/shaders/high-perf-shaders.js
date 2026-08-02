@@ -31,6 +31,13 @@ uniform mat4 u_viewMatrix;
 uniform mat4 u_modelMatrix;
 uniform mat4 u_projectionMatrix;
 uniform float u_pointSize;
+// The largest sprite this pass may draw, in the pixels it is drawing into.
+// A figure export rasterises the same scene at a multiple of the screen
+// size, so a fixed cap would clamp a point at a different fraction of the
+// image than it occupies on screen, and the exported figure would stop
+// being the view it claims to reproduce. Zero means unset, and the floor
+// below keeps that behaving exactly as the fixed cap did.
+uniform float u_pointSizeMax;
 uniform float u_sizeAttenuation;
 uniform float u_viewportHeight;
 uniform float u_fov;
@@ -85,11 +92,19 @@ void main() {
   float worldSize = u_pointSize * 0.01;
   float perspectiveSize = (worldSize * projectionFactor) / max(eyeDepth, 0.001);
   gl_PointSize = mix(u_pointSize, perspectiveSize, u_sizeAttenuation);
-  gl_PointSize = clamp(gl_PointSize, 0.5, 128.0);
+  gl_PointSize = clamp(gl_PointSize, 0.5, max(u_pointSizeMax, 128.0));
 
-  // Early discard for invisible points
+  // Reject invisible points before rasterisation.
+  //
+  // Shrinking the point is not enough: ALIASED_POINT_SIZE_RANGE starts at 1.0
+  // on this driver, so gl_PointSize = 0.0 is clamped back to one pixel and the
+  // point is assembled, rasterised, and shaded before the fragment discard
+  // throws it away. Moving the vertex outside the clip volume rejects it up
+  // front, which is what makes hiding cells cheaper than showing them instead
+  // of more expensive. The size is still zeroed as a second line of defence.
   if (alpha < 0.01) {
     gl_PointSize = 0.0;
+    gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
   }
 
   v_color = a_color.rgb;
@@ -164,6 +179,13 @@ uniform mat4 u_viewMatrix;
 uniform mat4 u_modelMatrix;
 uniform mat4 u_projectionMatrix;
 uniform float u_pointSize;
+// The largest sprite this pass may draw, in the pixels it is drawing into.
+// A figure export rasterises the same scene at a multiple of the screen
+// size, so a fixed cap would clamp a point at a different fraction of the
+// image than it occupies on screen, and the exported figure would stop
+// being the view it claims to reproduce. Zero means unset, and the floor
+// below keeps that behaving exactly as the fixed cap did.
+uniform float u_pointSizeMax;
 uniform float u_sizeAttenuation;
 uniform float u_viewportHeight;
 uniform float u_fov;
@@ -214,9 +236,23 @@ void main() {
   float worldSize = u_pointSize * 0.01;
   float perspectiveSize = (worldSize * projectionFactor) / max(eyeDepth, 0.001);
   gl_PointSize = mix(u_pointSize, perspectiveSize, u_sizeAttenuation);
-  gl_PointSize = clamp(gl_PointSize, 1.0, 192.0);
+  // Identical bounds to HP_VS_FULL, and to the copy HP_VS_HIGHLIGHT keeps of
+  // this formula. Shader quality selects shading, never geometry: a higher
+  // ceiling here made "light" and "ultralight" draw larger points than "full"
+  // at close range, which is both a different picture and — because point area
+  // is quadratic in the size — more fill. The old 192.0 measured 1.23x the GPU
+  // frame time of this at point size 40 and 1.90x at 60, so the two faster
+  // shaders were the slower ones exactly where speed is wanted.
+  gl_PointSize = clamp(gl_PointSize, 0.5, max(u_pointSizeMax, 128.0));
 
-  if (alpha < 0.01) gl_PointSize = 0.0;
+  // Reject invisible points before rasterisation — see HP_VS_FULL. This shader
+  // also backs the ultralight program, whose fragment shader does not discard,
+  // so without the clip rejection a hidden point still writes depth and
+  // occludes the visible points behind it.
+  if (alpha < 0.01) {
+    gl_PointSize = 0.0;
+    gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+  }
 
   v_color = a_color.rgb;
   v_alpha = alpha;
@@ -261,208 +297,6 @@ void main() {
 }
 `;
 
-/**
- * LOD vertex shader - supports variable point sizes based on aggregation level
- * Uses alpha texture with index remapping for LOD levels
- */
-export const HP_VS_LOD = `#version 300 es
-precision highp float;
-
-layout(location = 0) in vec3 a_position;
-layout(location = 1) in vec4 a_color; // RGBA packed, auto-normalized by WebGL
-layout(location = 2) in float a_lodSize;
-
-uniform mat4 u_mvpMatrix;
-uniform mat4 u_viewMatrix;
-uniform mat4 u_modelMatrix;
-uniform mat4 u_projectionMatrix;
-uniform float u_pointSize;
-uniform float u_viewportHeight;
-uniform float u_fov;
-
-// Alpha texture for efficient alpha-only updates
-uniform sampler2D u_alphaTex;
-uniform int u_alphaTexWidth;
-uniform float u_invAlphaTexWidth;
-uniform bool u_useAlphaTex;
-// For LOD: maps LOD vertex index to original point index for alpha lookup
-// Using usampler2D (unsigned int) for exact index representation up to 4 billion points
-uniform highp usampler2D u_lodIndexTex;
-uniform int u_lodIndexTexWidth;
-uniform float u_invLodIndexTexWidth;
-uniform bool u_useLodIndexTex;
-
-out vec3 v_color;
-out float v_viewDistance;
-out float v_alpha;
-
-void main() {
-  vec4 eyePos = u_viewMatrix * u_modelMatrix * vec4(a_position, 1.0);
-  gl_Position = u_projectionMatrix * eyePos;
-
-  float eyeDepth = -eyePos.z;
-  v_viewDistance = length(eyePos.xyz);
-
-  // Fetch alpha from texture if enabled
-  float alpha;
-  if (u_useAlphaTex && u_alphaTexWidth > 0) {
-    int origIdx;
-    if (u_useLodIndexTex && u_lodIndexTexWidth > 0) {
-      // LOD mode: lookup original index from index texture (R32UI format)
-      // Use integer division for indices >16M (float32 loses precision beyond 2^24)
-      int iy = gl_VertexID / u_lodIndexTexWidth;
-      int ix = gl_VertexID - iy * u_lodIndexTexWidth;
-      origIdx = int(texelFetch(u_lodIndexTex, ivec2(ix, iy), 0).r);
-    } else {
-      origIdx = gl_VertexID;
-    }
-    // Use integer division for indices >16M (float32 loses precision beyond 2^24)
-    int y = origIdx / u_alphaTexWidth;
-    int x = origIdx - y * u_alphaTexWidth;
-    alpha = texelFetch(u_alphaTex, ivec2(x, y), 0).r;
-  } else {
-    alpha = a_color.a;
-  }
-
-  // Size based on LOD level (aggregated points are larger)
-  float projectionFactor = u_viewportHeight / (2.0 * tan(u_fov * 0.5));
-  float worldSize = u_pointSize * 0.01 * a_lodSize;
-  float perspectiveSize = (worldSize * projectionFactor) / max(eyeDepth, 0.001);
-  gl_PointSize = clamp(perspectiveSize, 1.0, 256.0);
-
-  if (alpha < 0.01) gl_PointSize = 0.0;
-
-  v_color = a_color.rgb;
-  v_alpha = alpha;
-}
-`;
-
-/**
- * Instanced rendering vertex shader - for rendering many identical point sprites
- * Uses RGBA uint8 packed color (auto-normalized by WebGL)
- */
-export const HP_VS_INSTANCED = `#version 300 es
-precision highp float;
-
-// Per-vertex attributes (unit quad)
-layout(location = 0) in vec2 a_quadPos;
-
-// Per-instance attributes
-layout(location = 1) in vec3 a_instancePos;
-layout(location = 2) in vec4 a_instanceColor; // RGBA packed as uint8, auto-normalized
-
-uniform mat4 u_mvpMatrix;
-uniform mat4 u_viewMatrix;
-uniform float u_pointSize;
-uniform float u_viewportHeight;
-
-out vec3 v_color;
-out vec2 v_quadCoord;
-out float v_alpha;
-
-void main() {
-  vec4 eyePos = u_viewMatrix * vec4(a_instancePos, 1.0);
-  float eyeDepth = -eyePos.z;
-
-  // Billboard quad in clip space
-  vec4 clipPos = u_mvpMatrix * vec4(a_instancePos, 1.0);
-
-  float size = u_pointSize / u_viewportHeight;
-  vec2 offset = a_quadPos * size * clipPos.w;
-  clipPos.xy += offset;
-
-  gl_Position = clipPos;
-  v_quadCoord = a_quadPos;
-  v_color = a_instanceColor.rgb;
-  v_alpha = a_instanceColor.a;
-}
-`;
-
-export const HP_FS_INSTANCED = `#version 300 es
-precision highp float;
-
-in vec3 v_color;
-in vec2 v_quadCoord;
-in float v_alpha;
-
-out vec4 fragColor;
-
-void main() {
-  float r2 = dot(v_quadCoord, v_quadCoord);
-  if (r2 > 1.0) discard;
-
-  fragColor = vec4(v_color, v_alpha);
-}
-`;
-
-// ============================================================================
-// 16-BIT FLOAT SHADERS (for texture-based attribute storage)
-// ============================================================================
-
-/**
- * Vertex shader that fetches position/color from textures
- * Enables massive datasets with texture-based storage
- * NOTE: Uses gl_VertexID instead of float attribute for indices >16M precision
- */
-export const HP_VS_TEXTURE = `#version 300 es
-precision highp float;
-
-uniform sampler2D u_positionTex;
-uniform sampler2D u_colorTex; // Now stores RGBA
-uniform int u_texWidth;
-uniform mat4 u_mvpMatrix;
-uniform float u_pointSize;
-
-out vec3 v_color;
-out float v_alpha;
-
-vec4 fetchFromTexture(sampler2D tex, int idx, int width) {
-  // Use integer division for indices >16M (float32 loses precision beyond 2^24)
-  int y = idx / width;
-  int x = idx - y * width;
-  return texelFetch(tex, ivec2(x, y), 0);
-}
-
-void main() {
-  int idx = gl_VertexID;
-  vec4 pos = fetchFromTexture(u_positionTex, idx, u_texWidth);
-  vec4 col = fetchFromTexture(u_colorTex, idx, u_texWidth);
-
-  gl_Position = u_mvpMatrix * vec4(pos.xyz, 1.0);
-  gl_PointSize = u_pointSize;
-
-  if (col.a < 0.01) gl_PointSize = 0.0;
-
-  v_color = col.rgb;
-  v_alpha = col.a;
-}
-`;
-
-// ============================================================================
-// SHADER SELECTION HELPERS
-// ============================================================================
-
-/**
- * Get the appropriate shaders based on quality settings (WebGL2 only)
- */
-export function getShaders(quality = 'full') {
-  switch (quality) {
-    case 'ultralight':
-      return { vs: HP_VS_LIGHT, fs: HP_FS_ULTRALIGHT };
-    case 'light':
-      return { vs: HP_VS_LIGHT, fs: HP_FS_LIGHT };
-    case 'lod':
-      return { vs: HP_VS_LOD, fs: HP_FS_FULL };
-    case 'instanced':
-      return { vs: HP_VS_INSTANCED, fs: HP_FS_INSTANCED };
-    case 'texture':
-      return { vs: HP_VS_TEXTURE, fs: HP_FS_LIGHT };
-    case 'full':
-    default:
-      return { vs: HP_VS_FULL, fs: HP_FS_FULL };
-  }
-}
-
 // ============================================================================
 // HIGHLIGHT RING SHADERS - for rendering selection highlights
 // ============================================================================
@@ -482,6 +316,13 @@ uniform mat4 u_viewMatrix;
 uniform mat4 u_modelMatrix;
 uniform mat4 u_projectionMatrix;
 uniform float u_pointSize;
+// The largest sprite this pass may draw, in the pixels it is drawing into.
+// A figure export rasterises the same scene at a multiple of the screen
+// size, so a fixed cap would clamp a point at a different fraction of the
+// image than it occupies on screen, and the exported figure would stop
+// being the view it claims to reproduce. Zero means unset, and the floor
+// below keeps that behaving exactly as the fixed cap did.
+uniform float u_pointSizeMax;
 uniform float u_sizeAttenuation;
 uniform float u_viewportHeight;
 uniform float u_fov;
@@ -504,7 +345,7 @@ void main() {
   float dotWorldSize = u_pointSize * 0.01;
   float dotPerspective = (dotWorldSize * projectionFactor) / max(eyeDepth, 0.001);
   float dotSize = mix(u_pointSize, dotPerspective, u_sizeAttenuation);
-  dotSize = clamp(dotSize, 0.5, 128.0); // Same clamp as main dots!
+  dotSize = clamp(dotSize, 0.5, max(u_pointSizeMax, 128.0)); // Same clamp as main dots!
   v_dotSize = dotSize;
 
   // Highlight sprite scales proportionally with dot using constant multiplier
@@ -514,9 +355,20 @@ void main() {
   gl_PointSize = highlightSize;
   v_pointSize = highlightSize;
 
-  // Discard if not highlighted (alpha channel stores highlight state)
+  // Reject unhighlighted points before rasterisation — see HP_VS_FULL. Zeroing
+  // the size alone does not hide anything: the driver clamps it back to one
+  // pixel, so the point is still assembled, rasterised and shaded.
+  //
+  // Two facts elsewhere used to make that harmless, and this shader relies on
+  // neither. Both producers pack only points at or above MIN_VISIBLE_ALPHA_BYTE
+  // — 3/255 = 0.0118, above this 0.01 threshold — so nothing can reach this
+  // branch today (highlight-renderer.js, and the figure-export path in
+  // app/ui/modules/figure-export/utils/webgl-point-rasterizer.js); and both draw
+  // sites run depthMask(false). A producer that stops compacting, or a pass that
+  // starts writing depth, is then a change to those files and not to this one.
   if (a_color.a < 0.01) {
     gl_PointSize = 0.0;
+    gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
   }
 
   v_alpha = a_color.a;
@@ -794,55 +646,3 @@ void main() {
   discard;
 }
 `;
-
-/**
- * Alternative highlight shader with pulsing glow effect
- */
-export const HP_FS_HIGHLIGHT_GLOW = `#version 300 es
-precision highp float;
-
-in float v_alpha;
-
-uniform vec3 u_highlightColor;
-uniform float u_time;
-
-out vec4 fragColor;
-
-void main() {
-  if (v_alpha < 0.01) discard;
-
-  vec2 coord = gl_PointCoord * 2.0 - 1.0;
-  float r = length(coord);
-
-  if (r > 1.0) discard;
-
-  // Pulsing glow effect
-  float pulse = 0.7 + 0.3 * sin(u_time * 3.0);
-
-  // Outer ring
-  float ring = smoothstep(0.7, 0.85, r) * smoothstep(1.0, 0.9, r);
-
-  // Inner glow (subtle fill)
-  float innerGlow = (1.0 - r) * 0.15;
-
-  float alpha = (ring + innerGlow) * pulse * v_alpha;
-
-  fragColor = vec4(u_highlightColor, alpha);
-}
-`;
-
-export default {
-  HP_VS_FULL,
-  HP_FS_FULL,
-  HP_VS_LIGHT,
-  HP_FS_LIGHT,
-  HP_FS_ULTRALIGHT,
-  HP_VS_LOD,
-  HP_VS_INSTANCED,
-  HP_FS_INSTANCED,
-  HP_VS_TEXTURE,
-  HP_VS_HIGHLIGHT,
-  HP_FS_HIGHLIGHT,
-  HP_FS_HIGHLIGHT_GLOW,
-  getShaders
-};

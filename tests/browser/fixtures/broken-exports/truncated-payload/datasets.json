@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "default": "synthetic-cell-types-2d",
+  "datasets": [
+    {
+      "id": "synthetic-cell-types-2d",
+      "path": "synthetic-cell-types-2d/",
+      "name": "Synthetic cell-type islands \u2014 2D",
+      "description": "Three synthetic 2D populations for learning categorical and continuous coloring, marker genes, filtering, highlighting, and weighted connectivity.",
+      "n_cells": 72,
+      "n_genes": 8
+    }
+  ]
+}

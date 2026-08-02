@@ -69,7 +69,7 @@ export function createExpandButton(onClick) {
   const btn = document.createElement('button');
   btn.type = 'button';
   btn.className = 'btn-small analysis-expand-btn';
-  btn.innerHTML = '⤢ Expand';
+  btn.textContent = '⤢ Expand';
   btn.title = 'Open in popup for more options';
   btn.addEventListener('click', onClick);
   return btn;

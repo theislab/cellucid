@@ -24,6 +24,14 @@ import {
   ANALYSIS_CACHE_INVENTORY_CHUNK_PROFILE
 } from './contributors/analysis-artifacts.js';
 import {
+  CURRENT_GENERIC_STATIC_CHUNK_PROFILES,
+  MAX_PUBLISHED_DEFAULT_STATE_BYTES,
+  MAX_PUBLISHED_DEFAULT_UNCOMPRESSED_BYTES,
+  PUBLISHED_DEFAULT_STATIC_CHUNK_PROFILE,
+  STATIC_CHUNK_PROFILE_KEYS,
+  assertPublishedDefaultChunkProfile
+} from './published-default.js';
+import {
   assertDatasetFingerprint,
   buildSessionContext,
   createSessionRestoreTransaction,
@@ -65,9 +73,6 @@ import {
  * @property {(ctx: any, chunkMeta: any, payload: any) => Promise<void>|void} restore
  */
 
-const MAX_PUBLISHED_DEFAULT_STATE_BYTES = 32 * 1024;
-const MAX_PUBLISHED_DEFAULT_UNCOMPRESSED_BYTES = 64 * 1024;
-
 export const SESSION_RESTORE_SUPERSEDED_CODE =
   'CELLUCID_SESSION_RESTORE_SUPERSEDED';
 export const SESSION_RESTORE_CANCELED_CODE =
@@ -97,76 +102,49 @@ export function isSessionRestoreSupersededError(error) {
   return error?.code === SESSION_RESTORE_SUPERSEDED_CODE;
 }
 
-const PUBLISHED_DEFAULT_STATIC_CHUNK_PROFILE = Object.freeze([
-  Object.freeze({
-    id: 'core/field-overlays',
-    contributorId: 'field-overlays',
-    priority: 'eager',
-    kind: 'json',
-    codec: 'gzip',
-    label: 'Field overlays',
-    datasetDependent: true
-  }),
-  Object.freeze({
-    id: 'core/state',
-    contributorId: 'core-state',
-    priority: 'eager',
-    kind: 'json',
-    codec: 'gzip',
-    label: 'Core state',
-    datasetDependent: true
-  }),
-  Object.freeze({
-    id: 'ui/dockable-layout',
-    contributorId: 'dockable-layout',
-    priority: 'eager',
-    kind: 'json',
-    codec: 'gzip',
-    label: 'Floating panels',
-    datasetDependent: false
-  }),
-  Object.freeze({
-    id: 'analysis/windows',
-    contributorId: 'analysis-windows',
-    priority: 'eager',
-    kind: 'json',
-    codec: 'gzip',
-    label: 'Analysis windows',
-    datasetDependent: true
-  }),
-  Object.freeze({
-    id: 'highlights/meta',
-    contributorId: 'highlights-meta',
-    priority: 'eager',
-    kind: 'json',
-    codec: 'gzip',
-    label: 'Highlight metadata',
-    datasetDependent: true
-  })
-]);
-const CINEMATIC_CAMERA_CHUNK_PROFILE = Object.freeze({
-  id: 'cinematic/camera',
-  contributorId: 'cinematic-camera',
-  priority: 'eager',
-  kind: 'json',
-  codec: 'gzip',
-  label: 'Cinematic camera path',
-  datasetDependent: true
-});
-const CURRENT_GENERIC_STATIC_CHUNK_PROFILES = Object.freeze([
-  ...PUBLISHED_DEFAULT_STATIC_CHUNK_PROFILE,
-  ANALYSIS_CACHE_INVENTORY_CHUNK_PROFILE,
-  CINEMATIC_CAMERA_CHUNK_PROFILE
-]);
-const STATIC_CHUNK_PROFILE_KEYS = Object.freeze([
-  'id',
-  'contributorId',
-  'priority',
-  'kind',
-  'codec',
-  'label',
-  'datasetDependent'
-]);
+/**
+ * Marks a restore failure that has already been shown to the user.
+ *
+ * A restore owns a "Loading session" progress notification, and failing that
+ * notification is how the failure reaches the screen. The same error is then
+ * rethrown so the caller can roll its own state back — and a caller that also
+ * reports it publishes the identical sentence a second time. Users saw the
+ * message twice, once as "Loading session: <message>" and once bare.
+ *
+ * This was invisible while the two copies had different lifetimes: one expired
+ * before the other, so the duplicate looked like a flicker rather than a defect
+ * (CEL-0220).
+ */
+const SESSION_RESTORE_REPORTED = Symbol.for(
+  'cellucid.sessionRestoreFailureReported'
+);
+
+function markSessionRestoreReported(error) {
+  if (error instanceof Error) {
+    Object.defineProperty(error, SESSION_RESTORE_REPORTED, {
+      configurable: true,
+      enumerable: false,
+      value: true,
+      writable: false
+    });
+  }
+  return error;
+}
+
+/**
+ * Whether this failure has already been published to the user by the restore
+ * that produced it, so a caller must not announce it again.
+ *
+ * @param {unknown} error
+ * @returns {boolean}
+ */
+export function isSessionRestoreReportedError(error) {
+  return (
+    error instanceof Error &&
+    error[SESSION_RESTORE_REPORTED] === true
+  );
+}
+
 const BUILT_IN_STATIC_CHUNK_PROFILES = Object.freeze([
   ...CURRENT_GENERIC_STATIC_CHUNK_PROFILES
 ]);
@@ -462,63 +440,19 @@ function validateManifest(manifest, contributorById, manifestProfile) {
  * @param {any} manifest
  */
 function validatePublishedDefaultManifest(manifest) {
-  if (
-    manifest === null
-    || typeof manifest !== 'object'
-    || !Array.isArray(manifest.chunks)
-  ) {
+  if (manifest === null || typeof manifest !== 'object') {
     throw new TypeError(
       'Published default session must match the exact static profile.'
     );
   }
 
-  for (const entry of manifest.chunks) {
-    if (
-      entry !== null
-      && typeof entry === 'object'
-      && (
-        (
-          typeof entry.id === 'string'
-          && entry.id.startsWith('cinematic/')
-        )
-        || entry.contributorId === 'cinematic-camera'
-      )
-    ) {
-      throw new TypeError(
-        'Published default session must not contain cinematic camera data.'
-      );
-    }
-  }
-
-  if (
-    manifest.chunks.length
-    !== PUBLISHED_DEFAULT_STATIC_CHUNK_PROFILE.length
-  ) {
-    throw new TypeError(
-      'Published default session must match the exact static profile.'
-    );
-  }
+  // Which chunks are accepted, and in what order, is decided by
+  // `published-default.js` — the same function the publish step runs, so the
+  // rule the reader enforces and the rule the publisher obeys cannot drift.
+  assertPublishedDefaultChunkProfile(manifest.chunks);
 
   let aggregateUncompressedBytes = 0;
-  for (
-    let index = 0;
-    index < PUBLISHED_DEFAULT_STATIC_CHUNK_PROFILE.length;
-    index++
-  ) {
-    const actual = manifest.chunks[index];
-    const expected = PUBLISHED_DEFAULT_STATIC_CHUNK_PROFILE[index];
-    if (actual === null || typeof actual !== 'object') {
-      throw new TypeError(
-        'Published default session must match the exact static profile.'
-      );
-    }
-    for (const key of STATIC_CHUNK_PROFILE_KEYS) {
-      if (actual[key] !== expected[key]) {
-        throw new TypeError(
-          'Published default session must match the exact static profile.'
-        );
-      }
-    }
+  for (const actual of manifest.chunks) {
     const uncompressedBytes = assertSafeInteger(
       actual.uncompressedBytes,
       `Published default chunk "${actual.id}" uncompressedBytes`,
@@ -1449,8 +1383,10 @@ export class SessionSerializer {
               downloadId,
               'Session restore canceled.'
             );
+            markSessionRestoreReported(err);
           } else {
             notifications.failDownload(downloadId, failureMessage(err));
+            markSessionRestoreReported(err);
           }
         }
         throw err;
@@ -1712,8 +1648,10 @@ export class SessionSerializer {
         notifications.dismissDownload(downloadId);
       } else if (isAbortFailure) {
         notifications.failDownload(downloadId, 'Session restore canceled.');
+        markSessionRestoreReported(err);
       } else {
         notifications.failDownload(downloadId, failureMessage(err));
+        markSessionRestoreReported(err);
       }
       throw err;
     }

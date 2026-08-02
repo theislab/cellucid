@@ -4,10 +4,15 @@ import { createServer } from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import {
+  BROWSER_TEST_PORT_VARIABLE,
+  BROWSER_TEST_SAMPLE_PORT_VARIABLE,
+  describePortInUse,
+  resolveBrowserTestPorts,
+} from './browser-test-ports.mjs';
+
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const host = '127.0.0.1';
-const port = 4173;
-const samplePort = 4174;
+const { host, port, samplePort } = resolveBrowserTestPorts();
 const inventory = JSON.parse(
   await readFile(
     path.join(repositoryRoot, 'cellucid-web-assets.json'),
@@ -163,14 +168,34 @@ async function serve(request, response) {
 const server = createServer(serve);
 const sampleServer = createServer(serve);
 
+function reportListenFailure(error, role, listenPort, variable) {
+  if (error.code === 'EADDRINUSE') {
+    process.stderr.write(`${describePortInUse(role, listenPort, variable)}\n`);
+  } else {
+    process.stderr.write(
+      `Browser-test ${role} server cannot bind ${host}:${listenPort}: ` +
+        `${error.stack || error}\n`
+    );
+  }
+  // Exit rather than close(): the peer server may already be listening, and a
+  // half-bound pair would leave the run waiting for an address that will never
+  // answer.
+  process.exit(1);
+}
+
 server.on('error', error => {
-  throw error;
+  reportListenFailure(error, 'application', port, BROWSER_TEST_PORT_VARIABLE);
 });
 server.listen(port, host, () => {
   process.stdout.write(`Browser-test server listening on http://${host}:${port}\n`);
 });
 sampleServer.on('error', error => {
-  throw error;
+  reportListenFailure(
+    error,
+    'CORS sample',
+    samplePort,
+    BROWSER_TEST_SAMPLE_PORT_VARIABLE
+  );
 });
 sampleServer.listen(samplePort, host, () => {
   process.stdout.write(
@@ -186,6 +211,9 @@ function shutdown() {
         process.exitCode = 1;
       }
     });
+    // close() alone only stops new connections; a browser holding a keep-alive
+    // socket would keep the event loop -- and the run's teardown -- waiting.
+    activeServer.closeAllConnections();
   }
 }
 

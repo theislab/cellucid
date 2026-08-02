@@ -22,23 +22,27 @@ import {
   CONNECTIVITY_MANIFEST_CONTEXT,
   validateConnectivityManifest,
 } from './connectivity-manifest-contract.js';
+import {
+  getMetadataLoadSignal,
+  throwIfMetadataAborted,
+  waitForMetadata,
+} from './metadata-load-contract.js';
+import {
+  categoricalStorageForCount,
+  requireCategoricalCategoryCount,
+} from './categorical-storage-contract.js';
 
-const MAX_CELLUCID_CATEGORIES = 65_535;
+const CONNECTIVITY_EDGE_LABEL = 'Direct AnnData connectivity edge loading';
 const DEFAULT_MAX_MATERIALIZED_BYTES = 512 * 1024 * 1024;
 const JS_ARRAY_ELEMENT_BYTES = 8n;
 const ESTIMATED_JS_STRING_VALUE_BYTES = 64n;
 const ESTIMATED_JS_SET_ENTRY_BYTES = 48n;
 
 function validateCellucidCategoryCount(nCategories, fieldKey) {
-  if (nCategories > MAX_CELLUCID_CATEGORIES) {
-    throw new Error(
-      `Categorical observation field "${fieldKey}" has ` +
-      `${nCategories.toLocaleString('en-US')} categories, but Cellucid supports ` +
-      `at most ${MAX_CELLUCID_CATEGORIES.toLocaleString('en-US')}. ` +
-      'Reduce or merge categories before loading the dataset.'
-    );
-  }
-  return nCategories;
+  return requireCategoricalCategoryCount(
+    nCategories,
+    `Categorical observation field "${fieldKey}"`
+  );
 }
 
 function validateCellucidCategories(categories, fieldKey) {
@@ -125,19 +129,71 @@ function estimateCategoryRetainedBytes(categories) {
 }
 
 function getCellucidCategoryStorage(categories, fieldKey) {
-  const nCategories = validateCellucidCategories(categories, fieldKey);
-  if (nCategories > 255) {
-    return {
-      TypedArrayClass: Uint16Array,
-      dtype: 'uint16',
-      missingValue: 65_535
+  return categoricalStorageForCount(
+    validateCellucidCategories(categories, fieldKey),
+    `Categorical observation field "${fieldKey}"`
+  );
+}
+
+/**
+ * One cancellation owner shared by the callers of a coalesced computation.
+ *
+ * Coalesced callers run a single computation, so no individual caller may
+ * cancel it. The shared work observes a child signal that is aborted only once
+ * every caller that joined it has cancelled: one caller walking away can never
+ * strand another, and a request nobody is waiting for can never keep running.
+ */
+class CoalescedCancellationOwner {
+  constructor() {
+    this._controller = new AbortController();
+    this._abandoned = 0;
+    this._joined = 0;
+    this._uncancellable = 0;
+  }
+
+  /** @returns {boolean} */
+  get cancelled() {
+    return this._controller.signal.aborted;
+  }
+
+  /** @returns {AbortSignal} */
+  get signal() {
+    return this._controller.signal;
+  }
+
+  /**
+   * Attach one caller to the shared work.
+   *
+   * @param {AbortSignal|null} callerSignal - Exact owner signal or no owner
+   * @returns {() => void} Detach the caller once its result has settled
+   */
+  join(callerSignal) {
+    this._joined++;
+    if (callerSignal === null) {
+      // A caller without an owner signal can never abandon the work, so the
+      // shared computation stays uncancellable while it is attached.
+      this._uncancellable++;
+      return () => {};
+    }
+
+    let counted = false;
+    const onAbort = () => {
+      if (counted) return;
+      counted = true;
+      this._abandoned++;
+      if (
+        this._uncancellable === 0 &&
+        this._abandoned >= this._joined
+      ) {
+        this._controller.abort();
+      }
+    };
+    callerSignal.addEventListener('abort', onAbort, { once: true });
+    if (callerSignal.aborted) onAbort();
+    return () => {
+      callerSignal.removeEventListener('abort', onAbort);
     };
   }
-  return {
-    TypedArrayClass: Uint8Array,
-    dtype: 'uint8',
-    missingValue: 255
-  };
 }
 
 /**
@@ -271,30 +327,56 @@ export class BaseAnnDataAdapter {
    * stale registry immediately. A later caller may install a new promise for
    * the same key before the earlier promise settles.
    *
-   * @param {Map<any, Promise<any>>} registry
+   * The operation receives the shared cancellation signal of its callers so a
+   * cancelled request stops its work instead of only stopping its wait. A
+   * cancelled entry is never joined by a later caller: that caller starts a
+   * fresh computation, so cancelling one request can never poison the next.
+   *
+   * @param {Map<any, {cancellation: CoalescedCancellationOwner, promise: Promise<any>}>} registry
    * @param {any} key
    * @param {number} generation
-   * @param {() => Promise<any>|any} operation
+   * @param {(workSignal: AbortSignal) => Promise<any>|any} operation
+   * @param {AbortSignal|null} [callerSignal] - Exact owner signal or no owner
    * @returns {Promise<any>}
    * @private
    */
-  _coalesceInFlight(registry, key, generation, operation) {
+  _coalesceInFlight(
+    registry,
+    key,
+    generation,
+    operation,
+    callerSignal = null
+  ) {
     const existing = registry.get(key);
-    if (existing) return existing;
+    let entry = existing;
+    if (!entry || entry.cancellation.cancelled) {
+      const cancellation = new CoalescedCancellationOwner();
+      const pending = Promise.resolve().then(() => {
+        this._assertLifecycleGeneration(generation);
+        return operation(cancellation.signal);
+      });
+      entry = { cancellation, promise: pending };
+      registry.set(key, entry);
 
-    const pending = Promise.resolve().then(() => {
-      this._assertLifecycleGeneration(generation);
-      return operation();
-    });
-    registry.set(key, pending);
+      const removeSettled = () => {
+        if (registry.get(key) === entry) {
+          registry.delete(key);
+        }
+      };
+      pending.then(removeSettled, removeSettled);
+    }
 
-    const removeSettled = () => {
-      if (registry.get(key) === pending) {
-        registry.delete(key);
+    const release = entry.cancellation.join(callerSignal);
+    return entry.promise.then(
+      result => {
+        release();
+        return result;
+      },
+      error => {
+        release();
+        throw error;
       }
-    };
-    pending.then(removeSettled, removeSettled);
-    return pending;
+    );
   }
 
   /**
@@ -1636,12 +1718,6 @@ export class BaseAnnDataAdapter {
         files: embeddingFiles,
       },
       obs_fields: obsFields,
-      export_settings: {
-        compression: null,
-        var_quantization: null,
-        obs_continuous_quantization: null,
-        obs_categorical_dtype: 'auto',
-      },
       source: { ...source },
       ...(vectorFields ? { vector_fields: vectorFields } : {}),
     };
@@ -2231,82 +2307,106 @@ export class BaseAnnDataAdapter {
 
   /**
    * Get connectivity edges
+   *
+   * Edge extraction is the most expensive read this adapter performs, so it
+   * observes its caller's cancellation at every asynchronous boundary: a
+   * cancelled request is released immediately and its extraction never starts,
+   * leaving no partial payload and no retained working set behind.
+   *
+   * @param {{signal?: AbortSignal|null}} [options]
    * @returns {Promise<{sources: Uint32Array, destinations: Uint32Array, weights: Float64Array, nEdges: number}|null>}
    */
-  async getConnectivityEdges() {
+  async getConnectivityEdges(options = {}) {
+    const signal = getMetadataLoadSignal(
+      options,
+      'Direct AnnData connectivity edges'
+    );
+    throwIfMetadataAborted(signal, CONNECTIVITY_EDGE_LABEL);
     const generation = this._captureLifecycleGeneration();
     // Check if already computed.
     if (this._connectivityCache !== undefined) {
       const cached = this._connectivityCache;
       await Promise.resolve();
       this._assertLifecycleGeneration(generation);
+      throwIfMetadataAborted(signal, CONNECTIVITY_EDGE_LABEL);
       return cached;
     }
 
-    return this._coalesceInFlight(
-      this._connectivityInFlight,
-      'edges',
-      generation,
-      async () => {
-        if (this._connectivityCache !== undefined) {
-          this._assertLifecycleGeneration(generation);
-          return this._connectivityCache;
-        }
+    return waitForMetadata(
+      this._coalesceInFlight(
+        this._connectivityInFlight,
+        'edges',
+        generation,
+        async workSignal => {
+          if (this._connectivityCache !== undefined) {
+            this._assertLifecycleGeneration(generation);
+            return this._connectivityCache;
+          }
+          throwIfMetadataAborted(workSignal, CONNECTIVITY_EDGE_LABEL);
 
-        console.log(
-          '[BaseAnnDataAdapter] Loading connectivity edges...'
-        );
-
-        const conn = await this._loader.getConnectivities();
-        this._assertLifecycleGeneration(generation);
-
-        if (conn === null) {
           console.log(
-            '[BaseAnnDataAdapter] No connectivity data available'
+            '[BaseAnnDataAdapter] Loading connectivity edges...'
           );
-          this._connectivityCache = null;
-          return null;
-        }
-        if (
-          !conn ||
-          typeof conn !== 'object' ||
-          Array.isArray(conn)
-        ) {
-          throw new TypeError(
-            'Connectivity loader must return an exact null absence or one matrix object'
+
+          const conn = await this._loader.getConnectivities();
+          this._assertLifecycleGeneration(generation);
+          // The only asynchronous boundary before extraction: past this point
+          // the matrix is walked and the edge payloads are allocated, so a
+          // cancelled request releases the loader payload here instead of
+          // materializing a graph nobody is waiting for.
+          throwIfMetadataAborted(workSignal, CONNECTIVITY_EDGE_LABEL);
+
+          if (conn === null) {
+            console.log(
+              '[BaseAnnDataAdapter] No connectivity data available'
+            );
+            this._connectivityCache = null;
+            return null;
+          }
+          if (
+            !conn ||
+            typeof conn !== 'object' ||
+            Array.isArray(conn)
+          ) {
+            throw new TypeError(
+              'Connectivity loader must return an exact null absence or one matrix object'
+            );
+          }
+
+          const isDense = conn.format === 'dense';
+
+          const storedEntries =
+            isDense ? conn.data?.length : conn.indices.length;
+          console.log(
+            `[BaseAnnDataAdapter] Connectivity matrix: ` +
+            `${conn.shape?.[0] || 'unknown'}x` +
+            `${conn.shape?.[1] || 'unknown'}, ` +
+            `${storedEntries ?? 'unknown'} stored values`
           );
-        }
 
-        const isDense = conn.format === 'dense';
+          // Use shared utility for edge extraction.
+          const edges =
+            extractConnectivityEdges(conn, this._loader.nObs);
 
-        const storedEntries =
-          isDense ? conn.data?.length : conn.indices.length;
-        console.log(
-          `[BaseAnnDataAdapter] Connectivity matrix: ` +
-          `${conn.shape?.[0] || 'unknown'}x` +
-          `${conn.shape?.[1] || 'unknown'}, ` +
-          `${storedEntries ?? 'unknown'} stored values`
-        );
+          console.log(
+            `[BaseAnnDataAdapter] Extracted ${edges.nEdges} unique edges`
+          );
 
-        // Use shared utility for edge extraction.
-        const edges =
-          extractConnectivityEdges(conn, this._loader.nObs);
+          this._connectivityCache = {
+            sources: edges.sources,
+            destinations: edges.destinations,
+            weights: edges.weights,
+            nCells: edges.nCells,
+            nEdges: edges.nEdges,
+            maxNeighbors: edges.maxNeighbors,
+          };
 
-        console.log(
-          `[BaseAnnDataAdapter] Extracted ${edges.nEdges} unique edges`
-        );
-
-        this._connectivityCache = {
-          sources: edges.sources,
-          destinations: edges.destinations,
-          weights: edges.weights,
-          nCells: edges.nCells,
-          nEdges: edges.nEdges,
-          maxNeighbors: edges.maxNeighbors,
-        };
-
-        return this._connectivityCache;
-      }
+          return this._connectivityCache;
+        },
+        signal
+      ),
+      signal,
+      CONNECTIVITY_EDGE_LABEL
     );
   }
 

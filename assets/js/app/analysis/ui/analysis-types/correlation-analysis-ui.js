@@ -19,6 +19,7 @@ import {
 import { correlationResultsToCSV, downloadCSV } from '../../shared/analysis-utils.js';
 import { createVariableSelectorComponent } from '../shared/variable-selector.js';
 import { PageSelectorComponent } from '../shared/page-selector.js';
+import { applyFormControlAccessibility } from '../components/control-accessibility.js';
 import { isFiniteNumber } from '../../shared/number-utils.js';
 
 function requireCorrelationVariable(variable, label) {
@@ -248,9 +249,7 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
       if (result) {
         await this._showResult(result, requestId);
         if (!this._isCurrentAnalysisRequest(requestId)) return;
-        this._lastResult = result;
-        this._currentPageData = result.data || result;
-        this._requestedPlotOptions = structuredClone(result.options || {});
+        await this._publishAnalysisResult(result, requestId);
       }
     } catch (err) {
       if (!this._isCurrentAnalysisRequest(requestId)) return;
@@ -320,6 +319,9 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
    * @override
    */
   _renderControls() {
+    // Rebuilding the form on every accordion reopen must not discard the
+    // choices already made in it.
+    const carriedValues = this._captureFormControlValues();
     this._formContainer.innerHTML = '';
 
     // Validate page requirements
@@ -339,6 +341,12 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
 
     // Render form controls
     this._renderFormControls(wrapper);
+
+    // Same form-control accessibility pass the base class runs: scoped ids and
+    // a label bound to every control. Overriding _renderControls to drop the
+    // run button must not also drop that.
+    applyFormControlAccessibility(wrapper, this._controlScope);
+    this._restoreFormControlValues(wrapper, carriedValues);
 
     this._formContainer.appendChild(wrapper);
 
@@ -637,7 +645,7 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
       result,
       requestId,
       containerId: this._plotContainerIdBase,
-      clickable: true
+      expandable: true
     });
   }
 

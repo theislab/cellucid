@@ -113,6 +113,7 @@ const META_VIEW_KEYS = Object.freeze([
 ]);
 const NORM_TRANSFORM_KEYS = Object.freeze(['center', 'scale']);
 const RENDER_STATE_KEYS = Object.freeze([
+  'antialias',
   'bgColor',
   'cameraDistance',
   'cameraPosition',
@@ -592,6 +593,13 @@ function assertRenderState(renderState, context) {
   }
   assertInteger(renderState.viewportWidth, `${context}.viewportWidth`, 1);
   assertInteger(renderState.viewportHeight, `${context}.viewportHeight`, 1);
+  // Multisampling is a property of the drawing buffer the user is looking at,
+  // published by `viewer.getGrantedAntialiasing()`. It travels with the render
+  // state because a raster that does not honour it is a different picture of
+  // the same data — see `utils/webgl-point-rasterizer.js`.
+  if (typeof renderState.antialias !== 'boolean') {
+    throw new TypeError(`${context}.antialias must be an exact boolean.`);
+  }
   if (!SHADER_QUALITIES.has(renderState.shaderQuality)) {
     throw new TypeError(`${context}.shaderQuality is not a current shader quality.`);
   }

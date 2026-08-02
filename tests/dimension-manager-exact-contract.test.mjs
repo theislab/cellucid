@@ -133,3 +133,79 @@ test('per-view dimension lookup requires an explicitly published view', () => {
   );
   assert.equal(manager.viewDimensions.size, 0);
 });
+
+test('the cell axis is published through one validating seam', () => {
+  const manager = new DimensionManager({ embeddingsMetadata: metadata('a.bin') });
+
+  // Nothing is known before an identity states it or an embedding teaches it,
+  // and that zero is what leaves the first payload ceiling-bounded.
+  assert.equal(manager.getCellCount(), 0);
+
+  // `stats.n_cells` reaching the manager as a raw property write is how a
+  // wrong axis becomes a wrong byte bound. Every non-count is refused instead.
+  for (const rejected of [
+    0, -1, 1.5, NaN, Infinity, -Infinity,
+    Number.MAX_SAFE_INTEGER + 2,
+    '120', null, undefined, true, [120], { n_cells: 120 },
+  ]) {
+    assert.throws(
+      () => manager.publishCellCount(rejected),
+      /positive safe integer/,
+      `publishing ${String(rejected)} must be refused`
+    );
+    assert.equal(manager.getCellCount(), 0, 'a refused axis must not be stored');
+  }
+
+  assert.equal(manager.publishCellCount(120), 120);
+  assert.equal(manager.getCellCount(), 120);
+  // Republishing the same axis is the idempotent case, not a conflict.
+  assert.equal(manager.publishCellCount(120), 120);
+
+  // A second dataset's axis must not overwrite the first one's silently.
+  assert.throws(
+    () => manager.publishCellCount(121),
+    /already 120/
+  );
+  assert.equal(manager.getCellCount(), 120);
+
+  // Clearing is the documented way to reuse a manager, and it restores both
+  // the axis and the right to publish one.
+  manager.clearCache();
+  assert.equal(manager.getCellCount(), 0);
+  assert.equal(manager.publishCellCount(7), 7);
+});
+
+test('publishing the cell axis before the metadata is refused, not discarded', () => {
+  // `initFromMetadata` clears the cache and a cache clear zeroes the axis, so
+  // publishing first used to be silently dropped and left the first embedding
+  // bounded only by the browser byte ceiling. The owning module now refuses
+  // the order instead of relying on each construction site to remember it.
+  const manager = new DimensionManager();
+  manager.publishCellCount(120);
+  assert.throws(
+    () => manager.initFromMetadata(metadata('a.bin')),
+    /must be installed before the cell axis is published/
+  );
+  assert.equal(manager.getCellCount(), 120, 'the refused call must not clear');
+
+  // The correct order is unaffected.
+  const ordered = new DimensionManager();
+  ordered.initFromMetadata(metadata('a.bin'));
+  ordered.publishCellCount(120);
+  assert.equal(ordered.getCellCount(), 120);
+  assert.deepEqual(ordered.availableDimensions, [2]);
+
+  // A construction site that supplies metadata up front is already past the
+  // hazard, so it may publish immediately.
+  const constructed = new DimensionManager({
+    embeddingsMetadata: metadata('a.bin'),
+  });
+  assert.equal(constructed.publishCellCount(120), 120);
+
+  // An axis learned from a decoded payload is downstream of the metadata and
+  // does not pin the ordering.
+  const learned = new DimensionManager({ embeddingsMetadata: metadata('a.bin') });
+  learned.nCells = 120;
+  assert.equal(learned.initFromMetadata(metadata('b.bin', 3)), undefined);
+  assert.equal(learned.getCellCount(), 0);
+});

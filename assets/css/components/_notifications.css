@@ -101,6 +101,12 @@
   line-height: 1.4;
   color: var(--color-text-primary);
   word-break: break-word;
+  /* Messages are written as several sentences, and two are a key/value list
+     built with `bits.join('\n')`. The escaping on the way in leaves `\n`
+     alone, so the break arrives here intact; without this it is folded into a
+     space and the sentences run together. `pre-line` honours the break and
+     still collapses the ordinary whitespace of concatenated source. */
+  white-space: pre-line;
 }
 
 /* Type-specific styles - newspaper-inspired visual distinction */

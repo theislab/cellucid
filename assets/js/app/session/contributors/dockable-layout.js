@@ -63,17 +63,43 @@ function assertPanelId(value, context) {
   return assertNonEmptyString(value, `${context} stable nonempty DOM id`);
 }
 
-function readPanelRect(details, context) {
-  requireMethod(details, 'getBoundingClientRect', context);
-  const domRect = details.getBoundingClientRect();
-  if (domRect === null || typeof domRect !== 'object') {
-    throw new TypeError(`${context} must return a DOMRect.`);
+/** `--pos-*` is written by `StyleManager.setPosition()` as a bare pixel length. */
+const PANEL_LENGTH_PATTERN = /^(-?(?:\d+(?:\.\d+)?|\.\d+))px$/;
+
+function readPanelLength(details, property, context) {
+  const raw = StyleManager.getVariable(details, property);
+  if (typeof raw !== 'string') {
+    throw new TypeError(`${context} must be an exact pixel length.`);
   }
+  const match = PANEL_LENGTH_PATTERN.exec(raw.trim());
+  if (match === null) {
+    throw new TypeError(`${context} must be an exact pixel length.`);
+  }
+  return assertFiniteNumber(Number(match[1]), context);
+}
+
+/**
+ * The geometry the panel *has*, which is not always the geometry it shows.
+ *
+ * A floating panel's box is `--pos-x/y/width/height`, set by the dockable owner
+ * and read back here. `getBoundingClientRect()` reports what the stylesheet
+ * finally drew, and the stylesheet overrides that box in two places: a
+ * collapsed panel is forced to `height: auto` and a panel wider than the window
+ * is capped by `max-width` (`css/components/_accordion.css`). Measuring
+ * therefore saved the header height of a collapsed panel, and restoring floated
+ * it back at the 100px floor — so collapsing a panel before saving silently
+ * threw away the size it would reopen at, and every save/restore cycle on a
+ * narrow window ratcheted a wide panel narrower.
+ *
+ * @param {HTMLDetailsElement} details
+ * @param {string} context
+ */
+function readPanelRect(details, context) {
   const rect = {
-    left: assertFiniteNumber(domRect.left, `${context} left`),
-    top: assertFiniteNumber(domRect.top, `${context} top`),
-    width: assertFiniteNumber(domRect.width, `${context} width`),
-    height: assertFiniteNumber(domRect.height, `${context} height`)
+    left: readPanelLength(details, '--pos-x', `${context} left`),
+    top: readPanelLength(details, '--pos-y', `${context} top`),
+    width: readPanelLength(details, '--pos-width', `${context} width`),
+    height: readPanelLength(details, '--pos-height', `${context} height`)
   };
   if (rect.width <= 0 || rect.height <= 0) {
     throw new RangeError(`${context} width and height must be positive.`);

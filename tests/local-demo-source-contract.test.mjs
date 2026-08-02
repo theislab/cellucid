@@ -687,7 +687,7 @@ test('optional identity metadata is preserved only when valid', async t => {
       compression: 6,
       var_quantization: 8,
       obs_continuous_quantization: null,
-      obs_categorical_dtype: 'auto',
+      obs_categorical_dtype: 'uint8',
     };
     value.source = {
       name: 'Public source',
@@ -819,6 +819,82 @@ test('valid current demo catalog exposes exact metadata and default', async t =>
   assert.equal(Object.hasOwn(firstMetadata, 'created_at'), false);
   assert.equal(Object.hasOwn(firstMetadata, 'export_settings'), false);
   assert.equal(Object.hasOwn(firstMetadata, 'source'), false);
+});
+
+test('demo catalog identities are read as one batch, not one round trip each', async t => {
+  const originalFetch = globalThis.fetch;
+  const identityUrls = [];
+  const gates = [];
+  globalThis.fetch = async input => {
+    const url = String(input);
+    if (url.endsWith('/datasets.json')) {
+      return new Response(JSON.stringify(manifest()), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+    identityUrls.push(url);
+    const id = url.includes('/first/') ? 'first' : 'second';
+    const gate = deferred();
+    gates.push(() => gate.resolve(
+      new Response(
+        JSON.stringify(identity(id, `${id} identity`, 3)),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      )
+    ));
+    return gate.promise;
+  };
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const source = new LocalDemoDataSource(
+    'https://catalog.cellucid.test/exports/'
+  );
+  const listing = source.listDatasets();
+  // Drain the microtask queue without advancing any clock: whatever requests a
+  // batched reader intends to issue are all in flight by now. A reader that
+  // awaits one identity before requesting the next would have issued exactly
+  // one, and this assertion is what fails if that regresses.
+  for (let turn = 0; turn < 64; turn += 1) {
+    await Promise.resolve();
+  }
+  assert.deepEqual(identityUrls, [
+    'https://catalog.cellucid.test/exports/first/dataset_identity.json',
+    'https://catalog.cellucid.test/exports/second/dataset_identity.json',
+  ]);
+
+  for (const release of gates) release();
+  assert.deepEqual(
+    (await listing).map(dataset => dataset.id),
+    ['first', 'second']
+  );
+});
+
+test('a failed demo identity still names its own dataset and adopts nothing', async t => {
+  const source = sourceWithManifest(manifest());
+  installIdentityFetch(t, new Map([
+    [
+      'https://catalog.cellucid.test/exports/first/dataset_identity.json',
+      identity('first', 'First identity', 3),
+    ],
+  ]));
+
+  await assert.rejects(
+    source.listDatasets(),
+    error => (
+      error.code === 'INVALID_FORMAT' &&
+      error.details?.datasetId === 'second' &&
+      /^Dataset 'second' is invalid: /.test(error.message)
+    )
+  );
+  assert.equal(source._datasets, null);
+  // The cached failure is the same exact error, so a second listing repeats the
+  // diagnosis instead of degrading it to a bare empty catalog.
+  await assert.rejects(
+    source.listDatasets(),
+    error => error.details?.datasetId === 'second'
+  );
 });
 
 test('refresh aborts a stale sample metadata generation before it can refill caches', async t => {

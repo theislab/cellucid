@@ -436,7 +436,15 @@ export const viewContextCoreMethods = {
 
     this.activeViewId = key;
     if (this.viewer && typeof this.viewer.setViewLayout === 'function') {
-      this.viewer.setViewLayout('grid', this.activeViewId);
+      // Only the focus is ours to change. The layout mode belongs to the
+      // viewer, so it is read back rather than asserted: forcing "grid" here
+      // silently overrode the mode a restore had just set one line earlier,
+      // and a session saved in "single" reached the viewer as a grid until a
+      // later refresh happened to correct it.
+      const currentMode = typeof this.viewer.getViewLayout === 'function'
+        ? this.viewer.getViewLayout().mode
+        : 'grid';
+      this.viewer.setViewLayout(currentMode, this.activeViewId);
     }
     this.obsData = this._cloneObsData(ctx.obsData);
     this.varData = this._cloneVarData(ctx.varData);

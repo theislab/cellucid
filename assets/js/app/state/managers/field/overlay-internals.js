@@ -251,11 +251,10 @@ export class FieldOverlayInternalMethods {
       }
 
       const displayCategories = originalCategories.map(
-        (originalLabel, categoryIndex) => {
+        (originalLabel) => {
           const displayLabel = this._renameRegistry.getDisplayCategory(
             source,
             originalKey,
-            categoryIndex,
             originalLabel
           );
           StateValidator.validateCategoryLabel(displayLabel);

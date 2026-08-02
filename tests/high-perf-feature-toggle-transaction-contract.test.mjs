@@ -7,7 +7,6 @@ import {
 } from '../assets/js/rendering/high-perf-renderer.js';
 import {
   BottleneckAnalyzer,
-  HighPerfBenchmark,
 } from '../assets/js/dev/benchmark.js';
 
 function makeViewState() {
@@ -456,15 +455,18 @@ test('bottleneck CPU phase analysis restores exact public renderer state after f
   assert.equal(renderer.useFrustumCulling, false);
   assert.equal(renderer.activeQuality, 'light');
   assert.equal(renderer.forceLODLevel, 2);
-  assert.deepEqual(calls.slice(-4), [
+  // Quality is absent from the restore list because the analysis never changes
+  // it (CEL-0235); restoring something untouched would be dead code that hides
+  // a future arm reintroducing the perturbation.
+  assert.deepEqual(calls.slice(-3), [
     ['lod', true],
     ['force', 2],
     ['frustum', false],
-    ['quality', 'light'],
   ]);
+  assert.ok(!calls.some(([name]) => name === 'quality'));
 });
 
-test('bottleneck CPU phases measure exact shader labels and restore forced LOD after adaptive toggles', async () => {
+test('bottleneck CPU phases never disturb shader quality and restore forced LOD after adaptive toggles', async () => {
   const calls = [];
   const samples = [];
   const renderer = {
@@ -507,10 +509,16 @@ test('bottleneck CPU phases measure exact shader labels and restore forced LOD a
     },
   );
 
-  await analyzer._runCPUPhaseAnalysis({ testFrames: 24 });
+  const phases = await analyzer._runCPUPhaseAnalysis({ testFrames: 24 });
 
+  // Every arm runs at the quality the user already chose. The shader-quality
+  // sweep was removed with CEL-0235: this harness times the interval between
+  // `requestAnimationFrame` callbacks, which cannot resolve a fragment-shader
+  // difference in either direction, and the three qualities measure the same
+  // on instrumentation that can. Switching quality to time it only perturbed
+  // what was on screen.
   assert.deepEqual(
-    samples.slice(0, 4),
+    samples,
     Array.from(
       { length: 4 },
       () => ({
@@ -518,93 +526,27 @@ test('bottleneck CPU phases measure exact shader labels and restore forced LOD a
         renderQuality: 'light',
       }),
     ),
-    'LOD/frustum phases must retain the original shader quality',
+    'every CPU phase arm must retain the original shader quality',
   );
-  assert.deepEqual(samples.slice(4), [
-    { activeQuality: 'ultralight', renderQuality: 'ultralight' },
-    { activeQuality: 'light', renderQuality: 'light' },
-    { activeQuality: 'full', renderQuality: 'full' },
-  ]);
+  assert.equal(
+    phases.shaderComplexity,
+    undefined,
+    'no shader-quality phase result may survive',
+  );
+  assert.equal(phases.shaderQuality, undefined);
+  assert.ok(
+    !calls.some(([name]) => name === 'quality'),
+    `setQuality must never be called; got ${JSON.stringify(calls)}`,
+  );
   assert.equal(renderer.useAdaptiveLOD, true);
   assert.equal(renderer.forceLODLevel, 3);
   assert.equal(renderer.useFrustumCulling, false);
   assert.equal(renderer.activeQuality, 'light');
-  assert.deepEqual(calls.slice(-4), [
+  assert.deepEqual(calls.slice(-3), [
     ['lod', true],
     ['force', 3],
     ['frustum', false],
-    ['quality', 'light'],
   ]);
-});
-
-test('benchmark forced LOD publication validates before mutating configuration', () => {
-  const benchmark = new HighPerfBenchmark({});
-  const calls = [];
-  benchmark.config.forceLODLevel = 1;
-  benchmark.renderer = {
-    setForceLOD(level) {
-      calls.push(level);
-      if (level === 4) {
-        throw new RangeError('synthetic unavailable LOD');
-      }
-    },
-  };
-
-  assert.throws(
-    () => benchmark.setForceLODLevel(1.5),
-    /integer/,
-  );
-  assert.throws(
-    () => benchmark.setForceLODLevel(-2),
-    /-1 or greater/,
-  );
-  assert.deepEqual(calls, []);
-  assert.equal(benchmark.config.forceLODLevel, 1);
-  assert.throws(
-    () => benchmark.setForceLODLevel(4),
-    /synthetic unavailable LOD/,
-  );
-  assert.equal(benchmark.config.forceLODLevel, 1);
-  benchmark.setForceLODLevel(2);
-  assert.equal(benchmark.config.forceLODLevel, 2);
-  assert.deepEqual(calls, [4, 2]);
-});
-
-test('benchmark shader quality validates and publishes only after renderer acceptance', () => {
-  const benchmark = new HighPerfBenchmark({});
-  const calls = [];
-  benchmark.config.shaderQuality = 'light';
-  benchmark.renderer = {
-    setQuality(quality) {
-      calls.push(quality);
-      if (quality === 'ultralight') {
-        throw new Error('synthetic unavailable shader');
-      }
-    },
-  };
-
-  for (const invalid of [
-    undefined,
-    null,
-    '',
-    'medium',
-    new String('full'),
-  ]) {
-    assert.throws(
-      () => benchmark.setShaderQuality(invalid),
-      /exactly "full", "light", or "ultralight"/,
-    );
-  }
-  assert.deepEqual(calls, []);
-  assert.equal(benchmark.config.shaderQuality, 'light');
-  assert.throws(
-    () => benchmark.setShaderQuality('ultralight'),
-    /synthetic unavailable shader/,
-  );
-  assert.equal(benchmark.config.shaderQuality, 'light');
-  benchmark.setShaderQuality('full');
-  assert.equal(benchmark.config.shaderQuality, 'full');
-  assert.deepEqual(calls, ['ultralight', 'full']);
 });
 
 test('bottleneck RAF render failure rejects and restores exact renderer state', async () => {
@@ -679,12 +621,12 @@ test('bottleneck RAF render failure rejects and restores exact renderer state', 
   assert.equal(renderer.forceLODLevel, 2);
   assert.equal(renderer.useFrustumCulling, false);
   assert.equal(renderer.activeQuality, 'light');
-  assert.deepEqual(calls.slice(-4), [
+  assert.deepEqual(calls.slice(-3), [
     ['lod', true],
     ['force', 2],
     ['frustum', false],
-    ['quality', 'light'],
   ]);
+  assert.ok(!calls.some(([name]) => name === 'quality'));
 });
 
 test('bottleneck frame sampler rejects synchronous scheduling failures', async () => {
@@ -750,40 +692,50 @@ test('bottleneck default render parameters satisfy the exact renderer contract',
 });
 
 test('renderer control source keeps UI controls coherent when synchronous preparation rejects', async () => {
-  const mainSource = await readFile(
-    new URL('../assets/js/app/main.js', import.meta.url),
+  // The renderer controls are owned by `ui/modules/render-controls`, not by the
+  // bootstrap: a session is restored by dispatching each control's own event,
+  // and their listeners have to already exist when that happens (CEL-0129).
+  const controlsSource = await readFile(
+    new URL(
+      '../assets/js/app/ui/modules/render-controls.js',
+      import.meta.url,
+    ),
     'utf8',
   );
-  const controlsStart = mainSource.indexOf(
-    '    // Frustum culling toggle',
+  const controlsStart = controlsSource.indexOf(
+    '  listen(hpFrustumCullingCheckbox,',
   );
-  const controlsEnd = mainSource.indexOf(
-    '    if (benchmarkSection)',
+  const controlsEnd = controlsSource.indexOf(
+    '\n  applyPointSizeFromSlider();\n  updateLightingStrength();',
     controlsStart,
   );
   assert.notEqual(controlsStart, -1);
   assert.notEqual(controlsEnd, -1);
-  const controls = mainSource.slice(controlsStart, controlsEnd);
+  const controls = controlsSource.slice(controlsStart, controlsEnd);
 
   assert.match(
     controls,
-    /hpFrustumCulling\.checked\s*=\s*previousEnabled/,
+    /hpFrustumCullingCheckbox\.checked\s*=\s*previousEnabled/,
   );
   assert.match(
     controls,
-    /hpLodEnabled\.checked\s*=\s*previousEnabled/,
+    /hpLodEnabledCheckbox\.checked\s*=\s*previousEnabled/,
   );
   assert.match(
     controls,
-    /hpLodForceContainer\.style\.display\s*=\s*previousForceDisplay/,
+    /hpLodForceInput\.value\s*=\s*previousForcedValue/,
+  );
+  // The forced-LOD row and its readout are derived from the value the renderer
+  // accepted rather than from a snapshot of whatever the markup happened to
+  // show, so a rollback cannot restore a state the renderer never held.
+  assert.equal(
+    (controls.match(/\n\s*syncForcedLodUi\(\);/g) ?? []).length,
+    4,
+    'every forced-LOD outcome re-derives the row and readout',
   );
   assert.match(
-    controls,
-    /hpLodForce\.value\s*=\s*previousForceValue/,
-  );
-  assert.match(
-    mainSource,
-    /notifications\.error\(/,
+    controlsSource,
+    /getNotificationCenter\(\)\.error\(/,
   );
 });
 

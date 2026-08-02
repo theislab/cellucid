@@ -219,17 +219,8 @@ export {
 // =============================================================================
 
 export {
-  ANALYSIS_SETTINGS,
-  DEFAULT_ANALYSIS_SETTINGS,
-  COMMON_PLOT_OPTIONS,
-  COLOR_PALETTES,
-  getExportScaleFactor,
-  getAxisRotation,
-  createAnalysisSettingsPanel,
-  applyAnalysisSettings,
   createVariableSelector,
   createGeneExpressionSelector,
-  createPageSelector,
   createPlotTypeSelector,
   createAnalysisModal,
   openModal,
@@ -237,11 +228,6 @@ export {
   renderPlotOptions,
   createExportToolbar,
   createExpandButton,
-  createColorPaletteSelector,
-  createAnnotationStyleSelector,
-  createExportResolutionSelector,
-  createAxisRotationSelector,
-  createCustomizationPanel,
   renderSummaryStats,
   renderStatisticalAnnotations
 } from './ui/index.js';
@@ -262,10 +248,7 @@ export {
   DEAnalysisUI,
   createDEAnalysisUI,
   GeneSignatureUI,
-  createGeneSignatureUI,
-  ANALYSIS_TYPES,
-  isAnalysisTypeAvailable,
-  getAvailableAnalysisTypes
+  createGeneSignatureUI
 } from './ui/analysis-types/index.js';
 
 // Base class for analysis UIs

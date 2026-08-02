@@ -3,6 +3,22 @@
  *
  * The registry stores *original* identifiers as keys so it can be safely applied
  * after any reload/restore, regardless of current display names.
+ *
+ * A category's original identifier is its **label**, never its position in the
+ * inventory. Position is not identity: a session's dataset fingerprint pins the
+ * cells and their coordinates, not the obs schema, so the same dataset exported
+ * again from the same embedding with one more cell type restores cleanly with
+ * every category after the insertion point shifted by one. A registry keyed by
+ * position would then move a rename onto its neighbour and colour, label, and
+ * export those cells under a name that is not theirs — silently, because
+ * nothing downstream can tell a deliberate rename from a displaced one.
+ *
+ * Both parts of a category key are attacker- and user-controlled strings that
+ * may contain the ':' separator — field keys because ATAC feature names use it,
+ * labels because a label is arbitrary text — so the key length-prefixes the
+ * field key and tags the label's primitive type. That makes the composite
+ * injective: ("a", "b:c") and ("a:b", "c") cannot collide, and the number 1
+ * cannot collide with the string "1".
  */
 
 import { makeFieldId } from '../utils/field-constants.js';
@@ -29,11 +45,40 @@ function requireRecord(value, label) {
   return value;
 }
 
+/** Primitive-type tags, so `1` and `'1'` are different category identities. */
+const LABEL_TYPE_TAG = Object.freeze({
+  string: 's',
+  number: 'n',
+  boolean: 'b'
+});
+
+/**
+ * Build the injective key naming one category of one field.
+ *
+ * @param {string} source - 'obs' | 'var'
+ * @param {string} originalFieldKey
+ * @param {string|number|boolean} originalLabel
+ * @returns {string}
+ */
+function makeCategoryId(source, originalFieldKey, originalLabel) {
+  const tag = LABEL_TYPE_TAG[typeof originalLabel];
+  if (tag === undefined) {
+    throw new TypeError(
+      'Category rename identity must be a string, finite number, or boolean'
+    );
+  }
+  return (
+    `${source}:${originalFieldKey.length}:${originalFieldKey}`
+    + `:${tag}:${String(originalLabel)}`
+  );
+}
+
 export class RenameRegistry extends BaseRegistry {
   constructor() {
     super();
     this._fieldRenames = new Map(); // 'source:originalKey' -> displayKey
-    this._categoryRenames = new Map(); // 'source:originalFieldKey:catIdx' -> label
+    // 'source:<len>:originalFieldKey:<type>:originalLabel' -> displayLabel
+    this._categoryRenames = new Map();
     // Alias the canonical map so common BaseRegistry helpers apply.
     this._data = this._fieldRenames;
   }
@@ -81,44 +126,53 @@ export class RenameRegistry extends BaseRegistry {
   // Category renames
   // ---------------------------------------------------------------------------
 
-  setCategoryRename(source, originalFieldKey, categoryIndex, displayLabel) {
+  /**
+   * @param {string} source - 'obs' | 'var'
+   * @param {string} originalFieldKey
+   * @param {string|number|boolean} originalLabel - The category's own identity.
+   * @param {string|number|boolean} displayLabel
+   */
+  setCategoryRename(source, originalFieldKey, originalLabel, displayLabel) {
     requireSource(source);
     StateValidator.validateFieldKey(originalFieldKey);
-    if (!Number.isSafeInteger(categoryIndex) || categoryIndex < 0) {
-      throw new TypeError(
-        'Category rename index must be a non-negative safe integer'
-      );
-    }
+    StateValidator.validateCategoryLabel(originalLabel);
     StateValidator.validateCategoryLabel(displayLabel);
-    const mapKey = `${source}:${originalFieldKey}:${categoryIndex}`;
-    this._categoryRenames.set(mapKey, displayLabel);
+    const mapKey = makeCategoryId(source, originalFieldKey, originalLabel);
+    if (displayLabel === originalLabel) {
+      this._categoryRenames.delete(mapKey);
+    } else {
+      this._categoryRenames.set(mapKey, displayLabel);
+    }
   }
 
-  getDisplayCategory(source, originalFieldKey, categoryIndex, originalLabel) {
+  /**
+   * @param {string} source - 'obs' | 'var'
+   * @param {string} originalFieldKey
+   * @param {string|number|boolean} originalLabel
+   * @returns {string|number|boolean} The renamed label, or the original one.
+   */
+  getDisplayCategory(source, originalFieldKey, originalLabel) {
     requireSource(source);
     StateValidator.validateFieldKey(originalFieldKey);
-    if (!Number.isSafeInteger(categoryIndex) || categoryIndex < 0) {
-      throw new TypeError(
-        'Category rename index must be a non-negative safe integer'
-      );
-    }
     StateValidator.validateCategoryLabel(originalLabel);
-    const mapKey = `${source}:${originalFieldKey}:${categoryIndex}`;
+    const mapKey = makeCategoryId(source, originalFieldKey, originalLabel);
     return this._categoryRenames.has(mapKey)
       ? this._categoryRenames.get(mapKey)
       : originalLabel;
   }
 
-  revertCategoryRename(source, originalFieldKey, categoryIndex) {
+  /**
+   * @param {string} source - 'obs' | 'var'
+   * @param {string} originalFieldKey
+   * @param {string|number|boolean} originalLabel
+   */
+  revertCategoryRename(source, originalFieldKey, originalLabel) {
     requireSource(source);
     StateValidator.validateFieldKey(originalFieldKey);
-    if (!Number.isSafeInteger(categoryIndex) || categoryIndex < 0) {
-      throw new TypeError(
-        'Category rename index must be a non-negative safe integer'
-      );
-    }
-    const mapKey = `${source}:${originalFieldKey}:${categoryIndex}`;
-    this._categoryRenames.delete(mapKey);
+    StateValidator.validateCategoryLabel(originalLabel);
+    this._categoryRenames.delete(
+      makeCategoryId(source, originalFieldKey, originalLabel)
+    );
   }
 
   // ---------------------------------------------------------------------------

@@ -21,28 +21,8 @@ import {
 import {
   claimCommunityAnnotationModal
 } from './community-annotation-modal-owner.js';
-
-function el(tag, props = {}, children = []) {
-  const node = document.createElement(tag);
-  for (const [k, v] of Object.entries(props || {})) {
-    if (k === 'className') node.className = String(v);
-    else if (k === 'text') node.textContent = String(v);
-    else if (k.startsWith('on') && typeof v === 'function') node.addEventListener(k.slice(2).toLowerCase(), v);
-    else if (k === 'disabled' || k === 'checked' || k === 'readonly') {
-      // Boolean HTML attributes: presence = true, absence = false
-      if (v) node.setAttribute(k, '');
-    } else if (v != null && v !== false) node.setAttribute(k, String(v));
-  }
-  for (const c of children) {
-    if (c == null) continue;
-    node.appendChild(typeof c === 'string' ? document.createTextNode(c) : c);
-  }
-  return node;
-}
-
-function toCleanString(value) {
-  return String(value ?? '').trim();
-}
+import { el, toCleanString } from './community-annotation/dom.js';
+import { createDomId } from '../components/dom-id.js';
 
 function requireVotingContext(value, label) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
@@ -553,23 +533,6 @@ function formatRelativeTime(isoString) {
   if (diffHrs < 24) return `${diffHrs}h ago`;
   if (diffDays < 30) return `${diffDays}d ago`;
   return date.toLocaleDateString();
-}
-
-function createDomId(prefix = 'id') {
-  if (
-    typeof prefix !== 'string' ||
-    prefix.length === 0 ||
-    prefix !== prefix.trim()
-  ) {
-    throw new TypeError('DOM id prefix must be an exact string');
-  }
-  if (
-    typeof globalThis.crypto !== 'object' ||
-    typeof globalThis.crypto.randomUUID !== 'function'
-  ) {
-    throw new TypeError('Community annotation modals require crypto.randomUUID()');
-  }
-  return `${prefix}-${globalThis.crypto.randomUUID()}`;
 }
 
 function listFocusableElements(root) {
@@ -1087,6 +1050,23 @@ function renderComment({
 /** @type {{close: Function} | null} */
 let activeVotingModal = null;
 
+/**
+ * The voting modal's own shell.
+ *
+ * This is deliberately separate from `community-annotation/modal-shell.js`
+ * rather than duplicated by accident. That module carries the full rationale;
+ * the short form is that the two shells have different close orderings
+ * (`onClose` retires this shell's render lifecycle *before* the focus trap and
+ * the overlay removal), different nested-Escape protocols (`escCancelSelector`
+ * here, `COMMUNITY_MODAL_ESCAPE_OWNER` there), and only this one owns the
+ * primary/secondary voting modal cascade.
+ *
+ * The accessibility contract they *do* share — `role="dialog"`, `aria-modal`,
+ * a generated `aria-labelledby`, focus into the dialog on open, focus restored
+ * on close, Escape, and Tab wrapping both directions — is pinned by
+ * `tests/community-annotation-modal-shell-parity-contract.test.mjs`. Changing
+ * any of it here without the same change there fails that test.
+ */
 function showModal({
   title,
   buildContent,
@@ -2222,16 +2202,37 @@ function renderSuggestionCard({
   }
 
   if (canInteract) {
-    upBtn.addEventListener('click', () => {
+    // `vote()` reports `false` when this card no longer names a suggestion the
+    // session can find — the bucket moved under the modal (the numeric
+    // `catIdx` is resolved late, against category registrations another module
+    // writes without a `changed` event) or the suggestion was removed by a
+    // Pull. Neither case re-renders this card on its own, so an unreported
+    // `false` leaves the button looking live while every click is discarded.
+    // Reporting only on the failure branch keeps the common path silent.
+    const castVote = (button, direction) => {
       if (!isCurrent()) return;
-      focusRenderedModalTarget(upBtn);
-      session.vote(fieldKey, catIdx, suggestion.id, 'up');
-    });
-    downBtn.addEventListener('click', () => {
-      if (!isCurrent()) return;
-      focusRenderedModalTarget(downBtn);
-      session.vote(fieldKey, catIdx, suggestion.id, 'down');
-    });
+      focusRenderedModalTarget(button);
+      const recorded = session.vote(
+        fieldKey,
+        catIdx,
+        suggestion.id,
+        direction
+      );
+      if (typeof recorded !== 'boolean') {
+        throw new TypeError(
+          'Community annotation vote must report an exact boolean outcome'
+        );
+      }
+      if (recorded) return;
+      getNotificationCenter().error(
+        'Vote not recorded: this suggestion is no longer part of the ' +
+        'category shown here. Close and reopen community voting to see ' +
+        'the current suggestions.',
+        { category: 'annotation' }
+      );
+    };
+    upBtn.addEventListener('click', () => castVote(upBtn, 'up'));
+    downBtn.addEventListener('click', () => castVote(downBtn, 'down'));
   }
   actions.appendChild(upBtn);
   actions.appendChild(downBtn);
@@ -2419,12 +2420,17 @@ function renderSuggestionCard({
         style: 'display: none;'
       });
       const labelId = createDomId('community-annotation-merge-target-label');
+      const targetSelectId = createDomId(
+        'community-annotation-merge-target'
+      );
       mergeBox.appendChild(el('label', {
         id: labelId,
+        for: targetSelectId,
         className: 'community-annotation-new-title',
         text: `Merge “${toCleanString(suggestion.label)}” into`
       }));
       const targetSelect = el('select', {
+        id: targetSelectId,
         className: 'community-annotation-text-input',
         'aria-labelledby': labelId
       });
@@ -2946,6 +2952,21 @@ function buildVotingDetail({
     panel.isConnected
   );
 
+  // The bucket this panel is rendering. `catIdx` is a *position*, and the
+  // session resolves it late against category registrations that
+  // `ui/modules/legend/categorical-legend.js` and
+  // `community-annotation/consensus-column.js` overwrite through
+  // `setFieldCategories()` — a registration call that deliberately emits no
+  // `changed` event, so nothing re-renders and nothing invalidates
+  // `isCurrent()`. Every mutation that looks a suggestion up by id then fails
+  // and says so, but creating one would succeed against whichever bucket the
+  // position now names, filing a contributor's suggestion under a category
+  // they never chose. Pin the bucket at render time and refuse instead.
+  const renderedBucket = bucketKey(session, fieldKey, catIdx);
+  const rendersCurrentBucket = () => (
+    bucketKey(session, fieldKey, catIdx) === renderedBucket
+  );
+
   const access = getCommunityAnnotationAccessStore();
   const isClosed = session.isFieldClosed?.(fieldKey) === true;
   const canInteract = !isClosed || access.isAuthor();
@@ -3460,6 +3481,15 @@ function buildVotingDetail({
       try {
         if (!isCurrent()) return;
         focusRenderedModalTarget(addBtn);
+        if (!rendersCurrentBucket()) {
+          getNotificationCenter().error(
+            'Suggestion not added: the categories of this field changed while ' +
+            'the panel was open, so this panel no longer names the same ' +
+            'cluster. Close and reopen community voting, then add it again.',
+            { category: 'annotation' }
+          );
+          return;
+        }
         const markers = parseMarkerGenesInput(markerGenesInput.value);
         session.addSuggestion(fieldKey, catIdx, { label: labelInput.value, ontologyId: ontInput.value, evidence: evidenceInput.value, markers });
         invalidateCapSearch();

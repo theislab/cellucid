@@ -218,7 +218,7 @@ export function createInMemoryDimensionManager(candidate) {
   manager.availableDimensions = [dimension];
   manager.defaultDimension = dimension;
   manager.dimensionFiles = {};
-  manager.nCells = positions.length / 3;
+  manager.publishCellCount(positions.length / 3);
   manager.paddedPositionCache.set(dimension, positions);
   manager.viewDimensions.set('live', dimension);
   return manager;
@@ -301,8 +301,15 @@ class DimensionManager {
     // Used to apply the same transform to centroids in state.js
     this.normTransformCache = new Map();
 
-    // Number of cells (consistent across all dimensions)
+    // Number of cells (consistent across all dimensions). Zero means the axis
+    // is not known yet: either `publishCellCount` states it from the dataset
+    // identity, or the first decoded embedding teaches it.
     this.nCells = 0;
+
+    // Whether the axis above came from `publishCellCount` rather than from a
+    // decoded payload. Only the published form pins the ordering against
+    // `initFromMetadata`; a learned axis is already downstream of it.
+    this._cellAxisPublished = false;
 
     // Lifecycle generation. Clearing the manager invalidates every result that
     // started against the previous dataset, including overridden load seams.
@@ -315,11 +322,55 @@ class DimensionManager {
   }
 
   /**
+   * Publish the dataset's canonical cell axis before any embedding loads.
+   *
+   * `loadDimension` bounds a payload at `nCells * dim * 4` bytes, but it can
+   * only do that once some embedding has landed and taught it the count. The
+   * *first* embedding is therefore bounded by the 512 MiB browser ceiling
+   * alone unless the axis is published up front from `stats.n_cells`, which
+   * `dataset_identity.json` already states. This is the sole seam for doing
+   * that: it exists so the invariant lives in the module that owns it rather
+   * than in each construction site's memory.
+   *
+   * Ordering is enforced rather than documented. `initFromMetadata` clears the
+   * cache and a cache clear resets the axis, so publishing first would be
+   * silently discarded; that sequence now throws instead.
+   *
+   * @param {number} nCells - Exact cell count from the dataset identity.
+   * @returns {number} The published count.
+   */
+  publishCellCount(nCells) {
+    if (!Number.isSafeInteger(nCells) || nCells < 1) {
+      throw new TypeError(
+        'Dimension cell axis must be published as a positive safe integer, ' +
+        `received ${typeof nCells === 'number' ? nCells : typeof nCells}.`
+      );
+    }
+    if (this.nCells !== 0 && this.nCells !== nCells) {
+      throw new RangeError(
+        `Dimension cell axis is already ${this.nCells}; refusing to republish ` +
+        `it as ${nCells}. Clear the manager before reusing it for another dataset.`
+      );
+    }
+    this.nCells = nCells;
+    this._cellAxisPublished = true;
+    return nCells;
+  }
+
+  /**
    * Initialize from dataset_identity.json embeddings metadata
    * @param {Object} meta - Embeddings metadata object
    */
   initFromMetadata(meta) {
     const parsed = parseEmbeddingMetadata(meta);
+    if (this._cellAxisPublished) {
+      throw new Error(
+        'Dimension embedding metadata must be installed before the cell axis ' +
+        'is published: replacing the metadata clears the cache, which would ' +
+        'discard the published axis and leave the first embedding bounded ' +
+        'only by the browser byte ceiling.'
+      );
+    }
     this.clearCache();
     this.viewDimensions.clear();
     this.availableDimensions = [...parsed.availableDimensions];
@@ -926,6 +977,7 @@ class DimensionManager {
     this.loadingPromises.clear();
     this.loadingControllers.clear();
     this.nCells = 0;
+    this._cellAxisPublished = false;
   }
 
   /**

@@ -22,7 +22,8 @@
 import {
   mean as mathMean,
   variance as mathVariance,
-  std as mathStd
+  std as mathStd,
+  selectSorted
 } from '../compute/math-utils.js';
 import { isFiniteNumber } from '../../utils/number-utils.js';
 
@@ -131,12 +132,15 @@ export function computeStats(values) {
   }
   const stdVal = Math.sqrt(sumSq / n);
 
-  // For median, we need to sort
-  const sorted = [...valid].sort((a, b) => a - b);
+  // The median needs two positions of the ascending order, not the whole of it.
+  // `filterFiniteNumbers` has already removed every non-finite value, so
+  // `selectSorted` resolves those positions exactly — by counting distinct
+  // values when there are few, by sorting when there are many.
   const mid = Math.floor(n / 2);
+  const [lower, upper] = selectSorted(valid, [mid > 0 ? mid - 1 : 0, mid]);
   const medianVal = n % 2 === 0
-    ? (sorted[mid - 1] + sorted[mid]) / 2
-    : sorted[mid];
+    ? (lower + upper) / 2
+    : upper;
 
   return {
     count: n,

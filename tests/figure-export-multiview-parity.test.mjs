@@ -35,6 +35,7 @@ function cameraState() {
 
 function renderState() {
   return {
+    antialias: true,
     bgColor: Float32Array.from([1, 1, 1]),
     cameraDistance: 3,
     cameraPosition: [0, 0, 3],

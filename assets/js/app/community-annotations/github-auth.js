@@ -967,30 +967,64 @@ export class GitHubAuthSession extends EventEmitter {
     );
   }
 
+  /**
+   * Adopt the persisted session, if there is exactly one valid session to adopt.
+   *
+   * The persisted entry is a cache of a Worker-verified identity, never the
+   * source of truth, so an unreadable or malformed entry must degrade to
+   * "signed out" rather than fail construction. Failing here is unrecoverable
+   * in practice: the constructor runs inside application startup, nothing else
+   * writes this key, and a rejected entry that stays in storage would reject
+   * every later construction in the same browsing session too. The malformed
+   * entry is therefore discarded, so a reload recovers on its own.
+   *
+   * Validation is not relaxed by this: a session that fails any check is
+   * refused exactly as before. Only the consequence of refusing it changes.
+   */
   _loadFromSessionStorage() {
-    const rawSession = readSessionItem(SESSION_KEY);
-    if (rawSession === null) {
-      this._token = null;
-      this._user = null;
+    this._token = null;
+    this._user = null;
+    let rawSession;
+    try {
+      rawSession = readSessionItem(SESSION_KEY);
+    } catch {
+      // A browser that refuses session storage has no persisted identity to
+      // adopt. Sign-in reports its own storage failure when it cannot persist.
       return;
     }
-    const session = parseExactJson(rawSession, {
-      path: 'GitHub auth session',
-    });
-    assertExactObjectKeys(
-      session,
-      ['token', 'user'],
-      'Stored GitHub auth session'
-    );
-    if (
-      typeof session.token !== 'string' ||
-      !session.token ||
-      /^\s|\s$/.test(session.token)
-    ) {
-      throw new Error('Stored GitHub token must be an exact nonblank string');
+    if (rawSession === null) return;
+
+    let token;
+    let user;
+    try {
+      const session = parseExactJson(rawSession, {
+        path: 'GitHub auth session',
+      });
+      assertExactObjectKeys(
+        session,
+        ['token', 'user'],
+        'Stored GitHub auth session'
+      );
+      if (
+        typeof session.token !== 'string' ||
+        !session.token ||
+        /^\s|\s$/.test(session.token)
+      ) {
+        throw new Error('Stored GitHub token must be an exact nonblank string');
+      }
+      token = session.token;
+      user = Object.freeze({ ...assertStoredGitHubUser(session.user) });
+    } catch {
+      try {
+        removeSessionItem(SESSION_KEY);
+      } catch {
+        // Storage that refuses removal also refused to hand back a usable
+        // identity, so there is nothing left to adopt in either outcome.
+      }
+      return;
     }
-    this._token = session.token;
-    this._user = Object.freeze({ ...assertStoredGitHubUser(session.user) });
+    this._token = token;
+    this._user = user;
   }
 
   _persistAuthenticatedState(token, user) {
@@ -1229,6 +1263,9 @@ export class GitHubAuthSession extends EventEmitter {
     const hadAuthenticatedState = this.isAuthenticated();
     const signOutGeneration = this._advanceRequestGeneration();
     if (signOutGeneration !== this._requestGeneration) return;
+    // Storage removal comes first on purpose: a sign-out that cannot be made
+    // durable is refused rather than reported, so the in-memory session can
+    // never claim to be signed out while a reload would restore the token.
     removeSessionItem(SESSION_KEY);
     if (signOutGeneration !== this._requestGeneration) return;
     if (!hadAuthenticatedState) return;

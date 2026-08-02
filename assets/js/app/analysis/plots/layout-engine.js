@@ -7,6 +7,7 @@
 
 import { getPageColor, PAGE_COLORS } from '../core/plugin-contract.js';
 import { getPlotTheme } from '../shared/plot-theme.js';
+import { escapeHtml } from '../../utils/dom-utils.js';
 
 /**
  * Layout mode definitions
@@ -393,7 +394,9 @@ export class LayoutEngine {
         const yPos = 1 - row * (plotHeight + verticalSpacing) + 0.02;
 
         layout.annotations.push({
-          text: this.getPageName(i),
+          // Plotly parses its HTML subset in annotation text; page names are
+          // user/session supplied.
+          text: escapeHtml(this.getPageName(i)),
           x: xPos,
           y: yPos,
           xref: 'paper',

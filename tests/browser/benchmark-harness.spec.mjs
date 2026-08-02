@@ -15,10 +15,11 @@
  */
 
 import { expect, test } from '@playwright/test';
+import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 
 const FIXTURE_URL =
-  '/?exportsBaseUrl=http%3A%2F%2F127.0.0.1%3A4173%2Ftests%2Fbrowser%2Ffixtures%2Fexports%2F' +
+  `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}` +
   '&dataset=current-ui-prepared&acceptance=benchmark-harness-ci';
 
 const HARNESS_MODULE = '/assets/js/app/ui/modules/benchmark/index.js';
@@ -175,10 +176,19 @@ test('the harness observes LOD, culling and uploads under scripted motion', asyn
     outcome.windows.static.uploads.totalBytes
   );
 
-  // The synchronous GL points are on the same guard. A still camera must not
-  // stall the pipeline at all; a moving one does, and now that is countable.
+  // The synchronous GL points are on the same guard, but the guard moved.
+  // `_uploadToViewIndexBuffer` used to bracket every per-view, per-frame index
+  // publication in two `gl.getError()` calls; CEL-0071 takes that bracket only
+  // when publishing wider than any size the element buffer has been proven to
+  // hold, and skips it when replacing at or below that watermark. So a still
+  // camera stalls not at all, a moving one stalls only where the buffer grows,
+  // and the per-frame pipeline drain this counter was added to expose is gone.
+  // Asserting it is still there would assert the defect CEL-0071 removed; what
+  // must hold is that it cannot come back.
   expect(outcome.windows.static.uploads.totalSyncStallCalls).toBe(0);
-  expect(outcome.windows.orbit.uploads.totalSyncStallCalls).toBeGreaterThan(0);
+  expect(outcome.windows.orbit.uploads.totalSyncStallCalls).toBeLessThan(
+    outcome.windows.orbit.samples
+  );
 
   // Percentiles are withheld, not invented, when the window is this short.
   for (const regime of ['static', 'orbit']) {
@@ -327,6 +337,79 @@ test('synthetic generation runs off the main thread', async ({ page }) => {
   expect(result.workerMs).toBeGreaterThan(0);
   expect(result.framesDuringGeneration).toBeGreaterThan(0);
   expect(browserErrors).toEqual([]);
+});
+
+test('the worker builds exactly what the main thread would have built', async ({
+  page
+}) => {
+  // The Run button generates off-thread, so the worker evaluates its own copy
+  // of the generator module. Nothing may make the two copies disagree — a
+  // generator that reached for main-thread-only state, or a seed that did not
+  // survive the boundary, would silently produce a different dataset in the
+  // application than in every node test that calls the class directly.
+  await page.goto(FIXTURE_URL, { waitUntil: 'domcontentloaded' });
+  await dismissWelcome(page);
+
+  const compared = await page.evaluate(
+    async ({ moduleUrl, count }) => {
+      const generatorModule = await import('/assets/js/dev/benchmark.js');
+      const harnessModule = await import(moduleUrl);
+      const digest = async view => {
+        const hash = await crypto.subtle.digest(
+          'SHA-256',
+          new Uint8Array(view.buffer, view.byteOffset, view.byteLength)
+        );
+        return [...new Uint8Array(hash)]
+          .map(byte => byte.toString(16).padStart(2, '0'))
+          .join('');
+      };
+      const entryPoints = {
+        atlas: 'atlasLike',
+        batches: 'batchEffects',
+        clusters: 'gaussianClusters',
+        flatumap: 'flatUMAP',
+        octopus: 'octopus',
+        spirals: 'spirals',
+        uniform: 'uniformRandom'
+      };
+      const rows = [];
+      for (const [pattern, entryPoint] of Object.entries(entryPoints)) {
+        const onThread =
+          generatorModule.SyntheticDataGenerator[entryPoint](count);
+        const offThread = await harnessModule.generateSyntheticDataOffThread({
+          pattern,
+          count
+        });
+        rows.push({
+          pattern,
+          positionsMatch:
+            (await digest(onThread.positions)) ===
+            (await digest(offThread.positions)),
+          colorsMatch:
+            (await digest(onThread.colors)) === (await digest(offThread.colors)),
+          dimensionMatch:
+            onThread.dimensionLevel === offThread.dimensionLevel
+        });
+      }
+      return {
+        seed: generatorModule.SyntheticDataGenerator.seed,
+        defaultSeed: generatorModule.DEFAULT_SYNTHETIC_SEED,
+        rows
+      };
+    },
+    { moduleUrl: HARNESS_MODULE, count: 5_000 }
+  );
+
+  expect(compared.seed).toBe(compared.defaultSeed);
+  expect(compared.rows.length).toBe(7);
+  for (const row of compared.rows) {
+    expect(row, `pattern ${row.pattern}`).toEqual({
+      pattern: row.pattern,
+      positionsMatch: true,
+      colorsMatch: true,
+      dimensionMatch: true
+    });
+  }
 });
 
 test('an aborted generation terminates its worker', async ({ page }) => {

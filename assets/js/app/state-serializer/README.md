@@ -75,7 +75,11 @@ Scheduled eagerly:
   - Per-snapshot filters (replayed per view during multiview restore)
 - **Generic sidebar controls state**
   - Checkboxes/selects/ranges/text inputs (by DOM id)
-  - Accordion open/closed state (by summary label or DOM id)
+  - Accordion open/closed state (by DOM id; visible summary copy is never an
+    identity)
+  - Pressed-button groups (by DOM id), recording which button is pressed —
+    today this is the highlight toolbelt, so the **active selection tool**
+    (Annotation based / KNN drag / Proximity drag / Lasso) is part of a session
 - **Floating panels layout** (non-analysis)
   - Which accordion sections were floated
   - Their geometry + open/closed state
@@ -256,7 +260,85 @@ The **`core/state`** eager chunk uses these helper modules:
 Captures and restores lightweight UI state using **DOM element IDs**:
 - `input[id]`: checkbox, range, number, color, text/search
 - `select[id]`: selected option
-- `details.accordion-section`: open/closed state (by summary label or DOM id)
+- `details.accordion-section`: open/closed state (by DOM id)
+- `[data-state-serializer-pressed-group]`: the id of the group's one
+  `aria-pressed="true"` button
+
+#### Pressed-button groups
+
+A toolbelt — several buttons of which exactly one is pressed — is a standing
+choice, not a momentary action, so it is state. The highlight toolbelt is the
+one in the interface today: it decides whether a drag on the canvas is an
+annotation, a KNN expansion, a proximity brush, or a lasso, and switching it
+publishes `setLassoEnabled`, `setProximityEnabled`, and `setKnnEnabled` to the
+viewer. A session that did not carry it reopened in whatever tool the markup
+starts in, and the user's next drag did something they had not asked for.
+
+Marking the container is what puts it in the inventory; there is no list of
+group ids in `ui-controls.js`, so a second toolbelt is carried the day its
+markup lands. Two rules make a group well-formed, and both are enforced on
+capture *and* on validation rather than assumed:
+
+- every button in the group carries a stable nonempty DOM id, because the id of
+  the pressed button is the saved value;
+- exactly one button is `aria-pressed="true"`. None, several, or a value other
+  than `"true"`/`"false"`/absent is refused rather than resolved to a guess.
+
+`role="group"` alone is deliberately *not* the signal. `index.html` already uses
+it for the field-action toolbars, whose buttons are momentary actions that also
+carry ids, so recognizing groups by role would have inventoried controls that
+have no value to save. The explicit marker is also what keeps the group visible
+to `tests/session-preset-control-inventory-contract.test.mjs`, which reads the
+static markup: a group recognized only by a runtime-set attribute would be
+invisible there and would read as a preset carrying a key the markup lacks.
+
+Restoration follows the same publication rule as every other control — the
+pressed button is sent a `click`, and the group is re-read afterwards. Writing
+`aria-pressed` directly would repaint the toolbelt and leave the viewer in the
+previous tool, which is exactly the CEL-0129 failure in another shape. Pressed
+groups are restored **last**, after every value control has settled, because a
+tool switch reads the viewer's unified selection state.
+
+#### How a restored control reaches the thing it controls
+
+There is no registry mapping an id to a setter. A control is restored by
+writing its DOM value and then **dispatching the event its owner listens for**
+— `change` for checkboxes and selects, `input` for the rest. The owner's own
+listener is what publishes the value to the viewer, to `DataState`, or to
+wherever that control leads.
+
+Two consequences bind anything that touches this path:
+
+- **The owner's listener must already be attached when the restore runs.** A
+  dispatch with no listener does nothing at all, silently: the panel shows the
+  saved value and the thing it controls never hears about it. `main.js` restores
+  the advertised dataset state part-way through its bootstrap, so every control
+  in the inventory must be wired before that point. This was the CEL-0129
+  defect: the four renderer controls (`#hp-shader-quality`, `#hp-lod-enabled`,
+  `#hp-lod-force`, `#hp-frustum-culling`) were wired inline at the end of the
+  bootstrap, and every restored renderer setting was dropped. They now belong to
+  `cellucid/assets/js/app/ui/modules/render-controls.js`, which `initUI` builds
+  first. Accordions are the one exception, and only because setting `open`
+  needs no owner.
+- **A control that refuses its restored value fails the whole restore.** After
+  dispatching, the helper re-reads the control; an owner that rolled the value
+  back on a rejected publication leaves a mismatch, which is raised and rolls
+  the session back. Silence is never an outcome.
+
+`#hp-antialias` is the one control whose owner publishes to `localStorage`
+rather than to the viewer, because `antialias` is a WebGL context-creation
+attribute and cannot change on a live context. It is captured and restored by
+exactly the same generic path — it is an `input[id]` in the sidebar, so nothing
+had to be added to a list — and its handler stores the preference and updates a
+status line saying the change applies on the next load. A storage failure rolls
+the checkbox back, which fails the restore in the usual way. See
+`cellucid/assets/js/app/ui/core/antialias-preference.js`.
+
+`restoreUIControls` also accepts `deferControlIds`, which moves the named
+controls to the **end of the same restore call** and returns a function that
+applies them. It orders controls against each other, not against the bootstrap;
+`session/contributors/core-state.js` uses it so `render-mode` is replayed last,
+after the snapshot graph is rebuilt.
 
 Explicit exclusions:
 - Any subtree marked with `data-state-serializer-skip="true"` is ignored.
@@ -266,22 +348,39 @@ Explicit exclusions:
   - Dataset selection + connection UI is skipped in `cellucid/index.html` (sample dataset picker, local/remote/GitHub connect controls)
   - Community Annotation section is skipped in `cellucid/index.html` (network/auth-driven; sessions do not persist votes/moderation/UI state)
   - Floating analysis windows are skipped in `cellucid/assets/js/app/analysis/ui/analysis-window-manager.js`
-- Some IDs are intentionally skipped because domain logic restores them:
+- Some IDs are intentionally skipped by `DOMAIN_OWNED_IDS`, either because a
+  feature owner restores them or because they are not a preference at all.
+  This is the complete list; `tests/session-docs-current-contract.test.mjs`
+  reads the set out of `ui-controls.js` and fails when an id is missing here:
   - Active field selectors: `categorical-field`, `continuous-field`, `gene-expression-search`
   - Outlier slider: `outlier-filter` (restored after active field is set)
   - Navigation mode: `navigation-mode` (restored by camera restore)
   - Dimension select: `dimension-select` (restored explicitly to avoid async handler races)
   - Dataset/connection controls: `dataset-select`, `remote-server-url`, `github-repo-url` (sessions assume the dataset is already loaded)
+  - Pointer capture: `pointer-lock` is not restored by anything. It is not a
+    preference — it mirrors the browser's live pointer-lock state, and
+    `ui/modules/camera-controls.js` forces it unchecked on init and writes it
+    from the `pointerlockchange` event. Restoring it would either lie about the
+    pointer or grab it without a user gesture, and browsers refuse the latter.
 
 ### `filters.js` — Modified-Only Field Filters
 
 Persists *only* filter state that differs from defaults to keep eager restore small.
 
 Categorical fields:
-- category visibility toggles (`_categoryVisible`)
-- category color overrides (`_categoryColors`)
+- category visibility toggles (`_categoryVisible`), recorded as `categoryName`
+- category color overrides (`_categoryColors`), recorded as `categoryName`
 - filter enabled/disabled (`_categoryFilterEnabled`)
 - colormap override (`_colormapId`)
+
+Fields are recorded by `source:key` and categories by name, never by position.
+A position in the obs/var inventory or in `field.categories` is not pinned by
+the dataset fingerprint, which covers the cells and not the schema, so a dataset
+exported again with one more column or one more category moves every position
+after it. Restore resolves both from the names and refuses by name when a name
+is gone; it never applies a saved change to whatever now sits at the old
+position. The same rule owns field-owned highlight groups in
+`session/contributors/highlights-meta.js` (`fieldKey`, `categoryName`).
 
 Continuous fields:
 - numeric filter range (`_continuousFilter`)

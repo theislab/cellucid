@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "default": "synthetic-cell-types-2d",
+  "datasets": [
+    {
+      "id": "synthetic-cell-types-2d",
+      "path": "synthetic-cell-types-2d/",
+      "name": "Synthetic cell-type islands \u2014 2D",
+      "description": "Three synthetic 2D populations for learning categorical and continuous coloring, marker genes, filtering, highlighting, and weighted connectivity.",
+      "n_cells": 72,
+      "n_genes": 8
+    },
+    {
+      "id": "synthetic-development-3d",
+      "path": "synthetic-development-3d/",
+      "name": "Synthetic branching development \u2014 3D",
+      "description": "A synthetic two-lineage 3D progression for orbit navigation, temporal metadata, fate markers, graph context, and a velocity-style vector field.",
+      "n_cells": 96,
+      "n_genes": 10
+    },
+    {
+      "id": "synthetic-trajectory-1d",
+      "path": "synthetic-trajectory-1d/",
+      "name": "Synthetic trajectory \u2014 1D",
+      "description": "A synthetic 48-cell progression for learning planar 1D navigation, pseudotime coloring, gene trends, connectivity, and a velocity-style overlay.",
+      "n_cells": 48,
+      "n_genes": 6
+    }
+  ]
+}

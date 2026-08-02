@@ -1,4 +1,5 @@
 import { expect, test } from '@playwright/test';
+import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 
 const CURRENT_UI_DATASET =
@@ -70,7 +71,7 @@ test('volumetric smoke completes its exact GPU density and noise path', async ({
   });
 
   await page.goto(
-    '/?exportsBaseUrl=http%3A%2F%2F127.0.0.1%3A4173%2Ftests%2Fbrowser%2Ffixtures%2Fexports%2F&dataset=current-ui-prepared&acceptance=renderer-smoke-ci',
+    `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=renderer-smoke-ci`,
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
@@ -164,7 +165,7 @@ test('render-mode switch cancels one pending noise transaction and restarts clea
   });
 
   await page.goto(
-    '/?exportsBaseUrl=http%3A%2F%2F127.0.0.1%3A4173%2Ftests%2Fbrowser%2Ffixtures%2Fexports%2F&dataset=current-ui-prepared&acceptance=smoke-mode-generation-cancellation',
+    `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=smoke-mode-generation-cancellation`,
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
@@ -1745,7 +1746,7 @@ test('unavailable smoke mode rolls back the selector and retries cleanly', async
     }
   });
   await page.goto(
-    '/?exportsBaseUrl=http%3A%2F%2F127.0.0.1%3A4173%2Ftests%2Fbrowser%2Ffixtures%2Fexports%2F&dataset=current-ui-prepared&acceptance=smoke-mode-rollback',
+    `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=smoke-mode-rollback`,
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
@@ -1823,7 +1824,7 @@ test('runtime smoke noise failure settles once to points and retries cleanly', a
     }
   });
   await page.goto(
-    '/?exportsBaseUrl=http%3A%2F%2F127.0.0.1%3A4173%2Ftests%2Fbrowser%2Ffixtures%2Fexports%2F&dataset=current-ui-prepared&acceptance=smoke-runtime-failure-settlement',
+    `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=smoke-runtime-failure-settlement`,
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
@@ -1968,7 +1969,7 @@ test('GPU smoke density matches its prior GPU reference without product readback
 }) => {
   await installReadPixelsAudit(page);
   await page.goto(
-    '/?exportsBaseUrl=http%3A%2F%2F127.0.0.1%3A4173%2Ftests%2Fbrowser%2Ffixtures%2Fexports%2F&dataset=current-ui-prepared&acceptance=smoke-density-oracle',
+    `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=smoke-density-oracle`,
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
@@ -2411,7 +2412,7 @@ test('smoke owns an empty filtered view without errors or stale density', async 
   });
 
   await page.goto(
-    '/?exportsBaseUrl=http%3A%2F%2F127.0.0.1%3A4173%2Ftests%2Fbrowser%2Ffixtures%2Fexports%2F&dataset=current-ui-prepared&acceptance=smoke-empty-filter',
+    `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=smoke-empty-filter`,
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
@@ -2539,7 +2540,7 @@ test('every visible velocity slider endpoint reaches the GPU unchanged', async (
   );
 
   await page.goto(
-    '/?exportsBaseUrl=http%3A%2F%2F127.0.0.1%3A4173%2Ftests%2Fbrowser%2Ffixtures%2Fexports%2F&dataset=current-ui-prepared&acceptance=velocity-slider-endpoints',
+    `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=velocity-slider-endpoints`,
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
@@ -2629,7 +2630,7 @@ test('recoloring and position changes retain the published filter generation', a
   });
 
   await page.goto(
-    '/?exportsBaseUrl=http%3A%2F%2F127.0.0.1%3A4173%2Ftests%2Fbrowser%2Ffixtures%2Fexports%2F&dataset=current-ui-prepared&acceptance=renderer-alpha-generation',
+    `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=renderer-alpha-generation`,
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
@@ -2703,7 +2704,7 @@ test('projectiles use the published full-resolution collision index', async ({ p
   });
 
   await page.goto(
-    '/?exportsBaseUrl=http%3A%2F%2F127.0.0.1%3A4173%2Ftests%2Fbrowser%2Ffixtures%2Fexports%2F&dataset=current-ui-prepared&acceptance=renderer-projectile-ci',
+    `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=renderer-projectile-ci`,
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
@@ -2753,7 +2754,7 @@ test('spatial-index construction failures settle every owned notification', asyn
   });
 
   await page.goto(
-    '/?exportsBaseUrl=http%3A%2F%2F127.0.0.1%3A4173%2Ftests%2Fbrowser%2Ffixtures%2Fexports%2F&dataset=current-ui-prepared&acceptance=renderer-spatial-failure-ci',
+    `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=renderer-spatial-failure-ci`,
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);

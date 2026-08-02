@@ -136,10 +136,7 @@ function requireActiveHighlightGroups(owner) {
 }
 
 function requireCreatedCellIndices(cellIndices, pointCount) {
-  if (
-    !Array.isArray(cellIndices)
-    && !(cellIndices instanceof Uint32Array)
-  ) {
+  if (!isHighlightIndexList(cellIndices)) {
     throw new TypeError(
       'Category highlight cell indices must be an Array or Uint32Array.'
     );
@@ -214,6 +211,63 @@ function rejectHighlightCellIndex(cellIndex, pointCount, label) {
 }
 
 /**
+ * True when `value` can carry a list of highlighted cell indices.
+ *
+ * Both shapes are current: a session restore decodes a `Uint32Array`
+ * (`session/contributors/highlights-meta.js`), while a category or range
+ * selection still produces a plain array. Every reader of a highlight index
+ * list accepts both, so this predicate is the single place that says so.
+ *
+ * @param {unknown} value
+ * @returns {boolean}
+ */
+function isHighlightIndexList(value) {
+  return Array.isArray(value) || value instanceof Uint32Array;
+}
+
+/**
+ * Upper bound on how many cells a page's enabled groups can contribute.
+ *
+ * The sum of the enabled groups' index-list lengths: exact when the groups are
+ * disjoint, and larger than the truth by exactly the number of cells claimed by
+ * more than one group. Computing it walks the **groups**, never their cells, so
+ * `collectEnabledPageCells` can size its output in advance without a counting
+ * pass over the selection.
+ *
+ * The group-shape validation lives here as well as in the collector so that a
+ * malformed inventory is rejected before any membership byte is written, and a
+ * failed collection therefore cannot leave a shared scratch buffer dirty.
+ *
+ * @param {object|null} page - Highlight page, or null for "no page".
+ * @param {string} label - Page description used in thrown messages.
+ * @returns {number}
+ */
+function enabledPageCellCapacity(page, label) {
+  if (page === null || page === undefined) return 0;
+  const groups = page.highlightedGroups;
+  if (!Array.isArray(groups)) {
+    throw new TypeError(`${label} requires a group inventory.`);
+  }
+  let capacity = 0;
+  for (let groupIndex = 0; groupIndex < groups.length; groupIndex++) {
+    const group = groups[groupIndex];
+    if (group === null || typeof group !== 'object' || Array.isArray(group)) {
+      throw new TypeError(`${label} group ${groupIndex} must be an object.`);
+    }
+    if (group.enabled === false) continue;
+    const indices = group.cellIndices;
+    if (indices === null || indices === undefined) continue;
+    if (!isHighlightIndexList(indices)) {
+      throw new TypeError(
+        `${label} group "${group.id}" cellIndices must be an Array or Uint32Array.`
+      );
+    }
+    capacity += indices.length;
+  }
+  return capacity;
+}
+
+/**
  * The one definition of "the cells of a highlight page".
  *
  * A page's cells are the union of the cell indices of its **enabled** groups,
@@ -222,19 +276,35 @@ function rejectHighlightCellIndex(cellIndex, pointCount, label) {
  * construction the set the renderer paints — a page cannot be counted one way
  * and drawn another.
  *
- * `membership` doubles as the deduplication structure and as the output
- * buffer: entries for the page's cells are set to 255 and every other entry is
- * left untouched, so the caller passes either the live highlight array (active
- * page) or a scratch buffer it clears afterwards (any other page).
+ * `membership` doubles as the deduplication structure and as the highlight
+ * intensity output: entries for the page's cells are set to 255 and every other
+ * entry is left untouched, so the caller passes either the live highlight array
+ * (active page) or a scratch buffer it clears afterwards (any other page).
+ *
+ * `cells` receives the index list itself. It is a `Uint32Array` rather than a
+ * growable plain array because a selection can be the whole dataset: the caller
+ * sizes it from `enabledPageCellCapacity` and this function fills a prefix of
+ * it, so applying a highlight neither reallocates nor stores eight bytes for
+ * every four-byte index.
  *
  * @param {object|null} page - Highlight page, or null for "no page".
  * @param {number} pointCount - Cells in the current dataset.
  * @param {Uint8Array} membership - Buffer of length `pointCount`, zeroed for
  *   every index this page could claim.
  * @param {string} label - Page description used in thrown messages.
- * @returns {number[]} The page's cell indices, unique and in first-seen order.
+ * @param {Uint32Array} cells - Output buffer, at least `outOffset +
+ *   enabledPageCellCapacity(page)` entries long.
+ * @param {number} outOffset - First entry of `cells` to write.
+ * @returns {number} How many cells were written, unique and in first-seen order.
  */
-function collectEnabledPageCells(page, pointCount, membership, label) {
+function collectEnabledPageCells(
+  page,
+  pointCount,
+  membership,
+  label,
+  cells,
+  outOffset
+) {
   if (!(membership instanceof Uint8Array) || membership.length !== pointCount) {
     // The bound proved against `pointCount` is the bound written into
     // `membership`. If they disagree, an in-bounds index would be dropped by a
@@ -244,12 +314,16 @@ function collectEnabledPageCells(page, pointCount, membership, label) {
       `${label} membership buffer must be a Uint8Array of ${pointCount} entries.`
     );
   }
-  if (page === null || page === undefined) return [];
+  if (!(cells instanceof Uint32Array)) {
+    throw new TypeError(`${label} cell buffer must be a Uint32Array.`);
+  }
+  if (page === null || page === undefined) return 0;
   const groups = page.highlightedGroups;
   if (!Array.isArray(groups)) {
     throw new TypeError(`${label} requires a group inventory.`);
   }
-  const cells = [];
+  const capacity = cells.length;
+  let written = outOffset;
   for (let groupIndex = 0; groupIndex < groups.length; groupIndex++) {
     const group = groups[groupIndex];
     if (group === null || typeof group !== 'object' || Array.isArray(group)) {
@@ -258,7 +332,7 @@ function collectEnabledPageCells(page, pointCount, membership, label) {
     if (group.enabled === false) continue;
     const indices = group.cellIndices;
     if (indices === null || indices === undefined) continue;
-    if (!Array.isArray(indices) && !(indices instanceof Uint32Array)) {
+    if (!isHighlightIndexList(indices)) {
       throw new TypeError(
         `${label} group "${group.id}" cellIndices must be an Array or Uint32Array.`
       );
@@ -273,12 +347,36 @@ function collectEnabledPageCells(page, pointCount, membership, label) {
         );
       }
       if (membership[cellIndex] === 0) {
+        if (written >= capacity) {
+          // An out-of-range typed-array write is silent. Refuse instead, so a
+          // group inventory that grew between sizing and collecting can never
+          // paint a cell the published index list omits.
+          throw new RangeError(
+            `${label} produced more cells than its ${capacity}-entry buffer holds.`
+          );
+        }
         membership[cellIndex] = 255;
-        cells.push(cellIndex);
+        cells[written] = cellIndex;
+        written++;
       }
     }
   }
-  return cells;
+  return written - outOffset;
+}
+
+/**
+ * The exactly-sized index list for a filled prefix of a collection buffer.
+ *
+ * Returns the buffer itself when every entry was used — the common case, since
+ * groups usually claim disjoint cells — and a right-sized copy otherwise, so no
+ * published index list keeps an oversized backing store alive.
+ *
+ * @param {Uint32Array} cells
+ * @param {number} written
+ * @returns {Uint32Array}
+ */
+function publishedHighlightIndices(cells, written) {
+  return written === cells.length ? cells : cells.slice(0, written);
 }
 
 function requireSelectionTransparency(transparency, pointCount) {
@@ -381,14 +479,18 @@ export const highlightStateMethods = {
     const page = this.highlightPages.find((p) => p.id === pageId);
     if (!page) return 0;
 
+    const label = `Highlight page "${pageId}"`;
+    const cells = new Uint32Array(enabledPageCellCapacity(page, label));
     const membership = this._borrowHighlightMembershipScratch();
-    let cells;
+    let written;
     try {
-      cells = collectEnabledPageCells(
+      written = collectEnabledPageCells(
         page,
         this.pointCount,
         membership,
-        `Highlight page "${pageId}"`
+        label,
+        cells,
+        0
       );
     } catch (error) {
       // The buffer holds a partial page. Retire it rather than hand a dirty
@@ -396,8 +498,8 @@ export const highlightStateMethods = {
       this._highlightMembershipScratch = null;
       throw error;
     }
-    for (let i = 0; i < cells.length; i++) membership[cells[i]] = 0;
-    return cells.length;
+    for (let i = 0; i < written; i++) membership[cells[i]] = 0;
+    return written;
   },
 
   createHighlightPage(name = null) {
@@ -513,20 +615,24 @@ export const highlightStateMethods = {
     // the source page does not render.
     const membership = this._borrowHighlightMembershipScratch();
     const collect = (page) => {
-      let cells;
+      const label = `Highlight page "${page.id}"`;
+      const cells = new Uint32Array(enabledPageCellCapacity(page, label));
+      let written;
       try {
-        cells = collectEnabledPageCells(
+        written = collectEnabledPageCells(
           page,
           this.pointCount,
           membership,
-          `Highlight page "${page.id}"`
+          label,
+          cells,
+          0
         );
       } catch (error) {
         this._highlightMembershipScratch = null;
         throw error;
       }
-      for (let i = 0; i < cells.length; i++) membership[cells[i]] = 0;
-      return new Set(cells);
+      for (let i = 0; i < written; i++) membership[cells[i]] = 0;
+      return new Set(cells.subarray(0, written));
     };
 
     const set1 = collect(page1);
@@ -592,12 +698,18 @@ export const highlightStateMethods = {
     this.highlightArray.fill(0);
 
     // Collect all highlighted indices as we go (avoids O(n) scan in renderer)
-    const allHighlightedIndices = collectEnabledPageCells(
-      this._getActivePage(),
+    const page = this._getActivePage();
+    const label = 'Active highlight page';
+    const cells = new Uint32Array(enabledPageCellCapacity(page, label));
+    const written = collectEnabledPageCells(
+      page,
       this.pointCount,
       this.highlightArray,
-      'Active highlight page'
+      label,
+      cells,
+      0
     );
+    const allHighlightedIndices = publishedHighlightIndices(cells, written);
 
     this._highlightedCellIndices = allHighlightedIndices;
     this._pushHighlightToViewer(allHighlightedIndices);
@@ -714,7 +826,7 @@ export const highlightStateMethods = {
       this.clearPreviewHighlight();
       return;
     }
-    if (!Array.isArray(cellIndices) && !(cellIndices instanceof Uint32Array)) {
+    if (!isHighlightIndexList(cellIndices)) {
       throw new TypeError(
         'Preview highlight cell indices must be an Array or Uint32Array.'
       );
@@ -724,18 +836,27 @@ export const highlightStateMethods = {
     // Start with existing permanent highlights
     this.highlightArray.fill(0);
 
-    // Collect all highlighted indices (avoids O(n) scan in renderer)
-    const allHighlightedIndices = collectEnabledPageCells(
-      this._getActivePage(),
+    // Collect all highlighted indices (avoids O(n) scan in renderer). The page
+    // cells and the preview cells share one buffer, so the union is built in a
+    // single pass with no intermediate array.
+    const page = this._getActivePage();
+    const label = 'Active highlight page';
+    const previewCount = cellIndices.length;
+    const capacity = enabledPageCellCapacity(page, label) + previewCount;
+    const cells = new Uint32Array(capacity);
+    let written = collectEnabledPageCells(
+      page,
       this.pointCount,
       this.highlightArray,
-      'Active highlight page'
+      label,
+      cells,
+      0
     );
 
     // Add preview highlights on top
     const pointCount = this.pointCount;
     const highlightArray = this.highlightArray;
-    for (let i = 0; i < cellIndices.length; i++) {
+    for (let i = 0; i < previewCount; i++) {
       const idx = cellIndices[i];
       if (!isHighlightCellIndex(idx, pointCount)) {
         rejectHighlightCellIndex(
@@ -745,10 +866,20 @@ export const highlightStateMethods = {
         );
       }
       if (highlightArray[idx] === 0) {
+        if (written >= capacity) {
+          // The same refusal the collector makes: an out-of-range typed-array
+          // write is silent, and a painted cell missing from the published list
+          // is exactly the disagreement this module exists to prevent.
+          throw new RangeError(
+            `Preview highlight produced more cells than its ${capacity}-entry buffer holds.`
+          );
+        }
         highlightArray[idx] = 255;
-        allHighlightedIndices.push(idx);
+        cells[written] = idx;
+        written++;
       }
     }
+    const allHighlightedIndices = publishedHighlightIndices(cells, written);
     this._highlightedCellIndices = allHighlightedIndices;
     this._invalidateHighlightCountCache();
     this._pushHighlightToViewer(allHighlightedIndices);
@@ -900,17 +1031,22 @@ export const highlightStateMethods = {
       throw new TypeError('Direct highlight label must be a nonempty trimmed string.');
     }
     if (
-      (
-        !Array.isArray(groupData.cellIndices)
-        && !(groupData.cellIndices instanceof Uint32Array)
-      )
+      !isHighlightIndexList(groupData.cellIndices)
       || groupData.cellIndices.length === 0
     ) {
       throw new TypeError(
         'Direct highlight cellIndices must be a nonempty Array or Uint32Array.'
       );
     }
-    for (const cellIndex of groupData.cellIndices) {
+    // One pass validates and copies. The group owns its own storage — the
+    // caller's array is a lasso/KNN scratch that keeps changing — and a
+    // Uint32Array is that storage, so a whole-dataset selection costs four
+    // bytes per cell instead of eight and is never visited twice on the way in.
+    const sourceIndices = groupData.cellIndices;
+    const cellCount = sourceIndices.length;
+    const cellIndices = new Uint32Array(cellCount);
+    for (let i = 0; i < cellCount; i++) {
+      const cellIndex = sourceIndices[i];
       if (
         !Number.isSafeInteger(cellIndex)
         || cellIndex < 0
@@ -918,6 +1054,7 @@ export const highlightStateMethods = {
       ) {
         throw new RangeError('Direct highlight cell index is outside the current dataset.');
       }
+      cellIndices[i] = cellIndex;
     }
 
     const id = `highlight_${++this._highlightIdCounter}`;
@@ -926,10 +1063,8 @@ export const highlightStateMethods = {
       type: groupData.type,
       label: groupData.label,
       enabled: true,
-      cellIndices: Array.isArray(groupData.cellIndices)
-        ? [...groupData.cellIndices]
-        : Array.from(groupData.cellIndices),
-      cellCount: groupData.cellIndices.length,
+      cellIndices,
+      cellCount,
     };
 
     this.highlightedGroups.push(group);
@@ -1022,7 +1157,7 @@ export const highlightStateMethods = {
     // Returns count of highlighted cells that are currently visible (cached)
     if (!this.highlightArray) return 0;
     let highlightedIndices = this._highlightedCellIndices;
-    if (!Array.isArray(highlightedIndices)) {
+    if (!isHighlightIndexList(highlightedIndices)) {
       // Upgrade an already-live state or a minimal test fixture exactly once.
       highlightedIndices = [];
       for (let i = 0; i < this.highlightArray.length; i++) {
@@ -1077,7 +1212,7 @@ export const highlightStateMethods = {
     // Returns total count of all highlighted cells, including filtered-out ones (cached)
     if (!this.highlightArray) return 0;
     if (this._cachedTotalHighlightCount !== null) return this._cachedTotalHighlightCount;
-    if (!Array.isArray(this._highlightedCellIndices)) {
+    if (!isHighlightIndexList(this._highlightedCellIndices)) {
       this._highlightedCellIndices = [];
       for (let i = 0; i < this.highlightArray.length; i++) {
         if (this.highlightArray[i] >= MIN_VISIBLE_ALPHA_BYTE) {

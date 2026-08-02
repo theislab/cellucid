@@ -57,6 +57,7 @@ export function createMultiSelectDropdown(options) {
   btn.setAttribute('aria-label', buttonLabel);
   btn.setAttribute('aria-haspopup', 'dialog');
   btn.setAttribute('aria-expanded', 'false');
+  btn.setAttribute('aria-controls', `${id}-panel`);
   btn.textContent = buttonText;
   wrapper.appendChild(btn);
 
@@ -65,8 +66,12 @@ export function createMultiSelectDropdown(options) {
   panel.id = `${id}-panel`;
   panel.setAttribute('role', 'dialog');
   panel.setAttribute('aria-label', title);
+  panel.setAttribute('aria-modal', 'true');
   panel.style.display = 'none';
-  // Append to body to avoid affecting sidebar scroll position
+  // Append to body to avoid affecting sidebar scroll position. That places the
+  // panel at the very end of the document, so sequential focus would never
+  // reach it from the trigger — the panel keeps focus itself while it is open
+  // and hands it back to the trigger on close.
   document.body.appendChild(panel);
 
   const header = document.createElement('div');
@@ -93,6 +98,7 @@ export function createMultiSelectDropdown(options) {
   searchInput.type = 'text';
   searchInput.className = 'search-input multi-select-dropdown-search';
   searchInput.placeholder = 'Filter…';
+  searchInput.setAttribute('aria-label', `Filter ${title}`);
   searchInput.autocomplete = 'off';
   if (enableSearch) {
     panel.appendChild(searchInput);
@@ -180,7 +186,14 @@ export function createMultiSelectDropdown(options) {
   let isOpen = false;
   let openAbortController = null;
 
-  const close = () => {
+  /** Every element inside the panel a keyboard user can land on, in order. */
+  const getPanelFocusables = () => [
+    ...panel.querySelectorAll(
+      'button, input, select, textarea, [tabindex]:not([tabindex="-1"])'
+    )
+  ].filter(element => !element.disabled);
+
+  const close = ({ restoreFocus = true } = {}) => {
     if (!isOpen) return;
     isOpen = false;
 
@@ -189,10 +202,14 @@ export function createMultiSelectDropdown(options) {
       openAbortController = null;
     }
 
+    // Move focus out before hiding: a focused element inside a `display: none`
+    // subtree is dropped to `<body>`, which loses the user's place entirely.
+    const hadFocusInside = panel.contains(document.activeElement);
     panel.style.display = 'none';
     btn.setAttribute('aria-expanded', 'false');
     btn.classList.remove('open');
     panel.classList.remove('open');
+    if (restoreFocus && hadFocusInside) btn.focus({ preventScroll: true });
 
     // Reset pending state so next open reflects committed selection.
     pendingSelected = new Set(committedSelected);
@@ -224,18 +241,42 @@ export function createMultiSelectDropdown(options) {
     openAbortController = new AbortController();
     const { signal } = openAbortController;
 
-    // Close on Escape
+    // Close on Escape, and keep Tab inside the panel while it is open.
     document.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape') close();
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        close();
+        return;
+      }
+      if (e.key !== 'Tab') return;
+      const focusables = getPanelFocusables();
+      if (focusables.length === 0) return;
+      // Move focus explicitly rather than letting the engine's own Tab order
+      // decide: WebKit omits buttons from sequential focus, so a wrap-only trap
+      // lets focus escape the popup entirely there.
+      e.preventDefault();
+      const current = focusables.indexOf(document.activeElement);
+      const step = e.shiftKey ? -1 : 1;
+      const next = current < 0
+        ? (e.shiftKey ? focusables.length - 1 : 0)
+        : (current + step + focusables.length) % focusables.length;
+      focusables[next].focus();
     }, { signal });
 
     // Close on click outside
     document.addEventListener('mousedown', (e) => {
-      if (!wrapper.contains(e.target) && !panel.contains(e.target)) close();
+      if (!wrapper.contains(e.target) && !panel.contains(e.target)) {
+        close({ restoreFocus: false });
+      }
     }, { signal });
 
     // Update position on scroll (capture to catch scrolls from any ancestor)
     document.addEventListener('scroll', updatePanelPosition, { signal, capture: true });
+
+    // The panel lives at the end of <body>, so nothing would carry focus into
+    // it. Start on the filter box, or the first control when there is none.
+    const initialFocus = enableSearch ? searchInput : getPanelFocusables()[0];
+    initialFocus?.focus({ preventScroll: true });
   };
 
   const toggle = () => {
@@ -243,18 +284,12 @@ export function createMultiSelectDropdown(options) {
     else open();
   };
 
+  // A native <button> already turns Enter and Space into a click, and Escape is
+  // owned by the document listener installed while the panel is open, so the
+  // trigger needs no key handling of its own.
   btn.addEventListener('click', (e) => {
     e.stopPropagation();
     toggle();
-  });
-
-  btn.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' || e.key === ' ') {
-      e.preventDefault();
-      toggle();
-    } else if (e.key === 'Escape') {
-      close();
-    }
   });
 
   if (enableSearch) {
@@ -287,7 +322,8 @@ export function createMultiSelectDropdown(options) {
   updateMeta();
 
   const destroy = () => {
-    close();
+    // Teardown must not pull focus back to a button that is about to be removed.
+    close({ restoreFocus: false });
     wrapper.innerHTML = '';
     // Remove panel from body
     if (panel.parentNode) {

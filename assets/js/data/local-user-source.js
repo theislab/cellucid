@@ -12,9 +12,14 @@ import {
   MAX_METADATA_JSON_BYTES,
   MAX_PREPARED_BROWSER_BYTES,
   isLocalUserUrl,
-  validateDatasetIdentity
+  validateDatasetIdentity,
+  validateVectorFieldsMetadata
 } from './data-source.js';
 import { expandObsManifest, expandVarManifest } from './data-loaders.js';
+import {
+  MAX_CATEGORICAL_CATEGORIES,
+  categoricalStorageForDtype,
+} from './categorical-storage-contract.js';
 import {
   CONNECTIVITY_MANIFEST_CONTEXT,
   getConnectivityIndexStorage,
@@ -29,8 +34,8 @@ import {
   waitForMetadata,
 } from './metadata-load-contract.js';
 import { parseEmbeddingMetadata } from './dimension-manager.js';
-import { isH5adFile, createH5adLoader, H5adDataSource, createH5adDataSource } from './h5ad.js';
-import { isZarrDirectory, createZarrLoader, ZarrDataSource, createZarrDataSource } from './zarr.js';
+import { isH5adFile, H5adDataSource, createH5adDataSource } from './h5ad.js';
+import { ZarrDataSource, createZarrDataSource } from './zarr.js';
 import { getNotificationCenter } from '../app/notification-center.js';
 
 /**
@@ -136,7 +141,6 @@ function parsePreparedLocalUrl(url) {
 const MAX_EAGER_GENE_VALIDATION_BYTES = 64 * 1024 * 1024;
 const MAX_EAGER_GENE_VALIDATION_FILES = 256;
 const FLOAT32_BYTES = Float32Array.BYTES_PER_ELEMENT;
-const PREPARED_DIMENSIONS = new Set([1, 2, 3]);
 const PREPARED_DTYPE_INFO = Object.freeze({
   float64: {
     bytes: 8,
@@ -164,6 +168,23 @@ function preparedDataError(message, source, details = {}) {
   return new DataSourceError(
     message,
     DataSourceErrorCode.INVALID_FORMAT,
+    source,
+    details
+  );
+}
+
+/**
+ * A prepared directory refused for its size, not for its shape.
+ *
+ * The file is a valid export; it is only bigger than a browser ceiling. Sharing
+ * `INVALID_FORMAT` with the malformed-export failures is what routed it to the
+ * "re-export it with cellucid prepare" advice, which regenerates the identical
+ * file and meets the identical ceiling (CEL-0219).
+ */
+function preparedTooLargeError(message, source, details = {}) {
+  return new DataSourceError(
+    message,
+    DataSourceErrorCode.TOO_LARGE,
     source,
     details
   );
@@ -227,7 +248,7 @@ function checkedPreparedBytes(count, width, label, source) {
   }
   const bytes = count * width;
   if (bytes > MAX_PREPARED_BROWSER_BYTES) {
-    throw preparedDataError(
+    throw preparedTooLargeError(
       `${label} requires more than the 512 MiB browser working-set limit; use the Cellucid server instead`,
       source,
       { bytes, limit: MAX_PREPARED_BROWSER_BYTES }
@@ -249,7 +270,7 @@ function checkedPreparedWorkingSet(parts, label, source) {
     total += BigInt(part);
   }
   if (total > BigInt(MAX_PREPARED_BROWSER_BYTES)) {
-    throw preparedDataError(
+    throw preparedTooLargeError(
       `${label} working set exceeds the 512 MiB browser limit; use the Cellucid server instead`,
       source,
       {
@@ -376,15 +397,25 @@ function validatePreparedPathCompression(
   }
 }
 
+/**
+ * Validate the optional `export_settings` block of a prepared identity.
+ *
+ * `created_at` and `export_settings` are optional top-level keys of the export
+ * format, and the hosted-catalog reader treats them that way. A prepared export
+ * declares its compression in the manifests, which are required and which
+ * `expandObsManifest()` has already checked against every path pattern they
+ * carry, so the local reader resolves compression from `obs_manifest.json` and
+ * uses `export_settings` — when the producer wrote it — only to cross-check.
+ * `created_at` is validated for shape by `validateDatasetIdentity()` and read
+ * by nothing here.
+ *
+ * @param {Object} identity
+ * @param {string} source
+ * @returns {Object|null} the declared settings, or null when absent
+ */
 function validatePreparedIdentityExportContract(identity, source) {
-  if (
-    !Object.hasOwn(identity, 'created_at') ||
-    !Object.hasOwn(identity, 'export_settings')
-  ) {
-    throw preparedDataError(
-      'Prepared dataset_identity.json requires created_at and export_settings.',
-      source
-    );
+  if (!Object.hasOwn(identity, 'export_settings')) {
+    return null;
   }
   const settings = identity.export_settings;
   requirePreparedExactKeys(
@@ -428,7 +459,7 @@ function validatePreparedIdentityExportContract(identity, source) {
   return settings;
 }
 
-function getPreparedEmbeddingPlans(identity, source) {
+function getPreparedEmbeddingPlans(identity, compression, source) {
   const nCells = identity.stats.n_cells;
   let parsed;
   try {
@@ -459,7 +490,7 @@ function getPreparedEmbeddingPlans(identity, source) {
       );
       validatePreparedPathCompression(
         filename,
-        identity.export_settings.compression,
+        compression,
         `Embedding file for ${dimension}D`,
         source
       );
@@ -567,7 +598,15 @@ function validatePreparedPayloadPathUniqueness(
   }
 }
 
-function validatePreparedObsManifest(rawManifest, identity, source) {
+/**
+ * @param {Object} rawManifest
+ * @param {Object} identity
+ * @param {Object|null} settings - Declared export_settings, or null when the
+ *   optional block is absent. `obs_manifest.json` is required, so its own
+ *   `compression` is the export's compression either way.
+ * @param {string} source
+ */
+function validatePreparedObsManifest(rawManifest, identity, settings, source) {
   let manifest;
   try {
     manifest = expandObsManifest(rawManifest);
@@ -606,14 +645,14 @@ function validatePreparedObsManifest(rawManifest, identity, source) {
       source
     );
   }
-  const settings = identity.export_settings;
-  if (manifest.compression !== settings.compression) {
+  const compression = manifest.compression;
+  if (settings !== null && settings.compression !== compression) {
     throw preparedDataError(
       'obs_manifest.json compression must exactly match ' +
       'dataset_identity.json export_settings.compression.',
       source,
       {
-        manifestCompression: manifest.compression,
+        manifestCompression: compression,
         exportCompression: settings.compression,
       }
     );
@@ -640,28 +679,33 @@ function validatePreparedObsManifest(rawManifest, identity, source) {
       );
     }
     if (field.kind === 'continuous') {
-      const expectedBits = settings.obs_continuous_quantization;
-      if (
-        field.quantized !== (expectedBits !== null) ||
-        (
-          field.quantized &&
-          field.quantizationBits !== expectedBits
-        )
-      ) {
-        throw preparedDataError(
-          `Observation field "${field.key}" quantization must exactly ` +
-          'match dataset_identity.json export_settings.',
-          source
-        );
+      if (settings !== null) {
+        const expectedBits = settings.obs_continuous_quantization;
+        if (
+          field.quantized !== (expectedBits !== null) ||
+          (
+            field.quantized &&
+            field.quantizationBits !== expectedBits
+          )
+        ) {
+          throw preparedDataError(
+            `Observation field "${field.key}" quantization must exactly ` +
+            'match dataset_identity.json export_settings.',
+            source
+          );
+        }
       }
       validatePreparedPathCompression(
         field.valuesPath,
-        settings.compression,
+        compression,
         `Observation values for "${field.key}"`,
         source
       );
     } else {
-      if (field.codesDtype !== settings.obs_categorical_dtype) {
+      if (
+        settings !== null &&
+        field.codesDtype !== settings.obs_categorical_dtype
+      ) {
         throw preparedDataError(
           `Observation field "${field.key}" categorical dtype must ` +
           'exactly match dataset_identity.json export_settings.',
@@ -670,33 +714,35 @@ function validatePreparedObsManifest(rawManifest, identity, source) {
       }
       validatePreparedPathCompression(
         field.codesPath,
-        settings.compression,
+        compression,
         `Observation codes for "${field.key}"`,
         source
       );
       if (field.outlierQuantilesPath !== null) {
-        const expectedBits = settings.obs_continuous_quantization;
-        const actualBits = field.outlierDtype === 'uint8'
-          ? 8
-          : field.outlierDtype === 'uint16'
-            ? 16
-            : null;
-        if (
-          field.outlierQuantized !== (expectedBits !== null) ||
-          (
-            field.outlierQuantized &&
-            actualBits !== expectedBits
-          )
-        ) {
-          throw preparedDataError(
-            `Observation field "${field.key}" outlier quantization must ` +
-            'exactly match dataset_identity.json export_settings.',
-            source
-          );
+        if (settings !== null) {
+          const expectedBits = settings.obs_continuous_quantization;
+          const actualBits = field.outlierDtype === 'uint8'
+            ? 8
+            : field.outlierDtype === 'uint16'
+              ? 16
+              : null;
+          if (
+            field.outlierQuantized !== (expectedBits !== null) ||
+            (
+              field.outlierQuantized &&
+              actualBits !== expectedBits
+            )
+          ) {
+            throw preparedDataError(
+              `Observation field "${field.key}" outlier quantization must ` +
+              'exactly match dataset_identity.json export_settings.',
+              source
+            );
+          }
         }
         validatePreparedPathCompression(
           field.outlierQuantilesPath,
-          settings.compression,
+          compression,
           `Observation outliers for "${field.key}"`,
           source
         );
@@ -936,78 +982,6 @@ export class LocalUserDirDataSource {
       adopted = true;
 
       console.log(`[LocalUserDirDataSource] Loaded h5ad file: ${file.name}`);
-
-      return this._metadata;
-    } catch (error) {
-      if (selectionEpoch !== this._selectionEpoch) {
-        throw this._createSupersededSelectionError();
-      }
-      throw error;
-    } finally {
-      if (!adopted) {
-        candidateSource.clear();
-      }
-    }
-  }
-
-  /**
-   * Load a zarr directory
-   * @param {FileList} fileList - FileList from directory input
-   * @returns {Promise<DatasetMetadata>}
-   */
-  async loadFromZarrDirectory(fileList) {
-    const selectionEpoch = this._beginSelection();
-    if (!isZarrDirectory(fileList)) {
-      throw new DataSourceError(
-        'Not a zarr directory. Expected .zarr extension or zarr structure files.',
-        DataSourceErrorCode.INVALID_FORMAT,
-        this.type
-      );
-    }
-
-    const candidateSource = createZarrDataSource();
-    let adopted = false;
-
-    try {
-      const firstPath = (
-        fileList[0].webkitRelativePath || fileList[0].name
-      ).replace(/\\/g, '/');
-      const sourceDatasetId =
-        `zarr_${firstPath.split('/')[0].replace(/\.zarr$/i, '')}`;
-      const candidateDatasetId = createLocalApplicationDatasetId(
-        'zarr-directory',
-        sourceDatasetId
-      );
-      await candidateSource.loadFromFileList(
-        fileList,
-        {
-          showProgress: false,
-          datasetId: candidateDatasetId,
-          description: 'Loaded directly from Zarr directory',
-          source: {
-            name: 'Zarr directory',
-          },
-        }
-      );
-      this._assertSelectionCurrent(selectionEpoch);
-
-      const candidateDirectoryPath = candidateSource.dirname;
-      const candidateMetadata =
-        await candidateSource.getMetadata(candidateDatasetId);
-      this._assertSelectionCurrent(selectionEpoch);
-
-      // Commit only after the candidate is completely usable.
-      this._cleanup();
-      this._zarrSource = candidateSource;
-      this._sourceMode = 'zarr';
-      this.datasetId = candidateDatasetId;
-      this.directoryPath = candidateDirectoryPath;
-      this._metadata = candidateMetadata;
-      this._identityId = candidateMetadata.id;
-      this._adoptionEpoch += 1;
-      adopted = true;
-
-      console.log(`[LocalUserDirDataSource] Loaded zarr directory: ${this.directoryPath}`);
 
       return this._metadata;
     } catch (error) {
@@ -1273,12 +1247,17 @@ export class LocalUserDirDataSource {
   async _readFileAsText(filename, signal = null) {
     throwIfPreparedAborted(signal);
     const file = this._getFile(filename);
-    if (
-      !Number.isSafeInteger(file.size) ||
-      file.size < 0 ||
-      file.size > MAX_METADATA_JSON_BYTES
-    ) {
+    // A size that is not a size is a broken File, not an oversized one: the two
+    // need different advice and so carry different codes.
+    if (!Number.isSafeInteger(file.size) || file.size < 0) {
       throw preparedDataError(
+        `${filename} does not report a readable byte length`,
+        this.type,
+        { filename, size: file.size }
+      );
+    }
+    if (file.size > MAX_METADATA_JSON_BYTES) {
+      throw preparedTooLargeError(
         `${filename} exceeds the ${MAX_METADATA_JSON_BYTES}-byte metadata limit`,
         this.type,
         { filename, size: file.size }
@@ -1287,7 +1266,7 @@ export class LocalUserDirDataSource {
     const text = await file.text();
     throwIfPreparedAborted(signal);
     if (text.length > MAX_METADATA_JSON_BYTES) {
-      throw preparedDataError(
+      throw preparedTooLargeError(
         `${filename} exceeds the ${MAX_METADATA_JSON_BYTES}-character metadata limit`,
         this.type,
         { filename, length: text.length }
@@ -1312,6 +1291,9 @@ export class LocalUserDirDataSource {
       return await this._readFileAsJson(filename, signal);
     } catch (cause) {
       if (cause?.name === 'AbortError') throw cause;
+      // A file refused for its size never reached JSON.parse, so calling it
+      // "Invalid <filename>" accuses a document nothing has read yet.
+      if (cause?.code === DataSourceErrorCode.TOO_LARGE) throw cause;
       throw preparedDataError(
         `Invalid ${filename}: ${cause?.message || cause}`,
         this.type,
@@ -1331,12 +1313,15 @@ export class LocalUserDirDataSource {
         { filename, cause }
       );
     }
-    if (
-      !Number.isSafeInteger(file.size) ||
-      file.size < 0 ||
-      file.size > MAX_PREPARED_BROWSER_BYTES
-    ) {
+    if (!Number.isSafeInteger(file.size) || file.size < 0) {
       throw preparedDataError(
+        `${filename}: does not report a readable byte length`,
+        this.type,
+        { filename, actualBytes: file.size }
+      );
+    }
+    if (file.size > MAX_PREPARED_BROWSER_BYTES) {
+      throw preparedTooLargeError(
         `${filename}: compressed or binary file size exceeds the 512 MiB browser limit`,
         this.type,
         { filename, actualBytes: file.size }
@@ -1645,9 +1630,10 @@ export class LocalUserDirDataSource {
             this.type
           );
         }
-        if (field.categories.length > 65_535) {
+        if (field.categories.length > MAX_CATEGORICAL_CATEGORIES) {
           throw preparedDataError(
-            `Invalid obs_manifest.json: categorical field "${field.key}" exceeds 65,535 categories`,
+            `Invalid obs_manifest.json: categorical field "${field.key}" ` +
+            `exceeds ${MAX_CATEGORICAL_CATEGORIES.toLocaleString('en-US')} categories`,
             this.type
           );
         }
@@ -1681,6 +1667,10 @@ export class LocalUserDirDataSource {
             this.type
           );
         }
+        const codesStorage = categoricalStorageForDtype(
+          codesDtype,
+          `Observation codes for "${field.key}"`
+        );
         const dtypeBytes = preparedDtypeBytes(
           codesDtype,
           `Observation codes for "${field.key}"`,
@@ -1692,16 +1682,21 @@ export class LocalUserDirDataSource {
           filename,
           this.type
         );
-        const defaultMissing = codesDtype === 'uint8' ? 255 : 65_535;
+        // The missing sentinel is the terminal code of its width, exactly, and
+        // `categorical-storage-contract.js` is where that pairing is derived
+        // for every reader. Accepting a wider range here only let a manifest
+        // this reader cannot actually interpret pass its first gate and fail
+        // later, from a layer that no longer knows which file was wrong.
+        const requiredMissing = codesStorage.missingValue;
         const missingValue = field.codesMissingValue;
         if (
-          !Number.isInteger(missingValue) ||
-          missingValue < 0 ||
-          missingValue > defaultMissing ||
-          field.categories.length > missingValue
+          missingValue !== requiredMissing ||
+          field.categories.length > codesStorage.maxCategories
         ) {
           throw preparedDataError(
-            `Invalid obs_manifest.json: categorical field "${field.key}" has an invalid missing-code contract`,
+            `Invalid obs_manifest.json: categorical field "${field.key}" must ` +
+            `declare the exact ${codesDtype} missing sentinel ${requiredMissing} ` +
+            `and at most ${requiredMissing} categories`,
             this.type
           );
         }
@@ -1756,7 +1751,12 @@ export class LocalUserDirDataSource {
     }
   }
 
-  async _validatePreparedVarPayloads(identity, signal = null) {
+  async _validatePreparedVarPayloads(
+    identity,
+    settings,
+    compression,
+    signal = null
+  ) {
     this._preparedLazyValidationPlans.clear();
     const stats = identity.stats;
     const hasManifest = this._fileExists('var_manifest.json');
@@ -1796,10 +1796,20 @@ export class LocalUserDirDataSource {
         this.type
       );
     }
+    if (manifest.compression !== compression) {
+      throw preparedDataError(
+        'var_manifest.json compression must exactly match the export ' +
+        'compression declared by obs_manifest.json.',
+        this.type,
+        {
+          manifestCompression: manifest.compression,
+          exportCompression: compression,
+        }
+      );
+    }
     if (
-      manifest.compression !== identity.export_settings.compression ||
-      manifest.quantization !==
-        identity.export_settings.var_quantization
+      settings !== null &&
+      manifest.quantization !== settings.var_quantization
     ) {
       throw preparedDataError(
         'var_manifest.json compression and quantization must exactly ' +
@@ -1834,7 +1844,7 @@ export class LocalUserDirDataSource {
       );
       validatePreparedPathCompression(
         filename,
-        identity.export_settings.compression,
+        compression,
         `Gene values for "${field.key}"`,
         this.type
       );
@@ -1909,7 +1919,11 @@ export class LocalUserDirDataSource {
     return manifest;
   }
 
-  async _validatePreparedConnectivity(identity, signal = null) {
+  async _validatePreparedConnectivity(
+    identity,
+    compression,
+    signal = null
+  ) {
     const stats = identity.stats;
     const hasManifest = this._fileExists('connectivity_manifest.json');
     const advertised = stats.has_connectivity;
@@ -2046,13 +2060,15 @@ export class LocalUserDirDataSource {
       'connectivity_manifest.json compression',
       this.type
     );
-    if (
-      manifest.compression !== identity.export_settings.compression
-    ) {
+    if (manifest.compression !== compression) {
       throw preparedDataError(
-        'connectivity_manifest.json compression must exactly match ' +
-        'dataset_identity.json export_settings.compression.',
-        this.type
+        'connectivity_manifest.json compression must exactly match the ' +
+        'export compression declared by obs_manifest.json.',
+        this.type,
+        {
+          manifestCompression: manifest.compression,
+          exportCompression: compression,
+        }
       );
     }
     if (
@@ -2273,23 +2289,24 @@ export class LocalUserDirDataSource {
     return manifest;
   }
 
-  async _validatePreparedVectorFields(identity, signal = null) {
+  async _validatePreparedVectorFields(
+    identity,
+    compression,
+    signal = null
+  ) {
     const metadata = identity.vector_fields;
     if (metadata == null) return null;
-    requirePreparedExactKeys(
-      metadata,
-      ['default_field', 'fields'],
-      [],
-      'dataset_identity.json vector_fields',
-      this.type
-    );
-    if (
-      !isPlainObject(metadata.fields) ||
-      Object.keys(metadata.fields).length === 0 ||
-      typeof metadata.default_field !== 'string' ||
-      metadata.default_field.length === 0 ||
-      !Object.hasOwn(metadata.fields, metadata.default_field)
-    ) {
+    // The shape — exact key sets, dimension ordering, the embeddings subset
+    // rule, one file per advertised dimension, and default_dimension being the
+    // largest advertised one — is owned by validateVectorFieldsMetadata() in
+    // data-source.js, so a local folder and a hosted catalog answer with the
+    // same rule. Only the export-file rules below are specific to reading a
+    // prepared export off disk.
+    validateVectorFieldsMetadata(metadata, {
+      availableDimensions: identity.embeddings.available_dimensions,
+      sourceType: this.type,
+    });
+    if (metadata.default_field === null) {
       throw preparedDataError(
         'dataset_identity.json vector_fields must declare fields and one exact default_field',
         this.type
@@ -2306,78 +2323,17 @@ export class LocalUserDirDataSource {
     ) {
       const [fieldId, field] = vectorFieldEntries[payloadIndex];
       throwIfPreparedAborted(signal);
-      const isUmap = fieldId.endsWith('_umap');
-      requirePreparedExactKeys(
-        field,
-        [
-          'label',
-          'available_dimensions',
-          'default_dimension',
-          'files',
-          ...(isUmap ? ['basis'] : []),
-        ],
-        [],
-        `dataset_identity.json vector field "${fieldId}"`,
-        this.type
-      );
-      // A vector field id is no longer a path component, so it carries no
-      // filename rule: it only has to name one field exactly.
-      if (
-        fieldId.length === 0 ||
-        field.label !== fieldId ||
-        !Array.isArray(field.available_dimensions) ||
-        !isPlainObject(field.files) ||
-        (isUmap && field.basis !== 'umap')
-      ) {
+      // Both writers derive these two: label is the field id character for
+      // character and basis is always "umap". A vector field id is not a path
+      // component, so it carries no filename rule beyond naming one field.
+      if (field.label !== fieldId || field.basis !== 'umap') {
         throw preparedDataError(
           `Invalid vector field "${fieldId}" id, label, or basis ` +
           'in dataset_identity.json.',
           this.type
         );
       }
-      const dimensions = [];
-      const seen = new Set();
-      for (const dimension of field.available_dimensions) {
-        if (
-          !Number.isSafeInteger(dimension) ||
-          !PREPARED_DIMENSIONS.has(dimension) ||
-          seen.has(dimension) ||
-          !identity.embeddings.available_dimensions.includes(dimension)
-        ) {
-          throw preparedDataError(
-            `Invalid vector field "${fieldId}" dimensions`,
-            this.type
-          );
-        }
-        seen.add(dimension);
-        dimensions.push(dimension);
-      }
-      if (
-        dimensions.length === 0 ||
-        dimensions.some(
-          (dimension, index) =>
-            index > 0 && dimension <= dimensions[index - 1]
-        ) ||
-        field.default_dimension !== dimensions.at(-1)
-      ) {
-        throw preparedDataError(
-          `Invalid vector field "${fieldId}" ordered dimensions or default dimension`,
-          this.type
-        );
-      }
-      const expectedFileKeys =
-        dimensions.map(dimension => `${dimension}d`);
-      const actualFileKeys = Object.keys(field.files);
-      if (
-        actualFileKeys.length !== expectedFileKeys.length ||
-        actualFileKeys.some(key => !expectedFileKeys.includes(key))
-      ) {
-        throw preparedDataError(
-          `Vector field "${fieldId}" files must contain exactly one path per advertised dimension.`,
-          this.type,
-          { expectedFileKeys, actualFileKeys }
-        );
-      }
+      const dimensions = field.available_dimensions;
       for (const dimension of dimensions) {
         const filename = validatePreparedPath(
           field.files[`${dimension}d`],
@@ -2386,7 +2342,7 @@ export class LocalUserDirDataSource {
         );
         const expectedFilename =
           `vectors/${payloadIndex}_${dimension}d.bin` +
-          (identity.export_settings.compression === null ? '' : '.gz');
+          (compression === null ? '' : '.gz');
         if (filename !== expectedFilename) {
           throw preparedDataError(
             `Vector field "${fieldId}" ${dimension}D must use exact ` +
@@ -2397,7 +2353,7 @@ export class LocalUserDirDataSource {
         }
         validatePreparedPathCompression(
           filename,
-          identity.export_settings.compression,
+          compression,
           `Vector field "${fieldId}" ${dimension}D`,
           this.type
         );
@@ -2521,7 +2477,8 @@ export class LocalUserDirDataSource {
       );
     }
     validateDatasetIdentity(identity, identity.id, this.type);
-    validatePreparedIdentityExportContract(identity, this.type);
+    const exportSettings =
+      validatePreparedIdentityExportContract(identity, this.type);
     const applicationDatasetId = `local-user:${identity.id}`;
 
     const rawObsManifest = await this._readRequiredJson(
@@ -2531,9 +2488,19 @@ export class LocalUserDirDataSource {
     const obsManifest = validatePreparedObsManifest(
       rawObsManifest,
       identity,
+      exportSettings,
       this.type
     );
-    const embeddingPlan = getPreparedEmbeddingPlans(identity, this.type);
+    // obs_manifest.json is required and self-consistent: expandObsManifest()
+    // has already matched its declared compression against the .gz suffix of
+    // every path pattern it carries. It is therefore the export's compression,
+    // and the optional export_settings block only has to agree with it.
+    const exportCompression = obsManifest.compression;
+    const embeddingPlan = getPreparedEmbeddingPlans(
+      identity,
+      exportCompression,
+      this.type
+    );
     for (const plan of embeddingPlan.plans) {
       checkedPreparedWorkingSet(
         plan.dimension === 3
@@ -2557,12 +2524,19 @@ export class LocalUserDirDataSource {
 
     const varManifest = await this._validatePreparedVarPayloads(
       identity,
+      exportSettings,
+      exportCompression,
       signal
     );
     const connectivityManifest =
-      await this._validatePreparedConnectivity(identity, signal);
+      await this._validatePreparedConnectivity(
+        identity,
+        exportCompression,
+        signal
+      );
     const vectorFields = await this._validatePreparedVectorFields(
       identity,
+      exportCompression,
       signal
     );
     validatePreparedPayloadPathUniqueness(

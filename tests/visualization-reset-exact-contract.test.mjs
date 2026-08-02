@@ -111,7 +111,20 @@ function createHarness() {
   };
 
   const calls = [];
-  const viewer = {};
+  // The reset resolves the navigation mode from the focused view's dimension
+  // rather than from an app-init capture, so the harness publishes one.
+  const viewer = {
+    focusedViewId: 'live',
+    viewDimension: 3,
+    getFocusedViewId() {
+      calls.push(['viewer', 'getFocusedViewId']);
+      return this.focusedViewId;
+    },
+    getViewDimension(viewId) {
+      calls.push(['viewer', 'getViewDimension', viewId]);
+      return this.viewDimension;
+    }
+  };
   for (const method of [
     'resetCamera',
     'setBackground',
@@ -226,6 +239,13 @@ test('visualization reset requires its exact dependency and DOM ownership graph'
       /setInvertLookX/
     );
 
+    const missingDimensionOwnerHarness = createHarness();
+    delete missingDimensionOwnerHarness.viewer.getViewDimension;
+    assert.throws(
+      () => initVisualizationReset(resetOptions(missingDimensionOwnerHarness)),
+      /getViewDimension/
+    );
+
     const missingRenderOwnerHarness = createHarness();
     delete missingRenderOwnerHarness.renderControls.updateSmokeStepSlider;
     assert.throws(
@@ -304,6 +324,8 @@ test('visualization reset restores every captured value without defaults or coer
     assert.deepEqual(harness.calls, [
       ['viewer', 'resetCamera'],
       ['viewer', 'setBackground', 'grid-dark'],
+      ['viewer', 'getFocusedViewId'],
+      ['viewer', 'getViewDimension', 'live'],
       ['viewer', 'setNavigationMode', 'orbit'],
       ['camera', 'toggleNavigationPanels', 'orbit'],
       ['camera', 'updateLookSensitivity'],
@@ -364,11 +386,17 @@ test('capturing invalid reset state fails visibly instead of repairing it', () =
       /lighting strength/i
     );
 
-    const invalidNavigationHarness = createHarness();
-    invalidNavigationHarness.cameraDom.navigationModeSelect.value = 'Orbit';
+    // The navigation mode a reset applies is derived from the focused view's
+    // dimension, so that is where an impossible value must be refused rather
+    // than silently resolved to some mode.
+    const invalidDimensionHarness = createHarness();
+    invalidDimensionHarness.viewer.viewDimension = 4;
+    const invalidDimensionReset = initVisualizationReset(
+      resetOptions(invalidDimensionHarness)
+    );
     assert.throws(
-      () => initVisualizationReset(resetOptions(invalidNavigationHarness)),
-      /navigation mode/i
+      () => invalidDimensionReset.resetVisualizationToDefaults(),
+      /exactly 1, 2, or 3/i
     );
 
     const nonBooleanHarness = createHarness();
@@ -425,6 +453,51 @@ test('visualization reset destruction detaches and fences retained reset intents
     assert.deepEqual(harness.calls, []);
     assert.equal(harness.renderDom.backgroundSelect.value, 'black');
     assert.equal(harness.cameraDom.navigationModeSelect.value, 'planar');
+  } finally {
+    globalThis.document = previousDocument;
+  }
+});
+
+test('reset applies the navigation mode the focused dimension implies', () => {
+  const previousDocument = globalThis.document;
+  globalThis.document = { addEventListener() {} };
+  try {
+    // A 1-D or 2-D embedding is driven with Planar. The page starts on Orbit
+    // long before a dataset exists, so resetting to that start value would drop
+    // a flat embedding into the disoriented view Reset Camera is meant to fix.
+    for (const [dimension, expectedMode] of [
+      [1, 'planar'],
+      [2, 'planar'],
+      [3, 'orbit']
+    ]) {
+      const harness = createHarness();
+      harness.viewer.focusedViewId = 'snap_2';
+      harness.viewer.viewDimension = dimension;
+      assert.equal(harness.cameraDom.navigationModeSelect.value, 'orbit');
+      const reset = initVisualizationReset(resetOptions(harness));
+
+      harness.cameraDom.navigationModeSelect.value = 'free';
+      harness.calls.length = 0;
+      reset.resetVisualizationToDefaults();
+
+      assert.equal(
+        harness.cameraDom.navigationModeSelect.value,
+        expectedMode,
+        `reset at ${dimension}D must select ${expectedMode}`
+      );
+      assert.deepEqual(
+        harness.calls.filter(call => (
+          call[1] === 'setNavigationMode'
+          || call[1] === 'toggleNavigationPanels'
+          || call[1] === 'getViewDimension'
+        )),
+        [
+          ['viewer', 'getViewDimension', 'snap_2'],
+          ['viewer', 'setNavigationMode', expectedMode],
+          ['camera', 'toggleNavigationPanels', expectedMode]
+        ]
+      );
+    }
   } finally {
     globalThis.document = previousDocument;
   }

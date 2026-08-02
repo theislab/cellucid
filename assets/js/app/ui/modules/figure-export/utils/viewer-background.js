@@ -176,6 +176,6 @@ export function buildViewerBackgroundFidelityWarnings(documentRef) {
     detail:
       'The background control could not be read, so whether the viewer is '
       + 'drawing its reference grid — and in which theme — cannot be confirmed. '
-      + 'Restore the rendering controls before exporting.',
+      + 'Reload the page and export again.',
   }];
 }

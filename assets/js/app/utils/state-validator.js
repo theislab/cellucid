@@ -8,6 +8,9 @@
  */
 
 import { Limits, FieldKind, OverlapStrategy } from './field-constants.js';
+import {
+  requireCategoricalCategoryCount
+} from '../../data/categorical-storage-contract.js';
 
 /**
  * Characters that occupy no glyph, so a key carrying one is stored as
@@ -285,11 +288,10 @@ export class StateValidator {
       );
     }
 
-    if (categoryLabels.size > Limits.MAX_CATEGORIES_PER_FIELD) {
-      throw new Error(
-        `Too many categories (max ${Limits.MAX_CATEGORIES_PER_FIELD})`
-      );
-    }
+    requireCategoricalCategoryCount(
+      categoryLabels.size,
+      'A user-defined categorical'
+    );
 
     return true;
   }

@@ -52,6 +52,14 @@ function fakeDom() {
     },
     getBoundingClientRect() {
       return { ...this.bounds };
+    },
+    // The slot measures the layout box a candidate occupies, not the
+    // transformed visual box a bounding rect reports.
+    get clientWidth() {
+      return this.bounds.width;
+    },
+    get clientHeight() {
+      return this.bounds.height;
     }
   };
   return host;

@@ -22,6 +22,13 @@
  * (not just mvpMatrix) because lighting calculations need eye-space positions.
  * Missing render state is a contract error; export never changes fidelity.
  *
+ * ANTIALIASING:
+ * `antialias` is a WebGL context-creation attribute, so the viewer's buffer
+ * carries whichever value the browser granted it and the user can turn it off.
+ * The export requests the granted value rather than a fixed `true`; the
+ * viewer's own control measures the difference at 18% of pixels at the default
+ * point size and 32% with ultra-light square points.
+ *
  * CROSS-BROWSER NOTES:
  * - Uses one HTMLCanvasElement WebGL2 backend in every supported browser
  * - preserveDrawingBuffer is enabled for reliable HTMLCanvasElement.toBlob
@@ -135,6 +142,7 @@ function buildHighlightOverlayBuffers({
 
 /**
  * @typedef {object} RenderStateForWebgl
+ * @property {boolean} antialias
  * @property {Float32Array} mvpMatrix
  * @property {Float32Array} viewMatrix
  * @property {Float32Array} modelMatrix
@@ -178,15 +186,21 @@ const rasterContextOwners = new WeakMap();
 
 /**
  * @param {HTMLCanvasElement} canvas
+ * @param {boolean} antialias - the multisampling the viewer's buffer has
  * @returns {WebGL2RenderingContext}
  */
-function getWebgl2Context(canvas) {
+function getWebgl2Context(canvas, antialias) {
   let gl;
   try {
     // preserveDrawingBuffer is important for reliable HTMLCanvasElement.toBlob across browsers.
     gl = canvas.getContext('webgl2', {
       alpha: true,
-      antialias: true,
+      // Multisampling is a property of the drawing buffer the user is looking
+      // at, not an export preference. The viewer's antialiasing control
+      // measures the difference at 18% of pixels at the default point size and
+      // 32% with ultra-light square points, so requesting a fixed `true` here
+      // would publish a smoother cloud than the screen ever drew.
+      antialias,
       // Source-over blending stores premultiplied RGB in transparent pixels.
       // Publish that exact ownership to canvas compositing and PNG encoding;
       // declaring the buffer unpremultiplied would apply alpha a second time.
@@ -398,6 +412,24 @@ function packBuffers({
  * @param {number} [options.alphaThreshold=0.01]
  * @returns {HTMLCanvasElement}
  */
+/**
+ * The largest sprite this export may ask the shader to draw.
+ *
+ * @param {WebGL2RenderingContext} gl
+ * @param {number} rasterScale - export pixels per source viewport pixel.
+ * @returns {number}
+ */
+function exportPointSizeMax(gl, rasterScale) {
+  const VIEWER_POINT_SIZE_MAX = 128;
+  const scaled = VIEWER_POINT_SIZE_MAX * Math.max(1, rasterScale);
+  const range = gl.getParameter(gl.ALIASED_POINT_SIZE_RANGE);
+  const driverMax = Array.isArray(range) || ArrayBuffer.isView(range)
+    ? Number(range[1])
+    : Number.NaN;
+  if (!Number.isFinite(driverMax) || driverMax <= 0) return scaled;
+  return Math.min(scaled, driverMax);
+}
+
 export function rasterizePointsWebgl({
   positions,
   colors,
@@ -472,6 +504,11 @@ export function rasterizePointsWebgl({
       );
     }
   }
+  if (typeof renderState.antialias !== 'boolean') {
+    throw new TypeError(
+      'Figure-export renderState.antialias must be an exact boolean.'
+    );
+  }
   if (
     renderState.fogNear < 0 ||
     renderState.fogFar < renderState.fogNear
@@ -540,7 +577,7 @@ export function rasterizePointsWebgl({
   const outW = outputWidthPx;
   const outH = outputHeightPx;
   const canvas = createRasterCanvas();
-  const gl = getWebgl2Context(canvas);
+  const gl = getWebgl2Context(canvas, renderState.antialias);
   try {
     configureExactDrawingBuffer(gl, canvas, outW, outH);
   } catch (error) {
@@ -640,6 +677,15 @@ export function rasterizePointsWebgl({
     const pointSize = pointSizePx;
 
     setF1(u('u_pointSize'), pointSize);
+    // The shader caps a sprite at 128 pixels of whatever it is drawing into.
+    // This raster is `s` times the screen, so a point that the viewer clamps at
+    // 128 must clamp at 128 * s here, or it would occupy a smaller fraction of
+    // the exported image than of the view it reproduces. Reachable in an
+    // ordinary 3D close-up: with attenuation the size grows as 1/eyeDepth.
+    //
+    // The driver's own maximum bounds it, because asking for a larger sprite
+    // than ALIASED_POINT_SIZE_RANGE allows is undefined rather than clamped.
+    setF1(u('u_pointSizeMax'), exportPointSizeMax(gl, s));
     setF1(u('u_sizeAttenuation'), sizeAttenuation);
     // IMPORTANT: Keep u_viewportHeight in the SOURCE viewport pixel units.
     //
@@ -766,6 +812,7 @@ export function rasterizePointsWebgl({
         gl.vertexAttribPointer(1, 4, gl.UNSIGNED_BYTE, true, 0, 0);
 
         setF1(u('u_pointSize'), overlayPoints.pointSizePx);
+        setF1(u('u_pointSizeMax'), exportPointSizeMax(gl, s));
         gl.drawArrays(gl.POINTS, 0, overlayPacked.count);
       }
     }
@@ -810,6 +857,7 @@ export function rasterizePointsWebgl({
       setHMat4(hu('u_projectionMatrix'), renderState.projectionMatrix);
 
       setHF1(hu('u_pointSize'), pointSize);
+      setHF1(hu('u_pointSizeMax'), exportPointSizeMax(gl, s));
       setHF1(hu('u_sizeAttenuation'), sizeAttenuation);
       setHF1(hu('u_viewportHeight'), srcViewportH);
       setHF1(hu('u_fov'), fov);

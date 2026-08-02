@@ -119,7 +119,7 @@ function requireIndexCollection(indices, owner, valueCount, { sorted = false } =
  * @example
  * const loader = new StreamingGeneLoader({
  *   dataLayer,
- *   config: { preloadCount: 100, networkConcurrency: 6 }
+ *   config: { preloadCount: 100, networkConcurrency: 12 }
  * });
  *
  * for await (const { gene, valuesA, valuesB } of loader.streamGenes(genes, groupA, groupB)) {
@@ -666,16 +666,30 @@ export class StreamingGeneLoader {
    * @private
    */
   _recalculateBufferSize() {
-    // Estimate bytes per gene: 4 bytes per cell (Float32)
-    // Memory usage per gene includes:
-    // - Raw data in state.varData.fields: cellCount × 4 bytes
-    // - Buffer reference: cellCount × 4 bytes
-    // - Gathered valuesA: ~cellCount × 4 bytes (subset)
-    // - Gathered valuesB: ~cellCount × 4 bytes (subset)
-    // - Worker thread copies: potentially 2x more
-    // Conservative estimate: 6x base size
+    // What one *buffered* gene costs, which is what this budget bounds.
+    //
+    // The buffer holds a reference to the DataLayer var-field array, not a copy
+    // of it, so the marginal cost of keeping one more gene buffered is exactly
+    // one `cellCount × 4` Float32 array — the array this loader is pinning by
+    // not releasing it yet. The per-gene working set that surrounds it (the two
+    // gathered group arrays in `streamGenes`, the worker-side copy the consumer
+    // makes, the transferred result) is bounded by the *consumer's* in-flight
+    // limit — `maxInFlightGenes` in differential expression, `maxInFlight` in
+    // marker discovery, both ≤ 8 — and does not grow when the buffer grows. So
+    // it must not be multiplied by the buffer size.
+    //
+    // Counting it as if it did (the previous 6x factor, which also counted the
+    // buffer's reference as a second copy of the same array) shrank the buffer
+    // to a sixth of the budget the caller asked for. That silently capped
+    // network parallelism too: `_startPrefetch` will not start more loads than
+    // there are free buffer slots, so on a 562k-cell dataset with the default
+    // 512 MB budget the loader could never keep more than 11 requests in flight
+    // no matter what `networkConcurrency` was set to.
+    //
+    // The factor of 2 kept here is one whole array of headroom per buffered
+    // gene, which is more than the transient it can actually be responsible for.
     const baseBytes = this._totalCells * 4;
-    const overheadMultiplier = 6; // Conservative: raw + buffer + 2 gathers + worker copies
+    const overheadMultiplier = 2;
     const bytesPerGene = this._bytesPerGene > 0
       ? this._bytesPerGene
       : baseBytes * overheadMultiplier;
@@ -785,7 +799,9 @@ export class StreamingGeneLoader {
       this._stats.bytesLoaded += values.byteLength;
 
       // The running estimate controls capacity only; it never changes data.
-      const newBytesPerGene = values.byteLength * 6;
+      // Same accounting as `_recalculateBufferSize`: one pinned array per
+      // buffered gene, plus one array of headroom.
+      const newBytesPerGene = values.byteLength * 2;
       this._bytesPerGene = this._bytesPerGene === 0
         ? newBytesPerGene
         : Math.round(this._bytesPerGene * 0.8 + newBytesPerGene * 0.2);

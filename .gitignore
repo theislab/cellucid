@@ -43,6 +43,6 @@ project_context.txt
 /.playwright-cli
 /node_modules/
 /playwright-report/
-/test-results/
+/test-results*/
 /output/
 /.cellucid-maintenance

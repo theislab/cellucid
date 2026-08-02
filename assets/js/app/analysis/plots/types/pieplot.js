@@ -66,8 +66,12 @@ const pieplotDefinition = {
 
       traces.push({
         type: 'pie',
-        labels, values,
-        name: pd.pageName,
+        // Slice labels are dataset category values; Plotly parses its HTML
+        // subset in slice text, the legend, and the `%{label}` hover
+        // substitution.
+        labels: labels.map(label => escapeHtml(label)),
+        values,
+        name: escapeHtml(pd.pageName ?? ''),
         hole: options.donut ? 0.4 : 0,
         domain: { x: [xStart, xStart + xSize], y: [yStart, yStart + ySize] },
         textinfo: options.showPercent && options.showLabels ? 'label+percent'
@@ -92,9 +96,12 @@ const pieplotDefinition = {
     const rows = Math.ceil(numPages / cols);
 
     const layout = BasePlot.createLayout({ showLegend: true });
-    layout.legend = { orientation: 'h', x: 0.5, xanchor: 'center', y: -0.05, font: { family: theme.fontFamily, size: theme.legendFontSize, color: theme.legend.text } };
+    layout.legend = { orientation: 'h', x: 0.5, xanchor: 'center', y: -0.05, yanchor: 'top', font: { family: theme.fontFamily, size: theme.legendFontSize, color: theme.legend.text } };
     layout.margin = { l: 20, r: 20, t: 40, b: 40 };
-    layout.height = rows * 200 + 60;
+    // No explicit `layout.height`: the render slot owns the box. A pixel height
+    // here overflows the sidebar preview (painting over the Expand button and
+    // swallowing its clicks) and leaves a dead band in the expanded overlay,
+    // because Plotly stops autosizing as soon as a height is given.
 
     // Add page name annotations
     layout.annotations = pageData.map((pd, index) => {

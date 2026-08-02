@@ -73,7 +73,10 @@ export function buildOverlayFidelityWarnings({
     warnings.push({
       title: 'Connectivity overlay not exported',
       detail:
-        'Connectivity lines are enabled in the viewer, but figure export currently exports the point layer only (no edges).',
+        'Connectivity edges are enabled in the viewer, but figure export '
+        + 'renders the point layer only, so the exported figure would omit the '
+        + 'edges the active view shows. Turn "Show connectivity edges" off '
+        + 'before exporting.',
     });
   }
 
@@ -84,7 +87,7 @@ export function buildOverlayFidelityWarnings({
       detail:
         'Figure export draws the point layer only, and the velocity-overlay '
         + 'control could not be read, so whether the viewer is drawing a vector '
-        + 'field cannot be confirmed. Restore the rendering controls before exporting.',
+        + 'field cannot be confirmed. Reload the page and export again.',
     });
   } else if (velocityEnabled) {
     warnings.push({
@@ -92,7 +95,8 @@ export function buildOverlayFidelityWarnings({
       detail:
         'The velocity vector field is enabled in the viewer, but figure export '
         + 'renders the point layer only, so the exported figure would omit the '
-        + 'flow the active view shows. Turn the velocity overlay off before exporting.',
+        + 'flow the active view shows. Turn "Show overlay" off under Vector '
+        + 'Field Overlay before exporting.',
     });
   }
 

@@ -1093,7 +1093,7 @@ export class GenesPanelController {
     const availableVariables =
       this.dataLayer.getAvailableVariables('gene_expression');
     if (!Array.isArray(availableVariables) || availableVariables.length === 0) {
-      throw new Error(ERROR_MESSAGES.GENE_NOT_FOUND);
+      throw new Error(formatError(ERROR_MESSAGES.NO_GENES_AVAILABLE));
     }
     const availableGenes = new Set();
     for (const [index, variable] of availableVariables.entries()) {
@@ -1117,7 +1117,7 @@ export class GenesPanelController {
     for (const gene of genes) {
       if (!availableGenes.has(gene)) {
         throw new Error(
-          `Requested custom gene "${gene}" was not found`
+          formatError(ERROR_MESSAGES.GENE_NOT_FOUND, { symbol: gene })
         );
       }
     }

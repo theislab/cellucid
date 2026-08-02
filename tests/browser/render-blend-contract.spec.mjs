@@ -1,9 +1,10 @@
 import { expect, test } from '@playwright/test';
 
+import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 
 const DATASET_URL =
-  '/?exportsBaseUrl=http%3A%2F%2F127.0.0.1%3A4173%2Ftests%2Fbrowser%2Ffixtures%2Fexports%2F&dataset=current-ui-prepared&acceptance=render-blend-contract-ci';
+  `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=render-blend-contract-ci`;
 
 async function installBlendBoundaryAudit(page) {
   await page.addInitScript(() => {
@@ -493,6 +494,7 @@ test('figure-export highlight failure restores depth writes transactionally', as
         pointSizePx: 4,
         positions: Float32Array.from([0, 0, 0]),
         renderState: {
+          antialias: true,
           cameraPosition: [0, 0, 3],
           fogColor: [0, 0, 0],
           fogDensity: 0,
@@ -557,6 +559,7 @@ test('figure-export canvas and PNG preserve translucent color during compositing
       pointSizePx: 16,
       positions: Float32Array.from([0, 0, 0]),
       renderState: {
+        antialias: true,
         cameraPosition: [0, 0, 3],
         fogColor: [0, 0, 0],
         fogDensity: 0,
@@ -652,6 +655,7 @@ test('transient figure-export contexts retire across repeated raster passes', as
       0, 0, 0, 1,
     ]);
     const renderState = {
+      antialias: true,
       cameraPosition: [0, 0, 3],
       fogColor: [0, 0, 0],
       fogDensity: 0,

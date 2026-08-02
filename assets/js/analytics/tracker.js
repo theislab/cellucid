@@ -274,12 +274,16 @@ function setupButtonTracking({ dataSourceManager } = {}) {
     const target = event.target?.closest(BUTTON_SELECTOR);
     if (!target) return;
 
+    // An analytics identifier is declared, never read off the control. Every
+    // content surface on a control here - its accessible name, its value, its
+    // text - is built from the loaded data or from something the user typed,
+    // so inferring an id from any of them sends that content to Google
+    // Analytics. The legend's per-category buttons are named after the
+    // categories of whichever dataset is open, and the highlight page buttons
+    // after names the user wrote. A control that declares nothing is counted
+    // by its element type instead.
     const analyticsId = normalizeAnalyticsId(
-      target.dataset.analyticsId
-      || target.id
-      || target.name
-      || target.getAttribute('aria-label')
-      || (target.textContent || '').slice(0, 80)
+      target.dataset.analyticsId || target.id
     ) || `button:${(target.tagName || 'unknown').toLowerCase()}`;
     if (!analyticsId) return;
 

@@ -42,7 +42,9 @@ export const DEFAULTS = {
   // Performance parameters
   batchSize: 100,
   memoryBudgetMB: 512,
-  networkConcurrency: 6,
+  // Must agree with PerformanceConfig.batch.networkConcurrency; see the
+  // measurement recorded there for why twelve.
+  networkConcurrency: 12,
   progressInterval: 100, // Emit partial results every N genes
 
   // Cache parameters
@@ -154,7 +156,13 @@ export const FOLD_CHANGE_THRESHOLDS = [
 // =============================================================================
 
 /**
- * User-facing error messages with recovery hints
+ * User-facing error messages with recovery hints.
+ *
+ * An entry that contains a `{placeholder}` is a template, and it reaches a user
+ * only through `formatError`, which refuses to leave a placeholder unfilled.
+ * Throwing such an entry directly would put the literal `{placeholder}` text in
+ * front of the user, so `tests/genes-panel-error-message-substitution.test.mjs`
+ * rejects any reference to a templated entry outside a `formatError` call.
  */
 export const ERROR_MESSAGES = {
   NO_CATEGORICAL_OBS:
@@ -165,6 +173,9 @@ export const ERROR_MESSAGES = {
 
   TOO_FEW_GROUPS:
     'At least 2 groups required for marker analysis. Found: {n}.',
+
+  NO_GENES_AVAILABLE:
+    'This dataset publishes no gene expression fields, so no gene panel can be built. Load a dataset that includes gene expression.',
 
   GENE_NOT_FOUND:
     'Gene "{symbol}" not found in dataset. Check spelling or try another gene.',

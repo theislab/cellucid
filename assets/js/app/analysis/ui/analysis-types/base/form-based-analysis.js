@@ -49,6 +49,10 @@ import {
   createExpandButton,
   renderPlotOptions
 } from '../../components/index.js';
+import {
+  applyFormControlAccessibility
+} from '../../components/control-accessibility.js';
+import { selectablePageIdSet } from '../../../shared/page-derivation-utils.js';
 import { loadPlotly, downloadImage } from '../../../plots/plotly-loader.js';
 import { PlotRegistry } from '../../../shared/plot-registry-utils.js';
 import { PlotlyRenderSlot } from '../../../shared/plotly-render-slot.js';
@@ -337,6 +341,13 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
 
   /**
    * Validate the complete settings schema owned by a concrete form analysis.
+   *
+   * A settings snapshot is imported before the importing panel has rendered —
+   * that is how a floating analysis window is populated — so this cannot ask a
+   * page selector that does not exist yet, and Differential Expression and
+   * Marker Genes never build one at all. It resolves the shared selectable
+   * domain instead, which is what the exporting panel was selecting from.
+   *
    * @param {unknown} settings
    * @param {string[]} expectedKeys
    * @returns {{ selectedPages: string[], formControls: Object }}
@@ -346,15 +357,13 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
     requireExactKeys(settings, expectedKeys, 'Form-based analysis settings');
     requirePageIds(settings.selectedPages);
     requireFormControlSnapshot(settings.formControls);
-    const pages = this._pageSelector
-      ? this._pageSelector._getPages()
-      : this.dataLayer.getPages();
+    const pages = this.dataLayer.getPages();
     if (!Array.isArray(pages)) {
       throw new TypeError(
         'Form-based analysis page inventory must be an array'
       );
     }
-    const availablePageIds = new Set(pages.map(page => page.id));
+    const availablePageIds = selectablePageIdSet(pages);
     for (const pageId of settings.selectedPages) {
       if (!availablePageIds.has(pageId)) {
         throw new Error(
@@ -374,7 +383,23 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
   }
 
   /**
-   * Validate custom page colors against the initialized page selector.
+   * Validate custom page colors against the shared selectable page domain.
+   *
+   * `importSettings` validates one settings object against two page rules: its
+   * `selectedPages` through `_requireExactFormSettings` above, and its
+   * `customPageColors` here. Those have to be the same rule. This one used to
+   * resolve its domain from `this._pageSelector._getPages()` — the widget's
+   * current view — which agrees with `selectablePageIdSet` only because every
+   * form-based selector happens to be built with `includeDerivedPages: true`
+   * (`correlation-analysis-ui.js:441`, `gene-signature-ui.js:360`). That option
+   * defaults to `false` (`page-selector.js:168`), so the next selector built
+   * without it would have accepted a rest-of page as a selection and refused a
+   * colour for the very same page, out of one saved session.
+   *
+   * The selector is still required, because `_applyCustomPageColors` is what
+   * consumes the result and `importSettings` must fail before it mutates
+   * anything rather than half-way through applying.
+   *
    * @param {unknown} entries
    * @returns {Array<[string, string]>}
    * @protected
@@ -388,9 +413,13 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
         'Custom page color settings require an initialized page selector'
       );
     }
-    const availablePageIds = new Set(
-      this._pageSelector._getPages().map(page => page.id)
-    );
+    const pages = this.dataLayer.getPages();
+    if (!Array.isArray(pages)) {
+      throw new TypeError(
+        'Form-based analysis page inventory must be an array'
+      );
+    }
+    const availablePageIds = selectablePageIdSet(pages);
     const colors = [];
     const seenPageIds = new Set();
     for (const entry of entries) {
@@ -617,7 +646,6 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
 
   async _ensurePreviewPlotSlot({
     containerId,
-    clickable = false,
     height = null
   }) {
     if (!(this._resultContainer instanceof HTMLElement)) {
@@ -656,17 +684,6 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
     this._resultContainer.innerHTML = '';
     const previewContainer = document.createElement('div');
     previewContainer.className = 'analysis-preview-container';
-    if (clickable) {
-      previewContainer.style.cursor = 'pointer';
-      previewContainer.title =
-        'Click to open in full view with statistics and export options';
-      previewContainer.addEventListener('click', () => {
-        this._trackInteractiveTask(
-          this._openExpandedView(),
-          'Expanded analysis view'
-        );
-      });
-    }
 
     const host = document.createElement('div');
     host.className = 'analysis-preview-plot-host';
@@ -682,14 +699,38 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
     return slot;
   }
 
+  /**
+   * Render an analysis preview and, once it has a plot, the control that opens
+   * the full view.
+   *
+   * The expand affordance used to be each subclass's own business: DE, Marker
+   * Genes and Gene Signature each appended an identical `.analysis-actions` row
+   * after calling this method, while Correlation asked only for the preview
+   * container's `clickable` shortcut — a bare click listener on a `<div>` with
+   * `tabindex="-1"` and no role. Correlation's expanded view was therefore
+   * unreachable by keyboard and unannounced. The affordance belongs to the
+   * preview, so it is rendered here, once, for every mode.
+   *
+   * @param {Object} options
+   * @param {Object} options.result - Analysis result to plot.
+   * @param {number} options.requestId - Owning analysis request.
+   * @param {string} options.containerId - Exact id for the plot host.
+   * @param {boolean} [options.expandable=false] - Offer the full-view control.
+   * @param {number|null} [options.height=null] - Fixed preview height in px.
+   * @param {Function} [options.onRendered] - Plot-slot render callback.
+   * @returns {Promise<HTMLElement|null>} The rendered candidate, or null.
+   */
   async _renderPreviewPlot({
     result,
     requestId,
     containerId,
-    clickable = false,
+    expandable = false,
     height = null,
     onRendered
   }) {
+    if (typeof expandable !== 'boolean') {
+      throw new TypeError('Analysis preview expandable must be a boolean');
+    }
     if (!this._isCurrentAnalysisRequest(requestId)) return null;
     if (
       result === null ||
@@ -712,7 +753,6 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
     );
     const slot = await this._ensurePreviewPlotSlot({
       containerId,
-      clickable,
       height
     });
     if (!this._isCurrentAnalysisRequest(requestId)) return null;
@@ -736,7 +776,37 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
       }
     );
     if (candidate === null) return null;
+    if (expandable && this._isCurrentAnalysisRequest(requestId)) {
+      this._renderPreviewExpandAction();
+    }
     return candidate;
+  }
+
+  /**
+   * Put the full-view control below the preview it opens.
+   *
+   * `.analysis-actions` already carries the row's layout, so nothing here sets
+   * geometry inline.
+   *
+   * @returns {HTMLButtonElement} The rendered expand button.
+   * @protected
+   */
+  _renderPreviewExpandAction() {
+    if (!(this._resultContainer instanceof HTMLElement)) {
+      throw new TypeError(
+        'Analysis preview requires an initialized result container'
+      );
+    }
+    const priorActions = this._resultContainer.querySelector('.analysis-actions');
+    if (priorActions !== null) priorActions.remove();
+
+    const actions = document.createElement('div');
+    actions.className = 'analysis-actions';
+    const expandBtn = this._createExpandButton();
+    expandBtn.title = 'Open in full view with statistics and export options';
+    actions.appendChild(expandBtn);
+    this._resultContainer.appendChild(actions);
+    return expandBtn;
   }
 
   _trackModalCloseTask(task) {
@@ -861,43 +931,120 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
         }
       }
 
-      // Set modal title
-      const title = result.title || this._getTitle();
-      const subtitle = result.subtitle || '';
-      modal._title.textContent = subtitle ? `${title}: ${subtitle}` : title;
-
-      // Render options panel (right side)
-      this._renderModalOptions(modal._optionsContent);
-
       openModal(modal);
 
-      await loadPlotly();
-      if (this._modal !== modal || this._lastResult !== result) {
+      const rendered = await this._renderExpandedViewContent(modal, result);
+      if (!rendered && this._modal === modal) {
         await closeModal(modal);
-        return;
       }
-      await this._renderModalPlot(modal._plotContainer, {
-        isCurrent: () => (
-          !this._isDestroyed &&
-          this._modal === modal &&
-          this._lastResult === result
-        ),
-        modal,
-        result
-      });
-      if (this._modal !== modal || this._lastResult !== result) return;
-
-      // Render summary stats (bottom left)
-      this._renderModalStats(modal._statsContent);
-
-      // Render statistical annotations (bottom right)
-      this._renderModalAnnotations(modal._annotationsContent);
     } catch (error) {
       await throwAfterModalCleanup(
         this,
         modal,
         error,
         `${this.constructor.name} expanded analysis view`
+      );
+    }
+  }
+
+  /**
+   * Draw one result into an already-open expanded view.
+   *
+   * Everything the overlay shows comes from the result it is given: title,
+   * options panel, plot, summary statistics and annotations. Keeping them in
+   * one place is what lets the overlay be *re-drawn* when a new result arrives,
+   * instead of only when it is first opened.
+   *
+   * @param {Object} modal - The open analysis modal.
+   * @param {Object} result - The result to draw.
+   * @returns {Promise<boolean>} False when ownership changed mid-render.
+   * @protected
+   */
+  async _renderExpandedViewContent(modal, result) {
+    const title = result.title || this._getTitle();
+    const subtitle = result.subtitle || '';
+    modal._title.textContent = subtitle ? `${title}: ${subtitle}` : title;
+
+    // Render options panel (right side)
+    this._renderModalOptions(modal._optionsContent);
+
+    await loadPlotly();
+    if (
+      this._isDestroyed ||
+      this._modal !== modal ||
+      this._lastResult !== result
+    ) {
+      return false;
+    }
+
+    await this._renderModalPlot(modal._plotContainer, {
+      isCurrent: () => (
+        !this._isDestroyed &&
+        this._modal === modal &&
+        this._lastResult === result
+      ),
+      modal,
+      result
+    });
+    if (this._modal !== modal || this._lastResult !== result) return false;
+
+    // Render summary stats (bottom left)
+    this._renderModalStats(modal._statsContent);
+
+    // Render statistical annotations (bottom right)
+    this._renderModalAnnotations(modal._annotationsContent);
+    return true;
+  }
+
+  /**
+   * Publish a completed analysis as this UI's current result.
+   *
+   * The overlay used to be bound to whichever result was current when it was
+   * opened, and nothing re-drew it afterwards. Changing the inputs with the
+   * overlay open therefore left the two surfaces showing different science at
+   * the same time — measured on Gene Signature, the sidebar preview moved to
+   * mean 1.448292 while the overlay still showed mean 3.966388 under a title
+   * naming the previous gene set. Detailed analysis already refreshed its open
+   * modal (`_updateModal`); this is that missing counterpart for every
+   * form-based mode.
+   *
+   * @param {Object} result - The newly completed result.
+   * @param {number|null} [requestId] - Owning analysis request, when there is one.
+   * @returns {Promise<void>}
+   * @protected
+   */
+  async _publishAnalysisResult(result, requestId = null) {
+    this._lastResult = result;
+    this._currentPageData = result.data || result;
+    this._requestedPlotOptions = structuredClone(result.options || {});
+
+    const modal = this._modal;
+    if (modal === null || modal === undefined) return;
+    if (requestId !== null && !this._isCurrentAnalysisRequest(requestId)) return;
+
+    try {
+      await this._renderExpandedViewContent(modal, result);
+    } catch (error) {
+      // A stale overlay is worse than no overlay: it shows a result the user
+      // has already replaced. Close it and say why, rather than reporting the
+      // analysis — which succeeded — as failed. A teardown failure on top of
+      // the render failure is reported alongside it, never in place of it.
+      if (this._modal === modal) this._modal = null;
+      let cleanupError = null;
+      try {
+        await closeModal(modal);
+      } catch (closeFailure) {
+        cleanupError = closeFailure;
+      }
+      const reported = cleanupError === null
+        ? combineErrors([error], '')
+        : new AggregateError(
+          [error, cleanupError],
+          'Expanded view refresh and its teardown both failed'
+        );
+      this._notifications.error(
+        `Expanded view could not follow the new result: ${reported.message}`,
+        { category: 'analysis', title: 'Analysis Error' }
       );
     }
   }
@@ -1293,6 +1440,11 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
    * @override
    */
   _renderControls() {
+    // Collapsing an analysis accordion and opening it again rebuilds the form,
+    // which threw away every choice the user had made in it — the Marker Genes
+    // mode, statistical method and cache checkbox all snapped back to their
+    // defaults. Carry the named control values across the rebuild.
+    const carriedValues = this._captureFormControlValues();
     this._formContainer.innerHTML = '';
 
     // Validate page requirements
@@ -1313,6 +1465,15 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
 
     // Let subclass render form controls
     this._renderFormControls(wrapper);
+
+    // Scope ids to this UI instance, so a copied window cannot steal the
+    // sidebar's controls through a duplicate id, and name the rows the shared
+    // form factories did not build.
+    applyFormControlAccessibility(wrapper, this._controlScope);
+    // Restore before the intent listeners exist: re-stating the values the user
+    // already chose is not a fresh edit and must not schedule an analysis.
+    this._restoreFormControlValues(wrapper, carriedValues);
+
     const handleInputIntent = () => this._handleFormInputIntent();
     wrapper.addEventListener('input', handleInputIntent);
     wrapper.addEventListener('change', handleInputIntent);
@@ -1326,6 +1487,77 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
     wrapper.appendChild(runBtn);
 
     this._formContainer.appendChild(wrapper);
+  }
+
+  /**
+   * Snapshot the current named form-control values, if a form is rendered.
+   *
+   * Unlike {@link _snapshotNamedFormControls} this is lenient: it is used to
+   * carry a user's choices across a rebuild of the same form, so a missing form
+   * is simply "nothing to carry" rather than an error.
+   *
+   * @returns {Map<string, {checkbox: boolean, value: string|boolean}>|null}
+   * @protected
+   */
+  _captureFormControlValues() {
+    const form = this._formContainer?.querySelector?.('.analysis-form');
+    if (!form) return null;
+    const values = new Map();
+    for (const element of form.querySelectorAll(
+      'input[name], select[name], textarea[name]'
+    )) {
+      const name = element.getAttribute('name');
+      if (typeof name !== 'string' || name.length === 0) continue;
+      if (values.has(name)) continue;
+      values.set(
+        name,
+        element instanceof HTMLInputElement && element.type === 'checkbox'
+          ? { checkbox: true, value: element.checked }
+          : { checkbox: false, value: element.value }
+      );
+    }
+    return values;
+  }
+
+  /**
+   * Re-apply carried values to a freshly rendered form.
+   *
+   * A control that no longer exists, changed kind, or no longer offers the
+   * stored option keeps the new form's default — a selection that is no longer
+   * valid for the current dataset must not survive.
+   *
+   * @param {HTMLElement} root - The freshly rendered form.
+   * @param {Map<string, {checkbox: boolean, value: string|boolean}>|null} values
+   * @protected
+   */
+  _restoreFormControlValues(root, values) {
+    if (values === null || values.size === 0) return;
+    for (const element of root.querySelectorAll(
+      'input[name], select[name], textarea[name]'
+    )) {
+      const stored = values.get(element.getAttribute('name'));
+      if (stored === undefined) continue;
+      const isCheckbox = element instanceof HTMLInputElement
+        && element.type === 'checkbox';
+      if (stored.checkbox !== isCheckbox) continue;
+      if (isCheckbox) {
+        if (element.checked === stored.value) continue;
+        element.checked = stored.value;
+      } else {
+        if (
+          element instanceof HTMLSelectElement &&
+          ![...element.options].some(option => option.value === stored.value)
+        ) {
+          continue;
+        }
+        if (element.value === stored.value) continue;
+        element.value = stored.value;
+      }
+      element.dispatchEvent(new Event(
+        element instanceof HTMLTextAreaElement ? 'input' : 'change',
+        { bubbles: true }
+      ));
+    }
   }
 
   /**
@@ -1387,9 +1619,7 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
         if (!this._isCurrentAnalysisRequest(requestId)) return;
 
         // Publish result/data only after the owned render transaction commits.
-        this._lastResult = result;
-        this._currentPageData = result.data;
-        this._requestedPlotOptions = structuredClone(result.options || {});
+        await this._publishAnalysisResult(result, requestId);
 
         // Callback
         if (this.onResultChange !== null && this.onResultChange !== undefined) {

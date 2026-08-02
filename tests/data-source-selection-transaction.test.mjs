@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { readFile } from 'node:fs/promises';
 
 import {
   createDataSourceManager
@@ -507,4 +508,54 @@ test(
       /requires one registered custom protocol URL/i
     );
   }
+);
+
+test(
+  'the data source manager exposes exactly the members its consumers reach',
+  async () => {
+    const managerSource = await readFile(
+      new URL('../assets/js/data/data-source-manager.js', import.meta.url),
+      'utf8',
+    );
+    const manager = createDataSourceManager();
+
+    // `fetch` has no literal call site: session restore-from-URL reaches it
+    // through `requireMethod(ctx.dataSourceManager, 'fetch', ...)`, and figure
+    // export reaches `getStateSnapshot` through a method-name list. Deleting
+    // either because a call-site search came back empty breaks a live path, so
+    // both the lookup and the member are pinned here.
+    const serializerSource = await readFile(
+      new URL(
+        '../assets/js/app/session/session-serializer.js',
+        import.meta.url,
+      ),
+      'utf8',
+    );
+    assert.match(
+      serializerSource,
+      /requireMethod\(\s*ctx\.dataSourceManager,\s*'fetch',/,
+    );
+    assert.equal(typeof manager.fetch, 'function');
+
+    const exportSource = await readFile(
+      new URL(
+        '../assets/js/app/ui/modules/figure-export/figure-export-engine.js',
+        import.meta.url,
+      ),
+      'utf8',
+    );
+    assert.match(exportSource, /'getStateSnapshot',/);
+    assert.equal(typeof manager.getStateSnapshot, 'function');
+
+    // Nothing anywhere restores a snapshot through the manager, and nothing
+    // fetches JSON through it, so neither member may return.
+    for (const removed of ['restoreState', 'fetchJson']) {
+      assert.equal(
+        manager[removed],
+        undefined,
+        `${removed} has no consumer; re-adding it re-creates dead surface`,
+      );
+      assert.equal(managerSource.includes(removed), false);
+    }
+  },
 );

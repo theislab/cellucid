@@ -17,6 +17,32 @@ import {
 } from './shaders/high-perf-shaders.js';
 import { getNotificationCenter } from '../app/notification-center.js';
 import { configureStraightAlphaBlending } from './gl-utils.js';
+import {
+  requireDimensionLevel,
+  requireFiniteNumber,
+  requireNumericVector,
+  requireRenderContract,
+  requireShaderQuality,
+  requireSnapshotAlphas,
+  requireSnapshotColors,
+  requireSnapshotPointData,
+  requireViewId,
+} from './high-perf/renderer-contracts.js';
+import {
+  describeError,
+  settleCalculationNotification,
+} from './high-perf/calculation-notifications.js';
+import {
+  EMPTY_LOD_PROJECTION,
+  getReadOnlyLodProjection,
+  getReadOnlySpatialProjection,
+} from './high-perf/read-only-projections.js';
+import {
+  requireCleanWebGLState,
+  restorePointDrawBaseline,
+  settlePointDraw,
+} from './high-perf/gl-point-draw-state.js';
+import { SpatialIndex } from './high-perf/spatial-index.js';
 
 // ============================================================================
 // CONSTANTS
@@ -36,2525 +62,167 @@ const DEPTH_TEST_DIMENSION_THRESHOLD = 2;
  */
 let DEBUG_LOD_FRUSTUM = false;
 
-const SUPPORTED_DIMENSION_LEVELS = new Set([1, 2, 3]);
-const SUPPORTED_SHADER_QUALITIES = new Set(['full', 'light', 'ultralight']);
 
-const HIERARCHICAL_RADIX_BITS = 10;
-const HIERARCHICAL_RADIX_SIZE = 1 << HIERARCHICAL_RADIX_BITS;
-const HIERARCHICAL_RADIX_MASK = HIERARCHICAL_RADIX_SIZE - 1;
-const LOD_MAPPING_SENTINEL = 0xffffffff;
-const LOD_MAPPING_VISITED_BIT = 0x80000000;
-const LOD_FULL_DETAIL_ADMISSION_LEVEL = 0xff;
 const VISIBLE_INDEX_GROWTH_FACTOR = 1.5;
 const VISIBLE_INDEX_SHRINK_RATIO = 4;
 const VISIBLE_INDEX_MIN_RECLAIM = 256 * 1024;
-const EMPTY_LOD_PROJECTION = Object.freeze([]);
-const REQUIRED_RENDER_SCALAR_KEYS = Object.freeze([
-  'pointSize',
-  'sizeAttenuation',
-  'viewportHeight',
-  'viewportWidth',
-  'fov',
-  'lightingStrength',
-  'fogDensity',
-  'cameraDistance',
-]);
-const REQUIRED_RENDER_VECTOR_CONTRACTS = Object.freeze([
-  Object.freeze(['mvpMatrix', 16]),
-  Object.freeze(['viewMatrix', 16]),
-  Object.freeze(['modelMatrix', 16]),
-  Object.freeze(['projectionMatrix', 16]),
-  Object.freeze(['fogColor', 3]),
-  Object.freeze(['lightDir', 3]),
-  Object.freeze(['cameraPosition', 3]),
-]);
+/**
+ * Largest number of separate row regions one alpha publication may send.
+ *
+ * The alpha texture is a 2-D layout over a linear point index, so a change that
+ * touches few points touches few rows and is worth addressing directly. A
+ * change scattered across many rows is not: past this many regions the runs
+ * collapse into the single range that bounds them, which costs one call and at
+ * most the bytes a full upload always cost.
+ */
+const MAX_ALPHA_UPLOAD_REGIONS = 32;
+/**
+ * Points packed per full-detail interleaved upload chunk.
+ *
+ * The full-detail vertex store is sized on the GPU and then filled through this
+ * one fixed staging block, so the renderer never holds a client-side duplicate
+ * of the vertex buffer. The duplicate it replaces was a single `ArrayBuffer` of
+ * `pointCount * 16` bytes retained for the dataset's lifetime -- 16 bytes a
+ * point of resident memory that the GPU already held.
+ *
+ * This does not raise the largest publishable point count. The GPU vertex store
+ * is 16 bytes a point as well, and its own cap was then measured directly on
+ * all three engines by bisecting to the exact refusing byte count -- the
+ * `ARRAY_BUFFER` term, not a JS `ArrayBuffer` standing in for it:
+ *
+ *   Chromium  vertex store 2,145,386,496 B (= 2^31 - 2^21, the same cap its JS
+ *             `ArrayBuffer` allocator refuses one byte past) -> 134,086,656 pts
+ *   WebKit    vertex store 4,294,967,295 B (2^32 - 1; 2^32 is INVALID_VALUE)
+ *             -> 268,435,455 pts, one below its 16384^2 texture capacity
+ *   Firefox   vertex store 2,147,483,647 B (2^31 - 1; 2^31 is OUT_OF_MEMORY)
+ *             -> 134,217,727 pts, but its MAX_TEXTURE_SIZE is 8192, so the
+ *             alpha texture binds first at 67,108,864 pts
+ *
+ * So the vertex store binds on Chromium and WebKit and the alpha texture binds
+ * on Firefox, and removing the client-side duplicate moves none of them. What
+ * it buys is the memory needed to reach those counts, which is what decides
+ * whether a large dataset loads at all. Those are engine and API caps; the
+ * host's own memory is a separate and much lower practical bound.
+ *
+ * 65,536 points is 1 MiB: large enough that the per-chunk call overhead is one
+ * `bufferSubData` per 65,536 points, small enough that the block never scales
+ * with the dataset. Chunking is sound because every full-detail writer fills
+ * its destination strictly sequentially -- only the source index is arbitrary.
+ */
+const INTERLEAVED_CHUNK_POINTS = 65_536;
 // Renderer-created LOD projections receive a private readiness certificate
 // only after the complete deep CPU/GPU ownership validation succeeds. The
 // WeakMap cannot be forged by caller-provided fixtures and lets the render hot
 // path prove an unchanged accepted generation with constant-time identity
 // checks. Direct/external ensure calls retain the full structural validation.
 const LOD_RESOURCE_READINESS_CERTIFICATES = new WeakMap();
-const READ_ONLY_LOD_PROJECTIONS = new WeakMap();
-const READ_ONLY_SPATIAL_PROJECTIONS = new WeakMap();
-const READ_ONLY_SPATIAL_METHODS = new WeakMap();
-const READ_ONLY_MUTATOR_METHODS = new Set([
-  'add',
-  'clear',
-  'copyWithin',
-  'delete',
-  'ensureLODLevels',
-  'ensureLodNodeMappings',
-  'fill',
-  'pop',
-  'push',
-  'reverse',
-  'set',
-  'shift',
-  'sort',
-  'splice',
-  'unshift',
-]);
-const SPATIAL_PRIMITIVE_VISITOR_METHODS = new Set([
-  'visitProjectedRectCandidates',
-  'visitRadiusCandidates',
-  'visitRaySegmentCandidates',
-]);
+
+
+
+
+
+
+
 
 /**
- * Lazily expose a CPU spatial generation without handing callers its accepted
- * mutable graph. Typed arrays are copied only when actually observed; query
- * methods still execute against the exact renderer owner and recursively
- * project every callback/result.
- */
-function getReadOnlySpatialProjection(value, owner = 'SpatialIndex') {
-  if (
-    value === null ||
-    (typeof value !== 'object' && typeof value !== 'function')
-  ) {
-    return value;
-  }
-  if (ArrayBuffer.isView(value)) {
-    let copy = READ_ONLY_SPATIAL_PROJECTIONS.get(value);
-    if (copy === undefined) {
-      copy = value instanceof DataView
-        ? new DataView(value.buffer.slice(
-          value.byteOffset,
-          value.byteOffset + value.byteLength
-        ))
-        : new value.constructor(value);
-      READ_ONLY_SPATIAL_PROJECTIONS.set(value, copy);
-    }
-    return copy;
-  }
-  if (value instanceof ArrayBuffer) {
-    let copy = READ_ONLY_SPATIAL_PROJECTIONS.get(value);
-    if (copy === undefined) {
-      copy = value.slice(0);
-      READ_ONLY_SPATIAL_PROJECTIONS.set(value, copy);
-    }
-    return copy;
-  }
-  const cached = READ_ONLY_SPATIAL_PROJECTIONS.get(value);
-  if (cached !== undefined) return cached;
-  if (!Reflect.isExtensible(value)) {
-    const rawPrototype = Reflect.getPrototypeOf(value);
-    const projectedPrototype = rawPrototype === null
-      ? null
-      : getReadOnlySpatialProjection(
-          rawPrototype,
-          `${owner} prototype`
-        );
-    const copy = Array.isArray(value)
-      ? []
-      : Object.create(projectedPrototype);
-    if (Array.isArray(value)) {
-      Reflect.setPrototypeOf(copy, projectedPrototype);
-    }
-    READ_ONLY_SPATIAL_PROJECTIONS.set(value, copy);
-    for (const property of Reflect.ownKeys(value)) {
-      if (Array.isArray(value) && property === 'length') continue;
-      const descriptor =
-        Reflect.getOwnPropertyDescriptor(value, property);
-      Object.defineProperty(copy, property, {
-        configurable: false,
-        enumerable: descriptor?.enumerable ?? false,
-        writable: false,
-        value: getReadOnlySpatialProjection(
-          Reflect.get(value, property, value),
-          `${owner}.${String(property)}`
-        ),
-      });
-    }
-    return Object.freeze(copy);
-  }
-
-  const projection = new Proxy(value, {
-    get(target, property, receiver) {
-      const nested = Reflect.get(target, property, receiver);
-      if (typeof nested !== 'function') {
-        return getReadOnlySpatialProjection(
-          nested,
-          `${owner}.${String(property)}`
-        );
-      }
-      let methods = READ_ONLY_SPATIAL_METHODS.get(target);
-      if (methods === undefined) {
-        methods = new Map();
-        READ_ONLY_SPATIAL_METHODS.set(target, methods);
-      }
-      let method = methods.get(property);
-      if (method !== undefined) return method;
-      method = function readOnlySpatialMethod(...args) {
-        if (
-          READ_ONLY_MUTATOR_METHODS.has(property) ||
-          (
-            typeof property === 'string' &&
-            property.startsWith('_')
-          )
-        ) {
-          throw new TypeError(
-            `${owner}.${String(property)} is unavailable on a read-only spatial projection.`
-          );
-        }
-        const exactArgs = args.map((arg, index) => {
-          if (typeof arg !== 'function') return arg;
-          if (SPATIAL_PRIMITIVE_VISITOR_METHODS.has(property)) {
-            return function projectedSpatialIndexVisitor(cellIndex) {
-              return arg(cellIndex);
-            };
-          }
-          return function projectedSpatialCallback(...callbackArgs) {
-            return Reflect.apply(
-              arg,
-              this,
-              callbackArgs.map((callbackArg, callbackIndex) =>
-                getReadOnlySpatialProjection(
-                  callbackArg,
-                  `${owner}.${String(property)} callback argument ${callbackIndex}`
-                )
-              )
-            );
-          };
-        });
-        return getReadOnlySpatialProjection(
-          Reflect.apply(nested, target, exactArgs),
-          `${owner}.${String(property)} result`
-        );
-      };
-      methods.set(property, method);
-      return method;
-    },
-    set() {
-      throw new TypeError(`${owner} is read-only.`);
-    },
-    defineProperty() {
-      throw new TypeError(`${owner} is read-only.`);
-    },
-    deleteProperty() {
-      throw new TypeError(`${owner} is read-only.`);
-    },
-    setPrototypeOf() {
-      throw new TypeError(`${owner} prototype is read-only.`);
-    },
-    getPrototypeOf(target) {
-      const prototype = Reflect.getPrototypeOf(target);
-      return prototype === null
-        ? null
-        : getReadOnlySpatialProjection(
-            prototype,
-            `${owner} prototype`
-          );
-    },
-    preventExtensions() {
-      throw new TypeError(`${owner} cannot be made non-extensible.`);
-    },
-    getOwnPropertyDescriptor(target, property) {
-      const descriptor =
-        Reflect.getOwnPropertyDescriptor(target, property);
-      if (
-        descriptor === undefined ||
-        descriptor.configurable === false ||
-        !Object.hasOwn(descriptor, 'value')
-      ) {
-        return descriptor;
-      }
-      return {
-        ...descriptor,
-        value: getReadOnlySpatialProjection(
-          descriptor.value,
-          `${owner}.${String(property)}`
-        ),
-      };
-    },
-  });
-  READ_ONLY_SPATIAL_PROJECTIONS.set(value, projection);
-  return projection;
-}
-
-function getReadOnlyLodProjection(lodBuffers) {
-  if (lodBuffers.length === 0) return EMPTY_LOD_PROJECTION;
-  let projection = READ_ONLY_LOD_PROJECTIONS.get(lodBuffers);
-  if (projection !== undefined) return projection;
-  projection = Object.freeze(
-    lodBuffers.map(metadata => Object.freeze({ ...metadata }))
-  );
-  READ_ONLY_LOD_PROJECTIONS.set(lodBuffers, projection);
-  return projection;
-}
-
-function createReversedMortonContribution(dimensionLevel, axis) {
-  const contributions = new Uint32Array(HIERARCHICAL_RADIX_SIZE);
-  const priorityBits = dimensionLevel * HIERARCHICAL_RADIX_BITS;
-  for (
-    let coordinate = 0;
-    coordinate < HIERARCHICAL_RADIX_SIZE;
-    coordinate++
-  ) {
-    let contribution = 0;
-    for (let bit = 0; bit < HIERARCHICAL_RADIX_BITS; bit++) {
-      const mortonBit = bit * dimensionLevel + axis;
-      const priorityBit = priorityBits - mortonBit - 1;
-      contribution |=
-        ((coordinate >>> bit) & 1) << priorityBit;
-    }
-    contributions[coordinate] = contribution >>> 0;
-  }
-  return contributions;
-}
-
-// Reversing an interleaved Morton code is a fixed 10-bit coordinate
-// transformation. These small, module-owned tables remove all per-point bit
-// loops while retaining the exact historical 1D/2D/3D priorities.
-const HIERARCHICAL_PRIORITY_CONTRIBUTIONS = Object.freeze([
-  null,
-  Object.freeze([
-    createReversedMortonContribution(1, 0),
-  ]),
-  Object.freeze([
-    createReversedMortonContribution(2, 0),
-    createReversedMortonContribution(2, 1),
-  ]),
-  Object.freeze([
-    createReversedMortonContribution(3, 0),
-    createReversedMortonContribution(3, 1),
-    createReversedMortonContribution(3, 2),
-  ]),
-]);
-
-function requireDimensionLevel(value, owner = 'Renderer dimensionLevel') {
-  if (!Number.isInteger(value) || !SUPPORTED_DIMENSION_LEVELS.has(value)) {
-    throw new RangeError(
-      `${owner} is required and must be exactly 1, 2, or 3; received ${String(value)}.`
-    );
-  }
-  return value;
-}
-
-function requireViewId(value, owner = 'Renderer viewId') {
-  if (typeof value !== 'string' || value.length === 0) {
-    throw new TypeError(`${owner} must be a non-empty string.`);
-  }
-  return value;
-}
-
-function requireShaderQuality(value, owner = 'Renderer quality') {
-  if (!SUPPORTED_SHADER_QUALITIES.has(value)) {
-    throw new RangeError(
-      `${owner} must be exactly "full", "light", or "ultralight"; received ${String(value)}.`
-    );
-  }
-  return value;
-}
-
-function requireFiniteNumber(value, owner) {
-  if (!Number.isFinite(value)) {
-    throw new TypeError(`${owner} must be a finite number; received ${String(value)}.`);
-  }
-  return value;
-}
-
-function requireNumericVector(value, length, owner) {
-  if (
-    (!Array.isArray(value) && !ArrayBuffer.isView(value)) ||
-    value.length !== length
-  ) {
-    throw new TypeError(`${owner} must contain exactly ${length} numeric values.`);
-  }
-  for (let i = 0; i < length; i++) {
-    if (!Number.isFinite(value[i])) {
-      throw new TypeError(
-        `${owner}[${i}] must be a finite number; received ${String(value[i])}.`
-      );
-    }
-  }
-  return value;
-}
-
-function describeError(error) {
-  if (error instanceof Error && error.message.length > 0) {
-    return error.message;
-  }
-  return String(error);
-}
-
-function settleCalculationNotification(
-  notifications,
-  notificationId,
-  method,
-  ...args
-) {
-  try {
-    if (!notifications.hasNotification(notificationId)) return false;
-    notifications[method](notificationId, ...args);
-    return true;
-  } catch {
-    // Calculation notifications are observational. Eviction, dismissal, or a
-    // terminal UI delivery failure cannot invalidate completed scientific or
-    // GPU publication ownership.
-    return false;
-  }
-}
-
-function requireCleanWebGLState(gl, owner) {
-  const errorCode = gl.getError();
-  if (errorCode !== gl.NO_ERROR) {
-    throw new Error(
-      `${owner} encountered WebGL error 0x${errorCode.toString(16)}.`
-    );
-  }
-}
-
-function restorePointDrawBaseline(gl, detachElementBuffer) {
-  let failures = null;
-  if (detachElementBuffer) {
-    try {
-      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, null);
-    } catch (error) {
-      failures = [error];
-    }
-  }
-  try {
-    gl.bindVertexArray(null);
-  } catch (error) {
-    if (failures === null) failures = [error];
-    else failures.push(error);
-  }
-  try {
-    gl.activeTexture(gl.TEXTURE1);
-    gl.bindTexture(gl.TEXTURE_2D, null);
-  } catch (error) {
-    if (failures === null) failures = [error];
-    else failures.push(error);
-  }
-  try {
-    gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, null);
-  } catch (error) {
-    if (failures === null) failures = [error];
-    else failures.push(error);
-  }
-  if (failures !== null) {
-    if (failures.length === 1) throw failures[0];
-    throw new AggregateError(
-      failures,
-      'HighPerfRenderer point-draw baseline restoration failed.'
-    );
-  }
-}
-
-function settlePointDraw(operationError, restorationError, owner) {
-  if (operationError !== null) {
-    if (restorationError !== null) {
-      const restorationFailures =
-        restorationError instanceof AggregateError
-          ? restorationError.errors
-          : null;
-      throw new AggregateError(
-        restorationFailures === null
-          ? [operationError, restorationError]
-          : [operationError, ...restorationFailures],
-        `${owner} and baseline restoration both failed.`
-      );
-    }
-    throw operationError;
-  }
-  if (restorationError !== null) throw restorationError;
-}
-
-function getRenderContractOwner(snapshotId) {
-  return snapshotId === null
-    ? 'HighPerfRenderer render'
-    : `HighPerfRenderer snapshot "${snapshotId}"`;
-}
-
-function hasExactFiniteVector(value, length) {
-  if (
-    (!Array.isArray(value) && !ArrayBuffer.isView(value)) ||
-    value.length !== length
-  ) {
-    return false;
-  }
-  for (let index = 0; index < length; index++) {
-    if (!Number.isFinite(value[index])) return false;
-  }
-  return true;
-}
-
-function requireRenderContract(params, snapshotId = null) {
-  if (params === null || typeof params !== 'object' || Array.isArray(params)) {
-    throw new TypeError(
-      `${getRenderContractOwner(snapshotId)} parameters must be an object.`
-    );
-  }
-  for (
-    let index = 0;
-    index < REQUIRED_RENDER_VECTOR_CONTRACTS.length;
-    index++
-  ) {
-    const contract = REQUIRED_RENDER_VECTOR_CONTRACTS[index];
-    if (!hasExactFiniteVector(params[contract[0]], contract[1])) {
-      requireNumericVector(
-        params[contract[0]],
-        contract[1],
-        `${getRenderContractOwner(snapshotId)} ${contract[0]}`
-      );
-    }
-  }
-  for (const key of REQUIRED_RENDER_SCALAR_KEYS) {
-    const value = params[key];
-    if (!Number.isFinite(value)) {
-      throw new TypeError(
-        `${getRenderContractOwner(snapshotId)} ${key} must be a finite number; received ${String(value)}.`
-      );
-    }
-  }
-  if (!Number.isInteger(params.forceLOD) || params.forceLOD < -1) {
-    throw new RangeError(
-      `${getRenderContractOwner(snapshotId)} forceLOD must be an integer greater than or equal to -1.`
-    );
-  }
-  if (typeof params.autoFog !== 'boolean') {
-    throw new TypeError(
-      `${getRenderContractOwner(snapshotId)} autoFog must be a boolean.`
-    );
-  }
-  if (typeof params.useAlphaTexture !== 'boolean') {
-    throw new TypeError(
-      `${getRenderContractOwner(snapshotId)} useAlphaTexture must be a boolean.`
-    );
-  }
-  if (!SUPPORTED_SHADER_QUALITIES.has(params.quality)) {
-    requireShaderQuality(
-      params.quality,
-      `${getRenderContractOwner(snapshotId)} quality`
-    );
-  }
-  if (typeof params.viewId !== 'string' || params.viewId.length === 0) {
-    requireViewId(
-      params.viewId,
-      `${getRenderContractOwner(snapshotId)} viewId`
-    );
-  }
-  if (!SUPPORTED_DIMENSION_LEVELS.has(params.dimensionLevel)) {
-    requireDimensionLevel(
-      params.dimensionLevel,
-      `${getRenderContractOwner(snapshotId)} dimensionLevel`
-    );
-  }
-  return params;
-}
-
-function requireSnapshotPointData(
-  pointCount,
-  positions,
-  colors,
-  alphas,
-  owner
-) {
-  if (
-    !(positions instanceof Float32Array) ||
-    positions.length !== pointCount * 3
-  ) {
-    throw new TypeError(
-      `${owner} positions must be a Float32Array with exactly ${pointCount * 3} values.`
-    );
-  }
-  if (!(colors instanceof Uint8Array) || colors.length !== pointCount * 4) {
-    throw new TypeError(
-      `${owner} colors must be an RGBA Uint8Array with exactly ${pointCount * 4} bytes.`
-    );
-  }
-  if (alphas !== null) {
-    if (
-      !(alphas instanceof Float32Array) ||
-      alphas.length !== pointCount
-    ) {
-      throw new TypeError(
-        `${owner} alpha values must be null or a Float32Array with exactly ${pointCount} entries.`
-      );
-    }
-  }
-
-  return {
-    alphas,
-    colors,
-    positions,
-  };
-}
-
-function requireSnapshotColors(pointCount, colors, owner) {
-  if (
-    !(colors instanceof Uint8Array) ||
-    colors.length !== pointCount * 4
-  ) {
-    throw new TypeError(
-      `${owner} colors must be an RGBA Uint8Array with exactly ${pointCount * 4} bytes.`
-    );
-  }
-  return colors;
-}
-
-function requireSnapshotAlphas(pointCount, alphas, owner) {
-  if (
-    !(alphas instanceof Float32Array) ||
-    alphas.length !== pointCount
-  ) {
-    throw new TypeError(
-      `${owner} alpha values must be a Float32Array with exactly ${pointCount} entries.`
-    );
-  }
-  return alphas;
-}
-
-// ============================================================================
-// SPATIAL INDEX FOR LOD AND FRUSTUM CULLING (1D/2D/3D)
-// ============================================================================
-
-/**
- * Unified spatial index that adapts to data dimensionality:
- * - 1D: Binary tree (2 children) - for 1D layouts/histograms
- * - 2D: Quadtree (4 children) - for 2D projections (UMAP, t-SNE)
- * - 3D: Octree (8 children) - for 3D embeddings (PCA, etc.)
+ * JS heap the level-of-detail build adds per point, over and above what the
+ * loaded dataset already occupies, and the transient peak it reaches on top of
+ * that.
  *
- * Enables frustum culling and spatially-uniform LOD sampling in the
- * appropriate dimension space.
+ * Fitted from a 5M/10M/20M/30M curve measured on Chromium: the settled heap is
+ * 79.8 B a point plus 24 MiB with the LOD index built and 51.9 B a point plus
+ * 20 MiB without it, so the build *retains* 27.9 B a point plus 4 MiB. The
+ * transient term is the scratch that is live simultaneously during the build
+ * and enumerable from the code: three `Uint32Array(pointCount)` in the
+ * hierarchical ordering pass (12 B), the leaves and the geometric child chain
+ * `_buildNode` holds (~8.6 B), and the shared packing scratch (16 B).
+ *
+ * A build that fits its settled size but not its peak is the worst outcome
+ * available: the engine neither completes nor throws, it collects a multi-GiB
+ * heap indefinitely. The peak is therefore what is admitted against, not the
+ * settled size.
  */
-export class SpatialIndex {
-  /**
-   * @param {Float32Array} positions - Position data (x,y,z per point)
-   * @param {Uint8Array} colors - RGBA color data
-   * @param {number} dimensionLevel - 1, 2, or 3 for tree type
-   * @param {number} maxPointsPerNode - Max points before subdivision
-   * @param {number} maxDepth - Maximum tree depth
-   * @param {Object} options
-   * @param {boolean} options.buildLOD - Whether to generate LOD levels.
-   * @param {boolean} options.buildLodNodeMappings - Whether to precompute per-node LOD index mappings for fast LOD+frustum culling.
-   * @param {boolean} options.computeNodeStats - Whether to compute node centroid/avgColor/avgAlpha.
-   */
-  constructor(positions, colors, dimensionLevel, maxPointsPerNode, maxDepth, options) {
-    if (
-      !(positions instanceof Float32Array) ||
-      positions.length === 0 ||
-      positions.length % 3 !== 0
-    ) {
-      throw new TypeError(
-        'SpatialIndex positions must be a non-empty Float32Array with exactly three values per point.'
-      );
-    }
-    const pointCount = positions.length / 3;
-    if (!Number.isInteger(maxPointsPerNode) || maxPointsPerNode <= 0) {
-      throw new TypeError('SpatialIndex maxPointsPerNode must be a positive integer.');
-    }
-    if (!Number.isInteger(maxDepth) || maxDepth <= 0) {
-      throw new TypeError('SpatialIndex maxDepth must be a positive integer.');
-    }
-    if (options === null || typeof options !== 'object' || Array.isArray(options)) {
-      throw new TypeError('SpatialIndex options must be an object.');
-    }
-    const { buildLOD, buildLodNodeMappings, computeNodeStats } = options;
-    if (
-      typeof buildLOD !== 'boolean' ||
-      typeof buildLodNodeMappings !== 'boolean' ||
-      typeof computeNodeStats !== 'boolean'
-    ) {
-      throw new TypeError(
-        'SpatialIndex buildLOD, buildLodNodeMappings, and computeNodeStats options must be booleans.'
-      );
-    }
-    if (
-      colors !== null &&
-      (
-        !(colors instanceof Uint8Array) ||
-        colors.length !== pointCount * 4
+const LOD_BUILD_RETAINED_HEAP_BYTES_PER_POINT = 27.9;
+const LOD_BUILD_TRANSIENT_HEAP_BYTES_PER_POINT = 36.6;
+const LOD_BUILD_HEAP_FIXED_BYTES = 4 * 1024 * 1024;
+
+/** Peak JS heap a level-of-detail build adds for `pointCount` points. */
+function projectLodBuildHeapBytes(pointCount) {
+  return Math.ceil(
+    pointCount * (
+      LOD_BUILD_RETAINED_HEAP_BYTES_PER_POINT +
+      LOD_BUILD_TRANSIENT_HEAP_BYTES_PER_POINT
+    ) + LOD_BUILD_HEAP_FIXED_BYTES
+  );
+}
+
+function describeHeapMebibytes(bytes) {
+  return `${Math.round(bytes / (1024 * 1024)).toLocaleString()} MiB`;
+}
+
+/**
+ * Refuse a level-of-detail build this tab's heap cannot finish.
+ *
+ * The texture ceiling above is checked the same way and for the same reason,
+ * but it is not the ceiling that bites first: a device reports
+ * `MAX_TEXTURE_SIZE` and the renderer can compare against it, whereas the JS
+ * heap gives no error at all when it is exceeded during a build. The engine
+ * simply mark-compacts a multi-GiB heap for as long as the tab is open --
+ * alive, busy, no exception, no console message, nothing ever returned. An
+ * unbounded hang is worse than either a clean render or a stated refusal, so
+ * the count is admitted before the first allocation instead.
+ *
+ * The check is skipped where the engine publishes no heap limit. Only
+ * Chromium exposes `performance.memory`; WebKit completes the build that
+ * Chromium hangs on, and Firefox refuses it through `requireCleanWebGLState`
+ * with a real WebGL error, so neither needs a projection and neither may be
+ * given a fabricated limit.
+ *
+ * @param {number} pointCount Points the candidate index will cover.
+ * @param {boolean} buildLOD Whether this build produces LOD levels.
+ * @param {string} label Owner named in the refusal.
+ */
+function requireLodBuildHeapHeadroom(pointCount, buildLOD, label) {
+  if (buildLOD !== true) return;
+  if (!Number.isFinite(pointCount) || pointCount <= 0) return;
+  const memory =
+    typeof performance !== 'undefined' && performance !== null
+      ? performance.memory
+      : null;
+  if (memory === null || typeof memory !== 'object') return;
+  const limitBytes = memory.jsHeapSizeLimit;
+  const usedBytes = memory.usedJSHeapSize;
+  if (
+    !Number.isFinite(limitBytes) ||
+    !Number.isFinite(usedBytes) ||
+    limitBytes <= 0 ||
+    usedBytes < 0
+  ) {
+    return;
+  }
+  const projectedBytes = projectLodBuildHeapBytes(pointCount);
+  if (usedBytes + projectedBytes <= limitBytes) return;
+  const affordableBytes =
+    limitBytes - usedBytes - LOD_BUILD_HEAP_FIXED_BYTES;
+  const affordablePoints = Math.max(
+    0,
+    Math.floor(
+      affordableBytes / (
+        LOD_BUILD_RETAINED_HEAP_BYTES_PER_POINT +
+        LOD_BUILD_TRANSIENT_HEAP_BYTES_PER_POINT
       )
-    ) {
-      throw new TypeError(
-        `SpatialIndex colors must be null or an RGBA Uint8Array with exactly ${pointCount * 4} bytes.`
-      );
-    }
-    if (colors === null && computeNodeStats) {
-      throw new TypeError(
-        'SpatialIndex colors are required when computeNodeStats is enabled.'
-      );
-    }
-
-    this._buildLOD = buildLOD;
-    this._computeNodeStats = computeNodeStats;
-    this._lodNodeMappingsBuilt = false;
-    this._lodNodeMapping = null;
-    this._buildLodNodeMappings = buildLodNodeMappings;
-    // Built lazily only when a CPU consumer needs random-access LOD
-    // membership (highlights, connectivity, or export). All reduced LODs are
-    // nested prefixes of `_hierarchicalOrder`, so one byte per source point is
-    // sufficient for every level and every view sharing this spatial owner.
-    this._lodMembershipOwner = null;
-
-    this.maxPointsPerNode = maxPointsPerNode;
-    this.maxDepth = maxDepth;
-    this.positions = positions;
-    this.colors = colors;
-    this.dimensionLevel = requireDimensionLevel(
-      dimensionLevel,
-      'SpatialIndex dimensionLevel'
-    );
-    this.childCount = 1 << this.dimensionLevel; // 2, 4, or 8
-
-    this.pointCount = pointCount;
-
-    const treeNames = { 1: 'BinaryTree', 2: 'Quadtree', 3: 'Octree' };
-    const treeName = treeNames[this.dimensionLevel];
-
-    // Calculate bounds
-    this.bounds = this._calculateBounds();
-
-    // Build tree
-    console.time(`${treeName} build`);
-    this.root = this._buildNode(
-      this._createIndexArray(this.pointCount),
-      this.bounds,
-      0
-    );
-    console.timeEnd(`${treeName} build`);
-
-    // LOD is optional (many consumers just need the tree for queries/picking).
-    if (this._buildLOD) {
-      // Generate LOD levels
-      console.time('LOD generation');
-      this.lodLevels = this._generateLODLevels();
-      console.timeEnd('LOD generation');
-
-      if (this._buildLodNodeMappings) {
-        // Pre-compute LOD indices per node for fast frustum culling
-        this._buildLODNodeMappings();
-        this._lodNodeMappingsBuilt = true;
-      }
-    } else {
-      this.lodLevels = [];
-    }
-  }
-
-  ensureLODLevels() {
-    if (this.lodLevels && this.lodLevels.length > 0) return;
-
-    const notifications = getNotificationCenter();
-    const notifId = notifications.startCalculation(
-      `Generating LOD levels for ${this.pointCount.toLocaleString()} cells`,
-      'calculation'
-    );
-    const startTime = performance.now();
-
-    try {
-      console.time('LOD generation');
-      this.lodLevels = this._generateLODLevels();
-      console.timeEnd('LOD generation');
-      this._buildLOD = true;
-    } catch (error) {
-      console.timeEnd('LOD generation');
-      settleCalculationNotification(
-        notifications,
-        notifId,
-        'failCalculation',
-        `LOD generation failed: ${describeError(error)}`
-      );
-      throw error;
-    }
-
-    const elapsed = performance.now() - startTime;
-    settleCalculationNotification(
-      notifications,
-      notifId,
-      'completeCalculation',
-      `LOD ready (${this.lodLevels.length} levels)`,
-      elapsed
-    );
-  }
-
-  ensureLodNodeMappings() {
-    if (this._lodNodeMappingsBuilt) return;
-    this.ensureLODLevels();
-
-    const notifications = getNotificationCenter();
-    const notifId = notifications.startCalculation('Building LOD node mappings', 'calculation');
-    const startTime = performance.now();
-
-    try {
-      this._buildLODNodeMappings();
-      this._lodNodeMappingsBuilt = true;
-    } catch (error) {
-      settleCalculationNotification(
-        notifications,
-        notifId,
-        'failCalculation',
-        `LOD node mappings failed: ${describeError(error)}`
-      );
-      throw error;
-    }
-
-    const elapsed = performance.now() - startTime;
-    settleCalculationNotification(
-      notifications,
-      notifId,
-      'completeCalculation',
-      'LOD node mappings ready',
-      elapsed
-    );
-  }
-
-  _createIndexArray(count) {
-    const indices = new Uint32Array(count);
-    for (let i = 0; i < count; i++) indices[i] = i;
-    return indices;
-  }
-
-  _calculateBounds() {
-    let minX = Infinity, minY = Infinity, minZ = Infinity;
-    let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
-
-    const positions = this.positions;
-    const count = this.pointCount;
-
-    const CHUNK_SIZE = 10000;
-    for (let start = 0; start < count; start += CHUNK_SIZE) {
-      const end = Math.min(start + CHUNK_SIZE, count);
-      for (let i = start; i < end; i++) {
-        const idx = i * 3;
-        const x = positions[idx];
-        const y = positions[idx + 1];
-        const z = positions[idx + 2];
-
-        if (x < minX) minX = x;
-        if (y < minY) minY = y;
-        if (z < minZ) minZ = z;
-        if (x > maxX) maxX = x;
-        if (y > maxY) maxY = y;
-        if (z > maxZ) maxZ = z;
-      }
-    }
-
-    // Calculate extents
-    const extentX = maxX - minX;
-    const extentY = maxY - minY;
-    const extentZ = maxZ - minZ;
-
-    // Use dynamic padding based on max extent - ensures flat dimensions get meaningful padding
-    // This is critical for 1D/2D data where one or more dimensions are essentially zero
-    const maxExtent = Math.max(extentX, extentY, extentZ, 0.001);
-    const basePad = maxExtent * 0.001; // 0.1% of largest extent
-
-    // For flat dimensions (extent < 1% of max), use LARGE padding (50% of max extent)
-    // This ensures frustum culling doesn't clip quadtree nodes at different Z depths
-    // causing grid artifacts in 2D views. The large Z padding ensures all nodes
-    // span the full camera near-to-far range.
-    const flatThreshold = maxExtent * 0.01;
-    const flatPad = maxExtent * 0.5; // 50% padding for flat dimensions
-
-    const padX = extentX < flatThreshold ? flatPad : basePad;
-    const padY = extentY < flatThreshold ? flatPad : basePad;
-    const padZ = extentZ < flatThreshold ? flatPad : basePad;
-
-    return {
-      minX: minX - padX, minY: minY - padY, minZ: minZ - padZ,
-      maxX: maxX + padX, maxY: maxY + padY, maxZ: maxZ + padZ
-    };
-  }
-
-  _buildNode(indices, bounds, depth) {
-    const node = {
-      bounds,
-      indices: null,
-      children: null,
-      centroid: null,
-      avgColor: null,
-      avgAlpha: 0,
-      pointCount: indices.length
-    };
-
-    if (indices.length <= this.maxPointsPerNode || depth >= this.maxDepth) {
-      node.indices = indices;
-      if (this._computeNodeStats) {
-        node.centroid = this._computeCentroid(indices);
-        node.avgColor = this._computeAvgColor(indices);
-        node.avgAlpha = this._computeAvgAlpha(indices);
-      }
-      return node;
-    }
-
-    const midX = (bounds.minX + bounds.maxX) * 0.5;
-    const midY = (bounds.minY + bounds.maxY) * 0.5;
-    const midZ = (bounds.minZ + bounds.maxZ) * 0.5;
-
-    const dimLevel = this.dimensionLevel;
-    const numChildren = this.childCount; // 2, 4, or 8
-
-    // Generate child bounds based on dimension level
-    // 1D: 2 children (left/right on X)
-    // 2D: 4 children (quadtree on XY)
-    // 3D: 8 children (octree on XYZ)
-    const childBounds = [];
-    for (let c = 0; c < numChildren; c++) {
-      const xSplit = (c & 1) !== 0;
-      const ySplit = dimLevel >= 2 ? ((c & 2) !== 0) : false;
-      const zSplit = dimLevel >= 3 ? ((c & 4) !== 0) : false;
-
-      // For dimensions being split: divide at mid point (upper/lower halves)
-      // For dimensions NOT being split: children inherit FULL parent range
-      // This is critical for correct frustum culling in lower dimensions
-      //
-      // When splitting a dimension (e.g., Y in 2D mode):
-      //   - split=true means upper half: [mid, max]
-      //   - split=false means lower half: [min, mid]
-      // When NOT splitting a dimension (e.g., Y in 1D mode):
-      //   - full range: [min, max]
-      childBounds.push({
-        minX: xSplit ? midX : bounds.minX,
-        maxX: xSplit ? bounds.maxX : midX,
-        // Y bounds: split into halves if dimLevel >= 2, otherwise inherit full range
-        minY: ySplit ? midY : bounds.minY,
-        maxY: (dimLevel >= 2) ? (ySplit ? bounds.maxY : midY) : bounds.maxY,
-        // Z bounds: split into halves if dimLevel >= 3, otherwise inherit full range
-        minZ: zSplit ? midZ : bounds.minZ,
-        maxZ: (dimLevel >= 3) ? (zSplit ? bounds.maxZ : midZ) : bounds.maxZ
-      });
-    }
-
-    const positions = this.positions;
-    const n = indices.length;
-
-    // Count first, then recompute the child during distribution. Retaining one
-    // byte per point at every recursive level creates a large transient-memory
-    // multiplier, especially for degenerate inputs.
-    const childCounts = new Uint32Array(numChildren);
-    let occupiedChildCount = 0;
-    let onlyOccupiedChild = -1;
-
-    for (let i = 0; i < n; i++) {
-      const idx = indices[i];
-      const base = idx * 3;
-      const x = positions[base];
-      const y = positions[base + 1];
-      const z = positions[base + 2];
-
-      // Compute child index based on dimension level (branchless for perf)
-      let childIdx = (x >= midX) | 0;
-      if (dimLevel >= 2) childIdx += ((y >= midY) | 0) << 1;
-      if (dimLevel >= 3) childIdx += ((z >= midZ) | 0) << 2;
-
-      if (childCounts[childIdx] === 0) {
-        occupiedChildCount++;
-        onlyOccupiedChild = childIdx;
-      }
-      childCounts[childIdx]++;
-    }
-
-    // A unary partition must preserve the exact index owner. Allocating and
-    // copying N indices at every depth turns identical-coordinate datasets
-    // into O(N * maxDepth) allocation/copy work for no semantic benefit.
-    if (occupiedChildCount === 1) {
-      node.children = new Array(numChildren).fill(null);
-      node.children[onlyOccupiedChild] = this._buildNode(
-        indices,
-        childBounds[onlyOccupiedChild],
-        depth + 1
-      );
-
-      if (this._computeNodeStats) {
-        node.centroid = this._computeCentroidFromChildren(node);
-        node.avgColor = this._computeAvgColorFromChildren(node);
-        node.avgAlpha = this._computeAvgAlphaFromChildren(node);
-      }
-      return node;
-    }
-
-    // Pre-allocate child arrays based on counts
-    const childIndices = childBounds.map((_, i) =>
-      childCounts[i] > 0 ? new Uint32Array(childCounts[i]) : null
-    );
-    const childOffsets = new Uint32Array(numChildren);
-
-    // Second pass: recompute the child and distribute into exact-size owners.
-    // The additional sequential position reads are cheaper than allocating,
-    // filling, and collecting an N-byte routing owner per internal node.
-    for (let i = 0; i < n; i++) {
-      const idx = indices[i];
-      const base = idx * 3;
-      let childIdx = (positions[base] >= midX) | 0;
-      if (dimLevel >= 2) {
-        childIdx += ((positions[base + 1] >= midY) | 0) << 1;
-      }
-      if (dimLevel >= 3) {
-        childIdx += ((positions[base + 2] >= midZ) | 0) << 2;
-      }
-      childIndices[childIdx][childOffsets[childIdx]++] = idx;
-    }
-
-    node.children = childBounds.map((cb, i) =>
-      childIndices[i] !== null
-        ? this._buildNode(childIndices[i], cb, depth + 1)
-        : null
-    );
-
-    if (this._computeNodeStats) {
-      node.centroid = this._computeCentroidFromChildren(node);
-      node.avgColor = this._computeAvgColorFromChildren(node);
-      node.avgAlpha = this._computeAvgAlphaFromChildren(node);
-    }
-
-    return node;
-  }
-
-  _computeCentroid(indices) {
-    let sx = 0, sy = 0, sz = 0;
-    const positions = this.positions;
-    for (let i = 0; i < indices.length; i++) {
-      const idx = indices[i] * 3;
-      sx += positions[idx];
-      sy += positions[idx + 1];
-      sz += positions[idx + 2];
-    }
-    const n = indices.length;
-    return [sx / n, sy / n, sz / n];
-  }
-
-  _computeAvgColor(indices) {
-    let sr = 0, sg = 0, sb = 0;
-    const colors = this.colors;
-    const stride = colors.length === this.pointCount * 4 ? 4 : 3;
-    const scale = colors.BYTES_PER_ELEMENT === 1 ? (1 / 255) : 1;
-    for (let i = 0; i < indices.length; i++) {
-      const idx = indices[i] * stride;
-      sr += colors[idx] * scale;
-      sg += colors[idx + 1] * scale;
-      sb += colors[idx + 2] * scale;
-    }
-    const n = indices.length;
-    return [sr / n, sg / n, sb / n];
-  }
-
-  _computeAvgAlpha(indices) {
-    if (!indices.length) return 1.0;
-    let sum = 0;
-    const colors = this.colors;
-    for (let i = 0; i < indices.length; i++) {
-      sum += colors[indices[i] * 4 + 3];
-    }
-    return sum / (indices.length * 255);
-  }
-
-  _computeCentroidFromChildren(node) {
-    let sx = 0, sy = 0, sz = 0, totalCount = 0;
-    for (const child of node.children) {
-      if (child && child.centroid) {
-        sx += child.centroid[0] * child.pointCount;
-        sy += child.centroid[1] * child.pointCount;
-        sz += child.centroid[2] * child.pointCount;
-        totalCount += child.pointCount;
-      }
-    }
-    return totalCount > 0 ? [sx / totalCount, sy / totalCount, sz / totalCount] : [0, 0, 0];
-  }
-
-  _computeAvgColorFromChildren(node) {
-    let sr = 0, sg = 0, sb = 0, totalCount = 0;
-    for (const child of node.children) {
-      if (child && child.avgColor) {
-        sr += child.avgColor[0] * child.pointCount;
-        sg += child.avgColor[1] * child.pointCount;
-        sb += child.avgColor[2] * child.pointCount;
-        totalCount += child.pointCount;
-      }
-    }
-    return totalCount > 0 ? [sr / totalCount, sg / totalCount, sb / totalCount] : [0.5, 0.5, 0.5];
-  }
-
-  _computeAvgAlphaFromChildren(node) {
-    let sum = 0, totalCount = 0;
-    for (const child of node.children) {
-      if (child) {
-        sum += child.avgAlpha * child.pointCount;
-        totalCount += child.pointCount;
-      }
-    }
-    return totalCount > 0 ? sum / totalCount : 1.0;
-  }
-
-  _generateLODLevels() {
-    const levels = [];
-    const totalPoints = this.pointCount;
-
-    // Smooth LOD with 1.25x steps for imperceptible transitions (18 levels)
-    // Each step increases points by 25%, below human perception threshold
-    const reductionFactors = [44, 35, 28, 23, 18, 14.5, 11.5, 9.3, 7.5, 6, 4.8, 3.8, 3, 2.4, 1.95, 1.55, 1.25, 1];
-
-    for (let levelIdx = 0; levelIdx < reductionFactors.length; levelIdx++) {
-      const factor = reductionFactors[levelIdx];
-      const targetCount = Math.max(1000, Math.ceil(totalPoints / factor));
-
-      if (factor === 1) {
-        levels.push({
-          depth: levelIdx,
-          pointCount: totalPoints,
-          positions: this.positions,
-          colors: this.colors, // RGBA uint8 with alpha packed
-          sizes: null,
-          isFullDetail: true
-        });
-        continue;
-      }
-
-      const sampledIndices = this._stratifiedSample(targetCount);
-      const pointCount = sampledIndices.length;
-
-      levels.push({
-        depth: levelIdx,
-        pointCount,
-        indices: sampledIndices, // Exact original IDs for source-data lookup
-        sizes: null,
-        isFullDetail: false,
-        sizeMultiplier: Math.sqrt(factor) * 0.2 + 0.8
-      });
-    }
-
-    const treeNames = { 1: 'BinaryTree', 2: 'Quadtree', 3: 'Octree' };
-    const treeName = treeNames[this.dimensionLevel] || 'Octree';
-    console.log(`[${treeName}] Generated ${levels.length} LOD levels (dim=${this.dimensionLevel}):`,
-      levels.map(l => `${l.pointCount.toLocaleString()} pts`).join(', '));
-
-    return levels;
-  }
-
-  /**
-   * Build a stable hierarchical ordering of all points.
-   * Points are ranked so that coarser LOD levels are always strict subsets of finer levels.
-   * This prevents "popping" when transitioning between LOD levels.
-   *
-   * Uses Morton code (Z-order curve) + bit-reversal for optimal spatial distribution:
-   * - Morton code groups spatially close points together
-   * - Bit-reversal ensures coarse samples are evenly distributed across space
-   *
-   * Dimension-aware: Uses 1D/2D/3D Morton codes based on dimensionLevel.
-   */
-  _buildHierarchicalOrder() {
-    if (this._hierarchicalOrder) return this._hierarchicalOrder;
-
-    const n = this.pointCount;
-    const positions = this.positions;
-    const bounds = this.bounds;
-    const dimLevel = this.dimensionLevel;
-
-    // Normalize positions to 0-1023 range for 10-bit Morton codes
-    const scaleX = 1023 / Math.max(bounds.maxX - bounds.minX, 0.0001);
-    const scaleY = 1023 / Math.max(bounds.maxY - bounds.minY, 0.0001);
-    const scaleZ = 1023 / Math.max(bounds.maxZ - bounds.minZ, 0.0001);
-
-    // One priority array plus two ID arrays bounds peak working memory to
-    // 12 bytes per point. Initial ascending IDs preserve the stable reference
-    // tie order through every least-significant-digit radix pass.
-    let priorities = new Uint32Array(n);
-    let sourceIds = new Uint32Array(n);
-    let targetIds = new Uint32Array(n);
-    let radixOffsets = new Uint32Array(HIERARCHICAL_RADIX_SIZE);
-    const contributions =
-      HIERARCHICAL_PRIORITY_CONTRIBUTIONS[dimLevel];
-
-    if (dimLevel === 1) {
-      const xContributions = contributions[0];
-      for (let pointIndex = 0; pointIndex < n; pointIndex++) {
-        const positionOffset = pointIndex * 3;
-        const x =
-          Math.floor(
-            (positions[positionOffset] - bounds.minX) * scaleX
-          ) & HIERARCHICAL_RADIX_MASK;
-        priorities[pointIndex] = xContributions[x];
-        sourceIds[pointIndex] = pointIndex;
-      }
-    } else if (dimLevel === 2) {
-      const xContributions = contributions[0];
-      const yContributions = contributions[1];
-      for (let pointIndex = 0; pointIndex < n; pointIndex++) {
-        const positionOffset = pointIndex * 3;
-        const x =
-          Math.floor(
-            (positions[positionOffset] - bounds.minX) * scaleX
-          ) & HIERARCHICAL_RADIX_MASK;
-        const y =
-          Math.floor(
-            (positions[positionOffset + 1] - bounds.minY) * scaleY
-          ) & HIERARCHICAL_RADIX_MASK;
-        priorities[pointIndex] =
-          xContributions[x] | yContributions[y];
-        sourceIds[pointIndex] = pointIndex;
-      }
-    } else {
-      const xContributions = contributions[0];
-      const yContributions = contributions[1];
-      const zContributions = contributions[2];
-      for (let pointIndex = 0; pointIndex < n; pointIndex++) {
-        const positionOffset = pointIndex * 3;
-        const x =
-          Math.floor(
-            (positions[positionOffset] - bounds.minX) * scaleX
-          ) & HIERARCHICAL_RADIX_MASK;
-        const y =
-          Math.floor(
-            (positions[positionOffset + 1] - bounds.minY) * scaleY
-          ) & HIERARCHICAL_RADIX_MASK;
-        const z =
-          Math.floor(
-            (positions[positionOffset + 2] - bounds.minZ) * scaleZ
-          ) & HIERARCHICAL_RADIX_MASK;
-        priorities[pointIndex] =
-          xContributions[x] |
-          yContributions[y] |
-          zContributions[z];
-        sourceIds[pointIndex] = pointIndex;
-      }
-    }
-
-    // Priority widths are exactly 10, 20, or 30 bits, so one stable 10-bit
-    // pass per active dimension completely orders the IDs.
-    for (
-      let shift = 0;
-      shift < dimLevel * HIERARCHICAL_RADIX_BITS;
-      shift += HIERARCHICAL_RADIX_BITS
-    ) {
-      radixOffsets.fill(0);
-      for (let index = 0; index < n; index++) {
-        const pointId = sourceIds[index];
-        const digit =
-          (priorities[pointId] >>> shift) & HIERARCHICAL_RADIX_MASK;
-        radixOffsets[digit]++;
-      }
-
-      let offset = 0;
-      for (
-        let digit = 0;
-        digit < HIERARCHICAL_RADIX_SIZE;
-        digit++
-      ) {
-        const count = radixOffsets[digit];
-        radixOffsets[digit] = offset;
-        offset += count;
-      }
-
-      for (let index = 0; index < n; index++) {
-        const pointId = sourceIds[index];
-        const digit =
-          (priorities[pointId] >>> shift) & HIERARCHICAL_RADIX_MASK;
-        targetIds[radixOffsets[digit]++] = pointId;
-      }
-
-      const previousSource = sourceIds;
-      sourceIds = targetIds;
-      targetIds = previousSource;
-    }
-
-    // Only the final ID generation escapes. Explicitly release all build
-    // scratch references before atomically publishing the shared LOD owner.
-    const hierarchicalOrder = sourceIds;
-    priorities = null;
-    sourceIds = null;
-    targetIds = null;
-    radixOffsets = null;
-    this._hierarchicalOrder = hierarchicalOrder;
-    return this._hierarchicalOrder;
-  }
-
-  _stratifiedSample(targetCount) {
-    // Use hierarchical ordering for stable, subset-based sampling
-    const order = this._buildHierarchicalOrder();
-
-    // Return a stable prefix view into the single typed hierarchical order.
-    // Each LOD keeps its own Uint32Array view identity without another backing
-    // allocation.
-    const count = Math.min(targetCount, order.length);
-    return order.subarray(0, count);
-  }
-
-  /**
-   * Build one exact, shared admission-level owner for every reduced LOD.
-   *
-   * `admissionLevels[originalId]` is the first reduced LOD level that admits
-   * the source point. `0xff` means the point appears only at terminal full
-   * detail. Because the LOD index arrays are nested views into one hierarchy,
-   * this replaces every per-view Float32 membership mask with one immutable
-   * byte owner per spatial generation.
-   *
-   * Publication is transactional: allocation and complete prefix validation
-   * finish off-state before `_lodMembershipOwner` changes.
-   *
-   * @private
-   * @returns {Object}
-   */
-  _ensureLodMembershipOwner() {
-    if (this._lodMembershipOwner !== null) {
-      return this._lodMembershipOwner;
-    }
-    if (
-      !Array.isArray(this.lodLevels) ||
-      this.lodLevels.length < 1
-    ) {
-      throw new Error(
-        'SpatialIndex LOD membership requires a published LOD inventory.'
-      );
-    }
-
-    const terminalLevel = this.lodLevels.length - 1;
-    if (terminalLevel >= LOD_FULL_DETAIL_ADMISSION_LEVEL) {
-      throw new RangeError(
-        'SpatialIndex LOD membership exceeds the Uint8 admission-level contract.'
-      );
-    }
-    const fullDetail = this.lodLevels[terminalLevel];
-    if (
-      fullDetail?.isFullDetail !== true ||
-      fullDetail.pointCount !== this.pointCount
-    ) {
-      throw new Error(
-        'SpatialIndex LOD membership requires one exact terminal full-detail level.'
-      );
-    }
-
-    const hierarchy = this._buildHierarchicalOrder();
-    if (
-      !(hierarchy instanceof Uint32Array) ||
-      hierarchy.length !== this.pointCount
-    ) {
-      throw new Error(
-        'SpatialIndex LOD membership requires one exact full point hierarchy.'
-      );
-    }
-
-    const admissionLevels = new Uint8Array(this.pointCount);
-    admissionLevels.fill(LOD_FULL_DETAIL_ADMISSION_LEVEL);
-    const generationToken = Object.freeze({});
-    const descriptorsByLevel = new Array(this.lodLevels.length);
-    let previousCount = 0;
-
-    for (let lodLevel = 0; lodLevel < terminalLevel; lodLevel++) {
-      const level = this.lodLevels[lodLevel];
-      const indices = level?.indices;
-      if (
-        level?.isFullDetail !== false ||
-        !(indices instanceof Uint32Array) ||
-        !Number.isSafeInteger(level.pointCount) ||
-        level.pointCount !== indices.length ||
-        level.pointCount < previousCount ||
-        level.pointCount > this.pointCount
-      ) {
-        throw new Error(
-          `SpatialIndex LOD ${lodLevel} is not one exact monotonic reduced prefix.`
-        );
-      }
-      if (
-        indices.buffer !== hierarchy.buffer ||
-        indices.byteOffset !== hierarchy.byteOffset
-      ) {
-        throw new Error(
-          `SpatialIndex LOD ${lodLevel} does not share the exact hierarchical prefix owner.`
-        );
-      }
-
-      for (
-        let compactRank = previousCount;
-        compactRank < level.pointCount;
-        compactRank++
-      ) {
-        const originalId = hierarchy[compactRank];
-        if (originalId >= this.pointCount) {
-          throw new RangeError(
-            `SpatialIndex LOD ${lodLevel} contains source ID ${originalId} outside ${this.pointCount} points.`
-          );
-        }
-        if (
-          admissionLevels[originalId] !==
-          LOD_FULL_DETAIL_ADMISSION_LEVEL
-        ) {
-          throw new Error(
-            `SpatialIndex LOD hierarchy repeats source ID ${originalId}.`
-          );
-        }
-        admissionLevels[originalId] = lodLevel;
-      }
-
-      descriptorsByLevel[lodLevel] = Object.freeze({
-        admissionLevels,
-        dimensionLevel: this.dimensionLevel,
-        generationToken,
-        indices,
-        lodLevel,
-        pointCount: this.pointCount,
-      });
-      previousCount = level.pointCount;
-    }
-
-    // Reduced descriptors only expose hierarchy prefixes, but the backing
-    // hierarchy must still be one exact full-point permutation. Validate the
-    // terminal tail without retaining another point-count allocation: use the
-    // unpublished admission candidate as a temporary visited table, then
-    // restore terminal-only points to the canonical 0xff sentinel.
-    for (
-      let compactRank = previousCount;
-      compactRank < this.pointCount;
-      compactRank++
-    ) {
-      const originalId = hierarchy[compactRank];
-      if (originalId >= this.pointCount) {
-        throw new RangeError(
-          `SpatialIndex LOD hierarchy tail contains source ID ${originalId} outside ${this.pointCount} points.`
-        );
-      }
-      if (
-        admissionLevels[originalId] !==
-        LOD_FULL_DETAIL_ADMISSION_LEVEL
-      ) {
-        throw new Error(
-          `SpatialIndex LOD hierarchy repeats source ID ${originalId} in its full-detail tail.`
-        );
-      }
-      admissionLevels[originalId] = terminalLevel;
-    }
-    for (
-      let compactRank = previousCount;
-      compactRank < this.pointCount;
-      compactRank++
-    ) {
-      admissionLevels[hierarchy[compactRank]] =
-        LOD_FULL_DETAIL_ADMISSION_LEVEL;
-    }
-    descriptorsByLevel[terminalLevel] = null;
-
-    const candidate = Object.freeze({
-      admissionLevels,
-      descriptorsByLevel: Object.freeze(descriptorsByLevel),
-      generationToken,
-    });
-    this._lodMembershipOwner = candidate;
-    return candidate;
-  }
-
-  /**
-   * Return the exact shared membership descriptor for one LOD level.
-   * Terminal full detail is represented by null (all points admitted).
-   *
-   * @param {number} lodLevel
-   * @returns {Object|null}
-   */
-  getLodMembership(lodLevel) {
-    if (lodLevel === -1) return null;
-    if (
-      !Number.isInteger(lodLevel) ||
-      lodLevel < 0 ||
-      lodLevel >= this.lodLevels.length
-    ) {
-      throw new RangeError(
-        `SpatialIndex LOD membership level ${String(lodLevel)} is outside the published inventory.`
-      );
-    }
-    if (this.lodLevels[lodLevel]?.isFullDetail === true) {
-      return null;
-    }
-    const owner = this._ensureLodMembershipOwner();
-    const descriptor = owner.descriptorsByLevel[lodLevel];
-    if (descriptor === null || descriptor === undefined) {
-      throw new Error(
-        `SpatialIndex LOD ${lodLevel} has no exact membership descriptor.`
-      );
-    }
-    return descriptor;
-  }
-
-  /**
-   * Get LOD level for a given camera distance.
-   * @param {number} distance - Camera distance from target
-   * @param {number} viewportHeight - Viewport height in pixels
-   * @param {number} previousLevel - Previous LOD level for this view (for hysteresis). Pass -1 or undefined for first call.
-   * @param {number} dimensionLevel - Current dimension level (1, 2, or 3).
-   * @param {Object} [overrideBounds] - Optional bounds override for view-specific positions.
-   *   When positions differ from octree (e.g., 2D projection), pass actual bounds to get
-   *   correct LOD selection. Format: { minX, maxX, minY, maxY, minZ, maxZ }
-   * @returns {number} LOD level (0 = highest detail)
-   */
-  getLODLevel(distance, viewportHeight, previousLevel, dimensionLevel, overrideBounds = null) {
-    if (this.lodLevels.length === 0) return -1;
-
-    const validDimLevel = requireDimensionLevel(
-      dimensionLevel,
-      'SpatialIndex LOD dimensionLevel'
-    );
-
-    const numLevels = this.lodLevels.length;
-
-    // Calculate data diagonal size for scale-independent LOD selection
-    // Use override bounds if provided (for view-specific positions), otherwise use octree bounds
-    // This handles cases where the octree was built from 3D-padded positions but we're viewing in 2D
-    const bounds = overrideBounds || this.bounds;
-    const dx = bounds.maxX - bounds.minX;
-    const dy = bounds.maxY - bounds.minY;
-    const dz = bounds.maxZ - bounds.minZ;
-    // For lower dimensions, use only the significant extents (data may be along any axis)
-    // Sort extents to find the largest ones regardless of which axis they're on
-    let dataSize;
-    if (validDimLevel === 1) {
-      // 1D: use the largest extent (data could be along X, Y, or Z)
-      dataSize = Math.max(dx, dy, dz) || 1;
-	    } else if (validDimLevel === 2) {
-	      // 2D: use the two largest extents (handles XY, XZ, or YZ planes)
-	      // Avoid allocation/sort in a hot helper (used when adaptive LOD is enabled).
-	      const maxExtent = Math.max(dx, dy, dz);
-	      const minExtent = Math.min(dx, dy, dz);
-	      const midExtent = dx + dy + dz - maxExtent - minExtent;
-	      dataSize = Math.sqrt(maxExtent * maxExtent + midExtent * midExtent) || 1;
-	    } else {
-	      dataSize = Math.sqrt(dx * dx + dy * dy + dz * dz) || 1;  // 3D+: full diagonal
-	    }
-
-    // Normalize distance relative to data size
-    const distanceRatio = distance / dataSize;
-
-    // Map distance ratio to LOD level
-    const minRatio = 0.3;
-    const maxRatio = 3.0;
-    const clampedRatio = Math.max(minRatio, Math.min(maxRatio, distanceRatio));
-
-    const t = 1.0 - (Math.log(clampedRatio / minRatio) / Math.log(maxRatio / minRatio));
-    const targetLevel = t * (numLevels - 1);
-
-    // Apply hysteresis with large dead zone to prevent oscillation
-    const HYSTERESIS = 0.7;
-
-    // Use passed previousLevel for per-view hysteresis (instead of global state)
-    const currentLevel = previousLevel >= 0 ? previousLevel : Math.round(targetLevel);
-    let newLevel = currentLevel;
-
-    if (targetLevel > currentLevel + HYSTERESIS && currentLevel < numLevels - 1) {
-      newLevel = currentLevel + 1;
-    } else if (targetLevel < currentLevel - HYSTERESIS && currentLevel > 0) {
-      newLevel = currentLevel - 1;
-    }
-
-    return Math.max(0, Math.min(numLevels - 1, newLevel));
-  }
-
-  getVisibleIndices(frustumPlanes, maxPoints = Infinity) {
-    const visibleIndices = [];
-
-    const traverse = (node) => {
-      if (!node || visibleIndices.length >= maxPoints) return;
-
-      if (!this._boundsInFrustum(node.bounds, frustumPlanes)) {
-        return;
-      }
-
-      if (node.indices !== null) {
-        for (let i = 0; i < node.indices.length && visibleIndices.length < maxPoints; i++) {
-          visibleIndices.push(node.indices[i]);
-        }
-      } else if (node.children) {
-        for (const child of node.children) {
-          traverse(child);
-        }
-      }
-    };
-
-    traverse(this.root);
-    return visibleIndices;
-  }
-
-  _boundsInFrustum(bounds, planes) {
-    for (let i = 0; i < planes.length; i++) {
-      const plane = planes[i];
-      const px = plane[0] >= 0 ? bounds.maxX : bounds.minX;
-      const py = plane[1] >= 0 ? bounds.maxY : bounds.minY;
-      const pz = plane[2] >= 0 ? bounds.maxZ : bounds.minZ;
-
-      if (plane[0] * px + plane[1] * py + plane[2] * pz + plane[3] < 0) {
-        return false;
-      }
-    }
-    return true;
-  }
-
-  _boundsIntersectsSphere(bounds, center, radius) {
-    // Clamp point to AABB and measure distance to sphere center
-    const cx = Math.max(bounds.minX, Math.min(center[0], bounds.maxX));
-    const cy = Math.max(bounds.minY, Math.min(center[1], bounds.maxY));
-    const cz = Math.max(bounds.minZ, Math.min(center[2], bounds.maxZ));
-    const dx = cx - center[0];
-    const dy = cy - center[1];
-    const dz = cz - center[2];
-    return (dx * dx + dy * dy + dz * dz) <= radius * radius;
-  }
-
-  /**
-   * Visit every point in leaves whose bounds intersect a sphere. Node
-   * rejection is conservative; the caller owns the exact point-level
-   * predicate. Unlike queryRadius(), this traversal has no result cap.
-   * Each original point ID is visited at most once.
-   *
-   * @param {ArrayLike<number>} center
-   * @param {number} radius
-   * @param {(cellIndex: number) => void} visitor
-   */
-  visitRadiusCandidates(center, radius, visitor) {
-    requireNumericVector(center, 3, 'SpatialIndex radius center');
-    if (!Number.isFinite(radius) || radius < 0) {
-      throw new RangeError(
-        'SpatialIndex radius must be a finite non-negative number.'
-      );
-    }
-    if (typeof visitor !== 'function') {
-      throw new TypeError('SpatialIndex radius visitor must be a function.');
-    }
-    if (!this.root) return;
-
-    const stack = [this.root];
-    while (stack.length > 0) {
-      const node = stack.pop();
-      if (
-        !node ||
-        !this._boundsIntersectsSphere(node.bounds, center, radius)
-      ) {
-        continue;
-      }
-      if (node.indices) {
-        for (let index = 0; index < node.indices.length; index++) {
-          visitor(node.indices[index]);
-        }
-      } else if (node.children) {
-        for (let index = 0; index < node.children.length; index++) {
-          const child = node.children[index];
-          if (child) stack.push(child);
-        }
-      }
-    }
-  }
-
-  _boundsIntersectsProjectedRect(bounds, mvpMatrix, clipPlanes) {
-    // Screen-space division reverses inequalities behind the eye. Only prune
-    // boxes proven wholly in front of the clip-W singularity; boxes touching
-    // or crossing it are traversed so the caller's exact projection predicate
-    // remains authoritative.
-    const wa = mvpMatrix[3];
-    const wb = mvpMatrix[7];
-    const wc = mvpMatrix[11];
-    const wd = mvpMatrix[15];
-    const minimumClipW =
-      wd +
-      wa * (wa >= 0 ? bounds.minX : bounds.maxX) +
-      wb * (wb >= 0 ? bounds.minY : bounds.maxY) +
-      wc * (wc >= 0 ? bounds.minZ : bounds.maxZ);
-    if (minimumClipW <= 1e-10) return true;
-
-    for (let planeOffset = 0; planeOffset < 24; planeOffset += 4) {
-      const a = clipPlanes[planeOffset];
-      const b = clipPlanes[planeOffset + 1];
-      const c = clipPlanes[planeOffset + 2];
-      const d = clipPlanes[planeOffset + 3];
-      const maximum =
-        d +
-        a * (a >= 0 ? bounds.maxX : bounds.minX) +
-        b * (b >= 0 ? bounds.maxY : bounds.minY) +
-        c * (c >= 0 ? bounds.maxZ : bounds.minZ);
-      if (maximum < 0) return false;
-    }
-    return true;
-  }
-
-  /**
-   * Visit every point in leaves that can project into an NDC rectangle while
-   * passing the canonical near/far clip planes. The six object-space planes
-   * are derived exactly from the captured MVP matrix and rectangle. Boxes
-   * crossing clip-W=0 are deliberately retained for exact point testing.
-   *
-   * @param {ArrayLike<number>} mvpMatrix Column-major MVP matrix.
-   * @param {{minX:number,maxX:number,minY:number,maxY:number}} ndcBounds
-   * @param {(cellIndex: number) => void} visitor
-   */
-  visitProjectedRectCandidates(mvpMatrix, ndcBounds, visitor) {
-    requireNumericVector(
-      mvpMatrix,
-      16,
-      'SpatialIndex projected-rectangle MVP matrix'
-    );
-    if (
-      ndcBounds === null ||
-      typeof ndcBounds !== 'object' ||
-      Array.isArray(ndcBounds)
-    ) {
-      throw new TypeError(
-        'SpatialIndex projected-rectangle NDC bounds must be an object.'
-      );
-    }
-    const minX = requireFiniteNumber(
-      ndcBounds.minX,
-      'SpatialIndex projected-rectangle minX'
-    );
-    const maxX = requireFiniteNumber(
-      ndcBounds.maxX,
-      'SpatialIndex projected-rectangle maxX'
-    );
-    const minY = requireFiniteNumber(
-      ndcBounds.minY,
-      'SpatialIndex projected-rectangle minY'
-    );
-    const maxY = requireFiniteNumber(
-      ndcBounds.maxY,
-      'SpatialIndex projected-rectangle maxY'
-    );
-    if (minX > maxX || minY > maxY) {
-      throw new RangeError(
-        'SpatialIndex projected-rectangle NDC bounds must be ordered.'
-      );
-    }
-    if (typeof visitor !== 'function') {
-      throw new TypeError(
-        'SpatialIndex projected-rectangle visitor must be a function.'
-      );
-    }
-    if (!this.root) return;
-
-    // Column-major clip rows: X=(0,4,8,12), Y=(1,5,9,13),
-    // Z=(2,6,10,14), W=(3,7,11,15).
-    const planes = new Float64Array(24);
-    const setPlane = (offset, xFactor, yFactor, zFactor, wFactor) => {
-      planes[offset] =
-        xFactor * mvpMatrix[0] +
-        yFactor * mvpMatrix[1] +
-        zFactor * mvpMatrix[2] +
-        wFactor * mvpMatrix[3];
-      planes[offset + 1] =
-        xFactor * mvpMatrix[4] +
-        yFactor * mvpMatrix[5] +
-        zFactor * mvpMatrix[6] +
-        wFactor * mvpMatrix[7];
-      planes[offset + 2] =
-        xFactor * mvpMatrix[8] +
-        yFactor * mvpMatrix[9] +
-        zFactor * mvpMatrix[10] +
-        wFactor * mvpMatrix[11];
-      planes[offset + 3] =
-        xFactor * mvpMatrix[12] +
-        yFactor * mvpMatrix[13] +
-        zFactor * mvpMatrix[14] +
-        wFactor * mvpMatrix[15];
-    };
-    setPlane(0, 1, 0, 0, -minX);   // clipX >= minX * clipW
-    setPlane(4, -1, 0, 0, maxX);   // clipX <= maxX * clipW
-    setPlane(8, 0, 1, 0, -minY);   // clipY >= minY * clipW
-    setPlane(12, 0, -1, 0, maxY);  // clipY <= maxY * clipW
-    setPlane(16, 0, 0, 1, 1);      // clipZ >= -clipW
-    setPlane(20, 0, 0, -1, 1);     // clipZ <= clipW
-
-    const stack = [this.root];
-    while (stack.length > 0) {
-      const node = stack.pop();
-      if (
-        !node ||
-        !this._boundsIntersectsProjectedRect(
-          node.bounds,
-          mvpMatrix,
-          planes
-        )
-      ) {
-        continue;
-      }
-      if (node.indices) {
-        for (let index = 0; index < node.indices.length; index++) {
-          visitor(node.indices[index]);
-        }
-      } else if (node.children) {
-        for (let index = 0; index < node.children.length; index++) {
-          const child = node.children[index];
-          if (child) stack.push(child);
-        }
-      }
-    }
-  }
-
-  _boundsIntersectsExpandedRaySegment(
-    bounds,
-    origin,
-    direction,
-    maxDistance,
-    radius
-  ) {
-    let minimumDistance = 0;
-    let maximumDistance = maxDistance;
-
-    for (let axis = 0; axis < 3; axis++) {
-      const axisOrigin = origin[axis];
-      const axisDirection = direction[axis];
-      let axisMinimum;
-      let axisMaximum;
-      if (axis === 0) {
-        axisMinimum = bounds.minX - radius;
-        axisMaximum = bounds.maxX + radius;
-      } else if (axis === 1) {
-        axisMinimum = bounds.minY - radius;
-        axisMaximum = bounds.maxY + radius;
-      } else {
-        axisMinimum = bounds.minZ - radius;
-        axisMaximum = bounds.maxZ + radius;
-      }
-      if (axisDirection === 0) {
-        if (
-          axisOrigin < axisMinimum ||
-          axisOrigin > axisMaximum
-        ) {
-          return false;
-        }
-        continue;
-      }
-
-      const inverseDirection = 1 / axisDirection;
-      let entryDistance =
-        (axisMinimum - axisOrigin) * inverseDirection;
-      let exitDistance =
-        (axisMaximum - axisOrigin) * inverseDirection;
-      if (entryDistance > exitDistance) {
-        const swap = entryDistance;
-        entryDistance = exitDistance;
-        exitDistance = swap;
-      }
-      minimumDistance = Math.max(minimumDistance, entryDistance);
-      maximumDistance = Math.min(maximumDistance, exitDistance);
-      if (minimumDistance > maximumDistance) return false;
-    }
-    return true;
-  }
-
-  /**
-   * Visit every point in leaves that can intersect a radius-expanded finite
-   * ray segment. Node rejection is conservative; the caller owns the exact
-   * point-level predicate. Each original point ID is visited at most once.
-   *
-   * @param {ArrayLike<number>} origin
-   * @param {ArrayLike<number>} direction
-   * @param {number} maxDistance
-   * @param {number} radius
-   * @param {(cellIndex: number) => void} visitor
-   */
-  visitRaySegmentCandidates(
-    origin,
-    direction,
-    maxDistance,
-    radius,
-    visitor
-  ) {
-    requireNumericVector(origin, 3, 'SpatialIndex ray origin');
-    requireNumericVector(direction, 3, 'SpatialIndex ray direction');
-    if (!Number.isFinite(maxDistance) || maxDistance < 0) {
-      throw new RangeError(
-        'SpatialIndex ray maxDistance must be a finite non-negative number.'
-      );
-    }
-    if (!Number.isFinite(radius) || radius < 0) {
-      throw new RangeError(
-        'SpatialIndex ray radius must be a finite non-negative number.'
-      );
-    }
-    if (typeof visitor !== 'function') {
-      throw new TypeError('SpatialIndex ray visitor must be a function.');
-    }
-    if (!this.root) return;
-
-    const stack = [this.root];
-    while (stack.length > 0) {
-      const node = stack.pop();
-      if (
-        !node ||
-        !this._boundsIntersectsExpandedRaySegment(
-          node.bounds,
-          origin,
-          direction,
-          maxDistance,
-          radius
-        )
-      ) {
-        continue;
-      }
-      if (node.indices) {
-        for (let index = 0; index < node.indices.length; index++) {
-          visitor(node.indices[index]);
-        }
-      } else if (node.children) {
-        for (let index = 0; index < node.children.length; index++) {
-          const child = node.children[index];
-          if (child) stack.push(child);
-        }
-      }
-    }
-  }
-
-  queryRadius(center, radius, maxResults = 64) {
-    if (!this.root || radius <= 0) return [];
-    const results = [];
-    const stack = [this.root];
-    const r2 = radius * radius;
-
-    while (stack.length && results.length < maxResults) {
-      const node = stack.pop();
-      if (!node) continue;
-      if (!this._boundsIntersectsSphere(node.bounds, center, radius)) continue;
-
-      if (node.indices) {
-        for (let i = 0; i < node.indices.length && results.length < maxResults; i++) {
-          const idx = node.indices[i];
-          const px = this.positions[idx * 3];
-          const py = this.positions[idx * 3 + 1];
-          const pz = this.positions[idx * 3 + 2];
-          const dx = px - center[0];
-          const dy = py - center[1];
-          const dz = pz - center[2];
-          const dist2 = dx * dx + dy * dy + dz * dz;
-          if (dist2 <= r2) {
-            results.push(idx);
-          }
-        }
-      } else if (node.children) {
-        for (const child of node.children) {
-          if (child) stack.push(child);
-        }
-      }
-    }
-
-    return results;
-  }
-
-  /**
-   * Query points within radius at a specific LOD level.
-   * Each result's lodIndex is its compact LOD-prefix position, while
-   * originalIndex is the exact source-data point ID.
-   * @param {Array} center - [x, y, z] center point
-   * @param {number} radius - Search radius
-   * @param {number} lodLevel - LOD level to query (0 = lowest detail, max = full detail)
-   * @param {number} maxResults - Maximum results to return
-   * @param {Float32Array} [customPositions] - Optional custom positions array for view-specific queries
-   *   (e.g., 2D projected positions). If provided, queries against these positions instead of
-   *   the spatial index's source positions. Must have same point count as original data.
-   * @returns {Array} Array of { lodIndex, position, originalIndex }
-   */
-  queryRadiusAtLOD(center, radius, lodLevel, maxResults, customPositions = null) {
-    if (radius <= 0) return [];
-
-    const numLevels = this.lodLevels.length;
-    if (!Number.isInteger(lodLevel) || lodLevel < 0 || lodLevel >= numLevels) {
-      throw new RangeError(
-        `SpatialIndex LOD level must be an integer in [0, ${numLevels - 1}].`
-      );
-    }
-    if (!Number.isInteger(maxResults) || maxResults <= 0) {
-      throw new TypeError('SpatialIndex maxResults must be a positive integer.');
-    }
-    if (
-      customPositions !== null &&
-      (!(customPositions instanceof Float32Array) ||
-        customPositions.length !== this.positions.length)
-    ) {
-      throw new TypeError(
-        `SpatialIndex customPositions must be null or a Float32Array with exactly ${this.positions.length} values.`
-      );
-    }
-
-    const level = this.lodLevels[lodLevel];
-    const pointCount = level.pointCount;
-    const isFullDetail = level.isFullDetail;
-    const sourcePositions = customPositions ?? this.positions;
-
-    const results = [];
-    const r2 = radius * radius;
-
-    // Simple brute force over the LOD candidate IDs (reduced levels are small enough).
-    for (let i = 0; i < pointCount && results.length < maxResults; i++) {
-      const originalIdx = isFullDetail ? i : level.indices[i];
-      const sourceOffset = originalIdx * 3;
-      const px = sourcePositions[sourceOffset];
-      const py = sourcePositions[sourceOffset + 1];
-      const pz = sourcePositions[sourceOffset + 2];
-
-      const dx = px - center[0];
-      const dy = py - center[1];
-      const dz = pz - center[2];
-      const dist2 = dx * dx + dy * dy + dz * dz;
-      if (dist2 <= r2) {
-        results.push({
-          lodIndex: i,
-          originalIndex: originalIdx,
-          position: [px, py, pz]
-        });
-      }
-    }
-
-    return results;
-  }
-
-  getBoundingSphere() {
-    const b = this.bounds;
-    const centerX = (b.minX + b.maxX) * 0.5;
-    const centerY = (b.minY + b.maxY) * 0.5;
-    const centerZ = (b.minZ + b.maxZ) * 0.5;
-
-    const dx = b.maxX - b.minX;
-    const dy = b.maxY - b.minY;
-    const dz = b.maxZ - b.minZ;
-    const radius = Math.sqrt(dx * dx + dy * dy + dz * dz) * 0.5;
-
-    return { center: [centerX, centerY, centerZ], radius };
-  }
-
-  /**
-   * Publish one exact compact-rank-to-leaf mapping shared by every reduced
-   * LOD. A query marks its visible leaf ordinals, then scans only [0, K) for
-   * the requested prefix. The emitted EBO is therefore globally ordered by
-   * compact rank and costs O(visible leaves + K), independent of Kmax.
-   */
-  _buildLODNodeMappings() {
-    console.time('LOD node mapping');
-    try {
-      if (
-        !Array.isArray(this.lodLevels) ||
-        this.lodLevels.length === 0 ||
-        this.lodLevels.at(-1)?.isFullDetail !== true
-      ) {
-        throw new Error(
-          'SpatialIndex LOD node mapping requires one terminal full-detail level.'
-        );
-      }
-
-      const reducedLevels = this.lodLevels.slice(0, -1);
-      const maximumIndices =
-        reducedLevels.at(-1)?.indices ?? null;
-      if (
-        maximumIndices !== null &&
-        !(maximumIndices instanceof Uint32Array)
-      ) {
-        throw new TypeError(
-          'SpatialIndex LOD node mapping requires exact Uint32Array prefix indices.'
-        );
-      }
-      const maximumCount = maximumIndices?.length ?? 0;
-
-      // Staging is deliberately detached from both the tree and this owner.
-      // A late leaf read/allocation/publication failure therefore leaves the
-      // accepted generation byte-for-byte untouched and retryable.
-      const leaves = [];
-      const collectLeaves = node => {
-        if (!node) return;
-        const indices = node.indices;
-        if (indices !== null) {
-          if (!(indices instanceof Uint32Array)) {
-            throw new TypeError(
-              'SpatialIndex leaf membership must be an exact Uint32Array.'
-            );
-          }
-          leaves.push({ indices, node });
-          return;
-        }
-        if (node.children) {
-          for (const child of node.children) collectLeaves(child);
-        }
-      };
-      collectLeaves(this.root);
-      if (leaves.length >= LOD_MAPPING_VISITED_BIT) {
-        throw new RangeError(
-          'SpatialIndex LOD node mapping exceeds the Uint32 leaf-ordinal contract.'
-        );
-      }
-
-      // This point-count owner is temporary build scratch. It first proves
-      // that the leaves are one exact source-ID partition, then lends its high
-      // bit to validate maximum-prefix uniqueness without another N owner.
-      const leafOrdinalByOriginalId =
-        new Uint32Array(this.pointCount);
-      leafOrdinalByOriginalId.fill(LOD_MAPPING_SENTINEL);
-      let mappedPointCount = 0;
-      for (
-        let leafOrdinal = 0;
-        leafOrdinal < leaves.length;
-        leafOrdinal++
-      ) {
-        const { indices } = leaves[leafOrdinal];
-        for (let index = 0; index < indices.length; index++) {
-          const originalId = indices[index];
-          if (originalId >= this.pointCount) {
-            throw new RangeError(
-              `SpatialIndex leaf contains source ID ${originalId} outside ${this.pointCount} points.`
-            );
-          }
-          if (
-            leafOrdinalByOriginalId[originalId] !==
-            LOD_MAPPING_SENTINEL
-          ) {
-            throw new Error(
-              `SpatialIndex leaves repeat source ID ${originalId}.`
-            );
-          }
-          leafOrdinalByOriginalId[originalId] =
-            leafOrdinal;
-          mappedPointCount++;
-        }
-      }
-      if (mappedPointCount !== this.pointCount) {
-        throw new Error(
-          `SpatialIndex leaves own ${mappedPointCount} source IDs but the dataset contains ${this.pointCount}.`
-        );
-      }
-
-      const leafOrdinalsByCompactRank =
-        new Uint32Array(maximumCount);
-      for (
-        let compactRank = 0;
-        compactRank < maximumCount;
-        compactRank++
-      ) {
-        const originalId = maximumIndices[compactRank];
-        if (originalId >= this.pointCount) {
-          throw new RangeError(
-            `SpatialIndex maximum LOD prefix contains source ID ${originalId} outside ${this.pointCount} points.`
-          );
-        }
-        const encodedOrdinal =
-          leafOrdinalByOriginalId[originalId];
-        if (encodedOrdinal === LOD_MAPPING_SENTINEL) {
-          throw new Error(
-            `SpatialIndex maximum LOD prefix source ID ${originalId} has no leaf owner.`
-          );
-        }
-        if (
-          (encodedOrdinal & LOD_MAPPING_VISITED_BIT) !== 0
-        ) {
-          throw new Error(
-            `SpatialIndex maximum LOD prefix repeats source ID ${originalId}.`
-          );
-        }
-        leafOrdinalsByCompactRank[compactRank] =
-          encodedOrdinal;
-        leafOrdinalByOriginalId[originalId] =
-          encodedOrdinal | LOD_MAPPING_VISITED_BIT;
-      }
-
-      const generationToken = Object.freeze({});
-      const leafNodes = Object.freeze(
-        leaves.map(entry => entry.node)
-      );
-      const visibleLeafMarks =
-        new Uint32Array(leaves.length);
-      const queryState = Object.seal({
-        generation: 0,
-        lastExaminedRanks: 0,
-        lastMarkedLeafCount: 0,
-      });
-      const metadata = leaves.map(
-        ({ node }, ordinal) => ({
-          descriptor: Object.freeze({
-            generationToken,
-            ordinal,
-          }),
-          node,
-          previousDescriptor:
-            Object.getOwnPropertyDescriptor(
-              node,
-              'lodMapping'
-            ),
-        })
-      );
-      const candidateOwner = Object.freeze({
-        generationToken,
-        leafNodes,
-        leafOrdinalsByCompactRank,
-        maximumIndices,
-        pointCount: this.pointCount,
-        queryState,
-        visibleLeafMarks,
-      });
-
-      let publishedMetadataCount = 0;
-      try {
-        for (const entry of metadata) {
-          const published = Reflect.defineProperty(
-            entry.node,
-            'lodMapping',
-            {
-              configurable: true,
-              enumerable: true,
-              value: entry.descriptor,
-              writable: true,
-            }
-          );
-          if (!published) {
-            throw new TypeError(
-              'SpatialIndex leaf rejected LOD mapping publication.'
-            );
-          }
-          publishedMetadataCount++;
-        }
-        this._lodNodeMapping = candidateOwner;
-      } catch (error) {
-        for (
-          let index = publishedMetadataCount - 1;
-          index >= 0;
-          index--
-        ) {
-          const entry = metadata[index];
-          if (entry.previousDescriptor === undefined) {
-            Reflect.deleteProperty(
-              entry.node,
-              'lodMapping'
-            );
-          } else {
-            Reflect.defineProperty(
-              entry.node,
-              'lodMapping',
-              entry.previousDescriptor
-            );
-          }
-        }
-        throw error;
-      }
-    } finally {
-      console.timeEnd('LOD node mapping');
-    }
-  }
-
-  _validateLodNodeMapping() {
-    const owner = this._lodNodeMapping;
-    const maximumIndices =
-      this.lodLevels.at(-2)?.indices ?? null;
-    if (
-      owner === null ||
-      typeof owner !== 'object' ||
-      owner.maximumIndices !== maximumIndices ||
-      owner.pointCount !== this.pointCount ||
-      !Array.isArray(owner.leafNodes) ||
-      !Object.isFrozen(owner.leafNodes) ||
-      !(owner.leafOrdinalsByCompactRank instanceof Uint32Array) ||
-      owner.leafOrdinalsByCompactRank.length !==
-        (maximumIndices?.length ?? 0) ||
-      !(owner.visibleLeafMarks instanceof Uint32Array) ||
-      owner.visibleLeafMarks.length !==
-        owner.leafNodes.length ||
-      owner.queryState === null ||
-      typeof owner.queryState !== 'object' ||
-      !Object.isSealed(owner.queryState) ||
-      !Number.isInteger(owner.queryState.generation) ||
-      owner.queryState.generation < 0 ||
-      owner.queryState.generation > LOD_MAPPING_SENTINEL ||
-      owner.generationToken === null ||
-      typeof owner.generationToken !== 'object' ||
-      !Object.isFrozen(owner.generationToken)
-    ) {
-      throw new Error(
-        'SpatialIndex LOD node mapping has inconsistent generation ownership.'
-      );
-    }
-
-    let expectedOrdinal = 0;
-    const validateLeaves = node => {
-      if (!node) return;
-      if (node.indices !== null) {
-        const metadata = node.lodMapping;
-        if (
-          metadata === null ||
-          typeof metadata !== 'object' ||
-          !Object.isFrozen(metadata) ||
-          metadata.generationToken !== owner.generationToken ||
-          metadata.ordinal !== expectedOrdinal ||
-          owner.leafNodes[expectedOrdinal] !== node
-        ) {
-          throw new Error(
-            'SpatialIndex leaf has inconsistent LOD mapping metadata.'
-          );
-        }
-        expectedOrdinal++;
-        return;
-      }
-      if (node.children) {
-        for (const child of node.children) validateLeaves(child);
-      }
-    };
-    validateLeaves(this.root);
-    if (expectedOrdinal !== owner.leafNodes.length) {
-      throw new Error(
-        `SpatialIndex tree contains ${expectedOrdinal} leaves but the mapping owns ${owner.leafNodes.length}.`
-      );
-    }
-    for (
-      let compactRank = 0;
-      compactRank < owner.leafOrdinalsByCompactRank.length;
-      compactRank++
-    ) {
-      if (
-        owner.leafOrdinalsByCompactRank[compactRank] >=
-        owner.leafNodes.length
-      ) {
-        throw new RangeError(
-          `SpatialIndex compact rank ${compactRank} has an invalid leaf ordinal.`
-        );
-      }
-    }
-    return owner.generationToken;
-  }
-
-  _reserveLodMappingMarkGeneration(owner, span = 1) {
-    if (
-      owner !== this._lodNodeMapping ||
-      !(owner?.visibleLeafMarks instanceof Uint32Array) ||
-      !Number.isInteger(span) ||
-      span < 1 ||
-      span > 2
-    ) {
-      throw new Error(
-        'SpatialIndex LOD query requires the exact published mark owner.'
-      );
-    }
-    const queryState = owner.queryState;
-    let firstGeneration = queryState.generation + 1;
-    if (
-      firstGeneration >
-      LOD_MAPPING_SENTINEL - span + 1
-    ) {
-      owner.visibleLeafMarks.fill(0);
-      firstGeneration = 1;
-    }
-    queryState.generation =
-      firstGeneration + span - 1;
-    return firstGeneration;
-  }
-
-  _requireLodLeafOrdinal(owner, leaf) {
-    const metadata = leaf?.lodMapping;
-    const ordinal = metadata?.ordinal;
-    if (
-      metadata === null ||
-      typeof metadata !== 'object' ||
-      metadata.generationToken !== owner.generationToken ||
-      !Number.isInteger(ordinal) ||
-      ordinal < 0 ||
-      ordinal >= owner.leafNodes.length ||
-      owner.leafNodes[ordinal] !== leaf
-    ) {
-      throw new Error(
-        'SpatialIndex visible leaf does not belong to the exact LOD mapping.'
-      );
-    }
-    return ordinal;
-  }
-
-  _markLodVisibleLeaves(owner, visibleLeaves) {
-    const generation =
-      this._reserveLodMappingMarkGeneration(owner);
-    const marks = owner.visibleLeafMarks;
-    for (const leaf of visibleLeaves) {
-      const ordinal =
-        this._requireLodLeafOrdinal(owner, leaf);
-      if (marks[ordinal] === generation) {
-        throw new Error(
-          'SpatialIndex visible LOD leaves contain a duplicate leaf.'
-        );
-      }
-      marks[ordinal] = generation;
-    }
-    owner.queryState.lastMarkedLeafCount =
-      visibleLeaves.length;
-    return generation;
-  }
-
-  /**
-   * LOD EBO order is globally compact-rank ordered, so traversal order is not
-   * semantic. Compare exact leaf identity as a set without allocating a Set.
-   */
-  hasSameLodVisibleLeafSet(accepted, candidate) {
-    if (
-      !Array.isArray(accepted) ||
-      !Array.isArray(candidate) ||
-      accepted.length !== candidate.length
-    ) {
-      return false;
-    }
-    const owner = this._lodNodeMapping;
-    if (
-      owner === null ||
-      typeof owner !== 'object' ||
-      !(owner.visibleLeafMarks instanceof Uint32Array)
-    ) {
-      throw new Error(
-        'SpatialIndex LOD node mapping has not been published.'
-      );
-    }
-    if (accepted.length === 0) return true;
-
-    const acceptedGeneration =
-      this._reserveLodMappingMarkGeneration(owner, 2);
-    const candidateGeneration = acceptedGeneration + 1;
-    const marks = owner.visibleLeafMarks;
-    for (const leaf of accepted) {
-      const ordinal =
-        this._requireLodLeafOrdinal(owner, leaf);
-      if (marks[ordinal] === acceptedGeneration) {
-        return false;
-      }
-      marks[ordinal] = acceptedGeneration;
-    }
-    for (const leaf of candidate) {
-      const ordinal =
-        this._requireLodLeafOrdinal(owner, leaf);
-      if (marks[ordinal] !== acceptedGeneration) {
-        return false;
-      }
-      marks[ordinal] = candidateGeneration;
-    }
-    owner.queryState.lastExaminedRanks = 0;
-    owner.queryState.lastMarkedLeafCount =
-      accepted.length + candidate.length;
-    return true;
-  }
-
-  _requireReducedLodPrefixCount(lodLevel) {
-    if (
-      !Number.isInteger(lodLevel) ||
-      lodLevel < 0 ||
-      lodLevel >= this.lodLevels.length - 1
-    ) {
-      throw new RangeError(
-        `SpatialIndex reduced LOD level must be an integer in [0, ${this.lodLevels.length - 2}].`
-      );
-    }
-    const level = this.lodLevels[lodLevel];
-    if (
-      level?.isFullDetail === true ||
-      !(level?.indices instanceof Uint32Array) ||
-      level.indices.length !== level.pointCount
-    ) {
-      throw new Error(
-        `SpatialIndex LOD ${lodLevel} is not an exact reduced prefix.`
-      );
-    }
-    return level.pointCount;
-  }
-
-  countLodMappedIndices(visibleLeaves, lodLevel) {
-    if (!Array.isArray(visibleLeaves)) {
-      throw new TypeError(
-        'SpatialIndex visible LOD leaves must be an exact array.'
-      );
-    }
-    const prefixCount =
-      this._requireReducedLodPrefixCount(lodLevel);
-    const owner = this._lodNodeMapping;
-    const leafOrdinalsByCompactRank =
-      owner?.leafOrdinalsByCompactRank;
-    if (
-      !(leafOrdinalsByCompactRank instanceof Uint32Array) ||
-      !(owner.visibleLeafMarks instanceof Uint32Array)
-    ) {
-      throw new Error(
-        'SpatialIndex LOD node mapping has not been published.'
-      );
-    }
-    if (visibleLeaves.length === 0) {
-      owner.queryState.lastExaminedRanks = 0;
-      owner.queryState.lastMarkedLeafCount = 0;
-      return 0;
-    }
-
-    const generation =
-      this._markLodVisibleLeaves(owner, visibleLeaves);
-    const marks = owner.visibleLeafMarks;
-    let visibleCount = 0;
-    for (
-      let compactRank = 0;
-      compactRank < prefixCount;
-      compactRank++
-    ) {
-      if (
-        marks[leafOrdinalsByCompactRank[compactRank]] ===
-        generation
-      ) {
-        visibleCount++;
-      }
-    }
-    owner.queryState.lastExaminedRanks = prefixCount;
-    return visibleCount;
-  }
-
-  writeLodMappedIndices(
-    visibleLeaves,
-    lodLevel,
-    target
-  ) {
-    if (!(target instanceof Uint32Array)) {
-      throw new TypeError(
-        'SpatialIndex visible LOD target must be an exact Uint32Array.'
-      );
-    }
-    const prefixCount =
-      this._requireReducedLodPrefixCount(lodLevel);
-    const owner = this._lodNodeMapping;
-    const leafOrdinalsByCompactRank =
-      owner?.leafOrdinalsByCompactRank;
-    if (
-      !(leafOrdinalsByCompactRank instanceof Uint32Array) ||
-      !(owner.visibleLeafMarks instanceof Uint32Array)
-    ) {
-      throw new Error(
-        'SpatialIndex LOD node mapping has not been published.'
-      );
-    }
-    if (visibleLeaves.length === 0) {
-      owner.queryState.lastExaminedRanks = 0;
-      owner.queryState.lastMarkedLeafCount = 0;
-      return 0;
-    }
-
-    const generation =
-      this._markLodVisibleLeaves(owner, visibleLeaves);
-    const marks = owner.visibleLeafMarks;
-    let writeOffset = 0;
-    for (
-      let compactRank = 0;
-      compactRank < prefixCount;
-      compactRank++
-    ) {
-      if (
-        marks[leafOrdinalsByCompactRank[compactRank]] ===
-        generation
-      ) {
-        if (writeOffset >= target.length) {
-          throw new RangeError(
-            'SpatialIndex visible LOD target capacity is too small.'
-          );
-        }
-        target[writeOffset++] = compactRank;
-      }
-    }
-    owner.queryState.lastExaminedRanks = prefixCount;
-    return writeOffset;
-  }
-
-  /**
-   * Validate that spatial index contains all original points.
-   * Returns the total count of points in all leaf nodes.
-   */
-  validatePointCount() {
-    let count = 0;
-    const countLeaves = (node) => {
-      if (!node) return;
-      if (node.indices) {
-        count += node.indices.length;
-      } else if (node.children) {
-        for (const child of node.children) {
-          countLeaves(child);
-        }
-      }
-    };
-    countLeaves(this.root);
-    const valid = count === this.pointCount;
-    if (!valid) {
-      const treeNames = { 1: 'BinaryTree', 2: 'Quadtree', 3: 'Octree' };
-      console.error(`[${treeNames[this.dimensionLevel]}] Point count mismatch: tree has ${count}, expected ${this.pointCount}`);
-    }
-    return { count, expected: this.pointCount, valid };
-  }
+    )
+  );
+  throw new RangeError(
+    `${label} cannot build a level-of-detail index for ` +
+    `${pointCount.toLocaleString()} points on this device: the build peaks at ` +
+    `about ${describeHeapMebibytes(projectedBytes)} of JavaScript heap on top ` +
+    `of the ${describeHeapMebibytes(usedBytes)} already in use, and this ` +
+    `browser caps the tab at ${describeHeapMebibytes(limitBytes)}. Turn off ` +
+    'adaptive level of detail and frustum culling to render this dataset at ' +
+    `full detail, or subset it to at most ` +
+    `${affordablePoints.toLocaleString()} points.`
+  );
 }
 
 // ============================================================================
@@ -2639,6 +307,12 @@ export class HighPerfRenderer {
     this._alphaTexHeight = 0;
     this._alphaTexData = null; // Uint8Array for texture upload
     this._alphaTexStagingData = null;
+    // Scratch for the region-addressed alpha upload: one dirty flag per texture
+    // row, and the interleaved (rowStart, rowCount) pairs derived from it. Both
+    // are re-derived on every publication and sized against the current
+    // texture, so they are not part of the accepted alpha generation.
+    this._alphaDirtyRows = null;
+    this._alphaUploadRegions = null;
     this._useAlphaTexture = false; // Whether alpha texture is active
     this._currentAlphas = null;
     this._alphaTextureByteLength = 0;
@@ -2709,6 +383,9 @@ export class HighPerfRenderer {
     this._pendingProgramRetirements = new Set();
     this._pendingShaderRetirements = new Set();
     this._pendingProgramUnbind = false;
+    // Collaborators that allocate GPU storage against this context but own
+    // their own handles, so `stats.gpuMemoryMB` can describe the whole context.
+    this._gpuAllocationReporters = new Set();
     this._validatedLodNodeMappings = new WeakMap();
     this._validatedSpatialIndices = new WeakSet();
     // Lightweight semantic tokens let observers detect a replaced LOD
@@ -2742,10 +419,17 @@ export class HighPerfRenderer {
     // Dirty flags for lazy buffer rebuilds (avoids double rebuilds)
     this._bufferDirty = false;
     this._dirtyLodDimensions = new Set();
-    // Reusable ArrayBuffer to reduce GC pressure
+    // Point-count-sized packing owner for the compact LOD generations, which
+    // must reach the GPU as one transactional whole-store upload. Null on the
+    // shipped default path, where neither LOD nor frustum culling is enabled.
     this._interleavedArrayBuffer = null;
     this._interleavedPositionView = null;
     this._interleavedColorView = null;
+    // Fixed staging block for the full-detail interleaved store. Its size is a
+    // constant, never a function of pointCount.
+    this._interleavedChunkBuffer = null;
+    this._interleavedChunkPositionView = null;
+    this._interleavedChunkColorView = null;
 
     // Pooled visible indices buffer for frustum culling (grows as needed)
     this._visibleIndicesBuffer = null;
@@ -2905,6 +589,7 @@ export class HighPerfRenderer {
         indexBuffer: indexBuffer,        // Per-view index buffer (avoids shared buffer conflicts)
         indexBufferSize: 0,              // Current size of uploaded index buffer
         indexBufferByteLength: 0,        // Last WebGL-accepted backing-store size
+        indexBufferVerifiedByteLength: 0,// Largest store size WebGL was asked to verify for this EBO
         // Pre-cached index buffer support (eliminates upload on LOD level change)
         usePreCachedIndexBuffer: false,  // Whether to use pre-cached buffer vs per-view buffer
         preCachedIndexBuffer: null,      // Reference to pre-cached buffer from lodBuffers
@@ -2999,6 +684,7 @@ export class HighPerfRenderer {
     viewState.prevLodLevel = undefined;
     viewState.lastVisibleCount = undefined;
     viewState.indexBufferSize = 0;
+    viewState.indexBufferVerifiedByteLength = 0;
     viewState.usePreCachedIndexBuffer = false;
     viewState.preCachedIndexBuffer = null;
     viewState.preCachedGenerationToken = null;
@@ -3537,10 +1223,73 @@ export class HighPerfRenderer {
     }
   }
 
+  _ensureGpuAllocationReporters() {
+    if (!(this._gpuAllocationReporters instanceof Set)) {
+      this._gpuAllocationReporters = new Set();
+    }
+    return this._gpuAllocationReporters;
+  }
+
+  /**
+   * Include one collaborator's GPU allocations in `stats.gpuMemoryMB`.
+   *
+   * This renderer can only inventory handles it owns, but it is the sole
+   * publisher of the GPU memory figure the stats display and the benchmark
+   * panel show. A collaborator that allocates GPU storage against the same
+   * context — the highlight renderer's per-view compact buffers are the case
+   * this exists for — registers here so that figure describes the context
+   * rather than one owner of it.
+   *
+   * The reporter is called with the inventory sink, which deduplicates by
+   * WebGL handle, so a handle reported by two owners is still counted once.
+   *
+   * @param {(add: (handle: unknown, byteLength: number) => void) => void} reporter
+   */
+  registerGpuAllocationReporter(reporter) {
+    if (typeof reporter !== 'function') {
+      throw new TypeError(
+        'HighPerfRenderer GPU allocation reporter must be a function.'
+      );
+    }
+    this._ensureGpuAllocationReporters().add(reporter);
+    this._refreshGpuMemoryStats();
+  }
+
+  /**
+   * Stop including a collaborator's allocations. Its resources are its own to
+   * retire; this only removes them from the reported total.
+   *
+   * @param {Function} reporter - The exact function passed to
+   *   `registerGpuAllocationReporter`.
+   * @returns {boolean} Whether a registration was removed.
+   */
+  unregisterGpuAllocationReporter(reporter) {
+    const removed = this._ensureGpuAllocationReporters().delete(reporter);
+    if (removed) this._refreshGpuMemoryStats();
+    return removed;
+  }
+
+  /**
+   * Recompute the reported GPU total after a collaborator's allocation changed.
+   *
+   * `getStats` publishes the last computed figure rather than recomputing on
+   * read, because reads happen per stats tick and per benchmark frame. Every
+   * owner therefore refreshes at its own publication points, exactly as the
+   * alpha texture, the interleaved buffer and the snapshot resources do. The
+   * inventory is proportional to the number of views, dimensions and pending
+   * retirements — never to the dataset.
+   *
+   * @returns {number} The recomputed total in bytes.
+   */
+  notifyGpuAllocationsChanged() {
+    return this._refreshGpuMemoryStats();
+  }
+
   _refreshGpuMemoryStats() {
     if (!this.stats) return 0;
     this._ensureLodResourceOwnershipState();
     this._ensureRetirementOwnershipState();
+    this._ensureGpuAllocationReporters();
 
     // Resource metadata contains several deliberate aliases (per-level LOD
     // projections, borrowed topology, pending journals). Inventory by exact
@@ -3714,6 +1463,11 @@ export class HighPerfRenderer {
         retirement?.positionBufferByteLength
       );
     }
+    // Collaborators that allocate against this context but hold their own
+    // handles -- the highlight renderer's per-view compact buffers.
+    for (const reporter of this._gpuAllocationReporters) {
+      reporter(add);
+    }
 
     let bytes = 0;
     for (const byteLength of allocations.values()) {
@@ -3780,6 +1534,8 @@ export class HighPerfRenderer {
     this._alphaTexHeight = 0;
     this._alphaTexData = null;
     this._alphaTexStagingData = null;
+    this._alphaDirtyRows = null;
+    this._alphaUploadRegions = null;
     this._useAlphaTexture = false;
     this._currentAlphas = null;
     this._lodIndexTexturesByDimension = new Map();
@@ -5059,6 +2815,24 @@ export class HighPerfRenderer {
         `HighPerfRenderer colors must contain exactly ${expectedRGBA} RGBA bytes for ${pointCount} points; received ${colors.length}.`
       );
     }
+    // Refuse a dataset this device cannot represent before anything is
+    // allocated. One alpha texel per point in a MAX_TEXTURE_SIZE square R8
+    // texture is the renderer's hard capacity limit; `_createAlphaTexture`
+    // still owns that invariant, but it is reached only after the whole
+    // full-detail vertex store has been uploaded, so a user asking for more
+    // than the machine can do would pay for the upload before being refused.
+    const maxTextureSize = gl.getParameter(gl.MAX_TEXTURE_SIZE);
+    if (!Number.isInteger(maxTextureSize) || maxTextureSize <= 0) {
+      throw new Error(
+        'HighPerfRenderer received an invalid MAX_TEXTURE_SIZE capability.'
+      );
+    }
+    const maximumPointCount = maxTextureSize * maxTextureSize;
+    if (pointCount > maximumPointCount) {
+      throw new RangeError(
+        `HighPerfRenderer cannot render ${pointCount.toLocaleString()} points on this device: its ${maxTextureSize}x${maxTextureSize} alpha-texture capacity represents at most ${maximumPointCount.toLocaleString()} points. Subset the dataset before loading it.`
+      );
+    }
     const alphaValues = Object.hasOwn(options, 'alphaValues')
       ? options.alphaValues
       : null;
@@ -5281,6 +3055,11 @@ export class HighPerfRenderer {
       );
     }
 
+    requireLodBuildHeapHeadroom(
+      pos.length / 3,
+      needsLOD,
+      `HighPerfRenderer ${dim}D live view`
+    );
     // Build a complete CPU candidate off-state. The prior exact CPU/GPU
     // generation remains authoritative until both candidate stages succeed.
     console.log(`[HighPerfRenderer] Building ${dim}D spatial index...`);
@@ -6373,38 +4152,6 @@ export class HighPerfRenderer {
   _createInterleavedBuffer(positions, colors) {
     const gl = this.gl;
     const pointCount = positions.length / 3;
-    const requiredSize = pointCount * 16; // 16 bytes per point
-
-    // Main, compact LOD, and recolor packing share this one exact allocation.
-    // Every upload consumes its client bytes synchronously before the next
-    // sequential pack overwrites them.
-    const {
-      buffer,
-      positionView,
-      colorView,
-    } = this._ensureSharedPackingScratch(
-      requiredSize,
-      'HighPerfRenderer full-detail point packing'
-    );
-
-    // colors is Uint8Array with RGBA packed (4 bytes per point) - alpha is in 4th byte
-    for (let i = 0; i < pointCount; i++) {
-      const srcIdx = i * 3;
-      const floatOffset = i * 4; // 16 bytes / 4 = 4 floats per point
-      const byteOffset = i * 16 + 12; // color starts at byte 12 within each 16-byte block
-
-      // Position (3 floats = 12 bytes)
-      positionView[floatOffset] = positions[srcIdx];
-      positionView[floatOffset + 1] = positions[srcIdx + 1];
-      positionView[floatOffset + 2] = positions[srcIdx + 2];
-
-      // Color RGBA (4 uint8 = 4 bytes) - colors is already Uint8Array with RGBA
-      const colorSrcIdx = i * 4;
-      colorView[byteOffset] = colors[colorSrcIdx];
-      colorView[byteOffset + 1] = colors[colorSrcIdx + 1];
-      colorView[byteOffset + 2] = colors[colorSrcIdx + 2];
-      colorView[byteOffset + 3] = colors[colorSrcIdx + 3];
-    }
 
     if (!this.buffers.interleaved) {
       this.buffers.interleaved = gl.createBuffer();
@@ -6416,12 +4163,21 @@ export class HighPerfRenderer {
     }
 
     gl.bindBuffer(gl.ARRAY_BUFFER, this.buffers.interleaved);
-    gl.bufferData(gl.ARRAY_BUFFER, buffer, gl.STATIC_DRAW);
-    requireCleanWebGLState(
-      gl,
-      'HighPerfRenderer interleaved point-buffer upload'
+    this._interleavedGpuByteLength = this._uploadInterleavedPointStore(
+      pointCount,
+      gl.STATIC_DRAW,
+      'HighPerfRenderer interleaved point-buffer upload',
+      (positionView, colorView, firstPoint, count) => {
+        this._packInterleavedChunk(
+          positions,
+          colors,
+          positionView,
+          colorView,
+          firstPoint,
+          count
+        );
+      }
     );
-    this._interleavedGpuByteLength = requiredSize;
 
     // Setup VAO
     gl.bindVertexArray(this.vao);
@@ -6433,6 +4189,163 @@ export class HighPerfRenderer {
     );
   }
 
+  /**
+   * Pack one sequential run of points into the fixed staging block.
+   *
+   * `colors` is a Uint8Array of RGBA bytes; alpha travels in the fourth byte.
+   * Destination slots are `0..count-1` of the block, source points are
+   * `firstPoint..firstPoint+count-1`, so the run is contiguous on both sides.
+   *
+   * @param {Float32Array} positions
+   * @param {Uint8Array} colors
+   * @param {Float32Array} positionView
+   * @param {Uint8Array} colorView
+   * @param {number} firstPoint
+   * @param {number} count
+   */
+  _packInterleavedChunk(
+    positions,
+    colors,
+    positionView,
+    colorView,
+    firstPoint,
+    count
+  ) {
+    for (let slot = 0; slot < count; slot++) {
+      const point = firstPoint + slot;
+      const positionOffset = point * 3;
+      const colorOffset = point * 4;
+      const floatOffset = slot * 4; // 16 bytes / 4 = 4 floats per point
+      const byteOffset = slot * 16 + 12; // color starts at byte 12 of the block
+
+      positionView[floatOffset] = positions[positionOffset];
+      positionView[floatOffset + 1] = positions[positionOffset + 1];
+      positionView[floatOffset + 2] = positions[positionOffset + 2];
+
+      colorView[byteOffset] = colors[colorOffset];
+      colorView[byteOffset + 1] = colors[colorOffset + 1];
+      colorView[byteOffset + 2] = colors[colorOffset + 2];
+      colorView[byteOffset + 3] = colors[colorOffset + 3];
+    }
+  }
+
+  /**
+   * The fixed staging block every full-detail interleaved upload packs through.
+   *
+   * One constant-size allocation for the renderer's lifetime. Keeping it
+   * independent of `pointCount` is what removes the client-side duplicate of
+   * the vertex buffer, and with it 16 bytes a point of resident memory.
+   *
+   * @returns {{colorView: Uint8Array, positionView: Float32Array}}
+   */
+  _ensureInterleavedChunkScratch() {
+    const byteLength = INTERLEAVED_CHUNK_POINTS * 16;
+    let buffer = this._interleavedChunkBuffer;
+    if (
+      !(buffer instanceof ArrayBuffer) ||
+      buffer.byteLength !== byteLength
+    ) {
+      buffer = new ArrayBuffer(byteLength);
+      this._interleavedChunkBuffer = buffer;
+      this._interleavedChunkPositionView = null;
+      this._interleavedChunkColorView = null;
+    }
+    if (
+      !(this._interleavedChunkPositionView instanceof Float32Array) ||
+      this._interleavedChunkPositionView.buffer !== buffer
+    ) {
+      this._interleavedChunkPositionView = new Float32Array(buffer);
+    }
+    if (
+      !(this._interleavedChunkColorView instanceof Uint8Array) ||
+      this._interleavedChunkColorView.buffer !== buffer
+    ) {
+      this._interleavedChunkColorView = new Uint8Array(buffer);
+    }
+    return {
+      colorView: this._interleavedChunkColorView,
+      positionView: this._interleavedChunkPositionView,
+    };
+  }
+
+  /**
+   * Size the bound interleaved store on the GPU, then fill it chunk by chunk.
+   *
+   * `packChunk(positionView, colorView, firstPoint, count)` writes exactly
+   * `count` points into slots `0..count-1` of the staging block. Every caller
+   * fills its destination strictly sequentially, so each chunk is packed once,
+   * uploaded once, and never revisited: the accepted store is byte-identical to
+   * the one a single whole-buffer `bufferData` would have produced.
+   *
+   * Only the sizing `bufferData` can fail for want of memory -- every
+   * `bufferSubData` after it writes inside an allocation that already
+   * succeeded. A torn chunk sequence is therefore not reachable through
+   * exhaustion, and where one is reachable at all the caller's dirty flag
+   * survives the throw and the next flush republishes the whole store.
+   *
+   * @param {number} pointCount
+   * @param {number} usage
+   * @param {string} owner
+   * @param {(
+   *   positionView: Float32Array,
+   *   colorView: Uint8Array,
+   *   firstPoint: number,
+   *   count: number,
+   * ) => void} packChunk
+   * @returns {number} the accepted store's byte length
+   */
+  _uploadInterleavedPointStore(pointCount, usage, owner, packChunk) {
+    const gl = this.gl;
+    const byteLength = pointCount * 16; // 16 bytes per point
+    gl.bufferData(gl.ARRAY_BUFFER, byteLength, usage);
+    const allocationError = gl.getError();
+    if (allocationError !== gl.NO_ERROR) {
+      throw new RangeError(
+        `${owner} could not allocate ${byteLength.toLocaleString()} bytes of point storage for ${pointCount.toLocaleString()} points (WebGL error 0x${allocationError.toString(16)}).`
+      );
+    }
+    if (pointCount > 0) {
+      const {
+        colorView,
+        positionView,
+      } = this._ensureInterleavedChunkScratch();
+      for (
+        let firstPoint = 0;
+        firstPoint < pointCount;
+        firstPoint += INTERLEAVED_CHUNK_POINTS
+      ) {
+        const count = Math.min(
+          INTERLEAVED_CHUNK_POINTS,
+          pointCount - firstPoint
+        );
+        packChunk(positionView, colorView, firstPoint, count);
+        gl.bufferSubData(
+          gl.ARRAY_BUFFER,
+          firstPoint * 16,
+          colorView,
+          0,
+          count * 16
+        );
+      }
+      requireCleanWebGLState(gl, owner);
+    }
+    return byteLength;
+  }
+
+  /**
+   * The point-count-sized packing owner shared by the compact LOD generations.
+   *
+   * A compact LOD store must reach the GPU as one whole-store `bufferData`, so
+   * its bytes are staged in full before the upload. Publication and in-place
+   * recolor share this one allocation rather than holding a second 0.8N cache;
+   * each consumes its client bytes synchronously before the next sequential
+   * pack overwrites them. Sizing it to the full point count, rather than to the
+   * caller's request, is what lets both share it.
+   *
+   * The full-detail store does not use this: it is filled through the fixed
+   * staging block instead, so nothing allocates here unless LOD or frustum
+   * culling is enabled.
+   */
   _ensureSharedPackingScratch(requiredSize, owner) {
     if (
       !Number.isSafeInteger(requiredSize) ||
@@ -6669,18 +4582,53 @@ export class HighPerfRenderer {
     console.log(`[HighPerfRenderer] Created alpha texture: ${candidateWidth}x${candidateHeight} (${pointCount} points)`);
   }
 
-  _uploadAlphaTextureData(data, label) {
+  /**
+   * Publish full-row regions of the accepted alpha texture.
+   *
+   * `regions` is an interleaved `(rowStart, rowCount)` Int32Array holding
+   * `regionCount` pairs in strictly increasing, non-overlapping row order. All
+   * of them are sent inside one unpack transaction and one preflight/postflight
+   * pair, so a publication costs exactly three synchronous `getError` stalls
+   * however many regions it addresses.
+   *
+   * Rows are complete, so `UNPACK_ROW_LENGTH` stays neutral and the source
+   * range for a region is exactly `rowStart * width` through
+   * `(rowStart + rowCount) * width` — addressed with `srcOffset` rather than a
+   * subarray so a publication allocates nothing.
+   */
+  _uploadAlphaTextureRegions(data, regions, regionCount, label) {
     const gl = this.gl;
+    const width = this._alphaTexWidth;
+    const height = this._alphaTexHeight;
     if (
       !(data instanceof Uint8Array) ||
-      data.length !== this._alphaTexWidth * this._alphaTexHeight ||
+      data.length !== width * height ||
       !this._alphaTexture ||
-      this._alphaTexWidth <= 0 ||
-      this._alphaTexHeight <= 0
+      width <= 0 ||
+      height <= 0 ||
+      !(regions instanceof Int32Array) ||
+      !Number.isSafeInteger(regionCount) ||
+      regionCount <= 0 ||
+      regions.length < regionCount * 2
     ) {
       throw new Error(
         'HighPerfRenderer alpha texture upload received incomplete exact state.'
       );
+    }
+    let previousRowEnd = 0;
+    for (let index = 0; index < regionCount; index++) {
+      const rowStart = regions[index * 2];
+      const rowCount = regions[index * 2 + 1];
+      if (
+        rowCount <= 0 ||
+        rowStart < previousRowEnd ||
+        rowStart + rowCount > height
+      ) {
+        throw new Error(
+          'HighPerfRenderer alpha texture upload received an invalid row region.'
+        );
+      }
+      previousRowEnd = rowStart + rowCount;
     }
     requireCleanWebGLState(
       gl,
@@ -6692,11 +4640,15 @@ export class HighPerfRenderer {
         1,
         label,
         () => {
-          gl.texSubImage2D(
-            gl.TEXTURE_2D, 0,
-            0, 0, this._alphaTexWidth, this._alphaTexHeight,
-            gl.RED, gl.UNSIGNED_BYTE, data
-          );
+          for (let index = 0; index < regionCount; index++) {
+            const rowStart = regions[index * 2];
+            const rowCount = regions[index * 2 + 1];
+            gl.texSubImage2D(
+              gl.TEXTURE_2D, 0,
+              0, rowStart, width, rowCount,
+              gl.RED, gl.UNSIGNED_BYTE, data, rowStart * width
+            );
+          }
           requireCleanWebGLState(
             gl,
             label
@@ -6715,21 +4667,38 @@ export class HighPerfRenderer {
    * generation. A one-byte-per-texel staging owner keeps transient failures
    * retryable without retaining another Float32 point array.
    *
+   * Only the rows whose bytes moved are sent. Every other byte of the resident
+   * texture is, by the comparison that decided it, already the byte this
+   * generation would have written, so a region-addressed publication and a
+   * whole-texture one leave the same image.
+   *
    * @param {Float32Array} alphas - Alpha values (0.0-1.0) for each point
+   * @returns {boolean} Whether any accepted R8 byte moved. Point visibility is
+   *   defined on exactly these bytes (`alpha-visibility.js`: a point is visible
+   *   iff `Math.round(alpha * 255) >= 3`), so `false` certifies that no
+   *   consumer of the visibility boundary can have changed.
    */
   _updateAlphaTexture(alphas) {
+    const width = this._alphaTexWidth;
+    const height = this._alphaTexHeight;
     if (
       !(alphas instanceof Float32Array) ||
       alphas.length !== this.pointCount ||
       !this._alphaTexture ||
-      !(this._alphaTexData instanceof Uint8Array)
+      !(this._alphaTexData instanceof Uint8Array) ||
+      !Number.isSafeInteger(width) ||
+      !Number.isSafeInteger(height) ||
+      width <= 0 ||
+      height <= 0 ||
+      this._alphaTexData.length !== width * height
     ) {
       throw new Error(
         'HighPerfRenderer alpha texture update received incomplete exact state.'
       );
     }
     const n = this.pointCount;
-    const requiredSize = this._alphaTexData.length;
+    const accepted = this._alphaTexData;
+    const requiredSize = accepted.length;
     let candidate = this._alphaTexStagingData;
     if (
       !(candidate instanceof Uint8Array) ||
@@ -6738,36 +4707,97 @@ export class HighPerfRenderer {
       candidate = new Uint8Array(requiredSize);
       candidate.fill(255);
     }
-
-    let changed = false;
-    for (let i = 0; i < n; i++) {
-      const value = alphas[i];
-      if (!Number.isFinite(value) || value < 0 || value > 1) {
-        throw new RangeError(
-          `HighPerfRenderer alpha value at index ${i} must be finite and in [0, 1]; received ${String(value)}.`
-        );
-      }
-      const byte = Math.round(value * 255);
-      candidate[i] = byte;
-      if (byte !== this._alphaTexData[i]) changed = true;
+    // Scratch owned by this method alone. Both are re-derived from scratch on
+    // every call and sized against the current texture, so they carry nothing
+    // across a texture replacement and stay out of the publication transaction.
+    let dirtyRows = this._alphaDirtyRows;
+    if (!(dirtyRows instanceof Uint8Array) || dirtyRows.length !== height) {
+      dirtyRows = new Uint8Array(height);
+      this._alphaDirtyRows = dirtyRows;
+    } else {
+      dirtyRows.fill(0);
+    }
+    let regions = this._alphaUploadRegions;
+    if (!(regions instanceof Int32Array) || regions.length !== height * 2) {
+      regions = new Int32Array(height * 2);
+      this._alphaUploadRegions = regions;
     }
 
-    if (!changed) {
+    // Row-major traversal. It visits exactly the same indices in exactly the
+    // same order as a flat scan — same first rejection, same bytes written —
+    // and records which rows moved without a division per point.
+    let dirtyRowCount = 0;
+    for (let y = 0; y < height; y++) {
+      const rowStart = y * width;
+      const rowEnd = rowStart + width < n ? rowStart + width : n;
+      let rowChanged = false;
+      for (let i = rowStart; i < rowEnd; i++) {
+        const value = alphas[i];
+        if (!Number.isFinite(value) || value < 0 || value > 1) {
+          throw new RangeError(
+            `HighPerfRenderer alpha value at index ${i} must be finite and in [0, 1]; received ${String(value)}.`
+          );
+        }
+        const byte = Math.round(value * 255);
+        candidate[i] = byte;
+        if (byte !== accepted[i]) rowChanged = true;
+      }
+      if (rowChanged) {
+        dirtyRows[y] = 1;
+        dirtyRowCount++;
+      }
+    }
+
+    if (dirtyRowCount === 0) {
       this._alphaTexStagingData = candidate;
       this._useAlphaTexture = true;
-      return;
+      return false;
     }
 
-    const accepted = this._alphaTexData;
+    // One region per maximal run of consecutive dirty rows.
+    let regionCount = 0;
+    let runStart = -1;
+    for (let y = 0; y < height; y++) {
+      if (dirtyRows[y] === 1) {
+        if (runStart === -1) runStart = y;
+        continue;
+      }
+      if (runStart !== -1) {
+        regions[regionCount * 2] = runStart;
+        regions[regionCount * 2 + 1] = y - runStart;
+        regionCount++;
+        runStart = -1;
+      }
+    }
+    if (runStart !== -1) {
+      regions[regionCount * 2] = runStart;
+      regions[regionCount * 2 + 1] = height - runStart;
+      regionCount++;
+    }
+    if (regionCount > MAX_ALPHA_UPLOAD_REGIONS) {
+      const firstRow = regions[0];
+      const lastRowEnd =
+        regions[(regionCount - 1) * 2] + regions[(regionCount - 1) * 2 + 1];
+      regions[0] = firstRow;
+      regions[1] = lastRowEnd - firstRow;
+      regionCount = 1;
+    }
+
     try {
-      this._uploadAlphaTextureData(
+      this._uploadAlphaTextureRegions(
         candidate,
+        regions,
+        regionCount,
         'HighPerfRenderer alpha-value publication'
       );
     } catch (publicationError) {
       try {
-        this._uploadAlphaTextureData(
+        // Exactly the regions the failed publication could have touched, so
+        // restoring them restores the whole accepted image.
+        this._uploadAlphaTextureRegions(
           accepted,
+          regions,
+          regionCount,
           'HighPerfRenderer alpha-value restoration'
         );
       } catch (restorationError) {
@@ -6797,6 +4827,7 @@ export class HighPerfRenderer {
     this._alphaTexData = candidate;
     this._alphaTexStagingData = accepted;
     this._useAlphaTexture = true;
+    return true;
   }
 
   /**
@@ -6915,6 +4946,18 @@ export class HighPerfRenderer {
     }
   }
 
+  /**
+   * Publish one exact per-point alpha generation.
+   *
+   * @param {Float32Array} alphas - Alpha values (0.0-1.0) for each point.
+   * @returns {boolean} Whether the accepted R8 generation moved. Callers that
+   *   only care about *visibility* — which cells the highlight packer, the KNN
+   *   traversal and the category selectors admit — may skip their invalidation
+   *   when this is `false`: those predicates are exactly `Math.round(alpha *
+   *   255) >= MIN_VISIBLE_ALPHA_BYTE`, so an unmoved byte is an unmoved
+   *   visibility. A newly created texture reports `true` regardless, because a
+   *   fresh R8 owner is a new generation whatever its bytes hold.
+   */
   updateAlphas(alphas) {
     this._assertOperational('update alpha values');
     if (!(alphas instanceof Float32Array)) {
@@ -6931,16 +4974,19 @@ export class HighPerfRenderer {
     if (this.pointCount === 0) {
       this._useAlphaTexture = false;
       this._currentAlphas = alphas;
-      return;
+      return false;
     }
 
     // Use alpha texture for efficient updates (avoids full buffer rebuild)
     // This is ~16x faster: uploading N bytes vs N*16 bytes
+    let createdTexture = false;
     if (!this._alphaTexture) {
       this._createAlphaTexture(this.pointCount);
+      createdTexture = true;
     }
-    this._updateAlphaTexture(alphas);
+    const changed = this._updateAlphaTexture(alphas);
     this._currentAlphas = alphas;
+    return createdTexture || changed;
   }
 
   /** Get current colors array reference (for comparison) */
@@ -6999,42 +5045,26 @@ export class HighPerfRenderer {
     const n = this.pointCount;
     const positions = this._positions;
     const colors = this._colors; // Now Uint8Array with RGBA
-    const requiredSize = n * 16;
 
-    const {
-      buffer,
-      positionView,
-      colorView,
-    } = this._ensureSharedPackingScratch(
-      requiredSize,
-      'HighPerfRenderer full-detail color packing'
-    );
-
-    // Build interleaved data: [x,y,z (float32), r,g,b,a (uint8)] - 16 bytes per point
-    for (let i = 0; i < n; i++) {
-      const srcIdx = i * 3;
-      const floatOffset = i * 4;
-      const byteOffset = i * 16 + 12;
-
-      positionView[floatOffset] = positions[srcIdx];
-      positionView[floatOffset + 1] = positions[srcIdx + 1];
-      positionView[floatOffset + 2] = positions[srcIdx + 2];
-
-      // Colors already in uint8 RGBA format
-      const colorSrcIdx = i * 4;
-      colorView[byteOffset] = colors[colorSrcIdx];
-      colorView[byteOffset + 1] = colors[colorSrcIdx + 1];
-      colorView[byteOffset + 2] = colors[colorSrcIdx + 2];
-      colorView[byteOffset + 3] = colors[colorSrcIdx + 3];
-    }
-
+    // Build interleaved data: [x,y,z (float32), r,g,b,a (uint8)] - 16 bytes per
+    // point. `flushBufferUpdates` clears `_bufferDirty` only after this
+    // returns, so a rejected republication stays dirty and is retried whole.
     gl.bindBuffer(gl.ARRAY_BUFFER, this.buffers.interleaved);
-    gl.bufferData(gl.ARRAY_BUFFER, buffer, gl.DYNAMIC_DRAW);
-    requireCleanWebGLState(
-      gl,
-      'HighPerfRenderer full-detail color publication'
+    this._interleavedGpuByteLength = this._uploadInterleavedPointStore(
+      n,
+      gl.DYNAMIC_DRAW,
+      'HighPerfRenderer full-detail color publication',
+      (positionView, colorView, firstPoint, count) => {
+        this._packInterleavedChunk(
+          positions,
+          colors,
+          positionView,
+          colorView,
+          firstPoint,
+          count
+        );
+      }
     );
-    this._interleavedGpuByteLength = requiredSize;
     this._refreshGpuMemoryStats();
   }
 
@@ -8555,6 +6585,21 @@ export class HighPerfRenderer {
   /**
    * Upload indices to the per-view index buffer for frustum culling.
    * Each view has its own index buffer to avoid cross-view conflicts.
+   *
+   * This runs once per view on every frame of camera motion, so the WebGL
+   * error bracket around it is charged per frame. `gl.getError()` drains the
+   * client command buffer to the GPU process and blocks for the answer, which
+   * serializes the CPU against work the GPU has not finished: measured at 11 ms
+   * of wall time per frame inside this method at both 1 M and 10 M points.
+   *
+   * The bracket is therefore taken where the failure it detects can appear —
+   * an allocation larger than any this EBO has already been verified to hold,
+   * which is where OUT_OF_MEMORY lives — and skipped when the same store is
+   * replaced at or below a size WebGL has already accepted for it.
+   * `indexBufferVerifiedByteLength` carries that watermark, and every
+   * invalidation resets it, so any failed or abandoned publication makes the
+   * next upload verify again.
+   *
    * @param {Object} viewState - Per-view state object containing indexBuffer
    * @param {Uint32Array} visibleIndices - Array of visible point indices
    */
@@ -8570,11 +6615,20 @@ export class HighPerfRenderer {
       );
     }
 
+    const verifiedByteLength =
+      Number.isSafeInteger(viewState.indexBufferVerifiedByteLength) &&
+      viewState.indexBufferVerifiedByteLength > 0
+        ? viewState.indexBufferVerifiedByteLength
+        : 0;
+    const verifyPublication = visibleIndices.byteLength > verifiedByteLength;
+
     try {
-      requireCleanWebGLState(
-        gl,
-        'HighPerfRenderer per-view index publication preflight'
-      );
+      if (verifyPublication) {
+        requireCleanWebGLState(
+          gl,
+          'HighPerfRenderer per-view index publication preflight'
+        );
+      }
       // ELEMENT_ARRAY_BUFFER is VAO state. Upload with no VAO bound so this
       // reusable per-view EBO cannot become an accidental retained binding.
       gl.bindVertexArray(null);
@@ -8584,10 +6638,13 @@ export class HighPerfRenderer {
         visibleIndices,
         gl.DYNAMIC_DRAW
       );
-      requireCleanWebGLState(
-        gl,
-        'HighPerfRenderer per-view index publication'
-      );
+      if (verifyPublication) {
+        requireCleanWebGLState(
+          gl,
+          'HighPerfRenderer per-view index publication'
+        );
+        viewState.indexBufferVerifiedByteLength = visibleIndices.byteLength;
+      }
       // Publish the byte/count contract only after WebGL accepted the complete
       // replacement. A failed bufferData leaves the previous store intact.
       viewState.indexBufferSize = visibleIndices.length;
@@ -9525,6 +7582,11 @@ export class HighPerfRenderer {
         )
       );
       if (candidateNeedsReplacement) {
+        requireLodBuildHeapHeadroom(
+          snapshot.positions.length / 3,
+          needsLOD,
+          `HighPerfRenderer ${dimensionLevel}D view "${exactId}"`
+        );
         candidate = new SpatialIndex(
           snapshot.positions,
           null,
@@ -9567,6 +7629,11 @@ export class HighPerfRenderer {
           !cachedIsExact ||
           (needsLOD && !cachedLodIsReady)
         ) {
+          requireLodBuildHeapHeadroom(
+            this.pointCount,
+            needsLOD,
+            `HighPerfRenderer ${dimensionLevel}D live view`
+          );
           candidate = new SpatialIndex(
             this._positions,
             this._colors,
@@ -11091,6 +9158,11 @@ export class HighPerfRenderer {
           needsLOD
         );
         if (spatialIndex === null) {
+          requireLodBuildHeapHeadroom(
+            positions.length / 3,
+            needsLOD,
+            `HighPerfRenderer ${exactDimensionLevel}D view "${exactId}"`
+          );
           console.log(`[HighPerfRenderer] Building ${exactDimensionLevel}D spatial index for snapshot "${exactId}"...`);
 
           const notifications = getNotificationCenter();
@@ -11446,6 +9518,11 @@ export class HighPerfRenderer {
               needsLOD
             );
             if (nextSpatialIndex === null) {
+              requireLodBuildHeapHeadroom(
+                positions.length / 3,
+                needsLOD,
+                `HighPerfRenderer ${exactDimensionLevel}D view "${exactId}"`
+              );
               const notifications = getNotificationCenter();
               const treeNames = { 1: 'BinaryTree', 2: 'Quadtree', 3: 'Octree' };
               const treeName = treeNames[exactDimensionLevel];
@@ -12204,6 +10281,11 @@ export class HighPerfRenderer {
       needsLOD
     );
     if (candidateSpatialIndex === null) {
+      requireLodBuildHeapHeadroom(
+        snapshot.positions.length / 3,
+        needsLOD,
+        `HighPerfRenderer ${exactDimensionLevel}D view "${exactId}"`
+      );
       console.log(`[HighPerfRenderer] Rebuilding ${exactDimensionLevel}D spatial index for snapshot "${exactId}"...`);
 
       const notifications = getNotificationCenter();
@@ -13633,6 +11715,8 @@ export class HighPerfRenderer {
     this._alphaTexHeight = 0;
     this._alphaTexData = null;
     this._alphaTexStagingData = null;
+    this._alphaDirtyRows = null;
+    this._alphaUploadRegions = null;
     this._useAlphaTexture = false;
     this._currentAlphas = null;
     this._dummyLodIndexTexture = null;
@@ -13652,6 +11736,9 @@ export class HighPerfRenderer {
     this._pendingProgramRetirements = new Set();
     this._pendingShaderRetirements = new Set();
     this._pendingProgramUnbind = false;
+    // A lost context invalidates every collaborator's handles too; each one
+    // detaches its own ownership, so no allocation remains to report.
+    this._gpuAllocationReporters = new Set();
 
     this.pointCount = 0;
     this.forceLODLevel = -1;
@@ -13668,6 +11755,9 @@ export class HighPerfRenderer {
     this._interleavedArrayBuffer = null;
     this._interleavedPositionView = null;
     this._interleavedColorView = null;
+    this._interleavedChunkBuffer = null;
+    this._interleavedChunkPositionView = null;
+    this._interleavedChunkColorView = null;
     this._snapshotColorStagingData = null;
     this._snapshotAlphaStagingData = null;
     this._visibleIndicesBuffer = null;
@@ -13738,6 +11828,8 @@ export class HighPerfRenderer {
     this._alphaTexHeight = 0;
     this._alphaTexData = null;
     this._alphaTexStagingData = null;
+    this._alphaDirtyRows = null;
+    this._alphaUploadRegions = null;
     this._useAlphaTexture = false;
     this._currentAlphas = null;
     this._lodIndexTexturesByDimension = new Map();
@@ -13754,6 +11846,9 @@ export class HighPerfRenderer {
     this._bufferDirty = false;
     this._validatedLodNodeMappings = new WeakMap();
     this._validatedSpatialIndices = new WeakSet();
+    // Collaborators retire their own GPU handles. Drop the registrations so a
+    // disposed renderer neither reports their bytes nor keeps them reachable.
+    this._ensureGpuAllocationReporters().clear();
 
     const snapshots = Array.from(this.snapshotBuffers.values());
     this.snapshotBuffers.clear();
@@ -13784,6 +11879,9 @@ export class HighPerfRenderer {
     this._interleavedArrayBuffer = null;
     this._interleavedPositionView = null;
     this._interleavedColorView = null;
+    this._interleavedChunkBuffer = null;
+    this._interleavedChunkPositionView = null;
+    this._interleavedChunkColorView = null;
     this._refreshGpuMemoryStats();
 
     if (failures.length > 0) {

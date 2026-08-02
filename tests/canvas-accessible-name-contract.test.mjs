@@ -20,10 +20,12 @@ const ACCESSIBILITY_CSS_URL = new URL(
   '../assets/css/base/_accessibility.css',
   import.meta.url
 );
+const VIEWER_URL = new URL('../assets/js/rendering/viewer.js', import.meta.url);
 
-const [indexSource, accessibilityCss] = await Promise.all([
+const [indexSource, accessibilityCss, viewerSource] = await Promise.all([
   readFile(INDEX_URL, 'utf8'),
-  readFile(ACCESSIBILITY_CSS_URL, 'utf8')
+  readFile(ACCESSIBILITY_CSS_URL, 'utf8'),
+  readFile(VIEWER_URL, 'utf8')
 ]);
 
 /* Comments are blanked rather than removed so every offset stays comparable
@@ -127,13 +129,69 @@ test('the plot canvas is a named, described first Tab stop', () => {
   }
 });
 
-test('every key the canvas description names is a key the shortcuts panel lists', () => {
+/** The description host's text, whitespace-collapsed as a reader hears it. */
+function describedText() {
   const describedBy = attributeValue(canvas.attributes, 'aria-describedby');
-  const hostBody = indexHtml
+  const body = indexHtml
     .slice(indexHtml.indexOf('>', elementWithId(indexHtml, describedBy).index) + 1)
     .split('</p>')[0];
-  assert.match(hostBody, /\S/, 'the description host must not be empty');
+  assert.match(body, /\S/, 'the description host must not be empty');
+  return body.replace(/\s+/g, ' ').trim();
+}
 
+/** Standalone single characters are the keys the description names. */
+function keysIn(text) {
+  return new Set(
+    Array.from(text.matchAll(/(?:^|\s)([A-Z=?-])(?=\s|$)/g), match => match[1])
+  );
+}
+
+/**
+ * The description split into the clauses a reader hears as separate claims.
+ *
+ * A description is one spoken sentence, so "W A S D orbit or pan" and "= and -
+ * zoom" are two promises, not one. A new claim begins wherever a new run of key
+ * names begins — keys joined only by spaces or "and" belong to the same claim —
+ * so the split survives however the prose between them is punctuated. That is
+ * what lets a claim be checked against the handler that serves it rather than
+ * against the whole sentence, where any word satisfies any key.
+ */
+function describedClauses() {
+  const text = describedText().replace(/^Keyboard:\s*/, '');
+  const starts = [];
+  let previousEnd = null;
+  for (const match of text.matchAll(/(?:^|\s)([A-Z=?-])(?=\s|$)/g)) {
+    const keyIndex = match.index + match[0].length - 1;
+    const between = previousEnd === null
+      ? null
+      : text.slice(previousEnd, keyIndex);
+    if (between === null || !/^\s*(?:and\s+)?$/.test(between)) {
+      starts.push(keyIndex);
+    }
+    previousEnd = keyIndex + 1;
+  }
+  assert.ok(starts.length >= 4, 'the description must still make several claims');
+  return starts.map((start, index) => text
+    .slice(start, index + 1 < starts.length ? starts[index + 1] : text.length)
+    .replace(/[\s,]*(?:\band\b)?[\s,]*$/, '')
+    .trim());
+}
+
+/** The one clause that names every key in `keys`, and no other clause may. */
+function clauseNaming(keys) {
+  const matching = describedClauses().filter(clause => {
+    const named = keysIn(clause);
+    return keys.every(key => named.has(key));
+  });
+  assert.equal(
+    matching.length,
+    1,
+    `exactly one clause may describe ${keys.join(' ')} (found ${matching.length})`
+  );
+  return matching[0];
+}
+
+test('every key the canvas description names is a key the shortcuts panel lists', () => {
   const [shortcutsStart, shortcutsEnd] =
     detailsRanges(indexHtml).find(([start, end]) => {
       const block = indexHtml.slice(start, end);
@@ -147,9 +205,7 @@ test('every key the canvas description names is a key the shortcuts panel lists'
 
   // Standalone single characters in the description are key names. Anything
   // spoken as a key has to be a key the panel documents, or the two drift.
-  const named = new Set(
-    Array.from(hostBody.matchAll(/(?:^|\s)([A-Z=?-])(?=\s|$)/g), match => match[1])
-  );
+  const named = keysIn(describedText());
   assert.ok(
     named.size >= 8,
     `the description must still name the navigation keys (found ${named.size})`
@@ -159,6 +215,96 @@ test('every key the canvas description names is a key the shortcuts panel lists'
       shortcuts,
       new RegExp(`<kbd>${escapeRegExp(key)}</kbd>`),
       `the shortcuts panel must document the "${key}" key the canvas announces`
+    );
+  }
+});
+
+/*
+ * Naming the right keys is not the same as saying the right thing about them.
+ * The description shipped "W A S D orbit or pan, = and - zoom": both keys are
+ * real, both are in the panel, and both claims were wrong — free-fly moves on
+ * W A S D, and free-fly has no keyboard zoom at all. A presence check cannot
+ * see that, and a screen-reader user hears this sentence on every focus with no
+ * visible panel to check it against, so the claims are pinned to the handlers
+ * (CEL-0200).
+ */
+
+/** The body of one `viewer.js` per-frame navigation update. */
+function viewerFunctionBody(name, nextName) {
+  const start = viewerSource.indexOf(`function ${name}(`);
+  const end = viewerSource.indexOf(`function ${nextName}(`);
+  assert.ok(
+    start !== -1 && end > start,
+    `viewer.js must still define ${name} before ${nextName}`
+  );
+  const body = viewerSource.slice(start, end);
+  assert.ok(body.length > 200, `${name} must still have an implementation`);
+  return body;
+}
+
+const freeflyBody = viewerFunctionBody('updateFreefly', 'updateOrbitPlanarKeys');
+
+test('the movement keys are not described as orbit and pan only', () => {
+  // Every one of W A S D moves the free-fly camera, so a description that
+  // offers only the orbit and planar behaviours hides a whole navigation mode.
+  for (const code of ['KeyW', 'KeyA', 'KeyS', 'KeyD']) {
+    assert.match(
+      freeflyBody,
+      new RegExp(`activeKeys\\.has\\('${code}'\\)`),
+      `free-fly must still move on ${code}`
+    );
+  }
+
+  const clause = clauseNaming(['W', 'A', 'S', 'D']);
+  assert.match(
+    clause,
+    /\bmove|\bfly/i,
+    `"${clause}" describes only orbit and pan, but these keys also move the `
+    + 'free-fly camera'
+  );
+});
+
+test('the zoom keys are described as the two modes that answer them', () => {
+  // `updateFreefly` reads no zoom key, so an unqualified "= and - zoom" is a
+  // gesture the app ignores in one of its three navigation modes.
+  for (const code of ['Equal', 'Minus', 'BracketLeft', 'BracketRight']) {
+    assert.doesNotMatch(
+      freeflyBody,
+      new RegExp(`activeKeys\\.has\\('${code}'\\)`),
+      `free-fly now reads ${code}: the description may drop its scope clause`
+    );
+  }
+  assert.match(
+    viewerSource,
+    /activeKeys\.has\('Equal'\) \|\| activeKeys\.has\('BracketRight'\)/,
+    'orbit and planar must still zoom in on = and ]'
+  );
+
+  const clause = clauseNaming(['=', '-']);
+  for (const mode of [/\borbit/i, /\bplanar/i]) {
+    assert.match(
+      clause,
+      mode,
+      `"${clause}" must name the modes where these keys work, because the `
+      + 'third mode ignores them'
+    );
+  }
+  assert.doesNotMatch(
+    clause,
+    /free-fly/i,
+    `"${clause}" offers keyboard zoom in free-fly, where nothing reads it`
+  );
+});
+
+test('the mode-switch keys name every mode the description scopes claims to', () => {
+  // The scope clauses above are only meaningful if the reader has been told the
+  // modes exist, and the keys that reach them.
+  const clause = clauseNaming(['O', 'P', 'G']);
+  for (const mode of [/\borbit/i, /\bplanar/i, /free-fly/i]) {
+    assert.match(
+      clause,
+      mode,
+      `"${clause}" scopes other claims by mode without naming every mode`
     );
   }
 });

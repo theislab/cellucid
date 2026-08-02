@@ -1,10 +1,8 @@
 import { expect, test } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
 
+import { EXPORTS_BASE_URL as FIXTURE_ROOT } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
-
-const FIXTURE_ROOT =
-  'http://127.0.0.1:4173/tests/browser/fixtures/exports/';
 
 test('consensus snapshot downloads once and reports the exact success', async ({
   page,

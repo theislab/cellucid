@@ -7,6 +7,10 @@ import { StreamingGeneLoader } from '../assets/js/app/analysis/data/streaming-ge
 import { ComparisonModule } from '../assets/js/app/analysis/comparison-module.js';
 import { ExpressionMatrixBuilder } from '../assets/js/app/analysis/genes-panel/expression-matrix-builder.js';
 import { GenesPanelController } from '../assets/js/app/analysis/genes-panel/genes-panel-controller.js';
+import {
+  ERROR_MESSAGES as GENES_PANEL_ERROR_MESSAGES,
+  formatError,
+} from '../assets/js/app/analysis/genes-panel/constants.js';
 import { benjaminiHochbergAdjusted } from '../assets/js/app/analysis/stats/statistical-tests.js';
 import { MarkerCache } from '../assets/js/app/analysis/genes-panel/marker-cache.js';
 import { ClusteringEngine } from '../assets/js/app/analysis/genes-panel/clustering-engine.js';
@@ -264,7 +268,16 @@ test('custom marker analysis rejects every unknown requested gene', async () => 
       onProgress: undefined,
       signal: undefined,
     }),
-    /requested custom gene.*UNKNOWN.*not found/i,
+    // Asserted against the shared template rather than a loose pattern: the
+    // rejection has to name the gene the reader typed, so a message that lost
+    // its substitution and showed the literal `{symbol}` must fail here.
+    error => {
+      assert.equal(
+        error.message,
+        formatError(GENES_PANEL_ERROR_MESSAGES.GENE_NOT_FOUND, { symbol: 'UNKNOWN' }),
+      );
+      return true;
+    },
   );
 });
 

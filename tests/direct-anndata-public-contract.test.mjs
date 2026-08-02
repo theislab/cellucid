@@ -305,7 +305,6 @@ test('H5AD and Zarr publish one exact v2 identity before direct adoption', async
         'cellucid_data_version',
         'description',
         'embeddings',
-        'export_settings',
         'id',
         'name',
         'obs_fields',

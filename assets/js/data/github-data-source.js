@@ -27,6 +27,7 @@ import {
 } from './data-source.js';
 import {
   createMetadataAbortError,
+  loadMetadataBatchAtomically,
 } from './metadata-load-contract.js';
 import { getNotificationCenter } from '../app/notification-center.js';
 
@@ -443,6 +444,23 @@ function requireCatalogIdentityAgreement(entry, metadata) {
   }
 }
 
+/**
+ * Adopt every catalog entry's identity as one atomic generation.
+ *
+ * Each entry's `dataset_identity.json` is an independent read, so they are
+ * issued as one batch rather than one round trip after another: a five-dataset
+ * repository costs one network latency instead of five before its picker can
+ * render. `loadMetadataBatchAtomically` owns the exactness this needs — the
+ * first failure cancels every sibling, no partial catalog is ever returned, and
+ * results keep catalog order. It is the same contract `remote-source.js` and
+ * `jupyter-source.js` already use for their catalogs.
+ *
+ * @param {Object} manifest
+ * @param {string} baseUrl
+ * @param {string} sourceType
+ * @param {AbortSignal|null} signal
+ * @returns {Promise<DatasetMetadata[]>}
+ */
 async function loadGitHubDatasets(
   manifest,
   baseUrl,
@@ -450,31 +468,34 @@ async function loadGitHubDatasets(
   signal
 ) {
   validateGitHubCatalog(manifest, baseUrl);
-  const datasets = [];
-  for (const entry of manifest.datasets) {
-    try {
-      const datasetBaseUrl = resolveUrl(baseUrl, entry.path);
-      const metadata = await loadDatasetMetadata(
-        datasetBaseUrl,
-        entry.id,
-        sourceType,
-        { signal }
-      );
-      requireCatalogIdentityAgreement(entry, metadata);
-      datasets.push(metadata);
-    } catch (error) {
-      if (error?.name === 'AbortError') {
-        throw error;
+  return loadMetadataBatchAtomically(
+    manifest.datasets,
+    signal,
+    async (entry, entrySignal) => {
+      try {
+        const datasetBaseUrl = resolveUrl(baseUrl, entry.path);
+        const metadata = await loadDatasetMetadata(
+          datasetBaseUrl,
+          entry.id,
+          sourceType,
+          { signal: entrySignal }
+        );
+        requireCatalogIdentityAgreement(entry, metadata);
+        return metadata;
+      } catch (error) {
+        if (error?.name === 'AbortError') {
+          throw error;
+        }
+        throw new DataSourceError(
+          `Dataset '${entry.id}' is invalid: ${error?.message || error}`,
+          DataSourceErrorCode.INVALID_FORMAT,
+          sourceType,
+          { datasetId: entry.id, cause: error }
+        );
       }
-      throw new DataSourceError(
-        `Dataset '${entry.id}' is invalid: ${error?.message || error}`,
-        DataSourceErrorCode.INVALID_FORMAT,
-        sourceType,
-        { datasetId: entry.id, cause: error }
-      );
-    }
-  }
-  return datasets;
+    },
+    'GitHub catalog metadata loading'
+  );
 }
 
 /**

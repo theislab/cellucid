@@ -20,7 +20,12 @@ import {
 import { DATA_LOAD_METHODS } from '../../../analytics/tracker.js';
 import { debug } from '../../../utils/debug.js';
 import { isDatasetReloadSupersededError } from '../../dataset-reload-outcome.js';
-import { initDatasetConnections } from './dataset-connections.js';
+import {
+  classifyDataSourceFailure,
+  dataSourceFailureDetail,
+  describeDataSourceFailure,
+  initDatasetConnections
+} from './dataset-connections.js';
 
 export const NONE_DATASET_VALUE = '__none__';
 
@@ -29,9 +34,12 @@ const EMPTY_CATALOG_VALUE = '__catalog_empty__';
 const CATALOG_ERROR_VALUE = '__catalog_error__';
 const CATALOG_RETRY_LABEL = 'Try again';
 const CATALOG_RETRYING_LABEL = 'Retrying…';
+// Enumerating the sources is the manager's own contract work, so it fails only
+// when that contract is broken — never for a reason the UI could name. The
+// notice says what happened and offers the way out; it invents no cause.
 const CATALOG_TOTAL_FAILURE_MESSAGE =
-  'The dataset list could not be loaded — this is usually a lost or ' +
-  'blocked connection. Check your network, then try again.';
+  'The dataset list could not be loaded. Try again; if it keeps failing, ' +
+  'reload the page.';
 
 /**
  * One human name per registered source type, used both for the dropdown's
@@ -377,6 +385,9 @@ export function initDatasetControls(options) {
   let activeDatasetSelectionIntent = null;
   let datasetConnections = null;
   let catalogRetryInFlight = false;
+  // The operation the visible notice offers to repeat, or null when nothing
+  // has failed. A notice without one would be an affordance that does nothing.
+  let noticeRetry = null;
   let destroyed = false;
   let destroyPromise = null;
 
@@ -450,6 +461,9 @@ export function initDatasetControls(options) {
     option.value = value;
     option.dataset.sourceType = sourceType;
     option.dataset.datasetId = metadata.id;
+    // Kept apart from the label so a failure message can name the dataset
+    // without the cell count the dropdown appends.
+    option.dataset.datasetName = metadata.name;
     option.textContent =
       `${metadata.name} (${formatDataNumber(metadata.stats.n_cells)} cells)`;
     datasetOptionsByKey.set(value, option);
@@ -457,8 +471,14 @@ export function initDatasetControls(options) {
   }
 
   // =========================================================================
-  // Catalog recovery notice
+  // Dataset recovery notice
   // =========================================================================
+  // One notice owns the last data operation that failed — listing the catalog
+  // or opening a dataset — and carries the retry for exactly that operation.
+  // It persists until the next data operation succeeds, because a message that
+  // fades away leaves a user who looked at the plot instead of the toast with
+  // no explanation at all.
+  //
   // A source whose probe failed is reported by the manager as an entry that
   // carries an error and no datasets. A source that is merely unavailable —
   // GitHub with no repository connected, a remote server nobody has pointed at
@@ -484,8 +504,19 @@ export function initDatasetControls(options) {
   catalogNotice.appendChild(catalogRetryButton);
   datasetSelectBlock.appendChild(catalogNotice);
 
-  function setCatalogNotice(message) {
+  /**
+   * Publish the notice for one failed operation together with the retry that
+   * repeats exactly that operation.
+   *
+   * @param {string} message
+   * @param {() => Promise<unknown>} retry
+   */
+  function setCatalogNotice(message, retry) {
     requireNonEmptyString(message, 'Dataset catalog notice message');
+    if (typeof retry !== 'function') {
+      throw new TypeError('Dataset notice retry must be a function.');
+    }
+    noticeRetry = retry;
     catalogNoticeMessageEl.textContent = message;
     catalogRetryButton.disabled = false;
     catalogRetryButton.textContent = CATALOG_RETRY_LABEL;
@@ -493,6 +524,7 @@ export function initDatasetControls(options) {
   }
 
   function clearCatalogNotice() {
+    noticeRetry = null;
     catalogNoticeMessageEl.textContent = '';
     catalogRetryButton.disabled = false;
     catalogRetryButton.textContent = CATALOG_RETRY_LABEL;
@@ -509,9 +541,10 @@ export function initDatasetControls(options) {
   }
 
   /**
-   * One sentence naming every source that failed, in the same words the
-   * dropdown uses for it. Loader Error messages are transport diagnostics, so
-   * they are never shown; the notice names the source and the likely cause.
+   * One sentence per cause, naming the sources that share it in the same words
+   * the dropdown uses for them. Loader Error messages are transport
+   * diagnostics, so they are never shown; the cause the loader published on
+   * the error is what reaches the user.
    *
    * @param {{sourceType: string, error: Error|null}[]} records
    * @returns {string|null}
@@ -519,24 +552,54 @@ export function initDatasetControls(options) {
   function describeFailedSources(records) {
     const failed = records.filter(record => record.error !== null);
     if (failed.length === 0) return null;
-    const names = formatSourceList(
-      failed.map(record => sourceDisplayName(record.sourceType))
-    );
-    return (
-      `${names} could not be loaded — this is usually a lost or blocked ` +
-      'connection. Check your network, then try again.'
-    );
+    // Sources that failed the same way belong in one sentence; sources that
+    // failed differently must not be given a shared cause they do not have.
+    const byCause = new Map();
+    for (const record of failed) {
+      const cause = classifyDataSourceFailure(record.error);
+      const group = byCause.get(cause);
+      const name = sourceDisplayName(record.sourceType);
+      if (group === undefined) {
+        byCause.set(cause, { error: record.error, names: [name] });
+      } else {
+        group.names.push(name);
+      }
+    }
+    return [...byCause.values()]
+      .map(group => describeDataSourceFailure(
+        formatSourceList(group.names),
+        'could not be loaded',
+        group.error
+      ))
+      .join(' ');
   }
 
+  // Retrying the catalog is the refreshing pass: it clears the per-source
+  // failures the manager cached, which a plain re-read would keep returning.
+  const retryCatalog = () => populateDatasetDropdown({ refresh: true });
+
   function handleCatalogRetryClick() {
-    if (destroyed || catalogRetryInFlight || catalogNotice.hidden) return;
+    if (
+      destroyed ||
+      catalogRetryInFlight ||
+      catalogNotice.hidden ||
+      noticeRetry === null
+    ) {
+      return;
+    }
+    const retry = noticeRetry;
     catalogRetryInFlight = true;
+    markCatalogNoticeRetrying();
+    // A retry that is superseded settles without publishing an outcome of its
+    // own, so the affordance is re-armed here rather than left reading
+    // "Retrying…" over an operation nobody is waiting for any more.
     const settle = () => {
       catalogRetryInFlight = false;
+      if (destroyed || catalogNotice.hidden) return;
+      catalogRetryButton.disabled = false;
+      catalogRetryButton.textContent = CATALOG_RETRY_LABEL;
     };
-    void invokeTracked(
-      () => populateDatasetDropdown({ refresh: true })
-    ).then(settle, settle);
+    void invokeTracked(retry).then(settle, settle);
   }
 
   catalogRetryButton.addEventListener(
@@ -699,7 +762,7 @@ async function populateDatasetDropdown(options = {}) {
       clearCatalogNotice();
       if (refresh) showSessionStatus('Dataset list reloaded', false);
     } else {
-      setCatalogNotice(failureMessage);
+      setCatalogNotice(failureMessage, retryCatalog);
       if (refresh) showSessionStatus(failureMessage, true);
     }
 
@@ -830,7 +893,7 @@ async function populateDatasetDropdown(options = {}) {
     datasetInfo.classList.add('error');
     // The whole enumeration failed, so the selector is empty and the only way
     // back used to be a page reload. The notice carries the retry instead.
-    setCatalogNotice(CATALOG_TOTAL_FAILURE_MESSAGE);
+    setCatalogNotice(CATALOG_TOTAL_FAILURE_MESSAGE, retryCatalog);
     showSessionStatus(errorOption.textContent, true);
     return Object.freeze({
       error: exactError,
@@ -920,6 +983,8 @@ async function handleDatasetChangeForIntent(
     }
     updateDatasetInfo(metadata, sourceType);
     datasetInfo.classList.remove('loading', 'error');
+    // A dataset is on screen, so no earlier failure is still true.
+    clearCatalogNotice();
     showSessionStatus('Dataset loaded', false);
     return true;
   } catch (error) {
@@ -948,12 +1013,56 @@ async function handleDatasetChangeForIntent(
       updateDatasetInfo(activeMetadata, activeSourceType);
       datasetInfo.classList.add('error');
     }
-    const prefix = datasetReloaded
-      ? 'Dataset loaded, but URL state failed'
-      : 'Failed to switch dataset';
-    showSessionStatus(`${prefix}: ${exactError.message}`, true);
+    // The dataset itself arrived and only the address bar could not be
+    // rewritten: nothing about the data is wrong, so it keeps its own wording
+    // and offers no retry.
+    if (datasetReloaded) {
+      showSessionStatus(
+        `Dataset loaded, but URL state failed: ${exactError.message}`,
+        true
+      );
+      return false;
+    }
+    debug.error('[UI] Dataset switch failed:', exactError);
+    const explanation = describeDataSourceFailure(
+      `"${datasetDisplayName(sourceType, datasetId)}"`,
+      'could not be opened',
+      exactError
+    ) + (
+      activeMetadata === null
+        ? ''
+        : ` "${activeMetadata.name}" is still open.`
+    );
+    // Persist the explanation next to the selector and offer the same dataset
+    // again: a toast that fades leaves nothing behind to act on. The notice is
+    // a permanent fixture of the sidebar, so it carries no raw diagnostic —
+    // the notification and the console keep that.
+    setCatalogNotice(
+      explanation,
+      () => handleDatasetChange(datasetId, sourceType, loadMethod)
+    );
+    showSessionStatus(
+      explanation + dataSourceFailureDetail(exactError),
+      true
+    );
     return false;
   }
+}
+
+/**
+ * The dataset's own name where the catalog published one, so the message names
+ * what the dropdown showed rather than an internal id.
+ *
+ * @param {string} sourceType
+ * @param {string} datasetId
+ * @returns {string}
+ */
+function datasetDisplayName(sourceType, datasetId) {
+  const option = datasetOptionsByKey.get(
+    datasetSelectionValue(sourceType, datasetId)
+  );
+  const name = option?.dataset?.datasetName;
+  return typeof name === 'string' && name.length > 0 ? name : datasetId;
 }
 
 async function handleDatasetChange(
@@ -1020,6 +1129,9 @@ async function handleNoneDatasetSelectionForIntent(intentOwner) {
     }
     datasetSelect.disabled = false;
     datasetInfo.classList.remove('loading', 'error');
+    // The user asked for no dataset and got it, so a failed switch they walked
+    // away from is no longer something to retry.
+    clearCatalogNotice();
     showSessionStatus('No dataset selected', false);
     return true;
   } catch (error) {

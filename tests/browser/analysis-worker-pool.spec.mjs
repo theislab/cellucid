@@ -1,4 +1,5 @@
 import { expect, test } from '@playwright/test';
+import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 
 test('analysis worker pool initializes and computes the exact result', async ({ page }) => {
@@ -18,7 +19,7 @@ test('analysis worker pool initializes and computes the exact result', async ({ 
   });
 
   await page.goto(
-    '/?exportsBaseUrl=http%3A%2F%2F127.0.0.1%3A4173%2Ftests%2Fbrowser%2Ffixtures%2Fexports%2F&dataset=current-ui-prepared&acceptance=analysis-worker-ci',
+    `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=analysis-worker-ci`,
     { waitUntil: 'domcontentloaded' }
   );
   await dismissWelcome(page);

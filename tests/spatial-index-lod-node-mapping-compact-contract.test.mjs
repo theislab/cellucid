@@ -4,8 +4,8 @@ import test from 'node:test';
 
 import {
   HighPerfRenderer,
-  SpatialIndex,
 } from '../assets/js/rendering/high-perf-renderer.js';
+import { SpatialIndex } from '../assets/js/rendering/high-perf/spatial-index.js';
 
 const UNIFORM_NAMES = Object.freeze([
   'u_alphaTex',

@@ -7,7 +7,6 @@ import { DEAnalysisUI } from '../assets/js/app/analysis/ui/analysis-types/de-ana
 import { DetailedAnalysisUI } from '../assets/js/app/analysis/ui/analysis-types/detailed-analysis-ui.js';
 import { GeneSignatureUI } from '../assets/js/app/analysis/ui/analysis-types/gene-signature-ui.js';
 import { GenesPanelUI } from '../assets/js/app/analysis/ui/analysis-types/genes-panel-ui.js';
-import { FigureContainer } from '../assets/js/app/analysis/ui/shared/figure-container.js';
 import {
   restorePlotlyNotifications,
   setPlotlyHintsEnabled,
@@ -205,6 +204,15 @@ class FakeElement {
       width: 640,
       height: 480,
     };
+  }
+
+  // The plot slot measures the layout box, not the transformed visual box.
+  get clientWidth() {
+    return 640;
+  }
+
+  get clientHeight() {
+    return 480;
   }
 
   focus() {}
@@ -916,65 +924,3 @@ for (const [label, UIClass] of [
     });
   });
 }
-
-test('FigureContainer destroy drains a running preview and purges every candidate once', { concurrency: false }, async () => {
-  await withFakeDOM(async ({ document, purgeCounts }) => {
-    const runningGate = deferred();
-    const runningStarted = deferred();
-    const candidates = new Map();
-    const plotDef = {
-      async render(pageData, _options, candidate) {
-        const owner = pageData[0].owner;
-        candidate.dataset.owner = owner;
-        candidates.set(owner, candidate);
-        if (owner === 'running') {
-          runningStarted.resolve();
-          await runningGate.promise;
-        }
-      },
-    };
-
-    await withPlotDefinition(plotDef, async () => {
-      const container = attachRoot(document, 'figure-owner');
-      const figure = new FigureContainer({ container });
-      const makePageData = owner => [{
-        owner,
-        pageId: 'page-A',
-        pageName: 'Page A',
-        values: Float32Array.of(1),
-        cellIndices: Uint32Array.of(0),
-        variableInfo: {
-          name: 'score',
-          kind: 'continuous',
-        },
-      }];
-
-      await figure.renderPlot(
-        '__transaction-probe__',
-        makePageData('committed'),
-      );
-      const committed = candidates.get('committed');
-      const runningRender = figure.renderPlot(
-        '__transaction-probe__',
-        makePageData('running'),
-      );
-      await runningStarted.promise;
-      const running = candidates.get('running');
-
-      const destroyTask = figure.destroy();
-      const destroyIsAwaitable = typeof destroyTask?.then === 'function';
-      const runningStayedConnected = running.isConnected;
-      const runningPurgeBeforeSettlement = purgeCounts.get(running) ?? 0;
-
-      runningGate.resolve();
-      await runningRender;
-      await Promise.resolve(destroyTask);
-
-      assert.equal(destroyIsAwaitable, true);
-      assert.equal(runningStayedConnected, true);
-      assert.equal(runningPurgeBeforeSettlement, 0);
-      assert.equal(purgeCounts.get(committed), 1);
-      assert.equal(purgeCounts.get(running), 1);
-    });
-  });
-});

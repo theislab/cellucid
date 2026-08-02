@@ -38,6 +38,11 @@ function userCodesContext(pointCount, signal = null) {
     _codesLengthHint: pointCount,
     _codesTypeHint: 'Uint8Array',
     centroidsByDim: {},
+    // Restoring codes bounds them against the field's own inventory, so a
+    // categorical template without categories is not a state the metadata
+    // restore can produce. The width here is what these payloads exercise, so
+    // the inventory covers every uint8 code rather than constraining it.
+    categories: Array.from({ length: 256 }, (_value, index) => `c${index}`),
   };
   const state = {
     pointCount,

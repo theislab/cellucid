@@ -261,11 +261,19 @@
        description from it at all while the panel is shut. #glcanvas-help is a
        .sr-only element that is always rendered. It names a subset of the keys
        on purpose — a description is spoken in full on every focus — and
-       tests/canvas-accessible-name-contract.test.mjs pins every key it names to
-       a <kbd> in the shortcuts panel so the two cannot drift apart. -->
-  <p id="glcanvas-help" class="sr-only">Keyboard: W A S D orbit or pan, = and -
-    zoom, R resets the camera, O P G switch between orbit, planar and free-fly
-    navigation, and ? opens the full shortcut list.</p>
+       tests/canvas-accessible-name-contract.test.mjs pins it to viewer.js: every
+       key it names must have a <kbd> in the shortcuts panel, and what it claims
+       each key does must match the handler that implements it.
+
+       The scope clauses are load-bearing, not padding. `updateFreefly` moves on
+       W/A/S/D, so calling them "orbit or pan" hides a third of what they do;
+       `updateFreefly` reads no zoom key at all, so an unqualified "= and - zoom"
+       promises a gesture free-fly ignores. A screen-reader user hears this on
+       every focus and has no visible panel to check it against (CEL-0200). -->
+  <p id="glcanvas-help" class="sr-only">Keyboard: W A S D orbit, pan or move
+    depending on the navigation mode, = and - zoom in orbit and planar
+    navigation only, R resets the camera, O P G switch between orbit, planar and
+    free-fly navigation, and ? opens the full shortcut list.</p>
   <canvas id="glcanvas" tabindex="0" role="group"
           aria-label="Single-cell embedding plot"
           aria-describedby="glcanvas-help"></canvas>
@@ -325,10 +333,20 @@
           <!-- Dataset Selector -->
 	          <div class="control-block" data-state-serializer-skip="true">
 	            <label for="dataset-select">Sample datasets:</label>
-	            <select id="dataset-select" class="obs-select">
+	            <select id="dataset-select" class="obs-select" disabled aria-describedby="data-source-status">
 	              <option value="" disabled selected>Loading...</option>
 	            </select>
 	          </div>
+
+          <!--
+            Every data-source control below ships disabled: the listeners that
+            act on them are attached by initUI(), which does not run until the
+            first dataset has loaded. Until then a click would be discarded
+            without a request or a message, so the controls say plainly that
+            they are not ready yet. ui-coordinator.js admits them, and rewrites
+            this live region, the moment those listeners exist.
+          -->
+          <p id="data-source-status" class="dataset-info loading" role="status" aria-live="polite">Starting Cellucid — the data controls below open as soon as it is ready.</p>
 
           <!-- Local data selectors -->
 	          <div class="control-block mt-1 relative" id="user-data-block" data-state-serializer-skip="true">
@@ -360,13 +378,13 @@
               </div>
             </div>
             <div class="user-data-grid">
-              <button id="user-data-h5ad-btn" class="reset-btn data-btn" title="Load single .h5ad file">H5AD</button>
-              <button id="user-data-zarr-archive-btn" class="reset-btn data-btn" title="Load a portable Zarr ZIP archive in any supported browser">Zarr ZIP</button>
-              <button id="user-data-browse-btn" class="reset-btn data-btn data-btn-wide" title="Load prepared directory">Prepared</button>
+              <button id="user-data-h5ad-btn" class="reset-btn data-btn" title="Load single .h5ad file" disabled aria-describedby="data-source-status">H5AD</button>
+              <button id="user-data-zarr-archive-btn" class="reset-btn data-btn" title="Load a portable Zarr ZIP archive in any supported browser" disabled aria-describedby="data-source-status">Zarr ZIP</button>
+              <button id="user-data-browse-btn" class="reset-btn data-btn data-btn-wide" title="Load prepared directory" disabled aria-describedby="data-source-status">Prepared</button>
               <!-- Hidden file inputs -->
-              <input type="file" id="user-data-file-input" class="file-input-hidden" webkitdirectory directory multiple />
-              <input type="file" id="user-data-h5ad-input" class="file-input-hidden" accept=".h5ad" />
-              <input type="file" id="user-data-zarr-archive-input" class="file-input-hidden" accept=".zarr.zip,.zip,application/zip" />
+              <input type="file" id="user-data-file-input" class="file-input-hidden" webkitdirectory directory multiple disabled />
+              <input type="file" id="user-data-h5ad-input" class="file-input-hidden" accept=".h5ad" disabled />
+              <input type="file" id="user-data-zarr-archive-input" class="file-input-hidden" accept=".zarr.zip,.zip,application/zip" disabled />
             </div>
           </div>
 
@@ -401,11 +419,12 @@
             </div>
             <div class="user-data-row">
               <input type="text" id="remote-server-url" class="user-data-path"
-                     placeholder="http://localhost:8765" />
-              <button id="remote-connect-btn" class="reset-btn">Connect</button>
+                     placeholder="http://localhost:8765" disabled
+                     aria-describedby="data-source-status" />
+              <button id="remote-connect-btn" class="reset-btn" disabled aria-describedby="data-source-status">Connect</button>
             </div>
             <div id="remote-disconnect-container" class="user-data-row mt-1">
-              <button id="remote-disconnect-btn" class="reset-btn">Disconnect</button>
+              <button id="remote-disconnect-btn" class="reset-btn" disabled aria-describedby="data-source-status">Disconnect</button>
             </div>
           </div>
 
@@ -438,11 +457,12 @@
             </div>
             <div class="user-data-row">
               <input type="text" id="github-repo-url" class="user-data-path"
-                     placeholder="owner/repo/path/to/exports" />
-              <button id="github-connect-btn" class="reset-btn">Load</button>
+                     placeholder="owner/repo/path/to/exports" disabled
+                     aria-describedby="data-source-status" />
+              <button id="github-connect-btn" class="reset-btn" disabled aria-describedby="data-source-status">Connect</button>
             </div>
             <div id="github-disconnect-container" class="user-data-row mt-1">
-              <button id="github-disconnect-btn" class="reset-btn">Disconnect</button>
+              <button id="github-disconnect-btn" class="reset-btn" disabled aria-describedby="data-source-status">Disconnect</button>
             </div>
           </div>
 
@@ -595,7 +615,21 @@
                 hidden
               >
                 <div class="info-tooltip-content">
-                  Lower quality reduces GPU work for smoother interaction.
+                  <div class="info-step">
+                    This changes what a point looks like, not how fast it draws.
+                    Full adds lighting and fog, Light drops both, Ultra-light
+                    draws squares instead of round dots.
+                  </div>
+                  <div class="info-step">
+                    The three measured the same frame time at every point size
+                    tested on one Apple M1 Pro. Depth writes discard most
+                    overlapping fragments before the shader runs, so simplifying
+                    it has nothing left to save.
+                  </div>
+                  <div class="info-step">
+                    For speed, reach for Point size, a smaller window, filtering,
+                    or Image quality below.
+                  </div>
                 </div>
               </div>
               <select id="hp-shader-quality" class="obs-select">
@@ -650,6 +684,65 @@
                 Frustum culling
               </label>
             </div>
+          </div>
+
+          <!--
+            Antialiasing sits outside #renderer-controls on purpose: that block
+            is hidden in volumetric smoke mode, and this setting governs the
+            whole drawing buffer in both modes.
+          -->
+          <div class="control-block" id="antialias-controls">
+            <div class="d-flex items-center gap-1">
+              <label for="hp-antialias">Image quality:</label>
+              <button
+                type="button"
+                id="antialias-info-btn"
+                class="info-btn"
+                aria-label="About antialiasing"
+                aria-controls="antialias-info-tooltip"
+                aria-haspopup="dialog"
+                aria-expanded="false"
+              ><span aria-hidden="true">i</span></button>
+            </div>
+            <div
+              id="antialias-info-tooltip"
+              class="info-tooltip"
+              role="dialog"
+              aria-labelledby="antialias-info-btn"
+              tabindex="-1"
+              hidden
+            >
+              <div class="info-tooltip-content">
+                <div class="info-step">
+                  Antialiasing smooths the edge of every point. Turning it off
+                  measured 19% faster at the default point size and 34% faster
+                  at large point sizes, on 10 million points on one Apple M1
+                  Pro. Expect the shape, not the exact numbers, on other GPUs.
+                </div>
+                <div class="info-step">
+                  It is not free to turn off: 18% of pixels change at the
+                  default point size, and 32% with Ultra-light square points.
+                  Small dots are almost all edge, so this is the setting that
+                  changes what a dense cloud looks like.
+                </div>
+                <div class="info-step">
+                  The browser fixes this when it creates the drawing buffer, so
+                  it can only change when the page loads.
+                </div>
+              </div>
+            </div>
+            <div class="control-block">
+              <label class="checkbox-inline">
+                <input type="checkbox" id="hp-antialias" checked />
+                Antialiasing (smooth point edges)
+              </label>
+            </div>
+            <div
+              id="hp-antialias-status"
+              class="legend-help"
+              role="status"
+              aria-live="polite"
+            ></div>
           </div>
 
           <!-- Volumetric smoke controls -->
@@ -1530,11 +1623,11 @@
         <div class="accordion-content">
           <div class="highlight-mode-box">
             <label>Highlight mode:</label>
-            <div class="highlight-mode-buttons" role="group" aria-label="Highlight mode selection">
-              <button type="button" class="toggle-switch highlight-mode-btn" data-mode="annotation" aria-pressed="true">Annotation based</button>
-              <button type="button" class="toggle-switch highlight-mode-btn" data-mode="knn">KNN drag</button>
-              <button type="button" class="toggle-switch highlight-mode-btn" data-mode="proximity">Proximity drag</button>
-              <button type="button" class="toggle-switch highlight-mode-btn" data-mode="lasso">Lasso</button>
+            <div class="highlight-mode-buttons" role="group" aria-label="Highlight mode selection" id="highlight-mode" data-state-serializer-pressed-group>
+              <button type="button" class="toggle-switch highlight-mode-btn" id="highlight-mode-annotation" data-mode="annotation" aria-pressed="true">Annotation based</button>
+              <button type="button" class="toggle-switch highlight-mode-btn" id="highlight-mode-knn" data-mode="knn">KNN drag</button>
+              <button type="button" class="toggle-switch highlight-mode-btn" id="highlight-mode-proximity" data-mode="proximity">Proximity drag</button>
+              <button type="button" class="toggle-switch highlight-mode-btn" id="highlight-mode-lasso" data-mode="lasso">Lasso</button>
             </div>
             <div id="highlight-mode-description" class="legend-help">
               Alt+click a cell to highlight its group. Alt+drag to select a range.
@@ -1807,23 +1900,32 @@
             <div class="shortcut-item"><kbd>O</kbd><kbd>P</kbd><kbd>G</kbd><span>Orbit / Planar / Free-fly</span></div>
             <div class="shortcut-item"><kbd>?</kbd><span>Show shortcuts</span></div>
           </div>
+          <!-- Every row here is checked against the handler that implements it
+               by tests/keyboard-shortcut-panel-contract.test.mjs. A row that
+               names a gesture the code rejects is worse than no row: it spends
+               the user's time proving the app is broken. -->
           <div class="shortcuts-list mt-2">
             <div class="shortcut-group-title">Navigation (Orbit / Planar / Free-fly)</div>
-            <div class="shortcut-item"><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd><span>Orbit / pan</span></div>
-            <div class="shortcut-item"><kbd>=</kbd><kbd>]</kbd><span>Zoom in</span></div>
-            <div class="shortcut-item"><kbd>-</kbd><kbd>[</kbd><span>Zoom out</span></div>
+            <div class="shortcut-item"><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd><span>Orbit / pan / move</span></div>
             <div class="shortcut-item"><kbd>Shift</kbd><span>Move faster</span></div>
           </div>
           <div class="shortcuts-list">
+            <div class="shortcut-group-title">Orbit and Planar only</div>
+            <div class="shortcut-item"><kbd>=</kbd><kbd>]</kbd><span>Zoom in</span></div>
+            <div class="shortcut-item"><kbd>-</kbd><kbd>[</kbd><span>Zoom out</span></div>
+          </div>
+          <div class="shortcuts-list">
             <div class="shortcut-group-title">Free-fly specific</div>
-            <div class="shortcut-item"><kbd>Q</kbd><kbd>E</kbd><span>Up / down</span></div>
+            <div class="shortcut-item"><kbd>E</kbd><kbd>Q</kbd><span>Up / down</span></div>
             <div class="shortcut-item"><kbd>Esc</kbd><span>Exit pointer lock</span></div>
           </div>
           <div class="shortcuts-list mt-2">
             <div class="shortcut-group-title">Highlighting</div>
             <div class="shortcut-item"><kbd>Alt</kbd>+click<span>Highlight group</span></div>
-            <div class="shortcut-item"><kbd>Alt</kbd>+drag<span>Area selection</span></div>
-            <div class="shortcut-item"><kbd>Shift</kbd>+click<span>Add to selection</span></div>
+            <div class="shortcut-item"><kbd>Alt</kbd>+drag<span>Drag with the active tool</span></div>
+            <div class="shortcut-item"><kbd>Shift</kbd>+<kbd>Alt</kbd>+click<span>Add to selection</span></div>
+            <div class="shortcut-item"><kbd>Ctrl</kbd>+<kbd>Alt</kbd>+click<span>Subtract from selection</span></div>
+            <div class="shortcut-item"><kbd>Esc</kbd><span>Cancel selection in progress</span></div>
             <div class="shortcut-item"><kbd>X</kbd><span>Clear highlights</span></div>
           </div>
         </div>
@@ -1871,7 +1973,13 @@
           <!-- Custom count -->
           <div class="control-block mt-2">
             <label for="benchmark-count">Custom point count:</label>
-            <input type="number" id="benchmark-count" value="1000000" min="1000" max="50000000" step="100000" class="obs-select benchmark-count-input" />
+            <!--
+              min/max/step are MIN_SYNTHETIC_COUNT, MAX_SYNTHETIC_COUNT and one
+              exact point, from app/ui/modules/benchmark/generation-contract.js.
+              `benchmark-generation-contract.test.mjs` fails if they drift; this
+              is static markup, so the constant cannot be interpolated here.
+            -->
+            <input type="number" id="benchmark-count" value="1000000" min="1" max="50000000" step="1" class="obs-select benchmark-count-input" />
           </div>
 
           <!-- Pattern selection -->
@@ -2020,7 +2128,7 @@
                   <div class="bn-details-section">
                     <div>LOD overhead: <span id="bn-lod-overhead" class="bn-details-value">--</span></div>
                     <div>Frustum overhead: <span id="bn-frustum-overhead" class="bn-details-value">--</span></div>
-                    <div>Shader overhead: <span id="bn-shader-overhead" class="bn-details-value">--</span></div>
+                    <div>Point size response: <span id="bn-point-size-response" class="bn-details-value">--</span></div>
                   </div>
                   <div class="bn-details-section">
                     <div>Frame stability: <span id="bn-frame-stability" class="bn-details-value">--</span></div>

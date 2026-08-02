@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import { DATA_LOAD_METHODS } from '../assets/js/analytics/tracker.js';
@@ -859,7 +860,12 @@ test('failed connection candidates retire exactly once and preserve prior state'
         );
         assert.equal(terminal.length, 1);
         assert.equal(terminal[0].kind, 'fail');
-        assert.match(terminal[0].message, /connection failed/i);
+        // The loader published no cause on these errors, so the notification
+        // must say what happened without naming a cause it does not have, and
+        // must still carry the raw text as the only evidence there is.
+        assert.match(terminal[0].message, /could not be reached/i);
+        assert.doesNotMatch(terminal[0].message, /the server|the connection may/i);
+        assert.match(terminal[0].message, /Details: .+ rejected/);
       });
     }
   }
@@ -884,7 +890,7 @@ test('failed connection candidates retire exactly once and preserve prior state'
     );
     assert.equal(terminal.length, 1);
     assert.equal(terminal[0].kind, 'fail');
-    assert.match(terminal[0].message, /connection failed.*catalog rejected/i);
+    assert.match(terminal[0].message, /could not be reached.*catalog rejected/i);
   });
 
   await t.test('candidate factory failure is terminal and contained', async t => {
@@ -1291,4 +1297,55 @@ test('connection teardown unregisters transport listeners and disables DOM owner
   assert.deepEqual(harness.activations, []);
   assert.deepEqual(harness.clearCalls, []);
   assert.deepEqual(harness.populationCalls, []);
+});
+
+test('every connect button ships the label its wiring writes', async () => {
+  // `index.html` paints these buttons long before `initUI` runs — the sidebar
+  // ships them disabled precisely because their listeners arrive tens of
+  // seconds later on a slow link. Whatever the markup says is therefore on
+  // screen for the whole of startup, and it is what a screenshot taken during
+  // startup records. The GitHub button shipped "Load" and was relabelled
+  // "Connect" the moment the wiring ran (CEL-0170), so the app documented
+  // itself with a word it never shows once it is working.
+  const [indexHtml, connectionsSource, domCacheSource] = await Promise.all([
+    readFile(new URL('../index.html', import.meta.url), 'utf8'),
+    readFile(
+      new URL('../assets/js/app/ui/modules/dataset-connections.js', import.meta.url),
+      'utf8'
+    ),
+    readFile(
+      new URL('../assets/js/app/ui/core/dom-cache.js', import.meta.url),
+      'utf8'
+    ),
+  ]);
+
+  const label = /connectButton\.textContent =\s*connected \? '([^']+)' : '([^']+)';/
+    .exec(connectionsSource);
+  assert.ok(label !== null, 'the connect label must still be written in one place');
+  const [, connectedLabel, disconnectedLabel] = label;
+
+  // The buttons are whichever DOM keys the wiring is handed, resolved to their
+  // element ids by the DOM cache, so a third connection source is covered the
+  // day it is added rather than the day someone remembers this test.
+  const wiredKeys = [
+    ...connectionsSource.matchAll(/^\s+connectButton: \w+\.(\w+),$/gm),
+  ].map(match => match[1]);
+  assert.ok(wiredKeys.length >= 2, 'both connection sources must still be wired');
+
+  for (const key of wiredKeys) {
+    const idMatch = new RegExp(`${key}: byId\\('([^']+)'\\)`).exec(domCacheSource);
+    assert.ok(idMatch !== null, `dom-cache must resolve ${key} to an element id`);
+    const id = idMatch[1];
+    const shipped = new RegExp(
+      `<button[^>]*id="${id}"[^>]*>([^<]*)</button>`
+    ).exec(indexHtml);
+    assert.ok(shipped !== null, `index.html must carry a #${id} button`);
+    assert.equal(
+      shipped[1],
+      disconnectedLabel,
+      `#${id} must ship the label its wiring writes when nothing is connected, `
+        + 'so startup never shows a word the app then replaces'
+    );
+    assert.notEqual(shipped[1], connectedLabel);
+  }
 });

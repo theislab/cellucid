@@ -12,9 +12,12 @@ import { StateValidator } from '../../../utils/state-validator.js';
 import {
   ChangeType,
   FieldKind,
-  FieldSource,
-  Limits
+  FieldSource
 } from '../../../utils/field-constants.js';
+import {
+  categoricalStorageForCodes,
+  requireCategoricalCategoryCount
+} from '../../../../data/categorical-storage-contract.js';
 import { getFieldRegistry } from '../../../utils/field-registry.js';
 import { makeUniqueLabel } from '../../../utils/label-utils.js';
 import { getCategoryColor } from '../../../../data/palettes.js';
@@ -122,15 +125,10 @@ function requireCategoryField(field, label) {
 }
 
 function requireCategoryPayload(categories, codes, pointCount, label) {
-  if (
-    !Array.isArray(categories)
-    || categories.length === 0
-    || categories.length > Limits.MAX_CATEGORIES_PER_FIELD
-  ) {
-    throw new TypeError(
-      `${label} categories must contain from 1 through ${Limits.MAX_CATEGORIES_PER_FIELD} values`
-    );
+  if (!Array.isArray(categories) || categories.length === 0) {
+    throw new TypeError(`${label} categories must contain at least one value`);
   }
+  requireCategoricalCategoryCount(categories.length, `${label} categories`);
   const seen = new Set();
   for (const category of categories) {
     StateValidator.validateCategoryLabel(category);
@@ -147,7 +145,7 @@ function requireCategoryPayload(categories, codes, pointCount, label) {
       `${label} codes must be an exact dataset-length typed array`
     );
   }
-  const missing = codes instanceof Uint8Array ? 255 : 65_535;
+  const { missingValue: missing } = categoricalStorageForCodes(codes, label);
   for (let index = 0; index < codes.length; index++) {
     if (codes[index] >= categories.length && codes[index] !== missing) {
       throw new RangeError(
@@ -429,12 +427,12 @@ export class FieldOverlayPublicMethods {
       // Revert this category label to its original.
       field.categories[categoryIndex] = originalLabel;
       if (!isUserDefined) {
-        this._renameRegistry.revertCategoryRename(src, originalFieldKey, categoryIndex);
+        this._renameRegistry.revertCategoryRename(src, originalFieldKey, originalLabel);
       }
     } else {
       field.categories[categoryIndex] = newLabel;
       if (!isUserDefined) {
-        this._renameRegistry.setCategoryRename(src, originalFieldKey, categoryIndex, newLabel);
+        this._renameRegistry.setCategoryRename(src, originalFieldKey, originalLabel, newLabel);
       }
     }
 
@@ -773,9 +771,10 @@ export class FieldOverlayPublicMethods {
     }
     if (template._isPurged === true) return true;
 
-    // Mark template as deleted and purged
-    template._isDeleted = true;
-    template._isPurged = true;
+    // The registry owns the field's storage, so it owns releasing it. Setting
+    // the flags here instead is what left a purged field's per-cell codes
+    // resident for the life of the page and in every session bundle after it.
+    registry.purgeField(fieldId);
 
     // If field exists in array, mark it there too
     const fields = requireInventory(this, src);
@@ -794,8 +793,16 @@ export class FieldOverlayPublicMethods {
           'Injected user-defined field is not in a deleted state'
         );
       }
+      // The injected entry is a distinct object from the template when the
+      // field reached the inventory, so releasing only the template would
+      // leave the same arrays alive behind the other reference.
       field._isDeleted = true;
       field._isPurged = true;
+      field.codes = null;
+      field.values = null;
+      field.categories = [];
+      field.centroidsByDim = {};
+      field.loaded = false;
     }
 
     getFieldRegistry().invalidate();

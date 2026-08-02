@@ -15,6 +15,7 @@ import { makeFieldId } from '../utils/field-constants.js';
 import {
   assertArray,
   assertBoolean,
+  assertCategoryPrimitive,
   assertExactKeys,
   assertFiniteNumber,
   assertNonEmptyString,
@@ -22,6 +23,7 @@ import {
   assertNullableString,
   assertPlainRecord,
   assertSafeInteger,
+  describeCategory,
   requireMethod
 } from '../session/schema-contract.js';
 
@@ -147,6 +149,65 @@ function assertNullableBoolean(value, context) {
   return assertBoolean(value, context);
 }
 
+/**
+ * The name of one category of a field, by its current position.
+ *
+ * @param {object} field
+ * @param {number} categoryIndex
+ * @param {string} context
+ * @returns {string|number|boolean}
+ */
+function categoryNameAt(field, categoryIndex, context) {
+  if (!Array.isArray(field.categories)) {
+    throw new TypeError(
+      `${context} requires the category inventory of "${field.key}".`
+    );
+  }
+  if (categoryIndex >= field.categories.length) {
+    throw new RangeError(
+      `${context} is outside the categories of "${field.key}".`
+    );
+  }
+  return assertCategoryPrimitive(field.categories[categoryIndex], context);
+}
+
+/**
+ * Resolve one saved category name to its position in the current field.
+ *
+ * A category position is not pinned by anything the session can check: the
+ * dataset fingerprint covers the cells, not the category inventory, so
+ * exporting the same cells with one more category shifts every category after
+ * it. The name is the stable identity, and it is what the entry records, so a
+ * name that is gone is refused by name rather than applied to whichever
+ * category now sits at the old position.
+ *
+ * @param {object} field
+ * @param {string|number|boolean} categoryName
+ * @param {string} context
+ * @returns {number}
+ */
+function resolveCategoryIndex(field, categoryName, context) {
+  if (!Array.isArray(field.categories)) {
+    throw new TypeError(
+      `${context} requires the category inventory of "${field.key}".`
+    );
+  }
+  const categoryIndex = field.categories.indexOf(categoryName);
+  if (categoryIndex < 0) {
+    throw new RangeError(
+      `${context} names the category ${describeCategory(categoryName)}, `
+      + `which "${field.key}" no longer has.`
+    );
+  }
+  if (field.categories.lastIndexOf(categoryName) !== categoryIndex) {
+    throw new TypeError(
+      `${context} names the category ${describeCategory(categoryName)}, `
+      + `and "${field.key}" lists it more than once.`
+    );
+  }
+  return categoryIndex;
+}
+
 function assertNullableRange(value, context) {
   if (value === null) return value;
   return assertRange(value, context);
@@ -193,8 +254,14 @@ function serializeCategoryFilter(field) {
       }
       assertBoolean(visible, `Category visibility "${field.key}"[${rawIndex}]`);
       if (visible === false) {
+        const categoryIndex = Number(rawIndex);
         visibility.push({
-          categoryIndex: Number(rawIndex),
+          categoryIndex,
+          categoryName: categoryNameAt(
+            field,
+            categoryIndex,
+            `Category visibility index ${categoryIndex}`
+          ),
           visible
         });
       }
@@ -209,9 +276,16 @@ function serializeCategoryFilter(field) {
       const color = field._categoryColors[categoryIndex];
       if (color === undefined || color === null) continue;
       assertRgb(color, `Category color "${field.key}"[${categoryIndex}]`);
+      // The palette default is a function of position, so "changed" is measured
+      // against the position the colour is currently at. Only the change itself
+      // is carried across a re-export, and it is carried by name.
       if (!colorsEqual(color, getCategoryColor(categoryIndex))) {
         colors.push({
-          categoryIndex,
+          categoryName: categoryNameAt(
+            field,
+            categoryIndex,
+            `Category color index ${categoryIndex}`
+          ),
           color: [...color]
         });
       }
@@ -225,7 +299,10 @@ function serializeCategoryFilter(field) {
       false,
       `Category filterEnabled for "${field.key}"`
     ),
-    visibility,
+    visibility: visibility.map(change => ({
+      categoryName: change.categoryName,
+      visible: change.visible
+    })),
     colors,
     colormapId: explicitNullableColormap(
       field._colormapId,
@@ -368,47 +445,55 @@ function validateCategoryEntry(entry, field, fieldId) {
   }
 
   const visibilityIndices = new Set();
+  const resolvedVisibility = [];
   for (const change of entry.visibility) {
     assertExactKeys(
       change,
-      ['categoryIndex', 'visible'],
+      ['categoryName', 'visible'],
       `Category filter "${fieldId}" visibility change`
     );
-    const categoryIndex = assertSafeInteger(
-      change.categoryIndex,
-      `Category filter "${fieldId}" categoryIndex`
+    assertCategoryPrimitive(
+      change.categoryName,
+      `Category filter "${fieldId}" visibility categoryName`
     );
-    if (categoryIndex >= field.categories.length) {
-      throw new RangeError(`Category filter "${fieldId}" categoryIndex is out of range.`);
-    }
+    const categoryIndex = resolveCategoryIndex(
+      field,
+      change.categoryName,
+      `Category filter "${fieldId}" visibility change`
+    );
     if (visibilityIndices.has(categoryIndex)) {
-      throw new TypeError(`Category filter "${fieldId}" repeats a visibility categoryIndex.`);
+      throw new TypeError(`Category filter "${fieldId}" repeats a visibility category.`);
     }
     visibilityIndices.add(categoryIndex);
     if (change.visible !== false) {
       throw new TypeError(`Category filter "${fieldId}" visibility changes must be explicit false values.`);
     }
+    resolvedVisibility.push({ categoryIndex, visible: change.visible });
   }
 
   const colorIndices = new Set();
+  const resolvedColors = [];
   for (const change of entry.colors) {
     assertExactKeys(
       change,
-      ['categoryIndex', 'color'],
+      ['categoryName', 'color'],
       `Category filter "${fieldId}" color change`
     );
-    const categoryIndex = assertSafeInteger(
-      change.categoryIndex,
-      `Category filter "${fieldId}" color categoryIndex`
+    assertCategoryPrimitive(
+      change.categoryName,
+      `Category filter "${fieldId}" color categoryName`
     );
-    if (categoryIndex >= field.categories.length) {
-      throw new RangeError(`Category filter "${fieldId}" color categoryIndex is out of range.`);
-    }
+    const categoryIndex = resolveCategoryIndex(
+      field,
+      change.categoryName,
+      `Category filter "${fieldId}" color change`
+    );
     if (colorIndices.has(categoryIndex)) {
-      throw new TypeError(`Category filter "${fieldId}" repeats a color categoryIndex.`);
+      throw new TypeError(`Category filter "${fieldId}" repeats a color category.`);
     }
     colorIndices.add(categoryIndex);
     assertRgb(change.color, `Category filter "${fieldId}" color`);
+    resolvedColors.push({ categoryIndex, color: change.color });
   }
 
   if (
@@ -419,6 +504,7 @@ function validateCategoryEntry(entry, field, fieldId) {
   ) {
     throw new TypeError(`Category filter "${fieldId}" must contain an explicit change.`);
   }
+  return { visibility: resolvedVisibility, colors: resolvedColors };
 }
 
 function validateContinuousEntry(entry, fieldId) {
@@ -488,8 +574,9 @@ export function validateFiltersForState(state, filters) {
       throw new RangeError(`Current field "${fieldId}" was not found.`);
     }
     const field = fields[fieldIndex];
+    let resolved = null;
     if (field.kind === 'category') {
-      validateCategoryEntry(entry, field, fieldId);
+      resolved = validateCategoryEntry(entry, field, fieldId);
     } else {
       validateContinuousEntry(entry, fieldId);
     }
@@ -498,7 +585,7 @@ export function validateFiltersForState(state, filters) {
         `Filter "${fieldId}" kind does not match current field kind "${field.kind}".`
       );
     }
-    actions.push({ source, fieldIndex, field, entry });
+    actions.push({ source, fieldIndex, field, entry, resolved });
   }
   return actions;
 }
@@ -621,17 +708,18 @@ export function createFilterSerializer({ state }) {
         }
       }
 
-      for (const { field, entry } of actions) {
+      for (const { field, entry, resolved } of actions) {
         throwIfAborted(signal);
         if (entry.kind === 'category') {
-          for (const change of entry.visibility) {
+          // Positions resolved from the saved names, never the saved positions.
+          for (const change of resolved.visibility) {
             state.setVisibilityForCategory(
               field,
               change.categoryIndex,
               change.visible
             );
           }
-          for (const change of entry.colors) {
+          for (const change of resolved.colors) {
             state.setColorForCategory(
               field,
               change.categoryIndex,

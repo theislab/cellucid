@@ -57,14 +57,30 @@ function defaultRemoveCandidate({ candidate }) {
   candidate.parentNode?.removeChild(candidate);
 }
 
-function readHostMeasurement(host) {
-  if (typeof host.getBoundingClientRect !== 'function') {
+/**
+ * The layout box a candidate occupies inside `host`.
+ *
+ * Candidates are `position: absolute; inset: 0`, so the box they resolve
+ * against is the host's padding box - exactly `clientWidth`/`clientHeight`.
+ *
+ * `getBoundingClientRect()` reports the *visual* box instead: it adds the
+ * host's own border and multiplies in every ancestor transform. The expanded
+ * analysis overlay opens under `transform: scale(0.96)`, so a plot measured
+ * that way renders 4% small and never recovers, because a transform change
+ * does not notify a ResizeObserver. `clientWidth`/`clientHeight` is also the
+ * box Plotly's own responsive handler reads, so the two resize owners always
+ * agree on one size.
+ *
+ * @param {{ clientWidth: number, clientHeight: number }} host
+ * @returns {{ width: number, height: number }}
+ */
+export function readHostLayoutBox(host) {
+  if (host === null || typeof host !== 'object') {
     throw new Error('PlotRenderSlot host must be measurable');
   }
 
-  const bounds = host.getBoundingClientRect();
-  const width = Number(bounds.width);
-  const height = Number(bounds.height);
+  const width = Number(host.clientWidth);
+  const height = Number(host.clientHeight);
   if (!Number.isFinite(width) || width < 0 || !Number.isFinite(height) || height < 0) {
     throw new Error('PlotRenderSlot host dimensions must be finite and non-negative');
   }
@@ -86,7 +102,7 @@ function staleRequestError(signal) {
 }
 
 async function defaultMeasure({ host, signal, createResizeObserver }) {
-  const initial = readHostMeasurement(host);
+  const initial = readHostLayoutBox(host);
   if (initial.width > 0 && initial.height > 0) return initial;
   if (signal?.aborted) throw staleRequestError(signal);
 
@@ -123,7 +139,7 @@ async function defaultMeasure({ host, signal, createResizeObserver }) {
 
     const readPositiveMeasurement = () => {
       try {
-        const measurement = readHostMeasurement(host);
+        const measurement = readHostLayoutBox(host);
         if (measurement.width > 0 && measurement.height > 0) {
           settle(measurement);
         }

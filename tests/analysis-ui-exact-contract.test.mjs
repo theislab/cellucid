@@ -348,6 +348,7 @@ test('DE page comparison never constructs a pair from a zero-cell page', async (
 test('AnalysisUIManager accepts only factories that return a fully initialized UI', () => {
   const container = {
     classList: { add() {} },
+    setAttribute() {},
     remove() {},
   };
   let initCalls = 0;
@@ -473,6 +474,14 @@ class FakeElement {
       width: 320,
       height: 240,
     };
+  }
+
+  contains(node) {
+    if (node === null || node === undefined) return false;
+    if (node === this) return true;
+    return this.children.some(
+      child => typeof child?.contains === 'function' && child.contains(node)
+    );
   }
 
   remove() {
@@ -640,11 +649,12 @@ test('Form preview expand events observe failures and destruction drains the act
     };
 
     await ui._ensurePreviewPlotSlot({
-      clickable: true,
       containerId: 'event-owner-preview',
     });
-    const preview = ui._resultContainer.children[0];
-    preview.click();
+    // The full-view control is a real button; the preview itself carries no
+    // click listener.
+    const expandButton = ui._renderPreviewExpandAction();
+    expandButton.click();
     await Promise.resolve();
 
     const observedBeforeDestroy = rejectionObserverCount() > 0;
@@ -1208,7 +1218,7 @@ test('analysis previews invoke their required full-view modal owner', async () =
         label: 'Correlation',
         prototype: CorrelationAnalysisUI.prototype,
         result: { plotType: '__missing-correlation-preview-plot__' },
-        clickClass: 'analysis-preview-container',
+        clickClass: 'analysis-expand-btn',
         configure(ui) {
           ui._plotContainerIdBase = 'correlation-preview';
         },
@@ -1217,7 +1227,7 @@ test('analysis previews invoke their required full-view modal owner', async () =
         label: 'Gene Signature',
         prototype: GeneSignatureUI.prototype,
         result: { plotType: '__missing-signature-preview-plot__' },
-        clickClass: 'analysis-preview-container',
+        clickClass: 'analysis-expand-btn',
         configure(ui) {
           ui._instanceId = 'signature-preview';
         },

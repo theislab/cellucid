@@ -13,6 +13,11 @@
 
 import { StateValidator } from '../utils/state-validator.js';
 import { FieldKind, FieldSource, Limits, OverlapStrategy, generateId } from '../utils/field-constants.js';
+import {
+  categoricalStorageForCodes,
+  categoricalStorageForCount,
+  requireCategoricalCategoryCount
+} from '../../data/categorical-storage-contract.js';
 import { BaseRegistry } from './base-registry.js';
 import { computeAllDimensionCentroids, computeCentroidsForDimension } from './user-defined-fields/centroids.js';
 
@@ -41,15 +46,14 @@ function requireNullableRecord(value, context) {
 }
 
 function requireCategoryInventory(categories, context) {
-  if (
-    !Array.isArray(categories)
-    || categories.length === 0
-    || categories.length > Limits.MAX_CATEGORIES_PER_FIELD
-  ) {
-    throw new TypeError(
-      `${context} must contain from 1 through ${Limits.MAX_CATEGORIES_PER_FIELD} labels`
-    );
+  if (!Array.isArray(categories) || categories.length === 0) {
+    throw new TypeError(`${context} must contain at least one label`);
   }
+  // The ceiling a user-defined field accepts is the ceiling every reader and
+  // both writers accept, derived once in `data/categorical-storage-contract.js`.
+  // A narrower one here refused to copy, merge, or edit a categorical the app
+  // had just loaded and drawn.
+  requireCategoricalCategoryCount(categories.length, context);
   const categorySet = new Set();
   for (let index = 0; index < categories.length; index++) {
     const category = categories[index];
@@ -62,16 +66,30 @@ function requireCategoryInventory(categories, context) {
   return categories;
 }
 
-function requireCategoryCodes(codes, categories, expectedLength, context) {
+/**
+ * Require that every code indexes a real category.
+ *
+ * Exported because the session restore path has to ask the same question. A
+ * bundle can declare a code length and a code width that both check out while
+ * naming categories the field does not have, and nothing downstream looks
+ * again - the codes go straight into the field.
+ *
+ * @param {unknown} codes
+ * @param {string[]} categories
+ * @param {number} expectedLength
+ * @param {string} context
+ * @returns {Uint8Array|Uint16Array}
+ */
+export function requireCategoryCodes(codes, categories, expectedLength, context) {
   if (
     (!(codes instanceof Uint8Array) && !(codes instanceof Uint16Array))
     || codes.length !== expectedLength
   ) {
     throw new TypeError(`${context} codes must be an exact typed dataset-length array`);
   }
-  const missingCode = codes instanceof Uint8Array ? 255 : 65_535;
+  const { missingValue } = categoricalStorageForCodes(codes, context);
   for (let index = 0; index < codes.length; index++) {
-    if (codes[index] >= categories.length && codes[index] !== missingCode) {
+    if (codes[index] >= categories.length && codes[index] !== missingValue) {
       throw new RangeError(`${context} code ${index} is outside the category inventory`);
     }
   }
@@ -483,8 +501,14 @@ export class UserDefinedFieldsRegistry extends BaseRegistry {
 
       requireCategoryInventory(categories, 'Highlight-page categorical field');
 
-      const uncoveredIndex = hasUncovered ? (categories.length - 1) : 255;
-      codes = new Uint8Array(pointCount);
+      const storage = categoricalStorageForCount(
+        categories.length,
+        'Highlight-page categorical field'
+      );
+      const uncoveredIndex = hasUncovered
+        ? (categories.length - 1)
+        : storage.missingValue;
+      codes = new storage.TypedArrayClass(pointCount);
       codes.fill(uncoveredIndex);
 
       for (const [cellIdx, mask] of membershipByCell) {
@@ -534,8 +558,14 @@ export class UserDefinedFieldsRegistry extends BaseRegistry {
 
       requireCategoryInventory(categories, 'Highlight-page categorical field');
 
-      const unassigned = hasUncovered ? (categories.length - 1) : 255;
-      codes = new Uint8Array(pointCount);
+      const storage = categoricalStorageForCount(
+        categories.length,
+        'Highlight-page categorical field'
+      );
+      const unassigned = hasUncovered
+        ? (categories.length - 1)
+        : storage.missingValue;
+      codes = new storage.TypedArrayClass(pointCount);
       codes.fill(unassigned);
 
       const assignedCount = new Uint8Array(pointCount);
@@ -659,6 +689,44 @@ export class UserDefinedFieldsRegistry extends BaseRegistry {
     return this._fields.delete(id);
   }
 
+  /**
+   * Purge a soft-deleted field, releasing everything it can no longer use.
+   *
+   * A purge is irreversible - the restore list excludes purged fields - so the
+   * per-cell codes, the category inventory and the centroids are dead weight
+   * the moment it happens. They are released here rather than left for the
+   * garbage collector to never collect, because the template stays in the map
+   * so its id stays taken.
+   *
+   * The entry is kept, not deleted, so a later field cannot silently reuse the
+   * id a session bundle may still name.
+   *
+   * @param {string} id
+   * @returns {boolean} `true` once the field is purged.
+   */
+  purgeField(id) {
+    requireNonEmptyTrimmedString(id, 'User-defined field id');
+    const field = this._fields.get(id);
+    if (!field) {
+      throw new Error(`User-defined field "${id}" does not exist`);
+    }
+    if (field._isDeleted !== true) {
+      throw new Error('Only a soft-deleted user-defined field can be purged');
+    }
+    if (field._isPurged === true) return true;
+
+    field._isPurged = true;
+    field.codes = null;
+    field.values = null;
+    field.categories = [];
+    field.centroidsByDim = {};
+    field.loaded = false;
+    field._normalizedDims = new Set();
+    field._sourcePages = [];
+    field._intersectionLabels = null;
+    return true;
+  }
+
   updateField(id, updates) {
     requireNonEmptyTrimmedString(id, 'User-defined field id');
     const field = this._fields.get(id);
@@ -696,21 +764,32 @@ export class UserDefinedFieldsRegistry extends BaseRegistry {
     const nextCodes = Object.hasOwn(updates, 'codes') ? updates.codes : field.codes;
     if (field.kind === FieldKind.CATEGORY) {
       requireCategoryInventory(nextCategories, `User-defined field "${id}"`);
-      const expectedLength = (
-        field.codes instanceof Uint8Array
-        || field.codes instanceof Uint16Array
-      )
-        ? field.codes.length
-        : field._codesLengthHint;
-      if (!Number.isSafeInteger(expectedLength) || expectedLength < 1) {
-        throw new TypeError(`User-defined field "${id}" requires an exact code length`);
+      // Every code is already known to name a category in this inventory; that
+      // is this registry's invariant, established at creation and re-checked on
+      // every update that moves either operand. A rename moves neither -- it
+      // swaps a label for a label of the same inventory size against the same
+      // array -- so re-reading every code cannot change the verdict, and at
+      // dataset scale that read is the entire cost of the edit. It also used to
+      // reject a rename outright while a restored field waited for its lazy
+      // codes chunk, because an unloaded field has no codes to walk.
+      const inventoryResized = nextCategories.length !== field.categories.length;
+      if (nextCodes !== field.codes || inventoryResized) {
+        const expectedLength = (
+          field.codes instanceof Uint8Array
+          || field.codes instanceof Uint16Array
+        )
+          ? field.codes.length
+          : field._codesLengthHint;
+        if (!Number.isSafeInteger(expectedLength) || expectedLength < 1) {
+          throw new TypeError(`User-defined field "${id}" requires an exact code length`);
+        }
+        requireCategoryCodes(
+          nextCodes,
+          nextCategories,
+          expectedLength,
+          `User-defined field "${id}"`
+        );
       }
-      requireCategoryCodes(
-        nextCodes,
-        nextCategories,
-        expectedLength,
-        `User-defined field "${id}"`
-      );
     } else if (
       Object.hasOwn(updates, 'categories')
       || Object.hasOwn(updates, 'codes')
@@ -809,6 +888,26 @@ export class UserDefinedFieldsRegistry extends BaseRegistry {
       requireNullableRecord(field._operation, `User-defined field "${id}" operation metadata`);
       if (!Number.isFinite(field._createdAt)) {
         throw new TypeError(`User-defined field "${id}" requires a finite creation time`);
+      }
+
+      if (field._isPurged) {
+        // A purge is irreversible, so nothing here can ever be shown or
+        // restored again. Only the identity survives, and only so the id
+        // stays taken. Describing the released arrays would be describing
+        // data that no longer exists, and writing them would add megabytes
+        // to every bundle for a column the user permanently discarded.
+        result.push({
+          id,
+          source,
+          kind,
+          key: field.key,
+          isDeleted: true,
+          isPurged: true,
+          sourceField: field._sourceField,
+          operation: field._operation,
+          createdAt: field._createdAt
+        });
+        continue;
       }
 
       if (kind === FieldKind.CONTINUOUS) {
@@ -935,6 +1034,38 @@ export class UserDefinedFieldsRegistry extends BaseRegistry {
       requireNullableRecord(item.operation, `User-defined session item ${itemIndex} operation metadata`);
       if (!Number.isFinite(item.createdAt)) {
         throw new TypeError(`User-defined session item ${itemIndex} requires a finite creation time`);
+      }
+
+      if (item.isPurged) {
+        // The tombstone written by `toSessionMeta`. It carries no codes and
+        // no categories because the purge released them, so restoring it can
+        // only re-establish that the id is taken.
+        restored.set(item.id, {
+          key: item.key,
+          kind,
+          values: null,
+          codes: null,
+          categories: [],
+          centroidsByDim: {},
+          loaded: false,
+          _loadingPromise: null,
+
+          _isUserDefined: true,
+          _isDeleted: true,
+          _isPurged: true,
+          _userDefinedId: item.id,
+          _fieldSource: source,
+          _normalizedDims: new Set(),
+          _sourceField: item.sourceField,
+          _operation: item.operation,
+          _sourcePages: [],
+          _overlapStrategy: OverlapStrategy.FIRST,
+          _overlapLabel: null,
+          _intersectionLabels: null,
+          _uncoveredLabel: null,
+          _createdAt: item.createdAt
+        });
+        continue;
       }
 
       if (kind === FieldKind.CONTINUOUS) {

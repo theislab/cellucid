@@ -1,8 +1,9 @@
 import { expect, test } from '@playwright/test';
+import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 
 const PREPARED_DATASET_URL =
-  '/?exportsBaseUrl=http%3A%2F%2F127.0.0.1%3A4173%2Ftests%2Fbrowser%2Ffixtures%2Fexports%2F'
+  `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}`
   + '&dataset=current-ui-prepared&acceptance=highlight-selection-feedback-ci';
 
 const MODE_DESCRIPTION = '#highlight-mode-description';

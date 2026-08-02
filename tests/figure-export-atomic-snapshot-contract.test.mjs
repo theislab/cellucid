@@ -40,6 +40,7 @@ function cameraState() {
 
 function renderState() {
   return {
+    antialias: true,
     bgColor: Float32Array.from([1, 1, 1]),
     cameraDistance: 3,
     cameraPosition: [0, 0, 3],
@@ -318,6 +319,9 @@ test('reentrant abort in one grid snapshot fences every later borrowed owner', a
   const viewer = {
     getCentroidFlags() {
       return { labels: false, points: false };
+    },
+    getGrantedAntialiasing() {
+      return true;
     },
     getLiveViewLabel() {
       return 'Live';

@@ -20,7 +20,11 @@
  */
 export function mean(arr) {
   if (!arr || arr.length === 0) return NaN;
-  return arr.reduce((a, b) => a + b, 0) / arr.length;
+  // Left-to-right accumulation from 0, i.e. exactly what `reduce` performed,
+  // written as an index loop so a TypedArray is not walked through a callback.
+  let sum = 0;
+  for (let i = 0; i < arr.length; i++) sum += arr[i];
+  return sum / arr.length;
 }
 
 /**
@@ -33,7 +37,8 @@ export function mean(arr) {
 export function variance(arr, ddof = 0) {
   if (!arr || arr.length <= ddof) return NaN;
   const m = mean(arr);
-  const sumSq = arr.reduce((a, b) => a + (b - m) ** 2, 0);
+  let sumSq = 0;
+  for (let i = 0; i < arr.length; i++) sumSq += (arr[i] - m) ** 2;
   return sumSq / (arr.length - ddof);
 }
 
@@ -46,6 +51,33 @@ export function variance(arr, ddof = 0) {
  */
 export function std(arr, ddof = 0) {
   return Math.sqrt(variance(arr, ddof));
+}
+
+/**
+ * Sample mean and sample variance (ddof = 1) from one pass pair.
+ *
+ * Two passes in the same left-to-right order `mean()` and `variance(arr, 1)`
+ * use, so the moments are bit identical to calling those two functions — but
+ * the mean is accumulated once instead of twice. Callers that need both moments
+ * (Welch's t-test and its display wrapper) go through here so that a two-group
+ * comparison walks each group exactly twice rather than four times.
+ *
+ * @param {ArrayLike<number>} values
+ * @returns {{mean: number, variance: number, n: number}} `NaN` moments when
+ *   fewer than two values are present.
+ */
+export function sampleMoments(values) {
+  const n = values.length;
+  if (n < 2) return { mean: n === 1 ? values[0] : NaN, variance: NaN, n };
+
+  let sum = 0;
+  for (let i = 0; i < n; i++) sum += values[i];
+  const m = sum / n;
+
+  let sumSq = 0;
+  for (let i = 0; i < n; i++) sumSq += (values[i] - m) ** 2;
+
+  return { mean: m, variance: sumSq / (n - 1), n };
 }
 
 // ============================================================================
@@ -403,16 +435,156 @@ export function computeSpearmanR(pairs) {
 }
 
 /**
+ * Copy an array-like of numbers into a Float64Array sorted ascending.
+ *
+ * `%TypedArray%.prototype.sort` without a comparator is the engine's native
+ * numeric sort: no JavaScript callback runs per comparison, which is what makes
+ * the rank kernels below an order of magnitude cheaper than an index sort
+ * driven by a JS comparator. Every caller in this module filters to finite
+ * values first, so the total order the native sort applies to NaN and to
+ * signed zero is never reached with a distinguishable input.
+ *
+ * @param {ArrayLike<number>} values
+ * @returns {Float64Array}
+ */
+function sortedFloat64Copy(values) {
+  const n = values.length;
+  const copy = new Float64Array(n);
+  for (let i = 0; i < n; i++) copy[i] = values[i];
+  copy.sort();
+  return copy;
+}
+
+/**
+ * Largest number of distinct values a rank kernel will tabulate before it
+ * switches to sorting. Prepared exports quantize expression to 8 bits, so a
+ * gene carries at most 256 distinct values across half a million cells and the
+ * tabulated form is exact and far cheaper than any sort. `data-worker.js` bounds
+ * its own per-value marker tabulation with the same constant.
+ */
+const MAX_TABULATED_DISTINCT_VALUES = 4096;
+
+/**
+ * Average rank per distinct value, or `null` when the input carries more
+ * distinct values than the tabulation bound.
+ *
+ * A value occupying 1-based ranks `r+1 … r+count` has average rank
+ * `r + (count + 1) / 2`. Rank blocks are integers or exact halves and stay far
+ * below 2^53 for any dataset that fits in memory, so this closed form is not an
+ * approximation of averaging the individual ranks — it is the same number.
+ *
+ * @param {ArrayLike<number>} values
+ * @returns {Map<number, number>|null}
+ */
+function tabulateAverageRanks(values) {
+  const counts = tabulateValueCounts(values);
+  if (counts === null) return null;
+
+  const distinct = Float64Array.from(counts.keys());
+  distinct.sort();
+
+  const averageRanks = new Map();
+  let ranked = 0;
+  for (let i = 0; i < distinct.length; i++) {
+    const value = distinct[i];
+    const count = counts.get(value);
+    averageRanks.set(value, ranked + (count + 1) / 2);
+    ranked += count;
+  }
+  return averageRanks;
+}
+
+/**
+ * Values at given positions of the ascending order of `values`.
+ *
+ * This is what an order statistic — a minimum, a median, a quartile — actually
+ * needs: a handful of positions, not a fully materialized sorted array. Every
+ * copy of a value is the same number, so reading position `p` from a counted
+ * tabulation and reading it from a sorted copy give the same result.
+ *
+ * `values` must already be free of non-finite entries; every caller filters
+ * first. `positions` must be within `[0, values.length)`.
+ *
+ * @param {ArrayLike<number>} values
+ * @param {ArrayLike<number>} positions - 0-based positions in ascending order
+ * @returns {number[]} One value per requested position, in the requested order
+ */
+export function selectSorted(values, positions) {
+  const requested = positions.length;
+  const selected = new Array(requested);
+  if (requested === 0) return selected;
+
+  const counts = tabulateValueCounts(values);
+  if (counts === null) {
+    const sorted = sortedFloat64Copy(values);
+    for (let i = 0; i < requested; i++) selected[i] = sorted[positions[i]];
+    return selected;
+  }
+
+  const distinct = Float64Array.from(counts.keys());
+  distinct.sort();
+  const cumulative = new Float64Array(distinct.length);
+  let running = 0;
+  for (let i = 0; i < distinct.length; i++) {
+    running += counts.get(distinct[i]);
+    cumulative[i] = running;
+  }
+
+  for (let i = 0; i < requested; i++) {
+    const position = positions[i];
+    // First distinct value whose cumulative count passes this position.
+    let low = 0;
+    let high = distinct.length - 1;
+    while (low < high) {
+      const mid = (low + high) >>> 1;
+      if (cumulative[mid] <= position) low = mid + 1;
+      else high = mid;
+    }
+    selected[i] = distinct[low];
+  }
+  return selected;
+}
+
+/**
+ * Count occurrences per distinct value, or `null` past the tabulation bound.
+ * @param {ArrayLike<number>} values
+ * @returns {Map<number, number>|null}
+ */
+function tabulateValueCounts(values) {
+  const counts = new Map();
+  for (let i = 0; i < values.length; i++) {
+    const value = values[i];
+    const count = counts.get(value);
+    if (count === undefined) {
+      if (counts.size >= MAX_TABULATED_DISTINCT_VALUES) return null;
+      counts.set(value, 1);
+    } else {
+      counts.set(value, count + 1);
+    }
+  }
+  return counts;
+}
+
+/**
  * Compute ranks with proper handling of ties (average rank method).
  *
- * @param {number[]} values - Array of values to rank
+ * @param {ArrayLike<number>} values - Array of values to rank
  * @returns {number[]} Array of ranks (1-based, fractional for ties)
  */
 export function computeRanks(values) {
   const n = values.length;
   if (n === 0) return [];
 
-  // Sort an index array so we don't allocate per-element objects.
+  const averageRanks = tabulateAverageRanks(values);
+  if (averageRanks !== null) {
+    const ranks = new Array(n);
+    for (let i = 0; i < n; i++) ranks[i] = averageRanks.get(values[i]);
+    return ranks;
+  }
+
+  // More distinct values than the tabulation bound: rank through an index
+  // permutation instead. Sort an index array so we don't allocate per-element
+  // objects.
   const order = new Array(n);
   for (let i = 0; i < n; i++) order[i] = i;
 
@@ -569,6 +741,116 @@ export function mannWhitneyPValue(n1, n2, statistic, options = {}) {
 }
 
 /**
+ * @typedef {{count: number, countA: Float64Array, countB: Float64Array}} TieBlocks
+ *   Per-tie-block membership counts in ascending value order. `countA[i]` and
+ *   `countB[i]` are how many values of each sample fall in block `i`.
+ */
+
+/**
+ * Tie blocks by counting distinct values, or `null` when the pooled sample
+ * carries more distinct values than the tabulation bound.
+ *
+ * Counting abandons as soon as the bound is crossed, so the wasted work on a
+ * high-cardinality input is bounded by the bound itself and not by the sample
+ * size.
+ *
+ * @param {ArrayLike<number>} group1
+ * @param {ArrayLike<number>} group2
+ * @returns {TieBlocks|null}
+ */
+function tabulateTwoSampleBlocks(group1, group2) {
+  const slotByValue = new Map();
+  const countA = [];
+  const countB = [];
+
+  for (let i = 0; i < group1.length; i++) {
+    const value = group1[i];
+    const slot = slotByValue.get(value);
+    if (slot === undefined) {
+      if (slotByValue.size >= MAX_TABULATED_DISTINCT_VALUES) return null;
+      slotByValue.set(value, countA.length);
+      countA.push(1);
+      countB.push(0);
+    } else {
+      countA[slot] += 1;
+    }
+  }
+  for (let i = 0; i < group2.length; i++) {
+    const value = group2[i];
+    const slot = slotByValue.get(value);
+    if (slot === undefined) {
+      if (slotByValue.size >= MAX_TABULATED_DISTINCT_VALUES) return null;
+      slotByValue.set(value, countA.length);
+      countA.push(0);
+      countB.push(1);
+    } else {
+      countB[slot] += 1;
+    }
+  }
+
+  const distinct = Float64Array.from(slotByValue.keys());
+  distinct.sort();
+
+  const count = distinct.length;
+  const orderedA = new Float64Array(count);
+  const orderedB = new Float64Array(count);
+  for (let block = 0; block < count; block++) {
+    const slot = slotByValue.get(distinct[block]);
+    orderedA[block] = countA[slot];
+    orderedB[block] = countB[slot];
+  }
+  return { count, countA: orderedA, countB: orderedB };
+}
+
+/**
+ * Tie blocks by sorting each sample natively and merging them.
+ *
+ * Used when the pooled sample has too many distinct values to tabulate. The
+ * native `%TypedArray%.prototype.sort` runs no JavaScript callback per
+ * comparison, which is what makes this cheaper than index-sorting the
+ * concatenation through a comparator.
+ *
+ * @param {ArrayLike<number>} group1
+ * @param {ArrayLike<number>} group2
+ * @returns {TieBlocks}
+ */
+function mergeTwoSampleBlocks(group1, group2) {
+  const n1 = group1.length;
+  const n2 = group2.length;
+  const sortedA = sortedFloat64Copy(group1);
+  const sortedB = sortedFloat64Copy(group2);
+
+  const countA = new Float64Array(n1 + n2);
+  const countB = new Float64Array(n1 + n2);
+  let count = 0;
+  let indexA = 0;
+  let indexB = 0;
+
+  while (indexA < n1 || indexB < n2) {
+    const value = indexA < n1 && (indexB >= n2 || sortedA[indexA] <= sortedB[indexB])
+      ? sortedA[indexA]
+      : sortedB[indexB];
+
+    let blockA = 0;
+    while (indexA < n1 && sortedA[indexA] === value) {
+      blockA++;
+      indexA++;
+    }
+    let blockB = 0;
+    while (indexB < n2 && sortedB[indexB] === value) {
+      blockB++;
+      indexB++;
+    }
+
+    countA[count] = blockA;
+    countB[count] = blockB;
+    count++;
+  }
+
+  return { count, countA, countB };
+}
+
+/**
  * Mann-Whitney U test (Wilcoxon rank-sum test).
  * Non-parametric test for comparing two independent samples.
  *
@@ -590,35 +872,29 @@ export function mannWhitneyU(group1, group2) {
     };
   }
 
-  // Combine and rank (TypedArray-safe; avoids `.map()` which behaves differently on TypedArrays).
-  // Sort an index array so we don't allocate per-element objects.
-  const n = n1 + n2;
-  const order = new Uint32Array(n);
-  for (let i = 0; i < n; i++) order[i] = i;
+  // Rank-sum for group 1 with tie handling, walked one tie block at a time.
+  //
+  // A tie block is every copy of one value across both samples — exactly the
+  // block the previous index sort produced — so the ranks, the rank sum and the
+  // tie term are the same numbers. `countA * avgRank` replaces `countA` repeated
+  // additions of `avgRank`; both are exact in IEEE-754 doubles because rank
+  // blocks are integers or exact halves and the products and sums stay far below
+  // 2^53 for any dataset that fits in memory.
+  const blocks = tabulateTwoSampleBlocks(group1, group2)
+    ?? mergeTwoSampleBlocks(group1, group2);
 
-  const valueAt = (idx) => (idx < n1 ? group1[idx] : group2[idx - n1]);
-
-  order.sort((a, b) => valueAt(a) - valueAt(b));
-
-  // Rank-sum for group 1 with tie handling (no separate ranks[] allocation).
   let R1 = 0;
   let tieTerm = 0;
-  let i = 0;
-  while (i < n) {
-    let j = i + 1;
-    const v = valueAt(order[i]);
-    while (j < n && valueAt(order[j]) === v) j++;
-
-    const tieCount = j - i;
+  let ranked = 0;
+  for (let block = 0; block < blocks.count; block++) {
+    const countA = blocks.countA[block];
+    const tieCount = countA + blocks.countB[block];
     if (tieCount > 1) {
       tieTerm += tieCount ** 3 - tieCount;
     }
-
-    const avgRank = (i + j + 1) / 2; // ranks are 1-based
-    for (let k = i; k < j; k++) {
-      if (order[k] < n1) R1 += avgRank;
-    }
-    i = j;
+    // Ranks are 1-based: this block occupies ranks `ranked+1 … ranked+tieCount`.
+    R1 += countA * (ranked + (tieCount + 1) / 2);
+    ranked += tieCount;
   }
 
   const U1 = R1 - (n1 * (n1 + 1)) / 2;
@@ -701,18 +977,17 @@ export function welchTTest(group1, group2) {
     return { statistic: NaN, pValue: NaN, df: NaN };
   }
 
-  const mean1 = group1.reduce((sum, value) => sum + value, 0) / n1;
-  const mean2 = group2.reduce((sum, value) => sum + value, 0) / n2;
-  const variance1 = group1.reduce(
-    (sum, value) => sum + (value - mean1) ** 2,
-    0
-  ) / (n1 - 1);
-  const variance2 = group2.reduce(
-    (sum, value) => sum + (value - mean2) ** 2,
-    0
-  ) / (n2 - 1);
+  const momentsA = sampleMoments(group1);
+  const momentsB = sampleMoments(group2);
 
-  return welchTTestFromMoments(mean1, variance1, n1, mean2, variance2, n2);
+  return welchTTestFromMoments(
+    momentsA.mean,
+    momentsA.variance,
+    n1,
+    momentsB.mean,
+    momentsB.variance,
+    n2
+  );
 }
 
 // ============================================================================
@@ -935,6 +1210,7 @@ export default {
   mean,
   variance,
   std,
+  sampleMoments,
 
   // Distribution functions
   normalCDF,
@@ -953,6 +1229,7 @@ export default {
   computePearsonR,
   computeSpearmanR,
   computeRanks,
+  selectSorted,
   linearRegression,
 
   // Statistical tests

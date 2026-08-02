@@ -64,11 +64,16 @@ test('opening the benchmark panel publishes the harness module', () => {
   // The Performance Benchmark panel is what triggers the lazy load, so the
   // entry point is only reachable while that panel exists.
   assert.match(indexHtml, /\bid="benchmark-section"/);
-  const panelToggle = functionBody(
+  const panelSynchronization = functionBody(
     mainSource,
-    "benchmarkSection.addEventListener('toggle'"
+    'const synchronizeBenchmarkPanelWithSection = async ()'
   );
-  assert.ok(panelToggle.includes('await ensureBenchmarkModule()'));
+  assert.ok(panelSynchronization.includes('await ensureBenchmarkModule()'));
+  assert.match(
+    mainSource,
+    /benchmarkSection\.addEventListener\(\s*'toggle',\s*ownBenchmarkPanelSynchronization\s*\)/,
+    'the panel toggle must route through the synchronization owner'
+  );
 });
 
 test('the published module is the one the harness is created from', () => {

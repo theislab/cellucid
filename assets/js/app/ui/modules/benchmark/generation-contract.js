@@ -4,6 +4,13 @@
  * Shared by the benchmark harness and its generation worker so neither side
  * can invent a field the other does not publish.
  *
+ * It also owns the point-count bounds, because the control and the validators
+ * used to state three different rules: `#benchmark-count` advertised
+ * 1,000–50,000,000, `assertSyntheticCount` accepted one point and no ceiling,
+ * and `dev/benchmark.js` accepted the same but only checked it on the GLB
+ * path. `dev/benchmark.js` now imports the bounds, `index.html` declares them,
+ * and `benchmark-generation-contract.test.mjs` fails when the markup drifts.
+ *
  * @module app/ui/modules/benchmark/generation-contract
  */
 
@@ -21,6 +28,33 @@ export const SYNTHETIC_PATTERNS = Object.freeze([
 
 /** Patterns whose source data is fetched rather than computed. */
 export const FETCHED_PATTERNS = Object.freeze(['glb']);
+
+/**
+ * Smallest synthetic dataset the benchmark builds.
+ *
+ * One point is a complete dataset: the renderer publishes it and the
+ * determinism tests generate a few dozen. Anything above one would reject
+ * counts the rest of the system accepts.
+ */
+export const MIN_SYNTHETIC_COUNT = 1;
+
+/**
+ * Largest synthetic dataset the benchmark builds.
+ *
+ * This is the point-count control's own advertised ceiling, made binding.
+ * Above it the two source arrays alone reach 800 MB — 600 MB of Float32 XYZ
+ * and 200 MB of Uint8 RGBA — before the state's per-point arrays or any GPU
+ * copy, so a larger request does not produce a slow benchmark, it produces a
+ * failed allocation.
+ *
+ * It is a declared product limit, not the hardware's. The device's true
+ * ceiling is `MAX_TEXTURE_SIZE²` for the renderer's alpha texture, which
+ * varies by engine and is reported by the renderer when publication exceeds
+ * it. Raising this constant is therefore a deliberate act, and raising it here
+ * raises it everywhere: the control, both validators and the worker boundary
+ * all read this one value.
+ */
+export const MAX_SYNTHETIC_COUNT = 50_000_000;
 
 /**
  * @param {unknown} pattern - Candidate pattern name.
@@ -41,9 +75,15 @@ export function assertSyntheticPattern(pattern) {
  * @returns {number} The exact point count.
  */
 export function assertSyntheticCount(count) {
-  if (!Number.isSafeInteger(count) || count < 1) {
+  if (
+    !Number.isSafeInteger(count) ||
+    count < MIN_SYNTHETIC_COUNT ||
+    count > MAX_SYNTHETIC_COUNT
+  ) {
     throw new TypeError(
-      'Synthetic point count must be one positive safe integer.'
+      `Synthetic point count must be one integer between ` +
+      `${MIN_SYNTHETIC_COUNT} and ${MAX_SYNTHETIC_COUNT}; ` +
+      `received ${String(count)}.`
     );
   }
   return count;

@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <!-- The Plotly loader injects `assets/external/plotly.min.js` as a
+         document-relative path, the way it resolves when the application is
+         served from the site root. This harness lives deeper in the tree, so it
+         states the same base rather than being served a different library. -->
+    <base href="/">
+    <title>Cellucid analysis plot layout harness</title>
+    <link rel="stylesheet" href="/assets/css/main.css">
+    <style>
+      body { margin: 0; }
+      #plot-host { position: absolute; top: 0; left: 0; overflow: hidden; }
+    </style>
+  </head>
+  <body>
+    <div id="plot-host"></div>
+  </body>
+</html>

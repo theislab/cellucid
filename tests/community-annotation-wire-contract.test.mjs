@@ -1578,10 +1578,132 @@ test('GitHub identities reject strings, fractions, and malformed persisted state
   const previousSessionStorage = globalThis.sessionStorage;
   globalThis.sessionStorage = storage;
   try {
-    assert.throws(() => new GitHubAuthSession(), /duplicate JSON object key "id"/);
+    // A malformed persisted session is never adopted as an identity, and it is
+    // discarded rather than left to fail every later construction.
+    const session = new GitHubAuthSession();
+    assert.equal(session.isAuthenticated(), false);
+    assert.equal(session.getToken(), null);
+    assert.equal(session.getUser(), null);
+    assert.equal(values.has('cellucid:github-app-auth:session'), false);
   } finally {
     if (previousSessionStorage === undefined) delete globalThis.sessionStorage;
     else globalThis.sessionStorage = previousSessionStorage;
+  }
+});
+
+test('unreadable persisted auth state degrades to signed out instead of failing construction', () => {
+  const previousSessionStorage = globalThis.sessionStorage;
+  const poisoned = [
+    ['truncated JSON', '{"token":"t","user":{"id":42,"log'],
+    ['empty document', ''],
+    ['JSON null', 'null'],
+    ['JSON array', '[]'],
+    ['unknown session key', '{"token":"t","user":{"id":42,"login":"r"},"extra":1}'],
+    ['non-positive user id', '{"token":"t","user":{"id":0,"login":"r"}}'],
+    ['blank token', '{"token":"","user":{"id":42,"login":"r"}}'],
+    ['unknown user key', '{"token":"t","user":{"id":42,"login":"r","legacy":true}}'],
+  ];
+  try {
+    for (const [label, raw] of poisoned) {
+      const values = new Map([['cellucid:github-app-auth:session', raw]]);
+      globalThis.sessionStorage = {
+        getItem: (key) => values.has(key) ? values.get(key) : null,
+        setItem: (key, value) => values.set(String(key), String(value)),
+        removeItem: (key) => values.delete(String(key)),
+      };
+      const session = new GitHubAuthSession();
+      assert.equal(session.isAuthenticated(), false, label);
+      assert.equal(session.getToken(), null, label);
+      assert.equal(
+        values.has('cellucid:github-app-auth:session'),
+        false,
+        `${label}: the poisoned entry must be discarded so a reload recovers`
+      );
+      // A second construction over the same storage still succeeds: the
+      // failure is not sticky.
+      assert.equal(new GitHubAuthSession().isAuthenticated(), false, label);
+    }
+
+    // Storage that refuses every operation must not prevent the app from
+    // starting; the feature simply has no persisted session.
+    globalThis.sessionStorage = {
+      getItem() { throw new DOMException('denied', 'SecurityError'); },
+      setItem() { throw new DOMException('denied', 'SecurityError'); },
+      removeItem() { throw new DOMException('denied', 'SecurityError'); },
+    };
+    const denied = new GitHubAuthSession();
+    assert.equal(denied.isAuthenticated(), false);
+    assert.equal(denied.getToken(), null);
+
+    // An absent sessionStorage binding is the same class of environment fault.
+    delete globalThis.sessionStorage;
+    const absent = new GitHubAuthSession();
+    assert.equal(absent.isAuthenticated(), false);
+  } finally {
+    if (previousSessionStorage === undefined) delete globalThis.sessionStorage;
+    else globalThis.sessionStorage = previousSessionStorage;
+  }
+});
+
+test('persisting a new GitHub session still fails loudly when storage refuses', async () => {
+  const previousSessionStorage = globalThis.sessionStorage;
+  const previousWindow = globalThis.window;
+  const previousFetch = globalThis.fetch;
+  try {
+    globalThis.sessionStorage = {
+      getItem: () => null,
+      setItem() { throw new DOMException('quota', 'QuotaExceededError'); },
+      removeItem() {},
+    };
+    globalThis.window = {
+      location: {
+        href: `https://example.test/#cellucid_github_auth=1&cellucid_github_token=${'t'.repeat(8)}`,
+        hash: `#cellucid_github_auth=1&cellucid_github_token=${'t'.repeat(8)}`,
+        origin: 'https://example.test',
+        pathname: '/',
+        search: '',
+        assign() {},
+      },
+      history: { state: null, replaceState() {} },
+    };
+    globalThis.fetch = async (url) => {
+      const target = String(url);
+      const body = target.endsWith('/auth/user')
+        ? { id: 42, login: 'researcher' }
+        : {
+          status: 'ok',
+          service: 'Cellucid GitHub Auth',
+          contractVersion: 1,
+          endpoints: [
+            '/auth/login',
+            '/auth/callback',
+            '/auth/user',
+            '/auth/installations',
+            '/auth/installation-repos',
+            '/cap/lookup-cells',
+            '/cap/search-datasets',
+            '/api/repos/*',
+          ],
+        };
+      return new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    };
+    const session = new GitHubAuthSession();
+    await assert.rejects(
+      () => session.completeSignInFromRedirect(),
+      /GITHUB_AUTH_STORAGE_FAILED|sessionStorage write failed/
+    );
+    // The unpersistable candidate is never published as an authenticated identity.
+    assert.equal(session.isAuthenticated(), false);
+  } finally {
+    if (previousSessionStorage === undefined) delete globalThis.sessionStorage;
+    else globalThis.sessionStorage = previousSessionStorage;
+    if (previousWindow === undefined) delete globalThis.window;
+    else globalThis.window = previousWindow;
+    if (previousFetch === undefined) delete globalThis.fetch;
+    else globalThis.fetch = previousFetch;
   }
 });
 

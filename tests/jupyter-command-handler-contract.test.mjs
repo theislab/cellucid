@@ -116,14 +116,20 @@ test('Jupyter highlight uses the current DataState highlight contract', () => {
 
   const page = state.getActivePage();
   assert.equal(page.color, '#123abc');
-  assert.deepEqual(page.highlightedGroups, [{
+  assert.equal(page.highlightedGroups.length, 1);
+  const [group] = page.highlightedGroups;
+  assert.ok(
+    group.cellIndices instanceof Uint32Array,
+    'a direct highlight owns its cells as a Uint32Array, not a copy of the caller array'
+  );
+  assert.deepEqual({ ...group, cellIndices: [...group.cellIndices] }, {
     id: 'highlight_1',
     type: 'annotation',
     label: 'Python selection (2 cells)',
     enabled: true,
     cellIndices: [1, 3],
     cellCount: 2,
-  }]);
+  });
   assert.deepEqual([...state.highlightArray], [0, 255, 0, 255, 0]);
 });
 

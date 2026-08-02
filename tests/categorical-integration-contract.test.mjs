@@ -570,7 +570,7 @@ test('mutable state owns a writable copy of immutable loader categories', () => 
     _fieldDataCache: new Map(),
     _renameRegistry: {
       clear() {},
-      getDisplayCategory(_source, _key, _index, label) {
+      getDisplayCategory(_source, _key, label) {
         return label;
       },
       getDisplayKey(_source, key) {
@@ -768,6 +768,8 @@ test('genes analysis preserves numeric zero and false category labels', async ()
 test('bulk analysis page values preserve numeric zero and false labels', async () => {
   const integration = await prepareFalsyCategoryIntegration();
   const {
+    categories,
+    loaded,
     manager,
     obsManifest,
     previous
@@ -782,12 +784,21 @@ test('bulk analysis page values preserve numeric zero and false labels', async (
         cellIndices: [0, 1, 2, 3, 4, 5]
       }]
     }];
+    // Analysis reads observation fields through `DataState.ensureFieldLoaded`,
+    // which is what registers it as an independent lease on a shared field.
+    // This stands in for that loader: it publishes the already-fetched codes
+    // onto the descriptor exactly as DataState does.
+    const fields = obsManifest.fields.map(field => ({ ...field }));
     const state = {
       pointCount: 6,
-      manifestUrl: 'zarr://categorical-contract/obs/manifest.json',
-      obsManifest,
-      obsData: {
-        fields: obsManifest.fields
+      obsData: { fields },
+      async ensureFieldLoaded(fieldIndex) {
+        const field = fields[fieldIndex];
+        field.kind = 'category';
+        field.categories = categories;
+        field.codes = loaded.codes;
+        field.colors = {};
+        field.loaded = true;
       },
       getHighlightPages: () => pages
     };

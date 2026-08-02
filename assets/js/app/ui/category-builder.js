@@ -17,6 +17,9 @@ import { StyleManager } from '../../utils/style-manager.js';
 import { getCategoryColor, rgbToCss } from '../../data/palettes.js';
 import { formatCellCount } from '../../data/data-source.js';
 import { Limits, OverlapStrategy } from '../utils/field-constants.js';
+import {
+  MAX_CATEGORICAL_CATEGORIES
+} from '../../data/categorical-storage-contract.js';
 import { renderCategoryBuilderDom } from './category-builder/dom.js';
 import { formatIntersectionLabel, renderIntersectionLabelInputs } from './category-builder/intersections.js';
 import {
@@ -26,6 +29,27 @@ import {
 } from './keyboard-move.js';
 
 const DROP_MIME = 'application/x-highlight-page';
+
+/**
+ * Every state event that can change what the preview describes.
+ *
+ * The preview is the only account a user gets of the column they are about to
+ * create: the per-category counts, whether any cell is claimed twice, whether
+ * any cell is claimed at all, and which overlap combinations exist. All four
+ * are read from the highlight pages' group membership.
+ *
+ * `page:changed` announces only the page inventory — created, renamed,
+ * recoloured, switched, deleted. Adding a lasso to a page, disabling a group,
+ * or clearing one announces `highlight:changed` instead. Listening to the first
+ * alone left the preview describing the selection as it stood before the user's
+ * most recent one, while the Create button stayed enabled and the column that
+ * appeared did not match the numbers on screen.
+ */
+export const PREVIEW_INVALIDATING_EVENTS = Object.freeze([
+  'page:changed',
+  'highlight:changed'
+]);
+
 const STRATEGIES = new Set([
   OverlapStrategy.FIRST,
   OverlapStrategy.LAST,
@@ -138,7 +162,7 @@ export class CategoryBuilder {
     this._state = state;
     this._container = containerEl;
     this._initialized = false;
-    this._unsubscribePageChanged = null;
+    this._unsubscribeStateEvents = [];
     this._lifecycle = null;
     this._droppedItemsLifecycle = null;
     this._intersectionInputsLifecycle = null;
@@ -203,7 +227,7 @@ export class CategoryBuilder {
     this._view = view;
     this._lifecycle = new view.AbortController();
     this._initialized = true;
-    let unsubscribe = null;
+    const unsubscribers = [];
     try {
       this._render();
       this._bind();
@@ -212,31 +236,30 @@ export class CategoryBuilder {
       // still available to add; nothing else pulls that list on startup.
       this._renderDroppedItems();
 
-      // Keep colors, names, and counts synchronized with page ownership.
-      unsubscribe = this._state.on('page:changed', () => {
-        this._assertInitialized();
-        this._syncDatasetAvailability();
-        this._reconcileDroppedPages();
-        this._previewKey = null;
-        this._renderDroppedItems();
-        this._updatePreview(true);
-        this._updateConfirmState();
-      });
-      if (typeof unsubscribe !== 'function') {
-        throw new TypeError(
-          'Category builder page subscription must return an unsubscribe function'
+      // Keep colors, names, counts, and the preview synchronized with both the
+      // page inventory and the cells those pages hold.
+      for (const eventName of PREVIEW_INVALIDATING_EVENTS) {
+        const unsubscribe = this._state.on(
+          eventName,
+          () => this._resyncFromState()
         );
+        if (typeof unsubscribe !== 'function') {
+          throw new TypeError(
+            `Category builder "${eventName}" subscription must return an `
+            + 'unsubscribe function'
+          );
+        }
+        unsubscribers.push(unsubscribe);
       }
-      this._unsubscribePageChanged = unsubscribe;
+      this._unsubscribeStateEvents = unsubscribers;
     } catch (error) {
       const setupError = requireError(
         error,
         'Category builder initialization'
       );
-      const cleanups = [];
-      if (typeof unsubscribe === 'function') {
-        cleanups.push(() => unsubscribe());
-      }
+      const cleanups = unsubscribers.map(
+        unsubscribe => () => unsubscribe()
+      );
       cleanups.push(
         () => this._abortRenderLifecycles(),
         () => this._lifecycle.abort(),
@@ -270,9 +293,25 @@ export class CategoryBuilder {
     }
   }
 
+  /**
+   * Re-read everything the builder shows from the current highlight state.
+   *
+   * Clearing `_previewKey` is the load-bearing line: the preview is cached on
+   * strategy plus page identity, neither of which moves when a page's cells do.
+   */
+  _resyncFromState() {
+    this._assertInitialized();
+    this._syncDatasetAvailability();
+    this._reconcileDroppedPages();
+    this._previewKey = null;
+    this._renderDroppedItems();
+    this._updatePreview(true);
+    this._updateConfirmState();
+  }
+
   _resetLifecycleState() {
     this._initialized = false;
-    this._unsubscribePageChanged = null;
+    this._unsubscribeStateEvents = [];
     this._lifecycle = null;
     this._droppedItemsLifecycle = null;
     this._intersectionInputsLifecycle = null;
@@ -1488,8 +1527,11 @@ export class CategoryBuilder {
     if (new Set(labels).size !== labels.length) {
       return 'Every category label must be unique';
     }
-    if (labels.length > Limits.MAX_CATEGORIES_PER_FIELD) {
-      return `A field supports at most ${Limits.MAX_CATEGORIES_PER_FIELD} categories`;
+    if (labels.length > MAX_CATEGORICAL_CATEGORIES) {
+      return (
+        'A field supports at most '
+        + `${MAX_CATEGORICAL_CATEGORIES.toLocaleString('en-US')} categories`
+      );
     }
     return null;
   }
@@ -1604,10 +1646,14 @@ export class CategoryBuilder {
 
   destroy() {
     if (!this._initialized) return;
-    const unsubscribe = this._unsubscribePageChanged;
-    if (typeof unsubscribe !== 'function') {
+    const unsubscribers = this._unsubscribeStateEvents;
+    if (
+      !Array.isArray(unsubscribers)
+      || unsubscribers.length !== PREVIEW_INVALIDATING_EVENTS.length
+      || unsubscribers.some(entry => typeof entry !== 'function')
+    ) {
       throw new Error(
-        'Category builder lost its page subscription before destruction'
+        'Category builder lost a state subscription before destruction'
       );
     }
     const lifecycle = this._lifecycle;
@@ -1628,7 +1674,7 @@ export class CategoryBuilder {
             intersectionInputsLifecycle.abort();
           }
         },
-        () => unsubscribe(),
+        ...unsubscribers.map(unsubscribe => () => unsubscribe()),
         () => this._container.replaceChildren()
       ],
       'Category builder cleanup failed'

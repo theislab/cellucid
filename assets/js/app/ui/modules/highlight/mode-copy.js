@@ -35,14 +35,21 @@ export const ANNOTATION_NEEDS_FIELD_COPY =
  * A gesture that changes nothing must not be recorded as a step — it would
  * inflate the step counter and cost an undo for an action that did nothing —
  * but it must not be silent either, or it reads as the tool being broken.
+ *
+ * `noCellUnderPointer` names zoom and nothing else. Hit testing is a ray-sample
+ * search at a fixed world-space radius (`PICK_SEARCH_RADIUS` in
+ * `rendering/picking.js`) over the cells the renderer currently admits, and it
+ * reads no size uniform, so Point size moves what is drawn and never what is
+ * hittable. Zoom does move it: a nearer camera selects a finer LOD level, and
+ * `findRaySamplePick` rejects every cell the active level has not admitted.
  */
 export const SELECTION_NOTICE = Object.freeze({
   noFieldValue:
     'That cell has no value on the active field, so there is nothing to select.',
   noCellUnderPointer:
     'That click did not land on a cell, so there is nothing to select. Zoom '
-    + 'in, or raise Point size under Visualization, to make cells easier to '
-    + 'hit.',
+    + 'in to make cells easier to hit: only the cells the viewer is currently '
+    + 'drawing can be clicked.',
   releasedOffView:
     'That gesture ended outside the view, so nothing was selected.',
   unchanged: 'That gesture did not change the selection.'

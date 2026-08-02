@@ -33,7 +33,7 @@ import {
  * @property {number|null} compression - Gzip compression level
  * @property {number|null} var_quantization - Gene expression quantization bits
  * @property {number|null} obs_continuous_quantization - Continuous obs quantization bits
- * @property {string} obs_categorical_dtype - Categorical dtype ('auto', 'uint8', 'uint16')
+ * @property {string} obs_categorical_dtype - Categorical dtype ('uint8' or 'uint16')
  */
 
 /**
@@ -242,6 +242,29 @@ export const MAX_PREPARED_BROWSER_BYTES = 512 * 1024 * 1024;
 export const MAX_METADATA_JSON_BYTES = 64 * 1024 * 1024;
 
 /**
+ * The exact error a byte ceiling refuses with.
+ *
+ * A ceiling fires on well-formed data that is merely too big, so the refusal
+ * has to be told apart from a malformed document. It carries a code for the
+ * same reason every other loader failure does: the UI names a cause from the
+ * code and never from the message text, so a refusal that published no code
+ * would be given somebody else's advice — "re-export it", which regenerates a
+ * byte-identical file, or "check your network", which worked.
+ *
+ * @param {string} message
+ * @param {Object} [details]
+ * @returns {DataSourceError}
+ */
+function payloadTooLargeError(message, details = {}) {
+  return new DataSourceError(
+    message,
+    DataSourceErrorCode.TOO_LARGE,
+    null,
+    details
+  );
+}
+
+/**
  * Validate a manifest-declared payload length against the browser ceiling.
  *
  * Runs before the request is issued, so an over-declared payload costs no
@@ -253,14 +276,17 @@ export const MAX_METADATA_JSON_BYTES = 64 * 1024 * 1024;
  */
 export function requirePayloadBudget(expectedBytes, label) {
   if (!Number.isSafeInteger(expectedBytes) || expectedBytes < 0) {
+    // Not a size refusal: nothing was measured against the ceiling, and the
+    // caller passed something that is not a length at all.
     throw new RangeError(
       `${label}: declared payload length must be a non-negative safe integer, ` +
       `received ${String(expectedBytes)}`
     );
   }
   if (expectedBytes > MAX_PREPARED_BROWSER_BYTES) {
-    throw new RangeError(
-      `${label}: declared payload of ${expectedBytes} bytes exceeds the 512 MiB browser limit`
+    throw payloadTooLargeError(
+      `${label}: declared payload of ${expectedBytes} bytes exceeds the 512 MiB browser limit`,
+      { label, declaredBytes: expectedBytes, maxBytes: MAX_PREPARED_BROWSER_BYTES }
     );
   }
   return expectedBytes;
@@ -353,9 +379,10 @@ export async function readBoundedBody(response, options) {
         await reader.cancel(
           `${label}: transfer exceeded its ${maxBytes}-byte ceiling`
         );
-        throw new RangeError(
+        throw payloadTooLargeError(
           `${label}: transfer of at least ${loadedBytes} bytes exceeds ` +
-          `its ${maxBytes}-byte ceiling`
+          `its ${maxBytes}-byte ceiling`,
+          { label, loadedBytes, maxBytes }
         );
       }
       chunks.push(chunk);
@@ -642,6 +669,10 @@ export const DataSourceErrorCode = {
   INVALID_FORMAT: 'INVALID_FORMAT',
   PERMISSION_DENIED: 'PERMISSION_DENIED',
   NETWORK_ERROR: 'NETWORK_ERROR',
+  // A well-formed payload that is simply bigger than a browser ceiling. Kept
+  // apart from INVALID_FORMAT because the two need opposite advice: one asks
+  // for a re-export, the other says the export is fine and the browser is not.
+  TOO_LARGE: 'TOO_LARGE',
   VALIDATION_ERROR: 'VALIDATION_ERROR',
   UNSUPPORTED: 'UNSUPPORTED'
 };
@@ -655,6 +686,7 @@ export const ERROR_MESSAGES = {
   [DataSourceErrorCode.INVALID_FORMAT]: 'Invalid dataset format. Missing required files.',
   [DataSourceErrorCode.PERMISSION_DENIED]: 'Cannot access directory. Please grant permission.',
   [DataSourceErrorCode.NETWORK_ERROR]: 'Failed to load dataset. Check your connection.',
+  [DataSourceErrorCode.TOO_LARGE]: 'Dataset is larger than Cellucid opens in a browser.',
   [DataSourceErrorCode.VALIDATION_ERROR]: 'Dataset validation failed.',
   [DataSourceErrorCode.UNSUPPORTED]: 'This operation is not supported.'
 };
@@ -1138,12 +1170,11 @@ function validateIdentityExportSettings(settings, sourceType) {
     }
   }
   if (
-    settings.obs_categorical_dtype !== 'auto' &&
     settings.obs_categorical_dtype !== 'uint8' &&
     settings.obs_categorical_dtype !== 'uint16'
   ) {
     throw invalidDatasetIdentity(
-      'export_settings.obs_categorical_dtype must be auto, uint8, or uint16',
+      'export_settings.obs_categorical_dtype must be uint8 or uint16',
       sourceType
     );
   }
@@ -1169,7 +1200,38 @@ function validateIdentitySource(source, sourceType) {
   }
 }
 
-function validateIdentityVectorFields(vectorFields, sourceType) {
+/**
+ * The sole `vector_fields` rule.
+ *
+ * `dataset_identity.json["vector_fields"]` is validated here and nowhere else,
+ * so the hosted-catalog reader, the local prepared-export reader, and the
+ * runtime VectorFieldManager cannot drift apart. Every rule below is stated by
+ * the output format specification:
+ *
+ * - `vector_fields` holds exactly `default_field` and `fields`, and `fields`
+ *   is a non-empty object;
+ * - a field entry holds exactly `label`, `basis`, `available_dimensions`,
+ *   `default_dimension`, and `files` — `files` is the only path map an export
+ *   may declare;
+ * - `available_dimensions` is strictly increasing over 1/2/3 and, when the
+ *   dataset's embedding dimensions are known, a subset of them: a vector field
+ *   cannot advertise a dimension the dataset has no points file for;
+ * - `files` holds exactly one path per advertised dimension;
+ * - `default_dimension` is the **largest** advertised dimension, not merely one
+ *   of them. This is where the vector rule is strictly tighter than
+ *   `embeddings.default_dimension`, which accepts any available dimension.
+ *
+ * @param {unknown} vectorFields
+ * @param {{availableDimensions?: number[]|null, sourceType?: string}} [options]
+ *   `availableDimensions` is the dataset's `embeddings.available_dimensions`,
+ *   or null for a caller that has no embeddings context.
+ * @returns {Object} the validated vector_fields object
+ */
+export function validateVectorFieldsMetadata(vectorFields, options = {}) {
+  const {
+    availableDimensions = null,
+    sourceType = undefined,
+  } = options;
   assertExactKeys(
     vectorFields,
     ['default_field', 'fields'],
@@ -1224,12 +1286,83 @@ function validateIdentityVectorFields(vectorFields, sourceType) {
     );
     requireNonEmptyString(field.label, `${label}.label`, sourceType);
     requireNonEmptyString(field.basis, `${label}.basis`, sourceType);
-    validateIdentityEmbeddings({
-      available_dimensions: field.available_dimensions,
-      default_dimension: field.default_dimension,
-      files: field.files,
-    }, sourceType);
+
+    const dimensions = field.available_dimensions;
+    if (!Array.isArray(dimensions) || dimensions.length === 0) {
+      throw invalidDatasetIdentity(
+        `${label}.available_dimensions must be a non-empty array`,
+        sourceType
+      );
+    }
+    const dimensionSet = new Set();
+    for (let index = 0; index < dimensions.length; index++) {
+      const dimension = dimensions[index];
+      if (
+        !Number.isSafeInteger(dimension) ||
+        dimension < 1 ||
+        dimension > 3 ||
+        dimensionSet.has(dimension) ||
+        (index > 0 && dimensions[index - 1] >= dimension)
+      ) {
+        throw invalidDatasetIdentity(
+          `${label}.available_dimensions must contain strictly increasing ` +
+          'unique 1D, 2D, or 3D integers',
+          sourceType,
+          { dimensions }
+        );
+      }
+      dimensionSet.add(dimension);
+    }
+    if (
+      Array.isArray(availableDimensions) &&
+      dimensions.some(dimension => !availableDimensions.includes(dimension))
+    ) {
+      throw invalidDatasetIdentity(
+        `${label}.available_dimensions must be a subset of ` +
+        'embeddings.available_dimensions',
+        sourceType,
+        { dimensions, availableDimensions }
+      );
+    }
+    if (field.default_dimension !== dimensions[dimensions.length - 1]) {
+      throw invalidDatasetIdentity(
+        `${label}.default_dimension must be the largest advertised dimension`,
+        sourceType,
+        {
+          default_dimension: field.default_dimension,
+          available_dimensions: dimensions,
+        }
+      );
+    }
+
+    const files = field.files;
+    if (!isPlainRecord(files)) {
+      throw invalidDatasetIdentity(
+        `${label}.files must be an object`,
+        sourceType
+      );
+    }
+    const expectedFileKeys = dimensions.map(dimension => `${dimension}d`);
+    const actualFileKeys = Object.keys(files);
+    if (
+      actualFileKeys.length !== expectedFileKeys.length ||
+      actualFileKeys.some(key => !expectedFileKeys.includes(key))
+    ) {
+      throw invalidDatasetIdentity(
+        `${label}.files must contain exactly one path per advertised dimension`,
+        sourceType,
+        { expected: expectedFileKeys, actual: actualFileKeys }
+      );
+    }
+    for (const key of expectedFileKeys) {
+      requireIdentityPayloadPath(
+        files[key],
+        `${label}.files.${key}`,
+        sourceType
+      );
+    }
   }
+  return vectorFields;
 }
 
 function validateIdentityObsFields(obsFields, stats, sourceType) {
@@ -1430,7 +1563,10 @@ export function validateDatasetIdentity(
     validateIdentitySource(identity.source, sourceType);
   }
   if (Object.hasOwn(identity, 'vector_fields')) {
-    validateIdentityVectorFields(identity.vector_fields, sourceType);
+    validateVectorFieldsMetadata(identity.vector_fields, {
+      availableDimensions: identity.embeddings.available_dimensions,
+      sourceType,
+    });
   }
   return identity;
 }

@@ -1,4 +1,5 @@
 import { expect, test } from '@playwright/test';
+import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 
 test('GLB benchmark publishes one complete state generation', async ({
@@ -41,7 +42,7 @@ test('GLB benchmark publishes one complete state generation', async ({
   });
 
   await page.goto(
-    '/?exportsBaseUrl=http%3A%2F%2F127.0.0.1%3A4173%2Ftests%2Fbrowser%2Ffixtures%2Fexports%2F&dataset=current-ui-prepared&acceptance=benchmark-runtime-ci',
+    `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=benchmark-runtime-ci`,
     { waitUntil: 'domcontentloaded' }
   );
   await dismissWelcome(page);

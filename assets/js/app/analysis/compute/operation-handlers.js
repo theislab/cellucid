@@ -18,6 +18,7 @@ import {
   mean,
   tTwoSidedPValue,
   computeRanks,
+  selectSorted,
   mannWhitneyU,
   welchTTest,
   equalWidthBreaks,
@@ -333,13 +334,22 @@ export function computeStats(payload) {
     };
   }
 
-  // Sort for percentile calculations
-  const sorted = [...numericValues].sort((a, b) => a - b);
-  const n = sorted.length;
+  const n = numericValues.length;
 
-  // Basic stats
-  const min = sorted[0];
-  const max = sorted[n - 1];
+  // Only six positions of the ascending order are ever read, so only those six
+  // are resolved — `selectSorted` counts distinct values when there are few of
+  // them (the shape of quantized expression data) and sorts otherwise. No fully
+  // materialized sorted array, and no JavaScript comparator call per comparison.
+  const medianIdx = Math.floor(n * 0.5);
+  const [min, q1, lowerMedian, median1, q3, max] = selectSorted(numericValues, [
+    0,
+    Math.floor(n * 0.25),
+    medianIdx > 0 ? medianIdx - 1 : 0,
+    medianIdx,
+    Math.floor(n * 0.75),
+    n - 1
+  ]);
+
   const sum = numericValues.reduce((a, b) => a + b, 0);
   const mean = sum / n;
 
@@ -348,16 +358,9 @@ export function computeStats(payload) {
   const variance = squaredDiffs.reduce((a, b) => a + b, 0) / n;
   const std = Math.sqrt(variance);
 
-  // Percentiles
-  const q1Idx = Math.floor(n * 0.25);
-  const medianIdx = Math.floor(n * 0.5);
-  const q3Idx = Math.floor(n * 0.75);
-
-  const q1 = sorted[q1Idx];
   const median = n % 2 === 0
-    ? (sorted[medianIdx - 1] + sorted[medianIdx]) / 2
-    : sorted[medianIdx];
-  const q3 = sorted[q3Idx];
+    ? (lowerMedian + median1) / 2
+    : median1;
   const iqr = q3 - q1;
 
   return {

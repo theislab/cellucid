@@ -4,8 +4,8 @@ import test from 'node:test';
 
 import {
   HighPerfRenderer,
-  SpatialIndex,
 } from '../assets/js/rendering/high-perf-renderer.js';
+import { SpatialIndex } from '../assets/js/rendering/high-perf/spatial-index.js';
 
 const DIMENSION = 2;
 const FULL_POINT_COUNT = 41;
@@ -183,22 +183,47 @@ function createTrackingGl() {
         ? boundArrayBuffer
         : boundElementBuffer;
       if (!fail.stickyAfterUpload && buffer !== null) {
-        contents.buffers.set(buffer, cloneUpload(data));
+        // A numeric argument sizes a zero-filled store, exactly as WebGL does.
+        contents.buffers.set(
+          buffer,
+          typeof data === 'number'
+            ? new ArrayBuffer(data)
+            : cloneUpload(data),
+        );
       }
     },
-    bufferSubData(target, _offset, data) {
+    bufferSubData(target, offset, data, srcOffset = 0, length) {
       if (fail.throwBufferTarget === target) {
         throw new Error(
           `synthetic ${target === this.ARRAY_BUFFER ? 'array' : 'element'} upload failure`,
         );
       }
-      recordUpload('bufferSubData', target, data);
+      recordUpload('bufferSubData', target, data, null, { offset });
       const buffer = target === this.ARRAY_BUFFER
         ? boundArrayBuffer
         : boundElementBuffer;
-      if (!fail.stickyAfterUpload && buffer !== null) {
-        contents.buffers.set(buffer, cloneUpload(data));
-      }
+      if (fail.stickyAfterUpload || buffer === null) return;
+      // A sub-range write updates the existing store in place; it never
+      // replaces it, and it never writes past its end.
+      const store = contents.buffers.get(buffer);
+      assert.ok(
+        store instanceof ArrayBuffer,
+        'bufferSubData requires an allocated data store',
+      );
+      const source = new Uint8Array(
+        data.buffer,
+        data.byteOffset,
+        data.byteLength,
+      );
+      const count = length ?? source.byteLength - srcOffset;
+      assert.ok(
+        offset + count <= store.byteLength,
+        'bufferSubData must stay inside the allocated data store',
+      );
+      new Uint8Array(store).set(
+        source.subarray(srcOffset, srcOffset + count),
+        offset,
+      );
     },
     createBuffer() {
       const ordinal = creates.buffers.length + 1;
@@ -837,20 +862,28 @@ test('candidate rollback invalidates overwritten shared scratch while restoring 
   assert.equal(renderer._interleavedColorView, null);
 });
 
-test('compact packing overwrites only shared client bytes after the main GPU upload is accepted', () => {
+test('compact packing owns its client bytes and cannot disturb the accepted main GPU copy', () => {
   const fixture = createRendererFixture();
   fixture.renderer._createInterleavedBuffer(
     fixture.positions,
     fixture.colors,
   );
-  const sharedScratch =
-    fixture.renderer._interleavedArrayBuffer;
+  // The full-detail store is filled through the fixed staging block, so it
+  // allocates no point-count-sized client owner at all.
+  assert.equal(
+    fixture.renderer._interleavedArrayBuffer instanceof ArrayBuffer,
+    false,
+  );
+  assert.equal(
+    fixture.renderer._interleavedChunkBuffer.byteLength,
+    65_536 * 16,
+  );
   const acceptedMain = fixture.gl._state.contents.buffers.get(
     fixture.mainBuffer,
   );
   assert.ok(acceptedMain instanceof ArrayBuffer);
   const acceptedMainBytes =
-    new Uint8Array(acceptedMain);
+    new Uint8Array(acceptedMain.slice(0));
 
   resetGlActivity(fixture.gl);
   publishFixture(fixture);
@@ -858,10 +891,17 @@ test('compact packing overwrites only shared client bytes after the main GPU upl
     upload => upload.target === fixture.gl.ARRAY_BUFFER,
   );
   assert.ok(compactUpload);
+  // The compact generation is the only consumer of the point-count-sized
+  // packing owner, and it reaches the GPU as one whole-store upload.
+  const sharedScratch =
+    fixture.renderer._interleavedArrayBuffer;
+  assert.ok(sharedScratch instanceof ArrayBuffer);
+  assert.equal(sharedScratch.byteLength, FULL_POINT_COUNT * 16);
   assert.strictEqual(
     compactUpload.sourceBuffer,
     sharedScratch,
   );
+  assert.equal(compactUpload.kind, 'bufferData');
   assert.deepEqual(
     new Uint8Array(
       fixture.gl._state.contents.buffers.get(

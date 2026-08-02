@@ -4,9 +4,14 @@ import test from 'node:test';
 
 import {
   JupyterBridgeDataSource,
+  describeJupyterCommandFailure,
+  describeJupyterCommandType,
   getJupyterConfig,
   uploadJupyterSessionBundle,
 } from '../assets/js/data/jupyter-source.js';
+import {
+  getNotificationCenter,
+} from '../assets/js/app/notification-center.js';
 import {
   createDataSourceManager,
 } from '../assets/js/data/data-source-manager.js';
@@ -589,8 +594,8 @@ test(
 
     const failure = new Error('async notebook dispatch failed');
     const reported = [];
-    source._reportMessageFailure = error => {
-      reported.push(error);
+    source._reportMessageFailure = (commandType, error) => {
+      reported.push([commandType, error]);
     };
     source.onMessage(message => (
       message.type === 'requestSessionBundle'
@@ -608,7 +613,7 @@ test(
       source: runtime.parent,
     });
     await new Promise(resolve => setImmediate(resolve));
-    assert.deepEqual(reported, [failure]);
+    assert.deepEqual(reported, [['requestSessionBundle', failure]]);
     source.disconnect();
   },
 );
@@ -1256,7 +1261,6 @@ test('Jupyter browser notifications publish only exact current payloads', async 
     ctrl: true,
   });
   await source.notifyReady({ nCells: 120, dimensions: 2 });
-  await source.notifyCustomEvent('analysis', { result: 7 });
 
   assert.deepEqual(delivered.map(event => event.type), [
     'selection',
@@ -1264,7 +1268,6 @@ test('Jupyter browser notifications publish only exact current payloads', async 
     'hover',
     'click',
     'ready',
-    'analysis',
   ]);
   assert.deepEqual(delivered[4], {
     type: 'ready',
@@ -1283,11 +1286,89 @@ test('Jupyter browser notifications publish only exact current payloads', async 
     source.notifyHover(2, { x: 1, y: Number.NaN, z: 3 }),
     /finite/i,
   );
-  await assert.rejects(
-    source.notifyCustomEvent('analysis', { value: undefined }),
-    /JSON/i,
-  );
   assert.equal(delivered.length, callsBeforeInvalid);
+});
+
+test('the viewer publishes only event types Python accepts', async () => {
+  // `_postEventToPython` is the single outbound door, and Python is the reader:
+  // `_require_inbound_jupyter_event` looks the type up in `_INBOUND_EVENT_FIELDS`
+  // and raises `Unknown inbound Jupyter event type` for anything else, which the
+  // user sees as a kernel traceback and an HTTP 500. So the viewer may not build
+  // an event type from a caller-supplied value: there is no type it could pass
+  // that the reader would accept, and offering one is offering a guaranteed
+  // failure. Every type in this file must be a literal from the accepted set.
+  const accepted = new Set([
+    'selection',
+    'hover',
+    'click',
+    'ready',
+    'pong',
+    'debug_snapshot',
+    'session_bundle',
+    'command_error',
+  ]);
+
+  const source = readFileSync(
+    new URL('../assets/js/data/jupyter-source.js', import.meta.url),
+    'utf8'
+  );
+  const lines = source.split('\n');
+  const published = [];
+  for (const [index, line] of lines.entries()) {
+    const match = /(?:^|[^\w.$])type:\s*(.+?),?\s*$/.exec(line);
+    if (match === null) continue;
+    published.push({ line: index + 1, value: match[1] });
+  }
+  assert.ok(
+    published.length > 0,
+    'jupyter-source.js must still publish outbound event types'
+  );
+
+  for (const { line, value } of published) {
+    const literal = /^'([a-z_]+)'$/.exec(value);
+    assert.ok(
+      literal !== null,
+      `jupyter-source.js:${line} publishes a computed event type (${value}); `
+        + 'Python accepts a fixed set and rejects everything else'
+    );
+    assert.ok(
+      accepted.has(literal[1]),
+      `jupyter-source.js:${line} publishes "${literal[1]}", which Python's `
+        + 'inbound validator does not accept'
+    );
+  }
+
+  // The accepted set above is a copy of Python's, so it is checked against the
+  // original when the sibling repository is present and skipped explicitly when
+  // it is not.
+  let wireSource = null;
+  try {
+    wireSource = readFileSync(
+      new URL(
+        '../../cellucid-python/src/cellucid/jupyter/_wire.py',
+        import.meta.url
+      ),
+      'utf8'
+    );
+  } catch (error) {
+    assert.equal(error.code, 'ENOENT');
+  }
+  if (wireSource === null) return;
+  const mapping = wireSource.slice(
+    wireSource.indexOf('_INBOUND_EVENT_FIELDS: dict[str, frozenset[str]] = {'),
+    wireSource.indexOf('\n}\n', wireSource.indexOf('_INBOUND_EVENT_FIELDS'))
+  );
+  assert.ok(mapping.length > 0, '_INBOUND_EVENT_FIELDS must still be findable');
+  const declared = new Set(
+    [...mapping.matchAll(/^ {4}"([a-z_]+)": frozenset\(/gm)].map(
+      match => match[1]
+    )
+  );
+  assert.deepEqual(
+    [...declared].sort(),
+    [...accepted].sort(),
+    'the accepted event types must match cellucid-python _INBOUND_EVENT_FIELDS'
+  );
 });
 
 test('Jupyter mode does not register or enumerate the unrelated demo catalog', async () => {
@@ -1736,3 +1817,239 @@ test('Jupyter pointer hooks use per-view pick records without changing wire payl
       healthFailureSource.indexOf('notifications.error('),
   );
 });
+
+test('Jupyter command failure names the command for the person watching', () => {
+  assert.deepEqual(
+    describeJupyterCommandFailure(
+      'setColorBy',
+      new Error('Jupyter set-color-by command requires exactly one field "CD8A"'),
+    ),
+    {
+      title: 'Notebook command failed',
+      message:
+        'The notebook "setColorBy" command did not run: Jupyter set-color-by ' +
+        'command requires exactly one field "CD8A". The viewer is unchanged; ' +
+        'correct the notebook cell and run it again.',
+    },
+  );
+
+  assert.equal(
+    describeJupyterCommandFailure(null, new Error('boom')).message,
+    'A notebook command did not run: boom. The viewer is unchanged; ' +
+    'correct the notebook cell and run it again.',
+  );
+
+  // A thrown non-Error, or an Error with no message, still produces text a
+  // reader can act on rather than an empty or "undefined" notification.
+  for (const thrown of [new Error(''), 'plain string', null, undefined, { a: 1 }]) {
+    assert.equal(
+      describeJupyterCommandFailure('highlight', thrown).message,
+      'The notebook "highlight" command did not run: the viewer reported no ' +
+      'reason. The viewer is unchanged; correct the notebook cell and run it ' +
+      'again.',
+    );
+  }
+
+  // Newlines and stack-shaped text are collapsed, and an unbounded message is
+  // truncated so one failure cannot fill the notification surface.
+  assert.equal(
+    describeJupyterCommandFailure(
+      'highlight',
+      new Error('first line\n  second line\tthird'),
+    ).message.startsWith(
+      'The notebook "highlight" command did not run: first line second line third.',
+    ),
+    true,
+  );
+  const truncated = describeJupyterCommandFailure(
+    'highlight',
+    new Error('x'.repeat(4000)),
+  ).message;
+  assert.equal(truncated.includes(`${'x'.repeat(239)}…`), true);
+  assert.equal(truncated.includes('x'.repeat(241)), false);
+
+  // Only recognised command types may be named.
+  assert.throws(
+    () => describeJupyterCommandFailure('notACommand', new Error('boom')),
+    /one recognised command or null/,
+  );
+});
+
+test('Jupyter command labels are drawn from the exact command set', () => {
+  for (const type of [
+    'ping',
+    'debug_snapshot',
+    'highlight',
+    'setColorBy',
+    'setVisibility',
+    'clearHighlights',
+    'resetCamera',
+    'freeze',
+    'requestSessionBundle',
+  ]) {
+    assert.equal(describeJupyterCommandType({ type }), type);
+  }
+  for (const data of [
+    { type: 'javascript:alert(1)' },
+    { type: '__proto__' },
+    { type: 'constructor' },
+    { type: '' },
+    { type: 7 },
+    { type: ['highlight'] },
+    {},
+    null,
+    'highlight',
+    ['highlight'],
+  ]) {
+    assert.equal(describeJupyterCommandType(data), null);
+  }
+});
+
+test(
+  'A failed notebook command is announced in the viewer, not only the console',
+  async t => {
+    const runtime = installWindow(
+      '?jupyter=true&viewerId=viewer-1&viewerToken=secret-1',
+    );
+    globalThis.fetch = async () => jupyterHealthResponse();
+    const source = new JupyterBridgeDataSource(getJupyterConfig());
+    await source.initialize();
+
+    const notifications = getNotificationCenter();
+    const originalNotify = notifications.error;
+    const originalConsoleError = console.error;
+    const raised = [];
+    const logged = [];
+    notifications.error = (message, options) => {
+      raised.push({ message, options });
+      return 'jupyter-command-failure-test';
+    };
+    console.error = (...args) => {
+      logged.push(args);
+    };
+    t.after(() => {
+      notifications.error = originalNotify;
+      console.error = originalConsoleError;
+      source.disconnect();
+    });
+
+    // The real case: `viewer.set_color_by("CD8A")` in a notebook. The Python
+    // wire check accepts it, the browser handler is the first thing that can
+    // reject it, and the protocol has no reply channel to tell the notebook.
+    source.onMessage(message => {
+      if (message.type === 'setColorBy') {
+        throw new Error(
+          'Jupyter set-color-by command requires exactly one field "CD8A"',
+        );
+      }
+      if (message.type === 'javascript:alert(1)') {
+        throw new Error('no handler accepted this command');
+      }
+    });
+
+    // Must not throw out of the window `message` listener.
+    runtime.dispatch('message', {
+      data: {
+        type: 'setColorBy',
+        field: 'CD8A',
+        viewerId: 'viewer-1',
+        viewerToken: 'secret-1',
+      },
+      origin: 'https://notebook.example',
+      source: runtime.parent,
+    });
+
+    assert.equal(raised.length, 1);
+    assert.equal(
+      raised[0].message,
+      'The notebook "setColorBy" command did not run: Jupyter set-color-by ' +
+      'command requires exactly one field "CD8A". The viewer is unchanged; ' +
+      'correct the notebook cell and run it again.',
+    );
+    assert.deepEqual(raised[0].options, {
+      category: 'connectivity',
+      title: 'Notebook command failed',
+      duration: 0,
+    });
+    // The developer trace is kept alongside the user-facing notice.
+    assert.equal(logged.length, 1);
+    assert.match(logged[0][0], /^\[JupyterBridge\] The notebook "setColorBy"/);
+
+    // An asynchronous rejection reaches the same surface.
+    raised.length = 0;
+    logged.length = 0;
+    source.onHighlight(() => Promise.reject(new Error('highlight page missing')));
+    runtime.dispatch('message', {
+      data: {
+        type: 'highlight',
+        cells: [1, 2, 3],
+        color: '#ff0000',
+        viewerId: 'viewer-1',
+        viewerToken: 'secret-1',
+      },
+      origin: 'https://notebook.example',
+      source: runtime.parent,
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(raised.length, 1);
+    assert.match(
+      raised[0].message,
+      /^The notebook "highlight" command did not run: highlight page missing\./,
+    );
+
+    // An unrecognised command type is never echoed into the notification.
+    raised.length = 0;
+    runtime.dispatch('message', {
+      data: {
+        type: 'javascript:alert(1)',
+        viewerId: 'viewer-1',
+        viewerToken: 'secret-1',
+      },
+      origin: 'https://notebook.example',
+      source: runtime.parent,
+    });
+    assert.equal(raised.length, 1);
+    assert.match(raised[0].message, /^A notebook command did not run:/);
+    assert.equal(raised[0].message.includes('javascript:alert(1)'), false);
+
+    // A type that fails the message check itself is reported the same way,
+    // and its raw text stays out of the notification surface.
+    raised.length = 0;
+    runtime.dispatch('message', {
+      data: {
+        type: '<img src=x onerror=alert(1)>',
+        viewerId: 'viewer-1',
+        viewerToken: 'secret-1',
+      },
+      origin: 'https://notebook.example',
+      source: runtime.parent,
+    });
+    assert.equal(raised.length, 1);
+    assert.match(raised[0].message, /^A notebook command did not run:/);
+    assert.equal(raised[0].message.includes('onerror'), false);
+
+    // Reporting is last-resort: a notification surface that is itself broken
+    // must not turn the message listener into a thrown failure.
+    raised.length = 0;
+    logged.length = 0;
+    notifications.error = () => {
+      throw new Error('notification surface unavailable');
+    };
+    runtime.dispatch('message', {
+      data: {
+        type: 'setColorBy',
+        field: 'CD8A',
+        viewerId: 'viewer-1',
+        viewerToken: 'secret-1',
+      },
+      origin: 'https://notebook.example',
+      source: runtime.parent,
+    });
+    assert.equal(raised.length, 0);
+    assert.equal(logged.length, 2);
+    assert.match(
+      logged[1][0],
+      /^\[JupyterBridge\] Notebook command failure notice failed:/,
+    );
+  },
+);

@@ -443,6 +443,53 @@ test('GitHub catalog adoption rejects every dataset when one identity fails', as
   ]);
 });
 
+test('GitHub catalog identities are read as one batch, not one round trip each', async t => {
+  silenceNotifications(t);
+  const catalog = manifest({
+    datasets: [
+      { id: 'first', path: 'first/' },
+      { id: 'second', path: 'second/' },
+      { id: 'third', path: 'third/' },
+    ],
+    default: 'first',
+  });
+  const releases = [];
+  const identityUrls = [];
+  const requested = installFetch(t, url => {
+    if (url.endsWith('/datasets.json')) {
+      return jsonResponse(catalog);
+    }
+    identityUrls.push(url);
+    const id = /\/([^/]+)\/dataset_identity\.json$/.exec(url)[1];
+    return new Promise(resolve => {
+      releases.push(() => resolve(jsonResponse(identity(id))));
+    });
+  });
+
+  const source = new GitHubDataSource();
+  const connecting = source.connect('owner/repo/exports');
+  // No timers: draining the microtask queue is enough to show every request a
+  // batched reader means to issue. A reader that awaited one identity before
+  // asking for the next would show exactly one here.
+  for (let turn = 0; turn < 64; turn += 1) {
+    await Promise.resolve();
+  }
+  assert.equal(identityUrls.length, 3);
+
+  for (const release of releases) release();
+  await connecting;
+  assert.deepEqual(
+    (await source.listDatasets()).map(dataset => dataset.id),
+    ['first', 'second', 'third']
+  );
+  assert.deepEqual(requested, [
+    'https://raw.githubusercontent.com/owner/repo/main/exports/datasets.json',
+    'https://raw.githubusercontent.com/owner/repo/main/exports/first/dataset_identity.json',
+    'https://raw.githubusercontent.com/owner/repo/main/exports/second/dataset_identity.json',
+    'https://raw.githubusercontent.com/owner/repo/main/exports/third/dataset_identity.json',
+  ]);
+});
+
 test('GitHub catalog duplicates are assertions, never identity repairs', async t => {
   const canonical = identity('first', {
     name: 'Canonical identity name',

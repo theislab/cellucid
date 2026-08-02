@@ -12,6 +12,13 @@ uniform mat4 u_mvpMatrix;
 uniform mat4 u_viewMatrix;
 uniform mat4 u_modelMatrix;
 uniform float u_pointSize;
+// The largest sprite this pass may draw, in the pixels it is drawing into.
+// A figure export rasterises the same scene at a multiple of the screen
+// size, so a fixed cap would clamp a point at a different fraction of the
+// image than it occupies on screen, and the exported figure would stop
+// being the view it claims to reproduce. Zero means unset, and the floor
+// below keeps that behaving exactly as the fixed cap did.
+uniform float u_pointSizeMax;
 uniform float u_sizeAttenuation;
 uniform float u_viewportHeight;
 uniform float u_fov;
@@ -32,9 +39,21 @@ void main() {
   float worldSize = u_pointSize * 0.01;
   float perspectiveSize = (worldSize * projectionFactor) / max(eyeDepth, 0.001);
   gl_PointSize = mix(u_pointSize, perspectiveSize, u_sizeAttenuation);
-  gl_PointSize = clamp(gl_PointSize, 0.5, 128.0);
+  gl_PointSize = clamp(gl_PointSize, 0.5, max(u_pointSizeMax, 128.0));
 
-  if (a_color.a < 0.01) gl_PointSize = 0.0;
+  // Reject hidden centroids before rasterisation — see HP_VS_FULL. Zeroing the
+  // size alone does not hide one: the driver clamps it back to a pixel.
+  //
+  // This branch is live. A category filtered down to no visible cells arrives
+  // with alpha 0 (app/state/managers/field/summary.js), and the centroid pass
+  // draws on the renderer's depthMask(true) (viewer.js, drawCentroids), so
+  // without this rejection the only thing keeping a hidden centroid from
+  // writing depth over a visible point is the discard in CENTROID_FS below.
+  if (a_color.a < 0.01) {
+    gl_PointSize = 0.0;
+    gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+  }
+
   v_color = a_color.rgb;
   v_alpha = a_color.a;
 }

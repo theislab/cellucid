@@ -462,6 +462,11 @@ export const SESSION_WITHOUT_CELL_IDENTITY_MESSAGE =
  * on their multiset. Measured on 842k cells (9.64 MiB of Float32 coordinates):
  * 4.3 ms for the digest, 5.6 ms for the complete fingerprint.
  *
+ * A matching digest therefore proves the coordinates are the same ones in the
+ * same order. A differing digest proves only that they are not: it cannot
+ * separate permuted rows from re-computed coordinates, which is why
+ * `describeDatasetFingerprintMismatch()` names both.
+ *
  * The result is memoized against the coordinate array itself. The array is
  * replaced, never rewritten, when the dataset or the displayed embedding
  * changes, so the capture guard can re-derive the fingerprint once per
@@ -663,9 +668,23 @@ export function datasetFingerprintMatches(a, b) {
  * Explain a dataset fingerprint mismatch to the person loading the session.
  *
  * The session controls surface this text verbatim, so each cause gets the
- * sentence that names what actually differs and what to do next. A wrong cause
- * would be its own integrity failure: telling a user their data was re-ordered
- * when they merely switched the view would make them distrust a sound dataset.
+ * sentence that names what actually differs and what to do next. Naming a cause
+ * the evidence does not establish would be its own integrity failure: telling a
+ * user their data was re-ordered when they merely switched the view, or when
+ * the same rows were exported again from a re-computed embedding, would make
+ * them distrust a sound dataset.
+ *
+ * What each field can prove differs:
+ * - The scalars name the dataset, so a difference there is conclusive.
+ * - The dimension is read directly, so a difference there is conclusive.
+ * - `cellOrder.digest` is a one-way fold over the coordinate bytes in row
+ *   order. It changes when the rows are permuted and it changes when the
+ *   coordinate values change, and a hash cannot say which happened. So the
+ *   last message states the one thing that is established — the coordinates
+ *   are not the ones the session was saved against — and offers both causes
+ *   rather than asserting the alarming one. Separating them would need an
+ *   order-independent digest saved beside this one, which is a session-file
+ *   schema change shared with the Python reader.
  *
  * @param {any} saved
  * @param {any} current
@@ -700,9 +719,12 @@ export function describeDatasetFingerprintMismatch(saved, current) {
   }
   return (
     'This dataset is not the one this session was saved on. It has the same '
-    + 'name and the same number of cells and genes, but its cells are stored '
-    + 'in a different order, so every saved selection would mark the wrong '
-    + 'cells. The session was not opened. Load the version of the dataset the '
-    + 'session was saved on, or re-create the selections on this one.'
+    + 'name and the same number of cells and genes, but the cell coordinates '
+    + 'differ from the ones the session was saved against, so Cellucid cannot '
+    + 'confirm that a saved selection still marks the same cells. Either the '
+    + 'cells are stored in a different order, or the same cells were exported '
+    + 'again from a re-computed embedding. The session was not opened. Load '
+    + 'the version of the dataset the session was saved on, or re-create the '
+    + 'selections on this one.'
   );
 }

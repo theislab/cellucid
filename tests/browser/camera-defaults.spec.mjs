@@ -1,8 +1,8 @@
 import { expect, test } from '@playwright/test';
+import { appUrl } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 
-const SYNTHETIC_3D_ROOT =
-  'http://127.0.0.1:4173/tests/browser/fixtures/generated-3d/';
+const SYNTHETIC_3D_ROOT = appUrl('/tests/browser/fixtures/generated-3d/');
 const DATASET_ID = 'deterministic-orbit-3d';
 const CELL_COUNT = 12;
 

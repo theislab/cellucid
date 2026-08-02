@@ -198,10 +198,13 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     typeof viewer !== 'object' ||
     typeof viewer.withBorrowedViewData !== 'function' ||
     typeof viewer.getPresentedViewState !== 'function' ||
-    typeof viewer.onPresentedViewStateChanged !== 'function'
+    typeof viewer.onPresentedViewStateChanged !== 'function' ||
+    typeof viewer.getGrantedAntialiasing !== 'function'
   ) {
     throw new TypeError(
-      'Figure export viewer must publish withBorrowedViewData(), getPresentedViewState(), and onPresentedViewStateChanged().'
+      'Figure export viewer must publish withBorrowedViewData(), '
+      + 'getPresentedViewState(), onPresentedViewStateChanged(), and '
+      + 'getGrantedAntialiasing().'
     );
   }
   // Session bundles must NOT persist Figure Export UI state. Mark the entire

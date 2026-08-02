@@ -1,18 +1,26 @@
 /**
- * PERFORMANCE BENCHMARK MODULE
- * ============================
- * Simple benchmark for testing scatterplot rendering limits.
- * Integrates with the existing viewer for easy testing.
+ * PERFORMANCE BENCHMARK SUPPORT MODULE
+ * ===================================
+ * The measurement primitives the running application's benchmark panel loads
+ * on demand. Nothing here builds or owns a renderer: the harness in
+ * `app/ui/modules/benchmark/` drives the real viewer, and this module supplies
+ * the pieces that harness and the panel consume.
  *
- * Uses HighPerfRenderer (WebGL2) for all benchmarking:
- * - Interleaved vertex buffers
- * - Level-of-Detail (LOD) with spatial index
- * - Frustum culling
- * - Lightweight shaders
- * - GPU-only fog
+ * - `SyntheticDataGenerator` — the datasets every benchmark measures, also
+ *   used off-thread by `app/ui/modules/benchmark/generation-worker.js`.
+ * - `GLBParser` / `MeshSurfaceSampler` — mesh sampling behind the GLB pattern.
+ * - `GPUTimer` — EXT_disjoint_timer_query_webgl2 timing.
+ * - `PerformanceTracker` — the rolling frame-rate readout shown on screen.
+ * - `BottleneckAnalyzer` — the CPU/GPU phase breakdown behind "Analyze".
+ * - `BenchmarkReporter` — environment capture and report generation.
+ *
+ * Generation is deterministic: see `DEFAULT_SYNTHETIC_SEED`.
  */
 
-import { HighPerfRenderer, RendererConfig } from '../rendering/high-perf-renderer.js';
+import {
+  MAX_SYNTHETIC_COUNT,
+  MIN_SYNTHETIC_COUNT
+} from '../app/ui/modules/benchmark/generation-contract.js';
 import { formatCellCount as formatNumber } from '../data/data-source.js';
 
 const glbBufferPromises = new Map();
@@ -36,10 +44,27 @@ function estimatePrePublicationGpuMemoryMB(pointCount) {
     : null;
 }
 
+/**
+ * Bound a generation request by the one rule the whole product declares.
+ *
+ * The bounds are imported rather than restated: the point-count control, the
+ * off-thread message contract and these generators used to carry three
+ * different rules, so a value could be accepted here, rejected at the worker
+ * boundary, and advertised as out of range by the control.
+ *
+ * @param {unknown} count - Candidate point count.
+ * @returns {number} The exact point count.
+ */
 function requireSyntheticPointCount(count) {
-  if (!Number.isSafeInteger(count) || count < 1) {
+  if (
+    !Number.isSafeInteger(count) ||
+    count < MIN_SYNTHETIC_COUNT ||
+    count > MAX_SYNTHETIC_COUNT
+  ) {
     throw new RangeError(
-      'Synthetic point count must be one positive safe integer.'
+      `Synthetic point count must be one integer between ` +
+      `${MIN_SYNTHETIC_COUNT} and ${MAX_SYNTHETIC_COUNT}; ` +
+      `received ${String(count)}.`
     );
   }
   return count;
@@ -60,1271 +85,53 @@ function normalizedByte(value) {
 }
 
 /**
- * Benchmark configuration for high-performance renderer tests
+ * Seed every synthetic dataset is built from unless a caller changes it.
+ *
+ * Generation used to draw from the platform RNG, so every benchmark window
+ * measured a different point cloud: two runs of "20M clusters" disagreed on
+ * where the points were, how they were ordered, and therefore on overdraw,
+ * LOD occupancy and frustum residency. That makes a frame time from one
+ * session incomparable with a frame time from the next, which is the whole
+ * purpose of running the benchmark. A fixed seed makes the dataset a constant
+ * of the measurement rather than a variable of it.
  */
-export const BenchmarkConfig = {
-  // Quality presets
-  QUALITY_FULL: 'full',           // Full lighting and fog
-  QUALITY_LIGHT: 'light',         // Simplified lighting
-  QUALITY_ULTRALIGHT: 'ultralight', // Maximum performance
-
-  // Test scenarios
-  TEST_LOD: 'lod',
-  TEST_FRUSTUM_CULLING: 'frustum',
-  TEST_INTERLEAVED: 'interleaved',
-  TEST_SHADER_QUALITY: 'shader',
-
-  // Default test parameters
-  DEFAULT_FRAMES_PER_TEST: 60,
-  DEFAULT_WARMUP_FRAMES: 10,
-  DEFAULT_MULTI_RUN_COUNT: 3,
-  DEFAULT_COOLDOWN_MS: 500,
-
-  // Thresholds for performance classification
-  THRESHOLDS: {
-    FPS: {
-      EXCELLENT: 60,    // >= 60 FPS
-      GOOD: 45,         // >= 45 FPS
-      ACCEPTABLE: 30,   // >= 30 FPS
-      POOR: 15          // >= 15 FPS, below is critical
-    },
-    FRAME_TIME: {
-      EXCELLENT: 16.67, // <= 16.67ms (60 FPS)
-      GOOD: 22.22,      // <= 22.22ms (45 FPS)
-      ACCEPTABLE: 33.33, // <= 33.33ms (30 FPS)
-      POOR: 66.67       // <= 66.67ms (15 FPS)
-    },
-    JANK_PERCENT: {
-      GOOD: 2,          // <= 2% jank frames
-      ACCEPTABLE: 5,    // <= 5%
-      POOR: 10          // <= 10%, above is critical
-    },
-    CV: {
-      STABLE: 10,       // CV <= 10% is stable
-      MODERATE: 25,     // CV <= 25% is moderate
-      UNSTABLE: 50      // CV <= 50% is unstable, above is highly unstable
-    }
-  },
-
-  // Test suite configurations
-  TEST_SUITE: {
-    STANDARD: [
-      { name: 'Full Quality', quality: 'full', lod: true },
-      { name: 'Light Quality', quality: 'light', lod: true },
-      { name: 'Ultralight Quality', quality: 'ultralight', lod: true },
-      { name: 'No LOD', quality: 'full', lod: false },
-      { name: 'With LOD', quality: 'full', lod: true }
-    ],
-    EXTENDED: [
-      { name: 'Full Quality', quality: 'full', lod: true },
-      { name: 'Light Quality', quality: 'light', lod: true },
-      { name: 'Ultralight Quality', quality: 'ultralight', lod: true },
-      { name: 'No LOD', quality: 'full', lod: false },
-      { name: 'With LOD', quality: 'full', lod: true },
-      { name: 'With Frustum Culling', quality: 'full', lod: true, frustumCulling: true }
-    ],
-    MINIMAL: [
-      { name: 'Standard', quality: 'full', lod: true },
-      { name: 'Performance', quality: 'ultralight', lod: true }
-    ]
-  },
-
-  /**
-   * Classify performance based on FPS
-   * @param {number} fps - Frames per second
-   * @returns {string} Performance classification
-   */
-  classifyFPS(fps) {
-    const t = this.THRESHOLDS.FPS;
-    if (fps >= t.EXCELLENT) return 'excellent';
-    if (fps >= t.GOOD) return 'good';
-    if (fps >= t.ACCEPTABLE) return 'acceptable';
-    if (fps >= t.POOR) return 'poor';
-    return 'critical';
-  },
-
-  /**
-   * Classify stability based on coefficient of variation
-   * @param {number} cv - Coefficient of variation (percentage)
-   * @returns {string} Stability classification
-   */
-  classifyStability(cv) {
-    const t = this.THRESHOLDS.CV;
-    if (cv <= t.STABLE) return 'stable';
-    if (cv <= t.MODERATE) return 'moderate';
-    if (cv <= t.UNSTABLE) return 'unstable';
-    return 'highly_unstable';
-  }
-};
+export const DEFAULT_SYNTHETIC_SEED = 0x5EED1E;
 
 /**
- * High-Performance Renderer Benchmark Manager
+ * One deterministic unit-interval stream (splitmix32 finalizer).
+ *
+ * Matches `createSeededUnitStream` in `app/ui/modules/benchmark/camera-path.js`
+ * so the camera path and the dataset share one notion of a seeded stream.
+ *
+ * @param {number} seed - Safe-integer seed.
+ * @returns {() => number} Successive values in [0, 1).
  */
-export class HighPerfBenchmark {
-  constructor(canvas) {
-    this.canvas = canvas;
-    this.renderer = null;
-    this.isActive = false;
-    this.testResults = [];
-    
-    // Configuration state
-    this.config = {
-      useLOD: true,
-      useFrustumCulling: false,
-      useInterleavedBuffers: true,
-      shaderQuality: 'full',
-      forceLODLevel: -1,  // -1 = auto
-      dimensionLevel: 3   // 1=1D, 2=2D, 3=3D
-    };
+function createSeededUnitStream(seed) {
+  if (!Number.isSafeInteger(seed)) {
+    throw new TypeError('Synthetic generation seed must be one safe integer.');
   }
-  
-  /**
-   * Initialize the high-performance renderer
-   * @param {Object} options - Optional configuration including gl context
-   */
-  init(options = {}) {
-    if (this.renderer) {
-      this.renderer.dispose();
-    }
-
-    // HighPerfRenderer expects a WebGL2 context as first argument
-    // Get context from options or create from canvas
-    const gl = options.gl || this.canvas.getContext('webgl2', {
-      antialias: false,
-      alpha: false,
-      depth: true,
-      stencil: false,
-      powerPreference: 'high-performance'
-    });
-
-    if (!gl) {
-      throw new Error('[HighPerfBenchmark] Failed to get WebGL2 context');
-    }
-
-    this.gl = gl;  // Store for reference
-
-    this.renderer = new HighPerfRenderer(gl, {
-      USE_LOD: this.config.useLOD,
-      USE_FRUSTUM_CULLING: this.config.useFrustumCulling,
-      USE_INTERLEAVED_BUFFERS: this.config.useInterleavedBuffers
-    });
-
-    this.renderer.setQuality(this.config.shaderQuality);
-    this.renderer.setForceLOD(this.config.forceLODLevel);
-    this.isActive = true;
-
-    console.log('[HighPerfBenchmark] Renderer initialized:', {
-      quality: this.config.shaderQuality
-    });
-
-    return this.renderer;
-  }
-  
-  /**
-   * Load data into the high-performance renderer
-   * @param {Float32Array} positions - Position data (n * 3)
-   * @param {Uint8Array} colors - Color data (RGBA)
-   * @param {number} [dimensionLevel] - Optional dimension level override (1, 2, or 3)
-   */
-  loadData(positions, colors, dimensionLevel = undefined) {
-    if (!this.renderer) {
-      this.init();
-    }
-
-    const dimLevel = dimensionLevel ?? this.config.dimensionLevel;
-
-    // Alpha is packed in colors as RGBA uint8 - no separate array needed
-    // Build spatial index if either LOD or frustum culling is enabled
-    const stats = this.renderer.loadData(positions, colors, {
-      buildSpatialIndex: this.config.useLOD || this.config.useFrustumCulling,
-      dimensionLevel: dimLevel
-    });
-
-    console.log('[HighPerfBenchmark] Data loaded:', stats);
-    return stats;
-  }
-  
-  /**
-   * Configure LOD settings
-   */
-  setLODEnabled(enabled) {
-    if (typeof enabled !== 'boolean') {
-      throw new TypeError(
-        'HighPerfBenchmark LOD enabled must be a boolean.'
-      );
-    }
-    if (this.renderer) {
-      this.renderer.setAdaptiveLOD(enabled);
-    }
-    this.config.useLOD = enabled;
-  }
-  
-  /**
-   * Force a specific LOD level (-1 = auto)
-   */
-  setForceLODLevel(level) {
-    if (!Number.isInteger(level)) {
-      throw new TypeError(
-        'HighPerfBenchmark forced LOD level must be an integer.'
-      );
-    }
-    if (level < -1) {
-      throw new RangeError(
-        'HighPerfBenchmark forced LOD level must be -1 or greater.'
-      );
-    }
-    // Renderer acceptance is the publication boundary. A rejected level must
-    // leave the benchmark configuration unchanged.
-    if (this.renderer) {
-      this.renderer.setForceLOD(level);
-    }
-    this.config.forceLODLevel = level;
-  }
-  
-  /**
-   * Configure frustum culling
-   */
-  setFrustumCullingEnabled(enabled) {
-    if (typeof enabled !== 'boolean') {
-      throw new TypeError(
-        'HighPerfBenchmark frustum culling enabled must be a boolean.'
-      );
-    }
-    if (this.renderer) {
-      this.renderer.setFrustumCulling(enabled);
-    }
-    this.config.useFrustumCulling = enabled;
-  }
-  
-  /**
-   * Set shader quality level
-   */
-  setShaderQuality(quality) {
-    if (
-      quality !== BenchmarkConfig.QUALITY_FULL &&
-      quality !== BenchmarkConfig.QUALITY_LIGHT &&
-      quality !== BenchmarkConfig.QUALITY_ULTRALIGHT
-    ) {
-      throw new RangeError(
-        'HighPerfBenchmark shader quality must be exactly "full", ' +
-        '"light", or "ultralight".'
-      );
-    }
-    // Renderer acceptance is the publication boundary. Missing programs,
-    // context loss, or any other rejection must leave benchmark state exact.
-    if (this.renderer) {
-      this.renderer.setQuality(quality);
-    }
-    this.config.shaderQuality = quality;
-  }
-  
-  /**
-   * Get default render parameters for benchmarking.
-   * Uses identity matrices and sensible defaults for GPU activity measurement.
-   * @private
-   */
-  _getDefaultRenderParams() {
-    // Identity matrices for benchmarking (render all points without culling/transformation)
-    const identityMatrix = new Float32Array([
-      1, 0, 0, 0,
-      0, 1, 0, 0,
-      0, 0, 1, 0,
-      0, 0, 0, 1
-    ]);
-    return {
-      mvpMatrix: identityMatrix,
-      viewMatrix: identityMatrix,
-      modelMatrix: identityMatrix,
-      projectionMatrix: identityMatrix,
-      pointSize: 4.0,
-      sizeAttenuation: 0.0,
-      viewportWidth: this.canvas.width || 800,
-      viewportHeight: this.canvas.height || 600,
-      fov: Math.PI / 4,
-      fogDensity: 0.0,
-      fogNear: 0.0,
-      fogFar: 100.0,
-      fogColor: new Float32Array([0, 0, 0]),
-      bgColor: new Float32Array([0, 0, 0]),
-      lightDir: new Float32Array([0, 0, 1]),
-      lightingStrength: 0.0,
-      cameraPosition: [0, 0, 5],
-      cameraDistance: 5.0,
-      forceLOD: this.config.forceLODLevel,
-      quality: this.config.shaderQuality,
-      viewId: 'benchmark',
-      dimensionLevel: this.config.dimensionLevel,
-      useAlphaTexture: false,
-      autoFog: true,
-      overrideBounds: null
-    };
-  }
-
-  /**
-   * Render a frame using the high-performance renderer
-   */
-  render(params) {
-    if (!this.renderer || !this.isActive) {
-      return null;
-    }
-
-    // Merge provided params with defaults, then add force LOD and quality
-    const renderParams = {
-      ...this._getDefaultRenderParams(),
-      ...params,
-      forceLOD: this.config.forceLODLevel,
-      quality: this.config.shaderQuality
-    };
-
-    return this.renderer.render(renderParams);
-  }
-  
-  /**
-   * Get current statistics
-   */
-  getStats() {
-    if (!this.renderer) {
-      return null;
-    }
-    return this.renderer.getStats('benchmark');
-  }
-  
-  /**
-   * Get LOD level information
-   */
-  getLODInfo() {
-    if (!this.renderer) {
-      return null;
-    }
-    const dimLevel = this.renderer.currentDimensionLevel;
-    if (!this.renderer.hasSpatialIndex(dimLevel)) return null;
-
-    const lodBuffers = this.renderer.getLodBuffersForDimension(dimLevel);
-    return {
-      levelCount: this.renderer.getLODLevelCount(dimLevel),
-      levels: lodBuffers.map((lod, i) => ({
-        level: i,
-        pointCount: lod.pointCount,
-        depth: lod.depth
-      }))
-    };
-  }
-  
-  /**
-   * Run a comprehensive benchmark test suite
-   * @param {number} pointCount - Number of points being tested (for reference)
-   * @param {Function} onProgress - Progress callback
-   * @param {Object} options - Test options
-   * @returns {Promise<Array>} Array of test results
-   */
-  async runBenchmarkSuite(pointCount, onProgress, options = {}) {
-    const {
-      framesPerTest = BenchmarkConfig.DEFAULT_FRAMES_PER_TEST,
-      warmupFrames = BenchmarkConfig.DEFAULT_WARMUP_FRAMES,
-      includeExtended = false,
-      testSuite = null,  // Custom test suite override
-      validateResults = true
-    } = options;
-
-    // Select test suite: custom, extended, or standard
-    const suite = testSuite ||
-      (includeExtended ? BenchmarkConfig.TEST_SUITE.EXTENDED : BenchmarkConfig.TEST_SUITE.STANDARD);
-
-    const results = [];
-
-    // Save original settings to restore later
-    const originalConfig = {
-      useLOD: this.config.useLOD,
-      useFrustumCulling: this.config.useFrustumCulling,
-      shaderQuality: this.config.shaderQuality,
-      forceLODLevel: this.config.forceLODLevel
-    };
-
-    try {
-      // Run each test in the suite
-      for (let i = 0; i < suite.length; i++) {
-        const test = suite[i];
-        const progress = i / suite.length;
-
-        if (onProgress) {
-          onProgress({
-            test: test.name.toLowerCase().replace(/\s+/g, '_'),
-            status: 'running',
-            progress,
-            testIndex: i,
-            totalTests: suite.length
-          });
-        }
-
-        // Apply test configuration
-        this.setShaderQuality(test.quality || BenchmarkConfig.QUALITY_FULL);
-        this.setLODEnabled(test.lod !== false);
-        if (test.frustumCulling !== undefined) {
-          this.setFrustumCullingEnabled(test.frustumCulling);
-        }
-
-        // Run the test
-        const result = await this._runTimedTest(test.name, framesPerTest, warmupFrames);
-
-        // Add performance classification
-        result.classification = {
-          performance: BenchmarkConfig.classifyFPS(result.fps),
-          stability: result.stdDev && result.avgFrameTime
-            ? BenchmarkConfig.classifyStability((result.stdDev / result.avgFrameTime) * 100)
-            : 'unknown'
-        };
-
-        // Validate if requested
-        if (validateResults) {
-          result.validation = this.validateResults(result);
-        }
-
-        results.push(result);
-      }
-
-      // Add metadata to results
-      const metadata = {
-        pointCount,
-        timestamp: new Date().toISOString(),
-        testCount: results.length,
-        framesPerTest,
-        warmupFrames,
-        suiteType: testSuite ? 'custom' : (includeExtended ? 'extended' : 'standard')
-      };
-
-      // Calculate suite-level summary
-      const summary = {
-        bestFPS: Math.max(...results.map(r => r.fps)),
-        worstFPS: Math.min(...results.map(r => r.fps)),
-        avgFPS: results.reduce((sum, r) => sum + r.fps, 0) / results.length,
-        bestTest: results.reduce((best, r) => r.fps > best.fps ? r : best).name,
-        worstTest: results.reduce((worst, r) => r.fps < worst.fps ? r : worst).name,
-        overallClassification: BenchmarkConfig.classifyFPS(
-          results.reduce((sum, r) => sum + r.fps, 0) / results.length
-        )
-      };
-
-      this.testResults = { results, metadata, summary };
-
-      if (onProgress) {
-        onProgress({
-          test: 'complete',
-          status: 'done',
-          progress: 1,
-          summary
-        });
-      }
-
-      return { results, metadata, summary };
-    } finally {
-      // Restore original settings
-      this.config.useLOD = originalConfig.useLOD;
-      this.config.useFrustumCulling = originalConfig.useFrustumCulling;
-      this.config.shaderQuality = originalConfig.shaderQuality;
-      this.config.forceLODLevel = originalConfig.forceLODLevel;
-
-      if (this.renderer) {
-        this.renderer.setAdaptiveLOD(originalConfig.useLOD);
-        this.renderer.setForceLOD(
-          originalConfig.forceLODLevel
-        );
-        this.renderer.setFrustumCulling(originalConfig.useFrustumCulling);
-        this.renderer.setQuality(originalConfig.shaderQuality);
-      }
-    }
-  }
-
-  /**
-   * Run a timed test with proper warmup and rendering trigger
-   * @param {string} name - Test name
-   * @param {number} frames - Number of frames to measure
-   * @param {number} warmupFrames - Number of warmup frames to skip
-   * @returns {Promise<Object>} Test results with all metrics as numbers
-   */
-  async _runTimedTest(name, frames, warmupFrames = 10) {
-    return new Promise((resolve) => {
-      const frameTimes = [];
-      let totalFrameAttempts = 0;
-      let skippedFrames = 0;
-      let warmupCount = 0;
-      let lastFrameStart = performance.now();
-
-      const measure = () => {
-        const now = performance.now();
-        const frameTime = now - lastFrameStart;
-        lastFrameStart = now;
-
-        // Warmup phase - skip these frames
-        if (warmupCount < warmupFrames) {
-          warmupCount++;
-          // Force a render during warmup to stabilize GPU state
-          this.render();  // Uses default render params
-          requestAnimationFrame(measure);
-          return;
-        }
-
-        // Measurement phase - continue until we have enough valid frames
-        if (frameTimes.length >= frames) {
-          // Calculate comprehensive statistics (all as numbers)
-          const sorted = [...frameTimes].sort((a, b) => a - b);
-          const n = sorted.length;
-          const sum = sorted.reduce((a, b) => a + b, 0);
-          const avg = sum / n;
-          const fps = 1000 / avg;
-
-          // Calculate standard deviation
-          const sumSquares = sorted.reduce((a, b) => a + b * b, 0);
-          const variance = (sumSquares / n) - (avg * avg);
-          const stdDev = Math.sqrt(Math.max(0, variance));
-
-          // Percentiles with bounds checking and interpolation
-          const getPercentile = (p) => {
-            if (n === 0) return 0;
-            if (n === 1) return sorted[0];
-            const idx = p * (n - 1);
-            const lower = Math.floor(idx);
-            const upper = Math.ceil(idx);
-            if (lower === upper) return sorted[lower];
-            // Linear interpolation for more accurate percentiles
-            const frac = idx - lower;
-            return sorted[lower] * (1 - frac) + sorted[upper] * frac;
-          };
-
-          const medianFrameTime = getPercentile(0.50);
-          const p95FrameTime = getPercentile(0.95);
-          const p99FrameTime = getPercentile(0.99);
-
-          // Jank detection (frames > 1.5x average)
-          const jankThreshold = avg * 1.5;
-          const jankFrames = frameTimes.filter(t => t > jankThreshold).length;
-
-          // Use actual measured frame count for accuracy
-          const measuredFrames = frameTimes.length;
-
-          resolve({
-            name,
-            // All values as numbers for consistency
-            avgFrameTime: avg,
-            fps: Math.round(fps),
-            fpsRaw: fps, // Keep unrounded FPS for accurate comparisons
-            minFrameTime: sorted[0],
-            maxFrameTime: sorted[n - 1],
-            medianFrameTime,
-            p95FrameTime,
-            p99FrameTime,
-            stdDev,
-            frames: measuredFrames,
-            totalFrameAttempts,
-            skippedFrames,
-            warmupFrames,
-            jankFrames,
-            jankPercent: (jankFrames / measuredFrames) * 100,
-            // Raw data for further analysis
-            rawFrameTimes: frameTimes
-          });
-          return;
-        }
-
-        // Force a render to get accurate frame timing
-        this.render();  // Uses default render params
-
-        totalFrameAttempts++;
-
-        // Only record valid frame times (skip first frame which may include setup)
-        // Also skip obviously invalid frames (tab hidden, extreme outliers)
-        if (totalFrameAttempts > 1 && frameTime > 0.1 && frameTime < 1000) {
-          frameTimes.push(frameTime);
-        } else if (totalFrameAttempts > 1) {
-          skippedFrames++;
-        }
-
-        requestAnimationFrame(measure);
-      };
-
-      requestAnimationFrame(measure);
-    });
-  }
-
-  /**
-   * Compare two benchmark runs and identify regressions/improvements
-   * @param {Object} baseline - Baseline benchmark results
-   * @param {Object} current - Current benchmark results
-   * @param {Object} options - Comparison options
-   * @returns {Object} Comparison analysis
-   */
-  compareBenchmarks(baseline, current, options = {}) {
-    const {
-      regressionThreshold = 5,  // % FPS drop to consider regression
-      improvementThreshold = 5,  // % FPS gain to consider improvement
-      criticalThreshold = 20,    // % FPS drop for critical severity
-      warningThreshold = 10      // % FPS drop for warning severity
-    } = options;
-
-    const comparisons = [];
-
-    for (const currentTest of current.results) {
-      const baselineTest = baseline.results.find(b => b.name === currentTest.name);
-      if (!baselineTest) continue;
-
-      if (!Number.isFinite(baselineTest.fpsRaw) || baselineTest.fpsRaw <= 0) {
-        throw new TypeError(
-          `Baseline benchmark "${currentTest.name}" is missing its finite positive fpsRaw value`
-        );
-      }
-      if (!Number.isFinite(currentTest.fpsRaw) || currentTest.fpsRaw <= 0) {
-        throw new TypeError(
-          `Current benchmark "${currentTest.name}" is missing its finite positive fpsRaw value`
-        );
-      }
-      const baselineFps = baselineTest.fpsRaw;
-      const currentFps = currentTest.fpsRaw;
-
-      // Calculate changes using raw values for precision
-      const fpsChange = baselineFps > 0
-        ? ((currentFps - baselineFps) / baselineFps) * 100
-        : 0;
-      const frameTimeChange = baselineTest.avgFrameTime > 0
-        ? ((currentTest.avgFrameTime - baselineTest.avgFrameTime) / baselineTest.avgFrameTime) * 100
-        : 0;
-
-      // Calculate statistical significance (basic approach using stdDev)
-      const baselineStdDev = baselineTest.stdDev ?? 0;
-      const currentStdDev = currentTest.stdDev ?? 0;
-      const pooledStdDev = Math.sqrt((baselineStdDev ** 2 + currentStdDev ** 2) / 2);
-      const frameTimeDiff = Math.abs(currentTest.avgFrameTime - baselineTest.avgFrameTime);
-      const isStatisticallySignificant = pooledStdDev > 0
-        ? frameTimeDiff > (pooledStdDev * 2) // > 2 standard deviations
-        : true;
-
-      comparisons.push({
-        name: currentTest.name,
-        baseline: {
-          fps: baselineTest.fps,
-          fpsRaw: baselineFps,
-          avgFrameTime: baselineTest.avgFrameTime,
-          stdDev: baselineStdDev
-        },
-        current: {
-          fps: currentTest.fps,
-          fpsRaw: currentFps,
-          avgFrameTime: currentTest.avgFrameTime,
-          stdDev: currentStdDev
-        },
-        changes: {
-          fpsChange,
-          frameTimeChange,
-          absoluteFpsDiff: currentFps - baselineFps,
-          absoluteFrameTimeDiff: currentTest.avgFrameTime - baselineTest.avgFrameTime,
-          isRegression: fpsChange < -regressionThreshold,
-          isImprovement: fpsChange > improvementThreshold,
-          isStatisticallySignificant,
-          severity: fpsChange < -criticalThreshold ? 'critical'
-            : fpsChange < -warningThreshold ? 'warning'
-            : fpsChange > improvementThreshold ? 'improved'
-            : 'ok'
-        }
-      });
-    }
-
-    // Calculate overall summary statistics
-    const avgFpsChange = comparisons.length > 0
-      ? comparisons.reduce((sum, c) => sum + c.changes.fpsChange, 0) / comparisons.length
-      : 0;
-
-    return {
-      comparisons,
-      summary: {
-        regressions: comparisons.filter(c => c.changes.isRegression).length,
-        improvements: comparisons.filter(c => c.changes.isImprovement).length,
-        stable: comparisons.filter(c => !c.changes.isRegression && !c.changes.isImprovement).length,
-        significantChanges: comparisons.filter(c => c.changes.isStatisticallySignificant &&
-          (c.changes.isRegression || c.changes.isImprovement)).length,
-        avgFpsChange,
-        overallStatus: avgFpsChange < -criticalThreshold ? 'critical'
-          : avgFpsChange < -warningThreshold ? 'warning'
-          : avgFpsChange > improvementThreshold ? 'improved'
-          : 'stable'
-      }
-    };
-  }
-  
-  /**
-   * Dispose of resources
-   */
-  dispose() {
-    if (this.renderer) {
-      this.renderer.dispose();
-      this.renderer = null;
-    }
-    if (this.gpuTimer) {
-      this.gpuTimer.dispose();
-      this.gpuTimer = null;
-    }
-    this.isActive = false;
-  }
-
-  /**
-   * Initialize GPU timer for precise GPU timing measurements
-   * @returns {GPUTimer|null} GPU timer instance or null if unavailable
-   */
-  initGPUTimer() {
-    if (!this.renderer) {
-      console.warn('[HighPerfBenchmark] Renderer not initialized, cannot create GPU timer');
-      return null;
-    }
-    const gl = this.renderer.gl;
-    if (!gl) return null;
-
-    this.gpuTimer = new GPUTimer(gl);
-    return this.gpuTimer;
-  }
-
-  /**
-   * Run a benchmark multiple times and average the results for reliability
-   * @param {string} name - Test name
-   * @param {number} runs - Number of runs to average
-   * @param {number} frames - Frames per run
-   * @param {number} warmupFrames - Warmup frames per run
-   * @param {Object} options - Additional options
-   * @returns {Promise<Object>} Averaged results with statistical analysis
-   */
-  async runMultiRunBenchmark(name, runs = 3, frames = 60, warmupFrames = 10, options = {}) {
-    const {
-      cooldownMs = 500,      // Time between runs to let GPU cool
-      removeOutliers = true,  // Remove statistical outliers
-      outlierThreshold = 2.5  // IQR multiplier for outlier detection
-    } = options;
-
-    const allResults = [];
-    const memorySnapshots = [];
-
-    console.log(`[Benchmark] Starting ${runs}-run benchmark: ${name}`);
-
-    for (let run = 0; run < runs; run++) {
-      // Track memory before run
-      const memBefore = this._getMemorySnapshot();
-
-      // Wait for cooldown between runs (except first)
-      if (run > 0 && cooldownMs > 0) {
-        await new Promise(resolve => setTimeout(resolve, cooldownMs));
-      }
-
-      const result = await this._runTimedTest(`${name} (run ${run + 1})`, frames, warmupFrames);
-      allResults.push(result);
-
-      // Track memory after run
-      const memAfter = this._getMemorySnapshot();
-      memorySnapshots.push({
-        run: run + 1,
-        before: memBefore,
-        after: memAfter,
-        delta: memAfter && memBefore ? memAfter.usedMB - memBefore.usedMB : null
-      });
-
-      console.log(`[Benchmark] Run ${run + 1}/${runs}: ${result.fps} FPS, ${result.avgFrameTime.toFixed(2)}ms avg`);
-    }
-
-    // Collect all frame times across runs
-    let allFrameTimes = allResults.flatMap(r => r.rawFrameTimes);
-
-    // Detect and optionally remove outliers
-    const outlierAnalysis = this._detectOutliers(allFrameTimes, outlierThreshold);
-
-    if (removeOutliers && outlierAnalysis.outliers.length > 0) {
-      allFrameTimes = outlierAnalysis.filtered;
-      console.log(`[Benchmark] Removed ${outlierAnalysis.outliers.length} outliers`);
-    }
-
-    // Calculate combined statistics
-    const sorted = [...allFrameTimes].sort((a, b) => a - b);
-    const n = sorted.length;
-    const sum = sorted.reduce((a, b) => a + b, 0);
-    const avg = sum / n;
-    const fps = 1000 / avg;
-
-    // Standard deviation
-    const sumSquares = sorted.reduce((a, b) => a + b * b, 0);
-    const variance = (sumSquares / n) - (avg * avg);
-    const stdDev = Math.sqrt(Math.max(0, variance));
-
-    // Confidence interval (95%)
-    const standardError = stdDev / Math.sqrt(n);
-    const marginOfError = 1.96 * standardError; // 95% CI
-    const confidenceInterval = {
-      lower: avg - marginOfError,
-      upper: avg + marginOfError,
-      marginOfError,
-      confidenceLevel: 0.95
-    };
-
-    // Percentiles
-    const getPercentile = (p) => {
-      if (n === 0) return 0;
-      if (n === 1) return sorted[0];
-      const idx = p * (n - 1);
-      const lower = Math.floor(idx);
-      const upper = Math.ceil(idx);
-      if (lower === upper) return sorted[lower];
-      const frac = idx - lower;
-      return sorted[lower] * (1 - frac) + sorted[upper] * frac;
-    };
-
-    // Detect thermal throttling (performance degradation across runs)
-    const thermalAnalysis = this._detectThermalThrottling(allResults);
-
-    // Jank analysis
-    const jankThreshold = avg * 1.5;
-    const jankFrames = allFrameTimes.filter(t => t > jankThreshold).length;
-
-    return {
-      name,
-      runs,
-      // Combined metrics
-      fps: Math.round(fps),
-      fpsRaw: fps,
-      avgFrameTime: avg,
-      minFrameTime: sorted[0],
-      maxFrameTime: sorted[n - 1],
-      medianFrameTime: getPercentile(0.50),
-      p95FrameTime: getPercentile(0.95),
-      p99FrameTime: getPercentile(0.99),
-      stdDev,
-      variance,
-
-      // Statistical reliability
-      confidenceInterval,
-      coefficientOfVariation: (stdDev / avg) * 100, // CV as percentage
-
-      // Outlier info
-      outlierAnalysis: {
-        detected: outlierAnalysis.outliers.length,
-        removed: removeOutliers ? outlierAnalysis.outliers.length : 0,
-        threshold: outlierThreshold
-      },
-
-      // Jank
-      jankFrames,
-      jankPercent: (jankFrames / n) * 100,
-
-      // Thermal throttling
-      thermalThrottling: thermalAnalysis,
-
-      // Memory
-      memoryAnalysis: {
-        snapshots: memorySnapshots,
-        avgDelta: memorySnapshots.filter(m => m.delta != null).reduce((s, m) => s + m.delta, 0) /
-          memorySnapshots.filter(m => m.delta != null).length || null
-      },
-
-      // Per-run breakdown
-      perRunResults: allResults.map(r => ({
-        fps: r.fps,
-        avgFrameTime: r.avgFrameTime,
-        stdDev: r.stdDev
-      })),
-
-      // Raw data
-      totalFrames: n,
-      rawFrameTimes: allFrameTimes
-    };
-  }
-
-  /**
-   * Detect statistical outliers using IQR method
-   * @private
-   */
-  _detectOutliers(frameTimes, threshold = 2.5) {
-    if (frameTimes.length < 4) {
-      return { outliers: [], filtered: frameTimes, bounds: null };
-    }
-
-    const sorted = [...frameTimes].sort((a, b) => a - b);
-    const n = sorted.length;
-
-    // Calculate quartiles
-    const q1Idx = Math.floor(n * 0.25);
-    const q3Idx = Math.floor(n * 0.75);
-    const q1 = sorted[q1Idx];
-    const q3 = sorted[q3Idx];
-    const iqr = q3 - q1;
-
-    // Define outlier bounds
-    const lowerBound = q1 - threshold * iqr;
-    const upperBound = q3 + threshold * iqr;
-
-    const outliers = [];
-    const filtered = [];
-
-    for (const value of frameTimes) {
-      if (value < lowerBound || value > upperBound) {
-        outliers.push(value);
-      } else {
-        filtered.push(value);
-      }
-    }
-
-    return {
-      outliers,
-      filtered,
-      bounds: { lower: lowerBound, upper: upperBound, q1, q3, iqr }
-    };
-  }
-
-  /**
-   * Detect thermal throttling by analyzing performance degradation across runs
-   * @private
-   */
-  _detectThermalThrottling(runResults) {
-    if (runResults.length < 2) {
-      return { detected: false, severity: 'none', message: 'Insufficient runs for analysis' };
-    }
-
-    // Compare first run vs last run FPS
-    const firstRun = runResults[0];
-    const lastRun = runResults[runResults.length - 1];
-    const fpsDropPercent = ((firstRun.fps - lastRun.fps) / firstRun.fps) * 100;
-
-    // Calculate trend across all runs
-    const fpsTrend = runResults.map((r, i) => ({ run: i + 1, fps: r.fps }));
-    const avgFpsChange = runResults.slice(1).reduce((sum, r, i) => {
-      return sum + (r.fps - runResults[i].fps);
-    }, 0) / (runResults.length - 1);
-
-    let severity = 'none';
-    let detected = false;
-    let message = 'No thermal throttling detected';
-
-    if (fpsDropPercent > 15) {
-      severity = 'severe';
-      detected = true;
-      message = `Severe throttling: ${fpsDropPercent.toFixed(1)}% FPS drop from first to last run`;
-    } else if (fpsDropPercent > 8) {
-      severity = 'moderate';
-      detected = true;
-      message = `Moderate throttling: ${fpsDropPercent.toFixed(1)}% FPS drop`;
-    } else if (fpsDropPercent > 3) {
-      severity = 'mild';
-      detected = true;
-      message = `Mild throttling: ${fpsDropPercent.toFixed(1)}% FPS drop`;
-    }
-
-    return {
-      detected,
-      severity,
-      message,
-      fpsDropPercent,
-      avgFpsChange,
-      trend: fpsTrend,
-      recommendation: detected
-        ? 'Consider adding longer cooldown between runs or reducing test duration'
-        : null
-    };
-  }
-
-  /**
-   * Get current memory snapshot (Chrome only)
-   * @private
-   */
-  _getMemorySnapshot() {
-    if (typeof performance !== 'undefined' && performance.memory) {
-      return {
-        usedMB: performance.memory.usedJSHeapSize / (1024 * 1024),
-        totalMB: performance.memory.totalJSHeapSize / (1024 * 1024),
-        limitMB: performance.memory.jsHeapSizeLimit / (1024 * 1024)
-      };
-    }
-    return null;
-  }
-
-  /**
-   * Validate benchmark results for sanity
-   * @param {Object} results - Benchmark results to validate
-   * @returns {Object} Validation result with issues array
-   */
-  validateResults(results) {
-    const issues = [];
-
-    // Check FPS is reasonable
-    if (results.fps <= 0) {
-      issues.push({ severity: 'error', field: 'fps', message: 'FPS is zero or negative' });
-    } else if (results.fps > 1000) {
-      issues.push({ severity: 'warning', field: 'fps', message: 'FPS unrealistically high (>1000)' });
-    }
-
-    // Check frame times are positive
-    if (results.avgFrameTime <= 0) {
-      issues.push({ severity: 'error', field: 'avgFrameTime', message: 'Average frame time is zero or negative' });
-    }
-
-    // Check min/max relationship
-    if (results.minFrameTime > results.maxFrameTime) {
-      issues.push({ severity: 'error', field: 'minMaxFrameTime', message: 'Min frame time > max frame time' });
-    }
-
-    // Check percentile ordering
-    if (results.medianFrameTime > results.p95FrameTime) {
-      issues.push({ severity: 'warning', field: 'percentiles', message: 'Median > P95 (unexpected)' });
-    }
-    if (results.p95FrameTime > results.p99FrameTime) {
-      issues.push({ severity: 'warning', field: 'percentiles', message: 'P95 > P99 (unexpected)' });
-    }
-
-    // Check standard deviation is non-negative
-    if (results.stdDev < 0) {
-      issues.push({ severity: 'error', field: 'stdDev', message: 'Standard deviation is negative' });
-    }
-
-    // Check jank percentage is in valid range
-    if (results.jankPercent < 0 || results.jankPercent > 100) {
-      issues.push({ severity: 'error', field: 'jankPercent', message: 'Jank percentage out of range [0, 100]' });
-    }
-
-    // Check frame count matches raw data
-    if (results.rawFrameTimes && results.frames !== results.rawFrameTimes.length) {
-      issues.push({
-        severity: 'warning',
-        field: 'frames',
-        message: `Frame count (${results.frames}) doesn't match raw data length (${results.rawFrameTimes.length})`
-      });
-    }
-
-    // Check coefficient of variation (high = unstable)
-    if (results.coefficientOfVariation && results.coefficientOfVariation > 50) {
-      issues.push({
-        severity: 'warning',
-        field: 'stability',
-        message: `High coefficient of variation (${results.coefficientOfVariation.toFixed(1)}%) indicates unstable performance`
-      });
-    }
-
-    return {
-      valid: issues.filter(i => i.severity === 'error').length === 0,
-      issues,
-      errorCount: issues.filter(i => i.severity === 'error').length,
-      warningCount: issues.filter(i => i.severity === 'warning').length
-    };
-  }
-
-  /**
-   * Save benchmark results to localStorage as a baseline
-   * @param {Object} results - Benchmark results
-   * @param {string} key - Storage key
-   */
-  saveBaseline(results, key = 'benchmark-baseline') {
-    if (typeof localStorage === 'undefined') {
-      console.warn('[HighPerfBenchmark] localStorage not available');
-      return false;
-    }
-
-    const baseline = {
-      results,
-      savedAt: new Date().toISOString(),
-      userAgent: typeof navigator !== 'undefined' ? navigator.userAgent : null
-    };
-
-    try {
-      localStorage.setItem(key, JSON.stringify(baseline));
-      console.log(`[HighPerfBenchmark] Baseline saved to "${key}"`);
-      return true;
-    } catch (e) {
-      console.error('[HighPerfBenchmark] Failed to save baseline:', e);
-      return false;
-    }
-  }
-
-  /**
-   * Load baseline from localStorage
-   * @param {string} key - Storage key
-   * @returns {Object|null} Baseline data or null
-   */
-  loadBaseline(key = 'benchmark-baseline') {
-    if (typeof localStorage === 'undefined') {
-      return null;
-    }
-
-    try {
-      const data = localStorage.getItem(key);
-      if (!data) return null;
-      return JSON.parse(data);
-    } catch (e) {
-      console.error('[HighPerfBenchmark] Failed to load baseline:', e);
-      return null;
-    }
-  }
-
-  /**
-   * Delete baseline from localStorage
-   * @param {string} key - Storage key
-   */
-  deleteBaseline(key = 'benchmark-baseline') {
-    if (typeof localStorage !== 'undefined') {
-      localStorage.removeItem(key);
-    }
-  }
-
-  /**
-   * Run benchmark with GPU timing (if available)
-   * @param {string} name - Test name
-   * @param {number} frames - Number of frames
-   * @param {number} warmupFrames - Warmup frames
-   * @returns {Promise<Object>} Results including GPU timing
-   */
-  async runTimedTestWithGPU(name, frames = 60, warmupFrames = 10) {
-    // Initialize GPU timer if not already done
-    if (!this.gpuTimer) {
-      this.initGPUTimer();
-    }
-
-    const result = await this._runTimedTestWithGPUTiming(name, frames, warmupFrames);
-    return result;
-  }
-
-  /**
-   * Internal method to run timed test with GPU timing
-   * @private
-   */
-  async _runTimedTestWithGPUTiming(name, frames, warmupFrames = 10) {
-    return new Promise((resolve) => {
-      const frameTimes = [];
-      const gpuFrameTimes = [];
-      let totalFrameAttempts = 0;
-      let warmupCount = 0;
-      let lastFrameStart = performance.now();
-
-      const measure = () => {
-        const now = performance.now();
-        const frameTime = now - lastFrameStart;
-        lastFrameStart = now;
-
-        // Poll GPU timer for completed results
-        if (this.gpuTimer) {
-          const gpuResults = this.gpuTimer.poll();
-          for (const result of gpuResults) {
-            gpuFrameTimes.push(result.gpuTimeMs);
-          }
-        }
-
-        // Warmup phase
-        if (warmupCount < warmupFrames) {
-          warmupCount++;
-          if (this.gpuTimer) {
-            const query = this.gpuTimer.begin('warmup');
-            this.render();  // Uses default render params
-            this.gpuTimer.end(query);
-          } else {
-            this.render();  // Uses default render params
-          }
-          requestAnimationFrame(measure);
-          return;
-        }
-
-        // Measurement phase
-        if (frameTimes.length >= frames) {
-          // Final poll for remaining GPU timings
-          if (this.gpuTimer) {
-            // Give GPU time to finish
-            setTimeout(() => {
-              const finalResults = this.gpuTimer.poll();
-              for (const result of finalResults) {
-                gpuFrameTimes.push(result.gpuTimeMs);
-              }
-
-              resolve(this._buildResultsWithGPU(name, frameTimes, gpuFrameTimes, totalFrameAttempts, warmupFrames));
-            }, 50);
-            return;
-          }
-
-          resolve(this._buildResultsWithGPU(name, frameTimes, gpuFrameTimes, totalFrameAttempts, warmupFrames));
-          return;
-        }
-
-        // Render with GPU timing
-        if (this.gpuTimer) {
-          const query = this.gpuTimer.begin('frame');
-          this.render();  // Uses default render params
-          this.gpuTimer.end(query);
-        } else {
-          this.render();  // Uses default render params
-        }
-
-        totalFrameAttempts++;
-
-        if (totalFrameAttempts > 1 && frameTime > 0.1 && frameTime < 1000) {
-          frameTimes.push(frameTime);
-        }
-
-        requestAnimationFrame(measure);
-      };
-
-      requestAnimationFrame(measure);
-    });
-  }
-
-  /**
-   * Build results object including GPU timing data
-   * @private
-   */
-  _buildResultsWithGPU(name, frameTimes, gpuFrameTimes, totalFrameAttempts, warmupFrames) {
-    const sorted = [...frameTimes].sort((a, b) => a - b);
-    const n = sorted.length;
-    const sum = sorted.reduce((a, b) => a + b, 0);
-    const avg = sum / n;
-    const fps = 1000 / avg;
-
-    const sumSquares = sorted.reduce((a, b) => a + b * b, 0);
-    const variance = (sumSquares / n) - (avg * avg);
-    const stdDev = Math.sqrt(Math.max(0, variance));
-
-    const getPercentile = (p) => {
-      if (n === 0) return 0;
-      if (n === 1) return sorted[0];
-      const idx = p * (n - 1);
-      const lower = Math.floor(idx);
-      const upper = Math.ceil(idx);
-      if (lower === upper) return sorted[lower];
-      const frac = idx - lower;
-      return sorted[lower] * (1 - frac) + sorted[upper] * frac;
-    };
-
-    // GPU timing statistics
-    let gpuStats = null;
-    if (gpuFrameTimes.length > 0) {
-      const gpuSorted = [...gpuFrameTimes].sort((a, b) => a - b);
-      const gpuSum = gpuSorted.reduce((a, b) => a + b, 0);
-      const gpuAvg = gpuSum / gpuSorted.length;
-      gpuStats = {
-        avgGpuTime: gpuAvg,
-        minGpuTime: gpuSorted[0],
-        maxGpuTime: gpuSorted[gpuSorted.length - 1],
-        samples: gpuSorted.length,
-        gpuBoundRatio: gpuAvg / avg // Ratio of GPU time to total frame time
-      };
-    }
-
-    const jankThreshold = avg * 1.5;
-    const jankFrames = frameTimes.filter(t => t > jankThreshold).length;
-
-    return {
-      name,
-      avgFrameTime: avg,
-      fps: Math.round(fps),
-      fpsRaw: fps,
-      minFrameTime: sorted[0],
-      maxFrameTime: sorted[n - 1],
-      medianFrameTime: getPercentile(0.50),
-      p95FrameTime: getPercentile(0.95),
-      p99FrameTime: getPercentile(0.99),
-      stdDev,
-      frames: n,
-      totalFrameAttempts,
-      warmupFrames,
-      jankFrames,
-      jankPercent: (jankFrames / n) * 100,
-      gpuTiming: gpuStats,
-      rawFrameTimes: frameTimes,
-      rawGpuFrameTimes: gpuFrameTimes.length > 0 ? gpuFrameTimes : null
-    };
-  }
+  let state = seed >>> 0;
+  return function nextUnit() {
+    state = (state + 0x9e3779b9) >>> 0;
+    let z = state;
+    z = Math.imul(z ^ (z >>> 16), 0x21f0aaad) >>> 0;
+    z = Math.imul(z ^ (z >>> 15), 0x735a2d97) >>> 0;
+    z = (z ^ (z >>> 15)) >>> 0;
+    return z / 4294967296;
+  };
+}
+
+let activeSyntheticSeed = DEFAULT_SYNTHETIC_SEED;
+let syntheticUnitRandom = createSeededUnitStream(activeSyntheticSeed);
+
+/**
+ * Restart the generation stream so a generator call is reproducible from its
+ * first draw, whatever ran before it. Every public generator entry point calls
+ * this, which is what makes two calls with equal arguments produce byte-equal
+ * datasets.
+ */
+function restartSyntheticStream() {
+  syntheticUnitRandom = createSeededUnitStream(activeSyntheticSeed);
 }
 
 /**
@@ -1474,7 +281,14 @@ export class GLBParser {
  * Surface sampler for generating points on mesh triangles
  */
 export class MeshSurfaceSampler {
-  constructor(positions, indices) {
+  /**
+   * @param {Float32Array} positions - XYZ vertices.
+   * @param {Uint8Array|Uint16Array|Uint32Array|null} indices - Triangle indices.
+   * @param {(() => number)|null} [unitRandom] - Unit-interval source. Defaults
+   *   to the module's seeded generation stream, so a sampler built during a
+   *   generator call inherits that call's determinism.
+   */
+  constructor(positions, indices, unitRandom = null) {
     if (
       !(positions instanceof Float32Array) ||
       positions.length < 9 ||
@@ -1506,8 +320,14 @@ export class MeshSurfaceSampler {
         'A non-indexed mesh must contain complete triangle vertices.'
       );
     }
+    if (unitRandom !== null && typeof unitRandom !== 'function') {
+      throw new TypeError(
+        'Mesh surface unit-random source must be null or a function.'
+      );
+    }
     this.positions = positions;
     this.indices = indices;
+    this._unitRandom = unitRandom;
     this.triangleCount = indices ? indices.length / 3 : positions.length / 9;
 
     // Float64 cumulative weights avoid precision collapse on large meshes.
@@ -1615,13 +435,16 @@ export class MeshSurfaceSampler {
     normalTarget,
     normalOffset
   ) {
-    const r = Math.random() * this.totalArea;
+    const nextUnit = this._unitRandom === null
+      ? syntheticUnitRandom
+      : this._unitRandom;
+    const r = nextUnit() * this.totalArea;
     const triIdx = this._binarySearchTriangle(r);
     const dataOffset = triIdx * 12;
 
     // Random barycentric coordinates
-    let u = Math.random();
-    let v = Math.random();
+    let u = nextUnit();
+    let v = nextUnit();
     if (u + v > 1) {
       u = 1 - u;
       v = 1 - v;
@@ -1712,11 +535,38 @@ export class MeshSurfaceSampler {
  * Generate synthetic point cloud data
  */
 export class SyntheticDataGenerator {
+  /**
+   * The seed the next generator call will restart from.
+   *
+   * @returns {number} Active seed.
+   */
+  static get seed() {
+    return activeSyntheticSeed;
+  }
+
+  /**
+   * Vary the dataset deliberately. Comparing two runs is only meaningful when
+   * they share a seed, so this is the single place a run declares that it
+   * wants a different point cloud rather than getting one by accident.
+   *
+   * @param {number} seed - Safe-integer seed.
+   * @returns {number} The accepted seed.
+   */
+  static setSeed(seed) {
+    if (!Number.isSafeInteger(seed)) {
+      throw new TypeError('Synthetic generation seed must be one safe integer.');
+    }
+    activeSyntheticSeed = seed;
+    restartSyntheticStream();
+    return activeSyntheticSeed;
+  }
 
   /**
    * Generate octopus-like structure with body and tentacles
    */
   static octopus(count, numTentacles = 10) {
+    requireSyntheticPointCount(count);
+    restartSyntheticStream();
     console.log(`Generating ${count.toLocaleString()} points (octopus with ${numTentacles} tentacles)...`);
     const startTime = performance.now();
 
@@ -1728,9 +578,9 @@ export class SyntheticDataGenerator {
     const bodyCenter = [0, 0.28, 0];
     const bodyFreq = 0.4; // 40% of points in body to create dense cluster
     const bodyHotspots = Array.from({ length: 5 }, () => ({
-      theta: Math.random() * Math.PI * 2,
-      phi: Math.PI * 0.5 + (Math.random() - 0.5) * 0.4,
-      boost: 0.4 + Math.random() * 0.7
+      theta: syntheticUnitRandom() * Math.PI * 2,
+      phi: Math.PI * 0.5 + (syntheticUnitRandom() - 0.5) * 0.4,
+      boost: 0.4 + syntheticUnitRandom() * 0.7
     }));
 
     // Tentacle parameters - tighter curls with self-intersections
@@ -1745,29 +595,29 @@ export class SyntheticDataGenerator {
     // Generate tentacle base angles
     const tentacles = [];
     for (let t = 0; t < numTentacles; t++) {
-      const baseAngle = (t / numTentacles) * Math.PI * 2 + (Math.random() - 0.5) * 0.28;
-      const tiltAngle = Math.PI * 0.58 + (Math.random() - 0.5) * 0.32; // angle from vertical
+      const baseAngle = (t / numTentacles) * Math.PI * 2 + (syntheticUnitRandom() - 0.5) * 0.28;
+      const tiltAngle = Math.PI * 0.58 + (syntheticUnitRandom() - 0.5) * 0.32; // angle from vertical
       const hue = 0.02 + t * 0.015; // slight color variation per tentacle
-      const wrapTurns = 2.5 + Math.random() * 2.5; // coils around body
-      const wrapRadius = 0.35 + Math.random() * 0.35;
-      const wrapPhase = Math.random() * Math.PI * 2;
-      const wobblePhase = Math.random() * Math.PI * 2;
-      const suctionBands = 3 + Math.floor(Math.random() * 4);
+      const wrapTurns = 2.5 + syntheticUnitRandom() * 2.5; // coils around body
+      const wrapRadius = 0.35 + syntheticUnitRandom() * 0.35;
+      const wrapPhase = syntheticUnitRandom() * Math.PI * 2;
+      const wobblePhase = syntheticUnitRandom() * Math.PI * 2;
+      const suctionBands = 3 + Math.floor(syntheticUnitRandom() * 4);
       tentacles.push({ baseAngle, tiltAngle, hue, wrapTurns, wrapRadius, wrapPhase, wobblePhase, suctionBands });
     }
 
     for (let i = 0; i < count; i++) {
       const idx = i * 3;
-      const r = Math.random();
+      const r = syntheticUnitRandom();
 
       if (r < bodyFreq) {
         // Body point - lumpy ellipsoid with dense core
-        const hotspot = bodyHotspots[Math.floor(Math.random() * bodyHotspots.length)];
-        const useHotspot = Math.random() < 0.65;
-        const theta = useHotspot ? hotspot.theta + (Math.random() - 0.5) * 0.35 : Math.random() * Math.PI * 2;
-        const phi = useHotspot ? hotspot.phi + (Math.random() - 0.5) * 0.35 : Math.acos(2 * Math.random() - 1);
+        const hotspot = bodyHotspots[Math.floor(syntheticUnitRandom() * bodyHotspots.length)];
+        const useHotspot = syntheticUnitRandom() < 0.65;
+        const theta = useHotspot ? hotspot.theta + (syntheticUnitRandom() - 0.5) * 0.35 : syntheticUnitRandom() * Math.PI * 2;
+        const phi = useHotspot ? hotspot.phi + (syntheticUnitRandom() - 0.5) * 0.35 : Math.acos(2 * syntheticUnitRandom() - 1);
         const radiusScale = useHotspot ? hotspot.boost : 1;
-        const radius = bodyRadius * (0.3 + Math.pow(Math.random(), useHotspot ? 1.35 : 1.8) * 0.9) * radiusScale;
+        const radius = bodyRadius * (0.3 + Math.pow(syntheticUnitRandom(), useHotspot ? 1.35 : 1.8) * 0.9) * radiusScale;
 
         positions[idx] = bodyCenter[0] + radius * Math.sin(phi) * Math.cos(theta) * 1.35;
         positions[idx + 1] = bodyCenter[1] + radius * Math.cos(phi) * 0.9;
@@ -1775,9 +625,9 @@ export class SyntheticDataGenerator {
 
         // Body color with variation (convert to uint8)
         const cidx = i * 4;
-        colors[cidx] = Math.round(Math.max(0, Math.min(1, bodyColor[0] + (Math.random() - 0.5) * 0.12)) * 255);
-        colors[cidx + 1] = Math.round(Math.max(0, Math.min(1, bodyColor[1] + (Math.random() - 0.5) * 0.12)) * 255);
-        colors[cidx + 2] = Math.round(Math.max(0, Math.min(1, bodyColor[2] + (Math.random() - 0.5) * 0.12)) * 255);
+        colors[cidx] = Math.round(Math.max(0, Math.min(1, bodyColor[0] + (syntheticUnitRandom() - 0.5) * 0.12)) * 255);
+        colors[cidx + 1] = Math.round(Math.max(0, Math.min(1, bodyColor[1] + (syntheticUnitRandom() - 0.5) * 0.12)) * 255);
+        colors[cidx + 2] = Math.round(Math.max(0, Math.min(1, bodyColor[2] + (syntheticUnitRandom() - 0.5) * 0.12)) * 255);
         colors[cidx + 3] = 255; // full alpha
       } else {
         // Tentacle point
@@ -1785,7 +635,7 @@ export class SyntheticDataGenerator {
         const tent = tentacles[Math.min(tentacleIdx, numTentacles - 1)];
 
         // Position along tentacle (0 = base, 1 = tip), biased toward base for density
-        const t = Math.pow(Math.random(), 1.35);
+        const t = Math.pow(syntheticUnitRandom(), 1.35);
         const thickness = tentacleThickness * (1.1 - t * 0.5); // thicker near base
 
         // Base position where tentacle attaches to body
@@ -1809,9 +659,9 @@ export class SyntheticDataGenerator {
         const tentZ = baseZ + t * tentacleLength * Math.sin(tent.tiltAngle + bend * 0.35) * Math.sin(tent.baseAngle + bend) + wave2 + swirlZ;
 
         // Add thickness with suction-band clumping
-        const thickAngle = Math.random() * Math.PI * 2;
+        const thickAngle = syntheticUnitRandom() * Math.PI * 2;
         const ring = (Math.sin(t * tent.suctionBands * Math.PI * 2 + tent.wobblePhase) + 1) * 0.5;
-        const thickR = Math.sqrt(Math.random()) * thickness * (1 + ring * 0.65);
+        const thickR = Math.sqrt(syntheticUnitRandom()) * thickness * (1 + ring * 0.65);
 
         positions[idx] = tentX + thickR * Math.cos(thickAngle);
         positions[idx + 1] = tentY + thickR * Math.sin(thickAngle) * 0.6;
@@ -1820,9 +670,9 @@ export class SyntheticDataGenerator {
         // Tentacle color - gradient with darker tips and band highlights (convert to uint8)
         const tentColor = this._hslToRgb(tent.hue, 0.72, 0.48 - t * 0.22 + ring * 0.08);
         const cidx = i * 4;
-        colors[cidx] = Math.round(Math.max(0, Math.min(1, tentColor[0] + (Math.random() - 0.5) * 0.08)) * 255);
-        colors[cidx + 1] = Math.round(Math.max(0, Math.min(1, tentColor[1] + (Math.random() - 0.5) * 0.08)) * 255);
-        colors[cidx + 2] = Math.round(Math.max(0, Math.min(1, tentColor[2] + (Math.random() - 0.5) * 0.08)) * 255);
+        colors[cidx] = Math.round(Math.max(0, Math.min(1, tentColor[0] + (syntheticUnitRandom() - 0.5) * 0.08)) * 255);
+        colors[cidx + 1] = Math.round(Math.max(0, Math.min(1, tentColor[1] + (syntheticUnitRandom() - 0.5) * 0.08)) * 255);
+        colors[cidx + 2] = Math.round(Math.max(0, Math.min(1, tentColor[2] + (syntheticUnitRandom() - 0.5) * 0.08)) * 255);
         colors[cidx + 3] = 255; // full alpha
       }
     }
@@ -1836,6 +686,8 @@ export class SyntheticDataGenerator {
    * Generate 3D spiral/helix structures
    */
   static spirals(count, numSpirals = 7) {
+    requireSyntheticPointCount(count);
+    restartSyntheticStream();
     console.log(`Generating ${count.toLocaleString()} points (${numSpirals} spirals)...`);
     const startTime = performance.now();
 
@@ -1844,31 +696,31 @@ export class SyntheticDataGenerator {
 
     // Generate spiral configurations
     const spiralConfigs = [];
-    const globalBraidPhase = Math.random() * Math.PI * 2;
+    const globalBraidPhase = syntheticUnitRandom() * Math.PI * 2;
     for (let s = 0; s < numSpirals; s++) {
       spiralConfigs.push({
         // Starting position
-        startX: (Math.random() - 0.5) * 0.8,
-        startY: (Math.random() - 0.5) * 0.8,
-        startZ: (Math.random() - 0.5) * 0.8,
+        startX: (syntheticUnitRandom() - 0.5) * 0.8,
+        startY: (syntheticUnitRandom() - 0.5) * 0.8,
+        startZ: (syntheticUnitRandom() - 0.5) * 0.8,
         // Direction (normalized)
-        dirTheta: Math.random() * Math.PI * 2,
-        dirPhi: Math.PI * 0.35 + Math.random() * Math.PI * 0.6,
+        dirTheta: syntheticUnitRandom() * Math.PI * 2,
+        dirPhi: Math.PI * 0.35 + syntheticUnitRandom() * Math.PI * 0.6,
         // Spiral parameters
-        radius: 0.18 + Math.random() * 0.18,
-        length: 0.9 + Math.random() * 1.1,
-        turns: 4 + Math.random() * 4,
-        thickness: 0.035 + Math.random() * 0.035,
+        radius: 0.18 + syntheticUnitRandom() * 0.18,
+        length: 0.9 + syntheticUnitRandom() * 1.1,
+        turns: 4 + syntheticUnitRandom() * 4,
+        thickness: 0.035 + syntheticUnitRandom() * 0.035,
         // Color
         hue: s / Math.max(1, numSpirals - 1),
         // Taper
-        taper: Math.random() < 0.65,
-        orbitRadius: 0.25 + Math.random() * 0.25,
-        orbitTurns: 2 + Math.random() * 3,
-        strandCount: 2 + Math.floor(Math.random() * 3),
-        kink: 0.06 + Math.random() * 0.08,
-        noiseFreq: 2 + Math.random() * 4,
-        orbitPhase: globalBraidPhase + (Math.random() - 0.5) * Math.PI
+        taper: syntheticUnitRandom() < 0.65,
+        orbitRadius: 0.25 + syntheticUnitRandom() * 0.25,
+        orbitTurns: 2 + syntheticUnitRandom() * 3,
+        strandCount: 2 + Math.floor(syntheticUnitRandom() * 3),
+        kink: 0.06 + syntheticUnitRandom() * 0.08,
+        noiseFreq: 2 + syntheticUnitRandom() * 4,
+        orbitPhase: globalBraidPhase + (syntheticUnitRandom() - 0.5) * Math.PI
       });
     }
 
@@ -1880,7 +732,7 @@ export class SyntheticDataGenerator {
       const sp = spiralConfigs[spiralIdx];
 
       // Position along spiral (0-1), biased to start for heavier overlap
-      const t = Math.pow(Math.random(), 1.25);
+      const t = Math.pow(syntheticUnitRandom(), 1.25);
 
       // Direction vectors
       const dirX = Math.sin(sp.dirPhi) * Math.cos(sp.dirTheta);
@@ -1898,7 +750,7 @@ export class SyntheticDataGenerator {
       const orbitAngle = sp.orbitPhase + t * sp.orbitTurns * Math.PI * 2;
       const orbitR = sp.orbitRadius * (1 - t * 0.3);
 
-      const strandPhase = (Math.floor(Math.random() * sp.strandCount) / sp.strandCount) * Math.PI * 2;
+      const strandPhase = (Math.floor(syntheticUnitRandom() * sp.strandCount) / sp.strandCount) * Math.PI * 2;
       const wobble = Math.sin(t * sp.noiseFreq * Math.PI * 2 + sp.orbitPhase) * sp.kink +
         Math.cos(t * sp.noiseFreq * Math.PI + sp.orbitPhase * 0.5) * sp.kink * 0.5;
 
@@ -1924,9 +776,9 @@ export class SyntheticDataGenerator {
       const band = (Math.sin(angle * 0.5 + sp.orbitPhase) + 1) * 0.12;
       const color = this._hslToRgb((sp.hue + t * 0.12 + band * 0.1) % 1, 0.78, 0.42 + t * 0.18 + band * 0.15);
       const cidx = i * 4;
-      colors[cidx] = Math.round(Math.max(0, Math.min(1, color[0] + (Math.random() - 0.5) * 0.08)) * 255);
-      colors[cidx + 1] = Math.round(Math.max(0, Math.min(1, color[1] + (Math.random() - 0.5) * 0.08)) * 255);
-      colors[cidx + 2] = Math.round(Math.max(0, Math.min(1, color[2] + (Math.random() - 0.5) * 0.08)) * 255);
+      colors[cidx] = Math.round(Math.max(0, Math.min(1, color[0] + (syntheticUnitRandom() - 0.5) * 0.08)) * 255);
+      colors[cidx + 1] = Math.round(Math.max(0, Math.min(1, color[1] + (syntheticUnitRandom() - 0.5) * 0.08)) * 255);
+      colors[cidx + 2] = Math.round(Math.max(0, Math.min(1, color[2] + (syntheticUnitRandom() - 0.5) * 0.08)) * 255);
       colors[cidx + 3] = 255; // full alpha
     }
 
@@ -1939,6 +791,8 @@ export class SyntheticDataGenerator {
    * Generate 2D UMAP-like flat structure with clusters
    */
   static flatUMAP(count, numClusters = 25) {
+    requireSyntheticPointCount(count);
+    restartSyntheticStream();
     console.log(`Generating ${count.toLocaleString()} points (2D UMAP, ${numClusters} clusters)...`);
     const startTime = performance.now();
 
@@ -1954,31 +808,31 @@ export class SyntheticDataGenerator {
       // Use force-directed-like placement to avoid overlap
       let cx, cy, attempts = 0;
       do {
-        cx = (Math.random() - 0.5) * 1.8;
-        cy = (Math.random() - 0.5) * 1.8;
+        cx = (syntheticUnitRandom() - 0.5) * 1.8;
+        cy = (syntheticUnitRandom() - 0.5) * 1.8;
         attempts++;
       } while (attempts < 50 && clusters.some(cl =>
         Math.hypot(cl.center[0] - cx, cl.center[1] - cy) < 0.2
       ));
 
-      const isElongated = Math.random() < 0.4;
-      const angle = Math.random() * Math.PI;
+      const isElongated = syntheticUnitRandom() < 0.4;
+      const angle = syntheticUnitRandom() * Math.PI;
 
       clusters.push({
         center: [cx, cy],
-        spread: 0.04 + Math.random() * 0.08,
-        elongation: isElongated ? [1.5 + Math.random(), 0.4 + Math.random() * 0.3] : [1, 1],
+        spread: 0.04 + syntheticUnitRandom() * 0.08,
+        elongation: isElongated ? [1.5 + syntheticUnitRandom(), 0.4 + syntheticUnitRandom() * 0.3] : [1, 1],
         angle: angle,
         color: this._hslToRgb(c / numClusters, 0.7, 0.5),
-        weight: 0.5 + Math.random() * 1.5
+        weight: 0.5 + syntheticUnitRandom() * 1.5
       });
     }
 
     // Add some bridge/stream populations
     const numBridges = Math.floor(numClusters * 0.2);
     for (let b = 0; b < numBridges; b++) {
-      const c1 = clusters[Math.floor(Math.random() * numClusters)];
-      const c2 = clusters[Math.floor(Math.random() * numClusters)];
+      const c1 = clusters[Math.floor(syntheticUnitRandom() * numClusters)];
+      const c2 = clusters[Math.floor(syntheticUnitRandom() * numClusters)];
       if (c1 !== c2) {
         clusters.push({
           center: [(c1.center[0] + c2.center[0]) / 2, (c1.center[1] + c2.center[1]) / 2],
@@ -2011,7 +865,7 @@ export class SyntheticDataGenerator {
       const idx = i * 3;
 
       // Sample cluster
-      const r = Math.random();
+      const r = syntheticUnitRandom();
       let clusterIdx = cumDist.findIndex(c => r <= c);
       if (clusterIdx < 0) clusterIdx = clusters.length - 1;
       const cluster = clusters[clusterIdx];
@@ -2020,7 +874,7 @@ export class SyntheticDataGenerator {
 
       if (cluster.isBridge) {
         // Bridge point
-        const t = Math.random();
+        const t = syntheticUnitRandom();
         x = cluster.bridgeFrom[0] + t * (cluster.bridgeTo[0] - cluster.bridgeFrom[0]);
         y = cluster.bridgeFrom[1] + t * (cluster.bridgeTo[1] - cluster.bridgeFrom[1]);
         x += this._gaussianRandom() * cluster.spread;
@@ -2042,9 +896,9 @@ export class SyntheticDataGenerator {
 
       // Color (convert to uint8)
       const cidx = i * 4;
-      colors[cidx] = Math.round(Math.max(0, Math.min(1, cluster.color[0] + (Math.random() - 0.5) * 0.06)) * 255);
-      colors[cidx + 1] = Math.round(Math.max(0, Math.min(1, cluster.color[1] + (Math.random() - 0.5) * 0.06)) * 255);
-      colors[cidx + 2] = Math.round(Math.max(0, Math.min(1, cluster.color[2] + (Math.random() - 0.5) * 0.06)) * 255);
+      colors[cidx] = Math.round(Math.max(0, Math.min(1, cluster.color[0] + (syntheticUnitRandom() - 0.5) * 0.06)) * 255);
+      colors[cidx + 1] = Math.round(Math.max(0, Math.min(1, cluster.color[1] + (syntheticUnitRandom() - 0.5) * 0.06)) * 255);
+      colors[cidx + 2] = Math.round(Math.max(0, Math.min(1, cluster.color[2] + (syntheticUnitRandom() - 0.5) * 0.06)) * 255);
       colors[cidx + 3] = 255; // full alpha
     }
 
@@ -2058,6 +912,8 @@ export class SyntheticDataGenerator {
    * Designed to look closer to real embeddings while stressing LOD/culling.
    */
   static atlasLike(count, options = {}) {
+    requireSyntheticPointCount(count);
+    restartSyntheticStream();
     const {
       batches = 3,
       cellTypes = Math.max(16, Math.floor(count / 3500)),
@@ -2084,29 +940,29 @@ export class SyntheticDataGenerator {
     // Batch offsets to simulate lab/batch shifts
     const batchOffsets = Array.from({ length: Math.max(1, Math.floor(batches)) }, () => ({
       offset: [
-        (Math.random() - 0.5) * (strongBatchEffects ? 0.45 : 0.18),
-        (Math.random() - 0.5) * (strongBatchEffects ? 0.35 : 0.14),
-        (Math.random() - 0.5) * (strongBatchEffects ? 0.55 : 0.22)
+        (syntheticUnitRandom() - 0.5) * (strongBatchEffects ? 0.45 : 0.18),
+        (syntheticUnitRandom() - 0.5) * (strongBatchEffects ? 0.35 : 0.14),
+        (syntheticUnitRandom() - 0.5) * (strongBatchEffects ? 0.55 : 0.22)
       ],
-      tint: (Math.random() - 0.5) * (strongBatchEffects ? 0.18 : 0.08)
+      tint: (syntheticUnitRandom() - 0.5) * (strongBatchEffects ? 0.18 : 0.08)
     }));
 
     // Build anchor clusters arranged on a loose ring
     const anchors = [];
     for (let i = 0; i < safeCellTypes; i++) {
-      const angle = i * goldenAngle + (Math.random() - 0.5) * 0.1;
-      const radius = 0.25 + Math.random() * 1.15;
+      const angle = i * goldenAngle + (syntheticUnitRandom() - 0.5) * 0.1;
+      const radius = 0.25 + syntheticUnitRandom() * 1.15;
       const layer = ((i % 3) - 1) * layerDepth * 0.5;
       const center = [
-        Math.cos(angle) * radius + (Math.random() - 0.5) * 0.1,
-        Math.sin(angle) * radius + (Math.random() - 0.5) * 0.1,
+        Math.cos(angle) * radius + (syntheticUnitRandom() - 0.5) * 0.1,
+        Math.sin(angle) * radius + (syntheticUnitRandom() - 0.5) * 0.1,
         layer
       ];
-      const major = 0.025 + Math.random() * 0.05;
-      const minor = major * (0.55 + Math.random() * 0.9);
-      const theta = Math.random() * Math.PI;
+      const major = 0.025 + syntheticUnitRandom() * 0.05;
+      const minor = major * (0.55 + syntheticUnitRandom() * 0.9);
+      const theta = syntheticUnitRandom() * Math.PI;
       const color = this._hslToRgb(i / safeCellTypes, 0.68, 0.52);
-      const weight = 0.6 + Math.random() * 1.6;
+      const weight = 0.6 + syntheticUnitRandom() * 1.6;
 
       anchors.push({
         center,
@@ -2114,7 +970,7 @@ export class SyntheticDataGenerator {
         angle: theta,
         color,
         weight,
-        layerOffset: layer + (Math.random() - 0.5) * 0.08,
+        layerOffset: layer + (syntheticUnitRandom() - 0.5) * 0.08,
         sin: Math.sin(theta),
         cos: Math.cos(theta)
       });
@@ -2131,16 +987,16 @@ export class SyntheticDataGenerator {
     const trajectoryCount = Math.max(5, Math.floor(safeCellTypes * 0.45));
     const trajectories = [];
     for (let t = 0; t < trajectoryCount; t++) {
-      const a = anchors[Math.floor(Math.random() * anchors.length)];
-      let b = anchors[Math.floor(Math.random() * anchors.length)];
+      const a = anchors[Math.floor(syntheticUnitRandom() * anchors.length)];
+      let b = anchors[Math.floor(syntheticUnitRandom() * anchors.length)];
       if (a === b) b = anchors[(anchors.indexOf(a) + 1) % anchors.length];
 
-      const midX = (a.center[0] + b.center[0]) / 2 + (Math.random() - 0.5) * 0.25;
-      const midY = (a.center[1] + b.center[1]) / 2 + (Math.random() - 0.5) * 0.25;
-      const arch = (Math.random() - 0.5) * 0.25;
+      const midX = (a.center[0] + b.center[0]) / 2 + (syntheticUnitRandom() - 0.5) * 0.25;
+      const midY = (a.center[1] + b.center[1]) / 2 + (syntheticUnitRandom() - 0.5) * 0.25;
+      const arch = (syntheticUnitRandom() - 0.5) * 0.25;
 
-      const spread = 0.015 + Math.random() * 0.03;
-      const weight = 0.4 + Math.random() * 1.1;
+      const spread = 0.015 + syntheticUnitRandom() * 0.03;
+      const weight = 0.4 + syntheticUnitRandom() * 1.1;
 
       trajectories.push({
         from: a,
@@ -2159,14 +1015,14 @@ export class SyntheticDataGenerator {
     });
 
     const pickAnchor = () => {
-      const r = Math.random();
+      const r = syntheticUnitRandom();
       let idx = anchorCumDist.findIndex((c) => r <= c);
       if (idx < 0) idx = anchors.length - 1;
       return anchors[idx];
     };
 
     const pickTrajectory = () => {
-      const r = Math.random();
+      const r = syntheticUnitRandom();
       let idx = trajCumDist.findIndex((c) => r <= c);
       if (idx < 0) idx = trajectories.length - 1;
       return trajectories[idx];
@@ -2179,7 +1035,7 @@ export class SyntheticDataGenerator {
     // Anchor clusters
     for (let i = 0; i < anchorPoints; i++) {
       const idx = i * 3;
-      const batch = batchOffsets[Math.floor(Math.random() * batchOffsets.length)];
+      const batch = batchOffsets[Math.floor(syntheticUnitRandom() * batchOffsets.length)];
       const anchor = pickAnchor();
 
       const dx = this._gaussianRandom() * anchor.spread[0];
@@ -2190,7 +1046,7 @@ export class SyntheticDataGenerator {
       positions[idx + 2] = anchor.layerOffset + this._gaussianRandom() * 0.03 + batch.offset[2];
 
       const baseColor = anchor.color;
-      const shade = (Math.random() - 0.5) * 0.08 + batch.tint;
+      const shade = (syntheticUnitRandom() - 0.5) * 0.08 + batch.tint;
       const cidx = i * 4;
       colors[cidx] = Math.round(clamp01(baseColor[0] + shade) * 255);
       colors[cidx + 1] = Math.round(clamp01(baseColor[1] + shade * 0.6) * 255);
@@ -2201,9 +1057,9 @@ export class SyntheticDataGenerator {
     // Trajectory / bridge populations
     for (let i = anchorPoints; i < anchorPoints + trajectoryPoints; i++) {
       const idx = i * 3;
-      const batch = batchOffsets[Math.floor(Math.random() * batchOffsets.length)];
+      const batch = batchOffsets[Math.floor(syntheticUnitRandom() * batchOffsets.length)];
       const traj = pickTrajectory();
-      const t = Math.random();
+      const t = syntheticUnitRandom();
       const eased = t * t * (3 - 2 * t); // smoothstep for nicer density
       const inv = 1 - eased;
 
@@ -2220,7 +1076,7 @@ export class SyntheticDataGenerator {
         traj.from.color[1] * (1 - eased) + traj.to.color[1] * eased,
         traj.from.color[2] * (1 - eased) + traj.to.color[2] * eased
       ];
-      const shade = (Math.random() - 0.5) * 0.06 + batch.tint * 0.6;
+      const shade = (syntheticUnitRandom() - 0.5) * 0.06 + batch.tint * 0.6;
       const cidx = i * 4;
       colors[cidx] = Math.round(clamp01(mixColor[0] + shade) * 255);
       colors[cidx + 1] = Math.round(clamp01(mixColor[1] + shade * 0.6) * 255);
@@ -2231,34 +1087,34 @@ export class SyntheticDataGenerator {
     // Rare micro-clusters and outliers to stress LOD/culling
     for (let i = anchorPoints + trajectoryPoints; i < count; i++) {
       const idx = i * 3;
-      const batch = batchOffsets[Math.floor(Math.random() * batchOffsets.length)];
+      const batch = batchOffsets[Math.floor(syntheticUnitRandom() * batchOffsets.length)];
 
-      if (Math.random() < 0.7) {
+      if (syntheticUnitRandom() < 0.7) {
         const anchor = pickAnchor();
-        const radius = anchor.spread[0] * (0.2 + Math.random() * 0.4);
-        const theta = Math.random() * Math.PI * 2;
+        const radius = anchor.spread[0] * (0.2 + syntheticUnitRandom() * 0.4);
+        const theta = syntheticUnitRandom() * Math.PI * 2;
         positions[idx] = anchor.center[0] + Math.cos(theta) * radius + batch.offset[0] * (strongBatchEffects ? 1 : 0.4);
         positions[idx + 1] = anchor.center[1] + Math.sin(theta) * radius + batch.offset[1] * (strongBatchEffects ? 1 : 0.4);
         positions[idx + 2] = anchor.layerOffset + this._gaussianRandom() * 0.02 + batch.offset[2];
 
         const cidx = i * 4;
-        const shade = 0.1 + (Math.random() - 0.5) * 0.08 + batch.tint;
+        const shade = 0.1 + (syntheticUnitRandom() - 0.5) * 0.08 + batch.tint;
         colors[cidx] = Math.round(clamp01(anchor.color[0] + shade) * 255);
         colors[cidx + 1] = Math.round(clamp01(anchor.color[1] + shade * 0.5) * 255);
         colors[cidx + 2] = Math.round(clamp01(anchor.color[2] - shade * 0.5) * 255);
         colors[cidx + 3] = 255;
       } else {
         // Far outlier
-        positions[idx] = (Math.random() - 0.5) * 3 + batch.offset[0] * 0.5;
-        positions[idx + 1] = (Math.random() - 0.5) * 3 + batch.offset[1] * 0.5;
-        positions[idx + 2] = (Math.random() - 0.5) * (strongBatchEffects ? 2 : 1) + batch.offset[2] * 0.7;
+        positions[idx] = (syntheticUnitRandom() - 0.5) * 3 + batch.offset[0] * 0.5;
+        positions[idx + 1] = (syntheticUnitRandom() - 0.5) * 3 + batch.offset[1] * 0.5;
+        positions[idx + 2] = (syntheticUnitRandom() - 0.5) * (strongBatchEffects ? 2 : 1) + batch.offset[2] * 0.7;
 
         const cidx = i * 4;
-        const base = this._hslToRgb(Math.random(), 0.2, 0.55);
+        const base = this._hslToRgb(syntheticUnitRandom(), 0.2, 0.55);
         colors[cidx] = Math.round(clamp01(base[0]) * 255);
         colors[cidx + 1] = Math.round(clamp01(base[1]) * 255);
         colors[cidx + 2] = Math.round(clamp01(base[2]) * 255);
-        colors[cidx + 3] = 200 + Math.floor(Math.random() * 55); // slight transparency variance
+        colors[cidx + 3] = 200 + Math.floor(syntheticUnitRandom() * 55); // slight transparency variance
       }
     }
 
@@ -2285,8 +1141,10 @@ export class SyntheticDataGenerator {
    * Generate Gaussian clusters (100-200 clusters by default)
    */
   static gaussianClusters(count, numClusters = 150, clusterSpread = 0.06) {
+    requireSyntheticPointCount(count);
+    restartSyntheticStream();
     // Random number of clusters between 100-200 if using default
-    const actualClusters = numClusters === 150 ? 100 + Math.floor(Math.random() * 100) : numClusters;
+    const actualClusters = numClusters === 150 ? 100 + Math.floor(syntheticUnitRandom() * 100) : numClusters;
     console.log(`Generating ${count.toLocaleString()} points in ${actualClusters} clusters...`);
     const startTime = performance.now();
 
@@ -2298,24 +1156,24 @@ export class SyntheticDataGenerator {
     for (let c = 0; c < actualClusters; c++) {
       // Random position in 3D space
       const center = [
-        (Math.random() - 0.5) * 2,
-        (Math.random() - 0.5) * 2,
-        (Math.random() - 0.5) * 2
+        (syntheticUnitRandom() - 0.5) * 2,
+        (syntheticUnitRandom() - 0.5) * 2,
+        (syntheticUnitRandom() - 0.5) * 2
       ];
       // Random cluster size (some big, some small)
-      const size = clusterSpread * (0.5 + Math.random() * 1.5);
+      const size = clusterSpread * (0.5 + syntheticUnitRandom() * 1.5);
       // Random elongation
       const elongation = [
-        0.5 + Math.random() * 1.0,
-        0.5 + Math.random() * 1.0,
-        0.5 + Math.random() * 1.0
+        0.5 + syntheticUnitRandom() * 1.0,
+        0.5 + syntheticUnitRandom() * 1.0,
+        0.5 + syntheticUnitRandom() * 1.0
       ];
       // Color based on position for spatial coherence
       const hue = (Math.atan2(center[1], center[0]) / Math.PI + 1) / 2;
       const sat = 0.5 + center[2] * 0.25;
       const color = this._hslToRgb(hue, Math.max(0.4, Math.min(0.9, sat)), 0.5);
       // Random weight (frequency)
-      const weight = 0.5 + Math.random() * 1.5;
+      const weight = 0.5 + syntheticUnitRandom() * 1.5;
 
       clusters.push({ center, size, elongation, color, weight });
     }
@@ -2335,7 +1193,7 @@ export class SyntheticDataGenerator {
       const idx = i * 3;
 
       // Sample cluster based on weight
-      const r = Math.random();
+      const r = syntheticUnitRandom();
       let clusterIdx = cumDist.findIndex(c => r <= c);
       if (clusterIdx < 0) clusterIdx = actualClusters - 1;
 
@@ -2347,9 +1205,9 @@ export class SyntheticDataGenerator {
 
       // Convert to uint8
       const cidx = i * 4;
-      colors[cidx] = Math.round(Math.max(0, Math.min(1, cluster.color[0] + (Math.random() - 0.5) * 0.1)) * 255);
-      colors[cidx + 1] = Math.round(Math.max(0, Math.min(1, cluster.color[1] + (Math.random() - 0.5) * 0.1)) * 255);
-      colors[cidx + 2] = Math.round(Math.max(0, Math.min(1, cluster.color[2] + (Math.random() - 0.5) * 0.1)) * 255);
+      colors[cidx] = Math.round(Math.max(0, Math.min(1, cluster.color[0] + (syntheticUnitRandom() - 0.5) * 0.1)) * 255);
+      colors[cidx + 1] = Math.round(Math.max(0, Math.min(1, cluster.color[1] + (syntheticUnitRandom() - 0.5) * 0.1)) * 255);
+      colors[cidx + 2] = Math.round(Math.max(0, Math.min(1, cluster.color[2] + (syntheticUnitRandom() - 0.5) * 0.1)) * 255);
       colors[cidx + 3] = 255; // full alpha
     }
 
@@ -2363,6 +1221,8 @@ export class SyntheticDataGenerator {
    * Generate uniform random distribution
    */
   static uniformRandom(count, scale = 2.0) {
+    requireSyntheticPointCount(count);
+    restartSyntheticStream();
     console.log(`Generating ${count.toLocaleString()} random points...`);
     const startTime = performance.now();
 
@@ -2372,14 +1232,14 @@ export class SyntheticDataGenerator {
     for (let i = 0; i < count; i++) {
       const idx = i * 3;
 
-      positions[idx] = (Math.random() - 0.5) * scale * 2;
-      positions[idx + 1] = (Math.random() - 0.5) * scale * 2;
-      positions[idx + 2] = (Math.random() - 0.5) * scale * 2;
+      positions[idx] = (syntheticUnitRandom() - 0.5) * scale * 2;
+      positions[idx + 1] = (syntheticUnitRandom() - 0.5) * scale * 2;
+      positions[idx + 2] = (syntheticUnitRandom() - 0.5) * scale * 2;
 
       const cidx = i * 4;
-      colors[cidx] = Math.floor(Math.random() * 256);
-      colors[cidx + 1] = Math.floor(Math.random() * 256);
-      colors[cidx + 2] = Math.floor(Math.random() * 256);
+      colors[cidx] = Math.floor(syntheticUnitRandom() * 256);
+      colors[cidx + 1] = Math.floor(syntheticUnitRandom() * 256);
+      colors[cidx + 2] = Math.floor(syntheticUnitRandom() * 256);
       colors[cidx + 3] = 255; // full alpha
     }
 
@@ -2397,6 +1257,7 @@ export class SyntheticDataGenerator {
    */
   static fromGLB(count, glbBuffer) {
     requireSyntheticPointCount(count);
+    restartSyntheticStream();
     if (!(glbBuffer instanceof ArrayBuffer) || glbBuffer.byteLength === 0) {
       throw new TypeError(
         'GLB benchmark input must be one non-empty ArrayBuffer.'
@@ -2475,13 +1336,13 @@ export class SyntheticDataGenerator {
       // Add slight noise for visual interest (convert to uint8)
       const cidx = i * 4;
       colors[cidx] = normalizedByte(
-        red + (Math.random() - 0.5) * 0.05
+        red + (syntheticUnitRandom() - 0.5) * 0.05
       );
       colors[cidx + 1] = normalizedByte(
-        green + (Math.random() - 0.5) * 0.05
+        green + (syntheticUnitRandom() - 0.5) * 0.05
       );
       colors[cidx + 2] = normalizedByte(
-        blue + (Math.random() - 0.5) * 0.05
+        blue + (syntheticUnitRandom() - 0.5) * 0.05
       );
       colors[cidx + 3] = 255; // full alpha
     }
@@ -2545,8 +1406,8 @@ export class SyntheticDataGenerator {
 
   static _gaussianRandom() {
     let u = 0, v = 0;
-    while (u === 0) u = Math.random();
-    while (v === 0) v = Math.random();
+    while (u === 0) u = syntheticUnitRandom();
+    while (v === 0) v = syntheticUnitRandom();
     return Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
   }
 
@@ -3524,28 +2385,30 @@ export class BottleneckAnalyzer {
         percentOfFrame: ((this._avg(withFrustumTimes) - this._avg(noFrustumTimes)) / this._avg(withFrustumTimes)) * 100
       };
 
-      // Test 3: Shader quality comparison
-      console.log('  - Testing shader complexity overhead...');
-      const shaderTests = {};
-      for (const quality of ['ultralight', 'light', 'full']) {
-        renderParams.quality = quality;
-        this.renderer.setQuality(quality);
-        const times = await this._measureFrameTimes(config.testFrames / 6, renderParams);
-        shaderTests[quality] = {
-          avg: this._avg(times),
-          min: Math.min(...times),
-          max: Math.max(...times)
-        };
-      }
-
-      phases.shaderComplexity = {
-        ultralight: shaderTests.ultralight,
-        light: shaderTests.light,
-        full: shaderTests.full,
-        lightVsUltralight: shaderTests.light.avg - shaderTests.ultralight.avg,
-        fullVsLight: shaderTests.full.avg - shaderTests.light.avg,
-        fullVsUltralight: shaderTests.full.avg - shaderTests.ultralight.avg
-      };
+      // There is deliberately no shader-quality arm here, and the analysis
+      // never changes the quality the user is looking at.
+      //
+      // Shader quality is a look choice, not a speed control: measured with GPU
+      // timer queries on pose-pinned probes with counterbalanced arms, `Full`,
+      // `Light` and `Ultra-light` came out within noise at every point size
+      // tested, and so did every individual term inside them — fog, lighting,
+      // the alpha texture fetch, the round discard. Depth writes are on and
+      // submission order is uncorrelated with depth, so roughly 95% of
+      // rasterised fragments are killed before the fragment shader runs.
+      //
+      // This harness could not settle that question in either direction anyway.
+      // `_measureFrameTimes` records the wall-clock interval between
+      // `requestAnimationFrame` callbacks: quantised to the display refresh
+      // whenever the frame fits its budget, and mixing CPU, GPU, compositor and
+      // browser scheduling into one number. A noise floor derived from the same
+      // instrument inherits the same unreliability — a floor measured from a
+      // repeated arm was tried and observed to pass a 22ms "separation" on a
+      // machine whose frames were 100% janky, where the true effect is zero.
+      // There is no regime in which a verdict from this instrument both fires
+      // and is trustworthy, so it emits none.
+      //
+      // Point size is the control that does respond, and `_runBoundAnalysis`
+      // measures it.
       return phases;
     } catch (error) {
       analysisFailure = error;
@@ -3562,7 +2425,6 @@ export class BottleneckAnalyzer {
           }
         },
         () => this.renderer.setFrustumCulling(originalFrustum),
-        () => this.renderer.setQuality(originalQuality),
       ]) {
         try {
           restore();
@@ -4082,17 +2944,10 @@ export class BottleneckAnalyzer {
       });
     }
 
-    // Check shader complexity
-    if (cpuPhases.shaderComplexity) {
-      const shaderOverhead = cpuPhases.shaderComplexity.fullVsUltralight;
-      if (shaderOverhead > 2) {
-        bottlenecks.push({
-          type: 'Shader Complexity',
-          severity: 'contributing',
-          evidence: `Full shader adds ${shaderOverhead.toFixed(2)}ms vs ultralight`
-        });
-      }
-    }
+    // No `Shader Complexity` verdict is emitted. See `_runCPUPhaseAnalysis` for
+    // why: the effect is within noise on better instrumentation than this
+    // harness has, and this harness's wall-clock frame timing cannot resolve it
+    // in either direction.
 
     // Check LOD overhead
     if (cpuPhases.lodOverhead && cpuPhases.lodOverhead.overhead > 1) {
@@ -4172,10 +3027,10 @@ export class BottleneckAnalyzer {
         category: 'GPU',
         title: 'Reduce GPU workload',
         actions: [
-          'Use "ultralight" shader quality for maximum GPU performance',
           'Reduce point size to decrease fill rate requirements',
-          'Enable more aggressive LOD to reduce vertex count',
-          'Consider using WebGPU if available for better GPU utilization'
+          'Make the window smaller — fewer pixels is the biggest immediate win',
+          'Turn antialiasing off under Image quality (applies on the next load)',
+          'Enable more aggressive LOD to reduce vertex count'
         ]
       });
     }
@@ -4188,9 +3043,9 @@ export class BottleneckAnalyzer {
         title: 'Optimize fragment processing',
         actions: [
           'Reduce point size (current scaling shows fragment sensitivity)',
-          'Switch to ultralight shader (removes expensive lighting)',
-          'Consider rendering to smaller framebuffer and upscaling',
-          'Disable fog effects if not essential'
+          'Turn antialiasing off under Image quality — it costs per pixel covered',
+          'Make the window smaller, or use fewer views',
+          'Filter down to the cells you are looking at — hidden points are free'
         ]
       });
     }
@@ -4210,20 +3065,11 @@ export class BottleneckAnalyzer {
       });
     }
 
-    // Shader complexity
-    if (cpuPhases.shaderComplexity?.fullVsUltralight > 3) {
-      recommendations.push({
-        priority: 3,
-        category: 'Shader',
-        title: 'Reduce shader complexity',
-        actions: [
-          `Switch from "full" to "light" (saves ~${cpuPhases.shaderComplexity.fullVsLight.toFixed(1)}ms)`,
-          `Switch to "ultralight" for max perf (saves ~${cpuPhases.shaderComplexity.fullVsUltralight.toFixed(1)}ms)`,
-          'Disable fog if not needed',
-          'Consider baking lighting into vertex colors'
-        ]
-      });
-    }
+    // There is deliberately no shader-quality recommendation here. The three
+    // qualities measured within noise at every point size tested, so advising a
+    // switch would be advising a look change and calling it a speed fix. When
+    // the sweep does separate above its own floor it is reported as a
+    // contributing bottleneck, which is a measurement, not a suggestion.
 
     // Memory pressure
     if (memoryAnalysis.memoryPressure.level !== 'low') {
@@ -4310,7 +3156,7 @@ export class BottleneckAnalyzer {
         title: 'Low-end device detected',
         actions: [
           `Only ${jsAnalysis.cpuCores} CPU cores available`,
-          'Use simpler shader quality (ultralight)',
+          'Turn antialiasing off under Image quality (applies on the next load)',
           'Reduce data size or enable aggressive LOD',
           'Consider showing fewer points on mobile'
         ]
@@ -4351,12 +3197,18 @@ export class BottleneckAnalyzer {
       bottleneck: {
         primary: gpuAnalysis.available ? gpuAnalysis.boundBy : 'Unknown (no GPU timing)',
         gpuVsFragment: boundAnalysis.boundType,
-        gpuUtilization: gpuAnalysis.available ? gpuAnalysis.gpuUtilization.toFixed(1) + '%' : 'N/A'
+        gpuUtilization: gpuAnalysis.available ? gpuAnalysis.gpuUtilization.toFixed(1) + '%' : 'N/A',
+        // Point size is the rendering setting that measurably moves frame time,
+        // so this is what the panel reports where a shader-quality delta used
+        // to sit. It is a ratio over the swept range, not a per-frame cost.
+        pointSizeResponse:
+          `${boundAnalysis.pointSizeScaling.timeRatio.toFixed(2)}× over ` +
+          `${boundAnalysis.pointSizeScaling.smallestPointSize}→` +
+          `${boundAnalysis.pointSizeScaling.largestPointSize}px`
       },
       overhead: {
         lodMs: cpuPhases.lodOverhead?.overhead?.toFixed(2) || 'N/A',
-        frustumCullingMs: cpuPhases.frustumCullingOverhead?.overhead?.toFixed(2) || 'N/A',
-        shaderComplexityMs: cpuPhases.shaderComplexity?.fullVsUltralight?.toFixed(2) || 'N/A'
+        frustumCullingMs: cpuPhases.frustumCullingOverhead?.overhead?.toFixed(2) || 'N/A'
       },
       frameStability: {
         hasJank: jankAnalysis.hasJank || false,
@@ -4479,7 +3331,14 @@ export class BottleneckAnalyzer {
 
   _calculateScaling(pointSizeTests) {
     const sizes = Object.keys(pointSizeTests).map(Number).sort((a, b) => a - b);
-    if (sizes.length < 2) return { scalingFactor: 1, linear: false };
+    // A single sample cannot express a scaling, and returning a fabricated 1
+    // would be reported downstream as a measured "balanced" verdict.
+    if (sizes.length < 2) {
+      throw new Error(
+        'Point size scaling requires at least two measured point sizes; ' +
+        `received ${sizes.length}.`
+      );
+    }
 
     // Calculate how frame time scales with point size
     const baseline = pointSizeTests[sizes[0]].avg;
@@ -4495,6 +3354,8 @@ export class BottleneckAnalyzer {
       scalingFactor: timeRatio / sizeRatio,
       baselineMs: baseline,
       largestMs: largest,
+      smallestPointSize: sizes[0],
+      largestPointSize: sizes[sizes.length - 1],
       sizeRatio,
       timeRatio,
       interpretation: timeRatio > sizeRatio * 1.5 ? 'fragment-heavy' : 'balanced'
@@ -4503,7 +3364,13 @@ export class BottleneckAnalyzer {
 
   _calculateLODScaling(lodTests) {
     const levels = Object.keys(lodTests).map(Number).sort((a, b) => a - b);
-    if (levels.length < 2) return { scalingFactor: 1 };
+    // Same reason as the point size sweep above: one level is not a scaling.
+    if (levels.length < 2) {
+      throw new Error(
+        'LOD scaling requires at least two measured LOD levels; ' +
+        `received ${levels.length}.`
+      );
+    }
 
     const finest = lodTests[levels[0]];
     const coarsest = lodTests[levels[levels.length - 1]];
@@ -4525,7 +3392,7 @@ export class BottleneckAnalyzer {
     switch (boundType) {
       case 'fragment':
         return `Frame time scales significantly with point size (${fragmentScore.toFixed(2)}x). ` +
-               `The GPU is spending most time filling pixels. Reduce point size or use simpler shaders.`;
+               `The GPU is spending most time filling pixels. Reduce point size, shrink the window, or turn antialiasing off.`;
       case 'vertex':
         return `Frame time scales significantly with vertex count (${vertexScore.toFixed(2)}x). ` +
                `The GPU is bottlenecked on vertex processing. Use more aggressive LOD or frustum culling.`;
@@ -4614,7 +3481,8 @@ export class BottleneckAnalyzer {
       '│ BOTTLENECK IDENTIFICATION                                      │',
       '├─────────────────────────────────────────────────────────────────┤',
       `│ Primary Bottleneck: ${b.primary.type.padEnd(44)} │`,
-      `│ Evidence: ${(b.primary.evidence || 'N/A').substring(0, 54).padEnd(54)} │`
+      `│ Evidence: ${(b.primary.evidence || 'N/A').substring(0, 54).padEnd(54)} │`,
+      `│ Point size response: ${s.bottleneck.pointSizeResponse.padEnd(43)} │`
     ];
 
     if (b.contributing.length > 0) {
@@ -4634,7 +3502,6 @@ export class BottleneckAnalyzer {
     lines.push('├─────────────────────────────────────────────────────────────────┤');
     lines.push(`│ LOD Selection:      ${String(s.overhead.lodMs).padStart(8)}ms                                 │`);
     lines.push(`│ Frustum Culling:    ${String(s.overhead.frustumCullingMs).padStart(8)}ms                                 │`);
-    lines.push(`│ Shader Complexity:  ${String(s.overhead.shaderComplexityMs).padStart(8)}ms (full vs ultralight)          │`);
     lines.push('└─────────────────────────────────────────────────────────────────┘');
     lines.push('');
 
@@ -4753,13 +3620,11 @@ export class BottleneckAnalyzer {
     const maxOverhead = Math.max(
       parseFloat(s.overhead.lodMs) || 0,
       parseFloat(s.overhead.frustumCullingMs) || 0,
-      parseFloat(s.overhead.shaderComplexityMs) || 0,
       1 // minimum to avoid division by zero
     );
 
     const lodBarWidth = ((parseFloat(s.overhead.lodMs) || 0) / maxOverhead * 100);
     const frustumBarWidth = ((parseFloat(s.overhead.frustumCullingMs) || 0) / maxOverhead * 100);
-    const shaderBarWidth = ((parseFloat(s.overhead.shaderComplexityMs) || 0) / maxOverhead * 100);
 
     const panel = document.createElement('div');
     panel.id = 'bottleneck-metrics-panel';
@@ -4936,6 +3801,10 @@ export class BottleneckAnalyzer {
             ${b.primary.evidence ? b.primary.evidence.substring(0, 35) + '...' : ''}
           </span>
         </div>
+        <div class="metric-row" style="margin-top: ${8 * scale}px;">
+          <span class="metric-label">Point Size Response</span>
+          <span class="metric-value">${s.bottleneck.pointSizeResponse}</span>
+        </div>
         ${b.contributing.length > 0 ? `
           <div style="margin-top: ${8 * scale}px; padding-top: ${8 * scale}px; border-top: 1px solid rgba(75, 85, 99, 0.3);">
             <div style="color: #6b7280; font-size: ${10 * scale}px; margin-bottom: ${4 * scale}px;">Contributing:</div>
@@ -4997,14 +3866,6 @@ export class BottleneckAnalyzer {
         </div>
         <div class="bar-container">
           <div class="bar" style="width: ${frustumBarWidth}%; background: #8b5cf6;"></div>
-        </div>
-
-        <div class="metric-row" style="margin-top: ${6 * scale}px;">
-          <span class="metric-label">Shader Complexity</span>
-          <span class="metric-value">${s.overhead.shaderComplexityMs}ms</span>
-        </div>
-        <div class="bar-container">
-          <div class="bar" style="width: ${shaderBarWidth}%; background: #ec4899;"></div>
         </div>
       </div>
 
@@ -6273,13 +5134,13 @@ export class BenchmarkReporter {
         addIssue(S.CRITICAL, 'performance', `Critical: FPS is ${renderer.fps} (below ${t.fps.critical})`, {
           current: renderer.fps,
           threshold: t.fps.critical,
-          recommendation: 'Enable LOD, reduce point count, or use ultralight shader'
+          recommendation: 'Enable LOD, reduce point count, or turn antialiasing off'
         });
       } else if (renderer.fps < t.fps.warning) {
         addIssue(S.WARNING, 'performance', `FPS is ${renderer.fps} (target: ${t.fps.target})`, {
           current: renderer.fps,
           threshold: t.fps.warning,
-          recommendation: 'Consider enabling LOD or using light/ultralight shader'
+          recommendation: 'Consider enabling LOD, a smaller point size, or a smaller window'
         });
       }
     }
