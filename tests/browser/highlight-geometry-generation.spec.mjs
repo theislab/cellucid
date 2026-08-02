@@ -452,13 +452,16 @@ test('highlight OOM is report-once, pane-local, and recovers on a semantic gener
     viewer.pause();
     const baseline = audit.snapshot();
 
-    // Republish both panes while paused, then fail only the first compact
-    // highlight upload. The snapshot pane must still reach its own upload.
-    viewer.updateTransparency(
-      new Float32Array(payload.transparency),
-    );
+    // Publish one real R8 visibility change to both panes while paused, then
+    // fail only the first compact highlight upload. Byte-identical owner
+    // replacements deliberately do not advance the semantic filtering
+    // generation, so using a copied-but-unchanged array here would test the
+    // obsolete object-identity contract and correctly schedule no upload.
+    const changedTransparency = new Float32Array(payload.transparency);
+    changedTransparency[0] = changedTransparency[0] >= (1 / 255) ? 0 : 1;
+    viewer.updateTransparency(changedTransparency);
     viewer.updateSnapshotAttributes(snapshot.id, {
-      transparency: new Float32Array(payload.transparency),
+      transparency: new Float32Array(changedTransparency),
     });
     audit.failNextUpload();
     viewer.resume();
@@ -468,7 +471,8 @@ test('highlight OOM is report-once, pane-local, and recovers on a semantic gener
     const afterFailure = audit.snapshot();
     const stableFailureReportCount = reports.length;
 
-    // A new live filtering generation is a meaningful retry boundary.
+    // Restoring the original R8 visibility is a second meaningful live
+    // filtering generation and therefore the exact retry boundary.
     viewer.updateTransparency(
       new Float32Array(payload.transparency),
     );

@@ -39,8 +39,8 @@ test('Jupyter bridge owns authenticated parent traffic for its live lifecycle', 
       }
       return undefined;
     });
-    source._reportMessageFailure = error => {
-      reportedFailures.push(error.message);
+    source._reportMessageFailure = (commandType, error) => {
+      reportedFailures.push([commandType, error.message]);
     };
 
     const availableBeforeHealth = await source.isAvailable();
@@ -101,7 +101,10 @@ test('Jupyter bridge owns authenticated parent traffic for its live lifecycle', 
     deliveredAfterForeignSource: [],
     deliveredAfterParentSource: ['freeze'],
     deliveredAfterDisconnect: ['freeze', 'requestSessionBundle'],
-    reportedFailures: ['browser async notebook callback failed'],
+    reportedFailures: [[
+      'requestSessionBundle',
+      'browser async notebook callback failed',
+    ]],
     connectedAfterDisconnect: false,
   });
 });

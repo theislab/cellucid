@@ -315,37 +315,53 @@ test('production split snapshot VBOs match interleaved pixels and indexed draws'
       render(configureSplitRgbR8, first.vao, true),
     );
 
-    const drawsPerSample = 32;
-    const measure = (configure, vao, indexed) => {
-      gl.finish();
+    // Preserve the original 32-draw timing sample while keeping each
+    // synchronous submission batch below browser/driver watchdog windows.
+    // Frame-service time is excluded from the diagnostic, so the result still
+    // measures draw work rather than the cooperative scheduling boundary.
+    const drawsPerBatch = 8;
+    const batchesPerSample = 4;
+    const drawsPerSample = drawsPerBatch * batchesPerSample;
+    const measure = async (configure, vao, indexed) => {
       const start = performance.now();
-      for (let draw = 0; draw < drawsPerSample; draw++) {
-        configure();
-        gl.bindVertexArray(vao);
-        if (indexed) {
-          gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffer);
-          gl.drawElements(
-            gl.POINTS,
-            indexedCount,
-            gl.UNSIGNED_INT,
-            0,
-          );
-          gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, null);
-        } else {
-          gl.drawArrays(gl.POINTS, 0, pointCount);
+      let frameServiceTime = 0;
+      for (let batch = 0; batch < batchesPerSample; batch++) {
+        gl.finish();
+        for (let draw = 0; draw < drawsPerBatch; draw++) {
+          configure();
+          gl.bindVertexArray(vao);
+          if (indexed) {
+            gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffer);
+            gl.drawElements(
+              gl.POINTS,
+              indexedCount,
+              gl.UNSIGNED_INT,
+              0,
+            );
+            gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, null);
+          } else {
+            gl.drawArrays(gl.POINTS, 0, pointCount);
+          }
+          gl.bindVertexArray(null);
         }
-        gl.bindVertexArray(null);
+        gl.finish();
+        if (batch + 1 < batchesPerSample) {
+          const frameServiceStart = performance.now();
+          await new Promise(resolve => requestAnimationFrame(resolve));
+          frameServiceTime += performance.now() - frameServiceStart;
+        }
       }
-      gl.finish();
-      return (performance.now() - start) / drawsPerSample;
+      return (
+        performance.now() - start - frameServiceTime
+      ) / drawsPerSample;
     };
     // Compile, allocate, and warm both production shader paths before paired
     // measurement. The reference path uses baked RGBA; the split path performs
     // the snapshot-owned R8 texel fetch used by production rendering.
-    measure(configureInterleavedRgba, renderer.vao, false);
-    measure(configureSplitRgbR8, first.vao, false);
-    measure(configureInterleavedRgba, renderer.vao, true);
-    measure(configureSplitRgbR8, first.vao, true);
+    await measure(configureInterleavedRgba, renderer.vao, false);
+    await measure(configureSplitRgbR8, first.vao, false);
+    await measure(configureInterleavedRgba, renderer.vao, true);
+    await measure(configureSplitRgbR8, first.vao, true);
     const timings = {
       fullInterleaved: [],
       fullSplit: [],
@@ -410,9 +426,13 @@ test('production split snapshot VBOs match interleaved pixels and indexed draws'
         const [key, configure, vao, indexed] of firstLayout
       ) {
         timings[key].push(
-          measure(configure, vao, indexed),
+          await measure(configure, vao, indexed),
         );
       }
+      // Let the browser service completed GPU work between benchmark samples.
+      // Without this boundary Windows WebKit can reset an otherwise-correct
+      // context after hundreds of back-to-back full-dataset draws.
+      await new Promise(resolve => requestAnimationFrame(resolve));
     }
     const median = values => {
       const sorted = [...values].sort((a, b) => a - b);
@@ -622,6 +642,7 @@ test('production split snapshot VBOs match interleaved pixels and indexed draws'
         first: sourceIds[0],
         last: sourceIds[sourceIds.length - 1],
       },
+      drawsPerBatch,
       drawsPerSample,
       fullPixels,
       indexedPixels,
@@ -778,6 +799,8 @@ test('production split snapshot VBOs match interleaved pixels and indexed draws'
   expect(result.bindings.trackedPointerCallCount).toBeGreaterThanOrEqual(
     6,
   );
+  expect(result.drawsPerBatch).toBe(8);
+  expect(result.drawsPerSample).toBe(32);
   for (const value of Object.values(result.medians)) {
     expect(Number.isFinite(value)).toBe(true);
     // Some automated browser clocks quantize a completed GPU fence to 0 ms;

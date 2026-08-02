@@ -24,7 +24,7 @@ test('browser CI shards every engine and OS with one isolated worker', async () 
   );
   assert.match(
     workflow,
-    /browsers:[\s\S]*?timeout-minutes: 30[\s\S]*?strategy:\n\s+fail-fast: false/,
+    /browsers:[\s\S]*?timeout-minutes: 75[\s\S]*?strategy:\n\s+fail-fast: false/,
   );
   assert.match(playwrightConfig, /fullyParallel: false,/);
   assert.match(playwrightConfig, /workers: 1,/);

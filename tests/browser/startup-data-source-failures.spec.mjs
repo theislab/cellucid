@@ -171,12 +171,17 @@ test('an offline dataset switch explains itself and stays on screen', async ({
   // Nothing a wet-lab user has to decode.
   expect(message).not.toMatch(/Failed to fetch|https?:|gzip/);
 
-  // The explanation outlives the toast that announced it.
-  await expect
-    .poll(() => page.locator('#notification-center .notification').count(), {
-      timeout: 20_000,
-    })
-    .toBe(0);
+  // Errors intentionally stay until the reader dismisses them. The sidebar
+  // notice is the durable recovery owner, so dismissing the diagnostic toast
+  // must leave the explanation and its retry in place.
+  const failureNotification = page.locator(
+    '#notification-center .notification-error',
+  );
+  await expect(failureNotification).toHaveCount(1);
+  await failureNotification.locator(
+    '.notification-dismiss[data-role="dismiss"]',
+  ).click();
+  await expect(failureNotification).toHaveCount(0);
   await expect(notice).toBeVisible();
   expect(await noticeText(page)).toBe(message);
 

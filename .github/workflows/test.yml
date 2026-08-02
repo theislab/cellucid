@@ -43,7 +43,10 @@ jobs:
   browsers:
     name: ${{ matrix.os }} / ${{ matrix.browser }} / shard ${{ matrix.shard }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    # macOS Firefox runs the complete GPU-heavy shard correctly but needs well
+    # over the former 30-minute ceiling on hosted runners. Per-test timeouts
+    # still fence hangs; this job bound permits the full contract inventory.
+    timeout-minutes: 75
     strategy:
       fail-fast: false
       matrix:

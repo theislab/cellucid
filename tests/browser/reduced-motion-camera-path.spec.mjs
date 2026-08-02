@@ -79,6 +79,12 @@ async function preparePath(page) {
     state.orbit.targetRadius = state.orbit.radius;
     viewer.setCameraState(state);
   });
+  // `setCameraState` is synchronous, while its pixels belong to the next
+  // viewer frame. Wait through two animation boundaries so the first idle
+  // screenshot cannot capture the previous camera on a slower renderer.
+  await page.evaluate(() => new Promise(resolve => {
+    requestAnimationFrame(() => requestAnimationFrame(resolve));
+  }));
 }
 
 async function playAndMeasure(page) {

@@ -721,18 +721,33 @@ test('snapshot R8 alpha stays exact through every draw and resource lifecycle', 
         legacyPixels,
       );
 
-      const drawsPerSample = 32;
-      const measure = (configure, vao) => {
-        gl.finish();
+      // Preserve the original 32-draw timing sample while keeping each
+      // synchronous submission batch below browser/driver watchdog windows.
+      // Excluding frame-service time keeps the diagnostic about draw work.
+      const drawsPerBatch = 8;
+      const batchesPerSample = 4;
+      const drawsPerSample = drawsPerBatch * batchesPerSample;
+      const measure = async (configure, vao) => {
         const start = performance.now();
-        for (let draw = 0; draw < drawsPerSample; draw++) {
-          configure();
-          gl.bindVertexArray(vao);
-          gl.drawArrays(gl.POINTS, 0, pointCount);
-          gl.bindVertexArray(null);
+        let frameServiceTime = 0;
+        for (let batch = 0; batch < batchesPerSample; batch++) {
+          gl.finish();
+          for (let draw = 0; draw < drawsPerBatch; draw++) {
+            configure();
+            gl.bindVertexArray(vao);
+            gl.drawArrays(gl.POINTS, 0, pointCount);
+            gl.bindVertexArray(null);
+          }
+          gl.finish();
+          if (batch + 1 < batchesPerSample) {
+            const frameServiceStart = performance.now();
+            await new Promise(resolve => requestAnimationFrame(resolve));
+            frameServiceTime += performance.now() - frameServiceStart;
+          }
         }
-        gl.finish();
-        return (performance.now() - start) / drawsPerSample;
+        return (
+          performance.now() - start - frameServiceTime
+        ) / drawsPerSample;
       };
       const configureProduction = () => {
         gl.useProgram(program);
@@ -745,8 +760,8 @@ test('snapshot R8 alpha stays exact through every draw and resource lifecycle', 
         );
       };
       // Warm shaders, texture sampling, and both attribute layouts.
-      measure(configureProduction, snapshot.vao);
-      measure(configureLegacy, legacyVao);
+      await measure(configureProduction, snapshot.vao);
+      await measure(configureLegacy, legacyVao);
       const timingSamples = {
         legacyRgbaBakedMs: [],
         snapshotRgbR8Ms: [],
@@ -779,9 +794,10 @@ test('snapshot R8 alpha stays exact through every draw and resource lifecycle', 
             ];
         for (const [key, configure, vao] of order) {
           timingSamples[key].push(
-            measure(configure, vao),
+            await measure(configure, vao),
           );
         }
+        await new Promise(resolve => requestAnimationFrame(resolve));
       }
       const median = values => {
         const sorted = [...values].sort(
@@ -790,6 +806,7 @@ test('snapshot R8 alpha stays exact through every draw and resource lifecycle', 
         return sorted[Math.floor(sorted.length / 2)];
       };
       const timingDiagnostic = {
+        drawsPerBatch,
         drawsPerSample,
         medians: {
           legacyRgbaBakedMs:
@@ -1312,6 +1329,10 @@ test('snapshot R8 alpha stays exact through every draw and resource lifecycle', 
   expect(proof.deleteDelta.deleteVertexArray).toBe(1);
   expect(proof.deleteDelta.deleteBuffer).toBeGreaterThanOrEqual(2);
   expect(proof.glError).toBe(0);
+  expect(proof.timingDiagnostic).toMatchObject({
+    drawsPerBatch: 8,
+    drawsPerSample: 32,
+  });
 
   await testInfo.attach('snapshot-r8-draw-diagnostic.json', {
     body: Buffer.from(
