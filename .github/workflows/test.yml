@@ -94,9 +94,11 @@ jobs:
       # A process per whole shard retained native GPU state long enough to
       # degrade hosted macOS Firefox. A process per file then exhausted Windows
       # networking resources late in the larger shards. Preserve Playwright's
-      # exact assignment while bounding both dimensions: each child owns at
-      # most six files and each shard launches at most eight real browsers.
-      # Tests are neither retried nor skipped, mocked, or given more time.
+      # exact assignment while bounding all dimensions: each ordinary child
+      # owns at most six files and forty tests. Declared native-GPU stress files
+      # receive a separate process on Linux WebKit and macOS Firefox, and even
+      # those largest shards are capped at nine real browsers. Tests are neither
+      # retried nor skipped, mocked, or given more time.
       - name: Run the selected headed Firefox shard in bounded processes
         if: matrix.browser == 'firefox' && runner.os == 'Linux'
         run: >-

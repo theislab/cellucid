@@ -23,6 +23,9 @@ const FIXTURE_URL =
   '&dataset=current-ui-prepared&acceptance=benchmark-harness-ci';
 
 const HARNESS_MODULE = '/assets/js/app/ui/modules/benchmark/index.js';
+const PROCESS_INTENSIVE = Object.freeze({
+  tag: '@browser-process-intensive',
+});
 
 /** Small enough to stay a smoke test on a busy machine. */
 const SMOKE_POINT_COUNT = 120_000;
@@ -40,7 +43,7 @@ async function publishSyntheticDataset(page, pointCount, pattern) {
     .toBe(pointCount);
 }
 
-test('the harness observes LOD, culling and uploads under scripted motion', async ({
+test('the harness observes LOD, culling and uploads under scripted motion', PROCESS_INTENSIVE, async ({
   page
 }, testInfo) => {
   test.setTimeout(600_000);
@@ -206,7 +209,7 @@ test('the harness observes LOD, culling and uploads under scripted motion', asyn
   expect(browserErrors).toEqual([]);
 });
 
-test('the view-count axis reaches the viewer snapshot ceiling', async ({
+test('the view-count axis reaches the viewer snapshot ceiling', PROCESS_INTENSIVE, async ({
   page
 }) => {
   test.setTimeout(600_000);
@@ -283,7 +286,7 @@ test('the view-count axis reaches the viewer snapshot ceiling', async ({
   expect(browserErrors).toEqual([]);
 });
 
-test('synthetic generation runs off the main thread', async ({ page }) => {
+test('synthetic generation runs off the main thread', PROCESS_INTENSIVE, async ({ page }) => {
   test.setTimeout(600_000);
   const browserErrors = [];
   page.on('pageerror', error => {
@@ -348,7 +351,7 @@ test('synthetic generation runs off the main thread', async ({ page }) => {
   expect(browserErrors).toEqual([]);
 });
 
-test('the worker builds exactly what the main thread would have built', async ({
+test('the worker builds exactly what the main thread would have built', PROCESS_INTENSIVE, async ({
   page
 }) => {
   // The Run button generates off-thread, so the worker evaluates its own copy
@@ -421,7 +424,7 @@ test('the worker builds exactly what the main thread would have built', async ({
   }
 });
 
-test('an aborted generation terminates its worker', async ({ page }) => {
+test('an aborted generation terminates its worker', PROCESS_INTENSIVE, async ({ page }) => {
   await page.goto(FIXTURE_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
 

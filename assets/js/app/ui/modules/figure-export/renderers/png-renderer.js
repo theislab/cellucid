@@ -299,6 +299,9 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
   const ctx = /** @type {CanvasRenderingContext2D|null} */ (canvas.getContext('2d', { alpha: true }));
   if (!ctx) throw new Error('Canvas 2D context unavailable');
 
+  const rasterCanvases = new Set();
+  let renderingFailure = null;
+  try {
   ctx.save();
   ctx.scale(scale, scale);
 
@@ -495,7 +498,10 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
         );
       }
     } finally {
-      releaseWebglRasterCanvas(webglCanvas);
+      // Canvas2D may retain native work sourced from this WebGL canvas until
+      // PNG encoding settles. The function-level terminal owner releases the
+      // context after that downstream consumer, including on every error path.
+      rasterCanvases.add(webglCanvas);
     }
 
     ctx.restore();
@@ -850,7 +856,7 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
           );
         }
       } finally {
-        releaseWebglRasterCanvas(webglCanvas);
+        rasterCanvases.add(webglCanvas);
       }
 
       if (includeCentroidPoints || includeCentroidLabels) {
@@ -1044,4 +1050,43 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
   );
   throwIfFigureExportAborted(signal);
   return annotatedBlob;
+  } catch (error) {
+    renderingFailure = error instanceof Error
+      ? error
+      : new Error('PNG rendering threw a non-Error value.', { cause: error });
+    throw renderingFailure;
+  } finally {
+    const releaseFailures = [];
+    for (const rasterCanvas of rasterCanvases) {
+      try {
+        if (!releaseWebglRasterCanvas(rasterCanvas)) {
+          throw new Error(
+            'PNG renderer lost ownership of a WebGL raster canvas.'
+          );
+        }
+      } catch (error) {
+        releaseFailures.push(
+          error instanceof Error
+            ? error
+            : new Error(
+                'PNG WebGL raster release threw a non-Error value.',
+                { cause: error }
+              )
+        );
+      }
+    }
+    if (releaseFailures.length > 0) {
+      if (renderingFailure !== null) {
+        throw new AggregateError(
+          [renderingFailure, ...releaseFailures],
+          'PNG rendering and WebGL raster release were incomplete.'
+        );
+      }
+      if (releaseFailures.length === 1) throw releaseFailures[0];
+      throw new AggregateError(
+        releaseFailures,
+        'PNG WebGL raster release was incomplete.'
+      );
+    }
+  }
 }

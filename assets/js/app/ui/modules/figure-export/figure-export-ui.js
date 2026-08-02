@@ -1787,30 +1787,17 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     }
   }
 
-  let cachedWebgl2ExportSupport = /** @type {boolean|null} */ (null);
-  function canCreateWebgl2Context() {
-    if (cachedWebgl2ExportSupport != null) return cachedWebgl2ExportSupport;
-
-    const canvas = document.createElement('canvas');
-    canvas.width = 2;
-    canvas.height = 2;
-    const gl = canvas.getContext('webgl2', {
-      alpha: true,
-      antialias: true,
-      premultipliedAlpha: true,
-      preserveDrawingBuffer: true
-    });
-    if (gl) {
-      cachedWebgl2ExportSupport = true;
-      // This is a capability probe, not a retained renderer. Release its
-      // context immediately so repeated UI teardown/reinitialization cannot
-      // consume the browser's finite WebGL context budget.
-      gl.getExtension('WEBGL_lose_context')?.loseContext();
-      return true;
+  function hasUsableWebgl2Context() {
+    if (typeof WebGL2RenderingContext !== 'function') return false;
+    try {
+      const gl = viewer.getGLContext();
+      return (
+        gl instanceof WebGL2RenderingContext &&
+        gl.isContextLost() === false
+      );
+    } catch {
+      return false;
     }
-
-    cachedWebgl2ExportSupport = false;
-    return false;
   }
 
   // Seed centroid label font size from the on-screen overlay CSS when available.
@@ -3088,7 +3075,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     if (needsShaderAccurateRasterization) {
       const rs = getPreviewRenderStateForView(activeViewId);
       const missing = [];
-      if (!canCreateWebgl2Context()) missing.push('WebGL2');
+      if (!hasUsableWebgl2Context()) missing.push('WebGL2');
       if (!rs?.viewMatrix || !rs?.projectionMatrix || !rs?.modelMatrix) missing.push('camera matrices');
       if (missing.length) {
         warnings.push({

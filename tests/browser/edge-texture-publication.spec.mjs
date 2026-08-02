@@ -5,8 +5,11 @@ import { dismissWelcome } from './helpers/welcome.mjs';
 
 const DATASET_URL =
   `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=edge-texture-publication-ci`;
+const PROCESS_INTENSIVE = Object.freeze({
+  tag: '@browser-process-intensive',
+});
 
-test('edge generations preserve exact GL state and rollback/retry ownership', async ({
+test('edge generations preserve exact GL state and rollback/retry ownership', PROCESS_INTENSIVE, async ({
   page,
 }) => {
   const pageErrors = [];
@@ -225,7 +228,7 @@ test('edge generations preserve exact GL state and rollback/retry ownership', as
   );
 });
 
-test('edge texture pooling, streamed tails, and binary visibility stay exact', async ({
+test('edge texture pooling, streamed tails, and binary visibility stay exact', PROCESS_INTENSIVE, async ({
   page,
 }) => {
   const pageErrors = [];
@@ -763,7 +766,7 @@ test('edge texture pooling, streamed tails, and binary visibility stay exact', a
   expect(consoleDiagnostics).toEqual([]);
 });
 
-test('per-view edge prefixes remain exact across focus, R8 failure, and retirement', async ({
+test('per-view edge prefixes remain exact across focus, R8 failure, and retirement', PROCESS_INTENSIVE, async ({
   page,
 }) => {
   const pageErrors = [];
@@ -1451,7 +1454,7 @@ test('per-view edge prefixes remain exact across focus, R8 failure, and retireme
   expect(consoleDiagnostics).toEqual([]);
 });
 
-test('committed setData detaches every prior edge generation before retryable cleanup', async ({
+test('committed setData detaches every prior edge generation before retryable cleanup', PROCESS_INTENSIVE, async ({
   page,
 }) => {
   const pageErrors = [];

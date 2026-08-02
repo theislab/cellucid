@@ -21,12 +21,23 @@ const MAX_CAPTURE_BYTES = 64 * 1024 * 1024;
 
 // A process per whole shard retained native GPU state long enough to degrade
 // hosted macOS Firefox. A process per file fixed that but exhausted WinSock
-// resources late in 41-file Windows shards. Bound both dimensions: no browser
-// owns more than six files, no shard launches more than eight browsers, and a
-// growing inventory must add another CI shard instead of silently weakening
-// either resource fence.
+// resources late in 41-file Windows shards. File count alone is not a lifetime
+// bound: one six-file group can contain 74 tests while another contains 12.
+// Bound every ordinary lifetime dimension: no browser owns more than six files
+// or forty tests. A small number of tests deliberately exercise repeated native
+// GPU allocation/rollback generations; vulnerable hosted native GPU processes
+// must run each containing file in its own process because they retain enough
+// state to crash the next unrelated page. Even with those declared isolation
+// boundaries, no shard may launch more than nine browsers. A growing inventory
+// must add another CI shard (or split an oversized spec) instead of silently
+// weakening a resource fence.
 export const MAX_FILES_PER_BROWSER_PROCESS = 6;
-export const MAX_BROWSER_PROCESSES_PER_SHARD = 8;
+export const MAX_TESTS_PER_BROWSER_PROCESS = 40;
+export const MAX_ORDINARY_BROWSER_PROCESSES_PER_SHARD = 8;
+export const MAX_BROWSER_PROCESSES_PER_SHARD = 9;
+// Playwright requires `@browser-process-intensive` at declaration time and its
+// JSON reporter publishes the normalized tag without the leading `@`.
+export const PROCESS_INTENSIVE_REPORT_TAG = 'browser-process-intensive';
 
 function readOption(argument, name) {
   const prefix = `--${name}=`;
@@ -158,12 +169,12 @@ function listShard(project, shard, headed, environment) {
   }
 }
 
-function collectSuiteFiles(suites, files) {
+function collectSuiteSpecs(suites, specs) {
   for (const suite of suites ?? []) {
-    if (typeof suite.file === 'string' && suite.file !== '') {
-      files.add(suite.file);
+    for (const spec of suite.specs ?? []) {
+      specs.push(spec);
     }
-    collectSuiteFiles(suite.suites, files);
+    collectSuiteSpecs(suite.suites, specs);
   }
 }
 
@@ -183,15 +194,20 @@ function repositoryRelativeTestFile(testDirectory, file) {
 }
 
 /**
- * Recover the exact file inventory Playwright assigned to one shard.
+ * Recover the exact weighted file inventory Playwright assigned to one shard.
  * `fullyParallel` is false, so files are the indivisible shard owners and can
- * be replayed independently without dropping or duplicating a test.
+ * be replayed independently without dropping or duplicating a test. Test count
+ * is retained because file count alone does not bound browser-process lifetime.
  *
  * @param {object} report
  * @param {string} project
- * @returns {string[]}
+ * @returns {ReadonlyArray<Readonly<{
+ *   file: string,
+ *   intensive: boolean,
+ *   tests: number,
+ * }>>}
  */
-export function extractBoundedShardFiles(report, project) {
+export function extractBoundedShardInventory(report, project) {
   if (!report || typeof report !== 'object') {
     throw new TypeError('Playwright shard report must be an object.');
   }
@@ -207,55 +223,225 @@ export function extractBoundedShardFiles(report, project) {
     throw new Error(`Playwright project ${project} has no resolved testDir.`);
   }
 
-  const listedFiles = new Set();
-  collectSuiteFiles(report.suites, listedFiles);
-  if (listedFiles.size === 0) {
+  const listedSpecs = [];
+  collectSuiteSpecs(report.suites, listedSpecs);
+  if (listedSpecs.length === 0) {
     throw new Error(`Playwright assigned no files to ${project} shard.`);
   }
 
-  const relativeFiles = new Set();
-  for (const file of listedFiles) {
-    relativeFiles.add(repositoryRelativeTestFile(projectConfig.testDir, file));
+  const inventoryByFile = new Map();
+  for (const spec of listedSpecs) {
+    if (
+      spec === null ||
+      typeof spec !== 'object' ||
+      typeof spec.file !== 'string' ||
+      spec.file === '' ||
+      !Array.isArray(spec.tags) ||
+      spec.tags.some(tag => typeof tag !== 'string') ||
+      !Array.isArray(spec.tests) ||
+      spec.tests.length === 0
+    ) {
+      throw new TypeError(
+        'Every Playwright shard spec must publish string tags, a file, and at least one test.'
+      );
+    }
+    if (
+      spec.tests.some(
+        test => test === null ||
+          typeof test !== 'object' ||
+          test.projectName !== project
+      )
+    ) {
+      throw new Error(
+        `Playwright shard discovery mixed projects inside ${project}.`
+      );
+    }
+    const file = repositoryRelativeTestFile(
+      projectConfig.testDir,
+      spec.file
+    );
+    const previous = inventoryByFile.get(file) ?? {
+      intensive: false,
+      tests: 0,
+    };
+    const nextCount = previous.tests + spec.tests.length;
+    if (!Number.isSafeInteger(nextCount)) {
+      throw new RangeError(`Playwright test count overflowed for ${file}.`);
+    }
+    inventoryByFile.set(file, {
+      intensive:
+        previous.intensive ||
+        spec.tags.includes(PROCESS_INTENSIVE_REPORT_TAG),
+      tests: nextCount,
+    });
   }
-  return Array.from(relativeFiles);
+  return Object.freeze(
+    Array.from(
+      inventoryByFile,
+      ([file, { intensive, tests }]) =>
+        Object.freeze({ file, intensive, tests })
+    )
+  );
 }
 
 /**
- * Partition one exact Playwright shard without allowing either process
- * lifetime or process churn to become unbounded.
+ * Linux WebKit and macOS Firefox are the hosted implementations observed
+ * retaining native GPU state across otherwise fully retired pages. Keep the
+ * workload declaration in the specs engine-neutral, then apply its extra
+ * process boundary only to those exact implementations; other cells retain
+ * their proven process plan.
  *
- * @param {string[]} files
- * @returns {ReadonlyArray<ReadonlyArray<string>>}
+ * @param {string} project
+ * @param {Record<string, string | undefined>} environment
+ * @param {NodeJS.Platform} [platform]
+ * @returns {boolean}
  */
-export function partitionBrowserShardFiles(files) {
-  if (!Array.isArray(files) || files.length === 0) {
-    throw new TypeError('Bounded browser shard files must be a non-empty array.');
+export function shouldIsolateProcessIntensiveFiles(
+  project,
+  environment,
+  platform = process.platform
+) {
+  if (typeof project !== 'string' || !PROJECT_PATTERN.test(project)) {
+    throw new TypeError('Browser isolation project name is invalid.');
   }
-  if (files.some(file => typeof file !== 'string' || file === '')) {
-    throw new TypeError('Every bounded browser shard file must be a path.');
+  if (environment === null || typeof environment !== 'object') {
+    throw new TypeError('Browser isolation environment must be an object.');
   }
-  if (new Set(files).size !== files.length) {
+  const runnerOs = environment.RUNNER_OS;
+  if (runnerOs !== undefined && typeof runnerOs !== 'string') {
+    throw new TypeError('RUNNER_OS must be a string when supplied.');
+  }
+  const linux = runnerOs === undefined
+    ? platform === 'linux'
+    : runnerOs === 'Linux';
+  const macos = runnerOs === undefined
+    ? platform === 'darwin'
+    : runnerOs === 'macOS';
+  return (
+    (project === 'webkit' && linux) ||
+    (project === 'firefox' && macos)
+  );
+}
+
+/**
+ * Partition one exact Playwright shard without allowing file count, test
+ * weight, or process churn to become unbounded.
+ *
+ * @param {Array<{file: string, intensive: boolean, tests: number}>} inventory
+ * @param {boolean} [isolateProcessIntensiveFiles]
+ * @returns {ReadonlyArray<Readonly<{
+ *   files: ReadonlyArray<string>,
+ *   testCount: number,
+ * }>>}
+ */
+export function partitionBrowserShardInventory(
+  inventory,
+  isolateProcessIntensiveFiles = false
+) {
+  if (!Array.isArray(inventory) || inventory.length === 0) {
+    throw new TypeError(
+      'Bounded browser shard inventory must be a non-empty array.'
+    );
+  }
+  if (typeof isolateProcessIntensiveFiles !== 'boolean') {
+    throw new TypeError(
+      'Process-intensive browser isolation must be a boolean.'
+    );
+  }
+  for (const item of inventory) {
+    const itemKeys = item !== null && typeof item === 'object'
+      ? Reflect.ownKeys(item)
+      : [];
+    if (
+      item === null ||
+      typeof item !== 'object' ||
+      Array.isArray(item) ||
+      Object.getPrototypeOf(item) !== Object.prototype ||
+      itemKeys.length !== 3 ||
+      !itemKeys.includes('file') ||
+      !itemKeys.includes('intensive') ||
+      !itemKeys.includes('tests') ||
+      itemKeys.some(key => {
+        const descriptor = Object.getOwnPropertyDescriptor(item, key);
+        return descriptor === undefined ||
+          descriptor.enumerable !== true ||
+          !Object.hasOwn(descriptor, 'value');
+      }) ||
+      typeof item.file !== 'string' ||
+      item.file === '' ||
+      typeof item.intensive !== 'boolean' ||
+      !Number.isSafeInteger(item.tests) ||
+      item.tests < 1
+    ) {
+      throw new TypeError(
+        'Every bounded browser shard item must contain one file, one intensive flag, and a positive safe test count.'
+      );
+    }
+    if (item.tests > MAX_TESTS_PER_BROWSER_PROCESS) {
+      throw new RangeError(
+        `${item.file} owns ${item.tests} tests, exceeding the per-process ` +
+          `maximum of ${MAX_TESTS_PER_BROWSER_PROCESS}; split the spec file.`,
+      );
+    }
+  }
+  const files = inventory.map(item => item.file);
+  if (new Set(files).size !== inventory.length) {
     throw new TypeError('Bounded browser shard files must be unique.');
   }
 
-  const capacity =
-    MAX_FILES_PER_BROWSER_PROCESS * MAX_BROWSER_PROCESSES_PER_SHARD;
-  if (files.length > capacity) {
+  const hasIntensiveIsolation =
+    isolateProcessIntensiveFiles &&
+    inventory.some(item => item.intensive);
+  const processCapacity = hasIntensiveIsolation
+    ? MAX_BROWSER_PROCESSES_PER_SHARD
+    : MAX_ORDINARY_BROWSER_PROCESSES_PER_SHARD;
+  const fileCapacity = MAX_FILES_PER_BROWSER_PROCESS * processCapacity;
+  if (inventory.length > fileCapacity) {
     throw new RangeError(
-      `Browser shard assigns ${files.length} files, exceeding the bounded ` +
-        `capacity of ${capacity}; increase the CI shard count.`,
+      `Browser shard assigns ${inventory.length} files, exceeding the bounded ` +
+        `capacity of ${fileCapacity}; increase the CI shard count.`,
     );
   }
 
   const batches = [];
-  for (
-    let index = 0;
-    index < files.length;
-    index += MAX_FILES_PER_BROWSER_PROCESS
-  ) {
-    batches.push(Object.freeze(
-      files.slice(index, index + MAX_FILES_PER_BROWSER_PROCESS),
-    ));
+  let batchFiles = [];
+  let batchTestCount = 0;
+  const publishBatch = () => {
+    if (batchFiles.length === 0) return;
+    batches.push(Object.freeze({
+      files: Object.freeze(batchFiles),
+      testCount: batchTestCount,
+    }));
+    batchFiles = [];
+    batchTestCount = 0;
+  };
+  for (const item of inventory) {
+    if (isolateProcessIntensiveFiles && item.intensive) {
+      publishBatch();
+      batchFiles.push(item.file);
+      batchTestCount = item.tests;
+      publishBatch();
+      continue;
+    }
+    if (
+      batchFiles.length === MAX_FILES_PER_BROWSER_PROCESS ||
+      (
+        batchFiles.length > 0 &&
+        batchTestCount + item.tests > MAX_TESTS_PER_BROWSER_PROCESS
+      )
+    ) {
+      publishBatch();
+    }
+    batchFiles.push(item.file);
+    batchTestCount += item.tests;
+  }
+  publishBatch();
+  if (batches.length > processCapacity) {
+    throw new RangeError(
+      `Browser shard requires ${batches.length} bounded processes, exceeding ` +
+        `the maximum of ${processCapacity}; increase the CI ` +
+        `shard count.`,
+    );
   }
   return Object.freeze(batches);
 }
@@ -336,30 +522,41 @@ export function runBoundedBrowserShard(
   environment
 ) {
   const report = listShard(project, shard, headed, environment);
-  const files = extractBoundedShardFiles(report, project);
-  const batches = partitionBrowserShardFiles(files);
+  const inventory = extractBoundedShardInventory(report, project);
+  const isolateProcessIntensiveFiles =
+    shouldIsolateProcessIntensiveFiles(project, environment) &&
+    inventory.some(item => item.intensive);
+  const batches = partitionBrowserShardInventory(
+    inventory,
+    isolateProcessIntensiveFiles
+  );
   const portPlan = planBrowserBatchPorts(environment, batches.length);
+  const fileCount = inventory.length;
+  const testCount = inventory.reduce((total, item) => total + item.tests, 0);
   const failures = [];
 
   console.log(
-    `Running ${project} shard ${shard}: ${files.length} files in ` +
-      `${batches.length} bounded browser processes.`,
+    `Running ${project} shard ${shard}: ${fileCount} files and ` +
+      `${testCount} tests in ` +
+      `${batches.length} bounded browser processes` +
+      `${isolateProcessIntensiveFiles ? ' with native-GPU isolation' : ''}.`,
   );
   batches.forEach((batch, index) => {
     console.log(
-      `\n[bounded ${index + 1}/${batches.length}]\n` +
-        batch.map(file => `  ${file}`).join('\n'),
+      `\n[bounded ${index + 1}/${batches.length}: ` +
+        `${batch.testCount} tests]\n` +
+        batch.files.map(file => `  ${file}`).join('\n'),
     );
     const result = runBatch(
       project,
-      batch,
+      batch.files,
       portPlan[index],
       headed,
       environment
     );
     if (result.error || result.status !== 0) {
       failures.push({
-        files: batch,
+        files: batch.files,
         termination: result.error?.message ?? result.signal ?? result.status,
       });
     }
@@ -376,7 +573,8 @@ export function runBoundedBrowserShard(
     );
   }
   console.log(
-    `Completed all ${files.length} files in ${project} shard ${shard} ` +
+    `Completed all ${fileCount} files and ${testCount} tests in ${project} ` +
+      `shard ${shard} ` +
       `across ${batches.length} bounded browser processes.`,
   );
 }

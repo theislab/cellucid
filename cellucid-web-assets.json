@@ -2050,8 +2050,8 @@
     },
     {
       "path": "assets/js/app/ui/modules/figure-export/figure-export-ui.js",
-      "sha256": "70c3984466e948d8531e1e5ceea491e735ccaa11d6c4f72107e4c272ca3aaf3b",
-      "bytes": 119162,
+      "sha256": "ddd723af81c29346b963554c4e8f61917d2af911f6fc21a87c02451ba81c6a02",
+      "bytes": 118614,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
@@ -2062,8 +2062,8 @@
     },
     {
       "path": "assets/js/app/ui/modules/figure-export/renderers/png-renderer.js",
-      "sha256": "644275b79fc8f0b7f1984761147165d356c2ac8a0e97cf09e6140a80bbdd4d51",
-      "bytes": 35454,
+      "sha256": "f468adb84257864cec3e428f64397b9d4a58265e9b0b44865b9d18ed2b772e16",
+      "bytes": 36936,
       "content_type": "application/javascript; charset=utf-8"
     },
     {

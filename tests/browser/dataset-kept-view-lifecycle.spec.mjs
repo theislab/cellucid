@@ -783,25 +783,53 @@ test(
     const productErrors = observeProductErrors(page);
     await installAlternatePreparedDataset(page);
     await page.addInitScript(() => {
+      const originalGetContext = HTMLCanvasElement.prototype.getContext;
       const originalToBlob = HTMLCanvasElement.prototype.toBlob;
+      const webgl2Contexts = [];
+      HTMLCanvasElement.prototype.getContext = function getContext(
+        type,
+        ...args
+      ) {
+        const context = originalGetContext.call(this, type, ...args);
+        if (
+          type === 'webgl2' &&
+          context !== null &&
+          !webgl2Contexts.includes(context)
+        ) {
+          webgl2Contexts.push(context);
+        }
+        return context;
+      };
       const gate = {
         armed: false,
         lastRelease: null,
         pause: null,
+        webgl2Start: null,
         arm() {
           if (this.pause !== null) {
             throw new Error('A PNG encoding callback is already paused.');
           }
           this.armed = true;
           this.lastRelease = null;
+          this.webgl2Start = webgl2Contexts.length;
         },
         inspect() {
-          if (this.pause === null) return this.lastRelease;
+          const webgl2ContextLost = this.webgl2Start === null
+            ? []
+            : webgl2Contexts
+                .slice(this.webgl2Start)
+                .map(context => context.isContextLost());
+          if (this.pause === null) {
+            return this.lastRelease === null
+              ? null
+              : { ...this.lastRelease, webgl2ContextLost };
+          }
           return {
             height: this.pause.canvas.height,
             pausedHash: this.pause.pausedHash,
             releasedHash: this.pause.releasedHash,
             state: 'paused',
+            webgl2ContextLost,
             width: this.pause.canvas.width,
           };
         },
@@ -904,18 +932,19 @@ test(
     );
     await delayed.saveAs(delayedPath);
     const oldBytes = await readFile(delayedPath);
-    const pausedAfterRelease = await page.evaluate(
-      () => window.__sameNToBlobGate.inspect(),
-    );
     expect(pausedBeforeRelease).toMatchObject({
       pausedHash: expect.any(Number),
       releasedHash: null,
       state: 'paused',
+      webgl2ContextLost: [false],
     });
-    expect(pausedAfterRelease).toMatchObject({
+    await expect.poll(
+      () => page.evaluate(() => window.__sameNToBlobGate.inspect()),
+    ).toMatchObject({
       pausedHash: pausedBeforeRelease.pausedHash,
       releasedHash: pausedBeforeRelease.pausedHash,
       state: 'released',
+      webgl2ContextLost: [true],
     });
     expect(oldBytes.includes(Buffer.from('Current UI prepared fixture'))).toBe(
       true,
