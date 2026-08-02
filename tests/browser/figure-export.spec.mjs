@@ -562,21 +562,24 @@ test('teardown during the download click cannot roll back a committed export', a
     };
   });
 
-  const downloadPromise = page.waitForEvent('download');
-  await page.locator('#figure-export-btn').click();
-  const download = await downloadPromise;
-  expect(await download.failure()).toBeNull();
-  expect(path.extname(download.suggestedFilename())).toBe('.svg');
-  await expect(
-    page.locator('.notification-message').filter({
-      hasText: 'Exported 1 file',
-    })
-  ).toHaveCount(1);
+  const successNotice = page.locator('.notification-message').filter({
+    hasText: 'Exported 1 file',
+  });
+  const [download] = await Promise.all([
+    page.waitForEvent('download'),
+    // The product intentionally retires this success toast after 2.5 s. Own
+    // its visible interval while the browser reports the download instead of
+    // querying it after runner- and OS-dependent delivery latency.
+    expect(successNotice).toBeVisible(),
+    page.locator('#figure-export-btn').click(),
+  ]);
   await expect(
     page.locator('.notification-message').filter({
       hasText: 'Export failed',
     })
   ).toHaveCount(0);
+  expect(await download.failure()).toBeNull();
+  expect(path.extname(download.suggestedFilename())).toBe('.svg');
   expect(
     await page.evaluate(() => window.__figureExportCommitAbortCount)
   ).toBe(1);

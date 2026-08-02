@@ -256,9 +256,11 @@ test('browser batches bound file count, test weight, and process churn', () => {
   assert.ok(batches.every(batch => Object.isFrozen(batch.files)));
 
   // Linux WebKit's native GPU process crashed on the first ordinary test after
-  // the four intensive edge-publication tests. The tag makes that exact file a
-  // complete browser lifetime, while the 45-file shard remains capped at nine
-  // processes and every other runtime retains the eight-process plan above.
+  // the four intensive edge-publication tests. A separate browser lifetime was
+  // necessary but is not sufficient when the host GPU service outlives that
+  // process, so the exact stress file is quarantined after every ordinary file.
+  // The 45-file shard remains capped at nine processes and every other runtime
+  // retains the eight-process plan above.
   const isolatedInventory = inventory.map((item, index) => ({
     ...item,
     intensive: index === 0,
@@ -269,17 +271,22 @@ test('browser batches bound file count, test weight, and process churn', () => {
   );
   assert.deepEqual(
     isolatedBatches.map(batch => batch.files.length),
-    [1, 6, 6, 6, 6, 6, 6, 6, 2],
+    [6, 6, 6, 6, 6, 6, 6, 2, 1],
   );
   assert.deepEqual(
     isolatedBatches.map(batch => batch.testCount),
-    [4, 32, 21, 13, 31, 16, 16, 24, 7],
+    [32, 21, 13, 31, 16, 16, 24, 7, 4],
   );
-  assert.deepEqual(isolatedBatches[0].files, [inventory[0].file]);
+  assert.deepEqual(isolatedBatches.at(-1).files, [inventory[0].file]);
+  assert.deepEqual(
+    isolatedBatches.flatMap(batch => batch.files),
+    [...inventory.slice(1), inventory[0]].map(item => item.file),
+  );
 
   // macOS Firefox completed the five benchmark stress tests but retained a
-  // degraded GPU process that killed the following runtime-publication page.
-  // The benchmark file therefore owns one complete process generation too.
+  // degraded host GPU service after the Firefox process exited, killing the
+  // following runtime-publication page. The benchmark file therefore owns the
+  // final process generation rather than merely a separate middle generation.
   const shardOneCounts = [
     8, 1, 7, 22, 1, 3,
     1, 2, 1, 5, 2, 12,
@@ -300,15 +307,46 @@ test('browser batches bound file count, test weight, and process churn', () => {
   );
   assert.deepEqual(
     isolatedBenchmarkBatches.map(batch => batch.files.length),
-    [5, 4, 1, 6, 4, 4, 3],
+    [5, 6, 6, 2, 4, 3, 1],
   );
   assert.deepEqual(
     isolatedBenchmarkBatches.map(batch => batch.testCount),
-    [39, 7, 5, 26, 40, 37, 12],
+    [39, 21, 15, 37, 37, 12, 5],
   );
   assert.deepEqual(
-    isolatedBenchmarkBatches[2].files,
+    isolatedBenchmarkBatches.at(-1).files,
     [isolatedBenchmarkInventory[9].file],
+  );
+  assert.deepEqual(
+    isolatedBenchmarkBatches.flatMap(batch => batch.files),
+    [
+      ...isolatedBenchmarkInventory.filter(item => !item.intensive),
+      isolatedBenchmarkInventory[9],
+    ].map(item => item.file),
+  );
+
+  // More than one stress owner keeps its own relative order, and no ordinary
+  // test can ever be scheduled behind either retained host-GPU generation.
+  const multipleStressBatches = partitionBrowserShardInventory([
+    inventoryItem('ordinary-a', 2),
+    inventoryItem('stress-a', 3, true),
+    inventoryItem('ordinary-b', 4),
+    inventoryItem('stress-b', 5, true),
+    inventoryItem('ordinary-c', 6),
+  ], true);
+  assert.deepEqual(
+    multipleStressBatches.map(batch => ({
+      files: batch.files,
+      tests: batch.testCount,
+    })),
+    [
+      {
+        files: ['ordinary-a', 'ordinary-b', 'ordinary-c'],
+        tests: 12,
+      },
+      { files: ['stress-a'], tests: 3 },
+      { files: ['stress-b'], tests: 5 },
+    ],
   );
 
   // The hosted Firefox failure came from six legal files that together owned

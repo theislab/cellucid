@@ -75,6 +75,16 @@ test.describe.serial('GLB benchmark runtime publication', () => {
     await expect(page.locator('#filter-count')).toHaveText(
       'Showing all 120 points'
     );
+    // The filter count publishes dataset readiness before the linear bootstrap
+    // reaches the benchmark listeners. Use the benchmark control's production
+    // admission boundary before changing render mode; otherwise a slow native
+    // GPU can make this test race initial publication with an unrelated user
+    // operation that the test is not intended to cover.
+    await expect(page.locator('#benchmark-run')).toBeEnabled();
+    expect(harnessModuleRequests).toBe(0);
+    expect(
+      await page.evaluate(() => typeof window._cellucidBenchmarkHarness)
+    ).toBe('undefined');
   });
 
   test.afterAll(async () => {
@@ -113,14 +123,17 @@ test.describe.serial('GLB benchmark runtime publication', () => {
     // The published module namespace is the production readiness boundary.
     // A debug-console message is observability, not a synchronization API, and
     // its delivery lagged behind the ready panel on hosted Firefox.
-    await expect
-      .poll(() => page.evaluate(
+    await expect.poll(async () => ({
+      browserErrors: [...browserErrors],
+      harnessModuleRequests,
+      publishedType: await page.evaluate(
         () => typeof window._cellucidBenchmarkHarness
-      ))
-      .toBe('object');
-
-    expect(harnessModuleRequests).toBe(1);
-    expect(browserErrors).toEqual([]);
+      ),
+    })).toEqual({
+      browserErrors: [],
+      harnessModuleRequests: 1,
+      publishedType: 'object',
+    });
   });
 
   test('GLB benchmark publishes one complete state generation', async ({}, testInfo) => {

@@ -95,8 +95,10 @@ jobs:
       # degrade hosted macOS Firefox. A process per file then exhausted Windows
       # networking resources late in the larger shards. Preserve Playwright's
       # exact assignment while bounding all dimensions: each ordinary child
-      # owns at most six files and forty tests. Declared native-GPU stress files
-      # receive a separate process on Linux WebKit and macOS Firefox, and even
+      # owns at most six files and forty tests. On vulnerable runtimes, declared
+      # native-GPU stress files run as singleton processes after every ordinary
+      # batch: the hosted GPU service can retain degraded state after Firefox
+      # exits, so a process boundary alone cannot protect the next page. Even
       # those largest shards are capped at nine real browsers. Tests are neither
       # retried nor skipped, mocked, or given more time.
       - name: Run the selected headed Firefox shard in bounded processes

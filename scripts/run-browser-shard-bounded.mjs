@@ -27,10 +27,15 @@ const MAX_CAPTURE_BYTES = 64 * 1024 * 1024;
 // or forty tests. A small number of tests deliberately exercise repeated native
 // GPU allocation/rollback generations; vulnerable hosted native GPU processes
 // must run each containing file in its own process because they retain enough
-// state to crash the next unrelated page. Even with those declared isolation
-// boundaries, no shard may launch more than nine browsers. A growing inventory
-// must add another CI shard (or split an oversized spec) instead of silently
-// weakening a resource fence.
+// state to crash the next unrelated page. A browser-process boundary alone is
+// not a host-GPU boundary: hosted macOS Firefox can retain degraded GPU-service
+// state after the stressing Firefox process exits. Vulnerable runtimes therefore
+// run all ordinary conformance batches first and quarantine declared stress
+// files in singleton processes at the tail, where retained driver state cannot
+// poison an unrelated test. Even with those declared isolation boundaries, no
+// shard may launch more than nine browsers. A growing inventory must add another
+// CI shard (or split an oversized spec) instead of silently weakening a resource
+// fence.
 export const MAX_FILES_PER_BROWSER_PROCESS = 6;
 export const MAX_TESTS_PER_BROWSER_PROCESS = 40;
 export const MAX_ORDINARY_BROWSER_PROCESSES_PER_SHARD = 8;
@@ -325,7 +330,11 @@ export function shouldIsolateProcessIntensiveFiles(
 
 /**
  * Partition one exact Playwright shard without allowing file count, test
- * weight, or process churn to become unbounded.
+ * weight, or process churn to become unbounded. Vulnerable native-GPU runs
+ * preserve relative order inside the ordinary and intensive inventories but
+ * quarantine every intensive singleton after all ordinary batches. A stress
+ * process may outlive Firefox in a shared host GPU service, so process isolation
+ * without tail quarantine is not an isolation boundary for later tests.
  *
  * @param {Array<{file: string, intensive: boolean, tests: number}>} inventory
  * @param {boolean} [isolateProcessIntensiveFiles]
@@ -415,14 +424,13 @@ export function partitionBrowserShardInventory(
     batchFiles = [];
     batchTestCount = 0;
   };
-  for (const item of inventory) {
-    if (isolateProcessIntensiveFiles && item.intensive) {
-      publishBatch();
-      batchFiles.push(item.file);
-      batchTestCount = item.tests;
-      publishBatch();
-      continue;
-    }
+  const ordinaryInventory = isolateProcessIntensiveFiles
+    ? inventory.filter(item => !item.intensive)
+    : inventory;
+  const intensiveInventory = isolateProcessIntensiveFiles
+    ? inventory.filter(item => item.intensive)
+    : [];
+  for (const item of ordinaryInventory) {
     if (
       batchFiles.length === MAX_FILES_PER_BROWSER_PROCESS ||
       (
@@ -436,6 +444,11 @@ export function partitionBrowserShardInventory(
     batchTestCount += item.tests;
   }
   publishBatch();
+  for (const item of intensiveInventory) {
+    batchFiles.push(item.file);
+    batchTestCount = item.tests;
+    publishBatch();
+  }
   if (batches.length > processCapacity) {
     throw new RangeError(
       `Browser shard requires ${batches.length} bounded processes, exceeding ` +
@@ -539,7 +552,9 @@ export function runBoundedBrowserShard(
     `Running ${project} shard ${shard}: ${fileCount} files and ` +
       `${testCount} tests in ` +
       `${batches.length} bounded browser processes` +
-      `${isolateProcessIntensiveFiles ? ' with native-GPU isolation' : ''}.`,
+      `${isolateProcessIntensiveFiles
+        ? ' with tail-quarantined native-GPU isolation'
+        : ''}.`,
   );
   batches.forEach((batch, index) => {
     console.log(
