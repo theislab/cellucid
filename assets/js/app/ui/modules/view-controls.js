@@ -19,6 +19,7 @@ import {
   publishSnapshotView,
   retireSnapshotView,
 } from '../../view-snapshot-publication.js';
+import { viewerNeedsUiRetirement } from '../core/viewer-lifecycle.js';
 
 const LIVE_VIEW_ID = 'live';
 const VIEW_LAYOUT_MODES = new Set(['grid', 'single']);
@@ -1257,7 +1258,9 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
         );
       });
       cleanup(() => splitViewBadges.replaceChildren());
-      cleanup(() => viewer.setViewFocusHandler(() => {}));
+      if (viewerNeedsUiRetirement(viewer)) {
+        cleanup(() => viewer.setViewFocusHandler(() => {}));
+      }
       destructionPromise = Promise
         .allSettled([...pendingDimensionBadgeTasks])
         .then(outcomes => {

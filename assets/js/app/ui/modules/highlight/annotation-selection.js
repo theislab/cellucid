@@ -21,6 +21,7 @@ import {
   selectionNoticeHtml
 } from './mode-copy.js';
 import { MAX_HISTORY_STEPS, selectionUnchanged } from './selection-state.js';
+import { viewerNeedsUiRetirement } from '../../core/viewer-lifecycle.js';
 import { getStepControls, removeStepControls } from './step-controls.js';
 import {
   deliverSelectionToJupyter,
@@ -558,10 +559,12 @@ export function initAnnotationSelection(options) {
       } catch (error) {
         failures.push(error);
       }
-      try {
-        viewer.setSelectionStepCallback(() => {});
-      } catch (error) {
-        failures.push(error);
+      if (viewerNeedsUiRetirement(viewer)) {
+        try {
+          viewer.setSelectionStepCallback(() => {});
+        } catch (error) {
+          failures.push(error);
+        }
       }
       destructionPromise = Promise.allSettled(
         [...pendingDeliveries]

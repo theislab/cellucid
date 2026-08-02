@@ -14,7 +14,11 @@
 import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 
-import { expect, test } from '@playwright/test';
+import {
+  closePageWithApplicationRetirement,
+  expect,
+  test,
+} from './helpers/test.mjs';
 
 import { appUrl } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
@@ -444,7 +448,7 @@ test('a published starting state reports its field and leaves the dimension rule
   ]);
   const bundle = toPublishedDefault(await readFile(await download.path()));
   expect(bundle.byteLength).toBeGreaterThan(0);
-  await page.close();
+  await closePageWithApplicationRetirement(page);
 
   // Phase 2 — advertise it as the dataset's starting state and open the
   // dataset the way a first-time visitor does.
@@ -470,5 +474,5 @@ test('a published starting state reports its field and leaves the dimension rule
   await visitor.selectOption('#dimension-select', '2');
   await expect(visitor.locator('#navigation-mode')).toHaveValue('planar');
 
-  await visitor.close();
+  await closePageWithApplicationRetirement(visitor);
 });

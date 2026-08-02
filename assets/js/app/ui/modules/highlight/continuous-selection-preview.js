@@ -21,6 +21,7 @@ import {
   requireHighlightSelectionState,
   requireMethods
 } from './exact-contract.js';
+import { viewerNeedsUiRetirement } from '../../core/viewer-lifecycle.js';
 
 /**
  * @param {object} options
@@ -123,10 +124,13 @@ export function initContinuousSelectionPreview(options) {
       if (destroyed) return;
       destroyed = true;
       const failures = [];
-      for (const cleanup of [
-        () => viewer.setSelectionPreviewCallback(() => {}),
-        hideRangeLabel
-      ]) {
+      const cleanups = [hideRangeLabel];
+      if (viewerNeedsUiRetirement(viewer)) {
+        cleanups.unshift(
+          () => viewer.setSelectionPreviewCallback(() => {})
+        );
+      }
+      for (const cleanup of cleanups) {
         try {
           cleanup();
         } catch (error) {

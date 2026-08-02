@@ -1,4 +1,4 @@
-import { expect, test } from '@playwright/test';
+import { expect, test } from './helpers/test.mjs';
 
 const configuredPointCount = Number.parseInt(
   process.env.CELLUCID_SNAPSHOT_GPU_BENCH_POINTS ?? '262144',

@@ -1,6 +1,6 @@
 import { readFile } from 'node:fs/promises';
 
-import { expect, test } from '@playwright/test';
+import { expect, test } from './helpers/test.mjs';
 import { EXPORTS_BASE_URL as EXPORTS_ROOT } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 

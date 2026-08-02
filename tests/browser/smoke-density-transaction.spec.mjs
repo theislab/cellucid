@@ -1,4 +1,4 @@
-import { expect, test } from '@playwright/test';
+import { expect, test } from './helpers/test.mjs';
 import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 
@@ -753,4 +753,20 @@ test('viewer invalidates smoke resources and requires reload after WebGL context
       exact: true,
     }),
   ).toBeVisible();
+  const retirementFailure = await page.evaluate(async () => {
+    try {
+      await window._cellucidDispose();
+      return null;
+    } catch (error) {
+      const serialize = value => ({
+        errors: value instanceof AggregateError
+          ? value.errors.map(serialize)
+          : [],
+        message: value?.message ?? String(value),
+        name: value?.name ?? null,
+      });
+      return serialize(error);
+    }
+  });
+  expect(retirementFailure).toBeNull();
 });

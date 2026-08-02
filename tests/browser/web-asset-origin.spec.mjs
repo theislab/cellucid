@@ -1,4 +1,4 @@
-import { expect, test } from '@playwright/test';
+import { expect, test } from './helpers/test.mjs';
 
 test('web origin serves every declared MIME family exactly', async ({
   request,

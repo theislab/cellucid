@@ -1,4 +1,4 @@
-import { expect, test } from '@playwright/test';
+import { expect, test } from './helpers/test.mjs';
 
 test('invalid explicit remote intent stops on one visible startup failure', async ({
   page

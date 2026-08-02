@@ -1,5 +1,9 @@
 import { createHash } from 'node:crypto';
-import { expect, test } from '@playwright/test';
+import {
+  closeContextWithApplicationRetirement,
+  expect,
+  test,
+} from './helpers/test.mjs';
 import {
   APP_ORIGIN,
   ENCODED_EXPORTS_BASE_URL,
@@ -157,7 +161,7 @@ test('camera path playback honours a reduced-motion preference', async ({
         reducedMotion === 'reduce',
       );
     } finally {
-      await context.close();
+      await closeContextWithApplicationRetirement(context);
     }
   }
 

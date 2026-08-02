@@ -10,6 +10,7 @@
 
 import { getNotificationCenter } from '../../notification-center.js';
 import { parseRangeInput } from '../core/numeric-input-contract.js';
+import { viewerNeedsUiRetirement } from '../core/viewer-lifecycle.js';
 
 const REQUIRED_DOM_KEYS = [
   'navigationModeSelect',
@@ -353,9 +354,11 @@ export function initCameraControls({ viewer, dom, callbacks }) {
         failures.push(error);
       }
     };
-    cleanup(() => viewer.setPointerLockChangeHandler(() => {}));
-    cleanup(() => viewer.setPointerLockEnabled(false));
-    cleanup(() => viewer.setProjectilesEnabled(false));
+    if (viewerNeedsUiRetirement(viewer)) {
+      cleanup(() => viewer.setPointerLockChangeHandler(() => {}));
+      cleanup(() => viewer.setPointerLockEnabled(false));
+      cleanup(() => viewer.setProjectilesEnabled(false));
+    }
     if (projectileNotificationId !== null) {
       const notificationId = projectileNotificationId;
       projectileNotificationId = null;

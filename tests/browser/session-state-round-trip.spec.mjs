@@ -33,7 +33,7 @@
  */
 
 import { readFile } from 'node:fs/promises';
-import { expect, test } from '@playwright/test';
+import { expect, test } from './helpers/test.mjs';
 
 import { readBundle } from '../../assets/js/app/session/bundle/reader.js';
 import { gzipDecompress } from '../../assets/js/app/session/codecs/gzip.js';

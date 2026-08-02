@@ -1,4 +1,4 @@
-import { expect, test } from '@playwright/test';
+import { expect, test } from './helpers/test.mjs';
 
 const WEBGL_HARNESS = '/tests/browser/fixtures/webgl-harness.html';
 const TIMING_ENABLED = process.env.CELLUCID_GPU_TIMING === '1';

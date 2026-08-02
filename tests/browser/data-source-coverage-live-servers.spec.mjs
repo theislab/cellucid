@@ -31,7 +31,7 @@
  * every status, header and byte comes from Python, including the authenticated
  * `POST /_cellucid/events` that a wrong token would reject with HTTP 403.
  */
-import { expect, test } from '@playwright/test';
+import { expect, test } from './helpers/test.mjs';
 import { APP_ORIGIN as ORIGIN } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 

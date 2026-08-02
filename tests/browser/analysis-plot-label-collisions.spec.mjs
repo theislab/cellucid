@@ -27,7 +27,7 @@
  * reports overlaps that no reader can see, and a check built on that would
  * demand a thinning far more aggressive than the glyphs need.
  */
-import { expect, test } from '@playwright/test';
+import { expect, test } from './helpers/test.mjs';
 import { appUrl } from './helpers/origins.mjs';
 
 const HARNESS_URL = appUrl('/tests/browser/fixtures/analysis-plot-harness.html');

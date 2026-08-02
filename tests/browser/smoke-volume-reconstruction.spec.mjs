@@ -7,7 +7,7 @@
 // Nothing else in the suite asserts any of that, so a mapping or mip-level
 // change moves the smoke off the cells it represents in silence.
 
-import { expect, test } from '@playwright/test';
+import { expect, test } from './helpers/test.mjs';
 
 const HARNESS_URL = '/tests/browser/fixtures/webgl-harness.html';
 const PROBE = '/tests/browser/helpers/smoke-volume-probe.mjs';

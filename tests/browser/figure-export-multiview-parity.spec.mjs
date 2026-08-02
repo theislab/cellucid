@@ -1,4 +1,4 @@
-import { expect, test } from '@playwright/test';
+import { expect, test } from './helpers/test.mjs';
 
 test('grid PNG and Hybrid SVG own per-pane scientific adornments', async ({
   page,

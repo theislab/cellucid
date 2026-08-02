@@ -15,7 +15,7 @@
  * match the plot host's layout box, and the sidebar plot must not paint below
  * its host.
  */
-import { expect, test } from '@playwright/test';
+import { expect, test } from './helpers/test.mjs';
 import { encodedAppUrl } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 

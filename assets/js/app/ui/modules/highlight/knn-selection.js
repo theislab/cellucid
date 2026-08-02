@@ -15,6 +15,7 @@ import {
   selectionNoticeHtml
 } from './mode-copy.js';
 import { MAX_HISTORY_STEPS, selectionUnchanged } from './selection-state.js';
+import { viewerNeedsUiRetirement } from '../../core/viewer-lifecycle.js';
 import { getStepControls, removeStepControls } from './step-controls.js';
 import {
   deliverSelectionToJupyter,
@@ -437,12 +438,15 @@ export function initKnnSelection(options) {
       if (destructionPromise !== null) return destructionPromise;
       destroyed = true;
       const failures = [];
-      for (const operation of [
-        () => lifecycleController.abort(),
-        () => viewer.setKnnCallback(() => {}),
-        () => viewer.setKnnStepCallback(() => {}),
-        () => viewer.setKnnPreviewCallback(() => {})
-      ]) {
+      const operations = [() => lifecycleController.abort()];
+      if (viewerNeedsUiRetirement(viewer)) {
+        operations.push(
+          () => viewer.setKnnCallback(() => {}),
+          () => viewer.setKnnStepCallback(() => {}),
+          () => viewer.setKnnPreviewCallback(() => {})
+        );
+      }
+      for (const operation of operations) {
         try {
           operation();
         } catch (error) {

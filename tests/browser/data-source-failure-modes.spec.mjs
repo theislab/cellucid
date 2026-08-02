@@ -18,7 +18,7 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { expect, test } from '@playwright/test';
+import { expect, test } from './helpers/test.mjs';
 import { APP_ORIGIN as ORIGIN } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 
@@ -320,6 +320,9 @@ test('a broken default dataset stops startup with one actionable card', async ({
   await expect(failure).toContainText(
     'Correct the launch configuration or server response, then reload this page.',
   );
+  await expect.poll(() => page.evaluate(
+    () => window._cellucidViewer.isDisposalSettled(),
+  )).toBe(true);
   const observed = await recordUserFacingFailure(
     page,
     testInfo,

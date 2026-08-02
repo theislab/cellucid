@@ -2,7 +2,7 @@ import { once } from 'node:events';
 import { createPrivateKey } from 'node:crypto';
 import { createServer } from 'node:https';
 
-import { expect, test } from '@playwright/test';
+import { expect, test } from './helpers/test.mjs';
 
 import worker from '../../assets/js/app/community-annotations/_worker-code.js';
 import {

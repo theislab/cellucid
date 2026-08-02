@@ -1,4 +1,4 @@
-import { expect, test } from '@playwright/test';
+import { expect, test } from './helpers/test.mjs';
 
 import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
@@ -345,8 +345,19 @@ test('terminal disposal retains failed centroid DOM owners for a later exact ret
   const pageErrors = [];
   page.on('pageerror', error => pageErrors.push(error.message));
 
-  const proof = await page.evaluate(() => {
+  const proof = await page.evaluate(async () => {
     const viewer = window._cellucidViewer;
+    const ui = window._cellucidUi;
+    if (ui === null || typeof ui?.destroy !== 'function') {
+      throw new Error(
+        'Viewer terminal ownership requires the application UI disposer.',
+      );
+    }
+    // This test terminates the viewer directly so it can exercise the
+    // viewer's exact retry contract. Retire the higher-level UI owner first;
+    // otherwise its later cleanup would correctly attempt to call methods on
+    // a viewer the test has already made terminal.
+    await ui.destroy();
     const labelLayer = document.querySelector('#label-layer');
     viewer.setCentroidLabels([], 'live');
     const first = document.createElement('div');

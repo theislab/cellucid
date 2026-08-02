@@ -98,6 +98,7 @@ const TERMINAL_SAFE_VIEWER_METHODS = new Set([
   'getGrantedAntialiasing',
   'getHPRenderer',
   'getRequestedAntialiasing',
+  'isContextLost',
   'isDisposed',
   'isDisposalSettled',
   'isPaused',
@@ -10523,6 +10524,10 @@ export function createViewer({
 
     isDisposed() {
       return disposed;
+    },
+
+    isContextLost() {
+      return webglContextLost;
     },
 
     isDisposalSettled() {

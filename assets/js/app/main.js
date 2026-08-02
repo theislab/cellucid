@@ -17,7 +17,10 @@ import {
   MAX_SMOKE_GRID_SIZE
 } from '../rendering/smoke-cloud/smoke-density-contract.js';
 import { createDataState } from './state/index.js';
-import { initUI } from './ui/core/ui-coordinator.js';
+import {
+  createStableTerminalDestroy,
+  initUI
+} from './ui/core/ui-coordinator.js';
 import {
   createSessionSerializer
 } from './session/index.js';
@@ -163,6 +166,7 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
   let statsEl = null;
   let currentDatasetLoadToken = null;
   let buildDatasetAnalyticsContext = () => ({});
+  let destroyApplication = null;
 
   try {
     ThemeManager.init();
@@ -246,6 +250,9 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
     const connectivityLimitDisplay = document.getElementById('connectivity-limit-display');
     const connectivityInfo = document.getElementById('connectivity-info');
     let ui = null;
+    let comparisonModule = null;
+    let applicationRetired = false;
+    let stopPerfMonitoring = () => {};
 
     debug.log('[Main] Creating viewer...');
     // `antialias` is fixed at context creation and cannot be changed on a live
@@ -265,11 +272,44 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
     // Expose viewer globally for dev tools (benchmark, debugging)
     window._cellucidViewer = viewer;
 
+    // Browser page closure is not guaranteed to run asynchronous cleanup, so
+    // publish one terminal owner as soon as the viewer exists. It remains
+    // valid while the later UI and analysis owners are adopted, and always
+    // fences the render loop and releases WebGL synchronously before its
+    // returned task waits for asynchronous child teardown.
+    destroyApplication = createStableTerminalDestroy({
+      closeAdmission: () => {
+        applicationRetired = true;
+        window.removeEventListener(
+          'pagehide',
+          retireApplicationOnPageHide
+        );
+      },
+      getOperations: () => [
+        () => stopPerfMonitoring(),
+        ...(comparisonModule === null
+          ? []
+          : [() => comparisonModule.destroy()]),
+        ...(ui === null ? [] : [() => ui.destroy()]),
+        () => viewer.dispose()
+      ],
+      failureMessage: 'Application teardown was incomplete.'
+    });
+    function retireApplicationOnPageHide(event) {
+      if (event.persisted === true) return;
+      void destroyApplication().catch(error => {
+        console.error('[Main] Application teardown failed:', error);
+      });
+    }
+    window._cellucidDispose = destroyApplication;
+    window.addEventListener('pagehide', retireApplicationOnPageHide);
+
     const state = createDataState({ viewer, labelLayer });
     debug.log('[Main] State created successfully');
 
     // Expose state globally for dev tools
     window._cellucidState = state;
+
     // benchmarkReporter will be created lazily when benchmark report is requested
     let benchmarkReporter = null;
 
@@ -2336,14 +2376,6 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
       jupyterSource
     });
     window._cellucidUi = ui;
-    const retireApplicationUi = event => {
-      if (event.persisted === true) return;
-      window.removeEventListener('pagehide', retireApplicationUi);
-      void ui.destroy().catch(error => {
-        console.error('[Main] Application UI teardown failed:', error);
-      });
-    };
-    window.addEventListener('pagehide', retireApplicationUi);
     datasetCatalogReady = ui.datasetCatalogReady;
     fulfillDatasetSelectFocusRequest();
 
@@ -2375,7 +2407,7 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
     // Initialize Page Analysis / Comparison Module
     const pageAnalysisSection = document.getElementById('page-analysis-section');
     if (pageAnalysisSection) {
-      const comparisonModule = createComparisonModule({
+      comparisonModule = createComparisonModule({
         state,
         container: pageAnalysisSection
       });
@@ -3674,6 +3706,7 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
     };
 
     const startPerfMonitoring = ({ resetTracker = false } = {}) => {
+      if (applicationRetired) return;
       // perfTracker is lazy-loaded; if not available yet, skip monitoring
       if (!perfTracker) {
         console.warn('[Main] Performance tracker not loaded yet');
@@ -3720,7 +3753,7 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
       }
     };
 
-    const stopPerfMonitoring = () => {
+    stopPerfMonitoring = () => {
       benchmarkActive = false;
       if (perfVisibilityListenerActive) {
         document.removeEventListener(
@@ -3782,6 +3815,7 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
         if (benchmarkSection.open) {
           // Lazy-load benchmark module when section is first opened
           await ensureBenchmarkModule();
+          if (applicationRetired) return;
           activateBenchmarkingPanel({ resetTracker: true });
         } else {
           stopPerfMonitoring();
@@ -4552,6 +4586,11 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
   } catch (thrown) {
     const startupError = normalizeStartupError(thrown);
     console.error('[Main] Terminal startup failure:', startupError);
+    if (destroyApplication !== null) {
+      void destroyApplication().catch(error => {
+        console.error('[Main] Terminal startup teardown failed:', error);
+      });
+    }
     publishStartupFailure({
       documentOwner: document,
       error: startupError,

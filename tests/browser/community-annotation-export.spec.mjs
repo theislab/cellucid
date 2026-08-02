@@ -1,4 +1,4 @@
-import { expect, test } from '@playwright/test';
+import { expect, test } from './helpers/test.mjs';
 import { readFile } from 'node:fs/promises';
 
 import { EXPORTS_BASE_URL as FIXTURE_ROOT } from './helpers/origins.mjs';

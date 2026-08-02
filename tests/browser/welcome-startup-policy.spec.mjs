@@ -1,4 +1,4 @@
-import { expect, test } from '@playwright/test';
+import { expect, test } from './helpers/test.mjs';
 import { extname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {

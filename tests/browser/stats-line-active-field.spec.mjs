@@ -13,7 +13,7 @@
 // different field, and switch back. The line must name the field of the view
 // being looked at, every time.
 
-import { expect, test } from '@playwright/test';
+import { expect, test } from './helpers/test.mjs';
 import { sampleUrl } from './helpers/origins.mjs';
 
 const SAMPLE_ROOT = sampleUrl('/tests/browser/fixtures/exports/');

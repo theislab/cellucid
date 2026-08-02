@@ -19,7 +19,7 @@
  * was meant to produce it, because the whole question is whether two labels
  * drawn at the ends of a narrow box actually clear each other.
  */
-import { expect, test } from '@playwright/test';
+import { expect, test } from './helpers/test.mjs';
 import { appUrl } from './helpers/origins.mjs';
 
 const HARNESS_URL = appUrl('/tests/browser/fixtures/analysis-plot-harness.html');

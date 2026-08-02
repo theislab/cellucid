@@ -11,6 +11,7 @@
  */
 
 import { collectDOMReferences } from './dom-cache.js';
+import { viewerNeedsUiRetirement } from './viewer-lifecycle.js';
 import { initSidebarControls } from '../modules/sidebar-controls.js';
 import { initStatsDisplay } from '../modules/stats-display.js';
 import { initRenderControls } from '../modules/render-controls.js';
@@ -684,11 +685,31 @@ export function initUI({
       () => highlightControls.destroy(),
       () => sessionControls.destroy(),
       () => visualizationReset.destroy(),
-      () => viewer.setNavigationModeChangeHandler(() => {}),
-      () => viewer.setSmokeRenderFailureHandler(() => {}),
-      () => viewer.setVelocityRenderFailureHandler?.(() => {}),
-      () => viewer.setPointerLockChangeHandler(() => {}),
-      () => viewer.setViewFocusHandler(() => {}),
+      () => {
+        if (viewerNeedsUiRetirement(viewer)) {
+          viewer.setNavigationModeChangeHandler(() => {});
+        }
+      },
+      () => {
+        if (viewerNeedsUiRetirement(viewer)) {
+          viewer.setSmokeRenderFailureHandler(() => {});
+        }
+      },
+      () => {
+        if (viewerNeedsUiRetirement(viewer)) {
+          viewer.setVelocityRenderFailureHandler?.(() => {});
+        }
+      },
+      () => {
+        if (viewerNeedsUiRetirement(viewer)) {
+          viewer.setPointerLockChangeHandler(() => {});
+        }
+      },
+      () => {
+        if (viewerNeedsUiRetirement(viewer)) {
+          viewer.setViewFocusHandler(() => {});
+        }
+      },
       () => velocityOverlayControls.destroy(),
       () => dimensionControls.destroy(),
       () => datasetControls.destroy(),

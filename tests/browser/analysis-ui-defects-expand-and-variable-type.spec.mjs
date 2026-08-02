@@ -13,7 +13,7 @@
  * offers a real `.analysis-expand-btn`, so in Correlation alone the expanded
  * view was unreachable by keyboard and unannounced.
  */
-import { expect, test } from '@playwright/test';
+import { expect, test } from './helpers/test.mjs';
 import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 

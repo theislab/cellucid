@@ -1,4 +1,4 @@
-import { expect, test } from '@playwright/test';
+import { expect, test } from './helpers/test.mjs';
 
 test('browser runtime provides the working WebGL2 contract Cellucid requires', async ({
   page,

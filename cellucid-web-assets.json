@@ -1264,8 +1264,8 @@
     },
     {
       "path": "assets/js/app/main.js",
-      "sha256": "01556b911b3475fa539b4cb70dd9ff13b8ef35a772f1ecd89373a98e5408eec0",
-      "bytes": 166754,
+      "sha256": "0e29012c581d7d0e8c52c6113299904da42859727c61f42adb1433268df367d9",
+      "bytes": 168107,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
@@ -1738,8 +1738,14 @@
     },
     {
       "path": "assets/js/app/ui/core/ui-coordinator.js",
-      "sha256": "2fc5dd72a0a33a65d25beaaf13698f110af2c8fd3cf79f20e523961d13160891",
-      "bytes": 24461,
+      "sha256": "e41b1bbd5c53a6d7c863e9c18cddc5d96fb023210248320596eba193b782d0b4",
+      "bytes": 24916,
+      "content_type": "application/javascript; charset=utf-8"
+    },
+    {
+      "path": "assets/js/app/ui/core/viewer-lifecycle.js",
+      "sha256": "d17aa388564bb1cb462662e5a08392ce93a05c7ec4830ac813dd14ad8f37f716",
+      "bytes": 739,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
@@ -1804,8 +1810,8 @@
     },
     {
       "path": "assets/js/app/ui/modules/camera-controls.js",
-      "sha256": "0da6a4289e9438a5d6f996f29ef881723fa09095fab77ba910c4403cb235422c",
-      "bytes": 11666,
+      "sha256": "ba21f4cf0c85268f46188ceaa6aca1925cac4aa9ec1b729205fb49fd2c72fdf2",
+      "bytes": 11792,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
@@ -2236,14 +2242,14 @@
     },
     {
       "path": "assets/js/app/ui/modules/highlight/annotation-selection.js",
-      "sha256": "f1c3d85f47b8a0e9642d8f73625a3ee7745955f50ca5765f823bc7aeb8ecff40",
-      "bytes": 19411,
+      "sha256": "b406db2774efa60031bdeb57a776ae4b4092647fc9068b8876d76e457aab3888",
+      "bytes": 19548,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
       "path": "assets/js/app/ui/modules/highlight/continuous-selection-preview.js",
-      "sha256": "9b5d03327c0af4cf0bdfdb1c7b39ba5f5f2efcd5dc308d1c00c191c8a9bd3683",
-      "bytes": 4321,
+      "sha256": "7001f545e0ba0805c21b9f73a7ef843a705fc6e45545afb85e4b09ab7c6c3030",
+      "bytes": 4503,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
@@ -2272,14 +2278,14 @@
     },
     {
       "path": "assets/js/app/ui/modules/highlight/knn-selection.js",
-      "sha256": "381fdddb550770e2db63e7468d362a0f9dace53f76205e9f10af64a1bfe4459f",
-      "bytes": 14692,
+      "sha256": "446444954660db48caf6bc8fa2d03bb8b80417feca9a4403ab7204c46e3ccbe1",
+      "bytes": 14881,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
       "path": "assets/js/app/ui/modules/highlight/lasso-selection.js",
-      "sha256": "92ed17e8e3f71e5a083e7503c581525bb04a02b8c5aa66184fa52f006bfef599",
-      "bytes": 14951,
+      "sha256": "7b1181150538e53f15581775c818e4cd7616e9fd5d0ebee9b8233389d2a74c58",
+      "bytes": 15140,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
@@ -2296,8 +2302,8 @@
     },
     {
       "path": "assets/js/app/ui/modules/highlight/proximity-selection.js",
-      "sha256": "68ef97ae6d2fc50497945ecd711a9a53abee51897732cb0279d211c79c3cd0b2",
-      "bytes": 16379,
+      "sha256": "bc4445f45e98f1c2a9a165ebfec7cc10cf1e33f0493383a5b47ddcdb41dc7834",
+      "bytes": 16568,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
@@ -2368,8 +2374,8 @@
     },
     {
       "path": "assets/js/app/ui/modules/view-controls.js",
-      "sha256": "0783c4256abc8daa944d1bda147337725f5afc1229829e116b27e6c153b638eb",
-      "bytes": 40814,
+      "sha256": "f64fad17d1bdf7980d6a130d36a8799f32222930cfd43dd1f08c0a6a462ffcaf",
+      "bytes": 40940,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
@@ -2878,8 +2884,8 @@
     },
     {
       "path": "assets/js/rendering/viewer.js",
-      "sha256": "d51a7f3d2ee34eddd70c8cfadfdde117a6a0278d9049f59caeee13390902d8e0",
-      "bytes": 365886,
+      "sha256": "1e8c1f3dcc280b435d44d63e70d07e0c80b74a85bfbb41bd1a2321b4d072e6ef",
+      "bytes": 365966,
       "content_type": "application/javascript; charset=utf-8"
     },
     {

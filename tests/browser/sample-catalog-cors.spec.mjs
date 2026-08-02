@@ -1,4 +1,4 @@
-import { expect, test } from '@playwright/test';
+import { expect, test } from './helpers/test.mjs';
 import { sampleUrl } from './helpers/origins.mjs';
 
 const CORS_SAMPLE_ROOT = sampleUrl('/tests/browser/fixtures/exports/');
