@@ -142,6 +142,23 @@ test('an unusable address is named rather than accepted', () => {
       }),
     /must differ from/
   );
+
+  for (const blockedPort of [4190, 5060, 5061, 10080]) {
+    assert.throws(
+      () => resolveBrowserTestPorts({
+        [BROWSER_TEST_PORT_VARIABLE]: String(blockedPort),
+        [BROWSER_TEST_SAMPLE_PORT_VARIABLE]: '12000',
+      }),
+      new RegExp(`browser-blocked HTTP\\(S\\) port ${blockedPort}`),
+    );
+    assert.throws(
+      () => resolveBrowserTestPorts({
+        [BROWSER_TEST_PORT_VARIABLE]: '12000',
+        [BROWSER_TEST_SAMPLE_PORT_VARIABLE]: String(blockedPort),
+      }),
+      new RegExp(`browser-blocked HTTP\\(S\\) port ${blockedPort}`),
+    );
+  }
 });
 
 test('a taken address reports the port and the way to move it', () => {

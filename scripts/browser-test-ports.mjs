@@ -22,6 +22,19 @@ export const BROWSER_TEST_SAMPLE_PORT_VARIABLE =
 const LOWEST_PORT = 1024;
 const HIGHEST_PORT = 65535;
 
+// HTTP(S) requests to these ports are network errors by definition, even when
+// a local server bound the address successfully. Keep this list aligned with
+// the Fetch Standard's bad-port table:
+// https://fetch.spec.whatwg.org/#port-blocking
+const FETCH_BAD_PORTS = new Set([
+  0, 1, 7, 9, 11, 13, 15, 17, 19, 20, 21, 22, 23, 25, 37, 42, 43, 53, 69,
+  77, 79, 87, 95, 101, 102, 103, 104, 109, 110, 111, 113, 115, 117, 119,
+  123, 135, 137, 139, 143, 161, 179, 389, 427, 465, 512, 513, 514, 515,
+  526, 530, 531, 532, 540, 548, 554, 556, 563, 587, 601, 636, 989, 990,
+  993, 995, 1719, 1720, 1723, 2049, 3659, 4045, 4190, 5060, 5061, 6000,
+  6566, 6665, 6666, 6667, 6668, 6669, 6679, 6697, 10080,
+]);
+
 function describePortRange(variable) {
   return (
     `${variable} must be a whole number between ${LOWEST_PORT} and ` +
@@ -51,6 +64,24 @@ function assertPortInRange(value, variable, derivedFrom) {
 }
 
 /**
+ * Whether HTTP(S) navigation to a port is forbidden by the Fetch Standard.
+ *
+ * @param {number} port
+ * @returns {boolean}
+ */
+export function isBrowserBlockedPort(port) {
+  return FETCH_BAD_PORTS.has(port);
+}
+
+function assertPortUsableByBrowsers(value, variable) {
+  if (isBrowserBlockedPort(value)) {
+    throw new RangeError(
+      `${variable} must not use browser-blocked HTTP(S) port ${value}.`
+    );
+  }
+}
+
+/**
  * Resolve the two loopback ports a browser-test run uses.
  *
  * The main server hosts the application; the sample server hosts the same tree
@@ -73,6 +104,7 @@ export function resolveBrowserTestPorts(environment = process.env) {
     DEFAULT_BROWSER_TEST_PORT
   );
   assertPortInRange(port, BROWSER_TEST_PORT_VARIABLE);
+  assertPortUsableByBrowsers(port, BROWSER_TEST_PORT_VARIABLE);
 
   const samplePort = readPort(
     environment,
@@ -87,6 +119,7 @@ export function resolveBrowserTestPorts(environment = process.env) {
       ? `${BROWSER_TEST_PORT_VARIABLE}=${port}`
       : undefined
   );
+  assertPortUsableByBrowsers(samplePort, BROWSER_TEST_SAMPLE_PORT_VARIABLE);
   if (samplePort === port) {
     throw new RangeError(
       `${BROWSER_TEST_SAMPLE_PORT_VARIABLE} must differ from ` +
