@@ -703,6 +703,10 @@ test('ORCID retry, blur, timeout, and Escape settlements stay with the focused c
       }],
     };
     const emptyDocument = { 'expanded-result': [] };
+    const nonCooperativeBlurQueries = new Set([
+      'Deferred no-result query',
+      'Deferred failure query',
+    ]);
     const response = document => new Response(
       JSON.stringify(document),
       {
@@ -752,6 +756,11 @@ test('ORCID retry, blur, timeout, and Escape settlements stay with the focused c
         probe.pending.set(query, owner);
         const abort = () => {
           probe.aborts += 1;
+          // These two owners deliberately acknowledge cancellation without
+          // settling. They prove that the product's publication fence rejects
+          // a late fulfillment or rejection even when a transport does not
+          // cooperate with AbortSignal.
+          if (nonCooperativeBlurQueries.has(query)) return;
           if (probe.pending.get(query) === owner) {
             probe.pending.delete(query);
           }
@@ -834,7 +843,16 @@ test('ORCID retry, blur, timeout, and Escape settlements stay with the focused c
     '[role="listbox"][aria-label="ORCID search suggestions"]'
   );
 
-  await orcidInput.fill('Debounce blur query');
+  // Express the user's input-and-blur gesture inside one renderer task. Two
+  // separate automation round trips can exceed the 250 ms product debounce on
+  // a loaded hosted runner before the focus command is even delivered, which
+  // no blur implementation can retroactively prevent.
+  await orcidInput.evaluate((input, value) => {
+    input.focus();
+    input.value = value;
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.blur();
+  }, 'Debounce blur query');
   await titleInput.focus();
   await page.waitForTimeout(450);
   expect(
@@ -873,7 +891,15 @@ test('ORCID retry, blur, timeout, and Escape settlements stay with the focused c
       () => window.__cellucidOrcidLifecycleProbe.queries.at(-1)
     )
   ).toBe('Deferred no-result query');
+  const abortsBeforeDeferredResult = await page.evaluate(
+    () => window.__cellucidOrcidLifecycleProbe.aborts
+  );
   await titleInput.focus();
+  await expect.poll(
+    () => page.evaluate(
+      () => window.__cellucidOrcidLifecycleProbe.aborts
+    )
+  ).toBe(abortsBeforeDeferredResult + 1);
   await page.evaluate(() => {
     window.__cellucidOrcidLifecycleProbe.settle(
       'Deferred no-result query',
@@ -892,7 +918,15 @@ test('ORCID retry, blur, timeout, and Escape settlements stay with the focused c
       () => window.__cellucidOrcidLifecycleProbe.queries.at(-1)
     )
   ).toBe('Deferred failure query');
+  const abortsBeforeDeferredFailure = await page.evaluate(
+    () => window.__cellucidOrcidLifecycleProbe.aborts
+  );
   await titleInput.focus();
+  await expect.poll(
+    () => page.evaluate(
+      () => window.__cellucidOrcidLifecycleProbe.aborts
+    )
+  ).toBe(abortsBeforeDeferredFailure + 1);
   await page.evaluate(() => {
     window.__cellucidOrcidLifecycleProbe.settle(
       'Deferred failure query',

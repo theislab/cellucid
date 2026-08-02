@@ -623,11 +623,17 @@ export function createIdentityProfileModal({
           orcidInput.addEventListener('keydown', handleComboboxKeydown);
           const scheduleHide = () => {
             if (profileModalClosed) return;
+            // Focus owns both the debounce and any request it published. Retire
+            // that work at the blur boundary itself; the short delay below is
+            // solely a visual affordance that lets a suggestion pointerdown
+            // cancel hiding before its click selects the row. Delaying request
+            // retirement with the popup allowed an unfocused query to start on
+            // a busy event loop.
+            cancelPendingSearchTimer();
+            abortActiveSearch();
             if (hideTimer) clearTimeout(hideTimer);
             hideTimer = setTimeout(() => {
               hideTimer = null;
-              cancelPendingSearchTimer();
-              abortActiveSearch();
               hideSuggestions();
             }, 150);
           };

@@ -1930,8 +1930,8 @@
     },
     {
       "path": "assets/js/app/ui/modules/community-annotation/identity-profile-modal.js",
-      "sha256": "429917cb6ff477ac767a193850991def4c28251cf5a56453adfe0e901ddf48ab",
-      "bytes": 32394,
+      "sha256": "fe760a59d08573e733ef73a63b35e46abcf3254a5e82a747575ab47f17f63ab9",
+      "bytes": 32821,
       "content_type": "application/javascript; charset=utf-8"
     },
     {

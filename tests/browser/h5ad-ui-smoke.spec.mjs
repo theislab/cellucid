@@ -230,10 +230,13 @@ test('replaces prepared, Zarr ZIP, and H5AD datasets through the visible control
   );
 
   await page.locator('#user-data-zarr-archive-input').setInputFiles(zarrFixturePath);
+  // Completion is a four-second production notification. Observe that exact
+  // operation boundary before performing independent UI and field work, which
+  // can legitimately outlive the notification on a loaded hosted runner.
+  await expectUserDataReadyNotification(page);
   await expectFileInputCleared(page, '#user-data-zarr-archive-input');
   await expectPlanarCurrentDataset(page, 'current-ui-smoke');
   await colorByCellType(page);
-  await expectUserDataReadyNotification(page);
   await captureReadableDataset(
     page,
     testInfo.outputPath(`zarr-zip-loaded-${testInfo.project.name}.png`),
@@ -241,10 +244,10 @@ test('replaces prepared, Zarr ZIP, and H5AD datasets through the visible control
   await dismissAllNotifications(page);
 
   await page.locator('#user-data-h5ad-input').setInputFiles(fixturePath);
+  await expectUserDataReadyNotification(page);
   await expectFileInputCleared(page, '#user-data-h5ad-input');
   await expectPlanarCurrentDataset(page, 'current-ui-smoke');
   await colorByCellType(page);
-  await expectUserDataReadyNotification(page);
   await captureReadableDataset(
     page,
     testInfo.outputPath(`h5ad-loaded-${testInfo.project.name}.png`),
