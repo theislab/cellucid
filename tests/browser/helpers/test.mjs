@@ -109,13 +109,18 @@ export async function closeContextWithApplicationRetirement(context) {
 }
 
 export const test = playwrightTest.extend({
-  applicationRetirement: [async ({ context }, use) => {
+  // Override the lazy page fixture instead of installing an auto context
+  // fixture. An auto fixture materializes an otherwise unused default context
+  // in browser-only tests, and its teardown can run after Playwright has
+  // already closed the base page. This boundary retires the application while
+  // both its document and context are still live.
+  page: async ({ context, page }, use) => {
     try {
-      await use();
+      await use(page);
     } finally {
       await retireContextApplications(context);
     }
-  }, { auto: true }],
+  },
 });
 
 export { expect };

@@ -139,6 +139,10 @@ async function playAndMeasure(page, reducedMotion) {
 test('camera path playback honours a reduced-motion preference', async ({
   browser
 }) => {
+  // This test deliberately owns custom contexts so it can compare two media
+  // preferences in one browser generation. Its fixture must not materialize
+  // an unused default context alongside them.
+  expect(browser.contexts()).toHaveLength(0);
   const measurements = {};
   const errors = {};
 

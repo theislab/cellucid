@@ -31,6 +31,31 @@ test('every browser spec owns production application retirement', async () => {
   }
 });
 
+test('every explicit browser page or context retires before closure', async () => {
+  const specFiles = (await readdir(browserDir))
+    .filter(name => name.endsWith('.spec.mjs'))
+    .sort();
+
+  for (const filename of specFiles) {
+    const source = await readFile(path.join(browserDir, filename), 'utf8');
+    if (/browser\.newContext\(/.test(source)) {
+      assert.match(
+        source,
+        /closeContextWithApplicationRetirement/,
+        `${filename} closes a custom context without application retirement`,
+      );
+      assert.doesNotMatch(source, /\bcontext\?*\.close\(/);
+    }
+    if (/context\.newPage\(/.test(source)) {
+      assert.match(
+        source,
+        /close(?:Page|Context)WithApplicationRetirement/,
+        `${filename} closes an explicit page without application retirement`,
+      );
+    }
+  }
+});
+
 test('the browser fixture retires even a failed test through the stable owner', async () => {
   const source = await readFile(
     path.join(browserDir, 'helpers', 'test.mjs'),
@@ -40,7 +65,8 @@ test('the browser fixture retires even a failed test through the stable owner', 
     source,
     /finally\s*\{[\s\S]*retireContextApplications\(context\)/,
   );
-  assert.match(source, /applicationRetirement:[\s\S]*auto:\s*true/);
+  assert.match(source, /page:\s*async\s*\(\{\s*context,\s*page\s*\},\s*use\)/);
+  assert.doesNotMatch(source, /applicationRetirement:[\s\S]*auto:\s*true/);
   assert.match(source, /window\._cellucidDispose/);
   assert.match(source, /secondTask\s*!==\s*firstTask/);
   assert.match(

@@ -2,7 +2,11 @@ import { once } from 'node:events';
 import { createPrivateKey } from 'node:crypto';
 import { createServer } from 'node:https';
 
-import { expect, test } from './helpers/test.mjs';
+import {
+  closeContextWithApplicationRetirement,
+  expect,
+  test,
+} from './helpers/test.mjs';
 
 import worker from '../../assets/js/app/community-annotations/_worker-code.js';
 import {
@@ -180,6 +184,7 @@ test('OAuth owner cookies preserve exact raw Set-Cookie bytes', async () => {
 test(
   'state-specific OAuth cookies coexist and retire independently',
   async ({ browser }) => {
+    expect(browser.contexts()).toHaveLength(0);
     const previousFetch = globalThis.fetch;
     globalThis.fetch = async (_url, options) => {
       const body = parseExactJson(options.body);
@@ -290,7 +295,9 @@ test(
       expect(workerServer.serverErrors).toEqual([]);
     } finally {
       const cleanup = await Promise.allSettled([
-        context?.close(),
+        context === null
+          ? undefined
+          : closeContextWithApplicationRetirement(context),
         workerServer?.close(),
       ]);
       globalThis.fetch = previousFetch;
