@@ -49,6 +49,17 @@ const DATASET_URL =
   + '&dataset=synthetic-development-3d&acceptance=analysis-plot-surface-parity';
 const VIEWPORT = { width: 1440, height: 1000 };
 const RETIREMENT_CYCLES = 20;
+// This file repeatedly creates and purges real Plotly/WebGL-backed surfaces in
+// one application generation. Hosted macOS Firefox can finish the contract but
+// leave its host GPU service degraded after the Firefox process exits; later,
+// fresh browsers then stop during application bootstrap. It must therefore be
+// both process-isolated and the final browser file on a vulnerable CI host.
+const HOST_GPU_TERMINAL = Object.freeze({
+  tag: Object.freeze([
+    '@browser-process-intensive',
+    '@browser-host-gpu-terminal',
+  ]),
+});
 
 /** Plot type id -> the Plotly trace type its committed render must publish. */
 const CATEGORICAL_PLOTS = Object.freeze([
@@ -220,18 +231,31 @@ async function checkPlotSurfaces(page, kind, field, plots) {
 }
 
 test.describe('analysis plot surfaces', () => {
-  test('categorical plot types fill the sidebar preview and the expanded overlay', async ({ page }) => {
-    await checkPlotSurfaces(page, 'categorical', 'timepoint', CATEGORICAL_PLOTS);
-  });
+  test(
+    'categorical plot types fill the sidebar preview and the expanded overlay',
+    HOST_GPU_TERMINAL,
+    async ({ page }) => {
+      await checkPlotSurfaces(
+        page,
+        'categorical',
+        'timepoint',
+        CATEGORICAL_PLOTS,
+      );
+    },
+  );
 
-  test('continuous plot types fill the sidebar preview and the expanded overlay', async ({ page }) => {
-    await checkPlotSurfaces(
-      page,
-      'continuous',
-      'differentiation_score',
-      CONTINUOUS_PLOTS,
-    );
-  });
+  test(
+    'continuous plot types fill the sidebar preview and the expanded overlay',
+    HOST_GPU_TERMINAL,
+    async ({ page }) => {
+      await checkPlotSurfaces(
+        page,
+        'continuous',
+        'differentiation_score',
+        CONTINUOUS_PLOTS,
+      );
+    },
+  );
 
 });
 
@@ -271,26 +295,32 @@ test.describe.serial('analysis overlay retirement soak', () => {
   // the normal test timeout while all twenty still share one application and
   // therefore retain the original cumulative leak-detection contract.
   for (let cycle = 1; cycle <= RETIREMENT_CYCLES; cycle += 1) {
-    test(`cycle ${cycle} retires its exact overlay plot`, async () => {
-      if (page === null || productErrors === null) {
-        throw new Error('Analysis overlay retirement owner was not initialized.');
-      }
-      const expandButton = page.locator(
-        `${DETAILED_PANEL} .analysis-expand-btn`,
-      );
-      await expandButton.click();
-      await expect(page.locator('.analysis-modal.open')).toBeVisible();
-      await expectSettledPlot(page, 'overlay', 'box');
-      await page.keyboard.press('Escape');
-      await expect(page.locator('.analysis-modal')).toHaveCount(0);
+    test(
+      `cycle ${cycle} retires its exact overlay plot`,
+      HOST_GPU_TERMINAL,
+      async () => {
+        if (page === null || productErrors === null) {
+          throw new Error(
+            'Analysis overlay retirement owner was not initialized.',
+          );
+        }
+        const expandButton = page.locator(
+          `${DETAILED_PANEL} .analysis-expand-btn`,
+        );
+        await expandButton.click();
+        await expect(page.locator('.analysis-modal.open')).toBeVisible();
+        await expectSettledPlot(page, 'overlay', 'box');
+        await page.keyboard.press('Escape');
+        await expect(page.locator('.analysis-modal')).toHaveCount(0);
 
-      const settled = await readSurfaces(page);
-      expect(
-        settled.plotlyGraphs,
-        `cycle ${cycle} must leave exactly the sidebar plot`,
-      ).toBe(1);
-      expect(settled.openOverlays).toBe(0);
-      expect(productErrors).toEqual([]);
-    });
+        const settled = await readSurfaces(page);
+        expect(
+          settled.plotlyGraphs,
+          `cycle ${cycle} must leave exactly the sidebar plot`,
+        ).toBe(1);
+        expect(settled.openOverlays).toBe(0);
+        expect(productErrors).toEqual([]);
+      },
+    );
   }
 });

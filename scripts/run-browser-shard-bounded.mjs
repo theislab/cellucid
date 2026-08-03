@@ -31,12 +31,14 @@ const MAX_CAPTURE_BYTES = 64 * 1024 * 1024;
 // next unrelated page. A browser-process boundary alone is not a host-GPU
 // boundary: hosted macOS Firefox can retain degraded GPU-service state after
 // the stressing Firefox process exits. Vulnerable runtimes therefore run all
-// ordinary conformance batches first and quarantine declared stress files in
-// singleton processes at the tail, where retained driver state cannot poison
-// an unrelated test. Even
-// with those declared isolation boundaries, no shard may launch more than nine
-// browsers. A growing inventory must add another CI shard (or split an oversized
-// spec) instead of silently weakening a resource fence.
+// ordinary conformance batches first, then process-isolated stress files, and
+// finally at most one declared host-terminal stress file. That last class is
+// allowed to degrade the shared native service only after every other contract
+// has completed. Multiple host-terminal files in one shard are rejected because
+// no ordering on one host can isolate the second from the first. Even with those
+// declared isolation boundaries, no shard may launch more than nine browsers.
+// A growing inventory must add another CI shard (or split an oversized spec)
+// instead of silently weakening a resource fence.
 export const MAX_FILES_PER_BROWSER_PROCESS = 6;
 export const MAX_TESTS_PER_BROWSER_PROCESS = 40;
 export const MAX_ORDINARY_BROWSER_PROCESSES_PER_SHARD = 8;
@@ -44,6 +46,9 @@ export const MAX_BROWSER_PROCESSES_PER_SHARD = 9;
 // Playwright requires `@browser-process-intensive` at declaration time and its
 // JSON reporter publishes the normalized tag without the leading `@`.
 export const PROCESS_INTENSIVE_REPORT_TAG = 'browser-process-intensive';
+// A host-terminal file is also process-intensive, but it has a stronger
+// ordering contract: no browser test may run after it on a vulnerable host.
+export const HOST_GPU_TERMINAL_REPORT_TAG = 'browser-host-gpu-terminal';
 
 function readOption(argument, name) {
   const prefix = `--${name}=`;
@@ -209,6 +214,7 @@ function repositoryRelativeTestFile(testDirectory, file) {
  * @param {string} project
  * @returns {ReadonlyArray<Readonly<{
  *   file: string,
+ *   hostTerminal: boolean,
  *   intensive: boolean,
  *   tests: number,
  * }>>}
@@ -267,6 +273,7 @@ export function extractBoundedShardInventory(report, project) {
       spec.file
     );
     const previous = inventoryByFile.get(file) ?? {
+      hostTerminal: false,
       intensive: false,
       tests: 0,
     };
@@ -274,9 +281,14 @@ export function extractBoundedShardInventory(report, project) {
     if (!Number.isSafeInteger(nextCount)) {
       throw new RangeError(`Playwright test count overflowed for ${file}.`);
     }
+    const specIsHostTerminal = spec.tags.includes(
+      HOST_GPU_TERMINAL_REPORT_TAG
+    );
     inventoryByFile.set(file, {
+      hostTerminal: previous.hostTerminal || specIsHostTerminal,
       intensive:
         previous.intensive ||
+        specIsHostTerminal ||
         spec.tags.includes(PROCESS_INTENSIVE_REPORT_TAG),
       tests: nextCount,
     });
@@ -284,8 +296,8 @@ export function extractBoundedShardInventory(report, project) {
   return Object.freeze(
     Array.from(
       inventoryByFile,
-      ([file, { intensive, tests }]) =>
-        Object.freeze({ file, intensive, tests })
+      ([file, { hostTerminal, intensive, tests }]) =>
+        Object.freeze({ file, hostTerminal, intensive, tests })
     )
   );
 }
@@ -333,11 +345,17 @@ export function shouldIsolateProcessIntensiveFiles(
  * Partition one exact Playwright shard without allowing file count, test
  * weight, or process churn to become unbounded. Vulnerable native-GPU runs
  * preserve relative order inside the ordinary and intensive inventories but
- * quarantine every intensive singleton after all ordinary batches. A stress
+ * quarantine every intensive singleton after all ordinary batches. A declared
+ * host-terminal singleton runs after those process-isolated files. A stress
  * process may outlive Firefox in a shared host GPU service, so process isolation
- * without tail quarantine is not an isolation boundary for later tests.
+ * without explicit ordering is not an isolation boundary for later tests.
  *
- * @param {Array<{file: string, intensive: boolean, tests: number}>} inventory
+ * @param {Array<{
+ *   file: string,
+ *   hostTerminal: boolean,
+ *   intensive: boolean,
+ *   tests: number,
+ * }>} inventory
  * @param {boolean} [isolateProcessIntensiveFiles]
  * @returns {ReadonlyArray<Readonly<{
  *   files: ReadonlyArray<string>,
@@ -367,8 +385,9 @@ export function partitionBrowserShardInventory(
       typeof item !== 'object' ||
       Array.isArray(item) ||
       Object.getPrototypeOf(item) !== Object.prototype ||
-      itemKeys.length !== 3 ||
+      itemKeys.length !== 4 ||
       !itemKeys.includes('file') ||
+      !itemKeys.includes('hostTerminal') ||
       !itemKeys.includes('intensive') ||
       !itemKeys.includes('tests') ||
       itemKeys.some(key => {
@@ -379,12 +398,14 @@ export function partitionBrowserShardInventory(
       }) ||
       typeof item.file !== 'string' ||
       item.file === '' ||
+      typeof item.hostTerminal !== 'boolean' ||
       typeof item.intensive !== 'boolean' ||
+      (item.hostTerminal && !item.intensive) ||
       !Number.isSafeInteger(item.tests) ||
       item.tests < 1
     ) {
       throw new TypeError(
-        'Every bounded browser shard item must contain one file, one intensive flag, and a positive safe test count.'
+        'Every bounded browser shard item must contain one file, host-terminal and intensive flags, and a positive safe test count.'
       );
     }
     if (item.tests > MAX_TESTS_PER_BROWSER_PROCESS) {
@@ -429,8 +450,17 @@ export function partitionBrowserShardInventory(
     ? inventory.filter(item => !item.intensive)
     : inventory;
   const intensiveInventory = isolateProcessIntensiveFiles
-    ? inventory.filter(item => item.intensive)
+    ? inventory.filter(item => item.intensive && !item.hostTerminal)
     : [];
+  const hostTerminalInventory = isolateProcessIntensiveFiles
+    ? inventory.filter(item => item.hostTerminal)
+    : [];
+  if (hostTerminalInventory.length > 1) {
+    throw new RangeError(
+      `Browser shard contains ${hostTerminalInventory.length} host-terminal ` +
+        'GPU files; place each in a separate CI shard.',
+    );
+  }
   for (const item of ordinaryInventory) {
     if (
       batchFiles.length === MAX_FILES_PER_BROWSER_PROCESS ||
@@ -446,6 +476,11 @@ export function partitionBrowserShardInventory(
   }
   publishBatch();
   for (const item of intensiveInventory) {
+    batchFiles.push(item.file);
+    batchTestCount = item.tests;
+    publishBatch();
+  }
+  for (const item of hostTerminalInventory) {
     batchFiles.push(item.file);
     batchTestCount = item.tests;
     publishBatch();
@@ -554,7 +589,7 @@ export function runBoundedBrowserShard(
       `${testCount} tests in ` +
       `${batches.length} bounded browser processes` +
       `${isolateProcessIntensiveFiles
-        ? ' with tail-quarantined native-GPU isolation'
+        ? ' with process- and host-terminal native-GPU isolation'
         : ''}.`,
   );
   batches.forEach((batch, index) => {

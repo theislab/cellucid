@@ -4,6 +4,7 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import {
+  HOST_GPU_TERMINAL_REPORT_TAG,
   MAX_BROWSER_PROCESSES_PER_SHARD,
   MAX_FILES_PER_BROWSER_PROCESS,
   MAX_ORDINARY_BROWSER_PROCESSES_PER_SHARD,
@@ -16,8 +17,14 @@ import {
   shouldIsolateProcessIntensiveFiles,
 } from '../scripts/run-browser-shard-bounded.mjs';
 
-const inventoryItem = (file, tests, intensive = false) => ({
+const inventoryItem = (
   file,
+  tests,
+  intensive = false,
+  hostTerminal = false,
+) => ({
+  file,
+  hostTerminal,
   intensive,
   tests,
 });
@@ -91,7 +98,7 @@ test('bounded shard discovery preserves a unique repository-local file inventory
         specs: [spec(
           'alpha.spec.mjs',
           'firefox',
-          [PROCESS_INTENSIVE_REPORT_TAG],
+          [HOST_GPU_TERMINAL_REPORT_TAG],
         )],
         suites: [{ specs: [spec(absoluteAlpha)], suites: [] }],
       },
@@ -103,11 +110,13 @@ test('bounded shard discovery preserves a unique repository-local file inventory
   assert.deepEqual(inventory, [
     {
       file: 'tests/browser/alpha.spec.mjs',
+      hostTerminal: true,
       intensive: true,
       tests: 2,
     },
     {
       file: 'tests/browser/nested/beta.spec.mjs',
+      hostTerminal: false,
       intensive: false,
       tests: 1,
     },
@@ -217,6 +226,31 @@ test('native-GPU stress files declare every test process-intensive', async () =>
   }
 });
 
+test('host-GPU terminal stress is process-intensive and declared on every test', async () => {
+  const filename = 'analysis-plot-surface-parity.spec.mjs';
+  const source = await readFile(
+    new URL(`./browser/${filename}`, import.meta.url),
+    'utf8',
+  );
+  const declarations = source.match(/^\s*test\(/gm) ?? [];
+  const terminalDeclarations = source.match(
+    /,\s*HOST_GPU_TERMINAL,\s*async\s*\(/g,
+  ) ?? [];
+
+  assert.equal(declarations.length, 3, filename);
+  assert.equal(terminalDeclarations.length, declarations.length, filename);
+  assert.match(
+    source,
+    new RegExp(`['"]@${PROCESS_INTENSIVE_REPORT_TAG}['"]`),
+    filename,
+  );
+  assert.match(
+    source,
+    new RegExp(`['"]@${HOST_GPU_TERMINAL_REPORT_TAG}['"]`),
+    filename,
+  );
+});
+
 test('browser batches bound file count, test weight, and process churn', () => {
   assert.equal(MAX_FILES_PER_BROWSER_PROCESS, 6);
   assert.equal(MAX_TESTS_PER_BROWSER_PROCESS, 40);
@@ -284,12 +318,11 @@ test('browser batches bound file count, test weight, and process churn', () => {
     [...inventory.slice(1), inventory[0]].map(item => item.file),
   );
 
-  // macOS Firefox completed the live entry-point measurement and the five
-  // benchmark stress tests but retained a degraded host GPU service after the
-  // Firefox process exited, killing the following runtime-publication page.
-  // Both harness owners therefore run after every ordinary file. The entry
-  // point and full harness remain separate singleton generations because each
-  // independently instruments and drives the native WebGL context.
+  // macOS Firefox completed the twenty-cycle Plotly retirement soak but left
+  // the host GPU service degraded across every later Firefox process. The two
+  // benchmark harness owners therefore run after ordinary conformance and the
+  // analysis soak runs in the one host-terminal slot after both harnesses.
+  // Each remains a separate singleton generation.
   const shardOneCounts = [
     8, 1, 7, 22, 1, 3,
     1, 2, 1, 5, 2, 12,
@@ -301,7 +334,8 @@ test('browser batches bound file count, test weight, and process churn', () => {
     (tests, index) => inventoryItem(
       `tests/browser/shard-one-${index}.spec.mjs`,
       tests,
-      index === 8 || index === 9,
+      index === 3 || index === 8 || index === 9,
+      index === 3,
     ),
   );
   const isolatedBenchmarkBatches = partitionBrowserShardInventory(
@@ -310,17 +344,18 @@ test('browser batches bound file count, test weight, and process churn', () => {
   );
   assert.deepEqual(
     isolatedBenchmarkBatches.map(batch => batch.files.length),
-    [5, 6, 6, 2, 4, 2, 1, 1],
+    [6, 6, 4, 2, 4, 2, 1, 1, 1],
   );
   assert.deepEqual(
     isolatedBenchmarkBatches.map(batch => batch.testCount),
-    [39, 23, 14, 39, 37, 8, 1, 5],
+    [21, 25, 8, 39, 37, 8, 1, 5, 22],
   );
   assert.deepEqual(
-    isolatedBenchmarkBatches.slice(-2).map(batch => batch.files),
+    isolatedBenchmarkBatches.slice(-3).map(batch => batch.files),
     [
       [isolatedBenchmarkInventory[8].file],
       [isolatedBenchmarkInventory[9].file],
+      [isolatedBenchmarkInventory[3].file],
     ],
   );
   assert.deepEqual(
@@ -329,6 +364,7 @@ test('browser batches bound file count, test weight, and process churn', () => {
       ...isolatedBenchmarkInventory.filter(item => !item.intensive),
       isolatedBenchmarkInventory[8],
       isolatedBenchmarkInventory[9],
+      isolatedBenchmarkInventory[3],
     ].map(item => item.file),
   );
 
@@ -340,6 +376,7 @@ test('browser batches bound file count, test weight, and process churn', () => {
     inventoryItem('ordinary-b', 4),
     inventoryItem('stress-b', 5, true),
     inventoryItem('ordinary-c', 6),
+    inventoryItem('host-terminal', 7, true, true),
   ], true);
   assert.deepEqual(
     multipleStressBatches.map(batch => ({
@@ -353,7 +390,16 @@ test('browser batches bound file count, test weight, and process churn', () => {
       },
       { files: ['stress-a'], tests: 3 },
       { files: ['stress-b'], tests: 5 },
+      { files: ['host-terminal'], tests: 7 },
     ],
+  );
+
+  assert.throws(
+    () => partitionBrowserShardInventory([
+      inventoryItem('terminal-a', 1, true, true),
+      inventoryItem('terminal-b', 1, true, true),
+    ], true),
+    /place each in a separate CI shard/,
   );
 
   // The hosted Firefox failure came from six legal files that together owned
@@ -382,6 +428,7 @@ test('browser batches bound file count, test weight, and process churn', () => {
   assert.equal(partitionBrowserShardInventory(
     Array.from({ length: fileCapacity }, (_unused, index) => ({
       file: String(index),
+      hostTerminal: false,
       intensive: false,
       tests: 1,
     })),
@@ -390,6 +437,7 @@ test('browser batches bound file count, test weight, and process churn', () => {
     () => partitionBrowserShardInventory(
       Array.from({ length: fileCapacity + 1 }, (_unused, index) => ({
         file: String(index),
+        hostTerminal: false,
         intensive: false,
         tests: 1,
       })),
@@ -411,6 +459,7 @@ test('browser batches bound file count, test weight, and process churn', () => {
         length: MAX_ORDINARY_BROWSER_PROCESSES_PER_SHARD + 1,
       }, (_unused, index) => ({
         file: `weighted-${index}.spec.mjs`,
+        hostTerminal: false,
         intensive: false,
         tests: MAX_TESTS_PER_BROWSER_PROCESS,
       })),
@@ -433,6 +482,15 @@ test('browser batches bound file count, test weight, and process churn', () => {
       inventoryItem('valid.spec.mjs', 1),
     ], 'yes'),
     /isolation must be a boolean/,
+  );
+  assert.throws(
+    () => partitionBrowserShardInventory([{
+      file: 'invalid-terminal.spec.mjs',
+      hostTerminal: true,
+      intensive: false,
+      tests: 1,
+    }], true),
+    /host-terminal and intensive flags/,
   );
 });
 
