@@ -206,9 +206,21 @@ test.describe.serial('GLB benchmark runtime publication', () => {
     expect(workerRequests).toBe(1);
     expect(harnessModuleRequests).toBe(1);
     await expect(page.locator('#bench-points')).toHaveText('1K');
-    await expect.poll(async () => Number.parseFloat(
-      await page.locator('#bench-fps').textContent()
-    )).toBeGreaterThan(0);
+    // The readout appears only once the benchmark has measured more than one
+    // frame (`stats.samples > 1`), so a number here proves frames were measured
+    // and published — which is what a publication contract owes.
+    //
+    // It used to require that number to be greater than zero, which is an
+    // assertion about how fast the host renders, not about publication: the
+    // reading is frames per second, so any host slower than one frame per second
+    // publishes a truthful `0` and fails. A hosted macOS Firefox runner, where
+    // the VM has no GPU and the fragment stage runs on the CPU at 1440x1000, is
+    // slower than that often enough to fail two runs in three.
+    await expect.poll(async () => {
+      const text = await page.locator('#bench-fps').textContent();
+      const value = Number.parseFloat(text);
+      return Number.isFinite(value) && value >= 0;
+    }).toBe(true);
     await expect(page.locator('#bench-lod')).toHaveText('-');
 
     const publication = await page.evaluate(() => {
