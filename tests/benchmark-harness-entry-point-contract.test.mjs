@@ -47,6 +47,11 @@ test('opening the benchmark panel publishes the harness module', () => {
     ensure.includes(`import('${HARNESS_SPECIFIER}')`),
     'ensureBenchmarkModule must import the harness module'
   );
+  assert.match(
+    ensure,
+    /Promise\.all\(\[[\s\S]*?import\('\.\.\/dev\/benchmark\.js'\)[\s\S]*?import\('\.\/ui\/modules\/benchmark\/index\.js'\)/,
+    'the user activation must request both independent module graphs together'
+  );
   assert.ok(
     ensure.includes(`${HARNESS_GLOBAL} =`),
     `ensureBenchmarkModule must publish ${HARNESS_GLOBAL}`
@@ -73,6 +78,27 @@ test('opening the benchmark panel publishes the harness module', () => {
     mainSource,
     /benchmarkSection\.addEventListener\(\s*'toggle',\s*ownBenchmarkPanelSynchronization\s*\)/,
     'the panel toggle must route through the synchronization owner'
+  );
+
+  // A summary click is the synchronous user activation. Firefox can defer the
+  // later `toggle` task behind stressed native rendering, so the click path
+  // must start the module request and reconcile the final open state itself.
+  const summaryActivation = functionBody(
+    mainSource,
+    'const ownBenchmarkSummaryActivation = ()'
+  );
+  assert.ok(summaryActivation.includes('ensureBenchmarkModule()'));
+  assert.ok(summaryActivation.includes('publishBenchmarkPanelState()'));
+  assert.match(
+    mainSource,
+    /benchmarkSummary\.addEventListener\(\s*'click',\s*ownBenchmarkSummaryActivation\s*\)/,
+    'the direct summary activation must own a lazy-load signal'
+  );
+
+  assert.match(
+    ensure,
+    /if \(!loaded && benchmarkModuleLoadTask === loadTask\) \{\s*benchmarkModuleLoadTask = null;/,
+    'a failed lazy load must be retryable from the next activation'
   );
 });
 

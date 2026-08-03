@@ -3551,9 +3551,17 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
       if (benchmarkModuleLoaded) return Promise.resolve(true);
       if (benchmarkModuleLoadTask !== null) return benchmarkModuleLoadTask;
 
-      benchmarkModuleLoadTask = (async () => {
+      const loadTask = (async () => {
         try {
-          const benchmarkModule = await import('../dev/benchmark.js');
+          // Start both independent module graphs from the user activation.
+          // Waiting for the reporter graph before requesting the harness made
+          // the harness depend on a later event-loop turn. Native Firefox can
+          // keep rendering smoke while indefinitely delaying that turn after a
+          // stressed GPU generation, even though the page itself remains live.
+          const [benchmarkModule, harnessModule] = await Promise.all([
+            import('../dev/benchmark.js'),
+            import('./ui/modules/benchmark/index.js'),
+          ]);
           BenchmarkReporter = benchmarkModule.BenchmarkReporter;
           const PerformanceTrackerClass = benchmarkModule.PerformanceTracker;
           perfTracker = new PerformanceTrackerClass();
@@ -3568,8 +3576,6 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
           // the module runs on import; the harness instruments the GL context
           // only when it is explicitly created, so opening this panel does not
           // put counters on the product's render path.
-          const harnessModule =
-            await import('./ui/modules/benchmark/index.js');
           generateSyntheticDataOffThread =
             harnessModule.generateSyntheticDataOffThread;
           assertSyntheticCount = harnessModule.assertSyntheticCount;
@@ -3582,7 +3588,16 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
           return false;
         }
       })();
-      return benchmarkModuleLoadTask;
+      benchmarkModuleLoadTask = loadTask;
+      // A transient fetch, parse, or construction failure cannot permanently
+      // turn every later panel activation into the same cached `false` result.
+      // Successful loads retain the settled task and the published namespace.
+      void loadTask.then(loaded => {
+        if (!loaded && benchmarkModuleLoadTask === loadTask) {
+          benchmarkModuleLoadTask = null;
+        }
+      });
+      return loadTask;
     }
 
     let benchmarkActive = false;
@@ -3785,6 +3800,14 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
     syntheticDatasetInfo = null;
 
     if (benchmarkSection) {
+      const benchmarkSummary = benchmarkSection.querySelector(
+        ':scope > summary'
+      );
+      if (!(benchmarkSummary instanceof HTMLElement)) {
+        throw new TypeError(
+          'Performance benchmark disclosure requires its direct summary.'
+        );
+      }
       const reportBenchmarkPanelFailure = error => {
         const exactError = error instanceof Error
           ? error
@@ -3811,21 +3834,47 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
           );
         }
       };
+      const publishBenchmarkPanelState = () => {
+        if (applicationRetired) return;
+        if (benchmarkSection.open) {
+          // The summary activation and the native toggle notification can both
+          // settle the same opening. Only the first owns tracker reset/start.
+          if (!benchmarkActive) {
+            activateBenchmarkingPanel({ resetTracker: true });
+          }
+        } else if (benchmarkActive) {
+          stopPerfMonitoring();
+        }
+      };
       const synchronizeBenchmarkPanelWithSection = async () => {
         if (benchmarkSection.open) {
           // Lazy-load benchmark module when section is first opened
-          await ensureBenchmarkModule();
-          if (applicationRetired) return;
-          activateBenchmarkingPanel({ resetTracker: true });
-        } else {
-          stopPerfMonitoring();
+          const moduleLoaded = await ensureBenchmarkModule();
+          if (!moduleLoaded || applicationRetired) return;
         }
+        publishBenchmarkPanelState();
       };
       const ownBenchmarkPanelSynchronization = () => {
         synchronizeBenchmarkPanelWithSection().catch(
           reportBenchmarkPanelFailure
         );
       };
+      const ownBenchmarkSummaryActivation = () => {
+        // `toggle` is a queued notification. A stressed native Firefox GPU
+        // service can continue to render and service automation while delaying
+        // that notification indefinitely. The summary's click is the actual
+        // user activation, so initiate both lazy module requests in this task.
+        // Once they settle, the browser's default action has already published
+        // the exact `open` state and this owner can reconcile it directly.
+        ensureBenchmarkModule().then(moduleLoaded => {
+          if (!moduleLoaded || applicationRetired) return;
+          publishBenchmarkPanelState();
+        }).catch(reportBenchmarkPanelFailure);
+      };
+      benchmarkSummary.addEventListener(
+        'click',
+        ownBenchmarkSummaryActivation
+      );
       benchmarkSection.addEventListener(
         'toggle',
         ownBenchmarkPanelSynchronization
