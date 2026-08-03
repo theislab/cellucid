@@ -94,8 +94,60 @@ async function recordUserFacingFailure(page, testInfo, label) {
   return observed;
 }
 
+/**
+ * What the app believes it is showing, for a failure that says only "".
+ *
+ * `#dataset-name` is written in exactly three ways — the EN DASH placeholder,
+ * the EM DASH of `updateDatasetInfo(null)`, and `metadata.name` — so an empty
+ * reading means a publication carried an empty name, which is a different defect
+ * from a load that never finished. A CI-only intermittent that reports neither
+ * cannot be told apart from the other, so the failure carries the distinction.
+ */
+async function describeRenderState(page) {
+  try {
+    return await page.evaluate(() => {
+      const text = id => document.getElementById(id)?.textContent ?? null;
+      const source = window._cellucidDataSourceManager ?? null;
+      return {
+        datasetName: text('dataset-name'),
+        datasetCells: text('dataset-cells'),
+        datasetSource: text('dataset-source'),
+        filterCount: text('filter-count'),
+        selectValue: document.getElementById('dataset-select')?.value ?? null,
+        viewerPointCount: (() => {
+          try {
+            return window._cellucidViewer?.getPointCount?.() ?? null;
+          } catch (error) {
+            return `unavailable: ${error?.name ?? error}`;
+          }
+        })(),
+        currentDescriptor: (() => {
+          try {
+            return source?.getStateSnapshot?.() ?? null;
+          } catch (error) {
+            return `unavailable: ${error?.name ?? error}`;
+          }
+        })(),
+        errorNotifications: [...document.querySelectorAll('.notification-error')]
+          .map(node => node.textContent),
+      };
+    });
+  } catch (error) {
+    return { describeFailed: String(error?.message ?? error) };
+  }
+}
+
 async function expectRenders(page, dataset) {
-  await expect(page.locator('#dataset-name')).toHaveText(dataset.name);
+  try {
+    await expect(page.locator('#dataset-name')).toHaveText(dataset.name);
+  } catch (error) {
+    const state = await describeRenderState(page);
+    error.message +=
+      `\n\nApp state when the name did not arrive:\n${
+        JSON.stringify(state, null, 2)
+      }`;
+    throw error;
+  }
   await expect(page.locator('#dataset-cells')).toHaveText(
     String(dataset.cells),
   );
