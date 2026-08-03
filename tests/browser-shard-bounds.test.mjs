@@ -601,12 +601,20 @@ test('browser batches bound file count, test weight, and process churn', () => {
   );
 });
 
+// The ladder arithmetic is a property of the planner; which ports a machine
+// happens to have free is not. Every assertion about the arithmetic injects a
+// probe, so this test says the same thing on a CI runner, a developer laptop
+// with a leftover server, and a container with something on 4173.
+const allPortsFree = ports => new Set(ports);
+const portsFreeExcept = busy => ports =>
+  new Set(ports.filter(port => !busy.has(port)));
+
 test('bounded processes receive non-overlapping server and evidence ports', () => {
   assert.deepEqual(
     planBrowserBatchPorts({
       CELLUCID_BROWSER_TEST_PORT: '5000',
       CELLUCID_BROWSER_TEST_SAMPLE_PORT: '5001',
-    }, 3),
+    }, 3, allPortsFree),
     [
       { port: 5000, samplePort: 5001 },
       { port: 5002, samplePort: 5003 },
@@ -617,7 +625,7 @@ test('bounded processes receive non-overlapping server and evidence ports', () =
     planBrowserBatchPorts({
       CELLUCID_BROWSER_TEST_PORT: '5057',
       CELLUCID_BROWSER_TEST_SAMPLE_PORT: '5058',
-    }, 3),
+    }, 3, allPortsFree),
     [
       { port: 5057, samplePort: 5058 },
       { port: 5063, samplePort: 5064 },
@@ -626,7 +634,11 @@ test('bounded processes receive non-overlapping server and evidence ports', () =
     'allocation must cross the Fetch-blocked SIP ports without assigning them',
   );
   assert.deepEqual(
-    planBrowserBatchPorts({}, MAX_BROWSER_PROCESSES_PER_SHARD).slice(-2),
+    planBrowserBatchPorts(
+      {},
+      MAX_BROWSER_PROCESSES_PER_SHARD,
+      allPortsFree,
+    ).slice(-2),
     [
       { port: 4187, samplePort: 4188 },
       { port: 4191, samplePort: 4192 },
@@ -641,7 +653,58 @@ test('bounded processes receive non-overlapping server and evidence ports', () =
     () => planBrowserBatchPorts({
       CELLUCID_BROWSER_TEST_PORT: '65534',
       CELLUCID_BROWSER_TEST_SAMPLE_PORT: '65535',
-    }, 2),
-    /cannot allocate one valid port pair per batch/,
+    }, 2, allPortsFree),
+    /cannot allocate one free port pair per batch/,
   );
+});
+
+test('an occupied rung is stepped over rather than failing every batch', () => {
+  // The defect: the ladder was assumed, not discovered. With
+  // `reuseExistingServer: false`, one service on 4173 — a container, a
+  // self-hosted runner, a leftover server from an interrupted run — failed all
+  // nine batches identically, and the only recovery was a human setting an
+  // environment variable.
+  assert.deepEqual(
+    planBrowserBatchPorts({}, 2, portsFreeExcept(new Set([4173]))),
+    [
+      { port: 4175, samplePort: 4176 },
+      { port: 4177, samplePort: 4178 },
+    ],
+    'an occupied application port must skip the whole pair',
+  );
+  assert.deepEqual(
+    planBrowserBatchPorts({}, 2, portsFreeExcept(new Set([4176]))),
+    [
+      { port: 4173, samplePort: 4174 },
+      { port: 4177, samplePort: 4178 },
+    ],
+    'an occupied CORS sample port must skip the whole pair too',
+  );
+  assert.throws(
+    () => planBrowserBatchPorts({}, 2, () => new Set()),
+    /wanted 2, found 0/,
+    'exhaustion must name what it wanted, what it found, and the way out',
+  );
+  assert.throws(
+    () => planBrowserBatchPorts({}, 2, () => new Set()),
+    /CELLUCID_BROWSER_TEST_PORT/,
+  );
+});
+
+test('the real probe answers, and answers about ports that are actually free', async () => {
+  const { createServer } = await import('node:net');
+  const holder = createServer();
+  await new Promise(resolve => holder.listen(0, '127.0.0.1', resolve));
+  const taken = holder.address().port;
+  try {
+    const plan = planBrowserBatchPorts(
+      { CELLUCID_BROWSER_TEST_PORT: String(taken) },
+      1,
+    );
+    assert.equal(plan.length, 1);
+    assert.notEqual(plan[0].port, taken, 'a bound port must not be planned');
+    assert.notEqual(plan[0].samplePort, taken);
+  } finally {
+    await new Promise(resolve => holder.close(resolve));
+  }
 });

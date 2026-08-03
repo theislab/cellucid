@@ -3,6 +3,10 @@ import { readdir, readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import { initVisualizationReset } from '../assets/js/app/ui/modules/visualization-reset.js';
+import {
+  POINT_SIZE_SLIDER_MINIMUM,
+  pointSizeSliderPositionForCellCount,
+} from '../assets/js/rendering/point-size-scale.js';
 
 const resetSource = await readFile(
   new URL('../assets/js/app/ui/modules/visualization-reset.js', import.meta.url),
@@ -527,4 +531,49 @@ test('reset and viewer sources contain no legacy invert alias or optional reset 
   assert.doesNotMatch(resetSource, /\bBoolean\s*\(/);
   assert.doesNotMatch(resetSource, /\bparseFloat\s*\(/);
   assert.doesNotMatch(resetSource, /\|\|\s*['"`]/);
+});
+
+test('a large dataset opens at a negative slider position and is still captured', () => {
+  // The point-size slider is the one range control whose domain is not 0-100.
+  // Its position is the exponent of a logarithmic size curve and runs below zero
+  // so the curve reaches the sizes millions of cells need: 18,142,044 cells open
+  // at position -12. Capturing that against a 0-100 bound threw, and the
+  // publication path reports a throw here as "the dataset is loaded, but its
+  // controls could not be synchronized" — so every dataset above roughly four
+  // hundred thousand cells lost its Reset baseline and said so on screen.
+  const previousDocument = globalThis.document;
+  globalThis.document = { addEventListener() {} };
+  const harness = createHarness();
+  const openingPosition =
+    pointSizeSliderPositionForCellCount(18_142_044);
+  assert.ok(
+    openingPosition < 0,
+    'this test is meaningless unless the position really is negative',
+  );
+  assert.ok(openingPosition >= POINT_SIZE_SLIDER_MINIMUM);
+
+  try {
+    harness.renderDom.pointSizeInput.value = String(openingPosition);
+    const reset = initVisualizationReset(resetOptions(harness));
+    reset.captureInitialState();
+
+    harness.renderDom.pointSizeInput.value = '42.5';
+    reset.resetVisualizationToDefaults();
+    assert.equal(
+      harness.renderDom.pointSizeInput.value,
+      String(openingPosition),
+      'Reset must return to the size the dataset opened at',
+    );
+
+    // Every reachable position round-trips, including both ends of the domain.
+    for (const position of [POINT_SIZE_SLIDER_MINIMUM, -12, 0, 16.5, 100]) {
+      harness.renderDom.pointSizeInput.value = String(position);
+      reset.captureInitialState();
+      harness.renderDom.pointSizeInput.value = '7';
+      reset.resetVisualizationToDefaults();
+      assert.equal(harness.renderDom.pointSizeInput.value, String(position));
+    }
+  } finally {
+    globalThis.document = previousDocument;
+  }
 });

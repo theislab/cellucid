@@ -1264,8 +1264,8 @@
     },
     {
       "path": "assets/js/app/main.js",
-      "sha256": "6dc01901b9acdd59b527bee055c22ef4cc0072a7264973e77fa947622cc46378",
-      "bytes": 173451,
+      "sha256": "21bd89f6c138bc0e5463030548dbcb2db7b45b703780f9b0c630acc7b0cbe343",
+      "bytes": 174089,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
@@ -1432,8 +1432,8 @@
     },
     {
       "path": "assets/js/app/session/dataset-state-manifest.js",
-      "sha256": "cb6c67f06818cbbe9ad34c4b295d1aee9e476348ec90b375a4182e6848c508d7",
-      "bytes": 12498,
+      "sha256": "f4efb164647057cd33d4b2b6c5a87cc40d7a66457a2cdcd2f18bb9ce481fc2cc",
+      "bytes": 12559,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
@@ -1540,8 +1540,8 @@
     },
     {
       "path": "assets/js/app/state/managers/color-manager.js",
-      "sha256": "0d268bd29fbcfb1a77a629a7db03c39467b5687d9c6cdd12d0f9ca24ca5b6b58",
-      "bytes": 30281,
+      "sha256": "414b4ad7faae1d807132e9a0a90e562603b10c537e533261a16989871b374fe6",
+      "bytes": 31018,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
@@ -2386,8 +2386,8 @@
     },
     {
       "path": "assets/js/app/ui/modules/visualization-reset.js",
-      "sha256": "d95e5ec1087d1047c4da6c190261d1ab75e52809f527230c6c096b3b98878a58",
-      "bytes": 17588,
+      "sha256": "6ecf9c9930e7c6dec45a8c8720b14076515a6f15d0a9588e5b83c23f69d8669c",
+      "bytes": 18288,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
@@ -2493,6 +2493,12 @@
       "content_type": "application/javascript; charset=utf-8"
     },
     {
+      "path": "assets/js/app/utils/sha256.js",
+      "sha256": "f32bb2bb1a946c16458f31ddc502b93da264e4e83ceaa2c2f20ef3454212c43f",
+      "bytes": 6603,
+      "content_type": "application/javascript; charset=utf-8"
+    },
+    {
       "path": "assets/js/app/utils/state-validator.js",
       "sha256": "4951d831bd5d2decf01e46e6d27f232392fb6f93b347d9cf0dea3e4a5d1e802e",
       "bytes": 10389,
@@ -2536,8 +2542,8 @@
     },
     {
       "path": "assets/js/data/data-loaders.js",
-      "sha256": "fff8cbe5ea63bf66bb171edae597dc1e7dfe8185fa6c78380bc0cfcac04a579c",
-      "bytes": 104862,
+      "sha256": "c18f8658540e8939736e03d4a583030356075b43d183bfad55261307d8a5d0d3",
+      "bytes": 106258,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
@@ -2740,8 +2746,8 @@
     },
     {
       "path": "assets/js/rendering/high-perf/spatial-index.js",
-      "sha256": "f35be9624e711824ee7bef624f5eec964f9b1f11328c75f77cc23033b7103908",
-      "bytes": 72350,
+      "sha256": "86a126a31132f61cf1bca3300583e51ffbe7209e6d31e44927fcf203c93c5be0",
+      "bytes": 73333,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
@@ -2812,8 +2818,8 @@
     },
     {
       "path": "assets/js/rendering/point-size-scale.js",
-      "sha256": "97fe735ff25eea92e291c316ce60a1d681e1a428e353d6105474cf1bffbad057",
-      "bytes": 5757,
+      "sha256": "4bf169934d7d52da0e3b74c92c85f8eb02ee1722f72b5b736df0809d3e210e32",
+      "bytes": 7103,
       "content_type": "application/javascript; charset=utf-8"
     },
     {

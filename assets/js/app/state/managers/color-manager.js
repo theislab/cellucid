@@ -177,10 +177,20 @@ export class DataStateColorMethods {
   /**
    * Name the field in the words it is shown under, for a diagnosis.
    *
-   * `activeFieldSource` is what distinguishes a gene from an observation
-   * column, and it is the only thing that changes the remedy: a gene comes out
-   * of `adata.X` and a field out of `adata.obs`. An inactive field is described
-   * as a field, which is what it truthfully is rather than a guess.
+   * Gene or observation column is the only thing that changes the remedy — a
+   * gene comes out of `adata.X` and a field out of `adata.obs` — so it has to be
+   * a property of the field being described, not of the viewer.
+   *
+   * This read `activeFieldSource`, which is what the viewer is *currently*
+   * coloured by. That is right only when the field being validated is also the
+   * active one, and three of the callers are the opposite case:
+   * `computeGlobalVisibility()` walks every obs field carrying a filter, and
+   * `toggleFilterEnabled` / `removeFilter` validate one obs field by name. While
+   * a gene was coloured, `activeFieldSource` was `'var'` for all of them, so an
+   * `obs` column that could not be drawn was reported as a gene and handed the
+   * reader `adata.X` repair advice for a column that is not in `adata.X`.
+   *
+   * Membership answers it truthfully: this object owns both collections.
    *
    * @param {{key?: unknown}} field
    * @returns {{kind: 'gene'|'field', name: string}}
@@ -189,8 +199,12 @@ export class DataStateColorMethods {
     const name = typeof field?.key === 'string' && field.key.length > 0
       ? field.key
       : 'unnamed';
+    const varFields = this.varData?.fields;
+    const isGene = Array.isArray(varFields)
+      ? varFields.includes(field)
+      : false;
     return {
-      kind: this.activeFieldSource === 'var' ? 'gene' : 'field',
+      kind: isGene ? 'gene' : 'field',
       name,
     };
   }

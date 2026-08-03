@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { spawnSync } from 'node:child_process';
+import { createServer } from 'node:net';
 import { isAbsolute, relative, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -56,6 +57,9 @@ export const PROCESS_INTENSIVE_REPORT_TAG = 'browser-process-intensive';
 // A host-terminal file is also process-intensive, but it has a stronger
 // ordering contract: no browser test may run after it on a vulnerable host.
 export const HOST_GPU_TERMINAL_REPORT_TAG = 'browser-host-gpu-terminal';
+// How many rungs beyond the requested batch count the ladder may search
+// before giving up, so a host occupying a few of them still yields a plan.
+const PORT_CANDIDATE_OVERSUBSCRIPTION = 6;
 
 const DEFAULT_BROWSER_SHARD_LIMITS = Object.freeze({
   maxFilesPerProcess: MAX_FILES_PER_BROWSER_PROCESS,
@@ -595,16 +599,90 @@ export function partitionBrowserShardInventory(
   return Object.freeze(batches);
 }
 
+const BROWSER_TEST_PROBE_HOST = '127.0.0.1';
+const PROBE_TIMEOUT_MS = 10_000;
+
+/**
+ * Which of these loopback ports can be bound right now.
+ *
+ * A listen probe is the only honest test — a port can look free and still
+ * refuse a bind — and `net.Server#listen` is asynchronous, so the answer cannot
+ * be read back in the synchronous runner that needs it. One short-lived child
+ * probes the whole candidate list at once and prints the free ones, which costs
+ * a single process start rather than one per port.
+ *
+ * A probe is not a reservation: something else may take a port between the
+ * probe and the batch. That is why `reuseExistingServer: false` and the
+ * server's `EADDRINUSE` exit both stay exactly as they were. This removes the
+ * *predictable* collision — a fixed ladder meeting a host that already uses one
+ * of its rungs — and does not pretend to remove the racy one.
+ *
+ * @param {ReadonlyArray<number>} ports
+ * @returns {Set<number>}
+ */
+function probeFreeLoopbackPorts(ports) {
+  if (ports.length === 0) return new Set();
+  const script = `
+    import { createServer } from 'node:net';
+    const ports = JSON.parse(process.argv[1]);
+    const free = [];
+    for (const port of ports) {
+      const bound = await new Promise(resolve => {
+        const probe = createServer();
+        probe.once('error', () => resolve(false));
+        probe.listen(port, ${JSON.stringify(BROWSER_TEST_PROBE_HOST)}, () => {
+          probe.close(() => resolve(true));
+        });
+      });
+      if (bound) free.push(port);
+    }
+    process.stdout.write(JSON.stringify(free));
+  `;
+  const result = spawnSync(
+    process.execPath,
+    ['--input-type=module', '--eval', script, JSON.stringify([...ports])],
+    { encoding: 'utf8', timeout: PROBE_TIMEOUT_MS },
+  );
+  if (result.status !== 0 || typeof result.stdout !== 'string') {
+    // A probe that cannot run must not stop a run that would otherwise work.
+    // Falling through to the unprobed ladder is exactly the previous behaviour,
+    // and the server still refuses a taken port loudly.
+    return new Set(ports);
+  }
+  try {
+    const free = JSON.parse(result.stdout);
+    return Array.isArray(free) ? new Set(free) : new Set(ports);
+  } catch {
+    return new Set(ports);
+  }
+}
+
 /**
  * Give every bounded child process its own server pair and therefore its own
  * Playwright output directory. A failed batch's evidence cannot be overwritten
  * by a later batch, and a failed server teardown cannot strand the next one.
  *
+ * The ladder used to be assumed rather than discovered: 4173-4189, fixed, with
+ * `reuseExistingServer: false` turning any occupied rung into a hard stop for
+ * all nine batches. On a container, a self-hosted runner, or a developer
+ * machine with a leftover server from an interrupted run, every batch failed
+ * identically and the only recovery was a human setting an environment
+ * variable. Each pair is now probed before it is planned, and an occupied pair
+ * is stepped over exactly like a Fetch-blocked one.
+ *
+ * An explicitly configured start port is still honoured as a start: a caller
+ * who names a port is choosing where to look, not asserting what is free.
+ *
  * @param {Record<string, string | undefined>} environment
  * @param {number} batchCount
+ * @param {(port: number) => boolean} [isPortAvailable]
  * @returns {ReadonlyArray<Readonly<{port: number, samplePort: number}>>}
  */
-export function planBrowserBatchPorts(environment, batchCount) {
+export function planBrowserBatchPorts(
+  environment,
+  batchCount,
+  probePorts = probeFreeLoopbackPorts,
+) {
   if (!Number.isInteger(batchCount) || batchCount < 1) {
     throw new RangeError('Bounded browser shard batchCount must be positive.');
   }
@@ -616,19 +694,22 @@ export function planBrowserBatchPorts(environment, batchCount) {
   }
   const { port, samplePort } = resolveBrowserTestPorts(environment);
   const stride = Math.abs(samplePort - port) + 1;
-  const plan = [];
-  let candidateIndex = 0;
-  while (plan.length < batchCount) {
+
+  // Enough rungs that a host using some of them still leaves a full plan, and
+  // few enough that the probe stays one quick pass. Fetch-blocked pairs are
+  // dropped first so the probe never spends a bind on a port no browser can
+  // navigate to anyway.
+  const candidates = [];
+  for (
+    let candidateIndex = 0;
+    candidates.length < batchCount * PORT_CANDIDATE_OVERSUBSCRIPTION;
+    candidateIndex += 1
+  ) {
     const candidate = Object.freeze({
       port: port + stride * candidateIndex,
       samplePort: samplePort + stride * candidateIndex,
     });
-    candidateIndex += 1;
-    if (candidate.port > 65535 || candidate.samplePort > 65535) {
-      throw new RangeError(
-        'Bounded browser shard cannot allocate one valid port pair per batch.'
-      );
-    }
+    if (candidate.port > 65535 || candidate.samplePort > 65535) break;
     // Binding a Fetch-blocked port succeeds, but every browser navigation to
     // it fails. Skip the whole pair so neither the application nor CORS sample
     // origin can silently become unreachable as a shard grows.
@@ -638,7 +719,24 @@ export function planBrowserBatchPorts(environment, batchCount) {
     ) {
       continue;
     }
-    plan.push(candidate);
+    candidates.push(candidate);
+  }
+
+  const free = probePorts(
+    candidates.flatMap(candidate => [candidate.port, candidate.samplePort]),
+  );
+  // Both halves or neither: a batch needs an application origin and a CORS
+  // sample origin, and half a pair is not usable by anything.
+  const plan = candidates
+    .filter(candidate => free.has(candidate.port) && free.has(candidate.samplePort))
+    .slice(0, batchCount);
+  if (plan.length < batchCount) {
+    throw new RangeError(
+      `Bounded browser shard cannot allocate one free port pair per batch: ` +
+        `wanted ${batchCount}, found ${plan.length} between ${port} and ` +
+        `${candidates.at(-1)?.samplePort ?? port}. Set ` +
+        `${BROWSER_TEST_PORT_VARIABLE} to a free range.`
+    );
   }
   return Object.freeze(plan);
 }

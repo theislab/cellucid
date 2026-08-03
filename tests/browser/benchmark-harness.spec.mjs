@@ -18,7 +18,15 @@ import { expect, test } from './helpers/test.mjs';
 import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 /** The last rung of the 18-level ladder: every point, no reduction. */
-const FULL_DETAIL_LOD_LEVEL = 17;
+// Two different numbers for two different things, and conflating them is what
+// this spec got wrong. `FULL_DETAIL_LADDER_INDEX` is the rung you force to ask
+// for the whole cloud. `FULL_DETAIL_REPORTED_LEVEL` is what the renderer
+// publishes once it draws it: full detail is not a reduced level, so it draws
+// from the full buffer and reports -1, exactly as the LOD membership contract
+// publishes null for it.
+const FULL_DETAIL_LADDER_INDEX = 17;
+const FULL_DETAIL_REPORTED_LEVEL = -1;
+const ADAPTIVE_FLOOR_LADDER_INDEX = 8;
 
 const FIXTURE_URL =
   `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}` +
@@ -31,6 +39,11 @@ const PROCESS_INTENSIVE = Object.freeze({
 
 /** Small enough to stay a smoke test on a busy machine. */
 const SMOKE_POINT_COUNT = 120_000;
+// The measured window's length, passed into the page and asserted against on the
+// way out. A literal on each side is how `samples` came to expect 180 frames
+// from a window configured for 60.
+const SMOKE_WARMUP_FRAMES = 10;
+const SMOKE_MEASURE_FRAMES = 60;
 
 async function publishSyntheticDataset(page, pointCount, pattern) {
   await page.locator('#benchmark-section > summary').click();
@@ -67,7 +80,7 @@ test('the harness observes LOD, culling and uploads under scripted motion', PROC
   await publishSyntheticDataset(page, SMOKE_POINT_COUNT, 'atlas');
 
   const outcome = await page.evaluate(
-    async ({ moduleUrl }) => {
+    async ({ moduleUrl, warmupFrames, measureFrames }) => {
       const harnessModule = await import(moduleUrl);
       const viewer = window._cellucidViewer;
       const canvas = document.getElementById('glcanvas');
@@ -78,14 +91,9 @@ test('the harness observes LOD, culling and uploads under scripted motion', PROC
         const windows = {};
 
         // Culling on is the configuration whose per-frame element-buffer
-        // publication the counters exist to observe.
-        //
-        // The windows are short, and shorter than they were. Adaptive LOD is
-        // bounded by a point budget now, so on a cloud this small it never
-        // reduces anything and every frame here draws all 120,000 points where
-        // it used to draw as few as 2,727 when the camera pulled back. The
-        // frames got heavier, so there are fewer of them: this spec proves the
-        // counters work and publishes no number anyone may record.
+        // publication the counters exist to observe. The windows are short:
+        // this spec proves the counters work and publishes no number anyone
+        // may record.
         for (const regime of ['static', 'orbit']) {
           await runner.applyConfiguration({
             viewCount: 1,
@@ -97,8 +105,8 @@ test('the harness observes LOD, culling and uploads under scripted motion', PROC
           windows[regime] = await runner.runWindow({
             regime,
             path,
-            warmupFrames: 10,
-            measureFrames: 60
+            warmupFrames,
+            measureFrames
           });
         }
 
@@ -129,10 +137,10 @@ test('the harness observes LOD, culling and uploads under scripted motion', PROC
           probe.drawCalls.push(stats.drawCalls);
         }
 
-        // A second pass over forced levels. Adaptive selection is bounded by a
-        // point budget and has nothing to do on a cloud this small, so the
-        // camera cannot make it change level — but the ladder is still there,
-        // and the harness still has to be able to see one level from another.
+        // A second pass over forced levels. Adaptive selection has a floor, and
+        // a forced level is deliberately not held to it, so this reaches rungs
+        // the camera cannot: the harness has to see one level from another
+        // across the whole ladder, not only the part `Auto` uses.
         const forced = [];
         for (const forceLodLevel of [0, 8, 17]) {
           await runner.applyConfiguration({
@@ -177,7 +185,11 @@ test('the harness observes LOD, culling and uploads under scripted motion', PROC
         harness.dispose();
       }
     },
-    { moduleUrl: HARNESS_MODULE }
+    {
+      moduleUrl: HARNESS_MODULE,
+      warmupFrames: SMOKE_WARMUP_FRAMES,
+      measureFrames: SMOKE_MEASURE_FRAMES
+    }
   );
 
   // The rasterizer must be identified and recorded on every run, so a later
@@ -186,24 +198,50 @@ test('the harness observes LOD, culling and uploads under scripted motion', PROC
   expect(['hardware', 'software', 'unknown']).toContain(outcome.rasterizer.kind);
   expect(outcome.baselineKey).toMatch(/^[a-z0-9-]+$/);
 
-  // Adaptive selection is bounded by a point budget: it never reduces a cloud
-  // that already draws in one frame. 120,000 points is far inside that budget,
-  // so the correct observation is that the scripted path stays at full detail
-  // for its whole length — in both regimes, and with no transitions to count.
-  // This used to assert the opposite, on a fixed 44x ladder that reduced every
-  // dataset by the same ratio whatever its size.
-  expect(outcome.probe.distinctLodLevels).toEqual([FULL_DETAIL_LOD_LEVEL]);
-  expect(outcome.windows.orbit.lod.transitions).toBe(0);
-  expect(outcome.windows.static.lod.transitions).toBe(0);
+  // Adaptive selection follows the camera at every dataset size. Its floor is
+  // the smaller of an absolute point budget and a fixed reduction cap, so a
+  // 120,000-point cloud — far inside the budget, where an absolute-budget-only
+  // floor pinned every distance to full detail and made `Auto` inert — still
+  // has levels between full detail and its floor for the scripted path to cross.
+  const reportedLodLevels = outcome.probe.distinctLodLevels;
+  expect(reportedLodLevels.length).toBeGreaterThan(1);
+  expect(reportedLodLevels).toContain(FULL_DETAIL_REPORTED_LEVEL);
+  const reducedLodLevels = reportedLodLevels.filter(
+    level => level !== FULL_DETAIL_REPORTED_LEVEL
+  );
+  expect(reducedLodLevels.length).toBeGreaterThan(0);
+  expect(Math.min(...reducedLodLevels)).toBe(ADAPTIVE_FLOOR_LADDER_INDEX);
+  expect(Math.max(...reducedLodLevels)).toBeLessThan(FULL_DETAIL_LADDER_INDEX);
 
-  // The ladder itself is untouched by the budget — a forced level is an explicit
+  // The measured windows are sixty frames of whatever part of the path they
+  // happen to cover, so how many level changes fall inside one is a property of
+  // the window, not of the renderer. Assert that the counter is published and
+  // countable; the deterministic traversal above is what proves the level moves.
+  for (const regime of ['static', 'orbit']) {
+    const transitions = outcome.windows[regime].lod.transitions;
+    expect(Number.isSafeInteger(transitions)).toBe(true);
+    expect(transitions).toBeGreaterThanOrEqual(0);
+  }
+
+  // The ladder itself is untouched by the floor — a forced level is an explicit
   // request and is still honoured — so the harness can still tell one level from
-  // another, which is what it exists to measure.
-  expect(outcome.forced.map(entry => entry.observed)).toEqual([0, 8, 17]);
+  // another, which is what it exists to measure. Level 0 is below the adaptive
+  // floor and only a forced request reaches it.
+  expect(outcome.forced.map(entry => entry.observed)).toEqual([
+    0,
+    ADAPTIVE_FLOOR_LADDER_INDEX,
+    FULL_DETAIL_REPORTED_LEVEL
+  ]);
   const [coarsest, middle, full] = outcome.forced;
   expect(coarsest.visiblePoints).toBeLessThan(middle.visiblePoints);
   expect(middle.visiblePoints).toBeLessThan(full.visiblePoints);
-  expect(full.visiblePoints).toBe(SMOKE_POINT_COUNT);
+  // Frustum culling is on in this pass, so `visiblePoints` is what survived the
+  // frustum, not what the level holds. Asserting the whole cloud here would be
+  // asserting that the camera happens to see all of it, which is a property of
+  // wherever the scripted path left the camera. What the ladder owes is the
+  // ordering above and a full-detail count no reduced level can reach.
+  expect(full.visiblePoints).toBeGreaterThan(0);
+  expect(full.visiblePoints).toBeLessThanOrEqual(SMOKE_POINT_COUNT);
 
   // Proof that geometry leaves the frustum rather than merely being tested
   // against it: the renderer reports a nonzero culled fraction, and the
@@ -242,7 +280,7 @@ test('the harness observes LOD, culling and uploads under scripted motion', PROC
   // Percentiles are withheld, not invented, when the window is this short.
   for (const regime of ['static', 'orbit']) {
     const summary = outcome.windows[regime];
-    expect(summary.samples).toBe(180);
+    expect(summary.samples).toBe(SMOKE_MEASURE_FRAMES);
     expect(summary.percentileSupport.p99.reported).toBe(false);
     expect(summary.frameTimeMs.p99).toBeNull();
     expect(summary.frameTimeMs.median).toBeGreaterThan(0);

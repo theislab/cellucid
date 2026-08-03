@@ -5,6 +5,7 @@ import {
   HighPerfRenderer,
 } from '../assets/js/rendering/high-perf-renderer.js';
 import {
+  ADAPTIVE_LOD_MAXIMUM_REDUCTION,
   ADAPTIVE_LOD_POINT_BUDGET,
   SpatialIndex,
 } from '../assets/js/rendering/high-perf/spatial-index.js';
@@ -364,71 +365,123 @@ test('active full-detail LOD publishes null and velocity treats it as all cells'
   );
 });
 
-test('adaptive selection stops at the point budget instead of a fixed ratio', () => {
+// Positions and bounds as the renderer actually sees them: every embedding is
+// normalized into roughly [-1, 1] before it reaches the index, so a camera
+// distance of 1 is a camera one data-width away. A synthetic index built at
+// some other scale puts every test distance below the selector's near clamp and
+// hides whether the camera moves the level at all.
+const makeNormalizedIndex = pointCount => {
+  const positions = new Float32Array(pointCount * 3);
+  for (let index = 0; index < pointCount; index++) {
+    positions[index * 3] = ((index % 977) / 977) * 2 - 1;
+    positions[index * 3 + 1] = (((index * 31) % 1021) / 1021) * 2 - 1;
+  }
+  const index = Object.assign(
+    Object.create(SpatialIndex.prototype),
+    {
+      bounds: { minX: -1, maxX: 1, minY: -1, maxY: 1, minZ: 0, maxZ: 0 },
+      dimensionLevel: 2,
+      pointCount,
+      positions,
+      _adaptiveMinimumLevel: 0,
+    },
+  );
+  index.lodLevels = index._generateLODLevels();
+  return index;
+};
+
+// Pull back through the selector's whole useful range and return to where it
+// started, one call per step as the render loop makes them.
+const walkCamera = index => {
+  const distances = [0.5, 1, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10, 12];
+  const levels = [];
+  let previous = -1;
+  for (const distance of distances) {
+    previous = index.getLODLevel(distance, previous, 2);
+    levels.push(previous);
+  }
+  for (const distance of [...distances].reverse()) {
+    previous = index.getLODLevel(distance, previous, 2);
+    levels.push(previous);
+  }
+  return levels;
+};
+
+test('adaptive selection is bounded by a budget and a ratio, not a ratio alone', () => {
   // A fixed reduction ratio is what made a large dataset unusable on `Auto`:
   // the coarsest ladder step is 44x whatever the cell count, so pulling the
   // camera back on 18.1M cells discarded 97.7% of them whether or not the frame
-  // needed it. Adaptive selection is bounded by a point budget instead, and the
-  // bound scales itself: a dataset already inside the budget is never reduced.
+  // needed it.
+  //
+  // An absolute budget alone broke the other end. No level of a 200k cloud
+  // holds two million points, so the floor landed on full detail and `Auto`
+  // answered full detail at every camera distance -- on every dataset most
+  // people open, the level readout never moved and the forced-level slider was
+  // the only control that did anything.
   assert.equal(ADAPTIVE_LOD_POINT_BUDGET, 2_000_000);
+  assert.equal(ADAPTIVE_LOD_MAXIMUM_REDUCTION, 8);
 
-  const makeIndex = pointCount => {
-    const positions = new Float32Array(pointCount * 3);
-    for (let index = 0; index < pointCount; index++) {
-      positions[index * 3] = (index % 977) - 488;
-      positions[index * 3 + 1] = ((index * 31) % 1021) - 510;
-    }
-    return Object.assign(
-      Object.create(SpatialIndex.prototype),
-      {
-        bounds: {
-          minX: -512, maxX: 512, minY: -512, maxY: 512, minZ: 0, maxZ: 0,
-        },
-        dimensionLevel: 2,
-        pointCount,
-        positions,
-        _adaptiveMinimumLevel: 0,
-      },
-    );
-  };
-
-  // Under the budget: every level is admissible only at full detail, so the
-  // coarsest answer the selector can give is the whole cloud.
-  const small = makeIndex(4096);
-  small.lodLevels = small._generateLODLevels();
-  assert.equal(small._adaptiveMinimumLevel, small.lodLevels.length - 1);
-  assert.equal(small.lodLevels.at(-1).isFullDetail, true);
-  for (const distance of [0.1, 1, 3, 30]) {
-    assert.equal(
-      small.getLODLevel(distance, -1, 2),
-      small.lodLevels.length - 1,
-      `a ${small.pointCount}-point cloud must not be reduced at distance ${distance}`,
-    );
-  }
-
-  // Over the budget: the floor is the coarsest level still holding at least the
-  // budget, and no camera distance goes below it.
-  const large = makeIndex(3_000_000);
-  large.lodLevels = large._generateLODLevels();
-  const floorLevel = large._adaptiveMinimumLevel;
-  assert.ok(floorLevel > 0 && floorLevel < large.lodLevels.length - 1);
-  assert.ok(
-    large.lodLevels[floorLevel].pointCount >= ADAPTIVE_LOD_POINT_BUDGET,
-    'the floor level must hold at least the budget',
-  );
-  assert.ok(
-    large.lodLevels[floorLevel - 1].pointCount < ADAPTIVE_LOD_POINT_BUDGET,
-    'the floor must be the coarsest level that still holds the budget',
-  );
-  let previous = -1;
-  for (const distance of [0.1, 1, 2, 3, 10, 100]) {
-    previous = large.getLODLevel(distance, previous, 2);
+  for (const pointCount of [50_000, 200_000, 1_000_000, 3_000_000, 18_142_044]) {
+    const index = makeNormalizedIndex(pointCount);
+    const floorLevel = index._adaptiveMinimumLevel;
+    const finest = index.lodLevels.length - 1;
     assert.ok(
-      previous >= floorLevel,
-      `distance ${distance} selected level ${previous} below the floor ${floorLevel}`,
+      floorLevel > 0 && floorLevel < finest,
+      `${pointCount} points must leave adaptive selection a range to work in, `
+      + `got floor ${floorLevel} of ${finest}`,
+    );
+
+    const floorCount = Math.min(
+      ADAPTIVE_LOD_POINT_BUDGET,
+      pointCount / ADAPTIVE_LOD_MAXIMUM_REDUCTION,
+    );
+    assert.ok(
+      index.lodLevels[floorLevel].pointCount >= floorCount,
+      `the floor level must hold at least ${floorCount} points`,
+    );
+    assert.ok(
+      index.lodLevels[floorLevel - 1].pointCount < floorCount,
+      'the floor must be the coarsest level that still holds that count',
+    );
+
+    const levels = walkCamera(index);
+    assert.equal(
+      Math.max(...levels),
+      finest,
+      `${pointCount} points must reach full detail with the camera close`,
+    );
+    assert.equal(
+      Math.min(...levels),
+      floorLevel,
+      `${pointCount} points must reach the floor with the camera pulled back`,
+    );
+    assert.ok(
+      new Set(levels).size >= 4,
+      `${pointCount} points must give the camera more than a couple of levels`,
+    );
+
+    // Hysteresis must not be able to walk below the floor either, even when a
+    // restored session hands in a coarser previous level.
+    assert.ok(index.getLODLevel(100, 0, 2) >= floorLevel);
+  }
+});
+
+test('a cloud too small to sample keeps every level identical rather than empty', () => {
+  // The ladder floors each level at 1,000 points, so the smallest published
+  // dataset -- 3,696 cells -- cannot be reduced by more than 3.7x however far
+  // the camera pulls back. The camera still drives the level; the levels it
+  // drives to just hold the same number of points.
+  const index = makeNormalizedIndex(3_696);
+  assert.equal(index._adaptiveMinimumLevel, 0);
+  for (const level of index.lodLevels) {
+    assert.ok(
+      level.pointCount >= 1_000,
+      'no level may drop a small cloud below the 1,000-point ladder floor',
     );
   }
-  // Hysteresis must not be able to walk below the floor either, even when a
-  // restored session hands in a coarser previous level.
-  assert.ok(large.getLODLevel(100, 0, 2) >= floorLevel);
+  const levels = walkCamera(index);
+  assert.ok(
+    new Set(levels).size >= 4,
+    'the camera must still move the level on the smallest published dataset',
+  );
 });

@@ -10,6 +10,10 @@
 
 import { getDefaultNavigationMode } from '../../../rendering/viewer/viewer-contracts.js';
 import { parseRangeInput } from '../core/numeric-input-contract.js';
+import {
+  POINT_SIZE_SLIDER_MAXIMUM,
+  POINT_SIZE_SLIDER_MINIMUM,
+} from '../../../rendering/point-size-scale.js';
 
 const EXACT_OPTION_KEYS = Object.freeze([
   'cameraControls',
@@ -323,9 +327,20 @@ export function initVisualizationReset(options) {
         RENDER_MODES,
         'Visualization render mode'
       ),
+      // The point-size slider is the one range control whose domain is not
+      // 0-100: its position is the exponent of a logarithmic size curve, and it
+      // runs below zero so the curve can reach the sizes a dataset of millions
+      // of cells needs. A dataset above roughly four hundred thousand cells
+      // opens at a negative position, so a 0-100 bound here refused to capture
+      // the state of every large dataset and reported the whole control set as
+      // unsynchronized.
       pointSize: captureRange(
         pointSizeInput,
-        { minimum: 0, maximum: 100, label: 'Point size' }
+        {
+          minimum: POINT_SIZE_SLIDER_MINIMUM,
+          maximum: POINT_SIZE_SLIDER_MAXIMUM,
+          label: 'Point size',
+        }
       ),
       lighting: captureRange(
         lightingInput,

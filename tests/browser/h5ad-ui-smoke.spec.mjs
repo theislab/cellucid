@@ -314,6 +314,12 @@ test('saves and restores the exact current UI state through one file-input contr
   await expect(page.locator('#navigation-mode')).toHaveValue('planar');
   await expect(page.locator('.cinematic-transport-bar')).toHaveCount(0);
 
+  // Captured, not hardcoded. The point size a dataset opens at is derived from its
+  // cell count, so the value this session records is a property of the fixture
+  // rather than a constant — and what this test is about is that whatever was
+  // saved comes back, not what that value happens to be.
+  const savedPointSize = await page.locator('#point-size').inputValue();
+
   const downloadPromise = page.waitForEvent('download');
   await page.locator('#save-state-btn').click();
   const download = await downloadPromise;
@@ -337,7 +343,7 @@ test('saves and restores the exact current UI state through one file-input contr
 
   await expect(page.locator('#theme-select')).toHaveValue('light');
   await expect(page.locator('#background-select')).toHaveValue('grid');
-  await expect(page.locator('#point-size')).toHaveValue('16.5');
+  await expect(page.locator('#point-size')).toHaveValue(savedPointSize);
   await expect(page.locator('#visualization-section')).toHaveAttribute('open', '');
   await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
   await expect(page.locator('#dimension-select')).toHaveValue('2');

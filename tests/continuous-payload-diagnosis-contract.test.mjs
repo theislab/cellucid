@@ -48,10 +48,15 @@ function tallyOf(values) {
   return tally;
 }
 
-function makeColorOwner(values, activeFieldSource) {
+// `varFields` is the live variable-field array the state object owns. A field is
+// a gene because it is in that array, not because a gene happens to be the
+// colour source at the time -- see `describeContinuousFieldSubject`.
+function makeColorOwner(values, activeFieldSource, varFields = []) {
   const owner = Object.create(DataStateColorMethods.prototype);
   owner.pointCount = values.length;
   owner.activeFieldSource = activeFieldSource;
+  owner.varData = { fields: varFields };
+  owner.obsData = { fields: [] };
   return owner;
 }
 
@@ -124,13 +129,10 @@ test('a payload with no value at all is a different diagnosis', () => {
 
 test('the reader refuses an infinite field and names it, in one pass', () => {
   const values = new Float32Array([0.5, Number.POSITIVE_INFINITY, 2, 3]);
-  const owner = makeColorOwner(values, 'var');
+  const geneField = { kind: 'continuous', key: 'A2ML1', values };
+  const owner = makeColorOwner(values, 'var', [geneField]);
   assert.throws(
-    () => owner.ensureContinuousMetadata({
-      kind: 'continuous',
-      key: 'A2ML1',
-      values,
-    }),
+    () => owner.ensureContinuousMetadata(geneField),
     error => {
       assert.ok(error instanceof UndrawableContinuousPayloadError);
       assert.equal(error.subject.kind, 'gene');
@@ -154,6 +156,29 @@ test('the reader refuses an infinite field and names it, in one pass', () => {
         error.message,
         /^Field "HPCA_entropy_Level_1" contains/,
       );
+      return true;
+    },
+  );
+
+  // The case that was wrong: an obs column validated while a gene is the colour
+  // source. `computeGlobalVisibility()` walks every filtered obs field on every
+  // recompute, so this is the common path, not a corner. Reading the active
+  // source made it a gene and handed the reader `adata.X` repair advice for a
+  // column that is not in `adata.X`.
+  const geneWhileColoured = { kind: 'continuous', key: 'ACTB', values };
+  const mixedOwner = makeColorOwner(values, 'var', [geneWhileColoured]);
+  assert.throws(
+    () => mixedOwner.ensureContinuousMetadata({
+      kind: 'continuous',
+      key: 'n_counts',
+      values,
+    }),
+    error => {
+      assert.equal(error.subject.kind, 'field');
+      assert.equal(error.subject.name, 'n_counts');
+      assert.match(error.message, /^Field "n_counts" contains/);
+      assert.match(error.message, /adata\.obs/);
+      assert.doesNotMatch(error.message, /adata\.X/);
       return true;
     },
   );

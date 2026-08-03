@@ -165,8 +165,46 @@ async function serve(request, response) {
   stream.pipe(response);
 }
 
-const server = createServer(serve);
-const sampleServer = createServer(serve);
+// A request that never reaches the client is one test's problem. A server that
+// stops listening is every later test's problem, and it reports as
+// `ERR_CONNECTION_REFUSED` in specs that have nothing to do with the cause --
+// which is what a whole batch of community-annotation tests failing after the
+// twenty-eighth one looked like. Nothing a client does may end this process.
+//
+// Two things could. `serve` is `async`, so anything it threw after the request
+// was aborted -- writing a head to a socket the client had already reset, which
+// is exactly what the publication-abort specs do on purpose -- became an
+// unhandled rejection, and an unhandled rejection ends a Node process. And the
+// bind-failure handler was registered permanently rather than for the bind, so
+// any later server error called `process.exit(1)` through it.
+function handle(request, response) {
+  const abandon = () => {
+    if (!response.destroyed) response.destroy();
+  };
+  request.on('error', abandon);
+  response.on('error', abandon);
+  Promise.resolve()
+    .then(() => serve(request, response))
+    .catch(error => {
+      // A client that goes away mid-response is ordinary here and silent. Any
+      // other failure is worth seeing, and neither ends the process.
+      const code = error?.code;
+      if (
+        code !== 'ECONNRESET' &&
+        code !== 'EPIPE' &&
+        code !== 'ERR_STREAM_DESTROYED' &&
+        code !== 'ERR_STREAM_WRITE_AFTER_END'
+      ) {
+        process.stderr.write(
+          `Browser-test server request failed: ${error?.stack || error}\n`
+        );
+      }
+      abandon();
+    });
+}
+
+const server = createServer(handle);
+const sampleServer = createServer(handle);
 
 function reportListenFailure(error, role, listenPort, variable) {
   if (error.code === 'EADDRINUSE') {
@@ -183,23 +221,58 @@ function reportListenFailure(error, role, listenPort, variable) {
   process.exit(1);
 }
 
-server.on('error', error => {
-  reportListenFailure(error, 'application', port, BROWSER_TEST_PORT_VARIABLE);
-});
-server.listen(port, host, () => {
-  process.stdout.write(`Browser-test server listening on http://${host}:${port}\n`);
-});
-sampleServer.on('error', error => {
-  reportListenFailure(
-    error,
-    'CORS sample',
-    samplePort,
-    BROWSER_TEST_SAMPLE_PORT_VARIABLE
+/**
+ * Bind one server, exiting only if the address itself cannot be taken.
+ *
+ * The bind handler is `once` and is removed the moment the socket is listening,
+ * so a runtime error afterwards is reported and survived rather than being
+ * routed into `process.exit(1)` by a handler that outlived its purpose.
+ */
+function listenOnce(activeServer, role, listenPort, variable, announce) {
+  const onBindFailure = error => {
+    reportListenFailure(error, role, listenPort, variable);
+  };
+  activeServer.once('error', onBindFailure);
+  activeServer.on('clientError', (_error, socket) => {
+    if (!socket.destroyed) socket.destroy();
+  });
+  activeServer.listen(listenPort, host, () => {
+    activeServer.removeListener('error', onBindFailure);
+    activeServer.on('error', error => {
+      process.stderr.write(
+        `Browser-test ${role} server error: ${error.stack || error}\n`
+      );
+    });
+    process.stdout.write(announce);
+  });
+}
+
+listenOnce(
+  server,
+  'application',
+  port,
+  BROWSER_TEST_PORT_VARIABLE,
+  `Browser-test server listening on http://${host}:${port}\n`
+);
+listenOnce(
+  sampleServer,
+  'CORS sample',
+  samplePort,
+  BROWSER_TEST_SAMPLE_PORT_VARIABLE,
+  `CORS sample server listening on http://${host}:${samplePort}\n`
+);
+
+// Last line of defence. Every path above is handled, but a static server that
+// dies takes an entire batch with it and reports the death nowhere near its
+// cause, so an escape is logged and survived rather than fatal.
+process.on('uncaughtException', error => {
+  process.stderr.write(
+    `Browser-test server uncaught: ${error?.stack || error}\n`
   );
 });
-sampleServer.listen(samplePort, host, () => {
-  process.stdout.write(
-    `CORS sample server listening on http://${host}:${samplePort}\n`
+process.on('unhandledRejection', reason => {
+  process.stderr.write(
+    `Browser-test server unhandled rejection: ${reason?.stack || reason}\n`
   );
 });
 

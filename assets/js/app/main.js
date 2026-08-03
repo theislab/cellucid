@@ -1378,6 +1378,15 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
         dimensionLevel: stage.dimensionLevel,
         dimensionManager: stage.dimensionManager
       });
+      // The opening point size and the antialiasing decision are derived from
+      // how many points are being drawn, and a synthetic publication replaces
+      // the whole cloud. Deriving them only where a dataset *identity* is
+      // published left this path wearing the previous dataset's answer: the
+      // browser-test fixture publishes 120 cells, so its 120,000-point
+      // benchmark cloud was drawn at the size chosen for 120 of them. The count
+      // is authoritative here — `initSyntheticScene` measures the same
+      // `positions.length / 3`.
+      ui?.applyDatasetRenderDefaults?.(stage.positions.length / 3);
       EXPORT_BASE_URL = '';
       dimensionManager = stage.dimensionManager;
       obs = state.obsData;

@@ -63,6 +63,26 @@ export const POINT_SIZE_SLIDER_STEP = 0.5;
 export const POINT_SIZE_REFERENCE_CELLS = 100_000;
 export const POINT_SIZE_REFERENCE_SIZE = 1.5;
 
+/**
+ * The largest size the automatic curve may choose.
+ *
+ * Constant ink is the right law in the middle of the range and the wrong one at
+ * the small end: it answers 43 pixels for a hundred and twenty cells, which is
+ * arithmetically the same amount of ink and visually a field of overlapping
+ * discs with the background hidden behind them. Past this size a point has
+ * stopped being a mark for a cell and become a shape in its own right.
+ *
+ * It bounds only the automatic choice. The slider still reaches
+ * `MAXIMUM_POINT_SIZE`, because a person asking for a 200-pixel point has a
+ * reason and is looking at the result.
+ *
+ * The value is where the curve already is for the smallest dataset anyone
+ * ships: 3,696 cells asks for 7.8. So no dataset of a few thousand cells or
+ * more is affected by this bound at all — it only stops the toy end running
+ * away.
+ */
+export const MAXIMUM_AUTOMATIC_POINT_SIZE = 8;
+
 const POINT_SIZE_SPAN = MAXIMUM_POINT_SIZE / POINT_SIZE_AT_SLIDER_ZERO;
 
 function requireFinite(value, label) {
@@ -145,14 +165,23 @@ export function pointSizeSliderPositionForCellCount(cellCount) {
   const size = POINT_SIZE_REFERENCE_SIZE
     * Math.sqrt(POINT_SIZE_REFERENCE_CELLS / cellCount);
   const reachable = Math.min(
-    MAXIMUM_POINT_SIZE,
+    MAXIMUM_AUTOMATIC_POINT_SIZE,
     Math.max(MINIMUM_POINT_SIZE, size)
   );
   const snapped =
     Math.round(pointSizeToSliderPosition(reachable) / POINT_SIZE_SLIDER_STEP)
     * POINT_SIZE_SLIDER_STEP;
+  // Snapping rounds to the nearer step, which can land just above the ceiling.
+  // A bound that the value it bounds can exceed is not a bound, so the ceiling
+  // is expressed as a position and the snap is held under it.
+  const ceilingPosition =
+    Math.floor(
+      pointSizeToSliderPosition(MAXIMUM_AUTOMATIC_POINT_SIZE)
+      / POINT_SIZE_SLIDER_STEP
+    ) * POINT_SIZE_SLIDER_STEP;
   return Math.min(
     POINT_SIZE_SLIDER_MAXIMUM,
+    ceilingPosition,
     Math.max(POINT_SIZE_SLIDER_MINIMUM, snapped)
   );
 }

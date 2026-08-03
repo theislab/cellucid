@@ -19,6 +19,10 @@ import {
   isSessionRestoreCanceledError,
   isSessionRestoreSupersededError,
 } from './session-serializer.js';
+// `crypto.subtle` is secure-context only and has no non-secure counterpart, so
+// verifying a published state's advertised digest through it fails on exactly
+// the plain-HTTP LAN address the Python package is built to serve from.
+import { sha256Hex } from '../utils/sha256.js';
 
 const MANIFEST_FILENAME = 'state-snapshots.json';
 const DEFAULT_STATE_FILENAME = 'default.cellucid-session';
@@ -290,13 +294,6 @@ async function fetchBoundedArtifact({
     throw new Error(`${owner} request failed with HTTP ${response.status}.`);
   }
   return readBoundedBytes(response, signal, maxBytes, owner);
-}
-
-async function sha256Hex(bytes) {
-  const digest = await globalThis.crypto.subtle.digest('SHA-256', bytes);
-  return Array.from(new Uint8Array(digest), byte => (
-    byte.toString(16).padStart(2, '0')
-  )).join('');
 }
 
 export function assertDatasetStateManifest(value) {

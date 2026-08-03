@@ -357,8 +357,23 @@ test(
       record.viewport[0] === 0 &&
       record.viewport[1] === 0
     ))).toBe(true);
+
+    // The composite draws into the frame's own scene target, which is the
+    // default framebuffer only while antialiasing is off. With it on the scene
+    // is drawn into a multisampled renderbuffer and blitted at the end of the
+    // frame, so a composite that went to framebuffer zero would be painted over
+    // by that blit and the flow would vanish. What must hold in both states is
+    // that every pane composites into the SAME target, and that the target is
+    // the one the frame is being drawn into.
+    const compositeTargets = new Set(
+      gridComposite.map(record => record.framebufferId),
+    );
+    expect(compositeTargets.size).toBe(1);
+    const antialiasing = await page.evaluate(
+      () => window._cellucidViewer.getAntialiasing(),
+    );
+    expect([...compositeTargets][0] === null).toBe(!antialiasing);
     expect(gridComposite.every(record => (
-      record.framebufferId === null &&
       record.scissorEnabled === true &&
       record.viewport.join(',') === record.scissor.join(',')
     ))).toBe(true);

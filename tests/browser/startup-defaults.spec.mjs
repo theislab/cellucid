@@ -68,14 +68,23 @@ test('the default light grid publishes stable light framebuffer pixels', async (
   const evidence = await page.evaluate(async () => {
     const canvas = document.getElementById('glcanvas');
     const gl = canvas.getContext('webgl2');
-    const positions = [
-      [0.55, 0.25],
-      [0.70, 0.30],
-      [0.82, 0.40],
-      [0.50, 0.50],
-      [0.65, 0.60],
-      [0.80, 0.70],
-    ];
+    // An even grid rather than six hand-picked spots. What this test is about is
+    // the background the viewer clears to, and six positions sample it only for
+    // as long as no cell is drawn on them — which stopped being true once the
+    // opening point size started following the cell count, because a small
+    // dataset draws large marks. A grid measures the background over the whole
+    // canvas, so it answers the question the test is actually asking and does
+    // not depend on where one fixture's cells happen to land.
+    const SAMPLES_PER_AXIS = 8;
+    const positions = [];
+    for (let row = 0; row < SAMPLES_PER_AXIS; row += 1) {
+      for (let column = 0; column < SAMPLES_PER_AXIS; column += 1) {
+        positions.push([
+          (column + 0.5) / SAMPLES_PER_AXIS,
+          (row + 0.5) / SAMPLES_PER_AXIS,
+        ]);
+      }
+    }
     const frames = [];
 
     for (let frame = 0; frame < 8; frame += 1) {
@@ -101,7 +110,9 @@ test('the default light grid publishes stable light framebuffer pixels', async (
       frames.push({
         meanLuma:
           lumas.reduce((sum, value) => sum + value, 0) / lumas.length,
-        lightPixelCount: lumas.filter(value => value >= 0.85).length,
+        sampleCount: lumas.length,
+        lightPixelFraction:
+          lumas.filter(value => value >= 0.85).length / lumas.length,
         clearColor: [...gl.getParameter(gl.COLOR_CLEAR_VALUE)],
         framebufferIsDefault:
           gl.getParameter(gl.FRAMEBUFFER_BINDING) === null,
@@ -140,7 +151,12 @@ test('the default light grid publishes stable light framebuffer pixels', async (
   ]);
   for (const frame of evidence.frames) {
     expect(frame.meanLuma).toBeGreaterThan(0.85);
-    expect(frame.lightPixelCount).toBeGreaterThanOrEqual(5);
+    // Nearly the whole canvas is the cleared background; the remainder is the
+    // cells themselves. Stated as a fraction of an even grid this is a stronger
+    // claim than the five-of-six it replaces, and it cannot be satisfied by a
+    // background that is the wrong colour.
+    expect(frame.sampleCount).toBe(64);
+    expect(frame.lightPixelFraction).toBeGreaterThan(0.85);
     expect(frame.clearColor).toEqual([
       Math.fround(0.965),
       Math.fround(0.965),

@@ -27,20 +27,36 @@ const LOD_FULL_DETAIL_ADMISSION_LEVEL = 0xff;
 /**
  * The point count an adaptive LOD level is allowed to fall to.
  *
- * Adaptive selection is a frame-rate control, not a data-reduction policy, so
- * its coarsest useful answer is a point budget rather than a ratio. A fixed
- * ratio is what made a large dataset unusable: at 18.1M cells the coarsest
- * ladder step is a 44x reduction, which the selector reaches on any pull-back
- * and which discards 97.7% of the cells whether or not the frame needed it. A
- * budget stops at the point where drawing is already comfortable and no
- * further reduction buys anything a viewer can see, and it scales itself: a
- * dataset under the budget is never reduced by adaptive selection at all,
- * which is the correct answer for one that already draws in a single frame.
+ * How far adaptive selection may go, from both ends.
  *
- * The forced-level slider is deliberately not bounded by this. Asking for a
+ * Adaptive selection is a frame-rate control, not a data-reduction policy, so
+ * its coarsest useful answer is bounded. A fixed reduction ratio is what made a
+ * large dataset unusable: at 18.1M cells the coarsest ladder step is 44x, which
+ * the selector reaches on any pull-back and which discards 97.7% of the cells
+ * whether or not the frame needed it.
+ *
+ * Two bounds, and the smaller count wins.
+ *
+ * `ADAPTIVE_LOD_POINT_BUDGET` is the absolute one: once a level draws this many
+ * points, drawing is comfortable and further reduction buys nothing a viewer can
+ * see. It is the bound that binds on an atlas.
+ *
+ * `ADAPTIVE_LOD_MAXIMUM_REDUCTION` is the relative one, and it is the bound that
+ * binds on everything else. Expressing the floor as an absolute count alone made
+ * it unsatisfiable below the budget -- no level of a 200k cloud holds 2M points,
+ * so the floor landed on full detail and adaptive selection answered full detail
+ * at every camera distance. On the datasets most people open, `Auto` did nothing
+ * at all: the level readout never moved, and the only working control was the
+ * forced-level slider. A cap on the ratio is satisfiable at every size, so the
+ * camera drives the level on a 3,696-cell trajectory and an 18M-cell atlas
+ * alike, while the absolute budget still stops the atlas short of the 44x step
+ * that started this.
+ *
+ * The forced-level slider is deliberately not bounded by either. Asking for a
  * coarser level explicitly is a legitimate request on hardware that needs it.
  */
 const ADAPTIVE_LOD_POINT_BUDGET = 2_000_000;
+const ADAPTIVE_LOD_MAXIMUM_REDUCTION = 8;
 
 /**
  * Quantization bits per axis for the locality code, by dimension level.
@@ -597,12 +613,14 @@ export class SpatialIndex {
 
     // The coarsest level adaptive selection may choose. Levels are ordered
     // coarse-to-fine and their counts are non-decreasing, so the first level
-    // that meets the budget is that bound. A dataset at or under the budget
-    // resolves to terminal full detail, which is the honest answer: adaptive
-    // selection has no work to do for a cloud that already draws in one frame.
+    // that meets the floor count is that bound. The floor count is the smaller
+    // of the absolute budget and the reduction cap, so it is satisfiable at
+    // every dataset size -- the full-detail level always holds `totalPoints`,
+    // which is above `totalPoints / ADAPTIVE_LOD_MAXIMUM_REDUCTION` -- and the
+    // loop therefore always terminates on a real level.
     const adaptiveFloorCount = Math.min(
-      totalPoints,
-      ADAPTIVE_LOD_POINT_BUDGET
+      ADAPTIVE_LOD_POINT_BUDGET,
+      totalPoints / ADAPTIVE_LOD_MAXIMUM_REDUCTION
     );
     let adaptiveMinimumLevel = levels.length - 1;
     for (let levelIdx = 0; levelIdx < levels.length; levelIdx++) {
@@ -2114,6 +2132,7 @@ export {
   LOD_MAPPING_SENTINEL,
   LOD_MAPPING_VISITED_BIT,
   LOD_FULL_DETAIL_ADMISSION_LEVEL,
+  ADAPTIVE_LOD_MAXIMUM_REDUCTION,
   ADAPTIVE_LOD_POINT_BUDGET,
   LOCALITY_BITS_BY_DIMENSION,
   spreadPairwise,

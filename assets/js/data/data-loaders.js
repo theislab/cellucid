@@ -1092,18 +1092,40 @@ async function fetchBinaryWithProgressInternal(
     throw await describeFailedResponse(response, url);
   }
 
+  // Progress counts the bytes the body reader yields, so the total has to be
+  // measured in the same units — and which unit that is depends on who does the
+  // decompressing.
+  //
+  // A `.gz` URL is a gzip *file* transferred as-is: the reader yields the
+  // compressed bytes and this module inflates them afterwards, so the transfer
+  // length is the total and `Content-Length` is exactly it. The caller's
+  // declared length is the *decoded* size and is the wrong number here.
+  //
+  // Any other URL may be transport-compressed, and there the reader yields
+  // decoded bytes while `Content-Length` counts compressed ones. Telling the two
+  // apart by reading `Content-Encoding` works only same-origin: the header is
+  // not CORS-safelisted, so a cross-origin reader is handed `null` whether or
+  // not the body is gzipped. Treating that `null` as "then Content-Length is the
+  // decoded size" is what made every compressed payload from `cellucid serve`
+  // abort the moment decoded bytes passed compressed ones —
+  // `Download loadedBytes 59240 exceeds totalBytes 55003`, and a dataset that
+  // never opened. The caller's declared length is the decoded size and needs no
+  // header at all, so on that path it wins.
   const contentEncoding = response.headers.get('content-encoding');
   const contentLength = response.headers.get('content-length');
-  const totalBytes = contentEncoding === null && contentLength !== null
-    ? Number(contentLength)
-    : null;
+  const transferIsAlreadyDecoded = url.endsWith('.gz');
+  let totalBytes = transferIsAlreadyDecoded ? null : expectedBytes;
   if (
-    totalBytes !== null &&
-    (!Number.isSafeInteger(totalBytes) || totalBytes < 0)
+    totalBytes === null &&
+    contentLength !== null &&
+    (transferIsAlreadyDecoded || contentEncoding === null)
   ) {
-    throw new Error(
-      `Invalid Content-Length for ${url}: ${contentLength}`
-    );
+    totalBytes = Number(contentLength);
+    if (!Number.isSafeInteger(totalBytes) || totalBytes < 0) {
+      throw new Error(
+        `Invalid Content-Length for ${url}: ${contentLength}`
+      );
+    }
   }
 
   // The bounded reader owns the transfer, so progress is reported from the
