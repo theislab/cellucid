@@ -3536,12 +3536,13 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
     const hpFrustumCulling = document.getElementById('hp-frustum-culling');
     const hpLodEnabled = document.getElementById('hp-lod-enabled');
 
-    // FPS monitoring and the live harness are one small, lazy runtime. The
-    // report and bottleneck analyzer remain a separate, explicitly requested
+    // FPS monitoring and synthetic generation form the small live runtime.
+    // The configuration-matrix harness publishes independently, while the
+    // report and bottleneck analyzer remain a third, explicitly requested
     // developer-support graph.
     let perfTracker = null;
-    // Off-thread synthetic generation and the one point-count rule, captured
-    // from the lazily loaded harness so the panel keeps its lazy boundary.
+    // Off-thread synthetic generation and its point-count rule are captured
+    // from their focused modules so the panel keeps a small lazy boundary.
     let generateSyntheticDataOffThread = null;
     let assertSyntheticCount = null;
     let benchmarkHarnessModule = null;
@@ -3572,9 +3573,6 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
           // `createBenchmarkHarness({ viewer, canvas })` reachable. Nothing in
           // the module runs on import; the harness instruments the GL context
           // only when it is explicitly created.
-          generateSyntheticDataOffThread =
-            harnessModule.generateSyntheticDataOffThread;
-          assertSyntheticCount = harnessModule.assertSyntheticCount;
           window._cellucidBenchmarkHarness = harnessModule;
           benchmarkHarnessModule = harnessModule;
           return harnessModule;
@@ -3597,24 +3595,39 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
     }
 
     // Load only the live panel runtime from user activation. In particular,
-    // this path must never await `dev/benchmark.js`: that monolith also owns
-    // report generation, analyzer code, GPU timers, GLB parsing and every
-    // synthetic generator. Parsing all of it on a native Firefox main thread
-    // that is already rendering smoke can indefinitely delay an otherwise
-    // healthy panel and its independently loaded harness.
+    // panel readiness must await neither the full measurement harness nor
+    // `dev/benchmark.js`: those graphs own matrix runners, report generation,
+    // analyzers and GPU instrumentation that live statistics and synthetic
+    // generation do not use. Parsing them on a native Firefox main thread that
+    // is already rendering smoke can indefinitely delay an otherwise healthy
+    // panel. The full harness is requested only after the small live runtime is
+    // ready, then publishes through its own independent readiness boundary.
     function ensureBenchmarkModule() {
-      if (benchmarkModuleLoaded) return Promise.resolve(true);
+      if (applicationRetired) return Promise.resolve(false);
+      if (benchmarkModuleLoaded) {
+        // A failed optional harness fetch resets its own task. A later panel
+        // activation must retry it without invalidating the healthy live UI.
+        void ensureBenchmarkHarnessModule();
+        return Promise.resolve(true);
+      }
       if (benchmarkModuleLoadTask !== null) return benchmarkModuleLoadTask;
 
       const loadTask = (async () => {
         try {
-          const [harnessModule, trackerModule] = await Promise.all([
-            ensureBenchmarkHarnessModule(),
-            import('./ui/modules/benchmark/performance-tracker.js'),
+          const [generationModule, generationContract, trackerModule] = await Promise.all([
+            import('./ui/modules/benchmark/generation.js'),
+            import('./ui/modules/benchmark/generation-contract.js'),
+            import('./ui/modules/benchmark/performance-tracker.js')
           ]);
-          if (harnessModule === null || applicationRetired) return false;
+          if (applicationRetired) return false;
+          generateSyntheticDataOffThread =
+            generationModule.generateSyntheticDataOffThread;
+          assertSyntheticCount = generationContract.assertSyntheticCount;
           perfTracker = new trackerModule.PerformanceTracker();
           benchmarkModuleLoaded = true;
+          // This optional developer entry point remains reachable from the
+          // panel, but it cannot hold live production controls hostage.
+          void ensureBenchmarkHarnessModule();
           debug.log('[Main] Live benchmark runtime lazy-loaded');
           return true;
         } catch (err) {
@@ -3931,9 +3944,10 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
         // `toggle` is a queued notification. A stressed native Firefox GPU
         // service can continue to render and service automation while delaying
         // that notification indefinitely. The summary's click is the actual
-        // user activation, so initiate both lazy module requests in this task.
-        // Once they settle, the browser's default action has already published
-        // the exact `open` state and this owner can reconcile it directly.
+        // user activation, so initiate the live module request in this task.
+        // It starts the independent harness request only after live readiness;
+        // once the live graph settles, the browser's default action has already
+        // published the exact `open` state and this owner can reconcile it.
         ensureBenchmarkModule().then(moduleLoaded => {
           if (!moduleLoaded || applicationRetired) return;
           publishBenchmarkPanelState();

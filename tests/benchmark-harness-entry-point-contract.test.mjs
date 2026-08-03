@@ -66,8 +66,18 @@ test('opening the benchmark panel publishes the harness module', () => {
   );
   assert.match(
     ensureLiveRuntime,
-    /Promise\.all\(\[[\s\S]*?ensureBenchmarkHarnessModule\(\)[\s\S]*?import\('\.\/ui\/modules\/benchmark\/performance-tracker\.js'\)/,
-    'the user activation must request only the harness and live tracker graphs'
+    /Promise\.all\(\[[\s\S]*?import\('\.\/ui\/modules\/benchmark\/generation\.js'\)[\s\S]*?import\('\.\/ui\/modules\/benchmark\/generation-contract\.js'\)[\s\S]*?import\('\.\/ui\/modules\/benchmark\/performance-tracker\.js'\)/,
+    'live readiness must request only generation and tracker graphs'
+  );
+  assert.ok(
+    ensureLiveRuntime.indexOf('benchmarkModuleLoaded = true') <
+      ensureLiveRuntime.lastIndexOf('void ensureBenchmarkHarnessModule()'),
+    'the full harness must start only after live panel readiness is published'
+  );
+  assert.match(
+    ensureLiveRuntime,
+    /if \(benchmarkModuleLoaded\) \{[\s\S]*?void ensureBenchmarkHarnessModule\(\);[\s\S]*?return Promise\.resolve\(true\);/,
+    'a later panel activation must retry an independently failed harness load'
   );
   assert.doesNotMatch(
     ensureLiveRuntime,

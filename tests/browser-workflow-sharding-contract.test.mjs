@@ -21,7 +21,7 @@ test('browser CI shards every engine with bounded process generations', async ()
   );
   assert.match(
     workflow,
-    /os: \[ubuntu-latest, macos-latest, windows-latest\]\n\s+browser: \[chromium, firefox, webkit\]\n\s+shard: \["1\/2", "2\/2"\]/,
+    /os: \[ubuntu-latest, macos-latest, windows-latest\]\n\s+browser: \[chromium, firefox, webkit\]\n\s+shard: \["1\/3", "2\/3", "3\/3"\]/,
   );
   assert.match(
     workflow,
@@ -68,11 +68,11 @@ test('browser CI shards every engine with bounded process generations', async ()
   // rather than once per shard.
   assert.match(
     workflow,
-    /if: matrix\.browser == 'firefox' && runner\.os == 'Linux' && matrix\.shard == '1\/2'[\s\S]*?tests\/browser\/webgl2-runtime\.spec\.mjs/,
+    /if: matrix\.browser == 'firefox' && runner\.os == 'Linux' && matrix\.shard == '1\/3'[\s\S]*?tests\/browser\/webgl2-runtime\.spec\.mjs/,
   );
   assert.match(
     workflow,
-    /if: matrix\.browser == 'firefox' && runner\.os != 'Linux' && matrix\.shard == '1\/2'[\s\S]*?tests\/browser\/webgl2-runtime\.spec\.mjs/,
+    /if: matrix\.browser == 'firefox' && runner\.os != 'Linux' && matrix\.shard == '1\/3'[\s\S]*?tests\/browser\/webgl2-runtime\.spec\.mjs/,
   );
   assert.doesNotMatch(
     workflow,

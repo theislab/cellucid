@@ -4,6 +4,9 @@ import { dismissWelcome } from './helpers/welcome.mjs';
 
 const CURRENT_UI_DATASET =
   '/tests/browser/fixtures/exports/current-ui-prepared/';
+const PROCESS_INTENSIVE = Object.freeze({
+  tag: '@browser-process-intensive',
+});
 
 function createVelocityBytes(nCells) {
   const bytes = Buffer.alloc(
@@ -165,14 +168,17 @@ async function installVelocityFixture(page) {
 }
 
 async function advanceFrames(page, count) {
+  if (!Number.isSafeInteger(count) || count < 1) {
+    throw new RangeError('Velocity audit frame count must be a positive integer.');
+  }
   await page.evaluate(frameCount => new Promise(resolve => {
     let remaining = frameCount;
     const advance = () => {
-      if (remaining <= 0) {
+      remaining -= 1;
+      if (remaining === 0) {
         resolve();
         return;
       }
-      remaining -= 1;
       requestAnimationFrame(advance);
     };
     requestAnimationFrame(advance);
@@ -189,6 +195,7 @@ async function readAudit(page) {
 
 test(
   'velocity owns exact all-hidden and multiview GPU generations in every pane',
+  PROCESS_INTENSIVE,
   async ({ page }) => {
     const productErrors = [];
     const browserDiagnostics = [];
@@ -245,7 +252,8 @@ test(
     ).toBeVisible();
 
     await resetAudit(page);
-    await advanceFrames(page, 4);
+    // Two consecutive frames are the complete ping-pong ownership cycle.
+    await advanceFrames(page, 2);
     const singleRecords = await readAudit(page);
     const singleSimulation = singleRecords.filter(
       record => record.role === 'simulate',
@@ -253,8 +261,8 @@ test(
     const singleParticles = singleRecords.filter(
       record => record.role === 'particles',
     );
-    expect(singleSimulation.length).toBeGreaterThanOrEqual(3);
-    expect(singleParticles.length).toBeGreaterThanOrEqual(3);
+    expect(singleSimulation.length).toBeGreaterThanOrEqual(2);
+    expect(singleParticles.length).toBeGreaterThanOrEqual(2);
     expect(new Set(singleSimulation.map(
       record => record.transformFeedbackBufferId,
     )).size).toBe(2);
@@ -274,7 +282,7 @@ test(
     // timeout so this proves the committed empty table, not only its fence.
     await page.waitForTimeout(750);
     await resetAudit(page);
-    await advanceFrames(page, 5);
+    await advanceFrames(page, 2);
     const hiddenRecords = await readAudit(page);
     expect(
       hiddenRecords.filter(record => record.role === 'simulate'),
@@ -290,9 +298,12 @@ test(
     await expect(page.locator('#filter-count')).toHaveText(
       'Showing all 120 points',
     );
+    // Accumulate real frames until the rebuilt generation renders. Resetting
+    // inside the poll discarded valid evidence and multiplied GPU work on a
+    // slow native renderer.
+    await resetAudit(page);
     await expect.poll(async () => {
-      await resetAudit(page);
-      await advanceFrames(page, 2);
+      await advanceFrames(page, 1);
       return (await readAudit(page)).filter(
         record => record.role === 'simulate',
       ).length;
@@ -302,9 +313,12 @@ test(
     await expect.poll(() => page.evaluate(() => (
       window._cellucidViewer.getSnapshotViews().map(view => view.id)
     ))).toEqual(['snap_1']);
+    // The two views expose four ping-pong owners over two or more frames. Keep
+    // the audit cumulative so every poll advances the proof instead of erasing
+    // it and starting another four-frame GPU window.
+    await resetAudit(page);
     await expect.poll(async () => {
-      await resetAudit(page);
-      await advanceFrames(page, 4);
+      await advanceFrames(page, 1);
       const records = await readAudit(page);
       return new Set(records.filter(
         record => record.role === 'simulate',
@@ -364,6 +378,7 @@ test(
 
 test(
   'velocity allocation failure settles once without poisoning the viewer loop',
+  PROCESS_INTENSIVE,
   async ({ page }) => {
     const productErrors = [];
     page.on('console', message => {
@@ -416,7 +431,9 @@ test(
     await expect(page.locator('.notification-error')).toContainText(
       'Velocity rendering stopped:',
     );
-    await advanceFrames(page, 5);
+    // Two completed viewer frames prove failure settlement across a full
+    // ping-pong cycle without adding unrelated GPU soak work.
+    await advanceFrames(page, 2);
 
     const viewerState = await page.locator('#glcanvas').evaluate(canvas => {
       const gl = canvas.getContext('webgl2');
@@ -438,6 +455,7 @@ test(
 
 test(
   'transient velocity initialization failure cleans up and retries on the same overlay',
+  PROCESS_INTENSIVE,
   async ({ page }) => {
     const productErrors = [];
     page.on('console', message => {
@@ -492,7 +510,7 @@ test(
     await expect(
       page.getByText('Velocity overlay ready', { exact: true }),
     ).toBeVisible();
-    await advanceFrames(page, 4);
+    await advanceFrames(page, 2);
 
     const glError = await page.locator('#glcanvas').evaluate(canvas => (
       canvas.getContext('webgl2').getError()

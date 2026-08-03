@@ -247,13 +247,15 @@ test('native-GPU stress files declare every test process-intensive', async () =>
   for (const filename of [
     'benchmark-harness-entry-point.spec.mjs',
     'benchmark-harness.spec.mjs',
+    'benchmark-runtime.spec.mjs',
     'edge-texture-publication.spec.mjs',
+    'velocity-multiview-lifecycle.spec.mjs',
   ]) {
     const source = await readFile(
       new URL(`./browser/${filename}`, import.meta.url),
       'utf8',
     );
-    const declarations = source.match(/^test\(/gm) ?? [];
+    const declarations = source.match(/^\s*test\(/gm) ?? [];
     const intensiveDeclarations = source.match(
       /,\s*PROCESS_INTENSIVE,\s*async\s*\(/g,
     ) ?? [];
@@ -302,8 +304,8 @@ test('browser batches bound file count, test weight, and process churn', () => {
   assert.equal(WINDOWS_MAX_TESTS_PER_BROWSER_PROCESS, 90);
   assert.equal(WINDOWS_MAX_BROWSER_PROCESSES_PER_SHARD, 2);
 
-  // Exact current largest-shard weights. Its eight process generations remain
-  // unchanged while each is now fenced by both file and test count.
+  // A deliberately near-capacity 45-file regression inventory proves eight
+  // ordinary process generations remain fenced by both file and test count.
   const testCounts = [
     4, 2, 1, 8, 5, 11,
     5, 2, 10, 2, 1, 2,
@@ -364,8 +366,8 @@ test('browser batches bound file count, test weight, and process churn', () => {
   // the four intensive edge-publication tests. A separate browser lifetime was
   // necessary but is not sufficient when the host GPU service outlives that
   // process, so the exact stress file is quarantined after every ordinary file.
-  // The 45-file shard remains capped at nine processes and every other runtime
-  // retains the eight-process plan above.
+  // This near-capacity inventory remains capped at nine processes and every
+  // non-vulnerable runtime retains the eight-process plan above.
   const isolatedInventory = inventory.map((item, index) => ({
     ...item,
     intensive: index === 0,
@@ -389,22 +391,22 @@ test('browser batches bound file count, test weight, and process churn', () => {
   );
 
   // macOS Firefox completed the twenty-cycle Plotly retirement soak but left
-  // the host GPU service degraded across every later Firefox process. The two
-  // benchmark harness owners therefore run after ordinary conformance and the
-  // analysis soak runs in the one host-terminal slot after both harnesses.
-  // Each remains a separate singleton generation.
+  // the host GPU service degraded across every later Firefox process. The live
+  // benchmark runtime and two harness owners therefore run after ordinary
+  // conformance, while the analysis soak runs in the one host-terminal slot
+  // after all three. This is the exact first-shard inventory under the declared
+  // three-way CI partition; each stress owner remains a singleton generation.
   const shardOneCounts = [
     8, 1, 7, 22, 1, 3,
     1, 2, 1, 5, 2, 12,
     3, 3, 3, 3, 2, 1,
-    2, 35, 4, 7, 8, 18,
-    4, 4, 4,
+    2, 35,
   ];
   const isolatedBenchmarkInventory = shardOneCounts.map(
     (tests, index) => inventoryItem(
       `tests/browser/shard-one-${index}.spec.mjs`,
       tests,
-      index === 3 || index === 8 || index === 9,
+      index === 3 || index === 8 || index === 9 || index === 10,
       index === 3,
     ),
   );
@@ -414,7 +416,7 @@ test('browser batches bound file count, test weight, and process churn', () => {
   );
   assert.deepEqual(
     isolatedBenchmarkBatches.map(batch => batch.files.length),
-    [6, 6, 4, 2, 4, 2, 1, 1, 1],
+    [6, 6, 4, 1, 1, 1, 1],
   );
 
   const windowsShardOneBatches = partitionBrowserShardInventory(
@@ -429,7 +431,7 @@ test('browser batches bound file count, test weight, and process churn', () => {
     })),
     [
       { files: 19, tests: 82 },
-      { files: 8, tests: 84 },
+      { files: 1, tests: 35 },
     ],
   );
   assert.deepEqual(
@@ -438,13 +440,14 @@ test('browser batches bound file count, test weight, and process churn', () => {
   );
   assert.deepEqual(
     isolatedBenchmarkBatches.map(batch => batch.testCount),
-    [21, 25, 8, 39, 37, 8, 1, 5, 22],
+    [21, 26, 40, 1, 5, 2, 22],
   );
   assert.deepEqual(
-    isolatedBenchmarkBatches.slice(-3).map(batch => batch.files),
+    isolatedBenchmarkBatches.slice(-4).map(batch => batch.files),
     [
       [isolatedBenchmarkInventory[8].file],
       [isolatedBenchmarkInventory[9].file],
+      [isolatedBenchmarkInventory[10].file],
       [isolatedBenchmarkInventory[3].file],
     ],
   );
@@ -454,6 +457,7 @@ test('browser batches bound file count, test weight, and process churn', () => {
       ...isolatedBenchmarkInventory.filter(item => !item.intensive),
       isolatedBenchmarkInventory[8],
       isolatedBenchmarkInventory[9],
+      isolatedBenchmarkInventory[10],
       isolatedBenchmarkInventory[3],
     ].map(item => item.file),
   );

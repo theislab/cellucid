@@ -11,6 +11,15 @@ const HARNESS_MODULE_PATH = '/assets/js/app/ui/modules/benchmark/index.js';
 const PERFORMANCE_TRACKER_MODULE_PATH =
   '/assets/js/app/ui/modules/benchmark/performance-tracker.js';
 const SUPPORT_MODULE_PATH = '/assets/js/dev/benchmark.js';
+const PROCESS_INTENSIVE = Object.freeze({
+  tag: '@browser-process-intensive',
+});
+const MINIMUM_SMOKE_COST_CONTROLS = Object.freeze([
+  'cloud-resolution',
+  'noise-resolution',
+  'smoke-grid',
+  'smoke-steps',
+]);
 
 test.describe.serial('GLB benchmark runtime publication', () => {
   let context = null;
@@ -108,7 +117,7 @@ test.describe.serial('GLB benchmark runtime publication', () => {
     }
   });
 
-  test('the real benchmark panel becomes ready from smoke mode', async () => {
+  test('the real benchmark panel becomes ready from smoke mode', PROCESS_INTENSIVE, async () => {
     if (page === null || browserErrors === null) {
       throw new Error('GLB benchmark runtime owner was not initialized.');
     }
@@ -120,10 +129,24 @@ test.describe.serial('GLB benchmark runtime publication', () => {
         throw new Error('Renderer statistics are intentionally unavailable');
       };
     });
-    await page.locator('#smoke-grid').evaluate(input => {
-      input.value = '0';
-      input.dispatchEvent(new Event('input', { bubbles: true }));
-    });
+    // This is a module-publication contract, not a smoke throughput test. Use
+    // every real minimum-cost control: grid size bounds density construction,
+    // while ray steps and offscreen resolution bound the full-screen work that
+    // otherwise monopolizes a software/native Firefox main thread. The old
+    // test changed only grid size, which does not reduce fragment count.
+    await page.evaluate(controlIds => {
+      for (const id of controlIds) {
+        const input = document.getElementById(id);
+        if (!(input instanceof HTMLInputElement)) {
+          throw new Error(`Missing smoke cost control: ${id}`);
+        }
+        input.value = '0';
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+      }
+    }, MINIMUM_SMOKE_COST_CONTROLS);
+    for (const id of MINIMUM_SMOKE_COST_CONTROLS) {
+      await expect(page.locator(`#${id}`)).toHaveValue('0');
+    }
     await page.locator('#render-mode').selectOption('smoke');
     await expect(page.locator('#render-mode')).toHaveValue('smoke');
     await expect(page.locator('#smoke-controls')).toHaveClass(/visible/);
@@ -132,27 +155,26 @@ test.describe.serial('GLB benchmark runtime publication', () => {
 
     await page.locator('#benchmark-section > summary').click();
     await expect(page.locator('#benchmark-section')).toHaveAttribute('open', '');
-    // The published module namespace is the production readiness boundary.
-    // A debug-console message is observability, not a synchronization API, and
-    // its delivery lagged behind the ready panel on hosted Firefox.
+    // Visible live statistics are the production readiness boundary. The
+    // configuration-matrix harness has a separate reachability suite and must
+    // not hold this UI or synthetic generation hostage while its larger graph
+    // is parsed. Its request still starts exactly once from the same activation.
+    await expect(page.locator('#benchmark-stats')).toBeVisible();
+    await expect(page.locator('#bench-points')).toHaveText('120');
     await expect.poll(async () => ({
       browserErrors: [...browserErrors],
       harnessModuleRequests,
       performanceTrackerModuleRequests,
-      publishedType: await page.evaluate(
-        () => typeof window._cellucidBenchmarkHarness
-      ),
       supportModuleRequests,
     })).toEqual({
       browserErrors: [],
       harnessModuleRequests: 1,
       performanceTrackerModuleRequests: 1,
-      publishedType: 'object',
       supportModuleRequests: 0,
     });
   });
 
-  test('GLB benchmark publishes one complete state generation', async ({}, testInfo) => {
+  test('GLB benchmark publishes one complete state generation', PROCESS_INTENSIVE, async ({}, testInfo) => {
     if (
       page === null ||
       browserErrors === null ||

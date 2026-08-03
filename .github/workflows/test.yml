@@ -52,7 +52,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
         browser: [chromium, firefox, webkit]
-        shard: ["1/2", "2/2"]
+        shard: ["1/3", "2/3", "3/3"]
 
     steps:
       - name: Check out the exact source
@@ -76,7 +76,7 @@ jobs:
         run: npx playwright install ${{ matrix.browser }}
 
       - name: Verify Firefox WebGL2 through the Linux display server
-        if: matrix.browser == 'firefox' && runner.os == 'Linux' && matrix.shard == '1/2'
+        if: matrix.browser == 'firefox' && runner.os == 'Linux' && matrix.shard == '1/3'
         run: >-
           xvfb-run --auto-servernum --
           npm run test:browser --
@@ -85,7 +85,7 @@ jobs:
           tests/browser/webgl2-runtime.spec.mjs
 
       - name: Verify Firefox WebGL2 on macOS and Windows
-        if: matrix.browser == 'firefox' && runner.os != 'Linux' && matrix.shard == '1/2'
+        if: matrix.browser == 'firefox' && runner.os != 'Linux' && matrix.shard == '1/3'
         run: >-
           npm run test:browser --
           --project=firefox
