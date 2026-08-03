@@ -94,15 +94,17 @@ jobs:
       # A process per whole shard retained native GPU state long enough to
       # degrade hosted macOS Firefox. A process per file then exhausted Windows
       # networking resources late in the larger shards. Preserve Playwright's
-      # exact assignment while bounding all dimensions: each ordinary child
-      # owns at most six files and forty tests. A browser-process boundary is
-      # not a host-GPU boundary, so vulnerable runtimes run process-isolated
-      # stress after ordinary conformance and the one workload proven to degrade
-      # the shared host GPU service in an absolute-final singleton. Multiple
-      # host-terminal files are rejected so future stress growth must use
-      # separate CI shards. Even those largest shards are capped at nine real
-      # browsers. Tests are neither retried nor skipped, mocked, or given more
-      # time.
+      # exact assignment while bounding all dimensions. Ordinary native-GPU
+      # lifetimes own at most six files and forty tests. Windows instead owns at
+      # most two longer-lived processes of twenty-four files and ninety tests,
+      # preventing browser/server churn from exhausting the host WinSock pool.
+      # A browser-process boundary is not a host-GPU boundary, so vulnerable
+      # runtimes run process-isolated stress after ordinary conformance and the
+      # one workload proven to degrade the shared host GPU service in an
+      # absolute-final singleton. Multiple host-terminal files are rejected so
+      # future stress growth must use separate CI shards. Even those largest
+      # shards are capped at nine real browsers. Tests are neither retried nor
+      # skipped, mocked, or given more time.
       - name: Run the selected headed Firefox shard in bounded processes
         if: matrix.browser == 'firefox' && runner.os == 'Linux'
         run: >-

@@ -21,11 +21,15 @@ const MAX_CAPTURE_BYTES = 64 * 1024 * 1024;
 
 // A process per whole shard retained native GPU state long enough to degrade
 // hosted macOS Firefox. A process per file fixed that but exhausted WinSock
-// resources late in 41-file Windows shards. File count alone is not a lifetime
-// bound: one six-file group can contain 74 tests while another contains 12.
-// Bound every ordinary lifetime dimension: no browser owns more than six files
-// or forty tests. A small number of tests deliberately exercise repeated native
-// GPU allocation/rollback generations or instrument and drive measured frame
+// resources late in Windows shards. Those are opposing host-level limits, not
+// one universal batch size. On ordinary and native-GPU-vulnerable hosts, bound
+// every browser lifetime to six files and forty tests. Windows instead keeps a
+// shard to two longer-lived browser generations, each capped at twenty-four
+// files and ninety tests, so connections are reused inside the browser rather
+// than retiring enough network processes to exhaust the host socket pool.
+//
+// A small number of tests deliberately exercise repeated native GPU
+// allocation/rollback generations or instrument and drive measured frame
 // windows; vulnerable hosted native GPU processes must run each containing file
 // in its own process because they retain enough state to degrade or crash the
 // next unrelated page. A browser-process boundary alone is not a host-GPU
@@ -38,17 +42,33 @@ const MAX_CAPTURE_BYTES = 64 * 1024 * 1024;
 // no ordering on one host can isolate the second from the first. Even with those
 // declared isolation boundaries, no shard may launch more than nine browsers.
 // A growing inventory must add another CI shard (or split an oversized spec)
-// instead of silently weakening a resource fence.
+// instead of silently weakening either host resource fence.
 export const MAX_FILES_PER_BROWSER_PROCESS = 6;
 export const MAX_TESTS_PER_BROWSER_PROCESS = 40;
 export const MAX_ORDINARY_BROWSER_PROCESSES_PER_SHARD = 8;
 export const MAX_BROWSER_PROCESSES_PER_SHARD = 9;
+export const WINDOWS_MAX_FILES_PER_BROWSER_PROCESS = 24;
+export const WINDOWS_MAX_TESTS_PER_BROWSER_PROCESS = 90;
+export const WINDOWS_MAX_BROWSER_PROCESSES_PER_SHARD = 2;
 // Playwright requires `@browser-process-intensive` at declaration time and its
 // JSON reporter publishes the normalized tag without the leading `@`.
 export const PROCESS_INTENSIVE_REPORT_TAG = 'browser-process-intensive';
 // A host-terminal file is also process-intensive, but it has a stronger
 // ordering contract: no browser test may run after it on a vulnerable host.
 export const HOST_GPU_TERMINAL_REPORT_TAG = 'browser-host-gpu-terminal';
+
+const DEFAULT_BROWSER_SHARD_LIMITS = Object.freeze({
+  maxFilesPerProcess: MAX_FILES_PER_BROWSER_PROCESS,
+  maxOrdinaryProcessesPerShard: MAX_ORDINARY_BROWSER_PROCESSES_PER_SHARD,
+  maxProcessesPerShard: MAX_BROWSER_PROCESSES_PER_SHARD,
+  maxTestsPerProcess: MAX_TESTS_PER_BROWSER_PROCESS,
+});
+const WINDOWS_BROWSER_SHARD_LIMITS = Object.freeze({
+  maxFilesPerProcess: WINDOWS_MAX_FILES_PER_BROWSER_PROCESS,
+  maxOrdinaryProcessesPerShard: WINDOWS_MAX_BROWSER_PROCESSES_PER_SHARD,
+  maxProcessesPerShard: WINDOWS_MAX_BROWSER_PROCESSES_PER_SHARD,
+  maxTestsPerProcess: WINDOWS_MAX_TESTS_PER_BROWSER_PROCESS,
+});
 
 function readOption(argument, name) {
   const prefix = `--${name}=`;
@@ -342,6 +362,78 @@ export function shouldIsolateProcessIntensiveFiles(
 }
 
 /**
+ * Select the resource fence owned by the host, independently of the browser
+ * engine. GitHub publishes RUNNER_OS; process.platform is the exact local
+ * fallback used by contributors and self-hosted runs.
+ *
+ * @param {Record<string, string | undefined>} environment
+ * @param {NodeJS.Platform} [platform]
+ * @returns {Readonly<{
+ *   maxFilesPerProcess: number,
+ *   maxOrdinaryProcessesPerShard: number,
+ *   maxProcessesPerShard: number,
+ *   maxTestsPerProcess: number,
+ * }>}
+ */
+export function resolveBrowserShardLimits(
+  environment,
+  platform = process.platform,
+) {
+  if (environment === null || typeof environment !== 'object') {
+    throw new TypeError('Browser shard environment must be an object.');
+  }
+  if (typeof platform !== 'string' || platform === '') {
+    throw new TypeError('Browser shard platform must be a non-empty string.');
+  }
+  const runnerOs = environment.RUNNER_OS;
+  if (runnerOs !== undefined && typeof runnerOs !== 'string') {
+    throw new TypeError('RUNNER_OS must be a string when supplied.');
+  }
+  const windows = runnerOs === undefined
+    ? platform === 'win32'
+    : runnerOs === 'Windows';
+  return windows
+    ? WINDOWS_BROWSER_SHARD_LIMITS
+    : DEFAULT_BROWSER_SHARD_LIMITS;
+}
+
+function assertBrowserShardLimits(limits) {
+  const keys = limits !== null && typeof limits === 'object'
+    ? Reflect.ownKeys(limits)
+    : [];
+  const expectedKeys = [
+    'maxFilesPerProcess',
+    'maxOrdinaryProcessesPerShard',
+    'maxProcessesPerShard',
+    'maxTestsPerProcess',
+  ];
+  if (
+    limits === null ||
+    typeof limits !== 'object' ||
+    Array.isArray(limits) ||
+    keys.length !== expectedKeys.length ||
+    expectedKeys.some(key => !keys.includes(key)) ||
+    keys.some(key => {
+      const descriptor = Object.getOwnPropertyDescriptor(limits, key);
+      return descriptor === undefined ||
+        descriptor.enumerable !== true ||
+        !Object.hasOwn(descriptor, 'value') ||
+        !Number.isSafeInteger(descriptor.value) ||
+        descriptor.value < 1;
+    }) ||
+    limits.maxOrdinaryProcessesPerShard > limits.maxProcessesPerShard ||
+    limits.maxProcessesPerShard > MAX_BROWSER_PROCESSES_PER_SHARD ||
+    !Number.isSafeInteger(
+      limits.maxFilesPerProcess * limits.maxProcessesPerShard,
+    )
+  ) {
+    throw new TypeError(
+      'Browser shard limits must contain positive safe file, test, ordinary-process, and absolute-process bounds.',
+    );
+  }
+}
+
+/**
  * Partition one exact Playwright shard without allowing file count, test
  * weight, or process churn to become unbounded. Vulnerable native-GPU runs
  * preserve relative order inside the ordinary and intensive inventories but
@@ -357,6 +449,12 @@ export function shouldIsolateProcessIntensiveFiles(
  *   tests: number,
  * }>} inventory
  * @param {boolean} [isolateProcessIntensiveFiles]
+ * @param {Readonly<{
+ *   maxFilesPerProcess: number,
+ *   maxOrdinaryProcessesPerShard: number,
+ *   maxProcessesPerShard: number,
+ *   maxTestsPerProcess: number,
+ * }>} [limits]
  * @returns {ReadonlyArray<Readonly<{
  *   files: ReadonlyArray<string>,
  *   testCount: number,
@@ -364,7 +462,8 @@ export function shouldIsolateProcessIntensiveFiles(
  */
 export function partitionBrowserShardInventory(
   inventory,
-  isolateProcessIntensiveFiles = false
+  isolateProcessIntensiveFiles = false,
+  limits = DEFAULT_BROWSER_SHARD_LIMITS,
 ) {
   if (!Array.isArray(inventory) || inventory.length === 0) {
     throw new TypeError(
@@ -376,6 +475,7 @@ export function partitionBrowserShardInventory(
       'Process-intensive browser isolation must be a boolean.'
     );
   }
+  assertBrowserShardLimits(limits);
   for (const item of inventory) {
     const itemKeys = item !== null && typeof item === 'object'
       ? Reflect.ownKeys(item)
@@ -408,10 +508,10 @@ export function partitionBrowserShardInventory(
         'Every bounded browser shard item must contain one file, host-terminal and intensive flags, and a positive safe test count.'
       );
     }
-    if (item.tests > MAX_TESTS_PER_BROWSER_PROCESS) {
+    if (item.tests > limits.maxTestsPerProcess) {
       throw new RangeError(
         `${item.file} owns ${item.tests} tests, exceeding the per-process ` +
-          `maximum of ${MAX_TESTS_PER_BROWSER_PROCESS}; split the spec file.`,
+          `maximum of ${limits.maxTestsPerProcess}; split the spec file.`,
       );
     }
   }
@@ -424,9 +524,9 @@ export function partitionBrowserShardInventory(
     isolateProcessIntensiveFiles &&
     inventory.some(item => item.intensive);
   const processCapacity = hasIntensiveIsolation
-    ? MAX_BROWSER_PROCESSES_PER_SHARD
-    : MAX_ORDINARY_BROWSER_PROCESSES_PER_SHARD;
-  const fileCapacity = MAX_FILES_PER_BROWSER_PROCESS * processCapacity;
+    ? limits.maxProcessesPerShard
+    : limits.maxOrdinaryProcessesPerShard;
+  const fileCapacity = limits.maxFilesPerProcess * processCapacity;
   if (inventory.length > fileCapacity) {
     throw new RangeError(
       `Browser shard assigns ${inventory.length} files, exceeding the bounded ` +
@@ -463,10 +563,10 @@ export function partitionBrowserShardInventory(
   }
   for (const item of ordinaryInventory) {
     if (
-      batchFiles.length === MAX_FILES_PER_BROWSER_PROCESS ||
+      batchFiles.length === limits.maxFilesPerProcess ||
       (
         batchFiles.length > 0 &&
-        batchTestCount + item.tests > MAX_TESTS_PER_BROWSER_PROCESS
+        batchTestCount + item.tests > limits.maxTestsPerProcess
       )
     ) {
       publishBatch();
@@ -572,12 +672,14 @@ export function runBoundedBrowserShard(
 ) {
   const report = listShard(project, shard, headed, environment);
   const inventory = extractBoundedShardInventory(report, project);
+  const limits = resolveBrowserShardLimits(environment);
   const isolateProcessIntensiveFiles =
     shouldIsolateProcessIntensiveFiles(project, environment) &&
     inventory.some(item => item.intensive);
   const batches = partitionBrowserShardInventory(
     inventory,
-    isolateProcessIntensiveFiles
+    isolateProcessIntensiveFiles,
+    limits,
   );
   const portPlan = planBrowserBatchPorts(environment, batches.length);
   const fileCount = inventory.length;
@@ -590,6 +692,9 @@ export function runBoundedBrowserShard(
       `${batches.length} bounded browser processes` +
       `${isolateProcessIntensiveFiles
         ? ' with process- and host-terminal native-GPU isolation'
+        : ''}` +
+      `${limits === WINDOWS_BROWSER_SHARD_LIMITS
+        ? ' under the Windows low-churn network budget'
         : ''}.`,
   );
   batches.forEach((batch, index) => {

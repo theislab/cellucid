@@ -1,10 +1,10 @@
 /**
  * @fileoverview Full-window frame recorder with honest tail statistics.
  *
- * The live `PerformanceTracker` in `dev/benchmark.js` keeps a rolling window of
- * 120 samples, which is the right shape for an on-screen frame-rate readout and
- * the wrong shape for a tail measurement: a "p99" taken from 120 samples is the
- * second-worst frame of a two-second window, not a p99. This recorder keeps
+ * The live `PerformanceTracker` in `performance-tracker.js` keeps a rolling
+ * window of 120 samples, which is the right shape for an on-screen frame-rate
+ * readout and the wrong shape for a tail measurement: a "p99" from 120 samples
+ * is the second-worst frame of a two-second window, not a p99. This recorder keeps
  * every frame of the measurement window instead, and refuses to print a
  * percentile it cannot support.
  *

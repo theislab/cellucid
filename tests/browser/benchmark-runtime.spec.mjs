@@ -8,6 +8,9 @@ import { dismissWelcome } from './helpers/welcome.mjs';
 
 const VIEWPORT = { width: 1440, height: 1000 };
 const HARNESS_MODULE_PATH = '/assets/js/app/ui/modules/benchmark/index.js';
+const PERFORMANCE_TRACKER_MODULE_PATH =
+  '/assets/js/app/ui/modules/benchmark/performance-tracker.js';
+const SUPPORT_MODULE_PATH = '/assets/js/dev/benchmark.js';
 
 test.describe.serial('GLB benchmark runtime publication', () => {
   let context = null;
@@ -19,6 +22,8 @@ test.describe.serial('GLB benchmark runtime publication', () => {
   let workerReleased = false;
   let workerRequests = 0;
   let harnessModuleRequests = 0;
+  let performanceTrackerModuleRequests = 0;
+  let supportModuleRequests = 0;
 
   function releaseWorkerOnce() {
     if (workerReleased) return;
@@ -49,8 +54,13 @@ test.describe.serial('GLB benchmark runtime publication', () => {
       await route.continue();
     });
     page.on('request', request => {
-      if (new URL(request.url()).pathname === HARNESS_MODULE_PATH) {
+      const pathname = new URL(request.url()).pathname;
+      if (pathname === HARNESS_MODULE_PATH) {
         harnessModuleRequests += 1;
+      } else if (pathname === PERFORMANCE_TRACKER_MODULE_PATH) {
+        performanceTrackerModuleRequests += 1;
+      } else if (pathname === SUPPORT_MODULE_PATH) {
+        supportModuleRequests += 1;
       }
     });
     page.on('console', message => {
@@ -82,6 +92,8 @@ test.describe.serial('GLB benchmark runtime publication', () => {
     // operation that the test is not intended to cover.
     await expect(page.locator('#benchmark-run')).toBeEnabled();
     expect(harnessModuleRequests).toBe(0);
+    expect(performanceTrackerModuleRequests).toBe(0);
+    expect(supportModuleRequests).toBe(0);
     expect(
       await page.evaluate(() => typeof window._cellucidBenchmarkHarness)
     ).toBe('undefined');
@@ -126,13 +138,17 @@ test.describe.serial('GLB benchmark runtime publication', () => {
     await expect.poll(async () => ({
       browserErrors: [...browserErrors],
       harnessModuleRequests,
+      performanceTrackerModuleRequests,
       publishedType: await page.evaluate(
         () => typeof window._cellucidBenchmarkHarness
       ),
+      supportModuleRequests,
     })).toEqual({
       browserErrors: [],
       harnessModuleRequests: 1,
+      performanceTrackerModuleRequests: 1,
       publishedType: 'object',
+      supportModuleRequests: 0,
     });
   });
 

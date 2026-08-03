@@ -10,10 +10,14 @@ import {
   MAX_ORDINARY_BROWSER_PROCESSES_PER_SHARD,
   MAX_TESTS_PER_BROWSER_PROCESS,
   PROCESS_INTENSIVE_REPORT_TAG,
+  WINDOWS_MAX_BROWSER_PROCESSES_PER_SHARD,
+  WINDOWS_MAX_FILES_PER_BROWSER_PROCESS,
+  WINDOWS_MAX_TESTS_PER_BROWSER_PROCESS,
   extractBoundedShardInventory,
   parseBoundedShardArguments,
   partitionBrowserShardInventory,
   planBrowserBatchPorts,
+  resolveBrowserShardLimits,
   shouldIsolateProcessIntensiveFiles,
 } from '../scripts/run-browser-shard-bounded.mjs';
 
@@ -201,6 +205,44 @@ test('process-intensive isolation is limited to vulnerable native runtimes', () 
   );
 });
 
+test('Windows receives a two-generation host-network budget', () => {
+  const windowsLimits = resolveBrowserShardLimits(
+    { RUNNER_OS: 'Windows' },
+    'darwin',
+  );
+  assert.deepEqual(windowsLimits, {
+    maxFilesPerProcess: 24,
+    maxOrdinaryProcessesPerShard: 2,
+    maxProcessesPerShard: 2,
+    maxTestsPerProcess: 90,
+  });
+  assert.ok(Object.isFrozen(windowsLimits));
+  assert.strictEqual(
+    resolveBrowserShardLimits({}, 'win32'),
+    windowsLimits,
+  );
+
+  const ordinaryLimits = resolveBrowserShardLimits(
+    { RUNNER_OS: 'Linux' },
+    'win32',
+  );
+  assert.deepEqual(ordinaryLimits, {
+    maxFilesPerProcess: 6,
+    maxOrdinaryProcessesPerShard: 8,
+    maxProcessesPerShard: 9,
+    maxTestsPerProcess: 40,
+  });
+  assert.notStrictEqual(ordinaryLimits, windowsLimits);
+  assert.throws(
+    () => resolveBrowserShardLimits({ RUNNER_OS: 42 }, 'linux'),
+    /RUNNER_OS must be a string/,
+  );
+  assert.throws(
+    () => resolveBrowserShardLimits({}, ''),
+    /platform must be a non-empty string/,
+  );
+});
+
 test('native-GPU stress files declare every test process-intensive', async () => {
   for (const filename of [
     'benchmark-harness-entry-point.spec.mjs',
@@ -256,6 +298,9 @@ test('browser batches bound file count, test weight, and process churn', () => {
   assert.equal(MAX_TESTS_PER_BROWSER_PROCESS, 40);
   assert.equal(MAX_ORDINARY_BROWSER_PROCESSES_PER_SHARD, 8);
   assert.equal(MAX_BROWSER_PROCESSES_PER_SHARD, 9);
+  assert.equal(WINDOWS_MAX_FILES_PER_BROWSER_PROCESS, 24);
+  assert.equal(WINDOWS_MAX_TESTS_PER_BROWSER_PROCESS, 90);
+  assert.equal(WINDOWS_MAX_BROWSER_PROCESSES_PER_SHARD, 2);
 
   // Exact current largest-shard weights. Its eight process generations remain
   // unchanged while each is now fenced by both file and test count.
@@ -289,6 +334,31 @@ test('browser batches bound file count, test weight, and process churn', () => {
   assert.ok(Object.isFrozen(batches));
   assert.ok(batches.every(batch => Object.isFrozen(batch)));
   assert.ok(batches.every(batch => Object.isFrozen(batch.files)));
+
+  // Windows previously reached an explicit net::ERR_NO_BUFFER_SPACE with a
+  // browser/server generation per file, and later missed the module bootstrap
+  // after the third of eight bounded generations. The same exact 45-file,
+  // 164-test inventory now reuses connections in two balanced lifetimes. Both
+  // file and test growth remain hard-fenced; exceeding either requires another
+  // CI shard instead of another Windows process on the same host.
+  const windowsLimits = resolveBrowserShardLimits({ RUNNER_OS: 'Windows' });
+  const windowsBatches = partitionBrowserShardInventory(
+    inventory,
+    false,
+    windowsLimits,
+  );
+  assert.deepEqual(
+    windowsBatches.map(batch => batch.files.length),
+    [22, 23],
+  );
+  assert.deepEqual(
+    windowsBatches.map(batch => batch.testCount),
+    [79, 85],
+  );
+  assert.deepEqual(
+    windowsBatches.flatMap(batch => batch.files),
+    inventory.map(item => item.file),
+  );
 
   // Linux WebKit's native GPU process crashed on the first ordinary test after
   // the four intensive edge-publication tests. A separate browser lifetime was
@@ -345,6 +415,26 @@ test('browser batches bound file count, test weight, and process churn', () => {
   assert.deepEqual(
     isolatedBenchmarkBatches.map(batch => batch.files.length),
     [6, 6, 4, 2, 4, 2, 1, 1, 1],
+  );
+
+  const windowsShardOneBatches = partitionBrowserShardInventory(
+    isolatedBenchmarkInventory,
+    false,
+    windowsLimits,
+  );
+  assert.deepEqual(
+    windowsShardOneBatches.map(batch => ({
+      files: batch.files.length,
+      tests: batch.testCount,
+    })),
+    [
+      { files: 19, tests: 82 },
+      { files: 8, tests: 84 },
+    ],
+  );
+  assert.deepEqual(
+    windowsShardOneBatches.flatMap(batch => batch.files),
+    isolatedBenchmarkInventory.map(item => item.file),
   );
   assert.deepEqual(
     isolatedBenchmarkBatches.map(batch => batch.testCount),
@@ -491,6 +581,19 @@ test('browser batches bound file count, test weight, and process churn', () => {
       tests: 1,
     }], true),
     /host-terminal and intensive flags/,
+  );
+  assert.throws(
+    () => partitionBrowserShardInventory(
+      [inventoryItem('valid.spec.mjs', 1)],
+      false,
+      {
+        maxFilesPerProcess: 6,
+        maxOrdinaryProcessesPerShard: 10,
+        maxProcessesPerShard: 10,
+        maxTestsPerProcess: 40,
+      },
+    ),
+    /Browser shard limits must contain positive safe/,
   );
 });
 

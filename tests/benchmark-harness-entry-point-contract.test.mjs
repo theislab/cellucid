@@ -15,6 +15,12 @@ import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import * as harness from '../assets/js/app/ui/modules/benchmark/index.js';
+import {
+  PerformanceTracker as LivePerformanceTracker,
+} from '../assets/js/app/ui/modules/benchmark/performance-tracker.js';
+import {
+  PerformanceTracker as PublicPerformanceTracker,
+} from '../assets/js/dev/benchmark.js';
 
 const MAIN_URL = new URL('../assets/js/app/main.js', import.meta.url);
 const INDEX_URL = new URL('../index.html', import.meta.url);
@@ -42,28 +48,47 @@ function functionBody(source, declaration) {
 }
 
 test('opening the benchmark panel publishes the harness module', () => {
-  const ensure = functionBody(mainSource, 'function ensureBenchmarkModule(');
+  const ensureHarness = functionBody(
+    mainSource,
+    'function ensureBenchmarkHarnessModule('
+  );
+  const ensureLiveRuntime = functionBody(
+    mainSource,
+    'function ensureBenchmarkModule('
+  );
+  const ensureSupport = functionBody(
+    mainSource,
+    'function ensureBenchmarkSupportModule('
+  );
   assert.ok(
-    ensure.includes(`import('${HARNESS_SPECIFIER}')`),
-    'ensureBenchmarkModule must import the harness module'
+    ensureHarness.includes(`import('${HARNESS_SPECIFIER}')`),
+    'ensureBenchmarkHarnessModule must import the harness module'
   );
   assert.match(
-    ensure,
-    /Promise\.all\(\[[\s\S]*?import\('\.\.\/dev\/benchmark\.js'\)[\s\S]*?import\('\.\/ui\/modules\/benchmark\/index\.js'\)/,
-    'the user activation must request both independent module graphs together'
+    ensureLiveRuntime,
+    /Promise\.all\(\[[\s\S]*?ensureBenchmarkHarnessModule\(\)[\s\S]*?import\('\.\/ui\/modules\/benchmark\/performance-tracker\.js'\)/,
+    'the user activation must request only the harness and live tracker graphs'
+  );
+  assert.doesNotMatch(
+    ensureLiveRuntime,
+    /dev\/benchmark\.js|ensureBenchmarkSupportModule/,
+    'live panel readiness must not wait for optional report or analyzer support'
   );
   assert.ok(
-    ensure.includes(`${HARNESS_GLOBAL} =`),
-    `ensureBenchmarkModule must publish ${HARNESS_GLOBAL}`
+    ensureSupport.includes("import('../dev/benchmark.js')"),
+    'the developer-support graph must retain its own explicit lazy owner'
+  );
+  assert.ok(
+    ensureHarness.includes(`${HARNESS_GLOBAL} =`),
+    `ensureBenchmarkHarnessModule must publish ${HARNESS_GLOBAL}`
   );
 
-  // The publication has to happen before the module is marked loaded, or a
-  // second caller can observe `benchmarkModuleLoaded` while the global is
-  // still absent.
+  // Publication is the harness owner's atomic readiness boundary. It must not
+  // be hidden behind tracker construction or the optional support graph.
   assert.ok(
-    ensure.indexOf(HARNESS_GLOBAL) <
-      ensure.indexOf('benchmarkModuleLoaded = true'),
-    'the harness must be published before the load flag is set'
+    ensureHarness.indexOf(HARNESS_GLOBAL) <
+      ensureHarness.indexOf('benchmarkHarnessModule = harnessModule'),
+    'the harness global must be published before the owner caches readiness'
   );
 
   // The Performance Benchmark panel is what triggers the lazy load, so the
@@ -96,10 +121,18 @@ test('opening the benchmark panel publishes the harness module', () => {
   );
 
   assert.match(
-    ensure,
+    ensureLiveRuntime,
     /if \(!loaded && benchmarkModuleLoadTask === loadTask\) \{\s*benchmarkModuleLoadTask = null;/,
     'a failed lazy load must be retryable from the next activation'
   );
+});
+
+test('the live tracker is the stable public PerformanceTracker', () => {
+  assert.strictEqual(PublicPerformanceTracker, LivePerformanceTracker);
+  const tracker = new LivePerformanceTracker({ warmupFrames: 0 });
+  assert.equal(typeof tracker.recordFrame, 'function');
+  assert.equal(typeof tracker.pause, 'function');
+  assert.equal(typeof tracker.resume, 'function');
 });
 
 test('the published module is the one the harness is created from', () => {

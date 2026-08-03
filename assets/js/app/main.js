@@ -3536,35 +3536,32 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
     const hpFrustumCulling = document.getElementById('hp-frustum-culling');
     const hpLodEnabled = document.getElementById('hp-lod-enabled');
 
-    // Performance tracker for FPS monitoring (lazy-loaded with benchmark module)
+    // FPS monitoring and the live harness are one small, lazy runtime. The
+    // report and bottleneck analyzer remain a separate, explicitly requested
+    // developer-support graph.
     let perfTracker = null;
-    let BenchmarkReporter = null;       // For report generation
     // Off-thread synthetic generation and the one point-count rule, captured
     // from the lazily loaded harness so the panel keeps its lazy boundary.
     let generateSyntheticDataOffThread = null;
     let assertSyntheticCount = null;
+    let benchmarkHarnessModule = null;
+    let benchmarkHarnessModuleLoadTask = null;
     let benchmarkModuleLoaded = false;
     let benchmarkModuleLoadTask = null;
+    let benchmarkSupportModule = null;
+    let benchmarkSupportModuleLoadTask = null;
 
-    // Lazy-load benchmark module when first needed
-    function ensureBenchmarkModule() {
-      if (benchmarkModuleLoaded) return Promise.resolve(true);
-      if (benchmarkModuleLoadTask !== null) return benchmarkModuleLoadTask;
+    function ensureBenchmarkHarnessModule() {
+      if (benchmarkHarnessModule !== null) {
+        return Promise.resolve(benchmarkHarnessModule);
+      }
+      if (benchmarkHarnessModuleLoadTask !== null) {
+        return benchmarkHarnessModuleLoadTask;
+      }
 
-      const loadTask = (async () => {
-        try {
-          // Start both independent module graphs from the user activation.
-          // Waiting for the reporter graph before requesting the harness made
-          // the harness depend on a later event-loop turn. Native Firefox can
-          // keep rendering smoke while indefinitely delaying that turn after a
-          // stressed GPU generation, even though the page itself remains live.
-          const [benchmarkModule, harnessModule] = await Promise.all([
-            import('../dev/benchmark.js'),
-            import('./ui/modules/benchmark/index.js'),
-          ]);
-          BenchmarkReporter = benchmarkModule.BenchmarkReporter;
-          const PerformanceTrackerClass = benchmarkModule.PerformanceTracker;
-          perfTracker = new PerformanceTrackerClass();
+      const loadTask = import('./ui/modules/benchmark/index.js').then(
+        harnessModule => {
+          if (applicationRetired) return null;
           // The configuration-matrix harness is the only thing that can sweep
           // LOD, culling and view count with per-frame upload counters, and it
           // had no entry point in the running app at all: the page is served
@@ -3574,17 +3571,54 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
           // namespace next to _cellucidViewer / _cellucidState is what makes
           // `createBenchmarkHarness({ viewer, canvas })` reachable. Nothing in
           // the module runs on import; the harness instruments the GL context
-          // only when it is explicitly created, so opening this panel does not
-          // put counters on the product's render path.
+          // only when it is explicitly created.
           generateSyntheticDataOffThread =
             harnessModule.generateSyntheticDataOffThread;
           assertSyntheticCount = harnessModule.assertSyntheticCount;
           window._cellucidBenchmarkHarness = harnessModule;
+          benchmarkHarnessModule = harnessModule;
+          return harnessModule;
+        },
+        error => {
+          console.error('[Main] Failed to load benchmark harness:', error);
+          return null;
+        }
+      );
+      benchmarkHarnessModuleLoadTask = loadTask;
+      void loadTask.then(harnessModule => {
+        if (
+          harnessModule === null &&
+          benchmarkHarnessModuleLoadTask === loadTask
+        ) {
+          benchmarkHarnessModuleLoadTask = null;
+        }
+      });
+      return loadTask;
+    }
+
+    // Load only the live panel runtime from user activation. In particular,
+    // this path must never await `dev/benchmark.js`: that monolith also owns
+    // report generation, analyzer code, GPU timers, GLB parsing and every
+    // synthetic generator. Parsing all of it on a native Firefox main thread
+    // that is already rendering smoke can indefinitely delay an otherwise
+    // healthy panel and its independently loaded harness.
+    function ensureBenchmarkModule() {
+      if (benchmarkModuleLoaded) return Promise.resolve(true);
+      if (benchmarkModuleLoadTask !== null) return benchmarkModuleLoadTask;
+
+      const loadTask = (async () => {
+        try {
+          const [harnessModule, trackerModule] = await Promise.all([
+            ensureBenchmarkHarnessModule(),
+            import('./ui/modules/benchmark/performance-tracker.js'),
+          ]);
+          if (harnessModule === null || applicationRetired) return false;
+          perfTracker = new trackerModule.PerformanceTracker();
           benchmarkModuleLoaded = true;
-          debug.log('[Main] Benchmark module lazy-loaded');
+          debug.log('[Main] Live benchmark runtime lazy-loaded');
           return true;
         } catch (err) {
-          console.error('[Main] Failed to load benchmark module:', err);
+          console.error('[Main] Failed to load live benchmark runtime:', err);
           return false;
         }
       })();
@@ -3595,6 +3629,40 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
       void loadTask.then(loaded => {
         if (!loaded && benchmarkModuleLoadTask === loadTask) {
           benchmarkModuleLoadTask = null;
+        }
+      });
+      return loadTask;
+    }
+
+    function ensureBenchmarkSupportModule() {
+      if (benchmarkSupportModule !== null) {
+        return Promise.resolve(benchmarkSupportModule);
+      }
+      if (benchmarkSupportModuleLoadTask !== null) {
+        return benchmarkSupportModuleLoadTask;
+      }
+
+      const loadTask = import('../dev/benchmark.js').then(
+        module => {
+          if (applicationRetired) return null;
+          benchmarkSupportModule = module;
+          return module;
+        },
+        error => {
+          console.error(
+            '[Main] Failed to load benchmark report and analyzer support:',
+            error
+          );
+          return null;
+        }
+      );
+      benchmarkSupportModuleLoadTask = loadTask;
+      void loadTask.then(module => {
+        if (
+          module === null &&
+          benchmarkSupportModuleLoadTask === loadTask
+        ) {
+          benchmarkSupportModuleLoadTask = null;
         }
       });
       return loadTask;
@@ -4217,17 +4285,28 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
     }
 
     async function generateSituationReport() {
-      // Ensure benchmark module is loaded
-      const moduleLoaded = await ensureBenchmarkModule();
-      if (!moduleLoaded || !BenchmarkReporter) {
-        console.warn('[Main] Benchmark module not loaded, cannot generate report');
+      const [runtimeLoaded, supportModule] = await Promise.all([
+        ensureBenchmarkModule(),
+        ensureBenchmarkSupportModule()
+      ]);
+      if (
+        !runtimeLoaded ||
+        typeof supportModule?.BenchmarkReporter !== 'function'
+      ) {
+        console.warn(
+          '[Main] Benchmark report support is unavailable; report not generated'
+        );
         notifications.error('Benchmark module not available', { category: 'benchmark' });
         return;
       }
 
       // Create benchmarkReporter lazily on first use
       if (!benchmarkReporter) {
-        benchmarkReporter = new BenchmarkReporter({ viewer, state, canvas });
+        benchmarkReporter = new supportModule.BenchmarkReporter({
+          viewer,
+          state,
+          canvas
+        });
       }
 
       // Show notification for report generation
@@ -4369,9 +4448,21 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
           return;
         }
 
-        await ensureBenchmarkModule();
-        const benchmarkModule = await import('../dev/benchmark.js');
-        const BottleneckAnalyzer = benchmarkModule.BottleneckAnalyzer;
+        const [runtimeLoaded, supportModule] = await Promise.all([
+          ensureBenchmarkModule(),
+          ensureBenchmarkSupportModule()
+        ]);
+        if (
+          !runtimeLoaded ||
+          typeof supportModule?.BottleneckAnalyzer !== 'function'
+        ) {
+          notifications.error(
+            'Benchmark analyzer is not available',
+            { category: 'benchmark' }
+          );
+          return;
+        }
+        const BottleneckAnalyzer = supportModule.BottleneckAnalyzer;
 
         const canvas = document.querySelector('canvas');
         const gl = canvas?.getContext('webgl2');
