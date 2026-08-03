@@ -3989,7 +3989,7 @@ test('public Zarr loading requires explicit UMAP and never substitutes another e
               ),
               { showProgress: false }
             ),
-            /requires an exact UMAP embedding/i
+            /requires a UMAP embedding in obsm/i
           );
           assert.equal(source.dirname, 'working.zarr');
           assert.equal(source.getAdapter(), workingAdapter);
@@ -4011,20 +4011,30 @@ test('public Zarr loading requires explicit UMAP and never substitutes another e
   }
 });
 
-test('Zarr metadata accepts only exact dimension-suffixed UMAP keys', async t => {
-  await t.test('an unsuffixed X_umap array is never shape-inferred', async () => {
+test('Zarr metadata resolves suffixed keys, and a plain X_umap by width', async t => {
+  await t.test('an unsuffixed X_umap array is read at its own column count', async () => {
     const loader = embeddingLoader({ key: 'X_umap' });
-    let shapeReads = 0;
-    loader.getEmbeddingShape = async () => {
-      shapeReads++;
+    const shapeReads = [];
+    loader.getEmbeddingShape = async key => {
+      shapeReads.push(key);
       return { shape: [2, 2], nDims: 2 };
     };
+    loader.hasConnectivities = async () => false;
+
+    const metadata = await loader.getDatasetMetadata();
+    assert.deepEqual(shapeReads, ['X_umap']);
+    assert.deepEqual(metadata.embeddings.available_dimensions, [2]);
+    assert.deepEqual(metadata.embeddings.obsm_keys, { '2d': 'X_umap' });
+  });
+
+  await t.test('an unsuffixed X_umap of an unreadable width is refused', async () => {
+    const loader = embeddingLoader({ key: 'X_umap' });
+    loader.getEmbeddingShape = async () => ({ shape: [2, 10], nDims: 10 });
 
     await assert.rejects(
       loader.getDatasetMetadata(),
-      /exact UMAP.*X_umap_1d.*X_umap_2d.*X_umap_3d/i
+      /X_umap_1d.*X_umap_2d.*X_umap_3d/i
     );
-    assert.equal(shapeReads, 0);
   });
 
   await t.test('an explicit key is resolved without alias metadata', async () => {

@@ -593,8 +593,9 @@ function assertRenderState(renderState, context) {
   }
   assertInteger(renderState.viewportWidth, `${context}.viewportWidth`, 1);
   assertInteger(renderState.viewportHeight, `${context}.viewportHeight`, 1);
-  // Multisampling is a property of the drawing buffer the user is looking at,
-  // published by `viewer.getGrantedAntialiasing()`. It travels with the render
+  // Multisampling is a property of the view the user is looking at, published by
+  // `viewer.getAntialiasing()` at the moment of the export — it is a live
+  // setting that also follows the dataset's size. It travels with the render
   // state because a raster that does not honour it is a different picture of
   // the same data — see `utils/webgl-point-rasterizer.js`.
   if (typeof renderState.antialias !== 'boolean') {

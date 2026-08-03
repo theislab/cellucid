@@ -1482,7 +1482,29 @@ export class VelocityOverlay extends OverlayBase {
         );
       }
       if (lod >= 0) {
-        const factor = lod >= 6 ? 0 : lod >= 3 ? 0.25 : lod >= 1 ? 0.5 : 1.0;
+        // Coarseness is measured from full detail, not from zero. LOD level 0 is
+        // the *coarsest* level and the last level is full detail, so comparing
+        // the raw level against ascending thresholds reads the ladder backwards:
+        // it awarded the full particle count to the coarsest level and disposed
+        // the overlay at full detail, which is the exact inverse of the
+        // documented behaviour ("the flow vanishes with the camera zoomed out").
+        if (typeof ctx.getLodLevelCount !== 'function') {
+          throw new TypeError(
+            'VelocityOverlay context getLodLevelCount() is required.'
+          );
+        }
+        const levelCount = ctx.getLodLevelCount();
+        if (!Number.isInteger(levelCount) || levelCount < 1) {
+          throw new RangeError(
+            'VelocityOverlay context LOD level count must be a positive integer.'
+          );
+        }
+        const stepsBelowFullDetail = levelCount - 1 - lod;
+        const factor = stepsBelowFullDetail >= 6
+          ? 0
+          : stepsBelowFullDetail >= 3
+            ? 0.25
+            : stepsBelowFullDetail >= 1 ? 0.5 : 1.0;
         targetCount = Math.floor(targetCount * factor);
       }
     }

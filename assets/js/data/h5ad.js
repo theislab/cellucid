@@ -39,7 +39,7 @@
 import { getNotificationCenter } from '../app/notification-center.js';
 import { buildCscFromCsr, getSparseColumn, toInt32Array, toFloat32Array } from './sparse-utils.js';
 import { DataSourceError, DataSourceErrorCode } from './data-source.js';
-import { BaseAnnDataAdapter } from './base-anndata-adapter.js';
+import { BaseAnnDataAdapter, UNSUFFIXED_EMBEDDING_KEY } from './base-anndata-adapter.js';
 import {
   requireCategoricalCategoryCount,
 } from './categorical-storage-contract.js';
@@ -3147,11 +3147,24 @@ export class H5adLoader {
       embeddingKeysByDimension[`${dim}d`] = key;
     }
 
+    // An object that declares no dimensional key, but carries the plain
+    // 'X_umap' that sc.tl.umap() writes, is read at the dimension its own
+    // column count states. This is the same rule the Python package applies,
+    // so one file opens the same way here and through `cellucid serve`.
+    if (availableDimensions.size === 0 && this._obsmKeys.includes(UNSUFFIXED_EMBEDDING_KEY)) {
+      const { nDims } = this.getEmbeddingShape(UNSUFFIXED_EMBEDDING_KEY);
+      if (nDims === 1 || nDims === 2 || nDims === 3) {
+        availableDimensions.add(nDims);
+        embeddingKeysByDimension[`${nDims}d`] = UNSUFFIXED_EMBEDDING_KEY;
+      }
+    }
+
     const availableDimensionsList = Array.from(availableDimensions);
     if (availableDimensionsList.length === 0) {
       throw new Error(
-        'No exact UMAP embedding found in obsm. Expected one or more of ' +
-        'X_umap_1d, X_umap_2d, or X_umap_3d. ' +
+        'No UMAP embedding this viewer can read was found in obsm. Expected one ' +
+        'or more of X_umap_1d, X_umap_2d, or X_umap_3d, or a plain X_umap of 1, ' +
+        '2, or 3 columns. ' +
         `Available obsm keys: ${this._obsmKeys.join(', ') || '(none)'}.`
       );
     }

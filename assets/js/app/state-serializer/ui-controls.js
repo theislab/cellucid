@@ -417,15 +417,19 @@ function dispatchControlEvent(id, element, type) {
 /**
  * Controls that describe the machine, not the session.
  *
- * `#hp-antialias` is stored in `localStorage` and read once, before the WebGL
- * context exists, because `antialias` is a context-creation attribute. Its
- * owner therefore persists on every `change` event - including the synthetic
- * one a restore dispatches.
+ * `#hp-antialias` is stored in `localStorage` because the preference describes
+ * the machine that is drawing rather than the view being described. Its owner
+ * therefore persists on every `change` event - including the synthetic one a
+ * restore dispatches.
  *
  * That made a session the last writer of a device preference. Every sample
  * publishes an advertised default state, so switching antialiasing off and
  * reloading re-applied the saved `on` and stored it, and the setting could
  * never stay off. A shared session did the same to whoever opened it.
+ *
+ * The stored preference also has a third state, `auto`, that a checkbox cannot
+ * express: replaying a captured tick would turn "let the dataset decide" into a
+ * choice the user never made.
  *
  * These are still captured, and still required to be present, so the published
  * presets stay valid and a control that disappears from the markup is still

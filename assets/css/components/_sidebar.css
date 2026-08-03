@@ -358,6 +358,29 @@
   background: var(--color-surface-secondary);
 }
 
+/*
+   Maturity tag — a small pill that says a control's selected option is not
+   finished. Built from the same tokens as `.split-badge-pill` so it reads as
+   part of the sidebar rather than as an alert, and toned with the warning
+   triple, which is defined per theme and therefore correct in light and dark
+   without a second rule.
+*/
+.maturity-tag {
+  flex: 0 0 auto;
+  font-family: var(--font-display);
+  font-size: var(--text-2xs);
+  font-weight: var(--font-weight-semibold);
+  line-height: 1.4;
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-wider);
+  padding: var(--space-px) var(--space-1-5);
+  border-radius: var(--radius-full);
+  border: var(--border-width-1) solid color-mix(in srgb, var(--color-warning) 45%, transparent);
+  background: var(--color-warning-soft);
+  color: var(--color-warning-text);
+  cursor: help;
+}
+
 .split-badge-remove {
   background: transparent;
   border-radius: var(--radius-full);

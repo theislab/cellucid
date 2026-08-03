@@ -4,7 +4,10 @@ import test from 'node:test';
 import {
   HighPerfRenderer,
 } from '../assets/js/rendering/high-perf-renderer.js';
-import { SpatialIndex } from '../assets/js/rendering/high-perf/spatial-index.js';
+import {
+  ADAPTIVE_LOD_POINT_BUDGET,
+  SpatialIndex,
+} from '../assets/js/rendering/high-perf/spatial-index.js';
 import {
   VelocityOverlay,
 } from '../assets/js/rendering/overlays/velocity/velocity-overlay.js';
@@ -13,16 +16,18 @@ const REDUCTION_FACTORS = Object.freeze([
   44, 35, 28, 23, 18, 14.5, 11.5, 9.3, 7.5,
   6, 4.8, 3.8, 3, 2.4, 1.95, 1.55, 1.25,
 ]);
-const LEGACY_INDEX_ORDER = Object.freeze([4, 6, 5, 7, 2, 3, 0, 1]);
-const LEGACY_INDEX_BYTES = Object.freeze([
-  4, 0, 0, 0,
-  6, 0, 0, 0,
-  5, 0, 0, 0,
-  7, 0, 0, 0,
-  2, 0, 0, 0,
-  3, 0, 0, 0,
+// The published hierarchical order for the eight-point fixture: Morton rank
+// read in bit-reversed order (ranks 0, 4, 2, 6, 1, 5, 3, 7 of the curve).
+const HIERARCHICAL_INDEX_ORDER = Object.freeze([0, 6, 1, 7, 4, 2, 5, 3]);
+const HIERARCHICAL_INDEX_BYTES = Object.freeze([
   0, 0, 0, 0,
+  6, 0, 0, 0,
   1, 0, 0, 0,
+  7, 0, 0, 0,
+  4, 0, 0, 0,
+  2, 0, 0, 0,
+  5, 0, 0, 0,
+  3, 0, 0, 0,
 ]);
 const LARGE_POINT_COUNT = 10001;
 const LARGE_REDUCED_COUNTS = Object.freeze([
@@ -150,7 +155,7 @@ test('reduced CPU LOD levels publish stable shared-prefix original-index views',
 
   for (let levelIndex = 0; levelIndex < REDUCTION_FACTORS.length; levelIndex++) {
     const level = levelsIdentity[levelIndex];
-    assert.deepEqual(Array.from(level.indices), LEGACY_INDEX_ORDER);
+    assert.deepEqual(Array.from(level.indices), HIERARCHICAL_INDEX_ORDER);
     assert.deepEqual(
       Array.from(
         new Uint8Array(
@@ -159,7 +164,7 @@ test('reduced CPU LOD levels publish stable shared-prefix original-index views',
           level.indices.byteLength,
         ),
       ),
-      LEGACY_INDEX_BYTES,
+      HIERARCHICAL_INDEX_BYTES,
     );
     assert.equal(Object.hasOwn(level, 'positions'), false);
     assert.equal(Object.hasOwn(level, 'colors'), false);
@@ -184,7 +189,7 @@ test('reduced CPU LOD levels publish stable shared-prefix original-index views',
 
   const hierarchicalOrder = spatialIndex._hierarchicalOrder;
   assert.ok(hierarchicalOrder instanceof Uint32Array);
-  assert.deepEqual(Array.from(hierarchicalOrder), LEGACY_INDEX_ORDER);
+  assert.deepEqual(Array.from(hierarchicalOrder), HIERARCHICAL_INDEX_ORDER);
   assert.equal(hierarchicalOrder.length, spatialIndex.pointCount);
   assert.equal(hierarchicalOrder.byteOffset, 0);
   assert.equal(new Set(indexIdentities).size, REDUCTION_FACTORS.length);
@@ -357,4 +362,73 @@ test('active full-detail LOD publishes null and velocity treats it as all cells'
       (_, index) => index,
     ),
   );
+});
+
+test('adaptive selection stops at the point budget instead of a fixed ratio', () => {
+  // A fixed reduction ratio is what made a large dataset unusable on `Auto`:
+  // the coarsest ladder step is 44x whatever the cell count, so pulling the
+  // camera back on 18.1M cells discarded 97.7% of them whether or not the frame
+  // needed it. Adaptive selection is bounded by a point budget instead, and the
+  // bound scales itself: a dataset already inside the budget is never reduced.
+  assert.equal(ADAPTIVE_LOD_POINT_BUDGET, 2_000_000);
+
+  const makeIndex = pointCount => {
+    const positions = new Float32Array(pointCount * 3);
+    for (let index = 0; index < pointCount; index++) {
+      positions[index * 3] = (index % 977) - 488;
+      positions[index * 3 + 1] = ((index * 31) % 1021) - 510;
+    }
+    return Object.assign(
+      Object.create(SpatialIndex.prototype),
+      {
+        bounds: {
+          minX: -512, maxX: 512, minY: -512, maxY: 512, minZ: 0, maxZ: 0,
+        },
+        dimensionLevel: 2,
+        pointCount,
+        positions,
+        _adaptiveMinimumLevel: 0,
+      },
+    );
+  };
+
+  // Under the budget: every level is admissible only at full detail, so the
+  // coarsest answer the selector can give is the whole cloud.
+  const small = makeIndex(4096);
+  small.lodLevels = small._generateLODLevels();
+  assert.equal(small._adaptiveMinimumLevel, small.lodLevels.length - 1);
+  assert.equal(small.lodLevels.at(-1).isFullDetail, true);
+  for (const distance of [0.1, 1, 3, 30]) {
+    assert.equal(
+      small.getLODLevel(distance, -1, 2),
+      small.lodLevels.length - 1,
+      `a ${small.pointCount}-point cloud must not be reduced at distance ${distance}`,
+    );
+  }
+
+  // Over the budget: the floor is the coarsest level still holding at least the
+  // budget, and no camera distance goes below it.
+  const large = makeIndex(3_000_000);
+  large.lodLevels = large._generateLODLevels();
+  const floorLevel = large._adaptiveMinimumLevel;
+  assert.ok(floorLevel > 0 && floorLevel < large.lodLevels.length - 1);
+  assert.ok(
+    large.lodLevels[floorLevel].pointCount >= ADAPTIVE_LOD_POINT_BUDGET,
+    'the floor level must hold at least the budget',
+  );
+  assert.ok(
+    large.lodLevels[floorLevel - 1].pointCount < ADAPTIVE_LOD_POINT_BUDGET,
+    'the floor must be the coarsest level that still holds the budget',
+  );
+  let previous = -1;
+  for (const distance of [0.1, 1, 2, 3, 10, 100]) {
+    previous = large.getLODLevel(distance, previous, 2);
+    assert.ok(
+      previous >= floorLevel,
+      `distance ${distance} selected level ${previous} below the floor ${floorLevel}`,
+    );
+  }
+  // Hysteresis must not be able to walk below the floor either, even when a
+  // restored session hands in a coarser previous level.
+  assert.ok(large.getLODLevel(100, 0, 2) >= floorLevel);
 });

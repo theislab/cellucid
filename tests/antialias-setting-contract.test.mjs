@@ -1,30 +1,30 @@
 /**
- * Antialiasing is a user setting, and it is the one render setting that cannot
- * take effect while the page is open (CEL-0213).
+ * Antialiasing is a live render setting whose default comes from the dataset
+ * (CEL-0213).
  *
- * `antialias` is a WebGL context-creation attribute. `rendering/viewer.js` fixes
- * it in its single `getContext('webgl2', …)` call and nothing can change it
- * afterwards; Cellucid has no live context-rebuild path by design, because a
- * lost context is treated as terminal and the user is told to reload. So the
- * setting is a stored preference, read once before the viewer is built, and the
- * control has to say on screen that it applies on the next load. A setting that
- * silently does nothing until reload is worse than one that says so.
+ * It was neither of those things. `antialias` is a WebGL context-creation
+ * attribute, `rendering/viewer.js` fixed it in its single `getContext` call, and
+ * Cellucid has no path to a second context — so the setting was a stored
+ * preference read once before the viewer existed, and the control told the user
+ * it applied on the next load. That was honest about the constraint and wrong
+ * about the product: multisampling is the difference between a view that turns
+ * and one that does not at millions of cells, costs nothing worth measuring at a
+ * few thousand, and datasets are switched in place with no reload, so the right
+ * answer changes while the page is open.
  *
- * Three separate things could break that and each is held here:
+ * `rendering/scene-msaa-target.js` moved multisampling into a renderbuffer the
+ * application owns and blits, so the drawing buffer is single-sampled and the
+ * app owns the switch. Four things are held here:
  *
- *   - the preference could stop reaching the context — `main.js` must read it
- *     and `viewer.js` must request what it is given rather than a literal, and
- *     a stored value neither form matches must be discarded and reported rather
- *     than failing every load with no way back;
- *   - the control could stop reaching the preference — a restored session
- *     publishes by dispatching the control's own event, so `render-controls.js`
- *     must own a listener that exists before the bootstrap restores anything
- *     (the CEL-0129 shape), and a click before that listener exists must not be
- *     accepted (the CEL-0121 shape);
- *   - the control could stop telling the truth — the pending notice must track
- *     the viewer's own context attribute, and a browser that refuses
- *     multisampling must be reported as a refusal rather than as a pending
- *     reload that would never resolve.
+ *   - the preference has three states, not two, and the third is `auto` — which
+ *     is what an absent key means, and what defers to the cell count;
+ *   - the viewer must not take antialiasing as a construction argument, and must
+ *     not create a multisampled drawing buffer, or the old constraint returns;
+ *   - the control must publish to the viewer rather than only to storage, and an
+ *     explicit click must end automatic selection in both directions;
+ *   - a session must still capture the control and must still not apply it: it
+ *     is a device preference, and a shared session must not reach across
+ *     machines to turn it off.
  */
 
 import assert from 'node:assert/strict';
@@ -32,8 +32,12 @@ import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import {
+  ANTIALIAS_MODES,
   ANTIALIAS_STORAGE_KEY,
-  DEFAULT_ANTIALIASING,
+  AUTOMATIC_ANTIALIAS_CELL_LIMIT,
+  DEFAULT_ANTIALIAS_MODE,
+  antialiasingInForce,
+  automaticAntialiasingForCellCount,
   resolveAntialiasPreference,
   writeAntialiasPreference,
 } from '../assets/js/app/ui/core/antialias-preference.js';
@@ -41,7 +45,11 @@ import {
   DEFERRED_CONTROL_IDS,
 } from '../assets/js/app/ui/core/deferred-control-readiness.js';
 import { createUiControlSerializer } from '../assets/js/app/state-serializer/ui-controls.js';
+import { getNotificationCenter } from '../assets/js/app/notification-center.js';
 import { initRenderControls } from '../assets/js/app/ui/modules/render-controls.js';
+import {
+  POINT_SIZE_SLIDER_MINIMUM,
+} from '../assets/js/rendering/point-size-scale.js';
 
 const MAIN_URL = new URL('../assets/js/app/main.js', import.meta.url);
 const VIEWER_URL = new URL('../assets/js/rendering/viewer.js', import.meta.url);
@@ -51,11 +59,29 @@ const DOM_CACHE_URL = new URL(
 );
 const INDEX_URL = new URL('../index.html', import.meta.url);
 
-const [mainSource, viewerSource, domCacheSource, indexHtml] = await Promise.all([
+const SMOKE_RENDERER_URL = new URL(
+  '../assets/js/rendering/smoke-cloud/smoke-renderer.js',
+  import.meta.url
+);
+const COORDINATOR_URL = new URL(
+  '../assets/js/app/ui/core/ui-coordinator.js',
+  import.meta.url
+);
+
+const [
+  mainSource,
+  viewerSource,
+  domCacheSource,
+  indexHtml,
+  smokeRendererSource,
+  coordinatorSource,
+] = await Promise.all([
   readFile(MAIN_URL, 'utf8'),
   readFile(VIEWER_URL, 'utf8'),
   readFile(DOM_CACHE_URL, 'utf8'),
   readFile(INDEX_URL, 'utf8'),
+  readFile(SMOKE_RENDERER_URL, 'utf8'),
+  readFile(COORDINATOR_URL, 'utf8'),
 ]);
 
 // ---------------------------------------------------------------------------
@@ -84,26 +110,27 @@ function makeStorage(initial = {}) {
   };
 }
 
-test('nothing stored means antialiasing is on', () => {
-  assert.equal(DEFAULT_ANTIALIASING, true);
+test('nothing stored means the dataset decides', () => {
+  assert.equal(DEFAULT_ANTIALIAS_MODE, 'auto');
+  assert.deepEqual(Array.from(ANTIALIAS_MODES), ['auto', 'on', 'off']);
   assert.deepEqual(
     resolveAntialiasPreference(makeStorage()),
-    { enabled: true, discarded: null }
+    { mode: 'auto', discarded: null }
   );
 });
 
-test('the two stored forms read back exactly', () => {
-  assert.deepEqual(
-    resolveAntialiasPreference(makeStorage({ [ANTIALIAS_STORAGE_KEY]: 'on' })),
-    { enabled: true, discarded: null }
-  );
-  assert.deepEqual(
-    resolveAntialiasPreference(makeStorage({ [ANTIALIAS_STORAGE_KEY]: 'off' })),
-    { enabled: false, discarded: null }
-  );
+test('the three stored forms read back exactly', () => {
+  for (const mode of ANTIALIAS_MODES) {
+    assert.deepEqual(
+      resolveAntialiasPreference(
+        makeStorage({ [ANTIALIAS_STORAGE_KEY]: mode })
+      ),
+      { mode, discarded: null }
+    );
+  }
 });
 
-test('a stored value in neither form is discarded and handed back', () => {
+test('a stored value in none of the forms is discarded and handed back', () => {
   // Obeying it is impossible and refusing to start is worse: the app is the
   // only writer of this key, a half-finished write is enough to produce a bad
   // one, and a startup that fails identically on every reload has no way out
@@ -112,7 +139,7 @@ test('a stored value in neither form is discarded and handed back', () => {
   const storage = makeStorage({ [ANTIALIAS_STORAGE_KEY]: 'true' });
   assert.deepEqual(
     resolveAntialiasPreference(storage),
-    { enabled: DEFAULT_ANTIALIASING, discarded: 'true' }
+    { mode: DEFAULT_ANTIALIAS_MODE, discarded: 'true' }
   );
   assert.equal(
     storage.getItem(ANTIALIAS_STORAGE_KEY),
@@ -128,7 +155,7 @@ test('a storage that cannot be read starts on the default and reports nothing', 
   storage.failReads = new Error('The operation is insecure.');
   assert.deepEqual(
     resolveAntialiasPreference(storage),
-    { enabled: DEFAULT_ANTIALIASING, discarded: null }
+    { mode: DEFAULT_ANTIALIAS_MODE, discarded: null }
   );
 });
 
@@ -137,91 +164,155 @@ test('a bad value that cannot be removed is still reported and still starts', ()
   storage.failRemoves = new Error('The operation is insecure.');
   assert.deepEqual(
     resolveAntialiasPreference(storage),
-    { enabled: DEFAULT_ANTIALIASING, discarded: 'true' }
+    { mode: DEFAULT_ANTIALIAS_MODE, discarded: 'true' }
   );
 });
 
-test('the preference round-trips in both directions', () => {
+test('the preference round-trips in every direction', () => {
   const storage = makeStorage();
-  writeAntialiasPreference(storage, false);
-  assert.equal(storage.getItem(ANTIALIAS_STORAGE_KEY), 'off');
-  assert.equal(resolveAntialiasPreference(storage).enabled, false);
-  writeAntialiasPreference(storage, true);
-  assert.equal(storage.getItem(ANTIALIAS_STORAGE_KEY), 'on');
-  assert.equal(resolveAntialiasPreference(storage).enabled, true);
+  for (const mode of ANTIALIAS_MODES) {
+    writeAntialiasPreference(storage, mode);
+    assert.equal(storage.getItem(ANTIALIAS_STORAGE_KEY), mode);
+    assert.equal(resolveAntialiasPreference(storage).mode, mode);
+  }
 });
 
-test('the preference refuses a non-boolean and a storage that is not one', () => {
+test('the preference refuses an unknown mode and a storage that is not one', () => {
   assert.throws(
-    () => writeAntialiasPreference(makeStorage(), 'off'),
-    /exact boolean/
+    () => writeAntialiasPreference(makeStorage(), true),
+    /exactly "auto", "on", or "off"/
   );
   assert.throws(
     () => resolveAntialiasPreference(null),
     /current key\/value storage/
   );
   assert.throws(
-    () => writeAntialiasPreference({ getItem: () => null }, true),
+    () => writeAntialiasPreference({ getItem: () => null }, 'on'),
     /current key\/value storage/
   );
+});
+
+test('the automatic answer turns over at five million cells', () => {
+  // Multisampling multiplies the cost of every covered pixel, and a cloud this
+  // large covers nearly every pixel it is drawn over.
+  assert.equal(AUTOMATIC_ANTIALIAS_CELL_LIMIT, 5_000_000);
+  assert.equal(automaticAntialiasingForCellCount(1), true);
+  assert.equal(automaticAntialiasingForCellCount(561_947), true);
+  assert.equal(
+    automaticAntialiasingForCellCount(AUTOMATIC_ANTIALIAS_CELL_LIMIT - 1),
+    true
+  );
+  assert.equal(
+    automaticAntialiasingForCellCount(AUTOMATIC_ANTIALIAS_CELL_LIMIT),
+    false,
+    'the limit itself is at or above, so it is off'
+  );
+  assert.equal(automaticAntialiasingForCellCount(18_142_044), false);
+  assert.throws(
+    () => automaticAntialiasingForCellCount(0),
+    /positive safe integer cell count/
+  );
+});
+
+test('an explicit choice outranks the dataset, in both directions', () => {
+  // A user who ticks the box on an eighteen-million-cell dataset means it, and a
+  // user who unticks it on a small one means that too.
+  assert.equal(antialiasingInForce('on', 18_142_044), true);
+  assert.equal(antialiasingInForce('off', 3_696), false);
+  assert.equal(antialiasingInForce('auto', 3_696), true);
+  assert.equal(antialiasingInForce('auto', 18_142_044), false);
+  // No dataset: nothing to measure and nothing on screen to smooth.
+  assert.equal(antialiasingInForce('auto', null), true);
+  assert.throws(() => antialiasingInForce('maybe', 1), /exactly "auto"/);
 });
 
 // ---------------------------------------------------------------------------
 // The preference reaches the context
 // ---------------------------------------------------------------------------
 
-test('the viewer requests the antialiasing it is given, not a literal', () => {
-  // A GL context cannot be created here, so this is a source contract. It is
-  // the only thing standing between the setting and a hardcoded attribute
-  // quietly returning.
+test('the drawing buffer is single-sampled and owns no antialias attribute', () => {
+  // A GL context cannot be created here, so this is a source contract, and it is
+  // the only thing standing between the live setting and the constraint it
+  // replaced quietly returning.
+  assert.match(
+    viewerSource,
+    /getContext\('webgl2', \{\s*antialias: false,/,
+    'the drawing buffer must be single-sampled'
+  );
   assert.ok(
     !viewerSource.includes('antialias: true'),
-    'viewer.js must not hardcode the antialias attribute'
+    'a multisampled drawing buffer cannot be switched off again'
+  );
+  assert.ok(
+    !/createViewer\(\{[^}]*\bantialias\b/s.test(viewerSource),
+    'createViewer must not take antialiasing as a construction argument'
   );
   assert.match(
     viewerSource,
-    /getContext\('webgl2', \{ antialias, powerPreference/,
-    'the context must be created with the caller’s antialias value'
-  );
-  assert.match(
-    viewerSource,
-    /Viewer creation requires an exact antialias boolean/,
-    'createViewer must refuse a missing or non-boolean antialias'
+    /createSceneMsaaTarget\(gl\)/,
+    'multisampling must come from the target the application owns'
   );
 });
 
-test('the bootstrap reads the stored preference before building the viewer', () => {
-  const read = mainSource.indexOf('resolveAntialiasPreference(localStorage)');
-  const create = mainSource.indexOf('createViewer({');
-  assert.ok(read > 0, 'main.js must read the stored antialiasing preference');
-  assert.ok(create > 0, 'main.js must still create the viewer');
+test('the scene target is bound for the frame and resolved in a finally', () => {
+  // Four places in the frame body clear and draw, and three of them return
+  // early. Binding at each would be four chances to miss one; resolving outside
+  // a `finally` would leave a thrown pane showing the frame before it.
+  const render = viewerSource.slice(
+    viewerSource.indexOf('  function render() {'),
+    viewerSource.indexOf('  function renderSceneFrame() {')
+  );
+  assert.match(render, /sceneMsaaTarget\.beginFrame\(/);
+  assert.match(render, /try \{[\s\S]*renderSceneFrame\(\);[\s\S]*\} finally \{[\s\S]*sceneMsaaTarget\.resolveFrame\(/);
+});
+
+test('nothing mid-frame binds the default framebuffer behind the target', () => {
+  // The smoke renderer and the velocity overlay each bind a framebuffer of their
+  // own and have to come back to the scene. Coming back to zero would drop
+  // everything drawn after them out of the resolved image.
+  const smokeSource = smokeRendererSource;
   assert.ok(
-    read < create,
-    'the preference must be resolved before the context is created'
+    !smokeSource.includes('bindFramebuffer(gl.FRAMEBUFFER, null)'),
+    'the smoke renderer must return to the scene, not to the default buffer'
   );
+  assert.match(smokeSource, /sceneFramebuffer/);
   assert.match(
-    mainSource,
-    /antialias: antialiasPreference\.enabled/,
-    'the resolved preference must be what the context is created with'
+    viewerSource,
+    /outputFramebuffer: sceneMsaaTarget\.getSceneFramebuffer\(\)/,
+    'the overlay context must be given the scene target'
   );
+});
+
+test('the bootstrap no longer reads the preference at all', () => {
+  // One reader, and it is the control that owns the setting. Reading it in the
+  // bootstrap too would be a second answer to the same question, resolved
+  // before the cell count that decides it is known.
   assert.equal(
     (mainSource.match(/resolveAntialiasPreference\(/g) ?? []).length,
-    1,
-    'exactly one place may read the preference'
+    0,
+    'the bootstrap must not resolve the antialiasing preference'
   );
-});
-
-test('a discarded preference is reported to the user, not swallowed', () => {
-  const report = mainSource.indexOf('antialiasPreference.discarded !== null');
-  const init = mainSource.indexOf('notifications.init();');
-  assert.ok(report > 0, 'main.js must report a discarded preference');
   assert.ok(
-    report > init,
-    'the report must come after the notification centre exists'
+    !/createViewer\(\{[^}]*antialias/s.test(mainSource),
+    'the viewer must not be constructed with an antialiasing value'
   );
 });
 
-test('both antialiasing accessors survive context loss and disposal', () => {
+test('the dataset re-decides antialiasing on every publication', () => {
+  // Datasets are switched in place, so a page that opened on four thousand cells
+  // and now holds eighteen million has to answer for the eighteen million.
+  assert.match(
+    mainSource,
+    /ui\.applyDatasetRenderDefaults\(\s*publication\.stage\.generation\.identity\.stats\.n_cells/,
+    'the cell count must reach the render defaults'
+  );
+  assert.match(
+    coordinatorSource,
+    /renderControls\.applyDatasetAntialiasing\(cellCount\)/
+  );
+});
+
+test('the antialiasing accessors survive context loss and disposal', () => {
   // The panel stays on screen after a context loss, and the overlay tells the
   // user to reload — which is exactly when this control is still useful. A
   // guarded accessor would throw instead of answering.
@@ -229,8 +320,12 @@ test('both antialiasing accessors survive context loss and disposal', () => {
     viewerSource.indexOf('const TERMINAL_SAFE_VIEWER_METHODS'),
     viewerSource.indexOf(']);', viewerSource.indexOf('const TERMINAL_SAFE_VIEWER_METHODS'))
   );
-  assert.match(terminalSafe, /'getRequestedAntialiasing'/);
-  assert.match(terminalSafe, /'getGrantedAntialiasing'/);
+  assert.match(terminalSafe, /'getAntialiasing'/);
+  assert.match(terminalSafe, /'isAntialiasingAvailable'/);
+  assert.ok(
+    !terminalSafe.includes("'setAntialiasing'"),
+    'publishing a new value is a mutation and must stay fenced'
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -248,11 +343,13 @@ class FakeElement {
     max = '',
     step = '',
     options = [],
+    hidden = false,
   } = {}) {
     this.id = id;
     this.tagName = tagName;
     this.type = type;
     this.value = value;
+    this.hidden = hidden;
     this.checked = checked;
     this.min = min;
     this.max = max;
@@ -292,7 +389,7 @@ class FakeElement {
 }
 
 const SLIDER_DEFAULTS = Object.freeze({
-  pointSizeInput: ['16.5', '0.5'],
+  pointSizeInput: ['16.5', '0.5', String(POINT_SIZE_SLIDER_MINIMUM)],
   lightingInput: ['60', '1'],
   fogInput: ['50', '1'],
   sizeAttenuationInput: ['80', '1'],
@@ -333,6 +430,7 @@ function makeDom() {
   const dom = {
     backgroundSelect: new FakeElement({ tagName: 'SELECT', value: 'grid' }),
     renderModeSelect: new FakeElement({ tagName: 'SELECT', value: 'points' }),
+    renderModeMaturityTag: new FakeElement({ hidden: true }),
     depthControls: new FakeElement(),
     rendererControls: new FakeElement(),
     pointsControls: new FakeElement(),
@@ -358,15 +456,17 @@ function makeDom() {
     }),
     hpAntialiasStatus: new FakeElement({ id: 'hp-antialias-status' }),
   };
-  for (const [key, [value, step]] of Object.entries(SLIDER_DEFAULTS)) {
-    dom[key] = new FakeElement({ value, min: '0', max: '100', step });
+  for (const [key, [value, step, min = '0']] of Object.entries(SLIDER_DEFAULTS)) {
+    dom[key] = new FakeElement({ value, min, max: '100', step });
   }
   for (const key of DISPLAY_KEYS) dom[key] = new FakeElement();
   return dom;
 }
 
-function makeViewer({ requested = true, granted = requested } = {}) {
+function makeViewer({ available = true } = {}) {
+  let antialiasing = false;
   return {
+    published: [],
     setBackground: () => {},
     setRenderMode: () => {},
     setPointSize: () => {},
@@ -382,8 +482,13 @@ function makeViewer({ requested = true, granted = requested } = {}) {
     setAdaptiveLOD: () => {},
     setForceLOD: () => {},
     setFrustumCulling: () => {},
-    getRequestedAntialiasing: () => requested,
-    getGrantedAntialiasing: () => granted,
+    setAntialiasing(value) {
+      this.published.push(value);
+      antialiasing = available && value;
+      return antialiasing;
+    },
+    getAntialiasing: () => antialiasing,
+    isAntialiasingAvailable: () => available,
   };
 }
 
@@ -437,9 +542,9 @@ function installDocument(storage) {
   };
 }
 
-function bootstrap({ requested = true, granted = requested, storage } = {}) {
+function bootstrap({ available = true, storage } = {}) {
   const dom = makeDom();
-  const viewer = makeViewer({ requested, granted });
+  const viewer = makeViewer({ available });
   const controls = initRenderControls({
     viewer,
     dom,
@@ -448,68 +553,84 @@ function bootstrap({ requested = true, granted = requested, storage } = {}) {
   return { dom, viewer, controls, storage };
 }
 
-test('the checkbox is seeded from the context, not from the markup', t => {
-  // The markup ships `checked`. A user who turned antialiasing off and reloaded
-  // must not be shown a ticked box over a canvas that has no antialiasing.
+test('with nothing stored, the dataset decides and the box says so', t => {
+  const storage = makeStorage();
+  t.after(installDocument(storage));
+
+  const { dom, controls, viewer } = bootstrap({ storage });
+
+  // No dataset yet: nothing to measure, so the box starts on.
+  assert.equal(dom.hpAntialiasCheckbox.checked, true);
+  assert.match(dom.hpAntialiasStatus.textContent, /Chosen automatically/);
+
+  // A large dataset turns it off with no reload and without storing anything.
+  assert.equal(controls.applyDatasetAntialiasing(18_142_044), false);
+  assert.equal(dom.hpAntialiasCheckbox.checked, false);
+  assert.match(
+    dom.hpAntialiasStatus.textContent,
+    new RegExp(`${(18_142_044).toLocaleString()} cells`),
+  );
+  assert.equal(storage.getItem(ANTIALIAS_STORAGE_KEY), null);
+
+  // Switching in place to a small one turns it back on.
+  assert.equal(controls.applyDatasetAntialiasing(3_696), true);
+  assert.equal(dom.hpAntialiasCheckbox.checked, true);
+  assert.deepEqual(viewer.published, [true, false, true]);
+});
+
+test('a stored choice is published and the dataset stops deciding', t => {
   const storage = makeStorage({ [ANTIALIAS_STORAGE_KEY]: 'off' });
   t.after(installDocument(storage));
 
-  const { dom } = bootstrap({ requested: false, storage });
-
+  const { dom, controls } = bootstrap({ storage });
   assert.equal(dom.hpAntialiasCheckbox.checked, false);
   assert.equal(
     dom.hpAntialiasStatus.textContent,
     '',
-    'agreeing with the context in force is not a pending change'
+    'an explicit choice needs no explanation'
+  );
+
+  assert.equal(controls.applyDatasetAntialiasing(3_696), false);
+  assert.equal(
+    dom.hpAntialiasCheckbox.checked,
+    false,
+    'a small dataset must not override a choice'
   );
 });
 
-test('turning antialiasing off stores it and says when it applies', t => {
+test('clicking the box publishes it to the renderer and ends automatic', t => {
   const storage = makeStorage();
   t.after(installDocument(storage));
 
-  const { dom } = bootstrap({ requested: true, storage });
-  assert.equal(dom.hpAntialiasStatus.textContent, '');
-
-  dom.hpAntialiasCheckbox.checked = false;
-  dom.hpAntialiasCheckbox.dispatchEvent({ type: 'change' });
-
-  assert.equal(storage.getItem(ANTIALIAS_STORAGE_KEY), 'off');
-  assert.match(
-    dom.hpAntialiasStatus.textContent,
-    /Reload the page to apply/,
-    'a change that cannot take effect yet must say so'
-  );
-});
-
-test('changing back to the value in force clears the pending notice', t => {
-  const storage = makeStorage();
-  t.after(installDocument(storage));
-
-  const { dom } = bootstrap({ requested: true, storage });
-  dom.hpAntialiasCheckbox.checked = false;
-  dom.hpAntialiasCheckbox.dispatchEvent({ type: 'change' });
-  assert.notEqual(dom.hpAntialiasStatus.textContent, '');
+  const { dom, viewer, controls } = bootstrap({ storage });
+  controls.applyDatasetAntialiasing(18_142_044);
+  assert.equal(dom.hpAntialiasCheckbox.checked, false);
 
   dom.hpAntialiasCheckbox.checked = true;
   dom.hpAntialiasCheckbox.dispatchEvent({ type: 'change' });
 
   assert.equal(storage.getItem(ANTIALIAS_STORAGE_KEY), 'on');
+  assert.equal(viewer.getAntialiasing(), true);
   assert.equal(
     dom.hpAntialiasStatus.textContent,
     '',
-    'nothing is pending once the preference matches the live context again'
+    'no notice: it is already in force'
   );
+
+  // The dataset no longer gets a vote, in the direction the user chose.
+  assert.equal(controls.applyDatasetAntialiasing(18_142_044), true);
+  assert.equal(dom.hpAntialiasCheckbox.checked, true);
 });
 
 test('a browser that refuses multisampling is reported as a refusal', t => {
-  // `antialias` is a hint. Telling this user to reload would be a lie: the
-  // reload would ask again and be refused again.
+  // Telling this user to reload would be a lie: the reload would ask again and
+  // be refused again, and no preference changes it.
   const storage = makeStorage();
   t.after(installDocument(storage));
 
-  const { dom } = bootstrap({ requested: true, granted: false, storage });
+  const { dom } = bootstrap({ available: false, storage });
 
+  assert.equal(dom.hpAntialiasCheckbox.checked, false);
   assert.match(
     dom.hpAntialiasStatus.textContent,
     /not providing antialiasing/
@@ -517,21 +638,23 @@ test('a browser that refuses multisampling is reported as a refusal', t => {
   assert.doesNotMatch(dom.hpAntialiasStatus.textContent, /Reload/);
 });
 
-test('a preference that cannot be stored rolls the control back', t => {
-  // Storing is the only effect this control has. Accepting a click that was
-  // never recorded would leave the box claiming a setting no reload can deliver.
+test('a preference that cannot be stored rolls the control and renderer back', t => {
+  // The preference and the renderer are published together or not at all: a box
+  // that survived a failed write would promise a setting on the next load that
+  // was never recorded.
   const storage = makeStorage();
   t.after(installDocument(storage));
 
-  const { dom } = bootstrap({ requested: true, storage });
+  const { dom, viewer } = bootstrap({ storage });
+  assert.equal(viewer.getAntialiasing(), true);
   storage.failWrites = new Error('Storage is full.');
 
   dom.hpAntialiasCheckbox.checked = false;
   dom.hpAntialiasCheckbox.dispatchEvent({ type: 'change' });
 
   assert.equal(dom.hpAntialiasCheckbox.checked, true, 'the box must roll back');
+  assert.equal(viewer.getAntialiasing(), true, 'the renderer must roll back');
   assert.equal(storage.getItem(ANTIALIAS_STORAGE_KEY), null);
-  assert.equal(dom.hpAntialiasStatus.textContent, '');
 });
 
 // ---------------------------------------------------------------------------
@@ -563,9 +686,9 @@ test('a restored session leaves the antialiasing preference alone', t => {
   const storage = makeStorage();
   t.after(installDocument(storage));
 
-  // This machine has it on, and the incoming session says off.
-  const { dom } = bootstrap({ requested: true, storage });
+  // This machine has explicitly chosen on, and the incoming session says off.
   storage.setItem(ANTIALIAS_STORAGE_KEY, 'on');
+  const { dom } = bootstrap({ storage });
   const serializer = createUiControlSerializer({ sidebar: makeSidebar(dom) });
 
   serializer.restoreUIControls(savedSession(false));
@@ -583,7 +706,7 @@ test('a restored session leaves the antialiasing preference alone', t => {
   assert.equal(
     dom.hpAntialiasStatus.textContent,
     '',
-    'nothing changed, so there is nothing pending a reload'
+    'an explicit choice needs no explanation, before or after a restore'
   );
 });
 
@@ -593,8 +716,8 @@ test('the opposite direction is also left alone', t => {
   const storage = makeStorage();
   t.after(installDocument(storage));
 
-  const { dom } = bootstrap({ requested: false, storage });
   storage.setItem(ANTIALIAS_STORAGE_KEY, 'off');
+  const { dom } = bootstrap({ storage });
   const serializer = createUiControlSerializer({ sidebar: makeSidebar(dom) });
 
   serializer.restoreUIControls(savedSession(true));
@@ -610,7 +733,8 @@ test('the control is captured into a session without being listed anywhere', t =
   const storage = makeStorage();
   t.after(installDocument(storage));
 
-  const { dom } = bootstrap({ requested: true, storage });
+  storage.setItem(ANTIALIAS_STORAGE_KEY, 'on');
+  const { dom } = bootstrap({ storage });
   dom.hpAntialiasCheckbox.checked = false;
 
   const serializer = createUiControlSerializer({ sidebar: makeSidebar(dom) });
@@ -623,13 +747,12 @@ test('restoring the value the control already holds stores nothing new', t => {
   const storage = makeStorage();
   t.after(installDocument(storage));
 
-  const { dom } = bootstrap({ requested: true, storage });
+  const { dom } = bootstrap({ storage });
   const serializer = createUiControlSerializer({ sidebar: makeSidebar(dom) });
 
   serializer.restoreUIControls(savedSession(true));
 
   assert.equal(storage.getItem(ANTIALIAS_STORAGE_KEY), null);
-  assert.equal(dom.hpAntialiasStatus.textContent, '');
 });
 
 test('a restore does not depend on storage it never writes', t => {
@@ -639,7 +762,7 @@ test('a restore does not depend on storage it never writes', t => {
   const storage = makeStorage();
   t.after(installDocument(storage));
 
-  const { dom } = bootstrap({ requested: true, storage });
+  const { dom } = bootstrap({ storage });
   const serializer = createUiControlSerializer({ sidebar: makeSidebar(dom) });
   storage.failWrites = new Error('Storage is full.');
 
@@ -716,4 +839,46 @@ test('the tooltip states both halves of the trade', () => {
     /pixels change/,
     'the picture the user loses must be stated beside it'
   );
+});
+
+test('a discarded preference is reported without breaking the controls', t => {
+  const storage = makeStorage({ [ANTIALIAS_STORAGE_KEY]: 'true' });
+  t.after(installDocument(storage));
+  const center = getNotificationCenter();
+  const originalWarning = center.warning;
+  const warnings = [];
+  center.warning = (message, options) => {
+    warnings.push([message, options]);
+  };
+  t.after(() => {
+    center.warning = originalWarning;
+  });
+
+  const { dom } = bootstrap({ storage });
+
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0][0], /"true" was not recognized/);
+  assert.equal(warnings[0][1].category, 'rendering');
+  assert.equal(
+    dom.hpAntialiasCheckbox.checked,
+    true,
+    'the discarded value must leave the dataset deciding'
+  );
+});
+
+test('a reporter that throws cannot stop the controls initializing', t => {
+  // Discarding rather than throwing exists so a bad stored value cannot break a
+  // load. A report that throws would undo exactly that.
+  const storage = makeStorage({ [ANTIALIAS_STORAGE_KEY]: 'true' });
+  t.after(installDocument(storage));
+  const center = getNotificationCenter();
+  const originalWarning = center.warning;
+  center.warning = () => {
+    throw new Error('synthetic notification failure');
+  };
+  t.after(() => {
+    center.warning = originalWarning;
+  });
+
+  assert.doesNotThrow(() => bootstrap({ storage }));
 });

@@ -27,9 +27,22 @@ test('viewer visualization setters expose one exact current contract', async () 
     /function applyViewerBackgroundMode|cellucid_viewer_background|localStorage\.setItem/,
     'the GPU viewer must not also own browser preference persistence',
   );
+  // The bound is imported rather than written here: the slider curve in
+  // `render-controls.js` and this bound are the same contract, and the two
+  // literals they used to be could disagree — a slider reaching below the
+  // viewer's floor throws at its own low end, with nothing the user can do.
   assert.match(
     source,
-    /setPointSize\(size\)\s*\{[\s\S]{0,180}assertFiniteNumberInRange\(size,\s*0\.25,\s*200,\s*['"]Point size['"]\)/,
+    /setPointSize\(size\)\s*\{[\s\S]{0,240}assertFiniteNumberInRange\(\s*size,\s*MINIMUM_POINT_SIZE,\s*MAXIMUM_POINT_SIZE,\s*['"]Point size['"]\s*\)/,
+  );
+  assert.match(
+    source,
+    /import\s*\{[^}]*MINIMUM_POINT_SIZE[^}]*\}\s*from\s*'\.\/point-size-scale\.js'/,
+  );
+  assert.doesNotMatch(
+    source,
+    /assertFiniteNumberInRange\(\s*size,\s*0\.(25|05)\s*,/,
+    'the point-size bound must not be re-stated as a literal',
   );
   assert.match(
     source,

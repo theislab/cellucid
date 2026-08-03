@@ -26,7 +26,7 @@ import {
  *
  * `antialias` is a WebGL context-creation attribute, and since the viewer let
  * the user turn it off it is a published property of the drawing buffer the
- * user is looking at — `viewer.getGrantedAntialiasing()`. The app's own control
+ * user is looking at — `viewer.getAntialiasing()`. The app's own control
  * measures the difference at 18% of pixels at the default point size and 32%
  * with ultra-light square points (`index.html`, the antialiasing tooltip), so a
  * figure rasterised with multisampling the screen does not have is a different
@@ -383,7 +383,7 @@ test('the raster point diameter is the exact scaled diameter', () => {
     scalePointDiameterToRaster(0.75, 2 * 0.78125),
     2 * scalePointDiameterToRaster(0.75, 0.78125),
   );
-  // The smallest point the slider offers, at the same export.
+  // The point size at slider position zero, at the same export.
   assert.equal(scalePointDiameterToRaster(0.25, 0.78125), 0.1953125);
 
   for (const diameter of [0, -1, NaN, Infinity, '1']) {

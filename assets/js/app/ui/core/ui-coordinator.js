@@ -728,9 +728,33 @@ export function initUI({
     failureMessage: 'Application UI teardown was incomplete.',
   });
 
+  /**
+   * Open a newly published dataset with the render settings its size wants.
+   *
+   * Two settings depend on nothing but the cell count, and both were single
+   * shipped constants that could not be right for a 3,696-cell trajectory and an
+   * 18-million-cell atlas at once: the point size, and whether to antialias.
+   *
+   * Called once per dataset publication, before any saved state is replayed, so a
+   * session or a published preset still overrides the point size, and before
+   * `viewer.start()` on the first dataset, so no frame is drawn with the wrong
+   * one. `Reset` is re-captured afterwards: a reset should return to what this
+   * dataset opened with, not to the markup, which belongs to no dataset.
+   *
+   * @param {number} cellCount
+   * @returns {{pointSize: number, antialiasing: boolean}}
+   */
+  function applyDatasetRenderDefaults(cellCount) {
+    const pointSize = renderControls.applyAutomaticPointSize(cellCount);
+    const antialiasing = renderControls.applyDatasetAntialiasing(cellCount);
+    visualizationReset.captureInitialState();
+    return { pointSize, antialiasing };
+  }
+
   return {
     activateField: fieldSelector.activateField,
     applyRenderMode: renderControls.applyRenderMode,
+    applyDatasetRenderDefaults,
     prepareDatasetReplacement: fieldSelector.prepareDatasetReplacement,
     refreshUiAfterStateLoad,
     showSessionStatus,

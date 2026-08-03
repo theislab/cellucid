@@ -17,50 +17,72 @@ import {
   settleCalculationNotification,
 } from './calculation-notifications.js';
 
-const HIERARCHICAL_RADIX_BITS = 10;
+const HIERARCHICAL_RADIX_BITS = 11;
 const HIERARCHICAL_RADIX_SIZE = 1 << HIERARCHICAL_RADIX_BITS;
 const HIERARCHICAL_RADIX_MASK = HIERARCHICAL_RADIX_SIZE - 1;
 const LOD_MAPPING_SENTINEL = 0xffffffff;
 const LOD_MAPPING_VISITED_BIT = 0x80000000;
 const LOD_FULL_DETAIL_ADMISSION_LEVEL = 0xff;
-function createReversedMortonContribution(dimensionLevel, axis) {
-  const contributions = new Uint32Array(HIERARCHICAL_RADIX_SIZE);
-  const priorityBits = dimensionLevel * HIERARCHICAL_RADIX_BITS;
-  for (
-    let coordinate = 0;
-    coordinate < HIERARCHICAL_RADIX_SIZE;
-    coordinate++
-  ) {
-    let contribution = 0;
-    for (let bit = 0; bit < HIERARCHICAL_RADIX_BITS; bit++) {
-      const mortonBit = bit * dimensionLevel + axis;
-      const priorityBit = priorityBits - mortonBit - 1;
-      contribution |=
-        ((coordinate >>> bit) & 1) << priorityBit;
-    }
-    contributions[coordinate] = contribution >>> 0;
-  }
-  return contributions;
+
+/**
+ * The point count an adaptive LOD level is allowed to fall to.
+ *
+ * Adaptive selection is a frame-rate control, not a data-reduction policy, so
+ * its coarsest useful answer is a point budget rather than a ratio. A fixed
+ * ratio is what made a large dataset unusable: at 18.1M cells the coarsest
+ * ladder step is a 44x reduction, which the selector reaches on any pull-back
+ * and which discards 97.7% of the cells whether or not the frame needed it. A
+ * budget stops at the point where drawing is already comfortable and no
+ * further reduction buys anything a viewer can see, and it scales itself: a
+ * dataset under the budget is never reduced by adaptive selection at all,
+ * which is the correct answer for one that already draws in a single frame.
+ *
+ * The forced-level slider is deliberately not bounded by this. Asking for a
+ * coarser level explicitly is a legitimate request on hardware that needs it.
+ */
+const ADAPTIVE_LOD_POINT_BUDGET = 2_000_000;
+
+/**
+ * Quantization bits per axis for the locality code, by dimension level.
+ *
+ * Every code has to fit one Uint32 so the ordering can be produced by a typed
+ * radix sort, which caps the product at 32 bits. Within that cap the finest
+ * available grid is the right choice: the grid cell is the unit inside which
+ * the ordering has nothing left to say about position, so a coarse grid is a
+ * coarse sample. 2D uses the whole budget because 2D embeddings are what
+ * projections are almost always viewed in.
+ */
+const LOCALITY_BITS_BY_DIMENSION = Object.freeze([0, 30, 16, 10]);
+
+/**
+ * Interleave one 16-bit coordinate with a single zero between bits (2D Morton).
+ *
+ * @param {number} coordinate
+ * @returns {number}
+ */
+function spreadPairwise(coordinate) {
+  let bits = coordinate & 0xffff;
+  bits = (bits | (bits << 8)) & 0x00ff00ff;
+  bits = (bits | (bits << 4)) & 0x0f0f0f0f;
+  bits = (bits | (bits << 2)) & 0x33333333;
+  bits = (bits | (bits << 1)) & 0x55555555;
+  return bits >>> 0;
 }
 
-// Reversing an interleaved Morton code is a fixed 10-bit coordinate
-// transformation. These small, module-owned tables remove all per-point bit
-// loops while retaining the exact historical 1D/2D/3D priorities.
-const HIERARCHICAL_PRIORITY_CONTRIBUTIONS = Object.freeze([
-  null,
-  Object.freeze([
-    createReversedMortonContribution(1, 0),
-  ]),
-  Object.freeze([
-    createReversedMortonContribution(2, 0),
-    createReversedMortonContribution(2, 1),
-  ]),
-  Object.freeze([
-    createReversedMortonContribution(3, 0),
-    createReversedMortonContribution(3, 1),
-    createReversedMortonContribution(3, 2),
-  ]),
-]);
+/**
+ * Interleave one 10-bit coordinate with two zeros between bits (3D Morton).
+ *
+ * @param {number} coordinate
+ * @returns {number}
+ */
+function spreadTriplewise(coordinate) {
+  let bits = coordinate & 0x3ff;
+  bits = (bits | (bits << 16)) & 0x030000ff;
+  bits = (bits | (bits << 8)) & 0x0300f00f;
+  bits = (bits | (bits << 4)) & 0x030c30c3;
+  bits = (bits | (bits << 2)) & 0x09249249;
+  return bits >>> 0;
+}
 // ============================================================================
 // SPATIAL INDEX FOR LOD AND FRUSTUM CULLING (1D/2D/3D)
 // ============================================================================
@@ -143,6 +165,10 @@ export class SpatialIndex {
     // nested prefixes of `_hierarchicalOrder`, so one byte per source point is
     // sufficient for every level and every view sharing this spatial owner.
     this._lodMembershipOwner = null;
+    // The coarsest level adaptive selection may return, published by
+    // `_generateLODLevels`. Zero imposes no bound, which is unreachable before
+    // generation: `getLODLevel` answers -1 while there is no inventory.
+    this._adaptiveMinimumLevel = 0;
 
     this.maxPointsPerNode = maxPointsPerNode;
     this.maxDepth = maxDepth;
@@ -569,24 +595,70 @@ export class SpatialIndex {
       });
     }
 
+    // The coarsest level adaptive selection may choose. Levels are ordered
+    // coarse-to-fine and their counts are non-decreasing, so the first level
+    // that meets the budget is that bound. A dataset at or under the budget
+    // resolves to terminal full detail, which is the honest answer: adaptive
+    // selection has no work to do for a cloud that already draws in one frame.
+    const adaptiveFloorCount = Math.min(
+      totalPoints,
+      ADAPTIVE_LOD_POINT_BUDGET
+    );
+    let adaptiveMinimumLevel = levels.length - 1;
+    for (let levelIdx = 0; levelIdx < levels.length; levelIdx++) {
+      if (levels[levelIdx].pointCount >= adaptiveFloorCount) {
+        adaptiveMinimumLevel = levelIdx;
+        break;
+      }
+    }
+    this._adaptiveMinimumLevel = adaptiveMinimumLevel;
+
     const treeNames = { 1: 'BinaryTree', 2: 'Quadtree', 3: 'Octree' };
     const treeName = treeNames[this.dimensionLevel] || 'Octree';
     console.log(`[${treeName}] Generated ${levels.length} LOD levels (dim=${this.dimensionLevel}):`,
-      levels.map(l => `${l.pointCount.toLocaleString()} pts`).join(', '));
+      levels.map(l => `${l.pointCount.toLocaleString()} pts`).join(', '),
+      `| adaptive floor: level ${adaptiveMinimumLevel} `
+      + `(${levels[adaptiveMinimumLevel].pointCount.toLocaleString()} pts)`);
 
     return levels;
   }
 
   /**
    * Build a stable hierarchical ordering of all points.
-   * Points are ranked so that coarser LOD levels are always strict subsets of finer levels.
-   * This prevents "popping" when transitioning between LOD levels.
    *
-   * Uses Morton code (Z-order curve) + bit-reversal for optimal spatial distribution:
-   * - Morton code groups spatially close points together
-   * - Bit-reversal ensures coarse samples are evenly distributed across space
+   * Points are ranked so that coarser LOD levels are always strict subsets of
+   * finer levels, which is what stops points popping in and out across a level
+   * transition. The requirement on top of nesting is that *every* prefix reads
+   * as the same cloud at lower density: proportional to the local density
+   * everywhere, and carrying no structure of its own.
    *
-   * Dimension-aware: Uses 1D/2D/3D Morton codes based on dimensionLevel.
+   * Two steps, in this order.
+   *
+   * 1. Sort by the plain interleaved Morton code of the quantized position, so
+   *    rank is a space-filling-curve walk of the cloud. Rank density along that
+   *    walk is exactly point density.
+   * 2. Emit ranks in bit-reversed (van der Corput) order. A prefix of that
+   *    sequence is an evenly spaced set of *ranks* — every k-th point along the
+   *    curve — so it takes the same fraction of points out of every
+   *    neighbourhood the curve passes through.
+   *
+   * Step 2 is the whole fix for the reported square patches, and its absence
+   * was the defect. Reversing the bits of the Morton code instead — sorting by
+   * `reverse(morton)` — makes the sort key a bijection of the grid cell, so all
+   * points of a cell are contiguous and a prefix is a complete set of cells on
+   * an axis-aligned sublattice: every point of an admitted cell and none of a
+   * skipped one. At 18.1M 2D points and a 44x reduction that is a ~6 px lattice
+   * of ~1 px clumps, which is what a viewer sees as blocks with gaps between
+   * them. Reversing the *rank* instead decimates along the curve, where the
+   * spacing is measured in points rather than in pixels, so nothing lands on a
+   * lattice and there is nothing to see.
+   *
+   * Ties — points sharing a grid cell — keep ascending source order through
+   * every stable radix pass, and step 2 spreads a cell's own points across the
+   * ladder rather than admitting or dropping them together.
+   *
+   * Dimension-aware: 1D/2D/3D codes, at the finest per-axis resolution that
+   * still fits one Uint32 (see `LOCALITY_BITS_BY_DIMENSION`).
    */
   _buildHierarchicalOrder() {
     if (this._hierarchicalOrder) return this._hierarchicalOrder;
@@ -596,10 +668,20 @@ export class SpatialIndex {
     const bounds = this.bounds;
     const dimLevel = this.dimensionLevel;
 
-    // Normalize positions to 0-1023 range for 10-bit Morton codes
-    const scaleX = 1023 / Math.max(bounds.maxX - bounds.minX, 0.0001);
-    const scaleY = 1023 / Math.max(bounds.maxY - bounds.minY, 0.0001);
-    const scaleZ = 1023 / Math.max(bounds.maxZ - bounds.minZ, 0.0001);
+    const axisBits = LOCALITY_BITS_BY_DIMENSION[dimLevel];
+    const axisMaximum = (1 << axisBits) - 1;
+    const localityBits = axisBits * dimLevel;
+    const scaleX = axisMaximum / Math.max(bounds.maxX - bounds.minX, 0.0001);
+    const scaleY = axisMaximum / Math.max(bounds.maxY - bounds.minY, 0.0001);
+    const scaleZ = axisMaximum / Math.max(bounds.maxZ - bounds.minZ, 0.0001);
+
+    // Clamping rather than masking: a coordinate exactly at the upper bound can
+    // quantize one step past the axis maximum through float rounding, and a
+    // mask would wrap that point to the very start of the curve.
+    const quantize = (value, minimum, scale) => {
+      const bin = Math.floor((value - minimum) * scale);
+      return bin < 0 ? 0 : (bin > axisMaximum ? axisMaximum : bin);
+    };
 
     // One priority array plus two ID arrays bounds peak working memory to
     // 12 bytes per point. Initial ascending IDs preserve the stable reference
@@ -608,68 +690,47 @@ export class SpatialIndex {
     let sourceIds = new Uint32Array(n);
     let targetIds = new Uint32Array(n);
     let radixOffsets = new Uint32Array(HIERARCHICAL_RADIX_SIZE);
-    const contributions =
-      HIERARCHICAL_PRIORITY_CONTRIBUTIONS[dimLevel];
 
     if (dimLevel === 1) {
-      const xContributions = contributions[0];
       for (let pointIndex = 0; pointIndex < n; pointIndex++) {
         const positionOffset = pointIndex * 3;
-        const x =
-          Math.floor(
-            (positions[positionOffset] - bounds.minX) * scaleX
-          ) & HIERARCHICAL_RADIX_MASK;
-        priorities[pointIndex] = xContributions[x];
+        priorities[pointIndex] = quantize(
+          positions[positionOffset],
+          bounds.minX,
+          scaleX
+        );
         sourceIds[pointIndex] = pointIndex;
       }
     } else if (dimLevel === 2) {
-      const xContributions = contributions[0];
-      const yContributions = contributions[1];
       for (let pointIndex = 0; pointIndex < n; pointIndex++) {
         const positionOffset = pointIndex * 3;
-        const x =
-          Math.floor(
-            (positions[positionOffset] - bounds.minX) * scaleX
-          ) & HIERARCHICAL_RADIX_MASK;
-        const y =
-          Math.floor(
-            (positions[positionOffset + 1] - bounds.minY) * scaleY
-          ) & HIERARCHICAL_RADIX_MASK;
+        const x = quantize(positions[positionOffset], bounds.minX, scaleX);
+        const y = quantize(positions[positionOffset + 1], bounds.minY, scaleY);
         priorities[pointIndex] =
-          xContributions[x] | yContributions[y];
+          (spreadPairwise(x) | (spreadPairwise(y) << 1)) >>> 0;
         sourceIds[pointIndex] = pointIndex;
       }
     } else {
-      const xContributions = contributions[0];
-      const yContributions = contributions[1];
-      const zContributions = contributions[2];
       for (let pointIndex = 0; pointIndex < n; pointIndex++) {
         const positionOffset = pointIndex * 3;
-        const x =
-          Math.floor(
-            (positions[positionOffset] - bounds.minX) * scaleX
-          ) & HIERARCHICAL_RADIX_MASK;
-        const y =
-          Math.floor(
-            (positions[positionOffset + 1] - bounds.minY) * scaleY
-          ) & HIERARCHICAL_RADIX_MASK;
-        const z =
-          Math.floor(
-            (positions[positionOffset + 2] - bounds.minZ) * scaleZ
-          ) & HIERARCHICAL_RADIX_MASK;
+        const x = quantize(positions[positionOffset], bounds.minX, scaleX);
+        const y = quantize(positions[positionOffset + 1], bounds.minY, scaleY);
+        const z = quantize(positions[positionOffset + 2], bounds.minZ, scaleZ);
         priorities[pointIndex] =
-          xContributions[x] |
-          yContributions[y] |
-          zContributions[z];
+          (
+            spreadTriplewise(x)
+            | (spreadTriplewise(y) << 1)
+            | (spreadTriplewise(z) << 2)
+          ) >>> 0;
         sourceIds[pointIndex] = pointIndex;
       }
     }
 
-    // Priority widths are exactly 10, 20, or 30 bits, so one stable 10-bit
-    // pass per active dimension completely orders the IDs.
+    // Locality codes are at most 32 bits wide, so three stable 11-bit passes
+    // completely order the IDs for every dimension level.
     for (
       let shift = 0;
-      shift < dimLevel * HIERARCHICAL_RADIX_BITS;
+      shift < localityBits;
       shift += HIERARCHICAL_RADIX_BITS
     ) {
       radixOffsets.fill(0);
@@ -703,9 +764,38 @@ export class SpatialIndex {
       targetIds = previousSource;
     }
 
+    // Step 2. `targetIds` is spent radix scratch of exactly the right length,
+    // so the rank permutation is written in place of another N allocation.
+    const reversalBits = n <= 1 ? 0 : 32 - Math.clz32(n - 1);
+    if (reversalBits > 30) {
+      throw new RangeError(
+        `SpatialIndex hierarchical ordering supports at most ${(1 << 30).toLocaleString()} points.`
+      );
+    }
+    const reversalSpan = 1 << reversalBits;
+    const highestBit = reversalSpan >>> 1;
+    let rank = 0;
+    let emitted = 0;
+    for (let step = 0; step < reversalSpan; step++) {
+      if (rank < n) targetIds[emitted++] = sourceIds[rank];
+      // Increment the bit-reversed counter: carry propagates from the top bit
+      // down, which is the mirror image of an ordinary binary increment.
+      let carry = highestBit;
+      while (carry !== 0 && (rank & carry) !== 0) {
+        rank ^= carry;
+        carry >>>= 1;
+      }
+      rank |= carry;
+    }
+    if (emitted !== n) {
+      throw new Error(
+        `SpatialIndex hierarchical ordering emitted ${emitted} of ${n} points.`
+      );
+    }
+
     // Only the final ID generation escapes. Explicitly release all build
     // scratch references before atomically publishing the shared LOD owner.
-    const hierarchicalOrder = sourceIds;
+    const hierarchicalOrder = targetIds;
     priorities = null;
     sourceIds = null;
     targetIds = null;
@@ -921,15 +1011,16 @@ export class SpatialIndex {
   /**
    * Get LOD level for a given camera distance.
    * @param {number} distance - Camera distance from target
-   * @param {number} viewportHeight - Viewport height in pixels
    * @param {number} previousLevel - Previous LOD level for this view (for hysteresis). Pass -1 or undefined for first call.
    * @param {number} dimensionLevel - Current dimension level (1, 2, or 3).
    * @param {Object} [overrideBounds] - Optional bounds override for view-specific positions.
    *   When positions differ from octree (e.g., 2D projection), pass actual bounds to get
    *   correct LOD selection. Format: { minX, maxX, minY, maxY, minZ, maxZ }
-   * @returns {number} LOD level (0 = highest detail)
+   * @returns {number} LOD level (0 = coarsest, `lodLevels.length - 1` = full
+   *   detail). The answer is never coarser than the adaptive point budget
+   *   allows; a forced level bypasses this selector entirely.
    */
-  getLODLevel(distance, viewportHeight, previousLevel, dimensionLevel, overrideBounds = null) {
+  getLODLevel(distance, previousLevel, dimensionLevel, overrideBounds = null) {
     if (this.lodLevels.length === 0) return -1;
 
     const validDimLevel = requireDimensionLevel(
@@ -987,7 +1078,11 @@ export class SpatialIndex {
       newLevel = currentLevel - 1;
     }
 
-    return Math.max(0, Math.min(numLevels - 1, newLevel));
+    const floorLevel = Math.min(
+      numLevels - 1,
+      Math.max(0, this._adaptiveMinimumLevel)
+    );
+    return Math.max(floorLevel, Math.min(numLevels - 1, newLevel));
   }
 
   getVisibleIndices(frustumPlanes, maxPoints = Infinity) {
@@ -2019,6 +2114,8 @@ export {
   LOD_MAPPING_SENTINEL,
   LOD_MAPPING_VISITED_BIT,
   LOD_FULL_DETAIL_ADMISSION_LEVEL,
-  createReversedMortonContribution,
-  HIERARCHICAL_PRIORITY_CONTRIBUTIONS,
+  ADAPTIVE_LOD_POINT_BUDGET,
+  LOCALITY_BITS_BY_DIMENSION,
+  spreadPairwise,
+  spreadTriplewise,
 };

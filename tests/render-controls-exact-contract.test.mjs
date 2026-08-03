@@ -6,6 +6,12 @@ import { initRenderControls } from '../assets/js/app/ui/modules/render-controls.
 import {
   SmokeDensityBuildError,
 } from '../assets/js/rendering/smoke-cloud/smoke-density-contract.js';
+import {
+  MINIMUM_POINT_SIZE,
+  POINT_SIZE_SLIDER_MINIMUM,
+  formatPointSize,
+  sliderPositionToPointSize,
+} from '../assets/js/rendering/point-size-scale.js';
 
 class FakeElement {
   constructor({
@@ -14,8 +20,10 @@ class FakeElement {
     max = '',
     step = '',
     checked = null,
+    hidden = false,
   } = {}) {
     this.value = value;
+    this.hidden = hidden;
     this.min = min;
     this.max = max;
     this.step = step;
@@ -58,10 +66,17 @@ class FakeElement {
       listener({ target: this });
     }
   }
+
+  // Publishing a control value by dispatching the control's own event is the
+  // ownership rule the session serializer follows, so the fake has to model it.
+  dispatchEvent(event) {
+    this.dispatch(event.type);
+    return true;
+  }
 }
 
 const INPUT_DEFAULTS = Object.freeze({
-  pointSizeInput: ['16.5', '0.5'],
+  pointSizeInput: ['16.5', '0.5', String(POINT_SIZE_SLIDER_MINIMUM)],
   lightingInput: ['60', '1'],
   fogInput: ['50', '1'],
   sizeAttenuationInput: ['80', '1'],
@@ -102,6 +117,7 @@ function makeDom() {
   const dom = {
     backgroundSelect: new FakeElement({ value: 'grid' }),
     renderModeSelect: new FakeElement({ value: 'points' }),
+    renderModeMaturityTag: new FakeElement({ hidden: true }),
     depthControls: new FakeElement(),
     rendererControls: new FakeElement(),
     pointsControls: new FakeElement(),
@@ -123,10 +139,10 @@ function makeDom() {
     hpAntialiasCheckbox: new FakeElement({ checked: true }),
     hpAntialiasStatus: new FakeElement(),
   };
-  for (const [key, [value, step]] of Object.entries(INPUT_DEFAULTS)) {
+  for (const [key, [value, step, min = '0']] of Object.entries(INPUT_DEFAULTS)) {
     dom[key] = new FakeElement({
       value,
-      min: '0',
+      min,
       max: '100',
       step,
     });
@@ -137,8 +153,12 @@ function makeDom() {
   return dom;
 }
 
-function makeViewer({ hasSnapshots = false } = {}) {
+function makeViewer({
+  hasSnapshots = false,
+  antialiasingAvailable = true,
+} = {}) {
   const calls = [];
+  let antialiasing = false;
   const viewer = {
     calls,
     setBackground(value) {
@@ -188,11 +208,16 @@ function makeViewer({ hasSnapshots = false } = {}) {
       calls.push(['hasSnapshots']);
       return hasSnapshots;
     },
-    getRequestedAntialiasing() {
-      return true;
+    setAntialiasing(value) {
+      calls.push(['setAntialiasing', value]);
+      antialiasing = value;
+      return value;
     },
-    getGrantedAntialiasing() {
-      return true;
+    getAntialiasing() {
+      return antialiasing;
+    },
+    isAntialiasingAvailable() {
+      return antialiasingAvailable;
     },
   };
   return viewer;
@@ -220,6 +245,8 @@ function installDocument(background = 'grid', storage = null) {
         return null;
       },
       setItem() {
+      },
+      removeItem() {
       },
     },
   });
@@ -323,6 +350,8 @@ test('background persistence failure preserves the current viewer state', t => {
     setItem() {
       throw storageFailure;
     },
+    removeItem() {
+    },
   });
   t.after(restore);
   const { viewer, dom, smoke } = makeOptions();
@@ -347,12 +376,86 @@ test('public point-size conversion rejects out-of-contract values', t => {
 
   assert.throws(
     () => controls.pointSizeToSlider(0),
-    /point size.*between 0\.25 and 200/i,
+    /point size.*between 0\.050 and 200/i,
   );
   assert.throws(
     () => controls.pointSizeToSlider(Number.NaN),
     /point size.*finite number/i,
   );
+
+  // The slider's zero position is the curve's anchor, not its minimum: every
+  // position that was ever stored still means exactly the size it meant, and
+  // the reach below 0.25 is added under it rather than folded into it.
+  assert.equal(controls.pointSizeToSlider(0.25), 0);
+  assert.equal(controls.pointSizeToSlider(200), 100);
+  for (const position of [-24, -12, 0, 16.5, 50, 100]) {
+    assert.ok(
+      Math.abs(
+        controls.pointSizeToSlider(sliderPositionToPointSize(position))
+        - position,
+      ) < 1e-9,
+      `slider position ${position} must survive a round trip`,
+    );
+  }
+  assert.ok(MINIMUM_POINT_SIZE < 0.0503 && MINIMUM_POINT_SIZE > 0.05);
+  assert.equal(formatPointSize(MINIMUM_POINT_SIZE), '0.050');
+  assert.equal(
+    Number(sliderPositionToPointSize(16.5).toFixed(4)),
+    0.7533,
+  );
+});
+
+test('a dataset opens at the point size its cell count wants', t => {
+  const restore = installDocument();
+  t.after(restore);
+  const { viewer, dom, smoke } = makeOptions();
+  const controls = initRenderControls({ viewer, dom, smoke });
+
+  // Total drawn area is cellCount * diameter^2, so four times the cells is half
+  // the dot. One shipped constant cannot serve a 3,696-cell trajectory and an
+  // 18-million-cell atlas at once.
+  const sizeFor = cellCount => sliderPositionToPointSize(
+    controls.pointSizeSliderPositionForCellCount(cellCount),
+  );
+  const trajectory = sizeFor(3_696);
+  const atlas = sizeFor(18_142_044);
+  assert.ok(trajectory > 4, `${trajectory} is not large enough for 3,696 cells`);
+  assert.ok(atlas < 0.15, `${atlas} is not small enough for 18.1M cells`);
+  assert.ok(
+    Math.abs(sizeFor(400_000) - 0.75) < 0.03,
+    'around 400,000 cells must reproduce the size this control shipped with',
+  );
+  for (const cellCount of [1, 1_000, 10_000, 1_000_000, 500_000_000]) {
+    const position = controls.pointSizeSliderPositionForCellCount(cellCount);
+    assert.ok(position >= POINT_SIZE_SLIDER_MINIMUM && position <= 100);
+    assert.equal(
+      Math.abs(position % 0.5),
+      0,
+      `${position} is off the slider step`,
+    );
+  }
+  assert.throws(
+    () => controls.pointSizeSliderPositionForCellCount(0),
+    /positive safe integer cell count/i,
+  );
+
+  // Publication goes through the control's own input event, so every other
+  // owner of that slider sees it the way it sees a drag.
+  viewer.calls.length = 0;
+  const published = controls.applyAutomaticPointSize(18_142_044);
+  const publishedPosition = Number(dom.pointSizeInput.value);
+  assert.equal(
+    Math.abs(publishedPosition % 0.5),
+    0,
+    'the published position must survive the next exact range read',
+  );
+  assert.equal(published, sliderPositionToPointSize(publishedPosition));
+  assert.ok(published < 0.15, `${published} is not small enough for 18.1M cells`);
+  assert.deepEqual(
+    viewer.calls.filter(([method]) => method === 'setPointSize'),
+    [['setPointSize', published]],
+  );
+  assert.equal(dom.pointSizeDisplay.textContent, formatPointSize(published));
 });
 
 test('smoke conflicts notify and roll back the selector while the public owner rejects', t => {
@@ -898,4 +1001,31 @@ test('current render-control source contains no normalization/default route', as
     /gridSizeOverride\s*===\s*undefined\s*\?\s*smokeGridSize/,
   );
   assert.doesNotMatch(numberUtils, /export function clampNormalized\\b/);
+});
+
+test('the maturity tag names the selected mode, not the control', t => {
+  const restore = installDocument();
+  t.after(restore);
+  const { viewer, dom, smoke } = makeOptions();
+  const controls = initRenderControls({ viewer, dom, smoke });
+
+  // `Points` is finished; `Volumetric smoke cloud` is not. A tag next to the
+  // label would otherwise read as a property of the whole control.
+  assert.equal(dom.renderModeMaturityTag.hidden, true);
+  assert.equal(controls.applyRenderMode('smoke'), true);
+  assert.equal(dom.renderModeMaturityTag.hidden, false);
+  assert.equal(controls.applyRenderMode('points'), true);
+  assert.equal(dom.renderModeMaturityTag.hidden, true);
+
+  // A smoke failure settles the UI back to points, so the tag has to go with it.
+  const notificationCenter = getNotificationCenter();
+  const originalError = notificationCenter.error;
+  notificationCenter.error = () => {};
+  t.after(() => {
+    notificationCenter.error = originalError;
+  });
+  controls.applyRenderMode('smoke');
+  assert.equal(dom.renderModeMaturityTag.hidden, false);
+  controls.settleSmokeRenderFailure(new Error('synthetic smoke failure'));
+  assert.equal(dom.renderModeMaturityTag.hidden, true);
 });

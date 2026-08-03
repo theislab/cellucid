@@ -320,7 +320,7 @@ test('reentrant abort in one grid snapshot fences every later borrowed owner', a
     getCentroidFlags() {
       return { labels: false, points: false };
     },
-    getGrantedAntialiasing() {
+    getAntialiasing() {
       return true;
     },
     getLiveViewLabel() {

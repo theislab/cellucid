@@ -200,6 +200,15 @@ class CoalescedCancellationOwner {
  * Base adapter class for AnnData file formats
  * @abstract
  */
+/**
+ * The obsm key `sc.tl.umap()` writes, which names no dimension of its own.
+ * A reader resolves it by its column count when the object declares none of
+ * X_umap_1d / X_umap_2d / X_umap_3d, which is the rule the Python package
+ * applies in `cellucid/vector_fields.py` so one file opens the same way in the
+ * browser and through `cellucid serve`.
+ */
+export const UNSUFFIXED_EMBEDDING_KEY = 'X_umap';
+
 export class BaseAnnDataAdapter {
   /**
    * @param {Object} loader - The underlying loader (H5adLoader or ZarrLoader)

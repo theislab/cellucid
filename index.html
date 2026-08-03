@@ -523,12 +523,26 @@
             </select>
           </div>
 
-          <!-- Render mode -->
+          <!--
+            Render mode. The maturity tag is shown only while the mode it
+            describes is the selected one, so it reads as a property of that
+            option rather than of the control. The option text carries the same
+            word, because that is the only place a native <option> can carry it
+            and it has to be visible before the mode is chosen.
+          -->
           <div class="control-block">
-            <label for="render-mode">Render mode:</label>
+            <div class="d-flex items-center gap-1">
+              <label for="render-mode">Render mode:</label>
+              <span
+                id="render-mode-maturity-tag"
+                class="maturity-tag"
+                title="Volumetric smoke cloud is in alpha: it is still changing, it is slower than points, and figure export cannot reproduce it."
+                hidden
+              >Alpha</span>
+            </div>
             <select id="render-mode" class="obs-select">
               <option value="points">Points</option>
-              <option value="smoke">Volumetric smoke cloud</option>
+              <option value="smoke">Volumetric smoke cloud (alpha)</option>
             </select>
           </div>
 
@@ -561,7 +575,7 @@
             <div class="control-block">
               <label for="point-size">Point size (log):</label>
               <div class="slider-row">
-                <input id="point-size" type="range" min="0" max="100" step="0.5" value="16.5" />
+                <input id="point-size" type="range" min="-24" max="100" step="0.5" value="16.5" />
                 <span id="point-size-display" class="slider-value">0.75</span>
               </div>
             </div>
@@ -715,19 +729,21 @@
               <div class="info-tooltip-content">
                 <div class="info-step">
                   Antialiasing smooths the edge of every point. Turning it off
-                  measured 19% faster at the default point size and 34% faster
-                  at large point sizes, on 10 million points on one Apple M1
+                  measured 19% faster at point size 0.75 and 34% faster at
+                  large point sizes, on 10 million points on one Apple M1
                   Pro. Expect the shape, not the exact numbers, on other GPUs.
                 </div>
                 <div class="info-step">
-                  It is not free to turn off: 18% of pixels change at the
-                  default point size, and 32% with Ultra-light square points.
+                  It is not free to turn off: 18% of pixels change at point
+                  size 0.75, and 32% with Ultra-light square points.
                   Small dots are almost all edge, so this is the setting that
                   changes what a dense cloud looks like.
                 </div>
                 <div class="info-step">
-                  The browser fixes this when it creates the drawing buffer, so
-                  it can only change when the page loads.
+                  Until you set it yourself, it follows the dataset: on below
+                  five million cells, off at or above, re-decided whenever a
+                  dataset is opened. Setting it here ends that and applies to
+                  the next frame.
                 </div>
               </div>
             </div>

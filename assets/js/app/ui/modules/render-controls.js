@@ -6,11 +6,12 @@
  * level, frustum culling, antialiasing) and smoke controls
  * (grid/quality/density/etc) to the Viewer.
  *
- * Antialiasing is the one control here that does not publish to the viewer at
- * all. It is a WebGL context-creation attribute, fixed before this module runs,
- * so the control stores a preference and states on screen that it applies on the
- * next load. Everything else about it — ownership, restore, rollback — follows
- * the same rules as its neighbours.
+ * Antialiasing is the one control here that publishes to two places: to the
+ * viewer, like its neighbours, and to `localStorage`, because the preference
+ * describes the machine rather than the view. It also has a third state its
+ * checkbox cannot show — `auto`, which defers to the dataset's cell count.
+ * Everything else about it — ownership, restore, rollback — follows the same
+ * rules as its neighbours.
  *
  * Also exposes a `markSmokeDirty()` hook used by the coordinator to trigger
  * debounced smoke rebuilds after visibility changes.
@@ -32,19 +33,31 @@ import {
   parseFiniteNumberInRange
 } from '../../utils/number-utils.js';
 import { getNotificationCenter } from '../../notification-center.js';
-import { writeAntialiasPreference } from '../core/antialias-preference.js';
+import {
+  antialiasingInForce,
+  resolveAntialiasPreference,
+  writeAntialiasPreference,
+} from '../core/antialias-preference.js';
 import {
   MAX_SMOKE_GRID_SIZE,
   SMOKE_GRID_SIZES,
   SmokeDensityBuildError,
 } from '../../../rendering/smoke-cloud/smoke-density-contract.js';
+import {
+  formatPointSize,
+  pointSizeSliderPositionForCellCount,
+  pointSizeToSliderPosition,
+  sliderPositionToPointSize,
+  POINT_SIZE_SLIDER_MAXIMUM,
+  POINT_SIZE_SLIDER_MINIMUM,
+} from '../../../rendering/point-size-scale.js';
 
 const VIEWER_BACKGROUNDS = Object.freeze(['grid', 'grid-dark', 'white', 'black']);
 const RENDER_MODES = Object.freeze(['points', 'smoke']);
 const VIEWER_BACKGROUND_STORAGE_KEY = 'cellucid_viewer_background';
 
 const RANGE_CONTROLS = Object.freeze([
-  ['pointSizeInput', 'Point size slider', '0.5'],
+  ['pointSizeInput', 'Point size slider', '0.5', POINT_SIZE_SLIDER_MINIMUM],
   ['lightingInput', 'Lighting strength', '1'],
   ['fogInput', 'Fog density', '1'],
   ['sizeAttenuationInput', 'Perspective size scaling', '1'],
@@ -97,8 +110,9 @@ const VIEWER_METHODS = Object.freeze([
   'setAdaptiveLOD',
   'setForceLOD',
   'setFrustumCulling',
-  'getRequestedAntialiasing',
-  'getGrantedAntialiasing'
+  'setAntialiasing',
+  'getAntialiasing',
+  'isAntialiasingAvailable'
 ]);
 
 const SHADER_QUALITIES = Object.freeze(['full', 'light', 'ultralight']);
@@ -201,6 +215,16 @@ function assertForcedLodLevel(value, label) {
   return level;
 }
 
+function assertHideableElement(control, label) {
+  if (
+    control === null
+    || typeof control !== 'object'
+    || typeof control.hidden !== 'boolean'
+  ) {
+    throw new TypeError(`${label} requires one current hideable DOM element.`);
+  }
+}
+
 function assertContainer(control, label) {
   if (
     control === null
@@ -225,18 +249,24 @@ function assertDisplay(control, label) {
   }
 }
 
-function readExactRange(control, label, expectedStep) {
+function readExactRange(control, label, expectedStep, expectedMinimum = 0) {
   assertEventControl(control, label);
   if (
-    control.min !== '0'
+    control.min !== String(expectedMinimum)
     || control.max !== '100'
     || control.step !== expectedStep
   ) {
     throw new TypeError(
-      `${label} requires exact range attributes min="0", max="100", step="${expectedStep}".`
+      `${label} requires exact range attributes min="${expectedMinimum}", `
+      + `max="100", step="${expectedStep}".`
     );
   }
-  const value = parseFiniteNumberInRange(control.value, 0, 100, label);
+  const value = parseFiniteNumberInRange(
+    control.value,
+    expectedMinimum,
+    100,
+    label
+  );
   const step = Number(expectedStep);
   const quotient = value / step;
   if (Math.abs(quotient - Math.round(quotient)) > 1e-9) {
@@ -345,6 +375,7 @@ export function initRenderControls(options) {
   const {
     backgroundSelect,
     renderModeSelect,
+    renderModeMaturityTag,
     depthControls,
     rendererControls,
     pointsControls,
@@ -394,6 +425,7 @@ export function initRenderControls(options) {
   assertEventControl(backgroundSelect, 'Viewer background selector');
   assertEventControl(renderModeSelect, 'Render mode selector');
   assertContainer(depthControls, 'Depth controls');
+  assertHideableElement(renderModeMaturityTag, 'Render-mode maturity tag');
   assertContainer(rendererControls, 'Renderer controls');
   assertContainer(pointsControls, 'Point controls');
   assertContainer(smokeControls, 'Smoke controls');
@@ -406,8 +438,8 @@ export function initRenderControls(options) {
   assertContainer(hpLodForceContainer, 'Forced LOD level row');
   assertDisplay(hpLodForceDisplay, 'hpLodForceDisplay');
   assertForcedLodControl(hpLodForceInput, 'Forced LOD level slider');
-  for (const [key, label, step] of RANGE_CONTROLS) {
-    readExactRange(dom[key], label, step);
+  for (const [key, label, step, minimum = 0] of RANGE_CONTROLS) {
+    readExactRange(dom[key], label, step, minimum);
   }
   for (const key of DISPLAY_CONTROLS) {
     assertDisplay(dom[key], key);
@@ -506,43 +538,44 @@ export function initRenderControls(options) {
     }
   }
 
-  // Log-scale point size mapping
-  const MIN_POINT_SIZE = 0.25;
-  const MAX_POINT_SIZE = 200.0;
-  const POINT_SIZE_SCALE = MAX_POINT_SIZE / MIN_POINT_SIZE;
-
   function sliderToPointSize(sliderValue) {
     const raw = parseFiniteNumberInRange(
       sliderValue,
-      0,
-      100,
+      POINT_SIZE_SLIDER_MINIMUM,
+      POINT_SIZE_SLIDER_MAXIMUM,
       'Point size slider'
     );
-    const t = raw / 100;
-    return MIN_POINT_SIZE * Math.pow(POINT_SIZE_SCALE, t);
-  }
-
-  function pointSizeToSlider(size) {
-    if (!isFiniteNumber(size)) {
-      throw new TypeError('Point size must be one finite number.');
-    }
-    if (size < MIN_POINT_SIZE || size > MAX_POINT_SIZE) {
-      throw new RangeError(
-        `Point size must be between ${MIN_POINT_SIZE} and ${MAX_POINT_SIZE}.`
-      );
-    }
-    return (Math.log(size / MIN_POINT_SIZE) / Math.log(POINT_SIZE_SCALE)) * 100;
-  }
-
-  function formatPointSize(size) {
-    if (size < 0.1) return size.toFixed(3);
-    return size < 10 ? size.toFixed(2) : size.toFixed(1);
+    return sliderPositionToPointSize(raw);
   }
 
   function applyPointSizeFromSlider() {
     const size = sliderToPointSize(pointSizeInput.value);
     viewer.setPointSize(size);
     pointSizeDisplay.textContent = formatPointSize(size);
+  }
+
+  /**
+   * Move the point-size slider to the size a dataset of this many cells wants.
+   *
+   * Published through the control's own `input` event so every other owner of
+   * that control — the session serializer's restore path and the Visualization
+   * reset capture — sees the change the same way it sees a drag. A restore that
+   * runs afterwards overrides this, which is the correct precedence: an explicit
+   * saved choice outranks a derived default.
+   *
+   * @param {number} cellCount
+   * @returns {number} The published point size.
+   */
+  function applyAutomaticPointSize(cellCount) {
+    if (destroyed) {
+      throw new Error(
+        'Automatic point size cannot be published after teardown.'
+      );
+    }
+    const position = pointSizeSliderPositionForCellCount(cellCount);
+    pointSizeInput.value = String(position);
+    pointSizeInput.dispatchEvent(new Event('input', { bubbles: true }));
+    return sliderPositionToPointSize(position);
   }
 
   let currentRenderMode = renderModeSelect.value;
@@ -568,6 +601,9 @@ export function initRenderControls(options) {
 
   function syncRenderModeUi(mode) {
     renderModeSelect.value = mode;
+    // The tag names the maturity of the selected mode, so it is present exactly
+    // when that mode is. `Points` is not in alpha and must not wear the tag.
+    renderModeMaturityTag.hidden = mode !== 'smoke';
     smokeControls.classList.toggle('visible', mode === 'smoke');
     pointsControls.classList.toggle('visible', mode === 'points');
     depthControls.style.display = mode === 'smoke' ? 'none' : 'block';
@@ -1092,59 +1128,119 @@ export function initRenderControls(options) {
   // ---------------------------------------------------------------------------
   // Antialiasing
   //
-  // The odd one out, and it says so on screen. `antialias` is a WebGL
-  // context-creation attribute, so there is no setter to call: the viewer's
-  // context already has the value it will keep, and a change reaches the GPU
-  // only through a page load. See `ui/core/antialias-preference.js` for why a
-  // live context swap is not on the table.
+  // A live setting, published to the viewer like any other. It was not always:
+  // `antialias` is a WebGL context-creation attribute, and while the drawing
+  // buffer carried it the control could only store a preference and tell the user
+  // to reload. `rendering/scene-msaa-target.js` moved multisampling into a
+  // renderbuffer the application owns, so a change now reaches the next frame.
   //
-  // So the control owns exactly two things — the stored preference, and telling
-  // the user the truth about when it takes effect. The comparison is always
-  // against the viewer's own record of what it was built with, never against
-  // storage, so the notice is about this page rather than about a value another
-  // tab may have written.
+  // The checkbox has two states and the preference has three. `auto` is the
+  // third, and it is what the box shows when the user has not chosen: ticked or
+  // not according to the dataset, per `ui/core/antialias-preference.js`. Touching
+  // the box is what turns `auto` into a choice — after that the dataset stops
+  // deciding, which is the only reading of an explicit click that respects it.
   // ---------------------------------------------------------------------------
 
-  const antialiasingInForce = viewer.getRequestedAntialiasing();
-  const antialiasingGranted = viewer.getGrantedAntialiasing();
+  const antialiasingAvailable = viewer.isAntialiasingAvailable();
+  const storedAntialias = resolveAntialiasPreference(localStorage);
+  let antialiasPreferenceMode = storedAntialias.mode;
+  let datasetCellCount = null;
 
   function syncAntialiasStatus() {
-    if (antialiasingInForce && !antialiasingGranted) {
-      // Asked for and refused. Saying "reload to apply" here would be a lie:
-      // reloading would ask again and be refused again.
+    if (!antialiasingAvailable) {
+      // Not a state to keep offering: reloading would ask again and be refused
+      // again, and there is no preference that changes it.
       hpAntialiasStatus.textContent =
         'This browser is not providing antialiasing for this view.';
       return;
     }
-    hpAntialiasStatus.textContent =
-      hpAntialiasCheckbox.checked === antialiasingInForce
-        ? ''
-        : 'Saved. Reload the page to apply — the browser fixes this when it '
-          + 'creates the drawing buffer.';
+    hpAntialiasStatus.textContent = antialiasPreferenceMode === 'auto'
+      ? (
+        datasetCellCount === null
+          ? 'Chosen automatically from the size of the dataset.'
+          : `Chosen automatically: ${datasetCellCount.toLocaleString()} cells.`
+      )
+      : '';
   }
 
-  // The markup default is "on", which is also the preference default, but the
-  // viewer was built from whatever was stored. Seeding from the viewer is what
-  // stops a reloaded page showing a ticked box over an unantialiased canvas.
-  hpAntialiasCheckbox.checked = antialiasingInForce;
-  let acceptedAntialiasPreference = antialiasingInForce;
-  syncAntialiasStatus();
+  function publishAntialiasing(enabled) {
+    const inForce = viewer.setAntialiasing(enabled);
+    hpAntialiasCheckbox.checked = inForce;
+    syncAntialiasStatus();
+    return inForce;
+  }
+
+  publishAntialiasing(
+    antialiasingInForce(antialiasPreferenceMode, datasetCellCount)
+  );
+
+  if (storedAntialias.discarded !== null) {
+    // Discarded rather than obeyed, and never in silence: the user chose this
+    // setting once and is entitled to know the choice did not survive. Reporting
+    // it must not be able to stop the controls from working, though — the whole
+    // point of discarding rather than throwing is that a bad stored value cannot
+    // break a load.
+    try {
+      getNotificationCenter().warning(
+        `The stored antialiasing preference `
+        + `${JSON.stringify(storedAntialias.discarded)} was not recognized and `
+        + 'has been discarded, so antialiasing follows the size of the dataset. '
+        + 'Set it again in Visualization if you wanted it fixed.',
+        { category: 'rendering', title: 'Antialiasing preference reset' }
+      );
+    } catch (error) {
+      console.error(
+        '[RenderControls] Discarded antialiasing preference was not reported:',
+        error
+      );
+    }
+  }
+
+  /**
+   * Re-decide antialiasing for a dataset that has just been published.
+   *
+   * Does nothing to an explicit choice. `auto` is re-evaluated per dataset rather
+   * than once per page because datasets are switched in place: a page that opened
+   * on four thousand cells and now holds eighteen million has to answer for the
+   * eighteen million.
+   *
+   * @param {number} cellCount
+   * @returns {boolean} What is in force afterwards.
+   */
+  function applyDatasetAntialiasing(cellCount) {
+    if (destroyed) {
+      throw new Error(
+        'Automatic antialiasing cannot be published after teardown.'
+      );
+    }
+    if (!Number.isSafeInteger(cellCount) || cellCount <= 0) {
+      throw new RangeError(
+        'Automatic antialiasing requires one positive safe integer cell count.'
+      );
+    }
+    datasetCellCount = cellCount;
+    return publishAntialiasing(
+      antialiasingInForce(antialiasPreferenceMode, datasetCellCount)
+    );
+  }
 
   listen(hpAntialiasCheckbox, 'change', () => {
     const requested = hpAntialiasCheckbox.checked;
-    const previous = acceptedAntialiasPreference;
+    const previousMode = antialiasPreferenceMode;
+    const previousInForce = viewer.getAntialiasing();
     try {
-      writeAntialiasPreference(localStorage, requested);
-      acceptedAntialiasPreference = requested;
-      syncAntialiasStatus();
+      // An explicit click ends automatic selection for good, in both directions:
+      // a user who ticks the box on an eighteen-million-cell dataset means it.
+      writeAntialiasPreference(localStorage, requested ? 'on' : 'off');
+      antialiasPreferenceMode = requested ? 'on' : 'off';
+      publishAntialiasing(requested);
     } catch (error) {
-      // Storing the preference is the only thing this control does. If that
-      // fails the setting would do nothing at all on the next load, so the box
-      // returns to the value that is actually stored rather than showing a
-      // choice that was never recorded. A session restore reads the control
-      // back after dispatching, so this rollback is also what makes a restore
-      // that could not be persisted fail loudly instead of silently.
-      hpAntialiasCheckbox.checked = previous;
+      // The preference and the renderer are published together or not at all: a
+      // box that survives a failed write would promise a setting on the next
+      // load that was never recorded.
+      antialiasPreferenceMode = previousMode;
+      viewer.setAntialiasing(previousInForce);
+      hpAntialiasCheckbox.checked = previousInForce;
       syncAntialiasStatus();
       reportRendererControlFailure('Antialiasing', error);
     }
@@ -1167,7 +1263,10 @@ export function initRenderControls(options) {
     },
     applyRenderMode,
     applyPointSizeFromSlider,
-    pointSizeToSlider,
+    applyAutomaticPointSize,
+    applyDatasetAntialiasing,
+    pointSizeSliderPositionForCellCount,
+    pointSizeToSlider: pointSizeToSliderPosition,
     getSmokeGridSize: () => smokeGridSize,
     rebuildSmokeDensity: gridSize => rebuildSmokeDensity(assertSmokeGridSize(gridSize)),
 

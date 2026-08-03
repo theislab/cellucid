@@ -145,6 +145,7 @@ export function collectDOMReferences(root) {
     render: {
       backgroundSelect: byId('background-select'),
       renderModeSelect: byId('render-mode'),
+      renderModeMaturityTag: byId('render-mode-maturity-tag'),
       depthControls: byId('depth-controls'),
       rendererControls: byId('renderer-controls'),
       pointsControls: byId('points-controls'),

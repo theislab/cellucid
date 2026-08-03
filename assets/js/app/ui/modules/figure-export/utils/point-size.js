@@ -59,7 +59,7 @@ export function getEffectivePointDiameterPx({ viewer, renderState, viewId, dimen
  * else.
  *
  * Flooring the result at one pixel therefore does not "keep points visible": it
- * inflates them. The viewer's default point size is 0.75 and the default export
+ * inflates them. A dataset of around 400,000 cells opens at a point size of 0.75 and the default export
  * is half the viewport, so a 150-DPI export asks for 0.586 and a floor of 1
  * draws every cell 1.7x too large; at the smallest point size the same floor is
  * 5.1x. The minimum that does keep a point visible is the shaders' own

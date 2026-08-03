@@ -40,6 +40,11 @@ import {
   cloneCameraState
 } from './camera-state-contract.js';
 import { POINT_VISIBILITY_THRESHOLD } from './alpha-visibility.js';
+import { createSceneMsaaTarget } from './scene-msaa-target.js';
+import {
+  MAXIMUM_POINT_SIZE,
+  MINIMUM_POINT_SIZE,
+} from './point-size-scale.js';
 import {
   applyHorizontalProjectionCenter,
   computePaneCenterNdcX
@@ -95,9 +100,10 @@ export const INTERACTIVE_SPATIAL_INDEX_POINT_THRESHOLD = 250_000;
 const TERMINAL_SAFE_VIEWER_METHODS = new Set([
   'dispose',
   'getGLContext',
-  'getGrantedAntialiasing',
+  'getAntialiasing',
   'getHPRenderer',
-  'getRequestedAntialiasing',
+  'getAntialiasingSampleCount',
+  'isAntialiasingAvailable',
   'isContextLost',
   'isDisposed',
   'isDisposalSettled',
@@ -558,30 +564,29 @@ export function createViewer({
   canvas,
   labelLayer,
   viewTitleLayer,
-  onViewFocus,
-  antialias
+  onViewFocus
 }) {
-  // `antialias` is a context-creation attribute: it cannot be changed on a live
-  // context, so the caller owns it and it is fixed for this viewer's lifetime.
-  // `app/ui/core/antialias-preference.js` is where the value comes from and why
-  // it is a stored preference rather than a published setting.
-  if (typeof antialias !== 'boolean') {
-    throw new TypeError('Viewer creation requires an exact antialias boolean.');
-  }
+  // The drawing buffer is deliberately single-sampled. `antialias` as a
+  // context-creation attribute is fixed for the life of the context, and
+  // Cellucid has no path to a second one, which made antialiasing the only
+  // render setting that could not take effect until the page was reloaded — and
+  // it is the setting whose right answer depends on the dataset. Multisampling
+  // is provided instead by `rendering/scene-msaa-target.js`, which the app owns
+  // and can switch per frame.
   // Every current rendering path requires WebGL2.
-  const gl = canvas.getContext('webgl2', { antialias, powerPreference: 'high-performance' });
+  const gl = canvas.getContext('webgl2', {
+    antialias: false,
+    powerPreference: 'high-performance'
+  });
 
   if (!gl) {
     throw new Error('WebGL2 is required but not supported in this browser.');
   }
 
-  // Antialiasing is a hint. A browser may grant a single-sample drawing buffer
-  // for a context that asked for multisampling, so what was granted is read back
-  // once, here, and reported separately from what was asked for. Both are plain
-  // records of construction, so neither touches the context again — that is what
-  // lets them stay answerable after context loss.
-  const requestedAntialiasing = antialias;
-  const grantedAntialiasing = gl.getContextAttributes()?.antialias === true;
+  // Starts off, with nothing allocated. `render-controls.js` is the one owner of
+  // the preference and publishes it before `start()` draws the first frame, so
+  // there is no value to duplicate here and no frame drawn with the wrong one.
+  const sceneMsaaTarget = createSceneMsaaTarget(gl);
 
   console.log('[Viewer] Using WebGL2');
 
@@ -1747,6 +1752,10 @@ export function createViewer({
 	    lightDir,
 	    width: 0,
 	    height: 0,
+	    // Where the smoke composites. Null is the default framebuffer; with
+	    // antialiasing on it is the multisampled scene target, and binding zero
+	    // instead would drop the smoke out of the resolved image.
+	    sceneFramebuffer: null,
 	  };
 	  const _liveRenderViewRecord = {
 	    id: LIVE_VIEW_ID,
@@ -2385,6 +2394,9 @@ export function createViewer({
       // Terminalize the complete GPU ownership graph before any DOM or
       // application callback can re-enter viewer.dispose().
       attemptContextLossStep(handleHpRendererContextLost);
+      attemptContextLossStep(
+        () => sceneMsaaTarget.handleContextLost()
+      );
       attemptContextLossStep(
         () => projectileSystem.handleContextLost()
       );
@@ -6094,12 +6106,32 @@ export function createViewer({
     }
   }
 
+  /**
+   * Draw one frame into the scene target and resolve it onto the canvas.
+   *
+   * The target is bound once here rather than at each of the four places the
+   * frame body clears and draws, and resolved in a `finally` so a pane that
+   * throws still puts its partial frame on screen instead of leaving the canvas
+   * showing the frame before it. With antialiasing off both calls are no-ops and
+   * the body draws straight to the default framebuffer, exactly as it did before
+   * the target existed.
+   */
   function render() {
     if (disposed || webglContextLost || renderPaused) return;
     animationHandle = requestAnimationFrame(render);
     renderFrameId = renderFrameId === Number.MAX_SAFE_INTEGER
       ? 0
       : renderFrameId + 1;
+    const frameSize = canvasResizeObserver.getSize();
+    sceneMsaaTarget.beginFrame(frameSize.width, frameSize.height);
+    try {
+      renderSceneFrame();
+    } finally {
+      sceneMsaaTarget.resolveFrame(frameSize.width, frameSize.height);
+    }
+  }
+
+  function renderSceneFrame() {
     const now = performance.now();
     const timeSeconds = now / 1000;
     const dt = Math.min(0.05, Math.max(0.001, (now - lastFrameTime) / 1000));
@@ -6168,6 +6200,8 @@ export function createViewer({
         _smokeRenderParams.eye = eye;
         _smokeRenderParams.width = width;
         _smokeRenderParams.height = height;
+        _smokeRenderParams.sceneFramebuffer =
+          sceneMsaaTarget.getSceneFramebuffer();
         smokeRenderer.render(_smokeRenderParams);
       } catch (error) {
         renderMode = 'points';
@@ -6602,7 +6636,7 @@ export function createViewer({
 		          viewportX,
 		          viewportY,
 		          scissorEnabled,
-		          outputFramebuffer: null,
+		          outputFramebuffer: sceneMsaaTarget.getSceneFramebuffer(),
 		          hpRenderer,
 		          getViewPositions,
 		          getViewTransparency,
@@ -6620,7 +6654,8 @@ export function createViewer({
 		        overlayOpts.viewportX = viewportX;
 		        overlayOpts.viewportY = viewportY;
 		        overlayOpts.scissorEnabled = scissorEnabled;
-		        overlayOpts.outputFramebuffer = null;
+		        overlayOpts.outputFramebuffer =
+		          sceneMsaaTarget.getSceneFramebuffer();
 		        if (overlayCtx !== null) {
 		          overlayOpts.target = overlayCtx;
 		        }
@@ -8295,8 +8330,12 @@ export function createViewer({
     },
 
     setPointSize(size) {
-      const next =
-        assertFiniteNumberInRange(size, 0.25, 200, 'Point size');
+      const next = assertFiniteNumberInRange(
+        size,
+        MINIMUM_POINT_SIZE,
+        MAXIMUM_POINT_SIZE,
+        'Point size'
+      );
       if (next === basePointSize) return;
       basePointSize = next;
       publishPresentedViewStateChange('style', focusedViewId);
@@ -9951,21 +9990,37 @@ export function createViewer({
     isWebGL2() { return true; },
 
     /**
-     * The antialiasing this viewer's context was created with.
+     * Draw the scene antialiased, or stop.
      *
-     * This is what is in force for the whole life of the viewer, and it is what
-     * a control offering the setting must compare a pending preference against
-     * — never the stored preference, which may already have moved on.
+     * Takes effect on the next frame. Returns what is actually in force, which
+     * is not always what was asked for: a device that cannot multisample answers
+     * `false` to a request for `true`, and the control is entitled to say so
+     * rather than showing a setting that does nothing.
+     *
+     * @param {boolean} enabled
+     * @returns {boolean}
      */
-    getRequestedAntialiasing() { return requestedAntialiasing; },
+    setAntialiasing(enabled) {
+      return sceneMsaaTarget.setEnabled(
+        assertExactBoolean(enabled, 'Scene antialiasing')
+      );
+    },
+
+    /** Whether the scene is being drawn antialiased right now. */
+    getAntialiasing() { return sceneMsaaTarget.isEnabled(); },
 
     /**
-     * The antialiasing the browser actually granted.
+     * Whether this device can multisample at all.
      *
-     * Differs from the requested value when the browser refuses multisampling,
-     * which is legal: `antialias` is a hint.
+     * False means the setting cannot be honoured on this hardware, which is a
+     * refusal to report rather than a state to keep offering.
      */
-    getGrantedAntialiasing() { return grantedAntialiasing; },
+    isAntialiasingAvailable() { return sceneMsaaTarget.isAvailable(); },
+
+    /** Samples per pixel while antialiasing is on, or 0 when unavailable. */
+    getAntialiasingSampleCount() {
+      return sceneMsaaTarget.getSampleCount();
+    },
 
     // ---------------------------------------------------------------------
     // Vector field overlay (GPU particle flow)
@@ -10689,6 +10744,9 @@ export function createViewer({
 	      });
 	      attempt('high-performance renderer retirement', () => {
 	        disposeHpRenderer();
+	      });
+	      attempt('scene multisample target retirement', () => {
+	        sceneMsaaTarget.dispose();
 	      });
 	      attempt('highlight tools retirement', () => {
 	        highlightTools?.dispose?.();

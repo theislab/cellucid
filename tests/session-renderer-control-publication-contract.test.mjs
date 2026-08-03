@@ -25,6 +25,9 @@ import test from 'node:test';
 
 import { createUiControlSerializer } from '../assets/js/app/state-serializer/ui-controls.js';
 import { initRenderControls } from '../assets/js/app/ui/modules/render-controls.js';
+import {
+  POINT_SIZE_SLIDER_MINIMUM,
+} from '../assets/js/rendering/point-size-scale.js';
 
 const MAIN_URL = new URL('../assets/js/app/main.js', import.meta.url);
 const DOM_CACHE_URL = new URL(
@@ -56,11 +59,13 @@ class FakeElement {
     max = '',
     step = '',
     options = [],
+    hidden = false,
   } = {}) {
     this.id = id;
     this.tagName = tagName;
     this.type = type;
     this.value = value;
+    this.hidden = hidden;
     this.checked = checked;
     this.min = min;
     this.max = max;
@@ -109,7 +114,7 @@ class FakeElement {
 }
 
 const SLIDER_DEFAULTS = Object.freeze({
-  pointSizeInput: ['16.5', '0.5'],
+  pointSizeInput: ['16.5', '0.5', String(POINT_SIZE_SLIDER_MINIMUM)],
   lightingInput: ['60', '1'],
   fogInput: ['50', '1'],
   sizeAttenuationInput: ['80', '1'],
@@ -192,14 +197,15 @@ function makeDom(renderer) {
   const dom = {
     backgroundSelect: new FakeElement({ tagName: 'SELECT', value: 'grid' }),
     renderModeSelect: new FakeElement({ tagName: 'SELECT', value: 'points' }),
+    renderModeMaturityTag: new FakeElement({ hidden: true }),
     depthControls: new FakeElement(),
     rendererControls: new FakeElement(),
     pointsControls: new FakeElement(),
     smokeControls: new FakeElement(),
     ...renderer,
   };
-  for (const [key, [value, step]] of Object.entries(SLIDER_DEFAULTS)) {
-    dom[key] = new FakeElement({ value, min: '0', max: '100', step });
+  for (const [key, [value, step, min = '0']] of Object.entries(SLIDER_DEFAULTS)) {
+    dom[key] = new FakeElement({ value, min, max: '100', step });
   }
   for (const key of DISPLAY_KEYS) dom[key] = new FakeElement();
   return dom;
@@ -224,8 +230,12 @@ function makeViewer(overrides = {}) {
     setAdaptiveLOD: value => calls.push(['setAdaptiveLOD', value]),
     setForceLOD: value => calls.push(['setForceLOD', value]),
     setFrustumCulling: value => calls.push(['setFrustumCulling', value]),
-    getRequestedAntialiasing: () => true,
-    getGrantedAntialiasing: () => true,
+    setAntialiasing: value => {
+      calls.push(['setAntialiasing', value]);
+      return value;
+    },
+    getAntialiasing: () => false,
+    isAntialiasingAvailable: () => true,
     ...overrides,
   };
 }
@@ -248,7 +258,11 @@ function installDocument() {
   Object.defineProperty(globalThis, 'localStorage', {
     configurable: true,
     writable: true,
-    value: { getItem: () => null, setItem: () => {} },
+    value: {
+      getItem: () => null,
+      setItem: () => {},
+      removeItem: () => {},
+    },
   });
   return () => {
     if (priorDocument === undefined) delete globalThis.document;

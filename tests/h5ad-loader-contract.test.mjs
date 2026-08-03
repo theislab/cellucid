@@ -1681,21 +1681,35 @@ test('H5AD dataset metadata counts categorical fields without label payloads', a
   assert.equal(categoryReads, 0);
 });
 
-test('H5AD metadata accepts only exact dimension-suffixed UMAP keys', async t => {
-  await t.test('an unsuffixed X_umap array is never shape-inferred', async () => {
+test('H5AD metadata resolves dimension-suffixed keys, and a plain X_umap by width', async t => {
+  await t.test('an unsuffixed X_umap array is read at its own column count', async () => {
     const loader = loaderWithObs({}, 2);
     loader._obsmKeys = ['X_umap'];
-    let shapeReads = 0;
-    loader.getEmbeddingShape = () => {
-      shapeReads++;
+    const shapeReads = [];
+    loader.getEmbeddingShape = key => {
+      shapeReads.push(key);
       return { shape: [2, 2], nDims: 2 };
     };
+    loader.hasConnectivities = async () => false;
+
+    const metadata = await loader.getDatasetMetadata();
+    assert.deepEqual(shapeReads, ['X_umap']);
+    assert.deepEqual(metadata.embeddings, {
+      available_dimensions: [2],
+      default_dimension: 2,
+      obsm_keys: { '2d': 'X_umap' },
+    });
+  });
+
+  await t.test('an unsuffixed X_umap of an unreadable width is refused', async () => {
+    const loader = loaderWithObs({}, 2);
+    loader._obsmKeys = ['X_umap'];
+    loader.getEmbeddingShape = () => ({ shape: [2, 10], nDims: 10 });
 
     await assert.rejects(
       loader.getDatasetMetadata(),
-      /exact UMAP.*X_umap_1d.*X_umap_2d.*X_umap_3d/i
+      /X_umap_1d.*X_umap_2d.*X_umap_3d/i
     );
-    assert.equal(shapeReads, 0);
   });
 
   await t.test('an explicit key is resolved without alias metadata', async () => {
@@ -2141,7 +2155,7 @@ test('CEL-AUDIT-0122 H5AD rejects PCA-only data instead of silently substituting
 
   await assert.rejects(
     adapter.initialize(),
-    /no exact UMAP embedding.*X_umap_1d.*X_umap_2d.*X_umap_3d/i
+    /no UMAP embedding this viewer can read.*X_umap_1d.*X_umap_2d.*X_umap_3d/i
   );
   assert.equal(adapter.getMetadata(), null);
 });

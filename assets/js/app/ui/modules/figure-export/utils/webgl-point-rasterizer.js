@@ -23,11 +23,11 @@
  * Missing render state is a contract error; export never changes fidelity.
  *
  * ANTIALIASING:
- * `antialias` is a WebGL context-creation attribute, so the viewer's buffer
- * carries whichever value the browser granted it and the user can turn it off.
- * The export requests the granted value rather than a fixed `true`; the
- * viewer's own control measures the difference at 18% of pixels at the default
- * point size and 32% with ultra-light square points.
+ * The viewer draws antialiased or not according to a live setting that also
+ * follows the dataset's cell count. The export requests whatever is in force at
+ * the moment of the export rather than a fixed `true` or a value read once at
+ * startup; the viewer's own control measures the difference at 18% of pixels at
+ * point size 0.75 and 32% with ultra-light square points.
  *
  * CROSS-BROWSER NOTES:
  * - Uses one HTMLCanvasElement WebGL2 backend in every supported browser
@@ -197,7 +197,7 @@ function getWebgl2Context(canvas, antialias) {
       alpha: true,
       // Multisampling is a property of the drawing buffer the user is looking
       // at, not an export preference. The viewer's antialiasing control
-      // measures the difference at 18% of pixels at the default point size and
+      // measures the difference at 18% of pixels at point size 0.75 and
       // 32% with ultra-light square points, so requesting a fixed `true` here
       // would publish a smoother cloud than the screen ever drew.
       antialias,

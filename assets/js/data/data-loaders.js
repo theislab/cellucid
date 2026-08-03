@@ -710,6 +710,79 @@ async function dequantizeToFloat32(options) {
 
 
 /**
+ * The most of an error body worth reading back.
+ *
+ * A refusal explains itself in a sentence or two. Anything past this is either a
+ * server's HTML error page or a stack trace, neither of which belongs in a
+ * notification, and both of which could be arbitrarily large.
+ */
+const MAX_ERROR_BODY_BYTES = 4096;
+
+/**
+ * Turn one refused response into an error that repeats what the server said.
+ *
+ * The status line alone is not a diagnosis. `500 Internal Server Error` on a
+ * gene payload is the shape of a real Cellucid failure — the Python server
+ * refuses a gene whose values are not all finite, and its own message names the
+ * gene and the reason — and discarding the body threw that message away, leaving
+ * the browser to report the one thing that carries no information. The body is
+ * read here, bounded, and attached, so every caller can present it.
+ *
+ * Reading it must never replace the failure with a different one: a body that
+ * cannot be read leaves the status-line error exactly as it was.
+ *
+ * @param {Response} response
+ * @param {string} url
+ * @returns {Promise<Error & {status: number, serverDetail: string|null}>}
+ */
+async function describeFailedResponse(response, url) {
+  let detail = null;
+  try {
+    // Read from the stream rather than with `.text()`: the ceiling that bounds
+    // a payload does not apply to an error body, and a server that answers a
+    // failed request with a megabyte of markup must not be buffered whole to
+    // recover the one sentence that might be in it.
+    const reader = response.body?.getReader?.() ?? null;
+    let body = '';
+    if (reader === null) {
+      body = (await response.text()).slice(0, MAX_ERROR_BODY_BYTES);
+    } else {
+      const decoder = new TextDecoder();
+      let read = 0;
+      for (;;) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        read += chunk.value.byteLength;
+        body += decoder.decode(chunk.value, { stream: true });
+        if (read >= MAX_ERROR_BODY_BYTES) {
+          await reader.cancel();
+          break;
+        }
+      }
+      body += decoder.decode();
+    }
+    const trimmed = body.slice(0, MAX_ERROR_BODY_BYTES).trim();
+    // An HTML error page describes the server, not the request. Reporting its
+    // markup would be worse than reporting nothing.
+    if (trimmed.length > 0 && !trimmed.startsWith('<')) detail = trimmed;
+  } catch {
+    // A body that is already consumed, aborted, or malformed changes nothing
+    // about why the request failed.
+  }
+  const statusText = typeof response.statusText === 'string'
+    && response.statusText.length > 0
+    ? response.statusText
+    : `HTTP ${response.status}`;
+  const error = new Error(
+    `Failed to load ${url}: ${statusText}`
+    + (detail === null ? '' : ` — ${detail}`)
+  );
+  error.status = response.status;
+  error.serverDetail = detail;
+  return error;
+}
+
+/**
  * @param {string} url
  * @param {RequestInit} [init]
  */
@@ -724,9 +797,7 @@ async function fetchOk(url, init, stagedSource = null) {
   throwIfMetadataAborted(signal, 'URL resolution');
   const response = await fetchSampleArtifact(resolvedUrl, init);
   if (!response.ok) {
-    const err = new Error('Failed to load ' + url + ': ' + response.statusText);
-    err.status = response.status;
-    throw err;
+    throw await describeFailedResponse(response, url);
   }
   return response;
 }
@@ -1018,9 +1089,7 @@ async function fetchBinaryWithProgressInternal(
   throwIfAborted(signal);
 
   if (!response.ok) {
-    const err = new Error('Failed to load ' + url + ': ' + response.statusText);
-    err.status = response.status;
-    throw err;
+    throw await describeFailedResponse(response, url);
   }
 
   const contentEncoding = response.headers.get('content-encoding');

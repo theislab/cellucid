@@ -5,6 +5,9 @@
  */
 
 import { getNotificationCenter } from '../../notification-center.js';
+import {
+  explainContinuousPayloadFailure,
+} from '../../../data/continuous-payload-diagnosis.js';
 import { FieldSource } from '../../utils/field-constants.js';
 import { StateValidator } from '../../utils/state-validator.js';
 import {
@@ -415,6 +418,50 @@ export function initGeneExpressionSelector(options) {
     });
   }
 
+  /**
+   * Report a gene that could not be shown, with the reason it could not be.
+   *
+   * Kept apart from `reportTaskFailure` because this one failure has a diagnosis
+   * worth writing out. `Failed to load gene: X` names the symptom and nothing
+   * else — not whether the payload never arrived or arrived unusable, not what
+   * was wrong with it, and not what to do. `explainContinuousPayloadFailure`
+   * knows all three, and the notification centre renders the newlines it uses.
+   *
+   * @param {Promise<unknown>} task
+   * @param {string} geneKey
+   */
+  function reportGeneSelectionFailure(task, geneKey) {
+    if (
+      task === null
+      || typeof task !== 'object'
+      || typeof task.then !== 'function'
+      || typeof task.catch !== 'function'
+    ) {
+      throw new TypeError('Gene selector UI task must be a Promise');
+    }
+    if (typeof geneKey !== 'string' || geneKey.length === 0) {
+      throw new TypeError('Gene selection failure requires the gene key.');
+    }
+    interactionOwner.track(task);
+    task.catch((error) => {
+      if (
+        isFieldInteractionSupersededError(error)
+        || isDatasetFieldLoadSupersededError(error)
+      ) {
+        return;
+      }
+      const exactError = requireError(error, 'Gene selector UI task');
+      console.error(exactError);
+      getNotificationCenter().error(
+        explainContinuousPayloadFailure({
+          subject: { kind: 'gene', name: geneKey },
+          error: exactError,
+        }),
+        { category: 'data', title: 'Gene cannot be shown' }
+      );
+    });
+  }
+
   function readDatasetGeneration() {
     const generation = state.getDatasetGeneration();
     if (!Number.isSafeInteger(generation) || generation < 0) {
@@ -530,11 +577,7 @@ export function initGeneExpressionSelector(options) {
         item.textContent = label;
         item.dataset.originalIdx = String(originalIdx);
         item.addEventListener('click', () => {
-          reportTaskFailure(
-            selectGene(originalIdx),
-            'Failed to load gene',
-            'data'
-          );
+          reportGeneSelectionFailure(selectGene(originalIdx), field.key);
         }, { signal: lifecycle.signal });
         fragment.appendChild(item);
       }
@@ -801,10 +844,9 @@ export function initGeneExpressionSelector(options) {
       firstItem.dataset.originalIdx,
       'Gene dropdown index'
     );
-    reportTaskFailure(
+    reportGeneSelectionFailure(
       selectGene(originalIdx),
-      'Failed to load gene',
-      'data'
+      findGeneEntry(originalIdx).field.key
     );
   }, { signal: lifecycle.signal });
   geneSearch.addEventListener('blur', () => {

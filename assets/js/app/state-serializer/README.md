@@ -325,11 +325,11 @@ Two consequences bind anything that touches this path:
   back on a rejected publication leaves a mismatch, which is raised and rolls
   the session back. Silence is never an outcome.
 
-`#hp-antialias` is the one control whose owner publishes to `localStorage`
-rather than to the viewer, because `antialias` is a WebGL context-creation
-attribute and cannot change on a live context. It is **captured and validated
-like every other control, and deliberately not applied on restore** — the one
-member of `DEVICE_PREFERENCE_CONTROL_IDS`.
+`#hp-antialias` is **captured and validated like every other control, and
+deliberately not applied on restore** — the one member of
+`DEVICE_PREFERENCE_CONTROL_IDS`. Its owner publishes to the viewer *and* to
+`localStorage`: antialiasing is a live setting (`rendering/scene-msaa-target.js`)
+whose stored preference describes the machine rather than the view.
 
 Applying it was a defect, not a design. The owner persists on every `change`,
 including the synthetic one a restore dispatches, so a session became the last
@@ -337,6 +337,11 @@ writer of a preference that describes the machine rather than the view. Every
 sample publishes an advertised default state, so switching antialiasing off and
 reloading re-applied the saved value and stored it, and the setting could never
 stay off; a shared session did the same to whoever opened it.
+
+The stored preference also has a third state, `auto`, which no session can
+express: a checkbox records ticked or unticked, and `auto` is neither. That is a
+second reason a restore must not reach it — replaying a captured tick would
+convert "let the dataset decide" into a choice the user never made.
 
 It stays in the inventory rather than being marked skip, because that keeps the
 published presets valid and keeps a control vanishing from the markup a

@@ -2594,7 +2594,7 @@ export class BottleneckAnalyzer {
         actions: [
           'Reduce point size to decrease fill rate requirements',
           'Make the window smaller — fewer pixels is the biggest immediate win',
-          'Turn antialiasing off under Image quality (applies on the next load)',
+          'Turn antialiasing off under Image quality — it applies to the next frame',
           'Enable more aggressive LOD to reduce vertex count'
         ]
       });
@@ -2721,7 +2721,7 @@ export class BottleneckAnalyzer {
         title: 'Low-end device detected',
         actions: [
           `Only ${jsAnalysis.cpuCores} CPU cores available`,
-          'Turn antialiasing off under Image quality (applies on the next load)',
+          'Turn antialiasing off under Image quality — it applies to the next frame',
           'Reduce data size or enable aggressive LOD',
           'Consider showing fewer points on mobile'
         ]

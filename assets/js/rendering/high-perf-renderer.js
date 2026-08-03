@@ -5655,7 +5655,6 @@ export class HighPerfRenderer {
         // Pass per-view lastLodLevel for hysteresis (prevents oscillation per-view)
         lodLevel = spatialIndex.getLODLevel(
           cameraDistance,
-          viewportHeight,
           viewState.lastLodLevel,
           dimensionLevel,
           overrideBounds
@@ -10488,7 +10487,7 @@ export class HighPerfRenderer {
       if (lodLevel < 0 && lodSpatialIndex) {
         // Pass effectiveDimLevel for correct 2D/3D diagonal calculation (uses snapshot's stored dimension for custom positions)
         // Pass snapshot bounds when available (for custom positions that differ from octree)
-        lodLevel = lodSpatialIndex.getLODLevel(cameraDistance, viewportHeight, viewState.lastLodLevel, effectiveDimLevel, snapshot.bounds);
+        lodLevel = lodSpatialIndex.getLODLevel(cameraDistance, viewState.lastLodLevel, effectiveDimLevel, snapshot.bounds);
       }
     } else {
       // LOD disabled: only respect explicit per-render forceLOD, otherwise full detail

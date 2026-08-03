@@ -133,7 +133,7 @@ function cloneOwnedLegendValue(value, context, seen = new Map()) {
 
 /**
  * @param {object} renderState - the presented per-view render state
- * @param {boolean} antialias - `viewer.getGrantedAntialiasing()`
+ * @param {boolean} antialias - `viewer.getAntialiasing()`
  * @param {string} context
  */
 function cloneRenderState(renderState, antialias, context) {
@@ -788,12 +788,12 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
     // buffer, and the user can turn it off. The figure must be rasterised with
     // the value the viewer was *granted*, so it travels with the snapshot like
     // every other renderer input.
-    if (typeof viewer.getGrantedAntialiasing !== 'function') {
+    if (typeof viewer.getAntialiasing !== 'function') {
       throw new TypeError(
-        'Figure export requires viewer.getGrantedAntialiasing().'
+        'Figure export requires viewer.getAntialiasing().'
       );
     }
-    const grantedAntialiasing = viewer.getGrantedAntialiasing();
+    const grantedAntialiasing = viewer.getAntialiasing();
     throwIfFigureExportAborted(signal);
     if (typeof grantedAntialiasing !== 'boolean') {
       throw new TypeError(

@@ -25,7 +25,12 @@ export const RENDER_MODE_CONTROL_ID = 'render-mode';
 /** Render modes the viewer accepts. Mirrors `ui/modules/render-controls.js`. */
 const RENDER_MODES = Object.freeze(['points', 'smoke']);
 
-/** Reader-facing names, matching the `#render-mode` option text. */
+/**
+ * Reader-facing names, matching the `#render-mode` option text without its
+ * maturity tag. The option reads `Volumetric smoke cloud (alpha)` on screen;
+ * a blocker that names the mode is naming the feature, not its maturity, and
+ * `#render-mode-maturity-tag` is where the maturity is said.
+ */
 const RENDER_MODE_LABELS = Object.freeze({
   points: 'Points',
   smoke: 'Volumetric smoke cloud'

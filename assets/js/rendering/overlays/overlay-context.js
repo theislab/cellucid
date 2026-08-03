@@ -306,6 +306,14 @@ export function buildOverlayContext(options) {
   if (typeof ctx.getLodLevel !== 'function') {
     ctx.getLodLevel = () => ctx._hpRenderer.getCurrentLODLevel(ctx.viewId);
   }
+  // Level 0 is the coarsest and the last level is full detail, so a consumer
+  // that wants "how coarse is this" has to measure from the top. Publishing the
+  // count is what lets it do that without hardcoding the ladder length.
+  if (typeof ctx.getLodLevelCount !== 'function') {
+    ctx.getLodLevelCount = () => (
+      ctx._hpRenderer.getLODLevelCount(ctx.dimensionLevel)
+    );
+  }
   if (typeof ctx.getLodIndices !== 'function') {
     ctx.getLodIndices = () => (
       ctx._hpRenderer.getCurrentLodIndices(ctx.viewId, ctx.dimensionLevel)

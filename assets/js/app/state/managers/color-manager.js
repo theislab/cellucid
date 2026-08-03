@@ -18,6 +18,12 @@ import {
   sampleContinuousColormap
 } from '../../../data/palettes.js';
 import { NEUTRAL_GRAY_UINT8 } from '../core/constants.js';
+import {
+  UndrawableContinuousPayloadError,
+  createNonFiniteTally,
+  hasUndrawableValues,
+  recordNonFiniteValue,
+} from '../../../data/continuous-payload-diagnosis.js';
 import { BaseManager } from '../core/base-manager.js';
 import { colorOutlierMethods } from './color-outliers.js';
 
@@ -168,6 +174,27 @@ export class DataStateColorMethods {
     return this._applyCategoryCountsToCentroids(field, counts);
   }
 
+  /**
+   * Name the field in the words it is shown under, for a diagnosis.
+   *
+   * `activeFieldSource` is what distinguishes a gene from an observation
+   * column, and it is the only thing that changes the remedy: a gene comes out
+   * of `adata.X` and a field out of `adata.obs`. An inactive field is described
+   * as a field, which is what it truthfully is rather than a guess.
+   *
+   * @param {{key?: unknown}} field
+   * @returns {{kind: 'gene'|'field', name: string}}
+   */
+  describeContinuousFieldSubject(field) {
+    const name = typeof field?.key === 'string' && field.key.length > 0
+      ? field.key
+      : 'unnamed';
+    return {
+      kind: this.activeFieldSource === 'var' ? 'gene' : 'field',
+      name,
+    };
+  }
+
   ensureContinuousMetadata(field) {
     requireContinuousField(field);
     if (field.values.length !== this.pointCount) {
@@ -178,11 +205,16 @@ export class DataStateColorMethods {
     let max = -Infinity;
     let minPositive = Infinity;
     let maxPositive = -Infinity;
+    // The range scan is also the diagnosis scan. Reporting on the first
+    // offending value would name one flat index and nothing else; counting them
+    // here costs one pass that was already being made, and turns the refusal
+    // into something the person looking at the screen can act on.
+    const tally = createNonFiniteTally(field.values.length);
     for (let index = 0; index < field.values.length; index++) {
       const value = field.values[index];
-      if (Number.isNaN(value)) continue;
       if (!Number.isFinite(value)) {
-        throw new TypeError(`Continuous field value ${index} must be finite or NaN.`);
+        recordNonFiniteValue(tally, value, index);
+        continue;
       }
       if (value < min) min = value;
       if (value > max) max = value;
@@ -191,8 +223,11 @@ export class DataStateColorMethods {
         if (value > maxPositive) maxPositive = value;
       }
     }
-    if (min === Infinity) {
-      throw new RangeError('Continuous field must contain at least one finite value.');
+    if (hasUndrawableValues(tally) || min === Infinity) {
+      throw new UndrawableContinuousPayloadError({
+        subject: this.describeContinuousFieldSubject(field),
+        tally,
+      });
     }
 
     const computedStats = { min, max };

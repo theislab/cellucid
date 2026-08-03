@@ -96,7 +96,6 @@ import { getGitHubAuthSession } from './community-annotations/github-auth.js';
 import { initKeyboardShortcuts, initWelcomeModal, showWelcomeModal } from './ui/onboarding/index.js';
 import { publishWebBuildVersion } from './ui/core/build-version.js';
 import { retireDeferredControls } from './ui/core/deferred-control-readiness.js';
-import { resolveAntialiasPreference } from './ui/core/antialias-preference.js';
 import {
   initAnalytics,
   trackDataLoadMethod,
@@ -255,17 +254,14 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
     let stopPerfMonitoring = () => {};
 
     debug.log('[Main] Creating viewer...');
-    // `antialias` is fixed at context creation and cannot be changed on a live
-    // context, so the stored preference has to be read here, before the viewer
-    // exists. `render-controls.js` owns the control that writes it; this is the
-    // only place that reads it. A value it could not use is reported below,
-    // once the notification centre exists.
-    const antialiasPreference = resolveAntialiasPreference(localStorage);
+    // Antialiasing is not a construction argument. It is a live setting owned by
+    // `render-controls.js`, which reads the stored preference, resolves it
+    // against the dataset, and publishes it before `viewer.start()` draws the
+    // first frame — see `ui/core/antialias-preference.js`.
     const viewer = createViewer({
       canvas,
       labelLayer,
-      viewTitleLayer,
-      antialias: antialiasPreference.enabled
+      viewTitleLayer
     });
     debug.log('[Main] Viewer created successfully');
 
@@ -316,18 +312,6 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
     // Initialize notification center early
     const notifications = getNotificationCenter();
     notifications.init();
-
-    if (antialiasPreference.discarded !== null) {
-      // Discarded rather than obeyed, and never in silence: the user chose this
-      // setting once and is entitled to know the choice did not survive.
-      notifications.warning(
-        `The stored antialiasing preference `
-        + `${JSON.stringify(antialiasPreference.discarded)} was not recognized `
-        + 'and has been discarded, so antialiasing is on. Set it again in '
-        + 'Visualization if you wanted it off.',
-        { category: 'rendering', title: 'Antialiasing preference reset' }
-      );
-    }
 
     // Construct the optional GitHub annotation session inside the startup
     // boundary so storage/configuration failures cannot leave a blank page.
@@ -1551,6 +1535,13 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
             );
           }
           ui.refreshDatasetUI(activeMetadata);
+          // The cell count is the one thing a sensible opening point size
+          // depends on, and it is known here for the first time. Applied before
+          // `restoreAdvertisedDatasetState`, so a saved session or a published
+          // preset still overrides it.
+          ui.applyDatasetRenderDefaults(
+            publication.stage.generation.identity.stats.n_cells
+          );
         },
         finalize: () => {
           runtimeRetirementOwner.retire(

@@ -1265,7 +1265,14 @@ export class SmokeRenderer {
 
   // === MAIN RENDER METHOD ===
 
-  render({ invViewProjMatrix, eye, lightDir, width, height }) {
+  render({
+    invViewProjMatrix,
+    eye,
+    lightDir,
+    width,
+    height,
+    sceneFramebuffer = null,
+  }) {
     const gl = this.gl;
 
     if (this.contextLost) {
@@ -1421,7 +1428,7 @@ export class SmokeRenderer {
         gl.disable(gl.BLEND);
         gl.clearBufferfv(gl.COLOR, 0, TRANSPARENT_BLACK);
       } else {
-        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, sceneFramebuffer);
         gl.viewport(0, 0, width, height);
         gl.enable(gl.BLEND);
         gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
@@ -1521,7 +1528,7 @@ export class SmokeRenderer {
       gl.drawArrays(gl.TRIANGLES, 0, 3);
 
       if (needsOffscreen) {
-        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, sceneFramebuffer);
         gl.viewport(0, 0, width, height);
         gl.enable(gl.BLEND);
         gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
@@ -1548,7 +1555,7 @@ export class SmokeRenderer {
 
     attempt(
       failures,
-      () => gl.bindFramebuffer(gl.FRAMEBUFFER, null),
+      () => gl.bindFramebuffer(gl.FRAMEBUFFER, sceneFramebuffer),
       'Smoke framebuffer settlement failed with a non-Error value.'
     );
     attempt(
