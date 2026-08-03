@@ -2728,8 +2728,8 @@
     },
     {
       "path": "assets/js/rendering/high-perf/gl-point-draw-state.js",
-      "sha256": "7bec0084e59f0f3753556d37468340c48fad69ec0bb31540ea7c75e5426e16c8",
-      "bytes": 2198,
+      "sha256": "95bbe7c9114c0b53da2afa7a882bd9bf271b506ce0abc38606676b76489b0fae",
+      "bytes": 3280,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
