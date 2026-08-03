@@ -16,6 +16,14 @@ const VIEWPORT = { width: 1440, height: 1000 };
 const CANVAS_CLIP = { x: 420, y: 260, width: 480, height: 380 };
 const SAMPLE_COUNT = 8;
 const SAMPLE_INTERVAL_MS = 150;
+// Sampling a frame is a full-viewport screenshot, and on a hosted runner with no
+// GPU one costs far more than the 150 ms between samples. The path has to still
+// be playing while all eight are taken, or every sample lands after the end,
+// they all hash identically, and "it animated" reads as "it did not" — which is
+// exactly how this failed on hosted macOS Firefox while passing everywhere else.
+// Eight seconds leaves room for a screenshot an order of magnitude slower than
+// on developer hardware, and the transport poll below allows thirty.
+const PATH_DURATION_SECONDS = 8;
 
 function observeProductErrors(page) {
   const errors = [];
@@ -99,7 +107,9 @@ async function preparePath(page) {
     };
   });
 
-  await page.locator('#cinematic-set-all-duration').fill('2');
+  await page.locator('#cinematic-set-all-duration').fill(
+    String(PATH_DURATION_SECONDS)
+  );
   await page.locator('#cinematic-set-all-btn').click();
 
   await page.evaluate(() => {

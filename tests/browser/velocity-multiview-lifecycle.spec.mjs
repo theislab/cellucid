@@ -424,6 +424,17 @@ test(
     await expect(page.locator('#dataset-name')).toHaveText(
       'Current UI prepared fixture',
     );
+    // The injection below fails the next framebuffer *anyone* asks for, and the
+    // scene multisample target is the other thing in the frame that asks. It
+    // allocates lazily, on the first frame at a given drawing-buffer size, so
+    // whether it or the overlay consumes the one-shot failure depends on
+    // whether opening the overlay panel resized the canvas — which differs by
+    // engine, and is why this passed everywhere except one. Antialiasing off
+    // means `beginFrame` returns before allocating, so the failure can only
+    // reach the thing this test is named after.
+    await page.locator('#hp-antialias').uncheck();
+    await expect(page.locator('#hp-antialias')).not.toBeChecked();
+
     await page.locator('#glcanvas').evaluate(canvas => {
       const gl = canvas.getContext('webgl2');
       const original = gl.createFramebuffer.bind(gl);

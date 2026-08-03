@@ -164,6 +164,18 @@ export function createSceneMsaaTarget(gl) {
       gl.bindRenderbuffer(gl.RENDERBUFFER, null);
 
       candidateFramebuffer = gl.createFramebuffer();
+      // A context that cannot give out another framebuffer returns null, and
+      // null is also how WebGL names the *default* framebuffer. Binding it
+      // therefore succeeds, `checkFramebufferStatus` reports the canvas's own
+      // complete framebuffer, and the failure reads as success: `framebuffer`
+      // stays null while `allocatedWidth`/`allocatedHeight` claim an allocation
+      // that never happened. Every later frame then re-enters `allocate` and
+      // churns a fresh pair of renderbuffers, forever, in silence.
+      if (candidateFramebuffer === null) {
+        throw new Error(
+          'Scene multisample framebuffer could not be created.'
+        );
+      }
       gl.bindFramebuffer(gl.FRAMEBUFFER, candidateFramebuffer);
       gl.framebufferRenderbuffer(
         gl.FRAMEBUFFER,
