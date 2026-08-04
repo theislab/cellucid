@@ -14,15 +14,21 @@ const PREPARED_DATASET_URL =
 
 const VIEWPORT = { width: 1440, height: 1000 };
 const CANVAS_CLIP = { x: 420, y: 260, width: 480, height: 380 };
-const SAMPLE_COUNT = 8;
-const SAMPLE_INTERVAL_MS = 150;
-// Sampling a frame is a full-viewport screenshot, and on a hosted runner with no
-// GPU one costs far more than the 150 ms between samples. The path has to still
-// be playing while all eight are taken, or every sample lands after the end,
-// they all hash identically, and "it animated" reads as "it did not" — which is
-// exactly how this failed on hosted macOS Firefox while passing everywhere else.
-// Eight seconds leaves room for a screenshot an order of magnitude slower than
-// on developer hardware, and the transport poll below allows thirty.
+// Sampling a frame is a screenshot, and on a hosted runner with no GPU one
+// costs far more than the wait between samples — so the sample count, not the
+// interval, is what this test's wall-clock is made of. Four samples spaced
+// 300 ms apart watch for the same 1.2 s as the eight-at-150 ms they replace,
+// at half the screenshots. Reduced motion is the case that has to take all of
+// them; ordinary playback stops as soon as two samples differ, which is the
+// whole of what it asserts.
+const SAMPLE_COUNT = 4;
+const SAMPLE_INTERVAL_MS = 300;
+// The path has to still be playing while the samples that matter are taken, or
+// they all land after the end, hash identically, and "it animated" reads as "it
+// did not" — which is exactly how this failed on hosted macOS Firefox while
+// passing everywhere else. Eight seconds leaves room for a screenshot an order
+// of magnitude slower than on developer hardware, and the transport poll below
+// allows thirty.
 const PATH_DURATION_SECONDS = 8;
 
 function observeProductErrors(page) {
@@ -149,6 +155,17 @@ async function playAndMeasure(page, reducedMotion) {
   const framesWhilePlaying = new Set();
   for (let sample = 0; sample < SAMPLE_COUNT; sample += 1) {
     framesWhilePlaying.add(await hashCanvas(page));
+    // Ordinary playback is proven the moment two samples differ, and every
+    // sample after that costs another full screenshot for evidence already in
+    // hand. On a hosted runner without a GPU one screenshot is most of a
+    // second, and these two tests were spending 75 s and 71 s of their 90 s
+    // fence while the next test in the same shard took 11 s — close enough to
+    // the fence that the pair failed there and nowhere else. Stopping at the
+    // proof keeps the assertion below exactly as strong and returns the margin.
+    //
+    // Reduced motion asserts the opposite, that every sample is identical, so
+    // it has no early exit: that case has to look the whole window.
+    if (!reducedMotion && framesWhilePlaying.size > 1) break;
     await page.waitForTimeout(SAMPLE_INTERVAL_MS);
   }
 
