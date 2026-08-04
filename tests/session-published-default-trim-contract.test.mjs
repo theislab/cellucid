@@ -41,9 +41,11 @@ import {
 import {
   CURRENT_GENERIC_STATIC_CHUNK_PROFILES,
   PUBLISHED_DEFAULT_DROPPED_CHUNK_PROFILES,
+  PUBLISHED_DEFAULT_SOURCE_TYPE,
   PUBLISHED_DEFAULT_STATIC_CHUNK_PROFILE,
   STATIC_CHUNK_PROFILE_KEYS,
   assertPublishedDefaultChunkProfile,
+  rebindPublishedDefaultFingerprint,
   trimToPublishedDefault,
 } from '../assets/js/app/session/published-default.js';
 import {
@@ -155,9 +157,15 @@ test('every chunk a save can drop has a fixture that says what empty means', () 
 /**
  * A serializer whose contributors emit exactly the given chunks.
  *
+ * `identity` is what the data-source manager would report. A capture takes it
+ * from the source it was captured through and a published default is read
+ * under the catalog's, so the two differ by construction — a serializer that
+ * could not express that could not restore a published preset at all.
+ *
  * @param {{ profile: object, payload: any }[]} emissions
+ * @param {{ sourceType: string, datasetId: string }|null} [identity]
  */
-function makeSerializer(emissions) {
+function makeSerializer(emissions, identity = null) {
   const byContributor = new Map();
   for (const emission of emissions) {
     const list = byContributor.get(emission.profile.contributorId) ?? [];
@@ -184,7 +192,10 @@ function makeSerializer(emissions) {
     },
     viewer: {},
     sidebar: {},
-    dataSourceManager: null,
+    dataSourceManager: identity === null ? null : {
+      getCurrentSourceType: () => identity.sourceType,
+      getCurrentDatasetId: () => identity.datasetId,
+    },
     comparisonModule: null,
     analysisWindowManager: null,
     cinematicCamera: null,
@@ -223,6 +234,36 @@ function refusalOf(run) {
   return run().then(
     () => null,
     error => error.message,
+  );
+}
+
+const PUBLISHED_DATASET_ID = 'trim-contract-generation';
+
+/**
+ * The identity this capture would be published under.
+ *
+ * Publishing renames a capture and may not redescribe it, so the describing
+ * fields are read back out of the capture itself: a fixture that stated them
+ * independently would be asserting its own arithmetic rather than the rule.
+ *
+ * @param {Blob} save
+ * @param {object} [overrides] Fields to change, for the refusal cases.
+ */
+async function publishedIdentityFor(save, overrides = {}) {
+  const { manifest } = await readBundleParts(save);
+  return {
+    ...manifest.datasetFingerprint,
+    sourceType: PUBLISHED_DEFAULT_SOURCE_TYPE,
+    datasetId: PUBLISHED_DATASET_ID,
+    ...overrides,
+  };
+}
+
+/** Trim a capture under the identity it would really be published with. */
+async function publish(save, overrides = {}) {
+  return trimToPublishedDefault(
+    save,
+    await publishedIdentityFor(save, overrides),
   );
 }
 
@@ -309,7 +350,7 @@ test('the trim refuses to discard a recorded camera path', async () => {
     },
   });
 
-  const refusal = await refusalOf(() => trimToPublishedDefault(save));
+  const refusal = await refusalOf(() => publish(save));
   assert.ok(refusal !== null, 'the trim must refuse a save with a camera path');
   assert.match(
     refusal,
@@ -326,7 +367,7 @@ test('the trim refuses to discard a recorded camera path', async () => {
   // The same save with the path cleared publishes. Only the keyframe differs
   // between the two, which is what proves the refusal is the recorded path and
   // not something else about this capture.
-  const cleared = await trimToPublishedDefault(await captureSave());
+  const cleared = await publish(await captureSave());
   assert.deepEqual(
     (await readBundleParts(cleared)).manifest.chunks.map(chunk => chunk.id),
     KEPT_IDS,
@@ -340,7 +381,7 @@ test('the trim refuses to discard a non-empty analysis cache inventory', async (
     },
   });
 
-  const refusal = await refusalOf(() => trimToPublishedDefault(save));
+  const refusal = await refusalOf(() => publish(save));
   assert.ok(refusal !== null, 'the trim must refuse a save with cached artifacts');
   assert.match(refusal, /analysis\/cache-inventory/);
   assert.match(refusal, /artifactIds holds 1 entry/);
@@ -363,7 +404,7 @@ test('the trim refuses a chunk that is not one of the droppable singletons', asy
     payload: Uint8Array.of(1, 2, 3),
   }]);
 
-  const refusal = await refusalOf(() => trimToPublishedDefault(save));
+  const refusal = await refusalOf(() => publish(save));
   assert.ok(refusal !== null, 'the trim must refuse an unrecognised chunk');
   assert.match(refusal, /highlights\/cells\/group_1/);
   assert.match(
@@ -382,9 +423,138 @@ test('the trim refuses a dropped chunk whose payload shape is unrecognised', asy
     'analysis/cache-inventory': { artifactIds: [], pending: { gene: 'CD8A' } },
   });
 
-  const refusal = await refusalOf(() => trimToPublishedDefault(save));
+  const refusal = await refusalOf(() => publish(save));
   assert.ok(refusal !== null, 'the trim must refuse an unrecognised payload shape');
   assert.match(refusal, /pending is a nested record this publish step cannot prove empty/);
+});
+
+/* ------------------------------------------------------------------ *
+ * 2b. Publishing renames the capture, and may only rename it.
+ *
+ * A preset is authored by serving the prepared generation locally, so the
+ * capture records that serve's identity while the catalog serves the same bytes
+ * as `local-demo` under the generation's own id. `datasetFingerprintMatches()`
+ * compares both fields, so a preset that shipped with the capture's identity
+ * was refused on every open and the sample showed none of its published view.
+ * Five presets shipped that way.
+ * ------------------------------------------------------------------ */
+
+test('publishing rebinds a local capture to the identity it ships under', async () => {
+  const captured = {
+    sourceType: 'local-user',
+    datasetId: 'local-user:suo',
+    cellCount: 561_947,
+    varCount: 5_103,
+    cellOrder: { dimension: 3, digest: 'a229f7d3347dbb46' },
+  };
+  const rebound = rebindPublishedDefaultFingerprint(captured, {
+    ...captured,
+    sourceType: PUBLISHED_DEFAULT_SOURCE_TYPE,
+    datasetId: 'suo',
+  });
+
+  assert.deepEqual(rebound, {
+    sourceType: PUBLISHED_DEFAULT_SOURCE_TYPE,
+    datasetId: 'suo',
+    cellCount: 561_947,
+    varCount: 5_103,
+    cellOrder: { dimension: 3, digest: 'a229f7d3347dbb46' },
+  });
+  assert.notEqual(
+    rebound.datasetId,
+    captured.datasetId,
+    'the rename is the whole point; a rebinding that kept the capture id would '
+      + 'reproduce the defect this function exists to make impossible',
+  );
+});
+
+test('publishing refuses to restate what a capture was taken against', async () => {
+  const captured = {
+    sourceType: 'local-user',
+    datasetId: 'local-user:suo',
+    cellCount: 561_947,
+    varCount: 5_103,
+    cellOrder: { dimension: 3, digest: 'a229f7d3347dbb46' },
+  };
+  const published = {
+    ...captured,
+    sourceType: PUBLISHED_DEFAULT_SOURCE_TYPE,
+    datasetId: 'suo',
+  };
+
+  // Each describing field, one at a time, so a rule that checked only some of
+  // them fails here naming the one it skipped.
+  const corruptions = [
+    ['cell count', { cellCount: 561_946 }],
+    ['gene count', { varCount: 5_102 }],
+    ['embedding dimension', { cellOrder: { dimension: 2, digest: 'a229f7d3347dbb46' } }],
+    ['cell-order digest', { cellOrder: { dimension: 3, digest: '0000000000000000' } }],
+  ];
+  for (const [label, override] of corruptions) {
+    assert.throws(
+      () => rebindPublishedDefaultFingerprint(captured, {
+        ...published,
+        ...override,
+      }),
+      new RegExp(`cannot be published as "suo".*${label}`, 's'),
+      `a capture whose ${label} disagrees with the generation must be refused, `
+        + 'because publishing it would stamp the generation\'s name onto data '
+        + 'that is not the generation\'s',
+    );
+  }
+});
+
+test('publishing refuses an identity a published default is never read under', async () => {
+  const captured = {
+    sourceType: 'local-user',
+    datasetId: 'local-user:suo',
+    cellCount: 3,
+    varCount: 0,
+    cellOrder: { dimension: 3, digest: '0123456789abcdef' },
+  };
+  assert.throws(
+    () => rebindPublishedDefaultFingerprint(captured, {
+      ...captured,
+      sourceType: 'remote',
+      datasetId: 'suo',
+    }),
+    /cannot be published as "remote"/,
+    'a published default is fetched from a generation directory that only an '
+      + 'advertised catalog entry has, so no other source type can read it',
+  );
+  // `null` is the identity a viewer with no data-source manager reports, and
+  // the fingerprint schema permits it, so this is the one the rebinding itself
+  // has to refuse rather than the schema.
+  assert.throws(
+    () => rebindPublishedDefaultFingerprint(captured, {
+      ...captured,
+      sourceType: PUBLISHED_DEFAULT_SOURCE_TYPE,
+      datasetId: null,
+    }),
+    /must name the generation it ships beside/,
+  );
+  assert.throws(
+    () => rebindPublishedDefaultFingerprint(captured, {
+      ...captured,
+      sourceType: PUBLISHED_DEFAULT_SOURCE_TYPE,
+      datasetId: '',
+    }),
+    /datasetId must be a nonempty trimmed string/,
+    'an empty id is refused by the fingerprint schema before the rebinding '
+      + 'rule sees it, which is the same answer by a shorter route',
+  );
+});
+
+test('the trim will not publish a capture without an identity to publish it under', async () => {
+  const save = await captureSave();
+  const refusal = await refusalOf(() => trimToPublishedDefault(save));
+  assert.ok(
+    refusal !== null,
+    'omitting the identity must be refused rather than producing a file that '
+      + 'carries the capture identity by default -- that default is exactly '
+      + 'what shipped five inert presets',
+  );
+  assert.match(refusal, /Published dataset fingerprint/);
 });
 
 /* ------------------------------------------------------------------ *
@@ -394,7 +564,7 @@ test('the trim refuses a dropped chunk whose payload shape is unrecognised', asy
 test('the trim turns an empty save into a preset the application accepts', async () => {
   const save = await captureSave();
   const saveParts = await readBundleParts(save);
-  const trimmed = await trimToPublishedDefault(save);
+  const trimmed = await publish(save);
   const trimmedParts = await readBundleParts(trimmed);
 
   assert.deepEqual(
@@ -407,13 +577,19 @@ test('the trim turns an empty save into a preset the application accepts', async
     () => assertPublishedDefaultChunkProfile(trimmedParts.manifest.chunks),
   );
 
-  // Nothing was rewritten on the way through: the surviving chunks are the
-  // bytes the application itself wrote, and the manifest keeps the capture's
-  // own provenance.
+  // Nothing was rewritten on the way through except the identity: the
+  // surviving chunks are the bytes the application itself wrote, and the
+  // manifest keeps the capture's own provenance.
   assert.equal(trimmedParts.manifest.createdAt, saveParts.manifest.createdAt);
   assert.deepEqual(
     trimmedParts.manifest.datasetFingerprint,
-    saveParts.manifest.datasetFingerprint,
+    {
+      ...saveParts.manifest.datasetFingerprint,
+      sourceType: PUBLISHED_DEFAULT_SOURCE_TYPE,
+      datasetId: PUBLISHED_DATASET_ID,
+    },
+    'publishing renames the capture and changes nothing else about what it '
+      + 'was taken against',
   );
   for (const kept of trimmedParts.chunks) {
     const original = saveParts.chunks.find(
@@ -427,13 +603,17 @@ test('the trim turns an empty save into a preset the application accepts', async
     );
   }
 
-  // The real acceptance: the application restores it, and restores every chunk.
+  // The real acceptance: the application restores it, and restores every
+  // chunk. The reader is the catalog opening the sample, so it presents the
+  // published identity — which is what the rebinding above exists to match, and
+  // what a preset carrying its capture's identity fails against.
   const restored = [];
   const reader = makeSerializer(
     PUBLISHED_DEFAULT_STATIC_CHUNK_PROFILE.map(profile => ({
       profile,
       payload: { chunkId: profile.id },
     })),
+    { sourceType: PUBLISHED_DEFAULT_SOURCE_TYPE, datasetId: PUBLISHED_DATASET_ID },
   );
   for (const contributor of reader._contributors) {
     contributor.restore = (_ctx, meta) => restored.push(meta.id);

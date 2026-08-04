@@ -477,10 +477,16 @@ export const SESSION_WITHOUT_CELL_IDENTITY_MESSAGE =
 const CELL_ORDER_DIGESTS = new WeakMap();
 
 /**
+ * Exported for the publishing step in `cellucid-datasets`, which recomputes a
+ * generation's digest from the coordinates it ships to prove a capture belongs
+ * to it. That check has to run the function the application runs, not a
+ * transcription of it: a transcription that drifted would approve exactly the
+ * presets the reader then refuses.
+ *
  * @param {Float32Array} positions
  * @returns {string} 16 lowercase hexadecimal characters.
  */
-function digestCellOrder(positions) {
+export function digestCellOrder(positions) {
   const memoized = CELL_ORDER_DIGESTS.get(positions);
   if (memoized !== undefined) return memoized;
   // A Float32Array is always 4-byte aligned, so its buffer can be read as
@@ -675,7 +681,12 @@ export function datasetFingerprintMatches(a, b) {
  * them distrust a sound dataset.
  *
  * What each field can prove differs:
- * - The scalars name the dataset, so a difference there is conclusive.
+ * - The counts are conclusive, and they are also the evidence the first message
+ *   quotes, so that message is reserved for the case where they actually
+ *   differ. Two copies of one dataset opened through different sources agree on
+ *   every count, and quoting the same two numbers on both sides of "a different
+ *   dataset" reads as a broken check rather than a finding — so the identity
+ *   fields get their own sentence, which names the identities instead.
  * - The dimension is read directly, so a difference there is conclusive.
  * - `cellOrder.digest` is a one-way fold over the coordinate bytes in row
  *   order. It changes when the rows are permuted and it changes when the
@@ -690,12 +701,30 @@ export function datasetFingerprintMatches(a, b) {
  * @param {any} current
  * @returns {string|null} null when the two fingerprints are the same identity.
  */
+/**
+ * Name one side of an identity mismatch the way the person reading it would.
+ *
+ * Both fields are nullable, and either can be the one that differs, so this
+ * says whichever is available rather than interpolating a bare `null` or
+ * printing the same id on both sides of a sentence about a difference.
+ *
+ * @param {{sourceType: string|null, datasetId: string|null}} fingerprint
+ * @returns {string}
+ */
+function describeDatasetIdentity(fingerprint) {
+  if (typeof fingerprint.datasetId === 'string' && fingerprint.datasetId !== '') {
+    return `"${fingerprint.datasetId}"`;
+  }
+  if (typeof fingerprint.sourceType === 'string' && fingerprint.sourceType !== '') {
+    return `a dataset opened from ${fingerprint.sourceType}`;
+  }
+  return 'a dataset that recorded no source';
+}
+
 export function describeDatasetFingerprintMismatch(saved, current) {
   if (datasetFingerprintMatches(saved, current)) return null;
   if (
-    saved.sourceType !== current.sourceType
-    || saved.datasetId !== current.datasetId
-    || saved.cellCount !== current.cellCount
+    saved.cellCount !== current.cellCount
     || saved.varCount !== current.varCount
   ) {
     return (
@@ -705,6 +734,26 @@ export function describeDatasetFingerprintMismatch(saved, current) {
       + `${current.cellCount.toLocaleString('en-US')} cells and `
       + `${current.varCount.toLocaleString('en-US')} genes now). Open the `
       + 'dataset the session was saved on, then load the session again.'
+    );
+  }
+  // The counts are the evidence in the message above, so it can only be used
+  // where they differ. A session captured on the same data through a different
+  // source — the common one is a preset captured against a locally served copy
+  // of a dataset the catalog also publishes — reaches here with every count
+  // equal, and printing the same two numbers twice as proof of a difference
+  // reads as a bug in the check rather than a fact about the file.
+  if (
+    saved.sourceType !== current.sourceType
+    || saved.datasetId !== current.datasetId
+  ) {
+    return (
+      'This session was saved on a different copy of this dataset. It has the '
+      + `same ${saved.cellCount.toLocaleString('en-US')} cells and `
+      + `${saved.varCount.toLocaleString('en-US')} genes, but it was saved on `
+      + `${describeDatasetIdentity(saved)} and `
+      + `${describeDatasetIdentity(current)} is open now, so Cellucid cannot `
+      + 'confirm the two hold their cells in the same order. Open the dataset '
+      + 'the session was saved on, then load the session again.'
     );
   }
   if (saved.cellOrder.dimension !== current.cellOrder.dimension) {

@@ -1444,8 +1444,8 @@
     },
     {
       "path": "assets/js/app/session/published-default.js",
-      "sha256": "04f1ffec8a80912545cbfc0775a27bd4388f9100a7addfca752b2f2e319cbb94",
-      "bytes": 13986,
+      "sha256": "7a69a6107a0471055841bd66d52c27b7b30381bf9ee66a607338d1b1fabbd99c",
+      "bytes": 19481,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
@@ -1456,8 +1456,8 @@
     },
     {
       "path": "assets/js/app/session/session-context.js",
-      "sha256": "f7c0ae6afd1ad750be970e0171a90c44e1d7d061b9ae49ec07a0fab9ac7a9309",
-      "bytes": 23145,
+      "sha256": "ca2ae7c4866f47d12ea9d28d86967280cc50f1f1a1552e8c20cddfe33a324c3b",
+      "bytes": 25685,
       "content_type": "application/javascript; charset=utf-8"
     },
     {

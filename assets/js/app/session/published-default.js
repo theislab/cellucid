@@ -23,6 +23,11 @@
  * - {@link trimToPublishedDefault} is the publish step. It drops what the
  *   profile has no room for and **refuses when a dropped chunk carries
  *   anything**, so the precondition is enforced instead of trusted.
+ * - {@link rebindPublishedDefaultFingerprint} is the other half of publishing.
+ *   A preset is captured against a local serve of the generation and read back
+ *   as a catalog sample, and those are two identities; carrying the capture's
+ *   through produces a file the reader refuses on every open. Publishing
+ *   renames the capture, and verifies that it may.
  *
  * The droppable set is derived, not restated: it is
  * {@link CURRENT_GENERIC_STATIC_CHUNK_PROFILES} minus the published five. A
@@ -45,6 +50,7 @@ import {
   assertPlainRecord,
   assertSafeInteger
 } from './schema-contract.js';
+import { assertDatasetFingerprint } from './session-context.js';
 
 /** Transport ceiling for a published default, before decompression. */
 export const MAX_PUBLISHED_DEFAULT_STATE_BYTES = 32 * 1024;
@@ -294,6 +300,113 @@ async function decodeJsonChunkPayload(chunk) {
 }
 
 /**
+ * The source type every published default is opened under.
+ *
+ * A published default is fetched from the generation's own directory, which
+ * only an advertised catalog entry has — `assertDatasetStateDescriptor()` in
+ * `dataset-state-manifest.js` refuses a descriptor of any other source type. So
+ * this is not a default a caller may override: it is the only identity under
+ * which the file this step writes is ever read.
+ */
+export const PUBLISHED_DEFAULT_SOURCE_TYPE = 'local-demo';
+
+/**
+ * The fingerprint fields that describe the data rather than name it.
+ *
+ * The split is the whole of the rebinding rule below: publishing may rename a
+ * dataset and may never redescribe it.
+ */
+const DATASET_DESCRIBING_FINGERPRINT_FIELDS = Object.freeze([
+  Object.freeze({
+    read: fingerprint => fingerprint.cellCount,
+    label: 'cell count'
+  }),
+  Object.freeze({
+    read: fingerprint => fingerprint.varCount,
+    label: 'gene count'
+  }),
+  Object.freeze({
+    read: fingerprint => fingerprint.cellOrder.dimension,
+    label: 'embedding dimension'
+  }),
+  Object.freeze({
+    read: fingerprint => fingerprint.cellOrder.digest,
+    label: 'cell-order digest'
+  })
+]);
+
+/**
+ * Bind a capture's fingerprint to the identity it will be published under.
+ *
+ * A preset is authored by opening the generation and framing a view, and the
+ * natural way to do that is to serve the prepared directory locally. That
+ * capture records the identity of the *serve* — `local-user`, and a dataset id
+ * the local source made up — while the catalog serves the same bytes as
+ * {@link PUBLISHED_DEFAULT_SOURCE_TYPE} under the generation's own id.
+ * `datasetFingerprintMatches()` compares both fields, so a preset published with
+ * the capture's identity can never match the dataset it ships beside: the file
+ * is structurally valid, and the reader refuses it on identity every time the
+ * sample is opened. Carrying the capture's identity through was how five
+ * shipped presets came to refuse themselves.
+ *
+ * Renaming is safe only because the four describing fields are *verified*
+ * rather than replaced. A mismatch means the capture was taken against
+ * different data, and stamping the published name onto it would assert an
+ * identity the bytes do not have — so it is refused, naming the field.
+ *
+ * `cellOrder.digest` is carried from the capture rather than recomputed: this
+ * module never sees coordinates. What proves it is the digest of the *published*
+ * coordinates is the publishing repository's own step, which recomputes it from
+ * the generation's point payload before calling here.
+ *
+ * @param {any} captured - `manifest.datasetFingerprint` of the capture.
+ * @param {any} published - The fingerprint the generation is served under.
+ * @returns {object} The fingerprint the published default carries.
+ */
+export function rebindPublishedDefaultFingerprint(captured, published) {
+  assertDatasetFingerprint(captured, 'Captured dataset fingerprint');
+  assertDatasetFingerprint(published, 'Published dataset fingerprint');
+
+  if (published.sourceType !== PUBLISHED_DEFAULT_SOURCE_TYPE) {
+    throw new TypeError(
+      `A published default is read as ${PUBLISHED_DEFAULT_SOURCE_TYPE}, so it `
+      + `cannot be published as ${JSON.stringify(published.sourceType)}.`
+    );
+  }
+  if (typeof published.datasetId !== 'string' || published.datasetId === '') {
+    throw new TypeError(
+      'A published default must name the generation it ships beside.'
+    );
+  }
+
+  for (const field of DATASET_DESCRIBING_FINGERPRINT_FIELDS) {
+    const capturedValue = field.read(captured);
+    const publishedValue = field.read(published);
+    if (capturedValue !== publishedValue) {
+      throw new Error(
+        `This capture cannot be published as "${published.datasetId}": it was `
+        + `taken against data with a ${field.label} of `
+        + `${JSON.stringify(capturedValue)}, and that generation publishes `
+        + `${JSON.stringify(publishedValue)}. Publishing renames a capture; it `
+        + 'cannot restate what the capture was taken against. Re-capture the '
+        + 'view on the generation being published.'
+      );
+    }
+  }
+
+  return {
+    sourceType: PUBLISHED_DEFAULT_SOURCE_TYPE,
+    datasetId: published.datasetId,
+    cellCount: captured.cellCount,
+    varCount: captured.varCount,
+    cellOrder: {
+      dimension: captured.cellOrder.dimension,
+      digest: captured.cellOrder.digest
+    }
+  };
+}
+
+/**
  * Turn a Save State into the published default it would become, or refuse.
  *
  * The refusal is the point. Publishing drops chunks, and a dropped chunk that
@@ -301,10 +414,19 @@ async function decodeJsonChunkPayload(chunk) {
  * still loads, and the camera path the author recorded is simply not there. So
  * this drops only what it can prove empty, and names what it found otherwise.
  *
+ * The same applies to identity, which is not a chunk and is just as invisible
+ * when it is wrong — see {@link rebindPublishedDefaultFingerprint}.
+ *
  * @param {Blob} source - A `.cellucid-session` written by Save State.
+ * @param {object} publishedIdentity - The fingerprint the generation is served
+ *   under, in the shape `getDatasetFingerprint()` produces.
  * @returns {Promise<Blob>} The publishable `default.cellucid-session`.
  */
-export async function trimToPublishedDefault(source) {
+export async function trimToPublishedDefault(source, publishedIdentity) {
+  // Checked before the source is read, so a caller that omitted the identity is
+  // told so instead of watching a trim succeed and produce an inert file.
+  assertDatasetFingerprint(publishedIdentity, 'Published dataset fingerprint');
+
   // Fail closed: every droppable chunk must be one this step can inspect. A
   // singleton added to the session with a payload shape that is not JSON would
   // otherwise be dropped on the strength of never having been considered.
@@ -395,7 +517,10 @@ export async function trimToPublishedDefault(source) {
   const trimmed = writeBundle({
     manifest: {
       createdAt: manifest.createdAt,
-      datasetFingerprint: manifest.datasetFingerprint,
+      datasetFingerprint: rebindPublishedDefaultFingerprint(
+        manifest.datasetFingerprint,
+        publishedIdentity
+      ),
       chunks: kept.map(chunk => chunk.meta)
     },
     chunks: kept.map(chunk => chunk.bytes)
