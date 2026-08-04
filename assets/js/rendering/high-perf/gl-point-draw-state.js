@@ -12,6 +12,34 @@
 // check below.
 const CONTEXT_LOST_WEBGL = 0x9242;
 
+/**
+ * The name every terminal context-loss refusal carries.
+ *
+ * Two places raise one: `_assertOperational()` in the renderer, through
+ * `HighPerfRendererContextLostError`, and `requireCleanWebGLState()` below,
+ * which cannot construct that class without importing the module that imports
+ * this one. The name is what the two have in common, so it lives here — in the
+ * leaf both sides can reach — rather than being spelled out twice.
+ */
+export const CONTEXT_LOST_ERROR_NAME = 'HighPerfRendererContextLostError';
+
+/**
+ * Whether this is a renderer refusal to work on a context that is gone.
+ *
+ * A lost context is a terminal condition the viewer already owns a fence for,
+ * not a defect: the frame loop stops, the GPU ownership graph is retired, and
+ * only a reload builds a coherent replacement. Callers that drive the renderer
+ * from a callback the platform invokes — a frame, a resize — use this to tell
+ * that condition apart from a real failure, because rethrowing it there reaches
+ * `window.onerror` and reports a handled loss as a crash.
+ *
+ * @param {unknown} error
+ * @returns {boolean}
+ */
+export function isContextLostError(error) {
+  return error instanceof Error && error.name === CONTEXT_LOST_ERROR_NAME;
+}
+
 function requireCleanWebGLState(gl, owner) {
   const errorCode = gl.getError();
   if (errorCode === gl.NO_ERROR) return;
@@ -29,7 +57,7 @@ function requireCleanWebGLState(gl, owner) {
     const lost = new Error(
       `${owner} cannot continue after its WebGL context was lost.`
     );
-    lost.name = 'HighPerfRendererContextLostError';
+    lost.name = CONTEXT_LOST_ERROR_NAME;
     throw lost;
   }
   throw new Error(

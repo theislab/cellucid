@@ -22,6 +22,7 @@ import {
 import { CENTROID_VS, CENTROID_FS } from './shaders/centroid-shaders.js';
 import { SmokeRenderer } from './smoke-cloud/smoke-renderer.js';
 import { HighPerfRenderer } from './high-perf-renderer.js';
+import { isContextLostError } from './high-perf/gl-point-draw-state.js';
 import { HighlightTools } from './highlight-renderer.js';
 import { OrbitAnchorRenderer } from './orbit-anchor.js';
 import { createProjectileSystem } from './projectiles.js';
@@ -6118,6 +6119,13 @@ export function createViewer({
    */
   function render() {
     if (disposed || webglContextLost || renderPaused) return;
+    // A context can be physically gone before `webglcontextlost` is delivered,
+    // which is exactly the window a forced loss lands in and the reason the
+    // asynchronous commits above fence on the same question. A frame drawn in
+    // that window reaches the renderer's GL preflight, which refuses a lost
+    // context by design; the refusal is terminal, the event that follows owns
+    // the cleanup, and there is nothing to draw either way.
+    if (isWebGLContextLostForAsyncCommit()) return;
     animationHandle = requestAnimationFrame(render);
     renderFrameId = renderFrameId === Number.MAX_SAFE_INTEGER
       ? 0
@@ -6126,6 +6134,22 @@ export function createViewer({
     sceneMsaaTarget.beginFrame(frameSize.width, frameSize.height);
     try {
       renderSceneFrame();
+    } catch (error) {
+      // The loss can also happen *inside* the frame, after the check above
+      // passed. The renderer identifies that refusal so this boundary can tell
+      // it from a defect: rethrowing here reaches `window.onerror` and reports
+      // a handled loss as a crash, which is what a page-error assertion in the
+      // terminal-disposal contract caught. Anything else is a real failure and
+      // still propagates untouched.
+      if (!isContextLostError(error)) throw error;
+      const scheduledAnimationHandle = animationHandle;
+      animationHandle = null;
+      if (scheduledAnimationHandle !== null) {
+        cancelAnimationFrame(scheduledAnimationHandle);
+      }
+      // Stop driving frames now. `webglcontextlost` still owns the terminal
+      // ownership graph and runs whether or not it has been delivered yet.
+      renderPaused = true;
     } finally {
       sceneMsaaTarget.resolveFrame(frameSize.width, frameSize.height);
     }

@@ -2716,8 +2716,8 @@
     },
     {
       "path": "assets/js/rendering/high-perf-renderer.js",
-      "sha256": "b26425ebb78be2917f617ba24f93fd73be780c80d1d731b1299d879ceeb40183",
-      "bytes": 405995,
+      "sha256": "78dbe5e83b7bc7ba40f66fa3678aa8bc644079352845a01e6ffc6690561a2a85",
+      "bytes": 406218,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
@@ -2728,8 +2728,8 @@
     },
     {
       "path": "assets/js/rendering/high-perf/gl-point-draw-state.js",
-      "sha256": "95bbe7c9114c0b53da2afa7a882bd9bf271b506ce0abc38606676b76489b0fae",
-      "bytes": 3280,
+      "sha256": "26b5da24fbfcd873895d53e9d18cdded04caf28cdd72e73d4e98288f42f1ebc9",
+      "bytes": 4512,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
@@ -2914,8 +2914,8 @@
     },
     {
       "path": "assets/js/rendering/viewer.js",
-      "sha256": "44064a54fe81dbec9a4ecfca963b2c18fa2e13f4c52cd13721378754cea3b59f",
-      "bytes": 367997,
+      "sha256": "1dbda2e86473762cf89c416e25ea8bb5899a3268a2453bc8582cb8775b3dd036",
+      "bytes": 369458,
       "content_type": "application/javascript; charset=utf-8"
     },
     {

@@ -38,6 +38,7 @@ import {
   getReadOnlySpatialProjection,
 } from './high-perf/read-only-projections.js';
 import {
+  CONTEXT_LOST_ERROR_NAME,
   requireCleanWebGLState,
   restorePointDrawBaseline,
   settlePointDraw,
@@ -256,7 +257,10 @@ export class HighPerfRendererContextLostError extends Error {
     super(
       `HighPerfRenderer cannot ${operation} after its WebGL context was lost.`
     );
-    this.name = 'HighPerfRendererContextLostError';
+    // The shared marker, so this class and the GL-error preflight that cannot
+    // import it stay one recognisable condition. `isContextLostError()` beside
+    // it is what the frame loop tests against.
+    this.name = CONTEXT_LOST_ERROR_NAME;
   }
 }
 
