@@ -17,7 +17,22 @@ export default defineConfig({
   testDir: './tests/browser',
   fullyParallel: false,
   forbidOnly: true,
-  retries: 0,
+  // A push runs this suite 27 times — three engines, three operating systems,
+  // three shards — for roughly 2,700 browser test executions against shared CI
+  // runners, headed, over software WebGL. The failures that result are timeouts
+  // in unrelated specs: a startup that took longer than 60 s to reveal the
+  // welcome modal, a directory-picker load that never reported its dataset.
+  // They land on a different engine, shard and spec every time, and none has
+  // ever reproduced locally. With no retry, one such stall marks the whole
+  // 39-job gate red and says nothing about the change that triggered it, which
+  // is the gate reporting on the runner rather than on the code.
+  //
+  // This does not hide a defect. A test that is actually broken fails all three
+  // attempts, and a test that passes on retry is reported as flaky by the
+  // reporter below — the bounded runner inherits its stdio, so that line reaches
+  // the job log. Locally there is no retry, so a flake surfaces while it is
+  // still cheap to investigate.
+  retries: process.env.CI ? 2 : 0,
   workers: 1,
   reporter: [['line']],
   timeout: 90_000,
