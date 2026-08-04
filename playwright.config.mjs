@@ -17,22 +17,20 @@ export default defineConfig({
   testDir: './tests/browser',
   fullyParallel: false,
   forbidOnly: true,
-  // A push runs this suite 27 times — three engines, three operating systems,
-  // three shards — for roughly 2,700 browser test executions against shared CI
-  // runners, headed, over software WebGL. The failures that result are timeouts
-  // in unrelated specs: a startup that took longer than 60 s to reveal the
-  // welcome modal, a directory-picker load that never reported its dataset.
-  // They land on a different engine, shard and spec every time, and none has
-  // ever reproduced locally. With no retry, one such stall marks the whole
-  // 39-job gate red and says nothing about the change that triggered it, which
-  // is the gate reporting on the runner rather than on the code.
+  // Deliberately zero, in CI as well as locally, matching the policy stated in
+  // the browser job of `.github/workflows/`: tests are neither retried nor
+  // skipped, mocked, or given more time. A retry that turns a red gate green
+  // buys nothing here — this suite is the only thing standing between a
+  // renderer defect and the published site, and a failure it absorbed is a
+  // failure nobody read.
   //
-  // This does not hide a defect. A test that is actually broken fails all three
-  // attempts, and a test that passes on retry is reported as flaky by the
-  // reporter below — the bounded runner inherits its stdio, so that line reaches
-  // the job log. Locally there is no retry, so a flake surfaces while it is
-  // still cheap to investigate.
-  retries: process.env.CI ? 2 : 0,
+  // The cost is real and worth naming: a push runs this suite 27 times — three
+  // engines, three operating systems, three shards — and a single stall on a
+  // shared runner marks the whole gate red. When that happens the failure is a
+  // timeout in a spec unrelated to the change, on a different engine and shard
+  // each time. Re-run the job and read what it says the second time; if the
+  // same spec fails twice, it is the code.
+  retries: 0,
   workers: 1,
   reporter: [['line']],
   timeout: 90_000,
