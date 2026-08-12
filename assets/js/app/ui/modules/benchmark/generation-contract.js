@@ -42,19 +42,29 @@ export const MIN_SYNTHETIC_COUNT = 1;
  * Largest synthetic dataset the benchmark builds.
  *
  * This is the point-count control's own advertised ceiling, made binding.
- * Above it the two source arrays alone reach 800 MB — 600 MB of Float32 XYZ
- * and 200 MB of Uint8 RGBA — before the state's per-point arrays or any GPU
- * copy, so a larger request does not produce a slow benchmark, it produces a
- * failed allocation.
  *
- * It is a declared product limit, not the hardware's. The device's true
- * ceiling is `MAX_TEXTURE_SIZE²` for the renderer's alpha texture, which
- * varies by engine and is reported by the renderer when publication exceeds
- * it. Raising this constant is therefore a deliberate act, and raising it here
- * raises it everywhere: the control, both validators and the worker boundary
- * all read this one value.
+ * It is a declared product limit, not the hardware's, and it is set to the
+ * hardware's rather than below it. The device's true ceiling is
+ * `MAX_TEXTURE_SIZE²` for the renderer's alpha texture: on a WebGL2 context
+ * reporting the common 16,384 that is 268,435,456 points, and 250,000,000 sits
+ * just inside it, so every point the generator can produce remains addressable
+ * by the interaction-state texture. A context reporting a smaller
+ * `MAX_TEXTURE_SIZE` has a lower true ceiling, and the renderer reports that
+ * when publication exceeds it rather than failing silently.
+ *
+ * Memory, not the texture, is what a request near this ceiling actually meets
+ * first. The two source arrays scale as 16 bytes per point — Float32 XYZ plus
+ * Uint8 RGBA — so 50,000,000 points is 800 MB, and 250,000,000 is 4 GB, before
+ * the state's per-point arrays or any GPU copy. A request that cannot be
+ * allocated therefore fails as an allocation error, which is the honest outcome:
+ * the ceiling that binds on a given machine is its memory, and clamping the
+ * control to one machine's memory would misreport it as the product's limit.
+ *
+ * Raising this constant raises it everywhere — the control, both validators and
+ * the worker boundary all read this one value — so `index.html` and
+ * `benchmark-generation-contract.test.mjs` are kept in step with it.
  */
-export const MAX_SYNTHETIC_COUNT = 50_000_000;
+export const MAX_SYNTHETIC_COUNT = 250_000_000;
 
 /**
  * @param {unknown} pattern - Candidate pattern name.

@@ -1768,8 +1768,8 @@
     },
     {
       "path": "assets/js/app/ui/modules/benchmark/generation-contract.js",
-      "sha256": "198511253d0e9f968a2696e6fb10065e06e8f7f63e2d847d91a8c5ac59a2f748",
-      "bytes": 6223,
+      "sha256": "25f2881057d637b4730e85f61c970d6702460898222ee391a3b21d6f2095d555",
+      "bytes": 6923,
       "content_type": "application/javascript; charset=utf-8"
     },
     {
@@ -2974,8 +2974,8 @@
     },
     {
       "path": "index.html",
-      "sha256": "8633486f0131a949a09a1775bc81b0f1311af98866b18b561ce0e07481092953",
-      "bytes": 110188,
+      "sha256": "ff92e545b6b9d68f5b7f462d3f9634183595e325b067e7683340856c2c5cb6b3",
+      "bytes": 110189,
       "content_type": "text/html; charset=utf-8"
     },
     {

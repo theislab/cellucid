@@ -90,12 +90,12 @@ test('a request is refused before a worker is spawned for it', () => {
   );
   assert.throws(
     () => assertGenerationRequest({ requestId: 0, pattern: 'atlas', count: 0 }),
-    /must be one integer between 1 and 50000000/
+    /must be one integer between 1 and 250000000/
   );
   assert.throws(() => assertSyntheticPattern('spiral'), /Synthetic pattern/);
   assert.throws(
     () => assertSyntheticCount(1.5),
-    /must be one integer between 1 and 50000000/
+    /must be one integer between 1 and 250000000/
   );
 });
 
@@ -105,7 +105,7 @@ test('the point-count control and both validators enforce one rule', async () =>
   // multiples of the range the UI published. index.html is static markup and
   // cannot interpolate a constant, so the derivation is asserted here.
   assert.equal(MIN_SYNTHETIC_COUNT, 1);
-  assert.equal(MAX_SYNTHETIC_COUNT, 50_000_000);
+  assert.equal(MAX_SYNTHETIC_COUNT, 250_000_000);
   assert.equal(assertSyntheticCount(MIN_SYNTHETIC_COUNT), MIN_SYNTHETIC_COUNT);
   assert.equal(assertSyntheticCount(MAX_SYNTHETIC_COUNT), MAX_SYNTHETIC_COUNT);
   assert.throws(
@@ -180,18 +180,18 @@ test('every generator entry point is held to the same rule', async () => {
     for (const invalid of [0, -1, 1.5, MAX_SYNTHETIC_COUNT + 1]) {
       assert.throws(
         () => SyntheticDataGenerator[name](invalid),
-        /must be one integer between 1 and 50000000/,
+        /must be one integer between 1 and 250000000/,
         `${name}(${invalid}) must be refused at the boundary`
       );
     }
   }
   await assert.rejects(
     SyntheticDataGenerator.fromGLBUrl(MAX_SYNTHETIC_COUNT + 1),
-    /must be one integer between 1 and 50000000/
+    /must be one integer between 1 and 250000000/
   );
   assert.throws(
     () => SyntheticDataGenerator.fromGLB(0, new ArrayBuffer(8)),
-    /must be one integer between 1 and 50000000/
+    /must be one integer between 1 and 250000000/
   );
 });
 
