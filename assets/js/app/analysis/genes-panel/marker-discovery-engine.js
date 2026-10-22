@@ -25,6 +25,11 @@ import { waitForAvailableSlot } from '../shared/concurrency-utils.js';
 import { DEFAULTS, ERROR_MESSAGES, formatError, ANALYSIS_PHASES } from './constants.js';
 import { benjaminiHochbergAdjusted } from '../stats/statistical-tests.js';
 import { setOwnDataProperty } from '../../../utils/exact-record.js';
+import {
+  MAX_CATEGORICAL_CATEGORIES,
+  isCategoricalCodes,
+  missingCategoryCode
+} from '../../../data/categorical-storage-contract.js';
 
 // =============================================================================
 // INTERNAL HELPERS
@@ -308,7 +313,8 @@ export class MarkerDiscoveryEngine {
    * @param {number[]|Uint32Array} options.groups[].cellIndices
    * @param {number} [options.groups[].cellCount]
    * @param {string} [options.groups[].color]
-   * @param {Uint16Array} options.obsCodes - Per-cell category codes for obsCategory
+   * @param {Uint8Array|Uint16Array|Uint32Array} options.obsCodes - Per-cell
+   *   category codes for obsCategory, at the field's own width
    * @param {string[]} [options.geneList] - Gene keys (null = all genes)
    * @param {'wilcox'|'ttest'} [options.method='wilcox']
    * @param {number} [options.topNPerGroup=10]
@@ -483,9 +489,9 @@ export class MarkerDiscoveryEngine {
       throw signal.reason;
     }
     this._validateGroups(requestedGroups, minCells);
-    if (!(requestedObsCodes instanceof Uint16Array) || requestedObsCodes.length === 0) {
+    if (!isCategoricalCodes(requestedObsCodes) || requestedObsCodes.length === 0) {
       throw new TypeError(
-        '[MarkerDiscoveryEngine] obsCodes must be a non-empty Uint16Array'
+        '[MarkerDiscoveryEngine] obsCodes must be non-empty categorical codes'
       );
     }
     const pointCount = this.dataLayer.state?.pointCount;
@@ -507,7 +513,18 @@ export class MarkerDiscoveryEngine {
       cellCount: group.cellCount,
       color: group.color
     }));
-    const obsCodes = new Uint16Array(requestedObsCodes);
+    // The run owns a copy at the field's own width: a copy to another width
+    // would change which code means "missing", or truncate codes above it.
+    const obsCodes = requestedObsCodes.slice();
+    const missingCode = missingCategoryCode(obsCodes);
+    for (const group of groups) {
+      if (group.groupCode >= missingCode) {
+        throw new RangeError(
+          `Group "${group.groupId}" groupCode ${group.groupCode} is not a ` +
+          `category of codes whose missing code is ${missingCode}`
+        );
+      }
+    }
     const groupByCode = new Map(
       groups.map(group => [group.groupCode, group])
     );
@@ -516,7 +533,7 @@ export class MarkerDiscoveryEngine {
     );
     for (let cellIndex = 0; cellIndex < obsCodes.length; cellIndex++) {
       const code = obsCodes[cellIndex];
-      if (code === 65535) continue;
+      if (code === missingCode) continue;
       if (!groupByCode.has(code)) {
         throw new Error(
           `[MarkerDiscoveryEngine] obs code ${code} has no exact group owner`
@@ -635,7 +652,7 @@ export class MarkerDiscoveryEngine {
     for (const g of groups) {
       mapLen = Math.max(mapLen, g.groupCode + 1);
     }
-    const codeToGroupIndex = new Int16Array(mapLen);
+    const codeToGroupIndex = new Int32Array(mapLen);
     codeToGroupIndex.fill(-1);
     for (let i = 0; i < groups.length; i++) {
       const code = groups[i].groupCode;
@@ -647,8 +664,8 @@ export class MarkerDiscoveryEngine {
     await pool.broadcast(
       'MARKERS_SET_CONTEXT',
       (/* workerIndex */) => ({
-        codes: new Uint16Array(obsCodes),
-        codeToGroupIndex: new Int16Array(codeToGroupIndex),
+        codes: obsCodes.slice(),
+        codeToGroupIndex: codeToGroupIndex.slice(),
         groupCount
       }),
       { timeout: 30000 }
@@ -945,11 +962,6 @@ export class MarkerDiscoveryEngine {
         formatError(ERROR_MESSAGES.TOO_FEW_GROUPS, { n: groups.length })
       );
     }
-    if (groups.length > 32767) {
-      throw new RangeError(
-        '[MarkerDiscoveryEngine] group count exceeds the Int16 worker contract'
-      );
-    }
 
     const pointCount = this.dataLayer.state?.pointCount;
     if (!Number.isSafeInteger(pointCount) || pointCount <= 0) {
@@ -1010,10 +1022,11 @@ export class MarkerDiscoveryEngine {
       if (
         !Number.isSafeInteger(group.groupCode) ||
         group.groupCode < 0 ||
-        group.groupCode >= 65535
+        group.groupCode >= MAX_CATEGORICAL_CATEGORIES
       ) {
         throw new RangeError(
-          `Group "${group.groupId}" groupCode must be an integer from 0 through 65534`
+          `Group "${group.groupId}" groupCode must be a category code from 0 ` +
+          `through ${MAX_CATEGORICAL_CATEGORIES - 1}`
         );
       }
       if (groupCodes.has(group.groupCode)) {
@@ -1311,9 +1324,3 @@ export class MarkerDiscoveryEngine {
   }
 
 }
-
-export function createMarkerDiscoveryEngine(options) {
-  return new MarkerDiscoveryEngine(options);
-}
-
-export default MarkerDiscoveryEngine;

@@ -8,7 +8,7 @@
  * @module ui/modules/figure-export/components/orientation-indicator
  */
 
-import { escapeHtml } from '../../../../utils/dom-utils.js';
+import { escapeXml } from '../../../../utils/dom-utils.js';
 import { clamp } from '../../../../utils/number-utils.js';
 import { assertCameraState } from '../../../../../rendering/camera-state-contract.js';
 import { LIGHT_INK } from '../utils/figure-ink.js';
@@ -164,7 +164,7 @@ export function renderSvgOrientationIndicator({
   axes.sort((a, b) => (b.v[2] || 0) - (a.v[2] || 0));
 
   const parts = [];
-  parts.push(`<g font-family="${escapeHtml(fontFamily)}" font-size="${fs}" fill="${escapeHtml(textColor)}">`);
+  parts.push(`<g font-family="${escapeXml(fontFamily)}" font-size="${fs}" fill="${escapeXml(textColor)}">`);
   parts.push(`<rect x="${x}" y="${y}" width="${size}" height="${size}" rx="${cornerR}" fill="${ink.surface}" fill-opacity="0.85" stroke="${ink.frame}" stroke-width="1"/>`);
 
   for (const axis of axes) {
@@ -191,7 +191,7 @@ export function renderSvgOrientationIndicator({
     const baseY = y + size - pad;
     for (let i = 0; i < lines.length; i++) {
       const textY = baseY - (lines.length - 1 - i) * lineH;
-      parts.push(`<text x="${x + size / 2}" y="${textY}" text-anchor="middle" fill="${ink.surfaceInk}" stroke="none">${escapeHtml(lines[i])}</text>`);
+      parts.push(`<text x="${x + size / 2}" y="${textY}" text-anchor="middle" fill="${ink.surfaceInk}" stroke="none">${escapeXml(lines[i])}</text>`);
     }
   }
 

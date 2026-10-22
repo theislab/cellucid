@@ -85,6 +85,11 @@ class FakeHTMLElement {
           [...owner.className.split(' '), ...names].filter(Boolean),
         )].join(' ');
       },
+      remove(...names) {
+        owner.className = owner.className.split(' ')
+          .filter(name => name && !names.includes(name))
+          .join(' ');
+      },
     };
   }
 
@@ -104,8 +109,13 @@ class FakeHTMLElement {
     return child;
   }
 
-  replaceChildren() {
+  append(...nodes) {
+    this.children.push(...nodes);
+  }
+
+  replaceChildren(...nodes) {
     this.children.length = 0;
+    this.children.push(...nodes);
   }
 
   fire(type, event = {}) {
@@ -159,6 +169,9 @@ function installDom(t) {
     layoutModeSelect: select('grid'),
     badgesBox: element(),
     badgesList: element(),
+    layoutRow: element(),
+    navigationTarget: element(),
+    navigationTargetBadge: element(),
   };
   const renderDom = { renderModeSelect: select('points') };
   return { dom, renderDom };
@@ -182,14 +195,20 @@ function cameraState(radius = 3) {
   };
 }
 
+// Layouts are embedding ids; a view's dimension is its layout's.
+const LAYOUT_DIMENSIONS = Object.freeze({ X_umap: 2, X_tsne: 2, X_umap_3d: 3 });
+const LAYOUT_NAMES = Object.freeze({ X_umap: 'UMAP', X_tsne: 't-SNE', X_umap_3d: 'UMAP' });
+
 function createOwners() {
   const dimensionManager = {
     dimensions: new Map([['live', 2]]),
-    copyViewDimension(sourceViewId, targetViewId) {
+    layouts: new Map([['live', 'X_umap']]),
+    copyViewLayout(sourceViewId, targetViewId) {
       if (!this.dimensions.has(sourceViewId)) {
         throw new RangeError(`Unknown dimension source "${sourceViewId}".`);
       }
       this.dimensions.set(targetViewId, this.dimensions.get(sourceViewId));
+      this.layouts.set(targetViewId, this.layouts.get(sourceViewId));
     },
     getViewDimension(viewId) {
       if (!this.dimensions.has(viewId)) {
@@ -197,8 +216,13 @@ function createOwners() {
       }
       return this.dimensions.get(viewId);
     },
+    getViewLayout(viewId) {
+      this.getViewDimension(viewId);
+      return this.layouts.get(viewId);
+    },
     removeView(viewId) {
       this.dimensions.delete(viewId);
+      this.layouts.delete(viewId);
     },
   };
 
@@ -218,11 +242,10 @@ function createOwners() {
           activeFieldIndex: -1,
           activeVarFieldIndex: -1,
           activeFieldSource: null,
-          dimensionLevel: 2,
+          followsDefault: true,
           colorsArray: Uint8Array.from([1, 2, 3, 255, 4, 5, 6, 255]),
-          categoryTransparency: Float32Array.from([1, 1]),
-          cellVisibilityMask: Float32Array.from([1, 1]),
-          outlierQuantilesArray: Float32Array.from([-1, -1]),
+          categoryTransparency: Uint8Array.from([1, 1]),
+          cellVisibilityMask: Uint8Array.from([1, 1]),
           centroidPositions: new Float32Array(),
           centroidColors: new Uint8Array(),
           centroidOutliers: new Float32Array(),
@@ -262,14 +285,36 @@ function createOwners() {
           fieldKind: null,
           filtersText: [],
           label: 'All cells',
-          outlierQuantiles: Float32Array.from([-1, -1]),
           outlierThreshold: 0,
           pointCount: 2,
-          transparency: Float32Array.from([0.25, 1]),
+          transparency: Uint8Array.from([0, 1]),
         };
       },
       getViewDimensionLevel(viewId) {
         return this.dimensionManager.getViewDimension(viewId);
+      },
+      describeViewEmbedding(viewId) {
+        const layoutKey = this.dimensionManager.getViewLayout(viewId);
+        return {
+          dimension: LAYOUT_DIMENSIONS[layoutKey],
+          name: LAYOUT_NAMES[layoutKey],
+          label: layoutKey,
+          layoutKey,
+          isDefault: layoutKey !== 'X_tsne',
+        };
+      },
+      getViewLayoutKey(viewId) {
+        return this.dimensionManager.getViewLayout(viewId);
+      },
+      getViewEmbeddingRef(viewId) {
+        return { key: this.dimensionManager.getViewLayout(viewId), columns: null };
+      },
+      viewFollowsDefault(viewId) {
+        const context = this.viewContexts.get(viewId);
+        if (context === undefined) {
+          throw new RangeError(`Unknown state view "${viewId}".`);
+        }
+        return context.followsDefault === true;
       },
       restoreContext(context) {
         this.viewContexts.set(
@@ -306,12 +351,26 @@ function createOwners() {
         }
         return viewId;
       },
-      async setDimensionLevel(level, { viewId }) {
+      // The one representation transaction, reduced to what these tests
+      // observe: every owner publishes the layout, and the view records
+      // whether it follows its dimension's default.
+      async setViewRepresentation(viewId, layoutKey, { followsDefault }) {
         assert.equal(viewId, 'live');
-        this.viewContexts.get('live').dimensionLevel = level;
-        this.dimensionManager.dimensions.set('live', level);
-        owners.viewer.setViewDimension('live', level);
+        const dimension = LAYOUT_DIMENSIONS[layoutKey];
+        const live = this.viewContexts.get('live');
+        live.followsDefault = followsDefault;
+        this.dimensionManager.dimensions.set('live', dimension);
+        this.dimensionManager.layouts.set('live', layoutKey);
+        owners.viewer.setViewEmbedding('live', { dimension, layoutKey });
         await new Promise(resolve => setTimeout(resolve, 0));
+      },
+      // The restore entry of the session schema: an embedding reference.
+      async restoreViewEmbedding(viewId, ref) {
+        assert.equal(ref.columns, null);
+        await this.setViewRepresentation(viewId, ref.key, {
+          followsDefault: ref.key !== 'X_tsne',
+        });
+        return ref.key;
       },
       onVisibilityChanged(listener) {
         visibilityListeners.push(listener);
@@ -326,11 +385,13 @@ function createOwners() {
   let layoutMode = 'grid';
   const snapshots = [];
   const viewerDimensions = new Map([['live', 2]]);
+  const viewerLayouts = new Map([['live', 'X_umap']]);
   const navigationModes = new Map([['live', 'orbit']]);
   const viewCameras = new Map([['live', cameraState()]]);
 
   function forgetView(viewId) {
     viewerDimensions.delete(viewId);
+    viewerLayouts.delete(viewId);
     navigationModes.delete(viewId);
     viewCameras.delete(viewId);
   }
@@ -348,12 +409,32 @@ function createOwners() {
       nextId += 1;
       snapshots.push({ id, label: config.label });
       viewerDimensions.set(id, config.dimensionLevel);
+      // A kept view starts on its source view's layout.
+      viewerLayouts.set(id, viewerLayouts.get(config.sourceViewId));
       navigationModes.set(id, 'orbit');
       viewCameras.set(id, structuredClone(config.cameraState));
       return { id, label: config.label };
     },
     getCamerasLocked() {
       return camerasLocked;
+    },
+    // viewer.js `setViewTitlePrefixes()`: the pane chips' "N · shows" prefix.
+    titlePrefixes: new Map(),
+    setViewTitlePrefixes(prefixes) {
+      this.titlePrefixes = new Map(prefixes);
+    },
+    // viewer.js `getCameraLinkGroups()`: while linked, the groups of two or
+    // more presented views that show one representation.
+    getCameraLinkGroups() {
+      if (!camerasLocked) return [];
+      const groups = new Map();
+      for (const viewId of ['live', ...snapshots.map(snapshot => snapshot.id)]) {
+        if (viewId === 'live' && liveViewHidden) continue;
+        const layoutKey = viewerLayouts.get(viewId);
+        if (!groups.has(layoutKey)) groups.set(layoutKey, []);
+        groups.get(layoutKey).push(viewId);
+      }
+      return [...groups.values()].filter(group => group.length > 1);
     },
     getFocusedViewId() {
       return focusedViewId;
@@ -379,6 +460,10 @@ function createOwners() {
         throw new RangeError(`Unknown viewer dimension "${viewId}".`);
       }
       return viewerDimensions.get(viewId);
+    },
+    getViewLayoutKey(viewId) {
+      this.getViewDimension(viewId);
+      return viewerLayouts.get(viewId);
     },
     getViewNavigationMode(viewId) {
       const mode = navigationModes.get(viewId);
@@ -412,8 +497,9 @@ function createOwners() {
     setViewCameraState(viewId, camera) {
       viewCameras.set(viewId, structuredClone(camera));
     },
-    setViewDimension(viewId, level) {
-      viewerDimensions.set(viewId, level);
+    setViewEmbedding(viewId, { dimension, layoutKey }) {
+      viewerDimensions.set(viewId, dimension);
+      viewerLayouts.set(viewId, layoutKey);
     },
     setViewFocusHandler() {},
     setViewLayout(mode, activeId) {
@@ -455,10 +541,11 @@ function mountViewControls(t, owners) {
     renderDom,
     callbacks: {
       onActiveViewChanged: viewId => activeViewNotifications.push(viewId),
-      async onCycleViewDimension() {},
       onNavigationUiSyncRequested() {},
     },
   });
+  // `ui-coordinator.js` `publishCellPresence()`: these owners carry cells.
+  controls.setCellsPresent(true);
 
   // `ui-coordinator.js` `scheduleVisibilityUiUpdate()`: one coalesced frame per
   // burst of visibility changes, and the frame renders the view badges.
@@ -484,6 +571,20 @@ function keepView(dom) {
   dom.keepViewBtn.fire('click');
 }
 
+test('Keep view is offered only while the runtime has cells', t => {
+  const owners = createOwners();
+  const { controls, dom } = mountViewControls(t, owners);
+  assert.equal(dom.keepViewBtn.disabled, false);
+
+  controls.setCellsPresent(false);
+  assert.equal(dom.keepViewBtn.disabled, true);
+  assert.throws(() => controls.setCellsPresent(0), TypeError);
+  assert.equal(dom.keepViewBtn.disabled, true);
+
+  controls.setCellsPresent(true);
+  assert.equal(dom.keepViewBtn.disabled, false);
+});
+
 test('a cleared inventory leaves no kept view named by the badge renderer', t => {
   const owners = createOwners();
   const { controls, dom } = mountViewControls(t, owners);
@@ -495,6 +596,11 @@ test('a cleared inventory leaves no kept view named by the badge renderer', t =>
     'the kept view must exist, or the defect below is never reachable',
   );
   assert.equal(owners.state.getActiveViewId(), 'snap_1');
+  assert.equal(
+    dom.navigationTarget.hidden,
+    false,
+    'with two views open, Navigation names the view it drives',
+  );
 
   // The first act of every multiview restore (state-serializer/multiview.js).
   clearPublishedSnapshotViews({ state: owners.state, viewer: owners.viewer });
@@ -508,6 +614,11 @@ test('a cleared inventory leaves no kept view named by the badge renderer', t =>
   assert.doesNotThrow(
     () => controls.renderSplitViewBadges(),
     'the badge renderer must read the current active view, not a stale copy',
+  );
+  assert.equal(
+    dom.navigationTarget.hidden,
+    true,
+    'with one view left, Navigation has no view to name',
   );
 });
 
@@ -524,7 +635,7 @@ test('a cleared inventory leaves no hidden live view in the badge renderer', t =
 
   // The live badge's remove control hides the live view when kept views remain.
   const liveBadge = dom.badgesList.children[0];
-  const liveRemove = liveBadge.children.at(-1);
+  const liveRemove = liveBadge.children.find(child => child.className === 'split-badge-remove');
   liveRemove.fire('click');
   assert.equal(
     owners.viewer.getLiveViewHidden(),
@@ -561,7 +672,7 @@ test('a multiview restore raises nothing on the frames it schedules', async t =>
     snapshots: [{
       activeFields: { activeFieldKey: null, activeFieldSource: null },
       cameraState: cameraState(),
-      dimensionLevel: 2,
+      embedding: { key: 'X_umap', columns: null },
       fieldKey: null,
       fieldKind: null,
       filters: {},
@@ -599,4 +710,83 @@ test('a multiview restore raises nothing on the frames it schedules', async t =>
   );
   assert.equal(owners.state.getActiveViewId(), 'snap_2');
   assert.doesNotThrow(() => controls.renderSplitViewBadges());
+});
+
+/** The text of one rendered view row: number, what it shows, its field. */
+function rowText(badge) {
+  const select = badge.children.find(child => child.className === 'split-badge-select');
+  const meta = badge.children.find(child => child.className === 'split-badge-meta');
+  return {
+    number: select.children.find(child => child.className === 'split-badge-pill').textContent,
+    shows: select.children.find(child => child.className === 'split-badge-label').textContent,
+    field: meta.children.find(child => child.className === 'split-badge-sub').textContent,
+    linked: meta.children.some(child => child.className === 'split-badge-link'),
+  };
+}
+
+test('each row names what its view shows, with the colouring field under it', t => {
+  const owners = createOwners();
+  const { dom } = mountViewControls(t, owners);
+
+  keepView(dom);
+  assert.deepEqual(
+    dom.badgesList.children.map(rowText),
+    [
+      { number: '1', shows: 'UMAP · 2D', field: 'Live', linked: false },
+      { number: '2', shows: 'UMAP · 2D', field: 'All cells', linked: false },
+    ],
+  );
+  // The selected row is a pressed toggle; the other is not.
+  const pressed = dom.badgesList.children.map(badge => badge.children
+    .find(child => child.className === 'split-badge-select')
+    .getAttribute('aria-pressed'));
+  assert.deepEqual(pressed, ['false', 'true']);
+  assert.equal(
+    dom.badgesList.children[1].children
+      .find(child => child.className === 'split-badge-select')
+      .getAttribute('aria-label'),
+    'View 2: UMAP · 2D, coloured by All cells',
+  );
+  // The pane chips on the plot carry the same number and representation.
+  assert.deepEqual([...owners.viewer.titlePrefixes], [
+    ['live', '1 · UMAP 2D'],
+    ['snap_1', '2 · UMAP 2D'],
+  ]);
+});
+
+test('Link cameras is offered only between views that show one representation', async t => {
+  const owners = createOwners();
+  const { controls, dom } = mountViewControls(t, owners);
+
+  // One view: nothing to link.
+  controls.renderSplitViewBadges();
+  assert.equal(dom.cameraLockBtn.disabled, true);
+  assert.equal(dom.cameraLockBtn.getAttribute('aria-pressed'), 'false');
+  assert.match(dom.cameraLockBtn.title, /Keep a view first/);
+
+  // Two views of one representation: linkable, and the linked rows say so.
+  keepView(dom);
+  owners.viewer.setCamerasLocked(true);
+  controls.renderSplitViewBadges();
+  assert.equal(dom.cameraLockBtn.disabled, false);
+  assert.equal(dom.cameraLockBtn.getAttribute('aria-pressed'), 'true');
+  assert.deepEqual(dom.badgesList.children.map(rowText).map(row => row.linked), [true, true]);
+
+  // The live view switches to another representation of the same dimension:
+  // no two views share one, so the button is unavailable and shows as off,
+  // whatever the stored preference, and no row is linked.
+  owners.state.setActiveView('live');
+  await owners.state.setViewRepresentation('live', 'X_tsne', { followsDefault: false });
+  controls.renderSplitViewBadges();
+  assert.equal(owners.viewer.getCamerasLocked(), true, 'the preference is kept');
+  assert.equal(dom.cameraLockBtn.disabled, true);
+  assert.equal(dom.cameraLockBtn.getAttribute('aria-pressed'), 'false');
+  assert.match(dom.cameraLockBtn.title, /No two views show the same embedding/);
+  assert.deepEqual(
+    dom.badgesList.children.map(rowText),
+    [
+      { number: '1', shows: 't-SNE · 2D', field: 'Live', linked: false },
+      { number: '2', shows: 'UMAP · 2D', field: 'All cells', linked: false },
+    ],
+  );
 });

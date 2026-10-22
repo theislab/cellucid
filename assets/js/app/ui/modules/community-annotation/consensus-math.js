@@ -9,6 +9,8 @@
  * @module ui/modules/community-annotation/consensus-math
  */
 
+import { formatPercent } from '../../components/display-format.js';
+
 export function clampInt(value, min, max) {
   const n = Number.isFinite(value) ? Math.floor(value) : min;
   return Math.max(min, Math.min(max, n));
@@ -16,8 +18,7 @@ export function clampInt(value, min, max) {
 
 export function formatPctSigned11(value) {
   const v = Number.isFinite(value) ? value : 0;
-  const pct = Math.round(v * 100);
-  return `${pct}%`;
+  return formatPercent(Math.round(v * 100));
 }
 
 export function clampConsensusThreshold11(value) {

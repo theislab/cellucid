@@ -207,8 +207,23 @@ test('offline transition retires network owners and synchronously renders both g
   );
   assert.match(
     gating,
-    /disabled: controller\.isSyncBusy\(\) \|\| !online/
+    /disabled: datasetId === null \|\| controller\.isSyncBusy\(\) \|\| !online/
   );
+});
+
+test('a repository cannot be connected while no dataset is open', () => {
+  // A repository is stored per dataset id, and None publishes none, so the
+  // connection flow would end in a write it cannot key.
+  const render = slice(controlsPanelSource, 'function render()', 'return {');
+  const gating = render.slice(
+    0,
+    render.indexOf('// GitHub sync')
+  );
+  assert.match(
+    gating,
+    /if \(datasetId === null\) \{[\s\S]*?text: 'Load a dataset to connect a repository\.'/
+  );
+  assert.match(gating, /disabled: datasetId === null \|\|/);
 });
 
 test('every async confirmation is physically owned by the exact context signal', () => {
@@ -301,7 +316,7 @@ test('profile visibly discloses the external ORCID lookup to both inputs', () =>
   );
   assert.match(
     profile,
-    /const orcidDisclosureId =[\s\S]*?'aria-describedby': orcidDisclosureId,[\s\S]*?'aria-label': 'ORCID',[\s\S]*?'aria-describedby': orcidDisclosureId/
+    /const orcidDisclosureId =[\s\S]*?'aria-describedby': orcidDisclosureId,[\s\S]*?for: orcidInputId,[\s\S]*?'aria-describedby': orcidDisclosureId/
   );
   const threshold = slice(
     domSource,

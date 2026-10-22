@@ -18,6 +18,8 @@
  * Bidirectional communication works in ALL environments:
  * - Python → Frontend: postMessage from notebook to iframe
  * - Frontend → Python: HTTP POST to /_cellucid/events on the data server
+ *   (JSON events) and to /_cellucid/selection (a selection, as binary cell
+ *   indices; see `encodeJupyterSelectionCells`)
  */
 
 import {
@@ -31,6 +33,8 @@ import {
   throwIfMetadataAborted,
 } from './metadata-load-contract.js';
 import { getNotificationCenter } from '../app/notification-center.js';
+import { createDeadline } from '../utils/deadline.js';
+import { validateDataMapping } from './data-mapping.js';
 
 /**
  * @typedef {import('./data-source.js').DatasetMetadata} DatasetMetadata
@@ -57,14 +61,6 @@ function requireSingleJupyterParameter(params, key) {
     );
   }
   return values[0];
-}
-
-/**
- * Check if running in Jupyter iframe context
- * @returns {boolean}
- */
-export function isJupyterContext() {
-  return getJupyterConfig() !== null;
 }
 
 /**
@@ -115,7 +111,7 @@ export function getJupyterConfig() {
  * @param {string} url - URL to check
  * @returns {boolean}
  */
-export function isJupyterUrl(url) {
+function isJupyterUrl(url) {
   return url?.startsWith('jupyter://');
 }
 
@@ -124,7 +120,7 @@ export function isJupyterUrl(url) {
  * @param {string} url - URL to parse
  * @returns {{viewerId: string, path: string}|null}
  */
-export function parseJupyterUrl(url) {
+function parseJupyterUrl(url) {
   if (!isJupyterUrl(url)) return null;
 
   const match = url.match(/^jupyter:\/\/([^/]+)(\/.*)?$/);
@@ -315,10 +311,21 @@ function requireExactJsonValue(value, label, ancestors = new Set()) {
   ancestors.add(value);
   if (Array.isArray(value)) {
     for (let index = 0; index < value.length; index++) {
+      const entry = value[index];
+      // Scalars are checked inline: a label is built only for an entry that
+      // fails or that nests further, never once per element.
+      if (
+        entry === null ||
+        typeof entry === 'string' ||
+        typeof entry === 'boolean' ||
+        (typeof entry === 'number' && Number.isFinite(entry))
+      ) {
+        continue;
+      }
       if (!Object.hasOwn(value, index)) {
         throw new TypeError(`${label} arrays must not contain holes`);
       }
-      requireExactJsonValue(value[index], `${label}[${index}]`, ancestors);
+      requireExactJsonValue(entry, `${label}[${index}]`, ancestors);
     }
   } else {
     if (!isPlainRecord(value)) {
@@ -339,25 +346,115 @@ function requireNonNegativeInteger(value, label) {
   return value;
 }
 
+function failCellIndex(value, index, label) {
+  if (!Object.hasOwn(value, index)) {
+    throw new TypeError(`${label} must not contain holes`);
+  }
+  throw new TypeError(`${label}[${index}] must be a non-negative integer`);
+}
+
+/**
+ * Validate one array of unique non-negative integer cell indices.
+ *
+ * One pass checks every value and whether the array is already strictly
+ * ascending, which proves uniqueness. Only an unordered array pays for a
+ * sorted copy. No hash set is built: a JavaScript Set holds at most 2^24
+ * entries, and a selection can be larger.
+ *
+ * @param {unknown} value
+ * @param {string} label
+ * @returns {number[]} `value`, unchanged.
+ */
 function requireCellIndices(value, label) {
   if (!Array.isArray(value)) {
     throw new TypeError(`${label} must be an array`);
   }
-  const seen = new Set();
-  for (let index = 0; index < value.length; index++) {
-    if (!Object.hasOwn(value, index)) {
-      throw new TypeError(`${label} must not contain holes`);
+  const length = value.length;
+  let ascending = true;
+  let previous = -1;
+  for (let index = 0; index < length; index++) {
+    const cellIndex = value[index];
+    if (!Number.isInteger(cellIndex) || cellIndex < 0) {
+      failCellIndex(value, index, label);
     }
-    const cellIndex = requireNonNegativeInteger(
-      value[index],
-      `${label}[${index}]`
-    );
-    if (seen.has(cellIndex)) {
-      throw new TypeError(`${label} must not contain duplicate cell indices`);
+    if (cellIndex <= previous) ascending = false;
+    previous = cellIndex;
+  }
+  if (!ascending) {
+    const sorted = Float64Array.from(value).sort();
+    for (let index = 1; index < length; index++) {
+      if (sorted[index] === sorted[index - 1]) {
+        throw new TypeError(`${label} must not contain duplicate cell indices`);
+      }
     }
-    seen.add(cellIndex);
   }
   return value;
+}
+
+/** The largest cell index the binary selection wire can carry. */
+const MAX_SELECTION_CELL_INDEX = 0xFFFFFFFF;
+
+const HOST_IS_LITTLE_ENDIAN =
+  new Uint8Array(Uint32Array.of(1).buffer)[0] === 1;
+
+/**
+ * Encode one selection as the exact body of `POST /_cellucid/selection`.
+ *
+ * The wire is the selected cell indices as little-endian unsigned 32-bit
+ * integers, strictly ascending, at least one: four bytes per cell instead of
+ * a JSON array, and an order that lets Python prove uniqueness in one pass.
+ * Validation is one loop over the input with no per-element strings and no
+ * hash set; an unordered selection is sorted once as a typed array.
+ *
+ * @param {unknown} value - Array of unique non-negative integer cell indices
+ * @param {string} label
+ * @returns {Uint8Array} The request body.
+ */
+export function encodeJupyterSelectionCells(value, label = 'Jupyter selection cells') {
+  if (!Array.isArray(value)) {
+    throw new TypeError(`${label} must be an array`);
+  }
+  const length = value.length;
+  if (length === 0) {
+    throw new TypeError(`${label} must contain at least one cell`);
+  }
+  const cells = new Uint32Array(length);
+  let ascending = true;
+  let previous = -1;
+  for (let index = 0; index < length; index++) {
+    const cellIndex = value[index];
+    if (
+      !Number.isInteger(cellIndex) ||
+      cellIndex < 0 ||
+      cellIndex > MAX_SELECTION_CELL_INDEX
+    ) {
+      if (Number.isInteger(cellIndex) && cellIndex > MAX_SELECTION_CELL_INDEX) {
+        throw new RangeError(
+          `${label}[${index}] exceeds the largest selectable cell index ${MAX_SELECTION_CELL_INDEX}`
+        );
+      }
+      failCellIndex(value, index, label);
+    }
+    if (cellIndex <= previous) ascending = false;
+    cells[index] = cellIndex;
+    previous = cellIndex;
+  }
+  if (!ascending) {
+    cells.sort();
+    for (let index = 1; index < length; index++) {
+      if (cells[index] === cells[index - 1]) {
+        throw new TypeError(`${label} must not contain duplicate cell indices`);
+      }
+    }
+  }
+  const bytes = new Uint8Array(cells.buffer);
+  if (!HOST_IS_LITTLE_ENDIAN) {
+    const view = new DataView(cells.buffer);
+    for (let index = 0; index < length; index++) {
+      view.setUint32(index * 4, cells[index], true);
+    }
+  }
+  return bytes;
 }
 
 function requireJupyterHealthPayload(payload) {
@@ -416,32 +513,164 @@ function requireJupyterHealthPayload(payload) {
   return payload;
 }
 
+/**
+ * Deadline for one health exchange with the notebook's Python server. The
+ * server answers from the same machine, so a request still open after this
+ * long has stalled; without a deadline it would hold startup, or a health
+ * check, open forever.
+ */
+export const JUPYTER_HEALTH_TIMEOUT_MS = 30_000;
+
 async function requestJupyterHealth(config, signal = null) {
   const exactConfig = requireJupyterRuntimeConfig(config);
   throwIfMetadataAborted(signal, 'Jupyter health request');
-  const response = await fetch(
-    `${exactConfig.serverUrl}/_cellucid/health`,
-    {
+  const healthUrl = `${exactConfig.serverUrl}/_cellucid/health`;
+  const deadline = createDeadline(JUPYTER_HEALTH_TIMEOUT_MS);
+  const requestSignal = signal === null
+    ? deadline.signal
+    : AbortSignal.any([signal, deadline.signal]);
+  try {
+    const response = await fetch(healthUrl, {
       cache: 'no-store',
-      ...(signal === null ? {} : { signal }),
+      signal: requestSignal,
+    });
+    throwIfMetadataAborted(signal, 'Jupyter health request');
+    if (!(response instanceof Response)) {
+      throw new TypeError('Jupyter health fetch must return a Response');
     }
-  );
-  throwIfMetadataAborted(signal, 'Jupyter health request');
-  if (!(response instanceof Response)) {
-    throw new TypeError('Jupyter health fetch must return a Response');
+    if (!response.ok) {
+      throw new Error(
+        `Jupyter health request failed with HTTP ${response.status}`
+      );
+    }
+    const payload = await readBoundedJson(response, {
+      label: 'Jupyter health request',
+      signal: requestSignal,
+    });
+    throwIfMetadataAborted(signal, 'Jupyter health request');
+    return requireJupyterHealthPayload(payload);
+  } catch (error) {
+    if (deadline.signal.aborted && signal?.aborted !== true) {
+      throw new Error(
+        `The Jupyter Python server did not answer ${healthUrl} within ` +
+        `${JUPYTER_HEALTH_TIMEOUT_MS / 1000} s.`,
+        { cause: error }
+      );
+    }
+    throw error;
+  } finally {
+    deadline.release();
   }
-  if (!response.ok) {
-    throw new Error(
-      `Jupyter health request failed with HTTP ${response.status}`
-    );
-  }
-  const payload = await readBoundedJson(response, {
-    label: 'Jupyter health request',
-    signal,
-  });
-  throwIfMetadataAborted(signal, 'Jupyter health request');
-  return requireJupyterHealthPayload(payload);
 }
+
+/**
+ * What the notebook's `cellucid` accepts on the viewer wire, as
+ * `GET /_cellucid/protocol` publishes it: every inbound event type and every
+ * command type. Both lists grow; neither is a version to compare against.
+ *
+ * @typedef {{events: ReadonlySet<string>, commands: ReadonlySet<string>}} JupyterProtocol
+ */
+
+/** The protocol of a `cellucid` too old to publish one: it accepts nothing new. */
+const EMPTY_JUPYTER_PROTOCOL = Object.freeze({
+  events: Object.freeze(new Set()),
+  commands: Object.freeze(new Set()),
+});
+
+function requireProtocolNames(value, label) {
+  if (!Array.isArray(value)) {
+    throw new TypeError(`${label} must be an array`);
+  }
+  const names = new Set();
+  for (const [index, name] of value.entries()) {
+    requireExactText(name, `${label}[${index}]`);
+    if (names.has(name)) {
+      throw new TypeError(`${label} must not repeat "${name}"`);
+    }
+    names.add(name);
+  }
+  return Object.freeze(names);
+}
+
+/**
+ * Validate one `/_cellucid/protocol` document.
+ *
+ * @param {unknown} payload
+ * @returns {JupyterProtocol}
+ */
+export function requireJupyterProtocolPayload(payload) {
+  requireExactKeys(payload, ['events', 'commands'], 'Jupyter protocol response');
+  return Object.freeze({
+    events: requireProtocolNames(payload.events, 'Jupyter protocol events'),
+    commands: requireProtocolNames(payload.commands, 'Jupyter protocol commands'),
+  });
+}
+
+/**
+ * Ask the notebook's `cellucid` what it accepts on the viewer wire.
+ *
+ * The answer gates every event a newer viewer could send: Python validates an
+ * inbound event against an exact list and answers an unknown type with a
+ * kernel traceback and HTTP 500, and the package loads this build from
+ * www.cellucid.com without pinning one, so an older notebook driving a newer
+ * viewer is the normal case after a deploy. A server that predates the route
+ * answers 404 and accepts nothing new.
+ *
+ * @param {JupyterConfig} config
+ * @param {AbortSignal|null} signal
+ * @returns {Promise<JupyterProtocol>}
+ */
+async function requestJupyterProtocol(config, signal = null) {
+  const exactConfig = requireJupyterRuntimeConfig(config);
+  throwIfMetadataAborted(signal, 'Jupyter protocol request');
+  const protocolUrl = `${exactConfig.serverUrl}/_cellucid/protocol`;
+  const deadline = createDeadline(JUPYTER_HEALTH_TIMEOUT_MS);
+  const requestSignal = signal === null
+    ? deadline.signal
+    : AbortSignal.any([signal, deadline.signal]);
+  try {
+    const response = await fetch(protocolUrl, {
+      cache: 'no-store',
+      signal: requestSignal,
+    });
+    throwIfMetadataAborted(signal, 'Jupyter protocol request');
+    if (!(response instanceof Response)) {
+      throw new TypeError('Jupyter protocol fetch must return a Response');
+    }
+    if (response.status === 404) return EMPTY_JUPYTER_PROTOCOL;
+    if (!response.ok) {
+      throw new Error(
+        `Jupyter protocol request failed with HTTP ${response.status}`
+      );
+    }
+    const payload = await readBoundedJson(response, {
+      label: 'Jupyter protocol request',
+      signal: requestSignal,
+    });
+    throwIfMetadataAborted(signal, 'Jupyter protocol request');
+    return requireJupyterProtocolPayload(payload);
+  } catch (error) {
+    if (deadline.signal.aborted && signal?.aborted !== true) {
+      throw new Error(
+        `The Jupyter Python server did not answer ${protocolUrl} within ` +
+        `${JUPYTER_HEALTH_TIMEOUT_MS / 1000} s.`,
+        { cause: error }
+      );
+    }
+    throw error;
+  } finally {
+    deadline.release();
+  }
+}
+
+/** Why a `data_mapping` event reports the mapping it carries. */
+const JUPYTER_DATA_MAPPING_ORIGINS = Object.freeze([
+  'default',
+  'best_guess',
+  'session',
+  'user',
+  'notebook',
+]);
 
 function requireDatasetCatalogPath(value, label) {
   if (
@@ -550,6 +779,7 @@ const JUPYTER_COMMAND_TYPES = Object.freeze([
   'resetCamera',
   'freeze',
   'requestSessionBundle',
+  'setDataMapping',
 ]);
 
 const JUPYTER_FAILURE_REASON_LIMIT = 240;
@@ -584,32 +814,14 @@ function describeJupyterFailureReason(error) {
 /**
  * Build the exact user-facing text for one failed notebook command.
  *
- * The viewer is the only place this failure currently becomes visible. The
- * state-changing commands — `highlight`, `setColorBy`, `setVisibility`,
- * `clearHighlights`, `resetCamera` and `freeze` — carry no `requestId`, so
+ * The state-changing commands -- `highlight`, `setColorBy`, `setVisibility`,
+ * `clearHighlights`, `resetCamera` and `freeze` -- carry no `requestId`, so
  * `viewer.set_color_by(...)` returns whether the viewer applied it or threw.
  * Announcing the failure here is what separates "the command failed" from
- * "the command matched nothing".
- *
- * `cellucid-python` now defines an inbound `command_error` event
- * (`_require_inbound_jupyter_event` in `cellucid/jupyter/_wire.py`) carrying
- * `command` and `reason`, which is how the notebook is meant to learn this.
- * **Do not post it from here yet.** A notebook running a `cellucid` without
- * that event raises `ValueError` in the validator; the event endpoint logs a
- * traceback to the kernel and answers `500 Viewer callback failed`, which is a
- * louder and less accurate failure than the silence it replaces. The Python
- * package fetches this build from `https://www.cellucid.com`, so an older
- * notebook driving a newer build is the normal case after a deploy.
- *
- * Emitting requires positive evidence that the notebook accepts the type, and
- * no existing handshake field can carry it: `getJupyterConfig`,
- * `requireJupyterHealthPayload`, `requireJupyterSuccessPayload` and the
- * per-command `requireExactKeys` calls in this file all validate exact key
- * sets, so anything added to them breaks builds already deployed rather than
- * being ignored by them. The gate needs a channel an older build never reads —
- * an endpoint fetched during `initialize()`, which completes before the
- * command listener is installed — shipped in the same Python release as the
- * validator.
+ * "the command matched nothing". The bridge also reports it to the notebook as
+ * a `command_error` event, but only when the notebook's `cellucid` lists that
+ * event in `/_cellucid/protocol` (see `requestJupyterProtocol`); an older one
+ * would answer an unknown event with a kernel traceback.
  *
  * @param {string|null} commandType - A value from {@link describeJupyterCommandType}.
  * @param {unknown} error
@@ -734,6 +946,15 @@ export class JupyterBridgeDataSource {
     /** @type {JupyterConfig|null} */
     this._config = null;
 
+    /** @type {'exported'|'anndata'|null} Server type from the adopted health check */
+    this._serverType = null;
+
+    /**
+     * What the notebook's `cellucid` accepts on the wire, read at connect.
+     * @type {JupyterProtocol}
+     */
+    this._protocol = EMPTY_JUPYTER_PROTOCOL;
+
     this._parentWindow = window.parent;
 
     /**
@@ -812,6 +1033,27 @@ export class JupyterBridgeDataSource {
       console.error(`[JupyterBridge] ${failure.message}`, error);
     } catch {
       // Console reporting is observational only.
+    }
+    if (
+      commandType !== null &&
+      this._connected &&
+      this._protocol.events.has('command_error') &&
+      this._protocol.commands.has(commandType)
+    ) {
+      void this._postEventToPython({
+        type: 'command_error',
+        command: commandType,
+        reason: describeJupyterFailureReason(error)
+      }).catch(deliveryError => {
+        try {
+          console.error(
+            '[JupyterBridge] Notebook command failure delivery failed:',
+            deliveryError
+          );
+        } catch {
+          // Nothing further is available to report through.
+        }
+      });
     }
     try {
       getNotificationCenter().error(failure.message, {
@@ -953,11 +1195,15 @@ export class JupyterBridgeDataSource {
     this._removeMessageListener();
     this._connected = false;
     this._config = null;
+    this._serverType = null;
+    this._protocol = EMPTY_JUPYTER_PROTOCOL;
     this._parentOrigin = null;
     this._datasetCache.clear();
     this._datasetPaths.clear();
     try {
-      await requestJupyterHealth(config, controller.signal);
+      const health = await requestJupyterHealth(config, controller.signal);
+      this._assertLifecycle(revision, 'Jupyter initialization');
+      const protocol = await requestJupyterProtocol(config, controller.signal);
       this._assertLifecycle(revision, 'Jupyter initialization');
       if (this._initializationController !== controller) {
         throw createJupyterLifecycleSupersededError(
@@ -965,6 +1211,8 @@ export class JupyterBridgeDataSource {
         );
       }
       this._config = config;
+      this._serverType = health.type;
+      this._protocol = protocol;
       this._connected = true;
       this._beginCatalogGeneration(
         'Jupyter catalog was initialized'
@@ -984,6 +1232,8 @@ export class JupyterBridgeDataSource {
         this._removeMessageListener();
         this._connected = false;
         this._config = null;
+        this._serverType = null;
+        this._protocol = EMPTY_JUPYTER_PROTOCOL;
         this._parentOrigin = null;
       }
       throw error;
@@ -992,6 +1242,34 @@ export class JupyterBridgeDataSource {
         this._initializationController = null;
       }
     }
+  }
+
+  /**
+   * Whether the notebook's server serves an AnnData object (`show_anndata()`)
+   * rather than a prepared export. Such a server publishes the data mapping it
+   * serves at `_cellucid/mapping/candidates.json` under the dataset base.
+   *
+   * @returns {boolean}
+   */
+  servesAnnData() {
+    if (!this._connected || this._serverType === null) {
+      throw new Error('Jupyter data source is not connected.');
+    }
+    return this._serverType === 'anndata';
+  }
+
+  /**
+   * Whether the notebook's `cellucid` accepts one event type from this viewer,
+   * as its `/_cellucid/protocol` lists it.
+   *
+   * @param {string} type
+   * @returns {boolean}
+   */
+  acceptsEvent(type) {
+    if (!this._connected) {
+      throw new Error('Jupyter data source is not connected.');
+    }
+    return this._protocol.events.has(type);
   }
 
   /**
@@ -1110,6 +1388,21 @@ export class JupyterBridgeDataSource {
         );
         return deliverCallbacks(this._messageCallbacks, [data]);
 
+      case 'setDataMapping':
+        requireExactKeys(
+          data,
+          ['type', 'requestId', 'mapping', 'viewerId', 'viewerToken'],
+          'Jupyter set-data-mapping message'
+        );
+        requireExactText(
+          data.requestId,
+          'Jupyter set-data-mapping requestId'
+        );
+        validateDataMapping(data.mapping, {
+          label: 'Jupyter set-data-mapping mapping'
+        });
+        return deliverCallbacks(this._messageCallbacks, [data]);
+
       case 'requestSessionBundle':
         requireExactKeys(
           data,
@@ -1219,6 +1512,14 @@ export class JupyterBridgeDataSource {
   /**
    * Post event to Python via HTTP POST to the data server.
    * This enables Frontend → Python communication in ALL environments.
+   *
+   * Every event here is a small JSON record; a selection, which can be
+   * millions of cells, has its own binary route (`_postSelectionToPython`).
+   * No request uses `keepalive`: the Fetch standard caps the bodies of all
+   * in-flight keepalive requests at 64 KiB in total, no event is sent while
+   * the page unloads, and a keepalive request over that budget is refused by
+   * the browser before it reaches Python.
+   *
    * @param {Object} event - Event data with a non-empty type
    * @private
    */
@@ -1248,23 +1549,64 @@ export class JupyterBridgeDataSource {
         ...event,
         viewerId: config.viewerId,
         viewerToken: config.viewerToken,
-      }),
-      keepalive: true
+      })
     });
-    this._assertConnection(owner, 'Jupyter event delivery');
+    await this._requireDeliveryResponse(owner, response, 'Jupyter event delivery');
+  }
+
+  /**
+   * Post one encoded selection to `POST /_cellucid/selection`.
+   *
+   * The credentials and `source` travel in the query, as they do for the
+   * session-bundle upload, so the server authenticates before it reads the
+   * body. The body is the exact bytes `encodeJupyterSelectionCells` returns.
+   *
+   * @param {Uint8Array} body
+   * @param {string} source
+   * @private
+   */
+  async _postSelectionToPython(body, source) {
+    const owner = this._captureConnection('Jupyter selection delivery');
+    const config = owner.config;
+    const query = new URLSearchParams([
+      ['viewerId', config.viewerId],
+      ['viewerToken', config.viewerToken],
+      ['source', source],
+    ]);
+    const response = await fetch(
+      `${config.serverUrl}/_cellucid/selection?${query.toString()}`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/octet-stream'
+        },
+        body
+      }
+    );
+    await this._requireDeliveryResponse(owner, response, 'Jupyter selection delivery');
+  }
+
+  /**
+   * Require one successful delivery answer from the Python server.
+   *
+   * @param {{config: JupyterConfig}} owner
+   * @param {unknown} response
+   * @param {string} label
+   * @private
+   */
+  async _requireDeliveryResponse(owner, response, label) {
+    this._assertConnection(owner, label);
     if (!(response instanceof Response)) {
-      throw new TypeError('Jupyter event fetch must return a Response');
+      throw new TypeError(`${label} fetch must return a Response`);
     }
     if (!response.ok) {
       throw new Error(
-        `Jupyter event delivery failed with HTTP ${response.status}`
+        `${label} failed with HTTP ${response.status}`
       );
     }
-    const payload = await readBoundedJson(response, {
-      label: 'Jupyter event delivery',
-    });
-    this._assertConnection(owner, 'Jupyter event delivery');
-    requireJupyterSuccessPayload(payload, 'Jupyter event delivery');
+    const payload = await readBoundedJson(response, { label });
+    this._assertConnection(owner, label);
+    requireJupyterSuccessPayload(payload, label);
   }
 
   // =========================================================================
@@ -1274,21 +1616,17 @@ export class JupyterBridgeDataSource {
   // This works in ALL environments (Jupyter, JupyterLab, Colab, VSCode).
   /**
    * Notify Python of cell selection change
-   * @param {number[]} cellIndices - Selected cell indices
-   * @param {string} source - Selection source ('lasso', 'click', 'range')
+   * @param {number[]} cellIndices - Selected cell indices: unique non-negative
+   *   integers in any order, at least one. Python receives them ascending.
+   * @param {string} source - Selection source ('lasso', 'knn', 'proximity', 'annotation')
    */
   async notifySelection(cellIndices, source) {
     if (!this._connected) {
       throw new Error('Jupyter event source is not connected');
     }
-    requireCellIndices(cellIndices, 'Jupyter selection cells');
+    const body = encodeJupyterSelectionCells(cellIndices, 'Jupyter selection cells');
     requireExactText(source, 'Jupyter selection source');
-    const event = {
-      type: 'selection',
-      cells: cellIndices,
-      source: source
-    };
-    return this._postEventToPython(event);
+    return this._postSelectionToPython(body, source);
   }
 
   /**
@@ -1367,6 +1705,49 @@ export class JupyterBridgeDataSource {
       ctrl: options.ctrl
     };
     return this._postEventToPython(event);
+  }
+
+  /**
+   * Tell Python which data mapping the viewer shows, when the notebook's
+   * `cellucid` accepts the `data_mapping` event.
+   *
+   * @param {{origin: string, requestId: string|null, mapping: Object}} report
+   *   `requestId` names the `setDataMapping` command this answers; it is set
+   *   exactly when `origin` is `notebook`.
+   * @returns {Promise<boolean>} Whether the event was sent.
+   */
+  async notifyDataMapping(report) {
+    if (!this._connected) {
+      throw new Error('Jupyter event source is not connected');
+    }
+    requireExactKeys(
+      report,
+      ['origin', 'requestId', 'mapping'],
+      'Jupyter data-mapping report'
+    );
+    if (!JUPYTER_DATA_MAPPING_ORIGINS.includes(report.origin)) {
+      throw new TypeError(
+        `Jupyter data-mapping origin must be one of ${JUPYTER_DATA_MAPPING_ORIGINS.join(', ')}`
+      );
+    }
+    if (report.origin === 'notebook') {
+      requireExactText(report.requestId, 'Jupyter data-mapping requestId');
+    } else if (report.requestId !== null) {
+      throw new TypeError(
+        'Jupyter data-mapping requestId must be null unless it answers the notebook'
+      );
+    }
+    const mapping = validateDataMapping(report.mapping, {
+      label: 'Jupyter data-mapping report'
+    });
+    if (!this._protocol.events.has('data_mapping')) return false;
+    await this._postEventToPython({
+      type: 'data_mapping',
+      requestId: report.requestId,
+      origin: report.origin,
+      mapping
+    });
+    return true;
   }
 
   /**
@@ -1835,6 +2216,8 @@ export class JupyterBridgeDataSource {
     this._removeMessageListener();
     this._connected = false;
     this._config = null;
+    this._serverType = null;
+    this._protocol = EMPTY_JUPYTER_PROTOCOL;
     this._parentOrigin = null;
     this._datasetCache.clear();
     this._datasetPaths.clear();

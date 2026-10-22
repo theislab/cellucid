@@ -35,7 +35,7 @@ import test from 'node:test';
 
 import { PlotFactory } from '../assets/js/app/analysis/plots/plot-factory.js';
 
-// exports/pancreas/obs_manifest.json, fields `clusters` and `cell_type`.
+// cellucid-datasets exports-v3/pancreas/obs_manifest.json, fields `clusters` and `cell_type`.
 const PANCREAS_CELL_TYPES = [
   'Ductal', 'Ngn3 low EP', 'Ngn3 high EP', 'Pre-endocrine',
   'Beta', 'Alpha', 'Delta', 'Epsilon',

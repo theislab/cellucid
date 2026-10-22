@@ -98,7 +98,6 @@ test('worker exposes only the exact current route inventory', async () => {
       '/auth/installations',
       '/auth/installation-repos',
       '/cap/lookup-cells',
-      '/cap/search-datasets',
       '/api/repos/*',
     ],
   });
@@ -108,6 +107,12 @@ test('worker exposes only the exact current route inventory', async () => {
     ENV
   );
   assert.equal(removed.status, 404);
+
+  const removedCapRoute = await worker.fetch(
+    request('/cap/search-datasets', { method: 'POST' }),
+    ENV
+  );
+  assert.equal(removedCapRoute.status, 404);
 
   const removedMethod = await worker.fetch(
     request('/api/repos/owner/repo/git/refs/heads/topic', {

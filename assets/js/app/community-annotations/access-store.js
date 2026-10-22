@@ -71,7 +71,7 @@ function computeRoleFromRepoInfo(repoInfo) {
   return isAuthor ? 'author' : 'annotator';
 }
 
-export class CommunityAnnotationAccessStore extends EventEmitter {
+class CommunityAnnotationAccessStore extends EventEmitter {
   constructor() {
     super();
     this._role = 'unknown';

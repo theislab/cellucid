@@ -14,7 +14,13 @@ if (testFiles.length === 0) {
   throw new Error(`No web contract tests found in ${testsDirectory}`);
 }
 
-const result = spawnSync(process.execPath, ['--test', ...testFiles], {
+// node:test waits forever for a test that never settles (a promise nobody
+// resolves once an earlier step failed). Every contract test finishes in
+// seconds, so one still running after this long has hung: it fails with a
+// timeout and the run goes on, instead of blocking the suite for hours.
+const TEST_TIMEOUT_MS = 120_000;
+
+const result = spawnSync(process.execPath, ['--test', `--test-timeout=${TEST_TIMEOUT_MS}`, ...testFiles], {
   cwd: repositoryRoot,
   stdio: 'inherit',
 });

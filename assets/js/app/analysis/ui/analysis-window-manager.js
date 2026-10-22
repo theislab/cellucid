@@ -5,7 +5,9 @@
  * run multiple analyses in parallel perspectives.
  *
  * Key properties:
- * - Copies are floating panels (details.accordion-section) rendered in #floating-panels-root
+ * - Copies are floating panels (details.accordion-section) rendered in #floating-panels-root,
+ *   each standing in the frame the dockable owner builds for it (`panelFrame()`), with its
+ *   copy and close buttons in the frame's header action bar beside the summary
  * - Copies are "floating-only" (not dockable back into the sidebar)
  * - Each window owns its own Analysis UI instance and must be cleaned up on close
  * - Settings are copied via UI exportSettings/importSettings (results intentionally excluded)
@@ -15,8 +17,6 @@ import { getDockableAccordions } from '../../dockable-accordions-registry.js';
 import { SIDEBAR_MAX_WIDTH_PX, SIDEBAR_MIN_WIDTH_PX } from '../../sidebar-metrics.js';
 import { isFiniteNumber } from '../shared/number-utils.js';
 import { expandPagesWithDerived } from '../shared/page-derivation-utils.js';
-
-const MAX_ANALYSIS_WINDOWS = 20;
 
 function isPlainObject(value) {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
@@ -58,7 +58,8 @@ function requireDockableAccordions() {
     typeof dockable.floatingRoot.appendChild !== 'function' ||
     typeof dockable.register !== 'function' ||
     typeof dockable.float !== 'function' ||
-    typeof dockable.unregister !== 'function'
+    typeof dockable.unregister !== 'function' ||
+    typeof dockable.panelFrame !== 'function'
   ) {
     throw new Error(
       'Analysis windows require an initialized dockable-accordions registry'
@@ -193,7 +194,7 @@ export class AnalysisWindowManager {
     this._uiManager = options.uiManager;
     this._sidebar = options.sidebar;
 
-    /** @type {Map<string, { id: string, modeId: string, details: HTMLDetailsElement, content: HTMLDivElement, ui: any, lastKnownPageIds: string[], headerTitle: string, headerDesc: string, floatConstraints: any }>} */
+    /** @type {Map<string, { id: string, modeId: string, details: HTMLDetailsElement, frame: HTMLElement, content: HTMLDivElement, ui: any, lastKnownPageIds: string[], headerTitle: string, floatConstraints: any }>} */
     this._windows = new Map();
 
     this._counter = 0;
@@ -214,17 +215,17 @@ export class AnalysisWindowManager {
    * reconstructed quickly. Results are intentionally excluded; only settings
    * and geometry are persisted.
    *
-   * @returns {Array<{ modeId: string, rect: { left: number, top: number, width: number, height: number }, settings: any, headerTitle: string, headerDesc: string, constraints: any }>}
+   * @returns {Array<{ modeId: string, rect: { left: number, top: number, width: number, height: number }, settings: any, headerTitle: string, constraints: any }>}
    */
   exportSessionWindows() {
-    /** @type {Array<{ modeId: string, rect: { left: number, top: number, width: number, height: number }, settings: any, headerTitle: string, headerDesc: string, constraints: any }>} */
+    /** @type {Array<{ modeId: string, rect: { left: number, top: number, width: number, height: number }, settings: any, headerTitle: string, constraints: any }>} */
     const out = [];
 
     for (const entry of this._windows.values()) {
       if (
         entry === null ||
         typeof entry !== 'object' ||
-        typeof entry.details?.getBoundingClientRect !== 'function'
+        typeof entry.frame?.getBoundingClientRect !== 'function'
       ) {
         throw new TypeError('Analysis window registry contains an invalid entry');
       }
@@ -235,11 +236,8 @@ export class AnalysisWindowManager {
       }
       requireNonEmptyString(entry.modeId, 'Analysis window modeId');
       requireNonEmptyString(entry.headerTitle, 'Analysis window headerTitle');
-      if (typeof entry.headerDesc !== 'string') {
-        throw new TypeError('Analysis window headerDesc must be a string');
-      }
 
-      const measuredRect = entry.details.getBoundingClientRect();
+      const measuredRect = entry.frame.getBoundingClientRect();
       const rect = {
         left: measuredRect.left,
         top: measuredRect.top,
@@ -253,8 +251,7 @@ export class AnalysisWindowManager {
         modeId: entry.modeId,
         rect,
         settings,
-        headerTitle: entry.headerTitle,
-        headerDesc: entry.headerDesc
+        headerTitle: entry.headerTitle
       });
     }
 
@@ -264,14 +261,14 @@ export class AnalysisWindowManager {
   /**
    * Create a floating analysis window from a session restore descriptor.
    *
-   * @param {{ modeId: string, rect: { left: number, top: number, width: number, height: number }, settings: Object, headerTitle: string, headerDesc: string }} descriptor
+   * @param {{ modeId: string, rect: { left: number, top: number, width: number, height: number }, settings: Object, headerTitle: string }} descriptor
    * @returns {string|Promise<never>} windowId, or an awaitable failed rollback
    */
   createFromSessionDescriptor(descriptor) {
     this._assertWindowCreationAvailable();
     requireExactKeys(
       descriptor,
-      ['headerDesc', 'headerTitle', 'modeId', 'rect', 'settings'],
+      ['headerTitle', 'modeId', 'rect', 'settings'],
       'Analysis window descriptor'
     );
     requireNonEmptyString(descriptor.modeId, 'Analysis window descriptor modeId');
@@ -281,9 +278,6 @@ export class AnalysisWindowManager {
       descriptor.headerTitle,
       'Analysis window descriptor headerTitle'
     );
-    if (typeof descriptor.headerDesc !== 'string') {
-      throw new TypeError('Analysis window descriptor headerDesc must be a string');
-    }
 
     return this._createWindow(descriptor.modeId, settings, {
       left: descriptor.rect.left,
@@ -292,15 +286,14 @@ export class AnalysisWindowManager {
         width: descriptor.rect.width,
         height: descriptor.rect.height
       },
-      headerTitle: descriptor.headerTitle,
-      headerDesc: descriptor.headerDesc
+      headerTitle: descriptor.headerTitle
     });
   }
 
   /**
    * Create a floating copy from the embedded (sidebar) analysis mode instance.
    * @param {string} modeId
-   * @param {{ sourceRect?: DOMRect, preferredSize?: { width?: number, height?: number }, constraints?: any, headerTitle?: string, headerDesc?: string }} [options]
+   * @param {{ sourceRect?: DOMRect, preferredSize?: { width?: number, height?: number }, constraints?: any, headerTitle?: string }} [options]
    * @returns {string|Promise<never>} windowId, or an awaitable failed rollback
    */
   copyFromEmbedded(modeId, options = {}) {
@@ -339,14 +332,13 @@ export class AnalysisWindowManager {
         `Analysis window "${windowId}" UI must implement exportSettings()`
       );
     }
-    const rect = entry.details.getBoundingClientRect();
+    const rect = entry.frame.getBoundingClientRect();
     const settings = requireSettings(entry.ui.exportSettings());
     return this._createWindow(entry.modeId, settings, {
       sourceRect: rect,
       preferredSize: { width: rect.width, height: rect.height },
       constraints: entry.floatConstraints,
-      headerTitle: entry.headerTitle,
-      headerDesc: entry.headerDesc
+      headerTitle: entry.headerTitle
     });
   }
 
@@ -390,7 +382,7 @@ export class AnalysisWindowManager {
         }
 
         try {
-          entry.details.remove();
+          entry.frame.remove();
         } catch (error) {
           errors.push(error);
         }
@@ -632,11 +624,6 @@ export class AnalysisWindowManager {
         this._closeTasks.delete(closedId);
       }
     }
-    if (this._windows.size >= MAX_ANALYSIS_WINDOWS) {
-      throw new RangeError(
-        `Maximum of ${MAX_ANALYSIS_WINDOWS} analysis windows reached`
-      );
-    }
     requireNonEmptyString(modeId, 'Analysis mode ID');
     const exactSettings = requireSettings(settings);
     if (typeof this._uiManager.getTypeInfo !== 'function') {
@@ -660,10 +647,6 @@ export class AnalysisWindowManager {
       ? getHeaderTitleForMode(typeInfo, modeId)
       : options.headerTitle;
     requireNonEmptyString(headerTitle, 'Analysis window headerTitle');
-    const headerDesc = options.headerDesc === undefined ? '' : options.headerDesc;
-    if (typeof headerDesc !== 'string') {
-      throw new TypeError('Analysis window headerDesc must be a string');
-    }
     const preferredSize = this._resolvePreferredSize(options);
     const floatConstraints = this._resolveFloatConstraints(options);
     const hasLeft = options.left !== undefined;
@@ -698,53 +681,47 @@ export class AnalysisWindowManager {
     const summary = document.createElement('summary');
 
     const titleEl = document.createElement('span');
-    titleEl.className = 'analysis-accordion-title';
+    titleEl.className = 'disclosure-title';
     titleEl.textContent = headerTitle;
 
-    const descEl = document.createElement('span');
-    descEl.className = 'analysis-accordion-desc';
-    descEl.textContent = headerDesc;
-
     summary.appendChild(titleEl);
-    summary.appendChild(descEl);
     details.appendChild(summary);
 
-    // Header actions (icons via CSS pseudo-elements)
+    // Header actions (icons via CSS pseudo-elements). They are handed to the
+    // dockable owner, which stands them beside the summary: a summary is the
+    // disclosure button itself and must not contain other controls.
+    const copyLabel = `Copy ${headerTitle} analysis window`;
     const copyBtn = document.createElement('button');
     copyBtn.type = 'button';
     copyBtn.className = 'accordion-copy-btn';
-    copyBtn.title = 'Copy analysis window';
-    copyBtn.setAttribute('aria-label', 'Copy analysis window');
-    copyBtn.addEventListener('click', (e) => {
-      e.preventDefault();
-      e.stopPropagation();
+    copyBtn.title = copyLabel;
+    copyBtn.setAttribute('aria-label', copyLabel);
+    copyBtn.addEventListener('click', () => {
       observeWindowAction(
         () => this.copyFromWindow(windowId),
         `copy of analysis window "${windowId}"`
       );
     });
 
+    const closeLabel = `Close ${headerTitle} analysis window`;
     const closeBtn = document.createElement('button');
     closeBtn.type = 'button';
     closeBtn.className = 'accordion-close-btn';
-    closeBtn.title = 'Close analysis window';
-    closeBtn.setAttribute('aria-label', 'Close analysis window');
-    closeBtn.addEventListener('click', (e) => {
-      e.preventDefault();
-      e.stopPropagation();
+    closeBtn.title = closeLabel;
+    closeBtn.setAttribute('aria-label', closeLabel);
+    closeBtn.addEventListener('click', () => {
       observeWindowAction(
         () => this.closeWindow(windowId),
         `close of analysis window "${windowId}"`
       );
     });
 
-    summary.appendChild(copyBtn);
-    summary.appendChild(closeBtn);
-
+    // The open/closed chevron is decoration that closes the header row, after
+    // the buttons, as it always has; it ignores the pointer, so a press on it
+    // reaches the summary underneath.
     const chevron = document.createElement('span');
-    chevron.className = 'analysis-accordion-chevron';
+    chevron.className = 'disclosure-chevron';
     chevron.setAttribute('aria-hidden', 'true');
-    summary.appendChild(chevron);
 
     const content = document.createElement('div');
     content.className = 'accordion-content';
@@ -780,12 +757,12 @@ export class AnalysisWindowManager {
       id: windowId,
       modeId,
       details,
+      frame: null,
       content,
       ui: null,
       lastKnownPageIds: currentPageIds,
       lastKnownSelectableBasePageIds: currentSelectableBasePageIds,
       headerTitle,
-      headerDesc,
       floatConstraints
     };
 
@@ -833,12 +810,20 @@ export class AnalysisWindowManager {
       ui.importSettings(exactSettings);
       windowEntry.ui = ui;
       registrationAttempted = true;
-      dockable.register(details, { dockable: false });
+      dockable.register(details, {
+        dockable: false,
+        actions: [copyBtn, closeBtn, chevron]
+      });
+      windowEntry.frame = dockable.panelFrame(details);
+      windowEntry.frame.classList.add('analysis-window-frame');
       dockable.float(details, {
         left: computed.left,
         top: computed.top,
         preferredSize,
-        constraints: floatConstraints
+        constraints: floatConstraints,
+        // A window opened now finds a free spot; one restored to a saved
+        // position keeps it.
+        besideOpenWindows: !hasLeft
       });
       this._windows.set(windowId, windowEntry);
       return windowId;
@@ -862,7 +847,9 @@ export class AnalysisWindowManager {
 
       const finishRollback = () => {
         try {
-          details.remove();
+          // Registration stands the window in a frame; take out whichever
+          // element holds it now.
+          (dockable.panelFrame(details) ?? details).remove();
         } catch (cleanupError) {
           cleanupErrors.push(cleanupError);
         }

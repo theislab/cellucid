@@ -16,6 +16,10 @@
  */
 
 let counter = 0;
+// Every id this module has minted. A minted id is unique to this page by
+// construction, so nothing saved can name it again on another page; the
+// session serializer asks here so it never records such a control.
+const mintedIds = new Set();
 
 /**
  * Mint a collision-free DOM id for `for` / `aria-labelledby` / `aria-controls`
@@ -38,5 +42,17 @@ export function createDomId(prefix = 'id') {
     );
   }
   counter += 1;
-  return `${prefix}-${counter.toString(36)}`;
+  const id = `${prefix}-${counter.toString(36)}`;
+  mintedIds.add(id);
+  return id;
+}
+
+/**
+ * Whether `id` was minted by `createDomId` on this page.
+ *
+ * @param {string} id
+ * @returns {boolean}
+ */
+export function isGeneratedDomId(id) {
+  return mintedIds.has(id);
 }

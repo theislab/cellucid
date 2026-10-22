@@ -42,6 +42,7 @@ import {
 import {
   createHighlightSelectionState,
 } from '../assets/js/app/ui/modules/highlight/selection-state.js';
+import { createSelectModeDom } from './helpers/select-mode-dom.mjs';
 
 const INDEX_URL = new URL('../index.html', import.meta.url);
 const indexHtml = await readFile(INDEX_URL, 'utf8');
@@ -103,6 +104,8 @@ class FakeGroup {
     if (selector === '[data-state-serializer-skip]') {
       return this.skipped ? this : null;
     }
+    // The toolbelt's choices do not follow the embedding.
+    if (selector === '[data-state-serializer-after-embedding]') return null;
     throw new Error(`Unexpected closest() selector ${JSON.stringify(selector)}`);
   }
 
@@ -366,6 +369,7 @@ function makeModeOwner(buttons) {
     setKnnEnabled(on) { viewerCalls.push(`knn:${on}`); },
     setLassoEnabled(on) { viewerCalls.push(`lasso:${on}`); },
     setProximityEnabled(on) { viewerCalls.push(`proximity:${on}`); },
+    setSelectMode() {},
   };
   const modeDescriptionParent = { appendChild() {}, querySelector: () => null };
   const modeDescription = {
@@ -377,7 +381,7 @@ function makeModeOwner(buttons) {
   const modeUi = initHighlightModeUI({
     state: { pointCount: 8 },
     viewer,
-    dom: { modeButtons: buttons, modeDescription },
+    dom: { ...createSelectModeDom(), modeButtons: buttons, modeDescription },
     selectionState,
     modeHandlers: {
       restoreAnnotationSelection() {},

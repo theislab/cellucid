@@ -2,26 +2,6 @@
    Legend + colormap menu
    ===================================================================== */
 
-.legend-group {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1-5);
-  padding: var(--space-2-5) var(--space-2-5) var(--space-3);
-  border: var(--border-strong);
-  border-radius: 0;
-  background: var(--color-surface-elevated);
-  box-shadow: var(--shadow-sm);
-}
-
-.legend-section-title {
-  font-family: var(--font-display);
-  font-size: var(--text-xs);
-  font-weight: var(--font-weight-medium);
-  letter-spacing: var(--tracking-wider);
-  text-transform: uppercase;
-  opacity: var(--opacity-85);
-}
-
 #legend {
   display: flex;
   flex-direction: column;
@@ -39,35 +19,8 @@
   padding-top: var(--space-2);
 }
 
-.legend-subtitle {
-  font-size: var(--text-xs);
-  font-weight: var(--font-weight-semibold);
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  color: var(--color-text-primary);
-}
-
-.legend-toggle-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--space-2);
-}
-
-.legend-toggle-label {
-  font-size: var(--text-xs);
-  letter-spacing: 0.02em;
-  color: var(--color-text-secondary);
-}
-
 .legend-filter {
   gap: var(--space-1);
-}
-
-.legend-help {
-  font-size: var(--text-xs);
-  opacity: var(--opacity-70);
-  margin-top: var(--space-0-5);
 }
 
 /* Colormap button */
@@ -93,18 +46,28 @@
   outline-offset: 1px;
 }
 
-/* Colormap dropdown */
+/* The colorbar's two end values. */
+.colorbar-ticks {
+  display: flex;
+  justify-content: space-between;
+  margin-top: var(--space-0-5);
+  font-variant-numeric: tabular-nums;
+  font-size: var(--type-readout);
+  color: var(--color-text-secondary);
+}
+
+/* Colormap dropdown (opened and closed with the `hidden` attribute). */
 .colormap-menu {
   position: absolute;
   top: calc(100% + var(--space-1-5));
   left: 0;
   right: 0;
   background: var(--color-surface-elevated);
-  border: var(--border-strong);
-  border-radius: 0;
+  border: var(--border-default);
+  border-radius: var(--radius-none);
   box-shadow: var(--shadow-md);
   padding: var(--space-1-5);
-  display: none;
+  display: flex;
   flex-direction: column;
   gap: var(--space-1);
   z-index: var(--z-popover);
@@ -112,20 +75,17 @@
   overflow-y: auto;
 }
 
-.colormap-menu.visible {
-  display: flex;
-}
-
 .colormap-option {
   display: flex;
   align-items: center;
   gap: var(--space-2);
-  border: 1px solid transparent;
-  border-radius: 0;
+  border: var(--border-width-1) solid transparent;
+  border-radius: var(--radius-none);
   padding: var(--space-1-5) var(--space-2);
   background: var(--color-surface-secondary);
+  color: var(--color-text-primary);
   cursor: pointer;
-  font-size: var(--text-xs);
+  font-size: var(--type-control);
   text-align: left;
 }
 
@@ -144,17 +104,20 @@
   flex: 1;
   min-width: 90px;
   height: var(--space-3);
-  border-radius: var(--radius-lg);
+  border-radius: var(--radius-sm);
   border: var(--border-width-1) solid color-mix(in srgb, var(--color-border-strong) 15%, transparent);
   background: linear-gradient(to right,
     var(--colormap-stops, var(--color-border-light), var(--color-border-light)));
 }
 
+/* The row owns the ink, so the selected row's inverse colour reaches its
+   label. A colour of its own here kept the label primary-on-primary — dark on
+   the dark highlight in light theme, light on light in dark theme. */
 .colormap-name {
   min-width: 72px;
-  font-weight: 700;
-  color: var(--color-text-primary);
-  letter-spacing: 0.2px;
+  font-weight: var(--font-weight-semibold);
+  color: inherit;
+  letter-spacing: var(--tracking-normal);
 }
 
 /* Legend controls row */
@@ -173,27 +136,38 @@
 .legend-item {
   display: flex;
   align-items: center;
-  margin-bottom: 1px;
+  margin-bottom: var(--space-px);
   position: relative;
+}
+
+/* A long legend renders only the rows in view: an off-screen row keeps its
+   remembered height and skips style, layout and paint, so a 5,000-category
+   field scrolls and refreshes like a short one. */
+.legend-items-scrollable > .legend-item {
+  content-visibility: auto;
+  contain-intrinsic-size: auto var(--space-4);
 }
 
 .legend-item.legend-item-annotating {
   align-items: flex-start;
 }
 
-.legend-checkbox {
-  width: var(--space-3-5);
-  height: var(--space-3-5);
-  margin: 0 var(--space-1) 0 0;
+/* Scoped to the row so it outranks the global `input[type="checkbox"]`
+   reset (0,1,1), which used to zero this margin and press the tick against
+   the swatch. */
+.legend-item > .legend-checkbox {
+  width: var(--control-check-size);
+  height: var(--control-check-size);
+  margin: 0 var(--space-1-5) 0 0;
   cursor: pointer;
   flex-shrink: 0;
 }
 
 /* Color swatch & dropdown palette */
 .legend-swatch {
-  width: var(--space-3-5);
-  height: var(--space-3-5);
-  border-radius: 3px;
+  width: var(--control-check-size);
+  height: var(--control-check-size);
+  border-radius: var(--radius-sm);
   margin-right: var(--space-1-5);
   border: var(--border-width-1) solid color-mix(in srgb, var(--color-border-strong) 25%, transparent);
   background-color: var(--legend-swatch-color, var(--color-border-light));
@@ -221,11 +195,11 @@
 
 .legend-swatch:hover {
   border-color: color-mix(in srgb, var(--color-border-strong) 60%, transparent);
-  box-shadow: var(--shadow-soft-xs);
+  box-shadow: var(--shadow-xs);
 }
 
 .legend-label {
-  font-size: var(--text-xs);
+  font-size: var(--type-control);
   flex: 1;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -235,7 +209,7 @@
 .legend-label.legend-label-multiline {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: var(--space-0-5);
   white-space: normal;
 }
 
@@ -247,7 +221,7 @@
 
 .legend-label-sub {
   width: 100%;
-  font-size: var(--text-2xs);
+  font-size: var(--type-compact);
   opacity: var(--opacity-75);
   overflow: visible;
   white-space: nowrap;
@@ -268,7 +242,7 @@
   position: absolute;
   right: var(--space-5);
   bottom: 0;
-  font-size: var(--text-2xs);
+  font-size: var(--type-compact);
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
   text-align: right;
@@ -280,7 +254,7 @@
   right: 0;
   bottom: 0;
   padding: 0 var(--space-1);
-  font-size: var(--text-2xs);
+  font-size: var(--type-compact);
   line-height: 1;
   border-radius: var(--radius-full);
   border: var(--border-default);
@@ -323,8 +297,19 @@
   border-color: var(--color-accent-strong);
 }
 
+/* The row's rename and delete actions sit a step apart from the count. */
+.legend-item > .icon-btn {
+  margin-left: var(--space-1);
+}
+
+/* Legend rows are stacked edge to edge, so their actions keep the row as
+   their whole target instead of reaching into the next row. */
+.legend-item > .icon-btn::after {
+  inset: calc(-1 * var(--border-width-1));
+}
+
 .legend-count {
-  font-size: var(--text-xs);
+  font-size: var(--type-readout);
   opacity: var(--opacity-75);
   margin-left: var(--space-2);
   white-space: nowrap;
@@ -350,70 +335,41 @@
   overflow-x: hidden;
   padding-right: var(--space-1);
   /* Fade mask at bottom to indicate scrollability */
-  mask-image: linear-gradient(to bottom, black calc(100% - 24px), transparent 100%);
-  -webkit-mask-image: linear-gradient(to bottom, black calc(100% - 24px), transparent 100%);
-  /* Native scrollbar styling */
-  scrollbar-width: thin;
-  scrollbar-color: color-mix(in srgb, var(--color-text-primary) 35%, transparent)
-    color-mix(in srgb, var(--color-text-primary) 8%, transparent);
+  mask-image: linear-gradient(to bottom, var(--black) calc(100% - var(--space-6)), transparent 100%);
+  -webkit-mask-image: linear-gradient(to bottom, var(--black) calc(100% - var(--space-6)), transparent 100%);
 }
 
 /* Remove fade mask when scrolled to bottom */
+/* A virtual list (see `VIRTUAL_LIST_MIN_ROWS` in categorical-legend.js): the
+   spacer is as tall as every row, and the window of built rows sits at the
+   first row it holds. */
+.legend-virtual-spacer {
+  position: relative;
+  height: var(--legend-virtual-height, auto);
+}
+
+.legend-virtual-window {
+  position: absolute;
+  inset-inline: 0;
+  top: 0;
+  transform: translateY(var(--legend-virtual-offset, 0));
+}
+
+.legend-items-virtual .legend-item {
+  content-visibility: visible;
+}
+
 .legend-items-scrollable.scrolled-to-bottom {
   mask-image: none;
   -webkit-mask-image: none;
 }
 
-/* WebKit scrollbar styling */
-.legend-items-scrollable::-webkit-scrollbar {
-  width: 6px;
-}
-
-.legend-items-scrollable::-webkit-scrollbar-track {
-  background: color-mix(in srgb, var(--color-text-primary) 6%, transparent);
-  border-radius: 3px;
-}
-
-.legend-items-scrollable::-webkit-scrollbar-thumb {
-  background: color-mix(in srgb, var(--color-text-primary) 30%, transparent);
-  border-radius: 3px;
-  min-height: 32px;
-}
-
-.legend-items-scrollable::-webkit-scrollbar-thumb:hover {
-  background: color-mix(in srgb, var(--color-text-primary) 45%, transparent);
-}
-
-/* ========================================================================
-   Legend for categorical items (reusing pieces above)
-   ===================================================================== */
-
-/* Already covered above; kept for layout clarity */
-
+/* Action rows under the legend (Show all / Hide all, Filter / Reset, and the
+   kept-view layout row). */
 .legend-actions {
   display: flex;
   justify-content: flex-end;
+  align-items: center;
   gap: var(--space-1-5);
   margin-top: var(--space-1);
-}
-
-.legend-actions.compact {
-  justify-content: flex-end;
-  gap: var(--space-1-5);
-}
-
-.legend-actions.compact button {
-  padding: var(--space-1) var(--space-2);
-  font-size: var(--text-2xs);
-}
-
-.legend-actions button.primary {
-  background: var(--color-interactive-primary);
-  color: var(--color-text-inverse);
-  border-color: var(--color-interactive-primary);
-}
-
-.legend-actions button.primary:hover {
-  background: var(--color-interactive-primary-hover);
-  color: var(--color-text-inverse);
 }

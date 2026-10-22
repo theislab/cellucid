@@ -1,20 +1,25 @@
 /**
  * Quantization Worker
  *
- * Off-main-thread dequantization for quantized uint8/uint16 fields.
- * Used by data loaders to keep UI responsive and to parallelize decoding.
+ * Off-main-thread decoding for quantized uint8/uint16 fields: the gzip
+ * inflate of a compressed transfer and the dequantization of its codes both
+ * run here. Used by data loaders to keep UI responsive and to parallelize
+ * decoding — streaming analyses decode one payload per gene, so the inflate
+ * left on the main thread was the largest single cost per gene there.
  *
  * @module data/quantization-worker
  */
 
 import {
-  isConstantQuantizationRange,
+  decodeQuantizedToFloat32,
   validateQuantizationTask,
 } from './quantization-contract.js';
+import { gzipDecompress } from '../app/session/codecs/gzip.js';
 
 /**
  * @typedef {{
  *   buffer: ArrayBuffer,
+ *   gzipOutputBytes: number|null,
  *   dtype: 'uint8'|'uint16',
  *   minValue: number,
  *   maxValue: number,
@@ -23,38 +28,32 @@ import {
  */
 
 /**
- * @param {DequantizePayload} payload
- * @returns {ArrayBuffer} Float32Array buffer
+ * @param {Uint8Array} bytes
+ * @returns {ArrayBuffer} A buffer holding exactly `bytes`, from offset 0.
  */
-export function dequantizeToFloat32Buffer(payload) {
+function exactBuffer(bytes) {
+  return bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength
+    ? bytes.buffer
+    : bytes.slice().buffer;
+}
+
+/**
+ * @param {DequantizePayload} payload
+ * @returns {Promise<ArrayBuffer>} Float32Array buffer
+ */
+export async function dequantizeToFloat32Buffer(payload) {
   validateQuantizationTask(payload, 'Quantization worker task');
-  const { buffer, dtype, minValue, maxValue } = payload;
-  const isU8 = dtype === 'uint8';
-  const quantized = isU8 ? new Uint8Array(buffer) : new Uint16Array(buffer);
-
-  const n = quantized.length;
-  const out = new Float32Array(n);
-
-  const maxQuant = isU8 ? 254 : 65534;
-  const nanMarker = isU8 ? 255 : 65535;
-
-  if (isConstantQuantizationRange(minValue, maxValue)) {
-    // compact_v1's constant-field case: equal bounds, every code 0. Return the
-    // constant itself instead of scaling by a range of zero.
-    for (let i = 0; i < n; i++) {
-      out[i] = quantized[i] === nanMarker ? NaN : minValue;
-    }
-    return out.buffer;
-  }
-
-  const scale = (maxValue - minValue) / maxQuant;
-
-  for (let i = 0; i < n; i++) {
-    const q = quantized[i];
-    out[i] = q === nanMarker ? NaN : minValue + q * scale;
-  }
-
-  return out.buffer;
+  const { buffer, gzipOutputBytes, dtype, minValue, maxValue, bits } = payload;
+  const codes = gzipOutputBytes === null
+    ? buffer
+    : exactBuffer(await gzipDecompress(new Uint8Array(buffer), {
+      maxOutputBytes: gzipOutputBytes,
+      signal: null,
+    }));
+  const quantized = dtype === 'uint8'
+    ? new Uint8Array(codes)
+    : new Uint16Array(codes);
+  return decodeQuantizedToFloat32(quantized, minValue, maxValue, bits).buffer;
 }
 
 function validateWorkerMessage(message) {
@@ -93,9 +92,9 @@ function validateWorkerMessage(message) {
   return message;
 }
 
-export function processQuantizationWorkerMessage(message) {
+export async function processQuantizationWorkerMessage(message) {
   const { payload, requestId } = validateWorkerMessage(message);
-  const outBuffer = dequantizeToFloat32Buffer(payload);
+  const outBuffer = await dequantizeToFloat32Buffer(payload);
   return {
     requestId,
     success: true,
@@ -104,10 +103,10 @@ export function processQuantizationWorkerMessage(message) {
 }
 
 if (typeof self !== 'undefined') {
-  self.onmessage = event => {
+  self.onmessage = async event => {
     const message = event.data;
     try {
-      const response = processQuantizationWorkerMessage(message);
+      const response = await processQuantizationWorkerMessage(message);
       self.postMessage(response, [response.result.buffer]);
     } catch (error) {
       const requestId = (

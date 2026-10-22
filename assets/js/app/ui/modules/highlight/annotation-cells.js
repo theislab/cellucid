@@ -11,12 +11,13 @@
  * @module ui/modules/highlight/annotation-cells
  */
 
+import { CellSet } from '../../../utils/cell-set.js';
 import {
   requireContinuousStatistics,
-  requireFieldSource,
   requireFiniteNumber,
   requireSafeInteger
 } from './exact-contract.js';
+import { isCategoricalCodes, missingCategoryCode } from '../../../../data/categorical-storage-contract.js';
 
 /**
  * Vertical travel, in CSS pixels, above which the renderer reports a drag as a
@@ -47,21 +48,65 @@ export function annotationGestureType(dragDeltaY) {
 }
 
 /**
- * Resolve the cells an annotation gesture covers on the active field.
+ * The field an annotation gesture in one pane reads: the field that pane is
+ * colored by, or `null` when it is colored by none.
+ *
+ * A selection gesture never moves view focus, so in a grid of views the pane
+ * a gesture lands in need not be the focused one. Its category, value and
+ * range are therefore read from that pane's own field — never from the
+ * focused view's — exactly as its visibility comes from that pane's own
+ * transparency (`viewer.getViewTransparency(viewId)`).
+ *
+ * @param {import('../../../state/core/data-state.js').DataState} state
+ * @param {string} viewId Pane the gesture landed in.
+ * @returns {object|null}
+ */
+export function annotationFieldForPane(state, viewId) {
+  const field = state.getFieldForView(viewId);
+  if (field === null || field === undefined) return null;
+  if (field.kind !== 'category' && field.kind !== 'continuous') {
+    throw new TypeError(
+      `Unknown annotation field kind: ${String(field.kind)}.`
+    );
+  }
+  return field;
+}
+
+/**
+ * The renderer's name for the kind of field one pane is colored by.
+ *
+ * This is what the viewer is handed as its view field kind source
+ * (`viewer.setViewFieldKindSource`): it decides, per pane and at the moment of
+ * the press, whether an annotation gesture there can start, and which cursor
+ * the armed tool shows over that pane.
+ *
+ * @param {import('../../../state/core/data-state.js').DataState} state
+ * @param {string} viewId
+ * @returns {'none'|'continuous'|'categorical'}
+ */
+export function annotationFieldKindForPane(state, viewId) {
+  const field = annotationFieldForPane(state, viewId);
+  if (field === null) return 'none';
+  return field.kind === 'category' ? 'categorical' : 'continuous';
+}
+
+/**
+ * Resolve the cells an annotation gesture covers on the field of the pane it
+ * landed in.
  *
  * @param {object} options
  * @param {import('../../../state/core/data-state.js').DataState} options.state
- * @param {{kind: string, categories?: string[], codes?: ArrayBufferView}} options.activeField
+ * @param {object} options.field Field of the pane, from `annotationFieldForPane`.
  * @param {number} options.cellIndex Cell the gesture started on.
  * @param {'click'|'range'} options.gestureType
  * @param {number} options.dragDeltaY
- * @param {Float32Array|null} options.viewTransparency
+ * @param {Uint8Array} options.viewTransparency Transparency of the same pane.
  * @returns {{cellIndices: number[], range: {minVal: number, maxVal: number}|null}}
  */
 export function computeAnnotationGestureCells(options) {
   const {
     state,
-    activeField,
+    field,
     cellIndex,
     gestureType,
     dragDeltaY,
@@ -73,53 +118,54 @@ export function computeAnnotationGestureCells(options) {
     );
   }
   requireFiniteNumber(dragDeltaY, 'Annotation gesture dragDeltaY');
-  const source = requireFieldSource(state.activeFieldSource);
-  const fieldIndex = source === 'var'
-    ? state.activeVarFieldIndex
-    : state.activeFieldIndex;
-  requireSafeInteger(fieldIndex, 'Annotation active field index', 0);
-
-  if (activeField.kind === 'category') {
-    const categoryIndex = state.getCategoryForCell(
-      cellIndex,
-      fieldIndex,
-      source
+  requireSafeInteger(cellIndex, 'Annotation gesture cellIndex', 0);
+  if (cellIndex >= state.pointCount) {
+    throw new RangeError(
+      'Annotation gesture cellIndex is outside the current dataset.'
     );
-    const missingCode = activeField.codes instanceof Uint8Array
-      ? 255
-      : activeField.codes instanceof Uint16Array
-        ? 65_535
-        : null;
-    if (missingCode === null) {
+  }
+
+  if (field.kind === 'category') {
+    const codes = field.codes;
+    if (!isCategoricalCodes(codes) || codes.length !== state.pointCount) {
       throw new TypeError(
-        'Annotation category codes must be Uint8Array or Uint16Array.'
+        'Annotation category codes must be a Uint8Array, Uint16Array or Uint32Array with one code per cell.'
       );
     }
+    const missingCode = missingCategoryCode(codes);
+    const categoryIndex = codes[cellIndex];
     if (categoryIndex === missingCode) {
       return { cellIndices: [], range: null };
     }
-    requireSafeInteger(categoryIndex, 'Annotation category index', 0);
     if (
-      !Array.isArray(activeField.categories)
-      || categoryIndex >= activeField.categories.length
+      !Array.isArray(field.categories)
+      || categoryIndex >= field.categories.length
     ) {
       throw new RangeError(
-        'Annotation category index is outside the active categories.'
+        'Annotation category index is outside the field\'s categories.'
       );
     }
     return {
       cellIndices: state.getCellIndicesForCategory(
-        fieldIndex,
+        field,
         categoryIndex,
-        source,
         viewTransparency
       ),
       range: null
     };
   }
 
-  if (activeField.kind === 'continuous') {
-    const clickedValue = state.getValueForCell(cellIndex, fieldIndex, source);
+  if (field.kind === 'continuous') {
+    const values = field.values;
+    if (
+      (!(values instanceof Float32Array) && !(values instanceof Float64Array))
+      || values.length !== state.pointCount
+    ) {
+      throw new TypeError(
+        'Annotation continuous values must be a Float32Array or Float64Array with one value per cell.'
+      );
+    }
+    const clickedValue = values[cellIndex];
     if (Number.isNaN(clickedValue)) return { cellIndices: [], range: null };
     if (!Number.isFinite(clickedValue)) {
       throw new TypeError(
@@ -127,7 +173,7 @@ export function computeAnnotationGestureCells(options) {
       );
     }
 
-    const stats = requireContinuousStatistics(activeField);
+    const stats = requireContinuousStatistics(field);
     const valueRange = stats.max - stats.min;
 
     let minVal;
@@ -150,10 +196,9 @@ export function computeAnnotationGestureCells(options) {
 
     return {
       cellIndices: state.getCellIndicesForRange(
-        fieldIndex,
+        field,
         minVal,
         maxVal,
-        source,
         viewTransparency
       ),
       range: { minVal, maxVal }
@@ -161,7 +206,7 @@ export function computeAnnotationGestureCells(options) {
   }
 
   throw new TypeError(
-    `Unknown annotation field kind: ${activeField.kind}.`
+    `Unknown annotation field kind: ${field.kind}.`
   );
 }
 
@@ -174,17 +219,18 @@ export function computeAnnotationGestureCells(options) {
  * is how a subtract before any selection behaves.
  *
  * @param {object} options
- * @param {Set<number>|null} options.candidates
+ * @param {CellSet|null} options.candidates
  * @param {number[]} options.cellIndices
  * @param {'intersect'|'union'|'subtract'} options.mode
  * @param {string} options.fieldKind
- * @returns {{candidates: Set<number>|null, effectiveMode: string}}
+ * @param {number} options.cellCount - Cells in the dataset.
+ * @returns {{candidates: CellSet|null, effectiveMode: string}}
  */
 export function combineAnnotationCandidates(options) {
-  const { candidates, cellIndices, mode, fieldKind } = options;
-  if (candidates !== null && !(candidates instanceof Set)) {
+  const { candidates, cellIndices, mode, fieldKind, cellCount } = options;
+  if (candidates !== null && !(candidates instanceof CellSet)) {
     throw new TypeError(
-      'Annotation candidate combine requires a Set or null.'
+      'Annotation candidate combine requires a CellSet or null.'
     );
   }
   if (!Array.isArray(cellIndices)) {
@@ -193,46 +239,35 @@ export function combineAnnotationCandidates(options) {
     );
   }
 
+  // Candidates are a CellSet: a JS Set refuses more than 2^24 cells.
+  const incoming = CellSet.from(cellIndices, candidates?.cellCount ?? cellCount);
   if (fieldKind === 'category') {
     if (mode === 'intersect') {
-      return { candidates: new Set(cellIndices), effectiveMode: 'replace' };
+      return { candidates: incoming, effectiveMode: 'replace' };
     }
     if (mode === 'union') {
       if (candidates === null) {
-        return { candidates: new Set(cellIndices), effectiveMode: 'union' };
+        return { candidates: incoming, effectiveMode: 'union' };
       }
-      const next = new Set(candidates);
-      for (const cellIndex of cellIndices) next.add(cellIndex);
-      return { candidates: next, effectiveMode: 'union' };
+      return { candidates: candidates.clone().unionWith(incoming), effectiveMode: 'union' };
     }
     if (candidates === null) {
       return { candidates: null, effectiveMode: 'subtract' };
     }
-    const next = new Set(candidates);
-    for (const cellIndex of cellIndices) next.delete(cellIndex);
-    return { candidates: next, effectiveMode: 'subtract' };
+    return { candidates: candidates.clone().subtract(incoming), effectiveMode: 'subtract' };
   }
 
   if (candidates === null) {
     return {
-      candidates: mode === 'subtract' ? null : new Set(cellIndices),
+      candidates: mode === 'subtract' ? null : incoming,
       effectiveMode: mode
     };
   }
   if (mode === 'union') {
-    const next = new Set(candidates);
-    for (const cellIndex of cellIndices) next.add(cellIndex);
-    return { candidates: next, effectiveMode: 'union' };
+    return { candidates: candidates.clone().unionWith(incoming), effectiveMode: 'union' };
   }
   if (mode === 'subtract') {
-    const next = new Set(candidates);
-    for (const cellIndex of cellIndices) next.delete(cellIndex);
-    return { candidates: next, effectiveMode: 'subtract' };
+    return { candidates: candidates.clone().subtract(incoming), effectiveMode: 'subtract' };
   }
-  const incoming = new Set(cellIndices);
-  const next = new Set();
-  for (const cellIndex of candidates) {
-    if (incoming.has(cellIndex)) next.add(cellIndex);
-  }
-  return { candidates: next, effectiveMode: 'intersect' };
+  return { candidates: candidates.clone().intersectWith(incoming), effectiveMode: 'intersect' };
 }

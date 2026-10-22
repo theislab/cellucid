@@ -10,6 +10,7 @@ async function installHighlightUploadAudit(page) {
   await page.addInitScript(() => {
     const prototype = WebGL2RenderingContext.prototype;
     const originalBufferData = prototype.bufferData;
+    const originalBufferSubData = prototype.bufferSubData;
     const originalGetError = prototype.getError;
     let active = false;
     let failNextUpload = false;
@@ -30,33 +31,53 @@ async function installHighlightUploadAudit(page) {
       return null;
     };
 
+    // A highlight publication sizes its store -- 16 bytes per cell, and these
+    // tests publish one or two cells -- with bufferData, which is where OOM is
+    // injected, then writes the packed bytes with bufferSubData, which is
+    // where they are recorded.
+    let pendingRecord = null;
     prototype.bufferData = function (...args) {
       const [target, source, usage] = args;
       if (
         active &&
         target === this.ARRAY_BUFFER &&
-        usage === this.DYNAMIC_DRAW
+        usage === this.DYNAMIC_DRAW &&
+        (source === 16 || source === 32)
       ) {
-        const bytes = copyClientBytes(source);
-        if (bytes?.byteLength === 16) {
-          const failed = failNextUpload;
-          failNextUpload = false;
-          records.push(Object.freeze({
-            bytes: Object.freeze(Array.from(bytes)),
-            failed,
-          }));
-          if (failed) {
-            let errors = syntheticErrors.get(this);
-            if (errors === undefined) {
-              errors = [];
-              syntheticErrors.set(this, errors);
-            }
-            errors.push(this.OUT_OF_MEMORY);
-            return undefined;
+        const failed = failNextUpload;
+        failNextUpload = false;
+        const record = { byteLength: source, bytes: [], failed };
+        records.push(record);
+        pendingRecord = failed ? null : record;
+        if (failed) {
+          let errors = syntheticErrors.get(this);
+          if (errors === undefined) {
+            errors = [];
+            syntheticErrors.set(this, errors);
           }
+          errors.push(this.OUT_OF_MEMORY);
+          return undefined;
         }
       }
       return Reflect.apply(originalBufferData, this, args);
+    };
+    prototype.bufferSubData = function (...args) {
+      const [target, offset, source, sourceOffset = 0, length] = args;
+      if (
+        active &&
+        pendingRecord !== null &&
+        target === this.ARRAY_BUFFER &&
+        offset === 0 &&
+        length === pendingRecord.byteLength
+      ) {
+        const bytes = copyClientBytes(source).subarray(
+          sourceOffset,
+          sourceOffset + length,
+        );
+        pendingRecord.bytes = Array.from(bytes);
+        pendingRecord = null;
+      }
+      return Reflect.apply(originalBufferSubData, this, args);
     };
     prototype.getError = function (...args) {
       const errors = syntheticErrors.get(this);
@@ -78,6 +99,7 @@ async function installHighlightUploadAudit(page) {
         },
         snapshot() {
           return records.map(record => ({
+            byteLength: record.byteLength,
             bytes: [...record.bytes],
             failed: record.failed,
           }));
@@ -140,7 +162,8 @@ test('highlight upload follows exact same-reference geometry generations', async
     const audit = window.__cellucidHighlightUploadAudit;
     const gl = viewer.getGLContext();
     const targetPoint = 1;
-    const targetOffset = targetPoint * 3;
+    // Live positions carry exactly the live dimension's components.
+    const targetOffset = targetPoint * viewer.getViewDimension('live');
     const lodEvents = [];
     const lodObserverDiagnostics = [];
 
@@ -201,9 +224,10 @@ test('highlight upload follows exact same-reference geometry generations', async
     const dimensionLevel = viewer.getViewDimension('live');
     const initialGeneration =
       renderer.getViewGeometryGeneration('live');
-    const initialXyz = Array.from(
-      positions.subarray(targetOffset, targetOffset + 3),
-    );
+    // Highlight records are XYZ; an axis the embedding lacks is zero.
+    const initialXyz = [0, 1, 2].map(axis => (
+      axis < dimensionLevel ? positions[targetOffset + axis] : 0
+    ));
     const highlightData = new Uint8Array(viewer.getPointCount());
     highlightData[targetPoint] = 255;
 
@@ -443,25 +467,37 @@ test('highlight OOM is report-once, pane-local, and recovers on a semantic gener
       });
     });
 
+    // Cells 1 and 2 are highlighted; cell 2 starts hidden in both panes, so
+    // each pane publishes one 16-byte record.
+    const baseTransparency = new Uint8Array(payload.transparency);
+    baseTransparency[2] = 0;
+    viewer.updateTransparency(new Uint8Array(baseTransparency));
+    viewer.updateSnapshotAttributes(snapshot.id, {
+      transparency: new Uint8Array(baseTransparency),
+    });
     const highlightData = new Uint8Array(viewer.getPointCount());
     highlightData[1] = 255;
+    highlightData[2] = 255;
     audit.reset();
-    viewer.updateHighlight(highlightData, [1]);
+    viewer.updateHighlight(highlightData, [1, 2]);
     viewer.resume();
     await waitForUploadCount(2);
     viewer.pause();
     const baseline = audit.snapshot();
 
-    // Publish one real R8 visibility change to both panes while paused, then
-    // fail only the first compact highlight upload. Byte-identical owner
-    // replacements deliberately do not advance the semantic filtering
-    // generation, so using a copied-but-unchanged array here would test the
-    // obsolete object-identity contract and correctly schedule no upload.
-    const changedTransparency = new Float32Array(payload.transparency);
-    changedTransparency[0] = changedTransparency[0] >= (1 / 255) ? 0 : 1;
+    // Publish one real R8 visibility change to both panes while paused,
+    // revealing cell 2, then fail only the first compact highlight upload.
+    // Revealing a highlighted cell grows each pane's store beyond the size
+    // WebGL already accepted for it, which is the allocation that can be
+    // refused for memory: a republication at an accepted size is not
+    // re-verified. Byte-identical owner replacements deliberately do not
+    // advance the semantic filtering generation, so a copied-but-unchanged
+    // array here would correctly schedule no upload.
+    const changedTransparency = new Uint8Array(baseTransparency);
+    changedTransparency[2] = 1;
     viewer.updateTransparency(changedTransparency);
     viewer.updateSnapshotAttributes(snapshot.id, {
-      transparency: new Float32Array(changedTransparency),
+      transparency: new Uint8Array(changedTransparency),
     });
     audit.failNextUpload();
     viewer.resume();
@@ -471,10 +507,10 @@ test('highlight OOM is report-once, pane-local, and recovers on a semantic gener
     const afterFailure = audit.snapshot();
     const stableFailureReportCount = reports.length;
 
-    // Restoring the original R8 visibility is a second meaningful live
+    // Restoring the base R8 visibility is a second meaningful live
     // filtering generation and therefore the exact retry boundary.
     viewer.updateTransparency(
-      new Float32Array(payload.transparency),
+      new Uint8Array(baseTransparency),
     );
     viewer.resume();
     await waitForUploadCount(5);
@@ -496,8 +532,10 @@ test('highlight OOM is report-once, pane-local, and recovers on a semantic gener
 
   expect(proof.baseline).toHaveLength(2);
   expect(proof.baseline.every(record => record.failed === false)).toBe(true);
+  expect(proof.baseline.map(record => record.byteLength)).toEqual([16, 16]);
   expect(proof.afterFailure).toHaveLength(4);
   expect(proof.afterFailure[2].failed).toBe(true);
+  expect(proof.afterFailure[2].byteLength).toBe(32);
   expect(
     proof.afterFailure[3].failed,
     'the later snapshot pane must still publish after live-view OOM',

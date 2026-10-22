@@ -1,47 +1,52 @@
 // orbit-anchor-shaders.js - Precision Scientific Compass Shaders
-// Shaders for 3D and 2D compass visualization
 
-// 3D Version - Solid mesh with proper lighting and fog
-export const ORBIT_ANCHOR_3D_VS = `#version 300 es
+import { FOG_GLSL } from './fog-shaders.js';
+
+// One lit, fogged mesh program draws both the 3D and the flat 2D compass.
+// The mesh is built once in anchor-local units (center at the origin, unit
+// radius); u_partMatrix places, scales and turns each part of it every frame.
+
+export const ORBIT_ANCHOR_VS = `#version 300 es
 precision highp float;
 
-in vec3 a_position;
-in vec3 a_normal;
-in vec4 a_color;
+layout(location = 0) in vec3 a_position;
+layout(location = 1) in vec3 a_normal;
+layout(location = 2) in vec4 a_color;
 
 uniform mat4 u_mvpMatrix;
 uniform mat4 u_viewMatrix;
 uniform mat4 u_modelMatrix;
+uniform mat4 u_partMatrix;
 uniform vec3 u_cameraPos;
-
+${FOG_GLSL}
 out vec4 v_color;
 out vec3 v_normal;
 out vec3 v_worldPos;
-out float v_eyeDepth;
+// The opacity the shared fog model leaves this vertex (fog-shaders.js).
+out float v_fogOpacity;
 
 void main() {
-  vec4 worldPos = u_modelMatrix * vec4(a_position, 1.0);
+  // The part matrix is a rotation about Y times a positive uniform scale, so
+  // its upper 3x3 carries normals correctly once renormalized.
+  vec4 anchorPos = u_partMatrix * vec4(a_position, 1.0);
+  vec4 worldPos = u_modelMatrix * anchorPos;
   v_worldPos = worldPos.xyz;
   vec4 eyePos = u_viewMatrix * worldPos;
-  v_eyeDepth = -eyePos.z;
-  gl_Position = u_mvpMatrix * vec4(a_position, 1.0);
+  v_fogOpacity = fogOpacity(fogTransmittance(length(eyePos.xyz)));
+  gl_Position = u_mvpMatrix * anchorPos;
   v_color = a_color;
-  v_normal = normalize(mat3(u_modelMatrix) * a_normal);
+  v_normal = normalize(mat3(u_modelMatrix) * (mat3(u_partMatrix) * a_normal));
 }
 `;
 
-export const ORBIT_ANCHOR_3D_FS = `#version 300 es
+export const ORBIT_ANCHOR_FS = `#version 300 es
 precision highp float;
 
 in vec4 v_color;
 in vec3 v_normal;
 in vec3 v_worldPos;
-in float v_eyeDepth;
+in float v_fogOpacity;
 
-uniform float u_fogDensity;
-uniform float u_fogNear;
-uniform float u_fogFar;
-uniform vec3 u_fogColor;
 uniform float u_lightingStrength;
 uniform vec3 u_lightDir;
 uniform vec3 u_cameraPos;
@@ -69,70 +74,7 @@ void main() {
   float lighting = mix(1.0, ambient + diffuse + specular + fresnel, u_lightingStrength);
   vec3 litColor = v_color.rgb * lighting + v_color.rgb * u_emissive * 0.5;
 
-  // Fog
-  float fogFactor = 0.0;
-  if (u_fogDensity > 0.001) {
-    float fogSpan = max(u_fogFar - u_fogNear, 0.0001);
-    float normalizedDist = max(v_eyeDepth - u_fogNear, 0.0) / fogSpan;
-    float extinction = u_fogDensity * u_fogDensity * 0.6;
-    fogFactor = 1.0 - exp(-extinction * normalizedDist);
-  }
-
-  vec3 finalColor = mix(litColor, u_fogColor, fogFactor);
-  float finalAlpha = v_color.a * (1.0 - fogFactor * 0.85);
-
-  fragColor = vec4(finalColor, finalAlpha);
-}
-`;
-
-// 2D Version - Clean flat rendering
-export const ORBIT_ANCHOR_2D_VS = `#version 300 es
-precision highp float;
-
-in vec3 a_position;
-in vec4 a_color;
-
-uniform mat4 u_mvpMatrix;
-uniform mat4 u_viewMatrix;
-
-out vec4 v_color;
-out float v_eyeDepth;
-
-void main() {
-  vec4 eyePos = u_viewMatrix * vec4(a_position, 1.0);
-  v_eyeDepth = -eyePos.z;
-  gl_Position = u_mvpMatrix * vec4(a_position, 1.0);
-  v_color = a_color;
-}
-`;
-
-export const ORBIT_ANCHOR_2D_FS = `#version 300 es
-precision highp float;
-
-in vec4 v_color;
-in float v_eyeDepth;
-
-uniform float u_fogDensity;
-uniform float u_fogNear;
-uniform float u_fogFar;
-uniform vec3 u_fogColor;
-
-out vec4 fragColor;
-
-void main() {
-  if (v_color.a < 0.01) discard;
-
-  float fogFactor = 0.0;
-  if (u_fogDensity > 0.001) {
-    float fogSpan = max(u_fogFar - u_fogNear, 0.0001);
-    float normalizedDist = max(v_eyeDepth - u_fogNear, 0.0) / fogSpan;
-    float extinction = u_fogDensity * u_fogDensity * 0.6;
-    fogFactor = 1.0 - exp(-extinction * normalizedDist);
-  }
-
-  vec3 finalColor = mix(v_color.rgb, u_fogColor, fogFactor);
-  float finalAlpha = v_color.a * (1.0 - fogFactor * 0.85);
-
-  fragColor = vec4(finalColor, finalAlpha);
+  // Fog thins the anchor toward whatever is behind it (fog-shaders.js).
+  fragColor = vec4(litColor, v_color.a * v_fogOpacity);
 }
 `;

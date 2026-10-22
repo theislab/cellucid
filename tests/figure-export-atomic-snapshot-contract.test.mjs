@@ -41,6 +41,20 @@ function cameraState() {
 function renderState() {
   return {
     antialias: true,
+    backdrop: {
+      centerY: 0,
+      extentX: 1,
+      extentY: 1,
+      extentZ: 1,
+      flat: false,
+      floorY: -1.12,
+      glowCenterX: 0,
+      look: null,
+      pixelRatio: 1,
+      planarity: 0,
+      stageX: 0,
+      stageZ: 0,
+    },
     bgColor: Float32Array.from([1, 1, 1]),
     cameraDistance: 3,
     cameraPosition: [0, 0, 3],
@@ -67,7 +81,7 @@ function renderState() {
 
 function payload({
   positions = Float32Array.from([0, 0, 0]),
-  transparency = Float32Array.from([1]),
+  transparency = Uint8Array.from([1]),
 } = {}) {
   const pointCount = positions.length / 3;
   const colors = new Uint8Array(pointCount * 4);
@@ -142,6 +156,7 @@ function payload({
         geometryGeneration: 11,
         legendModel: null,
         lodMembership: null,
+        drawOrder: null,
         lodSizeMultiplier: 1,
         normTransform: {
           center: [0, 0, 0],
@@ -183,8 +198,37 @@ test('figure-export payload owns every asynchronous renderer input', () => {
   );
 });
 
+test('a pane\'s backdrop look travels in the payload, exact or refused', () => {
+  const withLook = (look) => {
+    const value = payload();
+    value.views[0].renderState.backdrop.look = look;
+    return value;
+  };
+  const size = 4;
+  const atelier = {
+    ambient: 0,
+    id: 'atelier',
+    shadow: { packed: new Uint16Array(size * size * 2), size, window: [0, 0, 2] },
+    time: 0,
+    tints: [[1, 1, 1], [0.8, 1.1, 1], [1.2, 0.9, 0.7]],
+  };
+  const exact = withLook(atelier);
+  assert.equal(assertFigureExportPayload(exact), exact);
+  assert.equal(assertFigureExportPayload(withLook({ ...atelier, id: 'nebula', shadow: null })).views.length, 1);
+  assert.throws(() => assertFigureExportPayload(withLook({ ...atelier, id: 'sepia' })), /look\.id/);
+  assert.throws(() => assertFigureExportPayload(withLook({ ...atelier, tints: [[1, 1, 1]] })), /tints/);
+  assert.throws(
+    () => assertFigureExportPayload(withLook({ ...atelier, shadow: { ...atelier.shadow, packed: new Uint16Array(3) } })),
+    /shadow\.packed/
+  );
+  assert.throws(() => assertFigureExportPayload(withLook({ ...atelier, ambient: 2 })), /ambient/);
+  const missing = payload();
+  delete missing.views[0].renderState.backdrop.look;
+  assert.throws(() => assertFigureExportPayload(missing), /look/);
+});
+
 test('all-filtered SVG export is deterministic and does not fail axes', async () => {
-  const exact = payload({ transparency: Float32Array.from([0]) });
+  const exact = payload({ transparency: Uint8Array.from([0]) });
   const blob = await renderFigureToSvgBlob({
     payload: exact,
     signal: new AbortController().signal,
@@ -262,12 +306,13 @@ test('reentrant abort in one grid snapshot fences every later borrowed owner', a
   const reason = new DOMException('reentrant fixture teardown', 'AbortError');
   const positions = Float32Array.from([0, 0, 0]);
   const colors = Uint8Array.from([255, 255, 255, 255]);
-  const transparency = Float32Array.from([1]);
+  const transparency = Uint8Array.from([1]);
   const presented = {
     cameraState: cameraState(),
     dimensionLevel: 3,
     geometryGeneration: 11,
     lodMembership: null,
+    drawOrder: null,
     lodSizeMultiplier: 1,
     renderState: renderState(),
   };
@@ -309,6 +354,9 @@ test('reentrant abort in one grid snapshot fences every later borrowed owner', a
     getViewDimensionLevel() {
       return 3;
     },
+    getViewLayoutKey() {
+      return '3d';
+    },
     pointCount: 1,
     viewContexts: new Map([
       ['snapshot-1', emptyViewContext()],
@@ -349,6 +397,7 @@ test('reentrant abort in one grid snapshot fences every later borrowed owner', a
         dimensionLevel: 3,
         geometryGeneration: 11,
         lodMembership: null,
+        drawOrder: null,
         pointCount: 1,
         positions,
         transparency,

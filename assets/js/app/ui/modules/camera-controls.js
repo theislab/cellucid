@@ -1,16 +1,19 @@
 /**
  * @fileoverview Camera + navigation controls.
  *
- * Wires the navigation mode dropdown (orbit/planar/free), look sensitivity,
- * movement speed, and related toggles (invert look, pointer lock, projectiles,
- * orbit anchor) to the Viewer API.
+ * Wires the Navigation panel — the mode dropdown (orbit/planar/free), one
+ * settings box per mode, look sensitivity, movement speed, and related toggles
+ * (invert look, pointer lock, projectiles, orbit anchor) — to the Viewer API.
+ * It is the only owner of these controls: Camera Path reads and restores the
+ * navigation settings it records through `exportSettings` and
+ * `restoreSettings`, and keeps the panel in step with `syncNavigationMode`.
  *
  * @module ui/modules/camera-controls
  */
 
 import { getNotificationCenter } from '../../notification-center.js';
-import { parseRangeInput } from '../core/numeric-input-contract.js';
 import { viewerNeedsUiRetirement } from '../core/viewer-lifecycle.js';
+import { wireNavigationSettings } from './navigation-settings.js';
 
 const REQUIRED_DOM_KEYS = [
   'navigationModeSelect',
@@ -68,11 +71,11 @@ function assertProjectileBuildResult(value) {
  */
 export function initCameraControls({ viewer, dom, callbacks }) {
   if (!dom || typeof dom !== 'object' || Array.isArray(dom)) {
-    throw new TypeError('Compare Views camera controls require a DOM reference object.');
+    throw new TypeError('Navigation controls require a DOM reference object.');
   }
   for (const key of REQUIRED_DOM_KEYS) {
     if (!dom[key]) {
-      throw new Error(`Compare Views camera controls are missing the required "${key}" element.`);
+      throw new Error(`Navigation controls are missing the required "${key}" element.`);
     }
   }
   if (
@@ -81,7 +84,7 @@ export function initCameraControls({ viewer, dom, callbacks }) {
     typeof callbacks.onViewBadgesMaybeChanged !== 'function'
   ) {
     throw new TypeError(
-      'Compare Views camera controls require onViewBadgesMaybeChanged().'
+      'Navigation controls require onViewBadgesMaybeChanged().'
     );
   }
   const notifications = getNotificationCenter();
@@ -123,75 +126,33 @@ export function initCameraControls({ viewer, dom, callbacks }) {
     return !destroyed && generation === operationGeneration;
   }
 
-  function toggleNavigationPanels(mode) {
-    if (destroyed) return;
-    freeflyControls.style.display = mode === 'free' ? 'block' : 'none';
-    orbitControls.style.display = mode === 'orbit' ? 'block' : 'none';
-    planarControls.style.display = mode === 'planar' ? 'block' : 'none';
-  }
-
-  function sliderToLookSensitivity(raw) {
-    const v = parseRangeInput(raw, {
-      minimum: 1,
-      maximum: 30,
-      label: 'Look sensitivity'
-    });
-    return v * 0.0005; // radians per pixel
-  }
-
-  function sliderToMoveSpeed(raw) {
-    const v = parseRangeInput(raw, {
-      minimum: 1,
-      maximum: 500,
-      label: 'Move speed'
-    });
-    return v / 100; // scene units per second
-  }
-
-  function updateLookSensitivity() {
-    if (destroyed) return;
-    const rawValue = parseRangeInput(lookSensitivityInput.value, {
-      minimum: 1,
-      maximum: 30,
-      label: 'Look sensitivity'
-    });
-    const sensitivity = sliderToLookSensitivity(lookSensitivityInput.value);
-    lookSensitivityDisplay.textContent = (rawValue / 100).toFixed(2) + 'x';
-    viewer.setLookSensitivity(sensitivity);
-  }
-
-  function updateMoveSpeed() {
-    if (destroyed) return;
-    const speed = sliderToMoveSpeed(moveSpeedInput.value);
-    moveSpeedDisplay.textContent = speed.toFixed(2) + ' u/s';
-    viewer.setMoveSpeed(speed);
-  }
-
-  // Keyboard navigation speed sliders for orbit and planar modes
-  function updateOrbitKeySpeed() {
-    if (destroyed) return;
-    const rawValue = parseRangeInput(orbitKeySpeedInput.value, {
-      minimum: 1,
-      maximum: 100,
-      label: 'Orbit keyboard speed'
-    });
-    const value = rawValue / 100;
-    orbitKeySpeedDisplay.textContent = value.toFixed(2) + 'x';
-    viewer.setOrbitKeySpeed(value);
-  }
-
-  function updatePlanarPanSpeed() {
-    if (destroyed) return;
-    const rawValue = parseRangeInput(planarPanSpeedInput.value, {
-      minimum: 1,
-      maximum: 100,
-      label: 'Planar keyboard pan speed'
-    });
-    const t = (rawValue - 1) / 99;
-    const value = 0.001 + t * (0.0075 - 0.001);
-    planarPanSpeedDisplay.textContent = value.toFixed(4) + 'x';
-    viewer.setPlanarPanSpeed(value);
-  }
+  // The settings block shared with Camera Path: one box per mode, the four
+  // speed sliders and the option checkboxes.
+  const navigation = wireNavigationSettings({
+    viewer,
+    dom: {
+      orbitControls,
+      planarControls,
+      freeflyControls,
+      orbitKeySpeedInput,
+      orbitKeySpeedDisplay,
+      planarPanSpeedInput,
+      planarPanSpeedDisplay,
+      lookSensitivityInput,
+      lookSensitivityDisplay,
+      moveSpeedInput,
+      moveSpeedDisplay,
+      orbitReverseCheckbox,
+      showOrbitAnchorCheckbox,
+      planarZoomToCursorCheckbox,
+      planarInvertAxesCheckbox,
+      invertLookCheckbox
+    },
+    listen,
+    isDestroyed: () => destroyed,
+    owner: 'Navigation'
+  });
+  const toggleNavigationPanels = navigation.showPanels;
 
   const applyPointerLock = (checked) => {
     if (destroyed) return;
@@ -219,29 +180,6 @@ export function initCameraControls({ viewer, dom, callbacks }) {
 
     toggleNavigationPanels(mode);
     navigationModeSelect.blur(); // allow WASD immediately
-  });
-
-  updateLookSensitivity();
-  listen(lookSensitivityInput, 'input', updateLookSensitivity);
-
-  updateMoveSpeed();
-  listen(moveSpeedInput, 'input', updateMoveSpeed);
-
-  updateOrbitKeySpeed();
-  listen(orbitKeySpeedInput, 'input', updateOrbitKeySpeed);
-
-  updatePlanarPanSpeed();
-  listen(planarPanSpeedInput, 'input', updatePlanarPanSpeed);
-
-  const applyInvertLook = (value) => {
-    if (destroyed) return;
-    viewer.setInvertLookY(value);
-    viewer.setInvertLookX(value);
-  };
-  applyInvertLook(invertLookCheckbox.checked);
-  listen(invertLookCheckbox, 'change', () => {
-    applyInvertLook(invertLookCheckbox.checked);
-    invertLookCheckbox.blur();
   });
 
   projectilesEnabledCheckbox.checked = false;
@@ -315,30 +253,63 @@ export function initCameraControls({ viewer, dom, callbacks }) {
     }
   });
 
-  viewer.setOrbitInvertRotation(orbitReverseCheckbox.checked);
-  listen(orbitReverseCheckbox, 'change', () => {
-    viewer.setOrbitInvertRotation(orbitReverseCheckbox.checked);
-  });
+  /**
+   * Show `mode` in the panel: the select, its settings box, and a pointer
+   * capture that only free-fly can hold. Called whenever something other
+   * than this select moves the mode (a view switch, a keyframe, playback, a
+   * restore).
+   */
+  function syncNavigationMode(mode) {
+    if (destroyed) return;
+    navigationModeSelect.value = mode;
+    toggleNavigationPanels(mode);
+    if (mode !== 'free') pointerLockCheckbox.checked = false;
+  }
 
-  viewer.setPlanarZoomToCursor(planarZoomToCursorCheckbox.checked);
-  listen(planarZoomToCursorCheckbox, 'change', () => {
-    viewer.setPlanarZoomToCursor(planarZoomToCursorCheckbox.checked);
-  });
+  /** The navigation settings a camera path records with its keyframes. */
+  function exportSettings() {
+    return {
+      invertLook: invertLookCheckbox.checked,
+      lookSensitivity: lookSensitivityInput.value,
+      moveSpeed: moveSpeedInput.value,
+      orbitKeySpeed: orbitKeySpeedInput.value,
+      orbitReverse: orbitReverseCheckbox.checked,
+      planarInvertAxes: planarInvertAxesCheckbox.checked,
+      planarPanSpeed: planarPanSpeedInput.value,
+      planarZoomToCursor: planarZoomToCursorCheckbox.checked,
+      showOrbitAnchor: showOrbitAnchorCheckbox.checked
+    };
+  }
 
-  viewer.setPlanarInvertAxes(planarInvertAxesCheckbox.checked);
-  listen(planarInvertAxesCheckbox, 'change', () => {
-    viewer.setPlanarInvertAxes(planarInvertAxesCheckbox.checked);
-  });
+  /** Apply settings recorded by `exportSettings` to the panel and viewer. */
+  function restoreSettings(data) {
+    if (destroyed) return;
+    orbitKeySpeedInput.value = data.orbitKeySpeed;
+    navigation.updateOrbitKeySpeed();
+    orbitReverseCheckbox.checked = data.orbitReverse;
+    viewer.setOrbitInvertRotation(data.orbitReverse);
+    showOrbitAnchorCheckbox.checked = data.showOrbitAnchor;
+    viewer.setShowOrbitAnchor(data.showOrbitAnchor);
 
-  viewer.setShowOrbitAnchor(showOrbitAnchorCheckbox.checked);
-  listen(showOrbitAnchorCheckbox, 'change', () => {
-    viewer.setShowOrbitAnchor(showOrbitAnchorCheckbox.checked);
-  });
+    planarPanSpeedInput.value = data.planarPanSpeed;
+    navigation.updatePlanarPanSpeed();
+    planarZoomToCursorCheckbox.checked = data.planarZoomToCursor;
+    viewer.setPlanarZoomToCursor(data.planarZoomToCursor);
+    planarInvertAxesCheckbox.checked = data.planarInvertAxes;
+    viewer.setPlanarInvertAxes(data.planarInvertAxes);
+
+    lookSensitivityInput.value = data.lookSensitivity;
+    navigation.updateLookSensitivity();
+    moveSpeedInput.value = data.moveSpeed;
+    navigation.updateMoveSpeed();
+    invertLookCheckbox.checked = data.invertLook;
+    navigation.applyInvertLook(data.invertLook);
+    pointerLockCheckbox.checked = false;
+    viewer.setPointerLockEnabled(false);
+  }
 
   // Initial navigation panel visibility
-  const startingNavMode = viewer.getNavigationMode();
-  navigationModeSelect.value = startingNavMode;
-  toggleNavigationPanels(startingNavMode);
+  syncNavigationMode(viewer.getNavigationMode());
 
   function destroy() {
     if (destroyed) return;
@@ -379,10 +350,13 @@ export function initCameraControls({ viewer, dom, callbacks }) {
 
   return {
     toggleNavigationPanels,
-    updateLookSensitivity,
-    updateMoveSpeed,
-    updateOrbitKeySpeed,
-    updatePlanarPanSpeed,
+    syncNavigationMode,
+    exportSettings,
+    restoreSettings,
+    updateLookSensitivity: navigation.updateLookSensitivity,
+    updateMoveSpeed: navigation.updateMoveSpeed,
+    updateOrbitKeySpeed: navigation.updateOrbitKeySpeed,
+    updatePlanarPanSpeed: navigation.updatePlanarPanSpeed,
     destroy
   };
 }

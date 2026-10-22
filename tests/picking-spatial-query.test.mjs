@@ -1,246 +1,148 @@
+/**
+ * Screen-space picking (assets/js/rendering/picking.js): the cell is the dot
+ * drawn under the pointer, sized exactly as the vertex shader sizes it. Hidden
+ * cells and cells the current level of detail does not draw are never picked,
+ * and the spatial-index traversal finds exactly what a full scan finds.
+ */
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { SpatialIndex } from '../assets/js/rendering/high-perf/spatial-index.js';
 import {
-  findRaySamplePick,
+  PICK_TOLERANCE_CSS_PX,
+  drawnPointRadiusCss,
+  findScreenSpacePick,
 } from '../assets/js/rendering/picking.js';
-import {
-  POINT_VISIBILITY_THRESHOLD,
-} from '../assets/js/rendering/alpha-visibility.js';
 
-const SEARCH_RADIUS = 0.03;
-const VISIBILITY_THRESHOLD = POINT_VISIBILITY_THRESHOLD;
-const MIN_SAMPLE_STEP = 0.02;
-const MAX_SAMPLE_COUNT = 500;
+const FOV = (45 * Math.PI) / 180;
+const PANE = Object.freeze({ cssWidth: 800, cssHeight: 600, framebufferHeight: 600 });
 
-function makeSpatialIndex(positions, maxPointsPerNode = 4) {
-  return new SpatialIndex(
-    positions,
-    new Uint8Array((positions.length / 3) * 4),
-    3,
-    maxPointsPerNode,
-    12,
-    {
-      buildLOD: false,
-      buildLodNodeMappings: false,
-      computeNodeStats: false,
-    },
-  );
-}
-
-function referenceRaySamplePick({
-  maxDistance,
-  positions,
-  ray,
-  transparency,
-}) {
-  const directionLength = Math.hypot(...ray.direction);
-  const direction = ray.direction.map(value => value / directionLength);
-  const sampleStep = Math.max(
-    MIN_SAMPLE_STEP,
-    maxDistance / MAX_SAMPLE_COUNT,
-  );
-  const sampleCount = Math.ceil(maxDistance / sampleStep);
-  const radiusSquared = SEARCH_RADIUS * SEARCH_RADIUS;
-
-  for (
-    let sampleIndex = 0;
-    sampleIndex < sampleCount;
-    sampleIndex++
-  ) {
-    const sampleDistance = sampleIndex * sampleStep;
-    const sampleX =
-      ray.origin[0] + direction[0] * sampleDistance;
-    const sampleY =
-      ray.origin[1] + direction[1] * sampleDistance;
-    const sampleZ =
-      ray.origin[2] + direction[2] * sampleDistance;
-    let bestCellIndex = -1;
-    let bestPerpendicularDistanceSquared = Infinity;
-
-    for (
-      let cellIndex = 0;
-      cellIndex < positions.length / 3;
-      cellIndex++
-    ) {
-      if (!(transparency[cellIndex] >= VISIBILITY_THRESHOLD)) continue;
-      const positionOffset = cellIndex * 3;
-      const offsetX = positions[positionOffset] - ray.origin[0];
-      const offsetY = positions[positionOffset + 1] - ray.origin[1];
-      const offsetZ = positions[positionOffset + 2] - ray.origin[2];
-      const projectedDistance =
-        offsetX * direction[0] +
-        offsetY * direction[1] +
-        offsetZ * direction[2];
-      if (projectedDistance < 0) continue;
-
-      const sampleOffsetX = positions[positionOffset] - sampleX;
-      const sampleOffsetY = positions[positionOffset + 1] - sampleY;
-      const sampleOffsetZ = positions[positionOffset + 2] - sampleZ;
-      if (
-        sampleOffsetX * sampleOffsetX +
-          sampleOffsetY * sampleOffsetY +
-          sampleOffsetZ * sampleOffsetZ >
-        radiusSquared
-      ) {
-        continue;
-      }
-
-      const crossX =
-        offsetY * direction[2] - offsetZ * direction[1];
-      const crossY =
-        offsetZ * direction[0] - offsetX * direction[2];
-      const crossZ =
-        offsetX * direction[1] - offsetY * direction[0];
-      const perpendicularDistanceSquared =
-        crossX * crossX + crossY * crossY + crossZ * crossZ;
-      if (
-        perpendicularDistanceSquared <
-          bestPerpendicularDistanceSquared ||
-        (
-          perpendicularDistanceSquared ===
-            bestPerpendicularDistanceSquared &&
-          (bestCellIndex === -1 || cellIndex < bestCellIndex)
-        )
-      ) {
-        bestCellIndex = cellIndex;
-        bestPerpendicularDistanceSquared =
-          perpendicularDistanceSquared;
-      }
-    }
-
-    if (bestCellIndex !== -1) {
-      return {
-        cellIndex: bestCellIndex,
-        firstSampleIndex: sampleIndex,
-        perpendicularDistanceSquared:
-          bestPerpendicularDistanceSquared,
-      };
+/** Column-major perspective × translate(0, 0, -distance): a camera on +Z looking at the origin. */
+function cameraMvp(distance = 3, aspect = PANE.cssWidth / PANE.cssHeight, near = 0.1, far = 100) {
+  const f = 1 / Math.tan(FOV / 2);
+  const projection = [
+    f / aspect, 0, 0, 0,
+    0, f, 0, 0,
+    0, 0, (far + near) / (near - far), -1,
+    0, 0, (2 * far * near) / (near - far), 0,
+  ];
+  const view = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, -distance, 1];
+  const out = new Float32Array(16);
+  for (let column = 0; column < 4; column++) {
+    for (let row = 0; row < 4; row++) {
+      let sum = 0;
+      for (let k = 0; k < 4; k++) sum += projection[k * 4 + row] * view[column * 4 + k];
+      out[column * 4 + row] = sum;
     }
   }
-
-  return {
-    cellIndex: -1,
-    firstSampleIndex: -1,
-    perpendicularDistanceSquared: Infinity,
-  };
+  return out;
 }
 
-function pickBothWays(input) {
-  const direct = findRaySamplePick({
-    ...input,
-    spatialIndex: null,
-  });
-  const spatialIndex = makeSpatialIndex(input.positions);
-  const indexed = findRaySamplePick({
-    ...input,
-    spatialIndex,
-  });
-  return { direct, indexed, spatialIndex };
+/** Where a world point lands on the pane, in CSS pixels. */
+function project(mvp, [x, y, z]) {
+  const w = mvp[3] * x + mvp[7] * y + mvp[11] * z + mvp[15];
+  const ndcX = (mvp[0] * x + mvp[4] * y + mvp[8] * z + mvp[12]) / w;
+  const ndcY = (mvp[1] * x + mvp[5] * y + mvp[9] * z + mvp[13]) / w;
+  return { x: (ndcX * 0.5 + 0.5) * PANE.cssWidth, y: (0.5 - ndcY * 0.5) * PANE.cssHeight, w };
 }
 
-test('the ray-sample search radius is fixed in world space and no drawn-size '
-  + 'input reaches it', () => {
-  const input = {
-    positions: Float32Array.from([SEARCH_RADIUS * 1.5, 0, 0.2]),
-    transparency: Float32Array.of(1),
-    ray: {
-      origin: [0, 0, 0],
-      direction: [0, 0, 1],
-    },
-    maxDistance: 0.5,
+function pick(overrides) {
+  return findScreenSpacePick({
+    dimension: 3,
+    transparency: new Uint8Array(overrides.positions.length / (overrides.dimension ?? 3)).fill(1),
+    mvpMatrix: cameraMvp(),
+    pane: PANE,
+    pointSize: 8,
+    sizeAttenuation: 0,
+    fov: FOV,
     spatialIndex: null,
-  };
+    ...overrides,
+  });
+}
 
-  const missed = findRaySamplePick(input);
+function makeSpatialIndex(positions, dimension = 3) {
+  return new SpatialIndex(positions, null, dimension, 4, 12, {
+    buildLOD: false,
+  });
+}
+
+test('the dot under the pointer wins over a nearer dot beside it', () => {
+  // The reported defect: the old ray search took the first cell within a fixed
+  // world radius of the ray, so a dot nearer the camera but beside the pointer
+  // beat the dot drawn right under it.
+  const mvp = cameraMvp();
+  const under = [0, 0, 0];
+  // 0.025 from the ray: inside the old 0.03 world radius, yet about 7.5 px
+  // from the pointer, beyond its 4 px dot plus the 3 px tolerance.
+  const nearerBeside = [0.025, 0, 0.6];
+  const positions = Float32Array.from([...nearerBeside, ...under]);
+  const cursor = project(mvp, under);
+  const beside = project(mvp, nearerBeside);
+  const besideRadius = drawnPointRadiusCss({
+    w: beside.w, pointSize: 8, sizeAttenuation: 0, fov: FOV, framebufferHeight: 600, devicePixelRatio: 1,
+  });
+  assert.ok(Math.hypot(beside.x - cursor.x, beside.y - cursor.y) > besideRadius + PICK_TOLERANCE_CSS_PX);
+  assert.equal(pick({ positions, mvpMatrix: mvp, cursor }).cellIndex, 1);
+});
+
+test('where drawn dots overlap, the front-most one is picked', () => {
+  const mvp = cameraMvp();
+  const back = [0, 0, -0.5];
+  const front = [0.001, 0, 0.5];
+  const positions = Float32Array.from([...back, ...front]);
+  assert.equal(pick({ positions, mvpMatrix: mvp, cursor: project(mvp, [0, 0, 0]) }).cellIndex, 1);
+});
+
+test('the hit area is the drawn dot plus the tolerance, and follows point size', () => {
+  const mvp = cameraMvp();
+  const positions = Float32Array.from([0, 0, 0]);
+  const centre = project(mvp, [0, 0, 0]);
+  const cursor = { x: centre.x + 6, y: centre.y };
+  // 16 px dot: radius 8 covers 6 px away.
+  assert.equal(pick({ positions, mvpMatrix: mvp, cursor, pointSize: 16 }).cellIndex, 0);
+  // 2 px dot: radius 1 plus 3 px of tolerance does not reach 6 px away.
+  assert.equal(pick({ positions, mvpMatrix: mvp, cursor, pointSize: 2 }).cellIndex, -1);
+  // Perspective attenuation grows a near dot exactly as the shader does.
+  const radius = drawnPointRadiusCss({
+    w: centre.w, pointSize: 2, sizeAttenuation: 1, fov: FOV, framebufferHeight: 600, devicePixelRatio: 1,
+  });
   assert.equal(
-    missed.cellIndex,
-    -1,
-    'a cell beyond the fixed world radius is not hittable',
-  );
-
-  // The Visualization "Point size" control ends at the `u_pointSize` shader
-  // uniform. Under full perspective attenuation that draws a world radius of
-  // pointSize * 0.01 / 2, so the slider maximum of 200 draws a dot more than
-  // thirty times wider than the search radius. Hit testing never sees it, so
-  // the abandoned-gesture notice must not offer it as a remedy.
-  for (const pointSize of [0.25, 0.75, 6, 200]) {
-    assert.deepEqual(
-      findRaySamplePick({ ...input, pointSize }),
-      missed,
-      `point size ${pointSize} must not change the hit set`,
-    );
-  }
-
-  assert.equal(
-    findRaySamplePick({
-      ...input,
-      positions: Float32Array.from([SEARCH_RADIUS * 0.5, 0, 0.2]),
-    }).cellIndex,
-    0,
-    'the same cell inside the fixed radius is hittable',
+    pick({ positions, mvpMatrix: mvp, cursor, pointSize: 2, sizeAttenuation: 1 }).cellIndex,
+    6 <= radius + PICK_TOLERANCE_CSS_PX ? 0 : -1,
   );
 });
 
-test('coarse LOD direct picking ignores a closer excluded source point', () => {
-  const positions = Float32Array.from([
-    0, 0, 0.1,
-    0, 0, 0.2,
-    1, 1, 0.15,
-  ]);
-  const transparency = new Float32Array(3).fill(1);
+test('a filtered-out cell is never picked; the visible cell behind it is', () => {
+  const mvp = cameraMvp();
+  const positions = Float32Array.from([0, 0, 0.5, 0, 0, -0.5]);
+  const transparency = Uint8Array.of(0, 1);
+  const cursor = project(mvp, [0, 0, 0]);
+  assert.equal(pick({ positions, mvpMatrix: mvp, cursor, transparency }).cellIndex, 1);
+  assert.equal(pick({ positions, mvpMatrix: mvp, cursor, transparency: Uint8Array.of(0, 0) }).cellIndex, -1);
+});
+
+test('a cell the current level of detail does not draw is never picked', () => {
+  const mvp = cameraMvp();
+  const positions = Float32Array.from([0, 0, 0.5, 0, 0, -0.5, 5, 5, 0]);
   const lodMembership = Object.freeze({
-    admissionLevels: Uint8Array.from([0xff, 0, 0xff]),
+    admissionLevels: Uint8Array.from([0xff, 0, 0]),
     dimensionLevel: 3,
     generationToken: Object.freeze({}),
-    indices: Uint32Array.of(1),
+    indices: Uint32Array.of(1, 2),
     lodLevel: 0,
     pointCount: 3,
   });
-  const input = {
-    positions,
-    transparency,
-    ray: {
-      origin: [0, 0, 0],
-      direction: [0, 0, 1],
-    },
-    maxDistance: 0.5,
-    spatialIndex: null,
-  };
-
-  const fullDetail = findRaySamplePick(input);
-  const coarseLod = findRaySamplePick({
-    ...input,
-    lodMembership,
-  });
-
-  assert.equal(fullDetail.cellIndex, 0);
-  assert.equal(coarseLod.cellIndex, 1);
-  assert.ok(coarseLod.firstSampleIndex > fullDetail.firstSampleIndex);
-  assert.equal(coarseLod.examinedPointCount, 1);
+  const cursor = project(mvp, [0, 0, 0]);
+  assert.equal(pick({ positions, mvpMatrix: mvp, cursor }).cellIndex, 0);
+  const coarse = pick({ positions, mvpMatrix: mvp, cursor, lodMembership });
+  assert.equal(coarse.cellIndex, 1);
+  assert.equal(coarse.examinedPointCount, 2);
 });
 
-test('coarse LOD direct picking rejects malformed compact membership', () => {
-  const positions = Float32Array.from([
-    0, 0, 0.1,
-    0, 0, 0.2,
-  ]);
-  const input = {
-    positions,
-    transparency: new Float32Array(2).fill(1),
-    ray: {
-      origin: [0, 0, 0],
-      direction: [0, 0, 1],
-    },
-    maxDistance: 0.5,
-    spatialIndex: null,
-  };
-  const makeMembership = ({
-    admissionLevels = Uint8Array.from([0, 0xff]),
-    indices = Uint32Array.of(0),
-    extra = false,
-  } = {}) => Object.freeze({
+test('a malformed level-of-detail certificate is refused', () => {
+  const positions = Float32Array.from([0, 0, 0.1, 0, 0, 0.2]);
+  const base = { positions, cursor: { x: 400, y: 300 } };
+  const membership = ({ admissionLevels = Uint8Array.from([0, 0xff]), indices = Uint32Array.of(0), extra = false } = {}) => Object.freeze({
     admissionLevels,
     dimensionLevel: 3,
     generationToken: Object.freeze({}),
@@ -249,280 +151,76 @@ test('coarse LOD direct picking rejects malformed compact membership', () => {
     pointCount: 2,
     ...(extra ? { unexpected: true } : {}),
   });
-
-  assert.throws(
-    () => findRaySamplePick({
-      ...input,
-      lodMembership: makeMembership({ extra: true }),
-    }),
-    /frozen renderer certificate/
-  );
-  assert.throws(
-    () => findRaySamplePick({
-      ...input,
-      lodMembership: makeMembership({
-        indices: Uint32Array.of(2),
-      }),
-    }),
-    /does not name an admitted source point/
-  );
-  assert.throws(
-    () => findRaySamplePick({
-      ...input,
-      lodMembership: makeMembership({
-        admissionLevels: Uint8Array.from([0xff, 0]),
-      }),
-    }),
-    /does not name an admitted source point/
-  );
+  assert.throws(() => pick({ ...base, lodMembership: membership({ extra: true }) }), /frozen renderer certificate/);
+  assert.throws(() => pick({ ...base, lodMembership: membership({ indices: Uint32Array.of(2) }) }), /does not name an admitted source point/);
+  assert.throws(() => pick({ ...base, lodMembership: membership({ admissionLevels: Uint8Array.from([0xff, 0]) }) }), /does not name an admitted source point/);
 });
 
-test('ray picking does not let 32 hidden traversal-first points mask a visible point', () => {
-  const pointCount = 40;
-  const positions = new Float32Array(pointCount * 3);
-  const transparency = new Float32Array(pointCount);
-  for (let cellIndex = 0; cellIndex < pointCount; cellIndex++) {
-    positions[cellIndex * 3 + 2] = 0.1;
-  }
-  transparency[32] = 1;
-  const input = {
-    positions,
-    transparency,
-    ray: {
-      origin: [0, 0, 0],
-      direction: [0, 0, 1],
-    },
-    maxDistance: 0.5,
-  };
-
-  const { direct, indexed } = pickBothWays(input);
-  assert.equal(referenceRaySamplePick(input).cellIndex, 32);
-  assert.equal(direct.cellIndex, 32);
-  assert.equal(indexed.cellIndex, 32);
-});
-
-test('ray picking chooses the nearest perpendicular point beyond the former candidate cap', () => {
-  const pointCount = 40;
-  const positions = new Float32Array(pointCount * 3);
-  const transparency = new Float32Array(pointCount).fill(1);
-  for (let cellIndex = 0; cellIndex < pointCount; cellIndex++) {
-    positions[cellIndex * 3 + 1] = 0.02;
-    positions[cellIndex * 3 + 2] = 0.1;
-  }
-  positions[32 * 3 + 1] = 0.001;
-  const input = {
-    positions,
-    transparency,
-    ray: {
-      origin: [0, 0, 0],
-      direction: [0, 0, 1],
-    },
-    maxDistance: 0.5,
-  };
-
-  const expected = referenceRaySamplePick(input);
-  const { direct, indexed } = pickBothWays(input);
-  assert.equal(expected.cellIndex, 32);
-  assert.equal(direct.cellIndex, expected.cellIndex);
-  assert.equal(indexed.cellIndex, expected.cellIndex);
-  assert.equal(direct.firstSampleIndex, expected.firstSampleIndex);
-  assert.equal(indexed.firstSampleIndex, expected.firstSampleIndex);
-});
-
-test('indexed and one-pass picking match an independent discrete-sample reference', () => {
-  let randomState = 0x6d2b79f5;
+test('the spatial index finds exactly what a full scan finds', () => {
+  let seed = 7;
   const random = () => {
-    randomState = (
-      Math.imul(randomState ^ (randomState >>> 15), 1 | randomState) +
-      0x6d2b79f5
-    ) >>> 0;
-    return randomState / 0x100000000;
+    seed = (seed * 1664525 + 1013904223) >>> 0;
+    return seed / 2 ** 32;
   };
-  const pointCount = 2048;
+  const pointCount = 4000;
   const positions = new Float32Array(pointCount * 3);
-  const transparency = new Float32Array(pointCount);
-  for (let cellIndex = 0; cellIndex < pointCount; cellIndex++) {
-    const offset = cellIndex * 3;
-    positions[offset] = (random() - 0.5) * 1.6;
-    positions[offset + 1] = (random() - 0.5) * 1.6;
-    positions[offset + 2] = random() * 3.4 - 0.2;
-    transparency[cellIndex] =
-      cellIndex % 11 === 0
-        ? 0
-        : (cellIndex % 13 === 0 ? 0.005 : 1);
+  for (let index = 0; index < positions.length; index++) positions[index] = random() * 2 - 1;
+  const transparency = new Uint8Array(pointCount);
+  for (let index = 0; index < pointCount; index++) transparency[index] = random() < 0.8 ? 1 : 0;
+  const spatialIndex = makeSpatialIndex(positions);
+  const mvp = cameraMvp(3.2);
+  for (const attenuation of [0, 0.65, 1]) {
+    for (let trial = 0; trial < 200; trial++) {
+      const cursor = { x: random() * PANE.cssWidth, y: random() * PANE.cssHeight };
+      const common = { positions, transparency, mvpMatrix: mvp, cursor, pointSize: 6, sizeAttenuation: attenuation };
+      const direct = pick(common);
+      const indexed = pick({ ...common, spatialIndex });
+      assert.equal(indexed.cellIndex, direct.cellIndex, `trial ${trial}, attenuation ${attenuation}`);
+      assert.ok(indexed.examinedPointCount <= direct.examinedPointCount);
+    }
   }
-  // Guarantee one non-boundary visible hit while leaving traversal order and
-  // surrounding candidates randomized.
-  positions[177 * 3] = 0.006;
-  positions[177 * 3 + 1] = -0.004;
-  positions[177 * 3 + 2] = 0.17;
-  transparency[177] = 1;
-
-  const input = {
-    positions,
-    transparency,
-    ray: {
-      origin: [0.01, -0.02, 0],
-      direction: [0.015, 0.01, 3],
-    },
-    maxDistance: 3,
-  };
-  const expected = referenceRaySamplePick(input);
-  const { direct, indexed } = pickBothWays(input);
-
-  assert.equal(direct.cellIndex, expected.cellIndex);
-  assert.equal(indexed.cellIndex, expected.cellIndex);
-  assert.equal(direct.firstSampleIndex, expected.firstSampleIndex);
-  assert.equal(indexed.firstSampleIndex, expected.firstSampleIndex);
-  assert.ok(
-    Math.abs(
-      direct.perpendicularDistanceSquared -
-        expected.perpendicularDistanceSquared
-    ) < 1e-15,
-  );
-  assert.equal(
-    indexed.perpendicularDistanceSquared,
-    direct.perpendicularDistanceSquared,
-  );
 });
 
-test('ray picking matches the shader alpha threshold', () => {
-  const positions = Float32Array.from([
-    0, 0, 0.1,
-    0.005, 0, 0.1,
-  ]);
-  const transparency = Float32Array.from([
-    Math.fround(2.49 / 255),
-    POINT_VISIBILITY_THRESHOLD,
-  ]);
-  const input = {
-    positions,
-    transparency,
-    ray: {
-      origin: [0, 0, 0],
-      direction: [0, 0, 1],
-    },
-    maxDistance: 0.5,
-  };
-
-  const { direct, indexed } = pickBothWays(input);
-  assert.equal(direct.cellIndex, 1);
-  assert.equal(indexed.cellIndex, 1);
-});
-
-test('ray picking verifies float32 sample-sphere boundaries exactly', () => {
-  const cases = [
-    {
-      name: 'last included sample axial boundary',
-      position: [0, 0, Math.fround(0.11)],
-      maxDistance: 0.1,
-      expectedSampleIndex: 4,
-    },
-    {
-      name: 'near-tangent narrow sample interval',
-      position: [
-        0,
-        Math.fround(0.029999),
-        Math.fround(0.2),
-      ],
-      maxDistance: 0.5,
-      expectedSampleIndex: 10,
-    },
-    {
-      name: 'off-axis sphere boundary',
-      position: [
-        0,
-        Math.fround(0.02),
-        Math.fround(
-          0.08 + Math.sqrt(
-            SEARCH_RADIUS * SEARCH_RADIUS - 0.02 * 0.02,
-          ),
-        ),
-      ],
-      maxDistance: 0.5,
-      // Float32 publication rounds this constructed boundary just outside
-      // sample 4; sample 5 is therefore the first exact discrete hit.
-      expectedSampleIndex: 5,
-    },
-  ];
-
-  for (const boundaryCase of cases) {
-    const positions = Float32Array.from(boundaryCase.position);
-    const transparency = Float32Array.of(1);
-    const input = {
-      positions,
-      transparency,
-      ray: {
-        origin: [0, 0, 0],
-        direction: [0, 0, 1],
-      },
-      maxDistance: boundaryCase.maxDistance,
-    };
-    const expected = referenceRaySamplePick(input);
-    const { direct, indexed } = pickBothWays(input);
+test('a 2D or 1D layout picks exactly what its zero-padded XYZ copy picks', () => {
+  const mvp = cameraMvp();
+  const xyz = Float32Array.from([-0.2, 0.1, 0, 0.3, -0.2, 0, 0.05, 0.05, 0]);
+  const xy = Float32Array.from([-0.2, 0.1, 0.3, -0.2, 0.05, 0.05]);
+  const x = Float32Array.from([-0.2, 0.3, 0.05]);
+  const xOnly = Float32Array.from([-0.2, 0, 0, 0.3, 0, 0, 0.05, 0, 0]);
+  for (const target of [[-0.2, 0.1, 0], [0.3, -0.2, 0], [0.05, 0.05, 0]]) {
+    const cursor = project(mvp, target);
+    const expected = pick({ positions: xyz, mvpMatrix: mvp, cursor }).cellIndex;
+    assert.equal(pick({ positions: xy, dimension: 2, mvpMatrix: mvp, cursor }).cellIndex, expected);
     assert.equal(
-      expected.firstSampleIndex,
-      boundaryCase.expectedSampleIndex,
-      boundaryCase.name,
+      pick({ positions: xy, dimension: 2, mvpMatrix: mvp, cursor, spatialIndex: makeSpatialIndex(xy, 2) }).cellIndex,
+      expected,
     );
-    assert.equal(direct.cellIndex, expected.cellIndex, boundaryCase.name);
+  }
+  for (const target of [[-0.2, 0, 0], [0.3, 0, 0]]) {
+    const cursor = project(mvp, target);
     assert.equal(
-      direct.firstSampleIndex,
-      expected.firstSampleIndex,
-      boundaryCase.name,
-    );
-    assert.equal(indexed.cellIndex, expected.cellIndex, boundaryCase.name);
-    assert.equal(
-      indexed.firstSampleIndex,
-      expected.firstSampleIndex,
-      boundaryCase.name,
+      pick({ positions: x, dimension: 1, mvpMatrix: mvp, cursor }).cellIndex,
+      pick({ positions: xOnly, mvpMatrix: mvp, cursor }).cellIndex,
     );
   }
 });
 
-test('fallback examines at most N points once and tree traversal never duplicates IDs', () => {
-  const pointCount = 20000;
-  const positions = new Float32Array(pointCount * 3);
-  const transparency = new Float32Array(pointCount).fill(1);
-  for (let cellIndex = 0; cellIndex < pointCount; cellIndex++) {
-    const offset = cellIndex * 3;
-    positions[offset] = 10 + (cellIndex % 17);
-    positions[offset + 1] = 20 + (cellIndex % 13);
-    positions[offset + 2] = (cellIndex % 1000) / 100;
-  }
-  const input = {
-    positions,
-    transparency,
-    ray: {
-      origin: [0, 0, 0],
-      direction: [0, 0, 1],
-    },
-    maxDistance: 10,
-  };
+test('nothing behind the camera or outside the clip range is picked', () => {
+  const mvp = cameraMvp(3, PANE.cssWidth / PANE.cssHeight, 0.1, 4);
+  const cursor = project(mvp, [0, 0, 0]);
+  // Behind the camera (z beyond +3) and past the far plane (z below -1).
+  const positions = Float32Array.from([0, 0, 3.5, 0, 0, -1.5]);
+  assert.equal(pick({ positions, mvpMatrix: mvp, cursor }).cellIndex, -1);
+});
 
-  const direct = findRaySamplePick({
-    ...input,
-    spatialIndex: null,
-  });
-  assert.equal(direct.cellIndex, -1);
-  assert.equal(direct.examinedPointCount, pointCount);
-
-  const spatialIndex = makeSpatialIndex(positions, 32);
-  const visited = [];
-  spatialIndex.visitRaySegmentCandidates(
-    input.ray.origin,
-    input.ray.direction,
-    9.98,
-    SEARCH_RADIUS,
-    cellIndex => visited.push(cellIndex),
+test('picking input is validated', () => {
+  const positions = Float32Array.from([0, 0, 0]);
+  assert.throws(() => pick({ positions, cursor: { x: 1, y: 1 }, mvpMatrix: new Float32Array(15) }), /16 values/);
+  assert.throws(() => pick({ positions, cursor: { x: Number.NaN, y: 1 } }), /cursor.x/);
+  assert.throws(() => pick({ positions, cursor: { x: 1, y: 1 }, pane: { ...PANE, cssWidth: 0 } }), /cssWidth/);
+  assert.throws(() => pick({ positions, cursor: { x: 1, y: 1 }, pointSize: 0 }), /pointSize/);
+  assert.throws(
+    () => pick({ positions, cursor: { x: 1, y: 1 }, spatialIndex: makeSpatialIndex(Float32Array.from([1, 1, 1])) }),
+    /exact matching spatial owner/,
   );
-  assert.equal(new Set(visited).size, visited.length);
-  assert.ok(visited.length <= pointCount);
-
-  const indexed = findRaySamplePick({
-    ...input,
-    spatialIndex,
-  });
-  assert.equal(indexed.cellIndex, -1);
-  assert.ok(indexed.examinedPointCount <= pointCount);
 });

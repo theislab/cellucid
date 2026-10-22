@@ -6,6 +6,44 @@
  */
 
 import { PlotRegistry } from '../../shared/plot-registry-utils.js';
+import { formatDecimal } from '../../../ui/components/display-format.js';
+
+/**
+ * Digits a readout needs to show every value a step can reach.
+ * @param {number} step
+ * @returns {number}
+ */
+function stepDigits(step) {
+  const text = String(step);
+  const exponent = text.match(/e-(\d+)$/);
+  if (exponent) return Math.min(6, Number(exponent[1]));
+  const fraction = text.split('.')[1];
+  return fraction === undefined ? 0 : Math.min(6, fraction.length);
+}
+
+/**
+ * The empty state an options panel shows when a plot has nothing to tune.
+ * @param {HTMLElement} container
+ */
+function appendNoOptions(container) {
+  const empty = document.createElement('p');
+  empty.className = 'empty-state';
+  empty.textContent = 'No customization options available.';
+  container.appendChild(empty);
+}
+
+/**
+ * A field label bound to the control it names.
+ * @param {string} text
+ * @param {string} controlId
+ * @returns {HTMLLabelElement}
+ */
+function createOptionLabel(text, controlId) {
+  const label = document.createElement('label');
+  label.textContent = text;
+  label.htmlFor = controlId;
+  return label;
+}
 
 // =============================================================================
 // PLOT OPTIONS RENDERING
@@ -103,10 +141,7 @@ export function renderPlotOptions(container, plotTypeId, currentOptions = {}, on
     );
   }
   if (Object.keys(optionSchema).length === 0) {
-    const empty = document.createElement('div');
-    empty.className = 'legend-help';
-    empty.textContent = 'No customization options available.';
-    container.appendChild(empty);
+    appendNoOptions(container);
     return;
   }
   const visibleOptions = PlotRegistry.getVisibleOptions(
@@ -137,20 +172,16 @@ export function renderPlotOptions(container, plotTypeId, currentOptions = {}, on
     }
 
     const optionRow = document.createElement('div');
-    optionRow.className = 'analysis-option-row';
+    optionRow.className = 'control-block';
 
     let input;
 
     switch (type) {
       case 'select': {
-        const label = document.createElement('label');
-        label.className = 'analysis-option-label';
-        label.textContent = labelText;
-        label.htmlFor = inputId;
-        optionRow.appendChild(label);
+        optionRow.appendChild(createOptionLabel(labelText, inputId));
 
         input = document.createElement('select');
-        input.className = 'obs-select analysis-option-select';
+        input.className = 'obs-select';
         input.id = inputId;
         const optionDefinitions = Object.hasOwn(def, 'options')
           ? def.options
@@ -206,11 +237,8 @@ export function renderPlotOptions(container, plotTypeId, currentOptions = {}, on
       }
 
       case 'checkbox': {
-        optionRow.className = 'analysis-option-row checkbox-row';
-
         input = document.createElement('input');
         input.type = 'checkbox';
-        input.className = 'analysis-option-checkbox';
         input.id = inputId;
         if (typeof value !== 'boolean') {
           throw new TypeError(`Checkbox option ${key} must be boolean`);
@@ -220,12 +248,12 @@ export function renderPlotOptions(container, plotTypeId, currentOptions = {}, on
           onChange(key, input.checked);
         });
 
+        // The option text is the checkbox's own label, wrapping it.
         const checkLabel = document.createElement('label');
-        checkLabel.className = 'analysis-option-label';
+        checkLabel.className = 'checkbox-inline';
         checkLabel.htmlFor = input.id;
-        checkLabel.textContent = labelText;
-
-        optionRow.appendChild(input);
+        checkLabel.appendChild(input);
+        checkLabel.appendChild(document.createTextNode(labelText));
         optionRow.appendChild(checkLabel);
         break;
       }
@@ -249,26 +277,16 @@ export function renderPlotOptions(container, plotTypeId, currentOptions = {}, on
         if (!Number.isFinite(value) || value < min || value > max) {
           throw new RangeError(`Numeric option ${key} value must be within its declared range`);
         }
-        const label = document.createElement('label');
-        label.className = 'analysis-option-label';
-        label.textContent = labelText;
-        label.htmlFor = inputId;
-        optionRow.appendChild(label);
+        optionRow.appendChild(createOptionLabel(labelText, inputId));
 
         input = document.createElement('input');
         input.type = type;
-        input.className = type === 'range'
-          ? 'analysis-option-range'
-          : 'analysis-option-number';
+        input.className = type === 'range' ? '' : 'obs-select';
         input.id = inputId;
         input.min = `${min}`;
         input.max = `${max}`;
         input.step = `${step}`;
         input.valueAsNumber = value;
-
-        const valueDisplay = document.createElement('span');
-        valueDisplay.className = 'analysis-option-value';
-        valueDisplay.textContent = `${value}`;
 
         const commitNumericChange = () => {
           const nextValue = input.valueAsNumber;
@@ -277,11 +295,23 @@ export function renderPlotOptions(container, plotTypeId, currentOptions = {}, on
           }
           onChange(key, nextValue);
         };
-
-        input.addEventListener('input', () => {
-          valueDisplay.textContent = `${input.valueAsNumber}`;
-        });
         input.addEventListener('change', commitNumericChange);
+
+        if (type === 'number') {
+          optionRow.appendChild(input);
+          break;
+        }
+
+        // A range shows its value beside the track, at the precision its
+        // step can reach; the drag only updates the readout, the release
+        // commits.
+        const digits = stepDigits(step);
+        const valueDisplay = document.createElement('span');
+        valueDisplay.className = 'slider-value';
+        valueDisplay.textContent = formatDecimal(value, digits);
+        input.addEventListener('input', () => {
+          valueDisplay.textContent = formatDecimal(input.valueAsNumber, digits);
+        });
 
         const rangeRow = document.createElement('div');
         rangeRow.className = 'slider-row';
@@ -292,15 +322,11 @@ export function renderPlotOptions(container, plotTypeId, currentOptions = {}, on
       }
 
       case 'text': {
-        const label = document.createElement('label');
-        label.className = 'analysis-option-label';
-        label.textContent = labelText;
-        label.htmlFor = inputId;
-        optionRow.appendChild(label);
+        optionRow.appendChild(createOptionLabel(labelText, inputId));
 
         input = document.createElement('input');
         input.type = 'text';
-        input.className = 'analysis-option-text';
+        input.className = 'obs-select';
         input.id = inputId;
         if (typeof value !== 'string') {
           throw new TypeError(`Text option ${key} must be a string`);
@@ -328,17 +354,6 @@ export function renderPlotOptions(container, plotTypeId, currentOptions = {}, on
   }
 
   if (container.children.length === 0) {
-    const empty = document.createElement('div');
-    empty.className = 'legend-help';
-    empty.textContent = 'No customization options available.';
-    container.appendChild(empty);
+    appendNoOptions(container);
   }
 }
-
-// =============================================================================
-// EXPORTS
-// =============================================================================
-
-export default {
-  renderPlotOptions
-};

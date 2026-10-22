@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
+import { infoTipText } from './helpers/info-tip-text.mjs';
 
 const keyframeModule = await import(
   '../assets/js/app/ui/modules/cinematic-camera/keyframe-store.js'
@@ -79,6 +80,7 @@ function keyframe(id, offset = 0) {
       yaw: -Math.PI / 2,
       pitch: 0
     },
+    representation: null,
     transitionDuration: 1
   };
 }
@@ -216,13 +218,40 @@ test('camera path duration edits reject invalid values instead of normalizing th
 
   assert.throws(() => store.setDuration(0, Number.NaN), /duration/i);
   assert.throws(() => store.setDuration(0, 0), /duration/i);
-  assert.throws(() => store.setDuration(0, 60.1), /duration/i);
+  assert.throws(() => store.setDuration(0, 0.09), /duration/i);
+  assert.throws(() => store.setDuration(0, Number.POSITIVE_INFINITY), /duration/i);
   assert.throws(() => store.setAllDurations('2'), /duration/i);
-  assert.throws(() => store.setAllDurations(60.1), /duration/i);
   assert.deepEqual(
     store.getAll().map(({ transitionDuration }) => transitionDuration),
     [1, 1]
   );
+});
+
+test('camera paths have no keyframe-count, duration or label ceiling', () => {
+  const store = keyframeModule.createKeyframeStore();
+  // Far past the former 100-keyframe, 60 s and 40-character caps.
+  const keyframes = Array.from({ length: 1_000 }, (_, index) => ({
+    ...keyframe(`k${index}`),
+    label: `${'Long keyframe label '.repeat(10)}${index}`,
+    transitionDuration: index % 2 === 0 ? 3_600 : null,
+  }));
+  assert.equal(store.importAll({ keyframes, nextIndex: 1_001 }), true);
+  assert.equal(store.getCount(), 1_000);
+  const {
+    id: _id,
+    label: _label,
+    transitionDuration: _duration,
+    representation: _representation,
+    ...cameraState
+  } = keyframe('next');
+  const added = store.add(cameraState, undefined, null);
+  assert.equal(typeof added, 'string');
+  assert.equal(store.getCount(), 1_001);
+  store.setDuration(0, 86_400);
+  store.setAllDurations(600);
+  assert.ok(store.getAll().slice(0, -1).every(({ transitionDuration }) => transitionDuration === 600));
+  store.rename(store.getAll()[1].id, 'x'.repeat(10_000));
+  assert.equal(store.getAll()[1].label.length, 10_000);
 });
 
 test('keyframe mutation commands reject invalid identities, labels, and directions', () => {
@@ -237,6 +266,7 @@ test('keyframe mutation commands reject invalid identities, labels, and directio
     id: _id,
     label: _label,
     transitionDuration: _transitionDuration,
+    representation: _representation,
     ...invalidCameraState
   } = keyframe('invalid-state');
   invalidCameraState.freefly = {
@@ -247,11 +277,12 @@ test('keyframe mutation commands reject invalid identities, labels, and directio
     id: _validId,
     label: _validLabel,
     transitionDuration: _validTransitionDuration,
+    representation: _validRepresentation,
     ...validCameraState
   } = keyframe('valid-state');
 
-  assert.throws(() => store.add(invalidCameraState), /camera state/i);
-  assert.throws(() => store.add(validCameraState, '  spaced  '), /label/i);
+  assert.throws(() => store.add(invalidCameraState, undefined, null), /camera state/i);
+  assert.throws(() => store.add(validCameraState, '  spaced  ', null), /label/i);
   assert.throws(() => store.remove('missing'), /not found/i);
   assert.throws(() => store.rename('missing', 'Renamed'), /not found/i);
   assert.throws(() => store.rename('one', '  Renamed  '), /label/i);
@@ -727,7 +758,7 @@ test('camera paths default to idle, restore autoplay transactionally, and reset 
   assert.match(cameraModuleSource, /dataSourceManager\.offDatasetChange\(handleDatasetChange\)/);
   assert.doesNotMatch(cameraModuleSource, /dataSourceManager\?\./);
   assert.match(uiCoordinatorSource, /initCinematicCamera\(\{[\s\S]*?dataSourceManager/);
-  assert.match(indexHtml, /Autoplay is opt-in\./);
+  assert.match(infoTipText(indexHtml, 'cinematic-playback-info-tooltip'), /Autoplay starts a ready path at once; it is off by default/);
   assert.match(
     indexHtml,
     /id="cinematic-loop"[\s\S]*?Loop playback[\s\S]*?id="cinematic-autoplay"[\s\S]*?Autoplay/
@@ -859,4 +890,32 @@ test('top transport remains unmounted until two valid sidebar keyframes exist', 
       globalThis.document = originalDocument;
     }
   }
+});
+
+test('a keyframe records the representation it was captured on', () => {
+  const store = keyframeModule.createKeyframeStore();
+  const {
+    id: _id,
+    label: _label,
+    transitionDuration: _duration,
+    representation: _representation,
+    ...camera
+  } = keyframe('represented');
+  const umap = { key: 'X_umap', columns: [0, 1] };
+  const id = store.add(camera, undefined, umap);
+  assert.deepEqual(store.getById(id).representation, umap);
+  assert.ok(Object.isFrozen(store.getById(id).representation));
+  // An export embedding is named by its id alone; a synthetic scene by none.
+  const exported = store.add(camera, undefined, { key: 'X_umap_3d', columns: null });
+  assert.equal(store.getById(exported).representation.columns, null);
+  assert.equal(store.getById(store.add(camera, undefined, null)).representation, null);
+  // A missing or malformed record is refused, never guessed.
+  assert.throws(() => store.add(camera), /representation/);
+  assert.throws(() => store.add(camera, undefined, { key: 'X_pca', columns: [0, 0] }), /representation/);
+  assert.equal(keyframeModule.isValidCameraKeyframe({ ...keyframe('k'), representation: { key: '' , columns: null } }), false);
+  // It survives a session round trip.
+  const exportedState = store.exportAll();
+  const restored = keyframeModule.createKeyframeStore();
+  assert.equal(restored.importAll(exportedState), true);
+  assert.deepEqual(restored.getAll().map(({ representation }) => representation), [umap, { key: 'X_umap_3d', columns: null }, null]);
 });

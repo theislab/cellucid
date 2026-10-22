@@ -29,7 +29,7 @@ import {
   CONTEXT_LOST_ERROR_NAME,
   isContextLostError,
   requireCleanWebGLState,
-} from '../assets/js/rendering/high-perf/gl-point-draw-state.js';
+} from '../assets/js/rendering/gl-errors.js';
 import {
   HighPerfRendererContextLostError,
 } from '../assets/js/rendering/high-perf-renderer.js';

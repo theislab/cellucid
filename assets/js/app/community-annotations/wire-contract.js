@@ -18,6 +18,13 @@ export const ANNOTATION_CONTRACT_IDS = Object.freeze({
 // browser/Worker boundary so publication and remote reconciliation cannot drift.
 export const ANNOTATION_FILE_MAX_UTF8_BYTES = 1_000_000;
 
+/**
+ * Lengths of the text a contributor types, as the annotation schema states
+ * them. Counts (datasets, fields, suggestions, votes, comments, merges) and the
+ * keys the exporters write (field keys, `field:category` buckets) have no
+ * limit of their own: the 1,000,000-byte file is the only bound on how much
+ * one contributor file holds.
+ */
 export const ANNOTATION_LIMITS = Object.freeze({
   githubUserId: Number.MAX_SAFE_INTEGER,
   username: 64,
@@ -28,25 +35,13 @@ export const ANNOTATION_LIMITS = Object.freeze({
   linkedin: 120,
   datasetId: 256,
   datasetName: 120,
-  datasets: 200,
-  fields: 200,
-  bucket: 1024,
-  suggestionBuckets: 5000,
-  suggestionsPerBucket: 200,
   suggestionId: 128,
   label: 120,
   ontologyId: 64,
   evidence: 2000,
-  markers: 50,
   markerGene: 64,
-  votes: 50000,
-  commentTargets: 10000,
-  commentsPerSuggestion: 800,
   commentId: 128,
   commentText: 500,
-  deletedBuckets: 10000,
-  deletedPerBucket: 5000,
-  merges: 5000,
   mergeNote: 512,
 });
 
@@ -73,7 +68,7 @@ export function hasAnnotationSuggestionIdDelimiter(value) {
   return typeof value === 'string' && value.includes(':');
 }
 
-export class AnnotationContractError extends Error {
+class AnnotationContractError extends Error {
   constructor(path, message) {
     super(`${path}: ${message}`);
     this.name = 'AnnotationContractError';
@@ -178,11 +173,7 @@ function assertNonblankString(value, path, max) {
 }
 
 function assertFieldKey(value, path) {
-  const field = assertNonblankString(
-    value,
-    path,
-    ANNOTATION_LIMITS.datasetId
-  );
+  const field = assertNonblankString(value, path);
   if (isReservedAnnotationFieldKey(field)) {
     reject(
       path,
@@ -227,13 +218,6 @@ function assertArray(value, path, { min = 0, max } = {}) {
     reject(path, `must contain at most ${max} item(s)`);
   }
   return value;
-}
-
-function assertObjectSize(value, path, max) {
-  const object = assertRecord(value, path);
-  const size = Object.keys(object).length;
-  if (size > max) reject(path, `must contain at most ${max} field(s)`);
-  return object;
 }
 
 function assertUniqueStrings(values, path) {
@@ -434,7 +418,7 @@ function assertGhid(value, path) {
 }
 
 function assertBucket(value, path) {
-  const bucket = assertNonblankString(value, path, ANNOTATION_LIMITS.bucket);
+  const bucket = assertNonblankString(value, path);
   const delimiter = bucket.indexOf(':');
   if (delimiter <= 0 || delimiter === bucket.length - 1) {
     reject(path, 'must have <fieldKey>:<categoryLabel> form');
@@ -498,9 +482,7 @@ function assertSuggestion(value, path, fileUser, suggestionIds) {
     }
   }
   if (Object.hasOwn(suggestion, 'markers') && suggestion.markers !== null) {
-    const markers = assertArray(suggestion.markers, child(path, 'markers'), {
-      max: ANNOTATION_LIMITS.markers,
-    });
+    const markers = assertArray(suggestion.markers, child(path, 'markers'));
     markers.forEach((marker, index) => {
       const markerPath = `${child(path, 'markers')}[${index}]`;
       if (typeof marker === 'string') {
@@ -532,7 +514,7 @@ function assertSuggestion(value, path, fileUser, suggestionIds) {
 }
 
 function assertDatasetAccessMap(value, path) {
-  const datasets = assertObjectSize(value, path, ANNOTATION_LIMITS.datasets);
+  const datasets = assertRecord(value, path);
   for (const [datasetId, entryValue] of Object.entries(datasets)) {
     assertNonblankString(datasetId, `${path} key`, ANNOTATION_LIMITS.datasetId);
     const entryPath = child(path, datasetId);
@@ -543,8 +525,7 @@ function assertDatasetAccessMap(value, path) {
     );
     const fields = assertArray(
       entry.fieldsToAnnotate,
-      child(entryPath, 'fieldsToAnnotate'),
-      { max: ANNOTATION_LIMITS.fields }
+      child(entryPath, 'fieldsToAnnotate')
     );
     fields.forEach((field, index) => {
       assertFieldKey(
@@ -609,10 +590,9 @@ export function assertUserDocument(value, { path = '$', filename = null } = {}) 
   }
 
   const suggestionIds = new Set();
-  const suggestions = assertObjectSize(
+  const suggestions = assertRecord(
     document.suggestions,
-    child(path, 'suggestions'),
-    ANNOTATION_LIMITS.suggestionBuckets
+    child(path, 'suggestions')
   );
   for (const [bucket, listValue] of Object.entries(suggestions)) {
     assertBucket(bucket, `${child(path, 'suggestions')} key`);
@@ -625,10 +605,9 @@ export function assertUserDocument(value, { path = '$', filename = null } = {}) 
     });
   }
 
-  const votes = assertObjectSize(
+  const votes = assertRecord(
     document.votes,
-    child(path, 'votes'),
-    ANNOTATION_LIMITS.votes
+    child(path, 'votes')
   );
   for (const [suggestionId, direction] of Object.entries(votes)) {
     assertSuggestionId(suggestionId, `${child(path, 'votes')} key`);
@@ -638,17 +617,14 @@ export function assertUserDocument(value, { path = '$', filename = null } = {}) 
   }
 
   if (Object.hasOwn(document, 'comments')) {
-    const comments = assertObjectSize(
+    const comments = assertRecord(
       document.comments,
-      child(path, 'comments'),
-      ANNOTATION_LIMITS.commentTargets
+      child(path, 'comments')
     );
     for (const [suggestionId, listValue] of Object.entries(comments)) {
       assertSuggestionId(suggestionId, `${child(path, 'comments')} key`);
       const listPath = child(child(path, 'comments'), suggestionId);
-      const list = assertArray(listValue, listPath, {
-        max: ANNOTATION_LIMITS.commentsPerSuggestion,
-      });
+      const list = assertArray(listValue, listPath);
       const commentIds = new Set();
       list.forEach((commentValue, index) => {
         const commentPath = `${listPath}[${index}]`;
@@ -689,17 +665,14 @@ export function assertUserDocument(value, { path = '$', filename = null } = {}) 
   }
 
   if (Object.hasOwn(document, 'deletedSuggestions')) {
-    const deleted = assertObjectSize(
+    const deleted = assertRecord(
       document.deletedSuggestions,
-      child(path, 'deletedSuggestions'),
-      ANNOTATION_LIMITS.deletedBuckets
+      child(path, 'deletedSuggestions')
     );
     for (const [bucket, idsValue] of Object.entries(deleted)) {
       assertBucket(bucket, `${child(path, 'deletedSuggestions')} key`);
       const idsPath = child(child(path, 'deletedSuggestions'), bucket);
-      const ids = assertArray(idsValue, idsPath, {
-        max: ANNOTATION_LIMITS.deletedPerBucket,
-      });
+      const ids = assertArray(idsValue, idsPath);
       ids.forEach((id, index) => {
         assertSuggestionId(id, `${idsPath}[${index}]`);
       });
@@ -715,7 +688,7 @@ export function assertConfigDocument(value, { path = '$' } = {}) {
   const entries = assertArray(
     document.supportedDatasets,
     child(path, 'supportedDatasets'),
-    { min: 1, max: ANNOTATION_LIMITS.datasets }
+    { min: 1 }
   );
   const datasetIds = new Set();
   entries.forEach((entryValue, index) => {
@@ -742,10 +715,7 @@ export function assertConfigDocument(value, { path = '$' } = {}) {
       ANNOTATION_LIMITS.datasetName
     );
     const fieldsPath = child(entryPath, 'fieldsToAnnotate');
-    const fields = assertArray(entry.fieldsToAnnotate, fieldsPath, {
-      min: 1,
-      max: ANNOTATION_LIMITS.fields,
-    });
+    const fields = assertArray(entry.fieldsToAnnotate, fieldsPath, { min: 1 });
     fields.forEach((field, fieldIndex) => {
       assertFieldKey(field, `${fieldsPath}[${fieldIndex}]`);
     });
@@ -753,10 +723,9 @@ export function assertConfigDocument(value, { path = '$' } = {}) {
     const fieldSet = new Set(fields);
 
     const settingsPath = child(entryPath, 'annotatableSettings');
-    const settings = assertObjectSize(
+    const settings = assertRecord(
       entry.annotatableSettings,
-      settingsPath,
-      ANNOTATION_LIMITS.fields
+      settingsPath
     );
     for (const field of fields) {
       if (!Object.hasOwn(settings, field)) {
@@ -775,7 +744,6 @@ export function assertConfigDocument(value, { path = '$' } = {}) {
       ]);
       assertInteger(setting.minAnnotators, child(settingPath, 'minAnnotators'), {
         min: 0,
-        max: 50,
       });
       assertNumber(setting.threshold, child(settingPath, 'threshold'), {
         min: -1,
@@ -784,9 +752,7 @@ export function assertConfigDocument(value, { path = '$' } = {}) {
     }
 
     const closedPath = child(entryPath, 'closedFields');
-    const closed = assertArray(entry.closedFields, closedPath, {
-      max: ANNOTATION_LIMITS.fields,
-    });
+    const closed = assertArray(entry.closedFields, closedPath);
     closed.forEach((field, fieldIndex) => {
       assertFieldKey(field, `${closedPath}[${fieldIndex}]`);
       if (!fieldSet.has(field)) {
@@ -802,9 +768,7 @@ export function assertMergesDocument(value, { path = '$' } = {}) {
   const document = assertExactFields(value, path, ['version', 'updatedAt', 'merges']);
   if (document.version !== 1) reject(child(path, 'version'), 'must equal 1');
   assertUtcDateTime(document.updatedAt, child(path, 'updatedAt'));
-  const merges = assertArray(document.merges, child(path, 'merges'), {
-    max: ANNOTATION_LIMITS.merges,
-  });
+  const merges = assertArray(document.merges, child(path, 'merges'));
   const byBucketFrom = new Set();
   const edgesByBucket = new Map();
   merges.forEach((value, index) => {

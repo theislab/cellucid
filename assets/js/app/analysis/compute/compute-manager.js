@@ -5,11 +5,15 @@
  * and CPU execution share operation-handlers.js, so changing the selected
  * backend does not change the scientific contract. An execution error is
  * returned unchanged to the caller.
+ *
+ * A terminal worker pool (crash, timeout, or running-task abort) fails the
+ * operations it owned and is then retired: `getStatus()` keeps reporting the
+ * failure, and the next `init()` or `execute()` discovers a fresh pool rather
+ * than rejecting every later worker operation until the page reloads.
  */
 
 import {
   CPU_CAPABLE_OPERATIONS,
-  GPU_CAPABLE_OPERATIONS,
   WORKER_CAPABLE_OPERATIONS,
   isValidOperation
 } from './operations.js';
@@ -19,9 +23,8 @@ import { debug } from '../shared/debug-utils.js';
 let workerPoolModule = null;
 let computeManagerInstance = null;
 
-const BACKENDS = new Set(['gpu', 'worker', 'cpu']);
+const BACKENDS = new Set(['worker', 'cpu']);
 const EXECUTION_OPTIONS = new Set(['backend', 'timeout', 'signal', 'transfer']);
-const BATCH_TASK_KEYS = new Set(['operation', 'payload']);
 
 function now() {
   if (
@@ -65,29 +68,13 @@ export const BackendStatus = {
  */
 export class ComputeManager {
   constructor() {
-    // GPU utility implementations are not selected until an operation has a
-    // parity-verified GPU contract in operations.js.
-    this._gpuStatus = BackendStatus.UNAVAILABLE;
     this._workerStatus = BackendStatus.UNKNOWN;
 
-    this._gpuBackend = null;
     this._workerBackend = null;
     this._workerFailure = null;
 
     this._initialized = false;
     this._initPromise = null;
-
-    this._metrics = this._newMetrics();
-  }
-
-  _newMetrics() {
-    return {
-      gpuExecutions: 0,
-      workerExecutions: 0,
-      cpuExecutions: 0,
-      totalExecutions: 0,
-      totalTimeMs: 0
-    };
   }
 
   /**
@@ -97,12 +84,7 @@ export class ComputeManager {
    * An unavailable worker is recorded before any scientific operation begins.
    */
   async init() {
-    if (this._workerStatus === BackendStatus.FAILED) {
-      if (!(this._workerFailure instanceof Error)) {
-        throw new Error('Failed worker backend requires one terminal Error');
-      }
-      throw this._workerFailure;
-    }
+    this._retireTerminalWorker();
     if (this._initialized) return;
     if (this._initPromise) return this._initPromise;
 
@@ -115,17 +97,10 @@ export class ComputeManager {
   }
 
   async _doInit() {
-    this._gpuStatus = GPU_CAPABLE_OPERATIONS.size > 0
-      ? BackendStatus.UNKNOWN
-      : BackendStatus.UNAVAILABLE;
-
     await this._initWorker();
     this._initialized = true;
 
-    debug(
-      'ComputeManager',
-      `Initialized - GPU: ${this._gpuStatus}, Worker: ${this._workerStatus}`
-    );
+    debug('ComputeManager', `Initialized - Worker: ${this._workerStatus}`);
   }
 
   async _initWorker() {
@@ -166,6 +141,23 @@ export class ComputeManager {
     }
   }
 
+  /**
+   * Retire a worker backend that has closed for good, wherever that happened
+   * (this manager, marker discovery, or an explicit terminate). Its failure
+   * stays visible in `getStatus()` until the next discovery replaces it.
+   */
+  _retireTerminalWorker() {
+    const backend = this._workerBackend;
+    if (backend === null || !backend.isTerminal()) return;
+    const failure = backend.getTerminalFailure();
+    this._workerBackend = null;
+    this._workerStatus = BackendStatus.FAILED;
+    this._workerFailure = failure instanceof Error
+      ? failure
+      : new Error('Analysis worker pool was terminated');
+    this._initialized = false;
+  }
+
   _validateExecutionOptions(options) {
     requirePlainRecord(options, 'Execution options');
 
@@ -199,11 +191,9 @@ export class ComputeManager {
   }
 
   _assertBackendSupported(backend, operation) {
-    const capabilitySet = backend === 'gpu'
-      ? GPU_CAPABLE_OPERATIONS
-      : backend === 'worker'
-        ? WORKER_CAPABLE_OPERATIONS
-        : CPU_CAPABLE_OPERATIONS;
+    const capabilitySet = backend === 'worker'
+      ? WORKER_CAPABLE_OPERATIONS
+      : CPU_CAPABLE_OPERATIONS;
 
     if (!capabilitySet.has(operation)) {
       throw new Error(`${backend} backend does not support operation: ${operation}`);
@@ -211,12 +201,6 @@ export class ComputeManager {
   }
 
   _assertBackendAvailable(backend) {
-    if (backend === 'gpu' && (
-      this._gpuStatus !== BackendStatus.AVAILABLE || !this._gpuBackend
-    )) {
-      throw new Error('GPU backend is unavailable');
-    }
-
     if (backend === 'worker' && (
       this._workerStatus !== BackendStatus.AVAILABLE || !this._workerBackend
     )) {
@@ -231,8 +215,8 @@ export class ComputeManager {
    * Select one backend from declared operation support and probed availability.
    *
    * @param {string} operation
-   * @param {'gpu'|'worker'|'cpu'|null} [requestedBackend]
-   * @returns {'gpu'|'worker'|'cpu'}
+   * @param {'worker'|'cpu'|null} [requestedBackend]
+   * @returns {'worker'|'cpu'}
    */
   selectBackend(operation, requestedBackend = null) {
     if (!isValidOperation(operation)) {
@@ -246,14 +230,6 @@ export class ComputeManager {
       this._assertBackendSupported(requestedBackend, operation);
       this._assertBackendAvailable(requestedBackend);
       return requestedBackend;
-    }
-
-    if (
-      GPU_CAPABLE_OPERATIONS.has(operation) &&
-      this._gpuStatus === BackendStatus.AVAILABLE &&
-      this._gpuBackend
-    ) {
-      return 'gpu';
     }
 
     if (
@@ -283,19 +259,13 @@ export class ComputeManager {
    */
   async execute(operation, payload, options = {}) {
     this._validateExecutionOptions(options);
-    if (!this._initialized) {
-      await this.init();
-    }
+    await this.init();
 
     const backend = this.selectBackend(operation, options.backend);
     const startedAt = now();
     const result = await this._executeOnBackend(backend, operation, payload, options);
     const elapsedMs = now() - startedAt;
     requirePlainRecord(result, `Compute result for ${operation}`);
-
-    this._metrics.totalExecutions++;
-    this._metrics.totalTimeMs += elapsedMs;
-    this._metrics[`${backend}Executions`]++;
 
     return {
       ...result,
@@ -309,8 +279,6 @@ export class ComputeManager {
 
   async _executeOnBackend(backend, operation, payload, options) {
     switch (backend) {
-      case 'gpu':
-        return this._executeGPU(operation, payload);
       case 'worker':
         return this._executeWorker(operation, payload, options);
       case 'cpu':
@@ -318,10 +286,6 @@ export class ComputeManager {
       default:
         throw new Error(`Unknown compute backend: ${backend}`);
     }
-  }
-
-  async _executeGPU(operation) {
-    throw new Error(`No parity-verified GPU implementation for operation: ${operation}`);
   }
 
   async _executeWorker(operation, payload, options = {}) {
@@ -335,13 +299,8 @@ export class ComputeManager {
     if (transfer !== undefined) workerOptions.transfer = transfer;
     try {
       return await backend.execute(operation, payload, workerOptions);
-    } catch (error) {
-      const terminalFailure = backend.getTerminalFailure();
-      if (terminalFailure !== null) {
-        this._workerStatus = BackendStatus.FAILED;
-        this._workerFailure = terminalFailure;
-      }
-      throw error;
+    } finally {
+      this._retireTerminalWorker();
     }
   }
 
@@ -349,44 +308,9 @@ export class ComputeManager {
     return executeOperation(operation, payload);
   }
 
-  /**
-   * Execute independent tasks and preserve each failure.
-   */
-  async executeBatch(tasks, options = {}) {
-    if (!Array.isArray(tasks)) {
-      throw new TypeError('Compute batch tasks must be an array');
-    }
-
-    return Promise.all(tasks.map((task) => {
-      requirePlainRecord(task, 'Each compute batch task');
-      for (const key of Object.keys(task)) {
-        if (!BATCH_TASK_KEYS.has(key)) {
-          throw new TypeError(`Unknown compute batch task key: ${key}`);
-        }
-      }
-      if (!Object.hasOwn(task, 'operation') || !Object.hasOwn(task, 'payload')) {
-        throw new TypeError(
-          'Each compute batch task requires operation and payload'
-        );
-      }
-      return this.execute(task.operation, task.payload, options);
-    }));
-  }
-
   getStatus() {
-    let gpuInfo = null;
-    if (this._gpuBackend !== null) {
-      if (typeof this._gpuBackend.getInfo !== 'function') {
-        throw new TypeError('GPU backend must implement getInfo()');
-      }
-      gpuInfo = this._gpuBackend.getInfo();
-    }
     return {
       initialized: this._initialized,
-      gpu: {
-        status: this._gpuStatus,
-        info: gpuInfo
-      },
       worker: {
         status: this._workerStatus,
         stats: this._workerBackend === null
@@ -399,34 +323,12 @@ export class ComputeManager {
     };
   }
 
-  getMetrics() {
-    return { ...this._metrics };
-  }
-
-  resetMetrics() {
-    this._metrics = this._newMetrics();
-  }
-
-  isGPUAvailable() {
-    return this._gpuStatus === BackendStatus.AVAILABLE;
-  }
-
-  isWorkerAvailable() {
-    return this._workerStatus === BackendStatus.AVAILABLE;
-  }
-
   terminate() {
     if (this._workerBackend !== null) {
       this._workerBackend.terminate();
     }
     this._workerBackend = null;
     this._workerFailure = null;
-    if (this._gpuBackend !== null) {
-      this._gpuBackend.dispose();
-    }
-    this._gpuBackend = null;
-
-    this._gpuStatus = BackendStatus.UNAVAILABLE;
     this._workerStatus = BackendStatus.UNKNOWN;
     this._initialized = false;
 
@@ -445,5 +347,3 @@ export function getComputeManager() {
   }
   return computeManagerInstance;
 }
-
-export default ComputeManager;

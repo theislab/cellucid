@@ -7,6 +7,8 @@
  * file-like contract.
  */
 
+import { createSlicedInputStream } from '../app/session/codecs/gzip.js';
+
 const LOCAL_FILE_SIGNATURE = 0x04034b50;
 const CENTRAL_FILE_SIGNATURE = 0x02014b50;
 const END_OF_CENTRAL_DIRECTORY_SIGNATURE = 0x06054b50;
@@ -17,13 +19,8 @@ const MAX_ZIP_COMMENT_BYTES = 0xffff;
 const MAX_EOCD_SEARCH_BYTES =
   END_OF_CENTRAL_DIRECTORY_BYTES + MAX_ZIP_COMMENT_BYTES;
 
-const MAX_ZIP_ARCHIVE_BYTES = 64 * 1024 * 1024 * 1024;
-const MAX_CENTRAL_DIRECTORY_BYTES = 32 * 1024 * 1024;
-const MAX_ZIP64_END_RECORD_BYTES = 64 * 1024;
-const MAX_ZIP_ENTRIES = 200_000;
-const MAX_ZIP_PATH_BYTES = 4096;
-const MAX_ZIP_ENTRY_BYTES = 64 * 1024 * 1024 + 64 * 1024;
-const MAX_TOTAL_UNCOMPRESSED_BYTES = 64n * 1024n * 1024n * 1024n;
+/** Fixed part of one central-directory record (APPNOTE 4.3.12). */
+const CENTRAL_DIRECTORY_RECORD_BYTES = 46;
 
 const UTF8_FLAG = 0x0800;
 const DATA_DESCRIPTOR_FLAG = 0x0008;
@@ -34,7 +31,6 @@ const ZIP64_EXTRA_FIELD_ID = 0x0001;
 
 const utf8Decoder = new TextDecoder('utf-8', { fatal: true });
 const textDecoder = new TextDecoder();
-const zipEntryExtractionWorkingBytes = new WeakMap();
 
 const CRC32_TABLE = (() => {
   const table = new Uint32Array(256);
@@ -78,42 +74,6 @@ function exactArrayBuffer(bytes) {
   );
 }
 
-/**
- * Model the archive-only peak while one entry is materialized. Stored entries
- * retain only their payload buffer. Raw-DEFLATE entries retain the compressed
- * payload while stream output is copied into pieces and those pieces are
- * joined into the returned buffer.
- *
- * @param {{method: number, compressedSize: number, uncompressedSize: number}} record
- * @returns {bigint}
- */
-export function estimateZarrZipEntryExtractionWorkingBytes(record) {
-  if (!record || typeof record !== 'object' ||
-      !Number.isSafeInteger(record.compressedSize) ||
-      record.compressedSize < 0 ||
-      !Number.isSafeInteger(record.uncompressedSize) ||
-      record.uncompressedSize < 0 ||
-      (record.method !== 0 && record.method !== 8)) {
-    throw new Error('Invalid ZIP entry extraction plan');
-  }
-  const compressedBytes = BigInt(record.compressedSize);
-  const uncompressedBytes = BigInt(record.uncompressedSize);
-  return record.method === 8
-    ? compressedBytes + (2n * uncompressedBytes)
-    : uncompressedBytes;
-}
-
-/**
- * Return the archive-only extraction peak attached to a file-like value
- * produced by readZarrZipArchive(). Ordinary File objects return zero.
- *
- * @param {Object} file
- * @returns {bigint}
- */
-export function getZarrZipEntryExtractionWorkingBytes(file) {
-  return zipEntryExtractionWorkingBytes.get(file) ?? 0n;
-}
-
 function validateReadRange(size, start, length, label) {
   if (!Number.isSafeInteger(start) || start < 0 ||
       !Number.isSafeInteger(length) || length < 0 ||
@@ -123,6 +83,23 @@ function validateReadRange(size, start, length, label) {
 }
 
 function createRandomAccessReader(source) {
+  // A range source (`data/range-source.js`): the AnnData reader worker reads
+  // the archive through the same synchronous, page-cached source the H5AD
+  // reader uses. Its small header reads repeat, and the cache serves them.
+  if (source && typeof source.readInto === 'function' && Number.isSafeInteger(source.size)) {
+    return {
+      size: source.size,
+      name: typeof source.name === 'string' ? source.name : '',
+      async read(start, length, label = 'ZIP') {
+        validateReadRange(source.size, start, length, label);
+        const bytes = new Uint8Array(length);
+        if (source.readInto(bytes, start) !== length) {
+          throw new Error(`Short ${label} read in ZIP archive`);
+        }
+        return bytes;
+      }
+    };
+  }
   if (source instanceof ArrayBuffer || ArrayBuffer.isView(source)) {
     const sourceBytes = asUint8Array(source, 'ZIP source');
     return {
@@ -179,11 +156,6 @@ function readSafeUint64(view, offset, label) {
 async function findEndOfCentralDirectory(reader) {
   if (reader.size < END_OF_CENTRAL_DIRECTORY_BYTES) {
     throw new Error('Invalid ZIP archive: end-of-central-directory record is missing');
-  }
-  if (reader.size > MAX_ZIP_ARCHIVE_BYTES) {
-    throw new Error(
-      `ZIP archive exceeds the ${MAX_ZIP_ARCHIVE_BYTES}-byte browser limit`
-    );
   }
 
   const tailLength = Math.min(reader.size, MAX_EOCD_SEARCH_BYTES);
@@ -285,7 +257,6 @@ async function resolveCentralDirectoryFooter(reader, footer) {
   );
   const totalRecordSize = remainingRecordSize + 12;
   if (remainingRecordSize < 44 ||
-      totalRecordSize > MAX_ZIP64_END_RECORD_BYTES ||
       zip64Offset + totalRecordSize !== locatorOffset) {
     throw new Error('Invalid ZIP64 end-of-central-directory record size');
   }
@@ -345,9 +316,9 @@ async function resolveCentralDirectoryFooter(reader, footer) {
 
 function decodeEntryName(nameBytes, flags) {
   if (nameBytes.byteLength === 0 ||
-      nameBytes.byteLength > MAX_ZIP_PATH_BYTES) {
+      nameBytes.byteLength > 0xffff) {
     throw new Error(
-      `Unsafe ZIP entry path: names must contain 1-${MAX_ZIP_PATH_BYTES} bytes`
+      'Unsafe ZIP entry path: names must contain 1-65535 bytes'
     );
   }
 
@@ -528,14 +499,19 @@ function validateCentralDirectoryRecord({
       `Unsupported ZIP compression method ${method} for '${path}'; use stored or deflate entries`
     );
   }
-  if (compressedSize > MAX_ZIP_ENTRY_BYTES) {
+  // An entry's bytes lie between its local header and the central
+  // directory; its declared uncompressed size is enforced exactly when it is
+  // read (a DEFLATE bomb stops at that size), and nothing else bounds it.
+  if (compressedSize > centralDirectoryOffset - 30 - localHeaderOffset) {
     throw new Error(
-      `ZIP entry '${path}' compressed size exceeds the ${MAX_ZIP_ENTRY_BYTES}-byte browser limit`
+      `ZIP entry '${path}' declares ${compressedSize} compressed bytes, more than the archive holds`
     );
   }
-  if (uncompressedSize > MAX_ZIP_ENTRY_BYTES) {
+  // DEFLATE expands at most 1032:1 (RFC 1951), so a larger declared size is
+  // not a real entry: refused before anything is allocated for it.
+  if (method === 8 && uncompressedSize > compressedSize * 1032 + 64) {
     throw new Error(
-      `ZIP entry '${path}' uncompressed size exceeds the ${MAX_ZIP_ENTRY_BYTES}-byte browser limit`
+      `ZIP entry '${path}' declares more uncompressed bytes than DEFLATE can encode in ${compressedSize}`
     );
   }
   if (method === 0 && compressedSize !== uncompressedSize) {
@@ -566,15 +542,11 @@ async function parseCentralDirectory(reader) {
   if (footer.entryCount === 0) {
     throw new Error('ZIP archive contains no entries');
   }
-  if (footer.entryCount > MAX_ZIP_ENTRIES) {
-    throw new Error(
-      `ZIP archive contains more than ${MAX_ZIP_ENTRIES} entries`
-    );
-  }
-  if (footer.centralDirectorySize > MAX_CENTRAL_DIRECTORY_BYTES) {
-    throw new Error(
-      `ZIP central directory exceeds the ${MAX_CENTRAL_DIRECTORY_BYTES}-byte browser limit`
-    );
+  // Structural bounds only: every record takes at least 46 bytes of a
+  // central directory that lies inside the archive.
+  if (footer.centralDirectorySize < footer.entryCount * CENTRAL_DIRECTORY_RECORD_BYTES ||
+      footer.centralDirectoryEnd > reader.size) {
+    throw new Error('Invalid ZIP central-directory bounds');
   }
   if (footer.centralDirectoryOffset > footer.centralDirectoryEnd ||
       footer.centralDirectorySize !==
@@ -592,7 +564,6 @@ async function parseCentralDirectory(reader) {
   const paths = new Set();
   const localOffsets = new Set();
   let cursor = 0;
-  let totalUncompressedBytes = 0n;
 
   for (let entryIndex = 0; entryIndex < footer.entryCount; entryIndex++) {
     if (cursor > bytes.byteLength - 46 ||
@@ -668,12 +639,6 @@ async function parseCentralDirectory(reader) {
         );
       }
       localOffsets.add(localHeaderOffset);
-      totalUncompressedBytes += BigInt(uncompressedSize);
-      if (totalUncompressedBytes > MAX_TOTAL_UNCOMPRESSED_BYTES) {
-        throw new Error(
-          'ZIP archive declared uncompressed size exceeds the 64 GiB browser limit'
-        );
-      }
       records.push(record);
     }
     cursor += recordLength;
@@ -767,8 +732,7 @@ async function browserInflateRaw(
   compressed,
   { expectedSize, checksum, path }
 ) {
-  if (typeof globalThis.DecompressionStream !== 'function' ||
-      typeof globalThis.Blob !== 'function') {
+  if (typeof globalThis.DecompressionStream !== 'function') {
     throw new Error(
       `This browser cannot decompress deflate ZIP entry '${path}'. ` +
       'A current browser with gzip DecompressionStream support is required.'
@@ -788,11 +752,11 @@ async function browserInflateRaw(
 
   let stream;
   try {
-    stream = new globalThis.Blob(
+    // Sliced input keeps native inflation paced by this reader, so the
+    // declared-size check below cancels a DEFLATE bomb within one slice.
+    stream = createSlicedInputStream(
       createGzipEnvelopeParts(compressed, checksum, expectedSize)
-    )
-      .stream()
-      .pipeThrough(decompressor);
+    ).pipeThrough(decompressor);
   } catch (error) {
     throw new Error(`Failed to start ZIP decompression for '${path}'`, {
       cause: error
@@ -800,7 +764,9 @@ async function browserInflateRaw(
   }
 
   const reader = stream.getReader();
-  const chunks = [];
+  // The declared size is exact, so the output is allocated once and filled
+  // in place: no second copy of the entry is ever held.
+  const result = new Uint8Array(expectedSize);
   let totalBytes = 0;
   try {
     while (true) {
@@ -808,15 +774,15 @@ async function browserInflateRaw(
       if (done) break;
       const chunk = asUint8Array(value, 'DecompressionStream output');
       if (chunk.byteLength > expectedSize - totalBytes) {
-        await reader.cancel();
         throw new Error(
           `ZIP entry '${path}' decompressed beyond its declared size`
         );
       }
-      chunks.push(chunk.slice());
+      result.set(chunk, totalBytes);
       totalBytes += chunk.byteLength;
     }
   } catch (error) {
+    await reader.cancel(error).catch(() => {});
     if (error?.message?.includes(`ZIP entry '${path}'`)) throw error;
     throw new Error(`Failed to decompress ZIP entry '${path}'`, {
       cause: error
@@ -825,13 +791,7 @@ async function browserInflateRaw(
     reader.releaseLock();
   }
 
-  const result = new Uint8Array(totalBytes);
-  let offset = 0;
-  for (const chunk of chunks) {
-    result.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return result;
+  return totalBytes === expectedSize ? result : result.slice(0, totalBytes);
 }
 
 async function readEntryBytes(
@@ -1025,10 +985,6 @@ function createFileLike(
       return textDecoder.decode(buffer);
     }
   });
-  zipEntryExtractionWorkingBytes.set(
-    file,
-    estimateZarrZipEntryExtractionWorkingBytes(record)
-  );
   return file;
 }
 

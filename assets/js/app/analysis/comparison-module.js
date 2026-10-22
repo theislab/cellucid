@@ -1,8 +1,8 @@
 /**
  * Page Comparison & Multi-Page Analysis Module
  *
- * Main entry point that orchestrates the data layer, transforms,
- * plot registry, layout engine, and UI components.
+ * Main entry point that orchestrates the data layer, plot registry,
+ * layout engine, and UI components.
  *
  * UI follows the same pattern as the Filtering section:
  * - Three separate dropdowns for categorical obs, continuous obs, and gene expression
@@ -12,20 +12,14 @@
  */
 
 import { createDataLayer } from './data/data-layer.js';
-import { TransformPipeline, createTransformPipeline } from './data/transform-pipeline.js';
-import { createLayoutEngine } from './plots/layout-engine.js';
 import { createMultiVariableAnalysis } from './stats/multi-variable-analysis.js';
-import { runStatisticalTests as runStats } from './stats/statistical-tests.js';
-import { loadPlotly } from './plots/plotly-loader.js';
 import { getNotificationCenter } from '../notification-center.js';
 import { getMemoryMonitor } from './shared/memory-monitor.js';
 import { clearActiveSourceCaches } from './shared/resource-cleanup.js';
-// Import PlotRegistry from centralized location
-import { PlotRegistry } from './shared/plot-registry-utils.js';
-import { getTransformRegistry } from './core/plugin-contract.js';
 import { debugError } from './shared/debug-utils.js';
 import { closeModal } from './ui/components/modal.js';
 import { setOwnDataProperty } from '../../utils/exact-record.js';
+import { createInfoTip } from '../ui/components/controls.js';
 
 // Import unified UI manager and analysis type factories
 import { createAnalysisUIManager } from './ui/analysis-ui-manager.js';
@@ -52,6 +46,31 @@ import './plots/types/gene-heatmap.js';
 /**
  * Comparison Module class
  */
+/**
+ * Whether an analysis mode row is open. The header's `aria-expanded` is the
+ * one record of that state; the region's `hidden` follows it.
+ *
+ * @param {Element} item - A `.analysis-mode` disclosure.
+ * @returns {boolean}
+ */
+function isModeItemOpen(item) {
+  return item.querySelector(':scope > .disclosure-header-row > .disclosure-header')
+    ?.getAttribute('aria-expanded') === 'true';
+}
+
+/**
+ * Open or close one analysis mode row.
+ *
+ * @param {Element} item - A `.analysis-mode` disclosure.
+ * @param {boolean} open
+ */
+function setModeItemOpen(item, open) {
+  const header = item.querySelector(':scope > .disclosure-header-row > .disclosure-header');
+  const content = item.querySelector(':scope > .analysis-mode-content');
+  if (header !== null) header.setAttribute('aria-expanded', open ? 'true' : 'false');
+  if (content !== null) content.hidden = !open;
+}
+
 export class ComparisonModule {
   /**
    * @param {Object} options
@@ -64,8 +83,6 @@ export class ComparisonModule {
 
     // Initialize components - DataLayer now includes all enhanced features by default
     this.dataLayer = createDataLayer(this.state);
-    this.layoutEngine = null;
-    this.transformPipeline = createTransformPipeline();
 
     // Advanced analysis modules (lazy initialized)
     this._multiVariableAnalysis = null;
@@ -87,10 +104,6 @@ export class ComparisonModule {
     // Notification center
     this._notifications = getNotificationCenter();
 
-    // Last statistical results (cached for UI reuse)
-    this._lastStatResults = [];
-    this._lastStatResultsTimestamp = null;
-    this._currentPageData = null;
     this._datasetReloadResetCount = 0;
     this._lastDatasetReloadReset = null;
     this._destroyPromise = null;
@@ -109,12 +122,6 @@ export class ComparisonModule {
       layout: 'grouped',
       plotOptions: {},
       syncAxes: true // Synchronize axes across multi-page plots
-    };
-
-    // Event hooks
-    this._hooks = {
-      beforeRender: [],
-      afterRender: []
     };
 
     // Register with memory monitor for automatic cleanup
@@ -190,150 +197,67 @@ export class ComparisonModule {
       return;
     }
 
-    // Create analysis type accordion (minimalist design)
-    // Each item has header + content area for proper accordion behavior
-    // ARIA attributes provide accessibility for screen readers
+    // Analysis type accordion (minimalist design). Each header is a native
+    // disclosure button; the copy action is its sibling rather than a button
+    // nested inside it, so both controls stay operable and announced.
+    // What each mode does is told by its (i), beside the title.
+    const ANALYSIS_MODES = [
+      { mode: 'simple', title: 'Quick', tip: 'analysis-quick' },
+      { mode: 'detailed', title: 'Detailed', tip: 'analysis-detailed' },
+      { mode: 'correlation', title: 'Correlation', tip: 'analysis-correlation' },
+      { mode: 'differential', title: 'Differential expression', tip: 'analysis-differential' },
+      { mode: 'signature', title: 'Gene signature', tip: 'analysis-signature' },
+      { mode: 'genesPanel', title: 'Marker genes', tip: 'analysis-marker-genes' },
+    ];
     this._modeToggleContainer = document.createElement('div');
-    this._modeToggleContainer.className = 'analysis-accordion';
-    this._modeToggleContainer.setAttribute('role', 'tablist');
-    this._modeToggleContainer.innerHTML = `
-      <div class="analysis-accordion-item" data-mode="simple">
-        <div id="analysis-header-simple" class="analysis-accordion-header" role="button" tabindex="0" aria-expanded="false" aria-controls="analysis-panel-simple">
-          <span class="analysis-accordion-title">Quick</span>
-          <span class="analysis-accordion-desc">Automatic insights</span>
-          <button type="button" class="analysis-accordion-copy-btn accordion-copy-btn" aria-label="Copy analysis window" title="Copy"></button>
-          <span class="analysis-accordion-chevron" aria-hidden="true"></span>
+    this._modeToggleContainer.className = 'disclosure-list analysis-mode-list';
+    this._modeToggleContainer.innerHTML = ANALYSIS_MODES.map(({ mode, title }) => `
+      <div class="disclosure analysis-mode" data-mode="${mode}">
+        <div class="disclosure-header-row">
+          <button type="button" id="analysis-header-${mode}" class="disclosure-header" aria-expanded="false" aria-controls="analysis-panel-${mode}">
+            <span class="disclosure-title">${title}</span>
+            <span class="disclosure-chevron" aria-hidden="true"></span>
+          </button>
+          <button type="button" class="analysis-mode-copy-btn accordion-copy-btn" aria-label="Copy ${title} analysis window" title="Copy ${title} analysis window"></button>
         </div>
-        <div class="analysis-accordion-content" id="analysis-panel-simple" data-mode="simple" role="region" aria-labelledby="analysis-header-simple"></div>
-      </div>
-      <div class="analysis-accordion-item" data-mode="detailed">
-        <div id="analysis-header-detailed" class="analysis-accordion-header" role="button" tabindex="0" aria-expanded="false" aria-controls="analysis-panel-detailed">
-          <span class="analysis-accordion-title">Detailed</span>
-          <span class="analysis-accordion-desc">Full control over options</span>
-          <button type="button" class="analysis-accordion-copy-btn accordion-copy-btn" aria-label="Copy analysis window" title="Copy"></button>
-          <span class="analysis-accordion-chevron" aria-hidden="true"></span>
-        </div>
-        <div class="analysis-accordion-content" id="analysis-panel-detailed" data-mode="detailed" role="region" aria-labelledby="analysis-header-detailed"></div>
-      </div>
-      <div class="analysis-accordion-item" data-mode="correlation">
-        <div id="analysis-header-correlation" class="analysis-accordion-header" role="button" tabindex="0" aria-expanded="false" aria-controls="analysis-panel-correlation">
-          <span class="analysis-accordion-title">Correlation</span>
-          <span class="analysis-accordion-desc">Explore variable relationships</span>
-          <button type="button" class="analysis-accordion-copy-btn accordion-copy-btn" aria-label="Copy analysis window" title="Copy"></button>
-          <span class="analysis-accordion-chevron" aria-hidden="true"></span>
-        </div>
-        <div class="analysis-accordion-content" id="analysis-panel-correlation" data-mode="correlation" role="region" aria-labelledby="analysis-header-correlation"></div>
-      </div>
-      <div class="analysis-accordion-item" data-mode="differential">
-        <div id="analysis-header-differential" class="analysis-accordion-header" role="button" tabindex="0" aria-expanded="false" aria-controls="analysis-panel-differential">
-          <span class="analysis-accordion-title">Differential Expression</span>
-          <span class="analysis-accordion-desc">Find DE genes between groups</span>
-          <button type="button" class="analysis-accordion-copy-btn accordion-copy-btn" aria-label="Copy analysis window" title="Copy"></button>
-          <span class="analysis-accordion-chevron" aria-hidden="true"></span>
-        </div>
-        <div class="analysis-accordion-content" id="analysis-panel-differential" data-mode="differential" role="region" aria-labelledby="analysis-header-differential"></div>
-      </div>
-      <div class="analysis-accordion-item" data-mode="signature">
-        <div id="analysis-header-signature" class="analysis-accordion-header" role="button" tabindex="0" aria-expanded="false" aria-controls="analysis-panel-signature">
-          <span class="analysis-accordion-title">Gene Signature</span>
-          <span class="analysis-accordion-desc">Compute signature scores</span>
-          <button type="button" class="analysis-accordion-copy-btn accordion-copy-btn" aria-label="Copy analysis window" title="Copy"></button>
-          <span class="analysis-accordion-chevron" aria-hidden="true"></span>
-        </div>
-        <div class="analysis-accordion-content" id="analysis-panel-signature" data-mode="signature" role="region" aria-labelledby="analysis-header-signature"></div>
-      </div>
-      <div class="analysis-accordion-item" data-mode="genesPanel">
-        <div id="analysis-header-genesPanel" class="analysis-accordion-header" role="button" tabindex="0" aria-expanded="false" aria-controls="analysis-panel-genesPanel">
-          <span class="analysis-accordion-title">Marker Genes</span>
-          <span class="analysis-accordion-desc">Discover markers across groups</span>
-          <button type="button" class="analysis-accordion-copy-btn accordion-copy-btn" aria-label="Copy analysis window" title="Copy"></button>
-          <span class="analysis-accordion-chevron" aria-hidden="true"></span>
-        </div>
-        <div class="analysis-accordion-content" id="analysis-panel-genesPanel" data-mode="genesPanel" role="region" aria-labelledby="analysis-header-genesPanel"></div>
-      </div>
-    `;
+        <div class="disclosure-content analysis-mode-content" id="analysis-panel-${mode}" data-mode="${mode}" role="region" aria-labelledby="analysis-header-${mode}" hidden></div>
+      </div>`).join('');
+    for (const { mode, title, tip } of ANALYSIS_MODES) {
+      const row = this._modeToggleContainer.querySelector(
+        `.analysis-mode[data-mode="${mode}"] > .disclosure-header-row`
+      );
+      const info = createInfoTip({ tip, label: `About ${title.toLowerCase()} analysis` });
+      row.insertBefore(info.button, row.querySelector('.analysis-mode-copy-btn'));
+      row.after(info.popover);
+    }
     accordionContent.appendChild(this._modeToggleContainer);
 
-    // Accordion click/keyboard event - select mode (ignore action button clicks)
-    this._modeToggleContainer.querySelectorAll('.analysis-accordion-header').forEach(header => {
-      const activate = () => {
-        const item = header.closest('.analysis-accordion-item');
-        if (!item) return;
-        this._setAnalysisMode(item.dataset.mode);
-      };
-
-      header.addEventListener('click', (e) => {
-        if (e.target?.closest?.('.analysis-accordion-copy-btn')) return;
-        activate();
-      });
-
-      header.addEventListener('keydown', (e) => {
-        if (e.target?.closest?.('.analysis-accordion-copy-btn')) return;
-        if (e.key !== 'Enter' && e.key !== ' ') return;
-        e.preventDefault();
-        activate();
-      });
-    });
-
-    // Copy buttons (open floating window)
-    this._modeToggleContainer.querySelectorAll('.analysis-accordion-copy-btn').forEach((btn) => {
-      btn.addEventListener('click', (e) => {
+    // A native button answers click, Enter, and Space with one click event.
+    // One delegated listener serves every header and every copy button.
+    this._modeToggleContainer.addEventListener('click', (e) => {
+      const target = e.target instanceof Element ? e.target : null;
+      const copyBtn = target?.closest('.analysis-mode-copy-btn') ?? null;
+      if (copyBtn !== null && this._modeToggleContainer.contains(copyBtn)) {
         e.preventDefault();
         e.stopPropagation();
-
-        const item = btn.closest('.analysis-accordion-item');
-        if (!item) return;
-
-        const mode = item.dataset.mode;
-        const header = item.querySelector('.analysis-accordion-header');
-        const sourceRect = header?.getBoundingClientRect?.() || item.getBoundingClientRect();
-        const sectionRect = btn.closest('details.accordion-section')?.getBoundingClientRect?.();
-        const itemRect = item.getBoundingClientRect();
-        const isExpanded = item.classList.contains('open');
-        const headerTitle = header?.querySelector?.('.analysis-accordion-title')?.textContent?.trim?.() || '';
-        const headerDesc = header?.querySelector?.('.analysis-accordion-desc')?.textContent?.trim?.() || '';
-
-        try {
-          const creation = this._analysisWindowManager?.copyFromEmbedded?.(
-            mode,
-            {
-              sourceRect,
-              preferredSize: {
-                width: sectionRect?.width ?? itemRect.width,
-                height: isExpanded ? itemRect.height : undefined
-              },
-              headerTitle,
-              headerDesc
-            }
-          );
-          if (creation && typeof creation.then === 'function') {
-            void creation.catch(error => {
-              console.error(
-                '[ComparisonModule] Analysis window creation failed:',
-                error
-              );
-              this._notifications.error(
-                `Could not create the analysis window: ${error.message}`,
-                { category: 'analysis', title: 'Analysis Window Error' }
-              );
-            });
-          }
-        } catch (error) {
-          console.error(
-            '[ComparisonModule] Analysis window creation failed:',
-            error
-          );
-          this._notifications.error(
-            `Could not create the analysis window: ${error.message}`,
-            { category: 'analysis', title: 'Analysis Window Error' }
-          );
-        }
-      });
+        this._copyModeToWindow(copyBtn);
+        return;
+      }
+      // Only a mode's own header switches modes: the disclosures inside a
+      // mode's form (Clustering, Performance settings) are headers too, and
+      // their clicks bubble through this list.
+      const header = target?.closest(
+        '.analysis-mode > .disclosure-header-row > .disclosure-header'
+      ) ?? null;
+      if (header === null || !this._modeToggleContainer.contains(header)) return;
+      const item = header.closest('.analysis-mode');
+      if (!item) return;
+      this._setAnalysisMode(item.dataset.mode);
     });
 
     // Build container map from accordion content areas
     const containerMap = {};
-    this._modeToggleContainer.querySelectorAll('.analysis-accordion-content').forEach(content => {
+    this._modeToggleContainer.querySelectorAll('.analysis-mode-content').forEach(content => {
       setOwnDataProperty(containerMap, content.dataset.mode, content);
     });
 
@@ -475,7 +399,7 @@ export class ComparisonModule {
     // Differential Expression
     this._uiManager.register({
       id: 'differential',
-      name: 'Differential Expression',
+      name: 'Differential expression',
       factory: createDEAnalysisUI,
       minPages: 1,
       maxPages: null, // User can select which 2 pages to compare from available pages
@@ -486,7 +410,7 @@ export class ComparisonModule {
     // Gene Signature Score
     this._uiManager.register({
       id: 'signature',
-      name: 'Gene Signature',
+      name: 'Gene signature',
       factory: createGeneSignatureUI,
       minPages: 1,
       maxPages: null,
@@ -497,13 +421,73 @@ export class ComparisonModule {
     // Marker Genes Panel
     this._uiManager.register({
       id: 'genesPanel',
-      name: 'Marker Genes',
+      name: 'Marker genes',
       factory: createGenesPanelUI,
       minPages: 1,
       maxPages: null,
       icon: 'grid',
       tooltip: 'Discover and visualize marker genes across cell groups'
     });
+  }
+
+  /**
+   * Copy one analysis mode into a floating window, sized from its row.
+   *
+   * @param {HTMLButtonElement} btn - The row's copy button.
+   */
+  _copyModeToWindow(btn) {
+    const item = btn.closest('.analysis-mode');
+    if (!item) return;
+
+    const mode = item.dataset.mode;
+    const header = item.querySelector('.disclosure-header');
+    const sourceRect = header?.getBoundingClientRect?.() || item.getBoundingClientRect();
+    const sectionRect = btn.closest('details.accordion-section')?.getBoundingClientRect?.();
+    const itemRect = item.getBoundingClientRect();
+    const isExpanded = isModeItemOpen(item);
+    const headerTitle = header?.querySelector?.('.disclosure-title')?.textContent?.trim?.() || '';
+
+    try {
+      // A mode whose data is missing shows a notice, not a form, so there are
+      // no settings to copy: say why instead of opening a window.
+      const data = this._uiManager.getUI(mode)?.validateDataRequirements();
+      if (data?.valid === false) {
+        this._notifications.info(data.error, { category: 'analysis' });
+        return;
+      }
+      const creation = this._analysisWindowManager?.copyFromEmbedded?.(
+        mode,
+        {
+          sourceRect,
+          preferredSize: {
+            width: sectionRect?.width ?? itemRect.width,
+            height: isExpanded ? itemRect.height : undefined
+          },
+          headerTitle
+        }
+      );
+      if (creation && typeof creation.then === 'function') {
+        void creation.catch(error => {
+          console.error(
+            '[ComparisonModule] Analysis window creation failed:',
+            error
+          );
+          this._notifications.error(
+            `Could not create the analysis window: ${error.message}`,
+            { category: 'analysis', title: 'Analysis Window Error' }
+          );
+        });
+      }
+    } catch (error) {
+      console.error(
+        '[ComparisonModule] Analysis window creation failed:',
+        error
+      );
+      this._notifications.error(
+        `Could not create the analysis window: ${error.message}`,
+        { category: 'analysis', title: 'Analysis Window Error' }
+      );
+    }
   }
 
   /**
@@ -519,33 +503,21 @@ export class ComparisonModule {
    * @param {'simple'|'detailed'|'correlation'|'differential'|'signature'|'genesPanel'} mode
    */
   _setAnalysisMode(mode) {
-    const allItems = this._modeToggleContainer.querySelectorAll('.analysis-accordion-item');
+    const allItems = this._modeToggleContainer.querySelectorAll('.analysis-mode');
     const clickedItem = this._modeToggleContainer.querySelector(
-      `.analysis-accordion-item[data-mode="${mode}"]`
+      `.analysis-mode[data-mode="${mode}"]`
     );
 
     // IMPORTANT: Check if clicked item is ALREADY open BEFORE any DOM changes
-    const isAlreadyOpen = clickedItem?.classList.contains('open');
+    const isAlreadyOpen = clickedItem !== null && isModeItemOpen(clickedItem);
 
-    // Close ALL accordion items and update ARIA states
-    allItems.forEach(item => {
-      item.classList.remove('open');
-      const header = item.querySelector('.analysis-accordion-header');
-      if (header) {
-        header.setAttribute('aria-expanded', 'false');
-      }
-    });
+    // Close ALL accordion items: aria-expanded and the region's `hidden`
+    // are the one record of the open state.
+    allItems.forEach(item => setModeItemOpen(item, false));
 
     // Toggle behavior: only open if it wasn't already open
     if (!isAlreadyOpen && clickedItem) {
-      // Open the clicked item
-      clickedItem.classList.add('open');
-
-      // Update ARIA expanded state
-      const clickedHeader = clickedItem.querySelector('.analysis-accordion-header');
-      if (clickedHeader) {
-        clickedHeader.setAttribute('aria-expanded', 'true');
-      }
+      setModeItemOpen(clickedItem, true);
 
       // Only switch UI manager when actually opening a new/different mode
       if (mode !== this._analysisMode) {
@@ -558,76 +530,6 @@ export class ComparisonModule {
       // Item was toggled closed - clear the active mode
       this._analysisMode = null;
       this._uiManager.clearActiveMode();
-    }
-  }
-
-  // ===========================================================================
-  // Public API Methods
-  // ===========================================================================
-
-  /**
-   * Run analysis with given configuration
-   *
-   * This method is used by:
-   * - advanced-analysis-ui.js for correlation plots
-   *
-   * @param {Object} config - Analysis configuration
-   * @returns {Promise<Object[]>} Transformed page data
-   */
-  async runAnalysis(config) {
-    try {
-      // Ensure Plotly is loaded (lazy loading)
-      await loadPlotly();
-
-      // Fire beforeRender hooks
-      for (const hook of this._hooks.beforeRender) {
-        await hook(config);
-      }
-
-      // Fetch data for all pages
-      const pageData = await this.dataLayer.getDataForPages({
-        type: config.dataSource.type,
-        variableKey: config.dataSource.variable,
-        pageIds: config.pages
-      });
-
-      if (pageData.length === 0) {
-        throw new Error('No data available for selected pages');
-      }
-
-      // Apply transforms if any
-      let transformedData = pageData;
-      if (config.transforms && config.transforms.length > 0) {
-        const pipeline = TransformPipeline.fromConfig(config.transforms);
-        transformedData = pageData.map(pd => ({
-          ...pd,
-          ...pipeline.apply(pd)
-        }));
-      }
-
-      // Create layout engine
-      this.layoutEngine = createLayoutEngine({
-        pageCount: transformedData.length,
-        pageIds: transformedData.map(pd => pd.pageId),
-        pageNames: transformedData.map(pd => pd.pageName),
-        syncXAxis: config.syncAxes !== false,
-        syncYAxis: config.syncAxes !== false
-      });
-
-      // Fire afterRender hooks
-      for (const hook of this._hooks.afterRender) {
-        await hook(config, transformedData);
-      }
-
-      // Store for use by runStatisticalTests()
-      this._currentPageData = transformedData;
-
-      // Return transformed data for external use (analysis UIs, exports)
-      return transformedData;
-
-    } catch (err) {
-      debugError('ComparisonModule', 'runAnalysis failed:', err);
-      throw err;
     }
   }
 
@@ -809,27 +711,6 @@ export class ComparisonModule {
     this.currentConfig = { ...this.currentConfig, ...config };
   }
 
-  /**
-   * Add event hook
-   */
-  on(event, callback) {
-    if (this._hooks[event]) {
-      this._hooks[event].push(callback);
-    }
-  }
-
-  /**
-   * Remove event hook
-   */
-  off(event, callback) {
-    if (this._hooks[event]) {
-      const idx = this._hooks[event].indexOf(callback);
-      if (idx >= 0) {
-        this._hooks[event].splice(idx, 1);
-      }
-    }
-  }
-
   // ===========================================================================
   // Lifecycle
   // ===========================================================================
@@ -841,15 +722,6 @@ export class ComparisonModule {
     if (this.dataLayer && this.dataLayer.performCacheCleanup) {
       const result = this.dataLayer.performCacheCleanup();
       console.debug('[ComparisonModule] Cleanup completed:', result);
-    }
-
-    // Clear stale stat results
-    if (this._lastStatResults && this._lastStatResults.length > 0) {
-      const now = Date.now();
-      if (this._lastStatResultsTimestamp && (now - this._lastStatResultsTimestamp) > 5 * 60 * 1000) {
-        this._lastStatResults = [];
-        this._lastStatResultsTimestamp = null;
-      }
     }
   }
 
@@ -979,13 +851,7 @@ export class ComparisonModule {
       this._analysisWindowManager = null;
       this._uiManager = null;
       this.dataLayer = null;
-      this._hooks = { beforeRender: [], afterRender: [] };
-      this.layoutEngine = null;
-      this.transformPipeline = null;
       this._multiVariableAnalysis = null;
-      this._lastStatResults = [];
-      this._lastStatResultsTimestamp = null;
-      this._currentPageData = null;
 
       const exactErrors = [...new Set(errors)];
       if (exactErrors.length === 1) throw exactErrors[0];
@@ -1013,31 +879,6 @@ export class ComparisonModule {
       this._multiVariableAnalysis = createMultiVariableAnalysis(this.dataLayer);
     }
     return this._multiVariableAnalysis;
-  }
-
-  /**
-   * Run statistical tests on current page data
-   * @returns {Promise<Object[]>} Statistical test results
-   */
-  async runStatisticalTests() {
-    if (!this._currentPageData || this._currentPageData.length < 2) {
-      return [];
-    }
-
-    const dataType = this.currentConfig.dataSource.type === 'categorical_obs'
-      ? 'categorical' : 'continuous';
-
-    this._lastStatResults = runStats(this._currentPageData, dataType);
-    this._lastStatResultsTimestamp = Date.now();
-    return this._lastStatResults;
-  }
-
-  /**
-   * Get the last statistical test results
-   * @returns {Object[]}
-   */
-  getLastStatResults() {
-    return this._lastStatResults;
   }
 
   /**
@@ -1200,7 +1041,7 @@ export class ComparisonModule {
           );
         } else {
           const items = this._modeToggleContainer.querySelectorAll(
-            '.analysis-accordion-item'
+            '.analysis-mode'
           );
           if (
             items === null ||
@@ -1213,15 +1054,7 @@ export class ComparisonModule {
             );
           } else {
             for (const item of items) {
-              runSynchronous(() => {
-                item.classList.remove('open');
-                const header = item.querySelector(
-                  '.analysis-accordion-header'
-                );
-                if (header !== null) {
-                  header.setAttribute('aria-expanded', 'false');
-                }
-              });
+              runSynchronous(() => setModeItemOpen(item, false));
             }
           }
         }
@@ -1278,9 +1111,6 @@ export class ComparisonModule {
 
       this._analysisMode = null;
       this._multiVariableAnalysis = null;
-      this._lastStatResults = [];
-      this._lastStatResultsTimestamp = null;
-      this._currentPageData = null;
 
       try {
         await this.onPagesChanged();
@@ -1338,54 +1168,7 @@ export class ComparisonModule {
   getUIManager() {
     return this._uiManager;
   }
-
-  // =========================================================================
-  // Static Extensibility APIs
-  // =========================================================================
-
-  static registerPlotType(plotType) {
-    PlotRegistry.register(plotType);
-  }
-
-  static registerTransform(id, transform) {
-    const registry = getTransformRegistry();
-    registry.register({
-      id,
-      name: transform.name || id,
-      description: transform.description || '',
-      supportedTypes: transform.supportedTypes || transform.applicableTo || ['any'],
-      defaultOptions: transform.defaultOptions || {},
-      optionSchema: transform.optionSchema || {},
-      execute: transform.execute || (async (data, opts, ctx) => {
-        if (typeof transform.apply === 'function') return transform.apply(data, opts, ctx);
-        throw new Error(`Transform '${id}' must provide an execute() or apply() function`);
-      })
-    });
-  }
-
-  static getPlotType(id) {
-    return PlotRegistry.get(id);
-  }
-
-  static getPlotTypes() {
-    return PlotRegistry.getAll();
-  }
-
-  static getTransforms() {
-    return getTransformRegistry().getAll();
-  }
 }
-
-// Custom exporter registry
-const customExporters = new Map();
-
-ComparisonModule.registerExporter = function(format, exportFn) {
-  customExporters.set(format, exportFn);
-};
-
-ComparisonModule.getExporter = function(format) {
-  return customExporters.get(format) || null;
-};
 
 /**
  * Create a new ComparisonModule instance
@@ -1395,31 +1178,3 @@ export function createComparisonModule(options) {
   module.init();
   return module;
 }
-
-// Re-export for external use
-export { PlotRegistry };
-export { DataLayer, createDataLayer } from './data/data-layer.js';
-export { TransformPipeline, createTransformPipeline } from './data/transform-pipeline.js';
-export { LayoutEngine, createLayoutEngine } from './plots/layout-engine.js';
-export { MultiVariableAnalysis, createMultiVariableAnalysis } from './stats/multi-variable-analysis.js';
-
-// Re-export UI manager and analysis UIs (all treated equally)
-export { AnalysisUIManager, createAnalysisUIManager } from './ui/analysis-ui-manager.js';
-export { QuickInsights, createQuickInsights } from './ui/analysis-types/quick-insights-ui.js';
-export { DetailedAnalysisUI, createDetailedAnalysisUI } from './ui/analysis-types/detailed-analysis-ui.js';
-export { CorrelationAnalysisUI, createCorrelationAnalysisUI } from './ui/analysis-types/correlation-analysis-ui.js';
-export { DEAnalysisUI, createDEAnalysisUI } from './ui/analysis-types/de-analysis-ui.js';
-export { GeneSignatureUI, createGeneSignatureUI } from './ui/analysis-types/gene-signature-ui.js';
-export { GenesPanelUI, createGenesPanelUI } from './ui/analysis-types/genes-panel-ui.js';
-
-// Re-export query builder
-export { QueryBuilder, createQueryBuilder, OPERATORS } from './data/query-builder.js';
-
-// Re-export statistical functions
-export {
-  benjaminiHochberg,
-  bonferroniCorrection,
-  applyMultipleTestingCorrection,
-  confidenceInterval,
-  computeFoldChange
-} from './stats/statistical-tests.js';

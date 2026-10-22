@@ -6,9 +6,10 @@
  * that carry per-overlay ownership on the DOM nodes themselves, and the
  * promise-shaped confirmation wrapper.
  *
- * `COMMUNITY_MODAL_LOCAL_CLOSE` and `COMMUNITY_MODAL_ESCAPE_OWNER` are module
- * identity: every module that reads or writes them must import them from here,
- * or an overlay written by one copy is invisible to the other.
+ * `COMMUNITY_MODAL_LOCAL_CLOSE` is private to this shell, and
+ * `COMMUNITY_MODAL_ESCAPE_OWNER` is module identity: every module that reads or
+ * writes it must import it from here, or an overlay written by one copy is
+ * invisible to the other.
  *
  * ## Why this is not the only community annotation modal shell
  *
@@ -23,9 +24,9 @@
  *   content holds abortable field loads that must not observe a detached tree.
  * - **The nested-Escape protocols differ.** This shell resolves Escape through
  *   `COMMUNITY_MODAL_ESCAPE_OWNER` on the event target, so an inline editor can
- *   claim Escape and report whether it handled it. The voting shell resolves it
- *   through an `escCancelSelector`, because its cancellable regions are marked
- *   declaratively (`data-esc-cancel`) by content it does not own.
+ *   claim Escape and report whether it handled it. The voting shells leave it to
+ *   any region marked declaratively with `data-esc-cancel`, because those
+ *   regions belong to content the shell does not own.
  * - **The voting shell owns a cascade this one has no concept of**
  *   (`activeVotingModal` / `activeSecondaryModal`), and its secondary shell
  *   owns a session-driven re-render loop with focus capture and restore across
@@ -53,7 +54,7 @@ import { el } from './dom.js';
 import { createDomId } from '../../components/dom-id.js';
 import { releaseExactModalDocumentLayer, runExactCleanup } from './cleanup.js';
 
-export const COMMUNITY_MODAL_LOCAL_CLOSE = Symbol('communityModalLocalClose');
+const COMMUNITY_MODAL_LOCAL_CLOSE = Symbol('communityModalLocalClose');
 export const COMMUNITY_MODAL_ESCAPE_OWNER = Symbol('communityModalEscapeOwner');
 
 export function removeOwningCommunityModal(content) {
@@ -112,7 +113,7 @@ export function showClusterModal({
   titleEl.id = createDomId('community-annotation-modal-title');
   overlay.setAttribute('aria-labelledby', titleEl.id);
   header.appendChild(titleEl);
-  const closeBtn = el('button', { type: 'button', className: 'btn-small community-annotation-modal-close', text: 'Close' });
+  const closeBtn = el('button', { type: 'button', className: 'btn community-annotation-modal-close', text: 'Close' });
   header.appendChild(closeBtn);
 
   const content = el('div', { className: 'community-annotation-modal-body' });
@@ -194,8 +195,11 @@ export function showClusterModal({
     closing = true;
     const restorePreviousFocus = () => {
       if (!shouldRestoreFocus) return;
+      // `body` is where focus rests when nothing held it (WebKit does not
+      // focus a clicked button), so it is not a control to return to.
       const previousFocusAvailable =
         prevFocus instanceof HTMLElement &&
+        prevFocus !== document.body &&
         prevFocus.isConnected &&
         !(
           prevFocus instanceof HTMLButtonElement &&
@@ -384,7 +388,7 @@ export function showClusterModal({
   }
 }
 
-export function confirmAsync({ title, message, confirmText, signal = null }) {
+export function confirmAsync({ title, message, confirmText, tone = 'danger', signal = null }) {
   if (
     signal !== null &&
     (
@@ -416,6 +420,7 @@ export function confirmAsync({ title, message, confirmText, signal = null }) {
       title,
       message,
       confirmText,
+      tone,
       onConfirm: () => settle(true),
       onCancel: () => settle(false)
     });

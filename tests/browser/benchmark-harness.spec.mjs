@@ -75,7 +75,7 @@ test('the harness observes LOD, culling and uploads under scripted motion', PROC
   await page.goto(FIXTURE_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await expect(page.locator('#filter-count')).toHaveText(
-    'Showing all 120 points'
+    'Showing all 120 cells'
   );
   await publishSyntheticDataset(page, SMOKE_POINT_COUNT, 'atlas');
 
@@ -253,29 +253,16 @@ test('the harness observes LOD, culling and uploads under scripted motion', PROC
   );
   expect(outcome.probe.minVisiblePoints).toBeLessThan(SMOKE_POINT_COUNT);
 
-  // The upload counters must work without any renderer change, and must
-  // separate a moving camera from a still one. The renderer publishes a new
-  // element buffer only when the ordered visible set changes, so a still
-  // camera must produce none.
-  expect(outcome.windows.orbit.uploads.totalElementCalls).toBeGreaterThan(0);
-  expect(outcome.windows.static.uploads.totalElementCalls).toBe(0);
-  expect(outcome.windows.orbit.uploads.totalBytes).toBeGreaterThan(
-    outcome.windows.static.uploads.totalBytes
-  );
-
-  // The synchronous GL points are on the same guard, but the guard moved.
-  // `_uploadToViewIndexBuffer` used to bracket every per-view, per-frame index
-  // publication in two `gl.getError()` calls; CEL-0071 takes that bracket only
-  // when publishing wider than any size the element buffer has been proven to
-  // hold, and skips it when replacing at or below that watermark. So a still
-  // camera stalls not at all, a moving one stalls only where the buffer grows,
-  // and the per-frame pipeline drain this counter was added to expose is gone.
-  // Asserting it is still there would assert the defect CEL-0071 removed; what
-  // must hold is that it cannot come back.
-  expect(outcome.windows.static.uploads.totalSyncStallCalls).toBe(0);
-  expect(outcome.windows.orbit.uploads.totalSyncStallCalls).toBeLessThan(
-    outcome.windows.orbit.samples
-  );
+  // The upload counters must work without any renderer change. Culling now
+  // draws node ranges out of the stored draw order, so neither a moving nor a
+  // still camera publishes an element buffer or uploads anything at all, and
+  // nothing in the frame waits on a synchronous GL query.
+  for (const regime of ['static', 'orbit']) {
+    const uploads = outcome.windows[regime].uploads;
+    expect(uploads.totalElementCalls, `${regime}: ${JSON.stringify(uploads)}`).toBe(0);
+    expect(uploads.totalSyncStallCalls, `${regime}: ${JSON.stringify(uploads)}`).toBe(0);
+  }
+  expect(outcome.windows.static.uploads.totalBytes).toBe(0);
 
   // Percentiles are withheld, not invented, when the window is this short.
   for (const regime of ['static', 'orbit']) {
@@ -293,7 +280,7 @@ test('the harness observes LOD, culling and uploads under scripted motion', PROC
   expect(browserErrors).toEqual([]);
 });
 
-test('the view-count axis reaches the viewer snapshot ceiling', PROCESS_INTENSIVE, async ({
+test('the view-count axis publishes real views, any number of them', PROCESS_INTENSIVE, async ({
   page
 }) => {
   test.setTimeout(600_000);
@@ -338,13 +325,9 @@ test('the view-count axis reaches the viewer snapshot ceiling', PROCESS_INTENSIV
             samples: summary.samples
           });
         }
-        let refusedBeyondCeiling = null;
-        try {
-          await runner.ensureViewCount(harnessModule.MAX_BENCHMARK_VIEWS + 1);
-        } catch (error) {
-          refusedBeyondCeiling = error.message;
-        }
-        return { cells, refusedBeyondCeiling };
+        // Any number of views: a fifth is published like the others.
+        const beyondFour = await runner.ensureViewCount(5);
+        return { cells, beyondFour };
       } finally {
         harness.dispose();
       }
@@ -359,14 +342,13 @@ test('the view-count axis reaches the viewer snapshot ceiling', PROCESS_INTENSIV
     { viewCount: 2, layoutMode: 'grid' },
     { viewCount: 4, layoutMode: 'grid' }
   ]);
-  // Per-view work must scale with the number of panes, not stay flat.
-  expect(measured.cells[1].elementUploadCalls).toBeGreaterThan(
-    measured.cells[0].elementUploadCalls
-  );
-  expect(measured.cells[2].elementUploadCalls).toBeGreaterThan(
-    measured.cells[1].elementUploadCalls
-  );
-  expect(measured.refusedBeyondCeiling).toMatch(/exceeds the viewer ceiling/);
+  // Culling draws node ranges of the stored order, so no view count uploads
+  // an element buffer while the camera moves.
+  for (const cell of measured.cells) {
+    expect(cell.elementUploadCalls).toBe(0);
+    expect(cell.syncStallCalls).toBe(0);
+  }
+  expect(measured.beyondFour).toEqual({ viewCount: 5, layoutMode: 'grid' });
   expect(browserErrors).toEqual([]);
 });
 

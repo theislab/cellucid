@@ -14,8 +14,9 @@
  * should extend this class and implement the abstract methods.
  *
  * REQUIREMENTS SYSTEM:
- * - Subclasses can define static getRequirements() to specify page constraints
- * - Use validatePageRequirements() to check if requirements are met
+ * - Subclasses can define static getRequirements() to specify page and data
+ *   constraints
+ * - Use validateRequirements() to check if requirements are met
  * - Use getRequirementText() to get human-readable requirement description
  *
  * @example
@@ -37,6 +38,8 @@
  * }
  */
 
+import { createStatusLine } from '../../ui/components/controls.js';
+import { createVisibilityGatedRender } from '../../ui/core/visibility-gate.js';
 import { getNotificationCenter } from '../../notification-center.js';
 import {
   validatePageRequirements,
@@ -44,7 +47,6 @@ import {
   pageDataToCSV,
   downloadCSV
 } from '../shared/analysis-utils.js';
-import { formatCount } from '../shared/formatting.js';
 import { selectablePageIdSet } from '../shared/page-derivation-utils.js';
 import { createAnalysisModal, openModal, closeModal } from './components/modal.js';
 import { createControlScope } from './components/control-accessibility.js';
@@ -149,6 +151,24 @@ function requireMatchingPages(selectedPages, configPages) {
   }
 }
 
+/**
+ * Outstanding busy claims per region. A region can be owned by more than one
+ * render at once (a sidebar preview and the expanded view of the same result,
+ * or a superseded run that has not unwound yet), so `aria-busy` is published
+ * from a count rather than by whichever owner wrote last.
+ *
+ * @type {WeakMap<Element, number>}
+ */
+const busyClaimCounts = new WeakMap();
+
+function publishBusyClaims(region) {
+  if ((busyClaimCounts.get(region) ?? 0) > 0) {
+    region.setAttribute('aria-busy', 'true');
+  } else {
+    region.removeAttribute('aria-busy');
+  }
+}
+
 function combineLifecycleErrors(errors, message) {
   const present = [...new Set(errors.filter(Boolean))];
   if (present.length === 0) return null;
@@ -229,6 +249,14 @@ export class BaseAnalysisUI {
     this._interactiveTasks = new Set();
     this._interactiveFailures = [];
     this._baseDestroyPromise = null;
+
+    // Release functions for level-triggered `_setBusy()` claims, per region.
+    this._busyReleases = new Map();
+
+    // Highlight changes run through a visibility gate: while the panel's
+    // section or window is collapsed, or the sidebar is hidden, the change is
+    // recorded and applied once when the panel is shown again.
+    this._highlightGate = null;
   }
 
   // ===========================================================================
@@ -238,21 +266,41 @@ export class BaseAnalysisUI {
   /**
    * Get page requirements for this analysis type (override in subclass)
    * @static
-   * @returns {{ minPages?: number, maxPages?: number, description?: string }|null}
+   * @returns {{ minPages?: number, maxPages?: number, description?: string, geneExpression?: boolean }|null}
    */
   static getRequirements() {
     return null; // No requirements by default
   }
 
   /**
-   * Validate page requirements against current selection
+   * Validate this analysis type's requirements: the data it is built on, then
+   * the current page selection.
    * @param {string[]} pageIds - Page IDs to validate
    * @returns {{ valid: boolean, error?: string }}
    */
-  validatePages(pageIds) {
+  validateRequirements(pageIds) {
+    const data = this.validateDataRequirements();
+    if (!data.valid) return data;
     const requirements = this.constructor.getRequirements();
     if (!requirements) return { valid: true };
     return validatePageRequirements(pageIds, requirements);
+  }
+
+  /**
+   * Validate the data this analysis type is built on, whatever the pages.
+   * None publishes no genes, and a dataset may be exported without them; a
+   * mode built on gene expression then has no form to offer or copy.
+   * @returns {{ valid: boolean, error?: string }}
+   */
+  validateDataRequirements() {
+    const requirements = this.constructor.getRequirements();
+    if (
+      requirements?.geneExpression === true &&
+      this.dataLayer.getAvailableVariables('gene_expression').length === 0
+    ) {
+      return { valid: false, error: 'Requires gene expression data.' };
+    }
+    return { valid: true };
   }
 
   /**
@@ -266,11 +314,11 @@ export class BaseAnalysisUI {
   }
 
   /**
-   * Check if current page selection meets requirements
+   * Check if this analysis type's requirements are met
    * @returns {boolean}
    */
-  meetsPageRequirements() {
-    return this.validatePages(this._selectedPages).valid;
+  meetsRequirements() {
+    return this.validateRequirements(this._selectedPages).valid;
   }
 
   // ===========================================================================
@@ -304,6 +352,11 @@ export class BaseAnalysisUI {
   init(container) {
     this._isDestroyed = false;
     this._container = container;
+    this._highlightGate?.destroy();
+    this._highlightGate = createVisibilityGatedRender(
+      container,
+      () => this._applyHighlightChange()
+    );
     this._render();
 
     if (this._selectedPages.length === 0) {
@@ -489,6 +542,28 @@ export class BaseAnalysisUI {
    * Update when highlights change (cells added/removed from pages)
    */
   onHighlightChanged() {
+    this._applyHighlightChangeWhenShown();
+  }
+
+  /**
+   * Apply a highlight change now if the panel is shown; otherwise record it.
+   * Recounting and re-running for a panel nobody can see is deferred until it
+   * is shown (see `onVisibilityChanged`).
+   * @protected
+   */
+  _applyHighlightChangeWhenShown() {
+    if (this._highlightGate === null) {
+      this._applyHighlightChange();
+      return;
+    }
+    this._highlightGate.request();
+  }
+
+  /**
+   * Bring a shown panel up to date with the current highlights.
+   * @protected
+   */
+  _applyHighlightChange() {
     this._updatePageSelectorCounts();
 
     if (this._selectedPages.length > 0 && this._currentConfig.dataSource.variable) {
@@ -513,22 +588,11 @@ export class BaseAnalysisUI {
   }
 
   /**
-   * Update page selector counts (override for custom implementation)
+   * Update the page selector's cell counts in place. A UI without a page
+   * selector component has no counts to update.
    */
   _updatePageSelectorCounts() {
-    if (!this._controlsContainer) return;
-
-    const pageTabs = this._controlsContainer.querySelectorAll('.analysis-page-tab');
-    pageTabs.forEach(tab => {
-      const pageId = tab.dataset.pageId;
-      if (pageId) {
-        const countSpan = tab.querySelector('.analysis-page-count');
-        if (countSpan) {
-          const cellCount = this.dataLayer.getCellIndicesForPage(pageId).length;
-          countSpan.textContent = cellCount > 0 ? formatCount(cellCount) : '(0)';
-        }
-      }
-    });
+    this._pageSelector?.updateCounts();
   }
 
   // ===========================================================================
@@ -597,7 +661,7 @@ export class BaseAnalysisUI {
             `${context} failed: ${
               error instanceof Error ? error.message : String(error)
             }`,
-            { category: 'analysis', title: 'Analysis Error' }
+            { category: 'analysis', title: 'Analysis error' }
           );
         } catch (reportingError) {
           this._interactiveFailures ??= [];
@@ -790,17 +854,91 @@ export class BaseAnalysisUI {
       this._previewContainer.classList.remove('loading');
     }
     if (this._actionsContainer) {
-      this._actionsContainer.style.display = 'none';
+      this._actionsContainer.hidden = true;
+    }
+  }
+
+  // ===========================================================================
+  // Busy Signal
+  // ===========================================================================
+
+  /**
+   * Claim that `region` is pending replacement until the returned release
+   * function is called.
+   *
+   * Analysis content fills in after debounces, Plotly loading, data fetches
+   * and asynchronous renders, so a region can change well after it appears.
+   * `aria-busy` tells assistive technology -- and anything waiting for the
+   * region to settle -- that it is still changing. Claims are counted, so a
+   * superseded render that unwinds late cannot clear the busy state a newer
+   * render still owns. Releasing twice is a no-op.
+   *
+   * @param {Element|null} [region]
+   * @returns {() => void}
+   * @protected
+   */
+  _claimBusy(region = this._container) {
+    if (region === null || region === undefined) return () => {};
+    if (
+      typeof region.setAttribute !== 'function' ||
+      typeof region.removeAttribute !== 'function'
+    ) {
+      throw new TypeError('Analysis busy region must be an element');
+    }
+    busyClaimCounts.set(region, (busyClaimCounts.get(region) ?? 0) + 1);
+    publishBusyClaims(region);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const remaining = (busyClaimCounts.get(region) ?? 1) - 1;
+      if (remaining > 0) busyClaimCounts.set(region, remaining);
+      else busyClaimCounts.delete(region);
+      publishBusyClaims(region);
+    };
+  }
+
+  /**
+   * Hold one busy claim on `region` for exactly the duration of `run`.
+   *
+   * @template T
+   * @param {Element|null} region
+   * @param {() => Promise<T>|T} run
+   * @returns {Promise<T>}
+   * @protected
+   */
+  async _whileBusy(region, run) {
+    const release = this._claimBusy(region);
+    try {
+      return await run();
+    } finally {
+      release();
     }
   }
 
   /**
-   * Show loading state in preview
+   * Level-triggered form of `_claimBusy()` for owners whose loading and
+   * settled states are separate calls: at most one claim per region is held
+   * on this UI's behalf, taken by `_setBusy(true)` and released by
+   * `_setBusy(false)`.
+   *
+   * @param {boolean} busy
+   * @param {Element|null} [region]
+   * @protected
    */
-  _showLoading() {
-    if (this._previewContainer) {
-      this._previewContainer.classList.remove('empty');
-      this._previewContainer.classList.add('loading');
+  _setBusy(busy, region = this._container) {
+    if (region === null || region === undefined) return;
+    this._busyReleases ??= new Map();
+    const release = this._busyReleases.get(region);
+    if (busy) {
+      if (release === undefined) {
+        this._busyReleases.set(region, this._claimBusy(region));
+      }
+      return;
+    }
+    if (release !== undefined) {
+      this._busyReleases.delete(region);
+      release();
     }
   }
 
@@ -813,16 +951,15 @@ export class BaseAnalysisUI {
       this._previewContainer.classList.remove('loading');
       this._previewContainer.classList.add('empty');
       this._previewContainer.textContent = '';
-      const errorEl = document.createElement('div');
-      errorEl.className = 'analysis-error';
-      errorEl.textContent = message ?? '';
-      this._previewContainer.appendChild(errorEl);
+      this._previewContainer.appendChild(
+        createStatusLine({ tone: 'danger', text: message ?? '' }).root
+      );
     }
     if (this._actionsContainer) {
-      this._actionsContainer.style.display = 'none';
+      this._actionsContainer.hidden = true;
     }
 
-    this._notifications.error(message, { category: 'data', title: 'Analysis Error' });
+    this._notifications.error(message, { category: 'data', title: 'Analysis error' });
   }
 
   // ===========================================================================
@@ -1005,6 +1142,8 @@ export class BaseAnalysisUI {
 
     const errors = [];
     this._isDestroyed = true;
+    this._highlightGate?.destroy();
+    this._highlightGate = null;
     try {
       this._invalidateAnalysisRequest();
     } catch (error) {
@@ -1070,16 +1209,3 @@ export class BaseAnalysisUI {
     return destroyTask;
   }
 }
-
-/**
- * Factory function to create analysis UI instance
- * @param {Function} UIClass - UI class constructor
- * @param {Object} options - Options for the UI
- * @returns {Object} UI instance
- */
-export function createAnalysisUI(UIClass, options) {
-  const ui = new UIClass(options);
-  return ui;
-}
-
-export default BaseAnalysisUI;

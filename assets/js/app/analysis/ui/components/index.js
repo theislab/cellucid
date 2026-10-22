@@ -17,12 +17,7 @@
 // SELECTORS
 // =============================================================================
 
-export {
-  createVariableSelector,
-  createGeneExpressionSelector,
-  createPageComparisonSelector,
-  createPlotTypeSelector
-} from './selectors.js';
+export { createPageComparisonSelector, createPlotTypeSelector } from './selectors.js';
 
 // PlotRegistry should be imported from '../shared/plot-registry-utils.js'
 
@@ -40,24 +35,14 @@ export {
 // EXPORT COMPONENTS
 // =============================================================================
 
-export {
-  createExportToolbar,
-  createExpandButton
-} from './export.js';
-
-// =============================================================================
-// MULTI-SELECT DROPDOWN
-// =============================================================================
-
-export {
-  createMultiSelectDropdown
-} from './multi-select-dropdown.js';
+export { createExpandButton } from './export.js';
 
 // =============================================================================
 // STATS DISPLAY
 // =============================================================================
 
 export {
+  preparePageStatistics,
   renderSummaryStats,
   renderStatisticalAnnotations
 } from './stats-display.js';
@@ -69,23 +54,3 @@ export {
 export {
   renderPlotOptions
 } from './options.js';
-
-// =============================================================================
-// DEFAULT EXPORT
-// =============================================================================
-
-import selectorsModule from './selectors.js';
-import modalModule from './modal.js';
-import exportModule from './export.js';
-import multiSelectDropdownModule from './multi-select-dropdown.js';
-import statsDisplayModule from './stats-display.js';
-import optionsModule from './options.js';
-
-export default {
-  ...selectorsModule,
-  ...modalModule,
-  ...exportModule,
-  ...multiSelectDropdownModule,
-  ...statsDisplayModule,
-  ...optionsModule
-};

@@ -106,7 +106,7 @@ const heatmapDefinition = {
       colorbar: {
         thickness: 12, len: 0.8,
         tickfont: { family: theme.fontFamily, size: 9, color: theme.textMuted },
-        title: { text: normalize === 'none' ? 'Count' : '%', font: { family: 'Oswald, system-ui, sans-serif', size: 10, color: theme.text } }
+        title: { text: normalize === 'none' ? 'Count' : '%', font: { family: theme.fontFamily, size: 10, color: theme.text } }
       },
       hovertemplate: '%{y}<br>%{x}: %{z:.1f}<extra></extra>',
       hoverlabel: COMMON_HOVER_STYLE

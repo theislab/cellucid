@@ -13,11 +13,9 @@
  * @module ui/modules/dataset-controls
  */
 
-import {
-  formatCellCount as formatDataNumber,
-  validateDatasetIdentity
-} from '../../../data/data-source.js';
-import { DATA_LOAD_METHODS } from '../../../analytics/tracker.js';
+import { validateDatasetIdentity } from '../../../data/data-source.js';
+import { formatCompactCount } from '../components/display-format.js';
+import { DATA_LOAD_METHODS } from '../../data-load-methods.js';
 import { debug } from '../../../utils/debug.js';
 import { isDatasetReloadSupersededError } from '../../dataset-reload-outcome.js';
 import {
@@ -30,6 +28,10 @@ import {
 export const NONE_DATASET_VALUE = '__none__';
 
 const LOADING_DATASET_VALUE = '__catalog_loading__';
+// Stands in the select for a choice that has no catalog option yet — a file
+// being read, a connection opening its only dataset, the startup selection
+// before the catalog is listed — so the select always shows what is loading.
+const PENDING_DATASET_VALUE = '__dataset_pending__';
 const EMPTY_CATALOG_VALUE = '__catalog_empty__';
 const CATALOG_ERROR_VALUE = '__catalog_error__';
 const CATALOG_RETRY_LABEL = 'Try again';
@@ -58,6 +60,7 @@ const DATASET_CONTROL_KEYS = [
   'callbacks',
   'clearDataset',
   'dataSourceManager',
+  'datasetChanges',
   'dom',
   'reloadDataset'
 ];
@@ -68,7 +71,7 @@ const DATASET_CALLBACK_KEYS = [
   'renderDeletedFieldsSection',
   'renderFieldSelects',
   'showSessionStatus',
-  'updateDimensionSelectUI'
+  'renderRepresentationPicker'
 ];
 const DATASET_EVENT_KEYS = [
   'baseUrl',
@@ -281,6 +284,7 @@ export function initDatasetControls(options) {
   const {
     dom,
     dataSourceManager,
+    datasetChanges,
     clearDataset,
     reloadDataset,
     callbacks
@@ -299,6 +303,19 @@ export function initDatasetControls(options) {
   }
   if (typeof clearDataset !== 'function') {
     throw new TypeError('Dataset controls clearDataset must be a function.');
+  }
+  if (
+    datasetChanges === null ||
+    typeof datasetChanges !== 'object' ||
+    typeof datasetChanges.begin !== 'function' ||
+    typeof datasetChanges.beginIfNoActionSince !== 'function' ||
+    typeof datasetChanges.whenSettled !== 'function' ||
+    typeof datasetChanges.settled !== 'boolean' ||
+    !Number.isSafeInteger(datasetChanges.actionSequence)
+  ) {
+    throw new TypeError(
+      'Dataset controls require the dataset-change coordinator.'
+    );
   }
   for (const method of [
     'getAllDatasets',
@@ -319,7 +336,7 @@ export function initDatasetControls(options) {
     initGeneExpressionDropdown,
     clearGeneSelection,
     refreshUIForActiveView,
-    updateDimensionSelectUI,
+    renderRepresentationPicker,
     showSessionStatus
   } = callbacks;
 
@@ -381,8 +398,10 @@ export function initDatasetControls(options) {
   const activeWork = new Set();
   let noneDatasetOption = null;
   let catalogGeneration = 0;
-  let datasetSelectionIntentGeneration = 0;
+  // The dataset choice these controls are presenting: the newest change the
+  // user made here, while it loads. Null once it has settled.
   let activeDatasetSelectionIntent = null;
+  let pendingDatasetOption = null;
   let datasetConnections = null;
   let catalogRetryInFlight = false;
   // The operation the visible notice offers to repeat, or null when nothing
@@ -418,20 +437,128 @@ export function initDatasetControls(options) {
     return !destroyed && generation === catalogGeneration;
   }
 
-  function beginDatasetSelectionIntent() {
+  /**
+   * Begin one dataset change for a choice the user just made. The
+   * transaction is begun before any of the choice's own work, so the load in
+   * flight — whoever started it — is aborted at once and can neither keep
+   * fetching nor publish late over this choice. `pending` says what the select
+   * shows while it loads: the catalog option it names, or a stand-in carrying
+   * its label.
+   *
+   * @param {{value: string|null, label: string}} pending
+   */
+  function beginDatasetSelectionIntent(pending) {
     assertAlive();
-    datasetSelectionIntentGeneration =
-      datasetSelectionIntentGeneration === Number.MAX_SAFE_INTEGER
-        ? 1
-        : datasetSelectionIntentGeneration + 1;
-    activeDatasetSelectionIntent = Object.freeze({
-      generation: datasetSelectionIntentGeneration
-    });
-    return activeDatasetSelectionIntent;
+    return adoptDatasetSelectionIntent(datasetChanges.begin(), pending);
   }
 
+  /**
+   * Begin the change only if the user did nothing that decides the dataset
+   * since `sequence` was read: a connection that turns out to hold one
+   * dataset replaces the loads that were running when the user clicked
+   * Connect, but never a choice made or a session applied after that.
+   */
+  function beginDatasetSelectionIntentIfNoActionSince(sequence, pending) {
+    assertAlive();
+    const transaction = datasetChanges.beginIfNoActionSince(sequence);
+    return transaction === null
+      ? null
+      : adoptDatasetSelectionIntent(transaction, pending);
+  }
+
+  function adoptDatasetSelectionIntent(transaction, pending) {
+    requirePendingSelection(pending);
+    const intent = Object.freeze({ pending, transaction });
+    activeDatasetSelectionIntent = intent;
+    presentPendingSelection();
+    return intent;
+  }
+
+  function requirePendingSelection(pending) {
+    requireExactKeys(pending, ['label', 'value'], 'Pending dataset selection');
+    if (pending.value !== null) {
+      requireNonEmptyString(pending.value, 'Pending dataset selection value');
+    }
+    requireNonEmptyString(pending.label, 'Pending dataset selection label');
+  }
+
+  /**
+   * True while `owner` is the newest dataset change of all — not only of the
+   * ones made here: the benchmark and startup begin theirs in the bootstrap.
+   */
   function ownsDatasetSelectionIntent(owner) {
-    return !destroyed && owner === activeDatasetSelectionIntent;
+    return (
+      !destroyed &&
+      owner === activeDatasetSelectionIntent &&
+      owner.transaction.isLatest()
+    );
+  }
+
+  function removePendingDatasetOption() {
+    if (pendingDatasetOption === null) return false;
+    const shown = pendingDatasetOption.selected;
+    pendingDatasetOption.remove();
+    pendingDatasetOption = null;
+    return shown;
+  }
+
+  function catalogIsPopulating() {
+    return datasetSelect.value === LOADING_DATASET_VALUE;
+  }
+
+  /**
+   * Show the active intent's choice in the select while it loads. A listing
+   * still in progress presents it when it finishes.
+   */
+  function presentPendingSelection() {
+    const intent = activeDatasetSelectionIntent;
+    if (destroyed || intent === null || catalogIsPopulating()) return;
+    removePendingDatasetOption();
+    const option = intent.pending.value === null
+      ? undefined
+      : intent.pending.value === NONE_DATASET_VALUE
+        ? ensureNoneDatasetOption()
+        : datasetOptionsByKey.get(intent.pending.value);
+    if (option !== undefined) {
+      datasetSelect.value = option.value;
+    } else {
+      pendingDatasetOption = ownerDocument.createElement('option');
+      pendingDatasetOption.value = PENDING_DATASET_VALUE;
+      pendingDatasetOption.disabled = true;
+      pendingDatasetOption.textContent = intent.pending.label;
+      datasetSelect.appendChild(pendingDatasetOption);
+      pendingDatasetOption.selected = true;
+    }
+    datasetInfo.classList.remove('error');
+    datasetInfo.classList.add('loading');
+  }
+
+  /**
+   * End one intent. Its transaction no longer holds back a session waiting
+   * for the dataset, and when nothing newer took its place the select stops
+   * showing it. An intent overtaken by a change made outside these controls
+   * (the benchmark) has to put the select back itself: nothing else will.
+   */
+  function settleDatasetSelectionIntent(intent) {
+    intent.transaction.finish();
+    if (destroyed || activeDatasetSelectionIntent !== intent) return;
+    activeDatasetSelectionIntent = null;
+    const pendingWasShown = removePendingDatasetOption();
+    if (catalogIsPopulating()) return;
+    if (!intent.transaction.isLatest()) {
+      synchronizeDatasetSelectToCurrent();
+      datasetInfo.classList.remove('loading');
+    } else if (pendingWasShown) {
+      synchronizeDatasetSelectToCurrent();
+    }
+  }
+
+  async function runDatasetSelectionIntent(intent, operation) {
+    try {
+      return await operation(intent);
+    } finally {
+      settleDatasetSelectionIntent(intent);
+    }
   }
 
   function createNoneDatasetOption() {
@@ -465,7 +592,7 @@ export function initDatasetControls(options) {
     // without the cell count the dropdown appends.
     option.dataset.datasetName = metadata.name;
     option.textContent =
-      `${metadata.name} (${formatDataNumber(metadata.stats.n_cells)} cells)`;
+      `${metadata.name} (${formatCompactCount(metadata.stats.n_cells)} cells)`;
     datasetOptionsByKey.set(value, option);
     return option;
   }
@@ -486,14 +613,14 @@ export function initDatasetControls(options) {
   // sees them, so the notice speaks only for genuine failures and an
   // unconfigured source stays silent.
   //
-  // refreshAll()'s own per-source outcomes are deliberately not surfaced here:
-  // an unconnected GitHub source rejects refresh() while reporting itself
-  // unavailable to a probe, so reporting refresh outcomes would accuse a
-  // source the user never asked for. The probe result is the only authority.
+  // On a reload the manager also reports a source whose refresh() failed on
+  // that source's entry, so "Dataset list reloaded" is never shown for a
+  // reload that did not happen. An unconfigured source has nothing to
+  // refresh and resolves, so it stays silent here too.
   const catalogNoticeMessageEl = ownerDocument.createElement('div');
   const catalogRetryButton = ownerDocument.createElement('button');
   catalogRetryButton.type = 'button';
-  catalogRetryButton.classList.add('reset-btn', 'mt-1');
+  catalogRetryButton.classList.add('btn', 'mt-1');
   catalogRetryButton.textContent = CATALOG_RETRY_LABEL;
   const catalogNotice = ownerDocument.createElement('div');
   catalogNotice.classList.add('dataset-info');
@@ -667,16 +794,40 @@ function updateDatasetInfo(metadata, sourceTypeOverride = null) {
   const url = metadata.source?.url ?? '—';
   datasetUrlEl.textContent = url;
   datasetUrlEl.title = url;
-  datasetCellsEl.textContent = formatDataNumber(stats.n_cells);
-  datasetGenesEl.textContent = formatDataNumber(stats.n_genes);
-  datasetObsEl.textContent = formatDataNumber(stats.n_obs_fields);
-  if (stats.has_connectivity) {
-    datasetConnectivityEl.textContent =
-      `${formatDataNumber(stats.n_edges)} edges`;
-  } else {
-    datasetConnectivityEl.textContent = 'None';
-  }
+  datasetCellsEl.textContent = formatCompactCount(stats.n_cells);
+  datasetGenesEl.textContent = formatCompactCount(stats.n_genes);
+  datasetObsEl.textContent = formatCompactCount(stats.n_obs_fields);
+  showConnectivityEdges(stats.has_connectivity ? stats.n_edges : null);
   datasetInfo.classList.remove('loading', 'error');
+}
+
+/**
+ * Show the edge count of the neighbour graph in use, or None.
+ * @param {number|null} edges
+ */
+function showConnectivityEdges(edges) {
+  datasetConnectivityEl.textContent = edges === null
+    ? 'None'
+    : `${formatCompactCount(edges)} edges`;
+}
+
+/**
+ * Show the facts a data-mapping change can alter: the dataset's own facts
+ * describe the mapping it opened with, and the neighbour graph and gene list
+ * in use are whichever the mapping names now.
+ *
+ * @param {{connectivityEdges: number|null, genes: number}} facts
+ */
+function updateMappedDatasetFacts({ connectivityEdges, genes }) {
+  assertAlive();
+  if (connectivityEdges !== null && !(Number.isSafeInteger(connectivityEdges) && connectivityEdges >= 0)) {
+    throw new TypeError('Connectivity edge count must be null or a non-negative integer.');
+  }
+  if (!Number.isSafeInteger(genes) || genes < 0) {
+    throw new TypeError('Gene count must be a non-negative integer.');
+  }
+  showConnectivityEdges(connectivityEdges);
+  datasetGenesEl.textContent = formatCompactCount(genes);
 }
 
 /**
@@ -697,8 +848,8 @@ function refreshDatasetUI(metadata) {
     ? null
     : dataSourceManager.getCurrentSourceType();
   updateDatasetInfo(currentMetadata, currentSourceType);
-  // Update dimension dropdown when dataset changes (different datasets may have different available dimensions)
-  updateDimensionSelectUI();
+  // A new dataset enables its own representations.
+  renderRepresentationPicker();
 }
 
 /**
@@ -789,6 +940,7 @@ async function populateDatasetDropdown(options = {}) {
       datasetSelect.value = NONE_DATASET_VALUE;
       datasetSelect.disabled = false;
       updateDatasetInfo(null);
+      presentPendingSelection();
       return Object.freeze({ status: 'ready' });
     }
 
@@ -872,6 +1024,9 @@ async function populateDatasetDropdown(options = {}) {
       updateDatasetInfo(null);
     }
     datasetSelect.disabled = false;
+    // A choice still loading is what the select shows, not the dataset it is
+    // about to replace.
+    presentPendingSelection();
     return Object.freeze({ status: 'ready' });
   } catch (error) {
     if (!ownsCatalogGeneration(generation)) {
@@ -911,14 +1066,20 @@ async function populateDatasetDropdown(options = {}) {
 async function handleDatasetChangeForIntent(
   datasetId,
   sourceType,
-  loadMethod = DATA_LOAD_METHODS.DATASET_DROPDOWN,
-  sourceOverride = null,
-  intentOwner
+  loadMethod,
+  sourceOverride,
+  intentOwner,
+  { startup = false } = {}
 ) {
   requireNonEmptyString(datasetId, 'Selected dataset id');
   requireNonEmptyString(sourceType, 'Selected dataset source type');
+  requireNonEmptyString(loadMethod, 'Selected dataset load method');
+  if (typeof startup !== 'boolean') {
+    throw new TypeError('Dataset change startup must be a boolean.');
+  }
 
-  // Check if this is already the current dataset
+  // Choosing the dataset already on screen ends whatever load was replacing
+  // it: this intent's transaction has already superseded that load.
   const currentId = dataSourceManager.getCurrentDatasetId();
   const currentSourceType = dataSourceManager.getCurrentSourceType();
   if (currentId === datasetId && currentSourceType === sourceType) {
@@ -936,7 +1097,9 @@ async function handleDatasetChangeForIntent(
     datasetCellsEl.textContent = '…';
     datasetGenesEl.textContent = '…';
 
-    showSessionStatus('Switching dataset...', false);
+    // Startup's own progress is the positions notification; a status toast
+    // announcing a switch nobody asked for would be noise.
+    if (!startup) showSessionStatus('Switching dataset...', false);
 
     const source = sourceOverride ?? dataSourceManager.getSource(sourceType);
     if (source === null) {
@@ -948,7 +1111,9 @@ async function handleDatasetChangeForIntent(
         datasetId,
         loadMethod,
         source,
-        sourceType
+        sourceType,
+        startup,
+        transaction: intentOwner.transaction
       }));
     if (!ownsDatasetSelectionIntent(intentOwner)) {
       return ready === true;
@@ -985,7 +1150,7 @@ async function handleDatasetChangeForIntent(
     datasetInfo.classList.remove('loading', 'error');
     // A dataset is on screen, so no earlier failure is still true.
     clearCatalogNotice();
-    showSessionStatus('Dataset loaded', false);
+    if (!startup) showSessionStatus('Dataset loaded', false);
     return true;
   } catch (error) {
     if (isDatasetReloadSupersededError(error)) {
@@ -996,6 +1161,9 @@ async function handleDatasetChangeForIntent(
     }
     const exactError = errorFromUnknown(error, 'Dataset switch');
     datasetInfo.classList.remove('loading');
+    // A startup selection that fails is the terminal startup failure, which
+    // owns the whole explanation.
+    if (startup) throw exactError;
     datasetInfo.classList.add('error');
     const activeMetadata = dataSourceManager.getCurrentMetadata();
     const activeSourceType = dataSourceManager.getCurrentSourceType();
@@ -1068,24 +1236,94 @@ function datasetDisplayName(sourceType, datasetId) {
 async function handleDatasetChange(
   datasetId,
   sourceType,
-  loadMethod = DATA_LOAD_METHODS.DATASET_DROPDOWN,
-  sourceOverride = null
+  loadMethod = DATA_LOAD_METHODS.DATASET_DROPDOWN
 ) {
   requireNonEmptyString(datasetId, 'Selected dataset id');
   requireNonEmptyString(sourceType, 'Selected dataset source type');
-  if (
-    dataSourceManager.getCurrentDatasetId() === datasetId &&
-    dataSourceManager.getCurrentSourceType() === sourceType
-  ) {
-    return true;
-  }
-  return await handleDatasetChangeForIntent(
+  const intent = beginDatasetSelectionIntent({
+    label: `Loading ${datasetDisplayName(sourceType, datasetId)}…`,
+    value: datasetSelectionValue(sourceType, datasetId)
+  });
+  return await runDatasetSelectionIntent(intent, owner =>
+    handleDatasetChangeForIntent(
+      datasetId,
+      sourceType,
+      loadMethod,
+      null,
+      owner
+    )
+  );
+}
+
+/**
+ * Activate one dataset for an intent the caller already began — a local file
+ * that has been read, a connection that holds one dataset. The caller owns
+ * the intent's settlement and hears a superseded activation as its own
+ * superseded error.
+ */
+function activateDatasetForIntent(
+  intent,
+  datasetId,
+  sourceType,
+  loadMethod,
+  source
+) {
+  return handleDatasetChangeForIntent(
     datasetId,
     sourceType,
     loadMethod,
-    sourceOverride,
-    beginDatasetSelectionIntent()
+    source,
+    intent
   );
+}
+
+/**
+ * Load the startup selection as the first ordinary dataset change, so the
+ * select shows it while it loads and any choice the user makes meanwhile
+ * replaces it.
+ *
+ * @param {{datasetId: string, loadMethod: string, sourceType: string}} selection
+ * @returns {Promise<'ready'|'superseded'>} Rejects with the load's own error
+ *   when it fails and nothing superseded it.
+ */
+async function loadStartupDataset(selection) {
+  requireExactKeys(
+    selection,
+    ['datasetId', 'loadMethod', 'sourceType'],
+    'Startup dataset selection'
+  );
+  const { datasetId, loadMethod, sourceType } = selection;
+  const intent = beginDatasetSelectionIntent({
+    label: `Loading ${datasetDisplayName(sourceType, datasetId)}…`,
+    value: datasetSelectionValue(sourceType, datasetId)
+  });
+  return await runDatasetSelectionIntent(intent, async owner => {
+    try {
+      const ready = await handleDatasetChangeForIntent(
+        datasetId,
+        sourceType,
+        loadMethod,
+        null,
+        owner,
+        { startup: true }
+      );
+      if (!ownsDatasetSelectionIntent(owner)) return 'superseded';
+      if (ready !== true) {
+        throw new Error(
+          'Startup dataset activation did not publish one ready generation.'
+        );
+      }
+      return 'ready';
+    } catch (error) {
+      if (
+        isDatasetReloadSupersededError(error) ||
+        !ownsDatasetSelectionIntent(owner)
+      ) {
+        return 'superseded';
+      }
+      throw error;
+    }
+  });
 }
 
 /**
@@ -1099,7 +1337,7 @@ async function handleNoneDatasetSelectionForIntent(intentOwner) {
     datasetInfo.classList.add('loading');
     showSessionStatus('Clearing dataset...', false);
 
-    const cleared = await trackWork(clearDataset());
+    const cleared = await trackWork(clearDataset(intentOwner.transaction));
     if (!ownsDatasetSelectionIntent(intentOwner)) {
       return cleared === true;
     }
@@ -1152,9 +1390,14 @@ async function handleNoneDatasetSelectionForIntent(intentOwner) {
   }
 }
 
-function handleNoneDatasetSelection() {
-  return handleNoneDatasetSelectionForIntent(
-    beginDatasetSelectionIntent()
+async function handleNoneDatasetSelection() {
+  const intent = beginDatasetSelectionIntent({
+    label: 'None',
+    value: NONE_DATASET_VALUE
+  });
+  return await runDatasetSelectionIntent(
+    intent,
+    handleNoneDatasetSelectionForIntent
   );
 }
 
@@ -1257,7 +1500,19 @@ function synchronizeTerminalDatasetSelectionFailure() {
 }
 
 async function handleDatasetSelectEvent(event) {
-  const intentOwner = beginDatasetSelectionIntent();
+  // The option the user picked is already showing, so it is what the select
+  // presents while it loads.
+  const intentOwner = beginDatasetSelectionIntent({
+    label: 'Loading…',
+    value: datasetSelect.value
+  });
+  return await runDatasetSelectionIntent(
+    intentOwner,
+    () => handleDatasetSelectEventForIntent(event, intentOwner)
+  );
+}
+
+async function handleDatasetSelectEventForIntent(event, intentOwner) {
   try {
     if (
       event === null ||
@@ -1401,8 +1656,18 @@ async function handleDatasetSelectEvent(event) {
     { signal: lifecycleController.signal }
   );
   datasetConnections = initDatasetConnections({
-    activateDataset: (...args) =>
-      invokeTracked(() => handleDatasetChange(...args)),
+    datasetIntents: Object.freeze({
+      activate: (intent, ...args) =>
+        invokeTracked(() => activateDatasetForIntent(intent, ...args)),
+      begin: pending => beginDatasetSelectionIntent(pending),
+      beginIfNoActionSince: (sequence, pending) =>
+        beginDatasetSelectionIntentIfNoActionSince(sequence, pending),
+      actionSequence: () => datasetChanges.actionSequence,
+      owns: intent => ownsDatasetSelectionIntent(intent),
+      settle: intent => settleDatasetSelectionIntent(intent),
+      settled: () => datasetChanges.settled,
+      whenSettled: () => datasetChanges.whenSettled()
+    }),
     clearDataset: () =>
       invokeTracked(() => handleNoneDatasetSelection()),
     dom,
@@ -1419,10 +1684,6 @@ async function handleDatasetSelectEvent(event) {
       catalogGeneration === Number.MAX_SAFE_INTEGER
         ? 1
         : catalogGeneration + 1;
-    datasetSelectionIntentGeneration =
-      datasetSelectionIntentGeneration === Number.MAX_SAFE_INTEGER
-        ? 1
-        : datasetSelectionIntentGeneration + 1;
     activeDatasetSelectionIntent = null;
     catalogRetryInFlight = false;
     const cleanupErrors = [];
@@ -1476,9 +1737,12 @@ async function handleDatasetSelectEvent(event) {
     clearDataset: () =>
       invokeTracked(() => handleNoneDatasetSelection()),
     destroy,
+    loadStartupDataset: selection =>
+      invokeTracked(() => loadStartupDataset(selection)),
     populateDatasetDropdown: () =>
       invokeTracked(() => populateDatasetDropdown()),
     refreshDatasetUI,
+    updateMappedDatasetFacts,
     selectDataset: (...args) =>
       invokeTracked(() => handleDatasetChange(...args))
   };

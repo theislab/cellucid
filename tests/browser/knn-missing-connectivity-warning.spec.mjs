@@ -4,6 +4,7 @@ import { expect, test } from './helpers/test.mjs';
 
 import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
+import { openCollapsedPanels } from './helpers/panels.mjs';
 
 /**
  * A dataset either ships a neighbour graph or it does not, and that fact
@@ -71,11 +72,12 @@ const visibleMissingGraphToasts = page => page.locator(
 async function openPreparedDataset(page) {
   await page.goto(PREPARED_DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
+  await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
     'Current UI prepared fixture',
   );
   await expect(page.locator('#filter-count')).toHaveText(
-    'Showing all 120 points',
+    'Showing all 120 cells',
   );
   // The fixture ships no connectivity, which is why the controls stay hidden.
   await expect(page.locator('#connectivity-controls')).toBeHidden();
@@ -233,6 +235,7 @@ test(
 
     await page.reload({ waitUntil: 'domcontentloaded' });
     await dismissWelcome(page);
+    await openCollapsedPanels(page);
     await expect(page.locator('#dataset-name')).toHaveText(
       'Current UI prepared fixture',
     );

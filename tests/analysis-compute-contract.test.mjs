@@ -2,39 +2,25 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
-import * as analysisPublic from '../assets/js/app/analysis/index.js';
 import {
   BackendStatus,
   ComputeManager
 } from '../assets/js/app/analysis/compute/compute-manager.js';
-import { GPUCompute } from '../assets/js/app/analysis/compute/gpu-compute.js';
 import { executeOperation } from '../assets/js/app/analysis/compute/operation-handlers.js';
 import {
   CPU_CAPABLE_OPERATIONS,
-  GPU_CAPABLE_OPERATIONS,
   OperationType,
   WORKER_CAPABLE_OPERATIONS
 } from '../assets/js/app/analysis/compute/operations.js';
 import { WorkerPool } from '../assets/js/app/analysis/compute/worker-pool.js';
-import { QueryBuilder } from '../assets/js/app/analysis/data/query-builder.js';
-import { sampleLargeDataset } from '../assets/js/app/analysis/plots/plotly-loader.js';
 import { toCSV } from '../assets/js/app/analysis/shared/analysis-utils.js';
 
 const COMPUTE_ROOT = new URL('../assets/js/app/analysis/compute/', import.meta.url);
 
-function createInitializedManager({ gpu = true, worker = true } = {}) {
+function createInitializedManager({ worker = true } = {}) {
   const manager = new ComputeManager();
   manager._initialized = true;
-  manager._gpuStatus = gpu ? BackendStatus.AVAILABLE : BackendStatus.UNAVAILABLE;
   manager._workerStatus = worker ? BackendStatus.AVAILABLE : BackendStatus.UNAVAILABLE;
-  manager._gpuBackend = gpu
-    ? {
-        dispose() {},
-        getInfo() {
-          return { initialized: true };
-        }
-      }
-    : null;
   manager._workerBackend = worker
     ? {
         execute() {
@@ -42,6 +28,12 @@ function createInitializedManager({ gpu = true, worker = true } = {}) {
         },
         getStats() {
           return { poolSize: 1 };
+        },
+        getTerminalFailure() {
+          return null;
+        },
+        isTerminal() {
+          return false;
         },
         terminate() {}
       }
@@ -53,150 +45,6 @@ function withoutComputeMetadata(result) {
   const { _compute, ...scientificResult } = result;
   return scientificResult;
 }
-
-test('numeric mismatches are not advertised as GPU-capable operations', () => {
-  assert.equal(GPU_CAPABLE_OPERATIONS.size, 0);
-  assert.deepEqual(
-    [...WORKER_CAPABLE_OPERATIONS].sort(),
-    [...CPU_CAPABLE_OPERATIONS].sort()
-  );
-
-  const values = new Float32Array([1, 2, 3, 4]);
-  const cpuStats = executeOperation(OperationType.COMPUTE_STATS, { values });
-  const gpuUtility = new GPUCompute();
-  const gpuStats = gpuUtility.computeFullStatistics(values);
-
-  assert.notEqual(
-    cpuStats.q1,
-    gpuStats.q1,
-    'the pre-fix CPU and GPU quartile definitions must remain a visible reproduction'
-  );
-  assert.equal(GPU_CAPABLE_OPERATIONS.has(OperationType.COMPUTE_STATS), false);
-
-  const constant = new Float32Array([5, 5, 5, 5]);
-  const cpuHistogram = executeOperation(OperationType.COMPUTE_HISTOGRAM, {
-    values: constant,
-    bins: 4
-  });
-  const gpuHistogram = gpuUtility.computeHistogram(constant, 4);
-
-  assert.equal(cpuHistogram.total, 4);
-  assert.equal(gpuHistogram.validCount, 0);
-  assert.equal(GPU_CAPABLE_OPERATIONS.has(OperationType.COMPUTE_HISTOGRAM), false);
-});
-
-test('batch extraction preserves every legal prototype-named variable', () => {
-  const variableNames = Object.getOwnPropertyNames(Object.prototype);
-  const result = executeOperation(OperationType.BATCH_EXTRACT, {
-    cellIndices: [0],
-    variables: variableNames.map((key, index) => ({
-      key,
-      rawValues: Float32Array.of(index + 0.5),
-      isCategorical: false,
-    })),
-  });
-
-  assert.equal(Object.getPrototypeOf(result), Object.prototype);
-  assert.deepEqual(Object.keys(result), variableNames);
-  for (const [index, key] of variableNames.entries()) {
-    assert.equal(Object.hasOwn(result, key), true, key);
-    assert.deepEqual(result[key], {
-      values: [index + 0.5],
-      validCount: 1,
-      validIndices: [0],
-    });
-  }
-});
-
-test('cell filtering requires an own field and accepts every own prototype-named field', () => {
-  const fieldNames = Object.getOwnPropertyNames(Object.prototype);
-
-  for (const [index, field] of fieldNames.entries()) {
-    const condition = {
-      field,
-      operator: 'equals',
-      value: undefined,
-    };
-    const inheritedOnly = executeOperation(OperationType.FILTER_CELLS, {
-      cellIndices: [0],
-      conditions: [condition],
-      fieldsData: {},
-    });
-    assert.deepEqual(inheritedOnly.filtered, [], field);
-    const inheritedOnlyNegated = executeOperation(
-      OperationType.FILTER_CELLS,
-      {
-        cellIndices: [0],
-        conditions: [{ ...condition, negate: true }],
-        fieldsData: {},
-      },
-    );
-    assert.deepEqual(inheritedOnlyNegated.filtered, [], field);
-
-    const ownField = executeOperation(OperationType.FILTER_CELLS, {
-      cellIndices: [0],
-      conditions: [{
-        ...condition,
-        value: index,
-      }],
-      fieldsData: Object.fromEntries([[field, [index]]]),
-    });
-    assert.deepEqual(ownField.filtered, [0], field);
-  }
-});
-
-test('QueryBuilder null filtering requires own prototype-named fields', async () => {
-  const fieldNames = Object.getOwnPropertyNames(Object.prototype);
-
-  for (const [index, field] of fieldNames.entries()) {
-    const builder = new QueryBuilder(null);
-    builder.addCondition({
-      id: `prototype-field-${index}`,
-      field,
-      operator: 'is_null',
-    });
-
-    assert.deepEqual(await builder.execute([0], {}), [], field);
-    assert.deepEqual(
-      await builder.execute(
-        [0],
-        Object.fromEntries([[field, [null]]]),
-      ),
-      [0],
-      field,
-    );
-  }
-});
-
-test('QueryBuilder resolves exact field ownership once outside the cell loop', async () => {
-  const cellCount = 10_000;
-  const builder = new QueryBuilder(null);
-  builder.addCondition({
-    id: 'hoisted-own-field',
-    field: 'constructor',
-    operator: 'greater_equal',
-    value: 0,
-  });
-  let ownershipChecks = 0;
-  const fieldsData = new Proxy(
-    Object.fromEntries([
-      ['constructor', new Float32Array(cellCount)],
-    ]),
-    {
-      getOwnPropertyDescriptor(target, key) {
-        if (key === 'constructor') ownershipChecks++;
-        return Reflect.getOwnPropertyDescriptor(target, key);
-      },
-    },
-  );
-
-  const result = await builder.execute(
-    Array.from({ length: cellCount }, (_, index) => index),
-    fieldsData,
-  );
-  assert.equal(result.length, cellCount);
-  assert.equal(ownershipChecks, 1);
-});
 
 test('CSV conversion requires own headers and row cells for prototype-named columns', () => {
   const columns = Object.getOwnPropertyNames(Object.prototype);
@@ -236,56 +84,10 @@ test('CSV conversion requires own headers and row cells for prototype-named colu
   );
 });
 
-test('large-dataset sampling preserves every own prototype-named aligned array', () => {
-  const arrayNames = Object.getOwnPropertyNames(Object.prototype);
-  const additionalArrays = Object.fromEntries(
-    arrayNames.map((name, index) => [name, [index, index + 100]]),
-  );
-  const sampled = sampleLargeDataset([0, 1], [10, 11], additionalArrays, 1);
-
-  assert.equal(Object.getPrototypeOf(sampled), Object.prototype);
-  assert.deepEqual(
-    Object.keys(sampled),
-    [
-      'x',
-      'y',
-      ...arrayNames,
-      'sampled',
-      'originalCount',
-      'sampledCount',
-    ],
-  );
-  for (const [index, name] of arrayNames.entries()) {
-    assert.equal(Object.hasOwn(sampled, name), true, name);
-    assert.deepEqual(sampled[name], [index], name);
-  }
-});
-
-test('large-dataset sampling resolves auxiliary arrays once before its point loop', () => {
-  const cellCount = 10_000;
-  const values = new Float32Array(cellCount);
-  let valueReads = 0;
-  const additionalArrays = new Proxy({ constructor: values }, {
-    get(target, key, receiver) {
-      if (key === 'constructor') valueReads++;
-      return Reflect.get(target, key, receiver);
-    },
-  });
-
-  const sampled = sampleLargeDataset(
-    values,
-    values,
-    additionalArrays,
-    1_000,
-  );
-  assert.equal(sampled.constructor.length, 1_000);
-  assert.equal(valueReads, 1);
-});
-
 test('ComputeManager executes exactly one preselected backend and propagates its error', async t => {
   const manager = createInitializedManager();
   t.after(() => manager.terminate());
-  manager.selectBackend = () => 'gpu';
+  manager.selectBackend = () => 'worker';
 
   const calls = [];
   manager._executeOnBackend = async backend => {
@@ -294,17 +96,17 @@ test('ComputeManager executes exactly one preselected backend and propagates its
   };
 
   await assert.rejects(
-    manager.execute(OperationType.SCALE, {
-      values: new Float32Array([1, 2]),
-      scale: 2
+    manager.execute(OperationType.COMPUTE_CORRELATION, {
+      xValues: new Float32Array([1, 2, 3]),
+      yValues: new Float32Array([1, 2, 4])
     }),
-    /gpu execution failed exactly once/
+    /worker execution failed exactly once/
   );
-  assert.deepEqual(calls, ['gpu']);
+  assert.deepEqual(calls, ['worker']);
 });
 
 test('worker execution failure is never recomputed on the main thread', async t => {
-  const manager = createInitializedManager({ gpu: false, worker: true });
+  const manager = createInitializedManager({ worker: true });
   t.after(() => manager.terminate());
 
   const calls = [];
@@ -324,7 +126,7 @@ test('worker execution failure is never recomputed on the main thread', async t 
 });
 
 test('an explicit backend request is exact and rejected before execution when unavailable', async t => {
-  const manager = createInitializedManager({ gpu: false, worker: false });
+  const manager = createInitializedManager({ worker: false });
   t.after(() => manager.terminate());
 
   const calls = [];
@@ -348,37 +150,13 @@ test('an explicit backend request is exact and rejected before execution when un
 
   await assert.rejects(
     manager.execute(
-      OperationType.SCALE,
-      { values: new Float32Array([1]), scale: 2 },
+      OperationType.COMPUTE_CORRELATION,
+      { xValues: new Float32Array([1]), yValues: new Float32Array([1]) },
       { preferredBackend: 'cpu' }
     ),
     /unknown execution option.*preferredBackend|preferredBackend.*unknown execution option/i
   );
   assert.deepEqual(calls, []);
-});
-
-test('batch execution never retries a failed task on CPU', async t => {
-  const manager = createInitializedManager();
-  t.after(() => manager.terminate());
-  manager.selectBackend = () => 'gpu';
-
-  const calls = [];
-  manager._executeOnBackend = async backend => {
-    calls.push(backend);
-    if (backend === 'gpu') throw new Error('batch GPU failure');
-    return { values: new Float32Array([99]) };
-  };
-
-  await assert.rejects(
-    manager.executeBatch([
-      {
-        operation: OperationType.SCALE,
-        payload: { values: new Float32Array([1]), scale: 2 }
-      }
-    ]),
-    /batch GPU failure/
-  );
-  assert.deepEqual(calls, ['gpu']);
 });
 
 test('WorkerPool never executes scientific work on the main thread', async t => {
@@ -387,21 +165,25 @@ test('WorkerPool never executes scientific work on the main thread', async t => 
   pool.workersAvailable = false;
 
   await assert.rejects(
-    pool.execute(OperationType.COMPUTE_STATS, {
-      values: new Float32Array([1, 2, 3])
+    pool.execute(OperationType.COMPUTE_CORRELATION,
+    {
+      xValues: new Float32Array([1, 2, 3]),
+      yValues: new Float32Array([1, 2, 3])
     }),
     /Web Workers.*unavailable|unavailable.*Web Workers/i
   );
 
   await assert.rejects(
-    pool.executeOnWorker(0, OperationType.COMPUTE_STATS, {
-      values: new Float32Array([1, 2, 3])
+    pool.executeOnWorker(0, OperationType.COMPUTE_CORRELATION,
+    {
+      xValues: new Float32Array([1, 2, 3]),
+      yValues: new Float32Array([1, 2, 3])
     }),
     /Web Workers.*unavailable|unavailable.*Web Workers/i
   );
 
   await assert.rejects(
-    pool.broadcast(OperationType.COMPUTE_STATS, [{ values: [1, 2, 3] }]),
+    pool.broadcast(OperationType.COMPUTE_CORRELATION, [{ xValues: [1, 2, 3], yValues: [1, 2, 3] }]),
     /Web Workers.*unavailable|unavailable.*Web Workers/i
   );
 });
@@ -434,8 +216,7 @@ test('WorkerPool rejects every undeclared or coercive configuration shape', asyn
   const pool = new WorkerPool({ poolSize: 1 });
   await assert.rejects(
     pool.execute(
-      OperationType.COMPUTE_STATS,
-      { values: [1, 2, 3] },
+      OperationType.COMPUTE_CORRELATION, { xValues: [1, 2, 3], yValues: [1, 2, 3] },
       { restartWorkerOnAbort: true }
     ),
     /unknown key.*restartWorkerOnAbort/i
@@ -443,15 +224,14 @@ test('WorkerPool rejects every undeclared or coercive configuration shape', asyn
   await assert.rejects(
     pool.executeOnWorker(
       0,
-      OperationType.COMPUTE_STATS,
-      { values: [1, 2, 3] },
+      OperationType.COMPUTE_CORRELATION, { xValues: [1, 2, 3], yValues: [1, 2, 3] },
       30_000
     ),
     /options must be a plain object/i
   );
 });
 
-test('WorkerPool preflights broadcasts and batches before dispatching any work', async t => {
+test('WorkerPool preflights broadcasts before dispatching any work', async t => {
   const posted = [];
   const pool = new WorkerPool({ poolSize: 2 });
   t.after(() => pool.terminate());
@@ -466,27 +246,11 @@ test('WorkerPool preflights broadcasts and batches before dispatching any work',
 
   await assert.rejects(
     pool.broadcast(
-      OperationType.COMPUTE_STATS,
-      [{ values: [1] }, Object.create(null)],
+      OperationType.COMPUTE_CORRELATION,
+      [{ xValues: [1], yValues: [1] }, Object.create(null)],
       { transfer: false }
     ),
     /broadcast payload 1 must be a plain object/i
-  );
-  assert.equal(posted.length, 0);
-
-  await assert.rejects(
-    pool.executeBatch([
-      {
-        type: OperationType.COMPUTE_STATS,
-        payload: { values: [1] }
-      },
-      {
-        type: OperationType.COMPUTE_STATS,
-        payload: { values: [2] },
-        alternate: true
-      }
-    ]),
-    /unknown key.*alternate/i
   );
   assert.equal(posted.length, 0);
 });
@@ -518,7 +282,7 @@ test('WorkerPool makes transfer traversal failure terminal immediately', async t
 
   await assert.rejects(
     pool.execute(
-      OperationType.COMPUTE_STATS,
+      OperationType.COMPUTE_CORRELATION,
       payload,
       { transfer: true }
     ),
@@ -565,13 +329,11 @@ test('a running-task abort terminates the exact worker pool and rejects its queu
 
   const controller = new AbortController();
   const running = pool.execute(
-    OperationType.COMPUTE_STATS,
-    { values: [1, 2, 3] },
+    OperationType.COMPUTE_CORRELATION, { xValues: [1, 2, 3], yValues: [1, 2, 3] },
     { signal: controller.signal, transfer: false }
   );
   const queued = pool.execute(
-    OperationType.COMPUTE_STATS,
-    { values: [4, 5, 6] },
+    OperationType.COMPUTE_CORRELATION, { xValues: [4, 5, 6], yValues: [4, 5, 6] },
     { transfer: false }
   );
   const settled = Promise.allSettled([running, queued]);
@@ -629,7 +391,7 @@ test('a worker crash has one terminal owner and never creates a replacement', as
       reject: error => resolve(error),
       timeoutId: null,
       workerIndex: 0,
-      type: OperationType.COMPUTE_STATS,
+      type: OperationType.COMPUTE_CORRELATION,
       signal: null,
       abortHandler: null,
       startTime: 0
@@ -646,88 +408,148 @@ test('a worker crash has one terminal owner and never creates a replacement', as
   assert.equal(pool.getTerminalFailure(), rejectedWith);
   assert.match(rejectedWith.message, /worker 0.*synthetic worker crash/i);
   await assert.rejects(
-    pool.execute(OperationType.COMPUTE_STATS, { values: [1] }),
+    pool.execute(OperationType.COMPUTE_CORRELATION, { xValues: [1], yValues: [1] }),
     error => error === rejectedWith
   );
 });
 
-test('ComputeManager exposes a terminal worker-pool failure without changing backend', async t => {
-  const manager = createInitializedManager({ gpu: false, worker: true });
+test('ComputeManager retires a terminal worker pool and discovers a fresh one for the next operation', async t => {
+  const originalWorker = globalThis.Worker;
+  const workers = [];
+  class AcknowledgingWorker {
+    constructor() {
+      this.terminated = false;
+      workers.push(this);
+    }
+
+    postMessage(message) {
+      if (message.type !== 'INIT') return;
+      queueMicrotask(() => {
+        this.onmessage({
+          data: { type: 'INIT_ACK', workerId: message.payload.id }
+        });
+      });
+    }
+
+    terminate() {
+      this.terminated = true;
+    }
+  }
+  globalThis.Worker = AcknowledgingWorker;
+  t.after(() => {
+    if (originalWorker === undefined) {
+      delete globalThis.Worker;
+    } else {
+      globalThis.Worker = originalWorker;
+    }
+  });
+
+  const manager = new ComputeManager();
+  t.after(() => manager.terminate());
+  await manager.init();
+  assert.equal(manager.getStatus().worker.status, BackendStatus.AVAILABLE);
+  const firstPool = manager._workerBackend;
+  assert.equal(workers.length, firstPool.poolSize);
+
+  // A running-task timeout is terminal for the exact pool that owned it.
+  const timedOut = manager.execute(
+    OperationType.COMPUTE_CORRELATION,
+    {
+      xValues: new Float32Array([1, 2, 3]),
+      yValues: new Float32Array([1, 2, 3])
+    },
+    { backend: 'worker', timeout: 1, transfer: false }
+  );
+  const terminalFailure = await timedOut.then(
+    () => assert.fail('a silent worker must time out'),
+    error => error
+  );
+  assert.match(terminalFailure.message, /timed out after 1ms/);
+  assert.equal(firstPool.isTerminal(), true);
+  assert.equal(firstPool.getTerminalFailure(), terminalFailure);
+  assert.ok(workers.every(worker => worker.terminated));
+  assert.equal(manager.getStatus().worker.status, BackendStatus.FAILED);
+  assert.equal(manager.getStatus().worker.failure, terminalFailure.message);
+  assert.notEqual(manager.getStatus().worker.status, BackendStatus.AVAILABLE);
+
+  // The next owner discovers a fresh pool instead of the terminal error.
+  const workersBefore = workers.length;
+  await manager.init();
+  assert.equal(manager.getStatus().worker.status, BackendStatus.AVAILABLE);
+  assert.notEqual(manager._workerBackend, firstPool);
+  assert.equal(manager._workerBackend.isReady(), true);
+  assert.equal(workers.length, workersBefore + firstPool.poolSize);
+  assert.equal(manager.getStatus().worker.failure, null);
+  // The terminal pool itself is never revived.
+  await assert.rejects(
+    firstPool.execute(OperationType.COMPUTE_CORRELATION, { xValues: [1], yValues: [1] }),
+    error => error === terminalFailure
+  );
+});
+
+test('a pool retired elsewhere is replaced before the manager selects a backend', async t => {
+  const manager = createInitializedManager({ worker: true });
   t.after(() => manager.terminate());
   const terminalFailure = new Error('terminal worker transport failure');
   manager._workerBackend = {
     async execute() {
-      throw terminalFailure;
+      assert.fail('a retired pool must not receive work');
     },
     getTerminalFailure() {
       return terminalFailure;
+    },
+    isTerminal() {
+      return true;
     },
     getStats() {
       return { poolSize: 1 };
     },
     terminate() {}
   };
+  const discovered = [];
+  manager._doInit = async () => {
+    discovered.push(manager.getStatus().worker.failure);
+    manager._workerBackend = null;
+    manager._workerStatus = BackendStatus.UNAVAILABLE;
+    manager._workerFailure = null;
+    manager._initialized = true;
+  };
 
-  await assert.rejects(
-    manager.execute(
-      OperationType.COMPUTE_STATS,
-      { values: new Float32Array([1, 2, 3]) },
-      { backend: 'worker' }
-    ),
-    error => error === terminalFailure
+  const result = await manager.execute(
+    OperationType.COMPUTE_CORRELATION,
+    {
+      xValues: new Float32Array([4, 5, 6]),
+      yValues: new Float32Array([4, 5, 6])
+    }
   );
-
-  assert.equal(manager.getStatus().worker.status, BackendStatus.FAILED);
-  assert.equal(manager.getStatus().worker.failure, terminalFailure.message);
-  assert.equal(manager.isWorkerAvailable(), false);
-  await assert.rejects(
-    manager.execute(
-      OperationType.COMPUTE_STATS,
-      { values: new Float32Array([4, 5, 6]) }
-    ),
-    error => error === terminalFailure
-  );
-  await assert.rejects(
-    manager.init(),
-    error => error === terminalFailure
-  );
+  assert.deepEqual(discovered, [terminalFailure.message]);
+  assert.equal(result._compute.backend, 'cpu');
 });
 
-test('ComputeManager rejects alternate option and batch task records', async t => {
-  const manager = createInitializedManager({ gpu: false, worker: false });
+test('ComputeManager rejects alternate option records', async t => {
+  const manager = createInitializedManager({ worker: false });
   t.after(() => manager.terminate());
 
   await assert.rejects(
     manager.execute(
-      OperationType.COMPUTE_STATS,
-      { values: new Float32Array([1, 2, 3]) },
+      OperationType.COMPUTE_CORRELATION,
+    {
+      xValues: new Float32Array([1, 2, 3]),
+      yValues: new Float32Array([1, 2, 3])
+    },
       Object.create(null)
     ),
     /options must be a plain object/i
   );
-  await assert.rejects(
-    manager.executeBatch([
-      {
-        operation: OperationType.COMPUTE_STATS,
-        payload: { values: new Float32Array([1, 2, 3]) },
-        backend: 'cpu'
-      }
-    ]),
-    /unknown compute batch task key.*backend/i
-  );
 });
 
 test('CPU and worker selections return the exact same scientific contract', async t => {
-  const manager = createInitializedManager({ gpu: false, worker: true });
+  const manager = createInitializedManager({ worker: true });
   t.after(() => manager.terminate());
   manager._workerBackend.execute = async (operation, payload) =>
     structuredClone(executeOperation(operation, payload));
 
   const fixtures = [
-    {
-      operation: OperationType.COMPUTE_STATS,
-      payload: { values: new Float32Array([1, 2, NaN, 4]) }
-    },
     {
       operation: OperationType.COMPUTE_CORRELATION,
       payload: {
@@ -743,10 +565,6 @@ test('CPU and worker selections return the exact same scientific contract', asyn
         groupBValues: new Float32Array([4, 5, 6, 7]),
         method: 'wilcox'
       }
-    },
-    {
-      operation: OperationType.AGGREGATE_CATEGORIES,
-      payload: { values: ['T', 'B', 'T'], normalize: true }
     }
   ];
 
@@ -769,13 +587,16 @@ test('CPU and worker selections return the exact same scientific contract', asyn
   }
 });
 
-test('compute metadata and metrics contain no retry or fallback narrative', async t => {
-  const manager = createInitializedManager({ gpu: false, worker: false });
+test('compute metadata contains no retry or fallback narrative', async t => {
+  const manager = createInitializedManager({ worker: false });
   t.after(() => manager.terminate());
 
   const result = await manager.execute(
-    OperationType.COMPUTE_STATS,
-    { values: new Float32Array([1, 2, 3]) },
+    OperationType.COMPUTE_CORRELATION,
+    {
+      xValues: new Float32Array([1, 2, 3]),
+      yValues: new Float32Array([1, 2, 3])
+    },
     { backend: 'cpu' }
   );
 
@@ -783,19 +604,9 @@ test('compute metadata and metrics contain no retry or fallback narrative', asyn
     Object.keys(result._compute).sort(),
     ['backend', 'elapsedMs', 'operation']
   );
-  assert.deepEqual(
-    Object.keys(manager.getMetrics()).sort(),
-    ['cpuExecutions', 'gpuExecutions', 'totalExecutions', 'totalTimeMs', 'workerExecutions']
-  );
 });
 
 test('obsolete compute compatibility surface and runtime fallback module are absent', async () => {
-  const computePublic = await import('../assets/js/app/analysis/compute/index.js');
-  assert.equal('executeFallback' in computePublic, false);
-  assert.equal('executeFallback' in analysisPublic, false);
-  assert.equal('initComputeManager' in computePublic, false);
-  assert.equal('createComputeManager' in computePublic, false);
-
   const manager = new ComputeManager();
   const pool = new WorkerPool({ poolSize: 1 });
   try {

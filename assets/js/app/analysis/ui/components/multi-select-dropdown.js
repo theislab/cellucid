@@ -5,6 +5,14 @@
  * Designed to match existing dropdown/popup styling in the app (paper box, black border, shadow).
  */
 
+import {
+  coalesceToFrame,
+  createButton,
+  createEmptyState
+} from '../../../ui/components/controls.js';
+import { StyleManager } from '../../../../utils/style-manager.js';
+
+
 /**
  * @typedef {Object} MultiSelectItem
  * @property {string} key
@@ -53,7 +61,7 @@ export function createMultiSelectDropdown(options) {
 
   const btn = document.createElement('button');
   btn.type = 'button';
-  btn.className = 'multi-select-dropdown-btn';
+  btn.className = 'icon-btn multi-select-dropdown-btn';
   btn.setAttribute('aria-label', buttonLabel);
   btn.setAttribute('aria-haspopup', 'dialog');
   btn.setAttribute('aria-expanded', 'false');
@@ -67,7 +75,7 @@ export function createMultiSelectDropdown(options) {
   panel.setAttribute('role', 'dialog');
   panel.setAttribute('aria-label', title);
   panel.setAttribute('aria-modal', 'true');
-  panel.style.display = 'none';
+  panel.hidden = true;
   // Append to body to avoid affecting sidebar scroll position. That places the
   // panel at the very end of the document, so sequential focus would never
   // reach it from the trigger — the panel keeps focus itself while it is open
@@ -96,7 +104,7 @@ export function createMultiSelectDropdown(options) {
 
   const searchInput = document.createElement('input');
   searchInput.type = 'text';
-  searchInput.className = 'search-input multi-select-dropdown-search';
+  searchInput.className = 'obs-select multi-select-dropdown-search';
   searchInput.placeholder = 'Filter…';
   searchInput.setAttribute('aria-label', `Filter ${title}`);
   searchInput.autocomplete = 'off';
@@ -106,29 +114,39 @@ export function createMultiSelectDropdown(options) {
 
   const list = document.createElement('div');
   list.className = 'multi-select-dropdown-list';
-  list.style.maxHeight = `${Math.max(120, maxListHeight)}px`;
+  StyleManager.setVariable(
+    list,
+    '--multi-select-list-max-height',
+    `${Math.max(120, maxListHeight)}px`
+  );
   panel.appendChild(list);
+
+  // One delegated listener records every checkbox change in the list.
+  list.addEventListener('change', (event) => {
+    const checkbox = event.target;
+    if (!(checkbox instanceof HTMLInputElement) || checkbox.type !== 'checkbox') return;
+    const key = checkbox.dataset.key;
+    if (checkbox.checked) pendingSelected.add(key);
+    else pendingSelected.delete(key);
+    updateMeta();
+  });
 
   const actions = document.createElement('div');
   actions.className = 'multi-select-dropdown-actions';
   panel.appendChild(actions);
 
-  const hideAllBtn = document.createElement('button');
-  hideAllBtn.type = 'button';
-  hideAllBtn.className = 'btn-small';
-  hideAllBtn.textContent = 'Hide All';
+  const hideAllBtn = createButton({ label: 'Hide all', className: 'btn-compact' });
   actions.appendChild(hideAllBtn);
 
-  const showAllBtn = document.createElement('button');
-  showAllBtn.type = 'button';
-  showAllBtn.className = 'btn-small';
-  showAllBtn.textContent = 'Show All';
+  const showAllBtn = createButton({ label: 'Show all', className: 'btn-compact' });
   actions.appendChild(showAllBtn);
 
-  const applyBtn = document.createElement('button');
-  applyBtn.type = 'button';
-  applyBtn.className = 'btn-small';
-  applyBtn.textContent = 'Apply';
+  // Apply commits the choice, so it is the panel's one primary action.
+  const applyBtn = createButton({
+    label: 'Apply',
+    variant: 'primary',
+    className: 'btn-compact'
+  });
   actions.appendChild(applyBtn);
 
   const updateMeta = () => {
@@ -138,8 +156,6 @@ export function createMultiSelectDropdown(options) {
 
   const renderList = () => {
     const q = enableSearch ? (searchInput.value || '').trim().toLowerCase() : '';
-    list.innerHTML = '';
-
     const filtered = q
       ? currentItems.filter(it =>
         (it.label || it.key).toLowerCase().includes(q) ||
@@ -148,26 +164,21 @@ export function createMultiSelectDropdown(options) {
       : currentItems;
 
     if (filtered.length === 0) {
-      const empty = document.createElement('div');
-      empty.className = 'multi-select-dropdown-empty';
-      empty.textContent = 'No matches';
-      list.appendChild(empty);
+      list.replaceChildren(createEmptyState('No matches.'));
       updateMeta();
       return;
     }
 
+    // Rows are built off-document and inserted in one step.
+    const fragment = document.createDocumentFragment();
     for (const it of filtered) {
       const row = document.createElement('label');
-      row.className = 'multi-select-dropdown-item';
+      row.className = 'checkbox-inline multi-select-dropdown-item';
 
       const checkbox = document.createElement('input');
       checkbox.type = 'checkbox';
+      checkbox.dataset.key = it.key;
       checkbox.checked = pendingSelected.has(it.key);
-      checkbox.addEventListener('change', () => {
-        if (checkbox.checked) pendingSelected.add(it.key);
-        else pendingSelected.delete(it.key);
-        updateMeta();
-      });
 
       const labelText = it.label || it.key;
       const labelEl = document.createElement('span');
@@ -177,8 +188,9 @@ export function createMultiSelectDropdown(options) {
 
       row.appendChild(checkbox);
       row.appendChild(labelEl);
-      list.appendChild(row);
+      fragment.appendChild(row);
     }
+    list.replaceChildren(fragment);
 
     updateMeta();
   };
@@ -205,10 +217,9 @@ export function createMultiSelectDropdown(options) {
     // Move focus out before hiding: a focused element inside a `display: none`
     // subtree is dropped to `<body>`, which loses the user's place entirely.
     const hadFocusInside = panel.contains(document.activeElement);
-    panel.style.display = 'none';
+    repositionPanel.cancel();
+    panel.hidden = true;
     btn.setAttribute('aria-expanded', 'false');
-    btn.classList.remove('open');
-    panel.classList.remove('open');
     if (restoreFocus && hadFocusInside) btn.focus({ preventScroll: true });
 
     // Reset pending state so next open reflects committed selection.
@@ -221,6 +232,9 @@ export function createMultiSelectDropdown(options) {
     panel.style.top = `${btnRect.bottom + 4}px`;
     panel.style.left = `${btnRect.left}px`;
   };
+  // Every scroll in the document fires the capture listener below; the panel
+  // only needs its position once per frame, read and written together.
+  const repositionPanel = coalesceToFrame(updatePanelPosition);
 
   const open = () => {
     if (isOpen) return;
@@ -231,12 +245,10 @@ export function createMultiSelectDropdown(options) {
     renderList();
 
     // Position panel using fixed positioning relative to the button
-    panel.style.display = 'block';
+    panel.hidden = false;
     updatePanelPosition();
 
     btn.setAttribute('aria-expanded', 'true');
-    btn.classList.add('open');
-    panel.classList.add('open');
 
     openAbortController = new AbortController();
     const { signal } = openAbortController;
@@ -271,7 +283,7 @@ export function createMultiSelectDropdown(options) {
     }, { signal });
 
     // Update position on scroll (capture to catch scrolls from any ancestor)
-    document.addEventListener('scroll', updatePanelPosition, { signal, capture: true });
+    document.addEventListener('scroll', () => repositionPanel(), { signal, capture: true });
 
     // The panel lives at the end of <body>, so nothing would carry focus into
     // it. Start on the filter box, or the first control when there is none.
@@ -333,7 +345,3 @@ export function createMultiSelectDropdown(options) {
 
   return { element: wrapper, destroy };
 }
-
-export default {
-  createMultiSelectDropdown
-};

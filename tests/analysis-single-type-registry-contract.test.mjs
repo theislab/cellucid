@@ -44,26 +44,6 @@ function* findModules(directory) {
   }
 }
 
-test('no analysis module publishes a second analysis-type registry', async () => {
-  const barrels = [
-    'index.js',
-    'ui/index.js',
-    'ui/analysis-types/index.js',
-  ].map(relative => path.join(ANALYSIS_ROOT, relative));
-
-  for (const barrel of barrels) {
-    const module = await import(pathToFileURL(barrel).href);
-    const offending = RETIRED_REGISTRY_EXPORTS.filter(name => name in module);
-    assert.deepEqual(
-      offending,
-      [],
-      `${path.relative(ANALYSIS_ROOT, barrel)} re-exports ${offending.join(', ')}; `
-        + 'the analysis-mode registry is AnalysisUIManager, populated by '
-        + 'ComparisonModule._registerAnalysisTypes()',
-    );
-  }
-});
-
 test('no analysis source defines a second analysis-type registry', () => {
   const offending = [];
   for (const modulePath of findModules(ANALYSIS_ROOT)) {

@@ -2,16 +2,19 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
-  clearUrlDataSource,
   prepareUrlForDatasetSelection,
   prepareUrlForDataSource,
-  updateUrlForDataSource,
 } from '../assets/js/app/url-state.js';
+import { resolveStartupUrlIntent } from '../assets/js/app/startup-url-intent.js';
+
+function updateUrlForDataSource(sourceType, sourceInfo) {
+  return prepareUrlForDataSource(sourceType, sourceInfo).commit();
+}
 
 const INITIAL_URL =
   'https://viewer.example.test/app?' +
   'dataset=old&source=old&remote=https%3A%2F%2Fold.example.test' +
-  '&github=old%2Frepo&annotations=team%2Flabels%40main#selected';
+  '&github=old%2Frepo&anndata=true&annotations=team%2Flabels%40main#selected';
 
 function installBrowser(initialHref = INITIAL_URL, replaceImplementation = null) {
   const previousWindow = globalThis.window;
@@ -63,6 +66,10 @@ function installBrowser(initialHref = INITIAL_URL, replaceImplementation = null)
 
 function assertPreservedApplicationState(nextHref) {
   const url = new URL(nextHref);
+  // `anndata=true` is the Python AnnData server's startup instruction for its
+  // own origin. Left behind after another source is published, it makes the
+  // reloaded URL either fail startup or describe a source that is gone.
+  assert.equal(url.searchParams.has('anndata'), false);
   assert.equal(url.searchParams.get('annotations'), 'team/labels@main');
   assert.equal(url.hash, '#selected');
   return url;
@@ -77,17 +84,33 @@ async function withBrowser(run, options = {}) {
   }
 }
 
-test('local-demo publishes exactly its dataset URL state', async () => {
+test('local-demo publishes exactly its source and dataset URL state', async () => {
   await withBrowser(browser => {
     updateUrlForDataSource('local-demo', { datasetId: 'pbmc-3k' });
 
     assert.equal(browser.calls.length, 1);
     const url = assertPreservedApplicationState(browser.href);
     assert.equal(url.searchParams.get('dataset'), 'pbmc-3k');
-    assert.equal(url.searchParams.has('source'), false);
+    // A bare `dataset` is read as a same-origin server dataset on a page the
+    // Python server hosts, so the sample catalog has to be named explicitly.
+    assert.equal(url.searchParams.get('source'), 'local-demo');
     assert.equal(url.searchParams.has('remote'), false);
     assert.equal(url.searchParams.has('github'), false);
   });
+});
+
+test('a published sample URL on a Python-server page reloads as that sample', async () => {
+  await withBrowser(browser => {
+    updateUrlForDataSource('local-demo', { datasetId: 'suo' });
+    const intent = resolveStartupUrlIntent(
+      new URL(browser.href).searchParams,
+      null
+    );
+    // Same-origin server auto-connect only runs for no source or "remote".
+    assert.equal(intent.sourceParam, 'local-demo');
+    assert.equal(intent.requestedDataset, 'suo');
+    assert.equal(intent.isAnndataMode, false);
+  }, { initialHref: 'http://127.0.0.1:8765/?anndata=true&dataset=served' });
 });
 
 test('remote publishes exactly its server and dataset URL state', async () => {
@@ -143,19 +166,6 @@ for (const sourceType of ['local-user', 'jupyter']) {
 test('null publishes the exact empty-dataset state', async () => {
   await withBrowser(browser => {
     updateUrlForDataSource(null, {});
-
-    assert.equal(browser.calls.length, 1);
-    const url = assertPreservedApplicationState(browser.href);
-    assert.equal(url.searchParams.has('dataset'), false);
-    assert.equal(url.searchParams.has('source'), false);
-    assert.equal(url.searchParams.has('remote'), false);
-    assert.equal(url.searchParams.has('github'), false);
-  });
-});
-
-test('clearUrlDataSource publishes the exact empty-dataset state', async () => {
-  await withBrowser(browser => {
-    clearUrlDataSource();
 
     assert.equal(browser.calls.length, 1);
     const url = assertPreservedApplicationState(browser.href);

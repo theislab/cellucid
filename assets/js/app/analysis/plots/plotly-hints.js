@@ -15,7 +15,6 @@
 
 import { getNotificationCenter } from '../../notification-center.js';
 
-let enabled = true;
 let observer = null;
 let cssHidden = false;
 
@@ -69,7 +68,7 @@ function extractNotifierText(noteEl) {
 }
 
 function forward(message) {
-  if (!enabled || !message) return;
+  if (!message) return;
   if (typeof message !== 'string') {
     throw new TypeError('Plotly notification message must be a string');
   }
@@ -124,6 +123,33 @@ function handleAddedNode(node) {
   }
 }
 
+/**
+ * Containers already observed for notes.
+ * @type {WeakSet<Element>}
+ */
+const observedContainers = new WeakSet();
+
+function isNotifierContainer(el) {
+  return el.classList.contains('plotly-notifier') || el.classList.contains('notifier-container');
+}
+
+/**
+ * Forward the notes a notifier container holds now and every note added to it
+ * later. Plotly appends each note as a direct child of the container.
+ */
+function observeNotifierContainer(container) {
+  if (observedContainers.has(container)) return;
+  observedContainers.add(container);
+  handleAddedNode(container);
+  new MutationObserver((mutations) => {
+    for (const mutation of mutations) {
+      for (const node of mutation.addedNodes) {
+        handleAddedNode(node);
+      }
+    }
+  }).observe(container, { childList: true });
+}
+
 function ensureObserver() {
   if (!canUseDOM()) return;
   if (observer) return;
@@ -136,15 +162,22 @@ function ensureObserver() {
     throw new TypeError('A document root is required for Plotly notification routing');
   }
 
+  // Plotly's notifier is a container appended directly to <body>, with one
+  // note per message appended directly to it. Only those two levels are
+  // watched: observing the whole document subtree ran a subtree query for
+  // every element anything inserted anywhere — every SVG point of every plot
+  // included, 170,000 queries for one box plot of a million-cell page.
   observer = new MutationObserver((mutations) => {
     for (const mutation of mutations) {
       for (const node of mutation.addedNodes) {
-        handleAddedNode(node);
+        if (node && node.nodeType === 1 && isNotifierContainer(node)) {
+          observeNotifierContainer(node);
+        }
       }
     }
   });
 
-  observer.observe(root, { childList: true, subtree: true });
+  observer.observe(root, { childList: true });
 }
 
 /**
@@ -152,7 +185,6 @@ function ensureObserver() {
  */
 export function hidePlotlyNativeHints() {
   if (!canUseDOM()) return;
-  if (!enabled) return;
   ensureObserver();
   if (!observer) {
     throw new Error('Plotly notification observer was not created');
@@ -177,7 +209,6 @@ export function hidePlotlyNativeHints() {
 /**
  * Attach hint forwarding (safe to call multiple times).
  * @param {HTMLElement} [container]
- * @param {Object} [_options]
  */
 export function attachPlotlyHints(container) {
   // Container is optional; DOM observer captures global Plotly notifier messages.
@@ -190,41 +221,3 @@ export function attachPlotlyHints(container) {
     handleAddedNode(container);
   }
 }
-
-/**
- * Enable/disable forwarding.
- */
-export function setPlotlyHintsEnabled(value) {
-  if (typeof value !== 'boolean') {
-    throw new TypeError('Plotly hint enabled state must be boolean');
-  }
-  enabled = value;
-}
-
-
-/**
- * Destroy and restore native behavior (stop forwarding + show native toasts again).
- */
-export function restorePlotlyNotifications() {
-  enabled = false;
-  if (canUseDOM()) {
-    const style = document.getElementById('plotly-notif-hide');
-    if (style !== null) style.remove();
-  }
-  cssHidden = false;
-  if (observer !== null) observer.disconnect();
-  observer = null;
-}
-
-export const getPlotlyHintsManager = () => ({
-  attach: attachPlotlyHints,
-  setEnabled: setPlotlyHintsEnabled,
-  destroy: restorePlotlyNotifications
-});
-
-export default {
-  attach: attachPlotlyHints,
-  hideNative: hidePlotlyNativeHints,
-  setEnabled: setPlotlyHintsEnabled,
-  restore: restorePlotlyNotifications
-};

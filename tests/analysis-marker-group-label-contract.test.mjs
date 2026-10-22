@@ -66,6 +66,10 @@ class FakeElement {
     this.listeners.set(type, handler);
   }
 
+  setAttribute(name, value) {
+    this[`attr:${name}`] = String(value);
+  }
+
   /** Every element of `tagName` in this subtree, in document order. */
   collect(tagName) {
     const wanted = tagName.toUpperCase();
@@ -96,7 +100,7 @@ function withFakeDocument(run) {
 // A marker result shaped exactly as MarkerDiscoveryEngine publishes one
 // =============================================================================
 
-// exports/pancreas/obs_manifest.json, field `cell_type`.
+// cellucid-datasets exports-v3/pancreas/obs_manifest.json, field `cell_type`.
 const PANCREAS_CELL_TYPES = [
   'Ductal', 'Ngn3 low EP', 'Ngn3 high EP', 'Pre-endocrine',
   'Beta', 'Alpha', 'Delta', 'Epsilon',
@@ -131,7 +135,6 @@ function renderPicker({ result, selectedGroupId = null }) {
     ui._lastResult = result;
     ui._modalGeneListMode = 'top5';
     ui._modalSelectedGroupId = selectedGroupId;
-    ui._modalAnnotationsRenderRevision = 0;
 
     const container = new FakeElement('div');
     ui._renderModalAnnotations(container);

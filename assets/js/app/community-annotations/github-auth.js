@@ -38,7 +38,6 @@ const WORKER_ENDPOINTS = Object.freeze([
   '/auth/installations',
   '/auth/installation-repos',
   '/cap/lookup-cells',
-  '/cap/search-datasets',
   '/api/repos/*',
 ]);
 
@@ -552,7 +551,7 @@ async function fetchJson(url, {
   }
 }
 
-export function getGitHubLoginUrl(workerOrigin = null) {
+function getGitHubLoginUrl(workerOrigin = null) {
   const rawOrigin = workerOrigin === null
     ? getGitHubWorkerOrigin()
     : workerOrigin;

@@ -149,159 +149,9 @@ function isObjectRecord(value) {
  */
 
 /**
- * Validate an analysis configuration
- * @param {AnalysisConfig} config - Configuration to validate
- * @param {Object} [options] - Validation options
- * @param {boolean} [options.strict=false] - Require all fields
- * @returns {ValidationResult}
- */
-export function validateAnalysisConfig(config, options = {}) {
-  const { strict = false } = options;
-  const errors = [];
-  const warnings = [];
-
-  // Required fields
-  if (!config) {
-    return { valid: false, errors: ['Config is null or undefined'], warnings: [] };
-  }
-
-  if (!config.type) {
-    errors.push('Missing required field: type');
-  } else if (!['comparison', 'differential', 'correlation', 'custom'].includes(config.type)) {
-    errors.push(`Invalid analysis type: ${config.type}`);
-  }
-
-  if (!config.pageIds || !Array.isArray(config.pageIds)) {
-    errors.push('Missing or invalid pageIds array');
-  } else if (config.pageIds.length === 0) {
-    errors.push('pageIds array is empty');
-  }
-
-  // Validate variables if present
-  if (config.variables) {
-    if (!Array.isArray(config.variables)) {
-      errors.push('variables must be an array');
-    } else {
-      config.variables.forEach((v, i) => {
-        const varErrors = validateVariableSelection(v);
-        varErrors.forEach(e => errors.push(`variables[${i}]: ${e}`));
-      });
-    }
-  } else if (strict) {
-    errors.push('Missing required field: variables');
-  }
-
-  // Validate transforms if present
-  if (config.transforms) {
-    if (!Array.isArray(config.transforms)) {
-      errors.push('transforms must be an array');
-    } else {
-      config.transforms.forEach((t, i) => {
-        const transformErrors = validateTransformConfig(t);
-        transformErrors.forEach(e => errors.push(`transforms[${i}]: ${e}`));
-      });
-    }
-  }
-
-  // Validate plots if present
-  if (config.plots) {
-    if (!Array.isArray(config.plots)) {
-      errors.push('plots must be an array');
-    } else {
-      config.plots.forEach((p, i) => {
-        const plotErrors = validatePlotConfig(p);
-        plotErrors.forEach(e => errors.push(`plots[${i}]: ${e}`));
-      });
-    }
-  }
-
-  // Check for ID
-  if (strict && !config.id) {
-    errors.push('Missing required field: id');
-  }
-
-  return {
-    valid: errors.length === 0,
-    errors,
-    warnings
-  };
-}
-
-/**
- * Validate a variable selection
- * @param {VariableSelection} variable
- * @returns {string[]} Array of error messages
- */
-export function validateVariableSelection(variable) {
-  const errors = [];
-
-  if (!variable.key) {
-    errors.push('Missing key');
-  }
-
-  if (!variable.type) {
-    errors.push('Missing type');
-  } else if (!['categorical_obs', 'continuous_obs', 'gene_expression'].includes(variable.type)) {
-    errors.push(`Invalid type: ${variable.type}`);
-  }
-
-  if (variable.role && !['primary', 'secondary', 'grouping', 'covariate'].includes(variable.role)) {
-    errors.push(`Invalid role: ${variable.role}`);
-  }
-
-  return errors;
-}
-
-/**
- * Validate a transform configuration
- * @param {TransformConfig} transform
- * @returns {string[]} Array of error messages
- */
-export function validateTransformConfig(transform) {
-  const errors = [];
-
-  if (!transform.id) {
-    errors.push('Missing id');
-  }
-
-  if (typeof transform.enabled !== 'boolean') {
-    errors.push('enabled must be a boolean');
-  }
-
-  if (transform.options && typeof transform.options !== 'object') {
-    errors.push('options must be an object');
-  }
-
-  return errors;
-}
-
-/**
- * Validate a plot configuration
- * @param {PlotConfig} plot
- * @returns {string[]} Array of error messages
- */
-export function validatePlotConfig(plot) {
-  const errors = [];
-
-  if (!plot.type) {
-    errors.push('Missing type');
-  }
-
-  if (!plot.variableKey) {
-    errors.push('Missing variableKey');
-  }
-
-  if (plot.options && typeof plot.options !== 'object') {
-    errors.push('options must be an object');
-  }
-
-  return errors;
-}
-
-/**
  * Validate a plugin contract definition
  * @param {PluginContract} plugin - Plugin to validate
- * @param {string} pluginType - Type of plugin ('plot' | 'transform' | 'template' | 'stat')
+ * @param {string} pluginType - Type of plugin ('plot' for render-contract checks)
  * @returns {ValidationResult}
  */
 export function validatePluginContract(plugin, pluginType = 'plugin') {
@@ -376,36 +226,11 @@ export function validatePluginContract(plugin, pluginType = 'plugin') {
   }
 
   // Type-specific validations
-  switch (pluginType) {
-    case 'plot':
-      if (
-        !Object.hasOwn(plugin, 'render') ||
-        typeof plugin.render !== 'function'
-      ) {
-        errors.push('Plot plugins must have a render function');
-      }
-      break;
-    case 'transform':
-      if (
-        !Object.hasOwn(plugin, 'execute') ||
-        typeof plugin.execute !== 'function'
-      ) {
-        errors.push('Transform plugins must have an execute function');
-      }
-      break;
-    case 'template':
-      if (!Object.hasOwn(plugin, 'requiredInputs') || !plugin.requiredInputs) {
-        errors.push('Template plugins must have requiredInputs');
-      }
-      break;
-    case 'stat':
-      if (
-        !Object.hasOwn(plugin, 'compute') ||
-        typeof plugin.compute !== 'function'
-      ) {
-        errors.push('Statistical test plugins must have a compute function');
-      }
-      break;
+  if (
+    pluginType === 'plot' &&
+    (!Object.hasOwn(plugin, 'render') || typeof plugin.render !== 'function')
+  ) {
+    errors.push('Plot plugins must have a render function');
   }
 
   return {
@@ -707,33 +532,6 @@ export function validateOptionsAgainstSchema(options, schema, defaults = {}) {
 // =============================================================================
 
 /**
- * Generate a unique analysis ID
- * @returns {string}
- */
-export function generateAnalysisId() {
-  return `analysis_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-}
-
-/**
- * Create a default analysis config
- * @param {Object} overrides - Values to override defaults
- * @returns {AnalysisConfig}
- */
-export function createDefaultConfig(overrides = {}) {
-  return {
-    id: generateAnalysisId(),
-    type: 'comparison',
-    pageIds: [],
-    variables: [],
-    transforms: [],
-    plots: [],
-    options: {},
-    created: Date.now(),
-    ...overrides
-  };
-}
-
-/**
  * Deep merge options with defaults
  * @param {Object} defaults - Default values
  * @param {Object} overrides - Override values
@@ -769,55 +567,3 @@ export function mergeOptions(defaults, overrides) {
 
   return result;
 }
-
-/**
- * Clone a config, generating a new ID
- * @param {AnalysisConfig} config - Config to clone
- * @returns {AnalysisConfig}
- */
-export function cloneConfig(config) {
-  return {
-    ...JSON.parse(JSON.stringify(config)),
-    id: generateAnalysisId(),
-    created: Date.now(),
-    modified: undefined
-  };
-}
-
-/**
- * Create summary string for a config (for display/export)
- * @param {AnalysisConfig} config
- * @returns {string}
- */
-export function summarizeConfig(config) {
-  const parts = [];
-
-  parts.push(`Type: ${config.type}`);
-  parts.push(`Pages: ${config.pageIds.length}`);
-
-  if (config.variables?.length) {
-    parts.push(`Variables: ${config.variables.length}`);
-  }
-
-  if (config.transforms?.length) {
-    const enabled = config.transforms.filter(t => t.enabled).length;
-    parts.push(`Transforms: ${enabled}/${config.transforms.length}`);
-  }
-
-  return parts.join(' | ');
-}
-
-export default {
-  validateAnalysisConfig,
-  validateVariableSelection,
-  validateTransformConfig,
-  validatePlotConfig,
-  validatePluginContract,
-  validateOptionSchema,
-  validateOptionsAgainstSchema,
-  generateAnalysisId,
-  createDefaultConfig,
-  mergeOptions,
-  cloneConfig,
-  summarizeConfig
-};

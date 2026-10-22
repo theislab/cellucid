@@ -39,19 +39,3 @@ export const debug = {
 
   get isEnabled() { return DEBUG; }
 };
-
-/**
- * Performance timing helper.
- * @param {string} label
- * @returns {Function} Call to end timing and log the result
- */
-export function startTiming(label) {
-  if (!DEBUG) return () => {};
-  const start = typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
-  return () => {
-    const end = typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
-    const elapsed = end - start;
-    console.log(`[Cellucid] ${label}: ${elapsed.toFixed(2)}ms`);
-  };
-}
-

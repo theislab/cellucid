@@ -40,7 +40,7 @@ const NO_FILTER_PLACEHOLDER = /No filters active/i;
  * @param {unknown} filters
  * @returns {string[]}
  */
-export function meaningfulFilterLines(filters) {
+function meaningfulFilterLines(filters) {
   if (!Array.isArray(filters)) return [];
   return filters
     .filter((line) => typeof line === 'string' && line.length > 0)

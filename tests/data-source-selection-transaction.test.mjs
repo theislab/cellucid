@@ -3,12 +3,13 @@ import test from 'node:test';
 import { readFile } from 'node:fs/promises';
 
 import {
-  createDataSourceManager
+  DataSourceManager
 } from '../assets/js/data/data-source-manager.js';
+import { selectDataset } from './helpers/dataset-selection.mjs';
 
 function metadata(id) {
   return Object.freeze({
-    version: 2,
+    version: 3,
     id,
     name: id,
     description: '',
@@ -23,9 +24,16 @@ function metadata(id) {
       n_edges: null,
     }),
     embeddings: Object.freeze({
-      available_dimensions: Object.freeze([2]),
       default_dimension: 2,
-      files: Object.freeze({ '2d': 'points_2d.bin' }),
+      defaults: Object.freeze({ '2d': 'X_umap' }),
+      items: Object.freeze({
+        X_umap: Object.freeze({
+          label: 'X_umap',
+          dimension: 2,
+          file: 'embeddings/0_2d.bin',
+          source: Object.freeze({ key: 'X_umap', columns: Object.freeze([0, 1]) }),
+        }),
+      }),
     }),
     obs_fields: Object.freeze([]),
   });
@@ -71,12 +79,12 @@ function source(
 }
 
 test('dataset selection remains side-effect free until final publication', async () => {
-  const manager = createDataSourceManager();
+  const manager = new DataSourceManager();
   const prior = source('local-user');
   const candidate = source('remote');
   manager.registerSource('local-user', prior);
   manager.registerSource('remote', candidate);
-  await manager.switchToDataset('local-user', 'prior');
+  await selectDataset(manager, 'local-user', 'prior');
 
   const events = [];
   manager.onDatasetChange(event => events.push(event));
@@ -128,7 +136,7 @@ test('dataset selection remains side-effect free until final publication', async
 });
 
 test('selection boundaries reject malformed inputs before source I/O', async t => {
-  const manager = createDataSourceManager();
+  const manager = new DataSourceManager();
   const candidate = source('remote');
   manager.registerSource('remote', candidate);
 
@@ -191,15 +199,14 @@ test('selection boundaries reject malformed inputs before source I/O', async t =
   assert.equal(accessorReads, 0);
 
   for (const [label, operationName, options] of [
-    ['non-boolean switch silent', 'switch', { silent: 1 }],
-    ['switch extra option', 'switch', { extra: true }],
+    ['selection extra option', 'select', { extra: true }],
     ['non-boolean clear silent', 'clear', { silent: 'false' }],
     ['clear extra option', 'clear', { extra: true }],
   ]) {
     await t.test(label, async () => {
       const operation = operationName === 'clear'
         ? Promise.resolve().then(() => manager.clearActiveDataset(options))
-        : manager.switchToDataset('remote', 'dataset', options);
+        : selectDataset(manager, 'remote', 'dataset', options);
       await assert.rejects(operation, TypeError);
       assert.deepEqual(candidate.metadataCalls, []);
     });
@@ -207,11 +214,11 @@ test('selection boundaries reject malformed inputs before source I/O', async t =
 });
 
 test('active source registry cannot be replaced or removed', async () => {
-  const manager = createDataSourceManager();
+  const manager = new DataSourceManager();
   const active = source('remote');
   const replacement = source('remote');
   manager.registerSource('remote', active);
-  await manager.switchToDataset('remote', 'served');
+  await selectDataset(manager, 'remote', 'served');
 
   assert.throws(
     () => manager.registerSource('remote', replacement),
@@ -233,10 +240,10 @@ test('active source registry cannot be replaced or removed', async () => {
 });
 
 test('malformed source results fail before manager publication', async t => {
-  const manager = createDataSourceManager();
+  const manager = new DataSourceManager();
   const prior = source('prior');
   manager.registerSource('prior', prior);
-  await manager.switchToDataset('prior', 'stable');
+  await selectDataset(manager, 'prior', 'stable');
   const events = [];
   manager.onDatasetChange(event => events.push(event));
 
@@ -281,15 +288,15 @@ test('malformed source results fail before manager publication', async t => {
 
 test('stale and failed staged commits preserve the exact prior selection', async t => {
   await t.test('intervening selection supersedes an older stage', async () => {
-    const manager = createDataSourceManager();
+    const manager = new DataSourceManager();
     const alpha = source('alpha');
     const beta = source('beta');
     manager.registerSource('alpha', alpha);
     manager.registerSource('beta', beta);
-    await manager.switchToDataset('alpha', 'prior');
+    await selectDataset(manager, 'alpha', 'prior');
 
     const stale = await manager.stageDatasetSelection('beta', 'stale');
-    await manager.switchToDataset('alpha', 'newer');
+    await selectDataset(manager, 'alpha', 'newer');
     assert.throws(
       () => manager.commitDatasetSelection(stale),
       /superseded/i
@@ -301,13 +308,13 @@ test('stale and failed staged commits preserve the exact prior selection', async
 
   await t.test('cleanup failure retains the fully published candidate', async () => {
     const deactivationFailure = new Error('cannot retire prior source');
-    const manager = createDataSourceManager();
+    const manager = new DataSourceManager();
     const prior = source('local-user', {
       deactivateError: deactivationFailure
     });
     manager.registerSource('local-user', prior);
     manager.registerSource('remote', source('remote'));
-    await manager.switchToDataset('local-user', 'prior');
+    await selectDataset(manager, 'local-user', 'prior');
 
     const stage = await manager.stageDatasetSelection(
       'remote',
@@ -328,10 +335,10 @@ test('stale and failed staged commits preserve the exact prior selection', async
 });
 
 test('None selection uses the same deferred commit and listener boundary', async () => {
-  const manager = createDataSourceManager();
+  const manager = new DataSourceManager();
   const prior = source('remote');
   manager.registerSource('remote', prior);
-  await manager.switchToDataset('remote', 'served');
+  await selectDataset(manager, 'remote', 'served');
   const events = [];
   manager.onDatasetChange(event => events.push(event));
 
@@ -364,13 +371,13 @@ test('None selection uses the same deferred commit and listener boundary', async
 });
 
 test('candidate publication retires one displaced non-active transport', async () => {
-  const manager = createDataSourceManager();
+  const manager = new DataSourceManager();
   const active = source('local-demo');
   const displaced = source('remote');
   const candidate = source('remote');
   manager.registerSource('local-demo', active);
   manager.registerSource('remote', displaced);
-  await manager.switchToDataset('local-demo', 'prior');
+  await selectDataset(manager, 'local-demo', 'prior');
 
   const stage = await manager.stageDatasetSelection(
     'remote',
@@ -391,13 +398,13 @@ test('candidate publication retires one displaced non-active transport', async (
 });
 
 test('unpublished manager commit can roll back after runtime publication failure', async () => {
-  const manager = createDataSourceManager();
+  const manager = new DataSourceManager();
   const prior = source('local-user');
   const displaced = source('remote');
   const candidate = source('remote');
   manager.registerSource('local-user', prior);
   manager.registerSource('remote', displaced);
-  await manager.switchToDataset('local-user', 'prior');
+  await selectDataset(manager, 'local-user', 'prior');
 
   const stage = await manager.stageDatasetSelection(
     'remote',
@@ -430,7 +437,7 @@ test(
       ['jupyter', 'jupyter://viewer/exact/data.bin'],
     ]) {
       await t.test(url.split('://')[0], async () => {
-        const manager = createDataSourceManager();
+        const manager = new DataSourceManager();
         const priorCalls = [];
         const candidateCalls = [];
         const prior = {
@@ -491,7 +498,7 @@ test(
       });
     }
 
-    const manager = createDataSourceManager();
+    const manager = new DataSourceManager();
     await assert.rejects(
       manager.resolveUrlWithSource(
         'https://ordinary.test/data.bin',
@@ -517,26 +524,11 @@ test(
       new URL('../assets/js/data/data-source-manager.js', import.meta.url),
       'utf8',
     );
-    const manager = createDataSourceManager();
+    const manager = new DataSourceManager();
 
-    // `fetch` has no literal call site: session restore-from-URL reaches it
-    // through `requireMethod(ctx.dataSourceManager, 'fetch', ...)`, and figure
-    // export reaches `getStateSnapshot` through a method-name list. Deleting
-    // either because a call-site search came back empty breaks a live path, so
-    // both the lookup and the member are pinned here.
-    const serializerSource = await readFile(
-      new URL(
-        '../assets/js/app/session/session-serializer.js',
-        import.meta.url,
-      ),
-      'utf8',
-    );
-    assert.match(
-      serializerSource,
-      /requireMethod\(\s*ctx\.dataSourceManager,\s*'fetch',/,
-    );
-    assert.equal(typeof manager.fetch, 'function');
-
+    // Figure export reaches `getStateSnapshot` through a method-name list, so
+    // a call-site search comes back empty for a live path: the lookup and the
+    // member are pinned here.
     const exportSource = await readFile(
       new URL(
         '../assets/js/app/ui/modules/figure-export/figure-export-engine.js',
@@ -546,6 +538,14 @@ test(
     );
     assert.match(exportSource, /'getStateSnapshot',/);
     assert.equal(typeof manager.getStateSnapshot, 'function');
+
+    // Session restore from a URL was never wired to the interface and is
+    // gone, and with it the only caller of the manager's `fetch`.
+    assert.equal(
+      manager.fetch,
+      undefined,
+      'fetch has no consumer; re-adding it re-creates dead surface',
+    );
 
     // Nothing anywhere restores a snapshot through the manager, and nothing
     // fetches JSON through it, so neither member may return.

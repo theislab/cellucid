@@ -31,7 +31,6 @@ The Worker exposes only these routes:
 | `/auth/installation-repos` | `POST` | GitHub bearer token | Return every repository in one installation |
 | `/api/repos/*` | `GET`, `POST`, or `PUT` | GitHub bearer token | Proxy the repository API calls used by Cellucid |
 | `/cap/lookup-cells` | `POST` | None; exact allowed `Origin` required | Run the fixed persisted CAP cell lookup and return a bounded projection |
-| `/cap/search-datasets` | `POST` | None; exact allowed `Origin` required | Run the fixed persisted CAP dataset lookup and return a bounded projection |
 
 The root health document and every successful CAP response carry
 `"contractVersion": 1`. The checked-in client pins that exact value as well as
@@ -51,21 +50,20 @@ installation-request fields, wrong JSON types, malformed GitHub responses,
 incomplete pagination, disallowed origins, unsupported routes, and unsupported
 methods fail visibly.
 
-The CAP routes accept only the following exact request objects:
+The CAP route accepts only this exact request object:
 
-- `/cap/lookup-cells`: `{ "kind": "name|ontology|marker|feedback",
-  "term": "...", "limit": 1..25 }`
-- `/cap/search-datasets`: `{ "search": "..." | null, "limit": 1..10 }`
+- `/cap/lookup-cells`: `{ "kind": "name|ontology|marker", "term": "...",
+  "limit": 1..25 }`
 
 The Worker maps the lookup `kind` to fixed upstream APQ variables:
 
-- `name` and `feedback` use `{ "name": term }`.
+- `name` uses `{ "name": term }`.
 - `ontology` uses `{ "name": term, "fields": ["ontologyTermId"] }`.
 - `marker` uses `{ "name": term,
   "fields": ["markerGenes", "canonicalMarkerGenes"] }`.
 
-CAP request bodies are limited to 4 KiB. Name, ontology, feedback, and dataset
-search text is limited to 256 Unicode code points. A marker lookup permits at
+CAP request bodies are limited to 4 KiB. Name and ontology search text is
+limited to 256 Unicode code points. A marker lookup permits at
 most 3,249 code points so the UI can send one deterministic signature made from
 as many as 50 individually validated 64-code-point marker genes plus their
 comma separators; the 4 KiB serialized-body limit remains authoritative.
@@ -136,15 +134,16 @@ remaining active reads, and retains the first error.
 
 ## 1. Prepare Cloudflare
 
-The checked-in Worker contract requires the Cloudflare Workers Paid plan with
-the Standard usage model. Its Wrangler configuration sets `limits.cpu_ms` to
-`1000` so strict duplicate-key request parsing, bounded collection-page
-projection, OAuth validation, and mutation validation remain available for the
-complete supported contract. Read-heavy repository documents are streamed to
-the browser, but a Free-plan deployment is still unsupported: its CPU ceiling
-cannot execute every accepted request reliably, even though small development
-fixtures may appear to work. The one-second limit is a runtime ceiling, not an
-expected per-request cost.
+The production Worker runs on the Cloudflare Workers Free plan, and the
+checked-in Wrangler configuration sets no CPU limit: a configured limit is a
+Workers Paid feature, and Cloudflare refuses to deploy one on Free. Free gives
+each request about 10 ms of CPU time. Read-heavy repository documents are
+streamed to the browser and cost little, but strict duplicate-key parsing of a
+large GitHub collection page, or validation of a large mutation, can exceed
+that budget; such a request fails with `exceededCpu` instead of returning a
+partial result. If a deployment serves repositories large enough to hit it,
+move the account to Workers Paid and add `"limits": { "cpu_ms": 1000 }` to the
+Wrangler configuration.
 
 1. Sign in to Cloudflare and enable a `workers.dev` subdomain for the account.
 2. Keep the Worker name in `wrangler.community-annotations.jsonc` as
@@ -330,7 +329,6 @@ return:
     "/auth/installations",
     "/auth/installation-repos",
     "/cap/lookup-cells",
-    "/cap/search-datasets",
     "/api/repos/*"
   ]
 }
@@ -515,12 +513,11 @@ successful result or forward an upstream error body.
 
 ### Cloudflare reports `exceededCpu`
 
-Confirm that the Worker uses the Paid Standard usage model and that the
-deployed version retains the checked-in `limits.cpu_ms = 1000` setting.
-Workers Free cannot satisfy the complete supported document contract. If a
-paid deployment still reaches the limit, retain the failing request identity
-from the Worker logs, verify the repository document is within the current
-contract, and investigate before increasing the ceiling.
+The request needed more CPU time than the plan allows (about 10 ms per request
+on Workers Free). Retain the failing request identity from the Worker logs and
+check the size of the repository document it handled. If documents of that size
+are expected, move the account to Workers Paid and add
+`"limits": { "cpu_ms": 1000 }` to `wrangler.community-annotations.jsonc`.
 
 ### Cellucid reports storage failure
 

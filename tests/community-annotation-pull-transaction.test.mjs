@@ -61,9 +61,17 @@ function createSession(SessionClass = CommunityAnnotationSession, ...args) {
 }
 
 
-function pulledStateOptions(overrides = {}) {
+/** One Pull's remote user files, folded for `session` as a Pull folds them. */
+function remoteFiles(session, docs) {
+  const files = session.createRemoteUserFiles();
+  for (const doc of docs) files.add(doc);
+  return files;
+}
+
+function pulledStateOptions(session, overrides = {}) {
+  const { remoteUserDocs = [remoteUserDocument()], ...rest } = overrides;
   return {
-    remoteUserDocs: [remoteUserDocument()],
+    remoteUserFiles: remoteFiles(session, remoteUserDocs),
     moderationDocument: moderationDocument(),
     categoricalFieldKeys: ['cell_type', 'batch'],
     fieldsToAnnotate: ['cell_type'],
@@ -77,7 +85,7 @@ function pulledStateOptions(overrides = {}) {
       'annotations/config.json': 'b'.repeat(40),
       'annotations/moderation/merges.json': 'c'.repeat(40),
     },
-    ...overrides,
+    ...rest,
   };
 }
 
@@ -129,7 +137,7 @@ test('Pull prevalidates both raw field inventories before opening its transactio
 
     assert.throws(
       () => session.applyPulledRepositoryState(
-        pulledStateOptions(overrides)
+        pulledStateOptions(session, overrides)
       ),
       /reserved.*field-key|field.*reserved/i,
       label
@@ -169,7 +177,7 @@ test('Pull accepts colon-bearing fields and every safe reserved-prefix lookalike
     clearPendingSave(session);
 
     assert.equal(
-      session.applyPulledRepositoryState(pulledStateOptions({
+      session.applyPulledRepositoryState(pulledStateOptions(session, {
         remoteUserDocs: [],
         moderationDocument: null,
         categoricalFieldKeys: ['cell_type', 'batch', fieldKey],
@@ -205,7 +213,7 @@ test('failed complete Pull application restores prior visible state and emits or
   });
 
   assert.throws(
-    () => session.applyPulledRepositoryState(pulledStateOptions({
+    () => session.applyPulledRepositoryState(pulledStateOptions(session, {
       remoteFileShas: {
         'annotations/users/ghid_7.json': 'not-a-git-sha',
       },
@@ -245,7 +253,7 @@ test('abort after complete-set rebuild rolls back before publishing any session 
   });
 
   assert.throws(
-    () => session.applyPulledRepositoryState(pulledStateOptions({
+    () => session.applyPulledRepositoryState(pulledStateOptions(session, {
       signal: abortController.signal,
     })),
     /Synthetic abort after rebuild/
@@ -267,7 +275,7 @@ test('successful Pull application publishes the whole new session through one ch
   });
 
   assert.equal(
-    session.applyPulledRepositoryState(pulledStateOptions()),
+    session.applyPulledRepositoryState(pulledStateOptions(session)),
     true
   );
 
@@ -282,7 +290,7 @@ test('successful Pull application publishes the whole new session through one ch
   assert.deepEqual(session.getModerationMerges(), moderationDocument().merges);
   assert.deepEqual(
     session.getRemoteFileShas(),
-    pulledStateOptions().remoteFileShas
+    pulledStateOptions(session).remoteFileShas
   );
   assert.deepEqual(
     session.getDatasetAccessMap().synthetic.fieldsToAnnotate,
@@ -323,7 +331,7 @@ test('Pull application preserves pre-existing local moderation intent', () => {
     note: 'Unpublished local merge',
   });
   const localMerges = session.getModerationMerges();
-  session.applyPulledRepositoryState(pulledStateOptions());
+  session.applyPulledRepositoryState(pulledStateOptions(session));
   assert.deepEqual(session.getModerationMerges(), localMerges);
   clearPendingSave(session);
 });
@@ -348,7 +356,7 @@ test('committed Pull ignores observer failure and a reentrant final abort', () =
 
   try {
     assert.equal(
-      session.applyPulledRepositoryState(pulledStateOptions({
+      session.applyPulledRepositoryState(pulledStateOptions(session, {
         signal: controller.signal,
       })),
       true

@@ -85,6 +85,11 @@ test('same-reference live publication preserves immutable kept-view geometry', a
     viewer.setForceLOD(0);
     viewer.setViewLayout('grid', 'live');
 
+    // The levels are built off the main thread; draw until both panes have them.
+    for (let frame = 0; frame < 600; frame++) {
+      if (viewer.getCurrentLODLevel(first.id) >= 0 && viewer.getCurrentLODLevel(second.id) >= 0) break;
+      await new Promise(resolve => requestAnimationFrame(resolve));
+    }
     await new Promise(resolve => {
       requestAnimationFrame(() => requestAnimationFrame(resolve));
     });
@@ -154,9 +159,12 @@ test('same-reference live publication preserves immutable kept-view geometry', a
         firstColor: firstSnapshot.bufferByteLength,
         secondColor: secondSnapshot.bufferByteLength,
         positions: geometry.positionBufferByteLength,
-        expectedColor: firstSnapshot.pointCount * 3,
-        expectedPositions: firstSnapshot.pointCount * 12,
+        expectedColor: firstSnapshot.pointCount * 4,
+        // Four bytes per embedding axis: the view's own components only.
+        expectedPositions:
+          firstSnapshot.pointCount * 4 * viewer.getViewDimension(first.id),
       },
+      positionStride: 4 * viewer.getViewDimension(first.id),
       generationLifecycle: {
         first: renderer.getViewGeometryGeneration(first.id),
         second: renderer.getViewGeometryGeneration(second.id),
@@ -195,10 +203,10 @@ test('same-reference live publication preserves immutable kept-view geometry', a
   expect(publication.gpuPositionsShared).toBe(true);
   expect(publication.colorsIndependent).toBe(true);
   expect(publication.splitAttributeLayout).toEqual({
-    firstPosition: { offset: 0, stride: 12 },
-    firstColor: { offset: 0, stride: 3 },
-    secondPosition: { offset: 0, stride: 12 },
-    secondColor: { offset: 0, stride: 3 },
+    firstPosition: { offset: 0, stride: publication.positionStride },
+    firstColor: { offset: 0, stride: 4 },
+    secondPosition: { offset: 0, stride: publication.positionStride },
+    secondColor: { offset: 0, stride: 4 },
   });
   expect(publication.splitByteOwnership).toEqual({
     firstColor: publication.splitByteOwnership.expectedColor,

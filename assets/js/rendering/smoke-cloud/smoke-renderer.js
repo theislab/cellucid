@@ -3,8 +3,8 @@
 // Encapsulates all smoke/cloud rendering logic extracted from viewer.js
 // Provides a clean API for volumetric cloud visualization
 
+import { requireCleanWebGLState } from '../gl-errors.js';
 import {
-  MAX_SMOKE_LIGHT_SAMPLES,
   SMOKE_COMPOSITE_FS,
   SMOKE_COMPOSITE_VS,
   SMOKE_FS_SOURCE,
@@ -12,27 +12,63 @@ import {
 } from '../shaders/smoke-shaders.js';
 import {
   buildDensityTextureGPU,
+  buildDerivedVolumesGPU,
   createDensityTexture3D,
   disposeDensityPipelineResources,
   invalidateDensityPipelineResources,
 } from './smoke-density.js';
 import {
   MAX_SMOKE_GRID_SIZE,
+  MAX_SMOKE_NOISE_RESOLUTION,
+  MIN_SMOKE_NOISE_RESOLUTION,
   SmokeDensityBuildError,
+  SmokeUnsupportedError,
 } from './smoke-density-contract.js';
+import { detectSmokeSupport } from './smoke-capabilities.js';
 import {
   getResolutionScaleFactor,
   startCloudNoiseTextureGeneration,
 } from './noise-textures.js';
-import {
-  disposePendingCloudNoiseGeneratorResources,
-  invalidatePendingCloudNoiseGeneratorResources,
-} from './gpu-noise-generator.js';
 import { getNotificationCenter } from '../../app/notification-center.js';
 
 const TRANSPARENT_BLACK = new Float32Array([0, 0, 0, 0]);
 const NO_RESOURCE_FAILURES = Object.freeze([]);
 const DEFAULT_SMOKE_NOISE_RESOLUTION = 128;
+
+// Upper bound on rays per frame, whatever the canvas size, device pixel ratio
+// and Render resolution. A ray-marched frame's cost is linear in its pixel
+// count, and one frame that runs past the GPU watchdog (about two seconds on
+// Windows and macOS) loses the whole WebGL context. 2560x1440 rays is the
+// budget: a 4K/retina canvas at 1.0x is rendered at this size and upsampled.
+export const MAX_SMOKE_TARGET_PIXELS = 2560 * 1440;
+
+// Render resolution is a fraction of the canvas; above 1.0 the march would
+// supersample a soft volume at up to four times the cost for no visible gain.
+export const MIN_SMOKE_RESOLUTION_SCALE = 0.25;
+export const MAX_SMOKE_RESOLUTION_SCALE = 1;
+
+/**
+ * Size of the smoke target for a canvas of `width` x `height` at `scale`,
+ * held to MAX_SMOKE_TARGET_PIXELS with its aspect ratio preserved.
+ */
+export function smokeTargetSize(width, height, scale) {
+  let targetW = Math.max(1, Math.floor(width * scale));
+  let targetH = Math.max(1, Math.floor(height * scale));
+  const pixels = targetW * targetH;
+  if (pixels > MAX_SMOKE_TARGET_PIXELS) {
+    const shrink = Math.sqrt(MAX_SMOKE_TARGET_PIXELS / pixels);
+    targetW = Math.max(1, Math.floor(targetW * shrink));
+    targetH = Math.max(1, Math.floor(targetH * shrink));
+  }
+  return { width: targetW, height: targetH };
+}
+
+function sameDirection(a, b) {
+  return a !== null
+    && a[0] === b[0]
+    && a[1] === b[1]
+    && a[2] === b[2];
+}
 
 function asError(value, message) {
   return value instanceof Error ? value : new Error(message);
@@ -104,23 +140,6 @@ function requireVector3(value, owner) {
   return value;
 }
 
-function requireCleanWebGLState(gl, owner) {
-  const errors = [];
-  for (let index = 0; index < 32; index++) {
-    const errorCode = gl.getError();
-    if (errorCode === gl.NO_ERROR) break;
-    errors.push(errorCode);
-    if (errorCode === gl.CONTEXT_LOST_WEBGL) break;
-  }
-  if (errors.length > 0) {
-    throw new Error(
-      `${owner} encountered WebGL error${errors.length === 1 ? '' : 's'} `
-      + errors.map(code => `0x${code.toString(16)}`).join(', ')
-      + '.'
-    );
-  }
-}
-
 export class SmokeRenderer {
   constructor(gl, createProgram) {
     if (!gl || typeof gl !== 'object') {
@@ -129,8 +148,104 @@ export class SmokeRenderer {
     if (typeof createProgram !== 'function') {
       throw new TypeError('SmokeRenderer requires the exact shader-program factory.');
     }
-    requireCleanWebGLState(gl, 'SmokeRenderer construction preflight');
     this.gl = gl;
+    // Programs and fullscreen vertex state are published on the first frame
+    // that has a volume and its noise to draw (`_ensurePrograms`), so a
+    // session that never shows smoke never compiles its shaders.
+    this._createProgram = createProgram;
+    this.smokeProgram = null;
+    this.compositeProgram = null;
+    this.smokeAttribLocations = null;
+    this.compositeAttribLocations = null;
+    this.smokeUniformLocations = null;
+    this.compositeUniformLocations = null;
+    this.quadBuffer = null;
+    this.smokeVertexArray = null;
+    this.compositeVertexArray = null;
+
+    // === STATE ===
+    this.textureInfo = null;
+    // Lighting and occupancy volumes derived from textureInfo for one light
+    // direction (buildDerivedVolumesGPU); rebuilt lazily when either changes.
+    this.derivedVolumes = null;
+    this._derivedVolumesSource = null;
+    this._derivedVolumesDirection = null;
+    this.volumeMin = new Float32Array([-1, -1, -1]);
+    this.volumeMax = new Float32Array([1, 1, 1]);
+
+    // Construction defaults; the sidebar publishes its own values on start.
+    this.noiseResolution = DEFAULT_SMOKE_NOISE_RESOLUTION;
+    this.density = 1.0;
+    this.noiseScale = getResolutionScaleFactor(this.noiseResolution);
+    this.warpStrength = 0.2;
+    this.stepMultiplier = 1.5;
+    this.animationSpeed = 1.0;
+    this.detailLevel = 2.0;
+    this.lightAbsorption = 1.0;
+    this.scatterStrength = 1.0;
+    this.edgeSoftness = 0.3;
+    this.directLight = 1.0;
+
+    // Resolution scaling
+    this.resolutionScale = 0.5;
+    this.framebuffer = null;
+    this.colorTex = null;
+    this.targetWidth = 0;
+    this.targetHeight = 0;
+
+    // Noise textures
+    this.noiseTextures = null;
+    this.noiseGenerationInProgress = false;
+    this.noiseGenerationError = null;
+    this.noiseGenerationToken = 0;
+    this._noiseGenerationTransaction = null;
+    this.contextLost = false;
+    this._pendingTextureDeletes = new Set();
+    this._pendingFramebufferDeletes = new Set();
+    this._pendingBufferDeletes = new Set();
+    this._pendingVertexArrayDeletes = new Set();
+    this._pendingProgramDeletes = new Set();
+    this._pendingDensityPipelineDisposal = false;
+    this._disposeStarted = false;
+    this.disposed = false;
+
+    // Animation: procedural time advances only while the smoke animates, so
+    // pausing (speed 0) and resuming continues where the motion stopped.
+    this.animationTime = 0;
+    this._lastRenderTime = null;
+  }
+
+  /**
+   * Whether this context can run smoke at all (smoke-capabilities.js),
+   * detected once from extension and limit queries.
+   */
+  getSupport() {
+    this._support ??= detectSmokeSupport(this.gl);
+    return this._support;
+  }
+
+  /**
+   * Whether the next frame can differ from the last one with nothing else
+   * changing: the smoke animates, or its volume is waiting for noise textures.
+   * A still smoke view with a still camera needs no frames at all.
+   */
+  needsContinuousFrames() {
+    if (this.contextLost || this.disposed || this._disposeStarted) return false;
+    if (this.textureInfo === null) return false;
+    return this.animationSpeed > 0 || this.noiseTextures === null;
+  }
+
+  /**
+   * Compile and publish the smoke and composite programs with their shared
+   * fullscreen-triangle buffer and vertex arrays, once. A failure rolls back
+   * every staged resource and leaves nothing published, so the next frame
+   * attempts the whole publication again.
+   */
+  _ensurePrograms() {
+    if (this.smokeProgram !== null) return;
+    const gl = this.gl;
+    const createProgram = this._createProgram;
+    requireCleanWebGLState(gl, 'SmokeRenderer program preflight');
     const previousVertexArray = gl.getParameter(gl.VERTEX_ARRAY_BINDING);
     const previousArrayBuffer = gl.getParameter(gl.ARRAY_BUFFER_BINDING);
     let smokeProgram = null;
@@ -184,15 +299,14 @@ export class SmokeRenderer {
         volumeMin:         gl.getUniformLocation(smokeProgram, 'u_volumeMin'),
         volumeMax:         gl.getUniformLocation(smokeProgram, 'u_volumeMax'),
         densityTex3D:      gl.getUniformLocation(smokeProgram, 'u_densityTex3D'),
+        lightTex3D:        gl.getUniformLocation(smokeProgram, 'u_lightTex3D'),
+        occupancyTex3D:    gl.getUniformLocation(smokeProgram, 'u_occupancyTex3D'),
         gridSize:          gl.getUniformLocation(smokeProgram, 'u_gridSize'),
         shapeNoise:        gl.getUniformLocation(smokeProgram, 'u_shapeNoise'),
         detailNoise:       gl.getUniformLocation(smokeProgram, 'u_detailNoise'),
         blueNoise:         gl.getUniformLocation(smokeProgram, 'u_blueNoise'),
-        blueNoiseOffset:   gl.getUniformLocation(smokeProgram, 'u_blueNoiseOffset'),
-        smokeColor:        gl.getUniformLocation(smokeProgram, 'u_smokeColor'),
         lightDir:          gl.getUniformLocation(smokeProgram, 'u_lightDir'),
         time:              gl.getUniformLocation(smokeProgram, 'u_time'),
-        animationSpeed:    gl.getUniformLocation(smokeProgram, 'u_animationSpeed'),
         densityMultiplier: gl.getUniformLocation(smokeProgram, 'u_densityMultiplier'),
         stepMultiplier:    gl.getUniformLocation(smokeProgram, 'u_stepMultiplier'),
         noiseScale:        gl.getUniformLocation(smokeProgram, 'u_noiseScale'),
@@ -202,7 +316,6 @@ export class SmokeRenderer {
         scatterStrength:   gl.getUniformLocation(smokeProgram, 'u_scatterStrength'),
         edgeSoftness:      gl.getUniformLocation(smokeProgram, 'u_edgeSoftness'),
         directLight:       gl.getUniformLocation(smokeProgram, 'u_directLightIntensity'),
-        lightSamples:      gl.getUniformLocation(smokeProgram, 'u_lightSamples'),
       };
       compositeUniformLocations = {
         smokeTex:          gl.getUniformLocation(compositeProgram, 'u_smokeTex'),
@@ -248,12 +361,12 @@ export class SmokeRenderer {
       }
       requireCleanWebGLState(
         gl,
-        'SmokeRenderer candidate construction'
+        'SmokeRenderer candidate program publication'
       );
     } catch (error) {
       failures.push(asError(
         error,
-        'SmokeRenderer construction failed with a non-Error value.'
+        'SmokeRenderer program publication failed with a non-Error value.'
       ));
     }
     attempt(
@@ -270,9 +383,9 @@ export class SmokeRenderer {
       failures,
       () => requireCleanWebGLState(
         gl,
-        'SmokeRenderer construction settlement'
+        'SmokeRenderer program settlement'
       ),
-      'SmokeRenderer construction settlement inspection failed with a non-Error value.'
+      'SmokeRenderer program settlement inspection failed with a non-Error value.'
     );
     if (failures.length > 0) {
       for (const vertexArray of [
@@ -305,13 +418,13 @@ export class SmokeRenderer {
         failures,
         () => requireCleanWebGLState(
           gl,
-          'SmokeRenderer construction rollback'
+          'SmokeRenderer program rollback'
         ),
-        'SmokeRenderer construction rollback inspection failed with a non-Error value.'
+        'SmokeRenderer program rollback inspection failed with a non-Error value.'
       );
       throwFailures(
         failures,
-        'SmokeRenderer construction and rollback failed.'
+        'SmokeRenderer program publication and rollback failed.'
       );
     }
     this.smokeProgram = smokeProgram;
@@ -323,57 +436,45 @@ export class SmokeRenderer {
     this.quadBuffer = quadBuffer;
     this.smokeVertexArray = smokeVertexArray;
     this.compositeVertexArray = compositeVertexArray;
-
-    // === STATE ===
-    this.textureInfo = null;
-    this.volumeMin = new Float32Array([-1, -1, -1]);
-    this.volumeMax = new Float32Array([1, 1, 1]);
-
-    // Tuned default values for visible, realistic volumetric clouds
-    this.noiseResolution = DEFAULT_SMOKE_NOISE_RESOLUTION;
-    this.density = 8.0;
-    this.noiseScale = getResolutionScaleFactor(this.noiseResolution);
-    this.warpStrength = 0.2;
-    this.stepMultiplier = 2.8;
-    this.animationSpeed = 1.0;
-    this.detailLevel = 3.8;
-    this.lightAbsorption = 1.5;
-    this.scatterStrength = 0.0;
-    this.edgeSoftness = 0.3;
-    this.lightSamples = 6;
-    this.directLight = 0.06;
-    this.color = new Float32Array([0.98, 0.98, 1.0]);
-
-    // Resolution scaling
-    this.resolutionScale = 0.5;
-    this.framebuffer = null;
-    this.colorTex = null;
-    this.targetWidth = 0;
-    this.targetHeight = 0;
-
-    // Noise textures
-    this.noiseTextures = null;
-    this.noiseGenerationInProgress = false;
-    this.noiseGenerationError = null;
-    this.noiseGenerationToken = 0;
-    this._noiseGenerationTransaction = null;
-    this.contextLost = false;
-    this._pendingTextureDeletes = new Set();
-    this._pendingFramebufferDeletes = new Set();
-    this._pendingBufferDeletes = new Set();
-    this._pendingVertexArrayDeletes = new Set();
-    this._pendingProgramDeletes = new Set();
-    this._pendingDensityPipelineDisposal = false;
-    this._pendingNoiseGeneratorDisposal = false;
-    this._disposeStarted = false;
-    this.disposed = false;
-
-    // Animation
-    this.startTime = performance.now();
-    this.frameIndex = 0;
   }
 
   // === VOLUME MANAGEMENT ===
+
+  /** Queue the derived volumes for deletion and forget them. */
+  _retireDerivedVolumes() {
+    const derived = this.derivedVolumes;
+    this.derivedVolumes = null;
+    this._derivedVolumesSource = null;
+    this._derivedVolumesDirection = null;
+    if (derived) {
+      this._pendingTextureDeletes.add(derived.lightTexture);
+      this._pendingTextureDeletes.add(derived.occupancyTexture);
+    }
+  }
+
+  /**
+   * Publish the lighting and occupancy volumes for the current density volume
+   * and light direction, building them only when either changed.
+   */
+  _ensureDerivedVolumes(lightDir) {
+    const source = this.textureInfo.texture;
+    if (
+      this.derivedVolumes !== null
+      && this._derivedVolumesSource === source
+      && sameDirection(this._derivedVolumesDirection, lightDir)
+    ) {
+      return;
+    }
+    this._retireDerivedVolumes();
+    this._convergePendingDirectResources('Smoke derived-volume replacement');
+    const direction = Array.from(lightDir);
+    this.derivedVolumes = buildDerivedVolumesGPU(this.gl, source, {
+      gridSize: this.textureInfo.gridSize,
+      lightDir: direction,
+    });
+    this._derivedVolumesSource = source;
+    this._derivedVolumesDirection = direction;
+  }
 
   _assertMutableLifecycle(operation) {
     // Context loss also starts terminal disposal, but it is the authoritative
@@ -589,6 +690,7 @@ export class SmokeRenderer {
     const nextTextureInfo = createDensityTexture3D(gl, volumeDesc);
     const previousTexture = this.textureInfo?.texture ?? null;
     this.textureInfo = nextTextureInfo;
+    this._retireDerivedVolumes();
     this.volumeMin.set(boundsMin);
     this.volumeMax.set(boundsMax);
     if (previousTexture) {
@@ -605,12 +707,13 @@ export class SmokeRenderer {
     this._convergePendingDirectResources('Smoke volume clearing');
     const previousTexture = this.textureInfo?.texture ?? null;
     this.textureInfo = null;
+    this._retireDerivedVolumes();
     if (previousTexture) {
       this._pendingTextureDeletes.add(previousTexture);
-      this._convergePendingDirectResources(
-        'Smoke cleared-volume retirement'
-      );
     }
+    this._convergePendingDirectResources(
+      'Smoke cleared-volume retirement'
+    );
   }
 
   buildVolumeGPU(positions, options = {}) {
@@ -619,6 +722,10 @@ export class SmokeRenderer {
       'GPU smoke density publication'
     );
     const gl = this.gl;
+    // A device that cannot run smoke is refused before any work or progress
+    // notification; its owner reports the human reason.
+    const support = this.getSupport();
+    if (!support.supported) throw new SmokeUnsupportedError(support);
     const notifications = getNotificationCenter();
     const notificationId = notifications.startCalculation(
       'Building smoke density volume',
@@ -730,9 +837,11 @@ export class SmokeRenderer {
         }
       }
       try {
+        // The headline is for the person using the app; the exact failure
+        // travels on the thrown error and is logged by its owner.
         notifications.failCalculation(
           notificationId,
-          `Smoke density unavailable: ${failures[0].message}`
+          'Volumetric smoke could not be built. Points rendering works as usual.'
         );
       } catch (notificationError) {
         failures.push(asError(
@@ -754,6 +863,7 @@ export class SmokeRenderer {
       previousTexture !== null
       && previousTexture !== candidate?.texture
     ) {
+      this._retireDerivedVolumes();
       this._pendingTextureDeletes.add(previousTexture);
       this._convergePendingDirectResources(
         'GPU smoke prior-density retirement'
@@ -777,6 +887,7 @@ export class SmokeRenderer {
     if (this.contextLost) return false;
     const hadDirectPublication = Boolean(
       this.textureInfo?.texture ||
+      this.derivedVolumes?.lightTexture ||
       this.noiseTextures?.shape ||
       this.noiseTextures?.detail ||
       this.noiseTextures?.blueNoise ||
@@ -797,6 +908,9 @@ export class SmokeRenderer {
     this._noiseGenerationTransaction = null;
     const transactionInvalidated = noiseTransaction?.invalidate() ?? false;
     this.textureInfo = null;
+    this.derivedVolumes = null;
+    this._derivedVolumesSource = null;
+    this._derivedVolumesDirection = null;
     this.noiseTextures = null;
     this.framebuffer = null;
     this.colorTex = null;
@@ -817,16 +931,11 @@ export class SmokeRenderer {
     this._pendingVertexArrayDeletes?.clear();
     this._pendingProgramDeletes?.clear();
     this._pendingDensityPipelineDisposal = false;
-    this._pendingNoiseGeneratorDisposal = false;
     const densityInvalidated = invalidateDensityPipelineResources(this.gl);
-    const noiseInvalidated =
-      invalidatePendingCloudNoiseGeneratorResources(this.gl);
     return (
       hadDirectPublication
-      ||
-      transactionInvalidated
+      || transactionInvalidated
       || densityInvalidated
-      || noiseInvalidated
     );
   }
 
@@ -863,20 +972,6 @@ export class SmokeRenderer {
           2
         )
       ],
-      lightSamples: (value) => {
-        requireFiniteNumber(
-          value,
-          'SmokeRenderer lightSamples',
-          1,
-          MAX_SMOKE_LIGHT_SAMPLES
-        );
-        if (!Number.isInteger(value)) {
-          throw new TypeError(
-            'SmokeRenderer lightSamples must be an integer.'
-          );
-        }
-        return ['lightSamples', value];
-      },
     };
     const staged = {};
     for (const [key, value] of Object.entries(params)) {
@@ -898,15 +993,20 @@ export class SmokeRenderer {
     const exactScale = requireFiniteNumber(
       scale,
       'SmokeRenderer resolutionScale',
-      0.25,
-      2
+      MIN_SMOKE_RESOLUTION_SCALE,
+      MAX_SMOKE_RESOLUTION_SCALE
     );
     if (exactScale === this.resolutionScale) return;
     this.resolutionScale = exactScale;
     this.targetWidth = 0;
     this.targetHeight = 0;
-    if (exactScale !== 1) return;
+    // Native scale draws straight into the scene unless the canvas exceeds
+    // the ray budget, in which case the next frame allocates a fresh target.
+    if (exactScale === 1) this._releaseRenderTarget();
+  }
 
+  /** Release the offscreen target once frames are drawn without it. */
+  _releaseRenderTarget() {
     const previousFramebuffer = this.framebuffer;
     const previousTexture = this.colorTex;
     this.framebuffer = null;
@@ -917,6 +1017,8 @@ export class SmokeRenderer {
     if (previousTexture) {
       this._pendingTextureDeletes.add(previousTexture);
     }
+    this.targetWidth = 0;
+    this.targetHeight = 0;
     this._convergePendingDirectResources(
       'Native-resolution smoke target cleanup'
     );
@@ -931,7 +1033,12 @@ export class SmokeRenderer {
     this._convergePendingDirectResources(
       'Smoke noise-resolution publication'
     );
-    requireFiniteNumber(size, 'SmokeRenderer noise resolution', 32, 256);
+    requireFiniteNumber(
+      size,
+      'SmokeRenderer noise resolution',
+      MIN_SMOKE_NOISE_RESOLUTION,
+      MAX_SMOKE_NOISE_RESOLUTION
+    );
     if (!Number.isInteger(size)) {
       throw new TypeError('SmokeRenderer noise resolution must be an integer.');
     }
@@ -963,10 +1070,6 @@ export class SmokeRenderer {
     return this.noiseResolution;
   }
 
-  getAdaptiveScaleFactor() {
-    return getResolutionScaleFactor(this.noiseResolution);
-  }
-
   hasPendingNoiseGeneration() {
     return (this._noiseGenerationTransaction ?? null)?.running === true;
   }
@@ -987,40 +1090,6 @@ export class SmokeRenderer {
     return this._cancelNoiseGeneration('Smoke render-mode switch');
   }
 
-  setQualityPreset(preset) {
-    this._assertMutableLifecycle('change quality preset');
-    switch (preset) {
-      case 'performance':
-        this.stepMultiplier = 0.6;
-        this.detailLevel = 1.0;
-        this.lightSamples = 3;
-        this.setResolutionScale(0.5);
-        break;
-      case 'balanced':
-        this.stepMultiplier = 1.0;
-        this.detailLevel = 2.0;
-        this.lightSamples = 6;
-        this.setResolutionScale(0.5);
-        break;
-      case 'quality':
-        this.stepMultiplier = 1.5;
-        this.detailLevel = 3.0;
-        this.lightSamples = 8;
-        this.setResolutionScale(1.0);
-        break;
-      case 'ultra':
-        this.stepMultiplier = 2.0;
-        this.detailLevel = 4.0;
-        this.lightSamples = MAX_SMOKE_LIGHT_SAMPLES;
-        this.setResolutionScale(1.0);
-        break;
-      default:
-        throw new RangeError(
-          'SmokeRenderer quality preset must be performance, balanced, quality, or ultra.'
-        );
-    }
-  }
-
   // === FRAMEBUFFER MANAGEMENT ===
 
   ensureRenderTarget(w, h) {
@@ -1031,9 +1100,8 @@ export class SmokeRenderer {
     const gl = this.gl;
     requireFiniteNumber(w, 'SmokeRenderer target width', Number.MIN_VALUE);
     requireFiniteNumber(h, 'SmokeRenderer target height', Number.MIN_VALUE);
-    const scale = this.resolutionScale;
-    const targetW = Math.max(1, Math.floor(w * scale));
-    const targetH = Math.max(1, Math.floor(h * scale));
+    const { width: targetW, height: targetH } =
+      smokeTargetSize(w, h, this.resolutionScale);
 
     if (this.framebuffer && targetW === this.targetWidth && targetH === this.targetHeight) {
       return;
@@ -1402,10 +1470,27 @@ export class SmokeRenderer {
     if (!this.noiseTextures) {
       return;
     }
+    this._ensurePrograms();
+    this._ensureDerivedVolumes(lightDir);
 
-    const needsOffscreen = this.resolutionScale !== 1.0;
+    const target = smokeTargetSize(width, height, this.resolutionScale);
+    const needsOffscreen =
+      target.width !== width || target.height !== height;
+    if (!needsOffscreen && this.framebuffer !== null) {
+      this._releaseRenderTarget();
+    }
     let targetW = width, targetH = height;
-    const nextFrameIndex = this.frameIndex + 1;
+
+    // Advance procedural time only while animating; a long pause between
+    // frames (an idle, still view) does not make the motion jump. A frame
+    // that fails publishes no time.
+    const now = performance.now();
+    const nextAnimationTime = this._lastRenderTime === null
+      ? this.animationTime
+      : this.animationTime + Math.min(
+        0.1,
+        (now - this._lastRenderTime) * 0.001
+      ) * this.animationSpeed;
     const failures = [];
     try {
       gl.disable(gl.DEPTH_TEST);
@@ -1449,15 +1534,8 @@ export class SmokeRenderer {
         this.smokeUniformLocations.gridSize,
         this.textureInfo.gridSize
       );
-      gl.uniform3fv(this.smokeUniformLocations.smokeColor, this.color);
       gl.uniform3fv(this.smokeUniformLocations.lightDir, lightDir);
-
-      const timeSeconds = (performance.now() - this.startTime) * 0.001;
-      gl.uniform1f(this.smokeUniformLocations.time, timeSeconds);
-      gl.uniform1f(
-        this.smokeUniformLocations.animationSpeed,
-        this.animationSpeed
-      );
+      gl.uniform1f(this.smokeUniformLocations.time, nextAnimationTime);
       gl.uniform1f(
         this.smokeUniformLocations.densityMultiplier,
         this.density
@@ -1491,23 +1569,6 @@ export class SmokeRenderer {
         this.smokeUniformLocations.directLight,
         this.directLight
       );
-      gl.uniform1i(
-        this.smokeUniformLocations.lightSamples,
-        this.lightSamples
-      );
-
-      const phi = 1.618033988749895;
-      const blueNoiseOffsetX = (
-        (nextFrameIndex * phi) % 1.0
-      ) * 128.0;
-      const blueNoiseOffsetY = (
-        (nextFrameIndex * phi * phi) % 1.0
-      ) * 128.0;
-      gl.uniform2f(
-        this.smokeUniformLocations.blueNoiseOffset,
-        blueNoiseOffsetX,
-        blueNoiseOffsetY
-      );
 
       gl.activeTexture(gl.TEXTURE0);
       gl.bindTexture(gl.TEXTURE_3D, this.textureInfo.texture);
@@ -1524,6 +1585,14 @@ export class SmokeRenderer {
       gl.activeTexture(gl.TEXTURE3);
       gl.bindTexture(gl.TEXTURE_2D, this.noiseTextures.blueNoise);
       gl.uniform1i(this.smokeUniformLocations.blueNoise, 3);
+
+      gl.activeTexture(gl.TEXTURE4);
+      gl.bindTexture(gl.TEXTURE_3D, this.derivedVolumes.lightTexture);
+      gl.uniform1i(this.smokeUniformLocations.lightTex3D, 4);
+
+      gl.activeTexture(gl.TEXTURE5);
+      gl.bindTexture(gl.TEXTURE_3D, this.derivedVolumes.occupancyTexture);
+      gl.uniform1i(this.smokeUniformLocations.occupancyTex3D, 5);
 
       gl.drawArrays(gl.TRIANGLES, 0, 3);
 
@@ -1640,7 +1709,8 @@ export class SmokeRenderer {
     if (failures.length > 0) {
       throwFailures(failures, 'Smoke rendering or state settlement failed.');
     }
-    this.frameIndex = nextFrameIndex;
+    this.animationTime = nextAnimationTime;
+    this._lastRenderTime = now;
   }
 
   // === CLEANUP ===
@@ -1652,7 +1722,6 @@ export class SmokeRenderer {
     this._pendingVertexArrayDeletes ??= new Set();
     this._pendingProgramDeletes ??= new Set();
     this._pendingDensityPipelineDisposal ??= false;
-    this._pendingNoiseGeneratorDisposal ??= false;
     this._noiseGenerationTransaction ??= null;
     this._disposeStarted ??= false;
   }
@@ -1660,6 +1729,8 @@ export class SmokeRenderer {
   _stageTerminalResourcesForDisposal() {
     const textures = new Set([
       this.textureInfo?.texture,
+      this.derivedVolumes?.lightTexture,
+      this.derivedVolumes?.occupancyTexture,
       this.noiseTextures?.shape,
       this.noiseTextures?.detail,
       this.noiseTextures?.blueNoise,
@@ -1693,11 +1764,13 @@ export class SmokeRenderer {
       }
     }
     this._pendingDensityPipelineDisposal = true;
-    this._pendingNoiseGeneratorDisposal = true;
 
     // Detach the complete live publication before the first fallible GL
     // operation. The pending sets remain the authoritative exact owners.
     this.textureInfo = null;
+    this.derivedVolumes = null;
+    this._derivedVolumesSource = null;
+    this._derivedVolumesDirection = null;
     this.noiseTextures = null;
     this.framebuffer = null;
     this.colorTex = null;
@@ -1721,17 +1794,6 @@ export class SmokeRenderer {
         failures.push(asError(
           error,
           'Smoke density-pipeline disposal failed with a non-Error value.'
-        ));
-      }
-    }
-    if (this._pendingNoiseGeneratorDisposal) {
-      try {
-        disposePendingCloudNoiseGeneratorResources(gl);
-        this._pendingNoiseGeneratorDisposal = false;
-      } catch (error) {
-        failures.push(asError(
-          error,
-          'Smoke noise-generator disposal failed with a non-Error value.'
         ));
       }
     }
@@ -1777,9 +1839,7 @@ export class SmokeRenderer {
       this._pendingVertexArrayDeletes.clear();
       this._pendingProgramDeletes.clear();
       this._pendingDensityPipelineDisposal = false;
-      this._pendingNoiseGeneratorDisposal = false;
       invalidateDensityPipelineResources(this.gl);
-      invalidatePendingCloudNoiseGeneratorResources(this.gl);
       this.disposed = true;
       return true;
     }

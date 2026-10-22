@@ -9,6 +9,8 @@ import {
   getMetadataLoadSignal,
   throwIfMetadataAborted,
 } from './metadata-load-contract.js';
+import { compareCodePoints } from './data-mapping.js';
+import { StateValidator } from '../app/utils/state-validator.js';
 
 /**
  * @typedef {Object} DatasetStats
@@ -33,7 +35,7 @@ import {
  * @property {number|null} compression - Gzip compression level
  * @property {number|null} var_quantization - Gene expression quantization bits
  * @property {number|null} obs_continuous_quantization - Continuous obs quantization bits
- * @property {string} obs_categorical_dtype - Categorical dtype ('uint8' or 'uint16')
+ * @property {string} obs_categorical_dtype - Categorical dtype ('uint8', 'uint16' or 'uint32')
  */
 
 /**
@@ -50,7 +52,7 @@ import {
  * @property {string} name - Human-readable display name
  * @property {string} description - Description (may be empty)
  * @property {string} [created_at] - ISO timestamp of export
- * @property {string} cellucid_data_version - Version of cellucid-data used
+ * @property {string} cellucid_data_version - Version of the cellucid package (Python or R) that wrote the export
  * @property {DatasetStats} stats - Dataset statistics
  * @property {Object} embeddings - Exact available/default embedding metadata
  * @property {DatasetObsField[]} obs_fields - List of observation fields
@@ -213,33 +215,23 @@ export const DATA_CONFIG = {
     'obs_manifest.json'
   ],
 
-  // Points files - check for dimensional files (3D preferred, then 2D, then 1D)
-  POINTS_FILES: ['points_3d.bin', 'points_2d.bin', 'points_1d.bin'],
-
   // Metadata file name
   DATASET_IDENTITY_FILE: 'dataset_identity.json',
 
   // Supported schema versions
   SUPPORTED_MANIFEST_VERSIONS: [1],
-  SUPPORTED_IDENTITY_VERSIONS: [2]
+  SUPPORTED_IDENTITY_VERSIONS: [3]
 };
 
 // ============================================================================
-// PAYLOAD BYTE CEILINGS
+// PAYLOAD SIZES
 // ============================================================================
 // Datasets are untrusted input: a user opens somebody else's GitHub repository
-// the same way they open their own directory. Both paths therefore share one
-// ceiling, so a payload refused on disk is refused over the network too.
-
-/**
- * Largest single binary payload the browser will materialize from any source.
- */
-export const MAX_PREPARED_BROWSER_BYTES = 512 * 1024 * 1024;
-
-/**
- * Largest metadata/manifest JSON document accepted from any source.
- */
-export const MAX_METADATA_JSON_BYTES = 64 * 1024 * 1024;
+// the same way they open their own directory. A binary payload's size is not
+// capped by a fixed number: every one is declared exactly by its manifest
+// (cells x item size, edges x item size), checked against the transfer and the
+// gzip envelope, and the only limit is the memory the browser grants. A
+// refused allocation is reported as a TOO_LARGE load error naming the bytes.
 
 /**
  * The exact error a byte ceiling refuses with.
@@ -255,7 +247,7 @@ export const MAX_METADATA_JSON_BYTES = 64 * 1024 * 1024;
  * @param {Object} [details]
  * @returns {DataSourceError}
  */
-function payloadTooLargeError(message, details = {}) {
+export function payloadTooLargeError(message, details = {}) {
   return new DataSourceError(
     message,
     DataSourceErrorCode.TOO_LARGE,
@@ -265,31 +257,42 @@ function payloadTooLargeError(message, details = {}) {
 }
 
 /**
- * Validate a manifest-declared payload length against the browser ceiling.
- *
- * Runs before the request is issued, so an over-declared payload costs no
- * network traffic at all.
+ * Validate a manifest-declared payload length.
  *
  * @param {number} expectedBytes - Manifest-declared decoded length
  * @param {string} label - Payload identity for the error message
  * @returns {number} The validated length
  */
-export function requirePayloadBudget(expectedBytes, label) {
+export function requireDeclaredPayloadLength(expectedBytes, label) {
   if (!Number.isSafeInteger(expectedBytes) || expectedBytes < 0) {
-    // Not a size refusal: nothing was measured against the ceiling, and the
-    // caller passed something that is not a length at all.
     throw new RangeError(
       `${label}: declared payload length must be a non-negative safe integer, ` +
       `received ${String(expectedBytes)}`
     );
   }
-  if (expectedBytes > MAX_PREPARED_BROWSER_BYTES) {
+  return expectedBytes;
+}
+
+/**
+ * Allocate a payload buffer, reporting a refused allocation as a TOO_LARGE
+ * load error that names the bytes (the browser's memory, not a fixed cap,
+ * is the limit).
+ *
+ * @param {number} byteLength
+ * @param {string} label
+ * @returns {Uint8Array}
+ */
+export function allocatePayloadBytes(byteLength, label) {
+  try {
+    return new Uint8Array(byteLength);
+  } catch (error) {
+    if (!(error instanceof RangeError)) throw error;
     throw payloadTooLargeError(
-      `${label}: declared payload of ${expectedBytes} bytes exceeds the 512 MiB browser limit`,
-      { label, declaredBytes: expectedBytes, maxBytes: MAX_PREPARED_BROWSER_BYTES }
+      `${label}: the browser could not allocate ${byteLength.toLocaleString('en-US')} bytes ` +
+      'for this payload (not enough memory)',
+      { label, declaredBytes: byteLength }
     );
   }
-  return expectedBytes;
 }
 
 /**
@@ -320,7 +323,7 @@ function requireByteCeiling(maxBytes, label) {
 
 /**
  * Read a response body into one Uint8Array, cancelling the source stream the
- * moment it grows past `maxBytes`.
+ * moment it grows past `maxBytes` or the read fails for any other reason.
  *
  * This enforces a *ceiling*, which is deliberately not the same contract as
  * the exact-output-length reader owned by the session gzip codec
@@ -334,7 +337,8 @@ function requireByteCeiling(maxBytes, label) {
  * @param {number} options.maxBytes - Hard ceiling on transferred bytes
  * @param {AbortSignal|null} [options.signal]
  * @param {((loadedBytes: number, totalBytes: number|null) => void)|null} [options.onProgress]
- * @param {number|null} [options.totalBytes] - Declared transfer size for progress
+ * @param {number|null} [options.totalBytes] - Declared transfer size, used for
+ *   progress and as the preallocation size for the body buffer
  * @returns {Promise<Uint8Array>}
  */
 export async function readBoundedBody(response, options) {
@@ -361,6 +365,13 @@ export async function readBoundedBody(response, options) {
     );
   }
 
+  // A declared size within the ceiling is preallocated once, so the body is
+  // copied straight into its final buffer. Without one (or when the body
+  // outgrows it) chunks are kept and joined once at the end.
+  const sizeHint = Number.isSafeInteger(totalBytes) && totalBytes > 0
+    ? Math.min(totalBytes, maxBytes)
+    : 0;
+  let preallocated = sizeHint > 0 ? allocatePayloadBytes(sizeHint, label) : null;
   const chunks = [];
   let loadedBytes = 0;
   const reader = body.getReader();
@@ -373,28 +384,43 @@ export async function readBoundedBody(response, options) {
         ? value
         : new Uint8Array(value);
       if (chunk.byteLength === 0) continue;
-      loadedBytes += chunk.byteLength;
-      if (loadedBytes > maxBytes) {
-        // Stop the transfer immediately rather than paying for the rest of it.
-        await reader.cancel(
-          `${label}: transfer exceeded its ${maxBytes}-byte ceiling`
-        );
+      const nextLoadedBytes = loadedBytes + chunk.byteLength;
+      if (nextLoadedBytes > maxBytes) {
         throw payloadTooLargeError(
-          `${label}: transfer of at least ${loadedBytes} bytes exceeds ` +
+          `${label}: transfer of at least ${nextLoadedBytes} bytes exceeds ` +
           `its ${maxBytes}-byte ceiling`,
-          { label, loadedBytes, maxBytes }
+          { label, loadedBytes: nextLoadedBytes, maxBytes }
         );
       }
-      chunks.push(chunk);
+      if (preallocated !== null && nextLoadedBytes > preallocated.byteLength) {
+        chunks.push(preallocated.subarray(0, loadedBytes));
+        preallocated = null;
+      }
+      if (preallocated !== null) {
+        preallocated.set(chunk, loadedBytes);
+      } else {
+        chunks.push(chunk);
+      }
+      loadedBytes = nextLoadedBytes;
       if (onProgress !== null) onProgress(loadedBytes, totalBytes);
     }
+    throwIfMetadataAborted(signal, label);
+  } catch (error) {
+    // Whatever ended the read (ceiling, abort, a throwing progress callback,
+    // or a network error) stops the transfer instead of letting it run on.
+    await reader.cancel(error).catch(() => {});
+    throw error;
   } finally {
     reader.releaseLock();
   }
-  throwIfMetadataAborted(signal, label);
 
+  if (preallocated !== null) {
+    return loadedBytes === preallocated.byteLength
+      ? preallocated
+      : preallocated.slice(0, loadedBytes);
+  }
   if (chunks.length === 1) return chunks[0];
-  const merged = new Uint8Array(loadedBytes);
+  const merged = allocatePayloadBytes(loadedBytes, label);
   let offset = 0;
   for (const chunk of chunks) {
     merged.set(chunk, offset);
@@ -404,7 +430,33 @@ export async function readBoundedBody(response, options) {
 }
 
 /**
- * Read a response body as JSON under a hard byte ceiling.
+ * Parse one JSON document, naming the only real limit on its size: the
+ * engine's longest string (about 2^29 UTF-16 units in V8, 2^30 in Firefox).
+ * A document longer than that cannot be parsed by any reader, so it is
+ * reported as too large rather than as malformed.
+ *
+ * @param {Uint8Array} bytes
+ * @param {string} label
+ * @returns {any}
+ */
+export function parseJsonBytes(bytes, label) {
+  let text;
+  try {
+    text = new TextDecoder().decode(bytes);
+  } catch (error) {
+    if (!(error instanceof RangeError)) throw error;
+    throw payloadTooLargeError(
+      `${label} (${bytes.byteLength.toLocaleString('en-US')} bytes) is longer than ` +
+      'the longest text this browser can hold',
+      { label, loadedBytes: bytes.byteLength }
+    );
+  }
+  return JSON.parse(text);
+}
+
+/**
+ * Read a response body as JSON. A metadata document has no fixed size limit;
+ * a caller that knows a document's exact bound passes it as `maxBytes`.
  *
  * @param {Response} response
  * @param {Object} options
@@ -417,14 +469,14 @@ export async function readBoundedJson(response, options) {
   const {
     label,
     signal = null,
-    maxBytes = MAX_METADATA_JSON_BYTES,
+    maxBytes = Number.MAX_SAFE_INTEGER,
   } = options;
   const bytes = await readBoundedBody(response, {
     label,
     maxBytes,
     signal,
   });
-  return JSON.parse(new TextDecoder().decode(bytes));
+  return parseJsonBytes(bytes, label);
 }
 
 // ============================================================================
@@ -432,13 +484,21 @@ export async function readBoundedJson(response, options) {
 // ============================================================================
 
 const REQUEST_METHODS = new Set(['GET', 'HEAD']);
-const REQUEST_CACHES = new Set([
-  'default',
-  'no-store',
-  'reload',
-  'no-cache',
-  'force-cache',
-]);
+
+/**
+ * The one HTTP cache mode of every dataset artifact: catalogs, identities,
+ * manifests and binary payloads alike.
+ *
+ * A dataset republished at the same URL keeps its payload paths. A path is an
+ * index, not a name, so a re-export that adds one gene renumbers `var/`: the
+ * file at `var/3.values.u8.gz` then holds another gene with exactly the same
+ * byte length, and no length check can tell. A cached copy reused without
+ * asking the origin (`force-cache`, or `default` within a host's max-age) would
+ * draw the old gene's values under the new manifest's name. Revalidating
+ * every request keeps the bytes and the manifests that describe them from one
+ * publication; an unchanged file costs a conditional request answered with 304.
+ */
+export const DATASET_ARTIFACT_CACHE = 'no-cache';
 const HEADER_NAME = /^[!#$%&'*+\-.^_`|~0-9a-z]+$/;
 const SAMPLE_CORS_TRANSPORT = Object.freeze({
   credentials: 'omit',
@@ -531,6 +591,7 @@ function validateExportsRequestOptions(init) {
     'cache',
     'headers',
     'signal',
+    'priority',
   ]);
   const unsupported = Object.keys(value).filter(
     key => !allowedKeys.has(key)
@@ -543,9 +604,6 @@ function validateExportsRequestOptions(init) {
   const method = Object.hasOwn(value, 'method')
     ? value.method
     : 'GET';
-  const cache = Object.hasOwn(value, 'cache')
-    ? value.cache
-    : 'default';
   const signal = Object.hasOwn(value, 'signal')
     ? value.signal
     : null;
@@ -554,17 +612,19 @@ function validateExportsRequestOptions(init) {
       'Sample request method must be exactly GET or HEAD.'
     );
   }
-  if (!REQUEST_CACHES.has(cache)) {
-    throw new TypeError(
-      'Sample request cache mode is unsupported.'
-    );
-  }
   if (
     signal !== null &&
     !(signal instanceof AbortSignal)
   ) {
     throw new TypeError(
       'Sample request signal must be an AbortSignal or null.'
+    );
+  }
+  // The fetch priority hint (see data/fetch-scheduler.js).
+  const priority = Object.hasOwn(value, 'priority') ? value.priority : 'auto';
+  if (priority !== 'high' && priority !== 'low' && priority !== 'auto') {
+    throw new TypeError(
+      'Sample request priority must be exactly "high", "low" or "auto".'
     );
   }
 
@@ -600,26 +660,33 @@ function validateExportsRequestOptions(init) {
   }
   return Object.freeze({
     method,
-    cache,
     headers,
     signal,
+    priority,
   });
 }
 
 /**
  * Fetch one data artifact. Files owned by the configured sample root use its
  * single current public transport: direct HTTP with browser CORS enforcement.
- * Other data sources retain the caller-provided HTTP transport options.
+ * Other data sources retain the caller-provided HTTP transport options. Every
+ * artifact is revalidated with its origin ({@link DATASET_ARTIFACT_CACHE});
+ * a caller cannot choose another cache mode.
  *
  * @param {string} url
  * @param {RequestInit} [init]
  * @returns {Promise<Response>}
  */
 export async function fetchSampleArtifact(url, init) {
+  if (init !== undefined && init !== null && Object.hasOwn(init, 'cache')) {
+    throw new TypeError(
+      'Dataset artifacts are always revalidated; a request cannot choose its cache mode.'
+    );
+  }
   const absUrl = getAbsoluteUrl(url);
 
   if (!isExportsUrl(absUrl)) {
-    return fetch(absUrl, init);
+    return fetch(absUrl, { ...init, cache: DATASET_ARTIFACT_CACHE });
   }
 
   requireCanonicalExportsFileUrl(url, absUrl);
@@ -627,9 +694,10 @@ export async function fetchSampleArtifact(url, init) {
   return fetch(absUrl, {
     ...SAMPLE_CORS_TRANSPORT,
     method: request.method,
-    cache: request.cache,
+    cache: DATASET_ARTIFACT_CACHE,
     headers: request.headers,
     signal: request.signal,
+    priority: request.priority,
   });
 }
 
@@ -674,7 +742,10 @@ export const DataSourceErrorCode = {
   // for a re-export, the other says the export is fine and the browser is not.
   TOO_LARGE: 'TOO_LARGE',
   VALIDATION_ERROR: 'VALIDATION_ERROR',
-  UNSUPPORTED: 'UNSUPPORTED'
+  UNSUPPORTED: 'UNSUPPORTED',
+  // An AnnData object none of whose obsm arrays can be plotted. The message
+  // lists what obsm holds and why each entry was not used.
+  NO_PLOTTABLE_EMBEDDING: 'NO_PLOTTABLE_EMBEDDING'
 };
 
 /**
@@ -744,19 +815,6 @@ export function resolveUrl(base, relative) {
 }
 
 /**
- * Check if a URL exists (returns ok status)
- * @param {string} url - URL to check
- * @returns {Promise<boolean>}
- */
-export async function urlExists(url) {
-  const response = await fetchSampleArtifact(
-    url,
-    { method: 'HEAD' }
-  );
-  return response.ok;
-}
-
-/**
  * Fetch JSON data from a URL with error handling
  * @param {string} url - URL to fetch
  * @param {string} [sourceType] - Source type for error context
@@ -767,6 +825,10 @@ export async function fetchJson(url, sourceType, options = {}) {
   const signal = getMetadataLoadSignal(options, 'JSON loader');
   try {
     throwIfMetadataAborted(signal, 'JSON loading');
+    // Metadata is revalidated like every dataset artifact
+    // (DATASET_ARTIFACT_CACHE): hosts such as GitHub Pages cache it for
+    // minutes, and a stale catalog or manifest beside freshly deployed presets
+    // and payloads makes a dataset fail to open until the cache expires.
     const response = await fetchSampleArtifact(
       url,
       signal === null ? undefined : { signal }
@@ -804,68 +866,6 @@ export async function fetchJson(url, sourceType, options = {}) {
       { url, originalError: err.message }
     );
   }
-}
-
-/**
- * Validate that a dataset directory has required files
- * @param {string} baseUrl - Base URL of the dataset
- * @param {string} [_sourceType] - Source type for error context (reserved for future use)
- * @returns {Promise<{valid: boolean, missing: string[], pointsFile: string}>}
- */
-export async function validateDatasetStructure(baseUrl, _sourceType) {
-  const missing = [];
-  let pointsFile = null;
-
-  // Build all URL check promises in parallel
-  // For points files: check both .gz and non-.gz variants for each candidate
-  const pointsChecks = DATA_CONFIG.POINTS_FILES.map(candidate => {
-    const pointsUrl = resolveUrl(baseUrl, candidate);
-    const pointsGzUrl = pointsUrl + '.gz';
-    return Promise.all([
-      urlExists(pointsGzUrl).then(exists => ({ candidate, gz: true, exists })),
-      urlExists(pointsUrl).then(exists => ({ candidate, gz: false, exists }))
-    ]);
-  });
-
-  // Check required files in parallel
-  const requiredChecks = DATA_CONFIG.REQUIRED_FILES.map(file => {
-    const url = resolveUrl(baseUrl, file);
-    return urlExists(url).then(exists => ({ file, exists }));
-  });
-
-  // Wait for all checks to complete in parallel
-  const [pointsResults, requiredResults] = await Promise.all([
-    Promise.all(pointsChecks),
-    Promise.all(requiredChecks)
-  ]);
-
-  // Find the highest priority points file that exists (3D > 2D > 1D, prefer .gz)
-  for (const [gzResult, plainResult] of pointsResults) {
-    if (gzResult.exists) {
-      pointsFile = gzResult.candidate + '.gz';
-      break;
-    } else if (plainResult.exists) {
-      pointsFile = plainResult.candidate;
-      break;
-    }
-  }
-
-  if (!pointsFile) {
-    missing.push('points_Xd.bin (at least one of: ' + DATA_CONFIG.POINTS_FILES.join(', ') + ')');
-  }
-
-  // Collect missing required files
-  for (const result of requiredResults) {
-    if (!result.exists) {
-      missing.push(result.file);
-    }
-  }
-
-  return {
-    valid: missing.length === 0,
-    missing,
-    pointsFile
-  };
 }
 
 function invalidDatasetIdentity(message, sourceType, details = {}) {
@@ -954,54 +954,6 @@ function requireCount(value, label, sourceType) {
   }
 }
 
-function requireIdentityPayloadPath(value, label, sourceType) {
-  if (
-    typeof value !== 'string' ||
-    value.length === 0 ||
-    value !== value.trim() ||
-    value.startsWith('/') ||
-    value.includes('\\') ||
-    value.includes('?') ||
-    value.includes('#') ||
-    /[\u0000-\u001f\u007f]/.test(value) ||
-    /^[A-Za-z]:/.test(value) ||
-    value.split('/').some(part => part.length === 0)
-  ) {
-    throw invalidDatasetIdentity(
-      `${label} must be a safe relative file path`,
-      sourceType,
-      { label, value }
-    );
-  }
-  for (const part of value.split('/')) {
-    let decoded;
-    try {
-      decoded = decodeURIComponent(part);
-    } catch {
-      throw invalidDatasetIdentity(
-        `${label} must be a safe relative file path`,
-        sourceType,
-        { label, value }
-      );
-    }
-    if (
-      decoded === '.' ||
-      decoded === '..' ||
-      decoded.includes('%') ||
-      decoded.includes('/') ||
-      decoded.includes('\\') ||
-      /[\u0000-\u001f\u007f]/.test(decoded) ||
-      encodeURIComponent(decoded) !== part
-    ) {
-      throw invalidDatasetIdentity(
-        `${label} must be a safe relative file path`,
-        sourceType,
-        { label, value }
-      );
-    }
-  }
-}
-
 function validateIdentityStats(stats, sourceType) {
   const countKeys = [
     'n_cells',
@@ -1052,80 +1004,197 @@ function validateIdentityStats(stats, sourceType) {
   }
 }
 
-function validateIdentityEmbeddings(embeddings, sourceType) {
+/**
+ * The exact payload path of one embedding item: its position in item order and
+ * its dimension, plus `.gz` exactly when the export was compressed. Both
+ * writers derive the path this way and the reader accepts no other string.
+ *
+ * @param {number} index
+ * @param {number} dimension
+ * @param {number|null} compression
+ * @returns {string}
+ */
+export function embeddingPayloadPath(index, dimension, compression) {
+  return `embeddings/${index}_${dimension}d.bin${compression === null ? '' : '.gz'}`;
+}
+
+/**
+ * The exact payload path of one vector field bound to one embedding item.
+ *
+ * @param {number} fieldIndex - Position of the field in `vector_fields.fields`.
+ * @param {number} embeddingIndex - Position of the bound item in `embeddings.items`.
+ * @param {number|null} compression
+ * @returns {string}
+ */
+export function vectorPayloadPath(fieldIndex, embeddingIndex, compression) {
+  return `vectors/${fieldIndex}_${embeddingIndex}.bin${compression === null ? '' : '.gz'}`;
+}
+
+/**
+ * The gzip level an identity's payload paths are derived with: the export's
+ * `export_settings.compression`, or null when the identity records no export
+ * settings (a dataset served straight from AnnData was never compressed).
+ *
+ * @param {Object} identity
+ * @returns {number|null}
+ */
+export function identityPayloadCompression(identity) {
+  return Object.hasOwn(identity, 'export_settings')
+    ? identity.export_settings.compression
+    : null;
+}
+
+function requireDisplayIdentity(value, label, sourceType) {
+  try {
+    StateValidator.validateFieldKey(value);
+  } catch (error) {
+    throw invalidDatasetIdentity(
+      `${label} ${JSON.stringify(value)} cannot be displayed exactly: ${error.message}`,
+      sourceType,
+      { label, value }
+    );
+  }
+}
+
+function validateEmbeddingSource(source, dimension, label, sourceType) {
+  assertExactKeys(source, ['key', 'columns'], [], `${label}.source`, sourceType);
+  if (source.key !== null && (typeof source.key !== 'string' || source.key.length === 0)) {
+    throw invalidDatasetIdentity(
+      `${label}.source.key must be null or a non-empty string`,
+      sourceType,
+      { value: source.key }
+    );
+  }
+  const columns = source.columns;
+  if (
+    !Array.isArray(columns) ||
+    columns.length !== dimension ||
+    columns.some(column => !Number.isSafeInteger(column) || column < 0) ||
+    new Set(columns).size !== columns.length
+  ) {
+    throw invalidDatasetIdentity(
+      `${label}.source.columns must be ${dimension} distinct 0-based column indices`,
+      sourceType,
+      { value: columns }
+    );
+  }
+}
+
+/**
+ * The sole `embeddings` rule of dataset identity version 3.
+ *
+ * `embeddings` holds exactly `default_dimension`, `defaults`, and `items`:
+ * - every item id obeys the field-identity rule; items are ordered by
+ *   dimension ascending, then id in code-point order, and an item's position
+ *   in that order is its payload index;
+ * - an item holds exactly `label` (display text), `dimension` (1, 2 or 3),
+ *   `file` (exactly `embeddings/{index}_{dimension}d.bin`, plus `.gz` when the
+ *   export is compressed) and `source` (`key`: string or null; `columns`:
+ *   `dimension` distinct 0-based indices);
+ * - `defaults` has exactly one key per item dimension, ascending, each naming
+ *   an item of that dimension;
+ * - `default_dimension` is a key of `defaults`.
+ *
+ * @param {unknown} embeddings
+ * @param {number|null} compression
+ * @param {string} [sourceType]
+ */
+function validateIdentityEmbeddings(embeddings, compression, sourceType) {
   assertExactKeys(
     embeddings,
-    ['available_dimensions', 'default_dimension', 'files'],
+    ['default_dimension', 'defaults', 'items'],
     [],
     'embeddings',
     sourceType
   );
-  const dimensions = embeddings.available_dimensions;
-  if (!Array.isArray(dimensions) || dimensions.length === 0) {
+  const items = embeddings.items;
+  if (!isPlainRecord(items) || Object.keys(items).length === 0) {
     throw invalidDatasetIdentity(
-      'embeddings.available_dimensions must be a non-empty array',
+      'embeddings.items must be a non-empty object',
       sourceType
     );
   }
-  const dimensionSet = new Set();
-  for (let index = 0; index < dimensions.length; index++) {
-    const dimension = dimensions[index];
-    if (
-      !Number.isSafeInteger(dimension) ||
-      dimension < 1 ||
-      dimension > 3 ||
-      dimensionSet.has(dimension) ||
-      (index > 0 && dimensions[index - 1] >= dimension)
-    ) {
+  const dimensions = [];
+  let previous = null;
+  let index = 0;
+  for (const [id, item] of Object.entries(items)) {
+    const label = `embeddings.items.${id}`;
+    requireDisplayIdentity(id, 'Embedding id', sourceType);
+    assertExactKeys(item, ['label', 'dimension', 'file', 'source'], [], label, sourceType);
+    requireDisplayIdentity(item.label, `${label}.label`, sourceType);
+    if (!Number.isSafeInteger(item.dimension) || item.dimension < 1 || item.dimension > 3) {
       throw invalidDatasetIdentity(
-        'embeddings.available_dimensions must contain strictly increasing unique 1D, 2D, or 3D integers',
+        `${label}.dimension must be 1, 2, or 3`,
         sourceType,
-        { dimensions }
+        { value: item.dimension }
       );
     }
-    dimensionSet.add(dimension);
+    if (
+      previous !== null &&
+      (
+        previous.dimension > item.dimension ||
+        (previous.dimension === item.dimension && compareCodePoints(previous.id, id) >= 0)
+      )
+    ) {
+      throw invalidDatasetIdentity(
+        'embeddings.items must be ordered by dimension, then id in code-point order',
+        sourceType,
+        { previous: previous.id, next: id }
+      );
+    }
+    const expectedFile = embeddingPayloadPath(index, item.dimension, compression);
+    if (item.file !== expectedFile) {
+      throw invalidDatasetIdentity(
+        `${label}.file must be exactly "${expectedFile}"`,
+        sourceType,
+        { value: item.file, expected: expectedFile }
+      );
+    }
+    validateEmbeddingSource(item.source, item.dimension, label, sourceType);
+    if (dimensions[dimensions.length - 1] !== item.dimension) {
+      dimensions.push(item.dimension);
+    }
+    previous = { id, dimension: item.dimension };
+    index += 1;
+  }
+
+  const defaults = embeddings.defaults;
+  if (!isPlainRecord(defaults)) {
+    throw invalidDatasetIdentity('embeddings.defaults must be an object', sourceType);
+  }
+  const expectedSlots = dimensions.map(dimension => `${dimension}d`);
+  const actualSlots = Object.keys(defaults);
+  if (actualSlots.join(',') !== expectedSlots.join(',')) {
+    throw invalidDatasetIdentity(
+      'embeddings.defaults must name exactly one item per embedding dimension, ascending',
+      sourceType,
+      { expected: expectedSlots, actual: actualSlots }
+    );
+  }
+  for (const slot of expectedSlots) {
+    const id = defaults[slot];
+    if (
+      typeof id !== 'string' ||
+      !Object.hasOwn(items, id) ||
+      `${items[id].dimension}d` !== slot
+    ) {
+      throw invalidDatasetIdentity(
+        `embeddings.defaults.${slot} must name an item of that dimension`,
+        sourceType,
+        { value: id }
+      );
+    }
   }
   if (
     !Number.isSafeInteger(embeddings.default_dimension) ||
-    !dimensionSet.has(embeddings.default_dimension)
+    !Object.hasOwn(defaults, `${embeddings.default_dimension}d`)
   ) {
     throw invalidDatasetIdentity(
-      'embeddings.default_dimension must be one of the available dimensions',
+      'embeddings.default_dimension must be a dimension named in embeddings.defaults',
       sourceType,
-      {
-        default_dimension: embeddings.default_dimension,
-        available_dimensions: dimensions,
-      }
+      { value: embeddings.default_dimension }
     );
   }
-
-  const files = embeddings.files;
-  if (!isPlainRecord(files)) {
-    throw invalidDatasetIdentity(
-      'embeddings.files must be an object',
-      sourceType
-    );
-  }
-  const expectedFileKeys = dimensions.map(dimension => `${dimension}d`);
-  const actualFileKeys = Object.keys(files);
-  if (
-    actualFileKeys.length !== expectedFileKeys.length ||
-    actualFileKeys.some(key => !expectedFileKeys.includes(key))
-  ) {
-    throw invalidDatasetIdentity(
-      'embeddings.files must contain exactly one path per available dimension',
-      sourceType,
-      { expected: expectedFileKeys, actual: actualFileKeys }
-    );
-  }
-  for (const key of expectedFileKeys) {
-    requireIdentityPayloadPath(
-      files[key],
-      `embeddings.files.${key}`,
-      sourceType
-    );
-  }
-
 }
 
 function validateIdentityExportSettings(settings, sourceType) {
@@ -1169,12 +1238,9 @@ function validateIdentityExportSettings(settings, sourceType) {
       );
     }
   }
-  if (
-    settings.obs_categorical_dtype !== 'uint8' &&
-    settings.obs_categorical_dtype !== 'uint16'
-  ) {
+  if (!['uint8', 'uint16', 'uint32'].includes(settings.obs_categorical_dtype)) {
     throw invalidDatasetIdentity(
-      'export_settings.obs_categorical_dtype must be uint8 or uint16',
+      'export_settings.obs_categorical_dtype must be uint8, uint16 or uint32',
       sourceType
     );
   }
@@ -1208,30 +1274,31 @@ function validateIdentitySource(source, sourceType) {
  * runtime VectorFieldManager cannot drift apart. Every rule below is stated by
  * the output format specification:
  *
- * - `vector_fields` holds exactly `default_field` and `fields`, and `fields`
- *   is a non-empty object;
- * - a field entry holds exactly `label`, `basis`, `available_dimensions`,
- *   `default_dimension`, and `files` — `files` is the only path map an export
- *   may declare;
- * - `available_dimensions` is strictly increasing over 1/2/3 and, when the
- *   dataset's embedding dimensions are known, a subset of them: a vector field
- *   cannot advertise a dimension the dataset has no points file for;
- * - `files` holds exactly one path per advertised dimension;
- * - `default_dimension` is the **largest** advertised dimension, not merely one
- *   of them. This is where the vector rule is strictly tighter than
- *   `embeddings.default_dimension`, which accepts any available dimension.
+ * - `vector_fields` holds exactly `default_field` and `fields`; `fields` is a
+ *   non-empty object whose ids are in code-point order;
+ * - a field entry holds exactly `label` and `files`, and `label` is the field
+ *   id character for character;
+ * - `files` maps each embedding id the field is bound to — a non-empty subset
+ *   of `embeddings.items`, in item order — to exactly
+ *   `vectors/{fieldIndex}_{embeddingIndex}.bin`, plus `.gz` when the export is
+ *   compressed.
  *
  * @param {unknown} vectorFields
- * @param {{availableDimensions?: number[]|null, sourceType?: string}} [options]
- *   `availableDimensions` is the dataset's `embeddings.available_dimensions`,
- *   or null for a caller that has no embeddings context.
+ * @param {{embeddingItems: Object, compression: number|null, sourceType?: string}} options
+ *   `embeddingItems` is the identity's validated `embeddings.items`.
  * @returns {Object} the validated vector_fields object
  */
-export function validateVectorFieldsMetadata(vectorFields, options = {}) {
-  const {
-    availableDimensions = null,
-    sourceType = undefined,
-  } = options;
+export function validateVectorFieldsMetadata(vectorFields, options) {
+  if (
+    !isPlainRecord(options) ||
+    !isPlainRecord(options.embeddingItems) ||
+    !(options.compression === null || Number.isSafeInteger(options.compression))
+  ) {
+    throw new TypeError(
+      'validateVectorFieldsMetadata requires the identity embedding items and its compression.'
+    );
+  }
+  const { embeddingItems, compression, sourceType = undefined } = options;
   assertExactKeys(
     vectorFields,
     ['default_field', 'fields'],
@@ -1264,103 +1331,65 @@ export function validateVectorFieldsMetadata(vectorFields, options = {}) {
       );
     }
   }
+  const embeddingIndex = new Map(
+    Object.keys(embeddingItems).map((id, index) => [id, index])
+  );
+  let previousFieldId = null;
+  let fieldIndex = 0;
   for (const [fieldId, field] of Object.entries(vectorFields.fields)) {
-    requireNonEmptyString(
-      fieldId,
-      'vector field id',
-      sourceType
-    );
-    const label = `vector_fields.fields.${fieldId}`;
-    assertExactKeys(
-      field,
-      [
-        'label',
-        'basis',
-        'available_dimensions',
-        'default_dimension',
-        'files',
-      ],
-      [],
-      label,
-      sourceType
-    );
-    requireNonEmptyString(field.label, `${label}.label`, sourceType);
-    requireNonEmptyString(field.basis, `${label}.basis`, sourceType);
-
-    const dimensions = field.available_dimensions;
-    if (!Array.isArray(dimensions) || dimensions.length === 0) {
+    requireDisplayIdentity(fieldId, 'Vector field id', sourceType);
+    if (previousFieldId !== null && compareCodePoints(previousFieldId, fieldId) >= 0) {
       throw invalidDatasetIdentity(
-        `${label}.available_dimensions must be a non-empty array`,
+        'vector_fields.fields must be ordered by id in code-point order',
+        sourceType,
+        { previous: previousFieldId, next: fieldId }
+      );
+    }
+    const label = `vector_fields.fields.${fieldId}`;
+    assertExactKeys(field, ['label', 'files'], [], label, sourceType);
+    if (field.label !== fieldId) {
+      throw invalidDatasetIdentity(
+        `${label}.label must be the field id "${fieldId}" exactly`,
+        sourceType,
+        { value: field.label }
+      );
+    }
+    const files = field.files;
+    if (!isPlainRecord(files) || Object.keys(files).length === 0) {
+      throw invalidDatasetIdentity(
+        `${label}.files must be a non-empty object`,
         sourceType
       );
     }
-    const dimensionSet = new Set();
-    for (let index = 0; index < dimensions.length; index++) {
-      const dimension = dimensions[index];
-      if (
-        !Number.isSafeInteger(dimension) ||
-        dimension < 1 ||
-        dimension > 3 ||
-        dimensionSet.has(dimension) ||
-        (index > 0 && dimensions[index - 1] >= dimension)
-      ) {
+    let previousIndex = -1;
+    for (const [embeddingId, path] of Object.entries(files)) {
+      const index = embeddingIndex.get(embeddingId);
+      if (index === undefined) {
         throw invalidDatasetIdentity(
-          `${label}.available_dimensions must contain strictly increasing ` +
-          'unique 1D, 2D, or 3D integers',
+          `${label}.files binds embedding "${embeddingId}", which embeddings.items does not declare`,
           sourceType,
-          { dimensions }
+          { embeddingId }
         );
       }
-      dimensionSet.add(dimension);
+      if (index <= previousIndex) {
+        throw invalidDatasetIdentity(
+          `${label}.files must list its embeddings in embeddings.items order`,
+          sourceType,
+          { embeddingId }
+        );
+      }
+      previousIndex = index;
+      const expected = vectorPayloadPath(fieldIndex, index, compression);
+      if (path !== expected) {
+        throw invalidDatasetIdentity(
+          `${label}.files.${embeddingId} must be exactly "${expected}"`,
+          sourceType,
+          { value: path, expected }
+        );
+      }
     }
-    if (
-      Array.isArray(availableDimensions) &&
-      dimensions.some(dimension => !availableDimensions.includes(dimension))
-    ) {
-      throw invalidDatasetIdentity(
-        `${label}.available_dimensions must be a subset of ` +
-        'embeddings.available_dimensions',
-        sourceType,
-        { dimensions, availableDimensions }
-      );
-    }
-    if (field.default_dimension !== dimensions[dimensions.length - 1]) {
-      throw invalidDatasetIdentity(
-        `${label}.default_dimension must be the largest advertised dimension`,
-        sourceType,
-        {
-          default_dimension: field.default_dimension,
-          available_dimensions: dimensions,
-        }
-      );
-    }
-
-    const files = field.files;
-    if (!isPlainRecord(files)) {
-      throw invalidDatasetIdentity(
-        `${label}.files must be an object`,
-        sourceType
-      );
-    }
-    const expectedFileKeys = dimensions.map(dimension => `${dimension}d`);
-    const actualFileKeys = Object.keys(files);
-    if (
-      actualFileKeys.length !== expectedFileKeys.length ||
-      actualFileKeys.some(key => !expectedFileKeys.includes(key))
-    ) {
-      throw invalidDatasetIdentity(
-        `${label}.files must contain exactly one path per advertised dimension`,
-        sourceType,
-        { expected: expectedFileKeys, actual: actualFileKeys }
-      );
-    }
-    for (const key of expectedFileKeys) {
-      requireIdentityPayloadPath(
-        files[key],
-        `${label}.files.${key}`,
-        sourceType
-      );
-    }
+    previousFieldId = fieldId;
+    fieldIndex += 1;
   }
   return vectorFields;
 }
@@ -1450,7 +1479,7 @@ function validateIdentityObsFields(obsFields, stats, sourceType) {
 }
 
 /**
- * Validate the sole current dataset_identity.json v2 contract.
+ * Validate the sole current dataset_identity.json version 3 contract.
  *
  * @param {unknown} identity
  * @param {string} datasetId
@@ -1529,7 +1558,14 @@ export function validateDatasetIdentity(
   }
 
   validateIdentityStats(identity.stats, sourceType);
-  validateIdentityEmbeddings(identity.embeddings, sourceType);
+  if (Object.hasOwn(identity, 'export_settings')) {
+    validateIdentityExportSettings(
+      identity.export_settings,
+      sourceType
+    );
+  }
+  const compression = identityPayloadCompression(identity);
+  validateIdentityEmbeddings(identity.embeddings, compression, sourceType);
   validateIdentityObsFields(
     identity.obs_fields,
     identity.stats,
@@ -1553,18 +1589,13 @@ export function validateDatasetIdentity(
       );
     }
   }
-  if (Object.hasOwn(identity, 'export_settings')) {
-    validateIdentityExportSettings(
-      identity.export_settings,
-      sourceType
-    );
-  }
   if (Object.hasOwn(identity, 'source')) {
     validateIdentitySource(identity.source, sourceType);
   }
   if (Object.hasOwn(identity, 'vector_fields')) {
     validateVectorFieldsMetadata(identity.vector_fields, {
-      availableDimensions: identity.embeddings.available_dimensions,
+      embeddingItems: identity.embeddings.items,
+      compression,
       sourceType,
     });
   }
@@ -1616,37 +1647,12 @@ export async function loadDatasetMetadata(
 }
 
 /**
- * Format a cell/gene count for display (e.g., 162259 -> "162K")
- * Named specifically to avoid collision with benchmark.js formatNumber
- * @param {number} n - Number to format
- * @returns {string}
- */
-export function formatCellCount(n) {
-  if (n == null) return '–';
-  if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
-  if (n >= 1000) return (n / 1000).toFixed(0) + 'K';
-  return String(n);
-}
-
-/**
  * Check if a URL uses the local-user:// protocol
  * @param {string} url - URL to check
  * @returns {boolean}
  */
 export function isLocalUserUrl(url) {
   return url?.startsWith('local-user://');
-}
-
-/**
- * Parse a local-user:// URL into its components
- * @param {string} url - URL to parse
- * @returns {{datasetId: string, filename: string}|null}
- */
-export function parseLocalUserUrl(url) {
-  if (!isLocalUserUrl(url)) return null;
-  const match = url.match(/^local-user:\/\/([^/]+)\/(.*)$/);
-  if (!match) return null;
-  return { datasetId: match[1], filename: match[2] };
 }
 
 /**
@@ -1730,7 +1736,7 @@ export function parseLocalUserUrl(url) {
  * JUPYTER BRIDGE SOURCE INTERFACE (future: JupyterBridgeDataSource)
  * ═══════════════════════════════════════════════════════════════════════════════
  *
- * For sources that communicate with a Jupyter kernel via the cellucid-data package:
+ * For sources that communicate with a Jupyter kernel via the cellucid Python package:
  *
  * connectToKernel(kernelId): Promise<void>
  *   Connect to a specific Jupyter kernel
@@ -1771,14 +1777,14 @@ export function parseLocalUserUrl(url) {
  *   manager.registerProtocol('remote://', 'remote');
  *
  * This allows data-loaders.js to automatically resolve URLs like:
- *   'remote://server.example.com/dataset/points_3d.bin'
+ *   'remote://server.example.com/dataset/embeddings/0_3d.bin'
  */
 
 /**
  * Example base class showing the interface (not required to extend)
  * @abstract
  */
-export class BaseDataSource {
+class BaseDataSource {
   constructor() {
     if (new.target === BaseDataSource) {
       throw new Error('BaseDataSource is abstract - use duck typing instead');

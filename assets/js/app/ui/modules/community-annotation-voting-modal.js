@@ -11,6 +11,7 @@ import { getNotificationCenter } from '../../notification-center.js';
 import { getCommunityAnnotationSession } from '../../community-annotations/session.js';
 import { getCommunityAnnotationAccessStore, isAnnotationRepoConnected } from '../../community-annotations/access-store.js';
 import { showConfirmDialog } from '../components/confirm-dialog.js';
+import { formatCountOf, formatPercent } from '../components/display-format.js';
 import { claimModalDocumentLayer } from '../components/modal-background-owner.js';
 import * as capApi from '../../community-annotations/cap-api.js';
 import { ANNOTATION_CONNECTION_CHANGED_EVENT } from '../../community-annotations/connection-events.js';
@@ -23,6 +24,7 @@ import {
 } from './community-annotation-modal-owner.js';
 import { el, toCleanString } from './community-annotation/dom.js';
 import { createDomId } from '../components/dom-id.js';
+import { createInfoTip } from '../components/controls.js';
 
 function requireVotingContext(value, label) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
@@ -177,14 +179,7 @@ function describeErrorMessage(err) {
   return err.message;
 }
 
-function truncateForUi(value, maxLen) {
-  const s = toCleanString(value);
-  const max = Number.isFinite(maxLen) ? Math.max(1, Math.floor(maxLen)) : 12;
-  if (s.length <= max) return s;
-  return `${s.slice(0, Math.max(0, max - 1))}…`;
-}
-
-function formatCommentAuthorHandle(session, username, { maxLen = 12 } = {}) {
+function formatCommentAuthorHandle(session, username) {
   if (
     typeof username !== 'string' ||
     username.length === 0 ||
@@ -202,7 +197,8 @@ function formatCommentAuthorHandle(session, username, { maxLen = 12 } = {}) {
     throw new TypeError('Known comment author login must be an exact string');
   }
   const handle = login || username;
-  return `@${truncateForUi(handle, maxLen)}`;
+  // The whole handle: a GitHub login is at most 39 characters.
+  return `@${handle}`;
 }
 
 function bucketKey(session, fieldKey, catIdx) {
@@ -392,7 +388,7 @@ function markerEntryGene(marker, index) {
   return requireMarkerGene(marker.gene, `Marker ${index + 1} gene`);
 }
 
-export function markersToGeneList(markers) {
+function markersToGeneList(markers) {
   if (markers === null || markers === undefined) return [];
   if (!Array.isArray(markers)) {
     throw new TypeError('Suggestion markers must be an array or null');
@@ -497,14 +493,6 @@ function formatLostMarkerStats(genes) {
     .join(', ');
 }
 
-function markersToDisplayText(markers) {
-  const genes = markersToGeneList(markers);
-  if (!genes.length) return '';
-  const shown = genes.slice(0, 8);
-  const suffix = genes.length > shown.length ? ` +${genes.length - shown.length}` : '';
-  return `Markers: ${shown.join(', ')}${suffix}`;
-}
-
 function markersToInputText(markers) {
   const genes = markersToGeneList(markers);
   return genes.length ? genes.join(', ') : '';
@@ -597,9 +585,19 @@ function captureModalRerenderFocus(root) {
   ) {
     return null;
   }
-  const desiredKey =
-    active.getAttribute(MODAL_FOCUS_RESTORE_ATTRIBUTE) ??
-    active.getAttribute(MODAL_FOCUS_KEY_ATTRIBUTE);
+  // An element's own identity comes first: an inline editor that the rebuild
+  // reopens keeps focus in its own field. The restoration identity names
+  // where focus goes when the rebuild no longer contains the element, such
+  // as the Edit button of an editor that its own Save just closed.
+  const ownKey = active.getAttribute(MODAL_FOCUS_KEY_ATTRIBUTE);
+  const desiredKeys = [
+    ownKey,
+    active.getAttribute(MODAL_FOCUS_RESTORE_ATTRIBUTE)
+  ].filter(key => key !== null);
+  const isTextField =
+    (active instanceof HTMLInputElement ||
+      active instanceof HTMLTextAreaElement) &&
+    typeof active.selectionStart === 'number';
   const attributes = {};
   for (const name of [
     'aria-label',
@@ -613,14 +611,258 @@ function captureModalRerenderFocus(root) {
     if (value !== null) attributes[name] = value;
   }
   return {
-    desiredKey,
+    ownKey,
+    desiredKeys,
     tagName: active.tagName,
     attributes,
     text:
       active instanceof HTMLButtonElement
         ? toCleanString(active.textContent)
-        : ''
+        : '',
+    selection: isTextField
+      ? {
+          start: active.selectionStart,
+          end: active.selectionEnd,
+          direction: active.selectionDirection ?? 'none'
+        }
+      : null
   };
+}
+
+const MODAL_DRAFT_ATTRIBUTE = 'data-community-modal-draft';
+
+/**
+ * Mark a compose field (new suggestion, new comment) whose unsent text must
+ * survive content rebuilds. The field must already own a focus identity.
+ *
+ * @param {HTMLInputElement|HTMLTextAreaElement} field
+ * @returns {HTMLInputElement|HTMLTextAreaElement}
+ */
+function ownModalDraft(field) {
+  if (
+    !(field instanceof HTMLInputElement || field instanceof HTMLTextAreaElement) ||
+    !field.hasAttribute(MODAL_FOCUS_KEY_ATTRIBUTE)
+  ) {
+    throw new TypeError('Modal drafts require a keyed text field');
+  }
+  field.setAttribute(MODAL_DRAFT_ATTRIBUTE, 'true');
+  return field;
+}
+
+/**
+ * Record what the viewer has typed into every compose field under `root`.
+ *
+ * Session changes (a Pull, another tab, the viewer's own vote) rebuild the
+ * voting content from scratch. Drafts live in `drafts` across those rebuilds,
+ * keyed by the same stable identity focus restoration uses, so an unsent
+ * suggestion or comment is never wiped by a re-render. A field emptied by its
+ * own Add, Send, or Clear action drops its draft here.
+ *
+ * @param {ParentNode} root
+ * @param {Map<string, string>} drafts
+ */
+function captureModalDrafts(root, drafts) {
+  for (const field of root.querySelectorAll(`[${MODAL_DRAFT_ATTRIBUTE}]`)) {
+    const key = field.getAttribute(MODAL_FOCUS_KEY_ATTRIBUTE);
+    if (field.value) drafts.set(key, field.value);
+    else drafts.delete(key);
+  }
+}
+
+/**
+ * Put recorded drafts back into the rebuilt fields with the same identity and
+ * let each field's own `input` handler refresh its counter, size, and search
+ * state.
+ *
+ * @param {ParentNode} root
+ * @param {Map<string, string>} drafts
+ */
+function restoreModalDrafts(root, drafts) {
+  if (drafts.size === 0) return;
+  for (const field of root.querySelectorAll(`[${MODAL_DRAFT_ATTRIBUTE}]`)) {
+    const value = drafts.get(field.getAttribute(MODAL_FOCUS_KEY_ATTRIBUTE));
+    if (value === undefined || field.disabled || field.value === value) continue;
+    field.value = value;
+    field.dispatchEvent(new Event('input'));
+  }
+}
+
+/**
+ * The inline editors of existing items (a comment, a suggestion, a merge
+ * note) that are open in one voting shell, kept outside the DOM so a content
+ * rebuild can reopen each of them.
+ *
+ * Session changes (another user's vote arriving through a Pull, another tab,
+ * the viewer's own vote on a different card) rebuild voting content from
+ * scratch. Every editor records its identity, the item it belongs to, and
+ * what the viewer has typed here as they type. A renderer that rebuilds an
+ * item whose edit is open calls `resume()` and builds that editor open again
+ * with the recorded text; the rerender focus snapshot then puts focus and the
+ * caret back into the same field.
+ *
+ * Rebuilds are bracketed by `beginRebuild()` and `finishRebuild()` (nested
+ * brackets count as one). An edit that no renderer resumed during a finished
+ * rebuild belongs to an item that is no longer shown: it was deleted, merged
+ * into another bundle, voting closed for the viewer, or the viewer paged
+ * away. Its editor cannot come back, so the edit is dropped and the viewer is
+ * told that its text was not saved. Keeping that text as a new draft was
+ * rejected: no compose field means the same thing as an edit of a deleted
+ * comment or a merged-away suggestion, and refiling the text under another
+ * item would be more surprising than a clear notice.
+ *
+ * Save runs its session mutation through `commit()`, which closes the edit
+ * first: the mutation emits `changed` synchronously, and the rebuild it
+ * triggers must not reopen an editor whose text is being committed. A save
+ * that throws or reports failure leaves the edit open again.
+ */
+class InlineEditState {
+  constructor() {
+    /** @type {Map<string, {anchorId: string, noun: string, values: Record<string, string>}>} */
+    this._edits = new Map();
+    /** @type {Set<string> | null} */
+    this._resumed = null;
+    this._rebuildDepth = 0;
+  }
+
+  /**
+   * @param {string} key  the editor's Edit-button focus identity
+   * @param {{anchorId: string, noun: string, values: Record<string, string>}} edit
+   *   `anchorId` names the listed item (suggestion or comment id) a paged list
+   *   keeps on screen while the edit is open; `noun` names the item for the
+   *   viewer.
+   */
+  open(key, { anchorId, noun, values }) {
+    if (typeof key !== 'string' || !key) {
+      throw new TypeError('Inline edit identity must be a non-empty string');
+    }
+    if (typeof noun !== 'string' || !noun) {
+      throw new TypeError('Inline edit noun must be a non-empty string');
+    }
+    if (!values || typeof values !== 'object' || Array.isArray(values)) {
+      throw new TypeError('Inline edit values must be an object');
+    }
+    this._edits.set(key, {
+      anchorId: toCleanString(anchorId),
+      noun,
+      values: { ...values }
+    });
+    this._resumed?.add(key);
+  }
+
+  /** Record the current text of one field of an open edit. */
+  set(key, field, value) {
+    const edit = this._edits.get(key);
+    if (edit !== undefined) edit.values[field] = String(value);
+  }
+
+  close(key) {
+    this._edits.delete(key);
+  }
+
+  /**
+   * Run the save mutation of an open edit with that edit closed.
+   *
+   * @template T
+   * @param {string} key
+   * @param {() => T} mutate
+   * @returns {T}
+   */
+  commit(key, mutate) {
+    const edit = this._edits.get(key);
+    this._edits.delete(key);
+    const reopen = () => {
+      if (edit !== undefined) this._edits.set(key, edit);
+    };
+    let result;
+    try {
+      result = mutate();
+    } catch (error) {
+      reopen();
+      throw error;
+    }
+    if (!result) reopen();
+    return result;
+  }
+
+  has(key) {
+    return this._edits.has(key);
+  }
+
+  /**
+   * Claim an open edit for the current rebuild.
+   *
+   * @returns {Record<string, string> | null} the recorded field text, or null
+   *   when this editor is not open
+   */
+  resume(key) {
+    const edit = this._edits.get(key);
+    if (edit === undefined) return null;
+    this._resumed?.add(key);
+    return { ...edit.values };
+  }
+
+  /** @returns {Set<string>} the items that have an open edit */
+  anchorIds() {
+    return new Set(
+      [...this._edits.values()].map(edit => edit.anchorId).filter(Boolean)
+    );
+  }
+
+  beginRebuild() {
+    if (this._rebuildDepth === 0) this._resumed = new Set();
+    this._rebuildDepth += 1;
+  }
+
+  /** End a rebuild that was abandoned or failed, leaving every edit open. */
+  cancelRebuild() {
+    this._endRebuild();
+  }
+
+  /** End a rebuild that is now on screen and drop the edits it did not resume. */
+  finishRebuild() {
+    const resumed = this._resumed;
+    if (!this._endRebuild()) return;
+    for (const [key, edit] of [...this._edits]) {
+      if (resumed.has(key)) continue;
+      this._edits.delete(key);
+      getNotificationCenter().warning(
+        `Edit not saved: the ${edit.noun} you were editing is no longer ` +
+        'shown here (deleted, merged, closed, or on another page).',
+        { category: 'annotation' }
+      );
+    }
+  }
+
+  /** Run `build` as one rebuild. */
+  rebuild(build) {
+    this.beginRebuild();
+    let result;
+    try {
+      result = build();
+    } catch (error) {
+      this.cancelRebuild();
+      throw error;
+    }
+    this.finishRebuild();
+    return result;
+  }
+
+  _endRebuild() {
+    if (this._rebuildDepth === 0) {
+      throw new Error('Inline edit rebuild ended without beginning');
+    }
+    this._rebuildDepth -= 1;
+    if (this._rebuildDepth !== 0) return false;
+    this._resumed = null;
+    return true;
+  }
+}
+
+function requireInlineEditState(inlineEdits, owner) {
+  if (!(inlineEdits instanceof InlineEditState)) {
+    throw new TypeError(`${owner} requires the shell's inline edit state`);
+  }
+  return inlineEdits;
 }
 
 function isRenderedModalFocusTarget(target) {
@@ -660,12 +902,11 @@ function restoreModalRerenderFocus(snapshot, root, closeTarget) {
   if (snapshot === null) return false;
   const focusables = listFocusableElements(root);
   let target = null;
-  if (snapshot.desiredKey !== null) {
+  for (const key of snapshot.desiredKeys) {
     target = focusables.find(
-      candidate =>
-        candidate.getAttribute(MODAL_FOCUS_KEY_ATTRIBUTE) ===
-        snapshot.desiredKey
+      candidate => candidate.getAttribute(MODAL_FOCUS_KEY_ATTRIBUTE) === key
     ) ?? null;
+    if (target !== null) break;
   }
   if (target === null) {
     const semanticMatches = focusables.filter(candidate => {
@@ -680,10 +921,40 @@ function restoreModalRerenderFocus(snapshot, root, closeTarget) {
     });
     if (semanticMatches.length === 1) target = semanticMatches[0];
   }
-  if (target !== null && focusRenderedModalTarget(target)) return true;
+  if (target !== null && focusRenderedModalTarget(target)) {
+    restoreModalTextSelection(snapshot, target);
+    return true;
+  }
   if (focusRenderedModalTarget(closeTarget)) return true;
   throw new Error(
     'Modal rerender could not restore focus to its stable close control'
+  );
+}
+
+/**
+ * Put the caret or selection back into the rebuilt copy of the text field the
+ * viewer was typing in. Only the same field identity qualifies, and only while
+ * the recorded range still fits its restored text.
+ */
+function restoreModalTextSelection(snapshot, target) {
+  const { selection } = snapshot;
+  if (
+    selection === null ||
+    snapshot.ownKey === null ||
+    target.getAttribute(MODAL_FOCUS_KEY_ATTRIBUTE) !== snapshot.ownKey ||
+    !(
+      target instanceof HTMLInputElement ||
+      target instanceof HTMLTextAreaElement
+    ) ||
+    typeof target.selectionStart !== 'number' ||
+    selection.end > target.value.length
+  ) {
+    return;
+  }
+  target.setSelectionRange(
+    selection.start,
+    selection.end,
+    selection.direction
   );
 }
 
@@ -696,7 +967,14 @@ function focusEnabledPaginationControl(preferred, alternate) {
   );
 }
 
-function trapModalFocus({ overlay, modal, close, escCancelSelector = null } = {}) {
+/**
+ * Inline editors mark their cancellable region with `data-esc-cancel="true"`
+ * and handle Escape themselves; every voting shell's trap leaves Escape from
+ * inside such a region to the editor instead of closing the dialog.
+ */
+const ESC_CANCEL_SELECTOR = '[data-esc-cancel="true"]';
+
+function trapModalFocus({ overlay, modal, close } = {}) {
   const o = overlay;
   const m = modal;
   if (
@@ -718,10 +996,8 @@ function trapModalFocus({ overlay, modal, close, escCancelSelector = null } = {}
       throw new TypeError('Modal focus trap requires exact keyboard event methods');
     }
     if (e.key === 'Escape') {
-      if (escCancelSelector) {
-        const target = e.target;
-        if (target && typeof target.closest === 'function' && target.closest(escCancelSelector)) return;
-      }
+      const target = e.target;
+      if (target && typeof target.closest === 'function' && target.closest(ESC_CANCEL_SELECTOR)) return;
       e.preventDefault();
       e.stopPropagation();
       close();
@@ -808,7 +1084,7 @@ function renderCapSearchResults({
   }
 
   if (!results.length) {
-    container.appendChild(el('div', { className: 'cap-search-empty', text: 'No results found in CAP database' }));
+    container.appendChild(el('p', { className: 'empty-state', text: 'No results found in the CAP database.' }));
   } else {
     const list = el('ul', { className: 'cap-search-result-list' });
     for (const result of results) {
@@ -827,7 +1103,7 @@ function renderCapSearchResults({
       item.appendChild(nameRow);
 
       if (result.synonyms?.length) {
-        item.appendChild(el('div', { className: 'cap-search-item-synonyms', text: `Synonyms: ${result.synonyms.slice(0, 3).join(', ')}${result.synonyms.length > 3 ? '...' : ''}` }));
+        item.appendChild(el('div', { className: 'cap-search-item-synonyms', text: `Synonyms: ${result.synonyms.join(', ')}` }));
       }
 
       const combinedMarkers = [];
@@ -845,8 +1121,7 @@ function renderCapSearchResults({
         item.appendChild(el('div', {
           className: 'cap-search-item-markers',
           text:
-            `Markers: ${combinedMarkers.slice(0, 5).join(', ')}` +
-            `${combinedMarkers.length > 5 ? '...' : ''}`
+            `Markers: ${combinedMarkers.join(', ')}`
         }));
       }
 
@@ -878,7 +1153,7 @@ function renderCapSearchResults({
     container.appendChild(list);
   }
 
-  const closeBtn = el('button', { type: 'button', className: 'btn-small cap-search-close', text: 'Close' });
+  const closeBtn = el('button', { type: 'button', className: 'btn cap-search-close', text: 'Close' });
   closeBtn.addEventListener('click', () => {
     onClose?.();
     if (
@@ -924,10 +1199,12 @@ function renderComment({
   catIdx,
   suggestionId,
   comment,
+  inlineEdits,
   lifecycle = null,
   canInteract = true,
   onUpdate
 }) {
+  requireInlineEditState(inlineEdits, 'Comment rendering');
   const isCurrent = () => (
     lifecycle === null ||
     (
@@ -966,26 +1243,28 @@ function renderComment({
     ownModalFocusKey(editBtn, editFocusKey);
     ownModalFocusKey(deleteBtn, `${commentFocusPrefix}:delete`);
 
-    editBtn.addEventListener('click', () => {
+    const openEditor = (text) => {
       const form = el('div', { className: 'community-annotation-comment-form' });
       const input = el('textarea', {
-        className: 'community-annotation-comment-input',
-        placeholder: 'Edit comment...',
+        className: 'obs-select community-annotation-textarea',
+        'aria-label': 'Edit comment',
+        placeholder: 'Edit comment…',
         maxlength: '500'
       });
       ownModalFocusKey(input, `${commentFocusPrefix}:edit-input`, {
         restoreKey: editFocusKey
       });
-      input.value = comment?.text || '';
+      input.value = text;
 
       const charCounter = el('div', { className: 'community-annotation-char-counter', text: `${input.value.length}/500` });
       input.addEventListener('input', () => {
         charCounter.textContent = `${input.value.length}/500`;
+        inlineEdits.set(editFocusKey, 'text', input.value);
       });
 
       const formActions = el('div', { className: 'community-annotation-comment-form-actions' });
-      const saveBtn = el('button', { type: 'button', className: 'btn-small', text: 'Save' });
-      const cancelBtn = el('button', { type: 'button', className: 'btn-small', text: 'Cancel' });
+      const saveBtn = el('button', { type: 'button', className: 'btn', text: 'Save' });
+      const cancelBtn = el('button', { type: 'button', className: 'btn', text: 'Cancel' });
       ownModalFocusKey(saveBtn, `${commentFocusPrefix}:save`, {
         restoreKey: editFocusKey
       });
@@ -998,7 +1277,10 @@ function renderComment({
         const newText = input.value.trim();
         if (!newText) return;
         focusRenderedModalTarget(saveBtn);
-        const ok = session.editComment(fieldKey, catIdx, suggestionId, comment.id, newText);
+        const ok = inlineEdits.commit(
+          editFocusKey,
+          () => session.editComment(fieldKey, catIdx, suggestionId, comment.id, newText)
+        );
         if (ok) {
           getNotificationCenter().success('Comment updated', { category: 'annotation', duration: 1500 });
           onUpdate?.();
@@ -1007,7 +1289,10 @@ function renderComment({
         }
       });
 
-      cancelBtn.addEventListener('click', () => onUpdate?.());
+      cancelBtn.addEventListener('click', () => {
+        inlineEdits.close(editFocusKey);
+        onUpdate?.();
+      });
 
       formActions.appendChild(saveBtn);
       formActions.appendChild(cancelBtn);
@@ -1017,7 +1302,17 @@ function renderComment({
 
       commentEl.innerHTML = '';
       commentEl.appendChild(form);
-      input.focus();
+      return input;
+    };
+
+    editBtn.addEventListener('click', () => {
+      const text = comment?.text || '';
+      inlineEdits.open(editFocusKey, {
+        anchorId: comment?.id,
+        noun: 'comment',
+        values: { text }
+      });
+      openEditor(text).focus();
     });
 
     deleteBtn.addEventListener('click', () => {
@@ -1042,6 +1337,9 @@ function renderComment({
     actions.appendChild(editBtn);
     actions.appendChild(deleteBtn);
     commentEl.appendChild(actions);
+
+    const resumed = inlineEdits.resume(editFocusKey);
+    if (resumed !== null) openEditor(resumed.text);
   }
 
   return commentEl;
@@ -1057,8 +1355,8 @@ let activeVotingModal = null;
  * rather than duplicated by accident. That module carries the full rationale;
  * the short form is that the two shells have different close orderings
  * (`onClose` retires this shell's render lifecycle *before* the focus trap and
- * the overlay removal), different nested-Escape protocols (`escCancelSelector`
- * here, `COMMUNITY_MODAL_ESCAPE_OWNER` there), and only this one owns the
+ * the overlay removal), different nested-Escape protocols (the `data-esc-cancel`
+ * marker here, `COMMUNITY_MODAL_ESCAPE_OWNER` there), and only this one owns the
  * primary/secondary voting modal cascade.
  *
  * The accessibility contract they *do* share — `role="dialog"`, `aria-modal`,
@@ -1108,7 +1406,7 @@ function showModal({
   titleEl.id = titleId;
   overlay.setAttribute('aria-labelledby', titleId);
   header.appendChild(titleEl);
-  const closeBtn = el('button', { type: 'button', className: 'btn-small community-annotation-modal-close', text: 'Close' });
+  const closeBtn = el('button', { type: 'button', className: 'btn community-annotation-modal-close', text: 'Close' });
   header.appendChild(closeBtn);
 
   const content = el('div', { className: 'community-annotation-modal-body' });
@@ -1334,9 +1632,11 @@ function renderMergeRow({
   catIdx,
   merge,
   idToLabel,
+  inlineEdits,
   lifecycle = null,
   canDetach
 }) {
+  requireInlineEditState(inlineEdits, 'Merge row rendering');
   const isCurrent = () => lifecycleIsCurrent(lifecycle);
   const fromId = toCleanString(merge?.fromSuggestionId);
   const intoId = toCleanString(merge?.intoSuggestionId);
@@ -1368,18 +1668,37 @@ function renderMergeRow({
 
   if (canDetach && fromId) {
     const actions = el('div', { className: 'community-annotation-merge-actions' });
+    const noteFocusPrefix = createModalFocusKey(
+      'merge-note',
+      fieldKey,
+      catIdx,
+      fromId
+    );
+    const editFocusKey = `${noteFocusPrefix}:edit`;
+    /** @type {HTMLButtonElement | null} */
+    let editBtn = null;
 
     const renderMetaDisplay = () => {
       if (!metaEl) return;
       metaEl.innerHTML = '';
       metaEl.textContent = buildMeta() || '';
       metaEl.dataset.mode = 'display';
+      editBtn = null;
 
       if (isOwn) {
-        const editBtn = el('button', { type: 'button', className: 'community-annotation-comment-action-btn', text: 'Edit' });
-        editBtn.addEventListener('click', () => enterNoteEdit());
+        editBtn = el('button', { type: 'button', className: 'community-annotation-comment-action-btn', text: 'Edit' });
+        ownModalFocusKey(editBtn, editFocusKey);
+        editBtn.addEventListener('click', () => {
+          inlineEdits.open(editFocusKey, {
+            anchorId: fromId,
+            noun: 'merge note',
+            values: { note: currentNote }
+          });
+          enterNoteEdit(currentNote).focus();
+        });
         const deleteBtn = el('button', { type: 'button', className: 'community-annotation-comment-action-btn', text: 'Delete' });
-        deleteBtn.style.display = currentNote ? '' : 'none';
+        ownModalFocusKey(deleteBtn, `${noteFocusPrefix}:delete`);
+        deleteBtn.hidden = !currentNote;
         deleteBtn.addEventListener('click', () => {
           showOwnedConfirmDialog(lifecycle, {
             title: 'Delete merge note?',
@@ -1404,13 +1723,13 @@ function renderMergeRow({
       }
     };
 
-    const enterNoteEdit = () => {
-      if (!metaEl) return;
-      if (metaEl.dataset.mode === 'edit') {
-        renderMetaDisplay();
-        return;
-      }
+    const closeNoteEdit = () => {
+      inlineEdits.close(editFocusKey);
+      renderMetaDisplay();
+      if (editBtn !== null) editBtn.focus({ preventScroll: true });
+    };
 
+    const enterNoteEdit = (note) => {
       metaEl.dataset.mode = 'edit';
       metaEl.innerHTML = '';
       const inputWrap = el('div', { className: 'community-annotation-comment-bar-wrap community-annotation-comment-bar-wrap--edit' });
@@ -1418,11 +1737,15 @@ function renderMergeRow({
         className: 'community-annotation-comment-bar community-annotation-comment-bar--edit',
         maxlength: '512',
         rows: '1',
+        'aria-label': 'Merge note',
         placeholder: 'Merge note (optional)…',
         'data-esc-cancel': 'true',
         title: 'Enter to save • Esc to cancel'
       });
-      input.value = currentNote;
+      ownModalFocusKey(input, `${noteFocusPrefix}:edit-input`, {
+        restoreKey: editFocusKey
+      });
+      input.value = note;
 
       const charCounter = el('div', {
         className: 'community-annotation-char-counter community-annotation-char-counter--overlay',
@@ -1437,12 +1760,16 @@ function renderMergeRow({
       };
 
       const save = () => {
+        if (!isCurrent()) return;
         const nextNote = toCleanString(input.value) || null;
-        const ok = session.editModerationMergeNote?.({ fieldKey, catIdx, fromSuggestionId: fromId, note: nextNote });
+        const ok = inlineEdits.commit(
+          editFocusKey,
+          () => session.editModerationMergeNote?.({ fieldKey, catIdx, fromSuggestionId: fromId, note: nextNote })
+        );
         if (ok) {
           currentNote = toCleanString(nextNote || '');
           getNotificationCenter().success('Merge note updated (local moderation)', { category: 'annotation', duration: 1800 });
-          renderMetaDisplay();
+          closeNoteEdit();
         } else {
           getNotificationCenter().error('Unable to update merge note', { category: 'annotation' });
         }
@@ -1450,13 +1777,14 @@ function renderMergeRow({
 
       input.addEventListener('input', () => {
         charCounter.textContent = `${input.value.length}/512`;
+        inlineEdits.set(editFocusKey, 'note', input.value);
         resize();
       });
       input.addEventListener('keydown', (e) => {
         if (e.key === 'Escape') {
           e.preventDefault();
           e.stopPropagation();
-          renderMetaDisplay();
+          closeNoteEdit();
           return;
         }
         if (e.key === 'Enter' && !e.shiftKey) {
@@ -1473,10 +1801,10 @@ function renderMergeRow({
         throw new TypeError('Merge note editing requires requestAnimationFrame()');
       }
       requestAnimationFrame(resize);
-      input.focus();
+      return input;
     };
 
-    const detachBtn = el('button', { type: 'button', className: 'btn-small', text: 'Detach' });
+    const detachBtn = el('button', { type: 'button', className: 'btn', text: 'Detach' });
     detachBtn.addEventListener('click', () => {
       showOwnedConfirmDialog(lifecycle, {
         title: 'Detach merge?',
@@ -1495,6 +1823,8 @@ function renderMergeRow({
     row.appendChild(actions);
 
     renderMetaDisplay();
+    const resumed = isOwn ? inlineEdits.resume(editFocusKey) : null;
+    if (resumed !== null) enterNoteEdit(resumed.note);
   }
 
   return row;
@@ -1593,7 +1923,7 @@ function showSecondaryModal({
   titleEl.id = titleId;
   overlay.setAttribute('aria-labelledby', titleId);
   header.appendChild(titleEl);
-  const closeBtn = el('button', { type: 'button', className: 'btn-small community-annotation-modal-close', text: 'Close' });
+  const closeBtn = el('button', { type: 'button', className: 'btn community-annotation-modal-close', text: 'Close' });
   header.appendChild(closeBtn);
 
   const content = el('div', { className: 'community-annotation-modal-body' });
@@ -1618,6 +1948,9 @@ function showSecondaryModal({
     )
   };
   const prevFocus = returnFocusTo ?? document.activeElement;
+  /** @type {Map<string, string>} */
+  const drafts = new Map();
+  const inlineEdits = new InlineEditState();
   let cleanupTrap = null;
   let releaseDocumentLayer = null;
   const releaseDocumentOwnership = () => {
@@ -1666,9 +1999,13 @@ function showSecondaryModal({
       )
     };
     const focusSnapshot = captureModalRerenderFocus(content);
+    captureModalDrafts(content, drafts);
     content.innerHTML = '';
     try {
-      buildContent(content, { close, lifecycle });
+      inlineEdits.rebuild(
+        () => buildContent(content, { close, lifecycle, inlineEdits })
+      );
+      restoreModalDrafts(content, drafts);
       restoreModalRerenderFocus(focusSnapshot, content, closeBtn);
     } finally {
       // Render ownership remains active until the next render or modal close.
@@ -1754,12 +2091,7 @@ function showSecondaryModal({
   });
 
   try {
-    cleanupTrap = trapModalFocus({
-      overlay,
-      modal,
-      close,
-      escCancelSelector: '[data-esc-cancel="true"]'
-    });
+    cleanupTrap = trapModalFocus({ overlay, modal, close });
     releaseDocumentLayer = claimModalDocumentLayer(overlay);
     document.body.appendChild(overlay);
     activeSecondaryModal = { close, overlay, lifecycle: modalLifecycle };
@@ -1773,10 +2105,12 @@ function showSecondaryModal({
     }
 
     if (ownerOverlay) {
+      // The owner's overlay is a child of <body>, so its removal is a
+      // childList change of <body> itself; nothing below <body> is watched.
       ownerObserver = new MutationObserver(() => {
         if (!document.body.contains(ownerOverlay)) close();
       });
-      ownerObserver.observe(document.body, { childList: true, subtree: true });
+      ownerObserver.observe(document.body, { childList: true });
     }
 
     render();
@@ -1814,7 +2148,7 @@ function openSuggestionCommentsModal({
       'comments',
       suggestionId
     ),
-    buildContent: (content, { lifecycle }) => {
+    buildContent: (content, { lifecycle, inlineEdits }) => {
       const comments = session.getComments(fieldKey, catIdx, suggestion?.id);
       if (!Array.isArray(comments)) {
         throw new TypeError('Comment expansion requires an exact comments array');
@@ -1844,16 +2178,16 @@ function openSuggestionCommentsModal({
       });
       const previous = el('button', {
         type: 'button',
-        className: 'btn-small',
+        className: 'btn',
         text: 'Previous'
       });
       const next = el('button', {
         type: 'button',
-        className: 'btn-small',
+        className: 'btn',
         text: 'Next'
       });
 
-      const renderPage = () => {
+      const renderPage = ({ followOpenEdit = false } = {}) => inlineEdits.rebuild(() => {
         const currentComments = session.getComments(
           fieldKey,
           catIdx,
@@ -1877,13 +2211,23 @@ function openSuggestionCommentsModal({
           1,
           Math.ceil(currentSorted.length / pageSize)
         );
+        // New comments shift older ones across pages. A rebuild for a session
+        // change keeps the page that holds an open inline edit; the viewer's
+        // own Previous and Next leave it.
+        if (followOpenEdit) {
+          const editedAnchors = inlineEdits.anchorIds();
+          const editedIndex = currentSorted.findIndex(
+            c => editedAnchors.has(toCleanString(c?.id))
+          );
+          if (editedIndex >= 0) page = Math.floor(editedIndex / pageSize);
+        }
         page = Math.min(page, currentPageCount - 1);
         list.innerHTML = '';
         const start = page * pageSize;
         const shown = currentSorted.slice(start, start + pageSize);
         if (!shown.length) {
           list.appendChild(el('div', {
-            className: 'legend-help',
+            className: 'empty-state',
             text: 'No comments yet.'
           }));
         } else {
@@ -1894,6 +2238,7 @@ function openSuggestionCommentsModal({
               catIdx,
               suggestionId: suggestion?.id,
               comment,
+              inlineEdits,
               lifecycle,
               canInteract,
               onUpdate: () => {
@@ -1909,7 +2254,7 @@ function openSuggestionCommentsModal({
           `${currentSorted.length} comment${currentSorted.length === 1 ? '' : 's'}`;
         previous.disabled = page === 0;
         next.disabled = page >= currentPageCount - 1;
-      };
+      });
 
       previous.addEventListener('click', () => {
         if (page === 0) return;
@@ -1927,7 +2272,7 @@ function openSuggestionCommentsModal({
       controls.appendChild(next);
       content.appendChild(list);
       content.appendChild(controls);
-      renderPage();
+      renderPage({ followOpenEdit: true });
     }
   });
 }
@@ -1952,7 +2297,7 @@ function openMergedSuggestionsModal({
       'merged',
       logicalSuggestionId
     ),
-    buildContent: (content, { lifecycle }) => {
+    buildContent: (content, { lifecycle, inlineEdits }) => {
       const bucket = bucketKey(session, fieldKey, catIdx);
       const mergesAll = session.getModerationMerges?.() || [];
       const merges = Array.isArray(mergesAll) ? mergesAll.filter((m) => toCleanString(m?.bucket) === bucket) : [];
@@ -1962,7 +2307,7 @@ function openMergedSuggestionsModal({
       const mergedFrom = Array.isArray(target?.mergedFrom) ? target.mergedFrom : [];
 
       if (!target || !mergedFrom.length) {
-        content.appendChild(el('div', { className: 'legend-help', text: 'No merged suggestions for this bundle.' }));
+        content.appendChild(el('p', { className: 'empty-state', text: 'No merged suggestions for this bundle.' }));
         return;
       }
 
@@ -1984,23 +2329,23 @@ function openMergedSuggestionsModal({
       if (!Array.isArray(raw)) {
         throw new TypeError('Merged suggestion snapshot bucket must be an array');
       }
-      for (const s of raw.slice(0, 5000)) {
+      for (const s of raw) {
         const id = toCleanString(s?.id);
         if (!id || idToLabel.has(id)) continue;
         idToLabel.set(id, toCleanString(s?.label) || id);
       }
 
       const targetId = toCleanString(target?.id);
-      content.appendChild(el('div', { className: 'community-annotation-inline-help', text: `Bundle: ${toCleanString(target?.label) || '—'}` }));
+      // How bundles count votes is told by the (i); the dialog shows the totals.
+      const bundleInfo = createInfoTip({ tip: 'community-bundle', label: 'About merged bundles' });
+      content.appendChild(el('div', { className: 'field-label-row' }, [
+        el('span', { className: 'community-annotation-inline-help', text: `Bundle: ${toCleanString(target?.label) || '—'}` }),
+        bundleInfo.button
+      ]));
+      content.appendChild(bundleInfo.popover);
       content.appendChild(el('div', {
-        className: 'legend-help',
-        text:
-          `Bundle total (de-duplicated per user): ▲${target.upvotes?.length || 0} ▼${target.downvotes?.length || 0}. ` +
-          'Cards below keep their own comments; merge rows show the chain and optional notes.'
-      }));
-      content.appendChild(el('div', {
-        className: 'legend-help',
-        text: 'If you have no direct vote on the bundle main card, your bundle vote is delegated from member votes (majority; ties = none) and shown with a dashed badge.'
+        className: 'status-line',
+        text: `Votes: ▲${target.upvotes?.length || 0} ▼${target.downvotes?.length || 0}`
       }));
 
       const traversal = buildMergeTraversal({
@@ -2030,6 +2375,7 @@ function openMergedSuggestionsModal({
           fieldKey,
           catIdx,
           suggestion: s,
+          inlineEdits,
           lifecycle,
           canInteract,
           duplicateLabelKeys: null,
@@ -2048,6 +2394,7 @@ function openMergedSuggestionsModal({
           catIdx,
           merge: step.merge,
           idToLabel,
+          inlineEdits,
           lifecycle,
           canDetach
         }));
@@ -2066,6 +2413,7 @@ function renderSuggestionCard({
   fieldKey,
   catIdx,
   suggestion,
+  inlineEdits,
   mergeTargets = [],
   lifecycle = null,
   canInteract = true,
@@ -2075,6 +2423,7 @@ function renderSuggestionCard({
   allowModerationDrag = true,
   voteDisplayMode = 'bundle'
 }) {
+  requireInlineEditState(inlineEdits, 'Suggestion card rendering');
   const isCurrent = () => (
     lifecycle === null ||
     (
@@ -2138,8 +2487,8 @@ function renderSuggestionCard({
   meta.appendChild(el('div', { className: 'community-annotation-suggestion-ontology', text: `Ontology: ${ontologyId || '—'}` }));
 
   const markers = markersToGeneList(suggestion?.markers);
-  const markerSummary = markers.length ? `${markers.slice(0, 10).join(', ')}${markers.length > 10 ? ` +${markers.length - 10}` : ''}` : '—';
-  meta.appendChild(el('div', { className: 'legend-help', text: `Markers: ${markerSummary}` }));
+  const markerSummary = markers.length ? markers.join(', ') : '—';
+  meta.appendChild(el('div', { className: 'field-help', text: `Markers: ${markerSummary}` }));
 
   const evidence = toCleanString(suggestion?.evidence || '');
   const evidenceShort = evidence ? truncateText(evidence, 220) : '';
@@ -2166,7 +2515,7 @@ function renderSuggestionCard({
         ),
         buildContent: (content) => {
           content.appendChild(el('div', { className: 'community-annotation-inline-help', text: toCleanString(suggestion?.label) || 'Suggestion' }));
-          content.appendChild(el('div', { className: 'community-annotation-dashed-box', text: evidence }));
+          content.appendChild(el('div', { className: 'control-box', text: evidence }));
         }
       });
     });
@@ -2178,7 +2527,7 @@ function renderSuggestionCard({
   const actions = el('div', { className: 'community-annotation-suggestion-actions' });
   const upBtn = el('button', {
     type: 'button',
-    className: 'btn-small community-annotation-vote-btn vote-up',
+    className: 'btn btn-compact community-annotation-vote-btn vote-up',
     text: `▲ ${up}`,
     disabled: !canInteract,
     'aria-label': `Upvote ${toCleanString(suggestion?.label) || 'suggestion'}; ${up} upvotes`,
@@ -2186,7 +2535,7 @@ function renderSuggestionCard({
   });
   const downBtn = el('button', {
     type: 'button',
-    className: 'btn-small community-annotation-vote-btn vote-down',
+    className: 'btn btn-compact community-annotation-vote-btn vote-down',
     text: `▼ ${down}`,
     disabled: !canInteract,
     'aria-label': `Downvote ${toCleanString(suggestion?.label) || 'suggestion'}; ${down} downvotes`,
@@ -2240,18 +2589,27 @@ function renderSuggestionCard({
   let editBox = null;
   let mergeBox = null;
   if (!isCompact && isMine && canInteract) {
-    const editBtn = el('button', { type: 'button', className: 'btn-small', text: 'Edit' });
+    // Edit opens the editor and stays "Edit" (its state is aria-expanded);
+    // Cancel and Save close it, so no second "Hide edit" control competes.
+    const editBoxId = createDomId('community-annotation-edit');
+    const editBtn = el('button', {
+      type: 'button',
+      className: 'btn',
+      text: 'Edit',
+      'aria-expanded': 'false',
+      'aria-controls': editBoxId
+    });
     const editFocusKey = `${suggestionFocusPrefix}:edit`;
     ownModalFocusKey(editBtn, editFocusKey);
 
-    editBox = el('div', { className: 'community-annotation-dashed-box', style: 'display: none; margin-top: 8px;' });
+    editBox = el('div', { className: 'control-box', id: editBoxId, hidden: true });
     editBox.appendChild(el('div', { className: 'community-annotation-new-title', text: 'Edit suggestion' }));
 
     const editForm = el('div', { className: 'community-annotation-new community-annotation-new-vertical' });
-    const labelInput = el('input', { type: 'text', className: 'community-annotation-text-input', placeholder: 'Label (required)', maxlength: '120' });
-    const ontInput = el('input', { type: 'text', className: 'community-annotation-text-input', placeholder: 'Ontology id (optional, e.g. CL:0000625)', maxlength: '64' });
-    const markerGenesInput = el('input', { type: 'text', className: 'community-annotation-text-input', placeholder: 'Marker genes (optional, comma-separated)' });
-    const evidenceInput = el('textarea', { className: 'community-annotation-text-input community-annotation-textarea', placeholder: 'Evidence (optional)', maxlength: '2000' });
+    const labelInput = el('input', { type: 'text', className: 'obs-select', 'aria-label': 'Label', placeholder: 'Label (required)', maxlength: '120' });
+    const ontInput = el('input', { type: 'text', className: 'obs-select', 'aria-label': 'Ontology id', placeholder: 'Ontology id (optional)', title: 'Ontology id, such as CL:0000625', maxlength: '64' });
+    const markerGenesInput = el('input', { type: 'text', className: 'obs-select', 'aria-label': 'Marker genes', placeholder: 'Marker genes (optional)', title: 'Marker genes, separated by commas' });
+    const evidenceInput = el('textarea', { className: 'obs-select community-annotation-textarea', 'aria-label': 'Evidence', placeholder: 'Evidence (optional)', maxlength: '2000' });
     ownModalFocusKey(labelInput, `${suggestionFocusPrefix}:edit-label`);
     ownModalFocusKey(
       ontInput,
@@ -2266,6 +2624,21 @@ function renderSuggestionCard({
       `${suggestionFocusPrefix}:edit-evidence`
     );
 
+    const editFields = {
+      label: labelInput,
+      ontologyId: ontInput,
+      markers: markerGenesInput,
+      evidence: evidenceInput
+    };
+    const readEditFields = () => Object.fromEntries(
+      Object.entries(editFields).map(([name, input]) => [name, input.value])
+    );
+    for (const [name, input] of Object.entries(editFields)) {
+      input.addEventListener('input', () => {
+        inlineEdits.set(editFocusKey, name, input.value);
+      });
+    }
+
     let originalMarkerText = '';
     const populateFromSuggestion = () => {
       labelInput.value = suggestion?.label || '';
@@ -2274,10 +2647,14 @@ function renderSuggestionCard({
       markerGenesInput.value = originalMarkerText;
       evidenceInput.value = suggestion?.evidence || '';
     };
+    const showEditBox = (open) => {
+      editBox.hidden = !open;
+      editBtn.setAttribute('aria-expanded', String(open));
+    };
 
     const editActions = el('div', { className: 'community-annotation-suggestion-actions' });
-    const saveBtn = el('button', { type: 'button', className: 'btn-small', text: 'Save' });
-    const cancelBtn = el('button', { type: 'button', className: 'btn-small', text: 'Cancel' });
+    const saveBtn = el('button', { type: 'button', className: 'btn', text: 'Save' });
+    const cancelBtn = el('button', { type: 'button', className: 'btn', text: 'Cancel' });
     ownModalFocusKey(saveBtn, `${suggestionFocusPrefix}:edit-save`, {
       restoreKey: editFocusKey
     });
@@ -2311,18 +2688,26 @@ function renderSuggestionCard({
         const save = () => {
           if (!isCurrent()) return;
           focusRenderedModalTarget(saveBtn);
-          session.editMySuggestion?.(
-            fieldKey,
-            catIdx,
-            suggestion?.id,
-            patch
+          const ok = inlineEdits.commit(
+            editFocusKey,
+            () => session.editMySuggestion?.(
+              fieldKey,
+              catIdx,
+              suggestion?.id,
+              patch
+            )
           );
+          if (!ok) {
+            getNotificationCenter().error('Failed to update suggestion', {
+              category: 'annotation'
+            });
+            return;
+          }
           getNotificationCenter().success('Suggestion updated', {
             category: 'annotation',
             duration: 1500
           });
-          editBox.style.display = 'none';
-          editBtn.textContent = 'Edit';
+          showEditBox(false);
           editBtn.focus({ preventScroll: true });
         };
 
@@ -2345,18 +2730,35 @@ function renderSuggestionCard({
     });
 
     cancelBtn.addEventListener('click', () => {
-      editBox.style.display = 'none';
-      editBtn.textContent = 'Edit';
+      inlineEdits.close(editFocusKey);
+      showEditBox(false);
       populateFromSuggestion();
     });
 
     editBtn.addEventListener('click', () => {
-      const open = editBox.style.display === 'none';
-      if (open) populateFromSuggestion();
-      editBox.style.display = open ? '' : 'none';
-      editBtn.textContent = open ? 'Hide edit' : 'Edit';
+      const open = editBox.hidden;
+      if (open) {
+        populateFromSuggestion();
+        inlineEdits.open(editFocusKey, {
+          anchorId: suggestion?.id,
+          noun: 'suggestion',
+          values: readEditFields()
+        });
+      } else {
+        inlineEdits.close(editFocusKey);
+      }
+      showEditBox(open);
       if (open) labelInput.focus?.();
     });
+
+    const resumedEdit = inlineEdits.resume(editFocusKey);
+    if (resumedEdit !== null) {
+      populateFromSuggestion();
+      for (const [name, input] of Object.entries(editFields)) {
+        input.value = resumedEdit[name] ?? input.value;
+      }
+      showEditBox(true);
+    }
 
     editForm.appendChild(labelInput);
     editForm.appendChild(ontInput);
@@ -2367,7 +2769,7 @@ function renderSuggestionCard({
 
     actions.appendChild(editBtn);
 
-    const delBtn = el('button', { type: 'button', className: 'btn-small', text: 'Delete' });
+    const delBtn = el('button', { type: 'button', className: 'btn', text: 'Delete' });
     ownModalFocusKey(delBtn, `${suggestionFocusPrefix}:delete`);
     delBtn.addEventListener('click', () => {
       showOwnedConfirmDialog(lifecycle, {
@@ -2406,7 +2808,7 @@ function renderSuggestionCard({
       const mergeBoxId = createDomId('community-annotation-merge-form');
       const mergeBtn = el('button', {
         type: 'button',
-        className: 'btn-small community-annotation-merge-button',
+        className: 'btn community-annotation-merge-button',
         text: 'Merge…',
         'aria-expanded': 'false',
         'aria-controls': mergeBoxId
@@ -2414,10 +2816,8 @@ function renderSuggestionCard({
       ownModalFocusKey(mergeBtn, `${suggestionFocusPrefix}:merge`);
       mergeBox = el('div', {
         id: mergeBoxId,
-        className:
-          'community-annotation-dashed-box ' +
-          'community-annotation-merge-form',
-        style: 'display: none;'
+        className: 'control-box community-annotation-merge-form',
+        hidden: true
       });
       const labelId = createDomId('community-annotation-merge-target-label');
       const targetSelectId = createDomId(
@@ -2426,12 +2826,13 @@ function renderSuggestionCard({
       mergeBox.appendChild(el('label', {
         id: labelId,
         for: targetSelectId,
-        className: 'community-annotation-new-title',
-        text: `Merge “${toCleanString(suggestion.label)}” into`
-      }));
+        className: 'community-annotation-new-title'
+      }, [
+        `Merge “${toCleanString(suggestion.label)}” into`
+      ]));
       const targetSelect = el('select', {
         id: targetSelectId,
-        className: 'community-annotation-text-input',
+        className: 'obs-select',
         'aria-labelledby': labelId
       });
       targetSelect.appendChild(el('option', {
@@ -2445,8 +2846,8 @@ function renderSuggestionCard({
         }));
       }
       const noteInput = el('textarea', {
-        className:
-          'community-annotation-text-input community-annotation-textarea',
+        className: 'obs-select community-annotation-textarea',
+        'aria-label': 'Merge note',
         placeholder: 'Optional merge note',
         maxlength: '512',
         rows: '2'
@@ -2464,12 +2865,12 @@ function renderSuggestionCard({
       });
       const confirmMergeBtn = el('button', {
         type: 'button',
-        className: 'btn-small',
+        className: 'btn',
         text: 'Merge suggestion'
       });
       const cancelMergeBtn = el('button', {
         type: 'button',
-        className: 'btn-small',
+        className: 'btn',
         text: 'Cancel'
       });
       ownModalFocusKey(
@@ -2483,14 +2884,14 @@ function renderSuggestionCard({
         { restoreKey: `${suggestionFocusPrefix}:merge` }
       );
       const closeMergeForm = () => {
-        mergeBox.style.display = 'none';
+        mergeBox.hidden = true;
         mergeBtn.setAttribute('aria-expanded', 'false');
         mergeBtn.focus?.();
       };
       mergeBtn.addEventListener('click', () => {
         if (!isCurrent()) return;
-        const willOpen = mergeBox.style.display === 'none';
-        mergeBox.style.display = willOpen ? '' : 'none';
+        const willOpen = mergeBox.hidden;
+        mergeBox.hidden = !willOpen;
         mergeBtn.setAttribute(
           'aria-expanded',
           willOpen ? 'true' : 'false'
@@ -2513,6 +2914,7 @@ function renderSuggestionCard({
         }
         showOwnedConfirmDialog(lifecycle, {
           title: 'Merge suggestions?',
+          tone: 'primary',
           message:
             `Merge “${toCleanString(suggestion.label)}” into ` +
             `“${toCleanString(target.label)}”? Votes will be combined ` +
@@ -2557,14 +2959,14 @@ function renderSuggestionCard({
   if (editBox) card.appendChild(editBox);
   if (mergeBox) card.appendChild(mergeBox);
 
-  const by = el('div', { className: 'legend-help', text: session.formatUserAttribution(suggestion?.proposedBy || '') });
+  const by = el('div', { className: 'field-help', text: session.formatUserAttribution(suggestion?.proposedBy || '') });
   card.appendChild(by);
 
   const mergedFrom = Array.isArray(suggestion?.mergedFrom) ? suggestion.mergedFrom : [];
   if (!isCompact && showMergedBundleRow && mergedFrom.length && suggestion?.id) {
     const bundleRow = el('div', { className: 'community-annotation-bundle-row' });
     bundleRow.appendChild(el('div', {
-      className: 'legend-help',
+      className: 'field-help',
       text: `Merged bundle (${mergedFrom.length + 1} suggestions) • votes de-duplicated`
     }));
     const mergedBtn = el('button', {
@@ -2604,12 +3006,15 @@ function renderSuggestionCard({
 
     const input = el('textarea', {
       className: 'community-annotation-comment-bar',
+      'aria-label': 'Comment',
       placeholder: canInteract ? 'Write a comment and press Enter…' : 'Comments are disabled (closed by author).',
       maxlength: '500',
       rows: '1',
       disabled: !canInteract
     });
-    ownModalFocusKey(input, `${suggestionFocusPrefix}:comment-compose`);
+    ownModalDraft(
+      ownModalFocusKey(input, `${suggestionFocusPrefix}:comment-compose`)
+    );
     const charCounter = el('div', {
       className: 'community-annotation-char-counter community-annotation-char-counter--overlay',
       text: `${input.value.length}/500`
@@ -2656,8 +3061,21 @@ function renderSuggestionCard({
         a?.createdAt || ''
       ));
 
+    const previewEditKey = (c) => `${createModalFocusKey(
+      'comment-preview',
+      fieldKey,
+      catIdx,
+      suggestion?.id,
+      c?.id
+    )}:edit`;
+    // The newest five comments, plus any older one whose edit is open: a
+    // comment arriving while the viewer edits the fifth must not push that
+    // editor out of the preview.
+    const previewComments = sorted.filter(
+      (c, index) => index < 5 || inlineEdits.has(previewEditKey(c))
+    );
     const scroll = el('div', { className: 'community-annotation-comments-scroll' });
-    for (const c of sorted.slice(0, 5)) {
+    for (const c of previewComments) {
       const commentPreviewFocusPrefix = createModalFocusKey(
         'comment-preview',
         fieldKey,
@@ -2673,13 +3091,13 @@ function renderSuggestionCard({
       const item = el('div', { className: 'community-annotation-comment-preview-item' });
       item.appendChild(el('span', { className: 'community-annotation-comment-preview-meta', text: metaText }));
 
-      const body = el('div', { style: 'flex: 1; min-width: 0;' });
+      const body = el('div', { className: 'community-annotation-comment-preview-body' });
       let currentText = toCleanString(c?.text || '');
       let isEditing = false;
 
       const editBtn = el('button', { type: 'button', className: 'community-annotation-comment-action-btn', text: 'Edit' });
       const deleteBtn = el('button', { type: 'button', className: 'community-annotation-comment-action-btn', text: 'Delete' });
-      const editFocusKey = `${commentPreviewFocusPrefix}:edit`;
+      const editFocusKey = previewEditKey(c);
       ownModalFocusKey(editBtn, editFocusKey);
       ownModalFocusKey(
         deleteBtn,
@@ -2698,13 +3116,14 @@ function renderSuggestionCard({
         body.appendChild(textWrap);
       };
 
-      const renderEdit = () => {
+      const renderEdit = (text) => {
         isEditing = true;
         body.innerHTML = '';
 
         const inputWrap = el('div', { className: 'community-annotation-comment-bar-wrap community-annotation-comment-bar-wrap--edit' });
         const input = el('textarea', {
           className: 'community-annotation-comment-bar community-annotation-comment-bar--edit',
+          'aria-label': 'Edit comment',
           placeholder: 'Edit comment…',
           maxlength: '500',
           rows: '1',
@@ -2714,7 +3133,7 @@ function renderSuggestionCard({
         ownModalFocusKey(input, `${commentPreviewFocusPrefix}:edit-input`, {
           restoreKey: editFocusKey
         });
-        input.value = currentText;
+        input.value = text;
         const counter = el('div', {
           className: 'community-annotation-char-counter community-annotation-char-counter--overlay',
           text: `${input.value.length}/500`
@@ -2728,10 +3147,14 @@ function renderSuggestionCard({
         };
 
         const save = () => {
+          if (!isCurrent()) return;
           const nextText = toCleanString(input.value);
           if (!nextText) return;
           focusRenderedModalTarget(input);
-          const ok = session.editComment?.(fieldKey, catIdx, suggestion.id, c?.id, nextText);
+          const ok = inlineEdits.commit(
+            editFocusKey,
+            () => session.editComment?.(fieldKey, catIdx, suggestion.id, c?.id, nextText)
+          );
           if (ok) {
             currentText = nextText;
             getNotificationCenter().success('Comment updated', { category: 'annotation', duration: 1500 });
@@ -2744,12 +3167,14 @@ function renderSuggestionCard({
 
         input.addEventListener('input', () => {
           counter.textContent = `${input.value.length}/500`;
+          inlineEdits.set(editFocusKey, 'text', input.value);
           resize();
         });
         input.addEventListener('keydown', (e) => {
           if (e.key === 'Escape') {
             e.preventDefault();
             e.stopPropagation();
+            inlineEdits.close(editFocusKey);
             renderPreview();
             editBtn.focus({ preventScroll: true });
             return;
@@ -2768,13 +3193,18 @@ function renderSuggestionCard({
           throw new TypeError('Comment editing requires requestAnimationFrame()');
         }
         requestAnimationFrame(resize);
-        input.focus();
+        return input;
       };
 
       if (isOwn && canInteract) {
         editBtn.addEventListener('click', () => {
           if (isEditing) return;
-          renderEdit();
+          inlineEdits.open(editFocusKey, {
+            anchorId: suggestion?.id,
+            noun: 'comment',
+            values: { text: currentText }
+          });
+          renderEdit(currentText).focus();
         });
 
         deleteBtn.addEventListener('click', () => {
@@ -2797,7 +3227,11 @@ function renderSuggestionCard({
         });
       }
 
-      renderPreview();
+      const resumedEdit = isOwn && canInteract
+        ? inlineEdits.resume(editFocusKey)
+        : null;
+      if (resumedEdit !== null) renderEdit(resumedEdit.text);
+      else renderPreview();
       item.appendChild(body);
       scroll.appendChild(item);
     }
@@ -2893,6 +3327,7 @@ function renderSuggestionCard({
 
       showOwnedConfirmDialog(lifecycle, {
         title: 'Merge suggestions?',
+        tone: 'primary',
         message:
           `Merge "${fromLabel || fromId}" into "${intoLabel || intoId}"?\n\n` +
           `Votes will be combined (1 per user). Comments stay separate and can be reviewed via “View merged”.`,
@@ -2946,6 +3381,10 @@ function buildVotingDetail({
   if (!viewState || typeof viewState !== 'object' || Array.isArray(viewState)) {
     throw new TypeError('Community voting detail requires an exact view state');
   }
+  const inlineEdits = requireInlineEditState(
+    viewState.inlineEdits,
+    'Community voting detail'
+  );
   const isCurrent = () => (
     !lifecycle.signal.aborted &&
     lifecycle.isCurrent() &&
@@ -2971,7 +3410,7 @@ function buildVotingDetail({
   const isClosed = session.isFieldClosed?.(fieldKey) === true;
   const canInteract = !isClosed || access.isAuthor();
   if (isClosed && !access.isAuthor()) {
-    panel.appendChild(el('div', { className: 'legend-help', text: 'Closed by the author (voting disabled).' }));
+    panel.appendChild(el('div', { className: 'status-line', text: 'Closed by the author.' }));
   }
 
   const consensusSettings = session.getAnnotatableConsensusSettings?.(fieldKey) || null;
@@ -2980,10 +3419,10 @@ function buildVotingDetail({
   const label = consensus.label ? `"${consensus.label}"` : '—';
   consensusLine.textContent =
     consensus.status === 'consensus'
-      ? `Consensus: ${label} (${Math.round(consensus.confidence * 100)}% • ${consensus.voters} voters)`
+      ? `Consensus: ${label} (${formatPercent(consensus.confidence * 100)} • ${formatCountOf(consensus.voters, 'voter')})`
       : consensus.status === 'disputed'
-        ? `Disputed: ${label} (${Math.round(consensus.confidence * 100)}% • ${consensus.voters} voters)`
-        : `Pending (${consensus.voters} voters)`;
+        ? `Disputed: ${label} (${formatPercent(consensus.confidence * 100)} • ${formatCountOf(consensus.voters, 'voter')})`
+        : `Pending (${formatCountOf(consensus.voters, 'voter')})`;
   panel.appendChild(consensusLine);
 
   const suggestions = session
@@ -3011,12 +3450,10 @@ function buildVotingDetail({
   if (duplicateLabelKeys.size) {
     const dupSuggestionCount = suggestions.filter((s) => duplicateLabelKeys.has(normalizeLabelForCompare(s?.label || ''))).length;
     panel.appendChild(el('div', {
-      className: 'legend-help',
-      text:
-        `Duplicate labels detected (${dupSuggestionCount} suggestions). ` +
-        (access.isAuthor()
-          ? 'Use the Merge… control on a suggestion to combine duplicates.'
-          : 'Ask the dataset author to merge duplicates so votes combine.')
+      className: 'status-line',
+      text: access.isAuthor()
+        ? `${dupSuggestionCount} duplicate labels: Merge… combines them.`
+        : `${dupSuggestionCount} duplicate labels: votes may be split.`
     }));
   }
 
@@ -3027,6 +3464,15 @@ function buildVotingDetail({
   );
   if (!Number.isSafeInteger(viewState.suggestionPage)) {
     viewState.suggestionPage = 0;
+  }
+  // Votes reorder the list. Keep the page that holds an open inline edit on
+  // screen so a rebuild never pages the viewer's editor away.
+  const editedAnchors = inlineEdits.anchorIds();
+  const editedIndex = suggestions.findIndex(
+    s => editedAnchors.has(toCleanString(s?.id))
+  );
+  if (editedIndex >= 0) {
+    viewState.suggestionPage = Math.floor(editedIndex / suggestionPageSize);
   }
   viewState.suggestionPage = Math.max(
     0,
@@ -3042,22 +3488,22 @@ function buildVotingDetail({
   });
   const previousSuggestionPage = el('button', {
     type: 'button',
-    className: 'btn-small',
+    className: 'btn',
     text: 'Previous suggestions'
   });
   const nextSuggestionPage = el('button', {
     type: 'button',
-    className: 'btn-small',
+    className: 'btn',
     text: 'Next suggestions'
   });
-  const renderSuggestionPage = () => {
+  const renderSuggestionPage = () => inlineEdits.rebuild(() => {
     list.innerHTML = '';
     const page = viewState.suggestionPage;
     const start = page * suggestionPageSize;
     const shown = suggestions.slice(start, start + suggestionPageSize);
     if (!shown.length) {
       list.appendChild(el('div', {
-        className: 'legend-help',
+        className: 'empty-state',
         text: 'No suggestions yet.'
       }));
     } else {
@@ -3067,6 +3513,7 @@ function buildVotingDetail({
           fieldKey,
           catIdx,
           suggestion,
+          inlineEdits,
           mergeTargets: suggestions,
           lifecycle,
           canInteract,
@@ -3081,7 +3528,7 @@ function buildVotingDetail({
       `${suggestions.length} suggestion${suggestions.length === 1 ? '' : 's'}`;
     previousSuggestionPage.disabled = page === 0;
     nextSuggestionPage.disabled = page >= suggestionPageCount - 1;
-  };
+  });
   previousSuggestionPage.addEventListener('click', () => {
     if (!isCurrent() || viewState.suggestionPage === 0) return;
     viewState.suggestionPage -= 1;
@@ -3121,10 +3568,10 @@ function buildVotingDetail({
     panel.appendChild(suggestionPageStatus);
   }
 
-  const formBox = el('div', { className: 'community-annotation-dashed-box' });
+  const formBox = el('div', { className: 'control-box' });
   formBox.appendChild(el('div', { className: 'community-annotation-new-title', text: 'New suggestion' }));
   if (!canInteract) {
-    formBox.appendChild(el('div', { className: 'legend-help', text: 'New suggestions are disabled while closed by the author.' }));
+    formBox.appendChild(el('div', { className: 'status-line', text: 'Closed by the author.' }));
   }
 
   const form = el('div', { className: 'community-annotation-new community-annotation-new-vertical' });
@@ -3135,32 +3582,32 @@ function buildVotingDetail({
   );
 
   const labelRow = el('div', { className: 'community-annotation-label-row' });
-  const labelInput = el('input', { type: 'text', className: 'community-annotation-text-input', placeholder: 'Label (required)', maxlength: '120', disabled: !canInteract });
+  const labelInput = el('input', { type: 'text', className: 'obs-select', 'aria-label': 'Label', placeholder: 'Label (required)', maxlength: '120', disabled: !canInteract });
   const searchCapBtn = el('button', {
     type: 'button',
-    className: 'btn-small cap-btn',
+    className: 'btn btn-compact cap-btn',
     text: 'Search CAP',
     title: 'Search Cell Annotation Platform for cell types',
     disabled: !canInteract,
     'aria-expanded': 'false'
   });
-  ownModalFocusKey(labelInput, `${newSuggestionFocusPrefix}:label`);
+  ownModalDraft(ownModalFocusKey(labelInput, `${newSuggestionFocusPrefix}:label`));
   ownModalFocusKey(searchCapBtn, `${newSuggestionFocusPrefix}:search-name`);
 
   labelRow.appendChild(labelInput);
   labelRow.appendChild(searchCapBtn);
 
   const ontRow = el('div', { className: 'community-annotation-label-row' });
-  const ontInput = el('input', { type: 'text', className: 'community-annotation-text-input', placeholder: 'Ontology id (optional, e.g. CL:0000625)', maxlength: '64', disabled: !canInteract });
+  const ontInput = el('input', { type: 'text', className: 'obs-select', 'aria-label': 'Ontology id', placeholder: 'Ontology id (optional)', title: 'Ontology id, such as CL:0000625', maxlength: '64', disabled: !canInteract });
   const searchOntBtn = el('button', {
     type: 'button',
-    className: 'btn-small cap-btn',
-    text: 'Search Ontology',
+    className: 'btn btn-compact cap-btn',
+    text: 'Search ontology',
     title: 'Search CAP by ontology ID',
     disabled: !canInteract,
     'aria-expanded': 'false'
   });
-  ownModalFocusKey(ontInput, `${newSuggestionFocusPrefix}:ontology`);
+  ownModalDraft(ownModalFocusKey(ontInput, `${newSuggestionFocusPrefix}:ontology`));
   ownModalFocusKey(
     searchOntBtn,
     `${newSuggestionFocusPrefix}:search-ontology`
@@ -3170,19 +3617,19 @@ function buildVotingDetail({
   ontRow.appendChild(searchOntBtn);
 
   const markerGenesRow = el('div', { className: 'community-annotation-label-row' });
-  const markerGenesInput = el('input', { type: 'text', className: 'community-annotation-text-input', placeholder: 'Marker genes (optional, comma-separated)', disabled: !canInteract });
+  const markerGenesInput = el('input', { type: 'text', className: 'obs-select', 'aria-label': 'Marker genes', placeholder: 'Marker genes (optional)', title: 'Marker genes, separated by commas', disabled: !canInteract });
   const searchMarkersBtn = el('button', {
     type: 'button',
-    className: 'btn-small cap-btn',
-    text: 'Search Markers',
+    className: 'btn btn-compact cap-btn',
+    text: 'Search markers',
     title: 'Search CAP by marker genes',
     disabled: !canInteract,
     'aria-expanded': 'false'
   });
-  ownModalFocusKey(
+  ownModalDraft(ownModalFocusKey(
     markerGenesInput,
     `${newSuggestionFocusPrefix}:markers`
-  );
+  ));
   ownModalFocusKey(
     searchMarkersBtn,
     `${newSuggestionFocusPrefix}:search-markers`
@@ -3191,8 +3638,8 @@ function buildVotingDetail({
   markerGenesRow.appendChild(markerGenesInput);
   markerGenesRow.appendChild(searchMarkersBtn);
 
-  const evidenceInput = el('textarea', { className: 'community-annotation-text-input community-annotation-textarea', placeholder: 'Evidence (optional)', maxlength: '2000', disabled: !canInteract });
-  ownModalFocusKey(evidenceInput, `${newSuggestionFocusPrefix}:evidence`);
+  const evidenceInput = el('textarea', { className: 'obs-select community-annotation-textarea', 'aria-label': 'Evidence', placeholder: 'Evidence (optional)', maxlength: '2000', disabled: !canInteract });
+  ownModalDraft(ownModalFocusKey(evidenceInput, `${newSuggestionFocusPrefix}:evidence`));
   const capStatus = el('div', {
     className: 'cap-import-status',
     role: 'status',
@@ -3201,8 +3648,8 @@ function buildVotingDetail({
 
   const searchButtons = [
     { button: searchCapBtn, idleText: 'Search CAP' },
-    { button: searchOntBtn, idleText: 'Search Ontology' },
-    { button: searchMarkersBtn, idleText: 'Search Markers' }
+    { button: searchOntBtn, idleText: 'Search ontology' },
+    { button: searchMarkersBtn, idleText: 'Search markers' }
   ];
   let searchGeneration = 0;
   let activeSearchController = null;
@@ -3357,7 +3804,13 @@ function buildVotingDetail({
       activeSearchButton = button;
       button.setAttribute('aria-controls', resultPanelId);
       button.setAttribute('aria-expanded', 'true');
-      formBox.appendChild(activeSearchPanel);
+      // The results open under the row whose search produced them, not at
+      // the end of the form below Add and Clear.
+      const triggerRow = button.closest('.community-annotation-label-row');
+      if (triggerRow === null) {
+        throw new Error('A CAP search button must sit in its field row');
+      }
+      triggerRow.after(activeSearchPanel);
     } catch (error) {
       if (
         controller.signal.aborted ||
@@ -3401,7 +3854,7 @@ function buildVotingDetail({
       failureLabel: 'CAP search failed',
       request: (signal) => capApi.searchCellTypes(
         searchTerm,
-        20,
+        capApi.CAP_LOOKUP_LIMIT,
         { kind: 'name', signal }
       )
     });
@@ -3454,7 +3907,7 @@ function buildVotingDetail({
       failureLabel: 'CAP marker search failed',
       request: (signal) => capApi.searchCellTypes(
         markerSignature,
-        20,
+        capApi.CAP_LOOKUP_LIMIT,
         { kind: 'marker', markerGenes: markers, signal }
       )
     });
@@ -3469,8 +3922,8 @@ function buildVotingDetail({
   }
 
   const actions = el('div', { className: 'community-annotation-suggestion-actions' });
-  const addBtn = el('button', { type: 'button', className: 'btn-small', text: 'Add', disabled: !canInteract });
-  const clearBtn = el('button', { type: 'button', className: 'btn-small', text: 'Clear', disabled: !canInteract });
+  const addBtn = el('button', { type: 'button', className: 'btn', text: 'Add', disabled: !canInteract });
+  const clearBtn = el('button', { type: 'button', className: 'btn', text: 'Clear', disabled: !canInteract });
   ownModalFocusKey(addBtn, `${newSuggestionFocusPrefix}:add`);
   ownModalFocusKey(clearBtn, `${newSuggestionFocusPrefix}:clear`);
   actions.appendChild(addBtn);
@@ -3563,7 +4016,7 @@ export function openCommunityAnnotationVotingModal({
       if (retireModalLifecycle !== null) retireModalLifecycle();
     },
     buildContent: (content) => {
-      const status = el('div', { className: 'legend-help', text: '' });
+      const status = el('p', { className: 'status-line', 'aria-live': 'polite', text: '' });
       content.appendChild(status);
 
       let cleaned = false;
@@ -3572,7 +4025,12 @@ export function openCommunityAnnotationVotingModal({
       let unsubscribeContextChanged = null;
       let renderVersion = 0;
       let retireActiveDetail = null;
-      const viewState = { suggestionPage: 0 };
+      /** @type {{suggestionPage: number, drafts: Map<string, string>, inlineEdits: InlineEditState}} */
+      const viewState = {
+        suggestionPage: 0,
+        drafts: new Map(),
+        inlineEdits: new InlineEditState()
+      };
 
       const cleanupModalLifecycle = () => {
         if (cleaned) return;
@@ -3672,6 +4130,7 @@ export function openCommunityAnnotationVotingModal({
       let isFirstRender = true;
       const replaceContentWithStatus = (message) => {
         const focusSnapshot = captureModalRerenderFocus(content);
+        captureModalDrafts(content, viewState.drafts);
         content.innerHTML = '';
         content.appendChild(status);
         status.textContent = message;
@@ -3780,6 +4239,7 @@ export function openCommunityAnnotationVotingModal({
           )
         };
         const newContent = document.createDocumentFragment();
+        viewState.inlineEdits.beginRebuild();
         try {
           newContent.appendChild(el('div', { className: 'community-annotation-inline-help', text: `${focusField} • ${catLabel}` }));
           newContent.appendChild(buildVotingDetail({
@@ -3790,6 +4250,7 @@ export function openCommunityAnnotationVotingModal({
             viewState
           }));
         } catch (error) {
+          viewState.inlineEdits.cancelRebuild();
           retireDetail();
           throw error;
         }
@@ -3798,14 +4259,18 @@ export function openCommunityAnnotationVotingModal({
           myVersion !== renderVersion ||
           !retainsModalContext()
         ) {
+          viewState.inlineEdits.cancelRebuild();
           retireDetail();
           return;
         }
 
         const focusSnapshot = captureModalRerenderFocus(content);
+        captureModalDrafts(content, viewState.drafts);
         retireActiveDetail = retireDetail;
         content.innerHTML = '';
         content.appendChild(newContent);
+        viewState.inlineEdits.finishRebuild();
+        restoreModalDrafts(content, viewState.drafts);
         restoreModalRerenderFocus(
           focusSnapshot,
           content,
@@ -3850,12 +4315,14 @@ export function openCommunityAnnotationVotingModal({
 
       requestFocusedRender();
 
+      // The content leaves the document only with its overlay, a child of
+      // <body>, so watching <body>'s own children is enough.
       observer = new MutationObserver(() => {
         if (!document.body.contains(content)) {
           cleanupModalLifecycle();
         }
       });
-      observer.observe(document.body, { childList: true, subtree: true });
+      observer.observe(document.body, { childList: true });
 
       if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') {
         throw new TypeError('Community voting requires window.addEventListener()');

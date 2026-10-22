@@ -8,10 +8,14 @@
  * - Plot type selector
  */
 
+import { createIntentPrefetcher } from '../../../utils/intent-prefetch.js';
 import { getPageColor } from '../../core/plugin-contract.js';
 import { NONE_VALUE } from '../../shared/dom-utils.js';
 import { expandPagesWithDerived } from '../../shared/page-derivation-utils.js';
 import { StyleManager } from '../../../../utils/style-manager.js';
+import { createField } from '../../../ui/components/controls.js';
+import { createDomId } from '../../../ui/components/dom-id.js';
+import { formatCells } from '../../../ui/components/display-format.js';
 
 // =============================================================================
 // PLOT REGISTRY - Imported from centralized location
@@ -42,19 +46,9 @@ export function createVariableSelector(options = {}) {
     onChange,
     selectedValue = '',
     label = 'Variable',
+    ariaLabel = 'Variable',
     id = ''
   } = options;
-
-  const container = document.createElement('div');
-  container.className = 'field-select';
-
-  // Only add label if provided
-  if (label) {
-    const labelEl = document.createElement('label');
-    if (id) labelEl.htmlFor = id;
-    labelEl.textContent = label;
-    container.appendChild(labelEl);
-  }
 
   const select = document.createElement('select');
   select.className = 'obs-select';
@@ -67,7 +61,6 @@ export function createVariableSelector(options = {}) {
   noneOption.selected = !selectedValue || selectedValue === NONE_VALUE;
   select.appendChild(noneOption);
 
-  // Add variable options
   variables.forEach(v => {
     const option = document.createElement('option');
     option.value = v.key;
@@ -82,9 +75,15 @@ export function createVariableSelector(options = {}) {
     if (onChange) onChange(select.value === NONE_VALUE ? '' : select.value);
   });
 
-  container.appendChild(select);
-
-  return container;
+  // A selector without a visible label still needs a name.
+  if (!label) {
+    select.setAttribute('aria-label', ariaLabel);
+    const container = document.createElement('div');
+    container.className = 'control-block field-select';
+    container.appendChild(select);
+    return container;
+  }
+  return createField({ label, control: select, className: 'field-select' });
 }
 
 // =============================================================================
@@ -96,6 +95,8 @@ export function createVariableSelector(options = {}) {
  * @param {Object} options
  * @param {Object[]} options.genes - Array of gene variable info objects
  * @param {Function} options.onChange - Callback when selection changes
+ * @param {((gene: string, signal: AbortSignal) => Promise<unknown>)|null} [options.prefetch]
+ *   Loads a gene the user is about to choose (see utils/intent-prefetch.js)
  * @param {string} options.selectedValue - Currently selected gene
  * @param {string} options.label - Label text
  * @param {string} options.id - Element ID
@@ -105,22 +106,18 @@ export function createGeneExpressionSelector(options = {}) {
   const {
     genes = [],
     onChange,
+    prefetch = null,
     selectedValue = '',
-    label = 'Gene expression:',
+    label = 'Gene expression',
     id = 'analysis-gene-expression'
   } = options;
-
-  const container = document.createElement('div');
-  container.className = 'field-select';
-  container.id = `${id}-container`;
-
-  // Only add label if provided
-  if (label) {
-    const labelEl = document.createElement('label');
-    labelEl.htmlFor = `${id}-search`;
-    labelEl.textContent = label;
-    container.appendChild(labelEl);
-  }
+  // Prefetch on intent (utils/intent-prefetch.js): a gene kept active or
+  // under the pointer is loaded before it is chosen.
+  const genePrefetch = prefetch === null ? null : createIntentPrefetcher(prefetch);
+  const intendOption = element => {
+    const key = element?.dataset.optionKey;
+    if (genePrefetch !== null && key) genePrefetch.intend(key);
+  };
 
   const wrapper = document.createElement('div');
   wrapper.className = 'searchable-dropdown';
@@ -132,7 +129,7 @@ export function createGeneExpressionSelector(options = {}) {
   const input = document.createElement('input');
   input.type = 'text';
   input.id = `${id}-search`;
-  input.className = 'obs-select gene-search-input';
+  input.className = 'obs-select';
   input.placeholder = 'None';
   input.autocomplete = 'off';
   input.setAttribute('role', 'combobox');
@@ -147,6 +144,7 @@ export function createGeneExpressionSelector(options = {}) {
   dropdown.className = 'dropdown-list';
   dropdown.setAttribute('role', 'listbox');
   dropdown.setAttribute('aria-label', 'Gene expression options');
+  dropdown.hidden = true;
 
   let currentSelectedGene = selectedValue;
   /** Index into `optionElements` that Enter would commit, or -1. */
@@ -164,9 +162,15 @@ export function createGeneExpressionSelector(options = {}) {
     }
   };
 
-  const isOpen = () => dropdown.style.display === 'block';
+  const isOpen = () => !dropdown.hidden;
 
-  const setActiveIndex = (nextIndex) => {
+  /**
+   * Mark one option active. Scrolling it into view forces a layout, so it is
+   * done only for keyboard navigation, or once, a frame after the list was
+   * (re)built, never right after the options were appended.
+   */
+  let scrollFrame = null;
+  const setActiveIndex = (nextIndex, { scroll = true } = {}) => {
     activeIndex = nextIndex;
     optionElements.forEach((element, index) => {
       const active = index === activeIndex;
@@ -179,10 +183,22 @@ export function createGeneExpressionSelector(options = {}) {
     }
     const active = optionElements[activeIndex];
     input.setAttribute('aria-activedescendant', active.id);
-    active.scrollIntoView({ block: 'nearest' });
+    intendOption(active);
+    if (scroll) {
+      active.scrollIntoView({ block: 'nearest' });
+      return;
+    }
+    if (scrollFrame !== null) cancelAnimationFrame(scrollFrame);
+    scrollFrame = requestAnimationFrame(() => {
+      scrollFrame = null;
+      if (active.isConnected) active.scrollIntoView({ block: 'nearest' });
+    });
   };
 
   const commit = (gene) => {
+    // A prefetch of this gene is the load its choice joins; any other is no
+    // longer wanted.
+    if (genePrefetch !== null && genePrefetch.current() !== gene) genePrefetch.cancel();
     currentSelectedGene = gene;
     closeDropdown();
     updateSelectedDisplay();
@@ -190,70 +206,119 @@ export function createGeneExpressionSelector(options = {}) {
   };
 
   function closeDropdown() {
-    dropdown.style.display = 'none';
+    dropdown.hidden = true;
     input.setAttribute('aria-expanded', 'false');
     input.removeAttribute('aria-activedescendant');
     activeIndex = -1;
   }
 
+  // Every opening shows a list just built: it starts at its top. Left where
+  // an earlier, longer list was scrolled, it would be clamped to its own end
+  // and build its next page before anyone scrolled.
   const openDropdown = () => {
-    dropdown.style.display = 'block';
+    dropdown.hidden = false;
+    dropdown.scrollTop = 0;
     input.setAttribute('aria-expanded', 'true');
   };
 
+  dropdown.addEventListener('pointerover', (e) => {
+    const item = e.target instanceof Element
+      ? e.target.closest('.dropdown-item[data-option-key]')
+      : null;
+    if (item !== null && dropdown.contains(item)) intendOption(item);
+  });
+
+  // One delegated listener commits whichever option the pointer pressed.
+  dropdown.addEventListener('mousedown', (e) => {
+    const item = e.target instanceof Element
+      ? e.target.closest('.dropdown-item[data-option-key]')
+      : null;
+    if (item === null || !dropdown.contains(item)) return;
+    e.preventDefault();
+    commit(item.dataset.optionKey);
+  });
+
+  /**
+   * Every gene that matches the search is listed. The options are built a page
+   * at a time — the first page when the list opens, the next when it is
+   * scrolled or arrowed to its end — so a search matching tens of thousands of
+   * genes costs a hundred list items to open, not tens of thousands.
+   */
+  const OPTION_PAGE = 100;
+  /** @type {Object[]} Matches of the current search, in gene order. */
+  let matches = [];
+  let renderedMatches = 0;
+
+  const addOption = (parent, key, text, extraClass) => {
+    const item = document.createElement('div');
+    item.className = `dropdown-item${extraClass ? ` ${extraClass}` : ''}`;
+    item.id = `${id}-option-${optionElements.length}`;
+    item.setAttribute('role', 'option');
+    item.setAttribute('aria-selected', 'false');
+    item.dataset.optionKey = key;
+    item.textContent = text;
+    parent.appendChild(item);
+    optionElements.push(item);
+    return item;
+  };
+
+  /** Append the next page of matches (or up to `through`, a match index). */
+  const renderMoreMatches = (through = renderedMatches + OPTION_PAGE - 1) => {
+    const end = Math.min(matches.length, Math.max(through + 1, renderedMatches));
+    if (end <= renderedMatches) return false;
+    const fragment = document.createDocumentFragment();
+    for (let i = renderedMatches; i < end; i++) {
+      addOption(fragment, matches[i].key, matches[i].key);
+    }
+    renderedMatches = end;
+    dropdown.appendChild(fragment);
+    return true;
+  };
+
   const renderOptions = (filter = '') => {
-    dropdown.innerHTML = '';
     optionElements = [];
     activeIndex = -1;
-
-    const addOption = (key, text, extraClass) => {
-      const item = document.createElement('div');
-      item.className = `dropdown-item${extraClass ? ` ${extraClass}` : ''}`;
-      item.id = `${id}-option-${optionElements.length}`;
-      item.setAttribute('role', 'option');
-      item.setAttribute('aria-selected', 'false');
-      item.dataset.optionKey = key;
-      item.textContent = text;
-      item.addEventListener('mousedown', (e) => {
-        e.preventDefault();
-        commit(key);
-      });
-      dropdown.appendChild(item);
-      optionElements.push(item);
-      return item;
-    };
+    // Options are built off-document and inserted in one step.
+    const fragment = document.createDocumentFragment();
 
     // "None" clears the selection.
-    addOption('', 'None', 'text-tertiary');
+    addOption(fragment, '', 'None', 'text-tertiary');
 
     const lowerFilter = filter.toLowerCase();
     // Don't filter if the input shows the current selection
     const isShowingSelection = currentSelectedGene && input.value === currentSelectedGene;
-    const filtered = genes.filter(g =>
-      isShowingSelection || g.key.toLowerCase().includes(lowerFilter)
-    ).slice(0, 50);
+    matches = isShowingSelection
+      ? genes
+      : genes.filter(g => g.key.toLowerCase().includes(lowerFilter));
+    renderedMatches = 0;
 
-    if (filtered.length === 0 && filter) {
+    if (matches.length === 0 && filter) {
       const empty = document.createElement('div');
-      empty.className = 'dropdown-item';
-      empty.textContent = 'No matches';
-      empty.classList.add('text-tertiary');
-      empty.style.fontStyle = 'italic';
+      empty.className = 'dropdown-no-results';
+      empty.textContent = 'No matches.';
       empty.setAttribute('role', 'option');
       empty.setAttribute('aria-disabled', 'true');
       empty.setAttribute('aria-selected', 'false');
-      dropdown.appendChild(empty);
+      fragment.appendChild(empty);
+      dropdown.replaceChildren(fragment);
       return;
     }
 
-    for (const g of filtered) {
-      addOption(g.key, g.key);
-    }
+    dropdown.replaceChildren(fragment);
+    // One page to open with, whatever the match count; the current gene is
+    // marked when it is on it.
+    renderMoreMatches();
     const currentIndex = optionElements.findIndex(
       item => item.dataset.optionKey === currentSelectedGene
     );
-    setActiveIndex(currentIndex >= 0 ? currentIndex : 0);
+    setActiveIndex(currentIndex >= 0 ? currentIndex : 0, { scroll: false });
   };
+
+  dropdown.addEventListener('scroll', () => {
+    if (dropdown.scrollTop + dropdown.clientHeight >= dropdown.scrollHeight - 2 * (optionElements[0]?.offsetHeight || 24)) {
+      renderMoreMatches();
+    }
+  });
 
   input.addEventListener('focus', () => {
     // Clear input to allow searching, but remember selection
@@ -298,6 +363,13 @@ export function createGeneExpressionSelector(options = {}) {
       return;
     }
     if (optionElements.length === 0) return;
+    // Moving past the last option built, or to the end, builds the rest of
+    // the way first: every match is reachable from the keyboard.
+    if (event.key === 'End' || (event.key === 'ArrowUp' && activeIndex <= 0)) {
+      renderMoreMatches(matches.length - 1);
+    } else if (event.key === 'ArrowDown' && activeIndex >= optionElements.length - 1) {
+      renderMoreMatches();
+    }
     const last = optionElements.length - 1;
     if (event.key === 'Home') setActiveIndex(0);
     else if (event.key === 'End') setActiveIndex(last);
@@ -317,9 +389,15 @@ export function createGeneExpressionSelector(options = {}) {
     });
   });
 
+  const container = label
+    ? createField({ label, control: input, className: 'field-select' })
+    : document.createElement('div');
+  if (!label) container.className = 'control-block field-select';
+  container.id = `${id}-container`;
+  if (label) input.replaceWith(wrapper);
   wrapper.appendChild(input);
   wrapper.appendChild(dropdown);
-  container.appendChild(wrapper);
+  if (!label) container.appendChild(wrapper);
 
   // Set initial state
   if (selectedValue) {
@@ -450,24 +528,26 @@ export function createPageComparisonSelector(options = {}) {
 
   // If fewer than 2 selectable options, show message
   if (selectablePages.length < 2) {
-    const notice = document.createElement('div');
-    notice.className = 'legend-help';
-    notice.textContent =
-      'Differential expression requires two non-empty cell groups.';
+    const notice = document.createElement('p');
+    notice.className = 'empty-state';
+    notice.textContent = 'Needs two non-empty groups.';
     container.appendChild(notice);
+    // The statuses sit in the same wrapping chip row the page selectors use,
+    // so a page name reads on one line instead of folding inside a narrow box.
+    const statusRow = document.createElement('div');
+    statusRow.className = 'analysis-page-tabs';
+    container.appendChild(statusRow);
     for (const page of displayPages) {
-      const status = document.createElement('div');
+      const status = document.createElement('span');
       const cellCount = cellCountByPageId.get(page.id);
-      status.className = 'analysis-page-tab' +
-        (page._derived ? ' derived' : '') +
-        (cellCount === 0 ? ' disabled' : '');
+      status.className = page._derived ? 'chip chip-status chip-derived' : 'chip chip-status';
       status.dataset.pageId = page.id;
       status.setAttribute(
         'aria-disabled',
         cellCount === 0 ? 'true' : 'false'
       );
-      status.textContent = `${page.name} (${cellCount.toLocaleString()} cells)`;
-      container.appendChild(status);
+      status.textContent = `${page.name} (${formatCells(cellCount)})`;
+      statusRow.appendChild(status);
     }
     container._getSelection = () => [];
     return container;
@@ -479,25 +559,36 @@ export function createPageComparisonSelector(options = {}) {
     comparisonDisplay.className = 'de-page-info';
     const color0 = customColors.get(pages[0].id) || getPageColor(0);
     const color1 = customColors.get(pages[1].id) || getPageColor(1);
-    const labelEl = document.createElement('div');
-    labelEl.className = 'de-comparison-label';
-    labelEl.textContent = 'Comparing:';
+    const labelEl = document.createElement('span');
+    labelEl.className = 'field-label';
+    labelEl.textContent = 'Comparing';
 
-    const badgeA = document.createElement('div');
-    badgeA.className = 'de-page-badge page-a';
-    badgeA.textContent = pages[0].name;
-    StyleManager.setVariable(badgeA, '--de-page-color', color0);
+    // The compared pages are drawn as the same chip every page selector uses,
+    // with the page colour in its swatch.
+    const pageChip = (page, color) => {
+      const chip = document.createElement('span');
+      chip.className = 'chip chip-status';
+      const swatch = document.createElement('span');
+      swatch.className = 'color-swatch';
+      swatch.setAttribute('aria-hidden', 'true');
+      StyleManager.setVariable(swatch, '--swatch-color', color);
+      const name = document.createElement('span');
+      name.className = 'chip-name';
+      name.textContent = page.name;
+      chip.append(swatch, name);
+      return chip;
+    };
 
     const vsEl = document.createElement('span');
     vsEl.className = 'de-vs';
     vsEl.textContent = 'vs';
 
-    const badgeB = document.createElement('div');
-    badgeB.className = 'de-page-badge page-b';
-    badgeB.textContent = pages[1].name;
-    StyleManager.setVariable(badgeB, '--de-page-color', color1);
-
-    comparisonDisplay.append(labelEl, badgeA, vsEl, badgeB);
+    comparisonDisplay.append(
+      labelEl,
+      pageChip(pages[0], color0),
+      vsEl,
+      pageChip(pages[1], color1)
+    );
     container.appendChild(comparisonDisplay);
 
     // Ensure both pages are selected
@@ -507,10 +598,13 @@ export function createPageComparisonSelector(options = {}) {
     return container;
   }
 
-  // More than 2 pages - show selection dropdowns
-  const label = document.createElement('label');
-  label.textContent = 'Select pages to compare:';
-  container.appendChild(label);
+  // More than 2 pages - show selection dropdowns. The caption names the pair
+  // of dropdowns as a group; each dropdown has its own label.
+  const caption = document.createElement('span');
+  caption.className = 'field-label';
+  caption.id = createDomId('page-comparison-caption');
+  caption.textContent = 'Pages to compare';
+  container.appendChild(caption);
 
   // Initialize selection with first two if not already selected
   let selectedA = selectedIds.length === 2
@@ -522,35 +616,31 @@ export function createPageComparisonSelector(options = {}) {
 
   const selectRow = document.createElement('div');
   selectRow.className = 'page-comparison-row';
+  selectRow.setAttribute('role', 'group');
+  selectRow.setAttribute('aria-labelledby', caption.id);
 
-  // Create Page A dropdown
-  const createPageDropdown = (currentValue, otherValue, onSelect, labelText) => {
+  // Both dropdowns are built once and updated in place, so choosing a page
+  // never rebuilds the control the keyboard user is standing on.
+  const createPageDropdown = (labelText, onSelect) => {
     const wrapper = document.createElement('div');
     wrapper.className = 'page-comparison-dropdown';
 
-    const dropdownLabel = document.createElement('span');
-    dropdownLabel.className = 'page-comparison-label';
-    dropdownLabel.textContent = labelText;
-    wrapper.appendChild(dropdownLabel);
-
     const select = document.createElement('select');
     select.className = 'obs-select page-select';
-    // `page-comparison-label` used to be a <span>, which named nothing: both
-    // comparison dropdowns reached the accessibility tree anonymous.
-    select.setAttribute('aria-label', labelText.replace(/:$/, ''));
+    select.id = createDomId('page-comparison-select');
+
+    const dropdownLabel = document.createElement('label');
+    dropdownLabel.htmlFor = select.id;
+    dropdownLabel.textContent = labelText;
+    wrapper.appendChild(dropdownLabel);
 
     const addOption = (page, parent) => {
       const option = document.createElement('option');
       option.value = page.id;
       const cellCount = cellCountByPageId.get(page.id);
       option.textContent = cellCount === 0
-        ? `${page.name} (0 cells)`
+        ? `${page.name} (${formatCells(0)})`
         : page.name;
-      option.selected = page.id === currentValue;
-      // Disable the option if it's selected in the other dropdown
-      if (page.id === otherValue || cellCount === 0) {
-        option.disabled = true;
-      }
       parent.appendChild(option);
     };
 
@@ -575,43 +665,39 @@ export function createPageComparisonSelector(options = {}) {
     });
 
     wrapper.appendChild(select);
-    return wrapper;
+    return { wrapper, select };
   };
 
+  const dropdownA = createPageDropdown('Page A', (val) => {
+    selectedA = val;
+    updateDropdowns();
+    if (onChange) onChange([selectedA, selectedB]);
+  });
+  const dropdownB = createPageDropdown('Page B', (val) => {
+    selectedB = val;
+    updateDropdowns();
+    if (onChange) onChange([selectedA, selectedB]);
+  });
+
+  // A page chosen in one dropdown is disabled in the other; empty pages are
+  // never selectable.
+  const syncDropdown = (select, currentValue, otherValue) => {
+    for (const option of select.options) {
+      option.selected = option.value === currentValue;
+      option.disabled =
+        option.value === otherValue ||
+        cellCountByPageId.get(option.value) === 0;
+    }
+  };
   const updateDropdowns = () => {
-    selectRow.innerHTML = '';
-
-    const dropdownA = createPageDropdown(
-      selectedA,
-      selectedB,
-      (val) => {
-        selectedA = val;
-        updateDropdowns();
-        if (onChange) onChange([selectedA, selectedB]);
-      },
-      'Page A:'
-    );
-
-    const vsSpan = document.createElement('span');
-    vsSpan.className = 'de-vs';
-    vsSpan.textContent = 'vs';
-
-    const dropdownB = createPageDropdown(
-      selectedB,
-      selectedA,
-      (val) => {
-        selectedB = val;
-        updateDropdowns();
-        if (onChange) onChange([selectedA, selectedB]);
-      },
-      'Page B:'
-    );
-
-    selectRow.appendChild(dropdownA);
-    selectRow.appendChild(vsSpan);
-    selectRow.appendChild(dropdownB);
+    syncDropdown(dropdownA.select, selectedA, selectedB);
+    syncDropdown(dropdownB.select, selectedB, selectedA);
   };
 
+  const vsSpan = document.createElement('span');
+  vsSpan.className = 'de-vs';
+  vsSpan.textContent = 'vs';
+  selectRow.append(dropdownA.wrapper, vsSpan, dropdownB.wrapper);
   updateDropdowns();
   container.appendChild(selectRow);
 
@@ -648,14 +734,6 @@ export function createPageComparisonSelector(options = {}) {
 export function createPlotTypeSelector(options = {}) {
   const { dataType = 'categorical', selectedId = '', onChange, id = 'analysis-plot-type' } = options;
 
-  const container = document.createElement('div');
-  container.className = 'field-select';
-
-  const label = document.createElement('label');
-  label.htmlFor = id;
-  label.textContent = 'Plot type:';
-  container.appendChild(label);
-
   const select = document.createElement('select');
   select.id = id;
   select.className = 'obs-select';
@@ -685,19 +763,5 @@ export function createPlotTypeSelector(options = {}) {
     if (onChange) onChange(select.value);
   });
 
-  container.appendChild(select);
-
-  return container;
+  return createField({ label: 'Plot type', control: select, className: 'field-select' });
 }
-
-// =============================================================================
-// EXPORTS
-// =============================================================================
-
-export default {
-  PlotRegistry,
-  createVariableSelector,
-  createGeneExpressionSelector,
-  createPageComparisonSelector,
-  createPlotTypeSelector
-};

@@ -15,8 +15,16 @@ import { getNotificationCenter } from '../notification-center.js';
 import { bindDropZone } from './components/drop-zone.js';
 import { StyleManager } from '../../utils/style-manager.js';
 import { getCategoryColor, rgbToCss } from '../../data/palettes.js';
-import { formatCellCount } from '../../data/data-source.js';
-import { Limits, OverlapStrategy } from '../utils/field-constants.js';
+import { ICONS, bindDisclosure, createIconButton } from './components/controls.js';
+import { formatCompactCount, formatCount } from './components/display-format.js';
+import { OverlapStrategy } from '../utils/field-constants.js';
+import {
+  MAX_INTERSECTION_PAGES,
+  compareIntersectionMasks,
+  intersectionMembership,
+  orderedMembership,
+  orderedPageCounts
+} from '../utils/page-membership.js';
 import {
   MAX_CATEGORICAL_CATEGORIES
 } from '../../data/categorical-storage-contract.js';
@@ -440,8 +448,7 @@ export class CategoryBuilder {
     if (!available) {
       this._droppedPages = [];
       this._isOpen = false;
-      this._els.toggle.setAttribute('aria-expanded', 'false');
-      this._els.item.classList.remove('open');
+      this._setExpanded(false);
       this._renderDroppedItems();
       this._updatePreview(true);
     }
@@ -457,7 +464,6 @@ export class CategoryBuilder {
     const {
       toggle,
       panel,
-      item,
       dropzone,
       pageSelect,
       addPageBtn,
@@ -469,11 +475,15 @@ export class CategoryBuilder {
     } = this._els;
     const signal = this._lifecycle.signal;
 
-    toggle.addEventListener('click', () => {
-      this._isOpen = !this._isOpen;
-      toggle.setAttribute('aria-expanded', this._isOpen ? 'true' : 'false');
-      item.classList.toggle('open', this._isOpen);
-    }, { signal });
+    this._setExpanded = bindDisclosure({
+      header: toggle,
+      content: panel,
+      expanded: this._isOpen,
+      onToggle: expanded => {
+        this._isOpen = expanded;
+      },
+      signal
+    });
 
     bindDropZone(dropzone, {
       onDrop: dataTransfer => {
@@ -686,13 +696,13 @@ export class CategoryBuilder {
       row.setAttribute('role', 'listitem');
 
       const colorIndicator = this._document.createElement('span');
-      colorIndicator.className = 'dropzone-item-color';
-      StyleManager.setVariable(colorIndicator, '--dropzone-item-color', pageColor);
+      colorIndicator.className = 'color-swatch';
+      StyleManager.setVariable(colorIndicator, '--swatch-color', pageColor);
       colorIndicator.title = 'Click to change page color';
 
       const colorInput = this._document.createElement('input');
       colorInput.type = 'color';
-      colorInput.className = 'dropzone-item-color-input';
+      colorInput.className = 'color-swatch-input';
       colorInput.value = pageColor;
       colorInput.title = 'Click to change page color';
       colorInput.addEventListener('input', () => {
@@ -700,7 +710,7 @@ export class CategoryBuilder {
           colorInput.value,
           'Highlight page color input'
         );
-        StyleManager.setVariable(colorIndicator, '--dropzone-item-color', newColor);
+        StyleManager.setVariable(colorIndicator, '--swatch-color', newColor);
         this._state.setHighlightPageColor(p.pageId, newColor);
       }, { signal });
       colorInput.addEventListener(
@@ -732,7 +742,7 @@ export class CategoryBuilder {
 
       const input = this._document.createElement('input');
       input.type = 'text';
-      input.className = 'dropzone-item-label';
+      input.className = 'obs-select dropzone-item-label';
       input.value = p.label;
       input.dataset.idx = String(idx);
       input.addEventListener('input', () => {
@@ -752,13 +762,13 @@ export class CategoryBuilder {
 
       const count = this._document.createElement('span');
       count.className = 'dropzone-item-count';
-      count.textContent = `(${formatCellCount(pageCount)})`;
+      count.textContent = `(${formatCompactCount(pageCount)})`;
 
-      const remove = this._document.createElement('button');
-      remove.type = 'button';
-      remove.className = 'dropzone-item-remove';
-      remove.title = 'Remove';
-      remove.textContent = '×';
+      const remove = createIconButton({
+        label: 'Remove this page',
+        icon: ICONS.close,
+        tone: 'danger'
+      });
       remove.addEventListener('click', () => {
         const removedLabel = this._droppedPages[idx].label;
         this._droppedPages.splice(idx, 1);
@@ -954,11 +964,13 @@ export class CategoryBuilder {
       );
     }
     const strategy = overlapStrategy;
-    const pageCounts = new Array(this._droppedPages.length).fill(0);
 
-    const buildCellSet = (pageId) => {
+    // Each dropped page's enabled groups, validated as the membership is built.
+    const membershipPages = this._droppedPages.map(pageInfo => {
+      const pageId = pageInfo.pageId;
       const page = this._getPage(pageId);
-      const cellSet = new Set();
+      const groups = [];
+      const groupIndices = [];
       for (
         let groupIndex = 0;
         groupIndex < page.highlightedGroups.length;
@@ -982,157 +994,70 @@ export class CategoryBuilder {
           );
         }
         if (!group.enabled) continue;
-        for (const idx of group.cellIndices) {
-          if (
-            !Number.isSafeInteger(idx)
-            || idx < 0
-            || idx >= pointCount
-          ) {
-            throw new RangeError(
-              `Highlight page "${pageId}" group ${groupIndex} has an out-of-range cell index`
-            );
-          }
-          cellSet.add(idx);
-        }
+        groups.push(group.cellIndices);
+        groupIndices.push(groupIndex);
       }
-      return cellSet;
-    };
-
-    const isPowerOfTwo = v => v > 0 && (v & (v - 1)) === 0;
-    const bitCount32 = (v) => {
-      let x = v >>> 0;
-      let c = 0;
-      while (x) { x &= (x - 1); c++; }
-      return c;
-    };
+      return {
+        groups,
+        describeGroup: position => `Highlight page "${pageId}" group ${groupIndices[position]}`
+      };
+    });
 
     // ────────────────────────────────────────────────────────────────────
     // Intersections: every overlap combination becomes a category
     // ────────────────────────────────────────────────────────────────────
     if (strategy === OverlapStrategy.INTERSECTIONS) {
-      if (this._droppedPages.length > Limits.MAX_INTERSECTION_PAGES) {
-        throw new RangeError(
-          `Each intersection supports at most ${Limits.MAX_INTERSECTION_PAGES} pages`
-        );
-      }
-      const membershipByCell = new Map(); // cellIdx -> bitmask
-      this._droppedPages.forEach((pageInfo, pageIndex) => {
-        const cellSet = buildCellSet(pageInfo.pageId);
-        const bit = 1 << pageIndex;
-        for (const idx of cellSet) {
-          const previous = membershipByCell.has(idx)
-            ? membershipByCell.get(idx)
-            : 0;
-          membershipByCell.set(idx, previous | bit);
-        }
-      });
-
-      let overlapCount = 0;
-      const intersectionCounts = new Map(); // mask -> count
-
-      for (const mask of membershipByCell.values()) {
-        if (isPowerOfTwo(mask)) {
-          pageCounts[Math.log2(mask)] += 1;
-        } else {
-          overlapCount += 1;
-          const count = intersectionCounts.has(mask)
-            ? intersectionCounts.get(mask)
-            : 0;
-          intersectionCounts.set(mask, count + 1);
-        }
-      }
-
-      const intersectionRows = [...intersectionCounts.entries()]
+      const membership = intersectionMembership(membershipPages, pointCount);
+      const intersectionRows = [...membership.intersectionCounts.entries()]
         .map(([mask, count]) => ({ mask, count }))
-        .sort((a, b) => {
-          const cardinality =
-            bitCount32(a.mask) - bitCount32(b.mask);
-          return cardinality === 0
-            ? a.mask - b.mask
-            : cardinality;
-        });
-
+        .sort((a, b) => compareIntersectionMasks(a.mask, b.mask));
       const uncoveredCount = requireCountDifference(
         pointCount,
-        membershipByCell.size,
+        membership.coveredCount,
         'Intersection preview'
       );
-      return { overlapCount, uncoveredCount, pageCounts, intersectionRows };
+      return {
+        overlapCount: membership.overlapCount,
+        uncoveredCount,
+        pageCounts: membership.pageCounts,
+        intersectionRows
+      };
     }
 
-    // ────────────────────────────────────────────────────────────────────
-    // Overlap bucket: all overlapping cells go to a new category
-    // ────────────────────────────────────────────────────────────────────
-    if (strategy === OverlapStrategy.OVERLAP_LABEL) {
-      const assigned = new Map(); // cellIdx -> catIndex, or -1 for overlap
-      let overlapCount = 0;
-
-      this._droppedPages.forEach((pageInfo, catIndex) => {
-        const cellSet = buildCellSet(pageInfo.pageId);
-
-        for (const idx of cellSet) {
-          const prev = assigned.get(idx);
-          if (prev === undefined) {
-            assigned.set(idx, catIndex);
-            pageCounts[catIndex] += 1;
-            continue;
-          }
-          if (prev === -1 || prev === catIndex) continue;
-          assigned.set(idx, -1);
-          pageCounts[prev] -= 1;
-          overlapCount += 1;
-        }
-      });
-
-      const uncoveredCount = requireCountDifference(
-        pointCount,
-        assigned.size,
-        'Overlap preview'
-      );
-      return { overlapCount, uncoveredCount, pageCounts, overlapBucketCount: overlapCount, intersectionRows: [] };
-    }
-
-    // ────────────────────────────────────────────────────────────────────
-    // First/last: overlaps assigned to first/last page in order
-    // ────────────────────────────────────────────────────────────────────
     if (
-      strategy !== OverlapStrategy.FIRST
+      strategy !== OverlapStrategy.OVERLAP_LABEL
+      && strategy !== OverlapStrategy.FIRST
       && strategy !== OverlapStrategy.LAST
     ) {
       throw new TypeError(
         `Category preview strategy "${strategy}" has no implementation`
       );
     }
-    const assigned = new Map(); // cellIdx -> category index
-    const overlapping = new Set();
 
-    const addCell = (cellIdx, catIndex) => {
-      const prev = assigned.get(cellIdx);
-      if (prev === undefined) {
-        assigned.set(cellIdx, catIndex);
-        pageCounts[catIndex] += 1;
-        return;
-      }
-
-      if (prev !== catIndex) overlapping.add(cellIdx);
-      if (strategy === OverlapStrategy.LAST && prev !== catIndex) {
-        pageCounts[prev] -= 1;
-        assigned.set(cellIdx, catIndex);
-        pageCounts[catIndex] += 1;
-      }
-    };
-
-    this._droppedPages.forEach((pageInfo, catIndex) => {
-      const cellSet = buildCellSet(pageInfo.pageId);
-      for (const idx of cellSet) addCell(idx, catIndex);
-    });
-
+    // ────────────────────────────────────────────────────────────────────
+    // Overlap bucket, first or last: one owner per cell
+    // ────────────────────────────────────────────────────────────────────
+    const membership = orderedMembership(membershipPages, pointCount);
+    const pageCounts = orderedPageCounts(
+      membership,
+      this._droppedPages.length,
+      strategy
+    );
     const uncoveredCount = requireCountDifference(
       pointCount,
-      assigned.size,
-      'Ordered-overlap preview'
+      membership.coveredCount,
+      strategy === OverlapStrategy.OVERLAP_LABEL ? 'Overlap preview' : 'Ordered-overlap preview'
     );
-    return { overlapCount: overlapping.size, uncoveredCount, pageCounts, intersectionRows: [] };
+    if (strategy === OverlapStrategy.OVERLAP_LABEL) {
+      return {
+        overlapCount: membership.overlapCount,
+        uncoveredCount,
+        pageCounts,
+        overlapBucketCount: membership.overlapCount,
+        intersectionRows: []
+      };
+    }
+    return { overlapCount: membership.overlapCount, uncoveredCount, pageCounts, intersectionRows: [] };
   }
 
   _updatePreview(refreshIntersectionInputs) {
@@ -1170,12 +1095,13 @@ export class CategoryBuilder {
     const strategy = this._getOverlapStrategy();
     if (
       strategy === OverlapStrategy.INTERSECTIONS
-      && this._droppedPages.length > Limits.MAX_INTERSECTION_PAGES
+      && this._droppedPages.length > MAX_INTERSECTION_PAGES
     ) {
-      const errorElement = this._document.createElement('div');
-      errorElement.className = 'analysis-error';
+      const errorElement = this._document.createElement('p');
+      errorElement.className = 'status-line';
+      errorElement.dataset.tone = 'danger';
       errorElement.textContent =
-        `Each intersection supports at most ${Limits.MAX_INTERSECTION_PAGES} pages.`;
+        `Each intersection supports at most ${MAX_INTERSECTION_PAGES} pages.`;
       preview.replaceChildren(errorElement);
       conflictSection.hidden = true;
       uncoveredSection.hidden = true;
@@ -1197,12 +1123,12 @@ export class CategoryBuilder {
 
     conflictSection.hidden = this._preview.overlapCount === 0;
     if (!conflictSection.hidden) {
-      conflictText.textContent = `${this._preview.overlapCount.toLocaleString()} cells appear in multiple pages`;
+      conflictText.textContent = `${formatCount(this._preview.overlapCount)} cells appear in multiple pages`;
     }
 
     uncoveredSection.hidden = this._preview.uncoveredCount === 0;
     if (!uncoveredSection.hidden) {
-      uncoveredCount.textContent = this._preview.uncoveredCount.toLocaleString();
+      uncoveredCount.textContent = formatCount(this._preview.uncoveredCount);
     }
 
     overlapLabelSection.hidden =
@@ -1270,7 +1196,7 @@ export class CategoryBuilder {
 
       const count = this._document.createElement('span');
       count.className = 'preview-count';
-      count.textContent = countValue.toLocaleString();
+      count.textContent = formatCount(countValue);
 
       item.appendChild(swatch);
       item.appendChild(label);
@@ -1350,7 +1276,7 @@ export class CategoryBuilder {
 
     const stats = this._document.createElement('div');
     stats.className = 'preview-stats';
-    stats.textContent = `Total: ${this._state.pointCount.toLocaleString()} cells | ${categoriesWrap.childElementCount} categories`;
+    stats.textContent = `Total: ${formatCount(this._state.pointCount)} cells · ${formatCount(categoriesWrap.childElementCount)} categories`;
 
     preview.replaceChildren(categoriesWrap, stats);
     this._updateConfirmState();
@@ -1406,7 +1332,6 @@ export class CategoryBuilder {
         typeof label !== 'string'
         || label.length === 0
         || label !== label.trim()
-        || label.length > Limits.MAX_CATEGORY_LABEL_LENGTH
       ) {
         return `Page ${pageIndex + 1} requires a valid non-empty trimmed label`;
       }
@@ -1438,7 +1363,6 @@ export class CategoryBuilder {
       typeof fieldName !== 'string'
       || fieldName.length === 0
       || fieldName !== fieldName.trim()
-      || fieldName.length > Limits.MAX_FIELD_KEY_LENGTH
       || fieldName.includes(':')
     ) {
       return 'Column name must be a valid non-empty trimmed field name';
@@ -1474,9 +1398,9 @@ export class CategoryBuilder {
     const strategy = this._getOverlapStrategy();
     if (
       strategy === OverlapStrategy.INTERSECTIONS
-      && this._droppedPages.length > Limits.MAX_INTERSECTION_PAGES
+      && this._droppedPages.length > MAX_INTERSECTION_PAGES
     ) {
-      return `Each intersection supports at most ${Limits.MAX_INTERSECTION_PAGES} pages`;
+      return `Each intersection supports at most ${MAX_INTERSECTION_PAGES} pages`;
     }
     const overlapLabel = this._els.overlapLabel.value;
     if (
@@ -1488,7 +1412,6 @@ export class CategoryBuilder {
     if (strategy === OverlapStrategy.OVERLAP_LABEL) {
       if (
         overlapLabel.length === 0
-        || overlapLabel.length > Limits.MAX_CATEGORY_LABEL_LENGTH
       ) {
         return 'Overlap strategy requires a valid non-empty label';
       }
@@ -1502,7 +1425,6 @@ export class CategoryBuilder {
           typeof label !== 'string'
           || label.length === 0
           || label !== label.trim()
-          || label.length > Limits.MAX_CATEGORY_LABEL_LENGTH
         ) {
           return `Intersection ${maskKey} requires a valid non-empty trimmed label`;
         }
@@ -1514,7 +1436,6 @@ export class CategoryBuilder {
     if (
       typeof uncoveredLabel !== 'string'
       || uncoveredLabel !== uncoveredLabel.trim()
-      || uncoveredLabel.length > Limits.MAX_CATEGORY_LABEL_LENGTH
     ) {
       return 'Uncovered label must be a valid trimmed string';
     }
@@ -1530,7 +1451,7 @@ export class CategoryBuilder {
     if (labels.length > MAX_CATEGORICAL_CATEGORIES) {
       return (
         'A field supports at most '
-        + `${MAX_CATEGORICAL_CATEGORIES.toLocaleString('en-US')} categories`
+        + `${formatCount(MAX_CATEGORICAL_CATEGORIES)} categories`
       );
     }
     return null;
@@ -1640,8 +1561,7 @@ export class CategoryBuilder {
 
     // Collapse panel
     this._isOpen = false;
-    this._els.toggle.setAttribute('aria-expanded', 'false');
-    this._els.item.classList.remove('open');
+    this._setExpanded(false);
   }
 
   destroy() {

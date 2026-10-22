@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
+import { isContextLostError } from '../assets/js/rendering/gl-errors.js';
 import {
   HighPerfRenderer,
 } from '../assets/js/rendering/high-perf-renderer.js';
@@ -12,37 +13,27 @@ import {
 function makeViewState() {
   return {
     lastFrustumMVP: new Float32Array(16),
-    cachedCulledCount: 7,
-    cachedVisibleIndices: new Uint32Array([0, 1]),
-    cachedLodVisibleIndices: new Uint32Array([0]),
-    cachedLodLevel: 2,
-    cachedLodDimension: 3,
-    cachedLodIsCulled: true,
-    cachedVisibleNodes: [{ id: 'accepted' }],
-    cachedVisibleSpatialOwner: { id: 'spatial-owner' },
-    cachedVisibleSpatialRoot: { id: 'spatial-root' },
-    cachedLodMappingGeneration: { id: 'mapping' },
-    visibleNodesScratch: [{ id: 'scratch' }],
-    visibleNodesSpare: [],
+    // The cull state's reusable scratch: leaf runs and draw ranges.
+    cull: {
+      tree: { id: 'spatial-owner' },
+      drawOrder: { id: 'draw-order' },
+      runs: new Uint32Array(256),
+      runCount: 3,
+      gaps: new Uint32Array(0),
+      stack: [],
+      band: 2,
+      starts: new Int32Array(256),
+      counts: new Int32Array(256),
+      rangeCount: 4,
+      elementCount: 7,
+    },
     lastDimensionLevel: 3,
     lastLodLevel: 2,
     prevLodLevel: 2,
-    lastVisibleCount: 7,
-    indexBuffer: Object.freeze({ id: 'view-ebo' }),
-    indexBufferSize: 7,
-    indexBufferByteLength: 64,
-    usePreCachedIndexBuffer: true,
-    preCachedIndexBuffer: Object.freeze({ id: 'lod-ebo' }),
-    preCachedGenerationToken: Object.freeze({}),
-    preCachedSpatialOwner: Object.freeze({}),
     frustumPlanes: Array.from(
       { length: 6 },
       () => new Float32Array(4),
     ),
-    visibleIndicesBuffer: new Uint32Array(32),
-    visibleIndicesCapacity: 32,
-    visibleLodIndicesBuffer: new Uint32Array(16),
-    visibleLodIndicesCapacity: 16,
     stats: {
       lastFrameTime: 4,
       fps: 250,
@@ -64,13 +55,8 @@ function makeToggleRenderer({
 } = {}) {
   const viewState = makeViewState();
   const unrelatedSpatial = Object.freeze({ id: 'unrelated-spatial' });
-  const unrelatedLod = Object.freeze([{ id: 'unrelated-lod' }]);
-  const unrelatedTextures = Object.freeze([{ id: 'unrelated-texture' }]);
-  const unrelatedOwner = Object.freeze({ id: 'unrelated-owner' });
+  const liveOrder = Object.freeze({ id: 'live-draw-order' });
   const spatialIndices = new Map([[1, unrelatedSpatial]]);
-  const lodBuffersByDimension = new Map([[1, unrelatedLod]]);
-  const lodIndexTextures = new Map([[1, unrelatedTextures]]);
-  const lodOwners = new Map([[1, unrelatedOwner]]);
   const perViewState = new Map([['live', viewState]]);
   const stats = {
     lastFrameTime: 4,
@@ -97,9 +83,7 @@ function makeToggleRenderer({
         : null,
       currentDimensionLevel: 3,
       spatialIndices,
-      lodBuffersByDimension,
-      _lodIndexTexturesByDimension: lodIndexTextures,
-      _lodResourceOwnersByDimension: lodOwners,
+      _liveOrder: liveOrder,
       snapshotBuffers: new Map(),
       _snapshotGeometryPools: new Map(),
       _liveGeometryGeneration: 1,
@@ -115,13 +99,8 @@ function makeToggleRenderer({
     renderer,
     viewState,
     spatialIndices,
-    lodBuffersByDimension,
-    lodIndexTextures,
-    lodOwners,
+    liveOrder,
     unrelatedSpatial,
-    unrelatedLod,
-    unrelatedTextures,
-    unrelatedOwner,
     perViewState,
     stats,
   };
@@ -153,200 +132,30 @@ for (const [method, flag] of [
   });
 }
 
-test('adaptive LOD preparation failure preserves every published semantic and ownership identity', () => {
-  const fixture = makeToggleRenderer();
-  const failure = new Error('injected LOD preparation failure');
-  fixture.renderer._prepareSpatialIndicesForFeature = needsLOD => {
-    assert.equal(needsLOD, true);
-    assert.equal(fixture.renderer.useAdaptiveLOD, false);
-    throw failure;
-  };
-
-  assert.throws(
-    () => fixture.renderer.setAdaptiveLOD(true),
-    error => error === failure,
-  );
-  assert.equal(fixture.renderer.useAdaptiveLOD, false);
-  assert.equal(fixture.renderer.forceLODLevel, 4);
-  assert.strictEqual(fixture.renderer.stats, fixture.stats);
-  assert.deepEqual(fixture.renderer.stats, {
-    lastFrameTime: 4,
-    fps: 250,
-    visiblePoints: 7,
-    lodLevel: 2,
-    gpuMemoryMB: 3,
-    drawCalls: 1,
-    frustumCulled: true,
-    cullPercent: 30,
-  });
-  assert.strictEqual(fixture.renderer._perViewState, fixture.perViewState);
-  assert.strictEqual(
-    fixture.renderer._perViewState.get('live'),
-    fixture.viewState,
-  );
-  assert.equal(fixture.viewState.statsPublished, true);
-  assert.strictEqual(fixture.renderer.spatialIndices, fixture.spatialIndices);
-  assert.strictEqual(
-    fixture.renderer.spatialIndices.get(1),
-    fixture.unrelatedSpatial,
-  );
-  assert.strictEqual(
-    fixture.renderer.lodBuffersByDimension,
-    fixture.lodBuffersByDimension,
-  );
-  assert.strictEqual(
-    fixture.renderer.lodBuffersByDimension.get(1),
-    fixture.unrelatedLod,
-  );
-  assert.strictEqual(
-    fixture.renderer._lodIndexTexturesByDimension,
-    fixture.lodIndexTextures,
-  );
-  assert.strictEqual(
-    fixture.renderer._lodIndexTexturesByDimension.get(1),
-    fixture.unrelatedTextures,
-  );
-  assert.strictEqual(
-    fixture.renderer._lodResourceOwnersByDimension,
-    fixture.lodOwners,
-  );
-  assert.strictEqual(
-    fixture.renderer._lodResourceOwnersByDimension.get(1),
-    fixture.unrelatedOwner,
-  );
+test('turning LOD or culling on builds nothing on the main thread', () => {
+  for (const method of ['setAdaptiveLOD', 'setFrustumCulling']) {
+    const fixture = makeToggleRenderer({ pointCount: 50_000, forceLODLevel: -1 });
+    fixture.renderer._invalidateViewStateRecord = () => {};
+    const build = fixture.renderer._getOrBuildSpatialIndexForDimension;
+    fixture.renderer._getOrBuildSpatialIndexForDimension = () => assert.fail(`${method} must not build a tree`);
+    fixture.renderer._requestSpatialIndex = () => assert.fail(`${method} must not even request one: the next frame does`);
+    fixture.renderer[method](true);
+    fixture.renderer._getOrBuildSpatialIndexForDimension = build;
+    assert.strictEqual(fixture.renderer.spatialIndices, fixture.spatialIndices);
+    assert.strictEqual(fixture.renderer.spatialIndices.get(1), fixture.unrelatedSpatial);
+    // The live store keeps the draw order it holds until a tree lands.
+    assert.strictEqual(fixture.renderer._liveOrder, fixture.liveOrder);
+  }
 });
 
-test('frustum preparation failure preserves flags, statistics, and reusable view owners', () => {
-  const fixture = makeToggleRenderer({ forceLODLevel: -1 });
-  const failure = new Error('injected frustum preparation failure');
-  fixture.renderer._prepareSpatialIndicesForFeature = needsLOD => {
-    assert.equal(needsLOD, false);
-    assert.equal(fixture.renderer.useFrustumCulling, false);
-    throw failure;
-  };
-  const indexBuffer = fixture.viewState.indexBuffer;
-  const visibleIndicesBuffer = fixture.viewState.visibleIndicesBuffer;
-
-  assert.throws(
-    () => fixture.renderer.setFrustumCulling(true),
-    error => error === failure,
-  );
-  assert.equal(fixture.renderer.useFrustumCulling, false);
-  assert.equal(fixture.renderer.forceLODLevel, -1);
-  assert.strictEqual(fixture.renderer.stats, fixture.stats);
-  assert.equal(fixture.renderer.stats.frustumCulled, true);
-  assert.equal(fixture.renderer.stats.cullPercent, 30);
-  assert.strictEqual(
-    fixture.renderer._perViewState.get('live'),
-    fixture.viewState,
-  );
-  assert.strictEqual(fixture.viewState.indexBuffer, indexBuffer);
-  assert.strictEqual(
-    fixture.viewState.visibleIndicesBuffer,
-    visibleIndicesBuffer,
-  );
-  assert.equal(fixture.viewState.statsPublished, true);
-});
-
-test('a later live dimension failure cannot publish an earlier staged LOD generation', () => {
-  const fixture = makeToggleRenderer();
-  const positions = fixture.renderer._positions;
-  const live3d = {
-    positions,
-    dimensionLevel: 3,
-    pointCount: 1,
-    lodLevels: [{ isFullDetail: true }],
-  };
-  const live2d = {
-    positions,
-    dimensionLevel: 2,
-    pointCount: 1,
-    lodLevels: [{ isFullDetail: true }],
-  };
-  const acceptedSpatialIndices = new Map([
-    [3, live3d],
-    [2, live2d],
-  ]);
-  const acceptedOwners = fixture.renderer._lodResourceOwnersByDimension;
-  const acceptedBuffers = fixture.renderer.lodBuffersByDimension;
-  const acceptedTextures =
-    fixture.renderer._lodIndexTexturesByDimension;
-  const stagedOwner = { id: 'staged-3d-owner' };
-  const stagedBuffers = [{ id: 'staged-3d-buffers' }];
-  const stagedTextures = [{ id: 'staged-3d-textures' }];
-  const failure = new Error('injected second-dimension failure');
-  const queuedRetirements = [];
-
-  fixture.renderer.spatialIndices = acceptedSpatialIndices;
-  fixture.renderer.snapshotBuffers = new Map([
-    ['live-backed-2d', {
-      dimensionLevel: 2,
-    }],
-  ]);
-  fixture.renderer._snapshotUsesLiveGeometry = () => true;
-  fixture.renderer._ensureLodResourcesForDimension = (
-    dimensionLevel,
-    spatialIndex,
-    deferPublication,
-  ) => {
-    assert.equal(deferPublication, true);
-    if (dimensionLevel === 2) throw failure;
-    assert.strictEqual(spatialIndex, live3d);
-    return {
-      dimensionLevel,
-      spatialIndex,
-      candidateOwner: stagedOwner,
-      candidateLodBuffers: stagedBuffers,
-      candidateIndexTextures: stagedTextures,
-      previousOwner: null,
-      previousLodBuffers: null,
-      previousIndexTextures: null,
-    };
-  };
-  fixture.renderer._queueDataRetirement = retirement => {
-    queuedRetirements.push(retirement);
-  };
-  fixture.renderer._drainDataRetirements = () => [];
-
-  assert.throws(
-    () => fixture.renderer._prepareSpatialIndicesForFeature(true),
-    error => error === failure,
-  );
-  assert.strictEqual(
-    fixture.renderer.spatialIndices,
-    acceptedSpatialIndices,
-  );
-  assert.strictEqual(
-    fixture.renderer._lodResourceOwnersByDimension,
-    acceptedOwners,
-  );
-  assert.strictEqual(
-    fixture.renderer.lodBuffersByDimension,
-    acceptedBuffers,
-  );
-  assert.strictEqual(
-    fixture.renderer._lodIndexTexturesByDimension,
-    acceptedTextures,
-  );
-  assert.equal(queuedRetirements.length, 1);
-  assert.strictEqual(
-    queuedRetirements[0].lodResourceOwnersByDimension.get(3),
-    stagedOwner,
-  );
-});
-
-test('feature toggles are idempotent before preparation, retirement, or cache invalidation', () => {
+test('feature toggles are idempotent before retirement or cache invalidation', () => {
   const adaptive = makeToggleRenderer({ adaptiveLOD: true });
   const frustum = makeToggleRenderer({ frustumCulling: false });
   for (const [fixture, method, value] of [
     [adaptive, 'setAdaptiveLOD', true],
     [frustum, 'setFrustumCulling', false],
   ]) {
-    let preparations = 0;
     let invalidations = 0;
-    fixture.renderer._prepareSpatialIndicesForFeature = () => {
-      preparations += 1;
-    };
     fixture.renderer._invalidateViewStateRecord = () => {
       invalidations += 1;
     };
@@ -354,7 +163,6 @@ test('feature toggles are idempotent before preparation, retirement, or cache in
       throw new Error('idempotent toggle must not retire view owners');
     };
     fixture.renderer[method](value);
-    assert.equal(preparations, 0);
     assert.equal(invalidations, 0);
     assert.strictEqual(
       fixture.renderer._perViewState.get('live'),
@@ -363,12 +171,11 @@ test('feature toggles are idempotent before preparation, retirement, or cache in
   }
 });
 
-test('successful toggles invalidate semantics in place without retiring EBO or scratch owners', () => {
+test('successful toggles invalidate semantics in place, keeping the cull scratch', () => {
   const fixture = makeToggleRenderer({ pointCount: 0 });
-  const indexBuffer = fixture.viewState.indexBuffer;
-  const visibleIndicesBuffer = fixture.viewState.visibleIndicesBuffer;
-  const visibleLodIndicesBuffer =
-    fixture.viewState.visibleLodIndicesBuffer;
+  const cull = fixture.viewState.cull;
+  const runs = cull.runs;
+  const starts = cull.starts;
   const frustumPlanes = fixture.viewState.frustumPlanes;
   fixture.renderer.clearAllViewState = () => {
     throw new Error('feature toggles must not retire view state');
@@ -380,16 +187,16 @@ test('successful toggles invalidate semantics in place without retiring EBO or s
     fixture.renderer._perViewState.get('live'),
     fixture.viewState,
   );
-  assert.strictEqual(fixture.viewState.indexBuffer, indexBuffer);
-  assert.strictEqual(
-    fixture.viewState.visibleIndicesBuffer,
-    visibleIndicesBuffer,
-  );
-  assert.strictEqual(
-    fixture.viewState.visibleLodIndicesBuffer,
-    visibleLodIndicesBuffer,
-  );
+  // Keys dropped, scratch kept: the next frame re-culls into the same arrays.
+  assert.strictEqual(fixture.viewState.cull, cull);
+  assert.strictEqual(cull.runs, runs);
+  assert.strictEqual(cull.starts, starts);
+  assert.equal(cull.tree, null);
+  assert.equal(cull.drawOrder, null);
+  assert.equal(cull.band, -1);
+  assert.equal(cull.rangeCount, 0);
   assert.strictEqual(fixture.viewState.frustumPlanes, frustumPlanes);
+  assert.equal(fixture.viewState.lastFrustumMVP, null);
   assert.equal(fixture.viewState.statsPublished, false);
 
   fixture.renderer.setFrustumCulling(true);
@@ -398,7 +205,7 @@ test('successful toggles invalidate semantics in place without retiring EBO or s
     fixture.renderer._perViewState.get('live'),
     fixture.viewState,
   );
-  assert.strictEqual(fixture.viewState.indexBuffer, indexBuffer);
+  assert.strictEqual(fixture.viewState.cull, cull);
   assert.equal(fixture.renderer.stats.frustumCulled, false);
   assert.equal(fixture.renderer.stats.cullPercent, 0);
 });
@@ -678,11 +485,22 @@ test('bottleneck default render parameters satisfy the exact renderer contract',
     Object.create(BottleneckAnalyzer.prototype),
     {
       gl: { canvas: { height: 480, width: 640 } },
-      renderer: { activeQuality: 'light' },
+      renderer: {
+        activeQuality: 'light',
+        getViewPositionDimension: viewId => {
+          assert.equal(viewId, 'live');
+          return 2;
+        },
+      },
     },
   );
   const params = analyzer._getDefaultRenderParams();
   assert.equal(params.quality, 'light');
+  assert.equal(
+    params.dimensionLevel,
+    2,
+    'the analyzer renders the live data in its own dimension',
+  );
   assert.equal(params.viewId, 'benchmark');
   assert.equal(params.useAlphaTexture, false);
   assert.equal(params.autoFog, true);
@@ -739,7 +557,7 @@ test('renderer control source keeps UI controls coherent when synchronous prepar
   );
 });
 
-test('render paths do not deep-verify one live LOD generation twice per frame', async () => {
+test('live and snapshot render paths reach the GPU through the one draw seam', async () => {
   const rendererSource = await readFile(
     new URL(
       '../assets/js/rendering/high-perf-renderer.js',
@@ -747,36 +565,20 @@ test('render paths do not deep-verify one live LOD generation twice per frame', 
     ),
     'utf8',
   );
-  const renderStart = rendererSource.indexOf('  render(params');
-  const renderEnd = rendererSource.indexOf(
-    '  _renderFullDetail(',
-    renderStart,
-  );
-  assert.notEqual(renderStart, -1);
-  assert.notEqual(renderEnd, -1);
-  const render = rendererSource.slice(renderStart, renderEnd);
-  assert.doesNotMatch(
-    render,
-    /this\._ensureLodResourcesForDimension\(/,
-  );
-
-  const snapshotStart = rendererSource.indexOf(
-    '  renderWithSnapshot(id, params',
-  );
-  const snapshotEnd = rendererSource.indexOf(
-    '  _renderSnapshotWithFrustumCulling(',
-    snapshotStart,
-  );
-  assert.notEqual(snapshotStart, -1);
-  assert.notEqual(snapshotEnd, -1);
-  const snapshotRender = rendererSource.slice(
-    snapshotStart,
-    snapshotEnd,
-  );
-  assert.doesNotMatch(
-    snapshotRender,
-    /this\._ensureLodResourcesForDimension\(/,
-  );
+  for (const [start, end] of [
+    ['  render(params', '  _validateSpatialOwnerOnce('],
+    ['  renderWithSnapshot(id, params', '\n  }\n'],
+  ]) {
+    const from = rendererSource.indexOf(start);
+    assert.notEqual(from, -1, start);
+    const to = rendererSource.indexOf(end, from + start.length);
+    assert.notEqual(to, -1, end);
+    const body = rendererSource.slice(from, to);
+    // One `_drawPoints` call issues every draw; the pass itself never draws
+    // or uploads.
+    assert.equal(body.match(/this\._drawPoints\(/g)?.length, 1, start);
+    assert.doesNotMatch(body, /\.draw(Arrays|Elements)\(|bufferData\(|bufferSubData\(/, start);
+  }
 });
 
 test('context loss terminally detaches all ownership without touching WebGL and makes dispose silent', () => {
@@ -802,10 +604,8 @@ test('context loss terminally detaches all ownership without touching WebGL and 
   renderer.uniformLocations = new Map([['full', {}]]);
   renderer.vao = Object.freeze({ id: 'vao' });
   renderer.buffers = {
-    interleaved: Object.freeze({ id: 'point-buffer' }),
-    positions: null,
-    colors: null,
-    alphas: null,
+    positions: Object.freeze({ id: 'point-position-buffer' }),
+    colors: Object.freeze({ id: 'point-color-buffer' }),
   };
   renderer._alphaTexture = Object.freeze({ id: 'alpha-texture' });
   renderer._dummyLodIndexTexture =
@@ -833,13 +633,13 @@ test('context loss terminally detaches all ownership without touching WebGL and 
   assert.equal(renderer.gl, null);
   assert.equal(renderer.activeProgram, null);
   assert.equal(renderer.vao, null);
-  assert.equal(renderer.buffers.interleaved, null);
+  assert.equal(renderer.buffers.positions, null);
+  assert.equal(renderer.buffers.colors, null);
   assert.equal(renderer._alphaTexture, null);
   assert.equal(renderer._dummyLodIndexTexture, null);
   assert.equal(renderer.spatialIndices.size, 0);
-  assert.equal(renderer.lodBuffersByDimension.size, 0);
-  assert.equal(renderer._lodResourceOwnersByDimension.size, 0);
-  assert.equal(renderer._lodIndexTexturesByDimension.size, 0);
+  assert.equal(renderer._liveOrder, null);
+  assert.equal(renderer._liveColorOrder, null);
   assert.equal(renderer.snapshotBuffers.size, 0);
   assert.equal(renderer._snapshotGeometryPools.size, 0);
   assert.equal(renderer._perViewState.size, 0);
@@ -852,13 +652,12 @@ test('context loss terminally detaches all ownership without touching WebGL and 
   assert.throws(
     () => renderer.render({}),
     error => (
-      error?.name === 'HighPerfRendererContextLostError' &&
-      /context was lost/i.test(error.message)
+      isContextLostError(error) && /context was lost/i.test(error.message)
     ),
   );
   assert.throws(
     () => renderer.setAdaptiveLOD(true),
-    error => error?.name === 'HighPerfRendererContextLostError',
+    error => isContextLostError(error),
   );
 
   renderer.dispose();

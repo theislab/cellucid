@@ -193,11 +193,34 @@ npm run test:browser        # Playwright suites in tests/browser/
 npm run test:worker-bundle  # dry-run build of the community-annotation Worker
 ```
 
+After changing any shipped file (`index.html`, `assets/`, root assets), run
+`node scripts/generate-web-asset-inventory.mjs`. It rewrites
+`cellucid-web-assets.json` and stamps the build id in `index.html` as
+`<date>.<digest>`, a digest of every shipped file, so the footer, the situation
+report and the Python web cache name the exact build. It also writes
+`sitemap.xml`, whose `<lastmod>` is the date half of that build id. `npm test`
+fails until it has been run.
+
+What search engines and link previews read — the `<head>` metadata, the JSON-LD
+block and its hash in the Content-Security-Policy, the visually hidden "About
+Cellucid" text, `robots.txt`, `sitemap.xml`, `404.html`, `llms.txt` and
+`site.webmanifest` — is pinned by `tests/seo-head-contract.test.mjs`.
+
 `npm test` runs `scripts/run-web-tests.mjs`, which discovers every
 `tests/*.test.mjs` file and runs them under the Node.js test runner — so a new
 contract file is picked up by adding it, with nothing to register. These are
-the same commands `.github/workflows/test.yml` runs, across Node 20/22/24/26
-and chromium/firefox/webkit, so a green local run is the same check CI applies.
+the same commands `.github/workflows/test.yml` runs, so a green local run is the
+same check CI applies:
+
+- `npm test` runs on Ubuntu, macOS, and Windows across Node 20/22/24/26, with
+  `cellucid-demo-custom-datasets` and `cellucid-datasets` checked out beside the
+  repository so the cross-repository fixture and session-preset contracts run.
+- On every push and pull request the browser suite runs chromium, firefox, and
+  webkit on Ubuntu, plus webkit on macOS. Every engine on every operating
+  system runs nightly and on manual dispatch (**Actions → Web contracts → Run
+  workflow**).
+- A failed browser job uploads its Playwright screenshots and error context as
+  a workflow artifact.
 
 ### Running two browser suites at once
 

@@ -16,24 +16,6 @@ function throwTransactionFailure(failures, message) {
   throw new AggregateError(failures, message);
 }
 
-export function createRequiredTexture(gl, role) {
-  if (!gl || typeof gl.createTexture !== 'function') {
-    throw new TypeError(
-      'Required WebGL texture allocation needs a WebGL2 context.'
-    );
-  }
-  if (typeof role !== 'string' || role.length === 0) {
-    throw new TypeError('Required WebGL allocation needs a non-empty texture role.');
-  }
-  const texture = gl.createTexture();
-  if (texture === null) {
-    throw new Error(
-      `WebGL2 could not allocate the required ${role} texture.`
-    );
-  }
-  return texture;
-}
-
 export function createShader(gl, type, source) {
   let shader = null;
   try {
@@ -197,6 +179,83 @@ export function createTransformFeedbackProgram(
 }
 
 /**
+ * Create several programs in one batch: each distinct shader source is
+ * compiled once and shared, every program is linked before any status is
+ * read, and status is read once per program at the end. A driver overlaps
+ * the compiles and links of a batch; reading status after each step makes it
+ * finish them one after another. On any failure every program and shader of
+ * the batch is deleted and the error names the program and its diagnostic.
+ *
+ * @param {WebGL2RenderingContext} gl
+ * @param {Array<{label: string, vs: string, fs: string, varyings?: string[], bufferMode?: number}>} specs
+ * @returns {WebGLProgram[]} One program per spec, in order.
+ */
+export function createProgramBatch(gl, specs) {
+  const shaders = new Map();
+  const programs = [];
+  const shaderOf = (type, source) => {
+    const key = `${type}:${source}`;
+    let shader = shaders.get(key);
+    if (shader !== undefined) return shader;
+    shader = gl.createShader(type);
+    if (!shader) throw new Error('Required WebGL shader allocation failed.');
+    shaders.set(key, shader);
+    gl.shaderSource(shader, source);
+    gl.compileShader(shader);
+    return shader;
+  };
+  const diagnose = (spec, program) => {
+    for (const [type, source, kind] of [[gl.VERTEX_SHADER, spec.vs, 'vertex'], [gl.FRAGMENT_SHADER, spec.fs, 'fragment']]) {
+      const shader = shaders.get(`${type}:${source}`);
+      if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+        return `Could not compile the ${spec.label} ${kind} shader:\n${gl.getShaderInfoLog(shader)}`;
+      }
+    }
+    return `Could not link the ${spec.label} program:\n${gl.getProgramInfoLog(program)}`;
+  };
+  try {
+    for (const spec of specs) {
+      const vs = shaderOf(gl.VERTEX_SHADER, spec.vs);
+      const fs = shaderOf(gl.FRAGMENT_SHADER, spec.fs);
+      const program = gl.createProgram();
+      if (!program) throw new Error('Could not allocate the required WebGL program.');
+      programs.push(program);
+      gl.attachShader(program, vs);
+      gl.attachShader(program, fs);
+      if (spec.varyings) {
+        gl.transformFeedbackVaryings(program, spec.varyings, spec.bufferMode ?? gl.INTERLEAVED_ATTRIBS);
+      }
+      gl.linkProgram(program);
+    }
+    specs.forEach((spec, index) => {
+      if (!gl.getProgramParameter(programs[index], gl.LINK_STATUS)) {
+        throw new Error(diagnose(spec, programs[index]));
+      }
+    });
+  } catch (error) {
+    const failures = [asError(error, 'WebGL program batch failed with a non-Error value.')];
+    for (const program of programs) {
+      attemptCleanup(failures, () => gl.deleteProgram(program), 'WebGL program rollback failed with a non-Error value.');
+    }
+    for (const shader of shaders.values()) {
+      attemptCleanup(failures, () => gl.deleteShader(shader), 'WebGL shader rollback failed with a non-Error value.');
+    }
+    throwTransactionFailure(failures, 'WebGL program batch creation and rollback failed.');
+  }
+  const cleanupFailures = [];
+  for (const shader of shaders.values()) {
+    attemptCleanup(cleanupFailures, () => gl.deleteShader(shader), 'WebGL shader cleanup failed with a non-Error value.');
+  }
+  if (cleanupFailures.length > 0) {
+    for (const program of programs) {
+      attemptCleanup(cleanupFailures, () => gl.deleteProgram(program), 'WebGL program rollback failed with a non-Error value.');
+    }
+    throwTransactionFailure(cleanupFailures, 'WebGL programs linked but shader cleanup failed.');
+  }
+  return programs;
+}
+
+/**
  * Publish the straight-alpha blend contract shared by Cellucid's translucent
  * point, grid, highlight, connectivity, and centroid passes.
  *
@@ -221,16 +280,82 @@ export function configureStraightAlphaBlending(gl) {
 }
 
 /**
+ * Most vertices one point draw submits.
+ *
+ * Firefox refuses any draw over 30,000,000 vertex ids
+ * (`webgl.max-vert-ids-per-draw`) with `INVALID_OPERATION` and draws nothing;
+ * 30,000,000 is accepted, 30,000,001 is not (probed on all three engines,
+ * scale plan section 3.1). Chromium and WebKit drew 200M points in one call.
+ * Every draw whose vertex count grows with the data therefore goes through
+ * `drawPointsInSegments`, on every engine, so one code path draws every size.
+ *
+ * Splitting is invisible: draws execute in submission order, so consecutive
+ * ranges rasterize the same points in the same order (blending, depth and
+ * transform-feedback output are those of the single draw), and `gl_VertexID`
+ * keeps counting from the range's `first`. 2^24 keeps every segment far below
+ * the Firefox limit and costs at most 6 extra calls at 100M points.
+ */
+export const MAX_VERTICES_PER_DRAW = 16_777_216;
+
+/**
+ * Draw `count` points from `first` as consecutive `drawArrays(POINTS)` calls
+ * of at most `MAX_VERTICES_PER_DRAW` vertices.
+ *
+ * @param {WebGL2RenderingContext} gl
+ * @param {number} first
+ * @param {number} count
+ * @returns {number} The number of draw calls issued.
+ */
+export function drawPointsInSegments(gl, first, count) {
+  let calls = 0;
+  for (let offset = 0; offset < count; offset += MAX_VERTICES_PER_DRAW) {
+    gl.drawArrays(gl.POINTS, first + offset, Math.min(MAX_VERTICES_PER_DRAW, count - offset));
+    calls++;
+  }
+  return calls;
+}
+
+// Whether the browser can observe the device-pixel box, which also reports a
+// move that changes the snapped size without changing the CSS size.
+const REPORTS_DEVICE_PIXEL_BOX = typeof ResizeObserverEntry === 'function'
+  && 'devicePixelContentBoxSize' in ResizeObserverEntry.prototype;
+
+/**
+ * The canvas's size in the device pixels the browser composites it onto.
+ *
+ * The compositor snaps each edge of the canvas to a device pixel, so the
+ * picture covers `round(right · dpr) - round(left · dpr)` pixels, not
+ * `floor(width · dpr)`. A drawing buffer of any other size is rescaled to fit
+ * on every frame, and a fractional layout width (a canvas beside a sidebar is
+ * often 1009.5 CSS px wide) is enough to resample every one-pixel line and dot
+ * of the scene. The size comes from the snapped edges themselves (the canvas
+ * has no border or padding, so its border box is its content box): the
+ * ResizeObserver's own device-pixel box is not used, because under emulated
+ * device scales it reports unscaled pixels in Chromium and Firefox. One layout
+ * read per resize, never per frame.
+ */
+function snappedDevicePixelSize(canvas, dpr) {
+  const rect = canvas.getBoundingClientRect();
+  return {
+    width: Math.max(0, Math.round(rect.right * dpr) - Math.round(rect.left * dpr)),
+    height: Math.max(0, Math.round(rect.bottom * dpr) - Math.round(rect.top * dpr)),
+  };
+}
+
+/**
  * Creates a ResizeObserver-based canvas size tracker to avoid per-frame layout reads.
  * Also monitors DPR changes (e.g., moving window between monitors with different scales).
  * Returns an object with a getSize() method that returns cached dimensions.
+ * `onChange` (optional) runs after the cached size changes, so a frame loop
+ * that stops while nothing changes can be asked for a frame at the new size.
  */
-export function createCanvasResizeObserver(canvas) {
+export function createCanvasResizeObserver(canvas, onChange = null) {
   let currentDpr = window.devicePixelRatio || 1;
   let cachedCssWidth = canvas.clientWidth;
   let cachedCssHeight = canvas.clientHeight;
-  let cachedWidth = Math.floor(cachedCssWidth * currentDpr);
-  let cachedHeight = Math.floor(cachedCssHeight * currentDpr);
+  const initialSize = snappedDevicePixelSize(canvas, currentDpr);
+  let cachedWidth = initialSize.width;
+  let cachedHeight = initialSize.height;
   const cachedSizeView = Object.freeze({
     get cssHeight() {
       return cachedCssHeight;
@@ -253,8 +378,10 @@ export function createCanvasResizeObserver(canvas) {
   // Function to recalculate dimensions with current DPR
   const updateDimensions = () => {
     currentDpr = window.devicePixelRatio || 1;
-    cachedWidth = Math.floor(cachedCssWidth * currentDpr);
-    cachedHeight = Math.floor(cachedCssHeight * currentDpr);
+    const size = snappedDevicePixelSize(canvas, currentDpr);
+    cachedWidth = size.width;
+    cachedHeight = size.height;
+    onChange?.();
   };
 
   const handleResize = entries => {
@@ -263,8 +390,10 @@ export function createCanvasResizeObserver(canvas) {
     currentDpr = window.devicePixelRatio || 1;
     cachedCssWidth = entry.contentRect.width;
     cachedCssHeight = entry.contentRect.height;
-    cachedWidth = Math.floor(cachedCssWidth * currentDpr);
-    cachedHeight = Math.floor(cachedCssHeight * currentDpr);
+    const size = snappedDevicePixelSize(canvas, currentDpr);
+    cachedWidth = size.width;
+    cachedHeight = size.height;
+    onChange?.();
   };
 
   const retireDprRegistration = registration => {
@@ -359,7 +488,10 @@ export function createCanvasResizeObserver(canvas) {
 
   try {
     observer = new ResizeObserver(handleResize);
-    observer.observe(canvas);
+    observer.observe(
+      canvas,
+      REPORTS_DEVICE_PIXEL_BOX ? { box: 'device-pixel-content-box' } : undefined
+    );
     armDprMonitor();
   } catch (error) {
     const cleanupFailures = [];
@@ -396,49 +528,72 @@ export function createCanvasResizeObserver(canvas) {
   };
 }
 
-export function normalizePositions(positions) {
+/**
+ * Centre and scale positions in place so the largest axis range spans [-1, 1].
+ *
+ * `dimension` is the number of components each cell holds (see
+ * `position-layout.js`). An axis the embedding does not have is exactly zero,
+ * so it contributes a zero range and a zero centre: normalizing a 2-D array
+ * gives bit-for-bit the x and y a zero-padded XYZ copy would have received.
+ *
+ * @param {Float32Array} positions
+ * @param {1|2|3} [dimension=3]
+ * @returns {{ center: [number, number, number], scale: number }}
+ */
+export function normalizePositions(positions, dimension = 3) {
+  if (dimension !== 1 && dimension !== 2 && dimension !== 3) {
+    throw new RangeError('normalizePositions dimension must be exactly 1, 2, or 3.');
+  }
   if (!positions || positions.length === 0) {
     return {
       center: [0, 0, 0],
       scale: 1
     };
   }
-  const n = positions.length / 3;
-  let minX = Infinity, minY = Infinity, minZ = Infinity;
-  let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
-
-  for (let i = 0; i < n; i++) {
-    const x = positions[3 * i];
-    const y = positions[3 * i + 1];
-    const z = positions[3 * i + 2];
-    if (x < minX) minX = x;
-    if (y < minY) minY = y;
-    if (z < minZ) minZ = z;
-    if (x > maxX) maxX = x;
-    if (y > maxY) maxY = y;
-    if (z > maxZ) maxZ = z;
+  if (positions.length % dimension !== 0) {
+    throw new RangeError(
+      `normalizePositions received ${positions.length} values, which is not a whole number of ${dimension}-component points.`
+    );
+  }
+  const min = [Infinity, Infinity, Infinity];
+  const max = [-Infinity, -Infinity, -Infinity];
+  for (let axis = 0; axis < dimension; axis++) {
+    let lo = Infinity;
+    let hi = -Infinity;
+    for (let i = axis; i < positions.length; i += dimension) {
+      const v = positions[i];
+      if (v < lo) lo = v;
+      if (v > hi) hi = v;
+    }
+    min[axis] = lo;
+    max[axis] = hi;
+  }
+  for (let axis = dimension; axis < 3; axis++) {
+    min[axis] = 0;
+    max[axis] = 0;
   }
 
-  const centerX = 0.5 * (minX + maxX);
-  const centerY = 0.5 * (minY + maxY);
-  const centerZ = 0.5 * (minZ + maxZ);
+  const centerX = 0.5 * (min[0] + max[0]);
+  const centerY = 0.5 * (min[1] + max[1]);
+  const centerZ = 0.5 * (min[2] + max[2]);
+  const center = [centerX, centerY, centerZ];
 
-  const rangeX = maxX - minX;
-  const rangeY = maxY - minY;
-  const rangeZ = maxZ - minZ;
+  const rangeX = max[0] - min[0];
+  const rangeY = max[1] - min[1];
+  const rangeZ = max[2] - min[2];
   let maxRange = Math.max(rangeX, rangeY, rangeZ);
   if (maxRange === 0) maxRange = 1.0;
   const scale = 2.0 / maxRange;
 
-  for (let i = 0; i < n; i++) {
-    const idx = 3 * i;
-    positions[idx] = (positions[idx] - centerX) * scale;
-    positions[idx + 1] = (positions[idx + 1] - centerY) * scale;
-    positions[idx + 2] = (positions[idx + 2] - centerZ) * scale;
+  for (let axis = 0; axis < dimension; axis++) {
+    const c = center[axis];
+    for (let i = axis; i < positions.length; i += dimension) {
+      positions[i] = (positions[i] - c) * scale;
+    }
   }
 
   return {
-    center: [centerX, centerY, centerZ],
+    center,
     scale
   };
 }

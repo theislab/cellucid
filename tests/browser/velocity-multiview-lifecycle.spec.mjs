@@ -1,6 +1,7 @@
 import { expect, test } from './helpers/test.mjs';
 import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
+import { openCollapsedPanels } from './helpers/panels.mjs';
 
 const CURRENT_UI_DATASET =
   '/tests/browser/fixtures/exports/current-ui-prepared/';
@@ -33,6 +34,7 @@ async function installVelocityGlAudit(page) {
     let currentScissor = [0, 0, 0, 0];
     let scissorEnabled = false;
     let records = [];
+    const deletedVertexArrayIds = new Set();
 
     const idFor = value => {
       if (value === null) return null;
@@ -61,6 +63,12 @@ async function installVelocityGlAudit(page) {
     });
     wrap('bindVertexArray', original => function (value) {
       currentVertexArray = value;
+      return Reflect.apply(original, this, [value]);
+    });
+    wrap('deleteVertexArray', original => function (value) {
+      if (value !== null && objectIds.has(value)) {
+        deletedVertexArrayIds.add(objectIds.get(value));
+      }
       return Reflect.apply(original, this, [value]);
     });
     wrap('bindBufferBase', original => function (target, index, value) {
@@ -122,6 +130,9 @@ async function installVelocityGlAudit(page) {
         reset() {
           records = [];
         },
+        deletedVertexArrayIds() {
+          return [...deletedVertexArrayIds];
+        },
         snapshot() {
           return records.map(record => ({
             ...record,
@@ -145,11 +156,8 @@ async function installVelocityFixture(page) {
         fields: {
           velocity_umap: {
             label: 'velocity_umap',
-            basis: 'umap',
-            available_dimensions: [2],
-            default_dimension: 2,
             files: {
-              '2d': 'vectors/0_2d.bin',
+              X_umap_2d: 'vectors/0_0.bin',
             },
           },
         },
@@ -158,7 +166,7 @@ async function installVelocityFixture(page) {
     },
   );
   await page.route(
-    `**${CURRENT_UI_DATASET}vectors/0_2d.bin`,
+    `**${CURRENT_UI_DATASET}vectors/0_0.bin`,
     route => route.fulfill({
       status: 200,
       contentType: 'application/octet-stream',
@@ -231,6 +239,7 @@ test(
       { waitUntil: 'domcontentloaded' },
     );
     await dismissWelcome(page);
+    await openCollapsedPanels(page);
     await expect(page.locator('#dataset-name')).toHaveText(
       'Current UI prepared fixture',
     );
@@ -272,15 +281,28 @@ test(
 
     const legend = page.locator('#legend');
     await legend.getByRole('button', {
-      name: 'Hide All',
+      name: 'Hide all',
       exact: true,
     }).click();
     await expect(page.locator('#filter-count')).toHaveText(
-      'Showing 0 of 120 points',
+      'Showing 0 of 120 cells',
     );
-    // Existing generations rebuild silently; wait past the idle-callback
-    // timeout so this proves the committed empty table, not only its fence.
-    await page.waitForTimeout(750);
+    // Existing generations rebuild silently, so wait for the committed empty
+    // table rather than only its fence: the overlay retires a pane's particle
+    // generation only once that table has been published, so the deletion of
+    // every particle vertex array drawn above is the commit itself, however
+    // late a loaded runner runs the idle-callback build. Accumulate frames so
+    // the rebuild is scheduled and consumed.
+    const singleParticleVertexArrays = [...new Set(singleParticles.map(
+      record => record.vertexArrayId,
+    ))];
+    await expect.poll(async () => {
+      await advanceFrames(page, 1);
+      const deleted = await page.evaluate(
+        () => window.__cellucidVelocityAudit.deletedVertexArrayIds(),
+      );
+      return singleParticleVertexArrays.filter(id => !deleted.includes(id));
+    }).toEqual([]);
     await resetAudit(page);
     await advanceFrames(page, 2);
     const hiddenRecords = await readAudit(page);
@@ -292,11 +314,11 @@ test(
     ).toEqual([]);
 
     await legend.getByRole('button', {
-      name: 'Show All',
+      name: 'Show all',
       exact: true,
     }).click();
     await expect(page.locator('#filter-count')).toHaveText(
-      'Showing all 120 points',
+      'Showing all 120 cells',
     );
     // Accumulate real frames until the rebuilt generation renders. Resetting
     // inside the poll discarded valid evidence and multiplied GPU work on a
@@ -421,6 +443,7 @@ test(
       { waitUntil: 'domcontentloaded' },
     );
     await dismissWelcome(page);
+    await openCollapsedPanels(page);
     await expect(page.locator('#dataset-name')).toHaveText(
       'Current UI prepared fixture',
     );
@@ -509,6 +532,7 @@ test(
       { waitUntil: 'domcontentloaded' },
     );
     await dismissWelcome(page);
+    await openCollapsedPanels(page);
     await expect(page.locator('#dataset-name')).toHaveText(
       'Current UI prepared fixture',
     );

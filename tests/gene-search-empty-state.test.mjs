@@ -142,6 +142,10 @@ class FakeElement extends FakeNode {
     return this.attributes.has(name) ? this.attributes.get(name) : null;
   }
 
+  removeAttribute(name) {
+    this.attributes.delete(name);
+  }
+
   addEventListener(type, listener) {
     const existing = this.listeners.get(type) ?? [];
     existing.push(listener);
@@ -217,7 +221,7 @@ function userDefinedGene(key) {
   };
 }
 
-function mountGeneSelector(varFields) {
+function mountGeneSelector(varFields, { onLoad = null } = {}) {
   const ownerDocument = createFakeDocument();
   const dom = {
     geneContainer: ownerDocument.createElement('div'),
@@ -238,8 +242,11 @@ function mountGeneSelector(varFields) {
     duplicateField() {
       throw new Error('not exercised');
     },
-    ensureVarFieldLoaded() {
-      throw new Error('not exercised');
+    ensureVarFieldLoaded(index, options) {
+      if (onLoad === null) throw new Error('not exercised');
+      onLoad(index, options);
+      // Held pending: the test asserts which gene was chosen, not the load.
+      return new Promise(() => {});
     },
     getDatasetGeneration: () => 1,
     getVarFields: () => varFields,
@@ -330,7 +337,7 @@ test('a gene search with no match explains the dataset gene panel', () => {
   assert.equal(link.tagName, 'A');
   assert.equal(
     link.href,
-    'https://cellucid.readthedocs.io/en/latest/user_guide/web_app/'
+    'https://docs.cellucid.com/en/latest/user_guide/web_app/'
       + 'd_fields_coloring_legends/05_troubleshooting_fields_legends.html'
       + '#symptom-gene-search-returns-nothing-enter-selects-the-wrong-gene'
   );
@@ -430,4 +437,96 @@ test('the empty state is announced through one persistent status region', () => 
 
   api.destroy();
   assert.equal(statusRegion(dom), null, 'destroy must release the region');
+});
+
+test('gene results are a keyboard-navigable listbox whose Enter picks the active row', async () => {
+  const loaded = [];
+  const { dom } = mountGeneSelector(
+    exportedGenes('CD3E', 'CD4', 'CD8A'),
+    { onLoad: index => loaded.push(index) }
+  );
+  const keydown = key => {
+    let prevented = false;
+    dom.geneSearch.dispatch('keydown', {
+      key,
+      preventDefault() {
+        prevented = true;
+      },
+    });
+    return prevented;
+  };
+
+  search(dom, 'CD');
+  assert.equal(dom.geneSearch.getAttribute('role'), 'combobox');
+  assert.equal(dom.geneSearch.getAttribute('aria-expanded'), 'true');
+  assert.equal(dom.geneDropdown.getAttribute('role'), 'listbox');
+  const options = dom.geneDropdown.children.filter(
+    child => child.classList.contains('dropdown-item')
+  );
+  assert.deepEqual(options.map(option => option.textContent), ['CD3E', 'CD4', 'CD8A']);
+  assert.ok(options.every(option => option.getAttribute('role') === 'option'));
+  assert.equal(dom.geneSearch.getAttribute('aria-activedescendant'), null);
+
+  assert.equal(keydown('ArrowDown'), true);
+  assert.equal(keydown('ArrowDown'), true);
+  assert.equal(
+    dom.geneSearch.getAttribute('aria-activedescendant'),
+    options[1].getAttribute('id')
+  );
+  assert.deepEqual(
+    options.map(option => option.getAttribute('aria-selected')),
+    ['false', 'true', 'false']
+  );
+  keydown('ArrowDown');
+  keydown('ArrowDown');
+  assert.equal(
+    dom.geneSearch.getAttribute('aria-activedescendant'),
+    options[2].getAttribute('id'),
+    'ArrowDown stops at the last option'
+  );
+  keydown('ArrowUp');
+
+  // Enter must choose the active row (CD4), not the first one.
+  assert.equal(keydown('Enter'), true);
+  assert.deepEqual(loaded, [1]);
+  assert.equal(dom.geneSearch.value, 'CD4');
+  assert.equal(dom.geneSearch.getAttribute('aria-expanded'), 'false');
+
+  search(dom, 'CD8');
+  assert.equal(
+    dom.geneSearch.getAttribute('aria-activedescendant'),
+    null,
+    'a new result list starts with no active option'
+  );
+});
+
+test('a gene kept active for a moment is prefetched, and moving on cancels it', async () => {
+  const loads = [];
+  const { dom, api } = mountGeneSelector(
+    exportedGenes('CD3E', 'CD4', 'CD8A'),
+    { onLoad: (index, options) => loads.push({ index, signal: options.signal }) }
+  );
+  const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
+  const keydown = key => dom.geneSearch.dispatch('keydown', { key, preventDefault() {} });
+  search(dom, 'CD');
+
+  // Sweeping past an option starts nothing.
+  keydown('ArrowDown');
+  keydown('ArrowDown');
+  await wait(250);
+  assert.deepEqual(loads.map(load => load.index), [1], 'only the option that stayed active');
+  assert.equal(loads[0].signal.aborted, false);
+
+  // Moving on cancels the prefetch in flight and prefetches the next gene.
+  keydown('ArrowDown');
+  assert.equal(loads[0].signal.aborted, true);
+  await wait(250);
+  assert.deepEqual(loads.map(load => load.index), [1, 2]);
+
+  // Choosing the prefetched gene shares its load rather than cancelling it.
+  keydown('Enter');
+  assert.equal(loads[1].signal.aborted, false);
+  assert.deepEqual(loads.map(load => load.index), [1, 2, 2]);
+  api.destroy();
+  assert.equal(loads[1].signal.aborted, true, 'destroying the selector cancels its prefetch');
 });

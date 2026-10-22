@@ -6,7 +6,9 @@
  * - Warm cache: IndexedDB for persistence across sessions
  *
  * Features:
- * - Automatic cache invalidation based on data version
+ * - Entries are addressed by the data generation they were computed over
+ *   (see `identity` below), so a reload under the same dataset id never
+ *   serves markers computed from other expression values
  * - TTL-based expiration for IndexedDB entries
  * - Memory-aware hot cache sizing
  * - Cache key generation from analysis parameters
@@ -21,6 +23,23 @@ import { DEFAULTS, CACHE_KEYS } from './constants.js';
 // =============================================================================
 
 const DB_NAME = 'cellucid_marker_cache';
+
+function requireCacheIdentity(identity) {
+  if (
+    identity === null ||
+    typeof identity !== 'object' ||
+    Array.isArray(identity) ||
+    Object.keys(identity).sort().join(',') !== 'key,persistent' ||
+    typeof identity.key !== 'string' ||
+    identity.key.trim().length === 0 ||
+    typeof identity.persistent !== 'boolean'
+  ) {
+    throw new TypeError(
+      'MarkerCache dataset identity is required as exactly { key: non-empty string, persistent: boolean }'
+    );
+  }
+  return identity;
+}
 const DB_VERSION = 1;
 const STORE_NAME = 'markers';
 
@@ -121,7 +140,7 @@ function cloneMarkerCacheData(data) {
  *   maxCategories: 3,
  *   maxAgeDays: 7,
  *   cacheVersion: 1,
- *   datasetId: 'pbmc3k'
+ *   identity: { key: 'pbmc3k@2026-01-01T00:00:00Z', persistent: true }
  * });
  * await cache.init();
  *
@@ -145,7 +164,12 @@ export class MarkerCache {
    * @param {number} [options.maxCategories=3] - Max categories in hot cache
    * @param {number} [options.maxAgeDays=7] - TTL for IndexedDB entries
    * @param {number} [options.cacheVersion=1] - Version to invalidate old caches
-   * @param {string} [options.datasetId] - Dataset identifier for cache keys
+   * @param {{ key: string, persistent: boolean }} options.identity - The
+   *   data generation entries belong to. `key` must change whenever the data
+   *   may have changed. `persistent` is true only when the key proves the
+   *   generation across page loads (a published export timestamp); otherwise
+   *   entries live in memory only, because a dataset id alone does not
+   *   identify the expression values a reload brings.
    */
   constructor(options = {}) {
     /** @type {number} Max categories in hot cache */
@@ -157,8 +181,11 @@ export class MarkerCache {
     /** @type {number} Cache version */
     this._cacheVersion = options.cacheVersion ?? DEFAULTS.cacheVersion;
 
-    /** @type {string} Dataset identifier */
-    this._datasetId = options.datasetId;
+    const identity = requireCacheIdentity(options.identity);
+    /** @type {string} Data generation key */
+    this._identityKey = identity.key;
+    /** @type {boolean} Whether entries may outlive this page */
+    this._persistent = identity.persistent;
     if (!Number.isSafeInteger(this._maxCategories) || this._maxCategories < 1) {
       throw new RangeError('MarkerCache maxCategories must be a positive integer');
     }
@@ -168,7 +195,6 @@ export class MarkerCache {
     if (!Number.isSafeInteger(this._cacheVersion) || this._cacheVersion < 1) {
       throw new RangeError('MarkerCache cacheVersion must be a positive integer');
     }
-    this._requireDatasetId(this._datasetId);
 
     /** @type {Map<string, { data: any, timestamp: number }>} Hot cache (LRU) */
     this._hotCache = new Map();
@@ -181,20 +207,26 @@ export class MarkerCache {
   }
 
   /**
-   * Update the dataset identifier used in cache keys.
+   * Adopt the data generation used in cache keys.
    *
-   * Important for correctness when the active dataset changes while the same
-   * MarkerCache instance is reused (prevents cross-dataset cache hits).
+   * Called before every lookup so a dataset switch, or a reload of the same
+   * dataset id, can never be answered from another generation's entries.
    *
-   * @param {string|null|undefined} datasetId
+   * @param {{ key: string, persistent: boolean }} identity
    * @returns {boolean} true if changed
    */
-  setDatasetId(datasetId) {
-    this._requireDatasetId(datasetId);
-    if (datasetId === this._datasetId) return false;
-    this._datasetId = datasetId;
-    // Hot cache entries are keyed by datasetId-prefixed keys; clearing keeps the
-    // in-memory LRU bounded and avoids wasting space on another dataset.
+  setIdentity(identity) {
+    const exact = requireCacheIdentity(identity);
+    if (
+      exact.key === this._identityKey &&
+      exact.persistent === this._persistent
+    ) {
+      return false;
+    }
+    this._identityKey = exact.key;
+    this._persistent = exact.persistent;
+    // Hot cache entries are keyed by the generation; clearing keeps the
+    // in-memory LRU bounded and avoids wasting space on another generation.
     this._hotCache.clear();
     return true;
   }
@@ -234,7 +266,7 @@ export class MarkerCache {
     }
 
     // Check warm cache (IndexedDB)
-    if (this._db) {
+    if (this._db && this._persistent) {
       const warmEntry = await this._getFromIndexedDB(cacheKey);
       if (warmEntry !== null) {
         // Promote to hot cache
@@ -267,7 +299,7 @@ export class MarkerCache {
     this._setHotCache(cacheKey, ownedData);
 
     // Store in warm cache (IndexedDB)
-    if (this._db) {
+    if (this._db && this._persistent) {
       await this._setInIndexedDB(cacheKey, ownedData);
     }
   }
@@ -287,7 +319,7 @@ export class MarkerCache {
       return true;
     }
 
-    if (this._db) {
+    if (this._db && this._persistent) {
       const entry = await this._getFromIndexedDB(cacheKey);
       return entry !== null;
     }
@@ -336,7 +368,8 @@ export class MarkerCache {
       hotCacheSize: this._hotCache.size,
       maxCategories: this._maxCategories,
       indexedDBAvailable: this._indexedDBAvailable,
-      datasetId: this._datasetId
+      identityKey: this._identityKey,
+      persistent: this._persistent
     };
   }
 
@@ -392,22 +425,12 @@ export class MarkerCache {
       return [key, value];
     });
     return JSON.stringify([
-      this._datasetId,
+      this._identityKey,
       this._cacheVersion,
       CACHE_KEYS.MARKERS,
       category,
       entries
     ]);
-  }
-
-  _requireDatasetId(datasetId) {
-    if (
-      typeof datasetId !== 'string' ||
-      datasetId.length === 0 ||
-      datasetId.trim().length === 0
-    ) {
-      throw new TypeError('MarkerCache datasetId is required and must be a non-empty string');
-    }
   }
 
   /**
@@ -611,19 +634,3 @@ export class MarkerCache {
     });
   }
 }
-
-// =============================================================================
-// FACTORY FUNCTION
-// =============================================================================
-
-/**
- * Create a MarkerCache instance
- *
- * @param {Object} [options] - Same options as MarkerCache constructor
- * @returns {MarkerCache}
- */
-export function createMarkerCache(options) {
-  return new MarkerCache(options);
-}
-
-export default MarkerCache;

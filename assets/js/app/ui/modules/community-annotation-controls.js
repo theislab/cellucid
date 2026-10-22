@@ -121,8 +121,34 @@ export function initCommunityAnnotationControls({
   const notifications = getNotificationCenter();
   const githubAuth = getGitHubAuthSession();
 
+  /**
+   * @typedef {{status: 'done'|'skipped'|'cancelled'|'failed', error?: string}} SyncOutcome
+   */
   let syncBusy = false;
+  /** @type {Set<() => void>} */
+  const syncBusyListeners = new Set();
   let syncError = null;
+
+  function notifySyncBusyChange() {
+    for (const listener of [...syncBusyListeners]) listener();
+  }
+
+  /**
+   * Observe every `syncBusy` transition, including ones started by the
+   * automatic-pull scheduler while a dialog is open.
+   *
+   * @param {() => void} listener
+   * @returns {() => void} unsubscribe
+   */
+  function subscribeSyncBusy(listener) {
+    if (typeof listener !== 'function') {
+      throw new TypeError('Sync busy listener must be a function');
+    }
+    syncBusyListeners.add(listener);
+    return () => {
+      syncBusyListeners.delete(listener);
+    };
+  }
   let lastRepoInfo = null;
   /** @type {AbortController|null} */
   let activeSyncAbort = null;
@@ -327,11 +353,21 @@ export function initCommunityAnnotationControls({
   let autoPullRuntime = null;
   let lastAutoPullPreferenceError = null;
 
+  /**
+   * Open a community annotation modal this controls instance owns.
+   *
+   * `options.onClosed`, when given, runs after the owner has released the
+   * modal, on every close path (Close, Escape, backdrop, replacement, context
+   * teardown). It is how a flow learns its dialog is gone; watching the
+   * document for the overlay to disappear would see every mutation in the
+   * page while the dialog is open.
+   */
   function showOwnedCommunityModal(options) {
     if (contextDestroyed) return null;
-    if (options?.onClosed !== undefined) {
-      throw new Error(
-        'Owned community annotation modals reserve their close settlement'
+    const { onClosed: callerOnClosed = null, ...modalOptions } = options ?? {};
+    if (callerOnClosed !== null && typeof callerOnClosed !== 'function') {
+      throw new TypeError(
+        'Owned community annotation modal close callback must be a function'
       );
     }
     if (activeCommunityModalClose !== null) {
@@ -346,12 +382,13 @@ export function initCommunityAnnotationControls({
     let ownedClose = null;
     let settled = false;
     const modalRef = showClusterModal({
-      ...options,
+      ...modalOptions,
       onClosed: () => {
         settled = true;
         if (activeCommunityModalClose === ownedClose) {
           activeCommunityModalClose = null;
         }
+        callerOnClosed?.();
       }
     });
     ownedClose = modalRef.close;
@@ -1429,7 +1466,12 @@ export function initCommunityAnnotationControls({
       });
       if (!isContextOwnerCurrent(currentOwner)) return false;
       if (!mine?.doc) return false;
-      session.mergeFromUserFiles([mine.doc], { preferLocalVotes: true });
+      session.mergeFromUserFiles([mine.doc], {
+        preferLocalVotes: true,
+        hydrateFromOwnFile: mine?.path && mine?.sha
+          ? session.ownUserFileNeedsHydration({ [mine.path]: mine.sha })
+          : true,
+      });
       if (mine?.path && mine?.sha) session.setRemoteFileSha(mine.path, mine.sha);
       return true;
     } catch (error) {
@@ -1519,7 +1561,15 @@ export function initCommunityAnnotationControls({
     githubAuth,
     dataSourceManager,
     isSyncBusy: () => syncBusy,
-    getSyncError: () => syncError,
+    subscribeSyncBusy,
+    resolveConnectionTrigger: () => {
+      const trigger = container.querySelector(
+        '[data-community-annotation-action="github-connection"]'
+      );
+      return trigger instanceof HTMLButtonElement && !trigger.disabled
+        ? trigger
+        : null;
+    },
     getLastRepoInfo: () => lastRepoInfo,
     setLastRepoInfo: (repoInfo) => {
       lastRepoInfo = repoInfo;
@@ -1551,6 +1601,7 @@ export function initCommunityAnnotationControls({
 
   const { render } = createControlsPanel({
     container,
+    lifecycleSignal: lifecycleAbort.signal,
     state,
     dataSourceManager,
     infoPopovers,
@@ -1584,7 +1635,15 @@ export function initCommunityAnnotationControls({
     const owner = applySessionCacheContext({ datasetId });
 
     const paramRepo = getUrlAnnotationRepo();
-    if (paramRepo && (githubAuth.isAuthenticated?.() || isSimulateRepoConnectedEnabled())) {
+    // An annotation repository is bound to one dataset. While no dataset is
+    // open — including while the startup dataset is still loading — there is
+    // nothing to bind the URL's repository to; it is applied when a dataset
+    // is published, which calls this again.
+    if (
+      paramRepo &&
+      datasetId !== null &&
+      (githubAuth.isAuthenticated?.() || isSimulateRepoConnectedEnabled())
+    ) {
       const username = owner.userKey;
       const parsed = parseOwnerRepo(paramRepo);
       // Resolve a missing branch once before persisting the canonical reference.
@@ -1806,6 +1865,7 @@ export function initCommunityAnnotationControls({
 
   function destroy() {
     contextDestroyed = true;
+    syncBusyListeners.clear();
     stopAutoPullScheduler();
     cancelScheduledRoleRetry();
     publishedContextIdentity = null;
@@ -1844,63 +1904,85 @@ export function initCommunityAnnotationControls({
     ]);
   }
 
-      async function pullFromGitHub({
-        repoOverride = null,
-        quiet = false,
-        confirmDatasetMismatch = false,
-        signal = null,
-      } = {}) {
-        if (syncBusy) return { ok: false, skipped: true };
-        const entryOwner = publishContextOwner(getCacheContext({}));
-        syncBusy = true;
-        syncError = null;
-        const opAbort = beginActiveSyncAbortScope();
-        const releaseEntryOwnerSignal =
-          bindActiveSyncOwnerSignal(opAbort, entryOwner.signal);
-        const releaseCallerSignal =
-          signal === null
-            ? null
-            : bindActiveSyncOwnerSignal(opAbort, signal);
-        render();
+  /**
+   * Run one Pull or Publish transaction while it exclusively owns `syncBusy`.
+   *
+   * The flag, the abort scope, and the owner-signal bindings are all acquired
+   * inside one try block and released in its finally, so no exception between
+   * acquisition and the operation can leave the controls permanently busy.
+   * Every caller receives an explicit outcome: `skipped` when another
+   * transaction already owns the flag, otherwise whatever the operation
+   * returns (`done`, `cancelled`, or `failed` with an exact error message).
+   *
+   * @param {AbortSignal|null} signal
+   * @param {(scope: {entryOwner: object, opAbort: AbortController}) => Promise<SyncOutcome>} operation
+   * @returns {Promise<SyncOutcome>}
+   */
+  async function runExclusiveSync(signal, operation) {
+    if (syncBusy) return Object.freeze({ status: 'skipped' });
+    let opAbort = null;
+    let releaseEntryOwnerSignal = null;
+    let releaseCallerSignal = null;
+    try {
+      syncBusy = true;
+      syncError = null;
+      const entryOwner = publishContextOwner(getCacheContext({}));
+      opAbort = beginActiveSyncAbortScope();
+      releaseEntryOwnerSignal =
+        bindActiveSyncOwnerSignal(opAbort, entryOwner.signal);
+      releaseCallerSignal =
+        signal === null
+          ? null
+          : bindActiveSyncOwnerSignal(opAbort, signal);
+      notifySyncBusyChange();
+      render();
+      return await operation({ entryOwner, opAbort });
+    } finally {
+      releaseCallerSignal?.();
+      releaseEntryOwnerSignal?.();
+      if (opAbort !== null) endActiveSyncAbortScope(opAbort);
+      syncBusy = false;
+      notifySyncBusyChange();
+      flushRoleRetryAfterActiveSync();
+      render();
+    }
+  }
 
-        const datasetId = dataSourceManager?.getCurrentDatasetId?.() || null;
-        if (!datasetId) {
-          syncBusy = false;
-          syncError = 'Missing dataset context.';
-          releaseCallerSignal?.();
-          releaseEntryOwnerSignal();
-          endActiveSyncAbortScope(opAbort);
-          render();
-          return { ok: false, error: syncError };
-        }
+  /**
+   * @param {{repoOverride?: string|null, quiet?: boolean, confirmDatasetMismatch?: boolean, signal?: AbortSignal|null}} [options]
+   * @returns {Promise<SyncOutcome>}
+   */
+  async function pullFromGitHub({ signal = null, ...options } = {}) {
+    return runExclusiveSync(signal, (scope) => pullExclusive(options, scope));
+  }
 
-      const prevRepoInfo = lastRepoInfo;
-      const prevRole = access.getRole?.() || 'unknown';
-      const prevRoleContext = lastRoleContext;
+  async function pullExclusive(
+    { repoOverride = null, quiet = false, confirmDatasetMismatch = false },
+    { entryOwner, opAbort },
+  ) {
+    const datasetId = dataSourceManager?.getCurrentDatasetId?.() || null;
+    if (!datasetId) {
+      syncError = 'Missing dataset context.';
+      return { status: 'failed', error: syncError };
+    }
 
-      const cacheUser = getCacheUserKey();
-      const storedRepoRef = getAnnotationRepoForDataset(datasetId, cacheUser);
-        const repoInput =
-          repoOverride !== null ? repoOverride : storedRepoRef;
-        if (!repoInput) {
-          syncBusy = false;
-        syncError = 'No annotation repo connected.';
-        releaseCallerSignal?.();
-        releaseEntryOwnerSignal();
-        endActiveSyncAbortScope(opAbort);
-        render();
-        return { ok: false, error: syncError };
-      }
+    const prevRepoInfo = lastRepoInfo;
+    const prevRole = access.getRole?.() || 'unknown';
+    const prevRoleContext = lastRoleContext;
 
-      if (!githubAuth.isAuthenticated?.()) {
-        syncBusy = false;
-        syncError = 'Sign in required.';
-        releaseCallerSignal?.();
-        releaseEntryOwnerSignal();
-        endActiveSyncAbortScope(opAbort);
-        render();
-        return { ok: false, error: syncError };
-      }
+    const cacheUser = getCacheUserKey();
+    const storedRepoRef = getAnnotationRepoForDataset(datasetId, cacheUser);
+    const repoInput =
+      repoOverride !== null ? repoOverride : storedRepoRef;
+    if (!repoInput) {
+      syncError = 'No annotation repo connected.';
+      return { status: 'failed', error: syncError };
+    }
+
+    if (!githubAuth.isAuthenticated?.()) {
+      syncError = 'Sign in required.';
+      return { status: 'failed', error: syncError };
+    }
 
     const trackerId = quiet ? null : notifications.progress(`Pulling annotations from ${repoInput}...`, 0, { category: 'annotation' });
     const updateProgress = (pct, opts) => {
@@ -2019,7 +2101,7 @@ export function initCommunityAnnotationControls({
             syncError = `${base}\nExisting repo connection preserved.`;
             notifications.error(syncError, { category: 'annotation', duration: 10000 });
             fail(base);
-            return { ok: false, error: base, preservedExisting: true };
+            return { status: 'failed', error: base, preservedExisting: true };
           }
           disconnectAnnotationRepo({
             datasetId,
@@ -2028,7 +2110,7 @@ export function initCommunityAnnotationControls({
             notify: 'error'
           });
           fail(base);
-          return { ok: false, error: base };
+          return { status: 'failed', error: base };
         }
 
       const isDatasetMismatch =
@@ -2054,7 +2136,7 @@ export function initCommunityAnnotationControls({
             syncError = `${base}\nExisting repo connection preserved.`;
             notifications.error(syncError, { category: 'annotation', duration: 10000 });
             fail(base);
-            return { ok: false, error: base, blocked: true, preservedExisting: true };
+            return { status: 'failed', error: base, blocked: true, preservedExisting: true };
           }
           disconnectAnnotationRepo({
             datasetId,
@@ -2063,7 +2145,7 @@ export function initCommunityAnnotationControls({
             notify: 'error'
           });
           fail(base);
-          return { ok: false, error: base, blocked: true };
+          return { status: 'failed', error: base, blocked: true };
         }
 
         const ok = await confirmAsync({
@@ -2076,6 +2158,7 @@ export function initCommunityAnnotationControls({
             `- Click Publish to write a new supportedDatasets entry for "${didLabel}" to annotations/config.json\n\n` +
             `Annotators are blocked until you publish.`,
           confirmText: 'Connect anyway',
+          tone: 'primary',
           signal: opAbort.signal,
         });
         throwIfActiveSyncAborted(opAbort);
@@ -2085,7 +2168,7 @@ export function initCommunityAnnotationControls({
           lastRoleContext = prevRoleContext;
           syncError = 'Cancelled.';
           complete('Cancelled.');
-          return { ok: false, cancelled: true };
+          return { status: 'cancelled' };
         }
         if (!quiet) {
           notifications.warning(
@@ -2151,9 +2234,47 @@ export function initCommunityAnnotationControls({
             { prefixes: ['annotations/moderation/'] }
           );
           updateProgress(15, { message: 'Checking `annotations/users/` (SHA)…' });
+          // Changed user files are cached a batch at a time as they arrive,
+          // so a Pull never holds every raw file at once; an interrupted Pull
+          // keeps what it cached and the next one fetches only the rest.
+          let cachedUserRecordCount = 0;
+          const cacheUserRecords = async (records) => {
+            throwIfActiveSyncAborted(opAbort);
+            if (!Array.isArray(records)) {
+              throw new Error('GitHub user pull returned an invalid record batch');
+            }
+            const cacheRecords = records.map((record) => {
+              if (
+                !record ||
+                typeof record !== 'object' ||
+                Array.isArray(record) ||
+                Object.keys(record).sort().join(',') !== 'doc,path,sha' ||
+                typeof record.path !== 'string' ||
+                !/^annotations\/users\/ghid_[1-9][0-9]*\.json$/.test(record.path) ||
+                typeof record.sha !== 'string' ||
+                !record.sha
+              ) {
+                throw new Error('GitHub user pull returned an invalid file record');
+              }
+              assertUserDocument(record.doc, {
+                path: record.path,
+                filename: record.path.split('/').pop(),
+              });
+              return { path: record.path, sha: record.sha, json: record.doc };
+            });
+            await fileCache.setManyJson({
+              datasetId,
+              repoRef: canonicalRepoRef,
+              userId,
+              records: cacheRecords,
+              signal: opAbort.signal,
+            });
+            cachedUserRecordCount += cacheRecords.length;
+          };
           const [pullResult, moderationResult] = await Promise.all([
             sync.pullAllUsers({
               knownShas: knownUserShas,
+              onRecords: cacheUserRecords,
               signal: opAbort.signal,
             }),
             sync.pullModerationMerges({
@@ -2167,7 +2288,7 @@ export function initCommunityAnnotationControls({
           !pullResult ||
           typeof pullResult !== 'object' ||
           Array.isArray(pullResult) ||
-          !Array.isArray(pullResult.docs) ||
+          Object.keys(pullResult).sort().join(',') !== 'concurrency,fetchedCount,shas,totalCount' ||
           !pullResult.shas ||
           typeof pullResult.shas !== 'object' ||
           Array.isArray(pullResult.shas) ||
@@ -2177,10 +2298,9 @@ export function initCommunityAnnotationControls({
         ) {
           throw new Error('GitHub user pull returned an invalid result shape');
         }
-        const fetchedUserRecords = pullResult.docs;
         const remoteUserShas = pullResult.shas;
         if (
-          pullResult.fetchedCount !== fetchedUserRecords.length ||
+          pullResult.fetchedCount !== cachedUserRecordCount ||
           pullResult.totalCount !== Object.keys(remoteUserShas).length ||
           pullResult.concurrency < 1
         ) {
@@ -2188,25 +2308,6 @@ export function initCommunityAnnotationControls({
         }
 
       const userPaths = Object.keys(remoteUserShas);
-      const fetchedPaths = new Set();
-      for (const record of fetchedUserRecords) {
-        if (
-          !record ||
-          typeof record !== 'object' ||
-          Array.isArray(record) ||
-          Object.keys(record).sort().join(',') !== 'doc,path,sha' ||
-          typeof record.path !== 'string' ||
-          typeof record.sha !== 'string' ||
-          !record.sha ||
-          record.sha !== remoteUserShas[record.path] ||
-          fetchedPaths.has(record.path)
-        ) {
-          throw new Error('GitHub user pull returned an invalid file record');
-        }
-        const filename = record.path.split('/').pop();
-        assertUserDocument(record.doc, { path: record.path, filename });
-        fetchedPaths.add(record.path);
-      }
       for (const [path, sha] of Object.entries(remoteUserShas)) {
         if (
           !/^annotations\/users\/ghid_[1-9][0-9]*\.json$/.test(path) ||
@@ -2243,32 +2344,25 @@ export function initCommunityAnnotationControls({
           `(cached ${pullResult.totalCount - pullResult.fetchedCount})`
       });
 
-      // Every fetched record is already contract-validated by the GitHub boundary.
       // Moderation merges (author-maintained, optional).
       const keepPaths = new Set(userPaths);
       updateProgress(60, { message: 'Checking `annotations/moderation/` (SHA)…' });
       if (moderationResult.sha) {
         keepPaths.add(moderationResult.path);
       }
-      const changedCacheRecords = fetchedUserRecords.map(record => ({
-        path: record.path,
-        sha: record.sha,
-        json: record.doc,
-      }));
       if (moderationResult.doc !== null) {
-        changedCacheRecords.push({
-          path: moderationResult.path,
-          sha: moderationResult.sha,
-          json: moderationResult.doc,
+        await fileCache.setManyJson({
+          datasetId,
+          repoRef: canonicalRepoRef,
+          userId,
+          records: [{
+            path: moderationResult.path,
+            sha: moderationResult.sha,
+            json: moderationResult.doc,
+          }],
+          signal: opAbort.signal,
         });
       }
-      await fileCache.setManyJson({
-        datasetId,
-        repoRef: canonicalRepoRef,
-        userId,
-        records: changedCacheRecords,
-        signal: opAbort.signal,
-      });
         throwIfActiveSyncAborted(opAbort);
 
         // Prune cached files that no longer exist remotely.
@@ -2280,37 +2374,46 @@ export function initCommunityAnnotationControls({
         // -------------------------------------------------------------------
         updateProgress(75, { message: 'Compiling merged view from cached raw files…' });
 
-        const cached = await fileCache.getAllJsonForRepo({
+        // Each cached file is folded into the merge as the cursor reaches it.
+        const mergesPath = 'annotations/moderation/merges.json';
+        const remoteUserFiles = session.createRemoteUserFiles();
+        const streamedUserPaths = new Set();
+        let cachedMergeEntry = null;
+        const cacheCorrupt = (message) => {
+          const error = new Error(message);
+          error.code = 'LOCAL_RAW_CACHE_CORRUPT';
+          return error;
+        };
+        await fileCache.forEachJsonForRepo({
           datasetId,
           repoRef: canonicalRepoRef,
           userId,
           prefixes: ['annotations/users/', 'annotations/moderation/'],
+          onRecord: (path, sha, json) => {
+            if (path === mergesPath) {
+              cachedMergeEntry = { sha, json };
+              return;
+            }
+            if (!Object.hasOwn(remoteUserShas, path)) {
+              throw cacheCorrupt(`Local cache holds ${path}, which the remote does not`);
+            }
+            if (sha !== remoteUserShas[path]) {
+              throw cacheCorrupt(`Local cache SHA does not match the remote SHA for ${path}`);
+            }
+            assertUserDocument(json, { path, filename: path.split('/').pop() });
+            remoteUserFiles.add(json);
+            streamedUserPaths.add(path);
+          },
         });
         throwIfActiveSyncAborted(opAbort);
-
-      const allUserDocsForSession = userPaths.map((path) => {
-        const entry = cached[path];
-        if (!entry?.json) {
-          const error = new Error(`Local cache is missing ${path}`);
-          error.code = 'LOCAL_RAW_CACHE_CORRUPT';
-          throw error;
+        for (const path of userPaths) {
+          if (!streamedUserPaths.has(path)) throw cacheCorrupt(`Local cache is missing ${path}`);
         }
-        if (entry.sha !== remoteUserShas[path]) {
-          const error = new Error(`Local cache SHA does not match the remote SHA for ${path}`);
-          error.code = 'LOCAL_RAW_CACHE_CORRUPT';
-          throw error;
-        }
-        const filename = path.split('/').pop();
-        assertUserDocument(entry.json, { path, filename });
-        return entry.json;
-      });
 
       // Resolve the exact cached moderation document before the session
       // transaction. Local author edits remain authoritative inside that
       // transaction until they are published.
-      const mergesPath = 'annotations/moderation/merges.json';
       const remoteMergesKnown = keepPaths.has(mergesPath);
-      const cachedMergeEntry = remoteMergesKnown ? cached[mergesPath] : null;
 
       if (remoteMergesKnown) {
         if (!cachedMergeEntry?.json) {
@@ -2344,7 +2447,7 @@ export function initCommunityAnnotationControls({
       // without scheduling persistence.
       throwIfActiveSyncAborted(opAbort);
       session.applyPulledRepositoryState({
-        remoteUserDocs: allUserDocsForSession,
+        remoteUserFiles,
         moderationDocument:
           remoteMergesKnown ? cachedMergeEntry.json : null,
         categoricalFieldKeys: allKeys,
@@ -2394,7 +2497,7 @@ export function initCommunityAnnotationControls({
         }
 
       complete('Pulled latest annotations');
-      return { ok: true, repoRef: canonicalRepoRef };
+      return { status: 'done', repoRef: canonicalRepoRef };
       } catch (caughtError) {
           const err = normalizeActiveSyncError(caughtError, opAbort);
           const statusCode = httpStatusOrNull(err);
@@ -2414,7 +2517,7 @@ export function initCommunityAnnotationControls({
         if (err?.code === 'ANNOTATION_SYNC_ABORTED') {
           syncError = msg;
           fail(msg);
-          return { ok: false, error: msg, aborted: true };
+          return { status: 'failed', error: msg, aborted: true };
         }
 
         if (
@@ -2466,7 +2569,7 @@ export function initCommunityAnnotationControls({
             syncError = abortedMessage;
             fail(abortedMessage);
             return {
-              ok: false,
+              status: 'failed',
               error: abortedMessage,
               cause: ownershipError ?? cacheRecoveryError,
               aborted: true,
@@ -2501,7 +2604,7 @@ export function initCommunityAnnotationControls({
             syncError = cacheRecoveryMessage;
             fail(cacheRecoveryMessage);
             return {
-              ok: false,
+              status: 'failed',
               error: cacheRecoveryMessage,
               cause: cacheRecoveryError,
               corruptedCache: true,
@@ -2518,7 +2621,7 @@ export function initCommunityAnnotationControls({
           });
           fail(cacheRecoveryMessage);
           return {
-            ok: false,
+            status: 'failed',
             error: cacheRecoveryMessage,
             cause: cacheRecoveryError,
             corruptedCache: true,
@@ -2643,50 +2746,35 @@ export function initCommunityAnnotationControls({
         }
 
           fail(syncError || msg);
-          return { ok: false, error: syncError || msg };
-          } finally {
-            releaseCallerSignal?.();
-            releaseEntryOwnerSignal();
-            endActiveSyncAbortScope(opAbort);
-            syncBusy = false;
-            flushRoleRetryAfterActiveSync();
-            render();
+          return { status: 'failed', error: syncError || msg };
       }
     }
 
+  /**
+   * @param {{signal?: AbortSignal|null}} [options]
+   * @returns {Promise<SyncOutcome>}
+   */
   async function pushToGitHub({ signal = null } = {}) {
+    return runExclusiveSync(signal, (scope) => publishExclusive(scope));
+  }
+
+  async function publishExclusive({ opAbort }) {
     const datasetId = dataSourceManager?.getCurrentDatasetId?.() || null;
     if (!datasetId) {
       syncError = 'Missing dataset context.';
-      render();
-      return;
+      return { status: 'failed', error: syncError };
     }
     const cacheUser = getCacheUserKey();
     const repo = getAnnotationRepoForDataset(datasetId, cacheUser);
     if (!repo) {
       syncError = 'No annotation repo connected.';
-      render();
-      return;
+      return { status: 'failed', error: syncError };
     }
 
     if (!githubAuth.isAuthenticated?.()) {
       syncError = 'Sign in required.';
-      render();
-      return;
+      return { status: 'failed', error: syncError };
     }
-
-    if (syncBusy) return;
-    const entryOwner = publishContextOwner(getCacheContext({}));
-    syncBusy = true;
-    syncError = null;
-    const opAbort = beginActiveSyncAbortScope();
-    const releaseEntryOwnerSignal =
-      bindActiveSyncOwnerSignal(opAbort, entryOwner.signal);
-    const releaseCallerSignal =
-      signal === null
-        ? null
-        : bindActiveSyncOwnerSignal(opAbort, signal);
-    render();
 
     const trackerId = notifications.loading(`Publishing your annotations to ${repo}...`, { category: 'annotation' });
     const completedPublicationSteps = [];
@@ -2740,7 +2828,7 @@ export function initCommunityAnnotationControls({
             notify: 'none'
           });
           notifications.fail(trackerId, msg);
-          return;
+          return { status: 'failed', error: syncError || msg };
         }
 
       const publishCapability = getPublishCapability(repoInfo);
@@ -2751,7 +2839,7 @@ export function initCommunityAnnotationControls({
           const msg = describeCannotPublishMessage(repoLabel);
           notifications.fail(trackerId, msg);
           syncError = msg;
-          return;
+          return { status: 'failed', error: msg };
         }
       }
         const ownerRepo = requireGitHubRepositoryFullName(repoInfo);
@@ -2983,7 +3071,7 @@ export function initCommunityAnnotationControls({
           signal: opAbort.signal,
         });
         await handlePublishResult(result);
-        return;
+        return { status: 'done' };
     } catch (caughtError) {
       const err = normalizeActiveSyncError(caughtError, opAbort);
       const statusCode = httpStatusOrNull(err);
@@ -3016,19 +3104,19 @@ export function initCommunityAnnotationControls({
           'that Pull completes.';
         syncError = msg;
         notifications.fail(trackerId, msg);
-        return;
+        return { status: 'failed', error: msg };
       }
 
       if (err?.code === 'ANNOTATION_SYNC_ABORTED') {
         syncError = msg;
         notifications.fail(trackerId, msg);
-        return;
+        return { status: 'failed', error: msg };
       }
 
       if (msg.toLowerCase().includes('cancelled')) {
         syncError = 'Cancelled.';
         notifications.complete(trackerId, 'Cancelled.');
-        return;
+        return { status: 'cancelled' };
       }
 
       const repoLabel = (() => {
@@ -3116,13 +3204,7 @@ export function initCommunityAnnotationControls({
         }
 
       notifications.fail(trackerId, msg);
-    } finally {
-      releaseCallerSignal?.();
-      releaseEntryOwnerSignal();
-      endActiveSyncAbortScope(opAbort);
-      syncBusy = false;
-      flushRoleRetryAfterActiveSync();
-      render();
+      return { status: 'failed', error: syncError || msg };
     }
   }
 

@@ -3,11 +3,12 @@
  * dialogs claiming the screen.
  *
  * The sidebar data-source controls are static markup, but the listeners that
- * act on them are attached by `initUI()`, which does not run until the initial
- * dataset has finished loading. They used to paint enabled and typeable for
- * that whole window, and a click there produced no request, no notification and
- * no record of any kind — a user who landed on the page and immediately picked
- * their own `.h5ad` watched the demo dataset stay put with no explanation.
+ * act on them are attached by `initUI()`, which runs only once startup has read
+ * its dataset catalog. They used to paint enabled and typeable for that whole
+ * window, and a click there produced no request, no notification and no record
+ * of any kind. Once they open, the startup dataset has not started loading
+ * yet, and a choice made while it loads replaces it
+ * (`dataset-load-supersede.spec.mjs`).
  *
  * The link is slowed by holding routes rather than by shipping large payloads:
  * this is a functional test of an ordering defect, not a measurement.
@@ -15,6 +16,7 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { expect, test } from './helpers/test.mjs';
+import { chooseDirectory } from './helpers/directory-upload.mjs';
 import {
   APP_ORIGIN as ORIGIN,
   SAMPLE_ORIGIN,
@@ -142,11 +144,10 @@ test(
 
     // And they really work, rather than merely looking enabled: a directory
     // holding a different dataset replaces what startup put on screen.
-    await page
-      .locator('#user-data-file-input')
-      .setInputFiles(path.join(
-        fixturesDirectory, 'demo-custom-exports', LOCAL_DATASET.id,
-      ));
+    await chooseDirectory(
+      page.locator('#user-data-file-input'),
+      path.join(fixturesDirectory, 'demo-custom-exports', LOCAL_DATASET.id),
+    );
     await expect(page.locator('#dataset-name')).toHaveText(LOCAL_DATASET.name);
     await expect(page.locator('#dataset-cells')).toHaveText(
       String(LOCAL_DATASET.cells),

@@ -11,8 +11,8 @@
 import { isExactCameraState } from '../../../../rendering/camera-state-contract.js';
 import { createOpaqueId } from '../../../utils/opaque-id.js';
 
-export const MAX_KEYFRAMES = 100;
-export const MAX_TRANSITION_DURATION_SECONDS = 60;
+/** The shortest transition a keyframe pair may declare; there is no longest. */
+export const MIN_TRANSITION_DURATION_SECONDS = 0.1;
 const VALID_KEYFRAME_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const KEYFRAME_KEYS = [
   'freefly',
@@ -20,8 +20,48 @@ const KEYFRAME_KEYS = [
   'label',
   'navigationMode',
   'orbit',
+  'representation',
   'transitionDuration'
 ];
+
+/**
+ * The representation a keyframe was recorded on: the embedding reference of
+ * the view it was captured in (`{key, columns}`), or null where there is none
+ * (a synthetic dataset). A path replays camera poses only; playing it on a
+ * view that shows another representation is allowed, and the interface says
+ * so.
+ *
+ * @param {unknown} value
+ * @returns {boolean}
+ */
+export function isValidKeyframeRepresentation(value) {
+  if (value === null) return true;
+  if (
+    typeof value !== 'object' ||
+    Array.isArray(value) ||
+    Object.keys(value).sort().join(',') !== 'columns,key' ||
+    typeof value.key !== 'string' ||
+    value.key.length === 0
+  ) {
+    return false;
+  }
+  return value.columns === null || (
+    Array.isArray(value.columns) &&
+    value.columns.length >= 1 &&
+    value.columns.length <= 3 &&
+    value.columns.every(column => Number.isSafeInteger(column) && column >= 0) &&
+    new Set(value.columns).size === value.columns.length
+  );
+}
+
+function freezeRepresentation(representation) {
+  return representation === null
+    ? null
+    : Object.freeze({
+      key: representation.key,
+      columns: representation.columns === null ? null : Object.freeze([...representation.columns])
+    });
+}
 
 function assertKeyframeId(id) {
   if (typeof id !== 'string' || !VALID_KEYFRAME_ID.test(id)) {
@@ -33,7 +73,6 @@ function assertKeyframeId(id) {
 function isExactKeyframeLabel(label) {
   return typeof label === 'string' &&
     label.length > 0 &&
-    label.length <= 40 &&
     label === label.trim();
 }
 
@@ -43,12 +82,14 @@ function createStoredKeyframe({
   navigationMode,
   orbit,
   freefly,
+  representation,
   transitionDuration
 }) {
   return Object.freeze({
     id,
     label,
     navigationMode,
+    representation: freezeRepresentation(representation),
     orbit: Object.freeze({
       radius: orbit.radius,
       targetRadius: orbit.targetRadius,
@@ -86,6 +127,14 @@ function cloneKeyframeForExport(keyframe) {
       yaw: keyframe.freefly.yaw,
       pitch: keyframe.freefly.pitch
     },
+    representation: keyframe.representation === null
+      ? null
+      : {
+        key: keyframe.representation.key,
+        columns: keyframe.representation.columns === null
+          ? null
+          : [...keyframe.representation.columns]
+      },
     transitionDuration: keyframe.transitionDuration
   };
 }
@@ -132,6 +181,7 @@ export function isValidCameraKeyframe(value) {
     return false;
   }
   if (typeof value.id !== 'string' || !VALID_KEYFRAME_ID.test(value.id)) return false;
+  if (!isValidKeyframeRepresentation(value.representation)) return false;
   if (!isExactKeyframeLabel(value.label)) {
     return false;
   }
@@ -139,8 +189,7 @@ export function isValidCameraKeyframe(value) {
   return value.transitionDuration === null ||
     (
       Number.isFinite(value.transitionDuration) &&
-      value.transitionDuration >= 0.1 &&
-      value.transitionDuration <= MAX_TRANSITION_DURATION_SECONDS
+      value.transitionDuration >= MIN_TRANSITION_DURATION_SECONDS
     );
 }
 
@@ -173,6 +222,8 @@ export function isCameraPathReady(keyframes) {
  * @property {string}       navigationMode      'orbit' | 'planar' | 'free'
  * @property {Object}       orbit               Orbit camera params.
  * @property {Object}       freefly             Free-fly camera params.
+ * @property {{key: string, columns: number[]|null}|null} representation
+ *                                                The embedding it was recorded on.
  * @property {number|null}  transitionDuration  Seconds to next keyframe, or null for auto-pace.
  */
 
@@ -219,10 +270,12 @@ export function createKeyframeStore() {
   /**
    * Add a camera-state snapshot as a new keyframe.
    * @param {Object} cameraState  The value returned by viewer.getCameraState().
-   * @param {string} [label]      Optional custom label.
-   * @returns {string|null}  The new keyframe's id, or null if at capacity.
+   * @param {string|undefined} label  A custom label, or undefined for "KF n".
+   * @param {{key: string, columns: number[]|null}|null} representation
+   *   The embedding the view it was captured in shows.
+   * @returns {string}  The new keyframe's id.
    */
-  function add(cameraState, label) {
+  function add(cameraState, label, representation) {
     if (!isValidCameraState(cameraState)) {
       throw new TypeError(
         'Camera path keyframes require an exact synchronized camera state.'
@@ -237,13 +290,14 @@ export function createKeyframeStore() {
     const exactLabel = usesDefaultLabel ? `KF ${nextIndex}` : label;
     if (!isExactKeyframeLabel(exactLabel)) {
       throw new TypeError(
-        'Camera path keyframe label must be a trimmed non-empty string of at most 40 characters.'
+        'Camera path keyframe label must be a trimmed non-empty string.'
       );
     }
-    if (keyframes.length >= MAX_KEYFRAMES) {
-      return null;
+    if (!isValidKeyframeRepresentation(representation)) {
+      throw new TypeError(
+        'Camera path keyframes record the representation they were captured on, or null.'
+      );
     }
-
     const id = createOpaqueId();
     keyframes.push(createStoredKeyframe({
       id,
@@ -251,6 +305,7 @@ export function createKeyframeStore() {
       navigationMode: cameraState.navigationMode,
       orbit: cameraState.orbit,
       freefly: cameraState.freefly,
+      representation,
       transitionDuration: null // auto-pace by default
     }));
     if (usesDefaultLabel) nextIndex++;
@@ -278,7 +333,7 @@ export function createKeyframeStore() {
     }
     if (!isExactKeyframeLabel(newLabel)) {
       throw new TypeError(
-        'Camera path keyframe label must be a trimmed non-empty string of at most 40 characters.'
+        'Camera path keyframe label must be a trimmed non-empty string.'
       );
     }
     keyframes[index] = createStoredKeyframe({
@@ -323,12 +378,11 @@ export function createKeyframeStore() {
       duration !== null &&
       (
         !Number.isFinite(duration) ||
-        duration < 0.1 ||
-        duration > MAX_TRANSITION_DURATION_SECONDS
+        duration < MIN_TRANSITION_DURATION_SECONDS
       )
     ) {
       throw new TypeError(
-        `Camera path duration must be null or a finite number from 0.1 through ${MAX_TRANSITION_DURATION_SECONDS} seconds.`
+        `Camera path duration must be null or a finite number of at least ${MIN_TRANSITION_DURATION_SECONDS} seconds.`
       );
     }
     keyframes[index] = createStoredKeyframe({
@@ -344,12 +398,11 @@ export function createKeyframeStore() {
       duration !== null &&
       (
         !Number.isFinite(duration) ||
-        duration < 0.1 ||
-        duration > MAX_TRANSITION_DURATION_SECONDS
+        duration < MIN_TRANSITION_DURATION_SECONDS
       )
     ) {
       throw new TypeError(
-        `Camera path duration must be null or a finite number from 0.1 through ${MAX_TRANSITION_DURATION_SECONDS} seconds.`
+        `Camera path duration must be null or a finite number of at least ${MIN_TRANSITION_DURATION_SECONDS} seconds.`
       );
     }
     for (let i = 0; i < keyframes.length; i++) {
@@ -409,7 +462,6 @@ export function createKeyframeStore() {
       keys[0] !== 'keyframes' ||
       keys[1] !== 'nextIndex' ||
       !Array.isArray(data.keyframes) ||
-      data.keyframes.length > MAX_KEYFRAMES ||
       !Number.isInteger(data.nextIndex) ||
       data.nextIndex <= 0
     ) {
@@ -446,7 +498,6 @@ export function createKeyframeStore() {
     exportAll,
     importAll,
     on,
-    off,
-    MAX_KEYFRAMES
+    off
   };
 }

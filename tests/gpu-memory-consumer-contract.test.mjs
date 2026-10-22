@@ -26,7 +26,11 @@ function createAnalyzer(gpuMemoryMB, pointCount = 20) {
     {
       gl,
       renderer: {
-        _positions: new Float32Array(pointCount * 3),
+        pointCount,
+        getViewPositionDimension(viewId) {
+          assert.equal(viewId, 'live');
+          return 3;
+        },
         getStats(viewId) {
           assert.equal(viewId, 'benchmark');
           return { gpuMemoryMB };
@@ -84,15 +88,17 @@ test('situation reporter distinguishes exact renderer memory from its pre-public
   assert.equal(exact.gpuMemoryMB, 321.5);
   assert.equal(exact.gpuMemoryEstimated, false);
 
-  const estimated = reporter._collectRendererSnapshot(null, {
-    dataset: { pointCount: 100 },
-    rendererStats: { gpuMemoryMB: Number.NaN },
-  });
-  assert.equal(
-    estimated.gpuMemoryMB,
-    100 * 28 / MEBIBYTE,
-  );
-  assert.equal(estimated.gpuMemoryEstimated, true);
+  // Before publication the estimate follows what the points renderer stores
+  // per cell: 4 bytes per position axis, 4 of RGBA colour and 1 of alpha —
+  // 13 B in 2D and 17 B in 3D, as measured; an unknown dimension counts as 3D.
+  for (const [dimension, bytesPerPoint] of [[2, 13], [3, 17], [null, 17]]) {
+    const estimated = reporter._collectRendererSnapshot(null, {
+      dataset: { pointCount: 100, dimension },
+      rendererStats: { gpuMemoryMB: Number.NaN },
+    });
+    assert.equal(estimated.gpuMemoryMB, 100 * bytesPerPoint / MEBIBYTE);
+    assert.equal(estimated.gpuMemoryEstimated, true);
+  }
 
   const unavailable = reporter._collectRendererSnapshot(null, {
     rendererStats: null,

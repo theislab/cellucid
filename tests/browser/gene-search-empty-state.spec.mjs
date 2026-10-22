@@ -1,6 +1,7 @@
 import { expect, test } from './helpers/test.mjs';
 import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
+import { openCollapsedPanels } from './helpers/panels.mjs';
 
 const PREPARED_DATASET_URL =
   `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}`
@@ -14,7 +15,7 @@ const GENE_PANEL_NOTE =
   + 'was prepared and possibly a subset of the source data. '
   + 'Check for typos too.';
 const HELP_URL =
-  'https://cellucid.readthedocs.io/en/latest/user_guide/web_app/'
+  'https://docs.cellucid.com/en/latest/user_guide/web_app/'
   + 'd_fields_coloring_legends/05_troubleshooting_fields_legends.html'
   + '#symptom-gene-search-returns-nothing-enter-selects-the-wrong-gene';
 
@@ -37,16 +38,13 @@ function observeProductErrors(page) {
 async function openGeneSearch(page) {
   await page.goto(PREPARED_DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
+  await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
     'Current UI prepared fixture'
   );
-  await expect(page.locator('#gene-expression-container')).toHaveClass(
-    /\bvisible\b/
-  );
+  await expect(page.locator('#gene-expression-container')).toBeVisible();
   await page.locator('#gene-expression-search').click();
-  await expect(page.locator('#gene-expression-dropdown')).toHaveClass(
-    /\bvisible\b/
-  );
+  await expect(page.locator('#gene-expression-dropdown')).toBeVisible();
 }
 
 test('a gene search with no match explains this dataset gene panel', async ({
@@ -204,5 +202,52 @@ test('the empty state reads in both themes', async ({ page }) => {
     }
   }
 
+  expect(productErrors).toEqual([]);
+});
+
+test('gene results and the colour palette menu work from the keyboard alone', async ({
+  page,
+}) => {
+  const productErrors = observeProductErrors(page);
+  await openGeneSearch(page);
+  const search = page.locator('#gene-expression-search');
+  const dropdown = page.locator('#gene-expression-dropdown');
+
+  await search.fill('C');
+  const options = dropdown.getByRole('option');
+  await expect(options.first()).toBeVisible();
+  const names = await options.allTextContents();
+  expect(names.length).toBeGreaterThan(1);
+  await expect(search).toHaveAttribute('role', 'combobox');
+  await expect(search).toHaveAttribute('aria-expanded', 'true');
+
+  await search.press('ArrowDown');
+  await search.press('ArrowDown');
+  const activeId = await search.getAttribute('aria-activedescendant');
+  await expect(page.locator(`[id="${activeId}"]`)).toHaveText(names[1]);
+  await expect(options.nth(1)).toHaveAttribute('aria-selected', 'true');
+  await search.press('Enter');
+  await expect(search).toHaveValue(names[1]);
+  await expect(search).toHaveAttribute('aria-expanded', 'false');
+
+  // The continuous legend's palette menu is a disclosure that Escape closes.
+  const palette = page.locator('.colorbar-gradient');
+  await expect(palette).toHaveAttribute('aria-expanded', 'false');
+  const before = await palette.getAttribute('aria-label');
+  await palette.focus();
+  await page.keyboard.press('Enter');
+  await expect(palette).toHaveAttribute('aria-expanded', 'true');
+  await page.keyboard.press('Escape');
+  await expect(palette).toHaveAttribute('aria-expanded', 'false');
+  await expect(palette).toBeFocused();
+
+  await page.keyboard.press('Enter');
+  const menu = page.locator(`[id="${await palette.getAttribute('aria-controls')}"]`);
+  const inactive = menu.locator('.colormap-option[aria-pressed="false"]').first();
+  await inactive.focus();
+  await page.keyboard.press('Enter');
+  const rebuilt = page.locator('.colorbar-gradient');
+  await expect(rebuilt).toBeFocused();
+  await expect(rebuilt).not.toHaveAttribute('aria-label', before);
   expect(productErrors).toEqual([]);
 });

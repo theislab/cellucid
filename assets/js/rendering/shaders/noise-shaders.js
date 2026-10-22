@@ -8,7 +8,7 @@
 // Vertex shader for fullscreen quad
 export const NOISE_VS = `#version 300 es
 precision highp float;
-in vec2 a_position;
+layout(location = 0) in vec2 a_position;
 out vec2 v_uv;
 void main() {
   v_uv = a_position * 0.5 + 0.5;

@@ -50,13 +50,24 @@ test('the smoke is reconstructed at the world positions the splat wrote', async 
       // A column of points along Z at one exact splat index: every voxel of
       // that column receives the full weight of one point, so the volume is
       // uniform in Z and the marched footprint is the reconstructed 2-D kernel.
-      const positions = new Float32Array(gridSize * 3);
+      //
+      // A lone column has no extent along X and Y, so the build would spread
+      // it into a soft slab (the treatment of 1D and 2D embeddings). Two
+      // anchor cells in opposite corners give the cloud full extent on every
+      // axis; they sit in rows 0 and gridSize - 1, outside the measured rows.
+      const positions = new Float32Array((gridSize + 2) * 3);
       for (let k = 0; k < gridSize; k++) {
         positions[k * 3] = worldX;
         positions[k * 3 + 1] = worldY;
         positions[k * 3 + 2] = indexToWorld(k, gridSize);
       }
-      const built = buildDensityTextureGPU(gl, positions, { gridSize, gamma: 1 });
+      positions.set([-1, -1, -1, 1, 1, 1], gridSize * 3);
+      const built = buildDensityTextureGPU(gl, positions, {
+        colors: new Uint8Array((gridSize + 2) * 4).fill(255),
+        dimension: 3,
+        gridSize,
+        gamma: 1,
+      });
       if (built === null) throw new Error('splat produced no volume');
       const frame = marchVolume(gl, {
         densityTexture: built.texture,
@@ -272,4 +283,104 @@ test('the smoke silhouette stays inside the support of the voxels written', asyn
     measurement.excessTexels,
     `silhouette reaches ${measurement.excessTexels} texels past the written support`,
   ).toBeLessThanOrEqual(0.25);
+});
+
+test('empty-space skipping through the occupancy volume loses no smoke', async ({
+  page,
+}) => {
+  await page.goto(HARNESS_URL);
+  const comparison = await page.evaluate(async ([probeUrl, densityUrl]) => {
+    const { marchVolume } = await import(probeUrl);
+    const {
+      buildDensityTextureGPU,
+      buildDerivedVolumesGPU,
+      disposeDensityPipelineResources,
+    } = await import(densityUrl);
+    const canvas = document.createElement('canvas');
+    const gl = canvas.getContext('webgl2');
+    if (!(gl instanceof WebGL2RenderingContext)) {
+      throw new Error('Smoke occupancy test requires WebGL2');
+    }
+    // Sparse, thin and faint structure: three dense clumps, a one-point-wide
+    // filament between two of them and isolated single cells, so most blocks
+    // are empty and the occupied ones include the faintest possible voxels.
+    const points = [];
+    let state = 12345;
+    const random = () => ((state = (state * 1103515245 + 12345) >>> 0) / 4294967296);
+    for (const [cx, cy, cz] of [[-0.6, -0.4, 0.1], [0.5, 0.45, -0.3], [0.2, -0.55, 0.5]]) {
+      for (let i = 0; i < 4000; i++) {
+        points.push(cx + (random() - 0.5) * 0.25, cy + (random() - 0.5) * 0.25, cz + (random() - 0.5) * 0.25);
+      }
+    }
+    for (let i = 0; i <= 200; i++) {
+      const f = i / 200;
+      points.push(-0.6 + 1.1 * f, -0.4 + 0.85 * f, 0.1 - 0.4 * f);
+    }
+    for (let i = 0; i < 40; i++) {
+      points.push(random() * 1.8 - 0.9, random() * 1.8 - 0.9, random() * 1.8 - 0.9);
+    }
+    const positions = new Float32Array(points);
+    const gridSize = 64;
+    const built = buildDensityTextureGPU(gl, positions, {
+      colors: new Uint8Array((positions.length / 3) * 4).fill(255),
+      dimension: 3,
+      gridSize,
+      gamma: 0.7,
+    });
+    const derived = buildDerivedVolumesGPU(gl, built.texture, {
+      gridSize,
+      lightDir: [0.5, 0.7, 0.5],
+    });
+    const options = {
+      densityTexture: built.texture,
+      gridSize,
+      size: 256,
+      half: 1.05,
+      densityMultiplier: 1,
+      stepMultiplier: 1.5,
+    };
+    const full = marchVolume(gl, options);
+    const skipped = marchVolume(gl, { ...options, occupancyTexture: derived.occupancyTexture });
+    let paintedFull = 0;
+    let lost = 0;
+    let gained = 0;
+    let maxDifference = 0;
+    let sumDifference = 0;
+    for (let y = 0; y < full.size; y++) {
+      for (let x = 0; x < full.size; x++) {
+        const a = full.alphaAt(x, y);
+        const b = skipped.alphaAt(x, y);
+        if (a > 0) paintedFull++;
+        if (a > 2 && b === 0) lost++;
+        if (b > 2 && a === 0) gained++;
+        maxDifference = Math.max(maxDifference, Math.abs(a - b));
+        sumDifference += Math.abs(a - b);
+      }
+    }
+    gl.deleteTexture(built.texture);
+    gl.deleteTexture(derived.lightTexture);
+    gl.deleteTexture(derived.occupancyTexture);
+    disposeDensityPipelineResources(gl);
+    return {
+      paintedFull,
+      lost,
+      gained,
+      maxDifference,
+      meanDifference: sumDifference / (full.size * full.size),
+      occupancyGridSize: derived.occupancyGridSize,
+      lightGridSize: derived.lightGridSize,
+      error: gl.getError(),
+    };
+  }, [PROBE, DENSITY]);
+
+  expect(comparison.error).toBe(0);
+  expect(comparison.occupancyGridSize).toBe(16);
+  expect(comparison.lightGridSize).toBe(32);
+  expect(comparison.paintedFull).toBeGreaterThan(2000);
+  // No pixel the full march paints is dropped by the skip, none is invented,
+  // and the rest differ only by the sample phase a leap re-aligns.
+  expect(comparison.lost).toBe(0);
+  expect(comparison.gained).toBe(0);
+  expect(comparison.meanDifference).toBeLessThan(0.5);
+  expect(comparison.maxDifference).toBeLessThanOrEqual(24);
 });

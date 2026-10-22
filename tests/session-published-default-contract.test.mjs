@@ -24,6 +24,10 @@ import {
 import {
   createSessionRestoreTransaction,
 } from '../assets/js/app/session/session-context.js';
+import {
+  createInMemoryDimensionManager,
+} from '../assets/js/data/dimension-manager.js';
+import { untilEntered } from './helpers/entered.mjs';
 
 const PUBLISHED_PROFILE = Object.freeze([
   Object.freeze({
@@ -73,6 +77,38 @@ const PUBLISHED_PROFILE = Object.freeze([
   }),
 ]);
 
+/**
+ * The export data mapping of a dataset whose one embedding is an in-memory 3D
+ * layout (keyed "3d").
+ */
+const IN_MEMORY_3D_MAPPING = Object.freeze({
+  kind: 'export',
+  embeddings: {
+    enabled: [{ key: '3d', columns: null }],
+    defaults: { '1d': null, '2d': null, '3d': { key: '3d', columns: null } },
+  },
+  geneNames: 'index',
+  vectorFields: [],
+});
+
+/**
+ * What a session fingerprint reads from a DataState besides its counts: the
+ * live positions, the dimension manager owning them as the live view's 3D
+ * layout, the live layout key and the dataset's data mapping.
+ */
+function fingerprintOwners(positionsArray) {
+  const dimensionManager = createInMemoryDimensionManager({
+    positions: positionsArray,
+    dimension: 3,
+  });
+  return {
+    positionsArray,
+    dimensionManager,
+    getDataMapping: () => IN_MEMORY_3D_MAPPING,
+    getViewLayoutKey: viewId => dimensionManager.getViewLayout(viewId),
+  };
+}
+
 function makeContributor(
   profile,
   restore = () => {},
@@ -97,7 +133,7 @@ function makeSerializer(contributors) {
       obsData: { fields: [] },
       pointCount: 3,
       getViewDimensionLevel: () => 3,
-      positionsArray: new Float32Array(9),
+      ...fingerprintOwners(new Float32Array(9)),
       varData: { fields: [] },
     },
     viewer: {},
@@ -167,7 +203,7 @@ function createOverlayState(initialPayload) {
     obsData: { fields: [] },
     pointCount: 3,
     getViewDimensionLevel: () => 3,
-    positionsArray: new Float32Array(9),
+    ...fingerprintOwners(new Float32Array(9)),
     varData: { fields: [] },
     applyFieldOverlays() {
       applications += 1;
@@ -235,9 +271,47 @@ function cameraState(radius) {
   };
 }
 
-function createCoreHarness(t) {
+/** The 3D embedding every harness view starts on. */
+const OPENING_EMBEDDING = Object.freeze({ key: '3d', columns: null });
+
+/**
+ * The dimension of one embedding reference: its column count, or the "<d>d"
+ * suffix of an export embedding id.
+ */
+function embeddingDimension(ref) {
+  if (ref.columns !== null) return ref.columns.length;
+  const match = /([123])d$/.exec(ref.key);
+  if (match === null) throw new RangeError(`No dimension for "${ref.key}".`);
+  return Number(match[1]);
+}
+
+/** The layout key a harness view publishes for one embedding reference. */
+function embeddingLayoutKey(ref) {
+  return ref.columns === null ? ref.key : `${ref.key}[${ref.columns.join(',')}]`;
+}
+
+/**
+ * A core-state owner over a live view and, with `allowSnapshots`, kept
+ * snapshot views. Each view shows one representation, named by an embedding
+ * reference; its dimension is the reference's, and its layout key is the
+ * export id or "<key>[<columns>]".
+ */
+function createCoreHarness(t, {
+  allowSnapshots = false,
+  liveEmbedding = OPENING_EMBEDDING,
+  snapshotLabels = [],
+} = {}) {
   const previousDocument = globalThis.document;
-  let dimension = 3;
+  let embedding = structuredClone(liveEmbedding);
+  let followsDefault = true;
+  const embeddingRequests = [];
+  const pendingSnapshotLabels = [...snapshotLabels];
+  // Snapshot view id -> the embedding it was kept with.
+  const snapshotLayouts = new Map();
+  // Layout key -> the embedding reference it plots.
+  const layouts = new Map([[embeddingLayoutKey(embedding), structuredClone(embedding)]]);
+  const dimension = () => embeddingDimension(embedding);
+  let snapshotCounter = 0;
   let viewerSnapshots = [];
   let visibilityGeneration = 0;
   const renderModeEvents = [];
@@ -251,7 +325,7 @@ function createCoreHarness(t) {
     },
     dispatchEvent(event) {
       renderModeEvents.push({
-        dimension,
+        dimension: dimension(),
         snapshotCount: viewerSnapshots.length,
         type: event.type,
         value: this.value,
@@ -261,10 +335,6 @@ function createCoreHarness(t) {
     },
   };
   const controls = new Map([
-    ['dimension-select', {
-      options: ['1', '2', '3'].map(value => ({ value })),
-      value: '3',
-    }],
     ['render-mode', renderModeControl],
     ['categorical-field', { value: '-1' }],
     ['continuous-field', { value: '-1' }],
@@ -291,12 +361,43 @@ function createCoreHarness(t) {
 
   let activeViewId = 'live';
   let abortOnTargetDimension = null;
+  const viewEmbedding = viewId => {
+    if (viewId === 'live') return embedding;
+    const kept = snapshotLayouts.get(viewId);
+    if (kept === undefined) throw new RangeError(`No view "${viewId}".`);
+    return kept;
+  };
+  const layoutKeyOf = viewId => embeddingLayoutKey(viewEmbedding(viewId));
+  const showLiveEmbedding = (viewId, ref, follows) => {
+    assert.equal(viewId, 'live');
+    embedding = structuredClone(ref);
+    followsDefault = follows;
+    layouts.set(embeddingLayoutKey(embedding), structuredClone(embedding));
+    if (
+      embeddingDimension(embedding) === 2
+      && abortOnTargetDimension !== null
+    ) {
+      const abort = abortOnTargetDimension;
+      abortOnTargetDimension = null;
+      abort();
+    }
+  };
+  const requireSnapshots = () => {
+    if (!allowSnapshots) {
+      throw new Error('No snapshot state publication is expected.');
+    }
+  };
   const dimensionManager = {
-    copyViewDimension() {
-      throw new Error('No snapshot dimension copy is expected.');
+    copyViewLayout(sourceViewId, targetViewId) {
+      requireSnapshots();
+      assert.equal(sourceViewId, 'live');
+      snapshotLayouts.set(targetViewId, structuredClone(embedding));
     },
-    getViewDimension() {
-      return dimension;
+    getViewDimension(viewId = 'live') {
+      return embeddingDimension(viewEmbedding(viewId));
+    },
+    getViewLayout(viewId = 'live') {
+      return layoutKeyOf(viewId);
     },
   };
   const state = {
@@ -308,11 +409,11 @@ function createCoreHarness(t) {
     activeFieldSource: null,
     viewContexts: new Map([['live', { id: 'live' }]]),
     applySnapshotConfigToView() {
-      throw new Error('No snapshot state publication is expected.');
+      requireSnapshots();
     },
     beginBatch() {},
     captureCurrentContext() {
-      return { dimensionLevel: dimension };
+      return { id: 'live' };
     },
     clearActiveField() {
       this.activeFieldIndex = -1;
@@ -321,8 +422,18 @@ function createCoreHarness(t) {
     },
     clearSnapshotViews() {},
     computeGlobalVisibility() {},
-    createViewFromSource() {
-      throw new Error('No snapshot state publication is expected.');
+    createViewFromSource(sourceViewId, viewId) {
+      requireSnapshots();
+      assert.equal(sourceViewId, 'live');
+      this.viewContexts.set(viewId, {
+        id: viewId,
+        followsDefault,
+        obsData: { fields: [] },
+        varData: { fields: [] },
+        activeFieldSource: null,
+        activeFieldIndex: -1,
+        activeVarFieldIndex: -1,
+      });
     },
     createViewFromActive() {},
     endBatch() {},
@@ -341,35 +452,60 @@ function createCoreHarness(t) {
       return this.obsData.fields;
     },
     getSnapshotPayload() {
-      throw new Error('No snapshot payload is expected.');
+      requireSnapshots();
+      return {
+        fieldKey: null,
+        fieldKind: null,
+        label: pendingSnapshotLabels.shift(),
+        dimensionLevel: dimension(),
+        filtersText: [],
+        colors: new Uint8Array(0),
+        transparency: new Float32Array(0),
+        centroidPositions: new Float32Array(0),
+        centroidColors: new Uint8Array(0),
+      };
     },
     getVarFields() {
       return this.varData.fields;
     },
-    getViewDimensionLevel() {
-      return dimension;
+    getViewDimensionLevel(viewId = 'live') {
+      return embeddingDimension(viewEmbedding(viewId));
+    },
+    getViewEmbeddingRef(viewId = 'live') {
+      return structuredClone(viewEmbedding(viewId));
+    },
+    getViewLayoutKey(viewId = 'live') {
+      return layoutKeyOf(viewId);
+    },
+    viewFollowsDefault(viewId) {
+      assert.equal(viewId, 'live');
+      return followsDefault;
     },
     restoreContext() {},
-    removeView() {},
+    removeView(viewId) {
+      this.viewContexts.delete(viewId);
+      snapshotLayouts.delete(viewId);
+    },
     setActiveView(viewId) {
       activeViewId = viewId;
       return viewId;
     },
-    async setDimensionLevel(nextDimension) {
-      dimension = nextDimension;
-      if (
-        nextDimension === 2
-        && abortOnTargetDimension !== null
-      ) {
-        const abort = abortOnTargetDimension;
-        abortOnTargetDimension = null;
-        abort();
-      }
+    async restoreViewEmbedding(viewId, ref) {
+      assert.deepEqual(Object.keys(ref).sort(), ['columns', 'key']);
+      embeddingRequests.push(structuredClone({ viewId, embedding: ref }));
+      showLiveEmbedding(viewId, ref, ref.key === OPENING_EMBEDDING.key);
+      return embeddingLayoutKey(ref);
+    },
+    async setViewRepresentation(viewId, layoutKey, options) {
+      assert.deepEqual(Object.keys(options), ['followsDefault']);
+      const ref = layouts.get(layoutKey);
+      if (ref === undefined) throw new RangeError(`No layout "${layoutKey}".`);
+      embeddingRequests.push(structuredClone({ viewId, embedding: ref }));
+      showLiveEmbedding(viewId, ref, options.followsDefault);
     },
     syncSnapshotContexts() {},
     updateFilterSummary() {},
     updateFilteredCount() {},
-    updateOutlierQuantiles() {},
     _notifyVisibilityChange() {
       visibilityGeneration += 1;
     },
@@ -389,8 +525,17 @@ function createCoreHarness(t) {
     clearSnapshotViews() {
       viewerSnapshots = [];
     },
-    createSnapshotView() {
-      throw new Error('No snapshot view is expected.');
+    createSnapshotView(config) {
+      requireSnapshots();
+      snapshotCounter += 1;
+      const created = { id: `snap_${snapshotCounter}`, label: config.label };
+      viewerSnapshots.push({
+        ...created,
+        fieldKey: config.fieldKey ?? null,
+        fieldKind: config.fieldKind ?? null,
+        meta: structuredClone(config.meta ?? { filtersText: [] }),
+      });
+      return { ...created };
     },
     getCameraState() {
       return structuredClone(camera);
@@ -401,11 +546,17 @@ function createCoreHarness(t) {
     getSnapshotViews() {
       return [...viewerSnapshots];
     },
+    getSmokeSupport() {
+      return { supported: true, reason: null, message: null, detail: null };
+    },
     getViewCameraState() {
       return structuredClone(camera);
     },
-    getViewDimension() {
-      return dimension;
+    getViewDimension(viewId = 'live') {
+      return embeddingDimension(viewEmbedding(viewId));
+    },
+    getViewLayoutKey(viewId = 'live') {
+      return layoutKeyOf(viewId);
     },
     getViewLayout() {
       return { ...layout };
@@ -453,7 +604,22 @@ function createCoreHarness(t) {
         viewer,
       };
     },
-    dimension: () => dimension,
+    dimension,
+    embedding: () => embedding,
+    embeddingRequests: () => structuredClone(embeddingRequests),
+    keepLiveView(label) {
+      // What "Keep view" leaves behind: a viewer snapshot and a state context
+      // copied from the live view, showing the live view's layout.
+      const created = this.viewer.createSnapshotView({ label });
+      this.state.createViewFromSource('live', created.id);
+      dimensionManager.copyViewLayout('live', created.id);
+      return created.id;
+    },
+    snapshotLayout: viewId => structuredClone(snapshotLayouts.get(viewId)),
+    async showLive(ref) {
+      await state.restoreViewEmbedding('live', ref);
+      embeddingRequests.length = 0;
+    },
     renderMode: () => renderModeControl.value,
     renderModeEvents: () => structuredClone(renderModeEvents),
     seedViewerSnapshot() {
@@ -654,80 +820,38 @@ test('published defaults accept only the exact ordered five-chunk static profile
   }
 });
 
-test('published defaults reject oversize blobs before bundle or contributor work', async () => {
-  const restored = [];
-  const serializer = makeSerializer(makeProfileContributors(
-    (_ctx, meta) => restored.push(meta.id),
-  ));
-  const oversize = new Blob([new Uint8Array((32 * 1024) + 1)]);
-
-  await assert.rejects(
-    serializer.restorePublishedDefaultState(oversize, {
-      refreshUi() {},
-      signal: new AbortController().signal,
-    }),
-    /32 KiB|32 kib|byte limit/i,
-  );
-  assert.deepEqual(restored, []);
-});
-
-test('published defaults bound every chunk and aggregate raw bytes before dispatch', async () => {
-  const exactAggregateSizes = [
-    13_108,
-    13_107,
-    13_107,
-    13_107,
-    13_107,
+test('a published default has no size limit; each chunk is held to its declared size', async () => {
+  // Far above the former 32 KiB transport and 64 KiB uncompressed caps.
+  const largeSizes = [
+    256 * 1024,
+    11,
+    11,
+    11,
+    11,
   ];
-  assert.equal(
-    exactAggregateSizes.reduce((sum, value) => sum + value, 0),
-    64 * 1024,
-  );
-  const exactBoundaryBundle = await createSizedPublishedBundle(
-    exactAggregateSizes,
-  );
-  assert.ok(exactBoundaryBundle.size <= 32 * 1024);
+  const largeBundle = await createSizedPublishedBundle(largeSizes);
   const restored = [];
   const serializer = makeSerializer(makeProfileContributors(
     (_ctx, meta) => restored.push(meta.id),
   ));
 
   await withNotificationHarness(async () => {
-    await serializer.restorePublishedDefaultState(exactBoundaryBundle, {
+    await serializer.restorePublishedDefaultState(largeBundle, {
       refreshUi() {},
       signal: new AbortController().signal,
     });
   });
   assert.deepEqual(restored, PUBLISHED_PROFILE.map(entry => entry.id));
 
+  // A chunk whose declared size is not a size is still refused before any
+  // contributor runs.
   restored.length = 0;
-  const aggregateBomb = await createSizedPublishedBundle([
-    ...exactAggregateSizes.slice(0, -1),
-    exactAggregateSizes.at(-1) + 1,
-  ]);
-  assert.ok(aggregateBomb.size <= 32 * 1024);
-  await withNotificationHarness(async () => {
-    await assert.rejects(
-      serializer.restorePublishedDefaultState(aggregateBomb, {
-        refreshUi() {},
-        signal: new AbortController().signal,
-      }),
-      /64 KiB aggregate uncompressed byte limit/i,
-    );
+  const notASize = await rewriteBundle(largeBundle, manifest => {
+    manifest.chunks[0].uncompressedBytes = -1;
   });
-  assert.deepEqual(restored, []);
-
-  const perChunkBomb = await createSizedPublishedBundle([
-    (64 * 1024) + 1,
-    11,
-    11,
-    11,
-    11,
-  ]);
-  assert.ok(perChunkBomb.size <= 32 * 1024);
   await withNotificationHarness(async () => {
     await assert.rejects(
-      serializer.restorePublishedDefaultState(perChunkBomb, {
+      serializer.restorePublishedDefaultState(notASize, {
         refreshUi() {},
         signal: new AbortController().signal,
       }),
@@ -785,7 +909,11 @@ test('published defaults stop a gzip stream that expands beyond its bounded decl
         refreshUi() {},
         signal: new AbortController().signal,
       }),
-      /Decompressed data exceeds limit/i,
+      // The honest trailer already disagrees with the declaration, so the
+      // envelope check refuses the chunk before anything is inflated; a forged
+      // trailer is stopped by the bounded native read instead
+      // (tests/session-gzip-codec.test.mjs).
+      /Gzip ISIZE 131072 does not match the exact 65492-byte contract/,
     );
   });
   assert.deepEqual(restored, []);
@@ -836,7 +964,7 @@ test('published restore stays pending until deferred async rollback settles', as
       },
     );
 
-    await rollbackStarted;
+    await untilEntered(rollbackStarted, restore, 'the deferred rollback');
     await Promise.resolve();
     assert.equal(
       settled,
@@ -947,7 +1075,7 @@ test('real field overlays roll back on late failure, abort, commit, and UI refre
         signal: controller.signal,
       });
       const rejected = assert.rejects(restore, { name: 'AbortError' });
-      await entered;
+      await untilEntered(entered, restore, 'the contributor restore');
       controller.abort();
       await rejected;
     }, 1);
@@ -1002,7 +1130,12 @@ test('real field overlays roll back on late failure, abort, commit, and UI refre
   });
 });
 
-test('real core state rolls back exact dimension and camera after commit failure or abort', async t => {
+// The live view starts on a 3D selection of an obsm array; the restored
+// session shows other columns of another array in 2D.
+const STARTING_EMBEDDING = Object.freeze({ key: 'X_diffmap', columns: Object.freeze([0, 1, 2]) });
+const TARGET_EMBEDDING = Object.freeze({ key: 'X_pca', columns: Object.freeze([3, 1]) });
+
+test('real core state rolls back exact representation and camera after commit failure or abort', async t => {
   async function targetPayload(harness) {
     const [chunk] = captureCoreState({
       sidebar: harness.sidebar,
@@ -1010,15 +1143,16 @@ test('real core state rolls back exact dimension and camera after commit failure
       viewer: harness.viewer,
     });
     const payload = structuredClone(chunk.payload);
+    assert.deepEqual(payload.liveEmbedding, STARTING_EMBEDDING);
     const targetCamera = cameraState(9);
     payload.camera = targetCamera;
-    payload.liveDimensionLevel = 2;
+    payload.liveEmbedding = structuredClone(TARGET_EMBEDDING);
     payload.multiview.liveCameraState = structuredClone(targetCamera);
     return payload;
   }
 
   await t.test('late commit failure', async t => {
-    const harness = createCoreHarness(t);
+    const harness = createCoreHarness(t, { liveEmbedding: STARTING_EMBEDDING });
     const transaction = createSessionRestoreTransaction();
     await restoreCoreState(
       harness.context(transaction, new AbortController().signal),
@@ -1026,6 +1160,7 @@ test('real core state rolls back exact dimension and camera after commit failure
       await targetPayload(harness),
     );
     assert.equal(harness.dimension(), 2);
+    assert.deepEqual(harness.embedding(), TARGET_EMBEDDING);
     assert.equal(harness.cameraRadius(), 9);
     transaction.register('test/core-late-commit', {
       value: null,
@@ -1040,11 +1175,12 @@ test('real core state rolls back exact dimension and camera after commit failure
       /core late commit failure/i,
     );
     assert.equal(harness.dimension(), 3);
+    assert.deepEqual(harness.embedding(), STARTING_EMBEDDING);
     assert.equal(harness.cameraRadius(), 3);
   });
 
   await t.test('abort during core application', async t => {
-    const harness = createCoreHarness(t);
+    const harness = createCoreHarness(t, { liveEmbedding: STARTING_EMBEDDING });
     const transaction = createSessionRestoreTransaction();
     const controller = new AbortController();
     harness.abortWhenApplyingTarget(() => controller.abort());
@@ -1058,8 +1194,172 @@ test('real core state rolls back exact dimension and camera after commit failure
     );
     await transaction.rollback();
     assert.equal(harness.dimension(), 3);
+    assert.deepEqual(harness.embedding(), STARTING_EMBEDDING);
     assert.equal(harness.cameraRadius(), 3);
   });
+});
+
+test('core state carries the live embedding through capture and restore', async t => {
+  for (const shown of [
+    { key: '2d', columns: null },
+    { key: 'X_tsne_2d', columns: null },
+    { key: 'X_pca', columns: [3, 1] },
+  ]) {
+    const source = createCoreHarness(t);
+    await source.showLive(shown);
+    const [chunk] = captureCoreState({
+      sidebar: source.sidebar,
+      state: source.state,
+      viewer: source.viewer,
+    });
+    // One reference names what the view shows; its dimension is not stored.
+    assert.equal(Object.hasOwn(chunk.payload, 'liveDimensionLevel'), false);
+    assert.deepEqual(chunk.payload.liveEmbedding, shown);
+    // A plain JSON copy, never the state's own record.
+    assert.notStrictEqual(chunk.payload.liveEmbedding, source.embedding());
+    assert.equal(Object.isFrozen(chunk.payload.liveEmbedding), false);
+    const payload = JSON.parse(JSON.stringify(chunk.payload));
+
+    const destination = createCoreHarness(t, { liveEmbedding: STARTING_EMBEDDING });
+    await restoreCoreState(
+      destination.context(null, new AbortController().signal),
+      { id: 'core/state' },
+      payload,
+    );
+    assert.equal(destination.dimension(), 2);
+    assert.deepEqual(destination.embedding(), shown);
+    // The live view is set as one transaction from the saved reference.
+    assert.deepEqual(destination.embeddingRequests()[0], {
+      viewId: 'live',
+      embedding: shown,
+    });
+  }
+});
+
+test('core state refuses a malformed live embedding before changing any view', async t => {
+  const source = createCoreHarness(t);
+  const [chunk] = captureCoreState({
+    sidebar: source.sidebar,
+    state: source.state,
+    viewer: source.viewer,
+  });
+  for (const malformed of [
+    undefined,
+    null,
+    { key: 'X_pca' },
+    { key: 'X_pca', columns: [1, 1] },
+    { key: 'X_pca', columns: [0, 1, 2, 3] },
+    { key: '', columns: null },
+    { key: 'X_pca', columns: [0, 1], dimension: 2 },
+  ]) {
+    const payload = structuredClone(chunk.payload);
+    if (malformed === undefined) delete payload.liveEmbedding;
+    else payload.liveEmbedding = malformed;
+    const destination = createCoreHarness(t, { liveEmbedding: STARTING_EMBEDDING });
+    await assert.rejects(
+      restoreCoreState(
+        destination.context(null, new AbortController().signal),
+        { id: 'core/state' },
+        payload,
+      ),
+      /exact keys|liveEmbedding|representation/i,
+    );
+    assert.equal(destination.dimension(), 3);
+    assert.deepEqual(destination.embedding(), STARTING_EMBEDDING);
+    assert.deepEqual(destination.embeddingRequests(), []);
+  }
+  // The retired pair of fields is refused, not read.
+  const retired = structuredClone(chunk.payload);
+  delete retired.liveEmbedding;
+  retired.liveDimensionLevel = 2;
+  retired.liveEmbeddingOverride = null;
+  const destination = createCoreHarness(t, { liveEmbedding: STARTING_EMBEDDING });
+  await assert.rejects(
+    restoreCoreState(
+      destination.context(null, new AbortController().signal),
+      { id: 'core/state' },
+      retired,
+    ),
+    /exact keys|liveEmbedding/i,
+  );
+  assert.deepEqual(destination.embeddingRequests(), []);
+});
+
+test('multiview snapshots carry their embedding through capture and replay', async t => {
+  const SNAPSHOT_EMBEDDING = { key: 'X_pca', columns: [3, 1] };
+  const LIVE_EMBEDDING = { key: 'X_diffmap', columns: [0, 1, 2] };
+  const source = createCoreHarness(t, { allowSnapshots: true });
+  // Keep a 2D view of PCA components 3 and 1, then move the live view on.
+  await source.showLive(SNAPSHOT_EMBEDDING);
+  const keptId = source.keepLiveView('PCA 3 vs 1');
+  await source.showLive(LIVE_EMBEDDING);
+  assert.deepEqual(source.snapshotLayout(keptId), SNAPSHOT_EMBEDDING);
+
+  const [chunk] = captureCoreState({
+    sidebar: source.sidebar,
+    state: source.state,
+    viewer: source.viewer,
+  });
+  const payload = JSON.parse(JSON.stringify(chunk.payload));
+  assert.deepEqual(payload.liveEmbedding, LIVE_EMBEDDING);
+  assert.equal(payload.multiview.snapshots.length, 1);
+  const [snapshot] = payload.multiview.snapshots;
+  assert.equal(Object.hasOwn(snapshot, 'dimensionLevel'), false);
+  assert.deepEqual(snapshot.embedding, SNAPSHOT_EMBEDDING);
+
+  const destination = createCoreHarness(t, {
+    allowSnapshots: true,
+    snapshotLabels: [snapshot.label],
+  });
+  await restoreCoreState(
+    destination.context(null, new AbortController().signal),
+    { id: 'core/state' },
+    payload,
+  );
+  // The kept view shows the saved embedding again, and the live view ends on
+  // its own.
+  assert.equal(destination.snapshotCount(), 1);
+  assert.deepEqual(destination.snapshotLayout('snap_1'), SNAPSHOT_EMBEDDING);
+  assert.equal(destination.viewer.getViewLayoutKey('snap_1'), 'X_pca[3,1]');
+  assert.equal(destination.dimension(), 3);
+  assert.deepEqual(destination.embedding(), LIVE_EMBEDDING);
+  assert.deepEqual(destination.embeddingRequests(), [
+    // core state: the live view.
+    { viewId: 'live', embedding: LIVE_EMBEDDING },
+    // multiview replay: back to the live base, then the snapshot's embedding.
+    { viewId: 'live', embedding: LIVE_EMBEDDING },
+    { viewId: 'live', embedding: SNAPSHOT_EMBEDDING },
+    // and the live base once the graph is rebuilt.
+    { viewId: 'live', embedding: LIVE_EMBEDDING },
+  ]);
+
+  // A snapshot without its embedding, with a malformed one, or with the
+  // retired dimension and override fields, is refused before any view is
+  // cleared or changed.
+  for (const mutate of [
+    entry => { delete entry.embedding; },
+    entry => { entry.embedding = { key: 'X_pca', columns: [3, 3] }; },
+    entry => {
+      delete entry.embedding;
+      entry.dimensionLevel = 2;
+      entry.embeddingOverride = SNAPSHOT_EMBEDDING;
+    },
+  ]) {
+    const malformed = structuredClone(payload);
+    mutate(malformed.multiview.snapshots[0]);
+    const refused = createCoreHarness(t, { allowSnapshots: true });
+    refused.keepLiveView('Existing');
+    await assert.rejects(
+      restoreCoreState(
+        refused.context(null, new AbortController().signal),
+        { id: 'core/state' },
+        malformed,
+      ),
+      /exact keys|representation/i,
+    );
+    assert.equal(refused.snapshotCount(), 1);
+    assert.deepEqual(refused.embeddingRequests(), []);
+  }
 });
 
 test('real core state replays in neutral points mode before publishing saved smoke', async t => {
@@ -1070,7 +1370,7 @@ test('real core state replays in neutral points mode before publishing saved smo
       viewer: harness.viewer,
     });
     const payload = structuredClone(chunk.payload);
-    payload.liveDimensionLevel = 2;
+    payload.liveEmbedding = { key: '2d', columns: null };
     return payload;
   }
 
@@ -1197,7 +1497,7 @@ test('published defaults forward caller aborts into contributor restore', async 
       signal: callerAbort.signal,
     });
     const rejected = assert.rejects(restore, { name: 'AbortError' });
-    await entered;
+    await untilEntered(entered, restore, 'the contributor restore');
     callerAbort.abort();
     await rejected;
   });
@@ -1236,7 +1536,7 @@ test('published notification cancel reports one exact canceled outcome without f
         && isSessionRestoreCanceledError(error)
       ),
     );
-    await entered;
+    await untilEntered(entered, restore, 'the contributor restore');
     controls.cancel('published-default-1');
     await rejected;
     assert.deepEqual(

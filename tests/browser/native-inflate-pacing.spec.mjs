@@ -1,0 +1,200 @@
+/**
+ * Every native inflate in the data layer is paced by its reader.
+ *
+ * A DEFLATE bomb must be cancelled after a few input slices, not after the
+ * native decoder has expanded the whole payload. Pacing is a property of the
+ * browser's `DecompressionStream` and its backpressure, so it is measured here,
+ * in each engine the application runs in: every case wraps the real native
+ * decompressor and counts the input bytes it was handed.
+ */
+
+import { deflateRawSync, deflateSync, gzipSync } from 'node:zlib';
+
+import { expect, test } from './helpers/test.mjs';
+
+const BOMB_BYTES = 60 * 1024 * 1024;
+const NOISE_BYTES = 32 * 1024 * 1024;
+
+// Level 1 keeps the bombs long enough to span many input slices.
+function payloads() {
+  const zeros = new Uint8Array(BOMB_BYTES);
+  const noise = new Uint8Array(NOISE_BYTES);
+  for (let index = 0; index < noise.byteLength; index += 1) {
+    noise[index] = (index * 2654435761) >>> 24;
+  }
+  const encode = bytes => Buffer.from(bytes).toString('base64');
+  return {
+    gzipBomb: encode(gzipSync(zeros, { level: 1 })),
+    zlibBomb: encode(deflateSync(zeros, { level: 1 })),
+    rawBomb: encode(deflateRawSync(zeros, { level: 1 })),
+    honest: encode(gzipSync(noise, { level: 1 })),
+    noiseBytes: NOISE_BYTES,
+  };
+}
+
+test('native inflate stops a DEFLATE bomb within a few input slices', async ({
+  page,
+}) => {
+  await page.goto('/tests/browser/fixtures/exports/datasets.json');
+  const results = await page.evaluate(async input => {
+    const {
+      gzipDecompress,
+      NATIVE_INFLATE_INPUT_SLICE_BYTES: SLICE,
+    } = await import('/assets/js/app/session/codecs/gzip.js');
+    const { decodeZarrChunk, getZarrDtypeInfo } = await import(
+      '/assets/js/data/zarr-codecs.js'
+    );
+    const { readZarrZipArchive } = await import('/assets/js/data/zarr-archive.js');
+
+    const decode = base64 => Uint8Array.from(atob(base64), char => char.charCodeAt(0));
+    const writeUint16 = (bytes, offset, value) => {
+      bytes[offset] = value & 0xff;
+      bytes[offset + 1] = (value >>> 8) & 0xff;
+    };
+    const writeUint32 = (bytes, offset, value) => {
+      writeUint16(bytes, offset, value & 0xffff);
+      writeUint16(bytes, offset + 2, value >>> 16);
+    };
+    // One-entry DEFLATE ZIP whose directory under-declares the entry size.
+    const deflateBombZip = (name, compressed, declaredSize) => {
+      const nameBytes = new TextEncoder().encode(name);
+      const local = new Uint8Array(30 + nameBytes.byteLength);
+      writeUint32(local, 0, 0x04034b50);
+      writeUint16(local, 4, 20);
+      writeUint16(local, 6, 0x0800);
+      writeUint16(local, 8, 8);
+      writeUint32(local, 18, compressed.byteLength);
+      writeUint32(local, 22, declaredSize);
+      writeUint16(local, 26, nameBytes.byteLength);
+      local.set(nameBytes, 30);
+      const central = new Uint8Array(46 + nameBytes.byteLength);
+      writeUint32(central, 0, 0x02014b50);
+      writeUint16(central, 4, 0x0314);
+      writeUint16(central, 6, 20);
+      writeUint16(central, 8, 0x0800);
+      writeUint16(central, 10, 8);
+      writeUint32(central, 20, compressed.byteLength);
+      writeUint32(central, 24, declaredSize);
+      writeUint16(central, 28, nameBytes.byteLength);
+      central.set(nameBytes, 46);
+      const eocd = new Uint8Array(22);
+      writeUint32(eocd, 0, 0x06054b50);
+      writeUint16(eocd, 8, 1);
+      writeUint16(eocd, 10, 1);
+      writeUint32(eocd, 12, central.byteLength);
+      writeUint32(eocd, 16, local.byteLength + compressed.byteLength);
+      return new Uint8Array(
+        [local, compressed, central, eocd].flatMap(part => [...part]),
+      );
+    };
+
+    // Run `operation` with the native decompressor wrapped so its input (and
+    // output) are counted; `onInput` may react to the running total.
+    const measure = async (operation, onInput = () => {}) => {
+      const Native = globalThis.DecompressionStream;
+      const counts = { input: 0, output: 0, error: null };
+      globalThis.DecompressionStream = class CountingDecompressionStream {
+        constructor(format) {
+          const native = new Native(format);
+          const inputCounter = new TransformStream({
+            transform(chunk, controller) {
+              counts.input += chunk.byteLength;
+              onInput(counts.input);
+              controller.enqueue(chunk);
+            },
+          });
+          inputCounter.readable.pipeTo(native.writable).catch(() => {});
+          const outputCounter = new TransformStream({
+            transform(chunk, controller) {
+              counts.output += chunk.byteLength;
+              controller.enqueue(chunk);
+            },
+          });
+          return {
+            writable: inputCounter.writable,
+            readable: native.readable.pipeThrough(outputCounter),
+          };
+        }
+      };
+      try {
+        await operation();
+      } catch (error) {
+        counts.error = `${error.name}: ${error.message}`;
+      } finally {
+        globalThis.DecompressionStream = Native;
+      }
+      return counts;
+    };
+
+    const out = { slice: SLICE };
+
+    // gzip with a forged ISIZE that matches the small limit, so only pacing
+    // can stop it.
+    const gzipBomb = decode(input.gzipBomb);
+    const maxOutputBytes = 1024 * 1024;
+    new DataView(gzipBomb.buffer).setUint32(
+      gzipBomb.byteLength - 4,
+      maxOutputBytes,
+      true,
+    );
+    out.gzip = await measure(() => gzipDecompress(gzipBomb, {
+      maxOutputBytes,
+      signal: null,
+    }));
+    out.gzip.compressed = gzipBomb.byteLength;
+
+    for (const [id, encoded] of [['gzip', input.gzipBomb], ['zlib', input.zlibBomb]]) {
+      const chunk = decode(encoded);
+      out[`zarr-${id}`] = await measure(() => decodeZarrChunk(
+        chunk,
+        { compressor: { id, level: 1 }, filters: null },
+        getZarrDtypeInfo('|u1'),
+        1024,
+      ));
+      out[`zarr-${id}`].compressed = chunk.byteLength;
+    }
+
+    const rawBomb = decode(input.rawBomb);
+    const { files } = await readZarrZipArchive(
+      deflateBombZip('bomb.zarr/.zgroup', rawBomb, 64),
+    );
+    out.zip = await measure(() => files.get('.zgroup').arrayBuffer());
+    out.zip.compressed = rawBomb.byteLength;
+
+    // Abort while inflating an honest payload: the source stops early.
+    const honest = decode(input.honest);
+    const controller = new AbortController();
+    out.abort = await measure(
+      () => gzipDecompress(honest, {
+        maxOutputBytes: input.noiseBytes,
+        signal: controller.signal,
+      }),
+      written => {
+        if (written > 4 * SLICE) controller.abort();
+      },
+    );
+    out.abort.compressed = honest.byteLength;
+    return out;
+  }, payloads());
+
+  const pacedInputLimit = 4 * results.slice;
+  for (const id of ['gzip', 'zarr-gzip', 'zarr-zlib', 'zip']) {
+    const result = results[id];
+    expect(result.compressed, `${id} bomb spans many slices`)
+      .toBeGreaterThan(8 * results.slice);
+    expect(result.error, `${id} bomb is rejected`).not.toBeNull();
+    expect(
+      result.input,
+      `${id} inflate consumed ${result.input} of ${result.compressed} input bytes`,
+    ).toBeLessThanOrEqual(pacedInputLimit);
+  }
+  expect(results.gzip.error).toMatch(/Decompressed data exceeds limit/);
+  expect(results['zarr-gzip'].error).toMatch(/exceeds its 1024-byte declared size/);
+  expect(results.zip.error).toMatch(/decompressed beyond its declared size/);
+
+  expect(results.abort.error).toMatch(/^AbortError/);
+  expect(
+    results.abort.input,
+    `abort must stop inflation early, wrote ${results.abort.input} of ${results.abort.compressed}`,
+  ).toBeLessThan(results.abort.compressed / 2);
+});

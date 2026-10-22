@@ -12,7 +12,6 @@
  * Subclasses must implement:
  * - static getRequirements() - Return { minPages, maxPages, description }
  * - _getTitle() - Return analysis title
- * - _getDescription() - Return analysis description
  * - _renderFormControls(wrapper) - Render form inputs into wrapper
  * - _getFormValues() - Extract form values as object
  * - _runAnalysisImpl(formValues) - Execute analysis, return result object
@@ -33,15 +32,8 @@
  */
 
 import { BaseAnalysisUI } from '../../base-analysis-ui.js';
-import {
-  createFormButton,
-  createNotice
-} from '../../../shared/dom-utils.js';
-import {
-  runAnalysisWithLoadingState,
-  validatePageRequirements,
-  getRequirementText
-} from '../../../shared/analysis-utils.js';
+import { createButton, createStatusLine } from '../../../../ui/components/controls.js';
+import { runAnalysisWithLoadingState } from '../../../shared/analysis-utils.js';
 import {
   createAnalysisModal,
   openModal,
@@ -529,15 +521,6 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
   }
 
   /**
-   * Get the analysis description
-   * @abstract
-   * @returns {string}
-   */
-  _getDescription() {
-    throw new Error('_getDescription() must be implemented by subclass');
-  }
-
-  /**
    * Render form-specific controls into the wrapper
    * @abstract
    * @param {HTMLElement} wrapper - Form wrapper element to render into
@@ -632,7 +615,7 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
     }
     this._notifications.error(
       `Plot resize failed: ${error.message}`,
-      { category: 'analysis', title: 'Analysis Error' }
+      { category: 'analysis', title: 'Analysis error' }
     );
   }
 
@@ -757,7 +740,7 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
     });
     if (!this._isCurrentAnalysisRequest(requestId)) return null;
 
-    this._resultContainer.classList.remove('hidden');
+    this._resultContainer.hidden = false;
     const candidate = await slot.render(
       {
         render: async plotCandidate => {
@@ -872,7 +855,7 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
       }
       this._notifications.error(
         `Expanded view cleanup failed: ${error.message}`,
-        { category: 'analysis', title: 'Analysis Cleanup Error' }
+        { category: 'analysis', title: 'Analysis cleanup error' }
       );
     };
   }
@@ -898,7 +881,10 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
     modal = createAnalysisModal({
       beforeClose: () => this._destroyModalPlotOwner(modal),
       onClose: () => {
-        if (this._modal === modal) this._modal = null;
+        if (this._modal === modal) {
+          this._modal = null;
+          this._cancelChunkedTableRender();
+        }
       },
       onCloseError: this._createModalCloseErrorHandler(),
       onExportPNG: () => this._trackInteractiveTask(
@@ -919,6 +905,7 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
     try {
       for (const field of [
         '_annotationsContent',
+        '_body',
         '_optionsContent',
         '_plotContainer',
         '_statsContent',
@@ -934,7 +921,10 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
       openModal(modal);
 
       const rendered = await this._renderExpandedViewContent(modal, result);
-      if (!rendered && this._modal === modal) {
+      // An unrendered view is closed only when its result was discarded and
+      // nothing replaced it. A newer result supersedes this render but owns
+      // the same overlay: `_publishAnalysisResult()` is drawing it right now.
+      if (!rendered && this._modal === modal && this._lastResult === null) {
         await closeModal(modal);
       }
     } catch (error) {
@@ -955,12 +945,23 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
    * one place is what lets the overlay be *re-drawn* when a new result arrives,
    * instead of only when it is first opened.
    *
+   * The overlay body is `aria-busy` for the whole render, Plotly loading
+   * included.
+   *
    * @param {Object} modal - The open analysis modal.
    * @param {Object} result - The result to draw.
    * @returns {Promise<boolean>} False when ownership changed mid-render.
    * @protected
    */
   async _renderExpandedViewContent(modal, result) {
+    return this._whileBusy(
+      modal._body,
+      () => this._drawExpandedViewContent(modal, result)
+    );
+  }
+
+  /** @private */
+  async _drawExpandedViewContent(modal, result) {
     const title = result.title || this._getTitle();
     const subtitle = result.subtitle || '';
     modal._title.textContent = subtitle ? `${title}: ${subtitle}` : title;
@@ -1044,9 +1045,59 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
         );
       this._notifications.error(
         `Expanded view could not follow the new result: ${reported.message}`,
-        { category: 'analysis', title: 'Analysis Error' }
+        { category: 'analysis', title: 'Analysis error' }
       );
     }
+  }
+
+  /**
+   * Append table rows to `tbody`, in 250-row chunks across tasks when
+   * `chunked`, so a very long gene list does not block the page.
+   *
+   * A UI owns at most one chunked render. Starting another, closing the
+   * expanded view, or destroying the UI cancels the chunks still pending, and a
+   * table that has left the document stops receiving rows.
+   *
+   * @param {HTMLElement} tbody
+   * @param {Array} rows
+   * @param {(row: *) => HTMLElement} createRow
+   * @param {{chunked: boolean}} options
+   * @protected
+   */
+  _renderTableRows(tbody, rows, createRow, { chunked }) {
+    this._cancelChunkedTableRender();
+    if (!chunked) {
+      for (const row of rows) tbody.appendChild(createRow(row));
+      return;
+    }
+    const CHUNK = 250;
+    let cursor = 0;
+    const appendChunk = () => {
+      const end = Math.min(rows.length, cursor + CHUNK);
+      const fragment = document.createDocumentFragment();
+      for (let index = cursor; index < end; index++) {
+        fragment.appendChild(createRow(rows[index]));
+      }
+      tbody.appendChild(fragment);
+      cursor = end;
+      if (cursor < rows.length) {
+        this._chunkedTableTimer = setTimeout(continueChunks, 0);
+      }
+    };
+    const continueChunks = () => {
+      this._chunkedTableTimer = null;
+      if (this._isDestroyed || !tbody.isConnected) return;
+      appendChunk();
+    };
+    // The first chunk is synchronous so the table is never shown empty.
+    appendChunk();
+  }
+
+  /** @protected */
+  _cancelChunkedTableRender() {
+    if (this._chunkedTableTimer == null) return;
+    clearTimeout(this._chunkedTableTimer);
+    this._chunkedTableTimer = null;
   }
 
   /**
@@ -1093,8 +1144,8 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
   _renderModalOptions(container) {
     const result = this._lastResult;
     if (!result?.plotType) {
-      const empty = document.createElement('div');
-      empty.className = 'legend-help';
+      const empty = document.createElement('p');
+      empty.className = 'empty-state';
       empty.textContent = 'No customization options available.';
       container.innerHTML = '';
       container.appendChild(empty);
@@ -1299,7 +1350,7 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
    */
   _renderModalStats(container) {
     // Default implementation - empty, subclasses should override
-    container.innerHTML = '<p class="modal-stats-placeholder">Statistics not available</p>';
+    container.innerHTML = '<p class="empty-state">Statistics not available</p>';
   }
 
   /**
@@ -1308,7 +1359,7 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
    */
   _renderModalAnnotations(container) {
     // Default implementation - empty, subclasses should override
-    container.innerHTML = '<p class="modal-annotations-placeholder">Statistical analysis not available</p>';
+    container.innerHTML = '<p class="empty-state">Statistical analysis not available</p>';
   }
 
   // ===========================================================================
@@ -1406,20 +1457,8 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
     if (!this._container) return;
 
     this._container.innerHTML = '';
-    // Use classList.add to preserve original classes (e.g., analysis-accordion-content)
+    // Use classList.add to preserve original classes (e.g., analysis-mode-content)
     this._container.classList.add(`${this._getClassName()}-panel`);
-
-    // Intro section
-    const intro = document.createElement('div');
-    intro.className = 'analysis-intro';
-    const title = document.createElement('h3');
-    title.textContent = this._getTitle();
-    intro.appendChild(title);
-
-    const description = document.createElement('p');
-    description.textContent = this._getDescription();
-    intro.appendChild(description);
-    this._container.appendChild(intro);
 
     // Form container
     this._formContainer = document.createElement('div');
@@ -1428,7 +1467,8 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
 
     // Result container (hidden initially)
     this._resultContainer = document.createElement('div');
-    this._resultContainer.className = `${this._getClassName()}-result-container hidden`;
+    this._resultContainer.className = `${this._getClassName()}-result-container`;
+    this._resultContainer.hidden = true;
     this._container.appendChild(this._resultContainer);
 
     // Render form controls
@@ -1447,15 +1487,14 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
     const carriedValues = this._captureFormControlValues();
     this._formContainer.innerHTML = '';
 
-    // Validate page requirements
-    const requirements = this.constructor.getRequirements();
-    const validation = validatePageRequirements(this._selectedPages, requirements);
+    // Validate requirements
+    const validation = this.validateRequirements(this._selectedPages);
 
     if (!validation.valid) {
-      const notice = createNotice(
-        validation.error || getRequirementText(requirements)
-      );
-      this._formContainer.appendChild(notice);
+      this._formContainer.appendChild(createStatusLine({
+        tone: 'warning',
+        text: validation.error || this.getRequirementText()
+      }).root);
       return;
     }
 
@@ -1467,8 +1506,7 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
     this._renderFormControls(wrapper);
 
     // Scope ids to this UI instance, so a copied window cannot steal the
-    // sidebar's controls through a duplicate id, and name the rows the shared
-    // form factories did not build.
+    // sidebar's controls through a duplicate id.
     applyFormControlAccessibility(wrapper, this._controlScope);
     // Restore before the intent listeners exist: re-stating the values the user
     // already chose is not a fresh edit and must not schedule an analysis.
@@ -1478,13 +1516,13 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
     wrapper.addEventListener('input', handleInputIntent);
     wrapper.addEventListener('change', handleInputIntent);
 
-    // Run button
-    const runBtn = createFormButton(
-      this._getRunButtonText(),
-      () => this._runAnalysis(),
-      { className: 'btn-small analysis-run-btn' }
-    );
-    wrapper.appendChild(runBtn);
+    // The run button is the one action that commits this form's work.
+    wrapper.appendChild(createButton({
+      label: this._getRunButtonText(),
+      variant: 'primary',
+      className: 'analysis-run-btn',
+      onClick: () => this._runAnalysis()
+    }));
 
     this._formContainer.appendChild(wrapper);
   }
@@ -1585,6 +1623,7 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
 
     const requestId = this._startAnalysisRequest();
     if (requestId === null) return;
+    const releaseBusy = this._claimBusy();
     const discardTask = this._discardFormResult();
     // Get run button for state management
     const runBtn = this._formContainer.querySelector('.analysis-run-btn');
@@ -1630,6 +1669,7 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
         }
       }
     } finally {
+      releaseBusy();
       this._finishAnalysisRequest(requestId);
     }
   }
@@ -1671,7 +1711,7 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
         '.analysis-actions'
       );
       if (actions) actions.remove();
-      this._resultContainer.classList.add('hidden');
+      this._resultContainer.hidden = true;
     }
     if (this._modal) {
       const modal = this._modal;
@@ -1752,6 +1792,7 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
     this._isDestroyed = true;
     this._invalidateAnalysisRequest();
     this._optionRenderRevision += 1;
+    this._cancelChunkedTableRender();
 
     this._destroyPromise = Promise.resolve().then(async () => {
       const errors = [];
@@ -1809,17 +1850,3 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
     return this._destroyPromise;
   }
 }
-
-/**
- * Factory function to create form-based analysis UI
- * @param {Function} UIClass - Subclass of FormBasedAnalysisUI
- * @param {Object} options - Options for the UI
- * @returns {FormBasedAnalysisUI}
- */
-export function createFormBasedAnalysisUI(UIClass, options) {
-  const ui = new UIClass(options);
-  ui.init(options.container);
-  return ui;
-}
-
-export default FormBasedAnalysisUI;

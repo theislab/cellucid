@@ -40,8 +40,8 @@ async function installBlendBoundaryAudit(page) {
       }
       if (
         kind === 'drawArraysInstanced' &&
-        mode === gl.TRIANGLES &&
-        count === 6 &&
+        mode === gl.TRIANGLE_STRIP &&
+        count === 4 &&
         instanceCount === activeAudit.edgeCount
       ) {
         return 'connectivity';
@@ -487,6 +487,7 @@ test('figure-export highlight failure restores depth writes transactionally', as
     let failure = null;
     try {
       rasterizePointsWebgl({
+        dimension: 3,
         colors: Uint8Array.from([255, 0, 0, 255]),
         highlightArray: Uint8Array.from([255]),
         outputHeightPx: 16,
@@ -553,6 +554,7 @@ test('figure-export canvas and PNG preserve translucent color during compositing
       0, 0, 0, 1,
     ]);
     const webglCanvas = rasterizePointsWebgl({
+      dimension: 3,
       colors: Uint8Array.from([255, 0, 0, 128]),
       outputHeightPx: 16,
       outputWidthPx: 16,
@@ -637,7 +639,7 @@ test('figure-export canvas and PNG preserve translucent color during compositing
   });
 });
 
-test('transient figure-export contexts retire across repeated raster passes', async ({
+test('repeated raster passes reuse one export context, never losing it mid-session', async ({
   page,
 }) => {
   await page.goto('/tests/browser/fixtures/webgl-harness.html');
@@ -675,8 +677,26 @@ test('transient figure-export contexts retire across repeated raster passes', as
       viewportWidth: 8,
     };
     const releases = [];
+    const canvases = new Set();
+    const contexts = new Set();
+    // Two passes leased at once take two contexts; both return to the pool.
+    const overlapping = [];
+    for (let index = 0; index < 2; index++) {
+      overlapping.push(rasterizePointsWebgl({
+        dimension: 3,
+        colors: Uint8Array.from([255, 0, 0, 255]),
+        outputHeightPx: 8,
+        outputWidthPx: 8,
+        pointSizePx: 4,
+        positions: Float32Array.from([0, 0, 0]),
+        renderState,
+      }));
+    }
+    const overlappingDistinct = overlapping[0] !== overlapping[1];
+    for (const canvas of overlapping) releaseWebglRasterCanvas(canvas);
     for (let index = 0; index < 24; index++) {
       const canvas = rasterizePointsWebgl({
+        dimension: 3,
         colors: Uint8Array.from([255, 0, 0, 255]),
         outputHeightPx: 8,
         outputWidthPx: 8,
@@ -685,22 +705,35 @@ test('transient figure-export contexts retire across repeated raster passes', as
         renderState,
       });
       const gl = canvas.getContext('webgl2');
+      canvases.add(canvas);
+      contexts.add(gl);
+      const pixel = new Uint8Array(4);
+      gl.readPixels(4, 4, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, pixel);
       releases.push({
         beforeReleaseLost: gl.isContextLost(),
+        drewRed: pixel[0] > 0 && pixel[3] > 0,
         first: releaseWebglRasterCanvas(canvas),
         second: releaseWebglRasterCanvas(canvas),
+        afterReleaseLost: gl.isContextLost(),
+        shrunk: canvas.width === 1 && canvas.height === 1,
       });
       await Promise.resolve();
     }
-    return releases;
+    return { releases, canvasCount: canvases.size, contextCount: contexts.size, overlappingDistinct };
   });
 
-  expect(proof).toHaveLength(24);
-  expect(proof).toEqual(
+  expect(proof.overlappingDistinct).toBe(true);
+  // Sequential passes all draw on the same pooled canvas and context.
+  expect(proof.canvasCount).toBe(1);
+  expect(proof.contextCount).toBe(1);
+  expect(proof.releases).toEqual(
     Array.from({ length: 24 }, () => ({
       beforeReleaseLost: false,
+      drewRed: true,
       first: true,
       second: false,
+      afterReleaseLost: false,
+      shrunk: true,
     })),
   );
 });

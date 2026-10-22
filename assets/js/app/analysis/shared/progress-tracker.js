@@ -12,6 +12,7 @@
  */
 
 import { getNotificationCenter } from '../../notification-center.js';
+import { formatDuration } from '../../notification-center/formatters.js';
 
 // =============================================================================
 // CONSTANTS
@@ -46,7 +47,7 @@ const DEFAULTS = {
  * const tracker = new ProgressTracker({
  *   totalItems: 20000,
  *   phases: ['Loading', 'Computing', 'Finalizing'],
- *   title: 'Differential Expression',
+ *   title: 'Differential expression',
  *   onUpdate: (progress) => console.log(progress)
  * });
  *
@@ -353,7 +354,7 @@ export class ProgressTracker {
     if (this._notificationId && this._notifications) {
       this._notifications.complete(
         this._notificationId,
-        message || `${this.title} complete (${this._formatDuration(stats.elapsedMs)})`
+        message || `${this.title} complete (${formatDuration(stats.elapsedMs)})`
       );
     }
 
@@ -441,9 +442,9 @@ export class ProgressTracker {
 
       // Time metrics
       elapsedMs,
-      elapsedFormatted: this._formatDuration(elapsedMs),
+      elapsedFormatted: formatDuration(elapsedMs),
       etaMs,
-      etaFormatted: etaMs !== null ? this._formatDuration(etaMs) : null,
+      etaFormatted: etaMs !== null ? formatDuration(Math.max(0, etaMs)) : null,
 
       // Throughput
       throughputPerSecond,
@@ -553,134 +554,4 @@ export class ProgressTracker {
       this._abortHandler = null;
     }
   }
-
-  /**
-   * Format duration in human-readable form
-   * @param {number} ms - Duration in milliseconds
-   * @returns {string}
-   * @private
-   */
-  _formatDuration(ms) {
-    if (ms < 1000) return `${Math.round(ms)}ms`;
-
-    const seconds = Math.floor(ms / 1000);
-    if (seconds < 60) return `${seconds}s`;
-
-    const minutes = Math.floor(seconds / 60);
-    const secs = seconds % 60;
-    if (minutes < 60) return `${minutes}m ${secs}s`;
-
-    const hours = Math.floor(minutes / 60);
-    const mins = minutes % 60;
-    return `${hours}h ${mins}m`;
-  }
 }
-
-// =============================================================================
-// SIMPLE PROGRESS HELPER
-// =============================================================================
-
-/**
- * Create a simple progress tracker for common use cases
- *
- * @param {Object} options
- * @param {number} options.total - Total items
- * @param {string} [options.title='Processing'] - Title
- * @param {Function} [options.onProgress] - Progress callback (0-100)
- * @returns {Object} Simple progress API
- *
- * @example
- * const progress = createSimpleProgress({ total: 100, title: 'Loading' });
- * progress.start();
- * for (let i = 0; i < 100; i++) {
- *   await doWork();
- *   progress.increment();
- * }
- * progress.done('Loaded 100 items');
- */
-export function createSimpleProgress(options) {
-  const { total, title = 'Processing', onProgress } = options;
-
-  const tracker = new ProgressTracker({
-    totalItems: total,
-    title,
-    onUpdate: onProgress ? (stats) => onProgress(stats.progress) : null
-  });
-
-  return {
-    start: () => tracker.start(),
-    increment: (count = 1) => tracker.itemComplete(count),
-    setProgress: (completed) => {
-      tracker.setCompletedItems(completed);
-    },
-    done: (message) => tracker.complete(message),
-    fail: (error) => tracker.fail(error),
-    cancel: () => tracker.cancel(),
-    getStats: () => tracker.getStats()
-  };
-}
-
-// =============================================================================
-// BATCH PROGRESS HELPER
-// =============================================================================
-
-/**
- * Create a progress tracker optimized for batch processing
- *
- * @param {Object} options
- * @param {number} options.totalItems - Total items
- * @param {number} options.batchSize - Items per batch
- * @param {string} [options.title='Batch Processing'] - Title
- * @param {Function} [options.onBatchComplete] - Callback after each batch
- * @returns {Object} Batch progress API
- */
-export function createBatchProgress(options) {
-  const { totalItems, batchSize, title = 'Batch Processing', onBatchComplete } = options;
-
-  const totalBatches = Math.ceil(totalItems / batchSize);
-  let currentBatch = 0;
-
-  const tracker = new ProgressTracker({
-    totalItems,
-    title,
-    phases: [`Batch 1/${totalBatches}`]
-  });
-
-  return {
-    start: () => tracker.start(),
-
-    batchComplete: (itemsInBatch = batchSize) => {
-      tracker.itemComplete(itemsInBatch);
-      currentBatch++;
-
-      if (onBatchComplete) {
-        onBatchComplete({
-          batch: currentBatch,
-          totalBatches,
-          itemsProcessed: tracker._completedItems,
-          totalItems
-        });
-      }
-
-      // Update phase name for next batch
-      if (currentBatch < totalBatches) {
-        tracker.phases[0] = `Batch ${currentBatch + 1}/${totalBatches}`;
-      }
-    },
-
-    done: (message) => tracker.complete(message),
-    fail: (error) => tracker.fail(error),
-    getStats: () => ({
-      ...tracker.getStats(),
-      currentBatch,
-      totalBatches,
-      batchSize
-    })
-  };
-}
-
-// =============================================================================
-// EXPORTS
-// =============================================================================
-
-export default ProgressTracker;

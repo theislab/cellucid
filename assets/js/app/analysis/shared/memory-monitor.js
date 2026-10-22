@@ -753,18 +753,8 @@ export function getMemoryMonitor() {
   return memoryMonitorInstance;
 }
 
-/**
- * Create a new MemoryMonitor instance (for testing)
- * @returns {MemoryMonitor}
- */
-export function createMemoryMonitor() {
-  return new MemoryMonitor();
-}
-
 // =============================================================================
 // CONVENIENCE EXPORTS
 // =============================================================================
 
-export { MemoryMonitor, INTERVALS };
-
-export default MemoryMonitor;
+export { MemoryMonitor };

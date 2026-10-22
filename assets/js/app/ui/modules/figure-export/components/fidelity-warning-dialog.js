@@ -84,25 +84,22 @@ export function confirmExportFidelityWarnings({
     };
 
     const body = createElement('div', {}, [
-      createElement('div', { className: 'legend-help' }, [
+      createElement('p', { className: 'field-help' }, [
         'Cellucid will not create an export that differs from the active view. Resolve the following first:'
       ])
     ]);
 
-    const list = createElement('div', { className: 'control-block figure-export-divider' });
+    const list = createElement('div', { className: 'control-block' });
     for (const warning of warnings) {
-      const row = createElement('div', { className: 'legend-toggle-row' }, [
-        createElement('div', { className: 'analysis-accordion-title' }, [warning.title]),
-      ]);
-      row.appendChild(
-        createElement('div', { className: 'legend-help' }, [warning.detail])
-      );
-      list.appendChild(row);
+      list.appendChild(createElement('div', { className: 'figure-export-warning' }, [
+        createElement('h3', { className: 'section-title' }, [warning.title]),
+        createElement('p', { className: 'field-help' }, [warning.detail])
+      ]));
     }
     body.appendChild(list);
 
     const actions = createElement('div', { className: 'figure-export-modal-actions' }, [
-      createElement('button', { type: 'button', className: 'btn-small' }, ['Back'])
+      createElement('button', { type: 'button', className: 'btn' }, ['Back'])
     ]);
     body.appendChild(actions);
 

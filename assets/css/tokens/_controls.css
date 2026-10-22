@@ -1,0 +1,94 @@
+/* tokens/_controls.css
+   Control geometry: the sizes every sidebar control is built from.
+
+   Mouse layouts use these values as written. `layouts/_responsive.css`
+   raises the target sizes for a coarse pointer by redefining the
+   `--control-target-*` tokens, so a component never restates a touch size of
+   its own.
+*/
+
+:root {
+  /* One spacing rhythm: between panels, between the top-level groups of a
+     panel, between blocks inside a group or a box, and between a label and
+     its control or one row and the next. */
+  --control-panel-gap: var(--space-2-5);
+  --control-group-gap: var(--space-3);
+  --control-block-gap: var(--space-2);
+  --control-row-gap: var(--space-1);
+  --control-box-padding-y: var(--space-1-5);
+  --control-box-padding-x: var(--space-2);
+
+  /* A panel's title row (sidebar panels, floating panels, analysis windows).
+     The header controls laid over the row are positioned from the same two
+     values, so the row and its controls can never disagree. */
+  --control-panel-summary-padding-y: var(--space-1-5);
+  --control-panel-summary-padding-x: var(--space-2-5);
+
+  /* Dialogs (license, confirm, figure export, analysis windows, community
+     annotation): one header band and one body inset. */
+  --control-dialog-header-padding-y: var(--space-2);
+  --control-dialog-header-padding-x: var(--space-3);
+  --control-dialog-padding: var(--space-3);
+
+  /* Field boxes (selects, text and number inputs). */
+  --control-padding-y: var(--space-1);
+  --control-padding-x: var(--space-2);
+
+  /* One drawn height for a field and a button that share a row, and one for
+     the compact size. */
+  --control-height: var(--space-6);
+  --control-compact-height: var(--space-5);
+
+  /* Buttons. */
+  --control-button-padding-y: var(--space-1);
+  --control-button-padding-x: var(--space-2-5);
+  --control-button-compact-padding-y: var(--space-0-5);
+  --control-button-compact-padding-x: var(--space-2);
+
+  /* Chips. */
+  --control-chip-padding-y: 3px;
+  --control-chip-padding-x: 7px;
+
+  /* One row of a list (legend categories, shortcuts, kept views, keyframes,
+     filters, dataset facts): compact, one line of text with a little air.
+     A coarse pointer raises rows to --control-row-min. */
+  --control-list-row-height: var(--space-5);
+
+  /* Icon buttons and their glyph. */
+  --control-icon-button-size: var(--space-4);
+  --control-icon-size: var(--space-3);
+
+  /* Glyph buttons whose icon is a text character (dock, copy, close, the
+     sidebar tab): small for an action inside a row or panel bar, medium for a
+     panel's close, large for a dialog's close and the sidebar tab. */
+  --control-glyph-sm: var(--text-md);
+  --control-glyph-md: var(--text-xl);
+  --control-glyph-lg: var(--text-2xl);
+
+  /* Checkbox, colour swatch. */
+  --control-check-size: var(--space-3-5);
+
+  /* Switch. */
+  --control-switch-track-width: 34px;
+  --control-switch-track-height: var(--space-5);
+  --control-switch-knob-size: var(--space-3-5);
+  --control-switch-inset: 3px;
+
+  /* Range slider. */
+  --control-slider-track-height: 3px;
+  --control-slider-thumb-size: var(--space-3-5);
+  --control-slider-hit-height: var(--space-6);
+
+  /* Touch geometry. On a mouse layout the drawn size is the target. On a
+     coarse pointer a boxed control (field, button, chip, segment) is drawn
+     --control-target-min tall and its hit area reaches past the drawn box by
+     --control-hit-extend above and below, so a fingertip gets about 44px
+     without the control looking inflated; an unboxed row (checkbox, switch,
+     disclosure) is --control-row-min tall. */
+  --control-target-min: 0px;
+  --control-row-min: 0px;
+  --control-hit-extend: 0px;
+
+  /* One disabled look for every control. */
+  --control-disabled-opacity: var(--opacity-50);
+}

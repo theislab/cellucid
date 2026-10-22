@@ -35,6 +35,38 @@ function createButton() {
   };
 }
 
+test('Save follows the runtime cells while Load stays available', () => {
+  const saveBtn = createButton();
+  const loadBtn = createButton();
+  const controls = initSessionControls({
+    dom: { saveBtn, loadBtn },
+    datasetChanges: {
+      recordAction: () => 1,
+      settled: true,
+      whenSettled: async () => {},
+    },
+    sessionSerializer: {
+      downloadSession() {},
+      loadSessionFromFile() {}
+    }
+  });
+  try {
+    assert.equal(saveBtn.disabled, true, 'nothing is published yet');
+    assert.equal(saveBtn.title, 'Load a dataset to save a session');
+    assert.equal(loadBtn.disabled, undefined);
+    controls.setCellsPresent(true);
+    assert.equal(saveBtn.disabled, false);
+    assert.equal(saveBtn.title, '');
+    controls.setCellsPresent(false);
+    assert.equal(saveBtn.disabled, true);
+    assert.equal(saveBtn.title, 'Load a dataset to save a session');
+    assert.throws(() => controls.setCellsPresent('yes'), TypeError);
+    assert.equal(loadBtn.disabled, undefined);
+  } finally {
+    void controls.destroy();
+  }
+});
+
 test('session-control destroy fences late publication and drains active work', async () => {
   const save = deferred();
   const load = deferred();
@@ -52,6 +84,12 @@ test('session-control destroy fences late publication and drains active work', a
     let afterLoads = 0;
     const controls = initSessionControls({
       dom: { saveBtn, loadBtn },
+      // No dataset change is in flight, so a chosen session restores at once.
+      datasetChanges: {
+        recordAction: () => 1,
+        settled: true,
+        whenSettled: async () => {},
+      },
       sessionSerializer: {
         downloadSession(filename) {
           serializerCalls.push(['save', filename]);

@@ -21,11 +21,16 @@ import {
   MAX_SYNTHETIC_COUNT,
   MIN_SYNTHETIC_COUNT
 } from '../app/ui/modules/benchmark/generation-contract.js';
-import { formatCellCount as formatNumber } from '../data/data-source.js';
+import { formatCompactCount as formatNumber } from '../app/ui/components/display-format.js';
 
 const glbBufferPromises = new Map();
 const MEBIBYTE = 1024 * 1024;
-const PRE_PUBLICATION_GPU_ESTIMATE_BYTES_PER_POINT = 28;
+// Before the renderer publishes its measured figure, GPU memory is estimated
+// from what the points renderer stores per cell: 4 bytes per position axis
+// (positions keep exactly the embedding's dimension), 4 bytes of RGBA colour
+// and 1 byte of alpha. Measured: 13 B/point in 2D and 17 B/point in 3D.
+const GPU_POSITION_BYTES_PER_AXIS = 4;
+const GPU_COLOR_AND_ALPHA_BYTES_PER_POINT = 5;
 
 function getExactGpuMemoryMB(rendererStats) {
   const gpuMemoryMB = rendererStats?.gpuMemoryMB;
@@ -34,14 +39,13 @@ function getExactGpuMemoryMB(rendererStats) {
     : null;
 }
 
-function estimatePrePublicationGpuMemoryMB(pointCount) {
-  return Number.isSafeInteger(pointCount) && pointCount >= 0
-    ? (
-      pointCount *
-      PRE_PUBLICATION_GPU_ESTIMATE_BYTES_PER_POINT /
-      MEBIBYTE
-    )
-    : null;
+function estimatePrePublicationGpuMemoryMB(pointCount, dimension) {
+  if (!Number.isSafeInteger(pointCount) || pointCount < 0) return null;
+  // An unknown dimension is estimated as 3D, the larger of the two.
+  const axes = dimension === 1 || dimension === 2 || dimension === 3 ? dimension : 3;
+  const bytesPerPoint =
+    axes * GPU_POSITION_BYTES_PER_AXIS + GPU_COLOR_AND_ALPHA_BYTES_PER_POINT;
+  return pointCount * bytesPerPoint / MEBIBYTE;
 }
 
 /**
@@ -796,11 +800,9 @@ export class SyntheticDataGenerator {
     console.log(`Generating ${count.toLocaleString()} points (2D UMAP, ${numClusters} clusters)...`);
     const startTime = performance.now();
 
-    const positions = new Float32Array(count * 3);
+    // A 2-D embedding: two position components per point, no padded z.
+    const positions = new Float32Array(count * 2);
     const colors = new Uint8Array(count * 4); // RGBA packed as uint8
-
-    // Z-axis scale (nearly flat)
-    const zScale = 0.02;
 
     // Generate cluster configurations
     const clusters = [];
@@ -862,7 +864,7 @@ export class SyntheticDataGenerator {
     });
 
     for (let i = 0; i < count; i++) {
-      const idx = i * 3;
+      const idx = i * 2;
 
       // Sample cluster
       const r = syntheticUnitRandom();
@@ -892,7 +894,6 @@ export class SyntheticDataGenerator {
 
       positions[idx] = x;
       positions[idx + 1] = y;
-      positions[idx + 2] = 0; // Keep perfectly flat for true 2D
 
       // Color (convert to uint8)
       const cidx = i * 4;
@@ -1630,16 +1631,23 @@ export { PerformanceTracker } from
  * 5. Fill rate analysis
  * 6. Thermal throttling detection
  *
+ * The analyzer drives `renderer.render()` from its own animation-frame loop,
+ * so the viewer that owns the renderer (`host`: `pause()`, `resume()`,
+ * `isPaused()`) is paused for the whole run. Otherwise both loops draw every
+ * frame and each measurement carries the viewer's frame too. The analyzer's
+ * private 'benchmark' view state is released when the run settles.
+ *
  * Usage:
- *   const analyzer = new BottleneckAnalyzer(gl, renderer);
+ *   const analyzer = new BottleneckAnalyzer(gl, renderer, viewer);
  *   await analyzer.runAnalysis({ warmupFrames: 30, testFrames: 120 });
  *   const report = analyzer.getReport();
  *   console.log(analyzer.formatReport());
  */
 export class BottleneckAnalyzer {
-  constructor(gl, renderer) {
+  constructor(gl, renderer, host) {
     this.gl = gl;
     this.renderer = renderer;
+    this.host = host;
     this.gpuTimer = null;
     this.results = null;
 
@@ -1688,6 +1696,50 @@ export class BottleneckAnalyzer {
    * @returns {Promise<Object>} Analysis results
    */
   async runAnalysis(options = {}) {
+    const host = this.host;
+    if (
+      !host ||
+      typeof host.pause !== 'function' ||
+      typeof host.resume !== 'function' ||
+      typeof host.isPaused !== 'function' ||
+      typeof this.renderer?.clearViewState !== 'function'
+    ) {
+      throw new TypeError(
+        'Bottleneck analysis requires a pausable viewer host and a renderer that can release its benchmark view.'
+      );
+    }
+    const hostWasPaused = host.isPaused();
+    if (!hostWasPaused) host.pause();
+    let analysisFailure = null;
+    try {
+      return await this._runAnalysisPhases(options);
+    } catch (error) {
+      analysisFailure = error;
+      throw error;
+    } finally {
+      const settlementFailures = [];
+      try {
+        this.renderer.clearViewState('benchmark');
+      } catch (error) {
+        settlementFailures.push(error);
+      }
+      try {
+        if (!hostWasPaused) host.resume();
+      } catch (error) {
+        settlementFailures.push(error);
+      }
+      if (settlementFailures.length > 0) {
+        throw new AggregateError(
+          analysisFailure === null
+            ? settlementFailures
+            : [analysisFailure, ...settlementFailures],
+          'Bottleneck analysis could not release its benchmark view or resume the viewer.'
+        );
+      }
+    }
+  }
+
+  async _runAnalysisPhases(options) {
     const config = { ...this.config, ...options };
 
     console.log('[BottleneckAnalyzer] Starting bottleneck analysis...');
@@ -1901,7 +1953,9 @@ export class BottleneckAnalyzer {
     if (
       typeof originalLOD !== 'boolean' ||
       typeof originalFrustum !== 'boolean' ||
-      !['ultralight', 'light', 'full'].includes(originalQuality) ||
+      // The renderer validated its own quality when it adopted it, and render()
+      // validates it again below; this module names no quality of its own.
+      typeof originalQuality !== 'string' ||
       !Number.isInteger(originalForceLOD) ||
       originalForceLOD < -1 ||
       (
@@ -1960,6 +2014,9 @@ export class BottleneckAnalyzer {
       // the alpha texture fetch, the round discard. Depth writes are on and
       // submission order is uncorrelated with depth, so roughly 95% of
       // rasterised fragments are killed before the fragment shader runs.
+      // (A 2-D view has no depth test; there, with antialiasing on, a dense
+      // embedding is bound by blending and `Light`/`Ultra-light` took about
+      // half of `Full`'s frame time — see the shader-quality tooltip.)
       //
       // This harness could not settle that question in either direction anyway.
       // `_measureFrameTimes` records the wall-clock interval between
@@ -2175,12 +2232,18 @@ export class BottleneckAnalyzer {
 
     // Retain component heuristics for directional diagnostics. The renderer's
     // managed total below is authoritative once it has been published.
-    const pointCount = this.renderer._positions?.length / 3 || 0;
-    const bytesPerPoint = 16; // interleaved: 12 bytes position + 4 bytes color
+    const pointCount = this.renderer.pointCount || 0;
+    // Two full-detail streams: 4 bytes of Float32 per embedding axis + 4
+    // bytes of RGBA8.
+    const bytesPerPoint = pointCount > 0
+      ? this.renderer.getViewPositionDimension('live') * 4 + 4
+      : 0;
     const geometryMemory = pointCount * bytesPerPoint;
 
-    // LOD buffers (approximately 1.5x main buffer due to multiple levels)
-    const lodMemoryEstimate = geometryMemory * 1.5;
+    // LOD: one shared compact prefix of at most every point, each holding the
+    // same two streams, a 4-byte original-ID index and a 4-byte
+    // R32UI lookup texel.
+    const lodMemoryEstimate = pointCount * (bytesPerPoint + 4 + 4);
 
     // Alpha texture (1 byte per point)
     const alphaTextureMemory = pointCount;
@@ -2875,7 +2938,8 @@ export class BottleneckAnalyzer {
       forceLOD: -1,
       quality: this.renderer.activeQuality,
       viewId: 'benchmark',
-      dimensionLevel: 3,
+      // The live publication's dimension is also its position layout.
+      dimensionLevel: this.renderer.getViewPositionDimension('live'),
       useAlphaTexture: false,
       autoFog: true,
       overrideBounds: null
@@ -3208,6 +3272,7 @@ export class BottleneckAnalyzer {
       max-width: ${420 * scale}px;
       box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
       backdrop-filter: blur(8px);
+      -webkit-user-select: none;
       user-select: none;
     `;
 
@@ -4542,11 +4607,16 @@ export class BenchmarkReporter {
       (filteredCount ? filteredCount.shown : null) ??
       pointCount;
 
+    const dimension = dataset.dimension ??
+      (fromState ? fromState.positionsDimension : null) ??
+      null;
+
     return {
       mode: dataset.mode || 'real',
       pattern: dataset.pattern || null,
       generationMs: dataset.generationMs || null,
       pointCount,
+      dimension,
       visiblePoints,
       filters,
       activeFieldKey: dataset.activeFieldKey || activeField?.key || null,
@@ -4597,7 +4667,8 @@ export class BenchmarkReporter {
     const exactGpuMemoryMB = getExactGpuMemoryMB(rendererStats);
     const prePublicationEstimateMB = exactGpuMemoryMB === null
       ? estimatePrePublicationGpuMemoryMB(
-        context.dataset?.pointCount
+        context.dataset?.pointCount,
+        context.dataset?.dimension
       )
       : null;
     const gpuMemoryMB =

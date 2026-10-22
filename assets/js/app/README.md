@@ -64,7 +64,7 @@ Common state events:
 - `field:changed` — field metadata changed (payload: `{ source, fieldIndex, changeType, detail }`)
 - `highlight:changed` — highlight groups changed
 - `page:changed` — highlight pages changed (add/remove/rename/switch)
-- `dimension:changed` — active view dimension changed (payload: `level`)
+- `view:representation-changed` — the representation a view shows changed, or focus moved to a view showing another one (payload: `{viewId, layoutKey, dimension, previousLayoutKey}`)
 
 **Performance-critical paths (benchmark before changing):**
 - `computeGlobalVisibility()` (visibility recomputation, O(n × filters))

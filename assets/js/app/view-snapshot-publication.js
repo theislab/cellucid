@@ -58,6 +58,7 @@ function requireSnapshotOwners(state, viewer) {
     'clearSnapshotViews',
     'createSnapshotView',
     'getSnapshotViews',
+    'getViewLayoutKey',
     'removeSnapshotView',
   ]) {
     requireMethod(viewer, methodName, 'Snapshot viewer owner');
@@ -148,21 +149,35 @@ export function publishSnapshotView({ state, viewer, config }) {
     const dimensionManager = state.getDimensionManager();
     requireMethod(
       dimensionManager,
-      'copyViewDimension',
-      'Snapshot dimension owner'
+      'copyViewLayout',
+      'Snapshot layout owner'
     );
     requireMethod(
       dimensionManager,
       'getViewDimension',
-      'Snapshot dimension owner'
+      'Snapshot layout owner'
     );
-    dimensionManager.copyViewDimension(sourceViewId, createdId);
+    requireMethod(
+      dimensionManager,
+      'getViewLayout',
+      'Snapshot layout owner'
+    );
+    dimensionManager.copyViewLayout(sourceViewId, createdId);
     if (
       dimensionManager.getViewDimension(createdId) !==
       config.dimensionLevel
     ) {
       throw new Error(
         `Dimension owner published the wrong dimension for snapshot "${createdId}".`
+      );
+    }
+    // The kept view shows the source's layout, which the viewer copied too.
+    if (
+      viewer.getViewLayoutKey(createdId) !==
+      dimensionManager.getViewLayout(createdId)
+    ) {
+      throw new Error(
+        `Viewer and dimension owner disagree on the layout of snapshot "${createdId}".`
       );
     }
     state.syncSnapshotContexts(after.map(snapshot => snapshot.id));

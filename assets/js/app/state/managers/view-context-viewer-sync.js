@@ -9,9 +9,43 @@
 
 import { getFieldRegistry } from '../../utils/field-registry.js';
 import { getPageColor } from '../../utils/page-colors.js';
-import { NEUTRAL_GRAY_UINT8 } from '../core/constants.js';
+import { fillNeutralGray } from '../core/constants.js';
 import { adoptScientificFieldDescriptors } from './field/descriptor-ownership.js';
-import { POINT_VISIBILITY_THRESHOLD } from '../../../rendering/alpha-visibility.js';
+import {
+  markSnapshotPublishedColors,
+  writableTransparency,
+} from './per-cell-array-ownership.js';
+
+/**
+ * Own a manifest field's centroids by layout: `centroidsByEmbedding` is keyed
+ * by embedding id, which is the layout key of that embedding. An id the
+ * dimension manager has not registered has no reachable centroids. The arrays
+ * are copied so lazy in-place normalization owns them; malformed shapes pass
+ * through unchanged for buildCentroidsForField to reject.
+ */
+function ownCentroidsByLayout(centroidsByEmbedding, dimensionManager) {
+  if (
+    centroidsByEmbedding === null
+    || typeof centroidsByEmbedding !== 'object'
+    || Array.isArray(centroidsByEmbedding)
+  ) {
+    return centroidsByEmbedding;
+  }
+  const owned = new Map();
+  for (const [layoutKey, centroids] of Object.entries(centroidsByEmbedding)) {
+    if (!dimensionManager.hasLayout(layoutKey)) continue;
+    owned.set(layoutKey, Array.isArray(centroids)
+      ? centroids.map((centroid) => (
+          centroid !== null
+          && typeof centroid === 'object'
+          && Array.isArray(centroid.position)
+            ? { ...centroid, position: [...centroid.position] }
+            : centroid
+        ))
+      : centroids);
+  }
+  return owned;
+}
 
 const SYNTHETIC_SCENE_KEYS = Object.freeze([
   'colors',
@@ -52,12 +86,13 @@ function requireSyntheticScene(scene) {
   if (
     !(scene.positions instanceof Float32Array) ||
     scene.positions.length === 0 ||
-    scene.positions.length % 3 !== 0 ||
+    scene.positions.length % scene.dimensionLevel !== 0 ||
     scene.positions.byteLength !==
       scene.positions.length * Float32Array.BYTES_PER_ELEMENT
   ) {
     throw new TypeError(
-      'Synthetic scene positions must be a non-empty exact Float32 XYZ array.'
+      'Synthetic scene positions must be a non-empty exact Float32 array ' +
+      'with dimensionLevel values per point.'
     );
   }
   for (let index = 0; index < scene.positions.length; index += 1) {
@@ -67,7 +102,7 @@ function requireSyntheticScene(scene) {
       );
     }
   }
-  const pointCount = scene.positions.length / 3;
+  const pointCount = scene.positions.length / scene.dimensionLevel;
   if (
     !(scene.colors instanceof Uint8Array) ||
     scene.colors.length !== pointCount * 4 ||
@@ -82,11 +117,11 @@ function requireSyntheticScene(scene) {
   const manager = scene.dimensionManager;
   for (const methodName of [
     'clearCache',
-    'getAvailableDimensions',
-    'getDefaultDimension',
-    'getPositions3D',
-    'hasDimension',
-    'setViewDimension'
+    'getLayout',
+    'getPositions',
+    'getViewLayout',
+    'isEnabled',
+    'setViewLayout'
   ]) {
     if (
       manager === null ||
@@ -98,16 +133,15 @@ function requireSyntheticScene(scene) {
       );
     }
   }
-  const availableDimensions = manager.getAvailableDimensions();
+  // The scene may enable several representations; the live view shows one,
+  // and the published positions are that one's.
+  const liveLayoutKey = manager.getViewLayout('live');
   if (
-    !Array.isArray(availableDimensions) ||
-    availableDimensions.length !== 1 ||
-    availableDimensions[0] !== scene.dimensionLevel ||
-    manager.getDefaultDimension() !== scene.dimensionLevel ||
-    manager.hasDimension(scene.dimensionLevel) !== true
+    manager.isEnabled(liveLayoutKey) !== true ||
+    manager.getLayout(liveLayoutKey).dimension !== scene.dimensionLevel
   ) {
     throw new Error(
-      'Synthetic dimension manager must own exactly the published dimension.'
+      'Synthetic dimension manager must show an enabled representation of the published dimension.'
     );
   }
 
@@ -115,6 +149,7 @@ function requireSyntheticScene(scene) {
     colors: scene.colors,
     dimensionLevel: scene.dimensionLevel,
     dimensionManager: manager,
+    layoutKey: liveLayoutKey,
     pointCount,
     positions: scene.positions
   });
@@ -123,6 +158,7 @@ function requireSyntheticScene(scene) {
 function requireSyntheticViewer(viewer) {
   for (const methodName of [
     'clearSnapshotViews',
+    'getViewLayoutKey',
     'resetVectorFieldOverlay',
     'setCentroidLabels',
     'setCentroids',
@@ -147,6 +183,8 @@ export const viewContextViewerSyncMethods = {
     if (this._isLiveView()) {
       this.viewer.updateColors(this.colorsArray);
     } else if (typeof this.viewer.updateSnapshotAttributes === 'function') {
+      // The viewer keeps a snapshot's colors by reference from here on.
+      markSnapshotPublishedColors(this.colorsArray);
       this.viewer.updateSnapshotAttributes(this.activeViewId, { colors: this.colorsArray });
     }
   },
@@ -174,15 +212,15 @@ export const viewContextViewerSyncMethods = {
           this.activeViewId
         );
         if (
-          !(accepted instanceof Float32Array) ||
-          !(this.categoryTransparency instanceof Float32Array) ||
+          !(accepted instanceof Uint8Array) ||
+          !(this.categoryTransparency instanceof Uint8Array) ||
           accepted.length !== this.categoryTransparency.length
         ) {
           throw new TypeError(
             'Visibility rollback requires the exact accepted view transparency.'
           );
         }
-        this.categoryTransparency.set(accepted);
+        writableTransparency(this).set(accepted);
         this._syncColorsAlpha();
         this._updateActiveCategoryCounts();
       } catch (restorationError) {
@@ -216,13 +254,10 @@ export const viewContextViewerSyncMethods = {
     }
   },
 
-  _getCentroidsForCurrentDim(field) {
-    if (!field) return [];
-    const currentDim = this.activeDimensionLevel || 3;
-    const centroidsByDim = field.centroidsByDim || {};
-    return centroidsByDim[String(currentDim)]
-      || centroidsByDim[currentDim]
-      || [];
+  _getCentroidsForActiveLayout(field) {
+    if (!field || !(field.centroidsByLayout instanceof Map)) return [];
+    const layoutKey = this.getViewLayoutKey(this.activeViewId);
+    return field.centroidsByLayout.get(layoutKey) || [];
   },
 
   _rebuildLabelLayerFromCentroids() {
@@ -231,7 +266,7 @@ export const viewContextViewerSyncMethods = {
     this._removeLabelsForView(viewKey);
     this.centroidLabels = [];
     const field = this.getActiveField ? this.getActiveField() : null;
-    const centroids = this._getCentroidsForCurrentDim(field);
+    const centroids = this._getCentroidsForActiveLayout(field);
     if (!field || field.kind !== 'category' || !this.centroidPositions || centroids.length === 0) {
       this.viewer.setCentroidLabels([], viewKey);
       return;
@@ -260,56 +295,88 @@ export const viewContextViewerSyncMethods = {
 
   initScene(positions, obs) {
     this._datasetGeneration = (this._datasetGeneration ?? 0) + 1;
+    // A new dataset starts with the gene list it was published with.
+    this._varAxisGeneration = 0;
     // Dataset swap: ensure GPU overlay resources referencing the previous dataset
     // are released before we upload new buffers.
     this.viewer.resetVectorFieldOverlay?.();
 
     const manifestFields = obs?.fields || [];
     this._obsFieldDescriptors = adoptScientificFieldDescriptors(manifestFields);
-    const normalizedFields = manifestFields.map((field) => ({
-      ...field,
-      categories: Array.isArray(field?.categories)
-        ? [...field.categories]
-        : field?.categories,
-      loaded: Boolean(field?.values || field?.codes),
-      _loadingPromise: null,
-      _loadingSignal: null,
-      _normalizedDims: null
-    }));
+    const normalizedFields = manifestFields.map((field) => {
+      const hasCentroids = field !== null && typeof field === 'object'
+        && Object.hasOwn(field, 'centroidsByEmbedding');
+      const rest = { ...field };
+      delete rest.centroidsByEmbedding;
+      return {
+        ...rest,
+        categories: Array.isArray(field?.categories)
+          ? [...field.categories]
+          : field?.categories,
+        loaded: Boolean(field?.values || field?.codes),
+        _loadingPromise: null,
+        _loadingSignal: null,
+        // Centroids are normalized lazily and in place, once per layout.
+        // The record of which layouts are done has to have exactly the
+        // lifetime of the arrays it describes: every view context clones this
+        // field shallowly, so the copied centroid arrays and this one Set are
+        // shared by all of them. A per-clone `null` let a view kept before the
+        // field's first colouring normalize the shared arrays a second time.
+        // The arrays themselves are copied so normalization never rewrites the
+        // dataset generation's manifest.
+        ...(hasCentroids
+          ? {
+              centroidsByLayout: ownCentroidsByLayout(
+                field.centroidsByEmbedding,
+                this.dimensionManager
+              )
+            }
+          : {}),
+        _normalizedLayouts: new Set()
+      };
+    });
     this.obsData = { ...obs, fields: normalizedFields };
     this._fieldDataCache.clear();
     this._varFieldDataCache.clear();
+    this._fieldUseOrder = new Map();
+    this._fieldUseClock = 0;
 
     this._renameRegistry.clear();
     this._deleteRegistry.clear();
     this._userDefinedFields.clear();
     getFieldRegistry().invalidate();
 
-    this.positionsArray = positions;
-
-    this.pointCount = positions.length / 3;
-
-    this.colorsArray = new Uint8Array(this.pointCount * 4);
-    for (let i = 0; i < this.pointCount; i++) {
-      const idx = i * 4;
-      this.colorsArray[idx] = NEUTRAL_GRAY_UINT8;
-      this.colorsArray[idx + 1] = NEUTRAL_GRAY_UINT8;
-      this.colorsArray[idx + 2] = NEUTRAL_GRAY_UINT8;
-      this.colorsArray[idx + 3] = 255;
+    // An empty scene (no dataset) shows no layout; its stride is moot.
+    const layoutKey = positions.length === 0
+      ? null
+      : this.getViewLayoutKey('live');
+    const positionsDimension = layoutKey === null
+      ? 3
+      : this.dimensionManager.getLayout(layoutKey).dimension;
+    if (
+      !(positions instanceof Float32Array) ||
+      positions.length % positionsDimension !== 0
+    ) {
+      throw new TypeError(
+        `Scene positions must be a Float32Array with exactly ${positionsDimension} values per cell.`
+      );
     }
-    this.outlierQuantilesArray = new Float32Array(this.pointCount);
-    this.outlierQuantilesArray.fill(-1.0);
-    this.categoryTransparency = new Float32Array(this.pointCount);
-    this.categoryTransparency.fill(1.0);
-    this.cellVisibilityMask = new Float32Array(this.pointCount);
-    this.cellVisibilityMask.fill(1.0);
+    this.positionsArray = positions;
+    this.positionsDimension = positionsDimension;
+
+    this.pointCount = positions.length / positionsDimension;
+
+    this.colorsArray = fillNeutralGray(new Uint8Array(this.pointCount * 4));
+    this.categoryTransparency = new Uint8Array(this.pointCount).fill(1);
+    this.cellVisibilityMask = new Uint8Array(this.pointCount).fill(1);
     this.filteredCount = { shown: this.pointCount, total: this.pointCount };
 
     this.viewer.setData({
       positions,
       colors: this.colorsArray,
       transparency: this.categoryTransparency,
-      dimensionLevel: this.activeDimensionLevel
+      dimensionLevel: positionsDimension,
+      layoutKey
     });
 
     this.clearCentroids();
@@ -343,7 +410,6 @@ export const viewContextViewerSyncMethods = {
     this.activeVarFieldIndex = -1;
     this.activeFieldSource = null;
     this._activeCategoryCounts = null;
-    this._visibilityScratch = null;
     this._batchMode = false;
     this._batchDepth = 0;
     this._batchDirty = {
@@ -373,12 +439,8 @@ export const viewContextViewerSyncMethods = {
   initSyntheticScene(scene) {
     const exact = requireSyntheticScene(scene);
     const viewer = requireSyntheticViewer(this.viewer);
-    const transparency = new Float32Array(exact.pointCount);
-    transparency.fill(1);
-    const cellVisibilityMask = new Float32Array(exact.pointCount);
-    cellVisibilityMask.fill(1);
-    const outlierQuantiles = new Float32Array(exact.pointCount);
-    outlierQuantiles.fill(-1);
+    const transparency = new Uint8Array(exact.pointCount).fill(1);
+    const cellVisibilityMask = new Uint8Array(exact.pointCount).fill(1);
     const highlights = new Uint8Array(exact.pointCount);
     const emptyCentroidPositions = new Float32Array(0);
     const emptyCentroidColors = new Uint8Array(0);
@@ -387,7 +449,8 @@ export const viewContextViewerSyncMethods = {
       positions: this.positionsArray,
       colors: this.colorsArray,
       transparency: this.categoryTransparency,
-      dimensionLevel: this.activeDimensionLevel
+      dimensionLevel: this.positionsDimension,
+      layoutKey: viewer.getViewLayoutKey('live')
     });
     const previousCentroidPayload = Object.freeze({
       positions: this.centroidPositions instanceof Float32Array
@@ -407,7 +470,8 @@ export const viewContextViewerSyncMethods = {
         positions: exact.positions,
         colors: exact.colors,
         transparency,
-        dimensionLevel: exact.dimensionLevel
+        dimensionLevel: exact.dimensionLevel,
+        layoutKey: exact.layoutKey
       });
       viewer.setCentroids({
         positions: emptyCentroidPositions,
@@ -441,25 +505,26 @@ export const viewContextViewerSyncMethods = {
     this.varFieldLoader = null;
     this.dimensionManager = exact.dimensionManager;
     this.vectorFieldManager = null;
+    this.publishDatasetMapping({ mapping: null, candidates: null, origin: null });
     this._obsFieldDescriptors = Object.freeze([]);
     this._varFieldDescriptors = Object.freeze([]);
     this.obsData = { fields: [] };
     this.varData = null;
     this._fieldDataCache.clear();
     this._varFieldDataCache.clear();
+    this._fieldUseOrder = new Map();
+    this._fieldUseClock = 0;
     this._renameRegistry.clear();
     this._deleteRegistry.clear();
     this._userDefinedFields.clear();
     getFieldRegistry().invalidate();
 
-    this.activeDimensionLevel = exact.dimensionLevel;
     this.positionsArray = exact.positions;
+    this.positionsDimension = exact.dimensionLevel;
     this.pointCount = exact.pointCount;
     this.colorsArray = exact.colors;
-    this.outlierQuantilesArray = outlierQuantiles;
     this.categoryTransparency = transparency;
     this.cellVisibilityMask = cellVisibilityMask;
-    this._visibilityScratch = null;
     this.filteredCount = {
       shown: exact.pointCount,
       total: exact.pointCount
@@ -500,7 +565,7 @@ export const viewContextViewerSyncMethods = {
     this._resetViewContexts();
 
     this.emit('vectorFields:changed', []);
-    this._notifyDimensionChange();
+    this._notifyRepresentationChange('live', null);
     this._notifyHighlightPageChange();
     this._notifyHighlightChange();
     this._notifyVisibilityChange();
@@ -522,46 +587,22 @@ export const viewContextViewerSyncMethods = {
     this.emit('field:changed', event);
   },
 
-  getVisibilityArray() {
-    const total = this.pointCount || 0;
-    if (!total) return new Float32Array();
-
-    const alpha = this.categoryTransparency || new Float32Array(total).fill(1.0);
-    const applyOutlierFilter = this.isOutlierFilterEnabledForActiveField();
-    const outliers = applyOutlierFilter ? (this.outlierQuantilesArray || []) : [];
-    const outlierThreshold = applyOutlierFilter ? this.getCurrentOutlierThreshold() : 1.0;
-
-    if (!this._visibilityScratch || this._visibilityScratch.length !== total) {
-      this._visibilityScratch = new Float32Array(total);
-    }
-
-    const mask = this._visibilityScratch;
-    for (let i = 0; i < total; i++) {
-      let visible =
-        (alpha[i] ?? 0) >= POINT_VISIBILITY_THRESHOLD;
-      if (visible && applyOutlierFilter) {
-        const q = (i < outliers.length) ? outliers[i] : -1;
-        if (q >= 0 && q > outlierThreshold) visible = false;
-      }
-      mask[i] = visible ? 1.0 : 0.0;
-    }
-    return mask;
-  },
-
   getSmokeDensitySource() {
     const positions = this.positionsArray;
+    const dimension = this.positionsDimension;
     const pointCount = this.pointCount;
     if (
       !(positions instanceof Float32Array)
-      || positions.length !== pointCount * 3
+      || (dimension !== 1 && dimension !== 2 && dimension !== 3)
+      || positions.length !== pointCount * dimension
     ) {
       throw new TypeError(
-        'Smoke density source requires the exact dataset Float32 XYZ array.'
+        'Smoke density source requires the exact dataset Float32 positions and their dimension.'
       );
     }
     const alpha = this.categoryTransparency;
     if (
-      !(alpha instanceof Float32Array)
+      !(alpha instanceof Uint8Array)
       || alpha.length !== pointCount
     ) {
       throw new TypeError(
@@ -575,7 +616,7 @@ export const viewContextViewerSyncMethods = {
       );
     }
     const outlierQuantiles = applyOutlierFilter
-      ? this.outlierQuantilesArray
+      ? this.getActiveOutlierQuantiles()
       : null;
     const outlierThreshold = applyOutlierFilter
       ? this.getCurrentOutlierThreshold()
@@ -604,8 +645,19 @@ export const viewContextViewerSyncMethods = {
         'Smoke density source outlier threshold must be between 0 and 1.'
       );
     }
+    const colors = this.colorsArray;
+    if (
+      !(colors instanceof Uint8Array)
+      || colors.length !== pointCount * 4
+    ) {
+      throw new TypeError(
+        'Smoke density source requires the exact dataset RGBA colors.'
+      );
+    }
     return Object.freeze({
       alpha,
+      colors,
+      dimension,
       outlierQuantiles,
       outlierThreshold,
       positions,

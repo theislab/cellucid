@@ -11,6 +11,7 @@
 
 import { purgePlot } from '../../plots/plotly-loader.js';
 import { createExportToolbar } from './export.js';
+import { coalesceToFrame } from '../../../ui/components/controls.js';
 
 // =============================================================================
 // CONSTANTS
@@ -178,7 +179,7 @@ export function createAnalysisModal(options = {}) {
   const title = document.createElement('h3');
   title.className = 'analysis-modal-title';
   title.id = titleId;
-  title.textContent = 'Page Analysis';
+  title.textContent = 'Page analysis';
 
   const closeBtn = document.createElement('button');
   closeBtn.type = 'button';
@@ -226,9 +227,13 @@ export function createAnalysisModal(options = {}) {
     const exportRow = document.createElement('div');
     exportRow.className = 'analysis-options-export-row';
 
+    // The caption names the group of export buttons.
     const exportLabel = document.createElement('span');
     exportLabel.className = 'analysis-options-export-label';
-    exportLabel.textContent = 'Export:';
+    exportLabel.id = `${titleId}-export`;
+    exportLabel.textContent = 'Export';
+    exportToolbar.setAttribute('role', 'group');
+    exportToolbar.setAttribute('aria-labelledby', exportLabel.id);
 
     exportRow.appendChild(exportLabel);
     exportRow.appendChild(exportToolbar);
@@ -237,7 +242,7 @@ export function createAnalysisModal(options = {}) {
 
   const optionsTitleText = document.createElement('span');
   optionsTitleText.className = 'analysis-options-title-text';
-  optionsTitleText.textContent = 'Plot Options';
+  optionsTitleText.textContent = 'Plot options';
   optionsTitle.appendChild(optionsTitleText);
   optionsPanel.appendChild(optionsTitle);
 
@@ -270,7 +275,7 @@ export function createAnalysisModal(options = {}) {
 
   const statsTitle = document.createElement('div');
   statsTitle.className = 'analysis-panel-title';
-  statsTitle.textContent = 'Summary Statistics';
+  statsTitle.textContent = 'Summary statistics';
   statsPanel.appendChild(statsTitle);
 
   const statsContent = document.createElement('div');
@@ -291,7 +296,7 @@ export function createAnalysisModal(options = {}) {
 
   const annotationsTitle = document.createElement('div');
   annotationsTitle.className = 'analysis-panel-title';
-  annotationsTitle.textContent = 'Statistical Analysis';
+  annotationsTitle.textContent = 'Statistical analysis';
   annotationsPanel.appendChild(annotationsTitle);
 
   const annotationsContent = document.createElement('div');
@@ -329,6 +334,8 @@ export function createAnalysisModal(options = {}) {
   modal._statsContent = statsContent;
   modal._annotationsContent = annotationsContent;
   modal._title = title;
+  // The region every expanded-view render replaces (plot, stats, annotations).
+  modal._body = body;
 
   return modal;
 }
@@ -438,6 +445,34 @@ function initializeModalResize(content, edgeRight, edgeBottom) {
 // =============================================================================
 
 /**
+ * An element's layout offset inside one of its offset ancestors.
+ *
+ * Sums `offsetLeft`/`offsetTop` up the offset-parent chain, which CSS
+ * transforms do not affect. Throws when `ancestor` is not on that chain, since
+ * a partial sum would be a position relative to some other box.
+ *
+ * @param {HTMLElement} element
+ * @param {HTMLElement} ancestor
+ * @returns {{ left: number, top: number }}
+ */
+function layoutOffsetWithin(element, ancestor) {
+  let left = 0;
+  let top = 0;
+  let node = element;
+  while (node !== ancestor) {
+    if (node === null || node === undefined) {
+      throw new TypeError(
+        'Analysis modal layout offset requires an offset ancestor on the chain.'
+      );
+    }
+    left += node.offsetLeft;
+    top += node.offsetTop;
+    node = node.offsetParent;
+  }
+  return { left, top };
+}
+
+/**
  * Initialize internal panel resizable behavior using flexbox and direct pixel manipulation
  * This approach is more predictable than CSS Grid fr units for resizing
  * @param {HTMLElement} content - Modal content element
@@ -457,6 +492,8 @@ function initializeResizers(content, body, footerArea, verticalResizer, horizont
   let startOptionsWidth = 0;
   let startFooterHeight = 0;
   let startStatsWidth = 0;
+  /** Sizes measured once at pointerdown; see `startResize`. */
+  let resizeBounds = null;
   let capturedPointerId = null;
   let capturedPointerTarget = null;
   let intersectionFrame = null;
@@ -466,20 +503,27 @@ function initializeResizers(content, body, footerArea, verticalResizer, horizont
   // Get elements
   const statsPanel = footerArea.querySelector('.analysis-modal-stats-panel');
 
-  // Position the intersection resizer at the corner of vertical and horizontal resizers
+  // Position the intersection resizer at the corner of vertical and horizontal
+  // resizers. Layout offsets, not client rectangles: the content box is under
+  // a `scale()` open transition, and a rectangle read while it runs is scaled
+  // about the box centre, so the corner landed somewhere different on every
+  // open depending on how far the transition had got.
   const updateIntersectionPosition = () => {
-    const contentRect = content.getBoundingClientRect();
-    const verticalResizerRect = verticalResizer.getBoundingClientRect();
-    const horizontalResizerRect = horizontalResizer.getBoundingClientRect();
+    // The narrow layout hides every internal resizer (`display: none`), and a
+    // box that is not rendered has no offset parent and no corner to mark.
+    if (
+      verticalResizer.offsetParent === null ||
+      horizontalResizer.offsetParent === null
+    ) {
+      return;
+    }
     const intersectionSize = 16;
-
-    // Get the center point of each resizer
-    const verticalResizerCenterX = verticalResizerRect.left + (verticalResizerRect.width / 2);
-    const horizontalResizerCenterY = horizontalResizerRect.top + (horizontalResizerRect.height / 2);
-
-    // Position intersection centered on both resizers (relative to content)
-    const leftPos = verticalResizerCenterX - contentRect.left - (intersectionSize / 2);
-    const topPos = horizontalResizerCenterY - contentRect.top - (intersectionSize / 2);
+    const vertical = layoutOffsetWithin(verticalResizer, content);
+    const horizontal = layoutOffsetWithin(horizontalResizer, content);
+    const leftPos =
+      vertical.left + (verticalResizer.offsetWidth / 2) - (intersectionSize / 2);
+    const topPos =
+      horizontal.top + (horizontalResizer.offsetHeight / 2) - (intersectionSize / 2);
 
     intersectionResizer.style.left = `${leftPos}px`;
     intersectionResizer.style.top = `${topPos}px`;
@@ -506,6 +550,18 @@ function initializeResizers(content, body, footerArea, verticalResizer, horizont
     startOptionsWidth = optionsPanel.offsetWidth;
     startFooterHeight = footerArea.offsetHeight;
     startStatsWidth = statsPanel ? statsPanel.offsetWidth : 0;
+    // Everything a drag measures is fixed for its duration, so it is measured
+    // once here; pointer moves then only compute and write.
+    const headerEl = content.querySelector('.analysis-modal-header');
+    resizeBounds = {
+      bodyWidth: body.getBoundingClientRect().width,
+      verticalResizerWidth: verticalResizer.offsetWidth,
+      contentHeight: content.getBoundingClientRect().height,
+      headerHeight: headerEl ? headerEl.offsetHeight : 0,
+      horizontalResizerHeight: horizontalResizer.offsetHeight,
+      footerWidth: footerArea.getBoundingClientRect().width,
+      footerResizerWidth: footerResizer.offsetWidth
+    };
 
     // Add resizing class for visual feedback
     if (type === 'vertical' || type === 'intersection') {
@@ -564,60 +620,55 @@ function initializeResizers(content, body, footerArea, verticalResizer, horizont
     }
   };
 
-  // Pointer move handler
-  const handlePointerMove = (e) => {
-    if (!activeResizer) return;
+  // Pointer moves arrive several times per frame. Each one only computes the
+  // target sizes from the bounds measured at pointerdown; the sizes are
+  // written once per frame, followed by the intersection handle's position.
+  const applyResize = coalesceToFrame((deltaX, deltaY, type) => {
+    const bounds = resizeBounds;
+    if (bounds === null) return;
 
-    const deltaX = e.clientX - startX;
-    const deltaY = e.clientY - startY;
-
-    // Handle vertical resizer (options panel width)
-    if (activeResizer === 'vertical' || activeResizer === 'intersection') {
-      const bodyRect = body.getBoundingClientRect();
-      const resizerWidth = verticalResizer.offsetWidth;
-      const maxOptionsWidth = bodyRect.width - MIN_SIZES.plotWidth - resizerWidth;
-
-      // Negative deltaX = dragging left = increasing options width
-      let newOptionsWidth = startOptionsWidth - deltaX;
-      newOptionsWidth = Math.max(MIN_SIZES.optionsWidth, Math.min(newOptionsWidth, maxOptionsWidth));
-
+    // Vertical resizer (options panel width). Dragging left (negative deltaX)
+    // widens the options panel.
+    if (type === 'vertical' || type === 'intersection') {
+      const maxOptionsWidth = bounds.bodyWidth - MIN_SIZES.plotWidth - bounds.verticalResizerWidth;
+      const newOptionsWidth = Math.max(
+        MIN_SIZES.optionsWidth,
+        Math.min(startOptionsWidth - deltaX, maxOptionsWidth)
+      );
       optionsPanel.style.width = `${newOptionsWidth}px`;
     }
 
-    // Handle horizontal resizer (footer height)
-    if (activeResizer === 'horizontal' || activeResizer === 'intersection') {
-      const contentRect = content.getBoundingClientRect();
-      const headerEl = content.querySelector('.analysis-modal-header');
-      const headerHeight = headerEl ? headerEl.offsetHeight : 0;
-      const hResizerHeight = horizontalResizer.offsetHeight;
-      const maxFooterHeight = contentRect.height - headerHeight - MIN_SIZES.bodyHeight - hResizerHeight;
-
-      // Negative deltaY = dragging up = increasing footer height
-      let newFooterHeight = startFooterHeight - deltaY;
-      newFooterHeight = Math.max(MIN_SIZES.footerHeight, Math.min(newFooterHeight, maxFooterHeight));
-
+    // Horizontal resizer (footer height). Dragging up raises the footer.
+    if (type === 'horizontal' || type === 'intersection') {
+      const maxFooterHeight = bounds.contentHeight - bounds.headerHeight
+        - MIN_SIZES.bodyHeight - bounds.horizontalResizerHeight;
+      const newFooterHeight = Math.max(
+        MIN_SIZES.footerHeight,
+        Math.min(startFooterHeight - deltaY, maxFooterHeight)
+      );
       footerArea.style.height = `${newFooterHeight}px`;
     }
 
-    // Handle footer resizer (stats/annotations split)
-    if (activeResizer === 'footer') {
-      const footerRect = footerArea.getBoundingClientRect();
-      const fResizerWidth = footerResizer.offsetWidth;
-      const maxStatsWidth = footerRect.width - MIN_SIZES.annotationsWidth - fResizerWidth;
-
-      let newStatsWidth = startStatsWidth + deltaX;
-      newStatsWidth = Math.max(MIN_SIZES.statsWidth, Math.min(newStatsWidth, maxStatsWidth));
-
-      if (statsPanel) {
-        statsPanel.style.flex = 'none';
-        statsPanel.style.width = `${newStatsWidth}px`;
-      }
+    // Footer resizer (stats/annotations split)
+    if (type === 'footer' && statsPanel) {
+      const maxStatsWidth = bounds.footerWidth - MIN_SIZES.annotationsWidth - bounds.footerResizerWidth;
+      const newStatsWidth = Math.max(
+        MIN_SIZES.statsWidth,
+        Math.min(startStatsWidth + deltaX, maxStatsWidth)
+      );
+      statsPanel.style.flex = 'none';
+      statsPanel.style.width = `${newStatsWidth}px`;
     }
 
-    // Update intersection position during resize
-    if (activeResizer === 'vertical' || activeResizer === 'horizontal' || activeResizer === 'intersection') {
-      scheduleIntersectionPosition();
+    if (type === 'vertical' || type === 'horizontal' || type === 'intersection') {
+      updateIntersectionPosition();
     }
+  });
+
+  // Pointer move handler
+  const handlePointerMove = (e) => {
+    if (!activeResizer) return;
+    applyResize(e.clientX - startX, e.clientY - startY, activeResizer);
   };
 
   const finishResize = ({ updatePosition = true } = {}) => {
@@ -627,6 +678,10 @@ function initializeResizers(content, body, footerArea, verticalResizer, horizont
     ) {
       return;
     }
+
+    // The last move of the drag is applied before the drag ends.
+    applyResize.flush();
+    resizeBounds = null;
 
     // Remove resizing classes
     verticalResizer.classList.remove('resizing');
@@ -691,19 +746,16 @@ function initializeResizers(content, body, footerArea, verticalResizer, horizont
   const onWindowResize = scheduleIntersectionPosition;
   window.addEventListener('resize', onWindowResize);
 
-  // Create a ResizeObserver to update intersection position when content changes
-  // This will also fire when the modal is first added to DOM and laid out
+  // Create a ResizeObserver to update intersection position when content changes.
+  // It also fires when the modal is first added to the DOM and laid out, and
+  // because the position is read from layout offsets, that first layout is
+  // final: the open transition cannot move it afterwards.
   const resizeObserver = new ResizeObserver(() => {
     scheduleIntersectionPosition();
   });
   resizeObserver.observe(content);
   resizeObserver.observe(body);
   resizeObserver.observe(footerArea);
-
-  // Also update after modal open animation completes (200ms + buffer)
-  const intersectionTimeout = setTimeout(() => {
-    updateIntersectionPosition();
-  }, 250);
 
   return () => {
     const errors = [];
@@ -733,7 +785,6 @@ function initializeResizers(content, body, footerArea, verticalResizer, horizont
       run(() => resizeObserver.disconnect());
     }
 
-    run(() => clearTimeout(intersectionTimeout));
     if (intersectionFrame !== null) {
       run(() => cancelAnimationFrame(intersectionFrame));
       intersectionFrame = null;
@@ -872,23 +923,21 @@ export function openModal(modal) {
   document.body.appendChild(modal);
   // Force reflow for animation
   modal.offsetHeight;
-  modal.classList.add('open');
 
-  // After animation, switch to absolute positioning so resize anchors top-left
+  // Anchor the content at its centred layout position so a resize grows from
+  // the top-left corner. The position is the layout offset, which a transform
+  // never changes, so it is read now rather than after the `scale()` open
+  // transition: a client rectangle read while that transition runs is scaled
+  // about the box centre, and a timer cannot know when it has finished.
   const content = modal.querySelector('.analysis-modal-content');
   if (content) {
-    // Wait for open animation to complete
-    modal._openPositionTimeout = setTimeout(() => {
-      const rect = content.getBoundingClientRect();
-      const modalRect = modal.getBoundingClientRect();
-
-      // Switch to absolute positioning anchored at top-left
-      content.style.position = 'absolute';
-      content.style.left = `${rect.left - modalRect.left}px`;
-      content.style.top = `${rect.top - modalRect.top}px`;
-      content.style.margin = '0';
-    }, 200);
+    const { left, top } = layoutOffsetWithin(content, modal);
+    content.style.position = 'absolute';
+    content.style.left = `${left}px`;
+    content.style.top = `${top}px`;
+    content.style.margin = '0';
   }
+  modal.classList.add('open');
 
   const focusableEls = getFocusableElements(modal);
   (focusableEls[0] ?? modal).focus();
@@ -1000,12 +1049,6 @@ function beginModalCleanup(modal) {
       document.removeEventListener('keydown', modal._escapeHandler, true);
     });
     modal._escapeHandler = null;
-  }
-
-  // Cancel deferred positioning if the modal is closed quickly.
-  if (modal._openPositionTimeout) {
-    clearTimeout(modal._openPositionTimeout);
-    modal._openPositionTimeout = null;
   }
 
   // Slot-owning callers retire their exact child before this parent purge
@@ -1160,13 +1203,3 @@ export function closeModal(modal) {
   }).then(resolveClose, rejectClose);
   return closePromise;
 }
-
-// =============================================================================
-// EXPORTS
-// =============================================================================
-
-export default {
-  createAnalysisModal,
-  openModal,
-  closeModal
-};

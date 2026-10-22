@@ -1,5 +1,5 @@
 {
-  "version": 2,
+  "version": 3,
   "id": "current-ui-prepared",
   "name": "Current UI prepared fixture",
   "description": "Exact prepared browser CI fixture",
@@ -15,12 +15,23 @@
     "n_edges": null
   },
   "embeddings": {
-    "available_dimensions": [
-      2
-    ],
     "default_dimension": 2,
-    "files": {
-      "2d": "points_2d.bin"
+    "defaults": {
+      "2d": "X_umap_2d"
+    },
+    "items": {
+      "X_umap_2d": {
+        "label": "X_umap_2d",
+        "dimension": 2,
+        "file": "embeddings/0_2d.bin",
+        "source": {
+          "key": "X_umap_2d",
+          "columns": [
+            0,
+            1
+          ]
+        }
+      }
     }
   },
   "obs_fields": [

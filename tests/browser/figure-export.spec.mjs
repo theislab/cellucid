@@ -70,7 +70,7 @@ async function openFigureExport(page, acceptance) {
     'Current UI prepared fixture',
   );
   await expect(page.locator('#filter-count')).toHaveText(
-    'Showing all 120 points',
+    'Showing all 120 cells',
   );
 
   await page.locator('#figure-export-section > summary').click();
@@ -290,12 +290,10 @@ test('export cancellation settles native canvas work and cleans download staging
   );
 
   const result = await page.evaluate(async () => {
-    const {
-      canvasToBlob,
-      downloadBlob,
-    } = await import(
+    const { canvasToBlob } = await import(
       '/assets/js/app/ui/modules/figure-export/utils/export-helpers.js'
     );
+    const { downloadBlob } = await import('/assets/js/app/utils/download.js');
 
     let lateCanvasCallback = null;
     const canvasController = new AbortController();
@@ -702,6 +700,42 @@ test('exports PNG and every explicit SVG strategy through the visible UI', async
     assertSvgArtifact(svg.bytes, strategy);
   }
 
+  expect(productErrors).toEqual([]);
+});
+
+test('exports the sculpted shader quality as PNG and every SVG strategy', async ({
+  page,
+}, testInfo) => {
+  // Sculpted draws opaque points whose depth-pass edge is a multisample
+  // coverage mask, and fogs by mixing toward the paper; the export runs the
+  // same programs and state, so it must complete in every format.
+  const productErrors = observeProductErrors(page);
+  await installExportProbe(page);
+  await openFigureExport(page, `figure-export-sculpted-${testInfo.project.name}`);
+  await page.evaluate(() => {
+    const select = document.getElementById('hp-shader-quality');
+    select.value = 'sculpted';
+    select.dispatchEvent(new Event('change', { bubbles: true }));
+  });
+
+  const png = await exportOne({
+    page,
+    testInfo,
+    mode: 'png',
+    strategy: null,
+    artifactLabel: `${testInfo.project.name}-figure-export-sculpted`,
+  });
+  assertPngArtifact(png.bytes);
+  for (const strategy of ['full-vector', 'hybrid']) {
+    const svg = await exportOne({
+      page,
+      testInfo,
+      mode: 'svg',
+      strategy,
+      artifactLabel: `${testInfo.project.name}-figure-export-sculpted-${strategy}`,
+    });
+    assertSvgArtifact(svg.bytes, strategy);
+  }
   expect(productErrors).toEqual([]);
 });
 

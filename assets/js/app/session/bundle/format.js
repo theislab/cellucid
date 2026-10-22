@@ -9,13 +9,17 @@
  *
  * Current format constraints:
  * - No version, compatibility, or migration fields.
- * - Treat session files as untrusted input; enforce strict bounds.
+ * - Treat session files as untrusted input: every length is checked against
+ *   the bytes the file still holds, and every inflate is bounded by the
+ *   chunk's declared `uncompressedBytes`.
+ * - A frame length is a u32, so the manifest and each stored chunk hold at
+ *   most 4 GiB − 1 bytes; that is the format's only size limit.
  *
  * @module session/bundle/format
  */
 
 /** Fixed ASCII prelude used to reject non-session files quickly. */
-export const SESSION_BUNDLE_MAGIC = 'CELLUCID_SESSION\n';
+const SESSION_BUNDLE_MAGIC = 'CELLUCID_SESSION\n';
 
 /** @type {Uint8Array} */
 export const SESSION_BUNDLE_MAGIC_BYTES = new TextEncoder().encode(SESSION_BUNDLE_MAGIC);
@@ -24,24 +28,10 @@ export const SESSION_BUNDLE_MAGIC_BYTES = new TextEncoder().encode(SESSION_BUNDL
 export const U32_BYTES = 4;
 
 /**
- * Hard cap for manifest size to avoid pathological allocations on corrupt input.
+ * The most bytes one frame (the manifest, or one stored chunk) can hold: its
+ * length is a u32. This is the format's limit, not a policy.
  */
-export const MAX_MANIFEST_BYTES = 16 * 1024 * 1024;
-
-/**
- * Hard cap for every uncompressed chunk.
- * This is a zip-bomb guard; `uncompressedBytes` is required in the current schema.
- */
-export const MAX_UNCOMPRESSED_CHUNK_BYTES = 512 * 1024 * 1024;
-
-/**
- * Hard cap for stored chunk size (after codec, before decompression/JSON parse).
- *
- * This is primarily a guard for streamed inputs where total file size may be
- * unknown or unreliable (e.g., `Content-Encoding` makes `Content-Length` a hint).
- * Without this, a corrupt file could request multi‑GB allocations.
- */
-export const MAX_STORED_CHUNK_BYTES = 512 * 1024 * 1024;
+export const MAX_FRAME_BYTES = 0xffff_ffff;
 
 /**
  * Encode a number as u32 little-endian.

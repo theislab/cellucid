@@ -92,7 +92,8 @@ test('a control named at runtime is named by the module that owns it', () => {
 
 test('the field action buttons name the field they act on', () => {
   const fieldActions = buttons.filter(button =>
-    button.className.split(/\s+/).includes('field-action-btn')
+    /^(copy|rename|delete|clear)-(categorical-field|continuous-field|gene-expression)$/.test(button.id ?? '')
+    && button.className.split(/\s+/).includes('icon-btn')
   );
   assert.equal(fieldActions.length, 12);
 

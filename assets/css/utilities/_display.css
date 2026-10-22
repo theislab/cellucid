@@ -38,8 +38,3 @@
 .shadow-md { box-shadow: var(--shadow-md) !important; }
 .shadow-lg { box-shadow: var(--shadow-lg) !important; }
 .shadow-xl { box-shadow: var(--shadow-xl) !important; }
-.shadow-soft-xs { box-shadow: var(--shadow-soft-xs) !important; }
-.shadow-soft-sm { box-shadow: var(--shadow-soft-sm) !important; }
-.shadow-soft-md { box-shadow: var(--shadow-soft-md) !important; }
-.shadow-soft-lg { box-shadow: var(--shadow-soft-lg) !important; }
-.shadow-soft-xl { box-shadow: var(--shadow-soft-xl) !important; }

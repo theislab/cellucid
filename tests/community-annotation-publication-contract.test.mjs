@@ -255,7 +255,7 @@ test('the browser validator rejects malformed streamed tree JSON before annotati
   try {
     const sync = createSync();
     await assert.rejects(
-      () => sync.pullAllUsers(),
+      () => sync.pullAllUsers({ onRecords: async () => {} }),
       /duplicate JSON object key "tree"/
     );
     assert.equal(fetchCount, 1);
@@ -289,7 +289,7 @@ test('the browser validator rejects malformed streamed blob base64 before annota
         });
       const sync = createSync();
       await assert.rejects(
-        () => sync.pullAllUsers(),
+        () => sync.pullAllUsers({ onRecords: async () => {} }),
         /base64|padding bits/
       );
       assert.equal(responses.length, 0);
@@ -360,7 +360,7 @@ test('oversized remote Contents and blob payloads retain typed path-aware pull e
         status: 200,
       });
     await assert.rejects(
-      () => createSync().pullAllUsers(),
+      () => createSync().pullAllUsers({ onRecords: async () => {} }),
       assertOversizedPullError
     );
     assert.equal(blobResponses.length, 0);

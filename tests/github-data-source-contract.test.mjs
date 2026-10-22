@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { getNotificationCenter } from '../assets/js/app/notification-center.js';
+import { DataSourceManager } from '../assets/js/data/data-source-manager.js';
 import {
   GitHubDataSource,
   parseGitHubPath,
@@ -35,7 +36,7 @@ function identity(
   } = {}
 ) {
   return {
-    version: 2,
+    version: 3,
     id,
     name,
     description,
@@ -50,9 +51,16 @@ function identity(
       n_edges: null,
     },
     embeddings: {
-      available_dimensions: [2],
       default_dimension: 2,
-      files: { '2d': 'points_2d.bin' },
+      defaults: { '2d': 'X_umap' },
+      items: {
+        X_umap: {
+          label: 'X_umap',
+          dimension: 2,
+          file: 'embeddings/0_2d.bin',
+          source: { key: 'X_umap', columns: [0, 1] },
+        },
+      },
     },
     obs_fields: [],
   };
@@ -930,4 +938,11 @@ test('an in-flight GitHub refresh cannot overwrite a replacement connection', as
     source.getBaseUrl('replacement'),
     'https://raw.githubusercontent.com/owner/repo/main/exports/replacement/'
   );
+});
+
+test('an unconnected GitHub source has nothing to refresh and does not fail a reload', async () => {
+  const manager = new DataSourceManager();
+  manager.registerSource('github-repo', new GitHubDataSource());
+  const results = await manager.getAllDatasets({ refresh: true });
+  assert.deepEqual(results, []);
 });

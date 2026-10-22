@@ -4,8 +4,10 @@
 // The shipped SMOKE_VS_SOURCE / SMOKE_FS_SOURCE are compiled unmodified and
 // driven with uniforms that neutralise everything except the base density:
 // curl warping off, detail off, erosion off, a constant shape-noise volume so
-// the shape modifier is exactly 1, and an all-zero blue-noise target so the
-// march jitter is zero unless a test asks for it. What comes back is therefore
+// the shape modifier is exactly 1, an all-zero blue-noise target so the
+// march jitter is zero unless a test asks for it, an unshadowed lighting
+// volume, and -- unless a test passes the built one -- an occupancy volume
+// that marks every block occupied, so no empty-space skip happens. What comes back is therefore
 // the density field the shader believes the volume holds, sampled on a
 // near-orthographic grid of rays down -Z.
 
@@ -142,9 +144,12 @@ export function marchVolume(gl, {
   jitter = false,
   densityMultiplier = 0.03,
   stepMultiplier = 1.0,
+  occupancyTexture = null,
 }) {
   const shape = constantVolume(gl, 8, 255);
   const detail = constantVolume(gl, 8, 128);
+  const light = constantVolume(gl, 8, 0);
+  const fullOccupancy = occupancyTexture === null ? constantVolume(gl, 8, 255) : null;
   const noise = blueNoise(gl, jitter);
 
   const program = link(gl, SMOKE_VS_SOURCE, SMOKE_FS_SOURCE);
@@ -193,10 +198,8 @@ export function marchVolume(gl, {
   gl.uniform3f(uniform('u_volumeMin'), -1, -1, -1);
   gl.uniform3f(uniform('u_volumeMax'), 1, 1, 1);
   gl.uniform1f(uniform('u_gridSize'), gridSize);
-  gl.uniform3f(uniform('u_smokeColor'), 1, 1, 1);
   gl.uniform3f(uniform('u_lightDir'), 0, 1, 0);
   gl.uniform1f(uniform('u_time'), 0);
-  gl.uniform1f(uniform('u_animationSpeed'), 0);
   gl.uniform1f(uniform('u_densityMultiplier'), densityMultiplier);
   gl.uniform1f(uniform('u_stepMultiplier'), stepMultiplier);
   gl.uniform1f(uniform('u_noiseScale'), 1);
@@ -206,8 +209,6 @@ export function marchVolume(gl, {
   gl.uniform1f(uniform('u_scatterStrength'), 0);
   gl.uniform1f(uniform('u_edgeSoftness'), 0);
   gl.uniform1f(uniform('u_directLightIntensity'), 0.5);
-  gl.uniform1i(uniform('u_lightSamples'), 1);
-  gl.uniform2f(uniform('u_blueNoiseOffset'), 0, 0);
   gl.activeTexture(gl.TEXTURE0);
   gl.bindTexture(gl.TEXTURE_3D, densityTexture);
   gl.uniform1i(uniform('u_densityTex3D'), 0);
@@ -220,6 +221,12 @@ export function marchVolume(gl, {
   gl.activeTexture(gl.TEXTURE3);
   gl.bindTexture(gl.TEXTURE_2D, noise);
   gl.uniform1i(uniform('u_blueNoise'), 3);
+  gl.activeTexture(gl.TEXTURE4);
+  gl.bindTexture(gl.TEXTURE_3D, light);
+  gl.uniform1i(uniform('u_lightTex3D'), 4);
+  gl.activeTexture(gl.TEXTURE5);
+  gl.bindTexture(gl.TEXTURE_3D, occupancyTexture ?? fullOccupancy);
+  gl.uniform1i(uniform('u_occupancyTex3D'), 5);
   gl.drawArrays(gl.TRIANGLES, 0, 3);
 
   const pixels = new Uint8Array(size * size * 4);
@@ -232,7 +239,7 @@ export function marchVolume(gl, {
   gl.useProgram(null);
   gl.bindVertexArray(null);
   gl.bindBuffer(gl.ARRAY_BUFFER, null);
-  for (const unit of [0, 1, 2, 3]) {
+  for (const unit of [0, 1, 2, 3, 4, 5]) {
     gl.activeTexture(gl.TEXTURE0 + unit);
     gl.bindTexture(gl.TEXTURE_2D, null);
     gl.bindTexture(gl.TEXTURE_3D, null);
@@ -243,6 +250,8 @@ export function marchVolume(gl, {
   gl.deleteTexture(shape);
   gl.deleteTexture(detail);
   gl.deleteTexture(noise);
+  gl.deleteTexture(light);
+  if (fullOccupancy !== null) gl.deleteTexture(fullOccupancy);
   gl.deleteVertexArray(vertexArray);
   gl.deleteBuffer(buffer);
   gl.deleteProgram(program);

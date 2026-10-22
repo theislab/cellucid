@@ -201,3 +201,38 @@ test('a duplicated category name is refused rather than guessed', async () => {
     },
   );
 });
+
+/** Wrap a category inventory so every element and length read is counted. */
+function countingCategories(names) {
+  const reads = { count: 0 };
+  const proxy = new Proxy([...names], {
+    get(target, property, receiver) {
+      if (property === 'length' || /^\d+$/.test(String(property))) {
+        reads.count += 1;
+      }
+      return Reflect.get(target, property, receiver);
+    },
+  });
+  return { proxy, reads };
+}
+
+test('restoring a filter over many categories reads the inventory once', () => {
+  const count = 2_000;
+  const names = Array.from({ length: count }, (_, index) => `cluster_${index}`);
+  const saving = createHarness(names);
+  for (let index = 0; index < count; index += 2) {
+    saving.state.setVisibilityForCategory(saving.cellType, index, false);
+  }
+  const session = saving.serializer.serializeFilters();
+  assert.equal(session['obs:cell_type'].visibility.length, count / 2);
+
+  const restoring = createHarness(names);
+  const { proxy, reads } = countingCategories(names);
+  restoring.cellType.categories = proxy;
+  reads.count = 0;
+  restoring.serializer.validateFilters(session);
+  assert.ok(
+    reads.count <= 4 * count,
+    `restore read the ${count}-category inventory ${reads.count} times`,
+  );
+});

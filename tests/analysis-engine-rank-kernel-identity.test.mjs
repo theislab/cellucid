@@ -12,6 +12,9 @@ import test from 'node:test';
 
 import {
   computeRanks,
+  DistinctValueIndex,
+  MAX_TABULATED_DISTINCT_VALUES,
+  medianInPlace,
   mannWhitneyPValue,
   mannWhitneyU,
   sampleMoments,
@@ -23,8 +26,7 @@ import {
 } from '../assets/js/app/analysis/compute/math-utils.js';
 import {
   computeCorrelation,
-  computeDifferential,
-  computeStats
+  computeDifferential
 } from '../assets/js/app/analysis/compute/operation-handlers.js';
 import {
   kruskalWallis,
@@ -32,6 +34,7 @@ import {
   tTest
 } from '../assets/js/app/analysis/stats/statistical-tests.js';
 import { computeStats as numberUtilsComputeStats } from '../assets/js/app/analysis/shared/number-utils.js';
+import { MultiVariableAnalysis } from '../assets/js/app/analysis/stats/multi-variable-analysis.js';
 
 // ---------------------------------------------------------------------------
 // Deterministic generators
@@ -172,46 +175,6 @@ function referenceKruskalH(groups) {
   const correction = 1 - tieTerm / (N ** 3 - N);
   if (!(correction > 0)) return null;
   return Math.max(0, H / correction);
-}
-
-/** Order statistics by definition: sort a boxed copy and index into it. */
-function referenceComputeStats(values) {
-  const numeric = [];
-  for (let i = 0; i < values.length; i++) {
-    const value = values[i];
-    if (typeof value === 'number' && Number.isFinite(value)) numeric.push(value);
-  }
-  const n = numeric.length;
-  if (n === 0) return null;
-  const sorted = [...numeric].sort((a, b) => a - b);
-  const sum = numeric.reduce((a, b) => a + b, 0);
-  const meanValue = sum / n;
-  // `computeStats` squares through `values.map(...)`, whose result container
-  // follows the input container: a Float32Array input rounds each squared
-  // deviation to single precision before summation, a boxed Array does not.
-  // That container-dependent rounding predates this test and is preserved here
-  // deliberately, so the reference has to mirror it.
-  const squaredDiffs = ArrayBuffer.isView(values)
-    ? new Float32Array(n)
-    : new Array(n);
-  for (let i = 0; i < n; i++) squaredDiffs[i] = Math.pow(numeric[i] - meanValue, 2);
-  const varianceValue = squaredDiffs.reduce((a, b) => a + b, 0) / n;
-  const q1 = sorted[Math.floor(n * 0.25)];
-  const midIndex = Math.floor(n * 0.5);
-  const q3 = sorted[Math.floor(n * 0.75)];
-  return {
-    count: n,
-    min: sorted[0],
-    max: sorted[n - 1],
-    mean: meanValue,
-    median: n % 2 === 0 ? (sorted[midIndex - 1] + sorted[midIndex]) / 2 : sorted[midIndex],
-    std: Math.sqrt(varianceValue),
-    q1,
-    q3,
-    iqr: q3 - q1,
-    sum,
-    variance: varianceValue
-  };
 }
 
 // ---------------------------------------------------------------------------
@@ -448,43 +411,6 @@ test('selectSorted returns the element at each requested sorted position', () =>
   assert.deepEqual(selectSorted([9, 4, 7, 4], [3, 0, 0]), [9, 4, 4]);
 });
 
-test('computeStats order statistics equal the boxed-sort definition', () => {
-  for (let trial = 0; trial < 300; trial++) {
-    const random = mulberry32(trial + 1501);
-    const length = 1 + Math.floor(random() * 2000);
-    const values = quantizedValues(length, trial + 1502, { dropout: random() * 0.9 });
-    const actual = computeStats({ values });
-    const expected = referenceComputeStats(values);
-    for (const key of Object.keys(expected)) {
-      assert.ok(
-        Object.is(actual[key], expected[key]),
-        `trial ${trial} ${key}: ${actual[key]} !== ${expected[key]}`
-      );
-    }
-  }
-
-  // Continuous inputs pass the tabulation bound and take the sorting strategy.
-  for (const length of [500, 9000]) {
-    const values = continuousValues(length, length + 1811);
-    const actual = computeStats({ values });
-    const expected = referenceComputeStats(values);
-    for (const key of Object.keys(expected)) {
-      assert.ok(
-        Object.is(actual[key], expected[key]),
-        `continuous ${length} ${key}: ${actual[key]} !== ${expected[key]}`
-      );
-    }
-  }
-
-  // A boxed Array input still walks the comparator path and must agree.
-  const boxed = Array.from(quantizedValues(500, 1599));
-  const boxedActual = computeStats({ values: boxed });
-  const boxedExpected = referenceComputeStats(boxed);
-  for (const key of Object.keys(boxedExpected)) {
-    assert.ok(Object.is(boxedActual[key], boxedExpected[key]), `boxed ${key}`);
-  }
-});
-
 test('number-utils computeStats median equals the boxed-sort definition', () => {
   for (let trial = 0; trial < 200; trial++) {
     const random = mulberry32(trial + 1701);
@@ -561,18 +487,26 @@ test('Spearman correlation still ranks through the shared kernel', () => {
 
     const xRanks = referenceMidRanks(xValues);
     const yRanks = referenceMidRanks(yValues);
+    // Pearson on the ranks, from centred two-pass moments.
     const n = xRanks.length;
-    let sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0;
+    let sx = 0, sy = 0;
     for (let i = 0; i < n; i++) {
       sx += xRanks[i];
       sy += yRanks[i];
-      sxx += xRanks[i] * xRanks[i];
-      syy += yRanks[i] * yRanks[i];
-      sxy += xRanks[i] * yRanks[i];
     }
-    const numerator = n * sxy - sx * sy;
-    const denominator = Math.sqrt((n * sxx - sx * sx) * (n * syy - sy * sy));
-    const expected = denominator === 0 ? 0 : numerator / denominator;
+    const meanX = sx / n;
+    const meanY = sy / n;
+    let sxx = 0, syy = 0, sxy = 0;
+    for (let i = 0; i < n; i++) {
+      const dx = xRanks[i] - meanX;
+      const dy = yRanks[i] - meanY;
+      sxx += dx * dx;
+      syy += dy * dy;
+      sxy += dx * dy;
+    }
+    const expected = sxx > 0 && syy > 0
+      ? Math.max(-1, Math.min(1, sxy / Math.sqrt(sxx * syy)))
+      : 0;
     assert.ok(Object.is(result.r, expected), `trial ${trial} r: ${result.r} !== ${expected}`);
   }
 });
@@ -613,4 +547,152 @@ test('numeric array validation still rejects every non-numeric container', () =>
   assert.equal(typeof tTest(new Float32Array([1, 2, 3]), [4, 5, 6]).pValue, 'number');
   assert.equal(typeof tTest(new Int16Array([1, 2, 3]), [4, 5, 6]).pValue, 'number');
   assert.equal(typeof tTest([1, 2, 3], [4, 5, 6]).pValue, 'number');
+});
+
+test('medianInPlace equals the median of the comparator-sorted sample', () => {
+  const random = mulberry32(77);
+  for (let trial = 0; trial < 3000; trial++) {
+    const count = 1 + Math.floor(random() * 80);
+    const values = new Float64Array(count + 5);
+    for (let i = 0; i < count; i++) {
+      // Few levels, so ties — the case selection must not miscount — dominate.
+      values[i] = trial % 3 === 0
+        ? Math.floor(random() * 4)
+        : (random() - 0.3) * 1e3;
+    }
+    const sorted = Array.from(values.subarray(0, count)).sort((a, b) => a - b);
+    const middle = Math.floor(count / 2);
+    const expected = count % 2 === 0
+      ? (sorted[middle - 1] + sorted[middle]) / 2
+      : sorted[middle];
+    assert.ok(Object.is(medianInPlace(values, count), expected), `trial ${trial}`);
+  }
+  assert.ok(Number.isNaN(medianInPlace(new Float64Array(3), 0)));
+});
+
+test('DistinctValueIndex numbers values exactly as SameValueZero keys would', () => {
+  const index = new DistinctValueIndex();
+  const seen = new Map();
+  const random = mulberry32(5);
+  for (let i = 0; i < 20000; i++) {
+    const value = i % 7 === 0
+      ? 0
+      : (i % 11 === 0 ? -0 : Math.fround(Math.floor(random() * 300) / 7));
+    const number = index.numberOf(value);
+    if (!seen.has(value)) seen.set(value, seen.size);
+    assert.equal(number, seen.get(value));
+    assert.ok(Object.is(index.values[number] === value, true));
+  }
+  assert.equal(index.size, seen.size);
+
+  // The bound is exact: the value past it is refused, earlier ones still map.
+  const bounded = new DistinctValueIndex();
+  for (let i = 0; i < MAX_TABULATED_DISTINCT_VALUES; i++) {
+    assert.equal(bounded.numberOf(i + 0.5), i);
+  }
+  assert.equal(bounded.numberOf(-1), -1);
+  assert.equal(bounded.numberOf(10.5), 10);
+  const ascending = Array.from(bounded.ascendingNumbers(), n => bounded.values[n]);
+  assert.deepEqual(ascending, [...ascending].sort((a, b) => a - b));
+});
+
+test('signature median scores and their statistics equal the sort-based definition', async () => {
+  const cellCount = 3000;
+  const genes = Array.from({ length: 13 }, (_, g) => `GENE${g}`);
+  const random = mulberry32(31);
+  const cellIndices = Uint32Array.from({ length: cellCount }, (_, i) => i * 2);
+  const geneData = {};
+  for (const gene of genes) {
+    const values = quantizedValues(cellCount, Math.floor(random() * 1e9), { levels: 16 });
+    // A few missing measurements, so the per-cell sample size varies.
+    for (let i = 0; i < cellCount; i += 97) values[i] = NaN;
+    geneData[gene] = {
+      'page-A': { values, cellIndices, pageName: 'Page A', cellCount },
+    };
+  }
+
+  const analysis = Object.create(MultiVariableAnalysis.prototype);
+  analysis.dataLayer = {
+    getGeneExpressionSubset: async () => geneData,
+    clearBulkGeneCache() {},
+    performCacheCleanup() {},
+  };
+  analysis._computeManager = null;
+  analysis._notifications = {
+    loading: () => 'n', complete() {}, fail() {}, dismiss() {},
+  };
+  const [result] = await analysis.computeSignatureScore({
+    genes,
+    pageIds: ['page-A'],
+    method: 'median',
+  });
+
+  const expected = new Float32Array(cellCount);
+  for (let cell = 0; cell < cellCount; cell++) {
+    const sample = genes
+      .map(gene => geneData[gene]['page-A'].values[cell])
+      .filter(Number.isFinite)
+      .sort((a, b) => a - b);
+    const middle = Math.floor(sample.length / 2);
+    expected[cell] = sample.length === 0
+      ? NaN
+      : (sample.length % 2 === 0
+        ? (sample[middle - 1] + sample[middle]) / 2
+        : sample[middle]);
+  }
+  assert.deepEqual(
+    new Uint32Array(result.scores.buffer),
+    new Uint32Array(expected.buffer)
+  );
+
+  const finite = Array.from(expected).filter(Number.isFinite).sort((a, b) => a - b);
+  const middle = Math.floor(finite.length / 2);
+  const expectedMedian = finite.length % 2 === 0
+    ? (finite[middle - 1] + finite[middle]) / 2
+    : finite[middle];
+  assert.ok(Object.is(result.statistics.median, expectedMedian));
+  assert.equal(result.statistics.count, finite.length);
+  assert.ok(Object.is(result.statistics.min, finite[0]));
+  assert.ok(Object.is(result.statistics.max, finite[finite.length - 1]));
+});
+
+test('density curves weighted by distinct values match the per-value kernel sum', async () => {
+  const { default: densityplot } = await import(
+    '../assets/js/app/analysis/plots/types/densityplot.js'
+  );
+  /** The kernel density estimate written value by value, as it is defined. */
+  const referenceDensity = (values, xs, h) => xs.map(xi => {
+    let sum = 0;
+    for (const d of values) {
+      const u = (xi - d) / h;
+      sum += Math.exp(-0.5 * u * u) / Math.sqrt(2 * Math.PI);
+    }
+    return sum / (values.length * h);
+  });
+  for (const [label, values, exact] of [
+    ['quantized', Array.from(quantizedValues(20000, 9)), false],
+    ['continuous', Array.from(continuousValues(6000, 10)), true],
+  ]) {
+    const [trace] = densityplot.buildTraces(
+      [{ pageId: 'p', pageName: 'P', values }],
+      { ...densityplot.defaultOptions },
+      null
+    );
+    const n = values.length;
+    const meanValue = values.reduce((a, b) => a + b, 0) / n;
+    const sd = Math.sqrt(values.reduce((a, b) => a + (b - meanValue) ** 2, 0) / n);
+    const h = 1.06 * sd * Math.pow(n, -0.2);
+    const expected = referenceDensity(values, trace.x, h);
+    for (let i = 0; i < expected.length; i++) {
+      if (exact) {
+        assert.ok(Object.is(trace.y[i], expected[i]), `${label} point ${i}`);
+      } else {
+        // The same sum regrouped by value: equal to rounding.
+        assert.ok(
+          Math.abs(trace.y[i] - expected[i]) <= 1e-12 * Math.max(1e-300, Math.abs(expected[i])),
+          `${label} point ${i}: ${trace.y[i]} vs ${expected[i]}`
+        );
+      }
+    }
+  }
 });

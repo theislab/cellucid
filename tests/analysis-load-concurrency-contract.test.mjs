@@ -277,8 +277,13 @@ test('a page fetch reads the exact membership its cache key was built from', asy
   // membership change in that window was cached under a version it no longer
   // matched. They now share one snapshot.
   const layer = Object.create(DataLayer.prototype);
-  let membership = [0, 1];
+  const page = {
+    id: 'page-1',
+    name: 'Page 1',
+    highlightedGroups: [{ id: 'group-1', enabled: true, cellIndices: [0, 1] }],
+  };
   layer.state = {
+    pointCount: 3,
     obsData: {
       fields: [{
         kind: 'continuous',
@@ -288,7 +293,7 @@ test('a page fetch reads the exact membership its cache key was built from', asy
     },
     async ensureFieldLoaded() {
       // The membership changes while the field download is in flight.
-      membership = [0, 1, 2];
+      page.highlightedGroups[0].cellIndices = [0, 1, 2];
       layer.state.obsData.fields[0].loaded = true;
     },
   };
@@ -299,11 +304,11 @@ test('a page fetch reads the exact membership its cache key was built from', asy
   layer._notifications = null;
   layer._pageVersions = new Map();
   layer._pageIndexSnapshots = new Map();
+  layer._pageMemberships = new Map();
   layer._dataCache = null;
   layer._pendingRequests = null;
-  layer.getPages = () => [{ id: 'page-1', name: 'Page 1' }];
+  layer.getPages = () => [page];
   layer.getPageInfo = () => ({ id: 'page-1', name: 'Page 1' });
-  layer.getCellIndicesForPage = () => [...membership];
   layer.getVariableInfo = () => ({
     key: 'score',
     kind: 'continuous',

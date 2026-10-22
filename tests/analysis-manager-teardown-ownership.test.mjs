@@ -206,13 +206,17 @@ function installDockableRegistry(events = []) {
     unregister(details) {
       events.push(`unregister:${details.id}`);
     },
+    panelFrame() {
+      throw new Error('A registered window carries its frame in its entry.');
+    },
   });
 }
 
+/** A window as registration leaves it: the details standing in its frame. */
 function createBareWindowManager({ destroy }) {
   const manager = Object.create(AnalysisWindowManager.prototype);
-  const details = {
-    id: 'details-a',
+  const details = { id: 'details-a' };
+  const frame = {
     removed: false,
     remove() {
       this.removed = true;
@@ -222,10 +226,11 @@ function createBareWindowManager({ destroy }) {
     ['window-a', {
       id: 'window-a',
       details,
+      frame,
       ui: { destroy },
     }],
   ]);
-  return { details, manager };
+  return { frame, manager };
 }
 
 test(
@@ -235,19 +240,19 @@ test(
     const registryEvents = [];
     installDockableRegistry(registryEvents);
     try {
-      const { details, manager } = createBareWindowManager({
+      const { frame, manager } = createBareWindowManager({
         destroy: () => destruction.promise,
       });
 
       const result = manager.closeWindow('window-a');
-      const removedBeforeDestructionSettled = details.removed;
+      const removedBeforeDestructionSettled = frame.removed;
 
       destruction.resolve();
       await Promise.resolve(result);
 
       assert.equal(isThenable(result), true);
       assert.equal(removedBeforeDestructionSettled, false);
-      assert.equal(details.removed, true);
+      assert.equal(frame.removed, true);
       assert.deepEqual(registryEvents, ['unregister:details-a']);
     } finally {
       setDockableAccordions(null);
@@ -293,14 +298,13 @@ test(
     const destruction = deferred();
     installDockableRegistry();
     try {
-      const { details, manager } = createBareWindowManager({
+      const { frame, manager } = createBareWindowManager({
         destroy: () => destruction.promise,
       });
       const entry = manager._windows.get('window-a');
       entry.modeId = 'owned';
       entry.headerTitle = 'Owned';
-      entry.headerDesc = '';
-      entry.details.getBoundingClientRect = () => ({
+      entry.frame.getBoundingClientRect = () => ({
         height: 240,
         left: 20,
         top: 40,
@@ -313,7 +317,7 @@ test(
       assert.equal(manager.getWindowCount(), 0);
       assert.deepEqual(manager.exportSessionWindows(), []);
       assert.equal(
-        details.removed,
+        frame.removed,
         false,
         'the DOM container remains owned until asynchronous UI teardown settles',
       );
@@ -794,6 +798,14 @@ class WindowTestElement {
     this.children = [];
     this.parentNode = null;
     this.className = '';
+    const element = this;
+    this.classList = {
+      add(...names) {
+        element.className = [...element.className.split(' '), ...names]
+          .filter(Boolean)
+          .join(' ');
+      },
+    };
     this.dataset = {};
     this.style = {};
     this.attributes = new Map();
@@ -929,6 +941,9 @@ test(
         throw primaryFailure;
       },
       unregister() {},
+      panelFrame() {
+        return null;
+      },
     });
 
     try {
@@ -972,6 +987,9 @@ test(
         throw primaryFailure;
       },
       unregister() {},
+      panelFrame() {
+        return null;
+      },
     });
 
     try {
@@ -1038,11 +1056,17 @@ test(
         return new WindowTestElement(tagName);
       },
     });
+    let registration = null;
     setDockableAccordions({
       floatingRoot,
       float() {},
-      register() {},
+      register(_details, options) {
+        registration = options;
+      },
       unregister() {},
+      panelFrame() {
+        return new WindowTestElement('div');
+      },
     });
     const reported = [];
     const originalConsoleError = console.error;
@@ -1053,9 +1077,15 @@ test(
     try {
       const windowId = manager._createWindow('owned', {}, {});
       assert.equal(typeof windowId, 'string');
+      // The header controls are handed to the dockable owner, which stands
+      // them beside the summary; none of them is inside it. The summary
+      // holds only the window's title.
       const details = floatingRoot.children[0];
       const summary = details.children[0];
-      const closeButton = summary.children[3];
+      assert.equal(summary.children.length, 1);
+      assert.equal(summary.children[0].className, 'disclosure-title');
+      const closeButton = registration.actions[1];
+      assert.equal(closeButton.className, 'accordion-close-btn');
       manager.closeWindow = receivedId => {
         assert.equal(receivedId, windowId);
         return rejectedClose;
@@ -1108,13 +1138,7 @@ test(
     comparison._analysisWindowManager = null;
     comparison._uiManager = null;
     comparison.dataLayer = null;
-    comparison._hooks = { beforeRender: [], afterRender: [] };
-    comparison.layoutEngine = {};
-    comparison.transformPipeline = {};
     comparison._multiVariableAnalysis = {};
-    comparison._lastStatResults = [{}];
-    comparison._lastStatResultsTimestamp = 1;
-    comparison._currentPageData = {};
 
     const destruction = comparison.destroy();
     assert.equal(state.listenerCount('page:changed'), 0);
@@ -1157,12 +1181,7 @@ test(
         dataLayerDestroyed = true;
       },
     };
-    comparison._hooks = { beforeRender: [], afterRender: [] };
-    comparison.layoutEngine = {};
     comparison._multiVariableAnalysis = {};
-    comparison._lastStatResults = [{}];
-    comparison._lastStatResultsTimestamp = 1;
-    comparison._currentPageData = {};
 
     const result = comparison.destroy();
     const dataDestroyedBeforeChildrenSettled = dataLayerDestroyed;
@@ -1210,13 +1229,7 @@ test(
         events.push('data:destroy');
       },
     };
-    comparison._hooks = { beforeRender: [], afterRender: [] };
-    comparison.layoutEngine = {};
-    comparison.transformPipeline = {};
     comparison._multiVariableAnalysis = {};
-    comparison._lastStatResults = [{}];
-    comparison._lastStatResultsTimestamp = 1;
-    comparison._currentPageData = {};
 
     const destroyTask = comparison.destroy();
     await Promise.resolve();
@@ -1271,9 +1284,6 @@ test(
       },
     };
     comparison._multiVariableAnalysis = {};
-    comparison._lastStatResults = [{}];
-    comparison._lastStatResultsTimestamp = 1;
-    comparison._currentPageData = {};
     comparison._datasetReloadResetCount = 0;
     comparison.onPagesChanged = () => {
       events.push('pages:publish');
@@ -1332,13 +1342,7 @@ test(
         events.push('data:destroy');
       },
     };
-    comparison._hooks = { beforeRender: [], afterRender: [] };
-    comparison.layoutEngine = {};
-    comparison.transformPipeline = {};
     comparison._multiVariableAnalysis = {};
-    comparison._lastStatResults = [{}];
-    comparison._lastStatResultsTimestamp = 1;
-    comparison._currentPageData = {};
     comparison._datasetReloadResetCount = 0;
     comparison.onPagesChanged = () => {
       events.push('pages:publish');
@@ -1422,13 +1426,7 @@ test(
         events.push('data:destroy');
       },
     };
-    comparison._hooks = { beforeRender: [], afterRender: [] };
-    comparison.layoutEngine = {};
-    comparison.transformPipeline = {};
     comparison._multiVariableAnalysis = {};
-    comparison._lastStatResults = [{}];
-    comparison._lastStatResultsTimestamp = 1;
-    comparison._currentPageData = {};
     comparison._datasetReloadResetCount = 0;
     comparison.onPagesChanged = () => {
       events.push('pages:publish');
@@ -1509,13 +1507,7 @@ test(
         events.push('data:destroy');
       },
     };
-    comparison._hooks = { beforeRender: [], afterRender: [] };
-    comparison.layoutEngine = {};
-    comparison.transformPipeline = {};
     comparison._multiVariableAnalysis = {};
-    comparison._lastStatResults = [];
-    comparison._lastStatResultsTimestamp = null;
-    comparison._currentPageData = null;
 
     const destroyTask = comparison.destroy();
     await Promise.resolve();
@@ -1564,13 +1556,7 @@ test(
         dataLayerDestroyed = true;
       },
     };
-    comparison._hooks = { beforeRender: [], afterRender: [] };
-    comparison.layoutEngine = {};
-    comparison.transformPipeline = {};
     comparison._multiVariableAnalysis = {};
-    comparison._lastStatResults = [{}];
-    comparison._lastStatResultsTimestamp = 1;
-    comparison._currentPageData = {};
     comparison._datasetReloadResetCount = 0;
     comparison.onPagesChanged = () => {};
 
@@ -1607,9 +1593,6 @@ test(
       },
     };
     comparison._multiVariableAnalysis = {};
-    comparison._lastStatResults = [{}];
-    comparison._lastStatResultsTimestamp = 1;
-    comparison._currentPageData = {};
     comparison._datasetReloadResetCount = 4;
     comparison._lastDatasetReloadReset = {
       at: 123,
@@ -1658,13 +1641,7 @@ test(
       },
       destroy() {},
     };
-    comparison._hooks = { beforeRender: [], afterRender: [] };
-    comparison.layoutEngine = {};
-    comparison.transformPipeline = {};
     comparison._multiVariableAnalysis = null;
-    comparison._lastStatResults = [];
-    comparison._lastStatResultsTimestamp = null;
-    comparison._currentPageData = null;
     comparison._datasetReloadResetCount = 0;
     comparison.onPagesChanged = () => {};
 

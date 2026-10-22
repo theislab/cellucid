@@ -3,12 +3,19 @@
  *
  * One document-level controller owns every `.info-btn` disclosure. Popovers
  * are portaled to `<body>` while open so fixed positioning is not constrained
- * by the sidebar's layout containment.
+ * by the sidebar's layout containment (to the open modal `<dialog>` instead,
+ * when the trigger is inside one). Their text comes from the tip registry
+ * (`info-tips.js`): static markup names a tip with `data-info-tip`, rendered
+ * when the controller starts, and `configurePair` renders the tip a component
+ * names.
  *
  * @module ui/components/info-popovers
  */
 
+import { renderInfoTip, renderStaticInfoTips } from './info-tips.js';
+
 const TRIGGER_SELECTOR = 'button.info-btn[aria-controls]';
+const CLOSE_SELECTOR = '[data-info-tip-close]';
 const FOCUSABLE_SELECTOR = [
   'a[href]',
   'button:not([disabled])',
@@ -241,13 +248,24 @@ function isSequentiallyFocusable(element, viewport) {
   return style.display !== 'none' && style.visibility !== 'hidden';
 }
 
-function getSequentialFocusTargets(documentRef, viewport, excludedPopover) {
-  return Array.from(documentRef.querySelectorAll(FOCUSABLE_SELECTOR)).filter(
-    element => (
-      !excludedPopover.contains(element)
-      && isSequentiallyFocusable(element, viewport)
-    )
-  );
+/**
+ * The first sequentially focusable element after `trigger` in document
+ * order, outside the popover. Candidates are tested one at a time from the
+ * trigger onward, so the cost is the few elements up to the answer, not a
+ * style and layout query for every focusable element in the document (a
+ * 5,000-category legend holds 25,000 of them).
+ */
+function nextSequentialFocusTarget(documentRef, viewport, trigger, excludedPopover) {
+  let passedTrigger = false;
+  for (const element of documentRef.querySelectorAll(FOCUSABLE_SELECTOR)) {
+    if (!passedTrigger) {
+      passedTrigger = element === trigger;
+      continue;
+    }
+    if (excludedPopover.contains(element)) continue;
+    if (isSequentiallyFocusable(element, viewport)) return element;
+  }
+  return null;
 }
 
 /**
@@ -262,7 +280,7 @@ export function initInfoPopovers({ root }) {
   let positionFrame = null;
   let destroyed = false;
 
-  function configurePair(trigger, popover, { id, label }) {
+  function configurePair(trigger, popover, { id, label, tip }) {
     if (destroyed) {
       throw new Error('Information popover controller is destroyed');
     }
@@ -281,6 +299,7 @@ export function initInfoPopovers({ root }) {
       throw new Error(`Duplicate information popover id: ${popoverId}`);
     }
 
+    renderInfoTip(popover, tip);
     trigger.setAttribute('type', 'button');
     trigger.setAttribute('id', `${popoverId}-trigger`);
     trigger.setAttribute('aria-label', accessibleLabel);
@@ -387,23 +406,19 @@ export function initInfoPopovers({ root }) {
     const pair = validatePair(trigger, documentRef);
     if (active !== null) close();
 
-    const focusTargets = getSequentialFocusTargets(
-      documentRef,
-      viewport,
-      pair.popover
-    );
-    const triggerFocusIndex = focusTargets.indexOf(pair.trigger);
-    if (triggerFocusIndex < 0) {
+    if (!isSequentiallyFocusable(pair.trigger, viewport)) {
       throw new Error('Information trigger must be sequentially focusable');
     }
 
     active = {
       ...pair,
       originalParent: pair.popover.parentNode,
-      originalNextSibling: pair.popover.nextSibling,
-      nextFocusTarget: focusTargets[triggerFocusIndex + 1] || null
+      originalNextSibling: pair.popover.nextSibling
     };
-    documentRef.body.appendChild(pair.popover);
+    // Inside an open modal <dialog> the rest of the page is inert and drawn
+    // beneath the dialog's top layer, so the tip stays in the dialog there.
+    const host = pair.trigger.closest('dialog[open]') ?? documentRef.body;
+    host.appendChild(pair.popover);
     pair.popover.style.visibility = 'hidden';
     pair.popover.hidden = false;
     pair.trigger.setAttribute('aria-expanded', 'true');
@@ -414,7 +429,10 @@ export function initInfoPopovers({ root }) {
   }
 
   function onClick(event) {
-    if (active !== null && active.popover.contains(event.target)) return;
+    if (active !== null && active.popover.contains(event.target)) {
+      if (event.target?.closest?.(CLOSE_SELECTOR)) close({ returnFocus: true });
+      return;
+    }
     const trigger = event.target?.closest?.(TRIGGER_SELECTOR) || null;
     if (trigger !== null && trigger.ownerDocument === documentRef) {
       if (active !== null && active.trigger === trigger) {
@@ -438,7 +456,9 @@ export function initInfoPopovers({ root }) {
   }
 
   function focusAfterTrigger() {
-    const nextTarget = active?.nextFocusTarget || null;
+    const nextTarget = active === null
+      ? null
+      : nextSequentialFocusTarget(documentRef, viewport, active.trigger, active.popover);
     close();
     nextTarget?.focus({ preventScroll: true });
   }
@@ -454,31 +474,30 @@ export function initInfoPopovers({ root }) {
       return;
     }
 
+    // The popover moves focus through its own controls (the close button,
+    // then each docs link) itself: WebKit leaves links out of the native Tab
+    // order unless the user has turned on full keyboard access, which would
+    // make the links unreachable from the keyboard there.
     const popoverFocusTargets = Array.from(
       active.popover.querySelectorAll(FOCUSABLE_SELECTOR)
     ).filter(element => isSequentiallyFocusable(element, viewport));
     const focused = documentRef.activeElement;
+    const index = popoverFocusTargets.indexOf(focused);
 
+    event.preventDefault();
     if (event.shiftKey) {
-      if (focused === active.popover || focused === popoverFocusTargets[0]) {
-        event.preventDefault();
+      if (index <= 0) {
         close({ returnFocus: true });
+        return;
       }
+      popoverFocusTargets[index - 1].focus({ preventScroll: true });
       return;
     }
-
-    if (focused === active.popover && popoverFocusTargets.length > 0) {
-      event.preventDefault();
-      popoverFocusTargets[0].focus({ preventScroll: true });
+    if (index + 1 < popoverFocusTargets.length) {
+      popoverFocusTargets[index + 1].focus({ preventScroll: true });
       return;
     }
-    if (
-      popoverFocusTargets.length === 0
-      || focused === popoverFocusTargets[popoverFocusTargets.length - 1]
-    ) {
-      event.preventDefault();
-      focusAfterTrigger();
-    }
+    focusAfterTrigger();
   }
 
   function onViewportChange() {
@@ -505,6 +524,7 @@ export function initInfoPopovers({ root }) {
     viewport.removeEventListener('pagehide', onPageHide);
   }
 
+  renderStaticInfoTips(documentRef);
   for (const trigger of documentRef.querySelectorAll(TRIGGER_SELECTOR)) {
     validatePair(trigger, documentRef);
   }

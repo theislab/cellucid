@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
-  createMemoryMonitor,
+  MemoryMonitor,
 } from '../assets/js/app/analysis/shared/memory-monitor.js';
 
 function deferred() {
@@ -20,7 +20,7 @@ function isThenable(value) {
 }
 
 function createTestMonitor() {
-  const monitor = createMemoryMonitor();
+  const monitor = new MemoryMonitor();
   monitor.setShowNotifications(false);
   monitor._notifications = {
     show() {

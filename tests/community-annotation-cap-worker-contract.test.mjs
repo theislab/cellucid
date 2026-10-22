@@ -5,6 +5,7 @@ import worker from '../assets/js/app/community-annotations/_worker-code.js';
 import {
   parseExactJson,
 } from '../assets/js/app/community-annotations/wire-contract.js';
+import { withMockedFetch } from './helpers/worker-fetch.mjs';
 
 const ENV = Object.freeze({
   ALLOWED_ORIGINS: 'https://app.example,http://localhost:8000',
@@ -14,8 +15,6 @@ const ENV = Object.freeze({
 const CAP_GRAPHQL_URL = 'https://celltype.info/graphql';
 const CAP_LOOKUP_APQ_HASH =
   '7669f4698d1243244b365018dc60a69b61969791659814e0b4ad1b65385ddaab';
-const CAP_DATASET_APQ_HASH =
-  '84226dc93685478baaabbc0687bb8c85fd24ea280c9d1db957d332dc8a9bff57';
 const CAP_REQUEST_BODY_MAX_BYTES = 4 * 1024;
 const CAP_RESPONSE_BODY_MAX_BYTES = 8 * 1024 * 1024;
 const WORKER_DEADLINE_MS = 15_000;
@@ -73,16 +72,6 @@ async function responseDocument(response) {
   });
 }
 
-async function withMockedFetch(mockFetch, callback) {
-  const previousFetch = globalThis.fetch;
-  globalThis.fetch = mockFetch;
-  try {
-    return await callback();
-  } finally {
-    globalThis.fetch = previousFetch;
-  }
-}
-
 function validLookupItem(overrides = {}) {
   return {
     id: '42',
@@ -122,20 +111,6 @@ function projectedLookupItem(item) {
       disagree: item.scores.disagree,
       idk: item.scores.idk,
     },
-  };
-}
-
-function validDatasetItem(overrides = {}) {
-  return {
-    id: '7',
-    name: 'Pancreas atlas',
-    cellCount: 1234,
-    consortiumTags: [{ name: 'ignored' }],
-    labelsets: [{ name: 'ignored' }],
-    project: { secret: 'must not cross the gateway' },
-    scores: { ignored: true },
-    __typename: 'Dataset',
-    ...overrides,
   };
 }
 
@@ -202,36 +177,34 @@ test('CAP namespace requires an exact allowed Origin and exact CORS preflight', 
       null
     );
 
-    for (const path of ['/cap/lookup-cells', '/cap/search-datasets']) {
-      const preflight = await worker.fetch(
-        capRequest(path, {
-          body: null,
-          headers: {
-            'Access-Control-Request-Headers': 'Content-Type',
-            'Access-Control-Request-Method': 'POST',
-          },
-          method: 'OPTIONS',
-        }),
-        ENV
-      );
-      assert.equal(preflight.status, 204);
-      assert.equal(
-        preflight.headers.get('Access-Control-Allow-Origin'),
-        'https://app.example'
-      );
-      assert.equal(preflight.headers.get('Access-Control-Allow-Methods'), 'POST');
-      assert.equal(
-        preflight.headers.get('Access-Control-Allow-Headers'),
-        'content-type'
-      );
-      assert.equal(preflight.headers.get('Access-Control-Expose-Headers'), null);
-      assert.equal(
-        preflight.headers.get('Access-Control-Allow-Credentials'),
-        null
-      );
-      assert.equal(preflight.headers.get('Access-Control-Max-Age'), '600');
-      assert.equal(preflight.headers.get('Vary'), 'Origin');
-    }
+    const preflight = await worker.fetch(
+      capRequest('/cap/lookup-cells', {
+        body: null,
+        headers: {
+          'Access-Control-Request-Headers': 'Content-Type',
+          'Access-Control-Request-Method': 'POST',
+        },
+        method: 'OPTIONS',
+      }),
+      ENV
+    );
+    assert.equal(preflight.status, 204);
+    assert.equal(
+      preflight.headers.get('Access-Control-Allow-Origin'),
+      'https://app.example'
+    );
+    assert.equal(preflight.headers.get('Access-Control-Allow-Methods'), 'POST');
+    assert.equal(
+      preflight.headers.get('Access-Control-Allow-Headers'),
+      'content-type'
+    );
+    assert.equal(preflight.headers.get('Access-Control-Expose-Headers'), null);
+    assert.equal(
+      preflight.headers.get('Access-Control-Allow-Credentials'),
+      null
+    );
+    assert.equal(preflight.headers.get('Access-Control-Max-Age'), '600');
+    assert.equal(preflight.headers.get('Vary'), 'Origin');
 
     for (const headers of [
       {
@@ -302,11 +275,6 @@ test('lookup route maps every search kind to the exact official APQ fields', asy
         fields: ['markerGenes', 'canonicalMarkerGenes'],
       },
     },
-    {
-      kind: 'feedback',
-      term: 'T cell',
-      search: { name: 'T cell' },
-    },
   ];
   await withMockedFetch(async (url, options = {}) => {
     captured.push({ options, url: String(url) });
@@ -357,7 +325,7 @@ test('lookup route maps every search kind to the exact official APQ fields', asy
     assert.equal(request.url, CAP_GRAPHQL_URL);
     assert.equal(request.options.method, 'POST');
     assert.equal(request.options.credentials, 'omit');
-    assert.equal(request.options.redirect, 'error');
+    assert.equal(request.options.redirect, 'manual');
     assert.ok(request.options.signal instanceof AbortSignal);
     assert.deepEqual(
       [...request.options.headers].map(([key, value]) => [key, value]),
@@ -384,63 +352,6 @@ test('lookup route maps every search kind to the exact official APQ fields', asy
     });
     assert.equal(Object.hasOwn(upstreamDocument, 'query'), false);
   }
-});
-
-test('dataset route maps both exact search forms to SearchDatasets APQ data.results', async () => {
-  const upstreamRequests = [];
-  const upstreamItem = validDatasetItem();
-  await withMockedFetch(async (_url, options = {}) => {
-    upstreamRequests.push(parseExactJson(options.body));
-    return jsonResponse({ data: { results: [upstreamItem] } });
-  }, async () => {
-    for (const search of [null, 'pancreas']) {
-      const response = await worker.fetch(
-        capRequest('/cap/search-datasets', {
-          body: JSON.stringify({ search, limit: 1 }),
-        }),
-        ENV
-      );
-      assert.equal(response.status, 200);
-      assert.deepEqual(await responseDocument(response), {
-        contractVersion: 1,
-        results: [{
-          id: upstreamItem.id,
-          name: upstreamItem.name,
-          cellCount: upstreamItem.cellCount,
-        }],
-        omittedInvalidCount: 0,
-      });
-    }
-  });
-  assert.deepEqual(upstreamRequests, [
-    {
-      operationName: 'SearchDatasets',
-      variables: { options: { limit: 1 }, search: null },
-      extensions: {
-        persistedQuery: {
-          version: 1,
-          sha256Hash: CAP_DATASET_APQ_HASH,
-        },
-      },
-    },
-    {
-      operationName: 'SearchDatasets',
-      variables: {
-        options: { limit: 1 },
-        search: { name: 'pancreas' },
-      },
-      extensions: {
-        persistedQuery: {
-          version: 1,
-          sha256Hash: CAP_DATASET_APQ_HASH,
-        },
-      },
-    },
-  ]);
-  assert.equal(
-    upstreamRequests.every((document) => !Object.hasOwn(document, 'query')),
-    true
-  );
 });
 
 test('CAP request schemas reject coercion, query material, and credentials before dispatch', async (t) => {
@@ -478,6 +389,13 @@ test('CAP request schemas reject coercion, query material, and credentials befor
       status: 400,
     },
     {
+      // The client never sent it, and it searched exactly as `name` does.
+      name: 'lookup retired feedback kind',
+      path: '/cap/lookup-cells',
+      body: '{"kind":"feedback","term":"T cell","limit":1}',
+      status: 400,
+    },
+    {
       name: 'lookup padded term',
       path: '/cap/lookup-cells',
       body: '{"kind":"name","term":" T cell","limit":1}',
@@ -493,24 +411,6 @@ test('CAP request schemas reject coercion, query material, and credentials befor
       name: 'lookup limit above ceiling',
       path: '/cap/lookup-cells',
       body: '{"kind":"name","term":"T cell","limit":26}',
-      status: 400,
-    },
-    {
-      name: 'dataset missing explicit search',
-      path: '/cap/search-datasets',
-      body: '{"limit":1}',
-      status: 400,
-    },
-    {
-      name: 'dataset blank search',
-      path: '/cap/search-datasets',
-      body: '{"search":"","limit":1}',
-      status: 400,
-    },
-    {
-      name: 'dataset limit above ceiling',
-      path: '/cap/search-datasets',
-      body: '{"search":null,"limit":11}',
       status: 400,
     },
     {
@@ -578,9 +478,7 @@ test('CAP term and limit code-point boundaries are exact', async () => {
   await withMockedFetch(async (_url, options = {}) => {
     const document = parseExactJson(options.body);
     forwarded.push(document);
-    const field =
-      document.operationName === 'LookupCells' ? 'lookupCells' : 'results';
-    return jsonResponse({ data: { [field]: [] } });
+    return jsonResponse({ data: { lookupCells: [] } });
   }, async () => {
     const accepted = [
       capRequest('/cap/lookup-cells', {
@@ -595,12 +493,6 @@ test('CAP term and limit code-point boundaries are exact', async () => {
           kind: 'name',
           term: '😀'.repeat(256),
           limit: 25,
-        }),
-      }),
-      capRequest('/cap/search-datasets', {
-        body: JSON.stringify({
-          search: '😀'.repeat(256),
-          limit: 10,
         }),
       }),
     ];
@@ -626,13 +518,6 @@ test('CAP term and limit code-point boundaries are exact', async () => {
           limit: 1,
         },
       ],
-      [
-        '/cap/search-datasets',
-        {
-          search: '😀'.repeat(257),
-          limit: 1,
-        },
-      ],
     ]) {
       const response = await worker.fetch(
         capRequest(path, { body: JSON.stringify(body) }),
@@ -641,7 +526,7 @@ test('CAP term and limit code-point boundaries are exact', async () => {
       assert.equal(response.status, 400);
     }
   });
-  assert.equal(forwarded.length, 3);
+  assert.equal(forwarded.length, 2);
 });
 
 test('CAP request body owns the exact 4 KiB UTF-8 boundary', async () => {
@@ -695,18 +580,22 @@ test('lookup projection omits and counts invalid rows without clipping valid bou
       idk: 3,
       __typename: 'CellLabelScores',
     },
+    ignoredPadding: 'secret'.repeat(10_000),
+  });
+  // Results longer than the former per-field caps are kept whole.
+  const long = validLookupItem({
+    id: 'i'.repeat(65),
+    fullName: 'F'.repeat(5_000),
+    ontologyTermId: 'C'.repeat(65),
+    synonyms: Array.from({ length: 1_000 }, (_, index) => `S${index}${'s'.repeat(600)}`),
+    markerGenes: Array.from({ length: 2_000 }, (_, index) => `G${index}${'g'.repeat(70)}`),
   });
   const invalid = [
     null,
-    validLookupItem({ id: 'i'.repeat(65) }),
     validLookupItem({ name: '' }),
-    validLookupItem({ fullName: 'F'.repeat(513) }),
     validLookupItem({ ontologyTerm: 42 }),
-    validLookupItem({ ontologyTermId: 'C'.repeat(65) }),
-    validLookupItem({ synonyms: Array(101).fill('synonym') }),
-    validLookupItem({ synonyms: ['S'.repeat(513)] }),
-    validLookupItem({ markerGenes: Array(201).fill('G') }),
-    validLookupItem({ markerGenes: ['G'.repeat(65)] }),
+    validLookupItem({ synonyms: 'not an array' }),
+    validLookupItem({ markerGenes: [' padded'] }),
     validLookupItem({ canonicalMarkerGenes: null }),
     validLookupItem({ count: -1 }),
     validLookupItem({
@@ -719,7 +608,7 @@ test('lookup projection omits and counts invalid rows without clipping valid bou
   ];
   await withMockedFetch(
     async () => jsonResponse({
-      data: { lookupCells: [valid, ...invalid] },
+      data: { lookupCells: [valid, long, ...invalid] },
     }),
     async () => {
       const response = await worker.fetch(
@@ -736,8 +625,9 @@ test('lookup projection omits and counts invalid rows without clipping valid bou
       const document = await responseDocument(response);
       assert.equal(document.contractVersion, 1);
       assert.equal(document.omittedInvalidCount, invalid.length);
-      assert.equal(document.results.length, 1);
+      assert.equal(document.results.length, 2);
       assert.deepEqual(document.results[0], projectedLookupItem(valid));
+      assert.deepEqual(document.results[1], projectedLookupItem(long));
       assert.equal(Object.hasOwn(document.results[0], '__typename'), false);
       assert.equal(
         Object.hasOwn(document.results[0], 'ignoredUpstreamField'),
@@ -752,46 +642,6 @@ test('lookup projection omits and counts invalid rows without clipping valid bou
   );
 });
 
-test('dataset projection immediately drops large extras and counts invalid rows', async () => {
-  const valid = validDatasetItem({
-    id: 'd'.repeat(64),
-    name: '😀'.repeat(512),
-    cellCount: 0,
-    ignoredPadding: 'secret'.repeat(10_000),
-  });
-  const invalid = [
-    null,
-    validDatasetItem({ id: '' }),
-    validDatasetItem({ id: 'd'.repeat(65) }),
-    validDatasetItem({ name: 'N'.repeat(513) }),
-    validDatasetItem({ cellCount: -1 }),
-    validDatasetItem({ cellCount: 1.5 }),
-  ];
-  await withMockedFetch(
-    async () => jsonResponse({ data: { results: [valid, ...invalid] } }),
-    async () => {
-      const response = await worker.fetch(
-        capRequest('/cap/search-datasets', {
-          body: JSON.stringify({ search: null, limit: 10 }),
-        }),
-        ENV
-      );
-      assert.equal(response.status, 200);
-      const document = await responseDocument(response);
-      assert.deepEqual(document, {
-        contractVersion: 1,
-        results: [{
-          id: valid.id,
-          name: valid.name,
-          cellCount: valid.cellCount,
-        }],
-        omittedInvalidCount: invalid.length,
-      });
-      assert.doesNotMatch(JSON.stringify(document), /secret/);
-    }
-  );
-});
-
 test('CAP malformed envelopes and all upstream failures fail closed without APQ fallback', async (t) => {
   const scenarios = [
     {
@@ -801,6 +651,17 @@ test('CAP malformed envelopes and all upstream failures fail closed without APQ 
           'Retry-After': '60',
           'Set-Cookie': 'secret=value',
         }),
+    },
+    {
+      // `redirect: 'manual'` hands the redirect back instead of following it.
+      name: 'upstream redirect',
+      fetch: async (_url, options) => {
+        assert.equal(options.redirect, 'manual');
+        return new Response('redirect secret', {
+          status: 302,
+          headers: { Location: 'https://elsewhere.example/graphql' },
+        });
+      },
     },
     {
       name: 'persisted query error',

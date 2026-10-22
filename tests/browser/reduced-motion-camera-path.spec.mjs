@@ -8,6 +8,7 @@ import {
   APP_ORIGIN,
   ENCODED_EXPORTS_BASE_URL,
 } from './helpers/origins.mjs';
+import { sceneQuietness } from './helpers/frame-scheduling.mjs';
 
 const PREPARED_DATASET_URL =
   `${APP_ORIGIN}/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=reduced-motion-camera-path-ci`;
@@ -127,7 +128,10 @@ async function preparePath(page) {
     state.orbit.targetRadius = state.orbit.radius;
     viewer.setCameraState(state);
   });
-  await waitForViewerPaint(page);
+  // The idle samples that follow must see a scene that has finished every
+  // multi-frame change (camera settlement, a backdrop fade, LOD), not one
+  // two frames after the jump.
+  await expect.poll(() => sceneQuietness(page), { timeout: 60_000 }).toBe('quiet');
   return expectedFinalCamera;
 }
 
@@ -153,26 +157,37 @@ async function playAndMeasure(page, reducedMotion) {
   await waitForViewerPaint(page);
 
   const framesWhilePlaying = new Set();
-  for (let sample = 0; sample < SAMPLE_COUNT; sample += 1) {
-    framesWhilePlaying.add(await hashCanvas(page));
-    // Ordinary playback is proven the moment two samples differ, and every
-    // sample after that costs another full screenshot for evidence already in
-    // hand. On a hosted runner without a GPU one screenshot is most of a
-    // second, and these two tests were spending 75 s and 71 s of their 90 s
-    // fence while the next test in the same shard took 11 s — close enough to
-    // the fence that the pair failed there and nowhere else. Stopping at the
-    // proof keeps the assertion below exactly as strong and returns the margin.
-    //
-    // Reduced motion asserts the opposite, that every sample is identical, so
-    // it has no early exit: that case has to look the whole window.
-    if (!reducedMotion && framesWhilePlaying.size > 1) break;
-    await page.waitForTimeout(SAMPLE_INTERVAL_MS);
+  if (reducedMotion) {
+    // Reduced motion asserts that every sample over the whole window is
+    // identical, so this case looks at the whole window on the clock.
+    for (let sample = 0; sample < SAMPLE_COUNT; sample += 1) {
+      framesWhilePlaying.add(await hashCanvas(page));
+      await page.waitForTimeout(SAMPLE_INTERVAL_MS);
+    }
+  } else {
+    // Ordinary playback is proven the moment two frames differ, so sample
+    // by presented frames, not by the clock: on a hosted renderer where one
+    // frame takes seconds and a screenshot more, a clocked window of a few
+    // hundred milliseconds saw one frame and called the playback still. The
+    // idle picture counts as a frame: a path whose first presented frame is
+    // already its endpoint has moved the camera all the same. Sampling stops
+    // at the proof (every sample costs a screenshot) or when playback ends.
+    framesWhilePlaying.add([...idle][idle.size - 1]);
+    while (framesWhilePlaying.size < 2) {
+      if ((await playButton.getAttribute('title')) !== 'Pause') break;
+      await waitForViewerPaint(page);
+      framesWhilePlaying.add(await hashCanvas(page));
+    }
   }
 
   await expect
     .poll(() => playButton.getAttribute('title'), { timeout: 30_000 })
     .toBe('Play');
-  await page.waitForTimeout(300);
+  // Both paths publish the exact endpoint synchronously before the stop that
+  // flips the title. Let the viewer consume it on real frames, so any residual
+  // motion would already have moved the camera off that endpoint.
+  await waitForViewerPaint(page);
+  if (!reducedMotion) framesWhilePlaying.add(await hashCanvas(page));
 
   return {
     finalCamera: await page.evaluate(
@@ -202,6 +217,15 @@ const PREFERENCE_CASES = Object.freeze([
 // already consumed by the first on hosted macOS Firefox.
 for (const scenario of PREFERENCE_CASES) {
   test(scenario.title, async ({ browser }) => {
+    // Frame-driven from end to end: every click, screenshot and paint wait
+    // below waits for a presented frame, and the scene draws a settle window
+    // after each camera change. On
+    // hosted macOS Firefox a frame took about three seconds: a click about
+    // nine, a screenshot about six, and the case without a preference had
+    // done all its work, final camera read back, at 95 s of a 90 s budget.
+    // The budget is the frame-driven WebGL specs' own, as in
+    // presented-layout and studio-background.
+    test.setTimeout(240_000);
     // The browser-only fixture must stay lazy: this contract owns the one
     // context whose media preference it is proving.
     expect(browser.contexts()).toHaveLength(0);

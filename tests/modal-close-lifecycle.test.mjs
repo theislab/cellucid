@@ -152,11 +152,18 @@ class FakeElement {
     this.listeners = new Map();
     this.offsetHeight = 480;
     this.offsetWidth = 640;
+    this.offsetLeft = 0;
+    this.offsetTop = 0;
     this.textContent = '';
     this.title = '';
     this.type = '';
     this.capturedPointers = new Set();
     this.releasedPointers = [];
+  }
+
+  // Every fake box is positioned, so its offset parent is its parent.
+  get offsetParent() {
+    return this.parentNode;
   }
 
   get childElementCount() {

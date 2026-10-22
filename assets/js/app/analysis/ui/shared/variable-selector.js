@@ -27,6 +27,11 @@
  * varSelector.destroy();
  */
 
+import {
+  createEmptyState,
+  createField,
+  createStatusLine
+} from '../../../ui/components/controls.js';
 import { NONE_VALUE } from '../../shared/dom-utils.js';
 import {
   createVariableSelector,
@@ -36,7 +41,7 @@ import {
 /**
  * Variable type constants
  */
-export const VariableType = {
+const VariableType = {
   CATEGORICAL_OBS: 'categorical_obs',
   CONTINUOUS_OBS: 'continuous_obs',
   GENE_EXPRESSION: 'gene_expression'
@@ -56,7 +61,7 @@ const TYPE_LABELS = {
  *
  * Encapsulates variable selection UI logic with a two-step flow.
  */
-export class VariableSelectorComponent {
+class VariableSelectorComponent {
   /**
    * @param {Object} options
    * @param {Object} options.dataLayer - Data layer instance for variable info
@@ -65,7 +70,7 @@ export class VariableSelectorComponent {
    * @param {string[]} [options.allowedTypes] - Which types to show: ['categorical', 'continuous', 'gene']
    * @param {Object} [options.initialSelection] - Initial selection { type, variable }
    * @param {Object} [options.labels] - Custom labels for each type
-   * @param {string} [options.typeLabel] - Custom label for the type selector (default: 'Variable type:')
+   * @param {string} [options.typeLabel] - Custom label for the type selector (default: 'Variable type')
    * @param {string} [options.idPrefix='var-selector'] - Prefix used to generate unique element IDs
    */
   constructor(options) {
@@ -76,11 +81,11 @@ export class VariableSelectorComponent {
     // Options with defaults
     this.allowedTypes = options.allowedTypes || ['categorical', 'continuous', 'gene'];
     this.idPrefix = options.idPrefix || 'var-selector';
-    this.typeLabel = options.typeLabel ?? 'Variable type:';
+    this.typeLabel = options.typeLabel ?? 'Variable type';
     this.labels = {
-      categorical: options.labels?.categorical ?? 'Categorical obs:',
-      continuous: options.labels?.continuous ?? 'Continuous obs:',
-      gene: options.labels?.gene ?? 'Gene expression:'
+      categorical: options.labels?.categorical ?? 'Categorical obs',
+      continuous: options.labels?.continuous ?? 'Continuous obs',
+      gene: options.labels?.gene ?? 'Gene expression'
     };
 
     // State
@@ -130,11 +135,10 @@ export class VariableSelectorComponent {
       }
     } catch (err) {
       console.error('[VariableSelectorComponent] Failed to render:', err);
-      this.container.innerHTML = `
-        <div class="legend-help text-danger">
-          Failed to load variables. Please try refreshing.
-        </div>
-      `;
+      this.container.replaceChildren(createStatusLine({
+        tone: 'danger',
+        text: 'Failed to load variables. Please try refreshing.'
+      }).root);
     }
   }
 
@@ -143,14 +147,6 @@ export class VariableSelectorComponent {
    * Uses .field-select and .obs-select to match site design
    */
   _renderTypeSelector() {
-    const fieldSelect = document.createElement('div');
-    fieldSelect.className = 'field-select';
-
-    const label = document.createElement('label');
-    label.textContent = this.typeLabel;
-    label.htmlFor = `${this.idPrefix}-type`;
-    fieldSelect.appendChild(label);
-
     const select = document.createElement('select');
     select.id = `${this.idPrefix}-type`;
     select.className = 'obs-select';
@@ -177,8 +173,11 @@ export class VariableSelectorComponent {
       this._handleTypeChange(select.value === NONE_VALUE ? '' : select.value);
     });
 
-    fieldSelect.appendChild(select);
-    this.container.appendChild(fieldSelect);
+    this.container.appendChild(createField({
+      label: this.typeLabel,
+      control: select,
+      className: 'field-select'
+    }));
     this._typeSelect = select;
   }
 
@@ -209,7 +208,10 @@ export class VariableSelectorComponent {
     const selector = createVariableSelector({
       variables: categoricalVars,
       selectedValue,
-      label: '', // No label needed - type already shown in first dropdown
+      // The visible caption is the type dropdown above; the list is named
+      // by the type it lists.
+      label: '',
+      ariaLabel: this.labels.categorical,
       id: `${this.idPrefix}-categorical`,
       onChange: (variable) => this._handleVariableChange(VariableType.CATEGORICAL_OBS, variable)
     });
@@ -231,7 +233,10 @@ export class VariableSelectorComponent {
     const selector = createVariableSelector({
       variables: continuousVars,
       selectedValue,
-      label: '', // No label needed - type already shown in first dropdown
+      // The visible caption is the type dropdown above; the list is named
+      // by the type it lists.
+      label: '',
+      ariaLabel: this.labels.continuous,
       id: `${this.idPrefix}-continuous`,
       onChange: (variable) => this._handleVariableChange(VariableType.CONTINUOUS_OBS, variable)
     });
@@ -247,10 +252,9 @@ export class VariableSelectorComponent {
     const geneVars = this.dataLayer.getAvailableVariables('gene_expression');
 
     if (geneVars.length === 0) {
-      const helpDiv = document.createElement('div');
-      helpDiv.className = 'legend-help';
-      helpDiv.textContent = 'No gene expression data available.';
-      this.container.appendChild(helpDiv);
+      this.container.appendChild(
+        createEmptyState('No gene expression data available.')
+      );
       return;
     }
 
@@ -263,7 +267,11 @@ export class VariableSelectorComponent {
       selectedValue,
       label: '', // No label needed - type already shown in first dropdown
       id: `${this.idPrefix}-gene`,
-      onChange: (variable) => this._handleVariableChange(VariableType.GENE_EXPRESSION, variable)
+      onChange: (variable) => this._handleVariableChange(VariableType.GENE_EXPRESSION, variable),
+      prefetch: (gene, signal) => this.dataLayer.ensureGeneExpressionLoaded(
+        gene,
+        { signal, priority: 'low' }
+      )
     });
 
     this.container.appendChild(selector);
@@ -404,5 +412,3 @@ export class VariableSelectorComponent {
 export function createVariableSelectorComponent(options) {
   return new VariableSelectorComponent(options);
 }
-
-export default VariableSelectorComponent;

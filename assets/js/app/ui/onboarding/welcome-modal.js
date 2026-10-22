@@ -131,9 +131,13 @@ export function initWelcomeModal(callbacks = {}) {
     const backdrop = welcomeModal.querySelector('.welcome-backdrop');
 
     if (exploreBtn) {
-      exploreBtn.addEventListener('click', () => {
+      exploreBtn.addEventListener('click', (event) => {
         hideWelcomeModal();
-        if (welcomeCallbacks.onExplore) welcomeCallbacks.onExplore();
+        if (welcomeCallbacks.onExplore) {
+          // A click with no pointer behind it (detail 0) came from the
+          // keyboard: Enter or Space on the focused button.
+          welcomeCallbacks.onExplore({ fromKeyboard: event.detail === 0 });
+        }
       });
     }
 
@@ -157,13 +161,14 @@ export function showWelcomeModal() {
   if (!welcomeModal) return false;
   captureWelcomeReturnFocus();
   welcomeModal.classList.remove('hidden');
-  const focusables = listWelcomeFocusable();
-  if (focusables.length === 0) {
+  if (listWelcomeFocusable().length === 0) {
     throw new Error(
       'Welcome modal must expose at least one focusable control to receive focus.'
     );
   }
-  focusables[0].focus();
+  // Focus enters the dialog itself, so no choice opens looking pre-selected;
+  // the first Tab reaches the first choice.
+  welcomeModal.focus({ preventScroll: true });
   return true;
 }
 

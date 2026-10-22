@@ -326,7 +326,7 @@ const geneHeatmapDefinition = {
           text: transform === 'zscore' ? 'Z-score' : (transform === 'log1p' ? 'log(1+x)' : 'Expression'),
           side: 'top',
           font: {
-            family: 'Oswald, system-ui, sans-serif',
+            family: theme.fontFamily,
             size: 10,
             color: theme.text
           }

@@ -42,10 +42,19 @@ function releaseExactModalDocumentLayer(release) {
 }
 
 
+/**
+ * Ask the user to confirm an action.
+ *
+ * `tone` names what the confirm button does: 'danger' (the default) for an
+ * action that removes or overwrites something, drawn as `.btn-danger`;
+ * 'primary' for one that only adds, combines or connects, drawn as
+ * `.btn-primary`.
+ */
 export function showConfirmDialog({
   title,
   message,
   confirmText = 'Delete',
+  tone = 'danger',
   inputLabel = null,
   inputPlaceholder = null,
   inputDefaultValue = '',
@@ -53,6 +62,9 @@ export function showConfirmDialog({
   onConfirm,
   onCancel
 }) {
+  if (tone !== 'danger' && tone !== 'primary') {
+    throw new TypeError(`Confirm dialog tone must be 'danger' or 'primary' (got ${String(tone)})`);
+  }
   if (activeDialogCancel !== null) {
     activeDialogCancel();
   } else if (activeKeydownHandler) {
@@ -76,11 +88,11 @@ export function showConfirmDialog({
   const inputBlock = wantsInput
     ? `
       <div class="confirm-dialog-input">
-        ${inputLabel ? `<label class="confirm-dialog-input-label" for="${escapeHtml(inputId)}">${escapeHtml(inputLabel)}</label>` : ''}
+        ${inputLabel ? `<label for="${escapeHtml(inputId)}">${escapeHtml(inputLabel)}</label>` : ''}
         <div class="confirm-dialog-textarea-wrap">
           <textarea
             id="${escapeHtml(inputId)}"
-            class="confirm-dialog-textarea"
+            class="obs-select confirm-dialog-textarea"
             rows="3"
             maxlength="${escapeHtml(String(inputMaxLength))}"
             placeholder="${escapeHtml(inputPlaceholder || '')}"
@@ -98,12 +110,12 @@ export function showConfirmDialog({
         <span class="confirm-dialog-title" id="${escapeHtml(titleId)}">${escapeHtml(title || 'Confirm')}</span>
       </div>
       <div class="confirm-dialog-body">
-        ${escapeHtml(message || '')}
+        <p class="confirm-dialog-message">${escapeHtml(message || '')}</p>
         ${inputBlock}
       </div>
       <div class="confirm-dialog-actions">
-        <button type="button" class="confirm-dialog-btn confirm-dialog-cancel">Cancel</button>
-        <button type="button" class="confirm-dialog-btn confirm-dialog-confirm">${escapeHtml(confirmText)}</button>
+        <button type="button" class="btn confirm-dialog-cancel">Cancel</button>
+        <button type="button" class="btn ${tone === 'danger' ? 'btn-danger' : 'btn-primary'} confirm-dialog-confirm">${escapeHtml(confirmText)}</button>
       </div>
     </div>
   `;

@@ -1,9 +1,21 @@
 /* components/_accordion.css
-   Incremental migration: dynamic floating panel geometry is driven by CSS vars,
-   set by JS via StyleManager, instead of direct left/top/width/height styles.
+   Dynamic floating panel geometry is driven by CSS vars, set by JS via
+   StyleManager, instead of direct left/top/width/height styles.
+
+   Every sidebar panel and analysis window is a frame:
+
+     .accordion-panel                 the unit that docks and floats
+       .accordion-panel-actions       header controls (undock, dock, copy, close)
+       details.accordion-section      the disclosure: summary + content, the card
+
+   A <summary> is itself the disclosure button, so no control may sit inside
+   it; a closed <details> renders only its summary, so the controls cannot sit
+   anywhere else in it either. The action bar is the frame's own child, laid
+   over the right end of the summary row, and the summary keeps a matching
+   empty slot (`summary::after`) so its title never runs under the controls.
 */
 
-.accordion-section.accordion-floating {
+.accordion-panel.accordion-floating {
   left: var(--pos-x, var(--space-2));
   top: var(--pos-y, var(--space-2));
   width: var(--pos-width, var(--accordion-default-width));
@@ -11,59 +23,109 @@
   z-index: var(--z-layer, var(--z-floating));
 }
 
-.accordion-section.accordion-floating .accordion-content {
+.accordion-floating > .accordion-section .accordion-content {
   max-height: var(--floating-content-max-height, none);
   overflow-y: auto;
   overflow-x: hidden;
 }
 
 /* ========================================================================
-   Accordion sections (paper modules)
+   Accordion sections
    ===================================================================== */
-
-.control-block {
-  margin-top: var(--space-1-5);
-}
 
 .accordion {
   display: flex;
   flex-direction: column;
-  gap: var(--space-4);
+  gap: var(--control-panel-gap);
 }
 
-/* Paper card around each details */
+/* The frame. Header controls are sized by one variable so the summary's slot
+   and the bar laid over it can never disagree. */
+.accordion-panel {
+  --panel-action-size: var(--space-5);
+  --panel-actions-width: var(--panel-action-size);
+  position: relative;
+}
+
+.accordion-panel-actions {
+  position: absolute;
+  top: calc(var(--border-width-1) + var(--control-panel-summary-padding-y));
+  right: calc(var(--border-width-1) + var(--control-panel-summary-padding-x));
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  height: var(--panel-action-size);
+  /* The controls draw their glyphs in the header's type, as they would
+     inside the summary. */
+  font-weight: var(--font-weight-medium);
+  font-size: var(--type-button);
+  color: var(--color-text-primary);
+  /* The bar's gaps and decoration belong to the summary underneath: a press
+     there toggles or drags the panel exactly as it did before the controls
+     moved out of the summary. */
+  pointer-events: none;
+}
+
+.accordion-panel-actions > button {
+  width: var(--panel-action-size);
+  height: var(--panel-action-size);
+  pointer-events: auto;
+}
+
+/* A floating card is positioned (it holds the width handle), so the bar, which
+   precedes it, is raised to stay painted over the card's header. Docked, the
+   card is not positioned and the bar paints over it as it is. */
+.accordion-floating > .accordion-panel-actions {
+  z-index: var(--z-raised);
+}
+
+/* The summary's slot for the bar: the same box the controls once took inside
+   it, so the row keeps its height and the title its room. */
+.accordion-panel-actions + .accordion-section > summary::after {
+  content: '';
+  flex: 0 0 var(--panel-actions-width);
+  height: var(--panel-action-size);
+  margin-left: auto;
+}
+
+/* Docked, a panel offers to undock; floating, it offers everything else. */
+.accordion-panel:not(.accordion-floating) > .accordion-panel-actions > .accordion-undock-btn,
+.accordion-panel.accordion-floating > .accordion-panel-actions > button:not(.accordion-undock-btn) {
+  display: inline-flex;
+}
+
+/* The card around each details */
 .accordion-section {
-  border: var(--border-strong);
-  border-radius: 0;
+  border: var(--border-default);
+  border-radius: var(--radius-none);
   overflow: visible; /* allow dropdowns (e.g., gene search) to render outside the card */
   background: var(--color-surface-elevated);
   box-shadow: var(--shadow-md);
 }
 
-/* Summary as bold, narrow heading stripe */
+/* The summary: the panel's title row. */
 .accordion-section summary {
   list-style: none;
   cursor: grab;
-  padding: var(--space-2) var(--space-3);
-  font-family: var(--font-display);
-  font-weight: var(--font-weight-medium);
-  font-size: var(--text-xs);
-  text-transform: uppercase;
-  letter-spacing: var(--tracking-wider);
+  padding: var(--control-panel-summary-padding-y) var(--control-panel-summary-padding-x);
+  font-weight: var(--font-weight-semibold);
+  font-size: var(--type-title);
+  line-height: var(--leading-tight);
   display: flex;
   align-items: center;
   gap: var(--space-2);
-  background: var(--color-surface-tertiary);
-  border-bottom: var(--border-strong);
+  background: var(--color-surface-secondary);
+  border-bottom: var(--border-width-1) solid transparent;
   color: var(--color-text-primary);
   transition: var(--transition-colors);
 }
 
-.accordion-section.dragging summary {
+.accordion-panel.dragging summary {
   cursor: grabbing;
 }
 
-.accordion-section.dragging {
+.accordion-panel.dragging {
+  -webkit-user-select: none;
   user-select: none;
 }
 
@@ -71,39 +133,33 @@
 .accordion-copy-btn,
 .accordion-close-btn {
   display: none;
-  width: 20px;
-  height: 20px;
+  width: var(--panel-action-size);
+  height: var(--panel-action-size);
   padding: 0;
-  border: var(--border-width-1) solid color-mix(in srgb, var(--color-border-strong) 50%, transparent);
-  border-radius: 0;
+  border: var(--border-width-1) solid var(--color-border-subtle);
+  border-radius: var(--radius-none);
   background: transparent;
-  color: currentColor;
-  box-shadow: var(--shadow-xs);
+  color: var(--color-text-secondary);
   cursor: pointer;
   align-items: center;
   justify-content: center;
 }
 
-.accordion-dock-btn,
-.accordion-copy-btn {
-  margin-left: auto;
-}
-
 .accordion-dock-btn::before {
   content: '↩';
-  font-size: 12px;
+  font-size: var(--control-glyph-sm);
   line-height: 1;
 }
 
 .accordion-copy-btn::before {
   content: '⧉';
-  font-size: 12px;
+  font-size: var(--control-glyph-sm);
   line-height: 1;
 }
 
 .accordion-close-btn::before {
   content: '×';
-  font-size: 14px;
+  font-size: var(--control-glyph-md);
   line-height: 1;
 }
 
@@ -111,13 +167,13 @@
 .accordion-copy-btn:hover,
 .accordion-close-btn:hover {
   background: var(--color-surface-elevated);
+  color: var(--color-text-primary);
 }
 
 .accordion-dock-btn:active,
 .accordion-copy-btn:active,
 .accordion-close-btn:active {
-  transform: translate(1px, 1px);
-  box-shadow: none;
+  background: var(--color-interactive-secondary-active);
 }
 
 .accordion-dock-btn:focus-visible,
@@ -138,112 +194,94 @@
   isolation: isolate;
 }
 
-/* Floating panel with proper scroll containment */
-.accordion-section.accordion-floating {
+/* Floating panel: the frame is the positioned window, the details inside it
+   the card with proper scroll containment.
+
+   The window is composited as one surface (`will-change: filter` asks for the
+   surface and applies no filter). Without one, the content scroller of a panel
+   whose content overflows is an opaque layer of its own over the WebGL plot,
+   and Chromium's software compositor culls the plot under it at the vertically
+   mirrored position: the plot's texture is bottom-left origin, and the culled
+   part of it is drawn flipped. The page background then shows through at the
+   scroller's mirror image across the canvas centre — a band below a panel near
+   the top, above one near the bottom. In its own surface the window's opaque
+   layers occlude only the window, never the plot. The surface is the size of
+   the window, so it adds no full-screen pass to a plot frame. */
+.accordion-panel.accordion-floating {
   pointer-events: auto;
   position: fixed;
   max-width: calc(100vw - var(--space-4));
-  font-size: var(--text-lg);
-  color: var(--color-text-primary);
-  /* Use flex column for proper content sizing */
+  /* Use flex column so the card fills the window */
   display: flex;
   flex-direction: column;
-  /* Overflow hidden on container; scroll on content. */
-  overflow: hidden;
-  border: var(--border-strong);
-  background: var(--color-surface-elevated);
-  box-shadow: var(--shadow-md);
   contain: layout style;
   transform: translateZ(0);
+  will-change: filter;
   backface-visibility: hidden;
   -webkit-backface-visibility: hidden;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
 
-.accordion-section.accordion-floating .accordion-dock-btn {
-  display: inline-flex;
+.accordion-floating > .accordion-section {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  /* The same base text as the docked sidebar. */
+  font-size: var(--type-control);
+  color: var(--color-text-primary);
+  /* Use flex column for proper content sizing */
+  display: flex;
+  flex-direction: column;
+  /* Overflow hidden on container; scroll on content. */
+  overflow: hidden;
+  border: var(--border-default);
+  background: var(--color-surface-elevated);
+  box-shadow: var(--shadow-lg);
+  contain: layout style;
 }
 
-.accordion-section.accordion-floating .accordion-copy-btn,
-.accordion-section.accordion-floating .accordion-close-btn {
-  display: inline-flex;
-}
-
-.accordion-section.accordion-floating > summary {
+.accordion-floating > .accordion-section > summary {
   flex: 0 0 auto;
+  /* A finger on a floating header moves the panel; nothing behind it scrolls. */
+  touch-action: none;
 }
 
 /* REDESIGNED: Floating panel content with explicit scroll containment */
-.accordion-section.accordion-floating .accordion-content {
+.accordion-floating > .accordion-section .accordion-content {
   /* Let JS set max-height for proper containment */
   flex: 1 1 auto;
   min-height: 0;
   box-sizing: border-box;
   /* Scroll is enabled via inline styles from JS */
   background: var(--color-surface-elevated);
-  /* Native scrollbar styling */
-  scrollbar-width: thin;
-  scrollbar-color: color-mix(in srgb, var(--color-text-primary) 40%, transparent)
-    color-mix(in srgb, var(--color-text-primary) 10%, transparent);
   -webkit-overflow-scrolling: touch;
   overscroll-behavior: contain;
 }
 
-/* WebKit scrollbar styling - more visible */
-.accordion-section.accordion-floating .accordion-content::-webkit-scrollbar {
-  width: 10px;
-  height: 10px;
-}
-
-.accordion-section.accordion-floating .accordion-content::-webkit-scrollbar-track {
-  background: color-mix(in srgb, var(--color-text-primary) 8%, transparent);
-  border-radius: 5px;
-  margin: 4px;
-}
-
-.accordion-section.accordion-floating .accordion-content::-webkit-scrollbar-thumb {
-  background: color-mix(in srgb, var(--color-text-primary) 35%, transparent);
-  border-radius: 5px;
-  border: 2px solid transparent;
-  background-clip: padding-box;
-  min-height: 40px;
-}
-
-.accordion-section.accordion-floating .accordion-content::-webkit-scrollbar-thumb:hover {
-  background: color-mix(in srgb, var(--color-text-primary) 50%, transparent);
-  background-clip: padding-box;
-}
-
-.accordion-section.accordion-floating .accordion-content::-webkit-scrollbar-thumb:active {
-  background: color-mix(in srgb, var(--color-text-primary) 60%, transparent);
-  background-clip: padding-box;
-}
-
 /* Force scrollbar visibility when content overflows */
-.accordion-section.accordion-floating .accordion-content.has-overflow {
-  overflow-y: scroll !important;
+.accordion-floating > .accordion-section .accordion-content.has-overflow {
+  overflow-y: scroll;
 }
 
 /* Keep content visible during drag */
-.accordion-section.accordion-floating.dragging .accordion-content {
+.accordion-floating.dragging .accordion-content {
   pointer-events: none;
 }
 
-/* Fix collapsed state in floating mode */
-.accordion-section.accordion-floating:not([open]) {
-  height: auto !important;
+/* A collapsed floating panel is as tall as its header; the selector outranks
+   the --pos-height rule above, so no !important is needed. */
+.accordion-panel.accordion-floating:has(> .accordion-section:not([open])) {
+  height: auto;
 }
 
-.accordion-section.accordion-floating:not([open]) .accordion-content {
+.accordion-floating > .accordion-section:not([open]) .accordion-content {
   display: none;
 }
 
 /* Global drag/resize state - prevents unwanted interactions */
 body.dock-dragging,
 body.dock-resizing {
-  user-select: none !important;
-  -webkit-user-select: none !important;
   overflow-anchor: none;
 }
 
@@ -255,36 +293,28 @@ body.dock-resizing {
   cursor: ew-resize !important;
 }
 
-/* During drag, floating root becomes interaction shield */
-#floating-panels-root.drag-overlay-active {
-  pointer-events: auto;
-  cursor: grabbing;
-}
-
 /* REDESIGNED: Dragging state - GPU optimized with proper containment */
-.accordion-section.accordion-floating.dragging {
+.accordion-panel.accordion-floating.dragging {
   transition: none !important;
   animation: none !important;
-  /* Elevated shadow while dragging */
-  box-shadow: var(--shadow-lg);
   opacity: var(--opacity-95);
   contain: layout style;
-  will-change: transform;
+  /* Still one surface while it moves (see the floating panel above). */
+  will-change: transform, filter;
   backface-visibility: hidden;
   -webkit-backface-visibility: hidden;
-  /* Keep overflow hidden - content is already constrained */
-  overflow: hidden;
 }
 
-.accordion-section.accordion-floating.resizing {
+/* Elevated shadow while dragging */
+.accordion-floating.dragging > .accordion-section {
+  animation: none !important;
+  box-shadow: var(--shadow-lg);
+}
+
+.accordion-panel.accordion-floating.resizing {
   transition: none !important;
   animation: none !important;
   contain: layout style;
-}
-
-/* Bottom-right corner resize handle - hidden, using width handle instead */
-.accordion-resize-handle {
-  display: none !important;
 }
 
 /* Width resize handle (right edge) - similar to sidebar resize */
@@ -314,16 +344,16 @@ body.dock-resizing {
 }
 
 .accordion-width-handle:hover::after,
-.accordion-section.accordion-floating.resizing .accordion-width-handle::after {
+.accordion-floating.resizing .accordion-width-handle::after {
   background: color-mix(in srgb, var(--color-border-strong) 35%, transparent);
 }
 
-.accordion-section.accordion-floating .accordion-width-handle {
+.accordion-floating .accordion-width-handle {
   display: block;
 }
 
 /* Keep the resize grab area off the scrollbars (header-only). */
-.accordion-section.accordion-floating .accordion-width-handle {
+.accordion-floating .accordion-width-handle {
   bottom: auto;
   height: var(--space-10);
 }
@@ -332,18 +362,24 @@ body.dock-resizing {
 /* Detach/Attach Animations - Sharp, minimal, paper-lifting aesthetic          */
 /* ═══════════════════════════════════════════════════════════════════════════ */
 
+/* The frame moves (scale, fade) and carries its header controls along; the
+   card inside it casts the shadow. */
+
 /* Undock animation - panel lifts off with subtle scale and shadow */
 @keyframes undock-lift {
   0% {
     opacity: var(--opacity-60);
     transform: translateZ(0) scale(0.96);
-    box-shadow: var(--shadow-sm);
   }
   100% {
     opacity: 1;
     transform: translateZ(0) scale(1);
-    box-shadow: var(--shadow-md);
   }
+}
+
+@keyframes undock-lift-shadow {
+  0% { box-shadow: var(--shadow-sm); }
+  100% { box-shadow: var(--shadow-md); }
 }
 
 /* Dock animation - panel settles back with quick fade */
@@ -351,21 +387,32 @@ body.dock-resizing {
   0% {
     opacity: 0;
     transform: scale(1.03);
-    box-shadow: var(--shadow-lg);
   }
   100% {
     opacity: 1;
     transform: scale(1);
-    box-shadow: var(--shadow-md);
   }
 }
 
-.accordion-section.floating-enter {
-  animation: undock-lift 160ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
+@keyframes dock-settle-shadow {
+  0% { box-shadow: var(--shadow-lg); }
+  100% { box-shadow: var(--shadow-md); }
 }
 
-.accordion-section.dock-settle {
-  animation: dock-settle 140ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
+.accordion-panel.floating-enter {
+  animation: undock-lift var(--duration-fast) var(--easing-out) forwards;
+}
+
+.accordion-panel.floating-enter > .accordion-section {
+  animation: undock-lift-shadow var(--duration-fast) var(--easing-out) forwards;
+}
+
+.accordion-panel.dock-settle {
+  animation: dock-settle var(--duration-fast) var(--easing-out) forwards;
+}
+
+.accordion-panel.dock-settle > .accordion-section {
+  animation: dock-settle-shadow var(--duration-fast) var(--easing-out) forwards;
 }
 
 /* Dock zone indicators - design-consistent dark gray */
@@ -395,15 +442,12 @@ body.dock-resizing {
   pointer-events: none;
   z-index: var(--z-max);
   background: var(--color-surface-elevated);
-  border: var(--border-strong);
+  border: var(--border-default);
   box-shadow: var(--shadow-md);
-  font-family: var(--font-display);
-  font-weight: var(--font-weight-medium);
-  font-size: var(--text-xs);
-  text-transform: uppercase;
-  letter-spacing: var(--tracking-wider);
+  font-weight: var(--font-weight-semibold);
+  font-size: var(--type-title);
   color: var(--color-text-primary);
-  padding: var(--space-2) var(--space-3);
+  padding: var(--control-panel-summary-padding-y) var(--control-panel-summary-padding-x);
   /* GPU accelerated */
   will-change: transform, box-shadow, border-width;
   backface-visibility: hidden;
@@ -420,7 +464,7 @@ body.dock-resizing {
 }
 
 /* Original element dimmed while being dragged - smooth fade */
-.accordion-section.drag-source {
+.accordion-panel.drag-source {
   opacity: var(--opacity-30);
   outline: 2px dashed var(--color-text-primary);
   outline-offset: -2px;
@@ -443,12 +487,14 @@ body.dock-dragging .sidebar-scroll {
   contain: strict;
 }
 
-body.dock-dragging .accordion-section:not(.accordion-floating) {
+body.dock-dragging .accordion-panel:not(.accordion-floating) > .accordion-section {
   /* Disable transitions on docked sections during drag */
   transition: none !important;
 }
 
-.accordion-section summary:hover {
+/* A pointer on a header control is a pointer on the header. */
+.accordion-section summary:hover,
+:where(.accordion-panel:has(> .accordion-panel-actions :hover)) > .accordion-section > summary {
   background: var(--color-border-light);
   color: var(--color-text-primary);
 }
@@ -457,20 +503,22 @@ body.dock-dragging .accordion-section:not(.accordion-floating) {
 .accordion-section summary::before {
   content: '';
   display: inline-block;
-  width: 10px;
-  height: 10px;
-  border: 2px solid currentColor;
+  width: 7px;
+  height: 7px;
+  border: 1.5px solid currentColor;
   border-left-color: transparent;
   border-top-color: transparent;
   transform: rotate(45deg);
   transition: transform var(--duration-fast) var(--easing-standard),
     border-color var(--duration-fast) var(--easing-standard);
-  font-size: 10px;
   color: var(--color-text-secondary);
 }
 
+/* Closed points down, open points up: the same reading every nested
+   disclosure in the app gives (analysis sub-panels, form sections). Open used
+   to point left, which reads as "go back", not "collapse". */
 .accordion-section[open] summary::before {
-  transform: rotate(135deg);
+  transform: rotate(225deg);
 }
 
 .accordion-section summary::-webkit-details-marker {
@@ -478,51 +526,30 @@ body.dock-dragging .accordion-section:not(.accordion-floating) {
 }
 
 .accordion-section[open] summary {
-  border-bottom: var(--border-strong);
+  border-bottom-color: var(--color-border-light);
 }
 
 .accordion-content {
   padding: var(--space-2) var(--space-2-5) var(--space-2-5);
   display: flex;
   flex-direction: column;
-  gap: var(--space-1-5);
+  gap: var(--control-group-gap);
   overflow-x: hidden;
 }
 
-/* Section titles inside cards */
-.section-divider {
-  border-top: var(--border-width-1) solid color-mix(in srgb, var(--color-border-strong) 12%, transparent);
-  margin: var(--space-1-5) 0 var(--space-1);
-  padding-top: var(--space-1);
-}
-
-.section-title {
-  font-family: var(--font-display);
-  font-size: var(--text-xs);
-  font-weight: var(--font-weight-medium);
-  color: var(--color-text-secondary);
-  text-transform: uppercase;
-  letter-spacing: var(--tracking-wider);
-  margin-bottom: var(--space-1);
-}
-
-/* Hint & stats remain visually hidden but accessible */
-.sr-only {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  padding: 0;
-  margin: -1px;
-  overflow: hidden;
-  clip: rect(0, 0, 0, 0);
-  white-space: nowrap;
-  border: 0;
+/* The panel's own gap is the rhythm between its top-level groups; a block's
+   top margin applies only where it is nested in a box or a group (the block
+   and group margins are zero-specificity, so this wins wherever it applies). */
+.accordion-content > * {
+  margin-top: 0;
 }
 
 /* Sidebar footer link */
+/* The footer sits on the sidebar's sunken paper, darker than any text surface
+   the theme contract measures, so it takes the secondary text token. */
 #copyright {
-  font-size: var(--text-xs);
-  opacity: var(--opacity-60);
+  font-size: var(--type-hint);
+  color: var(--color-text-secondary);
   margin-top: var(--space-2);
   padding-top: var(--space-2);
   border-top: var(--border-width-1) solid color-mix(in srgb, var(--color-border-strong) 8%, transparent);
@@ -530,12 +557,25 @@ body.dock-dragging .accordion-section:not(.accordion-floating) {
   white-space: normal;
 }
 
+/* Four short lines: who made it, docs and citing, the licence, the build. */
+#copyright p {
+  margin: 0;
+  line-height: var(--leading-normal);
+}
+
 #copyright a {
   color: inherit;
   text-decoration: none;
 }
 
+/* Each item of the footer keeps to one line, so a narrow sidebar breaks the
+   line between items rather than inside a link. */
+#copyright a,
+#copyright #web-build-version {
+  white-space: nowrap;
+}
+
 #copyright a:hover {
-  opacity: 1;
+  color: var(--color-text-primary);
   text-decoration: underline;
 }

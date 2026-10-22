@@ -5,7 +5,6 @@ import test from 'node:test';
 import { closeModal } from '../assets/js/app/analysis/ui/components/modal.js';
 import { FormBasedAnalysisUI } from '../assets/js/app/analysis/ui/analysis-types/base/form-based-analysis.js';
 import { createRequestIdTracker } from '../assets/js/app/analysis/shared/cancellable-operation.js';
-import { enableDebug } from '../assets/js/app/analysis/shared/debug-utils.js';
 import { CommunityAnnotationFileCache } from '../assets/js/app/community-annotations/file-cache.js';
 
 const exactFailureSurfaces = [
@@ -75,35 +74,6 @@ test('IndexedDB upgrade reports both the schema failure and abort failure', asyn
   } finally {
     if (previousIndexedDB === undefined) delete globalThis.indexedDB;
     else globalThis.indexedDB = previousIndexedDB;
-  }
-});
-
-test('debug enablement propagates storage failure before mutating debug state', () => {
-  const previousWindow = globalThis.window;
-  const previousLocalStorage = globalThis.localStorage;
-  const storageError = new Error('debug storage write failed');
-  globalThis.window = {
-    __CELLUCID_DEBUG__: false,
-    location: { href: 'https://cellucid.example/' },
-  };
-  globalThis.localStorage = {
-    getItem() {
-      return null;
-    },
-    setItem() {
-      throw storageError;
-    },
-    removeItem() {},
-  };
-
-  try {
-    assert.throws(() => enableDebug(), error => error === storageError);
-    assert.equal(globalThis.window.__CELLUCID_DEBUG__, false);
-  } finally {
-    if (previousWindow === undefined) delete globalThis.window;
-    else globalThis.window = previousWindow;
-    if (previousLocalStorage === undefined) delete globalThis.localStorage;
-    else globalThis.localStorage = previousLocalStorage;
   }
 });
 

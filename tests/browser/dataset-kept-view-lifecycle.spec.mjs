@@ -3,6 +3,7 @@ import { readFile } from 'node:fs/promises';
 import { expect, test } from './helpers/test.mjs';
 import { EXPORTS_BASE_URL as EXPORTS_ROOT } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
+import { openCollapsedPanels } from './helpers/panels.mjs';
 
 const PREPARED_FIXTURE_ROOT = new URL(
   './fixtures/exports/current-ui-prepared/',
@@ -167,7 +168,7 @@ function buildAlternateObsManifest({
       n_points: count,
     };
   });
-  categorical[5] = { 2: centroids };
+  categorical[5] = { X_umap_2d: centroids };
   return alternate;
 }
 
@@ -182,7 +183,7 @@ async function createAlternatePreparedArtifacts() {
   ] = await Promise.all([
     readFile(new URL('dataset_identity.json', PREPARED_FIXTURE_ROOT)),
     readFile(new URL('obs_manifest.json', PREPARED_FIXTURE_ROOT)),
-    readFile(new URL('points_2d.bin', PREPARED_FIXTURE_ROOT)),
+    readFile(new URL('embeddings/0_2d.bin', PREPARED_FIXTURE_ROOT)),
     readFile(
       new URL('obs/1.codes.u8', PREPARED_FIXTURE_ROOT),
     ),
@@ -235,7 +236,7 @@ async function createAlternatePreparedArtifacts() {
   return new Map([
     ['dataset_identity.json', Buffer.from(JSON.stringify(identity))],
     ['obs_manifest.json', Buffer.from(JSON.stringify(manifest))],
-    ['points_2d.bin', positions],
+    ['embeddings/0_2d.bin', positions],
     ['obs/1.codes.u8', codes],
     ['obs/1.outliers.f32', outliers],
     ['obs/0.values.f32', score],
@@ -322,7 +323,7 @@ async function installZeroCellPreparedDataset(page) {
   obsManifest.n_points = 0;
   for (const categorical of obsManifest._categoricalFields) {
     categorical[5] = Object.fromEntries(
-      Object.keys(categorical[5]).map(dimension => [dimension, []]),
+      Object.keys(categorical[5]).map(embeddingId => [embeddingId, []]),
     );
   }
   const varManifest = JSON.parse(varManifestBody.toString('utf8'));
@@ -389,9 +390,7 @@ async function selectCategoricalOutlierView(page) {
     label: 'cell_type',
   });
   await expect(page.locator('.legend-item')).toHaveCount(3);
-  await expect(page.locator('#outlier-filter-container')).toHaveClass(
-    /visible/,
-  );
+  await expect(page.locator('#outlier-filter-container')).toBeVisible();
   await page.locator('#outlier-filter').fill('50');
   await page.locator('#outlier-filter').dispatchEvent('change');
 }
@@ -531,6 +530,7 @@ test(
       waitUntil: 'domcontentloaded',
     });
     await dismissWelcome(page);
+    await openCollapsedPanels(page);
 
     await expect(page.locator('#dataset-name')).toHaveText(
       'Current UI prepared fixture',
@@ -543,7 +543,7 @@ test(
 
     await selectCategoricalOutlierView(page);
     await expect(page.locator('#filter-count')).toHaveText(
-      'Showing 60 of 120 points',
+      'Showing 60 of 120 cells',
     );
     await openFigureExportDownload(page);
     await settleRendering(page);
@@ -611,7 +611,7 @@ test(
         'dataset_identity.json',
         'obs_manifest.json',
         'var_manifest.json',
-        'points_2d.bin',
+        'embeddings/0_2d.bin',
       ]),
       selected: ALTERNATE_DATASET_OPTION,
     });
@@ -642,7 +642,7 @@ test(
     await expect(page.locator('#camera-lock-btn')).toBeDisabled();
     await selectCategoricalOutlierView(page);
     await expect(page.locator('#filter-count')).toHaveText(
-      'Showing 63 of 120 points',
+      'Showing 63 of 120 cells',
     );
     expect(
       await page.locator('.legend-item').allTextContents(),
@@ -708,6 +708,7 @@ test(
       waitUntil: 'domcontentloaded',
     });
     await dismissWelcome(page);
+    await openCollapsedPanels(page);
     await expect(page.locator('#dataset-name')).toHaveText(
       'Current UI prepared fixture',
     );
@@ -721,7 +722,10 @@ test(
       let error = null;
       try {
         viewer.withBorrowedViewData('live', borrowed => {
-          if (borrowed.pointCount !== replacement.length / 3) {
+          if (
+            borrowed.pointCount !==
+              replacement.length / borrowed.dimensionLevel
+          ) {
             throw new Error('Replacement changed the point count.');
           }
           viewer.updatePositions(replacement, borrowed.dimensionLevel);
@@ -903,6 +907,7 @@ test(
       waitUntil: 'domcontentloaded',
     });
     await dismissWelcome(page);
+    await openCollapsedPanels(page);
     await selectCategoricalOutlierView(page);
     await openFigureExportDownload(page);
     await configureSmallPngExport(page);
@@ -944,7 +949,9 @@ test(
       pausedHash: pausedBeforeRelease.pausedHash,
       releasedHash: pausedBeforeRelease.pausedHash,
       state: 'released',
-      webgl2ContextLost: [true],
+      // The export's raster context returns to its pool, never lost
+      // (webgl-point-rasterizer.js).
+      webgl2ContextLost: [false],
     });
     expect(oldBytes.includes(Buffer.from('Current UI prepared fixture'))).toBe(
       true,
@@ -978,6 +985,7 @@ test(
       waitUntil: 'domcontentloaded',
     });
     await dismissWelcome(page);
+    await openCollapsedPanels(page);
     await expect(page.locator('#dataset-name')).toHaveText(
       'Current UI prepared fixture',
     );
@@ -1007,7 +1015,7 @@ test(
       'dataset_identity.json',
       'obs_manifest.json',
     ]));
-    expect(zeroRequests).not.toContain('points_2d.bin');
+    expect(zeroRequests).not.toContain('embeddings/0_2d.bin');
     expect(pageErrors).toEqual([]);
     expect(await page.evaluate(
       () => window._cellucidViewer.getGLContext().getError(),

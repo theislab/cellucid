@@ -1,3 +1,4 @@
+import { createInMemoryDimensionManager } from '../assets/js/data/dimension-manager.js';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
@@ -8,6 +9,7 @@ import { FieldOverlayInternalMethods } from '../assets/js/app/state/managers/fie
 import { viewContextViewerSyncMethods } from '../assets/js/app/state/managers/view-context-viewer-sync.js';
 import { getFieldRegistry } from '../assets/js/app/utils/field-registry.js';
 import { BaseAnnDataAdapter } from '../assets/js/data/base-anndata-adapter.js';
+import { loaderMetadata } from './helpers/anndata-mapping-mocks.mjs';
 import {
   createObsFieldLoader,
   createVarFieldLoader,
@@ -18,20 +20,22 @@ import {
 import { getDataSourceManager } from '../assets/js/data/data-source-manager.js';
 
 function datasetMetadata(nObs) {
-  return {
-    version: 2,
-    id: 'categorical-contract',
-    name: 'categorical-contract',
-    stats: {
-      n_cells: nObs,
-      n_genes: 0
-    },
-    embeddings: {
-      available_dimensions: [],
-      default_dimension: null,
-      obsm_keys: {}
-    }
-  };
+  // The private adapter-construction descriptor a loader returns; the public
+  // identity is built from it by finalizeDirectIdentity(). Every fixture
+  // carries one plottable 2D X_umap.
+  return loaderMetadata({ nObs, obsm: { X_umap: 2 } });
+}
+
+/** `readObsmColumns` of that X_umap: cell `i` sits at `(i, -i)`. */
+async function diagonalObsmColumns(key, columns) {
+  assert.equal(key, 'X_umap');
+  const values = new Float64Array(this.nObs * columns.length);
+  for (let cell = 0; cell < this.nObs; cell++) {
+    columns.forEach((column, index) => {
+      values[cell * columns.length + index] = column === 0 ? cell : -cell;
+    });
+  }
+  return values;
 }
 
 function categoricalLoader({
@@ -44,7 +48,7 @@ function categoricalLoader({
     nVars: 0,
     obsKeys: [fieldKey],
     varNames: [],
-    obsmKeys: [],
+    readObsmColumns: diagonalObsmColumns,
     async getDatasetMetadata() {
       return datasetMetadata(codes.length);
     },
@@ -72,9 +76,9 @@ function metadataOnlyLoader(obsKeys, getObsFieldInfo, getObsField = null) {
     nVars: 0,
     obsKeys,
     varNames: [],
-    obsmKeys: [],
+    readObsmColumns: diagonalObsmColumns,
     async getDatasetMetadata() {
-      return datasetMetadata(1);
+      return datasetMetadata(this.nObs);
     },
     getObsFieldInfo,
     getObsField: getObsField ?? (async () => {
@@ -97,14 +101,12 @@ function restoreActiveDataset(manager, previous) {
   manager.activeDatasetMetadata = previous.activeDatasetMetadata;
 }
 
-test('rejects category dictionaries larger than the uint16 sentinel contract', async () => {
-  const categories = new Array(65_536).fill('category');
+test('a category dictionary past the uint16 width is accepted and stored as uint32', async () => {
+  const categories = Array.from({ length: 65_536 }, (_, index) => `category-${index}`);
   const adapter = new BaseAnnDataAdapter(categoricalLoader({ categories }));
-
-  await assert.rejects(
-    adapter.initialize(),
-    /65,536 categories.*at most 65,535.*reduce or merge/i
-  );
+  await adapter.initialize().catch(error => {
+    assert.doesNotMatch(error.message, /categories|at most 65,535/i);
+  });
 });
 
 test('shared adapter requires unique category labels by exact primitive identity', async t => {
@@ -158,7 +160,7 @@ test('primitive boolean discovery and code conversion preserve boolean identity'
   );
 });
 
-test('bounds cumulative retained observation categories across fields', async () => {
+test('category dictionaries of every field load with no cumulative ceiling', async () => {
   const loader = metadataOnlyLoader(
     ['first', 'second'],
     async () => ({
@@ -167,55 +169,17 @@ test('bounds cumulative retained observation categories across fields', async ()
     })
   );
   const adapter = new BaseAnnDataAdapter(loader, {
-    maxMaterializedBytes: 200
+    cacheBudgetBytes: 0
   });
-
-  await assert.rejects(
-    adapter.initialize(),
-    /cumulative observation metadata.*browser limit/i
-  );
+  // Initialization goes on to the embedding check, past every dictionary.
+  await assert.rejects(adapter.initialize(), error => !/browser limit|working set/i.test(error.message));
 });
 
-test('primitive category discovery stops at the portable ceiling and releases payloads', async () => {
-  let highestRead = -1;
-  let released = 0;
-  const values = new Proxy(
-    { length: 1_000_000 },
-    {
-      get(target, property) {
-        if (property === 'filter') {
-          throw new Error('copy-heavy filter path sentinel');
-        }
-        if (typeof property === 'string' && /^\d+$/.test(property)) {
-          const index = Number(property);
-          highestRead = Math.max(highestRead, index);
-          if (index < 65_536) return `category-${index}`;
-          throw new Error('category discovery read beyond ceiling');
-        }
-        return Reflect.get(target, property);
-      }
-    }
-  );
-  const field = { dtype: 'string', values };
-  const loader = metadataOnlyLoader(
-    ['label'],
-    async () => ({ dtype: 'string' }),
-    async () => field
-  );
-  loader.nObs = values.length;
-  loader.releaseObsField = (key, expected) => {
-    assert.equal(key, 'label');
-    assert.strictEqual(expected, field);
-    released++;
-  };
-  const adapter = new BaseAnnDataAdapter(loader);
-
-  await assert.rejects(
-    adapter.initialize(),
-    /65,536 categories.*at most 65,535.*reduce or merge/i
-  );
-  assert.equal(highestRead, 65_535);
-  assert.equal(released, 1);
+test('primitive category discovery keeps every distinct label past 65,535', () => {
+  const values = Array.from({ length: 70_000 }, (_, index) => `category-${index}`);
+  const adapter = new BaseAnnDataAdapter(metadataOnlyLoader(['label'], async () => ({ dtype: 'string' })));
+  const categories = adapter._discoverPrimitiveCategories(values, 'label');
+  assert.equal(categories.length, 70_000);
 });
 
 test('primitive loader payloads are released after discovery and code conversion', async () => {
@@ -238,7 +202,7 @@ test('primitive loader payloads are released after discovery and code conversion
   assert.equal(releaseCalls, 2);
 });
 
-test('bounds lazy observation intermediates by retained bytes', async () => {
+test('lazy observation payloads are evicted by the cache budget, never refused', async () => {
   const valuesByKey = {
     first: new Float32Array(40),
     second: new Float32Array(40)
@@ -249,27 +213,27 @@ test('bounds lazy observation intermediates by retained bytes', async () => {
     async key => ({ dtype: 'float', values: valuesByKey[key] })
   );
   loader.nObs = 40;
-  loader.getDatasetMetadata = async () => datasetMetadata(40);
   loader.close = () => {};
   const adapter = new BaseAnnDataAdapter(loader, {
-    maxMaterializedBytes: 200
+    cacheBudgetBytes: 2000
   });
   await adapter.initialize();
+  adapter._cacheBudgetBytes = 200n;
 
   await adapter.getObsFieldData('first');
   await adapter.getObsFieldData('second');
   assert.equal(adapter._obsFieldDataCache.size, 1);
   assert.ok(adapter._obsFieldDataCacheBytes <= 200n);
 
-  const metadataBytes = adapter._obsMetadataRetainedBytes;
+  // A payload larger than the whole budget is still returned.
+  adapter._cacheBudgetBytes = 1n;
   adapter.clearCaches();
   assert.equal(adapter._obsFieldDataCacheBytes, 0n);
-  assert.equal(adapter._obsMetadataRetainedBytes, metadataBytes);
+  assert.ok(await adapter.getObsFieldData('first'));
   assert.equal(adapter.getObsManifest().n_points, 40);
 
   adapter.close();
   assert.equal(adapter._obsFieldDataCacheBytes, 0n);
-  assert.equal(adapter._obsMetadataRetainedBytes, 0n);
   assert.equal(adapter._obsFieldsMetadata, null);
 });
 
@@ -305,48 +269,6 @@ test('primitive code maps build without a full categories.map temporary', async 
 
   const field = await adapter.getObsFieldData('label');
   assert.deepEqual(Array.from(new Uint8Array(field.data)), [1, 0, 255]);
-  assert.equal(adapter._obsFieldDataCache.size, 0);
-});
-
-test('preflights primitive category map and code workspace before traversal', async () => {
-  let valueReads = 0;
-  const values = new Proxy(
-    { length: 3 },
-    {
-      get(target, property, receiver) {
-        if (typeof property === 'string' && /^\d+$/.test(property)) {
-          valueReads++;
-          throw new Error('primitive category value sentinel');
-        }
-        return Reflect.get(target, property, receiver);
-      }
-    }
-  );
-  const loader = {
-    nObs: 3,
-    async getObsField() {
-      return { dtype: 'string', values };
-    }
-  };
-  const adapter = new BaseAnnDataAdapter(loader, {
-    maxMaterializedBytes: 450
-  });
-  adapter._metadata = datasetMetadata(3);
-  adapter._obsFieldsMetadata = [{
-    key: 'label',
-    kind: 'category',
-    categories: ['a', 'b'],
-    _needsCodeComputation: true
-  }];
-  // Two retained one-character category labels:
-  // 2 array references + 2 × (estimated object + UTF-16 payload).
-  adapter._obsMetadataRetainedBytes = 148n;
-
-  await assert.rejects(
-    adapter.getObsFieldData('label'),
-    /category conversion.*working set.*server or prepared format/i
-  );
-  assert.equal(valueReads, 0);
   assert.equal(adapter._obsFieldDataCache.size, 0);
 });
 
@@ -398,7 +320,7 @@ test('keeps the exact 255-category boundary on uint8', async () => {
   );
 });
 
-test('canonicalizes adapter uint8 missing codes to the uint16 sentinel', async () => {
+test('keeps adapter uint8 codes in their declared width with the uint8 missing sentinel', async () => {
   const adapter = new BaseAnnDataAdapter(categoricalLoader({
     categories: ['present'],
     codes: Int32Array.from([0, -1])
@@ -420,8 +342,10 @@ test('canonicalizes adapter uint8 missing codes to the uint16 sentinel', async (
       'zarr://missing-sentinel/obs/manifest.json',
       field
     );
-    assert.ok(loaded.codes instanceof Uint16Array);
-    assert.deepEqual(Array.from(loaded.codes), [0, 65_535]);
+    // One byte a cell: the runtime reads the missing code from the array's
+    // own storage, so nothing is widened to two bytes on load.
+    assert.ok(loaded.codes instanceof Uint8Array);
+    assert.deepEqual(Array.from(loaded.codes), [0, 255]);
   } finally {
     restoreActiveDataset(manager, previous);
   }
@@ -434,7 +358,7 @@ test('propagates supported observation-field validation failures during initiali
     nVars: 0,
     obsKeys: ['bad_bool'],
     varNames: [],
-    obsmKeys: [],
+    readObsmColumns: diagonalObsmColumns,
     async getDatasetMetadata() {
       return datasetMetadata(1);
     },
@@ -456,7 +380,7 @@ test('rejects fields whose dtype is not in the current contract', async () => {
     nVars: 0,
     obsKeys: ['opaque'],
     varNames: [],
-    obsmKeys: [],
+    readObsmColumns: diagonalObsmColumns,
     async getDatasetMetadata() {
       return datasetMetadata(1);
     },
@@ -474,7 +398,7 @@ test('rejects fields whose dtype is not in the current contract', async () => {
 
 test('rejects unsupported compact categorical code dtypes', () => {
   const compactManifest = {
-    _format: 'compact_v1',
+    _format: 'compact_v2',
     n_points: 1,
     centroid_outlier_quantile: 0.95,
     latent_key: 'latent_space',
@@ -490,12 +414,12 @@ test('rejects unsupported compact categorical code dtypes', () => {
     },
     _continuousFields: [],
     _categoricalFields: [
-      [0, 'group', ['A'], 'uint32', 0xffff_ffff, {}]
+      [0, 'group', ['A'], 'uint64', 0xffff_ffff, {}]
     ]
   };
   assert.throws(
     () => expandObsManifest(compactManifest),
-    /unsupported categorical codes dtype.*uint32.*uint8.*uint16/i
+    /unsupported categorical codes dtype.*uint64.*uint8.*uint16.*uint32/i
   );
 });
 
@@ -508,10 +432,10 @@ test('rejects unsupported direct AnnData categorical code dtypes', async () => {
     getAdapter: () => ({
       async getObsFieldData() {
         return {
-          data: Uint32Array.from([0, 1]).buffer,
+          data: new BigUint64Array([0n, 1n]).buffer,
           kind: 'category',
           categories: ['A', 'B'],
-          dtype: 'uint32',
+          dtype: 'uint64',
           missingValue: 0xffff_ffff
         };
       }
@@ -524,6 +448,7 @@ test('rejects unsupported direct AnnData categorical code dtypes', async () => {
       loadObsFieldData('zarr://unsupported-dtype/obs/manifest.json', {
         key: 'group',
         kind: 'category',
+        payloadIndex: 0,
         categories: ['A', 'B'],
         codesPath: 'obs/0.codes.u8',
         codesDtype: 'uint8',
@@ -531,9 +456,9 @@ test('rejects unsupported direct AnnData categorical code dtypes', async () => {
         outlierQuantilesPath: null,
         outlierDtype: null,
         outlierQuantized: false,
-        centroidsByDim: {},
+        centroidsByEmbedding: {},
       }),
-      /unsupported categorical codes dtype.*uint32.*uint8.*uint16/i
+      /unsupported categorical codes dtype.*uint64.*uint8.*uint16.*uint32/i
     );
   } finally {
     restoreActiveDataset(manager, previous);
@@ -544,7 +469,8 @@ test('rejects source categorical codes before narrowing can alter them', async (
   for (const invalidCode of [256, 0.5, -2]) {
     const adapter = new BaseAnnDataAdapter(categoricalLoader({
       categories: ['present'],
-      codes: Float64Array.from([invalidCode])
+      // Two cells: a one-cell embedding has no coordinate variation to plot.
+      codes: Float64Array.from([invalidCode, 0])
     }));
     await adapter.initialize();
     await assert.rejects(
@@ -586,8 +512,12 @@ test('mutable state owns a writable copy of immutable loader categories', () => 
       clear() {}
     },
     _varFieldDataCache: new Map(),
-    activeDimensionLevel: 2,
+    // The live view shows one 2D representation: positions carry 2 values a cell.
+    dimensionManager: {
+      getLayout: () => ({ layoutKey: 'X_umap', dimension: 2 })
+    },
     clearCentroids() {},
+    getViewLayoutKey: () => 'X_umap',
     viewer: {
       resetVectorFieldOverlay() {},
       setCentroidLabels() {},
@@ -636,8 +566,11 @@ test('dataset publication retires stale field and batch owners before notifying 
     _renameRegistry: { clear() {} },
     _userDefinedFields: { clear() {} },
     _varFieldDataCache: new Map(),
-    _visibilityScratch: new Float32Array(7),
-    activeDimensionLevel: 2,
+    // The live view shows one 2D representation: positions carry 2 values a cell.
+    dimensionManager: {
+      getLayout: () => ({ layoutKey: 'X_umap', dimension: 2 })
+    },
+    getViewLayoutKey: () => 'X_umap',
     activeFieldIndex: 0,
     activeFieldSource: 'obs',
     activeVarFieldIndex: 3,
@@ -680,7 +613,7 @@ test('dataset publication retires stale field and batch owners before notifying 
     batchMode: false,
   }]);
   assert.equal(state._activeCategoryCounts, null);
-  assert.equal(state._visibilityScratch, null);
+  assert.equal(Object.hasOwn(state, '_visibilityScratch'), false);
   assert.deepEqual(state._batchDirty, {
     visibility: false,
     colors: false,
@@ -738,13 +671,24 @@ test('genes analysis preserves numeric zero and false category labels', async ()
         state: {
           obsData: {
             fields: [{ key: 'group', loaded: true }]
-          }
+          },
+          getDataMapping: () => ({
+            kind: 'export',
+            embeddings: { '1d': null, '2d': { key: 'umap', columns: null }, '3d': null },
+            geneNames: 'index',
+            vectorFields: [],
+          })
         },
         async ensureObsFieldLoaded() {
+          // The data layer hands analysis its uint16 form of the codes
+          // (65535 = missing), whatever width the field loaded in.
           return {
             kind: 'category',
             categories,
-            codes: loaded.codes,
+            codes: Uint16Array.from(
+              loaded.codes,
+              code => (code === 255 ? 65_535 : code)
+            ),
             colors: {}
           };
         }
@@ -824,12 +768,18 @@ test('bulk analysis page values preserve numeric zero and false labels', async (
 });
 
 function createStateForFieldLoading() {
-  return new DataState({
+  const state = new DataState({
     resetVectorFieldOverlay() {},
     setCentroidLabels() {},
     setCentroids() {},
     setData() {}
   }, null);
+  // The two-cell 3D layout every scene in these tests publishes.
+  state.setDimensionManager(createInMemoryDimensionManager({
+    positions: new Float32Array(6),
+    dimension: 3
+  }));
+  return state;
 }
 
 test('DataState keeps exact field descriptors separate from mutable load state', async t => {
@@ -850,10 +800,13 @@ test('DataState keeps exact field descriptors separate from mutable load state',
       nObs: 2,
       nVars: 1,
       obsKeys: ['numeric_category', 'score'],
-      varNames: ['Gene A'],
-      obsmKeys: [],
+      readObsmColumns: diagonalObsmColumns,
       async getDatasetMetadata() {
-        return datasetMetadata(2);
+        return loaderMetadata({ nObs: 2, nVars: 1, obsm: { X_umap: 2 }, hasX: true });
+      },
+      async readVarNames(axis, column) {
+        assert.deepEqual([axis, column], ['X', null]);
+        return { index: ['Gene A'], values: ['Gene A'] };
       },
       async getObsFieldInfo(key) {
         if (key === 'numeric_category') {
@@ -878,8 +831,8 @@ test('DataState keeps exact field descriptors separate from mutable load state',
           values: Float32Array.from([1.25, 2.5])
         };
       },
-      async getGeneExpression(key) {
-        assert.equal(key, 'Gene A');
+      async getMatrixColumn(element, index) {
+        assert.deepEqual([element, index], ['X', 0]);
         return Float32Array.from([5.5, 6.75]);
       }
     };
@@ -900,9 +853,9 @@ test('DataState keeps exact field descriptors separate from mutable load state',
       'zarr://state-descriptor-direct/obs/manifest.json'
     ));
     state.setVarFieldLoader(createVarFieldLoader(
-      'zarr://state-descriptor-direct/var/manifest.json'
+      'zarr://state-descriptor-direct/var_manifest.json'
     ));
-    state.initVarData(expandVarManifest(adapter.getVarManifest()));
+    state.initVarData(expandVarManifest(await adapter.getVarManifest()));
     state.initScene(new Float32Array(6), obs);
 
     const categoricalIndex = state.obsData.fields.findIndex(
@@ -917,7 +870,8 @@ test('DataState keeps exact field descriptors separate from mutable load state',
 
     assert.equal(runtimeCategory.loaded, false);
     assert.equal(runtimeCategory._loadingPromise, null);
-    assert.equal(runtimeCategory._normalizedDims, null);
+    assert.ok(runtimeCategory._normalizedLayouts instanceof Set);
+    assert.equal(runtimeCategory._normalizedLayouts.size, 0);
     assert.equal(Object.isFrozen(ownedCategoryDescriptor), true);
     assert.equal(Object.isFrozen(ownedCategoryDescriptor.categories), true);
     assert.equal(Object.hasOwn(ownedCategoryDescriptor, 'loaded'), false);
@@ -926,7 +880,7 @@ test('DataState keeps exact field descriptors separate from mutable load state',
       false
     );
     assert.equal(
-      Object.hasOwn(ownedCategoryDescriptor, '_normalizedDims'),
+      Object.hasOwn(ownedCategoryDescriptor, '_normalizedLayouts'),
       false
     );
 
@@ -956,7 +910,7 @@ test('DataState keeps exact field descriptors separate from mutable load state',
     manager.activeDatasetMetadata = null;
 
     const obs = expandObsManifest({
-      _format: 'compact_v1',
+      _format: 'compact_v2',
       n_points: 2,
       centroid_outlier_quantile: null,
       latent_key: null,
@@ -1009,9 +963,8 @@ test('DataState keeps exact field descriptors separate from mutable load state',
       'https://example.test/var_manifest.json'
     ));
     state.initVarData(expandVarManifest({
-      _format: 'compact_v1',
+      _format: 'compact_v2',
       n_points: 2,
-      var_gene_id_column: null,
       compression: null,
       quantization: null,
       _varSchema: {
@@ -1021,7 +974,10 @@ test('DataState keeps exact field descriptors separate from mutable load state',
         dtype: 'float32',
         quantized: false
       },
-      fields: [[0, 'Gene A']]
+      fields: [[0, 'Gene A']],
+      gene_name_sets: [
+        { source: null, filled_from_index: 0, renamed: [], names: null }
+      ]
     }));
     state.initScene(new Float32Array(6), obs);
 

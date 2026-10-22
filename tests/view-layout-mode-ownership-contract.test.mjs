@@ -29,9 +29,8 @@ function viewContext(id) {
     activeFieldSource: null,
     dimensionLevel: 2,
     colorsArray: Uint8Array.from([1, 2, 3, 255]),
-    categoryTransparency: Float32Array.from([1]),
-    cellVisibilityMask: Float32Array.from([1]),
-    outlierQuantilesArray: Float32Array.from([-1]),
+    categoryTransparency: Uint8Array.from([1]),
+    cellVisibilityMask: Uint8Array.from([1]),
     centroidPositions: new Float32Array(),
     centroidColors: new Uint8Array(),
     centroidOutliers: new Float32Array(),
@@ -60,10 +59,9 @@ function makeState(initialMode) {
   const state = Object.assign(Object.create(viewContextCoreMethods), {
     activeViewId: 'live',
     pointCount: 1,
-    cellVisibilityMask: Float32Array.from([1]),
+    cellVisibilityMask: Uint8Array.from([1]),
     colorsArray: Uint8Array.from([1, 2, 3, 255]),
-    categoryTransparency: Float32Array.from([1]),
-    outlierQuantilesArray: Float32Array.from([-1]),
+    categoryTransparency: Uint8Array.from([1]),
     centroidPositions: new Float32Array(),
     centroidColors: new Uint8Array(),
     centroidOutliers: new Float32Array(),
@@ -84,7 +82,8 @@ function makeState(initialMode) {
     getAvailableDimensions: () => [2],
     getDimensionManager: () => ({
       getViewDimension: () => 2,
-      setViewDimension() {}
+      getViewLayout: () => '2d',
+      setViewLayout() {}
     }),
     getFields: () => [],
     getVarFields: () => [],

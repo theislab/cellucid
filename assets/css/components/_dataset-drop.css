@@ -1,0 +1,75 @@
+/* components/_dataset-drop.css
+   The overlay shown across the viewer while files are dragged over the page
+   (ui/modules/dataset-drop.js). It never takes pointer events: the document
+   owns the drag, so the overlay cannot swallow a drop. */
+
+.dataset-drop-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-tooltip);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-6);
+  background: var(--color-surface-overlay);
+  backdrop-filter: blur(2px);
+  pointer-events: none;
+  animation: dataset-drop-in var(--duration-fast) var(--easing-out);
+}
+
+.dataset-drop-overlay[hidden] {
+  display: none;
+}
+
+/* The frame marks the whole viewer as the target; the card says what to drop. */
+.dataset-drop-overlay::before {
+  content: '';
+  position: absolute;
+  inset: var(--space-4);
+  border: var(--border-width-2) dashed var(--color-accent-strong);
+  border-radius: var(--radius-sm);
+}
+
+.dataset-drop-panel {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-2);
+  max-width: 360px;
+  padding: var(--space-6) var(--space-8);
+  text-align: center;
+  background: var(--color-surface-elevated);
+  border: var(--border-default);
+  box-shadow: var(--shadow-lg);
+  color: var(--color-text-primary);
+}
+
+.dataset-drop-icon {
+  color: var(--color-accent-text);
+}
+
+.dataset-drop-title {
+  margin: 0;
+  font-size: var(--type-title);
+  font-weight: var(--font-weight-semibold);
+  letter-spacing: var(--tracking-tight);
+}
+
+.dataset-drop-hint {
+  margin: 0;
+  font-size: var(--type-body);
+  line-height: var(--leading-relaxed);
+  color: var(--color-text-secondary);
+}
+
+@keyframes dataset-drop-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .dataset-drop-overlay {
+    animation: none;
+  }
+}

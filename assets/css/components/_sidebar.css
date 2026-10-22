@@ -11,10 +11,10 @@
   bottom: var(--space-2-5);
   width: var(--sidebar-width);
   box-sizing: border-box;
-  border: var(--border-strong);
-  border-radius: 0;
+  border: var(--border-default);
+  border-radius: var(--radius-none);
   box-shadow: var(--shadow-md);
-  font-size: var(--text-lg);
+  font-size: var(--type-control);
   z-index: var(--z-sidebar);
   display: flex;
   flex-direction: column;
@@ -28,7 +28,7 @@
 .sidebar-scroll {
   flex: 1 1 auto;
   min-height: 0;
-  background-color: color-mix(in srgb, var(--color-surface-sunken) 94%, black);
+  background-color: color-mix(in srgb, var(--color-surface-sunken) 94%, var(--black));
   /* Subtle horizontal rules to suggest paper */
   background-image: linear-gradient(
     to bottom,
@@ -38,10 +38,10 @@
   background-size: 100% 26px;
   /* Subtle inset shadow for depth */
   box-shadow: inset 0 1px 3px color-mix(in srgb, var(--color-text-primary) 6%, transparent);
-  padding: var(--space-3-5) var(--space-4) var(--space-3);
+  padding: var(--space-2-5) var(--space-3) var(--space-2-5);
   display: flex;
   flex-direction: column;
-  gap: var(--space-3);
+  gap: var(--control-panel-gap);
   overflow-x: hidden;
   overflow-y: auto;
   /* Contain layout for smooth accordion drag/undock */
@@ -60,6 +60,7 @@
 
 #sidebar.resizing {
   transition: none;
+  -webkit-user-select: none;
   user-select: none;
 }
 
@@ -68,10 +69,10 @@
   position: fixed;
   top: var(--space-2-5);
   left: var(--space-2-5);
-  width: 38px;
-  height: 34px;
+  width: var(--sidebar-toggle-width);
+  height: var(--sidebar-toggle-height);
   background: var(--color-surface-elevated);
-  border: var(--border-strong);
+  border: var(--border-default);
   border-radius: 0 var(--radius-full) var(--radius-full) 0;
   box-shadow: var(--shadow-sm);
   cursor: pointer;
@@ -79,7 +80,7 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 18px;
+  font-size: var(--control-glyph-lg);
   color: var(--color-text-primary);
   transition: left var(--duration-normal) var(--easing-standard),
     background-color var(--duration-fast) var(--easing-standard),
@@ -129,8 +130,8 @@
 
 /* Masthead style for the logo */
 .sidebar-brand {
-  margin: 0 0 var(--space-1);
-  border: var(--border-strong);
+  margin: 0;
+  border: var(--border-default);
   background: var(--color-surface-elevated);
   box-shadow: var(--shadow-md);
 }
@@ -152,18 +153,6 @@
   background: var(--color-border-light);
 }
 
-[data-theme="dark"] .sidebar-brand {
-  background: var(--white);
-}
-
-[data-theme="dark"] .sidebar-brand-link:hover {
-  background: var(--gray-100);
-}
-
-[data-theme="dark"] .sidebar-brand-link:active {
-  background: var(--gray-200);
-}
-
 .sidebar-brand-link:focus-visible {
   outline: 2px solid var(--color-border-focus);
   outline-offset: 2px;
@@ -176,108 +165,28 @@
   display: block;
 }
 
-/* Typography inside sidebar */
-#sidebar h1 {
-  font-size: var(--text-2xl);
-  margin: 0 0 var(--space-1-5);
-  letter-spacing: 0.3px;
+/* The wordmark is grey-scale ink drawn for a light surface. In the dark theme
+   it is inverted (the hue rotation keeps any tint where it was), so the brand
+   card follows the theme like every other surface instead of staying a white
+   block. */
+:root[data-theme="dark"] .sidebar-logo,
+:root[data-theme="dark"] .welcome-logo {
+  filter: invert(1) hue-rotate(180deg);
 }
 
-/* Labels = mini newspaper sub-headings */
-#sidebar label,
-.accordion-section.accordion-floating label {
-  display: inline-block;
-  font-family: var(--font-display);
-  font-weight: var(--font-weight-medium);
-  font-size: var(--text-xs);
-  letter-spacing: var(--tracking-wide);
-  text-transform: uppercase;
-  color: var(--color-text-secondary);
-}
-
-/* Inline checkbox label utility (for centroid / smoke) */
-.checkbox-inline {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--space-1-5);
-  margin-top: var(--space-1);
-  font-size: var(--text-sm);
-  color: var(--color-text-secondary);
-}
-
-/* Simple field layout */
+/* Field selector rows: a label above a select and its field actions. */
 .field-select {
   display: flex;
   flex-direction: column;
-  gap: var(--space-1-5);
 }
 
 .field-select + .field-select {
-  margin-top: var(--space-1-5);
-}
-
-.field-select select,
-.field-select .searchable-dropdown,
-.field-select .obs-select {
-  margin-top: 0;
-}
-
-/* Selects – same paper box style everywhere */
-.obs-select,
-#background-select {
-  width: 100%;
-  margin-top: var(--space-1);
-  padding: calc(var(--space-1) + var(--space-px)) var(--space-2);
-  font-size: var(--text-sm);
-  border-radius: 0;
-  border: var(--border-strong);
-  background-color: var(--color-surface-elevated);
-  color: var(--color-text-primary);
-  box-shadow: var(--shadow-sm);
-  appearance: none;
-  -webkit-appearance: none;
-  -moz-appearance: none;
-  background-image: linear-gradient(45deg, transparent 50%, currentColor 50%),
-                    linear-gradient(135deg, currentColor 50%, transparent 50%);
-  background-position: calc(100% - 14px) 9px, calc(100% - 10px) 9px;
-  background-size: 4px 4px, 4px 4px;
-  background-repeat: no-repeat;
-}
-
-.obs-select:focus,
-#background-select:focus {
-  outline: 2px solid var(--color-border-focus);
-  outline-offset: 1px;
-  box-shadow: var(--shadow-md);
+  margin-top: var(--control-block-gap);
 }
 
 /* ========================================================================
    Split-view HUD (small multiples) in sidebar
    ===================================================================== */
-
-#split-view-controls {
-  margin-top: var(--space-2);
-}
-
-.split-view-badges-box {
-  margin-top: var(--space-2);
-  padding: var(--space-2) var(--space-2-5);
-  border: var(--border-width-1) solid color-mix(in srgb, var(--color-border-strong) 18%, transparent);
-  background: var(--color-surface-secondary);
-  border-radius: 0;
-  box-shadow: var(--shadow-sm);
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
-}
-
-.split-view-intro {
-  margin: calc(-1 * var(--space-0-5)) 0 var(--space-2-5);
-}
-
-.split-view-section-title {
-  margin-bottom: var(--space-1-5);
-}
 
 .split-view-row {
   display: flex;
@@ -285,9 +194,11 @@
   margin: var(--space-1-5) 0;
 }
 
-.camera-lock-btn {
-  text-align: center;
-  padding: var(--space-1) var(--space-3);
+/* The (i) beside "Link cameras" sits centred on the row, far enough from the
+   button that its hit ring (widest on touch) never covers it. */
+.split-view-row > .info-btn {
+  align-self: center;
+  margin-left: var(--space-1);
 }
 
 .split-view-badges {
@@ -302,8 +213,9 @@
   box-shadow: none;
 }
 
-.split-view-box-title {
-  margin: 8px 0 6px;
+/* The layout label sits beside its select in this row, not above it. */
+.split-view-actions label {
+  margin: 0;
 }
 
 .split-view-actions {
@@ -312,46 +224,93 @@
   padding-top: 0;
 }
 
-.view-layout-select,
+/* The layout select takes the row's free width, so "Grid compare" and "Edit
+   selected view" read in full instead of being cut to a fixed 100px. */
 #view-layout-mode {
-  width: 100px;
+  flex: 1 1 0;
+  min-width: 0;
+  margin-top: 0;
 }
 
-/* JS-controlled panels that should be hidden by default. */
-#lod-force-container,
-#dimension-controls,
-#connectivity-controls,
-#connectivity-sliders,
-#planar-controls,
-#freefly-controls {
-  display: none;
-}
-
-.split-badge {
+.split-badge,
+.view-target-badge {
   display: flex;
   align-items: center;
   gap: var(--space-1);
   padding: calc(var(--space-0-5) + var(--space-px)) var(--space-1-5);
-  border-radius: var(--radius-md);
-  font-size: var(--text-xs);
+  border-radius: var(--radius-sm);
+  font-size: var(--type-control);
   background: var(--color-border-light);
   border: var(--border-width-1) solid var(--color-border-default);
   cursor: pointer;
   transition: var(--transition-colors);
 }
 
+/* A view row is two lines: what the view shows (and its remove button), then
+   its field, link mark and navigation mode. */
+.split-badge {
+  flex-wrap: wrap;
+  row-gap: var(--space-0-5);
+}
+
+/* The row's first line selects the view: its number, the camera mark and what
+   it shows, which gets the line's full width. */
+.split-badge-select {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  flex: 1 1 0;
+  min-width: 0;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
 .split-badge-label {
-  flex: 1;
+  flex: 1 1 auto;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
+.split-badge-meta {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  flex: 1 1 100%;
+  min-width: 0;
+  /* Under the label: past the number pill and the camera mark. */
+  padding-left: calc(var(--space-5) + var(--space-1));
+}
+
+.split-badge-sub {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: var(--type-compact);
+  opacity: 0.75;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* "linked": the view shares its camera with the views of its embedding. */
+.split-badge-link {
+  flex-shrink: 0;
+  font-size: var(--type-compact);
+  padding: var(--space-px) var(--space-1);
+  border-radius: var(--radius-full);
+  border: var(--border-width-1) dashed color-mix(in srgb, currentColor 45%, transparent);
+  opacity: 0.85;
+  cursor: help;
+}
+
 .split-badge-pill {
-  font-family: var(--font-display);
-  font-size: var(--text-2xs);
-  text-transform: uppercase;
-  letter-spacing: var(--tracking-wider);
+  font-size: var(--type-compact);
   padding: var(--space-px) var(--space-1-5);
   border-radius: var(--radius-full);
   border: var(--border-width-1) solid color-mix(in srgb, var(--color-border-strong) 50%, transparent);
@@ -361,23 +320,20 @@
 /*
    Maturity tag — a small pill that says a control's selected option is not
    finished. Built from the same tokens as `.split-badge-pill` so it reads as
-   part of the sidebar rather than as an alert, and toned with the warning
-   triple, which is defined per theme and therefore correct in light and dark
-   without a second rule.
+   part of the sidebar rather than as an alert, and toned with the info triple
+   (a beta feature is usable, not a hazard), which is defined per theme and
+   therefore correct in light and dark without a second rule.
 */
 .maturity-tag {
   flex: 0 0 auto;
-  font-family: var(--font-display);
-  font-size: var(--text-2xs);
+  font-size: var(--type-compact);
   font-weight: var(--font-weight-semibold);
   line-height: 1.4;
-  text-transform: uppercase;
-  letter-spacing: var(--tracking-wider);
   padding: var(--space-px) var(--space-1-5);
   border-radius: var(--radius-full);
-  border: var(--border-width-1) solid color-mix(in srgb, var(--color-warning) 45%, transparent);
-  background: var(--color-warning-soft);
-  color: var(--color-warning-text);
+  border: var(--border-width-1) solid color-mix(in srgb, var(--color-info) 45%, transparent);
+  background: var(--color-info-soft);
+  color: var(--color-info-text);
   cursor: help;
 }
 
@@ -386,7 +342,7 @@
   border-radius: var(--radius-full);
   border: var(--border-width-1) solid color-mix(in srgb, var(--color-border-strong) 35%, transparent);
   cursor: pointer;
-  font-size: var(--text-sm);
+  font-size: var(--type-control);
   line-height: 1;
   padding: 0 var(--space-1);
   margin-left: var(--space-3);
@@ -404,10 +360,11 @@
   border-color: var(--color-interactive-primary);
 }
 
+/* The selected row keeps its number's circle, drawn in the inverse colour. */
 .split-badge.active .split-badge-pill {
-  background: var(--color-interactive-primary);
+  background: transparent;
   color: var(--color-text-inverse);
-  border-color: var(--color-interactive-primary);
+  border-color: color-mix(in srgb, var(--color-text-inverse) 70%, transparent);
 }
 
 .split-badge.active .split-badge-remove {
@@ -415,73 +372,51 @@
   color: var(--color-text-inverse);
 }
 
-.split-badge.active-camera {
+.split-badge.active-camera,
+.view-target-badge.active-camera {
   box-shadow: 0 0 0 2px var(--color-border-focus);
+}
+
+/* The Navigation panel's "Applies to" row: the focused view's badge, read-only. */
+.navigation-view-target {
+  display: flex;
+  flex-direction: column;
+  gap: var(--control-row-gap);
+}
+
+.navigation-view-target[hidden] {
+  display: none;
+}
+
+/* Read-only: it names the target, it is not a control. */
+.view-target-badge {
+  cursor: default;
 }
 
 /* Camera indicator - separate element outside the pill */
 .split-badge-camera {
-  font-size: var(--text-xs);
+  font-size: var(--type-hint);
   opacity: 0;
   margin-left: calc(-1 * var(--space-0-5));
 }
 
-.split-badge.active-camera .split-badge-camera {
+.split-badge.active-camera .split-badge-camera,
+.view-target-badge.active-camera .split-badge-camera {
   opacity: 1;
 }
 
-/* Dimension indicator on view badges */
-.split-badge-dim {
-  font-family: inherit;
-  font-size: var(--text-2xs);
-  font-weight: 500;
-  text-transform: uppercase;
-  letter-spacing: 0.02em;
-  padding: var(--space-px) 5px;
-  margin-left: 0;
-  border-radius: var(--radius-full);
-  background: transparent;
-  color: color-mix(in srgb, var(--color-border-strong) 55%, transparent);
-  border: var(--border-width-1) solid color-mix(in srgb, var(--color-border-strong) 25%, transparent);
-  cursor: pointer;
-  transition: var(--transition-colors);
-  flex-shrink: 0;
-}
-
-.split-badge-dim:hover {
-  background: color-mix(in srgb, var(--color-border-strong) 6%, transparent);
-  color: color-mix(in srgb, var(--color-border-strong) 75%, transparent);
-  border-color: color-mix(in srgb, var(--color-border-strong) 40%, transparent);
-}
-
-.split-badge-dim:active {
-  background: color-mix(in srgb, var(--color-border-strong) 10%, transparent);
-}
-
-.split-badge.active .split-badge-dim {
-  background: transparent;
-  color: color-mix(in srgb, var(--color-text-inverse) 60%, transparent);
-  border-color: color-mix(in srgb, var(--color-text-inverse) 35%, transparent);
-}
-
-.split-badge.active .split-badge-dim:hover {
-  background: color-mix(in srgb, var(--color-text-inverse) 8%, transparent);
-  color: color-mix(in srgb, var(--color-text-inverse) 85%, transparent);
-  border-color: color-mix(in srgb, var(--color-text-inverse) 50%, transparent);
-}
-
-/* Navigation mode indicator on view badges (only shown when cameras unlocked) */
+/* The navigation-mode indicator on each view row: every view navigates by
+   its own mode. It is always shown, so its text is a text colour (AA on the
+   row); only its outline is faint. */
 .split-badge-nav {
   font-family: inherit;
-  font-size: var(--text-2xs);
-  font-weight: 500;
-  text-transform: uppercase;
-  letter-spacing: 0.02em;
-  padding: var(--space-px) 5px;
+  font-size: var(--type-compact);
+  font-weight: var(--font-weight-medium);
+  padding: var(--space-px) var(--space-1);
   margin-left: 0;
   border-radius: var(--radius-full);
   background: transparent;
-  color: color-mix(in srgb, var(--color-border-strong) 55%, transparent);
+  color: var(--color-text-secondary);
   border: var(--border-width-1) solid color-mix(in srgb, var(--color-border-strong) 25%, transparent);
   cursor: pointer;
   transition: var(--transition-colors);
@@ -490,7 +425,7 @@
 
 .split-badge-nav:hover {
   background: color-mix(in srgb, var(--color-border-strong) 6%, transparent);
-  color: color-mix(in srgb, var(--color-border-strong) 75%, transparent);
+  color: var(--color-text-primary);
   border-color: color-mix(in srgb, var(--color-border-strong) 40%, transparent);
 }
 
@@ -500,12 +435,12 @@
 
 .split-badge.active .split-badge-nav {
   background: transparent;
-  color: color-mix(in srgb, var(--color-text-inverse) 60%, transparent);
+  color: var(--color-text-inverse);
   border-color: color-mix(in srgb, var(--color-text-inverse) 35%, transparent);
 }
 
 .split-badge.active .split-badge-nav:hover {
   background: color-mix(in srgb, var(--color-text-inverse) 8%, transparent);
-  color: color-mix(in srgb, var(--color-text-inverse) 85%, transparent);
+  color: var(--color-text-inverse);
   border-color: color-mix(in srgb, var(--color-text-inverse) 50%, transparent);
 }

@@ -19,7 +19,10 @@ export type PrimitiveColorToken =
   | 'yellow-50' | 'yellow-100' | 'yellow-200' | 'yellow-300' | 'yellow-400'
   | 'yellow-500' | 'yellow-600' | 'yellow-700' | 'yellow-800' | 'yellow-900'
   | 'white' | 'black' | 'transparent'
-  | 'viewer-bg-grid' | 'viewer-bg-grid-dark';
+  | 'viewer-bg-grid' | 'viewer-bg-grid-dark'
+  | 'viewer-bg-studio' | 'viewer-bg-studio-dark'
+  | 'viewer-bg-atelier' | 'viewer-bg-abyss' | 'viewer-bg-aurora'
+  | 'viewer-bg-nebula' | 'viewer-bg-abyss-dark' | 'viewer-bg-aurora-dark';
 
 export type SemanticColorToken =
   | 'color-surface-primary' | 'color-surface-secondary' | 'color-surface-tertiary'
@@ -28,6 +31,7 @@ export type SemanticColorToken =
   | 'color-text-inverse' | 'color-text-disabled' | 'color-text-link' | 'color-text-link-hover'
   | 'color-border-strong' | 'color-border-default' | 'color-border-light'
   | 'color-border-focus' | 'color-border-error'
+  | 'color-border-subtle' | 'color-border-faint'
   | 'color-interactive-primary' | 'color-interactive-primary-hover' | 'color-interactive-primary-active'
   | 'color-interactive-secondary' | 'color-interactive-secondary-hover' | 'color-interactive-secondary-active'
   | 'color-accent' | 'color-accent-strong' | 'color-accent-soft' | 'color-accent-text'
@@ -43,6 +47,7 @@ export type SpacingToken =
   | 'space-10' | 'space-11' | 'space-12' | 'space-14' | 'space-16'
   | 'space-20' | 'space-24'
   | 'sidebar-width' | 'sidebar-min-width' | 'sidebar-max-width'
+  | 'sidebar-toggle-width' | 'sidebar-toggle-height'
   | 'header-height' | 'accordion-default-width' | 'accordion-default-height';
 
 export type BreakpointToken =
@@ -56,6 +61,9 @@ export type TypographyToken =
   | 'font-sans' | 'font-display' | 'font-mono'
   | 'font-weight-regular' | 'font-weight-medium' | 'font-weight-semibold' | 'font-weight-bold'
   | 'text-2xs' | 'text-xs' | 'text-sm' | 'text-md' | 'text-lg' | 'text-xl' | 'text-2xl' | 'text-3xl'
+  | 'type-title' | 'type-heading' | 'type-body'
+  | 'type-label' | 'type-control'
+  | 'type-button' | 'type-hint' | 'type-readout' | 'type-compact'
   | 'tracking-tight' | 'tracking-normal' | 'tracking-wide' | 'tracking-wider'
   | 'leading-none' | 'leading-tight' | 'leading-normal' | 'leading-relaxed';
 
@@ -71,9 +79,9 @@ export type ShadowToken =
   | 'shadow-soft-xs' | 'shadow-soft-sm' | 'shadow-soft-md' | 'shadow-soft-lg' | 'shadow-soft-xl';
 
 export type TransitionToken =
-  | 'duration-instant' | 'duration-fast' | 'duration-normal' | 'duration-slow'
+  | 'duration-instant' | 'duration-fast' | 'duration-normal' | 'duration-slow' | 'duration-spin'
   | 'easing-linear' | 'easing-standard' | 'easing-smooth' | 'easing-out'
-  | 'transition-all' | 'transition-colors';
+  | 'transition-colors';
 
 export type ZIndexToken =
   | 'z-below' | 'z-base' | 'z-raised'
@@ -88,6 +96,24 @@ export type OpacityToken =
   | 'opacity-55' | 'opacity-60' | 'opacity-65' | 'opacity-70' | 'opacity-75'
   | 'opacity-80' | 'opacity-85' | 'opacity-90' | 'opacity-95' | 'opacity-100';
 
+export type ControlToken =
+  | 'control-panel-gap' | 'control-group-gap' | 'control-block-gap' | 'control-row-gap'
+  | 'control-box-padding-y' | 'control-box-padding-x'
+  | 'control-padding-y' | 'control-padding-x'
+  | 'control-height' | 'control-compact-height'
+  | 'control-button-padding-y' | 'control-button-padding-x'
+  | 'control-button-compact-padding-y' | 'control-button-compact-padding-x'
+  | 'control-chip-padding-y' | 'control-chip-padding-x'
+  | 'control-icon-button-size' | 'control-icon-size' | 'control-check-size'
+  | 'control-glyph-sm' | 'control-glyph-md' | 'control-glyph-lg'
+  | 'control-dialog-header-padding-y' | 'control-dialog-header-padding-x'
+  | 'control-dialog-padding'
+  | 'control-switch-track-width' | 'control-switch-track-height'
+  | 'control-switch-knob-size' | 'control-switch-inset'
+  | 'control-slider-track-height' | 'control-slider-thumb-size' | 'control-slider-hit-height'
+  | 'control-target-min' | 'control-row-min' | 'control-hit-extend'
+  | 'control-disabled-opacity';
+
 export type ThemeName = 'light' | 'dark';
 export type ThemePreference = ThemeName;
 
@@ -101,6 +127,7 @@ export type DesignTokenName =
   | ShadowToken
   | TransitionToken
   | ZIndexToken
-  | OpacityToken;
+  | OpacityToken
+  | ControlToken;
 
 export type DesignToken = `--${DesignTokenName}`;

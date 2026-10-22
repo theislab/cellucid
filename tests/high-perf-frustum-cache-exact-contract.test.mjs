@@ -7,12 +7,20 @@ import {
 } from '../assets/js/rendering/high-perf-renderer.js';
 
 function makeRenderer() {
-  return Object.create(HighPerfRenderer.prototype);
+  // Planes are extracted against the live tree's bounds when one exists.
+  return Object.assign(Object.create(HighPerfRenderer.prototype), {
+    currentDimensionLevel: 3,
+    spatialIndices: new Map(),
+  });
 }
 
 function makeViewState() {
+  const planes = () => Array.from({ length: 6 }, () => new Float32Array(4));
   return {
+    frustumPlaneScratch: planes(),
+    frustumPlanes: planes(),
     lastDimensionLevel: undefined,
+    lastFrustumBounds: null,
     lastFrustumMVP: null,
   };
 }
@@ -33,7 +41,7 @@ test('every finite MVP element change invalidates frustum visibility while stabl
   baseline[12] = 0.1;
 
   assert.equal(
-    renderer._checkFrustumCacheValid(
+    renderer._prepareFrustumCache(
       baseline,
       viewState,
       3,
@@ -44,7 +52,7 @@ test('every finite MVP element change invalidates frustum visibility while stabl
   const acceptedCache = viewState.lastFrustumMVP;
 
   assert.equal(
-    renderer._checkFrustumCacheValid(
+    renderer._prepareFrustumCache(
       baseline.slice(),
       viewState,
       3,
@@ -60,7 +68,7 @@ test('every finite MVP element change invalidates frustum visibility while stabl
     'fixture must be below the retired squared-difference threshold',
   );
   assert.equal(
-    renderer._checkFrustumCacheValid(
+    renderer._prepareFrustumCache(
       tinyMotion,
       viewState,
       3,
@@ -74,7 +82,7 @@ test('every finite MVP element change invalidates frustum visibility while stabl
   const startedAt = performance.now();
   for (let iteration = 0; iteration < 100_000; iteration++) {
     if (
-      renderer._checkFrustumCacheValid(
+      renderer._prepareFrustumCache(
         tinyMotion,
         viewState,
         3,
@@ -93,7 +101,7 @@ test('every finite MVP element change invalidates frustum visibility while stabl
 
   const source =
     HighPerfRenderer.prototype
-      ._checkFrustumCacheValid
+      ._prepareFrustumCache
       .toString();
   assert.doesNotMatch(source, /0\.0005|sumSqDiff/);
 });
@@ -119,7 +127,7 @@ test('sub-threshold camera motion recomputes a point exactly across a frustum bo
 
   const renderBoundary = matrix => {
     if (
-      renderer._checkFrustumCacheValid(
+      renderer._prepareFrustumCache(
         matrix,
         viewState,
         2,
@@ -155,7 +163,7 @@ test('non-finite MVP rejection is atomic across matrix and dimension cache keys'
   const renderer = makeRenderer();
   const viewState = makeViewState();
   const accepted = makeIdentityMatrix();
-  renderer._checkFrustumCacheValid(
+  renderer._prepareFrustumCache(
     accepted,
     viewState,
     2,
@@ -166,7 +174,7 @@ test('non-finite MVP rejection is atomic across matrix and dimension cache keys'
   const invalid = accepted.slice();
   invalid[7] = Number.NaN;
   assert.throws(
-    () => renderer._checkFrustumCacheValid(
+    () => renderer._prepareFrustumCache(
       invalid,
       viewState,
       3,

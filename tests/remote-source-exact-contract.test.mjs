@@ -4,9 +4,13 @@ import test from 'node:test';
 import {
   RemoteDataSource,
   isRemoteUrl,
-  isSecureRemoteUrl,
   parseRemoteUrl,
 } from '../assets/js/data/remote-source.js';
+import { loadMappingCandidates } from '../assets/js/data/data-loaders.js';
+import {
+  MAPPING_CANDIDATES_PATH,
+  resolveAnnDataMapping,
+} from '../assets/js/data/dataset-mapping.js';
 
 function jsonResponse(value, status = 200) {
   return new Response(
@@ -73,7 +77,7 @@ function catalog(
 
 function identity(id = 'cells', name = 'Cells') {
   return {
-    version: 2,
+    version: 3,
     id,
     name,
     description: 'Synthetic remote contract fixture',
@@ -88,9 +92,16 @@ function identity(id = 'cells', name = 'Cells') {
       n_edges: null,
     },
     embeddings: {
-      available_dimensions: [2],
       default_dimension: 2,
-      files: { '2d': 'points_2d.bin' },
+      defaults: { '2d': 'X_umap' },
+      items: {
+        X_umap: {
+          label: 'X_umap',
+          dimension: 2,
+          file: 'embeddings/0_2d.bin',
+          source: { key: 'X_umap', columns: [0, 1] },
+        },
+      },
     },
     obs_fields: [],
   };
@@ -212,14 +223,12 @@ test('remote custom URLs use one canonical explicit transport', () => {
   assert.equal(isRemoteUrl('remote://example.test/data/'), true);
   assert.equal(isRemoteUrl('remotes://example.test/data/'), true);
   assert.equal(isRemoteUrl({ startsWith: () => true }), false);
-  assert.equal(isSecureRemoteUrl('remote://example.test/data/'), false);
-  assert.equal(isSecureRemoteUrl('remotes://example.test/data/'), true);
 
   assert.deepEqual(
-    parseRemoteUrl('remote://example.test:8765/data/points_2d.bin'),
+    parseRemoteUrl('remote://example.test:8765/data/embeddings/0_2d.bin'),
     {
       serverUrl: 'http://example.test:8765',
-      path: 'data/points_2d.bin',
+      path: 'data/embeddings/0_2d.bin',
       secure: false,
     }
   );
@@ -319,11 +328,11 @@ test('connect adopts one complete exported server and exact catalog transaction'
 
   assert.equal(source.getBaseUrl('cells'), 'remote://127.0.0.1:8765/');
   assert.equal(
-    await source.resolveUrl('remote://127.0.0.1:8765/points_2d.bin'),
-    'http://127.0.0.1:8765/points_2d.bin'
+    await source.resolveUrl('remote://127.0.0.1:8765/embeddings/0_2d.bin'),
+    'http://127.0.0.1:8765/embeddings/0_2d.bin'
   );
   await assert.rejects(
-    source.resolveUrl('remote://other.test/points_2d.bin'),
+    source.resolveUrl('remote://other.test/embeddings/0_2d.bin'),
     /does not belong/i
   );
   await assert.rejects(
@@ -357,9 +366,15 @@ test('remote resolution is confined to current declared dataset paths', async t 
   );
   assert.equal(
     await source.resolveUrl(
-      'remote://127.0.0.1:8765/viewer/cells/points_2d.bin'
+      'remote://127.0.0.1:8765/viewer/cells/embeddings/0_2d.bin'
     ),
-    `${origin}/cells/points_2d.bin`
+    `${origin}/cells/embeddings/0_2d.bin`
+  );
+  assert.equal(
+    await source.resolveUrl(
+      `remote://127.0.0.1:8765/viewer/cells/${MAPPING_CANDIDATES_PATH}`
+    ),
+    `${origin}/cells/_cellucid/mapping/candidates.json`
   );
   for (const url of [
     'remote://127.0.0.1:8765/viewer/retired/private.json',
@@ -373,8 +388,34 @@ test('remote resolution is confined to current declared dataset paths', async t 
   }
 });
 
-test('connect accepts the exact current AnnData health and info pair', async t => {
-  installFetch(t, url => {
+function servedAnnDataCandidates() {
+  return {
+    kind: 'anndata',
+    defaults: {
+      kind: 'anndata',
+      // The served slot is the 2D default; a second array is enabled beside it.
+      embeddings: {
+        enabled: [
+          { key: 'X_tsne', columns: [0, 1] },
+          { key: 'X_umap', columns: [0, 1] },
+        ],
+        defaults: {
+          '1d': null,
+          '2d': { key: 'X_umap', columns: [0, 1] },
+          '3d': null,
+        },
+      },
+      knn: null,
+      geneNames: 'index',
+      expression: 'X',
+      latent: null,
+      vectorFields: [],
+    },
+  };
+}
+
+function installAnnDataServer(t, { candidates = servedAnnDataCandidates() } = {}) {
+  return installFetch(t, url => {
     if (url.endsWith('/_cellucid/health')) {
       return jsonResponse(anndataHealth());
     }
@@ -384,12 +425,93 @@ test('connect accepts the exact current AnnData health and info pair', async t =
     if (url.endsWith('/_cellucid/datasets')) {
       return jsonResponse(catalog());
     }
+    if (url === 'http://127.0.0.1:8765/dataset_identity.json') {
+      return jsonResponse(identity());
+    }
+    if (
+      candidates !== null &&
+      url === `http://127.0.0.1:8765/${MAPPING_CANDIDATES_PATH}`
+    ) {
+      return jsonResponse(candidates);
+    }
     return jsonResponse({}, 404);
   });
+}
+
+test('connect accepts the exact current AnnData health and info pair', async t => {
+  installAnnDataServer(t);
   const source = new RemoteDataSource();
+  assert.throws(() => source.servesAnnData(), /not connected/i);
   await source.connect({ url: 'http://127.0.0.1:8765' });
   assert.equal(source.isConnected(), true);
   assert.equal(source.getConnectionInfo().serverInfo.type, 'anndata');
+  assert.equal(source.servesAnnData(), true);
+  source.disconnect();
+  assert.throws(() => source.servesAnnData(), /not connected/i);
+});
+
+test('an exported server does not serve AnnData', async t => {
+  installCanonicalExportedServer(t);
+  const source = new RemoteDataSource();
+  await source.connect({ url: 'http://127.0.0.1:8765' });
+  assert.equal(source.servesAnnData(), false);
+});
+
+test('an AnnData server publishes the data mapping it serves under the dataset base', async t => {
+  const requests = installAnnDataServer(t);
+  const source = new RemoteDataSource();
+  await source.connect({ url: 'http://127.0.0.1:8765' });
+  const metadata = await source.getMetadata('cells');
+  const baseUrl = source.getBaseUrl('cells');
+  assert.equal(baseUrl, 'remote://127.0.0.1:8765/');
+
+  const candidates = await loadMappingCandidates(
+    `${baseUrl}${MAPPING_CANDIDATES_PATH}`,
+    { candidateAnnDataBinding: null, signal: null, stagedSource: source }
+  );
+  assert.equal(
+    requests.at(-1).url,
+    'http://127.0.0.1:8765/_cellucid/mapping/candidates.json'
+  );
+  assert.deepEqual(candidates, servedAnnDataCandidates());
+  assert.deepEqual(
+    resolveAnnDataMapping(candidates, metadata),
+    servedAnnDataCandidates().defaults
+  );
+});
+
+test('an AnnData server without the data-mapping route is refused, not guessed', async t => {
+  installAnnDataServer(t, { candidates: null });
+  const source = new RemoteDataSource();
+  await source.connect({ url: 'http://127.0.0.1:8765' });
+  assert.equal(source.servesAnnData(), true);
+  await assert.rejects(
+    loadMappingCandidates(
+      `${source.getBaseUrl('cells')}${MAPPING_CANDIDATES_PATH}`,
+      { candidateAnnDataBinding: null, signal: null, stagedSource: source }
+    ),
+    /404|not found/i
+  );
+});
+
+test('a served data mapping must agree with the identity served beside it', async t => {
+  const contradicting = servedAnnDataCandidates();
+  // The 2D default names other columns than the identity serves: enabled,
+  // so the mapping is valid, but not what the identity shows.
+  contradicting.defaults.embeddings.enabled.push({ key: 'X_umap', columns: [1, 0] });
+  contradicting.defaults.embeddings.defaults['2d'] = { key: 'X_umap', columns: [1, 0] };
+  installAnnDataServer(t, { candidates: contradicting });
+  const source = new RemoteDataSource();
+  await source.connect({ url: 'http://127.0.0.1:8765' });
+  const metadata = await source.getMetadata('cells');
+  const candidates = await loadMappingCandidates(
+    `${source.getBaseUrl('cells')}${MAPPING_CANDIDATES_PATH}`,
+    { candidateAnnDataBinding: null, signal: null, stagedSource: source }
+  );
+  assert.throws(
+    () => resolveAnnDataMapping(candidates, metadata),
+    /data mapping shows .*2d.*identity shows/i
+  );
 });
 
 test('health, info, and catalog schemas are closed and cross-checked', async t => {

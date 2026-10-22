@@ -2,11 +2,14 @@
  * @fileoverview Atmospheric fog, reproduced for the vector export strategies.
  *
  * WHY THIS EXISTS
- * The viewer's `full` point shader fades every point toward `u_fogColor` and
- * lowers its alpha with distance from the camera (`HP_FS_FULL`,
- * `rendering/shaders/high-perf-shaders.js`). Fog is on by default —
+ * The viewer's `full` point shader thins every point with distance from the
+ * camera (`HP_VS_FULL`, `rendering/shaders/high-perf-shaders.js`, with the
+ * one fog model of `rendering/shaders/fog-shaders.js`); the `sculpted` one is
+ * opaque, and fades its colour toward the fog colour instead
+ * (`HP_FS_SCULPTED`), which a figure sets to its paper. Fog is on by default —
  * `fogDensity` starts at 0.5 — and it is the strongest depth cue a 3D scatter
- * has: near points read saturated and opaque, far points read washed out.
+ * has: near points read saturated and opaque, far points fade into whatever
+ * lies behind them.
  *
  * The PNG and hybrid-SVG paths run that shader, so they carry the cue. The
  * `full-vector` and `optimized-vector` SVG strategies project points in
@@ -15,8 +18,10 @@
  * is not a cosmetic simplification: it flattens the depth axis of the data.
  *
  * WHAT IS AND IS NOT REPRODUCED
- * Reproduced exactly: the Beer-Lambert extinction, the colour blend toward the
- * fog colour, and the `(0.1 + 0.9 * transmittance)` alpha law.
+ * Reproduced exactly: the Beer-Lambert transmittance and the opacity it
+ * leaves a point (`fogOpacityAt`). Fog thins a point toward what is behind it
+ * rather than tinting it, so a circle keeps its colour and fades into the
+ * paper, whatever colour the paper is.
  *
  * Not reproduced: the sphere-impostor lighting term (`u_lightingStrength`),
  * which varies across each point sprite and has no flat-disc equivalent. It is
@@ -27,21 +32,16 @@
  * @module ui/modules/figure-export/utils/fog
  */
 
-/** Only the `full` shader variant carries fog; `light`/`ultralight` have none. */
-const FOGGED_SHADER_QUALITY = 'full';
-
-/** `alpha = (FOG_ALPHA_FLOOR + FOG_ALPHA_RANGE * transmittance) * v_alpha`. */
-const FOG_ALPHA_FLOOR = 0.1;
-const FOG_ALPHA_RANGE = 0.9;
-
-/** `extinction = u_fogDensity * u_fogDensity * FOG_EXTINCTION_SCALE`. */
-const FOG_EXTINCTION_SCALE = 0.6;
-
-/** `fogSpan = max(u_fogFar - u_fogNear, MIN_FOG_SPAN)`. */
-const MIN_FOG_SPAN = 0.0001;
+import {
+  fogOpacityAt,
+  fogScale,
+} from '../../../../../rendering/shaders/fog-shaders.js';
+import { SHADER_QUALITY_TRAITS } from '../../../../../rendering/shader-quality.js';
 
 /**
  * @typedef {object} FogEvaluator
+ * @property {boolean} fadesAlpha - Fog thins the point (`applyFogAlpha`);
+ *   false: it is opaque and fog mixes its colour (`applyFogChannel`).
  * @property {number} fogR - 0..255
  * @property {number} fogG - 0..255
  * @property {number} fogB - 0..255
@@ -58,7 +58,8 @@ const MIN_FOG_SPAN = 0.0001;
  */
 export function createFogEvaluator(renderState) {
   if (renderState === null || typeof renderState !== 'object') return null;
-  if (renderState.shaderQuality !== FOGGED_SHADER_QUALITY) return null;
+  const traits = SHADER_QUALITY_TRAITS[renderState.shaderQuality];
+  if (traits === undefined || traits.fog !== true) return null;
 
   const fogDensity = renderState.fogDensity;
   const fogNear = renderState.fogNear;
@@ -77,11 +78,11 @@ export function createFogEvaluator(renderState) {
     return null;
   }
 
-  const extinction = fogDensity * fogDensity * FOG_EXTINCTION_SCALE;
-  if (extinction === 0) return null;
+  const scale = fogScale(fogDensity, fogNear, fogFar);
+  if (scale === 0) return null;
 
-  // The shader reads `length(eyePos.xyz)` where `eyePos = u_viewMatrix *
-  // u_modelMatrix * position`; folding the two matrices keeps that one
+  // The shader reads `length(eyePos.xyz)` where `eyePos` is the model-view
+  // product applied to the position; folding the two matrices keeps that one
   // multiply per point.
   const mv = new Float64Array(16);
   for (let column = 0; column < 4; column++) {
@@ -94,9 +95,8 @@ export function createFogEvaluator(renderState) {
     }
   }
 
-  const fogSpan = Math.max(fogFar - fogNear, MIN_FOG_SPAN);
-
   return {
+    fadesAlpha: traits.fogAlpha === true,
     fogR: Math.round(Math.max(0, Math.min(1, fogColor[0])) * 255),
     fogG: Math.round(Math.max(0, Math.min(1, fogColor[1])) * 255),
     fogB: Math.round(Math.max(0, Math.min(1, fogColor[2])) * 255),
@@ -105,8 +105,7 @@ export function createFogEvaluator(renderState) {
       const ey = mv[1] * x + mv[5] * y + mv[9] * z + mv[13];
       const ez = mv[2] * x + mv[6] * y + mv[10] * z + mv[14];
       const distance = Math.sqrt(ex * ex + ey * ey + ez * ez);
-      const normalized = Math.max(distance - fogNear, 0) / fogSpan;
-      return Math.exp(-extinction * normalized);
+      return 2 ** (-scale * Math.max(distance - fogNear, 0));
     },
   };
 }
@@ -119,11 +118,12 @@ export function createFogEvaluator(renderState) {
  * @returns {number}
  */
 export function applyFogAlpha(transmittance, alpha) {
-  return (FOG_ALPHA_FLOOR + FOG_ALPHA_RANGE * transmittance) * alpha;
+  return fogOpacityAt(transmittance) * alpha;
 }
 
 /**
- * `mix(fogColor, channel, transmittance)` on one 0..255 channel.
+ * `mix(fogColor, channel, transmittance)` on one 0..255 channel: the fog of an
+ * opaque (`sculpted`) point.
  *
  * @param {number} fogChannel
  * @param {number} channel

@@ -48,6 +48,20 @@ const IDENTITY = Float32Array.from([
 function renderState({ antialias = true } = {}) {
   return {
     antialias,
+    backdrop: {
+      centerY: 0,
+      extentX: 1,
+      extentY: 1,
+      extentZ: 1,
+      flat: false,
+      floorY: -1.12,
+      glowCenterX: 0,
+      look: null,
+      pixelRatio: 1,
+      planarity: 0,
+      stageX: 0,
+      stageZ: 0,
+    },
     bgColor: Float32Array.from([1, 1, 1]),
     cameraDistance: 3,
     cameraPosition: [0, 0, 3],
@@ -104,8 +118,9 @@ function rasterizeWith(state, record) {
   try {
     rasterizePointsWebgl({
       positions: Float32Array.from([0, 0, 0]),
+      dimension: 3,
       colors: Uint8Array.from([255, 255, 255, 255]),
-      transparency: Float32Array.from([1]),
+      transparency: Uint8Array.from([1]),
       renderState: state,
       outputWidthPx: 8,
       outputHeightPx: 8,
@@ -174,7 +189,7 @@ test('an exported view must publish the antialiasing it was drawn with', () => {
       colors: Uint8Array.from([255, 255, 255, 255]),
       pointCount: 1,
       positions: Float32Array.from([0, 0, 0]),
-      transparency: Float32Array.from([1]),
+      transparency: Uint8Array.from([1]),
     },
     id: 'live',
     label: 'Live',
@@ -188,6 +203,7 @@ test('an exported view must publish the antialiasing it was drawn with', () => {
       geometryGeneration: 11,
       legendModel: null,
       lodMembership: null,
+      drawOrder: null,
       lodSizeMultiplier: 1,
       normTransform: { center: [0, 0, 0], scale: 1 },
     },

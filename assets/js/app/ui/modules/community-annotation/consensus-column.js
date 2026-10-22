@@ -13,7 +13,7 @@
  * @module ui/modules/community-annotation/consensus-column
  */
 
-import { categoricalStorageForCount } from '../../../../data/categorical-storage-contract.js';
+import { categoricalStorageForCount, isCategoricalCodes, missingCategoryCode } from '../../../../data/categorical-storage-contract.js';
 
 /**
  * @param {object} deps
@@ -107,12 +107,9 @@ export function createConsensusColumnApplier({ state, session, notifications }) 
       oldToNew[i] = getLabelIndex(label);
     }
 
-    const missingSourceCode =
-      codes instanceof Uint8Array
-        ? 255
-        : codes instanceof Uint16Array
-          ? 65535
-          : null;
+    const missingSourceCode = isCategoricalCodes(codes)
+      ? missingCategoryCode(codes)
+      : null;
 
     // "Pending" is reserved for cells the community has not resolved. It is
     // added only when some cell actually needs it: a category that no cell

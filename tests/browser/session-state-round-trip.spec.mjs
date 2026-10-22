@@ -39,6 +39,7 @@ import { readBundle } from '../../assets/js/app/session/bundle/reader.js';
 import { gzipDecompress } from '../../assets/js/app/session/codecs/gzip.js';
 import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
+import { openCollapsedPanels } from './helpers/panels.mjs';
 
 const DATASET_URL =
   `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}`
@@ -169,6 +170,7 @@ test('a saved session restores to the exact state it recorded', async (
 
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
+  await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
     'Current UI prepared fixture',
   );
@@ -365,4 +367,40 @@ test('a saved session restores to the exact state it recorded', async (
     browserErrors,
     'no session restore may raise a page error',
   ).toEqual([]);
+});
+
+test('a session saved while a view is coloured by a continuous field loads back', async (
+  { page },
+  testInfo,
+) => {
+  // The continuous legend rebuilds its range sliders with generated ids on
+  // every render. A session that recorded those ids named controls no fresh
+  // page has, and loading it was refused ("Session UI control … does not
+  // exist"). What the sliders show is the field's own filter and colour
+  // range, which the core state saves; the legend is not a control inventory.
+  const browserErrors = [];
+  page.on('pageerror', error => browserErrors.push(`page: ${error.stack || error.message}`));
+
+  await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
+  await dismissWelcome(page);
+  await openCollapsedPanels(page);
+  await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
+  await page.locator('#continuous-field').selectOption({ label: 'score' });
+  await expect(page.locator('#legend input[type="range"]').first()).toBeAttached();
+  const sessionPath = await saveSession(page, testInfo, 'continuous-legend.cellucid-session');
+
+  await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
+  await dismissWelcome(page);
+  await openCollapsedPanels(page);
+  await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
+  await loadSession(page, sessionPath);
+  await expect.poll(() => page.evaluate(() => {
+    const state = window._cellucidState;
+    const field = state.activeFieldSource === 'obs'
+      ? state.obsData.fields[state.activeFieldIndex]
+      : null;
+    return field?.key ?? null;
+  })).toBe('score');
+  await expect(page.locator('.notification', { hasText: /does not exist|could not|failed/i })).toHaveCount(0);
+  expect(browserErrors).toEqual([]);
 });

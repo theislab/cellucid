@@ -8,8 +8,10 @@
  * @module ui/modules/highlight/annotation-selection
  */
 
+import { CellSet } from '../../../utils/cell-set.js';
 import { debug } from '../../../../utils/debug.js';
 import {
+  annotationFieldForPane,
   combineAnnotationCandidates,
   computeAnnotationGestureCells
 } from './annotation-cells.js';
@@ -17,12 +19,18 @@ import {
   abandonedGestureNotice,
   ANNOTATION_NEEDS_FIELD_COPY,
   HIGHLIGHT_MODE_COPY,
+  SELECT_BAR_ANNOTATION_NEEDS_FIELD_HINT,
+  SELECT_BAR_HINT,
   SELECTION_NOTICE,
   selectionNoticeHtml
 } from './mode-copy.js';
-import { MAX_HISTORY_STEPS, selectionUnchanged } from './selection-state.js';
+import { pushHistoryStep, selectionUnchanged } from './selection-state.js';
 import { viewerNeedsUiRetirement } from '../../core/viewer-lifecycle.js';
-import { getStepControls, removeStepControls } from './step-controls.js';
+import {
+  publishSelectBarHint,
+  removeStepControls,
+  showStepControls
+} from './step-controls.js';
 import {
   deliverSelectionToJupyter,
   showSelectionDeliveryFailure
@@ -37,6 +45,7 @@ import {
   requireSavedHighlightGroup,
   requireUnifiedSelectionState
 } from './exact-contract.js';
+import { formatCount } from '../../components/display-format.js';
 
 /**
  * @param {object} options
@@ -63,10 +72,9 @@ export function initAnnotationSelection(options) {
       'addHighlightDirect',
       'clearPreviewHighlight',
       'getActiveField',
-      'getCategoryForCell',
       'getCellIndicesForCategory',
       'getCellIndicesForRange',
-      'getValueForCell',
+      'getFieldForView',
       'on',
       'setPreviewHighlightFromIndices'
     ]
@@ -78,6 +86,7 @@ export function initAnnotationSelection(options) {
       'cancelAnnotationSelection',
       'confirmAnnotationSelection',
       'getViewTransparency',
+      'onPresentedLayoutChange',
       'restoreUnifiedState',
       'setSelectionStepCallback'
     ]
@@ -114,6 +123,14 @@ export function initAnnotationSelection(options) {
   const pendingDeliveries = new Set();
   let destroyed = false;
   let destructionPromise = null;
+  // Kind of the field the last gesture was read with: the field of the pane
+  // it landed in, which need not be the focused view's. The step help text
+  // ("Alt to replace" for categories, "Alt to intersect" for ranges) follows
+  // it, so it describes the panel the user is selecting in.
+  let gestureFieldKind = null;
+  // Views on screen, from the last presented layout; null until the canvas
+  // has an area, when only the focused view is known.
+  let presentedViewIds = null;
 
   function listen(target, eventName, listener) {
     target.addEventListener(eventName, (...args) => {
@@ -128,23 +145,6 @@ export function initAnnotationSelection(options) {
       () => pendingDeliveries.delete(delivery),
       () => pendingDeliveries.delete(delivery)
     );
-  }
-
-  function computeAnnotationCellIndices(selectionEvent, viewTransparency) {
-    const activeField = state.getActiveField();
-    if (activeField === null) {
-      throw new Error(
-        'Annotation selection requires an active categorical or continuous field.'
-      );
-    }
-    return computeAnnotationGestureCells({
-      state,
-      activeField,
-      cellIndex: selectionEvent.cellIndex,
-      gestureType: selectionEvent.type,
-      dragDeltaY: selectionEvent.dragDeltaY,
-      viewTransparency
-    }).cellIndices;
   }
 
   /**
@@ -162,6 +162,7 @@ export function initAnnotationSelection(options) {
     selectionState.annotationStepCount = 0;
     selectionState.annotationHistory = [];
     selectionState.annotationRedoStack = [];
+    gestureFieldKind = null;
     viewer.restoreUnifiedState([], 0);
   }
 
@@ -185,20 +186,29 @@ export function initAnnotationSelection(options) {
 
     hideRangeLabel();
 
-    const activeField = state.getActiveField();
-    if (activeField === null) {
-      throw new Error(
-        'Annotation selection requires an active categorical or continuous field.'
-      );
+    // The gesture is read on the pane it landed in — its field and its
+    // filters — and never moves view focus, so the focused view's field is
+    // not the one to read when the two differ.
+    const field = annotationFieldForPane(state, stepEvent.viewId);
+    if (field === null) {
+      renderAnnotationState(SELECTION_NOTICE.noPanelField);
+      return;
     }
+    gestureFieldKind = field.kind;
 
-    const viewTransparency = viewer.getViewTransparency(stepEvent.viewId);
     const mode = stepEvent.mode;
-    const newCellIndices = computeAnnotationCellIndices(stepEvent, viewTransparency);
+    const newCellIndices = computeAnnotationGestureCells({
+      state,
+      field,
+      cellIndex: stepEvent.cellIndex,
+      gestureType: stepEvent.type,
+      dragDeltaY: stepEvent.dragDeltaY,
+      viewTransparency: viewer.getViewTransparency(stepEvent.viewId)
+    }).cellIndices;
 
     if (newCellIndices.length === 0 && mode !== 'subtract') {
-      // The gesture landed on a cell the active field has no value for. Saying
-      // nothing here is what reads as "the tool does not select".
+      // The gesture landed on a cell the pane's field has no value for.
+      // Saying nothing here is what reads as "the tool does not select".
       renderAnnotationState(SELECTION_NOTICE.noFieldValue);
       return;
     }
@@ -207,7 +217,8 @@ export function initAnnotationSelection(options) {
       candidates: selectionState.annotationCandidateSet,
       cellIndices: newCellIndices,
       mode,
-      fieldKind: activeField.kind
+      fieldKind: field.kind,
+      cellCount: state.pointCount
     });
 
     if (
@@ -220,20 +231,17 @@ export function initAnnotationSelection(options) {
       return;
     }
 
-    selectionState.annotationHistory.push({
-      candidates: selectionState.annotationCandidateSet ? new Set(selectionState.annotationCandidateSet) : null,
+    pushHistoryStep(selectionState, 'annotationHistory', {
+      candidates: selectionState.annotationCandidateSet ? selectionState.annotationCandidateSet.clone() : null,
       step: selectionState.annotationStepCount
     });
-    if (selectionState.annotationHistory.length > MAX_HISTORY_STEPS) {
-      selectionState.annotationHistory.shift();
-    }
     selectionState.annotationRedoStack = [];
 
     selectionState.annotationCandidateSet = combined.candidates;
     selectionState.annotationStepCount += 1;
 
     viewer.restoreUnifiedState(
-      [...selectionState.annotationCandidateSet],
+      selectionState.annotationCandidateSet.toArray(),
       selectionState.annotationStepCount
     );
 
@@ -244,7 +252,7 @@ export function initAnnotationSelection(options) {
     });
 
     if (selectionState.annotationCandidateSet.size > 0) {
-      state.setPreviewHighlightFromIndices([...selectionState.annotationCandidateSet]);
+      state.setPreviewHighlightFromIndices(selectionState.annotationCandidateSet.toArray());
     } else {
       state.clearPreviewHighlight();
     }
@@ -259,12 +267,12 @@ export function initAnnotationSelection(options) {
       return;
     }
 
-    const cellIndices = [...selectionState.annotationCandidateSet];
+    const cellIndices = selectionState.annotationCandidateSet.toArray();
     const stepsLabel = selectionState.annotationStepCount > 1 ? ` (${selectionState.annotationStepCount} steps)` : '';
 
     const savedGroup = state.addHighlightDirect({
       type: 'annotation',
-      label: `Annotation${stepsLabel} (${cellIndices.length.toLocaleString()} cells)`,
+      label: `Annotation${stepsLabel} (${formatCount(cellIndices.length)} cells)`,
       cellIndices
     });
     requireSavedHighlightGroup(
@@ -301,14 +309,14 @@ export function initAnnotationSelection(options) {
       selectionState.annotationHistory[selectionState.annotationHistory.length - 1];
     const restoredCandidates = prevState.candidates === null
       ? []
-      : [...prevState.candidates];
+      : prevState.candidates.toArray();
     viewer.restoreUnifiedState(
       restoredCandidates,
       restoredCandidates.length === 0 ? 0 : prevState.step
     );
 
     selectionState.annotationRedoStack.push({
-      candidates: selectionState.annotationCandidateSet ? new Set(selectionState.annotationCandidateSet) : null,
+      candidates: selectionState.annotationCandidateSet ? selectionState.annotationCandidateSet.clone() : null,
       step: selectionState.annotationStepCount
     });
 
@@ -322,7 +330,7 @@ export function initAnnotationSelection(options) {
         candidateCount: selectionState.annotationCandidateSet.size,
         restored: true
       });
-      state.setPreviewHighlightFromIndices([...selectionState.annotationCandidateSet]);
+      state.setPreviewHighlightFromIndices(selectionState.annotationCandidateSet.toArray());
     } else {
       updateAnnotationUI({
         step: 0,
@@ -341,14 +349,14 @@ export function initAnnotationSelection(options) {
       selectionState.annotationRedoStack[selectionState.annotationRedoStack.length - 1];
     const restoredCandidates = redoState.candidates === null
       ? []
-      : [...redoState.candidates];
+      : redoState.candidates.toArray();
     viewer.restoreUnifiedState(
       restoredCandidates,
       restoredCandidates.length === 0 ? 0 : redoState.step
     );
 
     selectionState.annotationHistory.push({
-      candidates: selectionState.annotationCandidateSet ? new Set(selectionState.annotationCandidateSet) : null,
+      candidates: selectionState.annotationCandidateSet ? selectionState.annotationCandidateSet.clone() : null,
       step: selectionState.annotationStepCount
     });
 
@@ -362,7 +370,7 @@ export function initAnnotationSelection(options) {
         candidateCount: selectionState.annotationCandidateSet.size,
         restored: true
       });
-      state.setPreviewHighlightFromIndices([...selectionState.annotationCandidateSet]);
+      state.setPreviewHighlightFromIndices(selectionState.annotationCandidateSet.toArray());
     } else {
       updateAnnotationUI({
         step: 0,
@@ -373,8 +381,12 @@ export function initAnnotationSelection(options) {
     }
   }
 
-  function getAnnotationControls() {
-    return getStepControls({
+  /**
+   * Publish the step controls for a selection of `candidateCount` cells, on
+   * the panel and the selection bar alike.
+   */
+  function showAnnotationControls(candidateCount, notice) {
+    showStepControls({
       documentOwner,
       tool: 'annotation',
       parent: highlightModeDescriptionEl.parentElement,
@@ -386,6 +398,12 @@ export function initAnnotationSelection(options) {
         cancel: () => {
           viewer.cancelAnnotationSelection();
         }
+      },
+      readout: {
+        candidateCount,
+        canUndo: selectionState.annotationHistory.length > 0,
+        canRedo: selectionState.annotationRedoStack.length > 0,
+        notice
       }
     });
   }
@@ -418,28 +436,54 @@ export function initAnnotationSelection(options) {
       candidateCount: candidates.size,
       restored: true
     }, notice);
-    state.setPreviewHighlightFromIndices([...candidates]);
+    state.setPreviewHighlightFromIndices(candidates.toArray());
+  }
+
+  /**
+   * Can an annotation press on screen select anything at all?
+   *
+   * A press reads the field of the pane it lands in, so the answer is "no"
+   * only when no presented pane is colored by a field; in a grid the focused
+   * view having none is not enough.
+   */
+  function anyPresentedPaneHasField() {
+    if (presentedViewIds === null) return state.getActiveField() !== null;
+    return presentedViewIds.some(
+      viewId => annotationFieldForPane(state, viewId) !== null
+    );
   }
 
   function updateAnnotationUI(stepEvent, notice = '') {
     if (destroyed) return;
     const activeField = state.getActiveField();
-    const isCategorical =
-      activeField !== null && activeField.kind === 'category';
+    // The help line describes the panel the last gesture was read in; before
+    // any gesture that is the focused view, where a selection starts.
+    const helpFieldKind = gestureFieldKind
+      ?? (activeField === null ? null : activeField.kind);
+    const isCategorical = helpFieldKind === 'category';
     const noticeHtml = selectionNoticeHtml(notice);
 
     if (!stepEvent || (stepEvent.step === 0 && !stepEvent.keepControls)) {
-      // Without an active field the viewer never starts an annotation gesture
-      // at all, so the idle copy has to say that instead of inviting a click
-      // that cannot do anything.
-      const idleCopy = activeField === null
-        ? ANNOTATION_NEEDS_FIELD_COPY
-        : HIGHLIGHT_MODE_COPY.annotation;
+      // With no field on any pane on screen, no press can select anything,
+      // so the idle copy has to say that instead of inviting a click that
+      // cannot do anything. A press in one field-less pane of a grid is
+      // answered on its own (`noPanelField`).
+      const canSelect = anyPresentedPaneHasField();
+      const idleCopy = canSelect
+        ? HIGHLIGHT_MODE_COPY.annotation
+        : ANNOTATION_NEEDS_FIELD_COPY;
       highlightModeDescriptionEl.innerHTML = `${idleCopy}${noticeHtml}`;
+      publishSelectBarHint(
+        documentOwner,
+        canSelect
+          ? SELECT_BAR_HINT.annotation
+          : SELECT_BAR_ANNOTATION_NEEDS_FIELD_HINT
+      );
       removeStepControls(
         documentOwner,
         'annotation',
-        highlightModeDescriptionEl.parentElement
+        highlightModeDescriptionEl.parentElement,
+        notice
       );
       return;
     }
@@ -450,14 +494,7 @@ export function initAnnotationSelection(options) {
         : 'Alt to intersect, Shift+Alt to add, Ctrl+Alt to subtract';
       const stepInfo = `<strong>No selection</strong><br><small>${helpText}</small>`;
 
-      const {
-        undoButton,
-        redoButton,
-        confirmButton
-      } = getAnnotationControls();
-      undoButton.disabled = selectionState.annotationHistory.length === 0;
-      redoButton.disabled = selectionState.annotationRedoStack.length === 0;
-      confirmButton.disabled = true;
+      showAnnotationControls(0, notice);
 
       highlightModeDescriptionEl.innerHTML = `${stepInfo}${noticeHtml}`;
       return;
@@ -482,16 +519,9 @@ export function initAnnotationSelection(options) {
       ? 'Alt to replace, Shift+Alt to add, Ctrl+Alt to subtract'
       : 'Alt to intersect, Shift+Alt to add, Ctrl+Alt to subtract';
 
-    const stepInfo = `<strong>Step ${stepEvent.step}:</strong> ${stepEvent.candidateCount.toLocaleString()} cells${modeLabel}<br><small>${helpText}</small>`;
+    const stepInfo = `<strong>Step ${stepEvent.step}:</strong> ${formatCount(stepEvent.candidateCount)} cells${modeLabel}<br><small>${helpText}</small>`;
 
-    const {
-      undoButton,
-      redoButton,
-      confirmButton
-    } = getAnnotationControls();
-    undoButton.disabled = selectionState.annotationHistory.length === 0;
-    redoButton.disabled = selectionState.annotationRedoStack.length === 0;
-    confirmButton.disabled = stepEvent.candidateCount === 0;
+    showAnnotationControls(stepEvent.candidateCount, notice);
 
     highlightModeDescriptionEl.innerHTML = `${stepInfo}${noticeHtml}`;
   }
@@ -501,8 +531,9 @@ export function initAnnotationSelection(options) {
     requireUnifiedSelectionState(unifiedState, state.pointCount);
     selectionState.annotationHistory = [];
     selectionState.annotationRedoStack = [];
+    gestureFieldKind = null;
     selectionState.annotationCandidateSet = unifiedState.inProgress
-      ? new Set(unifiedState.candidates)
+      ? CellSet.from(unifiedState.candidates, state.pointCount)
       : null;
     selectionState.annotationStepCount = unifiedState.stepCount;
     if (!unifiedState.inProgress) {
@@ -524,21 +555,34 @@ export function initAnnotationSelection(options) {
 
   viewer.setSelectionStepCallback(handleAnnotationStep);
 
-  // Whether an annotation gesture can do anything is decided by the active
-  // field, and the app publishes every change to it — and to the filters that
-  // decide which cells a gesture may reach — as `visibility:changed`. Without
-  // this the idle copy would keep whichever precondition was true when the mode
-  // was last entered. Only the idle copy is refreshed: an in-progress selection
-  // owns the panel, and the other three tools own it in their own modes.
-  const unsubscribeVisibility = state.on('visibility:changed', () => {
+  // Whether an annotation gesture can do anything is decided by the fields of
+  // the panes on screen. The app publishes every field change — and every
+  // change to the filters that decide which cells a gesture may reach — as
+  // `visibility:changed`, and the viewer publishes every change to which
+  // panes are on screen (a kept or removed view, single or grid layout) as a
+  // new presented layout. Without both the idle copy would keep whichever
+  // precondition was true when the mode was last entered. Only the idle copy
+  // is refreshed: an in-progress selection owns the panel, and the other
+  // three tools own it in their own modes.
+  function refreshIdleCopy() {
     if (destroyed) return;
     if (selectionState.activeMode !== 'annotation') return;
     if (selectionState.annotationCandidateSet !== null) return;
     updateAnnotationUI(null);
-  });
+  }
+  const unsubscribeVisibility = state.on('visibility:changed', refreshIdleCopy);
   if (typeof unsubscribeVisibility !== 'function') {
     throw new TypeError(
       'Annotation selection requires a visibility unsubscribe function.'
+    );
+  }
+  const unsubscribeLayout = viewer.onPresentedLayoutChange(layout => {
+    presentedViewIds = layout.panes.map(pane => pane.viewId);
+    refreshIdleCopy();
+  });
+  if (typeof unsubscribeLayout !== 'function') {
+    throw new TypeError(
+      'Annotation selection requires a presented-layout unsubscribe function.'
     );
   }
 
@@ -556,6 +600,11 @@ export function initAnnotationSelection(options) {
       }
       try {
         unsubscribeVisibility();
+      } catch (error) {
+        failures.push(error);
+      }
+      try {
+        unsubscribeLayout();
       } catch (error) {
         failures.push(error);
       }

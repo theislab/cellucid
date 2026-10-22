@@ -36,6 +36,20 @@ function cameraState() {
 function renderState() {
   return {
     antialias: true,
+    backdrop: {
+      centerY: 0,
+      extentX: 1,
+      extentY: 1,
+      extentZ: 1,
+      flat: false,
+      floorY: -1.12,
+      glowCenterX: 0,
+      look: null,
+      pixelRatio: 1,
+      planarity: 0,
+      stageX: 0,
+      stageZ: 0,
+    },
     bgColor: Float32Array.from([1, 1, 1]),
     cameraDistance: 3,
     cameraPosition: [0, 0, 3],
@@ -95,7 +109,7 @@ function makeView({
       colors: Uint8Array.from([255, 0, 0, 255]),
       pointCount: 1,
       positions: Float32Array.from([0, 0, 0]),
-      transparency: Float32Array.from([transparency]),
+      transparency: Uint8Array.from([transparency]),
     },
     id,
     label,
@@ -109,6 +123,7 @@ function makeView({
       geometryGeneration: 11,
       legendModel,
       lodMembership: null,
+      drawOrder: null,
       lodSizeMultiplier: 1,
       normTransform: {
         center: [0, 0, 0],
@@ -440,7 +455,7 @@ test('full-vector SVG depth sorting ignores earlier off-crop points without corr
     255, 0, 0, 255,
     0, 255, 0, 255,
   ]);
-  view.data.transparency = Float32Array.from([1, 1]);
+  view.data.transparency = Uint8Array.from([1, 1]);
   view.data.pointCount = 2;
 
   const exact = payload({

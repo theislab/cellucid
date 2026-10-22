@@ -24,6 +24,7 @@ import { getCategoryColor } from '../../../../data/palettes.js';
 import {
   createDatasetFieldLoadSupersededError
 } from './loading.js';
+import { isCategoricalCodes } from '../../../../data/categorical-storage-contract.js';
 
 function requireSource(source) {
   if (source !== FieldSource.OBS && source !== FieldSource.VAR) {
@@ -138,7 +139,7 @@ function requireCategoryPayload(categories, codes, pointCount, label) {
     seen.add(category);
   }
   if (
-    (!(codes instanceof Uint8Array) && !(codes instanceof Uint16Array))
+    !isCategoricalCodes(codes)
     || codes.length !== pointCount
   ) {
     throw new TypeError(
@@ -166,7 +167,7 @@ function requireOriginalKey(field) {
 
 function requireUserDefinedOwner(owner) {
   for (const methodName of [
-    'computeCentroidsByDim',
+    'computeCentroidsByLayout',
     'createContinuousAlias',
     'createFromCategoricalCodes',
     'getField',
@@ -367,10 +368,12 @@ export class FieldOverlayPublicMethods {
       }
     }
 
+    this._propagateRenameToViewContexts(src, field);
     this._refreshHighlightGroupsForField(src, fieldIndex);
     getFieldRegistry().invalidate();
     this.updateFilterSummary();
     this._syncActiveContext();
+    this._refreshInactiveViewLabels();
     this._notifyFieldChange(src, fieldIndex, ChangeType.RENAME, { originalKey, previousKey, newKey: field.key });
     return true;
   }
@@ -457,16 +460,24 @@ export class FieldOverlayPublicMethods {
 
     // Keep centroid labels consistent with the category list.
     this._syncCentroidCategoryLabels(field, previousCategories);
+    this._propagateRenameToViewContexts(src, field, {
+      previousLabel: previousCategories[categoryIndex],
+      newLabel: field.categories[categoryIndex]
+    });
     this._refreshHighlightGroupsForField(src, fieldIndex);
 
     // If this field is currently active, push centroid label updates.
     if (src === FieldSource.OBS && this.activeFieldSource === FieldSource.OBS && this.activeFieldIndex === fieldIndex) {
-      this.buildCentroidsForField(field, { viewId: this.activeViewId });
+      this.buildCentroidsForField(field, {
+        viewId: this.activeViewId,
+        layoutKey: this.getViewLayoutKey(this.activeViewId)
+      });
       this._pushCentroidsToViewer();
     }
 
     this.updateFilterSummary();
     this._syncActiveContext();
+    this._refreshInactiveViewLabels();
     this._notifyFieldChange(src, fieldIndex, ChangeType.CATEGORY_RENAME, { categoryIndex, newLabel: field.categories[categoryIndex] });
     return true;
   }
@@ -801,7 +812,8 @@ export class FieldOverlayPublicMethods {
       field.codes = null;
       field.values = null;
       field.categories = [];
-      field.centroidsByDim = {};
+      field.centroidsByLayout = new Map();
+      field._normalizedLayouts = new Set();
       field.loaded = false;
     }
 
@@ -895,7 +907,7 @@ export class FieldOverlayPublicMethods {
       const categories = [...field.categories];
       const codes = field.codes;
       if (
-        (!(codes instanceof Uint8Array) && !(codes instanceof Uint16Array))
+        !isCategoricalCodes(codes)
         || codes.length !== this.pointCount
       ) {
         throw new TypeError(
@@ -1283,11 +1295,8 @@ export class FieldOverlayPublicMethods {
         );
       }
 
-      const centroidsByDim = registry.computeCentroidsByDim(
-        codes,
-        categories,
-        this
-      );
+      const { centroidsByLayout, normalizedLayouts } =
+        registry.computeCentroidsByLayout(codes, categories, this);
       this.ensureCategoryMetadata(existing);
       const oldIndexByCategory = new Map();
       for (
@@ -1349,14 +1358,12 @@ export class FieldOverlayPublicMethods {
       if (operation !== null) {
         requireRecord(operation, 'User-defined categorical operation metadata');
       }
-      const normalizedDims = new Set();
-
       const updated = requireBoolean(
         registry.updateField(fieldId, {
           categories: [...categories],
           codes,
-          centroidsByDim,
-          normalizedDims,
+          centroidsByLayout,
+          normalizedLayouts,
           sourceField,
           operation
         }),
@@ -1370,8 +1377,8 @@ export class FieldOverlayPublicMethods {
 
       existing.categories = [...categories];
       existing.codes = codes;
-      existing.centroidsByDim = centroidsByDim;
-      existing._normalizedDims = normalizedDims;
+      existing.centroidsByLayout = centroidsByLayout;
+      existing._normalizedLayouts = normalizedLayouts;
       existing.loaded = true;
       existing._sourceField = sourceField;
       existing._operation = operation;

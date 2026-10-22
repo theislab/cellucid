@@ -3,13 +3,14 @@ import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import { getNotificationCenter } from '../assets/js/app/notification-center.js';
-import { initDimensionControls } from '../assets/js/app/ui/modules/dimension-controls.js';
+import { initRepresentationControls } from '../assets/js/app/ui/modules/representation-controls.js';
 import { initDatasetConnections } from '../assets/js/app/ui/modules/dataset-connections.js';
+import { createTestDatasetIntents } from './helpers/dataset-intents.mjs';
 import {
   DATA_CONFIG,
 } from '../assets/js/data/data-source.js';
 import {
-  createDataSourceManager,
+  DataSourceManager,
 } from '../assets/js/data/data-source-manager.js';
 import { LocalDemoDataSource } from '../assets/js/data/local-demo-source.js';
 
@@ -27,7 +28,7 @@ function manifest(overrides = {}) {
 
 function identity(id, name, cells) {
   return {
-    version: 2,
+    version: 3,
     id,
     name,
     description: `${name} description`,
@@ -42,11 +43,30 @@ function identity(id, name, cells) {
       n_edges: null,
     },
     embeddings: {
-      available_dimensions: [2],
       default_dimension: 2,
-      files: { '2d': 'points_2d.bin' },
+      defaults: { '2d': 'X_umap' },
+      items: {
+        X_umap: {
+          label: 'X_umap',
+          dimension: 2,
+          file: 'embeddings/0_2d.bin',
+          source: { key: 'X_umap', columns: [0, 1] },
+        },
+      },
     },
     obs_fields: [],
+  };
+}
+
+function embeddingItem(dimension, file, key = null) {
+  return {
+    label: key ?? `item ${dimension}d`,
+    dimension,
+    file,
+    source: {
+      key,
+      columns: Array.from({ length: dimension }, (_, column) => column),
+    },
   };
 }
 
@@ -300,6 +320,7 @@ test('demo catalog opts into one exact per-dataset state manifest', () => {
           name: 'First',
           state_manifest: 'state-snapshots.json',
           state_sha256: 'a'.repeat(64),
+          state_bytes: 3268,
         },
         { id: 'second', path: 'second/', name: 'Second' },
       ],
@@ -310,15 +331,17 @@ test('demo catalog opts into one exact per-dataset state manifest', () => {
     {
       manifestUrl:
         'https://catalog.cellucid.test/exports/first/state-snapshots.json',
+      stateBytes: 3268,
       stateSha256: 'a'.repeat(64),
     },
   );
   assert.equal(source.getStateDescriptor('second'), null);
 
-  const manager = createDataSourceManager();
+  const manager = new DataSourceManager();
   manager.activeSource = source;
   manager.activeDatasetId = 'first';
   manager.activeIdentityId = 'first-generation';
+  manager.activeBaseUrl = source.getBaseUrl('first');
   assert.deepEqual(
     manager.getCurrentStateDescriptor(),
     {
@@ -329,14 +352,16 @@ test('demo catalog opts into one exact per-dataset state manifest', () => {
         'https://catalog.cellucid.test/exports/first/state-snapshots.json',
       selectionRevision: 0,
       sourceType: 'local-demo',
+      stateBytes: 3268,
       stateSha256: 'a'.repeat(64),
     },
   );
   manager.activeDatasetId = 'second';
   manager.activeIdentityId = 'second-generation';
+  manager.activeBaseUrl = source.getBaseUrl('second');
   assert.equal(manager.getCurrentStateDescriptor(), null);
 
-  for (const [stateManifest, stateSha256] of [
+  for (const [stateManifest, stateSha256, stateBytes = 3268] of [
     ['states.json', 'a'.repeat(64)],
     ['../state-snapshots.json', 'a'.repeat(64)],
     ['/state-snapshots.json', 'a'.repeat(64)],
@@ -345,6 +370,9 @@ test('demo catalog opts into one exact per-dataset state manifest', () => {
     ['state-snapshots.json', 'short'],
     ['state-snapshots.json', undefined],
     [undefined, 'a'.repeat(64)],
+    ['state-snapshots.json', 'a'.repeat(64), null],
+    ['state-snapshots.json', 'a'.repeat(64), 0],
+    ['state-snapshots.json', 'a'.repeat(64), 1.5],
   ]) {
     const entry = {
       id: 'first',
@@ -356,6 +384,9 @@ test('demo catalog opts into one exact per-dataset state manifest', () => {
     if (stateSha256 !== undefined) {
       entry.state_sha256 = stateSha256;
     }
+    if (stateBytes !== null) {
+      entry.state_bytes = stateBytes;
+    }
     const invalid = sourceWithManifest(
       manifest({
         datasets: [entry],
@@ -364,7 +395,7 @@ test('demo catalog opts into one exact per-dataset state manifest', () => {
     );
     assert.throws(
       () => invalid.getStateDescriptor('first'),
-      /state_manifest|state_sha256|state-snapshots\.json|sha-256/i
+      /state_manifest|state_sha256|state_bytes|state-snapshots\.json|sha-256/i
     );
   }
 });
@@ -380,7 +411,7 @@ test('demo catalog rejects incomplete identities and count contradictions', asyn
     installIdentityFetch(t, new Map([
       [
         'https://catalog.cellucid.test/exports/broken/dataset_identity.json',
-        { version: 2 },
+        { version: 3 },
       ],
     ]));
 
@@ -418,7 +449,7 @@ test('demo catalog rejects incomplete identities and count contradictions', asyn
   });
 });
 
-test('dataset identity v2 rejects every incomplete scientific summary', async t => {
+test('dataset identity v3 rejects every incomplete scientific summary', async t => {
   await t.test('undeclared top-level fields are rejected', async t => {
     const value = identity('invalid', 'Identity', 3);
     value.legacy_stats = {};
@@ -510,7 +541,7 @@ test('dataset identity v2 rejects every incomplete scientific summary', async t 
   });
 });
 
-test('dataset identity v2 requires exact embedding metadata', async t => {
+test('dataset identity v3 requires exact embedding metadata', async t => {
   await t.test('alias-resolution metadata is not part of the current identity', async t => {
     const value = identity('invalid', 'Identity', 3);
     value.embeddings.umap_resolution = {
@@ -524,77 +555,257 @@ test('dataset identity v2 requires exact embedding metadata', async t => {
     );
   });
 
-  await t.test('available dimensions must be an array', async t => {
+  await t.test('version-2 embedding keys are not part of the current identity', async t => {
     const value = identity('invalid', 'Identity', 3);
-    value.embeddings.available_dimensions = 2;
+    value.embeddings.available_dimensions = [2];
     await expectIdentityRejection(
       t,
       value,
-      /dataset_identity.*available_dimensions.*array/i
+      /dataset_identity.*embeddings.*unsupported field.*available_dimensions/i
     );
   });
 
-  await t.test('available dimensions cannot contain duplicates', async t => {
-    const value = identity('invalid', 'Identity', 3);
-    value.embeddings.available_dimensions = [2, 2];
+  await t.test('embedding items must be a non-empty object', async t => {
+    for (const items of [[], {}, null]) {
+      const value = identity('invalid', 'Identity', 3);
+      value.embeddings.items = items;
+      await expectIdentityRejection(
+        t,
+        value,
+        /dataset_identity.*embeddings\.items.*non-empty object/i
+      );
+    }
+  });
+
+  await t.test('embedding items must be ordered by dimension, then id', async t => {
+    const byDimension = identity('invalid', 'Identity', 3);
+    byDimension.embeddings = {
+      default_dimension: 3,
+      defaults: { '2d': 'X_umap', '3d': 'X_tsne' },
+      items: {
+        X_tsne: embeddingItem(3, 'embeddings/0_3d.bin'),
+        X_umap: embeddingItem(2, 'embeddings/1_2d.bin', 'X_umap'),
+      },
+    };
     await expectIdentityRejection(
       t,
-      value,
-      /dataset_identity.*available_dimensions.*unique/i
+      byDimension,
+      /dataset_identity.*embeddings\.items.*ordered by dimension.*code-point/i
+    );
+
+    const byId = identity('invalid', 'Identity', 3);
+    byId.embeddings = {
+      default_dimension: 2,
+      defaults: { '2d': 'X_umap' },
+      items: {
+        X_umap: embeddingItem(2, 'embeddings/0_2d.bin', 'X_umap'),
+        X_pca: embeddingItem(2, 'embeddings/1_2d.bin', 'X_pca'),
+      },
+    };
+    await expectIdentityRejection(
+      t,
+      byId,
+      /dataset_identity.*embeddings\.items.*ordered by dimension.*code-point/i
     );
   });
 
-  await t.test('default dimension must be advertised', async t => {
+  await t.test('embedding items hold exactly label, dimension, file, and source', async t => {
+    const extra = identity('invalid', 'Identity', 3);
+    extra.embeddings.items.X_umap.basis = 'umap';
+    await expectIdentityRejection(
+      t,
+      extra,
+      /dataset_identity.*embeddings\.items\.X_umap.*unsupported field.*basis/i
+    );
+
+    const missing = identity('invalid', 'Identity', 3);
+    delete missing.embeddings.items.X_umap.source;
+    await expectIdentityRejection(
+      t,
+      missing,
+      /dataset_identity.*embeddings\.items\.X_umap.*missing required field.*source/i
+    );
+  });
+
+  await t.test('embedding ids and labels must be exact display text', async t => {
+    const paddedId = identity('invalid', 'Identity', 3);
+    paddedId.embeddings.items = {
+      ' X_umap': paddedId.embeddings.items.X_umap,
+    };
+    paddedId.embeddings.defaults['2d'] = ' X_umap';
+    await expectIdentityRejection(
+      t,
+      paddedId,
+      /dataset_identity.*Embedding id.*cannot be displayed exactly/i
+    );
+
+    const emptyLabel = identity('invalid', 'Identity', 3);
+    emptyLabel.embeddings.items.X_umap.label = '';
+    await expectIdentityRejection(
+      t,
+      emptyLabel,
+      /dataset_identity.*embeddings\.items\.X_umap\.label.*cannot be displayed exactly/i
+    );
+  });
+
+  await t.test('embedding dimensions must be 1, 2, or 3', async t => {
+    for (const dimension of [0, 4, 2.5, '2']) {
+      const value = identity('invalid', 'Identity', 3);
+      value.embeddings.items.X_umap.dimension = dimension;
+      await expectIdentityRejection(
+        t,
+        value,
+        /dataset_identity.*embeddings\.items\.X_umap\.dimension.*1, 2, or 3/i
+      );
+    }
+  });
+
+  await t.test('default dimension must be named in defaults', async t => {
     const value = identity('invalid', 'Identity', 3);
     value.embeddings.default_dimension = 3;
     await expectIdentityRejection(
       t,
       value,
-      /dataset_identity.*default_dimension.*available/i
+      /dataset_identity.*default_dimension.*embeddings\.defaults/i
     );
   });
 
-  await t.test('files must use exact dimensional keys', async t => {
-    const value = identity('invalid', 'Identity', 3);
-    value.embeddings.files = { 2: 'points_2d.bin' };
-    await expectIdentityRejection(
-      t,
-      value,
-      /dataset_identity.*embeddings\.files.*exactly/i
-    );
-  });
-
-  await t.test('advertised files must be safe relative paths', async t => {
-    for (const path of [
-      '../points_2d.bin',
-      '%2e%2e/points_2d.bin',
-      'nested/%2E%2E/points_2d.bin',
-      'nested/%2fpoints_2d.bin',
-      '%252e%252e/points_2d.bin',
-      'nested/%252fpoints_2d.bin',
-      'nested/%255cpoints_2d.bin',
-      'nested/%2541.bin',
-      'points_2d.bin?download=1',
-      'points_2d.bin#fragment',
-      'points 2d.bin',
+  await t.test('defaults must use exact dimensional keys, one per item dimension', async t => {
+    for (const defaults of [
+      { 2: 'X_umap' },
+      {},
+      { '2d': 'X_umap', '3d': 'X_umap' },
     ]) {
       const value = identity('invalid', 'Identity', 3);
-      value.embeddings.files['2d'] = path;
+      value.embeddings.defaults = defaults;
       await expectIdentityRejection(
         t,
         value,
-        /dataset_identity.*embeddings\.files\.2d.*safe relative/i
+        /dataset_identity.*embeddings\.defaults.*exactly one item per embedding dimension/i
+      );
+    }
+  });
+
+  await t.test('defaults must name an item of their own dimension', async t => {
+    const unknown = identity('invalid', 'Identity', 3);
+    unknown.embeddings.defaults['2d'] = 'X_missing';
+    await expectIdentityRejection(
+      t,
+      unknown,
+      /dataset_identity.*embeddings\.defaults\.2d.*item of that dimension/i
+    );
+
+    const wrongDimension = identity('invalid', 'Identity', 3);
+    wrongDimension.embeddings = {
+      default_dimension: 3,
+      defaults: { '2d': 'X_umap', '3d': 'X_umap' },
+      items: {
+        X_umap: embeddingItem(2, 'embeddings/0_2d.bin', 'X_umap'),
+        X_umap_3d: embeddingItem(3, 'embeddings/1_3d.bin'),
+      },
+    };
+    await expectIdentityRejection(
+      t,
+      wrongDimension,
+      /dataset_identity.*embeddings\.defaults\.3d.*item of that dimension/i
+    );
+  });
+
+  await t.test('embedding files must be the exact producer path', async t => {
+    for (const path of [
+      '../points_2d.bin',
+      'points_2d.bin',
+      '%2e%2e/embeddings/0_2d.bin',
+      'embeddings/%30_2d.bin',
+      'embeddings/1_2d.bin',
+      'embeddings/0_3d.bin',
+      'embeddings/0_2d.bin.gz',
+      'embeddings/0_2d.bin?download=1',
+      'embeddings/0_2d.bin#fragment',
+      './embeddings/0_2d.bin',
+      'embeddings/X_umap.bin',
+      ' embeddings/0_2d.bin',
+    ]) {
+      const value = identity('invalid', 'Identity', 3);
+      value.embeddings.items.X_umap.file = path;
+      await expectIdentityRejection(
+        t,
+        value,
+        /dataset_identity.*embeddings\.items\.X_umap\.file.*exactly "embeddings\/0_2d\.bin"/i
+      );
+    }
+  });
+
+  await t.test('a compressed export carries .gz on every embedding path', async t => {
+    const value = identity('invalid', 'Identity', 3);
+    value.export_settings = {
+      compression: 6,
+      var_quantization: null,
+      obs_continuous_quantization: null,
+      obs_categorical_dtype: 'uint8',
+    };
+    await expectIdentityRejection(
+      t,
+      value,
+      /dataset_identity.*embeddings\.items\.X_umap\.file.*exactly "embeddings\/0_2d\.bin\.gz"/i
+    );
+
+    const uncompressed = identity('invalid', 'Identity', 3);
+    uncompressed.export_settings = {
+      compression: null,
+      var_quantization: null,
+      obs_continuous_quantization: null,
+      obs_categorical_dtype: 'uint8',
+    };
+    uncompressed.embeddings.items.X_umap.file = 'embeddings/0_2d.bin.gz';
+    await expectIdentityRejection(
+      t,
+      uncompressed,
+      /dataset_identity.*embeddings\.items\.X_umap\.file.*exactly "embeddings\/0_2d\.bin"/i
+    );
+  });
+
+  await t.test('embedding source holds an optional key and one distinct column per axis', async t => {
+    for (const source of [
+      { key: 'X_umap' },
+      { key: 'X_umap', columns: [0, 1], basis: 'umap' },
+      { key: '', columns: [0, 1] },
+      { key: 7, columns: [0, 1] },
+      { key: 'X_umap', columns: [0] },
+      { key: 'X_umap', columns: [0, 0] },
+      { key: 'X_umap', columns: [0, -1] },
+      { key: 'X_umap', columns: [0, 1.5] },
+      { key: 'X_umap', columns: null },
+    ]) {
+      const value = identity('invalid', 'Identity', 3);
+      value.embeddings.items.X_umap.source = source;
+      await expectIdentityRejection(
+        t,
+        value,
+        /dataset_identity.*embeddings\.items\.X_umap\.source/i
       );
     }
   });
 
   await t.test(
-    'canonical spaces and single-encoded Unicode remain exact',
+    'multi-item embeddings with spaces and single-encoded Unicode ids remain exact',
     async t => {
       const value = identity('invalid', 'Identity', 3);
-      const path =
-        'cell%20atlas/%E7%BB%86%E8%83%9E.bin';
-      value.embeddings.files['2d'] = path;
+      value.embeddings = {
+        default_dimension: 3,
+        defaults: { '1d': 'pseudotime', '2d': 'cell atlas 细胞', '3d': 'X_umap_3d' },
+        items: {
+          pseudotime: embeddingItem(1, 'embeddings/0_1d.bin'),
+          X_umap: embeddingItem(2, 'embeddings/1_2d.bin', 'X_umap'),
+          'cell atlas 细胞': {
+            label: 'Cell atlas 细胞',
+            dimension: 2,
+            file: 'embeddings/2_2d.bin',
+            source: { key: 'X_atlas', columns: [3, 1] },
+          },
+          X_umap_3d: embeddingItem(3, 'embeddings/3_3d.bin'),
+        },
+      };
       const source = sourceWithManifest(
         manifest({
           default: 'invalid',
@@ -612,15 +823,16 @@ test('dataset identity v2 requires exact embedding metadata', async t => {
       ]));
 
       const datasets = await source.listDatasets();
-      assert.equal(
-        datasets[0].embeddings.files['2d'],
-        path
+      assert.deepEqual(datasets[0].embeddings, value.embeddings);
+      assert.deepEqual(
+        Object.keys(datasets[0].embeddings.items),
+        ['pseudotime', 'X_umap', 'cell atlas 细胞', 'X_umap_3d']
       );
     }
   );
 });
 
-test('dataset identity v2 requires exact observation summaries', async t => {
+test('dataset identity v3 requires exact observation summaries', async t => {
   await t.test('obs_fields length must match stats', async t => {
     const value = identity('invalid', 'Identity', 3);
     value.obs_fields.push({ key: 'score', kind: 'continuous' });
@@ -693,16 +905,14 @@ test('optional identity metadata is preserved only when valid', async t => {
       name: 'Public source',
       url: 'https://example.test/data',
     };
+    value.embeddings.items.X_umap.file = 'embeddings/0_2d.bin.gz';
     value.vector_fields = {
-      default_field: 'velocity_umap',
+      default_field: 'velocity',
       fields: {
-        velocity_umap: {
-          label: 'Velocity (UMAP)',
-          basis: 'umap',
-          available_dimensions: [2],
-          default_dimension: 2,
+        velocity: {
+          label: 'velocity',
           files: {
-            '2d': 'vectors/velocity_umap_2d.bin',
+            X_umap: 'vectors/0_0.bin.gz',
           },
         },
       },
@@ -720,6 +930,141 @@ test('optional identity metadata is preserved only when valid', async t => {
     assert.deepEqual(metadata.source, value.source);
     assert.deepEqual(metadata.vector_fields, value.vector_fields);
     assert.deepEqual(metadata.embeddings, value.embeddings);
+  });
+
+  await t.test('vector fields obey the exact version-3 binding rule', async t => {
+    function withVectors(fields, embeddings = null) {
+      const value = identity('invalid', 'Identity', 3);
+      if (embeddings) value.embeddings = embeddings;
+      value.vector_fields = {
+        default_field: Object.keys(fields)[0],
+        fields,
+      };
+      return value;
+    }
+    const twoItems = {
+      default_dimension: 3,
+      defaults: { '2d': 'X_umap', '3d': 'X_umap_3d' },
+      items: {
+        X_umap: embeddingItem(2, 'embeddings/0_2d.bin', 'X_umap'),
+        X_umap_3d: embeddingItem(3, 'embeddings/1_3d.bin'),
+      },
+    };
+    const cases = [
+      [
+        { velocity: { label: 'Velocity (UMAP)', files: { X_umap: 'vectors/0_0.bin' } } },
+        null,
+        /vector_fields\.fields\.velocity\.label.*field id "velocity" exactly/i,
+      ],
+      [
+        {
+          velocity: {
+            label: 'velocity',
+            basis: 'umap',
+            files: { X_umap: 'vectors/0_0.bin' },
+          },
+        },
+        null,
+        /vector_fields\.fields\.velocity.*unsupported field.*basis/i,
+      ],
+      [
+        {
+          velocity: {
+            label: 'velocity',
+            available_dimensions: [2],
+            default_dimension: 2,
+            files: { X_umap: 'vectors/0_0.bin' },
+          },
+        },
+        null,
+        /vector_fields\.fields\.velocity.*unsupported field.*available_dimensions/i,
+      ],
+      [
+        { velocity: { label: 'velocity', files: {} } },
+        null,
+        /vector_fields\.fields\.velocity\.files.*non-empty object/i,
+      ],
+      [
+        { velocity: { label: 'velocity', files: { X_tsne: 'vectors/0_0.bin' } } },
+        null,
+        /vector_fields\.fields\.velocity\.files binds embedding "X_tsne"/i,
+      ],
+      [
+        { velocity: { label: 'velocity', files: { '2d': 'vectors/0_0.bin' } } },
+        null,
+        /vector_fields\.fields\.velocity\.files binds embedding "2d"/i,
+      ],
+      [
+        { velocity: { label: 'velocity', files: { X_umap: 'vectors/velocity_umap_2d.bin' } } },
+        null,
+        /vector_fields\.fields\.velocity\.files\.X_umap.*exactly "vectors\/0_0\.bin"/i,
+      ],
+      [
+        { velocity: { label: 'velocity', files: { X_umap: 'vectors/0_0.bin.gz' } } },
+        null,
+        /vector_fields\.fields\.velocity\.files\.X_umap.*exactly "vectors\/0_0\.bin"/i,
+      ],
+      [
+        {
+          velocity: {
+            label: 'velocity',
+            files: {
+              X_umap_3d: 'vectors/0_1.bin',
+              X_umap: 'vectors/0_0.bin',
+            },
+          },
+        },
+        twoItems,
+        /vector_fields\.fields\.velocity\.files.*embeddings\.items order/i,
+      ],
+      [
+        {
+          velocity: { label: 'velocity', files: { X_umap: 'vectors/0_0.bin' } },
+          acceleration: { label: 'acceleration', files: { X_umap: 'vectors/1_0.bin' } },
+        },
+        null,
+        /vector_fields\.fields.*ordered by id in code-point order/i,
+      ],
+      [
+        {
+          acceleration: { label: 'acceleration', files: { X_umap: 'vectors/0_0.bin' } },
+          velocity: { label: 'velocity', files: { X_umap_3d: 'vectors/0_1.bin' } },
+        },
+        twoItems,
+        /vector_fields\.fields\.velocity\.files\.X_umap_3d.*exactly "vectors\/1_1\.bin"/i,
+      ],
+    ];
+    for (const [fields, embeddings, pattern] of cases) {
+      await expectIdentityRejection(
+        t,
+        withVectors(fields, embeddings),
+        new RegExp(`dataset_identity.*${pattern.source}`, 'i')
+      );
+    }
+
+    const source = sourceWithManifest(
+      manifest({
+        default: 'first',
+        datasets: [{ id: 'first', path: 'first/' }],
+      })
+    );
+    const valid = withVectors({
+      acceleration: { label: 'acceleration', files: { X_umap_3d: 'vectors/0_1.bin' } },
+      velocity: {
+        label: 'velocity',
+        files: { X_umap: 'vectors/1_0.bin', X_umap_3d: 'vectors/1_1.bin' },
+      },
+    }, twoItems);
+    valid.id = 'first';
+    installIdentityFetch(t, new Map([
+      [
+        'https://catalog.cellucid.test/exports/first/dataset_identity.json',
+        valid,
+      ],
+    ]));
+    const metadata = await source.getMetadata('first');
+    assert.deepEqual(metadata.vector_fields, valid.vector_fields);
+    assert.deepEqual(metadata.embeddings, valid.embeddings);
   });
 
   await t.test('malformed optional containers are rejected', async t => {
@@ -812,9 +1157,16 @@ test('valid current demo catalog exposes exact metadata and default', async t =>
 
   const firstMetadata = await source.getMetadata('first');
   assert.deepEqual(firstMetadata.embeddings, {
-    available_dimensions: [2],
     default_dimension: 2,
-    files: { '2d': 'points_2d.bin' },
+    defaults: { '2d': 'X_umap' },
+    items: {
+      X_umap: {
+        label: 'X_umap',
+        dimension: 2,
+        file: 'embeddings/0_2d.bin',
+        source: { key: 'X_umap', columns: [0, 1] },
+      },
+    },
   });
   assert.equal(Object.hasOwn(firstMetadata, 'created_at'), false);
   assert.equal(Object.hasOwn(firstMetadata, 'export_settings'), false);
@@ -959,61 +1311,75 @@ test('refresh aborts a stale sample metadata generation before it can refill cac
   assert.equal(current.stats.n_cells, 5);
 });
 
-test('an explicit empty bootstrap never adopts a synthetic zero-point scene', async () => {
+test('startup publishes the empty runtime and loads its selection as one dataset change', async () => {
   const mainSource = await readFile(
     new URL('../assets/js/app/main.js', import.meta.url),
     'utf8'
   );
-  const selectionStart = mainSource.indexOf(
-    'const hasInitialDataset ='
+  const emptyStart = mainSource.indexOf(
+    '// Startup publishes the empty runtime'
   );
-  const sceneEnd = mainSource.indexOf(
+  const emptyEnd = mainSource.indexOf(
     '// Stage one exact manager/source/runtime/URL generation',
-    selectionStart
+    emptyStart
   );
-  assert.ok(selectionStart >= 0 && sceneEnd > selectionStart);
-
-  const selectionBootstrap = mainSource.slice(selectionStart, sceneEnd);
+  assert.ok(emptyStart >= 0 && emptyEnd > emptyStart);
+  const emptyBootstrap = mainSource.slice(emptyStart, emptyEnd);
+  // No startup path of its own: the empty runtime is published whatever
+  // startup selected, and nothing here stages or publishes a dataset.
   assert.match(
-    selectionBootstrap,
-    /await stageDatasetRuntime\(\{[\s\S]*showProgress:\s*true,[\s\S]*\}\)/
-  );
-  assert.match(
-    selectionBootstrap,
-    /catch \(error\) \{[\s\S]*completeDataLoadFailure\([\s\S]*throw exactError;\s*\}/
+    emptyBootstrap,
+    /publishEmptyDatasetRuntime\(\{ clearViews: false \}\);/
   );
   assert.doesNotMatch(
-    selectionBootstrap,
-    /OptionalDefault|clearActiveDataset|rejected or unconfigured optional/
+    emptyBootstrap,
+    /stageDatasetRuntime|commitDatasetRuntimeStage|hasInitialDataset|initialPublication/
   );
   assert.doesNotMatch(
-    selectionBootstrap,
+    emptyBootstrap,
     /Promise\.resolve\(new Float32Array\(0\)\)|state\.initScene\(/
   );
 
-  const uiStart = mainSource.indexOf('ui = initUI({', sceneEnd);
-  const uiEnd = mainSource.indexOf('// Setup connectivity controls', uiStart);
-  assert.ok(uiStart >= 0 && uiEnd > uiStart);
-  const initialUiSource = mainSource.slice(uiStart, uiEnd);
+  // The reload owns the startup load: its progress is shown, its steps are
+  // deadline-bound startup steps, and its failure is logged once, by the
+  // terminal startup failure it becomes.
+  const reloadStart = mainSource.indexOf(
+    'async function reloadActiveDatasetInPlace'
+  );
+  const reloadEnd = mainSource.indexOf(
+    'async function clearActiveDatasetInPlace',
+    reloadStart
+  );
+  const reloadSource = mainSource.slice(reloadStart, reloadEnd);
+  assert.match(reloadSource, /showProgress: isStartupLoad,/);
   assert.match(
-    selectionBootstrap,
-    /let initialPublication = null;[\s\S]*initialPublication = commitDatasetRuntimeStage\(initialStage\)/
-  );
-  assert.doesNotMatch(
-    selectionBootstrap,
-    /initialReloadTransaction/
+    reloadSource,
+    /const stagePhases = isStartupLoad \? startup : RELOAD_STAGE_PHASES;/
   );
   assert.match(
-    initialUiSource,
-    /if \(hasInitialDataset\) \{[\s\S]*initialPublication\.isCurrent\(\)[\s\S]*synchronizePublishedDatasetUi\([\s\S]*initialPublication[\s\S]*await ui\.activateField\(-1\);[\s\S]*restoreAdvertisedDatasetState\(\{[\s\S]*initialPublication\.signal[\s\S]*settleInitialPublishedDatasetStateOutcome\(\{[\s\S]*transaction:\s*initialPublication,[\s\S]*cancel:\s*\(\) => cancelDataLoad\(initialLoadToken\)[\s\S]*complete:\s*\(\) => completeDataLoadSuccess\([\s\S]*currentDatasetLoadToken = null/
+    reloadSource,
+    /if \(!isStartupLoad\) \{\s*console\.error\(\s*'\[Main\] Failed to reload dataset in-place:'/
   );
-  assert.doesNotMatch(
-    initialUiSource,
-    /completeDataLoadSuccess\(currentDatasetLoadToken/
+  assert.doesNotMatch(mainSource, /initialDataLoad/);
+
+  // The startup selection loads only after every control and the render
+  // loop exist, and before startup is published ready.
+  const admission = mainSource.indexOf('admitDeferredControls();');
+  const viewerStart = mainSource.indexOf('viewer.start();', admission);
+  const startupLoad = mainSource.indexOf(
+    'startupOutcome = await ui.loadStartupDataset(startupSelection);',
+    viewerStart
+  );
+  const ready = mainSource.indexOf("startup.enter('ready');", startupLoad);
+  assert.ok(
+    admission > 0 &&
+    viewerStart > admission &&
+    startupLoad > viewerStart &&
+    ready > startupLoad
   );
 });
 
-test('single-dimension adoption publishes the exact selector option', t => {
+test('single-representation adoption publishes the exact picker option', t => {
   const originalDocument = globalThis.document;
   const originalHTMLElement = globalThis.HTMLElement;
   const originalHTMLSelectElement = globalThis.HTMLSelectElement;
@@ -1034,88 +1400,103 @@ test('single-dimension adoption publishes the exact selector option', t => {
   globalThis.HTMLElement = FakeHTMLElement;
   globalThis.HTMLSelectElement = FakeHTMLSelectElement;
 
-  const options = [];
   const ownerDocument = {
     createElement(tagName) {
-      assert.equal(tagName, 'option');
+      assert.ok(tagName === 'option' || tagName === 'optgroup', tagName);
       return {
-        disabled: false,
+        tagName,
+        label: '',
         title: '',
         value: '',
         textContent: '',
+        children: [],
+        appendChild(child) {
+          this.children.push(child);
+        },
       };
     },
   };
   globalThis.document = ownerDocument;
-  const dimensionSelect = Object.assign(new FakeHTMLSelectElement(), {
-    _innerHTML: '',
+  const select = Object.assign(new FakeHTMLSelectElement(), {
+    groups: [],
     value: '',
+    title: '',
+    disabled: false,
     ownerDocument,
     addEventListener() {},
-    appendChild(option) {
-      options.push(option);
+    replaceChildren(...groups) {
+      this.groups = groups;
     },
   });
-  Object.defineProperty(dimensionSelect, 'innerHTML', {
-    configurable: true,
-    get() {
-      return this._innerHTML;
-    },
-    set(value) {
-      this._innerHTML = value;
-      options.length = 0;
-    },
+  const label = Object.assign(new FakeHTMLElement(), { textContent: '' });
+  const controls = Object.assign(new FakeHTMLElement(), {
+    ownerDocument,
+    hidden: false,
   });
 
-  let availableDimensions = [];
-  let activeDimension = 3;
+  let representations = [];
+  let liveLayoutKey = null;
   const state = {
     getActiveViewId() {
       return 'live';
     },
-    getAvailableDimensions() {
-      return [...availableDimensions];
+    getEnabledRepresentations() {
+      return representations;
     },
-    getViewDimensionLevel() {
-      return activeDimension;
+    getViewLayoutKey() {
+      if (liveLayoutKey === null) {
+        throw new RangeError('Layout state is not published for view "live".');
+      }
+      return liveLayoutKey;
     },
     on() {
       return () => {};
     },
-    async setDimensionLevel() {},
+    async setViewRepresentation() {},
+    async cycleRepresentation() {},
   };
-  const dimensionControls = Object.assign(new FakeHTMLElement(), {
-    ownerDocument,
-    style: { display: '' },
-  });
-  const controls = initDimensionControls({
+  const picker = initRepresentationControls({
     state,
-    dom: {
-      controls: dimensionControls,
-      select: dimensionSelect,
-    },
+    dom: { controls, label, select },
     callbacks: {
+      viewLabel: () => null,
       onViewBadgesMaybeChanged() {},
     },
   });
 
-  assert.equal(options.length, 0);
-  assert.equal(dimensionControls.style.display, 'none');
+  // No dataset: no representation, nothing to pick, the block hidden.
+  assert.deepEqual(select.groups, []);
+  assert.equal(controls.hidden, true);
 
-  availableDimensions = [2];
-  activeDimension = 2;
-  controls.updateDimensionSelectUI();
+  representations = [Object.freeze({
+    layoutKey: 'X_umap',
+    dimension: 2,
+    name: 'UMAP',
+    label: 'UMAP',
+    ref: { key: 'X_umap', columns: null },
+    isDefault: true,
+  })];
+  liveLayoutKey = 'X_umap';
+  picker.render();
 
+  assert.equal(controls.hidden, false);
+  assert.equal(label.textContent, 'Shows');
   assert.deepEqual(
-    options.map(option => ({
-      value: option.value,
-      text: option.textContent,
-      disabled: option.disabled,
+    select.groups.map(group => ({
+      label: group.label,
+      options: group.children.map(option => ({
+        value: option.value,
+        text: option.textContent,
+      })),
     })),
-    [{ value: '2', text: '2D', disabled: false }]
+    [{ label: '2D', options: [{ value: 'X_umap', text: 'UMAP · 2D' }] }]
   );
-  assert.equal(dimensionSelect.value, '2');
-  assert.equal(dimensionControls.style.display, 'none');
+  assert.equal(select.value, 'X_umap');
+  // One representation names what the view shows; there is nothing to switch
+  // to, and the picker says where more come from.
+  assert.equal(select.disabled, true);
+  assert.match(select.title, /one embedding.*Data mapping/i);
+  picker.destroy();
 });
 
 test(
@@ -1191,7 +1572,7 @@ test(
       return new Response('', { status: 404 });
     };
 
-    const failingCatalogManager = createDataSourceManager();
+    const failingCatalogManager = new DataSourceManager();
     await failingCatalogManager.initialize();
     assert.equal(invalidIdentityRequests, 0);
     const firstPass = await failingCatalogManager.getAllDatasets();
@@ -1265,7 +1646,7 @@ test(
         async loadFromPreparedDirectory(files) {
           assert.deepEqual(
             Array.from(files, file => file.name),
-            ['dataset_identity.json', 'points_2d.bin']
+            ['dataset_identity.json', '0_2d.bin']
           );
           activeMetadata = preparedMetadata;
           return activeMetadata;
@@ -1280,7 +1661,7 @@ test(
       return candidate;
     }
 
-    const manager = createDataSourceManager();
+    const manager = new DataSourceManager();
     const localSource = createLocalCandidate();
     manager.registerSource('local-user', localSource);
     await manager.initialize();
@@ -1402,8 +1783,10 @@ test(
       status: 'failed',
     });
 
+    const datasetIntents = createTestDatasetIntents(activateDataset);
+
     initDatasetConnections({
-      activateDataset,
+      datasetIntents,
       clearDataset: async () => true,
       dataSourceManager: manager,
       dom: {
@@ -1433,7 +1816,7 @@ test(
       target: {
         files: [
           { name: 'dataset_identity.json' },
-          { name: 'points_2d.bin' },
+          { name: '0_2d.bin' },
         ],
       },
     });
@@ -1505,7 +1888,7 @@ test(
       'http://127.0.0.1:8765'
     );
     initDatasetConnections({
-      activateDataset,
+      datasetIntents,
       clearDataset: async () => true,
       dataSourceManager: manager,
       dom: {

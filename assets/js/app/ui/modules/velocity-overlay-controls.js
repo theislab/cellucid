@@ -7,14 +7,21 @@
  * - We do NOT load vector field data until the user enables it (or keeps it on
  *   while switching embedding dimensions).
  *
- * Vector fields are dimension-specific: only enable the overlay when the dataset
- * provides a field for the currently active embedding dimension.
+ * Vector fields are bound to embeddings: the overlay is enabled only while the
+ * active view shows an embedding the dataset provides a field for.
  *
  * @module ui/modules/velocity-overlay-controls
  */
 
-import { formatCellCount } from '../../../data/data-source.js';
 import { getNotificationCenter } from '../../notification-center.js';
+import { coalesceToFrame } from '../components/controls.js';
+import {
+  formatCompactCount,
+  formatDecimal,
+  formatMultiplier,
+  formatPercent,
+  formatWithUnit
+} from '../components/display-format.js';
 import {
   parseIntegerInput,
   parseRangeInput
@@ -184,6 +191,67 @@ const VELOCITY_NUMERIC_INPUTS = Object.freeze({
   })
 });
 
+const decimals = digits => value => formatDecimal(value, digits);
+
+/**
+ * Every overlay slider: the viewer setting it drives, how a slider position
+ * becomes that setting, and how the readout prints it. One table replaces the
+ * twenty-three hand-written update functions it used to take.
+ *
+ * `commit: 'change'` marks the one slider whose setting restarts the whole
+ * particle system (every particle is re-seeded and the trails are cleared):
+ * it follows the thumb with its readout only, and applies when the user lets
+ * go. Every other setting is applied at most once per frame while dragging.
+ */
+const VELOCITY_SLIDERS = Object.freeze([
+  { name: 'density', config: 'particleCount', display: 'velocityDensityDisplay', commit: 'change',
+    read: raw => raw * 1000, format: formatCompactCount },
+  { name: 'speed', config: 'speedMultiplier', display: 'velocitySpeedDisplay',
+    read: raw => raw / 100, format: value => formatMultiplier(value, value < 0.1 ? 2 : 1) },
+  { name: 'lifetime', config: 'lifetime', display: 'velocityLifetimeDisplay',
+    read: raw => raw / 100, format: value => formatWithUnit(value, 1, 's') },
+  { name: 'size', config: 'particleSize', display: 'velocitySizeDisplay',
+    read: raw => raw, format: value => formatDecimal(value, value < 10 ? 1 : 0) },
+  { name: 'opacity', config: 'opacity', display: 'velocityOpacityDisplay',
+    read: raw => raw / 100, format: value => formatPercent(value * 100) },
+  { name: 'intensity', config: 'intensity', display: 'velocityIntensityDisplay',
+    read: raw => raw, format: decimals(2) },
+  { name: 'glow', config: 'glowAmount', display: 'velocityGlowDisplay',
+    read: raw => raw, format: decimals(2) },
+  { name: 'cometStretch', config: 'cometStretch', display: 'velocityCometStretchDisplay',
+    read: raw => raw, format: decimals(2) },
+  { name: 'coreSharpness', config: 'coreSharpness', display: 'velocityCoreSharpnessDisplay',
+    read: raw => raw, format: decimals(2) },
+  { name: 'trailFade', config: 'trailFade', display: 'velocityTrailFadeDisplay',
+    read: raw => raw, format: decimals(3) },
+  { name: 'chromaticFade', config: 'chromaticFade', display: 'velocityChromaticFadeDisplay',
+    read: raw => raw, format: decimals(2) },
+  { name: 'turbulence', config: 'turbulence', display: 'velocityTurbulenceDisplay',
+    read: raw => raw, format: decimals(2) },
+  { name: 'exposure', config: 'exposure', display: 'velocityExposureDisplay',
+    read: raw => raw, format: decimals(2) },
+  { name: 'bloomStrength', config: 'bloomStrength', display: 'velocityBloomStrengthDisplay',
+    read: raw => raw, format: decimals(2) },
+  { name: 'bloomThreshold', config: 'bloomThreshold', display: 'velocityBloomThresholdDisplay',
+    read: raw => raw, format: decimals(2) },
+  { name: 'anamorphic', config: 'anamorphicRatio', display: 'velocityAnamorphicDisplay',
+    read: raw => raw, format: decimals(1) },
+  { name: 'saturation', config: 'saturation', display: 'velocitySaturationDisplay',
+    read: raw => raw, format: decimals(2) },
+  { name: 'contrast', config: 'contrast', display: 'velocityContrastDisplay',
+    read: raw => raw, format: decimals(2) },
+  { name: 'highlights', config: 'highlights', display: 'velocityHighlightsDisplay',
+    read: raw => raw, format: decimals(2) },
+  { name: 'shadows', config: 'shadows', display: 'velocityShadowsDisplay',
+    read: raw => raw, format: decimals(2) },
+  { name: 'vignette', config: 'vignette', display: 'velocityVignetteDisplay',
+    read: raw => raw, format: decimals(2) },
+  { name: 'filmGrain', config: 'filmGrain', display: 'velocityFilmGrainDisplay',
+    read: raw => raw, format: decimals(3) },
+  { name: 'chromaticAberration', config: 'chromaticAberration', display: 'velocityChromaticAberrationDisplay',
+    read: raw => raw, format: decimals(2) }
+].map(slider => Object.freeze(slider)));
+
 const REQUIRED_DOM_KEYS = Object.freeze([
   'velocityControls',
   'velocitySettings',
@@ -265,7 +333,9 @@ function assertVelocityOverlayContract(options) {
     }
   }
   for (const method of [
-    'getDimensionLevel',
+    'getActiveViewId',
+    'getDimensionManager',
+    'getViewLayoutKey',
     'getAvailableVectorFields',
     'getDefaultVectorFieldId',
     'ensureVectorField',
@@ -275,6 +345,9 @@ function assertVelocityOverlayContract(options) {
     if (!state || typeof state[method] !== 'function') {
       throw new TypeError(`Vector field overlay state requires ${method}().`);
     }
+  }
+  if (!(state.viewContexts instanceof Map)) {
+    throw new TypeError('Vector field overlay state requires its viewContexts Map.');
   }
   for (const method of [
     'setVectorFieldOverlayEnabled',
@@ -305,59 +378,8 @@ export function initVelocityOverlayControls(options) {
 
   const enabledCheckbox = dom.velocityEnabledCheckbox;
   const fieldSelect = dom.velocityFieldSelect;
-  const densityInput = dom.velocityDensityInput;
-  const densityDisplay = dom.velocityDensityDisplay;
-  const speedInput = dom.velocitySpeedInput;
-  const speedDisplay = dom.velocitySpeedDisplay;
-  const lifetimeInput = dom.velocityLifetimeInput;
-  const lifetimeDisplay = dom.velocityLifetimeDisplay;
-  const sizeInput = dom.velocitySizeInput;
-  const sizeDisplay = dom.velocitySizeDisplay;
-  const opacityInput = dom.velocityOpacityInput;
-  const opacityDisplay = dom.velocityOpacityDisplay;
   const colormapSelect = dom.velocityColormapSelect;
   const syncLodCheckbox = dom.velocitySyncLodCheckbox;
-  // Advanced settings - Particle Rendering
-  const intensityInput = dom.velocityIntensityInput;
-  const intensityDisplay = dom.velocityIntensityDisplay;
-  const glowInput = dom.velocityGlowInput;
-  const glowDisplay = dom.velocityGlowDisplay;
-  const cometStretchInput = dom.velocityCometStretchInput;
-  const cometStretchDisplay = dom.velocityCometStretchDisplay;
-  const coreSharpnessInput = dom.velocityCoreSharpnessInput;
-  const coreSharpnessDisplay = dom.velocityCoreSharpnessDisplay;
-  // Advanced settings - Trail
-  const trailFadeInput = dom.velocityTrailFadeInput;
-  const trailFadeDisplay = dom.velocityTrailFadeDisplay;
-  const chromaticFadeInput = dom.velocityChromaticFadeInput;
-  const chromaticFadeDisplay = dom.velocityChromaticFadeDisplay;
-  const turbulenceInput = dom.velocityTurbulenceInput;
-  const turbulenceDisplay = dom.velocityTurbulenceDisplay;
-  // Advanced settings - HDR & Bloom
-  const exposureInput = dom.velocityExposureInput;
-  const exposureDisplay = dom.velocityExposureDisplay;
-  const bloomStrengthInput = dom.velocityBloomStrengthInput;
-  const bloomStrengthDisplay = dom.velocityBloomStrengthDisplay;
-  const bloomThresholdInput = dom.velocityBloomThresholdInput;
-  const bloomThresholdDisplay = dom.velocityBloomThresholdDisplay;
-  const anamorphicInput = dom.velocityAnamorphicInput;
-  const anamorphicDisplay = dom.velocityAnamorphicDisplay;
-  // Advanced settings - Color Grading
-  const saturationInput = dom.velocitySaturationInput;
-  const saturationDisplay = dom.velocitySaturationDisplay;
-  const contrastInput = dom.velocityContrastInput;
-  const contrastDisplay = dom.velocityContrastDisplay;
-  const highlightsInput = dom.velocityHighlightsInput;
-  const highlightsDisplay = dom.velocityHighlightsDisplay;
-  const shadowsInput = dom.velocityShadowsInput;
-  const shadowsDisplay = dom.velocityShadowsDisplay;
-  // Advanced settings - Cinematic Effects
-  const vignetteInput = dom.velocityVignetteInput;
-  const vignetteDisplay = dom.velocityVignetteDisplay;
-  const filmGrainInput = dom.velocityFilmGrainInput;
-  const filmGrainDisplay = dom.velocityFilmGrainDisplay;
-  const chromaticAberrationInput = dom.velocityChromaticAberrationInput;
-  const chromaticAberrationDisplay = dom.velocityChromaticAberrationDisplay;
 
   let enabling = false;
   let suppressFieldChange = false;
@@ -429,16 +451,6 @@ export function initVelocityOverlayControls(options) {
     );
   }
 
-  const getActiveDim = () => {
-    const level = state.getDimensionLevel();
-    if (!Number.isInteger(level) || level < 1 || level > 3) {
-      throw new RangeError(
-        `Vector field overlay dimension must be exactly 1, 2, or 3; received ${String(level)}.`
-      );
-    }
-    return level;
-  };
-
   const getAllFields = () => {
     const fields = state.getAvailableVectorFields();
     if (!Array.isArray(fields)) {
@@ -454,26 +466,23 @@ export function initVelocityOverlayControls(options) {
         field.id.length === 0 ||
         typeof field.label !== 'string' ||
         field.label.length === 0 ||
-        !Array.isArray(field.availableDimensions) ||
-        field.availableDimensions.length === 0 ||
-        !Number.isInteger(field.defaultDimension) ||
-        !field.availableDimensions.includes(field.defaultDimension)
+        !Array.isArray(field.layoutKeys) ||
+        field.layoutKeys.length === 0
       ) {
         throw new TypeError('Each available vector field must expose one complete current descriptor.');
       }
-      const dimensions = new Set();
-      for (const dimension of field.availableDimensions) {
+      const layoutKeys = new Set();
+      for (const layoutKey of field.layoutKeys) {
         if (
-          !Number.isInteger(dimension) ||
-          dimension < 1 ||
-          dimension > 3 ||
-          dimensions.has(dimension)
+          typeof layoutKey !== 'string' ||
+          layoutKey.length === 0 ||
+          layoutKeys.has(layoutKey)
         ) {
           throw new TypeError(
-            `Vector field "${field.id}" must declare unique dimensions from 1 through 3.`
+            `Vector field "${field.id}" must be bound to distinct embedding ids.`
           );
         }
-        dimensions.add(dimension);
+        layoutKeys.add(layoutKey);
       }
       if (ids.has(field.id)) {
         throw new TypeError(`Vector field id "${field.id}" is duplicated.`);
@@ -483,19 +492,34 @@ export function initVelocityOverlayControls(options) {
     return fields;
   };
 
-  const getFieldsForDim = (dim) => {
-    if (!Number.isInteger(dim) || dim < 1 || dim > 3) {
-      throw new RangeError('Vector field dimension must be exactly 1, 2, or 3.');
-    }
-    return getAllFields().filter((field) => field.availableDimensions.includes(dim));
+  // A vector field is bound to embeddings, so it is drawn only in a view that
+  // shows one of them: the active view's layout, not its dimension, decides.
+  const getActiveLayoutKey = () => state.getViewLayoutKey(state.getActiveViewId());
+
+  const getFieldsForActiveLayout = () => {
+    const fields = getAllFields();
+    // Without vector fields there is nothing to match, and no dataset layout
+    // need be published yet.
+    if (fields.length === 0) return [];
+    const layoutKey = getActiveLayoutKey();
+    return fields.filter((field) => field.layoutKeys.includes(layoutKey));
   };
 
-  const getUnionDims = () => {
-    const dims = new Set();
+  /**
+   * The names of every embedding some vector field is bound to: its label and,
+   * when they differ, its id ("UMAP · X_umap_3d"), since one dataset can label
+   * several embeddings alike.
+   */
+  const getBoundEmbeddingLabels = () => {
+    const dimensionManager = state.getDimensionManager();
+    const labels = new Set();
     for (const field of getAllFields()) {
-      for (const dimension of field.availableDimensions) dims.add(dimension);
+      for (const layoutKey of field.layoutKeys) {
+        const { label } = dimensionManager.getLayout(layoutKey);
+        labels.add(label === layoutKey ? layoutKey : `${label} · ${layoutKey}`);
+      }
     }
-    return Array.from(dims).sort((a, b) => a - b);
+    return [...labels];
   };
 
   const getDefaultFieldId = () => {
@@ -519,7 +543,7 @@ export function initVelocityOverlayControls(options) {
 
   function syncDisabledOverlayUi() {
     enabledCheckbox.checked = false;
-    settings.style.display = 'none';
+    settings.hidden = true;
   }
 
   function disableOverlayUi() {
@@ -528,198 +552,34 @@ export function initVelocityOverlayControls(options) {
   }
 
   function updateSettingsVisibility() {
-    settings.style.display = enabledCheckbox.checked ? 'block' : 'none';
+    settings.hidden = !enabledCheckbox.checked;
   }
 
-  function updateDensityDisplay() {
-    const thousands = parseVelocityInput(dom, 'density');
-    const particles = thousands * 1000;
-    densityDisplay.textContent = formatCellCount(particles);
-    return particles;
-  }
-
-  function updateSpeedDisplay() {
-    const value = parseVelocityInput(dom, 'speed') / 100;
-    speedDisplay.textContent = `${value.toFixed(value < 0.1 ? 2 : 1)}×`;
-    return value;
-  }
-
-  function updateLifetimeDisplay() {
-    const value = parseVelocityInput(dom, 'lifetime') / 100;
-    lifetimeDisplay.textContent = `${value.toFixed(1)}s`;
-    return value;
-  }
-
-  function updateSizeDisplay() {
-    const value = parseVelocityInput(dom, 'size');
-    sizeDisplay.textContent = value < 10 ? value.toFixed(1) : `${Math.round(value)}`;
-    return value;
-  }
-
-  function updateOpacityDisplay() {
-    const value = parseVelocityInput(dom, 'opacity') / 100;
-    opacityDisplay.textContent = `${Math.round(value * 100)}%`;
-    return value;
-  }
-
-  // Advanced settings display functions - Particle Rendering
-  function updateIntensityDisplay() {
-    const value = parseVelocityInput(dom, 'intensity');
-    intensityDisplay.textContent = value.toFixed(2);
-    return value;
-  }
-
-  function updateGlowDisplay() {
-    const value = parseVelocityInput(dom, 'glow');
-    glowDisplay.textContent = value.toFixed(2);
-    return value;
-  }
-
-  function updateCometStretchDisplay() {
-    const value = parseVelocityInput(dom, 'cometStretch');
-    cometStretchDisplay.textContent = value.toFixed(2);
-    return value;
-  }
-
-  function updateCoreSharpnessDisplay() {
-    const value = parseVelocityInput(dom, 'coreSharpness');
-    coreSharpnessDisplay.textContent = value.toFixed(2);
-    return value;
-  }
-
-  // Trail settings
-  function updateTrailFadeDisplay() {
-    const value = parseVelocityInput(dom, 'trailFade');
-    trailFadeDisplay.textContent = value.toFixed(3);
-    return value;
-  }
-
-  function updateChromaticFadeDisplay() {
-    const value = parseVelocityInput(dom, 'chromaticFade');
-    chromaticFadeDisplay.textContent = value.toFixed(2);
-    return value;
-  }
-
-  function updateTurbulenceDisplay() {
-    const value = parseVelocityInput(dom, 'turbulence');
-    turbulenceDisplay.textContent = value.toFixed(2);
-    return value;
-  }
-
-  // HDR & Bloom
-  function updateExposureDisplay() {
-    const value = parseVelocityInput(dom, 'exposure');
-    exposureDisplay.textContent = value.toFixed(2);
-    return value;
-  }
-
-  function updateBloomStrengthDisplay() {
-    const value = parseVelocityInput(dom, 'bloomStrength');
-    bloomStrengthDisplay.textContent = value.toFixed(2);
-    return value;
-  }
-
-  function updateBloomThresholdDisplay() {
-    const value = parseVelocityInput(dom, 'bloomThreshold');
-    bloomThresholdDisplay.textContent = value.toFixed(2);
-    return value;
-  }
-
-  function updateAnamorphicDisplay() {
-    const value = parseVelocityInput(dom, 'anamorphic');
-    anamorphicDisplay.textContent = value.toFixed(1);
-    return value;
-  }
-
-  // Color Grading
-  function updateSaturationDisplay() {
-    const value = parseVelocityInput(dom, 'saturation');
-    saturationDisplay.textContent = value.toFixed(2);
-    return value;
-  }
-
-  function updateContrastDisplay() {
-    const value = parseVelocityInput(dom, 'contrast');
-    contrastDisplay.textContent = value.toFixed(2);
-    return value;
-  }
-
-  function updateHighlightsDisplay() {
-    const value = parseVelocityInput(dom, 'highlights');
-    highlightsDisplay.textContent = value.toFixed(2);
-    return value;
-  }
-
-  function updateShadowsDisplay() {
-    const value = parseVelocityInput(dom, 'shadows');
-    shadowsDisplay.textContent = value.toFixed(2);
-    return value;
-  }
-
-  // Cinematic Effects
-  function updateVignetteDisplay() {
-    const value = parseVelocityInput(dom, 'vignette');
-    vignetteDisplay.textContent = value.toFixed(2);
-    return value;
-  }
-
-  function updateFilmGrainDisplay() {
-    const value = parseVelocityInput(dom, 'filmGrain');
-    filmGrainDisplay.textContent = value.toFixed(3);
-    return value;
-  }
-
-  function updateChromaticAberrationDisplay() {
-    const value = parseVelocityInput(dom, 'chromaticAberration');
-    chromaticAberrationDisplay.textContent = value.toFixed(2);
+  /** Read one slider, print its readout, and return its viewer value. */
+  function readSlider(slider) {
+    const value = slider.read(parseVelocityInput(dom, slider.name));
+    dom[slider.display].textContent = slider.format(value);
     return value;
   }
 
   function applyConfigFromUi() {
     if (!enabledCheckbox.checked) return;
-
-    viewer.setVectorFieldConfig('particleCount', updateDensityDisplay());
-    viewer.setVectorFieldConfig('speedMultiplier', updateSpeedDisplay());
-    viewer.setVectorFieldConfig('lifetime', updateLifetimeDisplay());
-    viewer.setVectorFieldConfig('particleSize', updateSizeDisplay());
-    viewer.setVectorFieldConfig('opacity', updateOpacityDisplay());
+    for (const slider of VELOCITY_SLIDERS) {
+      viewer.setVectorFieldConfig(slider.config, readSlider(slider));
+    }
     viewer.setVectorFieldConfig('colormapId', colormapSelect.value);
     viewer.setVectorFieldConfig('syncWithLOD', syncLodCheckbox.checked);
-    // Advanced settings - Particle Rendering
-    viewer.setVectorFieldConfig('intensity', updateIntensityDisplay());
-    viewer.setVectorFieldConfig('glowAmount', updateGlowDisplay());
-    viewer.setVectorFieldConfig('cometStretch', updateCometStretchDisplay());
-    viewer.setVectorFieldConfig('coreSharpness', updateCoreSharpnessDisplay());
-    // Advanced settings - Trail
-    viewer.setVectorFieldConfig('trailFade', updateTrailFadeDisplay());
-    viewer.setVectorFieldConfig('chromaticFade', updateChromaticFadeDisplay());
-    viewer.setVectorFieldConfig('turbulence', updateTurbulenceDisplay());
-    // Advanced settings - HDR & Bloom
-    viewer.setVectorFieldConfig('exposure', updateExposureDisplay());
-    viewer.setVectorFieldConfig('bloomStrength', updateBloomStrengthDisplay());
-    viewer.setVectorFieldConfig('bloomThreshold', updateBloomThresholdDisplay());
-    viewer.setVectorFieldConfig('anamorphicRatio', updateAnamorphicDisplay());
-    // Advanced settings - Color Grading
-    viewer.setVectorFieldConfig('saturation', updateSaturationDisplay());
-    viewer.setVectorFieldConfig('contrast', updateContrastDisplay());
-    viewer.setVectorFieldConfig('highlights', updateHighlightsDisplay());
-    viewer.setVectorFieldConfig('shadows', updateShadowsDisplay());
-    // Advanced settings - Cinematic Effects
-    viewer.setVectorFieldConfig('vignette', updateVignetteDisplay());
-    viewer.setVectorFieldConfig('filmGrain', updateFilmGrainDisplay());
-    viewer.setVectorFieldConfig('chromaticAberration', updateChromaticAberrationDisplay());
   }
 
   function getSelectedFieldId() {
-    const dim = getActiveDim();
-    const fieldsForDim = getFieldsForDim(dim);
+    const fieldsForDim = getFieldsForActiveLayout();
     if (!fieldsForDim.length) return '';
 
     const current = fieldSelect.value;
     if (current.length > 0) {
       if (!fieldsForDim.some((field) => field.id === current)) {
         throw new Error(
-          `Selected vector field "${current}" is not declared for ${dim}D.`
+          `Selected vector field "${current}" is not bound to the embedding this view shows.`
         );
       }
       return current;
@@ -732,8 +592,7 @@ export function initVelocityOverlayControls(options) {
   }
 
   function renderFieldSelectForActiveDim() {
-    const dim = getActiveDim();
-    const fieldsForDim = getFieldsForDim(dim);
+    const fieldsForDim = getFieldsForActiveLayout();
     const selectedId = getSelectedFieldId();
 
     suppressFieldChange = true;
@@ -760,13 +619,12 @@ export function initVelocityOverlayControls(options) {
 
   function syncAvailability() {
     if (destroyed) return;
-    const unionDims = getUnionDims();
-    const hasAny = unionDims.length > 0;
-    const activeDim = getActiveDim();
-    const fieldsForDim = getFieldsForDim(activeDim);
+    const boundLabels = getBoundEmbeddingLabels();
+    const hasAny = boundLabels.length > 0;
+    const fieldsForDim = getFieldsForActiveLayout();
     const hasForDim = fieldsForDim.length > 0;
 
-    controlBlock.style.display = hasAny ? 'block' : 'none';
+    controlBlock.hidden = !hasAny;
     renderFieldSelectForActiveDim();
 
     if (!hasAny) {
@@ -790,36 +648,44 @@ export function initVelocityOverlayControls(options) {
 
     fieldSelect.disabled = enabling || !hasForDim;
 
-    const dimList = unionDims.map((d) => `${d}D`).join(', ');
+    const embeddingList = boundLabels.join(', ');
     if (!hasForDim) {
-      setInfo(`Vector fields available for ${dimList}. Switch embedding dimension to enable.`);
-      settings.style.display = 'none';
+      setInfo(`Vector fields are bound to ${embeddingList}. Show one of them in this view to enable.`);
+      settings.hidden = true;
       return;
     }
 
     if (!hasSelectedField) {
-      setInfo(`Available for ${dimList}. Select a vector field before enabling the overlay.`);
-      settings.style.display = 'block';
+      setInfo(`Available on ${embeddingList}. Select a vector field before enabling the overlay.`);
+      settings.hidden = false;
       return;
     }
 
-    setInfo(`Available for ${dimList}.`);
+    setInfo(`Available on ${embeddingList}.`);
     updateSettingsVisibility();
   }
 
-  async function ensureFieldForActiveDim(owner) {
-    const dim = getActiveDim();
+  /**
+   * Load the selected field for every representation an open view shows that
+   * the field is bound to: each representation's data is loaded once and
+   * drawn by every view that shows it.
+   */
+  async function ensureFieldForShownLayouts(owner) {
     const fieldId = getSelectedFieldId();
     if (fieldId.length === 0) {
       throw new Error(
         'A vector field must be selected before loading overlay data.'
       );
     }
-    await state.ensureVectorField(
-      fieldId,
-      dim,
-      { silent: false }
+    const field = getAllFields().find(candidate => candidate.id === fieldId);
+    const shown = new Set(
+      [...state.viewContexts.keys()].map(viewId => state.getViewLayoutKey(viewId))
     );
+    for (const layoutKey of field.layoutKeys) {
+      if (!shown.has(layoutKey)) continue;
+      await state.ensureVectorField(fieldId, layoutKey, { silent: false });
+      if (!isOperationOwnerCurrent(owner)) return false;
+    }
     if (!isOperationOwnerCurrent(owner)) return false;
     viewer.setActiveVectorField(fieldId);
     return true;
@@ -834,9 +700,7 @@ export function initVelocityOverlayControls(options) {
       return;
     }
 
-    const dims = getUnionDims();
-    const activeDim = getActiveDim();
-    if (!dims.includes(activeDim)) {
+    if (getFieldsForActiveLayout().length === 0) {
       disableOverlayUi();
       syncAvailability();
       return;
@@ -848,7 +712,7 @@ export function initVelocityOverlayControls(options) {
     let failureInfo = null;
 
     try {
-      await ensureFieldForActiveDim(owner);
+      await ensureFieldForShownLayouts(owner);
       if (!isOperationOwnerCurrent(owner)) return;
       viewer.setVectorFieldOverlayEnabled(true);
       applyConfigFromUi();
@@ -880,7 +744,7 @@ export function initVelocityOverlayControls(options) {
     const selectedFieldId = fieldSelect.value;
     if (
       selectedFieldId.length > 0 &&
-      !getFieldsForDim(getActiveDim()).some(
+      !getFieldsForActiveLayout().some(
         (field) => field.id === selectedFieldId
       )
     ) {
@@ -889,10 +753,9 @@ export function initVelocityOverlayControls(options) {
     syncAvailability();
     if (!enabledCheckbox.checked) return;
 
-    // Keep overlay on across dimension switches, but only if a field exists for that dim.
-    const dims = getUnionDims();
-    const activeDim = getActiveDim();
-    if (!dims.includes(activeDim)) {
+    // Keep the overlay on across layout switches, but only while the view
+    // shows an embedding some field is bound to.
+    if (getFieldsForActiveLayout().length === 0) {
       disableOverlayUi();
       syncAvailability();
       return;
@@ -903,7 +766,7 @@ export function initVelocityOverlayControls(options) {
       enabling = true;
       enabledCheckbox.disabled = true;
       setInfo('Loading vector field…');
-      await ensureFieldForActiveDim(owner);
+      await ensureFieldForShownLayouts(owner);
       if (!isOperationOwnerCurrent(owner)) return;
       viewer.setVectorFieldOverlayEnabled(true);
       applyConfigFromUi();
@@ -942,7 +805,7 @@ export function initVelocityOverlayControls(options) {
     setInfo('Loading vector field…');
     let failureInfo = null;
     try {
-      await ensureFieldForActiveDim(owner);
+      await ensureFieldForShownLayouts(owner);
       if (!isOperationOwnerCurrent(owner)) return;
       applyConfigFromUi();
       syncAvailability();
@@ -986,26 +849,30 @@ export function initVelocityOverlayControls(options) {
   listen(enabledCheckbox, 'change', handleEnabledChange);
   listen(fieldSelect, 'change', handleFieldChanged);
 
-  listen(densityInput, 'input', () => {
-    const particles = updateDensityDisplay();
-    if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('particleCount', particles);
-  });
-  listen(speedInput, 'input', () => {
-    const speed = updateSpeedDisplay();
-    if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('speedMultiplier', speed);
-  });
-  listen(lifetimeInput, 'input', () => {
-    const lifetime = updateLifetimeDisplay();
-    if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('lifetime', lifetime);
-  });
-  listen(sizeInput, 'input', () => {
-    const size = updateSizeDisplay();
-    if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('particleSize', size);
-  });
-  listen(opacityInput, 'input', () => {
-    const opacity = updateOpacityDisplay();
-    if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('opacity', opacity);
-  });
+  const sliderFrames = [];
+  for (const slider of VELOCITY_SLIDERS) {
+    const input = dom[VELOCITY_NUMERIC_INPUTS[slider.name].domKey];
+    const apply = () => {
+      const value = readSlider(slider);
+      if (enabledCheckbox.checked && !enabling) {
+        viewer.setVectorFieldConfig(slider.config, value);
+      }
+    };
+    if (slider.commit === 'change') {
+      const paint = coalesceToFrame(() => readSlider(slider));
+      sliderFrames.push(paint);
+      listen(input, 'input', () => paint());
+      listen(input, 'change', () => {
+        paint.cancel();
+        apply();
+      });
+    } else {
+      const frame = coalesceToFrame(apply);
+      sliderFrames.push(frame);
+      listen(input, 'input', () => frame());
+      listen(input, 'change', () => frame.flush());
+    }
+  }
   listen(colormapSelect, 'change', () => {
     if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('colormapId', colormapSelect.value);
   });
@@ -1013,84 +880,6 @@ export function initVelocityOverlayControls(options) {
     if (enabledCheckbox.checked && !enabling) {
       viewer.setVectorFieldConfig('syncWithLOD', syncLodCheckbox.checked);
     }
-  });
-
-  // Advanced settings event listeners - Particle Rendering
-  listen(intensityInput, 'input', () => {
-    const value = updateIntensityDisplay();
-    if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('intensity', value);
-  });
-  listen(glowInput, 'input', () => {
-    const value = updateGlowDisplay();
-    if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('glowAmount', value);
-  });
-  listen(cometStretchInput, 'input', () => {
-    const value = updateCometStretchDisplay();
-    if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('cometStretch', value);
-  });
-  listen(coreSharpnessInput, 'input', () => {
-    const value = updateCoreSharpnessDisplay();
-    if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('coreSharpness', value);
-  });
-  // Trail settings
-  listen(trailFadeInput, 'input', () => {
-    const value = updateTrailFadeDisplay();
-    if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('trailFade', value);
-  });
-  listen(chromaticFadeInput, 'input', () => {
-    const value = updateChromaticFadeDisplay();
-    if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('chromaticFade', value);
-  });
-  listen(turbulenceInput, 'input', () => {
-    const value = updateTurbulenceDisplay();
-    if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('turbulence', value);
-  });
-  // HDR & Bloom
-  listen(exposureInput, 'input', () => {
-    const value = updateExposureDisplay();
-    if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('exposure', value);
-  });
-  listen(bloomStrengthInput, 'input', () => {
-    const value = updateBloomStrengthDisplay();
-    if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('bloomStrength', value);
-  });
-  listen(bloomThresholdInput, 'input', () => {
-    const value = updateBloomThresholdDisplay();
-    if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('bloomThreshold', value);
-  });
-  listen(anamorphicInput, 'input', () => {
-    const value = updateAnamorphicDisplay();
-    if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('anamorphicRatio', value);
-  });
-  // Color Grading
-  listen(saturationInput, 'input', () => {
-    const value = updateSaturationDisplay();
-    if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('saturation', value);
-  });
-  listen(contrastInput, 'input', () => {
-    const value = updateContrastDisplay();
-    if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('contrast', value);
-  });
-  listen(highlightsInput, 'input', () => {
-    const value = updateHighlightsDisplay();
-    if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('highlights', value);
-  });
-  listen(shadowsInput, 'input', () => {
-    const value = updateShadowsDisplay();
-    if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('shadows', value);
-  });
-  // Cinematic Effects
-  listen(vignetteInput, 'input', () => {
-    const value = updateVignetteDisplay();
-    if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('vignette', value);
-  });
-  listen(filmGrainInput, 'input', () => {
-    const value = updateFilmGrainDisplay();
-    if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('filmGrain', value);
-  });
-  listen(chromaticAberrationInput, 'input', () => {
-    const value = updateChromaticAberrationDisplay();
-    if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('chromaticAberration', value);
   });
 
   // ---------------------------------------------------------------------------
@@ -1102,42 +891,15 @@ export function initVelocityOverlayControls(options) {
     if (destroyed) return undefined;
     return observeEventOperation(
       trackOperation(handleDimensionChanged()),
-      'dimension:changed'
+      'view:representation-changed'
     );
   };
 
   state.on('vectorFields:changed', onVectorFieldsChanged);
-  state.on('dimension:changed', onDimChanged);
+  state.on('view:representation-changed', onDimChanged);
 
   // Initialize UI state.
-  updateDensityDisplay();
-  updateSpeedDisplay();
-  updateLifetimeDisplay();
-  updateSizeDisplay();
-  updateOpacityDisplay();
-  // Advanced settings - Particle Rendering
-  updateIntensityDisplay();
-  updateGlowDisplay();
-  updateCometStretchDisplay();
-  updateCoreSharpnessDisplay();
-  // Advanced settings - Trail
-  updateTrailFadeDisplay();
-  updateChromaticFadeDisplay();
-  updateTurbulenceDisplay();
-  // Advanced settings - HDR & Bloom
-  updateExposureDisplay();
-  updateBloomStrengthDisplay();
-  updateBloomThresholdDisplay();
-  updateAnamorphicDisplay();
-  // Advanced settings - Color Grading
-  updateSaturationDisplay();
-  updateContrastDisplay();
-  updateHighlightsDisplay();
-  updateShadowsDisplay();
-  // Advanced settings - Cinematic Effects
-  updateVignetteDisplay();
-  updateFilmGrainDisplay();
-  updateChromaticAberrationDisplay();
+  for (const slider of VELOCITY_SLIDERS) readSlider(slider);
   updateSettingsVisibility();
   syncAvailability();
 
@@ -1155,8 +917,9 @@ export function initVelocityOverlayControls(options) {
     const cleanupErrors = [];
     for (const cleanup of [
       () => domLifecycle.abort(),
+      () => sliderFrames.forEach(frame => frame.cancel()),
       () => state.off('vectorFields:changed', onVectorFieldsChanged),
-      () => state.off('dimension:changed', onDimChanged),
+      () => state.off('view:representation-changed', onDimChanged),
     ]) {
       try {
         cleanup();

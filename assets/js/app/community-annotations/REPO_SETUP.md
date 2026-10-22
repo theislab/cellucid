@@ -210,21 +210,20 @@ a corrupt cache, but the visible session is restored exactly: moderation,
 merged suggestions, settings, access metadata, and remote SHAs
 publish synchronously through one session transaction and one change notification.
 
-One Pull accepts at most **10,000 active user files** and **64,000,000 total
-decoded UTF-8 bytes** across those files. The recursive tree's exact blob sizes
-are checked before any user blob is downloaded and rechecked against every
-fetched blob. The tree must prove an exact `annotations/users` inventory through
+A Pull has no limit on the number of active user files or their total size.
+Changed files are fetched and cached a batch at a time (about 32 MiB each), and
+the merged view is compiled by streaming the cache one file at a time, so a
+Pull never holds every raw file at once. Each file's exact blob size from the
+recursive tree is checked against the fetched blob. The tree must prove an exact `annotations/users` inventory through
 its directory entry or a valid direct child. The pristine template's one-byte
 `annotations/users/.gitkeep` blob (Git SHA
 `8b137891791fe96927ad78e64b0aad7bded08bdc`) is accepted only in that exact
-form; it is never downloaded or included in user SHAs, counts, or decoded-byte
-limits. An absent inventory or an inexact, renamed, or nested sentinel fails the
+form; it is never downloaded or included in user SHAs or counts. An absent inventory or an inexact, renamed, or nested sentinel fails the
 Pull. Unrelated valid Git submodules are ignored; a submodule or directory under
 `annotations/users/` is invalid. If one concurrent blob fails, Cellucid stops
 assigning work, cancels the rest of the active eight-request window, awaits its
-settlement, and reports the first failure. Archive old user documents outside
-`annotations/users/` or split the repository before retrying a Pull that
-exceeds either aggregate limit.
+settlement, and reports the first failure. Batches already cached stay cached,
+so the next Pull downloads only what is still missing.
 
 The Worker streams successful Contents, Git blob, and recursive-tree responses
 without first retaining their complete bodies in the shared isolate. It enforces
@@ -269,13 +268,13 @@ This worker is an **auth and bounded data proxy**:
 - `/auth/user`, `/auth/installations`, `/auth/installation-repos` expose minimal “who am I” + “which repos did I install the app on” queries
 - `/api/repos/*` proxies the repository requests used by Cellucid to
   `api.github.com/repos/*`
-- `/cap/lookup-cells` and `/cap/search-datasets` run only Cellucid's fixed
-  persisted CAP operations and return bounded, minimal result projections
+- `/cap/lookup-cells` runs only Cellucid's fixed persisted CAP cell-type
+  lookup and returns a bounded, minimal result projection
 
 Every successful CAP response contains exactly the pinned contract version
 alongside its data: `{ "contractVersion": 1, "results": [...],
 "omittedInvalidCount": number }`. Lookup kinds map to fixed APQ search fields:
-`name` and `feedback` use the default name search, `ontology` searches only
+`name` uses the default name search, `ontology` searches only
 `ontologyTermId`, and `marker` searches only `markerGenes` and
 `canonicalMarkerGenes`.
 
@@ -321,8 +320,8 @@ After every Worker deployment, verify the root response reports
 Cellucid origin:
 
 1. Search CAP for `T cell` and confirm a bounded T-cell result.
-2. Search Ontology for `CL:0000084` and confirm that exact ontology ID.
-3. Search Markers for `CD3D` and confirm a result containing `CD3D` in its
+2. Search ontology for `CL:0000084` and confirm that exact ontology ID.
+3. Search markers for `CD3D` and confirm a result containing `CD3D` in its
    general or canonical markers.
 
 ### Self-Hosting / Using Your Own Worker
@@ -331,10 +330,10 @@ If you want to run your own worker + GitHub App (recommended for organizations),
 
 - `docs/github-oauth-cloudflare-setup.md`
 
-The current strict Worker contract requires Cloudflare Workers Paid with the
-Standard usage model; the checked-in Wrangler configuration owns the exact CPU
-ceiling. A Free-plan deployment is not supported for the complete annotation
-document boundary.
+The checked-in Wrangler configuration deploys on the Cloudflare Workers Free
+plan, which gives each request about 10 ms of CPU time; a request over a very
+large repository document can exceed it and fail with `exceededCpu`. The setup
+guide explains when to move to Workers Paid with a configured CPU limit.
 
 For production, set the exact `DEFAULT_WORKER_ORIGIN` in
 `assets/js/app/community-annotations/github-auth.js`, rebuild Cellucid, and

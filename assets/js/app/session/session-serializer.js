@@ -15,9 +15,9 @@
 
 import { readBundle } from './bundle/reader.js';
 import { writeBundle } from './bundle/writer.js';
+import { downloadBlob } from '../utils/download.js';
 import {
-  MAX_UNCOMPRESSED_CHUNK_BYTES,
-  MAX_STORED_CHUNK_BYTES
+  MAX_FRAME_BYTES
 } from './bundle/format.js';
 import { gzipCompress, gzipDecompress } from './codecs/gzip.js';
 import {
@@ -25,8 +25,6 @@ import {
 } from './contributors/analysis-artifacts.js';
 import {
   CURRENT_GENERIC_STATIC_CHUNK_PROFILES,
-  MAX_PUBLISHED_DEFAULT_STATE_BYTES,
-  MAX_PUBLISHED_DEFAULT_UNCOMPRESSED_BYTES,
   PUBLISHED_DEFAULT_STATIC_CHUNK_PROFILE,
   STATIC_CHUNK_PROFILE_KEYS,
   assertPublishedDefaultChunkProfile
@@ -36,9 +34,10 @@ import {
   buildSessionContext,
   createSessionRestoreTransaction,
   datasetFingerprintMatches,
-  describeDatasetFingerprintMismatch,
   getDatasetFingerprint,
-  registerSessionRestoreSnapshots
+  verifySessionFingerprint,
+  registerSessionRestoreSnapshots,
+  restoreSessionDataMapping
 } from './session-context.js';
 import {
   assertArray,
@@ -73,9 +72,9 @@ import {
  * @property {(ctx: any, chunkMeta: any, payload: any) => Promise<void>|void} restore
  */
 
-export const SESSION_RESTORE_SUPERSEDED_CODE =
+const SESSION_RESTORE_SUPERSEDED_CODE =
   'CELLUCID_SESSION_RESTORE_SUPERSEDED';
-export const SESSION_RESTORE_CANCELED_CODE =
+const SESSION_RESTORE_CANCELED_CODE =
   'CELLUCID_SESSION_RESTORE_CANCELED';
 
 export function createSessionRestoreCanceledError() {
@@ -89,7 +88,7 @@ export function isSessionRestoreCanceledError(error) {
   return error?.code === SESSION_RESTORE_CANCELED_CODE;
 }
 
-export function createSessionRestoreSupersededError() {
+function createSessionRestoreSupersededError() {
   const error = new Error(
     'Session restore was superseded by a newer restore.'
   );
@@ -105,11 +104,11 @@ export function isSessionRestoreSupersededError(error) {
 /**
  * Marks a restore failure that has already been shown to the user.
  *
- * A restore owns a "Loading session" progress notification, and failing that
+ * A restore owns a "Session file" progress notification, and failing that
  * notification is how the failure reaches the screen. The same error is then
  * rethrown so the caller can roll its own state back — and a caller that also
  * reports it publishes the identical sentence a second time. Users saw the
- * message twice, once as "Loading session: <message>" and once bare.
+ * message twice, once as "Session file: <message>" and once bare.
  *
  * This was invisible while the two copies had different lifetimes: one expired
  * before the other, so the duplicate looked like a flicker rather than a defect
@@ -269,22 +268,6 @@ function nextTick() {
 }
 
 /**
- * Download a Blob as a file.
- * @param {Blob} blob
- * @param {string} filename
- */
-function downloadBlob(blob, filename) {
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
-}
-
-/**
  * Basic manifest shape validation (untrusted input).
  * @param {any} manifest
  */
@@ -411,11 +394,9 @@ function validateManifest(manifest, contributorById, manifestProfile) {
       );
     }
     assertSafeInteger(entry.storedBytes, `${context} storedBytes`, {
-      maximum: MAX_STORED_CHUNK_BYTES
+      maximum: MAX_FRAME_BYTES
     });
-    assertSafeInteger(entry.uncompressedBytes, `${context} uncompressedBytes`, {
-      maximum: MAX_UNCOMPRESSED_CHUNK_BYTES
-    });
+    assertSafeInteger(entry.uncompressedBytes, `${context} uncompressedBytes`);
   }
   if (manifestProfile === null) {
     for (const expected of CURRENT_GENERIC_STATIC_CHUNK_PROFILES) {
@@ -451,22 +432,13 @@ function validatePublishedDefaultManifest(manifest) {
   // rule the reader enforces and the rule the publisher obeys cannot drift.
   assertPublishedDefaultChunkProfile(manifest.chunks);
 
-  let aggregateUncompressedBytes = 0;
+  // Each chunk's declared size bounds its own inflate; a published default
+  // has no size limit of its own.
   for (const actual of manifest.chunks) {
-    const uncompressedBytes = assertSafeInteger(
+    assertSafeInteger(
       actual.uncompressedBytes,
-      `Published default chunk "${actual.id}" uncompressedBytes`,
-      { maximum: MAX_PUBLISHED_DEFAULT_UNCOMPRESSED_BYTES }
+      `Published default chunk "${actual.id}" uncompressedBytes`
     );
-    aggregateUncompressedBytes += uncompressedBytes;
-    if (
-      aggregateUncompressedBytes
-      > MAX_PUBLISHED_DEFAULT_UNCOMPRESSED_BYTES
-    ) {
-      throw new RangeError(
-        'Published default session exceeds the 64 KiB aggregate uncompressed byte limit.'
-      );
-    }
   }
   return manifest;
 }
@@ -769,8 +741,6 @@ export class SessionSerializer {
     this._activeRestoreAbort = null;
     /** @type {Promise<void>|null} */
     this._activeRestoreTask = null;
-    /** @type {Promise<void>|null} */
-    this._activeLazyTask = null;
     /** @type {(() => Promise<void>|void)|null} */
     this._captureSettlement = null;
     /** @type {(() => Promise<void>|void)|null} */
@@ -1129,19 +1099,14 @@ export class SessionSerializer {
         chunk.kind === 'json'
           ? encodeJsonBytes(chunk.payload)
           : chunk.payload;
-      if (uncompressedBytes.byteLength > MAX_UNCOMPRESSED_CHUNK_BYTES) {
-        throw new RangeError(
-          `Session chunk "${chunk.id}" exceeds the uncompressed byte limit.`
-        );
-      }
-
       // Apply codec.
       const storedBytes = chunk.codec === 'gzip'
         ? await gzipCompress(uncompressedBytes, { signal: null })
         : uncompressedBytes;
-      if (storedBytes.byteLength > MAX_STORED_CHUNK_BYTES) {
+      if (storedBytes.byteLength > MAX_FRAME_BYTES) {
         throw new RangeError(
-          `Session chunk "${chunk.id}" exceeds the stored byte limit.`
+          `Session chunk "${chunk.id}" holds ${storedBytes.byteLength} bytes; ` +
+          'a session chunk frame holds at most 4 GiB − 1 (its length is a u32).'
         );
       }
 
@@ -1185,11 +1150,34 @@ export class SessionSerializer {
    *
    * Resolves only after every selected session chunk has been restored.
    *
-   * @returns {Promise<boolean>} True if a file was selected and restore started.
+   * `beforeRestore` runs once a file has been chosen and before anything is
+   * read from it; resolving `false` abandons the restore. The session controls
+   * use it to wait for a dataset still loading, since a session is restored
+   * onto the dataset it was saved from.
+   *
+   * @param {{beforeRestore: (file: File) => Promise<boolean>}} options
+   * @returns {Promise<boolean>} True if a file was selected and restored.
    */
-  async loadSessionFromFile() {
+  async loadSessionFromFile(options) {
+    assertExactKeys(
+      options,
+      ['beforeRestore'],
+      'Session file load options'
+    );
+    if (typeof options.beforeRestore !== 'function') {
+      throw new TypeError(
+        'Session file load beforeRestore must be a function.'
+      );
+    }
     const file = await this._pickSessionFile();
     if (file === null) return false;
+    const proceed = await options.beforeRestore(file);
+    if (typeof proceed !== 'boolean') {
+      throw new TypeError(
+        'Session file load beforeRestore must resolve a boolean.'
+      );
+    }
+    if (!proceed) return false;
     try {
       await this.restoreFromBlob(file);
       return true;
@@ -1268,11 +1256,6 @@ export class SessionSerializer {
       blob.size,
       'Published default session Blob size'
     );
-    if (totalBytes > MAX_PUBLISHED_DEFAULT_STATE_BYTES) {
-      throw new RangeError(
-        'Published default session exceeds the 32 KiB byte limit.'
-      );
-    }
 
     await this._runOwnedRestore(
       (abortController) => this._restoreFromBundleSource(blob, {
@@ -1285,113 +1268,6 @@ export class SessionSerializer {
       }),
       { signal: callerSignal }
     );
-  }
-
-  /**
-   * Restore a session from a URL (fetch + streaming decode).
-   * Resolves only after every selected session chunk has been restored.
-   *
-   * @param {string} url
-   * @param {{ cache: RequestCache }} options
-   * @returns {Promise<void>}
-   */
-  async restoreFromUrl(url, options) {
-    const target = assertNonEmptyString(url, 'Session restore URL');
-    assertExactKeys(options, ['cache'], 'Session URL restore options');
-    const cacheModes = new Set([
-      'default',
-      'no-store',
-      'reload',
-      'no-cache',
-      'force-cache',
-      'only-if-cached'
-    ]);
-    if (!cacheModes.has(options.cache)) {
-      throw new TypeError('Session URL restore cache mode is invalid.');
-    }
-
-    await this._runOwnedRestore(async (abortController) => {
-      const ctx = buildSessionContext(this._base, {
-        abortSignal: abortController.signal,
-        restoreTransaction: null
-      });
-      const notifications = assertNotifications(ctx.notifications);
-
-      const downloadId = assertNonEmptyString(
-        notifications.startDownload('Loading session', null, {
-          onCancel: () => abortController.abort(
-            createSessionRestoreCanceledError()
-          )
-        }),
-        'Session download notification id'
-      );
-      let delegatedToRestore = false;
-
-      try {
-        const fetchFn = requireMethod(
-          ctx.dataSourceManager,
-          'fetch',
-          'Session URL restore data source manager'
-        ).bind(ctx.dataSourceManager);
-        const res = await fetchFn(target, {
-          signal: abortController.signal,
-          cache: options.cache
-        });
-        assertOwner(res, 'Session URL response');
-        if (res.ok !== true) {
-          assertSafeInteger(res.status, 'Session URL response status', {
-            minimum: 100,
-            maximum: 599
-          });
-          if (typeof res.statusText !== 'string') {
-            throw new TypeError(
-              'Session URL response statusText must be a string.'
-            );
-          }
-          throw new Error(
-            `Failed to fetch session (${res.status}): ${res.statusText}`
-          );
-        }
-        if (
-          res.body === null
-          || typeof res.body !== 'object'
-          || typeof res.body.getReader !== 'function'
-        ) {
-          throw new Error(
-            'restoreFromUrl: fetch response has no readable body stream.'
-          );
-        }
-
-        const source = {
-          stream: () => res.body
-        };
-        delegatedToRestore = true;
-        await this._restoreFromBundleSource(source, {
-          totalBytes: null,
-          notifications,
-          downloadId,
-          abortController,
-          manifestProfile: null,
-          refreshUi: null
-        });
-      } catch (err) {
-        if (!delegatedToRestore) {
-          if (isExpectedRestoreDismissal(err, abortController.signal)) {
-            notifications.dismissDownload(downloadId);
-          } else if (err instanceof Error && err.name === 'AbortError') {
-            notifications.failDownload(
-              downloadId,
-              'Session restore canceled.'
-            );
-            markSessionRestoreReported(err);
-          } else {
-            notifications.failDownload(downloadId, failureMessage(err));
-            markSessionRestoreReported(err);
-          }
-        }
-        throw err;
-      }
-    }, { signal: null });
   }
 
   /**
@@ -1478,7 +1354,7 @@ export class SessionSerializer {
     // existing progress + speed UI in NotificationCenter.
     const downloadId = providedDownloadId === null
       ? assertNonEmptyString(
-        notifications.startDownload('Loading session', totalBytes, {
+        notifications.startDownload('Session file', totalBytes, {
           onCancel: () => abortController.abort(
             createSessionRestoreCanceledError()
           )
@@ -1487,12 +1363,14 @@ export class SessionSerializer {
       )
       : providedDownloadId;
 
+    let bundle = null;
     try {
-      const { manifest, chunkStream } = await readBundle(source, {
+      bundle = await readBundle(source, {
         signal: abortController.signal,
         onProgress: (loaded) =>
           notifications.updateDownload(downloadId, loaded, totalBytes)
       });
+      const { manifest, chunkStream } = bundle;
 
       if (manifestProfile === 'published-default') {
         validatePublishedDefaultManifest(manifest);
@@ -1503,9 +1381,14 @@ export class SessionSerializer {
         manifestProfile
       );
 
-      const currentFp = getDatasetFingerprint(ctx);
-      const fileFp = manifest.datasetFingerprint;
-      const mismatch = describeDatasetFingerprintMismatch(fileFp, currentFp);
+      // Verify, then apply: the dataset, its data mapping and the cell order
+      // of the layout the session names are all checked before any chunk
+      // touches state.
+      const mismatch = await verifySessionFingerprint(
+        ctx,
+        manifest.datasetFingerprint
+      );
+      throwIfAborted(abortController.signal);
       if (mismatch !== null) {
         throw new RangeError(mismatch);
       }
@@ -1519,6 +1402,12 @@ export class SessionSerializer {
       for (const [chunkId, payload] of capturedSnapshots) {
         restoreSnapshots.set(chunkId, payload);
       }
+      // The embeddings the session names are restored before its views.
+      await restoreSessionDataMapping(
+        ctx,
+        manifest.datasetFingerprint.dataMapping
+      );
+      throwIfAborted(abortController.signal);
       // Phase split: apply eager chunks now, then continue lazy in the background.
       const iterator = chunkStream[Symbol.asyncIterator]();
 
@@ -1580,34 +1469,22 @@ export class SessionSerializer {
 
       // Apply the lazy stage in the same public restore operation. Yielding
       // between chunks keeps the browser responsive without creating a second
-      // failure channel after restoreFromBlob()/restoreFromUrl() has resolved.
+      // failure channel after restoreFromBlob() has resolved.
       if (firstLazy) {
-        const lazyTask = (async () => {
-          await applyChunk(firstLazy.meta, firstLazy.bytes);
-          while (true) {
-            throwIfAborted(abortController.signal);
-            const { value, done } = await iterator.next();
-            if (done) break;
-            await nextTick();
-            assertExactKeys(
-              value,
-              ['index', 'meta', 'bytes'],
-              'Session streamed chunk'
-            );
-            assertSafeInteger(value.index, 'Session streamed chunk index');
-            await applyChunk(value.meta, value.bytes);
-          }
-        })();
-        this._activeLazyTask = lazyTask;
-        try {
-          await lazyTask;
-        } finally {
-          if (this._activeLazyTask === lazyTask) {
-            this._activeLazyTask = null;
-          }
+        await applyChunk(firstLazy.meta, firstLazy.bytes);
+        while (true) {
+          throwIfAborted(abortController.signal);
+          const { value, done } = await iterator.next();
+          if (done) break;
+          await nextTick();
+          assertExactKeys(
+            value,
+            ['index', 'meta', 'bytes'],
+            'Session streamed chunk'
+          );
+          assertSafeInteger(value.index, 'Session streamed chunk index');
+          await applyChunk(value.meta, value.bytes);
         }
-      } else {
-        this._activeLazyTask = null;
       }
 
       if (refreshUi !== null) {
@@ -1624,12 +1501,13 @@ export class SessionSerializer {
         );
       }
       await restoreTransaction.commit();
-      notifications.info('Session fully restored.', {
-        category: 'session',
-        duration: 2200
-      });
+      // The restore's own progress notification is the one place its outcome
+      // is published, success and failure alike. A second toast for the same
+      // event put "Session fully restored." on screen twice.
       notifications.completeDownload(downloadId, 'Session fully restored.');
     } catch (err) {
+      // A restore that stops before the bundle's end releases its source.
+      if (bundle !== null) await bundle.cancel(err);
       try {
         await restoreTransaction.rollback();
       } catch (rollbackError) {
@@ -1645,6 +1523,12 @@ export class SessionSerializer {
           && abortController.signal.aborted
         );
       if (isSilentReplacement) {
+        notifications.dismissDownload(downloadId);
+      } else if (manifestProfile === 'published-default' && !isAbortFailure) {
+        // A published default fails after its dataset has already loaded.
+        // Only the caller knows that, and it publishes the one notification
+        // that says so ("Sample view unavailable"); failing this progress
+        // entry as well announced the same error twice.
         notifications.dismissDownload(downloadId);
       } else if (isAbortFailure) {
         notifications.failDownload(downloadId, 'Session restore canceled.');

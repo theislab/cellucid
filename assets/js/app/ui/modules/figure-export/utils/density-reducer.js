@@ -29,6 +29,7 @@
 
 import { clamp } from '../../../../utils/number-utils.js';
 import { createMulberry32 } from '../../../../utils/random-utils.js';
+import { requirePositionArray } from '../../../../../rendering/position-layout.js';
 import { assertCropRect01, cropRect01ToPx } from './crop.js';
 import {
   assertLodMembership,
@@ -43,7 +44,9 @@ import {
  * @property {Uint8Array} rgba - packed RGBA uint8 (n*4), alpha is NOT premultiplied
  * @property {Float32Array} alpha - per-point alpha (0..1)
  * @property {Uint32Array} index - source point index for each reduced point
- * @property {Float32Array} sourcePositions - packed source xyz values (n*3)
+ * @property {Float32Array} sourcePositions - the reduced points' source
+ *   coordinates as XYZ triples (n*3), with zero for the axes a 1-D or 2-D
+ *   embedding does not have
  * @property {Uint8Array} highlighted - sampled renderer highlight byte per point
  * @property {number} scannedSourceCount - unique primary/sparse source IDs examined
  * @property {number} candidateSourceCount - source IDs eligible before the preview scan cap
@@ -165,9 +168,10 @@ function apportionDensitySlots(
  * Reduce points by density in viewport space.
  *
  * @param {object} options
- * @param {Float32Array|null} options.positions - n*3
+ * @param {Float32Array|null} options.positions - n*dimension
+ * @param {1|2|3} options.dimension - components per position
  * @param {Uint8Array|null} options.colors - n*4
- * @param {Float32Array|null} [options.transparency] - n (0..1)
+ * @param {Uint8Array|null} [options.transparency] - n (0 or 1)
  * @param {import('./lod-membership.js').LodMembership|null} [options.lodMembership]
  * @param {Uint8Array|null} [options.highlightArray] - exact renderer highlight bytes
  * @param {number[]|Uint32Array|null} [options.highlightedIndices] - complete unique sparse highlight IDs
@@ -181,6 +185,7 @@ function apportionDensitySlots(
  */
 export function reducePointsByDensity({
   positions,
+  dimension,
   colors,
   transparency = null,
   lodMembership = null,
@@ -200,8 +205,13 @@ export function reducePointsByDensity({
     );
   }
 
-  const n = Math.min(Math.floor(positions.length / 3), Math.floor(colors.length / 4));
-  const sourcePointCount = Math.floor(positions.length / 3);
+  const sourcePointCount = requirePositionArray(
+    positions,
+    dimension,
+    'Figure-export density positions',
+    { allowEmpty: true }
+  );
+  const n = Math.min(sourcePointCount, Math.floor(colors.length / 4));
   const requestedTotal = Number.isFinite(targetCount)
     ? Math.max(0, Math.floor(targetCount))
     : 0;
@@ -353,10 +363,10 @@ export function reducePointsByDensity({
     else if (a > 1) a = 1;
     if (a < POINT_VISIBILITY_THRESHOLD) continue;
 
-    const ix = i * 3;
+    const ix = i * dimension;
     const x = positions[ix];
-    const y = positions[ix + 1];
-    const z = positions[ix + 2];
+    const y = dimension > 1 ? positions[ix + 1] : 0;
+    const z = dimension > 2 ? positions[ix + 2] : 0;
 
     const clipX = mvp[0] * x + mvp[4] * y + mvp[8] * z + mvp[12];
     const clipY = mvp[1] * x + mvp[5] * y + mvp[9] * z + mvp[13];
@@ -421,10 +431,10 @@ export function reducePointsByDensity({
       else if (a > 1) a = 1;
       if (a < POINT_VISIBILITY_THRESHOLD) continue;
 
-      const ix = i * 3;
+      const ix = i * dimension;
       const x = positions[ix];
-      const y = positions[ix + 1];
-      const z = positions[ix + 2];
+      const y = dimension > 1 ? positions[ix + 1] : 0;
+      const z = dimension > 2 ? positions[ix + 2] : 0;
       const clipX =
         mvp[0] * x + mvp[4] * y + mvp[8] * z + mvp[12];
       const clipY =
@@ -585,10 +595,10 @@ export function reducePointsByDensity({
     else if (a > 1) a = 1;
     if (a < POINT_VISIBILITY_THRESHOLD) continue;
 
-    const ix = i * 3;
+    const ix = i * dimension;
     const x = positions[ix];
-    const y = positions[ix + 1];
-    const z = positions[ix + 2];
+    const y = dimension > 1 ? positions[ix + 1] : 0;
+    const z = dimension > 2 ? positions[ix + 2] : 0;
 
     const clipX = mvp[0] * x + mvp[4] * y + mvp[8] * z + mvp[12];
     const clipY = mvp[1] * x + mvp[5] * y + mvp[9] * z + mvp[13];
@@ -685,10 +695,10 @@ export function reducePointsByDensity({
       else if (a > 1) a = 1;
       if (a < POINT_VISIBILITY_THRESHOLD) continue;
 
-      const ix = i * 3;
+      const ix = i * dimension;
       const x = positions[ix];
-      const y = positions[ix + 1];
-      const z = positions[ix + 2];
+      const y = dimension > 1 ? positions[ix + 1] : 0;
+      const z = dimension > 2 ? positions[ix + 2] : 0;
       const clipX =
         mvp[0] * x + mvp[4] * y + mvp[8] * z + mvp[12];
       const clipY =

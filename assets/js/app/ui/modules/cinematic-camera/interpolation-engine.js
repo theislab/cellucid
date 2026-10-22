@@ -141,7 +141,10 @@ function catmullRomPositiveScalar(p0, p1, p2, p3, t, label) {
 
 /** Catmull-Rom for an angle — unwrap neighbours before spline evaluation. */
 function catmullRomAngle(p0, p1, p2, p3, t) {
-  // Unwrap all angles relative to p1 so the spline doesn't jump
+  // Unwrap each neighbour against its adjacent, already unwrapped control
+  // point, so every hop takes the shortest way round. Unwrapping p3 against
+  // p1 instead folds any p1→p3 span of half a turn or more the short way,
+  // and the spline then overshoots each keyframe and backs up.
   const unwrap = (base, val) => {
     let d = val - base;
     d -= Math.round(d / (2 * Math.PI)) * 2 * Math.PI;
@@ -149,7 +152,7 @@ function catmullRomAngle(p0, p1, p2, p3, t) {
   };
   const u0 = unwrap(p1, p0);
   const u2 = unwrap(p1, p2);
-  const u3 = unwrap(p1, p3);
+  const u3 = unwrap(u2, p3);
   return catmullRomScalar(u0, p1, u2, u3, t);
 }
 

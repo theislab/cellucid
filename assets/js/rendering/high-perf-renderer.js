@@ -4,7 +4,10 @@
  * Optimized for 20-30+ million points using:
  *
  * 1. WebGL2 with VAOs and GLSL ES 3.0
- * 2. Interleaved vertex buffers (better GPU cache coherency)
+ * 2. Split vertex streams: Float32 positions (only the embedding's own
+ *    components: x, xy or xyz) and RGBA8 live in separate buffers, so a
+ *    recolor uploads 4 bytes a point and a position switch 4 per embedding
+ *    axis, each straight from the published typed array
  * 3. Level-of-Detail (LOD) with octree spatial indexing
  * 4. Frustum culling - only render visible points
  * 5. GPU-only fog (no CPU distance calculations)
@@ -12,11 +15,15 @@
  */
 
 import {
-  HP_VS_FULL, HP_FS_FULL,
-  HP_VS_LIGHT, HP_FS_LIGHT, HP_FS_ULTRALIGHT
+  HP_VS_FULL, HP_FS_FULL, HP_FS_FULL_NO_DEPTH,
+  HP_VS_LIGHT, HP_FS_LIGHT, HP_FS_LIGHT_NO_DEPTH, HP_FS_ULTRALIGHT,
+  HP_FS_SCULPTED, HP_FS_SCULPTED_NO_DEPTH,
+  NO_DEPTH_MAX_DIMENSION,
+  writePointShaderFrame
 } from './shaders/high-perf-shaders.js';
+import { writeFogUniforms } from './shaders/fog-shaders.js';
 import { getNotificationCenter } from '../app/notification-center.js';
-import { configureStraightAlphaBlending } from './gl-utils.js';
+import { configureStraightAlphaBlending, drawPointsInSegments } from './gl-utils.js';
 import {
   requireDimensionLevel,
   requireFiniteNumber,
@@ -33,17 +40,31 @@ import {
   settleCalculationNotification,
 } from './high-perf/calculation-notifications.js';
 import {
-  EMPTY_LOD_PROJECTION,
-  getReadOnlyLodProjection,
-  getReadOnlySpatialProjection,
-} from './high-perf/read-only-projections.js';
-import {
   CONTEXT_LOST_ERROR_NAME,
+  contextLostError,
   requireCleanWebGLState,
+  requireLiveContext,
+} from './gl-errors.js';
+import {
+  enterOpaquePointBlending,
   restorePointDrawBaseline,
   settlePointDraw,
 } from './high-perf/gl-point-draw-state.js';
 import { SpatialIndex } from './high-perf/spatial-index.js';
+import { buildSpatialTreeJob } from './high-perf/spatial-tree-job.js';
+import { GpuPermuter } from './high-perf/gpu-permute.js';
+import {
+  allocateLinearTexture,
+  planLinearTextureFor,
+  setLinearLayoutUniform,
+  writeLinearTextureRows,
+} from './linear-texture.js';
+import {
+  bindPositionAttribute,
+  positionByteLength,
+  readPositionBounds,
+  requirePositionArray,
+} from './position-layout.js';
 
 // ============================================================================
 // CONSTANTS
@@ -54,7 +75,64 @@ import { SpatialIndex } from './high-perf/spatial-index.js';
  * For 2D data (dimensionLevel <= this value), depth testing is disabled
  * to prevent draw-order artifacts when all points have the same Z.
  */
-const DEPTH_TEST_DIMENSION_THRESHOLD = 2;
+/**
+ * Positions sent to the tree worker per message, in floats (64 MiB). A
+ * geometry of any size goes to the worker in slices like this, one task
+ * each, so no main-thread task copies more than this and the main thread
+ * never holds a second full copy.
+ */
+const WORKER_POSITION_SLICE_FLOATS = 16 * 1024 * 1024;
+const DEPTH_TEST_DIMENSION_THRESHOLD = NO_DEPTH_MAX_DIMENSION;
+
+/**
+ * Every point program the renderer links, keyed by name. Each shader quality
+ * has one; a quality listed in `NO_DEPTH_POINT_PROGRAMS` has a second for the
+ * passes that run without depth.
+ */
+const POINT_PROGRAM_NAMES = Object.freeze([
+  'full',
+  'fullNoDepth',
+  'light',
+  'lightNoDepth',
+  'ultralight',
+  'sculpted',
+  'sculptedNoDepth',
+]);
+
+/**
+ * Programs whose points are opaque and draw without blending, so that their
+ * antialiased edge can become a multisample coverage mask with depth on (see
+ * HP_FS_SCULPTED and `enterOpaquePointBlending`).
+ */
+const OPAQUE_POINT_PROGRAMS = Object.freeze(new Set(['sculpted']));
+
+/**
+ * The program a quality draws with when the pass does not use the depth
+ * buffer (dimension level <= DEPTH_TEST_DIMENSION_THRESHOLD). A quality whose
+ * fragment shader discards has one: the no-depth variant replaces each discard
+ * with a zero-alpha fragment that blends to an identical pixel without
+ * serialising the blend (see HP_FS_LIGHT_NO_DEPTH). `full` gained nothing from
+ * this while it evaluated fog per fragment, because that was what bound its
+ * dense 2-D frame; with fog evaluated per point it is bound by the same
+ * serialisation as `light`. `ultralight` never discards.
+ */
+const NO_DEPTH_POINT_PROGRAMS = Object.freeze({
+  full: 'fullNoDepth',
+  light: 'lightNoDepth',
+  sculpted: 'sculptedNoDepth',
+});
+
+function createEmptyPointPrograms() {
+  return {
+    full: null,
+    fullNoDepth: null,
+    light: null,
+    lightNoDepth: null,
+    ultralight: null,
+    sculpted: null,
+    sculptedNoDepth: null,
+  };
+}
 
 /**
  * Debug flag for LOD and frustum culling logs.
@@ -77,46 +155,96 @@ const VISIBLE_INDEX_MIN_RECLAIM = 256 * 1024;
  * most the bytes a full upload always cost.
  */
 const MAX_ALPHA_UPLOAD_REGIONS = 32;
+
 /**
- * Points packed per full-detail interleaved upload chunk.
+ * The row regions of an alpha texture that moved: one region per maximal run
+ * of rows marked in `dirtyRows`, written into `regions` as (first row, row
+ * count) pairs. Past `MAX_ALPHA_UPLOAD_REGIONS` the runs collapse into the
+ * one range that bounds them.
  *
- * The full-detail vertex store is sized on the GPU and then filled through this
- * one fixed staging block, so the renderer never holds a client-side duplicate
- * of the vertex buffer. The duplicate it replaces was a single `ArrayBuffer` of
- * `pointCount * 16` bytes retained for the dataset's lifetime -- 16 bytes a
- * point of resident memory that the GPU already held.
- *
- * This does not raise the largest publishable point count. The GPU vertex store
- * is 16 bytes a point as well, and its own cap was then measured directly on
- * all three engines by bisecting to the exact refusing byte count -- the
- * `ARRAY_BUFFER` term, not a JS `ArrayBuffer` standing in for it:
- *
- *   Chromium  vertex store 2,145,386,496 B (= 2^31 - 2^21, the same cap its JS
- *             `ArrayBuffer` allocator refuses one byte past) -> 134,086,656 pts
- *   WebKit    vertex store 4,294,967,295 B (2^32 - 1; 2^32 is INVALID_VALUE)
- *             -> 268,435,455 pts, one below its 16384^2 texture capacity
- *   Firefox   vertex store 2,147,483,647 B (2^31 - 1; 2^31 is OUT_OF_MEMORY)
- *             -> 134,217,727 pts, but its MAX_TEXTURE_SIZE is 8192, so the
- *             alpha texture binds first at 67,108,864 pts
- *
- * So the vertex store binds on Chromium and WebKit and the alpha texture binds
- * on Firefox, and removing the client-side duplicate moves none of them. What
- * it buys is the memory needed to reach those counts, which is what decides
- * whether a large dataset loads at all. Those are engine and API caps; the
- * host's own memory is a separate and much lower practical bound.
- *
- * 65,536 points is 1 MiB: large enough that the per-chunk call overhead is one
- * `bufferSubData` per 65,536 points, small enough that the block never scales
- * with the dataset. Chunking is sound because every full-detail writer fills
- * its destination strictly sequentially -- only the source index is arbitrary.
+ * @param {Uint8Array} dirtyRows - 1 for a row that moved, one entry a row
+ * @param {number} height - rows
+ * @param {Int32Array} regions - at least `2 * height` entries
+ * @returns {number} regions written
  */
-const INTERLEAVED_CHUNK_POINTS = 65_536;
-// Renderer-created LOD projections receive a private readiness certificate
-// only after the complete deep CPU/GPU ownership validation succeeds. The
-// WeakMap cannot be forged by caller-provided fixtures and lets the render hot
-// path prove an unchanged accepted generation with constant-time identity
-// checks. Direct/external ensure calls retain the full structural validation.
-const LOD_RESOURCE_READINESS_CERTIFICATES = new WeakMap();
+function collectAlphaUploadRegions(dirtyRows, height, regions) {
+  let regionCount = 0;
+  let runStart = -1;
+  for (let y = 0; y < height; y++) {
+    if (dirtyRows[y] === 1) {
+      if (runStart === -1) runStart = y;
+      continue;
+    }
+    if (runStart !== -1) {
+      regions[regionCount * 2] = runStart;
+      regions[regionCount * 2 + 1] = y - runStart;
+      regionCount++;
+      runStart = -1;
+    }
+  }
+  if (runStart !== -1) {
+    regions[regionCount * 2] = runStart;
+    regions[regionCount * 2 + 1] = height - runStart;
+    regionCount++;
+  }
+  if (regionCount > MAX_ALPHA_UPLOAD_REGIONS) {
+    const firstRow = regions[0];
+    const lastRowEnd =
+      regions[(regionCount - 1) * 2] + regions[(regionCount - 1) * 2 + 1];
+    regions[0] = firstRow;
+    regions[1] = lastRowEnd - firstRow;
+    regionCount = 1;
+  }
+  return regionCount;
+}
+/*
+ * Point streams.
+ *
+ * A store in source order is the published Float32 position array
+ * (`dimension` components a point, never padded to three) and the published
+ * RGBA8 colour array, each handed to `bufferData` / `bufferSubData` as-is, so
+ * the renderer never holds a client-side copy of either. A store in a tree's
+ * draw order -- slot `k` holds point `indices[k]` -- is gathered on the GPU
+ * (`GpuPermuter`), so no client allocation proportional to the point count
+ * exists for it either.
+ *
+ * The two streams are also what makes a recolor cheap. Position and color
+ * used to share one 16-byte record, so every color change repacked and
+ * re-uploaded the positions beside it; now a recolor writes only the 4-byte
+ * color stores and a dimension switch only the position stores (4 bytes per
+ * embedding axis a point: 4, 8 or 12).
+ * Splitting costs no vertex throughput: measured on Chromium/Metal with 5M
+ * points, the split full-detail draw was within noise of the interleaved one.
+ *
+ * WebGL's per-buffer caps are byte caps. They were measured on all three
+ * engines by bisecting to the exact refusing byte count -- Chromium 2^31 - 2^21,
+ * WebKit 2^32 - 1, Firefox 2^31 - 1 -- and the largest store is the position
+ * stream, 12 bytes a point for a 3-D embedding: 178,782,208 points on
+ * Chromium, 178,956,970 on Firefox, 357,913,941 on WebKit. Per-point textures
+ * (alpha, permutation, the permute source) are linear textures
+ * (`linear-texture.js`): layers of `MAX_TEXTURE_SIZE` rows, so they bind no
+ * lower than the position stream on any engine, including those that report
+ * an 8192 texture size (Firefox). Every point draw is split into calls of at
+ * most 2^24 vertices (`drawPointsInSegments`), under Firefox's 30,000,000
+ * vertices a call. Those are engine and API caps; the host's own memory is a
+ * separate and much lower practical bound.
+ */
+/**
+ * Most draw ranges one frustum-culled draw issues where each range is its
+ * own `drawArrays` (engines without `WEBGL_multi_draw`: Firefox). Ranges are
+ * coarsened to fit by bridging the gaps that hide the fewest points: drawing
+ * a few points outside the frustum costs less than another draw call. At 10M
+ * points, 252 coarsened ranges drew a zoomed view in 7 ms on all three
+ * engines, against 21-31 ms for the per-point index path they replace.
+ */
+const MAX_CULLED_DRAW_RANGES = 256;
+/**
+ * The range budget where one `multiDrawArraysWEBGL` call draws them all: a
+ * range costs about 0.2 us there, so a finer cut draws fewer hidden points.
+ */
+const MAX_CULLED_DRAW_RANGES_MULTI_DRAW = 1024;
+/** The live geometry's store, as `_ensureStoreDrawOrder` names a store. */
+const LIVE_STORE = Object.freeze({ kind: 'live' });
 
 
 
@@ -136,7 +264,10 @@ const LOD_RESOURCE_READINESS_CERTIFICATES = new WeakMap();
  * transient term is the scratch that is live simultaneously during the build
  * and enumerable from the code: three `Uint32Array(pointCount)` in the
  * hierarchical ordering pass (12 B), the leaves and the geometric child chain
- * `_buildNode` holds (~8.6 B), and the shared packing scratch (16 B).
+ * `_buildNode` holds (~8.6 B), and 16 B that at calibration time was a
+ * point-count-sized packing scratch. Stores are now gathered on the GPU, so
+ * that scratch no longer exists; the 16 B stays in the projection as margin
+ * until the 40M Chromium hang is measured again.
  *
  * A build that fits its settled size but not its peak is the worst outcome
  * available: the engine neither completes nor throws, it collects a multi-GiB
@@ -183,6 +314,15 @@ function describeHeapMebibytes(bytes) {
  * @param {boolean} buildLOD Whether this build produces LOD levels.
  * @param {string} label Owner named in the refusal.
  */
+/**
+ * Whether a spatial index has its LOD levels.
+ * @param {SpatialIndex|null|undefined} index
+ * @returns {boolean}
+ */
+function spatialIndexHasLod(index) {
+  return Array.isArray(index?.lodLevels) && index.lodLevels.length > 0;
+}
+
 function requireLodBuildHeapHeadroom(pointCount, buildLOD, label) {
   if (buildLOD !== true) return;
   if (!Number.isFinite(pointCount) || pointCount <= 0) return;
@@ -226,6 +366,81 @@ function requireLodBuildHeapHeadroom(pointCount, buildLOD, label) {
   );
 }
 
+/**
+ * Refuse an RGBA8 array that does not start on a 4-byte boundary.
+ *
+ * Colors go to the GPU as one 32-bit word each (the R32UI source texture the
+ * draw-order gather reads), which needs a Uint32 view over the published
+ * bytes. Every array the application publishes is its own allocation and so
+ * starts at offset 0; a subarray at an odd offset is the only way to fail this.
+ *
+ * @param {Uint8Array} colors
+ */
+function requireWordAlignedColors(colors) {
+  if (colors.byteOffset % 4 !== 0) {
+    throw new TypeError(
+      `HighPerfRenderer colors must start on a 4-byte boundary of their buffer; received byte offset ${colors.byteOffset}.`
+    );
+  }
+}
+
+/**
+ * A colour store is written in a draw order only when that order places
+ * every point: one slot a colour.
+ *
+ * @param {{drawOrder: {indices: Uint32Array}}|null} order
+ * @param {Uint8Array} colors
+ * @param {string} owner
+ */
+function requireOrderCoversColors(order, colors, owner) {
+  if (order === null) return;
+  const slots = order.drawOrder.indices.length;
+  const count = colors.length >>> 2;
+  if (slots !== count) {
+    throw new RangeError(`${owner} has a draw order of ${slots} slots for ${count} colours.`);
+  }
+}
+
+/**
+ * One Uint32 word per RGBA8 color, aliasing the published bytes. Byte order is
+ * irrelevant because words are only ever copied.
+ *
+ * @param {Uint8Array} colors - Word-aligned RGBA8 colors.
+ * @returns {Uint32Array}
+ */
+function colorWordsOf(colors) {
+  requireWordAlignedColors(colors);
+  return new Uint32Array(
+    colors.buffer,
+    colors.byteOffset,
+    colors.length >>> 2
+  );
+}
+
+/**
+ * One view's frustum-cull state: the leaf runs inside the frustum (pairs of
+ * `[leafStart, leafEnd)`), the draw ranges they make for one band limit, and
+ * the tree and draw order they were computed for. Scratch arrays grow and are
+ * reused; nothing here is per point.
+ *
+ * @returns {object}
+ */
+function createCullState() {
+  return {
+    tree: null,
+    drawOrder: null,
+    runs: new Uint32Array(256),
+    runCount: 0,
+    gaps: new Uint32Array(0),
+    stack: [],
+    band: -1,
+    starts: new Int32Array(MAX_CULLED_DRAW_RANGES),
+    counts: new Int32Array(MAX_CULLED_DRAW_RANGES),
+    rangeCount: 0,
+    elementCount: 0,
+  };
+}
+
 // ============================================================================
 // HIGH PERFORMANCE RENDERER (WebGL2 Only)
 // ============================================================================
@@ -238,9 +453,9 @@ export const RendererConfig = {
   QUALITY_ULTRALIGHT: 'ultralight',
   QUALITY_LIGHT: 'light',
   QUALITY_FULL: 'full',
+  QUALITY_SCULPTED: 'sculpted',
 
   // Feature flags
-  USE_INTERLEAVED_BUFFERS: true,
   USE_LOD: false,
   USE_FRUSTUM_CULLING: false,
 
@@ -257,9 +472,9 @@ export class HighPerfRendererContextLostError extends Error {
     super(
       `HighPerfRenderer cannot ${operation} after its WebGL context was lost.`
     );
-    // The shared marker, so this class and the GL-error preflight that cannot
-    // import it stay one recognisable condition. `isContextLostError()` beside
-    // it is what the frame loop tests against.
+    // The shared marker from `gl-errors.js`, so this fence and every GL-error
+    // preflight raise one recognisable condition; `isContextLostError()` there
+    // is what the frame loop tests against.
     this.name = CONTEXT_LOST_ERROR_NAME;
   }
 }
@@ -279,11 +494,7 @@ export class HighPerfRenderer {
     console.log('[HighPerfRenderer] Using WebGL2');
 
     // Shader programs
-    this.programs = {
-      full: null,
-      light: null,
-      ultralight: null
-    };
+    this.programs = createEmptyPointPrograms();
 
     // Current active program
     this.activeProgram = null;
@@ -292,23 +503,25 @@ export class HighPerfRenderer {
     // Uniform locations cache
     this.uniformLocations = new Map();
 
-    // Data buffers
+    // Full-detail vertex streams: Float32 positions with the live dimension's
+    // components (attribute 0) and RGBA8 (attribute 1), one buffer each,
+    // bound into `this.vao`.
     this.buffers = {
-      interleaved: null,
       positions: null,
       colors: null,
-      alphas: null,
     };
-    // Exact logical store size accepted by WebGL for the live interleaved
-    // buffer. Keep this separate from pointCount: failed replacements retain
-    // their previous allocation even after semantic draw state is invalidated.
-    this._interleavedGpuByteLength = 0;
+    // Exact logical store sizes accepted by WebGL for the two live streams.
+    // Keep these separate from pointCount: failed replacements retain their
+    // previous allocation even after semantic draw state is invalidated.
+    this._positionGpuByteLength = 0;
+    this._colorGpuByteLength = 0;
 
     // Alpha texture for efficient alpha-only updates (avoids full buffer rebuild)
     // Using a texture allows updating alpha with texSubImage2D instead of bufferData
     this._alphaTexture = null;
     this._alphaTexWidth = 0;
     this._alphaTexHeight = 0;
+    this._alphaTexPlan = null;
     this._alphaTexData = null; // Uint8Array for texture upload
     this._alphaTexStagingData = null;
     // Scratch for the region-addressed alpha upload: one dirty flag per texture
@@ -321,22 +534,34 @@ export class HighPerfRenderer {
     this._currentAlphas = null;
     this._alphaTextureByteLength = 0;
 
-    // LOD index textures for alpha lookup (maps LOD vertex index to original index)
-    // Dimension-aware: Map<dimensionLevel, Array<{texture, width, height}>>
-    this._lodIndexTexturesByDimension = new Map();
-    // Metadata arrays above and lodBuffersByDimension are non-owning draw
-    // views. This map is the sole owner of each dimension's compact prefix
-    // generation and its shared original-ID topology.
-    this._lodResourceOwnersByDimension = new Map();
+    // The draw order the live position store holds (see "DRAW ORDER"):
+    // null while it holds source order, else `{ drawOrder, texture, width,
+    // height, byteLength }`, the texture mapping a stored slot back to its
+    // source index. `_liveColorOrder` is the draw order the live colour store
+    // holds; it follows `_liveOrder` at the next render.
+    this._liveOrder = null;
+    this._liveColorOrder = null;
+    // Live colour stores kept per draw order (see "COLOUR STORES KEPT PER
+    // DRAW ORDER").
+    this._liveColorCache = new Map();
+    // `WEBGL_multi_draw`, looked up once (undefined until then).
+    this._multiDraw = undefined;
 
-    // Dummy 1x1 R32UI texture for when LOD index texture is not used
-    // Required because usampler2D uniforms must have a valid unsigned int texture bound
+    // Dummy 1x1 R32UI texture bound while no draw order is: usampler2D
+    // uniforms must have a valid unsigned int texture bound.
     this._dummyLodIndexTexture = null;
     this._dummyLodIndexTextureByteLength = 0;
+    // Gathers stores into a draw order on the GPU (created on first use).
+    this._permuter = null;
+    // Called when a tree built off the main thread is installed, so the
+    // embedder draws a frame (the viewer invalidates its frame).
+    this.onAsyncTreeReady = null;
+    // Tree builds in flight and failed, per positions array.
+    this._treeBuilds = new WeakMap();
+    this._treeBuildFailures = new WeakMap();
 
     // LOD system - dimension-aware spatial indexing
     this.spatialIndices = new Map();  // Per-dimension spatial indices: Map<dimensionLevel, SpatialIndex>
-    this.lodBuffersByDimension = new Map();  // Per-dimension LOD buffers: Map<dimensionLevel, lodBuffers[]>
     this.currentDimensionLevel = 3;  // Current active dimension level for live view
 
     // State
@@ -344,35 +569,47 @@ export class HighPerfRenderer {
     this.forceLODLevel = -1; // -1 = auto, 0+ = forced level
     this.useAdaptiveLOD = this.options.USE_LOD;
     this.useFrustumCulling = this.options.USE_FRUSTUM_CULLING;
-    this.useInterleavedBuffers = this.options.USE_INTERLEAVED_BUFFERS;
 
     // VAO for WebGL2
     this.vao = null;
 
     // Snapshot buffers for multi-view rendering (avoids re-uploading per frame).
-    // Each snapshot owns one RGB VBO plus one R8 alpha texture while its
+    // Each snapshot owns one RGBA8 colour VBO plus one R8 alpha texture while its
     // geometry generation owns the immutable position VBO shared by every
     // same-generation VAO. `buffer` remains a compatibility alias for the
     // snapshot color owner's buffer.
     // Map<snapshotId, { vao, colorOwner, alphaTexture, pointCount, ... }>
     this.snapshotBuffers = new Map();
-    // Snapshot point publications are synchronous. One renderer-wide staging
-    // owner therefore serves every view without retaining another 3N+N bytes
-    // per snapshot at the 30M-point scale.
-    this._snapshotColorStagingData = null;
+    // Snapshot point publications are synchronous. One renderer-wide R8
+    // staging owner therefore serves every view without retaining another N
+    // bytes per snapshot.
     this._snapshotAlphaStagingData = null;
+    this._snapshotAlphaDirtyRows = null;
+    this._snapshotAlphaUploadRegions = null;
+    // The views the viewer presents this frame (`setPresentedViews`); null
+    // until it says, which keeps every view resident. A kept view that is not
+    // presented gives up its colour store and R8 texture when an allocation
+    // is refused (`_releaseDormantSnapshotStores`) and gets them back from
+    // its own colours and alpha bytes when it is next drawn or edited.
+    this._presentedViewIds = null;
+    // The kept view a public operation is working on: never released under it.
+    this._snapshotInOperation = null;
     // Geometry identity is an explicit publication generation, never an array
-    // identity. Callers are allowed to mutate and republish the same typed
-    // array, so reference equality cannot prove that two GPU publications own
-    // the same coordinates.
+    // identity: one published array can be published again as a new
+    // generation (a view switched back to a dimension it showed before), and
+    // each publication owns its own GPU store and spatial generation.
     this._liveGeometryGeneration = 0;
     this._nextGeometryGeneration = 1;
-    // Snapshot CPU coordinates and GPU positions are immutable renderer-owned
-    // publications. Snapshots derived from one geometry generation share
-    // exactly one CPU copy and one 12-byte-per-point position VBO.
+    // A published positions array is the geometry it describes: nothing
+    // writes it after publication (a changed embedding is a new array), so a
+    // snapshot adopts the array it is given instead of copying it. Snapshots
+    // derived from one geometry generation share that one array and one
+    // position VBO; snapshots of the live generation borrow the live
+    // publication's own VBO (`borrowsLivePositionBuffer`), which passes to the
+    // pool when the live publication retires.
     // Map<generation, {
     //   generation, positions, positionBuffer, positionBufferByteLength,
-    //   refCount, spatialIndices
+    //   borrowsLivePositionBuffer, refCount, spatialIndices
     // }>
     this._snapshotGeometryPools = new Map();
     // Detached snapshot generations and data publications remain explicitly
@@ -390,7 +627,6 @@ export class HighPerfRenderer {
     // Collaborators that allocate GPU storage against this context but own
     // their own handles, so `stats.gpuMemoryMB` can describe the whole context.
     this._gpuAllocationReporters = new Set();
-    this._validatedLodNodeMappings = new WeakMap();
     this._validatedSpatialIndices = new WeakSet();
     // Lightweight semantic tokens let observers detect a replaced LOD
     // spatial owner without forcing the lazy point-count membership table to
@@ -413,6 +649,15 @@ export class HighPerfRenderer {
       cullPercent: 0,
     };
 
+    // Per-draw products the point shaders read (see writePointShaderFrame),
+    // and whether the current pass draws into a multisampled target.
+    this._pointShaderFrame = {
+      modelView: new Float32Array(16),
+      halfDir: new Float32Array(3),
+      invCenterShade: 1,
+    };
+    this._pointPassMultisampled = false;
+
     // Fog bounds
     this.fogNear = 0;
     this.fogFar = 10;
@@ -420,24 +665,10 @@ export class HighPerfRenderer {
     // Cached bounding sphere (computed from positions, independent of octree)
     this._boundingSphere = null;
 
-    // Dirty flags for lazy buffer rebuilds (avoids double rebuilds)
-    this._bufferDirty = false;
-    this._dirtyLodDimensions = new Set();
-    // Point-count-sized packing owner for the compact LOD generations, which
-    // must reach the GPU as one transactional whole-store upload. Null on the
-    // shipped default path, where neither LOD nor frustum culling is enabled.
-    this._interleavedArrayBuffer = null;
-    this._interleavedPositionView = null;
-    this._interleavedColorView = null;
-    // Fixed staging block for the full-detail interleaved store. Its size is a
-    // constant, never a function of pointCount.
-    this._interleavedChunkBuffer = null;
-    this._interleavedChunkPositionView = null;
-    this._interleavedChunkColorView = null;
-
-    // Pooled visible indices buffer for frustum culling (grows as needed)
-    this._visibleIndicesBuffer = null;
-    this._visibleIndicesCapacity = 0;
+    // Deferred color publication: `updateColors` marks the live color
+    // stream dirty, and the next render uploads it once, however many
+    // recolors arrived in between.
+    this._colorsDirty = false;
 
     // Per-view state for multi-view rendering (frustum culling and LOD)
     // Each view needs its own cache to avoid cross-view interference
@@ -487,11 +718,7 @@ export class HighPerfRenderer {
       // state failure cannot strand the earlier programs/dummy texture.
       const programs = Object.values(this.programs ?? {});
       this._markProgramUnbindIfOwned(programs);
-      this.programs = {
-        full: null,
-        light: null,
-        ultralight: null,
-      };
+      this.programs = createEmptyPointPrograms();
       this.activeProgram = null;
       this.uniformLocations.clear();
 
@@ -555,50 +782,25 @@ export class HighPerfRenderer {
   }
 
   /**
-   * Get or create per-view state for multi-view rendering.
-   * Each view maintains its own frustum cache, LOD state, index buffer, AND frustum planes to avoid cross-view interference.
+   * Get or create per-view state for multi-view rendering. Each view keeps
+   * its own frustum key and planes, cull ranges, LOD hysteresis and stats, so
+   * views never disturb one another. It holds no GPU object.
    * @param {string} viewId - Exact view identifier.
-   * @returns {Object} Per-view state object with lastFrustumMVP, cachedCulledCount, prevLodLevel, indexBuffer, frustumPlanes
+   * @returns {Object} Per-view state.
    */
   _getViewState(viewId) {
     const vid = requireViewId(viewId);
     if (!this._perViewState.has(vid)) {
-      // Create per-view index buffer for frustum culling
-      const gl = this.gl;
-      const indexBuffer = gl.createBuffer();
-      if (!indexBuffer) {
-        throw new Error(
-          `HighPerfRenderer could not allocate the per-view index buffer for "${vid}".`
-        );
-      }
       this._perViewState.set(vid, {
         lastFrustumMVP: null,
         lastFrustumBounds: undefined,
-        cachedCulledCount: 0,
-        cachedVisibleIndices: null,
-        cachedLodVisibleIndices: null,  // For LOD + frustum culling combined
-        cachedLodLevel: -1,              // LOD level for which indices were cached
-        cachedLodDimension: -1,          // Dimension level for which LOD indices were cached
-        cachedLodIsCulled: false,        // Whether cached indices are frustum-culled (vs full LOD)
-        cachedVisibleNodes: [],          // Accepted ordered octree leaves for the current EBO
-        visibleNodesScratch: [],         // Per-view candidate leaves; swapped with cachedVisibleNodes on acceptance
-        visibleNodesSpare: null,         // Recovery-only second pool owner while semantic state is invalid
-        cachedVisibleSpatialOwner: null, // Exact tree that owns cachedVisibleNodes
-        cachedVisibleSpatialRoot: null,  // Exact immutable root traversed for cachedVisibleNodes
-        cachedLodMappingGeneration: null,// Exact leaf/rank mapping used by the cached LOD EBO
+        // The leaf runs inside the frustum and the draw ranges they make for
+        // one band limit, for one tree and its draw order.
+        cull: createCullState(),
         prevLodLevel: undefined,         // For logging LOD changes
         lastLodLevel: -1,                // For per-view LOD hysteresis
-        lastVisibleCount: undefined,     // For logging visible count changes
+        lodConverging: false,            // Adaptive LOD still stepping toward its target level
         lastDimensionLevel: undefined,   // For cache invalidation on dimension change
-        indexBuffer: indexBuffer,        // Per-view index buffer (avoids shared buffer conflicts)
-        indexBufferSize: 0,              // Current size of uploaded index buffer
-        indexBufferByteLength: 0,        // Last WebGL-accepted backing-store size
-        indexBufferVerifiedByteLength: 0,// Largest store size WebGL was asked to verify for this EBO
-        // Pre-cached index buffer support (eliminates upload on LOD level change)
-        usePreCachedIndexBuffer: false,  // Whether to use pre-cached buffer vs per-view buffer
-        preCachedIndexBuffer: null,      // Reference to pre-cached buffer from lodBuffers
-        preCachedGenerationToken: null,
-        preCachedSpatialOwner: null,
         // Per-view frustum planes to avoid shared state issues in multi-view rendering
         frustumPlanes: [
           new Float32Array(4), new Float32Array(4), new Float32Array(4),
@@ -610,11 +812,6 @@ export class HighPerfRenderer {
           new Float32Array(4), new Float32Array(4), new Float32Array(4),
           new Float32Array(4), new Float32Array(4), new Float32Array(4)
         ],
-        // Per-view visible indices buffer pool (avoids shared buffer issues in multi-view rendering)
-        visibleIndicesBuffer: null,
-        visibleIndicesCapacity: 0,
-        visibleLodIndicesBuffer: null,
-        visibleLodIndicesCapacity: 0,
         // Per-view stats (avoids stats being overwritten by last rendered view in multiview)
         stats: {
           lastFrameTime: 0,
@@ -632,67 +829,21 @@ export class HighPerfRenderer {
   }
 
   _invalidateViewStateRecord(viewState) {
-    // Retain both leaf-array owners across an invalidation. The accepted array
-    // is no longer semantically usable, but dropping it would force a fresh
-    // allocation after every filter, geometry, or failed-upload retry.
-    const acceptedVisibleNodes =
-      Array.isArray(viewState.cachedVisibleNodes)
-        ? viewState.cachedVisibleNodes
-        : null;
-    const visibleNodesScratch =
-      Array.isArray(viewState.visibleNodesScratch)
-        ? viewState.visibleNodesScratch
-        : null;
-    const visibleNodesSpare =
-      Array.isArray(viewState.visibleNodesSpare)
-        ? viewState.visibleNodesSpare
-        : null;
-    const primaryVisibleNodes =
-      visibleNodesScratch ??
-      acceptedVisibleNodes ??
-      visibleNodesSpare;
-    const secondaryVisibleNodes =
-      acceptedVisibleNodes !== null &&
-      acceptedVisibleNodes !== primaryVisibleNodes
-        ? acceptedVisibleNodes
-        : (
-            visibleNodesSpare !== null &&
-            visibleNodesSpare !== primaryVisibleNodes
-              ? visibleNodesSpare
-              : null
-          );
-    if (primaryVisibleNodes) {
-      primaryVisibleNodes.length = 0;
-    }
-    if (secondaryVisibleNodes) {
-      secondaryVisibleNodes.length = 0;
-    }
-    viewState.visibleNodesScratch =
-      primaryVisibleNodes ?? [];
-    viewState.visibleNodesSpare =
-      secondaryVisibleNodes;
+    // The cull scratch is kept for reuse; only its keys are dropped.
+    const cull = viewState.cull ?? createCullState();
+    cull.tree = null;
+    cull.drawOrder = null;
+    cull.runCount = 0;
+    cull.band = -1;
+    cull.rangeCount = 0;
+    cull.elementCount = 0;
+    viewState.cull = cull;
     viewState.lastFrustumMVP = null;
     viewState.lastFrustumBounds = undefined;
-    viewState.cachedCulledCount = 0;
-    viewState.cachedVisibleIndices = null;
-    viewState.cachedLodVisibleIndices = null;
-    viewState.cachedLodLevel = -1;
-    viewState.cachedLodDimension = -1;
-    viewState.cachedLodIsCulled = false;
-    viewState.cachedVisibleNodes = null;
-    viewState.cachedVisibleSpatialOwner = null;
-    viewState.cachedVisibleSpatialRoot = null;
-    viewState.cachedLodMappingGeneration = null;
     viewState.lastDimensionLevel = undefined;
     viewState.lastLodLevel = -1;
+    viewState.lodConverging = false;
     viewState.prevLodLevel = undefined;
-    viewState.lastVisibleCount = undefined;
-    viewState.indexBufferSize = 0;
-    viewState.indexBufferVerifiedByteLength = 0;
-    viewState.usePreCachedIndexBuffer = false;
-    viewState.preCachedIndexBuffer = null;
-    viewState.preCachedGenerationToken = null;
-    viewState.preCachedSpatialOwner = null;
     viewState.statsPublished = false;
     if (viewState.stats) {
       viewState.stats.lastFrameTime = 0;
@@ -731,22 +882,8 @@ export class HighPerfRenderer {
   clearViewState(viewId) {
     this._assertOperational('clear view state');
     const vid = requireViewId(viewId, 'HighPerfRenderer clearViewState viewId');
-    const viewState = this._perViewState.get(vid);
-    if (viewState) {
-      // Detach semantic state before fallible cleanup. The retirement journal
-      // becomes the sole owner of the EBO until deletion or liveness proof.
-      this._perViewState.delete(vid);
-      this._queueDataRetirement({
-        perViewState: new Map([[vid, viewState]]),
-      });
-    }
-    const failures = this._drainDataRetirements();
-    if (failures.length > 0) {
-      throw new AggregateError(
-        failures,
-        `HighPerfRenderer view "${vid}" is detached but ${failures.length} resource retirement failure(s) remain pending.`
-      );
-    }
+    // Per-view state owns no GPU object, so forgetting it is the whole job.
+    this._perViewState.delete(vid);
   }
 
   /**
@@ -754,49 +891,31 @@ export class HighPerfRenderer {
    */
   clearAllViewState() {
     this._assertOperational('clear all view state');
-    const detached = new Map(this._perViewState);
-    // Detach all observers first so a deletion exception cannot leave a
-    // partially active multiview publication.
     this._perViewState.clear();
-    if (detached.size > 0) {
-      this._queueDataRetirement({ perViewState: detached });
-    }
-    const failures = this._drainDataRetirements();
-    if (failures.length > 0) {
-      throw new AggregateError(
-        failures,
-        `HighPerfRenderer detached all view state with ${failures.length} resource retirement failure(s) still pending.`
-      );
-    }
   }
 
   /**
    * Compute bounds from a positions array.
    * Used for view-specific positions that differ from octree bounds.
-   * @param {Float32Array} positions - XYZ positions (length = n * 3)
+   * @param {Float32Array} positions - `dimension` components per point
+   * @param {number} dimension - Components per point (1, 2 or 3); the axes
+   *   the embedding does not have are exactly zero.
    * @returns {Object} Bounds object { minX, maxX, minY, maxY, minZ, maxZ }
    */
-  static computeBoundsFromPositions(positions) {
-    if (
-      !(positions instanceof Float32Array) ||
-      positions.length < 3 ||
-      positions.length % 3 !== 0
-    ) {
-      throw new TypeError(
-        'HighPerfRenderer bounds require a non-empty Float32Array with exactly three values per point.'
-      );
-    }
-    let minX = positions[0], maxX = positions[0];
-    let minY = positions[1], maxY = positions[1];
-    let minZ = positions[2], maxZ = positions[2];
-
-    for (let i = 3; i < positions.length; i += 3) {
-      const x = positions[i], y = positions[i + 1], z = positions[i + 2];
-      if (x < minX) minX = x; else if (x > maxX) maxX = x;
-      if (y < minY) minY = y; else if (y > maxY) maxY = y;
-      if (z < minZ) minZ = z; else if (z > maxZ) maxZ = z;
-    }
-    return { minX, maxX, minY, maxY, minZ, maxZ };
+  static computeBoundsFromPositions(positions, dimension) {
+    requirePositionArray(
+      positions,
+      dimension,
+      'HighPerfRenderer bounds positions'
+    );
+    // Scanned once per published array (`readPositionBounds`); a fresh record
+    // for the caller to own.
+    const { min, max } = readPositionBounds(positions, dimension);
+    return {
+      minX: min[0], maxX: max[0],
+      minY: min[1], maxY: max[1],
+      minZ: min[2], maxZ: max[2]
+    };
   }
 
   _needsLodResources(forceLOD) {
@@ -896,10 +1015,9 @@ export class HighPerfRenderer {
         gl.PIXEL_UNPACK_BUFFER,
         previousPixelUnpackBuffer
       );
-      requireCleanWebGLState(
-        gl,
-        `${owner} unpack-state restoration`
-      );
+      // Setting pixel-store state and a binding cannot be refused; only a
+      // lost context ends the transaction here.
+      requireLiveContext(gl, `${owner} unpack-state restoration`);
     } catch (error) {
       restorationError = error;
     }
@@ -917,23 +1035,18 @@ export class HighPerfRenderer {
 
   _createPrograms() {
     console.log('[HighPerfRenderer] Creating WebGL2 shader programs');
-    const candidatePrograms = {
-      full: null,
-      light: null,
-      ultralight: null,
-    };
+    const candidatePrograms = createEmptyPointPrograms();
     const candidateUniformLocations = new Map();
     try {
-      candidatePrograms.full =
-        this._createProgram(HP_VS_FULL, HP_FS_FULL, 'full');
-      candidatePrograms.light =
-        this._createProgram(HP_VS_LIGHT, HP_FS_LIGHT, 'light');
-      candidatePrograms.ultralight =
-        this._createProgram(
-          HP_VS_LIGHT,
-          HP_FS_ULTRALIGHT,
-          'ultralight'
-        );
+      Object.assign(candidatePrograms, this._createPointPrograms([
+        ['full', HP_VS_FULL, HP_FS_FULL],
+        ['fullNoDepth', HP_VS_FULL, HP_FS_FULL_NO_DEPTH],
+        ['light', HP_VS_LIGHT, HP_FS_LIGHT],
+        ['lightNoDepth', HP_VS_LIGHT, HP_FS_LIGHT_NO_DEPTH],
+        ['ultralight', HP_VS_LIGHT, HP_FS_ULTRALIGHT],
+        ['sculpted', HP_VS_FULL, HP_FS_SCULPTED],
+        ['sculptedNoDepth', HP_VS_FULL, HP_FS_SCULPTED_NO_DEPTH],
+      ]));
 
       for (
         const [name, program] of
@@ -972,9 +1085,10 @@ export class HighPerfRenderer {
   }
 
   /**
-   * Create a dummy 1x1 R32UI texture to bind when LOD index texture is not in use.
-   * Required because usampler2D uniforms must have a valid unsigned integer texture bound,
-   * even when the shader doesn't use it (u_useLodIndexTex = false).
+   * Create a dummy one-texel R32UI linear texture to bind when no permutation
+   * is in use. Required because a usampler2DArray uniform must have a valid
+   * unsigned integer texture bound even when the shader does not read it
+   * (u_useLodIndexTex = false).
    * @private
    */
   _createDummyLodIndexTexture() {
@@ -994,19 +1108,17 @@ export class HighPerfRenderer {
     }
     let candidateByteLength = 0;
     try {
-      gl.bindTexture(gl.TEXTURE_2D, candidateTexture);
-
-      // Create 1x1 R32UI texture with a dummy value.
+      gl.bindTexture(gl.TEXTURE_2D_ARRAY, candidateTexture);
+      // One R32UI texel with a dummy value, as a linear texture like every
+      // permutation the point programs read.
       const dummyData = new Uint32Array([0]);
+      const plan = planLinearTextureFor(gl, 1);
       this._withNeutralTextureUnpackState(
         4,
         'HighPerfRenderer candidate dummy LOD texture',
         () => {
-          gl.texImage2D(
-            gl.TEXTURE_2D, 0, gl.R32UI,
-            1, 1, 0,
-            gl.RED_INTEGER, gl.UNSIGNED_INT, dummyData
-          );
+          allocateLinearTexture(gl, gl.R32UI, plan);
+          writeLinearTextureRows(gl, plan, gl.RED_INTEGER, gl.UNSIGNED_INT, dummyData, 1);
           requireCleanWebGLState(
             gl,
             'HighPerfRenderer candidate dummy LOD texture upload'
@@ -1014,36 +1126,14 @@ export class HighPerfRenderer {
         }
       );
       candidateByteLength = dummyData.byteLength;
-
-      // Set filtering to NEAREST (required for integer textures).
-      gl.texParameteri(
-        gl.TEXTURE_2D,
-        gl.TEXTURE_MIN_FILTER,
-        gl.NEAREST
-      );
-      gl.texParameteri(
-        gl.TEXTURE_2D,
-        gl.TEXTURE_MAG_FILTER,
-        gl.NEAREST
-      );
-      gl.texParameteri(
-        gl.TEXTURE_2D,
-        gl.TEXTURE_WRAP_S,
-        gl.CLAMP_TO_EDGE
-      );
-      gl.texParameteri(
-        gl.TEXTURE_2D,
-        gl.TEXTURE_WRAP_T,
-        gl.CLAMP_TO_EDGE
-      );
-      gl.bindTexture(gl.TEXTURE_2D, null);
+      gl.bindTexture(gl.TEXTURE_2D_ARRAY, null);
       requireCleanWebGLState(
         gl,
         'HighPerfRenderer dummy LOD texture publication'
       );
     } catch (error) {
       try {
-        gl.bindTexture(gl.TEXTURE_2D, null);
+        gl.bindTexture(gl.TEXTURE_2D_ARRAY, null);
       } catch {
         // The retirement journal below remains authoritative.
       }
@@ -1073,107 +1163,88 @@ export class HighPerfRenderer {
     this._refreshGpuMemoryStats();
   }
 
-  _createProgram(vsSource, fsSource, name) {
+  /**
+   * Compile and link every point program in one batch: each distinct shader
+   * source is compiled once (the full and light vertex shaders serve several
+   * programs), every program is linked before any status is read, and a
+   * status is read once per program at the end. Reading status after each
+   * step made the driver finish every compile and link one after another
+   * (14 compiles, 7 links, 21 waits); batched, the driver overlaps them and
+   * the page waits once. A failure names the program and its diagnostic.
+   *
+   * @param {Array<[string, string, string]>} specs - [name, vertex, fragment].
+   * @returns {Record<string, WebGLProgram>}
+   * @private
+   */
+  _createPointPrograms(specs) {
     const gl = this.gl;
-    requireShaderQuality(name, 'HighPerfRenderer shader program name');
-    let vertexShader = null;
-    let fragmentShader = null;
-    let program = null;
+    const shaders = new Map();
+    const programs = {};
     let operationError = null;
+    const compile = (type, source, label) => {
+      const key = `${type}:${source}`;
+      let shader = shaders.get(key);
+      if (shader !== undefined) return shader;
+      shader = gl.createShader(type);
+      if (!shader) {
+        throw new Error(`HighPerfRenderer could not allocate the ${label} shader.`);
+      }
+      shaders.set(key, shader);
+      gl.shaderSource(shader, source);
+      gl.compileShader(shader);
+      return shader;
+    };
+    const describe = (shader, kind, name) => (
+      gl.getShaderParameter(shader, gl.COMPILE_STATUS)
+        ? null
+        : `HighPerfRenderer "${name}" ${kind} shader compilation failed: ${gl.getShaderInfoLog(shader) || 'no compiler diagnostic'}`
+    );
     try {
-      vertexShader = gl.createShader(gl.VERTEX_SHADER);
-      if (!vertexShader) {
-        throw new Error(
-          `HighPerfRenderer could not allocate the "${name}" vertex shader.`
-        );
+      for (const [name, vsSource, fsSource] of specs) {
+        if (!POINT_PROGRAM_NAMES.includes(name)) {
+          throw new TypeError(
+            `HighPerfRenderer shader program name must be one of ${POINT_PROGRAM_NAMES.join(', ')}; received ${String(name)}.`
+          );
+        }
+        const vertexShader = compile(gl.VERTEX_SHADER, vsSource, `"${name}" vertex`);
+        const fragmentShader = compile(gl.FRAGMENT_SHADER, fsSource, `"${name}" fragment`);
+        const program = gl.createProgram();
+        if (!program) {
+          throw new Error(`HighPerfRenderer could not allocate the "${name}" shader program.`);
+        }
+        programs[name] = program;
+        gl.attachShader(program, vertexShader);
+        gl.attachShader(program, fragmentShader);
+        gl.linkProgram(program);
       }
-      gl.shaderSource(vertexShader, vsSource);
-      gl.compileShader(vertexShader);
-      if (
-        !gl.getShaderParameter(
-          vertexShader,
-          gl.COMPILE_STATUS
-        )
-      ) {
-        const detail =
-          gl.getShaderInfoLog(vertexShader) ||
-          'no compiler diagnostic';
+      // One wait, after every compile and link has been issued.
+      for (const [name, vsSource, fsSource] of specs) {
+        if (gl.getProgramParameter(programs[name], gl.LINK_STATUS)) continue;
         throw new Error(
-          `HighPerfRenderer "${name}" vertex shader compilation failed: ${detail}`
-        );
-      }
-
-      fragmentShader = gl.createShader(gl.FRAGMENT_SHADER);
-      if (!fragmentShader) {
-        throw new Error(
-          `HighPerfRenderer could not allocate the "${name}" fragment shader.`
-        );
-      }
-      gl.shaderSource(fragmentShader, fsSource);
-      gl.compileShader(fragmentShader);
-      if (
-        !gl.getShaderParameter(
-          fragmentShader,
-          gl.COMPILE_STATUS
-        )
-      ) {
-        const detail =
-          gl.getShaderInfoLog(fragmentShader) ||
-          'no compiler diagnostic';
-        throw new Error(
-          `HighPerfRenderer "${name}" fragment shader compilation failed: ${detail}`
-        );
-      }
-
-      program = gl.createProgram();
-      if (!program) {
-        throw new Error(
-          `HighPerfRenderer could not allocate the "${name}" shader program.`
-        );
-      }
-      gl.attachShader(program, vertexShader);
-      gl.attachShader(program, fragmentShader);
-      gl.linkProgram(program);
-
-      if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
-        const detail =
-          gl.getProgramInfoLog(program) ||
-          'no linker diagnostic';
-        throw new Error(
-          `HighPerfRenderer "${name}" shader link failed: ${detail}`
+          describe(shaders.get(`${gl.VERTEX_SHADER}:${vsSource}`), 'vertex', name)
+            ?? describe(shaders.get(`${gl.FRAGMENT_SHADER}:${fsSource}`), 'fragment', name)
+            ?? `HighPerfRenderer "${name}" shader link failed: ${gl.getProgramInfoLog(programs[name]) || 'no linker diagnostic'}`
         );
       }
     } catch (error) {
       operationError = error;
     }
 
-    this._queueShaderRetirement([
-      vertexShader,
-      fragmentShader,
-    ]);
-    const shaderCleanupFailures =
-      this._drainShaderRetirements();
-
+    // Linked programs keep what they need: the shaders go now.
+    this._queueShaderRetirement([...shaders.values()]);
+    const shaderCleanupFailures = this._drainShaderRetirements();
     if (operationError || shaderCleanupFailures.length > 0) {
-      this._queueProgramRetirement([program]);
-      const programCleanupFailures =
-        this._drainProgramRetirements();
-      const cleanupFailures = [
-        ...shaderCleanupFailures,
-        ...programCleanupFailures,
-      ];
+      this._queueProgramRetirement(Object.values(programs));
+      const cleanupFailures = [...shaderCleanupFailures, ...this._drainProgramRetirements()];
       if (cleanupFailures.length > 0) {
         throw new AggregateError(
-          operationError
-            ? [operationError, ...cleanupFailures]
-            : cleanupFailures,
-          `HighPerfRenderer "${name}" shader program setup failed with ${cleanupFailures.length} cleanup error(s).`
+          operationError ? [operationError, ...cleanupFailures] : cleanupFailures,
+          `HighPerfRenderer shader program setup failed with ${cleanupFailures.length} cleanup error(s).`
         );
       }
       throw operationError;
     }
-
-    return program;
+    return programs;
   }
 
   _cacheUniformLocations(
@@ -1185,22 +1256,42 @@ export class HighPerfRenderer {
     const uniforms = {};
 
     const uniformNames = [
-      'u_mvpMatrix', 'u_viewMatrix', 'u_modelMatrix', 'u_projectionMatrix',
-      'u_pointSize', 'u_sizeAttenuation', 'u_viewportHeight', 'u_fov',
-      'u_lightingStrength', 'u_fogDensity', 'u_fogNear', 'u_fogFar',
-      'u_fogColor', 'u_lightDir',
+      'u_mvpMatrix', 'u_modelViewMatrix', 'u_projectionMatrix',
+      'u_pointSize', 'u_sizeAttenuation', 'u_pointScale',
+      'u_lightingStrength', 'u_fogNear', 'u_fogScale',
+      'u_fogColor', 'u_lightDir', 'u_halfDir',
+      // Sculpted lighting normalisation and coverage floor
+      'u_invCenterShade', 'u_coverageFloor',
       // Alpha texture uniforms for efficient alpha-only updates
-      'u_alphaTex', 'u_alphaTexWidth', 'u_invAlphaTexWidth', 'u_useAlphaTex',
+      'u_alphaTex', 'u_alphaLayout', 'u_useAlphaTex',
       // LOD index texture uniforms (for mapping LOD vertex to original index)
-      'u_lodIndexTex', 'u_lodIndexTexWidth', 'u_invLodIndexTexWidth', 'u_useLodIndexTex'
+      'u_lodIndexTex', 'u_lodIndexLayout', 'u_useLodIndexTex'
     ];
 
     for (const name of uniformNames) {
       uniforms[name] = gl.getUniformLocation(program, name);
     }
+    uniforms.opaque = OPAQUE_POINT_PROGRAMS.has(programName);
 
     target.set(programName, uniforms);
     return uniforms;
+  }
+
+  /**
+   * The program the active quality draws one point pass with. A pass at or
+   * below DEPTH_TEST_DIMENSION_THRESHOLD runs with DEPTH_TEST disabled, and a
+   * quality with a no-depth program uses it there (NO_DEPTH_POINT_PROGRAMS).
+   * The two programs of a quality produce identical pixels for such a pass.
+   *
+   * @param {number} dimensionLevel - Dimension the pass draws.
+   * @returns {string} Key into `programs` and `uniformLocations`.
+   */
+  _pointProgramName(dimensionLevel) {
+    if (dimensionLevel <= DEPTH_TEST_DIMENSION_THRESHOLD) {
+      const noDepthProgram = NO_DEPTH_POINT_PROGRAMS[this.activeQuality];
+      if (noDepthProgram !== undefined) return noDepthProgram;
+    }
+    return this.activeQuality;
   }
 
   setQuality(quality) {
@@ -1213,18 +1304,6 @@ export class HighPerfRenderer {
     this.activeQuality = exactQuality;
     this.activeProgram = program;
     this.gl.useProgram(program);
-  }
-
-  _ensureLodResourceOwnershipState() {
-    if (!(this._lodResourceOwnersByDimension instanceof Map)) {
-      this._lodResourceOwnersByDimension = new Map();
-    }
-    if (!(this._validatedLodNodeMappings instanceof WeakMap)) {
-      this._validatedLodNodeMappings = new WeakMap();
-    }
-    if (!(this._validatedSpatialIndices instanceof WeakSet)) {
-      this._validatedSpatialIndices = new WeakSet();
-    }
   }
 
   _ensureGpuAllocationReporters() {
@@ -1279,7 +1358,7 @@ export class HighPerfRenderer {
    * `getStats` publishes the last computed figure rather than recomputing on
    * read, because reads happen per stats tick and per benchmark frame. Every
    * owner therefore refreshes at its own publication points, exactly as the
-   * alpha texture, the interleaved buffer and the snapshot resources do. The
+   * alpha texture, the two point streams and the snapshot resources do. The
    * inventory is proportional to the number of views, dimensions and pending
    * retirements — never to the dataset.
    *
@@ -1291,7 +1370,6 @@ export class HighPerfRenderer {
 
   _refreshGpuMemoryStats() {
     if (!this.stats) return 0;
-    this._ensureLodResourceOwnershipState();
     this._ensureRetirementOwnershipState();
     this._ensureGpuAllocationReporters();
 
@@ -1316,14 +1394,20 @@ export class HighPerfRenderer {
         : derived
     );
 
+    const livePointCount =
+      Number.isSafeInteger(this.pointCount) && this.pointCount > 0
+        ? this.pointCount
+        : 0;
     add(
-      this.buffers?.interleaved,
+      this.buffers?.positions,
       knownOrDerived(
-        this._interleavedGpuByteLength,
-        Number.isSafeInteger(this.pointCount) && this.pointCount > 0
-          ? this.pointCount * 16
-          : 0
+        this._positionGpuByteLength,
+        positionByteLength(livePointCount, this.currentDimensionLevel)
       )
+    );
+    add(
+      this.buffers?.colors,
+      knownOrDerived(this._colorGpuByteLength, livePointCount * 4)
     );
     add(
       this._alphaTexture,
@@ -1347,50 +1431,8 @@ export class HighPerfRenderer {
       )
     );
 
-    for (const owner of this._lodResourceOwnersByDimension.values()) {
-      if (
-        !Number.isSafeInteger(owner?.gpuByteLength) ||
-        owner.gpuByteLength < 0
-      ) {
-        throw new Error(
-          'HighPerfRenderer LOD generation owner has invalid GPU byte accounting.'
-        );
-      }
-      let projectedBytes = 0;
-      add(owner.compactBuffer, owner.compactByteLength);
-      if (owner.compactBuffer) {
-        projectedBytes += Number.isSafeInteger(owner.compactByteLength)
-          ? Math.max(0, owner.compactByteLength)
-          : 0;
-      }
-      add(
-        owner.topologyOwner?.originalIndexBuffer,
-        owner.topologyOwner?.originalIndexByteLength
-      );
-      if (owner.topologyOwner?.originalIndexBuffer) {
-        projectedBytes += Number.isSafeInteger(
-          owner.topologyOwner?.originalIndexByteLength
-        )
-          ? Math.max(0, owner.topologyOwner.originalIndexByteLength)
-          : 0;
-      }
-      add(
-        owner.topologyOwner?.indexTexture,
-        owner.topologyOwner?.indexTextureByteLength
-      );
-      if (owner.topologyOwner?.indexTexture) {
-        projectedBytes += Number.isSafeInteger(
-          owner.topologyOwner?.indexTextureByteLength
-        )
-          ? Math.max(0, owner.topologyOwner.indexTextureByteLength)
-          : 0;
-      }
-      // Compatibility for an older publication that recorded only the exact
-      // aggregate. Current owners always project every component handle.
-      if (owner.gpuByteLength > projectedBytes) {
-        add(owner, owner.gpuByteLength - projectedBytes);
-      }
-    }
+    // The live geometry's draw-order permutation texture.
+    add(this._liveOrder?.texture, this._liveOrder?.byteLength);
 
     if (this.snapshotBuffers instanceof Map) {
       for (const snapshot of this.snapshotBuffers.values()) {
@@ -1400,7 +1442,7 @@ export class HighPerfRenderer {
             snapshot?.colorOwner?.byteLength ??
               snapshot?.bufferByteLength,
             Number.isSafeInteger(snapshot?.pointCount)
-              ? Math.max(0, snapshot.pointCount) * 3
+              ? Math.max(0, snapshot.pointCount) * 4
               : 0
           )
         );
@@ -1426,20 +1468,7 @@ export class HighPerfRenderer {
               : 0
           )
         );
-      }
-    }
-    if (this._perViewState instanceof Map) {
-      for (const viewState of this._perViewState.values()) {
-        add(
-          viewState?.indexBuffer,
-          knownOrDerived(
-            viewState?.indexBufferByteLength,
-            Number.isSafeInteger(viewState?.indexBufferSize)
-              ? Math.max(0, viewState.indexBufferSize) *
-                Uint32Array.BYTES_PER_ELEMENT
-              : 0
-          )
-        );
+        add(geometry?.order?.texture, geometry?.order?.byteLength);
       }
     }
     for (const retirement of this._pendingDataRetirements) {
@@ -1482,24 +1511,23 @@ export class HighPerfRenderer {
   }
 
   _captureDataPublication() {
-    this._ensureLodResourceOwnershipState();
     return {
       vao: this.vao,
       buffers: this.buffers,
-      interleavedGpuByteLength: this._interleavedGpuByteLength,
+      positionGpuByteLength: this._positionGpuByteLength,
+      colorGpuByteLength: this._colorGpuByteLength,
       alphaTexture: this._alphaTexture,
       alphaTextureByteLength: this._alphaTextureByteLength,
       alphaTexWidth: this._alphaTexWidth,
       alphaTexHeight: this._alphaTexHeight,
+      alphaTexPlan: this._alphaTexPlan,
       alphaTexData: this._alphaTexData,
       alphaTexStagingData: this._alphaTexStagingData,
       useAlphaTexture: this._useAlphaTexture,
       currentAlphas: this._currentAlphas,
-      lodIndexTexturesByDimension: this._lodIndexTexturesByDimension,
-      lodResourceOwnersByDimension:
-        this._lodResourceOwnersByDimension,
+      liveOrder: this._liveOrder,
+      liveColorOrder: this._liveColorOrder,
       spatialIndices: this.spatialIndices,
-      lodBuffersByDimension: this.lodBuffersByDimension,
       perViewState: this._perViewState,
       currentDimensionLevel: this.currentDimensionLevel,
       liveGeometryGeneration: this._liveGeometryGeneration,
@@ -1508,11 +1536,7 @@ export class HighPerfRenderer {
       colors: this._colors,
       firstRenderDone: this._firstRenderDone,
       boundingSphere: this._boundingSphere,
-      bufferDirty: this._bufferDirty,
-      dirtyLodDimensions: this._dirtyLodDimensions,
-      interleavedArrayBuffer: this._interleavedArrayBuffer,
-      interleavedPositionView: this._interleavedPositionView,
-      interleavedColorView: this._interleavedColorView,
+      colorsDirty: this._colorsDirty,
       gpuMemoryMB: this.stats.gpuMemoryMB,
     };
   }
@@ -1526,26 +1550,25 @@ export class HighPerfRenderer {
     }
     this.vao = candidateVao;
     this.buffers = {
-      interleaved: null,
       positions: null,
       colors: null,
-      alphas: null,
     };
-    this._interleavedGpuByteLength = 0;
+    this._positionGpuByteLength = 0;
+    this._colorGpuByteLength = 0;
     this._alphaTexture = null;
     this._alphaTextureByteLength = 0;
     this._alphaTexWidth = 0;
     this._alphaTexHeight = 0;
+    this._alphaTexPlan = null;
     this._alphaTexData = null;
     this._alphaTexStagingData = null;
     this._alphaDirtyRows = null;
     this._alphaUploadRegions = null;
     this._useAlphaTexture = false;
     this._currentAlphas = null;
-    this._lodIndexTexturesByDimension = new Map();
-    this._lodResourceOwnersByDimension = new Map();
+    this._liveOrder = null;
+    this._liveColorOrder = null;
     this.spatialIndices = new Map();
-    this.lodBuffersByDimension = new Map();
     this._perViewState = new Map();
     this.currentDimensionLevel = 3;
     this._liveGeometryGeneration = 0;
@@ -1554,40 +1577,30 @@ export class HighPerfRenderer {
     this._colors = null;
     this._firstRenderDone = false;
     this._boundingSphere = null;
-    this._bufferDirty = false;
-    this._dirtyLodDimensions = new Set();
-    this._validatedLodNodeMappings = new WeakMap();
+    this._colorsDirty = false;
     this._validatedSpatialIndices = new WeakSet();
-
-    // Reusing the CPU packing allocation avoids a second 16-byte-per-point
-    // allocation on same-size reloads. If publication fails, the restored
-    // renderer drops this cache because its bytes may have been overwritten.
-    this._interleavedArrayBuffer = previous.interleavedArrayBuffer;
-    this._interleavedPositionView = previous.interleavedPositionView;
-    this._interleavedColorView = previous.interleavedColorView;
   }
 
-  _restoreDataPublication(publication, { invalidateInterleavedCache = false } = {}) {
+  _restoreDataPublication(publication) {
     this.vao = publication.vao;
     this.buffers = publication.buffers;
-    this._interleavedGpuByteLength =
-      publication.interleavedGpuByteLength ?? 0;
+    this._positionGpuByteLength =
+      publication.positionGpuByteLength ?? 0;
+    this._colorGpuByteLength = publication.colorGpuByteLength ?? 0;
     this._alphaTexture = publication.alphaTexture;
     this._alphaTextureByteLength =
       publication.alphaTextureByteLength ?? 0;
     this._alphaTexWidth = publication.alphaTexWidth;
     this._alphaTexHeight = publication.alphaTexHeight;
+    this._alphaTexPlan = publication.alphaTexPlan ?? null;
     this._alphaTexData = publication.alphaTexData;
     this._alphaTexStagingData =
       publication.alphaTexStagingData ?? null;
     this._useAlphaTexture = publication.useAlphaTexture;
     this._currentAlphas = publication.currentAlphas;
-    this._lodIndexTexturesByDimension =
-      publication.lodIndexTexturesByDimension;
-    this._lodResourceOwnersByDimension =
-      publication.lodResourceOwnersByDimension ?? new Map();
+    this._liveOrder = publication.liveOrder ?? null;
+    this._liveColorOrder = publication.liveColorOrder ?? null;
     this.spatialIndices = publication.spatialIndices;
-    this.lodBuffersByDimension = publication.lodBuffersByDimension;
     this._perViewState = publication.perViewState;
     this.currentDimensionLevel = publication.currentDimensionLevel;
     this._liveGeometryGeneration =
@@ -1597,17 +1610,7 @@ export class HighPerfRenderer {
     this._colors = publication.colors;
     this._firstRenderDone = publication.firstRenderDone;
     this._boundingSphere = publication.boundingSphere;
-    this._bufferDirty = publication.bufferDirty;
-    this._dirtyLodDimensions = publication.dirtyLodDimensions;
-    this._interleavedArrayBuffer = invalidateInterleavedCache
-      ? null
-      : publication.interleavedArrayBuffer;
-    this._interleavedPositionView = invalidateInterleavedCache
-      ? null
-      : publication.interleavedPositionView;
-    this._interleavedColorView = invalidateInterleavedCache
-      ? null
-      : publication.interleavedColorView;
+    this._colorsDirty = publication.colorsDirty;
     this.stats.gpuMemoryMB = publication.gpuMemoryMB;
   }
 
@@ -1822,80 +1825,34 @@ export class HighPerfRenderer {
       }
     };
 
-    for (const buffer of Object.values(publication.buffers ?? {})) {
-      add(
-        buffers,
-        buffer,
-        buffer === publication.buffers?.interleaved
-          ? (
-            Number.isSafeInteger(
-              publication.interleavedGpuByteLength
-            )
-              ? publication.interleavedGpuByteLength
-              : (publication.pointCount ?? 0) * 16
-          )
-          : 0
-      );
-    }
+    const publishedPointCount = publication.pointCount ?? 0;
+    add(
+      buffers,
+      publication.buffers?.positions,
+      Number.isSafeInteger(publication.positionGpuByteLength)
+        ? publication.positionGpuByteLength
+        : positionByteLength(
+          publishedPointCount,
+          publication.currentDimensionLevel
+        )
+    );
+    add(
+      buffers,
+      publication.buffers?.colors,
+      Number.isSafeInteger(publication.colorGpuByteLength)
+        ? publication.colorGpuByteLength
+        : publishedPointCount * 4
+    );
     add(vertexArrays, publication.vao);
-    if (publication.perViewState instanceof Map) {
-      for (const viewState of publication.perViewState.values()) {
-        add(
-          buffers,
-          viewState.indexBuffer,
-          Number.isSafeInteger(viewState.indexBufferByteLength)
-            ? viewState.indexBufferByteLength
-            : (viewState.indexBufferSize ?? 0) *
-              Uint32Array.BYTES_PER_ELEMENT
-        );
-      }
-    }
-    if (publication.lodResourceOwnersByDimension instanceof Map) {
-      for (
-        const owner of
-        publication.lodResourceOwnersByDimension.values()
-      ) {
-        add(buffers, owner.compactBuffer, owner.compactByteLength);
-        add(vertexArrays, owner.compactVao);
-        add(
-          buffers,
-          owner.topologyOwner?.originalIndexBuffer,
-          owner.topologyOwner?.originalIndexByteLength
-        );
-        add(
-          textures,
-          owner.topologyOwner?.indexTexture,
-          owner.topologyOwner?.indexTextureByteLength
-        );
-      }
-    }
-    if (publication.lodBuffersByDimension instanceof Map) {
-      // Metadata is non-owning for current publications, but remains a
-      // deduplicated compatibility inventory for publications created before
-      // explicit generation owners existed. Full detail always borrows main
-      // vertex data and must never enter LOD retirement.
-      for (const lodBuffers of publication.lodBuffersByDimension.values()) {
-        for (const lod of lodBuffers) {
-          if (lod.isFullDetail !== true) {
-            add(buffers, lod.buffer);
-            add(vertexArrays, lod.vao);
-          }
-          // Current full-detail metadata has no EBO. Owner-map-free
-          // publications may still carry a sequential EBO even though their
-          // VBO/VAO borrow main data, so retain that deduplicated inventory.
-          add(buffers, lod.originalIndexBuffer);
-        }
-      }
-    }
-    if (publication.lodIndexTexturesByDimension instanceof Map) {
-      for (
-        const lodIndexTextures of
-        publication.lodIndexTexturesByDimension.values()
-      ) {
-        for (const entry of lodIndexTextures) {
-          add(textures, entry.texture);
-        }
-      }
+    // The live draw order's permutation texture.
+    add(
+      textures,
+      publication.liveOrder?.texture,
+      publication.liveOrder?.byteLength
+    );
+    // Explicit handle lists (a draw-order texture retired on its own).
+    for (const entry of Array.isArray(publication.textures) ? publication.textures : []) {
+      add(textures, entry?.handle, entry?.byteLength);
     }
     add(
       textures,
@@ -1935,9 +1892,48 @@ export class HighPerfRenderer {
     };
   }
 
+  /**
+   * A live position VBO that snapshot geometry borrows changes owner instead of
+   * being deleted when its publication retires: the pool record that borrows it
+   * becomes its sole owner and deletes it when its last snapshot goes.
+   *
+   * @param {Object} publication
+   * @returns {Object} The publication, without a borrowed position VBO.
+   * @private
+   */
+  _transferBorrowedLivePositionBuffer(publication) {
+    const positionBuffer = publication?.buffers?.positions ?? null;
+    if (
+      positionBuffer === null ||
+      !(this._snapshotGeometryPools instanceof Map)
+    ) {
+      return publication;
+    }
+    let borrowed = false;
+    for (const geometry of this._snapshotGeometryPools.values()) {
+      if (
+        geometry?.borrowsLivePositionBuffer === true &&
+        geometry.positionBuffer === positionBuffer
+      ) {
+        geometry.borrowsLivePositionBuffer = false;
+        // The store keeps its draw order, so its permutation goes with it.
+        geometry.order = publication.liveOrder ?? null;
+        borrowed = true;
+      }
+    }
+    if (!borrowed) return publication;
+    return {
+      ...publication,
+      buffers: { ...publication.buffers, positions: null },
+      liveOrder: null,
+    };
+  }
+
   _queueDataRetirement(publication) {
     this._ensureRetirementOwnershipState();
-    const retirement = this._createDataRetirement(publication);
+    const retirement = this._createDataRetirement(
+      this._transferBorrowedLivePositionBuffer(publication)
+    );
     const ownedBuffers = new Map();
     const ownedVertexArrays = new Map();
     const ownedTextures = new Map();
@@ -1992,6 +1988,9 @@ export class HighPerfRenderer {
         try {
           gl[deleteMethod](handle);
           entry.handle = null;
+          // GPU memory was released: a tree build refused for memory may
+          // succeed now (`_requestSpatialIndex`).
+          this._releaseEpoch = (this._releaseEpoch ?? 0) + 1;
         } catch (error) {
           let stillAlive = true;
           if (typeof gl[livenessMethod] === 'function') {
@@ -2009,17 +2008,28 @@ export class HighPerfRenderer {
         }
       }
     };
-    for (const retirement of Array.from(this._pendingDataRetirements)) {
+    // VAOs retain buffer references, including their element-array binding.
+    // Every pending VAO, of every retirement, is deleted before any buffer:
+    // a buffer evicted later (a retained geometry) can be referenced by a VAO
+    // an earlier retirement still holds, so the order is global, not per
+    // retirement. While any VAO is still alive, no buffer or texture is
+    // deleted; the retry deletes them once it is gone.
+    const pending = Array.from(this._pendingDataRetirements);
+    for (const retirement of pending) {
       drainEntries(
         retirement.vertexArrays,
         'deleteVertexArray',
         'isVertexArray'
       );
-      // VAOs retain buffer references, including their element-array binding.
-      // Delete vertex state first so a retired buffer cannot remain reachable
-      // through a still-live VAO on implementations with deferred destruction.
-      drainEntries(retirement.buffers, 'deleteBuffer', 'isBuffer');
-      drainEntries(retirement.textures, 'deleteTexture', 'isTexture');
+    }
+    const vertexArraysAlive = pending.some(retirement =>
+      retirement.vertexArrays.some(entry => entry.handle !== null)
+    );
+    for (const retirement of pending) {
+      if (!vertexArraysAlive) {
+        drainEntries(retirement.buffers, 'deleteBuffer', 'isBuffer');
+        drainEntries(retirement.textures, 'deleteTexture', 'isTexture');
+      }
       if (
         retirement.buffers.every(entry => entry.handle === null) &&
         retirement.vertexArrays.every(entry => entry.handle === null) &&
@@ -2151,15 +2161,13 @@ export class HighPerfRenderer {
     }
     staging.positionBuffer = positionBuffer;
     this.gl.bindBuffer(this.gl.ARRAY_BUFFER, positionBuffer);
-    this.gl.bufferData(
-      this.gl.ARRAY_BUFFER,
-      geometry.positions,
-      this.gl.STATIC_DRAW
-    );
-    requireCleanWebGLState(
-      this.gl,
-      `${owner} position-buffer upload`
-    );
+    this._allocateGpu(`${owner} could not allocate its position buffer`, () => {
+      this.gl.bufferData(
+        this.gl.ARRAY_BUFFER,
+        geometry.positions,
+        this.gl.STATIC_DRAW
+      );
+    });
     staging.positionBufferByteLength =
       geometry.positions.byteLength;
 
@@ -2182,10 +2190,12 @@ export class HighPerfRenderer {
     );
     let generation;
     let expectedPositions;
+    let sourceDimension;
     const sourceIsLive = exactSourceViewId === 'live';
     if (sourceIsLive) {
       generation = this._liveGeometryGeneration;
       expectedPositions = this._positions;
+      sourceDimension = this.currentDimensionLevel;
       if (!Number.isSafeInteger(generation) || generation <= 0) {
         throw new Error(
           'HighPerfRenderer live geometry has no published generation.'
@@ -2201,6 +2211,7 @@ export class HighPerfRenderer {
       }
       generation = sourceSnapshot.geometryGeneration;
       expectedPositions = sourceSnapshot.positions;
+      sourceDimension = sourceSnapshot.dimensionLevel;
     }
     if (!Number.isSafeInteger(generation) || generation <= 0) {
       throw new Error(
@@ -2220,17 +2231,37 @@ export class HighPerfRenderer {
           `HighPerfRenderer snapshot source "${exactSourceViewId}" has no owned frozen geometry.`
         );
       }
+      if (
+        !this.buffers.positions ||
+        this._positionGpuByteLength !== sourcePositions.byteLength
+      ) {
+        throw new Error(
+          'HighPerfRenderer live geometry has no exact position VBO to share.'
+        );
+      }
+      // The live generation already is this geometry, on the CPU and on the
+      // GPU. Copying it cost the snapshot a second array and a second VBO of
+      // the same coordinates: 4 bytes per axis per point twice over, 240 MB
+      // for one kept view of a 10,000,000-point 3D embedding.
       geometry = {
         generation,
-        positions: new Float32Array(sourcePositions),
-        positionBuffer: null,
-        positionBufferByteLength: 0,
+        // Components per point of `positions` (the embedding dimension).
+        dimension: sourceDimension,
+        positions: sourcePositions,
+        positionBuffer: this.buffers.positions,
+        positionBufferByteLength: this._positionGpuByteLength,
+        borrowsLivePositionBuffer: true,
+        // The borrowed store's order is the live view's (`_liveOrder`).
+        order: null,
         refCount: 0,
+        retained: false,
+        lastUsed: performance.now(),
         spatialIndices: new Map(),
       };
       this._snapshotGeometryPools.set(generation, geometry);
     } else if (
       geometry.positions.length !== sourcePositions.length ||
+      geometry.dimension !== sourceDimension ||
       (!sourceIsLive && geometry.positions !== sourcePositions) ||
       !Number.isSafeInteger(geometry.refCount) ||
       geometry.refCount < 0
@@ -2241,18 +2272,190 @@ export class HighPerfRenderer {
     }
     this._ensureSnapshotGeometryGpuOwner(geometry);
     geometry.refCount += 1;
+    geometry.retained = false;
     return geometry;
   }
 
-  _acquireIndependentSnapshotGeometry(sourcePositions) {
+  /**
+   * The geometry of one representation's positions for a snapshot: the live
+   * geometry when the live view shows the same positions, a pooled geometry
+   * (shown by another kept view, or retained since none shows it) when one
+   * holds them, else a new one. Views of one representation therefore share
+   * one position VBO and one spatial tree; only a representation no view has
+   * shown recently is uploaded.
+   *
+   * @param {Float32Array} positions
+   * @param {number} dimension
+   * @returns {Object} The acquired pool record (its refCount includes this use).
+   * @private
+   */
+  _acquireSnapshotGeometryForPositions(positions, dimension) {
+    this._ensureGeometryOwnershipState();
+    if (
+      positions === this._positions &&
+      dimension === this.currentDimensionLevel &&
+      Number.isSafeInteger(this._liveGeometryGeneration) &&
+      this._liveGeometryGeneration > 0
+    ) {
+      return this._acquireSnapshotGeometryFromSource('live', positions);
+    }
+    const pooled = this._findPooledGeometry(positions, dimension);
+    if (pooled !== null) {
+      this._ensureSnapshotGeometryGpuOwner(pooled);
+      pooled.refCount += 1;
+      pooled.retained = false;
+      return pooled;
+    }
+    return this._acquireIndependentSnapshotGeometry(positions, dimension);
+  }
+
+  /**
+   * The pooled geometry holding exactly these positions, or null.
+   * @private
+   */
+  _findPooledGeometry(positions, dimension) {
+    if (!(this._snapshotGeometryPools instanceof Map)) return null;
+    for (const geometry of this._snapshotGeometryPools.values()) {
+      if (geometry.positions === positions && geometry.dimension === dimension) {
+        return geometry;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * GPU bytes kept for geometries no view shows: twice the largest geometry a
+   * view shows now, between 64 MiB and 768 MiB, so switching back to a
+   * representation shown a moment ago costs no upload and no tree build,
+   * while a dataset near the device limit keeps nothing extra.
+   * @private
+   */
+  _geometryRetentionBudget() {
+    let largest = Number.isSafeInteger(this._positionGpuByteLength)
+      ? this._positionGpuByteLength
+      : 0;
+    for (const geometry of this._snapshotGeometryPools?.values() ?? []) {
+      if (geometry.refCount > 0) {
+        largest = Math.max(largest, geometry.positionBufferByteLength ?? 0);
+      }
+    }
+    const MIB = 1024 * 1024;
+    return Math.min(768 * MIB, Math.max(64 * MIB, 2 * largest));
+  }
+
+  /**
+   * Drop retained geometry built over one positions array (its CPU copy was
+   * evicted, so the geometry could never be matched again).
+   *
+   * @param {Float32Array} positions
+   * @returns {number} Bytes freed.
+   */
+  releaseRetainedGeometryFor(positions) {
+    let freed = 0;
+    for (const geometry of [...(this._snapshotGeometryPools?.values() ?? [])]) {
+      if (geometry.positions === positions && geometry.refCount === 0) {
+        freed += this._evictGeometryRecord(geometry);
+      }
+    }
+    if (freed > 0) this._drainDataRetirements();
+    return freed;
+  }
+
+  /**
+   * Bytes of position buffers held by geometries no view shows.
+   * @returns {number}
+   */
+  getRetainedGeometryBytes() {
+    let bytes = 0;
+    for (const geometry of this._snapshotGeometryPools?.values() ?? []) {
+      if (geometry.refCount === 0 && geometry.borrowsLivePositionBuffer !== true) {
+        bytes += geometry.positionBufferByteLength ?? 0;
+        if (geometry.order?.texture) bytes += geometry.order.byteLength;
+      }
+    }
+    return bytes;
+  }
+
+  /**
+   * Evict geometries no view shows, least recently used first, until their
+   * bytes plus `headroomBytes` fit the retention budget (`Infinity` evicts
+   * every one). Called before any large allocation, so retention never costs
+   * a dataset its maximum cell count, and after any geometry is retained.
+   *
+   * @param {number} [headroomBytes=0]
+   * @returns {number} Bytes freed.
+   */
+  evictRetainedGeometry(headroomBytes = 0) {
+    if (!(this._snapshotGeometryPools instanceof Map)) return 0;
+    const retained = [...this._snapshotGeometryPools.values()]
+      .filter(geometry => geometry.refCount === 0)
+      .sort((left, right) => (left.lastUsed ?? 0) - (right.lastUsed ?? 0));
+    const evictAll = headroomBytes === Infinity;
+    const budget = evictAll
+      ? 0
+      : Math.max(0, this._geometryRetentionBudget() - headroomBytes);
+    // Kept colour stores share the budget and go first: they are the
+    // cheaper to rebuild.
+    let held = this.getRetainedGeometryBytes() + this.getKeptColorBytes();
+    let freed = 0;
+    if (held > budget) {
+      const colorFreed = this._evictKeptColorStores(evictAll ? Infinity : held - budget);
+      held -= colorFreed;
+      freed += colorFreed;
+    }
+    for (const geometry of retained) {
+      if (!evictAll && held <= budget) break;
+      const bytes = this._evictGeometryRecord(geometry);
+      held -= bytes;
+      freed += bytes;
+    }
+    if (freed > 0) this._drainDataRetirements();
+    return freed;
+  }
+
+  /**
+   * Remove one unshown geometry from the pool and queue its buffer for
+   * deletion (a buffer the live view uses stays the live view's).
+   * @returns {number} Bytes queued for deletion.
+   * @private
+   */
+  _evictGeometryRecord(geometry) {
+    this._snapshotGeometryPools.delete(geometry.generation);
+    geometry.spatialIndices = new Map();
+    geometry.retained = false;
+    if (geometry.borrowsLivePositionBuffer === true || geometry.positionBuffer === null) {
+      return 0;
+    }
+    const orderBytes = geometry.order?.texture ? geometry.order.byteLength : 0;
+    this._retireDrawOrderRecord(geometry.order ?? null);
+    geometry.order = null;
+    const bytes = (geometry.positionBufferByteLength ?? 0) + orderBytes;
+    this._queueDataRetirement({
+      buffers: { positions: geometry.positionBuffer, colors: null },
+      positionGpuByteLength: geometry.positionBufferByteLength ?? 0,
+      pointCount: 0,
+    });
+    geometry.positionBuffer = null;
+    geometry.positionBufferByteLength = 0;
+    return bytes;
+  }
+
+  _acquireIndependentSnapshotGeometry(sourcePositions, dimension) {
     this._ensureGeometryOwnershipState();
     const generation = this._allocateGeometryGeneration();
     const geometry = {
       generation,
-      positions: new Float32Array(sourcePositions),
+      dimension,
+      // Adopted, not copied: a published positions array is never written.
+      positions: sourcePositions,
       positionBuffer: null,
       positionBufferByteLength: 0,
+      borrowsLivePositionBuffer: false,
+      // The draw order its store holds (null: source order).
+      order: null,
       refCount: 1,
+      retained: false,
+      lastUsed: performance.now(),
       spatialIndices: new Map(),
     };
     this._snapshotGeometryPools.set(generation, geometry);
@@ -2322,18 +2525,6 @@ export class HighPerfRenderer {
         `HighPerfRenderer snapshot geometry generation ${geometryGeneration} has an inconsistent ${dimensionLevel}D spatial owner.`
       );
     }
-    if (
-      spatialIndex !== null &&
-      needsLOD &&
-      (
-        !Array.isArray(spatialIndex.lodLevels) ||
-        spatialIndex.lodLevels.length === 0
-      )
-    ) {
-      // Promotion failure leaves the already accepted tree resident so the
-      // same owner can be retried without rebuilding its hierarchy.
-      spatialIndex.ensureLODLevels();
-    }
     return spatialIndex;
   }
 
@@ -2342,7 +2533,8 @@ export class HighPerfRenderer {
     positions,
     dimensionLevel,
     needsLOD,
-    spatialIndex
+    spatialIndex,
+    replace = false
   ) {
     if (
       !spatialIndex ||
@@ -2360,7 +2552,7 @@ export class HighPerfRenderer {
     const key =
       this._snapshotSpatialIndexKey(dimensionLevel, needsLOD);
     const existing = geometry.spatialIndices.get(key);
-    if (existing !== undefined && existing !== spatialIndex) {
+    if (existing !== undefined && existing !== spatialIndex && !replace) {
       throw new Error(
         `HighPerfRenderer snapshot geometry generation ${geometryGeneration} already owns a different ${dimensionLevel}D spatial index.`
       );
@@ -2407,16 +2599,19 @@ export class HighPerfRenderer {
       );
     }
     geometry.refCount -= 1;
-    if (geometry.refCount === 0) {
+    if (geometry.refCount === 0 && geometry.positionBuffer === null) {
+      // Nothing was uploaded for it (a publication that failed before its
+      // upload, or one that never drew): there is nothing worth keeping.
       this._snapshotGeometryPools.delete(snapshot.geometryGeneration);
-      const positionOwnership = {
-        positionBuffer: geometry.positionBuffer,
-        positionBufferByteLength:
-          geometry.positionBufferByteLength,
-      };
-      geometry.positionBuffer = null;
-      geometry.positionBufferByteLength = 0;
-      return positionOwnership;
+      return null;
+    }
+    if (geometry.refCount === 0) {
+      // No view shows this representation now. Its position buffer and trees
+      // stay retained, within the retention budget, so showing it again costs
+      // no upload and no rebuild; the budget evicts the least recently used.
+      geometry.retained = true;
+      geometry.lastUsed = performance.now();
+      this.evictRetainedGeometry();
     }
     return null;
   }
@@ -2452,7 +2647,7 @@ export class HighPerfRenderer {
       !Number.isSafeInteger(owner.byteLength) ||
       !Number.isSafeInteger(owner.pointCount) ||
       owner.pointCount < 0 ||
-      owner.byteLength !== owner.pointCount * 3 ||
+      owner.byteLength !== owner.pointCount * 4 ||
       owner.pointCount !== snapshot.pointCount ||
       !Number.isSafeInteger(owner.refCount) ||
       owner.refCount <= 0 ||
@@ -2466,11 +2661,38 @@ export class HighPerfRenderer {
     return owner;
   }
 
-  _createSnapshotColorOwner(buffer, byteLength) {
+  /**
+   * The draw order a geometry's position store holds, or null for source
+   * order. A geometry the live view shows holds the live store's order.
+   *
+   * @param {object} geometry - A pool record.
+   * @returns {object|null}
+   * @private
+   */
+  _geometryDrawOrder(geometry) {
+    return this._geometryOrderRecord(geometry)?.drawOrder ?? null;
+  }
+
+  /**
+   * The draw-order record (order plus permutation texture) of a geometry's
+   * position store, or null for source order.
+   *
+   * @param {object} geometry - A pool record.
+   * @returns {object|null}
+   * @private
+   */
+  _geometryOrderRecord(geometry) {
+    if (geometry.generation === this._liveGeometryGeneration) {
+      return this._liveOrder ?? null;
+    }
+    return geometry.order ?? null;
+  }
+
+  _createSnapshotColorOwner(buffer, byteLength, drawOrder = null) {
     if (
       !buffer ||
       !Number.isSafeInteger(byteLength) ||
-      byteLength !== this.pointCount * 3
+      byteLength !== this.pointCount * 4
     ) {
       throw new Error(
         'HighPerfRenderer cannot publish an invalid snapshot color-buffer owner.'
@@ -2481,6 +2703,8 @@ export class HighPerfRenderer {
       byteLength,
       pointCount: this.pointCount,
       refCount: 1,
+      // The draw order the colours are stored in (null: source order).
+      order: drawOrder,
     };
   }
 
@@ -2491,7 +2715,7 @@ export class HighPerfRenderer {
       !Number.isSafeInteger(owner.byteLength) ||
       !Number.isSafeInteger(owner.pointCount) ||
       owner.pointCount < 0 ||
-      owner.byteLength !== owner.pointCount * 3 ||
+      owner.byteLength !== owner.pointCount * 4 ||
       !Number.isSafeInteger(owner.refCount) ||
       owner.refCount <= 0 ||
       owner.refCount >= Number.MAX_SAFE_INTEGER
@@ -2512,7 +2736,7 @@ export class HighPerfRenderer {
       !Number.isSafeInteger(owner.byteLength) ||
       !Number.isSafeInteger(owner.pointCount) ||
       owner.pointCount < 0 ||
-      owner.byteLength !== owner.pointCount * 3 ||
+      owner.byteLength !== owner.pointCount * 4 ||
       !Number.isSafeInteger(owner.refCount) ||
       owner.refCount <= 0
     ) {
@@ -2693,6 +2917,10 @@ export class HighPerfRenderer {
     const colorOwner = releaseColor
       ? snapshot?.colorOwner ?? null
       : null;
+    // A retiring view takes the colour stores it kept with it.
+    if (releaseColor && releaseVao && snapshot?.colorCache instanceof Map) {
+      this._clearKeptColorStores(snapshot.colorCache);
+    }
     const unownedBuffer = releaseColor && colorOwner === null
       ? snapshot?.buffer ?? null
       : null;
@@ -2716,7 +2944,7 @@ export class HighPerfRenderer {
             unownedBuffer !== null &&
             Number.isSafeInteger(snapshot?.pointCount) &&
             snapshot.pointCount >= 0
-              ? snapshot.pointCount * 3
+              ? snapshot.pointCount * 4
               : 0
           ),
       colorOwner,
@@ -2761,14 +2989,15 @@ export class HighPerfRenderer {
   loadData(positions, colors, options = {}) {
     this._assertOperational('load data');
     const gl = this.gl;
-    if (!(positions instanceof Float32Array) || positions.length % 3 !== 0) {
+    if (!(positions instanceof Float32Array)) {
       throw new TypeError(
-        'HighPerfRenderer positions must be a Float32Array with exactly three values per point.'
+        'HighPerfRenderer positions must be a Float32Array.'
       );
     }
     if (!(colors instanceof Uint8Array)) {
       throw new TypeError('HighPerfRenderer colors must be an RGBA Uint8Array.');
     }
+    requireWordAlignedColors(colors);
     if (
       options === null ||
       typeof options !== 'object' ||
@@ -2785,25 +3014,25 @@ export class HighPerfRenderer {
       optionKeys.some(
         (key) =>
           key !== 'dimensionLevel' &&
-          key !== 'buildSpatialIndex' &&
           key !== 'alphaValues'
       )
     ) {
       throw new TypeError(
-        'HighPerfRenderer load options accept exactly dimensionLevel and optional alphaValues/buildSpatialIndex.'
+        'HighPerfRenderer load options accept exactly dimensionLevel and optional alphaValues.'
       );
-    }
-    // Only build spatial index if LOD/frustum culling is currently enabled at runtime
-    const defaultBuildSpatialIndex = this.useAdaptiveLOD || this.useFrustumCulling;
-    const buildSpatialIndex = options.buildSpatialIndex ?? defaultBuildSpatialIndex;
-    if (typeof buildSpatialIndex !== 'boolean') {
-      throw new TypeError('HighPerfRenderer buildSpatialIndex must be a boolean.');
     }
     const dimensionLevel = requireDimensionLevel(
       options.dimensionLevel,
       'HighPerfRenderer loadData dimensionLevel'
     );
-    const pointCount = positions.length / 3;
+    // Positions carry exactly the embedding's components per point, so the
+    // published dimension is also the position stride.
+    const pointCount = requirePositionArray(
+      positions,
+      dimensionLevel,
+      'HighPerfRenderer positions',
+      { allowEmpty: true }
+    );
     if (
       this.snapshotBuffers instanceof Map &&
       this.snapshotBuffers.size > 0 &&
@@ -2819,34 +3048,21 @@ export class HighPerfRenderer {
         `HighPerfRenderer colors must contain exactly ${expectedRGBA} RGBA bytes for ${pointCount} points; received ${colors.length}.`
       );
     }
-    // Refuse a dataset this device cannot represent before anything is
-    // allocated. One alpha texel per point in a MAX_TEXTURE_SIZE square R8
-    // texture is the renderer's hard capacity limit; `_createAlphaTexture`
-    // still owns that invariant, but it is reached only after the whole
-    // full-detail vertex store has been uploaded, so a user asking for more
-    // than the machine can do would pay for the upload before being refused.
-    const maxTextureSize = gl.getParameter(gl.MAX_TEXTURE_SIZE);
-    if (!Number.isInteger(maxTextureSize) || maxTextureSize <= 0) {
-      throw new Error(
-        'HighPerfRenderer received an invalid MAX_TEXTURE_SIZE capability.'
-      );
-    }
-    const maximumPointCount = maxTextureSize * maxTextureSize;
-    if (pointCount > maximumPointCount) {
-      throw new RangeError(
-        `HighPerfRenderer cannot render ${pointCount.toLocaleString()} points on this device: its ${maxTextureSize}x${maxTextureSize} alpha-texture capacity represents at most ${maximumPointCount.toLocaleString()} points. Subset the dataset before loading it.`
-      );
-    }
+    // Refuse, before anything is allocated, only a dataset the device cannot
+    // address at all: per-point textures are linear textures, so this is the
+    // layer capacity (`MAX_TEXTURE_SIZE^2 x MAX_ARRAY_TEXTURE_LAYERS`, at
+    // least 2^34 points), not a fixed size.
+    planLinearTextureFor(gl, pointCount);
     const alphaValues = Object.hasOwn(options, 'alphaValues')
       ? options.alphaValues
       : null;
     if (alphaValues !== null) {
       if (
-        !(alphaValues instanceof Float32Array) ||
+        !(alphaValues instanceof Uint8Array) ||
         alphaValues.length !== pointCount
       ) {
         throw new TypeError(
-          `HighPerfRenderer alphaValues must be a Float32Array with exactly ${pointCount} entries.`
+          `HighPerfRenderer alphaValues must be a Uint8Array with exactly ${pointCount} entries.`
         );
       }
       for (let index = 0; index < alphaValues.length; index++) {
@@ -2859,6 +3075,10 @@ export class HighPerfRenderer {
       }
     }
 
+    // A new dataset: geometry retained for the previous one is stale, and its
+    // memory belongs to this upload. So is a re-order in progress.
+    this._clearKeptColorStores(this._liveColorCache);
+    this.evictRetainedGeometry(Infinity);
     requireCleanWebGLState(gl, 'HighPerfRenderer data publication');
     const previousPublication = this._captureDataPublication();
     const candidateGeometryGeneration =
@@ -2880,29 +3100,17 @@ export class HighPerfRenderer {
 
       const startTime = performance.now();
 
-      // The full-detail buffer and alpha texture are staged first. LOD
-      // construction can then reference only candidate resources.
-      this._createInterleavedBuffer(positions, colors);
+      // The streams go up in source order; a tree LOD or culling needs is
+      // built off the main thread when the view first draws, and the store
+      // adopts its order then.
+      this._boundingSphere = this._computeBoundingSphere(
+        positions,
+        dimensionLevel
+      );
+      this._createPointStreams(positions, colors, dimensionLevel);
       this._createAlphaTexture(this.pointCount);
       if (alphaValues !== null) {
         this.updateAlphas(alphaValues);
-      }
-      this._boundingSphere = this._computeBoundingSphere(positions);
-
-      if (buildSpatialIndex && this.pointCount > 10000) {
-        console.log(
-          `[HighPerfRenderer] Building ${this.currentDimensionLevel}D spatial index for LOD/frustum culling...`
-        );
-        const spatialIndex =
-          this._getOrBuildSpatialIndexForDimension(
-            this.currentDimensionLevel,
-            false,
-            this._needsLodResources(-1)
-          );
-        if (spatialIndex) {
-          spatialIndex._lastLODLevel = undefined;
-          this._boundingSphere = spatialIndex.getBoundingSphere();
-        }
       }
 
       requireCleanWebGLState(
@@ -2927,9 +3135,7 @@ export class HighPerfRenderer {
       const cleanupErrors = [];
       if (candidateInstalled) {
         const rejectedPublication = this._captureDataPublication();
-        this._restoreDataPublication(previousPublication, {
-          invalidateInterleavedCache: true,
-        });
+        this._restoreDataPublication(previousPublication);
         cleanupErrors.push(
           ...this._retireDataPublication(rejectedPublication)
         );
@@ -2939,6 +3145,7 @@ export class HighPerfRenderer {
         gl.bindBuffer(gl.ARRAY_BUFFER, null);
         gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, null);
         gl.bindTexture(gl.TEXTURE_2D, null);
+        gl.bindTexture(gl.TEXTURE_2D_ARRAY, null);
         const cleanupGlError = gl.getError();
         if (cleanupGlError !== gl.NO_ERROR) {
           cleanupErrors.push(
@@ -2967,44 +3174,12 @@ export class HighPerfRenderer {
     return this.stats;
   }
 
-  /**
-   * Get or create a spatial index for a specific dimension level.
-   * Spatial indices are cached per dimension for efficient multiview rendering.
-   * @param {number} dimensionLevel - Dimension level (1, 2, or 3)
-   * @returns {SpatialIndex|null} Spatial index for the dimension, or null if data not available
-   */
-  getSpatialIndexForDimension(
-    dimensionLevel,
-    needsLOD = this._needsLodResources(-1)
-  ) {
-    this._assertOperational('build a spatial index');
-    const dim = requireDimensionLevel(
-      dimensionLevel,
-      'HighPerfRenderer spatial-index dimensionLevel'
-    );
-    if (typeof needsLOD !== 'boolean') {
-      throw new TypeError(
-        'HighPerfRenderer spatial-index needsLOD must be a boolean.'
-      );
-    }
-    const spatialIndex =
-      this._getOrBuildSpatialIndexForDimension(
-        dim,
-        false,
-        needsLOD
-      );
-    return spatialIndex === null
-      ? null
-      : getReadOnlySpatialProjection(
-        spatialIndex,
-        `HighPerfRenderer ${dim}D spatial index`
-      );
-  }
-
   _getOrBuildSpatialIndexForDimension(
     dim,
     forceReplacement,
-    needsLOD = this._needsLodResources(-1)
+    needsLOD = this._needsLodResources(-1),
+    prebuiltTree = null,
+    prebuiltOrder = null
   ) {
     if (typeof forceReplacement !== 'boolean') {
       throw new TypeError(
@@ -3022,6 +3197,14 @@ export class HighPerfRenderer {
     if (!pos || !col) {
       return null;
     }
+    // The live positions hold exactly the live dimension's components, so
+    // only that dimension's tree can be built over them.
+    if (dim !== this.currentDimensionLevel) {
+      throw new Error(
+        `HighPerfRenderer live positions are ${this.currentDimensionLevel}D; ` +
+        `a ${dim}D spatial index cannot be built over them.`
+      );
+    }
 
     // Check if we have a cached spatial index for this dimension
     const previousSpatialIndices = this.spatialIndices;
@@ -3032,24 +3215,14 @@ export class HighPerfRenderer {
       if (
         cached.positions === pos &&
         cached.dimensionLevel === dim &&
-        cached.pointCount === pos.length / 3
+        cached.pointCount === this.pointCount
       ) {
-        const cachedLodIsReady = (
-          Array.isArray(cached.lodLevels) &&
-          cached.lodLevels.length > 0
-        );
-        if (!needsLOD || cachedLodIsReady) {
-          if (needsLOD) {
-            this._getCertifiedLodResourcesForDimension(dim, cached);
-          }
+        if (!needsLOD || spatialIndexHasLod(cached)) {
           return cached;
         }
-        // Promote a frustum-only tree by building a complete LOD candidate
-        // off-state. Mutating the accepted tree in place would make a failed
-        // GPU publication impossible to roll back exactly.
-        console.log(
-          `[HighPerfRenderer] Replacing the ${dim}D tree with an exact LOD generation...`
-        );
+        // A tree without levels where they are needed is replaced by one
+        // built with them (its draw order is banded, so it is a new order).
+        console.log(`[HighPerfRenderer] Replacing the ${dim}D spatial index with one carrying LOD levels...`);
       } else {
         console.log(`[HighPerfRenderer] Spatial index for ${dim}D is stale, rebuilding...`);
       }
@@ -3059,21 +3232,26 @@ export class HighPerfRenderer {
       );
     }
 
-    requireLodBuildHeapHeadroom(
-      pos.length / 3,
-      needsLOD,
-      `HighPerfRenderer ${dim}D live view`
-    );
+    // A tree built off the main thread was announced by its request.
+    const announce = prebuiltTree === null;
+    if (announce) {
+      requireLodBuildHeapHeadroom(
+        this.pointCount,
+        needsLOD,
+        `HighPerfRenderer ${dim}D live view`
+      );
+    }
     // Build a complete CPU candidate off-state. The prior exact CPU/GPU
     // generation remains authoritative until both candidate stages succeed.
-    console.log(`[HighPerfRenderer] Building ${dim}D spatial index...`);
     const notifications = getNotificationCenter();
     const treeNames = { 1: 'BinaryTree', 2: 'Quadtree', 3: 'Octree' };
-    const cellCount = pos.length / 3;
-    const notifId = notifications.startCalculation(
-      `Building ${dim}D ${treeNames[dim]} for live view (${cellCount.toLocaleString()} cells)`,
-      'spatial'
-    );
+    const cellCount = this.pointCount;
+    const notifId = announce
+      ? notifications.startCalculation(
+        `Building ${dim}D ${treeNames[dim]} for live view (${cellCount.toLocaleString()} cells)`,
+        'spatial'
+      )
+      : null;
 
     const startTime = performance.now();
     let candidateSpatialIndex = null;
@@ -3087,1001 +3265,60 @@ export class HighPerfRenderer {
         this.options.LOD_MAX_DEPTH,
         {
           buildLOD: needsLOD,
-          buildLodNodeMappings: false,
-          computeNodeStats: false
+          prebuiltTree,
+          prebuiltOrder,
         }
       );
 
+      // Publishing the tree is the whole publication: the live store adopts
+      // its draw order at the next render (`_ensureStoreDrawOrder`), and until
+      // then still holds a complete, consistent order of its own.
       const candidateSpatialIndices = new Map(previousSpatialIndices);
       candidateSpatialIndices.set(dim, candidateSpatialIndex);
-      // Publish CPU identity before the atomic GPU publisher commits. Its old
-      // handle retirement observers must always resolve the matching candidate
-      // CPU owner, never an absent or stale generation.
       this.spatialIndices = candidateSpatialIndices;
       candidateCpuPublished = true;
-      if (needsLOD) {
-        this._ensureLodResourcesForDimension(
-          dim,
-          candidateSpatialIndex
-        );
-      } else if (
-        this._lodResourceOwnersByDimension?.has(dim) ||
-        this.lodBuffersByDimension.has(dim) ||
-        this._lodIndexTexturesByDimension.has(dim)
-      ) {
-        // A tree-only candidate cannot retain topology from a different CPU
-        // generation. Detach it only after the new CPU owner is authoritative.
-        this._deleteLodResourcesForDimension(dim);
-      }
 
-      const elapsed = performance.now() - startTime;
-      console.log(
-        `[HighPerfRenderer] ${dim}D spatial index built in ${elapsed.toFixed(1)}ms`
-      );
-      settleCalculationNotification(
-        notifications,
-        notifId,
-        'completeCalculation',
-        `${dim}D ${treeNames[dim]} ready (live view)`,
-        elapsed
-      );
+      if (announce) {
+        settleCalculationNotification(
+          notifications,
+          notifId,
+          'completeCalculation',
+          `${dim}D ${treeNames[dim]} ready (live view)`,
+          performance.now() - startTime
+        );
+      }
       return candidateSpatialIndex;
     } catch (error) {
-      const candidateGpuOwner =
-        this._lodResourceOwnersByDimension?.get(dim) ?? null;
-      const candidateGpuPublished =
-        needsLOD &&
-        candidateGpuOwner?.spatialIndex === candidateSpatialIndex;
-      if (
-        !candidateCpuPublished ||
-        (needsLOD && !candidateGpuPublished)
-      ) {
-        // GPU staging is transactional and preserves its previous owner on
-        // failure, so restoring the exact map reference completes rollback.
+      if (!candidateCpuPublished) {
         this.spatialIndices = previousSpatialIndices;
       }
-      settleCalculationNotification(
-        notifications,
-        notifId,
-        'failCalculation',
-        `${dim}D ${treeNames[dim]} failed: ${describeError(error)}`
-      );
-      throw error;
-    }
-  }
-
-  _certifyLodResourcesForDimension(
-    dimensionLevel,
-    spatialIndex,
-    owner,
-    lodBuffers,
-    indexTextures
-  ) {
-    const current =
-      LOD_RESOURCE_READINESS_CERTIFICATES.get(owner) ?? null;
-    const levels = spatialIndex.lodLevels;
-    const topologyOwner = owner.topologyOwner;
-    if (
-      current !== null &&
-      current.dimensionLevel === dimensionLevel &&
-      current.spatialIndex === spatialIndex &&
-      current.levels === levels &&
-      current.levelCount === levels.length &&
-      current.ownerGenerationToken === owner.generationToken &&
-      current.maximumIndices === owner.maximumIndices &&
-      current.topologyOwner === topologyOwner &&
-      current.compactBuffer === owner.compactBuffer &&
-      current.compactVao === owner.compactVao &&
-      current.gpuByteLength === owner.gpuByteLength &&
-      current.lodBuffers === lodBuffers &&
-      current.lodBufferCount === lodBuffers.length &&
-      current.indexTextures === indexTextures &&
-      current.indexTextureCount === indexTextures.length &&
-      current.liveGeometryGeneration ===
-        this._liveGeometryGeneration &&
-      current.pointCount === this.pointCount &&
-      current.fullDetailVao === this.vao &&
-      current.fullDetailBuffer === this.buffers?.interleaved
-    ) {
-      return;
-    }
-    LOD_RESOURCE_READINESS_CERTIFICATES.set(
-      owner,
-      Object.freeze({
-        dimensionLevel,
-        spatialIndex,
-        levels,
-        levelCount: levels.length,
-        ownerGenerationToken: owner.generationToken,
-        maximumIndices: owner.maximumIndices,
-        topologyOwner,
-        compactBuffer: owner.compactBuffer,
-        compactVao: owner.compactVao,
-        gpuByteLength: owner.gpuByteLength,
-        lodBuffers,
-        lodBufferCount: lodBuffers.length,
-        indexTextures,
-        indexTextureCount: indexTextures.length,
-        liveGeometryGeneration: this._liveGeometryGeneration,
-        pointCount: this.pointCount,
-        fullDetailVao: this.vao,
-        fullDetailBuffer: this.buffers?.interleaved,
-      })
-    );
-  }
-
-  /**
-   * Return a renderer-certified LOD projection without rescanning every level.
-   * Uncertified, replaced, or externally assembled owners take the deep
-   * validator path and receive a certificate only after it accepts them.
-   */
-  _getCertifiedLodResourcesForDimension(
-    dimensionLevel,
-    spatialIndex
-  ) {
-    const dim = requireDimensionLevel(
-      dimensionLevel,
-      'HighPerfRenderer certified LOD resource dimensionLevel'
-    );
-    this._ensureLodResourceOwnershipState();
-    const owner =
-      this._lodResourceOwnersByDimension.get(dim) ?? null;
-    const lodBuffers =
-      this.lodBuffersByDimension.get(dim) ?? null;
-    const indexTextures =
-      this._lodIndexTexturesByDimension.get(dim) ?? null;
-    const certificate = owner === null
-      ? null
-      : LOD_RESOURCE_READINESS_CERTIFICATES.get(owner) ?? null;
-    if (
-      certificate !== null &&
-      certificate.dimensionLevel === dim &&
-      certificate.spatialIndex === spatialIndex &&
-      certificate.levels === spatialIndex?.lodLevels &&
-      certificate.levelCount === spatialIndex.lodLevels.length &&
-      certificate.ownerGenerationToken === owner.generationToken &&
-      certificate.maximumIndices === owner.maximumIndices &&
-      certificate.topologyOwner === owner.topologyOwner &&
-      certificate.compactBuffer === owner.compactBuffer &&
-      certificate.compactVao === owner.compactVao &&
-      certificate.gpuByteLength === owner.gpuByteLength &&
-      certificate.lodBuffers === lodBuffers &&
-      certificate.lodBufferCount === lodBuffers?.length &&
-      certificate.indexTextures === indexTextures &&
-      certificate.indexTextureCount === indexTextures?.length &&
-      certificate.liveGeometryGeneration ===
-        this._liveGeometryGeneration &&
-      certificate.pointCount === this.pointCount &&
-      certificate.fullDetailVao === this.vao &&
-      certificate.fullDetailBuffer === this.buffers?.interleaved
-    ) {
-      return lodBuffers;
-    }
-    return this._ensureLodResourcesForDimension(dim, spatialIndex);
-  }
-
-  _ensureLodResourcesForDimension(
-    dimensionLevel,
-    spatialIndex,
-    deferPublication = false
-  ) {
-    const dim = requireDimensionLevel(
-      dimensionLevel,
-      'HighPerfRenderer LOD resource dimensionLevel'
-    );
-    if (typeof deferPublication !== 'boolean') {
-      throw new TypeError(
-        'HighPerfRenderer deferred LOD preparation must be a boolean.'
-      );
-    }
-    if (
-      !spatialIndex ||
-      spatialIndex.positions !== this._positions ||
-      spatialIndex.dimensionLevel !== dim ||
-      spatialIndex.pointCount !== this.pointCount
-    ) {
-      throw new Error(
-        `HighPerfRenderer ${dim}D LOD resources require the exact live spatial owner.`
-      );
-    }
-    if (
-      !Array.isArray(spatialIndex.lodLevels) ||
-      spatialIndex.lodLevels.length === 0
-    ) {
-      spatialIndex.ensureLODLevels();
-    }
-
-    this._ensureLodResourceOwnershipState();
-    const owner =
-      this._lodResourceOwnersByDimension.get(dim) ?? null;
-    const lodBuffers =
-      this.lodBuffersByDimension.get(dim) ?? null;
-    const indexTextures =
-      this._lodIndexTexturesByDimension.get(dim) ?? null;
-    const levels = spatialIndex.lodLevels;
-    const reducedLevels = levels.slice(0, -1);
-    const maximumIndices =
-      reducedLevels.at(-1)?.indices ?? null;
-    const maximumCount = maximumIndices?.length ?? 0;
-    const topologyOwner = owner?.topologyOwner ?? null;
-    const ownerTextureLimit = topologyOwner?.maxTextureSize;
-    const expectedTextureWidth = maximumCount === 0
-      ? 0
-      : (
-        Number.isInteger(ownerTextureLimit) &&
-        ownerTextureLimit > 0
-          ? Math.min(maximumCount, ownerTextureLimit)
-          : -1
-      );
-    const expectedTextureHeight = maximumCount === 0
-      ? 0
-      : Math.ceil(maximumCount / expectedTextureWidth);
-    const expectedCompactBytes = maximumCount * 16;
-    const expectedIndexBytes =
-      maximumCount * Uint32Array.BYTES_PER_ELEMENT;
-    const expectedTextureBytes =
-      expectedTextureWidth >= 0
-        ? expectedTextureWidth *
-          expectedTextureHeight *
-          Uint32Array.BYTES_PER_ELEMENT
-        : -1;
-    const hasReducedGeneration = maximumCount > 0;
-    const ownerProjectionIsExact = (
-      owner !== null &&
-      owner.dimensionLevel === dim &&
-      owner.spatialIndex === spatialIndex &&
-      owner.maximumIndices === maximumIndices &&
-      owner.pointCount === this.pointCount &&
-      owner.liveGeometryGeneration ===
-        this._liveGeometryGeneration &&
-      owner.generationToken !== null &&
-      typeof owner.generationToken === 'object' &&
-      Object.isFrozen(owner.generationToken) &&
-      owner.compactBuffer !== null === hasReducedGeneration &&
-      owner.compactVao !== null === hasReducedGeneration &&
-      owner.compactByteLength === expectedCompactBytes &&
-      topologyOwner !== null &&
-      typeof topologyOwner === 'object' &&
-      topologyOwner.originalIndexBuffer !== null ===
-        hasReducedGeneration &&
-      topologyOwner.originalIndexByteLength ===
-        expectedIndexBytes &&
-      topologyOwner.indexTexture !== null ===
-        hasReducedGeneration &&
-      topologyOwner.textureWidth === expectedTextureWidth &&
-      topologyOwner.textureHeight === expectedTextureHeight &&
-      topologyOwner.indexTextureByteLength ===
-        expectedTextureBytes &&
-      owner.gpuByteLength ===
-        expectedCompactBytes +
-          expectedIndexBytes +
-          expectedTextureBytes &&
-      Array.isArray(lodBuffers) &&
-      lodBuffers.length === levels.length &&
-      Array.isArray(indexTextures) &&
-      indexTextures.length === levels.length &&
-      levels.every((level, levelIndex) => {
-        const metadata = lodBuffers[levelIndex];
-        const texture = indexTextures[levelIndex];
-        if (!metadata || !texture) return false;
-        if (levelIndex === levels.length - 1) {
-          return (
-            level?.isFullDetail === true &&
-            metadata.isFullDetail === true &&
-            metadata.vao === this.vao &&
-            metadata.buffer === this.buffers?.interleaved &&
-            metadata.pointCount === level.pointCount &&
-            metadata.depth === level.depth &&
-            metadata.sizeMultiplier === 1 &&
-            metadata.originalIndexBuffer === null &&
-            metadata.originalIndexCount === 0 &&
-            metadata.generationToken === null &&
-            texture.texture === null &&
-            texture.width === 0 &&
-            texture.height === 0 &&
-            texture.generationToken === null
-          );
-        }
-        return (
-          level?.isFullDetail !== true &&
-          metadata.isFullDetail === false &&
-          metadata.vao === owner.compactVao &&
-          metadata.buffer === owner.compactBuffer &&
-          metadata.pointCount === level.pointCount &&
-          metadata.depth === level.depth &&
-          metadata.sizeMultiplier === level.sizeMultiplier &&
-          metadata.originalIndexBuffer ===
-            topologyOwner.originalIndexBuffer &&
-          metadata.originalIndexCount === level.pointCount &&
-          metadata.generationToken === owner.generationToken &&
-          texture.texture === topologyOwner.indexTexture &&
-          texture.width === topologyOwner.textureWidth &&
-          texture.height === topologyOwner.textureHeight &&
-          texture.generationToken === owner.generationToken
-        );
-      })
-    );
-    if (
-      !ownerProjectionIsExact
-    ) {
-      if (owner !== null) {
-        LOD_RESOURCE_READINESS_CERTIFICATES.delete(owner);
-      }
-      return this._createLODResourcesForDimension(
-        dim,
-        spatialIndex,
-        deferPublication
-      );
-    }
-    this._certifyLodResourcesForDimension(
-      dim,
-      spatialIndex,
-      owner,
-      lodBuffers,
-      indexTextures
-    );
-    return deferPublication ? null : lodBuffers;
-  }
-
-  /**
-   * Atomically publish one maximum-prefix GPU generation for a dimension.
-   * Every reduced LOD is a non-owning view over the same compact VBO/VAO,
-   * original-ID EBO, and R32UI lookup texture. Full detail borrows the main
-   * publication and therefore owns neither topology nor vertex resources.
-   *
-   * @param {number} dimensionLevel - Exact dimension level.
-   * @param {SpatialIndex} spatialIndex - Exact live spatial generation.
-   * @returns {Array} Non-owning LOD buffer metadata.
-   */
-  _createLODResourcesForDimension(
-    dimensionLevel,
-    spatialIndex,
-    deferPublication = false
-  ) {
-    const dim = requireDimensionLevel(
-      dimensionLevel,
-      'HighPerfRenderer LOD resource dimensionLevel'
-    );
-    if (typeof deferPublication !== 'boolean') {
-      throw new TypeError(
-        'HighPerfRenderer deferred LOD publication must be a boolean.'
-      );
-    }
-    this._ensureLodResourceOwnershipState();
-
-    if (
-      spatialIndex === null ||
-      typeof spatialIndex !== 'object' ||
-      !Array.isArray(spatialIndex.lodLevels) ||
-      spatialIndex.lodLevels.length === 0
-    ) {
-      throw new TypeError(
-        `HighPerfRenderer ${dim}D LOD publication requires a non-empty exact spatial-index generation.`
-      );
-    }
-    if (spatialIndex.dimensionLevel !== dim) {
-      throw new Error(
-        `HighPerfRenderer ${dim}D LOD publication received a ${String(spatialIndex.dimensionLevel)}D spatial-index owner.`
-      );
-    }
-    const sourcePositions = spatialIndex.positions;
-    if (
-      !(sourcePositions instanceof Float32Array) ||
-      sourcePositions !== this._positions ||
-      sourcePositions.length !== this.pointCount * 3 ||
-      spatialIndex.pointCount !== this.pointCount
-    ) {
-      throw new Error(
-        `HighPerfRenderer ${dim}D LOD publication requires the exact ${this.pointCount}-point live position generation.`
-      );
-    }
-    if (
-      !(this._colors instanceof Uint8Array) ||
-      this._colors.length !== this.pointCount * 4
-    ) {
-      throw new Error(
-        `HighPerfRenderer ${dim}D LOD publication requires the exact live RGBA generation.`
-      );
-    }
-    if (!this.vao || !this.buffers?.interleaved) {
-      throw new Error(
-        'HighPerfRenderer requires staged full-detail resources before creating LOD resources.'
-      );
-    }
-
-    const levels = spatialIndex.lodLevels;
-    const fullDetail = levels.at(-1);
-    if (
-      !fullDetail ||
-      fullDetail.isFullDetail !== true ||
-      fullDetail.pointCount !== this.pointCount ||
-      fullDetail.positions !== sourcePositions
-    ) {
-      throw new Error(
-        `HighPerfRenderer ${dim}D LOD publication requires one exact full-detail terminal level.`
-      );
-    }
-    for (let levelIndex = 0; levelIndex < levels.length - 1; levelIndex++) {
-      if (levels[levelIndex]?.isFullDetail === true) {
-        throw new Error(
-          `HighPerfRenderer ${dim}D LOD ${levelIndex} places full detail before the terminal level.`
-        );
-      }
-    }
-
-    const reducedLevels = levels.slice(0, -1);
-    let maximumIndices = null;
-    let previousCount = 0;
-    for (
-      let levelIndex = 0;
-      levelIndex < reducedLevels.length;
-      levelIndex++
-    ) {
-      const level = reducedLevels[levelIndex];
-      const pointCount = level?.pointCount;
-      if (
-        !Number.isSafeInteger(pointCount) ||
-        pointCount < previousCount ||
-        pointCount > this.pointCount ||
-        !(level.indices instanceof Uint32Array) ||
-        level.indices.length !== pointCount
-      ) {
-        throw new Error(
-          `HighPerfRenderer ${dim}D reduced LOD ${levelIndex} must have a non-decreasing exact original-index count no larger than full detail.`
-        );
-      }
-      const sizeMultiplier = requireFiniteNumber(
-        level.sizeMultiplier,
-        `HighPerfRenderer ${dim}D LOD ${levelIndex} sizeMultiplier`
-      );
-      if (sizeMultiplier <= 0) {
-        throw new RangeError(
-          `HighPerfRenderer ${dim}D LOD ${levelIndex} sizeMultiplier must be positive.`
-        );
-      }
-      previousCount = pointCount;
-      maximumIndices = level.indices;
-    }
-    if (maximumIndices !== null) {
-      // Every reduced level is a prefix of this maximum order, so one range
-      // scan proves the original-ID domain for all of them.
-      for (let index = 0; index < maximumIndices.length; index++) {
-        if (maximumIndices[index] >= this.pointCount) {
-          throw new RangeError(
-            `HighPerfRenderer ${dim}D maximum reduced LOD original index ${maximumIndices[index]} is outside ${this.pointCount} points.`
-          );
-        }
-      }
-      for (
-        let levelIndex = 0;
-        levelIndex < reducedLevels.length;
-        levelIndex++
-      ) {
-        const levelIndices = reducedLevels[levelIndex].indices;
-        // SpatialIndex's production representation uses typed prefix views
-        // over one owner. Their buffer/offset/length tuple proves prefix
-        // equality in O(1); retain the value comparison for exact external
-        // fixtures or independently materialized compatible generations.
-        if (
-          levelIndices.buffer === maximumIndices.buffer &&
-          levelIndices.byteOffset === maximumIndices.byteOffset
-        ) {
-          continue;
-        }
-        for (let index = 0; index < levelIndices.length; index++) {
-          if (levelIndices[index] !== maximumIndices[index]) {
-            throw new Error(
-              `HighPerfRenderer ${dim}D LOD ${levelIndex} is not an exact prefix of the maximum reduced original-ID order.`
-            );
-          }
-        }
-      }
-    }
-
-    const gl = this.gl;
-    const maxTextureSize = gl.getParameter(gl.MAX_TEXTURE_SIZE);
-    if (!Number.isInteger(maxTextureSize) || maxTextureSize <= 0) {
-      throw new Error(
-        'HighPerfRenderer received an invalid MAX_TEXTURE_SIZE capability.'
-      );
-    }
-    const maximumCount = maximumIndices?.length ?? 0;
-    const textureWidth = maximumCount === 0
-      ? 0
-      : Math.min(maximumCount, maxTextureSize);
-    const textureHeight = maximumCount === 0
-      ? 0
-      : Math.ceil(maximumCount / textureWidth);
-    if (textureHeight > maxTextureSize) {
-      throw new RangeError(
-        `HighPerfRenderer ${dim}D maximum reduced LOD requires ${maximumCount.toLocaleString()} indices, exceeding the exact ${textureWidth}x${maxTextureSize} R32UI texture capacity.`
-      );
-    }
-
-    // All CPU contracts and capabilities are validated before the first GL
-    // allocation, so malformed prefix generations cannot perturb live state.
-    requireCleanWebGLState(
-      gl,
-      `HighPerfRenderer ${dim}D LOD publication preflight`
-    );
-
-    const compactByteLength = maximumCount * 16;
-    const packingScratch = maximumCount > 0
-      ? this._ensureSharedPackingScratch(
-        compactByteLength,
-        `HighPerfRenderer ${dim}D compact LOD packing`
-      )
-      : null;
-    if (maximumCount > 0) {
-      for (let compactIndex = 0; compactIndex < maximumCount; compactIndex++) {
-        const originalIndex = maximumIndices[compactIndex];
-        const sourceOffset = originalIndex * 3;
-        const floatOffset = compactIndex * 4;
-        const byteOffset = compactIndex * 16 + 12;
-        const colorOffset = originalIndex * 4;
-        packingScratch.positionView[floatOffset] =
-          sourcePositions[sourceOffset];
-        packingScratch.positionView[floatOffset + 1] =
-          sourcePositions[sourceOffset + 1];
-        packingScratch.positionView[floatOffset + 2] =
-          sourcePositions[sourceOffset + 2];
-        packingScratch.colorView[byteOffset] =
-          this._colors[colorOffset];
-        packingScratch.colorView[byteOffset + 1] =
-          this._colors[colorOffset + 1];
-        packingScratch.colorView[byteOffset + 2] =
-          this._colors[colorOffset + 2];
-        packingScratch.colorView[byteOffset + 3] =
-          this._colors[colorOffset + 3];
-      }
-    }
-    const generationToken = Object.freeze({});
-    const topologyOwner = {
-      originalIndexBuffer: null,
-      originalIndexByteLength: 0,
-      indexTexture: null,
-      indexTextureByteLength: 0,
-      maxTextureSize,
-      textureWidth,
-      textureHeight,
-    };
-    const candidateOwner = {
-      dimensionLevel: dim,
-      spatialIndex,
-      maximumIndices,
-      pointCount: this.pointCount,
-      liveGeometryGeneration: this._liveGeometryGeneration,
-      generationToken,
-      compactBuffer: null,
-      compactVao: null,
-      compactByteLength: 0,
-      topologyOwner,
-      gpuByteLength: 0,
-    };
-    const candidateLodBuffers = [];
-    const candidateIndexTextures = [];
-    const previousOwner =
-      this._lodResourceOwnersByDimension.get(dim) ?? null;
-    const previousLodBuffers =
-      this.lodBuffersByDimension.get(dim) ?? null;
-    const previousIndexTextures =
-      this._lodIndexTexturesByDimension.get(dim) ?? null;
-    // Prepare complete replacement projections before allocating WebGL
-    // resources. Publication later consists only of three non-fallible
-    // property assignments, so observers can never see a half-replaced
-    // dimension.
-    const candidateOwnersByDimension =
-      new Map(this._lodResourceOwnersByDimension);
-    // Even an all-full-detail tree owns a semantic generation. Retaining its
-    // zero-byte owner prevents every subsequent forced-LOD render from
-    // rebuilding identical metadata.
-    candidateOwnersByDimension.set(dim, candidateOwner);
-    const candidateBuffersByDimension =
-      new Map(this.lodBuffersByDimension);
-    candidateBuffersByDimension.set(dim, candidateLodBuffers);
-    const candidateTexturesByDimension =
-      new Map(this._lodIndexTexturesByDimension);
-    candidateTexturesByDimension.set(dim, candidateIndexTextures);
-
-    try {
-      if (maximumCount > 0) {
-        candidateOwner.compactBuffer = gl.createBuffer();
-        if (!candidateOwner.compactBuffer) {
-          throw new Error(
-            `HighPerfRenderer could not allocate the ${dim}D compact LOD point buffer.`
-          );
-        }
-        gl.bindBuffer(gl.ARRAY_BUFFER, candidateOwner.compactBuffer);
-        gl.bufferData(
-          gl.ARRAY_BUFFER,
-          packingScratch.buffer.byteLength === compactByteLength
-            ? packingScratch.buffer
-            : new Uint8Array(
-              packingScratch.buffer,
-              0,
-              compactByteLength
-            ),
-          gl.STATIC_DRAW
-        );
-        requireCleanWebGLState(
-          gl,
-          `HighPerfRenderer ${dim}D compact LOD point upload`
-        );
-        candidateOwner.compactByteLength = compactByteLength;
-
-        candidateOwner.compactVao = gl.createVertexArray();
-        if (!candidateOwner.compactVao) {
-          throw new Error(
-            `HighPerfRenderer could not allocate the ${dim}D compact LOD vertex state.`
-          );
-        }
-        gl.bindVertexArray(candidateOwner.compactVao);
-        gl.bindBuffer(gl.ARRAY_BUFFER, candidateOwner.compactBuffer);
-        gl.enableVertexAttribArray(0);
-        gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 16, 0);
-        gl.enableVertexAttribArray(1);
-        gl.vertexAttribPointer(
-          1,
-          4,
-          gl.UNSIGNED_BYTE,
-          true,
-          16,
-          12
-        );
-
-        topologyOwner.originalIndexBuffer = gl.createBuffer();
-        if (!topologyOwner.originalIndexBuffer) {
-          throw new Error(
-            `HighPerfRenderer could not allocate the ${dim}D maximum-prefix original-index buffer.`
-          );
-        }
-        gl.bindBuffer(
-          gl.ELEMENT_ARRAY_BUFFER,
-          topologyOwner.originalIndexBuffer
-        );
-        gl.bufferData(
-          gl.ELEMENT_ARRAY_BUFFER,
-          maximumIndices,
-          gl.STATIC_DRAW
-        );
-        requireCleanWebGLState(
-          gl,
-          `HighPerfRenderer ${dim}D maximum-prefix original-index upload`
-        );
-        topologyOwner.originalIndexByteLength =
-          maximumCount * Uint32Array.BYTES_PER_ELEMENT;
-        // ELEMENT_ARRAY_BUFFER is VAO state. Detach topology while this exact
-        // staging VAO is still bound so later retirement cannot leave a
-        // deleted EBO reachable through it.
-        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, null);
-        gl.bindVertexArray(null);
-
-        topologyOwner.indexTexture = gl.createTexture();
-        if (!topologyOwner.indexTexture) {
-          throw new Error(
-            `HighPerfRenderer could not allocate the ${dim}D maximum-prefix index texture.`
-          );
-        }
-        gl.bindTexture(gl.TEXTURE_2D, topologyOwner.indexTexture);
-        this._withNeutralTextureUnpackState(
-          4,
-          `HighPerfRenderer ${dim}D maximum-prefix index texture`,
-          () => {
-            // Allocate immutable logical storage without duplicating the
-            // maximum prefix into a padded width*height CPU array.
-            gl.texImage2D(
-              gl.TEXTURE_2D,
-              0,
-              gl.R32UI,
-              textureWidth,
-              textureHeight,
-              0,
-              gl.RED_INTEGER,
-              gl.UNSIGNED_INT,
-              null
-            );
-            requireCleanWebGLState(
-              gl,
-              `HighPerfRenderer ${dim}D maximum-prefix index-texture allocation`
-            );
-            topologyOwner.indexTextureByteLength =
-              textureWidth *
-              textureHeight *
-              Uint32Array.BYTES_PER_ELEMENT;
-
-            const completeRows =
-              Math.floor(maximumCount / textureWidth);
-            const completeValueCount =
-              completeRows * textureWidth;
-            if (completeRows > 0) {
-              gl.texSubImage2D(
-                gl.TEXTURE_2D,
-                0,
-                0,
-                0,
-                textureWidth,
-                completeRows,
-                gl.RED_INTEGER,
-                gl.UNSIGNED_INT,
-                maximumIndices.subarray(0, completeValueCount)
-              );
-              requireCleanWebGLState(
-                gl,
-                `HighPerfRenderer ${dim}D complete index-texture rows`
-              );
-            }
-            const remainingValues =
-              maximumCount - completeValueCount;
-            if (remainingValues > 0) {
-              gl.texSubImage2D(
-                gl.TEXTURE_2D,
-                0,
-                0,
-                completeRows,
-                remainingValues,
-                1,
-                gl.RED_INTEGER,
-                gl.UNSIGNED_INT,
-                maximumIndices.subarray(completeValueCount)
-              );
-              requireCleanWebGLState(
-                gl,
-                `HighPerfRenderer ${dim}D terminal index-texture row`
-              );
-            }
-          }
-        );
-        gl.texParameteri(
-          gl.TEXTURE_2D,
-          gl.TEXTURE_MIN_FILTER,
-          gl.NEAREST
-        );
-        gl.texParameteri(
-          gl.TEXTURE_2D,
-          gl.TEXTURE_MAG_FILTER,
-          gl.NEAREST
-        );
-        gl.texParameteri(
-          gl.TEXTURE_2D,
-          gl.TEXTURE_WRAP_S,
-          gl.CLAMP_TO_EDGE
-        );
-        gl.texParameteri(
-          gl.TEXTURE_2D,
-          gl.TEXTURE_WRAP_T,
-          gl.CLAMP_TO_EDGE
-        );
-        gl.bindTexture(gl.TEXTURE_2D, null);
-      }
-
-      for (
-        let levelIndex = 0;
-        levelIndex < reducedLevels.length;
-        levelIndex++
-      ) {
-        const level = reducedLevels[levelIndex];
-        candidateLodBuffers.push({
-          vao: candidateOwner.compactVao,
-          buffer: candidateOwner.compactBuffer,
-          pointCount: level.pointCount,
-          depth: level.depth,
-          isFullDetail: false,
-          sizeMultiplier: level.sizeMultiplier,
-          originalIndexBuffer: topologyOwner.originalIndexBuffer,
-          originalIndexCount: level.pointCount,
-          generationToken,
-        });
-        candidateIndexTextures.push({
-          texture: topologyOwner.indexTexture,
-          width: textureWidth,
-          height: textureHeight,
-          generationToken,
-        });
-      }
-      candidateLodBuffers.push({
-        vao: this.vao,
-        buffer: this.buffers.interleaved,
-        pointCount: fullDetail.pointCount,
-        depth: fullDetail.depth,
-        isFullDetail: true,
-        sizeMultiplier: 1,
-        originalIndexBuffer: null,
-        originalIndexCount: 0,
-        generationToken: null,
-      });
-      candidateIndexTextures.push({
-        texture: null,
-        width: 0,
-        height: 0,
-        generationToken: null,
-      });
-      candidateOwner.gpuByteLength =
-        candidateOwner.compactByteLength +
-        topologyOwner.originalIndexByteLength +
-        topologyOwner.indexTextureByteLength;
-      for (const metadata of candidateLodBuffers) {
-        Object.freeze(metadata);
-      }
-      for (const metadata of candidateIndexTextures) {
-        Object.freeze(metadata);
-      }
-      Object.freeze(candidateLodBuffers);
-      Object.freeze(candidateIndexTextures);
-      Object.freeze(topologyOwner);
-      Object.freeze(candidateOwner);
-
-      requireCleanWebGLState(
-        gl,
-        `HighPerfRenderer ${dim}D atomic LOD resource publication`
-      );
-    } catch (error) {
-      const cleanupErrors = [];
-      try {
-        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, null);
-        gl.bindVertexArray(null);
-        gl.bindBuffer(gl.ARRAY_BUFFER, null);
-        gl.bindTexture(gl.TEXTURE_2D, null);
-      } catch (cleanupError) {
-        cleanupErrors.push(cleanupError);
-      }
-      if (
-        candidateOwner.compactBuffer ||
-        candidateOwner.compactVao ||
-        topologyOwner.originalIndexBuffer ||
-        topologyOwner.indexTexture
-      ) {
-        this._queueDataRetirement({
-          buffers: {},
-          vao: null,
-          pointCount: 0,
-          perViewState: null,
-          lodResourceOwnersByDimension:
-            new Map([[dim, candidateOwner]]),
-          lodBuffersByDimension: new Map(),
-          lodIndexTexturesByDimension: new Map(),
-          alphaTexture: null,
-          alphaTexWidth: 0,
-          alphaTexHeight: 0,
-        });
-        cleanupErrors.push(...this._drainDataRetirements());
-      }
-      if (cleanupErrors.length > 0) {
-        throw new AggregateError(
-          [error, ...cleanupErrors],
-          `HighPerfRenderer ${dim}D LOD publication failed and cleanup reported ${cleanupErrors.length} error(s).`
+      if (announce) {
+        settleCalculationNotification(
+          notifications,
+          notifId,
+          'failCalculation',
+          `${dim}D ${treeNames[dim]} failed: ${describeError(error)}`
         );
       }
       throw error;
     }
-
-    if (deferPublication) {
-      return {
-        dimensionLevel: dim,
-        spatialIndex,
-        candidateOwner,
-        candidateLodBuffers,
-        candidateIndexTextures,
-        previousOwner,
-        previousLodBuffers,
-        previousIndexTextures
-      };
-    }
-
-    // Staging and cleanup are now finished. From this point forward the
-    // candidate is authoritative: later accounting or old-generation
-    // retirement can never route through candidate rollback.
-    this._lodResourceOwnersByDimension =
-      candidateOwnersByDimension;
-    this.lodBuffersByDimension = candidateBuffersByDimension;
-    this._lodIndexTexturesByDimension =
-      candidateTexturesByDimension;
-    this._dirtyLodDimensions.delete(dim);
-    this._certifyLodResourcesForDimension(
-      dim,
-      spatialIndex,
-      candidateOwner,
-      candidateLodBuffers,
-      candidateIndexTextures
-    );
-    this._refreshGpuMemoryStats();
-
-    if (
-      previousOwner ||
-      previousLodBuffers ||
-      previousIndexTextures
-    ) {
-      this._queueDataRetirement({
-        buffers: {},
-        vao: null,
-        pointCount: 0,
-        perViewState: null,
-        lodResourceOwnersByDimension: previousOwner
-          ? new Map([[dim, previousOwner]])
-          : new Map(),
-        lodBuffersByDimension: previousLodBuffers
-          ? new Map([[dim, previousLodBuffers]])
-          : new Map(),
-        lodIndexTexturesByDimension: previousIndexTextures
-          ? new Map([[dim, previousIndexTextures]])
-          : new Map(),
-        alphaTexture: null,
-        alphaTexWidth: 0,
-        alphaTexHeight: 0,
-      });
-      // The candidate is authoritative. Retirement failures stay retry-owned
-      // and byte-accounted; they never roll back a valid generation.
-      this._drainDataRetirements();
-    }
-    console.log(
-      `[HighPerfRenderer] Published one shared ${maximumCount.toLocaleString()}-point LOD prefix for ${dim}D (${reducedLevels.length} reduced levels)`
-    );
-    return candidateLodBuffers;
   }
 
   /**
-   * Get LOD buffers for a specific dimension level.
-   * Creates them if they don't exist and spatial index is available.
-   * @param {number} dimensionLevel - Dimension level (1, 2, or 3)
-   * @returns {Array} LOD buffers array for the dimension (may be empty)
-   */
-  getLodBuffersForDimension(dimensionLevel) {
-    this._assertOperational('get or build LOD buffers');
-    return getReadOnlyLodProjection(
-      this._getLodBuffersForDimension(dimensionLevel)
-    );
-  }
-
-  /**
-   * Resolve the exact internal draw projection without a public defensive
-   * copy/proxy on the pane-cadence path.
+   * Show another representation in the live view: replace only its
+   * positions, keeping the published colours, transparency and alpha texture
+   * (they are per cell, not per representation). The live dimension is the
+   * dimension of the published positions, so this is the only way the live
+   * view changes dimension.
    *
-   * @private
-   */
-  _getLodBuffersForDimension(dimensionLevel) {
-    const dim = requireDimensionLevel(
-      dimensionLevel,
-      'HighPerfRenderer LOD-buffer dimensionLevel'
-    );
-
-    // Check if we already have LOD buffers for this dimension
-    if (this.lodBuffersByDimension.has(dim)) {
-      return this.lodBuffersByDimension.get(dim);
-    }
-
-    // Try to create them if spatial index exists
-    const spatialIndex = this.spatialIndices.get(dim);
-    if (spatialIndex && this._needsLodResources(-1)) {
-      return this._ensureLodResourcesForDimension(
-        dim,
-        spatialIndex
-      );
-    }
-
-    return EMPTY_LOD_PROJECTION;
-  }
-
-  /**
-   * Set the current dimension level for the live view.
-   * This determines which spatial index is used for rendering.
-   * @param {number} dimensionLevel - Dimension level (1, 2, or 3)
-   */
-  setDimensionLevel(dimensionLevel) {
-    this._assertOperational('set the live dimension');
-    const dim = requireDimensionLevel(
-      dimensionLevel,
-      'HighPerfRenderer active dimensionLevel'
-    );
-    if (dim !== this.currentDimensionLevel) {
-      console.log(`[HighPerfRenderer] Switching from ${this.currentDimensionLevel}D to ${dim}D`);
-      this.currentDimensionLevel = dim;
-      // Spatial index will be created lazily when needed (LOD/frustum culling enabled)
-    }
-  }
-
-  /**
-   * Update positions only (for dimension switching) - keeps existing colors and transparency
-   * More efficient than full loadData when only positions change
-   * @param {Float32Array} positions - New positions array (n_points * 3)
+   * The position stream and spatial tree come from the representation's
+   * pooled geometry when a kept view shows it or it was shown lately (no
+   * upload, no tree build); otherwise the positions are uploaded once. The
+   * geometry the live view leaves is retained (see `evictRetainedGeometry`),
+   * so switching back is as cheap. Everything else is one transactional
+   * publication like `loadData`: a failure restores the previous one exactly.
+   *
+   * @param {Float32Array} positions - New positions (n_points * dimensionLevel)
    * @param {number} dimensionLevel - Exact dimension level (1, 2, or 3).
    */
   updatePositions(positions, dimensionLevel) {
@@ -4094,340 +3331,595 @@ export class HighPerfRenderer {
       'HighPerfRenderer updatePositions dimensionLevel'
     );
 
-    const expectedLength = this.pointCount * 3;
+    const expectedLength = this.pointCount * newDimLevel;
     if (positions.length !== expectedLength) {
       throw new RangeError(
         `HighPerfRenderer updatePositions expected ${expectedLength} floats, received ${positions.length}.`
       );
     }
 
-    if (!(this._colors instanceof Uint8Array)) {
+    if (!(this._colors instanceof Uint8Array) || !this.buffers?.colors) {
       throw new Error(
         'HighPerfRenderer cannot update positions before exact color data is published.'
       );
     }
-    const loadOptions = {
-      buildSpatialIndex: this._needsSpatialIndex(-1),
-      dimensionLevel: newDimLevel,
-    };
-    if (this._currentAlphas !== null) {
-      loadOptions.alphaValues = this._currentAlphas;
+    if (positions === this._positions && newDimLevel === this.currentDimensionLevel) {
+      return this.stats;
     }
-    this.loadData(positions, this._colors, loadOptions);
-  }
-
-  /**
-   * Transactionally rebuild the active dimension's spatial generation.
-   * Other exact dimension caches remain reusable for multiview rendering.
-   */
-  rebuildSpatialIndex() {
-    this._assertOperational('rebuild the spatial index');
-    if (!this._positions || !this._colors) return;
-
-    // Only rebuild if LOD/frustum culling is currently enabled at runtime
-    const needsSpatialIndex = this._needsSpatialIndex(-1);
-    if (needsSpatialIndex && this.pointCount > 10000) {
-      console.log(`[HighPerfRenderer] Rebuilding ${this.currentDimensionLevel}D spatial index...`);
-
-      // Stage off-state, publish the candidate CPU identity, atomically replace
-      // its GPU generation, and only then retire the superseded active owner.
-      // A failure preserves all dimension/view/bounds/force-LOD state.
-      const spatialIndex = this._getOrBuildSpatialIndexForDimension(
-        this.currentDimensionLevel,
-        true
-      );
-      if (spatialIndex) {
-        spatialIndex._lastLODLevel = undefined;
-        this._boundingSphere = spatialIndex.getBoundingSphere();
-
-        // Clear all per-view caches since spatial index structure changed
-        this.clearAllViewState();
-
-        // Reset forced LOD level when spatial index changes - old level may be invalid
-        if (this.forceLODLevel >= 0) {
-          console.log('[HighPerfRenderer] Resetting forceLODLevel to auto (-1) after spatial index rebuild');
-          this.forceLODLevel = -1;
-        }
-
-      }
-    }
-  }
-
-  _createInterleavedBuffer(positions, colors) {
     const gl = this.gl;
-    const pointCount = positions.length / 3;
+    requireCleanWebGLState(gl, 'HighPerfRenderer position publication');
+    this._ensureGeometryOwnershipState();
+    const previous = this._captureDataPublication();
+    const donor = this._findPooledGeometry(positions, newDimLevel);
+    let candidateInstalled = false;
+    let uploadedPositionBuffer = null;
+    const startTime = performance.now();
+    try {
+      this._installCandidateDataPublication(previous);
+      candidateInstalled = true;
+      // Per-cell state moves to the candidate unchanged.
+      this.buffers.colors = previous.buffers.colors;
+      this._colorGpuByteLength = previous.colorGpuByteLength;
+      this._alphaTexture = previous.alphaTexture;
+      this._alphaTextureByteLength = previous.alphaTextureByteLength;
+      this._alphaTexWidth = previous.alphaTexWidth;
+      this._alphaTexHeight = previous.alphaTexHeight;
+      this._alphaTexPlan = previous.alphaTexPlan;
+      this._alphaTexData = previous.alphaTexData;
+      this._alphaTexStagingData = previous.alphaTexStagingData;
+      this._useAlphaTexture = previous.useAlphaTexture;
+      this._currentAlphas = previous.currentAlphas;
+      this._colors = previous.colors;
+      this._colorsDirty = previous.colorsDirty;
+      this._firstRenderDone = previous.firstRenderDone;
+      this.pointCount = previous.pointCount;
+      this.currentDimensionLevel = newDimLevel;
+      this._positions = positions;
 
-    if (!this.buffers.interleaved) {
-      this.buffers.interleaved = gl.createBuffer();
-      if (!this.buffers.interleaved) {
-        throw new Error(
-          'HighPerfRenderer could not allocate the interleaved point buffer.'
+      const donorTree = donor?.spatialIndices?.get(newDimLevel) ?? null;
+      if (donorTree !== null && donorTree.positions === positions) {
+        // The tree follows the renderer's colour generation, as on recolour.
+        donorTree.colors = this._colors;
+        const fullDetailLevel = donorTree.lodLevels?.at(-1);
+        if (fullDetailLevel?.isFullDetail === true) fullDetailLevel.colors = this._colors;
+        this.spatialIndices = new Map([[newDimLevel, donorTree]]);
+      }
+      // New positions go up in source order. A tree LOD or culling needs is
+      // built off the main thread when the view next draws.
+      if (donor !== null && donor.positionBuffer !== null) {
+        // The donor's store, in the draw order it holds.
+        this.buffers.positions = donor.positionBuffer;
+        this._positionGpuByteLength = donor.positionBufferByteLength;
+        this._liveGeometryGeneration = donor.generation;
+        this._liveOrder = donor.order ?? null;
+      } else {
+        uploadedPositionBuffer = gl.createBuffer();
+        if (!uploadedPositionBuffer) {
+          throw new Error('HighPerfRenderer could not allocate the point position buffer.');
+        }
+        gl.bindBuffer(gl.ARRAY_BUFFER, uploadedPositionBuffer);
+        this._liveOrder = null;
+        this._positionGpuByteLength = this._allocateVertexStore(
+          positions,
+          gl.STATIC_DRAW,
+          this.pointCount,
+          'HighPerfRenderer point-position upload'
+        );
+        gl.bindBuffer(gl.ARRAY_BUFFER, null);
+        this.buffers.positions = uploadedPositionBuffer;
+        this._liveGeometryGeneration = donor !== null
+          ? donor.generation
+          : this._allocateGeometryGeneration();
+      }
+      // The moved colour store keeps the order it holds; the next render
+      // regathers it into the new geometry's order when they differ.
+      this._liveColorOrder = previous.liveColorOrder ?? null;
+      gl.bindVertexArray(this.vao);
+      this._bindPointAttributes(this.buffers.positions, this.buffers.colors, newDimLevel);
+      gl.bindVertexArray(null);
+      this._boundingSphere = donor?.boundingSphere
+        ?? this._computeBoundingSphere(positions, newDimLevel);
+      requireCleanWebGLState(gl, 'HighPerfRenderer candidate position publication');
+      Object.assign(this.stats, {
+        lastFrameTime: 0,
+        fps: 0,
+        visiblePoints: 0,
+        lodLevel: -1,
+        drawCalls: 0,
+        frustumCulled: false,
+        cullPercent: 0,
+      });
+    } catch (error) {
+      const cleanupErrors = [];
+      if (candidateInstalled) {
+        const rejected = this._captureDataPublication();
+        this._restoreDataPublication(previous);
+        // Only what the candidate created is retired: the moved colour and
+        // alpha owners and a donor's buffer belong to their owners.
+        cleanupErrors.push(...this._retireDataPublication({
+          ...rejected,
+          // A donor's order stays the donor's.
+          liveOrder: uploadedPositionBuffer === null ? null : rejected.liveOrder,
+          buffers: { positions: uploadedPositionBuffer, colors: null },
+          positionGpuByteLength: uploadedPositionBuffer === null ? 0 : rejected.positionGpuByteLength,
+          colorGpuByteLength: 0,
+          alphaTexture: null,
+          alphaTextureByteLength: 0,
+        }));
+      }
+      try {
+        gl.bindVertexArray(null);
+        gl.bindBuffer(gl.ARRAY_BUFFER, null);
+        gl.getError();
+      } catch (cleanupError) {
+        cleanupErrors.push(cleanupError);
+      }
+      if (cleanupErrors.length > 0) {
+        throw new AggregateError(
+          [error, ...cleanupErrors],
+          `HighPerfRenderer position publication failed and rollback reported ${cleanupErrors.length} cleanup error(s).`
         );
       }
+      throw error;
     }
 
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.buffers.interleaved);
-    this._interleavedGpuByteLength = this._uploadInterleavedPointStore(
-      pointCount,
-      gl.STATIC_DRAW,
-      'HighPerfRenderer interleaved point-buffer upload',
-      (positionView, colorView, firstPoint, count) => {
-        this._packInterleavedChunk(
-          positions,
-          colors,
-          positionView,
-          colorView,
-          firstPoint,
-          count
-        );
+    // Commit. The donor's buffer is now the live view's; its pool record
+    // borrows it back (and owns it again when the live view moves on).
+    if (donor !== null) {
+      if (donor.positionBuffer === null) {
+        donor.positionBuffer = uploadedPositionBuffer;
+        donor.positionBufferByteLength = this._positionGpuByteLength;
       }
+      // Its store's order is the live view's while it lends the store.
+      donor.order = null;
+      donor.borrowsLivePositionBuffer = true;
+      donor.retained = false;
+      donor.lastUsed = performance.now();
+      donor.boundingSphere = this._boundingSphere;
+    }
+    this._retireDataPublication(this._retainLeavingLiveGeometry(previous));
+    // Kept views of the geometry the live view left draw it with their own
+    // tree now (the pooled one); those of the geometry it adopted draw from
+    // the live owner. Both start from fresh per-view state.
+    for (const [snapshotId, snapshot] of this.snapshotBuffers) {
+      if (
+        snapshot.geometryGeneration === previous.liveGeometryGeneration ||
+        snapshot.geometryGeneration === this._liveGeometryGeneration
+      ) {
+        this.invalidateViewState(snapshotId);
+      }
+    }
+    this._refreshGpuMemoryStats();
+    console.log(
+      `[HighPerfRenderer] Live view shows ${newDimLevel}D positions ` +
+      `(${donor !== null ? 'cached geometry' : 'uploaded'}) in ${(performance.now() - startTime).toFixed(1)}ms`
     );
-
-    // Setup VAO
-    gl.bindVertexArray(this.vao);
-    this._setupInterleavedAttributes();
-    gl.bindVertexArray(null);
-    requireCleanWebGLState(
-      gl,
-      'HighPerfRenderer interleaved point-buffer publication'
-    );
+    return this.stats;
   }
 
   /**
-   * Pack one sequential run of points into the fixed staging block.
+   * The geometry the live view leaves stays available: a pool record that
+   * borrows its buffer takes it over (with the live tree); otherwise a new
+   * retained record owns buffer and tree. Returns the publication to retire
+   * without the moved colour/alpha owners and without that buffer.
    *
-   * `colors` is a Uint8Array of RGBA bytes; alpha travels in the fourth byte.
-   * Destination slots are `0..count-1` of the block, source points are
-   * `firstPoint..firstPoint+count-1`, so the run is contiguous on both sides.
+   * @param {Object} previous - The captured previous publication.
+   * @returns {Object}
+   * @private
+   */
+  _retainLeavingLiveGeometry(previous) {
+    const positionBuffer = previous.buffers?.positions ?? null;
+    const dimension = previous.currentDimensionLevel;
+    const tree = previous.spatialIndices?.get(dimension) ?? null;
+    let record = null;
+    for (const geometry of this._snapshotGeometryPools.values()) {
+      if (geometry.positionBuffer === positionBuffer && positionBuffer !== null) {
+        record = geometry;
+        break;
+      }
+    }
+    if (record === null && positionBuffer !== null && previous.positions instanceof Float32Array) {
+      record = {
+        generation: previous.liveGeometryGeneration,
+        dimension,
+        positions: previous.positions,
+        positionBuffer,
+        // A publication records its exact store size; its positions' byte
+        // length is the same store when the record is older than that field.
+        positionBufferByteLength: Number.isSafeInteger(previous.positionGpuByteLength)
+          ? previous.positionGpuByteLength
+          : previous.positions.byteLength,
+        borrowsLivePositionBuffer: false,
+        refCount: 0,
+        retained: true,
+        lastUsed: performance.now(),
+        spatialIndices: new Map(),
+      };
+      this._snapshotGeometryPools.set(record.generation, record);
+    }
+    if (record !== null) {
+      record.borrowsLivePositionBuffer = false;
+      record.boundingSphere = previous.boundingSphere;
+      // The store keeps the order it holds, and its permutation with it.
+      record.order = previous.liveOrder ?? null;
+      if (tree !== null && tree.positions === record.positions) {
+        record.spatialIndices.set(dimension, tree);
+      }
+      if (record.refCount === 0) {
+        record.retained = true;
+        record.lastUsed = performance.now();
+      }
+    }
+    const retirement = {
+      ...previous,
+      liveOrder: record === null ? previous.liveOrder : null,
+      buffers: { positions: record === null ? positionBuffer : null, colors: null },
+      colorGpuByteLength: 0,
+      alphaTexture: null,
+      alphaTextureByteLength: 0,
+      // The trees move to the pool; only GPU LOD projections retire.
+      spatialIndices: new Map(),
+    };
+    queueMicrotask(() => {
+      if (!this._disposed) this.evictRetainedGeometry();
+    });
+    return retirement;
+  }
+
+  /**
+   * Publish the vertex streams for one dataset generation, in source order:
+   * each store is allocated straight from the published typed array -- the
+   * Float32 positions with exactly `dimension` components per point, and the
+   * RGBA8 colors -- so nothing is repacked, padded or copied on the client.
+   * A tree's order is adopted when a frame first needs it (`_ensureStoreDrawOrder`). The color
+   * stream is `DYNAMIC_DRAW` because a recolor rewrites it in place;
+   * positions change only through a new publication.
    *
    * @param {Float32Array} positions
    * @param {Uint8Array} colors
-   * @param {Float32Array} positionView
-   * @param {Uint8Array} colorView
-   * @param {number} firstPoint
-   * @param {number} count
+   * @param {number} dimension - Components per position (1, 2 or 3).
    */
-  _packInterleavedChunk(
-    positions,
-    colors,
-    positionView,
-    colorView,
-    firstPoint,
-    count
-  ) {
-    for (let slot = 0; slot < count; slot++) {
-      const point = firstPoint + slot;
-      const positionOffset = point * 3;
-      const colorOffset = point * 4;
-      const floatOffset = slot * 4; // 16 bytes / 4 = 4 floats per point
-      const byteOffset = slot * 16 + 12; // color starts at byte 12 of the block
-
-      positionView[floatOffset] = positions[positionOffset];
-      positionView[floatOffset + 1] = positions[positionOffset + 1];
-      positionView[floatOffset + 2] = positions[positionOffset + 2];
-
-      colorView[byteOffset] = colors[colorOffset];
-      colorView[byteOffset + 1] = colors[colorOffset + 1];
-      colorView[byteOffset + 2] = colors[colorOffset + 2];
-      colorView[byteOffset + 3] = colors[colorOffset + 3];
-    }
-  }
-
-  /**
-   * The fixed staging block every full-detail interleaved upload packs through.
-   *
-   * One constant-size allocation for the renderer's lifetime. Keeping it
-   * independent of `pointCount` is what removes the client-side duplicate of
-   * the vertex buffer, and with it 16 bytes a point of resident memory.
-   *
-   * @returns {{colorView: Uint8Array, positionView: Float32Array}}
-   */
-  _ensureInterleavedChunkScratch() {
-    const byteLength = INTERLEAVED_CHUNK_POINTS * 16;
-    let buffer = this._interleavedChunkBuffer;
-    if (
-      !(buffer instanceof ArrayBuffer) ||
-      buffer.byteLength !== byteLength
-    ) {
-      buffer = new ArrayBuffer(byteLength);
-      this._interleavedChunkBuffer = buffer;
-      this._interleavedChunkPositionView = null;
-      this._interleavedChunkColorView = null;
-    }
-    if (
-      !(this._interleavedChunkPositionView instanceof Float32Array) ||
-      this._interleavedChunkPositionView.buffer !== buffer
-    ) {
-      this._interleavedChunkPositionView = new Float32Array(buffer);
-    }
-    if (
-      !(this._interleavedChunkColorView instanceof Uint8Array) ||
-      this._interleavedChunkColorView.buffer !== buffer
-    ) {
-      this._interleavedChunkColorView = new Uint8Array(buffer);
-    }
-    return {
-      colorView: this._interleavedChunkColorView,
-      positionView: this._interleavedChunkPositionView,
-    };
-  }
-
-  /**
-   * Size the bound interleaved store on the GPU, then fill it chunk by chunk.
-   *
-   * `packChunk(positionView, colorView, firstPoint, count)` writes exactly
-   * `count` points into slots `0..count-1` of the staging block. Every caller
-   * fills its destination strictly sequentially, so each chunk is packed once,
-   * uploaded once, and never revisited: the accepted store is byte-identical to
-   * the one a single whole-buffer `bufferData` would have produced.
-   *
-   * Only the sizing `bufferData` can fail for want of memory -- every
-   * `bufferSubData` after it writes inside an allocation that already
-   * succeeded. A torn chunk sequence is therefore not reachable through
-   * exhaustion, and where one is reachable at all the caller's dirty flag
-   * survives the throw and the next flush republishes the whole store.
-   *
-   * @param {number} pointCount
-   * @param {number} usage
-   * @param {string} owner
-   * @param {(
-   *   positionView: Float32Array,
-   *   colorView: Uint8Array,
-   *   firstPoint: number,
-   *   count: number,
-   * ) => void} packChunk
-   * @returns {number} the accepted store's byte length
-   */
-  _uploadInterleavedPointStore(pointCount, usage, owner, packChunk) {
+  _createPointStreams(positions, colors, dimension) {
     const gl = this.gl;
-    const byteLength = pointCount * 16; // 16 bytes per point
-    gl.bufferData(gl.ARRAY_BUFFER, byteLength, usage);
-    const allocationError = gl.getError();
-    if (allocationError !== gl.NO_ERROR) {
-      throw new RangeError(
-        `${owner} could not allocate ${byteLength.toLocaleString()} bytes of point storage for ${pointCount.toLocaleString()} points (WebGL error 0x${allocationError.toString(16)}).`
-      );
-    }
-    if (pointCount > 0) {
-      const {
-        colorView,
-        positionView,
-      } = this._ensureInterleavedChunkScratch();
-      for (
-        let firstPoint = 0;
-        firstPoint < pointCount;
-        firstPoint += INTERLEAVED_CHUNK_POINTS
-      ) {
-        const count = Math.min(
-          INTERLEAVED_CHUNK_POINTS,
-          pointCount - firstPoint
-        );
-        packChunk(positionView, colorView, firstPoint, count);
-        gl.bufferSubData(
-          gl.ARRAY_BUFFER,
-          firstPoint * 16,
-          colorView,
-          0,
-          count * 16
+    const pointCount = positions.length / dimension;
+    this._liveOrder = null;
+
+    if (!this.buffers.positions) {
+      this.buffers.positions = gl.createBuffer();
+      if (!this.buffers.positions) {
+        throw new Error(
+          'HighPerfRenderer could not allocate the point position buffer.'
         );
       }
-      requireCleanWebGLState(gl, owner);
     }
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.buffers.positions);
+    this._positionGpuByteLength = this._allocateVertexStore(
+      positions,
+      gl.STATIC_DRAW,
+      pointCount,
+      'HighPerfRenderer point-position upload'
+    );
+
+    if (!this.buffers.colors) {
+      this.buffers.colors = gl.createBuffer();
+      if (!this.buffers.colors) {
+        throw new Error(
+          'HighPerfRenderer could not allocate the point color buffer.'
+        );
+      }
+    }
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.buffers.colors);
+    this._colorGpuByteLength = this._allocateVertexStore(
+      colors,
+      gl.DYNAMIC_DRAW,
+      pointCount,
+      'HighPerfRenderer point-color upload'
+    );
+    this._liveColorOrder = null;
+
+    gl.bindVertexArray(this.vao);
+    this._bindPointAttributes(
+      this.buffers.positions,
+      this.buffers.colors,
+      dimension
+    );
+    gl.bindVertexArray(null);
+    requireCleanWebGLState(
+      gl,
+      'HighPerfRenderer point-stream publication'
+    );
+  }
+
+
+  /**
+   * Allocate the bound `ARRAY_BUFFER` store, either from `data` (a typed array,
+   * uploaded as-is) or as `data` zero-filled bytes.
+   *
+   * WebGL 2 leaves the previous store untouched when the allocation is
+   * refused, so a refusal is reported here, naming the dataset, before any
+   * caller writes into a store that does not exist.
+   *
+   * @param {ArrayBufferView|number} data
+   * @param {number} usage
+   * @param {number} pointCount
+   * @param {string} owner
+   * @returns {number} the accepted store's byte length
+   */
+  _allocateVertexStore(data, usage, pointCount, owner) {
+    const gl = this.gl;
+    const byteLength = typeof data === 'number' ? data : data.byteLength;
+    this._allocateGpu(
+      `${owner} could not allocate ${byteLength.toLocaleString()} bytes of point storage for ${pointCount.toLocaleString()} points`,
+      () => gl.bufferData(gl.ARRAY_BUFFER, data, usage)
+    );
     return byteLength;
   }
 
   /**
-   * The point-count-sized packing owner shared by the compact LOD generations.
+   * Say which views are presented this frame. A kept view that is not
+   * presented is dormant: its colour store and R8 texture are the first
+   * thing released when an allocation is refused, and come back when it is
+   * next drawn or edited.
    *
-   * A compact LOD store must reach the GPU as one whole-store `bufferData`, so
-   * its bytes are staged in full before the upload. Publication and in-place
-   * recolor share this one allocation rather than holding a second 0.8N cache;
-   * each consumes its client bytes synchronously before the next sequential
-   * pack overwrites them. Sizing it to the full point count, rather than to the
-   * caller's request, is what lets both share it.
-   *
-   * The full-detail store does not use this: it is filled through the fixed
-   * staging block instead, so nothing allocates here unless LOD or frustum
-   * culling is enabled.
+   * @param {string[]} viewIds - Read, not copied: the caller's per-frame
+   *   list, rewritten in place each frame.
    */
-  _ensureSharedPackingScratch(requiredSize, owner) {
-    if (
-      !Number.isSafeInteger(requiredSize) ||
-      requiredSize < 0 ||
-      typeof owner !== 'string' ||
-      owner.length === 0
-    ) {
-      throw new TypeError(
-        'HighPerfRenderer shared packing scratch received an invalid contract.'
-      );
+  setPresentedViews(viewIds) {
+    if (!Array.isArray(viewIds)) {
+      throw new TypeError('HighPerfRenderer presented views must be an array of view ids.');
     }
-    const fullByteLength = this.pointCount * 16;
-    if (
-      !Number.isSafeInteger(fullByteLength) ||
-      fullByteLength < 0 ||
-      requiredSize > fullByteLength
-    ) {
-      throw new RangeError(
-        `${owner} requires ${requiredSize} bytes outside the exact ${fullByteLength}-byte full-detail packing owner.`
-      );
-    }
-
-    let buffer = this._interleavedArrayBuffer;
-    if (
-      !(buffer instanceof ArrayBuffer) ||
-      buffer.byteLength !== fullByteLength
-    ) {
-      buffer = new ArrayBuffer(fullByteLength);
-      this._interleavedArrayBuffer = buffer;
-      this._interleavedPositionView = null;
-      this._interleavedColorView = null;
-    }
-    if (
-      !(this._interleavedPositionView instanceof Float32Array) ||
-      this._interleavedPositionView.buffer !== buffer ||
-      this._interleavedPositionView.byteOffset !== 0 ||
-      this._interleavedPositionView.byteLength !==
-        buffer.byteLength
-    ) {
-      this._interleavedPositionView =
-        new Float32Array(buffer);
-    }
-    if (
-      !(this._interleavedColorView instanceof Uint8Array) ||
-      this._interleavedColorView.buffer !== buffer ||
-      this._interleavedColorView.byteOffset !== 0 ||
-      this._interleavedColorView.byteLength !==
-        buffer.byteLength
-    ) {
-      this._interleavedColorView = new Uint8Array(buffer);
-    }
-    return {
-      buffer,
-      positionView: this._interleavedPositionView,
-      colorView: this._interleavedColorView,
-    };
+    this._presentedViewIds = viewIds;
   }
 
-  _setupInterleavedAttributes() {
+  /** @private */
+  _isPresentedView(viewId) {
+    return this._presentedViewIds === null || this._presentedViewIds.includes(viewId);
+  }
+
+  /**
+   * Whether every presented view draws from its final geometry.
+   *
+   * With culling or level of detail on, a view's spatial tree (with levels
+   * when LOD needs them) is built off the main thread and lands in a later
+   * frame, and the store it serves then adopts the tree's draw order: a GPU
+   * re-order of positions and colours, with the error reads a publication
+   * owes. A benchmark window that contains that landing measures the
+   * landing, not the configuration, so the benchmark starts a window only
+   * once this holds. Reads the state and asks for nothing: no tree is
+   * requested and no order built.
+   *
+   * @returns {boolean}
+   */
+  isPresentedGeometrySettled() {
+    if (!this._needsSpatialIndex(-1)) return true;
+    const needsLOD = this._needsLodResources(-1);
+    const drawsFinalGeometry = (index, positions, dimensionLevel, order) => (
+      index !== null &&
+      index !== undefined &&
+      index.positions === positions &&
+      index.dimensionLevel === dimensionLevel &&
+      (!needsLOD || spatialIndexHasLod(index)) &&
+      index.drawOrder !== null &&
+      order !== null &&
+      order !== undefined &&
+      order.drawOrder === index.drawOrder
+    );
+    if (
+      this._positions instanceof Float32Array &&
+      this.pointCount > 0 &&
+      this._isPresentedView('live')
+    ) {
+      const index = this.spatialIndices.get(this.currentDimensionLevel) ?? null;
+      if (index === null || index.pointCount !== this.pointCount) return false;
+      if (!drawsFinalGeometry(index, this._positions, this.currentDimensionLevel, this._liveOrder)) {
+        return false;
+      }
+    }
+    for (const snapshot of this.snapshotBuffers.values()) {
+      if (!this._isPresentedView(snapshot.id) || snapshot.storesReleased === true) continue;
+      // A kept view of the live geometry draws from the live store, above.
+      if (this._snapshotUsesLiveGeometry(snapshot)) continue;
+      const geometry = this._snapshotGeometryPools?.get(snapshot.geometryGeneration) ?? null;
+      if (geometry === null || geometry.positions !== snapshot.positions) return false;
+      const index = snapshot.spatialIndex ??
+        geometry.spatialIndices.get(
+          this._snapshotSpatialIndexKey(snapshot.dimensionLevel, needsLOD)
+        ) ??
+        null;
+      if (!drawsFinalGeometry(index, snapshot.positions, snapshot.dimensionLevel, geometry.order)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /** @private */
+  _isDormantSnapshot(snapshot) {
+    return (
+      !this._isPresentedView(snapshot.id) &&
+      snapshot.id !== this._snapshotInOperation &&
+      snapshot.storesReleased !== true &&
+      snapshot.colorOwner?.refCount === 1
+    );
+  }
+
+  /**
+   * Bytes the dormant kept views' colour stores and R8 textures hold.
+   * @returns {number}
+   * @private
+   */
+  _dormantSnapshotStoreBytes() {
+    let bytes = 0;
+    if (!(this.snapshotBuffers instanceof Map)) return 0;
+    for (const snapshot of this.snapshotBuffers.values()) {
+      if (!this._isDormantSnapshot(snapshot)) continue;
+      bytes += snapshot.colorOwner.byteLength + (snapshot.alphaTextureByteLength ?? 0);
+    }
+    return bytes;
+  }
+
+  /**
+   * Release the colour store, kept colour stores and R8 texture of every
+   * dormant kept view (not presented, not being worked on, its store its
+   * own). The view keeps its colours and alpha bytes, its geometry and its
+   * vertex array, so `_restoreSnapshotStores` rebuilds exactly what it drew.
+   * @returns {number} Bytes released.
+   * @private
+   */
+  _releaseDormantSnapshotStores() {
+    if (!(this.snapshotBuffers instanceof Map)) return 0;
     const gl = this.gl;
-    const STRIDE = 16; // 12 bytes position + 4 bytes color
+    let released = 0;
+    for (const snapshot of this.snapshotBuffers.values()) {
+      if (!this._isDormantSnapshot(snapshot)) continue;
+      released += snapshot.colorOwner.byteLength + (snapshot.alphaTextureByteLength ?? 0);
+      if (snapshot.colorCache instanceof Map) this._clearKeptColorStores(snapshot.colorCache);
+      // A vertex array keeps a deleted buffer alive while it references it.
+      gl.bindVertexArray(snapshot.vao);
+      gl.bindBuffer(gl.ARRAY_BUFFER, null);
+      gl.vertexAttribPointer(1, 4, gl.UNSIGNED_BYTE, true, 4, 0);
+      gl.bindVertexArray(null);
+      this._queueSnapshotRetirement(snapshot, {
+        releaseAlpha: true,
+        releaseColor: true,
+        releaseGeometry: false,
+        releaseVao: false,
+      });
+      snapshot.colorOwner = null;
+      snapshot.buffer = null;
+      snapshot.bufferByteLength = 0;
+      snapshot.alphaTexture = null;
+      snapshot.alphaTextureByteLength = 0;
+      snapshot.storesReleased = true;
+      this._drainSnapshotRetirements(snapshot.id);
+    }
+    if (released > 0) {
+      console.log(
+        `[HighPerfRenderer] Released ${(released / 1024 / 1024).toFixed(1)} MB of colour and alpha stores of views not shown; they are rebuilt when shown.`
+      );
+      this._refreshGpuMemoryStats();
+    }
+    return released;
+  }
 
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.buffers.interleaved);
+  /**
+   * Rebuild a released kept view's colour store (in its geometry's current
+   * order) and R8 texture from its own colours and alpha bytes, and point
+   * its vertex array at the new store. A failure leaves it released.
+   * @private
+   */
+  _restoreSnapshotStores(snapshot) {
+    if (snapshot.storesReleased !== true) return;
+    const gl = this.gl;
+    const label = `HighPerfRenderer view "${snapshot.id}" restore`;
+    const order = this._snapshotUsesLiveGeometry(snapshot)
+      ? (this._liveOrder ?? null)
+      : (this._getSnapshotGeometryRecord(snapshot.geometryGeneration, snapshot.positions).order ?? null);
+    const previousOperation = this._snapshotInOperation;
+    this._snapshotInOperation = snapshot.id;
+    const alpha = { alphaTexture: null, alphaTextureByteLength: 0 };
+    let buffer = null;
+    let byteLength = 0;
+    try {
+      buffer = gl.createBuffer();
+      if (!buffer) throw new Error(`${label} could not allocate its colour store.`);
+      gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+      byteLength = this._uploadSnapshotColors(buffer, snapshot.colors, label, order);
+      gl.bindBuffer(gl.ARRAY_BUFFER, null);
+      this._uploadNewSnapshotAlphaTexture(snapshot.alphaTexData, snapshot.alphaTexPlan, label, alpha);
+      gl.bindVertexArray(snapshot.vao);
+      gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+      gl.vertexAttribPointer(1, 4, gl.UNSIGNED_BYTE, true, 4, 0);
+      gl.bindVertexArray(null);
+      gl.bindBuffer(gl.ARRAY_BUFFER, null);
+    } catch (error) {
+      gl.bindVertexArray(null);
+      gl.bindBuffer(gl.ARRAY_BUFFER, null);
+      if (buffer) this._retireBuffer(buffer, byteLength);
+      if (alpha.alphaTexture) {
+        this._queueDataRetirement({ textures: [{ handle: alpha.alphaTexture, byteLength: alpha.alphaTextureByteLength }] });
+      }
+      this._drainDataRetirements();
+      this._snapshotInOperation = previousOperation;
+      throw error;
+    }
+    snapshot.colorOwner = this._createSnapshotColorOwner(buffer, byteLength, order?.drawOrder ?? null);
+    snapshot.buffer = buffer;
+    snapshot.bufferByteLength = byteLength;
+    snapshot.alphaTexture = alpha.alphaTexture;
+    snapshot.alphaTextureByteLength = alpha.alphaTextureByteLength;
+    snapshot.storesReleased = false;
+    this._snapshotInOperation = previousOperation;
+    this._refreshGpuMemoryStats();
+  }
 
-    // Position (location 0): 3 floats at offset 0
-    gl.enableVertexAttribArray(0);
-    gl.vertexAttribPointer(0, 3, gl.FLOAT, false, STRIDE, 0);
+  /**
+   * Run one GPU allocation on the target its caller bound (`allocate` may
+   * run twice; the binding is restored before the second run). Memory kept only for speed -- geometry of representations no
+   * view shows, colour stores kept for switching back -- never costs an
+   * allocation: when the driver refuses one while any is kept, all of it is
+   * released and the allocation runs once more. Nothing is evicted while an
+   * allocation fits, so a switch back stays free whenever memory allows.
+   *
+   * The caller enters with an empty error queue.
+   *
+   * @param {string} refusal - The message when it cannot be allocated.
+   * @param {() => void} allocate
+   * @private
+   */
+  _allocateGpu(refusal, allocate) {
+    const gl = this.gl;
+    allocate();
+    let code = gl.getError();
+    // Only a refusal for memory is retried. Any other code is a defect (this
+    // allocation's, or an earlier unchecked write's: sub-uploads into
+    // accepted storage read nothing back) and is reported, not retried.
+    if (
+      code === gl.OUT_OF_MEMORY &&
+      !(typeof gl.isContextLost === 'function' && gl.isContextLost()) &&
+      this.getRetainedGeometryBytes() + this.getKeptColorBytes() +
+        this._dormantSnapshotStoreBytes() > 0
+    ) {
+      const buffer = gl.getParameter(gl.ARRAY_BUFFER_BINDING);
+      const texture = gl.getParameter(gl.TEXTURE_BINDING_2D_ARRAY);
+      const vertexArray = gl.getParameter(gl.VERTEX_ARRAY_BINDING);
+      this.evictRetainedGeometry(Infinity);
+      this._releaseDormantSnapshotStores();
+      gl.bindVertexArray(vertexArray);
+      gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+      gl.bindTexture(gl.TEXTURE_2D_ARRAY, texture);
+      allocate();
+      code = gl.getError();
+    }
+    if (code === gl.NO_ERROR) return;
+    if (typeof gl.isContextLost === 'function' && gl.isContextLost()) throw contextLostError(refusal);
+    throw new RangeError(`${refusal} (WebGL error 0x${code.toString(16)}).`);
+  }
 
-    // Color RGBA (location 1): 4 uint8 at offset 12, normalized to 0.0-1.0
+  /**
+   * Point the bound vertex array's two point attributes at their streams:
+   * location 0 is tightly packed Float32 with `dimension` components per
+   * point, location 1 tightly packed RGBA8 normalized to [0, 1].
+   *
+   * The shader declares `a_position` as a `vec3`; WebGL fills the components
+   * a 1-D or 2-D stream does not supply with 0, which is exactly the value of
+   * an axis the embedding does not have.
+   *
+   * @param {WebGLBuffer} positionBuffer
+   * @param {WebGLBuffer} colorBuffer
+   * @param {number} dimension - Components per position (1, 2 or 3).
+   */
+  _bindPointAttributes(positionBuffer, colorBuffer, dimension) {
+    const gl = this.gl;
+    bindPositionAttribute(gl, positionBuffer, dimension);
+    gl.bindBuffer(gl.ARRAY_BUFFER, colorBuffer);
     gl.enableVertexAttribArray(1);
-    gl.vertexAttribPointer(1, 4, gl.UNSIGNED_BYTE, true, STRIDE, 12);
-
-    // Note: Alpha is now packed in color as the 4th component, no separate attribute needed
+    gl.vertexAttribPointer(1, 4, gl.UNSIGNED_BYTE, true, 4, 0);
   }
 
   /**
    * Create or resize the alpha texture for efficient alpha-only updates.
-   * Uses R8 format (1 byte per point) instead of rebuilding the 16-byte interleaved buffer.
+   * Uses R8 format (1 byte per point), so an alpha change touches neither vertex stream.
    * @param {number} pointCount - Number of points to allocate for
    */
   _createAlphaTexture(pointCount) {
@@ -4452,6 +3944,7 @@ export class HighPerfRenderer {
       this._alphaTexStagingData = new Uint8Array();
       this._alphaTexWidth = 0;
       this._alphaTexHeight = 0;
+      this._alphaTexPlan = null;
       this._useAlphaTexture = false;
       if (previousTexture) {
         this._queueDataRetirement({
@@ -4464,24 +3957,11 @@ export class HighPerfRenderer {
       return;
     }
 
-    const maxTexSize = gl.getParameter(gl.MAX_TEXTURE_SIZE);
-    if (!Number.isInteger(maxTexSize) || maxTexSize <= 0) {
-      throw new Error(
-        'HighPerfRenderer received an invalid MAX_TEXTURE_SIZE capability.'
-      );
-    }
-    // Use the complete runtime texture width. An arbitrary smaller cap cuts
-    // the representable point count below the device's real MAX_TEXTURE_SIZE²
-    // limit and wastes available hardware on large datasets.
-    const candidateWidth = Math.min(pointCount, maxTexSize);
-    const candidateHeight =
-      Math.ceil(pointCount / candidateWidth);
-
-    if (candidateHeight > maxTexSize) {
-      throw new RangeError(
-        `HighPerfRenderer cannot represent ${pointCount.toLocaleString()} alpha values in the exact ${maxTexSize}x${maxTexSize} texture capacity.`
-      );
-    }
+    // A linear texture holds any count the engine can allocate (layers of
+    // MAX_TEXTURE_SIZE rows), so no point count is refused here.
+    const candidatePlan = planLinearTextureFor(gl, pointCount);
+    const candidateWidth = candidatePlan.width;
+    const candidateHeight = candidatePlan.rows;
 
     // Stage every fallible CPU/GL operation before changing the accepted
     // publication. This also keeps capability/texture failures from erasing a
@@ -4501,55 +3981,33 @@ export class HighPerfRenderer {
     }
     let candidateTextureByteLength = 0;
     try {
-      gl.bindTexture(gl.TEXTURE_2D, candidateTexture);
+      gl.bindTexture(gl.TEXTURE_2D_ARRAY, candidateTexture);
 
-      // Use R8 format (single channel, 1 byte per texel) - WebGL2 only.
+      // R8 (single channel, 1 byte per texel), nearest-filtered for exact
+      // texel fetch.
       this._withNeutralTextureUnpackState(
         1,
         'HighPerfRenderer candidate alpha texture',
         () => {
-          gl.texImage2D(
-            gl.TEXTURE_2D, 0, gl.R8,
-            candidateWidth, candidateHeight, 0,
-            gl.RED, gl.UNSIGNED_BYTE, candidateData
-          );
+          this._allocateGpu('HighPerfRenderer could not allocate the alpha texture', () => {
+            allocateLinearTexture(gl, gl.R8, candidatePlan);
+          });
+          writeLinearTextureRows(gl, candidatePlan, gl.RED, gl.UNSIGNED_BYTE, candidateData, 1);
           requireCleanWebGLState(
             gl,
             'HighPerfRenderer candidate alpha-texture upload'
           );
         }
       );
-      candidateTextureByteLength = requiredSize;
-
-      // Use NEAREST filtering for exact texel fetch (no interpolation).
-      gl.texParameteri(
-        gl.TEXTURE_2D,
-        gl.TEXTURE_MIN_FILTER,
-        gl.NEAREST
-      );
-      gl.texParameteri(
-        gl.TEXTURE_2D,
-        gl.TEXTURE_MAG_FILTER,
-        gl.NEAREST
-      );
-      gl.texParameteri(
-        gl.TEXTURE_2D,
-        gl.TEXTURE_WRAP_S,
-        gl.CLAMP_TO_EDGE
-      );
-      gl.texParameteri(
-        gl.TEXTURE_2D,
-        gl.TEXTURE_WRAP_T,
-        gl.CLAMP_TO_EDGE
-      );
-      gl.bindTexture(gl.TEXTURE_2D, null);
+      candidateTextureByteLength = candidatePlan.texels;
+      gl.bindTexture(gl.TEXTURE_2D_ARRAY, null);
       requireCleanWebGLState(
         gl,
         'HighPerfRenderer alpha-texture publication'
       );
     } catch (error) {
       try {
-        gl.bindTexture(gl.TEXTURE_2D, null);
+        gl.bindTexture(gl.TEXTURE_2D_ARRAY, null);
       } catch {
         // The retirement journal below remains authoritative.
       }
@@ -4573,6 +4031,7 @@ export class HighPerfRenderer {
     this._alphaTexStagingData = null;
     this._alphaTexWidth = candidateWidth;
     this._alphaTexHeight = candidateHeight;
+    this._alphaTexPlan = candidatePlan;
     if (previousTexture && previousTexture !== candidateTexture) {
       this._queueDataRetirement({
         alphaTexture: previousTexture,
@@ -4587,29 +4046,31 @@ export class HighPerfRenderer {
   }
 
   /**
-   * Publish full-row regions of the accepted alpha texture.
+   * Publish full-row regions of an accepted alpha texture (the live view's or
+   * a snapshot's), laid out as `plan`.
    *
    * `regions` is an interleaved `(rowStart, rowCount)` Int32Array holding
    * `regionCount` pairs in strictly increasing, non-overlapping row order. All
-   * of them are sent inside one unpack transaction and one preflight/postflight
-   * pair, so a publication costs exactly three synchronous `getError` stalls
-   * however many regions it addresses.
+   * of them are sent inside one unpack transaction; rows written into accepted
+   * storage read no error back (`requireLiveContext`).
    *
    * Rows are complete, so `UNPACK_ROW_LENGTH` stays neutral and the source
    * range for a region is exactly `rowStart * width` through
    * `(rowStart + rowCount) * width` — addressed with `srcOffset` rather than a
    * subarray so a publication allocates nothing.
    */
-  _uploadAlphaTextureRegions(data, regions, regionCount, label) {
+  _uploadAlphaRegions(texture, plan, data, regions, regionCount, label) {
     const gl = this.gl;
-    const width = this._alphaTexWidth;
-    const height = this._alphaTexHeight;
+    const width = plan?.width;
+    const height = plan?.rows;
     if (
-      !(data instanceof Uint8Array) ||
-      data.length !== width * height ||
-      !this._alphaTexture ||
+      !texture ||
+      !Number.isSafeInteger(width) ||
+      !Number.isSafeInteger(height) ||
       width <= 0 ||
       height <= 0 ||
+      !(data instanceof Uint8Array) ||
+      data.length !== width * height ||
       !(regions instanceof Int32Array) ||
       !Number.isSafeInteger(regionCount) ||
       regionCount <= 0 ||
@@ -4634,11 +4095,9 @@ export class HighPerfRenderer {
       }
       previousRowEnd = rowStart + rowCount;
     }
-    requireCleanWebGLState(
-      gl,
-      `${label} preflight`
-    );
-    gl.bindTexture(gl.TEXTURE_2D, this._alphaTexture);
+    // Rows of an accepted texture: no allocation, so nothing to read back.
+    requireLiveContext(gl, `${label} preflight`);
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, texture);
     try {
       this._withNeutralTextureUnpackState(
         1,
@@ -4647,22 +4106,18 @@ export class HighPerfRenderer {
           for (let index = 0; index < regionCount; index++) {
             const rowStart = regions[index * 2];
             const rowCount = regions[index * 2 + 1];
-            gl.texSubImage2D(
-              gl.TEXTURE_2D, 0,
-              0, rowStart, width, rowCount,
-              gl.RED, gl.UNSIGNED_BYTE, data, rowStart * width
+            writeLinearTextureRows(
+              gl, plan, gl.RED, gl.UNSIGNED_BYTE, data, 1, rowStart, rowStart + rowCount
             );
           }
-          requireCleanWebGLState(
-            gl,
-            label
-          );
+          requireLiveContext(gl, label);
         }
       );
     } finally {
-      gl.bindTexture(gl.TEXTURE_2D, null);
+      gl.bindTexture(gl.TEXTURE_2D_ARRAY, null);
     }
   }
+
 
   /**
    * Update the alpha texture with new alpha values.
@@ -4676,7 +4131,7 @@ export class HighPerfRenderer {
    * generation would have written, so a region-addressed publication and a
    * whole-texture one leave the same image.
    *
-   * @param {Float32Array} alphas - Alpha values (0.0-1.0) for each point
+   * @param {Uint8Array} alphas - Point transparency, exactly 0 or 1 a point
    * @returns {boolean} Whether any accepted R8 byte moved. Point visibility is
    *   defined on exactly these bytes (`alpha-visibility.js`: a point is visible
    *   iff `Math.round(alpha * 255) >= 3`), so `false` certifies that no
@@ -4686,7 +4141,7 @@ export class HighPerfRenderer {
     const width = this._alphaTexWidth;
     const height = this._alphaTexHeight;
     if (
-      !(alphas instanceof Float32Array) ||
+      !(alphas instanceof Uint8Array) ||
       alphas.length !== this.pointCount ||
       !this._alphaTexture ||
       !(this._alphaTexData instanceof Uint8Array) ||
@@ -4737,14 +4192,15 @@ export class HighPerfRenderer {
       let rowChanged = false;
       for (let i = rowStart; i < rowEnd; i++) {
         const value = alphas[i];
-        if (!Number.isFinite(value) || value < 0 || value > 1) {
+        // One comparison pair rejects NaN, infinities and out-of-range values.
+        if (!(value >= 0 && value <= 1)) {
           throw new RangeError(
             `HighPerfRenderer alpha value at index ${i} must be finite and in [0, 1]; received ${String(value)}.`
           );
         }
         const byte = Math.round(value * 255);
         candidate[i] = byte;
-        if (byte !== accepted[i]) rowChanged = true;
+        rowChanged ||= byte !== accepted[i];
       }
       if (rowChanged) {
         dirtyRows[y] = 1;
@@ -4758,37 +4214,12 @@ export class HighPerfRenderer {
       return false;
     }
 
-    // One region per maximal run of consecutive dirty rows.
-    let regionCount = 0;
-    let runStart = -1;
-    for (let y = 0; y < height; y++) {
-      if (dirtyRows[y] === 1) {
-        if (runStart === -1) runStart = y;
-        continue;
-      }
-      if (runStart !== -1) {
-        regions[regionCount * 2] = runStart;
-        regions[regionCount * 2 + 1] = y - runStart;
-        regionCount++;
-        runStart = -1;
-      }
-    }
-    if (runStart !== -1) {
-      regions[regionCount * 2] = runStart;
-      regions[regionCount * 2 + 1] = height - runStart;
-      regionCount++;
-    }
-    if (regionCount > MAX_ALPHA_UPLOAD_REGIONS) {
-      const firstRow = regions[0];
-      const lastRowEnd =
-        regions[(regionCount - 1) * 2] + regions[(regionCount - 1) * 2 + 1];
-      regions[0] = firstRow;
-      regions[1] = lastRowEnd - firstRow;
-      regionCount = 1;
-    }
+    const regionCount = collectAlphaUploadRegions(dirtyRows, height, regions);
 
     try {
-      this._uploadAlphaTextureRegions(
+      this._uploadAlphaRegions(
+        this._alphaTexture,
+        this._alphaTexPlan,
         candidate,
         regions,
         regionCount,
@@ -4798,7 +4229,9 @@ export class HighPerfRenderer {
       try {
         // Exactly the regions the failed publication could have touched, so
         // restoring them restores the whole accepted image.
-        this._uploadAlphaTextureRegions(
+        this._uploadAlphaRegions(
+          this._alphaTexture,
+          this._alphaTexPlan,
           accepted,
           regions,
           regionCount,
@@ -4834,90 +4267,6 @@ export class HighPerfRenderer {
     return true;
   }
 
-  /**
-   * Get LOD index textures for a specific dimension level.
-   * @param {number} dimensionLevel - The dimension level (1, 2, or 3)
-   * @returns {Array} LOD index textures array for the dimension (may be empty)
-   */
-  _getLodIndexTexturesForDimension(dimensionLevel) {
-    return (
-      this._lodIndexTexturesByDimension.get(dimensionLevel) ??
-      EMPTY_LOD_PROJECTION
-    );
-  }
-
-  /**
-   * Clear all LOD index textures (all dimensions).
-   * Call this when spatial indices or LOD buffers are cleared.
-   */
-  _clearLodIndexTextures() {
-    // Index textures are part of the indivisible per-dimension generation.
-    // Clearing this compatibility surface therefore retires the complete
-    // generation instead of deleting aliases behind the owner's back.
-    this._clearLodBuffers();
-  }
-
-  _deleteLodResourcesForDimension(dimensionLevel) {
-    const dim = requireDimensionLevel(
-      dimensionLevel,
-      'HighPerfRenderer LOD resource dimensionLevel'
-    );
-    this._ensureLodResourceOwnershipState();
-    const owner =
-      this._lodResourceOwnersByDimension.get(dim) ?? null;
-    const lodBuffers =
-      this.lodBuffersByDimension.get(dim) ?? null;
-    const lodIndexTextures =
-      this._lodIndexTexturesByDimension.get(dim) ?? null;
-
-    // Detach metadata and the sole owner before any fallible deletion. Failed
-    // handles remain in the retryable retirement inventory, never in active
-    // maps where a future publication could delete them twice.
-    this._lodResourceOwnersByDimension.delete(dim);
-    this.lodBuffersByDimension.delete(dim);
-    this._lodIndexTexturesByDimension.delete(dim);
-    this._dirtyLodDimensions?.delete(dim);
-    this._refreshGpuMemoryStats();
-
-    if (!owner && !lodBuffers && !lodIndexTextures) return [];
-    this._queueDataRetirement({
-      buffers: {},
-      vao: null,
-      pointCount: 0,
-      perViewState: null,
-      lodResourceOwnersByDimension: owner
-        ? new Map([[dim, owner]])
-        : new Map(),
-      lodBuffersByDimension: lodBuffers
-        ? new Map([[dim, lodBuffers]])
-        : new Map(),
-      lodIndexTexturesByDimension: lodIndexTextures
-        ? new Map([[dim, lodIndexTextures]])
-        : new Map(),
-      alphaTexture: null,
-      alphaTexWidth: 0,
-      alphaTexHeight: 0,
-    });
-    return this._drainDataRetirements();
-  }
-
-  /**
-   * Clear all LOD buffers (all dimensions), properly deleting GL resources.
-   * Call this before clearing spatial indices or when data changes.
-   * @private
-   */
-  _clearLodBuffers() {
-    this._ensureLodResourceOwnershipState();
-    const dimensions = new Set([
-      ...this._lodResourceOwnersByDimension.keys(),
-      ...this.lodBuffersByDimension.keys(),
-      ...this._lodIndexTexturesByDimension.keys(),
-    ]);
-    for (const dimensionLevel of dimensions) {
-      this._deleteLodResourcesForDimension(dimensionLevel);
-    }
-  }
-
   updateColors(colors) {
     this._assertOperational('update colors');
     const expectedRGBA = this.pointCount * 4;
@@ -4929,6 +4278,7 @@ export class HighPerfRenderer {
         `HighPerfRenderer colors must contain exactly ${expectedRGBA} RGBA bytes; received ${colors.length}.`
       );
     }
+    requireWordAlignedColors(colors);
 
     this._colors = colors;
     for (const spatialIndex of this.spatialIndices.values()) {
@@ -4941,19 +4291,16 @@ export class HighPerfRenderer {
       }
     }
 
-    // Mark buffers as dirty - actual rebuild deferred to render() to avoid double rebuilds
-    this._bufferDirty = true;
-    for (const [dimensionLevel, lodBuffers] of this.lodBuffersByDimension) {
-      if (lodBuffers.length > 0) {
-        this._dirtyLodDimensions.add(dimensionLevel);
-      }
-    }
+    // Publication is deferred to the next render, so back-to-back recolors
+    // upload once. Stores kept for other orders hold the old colours.
+    this._colorsDirty = true;
+    this._clearKeptColorStores(this._liveColorCache);
   }
 
   /**
    * Publish one exact per-point alpha generation.
    *
-   * @param {Float32Array} alphas - Alpha values (0.0-1.0) for each point.
+   * @param {Uint8Array} alphas - Point transparency, exactly 0 or 1 a point.
    * @returns {boolean} Whether the accepted R8 generation moved. Callers that
    *   only care about *visibility* — which cells the highlight packer, the KNN
    *   traversal and the category selectors admit — may skip their invalidation
@@ -4964,8 +4311,8 @@ export class HighPerfRenderer {
    */
   updateAlphas(alphas) {
     this._assertOperational('update alpha values');
-    if (!(alphas instanceof Float32Array)) {
-      throw new TypeError('HighPerfRenderer alpha values must be a Float32Array.');
+    if (!(alphas instanceof Uint8Array)) {
+      throw new TypeError('HighPerfRenderer alpha values must be a Uint8Array.');
     }
     if (alphas.length !== this.pointCount) {
       throw new RangeError(
@@ -4993,23 +4340,18 @@ export class HighPerfRenderer {
     return createdTexture || changed;
   }
 
-  /** Get current colors array reference (for comparison) */
-  getCurrentColors() {
-    return this._colors;
-  }
-
   /**
-   * Adopt an equivalent caller-private Float32 owner after its R8 generation
+   * Adopt an equivalent caller-private Uint8 owner after its R8 generation
    * has already been accepted. This performs no GPU work and exists so the
    * viewer can sever aliases to mutable application-state arrays.
    */
   _adoptCurrentAlphasOwner(alphas) {
     if (
-      !(alphas instanceof Float32Array) ||
+      !(alphas instanceof Uint8Array) ||
       alphas.length !== this.pointCount
     ) {
       throw new TypeError(
-        'HighPerfRenderer alpha owner must be one exact Float32 point array.'
+        'HighPerfRenderer alpha owner must be one exact Uint8 point array.'
       );
     }
     this._currentAlphas = alphas;
@@ -5029,177 +4371,48 @@ export class HighPerfRenderer {
       dimensionLevel,
       'HighPerfRenderer buffer-flush dimensionLevel'
     );
-    if (this._bufferDirty) {
-      this._rebuildInterleavedBuffer();
-      this._bufferDirty = false;
-    }
-
-    if (this._dirtyLodDimensions.has(dim)) {
-      this._rebuildLODBuffersWithCurrentData(dim);
-      this._dirtyLodDimensions.delete(dim);
+    if (dim !== this.currentDimensionLevel) return;
+    // The flag clears only after the publication returns, so a rejected
+    // upload stays dirty and is retried whole on the next flush.
+    if (this._colorsDirty) {
+      this._publishLiveColors();
     }
   }
 
-  _rebuildInterleavedBuffer() {
-    const gl = this.gl;
-    requireCleanWebGLState(
-      gl,
-      'HighPerfRenderer full-detail color publication preflight'
-    );
-    const n = this.pointCount;
-    const positions = this._positions;
-    const colors = this._colors; // Now Uint8Array with RGBA
-
-    // Build interleaved data: [x,y,z (float32), r,g,b,a (uint8)] - 16 bytes per
-    // point. `flushBufferUpdates` clears `_bufferDirty` only after this
-    // returns, so a rejected republication stays dirty and is retried whole.
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.buffers.interleaved);
-    this._interleavedGpuByteLength = this._uploadInterleavedPointStore(
-      n,
-      gl.DYNAMIC_DRAW,
-      'HighPerfRenderer full-detail color publication',
-      (positionView, colorView, firstPoint, count) => {
-        this._packInterleavedChunk(
-          positions,
-          colors,
-          positionView,
-          colorView,
-          firstPoint,
-          count
-        );
-      }
-    );
-    this._refreshGpuMemoryStats();
-  }
-
-  _rebuildLODBuffersWithCurrentData(dimensionLevel) {
-    const dim = requireDimensionLevel(
-      dimensionLevel,
-      'HighPerfRenderer LOD rebuild dimensionLevel'
-    );
+  /**
+   * Rewrite the live color stream in place from the live colors, in the
+   * order the live positions are stored in.
+   *
+   * The store's size is fixed by the publication, so this is one upload of
+   * 4 bytes a point -- straight into the store in source order, or into a
+   * transient texture the GPU gathers into the store in a draw order (see
+   * `_writeOrderedColors`) -- with no reallocation, and the position stream
+   * is not touched.
+   */
+  _publishLiveColors() {
     const gl = this.gl;
     const colors = this._colors;
-    requireCleanWebGLState(
-      gl,
-      `HighPerfRenderer ${dim}D LOD color publication preflight`
-    );
-
-    this._ensureLodResourceOwnershipState();
-    const spatialIndex = this.spatialIndices.get(dim);
-    const lodBuffers = this.lodBuffersByDimension.get(dim) || [];
-    const owner =
-      this._lodResourceOwnersByDimension.get(dim) ?? null;
-    if (!spatialIndex || !lodBuffers.length) {
-      throw new Error(
-        `HighPerfRenderer cannot publish dirty ${dim}D LOD colors without exact spatial-index and buffer owners.`
-      );
-    }
-    const sourcePositions = spatialIndex.positions;
     if (
-      !(sourcePositions instanceof Float32Array) ||
-      sourcePositions !== this._positions ||
-      sourcePositions.length !== this.pointCount * 3
-    ) {
-      throw new Error(
-        `HighPerfRenderer cannot publish dirty ${dim}D LOD colors without the exact ${this.pointCount}-point spatial-index position generation.`
-      );
-    }
-    if (
+      !this.buffers?.colors ||
       !(colors instanceof Uint8Array) ||
-      colors.length !== this.pointCount * 4
+      colors.byteLength !== this.pointCount * 4 ||
+      this._colorGpuByteLength !== colors.byteLength
     ) {
       throw new Error(
-        `HighPerfRenderer cannot publish dirty ${dim}D LOD colors without exact RGBA source bytes.`
+        'HighPerfRenderer full-detail color publication has no exact accepted color store.'
       );
     }
-
-    const reducedLevels = spatialIndex.lodLevels.slice(0, -1);
-    if (reducedLevels.length === 0) return;
-    const maximumLevel = reducedLevels.at(-1);
-    const maximumIndices = maximumLevel?.indices;
-    const requiredSize =
-      (maximumLevel?.pointCount ?? -1) * 16;
-    if (
-      !owner ||
-      owner.spatialIndex !== spatialIndex ||
-      owner.maximumIndices !== maximumIndices ||
-      owner.pointCount !== this.pointCount ||
-      owner.liveGeometryGeneration !==
-        this._liveGeometryGeneration ||
-      !(maximumIndices instanceof Uint32Array) ||
-      maximumIndices.length !== maximumLevel.pointCount ||
-      owner.compactByteLength !== requiredSize ||
-      !owner.compactBuffer ||
-      lodBuffers.some((metadata, levelIndex) => (
-        metadata.isFullDetail !== true &&
-        (
-          metadata.generationToken !== owner.generationToken ||
-          metadata.buffer !== owner.compactBuffer ||
-          metadata.vao !== owner.compactVao ||
-          metadata.originalIndexBuffer !==
-            owner.topologyOwner?.originalIndexBuffer ||
-          metadata.originalIndexCount !==
-            spatialIndex.lodLevels[levelIndex]?.pointCount
-        )
-      ))
-    ) {
-      throw new Error(
-        `HighPerfRenderer ${dim}D dirty LOD color publication has inconsistent generation ownership.`
-      );
-    }
-
-    // Main and compact uploads are sequential and WebGL consumes client data
-    // before returning. Repacking the shared full-detail client allocation
-    // therefore preserves both GPU generations without a second 0.8N cache.
-    const scratch = this._ensureSharedPackingScratch(
-      requiredSize,
-      `HighPerfRenderer ${dim}D compact LOD color packing`
+    // The store is accepted; a gather allocates through `_allocateGpu`.
+    requireLiveContext(gl, 'HighPerfRenderer full-detail color publication preflight');
+    const drawOrder = this._liveOrder?.drawOrder ?? null;
+    this._writeOrderedColors(
+      this.buffers.colors,
+      colors,
+      this._liveOrder,
+      'HighPerfRenderer full-detail color publication'
     );
-    for (let compactIndex = 0; compactIndex < maximumIndices.length; compactIndex++) {
-      const originalIndex = maximumIndices[compactIndex];
-      if (originalIndex >= this.pointCount) {
-        throw new RangeError(
-          `HighPerfRenderer ${dim}D maximum-prefix original index ${originalIndex} is outside ${this.pointCount} points.`
-        );
-      }
-      const floatOffset = compactIndex * 4;
-      const byteOffset = compactIndex * 16 + 12;
-      const positionOffset = originalIndex * 3;
-      const colorOffset = originalIndex * 4;
-      scratch.positionView[floatOffset] =
-        sourcePositions[positionOffset];
-      scratch.positionView[floatOffset + 1] =
-        sourcePositions[positionOffset + 1];
-      scratch.positionView[floatOffset + 2] =
-        sourcePositions[positionOffset + 2];
-      scratch.colorView[byteOffset] = colors[colorOffset];
-      scratch.colorView[byteOffset + 1] = colors[colorOffset + 1];
-      scratch.colorView[byteOffset + 2] = colors[colorOffset + 2];
-      scratch.colorView[byteOffset + 3] = colors[colorOffset + 3];
-    }
-    const uploadData = scratch.buffer.byteLength === requiredSize
-      ? scratch.buffer
-      : new Uint8Array(scratch.buffer, 0, requiredSize);
-
-    try {
-      gl.bindBuffer(gl.ARRAY_BUFFER, owner.compactBuffer);
-      // WebGL 2 bufferData guarantee: if an error is generated, the buffer's
-      // size is unmodified and no data is written. Immediate sticky-error
-      // validation therefore makes this in-place recolor a real transaction.
-      gl.bufferData(gl.ARRAY_BUFFER, uploadData, gl.DYNAMIC_DRAW);
-      requireCleanWebGLState(
-        gl,
-        `HighPerfRenderer ${dim}D LOD color publication`
-      );
-    } finally {
-      gl.bindBuffer(gl.ARRAY_BUFFER, null);
-    }
-  }
-
-  setFogRange(near, far) {
-    this._assertOperational('set the fog range');
-    this.fogNear = near;
-    this.fogFar = far;
+    this._liveColorOrder = drawOrder;
+    this._colorsDirty = false;
   }
 
   /**
@@ -5387,27 +4600,12 @@ export class HighPerfRenderer {
     );
   }
 
-  _computeBoundingSphere(positions) {
-    const count = positions.length / 3;
-    if (count === 0) return { center: [0, 0, 0], radius: 1 };
+  _computeBoundingSphere(positions, dimension) {
+    if (positions.length === 0) return { center: [0, 0, 0], radius: 1 };
 
-    // Compute bounding box
-    let minX = Infinity, minY = Infinity, minZ = Infinity;
-    let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
-
-    for (let i = 0; i < count; i++) {
-      const idx = i * 3;
-      const x = positions[idx];
-      const y = positions[idx + 1];
-      const z = positions[idx + 2];
-
-      if (x < minX) minX = x;
-      if (y < minY) minY = y;
-      if (z < minZ) minZ = z;
-      if (x > maxX) maxX = x;
-      if (y > maxY) maxY = y;
-      if (z > maxZ) maxZ = z;
-    }
+    const {
+      minX, maxX, minY, maxY, minZ, maxZ
+    } = HighPerfRenderer.computeBoundsFromPositions(positions, dimension);
 
     // Compute center and radius from bounding box
     const centerX = (minX + maxX) * 0.5;
@@ -5569,20 +4767,11 @@ export class HighPerfRenderer {
       throw new Error('HighPerfRenderer active shader program is unavailable.');
     }
 
-    if (!this.buffers.interleaved) {
-      throw new Error('HighPerfRenderer point buffer is unavailable.');
+    if (!this.buffers.positions || !this.buffers.colors) {
+      throw new Error('HighPerfRenderer point buffers are unavailable.');
     }
 
     const dimensionLevel = params.dimensionLevel;
-    // Flush any pending buffer updates (deferred from updateColors/updateAlphas)
-    // Full detail is shared; reduced LOD data is published only for the exact
-    // dimension this render is about to consume.
-    if (
-      this._bufferDirty ||
-      this._dirtyLodDimensions.has(dimensionLevel)
-    ) {
-      this.flushBufferUpdates(dimensionLevel);
-    }
 
     const {
       mvpMatrix,
@@ -5611,6 +4800,9 @@ export class HighPerfRenderer {
     const gl = this.gl;
     const frameStart = performance.now();
     configureStraightAlphaBlending(gl);
+    // Whether this pass draws into a multisampled target, which decides how an
+    // opaque program antialiases its edge (`enterOpaquePointBlending`).
+    this._pointPassMultisampled = params.multisampled === true;
 
     if (!this._firstRenderDone) {
       console.log('[HighPerfRenderer] First render frame:', {
@@ -5637,21 +4829,17 @@ export class HighPerfRenderer {
 
     // Get the correct spatial index for this view's dimension level
     // Each dimension (1D, 2D, 3D) needs its own spatial index for correct LOD/frustum culling
+    // A tree still building in a worker leaves the view at full detail (or
+    // with the tree it has) until it lands; nothing is built here.
     const needsSpatialIndex = this._needsSpatialIndex(forceLOD);
     const spatialIndex = needsSpatialIndex
-      ? this._getOrBuildSpatialIndexForDimension(
-        dimensionLevel,
-        false,
-        this._needsLodResources(forceLOD)
-      )
+      ? this._liveSpatialIndexForDraw(dimensionLevel, this._needsLodResources(forceLOD))
       : null;
-    const lodBuffersForDim =
-      this._getLodBuffersForDimension(dimensionLevel);
-
     // Select LOD level based on whether LOD is enabled
     // When LOD is disabled, forceLODLevel is ignored - only params.forceLOD is respected
     // This ensures disabling LOD always returns to full detail (unless explicitly overridden per-render)
     let lodLevel;
+    viewState.lodConverging = false;
     if (this.useAdaptiveLOD) {
       // LOD enabled: Priority is this.forceLODLevel > params.forceLOD > adaptive
       lodLevel = this.forceLODLevel >= 0 ? this.forceLODLevel : forceLOD;
@@ -5663,148 +4851,88 @@ export class HighPerfRenderer {
           dimensionLevel,
           overrideBounds
         );
+        viewState.lodConverging = spatialIndex.getLODLevel(
+          cameraDistance,
+          lodLevel,
+          dimensionLevel,
+          overrideBounds
+        ) !== lodLevel;
       }
     } else {
       // LOD disabled: only respect explicit per-render forceLOD, otherwise full detail
       lodLevel = forceLOD >= 0 ? forceLOD : -1;
     }
 
-    // Always update per-view LOD level for highlight rendering and other consumers
-    // This must happen after all LOD selection logic (forced, adaptive, or disabled)
-    // NOTE: lastDimensionLevel is NOT set here - it's handled inside _checkFrustumCacheValid
-    // to properly detect dimension changes and invalidate the frustum cache
-    viewState.lastLodLevel = lodLevel;
-
+    if (lodLevel >= 0 && !spatialIndexHasLod(spatialIndex)) {
+      // The levels are still building: full detail until they land.
+      lodLevel = -1;
+    }
     if (
       lodLevel >= 0 &&
-      (!Number.isInteger(lodLevel) || !lodBuffersForDim[lodLevel])
+      (!Number.isInteger(lodLevel) || !spatialIndex?.lodLevels?.[lodLevel])
     ) {
       throw new RangeError(
         `HighPerfRenderer LOD level ${String(lodLevel)} is unavailable for ${dimensionLevel}D view "${viewId}".`
       );
     }
-    const useFullDetail =
-      lodLevel < 0 || lodBuffersForDim[lodLevel].isFullDetail === true;
 
-    // Debug LOD selection - only log when level changes (per-view tracking)
-    if (viewState.prevLodLevel !== lodLevel && spatialIndex && (this.useAdaptiveLOD || this.forceLODLevel >= 0)) {
-      const lodBuf = lodBuffersForDim[lodLevel];
-      const pointCount = lodBuf ? lodBuf.pointCount : this.pointCount;
-      const mode = this.forceLODLevel >= 0 ? 'forced' : 'auto';
-      if (DEBUG_LOD_FRUSTUM) console.log(`[LOD] View ${viewId}: level ${viewState.prevLodLevel ?? 'init'} → ${lodLevel} (${pointCount.toLocaleString()} pts, ${mode})`);
-      viewState.prevLodLevel = lodLevel;
+    // The live geometry is stored in the draw order of its tree whenever the
+    // tree exists (a hover tree counts too): the order alone draws a 10M
+    // full-detail frame about 3x faster in 2D and in 3D. The store adopts
+    // that order in this frame, before it draws.
+    const orderTree = spatialIndex ?? this._currentLiveTree();
+    const order = orderTree !== null
+      ? this._ensureStoreDrawOrder(LIVE_STORE, orderTree)
+      : this._liveOrder;
+    const ordered = spatialIndex !== null && order?.drawOrder === spatialIndex.drawOrder;
+    if (!ordered) lodLevel = -1;
+    // Always update per-view LOD level for highlight rendering and other
+    // consumers: the level actually drawn.
+    viewState.lastLodLevel = lodLevel;
+    this._ensureLiveColorsInOrder();
+    const cull = this.useFrustumCulling && ordered;
+    if (!cull) {
+      this.stats.frustumCulled = false;
+      this.stats.cullPercent = 0;
     }
 
-    // Frustum culling can be combined with LOD for maximum performance
-    // Each view gets independent frustum culling via its own per-view state and frustum planes
-    if (this.useFrustumCulling && spatialIndex) {
-      // For 2D data, disable depth testing
-      // entirely to prevent draw-order artifacts. When all points have the same Z, depth testing
-      // causes visual differences at quadtree boundaries because frustum culling changes the
-      // draw order (spatially grouped vs original). Disabling depth writes alone is insufficient.
-      const disableDepth = dimensionLevel <= DEPTH_TEST_DIMENSION_THRESHOLD;
-      let frustumChanged = false;
-      let operationError = null;
-      try {
-        // Plane/key publication and every downstream consumer form one
-        // transaction. Any failure after publication rejects the new key so
-        // the next stable frame recomputes exact visibility.
+    // For 2D data, disable depth testing to prevent draw-order artifacts:
+    // every point has the same depth.
+    const disableDepth = dimensionLevel <= DEPTH_TEST_DIMENSION_THRESHOLD;
+    let frustumChanged = false;
+    let operationError = null;
+    try {
+      if (cull) {
         frustumChanged = this._prepareFrustumCache(
           mvpMatrix,
           viewState,
           dimensionLevel,
           overrideBounds
         );
-        const frustumPlanes = viewState.frustumPlanes;
-
-        // Debug: log render path on first frame or when path changes.
-        const renderPath = useFullDetail ? 'frustum-only' : 'LOD+frustum';
-        if (viewState._lastRenderPath !== renderPath) {
-          console.log(`[Render] View ${viewId}: ${renderPath} (lodLevel=${lodLevel}, useAdaptiveLOD=${this.useAdaptiveLOD}, lodBuffers=${lodBuffersForDim.length}, dim=${dimensionLevel})`);
-          viewState._lastRenderPath = renderPath;
-        }
-        if (disableDepth) {
-          gl.disable(gl.DEPTH_TEST);
-        }
-
-        if (useFullDetail) {
-          this._renderWithFrustumCulling(
-            params,
-            frustumPlanes,
-            viewState,
-            spatialIndex,
-            frustumChanged
-          );
-        } else {
-          // LOD active: combined LOD + frustum culling for maximum performance
-          // Ensure the spatial index owns its shared leaf/rank mapping.
-          spatialIndex.ensureLodNodeMappings();
-          this._renderLODWithFrustumCulling(
-            lodLevel,
-            params,
-            frustumPlanes,
-            viewState,
-            spatialIndex,
-            lodBuffersForDim,
-            frustumChanged
-          );
-        }
-      } catch (error) {
-        operationError = error;
-        if (frustumChanged) {
-          // Plane/key publication precedes traversal by design. A downstream
-          // failure must therefore reject that key as well as any partial
-          // visibility state, so the next stable frame retries exact culling.
-          this._invalidateViewStateRecord(viewState);
-        }
       }
-
-      let restorationError = null;
-      // DEPTH_TEST enabled is renderer-owned baseline state. Preserve it even
-      // when preparation, traversal, upload, shader state, or drawing throws.
-      try {
-        if (disableDepth) {
-          gl.enable(gl.DEPTH_TEST);
-        }
-      } catch (error) {
-        restorationError = error;
-      }
-      if (operationError !== null) {
-        if (restorationError !== null) {
-          throw new AggregateError(
-            [operationError, restorationError],
-            'HighPerfRenderer live frustum render and depth-state restoration both failed.'
-          );
-        }
-        throw operationError;
-      }
-      if (restorationError !== null) {
-        throw restorationError;
-      }
-
-      this._publishFrameTiming(viewState, frameStart);
-      return returnStats ? this.getStats(viewId) : undefined;
-    }
-
-    // Reset frustum culling stats when not using it
-    this.stats.frustumCulled = false;
-    this.stats.cullPercent = 0;
-
-    // For 2D data, disable depth testing to prevent draw-order artifacts
-    // (consistent with frustum culling path)
-    const disableDepth = dimensionLevel <= DEPTH_TEST_DIMENSION_THRESHOLD;
-    let operationError = null;
-    try {
       if (disableDepth) {
         gl.disable(gl.DEPTH_TEST);
       }
-      if (useFullDetail) {
-        this._renderFullDetail(params, viewState);
-      } else {
-        this._renderLOD(lodLevel, params, viewState);
-      }
+      this._drawPoints({
+        params,
+        viewState,
+        vao: this.vao,
+        pointCount: this.pointCount,
+        order,
+        tree: spatialIndex,
+        lodLevel,
+        cull,
+        frustumChanged,
+        alphaTexture: this._useAlphaTexture ? this._alphaTexture : null,
+        alphaPlan: this._alphaTexPlan,
+        label: `HighPerfRenderer live view "${viewId}"`,
+      });
     } catch (error) {
       operationError = error;
+      if (frustumChanged) {
+        // The accepted frustum key must not outlive a failed draw.
+        this._invalidateViewStateRecord(viewState);
+      }
     }
     let restorationError = null;
     try {
@@ -5817,36 +4945,23 @@ export class HighPerfRenderer {
     settlePointDraw(
       operationError,
       restorationError,
-      'HighPerfRenderer live direct render'
+      'HighPerfRenderer live render'
     );
-
-    // Publish the exact dimension used by non-frustum LOD consumers.
-    // This is done after rendering to ensure accurate per-view tracking without breaking cache invalidation
     viewState.lastDimensionLevel = dimensionLevel;
 
     this._publishFrameTiming(viewState, frameStart);
     return returnStats ? this.getStats(viewId) : undefined;
   }
 
-  _renderWithFrustumCulling(
-    params,
-    frustumPlanes,
-    viewState,
-    spatialIndex,
-    frustumChanged
-  ) {
-    const gl = this.gl;
-    const {
-      mvpMatrix, viewMatrix, modelMatrix, projectionMatrix,
-      pointSize, sizeAttenuation, viewportHeight, fov,
-      lightingStrength, fogDensity, fogColor, lightDir,
-      viewId,
-      dimensionLevel
-    } = params;
-
-    // Validate each exact spatial owner once. A renderer-global boolean would
-    // incorrectly trust same-sized replacement trees and other dimensions.
-    this._ensureLodResourceOwnershipState();
+  /**
+   * Validate each exact spatial owner once, live or snapshot. A
+   * renderer-global boolean would incorrectly trust same-sized replacement
+   * trees and other dimensions.
+   */
+  _validateSpatialOwnerOnce(spatialIndex) {
+    if (!(this._validatedSpatialIndices instanceof WeakSet)) {
+      this._validatedSpatialIndices = new WeakSet();
+    }
     if (
       spatialIndex &&
       !this._validatedSpatialIndices.has(spatialIndex)
@@ -5857,256 +4972,6 @@ export class HighPerfRenderer {
       }
       this._validatedSpatialIndices.add(spatialIndex);
     }
-
-    const spatialOwnerChanged =
-      viewState.cachedVisibleSpatialOwner !== spatialIndex ||
-      viewState.cachedVisibleSpatialRoot !== spatialIndex.root ||
-      !Array.isArray(viewState.cachedVisibleNodes);
-    const fullDetailCacheChanged =
-      viewState.cachedLodIsCulled === true ||
-      viewState.cachedLodLevel !== -1 ||
-      viewState.cachedLodDimension !== dimensionLevel ||
-      viewState.cachedLodMappingGeneration !== null ||
-      !(viewState.cachedVisibleIndices instanceof Uint32Array) ||
-      viewState.cachedCulledCount !==
-        viewState.cachedVisibleIndices?.length ||
-      (
-        viewState.cachedCulledCount > 0 &&
-        viewState.indexBufferSize !== viewState.cachedCulledCount
-      );
-    let visibleNodes = null;
-    let orderedAdmissionChanged = false;
-
-    if (
-      frustumChanged ||
-      spatialOwnerChanged ||
-      fullDetailCacheChanged
-    ) {
-      const candidate = this._collectVisibleNodeCandidate(
-        viewState,
-        spatialIndex.root,
-        frustumPlanes
-      );
-      const canReuseAcceptedEbo =
-        frustumChanged &&
-        !spatialOwnerChanged &&
-        !fullDetailCacheChanged &&
-        this._hasSameOrderedVisibleNodes(
-          viewState.cachedVisibleNodes,
-          candidate
-        );
-      if (canReuseAcceptedEbo) {
-        this._recycleVisibleNodeCandidate(viewState, candidate);
-      } else {
-        visibleNodes = candidate;
-        orderedAdmissionChanged = true;
-      }
-    }
-
-    const needsUpdate =
-      spatialOwnerChanged ||
-      fullDetailCacheChanged ||
-      orderedAdmissionChanged;
-
-    if (needsUpdate) {
-      try {
-        if (!Array.isArray(visibleNodes)) {
-          throw new Error(
-            `HighPerfRenderer frustum leaf admission is unavailable for view "${viewId}".`
-          );
-        }
-        if (visibleNodes.length === 0) {
-          const emptyIndices =
-            viewState.cachedVisibleIndices instanceof Uint32Array &&
-            viewState.cachedVisibleIndices.length === 0
-              ? viewState.cachedVisibleIndices
-              : new Uint32Array(0);
-          this._acceptVisibleNodeCandidate(viewState, visibleNodes);
-          viewState.cachedVisibleSpatialOwner = spatialIndex;
-          viewState.cachedVisibleSpatialRoot = spatialIndex.root;
-          viewState.cachedCulledCount = 0;
-          viewState.cachedVisibleIndices = emptyIndices;
-          viewState.cachedLodVisibleIndices = null;
-          viewState.cachedLodLevel = -1;
-          viewState.cachedLodDimension = dimensionLevel;
-          viewState.cachedLodIsCulled = false;
-          viewState.cachedLodMappingGeneration = null;
-          this._writeStats(viewState, 0, -1, 0, true, 100);
-          return;
-        }
-
-        // Count total visible points first to determine buffer size
-        let totalVisible = 0;
-        for (const node of visibleNodes) {
-          if (node.indices) totalVisible += node.indices.length;
-        }
-
-        // Per-view full-detail scratch follows the same transactional
-        // grow/shrink policy as reduced LOD scratch.
-        this._ensureVisibleIndexScratch(
-          viewState,
-          totalVisible,
-          false
-        );
-
-        // Fill the pooled buffer with visible indices
-        let writeOffset = 0;
-        for (const node of visibleNodes) {
-          if (node.indices) {
-            viewState.visibleIndicesBuffer.set(node.indices, writeOffset);
-            writeOffset += node.indices.length;
-          }
-        }
-
-        // Create a view of only the used portion (no backing-store allocation)
-        const visibleIndices = viewState.visibleIndicesBuffer.subarray(0, totalVisible);
-
-        const visibleRatio = totalVisible / this.pointCount;
-        const cullPercent = ((1 - visibleRatio) * 100);
-        const visibleCount = visibleIndices.length;
-
-        // Log only on significant change (>10% of total points)
-        if (DEBUG_LOD_FRUSTUM && this._isSignificantChange(viewState.lastVisibleCount, visibleCount, this.pointCount)) {
-          console.log(`[FrustumCulling] View ${viewId}: ${visibleCount.toLocaleString()}/${this.pointCount.toLocaleString()} visible (${cullPercent.toFixed(1)}% culled)`);
-          viewState.lastVisibleCount = visibleCount;
-        }
-
-        // GPU acceptance is the publication boundary. Until bufferData
-        // succeeds, the prior leaf list and CPU view remain authoritative.
-        this._uploadToViewIndexBuffer(viewState, visibleIndices);
-        this._acceptVisibleNodeCandidate(viewState, visibleNodes);
-        viewState.cachedVisibleSpatialOwner = spatialIndex;
-        viewState.cachedVisibleSpatialRoot = spatialIndex.root;
-        viewState.cachedCulledCount = visibleIndices.length;
-        viewState.cachedVisibleIndices = visibleIndices;
-        viewState.cachedLodVisibleIndices = null;
-        viewState.cachedLodLevel = -1;
-        viewState.cachedLodDimension = dimensionLevel;
-        viewState.cachedLodIsCulled = false;
-        viewState.cachedLodMappingGeneration = null;
-        this.stats.frustumCulled = true;
-        this.stats.cullPercent = cullPercent;
-      } catch (error) {
-        this._invalidateViewStateRecord(viewState);
-        throw error;
-      }
-    }
-
-    if (!(viewState.cachedVisibleIndices instanceof Uint32Array)) {
-      throw new Error(
-        `HighPerfRenderer frustum visibility state is unavailable for view "${viewId}".`
-      );
-    }
-    if (viewState.cachedVisibleIndices.length === 0) {
-      this._writeStats(viewState, 0, -1, 0, true, 100);
-      return;
-    }
-
-    const program = this.activeProgram;
-    const uniforms = this.uniformLocations.get(this.activeQuality);
-
-    if (!program || !uniforms) {
-      throw new Error(
-        `HighPerfRenderer "${this.activeQuality}" full-detail/frustum shader state is unavailable.`
-      );
-    }
-
-    gl.useProgram(program);
-
-    if (uniforms.u_mvpMatrix !== null) {
-      gl.uniformMatrix4fv(uniforms.u_mvpMatrix, false, mvpMatrix);
-    }
-    if (uniforms.u_viewMatrix !== null) {
-      gl.uniformMatrix4fv(uniforms.u_viewMatrix, false, viewMatrix);
-    }
-    if (uniforms.u_modelMatrix !== null) {
-      gl.uniformMatrix4fv(uniforms.u_modelMatrix, false, modelMatrix);
-    }
-    if (uniforms.u_projectionMatrix !== null && projectionMatrix) {
-      gl.uniformMatrix4fv(uniforms.u_projectionMatrix, false, projectionMatrix);
-    }
-    if (uniforms.u_pointSize !== null) {
-      gl.uniform1f(uniforms.u_pointSize, pointSize);
-    }
-    if (uniforms.u_sizeAttenuation !== null) {
-      gl.uniform1f(uniforms.u_sizeAttenuation, sizeAttenuation);
-    }
-    if (uniforms.u_viewportHeight !== null) {
-      gl.uniform1f(uniforms.u_viewportHeight, viewportHeight);
-    }
-    if (uniforms.u_fov !== null) {
-      gl.uniform1f(uniforms.u_fov, fov);
-    }
-    if (uniforms.u_lightingStrength !== null) {
-      gl.uniform1f(uniforms.u_lightingStrength, lightingStrength);
-    }
-    if (uniforms.u_fogDensity !== null) {
-      gl.uniform1f(uniforms.u_fogDensity, fogDensity);
-    }
-    if (uniforms.u_fogNear !== null) {
-      gl.uniform1f(uniforms.u_fogNear, this.fogNear);
-    }
-    if (uniforms.u_fogFar !== null) {
-      gl.uniform1f(uniforms.u_fogFar, this.fogFar);
-    }
-    if (uniforms.u_fogColor !== null) {
-      gl.uniform3fv(uniforms.u_fogColor, fogColor);
-    }
-    if (uniforms.u_lightDir !== null) {
-      gl.uniform3fv(uniforms.u_lightDir, lightDir);
-    }
-
-    // Defensive check: ensure index buffer is valid before drawing
-    // If indexBufferSize doesn't match cachedCulledCount, the buffer might be stale
-    if (viewState.indexBufferSize !== viewState.cachedCulledCount) {
-      throw new Error(
-        `HighPerfRenderer frustum index buffer for view "${viewId}" contains ` +
-        `${viewState.indexBufferSize} entries but ${viewState.cachedCulledCount} are required.`
-      );
-    }
-
-    let operationError = null;
-    try {
-      // With indexed drawing gl_VertexID is the original point index, which
-      // addresses the canonical alpha texture directly.
-      this._bindAlphaTexture(gl, uniforms, -1, dimensionLevel);
-      gl.bindVertexArray(this.vao);
-      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, viewState.indexBuffer);
-      gl.drawElements(
-        gl.POINTS,
-        viewState.cachedCulledCount,
-        gl.UNSIGNED_INT,
-        0
-      );
-    } catch (error) {
-      operationError = error;
-    }
-    let restorationError = null;
-    try {
-      restorePointDrawBaseline(gl, true);
-    } catch (error) {
-      restorationError = error;
-    }
-    settlePointDraw(
-      operationError,
-      restorationError,
-      'HighPerfRenderer live frustum draw'
-    );
-
-    // Update both global and per-view stats
-    this._writeStats(
-      viewState,
-      viewState.cachedCulledCount,
-      -1,
-      1,
-      true,
-      this.pointCount === 0
-        ? 100
-        : 100 * (
-            1 -
-            viewState.cachedCulledCount / this.pointCount
-          )
-    );
   }
 
   /**
@@ -6340,225 +5205,6 @@ export class HighPerfRenderer {
     return true;
   }
 
-  /**
-   * Check if frustum cache is valid and needs update.
-   * @param {Float32Array} mvpMatrix - Current MVP matrix
-   * @param {Object} viewState - Per-view state object
-   * @param {number} [dimensionLevel] - Current dimension level (triggers invalidation when changed)
-   * @returns {boolean} True if cache needs update
-   */
-  _checkFrustumCacheValid(mvpMatrix, viewState, dimensionLevel = undefined) {
-    if (
-      !viewState ||
-      (
-        !Array.isArray(mvpMatrix) &&
-        !ArrayBuffer.isView(mvpMatrix)
-      ) ||
-      mvpMatrix.length !== 16
-    ) {
-      throw new TypeError(
-        'HighPerfRenderer frustum cache requires a view state and exactly 16 MVP values.'
-      );
-    }
-
-    const cachedMatrix = viewState.lastFrustumMVP;
-    const hasExactCache =
-      (
-        Array.isArray(cachedMatrix) ||
-        ArrayBuffer.isView(cachedMatrix)
-      ) &&
-      cachedMatrix.length === 16;
-    let matrixChanged = !hasExactCache;
-
-    // Frustum admission is a hard visibility boundary: any finite matrix
-    // element change can move a point across a plane. Exact comparison also
-    // keeps the idle fast path allocation-free and avoids the prior
-    // subtract/multiply threshold work. Validate before mutating cache keys so
-    // NaN/Infinity cannot silently reuse stale visibility.
-    for (let index = 0; index < 16; index++) {
-      const value = mvpMatrix[index];
-      if (!Number.isFinite(value)) {
-        throw new TypeError(
-          `HighPerfRenderer frustum MVP[${index}] must be finite; received ${String(value)}.`
-        );
-      }
-      if (hasExactCache && value !== cachedMatrix[index]) {
-        matrixChanged = true;
-      }
-    }
-
-    const dimensionChanged =
-      dimensionLevel !== undefined &&
-      viewState.lastDimensionLevel !== undefined &&
-      viewState.lastDimensionLevel !== dimensionLevel;
-    if (!matrixChanged && !dimensionChanged) {
-      if (dimensionLevel !== undefined) {
-        viewState.lastDimensionLevel = dimensionLevel;
-      }
-      return false;
-    }
-
-    // Float64 preserves every JavaScript numeric matrix element exactly,
-    // including callers that supply stable Float64Array/Array matrices. The
-    // extra 64 bytes per view prevent rounded caches from invalidating every
-    // otherwise-idle frame.
-    const acceptedMatrix =
-      cachedMatrix instanceof Float64Array &&
-      cachedMatrix.length === 16
-        ? cachedMatrix
-        : new Float64Array(16);
-    for (let index = 0; index < 16; index++) {
-      acceptedMatrix[index] = mvpMatrix[index];
-    }
-    viewState.lastFrustumMVP = acceptedMatrix;
-    if (dimensionLevel !== undefined) {
-      viewState.lastDimensionLevel = dimensionLevel;
-    }
-    return true;
-  }
-
-  _collectVisibleNodes(node, frustumPlanes, result) {
-    if (!node) return;
-
-    const visibility = this._classifyNodeVisibility(node.bounds, frustumPlanes);
-
-    if (visibility === 'outside') {
-      return;
-    }
-
-    if (visibility === 'inside' || node.indices !== null) {
-      if (node.indices !== null) {
-        result.push(node);
-      } else if (node.children) {
-        this._collectAllLeaves(node, result);
-      }
-      return;
-    }
-
-    if (node.children) {
-      for (const child of node.children) {
-        this._collectVisibleNodes(child, frustumPlanes, result);
-      }
-    }
-  }
-
-  _collectAllLeaves(node, result) {
-    if (!node) return;
-    if (node.indices !== null) {
-      result.push(node);
-      return;
-    }
-    if (node.children) {
-      for (const child of node.children) {
-        this._collectAllLeaves(child, result);
-      }
-    }
-  }
-
-  /**
-   * Collect one candidate ordered leaf sequence into per-view reusable
-   * storage. The candidate must be accepted or recycled by the caller.
-   *
-   * @param {Object} viewState
-   * @param {Object} root
-   * @param {Array<Float32Array>} frustumPlanes
-   * @returns {Array<Object>}
-   * @private
-   */
-  _collectVisibleNodeCandidate(viewState, root, frustumPlanes) {
-    let candidate = viewState.visibleNodesScratch;
-    if (
-      !Array.isArray(candidate) ||
-      candidate === viewState.cachedVisibleNodes
-    ) {
-      candidate = [];
-    } else {
-      candidate.length = 0;
-    }
-
-    let operationError = null;
-    try {
-      this._collectVisibleNodes(root, frustumPlanes, candidate);
-    } catch (error) {
-      candidate.length = 0;
-      viewState.visibleNodesScratch = candidate;
-      // _checkFrustumCacheValid publishes the candidate MVP before traversal.
-      // A failed traversal must therefore invalidate that key or the next
-      // stable frame could draw the previously accepted, now-stale EBO.
-      this._invalidateViewStateRecord(viewState);
-      throw error;
-    }
-    return candidate;
-  }
-
-  /**
-   * Ordered leaf identity is the exact CPU/GPU EBO admission contract.
-   * Counts alone cannot distinguish reordered or same-sized replacements.
-   *
-   * @param {Array<Object>|null} accepted
-   * @param {Array<Object>} candidate
-   * @returns {boolean}
-   * @private
-   */
-  _hasSameOrderedVisibleNodes(accepted, candidate) {
-    if (
-      !Array.isArray(accepted) ||
-      !Array.isArray(candidate) ||
-      accepted.length !== candidate.length
-    ) {
-      return false;
-    }
-    for (let index = 0; index < accepted.length; index++) {
-      if (accepted[index] !== candidate[index]) return false;
-    }
-    return true;
-  }
-
-  /**
-   * Publish a candidate leaf sequence and recycle the previously accepted
-   * array as the next per-view traversal scratch.
-   *
-   * @param {Object} viewState
-   * @param {Array<Object>} candidate
-   * @private
-   */
-  _acceptVisibleNodeCandidate(viewState, candidate) {
-    const previous = viewState.cachedVisibleNodes;
-    viewState.cachedVisibleNodes = candidate;
-    if (Array.isArray(previous) && previous !== candidate) {
-      previous.length = 0;
-      viewState.visibleNodesScratch = previous;
-      viewState.visibleNodesSpare = null;
-      return;
-    }
-    const spare = viewState.visibleNodesSpare;
-    if (Array.isArray(spare) && spare !== candidate) {
-      spare.length = 0;
-      viewState.visibleNodesScratch = spare;
-      viewState.visibleNodesSpare = null;
-      return;
-    }
-    // Hand-built/test states and recovery after invalidation may not own the
-    // normal two-array pool yet. Allocate once, never once per frame.
-    viewState.visibleNodesScratch = [];
-    viewState.visibleNodesSpare = null;
-  }
-
-  /**
-   * Return an unchanged candidate to the per-view traversal pool.
-   *
-   * @param {Object} viewState
-   * @param {Array<Object>} candidate
-   * @private
-   */
-  _recycleVisibleNodeCandidate(viewState, candidate) {
-    candidate.length = 0;
-    viewState.visibleNodesScratch = candidate;
-    if (viewState.visibleNodesSpare === candidate) {
-      viewState.visibleNodesSpare = null;
-    }
-  }
-
   _classifyNodeVisibility(bounds, planes) {
     let allInside = true;
 
@@ -6586,81 +5232,68 @@ export class HighPerfRenderer {
   }
 
   /**
-   * Upload indices to the per-view index buffer for frustum culling.
-   * Each view has its own index buffer to avoid cross-view conflicts.
-   *
-   * This runs once per view on every frame of camera motion, so the WebGL
-   * error bracket around it is charged per frame. `gl.getError()` drains the
-   * client command buffer to the GPU process and blocks for the answer, which
-   * serializes the CPU against work the GPU has not finished: measured at 11 ms
-   * of wall time per frame inside this method at both 1 M and 10 M points.
-   *
-   * The bracket is therefore taken where the failure it detects can appear —
-   * an allocation larger than any this EBO has already been verified to hold,
-   * which is where OUT_OF_MEMORY lives — and skipped when the same store is
-   * replaced at or below a size WebGL has already accepted for it.
-   * `indexBufferVerifiedByteLength` carries that watermark, and every
-   * invalidation resets it, so any failed or abandoned publication makes the
-   * next upload verify again.
-   *
-   * @param {Object} viewState - Per-view state object containing indexBuffer
-   * @param {Uint32Array} visibleIndices - Array of visible point indices
+   * Publish the per-draw point uniforms every point pass shares. A location the
+   * active quality's shader does not declare is null and skipped. The fog range
+   * is the renderer-wide value the current frame computed. The products the
+   * shaders used to form per vertex or per fragment (model-view matrix, point
+   * scale, Blinn half vector) are derived here once per draw into renderer
+   * scratch, see `writePointShaderFrame`.
    */
-  _uploadToViewIndexBuffer(viewState, visibleIndices) {
-    const gl = this.gl;
-    if (
-      !viewState ||
-      !viewState.indexBuffer ||
-      !(visibleIndices instanceof Uint32Array)
-    ) {
-      throw new TypeError(
-        'HighPerfRenderer per-view index upload requires an owned EBO and exact Uint32Array indices.'
-      );
-    }
-
-    const verifiedByteLength =
-      Number.isSafeInteger(viewState.indexBufferVerifiedByteLength) &&
-      viewState.indexBufferVerifiedByteLength > 0
-        ? viewState.indexBufferVerifiedByteLength
-        : 0;
-    const verifyPublication = visibleIndices.byteLength > verifiedByteLength;
-
-    try {
-      if (verifyPublication) {
-        requireCleanWebGLState(
-          gl,
-          'HighPerfRenderer per-view index publication preflight'
-        );
+  _applyPointUniforms(
+    gl,
+    uniforms,
+    mvpMatrix,
+    viewMatrix,
+    modelMatrix,
+    projectionMatrix,
+    pointSize,
+    sizeAttenuation,
+    viewportHeight,
+    fov,
+    lightingStrength,
+    fogDensity,
+    fogColor,
+    lightDir
+  ) {
+    const frame = this._pointShaderFrame ??= {
+      modelView: new Float32Array(16),
+      halfDir: new Float32Array(3),
+      invCenterShade: 1,
+    };
+    const pointScale = writePointShaderFrame(
+      frame,
+      viewMatrix,
+      modelMatrix,
+      lightDir,
+      viewportHeight,
+      fov
+    );
+    if (uniforms.u_mvpMatrix !== null) gl.uniformMatrix4fv(uniforms.u_mvpMatrix, false, mvpMatrix);
+    if (uniforms.u_modelViewMatrix !== null) gl.uniformMatrix4fv(uniforms.u_modelViewMatrix, false, frame.modelView);
+    if (uniforms.u_projectionMatrix !== null && projectionMatrix) gl.uniformMatrix4fv(uniforms.u_projectionMatrix, false, projectionMatrix);
+    if (uniforms.u_pointSize !== null) gl.uniform1f(uniforms.u_pointSize, pointSize);
+    if (uniforms.u_sizeAttenuation !== null) gl.uniform1f(uniforms.u_sizeAttenuation, sizeAttenuation);
+    if (uniforms.u_pointScale !== null) gl.uniform1f(uniforms.u_pointScale, pointScale);
+    if (uniforms.u_lightingStrength !== null) gl.uniform1f(uniforms.u_lightingStrength, lightingStrength);
+    writeFogUniforms(
+      gl,
+      uniforms.u_fogNear,
+      uniforms.u_fogScale,
+      fogDensity,
+      this.fogNear,
+      this.fogFar
+    );
+    if (uniforms.u_fogColor !== null) gl.uniform3fv(uniforms.u_fogColor, fogColor);
+    if (uniforms.u_lightDir !== null) gl.uniform3fv(uniforms.u_lightDir, lightDir);
+    if (uniforms.u_halfDir !== null) gl.uniform3fv(uniforms.u_halfDir, frame.halfDir);
+    if (uniforms.u_invCenterShade !== null) gl.uniform1f(uniforms.u_invCenterShade, frame.invCenterShade);
+    if (uniforms.opaque === true) {
+      // Undone by restorePointDrawBaseline(..., true) after the draw.
+      const multisampled = this._pointPassMultisampled === true;
+      enterOpaquePointBlending(gl, multisampled);
+      if (uniforms.u_coverageFloor !== null) {
+        gl.uniform1f(uniforms.u_coverageFloor, multisampled ? 0 : 0.5);
       }
-      // ELEMENT_ARRAY_BUFFER is VAO state. Upload with no VAO bound so this
-      // reusable per-view EBO cannot become an accidental retained binding.
-      gl.bindVertexArray(null);
-      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, viewState.indexBuffer);
-      gl.bufferData(
-        gl.ELEMENT_ARRAY_BUFFER,
-        visibleIndices,
-        gl.DYNAMIC_DRAW
-      );
-      if (verifyPublication) {
-        requireCleanWebGLState(
-          gl,
-          'HighPerfRenderer per-view index publication'
-        );
-        viewState.indexBufferVerifiedByteLength = visibleIndices.byteLength;
-      }
-      // Publish the byte/count contract only after WebGL accepted the complete
-      // replacement. A failed bufferData leaves the previous store intact.
-      viewState.indexBufferSize = visibleIndices.length;
-      viewState.indexBufferByteLength = visibleIndices.byteLength;
-      this._refreshGpuMemoryStats();
-    } catch (error) {
-      // Callers may already have filled reusable CPU scratch or advanced
-      // frustum/LOD cache keys. Invalidate all semantic projections so the
-      // next frame recomputes and retries instead of drawing stale topology.
-      this._invalidateViewStateRecord(viewState);
-      throw error;
-    } finally {
-      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, null);
     }
   }
 
@@ -6678,1185 +5311,762 @@ export class HighPerfRenderer {
    * @returns {Uint32Array}
    * @private
    */
-  _ensureVisibleIndexScratch(
-    viewState,
-    requiredCount,
-    isLodScratch
-  ) {
-    if (
-      !viewState ||
-      !Number.isSafeInteger(requiredCount) ||
-      requiredCount < 0 ||
-      typeof isLodScratch !== 'boolean'
-    ) {
-      throw new TypeError(
-        'HighPerfRenderer visible-index scratch requires a view state, a non-negative safe-integer count, and an exact LOD ownership flag.'
-      );
-    }
 
-    const targetCapacity = Math.ceil(
-      requiredCount * VISIBLE_INDEX_GROWTH_FACTOR
-    );
-    if (!Number.isSafeInteger(targetCapacity)) {
-      throw new RangeError(
-        `HighPerfRenderer visible-index scratch capacity for ${requiredCount} indices is unsafe.`
-      );
-    }
-
-    const bufferKey = isLodScratch
-      ? 'visibleLodIndicesBuffer'
-      : 'visibleIndicesBuffer';
-    const capacityKey = isLodScratch
-      ? 'visibleLodIndicesCapacity'
-      : 'visibleIndicesCapacity';
-    const current =
-      viewState[bufferKey];
-    const hasExactScratch =
-      current instanceof Uint32Array;
-    const shouldGrow =
-      !hasExactScratch || current.length < requiredCount;
-    const shouldShrink =
-      hasExactScratch &&
-      current.length >
-        targetCapacity * VISIBLE_INDEX_SHRINK_RATIO &&
-      current.length - targetCapacity >=
-        VISIBLE_INDEX_MIN_RECLAIM;
-
-    if (shouldGrow || shouldShrink) {
-      // Publish only after allocation succeeds. On failure, the accepted
-      // scratch remains reachable and the caller's cache transaction aborts.
-      const replacement =
-        new Uint32Array(targetCapacity);
-      viewState[bufferKey] = replacement;
-      viewState[capacityKey] =
-        replacement.length;
-      return replacement;
-    }
-
-    viewState[capacityKey] = current.length;
-    return current;
-  }
-
-  _ensureVisibleLodIndexScratch(viewState, requiredCount) {
-    return this._ensureVisibleIndexScratch(
-      viewState,
-      requiredCount,
-      true
-    );
-  }
+  // ==========================================================================
+  // DRAW ORDER
+  //
+  // A geometry's points are stored on the GPU in the draw order of the tree
+  // over them (`SpatialIndex#drawOrder`): grouped by LOD band, then by tree
+  // leaf, then by ascending source index. Every reduced LOD level is a prefix
+  // of that order and every run of tree leaves is one contiguous range per
+  // band, so a reduced level is one `drawArrays` prefix and frustum culling
+  // draws node ranges -- no per-point index ever leaves the CPU after the
+  // order is built. Neighbouring points are also neighbours in memory and on
+  // screen, which is what makes the stored order faster to draw at full
+  // detail than source order (10M points: 18 ms against 68 ms on Chromium,
+  // 15 against 57 on WebKit, 14 against 57 on Firefox).
+  //
+  // Positions are per geometry, so each geometry carries its order; colours
+  // are per view and are gathered into the order of the geometry the view
+  // draws. Alpha stays in source order, read through the order's R32UI
+  // permutation texture (`u_useLodIndexTex`). Before a tree exists a geometry
+  // is stored in source order and draws at full detail only.
+  // ==========================================================================
 
   /**
-   * Check if visible count change is significant enough to log.
-   * Logs on first call and when cull percentage changes by >10 percentage points.
-   */
-  _isSignificantChange(lastCount, newCount, totalCount) {
-    if (lastCount === undefined || lastCount === null) return true;
-    if (totalCount === 0) return false;
-    const lastPercent = (lastCount / totalCount) * 100;
-    const newPercent = (newCount / totalCount) * 100;
-    return Math.abs(newPercent - lastPercent) > 10;
-  }
-
-  _renderFullDetail(params, viewState) {
-    const gl = this.gl;
-    const {
-      mvpMatrix, viewMatrix, modelMatrix, projectionMatrix,
-      pointSize, sizeAttenuation, viewportHeight, fov,
-      lightingStrength, fogDensity, fogColor, lightDir, dimensionLevel
-    } = params;
-
-    const program = this.activeProgram;
-    const uniforms = this.uniformLocations.get(this.activeQuality);
-
-    if (!program) {
-      throw new Error(
-        'HighPerfRenderer full-detail shader program is unavailable.'
-      );
-    }
-    if (!uniforms) {
-      throw new Error(
-        `HighPerfRenderer "${this.activeQuality}" full-detail uniform state is unavailable.`
-      );
-    }
-
-    gl.useProgram(program);
-
-    if (uniforms.u_mvpMatrix !== null) {
-      gl.uniformMatrix4fv(uniforms.u_mvpMatrix, false, mvpMatrix);
-    }
-
-    if (uniforms.u_viewMatrix !== null) {
-      gl.uniformMatrix4fv(uniforms.u_viewMatrix, false, viewMatrix);
-    }
-    if (uniforms.u_modelMatrix) {
-      gl.uniformMatrix4fv(uniforms.u_modelMatrix, false, modelMatrix);
-    }
-    if (uniforms.u_projectionMatrix !== null && projectionMatrix) {
-      gl.uniformMatrix4fv(uniforms.u_projectionMatrix, false, projectionMatrix);
-    }
-
-    if (uniforms.u_pointSize !== null) {
-      gl.uniform1f(uniforms.u_pointSize, pointSize);
-    }
-
-    if (uniforms.u_sizeAttenuation) {
-      gl.uniform1f(uniforms.u_sizeAttenuation, sizeAttenuation);
-    }
-    if (uniforms.u_viewportHeight) {
-      gl.uniform1f(uniforms.u_viewportHeight, viewportHeight);
-    }
-    if (uniforms.u_fov) {
-      gl.uniform1f(uniforms.u_fov, fov);
-    }
-    if (uniforms.u_lightingStrength) {
-      gl.uniform1f(uniforms.u_lightingStrength, lightingStrength);
-    }
-    if (uniforms.u_fogDensity) {
-      gl.uniform1f(uniforms.u_fogDensity, fogDensity);
-    }
-    if (uniforms.u_fogNear) {
-      gl.uniform1f(uniforms.u_fogNear, this.fogNear);
-    }
-    if (uniforms.u_fogFar) {
-      gl.uniform1f(uniforms.u_fogFar, this.fogFar);
-    }
-    if (uniforms.u_fogColor) {
-      gl.uniform3fv(uniforms.u_fogColor, fogColor);
-    }
-    if (uniforms.u_lightDir) {
-      gl.uniform3fv(uniforms.u_lightDir, lightDir);
-    }
-
-    let operationError = null;
-    try {
-      // Bind alpha texture for efficient alpha lookups (texture unit 0).
-      this._bindAlphaTexture(gl, uniforms, -1, dimensionLevel);
-      gl.bindVertexArray(this.vao);
-      gl.drawArrays(gl.POINTS, 0, this.pointCount);
-    } catch (error) {
-      operationError = error;
-    }
-    let restorationError = null;
-    try {
-      restorePointDrawBaseline(gl, false);
-    } catch (error) {
-      restorationError = error;
-    }
-    settlePointDraw(
-      operationError,
-      restorationError,
-      'HighPerfRenderer full-detail draw'
-    );
-
-    this._writeStats(
-      viewState,
-      this.pointCount,
-      -1,
-      1,
-      false,
-      0
-    );
-  }
-
-  /**
-   * Bind alpha texture and set uniforms for alpha texture lookup.
-   * @param {WebGL2RenderingContext} gl
-   * @param {Object} uniforms - Cached uniform locations
-   * @param {number} lodLevel - LOD level for index texture binding (-1 for full detail)
-   * @param {number} dimensionLevel - Exact dimension level for LOD index texture lookup
-   */
-  _bindAlphaTexture(gl, uniforms, lodLevel, dimensionLevel) {
-    if (!Number.isInteger(lodLevel) || lodLevel < -1) {
-      throw new RangeError('HighPerfRenderer alpha texture LOD level must be an integer of at least -1.');
-    }
-    requireDimensionLevel(
-      dimensionLevel,
-      'HighPerfRenderer alpha texture dimensionLevel'
-    );
-    // Bind alpha texture to texture unit 0
-    if (this._useAlphaTexture && this._alphaTexture) {
-      gl.activeTexture(gl.TEXTURE0);
-      gl.bindTexture(gl.TEXTURE_2D, this._alphaTexture);
-      if (uniforms.u_alphaTex !== null) {
-        gl.uniform1i(uniforms.u_alphaTex, 0); // Texture unit 0
-      }
-      if (uniforms.u_alphaTexWidth !== null) {
-        gl.uniform1i(uniforms.u_alphaTexWidth, this._alphaTexWidth);
-      }
-      if (uniforms.u_invAlphaTexWidth !== null && this._alphaTexWidth > 0) {
-        gl.uniform1f(uniforms.u_invAlphaTexWidth, 1.0 / this._alphaTexWidth);
-      }
-      if (uniforms.u_useAlphaTex !== null) {
-        gl.uniform1i(uniforms.u_useAlphaTex, 1); // true
-      }
-
-      // Bind LOD index texture if rendering LOD level (texture unit 1)
-      // Use dimension-aware LOD index textures to match LOD buffers
-      const lodIndexTextures = this._getLodIndexTexturesForDimension(dimensionLevel);
-      if (lodLevel >= 0 && lodIndexTextures[lodLevel]?.texture) {
-        const lodIdxTex = lodIndexTextures[lodLevel];
-        gl.activeTexture(gl.TEXTURE1);
-        gl.bindTexture(gl.TEXTURE_2D, lodIdxTex.texture);
-        if (uniforms.u_lodIndexTex !== null) {
-          gl.uniform1i(uniforms.u_lodIndexTex, 1); // Texture unit 1
-        }
-        if (uniforms.u_lodIndexTexWidth !== null) {
-          gl.uniform1i(uniforms.u_lodIndexTexWidth, lodIdxTex.width);
-        }
-        if (uniforms.u_invLodIndexTexWidth !== null && lodIdxTex.width > 0) {
-          gl.uniform1f(uniforms.u_invLodIndexTexWidth, 1.0 / lodIdxTex.width);
-        }
-        if (uniforms.u_useLodIndexTex !== null) {
-          gl.uniform1i(uniforms.u_useLodIndexTex, 1); // true
-        }
-      } else {
-        // No LOD index texture needed, but must bind dummy R32UI texture to satisfy usampler2D
-        // Without this, WebGL throws "Two textures of different types use the same sampler location"
-        if (this._dummyLodIndexTexture) {
-          gl.activeTexture(gl.TEXTURE1);
-          gl.bindTexture(gl.TEXTURE_2D, this._dummyLodIndexTexture);
-          if (uniforms.u_lodIndexTex !== null) {
-            gl.uniform1i(uniforms.u_lodIndexTex, 1); // Texture unit 1
-          }
-        }
-        if (uniforms.u_useLodIndexTex !== null) {
-          gl.uniform1i(uniforms.u_useLodIndexTex, 0); // false
-        }
-      }
-    } else {
-      // Alpha texture not active - use vertex attribute alpha
-      if (uniforms.u_useAlphaTex !== null) {
-        gl.uniform1i(uniforms.u_useAlphaTex, 0); // false
-      }
-      // Still need to bind dummy R32UI texture to satisfy usampler2D uniform
-      if (this._dummyLodIndexTexture) {
-        gl.activeTexture(gl.TEXTURE1);
-        gl.bindTexture(gl.TEXTURE_2D, this._dummyLodIndexTexture);
-        if (uniforms.u_lodIndexTex !== null) {
-          gl.uniform1i(uniforms.u_lodIndexTex, 1); // Texture unit 1
-        }
-      }
-      if (uniforms.u_useLodIndexTex !== null) {
-        gl.uniform1i(uniforms.u_useLodIndexTex, 0); // false
-      }
-    }
-  }
-
-  /**
-   * Bind the exact alpha owner for one snapshot draw. Snapshot EBOs contain
-   * source point IDs, so every direct/LOD/frustum branch indexes R8 with
-   * gl_VertexID and must keep the LOD remap sampler disabled.
-   */
-  _bindSnapshotAlphaTexture(
-    gl,
-    uniforms,
-    snapshot,
-    useLiveAlpha,
-    dimensionLevel
-  ) {
-    if (typeof useLiveAlpha !== 'boolean') {
-      throw new TypeError(
-        'HighPerfRenderer snapshot live-alpha override must be a boolean.'
-      );
-    }
-    requireDimensionLevel(
-      dimensionLevel,
-      'HighPerfRenderer snapshot alpha dimensionLevel'
-    );
-    if (useLiveAlpha) {
-      if (!this.isAlphaTextureActive()) {
-        throw new Error(
-          `HighPerfRenderer snapshot "${snapshot?.id ?? 'unknown'}" requested unavailable live alpha state.`
-        );
-      }
-      this._bindAlphaTexture(
-        gl,
-        uniforms,
-        -1,
-        dimensionLevel
-      );
-      return;
-    }
-    if (
-      !snapshot ||
-      !snapshot.alphaTexture ||
-      !(snapshot.alphaTexData instanceof Uint8Array) ||
-      !Number.isSafeInteger(snapshot.alphaTexWidth) ||
-      snapshot.alphaTexWidth <= 0 ||
-      !Number.isSafeInteger(snapshot.alphaTexHeight) ||
-      snapshot.alphaTexHeight <= 0 ||
-      snapshot.alphaTexData.length !==
-        snapshot.alphaTexWidth * snapshot.alphaTexHeight ||
-      snapshot.alphaTextureByteLength !==
-        snapshot.alphaTexData.byteLength
-    ) {
-      throw new Error(
-        `HighPerfRenderer snapshot "${snapshot?.id ?? 'unknown'}" has no exact accepted R8 alpha texture.`
-      );
-    }
-    if (!this._dummyLodIndexTexture) {
-      throw new Error(
-        `HighPerfRenderer snapshot "${snapshot.id}" requires its dummy LOD index texture.`
-      );
-    }
-
-    gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, snapshot.alphaTexture);
-    if (uniforms.u_alphaTex !== null) {
-      gl.uniform1i(uniforms.u_alphaTex, 0);
-    }
-    if (uniforms.u_alphaTexWidth !== null) {
-      gl.uniform1i(
-        uniforms.u_alphaTexWidth,
-        snapshot.alphaTexWidth
-      );
-    }
-    if (uniforms.u_invAlphaTexWidth !== null) {
-      gl.uniform1f(
-        uniforms.u_invAlphaTexWidth,
-        1.0 / snapshot.alphaTexWidth
-      );
-    }
-    if (uniforms.u_useAlphaTex !== null) {
-      gl.uniform1i(uniforms.u_useAlphaTex, 1);
-    }
-
-    gl.activeTexture(gl.TEXTURE1);
-    gl.bindTexture(
-      gl.TEXTURE_2D,
-      this._dummyLodIndexTexture
-    );
-    if (uniforms.u_lodIndexTex !== null) {
-      gl.uniform1i(uniforms.u_lodIndexTex, 1);
-    }
-    if (uniforms.u_lodIndexTexWidth !== null) {
-      gl.uniform1i(uniforms.u_lodIndexTexWidth, 1);
-    }
-    if (uniforms.u_invLodIndexTexWidth !== null) {
-      gl.uniform1f(uniforms.u_invLodIndexTexWidth, 1);
-    }
-    if (uniforms.u_useLodIndexTex !== null) {
-      gl.uniform1i(uniforms.u_useLodIndexTex, 0);
-    }
-  }
-
-  _renderLOD(lodLevel, params, viewState) {
-    const gl = this.gl;
-    const dimensionLevel = requireDimensionLevel(
-      params.dimensionLevel,
-      'HighPerfRenderer LOD render dimensionLevel'
-    );
-    const lodBuffers =
-      this._getLodBuffersForDimension(dimensionLevel);
-    const lod = lodBuffers[lodLevel];
-
-    if (!lod) {
-      throw new RangeError(
-        `HighPerfRenderer LOD level ${String(lodLevel)} is unavailable for ${dimensionLevel}D.`
-      );
-    }
-    if (lod.isFullDetail) {
-      this._renderFullDetail(params, viewState);
-      return;
-    }
-
-    const {
-      mvpMatrix, viewMatrix, modelMatrix, projectionMatrix,
-      pointSize, sizeAttenuation, viewportHeight, fov,
-      lightingStrength, fogDensity, fogColor, lightDir
-    } = params;
-
-    const adjustedPointSize = pointSize * lod.sizeMultiplier;
-
-    const program = this.activeProgram;
-    let uniforms = this.uniformLocations.get(this.activeQuality);
-
-    if (!uniforms || !program) {
-      throw new Error(
-        `HighPerfRenderer "${this.activeQuality}" LOD shader state is unavailable.`
-      );
-    }
-
-    gl.useProgram(program);
-
-    if (uniforms.u_mvpMatrix !== null) {
-      gl.uniformMatrix4fv(uniforms.u_mvpMatrix, false, mvpMatrix);
-    }
-    if (uniforms.u_viewMatrix !== null) {
-      gl.uniformMatrix4fv(uniforms.u_viewMatrix, false, viewMatrix);
-    }
-    if (uniforms.u_modelMatrix !== null) {
-      gl.uniformMatrix4fv(uniforms.u_modelMatrix, false, modelMatrix);
-    }
-    if (uniforms.u_projectionMatrix !== null && projectionMatrix) {
-      gl.uniformMatrix4fv(uniforms.u_projectionMatrix, false, projectionMatrix);
-    }
-    if (uniforms.u_pointSize !== null) {
-      gl.uniform1f(uniforms.u_pointSize, adjustedPointSize);
-    }
-    if (uniforms.u_sizeAttenuation !== null) {
-      gl.uniform1f(uniforms.u_sizeAttenuation, sizeAttenuation);
-    }
-    if (uniforms.u_viewportHeight !== null) {
-      gl.uniform1f(uniforms.u_viewportHeight, viewportHeight);
-    }
-    if (uniforms.u_fov !== null) {
-      gl.uniform1f(uniforms.u_fov, fov);
-    }
-    if (uniforms.u_lightingStrength !== null) {
-      gl.uniform1f(uniforms.u_lightingStrength, lightingStrength);
-    }
-    if (uniforms.u_fogDensity !== null) {
-      gl.uniform1f(uniforms.u_fogDensity, fogDensity);
-    }
-    if (uniforms.u_fogNear !== null) {
-      gl.uniform1f(uniforms.u_fogNear, this.fogNear);
-    }
-    if (uniforms.u_fogFar !== null) {
-      gl.uniform1f(uniforms.u_fogFar, this.fogFar);
-    }
-    if (uniforms.u_fogColor !== null) {
-      gl.uniform3fv(uniforms.u_fogColor, fogColor);
-    }
-    if (uniforms.u_lightDir !== null) {
-      gl.uniform3fv(uniforms.u_lightDir, lightDir);
-    }
-
-    let operationError = null;
-    try {
-      // Bind alpha texture with the exact dimension's LOD index texture.
-      this._bindAlphaTexture(gl, uniforms, lodLevel, dimensionLevel);
-      gl.bindVertexArray(lod.vao);
-      gl.drawArrays(gl.POINTS, 0, lod.pointCount);
-    } catch (error) {
-      operationError = error;
-    }
-    let restorationError = null;
-    try {
-      restorePointDrawBaseline(gl, false);
-    } catch (error) {
-      restorationError = error;
-    }
-    settlePointDraw(
-      operationError,
-      restorationError,
-      'HighPerfRenderer LOD draw'
-    );
-
-    this._writeStats(
-      viewState,
-      lod.pointCount,
-      lodLevel,
-      1,
-      false,
-      0
-    );
-  }
-
-  /**
-   * Render with combined LOD and frustum culling.
-   * This provides maximum performance by both reducing point count (LOD) and
-   * culling out-of-view points (frustum culling) simultaneously.
-   * Uses per-view index buffer to avoid cross-view conflicts.
+   * Create the permutation texture of one draw order: texel `k` holds the
+   * source index of the point stored in slot `k`.
+   *
+   * @param {Readonly<{indices: Uint32Array, pointCount: number}>} drawOrder
+   * @param {string} owner
+   * @returns {{drawOrder: object, texture: WebGLTexture, plan: object, byteLength: number}}
    * @private
    */
-  _renderLODWithFrustumCulling(
-    lodLevel,
-    params,
-    frustumPlanes,
-    viewState,
-    spatialIndex,
-    lodBuffersForDim,
-    frustumChanged
-  ) {
+  _createDrawOrderRecord(drawOrder, owner) {
     const gl = this.gl;
-    const lod = lodBuffersForDim[lodLevel];
-
-    if (!lod) {
-      throw new RangeError(
-        `HighPerfRenderer LOD level ${String(lodLevel)} is unavailable.`
-      );
+    const indices = drawOrder?.indices;
+    if (!(indices instanceof Uint32Array) || indices.length !== drawOrder.pointCount) {
+      throw new TypeError(`${owner} requires an exact draw order.`);
     }
-    if (lod.isFullDetail) {
-      this._renderWithFrustumCulling(
-        params,
-        frustumPlanes,
-        viewState,
-        spatialIndex,
-        frustumChanged
-      );
-      return;
+    const plan = planLinearTextureFor(gl, indices.length);
+    const byteLength = plan.texels * Uint32Array.BYTES_PER_ELEMENT;
+    // The allocation below is checked by `_allocateGpu`; the rows written
+    // into it need no read-back.
+    requireLiveContext(gl, `${owner} draw-order preflight`);
+    const texture = gl.createTexture();
+    if (!texture) {
+      throw new Error(`${owner} could not allocate its draw-order texture.`);
     }
-
-    // Validate the one shared mapping once per exact spatial generation.
-    this._ensureLodResourceOwnershipState();
-    const mappingToken =
-      spatialIndex._lodNodeMapping?.generationToken ?? null;
-    if (
-      this._validatedLodNodeMappings.get(spatialIndex) !==
-      mappingToken
-    ) {
-      const validatedToken =
-        spatialIndex._validateLodNodeMapping();
-      this._validatedLodNodeMappings.set(
-        spatialIndex,
-        validatedToken
-      );
-    }
-    const validatedMappingToken =
-      spatialIndex._lodNodeMapping?.generationToken ?? null;
-
-    const {
-      mvpMatrix, viewMatrix, modelMatrix, projectionMatrix,
-      pointSize, sizeAttenuation, viewportHeight, fov,
-      lightingStrength, fogDensity, fogColor, lightDir,
-      viewId,
-      dimensionLevel
-    } = params;
-
-    // Check whether the camera needs an exact tree traversal and whether the
-    // accepted EBO's LOD/mapping contract changed. A new finite MVP alone is
-    // not sufficient reason to refill or upload when traversal admits the
-    // same leaf set: global compact-rank order is authoritative for LOD EBOs.
-    const spatialOwnerChanged =
-      viewState.cachedVisibleSpatialOwner !== spatialIndex ||
-      viewState.cachedVisibleSpatialRoot !== spatialIndex.root ||
-      !Array.isArray(viewState.cachedVisibleNodes);
-    const lodCacheChanged =
-      viewState.cachedLodLevel !== lodLevel ||
-      viewState.cachedLodDimension !== dimensionLevel ||
-      viewState.cachedLodIsCulled !== true ||
-      viewState.cachedLodMappingGeneration !==
-        validatedMappingToken ||
-      !(viewState.cachedLodVisibleIndices instanceof Uint32Array) ||
-      viewState.cachedCulledCount !==
-        viewState.cachedLodVisibleIndices?.length ||
-      (
-        viewState.cachedCulledCount > 0 &&
-        viewState.indexBufferSize !== viewState.cachedCulledCount
-      );
-    let visibleNodes = viewState.cachedVisibleNodes;
-    let candidateToAccept = null;
-    let lodAdmissionChanged = false;
-
-    // Tree traversal remains exact for every finite MVP change, but uses a
-    // per-view candidate array and compares exact leaf-set membership before
-    // any O(K) mapping scan or GPU upload.
-    if (frustumChanged || spatialOwnerChanged) {
-      const candidate = this._collectVisibleNodeCandidate(
-        viewState,
-        spatialIndex.root,
-        frustumPlanes
-      );
-      const sameLodAdmission =
-        !spatialOwnerChanged &&
-        spatialIndex.hasSameLodVisibleLeafSet(
-          viewState.cachedVisibleNodes,
-          candidate
-        );
-      if (sameLodAdmission) {
-        this._recycleVisibleNodeCandidate(viewState, candidate);
-      } else {
-        visibleNodes = candidate;
-        candidateToAccept = candidate;
-        lodAdmissionChanged = true;
-      }
-    }
-
-    // Rebuild only when leaf-set admission, LOD mode, mapping generation, or
-    // exact spatial ownership changed. LOD-only changes reuse accepted leaves
-    // without another traversal.
-    // PERFORMANCE NOTE: This block is the main source of lag when zooming with LOD+Frustum enabled.
-    // Unlike LOD-only (which uses gl.drawArrays with pre-built VAOs) or Frustum-only (which only
-    // updates when camera moves), LOD+Frustum must rebuild index buffers on EVERY LOD level change.
-    // Pre-caching is NOT possible here because:
-    //   - Pre-cached originalIndexBuffer contains ALL LOD indices for a level
-    //   - Frustum culling requires only the SUBSET visible in current frustum
-    //   - This subset is view-dependent (each view has different frustum) and LOD-dependent
-    //   - When LOD changes during zoom, we must filter the shared maximum
-    //     prefix for visible leaves and upload the new EBO contents.
-    // With N views, this happens N times per LOD transition.
-    if (
-      spatialOwnerChanged ||
-      lodCacheChanged ||
-      lodAdmissionChanged
-    ) {
-      try {
-        if (!Array.isArray(visibleNodes)) {
-          throw new Error(
-            `HighPerfRenderer LOD leaf admission is unavailable for view "${viewId}".`
-          );
-        }
-        if (visibleNodes.length === 0) {
-          const emptyLodScratch =
-            this._ensureVisibleLodIndexScratch(viewState, 0);
-          if (candidateToAccept) {
-            this._acceptVisibleNodeCandidate(
-              viewState,
-              candidateToAccept
-            );
-          }
-          viewState.cachedVisibleSpatialOwner = spatialIndex;
-          viewState.cachedVisibleSpatialRoot = spatialIndex.root;
-          viewState.cachedCulledCount = 0;
-          viewState.cachedLodVisibleIndices =
-            emptyLodScratch.subarray(0, 0);
-          viewState.cachedLodLevel = lodLevel;
-          viewState.cachedLodDimension = dimensionLevel;
-          viewState.cachedLodIsCulled = true;
-          viewState.cachedLodMappingGeneration =
-            validatedMappingToken;
-          this._writeStats(
-            viewState,
-            0,
-            lodLevel,
-            0,
-            true,
-            100
-          );
-          return;
-        }
-
-        // Mark exact visible leaves and scan only this level's compact prefix.
-        // The query never walks the larger maximum prefix.
-        const visibleCount =
-          spatialIndex.countLodMappedIndices(
-            visibleNodes,
-            lodLevel
-          );
-
-        const totalLodPoints = lod.pointCount;
-        const visibleRatio = visibleCount / totalLodPoints;
-        const cullPercent = ((1 - visibleRatio) * 100);
-
-        const visibleLodIndicesBuffer =
-          this._ensureVisibleLodIndexScratch(
-            viewState,
-            visibleCount
-          );
-
-        const writtenCount = spatialIndex.writeLodMappedIndices(
-          visibleNodes,
-          lodLevel,
-          visibleLodIndicesBuffer
-        );
-        if (writtenCount !== visibleCount) {
-          throw new Error(
-            `HighPerfRenderer LOD ${lodLevel} mapping counted ${visibleCount} indices but wrote ${writtenCount}.`
-          );
-        }
-        // Create view of used portion (no backing-store allocation)
-        const visibleLodIndices =
-          visibleLodIndicesBuffer.subarray(0, visibleCount);
-
-        // Log only on significant change (>10% of total points)
-        if (DEBUG_LOD_FRUSTUM && this._isSignificantChange(viewState.lastVisibleCount, visibleCount, totalLodPoints)) {
-          console.log(`[LOD+Frustum] View ${viewId}: LOD ${lodLevel} - ${visibleCount.toLocaleString()}/${totalLodPoints.toLocaleString()} visible (${cullPercent.toFixed(1)}% culled)`);
-          viewState.lastVisibleCount = visibleCount;
-        }
-
-        // GPU acceptance is the publication boundary.
-        this._uploadToViewIndexBuffer(viewState, visibleLodIndices);
-        if (candidateToAccept) {
-          this._acceptVisibleNodeCandidate(
-            viewState,
-            candidateToAccept
-          );
-        }
-        viewState.cachedVisibleSpatialOwner = spatialIndex;
-        viewState.cachedVisibleSpatialRoot = spatialIndex.root;
-        viewState.cachedLodVisibleIndices = visibleLodIndices;
-        viewState.cachedCulledCount = visibleCount;
-        viewState.cachedLodLevel = lodLevel;
-        viewState.cachedLodDimension = dimensionLevel;
-        viewState.cachedLodIsCulled = true;
-        viewState.cachedLodMappingGeneration =
-          validatedMappingToken;
-        this.stats.frustumCulled = true;
-        this.stats.cullPercent = cullPercent;
-      } catch (error) {
-        this._invalidateViewStateRecord(viewState);
-        throw error;
-      }
-    }
-
-    // If no visible points after culling, skip rendering
-    if (
-      !(viewState.cachedLodVisibleIndices instanceof Uint32Array) ||
-      viewState.cachedCulledCount !==
-        viewState.cachedLodVisibleIndices.length ||
-      viewState.cachedLodLevel !== lodLevel ||
-      viewState.cachedLodDimension !== dimensionLevel ||
-      viewState.cachedLodIsCulled !== true ||
-      viewState.cachedVisibleSpatialOwner !== spatialIndex ||
-      viewState.cachedVisibleSpatialRoot !== spatialIndex.root ||
-      viewState.cachedLodMappingGeneration !==
-        validatedMappingToken
-    ) {
-      throw new Error(
-        `HighPerfRenderer LOD visibility state is inconsistent for view "${viewId}".`
-      );
-    }
-    if (viewState.cachedCulledCount === 0) {
-      this._writeStats(
-        viewState,
-        0,
-        lodLevel,
-        0,
-        true,
-        100
-      );
-      return;
-    }
-
-    // Render using LOD buffer with indexed drawing
-    const adjustedPointSize = pointSize * lod.sizeMultiplier;
-
-    const program = this.activeProgram;
-    const uniforms = this.uniformLocations.get(this.activeQuality);
-
-    if (!uniforms || !program) {
-      throw new Error(
-        `HighPerfRenderer "${this.activeQuality}" LOD/frustum shader state is unavailable.`
-      );
-    }
-
-    gl.useProgram(program);
-
-    if (uniforms.u_mvpMatrix !== null) gl.uniformMatrix4fv(uniforms.u_mvpMatrix, false, mvpMatrix);
-    if (uniforms.u_viewMatrix !== null) gl.uniformMatrix4fv(uniforms.u_viewMatrix, false, viewMatrix);
-    if (uniforms.u_modelMatrix !== null) gl.uniformMatrix4fv(uniforms.u_modelMatrix, false, modelMatrix);
-    if (uniforms.u_projectionMatrix !== null && projectionMatrix) gl.uniformMatrix4fv(uniforms.u_projectionMatrix, false, projectionMatrix);
-    if (uniforms.u_pointSize !== null) gl.uniform1f(uniforms.u_pointSize, adjustedPointSize);
-    if (uniforms.u_sizeAttenuation !== null) gl.uniform1f(uniforms.u_sizeAttenuation, sizeAttenuation);
-    if (uniforms.u_viewportHeight !== null) gl.uniform1f(uniforms.u_viewportHeight, viewportHeight);
-    if (uniforms.u_fov !== null) gl.uniform1f(uniforms.u_fov, fov);
-    if (uniforms.u_lightingStrength !== null) gl.uniform1f(uniforms.u_lightingStrength, lightingStrength);
-    if (uniforms.u_fogDensity !== null) gl.uniform1f(uniforms.u_fogDensity, fogDensity);
-    if (uniforms.u_fogNear !== null) gl.uniform1f(uniforms.u_fogNear, this.fogNear);
-    if (uniforms.u_fogFar !== null) gl.uniform1f(uniforms.u_fogFar, this.fogFar);
-    if (uniforms.u_fogColor !== null) gl.uniform3fv(uniforms.u_fogColor, fogColor);
-    if (uniforms.u_lightDir !== null) gl.uniform3fv(uniforms.u_lightDir, lightDir);
-
-    if (viewState.indexBufferSize !== viewState.cachedCulledCount) {
-      throw new Error(
-        `HighPerfRenderer LOD index buffer for view "${viewId}" contains ${viewState.indexBufferSize} entries but ${viewState.cachedCulledCount} are required.`
-      );
-    }
-
-    let operationError = null;
     try {
-      this._bindAlphaTexture(gl, uniforms, lodLevel, dimensionLevel);
-      gl.bindVertexArray(lod.vao);
-      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, viewState.indexBuffer);
-      gl.drawElements(
-        gl.POINTS,
-        viewState.cachedCulledCount,
-        gl.UNSIGNED_INT,
-        0
-      );
-    } catch (error) {
-      operationError = error;
-    }
-    let restorationError = null;
-    try {
-      restorePointDrawBaseline(gl, true);
-    } catch (error) {
-      restorationError = error;
-    }
-    settlePointDraw(
-      operationError,
-      restorationError,
-      'HighPerfRenderer live LOD/frustum draw'
-    );
-
-    // Update both global and per-view stats
-    this._writeStats(
-      viewState,
-      viewState.cachedCulledCount,
-      lodLevel,
-      1,
-      true,
-      lod.pointCount === 0
-        ? 100
-        : 100 * (
-            1 -
-            viewState.cachedCulledCount / lod.pointCount
-          )
-    );
-  }
-
-  /**
-   * Prepare every geometry owner that can be consumed by the currently
-   * published live/multiview set. Custom snapshot CPU trees are staged without
-   * mutating their accepted pool and are committed only after every build and
-   * every required live GPU generation succeeds.
-   */
-  _prepareSpatialIndicesForFeature(needsLOD) {
-    if (typeof needsLOD !== 'boolean') {
-      throw new TypeError(
-        'HighPerfRenderer feature preparation needsLOD must be a boolean.'
-      );
-    }
-    if (
-      this.pointCount === 0 ||
-      !this._positions ||
-      !this._colors
-    ) {
-      return;
-    }
-
-    const liveDimensions = new Set([requireDimensionLevel(
-      this.currentDimensionLevel,
-      'HighPerfRenderer feature preparation live dimensionLevel'
-    )]);
-    const geometryMapPublications = new Map();
-    const snapshotPublications = [];
-    const stagedLodPublications = [];
-    const liveLodRetirements = [];
-
-    for (const [snapshotId, snapshot] of this.snapshotBuffers) {
-      const exactId = requireViewId(
-        snapshotId,
-        'HighPerfRenderer feature preparation snapshot id'
-      );
-      const dimensionLevel = requireDimensionLevel(
-        snapshot?.dimensionLevel,
-        `HighPerfRenderer feature preparation snapshot "${exactId}" dimensionLevel`
-      );
-      if (this._snapshotUsesLiveGeometry(snapshot)) {
-        liveDimensions.add(dimensionLevel);
-        continue;
-      }
-      if (
-        !(snapshot?.positions instanceof Float32Array) ||
-        snapshot.positions.length !== snapshot.pointCount * 3
-      ) {
-        throw new Error(
-          `HighPerfRenderer feature preparation snapshot "${exactId}" has no exact position generation.`
-        );
-      }
-      const geometry =
-        this._snapshotGeometryPools.get(
-          snapshot.geometryGeneration
-        );
-      if (
-        !geometry ||
-        geometry.positions !== snapshot.positions ||
-        !(geometry.spatialIndices instanceof Map)
-      ) {
-        throw new Error(
-          `HighPerfRenderer feature preparation snapshot "${exactId}" has no exact geometry-pool owner.`
-        );
-      }
-
-      let stagedSpatialIndices =
-        geometryMapPublications.get(geometry);
-      if (stagedSpatialIndices === undefined) {
-        stagedSpatialIndices = new Map(geometry.spatialIndices);
-        geometryMapPublications.set(
-          geometry,
-          stagedSpatialIndices
-        );
-      }
-      let candidate =
-        stagedSpatialIndices.get(dimensionLevel) ??
-        snapshot.spatialIndex ??
-        null;
-      if (
-        candidate !== null &&
-        (
-          candidate.positions !== snapshot.positions ||
-          candidate.dimensionLevel !== dimensionLevel
-        )
-      ) {
-        throw new Error(
-          `HighPerfRenderer feature preparation snapshot "${exactId}" has an inconsistent spatial owner.`
-        );
-      }
-      const candidateNeedsReplacement = (
-        candidate === null ||
-        (
-          needsLOD &&
-          (
-            !Array.isArray(candidate.lodLevels) ||
-            candidate.lodLevels.length === 0
-          )
-        )
-      );
-      if (candidateNeedsReplacement) {
-        requireLodBuildHeapHeadroom(
-          snapshot.positions.length / 3,
-          needsLOD,
-          `HighPerfRenderer ${dimensionLevel}D view "${exactId}"`
-        );
-        candidate = new SpatialIndex(
-          snapshot.positions,
-          null,
-          dimensionLevel,
-          this.options.LOD_MAX_POINTS_PER_NODE,
-          this.options.LOD_MAX_DEPTH,
-          {
-            buildLOD: needsLOD,
-            buildLodNodeMappings: false,
-            computeNodeStats: false,
-          }
-        );
-      }
-      stagedSpatialIndices.set(dimensionLevel, candidate);
-      snapshotPublications.push({ snapshot, candidate });
-    }
-
-    // Custom candidates above are still private. Build every live CPU owner
-    // and every required GPU projection off-state as one batch. No dimension
-    // may become authoritative while a later dimension can still fail.
-    const previousSpatialIndices = this.spatialIndices;
-    let candidateSpatialIndices = previousSpatialIndices;
-    try {
-      for (const dimensionLevel of liveDimensions) {
-        const cached =
-          candidateSpatialIndices.get(dimensionLevel) ?? null;
-        const cachedIsExact = (
-          cached !== null &&
-          cached.positions === this._positions &&
-          cached.dimensionLevel === dimensionLevel &&
-          cached.pointCount === this.pointCount
-        );
-        const cachedLodIsReady = (
-          cachedIsExact &&
-          Array.isArray(cached.lodLevels) &&
-          cached.lodLevels.length > 0
-        );
-        let candidate = cached;
-        if (
-          !cachedIsExact ||
-          (needsLOD && !cachedLodIsReady)
-        ) {
-          requireLodBuildHeapHeadroom(
-            this.pointCount,
-            needsLOD,
-            `HighPerfRenderer ${dimensionLevel}D live view`
-          );
-          candidate = new SpatialIndex(
-            this._positions,
-            this._colors,
-            dimensionLevel,
-            this.options.LOD_MAX_POINTS_PER_NODE,
-            this.options.LOD_MAX_DEPTH,
-            {
-              buildLOD: needsLOD,
-              buildLodNodeMappings: false,
-              computeNodeStats: false,
-            }
-          );
-          if (candidateSpatialIndices === previousSpatialIndices) {
-            candidateSpatialIndices =
-              new Map(previousSpatialIndices);
-          }
-          candidateSpatialIndices.set(
-            dimensionLevel,
-            candidate
-          );
-        }
-
-        if (needsLOD) {
-          const staged = this._ensureLodResourcesForDimension(
-            dimensionLevel,
-            candidate,
-            true
-          );
-          if (staged !== null) {
-            stagedLodPublications.push(staged);
-          }
-        } else {
-          const previousOwner =
-            this._lodResourceOwnersByDimension.get(
-              dimensionLevel
-            ) ?? null;
-          const previousLodBuffers =
-            this.lodBuffersByDimension.get(
-              dimensionLevel
-            ) ?? null;
-          const previousIndexTextures =
-            this._lodIndexTexturesByDimension.get(
-              dimensionLevel
-            ) ?? null;
-          if (
-            previousOwner?.spatialIndex !== candidate &&
-            (
-              previousOwner !== null ||
-              previousLodBuffers !== null ||
-              previousIndexTextures !== null
-            )
-          ) {
-            liveLodRetirements.push({
-              dimensionLevel,
-              previousOwner,
-              previousLodBuffers,
-              previousIndexTextures,
-            });
-          }
-        }
-      }
-    } catch (error) {
-      const cleanupFailures = [];
-      for (const staged of stagedLodPublications) {
-        this._queueDataRetirement({
-          buffers: {},
-          vao: null,
-          pointCount: 0,
-          perViewState: null,
-          lodResourceOwnersByDimension: new Map([
-            [staged.dimensionLevel, staged.candidateOwner],
-          ]),
-          lodBuffersByDimension: new Map(),
-          lodIndexTexturesByDimension: new Map(),
-          alphaTexture: null,
-          alphaTexWidth: 0,
-          alphaTexHeight: 0,
+      gl.bindTexture(gl.TEXTURE_2D_ARRAY, texture);
+      this._withNeutralTextureUnpackState(4, `${owner} draw order`, () => {
+        // Immutable storage: no zero-fill pass before the rows are written.
+        this._allocateGpu(`${owner} could not allocate its draw-order texture`, () => {
+          allocateLinearTexture(gl, gl.R32UI, plan);
         });
+        writeLinearTextureRows(gl, plan, gl.RED_INTEGER, gl.UNSIGNED_INT, indices, 1);
+      });
+      gl.bindTexture(gl.TEXTURE_2D_ARRAY, null);
+      requireLiveContext(gl, `${owner} draw-order upload`);
+    } catch (error) {
+      try {
+        gl.bindTexture(gl.TEXTURE_2D_ARRAY, null);
+      } catch {
+        // The retirement below remains authoritative.
       }
-      cleanupFailures.push(...this._drainDataRetirements());
-      if (cleanupFailures.length > 0) {
-        throw new AggregateError(
-          [error, ...cleanupFailures],
-          `HighPerfRenderer feature preparation failed with ${cleanupFailures.length} staged LOD retirement failure(s).`
-        );
+      this._queueDataRetirement({ textures: [{ handle: texture, byteLength }] });
+      const failures = this._drainDataRetirements();
+      if (failures.length > 0) {
+        throw new AggregateError([error, ...failures], `${owner} draw-order upload failed with cleanup errors.`);
       }
       throw error;
     }
+    return { drawOrder, texture, plan, byteLength };
+  }
 
-    // Allocate every replacement map before the publication boundary.
-    let candidateLodOwners =
-      this._lodResourceOwnersByDimension;
-    let candidateLodBuffers =
-      this.lodBuffersByDimension;
-    let candidateLodTextures =
-      this._lodIndexTexturesByDimension;
-    if (
-      stagedLodPublications.length > 0 ||
-      liveLodRetirements.length > 0
-    ) {
-      candidateLodOwners =
-        new Map(this._lodResourceOwnersByDimension);
-      candidateLodBuffers =
-        new Map(this.lodBuffersByDimension);
-      candidateLodTextures =
-        new Map(this._lodIndexTexturesByDimension);
-      for (const staged of stagedLodPublications) {
-        candidateLodOwners.set(
-          staged.dimensionLevel,
-          staged.candidateOwner
-        );
-        candidateLodBuffers.set(
-          staged.dimensionLevel,
-          staged.candidateLodBuffers
-        );
-        candidateLodTextures.set(
-          staged.dimensionLevel,
-          staged.candidateIndexTextures
-        );
-      }
-      for (const retirement of liveLodRetirements) {
-        candidateLodOwners.delete(retirement.dimensionLevel);
-        candidateLodBuffers.delete(retirement.dimensionLevel);
-        candidateLodTextures.delete(retirement.dimensionLevel);
-      }
+  /**
+   * Queue one draw-order record's texture for deletion.
+   * @param {object|null} record
+   * @private
+   */
+  _retireDrawOrderRecord(record) {
+    if (record === null || record === undefined || !record.texture) return;
+    this._queueDataRetirement({
+      textures: [{ handle: record.texture, byteLength: record.byteLength }],
+    });
+    record.texture = null;
+    // Colour stores kept for this order can never be drawn again: no store
+    // holds it any more.
+    for (const [cache, drawOrder, entry] of this._keptColorStores()) {
+      if (drawOrder !== record.drawOrder) continue;
+      cache.delete(drawOrder);
+      this._retireBuffer(entry.buffer, entry.byteLength);
     }
+  }
 
-    // All fallible CPU/GL work has completed. These identity publications make
-    // every live and custom pane ready before the global feature flag becomes
-    // observable.
-    this.spatialIndices = candidateSpatialIndices;
-    this._lodResourceOwnersByDimension = candidateLodOwners;
-    this.lodBuffersByDimension = candidateLodBuffers;
-    this._lodIndexTexturesByDimension =
-      candidateLodTextures;
-    for (
-      const [geometry, stagedSpatialIndices]
-      of geometryMapPublications
-    ) {
-      geometry.spatialIndices = stagedSpatialIndices;
-    }
-    for (const { snapshot, candidate } of snapshotPublications) {
-      snapshot.spatialIndex = candidate;
-    }
-    for (const staged of stagedLodPublications) {
-      this._dirtyLodDimensions.delete(staged.dimensionLevel);
-      this._certifyLodResourcesForDimension(
-        staged.dimensionLevel,
-        staged.spatialIndex,
-        staged.candidateOwner,
-        staged.candidateLodBuffers,
-        staged.candidateIndexTextures
-      );
-    }
-    this._refreshGpuMemoryStats();
+  /** @private */
+  _getPermuter() {
+    this._permuter ??= new GpuPermuter(this.gl, (refusal, allocate) => this._allocateGpu(refusal, allocate));
+    return this._permuter;
+  }
 
-    // The complete batch is authoritative. Prior handles become retry-owned;
-    // cleanup failures cannot roll back the valid feature generation.
-    const retiredOwners = new Map();
-    const retiredBuffers = new Map();
-    const retiredTextures = new Map();
-    for (const staged of stagedLodPublications) {
-      if (staged.previousOwner !== null) {
-        retiredOwners.set(
-          staged.dimensionLevel,
-          staged.previousOwner
-        );
+  /**
+   * Rewrite an RGBA8 colour store (already sized) with one view's colours in
+   * the order of draw-order record `order`, or in source order when `order`
+   * is null. A draw order is gathered on the GPU through its permutation
+   * texture (`GpuPermuter`): the CPU uploads the source-order colours
+   * once, as a source-order store would, and never reads them at random.
+   *
+   * @param {WebGLBuffer} buffer
+   * @param {Uint8Array} colors - Word-aligned RGBA8, 4 bytes a point.
+   * @param {{texture: WebGLTexture, width: number}|null} order
+   * @param {string} owner
+   * @private
+   */
+  _writeOrderedColors(buffer, colors, order, owner) {
+    const gl = this.gl;
+    requireOrderCoversColors(order, colors, owner);
+    if (order === null) {
+      gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+      try {
+        gl.bufferSubData(gl.ARRAY_BUFFER, 0, colors);
+      } finally {
+        gl.bindBuffer(gl.ARRAY_BUFFER, null);
       }
-      if (staged.previousLodBuffers !== null) {
-        retiredBuffers.set(
-          staged.dimensionLevel,
-          staged.previousLodBuffers
-        );
-      }
-      if (staged.previousIndexTextures !== null) {
-        retiredTextures.set(
-          staged.dimensionLevel,
-          staged.previousIndexTextures
-        );
-      }
+    } else {
+      this._getPermuter().writeWords(buffer, colorWordsOf(colors), order, 1);
     }
-    for (const retirement of liveLodRetirements) {
-      if (retirement.previousOwner !== null) {
-        retiredOwners.set(
-          retirement.dimensionLevel,
-          retirement.previousOwner
-        );
-      }
-      if (retirement.previousLodBuffers !== null) {
-        retiredBuffers.set(
-          retirement.dimensionLevel,
-          retirement.previousLodBuffers
-        );
-      }
-      if (retirement.previousIndexTextures !== null) {
-        retiredTextures.set(
-          retirement.dimensionLevel,
-          retirement.previousIndexTextures
-        );
-      }
+    requireLiveContext(gl, owner);
+  }
+
+
+
+  /**
+   * The live tree of the live view's current positions, or null.
+   * @returns {SpatialIndex|null}
+   * @private
+   */
+  _currentLiveTree() {
+    const tree = this.spatialIndices.get(this.currentDimensionLevel) ?? null;
+    return tree !== null && tree.positions === this._positions ? tree : null;
+  }
+
+  /**
+   * Bring one position store to `tree`'s draw order, in the frame that first
+   * needs it: the permutation is uploaded, then the store's positions and
+   * the colours of every view that draws it are gathered on the GPU
+   * (`GpuPermuter`), in place, before the frame draws. The CPU only uploads
+   * the source-order words; it never reads them at random.
+   *
+   * Returns the record the store holds now.
+   *
+   * @param {{kind: 'live'}|{kind: 'geometry', geometry: object}} store
+   * @param {SpatialIndex} tree
+   * @returns {object}
+   * @private
+   */
+  _ensureStoreDrawOrder(store, tree) {
+    const drawOrder = tree.ensureDrawOrder();
+    const current = this._storeOrder(store);
+    if (current?.drawOrder === drawOrder) return current;
+    // One adoption a frame: when several trees land together (four panes of
+    // four representations), each store adopts in its own frame instead of
+    // all in one long frame. A deferred store draws as it is this frame.
+    if (this._frameAdoptions !== undefined && this._frameAdoptions >= 1) {
+      this.onAsyncTreeReady?.();
+      return current;
     }
-    if (
-      retiredOwners.size > 0 ||
-      retiredBuffers.size > 0 ||
-      retiredTextures.size > 0
-    ) {
-      this._queueDataRetirement({
-        buffers: {},
-        vao: null,
-        pointCount: 0,
-        perViewState: null,
-        lodResourceOwnersByDimension: retiredOwners,
-        lodBuffersByDimension: retiredBuffers,
-        lodIndexTexturesByDimension: retiredTextures,
-        alphaTexture: null,
-        alphaTexWidth: 0,
-        alphaTexHeight: 0,
+    if (this._frameAdoptions !== undefined) this._frameAdoptions += 1;
+    return this._adoptDrawOrder(store, drawOrder);
+  }
+
+  /**
+   * Start one frame (every pane): resets the per-frame adoption budget.
+   */
+  beginFrame() {
+    this._frameAdoptions = 0;
+    this._snapshotInOperation = null;
+  }
+
+  /** @private */
+  _storeLabel(store) {
+    return store.kind === 'live'
+      ? 'HighPerfRenderer live draw order'
+      : `HighPerfRenderer geometry ${store.geometry.generation} draw order`;
+  }
+
+  /**
+   * Write one colour target's colours into `buffer` in `order`.
+   * @private
+   */
+  _writeTargetColors(target, buffer, order, label) {
+    this._writeOrderedColors(buffer, target.source, order, label);
+  }
+
+  /** @private */
+  _storeOrder(store) {
+    return store.kind === 'live' ? this._liveOrder : (store.geometry.order ?? null);
+  }
+
+  /**
+   * The colour streams that must follow a store's order: the live colours
+   * and every kept view of the live geometry for the live store; every kept
+   * view of a pooled geometry for that geometry.
+   *
+   * @returns {Array<{key: object, source: Uint8Array, buffer: WebGLBuffer, byteLength: number}>}
+   * @private
+   */
+  _colorTargetsOf(store) {
+    const targets = [];
+    if (store.kind === 'live') {
+      targets.push({
+        key: this,
+        source: this._colors,
+        buffer: this.buffers.colors,
+        byteLength: this._colorGpuByteLength,
       });
-      this._drainDataRetirements();
     }
+    for (const snapshot of this.snapshotBuffers.values()) {
+      const onStore = store.kind === 'live'
+        ? this._snapshotUsesLiveGeometry(snapshot)
+        : snapshot.geometryGeneration === store.geometry.generation
+          && !this._snapshotUsesLiveGeometry(snapshot);
+      if (!onStore) continue;
+      // A released view regathers when restored; a view not presented
+      // regathers when next drawn (`_ensureSnapshotColorsInOrder`).
+      if (snapshot.storesReleased === true || !this._isPresentedView(snapshot.id)) {
+        continue;
+      }
+      const owner = this._ensureSnapshotColorOwner(snapshot);
+      targets.push({
+        key: owner,
+        source: snapshot.colors,
+        buffer: owner.buffer,
+        byteLength: owner.byteLength,
+      });
+    }
+    return targets;
+  }
+
+  /**
+   * Re-order a store and every colour stream of its views in place, now.
+   * Each stream records its own order as it is written, so a failure part
+   * way leaves every stream consistent with the order it says it holds (a
+   * colour store left behind is regathered by the next frame).
+   * @private
+   */
+  _adoptDrawOrder(store, drawOrder) {
+    const label = this._storeLabel(store);
+    const previous = this._storeOrder(store);
+    const record = this._createDrawOrderRecord(drawOrder, label);
+    const positions = store.kind === 'live' ? this._positions : store.geometry.positions;
+    const dimension = store.kind === 'live' ? this.currentDimensionLevel : store.geometry.dimension;
+    const buffer = store.kind === 'live' ? this.buffers.positions : store.geometry.positionBuffer;
+    const targets = this._colorTargetsOf(store);
+    try {
+      this._getPermuter().writeWords(
+        buffer,
+        new Uint32Array(positions.buffer, positions.byteOffset, positions.length),
+        record,
+        dimension
+      );
+      // A gather into the accepted position store: nothing to read back.
+      requireLiveContext(this.gl, `${label} positions`);
+    } catch (error) {
+      this._retireDrawOrderRecord(record);
+      this._drainDataRetirements();
+      throw error;
+    }
+    if (store.kind === 'live') {
+      this._liveOrder = record;
+    } else {
+      store.geometry.order = record;
+    }
+    this._retireDrawOrderRecord(previous);
+    for (const target of targets) {
+      this._writeTargetColors(target, target.buffer, record, label);
+      if (target.key === this) {
+        this._liveColorOrder = drawOrder;
+        this._colorsDirty = false;
+      } else {
+        target.key.order = drawOrder;
+      }
+    }
+    this._drainDataRetirements();
+    this._refreshGpuMemoryStats();
+    return record;
+  }
+
+  // ==========================================================================
+  // COLOUR STORES KEPT PER DRAW ORDER
+  //
+  // A view's colours are stored in the draw order of the geometry it shows.
+  // When a view switches to another representation, the store it leaves is
+  // kept (keyed by that order) instead of being regathered, so switching
+  // back costs no upload while the colours are unchanged. Kept stores count
+  // against the retention budget with retained geometry
+  // (`evictRetainedGeometry`) and are evicted first, least recently used
+  // first; a recolour drops every store kept for the old colours.
+  // ==========================================================================
+
+  /**
+   * Queue one buffer for deletion.
+   * @private
+   */
+  _retireBuffer(handle, byteLength) {
+    if (!handle) return;
+    this._queueDataRetirement({
+      buffers: { positions: handle, colors: null },
+      positionGpuByteLength: byteLength,
+      pointCount: 0,
+    });
+  }
+
+  /**
+   * Every kept colour store: `[cache, drawOrder, entry]` triples.
+   * @private
+   */
+  _keptColorStores() {
+    const out = [];
+    const visit = cache => {
+      if (!(cache instanceof Map)) return;
+      for (const [drawOrder, entry] of cache) out.push([cache, drawOrder, entry]);
+    };
+    visit(this._liveColorCache);
+    if (this.snapshotBuffers instanceof Map) {
+      for (const snapshot of this.snapshotBuffers.values()) visit(snapshot.colorCache);
+    }
+    return out;
+  }
+
+  /**
+   * Bytes of kept colour stores.
+   * @returns {number}
+   */
+  getKeptColorBytes() {
+    let bytes = 0;
+    for (const [, , entry] of this._keptColorStores()) bytes += entry.byteLength;
+    return bytes;
+  }
+
+  /**
+   * Drop kept colour stores, least recently used first, until `bytes` are
+   * freed (`Infinity`: all of them).
+   * @returns {number} Bytes freed.
+   * @private
+   */
+  _evictKeptColorStores(bytes) {
+    const kept = this._keptColorStores()
+      .sort((left, right) => left[2].lastUsed - right[2].lastUsed);
+    let freed = 0;
+    for (const [cache, drawOrder, entry] of kept) {
+      if (freed >= bytes) break;
+      cache.delete(drawOrder);
+      this._retireBuffer(entry.buffer, entry.byteLength);
+      freed += entry.byteLength;
+    }
+    return freed;
+  }
+
+  /**
+   * Drop every store a cache keeps (the colours they hold were replaced).
+   * @private
+   */
+  _clearKeptColorStores(cache) {
+    if (!(cache instanceof Map) || cache.size === 0) return;
+    for (const entry of cache.values()) this._retireBuffer(entry.buffer, entry.byteLength);
+    cache.clear();
+    this._drainDataRetirements();
+  }
+
+  /**
+   * Swap a view's colour store for the one holding `source` in `drawOrder`:
+   * a kept store when there is one, else a new store gathered now. The store
+   * left is kept under its own order.
+   *
+   * @param {Map} cache - The view's kept stores.
+   * @param {{buffer: WebGLBuffer, byteLength: number, order: object|null, source: Uint8Array}} current
+   * @param {object|null} order - Draw-order record of the order wanted.
+   * @param {string} label
+   * @returns {WebGLBuffer} The store to draw with.
+   * @private
+   */
+  _swapColorStore(cache, current, order, label) {
+    const gl = this.gl;
+    const now = performance.now();
+    const drawOrder = order?.drawOrder ?? null;
+    let entry = cache.get(drawOrder) ?? null;
+    if (entry !== null && entry.source !== current.source) {
+      cache.delete(drawOrder);
+      this._retireBuffer(entry.buffer, entry.byteLength);
+      entry = null;
+    }
+    // Keep the store being left, unless it already is the one wanted.
+    cache.set(current.order, {
+      buffer: current.buffer,
+      byteLength: current.byteLength,
+      source: current.source,
+      lastUsed: now,
+    });
+    let buffer;
+    if (entry !== null) {
+      cache.delete(drawOrder);
+      buffer = entry.buffer;
+    } else {
+      buffer = gl.createBuffer();
+      if (!buffer) {
+        cache.delete(current.order);
+        throw new Error(`${label} could not allocate a colour store.`);
+      }
+      try {
+        gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+        try {
+          this._allocateVertexStore(current.byteLength, gl.DYNAMIC_DRAW, current.byteLength / 4, label);
+        } finally {
+          gl.bindBuffer(gl.ARRAY_BUFFER, null);
+        }
+        this._writeTargetColors({ source: current.source }, buffer, order, label);
+      } catch (error) {
+        cache.delete(current.order);
+        this._retireBuffer(buffer, current.byteLength);
+        this._drainDataRetirements();
+        throw error;
+      }
+    }
+    // Retention never exceeds its budget.
+    this.evictRetainedGeometry();
+    this._drainDataRetirements();
+    return buffer;
+  }
+
+  /**
+   * Make the live colour store follow the live position order.
+   * @private
+   */
+  _ensureLiveColorsInOrder() {
+    const drawOrder = this._liveOrder?.drawOrder ?? null;
+    if (this._liveColorOrder === drawOrder && !this._colorsDirty) return;
+    if (this._liveColorOrder !== drawOrder && !this._colorsDirty) {
+      // The live view now shows another geometry: keep the store it leaves,
+      // and draw with the one kept for this order (or a new one).
+      const gl = this.gl;
+      const buffer = this._swapColorStore(
+        this._liveColorCache,
+        {
+          buffer: this.buffers.colors,
+          byteLength: this._colorGpuByteLength,
+          order: this._liveColorOrder,
+          source: this._colors,
+        },
+        this._liveOrder,
+        'HighPerfRenderer live colour store'
+      );
+      this.buffers = { ...this.buffers, colors: buffer };
+      gl.bindVertexArray(this.vao);
+      this._bindPointAttributes(this.buffers.positions, buffer, this.currentDimensionLevel);
+      gl.bindVertexArray(null);
+      this._liveColorOrder = drawOrder;
+      return;
+    }
+    this._publishLiveColors();
+  }
+
+  /**
+   * The draw-order record of the geometry a snapshot draws now: the live
+   * store's for a snapshot of the live geometry, else its pooled geometry's,
+   * re-ordered into `tree`'s order first when given.
+   *
+   * @param {object} snapshot
+   * @param {SpatialIndex|null} tree
+   * @returns {object|null}
+   * @private
+   */
+  _ensureSnapshotDrawOrder(snapshot, tree) {
+    if (this._snapshotUsesLiveGeometry(snapshot)) {
+      return tree === null
+        ? this._liveOrder
+        : this._ensureStoreDrawOrder(LIVE_STORE, tree);
+    }
+    const geometry = this._getSnapshotGeometryRecord(snapshot.geometryGeneration, snapshot.positions);
+    return tree === null
+      ? geometry.order ?? null
+      : this._ensureStoreDrawOrder({ kind: 'geometry', geometry }, tree);
+  }
+
+  /**
+   * Make one snapshot's colour store follow the order of its geometry.
+   * @param {object} snapshot
+   * @param {object|null} order - The geometry's draw-order record.
+   * @private
+   */
+  _ensureSnapshotColorsInOrder(snapshot, order) {
+    const owner = this._ensureSnapshotColorOwner(snapshot);
+    const drawOrder = order?.drawOrder ?? null;
+    if ((owner.order ?? null) === drawOrder) return;
+    if (!(snapshot.colorCache instanceof Map)) snapshot.colorCache = new Map();
+    // The view now shows another geometry: keep the store it leaves, and
+    // draw with the one kept for this order (or a new one).
+    const gl = this.gl;
+    const buffer = this._swapColorStore(
+      snapshot.colorCache,
+      {
+        buffer: owner.buffer,
+        byteLength: owner.byteLength,
+        order: owner.order ?? null,
+        source: snapshot.colors,
+      },
+      order,
+      `HighPerfRenderer view "${snapshot.id}" colour store`
+    );
+    owner.buffer = buffer;
+    owner.order = drawOrder;
+    snapshot.buffer = buffer;
+    gl.bindVertexArray(snapshot.vao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+    gl.vertexAttribPointer(1, 4, gl.UNSIGNED_BYTE, true, 4, 0);
+    gl.bindVertexArray(null);
+    gl.bindBuffer(gl.ARRAY_BUFFER, null);
+  }
+
+  /**
+   * Bind the source-order alpha texture and, when the points are stored in a
+   * draw order, the permutation that maps a stored slot back to its source
+   * index (texture unit 1); otherwise the dummy R32UI texture.
+   *
+   * @param {WebGL2RenderingContext} gl
+   * @param {object} uniforms
+   * @param {WebGLTexture|null} alphaTexture - null: per-vertex alpha.
+   * @param {object|null} alphaPlan - Linear-texture layout of `alphaTexture`.
+   * @param {object|null} order - Draw-order record of the drawn geometry.
+   * @private
+   */
+  _bindPointAlpha(gl, uniforms, alphaTexture, alphaPlan, order) {
+    // Both samplers always have a texture of their own type bound: a texture
+    // whose fetch is skipped (u_use* off) still has to be complete.
+    const alpha = alphaTexture ?? this._alphaTexture;
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, alpha);
+    if (uniforms.u_alphaTex !== null) gl.uniform1i(uniforms.u_alphaTex, 0);
+    if (alphaTexture !== null) setLinearLayoutUniform(gl, uniforms.u_alphaLayout, alphaPlan);
+    if (uniforms.u_useAlphaTex !== null) gl.uniform1i(uniforms.u_useAlphaTex, alphaTexture !== null ? 1 : 0);
+    const permutation = alphaTexture !== null && order !== null ? order : null;
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, permutation !== null ? permutation.texture : this._dummyLodIndexTexture);
+    if (uniforms.u_lodIndexTex !== null) gl.uniform1i(uniforms.u_lodIndexTex, 1);
+    if (permutation !== null) setLinearLayoutUniform(gl, uniforms.u_lodIndexLayout, permutation.plan);
+    if (uniforms.u_useLodIndexTex !== null) {
+      gl.uniform1i(uniforms.u_useLodIndexTex, permutation !== null ? 1 : 0);
+    }
+  }
+
+
+  /**
+   * Collect the runs of consecutive draw units (tree leaves, or coarse nodes
+   * in 1D/2D) inside the frustum into the view's cull state, as
+   * `[leafStart, leafEnd)` pairs in unit order. A subtree wholly inside is one
+   * run, read from its node without visiting its units; a unit partly inside
+   * is drawn whole.
+   *
+   * @param {object} cull - The view's cull state.
+   * @param {object} root
+   * @param {Float32Array[]} planes
+   * @private
+   */
+  _collectVisibleLeafRuns(cull, root, planes) {
+    let runs = cull.runs;
+    let count = 0;
+    let openStart = -1;
+    let openEnd = -1;
+    const stack = cull.stack;
+    stack.length = 0;
+    stack.push(root);
+    while (stack.length > 0) {
+      const node = stack.pop();
+      const visibility = this._classifyNodeVisibility(node.bounds, planes);
+      if (visibility === 'outside') continue;
+      if (visibility === 'partial' && node.drawUnit !== true && node.children) {
+        // Children are pushed in reverse so they pop in leaf order.
+        for (let child = node.children.length - 1; child >= 0; child--) {
+          if (node.children[child]) stack.push(node.children[child]);
+        }
+        continue;
+      }
+      if (node.leafStart === openEnd) {
+        openEnd = node.leafEnd;
+        continue;
+      }
+      if (openEnd > openStart) {
+        if ((count + 1) * 2 > runs.length) {
+          const grown = new Uint32Array(runs.length * 2);
+          grown.set(runs);
+          runs = grown;
+        }
+        runs[count * 2] = openStart;
+        runs[count * 2 + 1] = openEnd;
+        count++;
+      }
+      openStart = node.leafStart;
+      openEnd = node.leafEnd;
+    }
+    if (openEnd > openStart) {
+      if ((count + 1) * 2 > runs.length) {
+        const grown = new Uint32Array(runs.length * 2);
+        grown.set(runs);
+        runs = grown;
+      }
+      runs[count * 2] = openStart;
+      runs[count * 2 + 1] = openEnd;
+      count++;
+    }
+    cull.runs = runs;
+    cull.runCount = count;
+  }
+
+  /**
+   * Turn the view's leaf runs into draw ranges for every band up to
+   * `lastBand`, coarsened to the engine's range budget by bridging the gaps
+   * that hide the fewest points (`SpatialIndex#writeDrawRanges`): drawing a
+   * few points outside the frustum costs less than another draw call.
+   *
+   * @param {object} cull
+   * @param {SpatialIndex} tree
+   * @param {number} lastBand
+   * @private
+   */
+  _writeCulledRanges(cull, tree, lastBand) {
+    const cap = this._getMultiDraw() !== null ? MAX_CULLED_DRAW_RANGES_MULTI_DRAW : MAX_CULLED_DRAW_RANGES;
+    if (cull.starts.length < cap) {
+      cull.starts = new Int32Array(cap);
+      cull.counts = new Int32Array(cap);
+    }
+    const { rangeCount, elementCount } = tree.writeDrawRanges(
+      cull.runs, cull.runCount, lastBand, cull.starts, cull.counts, cap, cull
+    );
+    cull.rangeCount = rangeCount;
+    cull.elementCount = elementCount;
+    cull.band = lastBand;
+  }
+
+  /**
+   * Draw one view's points from a vertex array holding them in `order`.
+   *
+   * Full detail without culling draws every stored point; a reduced level
+   * draws the prefix the level admits; with culling, the leaf runs inside
+   * the frustum are drawn as node ranges (one call through
+   * `WEBGL_multi_draw`, else one `drawArrays` a range).
+   *
+   * @param {object} draw
+   * @param {object} draw.params - The render contract.
+   * @param {object} draw.viewState
+   * @param {WebGLVertexArrayObject} draw.vao
+   * @param {number} draw.pointCount
+   * @param {object|null} draw.order - Draw-order record of the geometry.
+   * @param {SpatialIndex|null} draw.tree - The tree `order` comes from.
+   * @param {number} draw.lodLevel - -1 or a level of `tree`.
+   * @param {boolean} draw.cull - Whether frustum culling applies.
+   * @param {boolean} draw.frustumChanged
+   * @param {WebGLTexture|null} draw.alphaTexture
+   * @param {object|null} draw.alphaPlan
+   * @param {string} draw.label
+   * @private
+   */
+  _drawPoints(draw) {
+    const gl = this.gl;
+    const { params, viewState, order, tree, lodLevel, cull } = draw;
+    const level = lodLevel >= 0 ? tree?.lodLevels?.[lodLevel] ?? null : null;
+    if (lodLevel >= 0 && level === null) {
+      throw new RangeError(`${draw.label} has no LOD level ${lodLevel}.`);
+    }
+    const reduced = level !== null && level.isFullDetail !== true;
+    if ((reduced || cull) && (order === null || tree === null || order.drawOrder !== tree.drawOrder)) {
+      throw new Error(`${draw.label} draws a reduced level or culled ranges without its tree's draw order.`);
+    }
+    const sizeMultiplier = reduced ? requireFiniteNumber(level.sizeMultiplier, `${draw.label} LOD size`) : 1;
+    const drawn = reduced ? level.pointCount : draw.pointCount;
+
+    let ranges = null;
+    if (cull) {
+      const state = viewState.cull;
+      const lastBand = reduced ? lodLevel : order.drawOrder.bandCount - 1;
+      const treeChanged = state.tree !== tree || state.drawOrder !== order.drawOrder;
+      if (draw.frustumChanged || treeChanged) {
+        this._validateSpatialOwnerOnce(tree);
+        this._collectVisibleLeafRuns(state, tree.root, viewState.frustumPlanes);
+        state.tree = tree;
+        state.drawOrder = order.drawOrder;
+        state.band = -1;
+      }
+      if (state.band !== lastBand) {
+        this._writeCulledRanges(state, tree, lastBand);
+      }
+      ranges = state;
+    }
+
+    const programName = this._pointProgramName(params.dimensionLevel);
+    const program = this.programs[programName];
+    const uniforms = this.uniformLocations.get(programName);
+    if (!program || !uniforms) {
+      throw new Error(`HighPerfRenderer "${this.activeQuality}" point shader state is unavailable.`);
+    }
+    gl.useProgram(program);
+    this._applyPointUniforms(
+      gl, uniforms,
+      params.mvpMatrix, params.viewMatrix, params.modelMatrix, params.projectionMatrix,
+      params.pointSize * sizeMultiplier, params.sizeAttenuation, params.viewportHeight, params.fov,
+      params.lightingStrength, params.fogDensity, params.fogColor, params.lightDir
+    );
+
+    let drawCalls = 0;
+    let operationError = null;
+    try {
+      this._bindPointAlpha(gl, uniforms, draw.alphaTexture, draw.alphaPlan, order);
+      gl.bindVertexArray(draw.vao);
+      if (ranges === null) {
+        drawCalls = drawPointsInSegments(gl, 0, drawn);
+      } else if (ranges.rangeCount > 0) {
+        const multiDraw = this._getMultiDraw();
+        if (multiDraw !== null) {
+          multiDraw.multiDrawArraysWEBGL(gl.POINTS, ranges.starts, 0, ranges.counts, 0, ranges.rangeCount);
+          drawCalls = 1;
+        } else {
+          for (let range = 0; range < ranges.rangeCount; range++) {
+            drawCalls += drawPointsInSegments(gl, ranges.starts[range], ranges.counts[range]);
+          }
+        }
+      }
+    } catch (error) {
+      operationError = error;
+    }
+    let restorationError = null;
+    try {
+      restorePointDrawBaseline(gl, false, uniforms.opaque === true);
+    } catch (error) {
+      restorationError = error;
+    }
+    settlePointDraw(operationError, restorationError, `${draw.label} draw`);
+
+    const visible = ranges === null ? drawn : ranges.elementCount;
+    this._writeStats(
+      viewState,
+      visible,
+      // Full detail reports -1, whichever ladder entry selected it.
+      reduced ? lodLevel : -1,
+      drawCalls,
+      cull,
+      cull && drawn > 0 ? 100 * (1 - Math.min(visible, drawn) / drawn) : 0
+    );
+  }
+
+  /**
+   * `WEBGL_multi_draw`, or null where the engine does not expose it (Firefox).
+   * @returns {object|null}
+   * @private
+   */
+  _getMultiDraw() {
+    if (this._multiDraw === undefined) {
+      this._multiDraw = this.gl.getExtension('WEBGL_multi_draw') ?? null;
+    }
+    return this._multiDraw;
   }
 
   setAdaptiveLOD(enabled) {
@@ -7868,13 +6078,10 @@ export class HighPerfRenderer {
     this._assertOperational('set adaptive LOD');
     if (enabled === this.useAdaptiveLOD) return;
 
-    // A global feature may become visible only after all live and multiview
-    // geometry owners are ready. Preparation failures leave flags, force LOD,
-    // per-view state, and unrelated dimension owners untouched.
-    if (enabled) {
-      this._prepareSpatialIndicesForFeature(true);
-    }
-
+    // Nothing is built here: each view's levels are built off the main
+    // thread when it next draws (`_requestSpatialIndex`), and the view draws
+    // full detail until they land. A build that failed is retried.
+    this._treeBuildFailures = new WeakMap();
     this.useAdaptiveLOD = enabled;
     if (!enabled && this.forceLODLevel >= 0) {
       this.forceLODLevel = -1;
@@ -7898,16 +6105,14 @@ export class HighPerfRenderer {
     this._assertOperational('inspect renderer status');
     const dimLevel = this.currentDimensionLevel;
     const spatialIndex = this.spatialIndices.get(dimLevel);
-    const lodBuffers =
-      this._getLodBuffersForDimension(dimLevel);
-
     const status = {
       pointCount: this.pointCount,
       currentDimensionLevel: dimLevel,
       useAdaptiveLOD: this.useAdaptiveLOD,
       useFrustumCulling: this.useFrustumCulling,
       forceLODLevel: this.forceLODLevel,
-      lodBuffersCount: lodBuffers.length,
+      lodLevelCount: spatialIndex?.lodLevels?.length ?? 0,
+      drawOrder: this._liveOrder === null ? 'source' : `${this._liveOrder.drawOrder.bandCount} bands`,
       spatialIndicesCount: this.spatialIndices.size,
       hasSpatialIndex: !!spatialIndex,
       spatialIndexPointCount: spatialIndex?.pointCount,
@@ -7940,12 +6145,8 @@ export class HighPerfRenderer {
     this._assertOperational('set frustum culling');
     if (enabled === this.useFrustumCulling) return;
 
-    if (enabled) {
-      this._prepareSpatialIndicesForFeature(
-        this._needsLodResources(-1)
-      );
-    }
-
+    // As for LOD: trees are built off the main thread when views next draw.
+    this._treeBuildFailures = new WeakMap();
     this.useFrustumCulling = enabled;
     for (const viewState of this._perViewState.values()) {
       this._invalidateViewStateRecord(viewState);
@@ -7955,27 +6156,6 @@ export class HighPerfRenderer {
     console.log(
       `[HighPerfRenderer] Frustum culling ${enabled ? 'enabled' : 'disabled'}`
     );
-  }
-
-  /**
-   * Get spatial index for a specific dimension level.
-   * Returns null if not yet built - use ensureSpatialIndex() to build first.
-   * @param {number} dimensionLevel - The dimension level (1, 2, or 3)
-   * @returns {SpatialIndex|null} The spatial index for the dimension, or null if not built
-   */
-  getSpatialIndex(dimensionLevel) {
-    this._assertOperational('get a spatial index');
-    const dim = requireDimensionLevel(
-      dimensionLevel,
-      'HighPerfRenderer getSpatialIndex dimensionLevel'
-    );
-    const spatialIndex = this.spatialIndices.get(dim) || null;
-    return spatialIndex === null
-      ? null
-      : getReadOnlySpatialProjection(
-        spatialIndex,
-        `HighPerfRenderer ${dim}D spatial index`
-      );
   }
 
   /**
@@ -8012,18 +6192,331 @@ export class HighPerfRenderer {
           console.log(`[HighPerfRenderer] ${dimLevel}D spatial index stale, rebuilding...`);
           this.clearAllViewState();
           this.spatialIndices.clear();
-          this._clearLodBuffers();  // Properly delete GL buffers before clearing
-          this._clearLodIndexTextures();  // Clear dimension-aware LOD index textures
         } else {
           console.log(`[HighPerfRenderer] Building ${dimLevel}D spatial index...`);
         }
-        this._getOrBuildSpatialIndexForDimension(
-          dimLevel,
-          false,
-          this._needsLodResources(-1)
-        );
+        // A query needs the tree, not its levels: those are built off the
+        // main thread for drawing and replace this tree when they land.
+        this._getOrBuildSpatialIndexForDimension(dimLevel, false, false);
       }
     }
+  }
+
+  // ==========================================================================
+  // SPATIAL TREES OFF THE MAIN THREAD
+  //
+  // Every tree the renderer needs for drawing -- for LOD, frustum culling, or
+  // a 3D view's stored order -- is built with its draw order in a worker
+  // (`spatial-tree-worker.js`, the same `buildSpatialTreeJob` either way), so
+  // turning LOD or culling on, loading a dataset, keeping a view or showing
+  // another representation never blocks a frame. Until a view's tree lands,
+  // the view draws full detail from its store as it is; when it lands, it is
+  // installed through the same publication a direct build takes and
+  // `onAsyncTreeReady` asks the viewer for a frame, in which the store adopts
+  // the tree's order (`_ensureStoreDrawOrder`). A build whose positions
+  // were replaced before it returned is dropped, never installed.
+  // ==========================================================================
+
+  /**
+   * Build a view's spatial tree in a worker, then install it. A hover reader
+   * asks for this instead of building on the main thread.
+   *
+   * Resolves true when the view has an index for its current positions, built
+   * now or already there; false when the positions changed before the tree
+   * came back, or are too large to copy to a worker.
+   *
+   * @param {string} viewId - 'live' or a snapshot id.
+   * @returns {Promise<boolean>}
+   */
+  buildSpatialIndexInBackground(viewId) {
+    this._assertOperational('build a spatial index in the background');
+    const exactId = requireViewId(viewId, 'HighPerfRenderer background spatial-index view id');
+    const target = this._spatialIndexTarget(exactId);
+    if (target === null) return Promise.resolve(true);
+    return new Promise(resolve => {
+      this._requestSpatialIndex(
+        target.live ? { kind: 'live' } : { kind: 'snapshot', id: exactId },
+        this._needsLodResources(-1),
+        installed => resolve(installed)
+      );
+    });
+  }
+
+  /**
+   * The positions a view's index would be built over, or null when it already
+   * has one for them. A snapshot drawn with the live geometry uses the live
+   * index.
+   */
+  _spatialIndexTarget(viewId) {
+    if (viewId !== 'live') {
+      const snapshot = this.snapshotBuffers.get(viewId);
+      if (!snapshot) {
+        throw new Error(`HighPerfRenderer snapshot "${viewId}" does not exist.`);
+      }
+      if (!this._snapshotUsesLiveGeometry(snapshot)) {
+        if (snapshot.spatialIndex && snapshot.spatialIndex.positions === snapshot.positions) return null;
+        return { positions: snapshot.positions, dimensionLevel: snapshot.dimensionLevel, live: false };
+      }
+    }
+    const positions = this._positions;
+    if (!positions || this.pointCount === 0) return null;
+    const dimensionLevel = this.currentDimensionLevel;
+    const existing = this.spatialIndices.get(dimensionLevel);
+    if (existing && existing.positions === positions && existing.pointCount === this.pointCount) return null;
+    return { positions, dimensionLevel, live: true };
+  }
+
+  /**
+   * The live view's tree for drawing: the published one when it serves
+   * (`needsLOD` asks for its LOD levels too), else whatever is published
+   * for the live positions while a worker builds the rest (null for none).
+   *
+   * @param {number} dimensionLevel - The live dimension.
+   * @param {boolean} needsLOD
+   * @returns {SpatialIndex|null}
+   * @private
+   */
+  _liveSpatialIndexForDraw(dimensionLevel, needsLOD) {
+    const current = () => {
+      const index = this.spatialIndices.get(dimensionLevel) ?? null;
+      return index !== null && index.positions === this._positions && index.pointCount === this.pointCount
+        ? index
+        : null;
+    };
+    const index = current();
+    if (index !== null && (!needsLOD || spatialIndexHasLod(index))) return index;
+    this._requestSpatialIndex({ kind: 'live' }, needsLOD);
+    // An inline build (no worker) has installed it already.
+    return current();
+  }
+
+  /**
+   * A custom-position snapshot's tree for drawing, as `_liveSpatialIndexForDraw`:
+   * its pooled geometry's tree when one serves, else a worker builds it.
+   *
+   * @param {string} id
+   * @param {object} snapshot
+   * @param {number} dimensionLevel
+   * @param {boolean} needsLOD
+   * @returns {SpatialIndex|null}
+   * @private
+   */
+  _snapshotSpatialIndexForDraw(id, snapshot, dimensionLevel, needsLOD) {
+    const serves = index => (
+      index !== null &&
+      index !== undefined &&
+      index.positions === snapshot.positions &&
+      index.dimensionLevel === dimensionLevel &&
+      (!needsLOD || spatialIndexHasLod(index))
+    );
+    if (serves(snapshot.spatialIndex)) return snapshot.spatialIndex;
+    // Another view of the same geometry may have its tree already.
+    const geometry = this._getSnapshotGeometryRecord(snapshot.geometryGeneration, snapshot.positions);
+    const pooled = geometry.spatialIndices.get(this._snapshotSpatialIndexKey(dimensionLevel, needsLOD)) ?? null;
+    if (serves(pooled)) {
+      snapshot.spatialIndex = pooled;
+      return pooled;
+    }
+    this._requestSpatialIndex({ kind: 'snapshot', id }, needsLOD);
+    const now = snapshot.spatialIndex;
+    return now !== null && now !== undefined && now.positions === snapshot.positions && now.dimensionLevel === dimensionLevel
+      ? now
+      : null;
+  }
+
+  /**
+   * Ask for the tree of a view's positions (with LOD levels when `needsLOD`)
+   * to be built off the main thread and installed. One build per positions
+   * array is in flight at a time; a build without LOD does not satisfy a
+   * request with it. A failed build is reported once and not retried until
+   * LOD or culling is toggled.
+   *
+   * @param {{kind: 'live'}|{kind: 'snapshot', id: string}} target
+   * @param {boolean} needsLOD
+   * @param {(installed: boolean) => void} [settled] - Called once with
+   *   whether a tree for the target's current positions is installed.
+   * @private
+   */
+  _requestSpatialIndex(target, needsLOD, settled = null) {
+    const snapshot = target.kind === 'snapshot' ? this.snapshotBuffers.get(target.id) : null;
+    const positions = target.kind === 'live' ? this._positions : snapshot?.positions;
+    const dimensionLevel = target.kind === 'live' ? this.currentDimensionLevel : snapshot?.dimensionLevel;
+    if (!(positions instanceof Float32Array) || positions.length === 0) {
+      settled?.(false);
+      return;
+    }
+    this._treeBuilds ??= new WeakMap();
+    this._treeBuildFailures ??= new WeakMap();
+    const inflight = this._treeBuilds.get(positions);
+    if (inflight && (inflight.needsLOD || !needsLOD)) {
+      if (settled) inflight.settled.push(settled);
+      return;
+    }
+    // A failed build is not retried for the same positions until memory has
+    // been released since it failed; then the next request tries again.
+    const failed = this._treeBuildFailures.get(positions);
+    if (
+      failed !== undefined &&
+      (failed.needsLOD || !needsLOD) &&
+      failed.epoch === (this._releaseEpoch ?? 0)
+    ) {
+      settled?.(false);
+      return;
+    }
+    const pointCount = target.kind === 'live' ? this.pointCount : snapshot.pointCount;
+    const treeNames = { 1: 'BinaryTree', 2: 'Quadtree', 3: 'Octree' };
+    const label = target.kind === 'live' ? 'live view' : 'a kept view';
+    const notifications = getNotificationCenter();
+    const build = { needsLOD, settled: settled ? [settled] : [] };
+    const finish = installed => {
+      if (this._treeBuilds?.get(positions) === build) this._treeBuilds.delete(positions);
+      for (const callback of build.settled) callback(installed);
+    };
+    let notifId = null;
+    try {
+      requireLodBuildHeapHeadroom(pointCount, needsLOD, `HighPerfRenderer ${dimensionLevel}D ${label}`);
+    } catch (error) {
+      this._treeBuildFailures.set(positions, { needsLOD, epoch: this._releaseEpoch ?? 0 });
+      notifications.error(describeError(error));
+      finish(false);
+      return;
+    }
+    this._treeBuilds.set(positions, build);
+    notifId = notifications.startCalculation(
+      `Building ${dimensionLevel}D ${treeNames[dimensionLevel]}${needsLOD ? ' and levels of detail' : ''} for ${label} (${pointCount.toLocaleString()} cells)`,
+      'spatial'
+    );
+    const startTime = performance.now();
+    this._buildSpatialTreeJob(positions, dimensionLevel, needsLOD, result => {
+      if (this._disposed === true || this._contextLost === true) {
+        finish(false);
+        return;
+      }
+      let installed = false;
+      try {
+        installed = this._installBuiltSpatialIndex(target, positions, dimensionLevel, needsLOD, result);
+      } catch (error) {
+        this._treeBuildFailures.set(positions, { needsLOD, epoch: this._releaseEpoch ?? 0 });
+        settleCalculationNotification(notifications, notifId, 'failCalculation',
+          `${dimensionLevel}D ${treeNames[dimensionLevel]} failed: ${describeError(error)}`);
+        finish(false);
+        return;
+      }
+      settleCalculationNotification(notifications, notifId, 'completeCalculation',
+        `${dimensionLevel}D ${treeNames[dimensionLevel]} ready (${label})`, performance.now() - startTime);
+      finish(installed);
+      if (installed) this.onAsyncTreeReady?.();
+    }, error => {
+      this._treeBuildFailures.set(positions, { needsLOD, epoch: this._releaseEpoch ?? 0 });
+      settleCalculationNotification(notifications, notifId, 'failCalculation',
+        `${dimensionLevel}D ${treeNames[dimensionLevel]} failed: ${describeError(error)}`);
+      finish(false);
+    });
+  }
+
+  /**
+   * Install a tree built off the main thread, if its positions are still
+   * the target's. Returns whether it was installed.
+   * @private
+   */
+  _installBuiltSpatialIndex(target, positions, dimensionLevel, needsLOD, { tree, order }) {
+    if (target.kind === 'live') {
+      if (this._positions !== positions || this.currentDimensionLevel !== dimensionLevel) return false;
+      const cached = this.spatialIndices.get(dimensionLevel) ?? null;
+      const cachedServes = cached !== null && cached.positions === positions &&
+        (!needsLOD || spatialIndexHasLod(cached));
+      if (cachedServes) return true;
+      this._getOrBuildSpatialIndexForDimension(dimensionLevel, cached !== null, needsLOD, tree, order);
+      return true;
+    }
+    const snapshot = this.snapshotBuffers.get(target.id);
+    if (!snapshot || snapshot.positions !== positions || snapshot.dimensionLevel !== dimensionLevel) return false;
+    this.rebuildSnapshotSpatialIndex(target.id, dimensionLevel, needsLOD, tree, order);
+    return true;
+  }
+
+  /**
+   * Run one tree build: in the worker, or inline where there is no worker
+   * or the positions are too large to copy to one. `onDone` gets
+   * `{tree, order}`; an inline build calls it before returning.
+   * @private
+   */
+  _buildSpatialTreeJob(positions, dimensionLevel, buildLOD, onDone, onError) {
+    const request = {
+      dimensionLevel,
+      buildLOD,
+      maxPointsPerNode: this.options.LOD_MAX_POINTS_PER_NODE,
+      maxDepth: this.options.LOD_MAX_DEPTH,
+    };
+    if (typeof Worker !== 'function') {
+      let result;
+      try {
+        result = buildSpatialTreeJob({ ...request, positions });
+      } catch (error) {
+        onError(error);
+        return;
+      }
+      onDone(result);
+      return;
+    }
+    if (!this._spatialTreeWorker) {
+      this._spatialTreeWorker = new Worker(
+        new URL('./high-perf/spatial-tree-worker.js', import.meta.url),
+        { type: 'module' }
+      );
+      this._spatialTreeRequests = new Map();
+      this._spatialTreeRequestId = 0;
+      this._spatialTreeWorker.onmessage = ({ data }) => {
+        const pending = this._spatialTreeRequests.get(data.id);
+        if (!pending) return;
+        this._spatialTreeRequests.delete(data.id);
+        if (data.error) pending.onError(new Error(`Background spatial index failed: ${data.error}`));
+        else pending.onDone({ tree: data.tree, order: data.order });
+      };
+      this._spatialTreeWorker.onerror = event => {
+        const error = new Error(`Background spatial index worker failed: ${event.message || 'unknown error'}`);
+        const pending = [...this._spatialTreeRequests.values()];
+        this._spatialTreeRequests.clear();
+        for (const entry of pending) entry.onError(error);
+      };
+    }
+    const id = ++this._spatialTreeRequestId;
+    const worker = this._spatialTreeWorker;
+    this._spatialTreeRequests.set(id, { onDone, onError });
+    // The worker gets its own copy, sent in slices of at most
+    // WORKER_POSITION_SLICE_FLOATS, one task each and each transferred: the
+    // renderer keeps drawing from the original, no task copies the whole
+    // geometry, and the main thread never holds a second full copy.
+    const total = positions.length;
+    let offset = 0;
+    const sendSlice = () => {
+      if (this._spatialTreeWorker !== worker || !this._spatialTreeRequests.has(id)) return;
+      const end = Math.min(total, offset + WORKER_POSITION_SLICE_FLOATS);
+      const slice = positions.slice(offset, end);
+      worker.postMessage({ id, kind: 'positions', offset, total, slice }, [slice.buffer]);
+      offset = end;
+      if (offset < total) {
+        setTimeout(sendSlice, 0);
+        return;
+      }
+      worker.postMessage({ id, kind: 'build', ...request });
+    };
+    if (total === 0) {
+      worker.postMessage({ id, kind: 'positions', offset: 0, total: 0, slice: new Float32Array(0) });
+      worker.postMessage({ id, kind: 'build', ...request });
+    } else {
+      sendSlice();
+    }
+  }
+
+  _retireSpatialTreeWorker() {
+    if (!this._spatialTreeWorker) return;
+    this._spatialTreeWorker.terminate();
+    this._spatialTreeWorker = null;
+    const error = new Error('HighPerfRenderer was disposed before the background spatial index finished.');
+    const pending = [...this._spatialTreeRequests.values()];
+    this._spatialTreeRequests.clear();
+    for (const entry of pending) entry.onError(error);
   }
 
   getStats(viewId) {
@@ -8183,6 +6676,62 @@ export class HighPerfRenderer {
   }
 
   /**
+   * Components per point of the positions published for one view: the
+   * view's dimension level, which is also its position stride.
+   *
+   * @param {string} viewId - `live` or an exact snapshot ID.
+   * @returns {1|2|3}
+   */
+  getViewPositionDimension(viewId) {
+    const exactViewId = requireViewId(
+      viewId,
+      'HighPerfRenderer position-dimension viewId'
+    );
+    if (exactViewId === 'live') {
+      if (!this._positions) {
+        throw new RangeError(
+          'HighPerfRenderer live view has no published positions.'
+        );
+      }
+      return this.currentDimensionLevel;
+    }
+    const snapshot = this.snapshotBuffers.get(exactViewId);
+    if (!snapshot) {
+      throw new RangeError(
+        `HighPerfRenderer view "${exactViewId}" does not exist.`
+      );
+    }
+    return snapshot.dimensionLevel;
+  }
+
+  /**
+   * The order one view's points are drawn in at full detail: the source
+   * indices of its geometry's stored draw order, or null while the geometry
+   * is stored in source order. A reduced LOD level draws a prefix of it
+   * (`getCurrentLodSequentialMembership`). Renderer-owned and never written;
+   * a new order is a new array. Figure export draws in this order so a
+   * figure overlaps translucent points exactly as the pane does.
+   *
+   * @param {string} viewId - `live` or an exact snapshot ID.
+   * @returns {Uint32Array|null}
+   */
+  getViewDrawOrder(viewId) {
+    const exactViewId = requireViewId(viewId, 'HighPerfRenderer draw-order viewId');
+    if (exactViewId === 'live') {
+      return this._liveOrder?.drawOrder.indices ?? null;
+    }
+    const snapshot = this.snapshotBuffers.get(exactViewId);
+    if (!snapshot) {
+      throw new RangeError(`HighPerfRenderer view "${exactViewId}" does not exist.`);
+    }
+    const geometry = this._snapshotGeometryPools.get(snapshot.geometryGeneration);
+    if (geometry === undefined) {
+      throw new Error(`HighPerfRenderer view "${exactViewId}" has no geometry owner.`);
+    }
+    return this._geometryDrawOrder(geometry)?.indices ?? null;
+  }
+
+  /**
    * Return the exact immutable geometry-publication certificate for one view.
    * Consumers may key derived read-only resources by this number without
    * receiving access to the renderer's mutable ownership records.
@@ -8244,38 +6793,11 @@ export class HighPerfRenderer {
   getAlphaTexture() { return this._alphaTexture; }
 
   /**
-   * @returns {number}
-   */
-  getAlphaTextureWidth() { return this._alphaTexWidth; }
-
-  /**
    * @returns {boolean}
    */
   isAlphaTextureActive() { return Boolean(this._useAlphaTexture && this._alphaTexture && this._alphaTexWidth > 0); }
 
-  /**
-   * Resolve the exact accepted alpha texture for one pane. The live view uses
-   * its mutable global publication; snapshots use their independent R8 owner.
-   */
-  getAlphaTextureForView(viewId) {
-    const exactViewId = requireViewId(
-      viewId,
-      'HighPerfRenderer alpha-texture viewId'
-    );
-    if (exactViewId === 'live') return this.getAlphaTexture();
-    return this.snapshotBuffers.get(exactViewId)?.alphaTexture ?? null;
-  }
 
-  getAlphaTextureWidthForView(viewId) {
-    const exactViewId = requireViewId(
-      viewId,
-      'HighPerfRenderer alpha-width viewId'
-    );
-    if (exactViewId === 'live') {
-      return this.getAlphaTextureWidth();
-    }
-    return this.snapshotBuffers.get(exactViewId)?.alphaTexWidth ?? 0;
-  }
 
   isAlphaTextureActiveForView(viewId) {
     const exactViewId = requireViewId(
@@ -8295,8 +6817,7 @@ export class HighPerfRenderer {
       snapshot.alphaTexHeight > 0 &&
       snapshot.alphaTexData.length ===
         snapshot.alphaTexWidth * snapshot.alphaTexHeight &&
-      snapshot.alphaTextureByteLength ===
-        snapshot.alphaTexData.byteLength
+      snapshot.alphaTextureByteLength === snapshot.alphaTexPlan?.texels
     );
   }
 
@@ -8596,9 +7117,42 @@ export class HighPerfRenderer {
    */
   getLODLevelCount(dimensionLevel) {
     this._assertOperational('get the LOD level count');
-    const lodBuffers =
-      this._getLodBuffersForDimension(dimensionLevel);
-    return lodBuffers.length;
+    const dim = requireDimensionLevel(
+      dimensionLevel,
+      'HighPerfRenderer LOD level count dimensionLevel'
+    );
+    if (dim !== this.currentDimensionLevel) return 0;
+    const tree = this._currentLiveTree();
+    return Array.isArray(tree?.lodLevels) ? tree.lodLevels.length : 0;
+  }
+
+  /**
+   * Whether the view's adaptive LOD is still stepping toward the level its
+   * camera distance asks for. Hysteresis moves one level per drawn frame, so
+   * the viewer keeps drawing while this holds, and only while it holds.
+   * @param {string} viewId - Exact view ID.
+   * @returns {boolean}
+   */
+  isViewLodConverging(viewId) {
+    const viewState = this._perViewState.get(
+      requireViewId(viewId, 'HighPerfRenderer LOD convergence viewId')
+    );
+    return viewState !== undefined && viewState.lodConverging === true;
+  }
+
+  /**
+   * The LOD ladder length of the tree one view draws with: the live tree for
+   * the live view and the views sharing its geometry, the view's own tree for
+   * a view of another representation. Zero when that view has no LOD tree.
+   *
+   * @param {string} viewId
+   * @param {number} dimensionLevel - The view's dimension.
+   * @returns {number}
+   */
+  getViewLODLevelCount(viewId, dimensionLevel) {
+    this._assertOperational('get a view LOD level count');
+    const spatialIndex = this._getSpatialIndexForViewGeneration(viewId, dimensionLevel);
+    return Array.isArray(spatialIndex?.lodLevels) ? spatialIndex.lodLevels.length : 0;
   }
 
   /**
@@ -8673,132 +7227,71 @@ export class HighPerfRenderer {
         `${owner} point count must be a positive safe integer.`
       );
     }
-    const maxTextureSize = this.gl.getParameter(
-      this.gl.MAX_TEXTURE_SIZE
-    );
-    if (
-      !Number.isSafeInteger(maxTextureSize) ||
-      maxTextureSize <= 0
-    ) {
-      throw new Error(
-        `${owner} received an invalid MAX_TEXTURE_SIZE capability.`
-      );
-    }
-    const width = Math.min(pointCount, maxTextureSize);
-    const height = Math.ceil(pointCount / width);
-    if (height > maxTextureSize) {
-      throw new RangeError(
-        `${owner} cannot represent ${pointCount.toLocaleString()} alpha values in the exact ${maxTextureSize}x${maxTextureSize} texture capacity.`
-      );
-    }
+    // A linear texture (layers of MAX_TEXTURE_SIZE rows) holds any count.
+    const plan = planLinearTextureFor(this.gl, pointCount);
     return {
-      height,
-      requiredSize: width * height,
-      width,
+      height: plan.rows,
+      plan,
+      requiredSize: plan.width * plan.rows,
+      width: plan.width,
     };
   }
 
-  _packSnapshotRgb(colors, owner) {
+
+  /**
+   * Size the bound `ARRAY_BUFFER` as one snapshot's RGBA8 colour store, 4
+   * bytes a point like the live store, and fill it from the snapshot's
+   * colors (gathered on the GPU for a draw order, `_writeOrderedColors`).
+   * Four bytes a vertex keep the attribute on the 4-byte stride Metal needs:
+   * a 3-byte RGB store made ANGLE keep a converted 4-byte copy of its own and
+   * convert it again after every write. Only the sizing call can fail for
+   * want of memory. A snapshot's alpha is its R8 texture; the store's alpha
+   * byte is never read.
+   *
+   * @param {WebGLBuffer} buffer - The store, bound to `ARRAY_BUFFER`.
+   * @param {Uint8Array} colors - Exact RGBA colors, 4 bytes a point.
+   * @param {string} owner
+   * @param {object|null} order - Draw-order record of the geometry the
+   *   snapshot draws; null stores source order.
+   * @returns {number} The store's byte length.
+   * @private
+   */
+  _uploadSnapshotColors(buffer, colors, owner, order) {
+    const gl = this.gl;
     const exactColors = requireSnapshotColors(
       this.pointCount,
       colors,
       owner
     );
-    const requiredSize = this.pointCount * 3;
-    let staging = this._snapshotColorStagingData;
-    if (
-      !(staging instanceof Uint8Array) ||
-      staging.length !== requiredSize
-    ) {
-      staging = new Uint8Array(requiredSize);
-      this._snapshotColorStagingData = staging;
-    }
-    for (
-      let pointIndex = 0, rgbIndex = 0;
-      pointIndex < this.pointCount;
-      pointIndex++, rgbIndex += 3
-    ) {
-      const rgbaIndex = pointIndex * 4;
-      staging[rgbIndex] = exactColors[rgbaIndex];
-      staging[rgbIndex + 1] = exactColors[rgbaIndex + 1];
-      staging[rgbIndex + 2] = exactColors[rgbaIndex + 2];
-    }
-    return staging;
-  }
-
-  _packSnapshotRgbAndAlpha(
-    colors,
-    alphas,
-    alphaTarget,
-    owner
-  ) {
-    const exactColors = requireSnapshotColors(
-      this.pointCount,
-      colors,
-      owner
+    const byteLength = this.pointCount * 4;
+    this._allocateGpu(`${owner} could not allocate its color buffer`, () => {
+      gl.bufferData(gl.ARRAY_BUFFER, byteLength, gl.STATIC_DRAW);
+    });
+    this._writeOrderedColors(
+      buffer,
+      exactColors,
+      order,
+      `${owner} color-buffer upload`
     );
-    const exactAlphas = alphas === null
-      ? null
-      : requireSnapshotAlphas(
-          this.pointCount,
-          alphas,
-          owner
-        );
-    if (
-      !(alphaTarget instanceof Uint8Array) ||
-      alphaTarget.length < this.pointCount
-    ) {
-      throw new TypeError(
-        `${owner} R8 target must contain at least one byte per point.`
-      );
-    }
-    const requiredRgbSize = this.pointCount * 3;
-    let rgb = this._snapshotColorStagingData;
-    if (
-      !(rgb instanceof Uint8Array) ||
-      rgb.length !== requiredRgbSize
-    ) {
-      rgb = new Uint8Array(requiredRgbSize);
-      this._snapshotColorStagingData = rgb;
-    }
-
-    for (
-      let pointIndex = 0, rgbIndex = 0;
-      pointIndex < this.pointCount;
-      pointIndex++, rgbIndex += 3
-    ) {
-      const rgbaIndex = pointIndex * 4;
-      rgb[rgbIndex] = exactColors[rgbaIndex];
-      rgb[rgbIndex + 1] = exactColors[rgbaIndex + 1];
-      rgb[rgbIndex + 2] = exactColors[rgbaIndex + 2];
-      if (exactAlphas === null) {
-        alphaTarget[pointIndex] =
-          exactColors[rgbaIndex + 3];
-      } else {
-        const value = exactAlphas[pointIndex];
-        if (
-          !Number.isFinite(value) ||
-          value < 0 ||
-          value > 1
-        ) {
-          throw new RangeError(
-            `${owner} alpha value at index ${pointIndex} must be finite and in [0, 1].`
-          );
-        }
-        alphaTarget[pointIndex] =
-          Math.round(value * 255);
-      }
-    }
-    alphaTarget.fill(255, this.pointCount);
-    return rgb;
+    gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+    return byteLength;
   }
 
+
+  /**
+   * Encode one snapshot R8 generation into `target` and report whether any
+   * byte differs from `accepted` (or from `target` itself when null). With
+   * `dirtyRows` (one entry a row of `rowWidth` texels, cleared by the caller)
+   * the rows that differ are marked, so only they are uploaded.
+   */
   _encodeSnapshotAlphaData(
     target,
     colors,
     alphas,
     owner,
-    accepted = null
+    accepted = null,
+    dirtyRows = null,
+    rowWidth = 0
   ) {
     if (
       !(target instanceof Uint8Array) ||
@@ -8833,46 +7326,55 @@ export class HighPerfRenderer {
         alphas,
         owner
       );
-    let changed = false;
-    for (let index = 0; index < this.pointCount; index++) {
-      let byte;
-      if (exactAlphas === null) {
-        byte = exactColors[index * 4 + 3];
-      } else {
-        const value = exactAlphas[index];
-        if (
-          !Number.isFinite(value) ||
-          value < 0 ||
-          value > 1
-        ) {
-          throw new RangeError(
-            `${owner} alpha value at index ${index} must be finite and in [0, 1].`
-          );
-        }
-        byte = Math.round(value * 255);
-      }
+    if (dirtyRows !== null) {
       if (
-        accepted === null
-          ? target[index] !== byte
-          : accepted[index] !== byte
+        accepted === null ||
+        !Number.isSafeInteger(rowWidth) ||
+        rowWidth <= 0 ||
+        !(dirtyRows instanceof Uint8Array) ||
+        dirtyRows.length * rowWidth !== target.length
       ) {
-        changed = true;
+        throw new TypeError(
+          `${owner} dirty-row tracking needs the accepted owner and its exact row layout.`
+        );
       }
-      target[index] = byte;
     }
-    for (
-      let index = this.pointCount;
-      index < target.length;
-      index++
-    ) {
-      if (
-        accepted === null
-          ? target[index] !== 255
-          : accepted[index] !== 255
-      ) {
-        changed = true;
+    // Row-major, so a moved row is marked without a division per point; the
+    // same indices are visited in the same order as a flat scan (same first
+    // rejection, same bytes). Texels past the last point are padding, 255.
+    const reference = accepted === null ? target : accepted;
+    const pointCount = this.pointCount;
+    const width = dirtyRows === null ? target.length : rowWidth;
+    let changed = false;
+    for (let rowStart = 0, row = 0; rowStart < target.length; rowStart += width, row++) {
+      const rowEnd = Math.min(rowStart + width, target.length);
+      let rowChanged = false;
+      for (let index = rowStart; index < rowEnd; index++) {
+        let byte = 255;
+        if (index < pointCount) {
+          if (exactAlphas === null) {
+            byte = exactColors[index * 4 + 3];
+          } else {
+            const value = exactAlphas[index];
+            if (
+              !Number.isFinite(value) ||
+              value < 0 ||
+              value > 1
+            ) {
+              throw new RangeError(
+                `${owner} alpha value at index ${index} must be finite and in [0, 1].`
+              );
+            }
+            byte = Math.round(value * 255);
+          }
+        }
+        if (reference[index] !== byte) rowChanged = true;
+        target[index] = byte;
       }
-      target[index] = 255;
+      if (rowChanged) {
+        changed = true;
+        if (dirtyRows !== null) dirtyRows[row] = 1;
+      }
     }
     return changed;
   }
@@ -8925,24 +7427,19 @@ export class HighPerfRenderer {
     ) {
       return;
     }
-    this._snapshotColorStagingData = null;
     this._snapshotAlphaStagingData = null;
   }
 
   _uploadNewSnapshotAlphaTexture(
     data,
-    width,
-    height,
+    plan,
     label,
     staging
   ) {
     if (
       !(data instanceof Uint8Array) ||
-      !Number.isSafeInteger(width) ||
-      width <= 0 ||
-      !Number.isSafeInteger(height) ||
-      height <= 0 ||
-      data.length !== width * height ||
+      !plan ||
+      data.length !== plan.width * plan.rows ||
       !staging ||
       staging.alphaTexture !== null ||
       staging.alphaTextureByteLength !== 0
@@ -8960,99 +7457,31 @@ export class HighPerfRenderer {
       );
     }
     staging.alphaTexture = texture;
-    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, texture);
     try {
       this._withNeutralTextureUnpackState(1, label, () => {
-        gl.texImage2D(
-          gl.TEXTURE_2D,
-          0,
-          gl.R8,
-          width,
-          height,
-          0,
-          gl.RED,
-          gl.UNSIGNED_BYTE,
-          data
-        );
+        this._allocateGpu(`${label} could not allocate its R8 texture`, () => {
+          allocateLinearTexture(gl, gl.R8, plan);
+        });
+        writeLinearTextureRows(gl, plan, gl.RED, gl.UNSIGNED_BYTE, data, 1);
         requireCleanWebGLState(gl, `${label} upload`);
       });
-      staging.alphaTextureByteLength = data.byteLength;
-      gl.texParameteri(
-        gl.TEXTURE_2D,
-        gl.TEXTURE_MIN_FILTER,
-        gl.NEAREST
-      );
-      gl.texParameteri(
-        gl.TEXTURE_2D,
-        gl.TEXTURE_MAG_FILTER,
-        gl.NEAREST
-      );
-      gl.texParameteri(
-        gl.TEXTURE_2D,
-        gl.TEXTURE_WRAP_S,
-        gl.CLAMP_TO_EDGE
-      );
-      gl.texParameteri(
-        gl.TEXTURE_2D,
-        gl.TEXTURE_WRAP_T,
-        gl.CLAMP_TO_EDGE
-      );
-      requireCleanWebGLState(gl, `${label} parameters`);
+      staging.alphaTextureByteLength = plan.texels;
     } finally {
-      gl.bindTexture(gl.TEXTURE_2D, null);
+      gl.bindTexture(gl.TEXTURE_2D_ARRAY, null);
     }
     return texture;
   }
 
-  _uploadSnapshotAlphaTextureData(
-    snapshot,
-    data,
-    label
-  ) {
-    if (
-      !snapshot?.alphaTexture ||
-      !(data instanceof Uint8Array) ||
-      !Number.isSafeInteger(snapshot.alphaTexWidth) ||
-      snapshot.alphaTexWidth <= 0 ||
-      !Number.isSafeInteger(snapshot.alphaTexHeight) ||
-      snapshot.alphaTexHeight <= 0 ||
-      data.length !==
-        snapshot.alphaTexWidth * snapshot.alphaTexHeight
-    ) {
-      throw new Error(
-        `${label} received incomplete accepted snapshot R8 state.`
-      );
-    }
-    const gl = this.gl;
-    requireCleanWebGLState(gl, `${label} preflight`);
-    gl.bindTexture(gl.TEXTURE_2D, snapshot.alphaTexture);
-    try {
-      this._withNeutralTextureUnpackState(1, label, () => {
-        gl.texSubImage2D(
-          gl.TEXTURE_2D,
-          0,
-          0,
-          0,
-          snapshot.alphaTexWidth,
-          snapshot.alphaTexHeight,
-          gl.RED,
-          gl.UNSIGNED_BYTE,
-          data
-        );
-        requireCleanWebGLState(gl, label);
-      });
-    } finally {
-      gl.bindTexture(gl.TEXTURE_2D, null);
-    }
-  }
+
 
   /**
    * Create a GPU buffer for a snapshot view. Call this once when snapshot is created.
-   * The snapshot owns one RGB VBO plus one R8 alpha texture and references its
+   * The snapshot owns one RGBA8 colour VBO plus one R8 alpha texture and references its
    * geometry generation's shared immutable position VBO through its VAO.
    * @param {string} id - Unique snapshot identifier
    * @param {Uint8Array} colors - Exact RGBA colors.
-   * @param {Float32Array|null} alphas - Exact alpha values or null to use RGBA alpha.
+   * @param {Uint8Array|null} alphas - Exact 0/1 point transparency or null to use RGBA alpha.
    * @param {Float32Array} viewPositions - Exact positions owned by this view.
    * @param {number} dimensionLevel - Exact published view dimension.
    * @param {string} sourceViewId - Exact view that owns viewPositions.
@@ -9084,6 +7513,7 @@ export class HighPerfRenderer {
     const pointData = requireSnapshotPointData(
       n,
       viewPositions,
+      exactDimensionLevel,
       colors,
       alphas,
       `HighPerfRenderer snapshot "${exactId}"`
@@ -9094,12 +7524,11 @@ export class HighPerfRenderer {
     const alphaData = this._acquireSnapshotAlphaStaging(
       alphaLayout.requiredSize
     );
-    let snapshotRgb;
     try {
-      snapshotRgb = this._packSnapshotRgbAndAlpha(
+      this._encodeSnapshotAlphaData(
+        alphaData,
         pointData.colors,
         pointData.alphas,
-        alphaData,
         owner
       );
     } catch (error) {
@@ -9118,6 +7547,9 @@ export class HighPerfRenderer {
       this._releaseSnapshotScratchIfUnused();
       throw error;
     }
+    // `requireSnapshotPointData` proved the source holds exactly
+    // `exactDimensionLevel` components a point, so the geometry it names is
+    // that dimension's.
     const positions = geometry.positions;
 
     // Snapshot positions are an immutable renderer-owned CPU publication.
@@ -9145,63 +7577,19 @@ export class HighPerfRenderer {
       positionBuffer: null,
       positionBufferByteLength: 0,
     };
-    let notification = null;
-    let notificationCompleted = false;
     let snapshotBounds = null;
     try {
-      snapshotBounds =
-        HighPerfRenderer.computeBoundsFromPositions(positions);
+      snapshotBounds = HighPerfRenderer.computeBoundsFromPositions(
+        positions,
+        exactDimensionLevel
+      );
 
       if (hasCustomPositions && needsSpatialIndex) {
-        const needsLOD = this._needsLodResources(-1);
-        spatialIndex = this._getPooledSnapshotSpatialIndex(
-          geometry.generation,
-          positions,
-          exactDimensionLevel,
-          needsLOD
-        );
-        if (spatialIndex === null) {
-          requireLodBuildHeapHeadroom(
-            positions.length / 3,
-            needsLOD,
-            `HighPerfRenderer ${exactDimensionLevel}D view "${exactId}"`
-          );
-          console.log(`[HighPerfRenderer] Building ${exactDimensionLevel}D spatial index for snapshot "${exactId}"...`);
-
-          const notifications = getNotificationCenter();
-          const treeNames = { 1: 'BinaryTree', 2: 'Quadtree', 3: 'Octree' };
-          const treeName = treeNames[exactDimensionLevel];
-          const notifId = notifications.startCalculation(
-            `Building ${exactDimensionLevel}D ${treeName} for view "${exactId}" (${n.toLocaleString()} cells)`,
-            'spatial'
-          );
-          notification = {
-            notifications,
-            notifId,
-            treeName,
-            startTime: performance.now()
-          };
-
-          spatialIndex = new SpatialIndex(
-            positions,
-            null,
-            exactDimensionLevel,
-            this.options.LOD_MAX_POINTS_PER_NODE,
-            this.options.LOD_MAX_DEPTH,
-            {
-              buildLOD: needsLOD,
-              buildLodNodeMappings: false,
-              computeNodeStats: false
-            }
-          );
-          this._publishPooledSnapshotSpatialIndex(
-            geometry.generation,
-            positions,
-            exactDimensionLevel,
-            needsLOD,
-            spatialIndex
-          );
-        }
+        // The geometry's tree when another view built it; otherwise the
+        // view's first frame asks a worker for it (`_snapshotSpatialIndexForDraw`).
+        spatialIndex = geometry.spatialIndices.get(
+          this._snapshotSpatialIndexKey(exactDimensionLevel, this._needsLodResources(-1))
+        ) ?? null;
       }
 
       requireCleanWebGLState(
@@ -9221,21 +7609,16 @@ export class HighPerfRenderer {
         );
       }
       gl.bindBuffer(gl.ARRAY_BUFFER, colorBuffer);
-      gl.bufferData(
-        gl.ARRAY_BUFFER,
-        snapshotRgb,
-        gl.STATIC_DRAW
+      colorBufferByteLength = this._uploadSnapshotColors(
+        colorBuffer,
+        pointData.colors,
+        `HighPerfRenderer candidate snapshot "${exactId}"`,
+        this._geometryOrderRecord(geometry)
       );
-      requireCleanWebGLState(
-        gl,
-        `HighPerfRenderer candidate snapshot "${exactId}" color-buffer upload`
-      );
-      colorBufferByteLength = snapshotRgb.byteLength;
 
       this._uploadNewSnapshotAlphaTexture(
         alphaData,
-        alphaLayout.width,
-        alphaLayout.height,
+        alphaLayout.plan,
         `HighPerfRenderer snapshot "${exactId}" alpha`,
         alphaStaging
       );
@@ -9247,16 +7630,15 @@ export class HighPerfRenderer {
         );
       }
       gl.bindVertexArray(vao);
-      gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
-      gl.enableVertexAttribArray(0);
-      gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 12, 0);
+      bindPositionAttribute(gl, positionBuffer, geometry.dimension);
       gl.bindBuffer(gl.ARRAY_BUFFER, colorBuffer);
       gl.enableVertexAttribArray(1);
       colorOwner = this._createSnapshotColorOwner(
         colorBuffer,
-        colorBufferByteLength
+        colorBufferByteLength,
+        this._geometryDrawOrder(geometry)
       );
-      gl.vertexAttribPointer(1, 3, gl.UNSIGNED_BYTE, true, 3, 0);
+      gl.vertexAttribPointer(1, 4, gl.UNSIGNED_BYTE, true, 4, 0);
       gl.bindVertexArray(null);
       gl.bindBuffer(gl.ARRAY_BUFFER, null);
       requireCleanWebGLState(
@@ -9264,17 +7646,6 @@ export class HighPerfRenderer {
         `HighPerfRenderer candidate snapshot "${exactId}" publication`
       );
 
-      if (notification !== null) {
-        const elapsed = performance.now() - notification.startTime;
-        settleCalculationNotification(
-          notification.notifications,
-          notification.notifId,
-          'completeCalculation',
-          `${exactDimensionLevel}D ${notification.treeName} ready (view "${exactId}")`,
-          elapsed
-        );
-        notificationCompleted = true;
-      }
     } catch (error) {
       const rollbackFailures = [];
       const rollback = operation => {
@@ -9310,14 +7681,6 @@ export class HighPerfRenderer {
         ...this._drainSnapshotRetirements(exactId)
       );
       rollback(() => gl.getError());
-      if (notification !== null && !notificationCompleted) {
-        settleCalculationNotification(
-          notification.notifications,
-          notification.notifId,
-          'failCalculation',
-          `${exactDimensionLevel}D ${notification.treeName} failed for view "${exactId}": ${describeError(error)}`
-        );
-      }
       if (rollbackFailures.length > 0) {
         this._donateSnapshotAlphaStaging(alphaData);
         this._releaseSnapshotScratchIfUnused();
@@ -9332,8 +7695,13 @@ export class HighPerfRenderer {
     }
 
     this.snapshotBuffers.set(exactId, {
+      // The published RGBA array, kept by reference: a published color array
+      // is never written (a recolor publishes a new one), and it is what the
+      // colour store is gathered from when its geometry's draw order changes.
+      colors: pointData.colors,
       alphaTexData: alphaData,
       alphaTexHeight: alphaLayout.height,
+      alphaTexPlan: alphaLayout.plan,
       alphaTexWidth: alphaLayout.width,
       alphaTexture: alphaStaging.alphaTexture,
       alphaTextureByteLength:
@@ -9363,7 +7731,7 @@ export class HighPerfRenderer {
     console.log(
       `[HighPerfRenderer] Created snapshot buffer "${exactId}" ` +
       `(${n.toLocaleString()} points, ` +
-      `${(colorBufferByteLength / 1024 / 1024).toFixed(1)} MB RGB, ` +
+      `${(colorBufferByteLength / 1024 / 1024).toFixed(1)} MB colour, ` +
       `${(alphaStaging.alphaTextureByteLength / 1024 / 1024).toFixed(1)} MB R8 alpha, ` +
       `${(positions.byteLength / 1024 / 1024).toFixed(1)} MB shared positions` +
       `${spatialIndex ? ', with spatial index' : ''})`
@@ -9372,11 +7740,11 @@ export class HighPerfRenderer {
   }
 
   /**
-   * Transactionally replace any requested snapshot RGB, R8, and geometry
+   * Transactionally replace any requested snapshot colour, R8, and geometry
    * owners while retaining unchanged publications by exact reference count.
    * @param {string} id - Snapshot identifier
    * @param {Uint8Array} colors - Exact RGBA colors.
-   * @param {Float32Array|null} alphas - Exact alpha values or null.
+   * @param {Uint8Array|null} alphas - Exact 0/1 point transparency or null.
    * @param {Float32Array} viewPositions - Exact positions owned by this view.
    * @param {number} dimensionLevel - Exact published view dimension.
    * @param {boolean} [forceGeometryPublication=false] - Treat even the same
@@ -9421,20 +7789,25 @@ export class HighPerfRenderer {
       );
     }
 
+    // A released view is rebuilt before its stores are replaced.
+    this._snapshotInOperation = exactId;
+    this._restoreSnapshotStores(snapshot);
     const gl = this.gl;
     const n = this.pointCount;
     const owner = `HighPerfRenderer snapshot "${exactId}"`;
     if (
       !(viewPositions instanceof Float32Array) ||
-      viewPositions.length !== n * 3
+      viewPositions.length !== n * exactDimensionLevel
     ) {
       throw new TypeError(
-        `${owner} positions must be a Float32Array with exactly ${n * 3} values.`
+        `${owner} positions must be a Float32Array with exactly ${n * exactDimensionLevel} values (${exactDimensionLevel} per point).`
       );
     }
-    let snapshotRgb = null;
     let alphaData = null;
     let alphaLayout = null;
+    if (replaceColor) {
+      requireSnapshotColors(n, colors, owner);
+    }
     if (replaceAlpha) {
       alphaLayout = this._getSnapshotAlphaTextureLayout(
         n,
@@ -9444,21 +7817,16 @@ export class HighPerfRenderer {
         alphaLayout.requiredSize
       );
       try {
-        snapshotRgb = this._packSnapshotRgbAndAlpha(
+        this._encodeSnapshotAlphaData(
+          alphaData,
           colors,
           alphas,
-          alphaData,
           owner
         );
       } catch (error) {
         this._donateSnapshotAlphaStaging(alphaData);
         throw error;
       }
-    } else if (replaceColor) {
-      snapshotRgb = this._packSnapshotRgb(
-        colors,
-        owner
-      );
     }
     const acceptedColorOwner =
       this._ensureSnapshotColorOwner(snapshot);
@@ -9468,16 +7836,31 @@ export class HighPerfRenderer {
       viewPositions !== snapshot.positions;
     let candidateGeometry;
     try {
-      candidateGeometry = positionsChanged
-        ? this._acquireIndependentSnapshotGeometry(viewPositions)
-        : this._acquireSnapshotGeometryFromSource(
+      // A forced publication re-uploads its own copy; otherwise a view
+      // switched to a representation another view shows (or showed lately)
+      // shares that geometry.
+      candidateGeometry = !positionsChanged
+        ? this._acquireSnapshotGeometryFromSource(
             exactId,
             viewPositions
-          );
+          )
+        : forceGeometryPublication
+          ? this._acquireIndependentSnapshotGeometry(
+              viewPositions,
+              exactDimensionLevel
+            )
+          : this._acquireSnapshotGeometryForPositions(
+              viewPositions,
+              exactDimensionLevel
+            );
     } catch (error) {
       this._donateSnapshotAlphaStaging(alphaData);
       throw error;
     }
+    // The length check above proved `viewPositions` holds exactly
+    // `exactDimensionLevel` components a point, so unchanged positions keep
+    // the snapshot's dimension: the published dimension is the position
+    // layout and changes only with a new position publication.
     const positions = candidateGeometry.positions;
     const nextGeometryGeneration = candidateGeometry.generation;
     const dimensionChanged =
@@ -9487,8 +7870,6 @@ export class HighPerfRenderer {
     let nextBounds = snapshot.bounds;
     let nextSpatialIndex = snapshot.spatialIndex;
     let nextDimensionLevel = snapshot.dimensionLevel;
-    let notification = null;
-    let notificationCompleted = false;
     let candidateBuffer = null;
     let candidateBufferByteLength = 0;
     let candidateColorOwner = null;
@@ -9507,64 +7888,19 @@ export class HighPerfRenderer {
         const hasCustomPositions =
           nextGeometryGeneration !== this._liveGeometryGeneration;
         if (positionsChanged || nextBounds === null) {
-          nextBounds =
-            HighPerfRenderer.computeBoundsFromPositions(positions);
+          nextBounds = HighPerfRenderer.computeBoundsFromPositions(
+            positions,
+            exactDimensionLevel
+          );
         }
 
-        if (hasCustomPositions) {
-          if (needsSpatialIndex) {
-            const needsLOD = this._needsLodResources(-1);
-            nextSpatialIndex = this._getPooledSnapshotSpatialIndex(
-              nextGeometryGeneration,
-              positions,
-              exactDimensionLevel,
-              needsLOD
-            );
-            if (nextSpatialIndex === null) {
-              requireLodBuildHeapHeadroom(
-                positions.length / 3,
-                needsLOD,
-                `HighPerfRenderer ${exactDimensionLevel}D view "${exactId}"`
-              );
-              const notifications = getNotificationCenter();
-              const treeNames = { 1: 'BinaryTree', 2: 'Quadtree', 3: 'Octree' };
-              const treeName = treeNames[exactDimensionLevel];
-              const notifId = notifications.startCalculation(
-                `Rebuilding ${exactDimensionLevel}D ${treeName} for view "${exactId}" (${n.toLocaleString()} cells)`,
-                'spatial'
-              );
-              notification = {
-                notifications,
-                notifId,
-                treeName,
-                startTime: performance.now()
-              };
-              nextSpatialIndex = new SpatialIndex(
-                positions,
-                null,
-                exactDimensionLevel,
-                this.options.LOD_MAX_POINTS_PER_NODE,
-                this.options.LOD_MAX_DEPTH,
-                {
-                  buildLOD: needsLOD,
-                  buildLodNodeMappings: false,
-                  computeNodeStats: false
-                }
-              );
-              this._publishPooledSnapshotSpatialIndex(
-                nextGeometryGeneration,
-                positions,
-                exactDimensionLevel,
-                needsLOD,
-                nextSpatialIndex
-              );
-            }
-          } else {
-            nextSpatialIndex = null;
-          }
-        } else {
-          nextSpatialIndex = null;
-        }
+        // The geometry's tree when another view built it; otherwise the
+        // view's next frame asks a worker for it.
+        nextSpatialIndex = hasCustomPositions && needsSpatialIndex
+          ? this._getSnapshotGeometryRecord(nextGeometryGeneration, positions).spatialIndices.get(
+            this._snapshotSpatialIndexKey(exactDimensionLevel, this._needsLodResources(-1))
+          ) ?? null
+          : null;
         nextDimensionLevel = exactDimensionLevel;
       }
 
@@ -9586,16 +7922,12 @@ export class HighPerfRenderer {
           );
         }
         gl.bindBuffer(gl.ARRAY_BUFFER, candidateBuffer);
-        gl.bufferData(
-          gl.ARRAY_BUFFER,
-          snapshotRgb,
-          gl.STATIC_DRAW
+        candidateBufferByteLength = this._uploadSnapshotColors(
+          candidateBuffer,
+          colors,
+          `HighPerfRenderer candidate snapshot "${exactId}"`,
+          this._geometryOrderRecord(candidateGeometry)
         );
-        requireCleanWebGLState(
-          gl,
-          `HighPerfRenderer candidate snapshot "${exactId}" color-buffer upload`
-        );
-        candidateBufferByteLength = snapshotRgb.byteLength;
       } else {
         candidateBuffer = acceptedColorOwner.buffer;
         candidateBufferByteLength =
@@ -9604,8 +7936,7 @@ export class HighPerfRenderer {
       if (replaceAlpha) {
         this._uploadNewSnapshotAlphaTexture(
           alphaData,
-          alphaLayout.width,
-          alphaLayout.height,
+          alphaLayout.plan,
           `HighPerfRenderer candidate snapshot "${exactId}" alpha`,
           candidateAlpha
         );
@@ -9617,25 +7948,24 @@ export class HighPerfRenderer {
         );
       }
       gl.bindVertexArray(candidateVao);
-      gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
-      gl.enableVertexAttribArray(0);
-      gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 12, 0);
+      bindPositionAttribute(gl, positionBuffer, candidateGeometry.dimension);
       gl.bindBuffer(gl.ARRAY_BUFFER, candidateBuffer);
       gl.enableVertexAttribArray(1);
       candidateColorOwner = replaceColor
         ? this._createSnapshotColorOwner(
             candidateBuffer,
-            candidateBufferByteLength
+            candidateBufferByteLength,
+            this._geometryDrawOrder(candidateGeometry)
           )
         : this._retainSnapshotColorOwner(
             acceptedColorOwner
           );
       gl.vertexAttribPointer(
         1,
-        3,
+        4,
         gl.UNSIGNED_BYTE,
         true,
-        3,
+        4,
         0
       );
       gl.bindVertexArray(null);
@@ -9645,17 +7975,6 @@ export class HighPerfRenderer {
         `HighPerfRenderer candidate snapshot "${exactId}" publication`
       );
 
-      if (notification !== null) {
-        const elapsed = performance.now() - notification.startTime;
-        settleCalculationNotification(
-          notification.notifications,
-          notification.notifId,
-          'completeCalculation',
-          `${exactDimensionLevel}D ${notification.treeName} ready (view "${exactId}")`,
-          elapsed
-        );
-        notificationCompleted = true;
-      }
     } catch (error) {
       const rollbackFailures = [];
       const rollback = operation => {
@@ -9694,14 +8013,6 @@ export class HighPerfRenderer {
         ...this._drainSnapshotRetirements(exactId)
       );
       rollback(() => gl.getError());
-      if (notification !== null && !notificationCompleted) {
-        settleCalculationNotification(
-          notification.notifications,
-          notification.notifId,
-          'failCalculation',
-          `${exactDimensionLevel}D ${notification.treeName} failed for view "${exactId}": ${describeError(error)}`
-        );
-      }
       if (rollbackFailures.length > 0) {
         this._donateSnapshotAlphaStaging(alphaData);
         throw new AggregateError(
@@ -9726,6 +8037,11 @@ export class HighPerfRenderer {
       positions: snapshot.positions,
     };
     const previousAlphaData = snapshot.alphaTexData;
+    if (replaceColor) {
+      snapshot.colors = colors;
+      // Stores kept for other orders hold the old colours.
+      this._clearKeptColorStores(snapshot.colorCache);
+    }
     snapshot.buffer = candidateBuffer;
     snapshot.bufferByteLength = candidateBufferByteLength;
     snapshot.colorOwner = candidateColorOwner;
@@ -9735,6 +8051,7 @@ export class HighPerfRenderer {
     if (replaceAlpha) {
       snapshot.alphaTexData = alphaData;
       snapshot.alphaTexHeight = alphaLayout.height;
+      snapshot.alphaTexPlan = alphaLayout.plan;
       snapshot.alphaTexWidth = alphaLayout.width;
       snapshot.alphaTexture = candidateAlpha.alphaTexture;
       snapshot.alphaTextureByteLength =
@@ -9758,11 +8075,6 @@ export class HighPerfRenderer {
 
     if (geometryChanged) {
       this.invalidateViewState(exactId);
-    }
-    if (notification !== null) {
-      console.log(
-        `[HighPerfRenderer] Rebuilt ${exactDimensionLevel}D spatial index for snapshot "${exactId}"`
-      );
     }
     return true;
   }
@@ -9789,8 +8101,13 @@ export class HighPerfRenderer {
   }
 
   /**
-   * Replace only one snapshot's RGB publication. RGBA alpha is deliberately
-   * ignored because the accepted R8 texture is an independent owner.
+   * Replace only one snapshot's colour publication. The colours' alpha byte is
+   * never read: the accepted R8 texture is the snapshot's alpha.
+   *
+   * A store this snapshot alone owns, already in the order it draws with, is
+   * rewritten in place (one gather, as an adoption rewrites it): no new
+   * buffer or vertex array per recolour. A shared store, or one in another
+   * order, is replaced.
    */
   updateSnapshotColors(id, colors) {
     this._assertOperational('update snapshot colors');
@@ -9803,6 +8120,32 @@ export class HighPerfRenderer {
       throw new Error(
         `HighPerfRenderer snapshot "${exactId}" does not exist.`
       );
+    }
+    if (snapshot.storesReleased === true) {
+      // Nothing on the GPU to rewrite: the view is rebuilt from these
+      // colours when it is next drawn.
+      requireSnapshotColors(this.pointCount, colors, `HighPerfRenderer snapshot "${exactId}" recolour`);
+      snapshot.colors = colors;
+      return true;
+    }
+    const owner = this._ensureSnapshotColorOwner(snapshot);
+    const orderRecord = this._snapshotUsesLiveGeometry(snapshot)
+      ? (this._liveOrder ?? null)
+      : (this._getSnapshotGeometryRecord(
+          snapshot.geometryGeneration,
+          snapshot.positions
+        ).order ?? null);
+    if (
+      owner.refCount === 1 &&
+      (owner.order ?? null) === (orderRecord?.drawOrder ?? null)
+    ) {
+      const label = `HighPerfRenderer snapshot "${exactId}" recolour`;
+      requireSnapshotColors(this.pointCount, colors, label);
+      this._writeOrderedColors(owner.buffer, colors, orderRecord, label);
+      snapshot.colors = colors;
+      // Stores kept for other orders hold the old colours.
+      this._clearKeptColorStores(snapshot.colorCache);
+      return true;
     }
     return this._replaceSnapshotResources(
       exactId,
@@ -9841,15 +8184,14 @@ export class HighPerfRenderer {
     const width = snapshot.alphaTexWidth;
     const height = snapshot.alphaTexHeight;
     const requiredSize = width * height;
-    const layout = { height, requiredSize, width };
+    const layout = { height, plan: snapshot.alphaTexPlan, requiredSize, width };
+    const plan = snapshot.alphaTexPlan;
     if (
       snapshot.pointCount !== this.pointCount ||
-      !Number.isSafeInteger(width) ||
-      width <= 0 ||
-      width > this.pointCount ||
-      !Number.isSafeInteger(height) ||
-      height !== Math.ceil(this.pointCount / width) ||
-      !Number.isSafeInteger(requiredSize) ||
+      !plan ||
+      plan.itemCount !== this.pointCount ||
+      width !== plan.width ||
+      height !== plan.rows ||
       !(snapshot.alphaTexData instanceof Uint8Array) ||
       snapshot.alphaTexData.length !== requiredSize ||
       (
@@ -9857,8 +8199,7 @@ export class HighPerfRenderer {
           ? snapshot.alphaTextureByteLength !== 0
           : (
             !snapshot.alphaTexture ||
-            snapshot.alphaTextureByteLength !==
-              requiredSize
+            snapshot.alphaTextureByteLength !== plan.texels
           )
       )
     ) {
@@ -9871,6 +8212,19 @@ export class HighPerfRenderer {
     const candidate = this._acquireSnapshotAlphaStaging(
       layout.requiredSize
     );
+    // Scratch owned by this method alone, re-derived on every call.
+    let dirtyRows = this._snapshotAlphaDirtyRows;
+    if (!(dirtyRows instanceof Uint8Array) || dirtyRows.length !== height) {
+      dirtyRows = new Uint8Array(height);
+      this._snapshotAlphaDirtyRows = dirtyRows;
+    } else {
+      dirtyRows.fill(0);
+    }
+    let regions = this._snapshotAlphaUploadRegions;
+    if (!(regions instanceof Int32Array) || regions.length !== height * 2) {
+      regions = new Int32Array(height * 2);
+      this._snapshotAlphaUploadRegions = regions;
+    }
     let changed;
     try {
       changed = this._encodeSnapshotAlphaData(
@@ -9878,11 +8232,21 @@ export class HighPerfRenderer {
         null,
         alphas,
         owner,
-        accepted
+        accepted,
+        dirtyRows,
+        width
       );
     } catch (error) {
       this._donateSnapshotAlphaStaging(candidate);
       throw error;
+    }
+
+    if (snapshot.storesReleased === true) {
+      // Nothing on the GPU to rewrite: the accepted bytes move, and the view
+      // is rebuilt from them when it is next drawn.
+      snapshot.alphaTexData = candidate;
+      this._donateSnapshotAlphaStaging(accepted);
+      return changed;
     }
 
     if (snapshot.alphaTexture === null) {
@@ -9893,8 +8257,7 @@ export class HighPerfRenderer {
       try {
         this._uploadNewSnapshotAlphaTexture(
           accepted,
-          layout.width,
-          layout.height,
+          snapshot.alphaTexPlan,
           `${owner} recovery`,
           recovery
         );
@@ -9932,21 +8295,33 @@ export class HighPerfRenderer {
     }
 
     if (!changed) {
+      // No byte moved, so no consumer of the visibility boundary can see a
+      // difference: the caller skips its highlight and edge work.
       this._donateSnapshotAlphaStaging(candidate);
-      return true;
+      return false;
     }
 
+    // Only the rows that moved are sent; every other row of the resident
+    // texture already holds the bytes this generation would write.
+    const regionCount = collectAlphaUploadRegions(dirtyRows, height, regions);
     try {
-      this._uploadSnapshotAlphaTextureData(
-        snapshot,
+      this._uploadAlphaRegions(
+        snapshot.alphaTexture,
+        plan,
         candidate,
+        regions,
+        regionCount,
         `${owner} publication`
       );
     } catch (publicationError) {
       try {
-        this._uploadSnapshotAlphaTextureData(
-          snapshot,
+        // Exactly the regions the failed publication could have touched.
+        this._uploadAlphaRegions(
+          snapshot.alphaTexture,
+          plan,
           accepted,
+          regions,
+          regionCount,
           `${owner} restoration`
         );
       } catch (restorationError) {
@@ -9989,7 +8364,7 @@ export class HighPerfRenderer {
 
   /**
    * Update only the positions for a snapshot buffer (for dimension switching).
-   * The existing RGB VBO and R8 texture remain independent accepted owners.
+   * The existing colour VBO and R8 texture remain independent accepted owners.
    * @param {string} id - Snapshot identifier
    * @param {Float32Array} viewPositions - New positions for the view
    * @param {number} dimensionLevel - Exact published view dimension.
@@ -10009,20 +8384,23 @@ export class HighPerfRenderer {
 
     if (
       !(viewPositions instanceof Float32Array) ||
-      viewPositions.length !== this.pointCount * 3
+      viewPositions.length !== this.pointCount * exactDimensionLevel
     ) {
       throw new TypeError(
-        `HighPerfRenderer snapshot "${exactId}" positions must contain exactly ${this.pointCount * 3} Float32 values.`
+        `HighPerfRenderer snapshot "${exactId}" positions must contain exactly ${this.pointCount * exactDimensionLevel} Float32 values.`
       );
     }
 
+    // Not forced: positions another view shows, or a retained geometry holds,
+    // are shared rather than uploaded again (`_acquireSnapshotGeometryForPositions`);
+    // a published array is immutable, so the same array is the same geometry.
     this._replaceSnapshotResources(
       exactId,
       null,
       null,
       viewPositions,
       exactDimensionLevel,
-      true,
+      false,
       false,
       false
     );
@@ -10104,8 +8482,9 @@ export class HighPerfRenderer {
   }
 
   /**
-   * Return the renderer-owned immutable CPU positions for a snapshot.
-   * Consumers must treat this reference as read-only.
+   * Return a snapshot's immutable CPU positions: its geometry generation's
+   * published array, which a snapshot of the live generation shares with the
+   * live view. Consumers must treat this reference as read-only.
    * @param {string} id - Snapshot identifier.
    * @returns {Float32Array}
    */
@@ -10124,98 +8503,20 @@ export class HighPerfRenderer {
   }
 
   /**
-   * Get a snapshot's spatial index for picking/queries.
-   * Returns a stable read-only projection of the exact main or snapshot
-   * spatial owner when already available.
+   * Build (or promote to LOD) a snapshot's spatial index for its published
+   * dimension. A snapshot's dimension is the layout of its positions, so it
+   * changes only through `updateSnapshotPositions`.
    * @param {string} id - Snapshot identifier
-   * @param {number} dimensionLevel - Exact published view dimension.
-   * @returns {SpatialIndex|null}
-   */
-  getSnapshotSpatialIndex(id, dimensionLevel) {
-    this._assertOperational('get a snapshot spatial index');
-    const exactId = requireViewId(
-      id,
-      'HighPerfRenderer snapshot id'
-    );
-    const dim = requireDimensionLevel(
-      dimensionLevel,
-      'HighPerfRenderer snapshot spatial-index dimensionLevel'
-    );
-    const snapshot = this.snapshotBuffers.get(exactId);
-    if (!snapshot) return null;
-    if (snapshot.dimensionLevel !== dim) {
-      throw new Error(
-        `HighPerfRenderer snapshot "${exactId}" owns ${snapshot.dimensionLevel}D data but received a ${dim}D spatial-index request.`
-      );
-    }
-    const spatialIndex =
-      this._getSpatialIndexForViewGeneration(exactId, dim);
-    return spatialIndex === null
-      ? null
-      : getReadOnlySpatialProjection(
-        spatialIndex,
-        `HighPerfRenderer snapshot "${exactId}" ${dim}D spatial index`
-      );
-  }
-
-  /**
-   * Publish dimension metadata for immutable snapshot geometry without
-   * re-uploading its unchanged GPU point buffer.
-   * @param {string} id - Snapshot identifier.
-   * @param {number} dimensionLevel - Exact published view dimension.
-   * @returns {boolean}
-   */
-  setSnapshotDimensionLevel(id, dimensionLevel) {
-    this._assertOperational('set a snapshot dimension');
-    const exactId = requireViewId(
-      id,
-      'HighPerfRenderer snapshot id'
-    );
-    const exactDimensionLevel = requireDimensionLevel(
-      dimensionLevel,
-      'HighPerfRenderer snapshot dimensionLevel'
-    );
-    const snapshot = this.snapshotBuffers.get(exactId);
-    if (!snapshot) {
-      throw new Error(
-        `HighPerfRenderer snapshot "${exactId}" does not exist.`
-      );
-    }
-    if (snapshot.dimensionLevel === exactDimensionLevel) {
-      return true;
-    }
-
-    if (
-      !this._snapshotUsesLiveGeometry(snapshot) &&
-      this._needsSpatialIndex(-1)
-    ) {
-      // The builder publishes only after its exact spatial owner completes.
-      // Terminal UI delivery is observational and cannot invalidate it.
-      this.rebuildSnapshotSpatialIndex(
-        exactId,
-        exactDimensionLevel
-      );
-    } else {
-      snapshot.spatialIndex = null;
-      snapshot.dimensionLevel = exactDimensionLevel;
-    }
-
-    this.invalidateViewState(exactId);
-    return true;
-  }
-
-  /**
-   * Rebuild a snapshot's spatial index for a new dimension level.
-   * Call this when changing a view's dimension to ensure LOD/frustum culling works correctly.
-   * @param {string} id - Snapshot identifier
-   * @param {number} dimensionLevel - New dimension level (1, 2, or 3)
+   * @param {number} dimensionLevel - The snapshot's published dimension (1, 2, or 3)
    * @param {boolean} [needsLOD] - Whether the exact tree must own LOD prefixes.
    * @returns {boolean} Success
    */
   rebuildSnapshotSpatialIndex(
     id,
     dimensionLevel,
-    needsLOD = this._needsLodResources(-1)
+    needsLOD = this._needsLodResources(-1),
+    prebuiltTree = null,
+    prebuiltOrder = null
   ) {
     this._assertOperational('rebuild a snapshot spatial index');
     const exactId = requireViewId(id, 'HighPerfRenderer snapshot id');
@@ -10232,23 +8533,26 @@ export class HighPerfRenderer {
     if (!snapshot) {
       throw new Error(`HighPerfRenderer snapshot "${exactId}" does not exist.`);
     }
+    if (snapshot.dimensionLevel !== exactDimensionLevel) {
+      throw new Error(
+        `HighPerfRenderer snapshot "${exactId}" owns ${snapshot.dimensionLevel}D positions; a ${exactDimensionLevel}D spatial index cannot be built over them.`
+      );
+    }
 
     // A matching geometry generation uses the dimension-specific main index.
-    // Snapshot CPU arrays are immutable copies, so reference equality is never
-    // an ownership signal.
+    // Generation, not array identity, is the ownership signal: one published
+    // array can back more than one geometry generation.
     if (this._snapshotUsesLiveGeometry(snapshot)) {
       // Clear any existing spatial index since it should use main index
       snapshot.spatialIndex = null;
-      snapshot.dimensionLevel = exactDimensionLevel;
       return true;
     }
 
-    // If we already have a valid spatial index for this positions array and dimension, don't rebuild.
+    // If we already have a valid spatial index for this positions array, don't rebuild.
     // This prevents duplicate quadtree builds when a dimension change updates positions first and then
     // calls rebuildSnapshotSpatialIndex() (common in multiview switching flows).
     if (snapshot.spatialIndex &&
-        snapshot.spatialIndex.positions === snapshot.positions &&
-        snapshot.dimensionLevel === exactDimensionLevel) {
+        snapshot.spatialIndex.positions === snapshot.positions) {
       if (
         !needsLOD ||
         (
@@ -10277,28 +8581,41 @@ export class HighPerfRenderer {
       }
     }
 
-    let candidateSpatialIndex = this._getPooledSnapshotSpatialIndex(
-      snapshot.geometryGeneration,
-      snapshot.positions,
-      exactDimensionLevel,
-      needsLOD
-    );
+    // A tree built off the main thread replaces a pooled one that does not
+    // serve (no LOD levels where they are needed); a direct rebuild
+    // promotes the pooled tree in place.
+    const pooledServing = () => {
+      const pooled = this._getSnapshotGeometryRecord(snapshot.geometryGeneration, snapshot.positions)
+        .spatialIndices.get(this._snapshotSpatialIndexKey(exactDimensionLevel, needsLOD)) ?? null;
+      return pooled !== null && (!needsLOD || spatialIndexHasLod(pooled)) ? pooled : null;
+    };
+    let candidateSpatialIndex = prebuiltTree === null
+      ? this._getPooledSnapshotSpatialIndex(
+        snapshot.geometryGeneration,
+        snapshot.positions,
+        exactDimensionLevel,
+        needsLOD
+      )
+      : pooledServing();
     if (candidateSpatialIndex === null) {
-      requireLodBuildHeapHeadroom(
-        snapshot.positions.length / 3,
-        needsLOD,
-        `HighPerfRenderer ${exactDimensionLevel}D view "${exactId}"`
-      );
-      console.log(`[HighPerfRenderer] Rebuilding ${exactDimensionLevel}D spatial index for snapshot "${exactId}"...`);
-
+      const announce = prebuiltTree === null;
+      if (announce) {
+        requireLodBuildHeapHeadroom(
+          snapshot.pointCount,
+          needsLOD,
+          `HighPerfRenderer ${exactDimensionLevel}D view "${exactId}"`
+        );
+      }
       const notifications = getNotificationCenter();
       const treeNames = { 1: 'BinaryTree', 2: 'Quadtree', 3: 'Octree' };
       const treeName = treeNames[exactDimensionLevel];
       const cellCount = snapshot.pointCount;
-      const notifId = notifications.startCalculation(
-        `Rebuilding ${exactDimensionLevel}D ${treeName} for view "${exactId}" (${cellCount.toLocaleString()} cells)`,
-        'spatial'
-      );
+      const notifId = announce
+        ? notifications.startCalculation(
+          `Rebuilding ${exactDimensionLevel}D ${treeName} for a kept view (${cellCount.toLocaleString()} cells)`,
+          'spatial'
+        )
+        : null;
       const startTime = performance.now();
 
       try {
@@ -10310,8 +8627,8 @@ export class HighPerfRenderer {
           this.options.LOD_MAX_DEPTH,
           {
             buildLOD: needsLOD,
-            buildLodNodeMappings: false,
-            computeNodeStats: false
+            prebuiltTree,
+            prebuiltOrder,
           }
         );
         this._publishPooledSnapshotSpatialIndex(
@@ -10319,28 +8636,29 @@ export class HighPerfRenderer {
           snapshot.positions,
           exactDimensionLevel,
           needsLOD,
-          candidateSpatialIndex
+          candidateSpatialIndex,
+          !announce
         );
-        const elapsed = performance.now() - startTime;
-        settleCalculationNotification(
-          notifications,
-          notifId,
-          'completeCalculation',
-          `${exactDimensionLevel}D ${treeName} ready (view "${exactId}")`,
-          elapsed
-        );
+        if (announce) {
+          settleCalculationNotification(
+            notifications,
+            notifId,
+            'completeCalculation',
+            `${exactDimensionLevel}D ${treeName} ready for a kept view`,
+            performance.now() - startTime
+          );
+        }
       } catch (error) {
-        settleCalculationNotification(
+        if (announce) settleCalculationNotification(
           notifications,
           notifId,
           'failCalculation',
-          `${exactDimensionLevel}D ${treeName} failed for view "${exactId}": ${describeError(error)}`
+          `${exactDimensionLevel}D ${treeName} failed for a kept view: ${describeError(error)}`
         );
         throw error;
       }
     }
     snapshot.spatialIndex = candidateSpatialIndex;
-    snapshot.dimensionLevel = exactDimensionLevel;
     this.invalidateViewState(exactId);
     console.log(`[HighPerfRenderer] Built ${exactDimensionLevel}D spatial index${needsLOD ? ` with ${candidateSpatialIndex.lodLevels.length} LOD levels` : ''}`);
     return true;
@@ -10375,6 +8693,10 @@ export class HighPerfRenderer {
     if (!snapshot) {
       throw new Error(`HighPerfRenderer snapshot "${exactId}" does not exist.`);
     }
+    // Drawing a view makes it the one being worked on: nothing it draws
+    // with is released under it, and a released view is rebuilt first.
+    this._snapshotInOperation = exactId;
+    this._restoreSnapshotStores(snapshot);
 
     const gl = this.gl;
     const {
@@ -10393,13 +8715,16 @@ export class HighPerfRenderer {
 
     const frameStart = performance.now();
     configureStraightAlphaBlending(gl);
+    // Whether this pass draws into a multisampled target, which decides how an
+    // opaque program antialiases its edge (`enterOpaquePointBlending`).
+    this._pointPassMultisampled = params.multisampled === true;
 
     // Get per-view state for frustum culling and LOD caching
     const viewState = this._getViewState(viewId);
 
     // Geometry-generation equality proves whether the main spatial/LOD
-    // resources index this snapshot. Snapshot arrays are immutable copies and
-    // therefore intentionally never share the live array identity.
+    // resources index this snapshot. Array identity does not: one published
+    // array can back more than one geometry generation.
     const hasCustomPositions =
       !this._snapshotUsesLiveGeometry(snapshot);
 
@@ -10431,26 +8756,9 @@ export class HighPerfRenderer {
       );
     }
 
-    if (hasCustomPositions && needsSpatialIndex) {
-      const indexStale =
-        !snapshot.spatialIndex ||
-        snapshot.spatialIndex.positions !== snapshot.positions ||
-        snapshot.spatialIndex.dimensionLevel !== dimensionLevel;
-
-      const lodMissing =
-        needsLOD &&
-        (
-          !Array.isArray(snapshot.spatialIndex?.lodLevels) ||
-          snapshot.spatialIndex.lodLevels.length === 0
-        );
-      if (indexStale || lodMissing) {
-        this.rebuildSnapshotSpatialIndex(
-          exactId,
-          dimensionLevel,
-          needsLOD
-        );
-      }
-    }
+    const customSpatialIndex = hasCustomPositions && needsSpatialIndex
+      ? this._snapshotSpatialIndexForDraw(exactId, snapshot, dimensionLevel, needsLOD)
+      : null;
 
     const effectiveDimLevel = dimensionLevel;
     const effectiveParams = exactParams;
@@ -10468,1202 +8776,115 @@ export class HighPerfRenderer {
     // Get the correct spatial index for this view's dimension level (for non-custom positions)
     // Custom positions use snapshot.spatialIndex instead
     const mainSpatialIndex = (!hasCustomPositions && needsSpatialIndex)
-      ? this._getOrBuildSpatialIndexForDimension(
-        effectiveDimLevel,
-        false,
-        needsLOD
-      )
+      ? this._liveSpatialIndexForDraw(effectiveDimLevel, needsLOD)
       : null;
 
-    // For adaptive LOD, use snapshot's spatial index for custom positions (if available)
-    // This enables LOD for 1D/2D views that have their own spatial index built from custom positions
-    const lodSpatialIndex = hasCustomPositions ? snapshot.spatialIndex : mainSpatialIndex;
-    const lodBuffersForDim =
-      this._getLodBuffersForDimension(effectiveDimLevel);
+    // A custom-position view draws with its own geometry's tree.
+    const lodSpatialIndex = hasCustomPositions ? customSpatialIndex : mainSpatialIndex;
 
     // Select LOD level based on whether LOD is enabled (consistent with render())
     // When LOD is disabled, forceLODLevel is ignored - only params.forceLOD is respected
-    // This ensures disabling LOD always returns to full detail (unless explicitly overridden per-render)
     let lodLevel;
+    viewState.lodConverging = false;
     if (this.useAdaptiveLOD) {
       // LOD enabled: Priority is this.forceLODLevel > params.forceLOD > adaptive
       lodLevel = this.forceLODLevel >= 0 ? this.forceLODLevel : forceLOD;
       if (lodLevel < 0 && lodSpatialIndex) {
-        // Pass effectiveDimLevel for correct 2D/3D diagonal calculation (uses snapshot's stored dimension for custom positions)
-        // Pass snapshot bounds when available (for custom positions that differ from octree)
+        // The view's own dimension and bounds decide the level of its tree.
         lodLevel = lodSpatialIndex.getLODLevel(cameraDistance, viewState.lastLodLevel, effectiveDimLevel, snapshot.bounds);
+        viewState.lodConverging =
+          lodSpatialIndex.getLODLevel(cameraDistance, lodLevel, effectiveDimLevel, snapshot.bounds) !== lodLevel;
       }
     } else {
       // LOD disabled: only respect explicit per-render forceLOD, otherwise full detail
       lodLevel = forceLOD >= 0 ? forceLOD : -1;
     }
-
-    // Always update per-view LOD level for highlight rendering and other consumers
-    // NOTE: lastDimensionLevel is NOT set here - it's handled inside _checkFrustumCacheValid
-    // to properly detect dimension changes and invalidate the frustum cache
-    viewState.lastLodLevel = lodLevel;
-
     if (!Number.isInteger(lodLevel) || lodLevel < -1) {
       throw new Error(
         `HighPerfRenderer selected an invalid LOD level for snapshot "${exactId}".`
       );
     }
-    const selectedSpatialLevel = lodLevel >= 0
-      ? lodSpatialIndex?.lodLevels?.[lodLevel]
-      : null;
-    if (lodLevel >= 0 && !selectedSpatialLevel) {
+    if (lodLevel >= 0 && !spatialIndexHasLod(lodSpatialIndex)) {
+      // The levels are still building: full detail until they land.
+      lodLevel = -1;
+    }
+    if (lodLevel >= 0 && !lodSpatialIndex?.lodLevels?.[lodLevel]) {
       throw new RangeError(
         `HighPerfRenderer snapshot "${exactId}" has no LOD level ${lodLevel} for ${effectiveDimLevel}D.`
       );
     }
-    let sizeMultiplier = 1.0;
-    if (lodLevel >= 0 && selectedSpatialLevel.isFullDetail !== true) {
-      sizeMultiplier = selectedSpatialLevel.sizeMultiplier;
-      if (!Number.isFinite(sizeMultiplier)) {
-        throw new TypeError(
-          `HighPerfRenderer snapshot "${exactId}" LOD sizeMultiplier must be a finite number; received ${String(sizeMultiplier)}.`
-        );
-      }
+
+    // The geometry is stored in the draw order of its tree whenever one
+    // exists, and the view's colours follow it. Until the store has adopted
+    // that order the frame draws full detail from it as it is.
+    const orderTree = lodSpatialIndex ?? (
+      hasCustomPositions
+        ? (snapshot.spatialIndex?.positions === snapshot.positions ? snapshot.spatialIndex : null)
+        : this._currentLiveTree()
+    );
+    const order = this._ensureSnapshotDrawOrder(snapshot, orderTree);
+    this._ensureSnapshotColorsInOrder(snapshot, order);
+    const ordered = lodSpatialIndex !== null && order?.drawOrder === lodSpatialIndex.drawOrder;
+    if (!ordered) lodLevel = -1;
+    viewState.lastLodLevel = lodLevel;
+    const cull = this.useFrustumCulling && ordered;
+    if (!cull) {
+      this.stats.frustumCulled = false;
+      this.stats.cullPercent = 0;
     }
 
-    // Debug LOD selection for snapshots - only log when level changes (per-view)
-    if (viewState.prevLodLevel !== lodLevel && lodSpatialIndex && (this.useAdaptiveLOD || this.forceLODLevel >= 0)) {
-      const pointCount = lodLevel < 0
-        ? snapshot.pointCount
-        : selectedSpatialLevel.pointCount;
-      const mode = this.forceLODLevel >= 0 ? 'forced' : 'auto';
-      if (DEBUG_LOD_FRUSTUM) console.log(`[LOD] Snapshot ${viewId}: level ${viewState.prevLodLevel ?? 'init'} → ${lodLevel} (${pointCount.toLocaleString()} pts, ${mode}, dim=${effectiveDimLevel})`);
-      viewState.prevLodLevel = lodLevel;
-    }
-
-    // Determine if we should use full detail or LOD
-    // Check both global LOD buffers AND the spatial index's LOD levels
-    // This allows snapshots with custom positions (and their own spatial index) to use LOD
-    // even if no global LOD buffers exist for that dimension
-    const useFullDetail =
-      lodLevel < 0 ||
-      selectedSpatialLevel.isFullDetail === true;
-
-    // Frustum culling for snapshots:
-    // - When positions match main buffer: use main octree for culling
-    // - When positions are custom (2D/1D views): use snapshot's spatial index (quadtree/binary tree)
-    if (this.useFrustumCulling) {
-      // Determine which spatial index to use
-      // and validate it before publishing a new frustum cache key.
-      const spatialIndex = hasCustomPositions
-        ? (
-        // Use snapshot's spatial index only if it exists and was built from current positions
-            snapshot.spatialIndex &&
-            snapshot.spatialIndex.positions === snapshot.positions
-              ? snapshot.spatialIndex
-              : null
-          )
-        : (
-        // Use the dimension-appropriate spatial index (quadtree for 2D, octree for 3D)
-            mainSpatialIndex
-          );
-
-      if (!spatialIndex) {
-        throw new Error(
-          `HighPerfRenderer snapshot "${exactId}" is missing the required ${effectiveDimLevel}D spatial index for frustum culling.`
-        );
-      }
-
-      // For 2D data (effectiveDimLevel <= DEPTH_TEST_DIMENSION_THRESHOLD), disable depth testing entirely
-      // to prevent draw-order artifacts. When all points have the same Z, depth testing causes visual
-      // differences at quadtree boundaries because frustum culling changes the draw order.
-      const disableDepth = effectiveDimLevel <= DEPTH_TEST_DIMENSION_THRESHOLD;
-      let frustumChanged = false;
-      let operationError = null;
-      try {
-        // Pass snapshot bounds for correct frustum margin calculation in
-        // 2D/1D views. Cache publication and all downstream work are atomic.
-        const boundsForFrustum =
-          hasCustomPositions ? snapshot.bounds : null;
+    // 2D/1D views draw without depth: every point has the same depth.
+    const disableDepth = effectiveDimLevel <= DEPTH_TEST_DIMENSION_THRESHOLD;
+    let frustumChanged = false;
+    let operationError = null;
+    try {
+      if (cull) {
         frustumChanged = this._prepareFrustumCache(
           mvpMatrix,
           viewState,
           effectiveDimLevel,
-          boundsForFrustum
+          hasCustomPositions ? snapshot.bounds : null
         );
-        const frustumPlanes = viewState.frustumPlanes;
-        if (disableDepth) {
-          gl.disable(gl.DEPTH_TEST);
-        }
-
-        if (useFullDetail) {
-          this._renderSnapshotWithFrustumCulling(
-            snapshot,
-            effectiveParams,
-            frustumPlanes,
-            viewState,
-            sizeMultiplier,
-            useAlphaTexture,
-            spatialIndex,
-            frustumChanged
-          );
-        } else {
-          this._renderSnapshotLODWithFrustumCulling(
-            snapshot,
-            lodLevel,
-            effectiveParams,
-            frustumPlanes,
-            viewState,
-            useAlphaTexture,
-            spatialIndex,
-            lodBuffersForDim,
-            frustumChanged
-          );
-        }
-      } catch (error) {
-        operationError = error;
-        if (frustumChanged) {
-          this._invalidateViewStateRecord(viewState);
-        }
       }
-
-      let restorationError = null;
-      try {
-        if (disableDepth) {
-          gl.enable(gl.DEPTH_TEST);
-        }
-      } catch (error) {
-        restorationError = error;
-      }
-      if (operationError !== null) {
-        if (restorationError !== null) {
-          throw new AggregateError(
-            [operationError, restorationError],
-            'HighPerfRenderer snapshot frustum render and depth-state restoration both failed.'
-          );
-        }
-        throw operationError;
-      }
-      if (restorationError !== null) {
-        throw restorationError;
-      }
-      this._publishFrameTiming(viewState, frameStart);
-      return returnStats ? this.getStats(viewId) : undefined;
-    }
-
-    // For 2D data (effectiveDimLevel <= 2), disable depth testing to prevent draw-order artifacts
-    // This is consistent with the frustum culling path and the main render() function
-    const disableDepth = effectiveDimLevel <= DEPTH_TEST_DIMENSION_THRESHOLD;
-
-    // No frustum culling - check if we should use LOD
-    if (!useFullDetail) {
-      let operationError = null;
-      try {
-        if (disableDepth) {
-          gl.disable(gl.DEPTH_TEST);
-        }
-        // Render with LOD using indexed drawing into snapshot buffer
-        // Use lodSpatialIndex for custom positions (snapshot.spatialIndex) or main spatial index
-        // Pass effectiveParams to ensure correct dimensionLevel is used
-        this._renderSnapshotWithLOD(snapshot, lodLevel, effectiveParams, viewState, useAlphaTexture, lodSpatialIndex, lodBuffersForDim);
-      } catch (error) {
-        operationError = error;
-      }
-      let restorationError = null;
-      try {
-        if (disableDepth) {
-          gl.enable(gl.DEPTH_TEST);
-        }
-      } catch (error) {
-        restorationError = error;
-      }
-      settlePointDraw(
-        operationError,
-        restorationError,
-        'HighPerfRenderer snapshot LOD render'
-      );
-
-      this._publishFrameTiming(viewState, frameStart);
-      return returnStats ? this.getStats(viewId) : undefined;
-    }
-
-    let operationError = null;
-    let renderResult;
-    try {
       if (disableDepth) {
         gl.disable(gl.DEPTH_TEST);
       }
-      // No frustum culling - render all points with snapshot VAO
-      const program = this.activeProgram;
-      const uniforms = this.uniformLocations.get(this.activeQuality);
-
-      if (!program || !uniforms) {
-        throw new Error(
-          `HighPerfRenderer "${this.activeQuality}" snapshot shader state is unavailable.`
-        );
-      }
-
-      gl.useProgram(program);
-
-      // Set uniforms
-      const adjustedPointSize = pointSize * sizeMultiplier;
-      if (uniforms.u_mvpMatrix !== null) gl.uniformMatrix4fv(uniforms.u_mvpMatrix, false, mvpMatrix);
-      if (uniforms.u_viewMatrix !== null) gl.uniformMatrix4fv(uniforms.u_viewMatrix, false, viewMatrix);
-      if (uniforms.u_modelMatrix !== null) gl.uniformMatrix4fv(uniforms.u_modelMatrix, false, modelMatrix);
-      if (uniforms.u_projectionMatrix !== null && projectionMatrix) gl.uniformMatrix4fv(uniforms.u_projectionMatrix, false, projectionMatrix);
-      if (uniforms.u_pointSize !== null) gl.uniform1f(uniforms.u_pointSize, adjustedPointSize);
-      if (uniforms.u_sizeAttenuation !== null) gl.uniform1f(uniforms.u_sizeAttenuation, sizeAttenuation);
-      if (uniforms.u_viewportHeight !== null) gl.uniform1f(uniforms.u_viewportHeight, viewportHeight);
-      if (uniforms.u_fov !== null) gl.uniform1f(uniforms.u_fov, fov);
-      if (uniforms.u_lightingStrength !== null) gl.uniform1f(uniforms.u_lightingStrength, lightingStrength);
-      if (uniforms.u_fogDensity !== null) gl.uniform1f(uniforms.u_fogDensity, fogDensity);
-      if (uniforms.u_fogNear !== null) gl.uniform1f(uniforms.u_fogNear, this.fogNear);
-      if (uniforms.u_fogFar !== null) gl.uniform1f(uniforms.u_fogFar, this.fogFar);
-      if (uniforms.u_fogColor !== null) gl.uniform3fv(uniforms.u_fogColor, fogColor);
-      if (uniforms.u_lightDir !== null) gl.uniform3fv(uniforms.u_lightDir, lightDir);
-
-      this._bindSnapshotAlphaTexture(
-        gl,
-        uniforms,
-        snapshot,
-        useAlphaTexture,
-        effectiveDimLevel
-      );
-
-      // Reset frustum culling stats
-      this.stats.frustumCulled = false;
-      this.stats.cullPercent = 0;
-
-      // Bind snapshot's VAO (no data upload!)
-      gl.bindVertexArray(snapshot.vao);
-      gl.drawArrays(gl.POINTS, 0, snapshot.pointCount);
-
-      // Publish the exact dimension used by non-frustum LOD consumers.
-      // This is done after rendering to ensure accurate per-view tracking without breaking cache invalidation
-      viewState.lastDimensionLevel = effectiveDimLevel;
-
-      this._writeStats(
+      this._drawPoints({
+        params: effectiveParams,
         viewState,
-        snapshot.pointCount,
+        vao: snapshot.vao,
+        pointCount: snapshot.pointCount,
+        order,
+        tree: lodSpatialIndex,
         lodLevel,
-        1,
-        false,
-        0
-      );
-      this._publishFrameTiming(viewState, frameStart);
-
-      renderResult =
-        returnStats ? this.getStats(viewId) : undefined;
+        cull,
+        frustumChanged,
+        alphaTexture: useAlphaTexture ? this._alphaTexture : snapshot.alphaTexture,
+        alphaPlan: useAlphaTexture ? this._alphaTexPlan : snapshot.alphaTexPlan,
+        label: `HighPerfRenderer view "${exactId}"`,
+      });
     } catch (error) {
       operationError = error;
+      if (frustumChanged) {
+        this._invalidateViewStateRecord(viewState);
+      }
     }
-    let cleanupFailures = null;
-    try {
-      restorePointDrawBaseline(gl, false);
-    } catch (error) {
-      cleanupFailures = [error];
-    }
+    let restorationError = null;
     try {
       if (disableDepth) {
         gl.enable(gl.DEPTH_TEST);
       }
     } catch (error) {
-      if (cleanupFailures === null) cleanupFailures = [error];
-      else cleanupFailures.push(error);
-    }
-    const restorationError = cleanupFailures === null
-      ? null
-      : (
-          cleanupFailures.length === 1
-            ? cleanupFailures[0]
-            : new AggregateError(
-                cleanupFailures,
-                'HighPerfRenderer snapshot direct-draw restoration failed.'
-              )
-        );
-    settlePointDraw(
-      operationError,
-      restorationError,
-      'HighPerfRenderer snapshot direct draw'
-    );
-    return renderResult;
-  }
-
-  /**
-   * Render snapshot with frustum culling using indexed drawing.
-   * The caller supplies the spatial index for the snapshot's exact geometry
-   * generation. Uses a per-view index buffer to avoid cross-view conflicts.
-   * @param {boolean} [useAlphaTexture=false] - If true, use the live alpha texture as an explicit override.
-   * @param {SpatialIndex} [spatialIndex] - Spatial index to use (snapshot's own or main octree)
-   * @private
-   */
-  _renderSnapshotWithFrustumCulling(
-    snapshot,
-    params,
-    frustumPlanes,
-    viewState,
-    sizeMultiplier,
-    useAlphaTexture,
-    spatialIndex,
-    frustumChanged
-  ) {
-    const gl = this.gl;
-    const {
-      mvpMatrix, viewMatrix, modelMatrix, projectionMatrix,
-      pointSize, sizeAttenuation, viewportHeight, fov,
-      lightingStrength, fogDensity, fogColor, lightDir,
-      viewId,
-      dimensionLevel
-    } = params;
-
-    const tree = spatialIndex;
-    if (!tree) {
-      throw new Error(
-        `HighPerfRenderer snapshot "${viewId}" frustum render requires an exact spatial index.`
-      );
-    }
-
-    const spatialOwnerChanged =
-      viewState.cachedVisibleSpatialOwner !== tree ||
-      viewState.cachedVisibleSpatialRoot !== tree.root ||
-      !Array.isArray(viewState.cachedVisibleNodes);
-    const fullDetailCacheChanged =
-      viewState.cachedLodIsCulled === true ||
-      viewState.cachedLodLevel !== -1 ||
-      viewState.cachedLodDimension !== dimensionLevel ||
-      viewState.cachedLodMappingGeneration !== null ||
-      !(viewState.cachedVisibleIndices instanceof Uint32Array) ||
-      viewState.cachedCulledCount !==
-        viewState.cachedVisibleIndices?.length ||
-      (
-        viewState.cachedCulledCount > 0 &&
-        viewState.indexBufferSize !== viewState.cachedCulledCount
-      );
-    let visibleNodes = null;
-    let orderedAdmissionChanged = false;
-
-    if (
-      frustumChanged ||
-      spatialOwnerChanged ||
-      fullDetailCacheChanged
-    ) {
-      const candidate = this._collectVisibleNodeCandidate(
-        viewState,
-        tree.root,
-        frustumPlanes
-      );
-      const canReuseAcceptedEbo =
-        frustumChanged &&
-        !spatialOwnerChanged &&
-        !fullDetailCacheChanged &&
-        this._hasSameOrderedVisibleNodes(
-          viewState.cachedVisibleNodes,
-          candidate
-        );
-      if (canReuseAcceptedEbo) {
-        this._recycleVisibleNodeCandidate(viewState, candidate);
-      } else {
-        visibleNodes = candidate;
-        orderedAdmissionChanged = true;
-      }
-    }
-
-    const needsUpdate =
-      spatialOwnerChanged ||
-      fullDetailCacheChanged ||
-      orderedAdmissionChanged;
-
-    if (needsUpdate) {
-      try {
-        if (!Array.isArray(visibleNodes)) {
-          throw new Error(
-            `HighPerfRenderer snapshot "${viewId}" frustum leaf admission is unavailable.`
-          );
-        }
-        if (visibleNodes.length === 0) {
-          const emptyIndices =
-            viewState.cachedVisibleIndices instanceof Uint32Array &&
-            viewState.cachedVisibleIndices.length === 0
-              ? viewState.cachedVisibleIndices
-              : new Uint32Array(0);
-          this._acceptVisibleNodeCandidate(viewState, visibleNodes);
-          viewState.cachedVisibleSpatialOwner = tree;
-          viewState.cachedVisibleSpatialRoot = tree.root;
-          viewState.cachedCulledCount = 0;
-          viewState.cachedVisibleIndices = emptyIndices;
-          viewState.cachedLodVisibleIndices = null;
-          viewState.cachedLodLevel = -1;
-          viewState.cachedLodDimension = dimensionLevel;
-          viewState.cachedLodIsCulled = false;
-          viewState.cachedLodMappingGeneration = null;
-          viewState._noVisibleNodesWarned = false;
-          this._writeStats(viewState, 0, -1, 0, true, 100);
-          return;
-        }
-
-        // Count total visible points
-        let totalVisible = 0;
-        for (const node of visibleNodes) {
-          if (node.indices) totalVisible += node.indices.length;
-        }
-
-        this._ensureVisibleIndexScratch(
-          viewState,
-          totalVisible,
-          false
-        );
-
-        let writeOffset = 0;
-        for (const node of visibleNodes) {
-          if (node.indices) {
-            viewState.visibleIndicesBuffer.set(node.indices, writeOffset);
-            writeOffset += node.indices.length;
-          }
-        }
-
-        const visibleIndices = viewState.visibleIndicesBuffer.subarray(0, totalVisible);
-        const visibleRatio = snapshot.pointCount === 0
-          ? 0
-          : totalVisible / snapshot.pointCount;
-        const cullPercent = ((1 - visibleRatio) * 100);
-
-        // Log only on significant change (>10% of total points)
-        if (DEBUG_LOD_FRUSTUM && this._isSignificantChange(viewState.lastVisibleCount, visibleIndices.length, snapshot.pointCount)) {
-          console.log(`[FrustumCulling] Snapshot ${viewId}: ${visibleIndices.length.toLocaleString()}/${snapshot.pointCount.toLocaleString()} visible (${cullPercent.toFixed(1)}% culled)`);
-          viewState.lastVisibleCount = visibleIndices.length;
-        }
-
-        // GPU acceptance is the publication boundary.
-        this._uploadToViewIndexBuffer(viewState, visibleIndices);
-        this._acceptVisibleNodeCandidate(viewState, visibleNodes);
-        viewState.cachedVisibleSpatialOwner = tree;
-        viewState.cachedVisibleSpatialRoot = tree.root;
-        viewState.cachedCulledCount = visibleIndices.length;
-        viewState._noVisibleNodesWarned = false;
-        viewState.cachedVisibleIndices = visibleIndices;
-        viewState.cachedLodVisibleIndices = null;
-        viewState.cachedLodLevel = -1;
-        viewState.cachedLodDimension = dimensionLevel;
-        viewState.cachedLodIsCulled = false;
-        viewState.cachedLodMappingGeneration = null;
-        this.stats.frustumCulled = true;
-        this.stats.cullPercent = cullPercent;
-      } catch (error) {
-        this._invalidateViewStateRecord(viewState);
-        throw error;
-      }
-    }
-
-    if (viewState.cachedCulledCount === 0) {
-      this._writeStats(viewState, 0, -1, 0, true, 100);
-      return;
-    }
-
-    const program = this.activeProgram;
-    const uniforms = this.uniformLocations.get(this.activeQuality);
-
-    if (!program || !uniforms) {
-      throw new Error(
-        `HighPerfRenderer "${this.activeQuality}" snapshot frustum shader state is unavailable.`
-      );
-    }
-
-    gl.useProgram(program);
-
-    const adjustedPointSize = pointSize * sizeMultiplier;
-    if (uniforms.u_mvpMatrix !== null) gl.uniformMatrix4fv(uniforms.u_mvpMatrix, false, mvpMatrix);
-    if (uniforms.u_viewMatrix !== null) gl.uniformMatrix4fv(uniforms.u_viewMatrix, false, viewMatrix);
-    if (uniforms.u_modelMatrix !== null) gl.uniformMatrix4fv(uniforms.u_modelMatrix, false, modelMatrix);
-    if (uniforms.u_projectionMatrix !== null && projectionMatrix) gl.uniformMatrix4fv(uniforms.u_projectionMatrix, false, projectionMatrix);
-    if (uniforms.u_pointSize !== null) gl.uniform1f(uniforms.u_pointSize, adjustedPointSize);
-    if (uniforms.u_sizeAttenuation !== null) gl.uniform1f(uniforms.u_sizeAttenuation, sizeAttenuation);
-    if (uniforms.u_viewportHeight !== null) gl.uniform1f(uniforms.u_viewportHeight, viewportHeight);
-    if (uniforms.u_fov !== null) gl.uniform1f(uniforms.u_fov, fov);
-    if (uniforms.u_lightingStrength !== null) gl.uniform1f(uniforms.u_lightingStrength, lightingStrength);
-    if (uniforms.u_fogDensity !== null) gl.uniform1f(uniforms.u_fogDensity, fogDensity);
-    if (uniforms.u_fogNear !== null) gl.uniform1f(uniforms.u_fogNear, this.fogNear);
-    if (uniforms.u_fogFar !== null) gl.uniform1f(uniforms.u_fogFar, this.fogFar);
-    if (uniforms.u_fogColor !== null) gl.uniform3fv(uniforms.u_fogColor, fogColor);
-    if (uniforms.u_lightDir !== null) gl.uniform3fv(uniforms.u_lightDir, lightDir);
-
-    // Defensive check: ensure index buffer is valid before drawing
-    if (viewState.indexBufferSize !== viewState.cachedCulledCount) {
-      throw new Error(
-        `HighPerfRenderer snapshot "${viewId}" frustum index buffer contains ${viewState.indexBufferSize} entries but ${viewState.cachedCulledCount} are required.`
-      );
-    }
-
-    let operationError = null;
-    try {
-      this._bindSnapshotAlphaTexture(
-        gl,
-        uniforms,
-        snapshot,
-        useAlphaTexture,
-        dimensionLevel
-      );
-      gl.bindVertexArray(snapshot.vao);
-      gl.bindBuffer(
-        gl.ELEMENT_ARRAY_BUFFER,
-        viewState.indexBuffer
-      );
-      gl.drawElements(
-        gl.POINTS,
-        viewState.cachedCulledCount,
-        gl.UNSIGNED_INT,
-        0
-      );
-    } catch (error) {
-      operationError = error;
-    }
-    let restorationError = null;
-    try {
-      restorePointDrawBaseline(gl, true);
-    } catch (error) {
       restorationError = error;
     }
     settlePointDraw(
       operationError,
       restorationError,
-      'HighPerfRenderer snapshot frustum draw'
+      'HighPerfRenderer snapshot render'
     );
-
-    // Update both global and per-view stats
-    this._writeStats(
-      viewState,
-      viewState.cachedCulledCount,
-      -1,
-      1,
-      true,
-      snapshot.pointCount === 0
-        ? 100
-        : 100 * (
-            1 -
-            viewState.cachedCulledCount / snapshot.pointCount
-          )
-    );
-  }
-
-  /**
-   * Render snapshot with LOD (no frustum culling).
-   * Uses indexed drawing into the snapshot buffer with LOD-selected indices.
-   * @param {boolean} [useAlphaTexture=false] - If true, use alpha texture for real-time filter updates
-   * @param {SpatialIndex} [spatialIndex] - Spatial index to use (for LOD levels)
-   * @param {Array} [lodBuffersForDim] - LOD buffers for the view's dimension level
-   * @private
-   */
-  _renderSnapshotWithLOD(
-    snapshot,
-    lodLevel,
-    params,
-    viewState,
-    useAlphaTexture,
-    spatialIndex,
-    lodBuffersForDim
-  ) {
-    const gl = this.gl;
-    const dimensionLevel = requireDimensionLevel(
-      params.dimensionLevel,
-      'HighPerfRenderer snapshot LOD dimensionLevel'
-    );
-    if (!Array.isArray(lodBuffersForDim)) {
-      throw new TypeError(
-        'HighPerfRenderer snapshot LOD buffers must be an exact array.'
-      );
-    }
-    const lodBuffers = lodBuffersForDim;
-    const tree = spatialIndex;
-    if (!tree) {
-      throw new Error(
-        `HighPerfRenderer snapshot "${params.viewId}" LOD render requires an exact spatial index.`
-      );
-    }
-
-    // Main-position snapshots may use their pre-uploaded LOD index buffer.
-    const lod = lodBuffers[lodLevel];
-
-    const treeLevel = tree.lodLevels[lodLevel];
-    if (
-      !treeLevel ||
-      treeLevel.isFullDetail ||
-      !(treeLevel.indices instanceof Uint32Array)
-    ) {
-      throw new Error(
-        `HighPerfRenderer snapshot "${params.viewId}" LOD ${lodLevel} is not an exact indexed LOD level.`
-      );
-    }
-
-    const {
-      mvpMatrix, viewMatrix, modelMatrix, projectionMatrix,
-      pointSize, sizeAttenuation, viewportHeight, fov,
-      lightingStrength, fogDensity, fogColor, lightDir
-    } = params;
-
-    // Check structural selection first; exact resource/spatial ownership is
-    // included below so same-level replacement generations cannot be missed.
-    const lodLevelChanged = viewState.cachedLodLevel !== lodLevel;
-    const wasFrustumCulled = viewState.cachedLodIsCulled;
-    const dimensionChanged = viewState.cachedLodDimension !== -1 && viewState.cachedLodDimension !== dimensionLevel;
-
-    // Determine if we can use pre-cached index buffer (main spatial index, not snapshot-specific)
-    // Pre-cached buffers are stored in lodBuffers and match the main spatial index
-    const usingMainSpatialIndex =
-      spatialIndex === this.spatialIndices.get(dimensionLevel);
-    const hasPreCachedBuffer = lod && lod.originalIndexBuffer && lod.originalIndexCount > 0;
-    const canUsePreCachedBuffer = usingMainSpatialIndex && hasPreCachedBuffer;
-    const generationToken =
-      canUsePreCachedBuffer
-        ? lod.generationToken ?? null
-        : null;
-    const borrowedGenerationChanged =
-      canUsePreCachedBuffer &&
-      (
-        viewState.usePreCachedIndexBuffer !== true ||
-        viewState.preCachedIndexBuffer !==
-          lod.originalIndexBuffer ||
-        viewState.preCachedGenerationToken !== generationToken ||
-        viewState.preCachedSpatialOwner !== spatialIndex
-      );
-    const perViewOwnerChanged =
-      !canUsePreCachedBuffer &&
-      (
-        viewState.usePreCachedIndexBuffer === true ||
-        viewState.preCachedSpatialOwner !== spatialIndex
-      );
-    const needsBufferUpdate =
-      lodLevelChanged ||
-      wasFrustumCulled ||
-      dimensionChanged ||
-      borrowedGenerationChanged ||
-      perViewOwnerChanged;
-
-    if (needsBufferUpdate) {
-      if (canUsePreCachedBuffer) {
-        // USE PRE-CACHED INDEX BUFFER: No upload needed, just bind directly during draw
-        // This eliminates the expensive gl.bufferData call on LOD level change
-        viewState.cachedCulledCount = lod.originalIndexCount;
-        viewState.cachedLodLevel = lodLevel;
-        viewState.cachedLodDimension = dimensionLevel;
-        viewState.cachedLodIsCulled = false;
-        viewState.usePreCachedIndexBuffer = true;  // Flag to use pre-cached buffer during draw
-        viewState.preCachedIndexBuffer = lod.originalIndexBuffer;
-        viewState.preCachedGenerationToken = generationToken;
-        viewState.preCachedSpatialOwner = spatialIndex;
-      } else {
-        const lodOriginalIndices = treeLevel.indices;
-        this._uploadToViewIndexBuffer(viewState, lodOriginalIndices);
-        viewState.cachedCulledCount = lodOriginalIndices.length;
-        viewState.cachedLodLevel = lodLevel;
-        viewState.cachedLodDimension = dimensionLevel;
-        viewState.cachedLodIsCulled = false;
-        viewState.usePreCachedIndexBuffer = false;
-        viewState.preCachedIndexBuffer = null;
-        viewState.preCachedGenerationToken = null;
-        viewState.preCachedSpatialOwner = spatialIndex;
-      }
-    }
-
-    const sizeMultiplier = treeLevel.sizeMultiplier;
-    if (!Number.isFinite(sizeMultiplier)) {
-      throw new TypeError(
-        `HighPerfRenderer snapshot "${params.viewId}" LOD sizeMultiplier must be a finite number; received ${String(sizeMultiplier)}.`
-      );
-    }
-    const adjustedPointSize = pointSize * sizeMultiplier;
-
-    const program = this.activeProgram;
-    const uniforms = this.uniformLocations.get(this.activeQuality);
-
-    if (!program || !uniforms) {
-      throw new Error(
-        `HighPerfRenderer "${this.activeQuality}" snapshot LOD shader state is unavailable.`
-      );
-    }
-
-    gl.useProgram(program);
-
-    if (uniforms.u_mvpMatrix !== null) gl.uniformMatrix4fv(uniforms.u_mvpMatrix, false, mvpMatrix);
-    if (uniforms.u_viewMatrix !== null) gl.uniformMatrix4fv(uniforms.u_viewMatrix, false, viewMatrix);
-    if (uniforms.u_modelMatrix !== null) gl.uniformMatrix4fv(uniforms.u_modelMatrix, false, modelMatrix);
-    if (uniforms.u_projectionMatrix !== null && projectionMatrix) gl.uniformMatrix4fv(uniforms.u_projectionMatrix, false, projectionMatrix);
-    if (uniforms.u_pointSize !== null) gl.uniform1f(uniforms.u_pointSize, adjustedPointSize);
-    if (uniforms.u_sizeAttenuation !== null) gl.uniform1f(uniforms.u_sizeAttenuation, sizeAttenuation);
-    if (uniforms.u_viewportHeight !== null) gl.uniform1f(uniforms.u_viewportHeight, viewportHeight);
-    if (uniforms.u_fov !== null) gl.uniform1f(uniforms.u_fov, fov);
-    if (uniforms.u_lightingStrength !== null) gl.uniform1f(uniforms.u_lightingStrength, lightingStrength);
-    if (uniforms.u_fogDensity !== null) gl.uniform1f(uniforms.u_fogDensity, fogDensity);
-    if (uniforms.u_fogNear !== null) gl.uniform1f(uniforms.u_fogNear, this.fogNear);
-    if (uniforms.u_fogFar !== null) gl.uniform1f(uniforms.u_fogFar, this.fogFar);
-    if (uniforms.u_fogColor !== null) gl.uniform3fv(uniforms.u_fogColor, fogColor);
-    if (uniforms.u_lightDir !== null) gl.uniform3fv(uniforms.u_lightDir, lightDir);
-
-    // Use pre-cached index buffer if available (eliminates upload on LOD change)
-    let drawIndexBuffer;
-    if (viewState.usePreCachedIndexBuffer) {
-      if (
-        !viewState.preCachedIndexBuffer ||
-        viewState.cachedCulledCount !== treeLevel.indices.length
-      ) {
-        throw new Error(
-          `HighPerfRenderer snapshot "${params.viewId}" pre-uploaded LOD index ownership is invalid.`
-        );
-      }
-      drawIndexBuffer = viewState.preCachedIndexBuffer;
-    } else {
-      if (
-        !viewState.indexBuffer ||
-        viewState.indexBufferSize !== viewState.cachedCulledCount
-      ) {
-        throw new Error(
-          `HighPerfRenderer snapshot "${params.viewId}" per-view LOD index ownership is invalid.`
-        );
-      }
-      drawIndexBuffer = viewState.indexBuffer;
-    }
-    // Snapshot EBOs contain source IDs, so alpha uses gl_VertexID directly.
-    let operationError = null;
-    try {
-      this._bindSnapshotAlphaTexture(
-        gl,
-        uniforms,
-        snapshot,
-        useAlphaTexture,
-        dimensionLevel
-      );
-      gl.bindVertexArray(snapshot.vao);
-      gl.bindBuffer(
-        gl.ELEMENT_ARRAY_BUFFER,
-        drawIndexBuffer
-      );
-      gl.drawElements(
-        gl.POINTS,
-        viewState.cachedCulledCount,
-        gl.UNSIGNED_INT,
-        0
-      );
-    } catch (error) {
-      operationError = error;
-    }
-    let restorationError = null;
-    try {
-      restorePointDrawBaseline(gl, true);
-    } catch (error) {
-      restorationError = error;
-    }
-    settlePointDraw(
-      operationError,
-      restorationError,
-      'HighPerfRenderer snapshot LOD draw'
-    );
-
-    // Update both global and per-view stats
-    this._writeStats(
-      viewState,
-      viewState.cachedCulledCount,
-      lodLevel,
-      1,
-      false,
-      0
-    );
-  }
-
-  /**
-   * Render snapshot with combined LOD and frustum culling.
-   * Uses indexed drawing into the snapshot buffer with filtered indices.
-   * @param {boolean} useAlphaTexture - Whether the exact alpha texture contract is active
-   * @param {SpatialIndex} spatialIndex - Spatial index owned by this snapshot render
-   * @param {Array} lodBuffersForDim - LOD buffers for the exact view dimension
-   * @private
-   */
-  _renderSnapshotLODWithFrustumCulling(
-    snapshot,
-    lodLevel,
-    params,
-    frustumPlanes,
-    viewState,
-    useAlphaTexture,
-    spatialIndex,
-    lodBuffersForDim,
-    frustumChanged
-  ) {
-    const gl = this.gl;
-    const dimLevel = requireDimensionLevel(
-      params.dimensionLevel,
-      'HighPerfRenderer snapshot LOD/frustum dimensionLevel'
-    );
-    if (!Array.isArray(lodBuffersForDim)) {
-      throw new TypeError(
-        'HighPerfRenderer snapshot LOD/frustum buffers must be an exact array.'
-      );
-    }
-    if (typeof frustumChanged !== 'boolean') {
-      throw new TypeError(
-        'HighPerfRenderer snapshot LOD/frustum cache state must be a boolean.'
-      );
-    }
-
-    const tree = spatialIndex;
-    if (!tree) {
-      throw new Error(
-        `HighPerfRenderer snapshot "${params.viewId}" LOD/frustum render requires an exact spatial index.`
-      );
-    }
-
-    if (!Number.isInteger(lodLevel) || lodLevel < 0) {
-      throw new RangeError(
-        `HighPerfRenderer snapshot "${params.viewId}" LOD level must be a non-negative integer.`
-      );
-    }
-
-    const treeLevel = tree.lodLevels[lodLevel];
-    if (
-      !treeLevel ||
-      treeLevel.isFullDetail ||
-      !(treeLevel.indices instanceof Uint32Array) ||
-      treeLevel.indices.length !== treeLevel.pointCount
-    ) {
-      throw new Error(
-        `HighPerfRenderer snapshot "${params.viewId}" LOD ${lodLevel} is not an exact indexed LOD level.`
-      );
-    }
-
-    const {
-      mvpMatrix, viewMatrix, modelMatrix, projectionMatrix,
-      pointSize, sizeAttenuation, viewportHeight, fov,
-      lightingStrength, fogDensity, fogColor, lightDir,
-      viewId,
-      dimensionLevel
-    } = params;
-
-    // Snapshot EBOs address the full source-order VAO, while the live LOD VAO
-    // is compact. Reuse its exact leaf/rank mapping, then translate only the
-    // admitted compact ranks through the one maximum-prefix original-ID
-    // owner. This avoids both a potentially multi-million-entry Set and two
-    // whole-prefix scans on every camera/LOD transition.
-    tree.ensureLodNodeMappings();
-    this._ensureLodResourceOwnershipState();
-    const unvalidatedMappingToken =
-      tree._lodNodeMapping?.generationToken ?? null;
-    if (
-      this._validatedLodNodeMappings.get(tree) !==
-      unvalidatedMappingToken
-    ) {
-      const validatedToken = tree._validateLodNodeMapping();
-      this._validatedLodNodeMappings.set(tree, validatedToken);
-    }
-    const mappingOwner = tree._lodNodeMapping;
-    const mappingToken = mappingOwner?.generationToken ?? null;
-    const maximumOriginalIndices = mappingOwner?.maximumIndices;
-    if (
-      mappingToken === null ||
-      this._validatedLodNodeMappings.get(tree) !== mappingToken ||
-      !(maximumOriginalIndices instanceof Uint32Array)
-    ) {
-      throw new Error(
-        `HighPerfRenderer snapshot "${viewId}" LOD mapping generation is unavailable.`
-      );
-    }
-
-    const spatialOwnerChanged =
-      viewState.cachedVisibleSpatialOwner !== tree ||
-      viewState.cachedVisibleSpatialRoot !== tree.root ||
-      !Array.isArray(viewState.cachedVisibleNodes);
-    const lodCacheChanged =
-      viewState.cachedLodLevel !== lodLevel ||
-      viewState.cachedLodDimension !== dimLevel ||
-      viewState.cachedLodIsCulled !== true ||
-      viewState.cachedLodMappingGeneration !== mappingToken ||
-      !(viewState.cachedLodVisibleIndices instanceof Uint32Array) ||
-      viewState.cachedCulledCount !==
-        viewState.cachedLodVisibleIndices?.length ||
-      (
-        viewState.cachedCulledCount > 0 &&
-        viewState.indexBufferSize !== viewState.cachedCulledCount
-      );
-    let visibleNodes = viewState.cachedVisibleNodes;
-    let candidateToAccept = null;
-    let lodAdmissionChanged = false;
-
-    if (frustumChanged || spatialOwnerChanged) {
-      const candidate = this._collectVisibleNodeCandidate(
-        viewState,
-        tree.root,
-        frustumPlanes
-      );
-      const sameLodAdmission =
-        !spatialOwnerChanged &&
-        tree.hasSameLodVisibleLeafSet(
-          viewState.cachedVisibleNodes,
-          candidate
-        );
-      if (sameLodAdmission) {
-        this._recycleVisibleNodeCandidate(viewState, candidate);
-      } else {
-        visibleNodes = candidate;
-        candidateToAccept = candidate;
-        lodAdmissionChanged = true;
-      }
-    }
-
-    if (
-      spatialOwnerChanged ||
-      lodCacheChanged ||
-      lodAdmissionChanged
-    ) {
-      try {
-        if (!Array.isArray(visibleNodes)) {
-          throw new Error(
-            `HighPerfRenderer snapshot "${viewId}" LOD leaf admission is unavailable.`
-          );
-        }
-        if (visibleNodes.length === 0) {
-          const emptyLodScratch =
-            this._ensureVisibleLodIndexScratch(viewState, 0);
-          if (candidateToAccept) {
-            this._acceptVisibleNodeCandidate(
-              viewState,
-              candidateToAccept
-            );
-          }
-          viewState.cachedVisibleSpatialOwner = tree;
-          viewState.cachedVisibleSpatialRoot = tree.root;
-          viewState.cachedLodMappingGeneration = mappingToken;
-          viewState.cachedCulledCount = 0;
-          viewState.cachedLodVisibleIndices =
-            emptyLodScratch.subarray(0, 0);
-          viewState.cachedLodLevel = lodLevel;
-          viewState.cachedLodDimension = dimLevel;
-          viewState.cachedLodIsCulled = true;
-          viewState.usePreCachedIndexBuffer = false;
-          viewState.preCachedIndexBuffer = null;
-          viewState.preCachedGenerationToken = null;
-          viewState.preCachedSpatialOwner = null;
-          viewState._noVisibleNodesWarned = false;
-          this._writeStats(
-            viewState,
-            0,
-            lodLevel,
-            0,
-            true,
-            100
-          );
-          return;
-        }
-
-        const visibleCount = tree.countLodMappedIndices(
-          visibleNodes,
-          lodLevel
-        );
-        const totalLodPoints = treeLevel.pointCount;
-        if (
-          !Number.isSafeInteger(visibleCount) ||
-          visibleCount < 0 ||
-          visibleCount > totalLodPoints
-        ) {
-          throw new RangeError(
-            `HighPerfRenderer snapshot LOD ${lodLevel} mapping counted invalid visibility ${String(visibleCount)} for prefix ${totalLodPoints}.`
-          );
-        }
-        const visibleRatio = totalLodPoints === 0
-          ? 0
-          : visibleCount / totalLodPoints;
-        const cullPercent = ((1 - visibleRatio) * 100);
-
-        // This per-view scratch is the only visibility-sized CPU owner. Its
-        // shared live/snapshot policy grows from admitted points and releases
-        // materially oversized wide-frustum retention with hysteresis.
-        const visibleLodIndices =
-          this._ensureVisibleLodIndexScratch(
-            viewState,
-            visibleCount
-          );
-
-        const writtenCount = tree.writeLodMappedIndices(
-          visibleNodes,
-          lodLevel,
-          visibleLodIndices
-        );
-        if (writtenCount !== visibleCount) {
-          throw new Error(
-            `HighPerfRenderer snapshot LOD ${lodLevel} mapping counted ${visibleCount} indices but wrote ${writtenCount}.`
-          );
-        }
-
-        // writeLodMappedIndices emits compact ranks in the same deterministic
-        // order consumed by live rendering. Translate in place so the
-        // snapshot's full source-order VAO receives the corresponding
-        // original IDs without allocating another O(N) projection.
-        for (let index = 0; index < visibleCount; index++) {
-          const compactRank = visibleLodIndices[index];
-          if (
-            compactRank >= totalLodPoints ||
-            compactRank >= maximumOriginalIndices.length
-          ) {
-            throw new RangeError(
-              `HighPerfRenderer snapshot LOD ${lodLevel} mapping emitted compact rank ${compactRank} outside prefix ${totalLodPoints}.`
-            );
-          }
-          visibleLodIndices[index] =
-            maximumOriginalIndices[compactRank];
-        }
-        const visibleLodIndicesView =
-          visibleLodIndices.subarray(0, visibleCount);
-
-        if (DEBUG_LOD_FRUSTUM && this._isSignificantChange(viewState.lastVisibleCount, visibleCount, totalLodPoints)) {
-          console.log(`[LOD+Frustum] Snapshot ${viewId}: LOD ${lodLevel} - ${visibleCount.toLocaleString()}/${totalLodPoints.toLocaleString()} visible (${cullPercent.toFixed(1)}% culled)`);
-          viewState.lastVisibleCount = visibleCount;
-        }
-
-        // GPU acceptance is the publication boundary. A failure invalidates
-        // the advanced MVP/LOD keys, so the next frame re-traverses and
-        // retries instead of drawing the previously accepted topology.
-        this._uploadToViewIndexBuffer(
-          viewState,
-          visibleLodIndicesView
-        );
-        if (candidateToAccept) {
-          this._acceptVisibleNodeCandidate(
-            viewState,
-            candidateToAccept
-          );
-        }
-        viewState.cachedVisibleSpatialOwner = tree;
-        viewState.cachedVisibleSpatialRoot = tree.root;
-        viewState.cachedLodMappingGeneration = mappingToken;
-        viewState.cachedLodVisibleIndices =
-          visibleLodIndicesView;
-        viewState.cachedCulledCount = visibleCount;
-        viewState.cachedLodLevel = lodLevel;
-        viewState.cachedLodDimension = dimLevel;
-        viewState.cachedLodIsCulled = true;
-        viewState.usePreCachedIndexBuffer = false;
-        viewState.preCachedIndexBuffer = null;
-        viewState.preCachedGenerationToken = null;
-        viewState.preCachedSpatialOwner = null;
-        viewState._noVisibleNodesWarned = false;
-        this.stats.frustumCulled = true;
-        this.stats.cullPercent = cullPercent;
-      } catch (error) {
-        this._invalidateViewStateRecord(viewState);
-        throw error;
-      }
-    }
-
-    if (
-      !(viewState.cachedLodVisibleIndices instanceof Uint32Array) ||
-      viewState.cachedCulledCount !==
-        viewState.cachedLodVisibleIndices.length ||
-      viewState.cachedLodLevel !== lodLevel ||
-      viewState.cachedLodDimension !== dimLevel ||
-      viewState.cachedLodIsCulled !== true ||
-      viewState.cachedVisibleSpatialOwner !== tree ||
-      viewState.cachedVisibleSpatialRoot !== tree.root ||
-      viewState.cachedLodMappingGeneration !== mappingToken
-    ) {
-      throw new Error(
-        `HighPerfRenderer snapshot "${viewId}" LOD/frustum visibility state is inconsistent.`
-      );
-    }
-
-    if (viewState.cachedCulledCount === 0) {
-      this._writeStats(
-        viewState,
-        0,
-        lodLevel,
-        0,
-        true,
-        100
-      );
-      return;
-    }
-
-    const sizeMultiplier = treeLevel.sizeMultiplier;
-    if (!Number.isFinite(sizeMultiplier)) {
-      throw new TypeError(
-        `HighPerfRenderer snapshot "${viewId}" LOD sizeMultiplier must be a finite number; received ${String(sizeMultiplier)}.`
-      );
-    }
-    const adjustedPointSize = pointSize * sizeMultiplier;
-
-    const program = this.activeProgram;
-    const uniforms = this.uniformLocations.get(this.activeQuality);
-
-    if (!program || !uniforms) {
-      throw new Error(
-        `HighPerfRenderer "${this.activeQuality}" snapshot LOD/frustum shader state is unavailable.`
-      );
-    }
-
-    gl.useProgram(program);
-
-    if (uniforms.u_mvpMatrix !== null) gl.uniformMatrix4fv(uniforms.u_mvpMatrix, false, mvpMatrix);
-    if (uniforms.u_viewMatrix !== null) gl.uniformMatrix4fv(uniforms.u_viewMatrix, false, viewMatrix);
-    if (uniforms.u_modelMatrix !== null) gl.uniformMatrix4fv(uniforms.u_modelMatrix, false, modelMatrix);
-    if (uniforms.u_projectionMatrix !== null && projectionMatrix) gl.uniformMatrix4fv(uniforms.u_projectionMatrix, false, projectionMatrix);
-    if (uniforms.u_pointSize !== null) gl.uniform1f(uniforms.u_pointSize, adjustedPointSize);
-    if (uniforms.u_sizeAttenuation !== null) gl.uniform1f(uniforms.u_sizeAttenuation, sizeAttenuation);
-    if (uniforms.u_viewportHeight !== null) gl.uniform1f(uniforms.u_viewportHeight, viewportHeight);
-    if (uniforms.u_fov !== null) gl.uniform1f(uniforms.u_fov, fov);
-    if (uniforms.u_lightingStrength !== null) gl.uniform1f(uniforms.u_lightingStrength, lightingStrength);
-    if (uniforms.u_fogDensity !== null) gl.uniform1f(uniforms.u_fogDensity, fogDensity);
-    if (uniforms.u_fogNear !== null) gl.uniform1f(uniforms.u_fogNear, this.fogNear);
-    if (uniforms.u_fogFar !== null) gl.uniform1f(uniforms.u_fogFar, this.fogFar);
-    if (uniforms.u_fogColor !== null) gl.uniform3fv(uniforms.u_fogColor, fogColor);
-    if (uniforms.u_lightDir !== null) gl.uniform3fv(uniforms.u_lightDir, lightDir);
-
-    if (
-      !viewState.indexBuffer ||
-      viewState.indexBufferSize !== viewState.cachedCulledCount
-    ) {
-      throw new Error(
-        `HighPerfRenderer snapshot "${viewId}" per-view LOD/frustum index ownership is invalid.`
-      );
-    }
-
-    let operationError = null;
-    try {
-      this._bindSnapshotAlphaTexture(
-        gl,
-        uniforms,
-        snapshot,
-        useAlphaTexture,
-        dimensionLevel
-      );
-      gl.bindVertexArray(snapshot.vao);
-      gl.bindBuffer(
-        gl.ELEMENT_ARRAY_BUFFER,
-        viewState.indexBuffer
-      );
-      gl.drawElements(
-        gl.POINTS,
-        viewState.cachedCulledCount,
-        gl.UNSIGNED_INT,
-        0
-      );
-    } catch (error) {
-      operationError = error;
-    }
-    let restorationError = null;
-    try {
-      restorePointDrawBaseline(gl, true);
-    } catch (error) {
-      restorationError = error;
-    }
-    settlePointDraw(
-      operationError,
-      restorationError,
-      'HighPerfRenderer snapshot LOD/frustum draw'
-    );
-
-    // Update both global and per-view stats
-    this._writeStats(
-      viewState,
-      viewState.cachedCulledCount,
-      lodLevel,
-      1,
-      true,
-      treeLevel.indices.length === 0
-        ? 100
-        : 100 * (
-            1 -
-            viewState.cachedCulledCount / treeLevel.indices.length
-          )
-    );
+    viewState.lastDimensionLevel = effectiveDimLevel;
+    this._publishFrameTiming(viewState, frameStart);
+    return returnStats ? this.getStats(viewId) : undefined;
   }
 
   /**
@@ -11697,25 +8918,21 @@ export class HighPerfRenderer {
    * @private
    */
   _detachContextLostOwnership() {
-    this.programs = {
-      full: null,
-      light: null,
-      ultralight: null,
-    };
+    this.programs = createEmptyPointPrograms();
     this.activeProgram = null;
     this.uniformLocations = new Map();
     this.vao = null;
     this.buffers = {
-      interleaved: null,
       positions: null,
       colors: null,
-      alphas: null,
     };
-    this._interleavedGpuByteLength = 0;
+    this._positionGpuByteLength = 0;
+    this._colorGpuByteLength = 0;
     this._alphaTexture = null;
     this._alphaTextureByteLength = 0;
     this._alphaTexWidth = 0;
     this._alphaTexHeight = 0;
+    this._alphaTexPlan = null;
     this._alphaTexData = null;
     this._alphaTexStagingData = null;
     this._alphaDirtyRows = null;
@@ -11724,12 +8941,14 @@ export class HighPerfRenderer {
     this._currentAlphas = null;
     this._dummyLodIndexTexture = null;
     this._dummyLodIndexTextureByteLength = 0;
+    this._permuter?.abandon();
+    this._permuter = null;
+    // The handles died with the context; drop them without deleting.
+    this._liveColorCache = new Map();
 
-    this._lodIndexTexturesByDimension = new Map();
-    this._lodResourceOwnersByDimension = new Map();
+    this._liveOrder = null;
+    this._liveColorOrder = null;
     this.spatialIndices = new Map();
-    this.lodBuffersByDimension = new Map();
-    this._dirtyLodDimensions = new Set();
     this._perViewState = new Map();
     this.snapshotBuffers = new Map();
     this._snapshotGeometryPools = new Map();
@@ -11752,20 +8971,10 @@ export class HighPerfRenderer {
     this._liveGeometryGeneration = 0;
     this._nextGeometryGeneration = 1;
     this._boundingSphere = null;
-    this._bufferDirty = false;
+    this._colorsDirty = false;
     this._firstRenderDone = false;
 
-    this._interleavedArrayBuffer = null;
-    this._interleavedPositionView = null;
-    this._interleavedColorView = null;
-    this._interleavedChunkBuffer = null;
-    this._interleavedChunkPositionView = null;
-    this._interleavedChunkColorView = null;
-    this._snapshotColorStagingData = null;
     this._snapshotAlphaStagingData = null;
-    this._visibleIndicesBuffer = null;
-    this._visibleIndicesCapacity = 0;
-    this._validatedLodNodeMappings = new WeakMap();
     this._validatedSpatialIndices = new WeakSet();
     this._lodSpatialOwnerTokens = new WeakMap();
     this._lodSequentialMemberships = new WeakMap();
@@ -11786,6 +8995,7 @@ export class HighPerfRenderer {
 
   dispose() {
     if (this._disposed === true) return;
+    this._retireSpatialTreeWorker();
     if (this._contextLost === true) {
       // Re-run the idempotent, GL-silent detach so disposal converges even if
       // a diagnostic or hostile caller perturbed public fields after loss.
@@ -11803,51 +9013,47 @@ export class HighPerfRenderer {
     // exact subsequent dispose retry.
     const programs = Object.values(this.programs ?? {});
     this._markProgramUnbindIfOwned(programs);
-    this.programs = {
-      full: null,
-      light: null,
-      ultralight: null,
-    };
+    this.programs = createEmptyPointPrograms();
     this.activeProgram = null;
     this.uniformLocations.clear();
     this._queueProgramRetirement(programs);
     const unbindFailure = this._attemptProgramUnbind();
     if (unbindFailure) failures.push(unbindFailure);
 
+    // A re-order in progress owns staging buffers of its own.
     // Capture and detach the complete current data publication before any
     // fallible deletion. Pending records own every resource across retries.
     this._queueDataRetirement(this._captureDataPublication());
     this.vao = null;
     this.buffers = {
-      interleaved: null,
       positions: null,
       colors: null,
-      alphas: null,
     };
-    this._interleavedGpuByteLength = 0;
+    this._positionGpuByteLength = 0;
+    this._colorGpuByteLength = 0;
     this._alphaTexture = null;
     this._alphaTextureByteLength = 0;
     this._alphaTexWidth = 0;
     this._alphaTexHeight = 0;
+    this._alphaTexPlan = null;
     this._alphaTexData = null;
     this._alphaTexStagingData = null;
     this._alphaDirtyRows = null;
     this._alphaUploadRegions = null;
     this._useAlphaTexture = false;
     this._currentAlphas = null;
-    this._lodIndexTexturesByDimension = new Map();
-    this._lodResourceOwnersByDimension = new Map();
+    // Kept colour stores are deleted with the rest (queued, drained below).
+    this._evictKeptColorStores(Infinity);
+    this._liveOrder = null;
+    this._liveColorOrder = null;
     this.spatialIndices = new Map();
-    this.lodBuffersByDimension = new Map();
     this._perViewState = new Map();
-    this._dirtyLodDimensions = new Set();
     this.pointCount = 0;
     this._positions = null;
     this._colors = null;
     this._liveGeometryGeneration = 0;
     this._boundingSphere = null;
-    this._bufferDirty = false;
-    this._validatedLodNodeMappings = new WeakMap();
+    this._colorsDirty = false;
     this._validatedSpatialIndices = new WeakSet();
     // Collaborators retire their own GPU handles. Drop the registrations so a
     // disposed renderer neither reports their bytes nor keeps them reachable.
@@ -11874,17 +9080,26 @@ export class HighPerfRenderer {
       this._dummyLodIndexTexture = null;
       this._dummyLodIndexTextureByteLength = 0;
     }
+    if (this._permuter) {
+      try {
+        this._permuter.dispose();
+      } catch (error) {
+        failures.push(error);
+      }
+      this._permuter = null;
+    }
 
-    failures.push(...this._drainDataRetirements());
+    // Snapshots retire first: releasing their geometry leaves it retained
+    // (refCount 0), and a disposed renderer retains nothing, so every such
+    // geometry -- and one the live publication handed to the pool -- is
+    // queued for deletion behind every VAO that drew it, then drained once.
     failures.push(...this._drainSnapshotRetirements());
+    for (const geometry of [...this._snapshotGeometryPools.values()]) {
+      if (geometry.refCount === 0) this._evictGeometryRecord(geometry);
+    }
+    failures.push(...this._drainDataRetirements());
     failures.push(...this._drainProgramRetirements());
     failures.push(...this._drainShaderRetirements());
-    this._interleavedArrayBuffer = null;
-    this._interleavedPositionView = null;
-    this._interleavedColorView = null;
-    this._interleavedChunkBuffer = null;
-    this._interleavedChunkPositionView = null;
-    this._interleavedChunkColorView = null;
     this._refreshGpuMemoryStats();
 
     if (failures.length > 0) {
@@ -11896,5 +9111,3 @@ export class HighPerfRenderer {
     this._disposed = true;
   }
 }
-
-export default HighPerfRenderer;

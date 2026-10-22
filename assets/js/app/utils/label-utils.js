@@ -12,7 +12,7 @@
  * @param {*} value
  * @returns {string}
  */
-export function normalizeForCompare(value) {
+function normalizeForCompare(value) {
   return String(value ?? '').trim().toLocaleLowerCase();
 }
 

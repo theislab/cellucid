@@ -12,7 +12,7 @@
  * - Early culling of clipped points
  *
  * TRANSPARENCY HANDLING:
- * - Accepts separate Float32 transparency array (0..1) OR uses RGBA alpha (0..255)
+ * - Accepts separate Uint8 transparency array (0 or 1) OR uses RGBA alpha (0..255)
  * - Transparency array takes precedence when provided
  * - Points with alpha < 0.01 are skipped for performance
  *
@@ -30,9 +30,12 @@
  * @module ui/modules/figure-export/utils/point-projector
  */
 
+import { requirePositionArray } from '../../../../../rendering/position-layout.js';
 import { assertCropRect01, cropRect01ToPx } from './crop.js';
 import {
+  assertDrawOrder,
   assertLodMembership,
+  drawnSequence,
   POINT_VISIBILITY_THRESHOLD,
 } from './lod-membership.js';
 
@@ -56,13 +59,17 @@ import {
  * Iterate visible points and call a callback with plot-space coordinates and RGBA.
  *
  * @param {object} options
- * @param {Float32Array|null} options.positions - length = n*3
+ * @param {Float32Array|null} options.positions - length = n*dimension
+ * @param {1|2|3} options.dimension - components per position (axes the
+ *   embedding does not have are zero)
  * @param {Uint8Array|null} options.colors - length = n*4 (RGBA)
- * @param {Float32Array|null} [options.transparency] - optional length = n (0..1)
+ * @param {Uint8Array|null} [options.transparency] - optional length = n (0 or 1)
  * @param {RenderStateLike} options.renderState
  * @param {PlotRect} options.plotRect
  * @param {number} [options.radiusPx]
  * @param {import('./lod-membership.js').LodMembership|null} [options.lodMembership]
+ * @param {Uint32Array|null} [options.drawOrder] - The pane's full-detail draw
+ *   order (`drawnSequence`); null draws in source order.
  * @param {{ enabled?: boolean; x?: number; y?: number; width?: number; height?: number } | null} [options.crop] - optional framing crop in normalized viewport coords
  * @param {boolean} [options.sortByDepth] - if true, draw back-to-front using binned depth ordering
  * @param {number} [options.depthBins]
@@ -72,12 +79,14 @@ import {
  */
 export function forEachProjectedPoint({
   positions,
+  dimension,
   colors,
   transparency = null,
   renderState,
   plotRect,
   radiusPx = 1.5,
   lodMembership = null,
+  drawOrder = null,
   crop = null,
   sortByDepth = false,
   depthBins = 256,
@@ -88,11 +97,18 @@ export function forEachProjectedPoint({
     return { drawn: 0, skipped: 0 };
   }
 
-  const n = Math.min(Math.floor(positions.length / 3), Math.floor(colors.length / 4));
+  const positionCount = requirePositionArray(
+    positions,
+    dimension,
+    'Figure-export projected positions',
+    { allowEmpty: true }
+  );
+  const n = Math.min(positionCount, Math.floor(colors.length / 4));
   assertLodMembership(lodMembership, {
-    pointCount: Math.floor(positions.length / 3),
+    pointCount: positionCount,
   });
-  const admittedIndices = lodMembership?.indices ?? null;
+  assertDrawOrder(drawOrder, { pointCount: positionCount });
+  const admittedIndices = drawnSequence(lodMembership, drawOrder);
   const candidateCount = admittedIndices?.length ?? n;
   const mvp = renderState.mvpMatrix;
   const viewportW = Math.max(1, renderState.viewportWidth || 1);
@@ -145,10 +161,10 @@ export function forEachProjectedPoint({
       else if (alpha > 1) alpha = 1;
       if (alpha < POINT_VISIBILITY_THRESHOLD) continue;
 
-      const ix = i * 3;
+      const ix = i * dimension;
       const x = positions[ix];
-      const y = positions[ix + 1];
-      const z = positions[ix + 2];
+      const y = dimension > 1 ? positions[ix + 1] : 0;
+      const z = dimension > 2 ? positions[ix + 2] : 0;
 
       const clipX = mvp[0] * x + mvp[4] * y + mvp[8] * z + mvp[12];
       const clipY = mvp[1] * x + mvp[5] * y + mvp[9] * z + mvp[13];
@@ -205,10 +221,10 @@ export function forEachProjectedPoint({
       else if (alpha > 1) alpha = 1;
       if (alpha < POINT_VISIBILITY_THRESHOLD) continue;
 
-      const ix = i * 3;
+      const ix = i * dimension;
       const x = positions[ix];
-      const y = positions[ix + 1];
-      const z = positions[ix + 2];
+      const y = dimension > 1 ? positions[ix + 1] : 0;
+      const z = dimension > 2 ? positions[ix + 2] : 0;
 
       const clipX = mvp[0] * x + mvp[4] * y + mvp[8] * z + mvp[12];
       const clipY = mvp[1] * x + mvp[5] * y + mvp[9] * z + mvp[13];
@@ -289,10 +305,10 @@ export function forEachProjectedPoint({
       continue;
     }
 
-    const ix = i * 3;
+    const ix = i * dimension;
     const x = positions[ix];
-    const y = positions[ix + 1];
-    const z = positions[ix + 2];
+    const y = dimension > 1 ? positions[ix + 1] : 0;
+    const z = dimension > 2 ? positions[ix + 2] : 0;
 
     // Column-major mat4 × vec4 (x,y,z,1).
     const clipX = mvp[0] * x + mvp[4] * y + mvp[8] * z + mvp[12];

@@ -26,64 +26,64 @@
 .welcome-content {
   position: relative;
   background: var(--color-surface-elevated);
-  border: var(--border-width-2) solid var(--color-border-strong);
+  border: var(--border-default);
   box-shadow: var(--shadow-lg);
   max-width: 420px;
   width: 100%;
+  /* On a short screen (a phone held sideways) the card is taller than the
+     viewport; it scrolls inside the overlay instead of losing its top and
+     bottom past the screen edges. */
+  max-height: 100%;
+  overflow-y: auto;
 }
 
 .welcome-header {
-  margin: 16px 16px 0;
-  padding: 12px 16px 10px;
+  margin: var(--space-3) var(--space-3) 0;
+  padding: var(--space-3) var(--space-3) var(--space-2-5);
   text-align: center;
   background: var(--color-surface-secondary);
-  border: 1px solid var(--color-text-primary);
-  box-shadow: var(--shadow-md);
+  border: var(--border-light);
 }
 
 .welcome-logo {
-  width: 260px;
+  width: 240px;
+  max-width: 100%;
   height: auto;
-  margin-bottom: 8px;
+  margin-bottom: var(--space-1-5);
 }
 
 .welcome-tagline {
-  font-family: "Oswald", system-ui, sans-serif;
-  font-size: 11px;
-  font-weight: 400;
-  text-transform: uppercase;
-  letter-spacing: 0.2em;
+  font-size: var(--type-label);
+  font-weight: var(--font-weight-regular);
   color: var(--color-text-secondary);
   margin: 0;
 }
 
 .welcome-body {
-  padding: 16px;
+  padding: var(--space-3);
 }
 
-
 .welcome-intro {
-  font-size: 13px;
-  line-height: 1.5;
+  font-size: var(--type-body);
+  line-height: var(--leading-relaxed);
   color: var(--color-text-secondary);
-  margin: 0 0 20px;
+  margin: 0 0 var(--space-3);
   text-align: center;
 }
 
 .welcome-actions {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: var(--space-2);
 }
 
 .welcome-btn {
   display: flex;
   align-items: center;
-  gap: 12px;
-  padding: 12px 16px;
+  gap: var(--space-2-5);
+  padding: var(--space-2-5) var(--space-3);
   background: var(--color-surface-secondary);
-  border: 1px solid var(--color-text-primary);
-  box-shadow: var(--shadow-md);
+  border: var(--border-default);
   cursor: pointer;
   text-decoration: none;
   color: var(--color-text-primary);
@@ -91,15 +91,11 @@
 
 .welcome-btn:hover {
   background: var(--color-border-light);
-  box-shadow: var(--shadow-lg);
-}
-
-.welcome-btn:active {
-  box-shadow: var(--shadow-xs);
 }
 
 .welcome-btn-primary {
   background: var(--color-text-primary);
+  border-color: var(--color-text-primary);
   color: var(--color-text-inverse);
 }
 
@@ -108,8 +104,8 @@
 }
 
 .welcome-btn-icon {
-  font-size: 20px;
-  width: 28px;
+  font-size: var(--control-glyph-lg);
+  width: var(--space-6);
   text-align: center;
   flex-shrink: 0;
 }
@@ -118,34 +114,30 @@
   display: flex;
   flex-direction: column;
   align-items: flex-start;
-  gap: 2px;
+  gap: var(--space-0-5);
 }
 
 .welcome-btn-title {
-  font-family: "Oswald", system-ui, sans-serif;
-  font-size: 13px;
-  font-weight: 500;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
+  font-size: var(--type-title);
+  font-weight: var(--font-weight-medium);
 }
 
 .welcome-btn-desc {
-  font-size: 11px;
+  font-size: var(--type-label);
   color: inherit;
   opacity: var(--opacity-70);
 }
 
 .welcome-btn-link {
   background: transparent;
-  border-style: dashed;
 }
 
 .welcome-quote {
-  margin: 20px 0 0;
-  padding-top: 16px;
+  margin: var(--space-3) 0 0;
+  padding-top: var(--space-3);
   border-top: var(--border-width-1) solid var(--color-border-light);
   font-style: italic;
-  font-size: 12px;
+  font-size: var(--type-body);
   color: var(--color-text-secondary);
   text-align: center;
 }
@@ -153,12 +145,10 @@
 .welcome-quote-explanation {
   display: block;
   font-style: normal;
-  font-size: 9px;
-  font-weight: 500;
-  letter-spacing: 0.05em;
-  text-transform: uppercase;
+  font-size: var(--type-compact);
+  font-weight: var(--font-weight-medium);
   color: var(--color-text-secondary);
-  margin-bottom: 6px;
+  margin-bottom: var(--space-1);
   opacity: var(--opacity-60);
 }
 
@@ -170,8 +160,8 @@
 .welcome-quote-attr {
   display: block;
   font-style: normal;
-  font-size: 10px;
-  margin-top: 4px;
+  font-size: var(--type-hint);
+  margin-top: var(--space-1);
   opacity: var(--opacity-60);
 }
 
@@ -207,16 +197,12 @@
 .license-content {
   position: relative;
   overflow: hidden;
-  border-radius: var(--radius-2xl);
-  background:
-    radial-gradient(140% 120% at 20% 0%, rgba(255, 255, 255, 0.10), transparent 60%),
-    radial-gradient(140% 140% at 80% 100%, rgba(0, 0, 0, 0.14), transparent 55%),
-    var(--color-surface-elevated);
-  border: 1px solid color-mix(in srgb, var(--color-border-default) 65%, transparent);
-  box-shadow:
-    0 24px 80px rgba(var(--shadow-rgb), var(--opacity-25)),
-    0 8px 22px rgba(var(--shadow-rgb), var(--opacity-12)),
-    inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  /* The card every other dialog uses (welcome, confirm, figure export,
+     community annotation): square, a strong 2px rule, a flat surface. */
+  border-radius: var(--radius-none);
+  background: var(--color-surface-elevated);
+  border: var(--border-default);
+  box-shadow: var(--shadow-lg);
   max-width: 600px;
   width: 100%;
   max-height: 80vh;
@@ -228,86 +214,109 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 16px 20px;
-  border-bottom: var(--border-width-1) solid var(--color-border-light);
-  background: var(--color-surface-secondary);
-}
-
-.license-header h2 {
-  margin: 0;
-  font-family: "Oswald", system-ui, sans-serif;
-  font-size: 18px;
-  font-weight: 500;
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
-  color: var(--color-text-primary);
-}
-
-.license-close {
-  width: 28px;
-  height: 28px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: transparent;
-  border: 1px solid transparent;
-  font-size: 24px;
-  line-height: 1;
-  color: var(--color-text-secondary);
-  cursor: pointer;
-  transition: var(--transition-all);
-}
-
-.license-close:hover {
-  background: var(--color-border-light);
-  border-color: var(--color-border-default);
-  color: var(--color-text-primary);
 }
 
 .license-body {
-  padding: 20px;
+  padding: var(--control-dialog-padding);
   overflow-y: auto;
-  font-family: "Inter", system-ui, sans-serif;
-  font-size: 13px;
-  line-height: 1.6;
+  font-family: var(--font-sans);
+  font-size: var(--type-body);
+  line-height: var(--leading-relaxed);
   color: var(--color-text-primary);
 }
 
 .license-body p {
-  margin: 0 0 12px 0;
+  margin: 0 0 var(--space-2-5) 0;
 }
 
 .license-body ol {
-  margin: 0 0 16px 0;
-  padding-left: 20px;
+  margin: 0 0 var(--space-3) 0;
+  padding-left: var(--space-5);
 }
 
 .license-body li {
-  margin-bottom: 10px;
+  margin-bottom: var(--space-2);
 }
 
 .license-copyright {
-  font-weight: 600;
+  font-weight: var(--font-weight-semibold);
   color: var(--color-text-primary);
 }
 
 .license-disclaimer {
-  font-size: 11px;
+  font-size: var(--type-label);
   color: var(--color-text-secondary);
-  padding: 12px;
+  padding: var(--control-box-padding-y) var(--control-box-padding-x);
   background: var(--color-surface-tertiary);
   border: var(--border-width-1) solid var(--color-border-light);
-  margin-top: 8px;
+  margin-top: var(--space-2);
 }
 
 @media (max-width: 640px) {
   .license-content {
     max-height: 90vh;
   }
+}
 
-  .license-body {
-    font-size: 12px;
-  }
+/* =========================================================================
+   Dialog chrome
+   One header band, title and close glyph for every dialog: license,
+   confirm, figure export, the analysis windows and the community annotation
+   dialogs. The title reads like a sidebar panel title. The welcome card is
+   the one exception: its header is the logo.
+   ========================================================================= */
+
+.license-header,
+.app-dialog-header,
+.confirm-dialog-header,
+.community-annotation-modal-header,
+.analysis-modal-header,
+.figure-export-modal-title {
+  padding: var(--control-dialog-header-padding-y) var(--control-dialog-header-padding-x);
+  background: var(--color-surface-secondary);
+  border-bottom: var(--border-width-1) solid var(--color-border-light);
+}
+
+.license-header h2,
+.app-dialog-header h2,
+.confirm-dialog-title,
+.community-annotation-modal-title,
+.figure-export-modal-title,
+.analysis-modal-title {
+  margin: 0;
+  font-size: var(--type-title);
+  font-weight: var(--font-weight-medium);
+  line-height: var(--leading-tight);
+  color: var(--color-text-primary);
+}
+
+.license-close,
+.app-dialog-close,
+.analysis-modal-close {
+  position: relative;
+  width: max(var(--space-6), var(--control-target-min));
+  height: max(var(--space-6), var(--control-target-min));
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  background: transparent;
+  border: var(--border-width-1) solid transparent;
+  border-radius: var(--radius-none);
+  font-size: var(--control-glyph-lg);
+  line-height: var(--leading-none);
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  transition: var(--transition-colors);
+}
+
+.license-close:hover,
+.app-dialog-close:hover,
+.analysis-modal-close:hover {
+  background: var(--color-interactive-secondary-hover);
+  border-color: var(--color-border-default);
+  color: var(--color-text-primary);
 }
 
 /* =========================================================================
@@ -317,56 +326,61 @@
 .shortcuts-list {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: var(--space-0-5);
 }
 
-.shortcut-group-title {
-  font-family: "Inter", system-ui, sans-serif;
-  font-size: 11px;
-  font-weight: 500;
-  color: var(--color-text-secondary);
-  margin-bottom: 2px;
-}
-
+/* What a shortcut does reads first, flush left, and its keys sit flush right,
+   so every description in the panel starts on one edge. With the keys first,
+   each description started wherever its own combination happened to end. */
 .shortcut-item {
   display: flex;
   align-items: center;
-  gap: 4px;
-  padding: 1px 0;
-  font-family: "Inter", system-ui, sans-serif;
-  font-size: 11px;
+  justify-content: space-between;
+  gap: var(--space-2);
+  min-height: var(--control-list-row-height);
+  padding: var(--space-0-5) 0;
+  font-family: var(--font-sans);
+  font-size: var(--type-control);
   color: var(--color-text-secondary);
+}
+
+.shortcut-desc {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.shortcut-keys {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  flex-shrink: 0;
+  white-space: nowrap;
+  color: var(--color-text-tertiary);
 }
 
 .shortcut-item kbd {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-width: 18px;
-  height: 18px;
-  padding: 0 4px;
-  font-family: "Fira Code", monospace;
-  font-size: 10px;
-  font-weight: 500;
+  min-width: calc(1.6em + var(--space-1));
+  height: 1.6em;
+  padding: 0 var(--space-1);
+  font-variant-numeric: tabular-nums;
+  font-size: var(--type-readout);
+  font-weight: var(--font-weight-medium);
   background: var(--color-surface-tertiary);
   border: var(--border-default);
   color: var(--color-text-primary);
 }
 
-.shortcut-item span {
-  flex: 1;
-  margin-left: 4px;
-}
-
 /* Mobile adjustments */
 @media (max-width: 480px) {
   .welcome-content {
-    margin: 10px;
+    margin: var(--space-2-5);
   }
 
   .welcome-header {
-    margin: 12px 12px 0;
-    padding: 16px 16px 12px;
+    margin: var(--space-2-5) var(--space-2-5) 0;
   }
 
   .welcome-logo {
@@ -374,19 +388,7 @@
   }
 
   .welcome-body {
-    padding: 12px;
-  }
-
-  .error-content {
-    padding: 24px;
-  }
-
-  .error-actions {
-    flex-direction: column;
-  }
-
-  .error-actions .btn-small {
-    width: 100%;
+    padding: var(--space-2-5);
   }
 }
 
@@ -422,18 +424,16 @@
   position: relative;
   width: 66vw;
   max-width: 860px;
-  min-width: 600px;
+  /* The minimums keep the plot usable; they never exceed the viewport, so a
+     short or narrow window still shows the header and its close button. */
+  min-width: min(600px, 95vw);
   height: 66vh;
-  min-height: 500px;
-  border-radius: var(--radius-2xl);
-  background:
-    radial-gradient(140% 120% at 22% 0%, rgba(255, 255, 255, 0.08), transparent 62%),
-    radial-gradient(140% 140% at 78% 100%, rgba(0, 0, 0, 0.18), transparent 55%),
-    var(--color-surface-elevated);
-  border: 1px solid color-mix(in srgb, var(--color-border-default) 70%, transparent);
-  box-shadow:
-    0 26px 88px rgba(var(--shadow-rgb), var(--opacity-30)),
-    0 10px 26px rgba(var(--shadow-rgb), var(--opacity-12));
+  min-height: min(500px, 95vh);
+  /* Same card as every other dialog. */
+  border-radius: var(--radius-none);
+  background: var(--color-surface-elevated);
+  border: var(--border-default);
+  box-shadow: var(--shadow-lg);
   /* Flexbox for main layout - more predictable than grid for resizing */
   display: flex;
   flex-direction: column;
@@ -453,42 +453,9 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 10px 14px;
-  background: var(--color-surface-secondary);
-  border-bottom: var(--border-width-1) solid var(--color-border-light);
   cursor: move;
 }
 
-.analysis-modal-title {
-  margin: 0;
-  font-family: "Oswald", system-ui, sans-serif;
-  font-weight: 500;
-  font-size: 11px;
-  text-transform: uppercase;
-  letter-spacing: 0.14em;
-  color: var(--color-text-primary);
-}
-
-.analysis-modal-close {
-  width: 24px;
-  height: 24px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: transparent;
-  border: 1px solid transparent;
-  font-size: 16px;
-  color: var(--color-text-secondary);
-  cursor: pointer;
-  border-radius: 0;
-  transition: var(--transition-all);
-}
-
-.analysis-modal-close:hover {
-  background: var(--color-border-light);
-  border-color: var(--color-border-default);
-  color: var(--color-text-primary);
-}
 
 .analysis-modal-body {
   /* Flex container for horizontal layout - plot | resizer | options */
@@ -506,7 +473,7 @@
   flex-direction: column;
   flex: 1;
   min-width: 250px;
-  padding: 16px 20px;
+  padding: var(--space-3);
   background: var(--color-surface-elevated);
   overflow: hidden;
 }
@@ -537,16 +504,13 @@
 }
 
 .analysis-options-title {
-  padding: 10px 12px;
+  padding: var(--control-box-padding-y) var(--control-box-padding-x);
   display: flex;
   flex-direction: column;
   align-items: flex-start;
-  gap: 6px;
-  font-family: "Oswald", system-ui, sans-serif;
-  font-weight: 500;
-  font-size: 10px;
-  text-transform: uppercase;
-  letter-spacing: 0.14em;
+  gap: var(--control-row-gap);
+  font-weight: var(--font-weight-medium);
+  font-size: var(--type-heading);
   color: var(--color-text-secondary);
   border-bottom: var(--border-width-1) solid var(--color-border-light);
   background: var(--color-surface-tertiary);
@@ -564,7 +528,7 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 10px;
+  gap: var(--control-block-gap);
 }
 
 .analysis-options-export-label {
@@ -575,139 +539,15 @@
   margin-top: 0;
 }
 
-.analysis-options-export-toolbar .btn-small {
+.analysis-options-export-toolbar .btn {
   flex: 0 0 auto;
-  padding: 4px 8px;
-  font-size: 10px;
 }
 
+/* The option fields are the shared .control-block fields (label, select,
+   slider row, checkbox): spaced by their own top margin. */
 .analysis-options-content {
   flex: 1;
-  padding: 12px;
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-
-/* Option rows - vertical layout for selects/sliders, horizontal for checkboxes */
-.analysis-option-row {
-  display: flex;
-  flex-direction: column;
-  gap: 5px;
-}
-
-.analysis-option-label {
-  display: block;
-  font-family: "Oswald", system-ui, sans-serif;
-  font-weight: 500;
-  font-size: 10px;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
-  color: var(--color-text-secondary);
-  line-height: 1.2;
-}
-
-/* Select dropdowns - matches .obs-select */
-.analysis-option-select {
-  width: 100%;
-  padding: 6px 8px;
-  font-family: "Inter", system-ui, sans-serif;
-  font-size: 11px;
-  border-radius: 0;
-  border: var(--border-strong);
-  background-color: var(--color-surface-elevated);
-  color: var(--color-text-primary);
-  cursor: pointer;
-  box-shadow: var(--shadow-sm);
-  transition: box-shadow var(--duration-fast) var(--easing-standard);
-}
-
-.analysis-option-select:focus {
-  outline: 2px solid var(--color-border-focus);
-  outline-offset: 1px;
-  box-shadow: var(--shadow-md);
-}
-
-/* Checkbox styling */
-.analysis-option-checkbox {
-  width: 12px;
-  height: 12px;
-  accent-color: var(--color-interactive-primary);
-  cursor: pointer;
-  margin: 0;
-  flex-shrink: 0;
-}
-
-/* Checkbox rows - inline layout with checkbox first, then label */
-.analysis-option-row.checkbox-row {
-  flex-direction: row;
-  align-items: center;
-  gap: 8px;
-  padding: 3px 0;
-}
-
-.analysis-option-row.checkbox-row .analysis-option-label {
-  font-family: "Inter", system-ui, sans-serif;
-  font-weight: 400;
-  font-size: 11px;
-  text-transform: none;
-  letter-spacing: 0;
-  color: var(--color-text-secondary);
-  cursor: pointer;
-  margin: 0;
-}
-
-/* `.analysis-option-range` is always rendered inside a `.slider-row`
-   (analysis/ui/components/options.js), so the single slider definition in
-   components/_forms.css owns its track, thumb, hit area and focus ring. */
-
-/* Slider value - matches .slider-value */
-.analysis-option-value {
-  font-family: "Fira Code", ui-monospace, monospace;
-  font-size: 11px;
-  opacity: var(--opacity-85);
-  min-width: 28px;
-  text-align: right;
-}
-
-.analysis-option-text {
-  width: 100%;
-  padding: 5px 8px;
-  font-size: 11px;
-  border-radius: 0;
-  border: var(--border-strong);
-  background-color: var(--color-surface-elevated);
-  color: var(--color-text-primary);
-  box-shadow: var(--shadow-sm);
-}
-
-.analysis-option-text:focus {
-  outline: 2px solid var(--color-border-focus);
-  outline-offset: 1px;
-  box-shadow: var(--shadow-md);
-}
-
-/* Section titles and dividers for option groups */
-.analysis-option-section-title {
-  font-family: "Oswald", system-ui, sans-serif;
-  font-size: 10px;
-  font-weight: 500;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: var(--color-text-secondary);
-  margin: 12px 0 8px 0;
-  padding: 0;
-}
-
-.analysis-option-section-title:first-child {
-  margin-top: 0;
-}
-
-.analysis-option-divider {
-  height: 1px;
-  background: var(--color-border-light);
-  margin: 12px 0;
-  border: none;
+  padding: 0 var(--control-box-padding-x) var(--control-box-padding-y);
 }
 
 /* =========================================================================
@@ -750,12 +590,9 @@
 
 /* Panel titles */
 .analysis-panel-title {
-  padding: 8px 12px;
-  font-family: "Oswald", system-ui, sans-serif;
-  font-weight: 500;
-  font-size: 10px;
-  text-transform: uppercase;
-  letter-spacing: 0.14em;
+  padding: var(--control-box-padding-y) var(--control-box-padding-x);
+  font-weight: var(--font-weight-medium);
+  font-size: var(--type-heading);
   color: var(--color-text-secondary);
   background: var(--color-surface-tertiary);
   border-bottom: var(--border-width-1) solid var(--color-border-light);
@@ -773,7 +610,7 @@
 .analysis-annotations-content {
   flex: 1;
   overflow-y: auto;
-  padding: 10px 12px;
+  padding: var(--control-box-padding-y) var(--control-box-padding-x);
 }
 
 /* Internal panel resizer elements */
@@ -890,4 +727,131 @@
 .analysis-modal-resizer-intersection:hover::before {
   opacity: 1;
   background-image: radial-gradient(circle, var(--color-text-secondary) 1.5px, transparent 1.5px);
+}
+
+/* =========================================================================
+   App dialogs: native <dialog> opened with showModal(), which owns the
+   backdrop, the focus trap, Escape and the return of focus. Cite Cellucid and
+   Share this dataset use it. The header band and close glyph are the shared
+   dialog chrome above.
+   ========================================================================= */
+
+.app-dialog {
+  width: min(480px, calc(100vw - 2 * var(--space-4)));
+  max-height: calc(100dvh - 2 * var(--space-4));
+  padding: 0;
+  overflow: auto;
+  border: var(--border-default);
+  border-radius: var(--radius-none);
+  background: var(--color-surface-elevated);
+  box-shadow: var(--shadow-lg);
+  color: var(--color-text-primary);
+  font-family: var(--font-sans);
+}
+
+.app-dialog::backdrop {
+  background: var(--color-surface-overlay);
+}
+
+.app-dialog-header {
+  position: sticky;
+  top: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.app-dialog-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--control-block-gap);
+  padding: var(--control-dialog-padding);
+  font-size: var(--type-body);
+  line-height: var(--leading-normal);
+}
+
+.app-dialog-body p {
+  margin: 0;
+}
+
+.app-dialog-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--control-row-gap);
+}
+
+.app-dialog-body a {
+  color: var(--color-text-primary);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+/* Cite Cellucid */
+.cite-placeholder {
+  padding: var(--control-box-padding-y) var(--control-box-padding-x);
+  border: var(--border-width-1) solid color-mix(in srgb, var(--color-warning) 35%, var(--color-border-default));
+  background: var(--color-warning-soft);
+  font-size: var(--type-label);
+}
+
+.cite-reference {
+  padding: var(--control-box-padding-y) var(--control-box-padding-x);
+  background: var(--color-surface-secondary);
+  border: var(--border-light);
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+.cite-bibtex {
+  margin: 0;
+  max-height: 160px;
+  overflow: auto;
+  padding: var(--control-box-padding-y) var(--control-box-padding-x);
+  background: var(--color-surface-secondary);
+  border: var(--border-light);
+  font-size: var(--type-readout);
+  line-height: var(--leading-normal);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+/* Share this dataset */
+.share-item {
+  display: flex;
+  flex-direction: column;
+  gap: var(--control-row-gap);
+}
+
+.app-dialog-title-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.share-item .share-badge-preview {
+  margin-left: auto;
+}
+
+.share-row {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--control-row-gap);
+}
+
+.share-row > .obs-select {
+  flex: 1;
+  min-width: 0;
+}
+
+.share-row > textarea.obs-select {
+  resize: none;
+  font-size: var(--type-readout);
+  line-height: var(--leading-normal);
+}
+
+.share-badge-preview {
+  display: block;
 }

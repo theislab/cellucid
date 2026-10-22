@@ -234,6 +234,9 @@ test('an exact authenticated Jupyter URL startup never shows or paints onboardin
     }));
   await page.route(appUrl('/_cellucid/events'), route =>
     jsonResponse(route, { status: 'ok', delivered: true }));
+  // A current notebook server publishes what it accepts on the wire.
+  await page.route(appUrl('/_cellucid/protocol'), route =>
+    jsonResponse(route, { events: ['ready'], commands: [] }));
   await installPreparedFixtureRoute(page, appUrl('/jupyter-fixture/'));
 
   const jupyterUrl = new URL('/', APP_ORIGIN);

@@ -15,7 +15,7 @@ import {
 import { parseExactJson } from './wire-contract.js';
 
 export const ORCID_RESPONSE_MAX_UTF8_BYTES = 256 * 1024;
-export const ORCID_EXPANDED_SEARCH_MAX_RESULTS = 8;
+const ORCID_EXPANDED_SEARCH_MAX_RESULTS = 8;
 
 const ORCID_API_ORIGIN = 'https://pub.orcid.org';
 

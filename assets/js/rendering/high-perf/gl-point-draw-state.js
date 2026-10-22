@@ -2,71 +2,45 @@
  * WebGL point-draw state validation and baseline restoration.
  *
  * The renderer must leave the GL state machine exactly as it found it after
- * every point draw. These helpers assert a clean error queue, restore the
- * baseline bindings, and settle an operation error against a restoration error
- * without losing either one.
+ * every point draw. These helpers restore the baseline bindings and settle an
+ * operation error against a restoration error without losing either one; the
+ * error queue itself is checked by `requireCleanWebGLState` in `../gl-errors.js`.
  */
 
-// `CONTEXT_LOST_WEBGL`. Fixed by the WebGL specification, and read from the
-// context when it exposes it so a conformant renaming cannot silently defeat the
-// check below.
-const CONTEXT_LOST_WEBGL = 0x9242;
+import { configureStraightAlphaBlending } from '../gl-utils.js';
 
 /**
- * The name every terminal context-loss refusal carries.
+ * The blend state an opaque point pass draws with (see HP_FS_SCULPTED): the
+ * colour replaces what is there, alpha composites "over" what is there (so an
+ * opaque target stays opaque and a transparent export canvas gains the
+ * point's coverage), and with multisampling the fragment's disc coverage
+ * becomes its sample mask.
  *
- * Two places raise one: `_assertOperational()` in the renderer, through
- * `HighPerfRendererContextLostError`, and `requireCleanWebGLState()` below,
- * which cannot construct that class without importing the module that imports
- * this one. The name is what the two have in common, so it lives here — in the
- * leaf both sides can reach — rather than being spelled out twice.
+ * @param {WebGL2RenderingContext} gl
+ * @param {boolean} multisampled - Whether the bound target has samples to mask.
  */
-export const CONTEXT_LOST_ERROR_NAME = 'HighPerfRendererContextLostError';
-
-/**
- * Whether this is a renderer refusal to work on a context that is gone.
- *
- * A lost context is a terminal condition the viewer already owns a fence for,
- * not a defect: the frame loop stops, the GPU ownership graph is retired, and
- * only a reload builds a coherent replacement. Callers that drive the renderer
- * from a callback the platform invokes — a frame, a resize — use this to tell
- * that condition apart from a real failure, because rethrowing it there reaches
- * `window.onerror` and reports a handled loss as a crash.
- *
- * @param {unknown} error
- * @returns {boolean}
- */
-export function isContextLostError(error) {
-  return error instanceof Error && error.name === CONTEXT_LOST_ERROR_NAME;
-}
-
-function requireCleanWebGLState(gl, owner) {
-  const errorCode = gl.getError();
-  if (errorCode === gl.NO_ERROR) return;
-  const contextLostCode = typeof gl.CONTEXT_LOST_WEBGL === 'number'
-    ? gl.CONTEXT_LOST_WEBGL
-    : CONTEXT_LOST_WEBGL;
-  // A lost context answers `CONTEXT_LOST_WEBGL` from every call, including this
-  // one, and keeps answering it. That is not dirty state a previous caller
-  // leaked — it is the context being gone — and the renderer already owns a
-  // fence for that, thrown by `_assertOperational` and identified by name.
-  // Reporting it as an unexpected WebGL error turned a handled loss into an
-  // unhandled page error whenever a publication began before the loss event was
-  // delivered, which is the window a forced context loss lands in.
-  if (errorCode === contextLostCode) {
-    const lost = new Error(
-      `${owner} cannot continue after its WebGL context was lost.`
-    );
-    lost.name = CONTEXT_LOST_ERROR_NAME;
-    throw lost;
+function enterOpaquePointBlending(gl, multisampled) {
+  gl.enable(gl.BLEND);
+  gl.blendEquation(gl.FUNC_ADD);
+  gl.blendFuncSeparate(gl.ONE, gl.ZERO, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+  if (multisampled) {
+    gl.enable(gl.SAMPLE_ALPHA_TO_COVERAGE);
+  } else {
+    gl.disable(gl.SAMPLE_ALPHA_TO_COVERAGE);
   }
-  throw new Error(
-    `${owner} encountered WebGL error 0x${errorCode.toString(16)}.`
-  );
 }
 
-function restorePointDrawBaseline(gl, detachElementBuffer) {
+function restorePointDrawBaseline(gl, detachElementBuffer, opaquePass = false) {
   let failures = null;
+  if (opaquePass) {
+    // Back to the straight-alpha baseline every other pass assumes.
+    try {
+      gl.disable(gl.SAMPLE_ALPHA_TO_COVERAGE);
+      configureStraightAlphaBlending(gl);
+    } catch (error) {
+      failures = [error];
+    }
+  }
   if (detachElementBuffer) {
     try {
       gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, null);
@@ -82,14 +56,14 @@ function restorePointDrawBaseline(gl, detachElementBuffer) {
   }
   try {
     gl.activeTexture(gl.TEXTURE1);
-    gl.bindTexture(gl.TEXTURE_2D, null);
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, null);
   } catch (error) {
     if (failures === null) failures = [error];
     else failures.push(error);
   }
   try {
     gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, null);
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, null);
   } catch (error) {
     if (failures === null) failures = [error];
     else failures.push(error);
@@ -123,7 +97,7 @@ function settlePointDraw(operationError, restorationError, owner) {
 }
 
 export {
-  requireCleanWebGLState,
+  enterOpaquePointBlending,
   restorePointDrawBaseline,
   settlePointDraw,
 };

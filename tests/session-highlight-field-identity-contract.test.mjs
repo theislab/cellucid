@@ -27,6 +27,9 @@ import {
 import {
   SessionSerializer,
 } from '../assets/js/app/session/session-serializer.js';
+import {
+  createInMemoryDimensionManager,
+} from '../assets/js/data/dimension-manager.js';
 
 const CELL_COUNT = 6;
 const VAR_COUNT = 4;
@@ -76,7 +79,22 @@ function obsField(descriptor) {
   };
 }
 
-function makeDatasetState({ obs = SAVED_OBS, pages, dimension = 3 }) {
+/**
+ * The data mapping of a dataset whose one embedding is the in-memory 3D
+ * layout (keyed "3d"): highlight identity is checked against obs and var
+ * schemas, never against this mapping, which is the same on both sides.
+ */
+const DATA_MAPPING = Object.freeze({
+  kind: 'export',
+  embeddings: {
+    enabled: [{ key: '3d', columns: null }],
+    defaults: { '1d': null, '2d': null, '3d': { key: '3d', columns: null } },
+  },
+  geneNames: 'index',
+  vectorFields: [],
+});
+
+function makeDatasetState({ obs = SAVED_OBS, pages }) {
   const state = Object.create(STATE_PROTOTYPE);
   state.getDatasetGeneration = () => 0;
   state.obsData = { fields: obs.map(obsField) };
@@ -88,7 +106,13 @@ function makeDatasetState({ obs = SAVED_OBS, pages, dimension = 3 }) {
   };
   state.pointCount = CELL_COUNT;
   state.positionsArray = positions();
-  state.getViewDimensionLevel = () => dimension;
+  state.dimensionManager = createInMemoryDimensionManager({
+    positions: state.positionsArray,
+    dimension: 3,
+  });
+  state.getDataMapping = () => DATA_MAPPING;
+  state.getViewDimensionLevel = () => 3;
+  state.getViewLayoutKey = () => state.dimensionManager.getViewLayout('live');
   state.highlightPages = pages;
   state.activePageId = 'page_1';
   state._highlightPageIdCounter = 1;
@@ -522,3 +546,60 @@ test(
     });
   },
 );
+
+test('restoring many category highlights reads each inventory once', async () => {
+  const count = 1_500;
+  const names = Array.from({ length: count }, (_, index) => `cluster_${index}`);
+  const groups = names.map((categoryName, categoryIndex) => ({
+    id: `highlight_${categoryIndex + 1}`,
+    type: 'category',
+    label: `cell_type: ${categoryName}`,
+    enabled: true,
+    fieldKey: 'cell_type',
+    fieldIndex: SAVED_OBS.indexOf('cell_type'),
+    fieldSource: 'obs',
+    categoryIndex,
+    categoryName,
+    cellIndices: [...SELECTED_ROWS],
+    cellCount: SELECTED_ROWS.length,
+  }));
+  const pages = [{
+    id: 'page_1',
+    name: 'Work',
+    color: '#112233',
+    highlightedGroups: groups,
+  }];
+  const source = makeDatasetState({
+    obs: SAVED_OBS.map(key => (
+      key === 'cell_type' ? { key, categories: names } : key
+    )),
+    pages,
+  });
+  const bundle = await makeSerializer(source).createSessionBundle();
+
+  const destination = makeDatasetState({
+    obs: SAVED_OBS.map(key => (
+      key === 'cell_type' ? { key, categories: names } : key
+    )),
+    pages: emptyPages(),
+  });
+  const field = destination.obsData.fields[SAVED_OBS.indexOf('cell_type')];
+  let reads = 0;
+  field.categories = new Proxy([...names], {
+    get(target, property, receiver) {
+      if (property === 'length' || /^\d+$/.test(String(property))) reads += 1;
+      return Reflect.get(target, property, receiver);
+    },
+  });
+
+  await withNotificationHarness(async () => {
+    await makeSerializer(destination).restoreFromBlob(bundle);
+  });
+  const restored = destination.highlightPages.flatMap(page => page.highlightedGroups);
+  assert.equal(restored.length, count);
+  assert.equal(restored.at(-1).categoryIndex, count - 1);
+  assert.ok(
+    reads <= 20 * count,
+    `restore read the ${count}-category inventory ${reads} times`,
+  );
+});

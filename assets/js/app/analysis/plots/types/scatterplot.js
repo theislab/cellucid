@@ -375,7 +375,7 @@ const scatterPlotDefinition = {
     layout.xaxis = {
       title: {
         text: xVariable,
-        font: { family: 'Oswald, system-ui, sans-serif', size: 12, color: theme.text }
+        font: { family: theme.fontFamily, size: 12, color: theme.text }
       },
       type: logScaleX ? 'log' : 'linear',
       showgrid: showGrid,
@@ -387,7 +387,7 @@ const scatterPlotDefinition = {
     layout.yaxis = {
       title: {
         text: yVariable,
-        font: { family: 'Oswald, system-ui, sans-serif', size: 12, color: theme.text }
+        font: { family: theme.fontFamily, size: 12, color: theme.text }
       },
       type: logScaleY ? 'log' : 'linear',
       showgrid: showGrid,

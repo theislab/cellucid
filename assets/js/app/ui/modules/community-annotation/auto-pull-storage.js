@@ -17,7 +17,7 @@ import {
   serializeAutoPullPreferences,
 } from '../../../community-annotations/auto-pull-preferences.js';
 
-export const AUTO_PULL_STORAGE_KEY =
+const AUTO_PULL_STORAGE_KEY =
   'cellucid:community-annotations:auto-pull:v1';
 
 export function readAutoPullPreferences() {

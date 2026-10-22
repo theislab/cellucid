@@ -1,4 +1,8 @@
-import { ABANDONED_GESTURE_REASONS } from './mode-copy.js';
+import { CellSet, hasDuplicateCellIndex } from '../../../utils/cell-set.js';
+import {
+  ABANDONED_GESTURE_REASONS,
+  ANNOTATION_ABANDONED_GESTURE_REASONS
+} from './mode-copy.js';
 
 const SELECTION_MODES = Object.freeze([
   'annotation',
@@ -164,17 +168,12 @@ export function requireCellIndices(value, label, { allowEmpty, pointCount }) {
     throw new TypeError(`${label} must not be empty.`);
   }
   requirePointCount(pointCount, label);
-  const seen = new Set();
   for (let index = 0; index < value.length; index++) {
     if (!Object.hasOwn(value, index)) {
       throw new TypeError(`${label} must not contain holes.`);
     }
     const cellIndex = value[index];
-    if (
-      !Number.isSafeInteger(cellIndex)
-      || cellIndex < 0
-      || seen.has(cellIndex)
-    ) {
+    if (!Number.isSafeInteger(cellIndex) || cellIndex < 0) {
       throw new TypeError(
         `${label} must contain unique non-negative safe integers.`
       );
@@ -184,7 +183,12 @@ export function requireCellIndices(value, label, { allowEmpty, pointCount }) {
         `${label} must be inside the current dataset of ${pointCount} cells.`
       );
     }
-    seen.add(cellIndex);
+  }
+  // One bit a cell, not a Set: a Set refuses more than 2^24 entries.
+  if (hasDuplicateCellIndex(value, pointCount)) {
+    throw new TypeError(
+      `${label} must contain unique non-negative safe integers.`
+    );
   }
   return value;
 }
@@ -192,10 +196,10 @@ export function requireCellIndices(value, label, { allowEmpty, pointCount }) {
 function requireCandidateCollection(value, label, collectionType, pointCount) {
   if (value === null) return null;
   if (collectionType === 'set') {
-    if (!(value instanceof Set)) {
-      throw new TypeError(`${label} must be a Set or null.`);
+    // A CellSet holds unique in-range cells by construction.
+    if (!(value instanceof CellSet) || value.cellCount !== pointCount) {
+      throw new TypeError(`${label} must be a CellSet over the current dataset or null.`);
     }
-    requireCellIndices([...value], label, { allowEmpty: true, pointCount });
     return value;
   }
   requireCellIndices(value, label, { allowEmpty: true, pointCount });
@@ -355,12 +359,10 @@ export function requireHighlightGroup(value, label, pointCount) {
       `${label} cellIndices must be an Array or Uint32Array matching cellCount.`
     );
   }
-  const seenCellIndices = new Set();
   for (const cellIndex of value.cellIndices) {
     if (
       !Number.isSafeInteger(cellIndex)
       || cellIndex < 0
-      || seenCellIndices.has(cellIndex)
     ) {
       throw new TypeError(
         `${label} cellIndices must contain unique non-negative safe integers.`
@@ -371,7 +373,11 @@ export function requireHighlightGroup(value, label, pointCount) {
         `${label} cellIndices must be inside the current dataset of ${pointCount} cells.`
       );
     }
-    seenCellIndices.add(cellIndex);
+  }
+  if (hasDuplicateCellIndex(value.cellIndices, pointCount)) {
+    throw new TypeError(
+      `${label} cellIndices must contain unique non-negative safe integers.`
+    );
   }
   if (type === 'category' || type === 'range') {
     if (
@@ -443,7 +449,7 @@ export function requireSavedHighlightGroup(
   // exactly cellCount long, so an equal length plus containment is set
   // equality. A permuted, offset, or substituted index set is rejected here
   // instead of being saved as a selection nobody made.
-  const expectedCellIndexSet = new Set(expectedCellIndices);
+  const expectedCellIndexSet = CellSet.from(expectedCellIndices, pointCount);
   for (const cellIndex of value.cellIndices) {
     if (!expectedCellIndexSet.has(cellIndex)) {
       throw new RangeError(
@@ -520,10 +526,13 @@ function requireAbandonedStep(event, tool) {
     ['abandoned', 'step', 'candidateCount'],
     `${tool} abandoned step event`
   );
-  if (!ABANDONED_GESTURE_REASONS.includes(event.abandoned)) {
+  const reasons = tool === 'annotation'
+    ? ANNOTATION_ABANDONED_GESTURE_REASONS
+    : ABANDONED_GESTURE_REASONS;
+  if (!reasons.includes(event.abandoned)) {
     throw new TypeError(
       `${tool} abandoned step reason must be exactly `
-      + `${ABANDONED_GESTURE_REASONS.join(' or ')}.`
+      + `${reasons.join(' or ')}.`
     );
   }
   if (event.step !== 0 || event.candidateCount !== 0) {
@@ -870,4 +879,128 @@ export function requireJupyterSource(jupyterSource) {
   return jupyterSource;
 }
 
-export const CURRENT_SELECTION_MODES = SELECTION_MODES;
+/**
+ * The DOM the Select mode surfaces need, passed down unchanged from the DOM
+ * cache to mode-ui.js: the switches and combine buttons of the panel and the
+ * selection bar, and the bar's step row and step buttons.
+ */
+export const SELECT_MODE_DOM_KEYS = Object.freeze([
+  'selectModeSwitches',
+  'selectCombineGroups',
+  'selectCombineButtons',
+  'selectBarSteps',
+  'selectBarStepButtons'
+]);
+
+/**
+ * @param {object} dom
+ * @returns {object} exactly the SELECT_MODE_DOM_KEYS entries of `dom`
+ */
+export function pickSelectModeDom(dom) {
+  return Object.fromEntries(SELECT_MODE_DOM_KEYS.map(key => [key, dom[key]]));
+}
+
+function readExactBoolean(button, attribute, label) {
+  const value = button.getAttribute(attribute);
+  if (value !== 'true' && value !== 'false') {
+    throw new TypeError(`${label} ${attribute} must be exactly "true" or "false".`);
+  }
+  return value === 'true';
+}
+
+/**
+ * Validate the Select mode controls and read the state their markup declares.
+ *
+ * Select mode has one switch and one combine choice, drawn on more than one
+ * surface (the Highlighting panel and the selection bar over the plot). Every
+ * switch must therefore show the same state, every combine group must offer
+ * each combine exactly once, and every button for one combine must agree, with
+ * exactly one combine pressed.
+ *
+ * @param {object} controls
+ * @param {HTMLElement[]} controls.switches every Select mode switch
+ * @param {HTMLElement[]} controls.combineGroups every combine group
+ * @param {HTMLElement[]} controls.combineButtons every combine button
+ * @param {readonly string[]} combines
+ * @returns {{enabled: boolean, combine: string}}
+ */
+export function requireSelectModeControls(controls, combines) {
+  requireExactKeys(
+    controls,
+    ['switches', 'combineGroups', 'combineButtons'],
+    'Select mode controls'
+  );
+  const { switches, combineGroups, combineButtons } = controls;
+  if (!Array.isArray(switches) || switches.length === 0) {
+    throw new TypeError('Select mode needs at least one switch.');
+  }
+  let enabled = null;
+  for (const control of switches) {
+    requireDomElement(
+      control,
+      'Select mode switch',
+      ['addEventListener', 'getAttribute', 'setAttribute']
+    );
+    if (control.getAttribute('role') !== 'switch') {
+      throw new TypeError('Select mode switch must carry role="switch".');
+    }
+    const checked = readExactBoolean(control, 'aria-checked', 'Select mode switch');
+    if (enabled !== null && checked !== enabled) {
+      throw new TypeError('Every Select mode switch must show the same state.');
+    }
+    enabled = checked;
+  }
+  if (!Array.isArray(combineGroups) || combineGroups.length !== switches.length) {
+    throw new TypeError('Select mode needs one combine group per switch.');
+  }
+  for (const group of combineGroups) {
+    requireDomElement(group, 'Select mode combine group');
+  }
+  if (
+    !Array.isArray(combineButtons)
+    || combineButtons.length !== combines.length * combineGroups.length
+  ) {
+    throw new TypeError(
+      `Select mode needs exactly ${combines.length} combine buttons per group.`
+    );
+  }
+  const counts = new Map(combines.map(name => [name, 0]));
+  const pressedByCombine = new Map();
+  for (const button of combineButtons) {
+    requireDomElement(
+      button,
+      'Select mode combine button',
+      ['addEventListener', 'getAttribute', 'setAttribute']
+    );
+    if (!isObject(button.dataset) || !combines.includes(button.dataset.combine)) {
+      throw new TypeError(
+        'Select mode combine button must name one combine in data-combine.'
+      );
+    }
+    const name = button.dataset.combine;
+    counts.set(name, counts.get(name) + 1);
+    const pressed = readExactBoolean(
+      button,
+      'aria-pressed',
+      'Select mode combine button'
+    );
+    if (pressedByCombine.has(name) && pressedByCombine.get(name) !== pressed) {
+      throw new TypeError(
+        `Every Select mode ${name} button must show the same state.`
+      );
+    }
+    pressedByCombine.set(name, pressed);
+  }
+  for (const [name, count] of counts) {
+    if (count !== combineGroups.length) {
+      throw new TypeError(
+        `Select mode needs one ${name} button in every combine group.`
+      );
+    }
+  }
+  const pressedCombines = combines.filter(name => pressedByCombine.get(name));
+  if (pressedCombines.length !== 1) {
+    throw new TypeError('Exactly one Select mode combine must be pressed.');
+  }
+  return { enabled, combine: pressedCombines[0] };
+}

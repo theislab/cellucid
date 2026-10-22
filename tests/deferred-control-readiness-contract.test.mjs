@@ -98,7 +98,7 @@ test('every deferred control exists in the interface and is wired late', () => {
   }
   for (const selector of DEFERRED_CONTROL_SELECTORS) {
     assert.ok(
-      indexHtml.includes(`class="btn-small ${selector.slice(1)}"`),
+      indexHtml.includes(`class="btn btn-compact ${selector.slice(1)}"`),
       `index.html must carry ${selector}`
     );
   }
@@ -124,32 +124,42 @@ test('retirement happens before the first await and admission after the last lis
   assert.ok(retirement > 0, 'main.js must retire the deferred controls');
   assert.ok(admission > retirement, 'main.js must admit them afterwards');
 
-  const firstAwait = mainSource.indexOf('await githubAuthSession');
+  // The first bootstrap await is the sign-in step of the startup owner.
+  const firstAwait = mainSource.indexOf("await startup.step(\n        'sign-in',");
   assert.ok(firstAwait > 0, 'the first bootstrap await must still be findable');
   assert.ok(
     retirement < firstAwait,
     'controls must be retired before the bootstrap blocks on anything'
   );
 
-  // The last await in the linear bootstrap settles the initial publication.
-  // Every benchmark wiring site sits after it, which is the defect this guards.
-  const settle = mainSource.indexOf(
-    'await settleInitialPublishedDatasetStateOutcome('
-  );
-  assert.ok(settle > firstAwait, 'the settle await must still be findable');
+  // `initUI` runs only after the bootstrap has awaited its sign-in, health
+  // and catalog steps. Every benchmark wiring site sits after it, which is the
+  // defect this guards.
+  const initUiCall = mainSource.indexOf('ui = initUI({');
+  assert.ok(initUiCall > firstAwait, 'initUI must still be findable');
 
   for (const [control, site] of Object.entries(BENCHMARK_WIRING_SITES)) {
     const wiring = mainSource.indexOf(site);
     assert.ok(wiring > 0, `${control} must still be wired at ${site}`);
     assert.ok(
-      wiring > settle,
-      `${control} is wired after the publication settles, so it must be deferred`
+      wiring > initUiCall,
+      `${control} is wired after the bootstrap blocks, so it must be deferred`
     );
     assert.ok(
       wiring < admission,
       `${control} must be wired before the controls are admitted`
     );
   }
+
+  // Every control is admitted before the startup selection starts loading, so
+  // a benchmark run, like any other dataset change, can supersede that load.
+  const startupLoad = mainSource.indexOf(
+    'await ui.loadStartupDataset(startupSelection)'
+  );
+  assert.ok(
+    admission > 0 && startupLoad > admission,
+    'the deferred controls must be admitted before the startup load'
+  );
 
   // The renderer controls are wired by `initUI`, which is itself several awaits
   // into the bootstrap — late enough to need deferring, early enough that a

@@ -1,6 +1,8 @@
+import './helpers/anndata-reader-in-process.mjs';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
+import { gzipSync } from 'node:zlib';
 
 import {
   expandObsManifest,
@@ -10,6 +12,7 @@ import {
 } from '../assets/js/data/data-loaders.js';
 import { BaseAnnDataAdapter } from '../assets/js/data/base-anndata-adapter.js';
 import {
+  decodeQuantizedToFloat32,
   validateQuantizationTask,
 } from '../assets/js/data/quantization-contract.js';
 import {
@@ -21,12 +24,13 @@ import {
   QuantizationWorkerPool,
 } from '../assets/js/data/quantization-worker-pool.js';
 import {
-  createDataSourceManager,
+  DataSourceManager,
   getDataSourceManager,
 } from '../assets/js/data/data-source-manager.js';
+import { validateCentroidEmbeddings } from '../assets/js/data/dataset-generation-contract.js';
 
 const indexHtml = await readFile(new URL('../index.html', import.meta.url), 'utf8');
-const h5adModule = await import('../assets/js/data/h5ad.js');
+const h5adModule = await import('../assets/js/data/h5ad-loader.js');
 
 function h5BooleanAttribute(value) {
   return {
@@ -203,14 +207,14 @@ test('H5AD categorical columns resolve only in the current AnnData layout', () =
   );
 });
 
-test('manifest expansion accepts only compact_v1', () => {
+test('manifest expansion accepts only compact_v2', () => {
   assert.throws(
     () => expandObsManifest({
       version: 1,
       n_points: 1,
       fields: [],
     }),
-    /obs.*compact_v1|compact_v1.*obs/i
+    /obs.*compact_v2|compact_v2.*obs/i
   );
   assert.throws(
     () => expandVarManifest({
@@ -218,7 +222,30 @@ test('manifest expansion accepts only compact_v1', () => {
       n_points: 1,
       fields: [],
     }),
-    /var.*compact_v1|compact_v1.*var/i
+    /var.*compact_v2|compact_v2.*var/i
+  );
+  // The previous compact contract is refused outright, even when every other
+  // property already has the current shape: no reader accepts both formats.
+  const previousObs = currentObsManifest();
+  previousObs._format = 'compact_v1';
+  assert.throws(
+    () => expandObsManifest(previousObs),
+    /obs manifest: expected the current compact_v2 contract/
+  );
+  const previousVar = currentVarManifest();
+  previousVar._format = 'compact_v1';
+  assert.throws(
+    () => expandVarManifest(previousVar),
+    /var manifest: expected the current compact_v2 contract/
+  );
+  // A var manifest in the previous shape names its gene id column instead of
+  // carrying gene name sets.
+  const previousVarShape = currentVarManifest();
+  delete previousVarShape.gene_name_sets;
+  previousVarShape.var_gene_id_column = null;
+  assert.throws(
+    () => expandVarManifest(previousVarShape),
+    /missing gene_name_sets; unexpected var_gene_id_column/
   );
 });
 
@@ -244,7 +271,7 @@ function currentObsManifest({
     'uint8',
     255,
     {
-      '2': [
+      X_umap: [
         { category: 'A', position: [0.25, -0.5], n_points: 1 },
         { category: 'B', position: [-0.25, 0.5], n_points: 1 },
       ],
@@ -256,7 +283,7 @@ function currentObsManifest({
   if (continuousFields.length > 0) schemas.continuous = continuousSchema;
   if (categoricalFields.length > 0) schemas.categorical = categoricalSchema;
   return {
-    _format: 'compact_v1',
+    _format: 'compact_v2',
     n_points: 2,
     centroid_outlier_quantile: 0.95,
     latent_key: 'latent_space',
@@ -278,15 +305,18 @@ function currentVarManifest({
   fields = [[0, 'Gene A']],
   quantization = null,
   compression = null,
+  geneNameSets = [
+    { source: null, filled_from_index: 0, renamed: [], names: null },
+  ],
 } = {}) {
   return {
-    _format: 'compact_v1',
+    _format: 'compact_v2',
     n_points: 2,
-    var_gene_id_column: null,
     compression,
     quantization,
     _varSchema: schema,
     fields,
+    gene_name_sets: geneNameSets,
   };
 }
 
@@ -294,12 +324,13 @@ function cloneJson(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
-test('compact_v1 expands the one exact unquantized obs and var contract', () => {
+test('compact_v2 expands the one exact unquantized obs and var contract', () => {
   const obs = expandObsManifest(currentObsManifest());
   assert.deepEqual(obs.fields, [
     {
       key: 'score',
       kind: 'continuous',
+      payloadIndex: 0,
       valuesPath: 'obs/0.values.f32',
       valuesDtype: 'float32',
       quantized: false,
@@ -309,6 +340,7 @@ test('compact_v1 expands the one exact unquantized obs and var contract', () => 
     {
       key: 'cluster',
       kind: 'category',
+      payloadIndex: 1,
       categories: ['A', 'B'],
       codesPath: 'obs/1.codes.u8',
       codesDtype: 'uint8',
@@ -316,8 +348,8 @@ test('compact_v1 expands the one exact unquantized obs and var contract', () => 
       outlierQuantilesPath: 'obs/1.outliers.f32',
       outlierDtype: 'float32',
       outlierQuantized: false,
-      centroidsByDim: {
-        '2': [
+      centroidsByEmbedding: {
+        X_umap: [
           { category: 'A', position: [0.25, -0.5], n_points: 1 },
           { category: 'B', position: [-0.25, 0.5], n_points: 1 },
         ],
@@ -333,9 +365,16 @@ test('compact_v1 expands the one exact unquantized obs and var contract', () => 
     valuesDtype: 'float32',
     quantized: false,
   }]);
+  // The expanded var manifest exposes the resolved gene name sets, not the
+  // gene id column the previous contract named.
+  assert.deepEqual(
+    variable.geneNameSets.map(set => ({ ...set })),
+    [{ source: null, names: ['Gene A'], filledFromIndex: 0, renamed: [] }]
+  );
+  assert.equal(Object.hasOwn(variable, 'var_gene_id_column'), false);
 });
 
-test('compact_v1 quantized schemas require exact codec metadata', () => {
+test('compact_v2 quantized schemas require exact codec metadata', () => {
   const obs = expandObsManifest(currentObsManifest({
     continuousSchema: {
       pathPattern: 'obs/{index}.values.u8.gz',
@@ -367,6 +406,7 @@ test('compact_v1 quantized schemas require exact codec metadata', () => {
   assert.deepEqual(obs.fields[0], {
     key: 'score',
     kind: 'continuous',
+    payloadIndex: 0,
     valuesPath: 'obs/0.values.u8.gz',
     valuesDtype: 'uint8',
     quantized: true,
@@ -379,6 +419,7 @@ test('compact_v1 quantized schemas require exact codec metadata', () => {
   assert.deepEqual(obs.fields[1], {
     key: 'cluster',
     kind: 'category',
+    payloadIndex: 1,
     categories: ['A'],
     codesPath: 'obs/1.codes.u16.gz',
     codesDtype: 'uint16',
@@ -388,7 +429,7 @@ test('compact_v1 quantized schemas require exact codec metadata', () => {
     outlierQuantized: true,
     outlierMinValue: 0,
     outlierMaxValue: 1,
-    centroidsByDim: {},
+    centroidsByEmbedding: {},
   });
 
   const variable = expandVarManifest(currentVarManifest({
@@ -416,12 +457,22 @@ test('compact_v1 quantized schemas require exact codec metadata', () => {
   });
 });
 
-test('direct AnnData manifests use the exact explicit-absence outlier state', () => {
+test('direct AnnData manifests use the exact explicit-absence outlier state', async () => {
   const adapter = Object.create(BaseAnnDataAdapter.prototype);
   adapter._loader = {
-    hasExpressionMatrix: true,
     nObs: 2,
-    varNames: ['Gene A'],
+    readVarNames: async () => ({ index: ['Gene A'], values: ['Gene A'] }),
+  };
+  adapter._closed = false;
+  adapter._lifecycleGeneration = 0;
+  adapter._geneNameSets = new Map();
+  // The file opens on X named by its var index.
+  adapter._candidates = {
+    defaults: { expression: 'X', geneNames: 'index' },
+    X: { n_vars: 1 },
+    raw: null,
+    layers: [],
+    var: { n_vars: 1, columns: [] },
   };
   adapter._obsFieldsMetadata = [
     { key: 'score', kind: 'continuous' },
@@ -429,6 +480,7 @@ test('direct AnnData manifests use the exact explicit-absence outlier state', ()
   ];
 
   const rawObs = adapter.getObsManifest();
+  assert.equal(rawObs._format, 'compact_v2');
   assert.deepEqual(rawObs._continuousFields, [[0, 'score']]);
   assert.deepEqual(rawObs._categoricalFields, [[
     1,
@@ -458,8 +510,17 @@ test('direct AnnData manifests use the exact explicit-absence outlier state', ()
     false
   );
 
+  assert.deepEqual(categorical.centroidsByEmbedding, {});
+
+  const rawVar = await adapter.getVarManifest();
+  assert.equal(rawVar._format, 'compact_v2');
+  assert.equal(Object.hasOwn(rawVar, 'var_gene_id_column'), false);
+  assert.deepEqual(rawVar.gene_name_sets, [
+    { source: null, filled_from_index: 0, renamed: [], names: null },
+  ]);
+  const expandedVar = expandVarManifest(rawVar);
   assert.deepEqual(
-    expandVarManifest(adapter.getVarManifest()).fields,
+    expandedVar.fields,
     [{
       key: 'Gene A',
       kind: 'continuous',
@@ -468,9 +529,10 @@ test('direct AnnData manifests use the exact explicit-absence outlier state', ()
       quantized: false,
     }]
   );
+  assert.deepEqual(expandedVar.geneNameSets[0].names, ['Gene A']);
 });
 
-test('compact_v1 rejects mixed categorical outlier availability states', () => {
+test('compact_v2 rejects mixed categorical outlier availability states', () => {
   const mixed = currentObsManifest({
     continuousFields: [],
     categoricalSchema: {
@@ -508,7 +570,7 @@ test('compact_v1 rejects mixed categorical outlier availability states', () => {
   );
 });
 
-test('compact_v1 rejects missing, extra, or contradictory schema properties', () => {
+test('compact_v2 rejects missing, extra, or contradictory schema properties', () => {
   const cases = [
     {
       label: 'missing top-level obs key',
@@ -599,7 +661,15 @@ test('compact_v1 rejects missing, extra, or contradictory schema properties', ()
       label: 'missing top-level var key',
       value: currentVarManifest(),
       mutate(value) {
-        delete value.var_gene_id_column;
+        delete value.gene_name_sets;
+      },
+      expand: expandVarManifest,
+    },
+    {
+      label: 'removed var_gene_id_column key',
+      value: currentVarManifest(),
+      mutate(value) {
+        value.var_gene_id_column = null;
       },
       expand: expandVarManifest,
     },
@@ -626,13 +696,13 @@ test('compact_v1 rejects missing, extra, or contradictory schema properties', ()
     mutate(candidate);
     assert.throws(
       () => expand(candidate),
-      /compact_v1|schema|property|properties|quantiz|field|latent_key|var_gene_id_column/i,
+      /compact_v2|schema|property|properties|quantiz|field|latent_key|gene_name_sets|var_gene_id_column/i,
       label
     );
   }
 });
 
-test('compact_v1 validates path templates and compression exactly', () => {
+test('compact_v2 validates path templates and compression exactly', () => {
   const cases = [
     ['missing key placeholder', value => {
       value._obsSchemas.continuous.pathPattern = 'obs/score.values.f32';
@@ -675,7 +745,7 @@ test('compact_v1 validates path templates and compression exactly', () => {
     mutate(candidate);
     assert.throws(
       () => expandObsManifest(candidate),
-      /path|placeholder|relative|compression|gzip|compact_v1/i,
+      /path|placeholder|relative|compression|gzip|compact_v2/i,
       label
     );
   }
@@ -688,7 +758,7 @@ test('compact_v1 validates path templates and compression exactly', () => {
   );
 });
 
-test('compact_v1 rejects malformed tuple arity, bounds, and payload indices', () => {
+test('compact_v2 rejects malformed tuple arity, bounds, and payload indices', () => {
   const continuousCases = [
     ['missing quantized bounds', [[0, 'score']]],
     ['partial quantized bounds', [[0, 'score', 0]]],
@@ -715,7 +785,7 @@ test('compact_v1 rejects malformed tuple arity, bounds, and payload indices', ()
     });
     assert.throws(
       () => expandObsManifest(candidate),
-      /tuple|field|key|bound|min|max|finite|range|compact_v1/i,
+      /tuple|field|key|bound|min|max|finite|range|compact_v2/i,
       label
     );
   }
@@ -772,11 +842,12 @@ test('compact_v1 rejects malformed tuple arity, bounds, and payload indices', ()
   );
 });
 
-test('compact_v1 categorical tuples enforce dtype, capacity, and sentinel', () => {
+test('compact_v2 categorical tuples enforce dtype, capacity, and sentinel', () => {
   const cases = [
     ['wrong uint8 sentinel', [0, 'group', ['A'], 'uint8', 65_535, {}]],
     ['wrong uint16 sentinel', [0, 'group', ['A'], 'uint16', 255, {}]],
-    ['unsupported dtype', [0, 'group', ['A'], 'uint32', 0xffff_ffff, {}]],
+    ['unsupported dtype', [0, 'group', ['A'], 'uint64', 0xffff_ffff, {}]],
+    ['wrong uint32 sentinel', [0, 'group', ['A'], 'uint32', 65_535, {}]],
     ['duplicate categories', [0, 'group', ['A', 'A'], 'uint8', 255, {}]],
     ['invalid category value', [0, 'group', [{}], 'uint8', 255, {}]],
     ['too many uint8 categories', [
@@ -804,7 +875,7 @@ test('compact_v1 categorical tuples enforce dtype, capacity, and sentinel', () =
         continuousFields: [],
         categoricalFields: [tuple],
       })),
-      /categor|dtype|sentinel|missing|tuple|capacity|unique|value|compact_v1/i,
+      /categor|dtype|sentinel|missing|tuple|capacity|unique|value|compact_v2/i,
       label
     );
   }
@@ -827,25 +898,46 @@ test('compact_v1 categorical tuples enforce dtype, capacity, and sentinel', () =
   );
 });
 
-test('compact_v1 validates every centroid dimension and category reference', () => {
+test('compact_v2 validates every centroid embedding and category reference', () => {
   const centroidCases = [
-    ['invalid dimension', {
-      '4': [{ category: 'A', position: [0, 0, 0, 0], n_points: 1 }],
+    ['four-component position', {
+      X_umap: [{ category: 'A', position: [0, 0, 0, 0], n_points: 1 }],
     }],
-    ['wrong position arity', {
-      '2': [{ category: 'A', position: [0], n_points: 1 }],
+    ['empty position', {
+      X_umap: [{ category: 'A', position: [], n_points: 1 }],
+    }],
+    ['positions of one embedding disagree on arity', {
+      X_umap: [
+        { category: 'A', position: [0, 0], n_points: 1 },
+        { category: 'B', position: [0], n_points: 1 },
+      ],
+    }],
+    ['empty embedding id', {
+      '': [{ category: 'A', position: [0, 0], n_points: 1 }],
+    }],
+    ['centroid list is not an array', {
+      X_umap: { category: 'A', position: [0, 0], n_points: 1 },
     }],
     ['nonfinite position', {
-      '2': [{ category: 'A', position: [0, Number.NaN], n_points: 1 }],
+      X_umap: [{ category: 'A', position: [0, Number.NaN], n_points: 1 }],
     }],
     ['unknown category', {
-      '2': [{ category: 'B', position: [0, 0], n_points: 1 }],
+      X_umap: [{ category: 'C', position: [0, 0], n_points: 1 }],
+    }],
+    ['duplicate category', {
+      X_umap: [
+        { category: 'A', position: [0, 0], n_points: 1 },
+        { category: 'A', position: [1, 1], n_points: 1 },
+      ],
     }],
     ['negative count', {
-      '2': [{ category: 'A', position: [0, 0], n_points: -1 }],
+      X_umap: [{ category: 'A', position: [0, 0], n_points: -1 }],
+    }],
+    ['count above n_points', {
+      X_umap: [{ category: 'A', position: [0, 0], n_points: 3 }],
     }],
     ['extra centroid property', {
-      '2': [{
+      X_umap: [{
         category: 'A',
         position: [0, 0],
         n_points: 1,
@@ -859,10 +951,170 @@ test('compact_v1 validates every centroid dimension and category reference', () 
       () => expandObsManifest(currentObsManifest({
         continuousFields: [],
         categoricalFields: [[
-          0, 'group', ['A'], 'uint8', 255, centroids,
+          0, 'group', ['A', 'B'], 'uint8', 255, centroids,
         ]],
       })),
-      /centroid|dimension|position|category|n_points|property|finite/i,
+      /centroid|dimension|position|category|n_points|property|finite|embedding id|array/i,
+      label
+    );
+  }
+
+  // Centroids are keyed by embedding id: one field may carry centroids for
+  // several embeddings of different dimensions, and every one is kept as-is.
+  const multi = {
+    X_umap: [{ category: 'A', position: [0.5, -0.5], n_points: 1 }],
+    X_pca_3d: [{ category: 'B', position: [0, 0.25, 1], n_points: 1 }],
+    trajectory: [{ category: 'A', position: [0.75], n_points: 2 }],
+  };
+  const [field] = expandObsManifest(currentObsManifest({
+    continuousFields: [],
+    categoricalFields: [[0, 'group', ['A', 'B'], 'uint8', 255, multi]],
+  })).fields;
+  assert.deepEqual(field.centroidsByEmbedding, multi);
+  assert.equal(Object.hasOwn(field, 'centroidsByDim'), false);
+});
+
+function centroidIdentity() {
+  return {
+    embeddings: {
+      default_dimension: 2,
+      defaults: { '1d': 'trajectory', '2d': 'X_umap' },
+      items: {
+        trajectory: {
+          label: 'trajectory',
+          dimension: 1,
+          file: 'embeddings/0_1d.bin',
+          source: { key: 'trajectory', columns: [0] },
+        },
+        X_umap: {
+          label: 'X_umap',
+          dimension: 2,
+          file: 'embeddings/1_2d.bin',
+          source: { key: 'X_umap', columns: [0, 1] },
+        },
+      },
+    },
+  };
+}
+
+function centroidObsManifest(centroids) {
+  return expandObsManifest(currentObsManifest({
+    continuousFields: [],
+    categoricalFields: [[0, 'group', ['A', 'B'], 'uint8', 255, centroids]],
+  }));
+}
+
+test('centroidsByEmbedding is cross-checked against the identity embedding items', () => {
+  // Accepted: every id is an identity item and every position has that
+  // item's dimension; a field may omit embeddings.
+  validateCentroidEmbeddings(centroidIdentity(), centroidObsManifest({
+    trajectory: [{ category: 'A', position: [0.5], n_points: 1 }],
+    X_umap: [{ category: 'B', position: [0, 1], n_points: 1 }],
+  }));
+  validateCentroidEmbeddings(centroidIdentity(), centroidObsManifest({}));
+
+  // A centroid for an embedding dataset_identity.json does not declare. A
+  // dimension name is not an embedding id.
+  for (const embeddingId of ['X_tsne', '2', '2d']) {
+    assert.throws(
+      () => validateCentroidEmbeddings(centroidIdentity(), centroidObsManifest({
+        [embeddingId]: [{ category: 'A', position: [0, 0], n_points: 1 }],
+      })),
+      new RegExp(
+        `centroids for embedding "${embeddingId}", which ` +
+        'dataset_identity.json does not declare'
+      ),
+      embeddingId
+    );
+  }
+
+  // A position whose arity is not the dimension of the item it names.
+  assert.throws(
+    () => validateCentroidEmbeddings(centroidIdentity(), centroidObsManifest({
+      X_umap: [{ category: 'A', position: [0], n_points: 1 }],
+    })),
+    /centroids for "X_umap" must have 2 coordinates/
+  );
+  assert.throws(
+    () => validateCentroidEmbeddings(centroidIdentity(), centroidObsManifest({
+      trajectory: [{ category: 'A', position: [0, 0], n_points: 1 }],
+    })),
+    /centroids for "trajectory" must have 1 coordinates/
+  );
+});
+
+test('gene_name_sets resolves every alternative name set exactly', () => {
+  const fields = [[0, 'Gene A'], [1, 'Gene B'], [2, 'Gene C']];
+  const expanded = expandVarManifest(currentVarManifest({
+    fields,
+    geneNameSets: [
+      { source: 'gene_ids', filled_from_index: 0, renamed: [], names: null },
+      {
+        source: 'symbol',
+        filled_from_index: 1,
+        renamed: [['SYM', 'SYM-1']],
+        names: ['SYM-1', null, 'GC'],
+      },
+    ],
+  }));
+  assert.deepEqual(
+    expanded.geneNameSets.map(set => ({
+      ...set,
+      names: [...set.names],
+      renamed: set.renamed.map(pair => [...pair]),
+    })),
+    [
+      {
+        source: 'gene_ids',
+        names: ['Gene A', 'Gene B', 'Gene C'],
+        filledFromIndex: 0,
+        renamed: [],
+      },
+      {
+        source: 'symbol',
+        names: ['SYM-1', 'Gene B', 'GC'],
+        filledFromIndex: 1,
+        renamed: [['SYM', 'SYM-1']],
+      },
+    ]
+  );
+  assert.equal(Object.isFrozen(expanded.geneNameSets[1]), true);
+  assert.equal(Object.isFrozen(expanded.geneNameSets[1].names), true);
+
+  const defaultSet = { source: null, filled_from_index: 0, renamed: [], names: null };
+  const alt = overrides => ({
+    source: 'symbol',
+    filled_from_index: 0,
+    renamed: [],
+    names: ['X', 'Y', 'Z'],
+    ...overrides,
+  });
+  const cases = [
+    ['empty list', [], /gene_name_sets must be a non-empty array/],
+    ['not an array', null, /gene_name_sets must be a non-empty array/],
+    ['extra set property', [{ ...defaultSet, label: 'x' }], /gene_name_sets\[0\]/],
+    ['missing set property', [{ source: null, filled_from_index: 0, names: null }], /gene_name_sets\[0\]/],
+    ['default set carries names', [{ ...defaultSet, names: ['X', 'Y', 'Z'] }], /gene_name_sets\[0\]\.names must be null/],
+    ['later set without a source', [defaultSet, alt({ source: null })], /gene_name_sets\[1\]\.source must be a non-empty string/],
+    ['empty source', [{ ...defaultSet, source: '' }], /gene_name_sets\[0\]\.source must be null or a non-empty string/],
+    ['duplicate source', [
+      { ...defaultSet, source: 'symbol' },
+      alt({ source: 'symbol' }),
+    ], /names a column another set already uses/],
+    ['index-named default filled from the index', [{ ...defaultSet, filled_from_index: 1 }], /filled_from_index/],
+    ['filled_from_index beyond the gene count', [defaultSet, alt({ filled_from_index: 4 })], /filled_from_index/],
+    ['fractional filled_from_index', [defaultSet, alt({ filled_from_index: 0.5 })], /filled_from_index/],
+    ['malformed renamed pair', [defaultSet, alt({ renamed: [['X']] })], /renamed must list/],
+    ['empty renamed name', [defaultSet, alt({ renamed: [['', 'X']] })], /renamed must list/],
+    ['names of the wrong length', [defaultSet, alt({ names: ['X', 'Y'] })], /names must hold one entry per field/],
+    ['name repeating the default', [defaultSet, alt({ names: ['Gene A', null, null] })], /repeats the default name/],
+    ['duplicate resolved names', [defaultSet, alt({ names: ['Gene B', null, null] })], /duplicated/],
+    ['undrawable name', [defaultSet, alt({ names: [' X', null, null] })], /cannot be displayed exactly/],
+  ];
+  for (const [label, geneNameSets, pattern] of cases) {
+    assert.throws(
+      () => expandVarManifest(currentVarManifest({ fields, geneNameSets })),
+      pattern,
       label
     );
   }
@@ -870,7 +1122,7 @@ test('compact_v1 validates every centroid dimension and category reference', () 
 
 test('custom protocol resolution requires one registered exact resolver', async t => {
   await t.test('rejects a custom protocol with no registered source', async () => {
-    const manager = createDataSourceManager();
+    const manager = new DataSourceManager();
     manager.registerProtocol('strict://', 'strict-source');
 
     await assert.rejects(
@@ -880,7 +1132,7 @@ test('custom protocol resolution requires one registered exact resolver', async 
   });
 
   await t.test('never calls the removed getFileUrl alternative', async () => {
-    const manager = createDataSourceManager();
+    const manager = new DataSourceManager();
     let getFileUrlCalls = 0;
     manager.registerProtocol('strict://', 'strict-source');
     manager.registerSource('strict-source', {
@@ -901,7 +1153,7 @@ test('custom protocol resolution requires one registered exact resolver', async 
   });
 
   await t.test('delegates the complete URL and exact signal once', async () => {
-    const manager = createDataSourceManager();
+    const manager = new DataSourceManager();
     const controller = new AbortController();
     const requestedUrl = 'strict://dataset/values.bin';
     let calls = 0;
@@ -927,7 +1179,7 @@ test('custom protocol resolution requires one registered exact resolver', async 
 });
 
 test('custom protocol registry preserves every prototype-named protocol as an exact own handler', () => {
-  const manager = createDataSourceManager();
+  const manager = new DataSourceManager();
   const prototypeNames = Object.getOwnPropertyNames(Object.prototype);
   const prototypeDescriptors = Object.getOwnPropertyDescriptors(
     Object.prototype,
@@ -1017,7 +1269,7 @@ test('field loaders reject incomplete scientific codec metadata before fetching'
         outlierQuantilesPath: 'obs/1.outliers.f32',
         outlierDtype: 'float32',
         outlierQuantized: false,
-        centroidsByDim: {},
+        centroidsByEmbedding: {},
       },
     },
     {
@@ -1241,6 +1493,7 @@ test('field quantization selects one backend before fetch and never refetches af
 test('quantization worker boundaries enforce the same exact scientific task', async () => {
   const validTask = () => ({
     buffer: Uint8Array.of(0, 127, 254, 255).buffer,
+    gzipOutputBytes: null,
     dtype: 'uint8',
     bits: 8,
     minValue: 10,
@@ -1253,9 +1506,21 @@ test('quantization worker boundaries enforce the same exact scientific task', as
     null,
     {
       buffer: Uint8Array.of(0).buffer,
+      gzipOutputBytes: null,
       dtype: 'uint8',
       minValue: 0,
       maxValue: 1,
+    },
+    {
+      buffer: Uint8Array.of(0).buffer,
+      dtype: 'uint8',
+      bits: 8,
+      minValue: 0,
+      maxValue: 1,
+    },
+    {
+      ...validTask(),
+      gzipOutputBytes: 1.5,
     },
     {
       ...validTask(),
@@ -1276,6 +1541,15 @@ test('quantization worker boundaries enforce the same exact scientific task', as
     },
     {
       buffer: new ArrayBuffer(1),
+      gzipOutputBytes: null,
+      dtype: 'uint16',
+      bits: 16,
+      minValue: 0,
+      maxValue: 1,
+    },
+    {
+      buffer: new ArrayBuffer(8),
+      gzipOutputBytes: 3,
       dtype: 'uint16',
       bits: 16,
       minValue: 0,
@@ -1285,21 +1559,21 @@ test('quantization worker boundaries enforce the same exact scientific task', as
   for (const task of invalidTasks) {
     assert.throws(
       () => validateQuantizationTask(task),
-      /quantization.*(object|propert|dtype|bits|finite|minValue|byte length)/i
+      /quantization.*(object|propert|dtype|bits|finite|minValue|byte length|gzipOutputBytes)/i
     );
     await assert.rejects(
       dequantizeToFloat32InWorker(task),
-      /quantization.*(object|propert|dtype|bits|finite|minValue|byte length)/i
+      /quantization.*(object|propert|dtype|bits|finite|minValue|byte length|gzipOutputBytes)/i
     );
   }
 
   const decoded = new Float32Array(
-    dequantizeToFloat32Buffer(validTask())
+    await dequantizeToFloat32Buffer(validTask())
   );
   assert.deepEqual(Array.from(decoded.slice(0, 3)), [10, 15, 20]);
   assert.equal(Number.isNaN(decoded[3]), true);
 
-  const response = processQuantizationWorkerMessage({
+  const response = await processQuantizationWorkerMessage({
     type: 'DEQUANTIZE_TO_F32',
     payload: validTask(),
     requestId: 'request-1',
@@ -1309,15 +1583,15 @@ test('quantization worker boundaries enforce the same exact scientific task', as
     Array.from(new Float32Array(response.result.buffer).slice(0, 3)),
     [10, 15, 20]
   );
-  assert.throws(
-    () => processQuantizationWorkerMessage({
+  await assert.rejects(
+    processQuantizationWorkerMessage({
       type: 'DEQUANTIZE_TO_F32',
       payload: validTask(),
     }),
     /exactly type, payload, and requestId/i
   );
-  assert.throws(
-    () => processQuantizationWorkerMessage({
+  await assert.rejects(
+    processQuantizationWorkerMessage({
       type: 'DEQUANTIZE',
       payload: validTask(),
       requestId: 'request-2',
@@ -1334,35 +1608,116 @@ test('quantization worker boundaries enforce the same exact scientific task', as
     /only poolSize/i
   );
 
+});
+
+/**
+ * A scripted stand-in for the quantization worker. Each instance decodes with
+ * the real worker function unless the test tells it to crash or to reply with
+ * a malformed response.
+ */
+function installScriptedWorkers(t) {
+  const original = Object.getOwnPropertyDescriptor(globalThis, 'Worker');
+  const instances = [];
+  class ScriptedWorker {
+    constructor() {
+      this.mode = 'decode';
+      this.terminated = false;
+      this.onmessage = null;
+      this.onerror = null;
+      instances.push(this);
+    }
+    postMessage(message) {
+      queueMicrotask(async () => {
+        if (this.terminated) return;
+        if (this.mode === 'crash') {
+          this.onerror?.({ message: 'worker crashed', preventDefault() {} });
+          return;
+        }
+        if (this.mode === 'malformed') {
+          this.onmessage?.({
+            data: {
+              requestId: message.requestId,
+              success: 1,
+              result: { buffer: new ArrayBuffer(4) },
+            },
+          });
+          return;
+        }
+        const data = await processQuantizationWorkerMessage(message);
+        if (this.terminated) return;
+        this.onmessage?.({ data });
+      });
+    }
+    terminate() {
+      this.terminated = true;
+    }
+  }
+  Object.defineProperty(globalThis, 'Worker', {
+    configurable: true,
+    writable: true,
+    value: ScriptedWorker,
+  });
+  t.after(() => {
+    if (original === undefined) delete globalThis.Worker;
+    else Object.defineProperty(globalThis, 'Worker', original);
+  });
+  return instances;
+}
+
+test('one quantization worker failure fails only its own request', async t => {
+  const validTask = () => ({
+    buffer: Uint8Array.of(0, 127, 254, 255).buffer,
+    gzipOutputBytes: null,
+    dtype: 'uint8',
+    bits: 8,
+    minValue: 10,
+    maxValue: 20,
+  });
+  const instances = installScriptedWorkers(t);
   const pool = new QuantizationWorkerPool({ poolSize: 1 });
-  let responseError = null;
-  pool._available = true;
-  pool.workers = [{ terminate() {} }];
-  pool.states = ['busy'];
-  pool.queues = [[]];
-  pool._pending.set('request-malformed', {
-    resolve() {},
-    reject(error) {
-      responseError = error;
-    },
-    workerIndex: 0,
-  });
-  pool._handleMessage(0, {
-    data: {
-      requestId: 'request-malformed',
-      success: 1,
-      result: { buffer: new ArrayBuffer(4) },
-    },
-  });
-  assert.match(
-    responseError?.message ?? '',
+  assert.equal(await pool.init(), true);
+  assert.equal(instances.length, 1);
+
+  // The first request crashes its worker; the two queued behind it on the
+  // same slot must still decode, on a replacement worker.
+  instances[0].mode = 'crash';
+  const outcomes = await Promise.allSettled([
+    pool.dequantizeToFloat32(validTask()),
+    pool.dequantizeToFloat32(validTask()),
+    pool.dequantizeToFloat32(validTask()),
+  ]);
+  assert.equal(outcomes[0].status, 'rejected');
+  assert.match(outcomes[0].reason.message, /worker crashed/);
+  for (const outcome of outcomes.slice(1)) {
+    assert.equal(outcome.status, 'fulfilled');
+    assert.deepEqual(Array.from(outcome.value.slice(0, 3)), [10, 15, 20]);
+  }
+  assert.equal(instances[0].terminated, true);
+  assert.equal(instances.length, 2, 'the failed worker is replaced once');
+  assert.equal(pool._available, true);
+
+  // A malformed response is a protocol failure of that worker alone.
+  instances[1].mode = 'malformed';
+  await assert.rejects(
+    pool.dequantizeToFloat32(validTask()),
     /success must be a boolean/i
   );
-  assert.equal(pool._available, false);
+  assert.equal(instances[1].terminated, true);
+  const later = await pool.dequantizeToFloat32(validTask());
+  assert.deepEqual(Array.from(later.slice(0, 3)), [10, 15, 20]);
+  assert.equal(instances.length, 3);
+  assert.equal(pool._pending.size, 0);
+
+  // Late events from a retired worker cannot touch its replacement's work.
+  instances[0].onerror?.({ message: 'stale failure' });
+  instances[1].onmessage?.({ data: { requestId: 'stale', success: false, error: 'x' } });
+  const afterStale = await pool.dequantizeToFloat32(validTask());
+  assert.deepEqual(Array.from(afterStale.slice(0, 3)), [10, 15, 20]);
+  assert.equal(instances[2].terminated, false);
 });
 
 test('a constant quantized field decodes to its exact value, never NaN or Infinity', async t => {
-  // compact_v1 publishes a field carrying one value as equal bounds with every
+  // compact_v2 publishes a field carrying one value as equal bounds with every
   // code 0 -- a gene a lineage subset left undetected, or an obs column the
   // subset flattened. Scaling by (maxValue - minValue) would divide by zero and
   // hand every cell of that gene a NaN or an Infinity, so both decoders take an
@@ -1381,6 +1736,7 @@ test('a constant quantized field decodes to its exact value, never NaN or Infini
 
       const task = {
         buffer: codes.buffer,
+        gzipOutputBytes: null,
         dtype,
         bits,
         minValue: constant,
@@ -1389,7 +1745,7 @@ test('a constant quantized field decodes to its exact value, never NaN or Infini
       // Equal bounds are a valid codec, not a malformed one.
       assert.strictEqual(validateQuantizationTask(task), task, label);
 
-      const decoded = new Float32Array(dequantizeToFloat32Buffer(task));
+      const decoded = new Float32Array(await dequantizeToFloat32Buffer(task));
       assert.deepEqual(
         Array.from(decoded.slice(0, 3)),
         [constant, constant, constant],
@@ -1574,4 +1930,161 @@ test('direct AnnData categorical fields do not invent outlier statistics', async
     Object.hasOwn(result, 'outlierQuantiles'),
     false
   );
+});
+
+test('field names follow the display-text rule every DataState inventory read applies', async () => {
+  const { StateValidator } = await import('../assets/js/app/utils/state-validator.js');
+  for (const name of ['cell_type ', ' cell_type', 'cell​type', 'cell\ttype']) {
+    assert.throws(() => StateValidator.validateFieldKey(name));
+    assert.throws(
+      () => expandObsManifest(currentObsManifest({ continuousFields: [[0, name]] })),
+      /obs manifest: field name .* cannot be displayed exactly/
+    );
+    assert.throws(
+      () => expandVarManifest(currentVarManifest({ fields: [[0, name]] })),
+      /var manifest: field name .* cannot be displayed exactly/
+    );
+  }
+  // Drawable names the writers publish stay accepted, however long.
+  const long = 'g'.repeat(400);
+  for (const name of ['chr1:100-200', long]) {
+    assert.equal(
+      expandObsManifest(currentObsManifest({ continuousFields: [[0, name]] }))
+        .fields[0].key,
+      name
+    );
+    assert.equal(
+      expandVarManifest(currentVarManifest({ fields: [[0, name]] })).fields[0].key,
+      name
+    );
+  }
+});
+
+test('category labels the writers publish are valid at any length', async () => {
+  const { StateValidator } = await import('../assets/js/app/utils/state-validator.js');
+  assert.equal(StateValidator.validateCategoryLabel('L'.repeat(300)), true);
+});
+
+test('the table decoder is bit identical to the per-cell quantization formula', () => {
+  // `decodeQuantizedToFloat32` decodes through one table entry per code. Each
+  // entry is the same double expression the per-cell formula evaluated, stored
+  // into Float32 the same way, so every code — not a sample of them — must
+  // decode to the identical bit pattern.
+  const boundsList = [
+    [0, 3.2],
+    [-1.5, 7.123456],
+    [0.1, 0.1000001],
+    [-3.4028234663852886e38, 3.4028234663852886e38],
+    [1e-30, 2e-30],
+    [5.5, 5.5],
+    [-0, -0],
+  ];
+  for (const bits of [8, 16]) {
+    const nanMarker = bits === 8 ? 255 : 65535;
+    const codes = bits === 8 ? new Uint8Array(256) : new Uint16Array(65536);
+    for (let code = 0; code < codes.length; code++) codes[code] = code;
+    for (const [minValue, maxValue] of boundsList) {
+      const reference = new Float32Array(codes.length);
+      const scale = (maxValue - minValue) / (nanMarker - 1);
+      for (let code = 0; code < codes.length; code++) {
+        reference[code] = code === nanMarker
+          ? NaN
+          : (minValue === maxValue ? minValue : minValue + code * scale);
+      }
+      const decoded = decodeQuantizedToFloat32(codes, minValue, maxValue, bits);
+      assert.deepEqual(
+        new Uint32Array(decoded.buffer),
+        new Uint32Array(reference.buffer),
+        `${bits}-bit [${minValue}, ${maxValue}]`
+      );
+    }
+  }
+});
+
+test('a gzip transfer decodes in the worker to the same values as a plain one', async () => {
+  const codes = Uint16Array.of(0, 1, 32767, 65534, 65535, 12345);
+  const plain = {
+    buffer: codes.slice().buffer,
+    gzipOutputBytes: null,
+    dtype: 'uint16',
+    bits: 16,
+    minValue: -2,
+    maxValue: 9.75,
+  };
+  const compressed = new Uint8Array(gzipSync(new Uint8Array(codes.buffer)));
+  const gzip = {
+    ...plain,
+    buffer: compressed.buffer.slice(
+      compressed.byteOffset,
+      compressed.byteOffset + compressed.byteLength
+    ),
+    gzipOutputBytes: codes.byteLength,
+  };
+  assert.deepEqual(
+    new Uint32Array(await dequantizeToFloat32Buffer(gzip)),
+    new Uint32Array(await dequantizeToFloat32Buffer(plain))
+  );
+
+  // The exact inflated length is a bound, not a hint: one byte short is a
+  // malformed transfer, never a truncated decode.
+  await assert.rejects(
+    dequantizeToFloat32Buffer({
+      ...gzip,
+      buffer: gzip.buffer.slice(0),
+      gzipOutputBytes: codes.byteLength - 2,
+    }),
+    /Decompressed data|gzip/i
+  );
+});
+
+test('a quantized gzip field decodes identically on the worker and main-thread backends', async t => {
+  const codes = Uint8Array.of(0, 127, 254, 255);
+  const compressed = new Uint8Array(gzipSync(codes));
+  const manager = getDataSourceManager();
+  const originalActiveSource = manager.activeSource;
+  const originalFetch = globalThis.fetch;
+  manager.activeSource = null;
+  globalThis.fetch = async () => new Response(compressed.slice());
+  t.after(() => {
+    manager.activeSource = originalActiveSource;
+    globalThis.fetch = originalFetch;
+  });
+  const [geneField] = expandVarManifest(currentVarManifest({
+    schema: {
+      kind: 'continuous',
+      pathPattern: 'var/{index}.values.u8.gz',
+      ext: 'u8',
+      dtype: 'uint8',
+      quantized: true,
+      quantizationBits: 8,
+    },
+    fields: [[0, 'GZ', 10, 20]],
+    quantization: 8,
+    compression: 6,
+  })).fields;
+  const manifest = 'https://example.test/var_manifest.json';
+
+  const mainThread = await loadVarFieldData(manifest, geneField, { pointCount: 4 });
+  installScriptedWorkers(t);
+  // The loader decodes through the shared pool, whose slots an earlier test
+  // filled with deliberately failing workers. A failed slot is replaced by the
+  // worker class installed at that moment, so two rounds of requests over every
+  // slot leave only scripted workers behind.
+  await Promise.allSettled(Array.from({ length: 8 }, () =>
+    dequantizeToFloat32InWorker({
+      buffer: Uint8Array.of(0).buffer,
+      gzipOutputBytes: null,
+      dtype: 'uint8',
+      bits: 8,
+      minValue: 0,
+      maxValue: 1,
+    })
+  ));
+  const worker = await loadVarFieldData(manifest, geneField, { pointCount: 4 });
+  assert.deepEqual(
+    new Uint32Array(worker.values.buffer),
+    new Uint32Array(mainThread.values.buffer)
+  );
+  assert.deepEqual(Array.from(mainThread.values.slice(0, 3)), [10, 15, 20]);
+  assert.equal(Number.isNaN(mainThread.values[3]), true);
 });

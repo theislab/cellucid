@@ -242,3 +242,28 @@ test('every status text token clears AA on the surfaces status panels use', () =
     `Status text pairs below ${NORMAL_TEXT_MINIMUM}:1:\n${failures.join('\n')}`,
   );
 });
+
+/* `--color-text-disabled` is deliberately below AA (1.5:1 on white in light
+   theme): it marks a control that cannot be used, where low contrast is the
+   message. Painting a result with it hides the result instead. The
+   correlation table rendered "Very Weak / None" in it, so the one strength
+   label a reader most needs to see was the one they could barely read. */
+test('the disabled text colour only paints rules that select a disabled state', () => {
+  const offenders = [];
+  const DISABLED_STATE = /:disabled|\[disabled\]|\[aria-disabled|\.disabled\b|\.is-disabled\b/;
+  for (const [fileName, css] of componentStylesheets) {
+    const stripped = css.replace(/\/\*[\s\S]*?\*\//g, '');
+    for (const rule of stripped.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+      const selector = rule[1].trim();
+      if (!/--color-text-disabled\b/.test(rule[2])) continue;
+      const nonDisabled = selector
+        .split(',')
+        .map(part => part.trim())
+        .filter(part => !DISABLED_STATE.test(part));
+      if (nonDisabled.length > 0) {
+        offenders.push(`${fileName}: ${nonDisabled.join(', ')}`);
+      }
+    }
+  }
+  assert.deepEqual(offenders, []);
+});

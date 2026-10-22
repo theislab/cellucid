@@ -26,8 +26,9 @@ import { sha256Hex } from '../utils/sha256.js';
 
 const MANIFEST_FILENAME = 'state-snapshots.json';
 const DEFAULT_STATE_FILENAME = 'default.cellucid-session';
+// The manifest has one valid shape, `{ "states": ["default.cellucid-session"] }`
+// (43 bytes as written), so a few kilobytes is its format bound, not a policy.
 const MAX_MANIFEST_BYTES = 4096;
-const MAX_STATE_BYTES = 32768;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 const DESCRIPTOR_KEYS = Object.freeze([
   'baseUrl',
@@ -36,6 +37,7 @@ const DESCRIPTOR_KEYS = Object.freeze([
   'manifestUrl',
   'selectionRevision',
   'sourceType',
+  'stateBytes',
   'stateSha256',
 ]);
 
@@ -150,6 +152,11 @@ function assertDatasetStateDescriptor(value) {
       'Dataset state SHA-256 must be one lowercase digest.'
     );
   }
+  if (!Number.isSafeInteger(value.stateBytes) || value.stateBytes < 1) {
+    throw new TypeError(
+      'Dataset state byte length must be a positive safe integer.'
+    );
+  }
   const expectedManifestUrl = new URL(MANIFEST_FILENAME, baseUrl).href;
   if (value.manifestUrl !== expectedManifestUrl) {
     throw new TypeError(
@@ -163,6 +170,7 @@ function assertDatasetStateDescriptor(value) {
     manifestUrl: expectedManifestUrl,
     selectionRevision: value.selectionRevision,
     sourceType: 'local-demo',
+    stateBytes: value.stateBytes,
     stateSha256: value.stateSha256,
   });
 }
@@ -271,29 +279,54 @@ function assertFetchArtifact(value) {
   return value;
 }
 
+function assertRequestStep(value) {
+  if (typeof value !== 'function') {
+    throw new TypeError(
+      'Dataset state requestStep must be a function.'
+    );
+  }
+  return value;
+}
+
+/**
+ * Fetch one bounded sidecar as one request step: the response and its whole
+ * body run inside `requestStep(url, operation)`, whose runner hands
+ * `operation` a signal it may abort (startup aborts it at its step deadline).
+ * The request observes that signal and the restore's own signal.
+ */
 async function fetchBoundedArtifact({
   accept,
   fetchArtifact,
   maxBytes,
   owner,
+  requestStep,
   signal,
   url,
 }) {
   throwIfAborted(signal);
-  const response = assertResponse(
-    await fetchArtifact(url, {
-      cache: 'no-store',
-      headers: { accept },
-      method: 'GET',
-      signal,
-    }),
-    owner
-  );
-  throwIfAborted(signal);
-  if (response.ok !== true) {
-    throw new Error(`${owner} request failed with HTTP ${response.status}.`);
-  }
-  return readBoundedBytes(response, signal, maxBytes, owner);
+  return requestStep(url, async stepSignal => {
+    if (!(stepSignal instanceof AbortSignal)) {
+      throw new TypeError(
+        `${owner} request step must provide an AbortSignal.`
+      );
+    }
+    const requestSignal = AbortSignal.any([signal, stepSignal]);
+    const response = assertResponse(
+      // Revalidated like every dataset artifact (DATASET_ARTIFACT_CACHE in
+      // data/data-source.js); the catalog's state_sha256 pins the bytes.
+      await fetchArtifact(url, {
+        headers: { accept },
+        method: 'GET',
+        signal: requestSignal,
+      }),
+      owner
+    );
+    throwIfAborted(requestSignal);
+    if (response.ok !== true) {
+      throw new Error(`${owner} request failed with HTTP ${response.status}.`);
+    }
+    return readBoundedBytes(response, requestSignal, maxBytes, owner);
+  });
 }
 
 export function assertDatasetStateManifest(value) {
@@ -313,7 +346,7 @@ export function assertDatasetStateManifest(value) {
 export async function loadCurrentDatasetStateTarget(options) {
   assertExactKeys(
     options,
-    ['dataSourceManager', 'fetchArtifact', 'signal'],
+    ['dataSourceManager', 'fetchArtifact', 'requestStep', 'signal'],
     'Dataset state target options'
   );
   const manager = assertOwner(
@@ -321,6 +354,7 @@ export async function loadCurrentDatasetStateTarget(options) {
     'Dataset state data source manager'
   );
   const fetchArtifact = assertFetchArtifact(options.fetchArtifact);
+  const requestStep = assertRequestStep(options.requestStep);
   const signal = assertAbortSignal(options.signal);
   throwIfAborted(signal);
 
@@ -331,6 +365,7 @@ export async function loadCurrentDatasetStateTarget(options) {
     fetchArtifact,
     maxBytes: MAX_MANIFEST_BYTES,
     owner: MANIFEST_FILENAME,
+    requestStep,
     signal,
     url: descriptor.manifestUrl,
   });
@@ -358,6 +393,7 @@ export async function restoreCurrentDatasetState(options) {
       'fetchArtifact',
       'getPublicationRevision',
       'refreshUi',
+      'requestStep',
       'sessionSerializer',
       'signal',
     ],
@@ -368,6 +404,7 @@ export async function restoreCurrentDatasetState(options) {
     'Dataset state restore data source manager'
   );
   const fetchArtifact = assertFetchArtifact(options.fetchArtifact);
+  const requestStep = assertRequestStep(options.requestStep);
   const serializer = assertOwner(
     options.sessionSerializer,
     'Dataset state session serializer'
@@ -403,6 +440,7 @@ export async function restoreCurrentDatasetState(options) {
   const target = await loadCurrentDatasetStateTarget({
     dataSourceManager: manager,
     fetchArtifact,
+    requestStep,
     signal,
   });
   if (target === null) return false;
@@ -412,14 +450,23 @@ export async function restoreCurrentDatasetState(options) {
   const stateBytes = await fetchBoundedArtifact({
     accept: 'application/octet-stream',
     fetchArtifact,
-    maxBytes: MAX_STATE_BYTES,
+    // The catalog declares the state's exact length (state_bytes) and its
+    // digest (state_sha256): the read stops past the declared length, and
+    // there is no other size limit.
+    maxBytes: target.stateBytes,
     owner: DEFAULT_STATE_FILENAME,
+    requestStep,
     signal,
     url: target.stateUrl,
   });
   throwIfAborted(signal);
   assertPublication();
   assertCurrentDescriptor(manager, target);
+  if (stateBytes.byteLength !== target.stateBytes) {
+    throw new Error(
+      `Default dataset state is ${stateBytes.byteLength} bytes; the catalog declares ${target.stateBytes}.`
+    );
+  }
   const actualSha256 = await sha256Hex(stateBytes);
   throwIfAborted(signal);
   if (actualSha256 !== target.stateSha256) {

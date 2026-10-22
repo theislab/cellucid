@@ -48,7 +48,7 @@ test('renderer facade recursively fences cached ownership and reflection escapes
         },
       );
       this.buffers = {
-        interleaved: { id: 'buffer' },
+        positions: { id: 'buffer' },
       };
       this.spatialMembership = Object.freeze({
         admissionLevels: new Uint8Array([8, 10]),
@@ -104,12 +104,12 @@ test('renderer facade recursively fences cached ownership and reflection escapes
         visiblePoints: 7,
       };
       this._positions = new Float32Array([1, 2, 3]);
-      this._maximumIndices = new Uint32Array([3, 5]);
-      this._lodResourceOwnersByDimension = new Map([
+      this._drawIndices = new Uint32Array([3, 5]);
+      this._snapshotGeometryPools = new Map([
         [2, Object.freeze({
-          maximumIndices: this._maximumIndices,
-          topologyOwner: Object.freeze({
-            admissionLevels: new Uint8Array([4, 6]),
+          positions: new Float32Array([7, 8]),
+          order: Object.freeze({
+            drawOrder: Object.freeze({ indices: this._drawIndices }),
           }),
         })],
       ]);
@@ -242,6 +242,7 @@ test('renderer facade recursively fences cached ownership and reflection escapes
   const facade = createViewerRendererFacade(
     renderer,
     () => terminalState,
+    () => {},
   );
 
   const programs = facade.programs;
@@ -269,17 +270,14 @@ test('renderer facade recursively fences cached ownership and reflection escapes
   const detachedPositions = facade._positions;
   detachedPositions[0] = 99;
   assert.equal(renderer._positions[0], 1);
-  const detachedLodOwner =
-    facade._lodResourceOwnersByDimension.get(2);
-  detachedLodOwner.maximumIndices[0] = 99;
-  detachedLodOwner.topologyOwner.admissionLevels[0] = 99;
-  assert.deepEqual([...renderer._maximumIndices], [3, 5]);
+  const detachedGeometry =
+    facade._snapshotGeometryPools.get(2);
+  detachedGeometry.order.drawOrder.indices[0] = 99;
+  detachedGeometry.positions[0] = 99;
+  assert.deepEqual([...renderer._drawIndices], [3, 5]);
   assert.deepEqual(
-    [
-      ...renderer._lodResourceOwnersByDimension
-        .get(2).topologyOwner.admissionLevels,
-    ],
-    [4, 6],
+    [...renderer._snapshotGeometryPools.get(2).positions],
+    [7, 8],
   );
 
   const detachedSpatialMembership =
@@ -562,7 +560,7 @@ test('renderer facade recursively fences cached ownership and reflection escapes
 
   const terminalMutations = [
     () => { programs.full = null; },
-    () => { buffers.interleaved = null; },
+    () => { buffers.positions = null; },
     () => { stats.visiblePoints = 0; },
     () => map.set(3, { id: 'late' }),
     () => callbackMap.clear(),
@@ -590,10 +588,65 @@ test('renderer facade recursively fences cached ownership and reflection escapes
   }
 
   assert.equal(renderer.programs.full.id, 'program');
-  assert.equal(renderer.buffers.interleaved.id, 'buffer');
+  assert.equal(renderer.buffers.positions.id, 'buffer');
   assert.equal(renderer.stats.visiblePoints, 7);
   assert.equal(renderer.spatialIndices.size, 2);
   assert.equal(renderer.list.length, 1);
   assert.equal(renderer.getterCalls, getterCallsAtFence);
   assert.equal(renderer.nestedGetter.calls, nestedGetterCallsAtFence);
+});
+
+test('renderer facade reports every drawing mutation and no read', () => {
+  class Renderer {
+    constructor() {
+      this.pointSize = 1;
+    }
+
+    getPointSize() {
+      return this.pointSize;
+    }
+
+    hasData() {
+      return true;
+    }
+
+    isReady() {
+      return true;
+    }
+
+    setPointSize(size) {
+      this.pointSize = size;
+    }
+  }
+  let mutations = 0;
+  const facade = createViewerRendererFacade(
+    new Renderer(),
+    () => null,
+    () => {
+      mutations += 1;
+    },
+  );
+
+  facade.getPointSize();
+  facade.hasData();
+  facade.isReady();
+  assert.equal(mutations, 0, 'reading the renderer must not request a frame');
+
+  facade.setPointSize(4);
+  assert.equal(mutations, 1);
+  facade.pointSize = 5;
+  assert.equal(mutations, 2);
+  Object.defineProperty(facade, 'extra', {
+    configurable: true,
+    value: 1,
+    writable: true,
+  });
+  assert.equal(mutations, 3);
+  delete facade.extra;
+  assert.equal(mutations, 4);
+
+  assert.throws(
+    () => createViewerRendererFacade(new Renderer(), () => null),
+    /mutation observer/,
+  );
 });

@@ -2,11 +2,13 @@
 // Used for small number of centroid points (WebGL2)
 // Uses RGBA uint8 normalized colors (same as main points)
 
+import { FULL_LIGHTING } from './high-perf-shaders.js';
+
 export const CENTROID_VS = `#version 300 es
 precision highp float;
 
-in vec3 a_position;
-in vec4 a_color; // RGBA packed as uint8, auto-normalized by WebGL
+layout(location = 0) in vec3 a_position;
+layout(location = 1) in vec4 a_color; // RGBA packed as uint8, auto-normalized by WebGL
 
 uniform mat4 u_mvpMatrix;
 uniform mat4 u_viewMatrix;
@@ -78,7 +80,7 @@ void main() {
   vec3 normal = vec3(coord.x, -coord.y, z);
   vec3 lightDir = normalize(vec3(0.5, 0.7, 0.5));
   float NdotL = max(dot(normal, lightDir), 0.0);
-  float lighting = 0.4 + 0.6 * NdotL;
+  float lighting = ${FULL_LIGHTING.ambient.toFixed(2)} + ${FULL_LIGHTING.diffuse.toFixed(2)} * NdotL;
 
   fragColor = vec4(v_color * lighting, v_alpha);
 }

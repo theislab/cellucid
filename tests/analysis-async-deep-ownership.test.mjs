@@ -173,6 +173,7 @@ test('correlation snapshots variable records and page IDs before its first await
     },
   };
   analysis._computeManager = {
+    async init() {},
     async execute() {
       return {
         correlation: 1,
@@ -274,6 +275,10 @@ function createDEMembershipProbe(indicesByPage) {
     },
     getCellIndicesForPage(pageId) {
       return indicesByPage[pageId];
+    },
+    // A local source: nothing is downloaded ahead.
+    async prefetchGenePayload() {
+      return null;
     },
     async ensureGeneExpressionLoaded() {
       calls.expressionRead += 1;

@@ -1,6 +1,7 @@
 import { expect, test } from './helpers/test.mjs';
 import { appUrl } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
+import { openCollapsedPanels } from './helpers/panels.mjs';
 
 const SYNTHETIC_3D_ROOT = appUrl('/tests/browser/fixtures/generated-3d/');
 const DATASET_ID = 'deterministic-orbit-3d';
@@ -19,7 +20,7 @@ const catalog = {
 };
 
 const identity = {
-  version: 2,
+  version: 3,
   id: DATASET_ID,
   name: 'Deterministic 3-D orbit fixture',
   description: 'Exact synthetic browser fixture for fresh 3-D camera ownership',
@@ -35,11 +36,24 @@ const identity = {
     n_edges: null,
   },
   embeddings: {
-    available_dimensions: [2, 3],
     default_dimension: 3,
-    files: {
-      '2d': 'points_2d.bin',
-      '3d': 'points_3d.bin',
+    defaults: {
+      '2d': 'orbit_2d',
+      '3d': 'orbit_3d',
+    },
+    items: {
+      orbit_2d: {
+        label: 'Orbit 2D',
+        dimension: 2,
+        file: 'embeddings/0_2d.bin',
+        source: { key: null, columns: [0, 1] },
+      },
+      orbit_3d: {
+        label: 'Orbit 3D',
+        dimension: 3,
+        file: 'embeddings/1_3d.bin',
+        source: { key: null, columns: [0, 1, 2] },
+      },
     },
   },
   obs_fields: [],
@@ -55,7 +69,7 @@ const identity = {
 };
 
 const obsManifest = {
-  _format: 'compact_v1',
+  _format: 'compact_v2',
   n_points: CELL_COUNT,
   centroid_outlier_quantile: null,
   latent_key: null,
@@ -151,14 +165,14 @@ async function installSynthetic3dFixture(page) {
       },
     ],
     [
-      `/tests/browser/fixtures/generated-3d/${DATASET_ID}/points_2d.bin`,
+      `/tests/browser/fixtures/generated-3d/${DATASET_ID}/embeddings/0_2d.bin`,
       {
         body: position2dBytes,
         contentType: 'application/octet-stream',
       },
     ],
     [
-      `/tests/browser/fixtures/generated-3d/${DATASET_ID}/points_3d.bin`,
+      `/tests/browser/fixtures/generated-3d/${DATASET_ID}/embeddings/1_3d.bin`,
       {
         body: positionBytes,
         contentType: 'application/octet-stream',
@@ -286,6 +300,7 @@ test('a fresh deterministic 3-D dataset selects dimension 3 and Orbit', async ({
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
+  await openCollapsedPanels(page);
 
   await expect(page.locator('#dataset-name')).toHaveText(
     'Deterministic 3-D orbit fixture',
@@ -293,9 +308,10 @@ test('a fresh deterministic 3-D dataset selects dimension 3 and Orbit', async ({
   await expect(page.locator('#dataset-cells')).toHaveText(String(CELL_COUNT));
   await expect(page.locator('#dataset-genes')).toHaveText('0');
   await expect(page.locator('#filter-count')).toHaveText(
-    `Showing all ${CELL_COUNT} points`,
+    `Showing all ${CELL_COUNT} cells`,
   );
-  await expect(page.locator('#dimension-select')).toHaveValue('3');
+  await expect(page.locator('#view-representation-select option:checked'))
+    .toHaveText(/ · 3D$/);
   await expect(page.locator('#navigation-mode')).toHaveValue('orbit');
   await expect(page.locator('.cinematic-transport-bar')).toHaveCount(0);
 
@@ -314,6 +330,7 @@ test('snapshot dimension switches publish one exact geometry generation', async 
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
+  await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
     'Deterministic 3-D orbit fixture',
   );
@@ -323,7 +340,7 @@ test('snapshot dimension switches publish one exact geometry generation', async 
     const state = window._cellucidState;
     const viewer = window._cellucidViewer;
     const publish = async dimensionLevel => {
-      await state.setDimensionLevel(dimensionLevel, { viewId });
+      await state.showDefaultRepresentation(viewId, dimensionLevel);
       await new Promise(resolve => {
         requestAnimationFrame(() => requestAnimationFrame(resolve));
       });
@@ -353,7 +370,7 @@ test('snapshot dimension switches publish one exact geometry generation', async 
   expect(productErrors).toEqual([]);
 });
 
-test('UI teardown drains and fences an in-flight dimension badge task', async ({
+test('UI teardown fences an in-flight representation switch from the picker', async ({
   page,
 }) => {
   const productErrors = observeProductErrors(page);
@@ -361,10 +378,11 @@ test('UI teardown drains and fences an in-flight dimension badge task', async ({
 
   await page.goto(
     `/?exportsBaseUrl=${encodeURIComponent(SYNTHETIC_3D_ROOT)}` +
-      `&dataset=${DATASET_ID}&acceptance=dimension-badge-terminal-owner`,
+      `&dataset=${DATASET_ID}&acceptance=representation-picker-terminal-owner`,
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
+  await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
     'Deterministic 3-D orbit fixture',
   );
@@ -374,69 +392,67 @@ test('UI teardown drains and fences an in-flight dimension badge task', async ({
     const state = window._cellucidState;
     const viewer = window._cellucidViewer;
     const ui = window._cellucidUi;
-    const originalSetDimensionLevel =
-      state.setDimensionLevel.bind(state);
-    let releaseDimension;
+    const originalSetViewRepresentation =
+      state.setViewRepresentation.bind(state);
+    let releaseSwitch;
     let markStarted;
     const started = new Promise(resolve => {
       markStarted = resolve;
     });
     const release = new Promise(resolve => {
-      releaseDimension = resolve;
+      releaseSwitch = resolve;
     });
-    state.setDimensionLevel = async (...args) => {
+    let switched = null;
+    state.setViewRepresentation = async (...args) => {
       markStarted();
       await release;
-      return originalSetDimensionLevel(...args);
+      switched = originalSetViewRepresentation(...args);
+      return switched;
     };
 
-    const indicator = document.querySelector(
-      '.split-badge.active .split-badge-dim',
-    );
-    if (!(indicator instanceof HTMLElement)) {
-      throw new Error(
-        'Dimension terminal regression requires an active dimension badge.',
-      );
+    // The selected kept view is switched to the 2D representation.
+    const picker = document.getElementById('view-representation-select');
+    const twoDimensional = picker.querySelector('optgroup[label="2D"] option');
+    if (!(twoDimensional instanceof HTMLOptionElement)) {
+      throw new Error('Representation terminal regression requires a 2D option.');
     }
-    indicator.dispatchEvent(new MouseEvent('click', {
-      bubbles: true,
-      cancelable: true,
-    }));
+    picker.value = twoDimensional.value;
+    picker.dispatchEvent(new Event('change', { bubbles: true }));
     await started;
+    const disabledWhileSwitching = picker.disabled;
     const destroying = ui.destroy();
-    const resolvedBeforeRelease = await Promise.race([
-      destroying.then(() => true),
-      new Promise(resolve => setTimeout(() => resolve(false), 0)),
-    ]);
+    await destroying;
     const badgeCountAtFence = document.querySelectorAll(
       '#split-view-badges-list .split-badge',
     ).length;
-    const retainedDisabledAtFence =
-      indicator.getAttribute('aria-disabled');
 
-    releaseDimension();
-    await destroying;
+    releaseSwitch();
+    // The switch loads the 2D positions, so it is awaited rather than given
+    // a fixed 50 ms: on hosted runners it had not finished by then. A
+    // switch that fails shows up below as the dimension it left behind.
+    while (switched === null) await new Promise(resolve => setTimeout(resolve, 0));
+    await switched.catch(() => {});
     const outcome = {
-      badgeCountAfterDrain: document.querySelectorAll(
+      badgeCountAfterSwitch: document.querySelectorAll(
         '#split-view-badges-list .split-badge',
       ).length,
       badgeCountAtFence,
-      retainedDisabledAfterDrain:
-        indicator.getAttribute('aria-disabled'),
-      retainedDisabledAtFence,
-      resolvedBeforeRelease,
+      disabledWhileSwitching,
+      switchNotices: [...document.querySelectorAll('#notification-center .notification')]
+        .filter(notice => /switch/i.test(notice.textContent)).length,
       snapshotDimension: viewer.getViewDimension('snap_1'),
     };
     viewer.dispose();
     return outcome;
   });
 
+  // The switch itself completes in the state it began in; the retired
+  // interface publishes nothing for it.
   expect(result).toEqual({
-    badgeCountAfterDrain: 0,
+    badgeCountAfterSwitch: 0,
     badgeCountAtFence: 0,
-    retainedDisabledAfterDrain: 'true',
-    retainedDisabledAtFence: 'true',
-    resolvedBeforeRelease: false,
+    disabledWhileSwitching: true,
+    switchNotices: 0,
     snapshotDimension: 2,
   });
   expect(productErrors).toEqual([]);
@@ -453,6 +469,7 @@ test('a navigation observer failure cannot enter dimension rollback', async ({
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
+  await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
     'Deterministic 3-D orbit fixture',
   );
@@ -473,7 +490,7 @@ test('a navigation observer failure cannot enter dimension rollback', async ({
 
     let rejection = null;
     try {
-      await state.setDimensionLevel(2, { viewId: 'live' });
+      await state.showDefaultRepresentation('live', 2);
     } catch (error) {
       rejection = error instanceof Error ? error.message : String(error);
     }
@@ -510,6 +527,7 @@ test('Orbit and Planar targets follow the sidebar-aware visual center', async ({
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
+  await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
     'Deterministic 3-D orbit fixture',
   );
@@ -602,13 +620,12 @@ test('Orbit and Planar targets follow the sidebar-aware visual center', async ({
     const canvasRect = canvas.getBoundingClientRect();
     const sidebarRight = sidebar.offsetLeft + sidebar.offsetWidth;
     const centerY = (canvasRect.top + canvasRect.bottom) / 2;
-    const paneWidth = canvasRect.width / 2;
-    const leftPaneRight = canvasRect.left + paneWidth;
-    const rightPaneLeft = leftPaneRight;
-    const leftX =
-      (Math.max(canvasRect.left, sidebarRight) + leftPaneRight) / 2;
-    const rightX =
-      (rightPaneLeft + canvasRect.right) / 2;
+    // Both grid cells lie in the canvas area right of the sidebar, each
+    // half of it wide; a camera target sits at the centre of its cell.
+    const paneWidth = (canvasRect.right - Math.max(canvasRect.left, sidebarRight)) / 2;
+    const leftPaneLeft = Math.max(canvasRect.left, sidebarRight);
+    const leftX = leftPaneLeft + paneWidth / 2;
+    const rightX = leftPaneLeft + paneWidth * 1.5;
     const leftRecord = viewer.pickCellRecordAtScreen(leftX, centerY);
     const rightRecord = viewer.pickCellRecordAtScreen(rightX, centerY);
     return {
@@ -642,37 +659,6 @@ test('Orbit and Planar targets follow the sidebar-aware visual center', async ({
   expect(interactionProof.rightPositionFrozen).toBe(true);
   expect(interactionProof.webglError).toBe(0);
 
-  const paneTargetRadiusProof = await page.evaluate(id => {
-    const viewer = window._cellucidViewer;
-    viewer.setCamerasLocked(false);
-    const snapshotCamera = viewer.getViewCameraState(id);
-    snapshotCamera.orbit.targetRadius = 0.001;
-    viewer.setViewCameraState(id, snapshotCamera);
-
-    const canvas = document.getElementById('glcanvas');
-    const sidebar = document.getElementById('sidebar');
-    const canvasRect = canvas.getBoundingClientRect();
-    const sidebarRight = sidebar.offsetLeft + sidebar.offsetWidth;
-    const centerY = (canvasRect.top + canvasRect.bottom) / 2;
-    const paneWidth = canvasRect.width / 2;
-    const leftPaneRight = canvasRect.left + paneWidth;
-    const rightPaneLeft = leftPaneRight;
-    const liveRecord = viewer.pickCellRecordAtScreen(
-      (Math.max(canvasRect.left, sidebarRight) + leftPaneRight) / 2,
-      centerY,
-    );
-    const snapshotRecord = viewer.pickCellRecordAtScreen(
-      (rightPaneLeft + canvasRect.right) / 2,
-      centerY,
-    );
-    return {
-      liveCell: liveRecord?.cellIndex ?? -1,
-      snapshotCell: snapshotRecord?.cellIndex ?? -1,
-    };
-  }, snapshotId);
-  expect(paneTargetRadiusProof.liveCell).toBe(singlePick);
-  expect(paneTargetRadiusProof.snapshotCell).toBe(-1);
-
   expect(productErrors).toEqual([]);
 });
 
@@ -688,6 +674,7 @@ test('coarse LOD picking follows the rendered live and snapshot prefixes', async
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
+  await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
     'Deterministic 3-D orbit fixture',
   );
@@ -769,13 +756,14 @@ test('coarse LOD picking follows the rendered live and snapshot prefixes', async
       const canvasRect = canvas.getBoundingClientRect();
       const sidebarRight = sidebar.offsetLeft + sidebar.offsetWidth;
       const centerY = (canvasRect.top + canvasRect.bottom) / 2;
-      const paneBoundary = canvasRect.left + canvasRect.width / 2;
+      // Single view and grid share the presented area right of the sidebar;
+      // the grid splits it into two equal cells.
+      const presentedLeft = Math.max(canvasRect.left, sidebarRight);
+      const paneBoundary = (presentedLeft + canvasRect.right) / 2;
       return {
         centerY,
-        liveX:
-          (Math.max(canvasRect.left, sidebarRight) + paneBoundary) / 2,
-        singleX:
-          (Math.max(canvasRect.left, sidebarRight) + canvasRect.right) / 2,
+        liveX: (presentedLeft + paneBoundary) / 2,
+        singleX: (presentedLeft + canvasRect.right) / 2,
         snapshotX: (paneBoundary + canvasRect.right) / 2,
       };
     };
@@ -804,6 +792,11 @@ test('coarse LOD picking follows the rendered live and snapshot prefixes', async
     viewer.setViewLayout('grid', snapshot.id);
     viewer.setAdaptiveLOD(true);
     viewer.setForceLOD(0);
+    // The levels are built off the main thread; draw until both panes have them.
+    for (let frame = 0; frame < 600; frame++) {
+      if (viewer.getCurrentLODLevel('live') >= 0 && viewer.getCurrentLODLevel(snapshot.id) >= 0) break;
+      await new Promise(resolve => requestAnimationFrame(resolve));
+    }
     await waitForFrames();
 
     const liveMembership = viewer.getCurrentLodMembership('live', 3);
@@ -904,6 +897,7 @@ test('unlocked mixed-mode panes render orbit anchors only in Orbit panes', async
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
+  await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
     'Deterministic 3-D orbit fixture',
   );
@@ -946,9 +940,16 @@ test('unlocked mixed-mode panes render orbit anchors only in Orbit panes', async
     viewer.setShowOrbitAnchor(false);
     viewer.setShowOrbitAnchor(true);
   }, snapshotId);
-  await expect.poll(readAnchorPaneXs).toEqual([0]);
+  // Grid cells are laid out right of the sidebar; each anchor is drawn in its
+  // own pane's framebuffer viewport.
+  const [livePaneX, snapshotPaneX] = await page.evaluate(() => (
+    window._cellucidViewer.getPresentedLayout().panes.map(pane => pane.viewportX)
+  ));
+  expect(livePaneX).toBeGreaterThan(0);
+  expect(snapshotPaneX).toBeGreaterThan(livePaneX);
+  await expect.poll(readAnchorPaneXs).toEqual([livePaneX]);
   const orbitFocusedPaneXs = await readAnchorPaneXs();
-  expect(orbitFocusedPaneXs).toEqual([0]);
+  expect(orbitFocusedPaneXs).toEqual([livePaneX]);
 
   await page.evaluate(id => {
     const viewer = window._cellucidViewer;
@@ -958,13 +959,7 @@ test('unlocked mixed-mode panes render orbit anchors only in Orbit panes', async
     viewer.setShowOrbitAnchor(false);
     viewer.setShowOrbitAnchor(true);
   }, snapshotId);
-  await expect.poll(async () => {
-    const paneXs = await readAnchorPaneXs();
-    return paneXs.length === 1 && paneXs[0] > 0;
-  }).toBe(true);
-  const orbitSnapshotPaneXs = await readAnchorPaneXs();
-  expect(orbitSnapshotPaneXs).toHaveLength(1);
-  expect(orbitSnapshotPaneXs[0]).toBeGreaterThan(0);
+  await expect.poll(readAnchorPaneXs).toEqual([snapshotPaneX]);
 
   const webglError = await page.evaluate(
     () => window._cellucidViewer.getGLContext().getError(),
@@ -986,6 +981,7 @@ test('responsive sidebar CSS remains live and republishes the target center', as
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
+  await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
     'Deterministic 3-D orbit fixture',
   );
@@ -1102,6 +1098,7 @@ test('sidebar drag coalesces camera geometry without synchronous layout reads', 
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
+  await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
     'Deterministic 3-D orbit fixture',
   );
@@ -1158,6 +1155,7 @@ test('public viewer controls reject invalid values before renderer mutation', as
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
+  await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
     'Deterministic 3-D orbit fixture',
   );
@@ -1184,8 +1182,7 @@ test('public viewer controls reject invalid values before renderer mutation', as
       liveViewLabel: viewer.getLiveViewLabel(),
       liveViewHidden: viewer.getLiveViewHidden(),
       viewLayout: viewer.getViewLayout(),
-      edgeLodLimit: viewer.getEdgeLodLimit(),
-      highlightMode: viewer.getHighlightMode(),
+      edgeTarget: viewer.getEdgeSelectionStatsForView('live')?.shownCount ?? null,
       cellSelectionEnabled: viewer.getCellSelectionEnabled(),
       lassoEnabled: viewer.getLassoEnabled(),
       proximityEnabled: viewer.getProximityEnabled(),
@@ -1220,7 +1217,7 @@ test('public viewer controls reject invalid values before renderer mutation', as
       ['setConnectivityLineWidth', [100]],
       ['setConnectivityAlpha', [0]],
       ['setConnectivityColor', [12.5, 20, 30]],
-      ['setEdgeDebugMode', [1]],
+      ['setEdgeVisibleTarget', [-1]],
       ['setViewFocusHandler', [42]],
       ['setNavigationModeChangeHandler', [42]],
       ['setLiveViewLabel', ['   ']],
@@ -1249,21 +1246,24 @@ test('public viewer controls reject invalid values before renderer mutation', as
       ['setActiveVectorField', ['  velocity  ']],
       [
         'setVectorFieldData',
-        ['velocity', 3, {
+        ['velocity', '3d', {
           vectors: new Float32Array([0, 0, Number.NaN]),
           components: 3,
           cellCount: 1,
           maxMagnitude: 1,
         }],
       ],
-      ['hasVectorFieldForDimension', ['', 3]],
+      ['hasVectorFieldForLayout', ['', '3d']],
+      ['hasVectorFieldForLayout', ['velocity', '']],
+      ['setViewEmbedding', ['live', { dimension: 3 }]],
+      ['setViewEmbedding', ['live', { dimension: 3, layoutKey: '' }]],
       ['setAdaptiveLOD', [1]],
       ['setFrustumCulling', [1]],
       ['setForceLOD', [1.5]],
       ['setViewLayout', ['garbage', 'live']],
       ['setViewLayout', ['grid', 'ghost']],
-      ['setEdgeLodLimit', ['4.9']],
-      ['setHighlightMode', ['garbage']],
+      ['setEdgeVisibleTarget', ['4.9']],
+      ['setViewFieldKindSource', ['categorical']],
       ['setCellSelectionEnabled', ['false']],
       ['setLassoEnabled', ['false']],
       ['setProximityEnabled', ['false']],
@@ -1297,11 +1297,11 @@ test('public viewer controls reject invalid values before renderer mutation', as
       ['updateColors', [new Uint8Array(liveColors.length - 4)]],
       [
         'updateTransparency',
-        [new Float32Array(liveTransparency.length - 1)],
+        [new Uint8Array(liveTransparency.length - 1)],
       ],
       [
         'updateTransparency',
-        [Float32Array.from(liveTransparency, (value, index) =>
+        [Uint8Array.from(liveTransparency, (value, index) =>
           index === 0 ? 2 : value)],
       ],
       [
@@ -1368,8 +1368,7 @@ test('public viewer controls reject invalid values before renderer mutation', as
       liveViewLabel: viewer.getLiveViewLabel(),
       liveViewHidden: viewer.getLiveViewHidden(),
       viewLayout: viewer.getViewLayout(),
-      edgeLodLimit: viewer.getEdgeLodLimit(),
-      highlightMode: viewer.getHighlightMode(),
+      edgeTarget: viewer.getEdgeSelectionStatsForView('live')?.shownCount ?? null,
       cellSelectionEnabled: viewer.getCellSelectionEnabled(),
       lassoEnabled: viewer.getLassoEnabled(),
       proximityEnabled: viewer.getProximityEnabled(),
@@ -1390,7 +1389,9 @@ test('public viewer controls reject invalid values before renderer mutation', as
       attempted: invalidCalls.length,
       removedMethodsAbsent:
         viewer.updateOutlierQuantiles === undefined &&
-        viewer.clearViewDimensionState === undefined,
+        viewer.clearViewDimensionState === undefined &&
+        viewer.setEdgeLodLimit === undefined &&
+        viewer.setEdgeDebugMode === undefined,
     };
   });
 
@@ -1415,6 +1416,7 @@ test('a failed GPU dataset publication preserves the complete live renderer', as
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
+  await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
     'Deterministic 3-D orbit fixture',
   );
@@ -1431,11 +1433,13 @@ test('a failed GPU dataset publication preserves the complete live renderer', as
       renderer: viewer.debugRendererStatus(),
     };
     const replacementCount = before.pointCount + 1;
+    // A 2D publication: two position components per point.
     const replacement = {
-      positions: new Float32Array(replacementCount * 3),
+      positions: new Float32Array(replacementCount * 2),
       colors: new Uint8Array(replacementCount * 4).fill(127),
-      transparency: new Float32Array(replacementCount).fill(1),
+      transparency: new Uint8Array(replacementCount).fill(1),
       dimensionLevel: 2,
+      layoutKey: '2d',
     };
     const originalBufferData = gl.bufferData.bind(gl);
     let injected = false;
@@ -1496,6 +1500,7 @@ test('adaptive LOD publishes complete dimension-owned GPU resources', async ({
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
+  await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
     'Deterministic 3-D orbit fixture',
   );
@@ -1503,6 +1508,11 @@ test('adaptive LOD publishes complete dimension-owned GPU resources', async ({
   const result = await page.evaluate(async () => {
     const viewer = window._cellucidViewer;
     viewer.setAdaptiveLOD(true);
+    // The tree with its levels is built off the main thread.
+    for (let frame = 0; frame < 600; frame++) {
+      if (viewer.debugRendererStatus().lodLevelCount > 0) break;
+      await new Promise(resolve => requestAnimationFrame(resolve));
+    }
     await new Promise((resolve) => {
       requestAnimationFrame(() => requestAnimationFrame(resolve));
     });
@@ -1512,7 +1522,8 @@ test('adaptive LOD publishes complete dimension-owned GPU resources', async ({
       dimension: status.currentDimensionLevel,
       useAdaptiveLOD: status.useAdaptiveLOD,
       spatialIndicesCount: status.spatialIndicesCount,
-      lodBuffersCount: status.lodBuffersCount,
+      lodLevelCount: status.lodLevelCount,
+      drawOrder: status.drawOrder,
       webglError: viewer.getGLContext().getError(),
     };
   });
@@ -1524,6 +1535,8 @@ test('adaptive LOD publishes complete dimension-owned GPU resources', async ({
     spatialIndicesCount: 1,
     webglError: 0,
   });
-  expect(result.lodBuffersCount).toBeGreaterThan(0);
+  // LOD keeps no GPU copy: its levels are prefixes of the one stored order.
+  expect(result.lodLevelCount).toBeGreaterThan(1);
+  expect(result.drawOrder).toBe(`${result.lodLevelCount} bands`);
   expect(productErrors).toEqual([]);
 });

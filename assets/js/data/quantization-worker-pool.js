@@ -8,7 +8,10 @@
  * @module data/quantization-worker-pool
  */
 
-import { validateQuantizationTask } from './quantization-contract.js';
+import {
+  decodedCodeByteLength,
+  validateQuantizationTask,
+} from './quantization-contract.js';
 
 export const QUANTIZATION_BACKEND = Object.freeze({
   MAIN_THREAD: 'main-thread',
@@ -20,6 +23,7 @@ export const QUANTIZATION_BACKEND = Object.freeze({
  *
  * @typedef {{
  *   buffer: ArrayBuffer,
+ *   gzipOutputBytes: number|null,
  *   dtype: QuantizedDType,
  *   minValue: number,
  *   maxValue: number,
@@ -121,14 +125,21 @@ export class QuantizationWorkerPool {
       ? options.poolSize
       : detectedPoolSize;
 
-    /** @type {Worker[]} */
+    /**
+     * One slot per worker. A slot whose worker failed holds `null` until its
+     * next request spawns the replacement, so a worker script that cannot load
+     * fails each request once instead of respawning in a loop.
+     * @type {(Worker|null)[]}
+     */
     this.workers = [];
     /** @type {('idle'|'busy')[]} */
     this.states = [];
     /** @type {Array<Array<{ start: () => void, reject: Function }>>} */
     this.queues = [];
+    /** @type {(string|null)[]} Request each slot is running. */
+    this._inFlight = [];
 
-    /** @type {Map<string, { resolve: Function, reject: Function }>} */
+    /** @type {Map<string, { resolve: Function, reject: Function, workerIndex: number }>} */
     this._pending = new Map();
     this._counter = 0;
     this._rr = 0;
@@ -141,15 +152,12 @@ export class QuantizationWorkerPool {
     if (this._initialized) return this._available;
     if (!this._available) return false;
 
-    const workerPath = new URL('./quantization-worker.js', import.meta.url).href;
-
     for (let i = 0; i < this.poolSize; i++) {
-      const worker = new Worker(workerPath, { type: 'module' });
-      worker.onmessage = (e) => this._handleMessage(i, e);
-      worker.onerror = (e) => this._handleError(i, e);
-      this.workers.push(worker);
       this.states.push('idle');
       this.queues.push([]);
+      this._inFlight.push(null);
+      this.workers.push(null);
+      this._spawnWorker(i);
     }
 
     this._initialized = true;
@@ -158,15 +166,35 @@ export class QuantizationWorkerPool {
 
   /**
    * @param {number} workerIndex
-   * @param {MessageEvent} e
+   * @returns {Worker}
    * @private
    */
-  _handleMessage(workerIndex, e) {
+  _spawnWorker(workerIndex) {
+    const workerPath = new URL('./quantization-worker.js', import.meta.url).href;
+    const worker = new Worker(workerPath, { type: 'module' });
+    worker.onmessage = (e) => this._handleMessage(workerIndex, e, worker);
+    worker.onerror = (e) => this._handleError(workerIndex, e, worker);
+    this.workers[workerIndex] = worker;
+    return worker;
+  }
+
+  /**
+   * @param {number} workerIndex
+   * @param {MessageEvent} e
+   * @param {Worker} [worker] Sender; messages from a replaced worker are stale.
+   * @private
+   */
+  _handleMessage(workerIndex, e, worker = this.workers[workerIndex]) {
+    if (worker == null || this.workers[workerIndex] !== worker) return;
     let data;
     try {
       data = validateWorkerResponse(e?.data);
       const pending = this._pending.get(data.requestId);
-      if (!pending || pending.workerIndex !== workerIndex) {
+      if (
+        !pending ||
+        pending.workerIndex !== workerIndex ||
+        this._inFlight[workerIndex] !== data.requestId
+      ) {
         throw new Error(
           `Quantization worker returned unknown requestId "${data.requestId}"`
         );
@@ -182,27 +210,27 @@ export class QuantizationWorkerPool {
         message: error instanceof Error
           ? error.message
           : 'Quantization worker response validation failed',
-      });
+      }, worker);
       return;
     }
 
-    if (!this._available || this.workers.length === 0) {
-      // Pool was disabled (e.g., worker error); ignore late messages.
-      return;
-    }
-
-    this.states[workerIndex] = 'idle';
-    const queue = this.queues[workerIndex];
-    const next = queue ? queue.shift() : null;
-    if (next) next.start();
+    this._startNext(workerIndex);
   }
 
   /**
+   * Fail the one request the worker was running, retire that worker, and let
+   * the slot's queued requests continue on a replacement.
+   *
    * @param {number} workerIndex
-   * @param {ErrorEvent} e
+   * @param {ErrorEvent|{ message: string }} e
+   * @param {Worker} [worker] Failing worker; errors from a replaced worker are stale.
    * @private
    */
-  _handleError(workerIndex, e) {
+  _handleError(workerIndex, e, worker = this.workers[workerIndex]) {
+    if (worker == null || this.workers[workerIndex] !== worker) return;
+    // The failure is reported through the owning request, not as an
+    // uncaught page error.
+    if (typeof e?.preventDefault === 'function') e.preventDefault();
     const message = (
       typeof e?.message === 'string' &&
       e.message.length > 0
@@ -211,46 +239,47 @@ export class QuantizationWorkerPool {
       : 'Quantization worker emitted an invalid error event';
     console.warn('[QuantizationWorkerPool] Worker error:', message);
 
-    // Reject every request owned by the failed worker backend.
-    for (const pending of this._pending.values()) {
-      try {
-        pending.reject(new Error(message));
-      } catch (_err) {
-        // ignore
-      }
+    try {
+      worker.terminate();
+    } catch (_err) {
+      // A worker that cannot be terminated is already gone.
     }
-    this._pending.clear();
+    this.workers[workerIndex] = null;
 
-    for (const queue of this.queues) {
-      for (const item of queue) {
-        try {
-          item.reject(new Error(message));
-        } catch (_err) {
-          // ignore
-        }
-      }
-      queue.length = 0;
+    const requestId = this._inFlight[workerIndex];
+    const pending = requestId === null ? null : this._pending.get(requestId);
+    if (pending) {
+      this._pending.delete(requestId);
+      pending.reject(new Error(message));
     }
+    this._startNext(workerIndex);
+  }
 
-    for (const worker of this.workers) {
-      try {
-        worker.terminate();
-      } catch (_err) {
-        // ignore
-      }
-    }
-
-    this.workers.length = 0;
-    this.states.length = 0;
-    this.queues.length = 0;
-    this._available = false;
-    this._initialized = true;
+  /**
+   * @param {number} workerIndex
+   * @private
+   */
+  _startNext(workerIndex) {
+    this.states[workerIndex] = 'idle';
+    this._inFlight[workerIndex] = null;
+    const next = this.queues[workerIndex].shift();
+    if (next) next.start();
   }
 
   _nextWorkerIndex() {
-    const idx = this._rr;
-    this._rr = (this._rr + 1) % this.poolSize;
-    return idx;
+    let best = 0;
+    let bestLoad = Infinity;
+    for (let offset = 0; offset < this.poolSize; offset++) {
+      const index = (this._rr + offset) % this.poolSize;
+      const load = (this.states[index] === 'busy' ? 1 : 0) + this.queues[index].length;
+      if (load < bestLoad) {
+        best = index;
+        bestLoad = load;
+        if (load === 0) break;
+      }
+    }
+    this._rr = (best + 1) % this.poolSize;
+    return best;
   }
 
   /**
@@ -263,25 +292,29 @@ export class QuantizationWorkerPool {
    */
   async _execute(workerIndex, type, payload, transferables) {
     await this.init();
-    if (!this._available || this.workers.length === 0) {
+    if (!this._available) {
       throw new Error('Quantization workers unavailable');
     }
     const requestId = `qdec-${Date.now()}-${this._counter++}`;
 
     return new Promise((resolve, reject) => {
       const start = () => {
-        const worker = this.workers[workerIndex];
-        if (!worker) {
-          reject(new Error('Quantization worker unavailable'));
-          return;
-        }
         this.states[workerIndex] = 'busy';
+        this._inFlight[workerIndex] = requestId;
         this._pending.set(requestId, {
           resolve,
           reject,
           workerIndex,
         });
-        worker.postMessage({ type, payload, requestId }, transferables);
+        try {
+          const worker = this.workers[workerIndex] ??
+            this._spawnWorker(workerIndex);
+          worker.postMessage({ type, payload, requestId }, transferables);
+        } catch (error) {
+          this._pending.delete(requestId);
+          reject(error);
+          this._startNext(workerIndex);
+        }
       };
 
       const queued = { start, reject };
@@ -291,22 +324,23 @@ export class QuantizationWorkerPool {
   }
 
   /**
-   * Dequantize quantized values into Float32Array in a worker.
+   * Decode one quantized payload transfer (inflating it first when it is
+   * gzip) into a Float32Array in a worker.
    *
    * @param {DequantizeTask} task
    * @returns {Promise<Float32Array>}
    */
   async dequantizeToFloat32(task) {
     validateQuantizationTask(task, 'Quantization worker-pool task');
-    const { buffer, dtype, minValue, maxValue, bits } = task;
+    const { buffer, gzipOutputBytes, dtype, minValue, maxValue, bits } = task;
     const expectedOutputBytes =
-      (buffer.byteLength / (bits / 8)) *
+      (decodedCodeByteLength(task) / (bits / 8)) *
       Float32Array.BYTES_PER_ELEMENT;
     const workerIndex = this._nextWorkerIndex();
     const result = await this._execute(
       workerIndex,
       'DEQUANTIZE_TO_F32',
-      { buffer, dtype, minValue, maxValue, bits },
+      { buffer, gzipOutputBytes, dtype, minValue, maxValue, bits },
       [buffer]
     );
 
@@ -334,7 +368,7 @@ let _pool = null;
 /**
  * @returns {QuantizationWorkerPool}
  */
-export function getQuantizationWorkerPool() {
+function getQuantizationWorkerPool() {
   if (!_pool) _pool = new QuantizationWorkerPool();
   return _pool;
 }
@@ -352,7 +386,7 @@ export async function selectQuantizationBackend() {
 
   const pool = getQuantizationWorkerPool();
   const available = await pool.init();
-  if (!available || !pool.workers || pool.workers.length === 0) {
+  if (!available) {
     throw new Error('Quantization workers unavailable');
   }
   return QUANTIZATION_BACKEND.WORKER;

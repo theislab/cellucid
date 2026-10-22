@@ -7,10 +7,6 @@ import { DEAnalysisUI } from '../assets/js/app/analysis/ui/analysis-types/de-ana
 import { DetailedAnalysisUI } from '../assets/js/app/analysis/ui/analysis-types/detailed-analysis-ui.js';
 import { GeneSignatureUI } from '../assets/js/app/analysis/ui/analysis-types/gene-signature-ui.js';
 import { GenesPanelUI } from '../assets/js/app/analysis/ui/analysis-types/genes-panel-ui.js';
-import {
-  restorePlotlyNotifications,
-  setPlotlyHintsEnabled,
-} from '../assets/js/app/analysis/plots/plotly-hints.js';
 
 function deferred() {
   let reject;
@@ -349,8 +345,6 @@ async function withFakeDOM(run) {
       purgeCounts,
     });
   } finally {
-    restorePlotlyNotifications();
-    setPlotlyHintsEnabled(true);
     for (const [name, value] of Object.entries(originals)) {
       if (value === undefined) delete globalThis[name];
       else globalThis[name] = value;
@@ -703,7 +697,6 @@ test('Detailed exports lease the exact committed modal child across replacement'
         _annotationsContent: null,
       };
       ui._currentPageData = [{ pageId: 'page-A' }];
-      ui._layoutEngine = {};
       ui._currentConfig = {
         dataSource: {
           type: 'continuous_obs',
@@ -713,15 +706,13 @@ test('Detailed exports lease the exact committed modal child across replacement'
         plotType: '__transaction-probe__',
         plotOptions: {},
       };
+      ui._committedView = Object.freeze({
+        config: structuredClone(ui._currentConfig),
+        pageData: ui._currentPageData,
+        layoutEngine: {},
+      });
       const requestId = ui._startAnalysisRequest();
-      await ui._updateModal(
-        plotDef,
-        {},
-        ui._currentPageData,
-        ui._layoutEngine,
-        ui._currentConfig,
-        requestId,
-      );
+      await ui._updateModal(plotDef, {}, requestId);
       const committedChild = modalPlot.children[0];
 
       const exporting = ui._exportPNG();
@@ -729,9 +720,6 @@ test('Detailed exports lease the exact committed modal child across replacement'
       const replacement = ui._updateModal(
         plotDef,
         { revision: 2 },
-        ui._currentPageData,
-        ui._layoutEngine,
-        ui._currentConfig,
         requestId,
       );
       for (let turn = 0; turn < 12; turn++) await Promise.resolve();
@@ -770,9 +758,13 @@ test('Detailed invalid and failed reruns retire preview and modal scientific sta
         'analysis-preview-container',
       );
       ui._actionsContainer = attachRoot(document, 'analysis-actions');
-      ui._actionsContainer.style.display = 'flex';
+      ui._actionsContainer.hidden = false;
       ui._currentPageData = [{ pageId: 'stale-page' }];
-      ui._layoutEngine = { owner: 'stale-layout' };
+      ui._committedView = Object.freeze({
+        config: {},
+        pageData: ui._currentPageData,
+        layoutEngine: { owner: 'stale-layout' },
+      });
       const stats = document.createElement('div');
       stats.innerHTML = 'stale stats';
       const annotations = document.createElement('div');
@@ -810,7 +802,7 @@ test('Detailed invalid and failed reruns retire preview and modal scientific sta
 
     assert.deepEqual(invalid.invalidations, { modal: 1, preview: 1 });
     assert.equal(invalid.ui._currentPageData, null);
-    assert.equal(invalid.ui._layoutEngine, null);
+    assert.equal(invalid.ui._committedView, null);
     assert.equal(invalid.stats.innerHTML, '');
     assert.equal(invalid.annotations.innerHTML, '');
 
@@ -820,11 +812,11 @@ test('Detailed invalid and failed reruns retire preview and modal scientific sta
 
     assert.deepEqual(failed.invalidations, { modal: 1, preview: 1 });
     assert.equal(failed.ui._currentPageData, null);
-    assert.equal(failed.ui._layoutEngine, null);
+    assert.equal(failed.ui._committedView, null);
     assert.equal(failed.stats.innerHTML, '');
     assert.equal(failed.annotations.innerHTML, '');
     assert.ok(
-      failed.ui._previewContainer.querySelector('.analysis-error'),
+      failed.ui._previewContainer.querySelector('.status-line'),
     );
     failed.ui._finishAnalysisRequest(requestId);
   });
@@ -871,7 +863,7 @@ test('Detailed stale error publication cannot append after a newer request start
     await publishingError;
 
     assert.equal(
-      ui._previewContainer.querySelector('.analysis-error'),
+      ui._previewContainer.querySelector('.status-line'),
       null,
     );
     assert.equal(ui._currentPageData, currentData);
@@ -916,7 +908,7 @@ for (const [label, UIClass] of [
       await publishingError;
 
       assert.equal(
-        ui._resultContainer.querySelector('.analysis-error'),
+        ui._resultContainer.querySelector('.status-line'),
         null,
       );
       assert.equal(notifications, 0);

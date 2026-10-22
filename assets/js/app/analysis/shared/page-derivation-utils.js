@@ -20,7 +20,7 @@
  * Prefix for derived "rest of" pages (complement of a base page).
  * @type {string}
  */
-export const REST_OF_PAGE_PREFIX = 'restof__';
+const REST_OF_PAGE_PREFIX = 'restof__';
 
 /**
  * Create a derived "rest of" page ID from a base page ID.
@@ -116,14 +116,3 @@ export function selectablePageIdSet(pages) {
     expandPagesWithDerived(pages, { includeRestOf: true }).map(page => page.id)
   );
 }
-
-export default {
-  REST_OF_PAGE_PREFIX,
-  createRestOfPageId,
-  isRestOfPageId,
-  getBasePageIdFromRestOf,
-  getRestOfPageName,
-  expandPagesWithDerived,
-  selectablePageIdSet
-};
-

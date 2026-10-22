@@ -24,6 +24,9 @@ import {
   registerModalDocumentAuxiliary
 } from './ui/components/modal-background-owner.js';
 
+/** Calculations shorter than this finish without a completion notice. */
+const QUICK_CALCULATION_MS = 250;
+
 // Singleton instance
 let instance = null;
 
@@ -67,6 +70,7 @@ const DEFAULT_DURATIONS_MS = Object.freeze({
 });
 
 const NOTIFICATION_OPTION_KEYS = new Set([
+  'action',
   'category',
   'dismissible',
   'duration',
@@ -198,6 +202,28 @@ function assertNotificationOptions(options, { partial = false } = {}) {
         'Notification onCancel is only valid for loading or progress notifications.'
       );
     }
+    if (
+      Object.hasOwn(options, 'action') &&
+      ACTIVE_NOTIFICATION_TYPES.has(type)
+    ) {
+      throw new TypeError(
+        'A notification action is only valid on a notification that is not in progress.'
+      );
+    }
+  }
+  if (Object.hasOwn(options, 'action')) {
+    const action = options.action;
+    if (
+      !isPlainObject(action) ||
+      Object.keys(action).sort().join(',') !== 'label,run' ||
+      typeof action.label !== 'string' ||
+      action.label.trim().length === 0 ||
+      typeof action.run !== 'function'
+    ) {
+      throw new TypeError(
+        'A notification action must be exactly { label, run } with a non-empty label.'
+      );
+    }
   }
 }
 
@@ -224,7 +250,15 @@ class NotificationCenter {
     this.container = null;
     this.notifications = new Map();
     this.notificationId = 0;
+    // Cards on screen at once. A card retired early to make room is kept in
+    // `overflowMessages` and listed behind the "earlier messages" control, so
+    // no message is lost to the cap.
     this.maxNotifications = 5;
+    /** @type {Array<{ type: string, title: string|null, message: string|null }>} */
+    this.overflowMessages = [];
+    this._overflowElement = null;
+    this._overflowParts = null;
+    this._overflowExpanded = false;
     this.initialized = false;
     this._releaseModalAuxiliary = null;
 
@@ -264,6 +298,7 @@ class NotificationCenter {
     this.container.setAttribute('aria-label', 'Notifications');
 
     document.body.appendChild(this.container);
+    this._publishStackBlockSize();
     try {
       this._releaseModalAuxiliary =
         registerModalDocumentAuxiliary(this.container);
@@ -276,6 +311,32 @@ class NotificationCenter {
     }
 
     debug.log('[NotificationCenter] Initialized');
+  }
+
+  /**
+   * Publish how far up from the bottom of the viewport the card stack reaches
+   * as `--notification-stack-block-size` on the root. The phone menu pads its
+   * scroll end by it, so its last controls can always be scrolled clear of
+   * the cards (they let taps through, but a control under a card cannot be
+   * seen). Padding only the scroll end moves nothing already on screen.
+   */
+  _publishStackBlockSize() {
+    const View = document.defaultView;
+    if (typeof View?.ResizeObserver !== 'function') return;
+    const root = document.documentElement;
+    const container = this.container;
+    const publish = () => {
+      const box = container.getBoundingClientRect();
+      const covered = box.height > 0
+        ? Math.max(0, View.innerHeight - box.top)
+        : 0;
+      root.style.setProperty(
+        '--notification-stack-block-size',
+        `${Math.ceil(covered)}px`
+      );
+    };
+    new View.ResizeObserver(publish).observe(container);
+    publish();
   }
 
   /**
@@ -298,7 +359,8 @@ class NotificationCenter {
       progress = null,
       speed = null,
       dismissible = true,
-      onCancel = null
+      onCancel = null,
+      action = null
     } = options;
 
     const el = document.createElement('div');
@@ -342,6 +404,10 @@ class NotificationCenter {
       }
     }
 
+    if (action !== null) {
+      html += `<button type="button" class="btn btn-compact notification-action">${escapeHtml(action.label)}</button>`;
+    }
+
     html += '</div>'; // Close notification-content
 
     const cancelable =
@@ -375,6 +441,15 @@ class NotificationCenter {
     const dismissBtn = el.querySelector('.notification-dismiss[data-role="dismiss"]');
     if (dismissBtn) {
       dismissBtn.addEventListener('click', () => this.dismiss(id));
+    }
+
+    // The action is the notification's one follow-up; taking it settles it.
+    const actionBtn = el.querySelector('.notification-action');
+    if (actionBtn !== null) {
+      actionBtn.addEventListener('click', () => {
+        this.dismiss(id);
+        action.run();
+      });
     }
 
     return el;
@@ -541,7 +616,7 @@ class NotificationCenter {
         'Notification progress, speed, and cancellation require an active notification type.'
       );
     }
-    for (const key of ['dismissible', 'onCancel']) {
+    for (const key of ['action', 'dismissible', 'onCancel']) {
       if (
         Object.hasOwn(options, key) &&
         options[key] !== notif.options[key]
@@ -578,6 +653,19 @@ class NotificationCenter {
         content.appendChild(msgEl);
       }
       msgEl.textContent = options.message;
+    }
+
+    // A title published with active work names that work in progress
+    // ("Downloading", "Processing", "Generating Data"). Once the work settles
+    // the title is no longer true, so a terminal transition that names no title
+    // of its own retires it instead of leaving a finished download announced as
+    // still downloading.
+    const retiresActiveTitle =
+      typeChanged &&
+      TERMINAL_NOTIFICATION_TYPES.has(nextType) &&
+      options.title === undefined;
+    if (retiresActiveTitle) {
+      element.querySelector('.notification-title')?.remove();
     }
 
     // Update title
@@ -688,6 +776,7 @@ class NotificationCenter {
 
     // Update stored options
     const nextOptions = { ...notif.options, ...options };
+    if (retiresActiveTitle) delete nextOptions.title;
     if (TERMINAL_NOTIFICATION_TYPES.has(nextType)) {
       delete nextOptions.progress;
       delete nextOptions.speed;
@@ -715,8 +804,92 @@ class NotificationCenter {
         }
       }
       if (candidateId === null) return;
+      const { options } = this.notifications.get(candidateId);
+      this.overflowMessages.push({
+        type: options.type,
+        title: typeof options.title === 'string' ? options.title : null,
+        message: typeof options.message === 'string' ? options.message : null,
+      });
       this.dismiss(candidateId);
+      this._renderOverflow();
     }
+  }
+
+  /**
+   * The control under the card stack naming the messages retired early to
+   * make room, and the list of every one of them it opens.
+   */
+  _renderOverflow() {
+    if (!this.initialized || this.container === null) return;
+    const count = this.overflowMessages.length;
+    if (count === 0) {
+      this._overflowElement?.remove();
+      this._overflowElement = null;
+      this._overflowParts = null;
+      this._overflowExpanded = false;
+      return;
+    }
+    if (this._overflowElement === null) {
+      const wrapper = document.createElement('div');
+      wrapper.className = 'notification-overflow';
+      const bar = document.createElement('div');
+      bar.className = 'notification-overflow-bar';
+      const toggle = document.createElement('button');
+      toggle.type = 'button';
+      toggle.className = 'btn btn-compact notification-overflow-toggle';
+      const clear = document.createElement('button');
+      clear.type = 'button';
+      clear.className = 'btn btn-compact notification-overflow-clear';
+      clear.textContent = 'Clear';
+      const list = document.createElement('div');
+      list.className = 'notification-overflow-list';
+      list.setAttribute('role', 'list');
+      bar.append(toggle, clear);
+      wrapper.append(bar, list);
+      toggle.addEventListener('click', () => {
+        this._overflowExpanded = !this._overflowExpanded;
+        this._renderOverflow();
+      });
+      clear.addEventListener('click', () => {
+        this.overflowMessages = [];
+        this._renderOverflow();
+      });
+      // The stack is column-reversed: the first child sits at the bottom,
+      // under the oldest card, where the retired messages came from.
+      this.container.prepend(wrapper);
+      this._overflowElement = wrapper;
+      this._overflowParts = { toggle, list };
+    }
+    const { toggle, list } = this._overflowParts;
+    toggle.textContent = `${this._overflowExpanded ? 'Hide' : 'Show'} ${count} earlier message${count === 1 ? '' : 's'}`;
+    toggle.setAttribute('aria-expanded', this._overflowExpanded ? 'true' : 'false');
+    list.hidden = !this._overflowExpanded;
+    if (!this._overflowExpanded) {
+      list.replaceChildren();
+      return;
+    }
+    const fragment = document.createDocumentFragment();
+    // Newest first, like the cards above.
+    for (let index = count - 1; index >= 0; index--) {
+      const record = this.overflowMessages[index];
+      const item = document.createElement('div');
+      item.className = `notification-overflow-item notification-${record.type}`;
+      item.setAttribute('role', 'listitem');
+      if (record.title) {
+        const title = document.createElement('div');
+        title.className = 'notification-title';
+        title.textContent = record.title;
+        item.append(title);
+      }
+      if (record.message) {
+        const message = document.createElement('div');
+        message.className = 'notification-message';
+        message.textContent = record.message;
+        item.append(message);
+      }
+      fragment.append(item);
+    }
+    list.replaceChildren(fragment);
   }
 
   /**
@@ -948,6 +1121,12 @@ class NotificationCenter {
    */
   completeCalculation(id, message, duration = null) {
     requireNonEmptyString(message, 'Calculation completion message');
+    // Work that finished in a blink needs no announcement: the calculation
+    // notice goes away instead of turning into a "ready (0ms)" one.
+    if (duration !== null && Number.isFinite(duration) && duration < QUICK_CALCULATION_MS) {
+      this.dismiss(id);
+      return;
+    }
     const finalMessage = duration !== null
       ? `${message} (${formatDuration(duration)})`
       : message;
@@ -1076,7 +1255,7 @@ export function getNotificationCenter() {
 }
 
 // Export types for external use
-export { NotificationType, CategoryIcons };
+export { NotificationType };
 
 // Export class for testing
 export { NotificationCenter };

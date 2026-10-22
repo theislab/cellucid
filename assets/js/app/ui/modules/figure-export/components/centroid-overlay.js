@@ -11,7 +11,7 @@
  * @module ui/modules/figure-export/components/centroid-overlay
  */
 
-import { escapeHtml } from '../../../../utils/dom-utils.js';
+import { escapeXml } from '../../../../utils/dom-utils.js';
 import { forEachProjectedPoint } from '../utils/point-projector.js';
 import { POINT_VISIBILITY_THRESHOLD } from '../utils/lod-membership.js';
 import { hexToRgb01 } from '../utils/color-utils.js';
@@ -74,13 +74,15 @@ export function renderSvgCentroidOverlay({
 
   // The centroid disc outline is the label ink: on a dark figure a near-black
   // ring around a coloured disc disappears entirely.
-  const outline = escapeHtml(labelColor);
+  const outline = escapeXml(labelColor);
 
   const parts = [];
-  parts.push(`<g font-family="${escapeHtml(fontFamily)}" fill="${escapeHtml(labelColor)}">`);
+  parts.push(`<g font-family="${escapeXml(fontFamily)}" fill="${escapeXml(labelColor)}">`);
 
   forEachProjectedPoint({
     positions,
+    // Centroids are XYZ triples in every dimension.
+    dimension: 3,
     colors,
     transparency: null,
     renderState,
@@ -108,15 +110,15 @@ export function renderSvgCentroidOverlay({
       if (f.labels) {
         const text = getLabelAtIndex(labelTexts, index);
         if (!text) return;
-        const safe = escapeHtml(text);
+        const safe = escapeXml(text);
         const tx = x.toFixed(2);
         const ty = y.toFixed(2);
         // Draw a halo for readability, then the label on top.
         parts.push(
-          `<text x="${tx}" y="${ty}" font-size="${labelSize}" text-anchor="middle" dy="0.35em" stroke="${escapeHtml(haloColor)}" stroke-width="${haloW}" stroke-linejoin="round" fill="none">${safe}</text>`
+          `<text x="${tx}" y="${ty}" font-size="${labelSize}" text-anchor="middle" dy="0.35em" stroke="${escapeXml(haloColor)}" stroke-width="${haloW}" stroke-linejoin="round" fill="none">${safe}</text>`
         );
         parts.push(
-          `<text x="${tx}" y="${ty}" font-size="${labelSize}" text-anchor="middle" dy="0.35em" fill="${escapeHtml(labelColor)}">${safe}</text>`
+          `<text x="${tx}" y="${ty}" font-size="${labelSize}" text-anchor="middle" dy="0.35em" fill="${escapeXml(labelColor)}">${safe}</text>`
         );
       }
     }
@@ -176,6 +178,8 @@ export function drawCanvasCentroidOverlay({
 
   forEachProjectedPoint({
     positions,
+    // Centroids are XYZ triples in every dimension.
+    dimension: 3,
     colors,
     transparency: null,
     renderState,

@@ -7,12 +7,46 @@
 // - Per-view independent state for unlocked camera mode
 
 import {
-  ORBIT_ANCHOR_3D_VS,
-  ORBIT_ANCHOR_3D_FS,
-  ORBIT_ANCHOR_2D_VS,
-  ORBIT_ANCHOR_2D_FS
+  ORBIT_ANCHOR_VS,
+  ORBIT_ANCHOR_FS,
 } from './shaders/orbit-anchor-shaders.js';
-import { configureStraightAlphaBlending } from './gl-utils.js';
+import { configureStraightAlphaBlending, createProgram } from './gl-utils.js';
+import { writeFogUniforms } from './shaders/fog-shaders.js';
+
+const VIEW_BUFFER_PROPERTIES = Object.freeze([
+  'positionBuffer',
+  'normalBuffer',
+  'colorBuffer',
+  'indexBuffer',
+  'linePositionBuffer',
+  'lineNormalBuffer',
+  'lineColorBuffer',
+]);
+const VIEW_VERTEX_ARRAY_PROPERTIES = Object.freeze([
+  'meshVao',
+  'lineVao',
+]);
+
+// Radius of the clinometer arc the elevation marker rides on, in anchor units.
+const ELEVATION_ARC_RADIUS = 0.82 * 0.78 * 0.68;
+
+/**
+ * Column-major part matrix: translate to the anchor center, scale by the
+ * anchor radius, then turn about +Y by `angle` (measured from +X towards +Z,
+ * the convention the compass builders use) after an anchor-local offset.
+ */
+function writePartMatrix(out, cx, cy, cz, r, angle, offsetX, offsetY) {
+  const c = Math.cos(angle) * r;
+  const s = Math.sin(angle) * r;
+  out[0] = c; out[1] = 0; out[2] = s; out[3] = 0;
+  out[4] = 0; out[5] = r; out[6] = 0; out[7] = 0;
+  out[8] = -s; out[9] = 0; out[10] = c; out[11] = 0;
+  out[12] = cx + offsetX * r;
+  out[13] = cy + offsetY * r;
+  out[14] = cz;
+  out[15] = 1;
+  return out;
+}
 
 // === ORBIT ANCHOR RENDERER CLASS ===
 
@@ -30,9 +64,12 @@ export class OrbitAnchorRenderer {
     // Global settings
     this.showAnchor = true;
 
-    // Compile shaders and create programs
-    this.program3D = this._createProgram(ORBIT_ANCHOR_3D_VS, ORBIT_ANCHOR_3D_FS);
-    this.program2D = this._createProgram(ORBIT_ANCHOR_2D_VS, ORBIT_ANCHOR_2D_FS);
+    // Reused per-part transforms; uniform uploads copy them immediately.
+    this._baseMatrix = new Float32Array(16);
+    this._needleMatrix = new Float32Array(16);
+    this._markerMatrix = new Float32Array(16);
+
+    this.program = createProgram(gl, ORBIT_ANCHOR_VS, ORBIT_ANCHOR_FS);
 
     // Get attribute and uniform locations
     this._setupLocations();
@@ -48,12 +85,9 @@ export class OrbitAnchorRenderer {
     this._disposeRequested = true;
     this.viewStates.clear();
     this._pendingViewRetirements.clear();
-    this.program3D = null;
-    this.program2D = null;
-    this.attribs3D = null;
-    this.uniforms3D = null;
-    this.attribs2D = null;
-    this.uniforms2D = null;
+    this.program = null;
+    this.attribs = null;
+    this.uniforms = null;
     this._disposed = true;
     return true;
   }
@@ -76,17 +110,14 @@ export class OrbitAnchorRenderer {
       failures.push(...this._retireViewState(viewId, state));
     }
 
-    const retireProgram = (program, clearOwner) => {
-      if (program === null) return;
+    if (this.program !== null) {
       try {
-        gl.deleteProgram(program);
-        clearOwner();
+        gl.deleteProgram(this.program);
+        this.program = null;
       } catch (error) {
         failures.push(error);
       }
-    };
-    retireProgram(this.program3D, () => { this.program3D = null; });
-    retireProgram(this.program2D, () => { this.program2D = null; });
+    }
 
     if (failures.length > 0) {
       throw new AggregateError(
@@ -98,75 +129,25 @@ export class OrbitAnchorRenderer {
     return true;
   }
 
-  _createShader(type, source) {
-    const gl = this.gl;
-    const shader = gl.createShader(type);
-    gl.shaderSource(shader, source);
-    gl.compileShader(shader);
-    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
-      console.error('Orbit anchor shader compile error:', gl.getShaderInfoLog(shader));
-      gl.deleteShader(shader);
-      return null;
-    }
-    return shader;
-  }
-
-  _createProgram(vsSource, fsSource) {
-    const gl = this.gl;
-    const vs = this._createShader(gl.VERTEX_SHADER, vsSource);
-    const fs = this._createShader(gl.FRAGMENT_SHADER, fsSource);
-    if (!vs || !fs) return null;
-
-    const program = gl.createProgram();
-    gl.attachShader(program, vs);
-    gl.attachShader(program, fs);
-    gl.linkProgram(program);
-
-    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
-      console.error('Orbit anchor program link error:', gl.getProgramInfoLog(program));
-      return null;
-    }
-
-    gl.deleteShader(vs);
-    gl.deleteShader(fs);
-    return program;
-  }
-
   _setupLocations() {
     const gl = this.gl;
-
-    // 3D program locations
-    this.attribs3D = {
-      position: gl.getAttribLocation(this.program3D, 'a_position'),
-      normal: gl.getAttribLocation(this.program3D, 'a_normal'),
-      color: gl.getAttribLocation(this.program3D, 'a_color'),
+    const program = this.program;
+    this.attribs = {
+      position: gl.getAttribLocation(program, 'a_position'),
+      normal: gl.getAttribLocation(program, 'a_normal'),
+      color: gl.getAttribLocation(program, 'a_color'),
     };
-    this.uniforms3D = {
-      mvpMatrix: gl.getUniformLocation(this.program3D, 'u_mvpMatrix'),
-      viewMatrix: gl.getUniformLocation(this.program3D, 'u_viewMatrix'),
-      modelMatrix: gl.getUniformLocation(this.program3D, 'u_modelMatrix'),
-      cameraPos: gl.getUniformLocation(this.program3D, 'u_cameraPos'),
-      fogDensity: gl.getUniformLocation(this.program3D, 'u_fogDensity'),
-      fogNear: gl.getUniformLocation(this.program3D, 'u_fogNear'),
-      fogFar: gl.getUniformLocation(this.program3D, 'u_fogFar'),
-      fogColor: gl.getUniformLocation(this.program3D, 'u_fogColor'),
-      lightingStrength: gl.getUniformLocation(this.program3D, 'u_lightingStrength'),
-      lightDir: gl.getUniformLocation(this.program3D, 'u_lightDir'),
-      emissive: gl.getUniformLocation(this.program3D, 'u_emissive'),
-    };
-
-    // 2D program locations
-    this.attribs2D = {
-      position: gl.getAttribLocation(this.program2D, 'a_position'),
-      color: gl.getAttribLocation(this.program2D, 'a_color'),
-    };
-    this.uniforms2D = {
-      mvpMatrix: gl.getUniformLocation(this.program2D, 'u_mvpMatrix'),
-      viewMatrix: gl.getUniformLocation(this.program2D, 'u_viewMatrix'),
-      fogDensity: gl.getUniformLocation(this.program2D, 'u_fogDensity'),
-      fogNear: gl.getUniformLocation(this.program2D, 'u_fogNear'),
-      fogFar: gl.getUniformLocation(this.program2D, 'u_fogFar'),
-      fogColor: gl.getUniformLocation(this.program2D, 'u_fogColor'),
+    this.uniforms = {
+      mvpMatrix: gl.getUniformLocation(program, 'u_mvpMatrix'),
+      viewMatrix: gl.getUniformLocation(program, 'u_viewMatrix'),
+      modelMatrix: gl.getUniformLocation(program, 'u_modelMatrix'),
+      partMatrix: gl.getUniformLocation(program, 'u_partMatrix'),
+      cameraPos: gl.getUniformLocation(program, 'u_cameraPos'),
+      fogNear: gl.getUniformLocation(program, 'u_fogNear'),
+      fogScale: gl.getUniformLocation(program, 'u_fogScale'),
+      lightingStrength: gl.getUniformLocation(program, 'u_lightingStrength'),
+      lightDir: gl.getUniformLocation(program, 'u_lightDir'),
+      emissive: gl.getUniformLocation(program, 'u_emissive'),
     };
   }
 
@@ -182,50 +163,42 @@ export class OrbitAnchorRenderer {
     }
     if (!this.viewStates.has(viewId)) {
       const gl = this.gl;
-      this.viewStates.set(viewId, {
-        positionBuffer: gl.createBuffer(),
-        normalBuffer: gl.createBuffer(),
-        colorBuffer: gl.createBuffer(),
-        indexBuffer: gl.createBuffer(),
-        linePositionBuffer: gl.createBuffer(),
-        lineNormalBuffer: gl.createBuffer(),
-        lineColorBuffer: gl.createBuffer(),
-        vertexCount: 0,
+      const state = {
+        geometryKey: null,
         indexCount: 0,
+        needleStart: 0,
+        needleCount: 0,
+        markerStart: 0,
+        markerCount: 0,
         lineCount: 0,
-        lineData: null,
-        needsRebuild: true,
-        is3D: true,
-        lastX: NaN, lastY: NaN, lastZ: NaN,
-        lastRadius: NaN,
-        lastTheta: NaN, lastPhi: NaN,
-        lastBgLuminance: -1
-      });
+      };
+      for (const property of VIEW_BUFFER_PROPERTIES) {
+        state[property] = gl.createBuffer();
+      }
+      for (const property of VIEW_VERTEX_ARRAY_PROPERTIES) {
+        state[property] = gl.createVertexArray();
+      }
+      this.viewStates.set(viewId, state);
     }
     return this.viewStates.get(viewId);
   }
 
   _retireViewState(viewId, state) {
     const failures = [];
-    const bufferProperties = [
-      'positionBuffer',
-      'normalBuffer',
-      'colorBuffer',
-      'indexBuffer',
-      'linePositionBuffer',
-      'lineNormalBuffer',
-      'lineColorBuffer',
-    ];
-    for (const property of bufferProperties) {
-      const buffer = state[property];
-      if (buffer === null) continue;
-      try {
-        this.gl.deleteBuffer(buffer);
-        state[property] = null;
-      } catch (error) {
-        failures.push(error);
+    const retire = (properties, remove) => {
+      for (const property of properties) {
+        const handle = state[property];
+        if (handle === null) continue;
+        try {
+          remove(handle);
+          state[property] = null;
+        } catch (error) {
+          failures.push(error);
+        }
       }
-    }
+    };
+    retire(VIEW_VERTEX_ARRAY_PROPERTIES, handle => this.gl.deleteVertexArray(handle));
+    retire(VIEW_BUFFER_PROPERTIES, handle => this.gl.deleteBuffer(handle));
     if (failures.length === 0) {
       this._pendingViewRetirements.delete(viewId);
     }
@@ -249,17 +222,10 @@ export class OrbitAnchorRenderer {
       throw new AggregateError(
         failures,
         `Orbit-anchor view "${String(viewId)}" retirement failed for `
-          + `${failures.length} buffer(s).`
+          + `${failures.length} resource(s).`
       );
     }
     return true;
-  }
-
-  // Trigger rebuild for all views
-  markAllNeedsRebuild() {
-    for (const state of this.viewStates.values()) {
-      state.needsRebuild = true;
-    }
   }
 
   // Professional scientific instrument color palette
@@ -615,8 +581,12 @@ export class OrbitAnchorRenderer {
     return { positions, normals, colors, indices, vertexCount: positions.length / 3 };
   }
 
-  // Build 3D compass geometry - Precision scientific instrument
-  buildGeometry3D(cx, cy, cz, r, viewTheta, viewPhi, bgColor) {
+  // Build 3D compass geometry - Precision scientific instrument.
+  // Anchor-local units: center at the origin, unit radius, needle along +X and
+  // elevation marker at the origin; the part ranges returned locate the needle
+  // and the marker so draw() can turn and move them with uniforms alone.
+  buildGeometry3D(bgColor) {
+    const cx = 0, cy = 0, cz = 0, r = 1;
     const palette = this.getColors(bgColor);
 
     let allPositions = [], allNormals = [], allColors = [], allIndices = [];
@@ -702,10 +672,12 @@ export class OrbitAnchorRenderer {
     mergeGeometry(northGlow);
 
     // === COMPASS NEEDLE - classic two-tone design ===
-    const needleAngle = viewTheta + Math.PI;
+    // The needle is built pointing along +X; draw() turns it to the view.
+    const needleAngle = 0;
     const needleLen = dialRadius * 0.90;
     const needleStart = r * 0.12;
     const needleHeight = r * 0.032;
+    const needleIndexStart = allIndices.length;
 
     // North half (red) - tapered
     const cosN = Math.cos(needleAngle), sinN = Math.sin(needleAngle);
@@ -741,6 +713,7 @@ export class OrbitAnchorRenderer {
       palette.needleSouth, southAngle
     );
     mergeGeometry(southTail);
+    const needleIndexEnd = allIndices.length;
 
     // === GIMBAL/CLINOMETER RING - elevation arc (matches inner dial) ===
     const arcRadius = dialRadius * 0.68;
@@ -785,17 +758,14 @@ export class OrbitAnchorRenderer {
     }
 
     // === ELEVATION INDICATOR - luminous marker ===
-    const adjustedPhi = viewPhi - Math.PI * 0.5;
-    const clampedEl = Math.max(-Math.PI * 0.5, Math.min(Math.PI * 0.5, adjustedPhi));
-
-    const elX = arcRadius * Math.cos(clampedEl);
-    const elY = arcRadius * Math.sin(clampedEl);
-
-    const elevSphere = this._generateSphere(cx + elX, cy + elY, cz, r * 0.040, 2, palette.elevMarker);
+    // Built at the origin; draw() moves it along the arc to the view elevation.
+    const markerIndexStart = allIndices.length;
+    const elevSphere = this._generateSphere(cx, cy, cz, r * 0.040, 2, palette.elevMarker);
     mergeGeometry(elevSphere);
 
-    const elevGlow = this._generateTorus(cx + elX, cy + elY, cz, r * 0.052, r * 0.008, 12, 6, palette.elevGlow, 'z');
+    const elevGlow = this._generateTorus(cx, cy, cz, r * 0.052, r * 0.008, 12, 6, palette.elevGlow, 'z');
     mergeGeometry(elevGlow);
+    const markerIndexEnd = allIndices.length;
 
     // === FINE CROSSHAIR at center ===
     const crossLen = dialRadius * 0.55;
@@ -810,6 +780,10 @@ export class OrbitAnchorRenderer {
       indices: new Uint16Array(allIndices),
       indexCount: allIndices.length,
       vertexCount: allPositions.length / 3,
+      needleStart: needleIndexStart,
+      needleCount: needleIndexEnd - needleIndexStart,
+      markerStart: markerIndexStart,
+      markerCount: markerIndexEnd - markerIndexStart,
       linePositions: new Float32Array(linePositions),
       lineNormals: new Float32Array(lineNormals),
       lineColors: new Float32Array(lineColors),
@@ -817,8 +791,10 @@ export class OrbitAnchorRenderer {
     };
   }
 
-  // Build 2D compass geometry - Clean, minimal design for light/ultralight shaders
-  buildGeometry2D(cx, cy, cz, r, viewTheta, viewPhi, bgColor) {
+  // Build 2D compass geometry - Clean, minimal design for light/ultralight
+  // shaders, in the same anchor-local units and part layout as buildGeometry3D.
+  buildGeometry2D(bgColor) {
+    const cx = 0, cy = 0, cz = 0, r = 1;
     const positions = [];
     const normals = [];
     const colors = [];
@@ -974,10 +950,12 @@ export class OrbitAnchorRenderer {
     );
 
     // === COMPASS NEEDLE ===
-    const needleAngle = viewTheta + Math.PI;
+    // The needle is built pointing along +X; draw() turns it to the view.
+    const needleAngle = 0;
     const needleLen = dialRadius * 0.90;
     const needleStart = r * 0.12;
     const cosN = Math.cos(needleAngle), sinN = Math.sin(needleAngle);
+    const needleIndexStart = indices.length;
 
     // North needle (tapered triangle)
     const needleTipX = cx + cosN * needleLen;
@@ -1014,6 +992,7 @@ export class OrbitAnchorRenderer {
       southBaseX - sPerpCos * baseWidth * 2.0, cy, southBaseZ - sPerpSin * baseWidth * 2.0,
       palette.needleSouth
     );
+    const needleIndexEnd = indices.length;
 
     // === ELEVATION ARC (matches inner dial) ===
     const arcRadius2 = dialRadius * 0.68;
@@ -1050,16 +1029,14 @@ export class OrbitAnchorRenderer {
     }
 
     // === ELEVATION INDICATOR ===
-    const adjustedPhi = viewPhi - Math.PI * 0.5;
-    const clampedEl = Math.max(-Math.PI * 0.5, Math.min(Math.PI * 0.5, adjustedPhi));
-    const elX = arcRadius2 * Math.cos(clampedEl);
-    const elY = arcRadius2 * Math.sin(clampedEl);
-
-    addDisc(cx + elX, cy + elY, cz, r * 0.045, 12, palette.elevMarker);
+    // Built at the origin; draw() moves it along the arc to the view elevation.
+    const markerIndexStart = indices.length;
+    addDisc(cx, cy, cz, r * 0.045, 12, palette.elevMarker);
 
     // Glow ring
     const glowColor = [palette.elevMarker[0], palette.elevMarker[1], palette.elevMarker[2], palette.elevMarker[3] * 0.35];
-    addRing(cx + elX, cy + elY, cz, r * 0.045, r * 0.062, 12, glowColor);
+    addRing(cx, cy, cz, r * 0.045, r * 0.062, 12, glowColor);
+    const markerIndexEnd = indices.length;
 
     return {
       positions: new Float32Array(positions),
@@ -1068,60 +1045,55 @@ export class OrbitAnchorRenderer {
       indices: new Uint16Array(indices),
       indexCount: indices.length,
       vertexCount: positions.length / 3,
-      useTriangles: true
+      needleStart: needleIndexStart,
+      needleCount: needleIndexEnd - needleIndexStart,
+      markerStart: markerIndexStart,
+      markerCount: markerIndexEnd - markerIndexStart,
+      linePositions: null,
+      lineNormals: null,
+      lineColors: null,
+      lineCount: 0
     };
   }
 
-  // Update buffers for a view
-  updateBuffers(viewState, cx, cy, cz, r, use3D, viewTheta, viewPhi, bgColor) {
+  /**
+   * Upload one view's anchor-local mesh. It depends only on the shader mode
+   * and on the light/dark palette, so camera motion never reaches this path.
+   */
+  _uploadGeometry(viewState, use3D, bgColor) {
     const gl = this.gl;
+    const geom = use3D ? this.buildGeometry3D(bgColor) : this.buildGeometry2D(bgColor);
+    const { position, normal, color } = this.attribs;
 
-    if (use3D) {
-      const geom = this.buildGeometry3D(cx, cy, cz, r, viewTheta, viewPhi, bgColor);
+    const bindAttribute = (buffer, location, size, data) => {
+      gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+      gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+      gl.enableVertexAttribArray(location);
+      gl.vertexAttribPointer(location, size, gl.FLOAT, false, 0, 0);
+    };
 
-      gl.bindBuffer(gl.ARRAY_BUFFER, viewState.positionBuffer);
-      gl.bufferData(gl.ARRAY_BUFFER, geom.positions, gl.DYNAMIC_DRAW);
+    gl.bindVertexArray(viewState.meshVao);
+    bindAttribute(viewState.positionBuffer, position, 3, geom.positions);
+    bindAttribute(viewState.normalBuffer, normal, 3, geom.normals);
+    bindAttribute(viewState.colorBuffer, color, 4, geom.colors);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, viewState.indexBuffer);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, geom.indices, gl.STATIC_DRAW);
 
-      gl.bindBuffer(gl.ARRAY_BUFFER, viewState.normalBuffer);
-      gl.bufferData(gl.ARRAY_BUFFER, geom.normals, gl.DYNAMIC_DRAW);
-
-      gl.bindBuffer(gl.ARRAY_BUFFER, viewState.colorBuffer);
-      gl.bufferData(gl.ARRAY_BUFFER, geom.colors, gl.DYNAMIC_DRAW);
-
-      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, viewState.indexBuffer);
-      gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, geom.indices, gl.DYNAMIC_DRAW);
-
-      viewState.vertexCount = geom.vertexCount;
-      viewState.indexCount = geom.indexCount;
-      viewState.lineCount = geom.lineCount;
-
-      viewState.lineData = {
-        positions: geom.linePositions,
-        normals: geom.lineNormals,
-        colors: geom.lineColors
-      };
-    } else {
-      const geom = this.buildGeometry2D(cx, cy, cz, r, viewTheta, viewPhi, bgColor);
-
-      gl.bindBuffer(gl.ARRAY_BUFFER, viewState.positionBuffer);
-      gl.bufferData(gl.ARRAY_BUFFER, geom.positions, gl.DYNAMIC_DRAW);
-
-      gl.bindBuffer(gl.ARRAY_BUFFER, viewState.normalBuffer);
-      gl.bufferData(gl.ARRAY_BUFFER, geom.normals, gl.DYNAMIC_DRAW);
-
-      gl.bindBuffer(gl.ARRAY_BUFFER, viewState.colorBuffer);
-      gl.bufferData(gl.ARRAY_BUFFER, geom.colors, gl.DYNAMIC_DRAW);
-
-      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, viewState.indexBuffer);
-      gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, geom.indices, gl.DYNAMIC_DRAW);
-
-      viewState.vertexCount = geom.vertexCount;
-      viewState.indexCount = geom.indexCount;
-      viewState.lineCount = 0;
-      viewState.lineData = null;
+    if (geom.lineCount > 0) {
+      gl.bindVertexArray(viewState.lineVao);
+      bindAttribute(viewState.linePositionBuffer, position, 3, geom.linePositions);
+      bindAttribute(viewState.lineNormalBuffer, normal, 3, geom.lineNormals);
+      bindAttribute(viewState.lineColorBuffer, color, 4, geom.lineColors);
     }
+    gl.bindVertexArray(null);
+    gl.bindBuffer(gl.ARRAY_BUFFER, null);
 
-    viewState.needsRebuild = false;
+    viewState.indexCount = geom.indexCount;
+    viewState.needleStart = geom.needleStart;
+    viewState.needleCount = geom.needleCount;
+    viewState.markerStart = geom.markerStart;
+    viewState.markerCount = geom.markerCount;
+    viewState.lineCount = geom.lineCount;
   }
 
   // Draw the orbit anchor for a view
@@ -1141,7 +1113,6 @@ export class OrbitAnchorRenderer {
       viewMatrix,
       modelMatrix,
       fogDensity,
-      fogColor,
       lightingStrength,
       lightDir,
       navigationMode
@@ -1154,135 +1125,109 @@ export class OrbitAnchorRenderer {
     const gl = this.gl;
     const viewState = this.getViewState(viewId);
 
-    const anchorRadius = this.computeAnchorRadius(pointBoundsRadius);
-
-    // Check if rebuild needed
-    const posChanged = viewTarget[0] !== viewState.lastX || viewTarget[1] !== viewState.lastY || viewTarget[2] !== viewState.lastZ;
-    const sizeChanged = Math.abs(anchorRadius - (viewState.lastRadius || 0)) > 0.0005;
-    const modeChanged = viewState.is3D !== use3D;
-    const angleChanged = Math.abs(viewTheta - (viewState.lastTheta || 0)) > 0.01 || Math.abs(viewPhi - (viewState.lastPhi || 0)) > 0.01;
-
-    const currentLuminance = bgColor[0] * 0.299 + bgColor[1] * 0.587 + bgColor[2] * 0.114;
-    const bgChanged = Math.abs(currentLuminance - viewState.lastBgLuminance) > 0.1;
-
-    if (viewState.needsRebuild || posChanged || sizeChanged || modeChanged || angleChanged || bgChanged || viewState.vertexCount === 0) {
-      this.updateBuffers(viewState, viewTarget[0], viewTarget[1], viewTarget[2], anchorRadius, use3D, viewTheta, viewPhi, bgColor);
-      viewState.lastX = viewTarget[0];
-      viewState.lastY = viewTarget[1];
-      viewState.lastZ = viewTarget[2];
-      viewState.lastRadius = anchorRadius;
-      viewState.lastTheta = viewTheta;
-      viewState.lastPhi = viewPhi;
-      viewState.lastBgLuminance = currentLuminance;
-      viewState.is3D = use3D;
-
-      if (use3D && viewState.lineData) {
-        gl.bindBuffer(gl.ARRAY_BUFFER, viewState.linePositionBuffer);
-        gl.bufferData(gl.ARRAY_BUFFER, viewState.lineData.positions, gl.DYNAMIC_DRAW);
-        gl.bindBuffer(gl.ARRAY_BUFFER, viewState.lineNormalBuffer);
-        gl.bufferData(gl.ARRAY_BUFFER, viewState.lineData.normals, gl.DYNAMIC_DRAW);
-        gl.bindBuffer(gl.ARRAY_BUFFER, viewState.lineColorBuffer);
-        gl.bufferData(gl.ARRAY_BUFFER, viewState.lineData.colors, gl.DYNAMIC_DRAW);
-      }
+    const isDark = bgColor[0] * 0.299 + bgColor[1] * 0.587 + bgColor[2] * 0.114 < 0.5;
+    const geometryKey = use3D
+      ? (isDark ? '3d-dark' : '3d-light')
+      : (isDark ? '2d-dark' : '2d-light');
+    if (viewState.geometryKey !== geometryKey) {
+      viewState.geometryKey = null;
+      this._uploadGeometry(viewState, use3D, bgColor);
+      viewState.geometryKey = geometryKey;
     }
+    if (viewState.indexCount === 0) return;
 
-    if (viewState.vertexCount === 0) return;
+    const cx = viewTarget[0];
+    const cy = viewTarget[1];
+    const cz = viewTarget[2];
+    const anchorRadius = this.computeAnchorRadius(pointBoundsRadius);
+    const elevation = Math.max(
+      -Math.PI * 0.5,
+      Math.min(Math.PI * 0.5, viewPhi - Math.PI * 0.5)
+    );
+    const baseMatrix = writePartMatrix(
+      this._baseMatrix, cx, cy, cz, anchorRadius, 0, 0, 0
+    );
+    const needleMatrix = writePartMatrix(
+      this._needleMatrix, cx, cy, cz, anchorRadius, viewTheta + Math.PI, 0, 0
+    );
+    const markerMatrix = writePartMatrix(
+      this._markerMatrix,
+      cx, cy, cz,
+      anchorRadius,
+      0,
+      ELEVATION_ARC_RADIUS * Math.cos(elevation),
+      ELEVATION_ARC_RADIUS * Math.sin(elevation)
+    );
 
     const fogNear = viewRadius * 0.2;
     const fogFar = viewRadius * 4.0;
 
-    const camX = viewTarget[0] + viewRadius * Math.sin(viewTheta) * Math.cos(viewPhi);
-    const camY = viewTarget[1] + viewRadius * Math.sin(viewPhi);
-    const camZ = viewTarget[2] + viewRadius * Math.cos(viewTheta) * Math.cos(viewPhi);
+    const camX = cx + viewRadius * Math.sin(viewTheta) * Math.cos(viewPhi);
+    const camY = cy + viewRadius * Math.sin(viewPhi);
+    const camZ = cz + viewRadius * Math.cos(viewTheta) * Math.cos(viewPhi);
 
     configureStraightAlphaBlending(gl);
 
-    if (use3D) {
-      gl.useProgram(this.program3D);
-      gl.uniformMatrix4fv(this.uniforms3D.mvpMatrix, false, mvpMatrix);
-      gl.uniformMatrix4fv(this.uniforms3D.viewMatrix, false, viewMatrix);
-      gl.uniformMatrix4fv(this.uniforms3D.modelMatrix, false, modelMatrix);
-      gl.uniform3f(this.uniforms3D.cameraPos, camX, camY, camZ);
-      gl.uniform1f(this.uniforms3D.fogDensity, fogDensity);
-      gl.uniform1f(this.uniforms3D.fogNear, fogNear);
-      gl.uniform1f(this.uniforms3D.fogFar, fogFar);
-      gl.uniform3fv(this.uniforms3D.fogColor, fogColor);
-      gl.uniform1f(this.uniforms3D.lightingStrength, lightingStrength);
-      gl.uniform3fv(this.uniforms3D.lightDir, lightDir);
-      gl.uniform1f(this.uniforms3D.emissive, 0.12);
+    const uniforms = this.uniforms;
+    gl.useProgram(this.program);
+    gl.uniformMatrix4fv(uniforms.mvpMatrix, false, mvpMatrix);
+    gl.uniformMatrix4fv(uniforms.viewMatrix, false, viewMatrix);
+    gl.uniformMatrix4fv(uniforms.modelMatrix, false, modelMatrix);
+    gl.uniform3f(uniforms.cameraPos, camX, camY, camZ);
+    writeFogUniforms(
+      gl,
+      uniforms.fogNear,
+      uniforms.fogScale,
+      fogDensity,
+      fogNear,
+      fogFar
+    );
+    // 2D mode shades the flat compass with minimal lighting.
+    gl.uniform1f(uniforms.lightingStrength, use3D ? lightingStrength : 0.25);
+    gl.uniform3fv(uniforms.lightDir, lightDir);
+    gl.uniform1f(uniforms.emissive, use3D ? 0.12 : 0.45);
 
-      gl.bindBuffer(gl.ARRAY_BUFFER, viewState.positionBuffer);
-      gl.enableVertexAttribArray(this.attribs3D.position);
-      gl.vertexAttribPointer(this.attribs3D.position, 3, gl.FLOAT, false, 0, 0);
+    // Four index ranges in build order -- body, needle, body, marker -- so the
+    // translucent triangles composite in exactly the order they were built.
+    const needleEnd = viewState.needleStart + viewState.needleCount;
+    gl.bindVertexArray(viewState.meshVao);
+    this._drawRange(baseMatrix, 0, viewState.needleStart);
+    this._drawRange(needleMatrix, viewState.needleStart, viewState.needleCount);
+    this._drawRange(baseMatrix, needleEnd, viewState.markerStart - needleEnd);
+    this._drawRange(markerMatrix, viewState.markerStart, viewState.markerCount);
+    this._drawRange(
+      baseMatrix,
+      viewState.markerStart + viewState.markerCount,
+      viewState.indexCount - viewState.markerStart - viewState.markerCount
+    );
 
-      gl.bindBuffer(gl.ARRAY_BUFFER, viewState.normalBuffer);
-      gl.enableVertexAttribArray(this.attribs3D.normal);
-      gl.vertexAttribPointer(this.attribs3D.normal, 3, gl.FLOAT, false, 0, 0);
-
-      gl.bindBuffer(gl.ARRAY_BUFFER, viewState.colorBuffer);
-      gl.enableVertexAttribArray(this.attribs3D.color);
-      gl.vertexAttribPointer(this.attribs3D.color, 4, gl.FLOAT, false, 0, 0);
-
-      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, viewState.indexBuffer);
-      gl.drawElements(gl.TRIANGLES, viewState.indexCount, gl.UNSIGNED_SHORT, 0);
-
-      if (viewState.lineCount > 0 && viewState.lineData) {
-        gl.uniform1f(this.uniforms3D.emissive, 0.0);
-
-        gl.bindBuffer(gl.ARRAY_BUFFER, viewState.linePositionBuffer);
-        gl.vertexAttribPointer(this.attribs3D.position, 3, gl.FLOAT, false, 0, 0);
-
-        gl.bindBuffer(gl.ARRAY_BUFFER, viewState.lineNormalBuffer);
-        gl.vertexAttribPointer(this.attribs3D.normal, 3, gl.FLOAT, false, 0, 0);
-
-        gl.bindBuffer(gl.ARRAY_BUFFER, viewState.lineColorBuffer);
-        gl.vertexAttribPointer(this.attribs3D.color, 4, gl.FLOAT, false, 0, 0);
-
-        gl.drawArrays(gl.LINES, 0, viewState.lineCount);
-      }
-
-      gl.disableVertexAttribArray(this.attribs3D.position);
-      gl.disableVertexAttribArray(this.attribs3D.normal);
-      gl.disableVertexAttribArray(this.attribs3D.color);
-    } else {
-      // 2D mode uses triangles with minimal lighting
-      gl.useProgram(this.program3D);
-      gl.uniformMatrix4fv(this.uniforms3D.mvpMatrix, false, mvpMatrix);
-      gl.uniformMatrix4fv(this.uniforms3D.viewMatrix, false, viewMatrix);
-      gl.uniformMatrix4fv(this.uniforms3D.modelMatrix, false, modelMatrix);
-      gl.uniform3f(this.uniforms3D.cameraPos, camX, camY, camZ);
-      gl.uniform1f(this.uniforms3D.fogDensity, fogDensity);
-      gl.uniform1f(this.uniforms3D.fogNear, fogNear);
-      gl.uniform1f(this.uniforms3D.fogFar, fogFar);
-      gl.uniform3fv(this.uniforms3D.fogColor, fogColor);
-      gl.uniform1f(this.uniforms3D.lightingStrength, 0.25);
-      gl.uniform3fv(this.uniforms3D.lightDir, lightDir);
-      gl.uniform1f(this.uniforms3D.emissive, 0.45);
-
-      gl.bindBuffer(gl.ARRAY_BUFFER, viewState.positionBuffer);
-      gl.enableVertexAttribArray(this.attribs3D.position);
-      gl.vertexAttribPointer(this.attribs3D.position, 3, gl.FLOAT, false, 0, 0);
-
-      gl.bindBuffer(gl.ARRAY_BUFFER, viewState.normalBuffer);
-      gl.enableVertexAttribArray(this.attribs3D.normal);
-      gl.vertexAttribPointer(this.attribs3D.normal, 3, gl.FLOAT, false, 0, 0);
-
-      gl.bindBuffer(gl.ARRAY_BUFFER, viewState.colorBuffer);
-      gl.enableVertexAttribArray(this.attribs3D.color);
-      gl.vertexAttribPointer(this.attribs3D.color, 4, gl.FLOAT, false, 0, 0);
-
-      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, viewState.indexBuffer);
-      gl.drawElements(gl.TRIANGLES, viewState.indexCount, gl.UNSIGNED_SHORT, 0);
-
-      gl.disableVertexAttribArray(this.attribs3D.position);
-      gl.disableVertexAttribArray(this.attribs3D.normal);
-      gl.disableVertexAttribArray(this.attribs3D.color);
+    if (use3D && viewState.lineCount > 0) {
+      gl.uniform1f(uniforms.emissive, 0.0);
+      gl.uniformMatrix4fv(uniforms.partMatrix, false, baseMatrix);
+      gl.bindVertexArray(viewState.lineVao);
+      gl.drawArrays(gl.LINES, 0, viewState.lineCount);
     }
+    gl.bindVertexArray(null);
+  }
+
+  /**
+   * Draw one index range of the bound mesh with its part matrix. A method
+   * rather than a closure in draw(), which runs every frame for every pane.
+   */
+  _drawRange(matrix, start, count) {
+    if (count <= 0) return;
+    const gl = this.gl;
+    gl.uniformMatrix4fv(this.uniforms.partMatrix, false, matrix);
+    gl.drawElements(
+      gl.TRIANGLES,
+      count,
+      gl.UNSIGNED_SHORT,
+      start * Uint16Array.BYTES_PER_ELEMENT
+    );
   }
 
   setShowAnchor(show) {
     this.showAnchor = !!show;
-    if (show) this.markAllNeedsRebuild();
   }
 
   getShowAnchor() {

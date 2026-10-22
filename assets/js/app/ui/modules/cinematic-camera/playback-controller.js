@@ -1,9 +1,9 @@
 /**
  * @fileoverview Playback state machine for cinematic camera paths.
  *
- * Runs its own `requestAnimationFrame` loop that calls
- * `viewer.setCameraState()` on every frame during playback.  The viewer's own
- * render loop picks up the updated camera values on its next frame.
+ * Runs a frame loop that calls `viewer.setCameraState()` at the top of every
+ * frame during playback (`rendering/frame-phases.js`), before the viewer draws,
+ * so each frame shows the camera of its own time, not the previous frame's.
  *
  * States: STOPPED → PLAYING ↔ PAUSED → STOPPED
  *
@@ -14,6 +14,7 @@
  * @module ui/modules/cinematic-camera/playback-controller
  */
 
+import { runBeforeNextFrame } from '../../../../rendering/frame-phases.js';
 import {
   assertCameraPathOptions,
   createCameraPathPlan,
@@ -246,7 +247,7 @@ export function createPlaybackController({ viewer, keyframeStore, getInterpolati
 
     emit('timeUpdate', { globalT, elapsed, totalDuration });
 
-    rafId = requestAnimationFrame(tick);
+    rafId = runBeforeNextFrame(tick);
   }
 
   // ---- Public API ----
@@ -285,7 +286,7 @@ export function createPlaybackController({ viewer, keyframeStore, getInterpolati
 
     state = PLAYING;
     emit('stateChange', state);
-    rafId = requestAnimationFrame(tick);
+    rafId = runBeforeNextFrame(tick);
   }
 
   function pause() {
@@ -293,7 +294,7 @@ export function createPlaybackController({ viewer, keyframeStore, getInterpolati
     if (state !== PLAYING) {
       throw new Error('Camera path playback can pause only while it is playing.');
     }
-    if (rafId != null) cancelAnimationFrame(rafId);
+    if (rafId != null) rafId();
     rafId = null;
 
     pauseElapsed = performance.now() / 1000 - startTime;
@@ -308,7 +309,7 @@ export function createPlaybackController({ viewer, keyframeStore, getInterpolati
       'resetCamera',
       'Camera path stop'
     );
-    if (rafId != null) cancelAnimationFrame(rafId);
+    if (rafId != null) rafId();
     rafId = null;
 
     state = STOPPED;
@@ -402,7 +403,7 @@ export function createPlaybackController({ viewer, keyframeStore, getInterpolati
     const failures = [];
     if (rafId != null) {
       try {
-        cancelAnimationFrame(rafId);
+        rafId();
       } catch (error) {
         failures.push(error);
       }

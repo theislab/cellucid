@@ -1,0 +1,57 @@
+/* layouts/_not-found.css - The page GitHub Pages serves for a missing path
+   (404.html). It is the welcome card on the viewer's backdrop: the same card,
+   logo and action rows as the onboarding dialog, laid out as a page instead of
+   an overlay. Everything else comes from the shared components and tokens. */
+
+/* The app shell never scrolls; this page must, on a short screen. */
+html:has(> body.not-found-page),
+body.not-found-page {
+  height: auto;
+  min-height: 100%;
+  overflow: auto;
+}
+
+.not-found {
+  box-sizing: border-box;
+  min-height: 100vh;
+  min-height: 100dvh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-5) var(--space-4);
+}
+
+.not-found .welcome-content {
+  max-height: none;
+}
+
+.not-found-title {
+  font-size: var(--type-title);
+  font-weight: var(--font-weight-semibold);
+  line-height: var(--leading-tight);
+  color: var(--color-text-primary);
+  margin: 0 0 var(--space-2);
+  text-align: center;
+}
+
+.not-found-links {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: var(--space-1) var(--space-3);
+  margin: var(--space-3) 0 0;
+  padding: var(--space-2-5) 0 0;
+  border-top: var(--border-width-1) solid var(--color-border-light);
+  list-style: none;
+  font-size: var(--type-label);
+}
+
+.not-found-links a {
+  color: var(--color-text-secondary);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.not-found-links a:hover {
+  color: var(--color-text-primary);
+}

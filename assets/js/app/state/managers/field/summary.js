@@ -11,10 +11,136 @@
  * @module state/managers/field/summary
  */
 
-import { isContinuousFilterFullRange } from '../filter-manager.js';
+import {
+  collectViewFilters,
+  isContinuousFilterFullRange,
+} from '../filter-manager.js';
 import {
   POINT_VISIBILITY_THRESHOLD,
 } from '../../../../rendering/alpha-visibility.js';
+import { transparencyEpoch } from '../per-cell-array-ownership.js';
+import { isCategoricalCodes } from '../../../../data/categorical-storage-contract.js';
+
+/**
+ * Resolve the filters that can hide a cell once per count.
+ *
+ * The count loops used to walk every field for every cell and re-derive each
+ * filter's state there — at 5,000,000 cells that was most of a categorical
+ * field switch. A category filter that hides nothing and a continuous filter
+ * spanning its whole range can never hide a cell, so they are left out.
+ *
+ * @param {Array<object>} obsFields
+ * @param {(field: object, index: number) => boolean} skipObs
+ * @param {object|null} varField Active gene, filtered like an obs field.
+ * @returns {{categories: Array<{codes: ArrayLike<number>, hidden: Uint8Array}>,
+ *   ranges: Array<{values: ArrayLike<number>, min: number, max: number}>}}
+ */
+function resolveCellFilters(obsFields, skipObs, varField) {
+  const categories = [];
+  const ranges = [];
+  const addRange = field => {
+    if (
+      field._filterEnabled === false ||
+      !field._continuousStats ||
+      !field._continuousFilter ||
+      isContinuousFilterFullRange(field._continuousFilter, field._continuousStats)
+    ) {
+      return;
+    }
+    ranges.push({
+      values: field.values || [],
+      min: field._continuousFilter.min,
+      max: field._continuousFilter.max,
+    });
+  };
+  for (let index = 0; index < obsFields.length; index++) {
+    const field = obsFields[index];
+    if (!field || field._isDeleted === true || skipObs(field, index)) continue;
+    if (field.kind === 'category' && field._categoryVisible) {
+      if (field._categoryFilterEnabled === false) continue;
+      const count = (field.categories || []).length;
+      const hidden = new Uint8Array(count);
+      let hidesAny = false;
+      for (let code = 0; code < count; code++) {
+        if (field._categoryVisible[code] === false) {
+          hidden[code] = 1;
+          hidesAny = true;
+        }
+      }
+      if (hidesAny) categories.push({ codes: field.codes || [], hidden });
+    } else if (field.kind === 'continuous') {
+      addRange(field);
+    }
+  }
+  if (varField !== null && varField.kind === 'continuous') addRange(varField);
+  return { categories, ranges };
+}
+
+/**
+ * Whether one cell survives every resolved filter.
+ *
+ * `hidden[codes[cell]] === 1` is the whole category test: a missing value, a
+ * code outside the inventory, a hole or a non-integer reads `undefined` from
+ * the per-code table and is never hidden, exactly as the explicit range checks
+ * it replaces decided.
+ */
+function cellPassesFilters(categories, ranges, cell) {
+  for (let index = 0; index < categories.length; index++) {
+    const filter = categories[index];
+    if (filter.hidden[filter.codes[cell]] === 1) return false;
+  }
+  for (let index = 0; index < ranges.length; index++) {
+    const filter = ranges[index];
+    const value = filter.values[cell];
+    if (value === null || value !== value || value < filter.min || value > filter.max) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Whether two resolved filter sets hide exactly the same cells: the same code
+ * and value arrays (published field data is never written in place) with the
+ * same hidden-code tables and range bounds.
+ */
+function sameResolvedFilters(left, right) {
+  if (
+    left.categories.length !== right.categories.length
+    || left.ranges.length !== right.ranges.length
+  ) {
+    return false;
+  }
+  for (let index = 0; index < left.categories.length; index++) {
+    const a = left.categories[index];
+    const b = right.categories[index];
+    if (a.codes !== b.codes || a.hidden.length !== b.hidden.length) return false;
+    for (let code = 0; code < a.hidden.length; code++) {
+      if (a.hidden[code] !== b.hidden[code]) return false;
+    }
+  }
+  for (let index = 0; index < left.ranges.length; index++) {
+    const a = left.ranges[index];
+    const b = right.ranges[index];
+    if (a.values !== b.values || a.min !== b.min || a.max !== b.max) return false;
+  }
+  return true;
+}
+
+/**
+ * Per-category tallies with typed counters: a dataset-length count loop over
+ * `new Array(n).fill(0)` pays a holey-elements store per cell. Published as
+ * plain arrays, which is what every consumer reads.
+ */
+function toCountArray(counts) {
+  return Array.from(counts);
+}
+
+function sumCounts(counts) {
+  let sum = 0;
+  for (let index = 0; index < counts.length; index++) sum += counts[index];
+  return sum;
+}
 
 export class FieldSummaryMethods {
   /**
@@ -40,66 +166,21 @@ export class FieldSummaryMethods {
   }
 
   /**
-   * Get the filter summary for a specific view (without switching to it).
+   * The restrictions in force in one view (without switching to it), as
+   * figure-export provenance records them. Active and stored views go through
+   * the same structured definition; a disabled filter hides nothing, so it is
+   * not a restriction and is left out.
    */
   getFilterSummaryForView(viewId) {
     const key = String(viewId || 'live');
-    if (key === String(this.activeViewId)) {
-      return this.getFilterSummaryLines();
-    }
-    const ctx = this.viewContexts.get(key);
-    if (!ctx || !ctx.obsData || !ctx.obsData.fields) return [];
-
-    const filters = [];
-    const fields = ctx.obsData.fields;
-
-    for (let fi = 0; fi < fields.length; fi++) {
-      const field = fields[fi];
-      if (!field) continue;
-      if (field._isDeleted === true) continue;
-      const fieldKey = field.key || `Field ${fi + 1}`;
-
-      // Check continuous filter
-      if (field.kind === 'continuous' && field._continuousStats && field._continuousFilter) {
-        const stats = field._continuousStats;
-        const filter = field._continuousFilter;
-        const fullRange = isContinuousFilterFullRange(filter, stats);
-        if (!fullRange && field._filterEnabled !== false) {
-          filters.push(`${fieldKey}: ${filter.min.toFixed(2)} – ${filter.max.toFixed(2)}`);
-        }
-      }
-
-      // Check category filter
-      if (field.kind === 'category') {
-        const categories = field.categories || [];
-        const visibleMap = field._categoryVisible || {};
-        const hiddenNames = [];
-        for (let i = 0; i < categories.length; i++) {
-          if (visibleMap[i] === false) {
-            hiddenNames.push(String(categories[i]));
-          }
-        }
-        if (hiddenNames.length > 0 && field._categoryFilterEnabled !== false) {
-          const preview = hiddenNames.slice(0, 2).join(', ');
-          const extra = hiddenNames.length > 2 ? ` +${hiddenNames.length - 2}` : '';
-          filters.push(`${fieldKey}: hiding ${preview}${extra}`);
-        }
-        if (
-          ctx.activeFieldSource === 'obs'
-          && ctx.activeFieldIndex === fi
-          && field.outlierQuantiles
-          && field.outlierQuantiles.length
-          && field._outlierFilterEnabled !== false
-        ) {
-          const threshold = field._outlierThreshold ?? 1;
-          if (threshold < 0.9999) {
-            filters.push(`${fieldKey}: outlier ≤ ${Math.round(threshold * 100)}%`);
-          }
-        }
-      }
-    }
-
-    return filters.length > 0 ? filters : ['No filters active'];
+    const view = key === String(this.activeViewId)
+      ? this
+      : this.viewContexts.get(key);
+    if (!view) return [];
+    const lines = collectViewFilters(view)
+      .filter((filter) => filter.enabled)
+      .map((filter) => filter.text);
+    return lines.length > 0 ? lines : ['No filters active'];
   }
 
   updateFilteredCount() {
@@ -110,19 +191,20 @@ export class FieldSummaryMethods {
     const total = this.pointCount;
     const applyOutlierFilter = this.isOutlierFilterEnabledForActiveField();
     const threshold = applyOutlierFilter ? this.getCurrentOutlierThreshold() : 1.0;
-    const outliers = applyOutlierFilter ? (this.outlierQuantilesArray || []) : [];
+    const outliers = applyOutlierFilter ? this.getActiveOutlierQuantiles() : null;
     const alpha = this.categoryTransparency || [];
     let shown = 0;
-    for (let i = 0; i < total; i++) {
-      const visible =
-        (alpha[i] ?? 0) >= POINT_VISIBILITY_THRESHOLD;
-      if (!visible) continue;
-      // Only apply outlier filter when supported by the active field.
-      if (applyOutlierFilter) {
+    if (!applyOutlierFilter) {
+      for (let i = 0; i < total; i++) {
+        if ((alpha[i] ?? 0) >= POINT_VISIBILITY_THRESHOLD) shown++;
+      }
+    } else {
+      for (let i = 0; i < total; i++) {
+        if (!((alpha[i] ?? 0) >= POINT_VISIBILITY_THRESHOLD)) continue;
         const q = outliers[i] ?? -1;
         if (q >= 0 && q > threshold) continue;
+        shown++;
       }
-      shown++;
     }
     this.filteredCount = { shown, total };
   }
@@ -135,106 +217,111 @@ export class FieldSummaryMethods {
     if (!field || field.kind !== 'category') return null;
     const categories = field.categories || [];
     const codes = field.codes || [];
-    const total = new Array(categories.length).fill(0);
-    const available = new Array(categories.length).fill(0); // respects other filters, ignores this field's category visibility
-    const visible = new Array(categories.length).fill(0); // respects all filters including this field's category visibility
+    const categoryCount = categories.length;
     const alpha = this.categoryTransparency || [];
     const applyOutlierFilter = this.isOutlierFilterEnabledForActiveField();
-    const outliers = applyOutlierFilter ? (this.outlierQuantilesArray || []) : [];
+    const outliers = applyOutlierFilter ? this.getActiveOutlierQuantiles() : null;
     const threshold = applyOutlierFilter ? this.getCurrentOutlierThreshold() : 1.0;
     const n = Math.min(this.pointCount, codes.length);
     const fields = this.obsData?.fields || [];
     const targetIndex = fields.indexOf(field);
     const activeVarField =
       this.activeFieldSource === 'var' && this.activeVarFieldIndex >= 0
-        ? this.varData?.fields?.[this.activeVarFieldIndex]
+        ? this.varData?.fields?.[this.activeVarFieldIndex] ?? null
         : null;
-    const activeVarValues = activeVarField?.values || [];
+    // "Available" respects every other filter but ignores this field's own
+    // category visibility.
+    const resolved = resolveCellFilters(
+      fields,
+      (_, index) => index === targetIndex,
+      activeVarField
+    );
+    const { categories: categoryFilters, ranges } = resolved;
 
-    for (let i = 0; i < n; i++) {
-      const code = codes[i];
-      if (code == null || code < 0 || code >= categories.length) continue;
-      total[code]++;
-
-      // Compute visibility from other filters (but ignoring this field's own category visibility)
-      let baseVisible = true;
-      for (let f = 0; f < fields.length; f++) {
-        const fField = fields[f];
-        if (!fField || fField._isDeleted === true) continue;
-        if (f === targetIndex) {
-          // Ignore this field's category visibility for "available" counts
-          continue;
-        }
-        if (fField.kind === 'category' && fField._categoryVisible) {
-          const categoryFilterEnabled = fField._categoryFilterEnabled !== false;
-          if (categoryFilterEnabled) {
-            const codesOther = fField.codes || [];
-            const catsOther = fField.categories || [];
-            const numCatsOther = catsOther.length;
-            const cCode = codesOther[i];
-            if (cCode != null && cCode >= 0 && cCode < numCatsOther) {
-              const isVis = fField._categoryVisible[cCode] !== false;
-              if (!isVis) { baseVisible = false; break; }
-            }
-          }
-        } else if (
-          fField.kind === 'continuous' &&
-          fField._continuousStats &&
-          fField._continuousFilter
-        ) {
-          const filterEnabled = fField._filterEnabled !== false;
-          if (filterEnabled) {
-            const stats = fField._continuousStats;
-            const filter = fField._continuousFilter;
-            const values = fField.values || [];
-            const fullRange = isContinuousFilterFullRange(filter, stats);
-            if (!fullRange) {
-              const v = values[i];
-              if (v === null || Number.isNaN(v) || v < filter.min || v > filter.max) {
-                baseVisible = false;
-                break;
-              }
-            }
-          }
-        }
-      }
-      if (baseVisible && activeVarField && activeVarField.kind === 'continuous') {
-        const filterEnabled = activeVarField._filterEnabled !== false;
-        if (filterEnabled && activeVarField._continuousStats && activeVarField._continuousFilter) {
-          const stats = activeVarField._continuousStats;
-          const filter = activeVarField._continuousFilter;
-          const fullRange = isContinuousFilterFullRange(filter, stats);
-          if (!fullRange) {
-            const v = activeVarValues[i];
-            if (v === null || Number.isNaN(v) || v < filter.min || v > filter.max) {
-              baseVisible = false;
-            }
-          }
-        }
-      }
-      // Only apply outlier filter when supported by the active field.
-      if (baseVisible && applyOutlierFilter) {
-        const q = outliers[i] ?? -1;
-        if (q >= 0 && q > threshold) {
-          baseVisible = false;
-        }
-      }
-      if (baseVisible) available[code]++;
-
-      // Current visibility already encoded in alpha + outliers
-      const isVisibleNow =
-        (alpha[i] ?? 0) >= POINT_VISIBILITY_THRESHOLD;
-      if (!isVisibleNow) continue;
-      // Only apply outlier filter when supported by the active field.
-      if (applyOutlierFilter) {
-        const qNow = outliers[i] ?? -1;
-        if (qNow >= 0 && qNow > threshold) continue;
-      }
-      visible[code]++;
+    // One visibility change asks for the same counts more than once (the
+    // centroid/legend refresh inside computeGlobalVisibility, then the Active
+    // filters row of the same field). Each is a dataset-length pass, so an
+    // unchanged question returns the counts it already answered. Every input
+    // is compared exactly: the code and transparency arrays by identity plus
+    // the transparency write epoch, the outlier quantiles and threshold, and
+    // every resolved filter's arrays, tables and bounds.
+    const epoch = transparencyEpoch(this);
+    const memo = this._categoryCountsMemo;
+    if (
+      memo !== undefined
+      && memo !== null
+      && memo.field === field
+      && memo.codes === codes
+      && memo.categoryCount === categoryCount
+      && memo.n === n
+      && memo.alpha === alpha
+      && memo.epoch === epoch
+      && memo.outliers === outliers
+      && memo.threshold === threshold
+      && sameResolvedFilters(memo.filters, resolved)
+    ) {
+      return memo.counts;
     }
-    const visibleTotal = visible.reduce((sum, v) => sum + v, 0);
-    const availableTotal = available.reduce((sum, v) => sum + v, 0);
-    return { total, available, availableTotal, visible, visibleTotal };
+
+    const total = new Float64Array(categoryCount);
+    const available = new Float64Array(categoryCount); // respects other filters, ignores this field's category visibility
+    const visible = new Float64Array(categoryCount); // respects all filters including this field's category visibility
+
+    if (
+      categoryFilters.length === 0 &&
+      ranges.length === 0 &&
+      !applyOutlierFilter
+    ) {
+      // Nothing but this field's own visibility can hide a cell, so every
+      // counted cell is available and one pass tallies total and visible.
+      for (let i = 0; i < n; i++) {
+        const code = codes[i];
+        if (code == null || code < 0 || code >= categoryCount) continue;
+        total[code]++;
+        if ((alpha[i] ?? 0) >= POINT_VISIBILITY_THRESHOLD) visible[code]++;
+      }
+      available.set(total);
+    } else {
+      for (let i = 0; i < n; i++) {
+        const code = codes[i];
+        if (code == null || code < 0 || code >= categoryCount) continue;
+        total[code]++;
+
+        // Only apply outlier filter when supported by the active field.
+        let outlierHidden = false;
+        if (applyOutlierFilter) {
+          const q = outliers[i] ?? -1;
+          outlierHidden = q >= 0 && q > threshold;
+        }
+        if (!outlierHidden && cellPassesFilters(categoryFilters, ranges, i)) {
+          available[code]++;
+        }
+
+        // Current visibility already encoded in alpha + outliers
+        if (outlierHidden || !((alpha[i] ?? 0) >= POINT_VISIBILITY_THRESHOLD)) continue;
+        visible[code]++;
+      }
+    }
+    const counts = {
+      total: toCountArray(total),
+      available: toCountArray(available),
+      availableTotal: sumCounts(available),
+      visible: toCountArray(visible),
+      visibleTotal: sumCounts(visible)
+    };
+    this._categoryCountsMemo = {
+      field,
+      codes,
+      categoryCount,
+      n,
+      alpha,
+      epoch,
+      outliers,
+      threshold,
+      filters: resolved,
+      counts,
+    };
+    return counts;
   }
 
   _computeCountsForContinuous(field, source, { ignoreSelfFilter = false } = {}) {
@@ -244,70 +331,43 @@ export class FieldSummaryMethods {
     const obsFields = this.obsData?.fields || [];
     const activeVarField =
       this.activeFieldSource === 'var' && this.activeVarFieldIndex >= 0
-        ? this.varData?.fields?.[this.activeVarFieldIndex]
+        ? this.varData?.fields?.[this.activeVarFieldIndex] ?? null
         : null;
-    const activeVarValues = activeVarField?.values || [];
     const targetValues = field.values || [];
     const applyOutlierFilter = this.isOutlierFilterEnabledForActiveField();
-    const outliers = applyOutlierFilter ? (this.outlierQuantilesArray || []) : [];
+    const outliers = applyOutlierFilter ? this.getActiveOutlierQuantiles() : null;
     const threshold = applyOutlierFilter ? this.getCurrentOutlierThreshold() : 1.0;
     let available = 0;
     let visible = 0;
+    // With `ignoreSelfFilter`, the field's own range is left out of
+    // "available" and applied below for "visible".
+    const filters = resolveCellFilters(
+      obsFields,
+      obsField => (
+        ignoreSelfFilter &&
+        source === 'obs' &&
+        obsField === field &&
+        obsField.kind === 'continuous'
+      ),
+      ignoreSelfFilter && source === 'var' && activeVarField === field
+        ? null
+        : activeVarField
+    );
 
+    // The self filter skipped above, applied for "visible" only.
+    const selfFilter = (
+      ignoreSelfFilter &&
+      field._filterEnabled !== false &&
+      field._continuousStats &&
+      field._continuousFilter &&
+      !isContinuousFilterFullRange(field._continuousFilter, field._continuousStats)
+    )
+      ? field._continuousFilter
+      : null;
+
+    const { categories: categoryFilters, ranges } = filters;
     for (let i = 0; i < n; i++) {
-      let passes = true;
-
-      for (let f = 0; f < obsFields.length; f++) {
-        const obsField = obsFields[f];
-        if (!obsField || obsField._isDeleted === true) continue;
-        if (obsField.kind === 'category' && obsField._categoryVisible) {
-          const categoryFilterEnabled = obsField._categoryFilterEnabled !== false;
-          if (categoryFilterEnabled) {
-            const codes = obsField.codes || [];
-            const categories = obsField.categories || [];
-            const numCats = categories.length;
-            const code = codes[i];
-            if (code != null && code >= 0 && code < numCats) {
-              const isVisible = obsField._categoryVisible[code] !== false;
-              if (!isVisible) { passes = false; break; }
-            }
-          }
-        } else if (obsField.kind === 'continuous' && obsField._continuousStats && obsField._continuousFilter) {
-          const filterEnabled = obsField._filterEnabled !== false;
-          const isSelf = source === 'obs' && obsField === field;
-          if (filterEnabled && !(isSelf && ignoreSelfFilter)) {
-            const stats = obsField._continuousStats;
-            const filter = obsField._continuousFilter;
-            const values = obsField.values || [];
-            const fullRange = isContinuousFilterFullRange(filter, stats);
-            if (!fullRange) {
-              const v = values[i];
-              if (v === null || Number.isNaN(v) || v < filter.min || v > filter.max) {
-                passes = false;
-                break;
-              }
-            }
-          }
-        }
-      }
-      if (!passes) continue;
-
-      if (activeVarField && activeVarField.kind === 'continuous' && activeVarField._continuousStats && activeVarField._continuousFilter) {
-        const filterEnabled = activeVarField._filterEnabled !== false;
-        const isSelfVar = source === 'var' && activeVarField === field;
-        if (filterEnabled && !(isSelfVar && ignoreSelfFilter)) {
-          const stats = activeVarField._continuousStats;
-          const filter = activeVarField._continuousFilter;
-          const fullRange = isContinuousFilterFullRange(filter, stats);
-          if (!fullRange) {
-            const v = activeVarValues[i];
-            if (v === null || Number.isNaN(v) || v < filter.min || v > filter.max) {
-              passes = false;
-            }
-          }
-        }
-      }
-      if (!passes) continue;
+      if (!cellPassesFilters(categoryFilters, ranges, i)) continue;
 
       // Outliers only apply if the outlier filter is enabled
       if (applyOutlierFilter) {
@@ -317,20 +377,10 @@ export class FieldSummaryMethods {
 
       available++;
 
-      // Apply self filter if it was skipped in the pass phase
-      if (ignoreSelfFilter) {
-        if (field._filterEnabled === false || !field._continuousStats || !field._continuousFilter) {
-          visible++;
+      if (selfFilter !== null) {
+        const v = targetValues[i];
+        if (v === null || Number.isNaN(v) || v < selfFilter.min || v > selfFilter.max) {
           continue;
-        }
-        const stats = field._continuousStats;
-        const filter = field._continuousFilter;
-        const fullRange = isContinuousFilterFullRange(filter, stats);
-        if (!fullRange) {
-          const v = targetValues[i];
-          if (v === null || Number.isNaN(v) || v < filter.min || v > filter.max) {
-            continue;
-          }
         }
       }
       visible++;
@@ -345,14 +395,17 @@ export class FieldSummaryMethods {
         filter.source === 'var'
           ? this.varData?.fields?.[filter.fieldIndex]
           : this.obsData?.fields?.[filter.fieldIndex];
-      const counts = field?._categoryCounts;
-      if (counts) {
-        return {
-          available: counts.availableTotal ?? counts.available?.reduce((s, v) => s + v, 0) ?? 0,
-          visible: counts.visibleTotal ?? counts.visible?.reduce((s, v) => s + v, 0) ?? 0
-        };
+      // Counted now, from the current filters: `_categoryCounts` is refreshed
+      // only while its field is the active one, so a row for any other field
+      // would otherwise report the counts from when it was last coloured.
+      if (
+        !field
+        || !isCategoricalCodes(field.codes)
+      ) {
+        return null;
       }
-      return null;
+      const counts = this.computeCategoryCountsForField(field);
+      return { available: counts.availableTotal, visible: counts.visibleTotal };
     }
     if (filter.type === 'continuous') {
       const field =
@@ -367,7 +420,7 @@ export class FieldSummaryMethods {
 
   _applyCategoryCountsToCentroids(field, counts) {
     if (!field || field.kind !== 'category') return false;
-    const centroids = this._getCentroidsForCurrentDim(field);
+    const centroids = this._getCentroidsForActiveLayout(field);
     if (centroids.length === 0 || !this.centroidColors) return false;
     const categories = field.categories || [];
     const visibleCounts = counts?.visible || [];

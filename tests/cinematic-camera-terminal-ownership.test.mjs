@@ -43,39 +43,14 @@ function createControl({ checked = false, value = '' } = {}) {
 
 function createDom() {
   const defaults = {
-    navModeSelect: { value: 'orbit' },
-    orbitKeySpeedInput: { value: '40' },
-    planarPanSpeedInput: { value: '100' },
-    lookSensitivityInput: { value: '5' },
-    moveSpeedInput: { value: '100' },
     defaultSpeedInput: { value: '30' },
     positionInterp: { value: 'catmull-rom' },
     rotationInterp: { value: 'slerp' },
     easingSelect: { value: 'linear' },
-    setAllDuration: { value: '' },
-    orbitReverseCheckbox: { checked: true },
-    showOrbitAnchorCheckbox: { checked: true }
+    setAllDuration: { value: '' }
   };
   const dom = {};
   for (const key of [
-    'navModeSelect',
-    'orbitControls',
-    'planarControls',
-    'freeflyControls',
-    'orbitKeySpeedInput',
-    'orbitKeySpeedDisplay',
-    'orbitReverseCheckbox',
-    'showOrbitAnchorCheckbox',
-    'planarPanSpeedInput',
-    'planarPanSpeedDisplay',
-    'planarZoomToCursorCheckbox',
-    'planarInvertAxesCheckbox',
-    'lookSensitivityInput',
-    'lookSensitivityDisplay',
-    'moveSpeedInput',
-    'moveSpeedDisplay',
-    'invertLookCheckbox',
-    'pointerLockCheckbox',
     'saveBtn',
     'keyframeList',
     'clearBtn',
@@ -179,7 +154,26 @@ test('cinematic-camera destroy cancels and fences DOM and list-frame owners', ()
         datasetListeners.delete(listener);
       }
     };
-    const camera = initCinematicCamera({ viewer, dom, dataSourceManager });
+    const navigationCalls = [];
+    const navigation = {
+      syncNavigationMode(mode) {
+        navigationCalls.push(['syncNavigationMode', mode]);
+      },
+      exportSettings() {
+        navigationCalls.push(['exportSettings']);
+        return {};
+      },
+      restoreSettings(data) {
+        navigationCalls.push(['restoreSettings', data]);
+      }
+    };
+    const camera = initCinematicCamera({
+      viewer,
+      dom,
+      navigation,
+      dataSourceManager,
+      focusedRepresentation: () => null,
+    });
     const retainedPlaybackController = camera.getPlaybackController();
     camera.getKeyframeStore().add({
       navigationMode: 'orbit',
@@ -195,8 +189,8 @@ test('cinematic-camera destroy cancels and fences DOM and list-frame owners', ()
         yaw: -Math.PI / 2,
         pitch: 0
       }
-    });
-    const retainedNavigationListener = dom.navModeSelect.listeners('change')[0];
+    }, undefined, null);
+    const retainedSaveListener = dom.saveBtn.listeners('click')[0];
     const [[frameId, retainedFrame]] = frames;
     viewerCalls.length = 0;
 
@@ -205,7 +199,7 @@ test('cinematic-camera destroy cancels and fences DOM and list-frame owners', ()
 
     assert.deepEqual(cancelledFrames, [frameId]);
     assert.equal(datasetListeners.size, 0);
-    assert.equal(dom.navModeSelect.listeners('change').length, 0);
+    assert.equal(dom.saveBtn.listeners('click').length, 0);
     assert.throws(
       () => retainedPlaybackController.play(),
       /after destruction/i
@@ -216,16 +210,15 @@ test('cinematic-camera destroy cancels and fences DOM and list-frame owners', ()
     assert.throws(() => camera.exportSessionState(), /after destruction/i);
     assert.throws(() => camera.getNavigationMode(), /after destruction/i);
 
-    dom.navModeSelect.value = 'free';
-    retainedNavigationListener();
+    navigationCalls.length = 0;
+    retainedSaveListener();
     retainedFrame(16);
-    camera.syncNavigationMode('planar');
     camera.resetCameraPath();
     camera.startAutoplay();
 
     assert.deepEqual(viewerCalls, []);
     assert.equal(dom.keyframeList.classList.toggles, 0);
-    assert.equal(dom.navModeSelect.value, 'free');
+    assert.deepEqual(navigationCalls, []);
   } finally {
     globalThis.document = previousDocument;
     globalThis.requestAnimationFrame = previousRequestAnimationFrame;

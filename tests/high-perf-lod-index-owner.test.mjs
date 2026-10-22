@@ -180,54 +180,30 @@ test('a new live generation detaches snapshots even when live array identity is 
   assert.notEqual(snapshotIndices, fixture.mainIndices);
 });
 
-test('snapshot picking uses the same generation owner as rendering and LOD', () => {
+test('a snapshot resolves the spatial index of its exact geometry generation', () => {
   const fixture = makeRenderer();
   const shared = fixture.renderer.snapshotBuffers.get('snap_shared');
-  const sharedProjection =
-    fixture.renderer.getSnapshotSpatialIndex('snap_shared', 2);
-
-  assert.notStrictEqual(
-    sharedProjection,
-    fixture.mainSpatialIndex,
-    'public picking access must not expose the mutable renderer owner',
-  );
+  // A snapshot of the live geometry reads the live tree.
   assert.strictEqual(
-    fixture.renderer.getSnapshotSpatialIndex('snap_shared', 2),
-    sharedProjection,
-    'an unchanged spatial generation must retain one stable projection',
+    fixture.renderer._getSpatialIndexForViewGeneration('snap_shared', 2),
+    fixture.mainSpatialIndex,
   );
-  assert.equal(sharedProjection.dimensionLevel, 2);
-  assert.deepEqual(
-    sharedProjection.lodLevels[0].indices,
-    fixture.mainIndices,
-  );
-  sharedProjection.lodLevels[0].indices[0] = 3;
-  assert.deepEqual(
-    fixture.mainIndices,
-    Uint32Array.from([0, 2]),
-    'projected query arrays must be detached from accepted topology',
-  );
-
+  // Once the live geometry moves on, that tree is not the snapshot's.
   fixture.renderer._liveGeometryGeneration = 11;
   assert.equal(
-    fixture.renderer.getSnapshotSpatialIndex('snap_shared', 2),
-    null
+    fixture.renderer._getSpatialIndexForViewGeneration('snap_shared', 2),
+    null,
   );
-
   const snapshotSpatialIndex = {
     dimensionLevel: 2,
     lodLevels: [],
     positions: shared.positions,
   };
   shared.spatialIndex = snapshotSpatialIndex;
-  const snapshotProjection =
-    fixture.renderer.getSnapshotSpatialIndex('snap_shared', 2);
-  assert.notStrictEqual(snapshotProjection, snapshotSpatialIndex);
   assert.strictEqual(
-    fixture.renderer.getSnapshotSpatialIndex('snap_shared', 2),
-    snapshotProjection,
+    fixture.renderer._getSpatialIndexForViewGeneration('snap_shared', 2),
+    snapshotSpatialIndex,
   );
-  assert.equal(snapshotProjection.dimensionLevel, 2);
 });
 
 test('snapshot LOD membership and size use the exact generation owner', () => {

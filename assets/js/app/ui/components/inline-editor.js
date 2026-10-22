@@ -50,11 +50,11 @@ export class InlineEditor {
     const input = document.createElement('input');
     input.type = 'text';
     input.value = String(currentValue ?? '');
-    input.className = 'inline-rename-input';
+    input.className = 'obs-select inline-rename-input';
     input.style.width = `${Math.max((rect.width || 0) + 20, minWidth)}px`;
 
-    const originalDisplay = targetEl.style.display;
-    targetEl.style.display = 'none';
+    const wasHidden = targetEl.hidden;
+    targetEl.hidden = true;
     targetEl.parentNode?.insertBefore(input, targetEl.nextSibling);
 
     let finished = false;
@@ -72,7 +72,7 @@ export class InlineEditor {
         failure = error;
       }
       try {
-        targetEl.style.display = originalDisplay || '';
+        targetEl.hidden = wasHidden;
       } catch (error) {
         failure = failure === null
           ? error
@@ -95,7 +95,7 @@ export class InlineEditor {
           if (validate) {
             const result = validate(nextValue);
             if (result !== true) {
-              input.classList.add('error');
+              input.setAttribute('aria-invalid', 'true');
               input.title = typeof result === 'string' ? result : 'Invalid value';
               finished = false;
               input.focus();

@@ -304,6 +304,3 @@ export const PlotRegistry = {
     };
   }
 };
-
-// Default export for convenience
-export default PlotRegistry;

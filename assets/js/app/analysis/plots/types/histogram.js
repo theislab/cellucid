@@ -5,8 +5,68 @@
  * Refactored to use PlotFactory for reduced code duplication.
  */
 
-import { PlotFactory, PlotRegistry, BasePlot, COMMON_HOVER_STYLE } from '../plot-factory.js';
+import { PlotFactory, PlotRegistry, COMMON_HOVER_STYLE } from '../plot-factory.js';
 import { escapeHtml } from '../../../utils/dom-utils.js';
+import { histogramSamples } from '../plotly-histogram-bins.js';
+import { adoptFiniteNumbers } from '../../shared/number-utils.js';
+import { getComputeManager } from '../../compute/compute-manager.js';
+import { OperationType } from '../../compute/operations.js';
+
+/**
+ * Values (over all pages) from which a histogram's bins and samples are
+ * computed by an analysis worker before it is drawn.
+ */
+const WORKER_MIN_VALUES = 200_000;
+
+/**
+ * Bins and samples already computed, per first page-values array: the arrays
+ * and bin count they were computed for, and the result. Page-data arrays are
+ * never edited once published, and the map holds them weakly.
+ * @type {WeakMap<ArrayLike<number>, Array<{arrays: ArrayLike<number>[], nbins: number, result: import('../plotly-histogram-bins.js').HistogramSamples}>>}
+ */
+const samplesCache = new WeakMap();
+
+function cachedSamples(pageData, nbins) {
+  if (pageData.length === 0) return null;
+  const entries = samplesCache.get(pageData[0].values) ?? [];
+  const entry = entries.find(candidate => (
+    candidate.nbins === nbins &&
+    candidate.arrays.length === pageData.length &&
+    candidate.arrays.every((values, i) => values === pageData[i].values)
+  ));
+  return entry?.result ?? null;
+}
+
+/**
+ * Compute a large histogram's bins and samples on an analysis worker before it
+ * is drawn: the same `histogramSamples` wherever it runs.
+ *
+ * @param {Object[]} pageData
+ * @param {number} nbins
+ */
+async function ensureHistogramSamples(pageData, nbins) {
+  if (pageData.length === 0 || cachedSamples(pageData, nbins) !== null) return;
+  let total = 0;
+  for (const pd of pageData) total += pd.values.length;
+  if (total < WORKER_MIN_VALUES) return;
+  const manager = getComputeManager();
+  await manager.init();
+  const { _compute, finite, ...result } = await manager.execute(
+    OperationType.COMPUTE_HISTOGRAM_SAMPLES,
+    {
+      pages: pageData.map(pd => (ArrayBuffer.isView(pd.values) ? pd.values : Float64Array.from(pd.values))),
+      nbins
+    },
+    { transfer: false }
+  );
+  pageData.forEach((pd, index) => {
+    adoptFiniteNumbers(pd.values, finite[index].finiteCount, finite[index].finite);
+  });
+  const key = pageData[0].values;
+  const entries = samplesCache.get(key) ?? [];
+  entries.push({ arrays: pageData.map(pd => pd.values), nbins, result });
+  samplesCache.set(key, entries);
+}
 
 const histogramDefinition = {
   id: 'histogram',
@@ -53,7 +113,8 @@ const histogramDefinition = {
 
   buildTraces(pageData, options, layoutEngine) {
     const { nbins = 20, histnorm = '', cumulative = false, barmode = 'overlay', opacity = 0.7 } = options;
-    const { min: globalMin, max: globalMax } = BasePlot.getGlobalRange(pageData);
+    const { min: globalMin, max: globalMax, size: binSize, samples } =
+      cachedSamples(pageData, nbins) ?? histogramSamples(pageData.map(pd => pd.values), nbins);
 
     return PlotFactory.createTraces({
       pageData,
@@ -66,7 +127,6 @@ const histogramDefinition = {
         const trace = {
           type: 'histogram',
           name: safePageName,
-          x: pd.values,
           nbinsx: nbins,
           histnorm,
           cumulative: { enabled: cumulative },
@@ -78,8 +138,18 @@ const histogramDefinition = {
           hoverlabel: COMMON_HOVER_STYLE
         };
 
-        if (isFinite(globalMin) && isFinite(globalMax)) {
-          trace.xbins = { start: globalMin, end: globalMax, size: (globalMax - globalMin) / nbins };
+        trace.xbins = { start: globalMin, end: globalMax, size: binSize };
+
+        const sample = samples[i];
+        if (sample !== null) {
+          // Explicit bins: hand Plotly a few values of each bin with summed
+          // weights instead of every value. It draws the same bars, heights
+          // and hover labels (see plotly-histogram-bins.js).
+          trace.x = sample.x;
+          trace.y = sample.y;
+          trace.histfunc = 'sum';
+        } else {
+          trace.x = Array.from(pd.values);
         }
 
         return trace;
@@ -95,10 +165,12 @@ const histogramDefinition = {
   },
 
   async render(pageData, options, container, layoutEngine) {
+    await ensureHistogramSamples(pageData, options.nbins ?? 20);
     return PlotFactory.render({ definition: this, pageData, options, container, layoutEngine });
   },
 
   async update(figure, pageData, options, layoutEngine) {
+    await ensureHistogramSamples(pageData, options.nbins ?? 20);
     return PlotFactory.update({ definition: this, figure, pageData, options, layoutEngine });
   },
 

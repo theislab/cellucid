@@ -3,21 +3,62 @@
  *
  * Shared base class for H5adDataAdapter and ZarrDataAdapter.
  * Contains common logic for:
- * - Embedding normalization
+ * - Resolving which `obsm` embedding each dimension shows, and the
+ *   data-mapping candidate catalog (`data-mapping-candidates.js`)
+ * - Embedding reads, load-time checks and normalization, by embedding id
  * - Obs manifest generation
  * - Var manifest generation
  * - Obs field data processing
  * - Connectivity edge extraction
  *
- * Subclasses must implement:
- * - _getLoader() - Returns the underlying loader (H5adLoader or ZarrLoader)
- * - _computeObsFieldsMetadata() - Compute obs field metadata (may have format-specific logic)
- *
- * This eliminates ~500 lines of duplicated code between h5ad.js and zarr.js.
+ * The loader (H5adLoader or ZarrLoader) provides `getDatasetMetadata()`, whose
+ * `probes` describe the file from metadata alone, and `readObsmColumns(key,
+ * columns)`, which reads the selected columns of one dense `obsm` array.
+ * Subclasses may override `_computeObsFieldsMetadata()`.
  */
 
-import { extractConnectivityEdges } from './sparse-utils.js';
-import { validateDatasetIdentity } from './data-source.js';
+import {
+  DataSourceError,
+  DataSourceErrorCode,
+  embeddingPayloadPath,
+  validateDatasetIdentity,
+  vectorPayloadPath,
+} from './data-source.js';
+import {
+  DIMENSION_SLOTS,
+  VECTOR_KEY_PATTERN,
+  canonicalEmbeddingId,
+  compareCodePoints,
+  describeObsmEntry,
+  dimensionSlot,
+  makeUniqueNames,
+  nothingPlottableMessage,
+  obsmEntryDefect,
+} from './data-mapping.js';
+import {
+  EmbeddingLoadError,
+  MappingLoadError,
+  assembleAnnDataCandidates,
+  axisVarColumns,
+  expressionAxisRoute,
+  geneNamesRoute,
+  parseMappingGenesPath,
+  describeAnnDataProbes,
+  embeddingLoadDefect,
+  obsmEntries,
+  obsmWidth,
+  parseMappingEmbeddingPath,
+  parseMappingLatentPath,
+  parseMappingVectorPath,
+  resolveVectorBinding,
+  LATENT_OUTLIER_MIN_POINTS,
+  latentCandidateReason,
+  valueLoadDefect,
+  resolveCandidateRef,
+  DEFAULT_KNN_KEY,
+  requireObspKey,
+  resolveEmbeddingSlotsAsync,
+} from './data-mapping-candidates.js';
 import {
   CONNECTIVITY_MANIFEST_CONTEXT,
   validateConnectivityManifest,
@@ -29,14 +70,33 @@ import {
 } from './metadata-load-contract.js';
 import {
   categoricalStorageForCount,
+  categoricalStorageForDtype,
   requireCategoricalCategoryCount,
 } from './categorical-storage-contract.js';
 
+import { residencyBudgetBytes } from './memory-budget.js';
+
 const CONNECTIVITY_EDGE_LABEL = 'Direct AnnData connectivity edge loading';
-const DEFAULT_MAX_MATERIALIZED_BYTES = 512 * 1024 * 1024;
+/** Bytes a JavaScript array slot takes, for an obs field held as an Array. */
 const JS_ARRAY_ELEMENT_BYTES = 8n;
-const ESTIMATED_JS_STRING_VALUE_BYTES = 64n;
-const ESTIMATED_JS_SET_ENTRY_BYTES = 48n;
+
+/**
+ * The refusal of one neighbour graph that fails its load-time check, in the
+ * words `cellucid serve` uses for the same graph.
+ *
+ * @param {string} key
+ * @param {unknown} error
+ * @returns {MappingLoadError}
+ */
+function connectivityRefusal(key, error) {
+  const message = error instanceof Error ? error.message : String(error);
+  if (/symmetric/i.test(message)) {
+    const reason = 'not symmetric — choose a connectivities matrix';
+    return new MappingLoadError(key, reason, `obsp['${key}'] is ${reason}.`);
+  }
+  const reason = message.replace(/\.\s*$/, '');
+  return new MappingLoadError(key, reason, `obsp['${key}']: ${reason}.`);
+}
 
 function validateCellucidCategoryCount(nCategories, fieldKey) {
   return requireCategoricalCategoryCount(
@@ -98,34 +158,6 @@ function comparePrimitiveCategories(left, right) {
     return left - right;
   }
   return left < right ? -1 : (left > right ? 1 : 0);
-}
-
-function validateFiniteCoordinateComponents(values, label) {
-  const length = Number(values?.length);
-  if (!Number.isSafeInteger(length) || length < 0) {
-    throw new Error(`${label} has an invalid coordinate length`);
-  }
-  for (let index = 0; index < length; index++) {
-    if (!Number.isFinite(values[index])) {
-      throw new Error(
-        `${label} contains a non-finite component at flat index ${index}`
-      );
-    }
-  }
-}
-
-function estimateCategoryRetainedBytes(categories) {
-  let bytes = BigInt(categories.length) * JS_ARRAY_ELEMENT_BYTES;
-  for (const category of categories) {
-    if (typeof category === 'string') {
-      bytes +=
-        ESTIMATED_JS_STRING_VALUE_BYTES +
-        BigInt(category.length) * 2n;
-    } else if (typeof category === 'number') {
-      bytes += 16n;
-    }
-  }
-  return bytes;
 }
 
 function getCellucidCategoryStorage(categories, fieldKey) {
@@ -200,20 +232,11 @@ class CoalescedCancellationOwner {
  * Base adapter class for AnnData file formats
  * @abstract
  */
-/**
- * The obsm key `sc.tl.umap()` writes, which names no dimension of its own.
- * A reader resolves it by its column count when the object declares none of
- * X_umap_1d / X_umap_2d / X_umap_3d, which is the rule the Python package
- * applies in `cellucid/vector_fields.py` so one file opens the same way in the
- * browser and through `cellucid serve`.
- */
-export const UNSUFFIXED_EMBEDDING_KEY = 'X_umap';
-
 export class BaseAnnDataAdapter {
   /**
    * @param {Object} loader - The underlying loader (H5adLoader or ZarrLoader)
    * @param {Object} [options]
-   * @param {number} [options.maxMaterializedBytes]
+   * @param {number} [options.cacheBudgetBytes] - Residency budget of the coordinate and obs caches
    */
   constructor(loader, options = {}) {
     /** @protected */
@@ -222,19 +245,44 @@ export class BaseAnnDataAdapter {
     /** @type {Object|null} */
     this._metadata = null;
 
-    /** @type {Object<string, string>|null} Private obsm embedding resolution */
-    this._embeddingKeysByDimension = null;
+    /**
+     * The embedding each dimension slot shows, as `{key, columns}` per slot
+     * (null when unused): the default rule, else the best guess.
+     * @type {Readonly<Object>|null}
+     */
+    this._slots = null;
 
-    /** @type {Map<string, Object<string, string>>} Private obsm vector resolution */
-    this._vectorFieldKeysById = new Map();
+    /** @type {Object|null} The frozen data-mapping candidate catalog */
+    this._candidates = null;
+
+    /**
+     * The described `obsm` entries, set before the catalog is assembled so the
+     * best guess can load its candidates.
+     * @type {ReadonlyArray<Object>|null}
+     */
+    this._describedObsm = null;
+
+    /**
+     * The embeddings of the published identity, in item order: their embedding
+     * id and `{key, columns}`. A payload path `embeddings/{i}_{d}d.bin` names
+     * item `i`.
+     * @type {ReadonlyArray<{id: string, dimension: number, ref: {key: string, columns: number[]}}>|null}
+     */
+    this._identityEmbeddings = null;
+
+    /**
+     * Vector fields: field id -> (bound embedding id -> obsm vector key).
+     * @type {Map<string, Map<string, string>>}
+     */
+    this._vectorBindings = new Map();
 
     /** @type {boolean} */
     this._directIdentityFinalized = false;
 
-    /** @type {Map<number, Float32Array>} Cached embeddings per dimension */
+    /** @type {Map<string, Float32Array>} Normalized embeddings per embedding id */
     this._embeddingCache = new Map();
 
-    /** @type {Map<string, Map<number, Float32Array>>} Cached vector fields per fieldId + dimension */
+    /** @type {Map<string, Float32Array>} Scaled vector payloads by mapping route */
     this._vectorFieldCache = new Map();
 
     /**
@@ -257,16 +305,20 @@ export class BaseAnnDataAdapter {
     /** @type {bigint} Retained bytes owned by the lazy obs field cache */
     this._obsFieldDataCacheBytes = 0n;
 
-    /** @type {Object|undefined|null} undefined = not computed, null = no connectivity, object = has data */
-    this._connectivityCache = undefined;
+    /**
+     * Extracted neighbour graphs by obsp key (null for an absent key): the
+     * default graph, and at most one other.
+     * @type {Map<string, Object|null>}
+     */
+    this._connectivityCache = new Map();
 
     /** @type {Readonly<Object>|undefined|null} Finalized direct manifest summary */
     this._connectivityManifest = undefined;
 
-    /** @type {Map<number, Object>} Normalization info per dimension */
+    /** @type {Map<string, Object>} Normalization info per embedding id */
     this._normInfo = new Map();
 
-    /** @type {Map<number, Promise<Float32Array>>} */
+    /** @type {Map<string, Promise<Float32Array>>} */
     this._embeddingInFlight = new Map();
 
     /** @type {Map<string, Promise<Object>>} */
@@ -281,24 +333,33 @@ export class BaseAnnDataAdapter {
     /** @type {Map<string, Promise<Float32Array>>} */
     this._geneExpressionInFlight = new Map();
 
+    /** @type {Map<string, Promise<Float32Array>>} Outlier quantiles by route. */
+    this._latentOutlierInFlight = new Map();
+
+    /**
+     * Unique gene names by var axis and name source, read once.
+     * @type {Map<string, Readonly<Object>>}
+     */
+    this._geneNameSets = new Map();
+
     /** @type {number} Invalidates results from asynchronous work after cache lifecycle changes */
     this._lifecycleGeneration = 0;
 
     /** @type {boolean} Closed adapters cannot start or publish new work */
     this._closed = false;
 
-    const maxMaterializedBytes =
-      options.maxMaterializedBytes ?? DEFAULT_MAX_MATERIALIZED_BYTES;
+    // A residency budget: it decides what the caches keep, never what loads.
+    const cacheBudgetBytes =
+      options.cacheBudgetBytes ?? residencyBudgetBytes('adapterCache');
     if (
-      !Number.isSafeInteger(maxMaterializedBytes) ||
-      maxMaterializedBytes <= 0
+      !Number.isSafeInteger(cacheBudgetBytes) ||
+      cacheBudgetBytes < 0
     ) {
       throw new TypeError(
-        'AnnData adapter materialization limit must be a positive safe integer.'
+        'AnnData adapter cache budget must be a non-negative safe integer.'
       );
     }
-    this._maxMaterializedBytes = BigInt(maxMaterializedBytes);
-    this._obsMetadataRetainedBytes = 0n;
+    this._cacheBudgetBytes = BigInt(cacheBudgetBytes);
   }
 
   /**
@@ -389,22 +450,21 @@ export class BaseAnnDataAdapter {
   }
 
   /**
-   * @param {number} dim
+   * @param {string} embeddingId
    * @returns {string}
    * @private
    */
-  _embeddingCoordinateCacheKey(dim) {
-    return JSON.stringify(['embedding', dim]);
+  _embeddingCoordinateCacheKey(embeddingId) {
+    return JSON.stringify(['embedding', embeddingId]);
   }
 
   /**
-   * @param {string} fieldId
-   * @param {number} dim
+   * @param {string} vectorPath - A mapping vector route.
    * @returns {string}
    * @private
    */
-  _vectorCoordinateCacheKey(fieldId, dim) {
-    return JSON.stringify(['vector', fieldId, dim]);
+  _vectorCoordinateCacheKey(vectorPath) {
+    return JSON.stringify(['vector', vectorPath]);
   }
 
   /**
@@ -488,34 +548,6 @@ export class BaseAnnDataAdapter {
   }
 
   /**
-   * Calculate normalized embedding bytes without reading coordinates.
-   *
-   * @param {Object} data
-   * @param {number} srcDim
-   * @param {number} targetDim
-   * @param {string} label
-   * @returns {bigint}
-   * @private
-   */
-  _checkedNormalizedEmbeddingBytes(data, srcDim, targetDim, label) {
-    const rawLength = Number(data?.length);
-    if (
-      !Number.isSafeInteger(rawLength) ||
-      rawLength < 0 ||
-      !Number.isSafeInteger(srcDim) ||
-      srcDim <= 0 ||
-      !Number.isSafeInteger(targetDim) ||
-      targetDim <= 0 ||
-      rawLength % srcDim !== 0
-    ) {
-      throw new Error(`${label} has an invalid embedding shape.`);
-    }
-    const outputLength =
-      BigInt(rawLength / srcDim) * BigInt(targetDim);
-    return outputLength * BigInt(Float32Array.BYTES_PER_ELEMENT);
-  }
-
-  /**
    * @param {string} cacheKey
    * @param {Float32Array} [expected]
    * @returns {boolean}
@@ -529,17 +561,11 @@ export class BaseAnnDataAdapter {
     this._coordinateCacheLru.delete(cacheKey);
 
     if (entry.kind === 'embedding') {
-      if (this._embeddingCache.get(entry.dim) === entry.value) {
-        this._embeddingCache.delete(entry.dim);
+      if (this._embeddingCache.get(entry.embeddingId) === entry.value) {
+        this._embeddingCache.delete(entry.embeddingId);
       }
-    } else {
-      const perField = this._vectorFieldCache.get(entry.fieldId);
-      if (perField?.get(entry.dim) === entry.value) {
-        perField.delete(entry.dim);
-        if (perField.size === 0) {
-          this._vectorFieldCache.delete(entry.fieldId);
-        }
-      }
+    } else if (this._vectorFieldCache.get(entry.vectorPath) === entry.value) {
+      this._vectorFieldCache.delete(entry.vectorPath);
     }
 
     const bufferRef =
@@ -578,21 +604,14 @@ export class BaseAnnDataAdapter {
    * @param {string} label
    * @private
    */
-  _makeCoordinateCacheRoom(additionalBytes, label) {
-    if (additionalBytes > this._maxMaterializedBytes) {
-      throw new Error(
-        `${label} retained cache requires ` +
-        `${additionalBytes.toString()} bytes and exceeds the ` +
-        `${this._maxMaterializedBytes.toString()}-byte browser limit; ` +
-        'use the Cellucid server or prepared format'
-      );
-    }
-
+  _makeCoordinateCacheRoom(additionalBytes) {
+    // The budget decides what is evicted, never what loads: coordinates in
+    // use stay pinned, and an entry larger than the budget is still admitted.
     while (
       this._coordinateCacheBytes +
         this._coordinateReservedOutputBytes +
         additionalBytes >
-      this._maxMaterializedBytes
+      this._cacheBudgetBytes
     ) {
       let victimKey = null;
       for (const cacheKey of this._coordinateCacheLru.keys()) {
@@ -601,14 +620,7 @@ export class BaseAnnDataAdapter {
           break;
         }
       }
-      if (victimKey == null) {
-        throw new Error(
-          `${label} retained cache cannot fit within the ` +
-          `${this._maxMaterializedBytes.toString()}-byte browser limit ` +
-          'while current coordinate results are in use; ' +
-          'use the Cellucid server or prepared format'
-        );
-      }
+      if (victimKey == null) return;
       this._deleteCoordinateCacheEntry(victimKey);
     }
   }
@@ -626,9 +638,6 @@ export class BaseAnnDataAdapter {
    * @private
    */
   _reserveCoordinateMaterialization(raw, outputBytes, label) {
-    if (outputBytes > this._maxMaterializedBytes) {
-      this._makeCoordinateCacheRoom(outputBytes, label);
-    }
 
     const descriptor = this._describeCoordinateBuffer(raw);
     let bufferRef =
@@ -657,7 +666,7 @@ export class BaseAnnDataAdapter {
     };
 
     try {
-      this._makeCoordinateCacheRoom(outputBytes, label);
+      this._makeCoordinateCacheRoom(outputBytes);
       this._coordinateReservedOutputBytes += outputBytes;
       reservation.outputReserved = true;
       return reservation;
@@ -737,8 +746,8 @@ export class BaseAnnDataAdapter {
    * @param {Object} options
    * @param {string} options.cacheKey
    * @param {'embedding'|'vector'} options.kind
-   * @param {number} options.dim
-   * @param {string} [options.fieldId]
+   * @param {string} options.embeddingId
+   * @param {string} [options.vectorPath]
    * @param {Float32Array} options.value
    * @param {string} options.label
    * @private
@@ -746,8 +755,8 @@ export class BaseAnnDataAdapter {
   _retainCoordinateCacheEntry({
     cacheKey,
     kind,
-    dim,
-    fieldId = null,
+    embeddingId,
+    vectorPath = null,
     value,
     label
   }) {
@@ -755,18 +764,13 @@ export class BaseAnnDataAdapter {
     const existingRef =
       this._coordinateBufferRefs.get(descriptor.identity);
     const additionalBytes = existingRef ? 0n : descriptor.bytes;
-    this._makeCoordinateCacheRoom(additionalBytes, label);
+    this._makeCoordinateCacheRoom(additionalBytes);
 
     this._deleteCoordinateCacheEntry(cacheKey);
     if (kind === 'embedding') {
-      this._embeddingCache.set(dim, value);
+      this._embeddingCache.set(embeddingId, value);
     } else {
-      let perField = this._vectorFieldCache.get(fieldId);
-      if (!perField) {
-        perField = new Map();
-        this._vectorFieldCache.set(fieldId, perField);
-      }
-      perField.set(dim, value);
+      this._vectorFieldCache.set(vectorPath, value);
     }
 
     const bufferRef =
@@ -783,8 +787,8 @@ export class BaseAnnDataAdapter {
     this._coordinateCacheLru.set(cacheKey, {
       bufferIdentity: descriptor.identity,
       cacheKey,
-      dim,
-      fieldId,
+      embeddingId,
+      vectorPath,
       kind,
       value
     });
@@ -805,7 +809,13 @@ export class BaseAnnDataAdapter {
   }
 
   /**
-   * Initialize the adapter and compute metadata
+   * Initialize the adapter and compute metadata.
+   *
+   * The loader describes the file from metadata alone. The adapter then
+   * resolves which embedding each dimension shows -- the default rule, else
+   * the best guess, whose candidates must pass the load-time check -- and
+   * assembles the data-mapping candidate catalog the panel lists.
+   *
    * @returns {Promise<void>}
    */
   async initialize() {
@@ -821,46 +831,42 @@ export class BaseAnnDataAdapter {
           'AnnData datasets must contain at least one observation'
         );
       }
-      const embeddingKeys = metadata?.embeddings?.obsm_keys;
-      if (
-        !embeddingKeys ||
-        typeof embeddingKeys !== 'object' ||
-        Array.isArray(embeddingKeys)
-      ) {
+      const described = describeAnnDataProbes(metadata?.probes);
+      if (described.nObs !== this._loader.nObs) {
         throw new Error(
-          'AnnData loader metadata must provide exact private obsm embedding keys'
+          'AnnData mapping probes must describe the loader cell axis exactly'
         );
       }
-      this._embeddingKeysByDimension = { ...embeddingKeys };
       this._metadata = metadata;
+      this._describedObsm = described.obsm;
       await this._computeObsFieldsMetadata(generation);
       this._assertLifecycleGeneration(generation);
+
+      const resolution = await this._resolveEmbeddingSlots(described, generation);
+      this._slots = Object.freeze({ ...resolution.slots });
+      this._candidates = assembleAnnDataCandidates(described, resolution);
       await this._computeVectorFieldsMetadata(generation);
       this._assertLifecycleGeneration(generation);
 
       // Candidate sources are adopted only after initialize() resolves.
-      // Validate the required default embedding payload here so corrupt bytes
-      // cannot replace and close a still-working dataset.
-      const defaultDimension =
-        Number(this._metadata?.embeddings?.default_dimension);
-      if (
-        Number.isInteger(defaultDimension) &&
-        defaultDimension >= 1 &&
-        defaultDimension <= 3
-      ) {
-        await this.getEmbedding(defaultDimension);
-        this._assertLifecycleGeneration(generation);
-      }
+      // Validate the default dimension's embedding payload here so corrupt
+      // bytes cannot replace and close a still-working dataset.
+      const defaultSlot = [...DIMENSION_SLOTS]
+        .reverse()
+        .find(slot => this._slots[slot] !== null);
+      await this.getEmbeddingForRef(this._slots[defaultSlot]);
+      this._assertLifecycleGeneration(generation);
     } catch (error) {
       if (
         !this._closed &&
         generation === this._lifecycleGeneration
       ) {
         this._metadata = null;
-        this._embeddingKeysByDimension = null;
-        this._vectorFieldKeysById.clear();
+        this._slots = null;
+        this._candidates = null;
+        this._describedObsm = null;
+        this._vectorBindings.clear();
         this._obsFieldsMetadata = null;
-        this._obsMetadataRetainedBytes = 0n;
         this.clearCaches();
       }
       throw error;
@@ -868,113 +874,117 @@ export class BaseAnnDataAdapter {
   }
 
   /**
-   * Detect available vector fields in `obsm` and attach a compact metadata
-   * summary onto the dataset identity.
+   * Resolve the embedding of every dimension slot, or refuse the file when
+   * nothing in `obsm` can be plotted.
    *
-   * This keeps the UI fast: we can show/hide the vector field overlay controls
-   * without loading the full vector arrays upfront.
+   * @param {ReturnType<typeof describeAnnDataProbes>} described
+   * @param {number} generation
+   * @returns {Promise<{slots: Object, guessed: string[], rejected: Array<[string, string]>}>}
+   * @private
+   */
+  async _resolveEmbeddingSlots(described, generation) {
+    const loadCheck = async (key, columns) => {
+      try {
+        await this.getEmbeddingForRef({ key, columns });
+        return null;
+      } catch (error) {
+        if (error instanceof EmbeddingLoadError) return error.reason;
+        throw error;
+      }
+    };
+    const resolution = await resolveEmbeddingSlotsAsync(
+      obsmEntries(described.obsm),
+      loadCheck
+    );
+    this._assertLifecycleGeneration(generation);
+    if (DIMENSION_SLOTS.every(slot => resolution.slots[slot] === null)) {
+      const rejected = new Map(resolution.rejected);
+      const descriptions = described.obsm.map(item => describeObsmEntry({
+        key: item.key,
+        storage: item.storage,
+        shape: item.shape,
+        defect: obsmEntryDefect(item, { latentKey: null, rejected }),
+      }));
+      throw new DataSourceError(
+        nothingPlottableMessage({ nObs: described.nObs, descriptions }),
+        DataSourceErrorCode.NO_PLOTTABLE_EMBEDDING,
+        this.constructor.sourceType ?? undefined
+      );
+    }
+    return resolution;
+  }
+
+  /**
+   * Record the vector fields the data-mapping default binds, without loading
+   * the vector arrays.
    *
-   * Naming convention (UMAP basis):
-   * - Exact per-dimension keys: `<field>_umap_<dim>d`
-   * - Examples: `velocity_umap_2d`, `T_fwd_umap_3d`
+   * The rule is the data-mapping default (`defaultVectorBindings` in
+   * `data-mapping.js`, the same rule `cellucid serve` applies): a key
+   * `<field>_umap_<d>d` is the vector field `<field>_umap`, bound to the
+   * `d`-dimensional slot embedding only when that slot shows `X_umap_<d>d` or
+   * `X_umap`. A bound key must be a dense array of exactly `d` columns.
    *
-   * Notes:
-   * - Keys starting with `X_` are reserved for embeddings and are ignored here.
-   * - This does not compute or validate semantics; it only validates shapes.
-   *
+   * @param {number} [generation]
    * @protected
    */
   async _computeVectorFieldsMetadata(
     generation = this._captureLifecycleGeneration()
   ) {
-    const obsmKeys = Array.isArray(this._loader?.obsmKeys) ? this._loader.obsmKeys : [];
-    if (!this._metadata || obsmKeys.length === 0) return;
-
-    const getShapeDims = async (key) => {
-      if (typeof this._loader.getEmbeddingShape !== 'function') {
+    this._vectorBindings.clear();
+    const bindings = this._candidates.defaults.vectorFields;
+    const byField = new Map();
+    for (const binding of bindings) {
+      const match = VECTOR_KEY_PATTERN.exec(binding.key);
+      const fieldId = match.groups.field;
+      const dimension = binding.embedding.columns.length;
+      const item = this._candidates.obsm.find(entry => entry.key === binding.key);
+      if (obsmWidth(item) !== dimension) {
         throw new Error(
-          `Direct AnnData loader cannot validate vector field '${key}'`
+          `Vector field '${binding.key}' has ${obsmWidth(item)} columns, ` +
+          `but its ${dimension}D suffix requires exactly ${dimension}`
         );
       }
-      const shapeMaybe = this._loader.getEmbeddingShape(key);
-      const shapeInfo = typeof shapeMaybe?.then === 'function'
-        ? await shapeMaybe
-        : shapeMaybe;
-      this._assertLifecycleGeneration(generation);
-      const nDims = shapeInfo?.nDims;
-      if (!Number.isInteger(nDims)) {
-        throw new Error(
-          `Vector field '${key}' is missing an exact dimension`
-        );
+      const embeddingId = this._embeddingIdOf(binding.embedding);
+      let keys = byField.get(fieldId);
+      if (keys === undefined) {
+        keys = new Map();
+        byField.set(fieldId, keys);
       }
-      return nDims;
-    };
-
-    const isEmbeddingKey = (key) => String(key || '').startsWith('X_');
-    const isUmapKey = (key) => String(key || '').endsWith('_umap');
-
-    const fields = new Map();
-    const ensureField = (id) => {
-      const key = String(id || '');
-      if (!fields.has(key)) {
-        fields.set(key, { dims: new Set(), keysByDim: {} });
-      }
-      return fields.get(key);
-    };
-
-    for (const key of obsmKeys) {
-      const match = String(key).match(/^(.*)_([123])d$/);
-      if (!match) continue;
-      const baseId = match[1];
-      const dim = Number.parseInt(match[2], 10);
-      if (!Number.isInteger(dim) || dim < 1 || dim > 3) continue;
-      if (!isUmapKey(baseId) || isEmbeddingKey(baseId)) continue;
-
-      const nDims = await getShapeDims(key);
-      if (nDims !== dim) {
-        throw new Error(
-          `Vector field '${key}' has ${nDims} columns, but its ${dim}D suffix requires exactly ${dim}`
-        );
-      }
-
-      const entry = ensureField(baseId);
-      entry.keysByDim[`${dim}d`] = key;
-      entry.dims.add(dim);
+      keys.set(embeddingId, binding.key);
     }
-
-    const buildLabel = (fieldId) => {
-      const id = String(fieldId || '');
-      if (!id) return '';
-      const base = id.endsWith('_umap') ? id.slice(0, -5) : id;
-      const pretty = base.replace(/_/g, ' ').trim();
-      const titled = pretty ? (pretty[0].toUpperCase() + pretty.slice(1)) : id;
-      return id.endsWith('_umap') ? `${titled} (UMAP)` : titled;
-    };
-
-    const fieldsObj = {};
-    for (const [id, entry] of fields.entries()) {
-      const dims = Array.from(entry.dims).sort((a, b) => a - b);
-      if (!dims.length) continue;
-      fieldsObj[id] = {
-        label: buildLabel(id),
-        basis: 'umap',
-        available_dimensions: dims,
-        default_dimension: Math.max(...dims),
-        obsm_keys: entry.keysByDim,
-      };
-      this._vectorFieldKeysById.set(id, { ...entry.keysByDim });
-    }
-
-    const ids = Object.keys(fieldsObj);
-    if (!ids.length) return;
-
-    const defaultField = ids.length === 1 ? ids[0] : null;
-
     this._assertLifecycleGeneration(generation);
-    this._metadata.vector_fields = {
-      default_field: defaultField,
-      fields: fieldsObj,
-    };
+    for (const fieldId of [...byField.keys()].sort(compareCodePoints)) {
+      this._vectorBindings.set(fieldId, byField.get(fieldId));
+    }
+  }
+
+  /**
+   * The embedding id of one `{key, columns}` reference: the key when the
+   * array is read whole, else `key[c0,c1]`.
+   *
+   * @param {{key: string, columns: ReadonlyArray<number>}} ref
+   * @returns {string}
+   * @private
+   */
+  _embeddingIdOf(ref) {
+    const item = this._describedObsm?.find(entry => entry.key === ref.key);
+    if (item === undefined) {
+      throw new RangeError(`obsm['${ref.key}'] does not exist in this file`);
+    }
+    return canonicalEmbeddingId(ref.key, ref.columns, { width: obsmWidth(item) });
+  }
+
+  /**
+   * The data-mapping candidate catalog of this file, the same document
+   * `cellucid serve` publishes at `_cellucid/mapping/candidates.json`.
+   *
+   * @returns {Object}
+   */
+  getMappingCandidates() {
+    if (this._candidates === null) {
+      throw new Error('AnnData data-mapping candidates are not initialized');
+    }
+    return this._candidates;
   }
 
   /**
@@ -987,7 +997,6 @@ export class BaseAnnDataAdapter {
   ) {
     const obsFieldsMetadata = [];
     this._obsFieldsMetadata = null;
-    this._obsMetadataRetainedBytes = 0n;
 
     for (const key of this._loader.obsKeys) {
       const fieldInfo = await this._loader.getObsFieldInfo(key);
@@ -995,7 +1004,6 @@ export class BaseAnnDataAdapter {
 
       if (fieldInfo.dtype === 'categorical') {
         validateCellucidCategories(fieldInfo.categories, key);
-        this._reserveObservationCategories(fieldInfo.categories, key);
         obsFieldsMetadata.push({
           key,
           kind: 'category',
@@ -1019,7 +1027,6 @@ export class BaseAnnDataAdapter {
           const categories =
             this._discoverPrimitiveCategories(field.values, key);
           validateCellucidCategories(categories, key);
-          this._reserveObservationCategories(categories, key);
           obsFieldsMetadata.push({
             key,
             kind: 'category',
@@ -1075,12 +1082,6 @@ export class BaseAnnDataAdapter {
 
     const categories = [];
     const seen = new Set();
-    let rawBytes = BigInt(length) * JS_ARRAY_ELEMENT_BYTES;
-    let discoveryBytes = 0n;
-    this._assertObservationBudget(
-      this._obsMetadataRetainedBytes + rawBytes,
-      `Observation field '${key}' category discovery`
-    );
 
     for (let index = 0; index < length; index++) {
       const value = values[index];
@@ -1102,42 +1103,12 @@ export class BaseAnnDataAdapter {
         );
       }
 
-      if (type === 'string') {
-        rawBytes +=
-          ESTIMATED_JS_STRING_VALUE_BYTES +
-          BigInt(value.length) * 2n;
-        this._assertObservationBudget(
-          this._obsMetadataRetainedBytes +
-            rawBytes +
-            discoveryBytes,
-          `Observation field '${key}' category discovery`
-        );
-      }
-
       if (seen.has(value)) continue;
       validateCellucidCategoryCount(categories.length + 1, key);
-
-      discoveryBytes +=
-        JS_ARRAY_ELEMENT_BYTES +
-        ESTIMATED_JS_SET_ENTRY_BYTES;
-      this._assertObservationBudget(
-        this._obsMetadataRetainedBytes +
-          rawBytes +
-          discoveryBytes,
-        `Observation field '${key}' category discovery`
-      );
       seen.add(value);
       categories.push(value);
     }
 
-    // Model a conservative reference-sized in-place sort workspace.
-    this._assertObservationBudget(
-      this._obsMetadataRetainedBytes +
-        rawBytes +
-        discoveryBytes +
-      BigInt(categories.length) * JS_ARRAY_ELEMENT_BYTES,
-      `Observation field '${key}' category discovery`
-    );
     if (categories.every(category => typeof category === 'string')) {
       categories.sort();
     } else {
@@ -1145,39 +1116,6 @@ export class BaseAnnDataAdapter {
     }
     validateCellucidCategories(categories, key);
     return categories;
-  }
-
-  /**
-   * Reserve persistent category metadata across every observation field.
-   *
-   * @param {Array} categories
-   * @param {string} key
-   * @private
-   */
-  _reserveObservationCategories(categories, key) {
-    const nextBytes =
-      this._obsMetadataRetainedBytes +
-      estimateCategoryRetainedBytes(categories);
-    this._assertObservationBudget(
-      nextBytes,
-      `Cumulative observation metadata for '${key}'`
-    );
-    this._obsMetadataRetainedBytes = nextBytes;
-  }
-
-  /**
-   * @param {bigint} bytes
-   * @param {string} label
-   * @private
-   */
-  _assertObservationBudget(bytes, label) {
-    if (bytes > this._maxMaterializedBytes) {
-      throw new Error(
-        `${label} working set exceeds the ` +
-        `${this._maxMaterializedBytes.toString()}-byte browser limit; ` +
-        'use the Cellucid server or prepared format'
-      );
-    }
   }
 
   /**
@@ -1194,24 +1132,8 @@ export class BaseAnnDataAdapter {
   }
 
   /**
-   * Release only the exact loader-owned raw coordinate result consumed by the
-   * adapter. Loader implementations identity-check the cache entry so a clear,
-   * replacement, or newer independent result cannot be invalidated by stale
-   * cleanup.
-   *
-   * @param {string} key
-   * @param {Object|null} embedding
-   * @private
-   */
-  _releaseLoaderEmbedding(key, embedding) {
-    if (!embedding) return;
-    this._loader.releaseEmbedding?.(key, embedding);
-  }
-
-  /**
-   * Estimate bytes uniquely retained by one lazy observation result. Category
-   * dictionaries are excluded because their canonical arrays are already
-   * accounted for in `_obsMetadataRetainedBytes`.
+   * Estimate bytes uniquely retained by one lazy observation result (its
+   * per-cell array; category dictionaries are shared with the metadata).
    *
    * @param {Object} result
    * @returns {bigint}
@@ -1256,8 +1178,8 @@ export class BaseAnnDataAdapter {
   }
 
   /**
-   * Retain one lazy result within the shared observation-memory ceiling.
-   * Entries are least-recently-used in Map iteration order.
+   * Retain one lazy result, evicting least-recently-used entries (Map
+   * iteration order) while the cache is over its residency budget.
    *
    * @param {string} key
    * @param {Object} result
@@ -1265,18 +1187,11 @@ export class BaseAnnDataAdapter {
    */
   _cacheObsFieldData(key, result) {
     const resultBytes = this._estimateObsFieldDataBytes(result);
-    this._assertObservationBudget(
-      this._obsMetadataRetainedBytes + resultBytes,
-      `Observation field '${key}' retained data`
-    );
 
     this._deleteObsFieldDataCache(key);
     while (
       this._obsFieldDataCache.size > 0 &&
-      this._obsMetadataRetainedBytes +
-        this._obsFieldDataCacheBytes +
-        resultBytes >
-        this._maxMaterializedBytes
+      this._obsFieldDataCacheBytes + resultBytes > this._cacheBudgetBytes
     ) {
       const oldestKey = this._obsFieldDataCache.keys().next().value;
       this._deleteObsFieldDataCache(oldestKey);
@@ -1284,38 +1199,6 @@ export class BaseAnnDataAdapter {
 
     this._obsFieldDataCache.set(key, result);
     this._obsFieldDataCacheBytes += resultBytes;
-  }
-
-  /**
-   * Make room for a transient observation operation before allocating its
-   * workspace. Existing lazy entries are expendable LRU state; canonical
-   * category metadata is not.
-   *
-   * @param {bigint} workspaceBytes
-   * @param {string} label
-   * @private
-   */
-  _prepareObsFieldWorkspace(workspaceBytes, label) {
-    this._assertObservationBudget(
-      this._obsMetadataRetainedBytes + workspaceBytes,
-      label
-    );
-    while (
-      this._obsFieldDataCache.size > 0 &&
-      this._obsMetadataRetainedBytes +
-        this._obsFieldDataCacheBytes +
-        workspaceBytes >
-        this._maxMaterializedBytes
-    ) {
-      const oldestKey = this._obsFieldDataCache.keys().next().value;
-      this._deleteObsFieldDataCache(oldestKey);
-    }
-    this._assertObservationBudget(
-      this._obsMetadataRetainedBytes +
-        this._obsFieldDataCacheBytes +
-        workspaceBytes,
-      label
-    );
   }
 
   /**
@@ -1430,47 +1313,6 @@ export class BaseAnnDataAdapter {
               `Observation field '${key}' has an invalid values length`
             );
           }
-          const mapBytes =
-            BigInt(categories.length) * ESTIMATED_JS_SET_ENTRY_BYTES;
-          const codesBytes =
-            BigInt(valueCount) *
-            BigInt(Int32Array.BYTES_PER_ELEMENT);
-          let rawBytes =
-            BigInt(valueCount) * JS_ARRAY_ELEMENT_BYTES;
-          if (field.dtype === 'string') {
-            rawBytes +=
-              BigInt(valueCount) * ESTIMATED_JS_STRING_VALUE_BYTES;
-          }
-          let workspaceBytes = rawBytes + mapBytes + codesBytes;
-          const workspaceLabel =
-            `Observation field '${key}' category conversion`;
-          this._prepareObsFieldWorkspace(
-            workspaceBytes,
-            workspaceLabel
-          );
-
-          // String payload lengths are available only after the loader has
-          // decoded the source array. Measure them before Map/code allocation.
-          if (field.dtype === 'string') {
-            let payloadBytes = 0n;
-            for (let index = 0; index < valueCount; index++) {
-              const value = field.values[index];
-              if (value == null) continue;
-              if (typeof value !== 'string') {
-                throw new Error(
-                  `Observation field '${key}' declared string storage but ` +
-                  `value ${index} is not a string`
-                );
-              }
-              payloadBytes += BigInt(value.length) * 2n;
-            }
-            workspaceBytes += payloadBytes;
-            this._prepareObsFieldWorkspace(
-              workspaceBytes,
-              workspaceLabel
-            );
-          }
-
           const categoryMap = new Map();
           for (let index = 0; index < categories.length; index++) {
             categoryMap.set(categories[index], index);
@@ -1536,14 +1378,6 @@ export class BaseAnnDataAdapter {
     return this._connectivityManifest;
   }
 
-  _getEmbeddingObsmKey(dim) {
-    return this._embeddingKeysByDimension?.[`${dim}d`];
-  }
-
-  _getVectorFieldObsmKey(fieldId, dim) {
-    return this._vectorFieldKeysById.get(fieldId)?.[`${dim}d`];
-  }
-
   /**
    * Build and validate the one public direct-AnnData dataset identity.
    * Loader-only obsm resolution remains private to this adapter.
@@ -1586,42 +1420,44 @@ export class BaseAnnDataAdapter {
       );
     }
 
-    const internalMetadata = this._metadata;
-    const internalEmbeddings = internalMetadata?.embeddings;
-    const dimensions = internalEmbeddings?.available_dimensions;
-    if (!Array.isArray(dimensions) || dimensions.length === 0) {
+    if (this._slots === null) {
+      throw new Error('Direct AnnData embeddings are not resolved');
+    }
+    const resolved = [];
+    for (const slot of DIMENSION_SLOTS) {
+      const ref = this._slots[slot];
+      if (ref === null) continue;
+      resolved.push({
+        id: this._embeddingIdOf(ref),
+        dimension: ref.columns.length,
+        key: ref.key,
+        columns: [...ref.columns],
+      });
+    }
+    if (resolved.length === 0) {
       throw new Error(
-        'Direct AnnData identity requires at least one embedding dimension'
+        'Direct AnnData identity requires at least one embedding'
       );
     }
-    const availableDimensions = [...dimensions];
-    availableDimensions.sort((left, right) => left - right);
-    if (
-      availableDimensions.some(
-        (dimension, index) =>
-          !Number.isSafeInteger(dimension) ||
-          dimension < 1 ||
-          dimension > 3 ||
-          (index > 0 && availableDimensions[index - 1] === dimension)
-      )
-    ) {
-      throw new Error(
-        'Direct AnnData embedding dimensions must be unique 1D, 2D, or 3D integers'
-      );
-    }
-    const defaultDimension =
-      availableDimensions[availableDimensions.length - 1];
-    const embeddingFiles = {};
-    for (const dimension of availableDimensions) {
-      const key = `${dimension}d`;
-      const obsmKey = this._embeddingKeysByDimension?.[key];
-      if (typeof obsmKey !== 'string' || obsmKey.length === 0) {
-        throw new Error(
-          `Direct AnnData identity is missing private ${dimension}D obsm resolution`
-        );
-      }
-      embeddingFiles[key] = `points_${dimension}d.bin`;
-    }
+    resolved.sort((left, right) =>
+      left.dimension - right.dimension || compareCodePoints(left.id, right.id)
+    );
+    // A dataset opened straight from AnnData is not an export and records no
+    // export_settings, so its payload paths are uncompressed.
+    const items = {};
+    const defaults = {};
+    resolved.forEach((embedding, index) => {
+      items[embedding.id] = {
+        label: embedding.id,
+        dimension: embedding.dimension,
+        file: embeddingPayloadPath(index, embedding.dimension, null),
+        source: { key: embedding.key, columns: [...embedding.columns] },
+      };
+      defaults[dimensionSlot(embedding.dimension)] = embedding.id;
+    });
+    const embeddingIndexById = new Map(
+      resolved.map((embedding, index) => [embedding.id, index])
+    );
 
     const edges = await this.getConnectivityEdges();
     this._assertLifecycleGeneration(generation);
@@ -1640,8 +1476,9 @@ export class BaseAnnDataAdapter {
       connectivityManifest,
       CONNECTIVITY_MANIFEST_CONTEXT.DIRECT
     );
-    const hasExpressionMatrix =
-      this._loader.hasExpressionMatrix !== false;
+    // The gene count of the gene list the file opens with (raw.X has its own).
+    const varManifest = await this.getVarManifest();
+    this._assertLifecycleGeneration(generation);
     const obsManifest = this.getObsManifest();
     const obsFields = [
       // Element 0 of every entry is the payload index; the key is element 1.
@@ -1663,54 +1500,41 @@ export class BaseAnnDataAdapter {
     ];
 
     let vectorFields;
-    const internalVectorFields = internalMetadata.vector_fields;
-    if (internalVectorFields) {
+    if (this._vectorBindings.size > 0) {
       const fields = {};
       let fieldIndex = 0;
-      for (const [
-        fieldId,
-        internalField,
-      ] of Object.entries(internalVectorFields.fields)) {
+      for (const [fieldId, keysByEmbedding] of this._vectorBindings) {
+        const bound = [...keysByEmbedding.keys()]
+          .sort((left, right) =>
+            embeddingIndexById.get(left) - embeddingIndexById.get(right)
+          );
         const files = {};
-        for (const dimension of internalField.available_dimensions) {
-          const key = `${dimension}d`;
-          const obsmKey =
-            this._vectorFieldKeysById.get(fieldId)?.[key];
-          if (typeof obsmKey !== 'string' || obsmKey.length === 0) {
-            throw new Error(
-              `Direct AnnData vector field "${fieldId}" is missing ` +
-              `private ${dimension}D obsm resolution`
-            );
-          }
-          files[key] =
-            `vectors/${fieldIndex}_${dimension}d.bin`;
+        for (const embeddingId of bound) {
+          files[embeddingId] = vectorPayloadPath(
+            fieldIndex,
+            embeddingIndexById.get(embeddingId),
+            null
+          );
         }
-        fields[fieldId] = {
-          label: internalField.label,
-          basis: internalField.basis,
-          available_dimensions: [
-            ...internalField.available_dimensions
-          ],
-          default_dimension: internalField.default_dimension,
-          files,
-        };
+        fields[fieldId] = { label: fieldId, files };
         fieldIndex++;
       }
+      const fieldIds = Object.keys(fields);
       vectorFields = {
-        default_field: internalVectorFields.default_field,
+        default_field: fieldIds.length === 1 ? fieldIds[0] : null,
         fields,
       };
     }
 
     const identity = {
-      version: 2,
+      version: 3,
       id,
       name,
       description,
       cellucid_data_version: cellucidDataVersion,
       stats: {
         n_cells: this._loader.nObs,
-        n_genes: hasExpressionMatrix ? this._loader.nVars : 0,
+        n_genes: varManifest.fields.length,
         n_obs_fields: obsFields.length,
         n_categorical_fields: obsFields.filter(
           field => field.kind === 'category'
@@ -1722,9 +1546,9 @@ export class BaseAnnDataAdapter {
         n_edges: hasConnectivity ? edges.nEdges : null,
       },
       embeddings: {
-        available_dimensions: availableDimensions,
-        default_dimension: defaultDimension,
-        files: embeddingFiles,
+        default_dimension: resolved[resolved.length - 1].dimension,
+        defaults,
+        items,
       },
       obs_fields: obsFields,
       source: { ...source },
@@ -1736,29 +1560,113 @@ export class BaseAnnDataAdapter {
       ? null
       : Object.freeze(connectivityManifest);
     this._metadata = identity;
+    this._identityEmbeddings = Object.freeze(resolved.map(embedding => Object.freeze({
+      id: embedding.id,
+      dimension: embedding.dimension,
+      ref: Object.freeze({ key: embedding.key, columns: Object.freeze([...embedding.columns]) }),
+    })));
     this._directIdentityFinalized = true;
     return identity;
   }
 
   /**
-   * Get embedding coordinates for a dimension
-   * @param {number} dim - Dimension (1, 2, or 3)
+   * The normalized coordinates of one stored embedding payload, by its path
+   * under the dataset base: `embeddings/{i}_{d}d.bin` names item `i` of the
+   * published identity, and `_cellucid/mapping/embeddings/{obsm}/{cols}.bin`
+   * names `obsm` entry `obsm` of the candidate catalog read at `cols`. The
+   * bytes are the ones a prepared export or `cellucid serve` publishes for the
+   * same array.
+   *
+   * The caller owns the returned array, exactly as it owns a fetched payload:
+   * the DimensionManager normalizes it in place for display and releases it
+   * when it evicts the layout. The adapter therefore hands over its cached
+   * copy and drops its own reference, so it never keeps (or hands out again)
+   * an array a caller may already have rewritten, and an eviction frees the
+   * memory instead of leaving it held here.
+   *
+   * @param {string} path
+   * @param {number} dimension - The dimension the caller's layout declares.
    * @returns {Promise<Float32Array>}
    */
-  async getEmbedding(dim) {
+  async getEmbeddingPayload(path, dimension) {
+    let ref;
+    const identityMatch = /^embeddings\/(0|[1-9][0-9]*)_([123])d\.bin$/.exec(path);
+    if (identityMatch !== null) {
+      const item = this._identityEmbeddings?.[Number(identityMatch[1])];
+      if (item === undefined || item.dimension !== Number(identityMatch[2])) {
+        throw new RangeError(`This dataset has no embedding payload '${path}'.`);
+      }
+      ref = item.ref;
+    } else {
+      const route = parseMappingEmbeddingPath(path);
+      const item = route === null ? undefined : this._candidates?.obsm[route.obsmIndex];
+      if (item === undefined) {
+        throw new RangeError(`This dataset has no embedding payload '${path}'.`);
+      }
+      ref = { key: item.key, columns: route.columns };
+    }
+    if (ref.columns.length !== dimension) {
+      throw new RangeError(
+        `Embedding payload '${path}' holds ${ref.columns.length}D coordinates, not ${dimension}D.`
+      );
+    }
+    const embedding = await this.getEmbeddingForRef(ref);
+    const coordinateCacheKey = this._embeddingCoordinateCacheKey(
+      this._resolveEmbeddingRef(ref).embeddingId
+    );
+    if (this._deleteCoordinateCacheEntry(coordinateCacheKey, embedding)) {
+      return embedding;
+    }
+    // Another caller of the same computation was handed the cached array
+    // first. Every caller sharing one computation resumes in the same turn,
+    // before any of them can write to it, so this copy is still the payload.
+    return new Float32Array(embedding);
+  }
+
+  /**
+   * The checked columns and canonical embedding id of one `obsm` reference.
+   *
+   * @param {{key: string, columns: ReadonlyArray<number>}} ref
+   * @returns {{columns: ReadonlyArray<number>, dimension: number, embeddingId: string}}
+   * @private
+   */
+  _resolveEmbeddingRef(ref) {
+    if (this._describedObsm === null) {
+      throw new Error('AnnData obsm entries are not described yet');
+    }
+    const dimension = ref.columns.length;
+    const resolved = resolveCandidateRef({ obsm: this._describedObsm }, ref, dimension);
+    if (!resolved.ok) {
+      throw new RangeError(`Cannot plot this embedding: ${resolved.reason}.`);
+    }
+    const columns = resolved.columns;
+    return {
+      columns,
+      dimension,
+      embeddingId: canonicalEmbeddingId(ref.key, columns, { width: resolved.width })
+    };
+  }
+
+  /**
+   * Read, check and normalize the selected columns of one `obsm` array.
+   *
+   * The columns must be finite, representable as float32 and span a non-zero
+   * range (`embeddingLoadDefect`); otherwise an `EmbeddingLoadError` names the
+   * first offending cell. The normalized result is cached by its embedding id.
+   *
+   * @param {{key: string, columns: ReadonlyArray<number>}} ref
+   * @returns {Promise<Float32Array>}
+   */
+  async getEmbeddingForRef(ref) {
     const generation = this._captureLifecycleGeneration();
-    const coordinateCacheKey =
-      this._embeddingCoordinateCacheKey(dim);
-    const releasePin =
-      this._pinCoordinateCacheKey(coordinateCacheKey);
+    const { columns, dimension, embeddingId } = this._resolveEmbeddingRef(ref);
+    const coordinateCacheKey = this._embeddingCoordinateCacheKey(embeddingId);
+    const releasePin = this._pinCoordinateCacheKey(coordinateCacheKey);
 
     try {
-      if (this._embeddingCache.has(dim)) {
-        const cached = this._embeddingCache.get(dim);
-        this._touchCoordinateCacheEntry(
-          coordinateCacheKey,
-          cached
-        );
+      if (this._embeddingCache.has(embeddingId)) {
+        const cached = this._embeddingCache.get(embeddingId);
+        this._touchCoordinateCacheEntry(coordinateCacheKey, cached);
         await Promise.resolve();
         this._assertLifecycleGeneration(generation);
         return cached;
@@ -1766,98 +1674,50 @@ export class BaseAnnDataAdapter {
 
       return await this._coalesceInFlight(
         this._embeddingInFlight,
-        dim,
+        embeddingId,
         generation,
         async () => {
-          if (this._embeddingCache.has(dim)) {
-            const cached = this._embeddingCache.get(dim);
-            this._touchCoordinateCacheEntry(
-              coordinateCacheKey,
-              cached
-            );
+          if (this._embeddingCache.has(embeddingId)) {
+            const cached = this._embeddingCache.get(embeddingId);
+            this._touchCoordinateCacheEntry(coordinateCacheKey, cached);
             this._assertLifecycleGeneration(generation);
             return cached;
           }
-
-          const embKey =
-            this._getEmbeddingObsmKey(dim);
-          if (typeof embKey !== 'string' || embKey.length === 0) {
-            throw new Error(
-              `Dataset metadata does not advertise an exact ${dim}D embedding key`
-            );
+          const values = await this._loader.readObsmColumns(ref.key, columns);
+          this._assertLifecycleGeneration(generation);
+          const label = `Embedding '${embeddingId}'`;
+          if (!(values instanceof Float64Array) || values.length !== this._loader.nObs * dimension) {
+            throw new Error(`${label} read did not return one row per cell`);
           }
-          if (!this._loader.obsmKeys.includes(embKey)) {
-            throw new Error(
-              `Metadata advertises '${embKey}' for ${dim}D, but it is missing from obsm`
-            );
+          const defect = embeddingLoadDefect(values, dimension);
+          if (defect !== null) {
+            throw new EmbeddingLoadError(ref.key, columns, defect);
           }
-
-          const emb = await this._loader.getEmbedding(embKey);
-          let materialization = null;
+          const outputBytes = this._checkedCoordinateResultBytes(values.length, label);
+          const materialization = this._reserveCoordinateMaterialization(
+            values,
+            outputBytes,
+            label
+          );
           try {
+            const normalized = this._normalizeEmbedding(values, dimension, embeddingId);
             this._assertLifecycleGeneration(generation);
-
-            // The exact suffixed obsm key must match the requested dimension.
-            if (emb.nDims !== dim) {
-              throw new Error(
-                `Embedding '${embKey}' has ${emb.nDims} dimensions, expected ${dim}`
-              );
+            this._consumeCoordinateOutputReservation(materialization);
+            this._retainCoordinateCacheEntry({
+              cacheKey: coordinateCacheKey,
+              embeddingId,
+              kind: 'embedding',
+              label,
+              value: normalized
+            });
+            return normalized;
+          } catch (error) {
+            if (!this._embeddingCache.has(embeddingId)) {
+              this._normInfo.delete(embeddingId);
             }
-
-            const cacheLabel = `Embedding '${embKey}'`;
-            const outputBytes =
-              this._checkedNormalizedEmbeddingBytes(
-                emb.data,
-                emb.nDims,
-                dim,
-                cacheLabel
-              );
-            materialization =
-              this._reserveCoordinateMaterialization(
-                emb.data,
-                outputBytes,
-                cacheLabel
-              );
-
-            validateFiniteCoordinateComponents(
-              emb.data,
-              cacheLabel
-            );
-
-            // Normalize to [-1, 1] range only after the full raw + output
-            // materialization is reserved under the shared coordinate owner.
-            let normalized;
-            try {
-              normalized =
-                this._normalizeEmbedding(
-                  emb.data,
-                  emb.nDims,
-                  dim,
-                  true
-                );
-              this._assertLifecycleGeneration(generation);
-              this._consumeCoordinateOutputReservation(
-                materialization
-              );
-              this._retainCoordinateCacheEntry({
-                cacheKey: coordinateCacheKey,
-                dim,
-                kind: 'embedding',
-                label: cacheLabel,
-                value: normalized
-              });
-              return normalized;
-            } catch (error) {
-              if (!this._embeddingCache.has(dim)) {
-                this._normInfo.delete(dim);
-              }
-              throw error;
-            }
+            throw error;
           } finally {
-            this._releaseCoordinateMaterialization(
-              materialization
-            );
-            this._releaseLoaderEmbedding(embKey, emb);
+            this._releaseCoordinateMaterialization(materialization);
           }
         }
       );
@@ -1867,46 +1727,49 @@ export class BaseAnnDataAdapter {
   }
 
   /**
-   * Get per-cell displacement vectors for a vector field in `obsm`.
+   * The per-cell displacement vectors of one vector field bound to one
+   * embedding, by its route
+   * `_cellucid/mapping/vectors/{vector}/{vcols}/{embedding}/{ecols}.bin`
+   * (`resolveVectorBinding`): the vector array read at `vcols`, checked
+   * (finite, representable as float32) and scaled by the bound embedding's
+   * normalization scale, so the vectors live in the same normalized space as
+   * its positions -- the payload `cellucid serve` answers the same route with.
    *
-   * Returns a flat Float32Array with `dim` components per cell, scaled by the
-   * same normalization scale as the embedding (so vectors live in the same
-   * normalized coordinate space as positions).
-   *
-   * The fieldId should match a `vector_fields.fields` key in dataset identity
-   * (e.g. `velocity_umap`, `T_fwd_umap`).
-   *
-   * @param {string} fieldId
-   * @param {number} dim
-   * @returns {Promise<Float32Array>}
+   * @param {string} path
+   * @param {number} dimension - The bound embedding's dimension, as the caller's layout declares it.
+   * @returns {Promise<Float32Array>} `dimension` components per cell.
    */
-  async getVectorField(fieldId, dim) {
+  async getVectorPayload(path, dimension) {
     const generation = this._captureLifecycleGeneration();
-    const id = String(fieldId || '');
-    if (!Number.isInteger(dim) || dim < 1 || dim > 3) {
-      throw new TypeError(
-        'Vector field dimension must be exactly 1, 2, or 3'
+    const route = parseMappingVectorPath(path);
+    const vectorItem = route === null ? undefined : this._candidates?.obsm[route.vectorIndex];
+    const embeddingItem = route === null ? undefined : this._candidates?.obsm[route.embeddingIndex];
+    if (vectorItem === undefined || embeddingItem === undefined) {
+      throw new RangeError(`This dataset has no vector payload '${path}'.`);
+    }
+    const embeddingRef = { key: embeddingItem.key, columns: route.embeddingColumns };
+    const resolved = resolveVectorBinding(this._candidates, { key: vectorItem.key, embedding: embeddingRef });
+    if (!resolved.ok) {
+      throw new RangeError(`Cannot draw this vector field: ${resolved.reason}.`);
+    }
+    if (resolved.path !== path) {
+      throw new RangeError(
+        `obsm['${vectorItem.key}'] cannot be bound to obsm['${embeddingItem.key}'] at these columns.`
       );
     }
-    const d = dim;
-    if (!id) {
-      throw new Error('BaseAnnDataAdapter.getVectorField: fieldId is required');
+    if (resolved.dimension !== dimension) {
+      throw new RangeError(
+        `Vector payload '${path}' holds ${resolved.dimension}D vectors, not ${dimension}D.`
+      );
     }
-
-    const inFlightKey = JSON.stringify([id, d]);
-    const coordinateCacheKey =
-      this._vectorCoordinateCacheKey(id, d);
-    const releasePin =
-      this._pinCoordinateCacheKey(coordinateCacheKey);
+    const embeddingId = resolved.layoutKey;
+    const coordinateCacheKey = this._vectorCoordinateCacheKey(path);
+    const releasePin = this._pinCoordinateCacheKey(coordinateCacheKey);
 
     try {
-      let perField = this._vectorFieldCache.get(id);
-      if (perField?.has(d)) {
-        const cached = perField.get(d);
-        this._touchCoordinateCacheEntry(
-          coordinateCacheKey,
-          cached
-        );
+      if (this._vectorFieldCache.has(path)) {
+        const cached = this._vectorFieldCache.get(path);
+        this._touchCoordinateCacheEntry(coordinateCacheKey, cached);
         await Promise.resolve();
         this._assertLifecycleGeneration(generation);
         return cached;
@@ -1914,87 +1777,51 @@ export class BaseAnnDataAdapter {
 
       return await this._coalesceInFlight(
         this._vectorFieldInFlight,
-        inFlightKey,
+        path,
         generation,
         async () => {
-          let currentPerField = this._vectorFieldCache.get(id);
-          if (currentPerField?.has(d)) {
-            const cached = currentPerField.get(d);
-            this._touchCoordinateCacheEntry(
-              coordinateCacheKey,
-              cached
-            );
+          if (this._vectorFieldCache.has(path)) {
+            const cached = this._vectorFieldCache.get(path);
+            this._touchCoordinateCacheEntry(coordinateCacheKey, cached);
             this._assertLifecycleGeneration(generation);
             return cached;
           }
 
-          // Ensure we have the embedding scale for this dimension.
-          if (!this._normInfo.has(d)) {
-            await this.getEmbedding(d);
+          // The vectors share their embedding's normalization scale.
+          if (!this._normInfo.has(embeddingId)) {
+            await this.getEmbeddingForRef(embeddingRef);
             this._assertLifecycleGeneration(generation);
           }
-          const scale = this._normInfo.get(d)?.scale;
+          const scale = this._normInfo.get(embeddingId)?.scale;
           if (!Number.isFinite(scale) || scale <= 0) {
             throw new Error(
-              `Embedding normalization for ${d}D has no finite positive scale`
+              `Embedding "${embeddingId}" normalization has no finite positive scale`
             );
           }
 
-          const obsmKeys = Array.isArray(this._loader?.obsmKeys)
-            ? this._loader.obsmKeys
-            : [];
-
-          const metaEntry =
-            this._metadata?.vector_fields?.fields?.[id] || null;
-          const keyFromMeta =
-            this._getVectorFieldObsmKey(id, d);
-          if (
-            typeof keyFromMeta !== 'string' ||
-            keyFromMeta.length === 0
-          ) {
-            throw new Error(
-              `Dataset metadata does not advertise an exact ${d}D vector field key for "${id}"`
+          const raw = await this._loader.readObsmColumns(vectorItem.key, route.vectorColumns);
+          this._assertLifecycleGeneration(generation);
+          const cacheLabel = `Vector field '${vectorItem.key}'`;
+          const defect = valueLoadDefect(raw, dimension);
+          if (defect !== null) {
+            throw new MappingLoadError(
+              vectorItem.key,
+              defect,
+              `${cacheLabel} cannot be drawn: ${defect}.`
             );
           }
-          if (!obsmKeys.includes(keyFromMeta)) {
-            throw new Error(
-              `Metadata advertises '${keyFromMeta}' for ${d}D vector field "${id}", but it is missing from obsm`
-            );
-          }
-          const key = keyFromMeta;
-
-          const vel = await this._loader.getEmbedding(key);
-          let materialization = null;
+          const outputBytes = this._checkedCoordinateResultBytes(raw.length, cacheLabel);
+          const materialization = this._reserveCoordinateMaterialization(
+            raw,
+            outputBytes,
+            cacheLabel
+          );
           try {
-            this._assertLifecycleGeneration(generation);
-            if (vel?.nDims !== d) {
-              throw new Error(
-                `Vector field '${key}' has ${vel?.nDims} dimensions, expected ${d}`
-              );
-            }
-
-            const raw = vel?.data;
-            const cacheLabel = `Vector field '${key}'`;
-            const outputBytes =
-              this._checkedCoordinateResultBytes(
-                raw?.length,
-                cacheLabel
-              );
-            materialization =
-              this._reserveCoordinateMaterialization(
-                raw,
-                outputBytes,
-                cacheLabel
-              );
-            validateFiniteCoordinateComponents(raw, cacheLabel);
-
-            const len = raw.length;
-            const data = new Float32Array(len);
-            for (let i = 0; i < len; i++) {
+            const data = new Float32Array(raw.length);
+            for (let i = 0; i < raw.length; i++) {
               const scaled = raw[i] * scale;
               const narrowed = Math.fround(scaled);
-              if (!Number.isFinite(scaled) ||
-                  !Number.isFinite(narrowed)) {
+              if (!Number.isFinite(scaled) || !Number.isFinite(narrowed)) {
                 throw new Error(
                   `${cacheLabel} component at flat index ${i} is outside the finite Float32 range after normalization`
                 );
@@ -2002,24 +1829,18 @@ export class BaseAnnDataAdapter {
               data[i] = narrowed;
             }
             this._assertLifecycleGeneration(generation);
-
-            this._consumeCoordinateOutputReservation(
-              materialization
-            );
+            this._consumeCoordinateOutputReservation(materialization);
             this._retainCoordinateCacheEntry({
               cacheKey: coordinateCacheKey,
-              dim: d,
-              fieldId: id,
+              embeddingId,
+              vectorPath: path,
               kind: 'vector',
               label: cacheLabel,
               value: data
             });
             return data;
           } finally {
-            this._releaseCoordinateMaterialization(
-              materialization
-            );
-            this._releaseLoaderEmbedding(key, vel);
+            this._releaseCoordinateMaterialization(materialization);
           }
         }
       );
@@ -2029,78 +1850,54 @@ export class BaseAnnDataAdapter {
   }
 
   /**
-   * Normalize finite embedding coordinates to [-1, 1] range with uniform
-   * scaling across all axes.
+   * Normalize checked embedding coordinates with the export format's rule --
+   * centred per axis, one `2 / max(axis ranges)` scale for every axis,
+   * computed at the input's precision and rounded to float32 once -- so the
+   * payload is byte-identical to the one `cellucid-python`/`cellucid-r`
+   * write and `cellucid serve` answers for the same array. The transform is
+   * recorded under the embedding's id so its vector fields share its scale.
    *
-   * @param {Float32Array} data - Raw embedding data (flattened, row-major)
-   * @param {number} srcDim - Source dimensions
-   * @param {number} targetDim - Target dimensions
-   * @param {boolean} coordinatesValidated - Internal one-pass validation marker
+   * @param {Float64Array} data - Checked coordinates, row-major
+   * @param {number} dimension - Components per cell
+   * @param {string} embeddingId
    * @returns {Float32Array}
    * @protected
    */
-  _normalizeEmbedding(
-    data,
-    srcDim,
-    targetDim,
-    coordinatesValidated = false
-  ) {
-    if (!coordinatesValidated) {
-      validateFiniteCoordinateComponents(
-        data,
-        'Embedding coordinates'
-      );
-    }
-    const nCells = data.length / srcDim;
+  _normalizeEmbedding(data, dimension, embeddingId) {
+    const nCells = data.length / dimension;
+    const result = new Float32Array(nCells * dimension);
+    if (nCells === 0) return result;
 
-    // Edge case: empty data
-    if (nCells === 0) {
-      return new Float32Array(0);
-    }
-
-    const result = new Float32Array(nCells * targetDim);
-
-    // Find min/max for each finite axis.
-    const mins = new Array(srcDim).fill(Infinity);
-    const maxs = new Array(srcDim).fill(-Infinity);
-
+    const mins = new Array(dimension).fill(Infinity);
+    const maxs = new Array(dimension).fill(-Infinity);
     for (let i = 0; i < nCells; i++) {
-      const baseIdx = i * srcDim;
-      for (let d = 0; d < srcDim; d++) {
+      const baseIdx = i * dimension;
+      for (let d = 0; d < dimension; d++) {
         const value = data[baseIdx + d];
         if (value < mins[d]) mins[d] = value;
         if (value > maxs[d]) maxs[d] = value;
       }
     }
 
-    // Find max range across all axes for uniform scaling
+    // One range for all axes keeps the layout's aspect ratio. The load-time
+    // check (`embeddingLoadDefect`) already refused a zero range, and any
+    // positive range is used as is: the format's rule has no floor, so a
+    // narrow embedding gets the scale every writer gives it.
     let maxRange = 0;
-    for (let d = 0; d < srcDim; d++) {
+    for (let d = 0; d < dimension; d++) {
       const range = maxs[d] - mins[d];
       if (range > maxRange) maxRange = range;
     }
 
-    // Edge case: all values are identical
-    if (maxRange < 1e-8) maxRange = 1;
-
-    // Compute centers
     const centers = mins.map((min, d) => (min + maxs[d]) / 2);
-
-    // Normalize
     const scale = 2 / maxRange;
     for (let i = 0; i < nCells; i++) {
-      for (let d = 0; d < Math.min(srcDim, targetDim); d++) {
-        const v = data[i * srcDim + d];
-        result[i * targetDim + d] =
-          (v - centers[d]) * scale;
-      }
-      // Zero-fill extra dimensions if targetDim > srcDim
-      for (let d = srcDim; d < targetDim; d++) {
-        result[i * targetDim + d] = 0;
+      for (let d = 0; d < dimension; d++) {
+        result[i * dimension + d] = (data[i * dimension + d] - centers[d]) * scale;
       }
     }
 
-    this._normInfo.set(targetDim, { maxRange, centers, scale });
+    this._normInfo.set(embeddingId, { maxRange, centers, scale });
     return result;
   }
 
@@ -2167,7 +1964,7 @@ export class BaseAnnDataAdapter {
     }
 
     return {
-      _format: 'compact_v1',
+      _format: 'compact_v2',
       n_points: this._loader.nObs,
       centroid_outlier_quantile: null,
       latent_key: null,
@@ -2179,10 +1976,18 @@ export class BaseAnnDataAdapter {
   }
 
   /**
-   * Get var manifest in Cellucid compact format
-   * @returns {Object}
+   * The gene list of one var axis named by one name source, in Cellucid's
+   * compact var-manifest format: `var_manifest.json` is the gene list this
+   * file opens with (the default expression matrix and gene names), and
+   * `_cellucid/mapping/genes/{axis}/{names}/var_manifest.json` any other. The
+   * names are made unique with `makeUniqueNames`, exactly as `cellucid serve`
+   * does; the manifest records what that changed.
+   *
+   * @param {string} [path='var_manifest.json']
+   * @returns {Promise<Object>}
    */
-  getVarManifest() {
+  async getVarManifest(path = 'var_manifest.json') {
+    const generation = this._captureLifecycleGeneration();
     if (
       !Number.isSafeInteger(this._loader.nObs) ||
       this._loader.nObs <= 0
@@ -2191,13 +1996,16 @@ export class BaseAnnDataAdapter {
         'AnnData datasets must contain at least one observation'
       );
     }
-    const fields = this._loader.hasExpressionMatrix === false
-      ? []
-      : this._loader.varNames.map((name, payloadIndex) => [payloadIndex, name]);
+    const route = this._resolveGeneRoute(path, 'var_manifest');
+    const names = route === null ? null : await this._geneNames(route);
+    this._assertLifecycleGeneration(generation);
+    // The genes listed here come from this matrix: let a reader that must
+    // index it by gene start now, in the background, so the first gene shown
+    // does not wait for the whole index.
+    if (route !== null) this._loader.prepareMatrix?.(route.element);
     return {
-      _format: 'compact_v1',
+      _format: 'compact_v2',
       n_points: this._loader.nObs,
-      var_gene_id_column: null,
       compression: null,
       quantization: null,
       _varSchema: {
@@ -2207,8 +2015,121 @@ export class BaseAnnDataAdapter {
         dtype: 'float32',
         quantized: false,
       },
-      fields,
+      fields: names === null
+        ? []
+        : names.names.map((name, payloadIndex) => [payloadIndex, name]),
+      gene_name_sets: [
+        names === null
+          ? { source: null, filled_from_index: 0, renamed: [], names: null }
+          : {
+              source: names.source,
+              filled_from_index: names.filledFromIndex,
+              renamed: names.renamed.map(pair => [...pair]),
+              names: null,
+            },
+      ],
     };
+  }
+
+  /**
+   * Resolve one gene path -- the file's own (`var_manifest.json`,
+   * `var/{g}.values.f32`) or a mapped one -- to the matrix and name source it
+   * reads. Null for the file's own gene list when it has no expression
+   * matrix.
+   *
+   * @param {string} path
+   * @param {'var_manifest'|'gene'} kind
+   * @returns {{axisRoute: string, namesRoute: string, element: string, varAxis: 'X'|'raw', column: string|null, gene: number|null}|null}
+   * @private
+   */
+  _resolveGeneRoute(path, kind) {
+    const candidates = this.getMappingCandidates();
+    let axisRoute;
+    let namesRoute;
+    let gene = null;
+    const mapped = parseMappingGenesPath(path);
+    if (mapped !== null) {
+      ({ axisRoute, namesRoute, gene } = mapped);
+    } else {
+      const own = kind === 'var_manifest'
+        ? (path === 'var_manifest.json' ? {} : null)
+        : /^var\/(0|[1-9][0-9]*)\.values\.f32$/.exec(path);
+      if (own === null) {
+        throw new RangeError(`This file has no gene payload '${path}'.`);
+      }
+      const defaults = candidates.defaults;
+      if (defaults.expression === null) {
+        if (kind === 'gene') {
+          throw new Error('This AnnData file has no expression matrix; gene expression is unavailable.');
+        }
+        return null;
+      }
+      axisRoute = expressionAxisRoute(candidates, defaults.expression);
+      namesRoute = geneNamesRoute(candidates, axisRoute, defaults.geneNames);
+      gene = kind === 'gene' ? Number(own[1]) : null;
+    }
+    if ((kind === 'gene') !== (gene !== null)) {
+      throw new RangeError(`This file has no gene payload '${path}'.`);
+    }
+    let element;
+    let varAxis = 'X';
+    if (axisRoute === 'X') {
+      if (candidates.X === null) throw new RangeError('This file has no X.');
+      element = 'X';
+    } else if (axisRoute === 'raw') {
+      if (candidates.raw === null) throw new RangeError('This file has no raw.');
+      element = 'raw/X';
+      varAxis = 'raw';
+    } else {
+      const layer = candidates.layers[Number(axisRoute.slice('layer-'.length))];
+      if (layer === undefined) throw new RangeError(`This file has no layer ${axisRoute}.`);
+      if (!layer.usable) {
+        throw new MappingLoadError(layer.key, layer.reason, `layers['${layer.key}'] ${layer.reason}.`);
+      }
+      element = `layers/${layer.key}`;
+    }
+    let column = null;
+    if (namesRoute !== 'index') {
+      const entry = axisVarColumns(candidates, axisRoute)[Number(namesRoute.slice('column-'.length))];
+      if (entry === undefined) throw new RangeError(`This file has no var column ${namesRoute}.`);
+      if (!entry.usable) {
+        throw new MappingLoadError(entry.key, entry.reason, `var column '${entry.key}': ${entry.reason}.`);
+      }
+      column = entry.key;
+    }
+    return { axisRoute, namesRoute, element, varAxis, column, gene };
+  }
+
+  /**
+   * The unique gene names of one axis and name source, read once and kept:
+   * the var index, or one var column whose empty values take the index name.
+   *
+   * @param {{varAxis: 'X'|'raw', column: string|null}} route
+   * @returns {Promise<{names: string[], renamed: Array<[string, string]>, filledFromIndex: number, source: string|null}>}
+   * @private
+   */
+  async _geneNames(route) {
+    const cacheKey = JSON.stringify([route.varAxis, route.column]);
+    const cached = this._geneNameSets.get(cacheKey);
+    if (cached !== undefined) return cached;
+    const generation = this._captureLifecycleGeneration();
+    const { index, values } = await this._loader.readVarNames(route.varAxis, route.column);
+    this._assertLifecycleGeneration(generation);
+    let unique;
+    try {
+      unique = makeUniqueNames(values, { index: route.column === null ? null : index });
+    } catch (error) {
+      const key = route.column ?? 'index';
+      throw new MappingLoadError(key, error.message.replace(/\.\s*$/, ''), error.message);
+    }
+    const result = Object.freeze({
+      names: unique.names,
+      renamed: unique.renamed,
+      filledFromIndex: unique.filledFromIndex,
+      source: route.column,
+    });
+    this._geneNameSets.set(cacheKey, result);
+    return result;
   }
 
   /**
@@ -2243,14 +2164,6 @@ export class BaseAnnDataAdapter {
           dtype: dtypeStr
         } = getCellucidCategoryStorage(fieldData.categories, key);
 
-        const sourceBytes = this._estimateObsFieldDataBytes(fieldData);
-        const outputBytes =
-          BigInt(fieldData.codes.length) *
-          BigInt(TypedArrayClass.BYTES_PER_ELEMENT);
-        this._assertObservationBudget(
-          this._obsMetadataRetainedBytes + sourceBytes + outputBytes,
-          `Observation field '${key}' categorical conversion`
-        );
         const codes = new TypedArrayClass(fieldData.codes.length);
         for (let i = 0; i < fieldData.codes.length; i++) {
           const code = fieldData.codes[i];
@@ -2290,24 +2203,29 @@ export class BaseAnnDataAdapter {
   }
 
   /**
-   * Get gene expression values
-   * @param {string} geneName - Gene name
+   * One gene's value in every cell, by its payload path: `var/{g}.values.f32`
+   * for the file's own gene list, or
+   * `_cellucid/mapping/genes/{axis}/{names}/var/{g}.values.f32`. The values
+   * depend only on the matrix and the gene's position on it, never on the
+   * name source.
+   *
+   * @param {string} path
    * @returns {Promise<Float32Array>}
    */
-  async getGeneExpression(geneName) {
+  async getGeneValues(path) {
     const generation = this._captureLifecycleGeneration();
-    if (this._loader.hasExpressionMatrix === false) {
-      throw new Error(
-        'This AnnData dataset does not contain an X expression matrix; gene expression is unavailable.'
-      );
+    const route = this._resolveGeneRoute(path, 'gene');
+    const names = await this._geneNames(route);
+    this._assertLifecycleGeneration(generation);
+    if (route.gene >= names.names.length) {
+      throw new RangeError(`This file has no gene ${route.gene} in ${route.element}.`);
     }
     return this._coalesceInFlight(
       this._geneExpressionInFlight,
-      geneName,
+      JSON.stringify([route.element, route.gene]),
       generation,
       async () => {
-        const result =
-          await this._loader.getGeneExpression(geneName);
+        const result = await this._loader.getMatrixColumn(route.element, route.gene);
         this._assertLifecycleGeneration(generation);
         return result;
       }
@@ -2315,93 +2233,146 @@ export class BaseAnnDataAdapter {
   }
 
   /**
-   * Get connectivity edges
+   * The outlier quantiles of one categorical obs field in one latent space,
+   * by its route `_cellucid/mapping/latent/{obsm}/obs/{field}.outliers.f32`:
+   * `obsm` is the latent space's catalog position and `field` the field's
+   * payload index. The latent space is read once, checked (every value finite
+   * and representable as float32) as the reader worker streams it from the
+   * file, of any size; the reader keeps it while it fits its memory budget.
+   * The quantiles are the rule `cellucid serve` computes
+   * (`data/latent-outliers.js`).
+   *
+   * @param {string} path
+   * @returns {Promise<Float32Array>}
+   */
+  async getLatentOutlierQuantiles(path) {
+    const generation = this._captureLifecycleGeneration();
+    const route = parseMappingLatentPath(path);
+    const item = route === null ? undefined : this._candidates?.obsm[route.obsmIndex];
+    if (item === undefined) {
+      throw new RangeError(`This dataset has no outlier payload '${path}'.`);
+    }
+    const reason = latentCandidateReason(item);
+    if (reason !== null) {
+      throw new MappingLoadError(item.key, reason, `obsm['${item.key}'] ${reason}.`);
+    }
+    const field = this._obsFieldsMetadata?.[route.fieldIndex];
+    if (field === undefined || field.kind !== 'category') {
+      throw new RangeError(`This dataset has no categorical obs field ${route.fieldIndex}.`);
+    }
+    return this._coalesceInFlight(
+      this._latentOutlierInFlight,
+      path,
+      generation,
+      async () => {
+        const fieldData = await this.getObsFieldData(field.key);
+        this._assertLifecycleGeneration(generation);
+        const { TypedArrayClass } = categoricalStorageForDtype(
+          fieldData.dtype,
+          `Categorical field '${field.key}'`
+        );
+        const quantiles = await this._loader.latentOutlierQuantiles(item.key, obsmWidth(item), {
+          codes: new TypedArrayClass(fieldData.data),
+          nCategories: fieldData.categories.length,
+          minPoints: LATENT_OUTLIER_MIN_POINTS,
+        });
+        this._assertLifecycleGeneration(generation);
+        return quantiles;
+      }
+    );
+  }
+
+  /**
+   * Get the edges of one neighbour graph, `obsp[key]`.
    *
    * Edge extraction is the most expensive read this adapter performs, so it
    * observes its caller's cancellation at every asynchronous boundary: a
    * cancelled request is released immediately and its extraction never starts,
    * leaving no partial payload and no retained working set behind.
    *
-   * @param {{signal?: AbortSignal|null}} [options]
-   * @returns {Promise<{sources: Uint32Array, destinations: Uint32Array, weights: Float64Array, nEdges: number}|null>}
+   * The graph is checked as it is extracted (finite, non-negative, zero
+   * diagonal, exactly symmetric) and never repaired. The default graph's
+   * edges are kept for the life of the file; of every other graph only the
+   * one asked for last is kept, so switching graphs never holds more than two
+   * (the viewer holds the graph it shows, so it is not read again).
+   * A graph other than the default that fails its check is a
+   * `MappingLoadError` naming the key, so that one choice is refused and the
+   * rest stay available.
+   *
+   * @param {{signal?: AbortSignal|null, key?: string}} [options] - `key`
+   *   defaults to the graph the file opens with, `obsp['connectivities']`.
+   * @returns {Promise<{sources: Uint32Array, destinations: Uint32Array, weights: Float64Array, nCells: number, nEdges: number, maxNeighbors: number}|null>}
+   *   Null when `obsp` has no such key.
    */
   async getConnectivityEdges(options = {}) {
+    if (options === null || typeof options !== 'object' || Array.isArray(options)) {
+      throw new TypeError('Connectivity edge options must be an object.');
+    }
+    const { key = DEFAULT_KNN_KEY, ...rest } = options;
+    requireObspKey(key);
     const signal = getMetadataLoadSignal(
-      options,
+      rest,
       'Direct AnnData connectivity edges'
     );
     throwIfMetadataAborted(signal, CONNECTIVITY_EDGE_LABEL);
     const generation = this._captureLifecycleGeneration();
     // Check if already computed.
-    if (this._connectivityCache !== undefined) {
-      const cached = this._connectivityCache;
+    if (this._connectivityCache.has(key)) {
+      const cached = this._connectivityCache.get(key);
       await Promise.resolve();
       this._assertLifecycleGeneration(generation);
       throwIfMetadataAborted(signal, CONNECTIVITY_EDGE_LABEL);
       return cached;
     }
 
+    const isDefault = key === DEFAULT_KNN_KEY;
     return waitForMetadata(
       this._coalesceInFlight(
         this._connectivityInFlight,
-        'edges',
+        key,
         generation,
         async workSignal => {
-          if (this._connectivityCache !== undefined) {
+          if (this._connectivityCache.has(key)) {
             this._assertLifecycleGeneration(generation);
-            return this._connectivityCache;
+            return this._connectivityCache.get(key);
           }
           throwIfMetadataAborted(workSignal, CONNECTIVITY_EDGE_LABEL);
 
           console.log(
-            '[BaseAnnDataAdapter] Loading connectivity edges...'
+            `[BaseAnnDataAdapter] Loading connectivity edges of obsp['${key}']...`
           );
 
-          const conn = await this._loader.getConnectivities();
+          // The reader extracts the edges where it holds the matrix (the
+          // AnnData reader worker), so checking and walking a graph of tens of
+          // millions of stored values never holds the page.
+          let edges;
+          try {
+            edges = await this._loader.getConnectivityEdges(key);
+          } catch (error) {
+            this._assertLifecycleGeneration(generation);
+            if (isDefault) throw error;
+            throw connectivityRefusal(key, error);
+          }
           this._assertLifecycleGeneration(generation);
-          // The only asynchronous boundary before extraction: past this point
-          // the matrix is walked and the edge payloads are allocated, so a
-          // cancelled request releases the loader payload here instead of
-          // materializing a graph nobody is waiting for.
           throwIfMetadataAborted(workSignal, CONNECTIVITY_EDGE_LABEL);
 
-          if (conn === null) {
+          if (edges === null) {
             console.log(
-              '[BaseAnnDataAdapter] No connectivity data available'
+              `[BaseAnnDataAdapter] obsp['${key}'] is absent`
             );
-            this._connectivityCache = null;
+            this._retainConnectivity(key, null, isDefault);
             return null;
           }
-          if (
-            !conn ||
-            typeof conn !== 'object' ||
-            Array.isArray(conn)
-          ) {
+          if (!edges || typeof edges !== 'object' || Array.isArray(edges)) {
             throw new TypeError(
-              'Connectivity loader must return an exact null absence or one matrix object'
+              'Connectivity loader must return an exact null absence or one edge list'
             );
           }
-
-          const isDense = conn.format === 'dense';
-
-          const storedEntries =
-            isDense ? conn.data?.length : conn.indices.length;
-          console.log(
-            `[BaseAnnDataAdapter] Connectivity matrix: ` +
-            `${conn.shape?.[0] || 'unknown'}x` +
-            `${conn.shape?.[1] || 'unknown'}, ` +
-            `${storedEntries ?? 'unknown'} stored values`
-          );
-
-          // Use shared utility for edge extraction.
-          const edges =
-            extractConnectivityEdges(conn, this._loader.nObs);
-
           console.log(
             `[BaseAnnDataAdapter] Extracted ${edges.nEdges} unique edges`
           );
 
-          this._connectivityCache = {
+          const result = {
             sources: edges.sources,
             destinations: edges.destinations,
             weights: edges.weights,
@@ -2409,8 +2380,8 @@ export class BaseAnnDataAdapter {
             nEdges: edges.nEdges,
             maxNeighbors: edges.maxNeighbors,
           };
-
-          return this._connectivityCache;
+          this._retainConnectivity(key, result, isDefault);
+          return result;
         },
         signal
       ),
@@ -2420,13 +2391,67 @@ export class BaseAnnDataAdapter {
   }
 
   /**
-   * Get gene names
-   * @returns {string[]}
+   * Keep one extracted graph: the default for the life of the file, any
+   * other in the single slot of the graph asked for last.
+   *
+   * @param {string} key
+   * @param {Object|null} edges
+   * @param {boolean} isDefault
+   * @private
    */
-  getGeneNames() {
-    return this._loader.hasExpressionMatrix === false
-      ? []
-      : this._loader.varNames;
+  _retainConnectivity(key, edges, isDefault) {
+    if (!isDefault) {
+      for (const cachedKey of [...this._connectivityCache.keys()]) {
+        if (cachedKey !== DEFAULT_KNN_KEY) {
+          this._connectivityCache.delete(cachedKey);
+        }
+      }
+    }
+    this._connectivityCache.set(key, edges);
+  }
+
+  /**
+   * The edge-pair manifest of one neighbour graph the candidate catalog
+   * lists, by its position in `candidates.obsp`
+   * (`_cellucid/mapping/knn/{p}/connectivity_manifest.json`). The graph is
+   * read and checked to count its edges; a graph that is unusable, absent or
+   * fails its check is a `MappingLoadError` naming the key.
+   *
+   * @param {number} obspIndex
+   * @param {{signal?: AbortSignal|null}} [options]
+   * @returns {Promise<Readonly<Object>>}
+   */
+  async getMappedConnectivityManifest(obspIndex, options = {}) {
+    const item = this.getMappingCandidates().obsp[obspIndex];
+    if (item === undefined) {
+      throw new RangeError(`This file has no obsp entry ${obspIndex}.`);
+    }
+    if (!item.usable) {
+      throw new MappingLoadError(
+        item.key,
+        item.reason,
+        `obsp['${item.key}'] ${item.reason}.`
+      );
+    }
+    const edges = await this.getConnectivityEdges({
+      signal: options.signal ?? null,
+      key: item.key,
+    });
+    if (edges === null) {
+      throw new MappingLoadError(
+        item.key,
+        'not present in this file',
+        `obsp['${item.key}'] is not present in this file.`
+      );
+    }
+    return Object.freeze(validateConnectivityManifest({
+      format: 'edge_pairs',
+      n_cells: edges.nCells,
+      n_edges: edges.nEdges,
+      max_neighbors: edges.maxNeighbors,
+      index_dtype: 'uint32',
+      index_bytes: Uint32Array.BYTES_PER_ELEMENT,
+    }, CONNECTIVITY_MANIFEST_CONTEXT.DIRECT));
   }
 
   /**
@@ -2440,12 +2465,14 @@ export class BaseAnnDataAdapter {
     this._vectorFieldInFlight.clear();
     this._connectivityInFlight.clear();
     this._geneExpressionInFlight.clear();
+    this._geneNameSets.clear();
+    this._latentOutlierInFlight.clear();
     this._embeddingCache.clear();
     this._vectorFieldCache.clear();
     this._resetCoordinateCacheOwner();
     this._obsFieldDataCache.clear();
     this._obsFieldDataCacheBytes = 0n;
-    this._connectivityCache = undefined;
+    this._connectivityCache.clear();
     this._normInfo.clear();
   }
 
@@ -2457,7 +2484,6 @@ export class BaseAnnDataAdapter {
     this.clearCaches();
     this._closed = true;
     this._obsFieldsMetadata = null;
-    this._obsMetadataRetainedBytes = 0n;
     this._loader.close();
   }
 }

@@ -25,8 +25,27 @@ import { ExpressionMatrixBuilder } from './expression-matrix-builder.js';
 import { ClusteringEngine } from './clustering-engine.js';
 import { MarkerCache } from './marker-cache.js';
 import { computeCategoryGroupingDigest } from '../data/data-layer.js';
+import {
+  isCategoricalCodes,
+  missingCategoryCode
+} from '../../../data/categorical-storage-contract.js';
 import { DEFAULTS, ANALYSIS_PHASES, ERROR_MESSAGES, formatError } from './constants.js';
 import { getDataSourceManager } from '../../../data/data-source-manager.js';
+
+/**
+ * The memory clustering may use: the run's analysis memory budget, the one
+ * marker discovery is bounded by (Performance settings), or its default.
+ *
+ * @param {{ memoryBudgetMB?: number }|undefined|null} batchConfig
+ * @returns {number} Bytes
+ */
+function clusteringBudgetBytes(batchConfig) {
+  const megabytes = batchConfig?.memoryBudgetMB ?? DEFAULTS.memoryBudgetMB;
+  if (!Number.isFinite(megabytes) || megabytes <= 0) {
+    throw new RangeError('The analysis memory budget must be a positive number of MB');
+  }
+  return Math.floor(megabytes * 2 ** 20);
+}
 
 // =============================================================================
 // GENES PANEL CONTROLLER
@@ -132,7 +151,7 @@ export class GenesPanelController {
       maxCategories: this._config.cacheMaxCategories,
       maxAgeDays: this._config.cacheMaxAgeDays,
       cacheVersion: this._config.cacheVersion,
-      datasetId: this._getDatasetId()
+      identity: this._getCacheIdentity()
     });
     const ownedCache = this._cache;
 
@@ -261,7 +280,7 @@ export class GenesPanelController {
 
       await this.init();
       throwIfAborted();
-      this._syncCacheDatasetId();
+      this._syncCacheIdentity();
 
       const reportProgress = onProgress === undefined
         ? undefined
@@ -414,6 +433,7 @@ export class GenesPanelController {
           clusterCols,
           distance,
           linkage,
+          memoryBudgetBytes: clusteringBudgetBytes(batchConfig),
           onProgress: reportProgress,
           signal
         });
@@ -476,7 +496,7 @@ export class GenesPanelController {
    *
    * @param {string} obsCategory
    * @param {{ onProgress?: Function, signal?: AbortSignal }} [options]
-   * @returns {Promise<{ groups: any[], obsCodes: Uint16Array }>}
+   * @returns {Promise<{ groups: any[], obsCodes: Uint8Array|Uint16Array|Uint32Array }>}
    */
   getGroupsAndCodes(obsCategory, options = {}) {
     return this._trackPublicOperation(() => {
@@ -618,7 +638,8 @@ export class GenesPanelController {
           clusterRows,
           clusterCols,
           distance,
-          linkage
+          linkage,
+          memoryBudgetBytes: clusteringBudgetBytes(metadata?.batchConfig)
         });
 
         // Apply ordering
@@ -773,12 +794,77 @@ export class GenesPanelController {
     return datasetId;
   }
 
-  _syncCacheDatasetId() {
-    if (!this._cache || typeof this._cache.setDatasetId !== 'function') {
-      throw new TypeError('Marker cache setDatasetId is required');
+  /**
+   * The data generation marker results belong to.
+   *
+   * A dataset id names a dataset, not the expression values a load brings: a
+   * re-export under the same id, or a re-saved file opened directly, shares
+   * the id with different data. A published export timestamp
+   * (`dataset_identity.json` `created_at`) identifies the generation across
+   * page loads, so only then may results persist. Without one, results are
+   * keyed to this page's load and kept in memory only.
+   * @private
+   */
+  /**
+   * The gene list marker results are computed over: the data mapping's
+   * expression matrix (an AnnData file's; a prepared export has one) and the
+   * gene names, which name every gene in a result. A result from one gene
+   * list is never served for another.
+   *
+   * @returns {[string|null, string]}
+   */
+  _getGeneAxisIdentity() {
+    const state = this.dataLayer?.state;
+    if (typeof state?.getDataMapping !== 'function') {
+      throw new TypeError('Marker analysis requires the data mapping of the open dataset');
     }
-    const id = this._getDatasetId();
-    this._cache.setDatasetId(id);
+    const mapping = state.getDataMapping();
+    if (mapping === null || typeof mapping !== 'object' || typeof mapping.geneNames !== 'string') {
+      throw new TypeError('Marker analysis requires the data mapping of the open dataset');
+    }
+    return [mapping.expression ?? null, mapping.geneNames];
+  }
+
+  _getCacheIdentity() {
+    const datasetId = this._getDatasetId();
+    const geneAxis = this._getGeneAxisIdentity();
+    const manager = getDataSourceManager();
+    if (
+      typeof manager.getCurrentMetadata !== 'function' ||
+      typeof manager.getCurrentSelectionRevision !== 'function'
+    ) {
+      throw new TypeError(
+        'The active dataset owner must publish its metadata and selection revision'
+      );
+    }
+    const metadata = manager.getCurrentMetadata();
+    const createdAt = metadata !== null &&
+      typeof metadata === 'object' &&
+      typeof metadata.created_at === 'string' &&
+      metadata.created_at.length > 0
+      ? metadata.created_at
+      : null;
+    if (createdAt !== null) {
+      return {
+        key: JSON.stringify(['export', datasetId, createdAt, geneAxis]),
+        persistent: true,
+      };
+    }
+    const revision = manager.getCurrentSelectionRevision();
+    if (!Number.isSafeInteger(revision) || revision < 0) {
+      throw new TypeError('The dataset selection revision must be a non-negative integer');
+    }
+    return {
+      key: JSON.stringify(['load', datasetId, revision, geneAxis]),
+      persistent: false,
+    };
+  }
+
+  _syncCacheIdentity() {
+    if (!this._cache || typeof this._cache.setIdentity !== 'function') {
+      throw new TypeError('Marker cache setIdentity is required');
+    }
+    this._cache.setIdentity(this._getCacheIdentity());
   }
 
   _extractTopNGenes(markers, topNPerGroup) {
@@ -896,7 +982,7 @@ export class GenesPanelController {
 
     const { codes, categories, colors = {} } = fieldData;
 
-    if (!(codes instanceof Uint16Array) || codes.length === 0) {
+    if (!isCategoricalCodes(codes) || codes.length === 0) {
       throw new Error(formatError(ERROR_MESSAGES.NO_CATEGORICAL_OBS));
     }
 
@@ -946,7 +1032,8 @@ export class GenesPanelController {
     // 2) allocate fixed-size Uint32Array per group
     // 3) fill indices without per-cell push overhead
     const countsByCode = new Uint32Array(catCount);
-    const missingCode = 65535;
+    // Codes are read at the field's own width, and so is its missing code.
+    const missingCode = missingCategoryCode(codes);
 
     for (let i = 0; i < codes.length; i++) {
       const code = codes[i];
@@ -1144,6 +1231,7 @@ export class GenesPanelController {
         clusterCols,
         distance,
         linkage,
+        memoryBudgetBytes: clusteringBudgetBytes(batchConfig),
         onProgress,
         signal
       });
@@ -1180,19 +1268,3 @@ export class GenesPanelController {
     return palette[index % palette.length];
   }
 }
-
-// =============================================================================
-// FACTORY FUNCTION
-// =============================================================================
-
-/**
- * Create a GenesPanelController instance
- *
- * @param {Object} options - Same options as GenesPanelController constructor
- * @returns {GenesPanelController}
- */
-export function createGenesPanelController(options) {
-  return new GenesPanelController(options);
-}
-
-export default GenesPanelController;

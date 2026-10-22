@@ -10,13 +10,16 @@
 import { initHighlightPagesUI } from './highlight/highlight-pages-ui.js';
 import { initHighlightSelectionTools } from './highlight/highlight-selection-tools.js';
 import { initHighlightSummaryUI } from './highlight/highlight-summary-ui.js';
+import { annotationFieldKindForPane } from './highlight/annotation-cells.js';
+import { viewerNeedsUiRetirement } from '../core/viewer-lifecycle.js';
 import {
-  requireCallback,
   requireDomElement,
   requireExactKeys,
   requireJupyterSource,
   requireMethods,
-  requireModeButtons
+  requireModeButtons,
+  SELECT_MODE_DOM_KEYS,
+  pickSelectModeDom
 } from './highlight/exact-contract.js';
 
 const REQUIRED_STATE_METHODS = Object.freeze([
@@ -40,17 +43,15 @@ const REQUIRED_STATE_METHODS = Object.freeze([
   'clearPreviewHighlight',
   'setPreviewHighlightFromIndices',
   'addHighlightDirect',
-  'getCategoryForCell',
   'getCellIndicesForCategory',
-  'getValueForCell',
   'getCellIndicesForRange',
+  'getFieldForView',
   'getActiveViewId',
   'on'
 ]);
 
 const REQUIRED_VIEWER_METHODS = Object.freeze([
-  'getHighlightMode',
-  'setHighlightMode',
+  'setViewFieldKindSource',
   'getViewTransparency',
   'setSelectionStepCallback',
   'setSelectionPreviewCallback',
@@ -97,35 +98,28 @@ export function initHighlightControls(options) {
   requireExactKeys(
     dom,
     [
-      'countEl',
+      'countEls',
       'groupsEl',
-      'clearAllBtn',
+      'clearButtons',
       'pagesTabsEl',
       'addPageBtn',
       'modeButtons',
-      'modeDescription'
+      'modeDescription',
+      ...SELECT_MODE_DOM_KEYS
     ],
     'Highlight DOM'
   );
   const {
-    countEl: highlightCountEl,
     groupsEl: highlightedGroupsEl,
-    clearAllBtn: clearAllHighlightsBtn,
     pagesTabsEl: highlightPagesTabsEl,
     addPageBtn: addHighlightPageBtn,
     modeButtons: highlightModeButtons,
     modeDescription: highlightModeDescription
   } = dom;
-  requireDomElement(highlightCountEl, 'Highlight count element');
   requireDomElement(
     highlightedGroupsEl,
     'Highlighted groups element',
     ['appendChild']
-  );
-  requireDomElement(
-    clearAllHighlightsBtn,
-    'Clear highlights button',
-    ['addEventListener']
   );
   requireDomElement(
     highlightPagesTabsEl,
@@ -151,9 +145,9 @@ export function initHighlightControls(options) {
   const summaryUi = initHighlightSummaryUI({
     state,
     dom: {
-      countEl: highlightCountEl,
+      countEls: dom.countEls,
       groupsEl: highlightedGroupsEl,
-      clearAllBtn: clearAllHighlightsBtn
+      clearButtons: dom.clearButtons
     }
   });
 
@@ -173,76 +167,39 @@ export function initHighlightControls(options) {
     jupyterSource,
     dom: {
       modeButtons: highlightModeButtons,
-      modeDescription: highlightModeDescription
+      modeDescription: highlightModeDescription,
+      ...pickSelectModeDom(dom)
     },
     renderHighlightSummary,
     renderHighlightPages
   });
 
-  let destroyed = false;
   let destructionPromise = null;
 
-  /**
-   * The renderer's highlight mode implied by the field the app is colouring by.
-   *
-   * @returns {'none'|'continuous'|'categorical'}
-   */
-  function highlightModeForActiveField() {
-    const activeField = state.getActiveField();
-    if (activeField === null) return 'none';
-    if (activeField.kind === 'continuous') return 'continuous';
-    if (activeField.kind === 'category') return 'categorical';
-    throw new TypeError(
-      `Unknown active highlight field kind: ${activeField.kind}.`
-    );
-  }
-
-  /**
-   * Publish the mode the current active field implies, if it is not already
-   * the one the renderer holds.
-   *
-   * Republishing a mode the renderer already has is not free: `setHighlightMode`
-   * drops `selectionDragStart` and resets the renderer's annotation step
-   * counter, so a gesture in the user's hand would be thrown away by an
-   * unrelated filter change. Comparing first is what makes this safe to run on
-   * every visibility event, and it reads the renderer rather than a local copy
-   * so a divergence from any source is corrected rather than assumed absent.
-   */
-  function updateHighlightMode() {
-    if (destroyed) return;
-    const mode = highlightModeForActiveField();
-    if (viewer.getHighlightMode() === mode) return;
-    viewer.setHighlightMode(mode);
-  }
-
-  // The renderer's highlight mode is a cache of the active field's kind: with
-  // no field, `handleMouseDown` discards every Alt gesture before any tool sees
-  // it. Nothing in DataState announces "the active field changed", but
-  // `setActiveField`, `setActiveVarField` and `clearActiveField` all run
-  // `computeGlobalVisibility()`, which ends in `visibility:changed` — the same
-  // signal `annotation-selection.js` already follows to decide whether the
-  // panel may invite a click. Following it here too is what keeps the invitation
-  // and the renderer from disagreeing: every path that activates a field
-  // reaches this, including the ones that bypass the field selector's change
-  // event (a published dataset's default state, a loaded session, a Jupyter
-  // command), which is where the panel used to promise a gesture the renderer
-  // then dropped in silence.
-  const unsubscribeVisibility = state.on(
-    'visibility:changed',
-    updateHighlightMode
-  );
-  requireCallback(
-    unsubscribeVisibility,
-    'Highlight mode visibility unsubscribe'
+  // Whether an annotation press can start, and which cursor the armed tool
+  // shows, is a question about the pane under the pointer: in a grid every
+  // pane may be colored by a different field, or by none, and a selection
+  // gesture never moves focus. The renderer therefore reads each pane's field
+  // kind from the state at the moment it needs it. There is nothing to
+  // publish when a field changes — by any path: the field selector, a
+  // dataset's default state, Load State, a Jupyter command — and no cached
+  // kind that could disagree with the panel's invitation.
+  viewer.setViewFieldKindSource(
+    viewId => annotationFieldKindForPane(state, viewId)
   );
 
   function destroy() {
     if (destructionPromise !== null) return destructionPromise;
-    destroyed = true;
     const failures = [];
     const pending = [];
     for (const operation of [
-      () => unsubscribeVisibility(),
+      () => {
+        // A retired panel must not keep the viewer reading a state it no
+        // longer owns.
+        if (viewerNeedsUiRetirement(viewer)) {
+          viewer.setViewFieldKindSource(() => 'none');
+        }
+      },
       () => selectionTools.destroy(),
       () => pagesUi.destroy(),
       () => summaryUi.destroy()
@@ -279,7 +236,6 @@ export function initHighlightControls(options) {
   return {
     renderHighlightSummary,
     renderHighlightPages,
-    updateHighlightMode,
     destroy
   };
 }

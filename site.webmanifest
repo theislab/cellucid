@@ -1,7 +1,7 @@
 {
-  "name": "cellucid",
-  "short_name": "cellucid",
-  "description": "Interactive Single-Cell Data Visualization",
+  "name": "Cellucid",
+  "short_name": "Cellucid",
+  "description": "Interactive single-cell data visualization in your browser: millions of cells in 2D and 3D UMAP and other embeddings.",
   "start_url": "/",
   "id": "/",
   "display": "standalone",

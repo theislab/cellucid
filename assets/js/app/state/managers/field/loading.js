@@ -2,7 +2,8 @@
  * @fileoverview DataState field loading + activation.
  *
  * Responsibilities:
- * - Materialize obs/var field arrays via loader functions (with LRU caching)
+ * - Materialize obs/var field arrays via loader functions (byte-bounded
+ *   residency: see ./residency.js)
  * - Support user-defined continuous aliases by copying from stable source keys
  * - Activate a field as the current coloring/filter driver
  *
@@ -15,10 +16,19 @@ import { getNotificationCenter } from '../../../notification-center.js';
 import { FieldKind, FieldSource } from '../../../utils/field-constants.js';
 import { getFieldRegistry } from '../../../utils/field-registry.js';
 import { adoptScientificFieldDescriptors } from './descriptor-ownership.js';
+import { requireOutlierQuantiles } from '../color-outliers.js';
+import {
+  FetchScheduler,
+  requirePriority
+} from '../../../../data/fetch-scheduler.js';
+import {
+  releaseInactiveFieldsOverBudget,
+  touchFieldResidency,
+} from './residency.js';
 
 const sharedLoadOwners = new WeakMap();
 
-export const DATASET_FIELD_LOAD_SUPERSEDED_CODE =
+const DATASET_FIELD_LOAD_SUPERSEDED_CODE =
   'CELLUCID_DATASET_FIELD_LOAD_SUPERSEDED';
 
 export function createDatasetFieldLoadSupersededError() {
@@ -32,6 +42,26 @@ export function createDatasetFieldLoadSupersededError() {
 
 export function isDatasetFieldLoadSupersededError(error) {
   return error?.code === DATASET_FIELD_LOAD_SUPERSEDED_CODE;
+}
+
+/** @type {WeakMap<object, {generation: number, scheduler: FetchScheduler}>} */
+const fetchSchedulers = new WeakMap();
+
+/**
+ * The download scheduler of the state's current dataset generation. A new
+ * generation (a dataset replaced) closes the previous scheduler, which aborts
+ * and rejects every download it still held, and starts an empty one: no key,
+ * slot or in-flight count of one dataset reaches the next.
+ */
+function fetchSchedulerOf(state) {
+  const generation = readDatasetGeneration(state);
+  let entry = fetchSchedulers.get(state);
+  if (entry?.generation !== generation) {
+    entry?.scheduler.close(createDatasetFieldLoadSupersededError());
+    entry = { generation, scheduler: new FetchScheduler() };
+    fetchSchedulers.set(state, entry);
+  }
+  return entry.scheduler;
 }
 
 function readDatasetGeneration(state) {
@@ -82,6 +112,21 @@ function awaitWithSignal(task, signal) {
       error => finish(reject, error)
     );
   });
+}
+
+/**
+ * A download progress callback that fills the loading notification's bar once
+ * the download's size is known, a whole percent at a time.
+ */
+function progressReporter(notifications, notifId) {
+  let lastPercent = -1;
+  return (loadedBytes, totalBytes) => {
+    if (!(totalBytes > 0)) return;
+    const percent = Math.min(100, Math.floor((loadedBytes / totalBytes) * 100));
+    if (percent === lastPercent) return;
+    lastPercent = percent;
+    notifications.updateProgress(notifId, percent);
+  };
 }
 
 function createSharedLoadOwner() {
@@ -304,6 +349,7 @@ export class FieldLoadingMethods {
       field.loaded = true;
       field._loadingPromise = null;
       this._fieldDataCache.set(cacheKey, { values: field.values, outlierQuantiles: field.outlierQuantiles });
+      touchFieldResidency(this, FieldSource.OBS, cacheKey);
       return field;
     }
 
@@ -315,6 +361,7 @@ export class FieldLoadingMethods {
           outlierQuantiles: field.outlierQuantiles
         });
       }
+      touchFieldResidency(this, FieldSource.OBS, cacheKey);
       return field;
     }
     if (field._loadingPromise) {
@@ -337,6 +384,7 @@ export class FieldLoadingMethods {
       if (cached.codes) field.codes = cached.codes;
       if (cached.outlierQuantiles) field.outlierQuantiles = cached.outlierQuantiles;
       field.loaded = true;
+      touchFieldResidency(this, FieldSource.OBS, cacheKey);
       return field;
     }
 
@@ -365,8 +413,17 @@ export class FieldLoadingMethods {
     task = Promise.resolve()
       .then(() => {
         if (sharedSignal.aborted) throw abortReason(sharedSignal);
+        // An observation field is what a view is about to show: it goes
+        // through the download scheduler as a foreground load, so a long
+        // analysis run's gene downloads wait while it arrives
+        // (data/fetch-scheduler.js).
         return awaitWithSignal(
-          loader(loaderField, { signal: sharedSignal }),
+          fetchSchedulerOf(this).run({
+            key: sharedOwner,
+            priority: 'normal',
+            signal: sharedSignal,
+            start: downloadSignal => loader(loaderField, { signal: downloadSignal })
+          }),
           sharedSignal
         );
       })
@@ -411,6 +468,7 @@ export class FieldLoadingMethods {
           codes: field.codes,
           outlierQuantiles: field.outlierQuantiles
         });
+        touchFieldResidency(this, FieldSource.OBS, cacheKey);
         if (notifId) notifications.complete(notifId, `Loaded field: ${field.key}`);
         return field;
       })
@@ -448,13 +506,20 @@ export class FieldLoadingMethods {
    * @param {number} fieldIndex - Index of the field in varData.fields
    * @param {Object} [options] - Options
    * @param {boolean} [options.silent=false] - If true, suppress notifications (for batch operations)
+   * @param {'high'|'normal'|'bulk'|'low'} [options.priority='normal'] - How
+   *   urgently the gene is needed (data/fetch-scheduler.js): `high` for a gene
+   *   the user chose and waits to see, `bulk` for one of a long run's genes,
+   *   `low` for a prefetch. A caller joining a load already under way raises
+   *   its priority.
    * @returns {Promise<Object>} The loaded field object
    */
   async ensureVarFieldLoaded(fieldIndex, options = {}) {
     const {
       signal: rawSignal = null,
-      silent = false
+      silent = false,
+      priority = 'normal'
     } = options;
+    requirePriority(priority);
     const signal = requireAbortSignal(rawSignal);
     if (signal?.aborted) throw abortReason(signal);
     const field = this.varData?.fields?.[fieldIndex];
@@ -499,6 +564,7 @@ export class FieldLoadingMethods {
       field.loaded = true;
       field._loadingPromise = null;
       this._varFieldDataCache.set(cacheKey, { values: field.values });
+      touchFieldResidency(this, FieldSource.VAR, cacheKey);
       return field;
     }
 
@@ -506,6 +572,7 @@ export class FieldLoadingMethods {
       if (!this._varFieldDataCache.has(cacheKey)) {
         this._varFieldDataCache.set(cacheKey, { values: field.values });
       }
+      touchFieldResidency(this, FieldSource.VAR, cacheKey);
       return field;
     }
     if (field._loadingPromise) {
@@ -514,6 +581,9 @@ export class FieldLoadingMethods {
         activeOwner?.task === field._loadingPromise
         && activeOwner.controller.signal.aborted === false
       ) {
+        // A gene prefetched, or queued by a long run, that the user now
+        // waits for goes first.
+        fetchSchedulerOf(this).raise(activeOwner, priority);
         return subscribeToSharedLoad(activeOwner, signal);
       }
       if (activeOwner?.task !== field._loadingPromise) {
@@ -526,6 +596,7 @@ export class FieldLoadingMethods {
     if (cached) {
       if (cached.values) field.values = cached.values;
       field.loaded = true;
+      touchFieldResidency(this, FieldSource.VAR, cacheKey);
       return field;
     }
 
@@ -554,8 +625,22 @@ export class FieldLoadingMethods {
     task = Promise.resolve()
       .then(() => {
         if (sharedSignal.aborted) throw abortReason(sharedSignal);
+        // One download scheduler for every gene load (data/fetch-scheduler.js):
+        // a gene the user waits for starts at once and holds back new
+        // downloads of long runs and prefetches until it has arrived.
         return awaitWithSignal(
-          loader(loaderField, { signal: sharedSignal }),
+          fetchSchedulerOf(this).run({
+            key: sharedOwner,
+            priority,
+            signal: sharedSignal,
+            start: (downloadSignal, startPriority) => loader(loaderField, {
+              signal: downloadSignal,
+              priority: startPriority,
+              // A gene the user is waiting for shows how much of it has
+              // arrived (a percent per step, not a DOM update per chunk).
+              onProgress: notifId === null ? null : progressReporter(notifications, notifId)
+            })
+          }),
           sharedSignal
         );
       })
@@ -579,6 +664,7 @@ export class FieldLoadingMethods {
           field._loadingSignal = null;
         }
         this._varFieldDataCache.set(cacheKey, { values: field.values });
+        touchFieldResidency(this, FieldSource.VAR, cacheKey);
         if (notifId) notifications.complete(notifId, `Loaded gene: ${field.key}`);
         return field;
       })
@@ -609,6 +695,50 @@ export class FieldLoadingMethods {
     field._loadingPromise = task;
     field._loadingSignal = sharedSignal;
     return subscribeToSharedLoad(sharedOwner, signal);
+  }
+
+  /**
+   * Download a gene's payload ahead of decoding it, for a long run that will
+   * ask for it soon: the bytes are kept by the dataset load's payload cache
+   * (data/payload-transfer-cache.js) and the later `ensureVarFieldLoaded`
+   * decodes them without a request.
+   *
+   * Two answers fetch nothing, and they mean different things to the run: a
+   * gene already loaded or loading, or a user-defined copy, needs nothing
+   * (`{resident: true}`; the run goes on downloading the genes after it),
+   * while a source with nothing to download ahead (a local file, a served
+   * AnnData) answers null, and the run stops downloading ahead.
+   *
+   * @param {number} fieldIndex
+   * @param {{signal?: AbortSignal|null}} [options]
+   * @returns {Promise<{kept: boolean, byteLength: number, budget: number}|{resident: true}|null>}
+   *   What the cache did with the download, that this gene needs none, or
+   *   null when the source downloads nothing ahead
+   */
+  async prefetchVarFieldPayload(fieldIndex, options = {}) {
+    const signal = requireAbortSignal(options.signal ?? null);
+    if (signal?.aborted) throw abortReason(signal);
+    const field = this.varData?.fields?.[fieldIndex];
+    if (!field) throw new Error(`Var field ${fieldIndex} is not available.`);
+    if (field.loaded || field._loadingPromise || field._isUserDefined === true) {
+      return { resident: true };
+    }
+    const loaderField = this._varFieldDescriptors?.[fieldIndex];
+    const loader = this.varFieldLoader;
+    if (!loaderField || !loader) return null;
+    const result = await fetchSchedulerOf(this).run({
+      key: {},
+      priority: 'bulk',
+      signal,
+      start: (downloadSignal, startPriority) => loader(loaderField, {
+        signal: downloadSignal,
+        priority: startPriority,
+        prefetchOnly: true
+      })
+    });
+    return result?.kept === undefined
+      ? null
+      : { kept: result.kept, byteLength: result.byteLength, budget: result.budget };
   }
 
   /**
@@ -704,21 +834,28 @@ export class FieldLoadingMethods {
       this.clearCentroids();
     } else {
       this.updateColorsCategorical(field);
-      this.buildCentroidsForField(field, { viewId: this.activeViewId });
+      this.buildCentroidsForField(field, {
+        viewId: this.activeViewId,
+        layoutKey: this.getViewLayoutKey(this.activeViewId)
+      });
     }
 
-    if (field.outlierQuantiles && field.outlierQuantiles.length > 0) {
-      if (field._outlierThreshold == null) field._outlierThreshold = 1.0;
+    if (field.outlierQuantiles !== undefined && field.outlierQuantiles !== null) {
+      // Proven once per decoded array; every later filter pass reads it as is.
+      requireOutlierQuantiles(field.outlierQuantiles, this.pointCount);
+      if (field.outlierQuantiles.length > 0 && field._outlierThreshold == null) {
+        field._outlierThreshold = 1.0;
+      }
     }
 
-    this.updateOutlierQuantiles();
     this._pushColorsToViewer();
     this._pushCentroidsToViewer();
     this.computeGlobalVisibility();
     this._syncActiveContext();
     this._pushActiveViewLabelToViewer();
+    releaseInactiveFieldsOverBudget(this);
 
-    const currentCentroids = this._getCentroidsForCurrentDim(field);
+    const currentCentroids = this._getCentroidsForActiveLayout(field);
     const centroidInfo =
       field.kind === 'category' && currentCentroids.length > 0 ? ` • Centroids: ${currentCentroids.length}` : '';
     return {
@@ -743,12 +880,12 @@ export class FieldLoadingMethods {
     this.updateColorsContinuous(field, { resetTransparency: true });
     this.clearCentroids();
 
-    this.updateOutlierQuantiles();
     this._pushColorsToViewer();
     this._pushCentroidsToViewer();
     this.computeGlobalVisibility();
     this._syncActiveContext();
     this._pushActiveViewLabelToViewer();
+    releaseInactiveFieldsOverBudget(this);
 
     return {
       field,
@@ -766,41 +903,5 @@ export class FieldLoadingMethods {
     if (idx == null || idx < 0) return { field: null, source: null, index: -1 };
     const field = this.obsData?.fields?.[idx];
     return { field, source: 'obs', index: idx };
-  }
-
-  updateOutlierQuantiles() {
-    if (!this.pointCount || !this.obsData || !this.obsData.fields) return;
-
-    const activeField = this.activeFieldSource === 'obs' ? this.getActiveField() : null;
-    const source = activeField?.outlierQuantiles;
-    if (source !== undefined && source !== null) {
-      if (!(source instanceof Float32Array) || source.length !== this.pointCount) {
-        throw new TypeError(
-          'Active outlier filtering requires one Float32 quantile per observation.'
-        );
-      }
-      for (let index = 0; index < source.length; index++) {
-        const quantile = source[index];
-        if (
-          !Number.isFinite(quantile)
-          || (quantile !== -1 && (quantile < 0 || quantile > 1))
-        ) {
-          throw new RangeError(
-            `Active-field outlier quantile ${index} must be -1 or a finite value from 0 through 1.`
-          );
-        }
-      }
-    }
-
-    if (!this.outlierQuantilesArray || this.outlierQuantilesArray.length !== this.pointCount) {
-      this.outlierQuantilesArray = new Float32Array(this.pointCount);
-    }
-    if (source instanceof Float32Array) {
-      this.outlierQuantilesArray.set(source);
-    } else {
-      this.outlierQuantilesArray.fill(-1.0);
-    }
-
-    this._syncActiveContext();
   }
 }

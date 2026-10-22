@@ -15,6 +15,7 @@ import {
   categoricalStorageForCodes,
   categoricalStorageForCount
 } from '../../data/categorical-storage-contract.js';
+import { isCategoricalCodes } from '../../data/categorical-storage-contract.js';
 
 function requireCategories(categories) {
   if (!Array.isArray(categories) || categories.length === 0) {
@@ -52,7 +53,7 @@ function requireCategories(categories) {
  * @param {{unassignedLabel: string}} options
  * @returns {{
  *   categories: Array<string|number|boolean>,
- *   mapping: Uint16Array,
+ *   mapping: Uint32Array,
  *   unassignedNewIndex: number,
  *   keptOldUnassignedIndex: number|null,
  *   mergedOldIndices: number[]
@@ -85,7 +86,7 @@ export function buildDeleteToUnassignedTransform(categories, deleteIndex, option
     throw new Error('Cannot delete the unassigned category');
   }
 
-  const mapping = new Uint16Array(oldCount);
+  const mapping = new Uint32Array(oldCount);
   const newCategories = [];
   let unassignedNewIndex = -1;
 
@@ -128,7 +129,7 @@ export function buildDeleteToUnassignedTransform(categories, deleteIndex, option
  * @param {number} toIndex
  * @returns {{
  *   categories: Array<string|number|boolean>,
- *   mapping: Uint16Array,
+ *   mapping: Uint32Array,
  *   targetNewIndex: number
  * }}
  */
@@ -147,7 +148,7 @@ export function buildMergeCategoriesTransform(categories, fromIndex, toIndex) {
   }
 
   const targetNewIndex = toIndex > fromIndex ? toIndex - 1 : toIndex;
-  const mapping = new Uint16Array(oldCount);
+  const mapping = new Uint32Array(oldCount);
 
   for (let i = 0; i < oldCount; i++) {
     if (i === fromIndex) {
@@ -165,17 +166,17 @@ export function buildMergeCategoriesTransform(categories, fromIndex, toIndex) {
 /**
  * Apply an old-index -> new-index mapping to a codes array.
  *
- * @param {Uint8Array|Uint16Array} codes
- * @param {Uint16Array} mapping
+ * @param {Uint8Array|Uint16Array|Uint32Array} codes
+ * @param {Uint32Array} mapping
  * @param {number} newCategoryCount
- * @returns {Uint8Array|Uint16Array}
+ * @returns {Uint8Array|Uint16Array|Uint32Array}
  */
 export function applyCategoryIndexMapping(codes, mapping, newCategoryCount) {
-  if (!(codes instanceof Uint8Array) && !(codes instanceof Uint16Array)) {
-    throw new TypeError('Category remapping requires Uint8Array or Uint16Array codes.');
+  if (!isCategoricalCodes(codes)) {
+    throw new TypeError('Category remapping requires Uint8Array, Uint16Array or Uint32Array codes.');
   }
-  if (!(mapping instanceof Uint16Array) || mapping.length === 0) {
-    throw new TypeError('Category remapping requires a nonempty Uint16Array mapping.');
+  if (!(mapping instanceof Uint32Array) || mapping.length === 0) {
+    throw new TypeError('Category remapping requires a nonempty Uint32Array mapping.');
   }
   if (!Number.isSafeInteger(newCategoryCount) || newCategoryCount < 1) {
     throw new RangeError('Category remapping requires at least one category.');

@@ -3,11 +3,14 @@ import test from 'node:test';
 
 import {
   DEFAULT_COLORMAP_ID,
-  sampleContinuousColormap,
+  getColormap,
 } from '../assets/js/data/palettes.js';
 import {
   UserDefinedFieldsRegistry,
 } from '../assets/js/app/registries/user-defined-fields.js';
+import {
+  DimensionManager,
+} from '../assets/js/data/dimension-manager.js';
 import {
   FieldCategoryOpsMethods,
 } from '../assets/js/app/state/managers/field/category-ops.js';
@@ -45,6 +48,34 @@ import {
   buildMergeCategoriesTransform,
 } from '../assets/js/app/utils/categorical-ops.js';
 
+/**
+ * A v3 dataset whose one embedding is the 2D item "X_umap_2d" (the layout key
+ * is the embedding id), with its normalized coordinates resident so
+ * user-defined centroids can be computed from them.
+ */
+function residentLayoutManager(positions) {
+  const manager = new DimensionManager({
+    embeddingsMetadata: {
+      default_dimension: 2,
+      defaults: { '2d': 'X_umap_2d' },
+      items: {
+        X_umap_2d: {
+          label: 'UMAP',
+          dimension: 2,
+          file: 'embeddings/0_2d.bin',
+          source: { key: 'X_umap', columns: [0, 1] },
+        },
+      },
+    },
+  });
+  assert.deepEqual(
+    manager.getLayoutsForDimension(2).map(layout => layout.layoutKey),
+    ['X_umap_2d'],
+  );
+  manager.normalizedPositionCache.set('X_umap_2d', positions);
+  return manager;
+}
+
 function exactContinuousField(values) {
   return {
     key: 'score',
@@ -70,16 +101,16 @@ test('field overlays preserve valid category-keyed centroid subsets by identity'
     key: 'cell_type',
     kind: 'category',
     categories: ['alpha', 'beta', 'gamma'],
-    centroidsByDim: {
-      1: [
+    centroidsByLayout: new Map([
+      ['X_umap_1d', [
         { category: 'alpha', position: [0], n_points: 4 },
         { category: 'gamma', position: [1], n_points: 2 },
-      ],
-      2: [
+      ]],
+      ['X_umap_2d', [
         { category: 'alpha', position: [0, 0], n_points: 4 },
         { category: 'gamma', position: [1, 1], n_points: 2 },
-      ],
-    },
+      ]],
+    ]),
   };
   const categoryRenames = new Map();
   const state = Object.assign(
@@ -108,7 +139,7 @@ test('field overlays preserve valid category-keyed centroid subsets by identity'
     () => state._applyOverlaysToFields([field], FieldSource.OBS),
   );
   assert.deepEqual(
-    field.centroidsByDim['1'].map(centroid => centroid.category),
+    field.centroidsByLayout.get('X_umap_1d').map(centroid => centroid.category),
     ['alpha', 'gamma'],
   );
 
@@ -116,11 +147,11 @@ test('field overlays preserve valid category-keyed centroid subsets by identity'
   state._applyOverlaysToFields([field], FieldSource.OBS);
   assert.deepEqual(field.categories, ['alpha', 'beta', 'gamma cells']);
   assert.deepEqual(
-    field.centroidsByDim['1'].map(centroid => centroid.category),
+    field.centroidsByLayout.get('X_umap_1d').map(centroid => centroid.category),
     ['alpha', 'gamma cells'],
   );
   assert.deepEqual(
-    field.centroidsByDim['2'].map(centroid => centroid.category),
+    field.centroidsByLayout.get('X_umap_2d').map(centroid => centroid.category),
     ['alpha', 'gamma cells'],
   );
 
@@ -128,7 +159,7 @@ test('field overlays preserve valid category-keyed centroid subsets by identity'
   state._applyOverlaysToFields([field], FieldSource.OBS);
   assert.deepEqual(field.categories, ['alpha', 'beta', 'gamma']);
   assert.deepEqual(
-    field.centroidsByDim['1'].map(centroid => centroid.category),
+    field.centroidsByLayout.get('X_umap_1d').map(centroid => centroid.category),
     ['alpha', 'gamma'],
   );
 });
@@ -285,14 +316,11 @@ test('category builder treats zero cells as an exact disabled startup state', ()
             },
           },
         },
-        item: {
-          classList: {
-            remove(name) {
-              classStates.set(name, false);
-            },
-          },
-        },
       },
+      _setExpanded(expanded) {
+        this.expandedStates.push(expanded);
+      },
+      expandedStates: [],
       _renderDroppedItems() {
         this.renderCalls += 1;
       },
@@ -311,6 +339,7 @@ test('category builder treats zero cells as an exact disabled startup state', ()
   assert.equal(classStates.get('disabled'), true);
   assert.deepEqual(builder._droppedPages, []);
   assert.equal(builder._isOpen, false);
+  assert.deepEqual(builder.expandedStates, [false]);
   assert.equal(builder.renderCalls, 1);
   assert.equal(builder.previewCalls, 1);
 
@@ -409,7 +438,7 @@ test('continuous color metadata preserves constant domains and rejects impossibl
     {
       pointCount: 2,
       colorsArray: new Uint8Array(8),
-      categoryTransparency: Float32Array.from([1, 1]),
+      categoryTransparency: Uint8Array.from([1, 1]),
     },
   );
 
@@ -420,7 +449,7 @@ test('continuous color metadata preserves constant domains and rejects impossibl
   assert.deepEqual(constantField._continuousStats, { min: 5, max: 5 });
   assert.deepEqual(constantField._continuousFilter, { min: 5, max: 5 });
   assert.deepEqual(constantField._continuousColorRange, { min: 5, max: 5 });
-  const expectedMidpoint = sampleContinuousColormap(DEFAULT_COLORMAP_ID, 0.5)
+  const expectedMidpoint = getColormap(DEFAULT_COLORMAP_ID).sample(0.5)
     .map(channel => Math.round(channel * 255));
   assert.deepEqual(Array.from(colorState.colorsArray.slice(0, 3)), expectedMidpoint);
   assert.deepEqual(Array.from(colorState.colorsArray.slice(4, 7)), expectedMidpoint);
@@ -446,7 +475,7 @@ test('continuous color metadata preserves constant domains and rejects impossibl
     {
       pointCount: 2,
       colorsArray: untouchedColors,
-      categoryTransparency: Float32Array.from([1, 1]),
+      categoryTransparency: Uint8Array.from([1, 1]),
       getContinuousFieldRef() {
         return { field: nonpositiveField };
       },
@@ -529,7 +558,7 @@ test('categorical color metadata rejects incomplete state without repairing it',
     9, 8, 7, 6,
     5, 4, 3, 2,
   ]);
-  const previousTransparency = Float32Array.from([0.25, 0.75]);
+  const previousTransparency = Uint8Array.from([0, 1]);
   const coloringState = Object.assign(
     Object.create(DataStateColorMethods.prototype),
     {
@@ -555,7 +584,7 @@ test('categorical color metadata rejects incomplete state without repairing it',
   );
   assert.deepEqual(
     Array.from(coloringState.categoryTransparency),
-    [0.25, 0.75],
+    [0, 1],
   );
 });
 
@@ -569,23 +598,22 @@ test('centroid construction rejects unknown categories before changing render bu
       activeViewId: 'live',
       centroidPositions: previousPositions,
       centroidColors: previousColors,
+      dimensionManager: residentLayoutManager(new Float32Array(2)),
     },
   );
   const field = exactCategoryMetadata({
     kind: 'category',
     categories: ['alpha'],
-    centroidsByDim: {
-      2: [{
-        category: 'unknown',
-        position: [0, 1],
-        n_points: 1,
-      }],
-    },
-    _normalizedDims: new Set(),
+    centroidsByLayout: new Map([['X_umap_2d', [{
+      category: 'unknown',
+      position: [0, 1],
+      n_points: 1,
+    }]]]),
+    _normalizedLayouts: new Set(),
   });
 
   assert.throws(
-    () => state.buildCentroidsForField(field, { viewId: 'live' }),
+    () => state.buildCentroidsForField(field, { viewId: 'live', layoutKey: 'X_umap_2d' }),
     /unknown category/i,
   );
   assert.strictEqual(state.centroidPositions, previousPositions);
@@ -610,25 +638,44 @@ test('highlight selections require exact target-view transparency', () => {
     },
     varData: { fields: [] },
   };
+  // The lookups are keyed by the field object a gesture resolved from its
+  // pane, never by an index into the focused view's inventory.
+  const [categoryField, continuousField] = state.obsData.fields;
 
   assert.throws(
     () => highlightStateMethods.getCellIndicesForCategory.call(
       state,
+      categoryField,
       0,
-      0,
-      FieldSource.OBS,
       undefined,
     ),
-    /complete Float32Array transparency/i,
+    /transparency must be a Uint8Array with exactly 4 entries/i,
+  );
+  assert.throws(
+    () => highlightStateMethods.getCellIndicesForCategory.call(
+      state,
+      categoryField,
+      0,
+      Float32Array.from([1, 1, 0, 1]),
+    ),
+    /transparency must be a Uint8Array/i,
+  );
+  assert.throws(
+    () => highlightStateMethods.getCellIndicesForCategory.call(
+      state,
+      categoryField,
+      0,
+      Uint8Array.from([1, 1, 0, 2]),
+    ),
+    /entry 3 must be exactly 0 or 1/i,
   );
 
-  const transparency = Float32Array.from([1, 1, 0, 0.5]);
+  const transparency = Uint8Array.from([1, 1, 0, 1]);
   assert.deepEqual(
     highlightStateMethods.getCellIndicesForCategory.call(
       state,
+      categoryField,
       0,
-      0,
-      FieldSource.OBS,
       transparency,
     ),
     [0, 3],
@@ -636,10 +683,9 @@ test('highlight selections require exact target-view transparency', () => {
   assert.deepEqual(
     highlightStateMethods.getCellIndicesForRange.call(
       state,
-      1,
+      continuousField,
       1,
       3,
-      FieldSource.OBS,
       transparency,
     ),
     [1, 3],
@@ -676,8 +722,8 @@ test('observation filters compose across fields while cloned view state remains 
       activeFieldSource: 'obs',
       activeFieldIndex: 1,
       activeVarFieldIndex: -1,
-      categoryTransparency: new Float32Array(4),
-      cellVisibilityMask: Float32Array.from([1, 1, 1, 1]),
+      categoryTransparency: new Uint8Array(4),
+      cellVisibilityMask: Uint8Array.from([1, 1, 1, 1]),
       colorsArray: new Uint8Array(16),
       ensureCategoryMetadata:
         DataStateColorMethods.prototype.ensureCategoryMetadata,
@@ -720,8 +766,8 @@ test('an exact zero-cell observation generation owns valid empty visibility', ()
     {
       pointCount: 0,
       obsData: { count: 0, fields: [] },
-      categoryTransparency: new Float32Array(),
-      cellVisibilityMask: new Float32Array(),
+      categoryTransparency: new Uint8Array(),
+      cellVisibilityMask: new Uint8Array(),
       colorsArray: new Uint8Array(),
     },
   );
@@ -747,9 +793,8 @@ test('view restoration preserves exact null field inventories', () => {
     activeDimensionLevel: 2,
     activeViewId: 'live',
     colorsArray: new Uint8Array(8),
-    categoryTransparency: Float32Array.from([1, 1]),
-    cellVisibilityMask: Float32Array.from([1, 1]),
-    outlierQuantilesArray: Float32Array.from([-1, -1]),
+    categoryTransparency: Uint8Array.from([1, 1]),
+    cellVisibilityMask: Uint8Array.from([1, 1]),
     centroidPositions: new Float32Array(),
     centroidColors: new Uint8Array(),
     centroidOutliers: new Float32Array(),
@@ -792,7 +837,7 @@ test('view restoration preserves exact null field inventories', () => {
   ]);
 });
 
-test('view switching restores cloned cell masks and rejects invalid targets atomically', () => {
+test('view switching moves cell masks between views and rejects invalid targets atomically', () => {
   const pointCount = 4;
   const state = {
     pointCount,
@@ -804,9 +849,8 @@ test('view switching restores cloned cell masks and rejects invalid targets atom
     activeDimensionLevel: 2,
     activeViewId: 'live',
     colorsArray: new Uint8Array(pointCount * 4),
-    categoryTransparency: Float32Array.from([1, 1, 1, 1]),
-    cellVisibilityMask: Float32Array.from([1, 1, 0, 1]),
-    outlierQuantilesArray: Float32Array.from([-1, -1, -1, -1]),
+    categoryTransparency: Uint8Array.from([1, 1, 1, 1]),
+    cellVisibilityMask: Uint8Array.from([1, 1, 0, 1]),
     centroidPositions: new Float32Array(),
     centroidColors: new Uint8Array(),
     centroidOutliers: new Float32Array(),
@@ -853,24 +897,32 @@ test('view switching restores cloned cell masks and rejects invalid targets atom
     _notifyVisibilityChange() {},
   };
 
-  const liveMask = Float32Array.from(state.cellVisibilityMask);
+  const liveMask = Uint8Array.from(state.cellVisibilityMask);
   const liveContext = state._buildContextFromCurrent('live', {
     cloneArrays: true,
   });
-  state.cellVisibilityMask = Float32Array.from([1, 0, 1, 1]);
+  state.cellVisibilityMask = Uint8Array.from([1, 0, 1, 1]);
   const snapshotContext = state._buildContextFromCurrent('snapshot-1', {
     cloneArrays: true,
   });
-  state.cellVisibilityMask = Float32Array.from(liveMask);
+  state.cellVisibilityMask = Uint8Array.from(liveMask);
   state.viewContexts.set('live', liveContext);
   state.viewContexts.set('snapshot-1', snapshotContext);
 
+  const liveMaskBeforeSwitch = state.cellVisibilityMask;
   assert.equal(state.setActiveView('snapshot-1'), 'snapshot-1');
   assert.deepEqual(Array.from(state.cellVisibilityMask), [1, 0, 1, 1]);
-  assert.notStrictEqual(
+  // Masks move rather than copy: the active view's context shares the state's
+  // mask, and the outgoing view keeps the array the state stopped writing to.
+  assert.strictEqual(
     state.cellVisibilityMask,
     state.viewContexts.get('snapshot-1').cellVisibilityMask,
   );
+  assert.strictEqual(
+    state.viewContexts.get('live').cellVisibilityMask,
+    liveMaskBeforeSwitch,
+  );
+  assert.notStrictEqual(state.cellVisibilityMask, liveMaskBeforeSwitch);
 
   state.setCellVisibility([3], false);
   assert.deepEqual(Array.from(state.categoryTransparency), [1, 0, 1, 0]);
@@ -940,7 +992,7 @@ test('visibility preflight rejects corrupt codes before changing view transparen
     loaded: true,
   });
   categoryField._categoryVisible[1] = false;
-  const previousTransparency = Float32Array.from([0.25, 0.75]);
+  const previousTransparency = Uint8Array.from([0, 1]);
   const state = Object.assign(
     Object.create(DataStateFilterMethods.prototype),
     {
@@ -951,7 +1003,7 @@ test('visibility preflight rejects corrupt codes before changing view transparen
       activeFieldIndex: -1,
       activeVarFieldIndex: -1,
       categoryTransparency: previousTransparency,
-      cellVisibilityMask: Float32Array.from([1, 1]),
+      cellVisibilityMask: Uint8Array.from([1, 1]),
       colorsArray: new Uint8Array(8),
       ensureCategoryMetadata:
         DataStateColorMethods.prototype.ensureCategoryMetadata,
@@ -967,7 +1019,7 @@ test('visibility preflight rejects corrupt codes before changing view transparen
   );
   assert.deepEqual(
     Array.from(state.categoryTransparency),
-    [0.25, 0.75],
+    [0, 1],
   );
 });
 
@@ -993,7 +1045,7 @@ test('category editing rejects non-typed codes before mutating its source field'
       editInPlace: false,
       unassignedLabel: 'unassigned',
     }),
-    /Uint8Array or Uint16Array/i,
+    /Uint8Array, Uint16Array or Uint32Array/i,
   );
   assert.deepEqual(sourceField.categories, ['alpha', 'beta']);
   assert.deepEqual(sourceField.codes, [0, 1]);
@@ -1062,19 +1114,12 @@ test('highlight-page fields require exact labels and serialize the valid current
         }],
       },
     ],
-    dimensionManager: {
-      positionCache: new Map([
-        [2, Float32Array.from([
+    dimensionManager: residentLayoutManager(Float32Array.from([
           0, 0,
           1, 0,
           0, 1,
           1, 1,
-        ])],
-      ]),
-      getAvailableDimensions() {
-        return [2];
-      },
-    },
+        ])),
   };
 
   assert.throws(
@@ -1110,7 +1155,7 @@ test('highlight-page fields require exact labels and serialize the valid current
   assert.equal(created.conflicts, 0);
   assert.equal(created.uncoveredCount, 1);
 
-  const [metadata] = registry.toSessionMeta();
+  const [metadata] = registry.toSessionMeta(state.dimensionManager);
   assert.equal(metadata.id, created.id);
   assert.equal(metadata.source, FieldSource.OBS);
   assert.equal(metadata.kind, 'category');
@@ -1142,19 +1187,12 @@ test('intersection fields require every exact user label and never invent or ren
         }],
       },
     ],
-    dimensionManager: {
-      positionCache: new Map([
-        [2, Float32Array.from([
+    dimensionManager: residentLayoutManager(Float32Array.from([
           0, 0,
           1, 0,
           0, 1,
           1, 1,
-        ])],
-      ]),
-      getAvailableDimensions() {
-        return [2];
-      },
-    },
+        ])),
   };
   const options = {
     key: 'intersection',
@@ -1232,18 +1270,11 @@ test('user-defined categorical state preserves exact primitive category identity
   const registry = new UserDefinedFieldsRegistry();
   const state = {
     pointCount: 3,
-    dimensionManager: {
-      positionCache: new Map([
-        [2, Float32Array.from([
+    dimensionManager: residentLayoutManager(Float32Array.from([
           0, 0,
           1, 0,
           0, 1,
-        ])],
-      ]),
-      getAvailableDimensions() {
-        return [2];
-      },
-    },
+        ])),
   };
   const categories = [0, false, '0'];
   const created = registry.createFromCategoricalCodes({
@@ -1255,15 +1286,19 @@ test('user-defined categorical state preserves exact primitive category identity
 
   assert.deepEqual(created.field.categories, categories);
   assert.deepEqual(
-    created.field.centroidsByDim['2'].map(centroid => centroid.category),
+    created.field.centroidsByLayout.get('X_umap_2d').map(centroid => centroid.category),
     categories,
   );
   const metadata = registry.toSessionMeta();
   assert.deepEqual(metadata[0].categories, categories);
+  // The session record carries codes, never centroids.
+  assert.equal(Object.hasOwn(metadata[0], 'centroidsByDim'), false);
+  assert.equal(Object.hasOwn(metadata[0], 'normalizedDims'), false);
 
   const restored = new UserDefinedFieldsRegistry();
-  restored.fromSessionMeta(metadata);
+  restored.fromSessionMeta(JSON.parse(JSON.stringify(metadata)));
   assert.deepEqual(restored.getField(created.id).categories, categories);
+  assert.equal(restored.getField(created.id).centroidsByLayout.size, 0);
   assert.throws(
     () => registry.createFromCategoricalCodes({
       key: 'invalid_groups',
@@ -1282,17 +1317,10 @@ test('categorical upsert replaces stale derived metadata as one exact update', (
     Object.create(FieldOverlayPublicMethods.prototype),
     {
       pointCount: 2,
-      dimensionManager: {
-        positionCache: new Map([
-          [2, Float32Array.from([
+      dimensionManager: residentLayoutManager(Float32Array.from([
             0, 0,
             1, 1,
-          ])],
-        ]),
-        getAvailableDimensions() {
-          return [2];
-        },
-      },
+          ])),
       _userDefinedFields: registry,
       ensureCategoryMetadata:
         DataStateColorMethods.prototype.ensureCategoryMetadata,
@@ -1321,7 +1349,8 @@ test('categorical upsert replaces stale derived metadata as one exact update', (
   state.ensureCategoryMetadata(created.field);
   created.field._categoryColors[0] = [0.2, 0.3, 0.4];
   created.field._categoryVisible[0] = false;
-  created.field._normalizedDims.add('2');
+  const staleNormalizedLayouts = created.field._normalizedLayouts;
+  assert.deepEqual([...staleNormalizedLayouts], ['X_umap_2d']);
   created.field._categoryCounts = {
     visible: [2],
     total: [2],
@@ -1356,7 +1385,14 @@ test('categorical upsert replaces stale derived metadata as one exact update', (
   assert.equal(created.field._categoryVisible[0], false);
   assert.equal(created.field._categoryVisible[1], true);
   assert.equal(created.field._categoryColors.length, 2);
-  assert.deepEqual([...created.field._normalizedDims], []);
+  // The upsert's centroids come from the resident normalized positions, so
+  // they are recorded as normalized in a fresh set, never the stale one.
+  assert.deepEqual([...created.field._normalizedLayouts], ['X_umap_2d']);
+  assert.notStrictEqual(created.field._normalizedLayouts, staleNormalizedLayouts);
+  assert.deepEqual(
+    created.field.centroidsByLayout.get('X_umap_2d').map(centroid => centroid.position),
+    [[0, 0], [1, 1]],
+  );
   assert.equal(created.field._categoryCounts, undefined);
   assert.equal(created.field._operation.revision, 2);
   assert.strictEqual(registry.getField(created.id), created.field);
@@ -1431,4 +1467,44 @@ test('community merge traversal is deterministic and rejects duplicate or cyclic
     }),
     /cycle/i,
   );
+});
+
+test('syncing the active view shares its per-cell arrays instead of copying them', () => {
+  // Coloring, filtering and centroid changes each sync the active context; a
+  // copy of every per-cell array per sync was the dominant transient memory
+  // while one large dataset loaded.
+  const pointCount = 3;
+  const live = { id: 'live' };
+  const state = {
+    activeViewId: 'live',
+    viewContexts: new Map([['live', live]]),
+    obsData: { fields: [] },
+    varData: null,
+    activeFieldIndex: -1,
+    activeVarFieldIndex: -1,
+    activeFieldSource: null,
+    activeDimensionLevel: 2,
+    colorsArray: new Uint8Array(pointCount * 4),
+    categoryTransparency: new Uint8Array(pointCount),
+    cellVisibilityMask: new Uint8Array(pointCount),
+    centroidPositions: new Float32Array(3),
+    centroidColors: new Uint8Array(4),
+    centroidOutliers: new Float32Array(1),
+    centroidLabels: [],
+    filteredCount: { shown: pointCount, total: pointCount },
+    _cloneFieldState: viewContextCoreMethods._cloneFieldState,
+    _cloneObsData: viewContextCoreMethods._cloneObsData,
+    _cloneVarData: viewContextCoreMethods._cloneVarData,
+  };
+  viewContextCoreMethods._syncActiveContext.call(state);
+  for (const key of [
+    'colorsArray',
+    'categoryTransparency',
+    'cellVisibilityMask',
+    'centroidPositions',
+    'centroidColors',
+    'centroidOutliers',
+  ]) {
+    assert.strictEqual(live[key], state[key], key);
+  }
 });

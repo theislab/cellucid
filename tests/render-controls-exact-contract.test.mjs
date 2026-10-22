@@ -121,6 +121,7 @@ function makeDom() {
     depthControls: new FakeElement(),
     rendererControls: new FakeElement(),
     pointsControls: new FakeElement(),
+    pointsPerformanceControls: new FakeElement(),
     smokeControls: new FakeElement(),
     hpShaderQualitySelect: new FakeElement({ value: 'full' }),
     hpLodEnabledCheckbox: new FakeElement({ checked: false }),
@@ -156,6 +157,7 @@ function makeDom() {
 function makeViewer({
   hasSnapshots = false,
   antialiasingAvailable = true,
+  smokeSupport = { supported: true, reason: null, message: null, detail: null },
 } = {}) {
   const calls = [];
   let antialiasing = false;
@@ -188,6 +190,10 @@ function makeViewer({
     setNoiseTextureResolution(value) {
       calls.push(['setNoiseTextureResolution', value]);
     },
+    getSmokeSupport() {
+      calls.push(['getSmokeSupport']);
+      return smokeSupport;
+    },
     setShaderQuality(value) {
       calls.push(['setShaderQuality', value]);
     },
@@ -199,10 +205,6 @@ function makeViewer({
     },
     setFrustumCulling(value) {
       calls.push(['setFrustumCulling', value]);
-    },
-    getAdaptiveScaleFactor() {
-      calls.push(['getAdaptiveScaleFactor']);
-      return 1;
     },
     hasSnapshots() {
       calls.push(['hasSnapshots']);
@@ -308,7 +310,7 @@ test('render controls require the validated bootstrap background exactly', t => 
 
   assert.throws(
     () => initRenderControls({ viewer, dom, smoke }),
-    /viewer background.*grid.*grid-dark.*white.*black/i,
+    /viewer background must be exactly one of "white", "grid", "studio", "atelier", "abyss", "aurora", "black", "grid-dark", "studio-dark", "nebula", "abyss-dark", "aurora-dark"/i,
   );
   assert.deepEqual(viewer.calls, []);
 });
@@ -492,6 +494,59 @@ test('smoke conflicts notify and roll back the selector while the public owner r
   );
 });
 
+test('choosing smoke on a device that cannot run it says why and stays in Points', t => {
+  const restore = installDocument();
+  t.after(restore);
+  const support = Object.freeze({
+    supported: false,
+    reason: 'float-blend',
+    message: "Volumetric smoke isn't available on this device: its graphics driver "
+      + "can't blend high-precision colour, which the smoke cloud needs to add up "
+      + 'the cells. Points rendering works as usual.',
+    detail: 'WebGL2 extension EXT_float_blend is unavailable.',
+  });
+  const { viewer, dom, smoke, smokeCalls } = makeOptions({ smokeSupport: support });
+  const controls = initRenderControls({ viewer, dom, smoke });
+  const notificationCenter = getNotificationCenter();
+  const originalWarning = notificationCenter.warning;
+  const originalError = notificationCenter.error;
+  const warnings = [];
+  const errors = [];
+  notificationCenter.warning = (message, options) => warnings.push([message, options]);
+  notificationCenter.error = (message, options) => errors.push([message, options]);
+  const originalInfo = console.info;
+  const consoleInfo = [];
+  console.info = (...args) => consoleInfo.push(args.join(' '));
+  t.after(() => {
+    notificationCenter.warning = originalWarning;
+    notificationCenter.error = originalError;
+    console.info = originalInfo;
+  });
+
+  dom.renderModeSelect.value = 'smoke';
+  dom.renderModeSelect.dispatch('change');
+  assert.equal(dom.renderModeSelect.value, 'points');
+  assert.deepEqual(smokeCalls, [], 'nothing is built');
+  assert.equal(
+    viewer.calls.filter(([method, value]) => method === 'setRenderMode' && value === 'smoke').length,
+    0,
+  );
+  assert.deepEqual(warnings, [[
+    support.message,
+    { category: 'rendering', title: 'Volumetric smoke unavailable' },
+  ]]);
+  assert.deepEqual(errors, []);
+  // The capability name is for the console, not the headline.
+  assert.doesNotMatch(support.message, /EXT_|R32F|WebGL/);
+  assert.match(consoleInfo.join('\n'), /EXT_float_blend/);
+
+  // Programmatic publication (session restore, Jupyter) gets the same answer
+  // instead of an exception.
+  assert.equal(controls.applyRenderMode('smoke'), false);
+  assert.equal(dom.renderModeSelect.value, 'points');
+  assert.equal(warnings.length, 2);
+});
+
 test('public smoke rebuild requires one explicit exact grid size', t => {
   const restore = installDocument();
   t.after(restore);
@@ -524,18 +579,18 @@ test('smoke grid defaults to bounded 128³ and exposes no oversized UI choice', 
   assert.equal(dom.smokeGridDisplay.textContent, '128³');
 });
 
-test('smoke render resolution exposes an exact native detent and exact endpoints', t => {
+test('smoke render resolution steps by 0.05 from 0.25× to native, never above', t => {
   const restore = installDocument();
   t.after(restore);
   const { viewer, dom, smoke } = makeOptions();
   initRenderControls({ viewer, dom, smoke });
 
   const expectations = [
-    ['0', 0.25, '0.25x'],
-    ['42', 0.985, '0.98x'],
-    ['43', 1, '1.00x'],
-    ['44', 1.02, '1.02x'],
-    ['100', 2, '2.00x'],
+    ['0', 0.25, '0.25×'],
+    ['33', 0.5, '0.50×'],
+    ['50', 0.65, '0.65×'],
+    ['97', 1, '1.00×'],
+    ['100', 1, '1.00×'],
   ];
   for (const [raw, exactScale, display] of expectations) {
     dom.cloudResolutionInput.value = raw;
@@ -653,6 +708,7 @@ test('failed smoke entry rolls every visible control back to points', t => {
   ]);
   assert.equal(dom.depthControls.style.display, 'block');
   assert.equal(dom.rendererControls.style.display, 'block');
+  assert.equal(dom.pointsPerformanceControls.hidden, false);
 });
 
 test('runtime smoke failure settlement synchronizes UI without republishing viewer state', t => {
@@ -693,14 +749,15 @@ test('runtime smoke failure settlement synchronizes UI without republishing view
   ]);
   assert.equal(dom.depthControls.style.display, 'block');
   assert.equal(dom.rendererControls.style.display, 'block');
+  assert.equal(dom.pointsPerformanceControls.hidden, false);
   assert.equal(
     viewer.calls.filter(([name]) => name === 'setRenderMode').length,
     setModeCallsBefore,
   );
   assert.deepEqual(observedModes, ['smoke', 'points']);
   assert.deepEqual(notifications, [[
-    'Smoke rendering failed: synthetic ray-march failure',
-    { category: 'rendering' },
+    'Volumetric smoke stopped rendering, so the view is back in Points.',
+    { category: 'rendering', title: 'Volumetric smoke stopped' },
   ]]);
 });
 

@@ -212,6 +212,7 @@ export class CommunityAnnotationScopeLock extends EventEmitter {
     this._renewTick = null;
     this._visibilityListener = null;
     this._storageListener = null;
+    this._pagehideListener = null;
   }
 
   getTabId() {
@@ -254,6 +255,7 @@ export class CommunityAnnotationScopeLock extends EventEmitter {
     const tabId = key && scopeKey ? this.getTabId() : null;
     this._stopRenew();
     this._detachStorageListener();
+    this._detachUnloadRelease();
     this._lockKey = null;
     this._scopeKey = null;
 
@@ -351,9 +353,22 @@ export class CommunityAnnotationScopeLock extends EventEmitter {
     return { ok: true, scopeKey };
   }
 
+  /**
+   * Release the held lock when the page is hidden for good. One listener per
+   * held lock: it is detached on every release, so switching scopes never
+   * accumulates listeners.
+   */
   _installUnloadRelease() {
-    if (typeof window === 'undefined') return;
-    window.addEventListener('pagehide', () => this.release(), { once: true });
+    if (this._pagehideListener || typeof window === 'undefined') return;
+    const onPagehide = () => this.release();
+    this._pagehideListener = onPagehide;
+    window.addEventListener('pagehide', onPagehide);
+  }
+
+  _detachUnloadRelease() {
+    if (!this._pagehideListener) return;
+    window.removeEventListener('pagehide', this._pagehideListener);
+    this._pagehideListener = null;
   }
 
   _startRenew() {

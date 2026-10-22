@@ -1,6 +1,8 @@
 import { expect, test } from './helpers/test.mjs';
 import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
+import { openCollapsedPanels } from './helpers/panels.mjs';
+import { settleStyleTransitions } from './helpers/style-transitions.mjs';
 
 const PREPARED_DATASET_URL =
   `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=performance-panel-ci`;
@@ -87,7 +89,7 @@ function revealResults() {
   for (let node = results; node; node = node.parentElement) {
     if (node.localName === 'details') node.open = true;
   }
-  results.style.display = 'block';
+  results.hidden = false;
   document.getElementById('bn-fps').textContent = '42';
 }
 
@@ -105,6 +107,7 @@ for (const theme of ['light', 'dark']) {
 
     await page.goto(PREPARED_DATASET_URL, { waitUntil: 'domcontentloaded' });
     await dismissWelcome(page);
+    await openCollapsedPanels(page);
     await expect(page.locator('#dataset-name')).toHaveText(
       'Current UI prepared fixture'
     );
@@ -113,7 +116,7 @@ for (const theme of ['light', 'dark']) {
     // themes/_base.css transitions every element during a theme change, so
     // computed colours are in flight until that class is gone.
     await expect(page.locator('html')).not.toHaveClass(/theme-transition/);
-    await page.waitForTimeout(500);
+    await settleStyleTransitions(page);
 
     await page.evaluate(installProbe);
     await page.evaluate(revealResults);
@@ -124,7 +127,7 @@ for (const theme of ['light', 'dark']) {
         document.getElementById('bn-verdict-box').dataset.status = value;
         document.getElementById('bn-fps').dataset.status = value;
       }, status);
-      await page.waitForTimeout(400);
+      await settleStyleTransitions(page);
 
       // Exactly one status glyph is shown, and it strokes with the verdict
       // colour rather than an emoji's fixed rendering.
@@ -148,7 +151,8 @@ for (const theme of ['light', 'dark']) {
         '#bn-fps',
         '.bn-fps-label',
         '.bn-fps-suffix',
-        '.bn-section-title'
+        '#bn-problems > .section-title',
+        '#bn-fixes > .section-title'
       ]) {
         const cell = await page.evaluate(
           target => window.__measureContrast(target),

@@ -5,12 +5,15 @@
  * and release, for categorical and continuous fields alike. This module answers
  * each one with the candidate set that releasing right now would commit, so the
  * highlight updates while the gesture is still in the user's hand, and shows a
- * range label whenever the active field is continuous.
+ * range label whenever the field of the pane the gesture started in is
+ * continuous. Like the committed step, the preview reads that pane's field and
+ * visibility, never the focused view's.
  *
  * @module ui/modules/highlight/continuous-selection-preview
  */
 
 import {
+  annotationFieldForPane,
   annotationGestureType,
   combineAnnotationCandidates,
   computeAnnotationGestureCells
@@ -44,11 +47,9 @@ export function initContinuousSelectionPreview(options) {
     'Continuous selection preview state',
     [
       'clearPreviewHighlight',
-      'getActiveField',
-      'getCategoryForCell',
       'getCellIndicesForCategory',
       'getCellIndicesForRange',
-      'getValueForCell',
+      'getFieldForView',
       'setPreviewHighlightFromIndices'
     ]
   );
@@ -74,17 +75,24 @@ export function initContinuousSelectionPreview(options) {
   function handleSelectionPreview(previewEvent) {
     if (destroyed) return;
     requireContinuousPreviewEvent(previewEvent, state.pointCount);
-    const activeField = state.getActiveField();
-    if (activeField === null) {
-      throw new Error(
-        'Annotation selection preview requires an active field.'
-      );
+    const field = annotationFieldForPane(state, previewEvent.viewId);
+    if (field === null) {
+      // A pane colored by no field selects nothing, so releasing now commits
+      // nothing: the preview is the standing selection, unchanged.
+      hideRangeLabel();
+      const standing = selectionState.annotationCandidateSet;
+      if (standing !== null && standing.size > 0) {
+        state.setPreviewHighlightFromIndices(standing.toArray());
+      } else {
+        state.clearPreviewHighlight();
+      }
+      return;
     }
 
     const gestureType = annotationGestureType(previewEvent.dragDeltaY);
     const { cellIndices, range } = computeAnnotationGestureCells({
       state,
-      activeField,
+      field,
       cellIndex: previewEvent.cellIndex,
       gestureType,
       dragDeltaY: previewEvent.dragDeltaY,
@@ -95,9 +103,10 @@ export function initContinuousSelectionPreview(options) {
       candidates: selectionState.annotationCandidateSet,
       cellIndices,
       mode: previewEvent.mode,
-      fieldKind: activeField.kind
+      fieldKind: field.kind,
+      cellCount: state.pointCount
     });
-    const combinedIndices = candidates === null ? [] : [...candidates];
+    const combinedIndices = candidates === null ? [] : candidates.toArray();
 
     if (combinedIndices.length > 0) {
       state.setPreviewHighlightFromIndices(combinedIndices);

@@ -15,7 +15,9 @@ import {
   assertNonEmptyString,
   assertPlainRecord,
   assertSafeInteger,
+  DUPLICATE_CATEGORY_POSITION,
   describeCategory,
+  indexCategoryPositions,
   requireMethod
 } from '../schema-contract.js';
 
@@ -189,6 +191,8 @@ function assertFieldInventory(fields, context) {
 function createHighlightFieldBinder(state) {
   const inventories = new Map();
   const lookups = new Map();
+  // One name index per category field for the whole restore pass.
+  const categoryPositions = new Map();
 
   function inventoryFor(source) {
     const cached = inventories.get(source);
@@ -239,15 +243,20 @@ function createHighlightFieldBinder(state) {
         + `"${group.fieldKey}".`
       );
     }
-    const categoryIndex = field.categories.indexOf(group.categoryName);
-    if (categoryIndex < 0) {
+    let positions = categoryPositions.get(field);
+    if (positions === undefined) {
+      positions = indexCategoryPositions(field.categories);
+      categoryPositions.set(field, positions);
+    }
+    const categoryIndex = positions.get(group.categoryName);
+    if (categoryIndex === undefined) {
       throw new RangeError(
         `${context} was saved on the category `
         + `${describeCategory(group.categoryName)} of the ${source} field `
         + `"${group.fieldKey}", which that field no longer has.`
       );
     }
-    if (field.categories.lastIndexOf(group.categoryName) !== categoryIndex) {
+    if (categoryIndex === DUPLICATE_CATEGORY_POSITION) {
       throw new TypeError(
         `${context} names the category ${describeCategory(group.categoryName)} `
         + `of the ${source} field "${group.fieldKey}", and that field lists it `

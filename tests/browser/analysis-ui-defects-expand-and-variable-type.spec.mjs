@@ -20,7 +20,7 @@ import { dismissWelcome } from './helpers/welcome.mjs';
 const PREPARED_DATASET_URL =
   `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=analysis-ui-defects-ci`;
 
-const panelFor = mode => `.analysis-accordion-content[data-mode="${mode}"]`;
+const panelFor = mode => `.analysis-mode-content[data-mode="${mode}"]`;
 
 function observeProductErrors(page) {
   const errors = [];
@@ -45,7 +45,11 @@ async function openMode(page, mode) {
   const header = page.locator(`#analysis-header-${mode}`);
   await header.click();
   await expect(header).toHaveAttribute('aria-expanded', 'true');
-  await expect(page.locator(panelFor(mode))).toBeVisible();
+  const panel = page.locator(panelFor(mode));
+  await expect(panel).toBeVisible();
+  // A panel that fills in asynchronously is `aria-busy` until it settles;
+  // every header below it moves when it does.
+  await expect(panel).not.toHaveAttribute('aria-busy', 'true');
   return header;
 }
 
@@ -161,7 +165,7 @@ test('CEL-0058: collapsible analysis settings are built as real disclosure contr
   await openDataset(page);
   await openMode(page, 'genesPanel');
 
-  const headers = page.locator(`${panelFor('genesPanel')} .analysis-perf-header`);
+  const headers = page.locator(`${panelFor('genesPanel')} .disclosure-inline .disclosure-header`);
   await expect(headers).toHaveCount(2);
 
   for (let index = 0; index < 2; index++) {
@@ -172,17 +176,133 @@ test('CEL-0058: collapsible analysis settings are built as real disclosure contr
     const region = page.locator(`[id="${regionId}"]`);
     await expect(region).toBeHidden();
 
-    // One key press, one toggle: the caret and the announced state agree.
+    // One key press, one toggle: the chevron turns with the announced state.
+    const chevron = header.locator('> .disclosure-chevron');
+    await expect(chevron).toHaveCSS('transform', 'none');
     await header.focus();
     await page.keyboard.press('Enter');
     await expect(header).toHaveAttribute('aria-expanded', 'true');
     await expect(region).toBeVisible();
-    await expect(header.locator('.analysis-perf-toggle')).toHaveText('▲');
+    await expect(chevron).not.toHaveCSS('transform', 'none');
     await page.keyboard.press(' ');
     await expect(header).toHaveAttribute('aria-expanded', 'false');
     await expect(region).toBeHidden();
-    await expect(header.locator('.analysis-perf-toggle')).toHaveText('▼');
+    await expect(chevron).toHaveCSS('transform', 'none');
   }
 
+  expect(productErrors).toEqual([]);
+});
+
+test('an expanded view follows a newer result and draws only the committed snapshot', async ({
+  page
+}) => {
+  const productErrors = observeProductErrors(page);
+  await openDataset(page);
+
+  // Form-based: a newer result arriving while the first render is in flight
+  // owns the same overlay; the superseded render must not close it.
+  const formOutcome = await page.evaluate(async () => {
+    const { FormBasedAnalysisUI } = await import(
+      '/assets/js/app/analysis/ui/analysis-types/base/form-based-analysis.js'
+    );
+    const resultA = { data: [], title: 'Result A' };
+    const resultB = { data: [], title: 'Result B' };
+    const ui = Object.create(FormBasedAnalysisUI.prototype);
+    Object.assign(ui, {
+      _isDestroyed: false,
+      _modal: null,
+      _lastResult: resultA,
+      _currentPageData: null,
+      _requestedPlotOptions: null,
+      _notifications: { error() {}, success() {} },
+    });
+    const drawn = [];
+    const busyDuringDraw = [];
+    ui._drawExpandedViewContent = async (modal, result) => {
+      busyDuringDraw.push(modal._body.getAttribute('aria-busy'));
+      if (result === resultA) {
+        await ui._publishAnalysisResult(resultB);
+        return false;
+      }
+      modal._title.textContent = result.title;
+      drawn.push(result.title);
+      return true;
+    };
+    await ui._openExpandedView();
+    const modal = ui._modal;
+    const outcome = {
+      busyDuringDraw,
+      busyAfter: modal === null ? 'closed' : modal._body.getAttribute('aria-busy'),
+      drawn,
+      open: modal !== null && modal.isConnected,
+      title: modal?._title.textContent ?? null,
+    };
+    if (modal !== null) {
+      const { closeModal } = await import(
+        '/assets/js/app/analysis/ui/components/modal.js'
+      );
+      await closeModal(modal);
+    }
+    return outcome;
+  });
+  expect(formOutcome).toEqual({
+    busyDuringDraw: ['true', 'true'],
+    busyAfter: null,
+    drawn: ['Result B'],
+    open: true,
+    title: 'Result B',
+  });
+
+  // Detailed: a control change moves `_currentConfig` before its debounced
+  // fetch; the expanded view must draw the config its data was fetched for.
+  const detailedOutcome = await page.evaluate(async () => {
+    const { DetailedAnalysisUI } = await import(
+      '/assets/js/app/analysis/ui/analysis-types/detailed-analysis-ui.js'
+    );
+    const { closeModal } = await import(
+      '/assets/js/app/analysis/ui/components/modal.js'
+    );
+    const ui = new DetailedAnalysisUI({ comparisonModule: {}, dataLayer: {} });
+    const committedConfig = {
+      dataSource: { type: 'categorical_obs', variable: 'cell_type' },
+      pages: ['page-1'],
+      plotType: 'barplot',
+      plotOptions: {},
+    };
+    const committedData = [{ pageId: 'page-1', values: ['A'] }];
+    ui._committedView = Object.freeze({
+      config: committedConfig,
+      pageData: committedData,
+      layoutEngine: {},
+    });
+    ui._currentConfig = {
+      dataSource: { type: 'continuous_obs', variable: 'score' },
+      pages: ['page-1'],
+      plotType: 'histogram',
+      plotOptions: {},
+    };
+    let drawnWith = null;
+    ui._drawExpandedView = async (modal, committed) => {
+      drawnWith = {
+        busy: modal._body.getAttribute('aria-busy'),
+        sameConfig: committed.config === committedConfig,
+        sameData: committed.pageData === committedData,
+      };
+    };
+    await ui._openExpandedView();
+    const modal = ui._modal;
+    const outcome = {
+      drawnWith,
+      title: modal._title.textContent,
+      busyAfter: modal._body.getAttribute('aria-busy'),
+    };
+    await closeModal(modal);
+    return outcome;
+  });
+  expect(detailedOutcome).toEqual({
+    drawnWith: { busy: 'true', sameConfig: true, sameData: true },
+    title: 'Comparing: cell_type',
+    busyAfter: null,
+  });
   expect(productErrors).toEqual([]);
 });

@@ -17,21 +17,11 @@ import { ClusteringEngine } from '../assets/js/app/analysis/genes-panel/clusteri
 import { BasePlot } from '../assets/js/app/analysis/plots/plot-base.js';
 import { LayoutEngine } from '../assets/js/app/analysis/plots/layout-engine.js';
 import geneHeatmapDefinition from '../assets/js/app/analysis/plots/types/gene-heatmap.js';
-import {
-  AnalysisError,
-  formatErrorForUser,
-  getErrorMessage,
-  wrapAsync,
-} from '../assets/js/app/analysis/shared/error-utils.js';
 import { waitForAvailableSlot } from '../assets/js/app/analysis/shared/concurrency-utils.js';
 import { getPerformanceFormValues } from '../assets/js/app/analysis/shared/dom-utils.js';
-import { createMemoryMonitor } from '../assets/js/app/analysis/shared/memory-monitor.js';
+import { MemoryMonitor } from '../assets/js/app/analysis/shared/memory-monitor.js';
 import { PerformanceConfig } from '../assets/js/app/analysis/shared/performance-config.js';
 import { cleanupAnalysisResources } from '../assets/js/app/analysis/shared/resource-cleanup.js';
-import {
-  computeQuickDifferentialExpression,
-  computeVarianceScore,
-} from '../assets/js/app/analysis/stats/quick-stats.js';
 import { MultiVariableAnalysis } from '../assets/js/app/analysis/stats/multi-variable-analysis.js';
 import { getDataSourceManager } from '../assets/js/data/data-source-manager.js';
 
@@ -55,13 +45,11 @@ test('analysis fallback, retry, coercion, and compatibility shims are absent fro
     'plots/plot-base.js',
     'plots/plotly-hints.js',
     'plots/types/gene-heatmap.js',
-    'shared/error-utils.js',
     'shared/concurrency-utils.js',
     'shared/dom-utils.js',
     'shared/memory-monitor.js',
     'shared/plot-theme.js',
     'shared/resource-cleanup.js',
-    'stats/quick-stats.js',
     'ui/analysis-types/de-analysis-ui.js',
     'ui/components/options.js',
   ];
@@ -508,21 +496,38 @@ test('gene heatmap CSV rows preserve every prototype-named group column', () => 
 });
 
 test('requested clustering never becomes an unclustered result', async () => {
+  // Clustering past the memory budget is refused, with the measured reason
+  // and what to change, before anything is allocated; it is never returned
+  // in input order as if it were clustered.
   const engine = new ClusteringEngine();
+  const matrix = { values: new Float32Array(501 * 2), nRows: 501, nCols: 2 };
   await assert.rejects(
     engine.clusterMatrix({
-      matrix: {
-        values: new Float32Array(501 * 2),
-        nRows: 501,
-        nCols: 2,
-      },
+      matrix,
       clusterRows: true,
       clusterCols: false,
       distance: 'euclidean',
       linkage: 'average',
+      memoryBudgetBytes: 2 ** 20,
     }),
-    /501.*500|clustering.*maximum/i,
+    {
+      name: 'RangeError',
+      message: 'Clustering 501 genes needs about 25 MB of memory, more than the 1 MB ' +
+        'analysis memory budget. Raise the budget in Performance settings, use fewer ' +
+        'genes, or turn clustering of genes off.',
+    },
   );
+  // The same 501 rows within the budget are clustered (no fixed row count).
+  const clustered = await engine.clusterMatrix({
+    matrix: { ...matrix, values: Float32Array.from({ length: 501 * 2 }, (_, i) => (i * 7919) % 101) },
+    clusterRows: true,
+    clusterCols: false,
+    distance: 'euclidean',
+    linkage: 'average',
+    memoryBudgetBytes: 512 * 2 ** 20,
+  });
+  assert.equal(clustered.rowOrder.length, 501);
+  assert.notEqual(clustered.rowDendrogram, null);
 });
 
 test('marker caches require one exact dataset identity', () => {
@@ -539,7 +544,7 @@ test('marker caches require one exact dataset identity', () => {
       maxCategories: 3,
       maxAgeDays: 7,
       cacheVersion: 1,
-      datasetId: '   ',
+      identity: { key: '   ', persistent: false },
     }),
     /datasetId.*non-empty|dataset identity/i,
   );
@@ -561,31 +566,8 @@ test('marker caches require one exact dataset identity', () => {
   }
 });
 
-test('error utilities preserve exact errors instead of substituting messages', async () => {
-  assert.equal(getErrorMessage('NOT_FOUND'), 'Resource not found');
-  assert.throws(
-    () => getErrorMessage('UNKNOWN_CODE'),
-    /unknown error code.*UNKNOWN_CODE/i,
-  );
-  assert.throws(
-    () => formatErrorForUser(null),
-    /error.*required/i,
-  );
-
-  const original = new TypeError('exact public failure');
-  await assert.rejects(
-    wrapAsync(async () => {
-      throw original;
-    }, 'ExactOperation'),
-    error => error === original,
-  );
-
-  const analysisError = new AnalysisError('exact analysis failure', 'ANALYSIS_ERROR');
-  assert.equal(formatErrorForUser(analysisError), 'exact analysis failure');
-});
-
 test('unsupported heap measurement stays explicitly unavailable without guessed decisions', () => {
-  const monitor = createMemoryMonitor();
+  const monitor = new MemoryMonitor();
   const usage = monitor.getMemoryUsage();
   if (!usage.available) {
     assert.equal(usage.usedJSHeapSize, null);
@@ -596,27 +578,6 @@ test('unsupported heap measurement stays explicitly unavailable without guessed 
   assert.equal(typeof monitor.suggestBatchSize, 'undefined');
 });
 
-test('quick statistics are deterministic and gene-load failures are terminal', async () => {
-  const values = Array.from({ length: 10_000 }, (_, index) => index % 37);
-  assert.deepEqual(computeVarianceScore(values), computeVarianceScore(values));
-
-  const loaderFailure = new Error('gene payload failed');
-  await assert.rejects(
-    computeQuickDifferentialExpression({
-      getAvailableVariables() {
-        return [{ key: 'GENE', name: 'Gene' }];
-      },
-      async getDataForPages() {
-        throw loaderFailure;
-      },
-    }, 'page-a', 'page-b', 1),
-    error => error === loaderFailure,
-  );
-
-  const source = await analysisSource('stats/quick-stats.js');
-  assert.doesNotMatch(source, /Math\.random|approximate statistics|skip failed genes/i);
-});
-
 test('streaming gene loads and analysis cleanup preserve exact failures', async () => {
   const loadFailure = new Error('exact streamed gene load failure');
   const loader = new StreamingGeneLoader({
@@ -624,6 +585,9 @@ test('streaming gene loads and analysis cleanup preserve exact failures', async 
       state: { pointCount: 4 },
       async ensureGeneExpressionLoaded() {
         throw loadFailure;
+      },
+      async prefetchGenePayload() {
+        return null;
       },
       unloadGeneExpression() {
         return true;

@@ -18,6 +18,7 @@
  * @module ui/modules/figure-export/utils/selection-badge
  */
 
+import { formatCount } from '../../../components/display-format.js';
 import {
   MIN_VISIBLE_ALPHA_BYTE,
   POINT_VISIBILITY_THRESHOLD,
@@ -37,7 +38,7 @@ const BADGE_MIN_WIDTH = 90;
  *
  * @param {object} options
  * @param {Uint8Array|null} options.highlightArray
- * @param {Float32Array|null} options.transparency
+ * @param {Uint8Array|null} options.transparency
  * @param {{ indices: Uint32Array }|null} [options.lodMembership]
  * @returns {number}
  */
@@ -98,7 +99,7 @@ export function countHighlightedVisiblePoints({
 export function buildSelectionBadge({ count, plotRect, fontSizePx }) {
   if (!Number.isSafeInteger(count) || count <= 0) return null;
 
-  const label = `n = ${count.toLocaleString()} selected`;
+  const label = `n = ${formatCount(count)} selected`;
   const height = Math.max(16, Math.round(fontSizePx * 1.35));
   const width = Math.min(
     Math.max(1, plotRect.width - BADGE_INSET * 2),

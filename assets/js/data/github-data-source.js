@@ -84,6 +84,14 @@ function splitGitHubSegments(value, { urlPath = false } = {}) {
 }
 
 /**
+ * What to tell someone whose input `parseGitHubPath` cannot read. It is the
+ * one wording for that refusal, whether the connect control refuses the input
+ * before trying it or `connect()` refuses it from code.
+ */
+export const INVALID_GITHUB_PATH_MESSAGE =
+  'Invalid GitHub path. Use format: owner/repo/exports (or owner/repo@branch/exports), or paste a GitHub URL.';
+
+/**
  * Parse a GitHub repository URL/path into components
  * @param {string} input - Exact shorthand, GitHub tree URL, or GitHub raw URL
  * @returns {{owner: string, repo: string, branch: string, path: string}|null}
@@ -601,7 +609,7 @@ export class GitHubDataSource {
       const parsedPath = parseGitHubPath(inputPath);
       if (!parsedPath) {
         throw new DataSourceError(
-          'Invalid GitHub path. Use format: owner/repo/exports (or owner/repo@branch/exports), or paste a GitHub URL.',
+          INVALID_GITHUB_PATH_MESSAGE,
           DataSourceErrorCode.INVALID_FORMAT,
           this.type,
           { input: inputPath }
@@ -812,15 +820,15 @@ export class GitHubDataSource {
   }
 
   /**
-   * Refresh cached data
+   * Refresh cached data.
+   *
+   * An unconnected source holds no catalog, so there is nothing to refresh
+   * and nothing has failed; a rejected refresh is reported to the user as a
+   * failed dataset-list reload.
    */
   async refresh() {
     if (!this._connected || !this._inputPath || !this._baseUrl) {
-      throw new DataSourceError(
-        'Not connected to GitHub repository',
-        DataSourceErrorCode.NETWORK_ERROR,
-        this.type
-      );
+      return;
     }
 
     const baseUrl = this._baseUrl;

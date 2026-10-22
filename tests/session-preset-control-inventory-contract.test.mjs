@@ -62,8 +62,8 @@
  * repinned in `cellucid-datasets`:
  *
  *  1. open the app on the dataset, restore its current preset, and save state;
- *  2. write the result to `exports/<id>/default.cellucid-session`;
- *  3. repin `state_sha256` for that entry in `exports/datasets.json`;
+ *  2. write the result to `exports-v3/<id>/default.cellucid-session`;
+ *  3. repin `state_sha256` for that entry in `exports-v3/datasets.json`;
  *  4. repin the same digest and the stored byte counts in
  *     `tests/catalog-contract.test.mjs` and
  *     `tests/session-presets-contract.test.mjs`.
@@ -78,10 +78,11 @@ import test from 'node:test';
 import { gunzipSync } from 'node:zlib';
 
 import { createUiControlSerializer } from '../assets/js/app/state-serializer/ui-controls.js';
+import { createDomId } from '../assets/js/app/ui/components/dom-id.js';
 
 const INDEX_URL = new URL('../index.html', import.meta.url);
 const PRESET_REPOSITORY_URL = new URL('../../cellucid-datasets/', import.meta.url);
-const PRESET_EXPORTS_URL = new URL('exports/', PRESET_REPOSITORY_URL);
+const PRESET_EXPORTS_URL = new URL('exports-v3/', PRESET_REPOSITORY_URL);
 const PRESET_FILENAME = 'default.cellucid-session';
 
 const indexHtml = await readFile(INDEX_URL, 'utf8');
@@ -465,7 +466,7 @@ function decodeCoreStateControls(bytes, label) {
  * The presets, or `null` when the sibling repository is not checked out.
  *
  * Only an absent *repository* is a reason to skip. A repository that is present
- * but publishes no `exports/` is a defect, not an environment, so that case is
+ * but publishes no `exports-v3/` is a defect, not an environment, so that case is
  * left to fail.
  */
 async function readPublishedPresets() {
@@ -923,4 +924,22 @@ test('a domain-owned control does not trip the guard wherever it sits', () => {
       + 'generic contributor, so moving it must not invalidate a published '
       + 'preset',
   );
+});
+
+test('a control whose id was minted on the page never enters the inventory', () => {
+  // A continuous legend rebuilds its range sliders with `createDomId` ids
+  // (`minimum-1b`) on every render. A session that recorded one named a
+  // control no other page has, and loading it was refused. Any minted id is
+  // page-local by construction, so the serializer leaves such controls out;
+  // a stable id beside it still enters.
+  const mintedId = createDomId('minimum');
+  const stableId = `${PROBE_ID}-stable`;
+  const added = deriveInventory(insertAfterTagOf(
+    indexHtml,
+    anchorInput.id,
+    `<input id="${mintedId}" type="range" min="0" max="1" step="0.1" value="0.5">`
+      + `<input id="${stableId}" type="checkbox">`,
+  ));
+  assert.equal(Object.hasOwn(added.controls, mintedId), false);
+  assert.equal(Object.hasOwn(added.controls, stableId), true);
 });

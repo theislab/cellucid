@@ -7,7 +7,8 @@
  * - User-defined categorical creation validation
  */
 
-import { Limits, FieldKind, OverlapStrategy } from './field-constants.js';
+import { FieldKind, OverlapStrategy } from './field-constants.js';
+import { MAX_INTERSECTION_PAGES } from './page-membership.js';
 import {
   requireCategoricalCategoryCount
 } from '../../data/categorical-storage-contract.js';
@@ -79,9 +80,6 @@ export class StateValidator {
     }
     if (type === 'number' && !Number.isFinite(label)) {
       throw new TypeError('Numeric category labels must be finite');
-    }
-    if (type === 'string' && label.length > Limits.MAX_CATEGORY_LABEL_LENGTH) {
-      throw new Error(`Category label too long (max ${Limits.MAX_CATEGORY_LABEL_LENGTH} characters)`);
     }
     return true;
   }
@@ -248,8 +246,8 @@ export class StateValidator {
     }
 
     if (overlapStrategy === OverlapStrategy.INTERSECTIONS) {
-      if (pages.length > Limits.MAX_INTERSECTION_PAGES) {
-        throw new Error(`Too many pages for intersections (max ${Limits.MAX_INTERSECTION_PAGES})`);
+      if (pages.length > MAX_INTERSECTION_PAGES) {
+        throw new RangeError(`Each intersection supports at most ${MAX_INTERSECTION_PAGES} pages`);
       }
       for (const [maskKey, label] of Object.entries(intersectionLabels)) {
         if (!/^[1-9][0-9]*$/.test(maskKey)) {

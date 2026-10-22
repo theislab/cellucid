@@ -6,18 +6,22 @@
  * treating unknown metadata or malformed compressed bytes as usable data.
  */
 
-export const MAX_ZARR_CHUNK_BYTES = 64 * 1024 * 1024;
-export const MAX_ZARR_ENCODED_CHUNK_BYTES = MAX_ZARR_CHUNK_BYTES + 64 * 1024;
-export const MAX_ZARR_METADATA_BYTES = 4 * 1024 * 1024;
-export const MAX_ZARR_MATERIALIZED_ARRAY_BYTES = 512 * 1024 * 1024;
-export const MAX_ZARR_STRING_ITEMS = 16 * 1024 * 1024;
-export const MAX_ZARR_CHUNKS_PER_ARRAY = 100_000;
+import { createSlicedInputStream } from '../app/session/codecs/gzip.js';
 
-// Conservative cross-engine estimate for the allocation owned by each
-// materialized JavaScript string, excluding its UTF-16 payload and array slot.
-// This intentionally covers V8, JavaScriptCore, and SpiderMonkey rather than
-// relying on one engine's compact-string representation.
-const ESTIMATED_JS_STRING_OVERHEAD_BYTES = 64;
+/**
+ * DEFLATE's maximum expansion: one 258-byte match per two bits at best gives
+ * 1032 output bytes per input byte (RFC 1951). The decoded size of a chunk
+ * whose array does not declare one (variable-length strings) is bounded by
+ * it, which is the codec's own limit, not a chosen number.
+ */
+const DEFLATE_MAX_EXPANSION = 1032;
+
+/**
+ * LZ4's maximum expansion: a 4-bit token plus 255-byte length extensions
+ * reach just under 255 output bytes per input byte. Blosc frames declare
+ * their decoded size, which may not exceed this times the compressed size.
+ */
+const LZ4_MAX_EXPANSION = 255;
 
 const NUMERIC_DTYPES = new Map([
   ['|b1', { ArrayType: Uint8Array, bytes: 1, kind: 'boolean' }],
@@ -172,15 +176,10 @@ export function validateZarrArrayMetadata(meta, context = 'Zarr') {
   if (meta.chunks.some(value => value <= 0)) {
     throw new Error('Invalid Zarr chunk shape: dimensions must be positive');
   }
-  const chunkCount = checkedProduct(
+  checkedProduct(
     meta.shape.map((dimension, index) => Math.ceil(dimension / meta.chunks[index])),
     'chunk count'
   );
-  if (chunkCount > MAX_ZARR_CHUNKS_PER_ARRAY) {
-    throw new Error(
-      `Zarr chunk count exceeds the ${MAX_ZARR_CHUNKS_PER_ARRAY}-chunk browser limit; use the Cellucid server or prepared format`
-    );
-  }
   if (meta.order !== 'C' && meta.order !== 'F') {
     throw new Error(`Unsupported Zarr array order '${meta.order}'`);
   }
@@ -192,176 +191,21 @@ export function validateZarrArrayMetadata(meta, context = 'Zarr') {
 
   const dtypeInfo = getZarrDtypeInfo(meta.dtype);
   if (dtypeInfo.bytes != null) {
-    const decodedChunkBytes = checkedProduct(
-      [chunkElementCount, dtypeInfo.bytes],
-      'decoded chunk size'
-    );
-    if (decodedChunkBytes > MAX_ZARR_CHUNK_BYTES) {
-      throw new Error(
-        `${context} decoded chunk exceeds the ${MAX_ZARR_CHUNK_BYTES}-byte browser limit; use the Cellucid server or prepared format`
-      );
-    }
+    checkedProduct([chunkElementCount, dtypeInfo.bytes], 'decoded chunk size');
   }
   validateFilters(meta.filters, dtypeInfo);
   validateCompressor(meta.compressor);
   return dtypeInfo;
 }
 
-export function estimateZarrChunkWorkingBytes(meta, dtypeInfo) {
-  const chunkElementCount = BigInt(checkedProduct(
-    meta.chunks,
-    'chunk shape'
-  ));
-  const decodedChunkBytes = dtypeInfo.bytes == null
-    ? BigInt(MAX_ZARR_CHUNK_BYTES)
-    : chunkElementCount * BigInt(dtypeInfo.bytes);
-  const compressorId = meta.compressor?.id ?? null;
-
-  // Account for the encoded File buffer plus decoder-owned output/scratch:
-  // - null: one decoded copy/view
-  // - gzip/zlib streams: retained pieces plus their combined output
-  // - Blosc: output, shuffled block, unshuffled block, and an LZ4 split
-  let decodedCopies = compressorId === 'blosc'
-    ? 4n
-    : (compressorId === 'gzip' || compressorId === 'zlib' ? 2n : 1n);
-  // With no compressor, the encoded File buffer and its decoded copy remain
-  // live while endian conversion allocates one more native-order buffer.
-  if (compressorId == null && dtypeInfo.bigEndian) {
-    decodedCopies += 1n;
-  }
-  const expandedMaterializationBytes = dtypeInfo.materializedBytes != null
-    ? chunkElementCount * BigInt(dtypeInfo.materializedBytes)
-    : 0n;
-  return BigInt(MAX_ZARR_ENCODED_CHUNK_BYTES) +
-    decodedChunkBytes * decodedCopies +
-    expandedMaterializationBytes;
-}
-
-function normalizeMinimumChunkWorkingBytes(value) {
-  if (typeof value === 'bigint') {
-    if (value < 0n) throw new Error('Invalid Zarr chunk working-set plan');
-    return value;
-  }
-  if (Number.isSafeInteger(value) && value >= 0) {
-    return BigInt(value);
-  }
-  throw new Error('Invalid Zarr chunk working-set plan');
-}
-
-export function validateZarrMaterialization(
-  meta,
-  dtypeInfo,
-  minimumChunkWorkingBytes = 0n
-) {
-  const elementCount = checkedProduct(meta.shape, 'shape');
-  const materializedBytesPerElement = dtypeInfo.category === 'numeric'
-    ? (dtypeInfo.materializedBytes ?? dtypeInfo.bytes)
-    : 8;
-  const estimatedBytes = checkedProduct(
-    [elementCount, materializedBytesPerElement],
-    'materialized array size'
-  );
-  if (estimatedBytes > MAX_ZARR_MATERIALIZED_ARRAY_BYTES ||
-      (dtypeInfo.bytes == null && elementCount > MAX_ZARR_STRING_ITEMS)) {
-    throw new Error(
-      `Zarr array exceeds the ${MAX_ZARR_MATERIALIZED_ARRAY_BYTES}-byte browser limit; use the Cellucid server or prepared format`
-    );
-  }
-
-  const limit = BigInt(MAX_ZARR_MATERIALIZED_ARRAY_BYTES);
-  const estimatedChunkWorkingBytes =
-    estimateZarrChunkWorkingBytes(meta, dtypeInfo);
-  const requestedChunkWorkingBytes =
-    normalizeMinimumChunkWorkingBytes(minimumChunkWorkingBytes);
-  const chunkWorkingBytes =
-    requestedChunkWorkingBytes > estimatedChunkWorkingBytes
-      ? requestedChunkWorkingBytes
-      : estimatedChunkWorkingBytes;
-  const zipExtractionDominates =
-    requestedChunkWorkingBytes > estimatedChunkWorkingBytes;
-  if (dtypeInfo.category === 'numeric') {
-    const peakWorkingBytes = BigInt(estimatedBytes) + chunkWorkingBytes;
-    if (peakWorkingBytes > limit) {
-      throw new Error(
-        zipExtractionDominates
-          ? `Zarr array plus ZIP extraction peak working set exceeds the ${MAX_ZARR_MATERIALIZED_ARRAY_BYTES}-byte browser limit; use the Cellucid server or prepared format`
-          : `Zarr array peak working set exceeds the ${MAX_ZARR_MATERIALIZED_ARRAY_BYTES}-byte browser limit; use the Cellucid server or prepared format`
-      );
-    }
-  } else {
-    const chunkElementCount = BigInt(checkedProduct(meta.chunks, 'chunk shape'));
-    const resultPointerBytes = BigInt(elementCount) * 8n;
-    const chunkPointerBytes = chunkElementCount * 8n;
-    const retainedStringObjectBytes =
-      BigInt(elementCount) * BigInt(ESTIMATED_JS_STRING_OVERHEAD_BYTES);
-    const temporaryStringObjectBytes =
-      chunkElementCount * BigInt(ESTIMATED_JS_STRING_OVERHEAD_BYTES);
-    let retainedStringPayloadBytes = 0n;
-    let temporaryStringPayloadBytes;
-    if (dtypeInfo.category === 'fixed-string') {
-      const utf16Multiplier = dtypeInfo.encoding === 'bytes' ? 2n : 1n;
-      retainedStringPayloadBytes =
-        BigInt(elementCount) * BigInt(dtypeInfo.bytes) * utf16Multiplier;
-      temporaryStringPayloadBytes =
-        chunkElementCount * BigInt(dtypeInfo.bytes) * utf16Multiplier;
-    } else {
-      // A valid VLenUTF8 decoded chunk is bounded by MAX_ZARR_CHUNK_BYTES.
-      // ASCII can expand to two-byte UTF-16 storage in a portable worst case.
-      temporaryStringPayloadBytes = BigInt(MAX_ZARR_CHUNK_BYTES) * 2n;
-    }
-    const peakWorkingBytes =
-      resultPointerBytes +
-      retainedStringObjectBytes +
-      retainedStringPayloadBytes +
-      chunkPointerBytes +
-      temporaryStringObjectBytes +
-      temporaryStringPayloadBytes +
-      chunkWorkingBytes;
-    if (peakWorkingBytes > BigInt(MAX_ZARR_MATERIALIZED_ARRAY_BYTES)) {
-      throw new Error(
-        zipExtractionDominates
-          ? `Zarr string array plus ZIP extraction peak working set exceeds the ${MAX_ZARR_MATERIALIZED_ARRAY_BYTES}-byte browser limit; use the Cellucid server or prepared format`
-          : `Zarr string array peak working set exceeds the ${MAX_ZARR_MATERIALIZED_ARRAY_BYTES}-byte browser limit; use the Cellucid server or prepared format`
-      );
-    }
-  }
-  return elementCount;
-}
-
-export function accountZarrStringStorage(
-  currentBytes,
-  values,
-  reservedBytes = 0,
-  valueCount = values?.length
-) {
-  if (!Number.isSafeInteger(currentBytes) || currentBytes < 0 ||
-      !Number.isSafeInteger(reservedBytes) || reservedBytes < 0 ||
-      reservedBytes > MAX_ZARR_MATERIALIZED_ARRAY_BYTES ||
-      !Array.isArray(values) ||
-      !Number.isSafeInteger(valueCount) ||
-      valueCount < 0 ||
-      valueCount > values.length) {
-    throw new Error('Invalid Zarr string storage accounting input');
-  }
-
-  let totalBytes = currentBytes;
-  for (let index = 0; index < valueCount; index++) {
-    const value = values[index];
-    if (typeof value !== 'string') {
-      throw new Error('Invalid non-string value in Zarr string array');
-    }
-    const stringBytes =
-      ESTIMATED_JS_STRING_OVERHEAD_BYTES + value.length * 2;
-    if (!Number.isSafeInteger(stringBytes) ||
-        stringBytes >
-          MAX_ZARR_MATERIALIZED_ARRAY_BYTES - reservedBytes - totalBytes) {
-      throw new Error(
-        `Zarr string array exceeds the ${MAX_ZARR_MATERIALIZED_ARRAY_BYTES}-byte browser limit; use the Cellucid server or prepared format`
-      );
-    }
-    totalBytes += stringBytes;
-  }
-  return totalBytes;
+/**
+ * The element count of one array (the product of its shape).
+ *
+ * @param {Object} meta
+ * @returns {number}
+ */
+export function zarrElementCount(meta) {
+  return checkedProduct(meta.shape, 'shape');
 }
 
 export function zarrChunkKey(indices, dimensionSeparator = '.') {
@@ -465,7 +309,7 @@ function readExtendedLz4Length(input, cursor, initialLength, maximumLength) {
 export function decodeLz4Block(inputValue, outputLength) {
   const input = asBytes(inputValue);
   if (!Number.isSafeInteger(outputLength) || outputLength < 0 ||
-      outputLength > MAX_ZARR_CHUNK_BYTES) {
+      outputLength > input.length * LZ4_MAX_EXPANSION + 64) {
     throw new Error('Invalid LZ4 output size');
   }
 
@@ -561,7 +405,7 @@ function unshuffleBytes(shuffled, typesize) {
 /**
  * Decode the bounded Blosc v1 frame subset produced by NumCodecs with LZ4.
  */
-export function decodeBloscLz4(
+function decodeBloscLz4(
   inputValue,
   compressor,
   expectedByteLength = null,
@@ -569,11 +413,6 @@ export function decodeBloscLz4(
 ) {
   validateCompressor(compressor);
   const input = asBytes(inputValue);
-  if (input.byteLength > MAX_ZARR_ENCODED_CHUNK_BYTES) {
-    throw new Error(
-      `Compressed Zarr chunk exceeds the ${MAX_ZARR_ENCODED_CHUNK_BYTES}-byte browser limit`
-    );
-  }
   if (input.byteLength < 16) {
     throw new Error('Malformed Blosc frame: header is truncated');
   }
@@ -593,8 +432,10 @@ export function decodeBloscLz4(
   if (typesize === 0) {
     throw new Error('Malformed Blosc frame: typesize is zero');
   }
-  if (nbytes > MAX_ZARR_CHUNK_BYTES) {
-    throw new Error(`Blosc chunk exceeds the ${MAX_ZARR_CHUNK_BYTES}-byte browser limit`);
+  if (expectedByteLength == null && nbytes > input.byteLength * LZ4_MAX_EXPANSION + 64) {
+    throw new Error(
+      `Malformed Blosc frame: declares ${nbytes} decoded bytes, more than LZ4 can encode in ${input.byteLength}`
+    );
   }
   if (expectedByteLength != null && nbytes !== expectedByteLength) {
     throw new Error(
@@ -730,28 +571,34 @@ export function decodeBloscLz4(
   return output.buffer;
 }
 
-async function decompressStream(input, format, outputLimit) {
+/**
+ * Inflate one chunk. With a declared size the output is allocated once at
+ * exactly that size and inflation stops the moment it would pass it; without
+ * one (variable-length strings) the output is bounded by DEFLATE's own
+ * maximum expansion of the input.
+ */
+async function decompressStream(input, format, expectedByteLength) {
   if (typeof DecompressionStream === 'undefined' ||
       typeof ReadableStream === 'undefined') {
     throw new Error(
-      `${format} decompression is unavailable in this browser; use Blosc/LZ4, an uncompressed Zarr store, or the Cellucid server`
+      `${format} decompression is unavailable in this browser; use Blosc/LZ4 or an uncompressed Zarr store`
     );
   }
+  const outputLimit = expectedByteLength ?? input.byteLength * DEFLATE_MAX_EXPANSION + 64;
 
   let stream;
   try {
-    const source = new ReadableStream({
-      start(controller) {
-        controller.enqueue(input);
-        controller.close();
-      }
-    });
-    stream = source.pipeThrough(new DecompressionStream(format));
+    // Sliced input keeps native inflation paced by this reader, so the limit
+    // below cancels a DEFLATE bomb within one slice instead of after the
+    // whole chunk has expanded.
+    stream = createSlicedInputStream([input])
+      .pipeThrough(new DecompressionStream(format));
   } catch (error) {
     throw new Error(`Unable to initialize ${format} decompression`, { cause: error });
   }
 
   const reader = stream.getReader();
+  const exact = expectedByteLength != null ? new Uint8Array(expectedByteLength) : null;
   const pieces = [];
   let total = 0;
   try {
@@ -759,18 +606,21 @@ async function decompressStream(input, format, outputLimit) {
       const { value, done } = await reader.read();
       if (done) break;
       const bytes = asBytes(value);
-      total += bytes.byteLength;
-      if (total > outputLimit || total > MAX_ZARR_CHUNK_BYTES) {
-        await reader.cancel();
-        throw new Error(`Decompressed Zarr chunk exceeds the ${outputLimit}-byte limit`);
+      if (total + bytes.byteLength > outputLimit) {
+        throw new Error(`Decompressed Zarr chunk exceeds its ${outputLimit}-byte declared size`);
       }
-      pieces.push(bytes);
+      if (exact !== null) exact.set(bytes, total);
+      else pieces.push(bytes);
+      total += bytes.byteLength;
     }
   } catch (error) {
-    if (/exceeds the/.test(error?.message ?? '')) throw error;
+    await reader.cancel(error).catch(() => {});
+    if (/exceeds its/.test(error?.message ?? '')) throw error;
     throw new Error(`Invalid or unsupported ${format} Zarr chunk`, { cause: error });
   }
-
+  if (exact !== null) {
+    return total === exact.length ? exact.buffer : exact.slice(0, total).buffer;
+  }
   const output = new Uint8Array(total);
   let offset = 0;
   for (const piece of pieces) {
@@ -788,9 +638,6 @@ async function decompressChunk(
 ) {
   validateCompressor(compressor);
   const input = asBytes(inputValue);
-  if (input.byteLength > MAX_ZARR_ENCODED_CHUNK_BYTES) {
-    throw new Error(`Compressed Zarr chunk exceeds the ${MAX_ZARR_ENCODED_CHUNK_BYTES}-byte browser limit`);
-  }
 
   let output;
   if (compressor === null) {
@@ -804,18 +651,9 @@ async function decompressChunk(
     );
   } else {
     const format = compressor.id === 'zlib' ? 'deflate' : 'gzip';
-    output = await decompressStream(
-      input,
-      format,
-      expectedByteLength ?? MAX_ZARR_CHUNK_BYTES
-    );
+    output = await decompressStream(input, format, expectedByteLength);
   }
 
-  if (output.byteLength > MAX_ZARR_CHUNK_BYTES) {
-    throw new Error(
-      `Decompressed Zarr chunk exceeds the ${MAX_ZARR_CHUNK_BYTES}-byte browser limit`
-    );
-  }
   if (expectedByteLength != null && output.byteLength !== expectedByteLength) {
     throw new Error(
       `Invalid Zarr chunk: decoded ${output.byteLength} bytes; expected ${expectedByteLength}`
@@ -836,8 +674,7 @@ export function decodeVLenUtf8(inputValue, expectedItems) {
       `Malformed VLenUTF8 payload: contains ${itemCount} items; expected ${expectedItems}`
     );
   }
-  if (itemCount > MAX_ZARR_STRING_ITEMS ||
-      itemCount > Math.floor((input.byteLength - 4) / 4)) {
+  if (itemCount > Math.floor((input.byteLength - 4) / 4)) {
     throw new Error('Malformed VLenUTF8 payload: item count exceeds payload bounds');
   }
 
@@ -873,12 +710,11 @@ export async function decodeZarrChunk(inputValue, meta, dtypeInfo, chunkElementC
     throw new Error('Invalid Zarr chunk element count');
   }
 
+  // The decoded size every chunk of a fixed-width array must have: its
+  // declared shape times its item size. Nothing else bounds a chunk.
   const expectedByteLength = dtypeInfo.bytes == null
     ? null
     : checkedProduct([chunkElementCount, dtypeInfo.bytes], 'chunk byte size');
-  if (expectedByteLength != null && expectedByteLength > MAX_ZARR_CHUNK_BYTES) {
-    throw new Error(`Zarr chunk exceeds the ${MAX_ZARR_CHUNK_BYTES}-byte browser limit`);
-  }
 
   const decoded = await decompressChunk(
     inputValue,

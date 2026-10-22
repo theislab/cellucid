@@ -5,7 +5,7 @@ import { CommunityAnnotationSession } from '../assets/js/app/community-annotatio
 import {
   CommunityAnnotationGitHubSync,
   parseOwnerRepo,
-  setDatasetAnnotationRepoFromUrlParamAsync,
+  resolveAnnotationRepositoryFromUrlParam,
 } from '../assets/js/app/community-annotations/github-sync.js';
 import { CommunityAnnotationFileCache } from '../assets/js/app/community-annotations/file-cache.js';
 import {
@@ -34,8 +34,6 @@ import {
 import { isAnnotationRepoConnected } from '../assets/js/app/community-annotations/access-store.js';
 import { CommunityAnnotationScopeLock } from '../assets/js/app/community-annotations/scope-lock.js';
 import {
-  getCommunityFeedback,
-  lookupByName,
   lookupByOntologyId,
   searchCellTypes,
 } from '../assets/js/app/community-annotations/cap-api.js';
@@ -126,6 +124,13 @@ function validMerges(overrides = {}) {
     ],
     ...overrides,
   };
+}
+
+/** One Pull's remote user files, folded for `session` as a Pull folds them. */
+function remoteFiles(session, docs) {
+  const files = session.createRemoteUserFiles();
+  for (const doc of docs) files.add(doc);
+  return files;
 }
 
 test('community annotation state preserves every legal prototype-named field and dataset identity', () => {
@@ -395,7 +400,7 @@ test('prototype-named annotation identities survive local persistence and atomic
       },
     });
     assert.throws(
-      () => consumer.rebuildMergedViewFromUserFiles([conflicting]),
+      () => consumer.rebuildMergedViewFromUserFiles(remoteFiles(consumer, [conflicting])),
       /conflicts with the suggestion owned by/
     );
     assert.equal(Object.getPrototypeOf(consumer._state.myComments), null);
@@ -409,7 +414,7 @@ test('prototype-named annotation identities survive local persistence and atomic
     );
 
     const pullInput = {
-      remoteUserDocs: [remote],
+      remoteUserFiles: remoteFiles(consumer, [remote]),
       moderationDocument: null,
       categoricalFieldKeys: ['cell_type', ...identities],
       fieldsToAnnotate: identities,
@@ -1504,10 +1509,8 @@ test('unauthenticated default-branch resolution returns false without storage mu
   });
   try {
     assert.equal(
-      await setDatasetAnnotationRepoFromUrlParamAsync({
-        datasetId: 'synthetic',
+      await resolveAnnotationRepositoryFromUrlParam({
         urlParamValue: 'owner/repo',
-        username: 'ghid_42',
       }),
       false
     );
@@ -1681,7 +1684,6 @@ test('persisting a new GitHub session still fails loudly when storage refuses', 
             '/auth/installations',
             '/auth/installation-repos',
             '/cap/lookup-cells',
-            '/cap/search-datasets',
             '/api/repos/*',
           ],
         };
@@ -1908,7 +1910,6 @@ test('GitHub sign-in verifies the exact current Worker before navigation and pre
         '/auth/installations',
         '/auth/installation-repos',
         '/cap/lookup-cells',
-        '/cap/search-datasets',
         '/api/repos/*',
       ],
     }), { status: 200 });
@@ -1977,7 +1978,6 @@ test('stale Worker capabilities fail before OAuth navigation or token exposure',
         '/auth/installations',
         '/auth/installation-repos',
         '/cap/lookup-cells',
-        '/cap/search-datasets',
         '/api/repos/*',
       ],
     }), { status: 200 });
@@ -2345,7 +2345,6 @@ test('OAuth callback proves Worker capabilities before exposing its candidate to
           '/auth/installations',
           '/auth/installation-repos',
           '/cap/lookup-cells',
-          '/cap/search-datasets',
           '/api/repos/*',
         ],
       }), { status: 200 });
@@ -2408,7 +2407,6 @@ test('restored GitHub sessions prove Worker capabilities before token-bearing re
           '/auth/installations',
           '/auth/installation-repos',
           '/cap/lookup-cells',
-          '/cap/search-datasets',
           '/api/repos/*',
         ],
       }), { status: 200 });
@@ -2481,7 +2479,6 @@ test('overlapping GitHub sign-in preflights are generation-owned and caller-abor
       '/auth/installations',
       '/auth/installation-repos',
       '/cap/lookup-cells',
-      '/cap/search-datasets',
       '/api/repos/*',
     ],
   }), { status: 200 });
@@ -3575,6 +3572,67 @@ test('scope lock ownership is checked against the authoritative storage record',
 });
 
 
+test('scope lock keeps one pagehide release listener across scope switches', () => {
+  const localValues = new Map();
+  const sessionValues = new Map([
+    [
+      'cellucid:community-annotations:tab-id:v1',
+      '123e4567-e89b-42d3-a456-426614174000',
+    ],
+  ]);
+  const listeners = new Map();
+  const previous = {
+    localStorage: globalThis.localStorage,
+    sessionStorage: globalThis.sessionStorage,
+    window: globalThis.window,
+  };
+  globalThis.localStorage = {
+    getItem: (key) => localValues.has(key) ? localValues.get(key) : null,
+    setItem: (key, value) => localValues.set(String(key), String(value)),
+    removeItem: (key) => localValues.delete(String(key)),
+  };
+  globalThis.sessionStorage = {
+    getItem: (key) => sessionValues.has(key) ? sessionValues.get(key) : null,
+    setItem: (key, value) => sessionValues.set(String(key), String(value)),
+    removeItem: (key) => sessionValues.delete(String(key)),
+  };
+  globalThis.window = {
+    addEventListener(type, listener) {
+      if (!listeners.has(type)) listeners.set(type, new Set());
+      listeners.get(type).add(listener);
+    },
+    removeEventListener(type, listener) {
+      listeners.get(type)?.delete(listener);
+    },
+  };
+  const lock = new CommunityAnnotationScopeLock();
+  try {
+    for (const datasetId of ['first', 'second', 'third', 'first']) {
+      const scopeKey = toCacheScopeKey({
+        datasetId,
+        repoRef: 'owner/repo@main',
+        userId: 42,
+      });
+      assert.equal(lock.setScopeKey(scopeKey).ok, true);
+      assert.equal(listeners.get('pagehide')?.size, 1);
+    }
+    const [onPagehide] = listeners.get('pagehide');
+    onPagehide();
+    assert.equal(lock.getScopeKey(), null);
+    assert.equal(listeners.get('pagehide').size, 0);
+    assert.equal(
+      [...localValues.keys()].some(key => key.includes(':lock:')),
+      false
+    );
+  } finally {
+    lock.release();
+    for (const [name, value] of Object.entries(previous)) {
+      if (value === undefined) delete globalThis[name];
+      else globalThis[name] = value;
+    }
+  }
+});
+
 test('merge contract rejects duplicate mappings and cycles', () => {
   const duplicate = validMerges();
   duplicate.merges.push({
@@ -4101,7 +4159,9 @@ test('GitHub pull returns only exact path/SHA/document records', async () => {
       branch: 'main',
       workerOrigin: 'https://worker.example',
     });
-    const result = await sync.pullAllUsers();
+    const docs = [];
+    const result = await sync.pullAllUsers({ onRecords: async records => { docs.push(...records); } });
+    result.docs = docs;
     assert.deepEqual(result.docs, [
       {
         path: 'annotations/users/ghid_7.json',
@@ -4149,7 +4209,7 @@ test('GitHub pull rejects one invalid user blob instead of returning a partial s
       workerOrigin: 'https://worker.example',
     });
     await assert.rejects(
-      () => sync.pullAllUsers(),
+      () => sync.pullAllUsers({ onRecords: async () => {} }),
       /unknown field.*unknownField|unknownField.*unknown field/i
     );
   } finally {
@@ -4191,7 +4251,7 @@ test('browser JSON boundary rejects decoded duplicate object keys', async () => 
       branch: 'main',
       workerOrigin: 'https://worker.example',
     });
-    await assert.rejects(() => sync.pullAllUsers(), /duplicate JSON object key "version"/);
+    await assert.rejects(() => sync.pullAllUsers({ onRecords: async () => {} }), /duplicate JSON object key "version"/);
   } finally {
     globalThis.fetch = previousFetch;
   }
@@ -4222,7 +4282,7 @@ test('GitHub HTTP success requires one exact JSON response document', async (t) 
           branch: 'main',
           workerOrigin: 'https://worker.example',
         });
-        await assert.rejects(() => sync.pullAllUsers(), scenario.pattern);
+        await assert.rejects(() => sync.pullAllUsers({ onRecords: async () => {} }), scenario.pattern);
       } finally {
         globalThis.fetch = previousFetch;
       }
@@ -4230,7 +4290,7 @@ test('GitHub HTTP success requires one exact JSON response document', async (t) 
   }
 });
 
-test('CAP exact lookups never substitute the first approximate result', async (t) => {
+test('CAP exact ontology lookup never substitutes the first approximate result', async (t) => {
   const capResult = (overrides = {}) => ({
     id: 'cap-result-1',
     name: 'T cell',
@@ -4265,45 +4325,6 @@ test('CAP exact lookups never substitute the first approximate result', async (t
     ]);
     try {
       assert.deepEqual(await lookupByOntologyId('CL:0000625'), {
-        results: [],
-        omittedInvalidCount: 0,
-      });
-    } finally {
-      globalThis.fetch = previousFetch;
-    }
-  });
-
-  await t.test('cell type name', async () => {
-    const previousFetch = globalThis.fetch;
-    globalThis.fetch = async () => responseFor([
-      capResult({
-        name: 'T cell',
-        fullName: 'T cell',
-        ontologyTerm: 'T cell',
-        ontologyTermId: 'CL:0000084',
-      }),
-    ]);
-    try {
-      assert.deepEqual(await lookupByName('B cell'), {
-        results: [],
-        omittedInvalidCount: 0,
-      });
-    } finally {
-      globalThis.fetch = previousFetch;
-    }
-  });
-
-  await t.test('community feedback', async () => {
-    const previousFetch = globalThis.fetch;
-    globalThis.fetch = async () => responseFor([
-      capResult({
-        name: 'T cell',
-        fullName: 'T cell',
-        scores: { agree: 10, disagree: 1, idk: 2 },
-      }),
-    ]);
-    try {
-      assert.deepEqual(await getCommunityFeedback('B cell'), {
         results: [],
         omittedInvalidCount: 0,
       });
@@ -4353,7 +4374,7 @@ test('GitHub pull rejects non-current JSON filenames under annotations/users', a
       branch: 'main',
       workerOrigin: 'https://worker.example',
     });
-    await assert.rejects(() => sync.pullAllUsers(), /Invalid annotation user-file path/);
+    await assert.rejects(() => sync.pullAllUsers({ onRecords: async () => {} }), /Invalid annotation user-file path/);
   } finally {
     globalThis.fetch = previousFetch;
   }
@@ -4372,7 +4393,7 @@ test('GitHub pull rejects truncated trees instead of compiling a partial reposit
       branch: 'main',
       workerOrigin: 'https://worker.example',
     });
-    await assert.rejects(() => sync.pullAllUsers(), /truncated git tree/);
+    await assert.rejects(() => sync.pullAllUsers({ onRecords: async () => {} }), /truncated git tree/);
   } finally {
     globalThis.fetch = previousFetch;
   }
@@ -4425,7 +4446,7 @@ test('GitHub pull rejects alternate blob encodings and UTF-8 BOM input', async (
           branch: 'main',
           workerOrigin: 'https://worker.example',
         });
-        await assert.rejects(() => sync.pullAllUsers(), scenario.pattern);
+        await assert.rejects(() => sync.pullAllUsers({ onRecords: async () => {} }), scenario.pattern);
       } finally {
         globalThis.fetch = previousFetch;
       }
@@ -4552,4 +4573,45 @@ test('raw-file SHA index and prefix filters use one exact representation', () =>
     if (previousLocalStorage === undefined) delete globalThis.localStorage;
     else globalThis.localStorage = previousLocalStorage;
   }
+});
+
+
+test('counts and exported keys have no fixed limit; the 1 MB file bounds them', () => {
+  // A category label as long as an export may write, many markers, many
+  // buckets, and a minimum voter count above the former 50.
+  const longBucket = `cell_type:${'L'.repeat(5_000)}`;
+  const buckets = Object.fromEntries(
+    Array.from({ length: 6_000 }, (_, index) => [`cell_type:c${index}`, []])
+  );
+  const user = validRemoteUser({
+    suggestions: {
+      ...buckets,
+      [longBucket]: [
+        {
+          id: 'suggestion-long',
+          label: 'T cell',
+          ontologyId: null,
+          evidence: null,
+          markers: Array.from({ length: 500 }, (_, index) => `G${index}`),
+          proposedBy: 'ghid_7',
+          proposedAt: '2026-07-25T01:02:03.456Z',
+          editedAt: null,
+        },
+      ],
+    },
+  });
+  assert.doesNotThrow(() => assertUserDocument(user));
+
+  const config = validConfig();
+  config.supportedDatasets[0].annotatableSettings.cell_type.minAnnotators = 500;
+  const fields = Array.from({ length: 300 }, (_, index) => `field_${index}`);
+  config.supportedDatasets[0].fieldsToAnnotate = ['cell_type', ...fields];
+  for (const field of fields) {
+    config.supportedDatasets[0].annotatableSettings[field] = { minAnnotators: 1, threshold: 0.5 };
+  }
+  assert.doesNotThrow(() => assertConfigDocument(config));
+
+  const merges = validMerges();
+  merges.merges[0].bucket = longBucket;
+  assert.doesNotThrow(() => assertMergesDocument(merges));
 });

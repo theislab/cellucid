@@ -20,6 +20,7 @@
  */
 
 import { isFiniteNumber, mean, std } from './number-utils.js';
+import { pearsonCorrelation } from '../compute/math-utils.js';
 
 // =============================================================================
 // MATRIX TRANSFORMATIONS
@@ -66,42 +67,6 @@ export function zscoreRows(matrix, nRows, nCols) {
 }
 
 /**
- * Apply column-wise z-score normalization to a matrix.
- * Each column is normalized to have mean=0 and std=1.
- *
- * @param {Float32Array} matrix - Row-major flattened matrix
- * @param {number} nRows - Number of rows
- * @param {number} nCols - Number of columns
- * @returns {Float32Array} New normalized matrix
- */
-export function zscoreCols(matrix, nRows, nCols) {
-  const result = new Float32Array(matrix.length);
-
-  for (let c = 0; c < nCols; c++) {
-    const col = [];
-
-    // Extract finite values from column
-    for (let r = 0; r < nRows; r++) {
-      const v = matrix[r * nCols + c];
-      if (isFiniteNumber(v)) col.push(v);
-    }
-
-    // Compute column statistics
-    const mu = col.length > 0 ? mean(col) : 0;
-    const sigma = col.length > 1 ? (std(col) || 1) : 1;
-
-    // Normalize column values
-    for (let r = 0; r < nRows; r++) {
-      const idx = r * nCols + c;
-      const v = matrix[idx];
-      result[idx] = isFiniteNumber(v) ? (v - mu) / sigma : 0;
-    }
-  }
-
-  return result;
-}
-
-/**
  * Apply log1p transform (log(1 + x)) to all values.
  * Handles negative values by clamping to 0.
  *
@@ -119,18 +84,6 @@ export function log1pTransform(values) {
     result[i] = Math.log1p(Math.max(0, values[i]));
   }
   return result;
-}
-
-/**
- * Apply log1p transform to a matrix (in-place style, returns new array).
- *
- * @param {Float32Array} matrix - Row-major flattened matrix
- * @param {number} nRows - Number of rows
- * @param {number} nCols - Number of columns
- * @returns {Float32Array} Transformed matrix
- */
-export function log1pMatrix(matrix, nRows, nCols) {
-  return log1pTransform(matrix);
 }
 
 // =============================================================================
@@ -208,51 +161,13 @@ export function reorderCols(matrix, nRows, nCols, colOrder) {
 // =============================================================================
 
 /**
- * Compute Pearson correlation between two vectors.
- * Handles NaN values by skipping them.
- *
- * @param {Float32Array|number[]} a - First vector
- * @param {Float32Array|number[]} b - Second vector (must have same length as a)
- * @returns {number} Pearson correlation coefficient (-1 to 1), or 0 if insufficient data
- *
- * @example
- * const a = new Float32Array([1, 2, 3, 4, 5]);
- * const b = new Float32Array([2, 4, 6, 8, 10]);
- * pearsonCorrelation(a, b); // Returns 1.0
- */
-export function pearsonCorrelation(a, b) {
-  const n = Math.min(a.length, b.length);
-  let count = 0;
-  let sumA = 0, sumB = 0, sumAB = 0, sumA2 = 0, sumB2 = 0;
-
-  for (let i = 0; i < n; i++) {
-    const ai = a[i], bi = b[i];
-    if (!isFiniteNumber(ai) || !isFiniteNumber(bi)) continue;
-
-    count++;
-    sumA += ai;
-    sumB += bi;
-    sumAB += ai * bi;
-    sumA2 += ai * ai;
-    sumB2 += bi * bi;
-  }
-
-  if (count < 2) return 0;
-
-  const num = count * sumAB - sumA * sumB;
-  const denom = Math.sqrt((count * sumA2 - sumA * sumA) * (count * sumB2 - sumB * sumB));
-
-  return denom === 0 ? 0 : num / denom;
-}
-
-/**
  * Compute Euclidean distance between two vectors.
  *
  * @param {Float32Array|number[]} a - First vector
  * @param {Float32Array|number[]} b - Second vector
  * @returns {number} Euclidean distance
  */
-export function euclideanDistance(a, b) {
+function euclideanDistance(a, b) {
   const n = Math.min(a.length, b.length);
   let sumSq = 0;
   let count = 0;
@@ -275,7 +190,7 @@ export function euclideanDistance(a, b) {
  * @param {Float32Array|number[]} b - Second vector
  * @returns {number} Cosine distance (0 to 2)
  */
-export function cosineDistance(a, b) {
+function cosineDistance(a, b) {
   const n = Math.min(a.length, b.length);
   let dotProduct = 0, normA = 0, normB = 0;
 
@@ -311,7 +226,7 @@ export function cosineDistance(a, b) {
  * const dist = correlationDistanceMatrix(matrix, 2, 3);
  * // Returns 2x2 distance matrix
  */
-export function correlationDistanceMatrix(matrix, nRows, nCols) {
+function correlationDistanceMatrix(matrix, nRows, nCols) {
   const dist = new Float32Array(nRows * nRows);
 
   for (let i = 0; i < nRows; i++) {
@@ -339,7 +254,7 @@ export function correlationDistanceMatrix(matrix, nRows, nCols) {
  * @param {number} nCols - Number of columns
  * @returns {Float32Array} nRows x nRows distance matrix (symmetric)
  */
-export function euclideanDistanceMatrix(matrix, nRows, nCols) {
+function euclideanDistanceMatrix(matrix, nRows, nCols) {
   const dist = new Float32Array(nRows * nRows);
 
   for (let i = 0; i < nRows; i++) {
@@ -366,7 +281,7 @@ export function euclideanDistanceMatrix(matrix, nRows, nCols) {
  * @param {number} nCols - Number of columns
  * @returns {Float32Array} nRows x nRows distance matrix (symmetric)
  */
-export function cosineDistanceMatrix(matrix, nRows, nCols) {
+function cosineDistanceMatrix(matrix, nRows, nCols) {
   const dist = new Float32Array(nRows * nRows);
 
   for (let i = 0; i < nRows; i++) {
@@ -405,79 +320,3 @@ export function computeDistanceMatrix(matrix, nRows, nCols, metric = 'correlatio
       return correlationDistanceMatrix(matrix, nRows, nCols);
   }
 }
-
-// =============================================================================
-// UTILITY FUNCTIONS
-// =============================================================================
-
-/**
- * Get min and max values from a matrix.
- *
- * @param {Float32Array} matrix - Matrix values
- * @returns {{ min: number, max: number }}
- */
-export function getMatrixMinMax(matrix) {
-  let min = Infinity;
-  let max = -Infinity;
-
-  for (let i = 0; i < matrix.length; i++) {
-    const v = matrix[i];
-    if (!isFiniteNumber(v)) continue;
-    if (v < min) min = v;
-    if (v > max) max = v;
-  }
-
-  return {
-    min: min === Infinity ? 0 : min,
-    max: max === -Infinity ? 0 : max
-  };
-}
-
-/**
- * Clamp matrix values to a range.
- *
- * @param {Float32Array} matrix - Input matrix
- * @param {number} min - Minimum value
- * @param {number} max - Maximum value
- * @returns {Float32Array} Clamped matrix
- */
-export function clampMatrix(matrix, min, max) {
-  const result = new Float32Array(matrix.length);
-  for (let i = 0; i < matrix.length; i++) {
-    const v = matrix[i];
-    if (!isFiniteNumber(v)) {
-      result[i] = 0;
-    } else {
-      result[i] = Math.max(min, Math.min(max, v));
-    }
-  }
-  return result;
-}
-
-export default {
-  // Transformations
-  zscoreRows,
-  zscoreCols,
-  log1pTransform,
-  log1pMatrix,
-
-  // Matrix operations
-  transposeMatrix,
-  reorderRows,
-  reorderCols,
-
-  // Correlation and distance
-  pearsonCorrelation,
-  euclideanDistance,
-  cosineDistance,
-
-  // Distance matrices
-  correlationDistanceMatrix,
-  euclideanDistanceMatrix,
-  cosineDistanceMatrix,
-  computeDistanceMatrix,
-
-  // Utilities
-  getMatrixMinMax,
-  clampMatrix
-};

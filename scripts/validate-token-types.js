@@ -39,6 +39,8 @@ const DESIGN_PREFIXES = [
   'sidebar-',
   'accordion-',
   'header-',
+  'control-',
+  'type-',
   // Typography
   'font-',
   'text-',

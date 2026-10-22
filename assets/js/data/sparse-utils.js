@@ -64,8 +64,7 @@ export function buildCscFromCsr(sparse) {
     return {
       colIndptr: new Int32Array(nCols + 1),
       rowIndices: new Int32Array(0),
-      colData: new Float32Array(0),
-      exactInteger: sparse.exactInteger === true
+      colData: new Float32Array(0)
     };
   }
 
@@ -108,8 +107,7 @@ export function buildCscFromCsr(sparse) {
   return {
     colIndptr,
     rowIndices,
-    colData,
-    exactInteger: sparse.exactInteger === true
+    colData
   };
 }
 
@@ -125,18 +123,12 @@ export function buildCscFromCsr(sparse) {
 export function addSparseFloat32(
   current,
   value,
-  label = 'Sparse column',
-  requireExactInteger = false
+  label = 'Sparse column'
 ) {
   const sum = current + value;
   const narrowed = Math.fround(sum);
   if (Number.isFinite(sum) && !Number.isFinite(narrowed)) {
     throw new Error(`${label} value is outside the Float32 range`);
-  }
-  if (requireExactInteger && Number(narrowed) !== sum) {
-    throw new Error(
-      `${label} integer sum ${sum} cannot be represented exactly in Float32`
-    );
   }
   return narrowed;
 }
@@ -182,8 +174,7 @@ export function getSparseColumn(cscData, colIdx, nRows) {
     result[rowIdx] = addSparseFloat32(
       result[rowIdx],
       colData[j],
-      'Sparse column',
-      cscData.exactInteger === true
+      'Sparse column'
     );
   }
 
@@ -204,28 +195,6 @@ export function getSparseColumn(cscData, colIdx, nRows) {
  * @param {number} nCells - Exact observation-axis length
  * @returns {{sources: Uint32Array, destinations: Uint32Array, weights: Float64Array, nCells: number, nEdges: number, maxNeighbors: number}}
  */
-const MAX_CONNECTIVITY_WORKING_BYTES = 512 * 1024 * 1024;
-
-function connectivityStorageBytes(values, unpackedBytesPerItem) {
-  if (!values) return 0n;
-  if (Number.isSafeInteger(values.byteLength) && values.byteLength >= 0) {
-    return BigInt(values.byteLength);
-  }
-  if (!Number.isSafeInteger(values.length) || values.length < 0) {
-    throw new Error('Connectivity storage has an invalid length');
-  }
-  return BigInt(values.length) * BigInt(unpackedBytesPerItem);
-}
-
-function requireConnectivityWorkingSet(sourceBytes, additionalBytes) {
-  if (sourceBytes + additionalBytes >
-      BigInt(MAX_CONNECTIVITY_WORKING_BYTES)) {
-    throw new Error(
-      `Connectivity edge working set exceeds the ${MAX_CONNECTIVITY_WORKING_BYTES}-byte browser limit; use the Cellucid server or prepared format`
-    );
-  }
-}
-
 function connectivityWeight(value, label) {
   if (typeof value !== 'number') {
     throw new TypeError(
@@ -309,6 +278,33 @@ function heapSortNumeric(keys, values, length) {
   }
 }
 
+/**
+ * The edge list of one connectivity matrix as a reader returns it, or null
+ * for an absent matrix: what `getConnectivityEdges(key)` of a direct reader
+ * answers. The matrix is checked and walked by `extractConnectivityEdges`.
+ *
+ * @param {Object|null} conn - A reader's `getConnectivities(key)` result
+ * @param {number} nCells
+ * @returns {{sources: Uint32Array, destinations: Uint32Array, weights: Float64Array, nCells: number, nEdges: number, maxNeighbors: number}|null}
+ */
+export function connectivityEdgesOf(conn, nCells) {
+  if (conn === null) return null;
+  if (!conn || typeof conn !== 'object' || Array.isArray(conn)) {
+    throw new TypeError(
+      'Connectivity loader must return an exact null absence or one matrix object'
+    );
+  }
+  const edges = extractConnectivityEdges(conn, nCells);
+  return {
+    sources: edges.sources,
+    destinations: edges.destinations,
+    weights: edges.weights,
+    nCells: edges.nCells,
+    nEdges: edges.nEdges,
+    maxNeighbors: edges.maxNeighbors,
+  };
+}
+
 export function extractConnectivityEdges(sparse, nCells) {
   if (!Number.isSafeInteger(nCells) || nCells <= 0) {
     throw new Error('Connectivity cell count must be a positive safe integer');
@@ -327,13 +323,6 @@ export function extractConnectivityEdges(sparse, nCells) {
         data.length !== nCells * nCells) {
       throw new Error('Dense connectivity matrix must be square and cell-aligned');
     }
-    const maximumEdgeCount =
-      BigInt(nCells) * BigInt(Math.max(0, nCells - 1)) / 2n;
-    const sourceBytes = connectivityStorageBytes(data, 8);
-    requireConnectivityWorkingSet(
-      sourceBytes,
-      maximumEdgeCount * 44n + BigInt(nCells) * 4n
-    );
 
     let edgeCount = 0;
     for (let source = 0; source < nCells; source++) {
@@ -365,10 +354,6 @@ export function extractConnectivityEdges(sparse, nCells) {
         }
       }
     }
-    requireConnectivityWorkingSet(
-      sourceBytes,
-      BigInt(edgeCount) * 44n + BigInt(nCells) * 4n
-    );
     const edgeSources = new Uint32Array(edgeCount);
     const edgeDestinations = new Uint32Array(edgeCount);
     const edgeWeights = new Float64Array(edgeCount);
@@ -441,20 +426,8 @@ export function extractConnectivityEdges(sparse, nCells) {
     throw new Error('Connectivity pointers must span every sparse entry');
   }
 
-  const sourceBytes =
-    connectivityStorageBytes(data, 8) +
-    connectivityStorageBytes(indices, 8) +
-    connectivityStorageBytes(indptr, 8);
-  // One non-mutating coordinate-key/weight copy plus the canonical,
-  // render-owned, and GPU-staging edge payloads for the largest valid
-  // symmetric graph. Heap sort below is in-place on the coordinate copy.
-  const maximumEdgeCount = Math.floor(indices.length / 2);
-  requireConnectivityWorkingSet(
-    sourceBytes,
-    BigInt(indices.length) * 16n +
-      BigInt(maximumEdgeCount) * 44n +
-      BigInt(nCells) * 4n
-  );
+  // One non-mutating coordinate-key/weight copy; the heap sort below is in
+  // place on it.
   const directedKeys = new Float64Array(indices.length);
   const directedWeights = new Float64Array(indices.length);
   const directedCount = indices.length;
@@ -537,11 +510,6 @@ export function extractConnectivityEdges(sparse, nCells) {
     }
     if (row < column) edgeCount++;
   }
-
-  requireConnectivityWorkingSet(
-    sourceBytes + BigInt(indices.length) * 16n,
-    BigInt(edgeCount) * 44n + BigInt(nCells) * 4n
-  );
   const edgeSources = new Uint32Array(edgeCount);
   const edgeDestinations = new Uint32Array(edgeCount);
   const edgeWeights = new Float64Array(edgeCount);
@@ -614,15 +582,13 @@ export function toInt32Array(arr, label = 'Integer value') {
  */
 export function toFloat32Array(
   arr,
-  label = 'Numeric value',
-  requireExactInteger = false
+  label = 'Numeric value'
 ) {
   if (!arr || !Number.isSafeInteger(arr.length) || arr.length < 0) {
     throw new Error(`${label} array has an invalid length`);
   }
 
-  // Already Float32Array - return as-is when no stronger contract is needed.
-  if (arr instanceof Float32Array && !requireExactInteger) {
+  if (arr instanceof Float32Array) {
     return arr;
   }
 
@@ -644,146 +610,7 @@ export function toFloat32Array(
     if (Number.isFinite(value) && !Number.isFinite(narrowed)) {
       throw new Error(`${label} value is outside the Float32 range`);
     }
-    if (requireExactInteger && Number(narrowed) !== value) {
-      throw new Error(
-        `${label} integer value ${value} cannot be represented exactly in Float32`
-      );
-    }
     result[i] = narrowed;
   }
   return result;
-}
-
-/**
- * Find the maximum value in an array without risking stack overflow.
- * Math.max(...arr) can fail for arrays > ~100k elements.
- *
- * @param {TypedArray|Array} arr - Array to find max in
- * @returns {number} Maximum value, or -1 if array is empty
- */
-export function findMax(arr) {
-  if (!arr || arr.length === 0) return -1;
-  let max = arr[0];
-  for (let i = 1; i < arr.length; i++) {
-    if (arr[i] > max) max = arr[i];
-  }
-  return max;
-}
-
-/**
- * Simple LRU (Least Recently Used) Cache implementation.
- * Used to limit memory usage for field data caches.
- *
- * When the cache exceeds maxSize, the least recently accessed items are evicted.
- * Access order is tracked: get() moves an item to most-recently-used position.
- */
-export class LRUCache {
-  /**
-   * Create a new LRU cache.
-   * @param {number} maxSize - Maximum number of items to store (default: 50)
-   */
-  constructor(maxSize = 50) {
-    this.maxSize = maxSize;
-    // Map maintains insertion order, which we use for LRU tracking
-    // Most recently used items are at the end (re-inserted on access)
-    this._cache = new Map();
-  }
-
-  /**
-   * Get an item from the cache.
-   * Moves the item to most-recently-used position.
-   * @param {string} key - Cache key
-   * @returns {*} Cached value or undefined if not found
-   */
-  get(key) {
-    if (!this._cache.has(key)) {
-      return undefined;
-    }
-    // Move to end (most recently used) by re-inserting
-    const value = this._cache.get(key);
-    this._cache.delete(key);
-    this._cache.set(key, value);
-    return value;
-  }
-
-  /**
-   * Set an item in the cache.
-   * Evicts least-recently-used items if cache is full.
-   * @param {string} key - Cache key
-   * @param {*} value - Value to cache
-   */
-  set(key, value) {
-    // If key exists, delete first to update position
-    if (this._cache.has(key)) {
-      this._cache.delete(key);
-    }
-
-    // Add to end (most recently used)
-    this._cache.set(key, value);
-
-    // Evict oldest items if over capacity
-    while (this._cache.size > this.maxSize) {
-      // Map.keys().next() gives the first (oldest) key
-      const oldestKey = this._cache.keys().next().value;
-      this._cache.delete(oldestKey);
-    }
-  }
-
-  /**
-   * Check if a key exists in the cache.
-   * Does NOT update access order (use get() for that).
-   * @param {string} key - Cache key
-   * @returns {boolean}
-   */
-  has(key) {
-    return this._cache.has(key);
-  }
-
-  /**
-   * Delete an item from the cache.
-   * @param {string} key - Cache key
-   * @returns {boolean} True if item was deleted
-   */
-  delete(key) {
-    return this._cache.delete(key);
-  }
-
-  /**
-   * Clear all items from the cache.
-   */
-  clear() {
-    this._cache.clear();
-  }
-
-  /**
-   * Get the current number of items in the cache.
-   * @returns {number}
-   */
-  get size() {
-    return this._cache.size;
-  }
-
-  /**
-   * Get all keys in the cache (oldest to newest).
-   * @returns {IterableIterator<string>}
-   */
-  keys() {
-    return this._cache.keys();
-  }
-
-  /**
-   * Get all values in the cache (oldest to newest).
-   * @returns {IterableIterator<*>}
-   */
-  values() {
-    return this._cache.values();
-  }
-
-  /**
-   * Get all entries in the cache (oldest to newest).
-   * @returns {IterableIterator<[string, *]>}
-   */
-  entries() {
-    return this._cache.entries();
-  }
 }

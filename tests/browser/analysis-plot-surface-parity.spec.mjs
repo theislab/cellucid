@@ -28,7 +28,7 @@ import { dismissWelcome } from './helpers/welcome.mjs';
  * analysis UI manager only assigns an id when the host markup has none, so the
  * id is not a stable contract while the markup owns it.
  */
-const DETAILED_PANEL = '.analysis-accordion-content[data-mode="detailed"]';
+const DETAILED_PANEL = '.analysis-mode-content[data-mode="detailed"]';
 
 /**
  * A `<select>` inside the Detailed panel, addressed by an option it owns.
@@ -130,7 +130,7 @@ function readSurfaces(page) {
           : null,
       };
     };
-    const panel = document.querySelector('.analysis-accordion-content[data-mode="detailed"]');
+    const panel = document.querySelector('.analysis-mode-content[data-mode="detailed"]');
     return {
       preview: surface(panel?.querySelector('.analysis-preview-container') ?? null),
       overlay: surface(

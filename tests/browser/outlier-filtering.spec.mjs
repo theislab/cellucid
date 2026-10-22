@@ -30,18 +30,18 @@ test('latent-space outlier filtering uses the active field raw quantiles', async
 
   await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
   await page.locator('#categorical-field').selectOption({ label: 'cell_type' });
-  await expect(page.locator('#outlier-filter-container')).toHaveClass(/visible/);
+  await expect(page.locator('#outlier-filter-container')).toBeVisible();
 
   await page.locator('#outlier-filter').fill('50');
   await page.locator('#outlier-filter').dispatchEvent('change');
 
-  await expect(page.locator('#filter-count')).toHaveText('Showing 60 of 120 points');
+  await expect(page.locator('#filter-count')).toHaveText('Showing 60 of 120 cells');
   await expect(page.locator('#active-filters')).toContainText('cell_type: outlier ≤ 50%');
 
   const filteredState = await page.evaluate(() => {
     const state = window._cellucidState;
     return {
-      quantiles: Array.from(state.outlierQuantilesArray),
+      quantiles: Array.from(state.getActiveOutlierQuantiles()),
       transparency: Array.from(state.categoryTransparency),
       visibility: Array.from(state.cellVisibilityMask),
     };
@@ -55,15 +55,15 @@ test('latent-space outlier filtering uses the active field raw quantiles', async
   expect(filteredState.visibility).toEqual(new Array(120).fill(1));
 
   await page.locator('#continuous-field').selectOption({ label: 'score' });
-  await expect(page.locator('#filter-count')).toHaveText('Showing all 120 points');
-  await expect(page.locator('#active-filters')).toHaveText('No filters active');
+  await expect(page.locator('#filter-count')).toHaveText('Showing all 120 cells');
+  await expect(page.locator('#active-filters')).toHaveText('No filters active.');
   await page.locator('#categorical-field').selectOption({ label: 'cell_type' });
-  await expect(page.locator('#filter-count')).toHaveText('Showing 60 of 120 points');
+  await expect(page.locator('#filter-count')).toHaveText('Showing 60 of 120 cells');
   await expect(page.locator('#active-filters')).toContainText('cell_type: outlier ≤ 50%');
 
   await page.locator('#outlier-filter').fill('100');
   await page.locator('#outlier-filter').dispatchEvent('change');
-  await expect(page.locator('#filter-count')).toHaveText('Showing all 120 points');
-  await expect(page.locator('#active-filters')).toHaveText('No filters active');
+  await expect(page.locator('#filter-count')).toHaveText('Showing all 120 cells');
+  await expect(page.locator('#active-filters')).toHaveText('No filters active.');
   expect(productErrors).toEqual([]);
 });

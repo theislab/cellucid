@@ -32,6 +32,8 @@
  * Vertex shader for GPU particle simulation with organic motion.
  * Each particle: position (vec3), velocity cache (vec3), age (float), cell index (uint)
  */
+import { FOG_GLSL } from '../../shaders/fog-shaders.js';
+
 export const PARTICLE_UPDATE_VS = `#version 300 es
 precision highp float;
 precision highp int;
@@ -403,11 +405,7 @@ uniform sampler2D u_alphaTex;
 uniform int u_alphaTexWidth;
 uniform bool u_useAlphaTex;
 
-// Fog parameters
-uniform float u_fogNear;
-uniform float u_fogFar;
-uniform float u_fogDensity;
-
+${FOG_GLSL}
 // Outputs to fragment shader
 out float v_age;
 out float v_speedNorm;
@@ -454,15 +452,8 @@ void main() {
   float eyeDepth = -viewPos.z;
   v_depth = eyeDepth;
 
-  // === FOG CALCULATION (matches main renderer) ===
-  // Use exponential squared fog for smooth atmospheric effect
-  float fogRange = max(u_fogFar - u_fogNear, 0.001);
-  float normalizedDist = clamp((eyeDepth - u_fogNear) / fogRange, 0.0, 1.0);
-
-  // Exponential squared - creates natural atmospheric falloff
-  float fogExponent = u_fogDensity * u_fogDensity * normalizedDist * normalizedDist;
-  v_fogFactor = exp(-fogExponent);
-  v_fogFactor = clamp(v_fogFactor, 0.0, 1.0);
+  // === FOG: the one model every fogged layer shares (fog-shaders.js) ===
+  v_fogFactor = fogTransmittance(length(viewPos.xyz));
 
   // === DYNAMIC PARTICLE SIZING ===
 
@@ -538,7 +529,6 @@ uniform float u_intensity;
 uniform float u_glowAmount;
 uniform float u_coreSharpness;
 uniform float u_cometStretch;
-uniform vec3 u_fogColor;
 
 out vec4 fragColor;
 
@@ -670,11 +660,10 @@ void main() {
   // Soft HDR curve - prevents harsh clipping while allowing bright peaks
   intensity = intensity * (1.0 + intensity * 0.4);
 
-  // Apply atmospheric fog color blending
-  vec3 finalColor = mix(u_fogColor * 0.08, particleColor, v_fogFactor);
-
-  // Final output - premultiplied alpha for additive blending
-  fragColor = vec4(finalColor * intensity, intensity);
+  // Final output - premultiplied alpha for additive blending. Fog has already
+  // dimmed the intensity with distance (depthBrightness above), which fades a
+  // particle toward whatever is behind it; no fog colour is mixed in.
+  fragColor = vec4(particleColor * intensity, intensity);
 }
 `;
 
@@ -1004,228 +993,5 @@ void main() {
   float alpha = clamp(totalAlpha * u_opacity, 0.0, 1.0);
 
   fragColor = vec4(clamp(color, 0.0, 1.0), alpha);
-}
-`;
-
-// =============================================================================
-// BONUS: VELOCITY-ALIGNED STREAK PARTICLES (Alternative Renderer)
-// =============================================================================
-
-/**
- * Vertex shader for velocity-aligned quad particles (higher quality than point sprites).
- * Creates proper comet shapes with head-to-tail geometry.
- */
-export const PARTICLE_STREAK_VS = `#version 300 es
-precision highp float;
-precision highp int;
-
-// Particle attributes
-layout(location = 0) in vec3 a_position;
-layout(location = 1) in vec3 a_velocity;
-layout(location = 2) in float a_age;
-layout(location = 3) in uint a_cellIndex;
-
-// Quad vertex (instanced)
-layout(location = 4) in vec2 a_quadVertex; // (-1,-1), (1,-1), (-1,1), (1,1)
-
-// Transform matrices
-uniform mat4 u_viewMatrix;
-uniform mat4 u_modelMatrix;
-uniform mat4 u_projectionMatrix;
-
-// Camera
-uniform vec3 u_cameraPosition;
-uniform float u_viewportHeight;
-
-// Appearance
-uniform float u_streakLength;
-uniform float u_streakWidth;
-uniform float u_invMaxMagnitude;
-
-// Visibility
-uniform sampler2D u_alphaTex;
-uniform int u_alphaTexWidth;
-uniform bool u_useAlphaTex;
-
-// Fog
-uniform float u_fogNear;
-uniform float u_fogFar;
-uniform float u_fogDensity;
-
-// Outputs
-out vec2 v_quadPos;
-out float v_age;
-out float v_speedNorm;
-out float v_alpha;
-out float v_fogFactor;
-out float v_headTail;
-
-float fetchAlpha(uint cellIndex) {
-  if (!u_useAlphaTex || u_alphaTexWidth <= 0) return 1.0;
-  int idx = int(cellIndex);
-  int y = idx / u_alphaTexWidth;
-  int x = idx - y * u_alphaTexWidth;
-  return texelFetch(u_alphaTex, ivec2(x, y), 0).r;
-}
-
-void main() {
-  v_alpha = fetchAlpha(a_cellIndex);
-
-  float speed = length(a_velocity);
-  v_speedNorm = clamp(speed * u_invMaxMagnitude, 0.0, 1.0);
-  v_age = a_age;
-  v_quadPos = a_quadVertex;
-
-  // Head-to-tail: y=1 is head (front), y=-1 is tail (back)
-  v_headTail = a_quadVertex.y * 0.5 + 0.5;
-
-  if (v_alpha < 0.01 || speed < 0.00001) {
-    gl_Position = vec4(0.0, 0.0, -2.0, 1.0);
-    return;
-  }
-
-  // Transform to world space
-  vec4 worldPos = u_modelMatrix * vec4(a_position, 1.0);
-  vec3 worldVel = mat3(u_modelMatrix) * a_velocity;
-
-  // Calculate billboard axes
-  vec3 toCamera = normalize(u_cameraPosition - worldPos.xyz);
-  vec3 velDir = normalize(worldVel);
-
-  // Cross product for perpendicular direction
-  vec3 right = normalize(cross(toCamera, velDir));
-  if (length(cross(toCamera, velDir)) < 0.001) {
-    right = normalize(cross(toCamera, vec3(0.0, 1.0, 0.0)));
-  }
-
-  // Streak dimensions based on speed
-  float speedBoost = 0.5 + 1.0 * v_speedNorm;
-  float streakLen = u_streakLength * speedBoost;
-  float streakWid = u_streakWidth * (0.4 + 0.6 * v_speedNorm);
-
-  // Age-based shrinking
-  float ageFactor = 1.0 - smoothstep(0.6, 1.0, a_age) * 0.5;
-  streakLen *= ageFactor;
-  streakWid *= ageFactor;
-
-  // Offset: tail behind particle, head in front
-  // quadVertex.y: -1 = tail, +1 = head
-  vec3 offset = velDir * a_quadVertex.y * streakLen + right * a_quadVertex.x * streakWid;
-  vec3 finalWorld = worldPos.xyz + offset;
-
-  // Project
-  vec4 viewPos = u_viewMatrix * vec4(finalWorld, 1.0);
-  gl_Position = u_projectionMatrix * viewPos;
-
-  // Fog
-  float eyeDepth = -viewPos.z;
-  float fogRange = max(u_fogFar - u_fogNear, 0.001);
-  float normalizedDist = max(eyeDepth - u_fogNear, 0.0) / fogRange;
-  v_fogFactor = exp(-u_fogDensity * u_fogDensity * normalizedDist * normalizedDist);
-  v_fogFactor = clamp(v_fogFactor, 0.0, 1.0);
-}
-`;
-
-/**
- * Fragment shader for velocity-aligned streak particles with premium effects.
- */
-export const PARTICLE_STREAK_FS = `#version 300 es
-precision highp float;
-
-in vec2 v_quadPos;
-in float v_age;
-in float v_speedNorm;
-in float v_alpha;
-in float v_fogFactor;
-in float v_headTail;
-
-uniform sampler2D u_colormapTex;
-uniform float u_intensity;
-uniform vec3 u_fogColor;
-uniform float u_glowAmount;
-
-out vec4 fragColor;
-
-void main() {
-  if (v_alpha < 0.01) discard;
-
-  // Comet shape falloff
-  float distX = abs(v_quadPos.x);
-  float distY = abs(v_quadPos.y);
-
-  // Edge falloff (perpendicular to velocity)
-  float edgeFalloff = 1.0 - smoothstep(0.4, 1.0, distX);
-  edgeFalloff = pow(edgeFalloff, 1.5);
-
-  // Length falloff with head-to-tail gradient
-  // Head (v_headTail=1) is bright, tail (v_headTail=0) fades
-  float tailFade = mix(0.2, 1.0, v_headTail);
-  float lengthFalloff = 1.0 - smoothstep(0.2, 1.0, distY * (1.0 - v_headTail * 0.5));
-
-  // Combine for comet alpha
-  float alpha = edgeFalloff * lengthFalloff * tailFade;
-  alpha = pow(alpha, 1.2);
-
-  if (alpha < 0.01) discard;
-
-  // Core brightness at head center
-  float coreX = 1.0 - smoothstep(0.0, 0.3, distX);
-  float coreY = smoothstep(0.5, 1.0, v_headTail);
-  float core = coreX * coreY;
-
-  // Color from colormap
-  vec3 baseColor = texture(u_colormapTex, vec2(v_speedNorm, 0.5)).rgb;
-
-  // Boost saturation
-  float luma = dot(baseColor, vec3(0.299, 0.587, 0.114));
-  vec3 saturatedColor = mix(vec3(luma), baseColor, 1.4);
-  saturatedColor = clamp(saturatedColor, 0.0, 1.0);
-
-  // White-hot core at head
-  float whiteMix = core * 0.6;
-  vec3 color = mix(saturatedColor, vec3(1.0, 0.98, 0.92), whiteMix);
-
-  // Cool shift towards tail
-  color = mix(color, color * vec3(0.85, 0.9, 1.1), (1.0 - v_headTail) * 0.4);
-
-  // Age fade
-  float ageFade = 1.0 - smoothstep(0.6, 1.0, v_age) * 0.5;
-
-  // Outer glow
-  float glowAlpha = exp(-distX * distX * 2.0) * exp(-distY * distY * 0.5);
-  alpha = mix(alpha, alpha + glowAlpha * 0.3, u_glowAmount);
-
-  // Final intensity
-  float intensity = alpha * u_intensity * v_alpha * ageFade;
-
-  // Apply fog
-  vec3 finalColor = mix(u_fogColor * 0.05, color, v_fogFactor);
-
-  // HDR boost
-  intensity *= 1.0 + intensity * 0.3;
-
-  fragColor = vec4(finalColor * intensity, intensity);
-}
-`;
-
-// =============================================================================
-// UTILITY: SIMPLE COPY SHADER
-// =============================================================================
-
-/**
- * Simple copy/blit shader for debug or intermediate copies
- */
-export const COPY_FS = `#version 300 es
-precision highp float;
-
-in vec2 v_uv;
-uniform sampler2D u_source;
-uniform float u_opacity;
-
-out vec4 fragColor;
-
-void main() {
-  vec4 color = texture(u_source, v_uv);
-  fragColor = vec4(color.rgb, color.a * u_opacity);
 }
 `;

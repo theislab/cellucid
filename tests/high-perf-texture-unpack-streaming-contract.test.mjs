@@ -46,7 +46,7 @@ function createTrackingGl(maxTextureSize = 4) {
   const textureOperations = [];
   const fail = {
     deleteTextureBefore: false,
-    stickyTexSubImageAt: null,
+    rejectTexSubImageAt: null,
   };
 
   const makeHandle = kind => {
@@ -76,6 +76,7 @@ function createTrackingGl(maxTextureSize = 4) {
     ELEMENT_ARRAY_BUFFER: 0x8893,
     FLOAT: 0x1406,
     INVALID_OPERATION: 0x0502,
+    MAX_ARRAY_TEXTURE_LAYERS: 0x88ff,
     MAX_TEXTURE_SIZE: 0x0d33,
     NEAREST: 0x2600,
     NO_ERROR: 0,
@@ -87,6 +88,7 @@ function createTrackingGl(maxTextureSize = 4) {
     RED_INTEGER: 0x8d94,
     STATIC_DRAW: 0x88e4,
     TEXTURE_2D: 0x0de1,
+    TEXTURE_2D_ARRAY: 0x8c1a,
     TEXTURE_BINDING_2D: 0x8069,
     TEXTURE_MAG_FILTER: 0x2800,
     TEXTURE_MIN_FILTER: 0x2801,
@@ -113,7 +115,7 @@ function createTrackingGl(maxTextureSize = 4) {
       }
     },
     bindTexture(target, texture) {
-      assert.equal(target, this.TEXTURE_2D);
+      assert.ok(target === this.TEXTURE_2D || target === this.TEXTURE_2D_ARRAY);
       boundTexture = texture;
     },
     bindVertexArray() {},
@@ -127,6 +129,7 @@ function createTrackingGl(maxTextureSize = 4) {
         usage,
       });
     },
+    bufferSubData() {},
     createBuffer() {
       const handle = makeHandle('buffer');
       creates.buffers.push(handle);
@@ -167,6 +170,7 @@ function createTrackingGl(maxTextureSize = 4) {
       if (parameter === this.MAX_TEXTURE_SIZE) {
         return maxTextureSize;
       }
+      if (parameter === this.MAX_ARRAY_TEXTURE_LAYERS) return 256;
       if (parameter === this.PIXEL_UNPACK_BUFFER_BINDING) {
         return boundPixelUnpackBuffer;
       }
@@ -257,8 +261,65 @@ function createTrackingGl(maxTextureSize = 4) {
         xOffset,
         yOffset,
       });
-      if (texSubImageCount === fail.stickyTexSubImageAt) {
-        pendingError = this.INVALID_OPERATION;
+      if (texSubImageCount === fail.rejectTexSubImageAt) {
+        // Rows written into a texture fail synchronously or not at all
+        // (WebGL throws for arguments it rejects); nothing is read back.
+        throw new TypeError('WebGL rejected the texSubImage upload.');
+      }
+    },
+    // Linear textures (rendering/linear-texture.js) are 2D arrays: storage,
+    // then rows addressed into the caller's array by offset.
+    texStorage3D(target, levels, internalFormat, width, height, depth) {
+      textureOperations.push({
+        data: null,
+        depth,
+        height,
+        internalFormat,
+        kind: 'texStorage2D',
+        level: 0,
+        levels,
+        state: snapshotUnpack(),
+        target,
+        texture: boundTexture,
+        width,
+      });
+    },
+    texSubImage3D(
+      target,
+      level,
+      xOffset,
+      yOffset,
+      zOffset,
+      width,
+      height,
+      depth,
+      format,
+      type,
+      data,
+      srcOffset = 0,
+    ) {
+      texSubImageCount += 1;
+      textureOperations.push({
+        data,
+        depth,
+        format,
+        height,
+        kind: 'texSubImage2D',
+        level,
+        srcOffset,
+        state: snapshotUnpack(),
+        target,
+        texture: boundTexture,
+        type,
+        width,
+        xOffset,
+        yOffset,
+        zOffset,
+      });
+      if (texSubImageCount === fail.rejectTexSubImageAt) {
+        // Rows written into a texture fail synchronously or not at all
+        // (WebGL throws for arguments it rejects); nothing is read back.
+        throw new TypeError('WebGL rejected the texSubImage upload.');
       }
     },
     texParameteri() {},
@@ -317,12 +378,12 @@ function createTrackingGl(maxTextureSize = 4) {
 }
 
 function makePointData(pointCount) {
-  const positions = new Float32Array(pointCount * 3);
+  // A DIMENSION-D embedding: DIMENSION components per point.
+  const positions = new Float32Array(pointCount * DIMENSION);
   const colors = new Uint8Array(pointCount * 4);
   for (let index = 0; index < pointCount; index++) {
-    positions[index * 3] = index + 0.25;
-    positions[index * 3 + 1] = -index - 0.5;
-    positions[index * 3 + 2] = index * 2 + 0.75;
+    positions[index * DIMENSION] = index + 0.25;
+    positions[index * DIMENSION + 1] = -index - 0.5;
     colors[index * 4] = index + 1;
     colors[index * 4 + 1] = index + 31;
     colors[index * 4 + 2] = index + 61;
@@ -331,50 +392,18 @@ function makePointData(pointCount) {
   return { colors, positions };
 }
 
-function makeSpatialIndex(
-  positions,
-  colors,
-  maximumIndices,
-) {
-  const reducedCounts = [3, 7, maximumIndices.length];
-  const lodLevels = reducedCounts.map((pointCount, depth) => ({
-    depth,
-    indices: maximumIndices.subarray(0, pointCount),
-    isFullDetail: false,
-    pointCount,
-    sizeMultiplier: 2 - depth * 0.25,
-  }));
-  lodLevels.push({
-    colors,
-    depth: reducedCounts.length,
-    isFullDetail: true,
-    pointCount: positions.length / 3,
-    positions,
-    sizeMultiplier: 1,
-  });
-  return {
-    colors,
-    dimensionLevel: DIMENSION,
-    lodLevels,
-    pointCount: positions.length / 3,
-    positions,
-  };
-}
-
 function makeRendererFixture({
   maxTextureSize = 4,
-  maximumIndices = Uint32Array.from([
-    12, 2, 9, 0, 7, 3, 11, 1, 8, 5,
+  // A draw order over 13 points: three full rows of a 4-wide texture and a
+  // one-texel terminal row.
+  drawIndices = Uint32Array.from([
+    12, 2, 9, 0, 7, 3, 11, 1, 8, 5, 4, 10, 6,
   ]),
   pointCount = 13,
 } = {}) {
   const gl = createTrackingGl(maxTextureSize);
   const { colors, positions } = makePointData(pointCount);
-  const spatialIndex = makeSpatialIndex(
-    positions,
-    colors,
-    maximumIndices,
-  );
+  const drawOrder = Object.freeze({ indices: drawIndices, pointCount });
   const renderer = Object.assign(
     Object.create(HighPerfRenderer.prototype),
     {
@@ -384,41 +413,38 @@ function makeRendererFixture({
       _alphaTexture: null,
       _alphaTextureByteLength: 0,
       _colors: colors,
-      _dirtyLodDimensions: new Set(),
       _dummyLodIndexTexture: null,
       _dummyLodIndexTextureByteLength: 0,
-      _interleavedGpuByteLength: 0,
+      _colorGpuByteLength: 0,
+      _positionGpuByteLength: 0,
       _liveGeometryGeneration: 17,
-      _lodArrayBuffers: null,
-      _lodIndexTexturesByDimension: new Map(),
-      _lodResourceOwnersByDimension: new Map(),
+      _liveOrder: null,
       _pendingDataRetirements: new Set(),
       _pendingSnapshotRetirements: new Set(),
       _perViewState: new Map(),
       _positions: positions,
+      _snapshotGeometryPools: new Map(),
+      currentDimensionLevel: DIMENSION,
       _useAlphaTexture: false,
       buffers: {
-        alphas: null,
-        colors: null,
-        interleaved: gl._adoptBuffer(),
-        positions: null,
+        colors: gl._adoptBuffer(),
+        positions: gl._adoptBuffer(),
       },
       gl,
-      lodBuffersByDimension: new Map(),
       pointCount,
       snapshotBuffers: new Map(),
-      spatialIndices: new Map([[DIMENSION, spatialIndex]]),
+      spatialIndices: new Map(),
       stats: { gpuMemoryMB: 0 },
       vao: gl._adoptVertexArray(),
     },
   );
   return {
     colors,
+    drawIndices,
+    drawOrder,
     gl,
-    maximumIndices,
     positions,
     renderer,
-    spatialIndex,
   };
 }
 
@@ -471,22 +497,19 @@ function findR32uiAllocation(operations) {
   ));
 }
 
-test('maximum-prefix R32UI staging allocates without a padded host duplicate and streams exact shared prefix views', () => {
+test('draw-order R32UI staging allocates without a padded host duplicate and streams the order itself', () => {
   const fixture = makeRendererFixture();
-  const hostileState = makeHostileUnpackState('lod-success');
+  const hostileState = makeHostileUnpackState('order-success');
   fixture.gl._setUnpackState(hostileState);
 
-  fixture.renderer._createLODResourcesForDimension(
-    DIMENSION,
-    fixture.spatialIndex,
+  const record = fixture.renderer._createDrawOrderRecord(
+    fixture.drawOrder,
+    'test draw order',
   );
 
-  const owner =
-    fixture.renderer._lodResourceOwnersByDimension.get(DIMENSION);
-  const topology = owner.topologyOwner;
   const textureOperations =
     fixture.gl._state.textureOperations.filter(
-      operation => operation.texture === topology.indexTexture,
+      operation => operation.texture === record.texture,
     );
   const allocations = findR32uiAllocation(textureOperations);
   const rowUploads = textureOperations.filter(
@@ -495,114 +518,78 @@ test('maximum-prefix R32UI staging allocates without a padded host duplicate and
 
   assert.equal(allocations.length, 1);
   assert.equal(allocations[0].width, 4);
-  assert.equal(allocations[0].height, 3);
+  assert.equal(allocations[0].height, 4);
   assert.equal(
     allocations[0].data,
     null,
     'R32UI storage must not receive a padded width*height Uint32Array duplicate',
   );
-  if (allocations[0].kind === 'texImage2D') {
-    assertNeutralUploadState(allocations[0], 4);
-  }
-  assert.ok(
-    rowUploads.length >= 2,
-    'complete rows and the short terminal row must be streamed separately',
-  );
-
-  const streamed = [];
-  let expectedY = 0;
+  assert.equal(allocations[0].depth, 1);
+  // The complete rows go up in one call and the terminal row at its exact
+  // width, both addressed into the order itself: no scratch at all.
+  assert.equal(rowUploads.length, 2);
+  const [fullRows, terminalRow] = rowUploads;
   for (const upload of rowUploads) {
     assertNeutralUploadState(upload, 4);
     assert.equal(upload.xOffset, 0);
-    assert.equal(upload.yOffset, expectedY);
-    assert.ok(upload.data instanceof Uint32Array);
+    assert.equal(upload.zOffset, 0);
     assert.strictEqual(
-      upload.data.buffer,
-      fixture.maximumIndices.buffer,
-      'each upload must be a zero-copy view of the exact maximum-prefix owner',
+      upload.data,
+      fixture.drawIndices,
+      'rows must be read from the draw order itself',
     );
-    assert.equal(upload.data.length, upload.width * upload.height);
-    assert.ok(upload.width <= 4);
-    if (upload.width < 4) {
-      assert.equal(upload.height, 1);
-      assert.strictEqual(upload, rowUploads.at(-1));
-    }
-    streamed.push(...upload.data);
-    expectedY += upload.height;
   }
-  assert.deepEqual(streamed, Array.from(fixture.maximumIndices));
-  assert.equal(expectedY, 3);
+  assert.equal(fullRows.yOffset, 0);
+  assert.equal(fullRows.height, 3);
+  assert.equal(fullRows.srcOffset, 0);
+  assert.equal(terminalRow.yOffset, 3);
+  assert.equal(terminalRow.height, 1);
+  assert.equal(terminalRow.width, 1);
+  assert.equal(terminalRow.srcOffset, 12);
   assertExactUnpackState(
     fixture.gl._state.snapshotUnpack(),
     hostileState,
   );
 
-  const textureBytes = 4 * 3 * UINT_BYTES;
-  const compactBytes = fixture.maximumIndices.length * 16;
-  const originalIndexBytes =
-    fixture.maximumIndices.length * UINT_BYTES;
-  assert.equal(topology.indexTextureByteLength, textureBytes);
-  assert.equal(topology.originalIndexByteLength, originalIndexBytes);
-  assert.equal(owner.compactByteLength, compactBytes);
-  assert.equal(
-    owner.gpuByteLength,
-    compactBytes + originalIndexBytes + textureBytes,
-  );
-  assertExactKnownGpuBytes(
-    fixture.renderer,
-    compactBytes + originalIndexBytes + textureBytes,
-  );
+  const textureBytes = 4 * 4 * UINT_BYTES;
+  assert.equal(record.byteLength, textureBytes);
+  assert.equal(record.plan.width, 4);
+  assert.equal(record.plan.rowsPerLayer, 4);
+  fixture.renderer._liveOrder = record;
+  fixture.renderer._refreshGpuMemoryStats();
+  assertExactKnownGpuBytes(fixture.renderer, textureBytes);
 });
 
 test('failed streamed R32UI replacement rolls back publication, restores unpack state, and byte-accounts a retry-owned texture exactly', () => {
   const fixture = makeRendererFixture();
-  fixture.renderer._createLODResourcesForDimension(
-    DIMENSION,
-    fixture.spatialIndex,
+  const accepted = fixture.renderer._createDrawOrderRecord(
+    fixture.drawOrder,
+    'accepted draw order',
   );
-  const acceptedOwner =
-    fixture.renderer._lodResourceOwnersByDimension.get(DIMENSION);
-  const acceptedBuffers =
-    fixture.renderer.lodBuffersByDimension.get(DIMENSION);
-  const acceptedTextures =
-    fixture.renderer._lodIndexTexturesByDimension.get(DIMENSION);
-  const acceptedBytes =
-    acceptedOwner.gpuByteLength;
+  fixture.renderer._liveOrder = accepted;
+  fixture.renderer._refreshGpuMemoryStats();
+  const acceptedBytes = accepted.byteLength;
 
-  const replacementMaximum = Uint32Array.from([
-    1, 11, 4, 9, 0, 12, 3, 8, 5, 2,
-  ]);
-  const replacement = makeSpatialIndex(
-    fixture.positions,
-    fixture.colors,
-    replacementMaximum,
-  );
-  const hostileState = makeHostileUnpackState('lod-failure');
+  const replacement = Object.freeze({
+    indices: Uint32Array.from([1, 11, 4, 9, 0, 12, 3, 8, 5, 2, 6, 10, 7]),
+    pointCount: 13,
+  });
+  const hostileState = makeHostileUnpackState('order-failure');
   fixture.gl._setUnpackState(hostileState);
-  fixture.gl._state.fail.stickyTexSubImageAt =
+  fixture.gl._state.fail.rejectTexSubImageAt =
     fixture.gl._state.texSubImageCount + 2;
   fixture.gl._state.fail.deleteTextureBefore = true;
 
   assert.throws(
-    () => fixture.renderer._createLODResourcesForDimension(
-      DIMENSION,
+    () => fixture.renderer._createDrawOrderRecord(
       replacement,
+      'replacement draw order',
     ),
-    /WebGL|texture|cleanup|publication/i,
+    /WebGL|texture|cleanup|publication|upload/i,
   );
 
-  assert.strictEqual(
-    fixture.renderer._lodResourceOwnersByDimension.get(DIMENSION),
-    acceptedOwner,
-  );
-  assert.strictEqual(
-    fixture.renderer.lodBuffersByDimension.get(DIMENSION),
-    acceptedBuffers,
-  );
-  assert.strictEqual(
-    fixture.renderer._lodIndexTexturesByDimension.get(DIMENSION),
-    acceptedTextures,
-  );
+  assert.strictEqual(fixture.renderer._liveOrder, accepted);
+  assert.equal(fixture.gl._state.live.textures.has(accepted.texture), true);
   assertExactUnpackState(
     fixture.gl._state.snapshotUnpack(),
     hostileState,
@@ -610,23 +597,16 @@ test('failed streamed R32UI replacement rolls back publication, restores unpack 
   assert.equal(fixture.renderer._pendingDataRetirements.size, 1);
 
   const candidateTexture = fixture.gl._state.creates.textures.at(-1);
-  assert.notStrictEqual(
-    candidateTexture,
-    acceptedOwner.topologyOwner.indexTexture,
-  );
+  assert.notStrictEqual(candidateTexture, accepted.texture);
   assert.equal(fixture.gl._state.live.textures.has(candidateTexture), true);
   assert.equal(
     fixture.gl._state.live.buffers.size,
-    3,
-    'only main plus the accepted compact VBO/EBO may remain live',
-  );
-  assert.equal(
-    fixture.gl._state.live.vertexArrays.size,
     2,
-    'only main plus the accepted compact VAO may remain live',
+    'only the two live streams may remain live',
   );
 
-  const candidateTextureBytes = 4 * 3 * UINT_BYTES;
+  const candidateTextureBytes = 4 * 4 * UINT_BYTES;
+  fixture.renderer._refreshGpuMemoryStats();
   assertExactKnownGpuBytes(
     fixture.renderer,
     acceptedBytes + candidateTextureBytes,
@@ -636,6 +616,7 @@ test('failed streamed R32UI replacement rolls back publication, restores unpack 
   assert.deepEqual(fixture.renderer._drainDataRetirements(), []);
   assert.equal(fixture.renderer._pendingDataRetirements.size, 0);
   assert.equal(fixture.gl._state.live.textures.has(candidateTexture), false);
+  fixture.renderer._refreshGpuMemoryStats();
   assertExactKnownGpuBytes(fixture.renderer, acceptedBytes);
 });
 
@@ -652,16 +633,14 @@ test('odd-width multi-row R8 creation and update use alignment 1, neutral unpack
       _alphaTextureByteLength: 0,
       _dummyLodIndexTexture: null,
       _dummyLodIndexTextureByteLength: 0,
-      _interleavedGpuByteLength: 0,
-      _lodIndexTexturesByDimension: new Map(),
-      _lodResourceOwnersByDimension: new Map(),
+      _colorGpuByteLength: 0,
+      _positionGpuByteLength: 0,
       _pendingDataRetirements: new Set(),
       _pendingSnapshotRetirements: new Set(),
       _perViewState: new Map(),
       _useAlphaTexture: false,
       buffers: {},
       gl,
-      lodBuffersByDimension: new Map(),
       pointCount,
       snapshotBuffers: new Map(),
       stats: { gpuMemoryMB: 0 },
@@ -672,37 +651,42 @@ test('odd-width multi-row R8 creation and update use alignment 1, neutral unpack
 
   renderer._createAlphaTexture(pointCount);
 
-  assert.equal(renderer._alphaTexWidth, 3);
-  assert.equal(renderer._alphaTexHeight, 2);
+  // A power-of-two width: 2 (the largest at most MAX_TEXTURE_SIZE = 3).
+  assert.equal(renderer._alphaTexWidth, 2);
+  assert.equal(renderer._alphaTexHeight, 3);
   assert.equal(renderer._alphaTexData.length, 6);
   assertExactKnownGpuBytes(renderer, 6);
-  const createUpload = gl._state.textureOperations.find(
+  const allocation = gl._state.textureOperations.find(
     operation => (
-      operation.kind === 'texImage2D' &&
+      operation.kind === 'texStorage2D' &&
       operation.internalFormat === gl.R8
     ),
   );
+  assert.ok(allocation);
+  const createUpload = gl._state.textureOperations.find(
+    operation => operation.kind === 'texSubImage2D' && operation.texture === allocation.texture,
+  );
   assert.ok(createUpload);
-  assert.equal(createUpload.width, 3);
-  assert.equal(createUpload.height, 2);
+  assert.equal(createUpload.width, 2);
+  assert.equal(createUpload.height, 3);
   assertNeutralUploadState(createUpload, 1);
   assertExactUnpackState(gl._state.snapshotUnpack(), hostileState);
 
   gl._state.textureOperations.length = 0;
   renderer._updateAlphaTexture(
-    Float32Array.from([0, 0.25, 0.5, 0.75, 1]),
+    Uint8Array.from([0, 1, 0, 1, 0]),
   );
   const updateUpload = gl._state.textureOperations.find(
     operation => operation.kind === 'texSubImage2D',
   );
   assert.ok(updateUpload);
-  assert.equal(updateUpload.width, 3);
-  assert.equal(updateUpload.height, 2);
+  assert.equal(updateUpload.width, 2);
+  assert.equal(updateUpload.height, 3);
   assertNeutralUploadState(updateUpload, 1);
   assertExactUnpackState(gl._state.snapshotUnpack(), hostileState);
   assert.deepEqual(
     Array.from(renderer._alphaTexData),
-    [0, 64, 128, 191, 255, 255],
+    [0, 255, 0, 255, 0, 255],
   );
   assert.equal(renderer._useAlphaTexture, true);
   const acceptedAlphaData = renderer._alphaTexData;
@@ -715,11 +699,11 @@ test('odd-width multi-row R8 creation and update use alignment 1, neutral unpack
     rowLength: 23,
   });
   gl._setUnpackState(failureState);
-  gl._state.fail.stickyTexSubImageAt =
+  gl._state.fail.rejectTexSubImageAt =
     gl._state.texSubImageCount + 1;
   assert.throws(
     () => renderer._updateAlphaTexture(
-      Float32Array.from([1, 0.75, 0.5, 0.25, 0]),
+      Uint8Array.from([1, 0, 1, 0, 1]),
     ),
     /WebGL|alpha|publication/i,
   );

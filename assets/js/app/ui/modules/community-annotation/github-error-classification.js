@@ -17,7 +17,7 @@ export function httpStatusOrNull(err) {
   return Number.isFinite(n) ? n : null;
 }
 
-export function lowerMessage(err) {
+function lowerMessage(err) {
   return String(err?.message || '').trim().toLowerCase();
 }
 
@@ -29,7 +29,7 @@ export function workerPath(err) {
   return String(err?.worker?.path || '').trim();
 }
 
-export function isRepoInfoApiPath(path) {
+function isRepoInfoApiPath(path) {
   return /^\/repos\/[^/]+\/[^/]+$/i.test(String(path || ''));
 }
 

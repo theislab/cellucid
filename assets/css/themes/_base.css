@@ -7,6 +7,15 @@
    Current policy: ship only `light` (default) and `dark`.
 */
 
+/* Derived border tones, defined once for every theme. They mix the theme's
+   own strong border, so they follow it in light and dark without a second
+   definition. `subtle` outlines a quiet box or an icon button, `faint` rules a
+   row from the next. */
+:root {
+  --color-border-subtle: color-mix(in srgb, var(--color-border-strong) 18%, transparent);
+  --color-border-faint: color-mix(in srgb, var(--color-border-strong) 8%, transparent);
+}
+
 /* Enable smooth theme transitions only during theme changes. */
 html.theme-transition,
 html.theme-transition * {

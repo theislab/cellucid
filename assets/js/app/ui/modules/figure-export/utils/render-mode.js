@@ -17,17 +17,17 @@
  */
 
 /** The one render mode figure export is able to reproduce. */
-export const EXPORTABLE_RENDER_MODE = 'points';
+const EXPORTABLE_RENDER_MODE = 'points';
 
 /** Element id of the control that owns the active render mode. */
-export const RENDER_MODE_CONTROL_ID = 'render-mode';
+const RENDER_MODE_CONTROL_ID = 'render-mode';
 
 /** Render modes the viewer accepts. Mirrors `ui/modules/render-controls.js`. */
 const RENDER_MODES = Object.freeze(['points', 'smoke']);
 
 /**
  * Reader-facing names, matching the `#render-mode` option text without its
- * maturity tag. The option reads `Volumetric smoke cloud (alpha)` on screen;
+ * maturity tag. The option reads `Volumetric smoke cloud (beta)` on screen;
  * a blocker that names the mode is naming the feature, not its maturity, and
  * `#render-mode-maturity-tag` is where the maturity is said.
  */

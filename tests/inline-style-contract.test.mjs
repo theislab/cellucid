@@ -3,12 +3,10 @@
  * `index.html`. Use utilities + component classes." (CEL-AUDIT-0101)
  *
  * Every presentational declaration index.html used to carry inline is now a
- * utility class that already existed. What remains is a short, explicit list of
- * elements whose `display` is written by application code at runtime; a
- * utility class cannot replace those, because the utilities are `!important`
- * and would win against the JavaScript that has to be able to show them again.
- * Each one is asserted to be owned by the module that toggles it, so the list
- * cannot quietly grow.
+ * utility class that already existed. The three elements whose initial
+ * `display: none` used to be written inline (the vector-field overlay block,
+ * its settings and the Camera Path "Set all" row) start with the `hidden`
+ * attribute instead, which their modules toggle, so no exemption remains.
  */
 
 import assert from 'node:assert/strict';
@@ -25,39 +23,13 @@ const SPACING_UTILITIES_URL = new URL(
   '../assets/css/utilities/_spacing.css',
   import.meta.url
 );
-const TYPOGRAPHY_UTILITIES_URL = new URL(
-  '../assets/css/utilities/_typography.css',
-  import.meta.url
-);
-const VELOCITY_CONTROLS_URL = new URL(
-  '../assets/js/app/ui/modules/velocity-overlay-controls.js',
-  import.meta.url
-);
-const CINEMATIC_CAMERA_URL = new URL(
-  '../assets/js/app/ui/modules/cinematic-camera/index.js',
-  import.meta.url
-);
-
-/**
- * Elements whose inline `display` is a runtime-owned initial state, mapped to
- * the module that writes it.
- */
-const RUNTIME_DISPLAY = Object.freeze({
-  'velocity-overlay-controls': VELOCITY_CONTROLS_URL,
-  'velocity-overlay-settings': VELOCITY_CONTROLS_URL,
-  'cinematic-timing-actions': CINEMATIC_CAMERA_URL
-});
-
 /** Utility classes index.html leans on instead of an inline declaration. */
 const REQUIRED_UTILITIES = Object.freeze({
   'w-full': LAYOUT_UTILITIES_URL,
   'd-flex': LAYOUT_UTILITIES_URL,
   'items-center': LAYOUT_UTILITIES_URL,
   'gap-1-5': LAYOUT_UTILITIES_URL,
-  'm-0': SPACING_UTILITIES_URL,
-  'mt-0': SPACING_UTILITIES_URL,
-  'mt-1-5': SPACING_UTILITIES_URL,
-  'font-medium': TYPOGRAPHY_UTILITIES_URL
+  'm-0': SPACING_UTILITIES_URL
 });
 
 const [indexSource, cssReadme] = await Promise.all([
@@ -70,42 +42,23 @@ test('the rule this test enforces is the one the design system states', () => {
   assert.match(cssReadme, /No inline styles in `index\.html`/);
 });
 
-test('index.html carries no inline style but the runtime-owned display flags', async () => {
+test('index.html carries no inline style at all', () => {
   const inlineStyled = Array.from(
-    indexHtml.matchAll(/<(\w+)\b([^>]*\bstyle="([^"]*)"[^>]*)>/g)
-  ).map(([, tagName, attributes, declarations]) => ({
-    tagName,
-    id: attributes.match(/(?:^|\s)id="([^"]*)"/)?.[1] ?? null,
-    declarations: declarations.trim()
-  }));
-
-  for (const element of inlineStyled) {
-    assert.ok(
-      element.id !== null && Object.hasOwn(RUNTIME_DISPLAY, element.id),
-      `<${element.tagName}> carries the inline style "${element.declarations}"; ` +
-      'move it onto a utility or component class'
-    );
-    assert.match(
-      element.declarations,
-      /^display:\s*none;?$/,
-      `#${element.id} may only carry its initial display state inline`
-    );
-  }
-
-  assert.deepEqual(
-    inlineStyled.map(element => element.id).sort(),
-    Object.keys(RUNTIME_DISPLAY).sort()
+    indexHtml.matchAll(/<(\w+)\b[^>]*\bstyle="([^"]*)"[^>]*>/g),
+    ([element, tagName]) => `<${tagName}> ${element.slice(0, 80)}`
   );
+  assert.deepEqual(inlineStyled, [], 'move each declaration onto a class or the hidden attribute');
+});
 
-  // Each exemption has to be earned: the module named must actually write the
-  // element's display, or the inline style is simply stale.
-  for (const [id, moduleUrl] of Object.entries(RUNTIME_DISPLAY)) {
-    const source = await readFile(moduleUrl, 'utf8');
-    assert.match(
-      source,
-      /\.style\.display\s*=/,
-      `the module owning #${id} must be the one that writes its display`
-    );
+test('the modules that show and hide former inline-display blocks use hidden', async () => {
+  for (const [file, pattern] of [
+    ['../assets/js/app/ui/modules/velocity-overlay-controls.js', /controlBlock\.hidden = /],
+    ['../assets/js/app/ui/modules/velocity-overlay-controls.js', /settings\.hidden = /],
+    ['../assets/js/app/ui/modules/cinematic-camera/index.js', /timingActions\.hidden = /]
+  ]) {
+    const source = await readFile(new URL(file, import.meta.url), 'utf8');
+    assert.match(source, pattern);
+    assert.doesNotMatch(source, /\.style\.display\s*=/, `${file} must not write an inline display`);
   }
 });
 

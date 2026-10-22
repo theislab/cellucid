@@ -1,0 +1,141 @@
+/* ========================================================================
+   Selection bar – Select mode on the plot (#select-bar in index.html)
+   ===================================================================== */
+
+/* A positioning track along the bottom of the part of the plot the sidebar
+   does not cover: the viewer's presented area, the rectangle the view grid is
+   laid out in (published by ui/modules/select-bar-placement.js). The track
+   itself takes no pointer, so only the card blocks the plot, and the card is
+   only as large as its rows. */
+.select-bar {
+  --select-bar-gutter: var(--space-4);
+  position: fixed;
+  left: var(--select-bar-presented-left, 0px);
+  width: var(--select-bar-presented-width, 100%);
+  box-sizing: border-box;
+  bottom: calc(var(--space-4) + env(safe-area-inset-bottom, 0px));
+  z-index: var(--z-overlay);
+  display: none;
+  justify-content: center;
+  padding: 0 var(--select-bar-gutter);
+  pointer-events: none;
+}
+
+/* Shown on any touch screen, where it is the only way to select without the
+   menu, and to a mouse while Select mode is on, so the selection can be
+   combined, confirmed, cleared and left from the plot as well. */
+@media (any-pointer: coarse) {
+  .select-bar {
+    display: flex;
+  }
+}
+
+.select-bar:has(#select-bar-mode[aria-checked="true"]) {
+  display: flex;
+}
+
+/* A square card, like every other surface in the interface. */
+.select-bar-card {
+  display: flex;
+  flex-direction: column;
+  box-sizing: border-box;
+  width: min(100%, 26rem);
+  padding: var(--space-1) var(--space-2-5);
+  border: var(--border-default);
+  border-radius: var(--radius-none);
+  background: var(--color-surface-elevated);
+  box-shadow: var(--shadow-md);
+  color: var(--color-text-primary);
+  font-family: var(--font-sans);
+  pointer-events: auto;
+  /* A finger on the card never zooms the page or reaches the plot. */
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* With Select mode off and nothing being selected, the card is only the
+   switch. */
+.select-bar:has(#select-bar-mode[aria-checked="false"]):has(#select-bar-steps[hidden]) .select-bar-card {
+  width: auto;
+}
+
+.select-bar:has(#select-bar-mode[aria-checked="false"]):has(#select-bar-steps[hidden]) .select-bar-controls {
+  border-top: 0;
+}
+
+.select-bar-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  /* Room for the row's controls and, on a touch screen, for their hit
+     areas, which must not reach into the next row's controls. */
+  min-height: max(
+    calc(var(--control-height) + var(--space-2)),
+    calc(var(--control-target-min) + 2 * var(--control-hit-extend))
+  );
+  margin: 0;
+}
+
+/* Row 1 (steps or hint) is always shown while Select mode is on, so the rows
+   below it carry the dividers. */
+.select-bar-page,
+.select-bar-controls {
+  border-top: var(--border-light);
+}
+
+.select-bar-status {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: var(--type-heading);
+  font-weight: var(--font-weight-medium);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Row 1: the selection in progress, with the tool's own step actions. */
+.select-bar-actions {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: var(--space-1-5);
+}
+
+/* Row 1 when nothing is being selected: what a tap or drag will do. It keeps
+   the steps row's height, so a second tap where Confirm was lands on this
+   text and never on the plot or on Clear. */
+.select-bar-hint {
+  display: none;
+  font-size: var(--type-control);
+  color: var(--color-text-secondary);
+}
+
+.select-bar:has(#select-bar-mode[aria-checked="true"]):has(#select-bar-steps[hidden]) .select-bar-hint {
+  display: flex;
+}
+
+/* The last gesture's outcome, when it changed nothing. */
+.select-bar-notice {
+  margin: 0 0 var(--space-1-5);
+  font-size: var(--type-hint);
+  color: var(--color-text-secondary);
+}
+
+.select-bar:has(#select-bar-mode[aria-checked="false"]) .select-bar-notice {
+  display: none;
+}
+
+/* Row 3: what is saved on the active page, and Clear. */
+.select-bar-page {
+  display: none;
+}
+
+.select-bar:has(#select-bar-mode[aria-checked="true"]):has(#select-bar-clear:not([hidden])) .select-bar-page {
+  display: flex;
+}
+
+/* Row 4: the switch and its combine choice. */
+.select-bar-controls {
+  justify-content: space-between;
+  flex-wrap: wrap;
+  row-gap: 0;
+}
+

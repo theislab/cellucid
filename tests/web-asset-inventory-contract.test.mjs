@@ -13,7 +13,9 @@ import test from 'node:test';
 
 import {
   assertPortableAssetPath,
+  STAMPED_BUILD_ID_PATTERN,
   buildWebAssetInventory,
+  computeBuildDigest,
   contentTypeForAssetPath,
   isDirectModuleInvocation,
   isRuntimeCacheAssetPath,
@@ -199,12 +201,16 @@ test('web inventory binds exact bytes to the single index build id', async () =>
     join(rootDir, 'assets', 'js', 'app.js'),
     'export const ready = true;\n'
   );
+  await writeFile(join(rootDir, '404.html'), '<!doctype html><title>Not found</title>\n');
+  await writeFile(join(rootDir, 'CITATION.cff'), 'cff-version: 1.2.0\n');
   await writeFile(join(rootDir, 'browserconfig.xml'), '<browserconfig/>\n');
   await writeFile(join(rootDir, 'site.webmanifest'), '{}\n');
 
   const inventory = await buildWebAssetInventory({
     rootDir,
     paths: [
+      '404.html',
+      'CITATION.cff',
       'assets/js/app.js',
       'browserconfig.xml',
       'index.html',
@@ -220,16 +226,20 @@ test('web inventory binds exact bytes to the single index build id', async () =>
   assert.deepEqual(
     inventory.assets.map(asset => asset.path),
     [
+      '404.html',
+      'CITATION.cff',
       'assets/js/app.js',
       'browserconfig.xml',
       'index.html',
       'site.webmanifest',
     ]
   );
-  assert.equal(inventory.assets[0].bytes, 27);
-  assert.match(inventory.assets[0].sha256, /^[0-9a-f]{64}$/);
+  assert.equal(inventory.assets[0].content_type, 'text/html; charset=utf-8');
+  assert.equal(inventory.assets[1].content_type, 'application/octet-stream');
+  assert.equal(inventory.assets[2].bytes, 27);
+  assert.match(inventory.assets[2].sha256, /^[0-9a-f]{64}$/);
   assert.equal(
-    inventory.assets[0].content_type,
+    inventory.assets[2].content_type,
     'application/javascript; charset=utf-8'
   );
 
@@ -249,6 +259,8 @@ test('web inventory binds exact bytes to the single index build id', async () =>
     buildWebAssetInventory({
       rootDir,
       paths: [
+        '404.html',
+        'CITATION.cff',
         'assets/js/app.js',
         'browserconfig.xml',
         'index.html',
@@ -289,7 +301,43 @@ test('checked-in runtime inventory matches every packaged source byte', async ()
   const checkedIn = await readFile(
     join(rootDir, 'cellucid-web-assets.json')
   );
+  // Name exactly the assets that changed and the one command that regenerates
+  // the inventory; the byte comparison after it still guards everything else.
+  const entriesByPath = bytes => new Map(
+    JSON.parse(bytes.toString('utf8')).assets
+      .map(asset => [asset.path, JSON.stringify(asset)])
+  );
+  const checkedInEntries = entriesByPath(checkedIn);
+  const generatedEntries = entriesByPath(generated);
+  const staleAssets = [
+    ...new Set([...checkedInEntries.keys(), ...generatedEntries.keys()]),
+  ]
+    .filter(path => checkedInEntries.get(path) !== generatedEntries.get(path))
+    .sort();
+  assert.deepEqual(
+    staleAssets,
+    [],
+    'cellucid-web-assets.json is stale for the assets listed; regenerate it '
+      + 'with `node scripts/generate-web-asset-inventory.mjs`.'
+  );
   assert.deepEqual(checkedIn, generated);
+});
+
+test('the build id names the exact shipped bytes', async () => {
+  // A hand-edited id went stale for months while the site changed under it.
+  // The id is stamped by the generator from a digest of every shipped file, so
+  // any asset change without a regeneration fails here, and the footer, the
+  // situation report and the pip web cache all name the real build.
+  const rootDir = fileURLToPath(new URL('..', import.meta.url));
+  const paths = await listSourceControlledAssets(rootDir);
+  const { build_id: buildId } = await buildWebAssetInventory({ rootDir, paths });
+  assert.match(buildId, STAMPED_BUILD_ID_PATTERN);
+  assert.equal(
+    buildId.split('.')[1],
+    await computeBuildDigest({ rootDir, paths }),
+    'index.html names a different build than its files; regenerate with '
+      + '`node scripts/generate-web-asset-inventory.mjs`.'
+  );
 });
 
 test(

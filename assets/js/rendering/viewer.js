@@ -2,27 +2,40 @@
  * WebGL2 Viewer with High-Performance Renderer
  * =============================================
  * Uses HighPerfRenderer for scatter points with WebGL2 only.
- * Keeps smoke, grid, and line rendering.
+ * Keeps smoke, grid, studio backdrop, and line rendering.
  */
 
-import { GRID_VS_SOURCE, GRID_FS_SOURCE, LINE_INSTANCED_VS_SOURCE, LINE_INSTANCED_FS_SOURCE } from './shaders/edge-grid-shaders.js';
-import { createConnectivityRenderWeights } from './connectivity-weights.js';
+import { GRID_VS_SOURCE, GRID_FS_SOURCE } from './shaders/edge-grid-shaders.js';
+import { createConnectivityEdgeLayer } from './connectivity-edge-layer.js';
 import {
-  buildAllVisibleConnectivityEdgePrefixOwner,
-  buildConnectivityEdgePrefixOwner,
-  resolveConnectivityEdgeRawPrefix,
-  retireConnectivityEdgePrefixOwner
-} from './connectivity-edge-prefix.js';
+  drainAfterFramePhase,
+  drainBeforeFramePhase,
+  setFramePhaseDriver,
+} from './frame-phases.js';
 import {
   configureStraightAlphaBlending,
   createProgram,
-  createCanvasResizeObserver,
-  createRequiredTexture
+  createProgramBatch,
+  createCanvasResizeObserver
 } from './gl-utils.js';
 import { CENTROID_VS, CENTROID_FS } from './shaders/centroid-shaders.js';
+import { STUDIO_VS_SOURCE, STUDIO_FS_SOURCE } from './shaders/studio-shaders.js';
+import {
+  STUDIO_PALETTES,
+  STUDIO_STAGE,
+  STUDIO_SURFACE_TRANSITION_SECONDS,
+  resolveStudioBackdropPlane,
+  resolveStudioPaneGeometry,
+  resolveStudioPool,
+  resolveStudioSurfaceWeights,
+  studioColor01,
+  studioSurfacePlanarity
+} from './studio-backdrop.js';
+import { createBackdropLookRenderer } from './backdrops/backdrop-look-renderer.js';
+import { backdropLookSurface01, isBackdropLook } from './backdrops/backdrop-looks.js';
 import { SmokeRenderer } from './smoke-cloud/smoke-renderer.js';
 import { HighPerfRenderer } from './high-perf-renderer.js';
-import { isContextLostError } from './high-perf/gl-point-draw-state.js';
+import { isContextLostError, requireCleanWebGLState } from './gl-errors.js';
 import { HighlightTools } from './highlight-renderer.js';
 import { OrbitAnchorRenderer } from './orbit-anchor.js';
 import { createProjectileSystem } from './projectiles.js';
@@ -46,11 +59,18 @@ import {
   MAXIMUM_POINT_SIZE,
   MINIMUM_POINT_SIZE,
 } from './point-size-scale.js';
+import { applyHorizontalProjectionCenter } from './viewport-center.js';
+import { findScreenSpacePick } from './picking.js';
 import {
-  applyHorizontalProjectionCenter,
-  computePaneCenterNdcX
-} from './viewport-center.js';
-import { findRaySamplePick } from './picking.js';
+  DEFAULT_SHADER_QUALITY,
+  SHADER_QUALITY_TRAITS,
+} from './shader-quality.js';
+import {
+  readPositionBounds,
+  readPositionXYZ,
+  requirePositionArray
+} from './position-layout.js';
+import { createDefaultCameraPose } from './camera-state-contract.js';
 import {
   PresentedCameraSettlementTracker
 } from './presented-camera-settlement.js';
@@ -64,7 +84,6 @@ import {
   assertCentroidLabelEntries,
   assertCentroidPayload,
   assertExactBoolean,
-  assertExactFloat32Array,
   assertExactFunction,
   assertExactUint8Array,
   assertFiniteFloat32Array,
@@ -78,11 +97,14 @@ import {
   assertViewId,
   assertViewerBackground,
   assertViewerDataPayload,
+  assertViewLayoutKey,
   cloneSnapshotMeta,
   getDefaultNavigationMode
 } from './viewer/viewer-contracts.js';
 import {
-  resolvePresentedViewLayout,
+  getPresentedPane,
+  getPresentedPaneAtCssPoint,
+  resolvePresentedLayout,
   runSynchronousBorrowedViewDataCallback,
   selectPresentedCameraState
 } from './viewer/presented-view-layout.js';
@@ -93,11 +115,56 @@ let nextWebglContextOverlayIdentity = 1;
 // Below this size, one direct interaction scan is cheaper than retaining a
 // tree. Large clicked panes build exactly one notified tree lazily so picking,
 // lasso previews, and proximity previews never rescan 10–30M points per move.
-export const INTERACTIVE_SPATIAL_INDEX_POINT_THRESHOLD = 250_000;
+const INTERACTIVE_SPATIAL_INDEX_POINT_THRESHOLD = 250_000;
+// A frame is drawn only when something on screen can have changed: a public
+// API mutation, viewer input, a canvas resize, or a time-driven animation.
+// Drawing continues after the last such cause until FRAME_SETTLE_MIN_FRAMES
+// frames have been drawn, and then stops. Every multi-frame convergence is a
+// named cause of its own (camera settlement, LOD hysteresis, fades, smoke),
+// so the floor only has to cover the frame that shows a change. There is no
+// wall-clock window on top: it kept a fast display drawing 60–120 identical
+// frames after every change, and a slow renderer never reached its second
+// frame inside it anyway.
+const FRAME_SETTLE_MIN_FRAMES = 2;
 // The raw GL getter and guarded renderer facade remain available so cleanup
 // diagnostics can inspect exact owners. Renderer methods and property writes
 // are actively fenced at either terminal boundary; the raw GL object is
 // read-only by contract once the viewer is terminal.
+/**
+ * Public methods that only read state. Every other public call can change what
+ * is drawn, so it marks the next frame for drawing.
+ *
+ * `pick…` looks a cell up under a screen point; hover readers call it on every
+ * pointer frame, and treating it as a mutation redrew the whole scene for a
+ * full settle window after each lookup. `prepareCellPicking` builds, in a
+ * worker, the index those lookups read, which changes nothing on screen.
+ */
+const FRAME_NEUTRAL_VIEWER_METHODS = new Set(['prepareCellPicking']);
+
+function isFrameReaderMethodName(methodName) {
+  return /^(get|has|is|pick)[A-Z]/.test(methodName)
+    || FRAME_NEUTRAL_VIEWER_METHODS.has(methodName);
+}
+
+/**
+ * Public setters that invalidate the frame themselves, and only when they
+ * change something drawn.
+ *
+ * The app re-publishes every view's label on each field activation and filter
+ * change (`_pushActiveViewLabelToViewer`, `_refreshInactiveViewLabels`), and
+ * almost every one of those pushes carries the label the view already shows.
+ * Under the blanket rule each push redrew the whole scene for a settle window,
+ * which is a full GPU pass per frame for nothing and, on a renderer that takes
+ * seconds per frame, tens of seconds of drawing after a click. A lasso,
+ * proximity or KNN preview likewise republishes the highlight on every
+ * pointer move, mostly with the cells it already shows.
+ */
+const SELF_INVALIDATING_VIEWER_METHODS = new Set([
+  'setLiveViewLabel',
+  'updateHighlight',
+  'updateSnapshotAttributes'
+]);
+
 const TERMINAL_SAFE_VIEWER_METHODS = new Set([
   'dispose',
   'getGLContext',
@@ -115,11 +182,7 @@ const TERMINAL_SAFE_VIEWER_METHODS = new Set([
   'start'
 ]);
 
-export {
-  assertCameraState,
-  assertNavigationMode,
-  cloneCameraState
-} from './camera-state-contract.js';
+export { assertNavigationMode } from './camera-state-contract.js';
 
 export {
   createViewerRendererFacade
@@ -130,7 +193,10 @@ export {
 } from './viewer/viewer-contracts.js';
 
 export {
-  resolvePresentedViewLayout,
+  getPresentedGridColumns,
+  getPresentedPane,
+  getPresentedPaneAtCssPoint,
+  resolvePresentedLayout,
   runSynchronousBorrowedViewDataCallback,
   selectPresentedCameraState
 } from './viewer/presented-view-layout.js';
@@ -181,33 +247,6 @@ export function centroidSnapshotBufferOwnsData(
     record.count === positions.length / 3 &&
     colors.length === record.count * 4
   );
-}
-
-/**
- * Return the exact binary visibility byte consumed by the edge shader.
- * WebGL normalizes R8 bytes to [0, 1], so 0/255 preserves the shader's
- * historical `visibility < 0.5` decision for every finite Float32 input in
- * the documented [0, 1] contract.
- *
- * @param {number} value
- * @param {number} [index=-1]
- * @returns {0|255}
- */
-export function encodeEdgeVisibilityByte(value, index = -1) {
-  const suffix = Number.isSafeInteger(index) && index >= 0
-    ? ` at index ${index}`
-    : '';
-  if (typeof value !== 'number' || !Number.isFinite(value)) {
-    throw new TypeError(
-      `Connectivity visibility${suffix} must be one finite Float32 value.`
-    );
-  }
-  if (value < 0 || value > 1) {
-    throw new RangeError(
-      `Connectivity visibility${suffix} must be between 0 and 1.`
-    );
-  }
-  return value < 0.5 ? 0 : 255;
 }
 
 function requireViewerLodMembership(membership, pointCount) {
@@ -281,11 +320,11 @@ function createLodFilteredVisibilityOwner(
   membership
 ) {
   if (
-    !(transparency instanceof Float32Array) ||
+    !(transparency instanceof Uint8Array) ||
     transparency.length === 0
   ) {
     throw new TypeError(
-      'LOD-filtered connectivity requires one non-empty Float32 transparency array.'
+      'LOD-filtered connectivity requires one non-empty Uint8 transparency array.'
     );
   }
   const exactMembership = requireViewerLodMembership(
@@ -300,263 +339,52 @@ function createLodFilteredVisibilityOwner(
   });
 }
 
-/**
- * Compute the square-ish texture layout shared by edge positions and
- * visibility. Keeping this pure makes the exact allocation arithmetic
- * independently testable at production-scale point counts.
- *
- * @param {number} count
- * @param {number} maxTextureSize
- * @returns {[number, number]}
- */
-export function calculateEdgeTextureDimensions(count, maxTextureSize) {
-  if (!Number.isSafeInteger(count) || count < 0) {
-    throw new RangeError(
-      'Connectivity texture count must be one non-negative safe integer.'
-    );
-  }
-  if (!Number.isSafeInteger(maxTextureSize) || maxTextureSize <= 0) {
-    throw new RangeError(
-      'Connectivity maximum texture size must be one positive safe integer.'
-    );
-  }
-  if (count === 0) return [1, 1];
-  const width = Math.min(Math.ceil(Math.sqrt(count)), maxTextureSize);
-  const height = Math.ceil(count / width);
-  return [width, Math.min(height, maxTextureSize)];
-}
-
-function assertNoWebGLError(gl, label) {
-  const errorCodes = [];
-  for (let attempt = 0; attempt < 32; attempt++) {
-    const errorCode = gl.getError();
-    if (errorCode === gl.NO_ERROR) break;
-    errorCodes.push(errorCode);
-  }
-  if (errorCodes.length > 0) {
-    const encodedErrors = errorCodes
-      .map(errorCode => `0x${errorCode.toString(16)}`)
-      .join(', ');
-    throw new Error(
-      `${label} encountered WebGL error${errorCodes.length === 1 ? '' : 's'} ${encodedErrors}.`
-    );
-  }
-}
 
 /**
- * Execute one ArrayBufferView texture publication against neutral WebGL2
- * unpack state and restore every caller-owned binding/addressing parameter.
+ * The navigation modes the user chose, per view and per dimension.
  *
- * @param {WebGL2RenderingContext|Object} gl
- * @param {WebGLTexture|Object} texture
- * @param {string} label
- * @param {Function} upload
- */
-export function runExactEdgeTextureUpload(
-  gl,
-  texture,
-  label,
-  upload
-) {
-  assertNoWebGLError(gl, `${label} preflight`);
-  const previousTexture = gl.getParameter(gl.TEXTURE_BINDING_2D);
-  const unpackParameters = [
-    gl.UNPACK_ALIGNMENT,
-    gl.UNPACK_ROW_LENGTH,
-    gl.UNPACK_IMAGE_HEIGHT,
-    gl.UNPACK_SKIP_PIXELS,
-    gl.UNPACK_SKIP_ROWS,
-    gl.UNPACK_SKIP_IMAGES,
-  ].filter(Number.isInteger);
-  const ownsPixelUnpackBufferState = (
-    Number.isInteger(gl.PIXEL_UNPACK_BUFFER) &&
-    Number.isInteger(gl.PIXEL_UNPACK_BUFFER_BINDING) &&
-    typeof gl.bindBuffer === 'function'
-  );
-  const previousPixelStore = unpackParameters.map(
-    parameter => gl.getParameter(parameter)
-  );
-  const previousPixelUnpackBuffer = ownsPixelUnpackBufferState
-    ? gl.getParameter(gl.PIXEL_UNPACK_BUFFER_BINDING)
-    : null;
-  let publicationError = null;
-  try {
-    gl.bindTexture(gl.TEXTURE_2D, texture);
-    if (ownsPixelUnpackBufferState) {
-      gl.bindBuffer(gl.PIXEL_UNPACK_BUFFER, null);
-    }
-    for (const parameter of unpackParameters) {
-      gl.pixelStorei(
-        parameter,
-        parameter === gl.UNPACK_ALIGNMENT ? 1 : 0
-      );
-    }
-    upload();
-    assertNoWebGLError(gl, label);
-  } catch (error) {
-    publicationError = error instanceof Error
-      ? error
-      : new Error(`${label} threw a non-Error value.`);
-  }
-
-  const restorationFailures = [];
-  const restorationOperations = [];
-  for (let index = 0; index < unpackParameters.length; index++) {
-    restorationOperations.push(
-      () => gl.pixelStorei(
-        unpackParameters[index],
-        previousPixelStore[index]
-      )
-    );
-  }
-  if (ownsPixelUnpackBufferState) {
-    restorationOperations.push(
-      () => gl.bindBuffer(
-        gl.PIXEL_UNPACK_BUFFER,
-        previousPixelUnpackBuffer
-      )
-    );
-  }
-  restorationOperations.push(
-    () => gl.bindTexture(gl.TEXTURE_2D, previousTexture)
-  );
-  for (const operation of restorationOperations) {
-    try {
-      operation();
-    } catch (error) {
-      restorationFailures.push(
-        error instanceof Error
-          ? error
-          : new Error(`${label} state restoration threw a non-Error value.`)
-      );
-    }
-  }
-  try {
-    assertNoWebGLError(gl, `${label} state restoration`);
-  } catch (error) {
-    restorationFailures.push(error);
-  }
-  if (publicationError !== null || restorationFailures.length > 0) {
-    const failures = publicationError === null
-      ? restorationFailures
-      : [publicationError, ...restorationFailures];
-    if (failures.length === 1) throw failures[0];
-    throw new AggregateError(
-      failures,
-      `${label} failed and WebGL state restoration was incomplete.`
-    );
-  }
-}
-
-/**
- * Drain exact texture handles while distinguishing a pre-delete failure from
- * a wrapper that threw after WebGL already accepted deletion.
- *
- * @param {WebGL2RenderingContext|Object} gl
- * @param {Set<*>} pending
- * @returns {Error[]}
- */
-export function drainExactTextureRetirements(gl, pending) {
-  if (!(pending instanceof Set)) {
-    throw new TypeError(
-      'Texture retirement journal must be one exact Set.'
-    );
-  }
-  const failures = [];
-  for (const texture of Array.from(pending)) {
-    try {
-      gl.deleteTexture(texture);
-      pending.delete(texture);
-    } catch (error) {
-      const exactError = error instanceof Error
-        ? error
-        : new Error('Texture retirement threw a non-Error value.');
-      let definitelyRetired = false;
-      if (typeof gl.isTexture === 'function') {
-        try {
-          definitelyRetired = gl.isTexture(texture) === false;
-        } catch (livenessError) {
-          failures.push(
-            new AggregateError(
-              [
-                exactError,
-                livenessError instanceof Error
-                  ? livenessError
-                  : new Error(
-                    'Texture liveness check threw a non-Error value.'
-                  ),
-              ],
-              'Texture deletion and liveness verification both failed.'
-            )
-          );
-          continue;
-        }
-      }
-      if (definitelyRetired) {
-        pending.delete(texture);
-      } else {
-        failures.push(exactError);
-      }
-    }
-  }
-  return failures;
-}
-
-/**
- * Track whether dimension defaults still own navigation for each view.
- * This state changes only on UI/session events and is never read by the render
- * loop.
- *
- * Ownership means one thing: the applied mode differs from the mode the view's
- * dimension implies. Publishing the dimension's own default — a dataset's
- * advertised starting state, a snapshot inheriting its source, Reset Camera —
- * is not a choice and leaves the dimension rule in charge, so the caller
- * releases instead of recording. That is what makes the coupling reversible:
- * selecting the default again from the Mode dropdown hands navigation back.
+ * Every view navigates by its own dimension: a 3D view orbits, a 1D or 2D view
+ * pans (see `getDefaultNavigationMode`). A choice is recorded only when it
+ * differs from that default, for the dimension the view showed when it was
+ * made: a view the user set to free-fly in 3D flies again whenever it shows a
+ * 3D representation, and pans whenever it shows a 2D one. Publishing a
+ * dimension's own default -- a dataset's opening state, Reset Camera, a
+ * session -- is not a choice and releases it. This state changes only on
+ * UI/session events and is never read by the render loop.
  */
 export function createNavigationModeOwnership() {
-  let sharedUserChoice = false;
-  const viewUserChoices = new Set();
+  const choices = new Map();
 
   return Object.freeze({
-    recordSharedUserChoice(mode) {
+    record(viewId, dimension, mode) {
       assertNavigationMode(mode);
-      sharedUserChoice = true;
-    },
-    releaseSharedUserChoice(mode) {
-      assertNavigationMode(mode);
-      // A shared publication reaches every view, so it also clears the per-view
-      // overrides it just overwrote.
-      sharedUserChoice = false;
-      viewUserChoices.clear();
-    },
-    recordViewUserChoice(viewId, mode) {
-      assertNavigationMode(mode);
-      viewUserChoices.add(assertViewId(viewId));
-    },
-    releaseViewUserChoice(viewId, mode) {
-      assertNavigationMode(mode);
-      viewUserChoices.delete(assertViewId(viewId));
-    },
-    promoteViewUserChoice(viewId, mode) {
-      assertNavigationMode(mode);
+      getDefaultNavigationMode(dimension);
       const exactViewId = assertViewId(viewId);
-      if (!viewUserChoices.has(exactViewId)) {
-        return false;
+      if (!choices.has(exactViewId)) choices.set(exactViewId, new Map());
+      choices.get(exactViewId).set(dimension, mode);
+    },
+    release(viewId, dimension) {
+      getDefaultNavigationMode(dimension);
+      choices.get(assertViewId(viewId))?.delete(dimension);
+    },
+    choiceFor(viewId, dimension) {
+      getDefaultNavigationMode(dimension);
+      return choices.get(assertViewId(viewId))?.get(dimension) ?? null;
+    },
+    copyView(sourceViewId, targetViewId) {
+      const source = choices.get(assertViewId(sourceViewId));
+      const target = assertViewId(targetViewId);
+      if (source === undefined) {
+        choices.delete(target);
+      } else {
+        choices.set(target, new Map(source));
       }
-      sharedUserChoice = true;
-      return true;
-    },
-    hasExplicitUserChoice(viewId) {
-      const exactViewId = assertViewId(viewId);
-      return sharedUserChoice || viewUserChoices.has(exactViewId);
     },
     deleteView(viewId) {
-      viewUserChoices.delete(assertViewId(viewId));
+      choices.delete(assertViewId(viewId));
     },
     clear() {
-      sharedUserChoice = false;
-      viewUserChoices.clear();
+      choices.clear();
     }
   });
 }
@@ -575,9 +403,13 @@ export function createViewer({
   // is provided instead by `rendering/scene-msaa-target.js`, which the app owns
   // and can switch per frame.
   // Every current rendering path requires WebGL2.
+  // The drawing buffer is preserved because frames are drawn only when the
+  // scene changes; a reader of the canvas between drawn frames still sees the
+  // last one instead of a cleared buffer.
   const gl = canvas.getContext('webgl2', {
     antialias: false,
-    powerPreference: 'high-performance'
+    powerPreference: 'high-performance',
+    preserveDrawingBuffer: true
   });
 
   if (!gl) {
@@ -592,7 +424,8 @@ export function createViewer({
   console.log('[Viewer] Using WebGL2');
 
   // ResizeObserver-based canvas sizing to avoid per-frame layout reads
-  const canvasResizeObserver = createCanvasResizeObserver(canvas);
+  // A canvas that changes size needs a frame at its new size.
+  const canvasResizeObserver = createCanvasResizeObserver(canvas, () => ensureFrameScheduled());
 
   const mat4 = glMatrix.mat4;
   const vec3 = glMatrix.vec3;
@@ -601,8 +434,7 @@ export function createViewer({
   // === HIGH-PERFORMANCE RENDERER FOR SCATTER POINTS ===
   const hpRenderer = new HighPerfRenderer(gl, {
     USE_LOD: false,
-    USE_FRUSTUM_CULLING: false,
-    USE_INTERLEAVED_BUFFERS: true
+    USE_FRUSTUM_CULLING: false
   });
   // Terminal cleanup is an internal lifecycle capability, not a replaceable
   // facade extension point. Capture the exact implementation before callers
@@ -611,6 +443,8 @@ export function createViewer({
     hpRenderer.handleContextLost.bind(hpRenderer);
   const disposeHpRenderer =
     hpRenderer.dispose.bind(hpRenderer);
+  // A tree built off the main thread has landed: draw, so its view adopts it.
+  hpRenderer.onAsyncTreeReady = () => invalidateFrame();
   console.log('[Viewer] HighPerfRenderer initialized');
 
   // === ORBIT ANCHOR RENDERER ===
@@ -622,40 +456,22 @@ export function createViewer({
   const smokeRenderer = new SmokeRenderer(gl, createProgram);
   console.log('[Viewer] SmokeRenderer initialized');
 
-  // === INSTANCED LINE PROGRAM (V2 - GPU-optimized) ===
-  let lineInstancedProgram = createProgram(gl, LINE_INSTANCED_VS_SOURCE, LINE_INSTANCED_FS_SOURCE);
-  const lineInstancedAttribLocations = {
-    quadPos: gl.getAttribLocation(lineInstancedProgram, 'a_quadPos'),
-  };
-  const lineInstancedUniformLocations = {
-    mvpMatrix:         gl.getUniformLocation(lineInstancedProgram, 'u_mvpMatrix'),
-    viewMatrix:        gl.getUniformLocation(lineInstancedProgram, 'u_viewMatrix'),
-    modelMatrix:       gl.getUniformLocation(lineInstancedProgram, 'u_modelMatrix'),
-    viewportSize:      gl.getUniformLocation(lineInstancedProgram, 'u_viewportSize'),
-    lineWidth:         gl.getUniformLocation(lineInstancedProgram, 'u_lineWidth'),
-    maxEdges:          gl.getUniformLocation(lineInstancedProgram, 'u_maxEdges'),
-    edgeTexture:       gl.getUniformLocation(lineInstancedProgram, 'u_edgeTexture'),
-    edgeWeightTexture: gl.getUniformLocation(lineInstancedProgram, 'u_edgeWeightTexture'),
-    edgeTexDims:       gl.getUniformLocation(lineInstancedProgram, 'u_edgeTexDims'),
-    positionTexture:   gl.getUniformLocation(lineInstancedProgram, 'u_positionTexture'),
-    posTexDims:        gl.getUniformLocation(lineInstancedProgram, 'u_posTexDims'),
-    visibilityTexture: gl.getUniformLocation(lineInstancedProgram, 'u_visibilityTexture'),
-    lineColor:         gl.getUniformLocation(lineInstancedProgram, 'u_lineColor'),
-    lineAlpha:         gl.getUniformLocation(lineInstancedProgram, 'u_lineAlpha'),
-    fogDensity:        gl.getUniformLocation(lineInstancedProgram, 'u_fogDensity'),
-    fogNearMean:       gl.getUniformLocation(lineInstancedProgram, 'u_fogNearMean'),
-    fogFarMean:        gl.getUniformLocation(lineInstancedProgram, 'u_fogFarMean'),
-    fogColor:          gl.getUniformLocation(lineInstancedProgram, 'u_fogColor'),
-  };
+  // The grid, studio backdrop and centroid programs, compiled and linked in
+  // one batch (`createProgramBatch`): one wait instead of three.
+  const [initialGridProgram, initialStudioProgram, initialCentroidProgram] =
+    createProgramBatch(gl, [
+      { label: 'grid', vs: GRID_VS_SOURCE, fs: GRID_FS_SOURCE },
+      { label: 'studio backdrop', vs: STUDIO_VS_SOURCE, fs: STUDIO_FS_SOURCE },
+      { label: 'centroid', vs: CENTROID_VS, fs: CENTROID_FS },
+    ]);
 
   // === GRID PROGRAM ===
-  let gridProgram = createProgram(gl, GRID_VS_SOURCE, GRID_FS_SOURCE);
+  let gridProgram = initialGridProgram;
   const gridAttribLocations = {
     position: gl.getAttribLocation(gridProgram, 'a_position'),
   };
   const gridUniformLocations = {
     mvpMatrix:    gl.getUniformLocation(gridProgram, 'u_mvpMatrix'),
-    viewMatrix:   gl.getUniformLocation(gridProgram, 'u_viewMatrix'),
     modelMatrix:  gl.getUniformLocation(gridProgram, 'u_modelMatrix'),
     gridColor:    gl.getUniformLocation(gridProgram, 'u_gridColor'),
     bgColor:      gl.getUniformLocation(gridProgram, 'u_bgColor'),
@@ -664,17 +480,72 @@ export function createViewer({
     gridOpacity:  gl.getUniformLocation(gridProgram, 'u_gridOpacity'),
     planeAlpha:   gl.getUniformLocation(gridProgram, 'u_planeAlpha'),
     planeType:    gl.getUniformLocation(gridProgram, 'u_planeType'),
-    fogDensity:   gl.getUniformLocation(gridProgram, 'u_fogDensity'),
-    fogNearMean:  gl.getUniformLocation(gridProgram, 'u_fogNearMean'),
-    fogFarMean:   gl.getUniformLocation(gridProgram, 'u_fogFarMean'),
     axisXColor:   gl.getUniformLocation(gridProgram, 'u_axisXColor'),
     axisYColor:   gl.getUniformLocation(gridProgram, 'u_axisYColor'),
     axisZColor:   gl.getUniformLocation(gridProgram, 'u_axisZColor'),
     gridSize:     gl.getUniformLocation(gridProgram, 'u_gridSize'),
   };
 
+  // === STUDIO BACKDROP PROGRAM ===
+  // One full-pane triangle in its own vertex array, so the draw neither reads
+  // nor disturbs the attribute state another pass left on the default one.
+  let studioProgram = initialStudioProgram;
+  let studioVao = gl.createVertexArray();
+  let studioCornerBuffer = gl.createBuffer();
+  gl.bindVertexArray(studioVao);
+  gl.bindBuffer(gl.ARRAY_BUFFER, studioCornerBuffer);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+  gl.bindVertexArray(null);
+  gl.bindBuffer(gl.ARRAY_BUFFER, null);
+  const studioUniformLocations = {
+    invMvpMatrix:     gl.getUniformLocation(studioProgram, 'u_invMvpMatrix'),
+    eye:              gl.getUniformLocation(studioProgram, 'u_eye'),
+    pixelRatio:       gl.getUniformLocation(studioProgram, 'u_pixelRatio'),
+    surfaceColor:     gl.getUniformLocation(studioProgram, 'u_surfaceColor'),
+    glowColor:        gl.getUniformLocation(studioProgram, 'u_glowColor'),
+    glowCenterX:      gl.getUniformLocation(studioProgram, 'u_glowCenterX'),
+    inkColor:         gl.getUniformLocation(studioProgram, 'u_inkColor'),
+    lineMinorAlpha:   gl.getUniformLocation(studioProgram, 'u_lineMinorAlpha'),
+    lineMajorAlpha:   gl.getUniformLocation(studioProgram, 'u_lineMajorAlpha'),
+    dotMinorAlpha:    gl.getUniformLocation(studioProgram, 'u_dotMinorAlpha'),
+    dotMajorAlpha:    gl.getUniformLocation(studioProgram, 'u_dotMajorAlpha'),
+    opacity:          gl.getUniformLocation(studioProgram, 'u_opacity'),
+    floorWeight:      gl.getUniformLocation(studioProgram, 'u_floorWeight'),
+    floorY:           gl.getUniformLocation(studioProgram, 'u_floorY'),
+    stageCenter:      gl.getUniformLocation(studioProgram, 'u_stageCenter'),
+    backdropWeight:   gl.getUniformLocation(studioProgram, 'u_backdropWeight'),
+    backNormal:       gl.getUniformLocation(studioProgram, 'u_backNormal'),
+    backOffset:       gl.getUniformLocation(studioProgram, 'u_backOffset'),
+    backU:            gl.getUniformLocation(studioProgram, 'u_backU'),
+    backV:            gl.getUniformLocation(studioProgram, 'u_backV'),
+    poolCenter:       gl.getUniformLocation(studioProgram, 'u_poolCenter'),
+    poolInverse:      gl.getUniformLocation(studioProgram, 'u_poolInverse'),
+    poolStrength:     gl.getUniformLocation(studioProgram, 'u_poolStrength'),
+  };
+
+  // === BACKDROP LOOKS ===
+  // Baked procedural backgrounds; see rendering/backdrops/. Bakes run in idle
+  // slices outside the frame and wake the viewer once when they land.
+  const backdropLooks = createBackdropLookRenderer(gl, {
+    invalidate: () => invalidateFrame(),
+    prefersReducedMotion: () => prefersReducedMotion(),
+    readViewSource: (viewId) => {
+      const record = viewPositionsCache.get(viewId);
+      if (!(record?.positions instanceof Float32Array)) return null;
+      let colors = null;
+      let visibility = null;
+      let generation = 0;
+      try { colors = getExactViewColors(viewId); } catch { colors = null; }
+      try { visibility = getExactViewTransparency(viewId); } catch { visibility = null; }
+      try { generation = getViewDataGeneration(viewId); } catch { generation = 0; }
+      return { positions: record.positions, dimension: record.dimension, colors, visibility, generation };
+    },
+  });
+
   // === CENTROID PROGRAM (simple WebGL2 shader for small centroid count) ===
-  let centroidProgram = createProgram(gl, CENTROID_VS, CENTROID_FS);
+  let centroidProgram = initialCentroidProgram;
   const centroidAttribLocations = {
     position: gl.getAttribLocation(centroidProgram, 'a_position'),
     color: gl.getAttribLocation(centroidProgram, 'a_color'), // RGBA uint8 normalized
@@ -691,7 +562,7 @@ export function createViewer({
 
   // Highlight toolset (renderer + interactive tools)
   let highlightTools = null;
-  let currentShaderQuality = 'full';
+  let currentShaderQuality = DEFAULT_SHADER_QUALITY;
 
   // === OVERLAYS (opt-in render passes, e.g. vector field particles) ===
   let overlayManager = null;
@@ -802,65 +673,53 @@ export function createViewer({
   // Color buffer now stores RGBA as uint8 (alpha packed in)
   let centroidPositionBuffer = gl.createBuffer();
   let centroidColorBuffer = gl.createBuffer(); // RGBA uint8
-  if (!centroidPositionBuffer || !centroidColorBuffer) {
+  // The live centroid pass owns its vertex array, so its attribute state never
+  // lands on whichever vertex array another pass left bound.
+  let centroidVao = gl.createVertexArray();
+  if (!centroidPositionBuffer || !centroidColorBuffer || !centroidVao) {
     if (centroidPositionBuffer) gl.deleteBuffer(centroidPositionBuffer);
     if (centroidColorBuffer) gl.deleteBuffer(centroidColorBuffer);
+    if (centroidVao) gl.deleteVertexArray(centroidVao);
     throw new Error(
       'Viewer could not allocate the required centroid buffers.'
     );
   }
 
-  // === INSTANCED EDGE RENDERING ===
-  // Quad geometry buffer for instanced edges (6 vertices, 2 triangles)
-  // Each vertex has (x, y) where x = endpoint (-1=src, +1=dst), y = side (-1=left, +1=right)
-  let edgeQuadBuffer = gl.createBuffer();
-  gl.bindBuffer(gl.ARRAY_BUFFER, edgeQuadBuffer);
-  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
-    // Triangle 1: src-left, src-right, dst-left
-    -1, -1,  -1, 1,  1, -1,
-    // Triangle 2: src-right, dst-right, dst-left
-    -1, 1,  1, 1,  1, -1,
-  ]), gl.STATIC_DRAW);
-
-  // V2 edge textures (created on demand)
-  // Global edge topology texture (shared across all views - edges don't change)
-  let edgeTextureV2 = null;
-  let edgeWeightTextureV2 = null;
-  let edgeTexDimsV2 = [0, 0];
-  let nEdgesV2 = 0;
-  let nCellsV2 = 0;
-  let hasEdgeDataV2 = false;
-  let useInstancedEdges = false;  // Whether to use v2 instanced rendering
-  // Endpoint owners alias the exact shuffled dataset generation. Per-view
-  // sparse prefix indices are certified against the accepted R8 visibility
-  // scratch so every pane can submit its own exact instance count.
-  let edgeSourcesV2 = null;
-  let edgeDestinationsV2 = null;
-  let edgeVisibleTarget = 0;
-  let edgeAllVisiblePrefixOwner = null;
-  const edgePrefixOwnersV2 = new Map();
-  let edgePrefixCheckpointStaging = null;
-
-  // Per-view edge textures for multi-view/multi-dimension support
-  // Each view can have different positions (embeddings) and visibility (filters/LOD)
-  // Exact renderer geometry generations share one immutable RGB32F texture.
-  // The view map intentionally points at the pooled entry itself so a frozen
-  // snapshot retains its old generation when the live view is republished.
-  const edgePositionTexturePoolV2 = new Map(); // generation -> pooled entry
-  const edgePositionTexturesV2 = new Map();   // viewId -> pooled entry
-  const edgeVisibilityTexturesV2 = new Map(); // viewId -> { texture, dims: [w, h], scratchBuffer, format }
-  const edgeTextureLookupScratch = {
-    posTexture: null,
-    visTexture: null,
-    dims: null
+  // === CONNECTIVITY EDGES ===
+  // The graph, each pane's shown edges and their GPU records
+  // (connectivity-edge-layer.js). The layer reads a pane's positions from the
+  // renderer at draw time, so a representation switch needs no call here.
+  const edgeLayer = createConnectivityEdgeLayer({
+    gl,
+    getViewGeometry: viewId => getCertifiedEdgeGeometry(viewId),
+    onVisibleCount: (viewId, stats) => {
+      for (const listener of edgeVisibleCountListeners) {
+        try {
+          listener(viewId, stats);
+        } catch (error) {
+          queueMicrotask(() => {
+            throw error;
+          });
+        }
+      }
+    },
+  });
+  const edgeVisibleCountListeners = new Set();
+  let useInstancedEdges = false; // Whether published edges are drawn
+  // Scratch for the per-draw model-view product the edge shader reads.
+  const edgeModelViewMatrix = mat4.create();
+  const edgeFrame = {
+    mvpMatrix: null,
+    modelViewMatrix: edgeModelViewMatrix,
+    widthPx: 0,
+    heightPx: 0,
+    lineWidth: 1,
+    lineColor: new Float32Array(3),
+    lineAlpha: 1,
+    fogDensity: 0,
+    fogNear: 0,
+    fogFar: 0,
   };
-  let edgeVisibilityStagingBuffer = null;
-  const pendingEdgeTextureRetirements = new Set();
-
-  // Debug flag for edge rendering (set to true to enable verbose logging)
-  let edgeDebugMode = false;
-  let edgeDebugFrameCount = 0;  // Limit debug output to first few frames
-
 
   // Centroid snapshot buffers - pre-uploaded GPU buffers for each snapshot view
   // Eliminates per-frame CPU→GPU uploads in multiview mode
@@ -989,7 +848,8 @@ export function createViewer({
 
   // Small-multiples / snapshot views
   const LIVE_VIEW_ID = 'live';
-  const MAX_SNAPSHOTS = 3;
+  // The views drawn this frame, rewritten in place (hpRenderer.setPresentedViews).
+  const _presentedViewIdsScratch = [];
   let snapshotViews = [];
   const snapshotViewsById = new Map();
   const certifiedCameraStateOwners = new WeakSet();
@@ -1003,6 +863,19 @@ export function createViewer({
   let navigationModeChangeHandler = null;
   let highlightRenderFailureHandler = null;
   let smokeRenderFailureHandler = null;
+  // Told whenever the live view's positions or colours are republished: a
+  // built smoke volume is a function of both, so its owner must rebuild it.
+  let smokeSourceChangeHandler = null;
+  function publishSmokeSourceChange() {
+    if (smokeSourceChangeHandler === null) return;
+    try {
+      smokeSourceChangeHandler();
+    } catch (observerError) {
+      queueMicrotask(() => {
+        throw observerError;
+      });
+    }
+  }
   let velocityRenderFailureHandler = null;
 
   function assertKnownViewId(viewId) {
@@ -1031,22 +904,56 @@ export function createViewer({
     return cameraState;
   }
 
-  // Camera lock state for independent view navigation
-  let camerasLocked = true;           // Default: all views share camera
-  let liveCameraState = null;         // Camera state for live view when unlocked
+  // Every view owns a camera state, navigation mode included. The focused
+  // view is drawn from the global camera scalars; with linked cameras, so is
+  // every other view that shows the same representation (layout) as the
+  // focused one. Views of another representation keep their own cameras even
+  // while linked: one camera cannot serve a 3D view and a 2D view, or two
+  // embeddings with different geometry. `cameraFollowers` is that set, kept
+  // current on every focus, link, layout and inventory change, so the render
+  // loop reads one Set per pane.
+  let camerasLocked = true;           // "Link cameras": link views of one representation
+  let liveCameraState = null;         // The live view's stored camera
+  let cameraFollowers = new Set([LIVE_VIEW_ID]);
 
   // Cached view matrices for unlocked camera mode (avoids per-frame recalculation)
   const cachedViewMatrices = new Map();  // viewId -> { viewMatrix: Float32Array, radius: number, dirty: boolean }
-  const cachedGridProjections = new Map();
-  let cachedGridProjectionAspect = null;
+  // Presented layout (see getPresentedLayout): the resolved panes, the
+  // inputs they were resolved from, and one projection matrix per pane.
+  let presentedLayout = null;
+  const presentedLayoutKey = {
+    width: 0,
+    height: 0,
+    cssWidth: 0,
+    cssHeight: 0,
+    leftOcclusionRatio: 0,
+    mode: null,
+    focusedViewId: null,
+    liveViewHidden: false,
+    snapshotIds: []
+  };
+  const presentedPaneProjections = [];
+  const presentedLayoutListeners = new Set();
 
 	  // Per-view dimension tracking for multi-dimensional support
 	  const viewDimensionLevels = new Map([
 	    [LIVE_VIEW_ID, INITIAL_DIMENSION_LEVEL]
 	  ]);  // viewId -> exact published dimension level
-	  const viewPositionsCache = new Map();   // viewId -> Float32Array positions
+	  // viewId -> layout key of the embedding the view's positions belong to
+	  // (null while the view shows no dataset). The layout, not the dimension,
+	  // is the identity of a view's geometry: per-view LOD, picking and vector
+	  // state is invalidated whenever it changes.
+	  const viewLayoutKeys = new Map([
+	    [LIVE_VIEW_ID, null]
+	  ]);
+	  // viewId -> { positions, dimension }: each view's published positions and
+	  // their components per point (rendering/position-layout.js).
+	  const viewPositionsCache = new Map();
 	  // Per-view render params (avoid per-frame allocations in multiview render loop)
 	  const renderParamsByView = new Map();   // viewId -> mutable params object passed to HighPerfRenderer
+	  // viewId -> the studio backdrop's per-view record: the geometry resolved
+	  // from the positions it was derived from, and the surface crossfade.
+	  const studioPaneStates = new Map();
 	  // Per-view overlay contexts + stable builder options (avoid per-frame allocations/closures)
 	  const overlayCtxByView = new Map();     // viewId -> OverlayContext
 	  const overlayCtxOptionsByView = new Map(); // viewId -> stable buildOverlayContext options object
@@ -1356,7 +1263,10 @@ export function createViewer({
 	      lodLevel,
 	      viewId: exactViewId,
 	    });
-	    publishPresentedViewStateChange('lod', exactViewId);
+	    // A level of detail change is not a camera change: it must not restart
+	    // the camera burst, or a zoom that steps LOD emits a camera-changing
+	    // per step and never settles.
+	    publishPresentedViewStateChange('lod', exactViewId, false);
 	    const observerFailures = [];
 	    for (const listener of lodChangeListeners) {
 	      try {
@@ -1405,15 +1315,38 @@ export function createViewer({
 	    return dimensionLevel;
 	  }
 
-	  function getExactViewPositions(viewId) {
+	  function getExactViewPositionRecord(viewId) {
 	    if (typeof viewId !== 'string' || viewId.length === 0) {
 	      throw new TypeError('Renderer view id must be a non-empty string.');
 	    }
-	    const positions = viewPositionsCache.get(viewId);
-	    if (!(positions instanceof Float32Array)) {
+	    const record = viewPositionsCache.get(viewId);
+	    if (!(record?.positions instanceof Float32Array)) {
 	      throw new Error(`Positions are not published for view "${viewId}".`);
 	    }
-	    return positions;
+	    return record;
+	  }
+
+	  function getExactViewPositions(viewId) {
+	    return getExactViewPositionRecord(viewId).positions;
+	  }
+
+	  /** Components per point of a view's published positions (1, 2 or 3). */
+	  function getExactViewPositionDimension(viewId) {
+	    return getExactViewPositionRecord(viewId).dimension;
+	  }
+
+	  function publishViewPositions(viewId, positions, dimension) {
+	    // An empty publication (no dataset) is valid in any layout.
+	    requirePositionArray(
+	      positions,
+	      dimension,
+	      `Positions for view "${viewId}"`,
+	      { allowEmpty: true }
+	    );
+	    viewPositionsCache.set(
+	      viewId,
+	      Object.freeze({ positions, dimension })
+	    );
 	  }
 
 	  function getExactViewColors(viewId) {
@@ -1438,7 +1371,7 @@ export function createViewer({
 	      throw new TypeError('Renderer view id must be a non-empty string.');
 	    }
 	    if (viewId === LIVE_VIEW_ID) {
-	      if (!(transparencyArray instanceof Float32Array)) {
+	      if (!(transparencyArray instanceof Uint8Array)) {
 	        throw new Error('Transparency is not published for view "live".');
 	      }
 	      return transparencyArray;
@@ -1447,7 +1380,7 @@ export function createViewer({
 	    if (!snapshot) {
 	      throw new Error(`View "${viewId}" does not exist.`);
 	    }
-	    if (!(snapshot.transparency instanceof Float32Array)) {
+	    if (!(snapshot.transparency instanceof Uint8Array)) {
 	      throw new Error(`Transparency is not published for view "${viewId}".`);
 	    }
 		    return snapshot.transparency;
@@ -1464,8 +1397,10 @@ export function createViewer({
 	      getExactViewTransparency(exactViewId);
 	    const dimensionLevel =
 	      getPublishedDimensionLevel(exactViewId);
-	    const pointCountForView = positions.length / 3;
+	    // The published dimension is also the positions' stride.
+	    const pointCountForView = positions.length / dimensionLevel;
 	    if (
+	      getExactViewPositionDimension(exactViewId) !== dimensionLevel ||
 	      !Number.isSafeInteger(pointCountForView) ||
 	      pointCountForView !== pointCount ||
 	      colors.length !== pointCountForView * 4 ||
@@ -1489,6 +1424,9 @@ export function createViewer({
 	        exactViewId,
 	        dimensionLevel
 	      );
+	    // The order the pane draws its points in at full detail (null: source
+	    // order); a reduced level draws a prefix of it.
+	    const drawOrder = hpRenderer.getViewDrawOrder(exactViewId);
 	    const geometryGenerationAfter =
 	      hpRenderer.getViewGeometryGeneration(exactViewId);
 	    if (
@@ -1504,6 +1442,7 @@ export function createViewer({
 	      colors,
 	      dataGeneration,
 	      dimensionLevel,
+	      drawOrder,
 	      geometryGeneration: geometryGenerationAfter,
 	      lodLevel,
 	      lodMembership,
@@ -1538,6 +1477,7 @@ export function createViewer({
 	      current.dataGeneration !== owner.dataGeneration ||
 	      current.lodLevel !== owner.lodLevel ||
 	      current.lodMembership !== owner.lodMembership ||
+	      current.drawOrder !== owner.drawOrder ||
 	      current.lodSizeMultiplier !== owner.lodSizeMultiplier
 	    ) {
 	      throw new Error(
@@ -1574,7 +1514,12 @@ export function createViewer({
         const transparency = getExactViewTransparency(exactViewId);
         const dimensionLevel =
           getPublishedDimensionLevel(exactViewId);
-        const pointCountForView = publishedPositions.length / 3;
+        if (getExactViewPositionDimension(exactViewId) !== dimensionLevel) {
+          throw new Error(
+            `Spatial-query positions for view "${exactViewId}" are not published in its ${dimensionLevel}D layout.`
+          );
+        }
+        const pointCountForView = publishedPositions.length / dimensionLevel;
         const resolveIndex = () => (
           exactViewId === LIVE_VIEW_ID
             ? hpRenderer.spatialIndices.get(dimensionLevel) ?? null
@@ -1629,7 +1574,6 @@ export function createViewer({
           (
             spatialIndex.pointCount !== pointCountForView ||
             spatialIndex.dimensionLevel !== dimensionLevel ||
-            typeof spatialIndex.visitRaySegmentCandidates !== 'function' ||
             typeof spatialIndex.visitRadiusCandidates !== 'function' ||
             typeof spatialIndex.visitProjectedRectCandidates !== 'function'
           )
@@ -1694,6 +1638,7 @@ export function createViewer({
 	        viewId: vid,
 	        dimensionLevel: getPublishedDimensionLevel(vid),
 	        useAlphaTexture: false,
+	        multisampled: false,
 	        autoFog: true,
 	        overrideBounds: null
 	      };
@@ -1704,11 +1649,11 @@ export function createViewer({
 
   const viewTitleLayerEl = viewTitleLayer || null;
   let viewTitleEntries = [];
-  // Cache for view title layout to avoid per-frame style updates
-  let lastTitleLayoutWidth = 0;
-  let lastTitleLayoutHeight = 0;
-  let lastTitleLayoutCols = 0;
-  let lastTitleLayoutRows = 0;
+  // The presented layout the title chips were last placed for; chips are
+  // repositioned only when the layout object changes, never per frame.
+  let lastTitleLayout = null;
+  // A chip sits this far below the top edge of its pane (CSS pixels).
+  const VIEW_TITLE_TOP_OFFSET_PX = 20;
 
   const projectionMatrix = mat4.create();
   const viewMatrix = mat4.create();
@@ -1717,6 +1662,33 @@ export function createViewer({
   const viewProjMatrix = mat4.create();
   const invViewProjMatrix = mat4.create();
   const tempInvViewMatrix = mat4.create();
+  // Preallocated studio backdrop scratch: one pane's inverse MVP and camera.
+  const _studioInvMvpMatrix = mat4.create();
+  const _studioInvViewMatrix = mat4.create();
+  const _studioEye = new Float32Array(3);
+  const _studioPool = {
+    gate: 0,
+    centerX: 0,
+    centerY: 0,
+    axisAX: 0,
+    axisAY: 0,
+    axisBX: 0,
+    axisBY: 0,
+  };
+  const _studioPoolInverse = new Float32Array(4);
+  const _studioSurfaceWeights = { floor: 0, backdrop: 0 };
+  const _studioBackPlane = {
+    normalX: 0,
+    normalY: 0,
+    normalZ: -1,
+    offset: 0,
+    uX: 1,
+    uY: 0,
+    uZ: 0,
+    vX: 0,
+    vY: 1,
+    vZ: 0,
+  };
   mat4.identity(modelMatrix);
 
   const tempVec4 = vec4.create();
@@ -1828,7 +1800,6 @@ export function createViewer({
 	    viewMatrix,
 	    modelMatrix,
 	    fogDensity: 0,
-	    fogColor: null,
 	    lightingStrength: 0,
 	    lightDir,
 	    navigationMode: 'orbit'
@@ -1837,8 +1808,6 @@ export function createViewer({
   let positionsArray = null;
   let colorsArray = null;
   let transparencyArray = null;
-  let fogNearMean = 0.0;
-  let fogFarMean = 1.0;
 
   // Render mode state
   let renderMode = 'points';
@@ -1853,9 +1822,9 @@ export function createViewer({
     pickCellAtScreen,
     screenToRay,
     getViewportInfoAtScreen,
+    getViewIdAtCanvasPoint: getPresentedViewIdAtCssPoint,
     getRenderContext: () => getHighlightContext(),
     getNavigationState: () => ({ navigationMode, isDragging }),
-    getViewPositions: getExactViewPositions,
     getViewTransparency: getExactViewTransparency,
     getSpatialQueryOwner,
     startTime,
@@ -1867,7 +1836,6 @@ export function createViewer({
   let connectivityLineWidth = 1.0;
   let connectivityAlpha = 0.60;
   const connectivityColorBytes = new Uint8Array([77, 77, 77]); // ~0.3 in 0-255
-  const connectivityColorVec = vec3.create(); // normalized to 0-1 on use
 
   // Camera
   // Keep near plane tight so points do not disappear too early when orbiting in
@@ -1896,20 +1864,28 @@ export function createViewer({
   // Target values for smooth grid transitions
   let targetGridOpacity = 0.75;
   let gridTransitionSpeed = 3.0;  // Opacity change per second
-  // Allow theme-specific tuning of how strongly fog affects the grid.
-  // In light grid mode we keep the grid more visible at distance by
-  // lowering effective fog strength slightly.
-  let gridFogDensityMultiplier = 1.0;
+  // Studio backdrop state. The palette is the last studio background shown, so
+  // a fade-out after switching away keeps its own marks; the surface it fades
+  // over is always the current clear colour.
+  let showStudio = false;
+  let studioOpacity = 0;
+  let studioPalette = STUDIO_PALETTES.studio;
+  let studioGlowColor = studioColor01(STUDIO_PALETTES.studio.glow);
+  let studioInkColor = studioColor01(STUDIO_PALETTES.studio.ink);
+  // Whether a pane drawn in the last frame was still crossing between the
+  // floor and the dot surface, so the next frame is still owed.
+  let studioSurfaceInTransition = false;
   // Scientific grayscale axis colors (no distracting colors)
   let axisXColor = [0.35, 0.35, 0.35];  // Neutral gray for all axes
   let axisYColor = [0.35, 0.35, 0.35];
   let axisZColor = [0.35, 0.35, 0.35];
 
   // Interaction
-  let radius = 3.0;
-  let theta = Math.PI / 4;
-  let phi = Math.PI / 4;
-  const target = vec3.fromValues(0, 0, 0);
+  const initialCameraPose = createDefaultCameraPose();
+  let radius = initialCameraPose.orbit.radius;
+  let theta = initialCameraPose.orbit.theta;
+  let phi = initialCameraPose.orbit.phi;
+  const target = vec3.fromValues(...initialCameraPose.orbit.target);
   const eye = vec3.create();
   const up = vec3.fromValues(0, 1, 0);
   // Google Earth-style orbit by default (drag inverts horizontal)
@@ -1922,7 +1898,6 @@ export function createViewer({
   let cursorX = 0;  // Current cursor position for aiming (client coords)
   let cursorY = 0;
 	  let targetRadius = radius;
-	  let lastTouchDist = 0;
 	  let animationHandle = null;
 	  let renderPaused = false;
 	  let disposed = false;
@@ -1947,11 +1922,33 @@ export function createViewer({
   let orbitKeySpeed = 0.4; // multiplier for orbit rotation and zoom speed
   let planarPanSpeed = 0.0075; // multiplier for planar pan and zoom speed
   const sprintMultiplier = 2.2;
+  // WASD navigation works in all modes (free, orbit, planar). Zoom keys: Equal
+  // (=) and Minus (-), also BracketRight (]) and BracketLeft ([). Shift only
+  // speeds a movement key up, so on its own it moves nothing.
+  const MOVEMENT_KEY_CODES = new Set([
+    'KeyW', 'KeyA', 'KeyS', 'KeyD', 'KeyQ', 'KeyE',
+    'Equal', 'Minus', 'BracketLeft', 'BracketRight'
+  ]);
+  const NAVIGATION_KEY_CODES = new Set([...MOVEMENT_KEY_CODES, 'ShiftLeft', 'ShiftRight']);
+  // Only navigation keys are held here. Any key left in the set would read as
+  // camera motion and keep the frame loop running until its keyup, which a
+  // shortcut or a focus change can swallow.
   const activeKeys = new Set();
-  let freeflyPosition = vec3.fromValues(0, 0, 3.0);
+  function isMovementKeyHeld() {
+    for (const code of activeKeys) {
+      if (MOVEMENT_KEY_CODES.has(code)) return true;
+    }
+    return false;
+  }
+  function releaseHeldKeys() {
+    if (activeKeys.size === 0) return;
+    activeKeys.clear();
+    invalidateFrame();
+  }
+  let freeflyPosition = vec3.fromValues(...initialCameraPose.freefly.position);
   let freeflyVelocity = vec3.create();
-  let freeflyYaw = Math.PI / 4;
-  let freeflyPitch = 0;
+  let freeflyYaw = initialCameraPose.freefly.yaw;
+  let freeflyPitch = initialCameraPose.freefly.pitch;
   let pointerLockEnabled = false;
   let pointerLockActive = false;
   let pointerLockChangeHandler = null;
@@ -1967,6 +1964,28 @@ export function createViewer({
   let lookActive = false;
   let lastFrameTime = performance.now();
   let renderFrameId = 0;
+  let frameInvalidated = true;
+  // The frame loop runs only while something can change what is drawn: it
+  // stops once the scene has settled and an invalidation (or a frame-phase
+  // request, a resize, a held key) starts it again. Started by `start()`.
+  let frameLoopStarted = false;
+  // Bumped by every change that can alter what any pane draws, but not by a
+  // camera change alone: a pane whose camera did not move and whose scene
+  // generation is unchanged keeps the pixels it drew (retained panes).
+  let sceneGeneration = 0;
+  let lastFrameCauseTime = -Infinity;
+  let framesDrawnSinceCause = 0;
+  // Whether a pane drawn in the last frame left its LOD short of the level its
+  // camera asks for (hysteresis steps one level per frame).
+  let lodConvergingInLastFrame = false;
+  // What last started a settle window: 'invalidated', 'resize', or the
+  // time-driven effect's name (see sceneAnimationCause). Diagnostics only.
+  let lastFrameCause = null;
+  // Opt-in tracing of what invalidates frames (setFrameInvalidationTracing).
+  let frameInvalidationTracing = false;
+  let lastFrameInvalidationTrace = null;
+  let lastDrawnCanvasWidth = 0;
+  let lastDrawnCanvasHeight = 0;
 
   let velocityTheta = 0;
   let velocityPhi = 0;
@@ -1978,9 +1997,16 @@ export function createViewer({
   let lastDy = 0;
 
   const INERTIA_FRICTION = 0.92;
+  // The longest frame camera motion integrates in one step. Every integrator
+  // below is exact for any step, so a slow frame (a large dataset at a low
+  // frame rate) advances the camera by its real duration instead of in slow
+  // motion; only a stall longer than this (a background tab, a debugger
+  // pause) is cut short, so the camera never leaps on resume.
+  const MAX_FRAME_DT = 0.25;
   const INERTIA_MIN_VELOCITY = 0.0001;
   const VELOCITY_SMOOTHING = 0.3;
   const PHYSICS_TICK_RATE = 60;          // Reference frame rate for frame-independent physics (Hz)
+  const SMOOTH_ZOOM_RATE = 0.15;         // Fraction of the remaining zoom closed per reference tick
 
   const projectileSystem = createProjectileSystem({
     gl,
@@ -1994,9 +2020,6 @@ export function createViewer({
     getPositionsArray: () => positionsArray,
     getColorsArray: () => colorsArray,
     getCursorPosition: () => ({ x: cursorX, y: cursorY }),
-    getFreeflyPosition: () => freeflyPosition,
-    getFreeflyAxes,
-    getCameraParams: () => ({ fov, near, far }),
     centroidProgram,
     centroidAttribLocations,
     centroidUniformLocations,
@@ -2004,12 +2027,42 @@ export function createViewer({
     getLassoCtx: () => highlightTools?.getLassoCtx?.() || null,
     getPointerLockActive: () => pointerLockActive,
     getNavigationMode: () => navigationMode,
-    // For grid collision
-    getGridBounds: () => ({ min: -GRID_SIZE, max: GRID_SIZE }),
-    isGridVisible: () => showGrid && gridOpacity > 0.1,
+    // The surfaces projectiles bounce off: what the live view's backdrop shows
+    getCollisionStage: getLiveCollisionStage,
     // For dimension-aware spatial index collision queries
     getCurrentDimensionLevel: () => getPublishedDimensionLevel(LIVE_VIEW_ID),
   });
+
+  // Reused stage records, so a physics step allocates nothing.
+  const gridCollisionStage = { kind: 'box', min: -GRID_SIZE, max: GRID_SIZE };
+  const floorCollisionStage = { kind: 'floor', y: 0, centerX: 0, centerZ: 0, radius: STUDIO_STAGE.outerRadius };
+
+  /**
+   * The solid surfaces of the live view's backdrop, or null when it shows
+   * none: the grid's box, or the studio floor of a 3D view navigated in
+   * orbit or free-fly (a 1D, 2D or planar view sits on a dot surface, which
+   * stands behind the data and is not something to land on). A backdrop
+   * still fading in or out counts once it is a tenth visible.
+   *
+   * Projectiles fly in the live view's world (its positions and tree), so the
+   * stage is the live view's own: its representation's dimension and its own
+   * navigation mode, whichever view has focus.
+   */
+  function getLiveCollisionStage() {
+    if (showGrid && gridOpacity > 0.1) return gridCollisionStage;
+    if (!showStudio || studioOpacity <= 0.1) return null;
+    const dimensionLevel = getPublishedDimensionLevel(LIVE_VIEW_ID);
+    // Read without cloning: this runs every physics step.
+    const liveNavigationMode = cameraFollowers.has(LIVE_VIEW_ID)
+      ? navigationMode
+      : liveCameraState.navigationMode;
+    if (studioSurfacePlanarity(dimensionLevel, liveNavigationMode) !== 0) return null;
+    const state = getStudioPaneState(LIVE_VIEW_ID);
+    floorCollisionStage.y = state.floorY;
+    floorCollisionStage.centerX = state.stageX;
+    floorCollisionStage.centerZ = state.stageZ;
+    return floorCollisionStage;
+  }
 
   function getOrbitSigns() {
     // Google Earth style: invert horizontal drag to feel like grabbing the globe
@@ -2042,6 +2095,30 @@ export function createViewer({
       ) {
         return;
       }
+      invalidateFrame();
+      return Reflect.apply(handler, this, args);
+    };
+    target.addEventListener(event, guardedHandler, options);
+    eventCleanupFns.push(
+      () => target.removeEventListener(event, guardedHandler, options)
+    );
+  }
+
+  /**
+   * A viewer listener that sees many events it does not act on: page-wide
+   * (`window`) pointer movement over the sidebar and other panels, keystrokes
+   * into a text field, and the canvas's own pointer events for a mouse, which
+   * the mouse listeners handle instead. Unlike
+   * `addEventListenerWithCleanup` it does not invalidate the frame on its own;
+   * the handler calls `invalidateFrame()` on the paths that change what is on
+   * screen. An invalidation keeps the scene drawing for a settle window
+   * (FRAME_SETTLE_MIN_FRAMES frames), so a blanket one here made
+   * merely moving the mouse anywhere on the page redraw the full scene at the
+   * display rate.
+   */
+  function addPageInputListenerWithCleanup(target, event, handler, options) {
+    const guardedHandler = function viewerPageInputHandler(...args) {
+      if (disposed || webglContextLost) return;
       return Reflect.apply(handler, this, args);
     };
     target.addEventListener(event, guardedHandler, options);
@@ -2080,7 +2157,8 @@ export function createViewer({
         : webglContextLost
           ? 'context-lost'
           : null
-    )
+    ),
+    invalidateFrame
   );
 
   function ensureWebglContextOverlay() {
@@ -2134,7 +2212,7 @@ export function createViewer({
 
     const btn = document.createElement('button');
     btn.type = 'button';
-    btn.className = 'btn-small';
+    btn.className = 'btn';
     btn.textContent = 'Reload';
     btn.style.cssText = 'cursor: pointer;';
     const handleReload = () => window.location.reload();
@@ -2172,29 +2250,22 @@ export function createViewer({
   }
 
   function invalidateViewerWebGLOwnersAfterContextLoss() {
-    const prefixOwners = new Set();
-    for (const owner of edgePrefixOwnersV2.values()) {
-      if (owner.provisional !== true) {
-        prefixOwners.add(owner.prefixOwner);
-      }
-    }
-    if (edgeAllVisiblePrefixOwner !== null) {
-      prefixOwners.add(edgeAllVisiblePrefixOwner);
-    }
-
     // WebGL has already invalidated every handle. Drop those invalid owners
     // directly; routing them through ordinary retirement would itself issue
     // illegal/no-op GL calls on some browser backends.
     centroidPositionBuffer = null;
     centroidColorBuffer = null;
+    centroidVao = null;
     centroidCount = 0;
-    lineInstancedProgram = null;
     gridProgram = null;
+    studioProgram = null;
+    studioVao = null;
+    studioCornerBuffer = null;
+    backdropLooks.abandon();
     centroidProgram = null;
-    edgeQuadBuffer = null;
     for (const locations of [
-      lineInstancedUniformLocations,
       gridUniformLocations,
+      studioUniformLocations,
       centroidUniformLocations,
     ]) {
       for (const key of Object.keys(locations)) {
@@ -2207,39 +2278,8 @@ export function createViewer({
       gridPlaneBuffers[key] = null;
     }
 
-    edgeTextureV2 = null;
-    edgeWeightTextureV2 = null;
-    edgePositionTexturePoolV2.clear();
-    edgePositionTexturesV2.clear();
-    edgeVisibilityTexturesV2.clear();
-    pendingEdgeTextureRetirements.clear();
-    edgeVisibilityStagingBuffer = null;
-    edgeSourcesV2 = null;
-    edgeDestinationsV2 = null;
-    edgePrefixOwnersV2.clear();
-    edgePrefixCheckpointStaging = null;
-    edgeAllVisiblePrefixOwner = null;
-    edgeVisibleTarget = 0;
-    edgeTexDimsV2 = [0, 0];
-    nEdgesV2 = 0;
-    nCellsV2 = 0;
-    hasEdgeDataV2 = false;
+    edgeLayer.abandon();
     useInstancedEdges = false;
-
-    const failures = [];
-    for (const owner of prefixOwners) {
-      try {
-        retireConnectivityEdgePrefixOwner(owner);
-      } catch (error) {
-        failures.push(error);
-      }
-    }
-    if (failures.length > 0) {
-      throw new AggregateError(
-        failures,
-        'Connectivity CPU ownership could not be fully retired after context loss.'
-      );
-    }
   }
 
   function retireCleanupCallbacks(callbacks, owner) {
@@ -2275,10 +2315,7 @@ export function createViewer({
       }
     }
     viewTitleEntries = failedEntries;
-    lastTitleLayoutWidth = 0;
-    lastTitleLayoutHeight = 0;
-    lastTitleLayoutCols = 0;
-    lastTitleLayoutRows = 0;
+    lastTitleLayout = null;
     if (failures.length > 0) {
       throw new AggregateError(
         failures,
@@ -2312,9 +2349,11 @@ export function createViewer({
     retireRenderViewRecord(_liveRenderViewRecord);
     cachedViewMatrices.clear();
     renderParamsByView.clear();
+    studioPaneStates.clear();
     overlayCtxByView.clear();
     overlayCtxOptionsByView.clear();
     viewDimensionLevels.clear();
+    viewLayoutKeys.clear();
     viewPositionsCache.clear();
     viewDataGenerations.clear();
     viewCentroidFlags.clear();
@@ -2324,7 +2363,9 @@ export function createViewer({
     presentedViewStateListeners.clear();
     presentedFrameState.initialized = false;
     presentedFrameState.pending = false;
-    cachedGridProjections.clear();
+    presentedLayout = null;
+    presentedPaneProjections.length = 0;
+    presentedLayoutListeners.clear();
     activeKeys.clear();
     _renderAllViews.length = 0;
     _renderVelocityViewIds.length = 0;
@@ -2338,9 +2379,15 @@ export function createViewer({
     centroidCount = 0;
     navigationModeOwnership.clear();
     viewFocusHandler = null;
+    sidebarFocusPending = false;
+    if (sidebarFocusTimer !== null) {
+      clearTimeout(sidebarFocusTimer);
+      sidebarFocusTimer = null;
+    }
     navigationModeChangeHandler = null;
     highlightRenderFailureHandler = null;
     smokeRenderFailureHandler = null;
+    smokeSourceChangeHandler = null;
     velocityRenderFailureHandler = null;
     if (labelLayer) labelLayer.style.display = 'none';
     if (viewTitleLayerEl) viewTitleLayerEl.style.display = 'none';
@@ -2387,6 +2434,7 @@ export function createViewer({
           () => cancelAnimationFrame(scheduledAnimationHandle)
         );
       }
+      attemptContextLossStep(() => reconcileFramePhases());
       attemptContextLossStep(() => {
         projectileBuildCompletionToPublish =
           detachPendingProjectileBuild();
@@ -2531,161 +2579,120 @@ export function createViewer({
     }
   );
 
-  addEventListenerWithCleanup(canvas, 'mousedown', (e) => {
-    if (highlightTools && highlightTools.handleMouseDown(e)) {
-      return;
+  /**
+   * In grid mode, a camera press in a different view's area focuses that view,
+   * so the representation picker and every other view-specific operation
+   * target the view the user pressed, and the camera and navigation mode
+   * become that view's. Mouse and touch presses share this so a finger in
+   * multiview moves the view it touches, not whichever view last had focus.
+   */
+  function focusViewAtScreenPosition(clientX, clientY, commit = 'release') {
+    if (viewLayoutMode !== 'grid') return;
+    if (highlightTools?.isInteractionActive?.()) return;
+    const clickedViewId = getViewIdAtScreenPosition(clientX, clientY);
+    if (clickedViewId && clickedViewId !== focusedViewId) {
+      // The camera follows the pane at once; the sidebar's switch to it
+      // (`viewFocusHandler`: its legend, counts and controls) waits until the
+      // gesture ends, so starting a drag or a wheel zoom in another pane
+      // never waits for the sidebar to rebuild.
+      transferViewFocus(clickedViewId, { saveOutgoing: true });
+      publishPresentedViewStateChange('focus', focusedViewId);
+      deferSidebarFocus(commit);
     }
+  }
 
-    const highlighterActive = highlightTools?.isInteractionActive?.();
-    // In grid mode, ALWAYS update focused view when clicking in a different view's area.
-    // This ensures dimension controls and other view-specific operations target the correct view.
-    // Camera save/restore only happens when cameras are unlocked.
-    if (viewLayoutMode === 'grid' && !highlighterActive) {
-      const clickedViewId = getViewIdAtScreenPosition(e.clientX, e.clientY);
-      if (clickedViewId && clickedViewId !== focusedViewId) {
-        // Only save/restore cameras when unlocked
-        if (!camerasLocked) {
-          // Save current camera to previous view
-          setViewCameraState(focusedViewId, getCurrentCameraStateInternal());
-          // Stop any ongoing inertia (so it doesn't carry to new view)
-          velocityTheta = velocityPhi = velocityPanX = velocityPanY = velocityPanZ = 0;
-          vec3.set(freeflyVelocity, 0, 0, 0);
-        }
-        // Switch focus (always, regardless of camera lock state)
-        focusedViewId = clickedViewId;
-        // Update active state on view title chips
-        updateViewTitleActiveState();
-        // Load new view's camera (only when unlocked)
-        if (!camerasLocked) {
-          const newCam =
-            getStoredViewCameraState(focusedViewId);
-          if (newCam) applyCameraStateTemporarily(newCam);
-        }
-        publishPresentedViewStateChange('focus', focusedViewId);
-        // Notify UI (always, so dimension buttons target the clicked view)
-        if (viewFocusHandler) viewFocusHandler(focusedViewId);
-      }
-    }
+  let sidebarFocusPending = false;
+  let sidebarFocusTimer = null;
+  // A wheel gesture has no release: it ends when the wheel has rested this long.
+  const WHEEL_GESTURE_REST_MS = 150;
 
-    if (navigationMode === 'free') {
-      const wantsShot = e.button === 0;
-      // Only request pointer lock if user has enabled it via checkbox
-      if (pointerLockEnabled && !pointerLockActive) {
-        // Pointer lock enabled but not yet active - request it and queue the shot
-        // Capture viewport info NOW (before pointer lock changes cursor behavior)
-        if (wantsShot) {
-          const vpInfo = getViewportInfoAtScreen(e.clientX, e.clientY);
-          // Use getCameraForView which correctly handles non-focused views via cached view matrix
-          const { position: cameraPosition, axes: cameraAxes } = getCameraForView(vpInfo.viewId);
-          pendingShotViewportInfo = {
-            vpWidth: vpInfo.vpWidth,
-            vpHeight: vpInfo.vpHeight,
-            vpOffsetX: vpInfo.vpOffsetX,
-            vpOffsetY: vpInfo.vpOffsetY,
-            vpAspect: vpInfo.vpAspect,
-            cameraPosition,
-            cameraAxes
-          };
-        }
-        pendingShot = pendingShot || wantsShot;
-        requestPointerLockOwned();
-      } else {
-        // Either pointer lock is disabled, or already active - use normal mouse look
-        lookActive = true;
-        lastX = e.clientX;
-        lastY = e.clientY;
-        if (wantsShot) {
-          // Start charging instead of firing immediately
-          const vpInfo = getViewportInfoAtScreen(e.clientX, e.clientY);
-          // Use getCameraForView which correctly handles non-focused views via cached view matrix
-          const { position: cameraPosition, axes: cameraAxes } = getCameraForView(vpInfo.viewId);
-          projectileSystem.startCharging({
-            vpWidth: vpInfo.vpWidth,
-            vpHeight: vpInfo.vpHeight,
-            vpOffsetX: vpInfo.vpOffsetX,
-            vpOffsetY: vpInfo.vpOffsetY,
-            vpAspect: vpInfo.vpAspect,
-            cameraPosition,
-            cameraAxes
-          });
-        }
-      }
-      canvas.classList.add('dragging');
-      canvas.style.cursor = pointerLockActive ? 'none' : 'crosshair';
-      e.preventDefault();
-      return;
+  /** Publish the focused pane to the sidebar now, if a gesture deferred it. */
+  function commitSidebarFocus() {
+    if (sidebarFocusTimer !== null) {
+      clearTimeout(sidebarFocusTimer);
+      sidebarFocusTimer = null;
     }
+    if (!sidebarFocusPending) return;
+    sidebarFocusPending = false;
+    if (disposed || webglContextLost) return;
+    // Notify UI (always, so dimension buttons target the focused view)
+    if (viewFocusHandler) viewFocusHandler(focusedViewId);
+  }
+
+  /**
+   * Defer the sidebar's switch to the focused pane to the end of the
+   * gesture: the release of a press (`'release'`), or a rest of the wheel
+   * (`'wheel'`).
+   */
+  function deferSidebarFocus(commit) {
+    sidebarFocusPending = true;
+    if (commit === 'wheel') {
+      if (sidebarFocusTimer !== null) clearTimeout(sidebarFocusTimer);
+      sidebarFocusTimer = setTimeout(commitSidebarFocus, WHEEL_GESTURE_REST_MS);
+    }
+  }
+
+  /** Start one camera drag at a screen point. */
+  function beginCameraDrag(clientX, clientY, mode) {
     isDragging = true;
-    lastX = e.clientX;
-    lastY = e.clientY;
+    dragMode = mode;
+    lastX = clientX;
+    lastY = clientY;
     lastMoveTime = performance.now();
     velocityTheta = velocityPhi = velocityPanX = velocityPanY = velocityPanZ = 0;
     lastDx = lastDy = 0;
+  }
 
+  function rotateCameraByScreenDelta(dx, dy) {
+    const rotateSpeed = 0.005;
+    const { xSign, ySign } = getOrbitSigns();
+    theta -= dx * rotateSpeed * xSign;
+    phi -= dy * rotateSpeed * ySign;
+    const EPS = 0.05;
+    phi = Math.max(EPS, Math.min(Math.PI - EPS, phi));
+    while (theta > Math.PI * 2) theta -= Math.PI * 2;
+    while (theta < 0) theta += Math.PI * 2;
+  }
+
+  function panCameraByScreenDelta(dx, dy) {
+    const panSpeed = radius * 0.002;
     if (navigationMode === 'planar') {
-      // Planar mode: always pan (no rotation)
-      dragMode = 'pan';
-      canvas.style.cursor = 'move';
-    } else if (e.button === 2 || e.shiftKey) {
-      dragMode = 'pan';
-      canvas.style.cursor = 'move';
+      // Planar mode: pan in X and Y (camera looks down Z axis)
+      const invertX = planarInvertAxes ? 1 : -1;
+      const invertY = planarInvertAxes ? -1 : 1;
+      target[0] += dx * panSpeed * invertX;
+      target[1] += dy * panSpeed * invertY;
     } else {
-      dragMode = 'rotate';
-      canvas.style.cursor = 'grabbing';
+      // Use scratch vectors to avoid per-event allocations
+      vec3.sub(tempVec3d, target, eye);  // forward
+      vec3.normalize(tempVec3d, tempVec3d);
+      vec3.cross(tempVec3e, tempVec3d, up);  // camRight
+      vec3.normalize(tempVec3e, tempVec3e);
+      vec3.cross(tempVec3f, tempVec3e, tempVec3d);  // camUp
+      vec3.normalize(tempVec3f, tempVec3f);
+      vec3.scaleAndAdd(target, target, tempVec3e, -dx * panSpeed);
+      vec3.scaleAndAdd(target, target, tempVec3f, dy * panSpeed);
     }
-    canvas.classList.add('dragging');
-  });
+  }
 
-  const handleMouseUp = (e) => {
-    if (highlightTools && highlightTools.handleMouseUp(e)) {
-      return;
+  /** Move the camera drag in progress to a new screen point. */
+  function moveCameraDrag(clientX, clientY) {
+    const dx = clientX - lastX;
+    const dy = clientY - lastY;
+    lastDx = dx * VELOCITY_SMOOTHING + lastDx * (1 - VELOCITY_SMOOTHING);
+    lastDy = dy * VELOCITY_SMOOTHING + lastDy * (1 - VELOCITY_SMOOTHING);
+    lastMoveTime = performance.now();
+    if (dragMode === 'rotate') {
+      rotateCameraByScreenDelta(dx, dy);
+    } else if (dragMode === 'pan') {
+      panCameraByScreenDelta(dx, dy);
     }
+    lastX = clientX;
+    lastY = clientY;
+  }
 
-    // Fire charged projectile on release
-    if (projectileSystem.isCharging() && e.button === 0) {
-      // When pointer lock is active, use the viewport info captured at click time
-      // (cursor position is locked, so e.clientX/Y would give wrong viewport)
-      let viewportInfo;
-      if (pointerLockActive && pendingShotViewportInfo) {
-        viewportInfo = pendingShotViewportInfo;
-      } else {
-        const vpInfo = getViewportInfoAtScreen(e.clientX, e.clientY);
-        // Use getCameraForView which correctly handles non-focused views via cached view matrix
-        const { position: cameraPosition, axes: cameraAxes } = getCameraForView(vpInfo.viewId);
-        viewportInfo = {
-          vpWidth: vpInfo.vpWidth,
-          vpHeight: vpInfo.vpHeight,
-          vpOffsetX: vpInfo.vpOffsetX,
-          vpOffsetY: vpInfo.vpOffsetY,
-          vpAspect: vpInfo.vpAspect,
-          cameraPosition,
-          cameraAxes
-        };
-      }
-
-      projectileSystem.stopChargingAndFire({
-        navigationMode,
-        pointerLockActive,
-        viewportInfo
-      });
-
-      // Clear stored viewport info after firing
-      pendingShotViewportInfo = null;
-    }
-
-    if (navigationMode === 'free') {
-      // Keep looking active while pointer lock is held; only stop drag-look when not locked
-      if (!pointerLockActive) {
-        lookActive = false;
-        canvas.classList.remove('dragging');
-        canvas.style.cursor = 'crosshair';
-      } else {
-        canvas.classList.add('dragging');
-        canvas.style.cursor = 'none';
-      }
-      isDragging = false;
-      return;
-    }
+  /** End the camera drag in progress, handing a fast release to inertia. */
+  function releaseCameraDrag() {
     if (isDragging) {
       const timeDelta = performance.now() - lastMoveTime;
       if (timeDelta < 50 && (Math.abs(lastDx) > 0.5 || Math.abs(lastDy) > 0.5)) {
@@ -2710,15 +2717,159 @@ export function createViewer({
       }
     }
     isDragging = false;
+  }
+
+  /** Save the live camera to the focused view. */
+  function saveFocusedViewCamera() {
+    setViewCameraState(focusedViewId, getCurrentCameraStateInternal());
+  }
+
+  /**
+   * The pane a projectile is aimed in, captured at the press: its render
+   * rectangle, the exact projection it is drawn with, and its camera. The
+   * shot keeps this pane for its whole charge, so it leaves from the pane it
+   * was aimed in even if the pointer strays across a pane edge.
+   */
+  function captureProjectileViewport(clientX, clientY) {
+    const vpInfo = getViewportInfoAtScreen(clientX, clientY);
+    if (vpInfo === -1) return null;
+    // Use getCameraForView which correctly handles non-focused views via cached view matrix
+    const { position: cameraPosition, axes: cameraAxes } = getCameraForView(vpInfo.viewId);
+    return {
+      viewId: vpInfo.viewId,
+      vpWidth: vpInfo.vpWidth,
+      vpHeight: vpInfo.vpHeight,
+      vpOffsetX: vpInfo.vpOffsetX,
+      vpOffsetY: vpInfo.vpOffsetY,
+      vpAspect: vpInfo.vpAspect,
+      projectionMatrix: vpInfo.projectionMatrix,
+      projectionCenterNdcX: vpInfo.projectionCenterNdcX,
+      cameraPosition,
+      cameraAxes
+    };
+  }
+
+  // A camera press with the mouse captures the pointer until it is released:
+  // a drag that crosses the sidebar or a plot keeps going to the canvas, so
+  // the page does not hit-test hover styles and plot tooltips under it at
+  // every move (the release ends the capture by itself). Selection gestures
+  // are not captured: where they are let go decides whether they commit.
+  let lastMousePointerId = null;
+  addPageInputListenerWithCleanup(canvas, 'pointerdown', (e) => {
+    if (e.pointerType === 'mouse') lastMousePointerId = e.pointerId;
+  });
+  function captureCameraPointer() {
+    if (lastMousePointerId === null || typeof canvas.setPointerCapture !== 'function') return;
+    try {
+      canvas.setPointerCapture(lastMousePointerId);
+    } catch {
+      // The pointer is gone already; there is nothing to capture.
+    }
+  }
+
+  addEventListenerWithCleanup(canvas, 'mousedown', (e) => {
+    if (highlightTools && highlightTools.handlePointerDown(e)) {
+      return;
+    }
+    captureCameraPointer();
+
+    focusViewAtScreenPosition(e.clientX, e.clientY);
+
+    if (navigationMode === 'free') {
+      const wantsShot = e.button === 0;
+      // Only request pointer lock if user has enabled it via checkbox
+      if (pointerLockEnabled && !pointerLockActive) {
+        // Pointer lock enabled but not yet active - request it and queue the shot
+        // Capture viewport info NOW (before pointer lock changes cursor behavior)
+        if (wantsShot) {
+          pendingShotViewportInfo = captureProjectileViewport(
+            e.clientX,
+            e.clientY
+          );
+        }
+        pendingShot = pendingShot || wantsShot;
+        requestPointerLockOwned();
+      } else {
+        // Either pointer lock is disabled, or already active - use normal mouse look
+        lookActive = true;
+        lastX = e.clientX;
+        lastY = e.clientY;
+        if (wantsShot) {
+          // Start charging instead of firing immediately
+          const shotViewport = captureProjectileViewport(e.clientX, e.clientY);
+          if (shotViewport !== null) {
+            projectileSystem.startCharging(shotViewport);
+          }
+        }
+      }
+      canvas.classList.add('dragging');
+      canvas.style.cursor = pointerLockActive ? 'none' : 'crosshair';
+      e.preventDefault();
+      return;
+    }
+    if (navigationMode === 'planar') {
+      // Planar mode: always pan (no rotation)
+      beginCameraDrag(e.clientX, e.clientY, 'pan');
+      canvas.style.cursor = 'move';
+    } else if (e.button === 2 || e.shiftKey) {
+      beginCameraDrag(e.clientX, e.clientY, 'pan');
+      canvas.style.cursor = 'move';
+    } else {
+      beginCameraDrag(e.clientX, e.clientY, 'rotate');
+      canvas.style.cursor = 'grabbing';
+    }
+    canvas.classList.add('dragging');
+  });
+
+  const handleMouseUp = (e) => {
+    // The press that focused a pane has ended: the sidebar follows now.
+    if (sidebarFocusPending && sidebarFocusTimer === null) commitSidebarFocus();
+    if (highlightTools && highlightTools.handlePointerUp(e.target)) {
+      invalidateFrame();
+      return;
+    }
+    // A release ends a gesture the viewer owns: a drag, a look, a charged
+    // shot. Anywhere else on the page (a click in the sidebar) it changes
+    // nothing drawn, and redrawing the scene for a settle window after every
+    // such click was a full GPU pass per frame for nothing.
+    if (isDragging || lookActive || projectileSystem.isCharging()) {
+      invalidateFrame();
+    }
+
+    // Fire charged projectile on release, from the pane it was charged in
+    // (captured at the press; under pointer lock the cursor no longer moves).
+    if (projectileSystem.isCharging() && e.button === 0) {
+      projectileSystem.stopChargingAndFire({
+        navigationMode,
+        pointerLockActive,
+        viewportInfo: projectileSystem.getChargeViewportInfo()
+      });
+
+      // Clear stored viewport info after firing
+      pendingShotViewportInfo = null;
+    }
+
+    if (navigationMode === 'free') {
+      // Keep looking active while pointer lock is held; only stop drag-look when not locked
+      if (!pointerLockActive) {
+        lookActive = false;
+        canvas.classList.remove('dragging');
+        canvas.style.cursor = 'crosshair';
+      } else {
+        canvas.classList.add('dragging');
+        canvas.style.cursor = 'none';
+      }
+      isDragging = false;
+      return;
+    }
+    releaseCameraDrag();
     canvas.classList.remove('dragging');
-    updateCursorForHighlightMode();
+    updateSelectionCursor();
 
     // Save camera state to active view when unlocked
-    if (!camerasLocked) {
-      setViewCameraState(focusedViewId, getCurrentCameraStateInternal());
-    }
+    saveFocusedViewCamera();
   };
-  addEventListenerWithCleanup(window, 'mouseup', handleMouseUp);
+  addPageInputListenerWithCleanup(window, 'mouseup', handleMouseUp);
 
   const handleMouseMove = (e) => {
     // Always track cursor position for aiming (when not in pointer lock)
@@ -2727,12 +2878,14 @@ export function createViewer({
       cursorY = e.clientY;
     }
 
-    if (highlightTools && highlightTools.handleMouseMove(e)) {
+    if (highlightTools && highlightTools.handlePointerMove(e)) {
+      invalidateFrame();
       return;
     }
 
     if (navigationMode === 'free') {
       if (!lookActive) return;
+      invalidateCameraFrame();
       const dx = pointerLockActive ? e.movementX : (e.clientX - lastX);
       const dy = pointerLockActive ? e.movementY : (e.clientY - lastY);
       const invertX = invertLookX ? -1 : 1;
@@ -2749,48 +2902,35 @@ export function createViewer({
       return;
     }
     if (!isDragging) return;
-    const dx = e.clientX - lastX;
-    const dy = e.clientY - lastY;
-    lastDx = dx * VELOCITY_SMOOTHING + lastDx * (1 - VELOCITY_SMOOTHING);
-    lastDy = dy * VELOCITY_SMOOTHING + lastDy * (1 - VELOCITY_SMOOTHING);
-    lastMoveTime = performance.now();
-    const rotateSpeed = 0.005;
-    const { xSign, ySign } = getOrbitSigns();
-
-    if (dragMode === 'rotate') {
-      theta -= dx * rotateSpeed * xSign;
-      phi -= dy * rotateSpeed * ySign;
-      const EPS = 0.05;
-      phi = Math.max(EPS, Math.min(Math.PI - EPS, phi));
-      while (theta > Math.PI * 2) theta -= Math.PI * 2;
-      while (theta < 0) theta += Math.PI * 2;
-    } else if (dragMode === 'pan') {
-      const panSpeed = radius * 0.002;
-      if (navigationMode === 'planar') {
-        // Planar mode: pan in X and Y (camera looks down Z axis)
-        const invertX = planarInvertAxes ? 1 : -1;
-        const invertY = planarInvertAxes ? -1 : 1;
-        target[0] += dx * panSpeed * invertX;
-        target[1] += dy * panSpeed * invertY;
-      } else {
-        // Use scratch vectors to avoid per-event allocations
-        vec3.sub(tempVec3d, target, eye);  // forward
-        vec3.normalize(tempVec3d, tempVec3d);
-        vec3.cross(tempVec3e, tempVec3d, up);  // camRight
-        vec3.normalize(tempVec3e, tempVec3e);
-        vec3.cross(tempVec3f, tempVec3e, tempVec3d);  // camUp
-        vec3.normalize(tempVec3f, tempVec3f);
-        vec3.scaleAndAdd(target, target, tempVec3e, -dx * panSpeed);
-        vec3.scaleAndAdd(target, target, tempVec3f, dy * panSpeed);
-      }
+    if (e.buttons === 0) {
+      invalidateFrame();
+      // The release landed where the page could not see it (another window, a
+      // system overlay). End the drag, without inertia, instead of steering
+      // the camera with no button held.
+      isDragging = false;
+      velocityTheta = velocityPhi = velocityPanX = velocityPanY = velocityPanZ = 0;
+      canvas.classList.remove('dragging');
+      updateSelectionCursor();
+      return;
     }
-    lastX = e.clientX;
-    lastY = e.clientY;
+    invalidateCameraFrame();
+    moveCameraDrag(e.clientX, e.clientY);
   };
-  addEventListenerWithCleanup(window, 'mousemove', handleMouseMove);
+  addPageInputListenerWithCleanup(window, 'mousemove', handleMouseMove);
 
-  addEventListenerWithCleanup(canvas, 'wheel', (e) => {
+  // Invalidates only when the wheel moved the camera (a free-fly wheel, or
+  // one against a zoom limit, changes nothing and draws nothing).
+  addPageInputListenerWithCleanup(canvas, 'wheel', (e) => {
     e.preventDefault();
+    // The wheel zooms the pane under the cursor, as a press would act on it.
+    const previousFocus = focusedViewId;
+    focusViewAtScreenPosition(e.clientX, e.clientY, 'wheel');
+    if (focusedViewId !== previousFocus) invalidateFrame();
+    else if (sidebarFocusPending && sidebarFocusTimer !== null) {
+      // Still wheeling: the gesture's end moves on.
+      clearTimeout(sidebarFocusTimer);
+      sidebarFocusTimer = setTimeout(commitSidebarFocus, WHEEL_GESTURE_REST_MS);
+    }
     if (navigationMode === 'free') {
       return;
     }
@@ -2802,14 +2942,19 @@ export function createViewer({
     const oldRadius = targetRadius;
     targetRadius += delta * sensitivity;
     targetRadius = Math.max(minOrbitRadius, Math.min(100.0, targetRadius));
+    if (targetRadius === oldRadius) return;
+    invalidateCameraFrame();
 
     // Planar zoom-to-cursor: adjust target so cursor stays at same world position
-    if (navigationMode === 'planar' && planarZoomToCursor) {
-      // In multiview mode, use viewport-local coordinates for correct NDC calculation
-      const vpInfo = getViewportInfoAtScreen(e.clientX, e.clientY);
+    const vpInfo = navigationMode === 'planar' && planarZoomToCursor
+      ? getViewportInfoAtScreen(e.clientX, e.clientY)
+      : -1;
+    if (vpInfo !== -1) {
+      // Pane-local coordinates of the pane under the cursor, which the wheel
+      // has just focused, against the projection that pane is drawn with.
       // Normalized device coords (-1 to 1) relative to the viewport
       const rawNdcX = (vpInfo.vpLocalX / vpInfo.vpWidth) * 2 - 1;
-      const ndcX = rawNdcX - (vpInfo.projectionCenterNdcX ?? 0);
+      const ndcX = rawNdcX - vpInfo.projectionCenterNdcX;
       const ndcY = -((vpInfo.vpLocalY / vpInfo.vpHeight) * 2 - 1);
       // In planar mode with perspective, calculate world offset at target plane
       const aspect = vpInfo.vpAspect;
@@ -2828,39 +2973,47 @@ export function createViewer({
       radius = targetRadius;
     }
 
-    // Save camera state to active view when unlocked
-    if (!camerasLocked) {
-      setViewCameraState(focusedViewId, getCurrentCameraStateInternal());
-    }
+    // Save the camera to the focused view.
+    setViewCameraState(focusedViewId, getCurrentCameraStateInternal());
   }, { passive: false });
 
-  function updateCursorForHighlightMode() {
+  function updateSelectionCursor() {
     if (highlightTools) {
-      highlightTools.updateCursorForHighlightMode();
+      highlightTools.updateSelectionCursor();
     }
   }
 
   const handleAltKeyDown = (e) => {
     if (isTypingTarget(e.target)) return;
     if (e.key === 'Alt') {
+      invalidateFrame();
       highlightTools?.handleAltKeyDown?.();
     }
   };
-  addEventListenerWithCleanup(window, 'keydown', handleAltKeyDown);
+  addPageInputListenerWithCleanup(window, 'keydown', handleAltKeyDown);
 
   const handleAltKeyUp = (e) => {
     if (isTypingTarget(e.target)) return;
     if (e.key === 'Alt') {
+      invalidateFrame();
       highlightTools?.handleAltKeyUp?.();
     }
   };
-  addEventListenerWithCleanup(window, 'keyup', handleAltKeyUp);
+  addPageInputListenerWithCleanup(window, 'keyup', handleAltKeyUp);
 
-  // Also update when window loses focus (Alt might be released while window unfocused)
+  // Losing focus ends the input the page will never see released: an Alt-armed
+  // or in-progress selection (Alt may be let go elsewhere) and held navigation
+  // keys. Focus also moves for reasons that change nothing (another window, a
+  // system dialog), so the frame is redrawn only when one of those was live:
+  // a blanket invalidation redrew the scene for a whole settle window on every
+  // focus change.
   const handleWindowBlur = () => {
+    const interactionWasLive = highlightTools?.isInteractionActive?.() === true;
     highlightTools?.handleWindowBlur?.();
+    if (interactionWasLive) invalidateFrame();
+    releaseHeldKeys();
   };
-  addEventListenerWithCleanup(window, 'blur', handleWindowBlur);
+  addPageInputListenerWithCleanup(window, 'blur', handleWindowBlur);
 
   function publishPointerLockState(active, errorMessage) {
     if (pointerLockChangeHandler !== null) {
@@ -2881,7 +3034,7 @@ export function createViewer({
     if (navigationMode === 'free') {
       canvas.style.cursor = 'crosshair';
     } else {
-      updateCursorForHighlightMode();
+      updateSelectionCursor();
     }
     publishPointerLockState(false, errorMessage);
   }
@@ -3091,106 +3244,189 @@ export function createViewer({
 
   const handleNavigationKeyDown = (e) => {
     if (isTypingTarget(e.target)) return;
+    invalidateFrame();
     const code = e.code;
     if (pointerLockActive && code === 'Escape') {
       if (document.exitPointerLock) document.exitPointerLock();
       clearPointerLockIntent(null);
       return;
     }
-    // WASD navigation works in all modes (free, orbit, planar)
-    // Zoom keys: Equal (=) and Minus (-) for zoom in/out, also BracketRight (]) and BracketLeft ([)
-    const navKeys = ['KeyW', 'KeyA', 'KeyS', 'KeyD', 'KeyQ', 'KeyE', 'ShiftLeft', 'ShiftRight',
-                     'Equal', 'Minus', 'BracketLeft', 'BracketRight'];
-    if (navKeys.includes(code)) {
-      e.preventDefault();
-    }
+    if (!NAVIGATION_KEY_CODES.has(code)) return;
+    // A Cmd or Ctrl chord is a browser or system shortcut (Cmd+Minus, the
+    // screenshot keys), not navigation, and macOS sends no keyup for a key
+    // pressed while Cmd is held.
+    if (e.metaKey || e.ctrlKey) return;
+    e.preventDefault();
     activeKeys.add(code);
+    // A held key moves the camera every frame: the loop must be running.
+    ensureFrameScheduled();
   };
-  addEventListenerWithCleanup(window, 'keydown', handleNavigationKeyDown);
+  addPageInputListenerWithCleanup(window, 'keydown', handleNavigationKeyDown);
 
   const handleKeyUp = (e) => {
-    activeKeys.delete(e.code);
+    // Releasing a held key ends its acceleration; the inertia it leaves keeps
+    // the frame drawing through sceneAnimationCause().
+    if (activeKeys.delete(e.code)) invalidateFrame();
+    // Keys released while Cmd was held never sent their keyup on macOS.
+    if (e.key === 'Meta') releaseHeldKeys();
   };
-  addEventListenerWithCleanup(window, 'keyup', handleKeyUp);
+  addPageInputListenerWithCleanup(window, 'keyup', handleKeyUp);
+  // A key released while the page was hidden never sends its keyup either.
+  // (Blur releases them too, in handleWindowBlur.)
+  const handleHeldKeysVisibility = () => {
+    if (document.visibilityState === 'hidden') releaseHeldKeys();
+  };
+  addPageInputListenerWithCleanup(document, 'visibilitychange', handleHeldKeysVisibility);
 
-  // Touch events (use cleanup registry to prevent handler stacking on recreate)
-  addEventListenerWithCleanup(canvas, 'touchstart', (e) => {
-    if (navigationMode === 'free') return;
-    velocityTheta = velocityPhi = velocityPanX = velocityPanY = velocityPanZ = 0;
-    lastDx = lastDy = 0;
-    if (e.touches.length === 1) {
-      isDragging = true;
-      // Planar mode: always pan (no rotation)
-      dragMode = navigationMode === 'planar' ? 'pan' : 'rotate';
-      lastX = e.touches[0].clientX;
-      lastY = e.touches[0].clientY;
-      lastMoveTime = performance.now();
-    } else if (e.touches.length === 2) {
-      isDragging = false;
-      const dx = e.touches[0].clientX - e.touches[1].clientX;
-      const dy = e.touches[0].clientY - e.touches[1].clientY;
-      lastTouchDist = Math.sqrt(dx * dx + dy * dy);
+  // === Touch and pen input ===
+  //
+  // Fingers and pens arrive as PointerEvents; the mouse keeps the mouse
+  // listeners above. Both feed the same highlight pipeline, so a finger arms a
+  // selection gesture under exactly the rule an Alt press does
+  // (`resolveSelectionGestureCombine`): with select mode on, or a pen pressed
+  // with Alt held, one pointer runs the active tool. Otherwise one pointer
+  // orbits (pans in planar mode), and two pointers pinch to zoom and move their
+  // midpoint to pan, whatever select mode says. A second pointer landing
+  // during a selection abandons it rather than committing a half-drawn shape.
+  //
+  // `touch-action: none` on the canvas keeps the browser from claiming these
+  // pointers for page scrolling or zoom, and cancelling the press keeps it
+  // from replaying the touch as mouse events the mouse path would also act on.
+  // A touch pointer is implicitly captured by the canvas it lands on, so its
+  // moves and release keep arriving here even over the sidebar; that is why
+  // the release is located with `elementFromPoint` rather than by its target.
+  const touchPointers = new Map();
+  /** @type {'idle'|'select'|'camera'|'two-pointer'|'spent'} */
+  let touchGesture = 'idle';
+  let selectPointerId = null;
+  let twoPointerLast = null;
+
+  function measureTwoPointers() {
+    const [a, b] = touchPointers.values();
+    const dx = a.x - b.x;
+    const dy = a.y - b.y;
+    return {
+      dist: Math.sqrt(dx * dx + dy * dy),
+      midX: (a.x + b.x) / 2,
+      midY: (a.y + b.y) / 2
+    };
+  }
+
+  function beginOnePointerGesture(e) {
+    if (highlightTools && highlightTools.handlePointerDown(e)) {
+      touchGesture = 'select';
+      selectPointerId = e.pointerId;
+      return;
     }
-    e.preventDefault();
-  }, { passive: false });
-
-  addEventListenerWithCleanup(canvas, 'touchmove', (e) => {
-    if (navigationMode === 'free') return;
-    e.preventDefault();
-    if (e.touches.length === 1 && isDragging) {
-      const dx = e.touches[0].clientX - lastX;
-      const dy = e.touches[0].clientY - lastY;
-      lastDx = dx * VELOCITY_SMOOTHING + lastDx * (1 - VELOCITY_SMOOTHING);
-      lastDy = dy * VELOCITY_SMOOTHING + lastDy * (1 - VELOCITY_SMOOTHING);
-      lastMoveTime = performance.now();
-      if (navigationMode === 'planar') {
-        // Planar mode: pan in X and Y (camera looks down Z axis)
-        const panSpeed = radius * 0.002;
-        const invertX = planarInvertAxes ? 1 : -1;
-        const invertY = planarInvertAxes ? -1 : 1;
-        target[0] += dx * panSpeed * invertX;
-        target[1] += dy * panSpeed * invertY;
-      } else {
-        const rotateSpeed = 0.005;
-        const { xSign, ySign } = getOrbitSigns();
-        theta -= dx * rotateSpeed * xSign;
-        phi -= dy * rotateSpeed * ySign;
-        const EPS = 0.05;
-        phi = Math.max(EPS, Math.min(Math.PI - EPS, phi));
-        while (theta > Math.PI * 2) theta -= Math.PI * 2;
-        while (theta < 0) theta += Math.PI * 2;
-      }
-      lastX = e.touches[0].clientX;
-      lastY = e.touches[0].clientY;
-    } else if (e.touches.length === 2) {
-      const dx = e.touches[0].clientX - e.touches[1].clientX;
-      const dy = e.touches[0].clientY - e.touches[1].clientY;
-      const dist = Math.sqrt(dx * dx + dy * dy);
-      if (lastTouchDist > 0) {
-        targetRadius *= lastTouchDist / dist;
-        targetRadius = Math.max(minOrbitRadius, Math.min(100.0, targetRadius));
-      }
-      lastTouchDist = dist;
+    if (navigationMode === 'free') {
+      touchGesture = 'spent';
+      return;
     }
-  }, { passive: false });
+    focusViewAtScreenPosition(e.clientX, e.clientY);
+    // Planar mode: always pan (no rotation)
+    beginCameraDrag(
+      e.clientX,
+      e.clientY,
+      navigationMode === 'planar' ? 'pan' : 'rotate'
+    );
+    touchGesture = 'camera';
+  }
 
-  addEventListenerWithCleanup(canvas, 'touchend', (e) => {
-    if (navigationMode === 'free') return;
-    if (isDragging && e.touches.length === 0) {
-      const timeDelta = performance.now() - lastMoveTime;
-      if (timeDelta < 50 && (Math.abs(lastDx) > 0.5 || Math.abs(lastDy) > 0.5)) {
-        const { xSign, ySign } = getOrbitSigns();
-        velocityTheta = -lastDx * 0.005 * 0.5 * xSign;
-        velocityPhi = -lastDy * 0.005 * 0.5 * ySign;
-      }
+  function beginTwoPointerGesture() {
+    if (touchGesture === 'select') {
+      highlightTools.interruptPointerGesture();
+      selectPointerId = null;
     }
     isDragging = false;
-    lastTouchDist = 0;
+    velocityTheta = velocityPhi = velocityPanX = velocityPanY = velocityPanZ = 0;
+    lastDx = lastDy = 0;
+    if (navigationMode === 'free') {
+      touchGesture = 'spent';
+      return;
+    }
+    touchGesture = 'two-pointer';
+    twoPointerLast = measureTwoPointers();
+  }
+
+  addPageInputListenerWithCleanup(canvas, 'pointerdown', (e) => {
+    if (e.pointerType === 'mouse') return;
+    invalidateFrame();
+    e.preventDefault();
+    touchPointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (touchPointers.size === 1) {
+      beginOnePointerGesture(e);
+    } else if (touchPointers.size === 2) {
+      beginTwoPointerGesture();
+    }
+  }, { passive: false });
+
+  addPageInputListenerWithCleanup(canvas, 'pointermove', (e) => {
+    if (e.pointerType === 'mouse') return;
+    const pointer = touchPointers.get(e.pointerId);
+    if (pointer === undefined) return;
+    pointer.x = e.clientX;
+    pointer.y = e.clientY;
+    if (touchGesture === 'select') {
+      invalidateFrame();
+      if (e.pointerId === selectPointerId) highlightTools.handlePointerMove(e);
+      return;
+    }
+    // A camera gesture moves only its pane's camera.
+    invalidateCameraFrame();
+    if (touchGesture === 'camera') {
+      moveCameraDrag(e.clientX, e.clientY);
+    } else if (touchGesture === 'two-pointer' && touchPointers.size >= 2) {
+      const next = measureTwoPointers();
+      if (twoPointerLast.dist > 0 && next.dist > 0) {
+        targetRadius *= twoPointerLast.dist / next.dist;
+        targetRadius = Math.max(minOrbitRadius, Math.min(100.0, targetRadius));
+      }
+      panCameraByScreenDelta(
+        next.midX - twoPointerLast.midX,
+        next.midY - twoPointerLast.midY
+      );
+      twoPointerLast = next;
+    }
   });
 
+  const handleTouchPointerEnd = (e) => {
+    if (e.pointerType === 'mouse') return;
+    if (!touchPointers.has(e.pointerId)) return;
+    invalidateFrame();
+    touchPointers.delete(e.pointerId);
+    if (touchGesture === 'select' && e.pointerId === selectPointerId) {
+      selectPointerId = null;
+      if (e.type === 'pointercancel') {
+        highlightTools.interruptPointerGesture();
+      } else {
+        highlightTools.handlePointerUp(
+          canvas.ownerDocument.elementFromPoint(e.clientX, e.clientY)
+        );
+      }
+      touchGesture = 'spent';
+    } else if (touchGesture === 'camera') {
+      if (e.type === 'pointercancel') isDragging = false;
+      else releaseCameraDrag();
+      saveFocusedViewCamera();
+      touchGesture = 'spent';
+    } else if (touchGesture === 'two-pointer' && touchPointers.size < 2) {
+      twoPointerLast = null;
+      saveFocusedViewCamera();
+      touchGesture = 'spent';
+    }
+    // Lifting fingers one at a time never turns what is left of a gesture
+    // into a new one: the next gesture starts when every finger is up.
+    if (touchPointers.size === 0) {
+      touchGesture = 'idle';
+      if (sidebarFocusPending && sidebarFocusTimer === null) commitSidebarFocus();
+    }
+  };
+  addPageInputListenerWithCleanup(canvas, 'pointerup', handleTouchPointerEnd);
+  addPageInputListenerWithCleanup(canvas, 'pointercancel', handleTouchPointerEnd);
+
   // === Helper Functions ===
-  function computePointBoundsFromPositions(positions) {
-    projectileSystem.computePointBoundsFromPositions(positions);
+  function computePointBoundsFromPositions(positions, dimension) {
+    projectileSystem.computePointBoundsFromPositions(positions, dimension);
   }
 
   function getFreeflyAxes() {
@@ -3250,8 +3486,8 @@ export function createViewer({
   function getCameraForView(viewId) {
     const vid = assertViewId(viewId);
     const isFocused = vid === assertViewId(focusedViewId);
-    // For the focused view, use global state (always up-to-date)
-    if (isFocused || camerasLocked) {
+    // The focused view and its linked followers use the global state.
+    if (isFocused || cameraFollowers.has(vid)) {
       return { position: freeflyPosition, axes: getFreeflyAxes() };
     }
     // For non-focused views, try cached view matrix first (most reliable)
@@ -3289,25 +3525,36 @@ export function createViewer({
       vec3.scale(_freeflyTargetVel, _freeflyMove, moveSpeed * sprint);
       const lerpAlpha = Math.min(1, dt * 10);
       vec3.lerp(freeflyVelocity, freeflyVelocity, _freeflyTargetVel, lerpAlpha);
+      vec3.scaleAndAdd(freeflyPosition, freeflyPosition, freeflyVelocity, dt);
     } else {
-      vec3.scale(freeflyVelocity, freeflyVelocity, Math.pow(INERTIA_FRICTION, dt * PHYSICS_TICK_RATE));
+      // Coasting: each tick decays the velocity, then moves by it, so the
+      // distance over the step is the geometric sum from the first decayed
+      // velocity (velocity is per second; one tick is 1 / PHYSICS_TICK_RATE
+      // seconds). Exact for any step length, and one decayed velocity's tick
+      // at exactly one tick.
+      const friction = Math.pow(INERTIA_FRICTION, dt * PHYSICS_TICK_RATE);
+      const travelSeconds = INERTIA_FRICTION * (1 - friction)
+        / (1 - INERTIA_FRICTION) / PHYSICS_TICK_RATE;
+      vec3.scaleAndAdd(freeflyPosition, freeflyPosition, freeflyVelocity, travelSeconds);
+      vec3.scale(freeflyVelocity, freeflyVelocity, friction);
       if (vec3.length(freeflyVelocity) < INERTIA_MIN_VELOCITY) {
         vec3.set(freeflyVelocity, 0, 0, 0);
       }
     }
-
-    vec3.scaleAndAdd(freeflyPosition, freeflyPosition, freeflyVelocity, dt);
   }
 
   // WASD navigation and zoom for orbit/planar modes
   // Uses velocity system for smooth inertia (same as mouse drag)
   function updateOrbitPlanarKeys(dt) {
     const sprint = (activeKeys.has('ShiftLeft') || activeKeys.has('ShiftRight')) ? 3.0 : 1.0;
+    // Key acceleration is specified per reference tick, so a held key builds
+    // the same velocity per second at any display rate.
+    const ticks = dt * PHYSICS_TICK_RATE;
 
     if (navigationMode === 'planar') {
       // Planar mode: WASD pans the view using velocity for smooth inertia
       // Respects "Invert axes" checkbox (same as mouse drag)
-      const panAccel = radius * 0.15 * planarPanSpeed * sprint;
+      const panAccel = radius * 0.15 * planarPanSpeed * sprint * ticks;
       const invertX = planarInvertAxes ? 1 : -1;
       const invertY = planarInvertAxes ? -1 : 1;
       if (activeKeys.has('KeyW')) velocityPanY += panAccel * invertY;
@@ -3325,7 +3572,7 @@ export function createViewer({
     } else if (navigationMode === 'orbit') {
       // Orbit mode: WASD rotates around the anchor using velocity for smooth inertia
       // Respects "Google Earth-style drag" checkbox (orbitInvertX) for A/D keys
-      const orbitAccel = 0.008 * orbitKeySpeed * sprint;
+      const orbitAccel = 0.008 * orbitKeySpeed * sprint * ticks;
       const xSign = orbitInvertX ? -1 : 1;
       // A/D rotate horizontally (theta) - respects invert setting
       if (activeKeys.has('KeyA')) velocityTheta -= orbitAccel * xSign;
@@ -3364,107 +3611,198 @@ export function createViewer({
     phi = Math.max(EPS, Math.min(Math.PI - EPS, phi));
   }
 
-  function updateInertia() {
+  /**
+   * Advance orbit and pan inertia by `dt` seconds.
+   *
+   * Velocities are in units per reference tick (PHYSICS_TICK_RATE), and both
+   * the motion and the friction scale with the elapsed ticks, as freefly's
+   * already do. Applying them once per frame made the camera coast, and a held
+   * key accelerate, twice as fast in wall-clock time on a 120 Hz display as on
+   * a 60 Hz one, and slower than intended whenever frames ran long. At exactly
+   * one tick per frame this is the per-frame update it replaces.
+   */
+  function updateInertia(dt) {
+    const ticks = dt * PHYSICS_TICK_RATE;
+    const friction = Math.pow(INERTIA_FRICTION, ticks);
+    // Distance covered over `ticks` ticks of a velocity decaying by the
+    // friction each tick: the geometric sum, exact for a fractional or long
+    // step and exactly one velocity at one tick.
+    const travel = (1 - friction) / (1 - INERTIA_FRICTION);
     if (Math.abs(velocityTheta) > INERTIA_MIN_VELOCITY || Math.abs(velocityPhi) > INERTIA_MIN_VELOCITY) {
-      theta += velocityTheta;
-      phi += velocityPhi;
+      theta += velocityTheta * travel;
+      phi += velocityPhi * travel;
       const EPS = 0.05;
       phi = Math.max(EPS, Math.min(Math.PI - EPS, phi));
       while (theta > Math.PI * 2) theta -= Math.PI * 2;
       while (theta < 0) theta += Math.PI * 2;
-      velocityTheta *= INERTIA_FRICTION;
-      velocityPhi *= INERTIA_FRICTION;
+      velocityTheta *= friction;
+      velocityPhi *= friction;
       if (Math.abs(velocityTheta) < INERTIA_MIN_VELOCITY) velocityTheta = 0;
       if (Math.abs(velocityPhi) < INERTIA_MIN_VELOCITY) velocityPhi = 0;
     }
 
     const panVelocityMag = Math.sqrt(velocityPanX * velocityPanX + velocityPanY * velocityPanY + velocityPanZ * velocityPanZ);
     if (panVelocityMag > INERTIA_MIN_VELOCITY) {
-      target[0] += velocityPanX;
-      target[1] += velocityPanY;
-      target[2] += velocityPanZ;
-      velocityPanX *= INERTIA_FRICTION;
-      velocityPanY *= INERTIA_FRICTION;
-      velocityPanZ *= INERTIA_FRICTION;
-      if (panVelocityMag * INERTIA_FRICTION < INERTIA_MIN_VELOCITY) {
+      target[0] += velocityPanX * travel;
+      target[1] += velocityPanY * travel;
+      target[2] += velocityPanZ * travel;
+      velocityPanX *= friction;
+      velocityPanY *= friction;
+      velocityPanZ *= friction;
+      if (panVelocityMag * friction < INERTIA_MIN_VELOCITY) {
         velocityPanX = velocityPanY = velocityPanZ = 0;
       }
     }
   }
 
-  function updateSmoothZoom() {
+  /**
+   * Ease the orbit radius toward its target: 15 % of the remaining distance
+   * per reference tick, compounded over the ticks `dt` spans, so a zoom takes
+   * the same time at any display rate.
+   */
+  function updateSmoothZoom(dt) {
     const diff = targetRadius - radius;
     if (Math.abs(diff) > 0.001) {
-      radius += diff * 0.15;
+      radius += diff * (1 - Math.pow(1 - SMOOTH_ZOOM_RATE, dt * PHYSICS_TICK_RATE));
     } else {
       radius = targetRadius;
     }
   }
 
-  function getProjectionCenterNdcX(
-    paneLeftRatio,
-    paneWidthRatio,
-    paneNavigationMode = navigationMode
-  ) {
-    const exactMode = assertNavigationMode(paneNavigationMode);
-    if (exactMode === 'free') return 0;
-    return computePaneCenterNdcX(
-      paneLeftRatio,
-      paneWidthRatio,
-      viewportLeftOcclusionRatio
-    );
-  }
-
-  function configureInteractiveProjection(
-    output,
-    aspect,
-    paneLeftRatio = 0,
-    paneWidthRatio = 1,
-    paneNavigationMode = navigationMode
-  ) {
-    mat4.perspective(output, fov, aspect, near, far);
-    const centerNdcX = getProjectionCenterNdcX(
-      paneLeftRatio,
-      paneWidthRatio,
-      paneNavigationMode
-    );
-    if (centerNdcX !== null) {
-      applyHorizontalProjectionCenter(output, centerNdcX);
+  /**
+   * The presented layout: every pane's place on the canvas, resolved from the
+   * canvas size, the sidebar's left occlusion, the layout mode, and the
+   * presented view inventory. It is recomputed only when one of those inputs
+   * changes; between changes every caller receives the same frozen object, so
+   * per-frame use is a handful of scalar comparisons.
+   *
+   * Returns null while the canvas has no area.
+   */
+  function getPresentedLayout() {
+    const size = canvasResizeObserver.getSize();
+    const width = size.width;
+    const height = size.height;
+    const cssWidth = size.cssWidth;
+    const cssHeight = size.cssHeight;
+    if (!(width > 0 && height > 0 && cssWidth > 0 && cssHeight > 0)) {
+      return null;
     }
-    return centerNdcX;
-  }
-
-  function getCachedGridProjection(
-    aspect,
-    paneLeftRatio,
-    paneWidthRatio,
-    paneNavigationMode
-  ) {
-    const centerNdcX = getProjectionCenterNdcX(
-      paneLeftRatio,
-      paneWidthRatio,
-      paneNavigationMode
-    );
-    if (cachedGridProjectionAspect !== aspect) {
-      cachedGridProjections.clear();
-      cachedGridProjectionAspect = aspect;
-    }
-    const cacheKey = centerNdcX === null ? -1 : centerNdcX;
-    let matrix = cachedGridProjections.get(cacheKey);
-    if (!matrix) {
-      matrix = mat4.create();
-      mat4.perspective(matrix, fov, aspect, near, far);
-      if (centerNdcX !== null) {
-        applyHorizontalProjectionCenter(matrix, centerNdcX);
+    const snapshotCount = snapshotViews.length;
+    let inventoryMatches =
+      presentedLayout !== null &&
+      presentedLayoutKey.liveViewHidden === liveViewHidden &&
+      presentedLayoutKey.snapshotIds.length === snapshotCount;
+    if (inventoryMatches) {
+      for (let index = 0; index < snapshotCount; index += 1) {
+        if (presentedLayoutKey.snapshotIds[index] !== snapshotViews[index].id) {
+          inventoryMatches = false;
+          break;
+        }
       }
-      cachedGridProjections.set(cacheKey, matrix);
+    }
+    if (
+      inventoryMatches &&
+      presentedLayoutKey.width === width &&
+      presentedLayoutKey.height === height &&
+      presentedLayoutKey.cssWidth === cssWidth &&
+      presentedLayoutKey.cssHeight === cssHeight &&
+      presentedLayoutKey.leftOcclusionRatio === viewportLeftOcclusionRatio &&
+      presentedLayoutKey.mode === viewLayoutMode &&
+      presentedLayoutKey.focusedViewId === focusedViewId
+    ) {
+      return presentedLayout;
+    }
+    const viewIds = [];
+    if (!liveViewHidden) viewIds.push(LIVE_VIEW_ID);
+    for (const snapshot of snapshotViews) viewIds.push(snapshot.id);
+    const layout = resolvePresentedLayout({
+      canvasHeight: height,
+      canvasWidth: width,
+      cssHeight,
+      cssWidth,
+      focusedViewId,
+      leftOcclusionRatio: viewportLeftOcclusionRatio,
+      mode: viewLayoutMode,
+      viewIds
+    });
+    presentedPaneProjections.length = 0;
+    for (const pane of layout.panes) {
+      presentedPaneProjections.push(
+        configurePaneProjection(mat4.create(), pane)
+      );
+    }
+    presentedLayout = layout;
+    presentedLayoutKey.width = width;
+    presentedLayoutKey.height = height;
+    presentedLayoutKey.cssWidth = cssWidth;
+    presentedLayoutKey.cssHeight = cssHeight;
+    presentedLayoutKey.leftOcclusionRatio = viewportLeftOcclusionRatio;
+    presentedLayoutKey.mode = viewLayoutMode;
+    presentedLayoutKey.focusedViewId = focusedViewId;
+    presentedLayoutKey.liveViewHidden = liveViewHidden;
+    presentedLayoutKey.snapshotIds.length = 0;
+    for (const snapshot of snapshotViews) {
+      presentedLayoutKey.snapshotIds.push(snapshot.id);
+    }
+    // Observers (e.g. the selection bar) place themselves from the same
+    // resolved layout the panes are drawn with. An observer failure is
+    // reported without interrupting the frame that resolved the layout.
+    for (const listener of presentedLayoutListeners) {
+      try {
+        listener(layout);
+      } catch (error) {
+        queueMicrotask(() => {
+          throw error;
+        });
+      }
+    }
+    return layout;
+  }
+
+  /** The projection one pane renders with: its aspect, its principal point. */
+  function configurePaneProjection(output, pane) {
+    mat4.perspective(
+      output,
+      fov,
+      pane.viewportWidth / pane.viewportHeight,
+      near,
+      far
+    );
+    applyHorizontalProjectionCenter(output, pane.projectionCenterNdcX);
+    return output;
+  }
+
+  /** The cached projection of one pane of the current presented layout. */
+  function getPresentedPaneProjection(layout, paneIndex) {
+    if (layout !== presentedLayout) {
+      throw new Error('Pane projection requested for a superseded presented layout.');
+    }
+    const matrix = presentedPaneProjections[paneIndex];
+    if (matrix === undefined) {
+      throw new RangeError(`Presented pane ${paneIndex} does not exist.`);
     }
     return matrix;
   }
 
+  /**
+   * The full-canvas projection: the single-view projection, whose principal
+   * point sits at the centre of the presented area. It is the viewer's
+   * ambient projection outside grid panes.
+   */
+  function configureFullCanvasProjection(output, aspect) {
+    mat4.perspective(output, fov, aspect, near, far);
+    const layout = getPresentedLayout();
+    applyHorizontalProjectionCenter(
+      output,
+      layout === null
+        ? 0
+        : layout.presentedArea.cssLeft / layout.cssWidth
+    );
+    return output;
+  }
+
   function updateCamera(width, height) {
-    const aspect = width / height;
-    configureInteractiveProjection(projectionMatrix, aspect);
+    configureFullCanvasProjection(projectionMatrix, width / height);
     if (navigationMode === 'free') {
       const { forward, upVec } = getFreeflyAxes();
       vec3.copy(eye, freeflyPosition);
@@ -3487,44 +3825,6 @@ export function createViewer({
     }
   }
 
-  function computeFogAnchors() {
-    if (navigationMode === 'free') {
-      const speed = vec3.length(freeflyVelocity);
-      fogNearMean = Math.max(0.5, 1.5 + speed * 0.5);
-      fogFarMean = fogNearMean + 5.0;
-    } else {
-      fogNearMean = Math.max(0, radius - 2);
-      fogFarMean = radius + 2;
-    }
-  }
-
-  // ============================================================================
-  // INSTANCED EDGE RENDERING - GPU-OPTIMIZED
-  // ============================================================================
-
-  /**
-   * Calculate optimal 2D texture dimensions for a given count
-   * @param {number} count - Number of elements
-   * @returns {[number, number]} - [width, height]
-   */
-  function calcTextureDims(count) {
-    const maxSize = gl.getParameter(gl.MAX_TEXTURE_SIZE);
-    return calculateEdgeTextureDimensions(count, maxSize);
-  }
-
-  function queueEdgeTextureRetirement(texture) {
-    if (texture !== null && texture !== undefined) {
-      pendingEdgeTextureRetirements.add(texture);
-    }
-  }
-
-  function drainEdgeTextureRetirements() {
-    return drainExactTextureRetirements(
-      gl,
-      pendingEdgeTextureRetirements
-    );
-  }
-
   function reportCommittedRetirementFailures(failures, message) {
     if (failures.length === 0) return;
     const diagnostic = failures.length === 1
@@ -3537,428 +3837,11 @@ export function createViewer({
     }
   }
 
-  function throwEdgeTexturePublicationFailure(error, textures, message) {
-    const exactError = error instanceof Error
-      ? error
-      : new Error('Edge texture publication threw a non-Error value.');
-    for (const texture of textures) {
-      queueEdgeTextureRetirement(texture);
-    }
-    const cleanupFailures = drainEdgeTextureRetirements();
-    if (cleanupFailures.length > 0) {
-      throw new AggregateError(
-        [exactError, ...cleanupFailures],
-        message
-      );
-    }
-    throw exactError;
-  }
-
-  function runEdgeTextureUpload(texture, label, upload) {
-    return runExactEdgeTextureUpload(gl, texture, label, upload);
-  }
-
-  function createUploadedEdgeTexture(label, upload) {
-    assertNoWebGLError(gl, `${label} allocation preflight`);
-    const texture = createRequiredTexture(gl, label);
-    try {
-      runEdgeTextureUpload(texture, label, upload);
-    } catch (error) {
-      throwEdgeTexturePublicationFailure(
-        error,
-        [texture],
-        `${label} publication and cleanup were incomplete.`
-      );
-    }
-    return texture;
-  }
-
-  function publishEdgeTextureReplacements(replacements, message) {
-    const failures = [];
-    try {
-      const boundTexture = gl.getParameter(gl.TEXTURE_BINDING_2D);
-      if (replacements.has(boundTexture)) {
-        gl.bindTexture(
-          gl.TEXTURE_2D,
-          replacements.get(boundTexture)
-        );
-      }
-    } catch (error) {
-      failures.push(
-        error instanceof Error
-          ? error
-          : new Error('Edge texture binding replacement threw a non-Error value.')
-      );
-    }
-    for (const retiredTexture of replacements.keys()) {
-      queueEdgeTextureRetirement(retiredTexture);
-    }
-    failures.push(...drainEdgeTextureRetirements());
-    reportCommittedRetirementFailures(failures, message);
-  }
-
   /**
-   * Create edge topology and weight textures from one aligned payload.
-   * @param {Uint32Array} sources - Source cell indices
-   * @param {Uint32Array} destinations - Destination cell indices
-   * @param {Float32Array} renderWeights - Validated relative edge strengths
-   * @param {number} nEdges - Number of edges
+   * The positions a pane's connectivity edges are drawn from: the renderer's
+   * published source-order positions of that view, with their geometry
+   * generation (the edge layer re-gathers its records when it moves).
    */
-  function createEdgeTexturesV2(
-    sources,
-    destinations,
-    renderWeights,
-    nEdges,
-    nCells
-  ) {
-    const nextDims = calcTextureDims(nEdges);
-    const [width, height] = nextDims;
-    const texelCount = width * height;
-    if (texelCount < nEdges) {
-      throw new Error(
-        `Connectivity rendering requires ${nEdges} texture texels, ` +
-        `but this WebGL2 implementation supports ${texelCount}.`
-      );
-    }
-
-    const topologyData = new Uint32Array(texelCount * 2);
-    for (let i = 0; i < nEdges; i++) {
-      const source = sources[i];
-      const destination = destinations[i];
-      if (
-        source >= nCells ||
-        destination >= nCells ||
-        source >= destination
-      ) {
-        throw new RangeError(
-          `Connectivity edge ${i} must reference two cells in [0, ${nCells}) ` +
-          'with source < destination.'
-        );
-      }
-      topologyData[i * 2] = source;
-      topologyData[i * 2 + 1] = destination;
-    }
-    const weightData = new Float32Array(texelCount);
-    weightData.set(renderWeights);
-
-    let nextTopologyTexture = null;
-    let nextWeightTexture = null;
-
-    try {
-      nextTopologyTexture = createUploadedEdgeTexture(
-        'weighted connectivity topology',
-        () => {
-          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RG32UI, width, height, 0, gl.RG_INTEGER, gl.UNSIGNED_INT, topologyData);
-          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-        }
-      );
-      nextWeightTexture = createUploadedEdgeTexture(
-        'weighted connectivity weights',
-        () => {
-          gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, width, height, 0, gl.RED, gl.FLOAT, weightData);
-          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-        }
-      );
-    } catch (error) {
-      throwEdgeTexturePublicationFailure(
-        error,
-        [nextTopologyTexture, nextWeightTexture],
-        'Weighted connectivity texture publication and cleanup were incomplete.'
-      );
-    }
-
-    const previousTopologyTexture = edgeTextureV2;
-    const previousWeightTexture = edgeWeightTextureV2;
-    edgeTextureV2 = nextTopologyTexture;
-    edgeWeightTextureV2 = nextWeightTexture;
-    edgeTexDimsV2 = nextDims;
-    nEdgesV2 = nEdges;
-    const replacements = new Map();
-    if (previousTopologyTexture !== null) {
-      replacements.set(previousTopologyTexture, nextTopologyTexture);
-    }
-    if (previousWeightTexture !== null) {
-      replacements.set(previousWeightTexture, nextWeightTexture);
-    }
-    publishEdgeTextureReplacements(
-      replacements,
-      'Weighted connectivity prior-generation retirement was incomplete.'
-    );
-    console.log(`[Viewer] Created weighted edge textures V2: ${nEdges} edges, ${width}x${height} textures`);
-    return true;
-  }
-
-  function retireEdgePrefixOwner(viewId) {
-    const previous = edgePrefixOwnersV2.get(viewId);
-    edgePrefixOwnersV2.delete(viewId);
-    if (!previous || previous.provisional === true) return;
-    const checkpoints = retireConnectivityEdgePrefixOwner(
-      previous.prefixOwner
-    );
-    if (
-      checkpoints instanceof Uint32Array &&
-      (
-        !(edgePrefixCheckpointStaging instanceof Uint32Array) ||
-        edgePrefixCheckpointStaging.length !== checkpoints.length
-      )
-    ) {
-      edgePrefixCheckpointStaging = checkpoints;
-    }
-  }
-
-  function getCurrentEdgePrefixOwner(viewId) {
-    const visibilityEntry = edgeVisibilityTexturesV2.get(viewId);
-    const owner = edgePrefixOwnersV2.get(viewId);
-    if (
-      !visibilityEntry ||
-      !Number.isSafeInteger(visibilityEntry.revision) ||
-      visibilityEntry.revision <= 0 ||
-      !owner ||
-      owner.visibilityRevision !== visibilityEntry.revision
-    ) {
-      return null;
-    }
-    return owner;
-  }
-
-  function describeEdgePrefixOwner(viewId, owner = null) {
-    const exactOwner = owner ?? getCurrentEdgePrefixOwner(viewId);
-    if (exactOwner === null) return null;
-    return Object.freeze({
-      checkpointBytes:
-        exactOwner.prefixOwner.checkpoints.byteLength,
-      checkpointCount:
-        exactOwner.prefixOwner.checkpoints.length,
-      current:
-        getCurrentEdgePrefixOwner(viewId) === exactOwner,
-      provisional: exactOwner.provisional === true,
-      rawPrefix: exactOwner.rawPrefix,
-      visibleCount: exactOwner.prefixOwner.visibleCount,
-      visibilityRevision: exactOwner.visibilityRevision,
-      viewId,
-    });
-  }
-
-  function refreshEdgePrefixForView(viewId) {
-    const vid = assertViewId(viewId);
-    if (
-      !(edgeSourcesV2 instanceof Uint32Array) ||
-      !(edgeDestinationsV2 instanceof Uint32Array) ||
-      edgeSourcesV2.length !== nEdgesV2 ||
-      edgeDestinationsV2.length !== nEdgesV2
-    ) {
-      throw new Error(
-        'Connectivity edge-prefix refresh requires the accepted endpoint generation.'
-      );
-    }
-    const visibilityEntry = edgeVisibilityTexturesV2.get(vid);
-    if (
-      !visibilityEntry ||
-      !(visibilityEntry.scratchBuffer instanceof Uint8Array) ||
-      !Number.isSafeInteger(visibilityEntry.revision) ||
-      visibilityEntry.revision <= 0
-    ) {
-      throw new Error(
-        `Connectivity edge-prefix refresh requires accepted visibility for view "${vid}".`
-      );
-    }
-
-    const current = getCurrentEdgePrefixOwner(vid);
-    if (current !== null && current.provisional !== true) {
-      return describeEdgePrefixOwner(vid, current);
-    }
-
-    const build = buildConnectivityEdgePrefixOwner(
-      edgeSourcesV2,
-      edgeDestinationsV2,
-      visibilityEntry.scratchBuffer,
-      edgePrefixCheckpointStaging
-    );
-    if (
-      build === null ||
-      typeof build !== 'object' ||
-      Array.isArray(build) ||
-      !build.owner ||
-      !(build.owner.checkpoints instanceof Uint32Array)
-    ) {
-      throw new Error(
-        'Connectivity edge-prefix builder returned an invalid candidate.'
-      );
-    }
-    const prefixOwner = build.owner;
-    let rawPrefix;
-    try {
-      rawPrefix = resolveConnectivityEdgeRawPrefix(
-        prefixOwner,
-        edgeSourcesV2,
-        edgeDestinationsV2,
-        visibilityEntry.scratchBuffer,
-        Math.min(edgeVisibleTarget, prefixOwner.visibleCount)
-      );
-    } catch (error) {
-      edgePrefixCheckpointStaging =
-        retireConnectivityEdgePrefixOwner(prefixOwner);
-      throw error;
-    }
-    const candidate = Object.freeze({
-      prefixOwner,
-      provisional: false,
-      rawPrefix,
-      visibilityRevision: visibilityEntry.revision,
-    });
-
-    // The complete candidate is now non-fallibly publishable. Only after that
-    // boundary may the previous checkpoints become the shared staging owner.
-    const previous = edgePrefixOwnersV2.get(vid);
-    edgePrefixOwnersV2.set(vid, candidate);
-    if (previous && previous.provisional !== true) {
-      edgePrefixCheckpointStaging =
-        retireConnectivityEdgePrefixOwner(previous.prefixOwner);
-    } else if (
-      build.reusableCheckpoints instanceof Uint32Array &&
-      build.reusableCheckpoints !== prefixOwner.checkpoints
-    ) {
-      edgePrefixCheckpointStaging = build.reusableCheckpoints;
-    } else {
-      edgePrefixCheckpointStaging = null;
-    }
-    return describeEdgePrefixOwner(vid, candidate);
-  }
-
-  function setEdgeVisibleTarget(target) {
-    const exactTarget = assertIntegerInRange(
-      target,
-      0,
-      nEdgesV2,
-      'Connectivity visible-edge target'
-    );
-    const stagedOwners = [];
-    for (const [viewId, visibilityEntry] of edgeVisibilityTexturesV2) {
-      const current = getCurrentEdgePrefixOwner(viewId);
-      if (
-        current === null ||
-        current.provisional === true ||
-        current.visibilityRevision !== visibilityEntry.revision
-      ) {
-        throw new Error(
-          `Connectivity visible-edge target requires a current prefix for view "${viewId}".`
-        );
-      }
-      const rawPrefix = resolveConnectivityEdgeRawPrefix(
-        current.prefixOwner,
-        edgeSourcesV2,
-        edgeDestinationsV2,
-        visibilityEntry.scratchBuffer,
-        Math.min(exactTarget, current.prefixOwner.visibleCount)
-      );
-      stagedOwners.push([
-        viewId,
-        Object.freeze({
-          prefixOwner: current.prefixOwner,
-          provisional: false,
-          rawPrefix,
-          visibilityRevision: current.visibilityRevision,
-        })
-      ]);
-    }
-
-    // Resolution and allocation for every pane completed before the shared
-    // visible target or any pane-specific raw prefix changes.
-    edgeVisibleTarget = exactTarget;
-    for (const [viewId, owner] of stagedOwners) {
-      edgePrefixOwnersV2.set(viewId, owner);
-    }
-    return true;
-  }
-
-  function detachEdgeResourcesV2() {
-    const retiringTextures = new Set(pendingEdgeTextureRetirements);
-    const retiringPrefixOwners = new Set();
-    for (const owner of edgePrefixOwnersV2.values()) {
-      if (owner.provisional !== true) {
-        retiringPrefixOwners.add(owner.prefixOwner);
-      }
-    }
-    if (edgeAllVisiblePrefixOwner !== null) {
-      retiringPrefixOwners.add(edgeAllVisiblePrefixOwner);
-    }
-    if (edgeTextureV2 !== null) retiringTextures.add(edgeTextureV2);
-    if (edgeWeightTextureV2 !== null) {
-      retiringTextures.add(edgeWeightTextureV2);
-    }
-    for (const entry of edgePositionTexturePoolV2.values()) {
-      if (entry.texture) retiringTextures.add(entry.texture);
-      entry.refCount = 0;
-    }
-    for (const entry of edgeVisibilityTexturesV2.values()) {
-      if (entry.texture) retiringTextures.add(entry.texture);
-    }
-
-    // Detach the render inventory before any hostile deletion can fail.
-    edgeTextureV2 = null;
-    edgeWeightTextureV2 = null;
-    edgePositionTexturePoolV2.clear();
-    edgePositionTexturesV2.clear();
-    edgeVisibilityTexturesV2.clear();
-    edgeVisibilityStagingBuffer = null;
-    edgeSourcesV2 = null;
-    edgeDestinationsV2 = null;
-    edgePrefixOwnersV2.clear();
-    edgePrefixCheckpointStaging = null;
-    edgeAllVisiblePrefixOwner = null;
-    edgeVisibleTarget = 0;
-    edgeTexDimsV2 = [0, 0];
-    nEdgesV2 = 0;
-    nCellsV2 = 0;
-    hasEdgeDataV2 = false;
-    useInstancedEdges = false;
-
-    const failures = [];
-    for (const owner of retiringPrefixOwners) {
-      try {
-        retireConnectivityEdgePrefixOwner(owner);
-      } catch (error) {
-        failures.push(error);
-      }
-    }
-    if (retiringTextures.size === 0) return failures;
-
-    try {
-      const boundTexture = gl.getParameter(gl.TEXTURE_BINDING_2D);
-      if (retiringTextures.has(boundTexture)) {
-        gl.bindTexture(gl.TEXTURE_2D, null);
-      }
-    } catch (error) {
-      failures.push(error);
-    }
-    for (const texture of retiringTextures) {
-      queueEdgeTextureRetirement(texture);
-    }
-    failures.push(...drainEdgeTextureRetirements());
-    return failures;
-  }
-
-  function clearEdgeResourcesV2() {
-    const failures = detachEdgeResourcesV2();
-    if (failures.length > 0) {
-      throw new AggregateError(
-        failures,
-        'Connectivity resources were detached with pending texture retirement failures.'
-      );
-    }
-  }
-
-  // ========================================================================
-  // PER-VIEW EDGE TEXTURE MANAGEMENT
-  // Enables multi-view edge rendering with different positions/visibility per view
-  // ========================================================================
-
   function getCertifiedEdgeGeometry(viewId) {
     const vid = assertViewId(viewId);
     const generationBefore =
@@ -3966,6 +3849,7 @@ export function createViewer({
     const positions = vid === LIVE_VIEW_ID
       ? hpRenderer.getPositions()
       : hpRenderer.getSnapshotPositions(vid);
+    const dimension = hpRenderer.getViewPositionDimension(vid);
     const generationAfter =
       hpRenderer.getViewGeometryGeneration(vid);
     if (
@@ -3980,886 +3864,29 @@ export function createViewer({
     if (
       !(positions instanceof Float32Array) ||
       positions.length === 0 ||
-      positions.length % 3 !== 0
+      ![1, 2, 3].includes(dimension) ||
+      positions.length % dimension !== 0
     ) {
       throw new Error(
         `Renderer published invalid connectivity positions for view "${vid}".`
       );
     }
-    const nCells = positions.length / 3;
+    const nCells = positions.length / dimension;
     if (
       !Number.isSafeInteger(nCells) ||
       nCells <= 0 ||
-      (pointCount > 0 && nCells !== pointCount) ||
-      (nCellsV2 > 0 && nCells !== nCellsV2)
+      (pointCount > 0 && nCells !== pointCount)
     ) {
       throw new RangeError(
         `Renderer connectivity geometry for view "${vid}" has an incompatible cell count.`
       );
     }
     return {
+      dimension,
       generation: generationAfter,
       nCells,
       positions,
     };
-  }
-
-  function releaseEdgePositionPoolEntry(
-    entry,
-    replacementTexture,
-    replacements
-  ) {
-    if (!entry) return;
-    if (
-      !Number.isSafeInteger(entry.refCount) ||
-      entry.refCount <= 0 ||
-      edgePositionTexturePoolV2.get(entry.generation) !== entry
-    ) {
-      throw new Error(
-        'Connectivity position texture pool ownership is inconsistent.'
-      );
-    }
-    entry.refCount -= 1;
-    if (entry.refCount !== 0) return;
-    edgePositionTexturePoolV2.delete(entry.generation);
-    replacements.set(entry.texture, replacementTexture);
-  }
-
-  /**
-   * Create or update position texture for a specific view.
-   * Exact renderer geometry generations share one immutable texture.
-   * @param {string} viewId - View identifier
-   * @param {Float32Array|null} expectedPositions - Optional compatibility input
-   * @param {number|null} expectedNCells - Optional compatibility input
-   * @returns {boolean} True if texture was created successfully
-   */
-  function createPositionTextureV2ForView(
-    viewId,
-    expectedPositions = null,
-    expectedNCells = null
-  ) {
-    if (typeof viewId !== 'string' || viewId.length === 0) {
-      return false;
-    }
-    const vid = viewId;
-    const geometry = getCertifiedEdgeGeometry(vid);
-    const { generation, nCells, positions } = geometry;
-    if (expectedPositions !== null) {
-      if (
-        !(expectedPositions instanceof Float32Array) ||
-        expectedPositions.length !== positions.length
-      ) {
-        throw new TypeError(
-          `Connectivity setup positions for view "${vid}" do not match the renderer publication.`
-        );
-      }
-      for (let index = 0; index < positions.length; index++) {
-        if (!Object.is(expectedPositions[index], positions[index])) {
-          throw new RangeError(
-            `Connectivity setup positions for view "${vid}" differ from ` +
-            `the certified renderer owner at coordinate ${index}.`
-          );
-        }
-      }
-    }
-    if (
-      expectedNCells !== null &&
-      (
-        !Number.isSafeInteger(expectedNCells) ||
-        expectedNCells !== nCells
-      )
-    ) {
-      throw new RangeError(
-        `Connectivity setup cell count for view "${vid}" does not match the renderer publication.`
-      );
-    }
-
-    const existing = edgePositionTexturesV2.get(vid);
-    const newDims = calcTextureDims(nCells);
-    const [width, height] = newDims;
-    const texelCount = width * height;
-    if (texelCount < nCells) {
-      throw new RangeError(
-        `Connectivity positions for view "${vid}" require ${nCells} texels, ` +
-        `but this WebGL2 implementation supports ${texelCount}.`
-      );
-    }
-
-    let pooledEntry = edgePositionTexturePoolV2.get(generation);
-    if (pooledEntry) {
-      if (
-        pooledEntry.nCells !== nCells ||
-        pooledEntry.dims[0] !== width ||
-        pooledEntry.dims[1] !== height ||
-        pooledEntry.format !== 'RGB32F' ||
-        !pooledEntry.texture
-      ) {
-        throw new Error(
-          `Connectivity position texture generation ${generation} is inconsistent.`
-        );
-      }
-    } else {
-      const texture = createUploadedEdgeTexture(
-        `weighted connectivity positions for view "${vid}"`,
-        () => {
-          gl.texParameteri(
-            gl.TEXTURE_2D,
-            gl.TEXTURE_MIN_FILTER,
-            gl.NEAREST
-          );
-          gl.texParameteri(
-            gl.TEXTURE_2D,
-            gl.TEXTURE_MAG_FILTER,
-            gl.NEAREST
-          );
-          gl.texParameteri(
-            gl.TEXTURE_2D,
-            gl.TEXTURE_WRAP_S,
-            gl.CLAMP_TO_EDGE
-          );
-          gl.texParameteri(
-            gl.TEXTURE_2D,
-            gl.TEXTURE_WRAP_T,
-            gl.CLAMP_TO_EDGE
-          );
-          // Allocate zero-initialized GPU storage, then stream directly from
-          // the exact renderer owner. This avoids a width*height*3 padded host
-          // duplicate at 10–30M cells.
-          gl.texImage2D(
-            gl.TEXTURE_2D,
-            0,
-            gl.RGB32F,
-            width,
-            height,
-            0,
-            gl.RGB,
-            gl.FLOAT,
-            null
-          );
-          const completeRows = Math.floor(nCells / width);
-          if (completeRows > 0) {
-            gl.texSubImage2D(
-              gl.TEXTURE_2D,
-              0,
-              0,
-              0,
-              width,
-              completeRows,
-              gl.RGB,
-              gl.FLOAT,
-              positions,
-              0
-            );
-          }
-          const tailLength = nCells - completeRows * width;
-          if (tailLength > 0) {
-            gl.texSubImage2D(
-              gl.TEXTURE_2D,
-              0,
-              0,
-              completeRows,
-              tailLength,
-              1,
-              gl.RGB,
-              gl.FLOAT,
-              positions,
-              completeRows * width * 3
-            );
-          }
-        }
-      );
-      pooledEntry = {
-        dims: newDims,
-        format: 'RGB32F',
-        generation,
-        nCells,
-        refCount: 0,
-        texture,
-      };
-      edgePositionTexturePoolV2.set(generation, pooledEntry);
-    }
-
-    if (existing === pooledEntry) {
-      if (vid === LIVE_VIEW_ID) nCellsV2 = nCells;
-      return true;
-    }
-
-    const replacements = new Map();
-    const dimsChanged =
-      existing?.texture &&
-      (
-        !existing.dims ||
-        existing.dims[0] !== newDims[0] ||
-        existing.dims[1] !== newDims[1]
-      );
-
-    // Publish the new lookup/refcount before retiring the prior entry. No
-    // WebGL deletion is allowed to roll back this committed generation.
-    pooledEntry.refCount += 1;
-    edgePositionTexturesV2.set(vid, pooledEntry);
-    releaseEdgePositionPoolEntry(
-      existing,
-      pooledEntry.texture,
-      replacements
-    );
-    if (dimsChanged) {
-      const visEntry = edgeVisibilityTexturesV2.get(vid);
-      edgeVisibilityTexturesV2.delete(vid);
-      retireEdgePrefixOwner(vid);
-      if (visEntry?.texture) {
-        replacements.set(visEntry.texture, null);
-      }
-    }
-
-    // Track cell count for debugging (use live view's count as the canonical value)
-    if (vid === LIVE_VIEW_ID) {
-      nCellsV2 = nCells;
-    }
-    publishEdgeTextureReplacements(
-      replacements,
-      `Connectivity prior position generation for view "${vid}" could not be fully retired.`
-    );
-
-    return true;
-  }
-
-  /**
-   * Create or update visibility texture for a specific view.
-   * Each view can have different visibility (filters, LOD level).
-   * @param {string} viewId - View identifier
-   * @param {Float32Array} visibility - Per-cell visibility (0-1)
-   * @returns {boolean} True if texture was created/updated successfully
-   */
-  function updateVisibilityTextureV2ForView(
-    viewId,
-    visibility,
-    internalVisibility = null
-  ) {
-    if (typeof viewId !== 'string' || viewId.length === 0) {
-      return false;
-    }
-    const vid = viewId;
-
-    let nCells;
-    let readByte = null;
-    let lodVisibility = null;
-    if (internalVisibility === null) {
-      if (
-        !(visibility instanceof Float32Array) ||
-        visibility.length === 0
-      ) {
-        console.warn(`[Viewer] Invalid visibility for view ${vid}: visibility is empty or null`);
-        return false;
-      }
-      nCells = visibility.length;
-      readByte = index => encodeEdgeVisibilityByte(
-        visibility[index],
-        index
-      );
-    } else {
-      if (
-        !Number.isSafeInteger(visibility) ||
-        visibility <= 0
-      ) {
-        throw new TypeError(
-          'Internal connectivity visibility publication is invalid.'
-        );
-      }
-      nCells = visibility;
-      if (typeof internalVisibility === 'function') {
-        readByte = internalVisibility;
-      } else if (
-        internalVisibility !== null &&
-        typeof internalVisibility === 'object' &&
-        !Array.isArray(internalVisibility) &&
-        Object.isFrozen(internalVisibility) &&
-        internalVisibility.transparency instanceof Float32Array &&
-        internalVisibility.transparency.length === nCells &&
-        (
-          internalVisibility.admissionLevels === null ||
-          (
-            internalVisibility.admissionLevels instanceof Uint8Array &&
-            internalVisibility.admissionLevels.length === nCells
-          )
-        ) &&
-        Number.isInteger(internalVisibility.lodLevel) &&
-        internalVisibility.lodLevel >= -1 &&
-        internalVisibility.lodLevel < 0xff
-      ) {
-        lodVisibility = internalVisibility;
-      } else {
-        throw new TypeError(
-          'Internal connectivity visibility publication is invalid.'
-        );
-      }
-    }
-
-    // Get position texture dims for this view (visibility must match position count)
-    const posEntry = edgePositionTexturesV2.get(vid);
-    if (!posEntry) {
-      console.warn(`[Viewer] Cannot update visibility for view ${vid}: no position texture`);
-      return false;
-    }
-    if (nCells !== posEntry.nCells) {
-      return false;
-    }
-
-    const [width, height] = posEntry.dims;
-    const texelCount = width * height;
-
-    // Get or create visibility entry
-    let visEntry = edgeVisibilityTexturesV2.get(vid);
-
-    // Check if existing visibility texture has mismatched dimensions (safety check)
-    // This can happen if position texture was recreated without cleaning up visibility
-    if (visEntry?.texture && visEntry.dims) {
-      const dimsMismatch = visEntry.dims[0] !== width || visEntry.dims[1] !== height;
-      if (dimsMismatch) {
-        edgeVisibilityTexturesV2.delete(vid);
-        retireEdgePrefixOwner(vid);
-        publishEdgeTextureReplacements(
-          new Map([[visEntry.texture, null]]),
-          `Connectivity mismatched visibility generation for view "${vid}" could not be fully retired.`
-        );
-        visEntry = null;
-      }
-    }
-
-    // R8 is the exact shader contract: hidden=0, visible=255. Keep the
-    // accepted owner immutable until WebGL accepts the candidate. One shared
-    // staging buffer serves every view synchronously, bounding extra memory
-    // to one byte per texel instead of one candidate per pane.
-    const scratchBuffer = visEntry?.scratchBuffer;
-    const hadPreviousBuffer = (
-      scratchBuffer instanceof Uint8Array &&
-      scratchBuffer.length === texelCount
-    );
-    let candidateBuffer = edgeVisibilityStagingBuffer;
-    if (
-      !(candidateBuffer instanceof Uint8Array) ||
-      candidateBuffer.length !== texelCount ||
-      candidateBuffer === scratchBuffer
-    ) {
-      candidateBuffer = new Uint8Array(texelCount);
-    }
-
-    // Validate, encode, and compare in one pass. The LOD path is inlined to
-    // avoid tens of millions of indirect closure calls during filter drags.
-    let dirtyRowStart = height;
-    let dirtyRowEnd = 0;
-    for (let index = 0; index < nCells; index++) {
-      let nextByte;
-      if (lodVisibility !== null) {
-        const alpha = lodVisibility.transparency[index];
-        if (!Number.isFinite(alpha) || alpha < 0 || alpha > 1) {
-          throw new RangeError(
-            `LOD-filtered connectivity transparency at index ${index} must be finite and in [0, 1].`
-          );
-        }
-        nextByte = (
-          alpha >= POINT_VISIBILITY_THRESHOLD &&
-          (
-            lodVisibility.admissionLevels === null ||
-            lodVisibility.admissionLevels[index] <=
-              lodVisibility.lodLevel
-          )
-        ) ? 255 : 0;
-      } else {
-        nextByte = readByte(index);
-      }
-      if (nextByte !== 0 && nextByte !== 255) {
-        throw new RangeError(
-          `Internal connectivity visibility byte at index ${index} must be 0 or 255.`
-        );
-      }
-      candidateBuffer[index] = nextByte;
-      if (!hadPreviousBuffer || scratchBuffer[index] !== nextByte) {
-        const row = Math.floor(index / width);
-        if (row < dirtyRowStart) dirtyRowStart = row;
-        dirtyRowEnd = row + 1;
-      }
-    }
-    candidateBuffer.fill(0, nCells);
-    if (hadPreviousBuffer && dirtyRowEnd === 0) {
-      edgeVisibilityStagingBuffer = candidateBuffer;
-      return true;
-    }
-
-    const uploadRows = (buffer, startRow, endRow) => {
-      const completeRowCount = Math.floor(nCells / width);
-      const completeEnd = Math.min(endRow, completeRowCount);
-      if (startRow < completeEnd) {
-        gl.texSubImage2D(
-          gl.TEXTURE_2D,
-          0,
-          0,
-          startRow,
-          width,
-          completeEnd - startRow,
-          gl.RED,
-          gl.UNSIGNED_BYTE,
-          buffer,
-          startRow * width
-        );
-      }
-      const tailLength = nCells % width;
-      const tailRow = completeRowCount;
-      if (
-        tailLength > 0 &&
-        startRow <= tailRow &&
-        endRow > tailRow
-      ) {
-        const tailOffset = tailRow * width;
-        gl.texSubImage2D(
-          gl.TEXTURE_2D,
-          0,
-          0,
-          tailRow,
-          tailLength,
-          1,
-          gl.RED,
-          gl.UNSIGNED_BYTE,
-          buffer,
-          tailOffset
-        );
-      }
-    };
-
-    if (!visEntry?.texture) {
-      let texture;
-      try {
-        texture = createUploadedEdgeTexture(
-          `weighted connectivity visibility for view "${vid}"`,
-          () => {
-            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-            gl.texImage2D(
-              gl.TEXTURE_2D,
-              0,
-              gl.R8,
-              width,
-              height,
-              0,
-              gl.RED,
-              gl.UNSIGNED_BYTE,
-              null
-            );
-            uploadRows(candidateBuffer, 0, height);
-          }
-        );
-      } catch (error) {
-        edgeVisibilityStagingBuffer = candidateBuffer;
-        throw error;
-      }
-
-      // Store with format tag for validation
-      edgeVisibilityTexturesV2.set(vid, {
-        dims: [width, height],
-        format: 'R8',
-        revision: 1,
-        scratchBuffer: candidateBuffer,
-        texture,
-      });
-      edgeVisibilityStagingBuffer = null;
-    } else {
-      if (
-        !Number.isSafeInteger(visEntry.revision) ||
-        visEntry.revision <= 0 ||
-        visEntry.revision >= Number.MAX_SAFE_INTEGER
-      ) {
-        edgeVisibilityStagingBuffer = candidateBuffer;
-        throw new RangeError(
-          `Connectivity visibility revision for view "${vid}" cannot advance safely.`
-        );
-      }
-      const nextRevision = visEntry.revision + 1;
-      // Subsequent updates: use row-based partial upload if fewer than 50% of rows changed
-      const dirtyRowCount = dirtyRowEnd - dirtyRowStart;
-      const usePartialUpload = dirtyRowCount < height * 0.5 && dirtyRowCount > 0;
-
-      try {
-        runEdgeTextureUpload(
-          visEntry.texture,
-          `weighted connectivity visibility update for view "${vid}"`,
-          () => {
-            if (usePartialUpload) {
-              uploadRows(
-                candidateBuffer,
-                dirtyRowStart,
-                dirtyRowEnd
-              );
-            } else {
-              uploadRows(candidateBuffer, 0, height);
-            }
-          }
-        );
-      } catch (publicationError) {
-        try {
-          runEdgeTextureUpload(
-            visEntry.texture,
-            `weighted connectivity visibility restoration for view "${vid}"`,
-            () => uploadRows(scratchBuffer, 0, height)
-          );
-        } catch (restorationError) {
-          edgeVisibilityTexturesV2.delete(vid);
-          retireEdgePrefixOwner(vid);
-          edgeVisibilityStagingBuffer = candidateBuffer;
-          throwEdgeTexturePublicationFailure(
-            new AggregateError(
-              [publicationError, restorationError],
-              `Connectivity visibility update for view "${vid}" failed with incomplete restoration.`
-            ),
-            [visEntry.texture],
-            `Connectivity visibility update for view "${vid}" failed and cleanup was incomplete.`
-          );
-        }
-        edgeVisibilityStagingBuffer = candidateBuffer;
-        throw publicationError;
-      }
-
-      // The scratch owner and GPU texture now represent the same generation.
-      visEntry.scratchBuffer = candidateBuffer;
-      visEntry.revision = nextRevision;
-      edgeVisibilityStagingBuffer = scratchBuffer;
-    }
-
-    return true;
-  }
-
-  /**
-   * Delete edge textures for a specific view (cleanup on snapshot removal).
-   * @param {string} viewId - View identifier
-   * @returns {boolean} Whether an exact view identifier was accepted
-   */
-  function deleteEdgeTexturesForView(viewId) {
-    if (typeof viewId !== 'string' || viewId.length === 0) {
-      return false;
-    }
-    const vid = viewId;
-
-    const posEntry = edgePositionTexturesV2.get(vid);
-    edgePositionTexturesV2.delete(vid);
-
-    const visEntry = edgeVisibilityTexturesV2.get(vid);
-    edgeVisibilityTexturesV2.delete(vid);
-    retireEdgePrefixOwner(vid);
-
-    const replacements = new Map();
-    releaseEdgePositionPoolEntry(posEntry, null, replacements);
-    if (visEntry?.texture) {
-      replacements.set(visEntry.texture, null);
-    }
-    const failures = [];
-    try {
-      const boundTexture = gl.getParameter(gl.TEXTURE_BINDING_2D);
-      if (replacements.has(boundTexture)) {
-        gl.bindTexture(
-          gl.TEXTURE_2D,
-          replacements.get(boundTexture)
-        );
-      }
-    } catch (error) {
-      failures.push(error);
-    }
-    for (const texture of replacements.keys()) {
-      queueEdgeTextureRetirement(texture);
-    }
-    failures.push(...drainEdgeTextureRetirements());
-    if (failures.length > 0) {
-      throw new AggregateError(
-        failures,
-        `Connectivity textures for view "${vid}" were detached with pending retirement failures.`
-      );
-    }
-    return true;
-  }
-
-  /**
-   * Validate that a texture entry has the expected shader-facing format.
-   * @param {Object} entry - Texture entry with texture and format properties
-   * @param {string} expectedFormat - Expected format ('RGB32F' or 'R8')
-   * @returns {boolean} True if valid
-   */
-  function isValidEdgeTexture(entry, expectedFormat) {
-    if (!entry?.texture) return false;
-    // If format was tracked, verify it matches
-    if (entry.format && entry.format !== expectedFormat) {
-      console.error(`[Viewer] Texture format mismatch: expected ${expectedFormat}, got ${entry.format}`);
-      return false;
-    }
-    return true;
-  }
-
-  /**
-   * Get the exact edge textures owned by a specific view.
-   * Live and snapshot views each require their own position and visibility
-   * textures so per-view filtering cannot leak across views.
-   *
-   * @param {string} viewId - View identifier
-   * @returns {{ posTexture, visTexture, dims } | null} Textures and dimensions, or null if unavailable
-   */
-  function getEdgeTexturesForView(viewId) {
-    if (typeof viewId !== 'string' || viewId.length === 0) {
-      return null;
-    }
-    const vid = viewId;
-    if (
-      vid !== LIVE_VIEW_ID &&
-      !viewDimensionLevels.has(vid)
-    ) {
-      return null;
-    }
-    const posEntry = edgePositionTexturesV2.get(vid);
-    const visEntry = edgeVisibilityTexturesV2.get(vid);
-    if (!isValidEdgeTexture(posEntry, 'RGB32F')) {
-      console.warn(
-        `[Viewer] Invalid position texture for view "${vid}".`
-      );
-      return null;
-    }
-    if (!isValidEdgeTexture(visEntry, 'R8')) {
-      console.warn(
-        `[Viewer] Invalid visibility texture for view "${vid}".`
-      );
-      return null;
-    }
-    const posDims = posEntry.dims;
-    const visDims = visEntry.dims;
-    if (
-      !posDims ||
-      !visDims ||
-      posDims[0] !== visDims[0] ||
-      posDims[1] !== visDims[1]
-    ) {
-      console.warn(
-        `[Viewer] Dimension mismatch for view "${vid}": pos=${posDims}, vis=${visDims}.`
-      );
-      return null;
-    }
-    edgeTextureLookupScratch.posTexture = posEntry.texture;
-    edgeTextureLookupScratch.visTexture = visEntry.texture;
-    edgeTextureLookupScratch.dims = posDims;
-    return edgeTextureLookupScratch;
-  }
-
-  /**
-   * Check if a view has per-view edge textures set up.
-   * @param {string} viewId - View identifier
-   * @returns {boolean}
-   */
-  function hasEdgeTexturesForView(viewId) {
-    if (typeof viewId !== 'string' || viewId.length === 0) {
-      return false;
-    }
-    return edgePositionTexturesV2.has(viewId) &&
-      edgeVisibilityTexturesV2.has(viewId);
-  }
-
-  function getEdgeTextureStatsV2() {
-    const positionGenerations = Array.from(
-      edgePositionTexturePoolV2.values(),
-      entry => Object.freeze({
-        allocatedTexels: entry.dims[0] * entry.dims[1],
-        generation: entry.generation,
-        gpuBytes:
-          entry.dims[0] *
-          entry.dims[1] *
-          3 *
-          Float32Array.BYTES_PER_ELEMENT,
-        nCells: entry.nCells,
-        refCount: entry.refCount,
-      })
-    );
-    const positionViewGenerations = Array.from(
-      edgePositionTexturesV2,
-      ([viewId, entry]) => Object.freeze({
-        generation: entry.generation,
-        viewId,
-      })
-    );
-    const visibilityViews = Array.from(
-      edgeVisibilityTexturesV2,
-      ([viewId, entry]) => {
-        const allocatedTexels = entry.dims[0] * entry.dims[1];
-        return Object.freeze({
-          allocatedTexels,
-          cpuBytes: entry.scratchBuffer.byteLength,
-          format: entry.format,
-          gpuBytes: allocatedTexels,
-          revision: entry.revision,
-          viewId,
-        });
-      }
-    );
-    const prefixViews = Array.from(
-      edgePrefixOwnersV2,
-      ([viewId, owner]) => describeEdgePrefixOwner(viewId, owner)
-    );
-    return Object.freeze({
-      allVisiblePrefixBytes:
-        edgeAllVisiblePrefixOwner?.checkpoints.byteLength ?? 0,
-      endpointAliasBytes:
-        (edgeSourcesV2?.byteLength ?? 0) +
-        (edgeDestinationsV2?.byteLength ?? 0),
-      prefixStagingBytes:
-        edgePrefixCheckpointStaging?.byteLength ?? 0,
-      prefixViews: Object.freeze(prefixViews),
-      pendingRetirements: pendingEdgeTextureRetirements.size,
-      positionGenerations: Object.freeze(positionGenerations),
-      positionViewGenerations: Object.freeze(
-        positionViewGenerations
-      ),
-      visibleTarget: edgeVisibleTarget,
-      visibilityViews: Object.freeze(visibilityViews),
-    });
-  }
-
-  /**
-   * Draw connectivity using instanced rendering (V2)
-   * Now supports per-view textures for multi-view rendering with different
-   * dimensional projections (e.g., XY vs XZ) and view-specific filtering.
-   *
-   * @param {number} widthPx - Viewport width in pixels
-   * @param {number} heightPx - Viewport height in pixels
-   * @param {string} viewId - View ID for exact per-view texture lookup
-   * @param {number} paneFogNear - Fog near range published by this pane's point pass
-   * @param {number} paneFogFar - Fog far range published by this pane's point pass
-   */
-  function drawConnectivityInstanced(
-    widthPx,
-    heightPx,
-    viewId,
-    paneFogNear,
-    paneFogFar
-  ) {
-    if (
-      !showConnectivity ||
-      nEdgesV2 === 0 ||
-      !edgeTextureV2 ||
-      !edgeWeightTextureV2
-    ) {
-      return;
-    }
-
-    const prefixOwner = getCurrentEdgePrefixOwner(viewId);
-    if (prefixOwner === null || prefixOwner.rawPrefix === 0) {
-      return;
-    }
-    const maxEdges = assertIntegerInRange(
-      prefixOwner.rawPrefix,
-      1,
-      nEdgesV2,
-      `Connectivity raw edge prefix for view "${viewId}"`
-    );
-    if (
-      !Number.isFinite(paneFogNear) ||
-      paneFogNear < 0 ||
-      !Number.isFinite(paneFogFar) ||
-      paneFogFar < paneFogNear
-    ) {
-      throw new RangeError(
-        `Connectivity fog range for view "${viewId}" is invalid.`
-      );
-    }
-
-    // Get textures owned by this view.
-    const textures = getEdgeTexturesForView(viewId);
-
-    // Need valid textures to render
-    if (!textures || !textures.posTexture || !textures.visTexture) {
-      if (edgeDebugMode && edgeDebugFrameCount < 5) {
-        console.warn(`[Viewer] No valid textures for view ${viewId}, skipping edge render`);
-      }
-      return;
-    }
-
-    const { posTexture, visTexture, dims } = textures;
-
-    // Validate dimensions are non-zero and valid
-    if (!dims || !Array.isArray(dims) || dims.length < 2 || !dims[0] || !dims[1]) {
-      console.warn(`[Viewer] Invalid edge texture dims for view ${viewId}:`, dims);
-      return;
-    }
-
-    // Debug logging for first few frames
-    if (edgeDebugMode && edgeDebugFrameCount < 5) {
-      console.log(`[Viewer] Edge render for ${viewId}: dims=${dims}, posTexture=${!!posTexture}, visTexture=${!!visTexture}`);
-    }
-
-    gl.useProgram(lineInstancedProgram);
-    configureStraightAlphaBlending(gl);
-
-    // Set uniforms
-    gl.uniformMatrix4fv(lineInstancedUniformLocations.mvpMatrix, false, mvpMatrix);
-    gl.uniformMatrix4fv(lineInstancedUniformLocations.viewMatrix, false, viewMatrix);
-    gl.uniformMatrix4fv(lineInstancedUniformLocations.modelMatrix, false, modelMatrix);
-    gl.uniform2f(lineInstancedUniformLocations.viewportSize, widthPx, heightPx);
-    gl.uniform1f(lineInstancedUniformLocations.lineWidth, connectivityLineWidth);
-
-    // Every pane owns its exact shuffled raw prefix. Zero returned before any
-    // GL work above, while a full-detail pane explicitly submits nEdgesV2.
-    // Keep uniform for shader-side early-out (defensive, in case instance count differs)
-    gl.uniform1i(lineInstancedUniformLocations.maxEdges, maxEdges);
-
-    // Texture dimensions (use per-view dims for position texture)
-    gl.uniform2i(lineInstancedUniformLocations.edgeTexDims, edgeTexDimsV2[0], edgeTexDimsV2[1]);
-    gl.uniform2i(lineInstancedUniformLocations.posTexDims, dims[0], dims[1]);
-
-    // Bind textures
-    gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, edgeTextureV2);
-    gl.uniform1i(lineInstancedUniformLocations.edgeTexture, 0);
-
-    gl.activeTexture(gl.TEXTURE1);
-    gl.bindTexture(gl.TEXTURE_2D, posTexture);  // Per-view position texture
-    gl.uniform1i(lineInstancedUniformLocations.positionTexture, 1);
-
-    gl.activeTexture(gl.TEXTURE2);
-    gl.bindTexture(gl.TEXTURE_2D, visTexture);  // Per-view visibility texture
-    gl.uniform1i(lineInstancedUniformLocations.visibilityTexture, 2);
-
-    gl.activeTexture(gl.TEXTURE3);
-    gl.bindTexture(gl.TEXTURE_2D, edgeWeightTextureV2);
-    gl.uniform1i(lineInstancedUniformLocations.edgeWeightTexture, 3);
-
-    // Color and fog uniforms
-    connectivityColorVec[0] = connectivityColorBytes[0] / 255;
-    connectivityColorVec[1] = connectivityColorBytes[1] / 255;
-    connectivityColorVec[2] = connectivityColorBytes[2] / 255;
-    gl.uniform3fv(lineInstancedUniformLocations.lineColor, connectivityColorVec);
-    gl.uniform1f(lineInstancedUniformLocations.lineAlpha, connectivityAlpha);
-    gl.uniform1f(lineInstancedUniformLocations.fogDensity, fogDensity);
-    gl.uniform1f(lineInstancedUniformLocations.fogNearMean, paneFogNear);
-    gl.uniform1f(lineInstancedUniformLocations.fogFarMean, paneFogFar);
-    gl.uniform3fv(lineInstancedUniformLocations.fogColor, fogColor);
-
-    // Bind quad geometry
-    gl.bindBuffer(gl.ARRAY_BUFFER, edgeQuadBuffer);
-    gl.enableVertexAttribArray(lineInstancedAttribLocations.quadPos);
-    gl.vertexAttribPointer(lineInstancedAttribLocations.quadPos, 2, gl.FLOAT, false, 0, 0);
-
-    // Draw instanced - use maxEdges (not nEdgesV2) to actually reduce GPU work
-    // This is the critical fix: reducing the instance count saves vertex shader invocations,
-    // whereas the shader-side check just outputs degenerate triangles but still runs the VS
-    gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, maxEdges);
-
-    // Cleanup - explicitly unbind textures to prevent state leakage
-    gl.disableVertexAttribArray(lineInstancedAttribLocations.quadPos);
-    gl.activeTexture(gl.TEXTURE3);
-    gl.bindTexture(gl.TEXTURE_2D, null);
-    gl.activeTexture(gl.TEXTURE2);
-    gl.bindTexture(gl.TEXTURE_2D, null);
-    gl.activeTexture(gl.TEXTURE1);
-    gl.bindTexture(gl.TEXTURE_2D, null);
-    gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, null);
-
-    // Increment debug frame counter
-    if (edgeDebugMode) {
-      edgeDebugFrameCount++;
-    }
   }
 
 		  function drawGrid() {
@@ -4867,16 +3894,12 @@ export function createViewer({
 		    if (gridOpacity <= 0) return;
 		    gl.useProgram(gridProgram);
 		    gl.uniformMatrix4fv(gridUniformLocations.mvpMatrix, false, mvpMatrix);
-		    gl.uniformMatrix4fv(gridUniformLocations.viewMatrix, false, viewMatrix);
 		    gl.uniformMatrix4fv(gridUniformLocations.modelMatrix, false, modelMatrix);
 		    gl.uniform3fv(gridUniformLocations.gridColor, gridColor);
 		    gl.uniform3fv(gridUniformLocations.bgColor, gridBgColor);
 		    gl.uniform1f(gridUniformLocations.gridSpacing, gridSpacing);
 		    gl.uniform1f(gridUniformLocations.gridLineWidth, gridLineWidth);
 		    gl.uniform1f(gridUniformLocations.gridOpacity, gridOpacity);
-		    gl.uniform1f(gridUniformLocations.fogDensity, fogDensity * gridFogDensityMultiplier);
-		    gl.uniform1f(gridUniformLocations.fogNearMean, fogNearMean);
-		    gl.uniform1f(gridUniformLocations.fogFarMean, fogFarMean);
 		    gl.uniform1f(gridUniformLocations.gridSize, GRID_SIZE);
 
     // Scientific axis colors (RGB for XYZ)
@@ -4942,6 +3965,193 @@ export function createViewer({
     }
   }
 
+  /**
+   * The studio backdrop's record for one view. Its geometry is derived from
+   * the view's published positions and re-derived only when they are
+   * replaced, so a steady frame reads it without scanning or allocating.
+   */
+  function getStudioPaneState(viewId) {
+    const { positions, dimension } = getExactViewPositionRecord(viewId);
+    let state = studioPaneStates.get(viewId);
+    if (state === undefined) {
+      state = {
+        positions: null,
+        dimension: 0,
+        floorY: 0,
+        flat: false,
+        centerY: 0,
+        extentY: 0,
+        stageX: 0,
+        stageZ: 0,
+        extentX: 0,
+        extentZ: 0,
+        // Unset until the first draw, which starts on the target surface.
+        planarity: -1,
+      };
+      studioPaneStates.set(viewId, state);
+    }
+    if (state.positions !== positions || state.dimension !== dimension) {
+      resolveStudioPaneGeometry(
+        positions.length === 0 ? null : readPositionBounds(positions, dimension),
+        dimension,
+        state
+      );
+      state.positions = positions;
+      state.dimension = dimension;
+    }
+    return state;
+  }
+
+  /**
+   * Paint one pane's studio backdrop: background, floor and dot surface in a
+   * single opaque full-pane pass, drawn first with the pane's current
+   * matrices. Panes crossfade between the floor and the dot surface when
+   * their dimension or navigation mode changes; while one does, the next
+   * frame is owed (`sceneAnimationCause`).
+   */
+  function drawStudioBackdrop(
+    viewId,
+    pixelRatio,
+    glowCenterX,
+    paneNavigationMode,
+    dtSeconds
+  ) {
+    if (studioOpacity <= 0) return;
+    const state = getStudioPaneState(viewId);
+    const target = studioSurfacePlanarity(state.dimension, paneNavigationMode);
+    if (state.planarity < 0) {
+      state.planarity = target;
+    } else if (state.planarity !== target) {
+      const step = prefersReducedMotion()
+        ? Infinity
+        : dtSeconds / STUDIO_SURFACE_TRANSITION_SECONDS;
+      state.planarity = target > state.planarity
+        ? Math.min(target, state.planarity + step)
+        : Math.max(target, state.planarity - step);
+      if (state.planarity !== target) studioSurfaceInTransition = true;
+    }
+    // A singular camera has no rays to cast; the pane keeps its clear colour.
+    if (
+      mat4.invert(_studioInvMvpMatrix, mvpMatrix) === null ||
+      mat4.invert(_studioInvViewMatrix, viewMatrix) === null
+    ) {
+      return;
+    }
+    // The model matrix is the identity, so the camera's world position is
+    // also its position in the model space the floor is defined in.
+    _studioEye[0] = _studioInvViewMatrix[12];
+    _studioEye[1] = _studioInvViewMatrix[13];
+    _studioEye[2] = _studioInvViewMatrix[14];
+
+    const locations = studioUniformLocations;
+    gl.useProgram(studioProgram);
+    gl.bindVertexArray(studioVao);
+    gl.uniformMatrix4fv(locations.invMvpMatrix, false, _studioInvMvpMatrix);
+    gl.uniform3fv(locations.eye, _studioEye);
+    gl.uniform1f(locations.pixelRatio, pixelRatio);
+    gl.uniform3fv(locations.surfaceColor, bgColor);
+    gl.uniform3fv(locations.glowColor, studioGlowColor);
+    gl.uniform1f(locations.glowCenterX, glowCenterX);
+    gl.uniform3fv(locations.inkColor, studioInkColor);
+    gl.uniform1f(locations.lineMinorAlpha, studioPalette.lineMinorAlpha);
+    gl.uniform1f(locations.lineMajorAlpha, studioPalette.lineMajorAlpha);
+    gl.uniform1f(locations.dotMinorAlpha, studioPalette.dotMinorAlpha);
+    gl.uniform1f(locations.dotMajorAlpha, studioPalette.dotMajorAlpha);
+    gl.uniform1f(locations.opacity, studioOpacity);
+    const weights = resolveStudioSurfaceWeights(
+      state.planarity,
+      _studioSurfaceWeights
+    );
+    const floorWeight = weights.floor;
+    gl.uniform1f(locations.floorWeight, floorWeight);
+    gl.uniform1f(locations.floorY, state.floorY);
+    gl.uniform2f(locations.stageCenter, state.stageX, state.stageZ);
+    gl.uniform1f(locations.backdropWeight, weights.backdrop);
+    const plane = resolveStudioBackdropPlane(viewMatrix, state, _studioBackPlane);
+    gl.uniform3f(locations.backNormal, plane.normalX, plane.normalY, plane.normalZ);
+    gl.uniform1f(locations.backOffset, plane.offset);
+    gl.uniform3f(locations.backU, plane.uX, plane.uY, plane.uZ);
+    gl.uniform3f(locations.backV, plane.vX, plane.vY, plane.vZ);
+    // The pool belongs to the floor and fades with it.
+    resolveStudioPool(mvpMatrix, _studioEye, state, _studioPool);
+    const poolStrength =
+      _studioPool.gate * studioPalette.poolAlpha * floorWeight;
+    if (poolStrength > 0) {
+      const pool = _studioPool;
+      const determinant = pool.axisAX * pool.axisBY - pool.axisBX * pool.axisAY;
+      _studioPoolInverse[0] = pool.axisBY / determinant;
+      _studioPoolInverse[1] = -pool.axisAY / determinant;
+      _studioPoolInverse[2] = -pool.axisBX / determinant;
+      _studioPoolInverse[3] = pool.axisAX / determinant;
+      gl.uniform2f(locations.poolCenter, pool.centerX, pool.centerY);
+      gl.uniformMatrix2fv(locations.poolInverse, false, _studioPoolInverse);
+    }
+    gl.uniform1f(locations.poolStrength, poolStrength);
+    try {
+      gl.depthMask(false);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+    } finally {
+      gl.depthMask(true);
+      gl.bindVertexArray(null);
+    }
+  }
+
+  /**
+   * Paint one pane's backdrop look (rendering/backdrops/), when one is
+   * active: one opaque full-pane pass drawn right after the studio slot and
+   * before the grid and points.
+   */
+  function drawBackdropLook(
+    viewId,
+    pixelRatio,
+    glowCenterX,
+    paneNavigationMode,
+    viewportWidth,
+    viewportHeight
+  ) {
+    if (!backdropLooks.isActive()) return;
+    const state = getStudioPaneState(viewId);
+    if (
+      mat4.invert(_studioInvMvpMatrix, mvpMatrix) === null ||
+      mat4.invert(_studioInvViewMatrix, viewMatrix) === null
+    ) {
+      return;
+    }
+    _studioEye[0] = _studioInvViewMatrix[12];
+    _studioEye[1] = _studioInvViewMatrix[13];
+    _studioEye[2] = _studioInvViewMatrix[14];
+    backdropLooks.draw({
+      viewId,
+      invMvp: _studioInvMvpMatrix,
+      mvp: mvpMatrix,
+      projection: projectionMatrix,
+      eye: _studioEye,
+      pixelRatio,
+      glowCenterX,
+      viewportWidth,
+      viewportHeight,
+      planar: studioSurfacePlanarity(state.dimension, paneNavigationMode),
+      geometry: state,
+    });
+  }
+
+  /** `value` moved toward `target` by at most `step`, landing on it exactly. */
+  function moveToward(value, target, step) {
+    if (value < target) return Math.min(target, value + step);
+    if (value > target) return Math.max(target, value - step);
+    return value;
+  }
+
+  // Decorative transitions (backdrop fades and crossfades) complete at once
+  // when the user asked the system for reduced motion.
+  const reducedMotionQuery =
+    typeof window.matchMedia === 'function'
+      ? window.matchMedia('(prefers-reduced-motion: reduce)')
+      : null;
+  function prefersReducedMotion() {
+    return reducedMotionQuery !== null && reducedMotionQuery.matches === true;
+  }
+
   // Smoothstep helper for smooth transitions
   function smoothstep(edge0, edge1, x) {
     const t = Math.max(0, Math.min(1, (x - edge0) / (edge1 - edge0)));
@@ -4955,13 +4165,32 @@ export function createViewer({
     paneFogNear,
     paneFogFar
   ) {
-    drawConnectivityInstanced(
-      widthPx,
-      heightPx,
-      viewId,
-      paneFogNear,
-      paneFogFar
-    );
+    if (!showConnectivity || !useInstancedEdges || !edgeLayer.hasView(viewId)) {
+      return;
+    }
+    if (
+      !Number.isFinite(paneFogNear) ||
+      paneFogNear < 0 ||
+      !Number.isFinite(paneFogFar) ||
+      paneFogFar < paneFogNear
+    ) {
+      throw new RangeError(
+        `Connectivity fog range for view "${viewId}" is invalid.`
+      );
+    }
+    mat4.multiply(edgeModelViewMatrix, viewMatrix, modelMatrix);
+    edgeFrame.mvpMatrix = mvpMatrix;
+    edgeFrame.widthPx = widthPx;
+    edgeFrame.heightPx = heightPx;
+    edgeFrame.lineWidth = connectivityLineWidth;
+    edgeFrame.lineColor[0] = connectivityColorBytes[0] / 255;
+    edgeFrame.lineColor[1] = connectivityColorBytes[1] / 255;
+    edgeFrame.lineColor[2] = connectivityColorBytes[2] / 255;
+    edgeFrame.lineAlpha = connectivityAlpha;
+    edgeFrame.fogDensity = fogDensity;
+    edgeFrame.fogNear = paneFogNear;
+    edgeFrame.fogFar = paneFogFar;
+    edgeLayer.draw(viewId, edgeFrame);
   }
 
   function drawCentroids(count, viewportHeight) {
@@ -4977,6 +4206,9 @@ export function createViewer({
     gl.uniform1f(centroidUniformLocations.viewportHeight, viewportHeight);
     gl.uniform1f(centroidUniformLocations.fov, fov);
 
+    // The live buffers are replaced on every centroid publication, so the
+    // pointers are re-recorded into the pass's own vertex array per draw.
+    gl.bindVertexArray(centroidVao);
     gl.bindBuffer(gl.ARRAY_BUFFER, centroidPositionBuffer);
     gl.enableVertexAttribArray(centroidAttribLocations.position);
     gl.vertexAttribPointer(centroidAttribLocations.position, 3, gl.FLOAT, false, 0, 0);
@@ -4987,6 +4219,7 @@ export function createViewer({
 
     configureStraightAlphaBlending(gl);
     gl.drawArrays(gl.POINTS, 0, numPoints);
+    gl.bindVertexArray(null);
   }
 
   // === CENTROID SNAPSHOT BUFFER MANAGEMENT ===
@@ -5087,7 +4320,7 @@ export function createViewer({
     }
 
     // Create GPU buffer (STATIC_DRAW - uploaded once)
-    assertNoWebGLError(gl, 'Centroid snapshot publication');
+    requireCleanWebGLState(gl, 'Centroid snapshot publication');
     let glBuffer = null;
     let vao = null;
     try {
@@ -5122,7 +4355,7 @@ export function createViewer({
       );
       gl.bindVertexArray(null);
       gl.bindBuffer(gl.ARRAY_BUFFER, null);
-      assertNoWebGLError(gl, 'Candidate centroid snapshot publication');
+      requireCleanWebGLState(gl, 'Candidate centroid snapshot publication');
     } catch (error) {
       const rollbackFailures = [];
       for (const operation of [
@@ -5295,57 +4528,45 @@ export function createViewer({
     return { origin: near3, direction: dir };
   }
 
-  // Get viewport info for a screen position (handles multiview grid layout)
+  /**
+   * The presented pane under one client point, with everything an
+   * interaction needs to map that point into the pane's view: the pane's
+   * render rectangle (`vpOffset*`, `vpWidth`, `vpHeight`, canvas-local CSS
+   * pixels) and the point inside it (`vpLocal*`), the presented part of that
+   * rectangle (`visible*`), and the exact camera and projection the pane is
+   * drawn with. Returns -1 over an empty grid slot. Every screen-to-view
+   * mapping (picking, focus, highlight tools, projectiles, zoom-to-cursor)
+   * goes through here, so all of them follow the presented layout.
+   */
   function getViewportInfoAtScreen(screenX, screenY) {
+    const layout = getPresentedLayout();
+    if (layout === null) return -1;
+    // Read the camera as it is now, not as the last frame drew it: the view
+    // matrix is otherwise refreshed only when a frame renders, so a pointer
+    // read right after the camera moved landed on the previous picture.
+    const canvasSize = canvasResizeObserver.getSize();
+    updateCamera(canvasSize.width, canvasSize.height);
     const rect = canvas.getBoundingClientRect();
     const localX = screenX - rect.left;
     const localY = screenY - rect.top;
-
-    let vpLocalX = localX;
-    let vpLocalY = localY;
-    let vpWidth = rect.width;
-    let vpHeight = rect.height;
-    let vpOffsetX = 0;
-    let vpOffsetY = 0;
-    let clickedViewId = focusedViewId;
-
-    const viewCount = (liveViewHidden ? 0 : 1) + snapshotViews.length;
-
-    if (viewLayoutMode === 'grid' && viewCount > 1) {
-      const cols = viewCount <= 3 ? viewCount : Math.ceil(Math.sqrt(viewCount));
-      const rows = Math.ceil(viewCount / cols);
-      vpWidth = rect.width / cols;
-      vpHeight = rect.height / rows;
-
-      const col = Math.floor(localX / vpWidth);
-      const row = Math.floor(localY / vpHeight);
-      const clampedCol = Math.max(0, Math.min(col, cols - 1));
-      const clampedRow = Math.max(0, Math.min(row, rows - 1));
-
-      vpOffsetX = clampedCol * vpWidth;
-      vpOffsetY = clampedRow * vpHeight;
-      vpLocalX = localX - vpOffsetX;
-      vpLocalY = localY - vpOffsetY;
-
-      const viewIndex = clampedRow * cols + clampedCol;
-      const allViews = [];
-      if (!liveViewHidden) allViews.push({ id: LIVE_VIEW_ID });
-      snapshotViews.forEach(s => allViews.push({ id: s.id }));
-      const clickedView = allViews[viewIndex];
-      if (!clickedView) return -1;
-      clickedViewId = clickedView.id;
-    }
+    const pane = getPresentedPaneAtCssPoint(layout, localX, localY);
+    if (pane === null) return -1;
+    const paneIndex = layout.panes.indexOf(pane);
+    const clickedViewId = pane.viewId;
+    const vpWidth = pane.cssWidth;
+    const vpHeight = pane.cssHeight;
+    const vpOffsetX = pane.cssLeft;
+    const vpOffsetY = pane.cssTop;
+    const viewCount = layout.viewCount;
 
     // Get effective view matrix for the viewport
     let effectiveViewMatrix = null;
-    let effectiveNavigationMode = navigationMode;
     let effectiveTargetRadius = targetRadius;
-    if (!camerasLocked && viewCount > 1) {
+    if (!cameraFollowers.has(clickedViewId) && viewCount > 1) {
       const cameraState = assertCameraState(
         getViewCameraState(clickedViewId),
         `Viewport camera state for view "${clickedViewId}"`
       );
-      effectiveNavigationMode = cameraState.navigationMode;
       effectiveTargetRadius = cameraState.orbit.targetRadius;
       const cached = cachedViewMatrices.get(clickedViewId);
       if (cached && cached.viewMatrix) {
@@ -5356,27 +4577,10 @@ export function createViewer({
       }
     }
 
-    const paneLeftRatio = vpOffsetX / rect.width;
-    const paneWidthRatio = vpWidth / rect.width;
-    const projectionCenterNdcX = getProjectionCenterNdcX(
-      paneLeftRatio,
-      paneWidthRatio,
-      effectiveNavigationMode
+    const projectionCenterNdcX = pane.projectionCenterNdcX;
+    const viewportProjectionMatrix = mat4.clone(
+      getPresentedPaneProjection(layout, paneIndex)
     );
-    const viewportProjectionMatrix = mat4.create();
-    mat4.perspective(
-      viewportProjectionMatrix,
-      fov,
-      vpWidth / vpHeight,
-      near,
-      far
-    );
-    if (projectionCenterNdcX !== null) {
-      applyHorizontalProjectionCenter(
-        viewportProjectionMatrix,
-        projectionCenterNdcX
-      );
-    }
     const interactionViewMatrix = effectiveViewMatrix ?? viewMatrix;
     const cameraForward = vec3.fromValues(
       -interactionViewMatrix[2],
@@ -5404,13 +4608,17 @@ export function createViewer({
       vpHeight,
       vpOffsetX,
       vpOffsetY,
-      vpLocalX,
-      vpLocalY,
+      vpLocalX: localX - vpOffsetX,
+      vpLocalY: localY - vpOffsetY,
+      visibleOffsetX: pane.visibleCssLeft,
+      visibleOffsetY: pane.visibleCssTop,
+      visibleWidth: pane.visibleCssWidth,
+      visibleHeight: pane.visibleCssHeight,
       viewId: clickedViewId,
       effectiveViewMatrix,
-      vpAspect: vpWidth / vpHeight,
-      paneLeftRatio,
-      paneWidthRatio,
+      // The framebuffer aspect: the one the pane is rendered with.
+      vpAspect: pane.viewportWidth / pane.viewportHeight,
+      framebufferHeight: pane.viewportHeight,
       projectionCenterNdcX,
       projectionMatrix: viewportProjectionMatrix,
       cameraForward,
@@ -5418,61 +4626,103 @@ export function createViewer({
     };
   }
 
-  function pickCellRecordAtScreen(screenX, screenY) {
+  /**
+   * @param {number} screenX
+   * @param {number} screenY
+   * @param {boolean} buildIndex - Build a large pane's spatial index now if it
+   *   is missing (a click: the user asked, and waits). A hover reader passes
+   *   false: a large pane without an index answers null rather than blocking
+   *   the page for the build.
+   */
+  const pickMvpScratch = mat4.create();
+
+  function pickCellRecordWith(screenX, screenY, buildIndex) {
     const viewport = getViewportInfoAtScreen(screenX, screenY);
     if (viewport === -1) return null;
+    // Only what the pane presents can be picked: nothing under the sidebar,
+    // nothing in the slack between grid cells.
+    const canvasX = viewport.vpOffsetX + viewport.vpLocalX;
+    const canvasY = viewport.vpOffsetY + viewport.vpLocalY;
+    if (
+      canvasX < viewport.visibleOffsetX ||
+      canvasX >= viewport.visibleOffsetX + viewport.visibleWidth ||
+      canvasY < viewport.visibleOffsetY ||
+      canvasY >= viewport.visibleOffsetY + viewport.visibleHeight
+    ) {
+      return null;
+    }
     const {
       vpLocalX,
       vpLocalY,
       vpWidth,
       vpHeight,
-      vpAspect,
+      framebufferHeight,
       effectiveViewMatrix,
-      projectionCenterNdcX,
-      viewId: clickedViewId,
-      cameraTargetRadius
+      projectionMatrix: paneProjectionMatrix,
+      viewId: clickedViewId
     } = viewport;
-    const ray = screenToRay(
-      vpLocalX,
-      vpLocalY,
-      vpWidth,
-      vpHeight,
-      vpAspect,
-      effectiveViewMatrix,
-      projectionCenterNdcX
-    );
-    if (!ray) return null;
 
     // Large panes lazily build one exact, notified spatial owner on first
     // interaction. Small panes retain the lower-overhead direct scan.
-    const queryOwner = getSpatialQueryOwner(clickedViewId, true);
+    const queryOwner = getSpatialQueryOwner(clickedViewId, buildIndex);
     const positions = queryOwner.positions;
+    if (
+      !buildIndex
+      && queryOwner.spatialIndex === null
+      && positions.length / queryOwner.dimensionLevel
+        >= INTERACTIVE_SPATIAL_INDEX_POINT_THRESHOLD
+    ) {
+      return null;
+    }
     const lodMembership = hpRenderer.getCurrentLodMembership(
       clickedViewId,
       queryOwner.dimensionLevel
     );
 
-    const pick = findRaySamplePick({
+    // The pane exactly as drawn: its projection, its camera, the model matrix,
+    // and the point-size uniforms the vertex shader sizes every dot with.
+    const paneMvp = mat4.multiply(
+      pickMvpScratch,
+      paneProjectionMatrix,
+      // A pane without a camera of its own is drawn with the shared one.
+      effectiveViewMatrix ?? viewMatrix
+    );
+    mat4.multiply(paneMvp, paneMvp, modelMatrix);
+    const pick = findScreenSpacePick({
+      dimension: queryOwner.dimensionLevel,
       lodMembership,
       positions,
       transparency: queryOwner.transparency,
-      ray,
-      maxDistance: Math.min(cameraTargetRadius * 4, 10),
-      spatialIndex: queryOwner.spatialIndex
+      spatialIndex: queryOwner.spatialIndex,
+      mvpMatrix: paneMvp,
+      cursor: { x: vpLocalX, y: vpLocalY },
+      pane: { cssWidth: vpWidth, cssHeight: vpHeight, framebufferHeight },
+      pointSize: basePointSize,
+      sizeAttenuation,
+      fov
     });
     if (pick.cellIndex === -1) return null;
 
-    const positionOffset = pick.cellIndex * 3;
-    const position = Object.freeze({
-      x: positions[positionOffset],
-      y: positions[positionOffset + 1],
-      z: positions[positionOffset + 2]
-    });
+    const [x, y, z] = readPositionXYZ(
+      positions,
+      queryOwner.dimensionLevel,
+      pick.cellIndex,
+      [0, 0, 0]
+    );
+    const position = Object.freeze({ x, y, z });
     return Object.freeze({
       viewId: clickedViewId,
       cellIndex: pick.cellIndex,
       position
     });
+  }
+
+  function pickCellRecordAtScreen(screenX, screenY) {
+    return pickCellRecordWith(screenX, screenY, true);
+  }
+
+  function pickReadyCellRecordAtScreen(screenX, screenY) {
+    return pickCellRecordWith(screenX, screenY, false);
   }
 
   function pickCellAtScreen(screenX, screenY) {
@@ -5817,41 +5067,58 @@ export function createViewer({
   }
 
   function updateLabelLayerVisibility() {
-    let anyVisible = false;
-    const singleMode = viewLayoutMode === 'single';
-    const focusKey = String(focusedViewId || LIVE_VIEW_ID);
-    for (const [viewId, labels] of viewCentroidLabels.entries()) {
-      if (!shouldShowCentroidLabels(viewId) || !labels.length) continue;
-      const isActiveView = String(viewId) === focusKey;
-      if (singleMode && !isActiveView) {
-        hideLabelsForView(viewId);
-        continue;
-      }
-      for (const item of labels) {
-        if (item?.el && item.el.style.display !== 'none') {
-          anyVisible = true;
-          break;
-        }
-      }
-      if (anyVisible && singleMode) {
-        break;
-      }
-    }
+    labelLayerAnyVisible = false;
+    labelLayerSingleMode = viewLayoutMode === 'single';
+    labelLayerFocusKey = String(focusedViewId || LIVE_VIEW_ID);
+    // forEach with a hoisted callback rather than an entries() iterator: this
+    // runs on every drawn frame.
+    viewCentroidLabels.forEach(updateLabelLayerVisibilityForView);
     if (labelLayer) {
-      const display = anyVisible ? 'block' : 'none';
+      const display = labelLayerAnyVisible ? 'block' : 'none';
       if (labelLayer.style.display !== display) {
         labelLayer.style.display = display;
       }
     }
   }
 
+  let labelLayerAnyVisible = false;
+  let labelLayerSingleMode = false;
+  let labelLayerFocusKey = '';
+  function updateLabelLayerVisibilityForView(labels, viewId) {
+    // In single mode the first visible label settles the layer.
+    if (labelLayerAnyVisible && labelLayerSingleMode) return;
+    if (!shouldShowCentroidLabels(viewId) || !labels.length) return;
+    const isActiveView = String(viewId) === labelLayerFocusKey;
+    if (labelLayerSingleMode && !isActiveView) {
+      hideLabelsForView(viewId);
+      return;
+    }
+    if (labelLayerAnyVisible) return;
+    for (let index = 0; index < labels.length; index++) {
+      const item = labels[index];
+      if (item?.el && item.el.style.display !== 'none') {
+        labelLayerAnyVisible = true;
+        return;
+      }
+    }
+  }
+
   /**
-   * Update view title chips (positioned at top-center of each viewport in grid mode)
+   * Update view title chips: one per grid pane, centred on the top edge of
+   * the pane's presented rectangle.
    * @param {Array} views - Array of view objects with id and label
-   * @param {number} cols - Number of columns in grid
-   * @param {number} rows - Number of rows in grid
+   * @param {Object} layout - The presented layout the panes belong to
    */
-  function updateViewTitles(views, cols, rows) {
+  // What each pane's title chip says before its field: the view's number and
+  // what it shows ("2 · PCA 2D"), published by the view controls.
+  const viewTitlePrefixes = new Map();
+  function viewTitleText(view) {
+    const label = view.label || view.id;
+    const prefix = viewTitlePrefixes.get(view.id) ?? null;
+    return prefix === null ? label : `${prefix} · ${label}`;
+  }
+
+  function updateViewTitles(views, layout) {
     if (!viewTitleLayerEl) return;
 
     let inventoryMatches =
@@ -5860,7 +5127,7 @@ export function createViewer({
       for (let index = 0; index < views.length; index++) {
         const view = views[index];
         const entry = viewTitleEntries[index];
-        const label = view.label || view.id;
+        const label = viewTitleText(view);
         if (
           entry.viewId !== view.id ||
           entry.label !== label
@@ -5871,8 +5138,8 @@ export function createViewer({
       }
     }
     if (inventoryMatches) {
-      // Just update positions (in case canvas resized)
-      repositionViewTitles(views, cols, rows);
+      // Just update positions (in case the layout changed)
+      repositionViewTitles(layout);
       return;
     }
 
@@ -5882,15 +5149,10 @@ export function createViewer({
     }
     viewTitleEntries = [];
 
-    // Create chips for each view
-    const canvasSize = canvasResizeObserver.getSize();
-    const width = canvasSize.cssWidth;
-    const height = canvasSize.cssHeight;
-
     for (let i = 0; i < views.length; i++) {
       const view = views[i];
       const viewId = view.id;
-      const label = view.label || viewId;
+      const label = viewTitleText(view);
       const chip = document.createElement('div');
       chip.className = 'view-title-chip';
       // Mark active view
@@ -5898,42 +5160,26 @@ export function createViewer({
         chip.classList.add('active');
       }
       chip.textContent = label;
+      chip.title = label;
       chip.dataset.viewId = viewId;
 
       // Click handler to focus this view
       chip.addEventListener('click', () => {
         if (viewId !== focusedViewId) {
-          // Save current camera to previous view before switching
-          if (!camerasLocked) {
-            setViewCameraState(focusedViewId, getCurrentCameraStateInternal());
-          }
-          focusedViewId = viewId;
-          // Load new view's camera
-          if (!camerasLocked) {
-            const newCam =
-              getStoredViewCameraState(focusedViewId);
-            if (newCam) applyCameraStateTemporarily(newCam);
-          }
-          // Update active state on title chips
-          updateViewTitleActiveState();
+          transferViewFocus(viewId, { saveOutgoing: true });
           publishPresentedViewStateChange(
             'focus',
             focusedViewId
           );
         }
+        // An explicit choice of pane: the sidebar follows at once.
+        sidebarFocusPending = false;
+        if (sidebarFocusTimer !== null) {
+          clearTimeout(sidebarFocusTimer);
+          sidebarFocusTimer = null;
+        }
         if (viewFocusHandler) viewFocusHandler(viewId);
       });
-
-      // Calculate position: center-top of each viewport cell
-      const col = i % cols;
-      const row = Math.floor(i / cols);
-      const cellW = width / cols;
-      const cellH = height / rows;
-      const x = col * cellW + cellW / 2;
-      const y = row * cellH + 20; // 20px from top of cell
-
-      chip.style.left = `${x}px`;
-      chip.style.top = `${y}px`;
 
       viewTitleLayerEl.appendChild(chip);
       viewTitleEntries.push({
@@ -5942,38 +5188,25 @@ export function createViewer({
         label
       });
     }
+    lastTitleLayout = null;
+    repositionViewTitles(layout);
   }
 
-  function repositionViewTitles(views, cols, rows) {
-    const canvasSize = canvasResizeObserver.getSize();
-    const width = canvasSize.cssWidth;
-    const height = canvasSize.cssHeight;
-
-    // Skip style updates if layout dimensions haven't changed
-    if (width === lastTitleLayoutWidth &&
-        height === lastTitleLayoutHeight &&
-        cols === lastTitleLayoutCols &&
-        rows === lastTitleLayoutRows) {
-      return;
-    }
-
-    // Cache current layout for next frame comparison
-    lastTitleLayoutWidth = width;
-    lastTitleLayoutHeight = height;
-    lastTitleLayoutCols = cols;
-    lastTitleLayoutRows = rows;
+  function repositionViewTitles(layout) {
+    // Positions change only with the layout, which is one stable object
+    // between geometry changes.
+    if (layout === lastTitleLayout) return;
+    lastTitleLayout = layout;
 
     for (let i = 0; i < viewTitleEntries.length; i++) {
       const entry = viewTitleEntries[i];
-      if (!entry.el || i >= views.length) continue;
-      const col = i % cols;
-      const row = Math.floor(i / cols);
-      const cellW = width / cols;
-      const cellH = height / rows;
-      const x = col * cellW + cellW / 2;
-      const y = row * cellH + 20;
-      entry.el.style.left = `${x}px`;
-      entry.el.style.top = `${y}px`;
+      const pane = layout.panes[i];
+      if (!entry.el || pane === undefined) continue;
+      const x = pane.visibleCssLeft + pane.visibleCssWidth / 2;
+      const y = pane.visibleCssTop + VIEW_TITLE_TOP_OFFSET_PX;
+      entry.el.style.setProperty('--view-title-x', `${x}px`);
+      entry.el.style.setProperty('--view-title-y', `${y}px`);
+      entry.el.style.setProperty('--view-title-pane-width', `${pane.visibleCssWidth}px`);
     }
   }
 
@@ -6010,25 +5243,23 @@ export function createViewer({
     });
   }
 
-  function updateCentroidLabelPositions(
-    labels,
-    viewportNormX,
-    viewportNormY,
-    viewportNormWidth,
-    viewportNormHeight,
-    viewId
-  ) {
+  /**
+   * Place one pane's centroid labels. Projection maps NDC onto the pane's
+   * render rectangle; a label is shown only inside its presented part, so no
+   * label sits under the sidebar or over a neighbouring grid cell.
+   */
+  function updateCentroidLabelPositions(labels, pane, viewId) {
     hiddenCentroidLabelViews.delete(viewId);
-    // ResizeObserver owns the CSS-pixel dimensions; this avoids a synchronous
-    // layout read for every visible label and pane.
-    const canvasSize = canvasResizeObserver.getSize();
-    const width = canvasSize.cssWidth;
-    const height = canvasSize.cssHeight;
-    // Viewport bounds in CSS pixels
-    const vpX = viewportNormX * width;
-    const vpY = viewportNormY * height;
-    const vpW = viewportNormWidth * width;
-    const vpH = viewportNormHeight * height;
+    // Pane rectangles are canvas-local CSS pixels resolved from the
+    // ResizeObserver-owned canvas size: no per-label layout read.
+    const vpX = pane.cssLeft;
+    const vpY = pane.cssTop;
+    const vpW = pane.cssWidth;
+    const vpH = pane.cssHeight;
+    const visibleLeft = pane.visibleCssLeft;
+    const visibleTop = pane.visibleCssTop;
+    const visibleRight = visibleLeft + pane.visibleCssWidth;
+    const visibleBottom = visibleTop + pane.visibleCssHeight;
     // Small margin to hide labels that are partially outside (avoids text clipping at edges)
     const margin = 5;
 
@@ -6072,10 +5303,10 @@ export function createViewer({
         visible =
           Number.isFinite(screenX) &&
           Number.isFinite(screenY) &&
-          screenX >= vpX + margin &&
-          screenX <= vpX + vpW - margin &&
-          screenY >= vpY + margin &&
-          screenY <= vpY + vpH - margin;
+          screenX >= visibleLeft + margin &&
+          screenX <= visibleRight - margin &&
+          screenY >= visibleTop + margin &&
+          screenY <= visibleBottom - margin;
       }
 
       if (!visible) {
@@ -6117,8 +5348,210 @@ export function createViewer({
    * the body draws straight to the default framebuffer, exactly as it did before
    * the target existed.
    */
+  function invalidateFrame() {
+    frameInvalidated = true;
+    sceneGeneration += 1;
+    ensureFrameScheduled();
+    if (frameInvalidationTracing) {
+      // Diagnostics only: who asked for the next frame. Off by default, and a
+      // single boolean test when off.
+      lastFrameInvalidationTrace = new Error('frame invalidated').stack ?? null;
+    }
+  }
+
+  // What each grid pane last drew, for retained panes: a pane whose scene
+  // generation, camera, projection, rectangle and navigation mode are all
+  // unchanged keeps the pixels it drew in the scene target and is skipped.
+  const paneDrawRecords = new Map();
+  // Whether this frame changed any pixel of the scene target; a frame that
+  // changed none skips the resolve (the canvas already shows it).
+  let sceneTargetChangedThisFrame = true;
+  let retainedSceneTarget = null;
+  let retainedLayoutKey = '';
+
+  /**
+   * Whether the scene target still holds what the last frame drew there: the
+   * same framebuffer (the multisampled target or the default one), sampled the
+   * same way, at the same size. Anything else starts every pane afresh.
+   */
+  function sceneTargetRetained(width, height) {
+    const framebuffer = sceneMsaaTarget.getSceneFramebuffer();
+    const multisampled = sceneMsaaTarget.isMultisampledThisFrame();
+    const previous = retainedSceneTarget;
+    retainedSceneTarget = { framebuffer, multisampled, width, height };
+    return previous !== null
+      && previous.framebuffer === framebuffer
+      && previous.multisampled === multisampled
+      && previous.width === width
+      && previous.height === height;
+  }
+
+  function paneIsUnchanged(record, mvp, pane, paneNavigationMode) {
+    if (
+      record === undefined
+      || record.generation !== sceneGeneration
+      || record.navigationMode !== paneNavigationMode
+      || record.x !== pane.viewportX
+      || record.y !== pane.viewportY
+      || record.width !== pane.viewportWidth
+      || record.height !== pane.viewportHeight
+    ) {
+      return false;
+    }
+    for (let index = 0; index < 16; index++) {
+      if (record.mvp[index] !== mvp[index]) return false;
+    }
+    return true;
+  }
+
+  function recordPaneDraw(viewId, mvp, pane, paneNavigationMode) {
+    let record = paneDrawRecords.get(viewId);
+    if (record === undefined) {
+      record = { mvp: new Float32Array(16) };
+      paneDrawRecords.set(viewId, record);
+    }
+    record.mvp.set(mvp);
+    record.generation = sceneGeneration;
+    record.navigationMode = paneNavigationMode;
+    record.x = pane.viewportX;
+    record.y = pane.viewportY;
+    record.width = pane.viewportWidth;
+    record.height = pane.viewportHeight;
+  }
+
+  /** Arm the frame loop for the next animation frame, unless it is armed. */
+  function ensureFrameScheduled() {
+    if (
+      !frameLoopStarted
+      || animationHandle !== null
+      || disposed
+      || webglContextLost
+      || renderPaused
+    ) {
+      return;
+    }
+    animationHandle = requestAnimationFrame(render);
+  }
+
+  /**
+   * Ask for a frame for a camera change alone (a drag, a wheel zoom, a
+   * pinch): only the panes whose camera moved are redrawn; every other pane
+   * keeps its pixels.
+   */
+  function invalidateCameraFrame() {
+    frameInvalidated = true;
+    ensureFrameScheduled();
+    if (frameInvalidationTracing) {
+      lastFrameInvalidationTrace = new Error('frame invalidated (camera)').stack ?? null;
+    }
+  }
+
+  /**
+   * Whether a time-driven effect other than the camera's own motion changes
+   * what panes draw this frame (fades, smoke, overlays, the highlight pulse,
+   * projectiles, LOD still converging). While one is, every pane is redrawn.
+   */
+  function sceneWideAnimationActive() {
+    return (
+      gridOpacity !== (showGrid ? targetGridOpacity : 0)
+      || studioOpacity !== (showStudio ? 1 : 0)
+      || studioSurfaceInTransition
+      || (renderMode === 'smoke' && smokeRenderer.needsContinuousFrames())
+      || overlayManager?.needsContinuousFrames() === true
+      || (highlightTools !== null && highlightTools.isHighlightAnimating())
+      || projectileSystem.isAnimating()
+      || lodConvergingInLastFrame
+      || backdropLooks.frameCause() !== null
+    );
+  }
+
+  /**
+   * Build the spatial index of every presented large pane in a worker, so a
+   * hover reader or a selection tool never pays for it on the main thread.
+   * Panes below the interactive-index threshold keep their direct scan and
+   * build nothing. Resolves once every requested build has settled; a failed
+   * build is reported and leaves that pane to its press-time build.
+   */
+  function prepareSpatialQueryIndices() {
+    const layout = getPresentedLayout();
+    if (layout === null) return Promise.resolve();
+    const builds = [];
+    for (const pane of layout.panes) {
+      const dimensionLevel = getPublishedDimensionLevel(pane.viewId);
+      const count = getExactViewPositions(pane.viewId).length / dimensionLevel;
+      if (count < INTERACTIVE_SPATIAL_INDEX_POINT_THRESHOLD) continue;
+      builds.push(
+        hpRenderer.buildSpatialIndexInBackground(pane.viewId).catch(error => {
+          console.warn('[Viewer] Background spatial index failed:', error);
+        })
+      );
+    }
+    return Promise.all(builds).then(() => undefined);
+  }
+
+  /**
+   * The first time-driven effect that still changes the next frame, by name,
+   * or null. One list serves the frame loop and the schedule diagnostics, so
+   * a report can never disagree with the loop.
+   */
+  function sceneAnimationCause() {
+    if (isMovementKeyHeld()) return 'movement-key';
+    if (
+      Math.abs(velocityTheta) > INERTIA_MIN_VELOCITY ||
+      Math.abs(velocityPhi) > INERTIA_MIN_VELOCITY
+    ) {
+      return 'orbit-inertia';
+    }
+    if (Math.hypot(velocityPanX, velocityPanY, velocityPanZ) > INERTIA_MIN_VELOCITY) {
+      return 'pan-inertia';
+    }
+    if (vec3.length(freeflyVelocity) > 0) return 'freefly-coast';
+    if (radius !== targetRadius) return 'zoom-easing';
+    if (gridOpacity !== (showGrid ? targetGridOpacity : 0)) return 'grid-fade';
+    if (studioOpacity !== (showStudio ? 1 : 0)) return 'studio-fade';
+    if (studioSurfaceInTransition) return 'studio-surface';
+    const backdropLookCause = backdropLooks.frameCause();
+    if (backdropLookCause !== null) return backdropLookCause;
+    if (renderMode === 'smoke' && smokeRenderer.needsContinuousFrames()) return 'smoke';
+    if (overlayManager?.needsContinuousFrames() === true) return 'overlay';
+    if (highlightTools !== null && highlightTools.isHighlightAnimating()) return 'highlight';
+    if (projectileSystem.isAnimating()) return 'projectile';
+    if (presentedCameraSettlement.isPending()) return 'camera-settlement';
+    if (lodConvergingInLastFrame) return 'lod';
+    return null;
+  }
+
+
+  /**
+   * What starts a settle window on a frame of `frameSize`: an invalidation, a
+   * canvas resize, or a time-driven effect, by name; null when none. The frame
+   * loop and getFrameScheduleState() both ask here, so the diagnostics can
+   * never disagree with the loop.
+   */
+  function nextFrameCause(frameSize) {
+    if (frameInvalidated) return 'invalidated';
+    if (
+      frameSize.width !== lastDrawnCanvasWidth ||
+      frameSize.height !== lastDrawnCanvasHeight
+    ) {
+      return 'resize';
+    }
+    return sceneAnimationCause();
+  }
+
+  /** Whether the settle frames after the last cause have been drawn. */
+  function settleWindowElapsed() {
+    return framesDrawnSinceCause >= FRAME_SETTLE_MIN_FRAMES;
+  }
+
   function render() {
-    if (disposed || webglContextLost || renderPaused) return;
+    // This callback is the armed frame; it re-arms only while drawing goes on.
+    animationHandle = null;
+    if (disposed || webglContextLost || renderPaused) {
+      // Stopped: queued phase work runs from a frame of its own.
+      reconcileFramePhases();
+      return;
+    }
     // A context can be physically gone before `webglcontextlost` is delivered,
     // which is exactly the window a forced loss lands in and the reason the
     // asynchronous commits above fence on the same question. A frame drawn in
@@ -6126,12 +5559,37 @@ export function createViewer({
     // context by design; the refusal is terminal, the event that follows owns
     // the cleanup, and there is nothing to draw either way.
     if (isWebGLContextLostForAsyncCommit()) return;
-    animationHandle = requestAnimationFrame(render);
+    // Coalesced input first, so what it changes is drawn in this frame.
+    drainBeforeFramePhase();
+    const frameSize = canvasResizeObserver.getSize();
+    const now = performance.now();
+    const frameCause = nextFrameCause(frameSize);
+    if (frameCause !== null) {
+      lastFrameCauseTime = now;
+      lastFrameCause = frameCause;
+      framesDrawnSinceCause = 0;
+    } else if (settleWindowElapsed()) {
+      // Nothing on screen can change: the presented frame stays as it is,
+      // and the loop stops until something asks for a frame.
+      lastFrameTime = now;
+      drainAfterFramePhase();
+      return;
+    }
+    // A drawn frame keeps the loop armed for its settle frames and running
+    // effects. Armed before drawing, as the always-running loop was, so a
+    // callback requested during the frame still runs behind the viewer's.
+    ensureFrameScheduled();
+    frameInvalidated = false;
+    framesDrawnSinceCause += 1;
+    lastDrawnCanvasWidth = frameSize.width;
+    lastDrawnCanvasHeight = frameSize.height;
     renderFrameId = renderFrameId === Number.MAX_SAFE_INTEGER
       ? 0
       : renderFrameId + 1;
-    const frameSize = canvasResizeObserver.getSize();
+    if (sceneWideAnimationActive()) sceneGeneration += 1;
+    sceneTargetChangedThisFrame = true;
     sceneMsaaTarget.beginFrame(frameSize.width, frameSize.height);
+    lodConvergingInLastFrame = false;
     try {
       renderSceneFrame();
     } catch (error) {
@@ -6141,7 +5599,14 @@ export function createViewer({
       // a handled loss as a crash, which is what a page-error assertion in the
       // terminal-disposal contract caught. Anything else is a real failure and
       // still propagates untouched.
-      if (!isContextLostError(error)) throw error;
+      if (!isContextLostError(error)) {
+        // The canvas holds a partial frame; the next frame redraws it, every
+        // pane afresh (nothing drawn this frame can be retained).
+        retainedLayoutKey = '';
+        paneDrawRecords.clear();
+        invalidateFrame();
+        throw error;
+      }
       const scheduledAnimationHandle = animationHandle;
       animationHandle = null;
       if (scheduledAnimationHandle !== null) {
@@ -6151,22 +5616,45 @@ export function createViewer({
       // ownership graph and runs whether or not it has been delivered yet.
       renderPaused = true;
     } finally {
-      sceneMsaaTarget.resolveFrame(frameSize.width, frameSize.height);
+      if (sceneTargetChangedThisFrame) {
+        sceneMsaaTarget.resolveFrame(frameSize.width, frameSize.height);
+      } else {
+        sceneMsaaTarget.endFrameUnchanged();
+      }
     }
+    // What only reflects the drawn frame (readouts, observers) runs now.
+    drainAfterFramePhase();
+  }
+
+  /** The frame-phase driver: this viewer while its loop runs. */
+  const framePhaseDriver = Object.freeze({
+    isRunning: () => (
+      frameLoopStarted && !disposed && !webglContextLost && !renderPaused
+    ),
+    requestFrame: () => ensureFrameScheduled(),
+  });
+
+  /**
+   * Tell the frame phases whether this viewer drives them now (after the loop
+   * starts or stops), so queued work is never stranded.
+   */
+  function reconcileFramePhases() {
+    setFramePhaseDriver(disposed ? null : framePhaseDriver);
   }
 
   function renderSceneFrame() {
+    hpRenderer.beginFrame();
     const now = performance.now();
     const timeSeconds = now / 1000;
-    const dt = Math.min(0.05, Math.max(0.001, (now - lastFrameTime) / 1000));
+    const dt = Math.min(MAX_FRAME_DT, Math.max(0.001, (now - lastFrameTime) / 1000));
     lastFrameTime = now;
 
     if (navigationMode === 'free') {
       updateFreefly(dt);
     } else {
       updateOrbitPlanarKeys(dt);
-      updateSmoothZoom();
-      updateInertia();
+      updateSmoothZoom(dt);
+      updateInertia(dt);
     }
 
     projectileSystem.update(dt);
@@ -6174,18 +5662,17 @@ export function createViewer({
     // Update charge indicator UI (handled by projectile system)
     projectileSystem.updateChargeUI();
 
-    // Smooth grid opacity transition
-    if (showGrid) {
-      // Fade in towards target
-      if (gridOpacity < targetGridOpacity) {
-        gridOpacity = Math.min(targetGridOpacity, gridOpacity + gridTransitionSpeed * dt);
-      }
-    } else {
-      // Fade out towards zero
-      if (gridOpacity > 0) {
-        gridOpacity = Math.max(0, gridOpacity - gridTransitionSpeed * dt);
-      }
-    }
+    // Backdrop fades move toward their target in either direction: a grid
+    // whose target dropped (Grid light 0.85 to Grid dark 0.75) used to stay
+    // above it, and the scheduler then redrew every frame for good. With
+    // reduced motion requested they complete at once.
+    const fadeStep = prefersReducedMotion() ? Infinity : gridTransitionSpeed * dt;
+    gridOpacity = moveToward(gridOpacity, showGrid ? targetGridOpacity : 0, fadeStep);
+    // The studio backdrop fades at the grid's rate. Panes still crossing
+    // between floor and dot surface report themselves while this frame draws.
+    studioOpacity = moveToward(studioOpacity, showStudio ? 1 : 0, fadeStep);
+    studioSurfaceInTransition = false;
+    backdropLooks.advance(dt);
 
     const canvasSize = canvasResizeObserver.getSize();
     const width = canvasSize.width;
@@ -6195,6 +5682,7 @@ export function createViewer({
     }
 
     if (!pointCount) {
+      retainedLayoutKey = '';
       _renderVelocityViewIds.length = 0;
       prepareVelocityFrame(_renderVelocityViewIds);
       gl.viewport(0, 0, width, height);
@@ -6203,16 +5691,38 @@ export function createViewer({
     }
 
     updateCamera(width, height);
-    computeFogAnchors();
     mat4.multiply(mvpMatrix, projectionMatrix, viewMatrix);
     mat4.multiply(mvpMatrix, mvpMatrix, modelMatrix);
 
 		    if (renderMode === 'smoke') {
+		      // Smoke draws the live view alone: every kept view is dormant.
+		      _presentedViewIdsScratch.length = 1;
+		      _presentedViewIdsScratch[0] = LIVE_VIEW_ID;
+		      hpRenderer.setPresentedViews(_presentedViewIdsScratch);
+		      retainedLayoutKey = '';
 		      _renderVelocityViewIds.length = 0;
 		      prepareVelocityFrame(_renderVelocityViewIds);
 		      gl.viewport(0, 0, width, height);
 		      gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-		      // Draw grid first as background reference (render during fade-out too)
+		      // Draw the background layers first (render during fade-out too)
+		      const smokeLayout = getPresentedLayout();
+		      if (smokeLayout !== null) {
+		        drawStudioBackdrop(
+		          LIVE_VIEW_ID,
+		          width / smokeLayout.cssWidth,
+		          smokeLayout.presentedArea.cssLeft / smokeLayout.cssWidth,
+		          navigationMode,
+		          dt
+		        );
+		        drawBackdropLook(
+		          LIVE_VIEW_ID,
+		          width / smokeLayout.cssWidth,
+		          smokeLayout.presentedArea.cssLeft / smokeLayout.cssWidth,
+		          navigationMode,
+		          width,
+		          height
+		        );
+		      }
 		      if (gridOpacity > 0) {
 		        drawGrid();
 		      }
@@ -6249,10 +5759,11 @@ export function createViewer({
       return;
     }
 
-    // Determine views to render (include centroid data for each view)
-    // Reuse preallocated array to avoid per-frame allocation
-    _renderAllViews.length = 0;
-    let focusedRenderView = null;
+    // Determine views to render (include centroid data for each view).
+    // The preallocated array is overwritten in place and then truncated:
+    // `length = 0` would release its backing store, and the pushes after it
+    // would allocate a new one every frame.
+    let renderViewCount = 0;
 
     // Add live view only if not hidden
     if (!liveViewHidden) {
@@ -6262,125 +5773,108 @@ export function createViewer({
         transparencyArray;
       _liveRenderViewRecord.centroidCount = centroidCount;
       _liveRenderViewRecord.cameraState = liveCameraState;
-      _renderAllViews.push(_liveRenderViewRecord);
-      if (focusedViewId === LIVE_VIEW_ID) {
-        focusedRenderView = _liveRenderViewRecord;
-      }
+      _renderAllViews[renderViewCount++] = _liveRenderViewRecord;
     }
 
-    for (const snap of snapshotViews) {
-      const renderView = getSnapshotRenderViewRecord(snap);
-      _renderAllViews.push(renderView);
-      if (renderView.id === focusedViewId) {
-        focusedRenderView = renderView;
-      }
+    for (let index = 0; index < snapshotViews.length; index++) {
+      _renderAllViews[renderViewCount++] =
+        getSnapshotRenderViewRecord(snapshotViews[index]);
+    }
+    _renderAllViews.length = renderViewCount;
+
+    const layout = getPresentedLayout();
+    if (layout === null) {
+      retainedLayoutKey = '';
+      _renderVelocityViewIds.length = 0;
+      prepareVelocityFrame(_renderVelocityViewIds);
+      gl.viewport(0, 0, width, height);
+      gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+      return;
     }
 
-    // In single mode or only one view, render full screen
-    if (viewLayoutMode === 'single' || _renderAllViews.length <= 1) {
+    // Single view: one pane over the whole canvas, its projection centred on
+    // the presented area (updateCamera already configured exactly that).
+    // The views drawn this frame; a kept view that is not is dormant (its
+    // stores are the first released when memory runs out).
+    _presentedViewIdsScratch.length = layout.panes.length;
+    for (let index = 0; index < layout.panes.length; index++) {
+      _presentedViewIdsScratch[index] = layout.panes[index].viewId;
+    }
+    hpRenderer.setPresentedViews(_presentedViewIdsScratch);
+    if (!layout.gridMultiview) {
+      const pane = layout.panes[0];
+      const view = _renderAllViews[pane.viewIndex];
+      if (!view || view.id !== pane.viewId) {
+        throw new Error(
+          `Focused view "${pane.viewId}" is absent from the published render layout.`
+        );
+      }
+      // One pane over the whole canvas: a frame that would draw exactly what
+      // the scene target already holds (the settle frame after a change)
+      // draws nothing.
+      const singleKey = `single:${pane.viewId}:${pane.viewportX},${pane.viewportY},${pane.viewportWidth},${pane.viewportHeight};`;
+      const retainSingle = sceneTargetRetained(width, height) && singleKey === retainedLayoutKey;
+      retainedLayoutKey = singleKey;
+      if (!retainSingle) paneDrawRecords.clear();
+      if (retainSingle && paneIsUnchanged(paneDrawRecords.get(view.id), mvpMatrix, pane, navigationMode)) {
+        sceneTargetChangedThisFrame = false;
+        return;
+      }
+      recordPaneDraw(view.id, mvpMatrix, pane, navigationMode);
       gl.viewport(0, 0, width, height);
       gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 
-      // If we have exactly one view (e.g., live hidden with 1 snapshot), load its data
-      if (_renderAllViews.length === 1) {
-        const view = _renderAllViews[0];
-        _renderVelocityViewIds.length = 0;
-        _renderVelocityViewIds.push(view.id);
-        prepareVelocityFrame(_renderVelocityViewIds);
+      _renderVelocityViewIds[0] = view.id;
+      _renderVelocityViewIds.length = 1;
+      prepareVelocityFrame(_renderVelocityViewIds);
+      ensureCentroidSnapshotBuffer(view);
 
-        const snapshotId = requireSnapshotBufferId(view.id);
-        renderSingleView(
-          width,
-          height,
-          0,
-          0,
-          1,
-          1,
-          view.id,
-          view.centroidCount,
-          snapshotId,
-          dt,
-          timeSeconds,
-          navigationMode,
-          0,
-          0,
-          false
-        );
-      } else {
-        // The focused view must be part of the published render layout.
-        const view = focusedRenderView;
-        if (!view) {
-          throw new Error(
-            `Focused view "${focusedViewId}" is absent from the published render layout.`
-          );
-        }
-        _renderVelocityViewIds.length = 0;
-        _renderVelocityViewIds.push(view.id);
-        prepareVelocityFrame(_renderVelocityViewIds);
+      const snapshotId = requireSnapshotBufferId(view.id);
+      renderSingleView(
+        pane,
+        view.id,
+        view.centroidCount,
+        snapshotId,
+        dt,
+        timeSeconds,
+        navigationMode
+      );
+      hideViewTitles(); // No titles in single/fullscreen mode
+      updateLabelLayerVisibility();
+      return;
+    }
 
-        // Create or recreate centroid snapshot buffer if needed
-        if (
-          view.centroidPositions?.length > 0 &&
-          view.centroidColors &&
-          centroidBufferNeedsUpdate(
-            view.id,
-            view.centroidPositions,
-            view.centroidColors
-          )
-        ) {
-          createCentroidSnapshotBuffer(
-            view.id,
-            view.centroidPositions,
-            view.centroidColors
-          );
-        }
-
-	        const snapshotId = requireSnapshotBufferId(view.id);
-	        renderSingleView(
-	          width,
-	          height,
-	          0,
-	          0,
-	          1,
-	          1,
-	          view.id,
-	          view.centroidCount,
-	          snapshotId,
-	          dt,
-	          timeSeconds,
-	          navigationMode,
-	          0,
-	          0,
-	          false
-	        );
-	      }
-	      hideViewTitles(); // No titles in single/fullscreen mode
-	      updateLabelLayerVisibility();
-	      return;
-	    }
-
-    // Grid mode: render multiple viewports
-    gl.viewport(0, 0, width, height);
-    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    // Grid mode: render multiple viewports, one scissored pane per view, all
+    // inside the presented area. A pane that has not changed since it was
+    // drawn keeps its pixels in the scene target: orbiting one pane of four
+    // redraws one pane. The whole target is cleared and every pane drawn only
+    // when the target, the layout or the inventory changed.
+    let layoutKey = '';
+    for (const pane of layout.panes) {
+      layoutKey += `${pane.viewId}:${pane.viewportX},${pane.viewportY},${pane.viewportWidth},${pane.viewportHeight};`;
+    }
+    const retainPanes = sceneTargetRetained(width, height) && layoutKey === retainedLayoutKey;
+    retainedLayoutKey = layoutKey;
+    if (!retainPanes) {
+      paneDrawRecords.clear();
+      gl.viewport(0, 0, width, height);
+      gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    }
+    let panesDrawn = retainPanes ? 0 : 1;
 
     const viewCount = _renderAllViews.length;
-    _renderVelocityViewIds.length = 0;
-    for (let index = 0; index < viewCount; index++) {
-      _renderVelocityViewIds.push(_renderAllViews[index].id);
+    if (viewCount !== layout.panes.length) {
+      throw new Error('The presented layout does not match the render inventory.');
     }
+    for (let index = 0; index < viewCount; index++) {
+      _renderVelocityViewIds[index] = _renderAllViews[index].id;
+    }
+    _renderVelocityViewIds.length = viewCount;
     prepareVelocityFrame(_renderVelocityViewIds);
-    // Layout: 1=1x1, 2=2x1, 3=3x1, 4=2x2, 5+=grid
-    const cols = viewCount <= 3 ? viewCount : Math.ceil(Math.sqrt(viewCount));
-    const rows = Math.ceil(viewCount / cols);
 
     // Update view title chips
-    updateViewTitles(_renderAllViews, cols, rows);
+    updateViewTitles(_renderAllViews, layout);
     showViewTitles();
-
-    // Pre-compute viewport dimensions (same for all cells in uniform grid)
-    const vw = Math.floor(width / cols);
-    const vh = Math.floor(height / rows);
-    const vpAspect = vw / vh;
 
     // Store active view's matrices (computed once in updateCamera before this loop)
     // Use preallocated scratch matrix to avoid per-frame allocation
@@ -6395,21 +5889,24 @@ export function createViewer({
       try {
         for (let i = 0; i < viewCount; i++) {
         const view = _renderAllViews[i];
-        const col = i % cols;
-        const row = Math.floor(i / cols);
-        const vx = col * vw;
-        const vy = (rows - 1 - row) * vh; // Flip Y for GL
+        const pane = layout.panes[i];
+        if (pane.viewId !== view.id) {
+          throw new Error(
+            `Presented pane ${i} belongs to "${pane.viewId}", not "${view.id}".`
+          );
+        }
 
-        const isActiveView = view.id === focusedViewId;
+        const followsCamera = cameraFollowers.has(view.id);
         let paneNavigationMode = navigationMode;
 
         // OPTIMIZATION: Use cached view matrices instead of per-frame recalculation
         // No global state modification, no applyCameraStateTemporarily, no updateCamera
-        if (isActiveView) {
-          // Active view: always use the freshly computed active view matrix
+        if (followsCamera) {
+          // The focused view and its linked followers: the freshly computed
+          // active view matrix.
           mat4.copy(viewMatrix, _activeViewMatrixScratch);
           radius = activeRadius;
-        } else if (!camerasLocked) {
+        } else {
           const cached = cachedViewMatrices.get(view.id);
           const cameraState = getViewCameraState(view.id);
           paneNavigationMode = cameraState.navigationMode;
@@ -6428,61 +5925,46 @@ export function createViewer({
             // Cache for future frames
             updateCachedViewMatrix(view.id, cameraState);
           }
-        } else {
-          // Locked mode: non-active views use active view's matrix
-          mat4.copy(viewMatrix, _activeViewMatrixScratch);
-          radius = activeRadius;
         }
 
-        const cachedProjection = getCachedGridProjection(
-          vpAspect,
-          col / cols,
-          1 / cols,
-          paneNavigationMode
-        );
-        mat4.copy(projectionMatrix, cachedProjection);
+        mat4.copy(projectionMatrix, getPresentedPaneProjection(layout, i));
         mat4.multiply(mvpMatrix, projectionMatrix, viewMatrix);
         mat4.multiply(mvpMatrix, mvpMatrix, modelMatrix);
 
-          // Set viewport and clear depth for this pane
-          gl.viewport(vx, vy, vw, vh);
-          gl.scissor(vx, vy, vw, vh);
-          gl.clear(gl.DEPTH_BUFFER_BIT);
+          if (retainPanes && paneIsUnchanged(paneDrawRecords.get(view.id), mvpMatrix, pane, paneNavigationMode)) {
+            continue;
+          }
+          panesDrawn += 1;
+
+          // Set viewport and clear this pane (a retained frame keeps the
+          // other panes' pixels, so the pane clears its own colour too).
+          gl.viewport(
+            pane.viewportX,
+            pane.viewportY,
+            pane.viewportWidth,
+            pane.viewportHeight
+          );
+          gl.scissor(
+            pane.viewportX,
+            pane.viewportY,
+            pane.viewportWidth,
+            pane.viewportHeight
+          );
+          gl.clear(retainPanes ? gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT : gl.DEPTH_BUFFER_BIT);
+          recordPaneDraw(view.id, mvpMatrix, pane, paneNavigationMode);
 
           // Recreate only when the immutable position/color publication changes.
-          if (
-            view.centroidPositions?.length > 0 &&
-            view.centroidColors &&
-            centroidBufferNeedsUpdate(
-              view.id,
-              view.centroidPositions,
-              view.centroidColors
-            )
-          ) {
-            createCentroidSnapshotBuffer(
-              view.id,
-              view.centroidPositions,
-              view.centroidColors
-            );
-          }
+          ensureCentroidSnapshotBuffer(view);
 
           const snapshotId = requireSnapshotBufferId(view.id);
           renderSingleView(
-            vw,
-            vh,
-            col / cols,
-            row / rows,
-            1 / cols,
-            1 / rows,
+            pane,
             view.id,
             view.centroidCount,
             snapshotId,
             dt,
             timeSeconds,
-            paneNavigationMode,
-            vx,
-            vy,
-            true
+            paneNavigationMode
           );
         }
       } finally {
@@ -6495,7 +5977,7 @@ export function createViewer({
       // the already-scheduled next frame then starts from coherent state.
       mat4.copy(viewMatrix, _activeViewMatrixScratch);
       radius = activeRadius;
-      configureInteractiveProjection(
+      configureFullCanvasProjection(
         projectionMatrix,
         width / height
       );
@@ -6505,39 +5987,53 @@ export function createViewer({
 
 	    // Aggregate label layer visibility once per frame (after all views render).
 	    updateLabelLayerVisibility();
+	    if (panesDrawn === 0) sceneTargetChangedThisFrame = false;
 	  }
 
-		  function renderSingleView(
-		    width,
-		    height,
-		    viewportNormX,
-		    viewportNormY,
-		    viewportNormWidth,
-		    viewportNormHeight,
-		    viewId,
-		    overrideCentroidCount,
-		    snapshotBufferId = null,
-		    dtSeconds = 0.016,
-		    timeSeconds = 0,
-		    paneNavigationMode,
-		    viewportX,
-		    viewportY,
-		    scissorEnabled
-		  ) {
+  /** Recreate a view's centroid buffer only when its publication changed. */
+  function ensureCentroidSnapshotBuffer(view) {
+    if (
+      view.centroidPositions?.length > 0 &&
+      view.centroidColors &&
+      centroidBufferNeedsUpdate(
+        view.id,
+        view.centroidPositions,
+        view.centroidColors
+      )
+    ) {
+      createCentroidSnapshotBuffer(
+        view.id,
+        view.centroidPositions,
+        view.centroidColors
+      );
+    }
+  }
+
+  /**
+   * Draw one view into one presented pane. The caller has bound the pane's
+   * viewport (and scissor, for grid cells) and its projection.
+   */
+  function renderSingleView(
+    pane,
+    viewId,
+    overrideCentroidCount,
+    snapshotBufferId = null,
+    dtSeconds = 0.016,
+    timeSeconds = 0,
+    paneNavigationMode
+  ) {
+    const width = pane.viewportWidth;
+    const height = pane.viewportHeight;
+    const viewportX = pane.viewportX;
+    const viewportY = pane.viewportY;
+    const scissorEnabled = pane.scissorEnabled;
 		    const vid = assertViewId(viewId);
 		    const exactPaneNavigationMode = assertNavigationMode(
 		      paneNavigationMode
 		    );
-		    if (
-		      !Number.isFinite(viewportNormX) ||
-		      !Number.isFinite(viewportNormY) ||
-		      !Number.isFinite(viewportNormWidth) ||
-		      viewportNormWidth <= 0 ||
-		      !Number.isFinite(viewportNormHeight) ||
-		      viewportNormHeight <= 0
-		    ) {
-		      throw new TypeError(
-		        `Normalized viewport for view "${vid}" is invalid.`
+		    if (pane.viewId !== vid) {
+		      throw new Error(
+		        `View "${vid}" cannot render into the pane of "${pane.viewId}".`
 		      );
 		    }
 		    if (
@@ -6566,7 +6062,22 @@ export function createViewer({
 		    }
 		    const numCentroids = overrideCentroidCount;
 
-			    // Draw grid first
+			    // Draw the background layers first
+			    drawStudioBackdrop(
+			      vid,
+			      width / pane.cssWidth,
+			      pane.projectionCenterNdcX,
+			      exactPaneNavigationMode,
+			      dtSeconds
+			    );
+			    drawBackdropLook(
+			      vid,
+			      width / pane.cssWidth,
+			      pane.projectionCenterNdcX,
+			      exactPaneNavigationMode,
+			      width,
+			      height
+			    );
 			    drawGrid();
 
 	    // Render params shared by both render paths
@@ -6575,8 +6086,8 @@ export function createViewer({
 	    // Camera distance calculation: use per-view cached distance when available (for multiview support)
 	    // For focused view or locked cameras, global state is authoritative; otherwise use cached per-view value
 	    let camDist;
-	    const isActiveView = vid === focusedViewId;
-	    if (isActiveView || camerasLocked) {
+	    const followsCamera = cameraFollowers.has(vid);
+	    if (followsCamera) {
 	      // Active view: use global state (most up-to-date during interaction)
 	      camDist = navigationMode === 'free' ? vec3.length(freeflyPosition) : radius;
 	    } else {
@@ -6602,10 +6113,11 @@ export function createViewer({
 	    renderParams.dimensionLevel = dimLevel;
 	    renderParams.useAlphaTexture = false;
 	    renderParams.quality = currentShaderQuality;
+	    renderParams.multisampled = sceneMsaaTarget.isMultisampledThisFrame();
 
 	    // Camera position is used for fog/lighting; avoid per-view mat4.invert in the render loop.
 	    const cameraPosition = renderParams.cameraPosition;
-	    if (isActiveView || camerasLocked) {
+	    if (followsCamera) {
 	      cameraPosition[0] = eye[0];
 	      cameraPosition[1] = eye[1];
 	      cameraPosition[2] = eye[2];
@@ -6634,6 +6146,7 @@ export function createViewer({
 	    } else {
       hpRenderer.render(renderParams, false);
     }
+    if (hpRenderer.isViewLodConverging(vid)) lodConvergingInLastFrame = true;
 	    // Capture this point pass's exact range before any overlay or later
 	    // pane can reuse the shared HighPerfRenderer fog scalars.
 	    const paneFogNear = hpRenderer.getFogNear();
@@ -6656,6 +6169,7 @@ export function createViewer({
 		          deltaTimeSeconds: dtSeconds,
 		          isSnapshot: Boolean(snapshotBufferId),
 		          dimensionLevel: dimLevel,
+		          layoutKey: viewLayoutKeys.get(vid) ?? null,
 		          devicePixelRatio: window.devicePixelRatio,
 		          viewportX,
 		          viewportY,
@@ -6674,6 +6188,7 @@ export function createViewer({
 		        overlayOpts.deltaTimeSeconds = dtSeconds;
 		        overlayOpts.isSnapshot = Boolean(snapshotBufferId);
 		        overlayOpts.dimensionLevel = dimLevel;
+		        overlayOpts.layoutKey = viewLayoutKeys.get(vid) ?? null;
 		        overlayOpts.devicePixelRatio = window.devicePixelRatio;
 		        overlayOpts.viewportX = viewportX;
 		        overlayOpts.viewportY = viewportY;
@@ -6750,7 +6265,7 @@ export function createViewer({
       let viewPhi = phi;
       let viewTarget = target;
       let viewRadius = radius;
-      if (!camerasLocked && vid !== focusedViewId) {
+      if (!cameraFollowers.has(vid)) {
         const camState = getViewCameraState(vid);
         viewTheta = camState.orbit.theta;
         viewPhi = camState.orbit.phi;
@@ -6764,9 +6279,9 @@ export function createViewer({
 	      _orbitAnchorDrawParams.viewRadius = viewRadius;
 	      _orbitAnchorDrawParams.pointBoundsRadius = projectileSystem.getPointBoundsRadius();
 	      _orbitAnchorDrawParams.bgColor = bgColor;
-	      _orbitAnchorDrawParams.use3D = currentShaderQuality === 'full';
+	      _orbitAnchorDrawParams.use3D =
+	        SHADER_QUALITY_TRAITS[currentShaderQuality].sphere;
 	      _orbitAnchorDrawParams.fogDensity = fogDensity;
-	      _orbitAnchorDrawParams.fogColor = fogColor;
 	      _orbitAnchorDrawParams.lightingStrength = lightingStrength;
 		      _orbitAnchorDrawParams.navigationMode = exactPaneNavigationMode;
 	      orbitAnchorRenderer.draw(_orbitAnchorDrawParams);
@@ -6776,14 +6291,7 @@ export function createViewer({
 		    if (showCentroidLabels) {
 		      const labels = getLabelsForView(vid);
 		      if (labels.length) {
-		        updateCentroidLabelPositions(
-		          labels,
-		          viewportNormX,
-		          viewportNormY,
-		          viewportNormWidth,
-		          viewportNormHeight,
-		          vid
-		        );
+		        updateCentroidLabelPositions(labels, pane, vid);
 		      }
 	    } else {
 	      hideLabelsForView(vid);
@@ -6793,6 +6301,17 @@ export function createViewer({
   function setBackground(mode) {
     const exactMode = assertViewerBackground(mode);
     showGrid = false;
+    showStudio = false;
+    backdropLooks.setLook(isBackdropLook(exactMode) ? exactMode : null);
+    if (isBackdropLook(exactMode)) {
+      // A baked look: the clear colour is its surface (and the CSS page
+      // colour), shown until its bake lands and the look fades in.
+      const surface = backdropLookSurface01(exactMode);
+      gl.clearColor(surface[0], surface[1], surface[2], 1);
+      bgColor = surface;
+      fogColor = [...surface];
+      gridBgColor = [...surface];
+    }
     switch (exactMode) {
 	      case 'grid':
 	        showGrid = true;
@@ -6812,7 +6331,6 @@ export function createViewer({
 		        axisXColor = [0.48, 0.46, 0.46];
 		        axisYColor = [0.46, 0.48, 0.46];
 		        axisZColor = [0.46, 0.46, 0.48];
-	        gridFogDensityMultiplier = 1.0;
 	        break;
 	      case 'grid-dark':
         showGrid = true;
@@ -6828,8 +6346,23 @@ export function createViewer({
 		        axisXColor = [0.62, 0.58, 0.58];
 		        axisYColor = [0.58, 0.62, 0.58];
 		        axisZColor = [0.58, 0.58, 0.62];
-	        gridFogDensityMultiplier = 1.0;
 	        break;
+      case 'studio':
+      case 'studio-dark': {
+        // Floor and dot surface over a neutral stage; the clear colour is the
+        // backdrop's edge colour and the exact CSS page colour.
+        showStudio = true;
+        studioPalette = STUDIO_PALETTES[exactMode];
+        const surface = studioColor01(studioPalette.surface);
+        studioGlowColor = studioColor01(studioPalette.glow);
+        studioInkColor = studioColor01(studioPalette.ink);
+        gl.clearColor(surface[0], surface[1], surface[2], 1);
+        bgColor = surface;
+        fogColor = [...surface];
+        // Keep a fading box grid on the new surface.
+        gridBgColor = [...surface];
+        break;
+      }
       case 'black':
         gl.clearColor(0, 0, 0, 1);
         bgColor = [0, 0, 0];
@@ -6837,7 +6370,6 @@ export function createViewer({
         // Match grid bg to main bg for clean fade-out
         gridBgColor = [0, 0, 0];
         gridColor = [0.3, 0.3, 0.3];
-        gridFogDensityMultiplier = 1.0;
         break;
       case 'white':
         gl.clearColor(1, 1, 1, 1);
@@ -6846,7 +6378,6 @@ export function createViewer({
         // Match grid bg to main bg for clean fade-out
         gridBgColor = [1, 1, 1];
         gridColor = [0.7, 0.7, 0.7];
-        gridFogDensityMultiplier = 1.0;
     }
     publishPresentedViewStateChange(
       'background',
@@ -6884,10 +6415,10 @@ export function createViewer({
 
   function getViewCameraState(viewId, boundary = undefined) {
     const exactViewId = assertKnownViewId(viewId);
-    // The focused pane and every locked pane are rendered from the live global
-    // camera scalars. Public/session/snapshot capture must observe that same
-    // authoritative state rather than an older stored transition record.
-    if (camerasLocked || exactViewId === focusedViewId) {
+    // The focused pane and its linked followers are rendered from the live
+    // global camera scalars. Public/session/snapshot capture must observe that
+    // same authoritative state rather than an older stored record.
+    if (cameraFollowers.has(exactViewId)) {
       return certifyCameraStateOwner(
         getCurrentCameraStateInternal(),
         boundary ?? `Camera state for view "${exactViewId}"`
@@ -6910,19 +6441,118 @@ export function createViewer({
     }
     certifiedCameraStateOwners.add(ownedState);
 
-    // Update cached view matrix for this view (avoids per-frame recalculation).
-    // Although the focused pane currently consumes globals, retaining the
-    // cache makes a later focus transition publication-ready.
-    if (!camerasLocked) {
-      updateCachedViewMatrix(exactViewId, ownedState);
-    }
+    // The cached matrix draws the view whenever it does not follow the
+    // focused camera; keeping it current makes any focus or link change
+    // publication-ready.
+    updateCachedViewMatrix(exactViewId, ownedState);
     return ownedState;
+  }
+
+  function viewExists(viewId) {
+    return viewId === LIVE_VIEW_ID || snapshotViewsById.has(viewId);
+  }
+
+  /**
+   * The views drawn from the focused camera: the focused view, and with
+   * linked cameras every view showing the same representation (layout).
+   * A view with no published layout links with no other view.
+   */
+  function computeCameraFollowers() {
+    const followers = new Set([focusedViewId]);
+    if (!camerasLocked) return followers;
+    const layoutKey = viewLayoutKeys.get(focusedViewId) ?? null;
+    if (layoutKey === null) return followers;
+    for (const [viewId, viewLayoutKey] of viewLayoutKeys) {
+      if (viewLayoutKey === layoutKey && viewExists(viewId)) followers.add(viewId);
+    }
+    return followers;
+  }
+
+  /**
+   * Store the live camera in every view that follows it now, so a view that
+   * stops following keeps exactly what it showed.
+   */
+  function persistFocusedCamera() {
+    const current = getCurrentCameraStateInternal();
+    for (const viewId of cameraFollowers) {
+      if (viewExists(viewId)) setViewCameraState(viewId, current);
+    }
+  }
+
+  /**
+   * Recompute the followers after focus, linking, a layout or the view
+   * inventory changed. Callers persist the live camera first
+   * (`persistFocusedCamera`) while the old followers still describe it.
+   */
+  function refreshCameraFollowers() {
+    cameraFollowers = computeCameraFollowers();
+  }
+
+  /**
+   * With linked cameras, give every group of views that show one
+   * representation one camera: the focused group follows the live camera; any
+   * other group takes the stored camera of its first view (the live view
+   * first, then kept views in order).
+   */
+  function unifyLinkedCameras() {
+    if (!camerasLocked) return;
+    const focusedLayoutKey = viewLayoutKeys.get(focusedViewId) ?? null;
+    const groups = new Map();
+    const ordered = [LIVE_VIEW_ID, ...snapshotViews.map(snapshot => snapshot.id)];
+    for (const viewId of ordered) {
+      const layoutKey = viewLayoutKeys.get(viewId) ?? null;
+      if (layoutKey === null || layoutKey === focusedLayoutKey) continue;
+      if (!groups.has(layoutKey)) groups.set(layoutKey, []);
+      groups.get(layoutKey).push(viewId);
+    }
+    for (const members of groups.values()) {
+      if (members.length < 2) continue;
+      const shared = getStoredViewCameraState(members[0]);
+      for (const viewId of members.slice(1)) setViewCameraState(viewId, shared);
+    }
+  }
+
+  /**
+   * The one transfer of camera ownership between panes. The focused pane (and
+   * its linked followers) is drawn from the global camera scalars, so a focus
+   * change must (1) store the live camera in every view that follows it while
+   * those views still exist, (2) stop motion so inertia never glides the
+   * incoming pane, and (3) load the incoming pane's own camera and navigation
+   * mode. A pane that is being removed is not saved: its camera dies with it.
+   */
+  function transferViewFocus(nextViewId, { saveOutgoing }) {
+    if (saveOutgoing) {
+      persistFocusedCamera();
+    } else {
+      // The outgoing pane is being removed; its linked followers keep the
+      // live camera.
+      const current = getCurrentCameraStateInternal();
+      for (const viewId of cameraFollowers) {
+        if (viewId !== focusedViewId && viewExists(viewId)) {
+          setViewCameraState(viewId, current);
+        }
+      }
+    }
+    const incomingCamera = assertCameraState(
+      getStoredViewCameraState(nextViewId),
+      `Camera state for focused view "${nextViewId}"`
+    );
+    velocityTheta = velocityPhi = velocityPanX = velocityPanY = velocityPanZ = 0;
+    vec3.set(freeflyVelocity, 0, 0, 0);
+    focusedViewId = nextViewId;
+    refreshCameraFollowers();
+    const previousMode = navigationMode;
+    applyCameraStateTemporarily(incomingCamera);
+    if (navigationMode !== previousMode) {
+      navigationModeChangeHandler?.(focusedViewId, navigationMode);
+    }
+    updateViewTitleActiveState();
   }
 
   // === Per-view navigation mode helpers ===
   function getViewNavigationMode(viewId) {
     const exactViewId = assertKnownViewId(viewId);
-    if (camerasLocked) {
+    if (cameraFollowers.has(exactViewId)) {
       return navigationMode;
     }
     const camState = getViewCameraState(exactViewId);
@@ -6962,51 +6592,32 @@ export function createViewer({
     };
   }
 
+  /**
+   * Set one view's navigation mode. A view drawn from the focused camera (the
+   * focused view and its linked followers) changes the live mode, which every
+   * follower shares; any other view changes its stored camera.
+   */
   function applyViewNavigationMode(viewId, mode) {
     const exactMode = assertNavigationMode(mode);
-    // For the focused view, get fresh camera state that includes current global position
-    const isFocused = viewId === focusedViewId;
-
-    // Handle live view specially - ensure liveCameraState exists
-    if (viewId === LIVE_VIEW_ID) {
-      if (!liveCameraState || isFocused) {
-        // Always refresh camera state for focused view to capture current position
-        liveCameraState = getCurrentCameraStateInternal();
+    const exactViewId = assertKnownViewId(viewId);
+    if (cameraFollowers.has(exactViewId)) {
+      applyNavigationModeWithSync(exactMode);
+      const current = getCurrentCameraStateInternal();
+      for (const follower of cameraFollowers) {
+        if (viewExists(follower)) setViewCameraState(follower, current);
       }
-      // When switching to free-fly, ensure freefly data is synced from orbit
-      if (exactMode === 'free' && !isFocused) {
-        syncFreeflyInCameraState(liveCameraState);
-      }
-      liveCameraState.navigationMode = exactMode;
-      if (!camerasLocked) {
-        updateCachedViewMatrix(viewId, liveCameraState);
-      }
-    } else {
-      // Handle snapshot views
-      const snap = snapshotViewsById.get(viewId);
-      if (!snap) {
-        throw new RangeError(`Unknown camera view "${String(viewId)}".`);
-      }
-      if (!snap.cameraState) {
-        throw new TypeError(`Camera state is missing for view "${viewId}".`);
-      }
-      if (isFocused) {
-        // Refresh the focused view from the active camera.
-        snap.cameraState = getCurrentCameraStateInternal();
-      }
-      // When switching to free-fly, ensure freefly data is synced from orbit
-      if (exactMode === 'free' && !isFocused) {
-        syncFreeflyInCameraState(snap.cameraState);
-      }
-      snap.cameraState.navigationMode = exactMode;
-      if (!camerasLocked) {
-        updateCachedViewMatrix(viewId, snap.cameraState);
-      }
+      return;
     }
-    // If this is the focused view, also update the global navigation mode
-    if (isFocused) {
-      applyNavigationModeDirectly(exactMode);
+    const stored = cloneCameraState(
+      getStoredViewCameraState(exactViewId),
+      `Camera state for view "${exactViewId}"`
+    );
+    // When switching to free-fly, ensure freefly data is synced from orbit
+    if (exactMode === 'free') {
+      syncFreeflyInCameraState(stored);
     }
+    stored.navigationMode = exactMode;
+    setViewCameraState(exactViewId, stored);
   }
 
   // Apply navigation mode directly without triggering UI sync (internal use)
@@ -7033,7 +6644,7 @@ export function createViewer({
       if (document.pointerLockElement === canvas && document.exitPointerLock) {
         document.exitPointerLock();
       }
-      updateCursorForHighlightMode();
+      updateSelectionCursor();
     } else {
       // orbit mode
       lookActive = false;
@@ -7041,16 +6652,14 @@ export function createViewer({
       if (document.pointerLockElement === canvas && document.exitPointerLock) {
         document.exitPointerLock();
       }
-      updateCursorForHighlightMode();
+      updateSelectionCursor();
     }
   }
 
   /**
-   * Record or release dimension ownership for one applied navigation mode.
-   *
-   * A mode that already equals the view's dimension default is not an override,
-   * whoever applied it, so it must not end the dimension coupling. Anything
-   * else is an override and takes navigation for that view.
+   * Record or release the user's navigation choice for one view at the
+   * dimension it shows. A mode that equals that dimension's default is not a
+   * choice, whoever applied it.
    *
    * @param {string} viewId
    * @param {'orbit'|'planar'|'free'} mode
@@ -7059,44 +6668,59 @@ export function createViewer({
     const exactViewId = assertViewId(viewId);
     const dimensionLevel = getPublishedDimensionLevel(exactViewId);
     if (mode === getDefaultNavigationMode(dimensionLevel)) {
-      navigationModeOwnership.releaseViewUserChoice(exactViewId, mode);
+      navigationModeOwnership.release(exactViewId, dimensionLevel);
       return;
     }
-    navigationModeOwnership.recordViewUserChoice(exactViewId, mode);
+    navigationModeOwnership.record(exactViewId, dimensionLevel, mode);
   }
 
   /**
-   * The locked-camera counterpart: one mode is shared by every view, so the
-   * focused view's dimension decides whether it is an override.
-   *
-   * @param {string} viewId
-   * @param {'orbit'|'planar'|'free'} mode
+   * Put one view's camera at the default framing, in the navigation mode its
+   * dimension (or the user's choice for it there) implies. The focused view
+   * and its linked followers take it through the live camera.
    */
-  function settleSharedNavigationOwnership(viewId, mode) {
-    const dimensionLevel = getPublishedDimensionLevel(assertViewId(viewId));
-    if (mode === getDefaultNavigationMode(dimensionLevel)) {
-      navigationModeOwnership.releaseSharedUserChoice(mode);
-      return;
+  function resetViewCameraForDimension(viewId, dimensionLevel) {
+    const exactViewId = assertKnownViewId(viewId);
+    const pose = createDefaultCameraPose();
+    const camState = {
+      navigationMode: navigationModeOwnership.choiceFor(exactViewId, dimensionLevel)
+        ?? getDefaultNavigationMode(dimensionLevel),
+      orbit: {
+        radius: pose.orbit.radius,
+        targetRadius: pose.orbit.radius,
+        theta: pose.orbit.theta,
+        phi: pose.orbit.phi,
+        target: [...pose.orbit.target],
+      },
+      freefly: {
+        position: [...pose.freefly.position],
+        yaw: pose.freefly.yaw,
+        pitch: pose.freefly.pitch,
+      },
+    };
+    if (cameraFollowers.has(exactViewId)) {
+      velocityTheta = velocityPhi = velocityPanX = velocityPanY = velocityPanZ = 0;
+      vec3.set(freeflyVelocity, 0, 0, 0);
+      applyCameraStateTemporarily(camState, { applyNavMode: false });
+      for (const follower of cameraFollowers) {
+        if (viewExists(follower)) setViewCameraState(follower, getCurrentCameraStateInternal());
+      }
+    } else {
+      setViewCameraState(exactViewId, camState);
     }
-    navigationModeOwnership.recordSharedUserChoice(mode);
   }
 
+  /**
+   * A view now shows a representation of `dimensionLevel`: it navigates the
+   * way the user last chose for it at that dimension, else by the dimension's
+   * default (orbit in 3D, planar in 1D and 2D).
+   */
 	  function applyDimensionNavigationDefault(viewId, dimensionLevel) {
 	    const exactViewId = assertViewId(viewId);
-    // Resolved before the ownership test on purpose: an out-of-range dimension
-    // is rejected whether or not a default is about to be applied, so a view
-    // the user has taken over cannot smuggle an invalid level past this
-    // boundary.
-    const defaultMode = getDefaultNavigationMode(dimensionLevel);
-    if (navigationModeOwnership.hasExplicitUserChoice(exactViewId)) {
-      return false;
-    }
-
+    const mode = navigationModeOwnership.choiceFor(exactViewId, dimensionLevel)
+      ?? getDefaultNavigationMode(dimensionLevel);
     const previousMode = navigationMode;
-    if (camerasLocked || exactViewId === focusedViewId) {
-      applyNavigationModeWithSync(defaultMode);
-    }
-    applyViewNavigationMode(exactViewId, defaultMode);
+    applyViewNavigationMode(exactViewId, mode);
     if (navigationMode !== previousMode) {
       const observer = navigationModeChangeHandler;
       const publishedMode = navigationMode;
@@ -7105,7 +6729,7 @@ export function createViewer({
         // observer, not a publication veto, so only a thrown observer error is
         // reported outside the caller's reversible dimension transaction.
         try {
-          observer(exactViewId, publishedMode);
+          observer(focusedViewId, publishedMode);
         } catch (observerError) {
           queueMicrotask(() => {
             throw observerError;
@@ -7150,7 +6774,7 @@ export function createViewer({
       activeKeys.clear();
       vec3.set(freeflyVelocity, 0, 0, 0);
       velocityTheta = velocityPhi = velocityPanX = velocityPanY = velocityPanZ = 0;
-      updateCursorForHighlightMode();
+      updateSelectionCursor();
     } else {
       // Orbit mode.
       if (navigationMode === 'free') {
@@ -7169,7 +6793,7 @@ export function createViewer({
       }
       activeKeys.clear();
       vec3.set(freeflyVelocity, 0, 0, 0);
-      updateCursorForHighlightMode();
+      updateSelectionCursor();
     }
   }
 
@@ -7396,16 +7020,22 @@ export function createViewer({
 	    }
 	  }
 
-  // Invalidate all cached matrices (call when switching lock modes)
-  function invalidateAllCachedMatrices() {
-    cachedViewMatrices.clear();
-    cachedGridProjections.clear();
-    cachedGridProjectionAspect = null;
-  }
-
   function getViewIdAtScreenPosition(screenX, screenY) {
     const viewport = getViewportInfoAtScreen(screenX, screenY);
     return viewport === -1 ? focusedViewId : viewport.viewId;
+  }
+
+  /**
+   * The view presented under one canvas-local CSS point, or null over an
+   * empty grid slot or a canvas with no area. Unlike
+   * `getViewportInfoAtScreen` it reads no layout and builds no matrices, so a
+   * pointer-move reader (the armed selection cursor) can afford it per move.
+   */
+  function getPresentedViewIdAtCssPoint(cssX, cssY) {
+    const layout = getPresentedLayout();
+    if (layout === null) return null;
+    const pane = getPresentedPaneAtCssPoint(layout, cssX, cssY);
+    return pane === null ? null : pane.viewId;
   }
 
   // === Public API ===
@@ -7416,6 +7046,7 @@ export function createViewer({
         colors,
         transparency,
         dimensionLevel,
+        layoutKey,
         pointCount: nextPointCount
       } = assertViewerDataPayload(payload);
       // Load data into HP renderer (alpha is packed in colors as RGBA uint8)
@@ -7425,16 +7056,12 @@ export function createViewer({
         dimensionLevel
       });
 
-      // The renderer generation is authoritative once loadData returns. Edge
-      // topology and every per-view derived texture belong to the superseded
-      // dataset, so detach their logical inventory before any later viewer
-      // work can render or throw. Hostile deletion remains journaled and
-      // diagnostic-only; it cannot make the committed data publication appear
-      // rolled back to this caller.
-      reportCommittedRetirementFailures(
-        detachEdgeResourcesV2(),
-        'Connectivity resources from the prior committed dataset generation could not be fully retired.'
-      );
+      // The renderer generation is authoritative once loadData returns. The
+      // connectivity graph and every pane's edge records belong to the
+      // superseded dataset, so they go before any later viewer work can
+      // render or throw.
+      edgeLayer.clear();
+      useInstancedEdges = false;
 
       highlightTools.retireSpatialInteractions(LIVE_VIEW_ID);
       cancelPendingProjectileBuild(
@@ -7444,14 +7071,16 @@ export function createViewer({
       pointCount = nextPointCount;
       positionsArray = positions;
       colorsArray = colors;
-      transparencyArray = new Float32Array(transparency);
+      transparencyArray = new Uint8Array(transparency);
       hpRenderer._adoptCurrentAlphasOwner(transparencyArray);
-      computePointBoundsFromPositions(positions);
+      computePointBoundsFromPositions(positions, dimensionLevel);
       viewDimensionLevels.set(LIVE_VIEW_ID, dimensionLevel);
-      viewPositionsCache.set(LIVE_VIEW_ID, positions);
+      viewLayoutKeys.set(LIVE_VIEW_ID, layoutKey);
+      publishViewPositions(LIVE_VIEW_ID, positions, dimensionLevel);
       publishViewDataGeneration(LIVE_VIEW_ID);
       applyDimensionNavigationDefault(LIVE_VIEW_ID, dimensionLevel);
       vectorFieldOverlay?.markGeometryDirty?.(LIVE_VIEW_ID);
+      publishSmokeSourceChange();
     },
 
     updateColors(colors) {
@@ -7459,67 +7088,29 @@ export function createViewer({
       hpRenderer.updateColors(colors);
       colorsArray = colors;
       publishViewDataGeneration(LIVE_VIEW_ID);
+      publishSmokeSourceChange();
     },
 
     updateTransparency(alphaArray) {
-      assertExactFloat32Array(
+      assertExactUint8Array(
         alphaArray,
         pointCount,
         'Viewer live transparency'
       );
       highlightTools.retireSpatialInteractions(LIVE_VIEW_ID);
       if (
-        !(transparencyArray instanceof Float32Array) ||
+        !(transparencyArray instanceof Uint8Array) ||
         transparencyArray.length !== pointCount
       ) {
         throw new Error(
           'Viewer live transparency has no exact prior publication.'
         );
       }
-      let nextEdgeVisibility = null;
-      let previousEdgeVisibility = null;
-      if (edgePositionTexturesV2.has(LIVE_VIEW_ID)) {
-        const lodMembership = hpRenderer.getCurrentLodMembership(
-          LIVE_VIEW_ID,
-          getPublishedDimensionLevel(LIVE_VIEW_ID)
-        );
-        nextEdgeVisibility = createLodFilteredVisibilityOwner(
-          alphaArray,
-          lodMembership
-        );
-        previousEdgeVisibility =
-          createLodFilteredVisibilityOwner(
-            transparencyArray,
-            lodMembership
-          );
-      }
-
       let rendererPublished = false;
-      let edgeVisibilityAttempted = false;
+      let alphaGenerationMoved = false;
       try {
-        const alphaGenerationMoved = hpRenderer.updateAlphas(alphaArray);
+        alphaGenerationMoved = hpRenderer.updateAlphas(alphaArray);
         rendererPublished = true;
-        if (nextEdgeVisibility !== null) {
-          edgeVisibilityAttempted = true;
-          if (
-            !updateVisibilityTextureV2ForView(
-              LIVE_VIEW_ID,
-              pointCount,
-              nextEdgeVisibility
-            )
-          ) {
-            throw new Error(
-              'Live edge visibility was not published.'
-            );
-          }
-          const edgePrefix =
-            refreshEdgePrefixForView(LIVE_VIEW_ID);
-          if (edgePrefix === null || edgePrefix.current !== true) {
-            throw new Error(
-              'Live edge prefix was not published.'
-            );
-          }
-        }
         // A filter interaction republishes the whole transparency array even
         // when it moves no cell across the visible boundary, and invalidating
         // the highlight generation repacks and re-uploads one compact buffer of
@@ -7540,36 +7131,9 @@ export function createViewer({
           } catch (restorationError) {
             restorationFailures.push(restorationError);
           }
-          if (edgeVisibilityAttempted) {
-            try {
-              if (
-                !updateVisibilityTextureV2ForView(
-                  LIVE_VIEW_ID,
-                  pointCount,
-                  previousEdgeVisibility
-                )
-              ) {
-                throw new Error(
-                  'Live edge visibility restoration failed.'
-                );
-              }
-              const restoredEdgePrefix =
-                refreshEdgePrefixForView(LIVE_VIEW_ID);
-              if (
-                restoredEdgePrefix === null ||
-                restoredEdgePrefix.current !== true
-              ) {
-                throw new Error(
-                  'Live edge prefix restoration failed.'
-                );
-              }
-            } catch (restorationError) {
-              restorationFailures.push(restorationError);
-            }
-          }
         }
         try {
-          // Application state commonly reuses and mutates its Float32 owner
+          // Application state commonly reuses and mutates its Uint8 owner
           // before calling this method. Restore that caller owner as part of
           // the same failed publication so state and rendering cannot diverge.
           alphaArray.set(transparencyArray);
@@ -7579,7 +7143,7 @@ export function createViewer({
         if (restorationFailures.length > 0) {
           throw new AggregateError(
             [publicationError, ...restorationFailures],
-            'Live point and connectivity visibility publication failed with incomplete restoration.'
+            'Live point visibility publication failed with incomplete restoration.'
           );
         }
         throw publicationError;
@@ -7587,6 +7151,22 @@ export function createViewer({
 
       transparencyArray.set(alphaArray);
       hpRenderer._adoptCurrentAlphasOwner(transparencyArray);
+      if (alphaGenerationMoved && edgeLayer.hasView(LIVE_VIEW_ID)) {
+        // Shown edges follow the published visibility: the first K visible
+        // edges of the fixed order, re-selected now; the count follows in
+        // slices. An unmoved generation (same bytes) shows the same edges.
+        edgeLayer.publishVisibility(
+          LIVE_VIEW_ID,
+          createLodFilteredVisibilityOwner(
+            transparencyArray,
+            hpRenderer.getCurrentLodMembership(
+              LIVE_VIEW_ID,
+              getPublishedDimensionLevel(LIVE_VIEW_ID)
+            )
+          )
+        );
+        edgeLayer.refresh(LIVE_VIEW_ID);
+      }
       publishViewDataGeneration(LIVE_VIEW_ID);
       // Let overlays (e.g., vector field particles) rebuild spawn sources lazily when visibility changes.
       if (vectorFieldOverlay?.enabled) {
@@ -7595,18 +7175,19 @@ export function createViewer({
     },
 
     /**
-     * Update positions for dimension switching (maintains same point count and indices)
-     * Also updates edge position texture if edge rendering is enabled.
-     * @param {Float32Array} positions - New 3D positions array (n_points * 3)
+     * Update positions for dimension switching (maintains same point count and indices).
+     * Connectivity edges re-gather their endpoints from the new positions on
+     * their next draw.
+     * @param {Float32Array} positions - New positions (n_points * dimensionLevel)
      * @param {number} dimensionLevel - Dimension owned by this position generation.
      */
     updatePositions(positions, dimensionLevel) {
+      getDefaultNavigationMode(dimensionLevel);
       assertFiniteFloat32Array(
         positions,
-        pointCount * 3,
+        pointCount * dimensionLevel,
         'Viewer live positions'
       );
-      getDefaultNavigationMode(dimensionLevel);
       const previousDimensionLevel =
         getPublishedDimensionLevel(LIVE_VIEW_ID);
       const previousPositions = positionsArray;
@@ -7614,13 +7195,6 @@ export function createViewer({
       try {
         hpRenderer.updatePositions(positions, dimensionLevel);
         rendererPublished = true;
-
-        // The edge helper stages its texture and preserves the old texture if
-        // upload fails. Only after both owners succeed is the position set
-        // visible to the rest of the viewer.
-        if (useInstancedEdges && nEdgesV2 > 0) {
-          createPositionTextureV2ForView(LIVE_VIEW_ID);
-        }
       } catch (publicationError) {
         if (rendererPublished) {
           const restorationFailures = [];
@@ -7631,17 +7205,6 @@ export function createViewer({
             });
           } catch (restorationError) {
             restorationFailures.push(restorationError);
-          }
-          if (
-            restorationFailures.length === 0 &&
-            useInstancedEdges &&
-            nEdgesV2 > 0
-          ) {
-            try {
-              createPositionTextureV2ForView(LIVE_VIEW_ID);
-            } catch (edgeRestorationError) {
-              restorationFailures.push(edgeRestorationError);
-            }
           }
           if (restorationFailures.length > 0) {
             throw new AggregateError(
@@ -7655,10 +7218,11 @@ export function createViewer({
 
       highlightTools.retireSpatialInteractions(LIVE_VIEW_ID);
       positionsArray = positions;
-      viewPositionsCache.set(LIVE_VIEW_ID, positions);
-      computePointBoundsFromPositions(positions);
+      publishViewPositions(LIVE_VIEW_ID, positions, dimensionLevel);
+      computePointBoundsFromPositions(positions, dimensionLevel);
       publishViewDataGeneration(LIVE_VIEW_ID);
       vectorFieldOverlay?.markGeometryDirty?.(LIVE_VIEW_ID);
+      publishSmokeSourceChange();
     },
 
     /**
@@ -7698,13 +7262,14 @@ export function createViewer({
           `Cell position index must be an integer in [0, ${pointCount}).`
         );
       }
-      const positions = getExactViewPositions(assertKnownViewId(viewId));
-      const offset = cellIndex * 3;
-      return Object.freeze({
-        x: positions[offset],
-        y: positions[offset + 1],
-        z: positions[offset + 2]
-      });
+      const record = getExactViewPositionRecord(assertKnownViewId(viewId));
+      const [x, y, z] = readPositionXYZ(
+        record.positions,
+        record.dimension,
+        cellIndex,
+        [0, 0, 0]
+      );
+      return Object.freeze({ x, y, z });
     },
 
     /**
@@ -7716,47 +7281,129 @@ export function createViewer({
     },
 
     /**
-     * Set dimension level for a specific view (for multi-dimensional support)
+     * Publish the embedding a view shows: its dimension and the layout key
+     * its positions belong to. The positions themselves were already
+     * published through updatePositions / setViewPositions; this call
+     * exposes their layout through viewer state.
+     *
+     * The layout, not the dimension, is the identity of a view's geometry:
+     * switching between two layouts of one dimension changes LOD membership,
+     * frustum culling, picking and vector spawn sources exactly as a
+     * dimension switch does, so every per-view cache derived from the
+     * geometry is invalidated whenever the layout key changes. The
+     * navigation default follows only a dimension change; every layout is
+     * normalized to the same extent, so the camera stays valid.
+     *
      * @param {string} viewId - View identifier
-     * @param {number} level - Dimension level (1, 2, or 3)
+     * @param {{ dimension: number, layoutKey: string }} embedding
      */
-    setViewDimension(viewId, level) {
+    setViewEmbedding(viewId, embedding) {
       const vid = assertViewId(viewId);
+      if (
+        embedding === null ||
+        typeof embedding !== 'object' ||
+        Array.isArray(embedding) ||
+        Object.keys(embedding).sort().join(',') !== 'dimension,layoutKey'
+      ) {
+        throw new TypeError(
+          'A view embedding must contain exactly dimension and layoutKey.'
+        );
+      }
+      const level = embedding.dimension;
       getDefaultNavigationMode(level);
+      const layoutKey = assertViewLayoutKey(
+        embedding.layoutKey,
+        `View "${vid}" embedding`
+      );
+      if (layoutKey === null) {
+        throw new TypeError(
+          `View "${vid}" embedding must name the layout of its positions.`
+        );
+      }
       const oldLevel = getPublishedDimensionLevel(vid);
-      if (vid === LIVE_VIEW_ID && oldLevel !== level) {
+      const oldLayoutKey = viewLayoutKeys.get(vid) ?? null;
+      const layoutChanged = oldLayoutKey !== layoutKey;
+      if (vid === LIVE_VIEW_ID && layoutChanged) {
         cancelPendingProjectileBuild(
-          'Projectile preparation was cancelled because the live dimension changed.'
+          'Projectile preparation was cancelled because the live embedding changed.'
         );
         projectileSystem.setEnabled(false);
       }
       const snap = snapshotViewsById.get(vid);
 
-      // Invalidate per-view caches when dimension changes (LOD/frustum calculations differ)
-      if (oldLevel !== level && hpRenderer) {
-        // Publish the renderer owner before exposing the dimension through
-        // viewer state. Snapshot metadata changes preserve their immutable
-        // geometry buffer and rebuild only a required custom spatial index.
-        if (snap) {
-          hpRenderer.setSnapshotDimensionLevel(vid, level);
-        } else {
-          hpRenderer.setDimensionLevel(level);
-        }
+      const positionDimension = hpRenderer.getViewPositionDimension(vid);
+      if (
+        positionDimension !== level ||
+        getExactViewPositionDimension(vid) !== level
+      ) {
+        throw new Error(
+          `View "${vid}" publishes ${positionDimension}D positions; publish ${level}D positions before its ${level}D dimension.`
+        );
+      }
+      // Per-view LOD/frustum/picking caches describe the previous geometry.
+      if (layoutChanged) {
         hpRenderer.invalidateViewState(vid);
         highlightTools.retireSpatialInteractions(vid);
       }
 
+      // Linked cameras group views by representation: store the live camera
+      // in its followers while they still follow it, so a view leaving the
+      // group keeps what it showed.
+      persistFocusedCamera();
       viewDimensionLevels.set(vid, level);
+      viewLayoutKeys.set(vid, layoutKey);
       if (snap) {
         snap.dimensionLevel = level;
+      }
+      let joinedLinkedGroup = false;
+      if (camerasLocked && layoutChanged && vid !== focusedViewId) {
+        // A view that joins a linked group of another representation takes
+        // that group's camera; one that joins the focused group follows the
+        // live camera.
+        const member = [LIVE_VIEW_ID, ...snapshotViews.map(snapshot => snapshot.id)].find(
+          viewId => viewId !== vid && viewLayoutKeys.get(viewId) === layoutKey
+        );
+        if (member !== undefined) {
+          joinedLinkedGroup = true;
+          if (viewLayoutKeys.get(focusedViewId) !== layoutKey) {
+            setViewCameraState(vid, getStoredViewCameraState(member));
+          }
+        }
+      }
+      refreshCameraFollowers();
+      if (oldLevel !== level && !joinedLinkedGroup) {
+        // A pose framed for one dimension does not frame another: a planar
+        // close-up seen as an orbit sits inside the cloud. A view that changes
+        // dimension starts from the default framing of its new dimension.
+        resetViewCameraForDimension(vid, level);
       }
 
       // Invalidate cached view matrix since camera behavior may differ per dimension
       cachedViewMatrices.delete(vid);
-      applyDimensionNavigationDefault(vid, level);
-      if (oldLevel !== level) {
-        vectorFieldOverlay?.markDimensionDirty?.(vid);
+      if (!cameraFollowers.has(vid)) {
+        updateCachedViewMatrix(vid, getStoredViewCameraState(vid));
       }
+      if (oldLevel !== level) {
+        applyDimensionNavigationDefault(vid, level);
+      }
+      if (layoutChanged) {
+        vectorFieldOverlay?.markLayoutDirty?.(vid);
+      }
+    },
+
+    /**
+     * Get the layout key of the embedding a view shows.
+     * @param {string} viewId - View identifier
+     * @returns {string|null} Null while the view shows no dataset.
+     */
+    getViewLayoutKey(viewId) {
+      const vid = assertKnownViewId(viewId);
+      if (!viewLayoutKeys.has(vid)) {
+        throw new RangeError(
+          `Layout state is not published for view "${vid}".`
+        );
+      }
+      return viewLayoutKeys.get(vid);
     },
 
     /**
@@ -7771,19 +7418,19 @@ export function createViewer({
     /**
      * Set positions for a specific view (for multi-dimensional support in multiview)
      * Updates the snapshot buffer with new positions if the view has one.
-     * Also updates per-view edge position textures if edge rendering is enabled.
+     * Connectivity edges re-gather their endpoints on their next draw.
      * @param {string} viewId - View identifier
-     * @param {Float32Array} positions - 3D positions array
+     * @param {Float32Array} positions - Positions (n_points * dimensionLevel)
      * @param {number} dimensionLevel - Dimension owned by this position generation.
      */
     setViewPositions(viewId, positions, dimensionLevel) {
       const vid = assertKnownViewId(viewId);
+      getDefaultNavigationMode(dimensionLevel);
       assertFiniteFloat32Array(
         positions,
-        pointCount * 3,
+        pointCount * dimensionLevel,
         `Positions for view "${vid}"`
       );
-      getDefaultNavigationMode(dimensionLevel);
       let publishedPositions = positions;
       const previousPositions = getExactViewPositions(vid);
       const previousDimensionLevel = getPublishedDimensionLevel(vid);
@@ -7794,9 +7441,6 @@ export function createViewer({
         try {
           hpRenderer.updatePositions(positions, dimensionLevel);
           rendererPublished = true;
-          if (useInstancedEdges && nEdgesV2 > 0) {
-            createPositionTextureV2ForView(vid);
-          }
         } catch (publicationError) {
           if (rendererPublished) {
             const restorationFailures = [];
@@ -7807,17 +7451,6 @@ export function createViewer({
               });
             } catch (restorationError) {
               restorationFailures.push(restorationError);
-            }
-            if (
-              restorationFailures.length === 0 &&
-              useInstancedEdges &&
-              nEdgesV2 > 0
-            ) {
-              try {
-                createPositionTextureV2ForView(vid);
-              } catch (edgeRestorationError) {
-                restorationFailures.push(edgeRestorationError);
-              }
             }
             if (restorationFailures.length > 0) {
               throw new AggregateError(
@@ -7830,7 +7463,7 @@ export function createViewer({
         }
         highlightTools.retireSpatialInteractions(vid);
         positionsArray = positions;
-        computePointBoundsFromPositions(positions);
+        computePointBoundsFromPositions(positions, dimensionLevel);
       } else {
         try {
           hpRenderer.updateSnapshotPositions(
@@ -7840,9 +7473,6 @@ export function createViewer({
           );
           rendererPublished = true;
           publishedPositions = hpRenderer.getSnapshotPositions(vid);
-          if (useInstancedEdges && nEdgesV2 > 0) {
-            createPositionTextureV2ForView(vid);
-          }
         } catch (publicationError) {
           if (rendererPublished) {
             const restorationFailures = [];
@@ -7856,23 +7486,13 @@ export function createViewer({
               // copy. Restore the cache to that exact owner, not the released
               // pre-attempt array, so subsequent snapshot derivation can prove
               // geometry-generation identity.
-              viewPositionsCache.set(
+              publishViewPositions(
                 vid,
-                hpRenderer.getSnapshotPositions(vid)
+                hpRenderer.getSnapshotPositions(vid),
+                previousDimensionLevel
               );
             } catch (restorationError) {
               restorationFailures.push(restorationError);
-            }
-            if (
-              restorationFailures.length === 0 &&
-              useInstancedEdges &&
-              nEdgesV2 > 0
-            ) {
-              try {
-                createPositionTextureV2ForView(vid);
-              } catch (edgeRestorationError) {
-                restorationFailures.push(edgeRestorationError);
-              }
             }
             if (restorationFailures.length > 0) {
               throw new AggregateError(
@@ -7885,7 +7505,7 @@ export function createViewer({
         }
         highlightTools.retireSpatialInteractions(vid);
       }
-      viewPositionsCache.set(vid, publishedPositions);
+      publishViewPositions(vid, publishedPositions, dimensionLevel);
       publishViewDataGeneration(vid);
       vectorFieldOverlay?.markGeometryDirty?.(vid);
     },
@@ -7914,7 +7534,7 @@ export function createViewer({
      * Get transparency array for a specific view.
      * Used by selection tools to respect per-view filtering in multi-view mode.
      * @param {string} viewId - View identifier
-     * @returns {Float32Array|null} Transparency array (0 = hidden, >0 = visible)
+     * @returns {Uint8Array|null} Transparency array (0 = hidden, 1 = visible)
      */
     getViewTransparency(viewId) {
       return getExactViewTransparency(viewId);
@@ -7940,7 +7560,8 @@ export function createViewer({
         pointCount: owner.pointCount,
         dimensionLevel: owner.dimensionLevel,
         geometryGeneration: owner.geometryGeneration,
-        lodMembership: owner.lodMembership
+        lodMembership: owner.lodMembership,
+        drawOrder: owner.drawOrder
       });
       return runSynchronousBorrowedViewDataCallback(
         callback,
@@ -7950,7 +7571,11 @@ export function createViewer({
     },
 
     updateHighlight(highlightData, highlightedIndices = null) {
-      highlightTools.updateHighlight(highlightData, highlightedIndices);
+      // A selection preview republishes on every pointer move, mostly
+      // unchanged; only a changed highlight redraws the scene.
+      if (highlightTools.updateHighlight(highlightData, highlightedIndices)) {
+        invalidateFrame();
+      }
     },
 
     setHighlightStyle(options = {}) {
@@ -7971,6 +7596,89 @@ export function createViewer({
      */
     pickCellRecordAtScreen(screenX, screenY) {
       return pickCellRecordAtScreen(screenX, screenY);
+    },
+
+    /** Like pickCellRecordAtScreen, but never builds a missing large index. */
+    pickReadyCellRecordAtScreen(screenX, screenY) {
+      return pickReadyCellRecordAtScreen(screenX, screenY);
+    },
+
+    /**
+     * Record the call stack of every frame invalidation (diagnostics; off by
+     * default). Read it back through getFrameScheduleState().
+     */
+    setFrameInvalidationTracing(enabled) {
+      frameInvalidationTracing = assertExactBoolean(
+        enabled,
+        'Frame invalidation tracing'
+      );
+      lastFrameInvalidationTrace = null;
+    },
+
+    /**
+     * Why the frame loop would draw the next frame, for diagnostics: whether
+     * the scene has settled (the loop draws nothing more until something
+     * changes), whether a mutation or input invalidated it, the time-driven
+     * effect still running (null when none), whether the canvas size differs
+     * from the last drawn frame, and how far the loop is into its settle
+     * window. Reading it changes nothing.
+     */
+    getFrameScheduleState() {
+      const size = canvasResizeObserver.getSize();
+      const now = performance.now();
+      return Object.freeze({
+        // The loop's own stop condition: true once nothing has started a
+        // settle window and the last one has run out, so the next frame draws
+        // nothing until something changes. This, not a wall-clock wait with
+        // no draw in it, is when a scene is quiet: a renderer that takes
+        // longer per frame than such a wait draws nothing in it while it is
+        // still settling.
+        settled: nextFrameCause(size) === null && settleWindowElapsed(),
+        invalidated: frameInvalidated,
+        animationCause: sceneAnimationCause(),
+        canvasResized:
+          size.width !== lastDrawnCanvasWidth || size.height !== lastDrawnCanvasHeight,
+        lastCause: lastFrameCause,
+        msSinceCause: now - lastFrameCauseTime,
+        framesDrawnSinceCause,
+        // Whether a frame callback is requested: false once the loop has
+        // stopped on a settled scene, until something asks for a frame.
+        frameArmed: animationHandle !== null,
+        // With tracing on: the call stack of the last invalidation, so a
+        // frame that should not have been drawn names who asked for it.
+        lastInvalidationTrace: lastFrameInvalidationTrace,
+      });
+    },
+
+    /**
+     * Whether the camera is moving or being moved right now: a drag or a
+     * touch gesture in progress, held navigation keys, inertia, a zoom still
+     * easing toward its target, or a presented camera still settling. A pick
+     * taken in that window describes a frame that is already gone, so hover
+     * readers wait for it to end.
+     */
+    isCameraInMotion() {
+      return (
+        isDragging ||
+        touchGesture === 'camera' ||
+        touchGesture === 'two-pointer' ||
+        isMovementKeyHeld() ||
+        Math.abs(velocityTheta) > INERTIA_MIN_VELOCITY ||
+        Math.abs(velocityPhi) > INERTIA_MIN_VELOCITY ||
+        Math.hypot(velocityPanX, velocityPanY, velocityPanZ) >
+          INERTIA_MIN_VELOCITY ||
+        vec3.length(freeflyVelocity) > 0 ||
+        radius !== targetRadius ||
+        presentedCameraSettlement.isPending()
+      );
+    },
+
+    /**
+     * Build the spatial index of every presented large pane in a worker
+     * (`prepareSpatialQueryIndices`).
+     */
+    prepareCellPicking() {
+      return prepareSpatialQueryIndices();
     },
 
     // Scalar convenience API for callers that need only the cell ID.
@@ -8010,17 +7718,30 @@ export function createViewer({
       highlightTools.cancelAnnotationSelection();
     },
 
-    setHighlightMode(mode) {
-      highlightTools.setHighlightMode(mode);
+    /**
+     * Where the annotation tool reads each pane's field kind from:
+     * `source(viewId)` returns 'none', 'continuous' or 'categorical' for the
+     * field that pane is colored by. See `HighlightTools.setViewFieldKindSource`.
+     */
+    setViewFieldKindSource(source) {
+      highlightTools.setViewFieldKindSource(source);
     },
 
-    getHighlightMode() {
-      return highlightTools.getHighlightMode();
+    // Select mode: the on-screen stand-in for a held Alt key, so a finger (or
+    // a plain click) runs the active highlight tool. See rendering/select-mode.js.
+    setSelectMode(selectMode) {
+      highlightTools.setSelectMode(selectMode);
+    },
+
+    getSelectMode() {
+      return highlightTools.getSelectMode();
     },
 
     // Lasso selection API
     setLassoEnabled(enabled) {
       highlightTools.setLassoEnabled(enabled);
+      // An armed tool's first press finds its index built off the main thread.
+      if (enabled) void prepareSpatialQueryIndices();
     },
 
     getLassoEnabled() {
@@ -8064,6 +7785,7 @@ export function createViewer({
     // Proximity drag selection API
     setProximityEnabled(enabled) {
       highlightTools.setProximityEnabled(enabled);
+      if (enabled === true) void prepareSpatialQueryIndices();
     },
 
     getProximityEnabled() {
@@ -8102,6 +7824,7 @@ export function createViewer({
     // KNN drag selection API
     setKnnEnabled(enabled) {
       highlightTools.setKnnEnabled(enabled);
+      if (enabled === true) void prepareSpatialQueryIndices();
     },
 
     getKnnEnabled() {
@@ -8128,9 +7851,9 @@ export function createViewer({
       return highlightTools.getKnnState();
     },
 
-    // Load KNN edges from edge arrays and build adjacency list
+    // Load KNN edges over the published cells and build their adjacency.
     loadKnnEdges(sources, destinations) {
-      return highlightTools.loadKnnEdges(sources, destinations);
+      return highlightTools.loadKnnEdges(sources, destinations, pointCount);
     },
 
     clearKnnEdges() {
@@ -8196,7 +7919,7 @@ export function createViewer({
       );
       return;
     }
-    assertNoWebGLError(gl, 'Viewer centroid publication');
+    requireCleanWebGLState(gl, 'Viewer centroid publication');
     let candidatePositions = null;
     let candidateColors = null;
     try {
@@ -8212,7 +7935,7 @@ export function createViewer({
       gl.bindBuffer(gl.ARRAY_BUFFER, candidateColors);
       gl.bufferData(gl.ARRAY_BUFFER, colors, gl.STATIC_DRAW);
       gl.bindBuffer(gl.ARRAY_BUFFER, null);
-      assertNoWebGLError(gl, 'Viewer candidate centroid publication');
+      requireCleanWebGLState(gl, 'Viewer candidate centroid publication');
     } catch (error) {
       const rollbackFailures = [];
       for (const operation of [
@@ -8410,6 +8133,13 @@ export function createViewer({
 
     getCentroidFlags(viewId) { return getViewFlags(viewId); },
     setBackground,
+    /** Diagnostics of the backdrop looks: bakes, slices, GPU bytes. */
+    getBackdropLookDiagnostics: () => backdropLooks.getDiagnostics(),
+    /**
+     * Star twinkle and mote drift: off by default; when on, at most 30 Hz, and
+     * never while the tab is hidden or the user prefers reduced motion.
+     */
+    setBackdropAmbientMotion: (enabled) => backdropLooks.setAmbientMotion(enabled),
     setViewportLeftOcclusionRatio(value) {
       const exactRatio = assertFiniteNumberInRange(
         value,
@@ -8419,8 +8149,6 @@ export function createViewer({
       );
       if (exactRatio === viewportLeftOcclusionRatio) return;
       viewportLeftOcclusionRatio = exactRatio;
-      cachedGridProjections.clear();
-      cachedGridProjectionAspect = null;
       publishPresentedViewStateChange(
         'viewport',
         focusedViewId
@@ -8448,6 +8176,12 @@ export function createViewer({
         'Smoke render failure handler'
       );
     },
+    setSmokeSourceChangeHandler(fn) {
+      smokeSourceChangeHandler = assertExactFunction(
+        fn,
+        'Smoke source change handler'
+      );
+    },
     setVelocityRenderFailureHandler(fn) {
       velocityRenderFailureHandler = assertExactFunction(
         fn,
@@ -8457,20 +8191,11 @@ export function createViewer({
     setNavigationMode(mode) {
       const exactMode = assertNavigationMode(mode);
       const previousMode = navigationMode;
-      if (camerasLocked) {
-        settleSharedNavigationOwnership(focusedViewId, exactMode);
-      } else {
-        settleViewNavigationOwnership(focusedViewId, exactMode);
+      // The focused view's mode, shared by the views linked to its camera.
+      for (const viewId of cameraFollowers) {
+        if (viewExists(viewId)) settleViewNavigationOwnership(viewId, exactMode);
       }
-      applyNavigationModeWithSync(exactMode);
-      if (camerasLocked) {
-        applyViewNavigationMode(LIVE_VIEW_ID, exactMode);
-        for (const snapshot of snapshotViews) {
-          applyViewNavigationMode(snapshot.id, exactMode);
-        }
-      } else {
-        applyViewNavigationMode(focusedViewId, exactMode);
-      }
+      applyViewNavigationMode(focusedViewId, exactMode);
       if (navigationMode !== previousMode) {
         navigationModeChangeHandler?.(focusedViewId, navigationMode);
       }
@@ -8642,6 +8367,11 @@ export function createViewer({
       return !!(hpRenderer && hpRenderer.hasSpatialIndex(dimLevel));
     },
 
+    /** World positions of the projectiles in flight, as [x, y, z] copies. */
+    getProjectilePositions() {
+      return projectileSystem.getProjectilePositions();
+    },
+
     // Orbit anchor visibility control
     setShowOrbitAnchor(show) {
       orbitAnchorRenderer.setShowAnchor(
@@ -8651,21 +8381,19 @@ export function createViewer({
     getShowOrbitAnchor() { return orbitAnchorRenderer.getShowAnchor(); },
 
     // Smoke renderer API (delegates to SmokeRenderer)
-    setSmokeVolume(volumeDesc) { smokeRenderer.setVolume(volumeDesc); },
     clearSmokeVolume() { smokeRenderer.clearVolume(); },
     buildSmokeVolumeGPU(positions, options = {}) { return smokeRenderer.buildVolumeGPU(positions, options); },
     hasSmokeVolume() { return smokeRenderer.hasVolume(); },
+    getSmokeSupport() { return smokeRenderer.getSupport(); },
     setSmokeParams(params) { smokeRenderer.setParams(params); },
     setCloudResolutionScale(scale) { smokeRenderer.setResolutionScale(scale); },
     getCloudResolutionScale() { return smokeRenderer.getResolutionScale(); },
     setNoiseTextureResolution(size) { smokeRenderer.setNoiseTextureResolution(size); },
     getNoiseTextureResolution() { return smokeRenderer.getNoiseTextureResolution(); },
-    getAdaptiveScaleFactor() { return smokeRenderer.getAdaptiveScaleFactor(); },
     hasPendingSmokeNoiseGeneration() {
       return smokeRenderer.hasPendingNoiseGeneration();
     },
     hasSmokeNoiseTextures() { return smokeRenderer.hasNoiseTextures(); },
-	    setSmokeQualityPreset(preset) { smokeRenderer.setQualityPreset(preset); },
 
     setShowConnectivity(show) {
       showConnectivity = assertExactBoolean(show, 'Connectivity visibility');
@@ -8699,463 +8427,132 @@ export function createViewer({
     },
     // Returns byte values (0-255)
     getConnectivityColor() { return [connectivityColorBytes[0], connectivityColorBytes[1], connectivityColorBytes[2]]; },
-    hasConnectivityData() { return hasEdgeDataV2; },
-    getEdgeCount() { return nEdgesV2; },
+    hasConnectivityData() { return edgeLayer.hasGraph(); },
+    getEdgeCount() { return edgeLayer.getEdgeCount(); },
 
     // ========================================================================
-    // V2 GPU-INSTANCED EDGE API
+    // CONNECTIVITY EDGES (connectivity-edge-layer.js)
     // ========================================================================
 
     /**
-     * Set up V2 instanced edge rendering with edge data
-     * @param {Object} edgeData - Exact weighted edge payload
-     * @param {Float32Array} positions - Cell positions (flat xyz array)
+     * Publish one connectivity graph and show it in the live pane. Endpoints
+     * are kept as loaded (no copy, no shuffle); the Float64 weights are read
+     * once into Float32 relative strengths. Nothing is shown until the edge
+     * target is set (`setEdgeVisibleTarget`).
+     * @param {{sources: Uint32Array, destinations: Uint32Array, weights: Float64Array, nEdges: number, nCells: number}} edgeData
      */
-    setupEdgesV2(edgeData, positions = null) {
-      const {
-        sources,
-        destinations,
-        weights,
-        nEdges,
-        nCells,
-      } = edgeData;
-
+    setupEdgesV2(edgeData) {
       if (
-        !(sources instanceof Uint32Array) ||
-        !(destinations instanceof Uint32Array) ||
-        !(weights instanceof Float64Array) ||
-        !Number.isSafeInteger(nEdges) ||
-        nEdges < 0 ||
-        !Number.isSafeInteger(nCells) ||
-        nCells <= 0 ||
-        sources.length !== nEdges ||
-        destinations.length !== nEdges ||
-        weights.length !== nEdges ||
-        (
-          positions !== null &&
-          (
-            !(positions instanceof Float32Array) ||
-            positions.length !== nCells * 3
-          )
-        )
+        edgeData === null ||
+        typeof edgeData !== 'object' ||
+        edgeData.nCells !== pointCount
       ) {
         throw new TypeError(
-          'V2 edge setup requires exact edge summaries, matching ' +
-          'Uint32 endpoints and Float64 weights, and a renderer-published ' +
-          'Float32 XYZ geometry generation.'
+          'Connectivity edges must cover exactly the published cells.'
         );
       }
-
-      const renderWeights =
-        createConnectivityRenderWeights(weights).values;
-      clearEdgeResourcesV2();
-      try {
-        createEdgeTexturesV2(
-          sources,
-          destinations,
-          renderWeights,
-          nEdges,
-          nCells
-        );
-
-        if (
-          !createPositionTextureV2ForView(
-            LIVE_VIEW_ID,
-            positions,
-            nCells
-          ) ||
-          !updateVisibilityTextureV2ForView(
-            LIVE_VIEW_ID,
-            nCells,
-            () => 255
-          )
-        ) {
-          clearEdgeResourcesV2();
-          return false;
-        }
-
-        edgeSourcesV2 = sources;
-        edgeDestinationsV2 = destinations;
-        edgeVisibleTarget = nEdges;
-        const initialPrefixBuild =
-          buildAllVisibleConnectivityEdgePrefixOwner(
-            nEdges,
-            edgePrefixCheckpointStaging
-          );
-        const liveVisibilityEntry =
-          edgeVisibilityTexturesV2.get(LIVE_VIEW_ID);
-        if (
-          !initialPrefixBuild?.owner ||
-          initialPrefixBuild.owner.visibleCount !== nEdges ||
-          !liveVisibilityEntry ||
-          !Number.isSafeInteger(liveVisibilityEntry.revision) ||
-          liveVisibilityEntry.revision <= 0
-        ) {
-          throw new Error(
-            'Connectivity setup did not produce an exact initial prefix generation.'
-          );
-        }
-        edgeAllVisiblePrefixOwner = initialPrefixBuild.owner;
-        edgePrefixOwnersV2.set(
-          LIVE_VIEW_ID,
-          Object.freeze({
-            prefixOwner: edgeAllVisiblePrefixOwner,
-            provisional: true,
-            rawPrefix: nEdges,
-            visibilityRevision: liveVisibilityEntry.revision,
-          })
-        );
-        edgePrefixCheckpointStaging =
-          initialPrefixBuild.reusableCheckpoints ?? null;
-      } catch (error) {
-        clearEdgeResourcesV2();
-        throw error;
-      }
-
-      hasEdgeDataV2 = true;
+      edgeLayer.setGraph(edgeData);
+      edgeLayer.addView(LIVE_VIEW_ID);
       useInstancedEdges = true;
-      console.log(`[Viewer] V2 instanced edges enabled: ${nEdges} edges, ${nCells} cells`);
       return true;
     },
 
     /**
-     * Update visibility texture for V2 edges (live view).
-     * @param {Float32Array} visibility - Per-cell visibility (0-1)
-     */
-    updateEdgeVisibilityV2(visibility) {
-      if (
-        !hasEdgeDataV2 ||
-        !useInstancedEdges ||
-        !edgePositionTexturesV2.has(LIVE_VIEW_ID)
-      ) {
-        return false;
-      }
-      return updateVisibilityTextureV2ForView(
-        LIVE_VIEW_ID,
-        visibility
-      );
-    },
-
-    /**
-     * Publish live connectivity visibility directly from the renderer's
-     * shared LOD membership owner plus the existing transparency generation.
-     * No point-count-sized combined CPU mask is materialized.
+     * Publish the live pane's edge visibility from its transparency and LOD
+     * admission (no combined per-cell mask is built).
      */
     updateEdgeVisibilityV2FromLod(transparency, lodMembership) {
-      if (
-        !hasEdgeDataV2 ||
-        !useInstancedEdges ||
-        !edgePositionTexturesV2.has(LIVE_VIEW_ID)
-      ) {
-        return false;
-      }
-      const visibilityOwner = createLodFilteredVisibilityOwner(
-        transparency,
-        lodMembership
-      );
-      return updateVisibilityTextureV2ForView(
+      if (!edgeLayer.hasView(LIVE_VIEW_ID)) return false;
+      return edgeLayer.publishVisibility(
         LIVE_VIEW_ID,
-        transparency.length,
-        visibilityOwner
+        createLodFilteredVisibilityOwner(transparency, lodMembership)
       );
     },
 
-    refreshEdgePrefixForView(viewId) {
-      return refreshEdgePrefixForView(viewId);
-    },
-
-    setEdgeVisibleTarget(target) {
-      return setEdgeVisibleTarget(target);
-    },
-
-    getEdgePrefixStatsForView(viewId) {
+    /** Publish one kept pane's edge visibility. */
+    updateEdgeVisibilityV2ForViewFromLod(viewId, transparency, lodMembership) {
       const vid = assertViewId(viewId);
-      return describeEdgePrefixOwner(vid);
+      if (!edgeLayer.hasView(vid)) return false;
+      return edgeLayer.publishVisibility(
+        vid,
+        createLodFilteredVisibilityOwner(transparency, lodMembership)
+      );
     },
 
     /**
-     * Compatibility wrapper for callers that explicitly control the focused
-     * pane's raw shuffled prefix. Product UI uses setEdgeVisibleTarget() so
-     * each pane resolves its own prefix from the shared visible-edge target.
-     * Zero now means exactly zero instances.
+     * Re-select a pane's shown edges if its visibility or the target moved,
+     * and start counting its visible edges. Returns its statistics
+     * (`visibleCount` is null until the count lands; see
+     * `onConnectivityVisibleCount`).
      */
-    setEdgeLodLimit(limit) {
-      const exactLimit = assertIntegerInRange(
-        limit,
-        0,
-        nEdgesV2,
-        'Connectivity edge LOD limit'
-      );
-      if (nEdgesV2 === 0 && exactLimit === 0) return;
-      const viewId = edgePrefixOwnersV2.has(focusedViewId)
-        ? focusedViewId
-        : LIVE_VIEW_ID;
-      const current = getCurrentEdgePrefixOwner(viewId);
-      if (current === null) {
-        throw new Error(
-          `Connectivity raw-prefix override requires a current owner for view "${viewId}".`
-        );
+    refreshEdgeSelectionForView(viewId) {
+      return edgeLayer.refresh(assertViewId(viewId));
+    },
+
+    /** Show the first `target` visible edges in every pane. */
+    setEdgeVisibleTarget(target) {
+      return edgeLayer.setVisibleTarget(target);
+    },
+
+    getEdgeSelectionStatsForView(viewId) {
+      return edgeLayer.getStats(assertViewId(viewId));
+    },
+
+    /**
+     * Subscribe to visible-edge counts as they land, pane by pane.
+     * @param {(viewId: string, stats: object) => void} listener
+     * @returns {() => void} Unsubscribe.
+     */
+    onConnectivityVisibleCount(listener) {
+      if (typeof listener !== 'function') {
+        throw new TypeError('Connectivity count listener must be a function.');
       }
-      edgePrefixOwnersV2.set(
-        viewId,
-        Object.freeze({
-          prefixOwner: current.prefixOwner,
-          provisional: current.provisional === true,
-          rawPrefix: exactLimit,
-          visibilityRevision: current.visibilityRevision,
-        })
-      );
+      edgeVisibleCountListeners.add(listener);
+      return () => edgeVisibleCountListeners.delete(listener);
     },
 
-    /**
-     * Get the focused pane's current raw edge prefix.
-     */
-    getEdgeLodLimit() {
-      const viewId = edgePrefixOwnersV2.has(focusedViewId)
-        ? focusedViewId
-        : LIVE_VIEW_ID;
-      return getCurrentEdgePrefixOwner(viewId)?.rawPrefix ?? 0;
-    },
-
-    /**
-     * Check if V2 instanced edges are enabled
-     */
     isUsingInstancedEdges() {
       return useInstancedEdges;
     },
 
-    /**
-     * Get V2 edge count
-     */
-    getEdgeCountV2() {
-      return nEdgesV2;
-    },
-
-    /**
-     * Disable V2 instanced edges
-     */
-    disableEdgesV2() {
+    clearEdgesV2() {
+      edgeLayer.clear();
       useInstancedEdges = false;
     },
 
-    clearEdgesV2() {
-      clearEdgeResourcesV2();
+    /** Show the published graph in one more pane (a kept view). */
+    setupEdgesV2ForView(viewId) {
+      const vid = assertViewId(viewId);
+      if (!edgeLayer.hasGraph() || !useInstancedEdges) return false;
+      return edgeLayer.addView(vid);
     },
 
-    /**
-     * Enable V2 instanced edges (if set up)
-     */
-    enableEdgesV2() {
-      if (
-        !hasEdgeDataV2 ||
-        edgeTextureV2 === null ||
-        edgeWeightTextureV2 === null ||
-        !edgePositionTexturesV2.has(LIVE_VIEW_ID) ||
-        !edgeVisibilityTexturesV2.has(LIVE_VIEW_ID)
-      ) {
-        return false;
-      }
-      useInstancedEdges = true;
-      return true;
+    hasConnectivityView(viewId) {
+      return edgeLayer.hasView(assertViewId(viewId));
     },
 
-    // ========================================================================
-    // PER-VIEW EDGE API (Multi-view / Multi-dimension support)
-    // ========================================================================
-
-    /**
-     * Set up edge position texture for a specific view.
-     * Call this when a view has different positions than the global (e.g., XY vs XZ embedding).
-     * The edge topology texture is shared across all views.
-     * @param {string} viewId - View identifier
-     * @param {Float32Array} positions - Cell positions (flat xyz array, nCells * 3)
-     * @param {number} nCells - Number of cells
-     */
-    setupEdgesV2ForView(
-      viewId,
-      positions = null,
-      nCells = null
-    ) {
-      if (!hasEdgeDataV2 || !useInstancedEdges) {
-        console.warn('[Viewer] Cannot setup per-view edges: V2 edges not initialized');
-        return false;
-      }
-      if (
-        typeof viewId !== 'string' ||
-        viewId.length === 0 ||
-        (
-          nCells !== null &&
-          (
-            !Number.isSafeInteger(nCells) ||
-            nCells <= 0 ||
-            nCells !== nCellsV2
-          )
-        ) ||
-        (
-          positions !== null &&
-          (
-            !(positions instanceof Float32Array) ||
-            positions.length !== nCellsV2 * 3
-          )
-        )
-      ) {
-        throw new TypeError(
-          'Per-view edge setup requires a non-empty view id and, when ' +
-          'provided, the exact published cell count and Float32 XYZ shape.'
-        );
-      }
-      if (!createPositionTextureV2ForView(viewId, positions, nCells)) {
-        return false;
-      }
-      if (
-        !updateVisibilityTextureV2ForView(
-          viewId,
-          nCellsV2,
-          () => 255
-        )
-      ) {
-        deleteEdgeTexturesForView(viewId);
-        return false;
-      }
-      const visibilityEntry =
-        edgeVisibilityTexturesV2.get(viewId);
-      if (
-        edgeAllVisiblePrefixOwner === null ||
-        !visibilityEntry ||
-        !Number.isSafeInteger(visibilityEntry.revision) ||
-        visibilityEntry.revision <= 0
-      ) {
-        deleteEdgeTexturesForView(viewId);
-        throw new Error(
-          `Per-view connectivity setup for "${viewId}" has no exact full prefix generation.`
-        );
-      }
-      retireEdgePrefixOwner(viewId);
-      edgePrefixOwnersV2.set(
-        viewId,
-        Object.freeze({
-          prefixOwner: edgeAllVisiblePrefixOwner,
-          provisional: true,
-          rawPrefix: nEdgesV2,
-          visibilityRevision: visibilityEntry.revision,
-        })
-      );
-      return true;
+    deleteConnectivityView(viewId) {
+      return edgeLayer.deleteView(assertViewId(viewId));
     },
 
-    /**
-     * Update edge visibility texture for a specific view.
-     * @param {string} viewId - View identifier
-     * @param {Float32Array} visibility - Per-cell visibility (0-1)
-     */
-    updateEdgeVisibilityV2ForView(viewId, visibility) {
-      if (!hasEdgeDataV2 || !useInstancedEdges) {
-        return false;
-      }
-      if (typeof viewId !== 'string' || viewId.length === 0) {
-        return false;
-      }
-      const vid = viewId;
-      if (!edgePositionTexturesV2.has(vid)) {
-        return false;
-      }
-      return updateVisibilityTextureV2ForView(viewId, visibility);
-    },
-
-    /**
-     * Publish one snapshot's connectivity visibility without allocating a
-     * dense combined LOD/filter mask.
-     */
-    updateEdgeVisibilityV2ForViewFromLod(
-      viewId,
-      transparency,
-      lodMembership
-    ) {
-      if (!hasEdgeDataV2 || !useInstancedEdges) {
-        return false;
-      }
-      if (
-        typeof viewId !== 'string' ||
-        viewId.length === 0 ||
-        !edgePositionTexturesV2.has(viewId)
-      ) {
-        return false;
-      }
-      const visibilityOwner = createLodFilteredVisibilityOwner(
-        transparency,
-        lodMembership
-      );
-      return updateVisibilityTextureV2ForView(
-        viewId,
-        transparency.length,
-        visibilityOwner
-      );
-    },
-
-    /**
-     * Check if a view has per-view edge textures set up.
-     * @param {string} viewId - View identifier
-     * @returns {boolean}
-     */
-    hasEdgeTexturesForView(viewId) {
-      return hasEdgeTexturesForView(viewId);
-    },
-
-    /**
-     * Delete edge textures for a specific view (cleanup on snapshot removal).
-     * @param {string} viewId - View identifier
-     * @returns {boolean} Whether an exact view identifier was accepted
-     */
-    deleteEdgeTexturesForView(viewId) {
-      return deleteEdgeTexturesForView(viewId);
-    },
-
-    /**
-     * Get the number of cells for edge rendering (for visibility array sizing).
-     * @returns {number}
-     */
-    getEdgeCellCount() {
-      // Return from first per-view entry (live view is always set up first)
-      for (const entry of edgePositionTexturesV2.values()) {
-        return entry.nCells;
-      }
-      return 0;
-    },
-
-    getEdgeTextureStatsV2() {
-      return getEdgeTextureStatsV2();
-    },
-
-    /**
-     * Enable/disable edge debug mode for troubleshooting.
-     * @param {boolean} enabled - Whether to enable debug logging
-     */
-    setEdgeDebugMode(enabled) {
-      edgeDebugMode = assertExactBoolean(enabled, 'Edge debug mode');
-      edgeDebugFrameCount = 0;  // Reset frame counter
-      if (enabled) {
-        console.log('[Viewer] Edge debug mode enabled. Debug output will be logged for next 5 frames.');
-        console.log('[Viewer] Edge texture state:', {
-          edgeTextureV2: !!edgeTextureV2,
-          edgeWeightTextureV2: !!edgeWeightTextureV2,
-          nEdgesV2,
-          nCellsV2,
-          useInstancedEdges,
-          positionTextures: Array.from(edgePositionTexturesV2.keys()),
-          visibilityTextures: Array.from(edgeVisibilityTexturesV2.keys())
-        });
-      }
+    /** GPU and CPU bytes the connectivity layer holds, by pane. */
+    getConnectivityMemoryStats() {
+      return edgeLayer.describeMemory();
     },
 
     resetCamera() {
       velocityTheta = velocityPhi = velocityPanX = velocityPanY = velocityPanZ = 0;
-      radius = targetRadius = 3.0;
-      theta = phi = Math.PI / 4;
-      vec3.set(target, 0, 0, 0);
-      vec3.set(freeflyPosition, 0, 0, 3.0);
+      // One pose for both modes: free-fly sits where the orbit camera sits,
+      // looking at the same target, so R frames the data in either mode.
+      const pose = createDefaultCameraPose();
+      radius = targetRadius = pose.orbit.radius;
+      theta = pose.orbit.theta;
+      phi = pose.orbit.phi;
+      vec3.set(target, ...pose.orbit.target);
+      vec3.set(freeflyPosition, ...pose.freefly.position);
       vec3.set(freeflyVelocity, 0, 0, 0);
-      freeflyYaw = Math.PI / 4;
-      freeflyPitch = 0;
+      freeflyYaw = pose.freefly.yaw;
+      freeflyPitch = pose.freefly.pitch;
       const resetWasPointerLocked = document.pointerLockElement === canvas;
       clearPointerLockIntent(null);
       projectileSystem.reset();
@@ -9219,62 +8616,80 @@ export function createViewer({
       vec3.set(freeflyVelocity, 0, 0, 0);
     },
 
-    // Camera lock API for independent view navigation
+    /**
+     * Link cameras: views that show the same representation share one camera
+     * and navigation mode; views of different representations always keep
+     * their own. Linking gives every such group one camera (see
+     * `unifyLinkedCameras`); unlinking leaves every view with what it shows.
+     */
     setCamerasLocked(locked) {
       if (typeof locked !== 'boolean') {
         throw new TypeError('Camera lock state must be an exact boolean.');
       }
-      const wasLocked = camerasLocked;
+      if (locked === camerasLocked) return;
+      persistFocusedCamera();
       camerasLocked = locked;
+      unifyLinkedCameras();
+      refreshCameraFollowers();
+      publishPresentedViewStateChange(
+        'camera-lock',
+        focusedViewId
+      );
+    },
 
-      if (wasLocked && !camerasLocked) {
-        // Transitioning to unlocked: initialize all view cameras from current state
-        const currentCam = getCurrentCameraStateInternal();
-        if (!liveCameraState) {
-          liveCameraState = JSON.parse(JSON.stringify(currentCam));
-        } else {
-          // Update existing camera state with current navigation mode and camera position
-          liveCameraState.navigationMode = currentCam.navigationMode;
-          liveCameraState.orbit = JSON.parse(JSON.stringify(currentCam.orbit));
-          liveCameraState.freefly = JSON.parse(JSON.stringify(currentCam.freefly));
-        }
-        for (const snap of snapshotViews) {
-          if (!snap.cameraState) {
-            snap.cameraState = JSON.parse(JSON.stringify(currentCam));
-          } else {
-            // Update existing camera state with current navigation mode and camera position
-            snap.cameraState.navigationMode = currentCam.navigationMode;
-            snap.cameraState.orbit = JSON.parse(JSON.stringify(currentCam.orbit));
-            snap.cameraState.freefly = JSON.parse(JSON.stringify(currentCam.freefly));
-          }
-        }
-        // Pre-compute cached view matrices for all views (avoids per-frame recalculation)
-        updateCachedViewMatrix(LIVE_VIEW_ID, liveCameraState);
-        for (const snap of snapshotViews) {
-          updateCachedViewMatrix(snap.id, snap.cameraState);
-        }
-      } else if (!wasLocked && camerasLocked) {
-        // Transitioning to locked: adopt active view's camera as global
-        const activeCam = getViewCameraState(focusedViewId);
-        if (activeCam) {
-          navigationModeOwnership.promoteViewUserChoice(
-            focusedViewId,
-            activeCam.navigationMode
-          );
-          applyCameraStateTemporarily(activeCam);
-        }
-        // Clear cached matrices (not needed in locked mode)
-        invalidateAllCachedMatrices();
+    /**
+     * The views whose cameras are linked: one array of view ids per group of
+     * two or more views that show the same representation, while cameras are
+     * linked; empty otherwise.
+     * @returns {string[][]}
+     */
+    getCameraLinkGroups() {
+      if (!camerasLocked) return [];
+      const groups = new Map();
+      for (const viewId of [LIVE_VIEW_ID, ...snapshotViews.map(snapshot => snapshot.id)]) {
+        if (viewId === LIVE_VIEW_ID && liveViewHidden) continue;
+        const layoutKey = viewLayoutKeys.get(viewId) ?? null;
+        if (layoutKey === null) continue;
+        if (!groups.has(layoutKey)) groups.set(layoutKey, []);
+        groups.get(layoutKey).push(viewId);
       }
-      if (wasLocked !== camerasLocked) {
-        publishPresentedViewStateChange(
-          'camera-lock',
-          focusedViewId
-        );
-      }
+      return [...groups.values()].filter(group => group.length > 1);
     },
 
     getCamerasLocked() { return camerasLocked; },
+
+    /**
+     * Set what each pane's title chip says before the view's field, or clear
+     * it with null: the view controls publish "2 · PCA 2D" for every view
+     * while several are open.
+     * @param {Map<string, string|null>|Object<string, string|null>} prefixes
+     */
+    setViewTitlePrefixes(prefixes) {
+      viewTitlePrefixes.clear();
+      for (const [viewId, prefix] of prefixes instanceof Map ? prefixes : Object.entries(prefixes)) {
+        if (prefix === null) continue;
+        if (typeof prefix !== 'string' || prefix.length === 0) {
+          throw new TypeError('A view title prefix must be a non-empty string or null.');
+        }
+        viewTitlePrefixes.set(String(viewId), prefix);
+      }
+      publishPresentedViewStateChange('titles', focusedViewId);
+    },
+
+    /**
+     * Drop the GPU geometry kept for one representation's positions (their
+     * CPU copy was evicted), or for every representation no view shows.
+     */
+    releaseRepresentationGeometry(positions) {
+      return hpRenderer.releaseRetainedGeometryFor(positions);
+    },
+    releaseRetainedGeometry() {
+      return hpRenderer.evictRetainedGeometry(Infinity);
+    },
+    /** Bytes of GPU geometry kept for representations no view shows. */
+    getRetainedGeometryBytes() {
+      return hpRenderer.getRetainedGeometryBytes();
+    },
     getFocusedViewId() { return focusedViewId; },
 
     getViewCameraState(viewId) {
@@ -9290,7 +8705,7 @@ export function createViewer({
       settleViewNavigationOwnership(exactViewId, exactMode);
       const ownedState =
         setViewCameraState(exactViewId, exactState);
-      if (camerasLocked || exactViewId === focusedViewId) {
+      if (cameraFollowers.has(exactViewId)) {
         const previousMode = navigationMode;
         // This explicit external/session publication supersedes active
         // interaction inertia. Internal focus/mouse persistence continues to
@@ -9312,7 +8727,8 @@ export function createViewer({
       );
     },
 
-    // Per-view navigation mode (only relevant when cameras are unlocked)
+    // Per-view navigation mode: each view's own, shared only by views linked
+    // to one camera.
     getViewNavigationMode(viewId) { return getViewNavigationMode(viewId); },
     setViewNavigationMode(viewId, mode) {
       const exactViewId = assertKnownViewId(viewId);
@@ -9339,7 +8755,12 @@ export function createViewer({
       );
     },
     setLiveViewLabel(label) {
-      liveViewLabel = assertNonEmptyTrimmedString(label, 'Live view label');
+      const nextLabel = assertNonEmptyTrimmedString(label, 'Live view label');
+      // The label is drawn as the pane's title chip; an unchanged one changes
+      // nothing on screen (see SELF_INVALIDATING_VIEWER_METHODS).
+      if (nextLabel === liveViewLabel) return;
+      liveViewLabel = nextLabel;
+      invalidateFrame();
     },
     getLiveViewLabel() { return liveViewLabel; },
 
@@ -9350,9 +8771,6 @@ export function createViewer({
           'Snapshot creation is unavailable in smoke render mode.'
         );
       }
-      if (snapshotViews.length >= MAX_SNAPSHOTS) {
-        throw new RangeError(`Viewer supports a maximum of ${MAX_SNAPSHOTS} snapshots.`);
-      }
       if (
         config === null ||
         typeof config !== 'object' ||
@@ -9362,11 +8780,17 @@ export function createViewer({
         throw new TypeError('Snapshot configuration must be one exact plain object.');
       }
       const sourceViewId = assertKnownViewId(config.sourceViewId);
-      const sourcePositions = getExactViewPositions(sourceViewId);
+      const sourceRecord = getExactViewPositionRecord(sourceViewId);
+      const sourcePositions = sourceRecord.positions;
       const exactConfig = assertSnapshotConfig(
         config,
-        sourcePositions.length / 3
+        sourcePositions.length / sourceRecord.dimension
       );
+      if (exactConfig.dimensionLevel !== sourceRecord.dimension) {
+        throw new RangeError(
+          `Snapshot dimensionLevel ${exactConfig.dimensionLevel} does not match the ${sourceRecord.dimension}D positions of source view "${sourceViewId}".`
+        );
+      }
       const inheritedMode = exactConfig.cameraState.navigationMode;
       const initialDimLevel = exactConfig.dimensionLevel;
       const id = `snap_${nextSnapshotId}`;
@@ -9387,7 +8811,7 @@ export function createViewer({
 
       let snapshotBufferAttempted = false;
       let centroidBufferAttempted = false;
-      let edgeTexturesAttempted = false;
+      let edgeViewAttempted = false;
       let snapshotPositions = null;
       try {
         // Stage every fallible renderer resource before publishing inventory or
@@ -9412,35 +8836,17 @@ export function createViewer({
           );
         }
 
-        if (useInstancedEdges && nEdgesV2 > 0) {
-          edgeTexturesAttempted = true;
-          const nCells = snapshotPositions.length / 3;
-          if (!createPositionTextureV2ForView(id)) {
-            throw new Error(`Snapshot edge positions were not published for view "${id}".`);
-          }
-          if (
-            !updateVisibilityTextureV2ForView(
-              id,
-              nCells,
-              index => (
-                snapshot.transparency[index] >=
-                  POINT_VISIBILITY_THRESHOLD ? 255 : 0
-              )
-            )
-          ) {
-            throw new Error(`Snapshot edge visibility was not published for view "${id}".`);
-          }
-          const edgePrefix = refreshEdgePrefixForView(id);
-          if (edgePrefix === null || edgePrefix.current !== true) {
-            throw new Error(
-              `Snapshot edge prefix was not published for view "${id}".`
-            );
-          }
+        if (useInstancedEdges && edgeLayer.hasGraph()) {
+          edgeViewAttempted = true;
+          edgeLayer.addView(id);
+          edgeLayer.publishVisibility(
+            id,
+            createLodFilteredVisibilityOwner(snapshot.transparency, null)
+          );
+          edgeLayer.refresh(id);
         }
 
-        if (!camerasLocked) {
-          updateCachedViewMatrix(id, exactConfig.cameraState);
-        }
+        updateCachedViewMatrix(id, exactConfig.cameraState);
       } catch (error) {
         const rollbackFailures = [];
         const rollback = operation => {
@@ -9457,8 +8863,8 @@ export function createViewer({
         if (centroidBufferAttempted) {
           rollback(() => deleteCentroidSnapshotBuffer(id));
         }
-        if (edgeTexturesAttempted) {
-          rollback(() => deleteEdgeTexturesForView(id));
+        if (edgeViewAttempted) {
+          rollback(() => edgeLayer.deleteView(id));
         }
         cachedViewMatrices.delete(id);
         if (rollbackFailures.length > 0) {
@@ -9474,8 +8880,12 @@ export function createViewer({
       snapshotViewsById.set(id, snapshot);
       certifiedCameraStateOwners.add(snapshot.cameraState);
       viewDimensionLevels.set(id, initialDimLevel);
-      viewPositionsCache.set(id, snapshotPositions);
+      viewLayoutKeys.set(id, viewLayoutKeys.get(sourceViewId) ?? null);
+      publishViewPositions(id, snapshotPositions, initialDimLevel);
+      // A kept view navigates as its source does, in every dimension.
+      navigationModeOwnership.copyView(sourceViewId, id);
       settleViewNavigationOwnership(id, inheritedMode);
+      refreshCameraFollowers();
       publishViewDataGeneration(id);
       nextSnapshotId += 1;
       return { id, label: snapshot.label };
@@ -9514,7 +8924,9 @@ export function createViewer({
         );
       }
       const snap = snapshotViewsById.get(exactId);
-      const pointCountForSnapshot = getExactViewPositions(exactId).length / 3;
+      const pointCountForSnapshot =
+        getExactViewPositions(exactId).length /
+        getExactViewPositionDimension(exactId);
       const colorsChanged = Object.hasOwn(attrs, 'colors');
       const transparencyChanged = Object.hasOwn(attrs, 'transparency');
       const centroidPositionsChanged = Object.hasOwn(
@@ -9543,19 +8955,24 @@ export function createViewer({
         );
       }
 
+      // Colors are adopted by reference, as at creation (see
+      // assertSnapshotConfig). Transparency is published from the caller's
+      // array and copied into the view's own owner (made at creation) only
+      // once the publication succeeded, so a failed one leaves the accepted
+      // generation intact without a new array per update.
       const nextColors = colorsChanged
-        ? new Uint8Array(assertExactUint8Array(
+        ? assertExactUint8Array(
             attrs.colors,
             pointCountForSnapshot * 4,
             'Snapshot colors'
-          ))
+          )
         : snap.colors;
       const nextTransparency = transparencyChanged
-        ? new Float32Array(assertTransparencyArray(
+        ? assertTransparencyArray(
             attrs.transparency,
             pointCountForSnapshot,
             'Snapshot transparency'
-          ))
+          )
         : snap.transparency;
       let nextCentroidPositions = snap.centroidPositions;
       let nextCentroidColors = snap.centroidColors;
@@ -9590,29 +9007,25 @@ export function createViewer({
         ? cloneSnapshotMeta(attrs.meta)
         : snap.meta;
 
-      let nextEdgeVisibility = null;
-      let previousEdgeVisibility = null;
-      if (
-        transparencyChanged &&
-        edgePositionTexturesV2.has(exactId)
-      ) {
-        const lodMembership = hpRenderer.getCurrentLodMembership(
-          exactId,
-          getPublishedDimensionLevel(exactId)
-        );
-        nextEdgeVisibility = createLodFilteredVisibilityOwner(
-          nextTransparency,
-          lodMembership
-        );
-        previousEdgeVisibility = createLodFilteredVisibilityOwner(
-          snap.transparency,
-          lodMembership
-        );
+      // A point or centroid buffer write changes the frame, and so can a
+      // failed one whose restoration is incomplete, so either invalidates
+      // before any GPU work. Of the descriptive attributes only the label is
+      // drawn (the pane's title chip); the field descriptor and the filter
+      // metadata are read back through getSnapshotViews(), never by a frame.
+      // A label push that repeats the current label leaves the frame alone
+      // (see SELF_INVALIDATING_VIEWER_METHODS).
+      if (colorsChanged || transparencyChanged || centroidPositionsChanged) {
+        invalidateFrame();
       }
+      const labelChanged = nextLabel !== snap.label;
 
       if (transparencyChanged) {
         highlightTools.retireSpatialInteractions(exactId);
       }
+      // Whether any alpha byte moved: an alpha-only publication reports it
+      // (the bytes it compared), so an unmoved one skips the highlight, edge
+      // and overlay work that follows visibility.
+      let visibilityMoved = transparencyChanged;
       if (colorsChanged || transparencyChanged) {
         const publishSnapshotPointAttributes = (colors, transparency) => {
           if (colorsChanged && transparencyChanged) {
@@ -9623,39 +9036,20 @@ export function createViewer({
               getExactViewPositions(exactId),
               getPublishedDimensionLevel(exactId)
             );
-          } else if (colorsChanged) {
-            hpRenderer.updateSnapshotColors(exactId, colors);
-          } else {
-            hpRenderer.updateSnapshotAlphas(exactId, transparency);
+            return true;
           }
+          if (colorsChanged) {
+            hpRenderer.updateSnapshotColors(exactId, colors);
+            return false;
+          }
+          return hpRenderer.updateSnapshotAlphas(exactId, transparency);
         };
         let rendererPublished = false;
-        let edgeVisibilityAttempted = false;
         try {
-          publishSnapshotPointAttributes(nextColors, nextTransparency);
+          const moved = publishSnapshotPointAttributes(nextColors, nextTransparency);
           rendererPublished = true;
-          if (nextEdgeVisibility !== null) {
-            edgeVisibilityAttempted = true;
-            if (
-              !updateVisibilityTextureV2ForView(
-                exactId,
-                pointCountForSnapshot,
-                nextEdgeVisibility
-              )
-            ) {
-              throw new Error(
-                `Snapshot edge visibility was not published for view "${exactId}".`
-              );
-            }
-            const edgePrefix =
-              refreshEdgePrefixForView(exactId);
-            if (edgePrefix === null || edgePrefix.current !== true) {
-              throw new Error(
-                `Snapshot edge prefix was not published for view "${exactId}".`
-              );
-            }
-          }
-          if (transparencyChanged) {
+          visibilityMoved = transparencyChanged && moved;
+          if (visibilityMoved) {
             highlightTools.handleTransparencyChange(exactId);
           }
         } catch (publicationError) {
@@ -9669,37 +9063,10 @@ export function createViewer({
             } catch (restorationError) {
               restorationFailures.push(restorationError);
             }
-            if (edgeVisibilityAttempted) {
-              try {
-                if (
-                  !updateVisibilityTextureV2ForView(
-                    exactId,
-                    pointCountForSnapshot,
-                    previousEdgeVisibility
-                  )
-                ) {
-                  throw new Error(
-                    `Snapshot edge visibility restoration failed for view "${exactId}".`
-                  );
-                }
-                const restoredEdgePrefix =
-                  refreshEdgePrefixForView(exactId);
-                if (
-                  restoredEdgePrefix === null ||
-                  restoredEdgePrefix.current !== true
-                ) {
-                  throw new Error(
-                    `Snapshot edge prefix restoration failed for view "${exactId}".`
-                  );
-                }
-              } catch (restorationError) {
-                restorationFailures.push(restorationError);
-              }
-            }
             if (restorationFailures.length > 0) {
               throw new AggregateError(
                 [publicationError, ...restorationFailures],
-                `Snapshot "${exactId}" point and connectivity publication failed with incomplete restoration.`
+                `Snapshot "${exactId}" point publication failed with incomplete restoration.`
               );
             }
           }
@@ -9716,7 +9083,20 @@ export function createViewer({
       }
 
       snap.colors = nextColors;
-      snap.transparency = nextTransparency;
+      if (transparencyChanged) snap.transparency.set(nextTransparency);
+      if (visibilityMoved && edgeLayer.hasView(exactId)) {
+        edgeLayer.publishVisibility(
+          exactId,
+          createLodFilteredVisibilityOwner(
+            snap.transparency,
+            hpRenderer.getCurrentLodMembership(
+              exactId,
+              getPublishedDimensionLevel(exactId)
+            )
+          )
+        );
+        edgeLayer.refresh(exactId);
+      }
       snap.centroidPositions = nextCentroidPositions;
       snap.centroidColors = nextCentroidColors;
       snap.label = nextLabel;
@@ -9733,12 +9113,13 @@ export function createViewer({
         publishViewDataGeneration(exactId);
       }
       if (
-        transparencyChanged &&
+        visibilityMoved &&
         vectorFieldOverlay !== null &&
         vectorFieldOverlay.enabled
       ) {
         vectorFieldOverlay.markVisibilityDirty(exactId);
       }
+      if (labelChanged) invalidateFrame();
       return true;
     },
 
@@ -9760,7 +9141,7 @@ export function createViewer({
         retry(() => hpRenderer?.clearViewState?.(exactId));
         retry(() => highlightTools?.clearViewState?.(exactId));
         retry(() => deleteCentroidSnapshotBuffer(exactId));
-        retry(() => deleteEdgeTexturesForView(exactId));
+        retry(() => edgeLayer.deleteView(exactId));
         retry(() => orbitAnchorRenderer?.deleteViewState?.(exactId));
         retry(() => vectorFieldOverlay?.disposeView?.(exactId));
         if (viewCentroidLabels.has(exactId)) {
@@ -9797,13 +9178,16 @@ export function createViewer({
         }
         cleanup(() => highlightTools.clearViewState(exactId));
         cleanup(() => deleteCentroidSnapshotBuffer(exactId));
-        cleanup(() => deleteEdgeTexturesForView(exactId));
+        cleanup(() => edgeLayer.deleteView(exactId));
         cleanup(() => orbitAnchorRenderer.deleteViewState(exactId));
         cachedViewMatrices.delete(exactId);
         renderParamsByView.delete(exactId);
+        studioPaneStates.delete(exactId);
+        backdropLooks.forgetView(exactId);
         overlayCtxByView.delete(exactId);
         overlayCtxOptionsByView.delete(exactId);
         viewDimensionLevels.delete(exactId);
+        viewLayoutKeys.delete(exactId);
         viewPositionsCache.delete(exactId);
         viewDataGenerations.delete(exactId);
         publishedLodCertificates.delete(exactId);
@@ -9814,7 +9198,10 @@ export function createViewer({
           cleanup(() => removeLabelsForView(key));
           viewCentroidFlags.delete(key);
         }
-        if (focusedViewId === exactId) focusedViewId = LIVE_VIEW_ID;
+        if (focusedViewId === exactId) {
+          cleanup(() => transferViewFocus(LIVE_VIEW_ID, { saveOutgoing: false }));
+        }
+        cleanup(() => refreshCameraFollowers());
         if (snapshotViews.length === 0 && liveViewHidden) {
           liveViewHidden = false;
         }
@@ -9839,7 +9226,6 @@ export function createViewer({
         pendingSnapshotCleanupIds.add(snapshot.id);
       }
       const cleanupIds = Array.from(pendingSnapshotCleanupIds);
-      focusedViewId = LIVE_VIEW_ID;
       liveViewHidden = false;
       const cleanupFailures = [];
       const cleanup = operation => {
@@ -9849,6 +9235,13 @@ export function createViewer({
           cleanupFailures.push(error);
         }
       };
+      if (focusedViewId !== LIVE_VIEW_ID) {
+        // The focused snapshot's camera dies with it; the live pane gets its
+        // own camera back rather than inheriting the removed pane's globals.
+        cleanup(() => transferViewFocus(LIVE_VIEW_ID, { saveOutgoing: false }));
+      }
+      focusedViewId = LIVE_VIEW_ID;
+      cameraFollowers = new Set([LIVE_VIEW_ID]);
 
       if (hpRenderer) {
         cleanup(() => hpRenderer.deleteAllSnapshotBuffers());
@@ -9862,9 +9255,9 @@ export function createViewer({
           cleanup(() => deleteCentroidSnapshotBuffer(id));
         }
       }
-      for (const id of Array.from(edgePositionTexturesV2.keys())) {
-        if (String(id) !== LIVE_VIEW_ID) {
-          cleanup(() => deleteEdgeTexturesForView(id));
+      for (const id of edgeLayer.getViewIds()) {
+        if (id !== LIVE_VIEW_ID) {
+          cleanup(() => edgeLayer.deleteView(id));
         }
       }
       cleanup(() => {
@@ -9876,22 +9269,16 @@ export function createViewer({
           );
         }
       });
-      cleanup(() => {
-        const failures = drainEdgeTextureRetirements();
-        if (failures.length > 0) {
-          throw new AggregateError(
-            failures,
-            'Pending edge texture retirement remains incomplete.'
-          );
-        }
-      });
       for (const viewId of cleanupIds) {
         cleanup(() => highlightTools.clearViewState(viewId));
         cachedViewMatrices.delete(viewId);
         renderParamsByView.delete(viewId);
+        studioPaneStates.delete(viewId);
+        backdropLooks.forgetView(viewId);
         overlayCtxByView.delete(viewId);
         overlayCtxOptionsByView.delete(viewId);
         viewDimensionLevels.delete(viewId);
+        viewLayoutKeys.delete(viewId);
         viewPositionsCache.delete(viewId);
         viewDataGenerations.delete(viewId);
         publishedLodCertificates.delete(viewId);
@@ -9941,26 +9328,10 @@ export function createViewer({
       const exactActiveId = assertKnownViewId(activeId);
       const changesLayout = mode !== viewLayoutMode;
       const changesFocus = exactActiveId !== focusedViewId;
-      const nextCamera = changesFocus && !camerasLocked
-        ? assertCameraState(
-            getViewCameraState(exactActiveId),
-            `Camera state for layout view "${exactActiveId}"`
-          )
-        : null;
 
       viewLayoutMode = mode;
       if (changesFocus) {
-        // Save current camera to previous view before switching (if unlocked)
-        if (!camerasLocked) {
-          setViewCameraState(focusedViewId, getCurrentCameraStateInternal());
-        }
-        focusedViewId = exactActiveId;
-        // Update active state on title chips
-        updateViewTitleActiveState();
-        // Load new view's camera (if unlocked)
-        if (!camerasLocked) {
-          applyCameraStateTemporarily(nextCamera);
-        }
+        transferViewFocus(exactActiveId, { saveOutgoing: true });
       }
       if (viewLayoutMode === 'single') {
         for (const key of viewCentroidLabels.keys()) {
@@ -9979,6 +9350,49 @@ export function createViewer({
     },
 
     getViewLayout() { return { mode: viewLayoutMode, activeId: focusedViewId, liveViewHidden }; },
+
+    /**
+     * The presented layout: where every presented view sits on the canvas.
+     *
+     * One frozen object, stable until the canvas size, device pixel ratio,
+     * sidebar occlusion (setViewportLeftOcclusionRatio), layout mode, focus
+     * (single layout), or view inventory changes. `presentedArea` is the part
+     * of the canvas the sidebar leaves uncovered; each of `panes` (in render
+     * order) carries its WebGL viewport (`viewport*`, framebuffer pixels,
+     * bottom-left origin), its render rectangle (`css*`) and presented
+     * rectangle (`visibleCss*`) in canvas-local CSS pixels (top-left
+     * origin), and the horizontal NDC of its principal point
+     * (`projectionCenterNdcX`). Grid cells all have the same size and lie
+     * inside the presented area; a single view renders the whole canvas with
+     * its principal point at the presented area's centre. Null while the
+     * canvas has no area.
+     *
+     * @returns {Object|null}
+     */
+    getPresentedLayout() {
+      return getPresentedLayout();
+    },
+
+    /**
+     * Observe the presented layout. The listener receives the current layout
+     * at once (when the canvas has an area) and every newly resolved layout
+     * after it: one call per geometry change, never per frame. Returns the
+     * unsubscribe function.
+     *
+     * @param {(layout: Object) => void} listener
+     * @returns {() => void}
+     */
+    onPresentedLayoutChange(listener) {
+      if (typeof listener !== 'function') {
+        throw new TypeError('Presented-layout listener must be a function.');
+      }
+      const current = getPresentedLayout();
+      presentedLayoutListeners.add(listener);
+      if (current !== null) listener(current);
+      return () => {
+        presentedLayoutListeners.delete(listener);
+      };
+    },
 
     setLiveViewHidden(hidden) {
       const exactHidden = assertExactBoolean(hidden, 'Live view visibility');
@@ -10077,11 +9491,11 @@ export function createViewer({
       overlay.setActiveField(exactFieldId);
     },
 
-    setVectorFieldData(fieldId, dimensionLevel, fieldData) {
+    setVectorFieldData(fieldId, layoutKey, fieldData) {
       if (vectorFieldOverlay !== null) {
         vectorFieldOverlay.setVectorFieldData(
           fieldId,
-          dimensionLevel,
+          layoutKey,
           fieldData
         );
         return;
@@ -10090,7 +9504,7 @@ export function createViewer({
       const candidate = new VelocityOverlay(gl);
       candidate.setFailureHandler(reportVelocityRenderFailure);
       try {
-        candidate.setVectorFieldData(fieldId, dimensionLevel, fieldData);
+        candidate.setVectorFieldData(fieldId, layoutKey, fieldData);
         ensureOverlayManager().register(candidate);
       } catch (error) {
         try {
@@ -10106,13 +9520,15 @@ export function createViewer({
       vectorFieldOverlay = candidate;
     },
 
-    hasVectorFieldForDimension(fieldId, dimensionLevel) {
+    hasVectorFieldForLayout(fieldId, layoutKey) {
       const exactFieldId = validateVelocityFieldId(fieldId);
-      getDefaultNavigationMode(dimensionLevel);
+      if (assertViewLayoutKey(layoutKey, 'Vector field') === null) {
+        throw new TypeError('Vector field layoutKey must be a non-empty string.');
+      }
       if (vectorFieldOverlay === null) return false;
-      return vectorFieldOverlay.hasFieldForDimension(
+      return vectorFieldOverlay.hasFieldForLayout(
         exactFieldId,
-        dimensionLevel
+        layoutKey
       );
     },
 
@@ -10293,33 +9709,21 @@ export function createViewer({
      */
     getPresentedViewState(viewId) {
       const owner = captureExactViewDataOwnership(viewId);
-      const canvasSize = canvasResizeObserver.getSize();
-      const viewIds = [];
-      if (!liveViewHidden) viewIds.push(LIVE_VIEW_ID);
-      for (const snapshot of snapshotViews) {
-        viewIds.push(snapshot.id);
+      const layout = getPresentedLayout();
+      if (layout === null) {
+        throw new Error('The viewer presents no pane while its canvas has no area.');
       }
-      const layout = resolvePresentedViewLayout({
-        canvasHeight: canvasSize.height,
-        canvasWidth: canvasSize.width,
-        focusedViewId,
-        mode: viewLayoutMode,
-        viewId: owner.viewId,
-        viewIds
-      });
+      const pane = getPresentedPane(layout, owner.viewId);
+      const paneIndex = layout.panes.indexOf(pane);
 
-      const useStoredCamera = (
-        layout.gridMultiview &&
-        !camerasLocked &&
-        owner.viewId !== focusedViewId
-      );
+      const followsFocusedCamera = cameraFollowers.has(owner.viewId);
+      const useStoredCamera = layout.gridMultiview && !followsFocusedCamera;
       const globalCameraState = getCurrentCameraStateInternal();
       const storedCameraState = useStoredCamera
         ? getViewCameraState(owner.viewId)
         : null;
       const cameraState = selectPresentedCameraState({
-        camerasLocked,
-        focusedViewId,
+        followsFocusedCamera,
         globalCameraState,
         gridMultiview: layout.gridMultiview,
         storedCameraState,
@@ -10328,14 +9732,10 @@ export function createViewer({
 
       const viewMtx = mat4.create();
       computeViewMatrixFromState(cameraState, viewMtx);
-      const projMtx = mat4.create();
-      const projectionCenterNdcX = configureInteractiveProjection(
-        projMtx,
-        layout.viewportWidth / layout.viewportHeight,
-        layout.paneLeftRatio,
-        layout.paneWidthRatio,
-        cameraState.navigationMode
+      const projMtx = mat4.clone(
+        getPresentedPaneProjection(layout, paneIndex)
       );
+      const projectionCenterNdcX = pane.projectionCenterNdcX;
       const mvpMtx = mat4.create();
       mat4.multiply(mvpMtx, projMtx, viewMtx);
       mat4.multiply(mvpMtx, mvpMtx, modelMatrix);
@@ -10363,6 +9763,29 @@ export function createViewer({
         owner.viewId,
         cameraPosition
       );
+      // Everything the studio backdrop of this pane is drawn from besides the
+      // matrices, so figure export can reproduce it. The surface is the
+      // settled one for the presented camera.
+      const studioState = getStudioPaneState(owner.viewId);
+      const backdrop = Object.freeze({
+        centerY: studioState.centerY,
+        extentX: studioState.extentX,
+        extentY: studioState.extentY,
+        extentZ: studioState.extentZ,
+        flat: studioState.flat,
+        floorY: studioState.floorY,
+        glowCenterX: projectionCenterNdcX,
+        pixelRatio: pane.viewportWidth / pane.cssWidth,
+        planarity: studioSurfacePlanarity(
+          owner.dimensionLevel,
+          cameraState.navigationMode
+        ),
+        stageX: studioState.stageX,
+        stageZ: studioState.stageZ,
+        // The active backdrop look as this pane shows it, frozen for figure
+        // export (rendering/backdrops/); null without one.
+        look: backdropLooks.getExportState(owner.viewId)
+      });
 
       // No user callback or await occurs above, but retain the same exact
       // ownership fence as the borrowed-data path so future helper changes
@@ -10376,13 +9799,13 @@ export function createViewer({
         cameraState,
         viewMatrix: Array.from(viewMtx)
       });
+      // The whole resolved layout: canvas size, sidebar occlusion, mode,
+      // inventory, and every pane rectangle.
       const layoutKey = JSON.stringify({
         camerasLocked,
+        cameraFollowers: [...cameraFollowers],
         focusedViewId,
-        layout,
-        projectionCenterNdcX,
-        viewportLeftOcclusionRatio,
-        viewIds
+        layout
       });
       const renderKey = JSON.stringify({
         background: bgColor,
@@ -10432,6 +9855,7 @@ export function createViewer({
         viewId: owner.viewId
       });
       const renderState = {
+        backdrop,
         bgColor: new Float32Array(bgColor),
         cameraDistance,
         cameraPosition,
@@ -10448,20 +9872,21 @@ export function createViewer({
         modelMatrix: new Float32Array(modelMatrix),
         mvpMatrix: new Float32Array(mvpMtx),
         near,
-        paneLeftRatio: layout.paneLeftRatio,
-        paneWidthRatio: layout.paneWidthRatio,
+        // The presented pane (frozen): render and visible rectangles in
+        // canvas-local CSS pixels, framebuffer viewport, principal point.
+        pane,
         pointSize: basePointSize,
         projectionCenterNdcX,
         projectionMatrix: new Float32Array(projMtx),
-        scissorEnabled: layout.scissorEnabled,
+        scissorEnabled: pane.scissorEnabled,
         shaderQuality: currentShaderQuality,
         sizeAttenuation,
         viewId: owner.viewId,
         viewMatrix: new Float32Array(viewMtx),
-        viewportHeight: layout.viewportHeight,
-        viewportWidth: layout.viewportWidth,
-        viewportX: layout.viewportX,
-        viewportY: layout.viewportY
+        viewportHeight: pane.viewportHeight,
+        viewportWidth: pane.viewportWidth,
+        viewportX: pane.viewportX,
+        viewportY: pane.viewportY
       };
 
       return Object.freeze({
@@ -10519,6 +9944,14 @@ export function createViewer({
     getCurrentLODLevel(viewId) {
       return hpRenderer.getCurrentLODLevel(assertKnownViewId(viewId));
     },
+    /**
+     * Whether every presented view draws from its final geometry: no spatial
+     * tree is still to land and no store still to adopt a draw order. The
+     * benchmark starts a measurement window only once this holds.
+     */
+    isPresentedGeometrySettled() {
+      return hpRenderer.isPresentedGeometrySettled();
+    },
     onLodChanged(listener) {
       const exactListener = assertExactFunction(
         listener,
@@ -10567,9 +10000,9 @@ export function createViewer({
     start() {
       if (disposed || webglContextLost) return;
       if (renderPaused) return;
-      if (animationHandle === null) {
-        animationHandle = requestAnimationFrame(render);
-      }
+      frameLoopStarted = true;
+      invalidateFrame();
+      reconcileFramePhases();
     },
 
     /**
@@ -10584,6 +10017,7 @@ export function createViewer({
         cancelAnimationFrame(animationHandle);
         animationHandle = null;
       }
+      reconcileFramePhases();
     },
 
     /**
@@ -10592,9 +10026,9 @@ export function createViewer({
     resume() {
       if (disposed || webglContextLost) return;
       renderPaused = false;
-      if (animationHandle === null) {
-        animationHandle = requestAnimationFrame(render);
-      }
+      frameLoopStarted = true;
+      invalidateFrame();
+      reconcileFramePhases();
     },
 
     isPaused() {
@@ -10659,6 +10093,7 @@ export function createViewer({
 	            );
 	          }
 	        }
+	        reconcileFramePhases();
 	        // The overlay manager becomes the sole retry owner immediately.
 	        vectorFieldOverlay = null;
 	      }
@@ -10763,8 +10198,8 @@ export function createViewer({
 	          }
 	        });
 	      }
-	      attempt('edge texture retirement', () => {
-	        clearEdgeResourcesV2();
+	      attempt('connectivity edge retirement', () => {
+	        edgeLayer.dispose();
 	      });
 	      attempt('high-performance renderer retirement', () => {
 	        disposeHpRenderer();
@@ -10780,15 +10215,6 @@ export function createViewer({
 	        smokeRenderer.dispose();
 	      });
 
-	      attempt('line program', () => {
-	        if (!webglContextLost && lineInstancedProgram) {
-	          gl.deleteProgram(lineInstancedProgram);
-	        }
-	        lineInstancedProgram = null;
-	        for (const key of Object.keys(lineInstancedUniformLocations)) {
-	          lineInstancedUniformLocations[key] = null;
-	        }
-	      });
 	      attempt('grid program', () => {
 	        if (!webglContextLost && gridProgram) {
 	          gl.deleteProgram(gridProgram);
@@ -10797,6 +10223,31 @@ export function createViewer({
 	        for (const key of Object.keys(gridUniformLocations)) {
 	          gridUniformLocations[key] = null;
 	        }
+	      });
+	      attempt('studio backdrop program', () => {
+	        if (!webglContextLost && studioProgram) {
+	          gl.deleteProgram(studioProgram);
+	        }
+	        studioProgram = null;
+	        for (const key of Object.keys(studioUniformLocations)) {
+	          studioUniformLocations[key] = null;
+	        }
+	      });
+	      attempt('studio backdrop vertex array', () => {
+	        if (!webglContextLost && studioVao) {
+	          gl.deleteVertexArray(studioVao);
+	        }
+	        studioVao = null;
+	      });
+	      attempt('backdrop looks', () => {
+	        if (webglContextLost) backdropLooks.abandon();
+	        else backdropLooks.dispose();
+	      });
+	      attempt('studio backdrop corner buffer', () => {
+	        if (!webglContextLost && studioCornerBuffer) {
+	          gl.deleteBuffer(studioCornerBuffer);
+	        }
+	        studioCornerBuffer = null;
 	      });
 	      attempt('centroid program', () => {
 	        if (!webglContextLost && centroidProgram) {
@@ -10819,11 +10270,11 @@ export function createViewer({
 	          centroidColorBuffer = null;
 	        }
 	      });
-	      attempt('edge quad buffer', () => {
-	        if (!webglContextLost && edgeQuadBuffer) {
-	          gl.deleteBuffer(edgeQuadBuffer);
+	      attempt('centroid vertex array', () => {
+	        if (centroidVao) {
+	          gl.deleteVertexArray(centroidVao);
+	          centroidVao = null;
 	        }
-	        edgeQuadBuffer = null;
 	      });
 	      attempt('viewer cache retirement', () => {
 	        retireViewerCpuCaches();
@@ -10854,6 +10305,9 @@ export function createViewer({
   // whose first retirement attempt failed. Wrapper identities remain stable.
   for (const [methodName, method] of Object.entries(publicApi)) {
     if (TERMINAL_SAFE_VIEWER_METHODS.has(methodName)) continue;
+    const invalidatesFrame =
+      !isFrameReaderMethodName(methodName) &&
+      !SELF_INVALIDATING_VIEWER_METHODS.has(methodName);
     publicApi[methodName] = function guardedViewerMethod(...args) {
       if (disposed) {
         throw createViewerDisposedError(methodName);
@@ -10863,6 +10317,7 @@ export function createViewer({
           `Viewer method "${methodName}"`
         );
       }
+      if (invalidatesFrame) invalidateFrame();
       return Reflect.apply(method, publicApi, args);
     };
   }

@@ -1,6 +1,7 @@
 import { expect, test } from './helpers/test.mjs';
 import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
+import { openCollapsedPanels } from './helpers/panels.mjs';
 
 const PREPARED_DATASET_URL =
   `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=slider-focus-and-target-ci`;
@@ -85,6 +86,7 @@ test('range sliders paint a keyboard focus ring and accept pointer input across 
   const productErrors = observeProductErrors(page);
   await page.goto(PREPARED_DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
+  await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
     'Current UI prepared fixture'
   );

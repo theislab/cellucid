@@ -1,0 +1,418 @@
+{
+  "genes": {
+    "X/column-0": {
+      "name_set": {
+        "filled_from_index": 1,
+        "names": null,
+        "renamed": [
+          [
+            "LYZ",
+            "LYZ-1"
+          ]
+        ],
+        "source": "gene_symbols"
+      },
+      "names": [
+        "CD3E",
+        "MS4A1",
+        "LYZ",
+        "LYZ-1",
+        "ENSG00000000005",
+        "NKG7"
+      ],
+      "values": [
+        "57e1ccb702a0b76c04e7869919bed0f408b94eb0e5c3f8880058da144ca791ab",
+        "25552a354db349231fee58ea14ec4139650a2646f982aab3b4b1eaf2348625c0",
+        "3001a88d674eb547c619c64559af5c54b4ff4798a8ff73d926162d12f551d75f",
+        "a7d2b820413070afde92a06f934c928e482416108a1d660e778017663d6375cf",
+        "a4b7bb6e73fb63d5488f35dc45401da9b6e6e874eeb7373d4176e387b48ede3b",
+        "359ec38a458556f28f40c1d3c1c256b525b8ee52b51873fc0b43b0ae6f752cd1"
+      ]
+    },
+    "X/column-1": {
+      "name_set": {
+        "filled_from_index": 0,
+        "names": null,
+        "renamed": [
+          [
+            "Gene Expression",
+            "Gene Expression-1"
+          ],
+          [
+            "Gene Expression",
+            "Gene Expression-2"
+          ],
+          [
+            "Gene Expression",
+            "Gene Expression-3"
+          ],
+          [
+            "Gene Expression",
+            "Gene Expression-4"
+          ],
+          [
+            "Gene Expression",
+            "Gene Expression-5"
+          ]
+        ],
+        "source": "feature_type"
+      },
+      "names": [
+        "Gene Expression",
+        "Gene Expression-1",
+        "Gene Expression-2",
+        "Gene Expression-3",
+        "Gene Expression-4",
+        "Gene Expression-5"
+      ],
+      "values": [
+        "57e1ccb702a0b76c04e7869919bed0f408b94eb0e5c3f8880058da144ca791ab",
+        "25552a354db349231fee58ea14ec4139650a2646f982aab3b4b1eaf2348625c0",
+        "3001a88d674eb547c619c64559af5c54b4ff4798a8ff73d926162d12f551d75f",
+        "a7d2b820413070afde92a06f934c928e482416108a1d660e778017663d6375cf",
+        "a4b7bb6e73fb63d5488f35dc45401da9b6e6e874eeb7373d4176e387b48ede3b",
+        "359ec38a458556f28f40c1d3c1c256b525b8ee52b51873fc0b43b0ae6f752cd1"
+      ]
+    },
+    "X/index": {
+      "name_set": {
+        "filled_from_index": 0,
+        "names": null,
+        "renamed": [],
+        "source": null
+      },
+      "names": [
+        "ENSG00000000001",
+        "ENSG00000000002",
+        "ENSG00000000003",
+        "ENSG00000000004",
+        "ENSG00000000005",
+        "ENSG00000000006"
+      ],
+      "values": [
+        "57e1ccb702a0b76c04e7869919bed0f408b94eb0e5c3f8880058da144ca791ab",
+        "25552a354db349231fee58ea14ec4139650a2646f982aab3b4b1eaf2348625c0",
+        "3001a88d674eb547c619c64559af5c54b4ff4798a8ff73d926162d12f551d75f",
+        "a7d2b820413070afde92a06f934c928e482416108a1d660e778017663d6375cf",
+        "a4b7bb6e73fb63d5488f35dc45401da9b6e6e874eeb7373d4176e387b48ede3b",
+        "359ec38a458556f28f40c1d3c1c256b525b8ee52b51873fc0b43b0ae6f752cd1"
+      ]
+    },
+    "layer-0/column-0": {
+      "name_set": {
+        "filled_from_index": 1,
+        "names": null,
+        "renamed": [
+          [
+            "LYZ",
+            "LYZ-1"
+          ]
+        ],
+        "source": "gene_symbols"
+      },
+      "names": [
+        "CD3E",
+        "MS4A1",
+        "LYZ",
+        "LYZ-1",
+        "ENSG00000000005",
+        "NKG7"
+      ],
+      "values": [
+        "e1ddefdb06226471b0b648c5fd453b7213037f62564df7581711ea065736877e",
+        "6e3d2005ec8074a754df4f67945d0670455b45d67a5b72edd4f3dd258380ec95",
+        "c9d27ad152c8115fb44285183c1667f2bb060dd552f6961104161f40811a8ecb",
+        "0d12101b30947298f9e8291116e09935083a87ba3bfd34cd5dd6f12abb69c41e",
+        "0dec2c58dbf5ff3572d6e1a667f43d771ba2f54bfe41687db51231144cc0b237",
+        "e45097c2ec19edacf7ed523bda03888a668a35a105111f19ee5d7899e22472bd"
+      ]
+    },
+    "layer-0/column-1": {
+      "name_set": {
+        "filled_from_index": 0,
+        "names": null,
+        "renamed": [
+          [
+            "Gene Expression",
+            "Gene Expression-1"
+          ],
+          [
+            "Gene Expression",
+            "Gene Expression-2"
+          ],
+          [
+            "Gene Expression",
+            "Gene Expression-3"
+          ],
+          [
+            "Gene Expression",
+            "Gene Expression-4"
+          ],
+          [
+            "Gene Expression",
+            "Gene Expression-5"
+          ]
+        ],
+        "source": "feature_type"
+      },
+      "names": [
+        "Gene Expression",
+        "Gene Expression-1",
+        "Gene Expression-2",
+        "Gene Expression-3",
+        "Gene Expression-4",
+        "Gene Expression-5"
+      ],
+      "values": [
+        "e1ddefdb06226471b0b648c5fd453b7213037f62564df7581711ea065736877e",
+        "6e3d2005ec8074a754df4f67945d0670455b45d67a5b72edd4f3dd258380ec95",
+        "c9d27ad152c8115fb44285183c1667f2bb060dd552f6961104161f40811a8ecb",
+        "0d12101b30947298f9e8291116e09935083a87ba3bfd34cd5dd6f12abb69c41e",
+        "0dec2c58dbf5ff3572d6e1a667f43d771ba2f54bfe41687db51231144cc0b237",
+        "e45097c2ec19edacf7ed523bda03888a668a35a105111f19ee5d7899e22472bd"
+      ]
+    },
+    "layer-0/index": {
+      "name_set": {
+        "filled_from_index": 0,
+        "names": null,
+        "renamed": [],
+        "source": null
+      },
+      "names": [
+        "ENSG00000000001",
+        "ENSG00000000002",
+        "ENSG00000000003",
+        "ENSG00000000004",
+        "ENSG00000000005",
+        "ENSG00000000006"
+      ],
+      "values": [
+        "e1ddefdb06226471b0b648c5fd453b7213037f62564df7581711ea065736877e",
+        "6e3d2005ec8074a754df4f67945d0670455b45d67a5b72edd4f3dd258380ec95",
+        "c9d27ad152c8115fb44285183c1667f2bb060dd552f6961104161f40811a8ecb",
+        "0d12101b30947298f9e8291116e09935083a87ba3bfd34cd5dd6f12abb69c41e",
+        "0dec2c58dbf5ff3572d6e1a667f43d771ba2f54bfe41687db51231144cc0b237",
+        "e45097c2ec19edacf7ed523bda03888a668a35a105111f19ee5d7899e22472bd"
+      ]
+    },
+    "layer-1/column-0": {
+      "name_set": {
+        "filled_from_index": 1,
+        "names": null,
+        "renamed": [
+          [
+            "LYZ",
+            "LYZ-1"
+          ]
+        ],
+        "source": "gene_symbols"
+      },
+      "names": [
+        "CD3E",
+        "MS4A1",
+        "LYZ",
+        "LYZ-1",
+        "ENSG00000000005",
+        "NKG7"
+      ],
+      "values": [
+        "5b758a442e3f866c1cbf7b9e404a95d323dab5a26eab502adb757a3e638aff20",
+        "7b2be74b537aa068ca3794a71d2864d1091c16c6ac2b56358c21a5e470f0382c",
+        "b5b86e390e1afcdd4edb620b92914a4b6bbde8b1306d68112964d8024a010a4c",
+        "d0f62c26b8262756ac5cf7de89fb6c6276b9d0d387f0ed25201f4723a5765ac6",
+        "b19241eb725b6096c2ae95e949feab54a913835f55651e6ca44cb87317ba52b9",
+        "ba43f88da94aca9156fa31c544c9b042519e304e5e9c945d4c623ad33d8b1c3c"
+      ]
+    },
+    "layer-1/column-1": {
+      "name_set": {
+        "filled_from_index": 0,
+        "names": null,
+        "renamed": [
+          [
+            "Gene Expression",
+            "Gene Expression-1"
+          ],
+          [
+            "Gene Expression",
+            "Gene Expression-2"
+          ],
+          [
+            "Gene Expression",
+            "Gene Expression-3"
+          ],
+          [
+            "Gene Expression",
+            "Gene Expression-4"
+          ],
+          [
+            "Gene Expression",
+            "Gene Expression-5"
+          ]
+        ],
+        "source": "feature_type"
+      },
+      "names": [
+        "Gene Expression",
+        "Gene Expression-1",
+        "Gene Expression-2",
+        "Gene Expression-3",
+        "Gene Expression-4",
+        "Gene Expression-5"
+      ],
+      "values": [
+        "5b758a442e3f866c1cbf7b9e404a95d323dab5a26eab502adb757a3e638aff20",
+        "7b2be74b537aa068ca3794a71d2864d1091c16c6ac2b56358c21a5e470f0382c",
+        "b5b86e390e1afcdd4edb620b92914a4b6bbde8b1306d68112964d8024a010a4c",
+        "d0f62c26b8262756ac5cf7de89fb6c6276b9d0d387f0ed25201f4723a5765ac6",
+        "b19241eb725b6096c2ae95e949feab54a913835f55651e6ca44cb87317ba52b9",
+        "ba43f88da94aca9156fa31c544c9b042519e304e5e9c945d4c623ad33d8b1c3c"
+      ]
+    },
+    "layer-1/index": {
+      "name_set": {
+        "filled_from_index": 0,
+        "names": null,
+        "renamed": [],
+        "source": null
+      },
+      "names": [
+        "ENSG00000000001",
+        "ENSG00000000002",
+        "ENSG00000000003",
+        "ENSG00000000004",
+        "ENSG00000000005",
+        "ENSG00000000006"
+      ],
+      "values": [
+        "5b758a442e3f866c1cbf7b9e404a95d323dab5a26eab502adb757a3e638aff20",
+        "7b2be74b537aa068ca3794a71d2864d1091c16c6ac2b56358c21a5e470f0382c",
+        "b5b86e390e1afcdd4edb620b92914a4b6bbde8b1306d68112964d8024a010a4c",
+        "d0f62c26b8262756ac5cf7de89fb6c6276b9d0d387f0ed25201f4723a5765ac6",
+        "b19241eb725b6096c2ae95e949feab54a913835f55651e6ca44cb87317ba52b9",
+        "ba43f88da94aca9156fa31c544c9b042519e304e5e9c945d4c623ad33d8b1c3c"
+      ]
+    },
+    "raw/column-0": {
+      "name_set": {
+        "filled_from_index": 1,
+        "names": null,
+        "renamed": [
+          [
+            "LYZ",
+            "LYZ-1"
+          ]
+        ],
+        "source": "gene_symbols"
+      },
+      "names": [
+        "CD3E",
+        "MS4A1",
+        "LYZ",
+        "LYZ-1",
+        "ENSG00000000005",
+        "NKG7",
+        "PPBP",
+        "GNLY"
+      ],
+      "values": [
+        "e1ddefdb06226471b0b648c5fd453b7213037f62564df7581711ea065736877e",
+        "6e3d2005ec8074a754df4f67945d0670455b45d67a5b72edd4f3dd258380ec95",
+        "c9d27ad152c8115fb44285183c1667f2bb060dd552f6961104161f40811a8ecb",
+        "0d12101b30947298f9e8291116e09935083a87ba3bfd34cd5dd6f12abb69c41e",
+        "0dec2c58dbf5ff3572d6e1a667f43d771ba2f54bfe41687db51231144cc0b237",
+        "e45097c2ec19edacf7ed523bda03888a668a35a105111f19ee5d7899e22472bd",
+        "9899485daeee4f7fdcaf865c53cedb84cf48c41c9e25a2ec17e6f774795099c1",
+        "8059d5ce559fd0bc3077329a4463c88f952bde8d546c29c9d0197b3989b49d30"
+      ]
+    },
+    "raw/index": {
+      "name_set": {
+        "filled_from_index": 0,
+        "names": null,
+        "renamed": [],
+        "source": null
+      },
+      "names": [
+        "ENSG00000000001",
+        "ENSG00000000002",
+        "ENSG00000000003",
+        "ENSG00000000004",
+        "ENSG00000000005",
+        "ENSG00000000006",
+        "ENSG00000000007",
+        "ENSG00000000008"
+      ],
+      "values": [
+        "e1ddefdb06226471b0b648c5fd453b7213037f62564df7581711ea065736877e",
+        "6e3d2005ec8074a754df4f67945d0670455b45d67a5b72edd4f3dd258380ec95",
+        "c9d27ad152c8115fb44285183c1667f2bb060dd552f6961104161f40811a8ecb",
+        "0d12101b30947298f9e8291116e09935083a87ba3bfd34cd5dd6f12abb69c41e",
+        "0dec2c58dbf5ff3572d6e1a667f43d771ba2f54bfe41687db51231144cc0b237",
+        "e45097c2ec19edacf7ed523bda03888a668a35a105111f19ee5d7899e22472bd",
+        "9899485daeee4f7fdcaf865c53cedb84cf48c41c9e25a2ec17e6f774795099c1",
+        "8059d5ce559fd0bc3077329a4463c88f952bde8d546c29c9d0197b3989b49d30"
+      ]
+    }
+  },
+  "knn": {
+    "connectivities": {
+      "destinations": "c20363492cd8524a5888b85f381c32e7ffffc7c4f51a4b6d669584a47f02eabc",
+      "max_neighbors": 18,
+      "n_edges": 1747,
+      "sources": "d7e71512d8f9eb941502db6b1e090c91ce40c991d5b47094c1f631ed09b2f251",
+      "weights": "088ef5e75f1894fedb942f76eafdf67fbee197bf4506eff704a7cb4ccc5bda82"
+    },
+    "distances": {
+      "refused": true
+    },
+    "scvi_connectivities": {
+      "destinations": "6dac06caed7e030f055ecf16e335405375c6578290db8128abd51831240697f9",
+      "max_neighbors": 15,
+      "n_edges": 1178,
+      "sources": "9e78dd763ffb290d90349011ca03e89f75636dfab86db2cc6bbc59e19abf0bf9",
+      "weights": "0649da48bed79b838ce3fbdf06785799a31c410a4721a35c4e53e42e5e717a88"
+    }
+  },
+  "latent": {
+    "X_broken": {
+      "refused": "NaN at cell 5"
+    },
+    "X_pca": {
+      "batch": "33532b10ce20b7bd51be15598b2ce4dc49fa7728e08dce6775f3f44c48548dfc",
+      "cell_type": "6f5f8631ee4c17290d62af53e00682a0b264393d91d8e1f8c2a475b2e7bc3bc6"
+    },
+    "X_scVI": {
+      "batch": "82d9c071a759f2e213e011f0376f374de158c16e363625bb1780bff9e3478c12",
+      "cell_type": "5e01bdc75ab39a975c89653ae6385c242489ac7b71a37ca83a0b7040e325a40d"
+    },
+    "X_tsne": {
+      "batch": "fe044e1654b9b92ac403ec06246522111bcdf65ddeb6efb3f968c159e9c4f8a8",
+      "cell_type": "704adcd2fb7d5fb484fd836dc74a2584feaf3561365d6f9fe868011aaec2ad91"
+    },
+    "X_umap": {
+      "batch": "ba4db2125c1415d4fa92846c90410d57d5db7976dbf739259a48749ac624fe73",
+      "cell_type": "3e8cc2e4b648a23da33419e05a47f2e79d6237b90375b376ca0aabbe07f4f493"
+    },
+    "velocity_pca": {
+      "batch": "f8615aa7d526e42b396289e6fb74bf32207038ef710ffe8510e133f3d5ba6adf",
+      "cell_type": "76afcc3fac410710de79ab7dd4c7159f9b339e732b01f8f980742cfdbfa68d43"
+    },
+    "velocity_tsne": {
+      "batch": "b39dc8ba935350072e83a95a43737587a8a00787eba6ffe43d988f95d6d87d0b",
+      "cell_type": "cfba209687c3841229ec1c0d0b2300d1d364cd3079c93210235a6d31c56f493f"
+    },
+    "velocity_umap_2d": {
+      "batch": "23c8493dc007c4497e4f5ec89d9df8e15a3bba17f0bd2732f351b667b6c8480d",
+      "cell_type": "13ae982616080b99d3d36aa561882400bcb52b3a73f74e9db5d159f5e6bab521"
+    }
+  },
+  "n_obs": 300,
+  "vectors": {
+    "velocity_pca@X_pca[0,1,2]": "14e44fa3ec70d9abc02ac1839876796ea1f52ca73ad251fb3b881d623969c1f8",
+    "velocity_pca@X_pca[2,3]": "d4a1fcd9b8e7c7fcc0c1f3f01a26fe3de3d5a8aba78b53c4a90acc6741f8069c",
+    "velocity_tsne@X_tsne[0,1]": "96976ff22f0987caedc48c761874172d727329b9da40601d08d9402ea49e3c6f",
+    "velocity_umap_2d@X_umap[0,1]": "bba8d8019acde033d0d89d0efc975dda2ccd165ca4cab508fc40cb0b07771933"
+  }
+}

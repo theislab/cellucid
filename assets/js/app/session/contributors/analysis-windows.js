@@ -122,11 +122,19 @@ export async function restore(ctx, _chunkMeta, payload) {
   const previousWindows = sharedSnapshot === undefined
     ? requireRestorePayload(capture(ctx)[0].payload)
     : requireRestorePayload(structuredClone(sharedSnapshot));
+  // Window settings name highlight pages and analysis caches that later
+  // chunks stage and publish only at commit, so the windows reopen in the
+  // transaction's presentation stage, after every state participant has
+  // committed. The windows being replaced close now so none of them observes
+  // the restore half-applied.
   let applied = false;
   restoreTransaction.register('analysis-windows/state', {
     value: windows,
+    stage: 'presentation',
     prepare() {},
-    commit() {},
+    async commit() {
+      await applyWindows(mgr, windows);
+    },
     async rollback() {
       if (!applied) return;
       await applyWindows(mgr, previousWindows);
@@ -135,5 +143,5 @@ export async function restore(ctx, _chunkMeta, payload) {
   });
 
   applied = true;
-  await applyWindows(mgr, windows);
+  await mgr.closeAll();
 }

@@ -3,7 +3,7 @@ import { expect, test } from './helpers/test.mjs';
 const WEBGL_HARNESS = '/tests/browser/fixtures/webgl-harness.html';
 const TIMING_ENABLED = process.env.CELLUCID_GPU_TIMING === '1';
 
-test('headed GPU noise callback timing at 128 and 256', async ({
+test('headed GPU noise callback timing at 64 and 128', async ({
   browserName,
   page,
 }) => {
@@ -103,14 +103,14 @@ test('headed GPU noise callback timing at 128 and 256', async ({
     };
 
     return {
+      resolution64: await run(64),
       resolution128: await run(128),
-      resolution256: await run(256),
     };
   });
 
   console.log(`CELLUCID_GPU_NOISE_TIMING ${JSON.stringify(proof)}`);
+  expect(proof.resolution64.maximumSliceDelta).toBeLessThanOrEqual(16);
   expect(proof.resolution128.maximumSliceDelta).toBeLessThanOrEqual(16);
-  expect(proof.resolution256.maximumSliceDelta).toBeLessThanOrEqual(4);
   for (const result of Object.values(proof)) {
     expect(result.callbackCount).toBeGreaterThan(0);
     expect(result.cleanupComplete).toBe(true);

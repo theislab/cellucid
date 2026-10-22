@@ -4,6 +4,8 @@ import test from 'node:test';
 import {
   HighPerfRenderer,
 } from '../assets/js/rendering/high-perf-renderer.js';
+import { createCpuPermuter } from './helpers/cpu-permuter.mjs';
+import { planLinearTexture } from '../assets/js/rendering/linear-texture.js';
 
 const MIB = 1024 * 1024;
 
@@ -42,6 +44,7 @@ function createTrackingGl(maxTextureSize = 4) {
   const bufferBytes = new Map();
   const textureBytes = new Map();
   const textureDimensions = new Map();
+  const freshTextures = new Set();
   const textureUploads = [];
   const uniformCalls = [];
   const vertexAttribCalls = [];
@@ -75,7 +78,6 @@ function createTrackingGl(maxTextureSize = 4) {
   const maybeRejectTextureUpload = () => {
     textureUploadCount += 1;
     if (fail.textureUploads.has(textureUploadCount)) {
-      pendingError = gl.INVALID_OPERATION;
       return true;
     }
     return false;
@@ -88,6 +90,7 @@ function createTrackingGl(maxTextureSize = 4) {
     ELEMENT_ARRAY_BUFFER: 0x8893,
     FLOAT: 0x1406,
     INVALID_OPERATION: 0x0502,
+    MAX_ARRAY_TEXTURE_LAYERS: 0x88ff,
     MAX_TEXTURE_SIZE: 0x0d33,
     NEAREST: 0x2600,
     NO_ERROR: 0,
@@ -99,7 +102,9 @@ function createTrackingGl(maxTextureSize = 4) {
     TEXTURE0: 0x84c0,
     TEXTURE1: 0x84c1,
     TEXTURE_2D: 0x0de1,
+    TEXTURE_2D_ARRAY: 0x8c1a,
     TEXTURE_BINDING_2D: 0x8069,
+    TEXTURE_BINDING_2D_ARRAY: 0x8c1d,
     TEXTURE_MAG_FILTER: 0x2800,
     TEXTURE_MIN_FILTER: 0x2801,
     TEXTURE_WRAP_S: 0x2802,
@@ -129,7 +134,7 @@ function createTrackingGl(maxTextureSize = 4) {
       throw new TypeError(`unexpected buffer target ${target}`);
     },
     bindTexture(target, texture) {
-      assert.equal(target, this.TEXTURE_2D);
+      assert.ok(target === this.TEXTURE_2D || target === this.TEXTURE_2D_ARRAY);
       if (texture !== null) {
         assert.equal(
           live.textures.has(texture),
@@ -152,6 +157,11 @@ function createTrackingGl(maxTextureSize = 4) {
       if (fail.bufferUploads.has(bufferUploadCount)) {
         throw new Error('synthetic snapshot buffer upload failure');
       }
+      if (typeof source === 'number') {
+        // A sizing allocation; the store is filled by bufferSubData.
+        bufferBytes.set(arrayBufferBinding, new Uint8Array(source));
+        return;
+      }
       const bytes = source instanceof ArrayBuffer
         ? new Uint8Array(source)
         : new Uint8Array(
@@ -160,6 +170,22 @@ function createTrackingGl(maxTextureSize = 4) {
             source.byteLength,
           );
       bufferBytes.set(arrayBufferBinding, Uint8Array.from(bytes));
+    },
+    bufferSubData(target, dstByteOffset, source, sourceOffset = 0, length) {
+      assert.equal(target, this.ARRAY_BUFFER);
+      assert.ok(arrayBufferBinding);
+      const store = bufferBytes.get(arrayBufferBinding);
+      assert.ok(store, 'bufferSubData writes inside a sized store');
+      const width = source.BYTES_PER_ELEMENT;
+      const count = length ?? (source.length - sourceOffset);
+      store.set(
+        new Uint8Array(
+          source.buffer,
+          source.byteOffset + sourceOffset * width,
+          count * width,
+        ),
+        dstByteOffset,
+      );
     },
     createBuffer() {
       return createHandle('buffer');
@@ -218,9 +244,10 @@ function createTrackingGl(maxTextureSize = 4) {
       if (parameter === this.PIXEL_UNPACK_BUFFER_BINDING) {
         return pixelUnpackBufferBinding;
       }
-      if (parameter === this.TEXTURE_BINDING_2D) {
+      if (parameter === this.TEXTURE_BINDING_2D || parameter === this.TEXTURE_BINDING_2D_ARRAY) {
         return textureBindings.get(activeTextureUnit) ?? null;
       }
+      if (parameter === this.MAX_ARRAY_TEXTURE_LAYERS) return 256;
       if (parameter === this.CURRENT_PROGRAM) return null;
       if (unpackState.has(parameter)) {
         return unpackState.get(parameter);
@@ -262,7 +289,7 @@ function createTrackingGl(maxTextureSize = 4) {
         texture,
         width,
       });
-      if (rejected) return;
+      if (rejected) throw new TypeError('WebGL rejected the texture upload.');
       assert.equal(level, 0);
       assert.equal(internalFormat, this.R8);
       assert.equal(border, 0);
@@ -273,6 +300,49 @@ function createTrackingGl(maxTextureSize = 4) {
       textureDimensions.set(texture, { height, width });
     },
     texParameteri() {},
+    // Linear textures (rendering/linear-texture.js): storage, then a first
+    // whole-image write (recorded as the creating upload) or a later update.
+    texStorage3D(target, levels, internalFormat, width, height, depth) {
+      assert.equal(target, this.TEXTURE_2D_ARRAY);
+      assert.equal(levels, 1);
+      assert.equal(internalFormat, this.R8);
+      assert.equal(depth, 1, 'these fixtures fit one layer');
+      const texture = requireTextureBinding();
+      textureDimensions.set(texture, { height, width });
+      freshTextures.add(texture);
+    },
+    texSubImage3D(
+      target, level, xOffset, yOffset, zOffset, width, height, depth, format, type, data, srcOffset = 0,
+    ) {
+      assert.equal(target, this.TEXTURE_2D_ARRAY);
+      const texture = requireTextureBinding();
+      const region = copyBytes(data).subarray(srcOffset, srcOffset + width * height);
+      const kind = freshTextures.has(texture) ? 'texImage2D' : 'texSubImage2D';
+      const rejected = maybeRejectTextureUpload();
+      textureUploads.push({ data: region, height, kind, rejected, texture, width });
+      if (rejected) {
+        // Rows written into a texture fail synchronously or not at all
+        // (WebGL throws for arguments it rejects); nothing is read back.
+        throw new TypeError('WebGL rejected the R8 texSubImage3D upload.');
+      }
+      assert.equal(level, 0);
+      // Whole rows: a fresh texture is written whole, an accepted one in the
+      // row regions that moved.
+      const dimensions = textureDimensions.get(texture);
+      assert.equal([xOffset, zOffset, depth].join(), '0,0,1');
+      assert.equal(width, dimensions.width);
+      assert.ok(yOffset >= 0 && yOffset + height <= dimensions.height);
+      if (freshTextures.has(texture)) {
+        assert.deepEqual({ height, width }, dimensions);
+      }
+      assert.equal(format, this.RED);
+      assert.equal(type, this.UNSIGNED_BYTE);
+      const image = textureBytes.get(texture) ?? new Uint8Array(dimensions.width * dimensions.height);
+      const next = image.slice();
+      next.set(region, yOffset * width);
+      textureBytes.set(texture, next);
+      freshTextures.delete(texture);
+    },
     texSubImage2D(
       target,
       level,
@@ -295,7 +365,7 @@ function createTrackingGl(maxTextureSize = 4) {
         texture,
         width,
       });
-      if (rejected) return;
+      if (rejected) throw new TypeError('WebGL rejected the texture upload.');
       assert.equal(level, 0);
       assert.equal(xOffset, 0);
       assert.equal(yOffset, 0);
@@ -313,6 +383,9 @@ function createTrackingGl(maxTextureSize = 4) {
     },
     uniform1i(location, value) {
       uniformCalls.push({ kind: 'uniform1i', location, value });
+    },
+    uniform2i(location, x, y) {
+      uniformCalls.push({ kind: 'uniform2i', location, value: [x, y] });
     },
     useProgram() {},
     vertexAttribPointer(
@@ -386,9 +459,8 @@ function configureAccounting(renderer) {
     _alphaTextureByteLength: 0,
     _dummyLodIndexTexture: null,
     _dummyLodIndexTextureByteLength: 0,
-    _interleavedGpuByteLength: 0,
-    _lodIndexTexturesByDimension: new Map(),
-    _lodResourceOwnersByDimension: new Map(),
+    _colorGpuByteLength: 0,
+    _positionGpuByteLength: 0,
     _pendingDataRetirements: new Set(),
     _pendingProgramRetirements: new Set(),
     _pendingProgramUnbind: false,
@@ -396,9 +468,7 @@ function configureAccounting(renderer) {
     _pendingSnapshotRetirements: new Set(),
     _perViewState: new Map(),
     buffers: {
-      alphas: null,
       colors: null,
-      interleaved: null,
       positions: null,
     },
     stats: { gpuMemoryMB: 0 },
@@ -408,7 +478,7 @@ function configureAccounting(renderer) {
 function makePointData(pointCount) {
   const positions = new Float32Array(pointCount * 3);
   const colors = new Uint8Array(pointCount * 4);
-  const alphas = new Float32Array(pointCount);
+  const alphas = new Uint8Array(pointCount);
   for (let index = 0; index < pointCount; index++) {
     positions[index * 3] = index + 0.25;
     positions[index * 3 + 1] = -index - 0.5;
@@ -417,7 +487,7 @@ function makePointData(pointCount) {
     colors[index * 4 + 1] = 30 + index;
     colors[index * 4 + 2] = 50 + index;
     colors[index * 4 + 3] = 5 + index * 50;
-    alphas[index] = index / (pointCount - 1);
+    alphas[index] = index % 2;
   }
   return { alphas, colors, positions };
 }
@@ -435,12 +505,13 @@ function createRenderer({
     : alphas;
   Object.assign(renderer, {
     gl,
+    _permuter: createCpuPermuter(gl),
     pointCount,
     _positions: pointData.positions,
+    currentDimensionLevel: 3,
     _liveGeometryGeneration: 1,
     _nextGeometryGeneration: 2,
     _snapshotAlphaStagingData: null,
-    _snapshotColorStagingData: null,
     _snapshotGeometryPools: new Map(),
     snapshotBuffers: new Map(),
     forceLODLevel: -1,
@@ -448,6 +519,14 @@ function createRenderer({
     useFrustumCulling: false,
   });
   configureAccounting(renderer);
+  // The live publication's VBO, which a snapshot of the live generation
+  // borrows. It is owned outside the snapshot storage under test, so it is not
+  // one of the tracking context's handles.
+  renderer.buffers = {
+    positions: Object.freeze({ kind: 'buffer', id: 'live-positions' }),
+    colors: null,
+  };
+  renderer._positionGpuByteLength = pointData.positions.byteLength;
   renderer.createSnapshotBuffer(
     'snap_1',
     pointData.colors,
@@ -477,15 +556,9 @@ function expectedAlphaBytes(alphas, colors, texelCount) {
   return result;
 }
 
-function expectedRgbBytes(colors) {
-  const pointCount = colors.length / 4;
-  const result = new Uint8Array(pointCount * 3);
-  for (let index = 0; index < pointCount; index++) {
-    result[index * 3] = colors[index * 4];
-    result[index * 3 + 1] = colors[index * 4 + 1];
-    result[index * 3 + 2] = colors[index * 4 + 2];
-  }
-  return result;
+/** A snapshot colour store holds its RGBA8 colours as they are, 4 bytes a point. */
+function expectedStoreBytes(colors) {
+  return Uint8Array.from(colors);
 }
 
 function snapshotIdentity(snapshot) {
@@ -502,20 +575,14 @@ function snapshotIdentity(snapshot) {
 function configureForDispose(renderer) {
   Object.assign(renderer, {
     _boundingSphere: null,
-    _bufferDirty: false,
+    _colorsDirty: false,
     _colors: null,
     _currentAlphas: null,
-    _dirtyLodDimensions: new Set(),
     _firstRenderDone: false,
-    _interleavedArrayBuffer: null,
-    _interleavedColorView: null,
-    _interleavedPositionView: null,
     _useAlphaTexture: false,
-    _validatedLodNodeMappings: new WeakMap(),
     _validatedSpatialIndices: new WeakSet(),
     activeProgram: null,
     currentDimensionLevel: 3,
-    lodBuffersByDimension: new Map(),
     programs: {
       full: null,
       light: null,
@@ -558,10 +625,10 @@ test('snapshot creation publishes exact source-order R8 ownership and accounts 3
   );
   assert.deepEqual(
     gl._state.bufferBytes.get(snapshot.buffer),
-    expectedRgbBytes(colors),
-    'snapshot color storage contains RGB only; alpha has one canonical R8 owner',
+    expectedStoreBytes(colors),
+    'a snapshot colour store is RGBA8 on a 4-byte stride; its alpha is the one R8 owner, and the store\'s alpha byte is never read',
   );
-  assert.equal(snapshot.bufferByteLength, renderer.pointCount * 3);
+  assert.equal(snapshot.bufferByteLength, renderer.pointCount * 4);
   const colorAttribute = gl._state.vertexAttribCalls
     .filter(call => call.vao === snapshot.vao && call.index === 1)
     .at(-1);
@@ -572,19 +639,16 @@ test('snapshot creation publishes exact source-order R8 ownership and accounts 3
       index: 1,
       normalized: true,
       offset: 0,
-      size: 3,
-      stride: 3,
+      size: 4,
+      stride: 4,
       type: gl.UNSIGNED_BYTE,
       vao: snapshot.vao,
     },
   );
-  assert.ok(
-    renderer._snapshotColorStagingData instanceof Uint8Array,
-  );
-  assert.equal(
-    renderer._snapshotColorStagingData.byteLength,
-    renderer.pointCount * 3,
-  );
+  // In source order the colours are the store's bytes: one direct upload,
+  // no permute pass and no point-sized scratch beside the snapshot.
+  assert.equal(Object.hasOwn(renderer, '_snapshotColorStagingData'), false);
+  assert.equal(renderer._permuter.wordWrites[1], 0);
   assert.equal(
     renderer.stats.gpuMemoryMB * MIB,
     snapshot.positions.byteLength +
@@ -608,7 +672,7 @@ test('snapshot creation publishes exact source-order R8 ownership and accounts 3
     inherited.gl._state.bufferBytes.get(
       inherited.snapshot.buffer
     ),
-    expectedRgbBytes(inherited.colors),
+    expectedStoreBytes(inherited.colors),
   );
 
   const pointCount = 30_000_000;
@@ -620,12 +684,13 @@ test('snapshot creation publishes exact source-order R8 ownership and accounts 3
   const positionBytes =
     pointCount * 3 * Float32Array.BYTES_PER_ELEMENT;
   const perViewColorBytes =
-    pointCount * 3 * Uint8Array.BYTES_PER_ELEMENT;
+    pointCount * 4 * Uint8Array.BYTES_PER_ELEMENT;
   const scaled = Object.create(HighPerfRenderer.prototype);
   configureAccounting(scaled);
   scaled.pointCount = pointCount;
   scaled._snapshotGeometryPools = new Map([
     [1, {
+      dimension: 3,
       generation: 1,
       positionBuffer: { id: 'shared-position' },
       positionBufferByteLength: positionBytes,
@@ -662,12 +727,8 @@ test('snapshot creation publishes exact source-order R8 ownership and accounts 3
     perSnapshotStagingBytes - retainedR8CpuBytes,
     (viewCount - 1) * alphaTextureBytes,
   );
-  const priorRgbaBudget = viewCount * pointCount * 4;
-  const logicalRgbPlusR8Budget =
-    viewCount * pointCount * (3 + 1);
   const physicalPaddingBytes =
     viewCount * (alphaTextureBytes - pointCount);
-  assert.equal(logicalRgbPlusR8Budget, priorRgbaBudget);
   assert.ok(
     physicalPaddingBytes >= 0 &&
       physicalPaddingBytes < viewCount * maxTextureSize,
@@ -695,12 +756,12 @@ test('alpha-only updates perform one R8 upload without color, position, VAO, or 
   const beforeCapabilityQueries =
     gl._state.maxTextureSizeQueryCount;
   const beforeTextureUploads = gl._state.textureUploadCount;
-  const replacement = Float32Array.from([
+  const replacement = Uint8Array.from([
     1,
-    0.1,
-    0.2,
-    0.3,
-    0.4,
+    0,
+    1,
+    1,
+    0,
   ]);
 
   assert.equal(
@@ -736,13 +797,17 @@ test('alpha-only updates perform one R8 upload without color, position, VAO, or 
   );
 
   const uploadsBeforeNoop = gl._state.textureUploadCount;
-  const sameQuantizedGeneration = Float32Array.from(
+  const sameQuantizedGeneration = Uint8Array.from(
     snapshot.alphaTexData.subarray(0, replacement.length),
     value => value / 255,
   );
-  renderer.updateSnapshotAlphas(
-    'snap_1',
-    sameQuantizedGeneration
+  assert.equal(
+    renderer.updateSnapshotAlphas(
+      'snap_1',
+      sameQuantizedGeneration
+    ),
+    false,
+    'an update that moves no byte says so, so the viewer skips its visibility work',
   );
   assert.equal(
     gl._state.textureUploadCount,
@@ -760,7 +825,7 @@ test('alpha-only updates perform one R8 upload without color, position, VAO, or 
 
   const uploadsBeforeInvalid = gl._state.textureUploadCount;
   const invalid = replacement.slice();
-  invalid[3] = Number.NaN;
+  invalid[3] = 2;
   assert.throws(
     () => renderer.updateSnapshotAlphas('snap_1', invalid),
     /alpha.*index 3|index 3.*alpha/i,
@@ -795,8 +860,11 @@ test('color-only and position-only updates preserve independent snapshot owners'
       renderer.updateSnapshotColors('snap_1', replacement),
       true,
     );
-    assert.notStrictEqual(snapshot.buffer, before.buffer);
-    assert.notStrictEqual(snapshot.vao, before.vao);
+    // The view alone owns its store: the colours are gathered into it in
+    // place, with no new buffer or vertex array.
+    assert.strictEqual(snapshot.buffer, before.buffer);
+    assert.strictEqual(snapshot.vao, before.vao);
+    assert.strictEqual(snapshot.colors, replacement);
     assert.strictEqual(snapshot.alphaTexture, before.alphaTexture);
     assert.strictEqual(snapshot.alphaTexData, before.alphaTexData);
     assert.strictEqual(snapshot.positions, before.positions);
@@ -813,11 +881,12 @@ test('color-only and position-only updates preserve independent snapshot owners'
     assert.strictEqual(geometry.positionBuffer, positionBuffer);
     assert.deepEqual(
       gl._state.bufferBytes.get(snapshot.buffer),
-      expectedRgbBytes(replacement),
+      expectedStoreBytes(replacement),
     );
     assert.equal(
       gl._state.bufferUploadCount,
-      beforeBufferUploads + 1,
+      beforeBufferUploads,
+      'an in-place recolour allocates no store',
     );
     assert.equal(
       gl._state.textureUploadCount,
@@ -841,7 +910,7 @@ test('color-only and position-only updates preserve independent snapshot owners'
     replacement[0] += 10;
 
     assert.equal(
-      renderer.updateSnapshotPositions('snap_1', replacement, 2),
+      renderer.updateSnapshotPositions('snap_1', replacement, 3),
       true,
     );
     assert.strictEqual(snapshot.buffer, before.buffer);
@@ -880,8 +949,8 @@ test('failed alpha, color, and position publications preserve accepted owners an
     const accepted = snapshot.alphaTexData.slice();
     const nextUpload = gl._state.textureUploadCount + 1;
     gl._state.fail.textureUploads.add(nextUpload);
-    const replacement = Float32Array.from([
-      1, 0.8, 0.6, 0.4, 0.2,
+    const replacement = Uint8Array.from([
+      1, 0, 1, 0, 1,
     ]);
 
     assert.throws(
@@ -921,8 +990,8 @@ test('failed alpha, color, and position publications preserve accepted owners an
     const nextUpload = gl._state.textureUploadCount + 1;
     gl._state.fail.textureUploads.add(nextUpload);
     gl._state.fail.textureUploads.add(nextUpload + 1);
-    const replacement = Float32Array.from([
-      0.9, 0.7, 0.5, 0.3, 0.1,
+    const replacement = Uint8Array.from([
+      0, 1, 1, 0, 1,
     ]);
 
     assert.throws(
@@ -953,17 +1022,23 @@ test('failed alpha, color, and position publications preserve accepted owners an
       snapshot,
     } = createRenderer();
     const colorBefore = snapshotIdentity(snapshot);
-    gl._state.fail.bufferUploads.add(
-      gl._state.bufferUploadCount + 1
-    );
+    const colorsBefore = snapshot.colors;
+    // A write into the accepted store fails synchronously (WebGL throws for
+    // arguments it rejects) and writes nothing.
+    const bufferSubData = gl.bufferSubData;
+    gl.bufferSubData = () => {
+      throw new TypeError('WebGL rejected the colour store write.');
+    };
     assert.throws(
       () => renderer.updateSnapshotColors(
         'snap_1',
         new Uint8Array(renderer.pointCount * 4)
       ),
-      /synthetic snapshot buffer upload failure/,
+      /rejected the colour store write/,
     );
+    gl.bufferSubData = bufferSubData;
     assert.deepEqual(snapshotIdentity(snapshot), colorBefore);
+    assert.strictEqual(snapshot.colors, colorsBefore, 'the accepted colours stay published');
 
     gl._state.fail.bufferUploads.clear();
     const positionBefore = snapshotIdentity(snapshot);
@@ -976,7 +1051,7 @@ test('failed alpha, color, and position publications preserve accepted owners an
       () => renderer.updateSnapshotPositions(
         'snap_1',
         replacementPositions,
-        2,
+        3,
       ),
       /synthetic snapshot buffer upload failure/,
     );
@@ -987,7 +1062,7 @@ test('failed alpha, color, and position publications preserve accepted owners an
       renderer.updateSnapshotPositions(
         'snap_1',
         replacementPositions,
-        2,
+        3,
       ),
       true,
     );
@@ -1015,7 +1090,7 @@ test('snapshot alpha retirement survives hostile cleanup and disposal retry', as
       renderer.updateSnapshotPositions(
         'snap_1',
         firstPositions,
-        2,
+        3,
       ),
       true,
     );
@@ -1025,8 +1100,10 @@ test('snapshot alpha retirement survives hostile cleanup and disposal retry', as
     assert.equal(colorOwner.refCount, 2);
     assert.equal(renderer._pendingSnapshotRetirements.size, 1);
 
-    const secondPositions = snapshot.positions.slice();
-    secondPositions[1] += 2;
+    // The 1D embedding of the same cells: one component per point.
+    const secondPositions = new Float32Array(renderer.pointCount).map(
+      (_, point) => snapshot.positions[point * 3] + 2,
+    );
     assert.equal(
       renderer.updateSnapshotPositions(
         'snap_1',
@@ -1042,7 +1119,9 @@ test('snapshot alpha retirement survives hostile cleanup and disposal retry', as
     assert.equal(renderer._pendingSnapshotRetirements.size, 2);
     assert.equal(
       renderer._refreshGpuMemoryStats(),
-      3 * positionByteLength +
+      // Two 3D generations plus the 1D one, which costs 4 bytes a point.
+      2 * positionByteLength +
+        secondPositions.byteLength +
         snapshot.bufferByteLength +
         snapshot.alphaTextureByteLength,
       'one shared RGB handle is counted once while all three position generations remain VAO-reachable',
@@ -1066,13 +1145,29 @@ test('snapshot alpha retirement survives hostile cleanup and disposal retry', as
       () => renderer.deleteSnapshotBuffer('snap_1')
     );
     assert.equal(renderer._pendingSnapshotRetirements.size, 0);
+    // Once their last VAO is gone, the three position generations are
+    // retained for reuse rather than deleted; eviction deletes them.
+    const retained = [...renderer._snapshotGeometryPools.values()];
+    assert.equal(retained.length, 3);
+    assert.ok(retained.every(geometry => geometry.refCount === 0 && geometry.retained === true));
+    // The first generation borrows the live VBO, which stays the live
+    // publication's; the two the snapshot uploaded are retained storage.
+    const [borrowed, ...owned] = retained;
+    assert.equal(borrowed.borrowsLivePositionBuffer, true);
+    assert.equal(owned.length, 2);
+    assert.ok(owned.every(geometry => gl._state.live.buffers.has(geometry.positionBuffer)));
+    assert.equal(
+      renderer.getRetainedGeometryBytes(),
+      positionByteLength + secondPositions.byteLength,
+    );
+    renderer.evictRetainedGeometry(Infinity);
     assert.equal(renderer._snapshotGeometryPools.size, 0);
     assert.equal(
       gl._state.deleted.buffers.filter(
         handle => handle === colorBuffer
       ).length,
       1,
-      'the last retired VAO releases and deletes the shared RGB VBO exactly once',
+      'the last retired VAO releases and deletes the shared colour VBO exactly once',
     );
     assert.equal(
       gl._state.deleted.textures.filter(
@@ -1083,7 +1178,6 @@ test('snapshot alpha retirement survives hostile cleanup and disposal retry', as
     assert.equal(gl._state.live.buffers.size, 0);
     assert.equal(gl._state.live.textures.size, 0);
     assert.equal(gl._state.live.vertexArrays.size, 0);
-    assert.equal(renderer._snapshotColorStagingData, null);
     assert.equal(renderer._snapshotAlphaStagingData, null);
   });
 
@@ -1108,8 +1202,8 @@ test('snapshot alpha retirement survives hostile cleanup and disposal retry', as
     assert.equal(renderer._pendingSnapshotRetirements.size, 1);
     assert.equal(
       renderer.stats.gpuMemoryMB * MIB,
-      snapshot.alphaTextureByteLength,
-      'the detached but still-live R8 allocation remains accounted until retry',
+      renderer._positionGpuByteLength + snapshot.alphaTextureByteLength,
+      'the detached but still-live R8 allocation remains accounted until retry, beside the live position store the snapshot borrowed',
     );
 
     gl._state.fail.deleteTextureBefore = false;
@@ -1190,94 +1284,98 @@ test('live point-count replacement is rejected before GL work while snapshots ar
   );
 });
 
-test('every snapshot draw path binds source-order snapshot alpha, while live override stays explicit', () => {
+test('every snapshot draw path binds source-order snapshot alpha through its geometry\'s permutation, while live override stays explicit', () => {
   const {
     gl,
     renderer,
     snapshot,
   } = createRenderer();
-  assert.equal(
-    typeof renderer._bindSnapshotAlphaTexture,
-    'function',
+  // Every snapshot pass draws through the one draw seam, handing it the
+  // snapshot's own alpha unless the live override is explicit.
+  assert.match(
+    HighPerfRenderer.prototype.renderWithSnapshot.toString(),
+    /alphaTexture: useAlphaTexture \? this\._alphaTexture : snapshot\.alphaTexture/,
   );
-  const drawMethods = [
-    HighPerfRenderer.prototype.renderWithSnapshot,
-    HighPerfRenderer.prototype._renderSnapshotWithFrustumCulling,
-    HighPerfRenderer.prototype._renderSnapshotWithLOD,
-    HighPerfRenderer.prototype._renderSnapshotLODWithFrustumCulling,
-  ];
-  for (const method of drawMethods) {
-    assert.match(
-      method.toString(),
-      /_bindSnapshotAlphaTexture/,
-      `${method.name} must use the exact snapshot-alpha binding path`,
-    );
-  }
+  assert.match(
+    HighPerfRenderer.prototype._drawPoints.toString(),
+    /this\._bindPointAlpha\(gl, uniforms, draw\.alphaTexture, draw\.alphaPlan, order\)/,
+  );
 
   const dummy = gl.createTexture();
   const liveTexture = gl.createTexture();
+  const permutation = gl.createTexture();
   renderer._dummyLodIndexTexture = dummy;
   renderer._dummyLodIndexTextureByteLength = 4;
-  renderer._alphaTexture = liveTexture;
-  renderer._alphaTextureByteLength = snapshot.alphaTextureByteLength;
-  renderer._alphaTexWidth = snapshot.alphaTexWidth;
-  renderer._alphaTexHeight = snapshot.alphaTexHeight;
-  renderer._useAlphaTexture = true;
   const uniforms = {
     u_alphaTex: 'alpha',
-    u_alphaTexWidth: 'alpha-width',
-    u_invAlphaTexWidth: 'alpha-inverse-width',
+    u_alphaLayout: 'alpha-layout',
     u_lodIndexTex: 'lod-index',
-    u_lodIndexTexWidth: 'lod-width',
-    u_invLodIndexTexWidth: 'lod-inverse-width',
+    u_lodIndexLayout: 'lod-layout',
     u_useAlphaTex: 'use-alpha',
     u_useLodIndexTex: 'use-lod-index',
   };
+  const lastUniform = location => gl._state.uniformCalls
+    .filter(call => call.location === location)
+    .at(-1);
 
-  renderer._bindSnapshotAlphaTexture(
-    gl,
-    uniforms,
-    snapshot,
-    false,
-    3,
-  );
-  assert.strictEqual(
-    gl._state.textureBindings.get(0),
-    snapshot.alphaTexture,
-  );
+  // A geometry still in source order: gl_VertexID is the source index.
+  renderer._bindPointAlpha(gl, uniforms, snapshot.alphaTexture, snapshot.alphaTexPlan, null);
+  assert.strictEqual(gl._state.textureBindings.get(0), snapshot.alphaTexture);
   assert.strictEqual(gl._state.textureBindings.get(1), dummy);
-  assert.deepEqual(
-    gl._state.uniformCalls
-      .filter(call => call.location === 'use-lod-index')
-      .at(-1),
-    {
-      kind: 'uniform1i',
-      location: 'use-lod-index',
-      value: 0,
-    },
-    'snapshot EBOs contain original IDs, so alpha lookup uses gl_VertexID directly',
-  );
+  assert.deepEqual(lastUniform('use-lod-index'), {
+    kind: 'uniform1i',
+    location: 'use-lod-index',
+    value: 0,
+  });
 
-  renderer._bindSnapshotAlphaTexture(
-    gl,
-    uniforms,
-    snapshot,
-    true,
-    3,
-  );
+  // A geometry in a draw order: the stored slot maps back to its source
+  // index through the order's permutation, so the source-order alpha holds.
+  const order = { texture: permutation, plan: planLinearTexture(7, 4, 256) };
+  renderer._bindPointAlpha(gl, uniforms, snapshot.alphaTexture, snapshot.alphaTexPlan, order);
+  assert.strictEqual(gl._state.textureBindings.get(0), snapshot.alphaTexture);
+  assert.strictEqual(gl._state.textureBindings.get(1), permutation);
+  assert.deepEqual(lastUniform('use-lod-index'), {
+    kind: 'uniform1i',
+    location: 'use-lod-index',
+    value: 1,
+  });
+  // The permutation's layout: width 4 (shift 2), two rows in one layer.
+  assert.deepEqual(lastUniform('lod-layout'), {
+    kind: 'uniform2i',
+    location: 'lod-layout',
+    value: [2, 2],
+  });
+
+  // The live override binds the live alpha through the same permutation.
+  renderer._bindPointAlpha(gl, uniforms, liveTexture, snapshot.alphaTexPlan, order);
   assert.strictEqual(
     gl._state.textureBindings.get(0),
     liveTexture,
     'the live-global alpha texture is used only for an explicit override',
   );
+  assert.strictEqual(gl._state.textureBindings.get(1), permutation);
+});
+
+
+test('a snapshot alpha update uploads only the rows that moved', () => {
+  const { gl, renderer, snapshot } = createRenderer();
+  const width = snapshot.alphaTexPlan.width;
+  const rows = snapshot.alphaTexPlan.rows;
+  assert.ok(rows > 1, 'the fixture lays its five cells over several rows');
+  // Move one cell in the last row only.
+  const next = Uint8Array.from(snapshot.alphaTexData.subarray(0, 5), byte => (byte === 255 ? 1 : 0));
+  const last = 4;
+  next[last] = next[last] === 1 ? 0 : 1;
+  const uploadsBefore = gl._state.textureUploads.length;
+  assert.equal(renderer.updateSnapshotAlphas('snap_1', next), true);
+  const uploads = gl._state.textureUploads.slice(uploadsBefore);
+  assert.equal(uploads.length, 1);
+  assert.equal(uploads[0].height, 1, 'one row, not the whole texture');
+  assert.equal(snapshot.alphaTexData[last], next[last] * 255);
   assert.deepEqual(
-    gl._state.uniformCalls
-      .filter(call => call.location === 'use-lod-index')
-      .at(-1),
-    {
-      kind: 'uniform1i',
-      location: 'use-lod-index',
-      value: 0,
-    },
+    gl._state.textureBytes.get(snapshot.alphaTexture),
+    snapshot.alphaTexData,
+    'the resident image equals the accepted bytes',
   );
+  assert.ok(Math.floor(last / width) === rows - 1);
 });

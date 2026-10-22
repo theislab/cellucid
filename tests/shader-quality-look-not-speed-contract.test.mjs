@@ -19,6 +19,15 @@
  *   - The bottleneck analyser computed a `Shader Complexity` figure from a
  *     `full` minus `ultralight` delta and printed it as `Shader overhead:`.
  *
+ * One regime is the exception, and the tooltip says so rather than hiding it.
+ * A 1-D or 2-D view is drawn without depth, so nothing is killed before the
+ * fragment shader: every overlapping fragment is shaded and blended, and with
+ * antialiasing on a dense embedding is bound by that blending. There `Light`
+ * draws without a discard (HP_FS_LIGHT_NO_DEPTH) and `Light`/`Ultra-light`
+ * took about half the frame time of `Full` on the one machine measured. Any
+ * frame-time difference the tooltip states must be scoped to 2-D views and
+ * name that machine; the claim "shader quality is a speed control" stays out.
+ *
  * That statistic could not measure the effect it named, and no gate rescues it.
  * `_measureFrameTimes` records the wall-clock interval between
  * `requestAnimationFrame` callbacks: quantised to the display refresh whenever
@@ -42,6 +51,7 @@ import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import { BottleneckAnalyzer } from '../assets/js/dev/benchmark.js';
+import { infoTipText } from './helpers/info-tip-text.mjs';
 
 const INDEX_URL = new URL('../index.html', import.meta.url);
 const MAIN_URL = new URL('../assets/js/app/main.js', import.meta.url);
@@ -268,24 +278,8 @@ function methodBody(source, declaration) {
   throw new Error(`${declaration} is unbalanced`);
 }
 
-function tooltipContent(id) {
-  const start = indexHtml.indexOf(`id="${id}"`);
-  assert.ok(start >= 0, `${id} must exist in index.html`);
-  const open = indexHtml.indexOf('<div class="info-tooltip-content">', start);
-  assert.ok(open >= 0, `${id} must carry an info-tooltip-content block`);
-
-  // Balance the div so a neighbouring control cannot leak into the slice and
-  // satisfy an assertion the tooltip itself does not.
-  const tags = /<div\b[^>]*>|<\/div>/g;
-  tags.lastIndex = open;
-  let depth = 0;
-  let match;
-  while ((match = tags.exec(indexHtml)) !== null) {
-    depth += match[0] === '</div>' ? -1 : 1;
-    if (depth === 0) return indexHtml.slice(open, tags.lastIndex);
-  }
-  throw new Error(`${id} tooltip content is unbalanced`);
-}
+// The tip text lives in the registry the markup names it from.
+const tooltipContent = id => infoTipText(indexHtml, id);
 
 test('the shader-quality tooltip calls it a look, never a speed control', () => {
   const content = tooltipContent('shader-quality-info-tooltip');
@@ -295,6 +289,11 @@ test('the shader-quality tooltip calls it a look, never a speed control', () => 
     /reduces? gpu work|smoother interaction|faster|speed up|better performance|improves? performance/i,
     'the tooltip must not claim a speed benefit measurement has refuted'
   );
+  // The one measured difference is scoped to where it exists.
+  if (/half the frame time|frame time/i.test(content)) {
+    assert.match(content, /2D views/, 'a stated frame-time difference must be scoped to 2D views');
+    assert.match(content, /3D views/, 'and must say 3D views measured the same');
+  }
   assert.match(
     content,
     /look|appearance/i,

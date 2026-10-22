@@ -1,3 +1,4 @@
+import './helpers/anndata-reader-in-process.mjs';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { gzipSync } from 'node:zlib';
@@ -12,7 +13,7 @@ import {
   LocalUserDirDataSource
 } from '../assets/js/data/local-user-source.js';
 import {
-  createDataSourceManager,
+  DataSourceManager,
   getDataSourceManager,
 } from '../assets/js/data/data-source-manager.js';
 import {
@@ -31,8 +32,42 @@ import {
 import {
   ZarrDataSource
 } from '../assets/js/data/zarr.js';
+import { selectDataset } from './helpers/dataset-selection.mjs';
 
 const PREPARED_CREATED_AT = '2026-01-02T03:04:05Z';
+const EMBEDDING_ID = 'X_umap';
+const EMBEDDING_FILE = 'embeddings/0_2d.bin';
+const DEFAULT_GENE_NAME_SETS = Object.freeze([
+  Object.freeze({
+    source: null,
+    filled_from_index: 0,
+    renamed: Object.freeze([]),
+    names: null,
+  }),
+]);
+
+/**
+ * The version 3 embeddings block of a one-embedding 2D export whose only item
+ * is `X_umap`, stored at `file`.
+ */
+function createPreparedEmbeddings(file = EMBEDDING_FILE) {
+  return {
+    default_dimension: 2,
+    defaults: { '2d': EMBEDDING_ID },
+    items: {
+      [EMBEDDING_ID]: {
+        label: EMBEDDING_ID,
+        dimension: 2,
+        file,
+        source: { key: EMBEDDING_ID, columns: [0, 1] },
+      },
+    },
+  };
+}
+
+function geneNameSets() {
+  return structuredClone(DEFAULT_GENE_NAME_SETS);
+}
 
 function createPreparedExportSettings(overrides = {}) {
   return {
@@ -71,11 +106,11 @@ function createPreparedDirectory(
     identityText = null,
     obsText = null,
     pointsContents = null,
-    pointsFilename = 'points_2d.bin',
+    embeddingFile = EMBEDDING_FILE,
   } = {}
 ) {
   const identity = JSON.stringify(identityPayload ?? {
-      version: 2,
+      version: 3,
       id: directoryName,
       name: displayName,
       description: `Prepared fixture ${displayName}`,
@@ -90,11 +125,7 @@ function createPreparedDirectory(
         has_connectivity: false,
         n_edges: null,
       },
-      embeddings: {
-        available_dimensions: [2],
-        default_dimension: 2,
-        files: { '2d': pointsFilename },
-      },
+      embeddings: createPreparedEmbeddings(embeddingFile),
       obs_fields: [],
       export_settings: createPreparedExportSettings(),
     });
@@ -114,7 +145,7 @@ function createPreparedDirectory(
     createFile(
       `${directoryName}/obs_manifest.json`,
       obsText ?? JSON.stringify({
-        _format: 'compact_v1',
+        _format: 'compact_v2',
         n_points: nCells,
         centroid_outlier_quantile: null,
         latent_key: null,
@@ -125,7 +156,7 @@ function createPreparedDirectory(
       })
     ),
     createFile(
-      `${directoryName}/${pointsFilename}`,
+      `${directoryName}/${embeddingFile}`,
       pointsContents ??
         new Uint8Array(nCells * 2 * Float32Array.BYTES_PER_ELEMENT)
     ),
@@ -139,13 +170,13 @@ function createPreparedDirectory(
 function createPreparedIdentity({
   id = 'candidate-dataset',
   nCells = 2,
-  pointsFilename = 'points_2d.bin',
+  embeddingFile = EMBEDDING_FILE,
   stats = {},
   exportSettings = {},
   ...extra
 } = {}) {
   return {
-    version: 2,
+    version: 3,
     id,
     name: 'Candidate dataset',
     description: 'Prepared fixture candidate',
@@ -161,11 +192,7 @@ function createPreparedIdentity({
       n_edges: null,
       ...stats,
     },
-    embeddings: {
-      available_dimensions: [2],
-      default_dimension: 2,
-      files: { '2d': pointsFilename },
-    },
+    embeddings: createPreparedEmbeddings(embeddingFile),
     obs_fields: [],
     export_settings: createPreparedExportSettings(exportSettings),
     ...extra,
@@ -224,16 +251,13 @@ function createRichCompactPreparedDirectory(directoryName = 'rich-compact') {
       fields: {
         velocity_umap: {
           label: 'velocity_umap',
-          available_dimensions: [2],
-          default_dimension: 2,
-          files: { '2d': 'vectors/0_2d.bin' },
-          basis: 'umap',
+          files: { [EMBEDDING_ID]: 'vectors/0_0.bin' },
         },
       },
     },
   });
   const obsManifest = {
-    _format: 'compact_v1',
+    _format: 'compact_v2',
     n_points: nCells,
     centroid_outlier_quantile: 0.95,
     latent_key: null,
@@ -260,13 +284,12 @@ function createRichCompactPreparedDirectory(directoryName = 'rich-compact') {
       ['A', 'B'],
       'uint8',
       255,
-      { '2': [] },
+      { X_umap: [] },
     ]],
   };
   const varManifest = {
-    _format: 'compact_v1',
+    _format: 'compact_v2',
     n_points: nCells,
-    var_gene_id_column: null,
     compression: null,
     quantization: null,
     _varSchema: {
@@ -277,6 +300,7 @@ function createRichCompactPreparedDirectory(directoryName = 'rich-compact') {
       quantized: false,
     },
     fields: [[0, 'Gene A'], [1, 'Gene/B']],
+    gene_name_sets: geneNameSets(),
   };
   const connectivityManifest = {
     format: 'edge_pairs',
@@ -310,7 +334,7 @@ function createRichCompactPreparedDirectory(directoryName = 'rich-compact') {
       ['connectivity/edges.dst.bin', uint16Bytes([1, 2])],
       ['connectivity/edges.weights.f64.bin', float64Bytes([0.25, 2])],
       [
-        'vectors/0_2d.bin',
+        'vectors/0_0.bin',
         float32Bytes([0.1, 0, 0.2, 0, 0.3, 0]),
       ],
     ],
@@ -409,9 +433,8 @@ function createLargePreparedGeneDirectory(
   extraFiles.unshift([
     'var_manifest.json',
     JSON.stringify({
-      _format: 'compact_v1',
+      _format: 'compact_v2',
       n_points: 2,
-      var_gene_id_column: null,
       compression: gzipAll ? 6 : null,
       quantization: null,
       _varSchema: {
@@ -423,21 +446,22 @@ function createLargePreparedGeneDirectory(
         quantized: false,
       },
       fields,
+      gene_name_sets: geneNameSets(),
     }),
   ]);
   return createPreparedDirectory(directoryName, {
     identityPayload: createPreparedIdentity({
-      pointsFilename: gzipAll
-        ? 'points_2d.bin.gz'
-        : 'points_2d.bin',
+      embeddingFile: gzipAll
+        ? 'embeddings/0_2d.bin.gz'
+        : 'embeddings/0_2d.bin',
       stats: { n_genes: nGenes },
       exportSettings: {
         compression: gzipAll ? 6 : null,
       },
     }),
-    pointsFilename: gzipAll
-      ? 'points_2d.bin.gz'
-      : 'points_2d.bin',
+    embeddingFile: gzipAll
+      ? 'embeddings/0_2d.bin.gz'
+      : 'embeddings/0_2d.bin',
     pointsContents: gzipAll
       ? gzipSync(
           new Uint8Array(2 * 2 * Float32Array.BYTES_PER_ELEMENT)
@@ -445,7 +469,7 @@ function createLargePreparedGeneDirectory(
       : null,
     obsText: gzipAll
       ? JSON.stringify({
-          _format: 'compact_v1',
+          _format: 'compact_v2',
           n_points: 2,
           centroid_outlier_quantile: null,
           latent_key: null,
@@ -457,6 +481,26 @@ function createLargePreparedGeneDirectory(
       : null,
     extraFiles,
   });
+}
+
+function findPreparedFile(files, relativePath) {
+  const file = files.find(candidate =>
+    candidate.webkitRelativePath.split('/').slice(1).join('/') === relativePath
+  );
+  assert.ok(file, `fixture must contain ${relativePath}`);
+  return file;
+}
+
+function createVelocityVectorFields() {
+  return {
+    default_field: 'velocity_umap',
+    fields: {
+      velocity_umap: {
+        label: 'velocity_umap',
+        files: { [EMBEDDING_ID]: 'vectors/0_0.bin' },
+      },
+    },
+  };
 }
 
 function spoofGzipSize(contents, declaredBytes) {
@@ -548,7 +592,7 @@ test('local selections expose a monotonic identity before asynchronous work', as
   source.clear();
   assert.ok(source.getSelectionIdentity() > loadingIdentity);
   identityRead.resolve(JSON.stringify({
-    version: 2,
+    version: 3,
     name: 'Delayed dataset',
     stats: { n_cells: 2 }
   }));
@@ -614,24 +658,83 @@ test('prepared adoption requires the sole exact dataset identity before mutation
     [
       'string dimensions',
       identity => {
-        identity.embeddings.available_dimensions = ['2'];
+        identity.embeddings.items.X_umap.dimension = '2';
         identity.embeddings.default_dimension = '2';
       },
-      /available_dimensions.*integer|dimension/i,
+      /embeddings\.items\.X_umap\.dimension must be 1, 2, or 3/,
     ],
     [
-      'duplicate dimensions',
+      'default for a dimension no item has',
       identity => {
-        identity.embeddings.available_dimensions = [2, 2];
+        identity.embeddings.defaults['3d'] = 'X_umap';
       },
-      /available_dimensions.*unique|dimension/i,
+      /embeddings\.defaults must name exactly one item per embedding dimension/,
     ],
     [
-      'unadvertised embedding path',
+      'default naming an item of another dimension',
       identity => {
-        identity.embeddings.files['3d'] = 'points_3d.bin';
+        identity.embeddings.items.X_umap.dimension = 1;
+        identity.embeddings.items.X_umap.file = 'embeddings/0_1d.bin';
+        identity.embeddings.items.X_umap.source.columns = [0];
+        identity.embeddings.items.X_tsne = {
+          label: 'X_tsne',
+          dimension: 2,
+          file: 'embeddings/1_2d.bin',
+          source: { key: 'X_tsne', columns: [0, 1] },
+        };
+        identity.embeddings.defaults = { '1d': 'X_umap', '2d': 'X_umap' };
       },
-      /embeddings\.files.*exact|unadvertised.*dimension/i,
+      /embeddings\.defaults\.2d must name an item of that dimension/,
+    ],
+    [
+      'default dimension without a default',
+      identity => {
+        identity.embeddings.default_dimension = 3;
+      },
+      /embeddings\.default_dimension must be a dimension named in embeddings\.defaults/,
+    ],
+    [
+      'embedding path that is not the producer path',
+      identity => {
+        identity.embeddings.items.X_umap.file = 'points_2d.bin';
+      },
+      /embeddings\.items\.X_umap\.file must be exactly "embeddings\/0_2d\.bin"/,
+    ],
+    [
+      'embedding items out of dimension and id order',
+      identity => {
+        identity.embeddings.items = {
+          X_umap: identity.embeddings.items.X_umap,
+          X_pca: {
+            label: 'X_pca',
+            dimension: 2,
+            file: 'embeddings/1_2d.bin',
+            source: { key: 'X_pca', columns: [0, 1] },
+          },
+        };
+      },
+      /embeddings\.items must be ordered by dimension, then id in code-point order/,
+    ],
+    [
+      'embedding source columns of the wrong arity',
+      identity => {
+        identity.embeddings.items.X_umap.source.columns = [0, 1, 2];
+      },
+      /embeddings\.items\.X_umap\.source\.columns must be 2 distinct 0-based column indices/,
+    ],
+    [
+      'retired available_dimensions key',
+      identity => {
+        identity.embeddings.available_dimensions = [2];
+      },
+      /embeddings.*available_dimensions/,
+    ],
+    [
+      'previous identity version',
+      identity => {
+        identity.version = 2;
+      },
+      /version/i,
     ],
     [
       'internal adapter marker',
@@ -703,7 +806,7 @@ test('prepared loading has one explicit public entry point', async () => {
   );
 });
 
-test('valid rich compact_v1 prepared exports retain their full contract', async t => {
+test('valid rich compact_v2 prepared exports retain their full contract', async t => {
   const source = new LocalUserDirDataSource();
   t.after(() => source.clear());
 
@@ -735,10 +838,15 @@ test('valid rich compact_v1 prepared exports retain their full contract', async 
     metadata.vector_fields.default_field,
     'velocity_umap'
   );
-  assert.equal(
-    metadata.vector_fields.fields.velocity_umap.label,
-    'velocity_umap'
+  assert.deepEqual(
+    metadata.vector_fields.fields.velocity_umap,
+    {
+      label: 'velocity_umap',
+      files: { [EMBEDDING_ID]: 'vectors/0_0.bin' },
+    }
   );
+  assert.equal(metadata.version, 3);
+  assert.deepEqual(metadata.embeddings, createPreparedEmbeddings());
   assert.match(
     await source.resolveUrl(
       `${source.getBaseUrl(source.datasetId)}var/0.values.f32`,
@@ -793,7 +901,8 @@ test('prepared lazy payloads stay file-backed across repeated dataset adoption',
       obsManifestUrl,
       categoricalField
     );
-    assert.deepEqual(Array.from(categorical.codes), [0, 1, 65_535]);
+    assert.ok(categorical.codes instanceof Uint8Array);
+    assert.deepEqual(Array.from(categorical.codes), [0, 1, 255]);
     assert.deepEqual(
       Array.from(categorical.outlierQuantiles),
       [
@@ -849,10 +958,10 @@ test('prepared vector metadata has one exact current shape', async t => {
       },
     ],
     [
-      'string dimension',
+      'retired dimension keys',
       field => {
-        field.available_dimensions = ['2'];
-        field.default_dimension = '2';
+        field.available_dimensions = [2];
+        field.default_dimension = 2;
       },
     ],
     [
@@ -862,9 +971,21 @@ test('prepared vector metadata has one exact current shape', async t => {
       },
     ],
     [
-      'unadvertised file',
+      'files keyed by dimension instead of embedding id',
       field => {
-        field.files['3d'] = 'vectors/0_3d.bin';
+        field.files = { '2d': 'vectors/0_0.bin' };
+      },
+    ],
+    [
+      'unadvertised embedding',
+      field => {
+        field.files.X_tsne = 'vectors/0_1.bin';
+      },
+    ],
+    [
+      'empty files',
+      field => {
+        field.files = {};
       },
     ],
   ];
@@ -874,20 +995,7 @@ test('prepared vector metadata has one exact current shape', async t => {
       const working = await loadWorkingPreparedSource(t);
       const adoptionIdentity = working.source.getAdoptionIdentity();
       const identity = createPreparedIdentity({
-        vector_fields: {
-          default_field: 'velocity_umap',
-          fields: {
-            velocity_umap: {
-              label: 'velocity_umap',
-              available_dimensions: [2],
-              default_dimension: 2,
-              files: {
-                '2d': 'vectors/0_2d.bin',
-              },
-              basis: 'umap',
-            },
-          },
-        },
+        vector_fields: createVelocityVectorFields(),
       });
       mutate(identity.vector_fields.fields.velocity_umap);
 
@@ -896,12 +1004,12 @@ test('prepared vector metadata has one exact current shape', async t => {
           createPreparedDirectory(`invalid-vector-${name}`, {
             identityPayload: identity,
             extraFiles: [[
-              'vectors/0_2d.bin',
+              'vectors/0_0.bin',
               float32Bytes([0, 0, 0, 0]),
             ]],
           })
         ),
-        /vector field|vector_fields|dimension/i
+        /Invalid dataset_identity\.json: vector_fields\.fields\.velocity_umap/
       );
       assert.equal(
         working.source.getAdoptionIdentity(),
@@ -999,9 +1107,10 @@ test('prepared identity omits created_at and export_settings without penalty', a
   assert.equal(Object.hasOwn(metadata, 'export_settings'), false);
 });
 
-test('prepared payload paths follow obs_manifest.json compression alone', async t => {
-  // With export_settings absent, obs_manifest.json is the export's compression
-  // declaration, so a .gz mismatch anywhere still fails the whole dataset.
+test('an export without export_settings is uncompressed, manifests included', async t => {
+  // With export_settings absent the identity's payload paths carry no .gz, so
+  // an obs_manifest.json that declares a compression contradicts them and the
+  // whole dataset fails before any payload is read.
   const working = await loadWorkingPreparedSource(t);
   const adoptionIdentity = working.source.getAdoptionIdentity();
   const identity = createPreparedIdentity({
@@ -1014,7 +1123,7 @@ test('prepared payload paths follow obs_manifest.json compression alone', async 
       createPreparedDirectory('derived-compression-contradiction', {
         identityPayload: identity,
         obsText: JSON.stringify({
-          _format: 'compact_v1',
+          _format: 'compact_v2',
           n_points: 2,
           centroid_outlier_quantile: null,
           latent_key: null,
@@ -1025,7 +1134,7 @@ test('prepared payload paths follow obs_manifest.json compression alone', async 
         }),
       })
     ),
-    /must not end in \.gz|must end in \.gz/i
+    /obs_manifest\.json compression must exactly match the compression dataset_identity\.json export_settings declares \(none when absent\)/
   );
   assert.equal(
     working.source.getAdoptionIdentity(),
@@ -1314,7 +1423,7 @@ test(
     assert.equal(obsManifest.n_points, 3);
 
     const positions = await loadPointsBinary(
-      `${baseUrl}points_2d.bin`,
+      `${baseUrl}${EMBEDDING_FILE}`,
       {
         dimension: 2,
         expectedBytes: obsManifest.n_points * 2 * 4,
@@ -1332,8 +1441,13 @@ test(
       stagedSource: candidate,
     });
     assert.equal(
-      (await dimensionManager.loadDimension(
-        identity.embeddings.default_dimension,
+      dimensionManager.getDefaultLayout(identity.embeddings.default_dimension),
+      EMBEDDING_ID
+    );
+    assert.equal(dimensionManager.getDefaultLayoutKey(), EMBEDDING_ID);
+    assert.equal(
+      (await dimensionManager.loadLayout(
+        dimensionManager.getDefaultLayoutKey(),
         { showProgress: false }
       )).length,
       6
@@ -1413,11 +1527,11 @@ test('prepared metadata and base URLs require the exact adopted dataset id', asy
     /exact adopted dataset identity id/i
   );
 
-  const manager = createDataSourceManager();
+  const manager = new DataSourceManager();
   manager.registerSource('local-user', source);
   const datasetEvents = [];
   manager.onDatasetChange(event => datasetEvents.push(event));
-  await manager.switchToDataset('local-user', source.datasetId, {
+  await selectDataset(manager, 'local-user', source.datasetId, {
     loadMethod: 'local-user-prepared',
   });
   assert.equal(manager.getCurrentDatasetId(), 'local-user:exact-id');
@@ -1457,22 +1571,49 @@ test('prepared vector identity matches the exact producer output', async t => {
       },
     ],
     [
-      'missing UMAP basis',
+      'retired basis key',
       metadata => {
-        delete metadata.fields.velocity_umap.basis;
-      },
-    ],
-    [
-      'arbitrary basis',
-      metadata => {
-        metadata.fields.velocity_umap.basis = 'pca';
+        metadata.fields.velocity_umap.basis = 'umap';
       },
     ],
     [
       'noncanonical vector path',
       metadata => {
-        metadata.fields.velocity_umap.files['2d'] =
+        metadata.fields.velocity_umap.files[EMBEDDING_ID] =
           'vectors/custom.bin';
+      },
+    ],
+    [
+      'previous dimension-named vector path',
+      metadata => {
+        metadata.fields.velocity_umap.files[EMBEDDING_ID] =
+          'vectors/0_2d.bin';
+      },
+    ],
+    [
+      'vector path of another field index',
+      metadata => {
+        metadata.fields.velocity_umap.files[EMBEDDING_ID] =
+          'vectors/1_0.bin';
+      },
+    ],
+    [
+      'compressed vector path in an uncompressed export',
+      metadata => {
+        metadata.fields.velocity_umap.files[EMBEDDING_ID] =
+          'vectors/0_0.bin.gz';
+      },
+    ],
+    [
+      'fields out of code-point order',
+      metadata => {
+        metadata.fields = {
+          velocity_umap: metadata.fields.velocity_umap,
+          drift_umap: {
+            label: 'drift_umap',
+            files: { [EMBEDDING_ID]: 'vectors/1_0.bin' },
+          },
+        };
       },
     ],
   ];
@@ -1480,23 +1621,10 @@ test('prepared vector identity matches the exact producer output', async t => {
   for (const [name, mutate] of cases) {
     await t.test(name, async t => {
       const working = await loadWorkingPreparedSource(t);
-      const metadata = {
-        default_field: 'velocity_umap',
-        fields: {
-          velocity_umap: {
-            label: 'velocity_umap',
-            available_dimensions: [2],
-            default_dimension: 2,
-            files: {
-              '2d': 'vectors/0_2d.bin',
-            },
-            basis: 'umap',
-          },
-        },
-      };
+      const metadata = createVelocityVectorFields();
       mutate(metadata);
-      const field = Object.values(metadata.fields)[0];
-      const path = field.files['2d'];
+      const paths = Object.values(metadata.fields)
+        .flatMap(field => Object.values(field.files));
       await assert.rejects(
         working.source.loadFromPreparedDirectory(
           createPreparedDirectory(
@@ -1506,17 +1634,126 @@ test('prepared vector identity matches the exact producer output', async t => {
                 id: `invalid-exact-vector-${name.replaceAll(' ', '-')}`,
                 vector_fields: metadata,
               }),
-              extraFiles: [[
+              extraFiles: paths.map(path => [
                 path,
                 float32Bytes([0, 0, 0, 0]),
-              ]],
+              ]),
             }
           )
         ),
-        /vector field|vector_fields|basis|label|path|id/i
+        /dataset_identity\.json.*vector_fields/
       );
       await assertWorkingPreparedSource(working);
     });
+  }
+});
+
+test('prepared vector fields bind to embedding ids in item order', async t => {
+  // Two embeddings of different dimensions: a field bound to both stores one
+  // payload per binding, each `n_cells x dimension` float32 values, at
+  // vectors/{fieldIndex}_{embeddingIndex}.bin.
+  const nCells = 2;
+  const embeddings = {
+    default_dimension: 2,
+    defaults: { '2d': 'X_umap', '3d': 'X_umap_3d' },
+    items: {
+      X_umap: {
+        label: 'X_umap',
+        dimension: 2,
+        file: 'embeddings/0_2d.bin',
+        source: { key: 'X_umap', columns: [0, 1] },
+      },
+      X_umap_3d: {
+        label: 'X_umap_3d',
+        dimension: 3,
+        file: 'embeddings/1_3d.bin',
+        source: { key: 'X_umap_3d', columns: [0, 1, 2] },
+      },
+    },
+  };
+  const vectorFields = {
+    default_field: 'velocity',
+    fields: {
+      velocity: {
+        label: 'velocity',
+        files: {
+          X_umap: 'vectors/0_0.bin',
+          X_umap_3d: 'vectors/0_1.bin',
+        },
+      },
+    },
+  };
+  const directoryFor = (name, fields, vectorFiles) => createPreparedDirectory(
+    name,
+    {
+      identityPayload: createPreparedIdentity({
+        id: name,
+        nCells,
+        embeddings,
+        vector_fields: fields,
+      }),
+      extraFiles: [
+        ['embeddings/1_3d.bin', new Uint8Array(nCells * 3 * 4)],
+        ...vectorFiles,
+      ],
+    }
+  );
+
+  const source = new LocalUserDirDataSource();
+  t.after(() => source.clear());
+  const metadata = await source.loadFromPreparedDirectory(directoryFor(
+    'two-embedding-vectors',
+    vectorFields,
+    [
+      ['vectors/0_0.bin', new Uint8Array(nCells * 2 * 4)],
+      ['vectors/0_1.bin', new Uint8Array(nCells * 3 * 4)],
+    ]
+  ));
+  assert.deepEqual(metadata.vector_fields, vectorFields);
+
+  const cases = [
+    {
+      name: 'bindings out of item order',
+      fields: {
+        default_field: 'velocity',
+        fields: {
+          velocity: {
+            label: 'velocity',
+            files: {
+              X_umap_3d: 'vectors/0_1.bin',
+              X_umap: 'vectors/0_0.bin',
+            },
+          },
+        },
+      },
+      files: [
+        ['vectors/0_0.bin', new Uint8Array(nCells * 2 * 4)],
+        ['vectors/0_1.bin', new Uint8Array(nCells * 3 * 4)],
+      ],
+      expected: /files must list its embeddings in embeddings\.items order/,
+    },
+    {
+      name: 'payload sized for another embedding dimension',
+      fields: vectorFields,
+      files: [
+        ['vectors/0_0.bin', new Uint8Array(nCells * 2 * 4)],
+        ['vectors/0_1.bin', new Uint8Array(nCells * 2 * 4)],
+      ],
+      expected: /vectors\/0_1\.bin.*expected 24 bytes/i,
+    },
+  ];
+  for (const fixture of cases) {
+    const working = await loadWorkingPreparedSource(t);
+    await assert.rejects(
+      working.source.loadFromPreparedDirectory(directoryFor(
+        `two-embedding-${fixture.name.replaceAll(' ', '-')}`,
+        fixture.fields,
+        fixture.files
+      )),
+      fixture.expected,
+      fixture.name
+    );
+    await assertWorkingPreparedSource(working);
   }
 });
 
@@ -1550,7 +1787,7 @@ test('valid zero-valued optional stats need no optional manifests', async t => {
   });
 });
 
-test('prepared manifests require the sole compact_v1 contract', async t => {
+test('prepared manifests require the sole compact_v2 contract', async t => {
   await t.test('verbose observation manifest is rejected', async () => {
     const source = new LocalUserDirDataSource();
     t.after(() => source.clear());
@@ -1564,7 +1801,7 @@ test('prepared manifests require the sole compact_v1 contract', async t => {
           }),
         })
       ),
-      /obs_manifest\.json.*compact_v1|compact_v1.*obs_manifest/i
+      /obs_manifest\.json.*compact_v2|compact_v2.*obs_manifest/i
     );
   });
 
@@ -1595,25 +1832,57 @@ test('prepared manifests require the sole compact_v1 contract', async t => {
           ]],
         })
       ),
-      /var_manifest\.json.*compact_v1|compact_v1.*var_manifest/i
+      /var_manifest\.json.*compact_v2|compact_v2.*var_manifest/i
+    );
+  });
+
+  await t.test('a previous compact_v1 variable manifest is rejected', async () => {
+    const source = new LocalUserDirDataSource();
+    t.after(() => source.clear());
+    await assert.rejects(
+      source.loadFromPreparedDirectory(
+        createPreparedDirectory('previous-var', {
+          identityPayload: createPreparedIdentity({
+            stats: { n_genes: 1 },
+          }),
+          extraFiles: [[
+            'var_manifest.json',
+            JSON.stringify({
+              _format: 'compact_v1',
+              n_points: 2,
+              var_gene_id_column: null,
+              compression: null,
+              quantization: null,
+              _varSchema: {
+                kind: 'continuous',
+                pathPattern: 'var/{index}.values.f32',
+                ext: 'f32',
+                dtype: 'float32',
+                quantized: false,
+              },
+              fields: [[0, 'A']],
+            }),
+          ], [
+            'var/0.values.f32',
+            float32Bytes([1, 2]),
+          ]],
+        })
+      ),
+      /var_manifest\.json.*(compact_v2|gene_name_sets|var_gene_id_column)/i
     );
   });
 });
 
-test('prepared embeddings publish only the exact current identity and advertised path', async t => {
-  await t.test('a custom advertised path needs no conventional sibling', async () => {
+test('prepared embeddings publish only the exact current identity and producer path', async t => {
+  await t.test('the producer path loads and is published unchanged', async () => {
     const source = new LocalUserDirDataSource();
     t.after(() => source.clear());
     const metadata = await source.loadFromPreparedDirectory(
-      createPreparedDirectory('custom-embedding-name', {
-        pointsFilename: 'advertised.bin',
+      createPreparedDirectory('producer-embedding-name', {
         pointsContents: float32Bytes([0, 1, 2, 3]),
       })
     );
-    assert.equal(
-      metadata.embeddings.files['2d'],
-      'advertised.bin'
-    );
+    assert.deepEqual(metadata.embeddings, createPreparedEmbeddings());
     assert.equal(Object.hasOwn(metadata, 'pointsFile'), false);
     assert.equal(
       validateDatasetIdentity(
@@ -1625,13 +1894,29 @@ test('prepared embeddings publish only the exact current identity and advertised
     );
   });
 
+  await t.test('a custom advertised path is refused', async () => {
+    const source = new LocalUserDirDataSource();
+    t.after(() => source.clear());
+    await assert.rejects(
+      source.loadFromPreparedDirectory(
+        createPreparedDirectory('custom-embedding-name', {
+          embeddingFile: 'advertised.bin',
+          pointsContents: float32Bytes([0, 1, 2, 3]),
+        })
+      ),
+      /embeddings\.items\.X_umap\.file must be exactly "embeddings\/0_2d\.bin"/
+    );
+  });
+
   await t.test('structural metadata cannot also own coordinates', async () => {
+    // The exact producer path rule leaves no way for an embedding to name a
+    // metadata file: the identity is refused before any payload is planned.
     const source = new LocalUserDirDataSource();
     t.after(() => source.clear());
     const nCells = 128;
     const identity = createPreparedIdentity({
       nCells,
-      pointsFilename: 'dataset_identity.json',
+      embeddingFile: 'dataset_identity.json',
     });
     const compactIdentity = JSON.stringify(identity);
     const paddedIdentity =
@@ -1640,7 +1925,7 @@ test('prepared embeddings publish only the exact current identity and advertised
           compactIdentity.length
       );
     const compactObs = JSON.stringify({
-      _format: 'compact_v1',
+      _format: 'compact_v2',
       n_points: nCells,
       centroid_outlier_quantile: null,
       latent_key: null,
@@ -1655,24 +1940,39 @@ test('prepared embeddings publish only the exact current identity and advertised
         createFile('metadata-alias/dataset_identity.json', paddedIdentity),
         createFile('metadata-alias/obs_manifest.json', compactObs),
         createFile(
-          'metadata-alias/points_2d.bin',
+          `metadata-alias/${EMBEDDING_FILE}`,
           new Uint8Array(nCells * 2 * Float32Array.BYTES_PER_ELEMENT)
         ),
       ]),
-      /dataset_identity\.json.*(metadata|structural|payload|reserved)/i
+      /embeddings\.items\.X_umap\.file must be exactly "embeddings\/0_2d\.bin"/
     );
   });
 });
 
-test('prepared identity payload paths decode exactly once', () => {
+test('prepared identity payload paths are exactly the producer path, never decoded', () => {
+  // A version 3 embedding path is derived from the item's position and
+  // dimension, so it is compared as text: an encoded, relative, aliased or
+  // dimension-named spelling of the same file is a different string and is
+  // refused, and nothing is ever percent-decoded.
   for (const path of [
     '%252e%252e/points_2d.bin',
     'nested/%252fpoints_2d.bin',
     'nested/%255cpoints_2d.bin',
     'nested/%2541.bin',
+    'cell%20atlas/%E7%BB%86%E8%83%9E.bin',
+    'embeddings%2F0_2d.bin',
+    '%65mbeddings/0_2d.bin',
+    'embeddings/0%5F2d.bin',
+    './embeddings/0_2d.bin',
+    'embeddings//0_2d.bin',
+    '/embeddings/0_2d.bin',
+    'embeddings/0_2d.bin.gz',
+    'embeddings/1_2d.bin',
+    'embeddings/0_3d.bin',
+    'points_2d.bin',
   ]) {
     const identity = createPreparedIdentity({
-      pointsFilename: path,
+      embeddingFile: path,
     });
     assert.throws(
       () => validateDatasetIdentity(
@@ -1680,16 +1980,12 @@ test('prepared identity payload paths decode exactly once', () => {
         identity.id,
         'local-user'
       ),
-      /embeddings\.files\.2d.*safe relative file path/i,
+      /embeddings\.items\.X_umap\.file must be exactly "embeddings\/0_2d\.bin"/,
       path,
     );
   }
 
-  const canonicalPath =
-    'cell%20atlas/%E7%BB%86%E8%83%9E.bin';
-  const canonicalIdentity = createPreparedIdentity({
-    pointsFilename: canonicalPath,
-  });
+  const canonicalIdentity = createPreparedIdentity();
   assert.strictEqual(
     validateDatasetIdentity(
       canonicalIdentity,
@@ -1699,8 +1995,30 @@ test('prepared identity payload paths decode exactly once', () => {
     canonicalIdentity,
   );
   assert.equal(
-    canonicalIdentity.embeddings.files['2d'],
-    canonicalPath,
+    canonicalIdentity.embeddings.items.X_umap.file,
+    EMBEDDING_FILE,
+  );
+
+  // The compressed spelling is the producer path exactly when the export
+  // declares compression.
+  const compressed = createPreparedIdentity({
+    embeddingFile: 'embeddings/0_2d.bin.gz',
+    exportSettings: { compression: 6 },
+  });
+  assert.strictEqual(
+    validateDatasetIdentity(compressed, compressed.id, 'local-user'),
+    compressed
+  );
+  const uncompressedPathInCompressedExport = createPreparedIdentity({
+    exportSettings: { compression: 6 },
+  });
+  assert.throws(
+    () => validateDatasetIdentity(
+      uncompressedPathInCompressedExport,
+      uncompressedPathInCompressedExport.id,
+      'local-user'
+    ),
+    /embeddings\.items\.X_umap\.file must be exactly "embeddings\/0_2d\.bin\.gz"/
   );
 });
 
@@ -1709,7 +2027,7 @@ test('prepared exports reject aliased advertised payload paths', async t => {
     {
       name: 'compact obs fields that declare one payload index',
       obsManifest: {
-        _format: 'compact_v1',
+        _format: 'compact_v2',
         n_points: 2,
         centroid_outlier_quantile: null,
         latent_key: null,
@@ -1733,7 +2051,7 @@ test('prepared exports reject aliased advertised payload paths', async t => {
     {
       name: 'categorical fields with one codes path',
       obsManifest: {
-        _format: 'compact_v1',
+        _format: 'compact_v2',
         n_points: 2,
         centroid_outlier_quantile: 0.95,
         latent_key: null,
@@ -1749,8 +2067,8 @@ test('prepared exports reject aliased advertised payload paths', async t => {
         },
         _continuousFields: [],
         _categoricalFields: [
-          [0, 'first', ['A'], 'uint8', 255, { '2': [] }],
-          [1, 'second', ['B'], 'uint8', 255, { '2': [] }],
+          [0, 'first', ['A'], 'uint8', 255, { X_umap: [] }],
+          [1, 'second', ['B'], 'uint8', 255, { X_umap: [] }],
         ],
       },
       extraFiles: [
@@ -1763,7 +2081,7 @@ test('prepared exports reject aliased advertised payload paths', async t => {
     {
       name: 'categorical fields with one outlier path',
       obsManifest: {
-        _format: 'compact_v1',
+        _format: 'compact_v2',
         n_points: 2,
         centroid_outlier_quantile: 0.95,
         latent_key: null,
@@ -1779,8 +2097,8 @@ test('prepared exports reject aliased advertised payload paths', async t => {
         },
         _continuousFields: [],
         _categoricalFields: [
-          [0, 'first', ['A'], 'uint8', 255, { '2': [] }],
-          [1, 'second', ['B'], 'uint8', 255, { '2': [] }],
+          [0, 'first', ['A'], 'uint8', 255, { X_umap: [] }],
+          [1, 'second', ['B'], 'uint8', 255, { X_umap: [] }],
         ],
       },
       extraFiles: [
@@ -1790,40 +2108,67 @@ test('prepared exports reject aliased advertised payload paths', async t => {
       ],
       expectedError: /outlierPathPattern.*placeholders/i,
     },
-    {
-      name: 'observation values that alias the embedding',
-      obsManifest: {
-        _format: 'compact_v1',
-        n_points: 2,
-        centroid_outlier_quantile: null,
-        latent_key: null,
-        compression: null,
-        _obsSchemas: {
-          continuous: {
-            pathPattern: 'obs/{index}.values.f32',
-            ext: 'f32',
-            dtype: 'float32',
-            quantized: false,
-          },
+    (() => {
+      // An embedding path is fixed by the format, so the only payload path a
+      // writer chooses freely that can still land on it is a connectivity
+      // array. The complete graph on 9 cells has 36 canonical edges, whose
+      // uint16 sources are exactly the 72 bytes of a 9-cell 2D embedding, so
+      // the aliased file passes both length checks and only the path rule
+      // can refuse it.
+      const nCells = 9;
+      const sources = [];
+      const destinations = [];
+      for (let source = 0; source < nCells; source++) {
+        for (let destination = source + 1; destination < nCells; destination++) {
+          sources.push(source);
+          destinations.push(destination);
+        }
+      }
+      return {
+        name: 'connectivity sources that alias the embedding',
+        obsManifest: {
+          _format: 'compact_v2',
+          n_points: nCells,
+          centroid_outlier_quantile: null,
+          latent_key: null,
+          compression: null,
+          _obsSchemas: {},
+          _continuousFields: [],
+          _categoricalFields: [],
         },
-        _continuousFields: [[0, 'position_alias']],
-        _categoricalFields: [],
-      },
-      extraFiles: [],
-      expectedPath: 'obs/0.values.f32',
-      identityPayload: createPreparedIdentity({
-        nCells: 2,
-        pointsFilename: 'obs/0.values.f32',
-        name: 'Aliased embedding payload',
-        embeddings: {
-          available_dimensions: [1],
-          default_dimension: 1,
-          files: { '1d': 'obs/0.values.f32' },
-        },
-      }),
-      pointsFilename: 'obs/0.values.f32',
-      pointsContents: float32Bytes([0, 1]),
-    },
+        extraFiles: [
+          [
+            'connectivity_manifest.json',
+            JSON.stringify({
+              format: 'edge_pairs',
+              n_cells: nCells,
+              n_edges: sources.length,
+              max_neighbors: nCells - 1,
+              index_bytes: 2,
+              index_dtype: 'uint16',
+              sourcesPath: EMBEDDING_FILE,
+              destinationsPath: 'connectivity/edges.dst.bin',
+              weightsPath: 'connectivity/edges.weights.f64.bin',
+              weight_bytes: 8,
+              weight_dtype: 'float64',
+              compression: null,
+            }),
+          ],
+          ['connectivity/edges.dst.bin', uint16Bytes(destinations)],
+          [
+            'connectivity/edges.weights.f64.bin',
+            float64Bytes(new Array(sources.length).fill(1)),
+          ],
+        ],
+        expectedPath: EMBEDDING_FILE,
+        identityPayload: createPreparedIdentity({
+          nCells,
+          name: 'Aliased embedding payload',
+          stats: { has_connectivity: true, n_edges: sources.length },
+        }),
+        pointsContents: uint16Bytes(sources),
+      };
+    })(),
   ];
 
   for (const fixture of fixtures) {
@@ -1836,7 +2181,6 @@ test('prepared exports reject aliased advertised payload paths', async t => {
           obsText: JSON.stringify(fixture.obsManifest),
           extraFiles: fixture.extraFiles,
           identityPayload: fixture.identityPayload,
-          pointsFilename: fixture.pointsFilename,
           pointsContents: fixture.pointsContents,
         }
       );
@@ -1875,7 +2219,7 @@ test('a staged categorical field requires the exact writer missing sentinel', as
         `sentinel-${sentinel.missing}`,
         {
           obsText: JSON.stringify({
-            _format: 'compact_v1',
+            _format: 'compact_v2',
             n_points: 2,
             centroid_outlier_quantile: null,
             latent_key: null,
@@ -1891,7 +2235,7 @@ test('a staged categorical field requires the exact writer missing sentinel', as
             },
             _continuousFields: [],
             _categoricalFields: [
-              [0, 'batch', ['A'], sentinel.dtype, sentinel.missing, { '2': [] }],
+              [0, 'batch', ['A'], sentinel.dtype, sentinel.missing, { X_umap: [] }],
             ],
           }),
           extraFiles: [
@@ -1913,6 +2257,91 @@ test('a staged categorical field requires the exact writer missing sentinel', as
         }
       );
     });
+  }
+});
+
+test('prepared categorical centroids name identity embeddings at their dimension', async t => {
+  const directoryFor = (name, centroidsByEmbedding) => createPreparedDirectory(
+    name,
+    {
+      identityPayload: createPreparedIdentity({
+        id: name,
+        stats: {
+          n_obs_fields: 1,
+          n_categorical_fields: 1,
+          n_continuous_fields: 0,
+        },
+        obs_fields: [{ key: 'batch', kind: 'category', n_categories: 2 }],
+        exportSettings: { obs_categorical_dtype: 'uint8' },
+      }),
+      obsText: JSON.stringify({
+        _format: 'compact_v2',
+        n_points: 2,
+        centroid_outlier_quantile: 0.95,
+        latent_key: null,
+        compression: null,
+        _obsSchemas: {
+          categorical: {
+            codesPathPattern: 'obs/{index}.codes.{ext}',
+            outlierPathPattern: 'obs/{index}.outliers.f32',
+            outlierExt: 'f32',
+            outlierDtype: 'float32',
+            outlierQuantized: false,
+          },
+        },
+        _continuousFields: [],
+        _categoricalFields: [
+          [0, 'batch', ['A', 'B'], 'uint8', 255, centroidsByEmbedding],
+        ],
+      }),
+      extraFiles: [
+        ['obs/0.codes.u8', new Uint8Array([0, 1])],
+        ['obs/0.outliers.f32', float32Bytes([0.1, 0.2])],
+      ],
+    }
+  );
+
+  const source = new LocalUserDirDataSource();
+  t.after(() => source.clear());
+  const metadata = await source.loadFromPreparedDirectory(
+    directoryFor('centroids-exact', {
+      [EMBEDDING_ID]: [
+        { category: 'A', position: [0, 0], n_points: 1 },
+        { category: 'B', position: [1, 1], n_points: 1 },
+      ],
+    })
+  );
+  assert.equal(metadata.id, 'local-user:centroids-exact');
+
+  const cases = [
+    {
+      // The previous format keyed centroids by dimension.
+      name: 'centroids keyed by dimension',
+      centroids: { '2': [{ category: 'A', position: [0, 0], n_points: 1 }] },
+      expected: /Invalid obs_manifest\.json: .*centroids for embedding "2", which dataset_identity\.json does not declare/,
+    },
+    {
+      name: 'centroids for an undeclared embedding',
+      centroids: { X_tsne: [{ category: 'A', position: [0, 0], n_points: 1 }] },
+      expected: /Invalid obs_manifest\.json: .*centroids for embedding "X_tsne", which dataset_identity\.json does not declare/,
+    },
+    {
+      name: 'centroids of another dimension',
+      centroids: { [EMBEDDING_ID]: [{ category: 'A', position: [0, 0, 0], n_points: 1 }] },
+      expected: /Invalid obs_manifest\.json: .*centroids for "X_umap" must have 2 coordinates/,
+    },
+  ];
+  for (const fixture of cases) {
+    const working = await loadWorkingPreparedSource(t);
+    await assert.rejects(
+      working.source.loadFromPreparedDirectory(directoryFor(
+        `centroids-${fixture.name.replaceAll(' ', '-')}`,
+        fixture.centroids
+      )),
+      fixture.expected,
+      fixture.name
+    );
+    await assertWorkingPreparedSource(working);
   }
 });
 
@@ -2086,12 +2515,14 @@ test('invalid local replacements leave the working prepared source usable', asyn
 
     await assert.rejects(
       working.source.loadFromPreparedDirectory(invalidDirectory),
-      /points_2d\.bin.*expected 16 bytes.*found 1/i
+      /embeddings\/0_2d\.bin.*expected 16 bytes.*found 1/i
     );
     await assertWorkingPreparedSource(working);
   });
 
-  await t.test('prepared directory rejects an oversized position plan', async t => {
+  await t.test('a position plan above the old 512 MiB limit is read and size-checked', async t => {
+    // No fixed ceiling: 67,108,865 2D cells (just over 512 MiB) are planned
+    // like any other size, and the file is held to that plan.
     const working = await loadWorkingPreparedSource(t);
     const invalidDirectory = createPreparedDirectory('oversized-points', {
       nCells: 67_108_865,
@@ -2100,7 +2531,7 @@ test('invalid local replacements leave the working prepared source usable', asyn
 
     await assert.rejects(
       working.source.loadFromPreparedDirectory(invalidDirectory),
-      /points_2d\.bin.*512 MiB.*server/i
+      /embeddings\/0_2d\.bin.*expected 536870920 bytes.*found 1/i
     );
     await assertWorkingPreparedSource(working);
   });
@@ -2110,13 +2541,13 @@ test('invalid local replacements leave the working prepared source usable', asyn
     const invalidDirectory = createPreparedDirectory('gzip-bomb', {
       identityPayload: createPreparedIdentity({
         id: 'gzip-bomb',
-        pointsFilename: 'points_2d.bin.gz',
+        embeddingFile: 'embeddings/0_2d.bin.gz',
         exportSettings: { compression: 6 },
       }),
-      pointsFilename: 'points_2d.bin.gz',
+      embeddingFile: 'embeddings/0_2d.bin.gz',
       pointsContents: gzipSync(new Uint8Array(1024 * 1024)),
       obsText: JSON.stringify({
-        _format: 'compact_v1',
+        _format: 'compact_v2',
         n_points: 2,
         centroid_outlier_quantile: null,
         latent_key: null,
@@ -2129,7 +2560,7 @@ test('invalid local replacements leave the working prepared source usable', asyn
 
     await assert.rejects(
       working.source.loadFromPreparedDirectory(invalidDirectory),
-      /points_2d\.bin\.gz.*expected 16 bytes/i
+      /embeddings\/0_2d\.bin\.gz.*expected 16 bytes/i
     );
     await assertWorkingPreparedSource(working);
   });
@@ -2137,7 +2568,7 @@ test('invalid local replacements leave the working prepared source usable', asyn
   await t.test('prepared directory verifies compressed observation integrity', async t => {
     const working = await loadWorkingPreparedSource(t);
     const obsManifest = {
-      _format: 'compact_v1',
+      _format: 'compact_v2',
       n_points: 2,
       centroid_outlier_quantile: null,
       latent_key: null,
@@ -2156,7 +2587,7 @@ test('invalid local replacements leave the working prepared source usable', asyn
     const invalidDirectory = createPreparedDirectory('spoofed-obs-gzip', {
       identityPayload: createPreparedIdentity({
         id: 'spoofed-obs-gzip',
-        pointsFilename: 'points_2d.bin.gz',
+        embeddingFile: 'embeddings/0_2d.bin.gz',
         stats: {
           n_obs_fields: 1,
           n_continuous_fields: 1,
@@ -2165,7 +2596,7 @@ test('invalid local replacements leave the working prepared source usable', asyn
         exportSettings: { compression: 6 },
         obs_fields: [{ key: 'score', kind: 'continuous' }],
       }),
-      pointsFilename: 'points_2d.bin.gz',
+      embeddingFile: 'embeddings/0_2d.bin.gz',
       pointsContents: gzipSync(
         new Uint8Array(2 * 2 * Float32Array.BYTES_PER_ELEMENT)
       ),
@@ -2202,9 +2633,8 @@ test('invalid local replacements leave the working prepared source usable', asyn
   await t.test('prepared directory requires every advertised gene payload', async t => {
     const working = await loadWorkingPreparedSource(t);
     const varManifest = {
-      _format: 'compact_v1',
+      _format: 'compact_v2',
       n_points: 2,
-      var_gene_id_column: null,
       compression: null,
       quantization: null,
       _varSchema: {
@@ -2215,6 +2645,7 @@ test('invalid local replacements leave the working prepared source usable', asyn
         quantized: false,
       },
       fields: [[0, 'A']],
+      gene_name_sets: geneNameSets(),
     };
     const invalidDirectory = createPreparedDirectory('missing-gene-values', {
       identityPayload: createPreparedIdentity({
@@ -2253,24 +2684,13 @@ test('invalid local replacements leave the working prepared source usable', asyn
     const working = await loadWorkingPreparedSource(t);
     const invalidDirectory = createPreparedDirectory('missing-vector', {
       identityPayload: createPreparedIdentity({
-        vector_fields: {
-          default_field: 'velocity_umap',
-          fields: {
-            velocity_umap: {
-              label: 'velocity_umap',
-              available_dimensions: [2],
-              default_dimension: 2,
-              files: { '2d': 'vectors/0_2d.bin' },
-              basis: 'umap',
-            },
-          },
-        },
+        vector_fields: createVelocityVectorFields(),
       }),
     });
 
     await assert.rejects(
       working.source.loadFromPreparedDirectory(invalidDirectory),
-      /vector.*velocity_umap|vectors\/0_2d\.bin/i
+      /vector.*velocity_umap|vectors\/0_0\.bin/i
     );
     await assertWorkingPreparedSource(working);
   });
@@ -2315,7 +2735,7 @@ test('invalid local replacements leave the working prepared source usable', asyn
   await t.test('prepared directory rejects duplicate identity obs summaries', async t => {
     const working = await loadWorkingPreparedSource(t);
     const obsManifest = {
-      _format: 'compact_v1',
+      _format: 'compact_v2',
       n_points: 2,
       centroid_outlier_quantile: null,
       latent_key: null,
@@ -2430,39 +2850,43 @@ test('invalid local replacements leave the working prepared source usable', asyn
     }
   });
 
-  await t.test('prepared directory preflights raw plus padded embedding memory', async t => {
+  await t.test('prepared directory reads an embedding of any planned size', async t => {
     const working = await loadWorkingPreparedSource(t);
-    const nCells = 40_000_000;
-    const expectedBytes =
-      nCells * 2 * Float32Array.BYTES_PER_ELEMENT;
-    const invalidDirectory = createPreparedDirectory('padding-peak', {
-      nCells,
-      pointsContents: new Uint8Array(0),
-    });
-    const pointsFile = invalidDirectory.find(
-      file => file.name === 'points_2d.bin'
-    );
-    let streamTouched = false;
-    Object.defineProperties(pointsFile, {
-      size: {
-        configurable: true,
-        value: expectedBytes,
-      },
-      stream: {
-        configurable: true,
-        value() {
-          streamTouched = true;
-          throw new Error('oversized embedding must reject before streaming');
+    // No fixed working-set budget: 40M and 70M 2D cells both reach the
+    // stream; only the browser's memory refuses a payload.
+    for (const [nCells, expected] of [
+      [70_000_000, /oversized embedding reached the stream/],
+      [40_000_000, /oversized embedding reached the stream/],
+    ]) {
+      const expectedBytes =
+        nCells * 2 * Float32Array.BYTES_PER_ELEMENT;
+      const invalidDirectory = createPreparedDirectory(`layout-${nCells}`, {
+        nCells,
+        pointsContents: new Uint8Array(0),
+      });
+      const pointsFile = findPreparedFile(invalidDirectory, EMBEDDING_FILE);
+      let streamTouched = false;
+      Object.defineProperties(pointsFile, {
+        size: {
+          configurable: true,
+          value: expectedBytes,
         },
-      },
-    });
+        stream: {
+          configurable: true,
+          value() {
+            streamTouched = true;
+            throw new Error('oversized embedding reached the stream');
+          },
+        },
+      });
 
-    await assert.rejects(
-      working.source.loadFromPreparedDirectory(invalidDirectory),
-      /embedding.*working set.*512 MiB|points_2d\.bin.*512 MiB/i
-    );
-    assert.equal(streamTouched, false);
-    await assertWorkingPreparedSource(working);
+      await assert.rejects(
+        working.source.loadFromPreparedDirectory(invalidDirectory),
+        expected
+      );
+      assert.equal(streamTouched, true);
+      await assertWorkingPreparedSource(working);
+    }
   });
 
   await t.test('H5AD file', async t => {
@@ -2679,7 +3103,7 @@ test('superseded prepared validation aborts its active stream promptly', async (
   const readGate = deferred();
   let readerCancelled = false;
   const candidate = createPreparedDirectory('slow-stream');
-  const pointsFile = candidate.find(file => file.name === 'points_2d.bin');
+  const pointsFile = findPreparedFile(candidate, EMBEDDING_FILE);
   Object.defineProperty(pointsFile, 'stream', {
     configurable: true,
     value() {
@@ -2933,7 +3357,7 @@ test('overlapping prepared-directory selections preserve the newest dataset', as
   const newerMetadata = await newerLoad;
   olderIdentity.resolve(
     JSON.stringify({
-      version: 2,
+      version: 3,
       name: 'Older dataset',
       stats: { n_cells: 2 }
     })
@@ -2962,4 +3386,65 @@ test('overlapping prepared-directory selections preserve the newest dataset', as
     olderOutcome.reason?.code,
     'CELLUCID_DATASET_RELOAD_SUPERSEDED'
   );
+});
+
+test('refresh validates a candidate and publishes only a current success', async t => {
+  const source = new LocalUserDirDataSource();
+  t.after(() => source.clear());
+  const files = createPreparedDirectory('working', {
+    displayName: 'Working dataset',
+    nCells: 3,
+  });
+  const working = await source.loadFromPreparedDirectory(files);
+  const workingSnapshot = structuredClone(working);
+  const adoptionIdentity = source.getAdoptionIdentity();
+  const identityFile = files.find(file => file.name === 'dataset_identity.json');
+  const identityText = await identityFile.text();
+
+  // A refresh that fails validation leaves the working source untouched.
+  Object.defineProperty(identityFile, 'text', {
+    configurable: true,
+    value: async () => '{ not json',
+  });
+  await assert.rejects(source.refresh(), /Invalid dataset_identity\.json/);
+  assert.deepEqual(await source.listDatasets(), [workingSnapshot]);
+  assert.equal(source.getAdoptionIdentity(), adoptionIdentity);
+
+  // A successful refresh publishes what it re-validated.
+  Object.defineProperty(identityFile, 'text', {
+    configurable: true,
+    value: async () => identityText.replace('Working dataset', 'Renamed dataset'),
+  });
+  await source.refresh();
+  assert.equal((await source.listDatasets())[0].name, 'Renamed dataset');
+  assert.equal(source.datasetId, working.id);
+});
+
+test('a refresh superseded by clearing the source publishes nothing', async t => {
+  const source = new LocalUserDirDataSource();
+  t.after(() => source.clear());
+  const files = createPreparedDirectory('working', { nCells: 3 });
+  await source.loadFromPreparedDirectory(files);
+
+  const obsFile = files.find(file => file.name === 'obs_manifest.json');
+  const obsText = await obsFile.text();
+  const obsRequested = deferred();
+  const releaseObs = deferred();
+  Object.defineProperty(obsFile, 'text', {
+    configurable: true,
+    value: async () => {
+      obsRequested.resolve();
+      await releaseObs.promise;
+      return obsText;
+    },
+  });
+
+  const refreshing = source.refresh();
+  await obsRequested.promise;
+  source.clear();
+  releaseObs.resolve();
+
+  await assert.rejects(refreshing, isExplicitSupersession);
+  assert.deepEqual(await source.listDatasets(), []);
+  assert.equal(source.datasetId, null);
 });

@@ -12,14 +12,28 @@ if (
     'CELLUCID_SNAPSHOT_GPU_BENCH_POINTS must be a positive safe integer.',
   );
 }
+// The pixel, ownership and GL-state contract needs one paired sample of each
+// draw path; the timing is diagnostic. A benchmark takes more samples when
+// asked (CELLUCID_SNAPSHOT_GPU_BENCH_SAMPLES=7: seven wall-clock and seven
+// GPU-timer samples of 32 draws per path). Run by default, the old seven and
+// five took about 85 of the spec's 120 s under a software rasterizer.
+const configuredSamples = Number.parseInt(
+  process.env.CELLUCID_SNAPSHOT_GPU_BENCH_SAMPLES ?? '1',
+  10,
+);
+if (!Number.isSafeInteger(configuredSamples) || configuredSamples < 1) {
+  throw new RangeError(
+    'CELLUCID_SNAPSHOT_GPU_BENCH_SAMPLES must be a positive safe integer.',
+  );
+}
 
-test('production split snapshot VBOs match interleaved pixels and indexed draws', async ({
+test('production split snapshot VBOs match live RGBA-stream pixels and indexed draws', async ({
   page,
 }, testInfo) => {
   test.setTimeout(120_000);
   await page.goto('/tests/browser/fixtures/webgl-harness.html');
 
-  const result = await page.evaluate(async pointCount => {
+  const result = await page.evaluate(async ({ pointCount, samples }) => {
     const canvas = document.createElement('canvas');
     canvas.id = 'snapshot-split-benchmark';
     canvas.width = 512;
@@ -93,14 +107,14 @@ test('production split snapshot VBOs match interleaved pixels and indexed draws'
       '/assets/js/rendering/high-perf-renderer.js'
     );
     const side = Math.ceil(Math.sqrt(pointCount));
-    const positions = new Float32Array(pointCount * 3);
+    // A 2D embedding: two position components per point.
+    const positions = new Float32Array(pointCount * 2);
     const colors = new Uint8Array(pointCount * 4);
     for (let index = 0; index < pointCount; index++) {
-      positions[index * 3] =
+      positions[index * 2] =
         (((index % side) + 0.5) / side) * 2 - 1;
-      positions[index * 3 + 1] =
+      positions[index * 2 + 1] =
         ((Math.floor(index / side) + 0.5) / side) * 2 - 1;
-      positions[index * 3 + 2] = 0;
       colors[index * 4] = index & 0xff;
       colors[index * 4 + 1] = (index >>> 3) & 0xff;
       colors[index * 4 + 2] = (index >>> 7) & 0xff;
@@ -112,7 +126,6 @@ test('production split snapshot VBOs match interleaved pixels and indexed draws'
       USE_LOD: false,
     });
     renderer.loadData(positions, colors, {
-      buildSpatialIndex: false,
       dimensionLevel: 2,
     });
     const bytesBeforeSnapshots =
@@ -165,16 +178,9 @@ test('production split snapshot VBOs match interleaved pixels and indexed draws'
         identity,
       );
     }
-    if (uniforms.u_viewMatrix !== null) {
+    if (uniforms.u_modelViewMatrix !== null) {
       gl.uniformMatrix4fv(
-        uniforms.u_viewMatrix,
-        false,
-        identity,
-      );
-    }
-    if (uniforms.u_modelMatrix !== null) {
-      gl.uniformMatrix4fv(
-        uniforms.u_modelMatrix,
+        uniforms.u_modelViewMatrix,
         false,
         identity,
       );
@@ -192,31 +198,28 @@ test('production split snapshot VBOs match interleaved pixels and indexed draws'
     if (uniforms.u_sizeAttenuation !== null) {
       gl.uniform1f(uniforms.u_sizeAttenuation, 0);
     }
-    if (uniforms.u_viewportHeight !== null) {
+    if (uniforms.u_pointScale !== null) {
       gl.uniform1f(
-        uniforms.u_viewportHeight,
-        canvas.height,
+        uniforms.u_pointScale,
+        (canvas.height / (2 * Math.tan(Math.PI / 6))) * 0.01,
       );
     }
-    if (uniforms.u_fov !== null) {
-      gl.uniform1f(uniforms.u_fov, Math.PI / 3);
-    }
-    const configureSplitRgbR8 = () => {
+    const configureSplitRgbaR8 = () => {
       gl.useProgram(program);
-      renderer._bindSnapshotAlphaTexture(
+      renderer._bindPointAlpha(
         gl,
         uniforms,
-        first,
-        false,
-        2,
+        first.alphaTexture,
+        first.alphaTexPlan,
+        renderer._ensureSnapshotDrawOrder(first, null),
       );
     };
-    const configureInterleavedRgba = () => {
+    const configureLiveRgba = () => {
       gl.useProgram(program);
       // Keep both sampler types complete and on distinct units even though
       // this reference path reads alpha from the RGBA vertex attribute.
       gl.activeTexture(gl.TEXTURE0);
-      gl.bindTexture(gl.TEXTURE_2D, first.alphaTexture);
+      gl.bindTexture(gl.TEXTURE_2D_ARRAY, first.alphaTexture);
       if (uniforms.u_alphaTex !== null) {
         gl.uniform1i(uniforms.u_alphaTex, 0);
       }
@@ -225,7 +228,7 @@ test('production split snapshot VBOs match interleaved pixels and indexed draws'
       }
       gl.activeTexture(gl.TEXTURE1);
       gl.bindTexture(
-        gl.TEXTURE_2D,
+        gl.TEXTURE_2D_ARRAY,
         renderer._dummyLodIndexTexture,
       );
       if (uniforms.u_lodIndexTex !== null) {
@@ -307,12 +310,12 @@ test('production split snapshot VBOs match interleaved pixels and indexed draws'
       };
     };
     const fullPixels = comparePixels(
-      render(configureInterleavedRgba, renderer.vao, false),
-      render(configureSplitRgbR8, first.vao, false),
+      render(configureLiveRgba, renderer.vao, false),
+      render(configureSplitRgbaR8, first.vao, false),
     );
     const indexedPixels = comparePixels(
-      render(configureInterleavedRgba, renderer.vao, true),
-      render(configureSplitRgbR8, first.vao, true),
+      render(configureLiveRgba, renderer.vao, true),
+      render(configureSplitRgbaR8, first.vao, true),
     );
 
     // Preserve the original 32-draw timing sample while keeping each
@@ -358,40 +361,40 @@ test('production split snapshot VBOs match interleaved pixels and indexed draws'
     // Compile, allocate, and warm both production shader paths before paired
     // measurement. The reference path uses baked RGBA; the split path performs
     // the snapshot-owned R8 texel fetch used by production rendering.
-    await measure(configureInterleavedRgba, renderer.vao, false);
-    await measure(configureSplitRgbR8, first.vao, false);
-    await measure(configureInterleavedRgba, renderer.vao, true);
-    await measure(configureSplitRgbR8, first.vao, true);
+    await measure(configureLiveRgba, renderer.vao, false);
+    await measure(configureSplitRgbaR8, first.vao, false);
+    await measure(configureLiveRgba, renderer.vao, true);
+    await measure(configureSplitRgbaR8, first.vao, true);
     const timings = {
-      fullInterleaved: [],
+      fullLive: [],
       fullSplit: [],
-      indexedInterleaved: [],
+      indexedLive: [],
       indexedSplit: [],
     };
-    for (let sample = 0; sample < 7; sample++) {
+    for (let sample = 0; sample < samples; sample++) {
       const firstLayout = sample % 2 === 0
         ? [
             [
-              'fullInterleaved',
-              configureInterleavedRgba,
+              'fullLive',
+              configureLiveRgba,
               renderer.vao,
               false,
             ],
             [
               'fullSplit',
-              configureSplitRgbR8,
+              configureSplitRgbaR8,
               first.vao,
               false,
             ],
             [
-              'indexedInterleaved',
-              configureInterleavedRgba,
+              'indexedLive',
+              configureLiveRgba,
               renderer.vao,
               true,
             ],
             [
               'indexedSplit',
-              configureSplitRgbR8,
+              configureSplitRgbaR8,
               first.vao,
               true,
             ],
@@ -399,25 +402,25 @@ test('production split snapshot VBOs match interleaved pixels and indexed draws'
         : [
             [
               'fullSplit',
-              configureSplitRgbR8,
+              configureSplitRgbaR8,
               first.vao,
               false,
             ],
             [
-              'fullInterleaved',
-              configureInterleavedRgba,
+              'fullLive',
+              configureLiveRgba,
               renderer.vao,
               false,
             ],
             [
               'indexedSplit',
-              configureSplitRgbR8,
+              configureSplitRgbaR8,
               first.vao,
               true,
             ],
             [
-              'indexedInterleaved',
-              configureInterleavedRgba,
+              'indexedLive',
+              configureLiveRgba,
               renderer.vao,
               true,
             ],
@@ -450,9 +453,9 @@ test('production split snapshot VBOs match interleaved pixels and indexed draws'
     const gpuTimings = timerExtension === null
       ? null
       : {
-          fullInterleaved: [],
+          fullLive: [],
           fullSplit: [],
-          indexedInterleaved: [],
+          indexedLive: [],
           indexedSplit: [],
         };
     const measureGpu = async (configure, vao, indexed) => {
@@ -503,30 +506,30 @@ test('production split snapshot VBOs match interleaved pixels and indexed draws'
       return null;
     };
     if (gpuTimings !== null) {
-      for (let sample = 0; sample < 5; sample++) {
+      for (let sample = 0; sample < samples; sample++) {
         const order = sample % 2 === 0
           ? [
               [
-                'fullInterleaved',
-                configureInterleavedRgba,
+                'fullLive',
+                configureLiveRgba,
                 renderer.vao,
                 false,
               ],
               [
                 'fullSplit',
-                configureSplitRgbR8,
+                configureSplitRgbaR8,
                 first.vao,
                 false,
               ],
               [
-                'indexedInterleaved',
-                configureInterleavedRgba,
+                'indexedLive',
+                configureLiveRgba,
                 renderer.vao,
                 true,
               ],
               [
                 'indexedSplit',
-                configureSplitRgbR8,
+                configureSplitRgbaR8,
                 first.vao,
                 true,
               ],
@@ -534,25 +537,25 @@ test('production split snapshot VBOs match interleaved pixels and indexed draws'
           : [
               [
                 'fullSplit',
-                configureSplitRgbR8,
+                configureSplitRgbaR8,
                 first.vao,
                 false,
               ],
               [
-                'fullInterleaved',
-                configureInterleavedRgba,
+                'fullLive',
+                configureLiveRgba,
                 renderer.vao,
                 false,
               ],
               [
                 'indexedSplit',
-                configureSplitRgbR8,
+                configureSplitRgbaR8,
                 first.vao,
                 true,
               ],
               [
-                'indexedInterleaved',
-                configureInterleavedRgba,
+                'indexedLive',
+                configureLiveRgba,
                 renderer.vao,
                 true,
               ],
@@ -601,15 +604,15 @@ test('production split snapshot VBOs match interleaved pixels and indexed draws'
       1,
       'Split snapshot',
     );
-    const interleavedPositionAttribute = requireTrackedAttribute(
+    const livePositionAttribute = requireTrackedAttribute(
       renderer.vao,
       0,
-      'Live interleaved',
+      'Live full-detail',
     );
-    const interleavedColorAttribute = requireTrackedAttribute(
+    const liveColorAttribute = requireTrackedAttribute(
       renderer.vao,
       1,
-      'Live interleaved',
+      'Live full-detail',
     );
     const debugInfo =
       gl.getExtension('WEBGL_debug_renderer_info');
@@ -625,7 +628,7 @@ test('production split snapshot VBOs match interleaved pixels and indexed draws'
 
     // Leave the production split full-detail image on the headed canvas for
     // the test artifact, then release every benchmark owner afterward.
-    render(configureSplitRgbR8, first.vao, false);
+    render(configureSplitRgbaR8, first.vao, false);
     window.__disposeSnapshotSplitBenchmark = () => {
       gl.deleteBuffer(indexBuffer);
       renderer.dispose();
@@ -655,8 +658,10 @@ test('production split snapshot VBOs match interleaved pixels and indexed draws'
           bytesAfterFirst - bytesBeforeSnapshots,
         secondSnapshotDelta:
           bytesAfterSecond - bytesAfterFirst,
-        expectedFirstSnapshot: pointCount * 16,
-        expectedSecondSnapshot: pointCount * 4,
+        // Snapshots of the live generation borrow the live 2D position store,
+        // so each adds only its RGBA8 colours (4 bytes a point) and R8 (1).
+        expectedFirstSnapshot: pointCount * 5,
+        expectedSecondSnapshot: pointCount * 5,
       },
       generation: {
         first: renderer.getViewGeometryGeneration('split-a'),
@@ -679,29 +684,32 @@ test('production split snapshot VBOs match interleaved pixels and indexed draws'
       },
       bindings: {
         trackedPointerCallCount: pointerCallCount,
-        interleavedSharesOneBuffer:
-          interleavedPositionAttribute.buffer ===
-            interleavedColorAttribute.buffer &&
-          interleavedPositionAttribute.buffer ===
-            renderer.buffers.interleaved,
-        interleavedPosition: {
-          normalized: interleavedPositionAttribute.normalized,
-          offset: interleavedPositionAttribute.offset,
-          size: interleavedPositionAttribute.size,
-          stride: interleavedPositionAttribute.stride,
+        liveStreamsAreSeparate:
+          livePositionAttribute.buffer ===
+            renderer.buffers.positions &&
+          liveColorAttribute.buffer === renderer.buffers.colors &&
+          livePositionAttribute.buffer !== liveColorAttribute.buffer,
+        livePosition: {
+          normalized: livePositionAttribute.normalized,
+          offset: livePositionAttribute.offset,
+          size: livePositionAttribute.size,
+          stride: livePositionAttribute.stride,
           typeIsFloat:
-            interleavedPositionAttribute.type === gl.FLOAT,
+            livePositionAttribute.type === gl.FLOAT,
         },
-        interleavedColor: {
-          normalized: interleavedColorAttribute.normalized,
-          offset: interleavedColorAttribute.offset,
-          size: interleavedColorAttribute.size,
-          stride: interleavedColorAttribute.stride,
+        liveColor: {
+          normalized: liveColorAttribute.normalized,
+          offset: liveColorAttribute.offset,
+          size: liveColorAttribute.size,
+          stride: liveColorAttribute.stride,
           typeIsUnsignedByte:
-            interleavedColorAttribute.type === gl.UNSIGNED_BYTE,
+            liveColorAttribute.type === gl.UNSIGNED_BYTE,
         },
         splitPositionIsPooled:
           splitPositionAttribute.buffer === geometry.positionBuffer,
+        // A snapshot of the live generation draws the live position store.
+        splitPositionIsLive:
+          splitPositionAttribute.buffer === renderer.buffers.positions,
         splitColorIsPerSnapshot:
           splitColorAttribute.buffer === first.buffer,
         sameGenerationPositionShared:
@@ -726,7 +734,7 @@ test('production split snapshot VBOs match interleaved pixels and indexed draws'
       },
       glError: gl.getError(),
     };
-  }, configuredPointCount);
+  }, { pointCount: configuredPointCount, samples: configuredSamples });
 
   await testInfo.attach('snapshot-split-vbo-benchmark.json', {
     body: Buffer.from(`${JSON.stringify(result, null, 2)}\n`),
@@ -763,36 +771,37 @@ test('production split snapshot VBOs match interleaved pixels and indexed draws'
     owned: true,
   });
   expect(result.bindings).toMatchObject({
-    interleavedSharesOneBuffer: true,
-    interleavedPosition: {
+    liveStreamsAreSeparate: true,
+    livePosition: {
       normalized: false,
       offset: 0,
-      size: 3,
-      stride: 16,
+      size: 2,
+      stride: 8,
       typeIsFloat: true,
     },
-    interleavedColor: {
+    liveColor: {
       normalized: true,
-      offset: 12,
+      offset: 0,
       size: 4,
-      stride: 16,
+      stride: 4,
       typeIsUnsignedByte: true,
     },
     splitPositionIsPooled: true,
+    splitPositionIsLive: true,
     splitColorIsPerSnapshot: true,
     sameGenerationPositionShared: true,
     splitPosition: {
       normalized: false,
       offset: 0,
-      size: 3,
-      stride: 12,
+      size: 2,
+      stride: 8,
       typeIsFloat: true,
     },
     splitColor: {
       normalized: true,
       offset: 0,
-      size: 3,
-      stride: 3,
+      size: 4,
+      stride: 4,
       typeIsUnsignedByte: true,
     },
   });
@@ -817,12 +826,12 @@ test('production split snapshot VBOs match interleaved pixels and indexed draws'
   console.log(
     `[snapshot split VBO ${testInfo.project.name}] ` +
     `${result.pointCount.toLocaleString()} points; ` +
-    `${result.gpuMedians === null ? 'wall' : 'GPU'} full interleaved ` +
-    `${(result.gpuMedians ?? result.medians).fullInterleaved.toFixed(3)} ms/draw, ` +
-    `split RGB+R8 ${(result.gpuMedians ?? result.medians).fullSplit.toFixed(3)} ms/draw; ` +
-    `indexed(${result.indexedCount.toLocaleString()}) interleaved ` +
-    `${(result.gpuMedians ?? result.medians).indexedInterleaved.toFixed(3)} ms/draw, ` +
-    `split RGB+R8 ${(result.gpuMedians ?? result.medians).indexedSplit.toFixed(3)} ms/draw; ` +
+    `${result.gpuMedians === null ? 'wall' : 'GPU'} full live RGBA ` +
+    `${(result.gpuMedians ?? result.medians).fullLive.toFixed(3)} ms/draw, ` +
+    `split RGBA+R8 ${(result.gpuMedians ?? result.medians).fullSplit.toFixed(3)} ms/draw; ` +
+    `indexed(${result.indexedCount.toLocaleString()}) live RGBA ` +
+    `${(result.gpuMedians ?? result.medians).indexedLive.toFixed(3)} ms/draw, ` +
+    `split RGBA+R8 ${(result.gpuMedians ?? result.medians).indexedSplit.toFixed(3)} ms/draw; ` +
     `pixel mismatches full/indexed ` +
     `${result.fullPixels.mismatches}/${result.indexedPixels.mismatches}; ` +
     `${result.runtime.renderer}`,

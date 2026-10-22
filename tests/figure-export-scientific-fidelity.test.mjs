@@ -288,6 +288,48 @@ test('Canvas legend never gives a hidden category a colored swatch', () => {
   );
 });
 
+test('a checked category that other filters leave without cells is marked hidden', () => {
+  // On screen this row is disabled ("No cells available in this category
+  // after other filters"): the figure draws none of its points either.
+  const model = categoryModel({
+    visible: { 0: true, 1: true, 2: true },
+    counts: {
+      available: [4, 0, 2],
+      availableTotal: 6,
+      total: [5, 3, 2],
+      visible: [4, 0, 2],
+      visibleTotal: 6,
+    },
+  });
+  const { svg } = renderSvgLegend({
+    legendRect: WIDE_RECT,
+    fieldKey: 'cell_type',
+    model,
+  });
+  assert.deepEqual(svgTexts(svg), [
+    'cell_type',
+    'B cell',
+    'T cell (hidden)',
+    'Macrophage',
+  ]);
+  assert.doesNotMatch(svg, /rgb\(0,255,0\)/);
+
+  const { ctx, record } = recordingContext();
+  drawCanvasLegend({
+    ctx,
+    legendRect: WIDE_RECT,
+    fieldKey: 'cell_type',
+    model,
+  });
+  assert.deepEqual(
+    record.filledRects
+      .filter((entry) => entry.w === 10 && entry.h === 10)
+      .map((entry) => entry.style),
+    ['rgb(255,0,0)', 'rgb(0,0,255)']
+  );
+  assert.ok(record.texts.map((entry) => entry.text).includes('T cell (hidden)'));
+});
+
 test('SVG and Canvas legends publish identical category text', () => {
   const model = categoryModel();
   const { svg } = renderSvgLegend({
@@ -441,6 +483,20 @@ function gridCameraState() {
 function gridRenderState() {
   return {
     antialias: true,
+    backdrop: {
+      centerY: 0,
+      extentX: 1,
+      extentY: 1,
+      extentZ: 1,
+      flat: false,
+      floorY: -1.12,
+      glowCenterX: 0,
+      look: null,
+      pixelRatio: 1,
+      planarity: 0,
+      stageX: 0,
+      stageZ: 0,
+    },
     bgColor: Float32Array.from([1, 1, 1]),
     cameraDistance: 3,
     cameraPosition: [0, 0, 3],
@@ -477,7 +533,7 @@ function gridView({ id, label, fieldKey, fieldKind, legendModel, filters = [] })
       colors: Uint8Array.from([255, 0, 0, 255]),
       pointCount: 1,
       positions: Float32Array.from([0, 0, 0]),
-      transparency: Float32Array.from([1]),
+      transparency: Uint8Array.from([1]),
     },
     id,
     label,
@@ -491,6 +547,7 @@ function gridView({ id, label, fieldKey, fieldKind, legendModel, filters = [] })
       geometryGeneration: 11,
       legendModel,
       lodMembership: null,
+      drawOrder: null,
       lodSizeMultiplier: 1,
       normTransform: { center: [0, 0, 0], scale: 1 },
     },
@@ -921,13 +978,13 @@ test('each panel counts its own selection instead of copying the active one', as
     view.data.positions = Float32Array.from([0, 0, 0, 0.1, 0.1, 0]);
     view.data.colors = Uint8Array.from([255, 0, 0, 255, 0, 0, 255, 255]);
   }
-  views[0].data.transparency = Float32Array.from([1, 1]);
-  views[1].data.transparency = Float32Array.from([1, 0]);
+  views[0].data.transparency = Uint8Array.from([1, 1]);
+  views[1].data.transparency = Uint8Array.from([1, 0]);
   for (const view of views.slice(2)) {
     view.data.pointCount = 2;
     view.data.positions = Float32Array.from([0, 0, 0, 0.1, 0.1, 0]);
     view.data.colors = Uint8Array.from([255, 0, 0, 255, 0, 0, 255, 255]);
-    view.data.transparency = Float32Array.from([0, 0]);
+    view.data.transparency = Uint8Array.from([0, 0]);
   }
 
   const payload = gridPayload(views);
@@ -949,15 +1006,16 @@ test('each panel counts its own selection instead of copying the active one', as
   assert.equal(
     countHighlightedVisiblePoints({
       highlightArray: Uint8Array.from([255, 255]),
-      transparency: Float32Array.from([1, 0]),
+      transparency: Uint8Array.from([1, 0]),
     }),
     1
   );
   assert.equal(
     countHighlightedVisiblePoints({
       highlightArray: Uint8Array.from([255, 255]),
-      transparency: Float32Array.from([1, 1]),
+      transparency: Uint8Array.from([1, 1]),
       lodMembership: { indices: Uint32Array.from([1]) },
+      drawOrder: null,
     }),
     1
   );
@@ -1008,5 +1066,38 @@ test('both renderers place panel legends through the one shared layout', async (
       /buildProvenanceDescription\(meta\)/,
       `${name} renderer must embed the shared provenance description`
     );
+  }
+});
+
+test('SVG text from the data cannot carry characters XML forbids', async () => {
+  const { svg } = renderSvgLegend({
+    legendRect: WIDE_RECT,
+    fieldKey: 'cell\u0007type',
+    model: categoryModel({
+      categories: ['B\u0001cell <1>', 'T cell\uD800', 'Macro\u001Fphage'],
+      visible: { 0: true, 1: true, 2: true },
+    }),
+  });
+  const xmlForbidden =
+    /[\u0000-\u0008\u000B\u000C\u000E-\u001F￾￿]|[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+  assert.doesNotMatch(svg, xmlForbidden);
+  assert.match(svg, />cell�type</);
+  assert.match(svg, /B�cell &lt;1&gt;/);
+
+  // Every figure-export SVG builder escapes through the XML-safe helper.
+  const root = new URL(
+    '../assets/js/app/ui/modules/figure-export/',
+    import.meta.url
+  );
+  for (const file of [
+    'renderers/svg-renderer.js',
+    'components/axes-builder.js',
+    'components/centroid-overlay.js',
+    'components/legend-builder.js',
+    'components/orientation-indicator.js',
+  ]) {
+    const source = await readFile(new URL(file, root), 'utf8');
+    assert.doesNotMatch(source, /escapeHtml/, file);
+    assert.match(source, /escapeXml\(/, file);
   }
 });

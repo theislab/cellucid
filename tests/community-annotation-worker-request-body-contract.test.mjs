@@ -1,9 +1,12 @@
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
 
 import worker from '../assets/js/app/community-annotations/_worker-code.js';
 import { parseExactJson } from '../assets/js/app/community-annotations/wire-contract.js';
+import { withMockedFetch } from './helpers/worker-fetch.mjs';
 
 const ENV = Object.freeze({
   ALLOWED_ORIGINS: 'https://app.example,http://localhost:8000',
@@ -78,16 +81,6 @@ async function responseDocument(response) {
   return parseExactJson(await response.text(), {
     path: `Worker HTTP ${response.status} response`,
   });
-}
-
-async function withMockedFetch(mockFetch, callback) {
-  const previousFetch = globalThis.fetch;
-  globalThis.fetch = mockFetch;
-  try {
-    return await callback();
-  } finally {
-    globalThis.fetch = previousFetch;
-  }
 }
 
 function oneChunkBody(bytes) {
@@ -276,7 +269,7 @@ function observeBodyOwnership(body) {
   };
 }
 
-test('Wrangler enables only the exact incoming Request.signal flag', () => {
+test('Wrangler enables only the exact incoming Request.signal flag and sets no plan-only limit', () => {
   const config = parseExactJson(
     readFileSync(
       new URL('../wrangler.community-annotations.jsonc', import.meta.url),
@@ -288,7 +281,24 @@ test('Wrangler enables only the exact incoming Request.signal flag', () => {
     config.compatibility_flags,
     ['enable_request_signal']
   );
-  assert.deepEqual(config.limits, { cpu_ms: 1_000 });
+  // A configured CPU limit is a Workers Paid feature; Cloudflare refuses to
+  // deploy it on the Free plan the production Worker runs on.
+  assert.equal(Object.hasOwn(config, 'limits'), false);
+  // Every preview URL would serve the same secrets at another address; OAuth
+  // is registered only for the production workers.dev origin.
+  assert.equal(config.preview_urls, false);
+});
+
+test('local Wrangler builds and Miniflare state are never committed', () => {
+  const ignored = readFileSync(new URL('../.gitignore', import.meta.url), 'utf8')
+    .split('\n')
+    .map(line => line.trim());
+  assert.ok(ignored.includes('/.wrangler/'));
+  const tracked = execFileSync('git', ['ls-files', '--', '.wrangler'], {
+    cwd: fileURLToPath(new URL('..', import.meta.url)),
+    encoding: 'utf8',
+  });
+  assert.equal(tracked, '');
 });
 
 test('Worker bundle validation pins Wrangler and runs only on Node 24 in CI', () => {

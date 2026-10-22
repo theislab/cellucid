@@ -17,17 +17,26 @@ const CAP_DEFAULT_TIMEOUT_MS = 12_000;
 const CAP_WORKER_CONTRACT_VERSION = 1;
 const CAP_REQUEST_BODY_MAX_BYTES = 4 * 1024;
 const CAP_RESPONSE_BODY_MAX_BYTES = 8 * 1024 * 1024;
-const CAP_LOOKUP_LIMIT = 25;
-const CAP_DATASET_LIMIT = 10;
+/**
+ * Results one lookup fetches (the worker's CAP_LOOKUP_LIMIT_MAX). The voting
+ * modal asks for all of them, so every fetched result is shown; a term whose
+ * matches exceed one lookup is narrowed by the user.
+ */
+export const CAP_LOOKUP_LIMIT = 25;
 const CAP_TERM_MAX_CODEPOINTS = 256;
 const CAP_MARKER_TERM_MAX_CODEPOINTS = (50 * 64) + 49;
-const CAP_RESULT_TEXT_MAX_CODEPOINTS = 512;
-const CAP_RESULT_ID_MAX_CODEPOINTS = 64;
-const CAP_RESULT_GENE_MAX_CODEPOINTS = 64;
-const CAP_RESULT_SYNONYM_LIMIT = 100;
-const CAP_RESULT_MARKER_LIMIT = 200;
+// A CAP result's strings and arrays have no length limit of their own: a
+// result is shown whole, and the whole response is bounded by
+// CAP_RESPONSE_BODY_MAX_BYTES.
+const CAP_RESULT_UNBOUNDED = Number.MAX_SAFE_INTEGER;
+// A gene a marker search may name: the worker accepts at most
+// CAP_MARKER_TERM_MAX_CODEPOINTS for the whole marker signature.
+const CAP_MARKER_GENE_MAX_CODEPOINTS = 64;
+// The worker's own error sentences are short; a longer "error" is not one of
+// them, and the status code is shown instead (MSG).
+const CAP_WORKER_ERROR_MAX_CODEPOINTS = 512;
 
-const LOOKUP_KINDS = new Set(['name', 'ontology', 'marker', 'feedback']);
+const LOOKUP_KINDS = new Set(['name', 'ontology', 'marker']);
 const LOOKUP_RESULT_KEYS = [
   'canonicalMarkerGenes',
   'count',
@@ -40,7 +49,6 @@ const LOOKUP_RESULT_KEYS = [
   'scores',
   'synonyms',
 ];
-const DATASET_RESULT_KEYS = ['cellCount', 'id', 'name'];
 
 function toCleanString(value) {
   return String(value ?? '').trim();
@@ -99,19 +107,12 @@ function assertNonnegativeSafeInteger(value, label) {
   return value;
 }
 
-function assertExactStringArray(value, label, {
-  maxItems,
-  maxCodePoints,
-} = {}) {
-  if (!Array.isArray(value) || value.length > maxItems) {
-    throw new Error(`${label} must be an array of at most ${maxItems} strings`);
+function assertExactStringArray(value, label) {
+  if (!Array.isArray(value)) {
+    throw new Error(`${label} must be an array of strings`);
   }
   return value.map((entry, index) => (
-    assertBoundedString(
-      entry,
-      `${label}[${index}]`,
-      maxCodePoints
-    )
+    assertBoundedString(entry, `${label}[${index}]`, CAP_RESULT_UNBOUNDED)
   ));
 }
 
@@ -224,12 +225,8 @@ function isNetworkError(error) {
   return /failed to fetch|load failed|networkerror|fetch failed/i.test(message);
 }
 
-function workerUrl(path) {
-  if (path !== '/cap/lookup-cells' && path !== '/cap/search-datasets') {
-    throw new Error('CAP proxy path is not an approved persisted operation');
-  }
-  return `${getGitHubWorkerOrigin()}${path}`;
-}
+/** The worker's one CAP route: a fixed persisted cell-type lookup. */
+const CAP_LOOKUP_PATH = '/cap/lookup-cells';
 
 function parseWorkerError(value, status) {
   if (
@@ -242,7 +239,7 @@ function parseWorkerError(value, status) {
     !/^\s|\s$/.test(value.error) &&
     !exceedsCodePointLimit(
       value.error,
-      CAP_RESULT_TEXT_MAX_CODEPOINTS
+      CAP_WORKER_ERROR_MAX_CODEPOINTS
     )
   ) {
     return value.error;
@@ -380,16 +377,14 @@ async function readBoundedResponseText(response) {
   return text;
 }
 
-async function executeProxy(path, body, {
+async function executeLookupProxy(body, {
   signal = null,
   timeoutMs = CAP_DEFAULT_TIMEOUT_MS,
 } = {}) {
   assertExactObject(
     body,
     'CAP proxy request body',
-    path === '/cap/lookup-cells'
-      ? ['kind', 'term', 'limit']
-      : ['search', 'limit']
+    ['kind', 'term', 'limit']
   );
   const scope = createRequestAbortScope(signal, timeoutMs);
   try {
@@ -404,7 +399,7 @@ async function executeProxy(path, body, {
         'CAP_REQUEST_TOO_LARGE'
       );
     }
-    const response = await fetch(workerUrl(path), {
+    const response = await fetch(`${getGitHubWorkerOrigin()}${CAP_LOOKUP_PATH}`, {
       method: 'POST',
       credentials: 'omit',
       headers: {
@@ -430,7 +425,7 @@ async function executeProxy(path, body, {
       if (text) {
         try {
           const errorDocument = parseExactJson(text, {
-            path: `CAP proxy ${path} error response`,
+            path: `CAP proxy ${CAP_LOOKUP_PATH} error response`,
           });
           const workerDetail = parseWorkerError(
             errorDocument,
@@ -449,7 +444,7 @@ async function executeProxy(path, body, {
     let document;
     try {
       if (!text) throw new Error('empty response body');
-      document = parseExactJson(text, { path: `CAP proxy ${path} response` });
+      document = parseExactJson(text, { path: `CAP proxy ${CAP_LOOKUP_PATH} response` });
     } catch (cause) {
       throw new Error(`CAP proxy returned invalid JSON: ${cause?.message || cause}`, {
         cause,
@@ -457,7 +452,7 @@ async function executeProxy(path, body, {
     }
     return assertExactObject(
       document,
-      `CAP proxy ${path} response`,
+      `CAP proxy ${CAP_LOOKUP_PATH} response`,
       ['contractVersion', 'results', 'omittedInvalidCount']
     );
   } catch (error) {
@@ -494,53 +489,33 @@ function validateLookupResult(value, index) {
     throw new Error(`${path}.scores total must be a safe integer`);
   }
   return {
-    id: assertBoundedString(item.id, `${path}.id`, CAP_RESULT_ID_MAX_CODEPOINTS),
-    name: assertBoundedString(item.name, `${path}.name`, CAP_RESULT_TEXT_MAX_CODEPOINTS),
+    id: assertBoundedString(item.id, `${path}.id`, CAP_RESULT_UNBOUNDED),
+    name: assertBoundedString(item.name, `${path}.name`, CAP_RESULT_UNBOUNDED),
     fullName: assertBoundedString(
       item.fullName,
       `${path}.fullName`,
-      CAP_RESULT_TEXT_MAX_CODEPOINTS
+      CAP_RESULT_UNBOUNDED
     ),
     ontologyTerm: assertBoundedString(
       item.ontologyTerm,
       `${path}.ontologyTerm`,
-      CAP_RESULT_TEXT_MAX_CODEPOINTS,
+      CAP_RESULT_UNBOUNDED,
       { nullable: true }
     ),
     ontologyTermId: assertBoundedString(
       item.ontologyTermId,
       `${path}.ontologyTermId`,
-      CAP_RESULT_ID_MAX_CODEPOINTS,
+      CAP_RESULT_UNBOUNDED,
       { nullable: true }
     ),
-    synonyms: assertExactStringArray(item.synonyms, `${path}.synonyms`, {
-      maxItems: CAP_RESULT_SYNONYM_LIMIT,
-      maxCodePoints: CAP_RESULT_TEXT_MAX_CODEPOINTS,
-    }),
-    markerGenes: assertExactStringArray(item.markerGenes, `${path}.markerGenes`, {
-      maxItems: CAP_RESULT_MARKER_LIMIT,
-      maxCodePoints: CAP_RESULT_GENE_MAX_CODEPOINTS,
-    }),
+    synonyms: assertExactStringArray(item.synonyms, `${path}.synonyms`),
+    markerGenes: assertExactStringArray(item.markerGenes, `${path}.markerGenes`),
     canonicalMarkerGenes: assertExactStringArray(
       item.canonicalMarkerGenes,
-      `${path}.canonicalMarkerGenes`,
-      {
-        maxItems: CAP_RESULT_MARKER_LIMIT,
-        maxCodePoints: CAP_RESULT_GENE_MAX_CODEPOINTS,
-      }
+      `${path}.canonicalMarkerGenes`
     ),
     count: assertNonnegativeSafeInteger(item.count, `${path}.count`),
     scores: { agree, disagree, idk },
-  };
-}
-
-function validateDatasetResult(value, index) {
-  const path = `CAP dataset results[${index}]`;
-  const item = assertExactObject(value, path, DATASET_RESULT_KEYS);
-  return {
-    id: assertBoundedString(item.id, `${path}.id`, CAP_RESULT_ID_MAX_CODEPOINTS),
-    name: assertBoundedString(item.name, `${path}.name`, CAP_RESULT_TEXT_MAX_CODEPOINTS),
-    cellCount: assertNonnegativeSafeInteger(item.cellCount, `${path}.cellCount`),
   };
 }
 
@@ -661,7 +636,7 @@ function normalizeMarkerSearchInput(markerGenes) {
     const gene = assertBoundedString(
       markerGenes[index],
       `CAP markerGenes[${index}]`,
-      CAP_RESULT_GENE_MAX_CODEPOINTS
+      CAP_MARKER_GENE_MAX_CODEPOINTS
     );
     const key = normalizeMarkerKey(gene);
     if (seen.has(key)) continue;
@@ -772,7 +747,7 @@ function rankAndDedupe(results, searchTerm, markerGenes, limit) {
 
 function assertLookupKind(kind) {
   if (!LOOKUP_KINDS.has(kind)) {
-    throw new Error('CAP lookup kind must equal name, ontology, marker, or feedback');
+    throw new Error('CAP lookup kind must equal name, ontology, or marker');
   }
   return kind;
 }
@@ -826,8 +801,7 @@ export async function searchCellTypes(searchTerm, limit = 10, options = {}) {
   const term = assertSearchTerm(searchTerm, kind);
   if (!term) return { results: [], omittedInvalidCount: 0 };
   const markerGenes = normalizeMarkerSearchInput(exactOptions.markerGenes ?? null);
-  const document = await executeProxy(
-    '/cap/lookup-cells',
+  const document = await executeLookupProxy(
     { kind, term, limit: CAP_LOOKUP_LIMIT },
     {
       signal: exactOptions.signal ?? null,
@@ -866,185 +840,4 @@ export async function lookupByOntologyId(ontologyId, options = {}) {
     results: match ? [match] : [],
     omittedInvalidCount: envelope.omittedInvalidCount,
   };
-}
-
-export async function lookupByName(name, options = {}) {
-  const exactOptions = assertOptions(
-    options,
-    ['signal', 'timeoutMs'],
-    'CAP name lookup options'
-  );
-  const term = assertSearchTerm(name, 'name');
-  if (!term) return { results: [], omittedInvalidCount: 0 };
-  const envelope = await searchCellTypes(term, CAP_LOOKUP_LIMIT, {
-    kind: 'name',
-    ...exactOptions,
-  });
-  const normalized = term.toLowerCase();
-  const match = envelope.results.find((result) => (
-    result.fullName.toLowerCase() === normalized ||
-    result.name.toLowerCase() === normalized ||
-    result.ontologyTerm?.toLowerCase() === normalized ||
-    result.synonyms.some((synonym) => synonym.toLowerCase() === normalized)
-  ));
-  return {
-    results: match ? [match] : [],
-    omittedInvalidCount: envelope.omittedInvalidCount,
-  };
-}
-
-export async function getCommunityFeedback(cellTypeName, options = {}) {
-  const exactOptions = assertOptions(
-    options,
-    ['signal', 'timeoutMs'],
-    'CAP feedback options'
-  );
-  const term = assertSearchTerm(cellTypeName, 'feedback');
-  if (!term) return { results: [], omittedInvalidCount: 0 };
-  const envelope = await searchCellTypes(term, CAP_LOOKUP_LIMIT, {
-    kind: 'feedback',
-    ...exactOptions,
-  });
-  const normalized = term.toLowerCase();
-  const label = envelope.results.find((result) => (
-    result.fullName.toLowerCase() === normalized ||
-    result.name.toLowerCase() === normalized
-  ));
-  if (!label) {
-    return { results: [], omittedInvalidCount: envelope.omittedInvalidCount };
-  }
-  const { agree, disagree, idk } = label.scores;
-  const total = agree + disagree + idk;
-  if (!Number.isSafeInteger(total)) {
-    throw new Error('CAP feedback total must be a safe integer');
-  }
-  return {
-    results: [{
-      name: label.fullName || label.name,
-      feedback: { agree, disagree, idk },
-      total,
-      agreePercent: total > 0 ? Math.round((agree / total) * 100) : 0,
-    }],
-    omittedInvalidCount: envelope.omittedInvalidCount,
-  };
-}
-
-export async function findSynonyms(cellTypeName, options = {}) {
-  const envelope = await lookupByName(cellTypeName, options);
-  const label = envelope.results[0] ?? null;
-  if (!label) return envelope;
-  const allNames = new Set([label.name, label.fullName]);
-  if (label.ontologyTerm) allNames.add(label.ontologyTerm);
-  const synonyms = label.synonyms.filter((synonym) => synonym !== 'unknown');
-  for (const synonym of synonyms) allNames.add(synonym);
-  return {
-    results: [{
-      name: label.fullName || label.name,
-      ontologyTermId: label.ontologyTermId,
-      synonyms,
-      allNames: [...allNames],
-    }],
-    omittedInvalidCount: envelope.omittedInvalidCount,
-  };
-}
-
-export async function checkIfSynonyms(name1, name2, options = {}) {
-  const exactOptions = assertOptions(
-    options,
-    ['signal', 'timeoutMs'],
-    'CAP synonym comparison options'
-  );
-  const firstName = assertSearchTerm(name1, 'name');
-  const secondName = assertSearchTerm(name2, 'name');
-  if (!firstName || !secondName) {
-    return {
-      results: [{
-        areSynonyms: false,
-        sharedOntologyId: null,
-        canonicalName: null,
-      }],
-      omittedInvalidCount: 0,
-    };
-  }
-  if (firstName.toLowerCase() === secondName.toLowerCase()) {
-    return {
-      results: [{
-        areSynonyms: true,
-        sharedOntologyId: null,
-        canonicalName: firstName,
-      }],
-      omittedInvalidCount: 0,
-    };
-  }
-  const [firstEnvelope, secondEnvelope] = await Promise.all([
-    findSynonyms(firstName, exactOptions),
-    findSynonyms(secondName, exactOptions),
-  ]);
-  const omittedInvalidCount =
-    firstEnvelope.omittedInvalidCount + secondEnvelope.omittedInvalidCount;
-  if (!Number.isSafeInteger(omittedInvalidCount)) {
-    throw new Error('CAP combined omittedInvalidCount must be a safe integer');
-  }
-  const first = firstEnvelope.results[0] ?? null;
-  const second = secondEnvelope.results[0] ?? null;
-  const firstLower = firstName.toLowerCase();
-  const secondLower = secondName.toLowerCase();
-  let result = {
-    areSynonyms: false,
-    sharedOntologyId: null,
-    canonicalName: null,
-  };
-  if (
-    first?.ontologyTermId &&
-    second?.ontologyTermId &&
-    first.ontologyTermId === second.ontologyTermId
-  ) {
-    result = {
-      areSynonyms: true,
-      sharedOntologyId: first.ontologyTermId,
-      canonicalName: first.name,
-    };
-  } else if (first?.allNames.some((name) => name.toLowerCase() === secondLower)) {
-    result = {
-      areSynonyms: true,
-      sharedOntologyId: first.ontologyTermId,
-      canonicalName: first.name,
-    };
-  } else if (second?.allNames.some((name) => name.toLowerCase() === firstLower)) {
-    result = {
-      areSynonyms: true,
-      sharedOntologyId: second.ontologyTermId,
-      canonicalName: second.name,
-    };
-  }
-  return { results: [result], omittedInvalidCount };
-}
-
-export async function searchDatasets(options = {}) {
-  const exactOptions = assertOptions(
-    options,
-    ['search', 'limit', 'signal', 'timeoutMs'],
-    'CAP dataset options'
-  );
-  const search = exactOptions.search ?? null;
-  const limit = exactOptions.limit ?? CAP_DATASET_LIMIT;
-  const signal = exactOptions.signal ?? null;
-  const timeoutMs = exactOptions.timeoutMs ?? CAP_DEFAULT_TIMEOUT_MS;
-  assertLimit(limit, CAP_DATASET_LIMIT, 'CAP dataset limit');
-  let exactSearch = null;
-  if (search !== null) {
-    exactSearch = assertSearchTerm(search, 'name');
-    if (!exactSearch) exactSearch = null;
-  }
-  const document = await executeProxy(
-    '/cap/search-datasets',
-    { search: exactSearch, limit },
-    { signal, timeoutMs }
-  );
-  return validateEnvelope(
-    document,
-    validateDatasetResult,
-    'CAP dataset response',
-    limit
-  );
 }

@@ -30,6 +30,10 @@ function createViewerContextLostError(ownerName) {
   return error;
 }
 
+function isReaderMethodName(property) {
+  return typeof property === 'string' && /^(get|has|is)[A-Z]/.test(property);
+}
+
 function createRendererDisposedError(ownerName) {
   const error = new Error(
     `${ownerName} is unavailable after viewer dispose(); ` +
@@ -39,7 +43,21 @@ function createRendererDisposedError(ownerName) {
   return error;
 }
 
-export function createViewerRendererFacade(renderer, getTerminalState) {
+/**
+ * @param {Object} renderer
+ * @param {() => (string|null)} getTerminalState
+ * @param {() => void} onMutation - Called before any call or write through
+ *   the facade that can change what the renderer draws; methods named
+ *   `get*`, `has*`, or `is*` only read.
+ */
+export function createViewerRendererFacade(
+  renderer,
+  getTerminalState,
+  onMutation
+) {
+  if (typeof onMutation !== 'function') {
+    throw new TypeError('Renderer facade requires a mutation observer.');
+  }
   const methodFacades = new Map();
   const restorationMethods = new WeakMap();
   const guardedValues = new WeakMap();
@@ -53,7 +71,6 @@ export function createViewerRendererFacade(renderer, getTerminalState) {
     'activeProgram',
     'buffers',
     'gl',
-    'lodBuffersByDimension',
     'programs',
     'snapshotBuffers',
     'spatialIndices',
@@ -1024,6 +1041,7 @@ export function createViewerRendererFacade(renderer, getTerminalState) {
             }
           : function guardedRendererMethod(...args) {
               assertMutable(`Renderer method "${String(property)}"`);
+              if (!isReaderMethodName(property)) onMutation();
               return guardRendererMethodResult(
                 Reflect.apply(
                   value,
@@ -1058,6 +1076,7 @@ export function createViewerRendererFacade(renderer, getTerminalState) {
     },
     set(target, property, value) {
       assertMutable(`Renderer property "${String(property)}"`);
+      onMutation();
       if (isReadOnlyRendererOwner(property)) {
         throw new TypeError(
           `Renderer property "${String(property)}" is read-only.`
@@ -1073,6 +1092,7 @@ export function createViewerRendererFacade(renderer, getTerminalState) {
     },
     defineProperty(target, property, descriptor) {
       assertMutable(`Renderer property "${String(property)}"`);
+      onMutation();
       if (isReadOnlyRendererOwner(property)) {
         throw new TypeError(
           `Renderer property "${String(property)}" is read-only.`
@@ -1112,6 +1132,7 @@ export function createViewerRendererFacade(renderer, getTerminalState) {
     },
     deleteProperty(target, property) {
       assertMutable(`Renderer property "${String(property)}"`);
+      onMutation();
       if (isReadOnlyRendererOwner(property)) {
         throw new TypeError(
           `Renderer property "${String(property)}" is read-only.`

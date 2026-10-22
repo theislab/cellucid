@@ -12,7 +12,8 @@ Current constraints:
 - The reader implements one exact current document shape and rejects every
   other shape; restoration is always all-or-nothing.
 - Sessions are treated as **untrusted input** with exact profiles, bounds,
-  single-member gzip preflight, and transactional rollback.
+  an exact single-member gzip envelope (trailer size checked before one paced
+  native inflate), and transactional rollback.
 - Row indices restore only against a proven cell ordering; a bundle whose
   ordering cannot be proven is refused. See
   [Dataset Fingerprint (Cell-Order Identity)](#dataset-fingerprint-cell-order-identity).
@@ -33,8 +34,8 @@ UI refresh succeeds. Any later failure rolls back earlier state.
 
 ## Explicit Session Loading
 
-Ordinary user state is saved and restored through **Save State** and **Load
-State**. Separately, an official catalog generation may explicitly advertise
+Ordinary user state is saved and restored through the **Save** and **Load**
+buttons under Session file. Separately, an official catalog generation may explicitly advertise
 one SHA-256-pinned five-chunk `default.cellucid-session`; Cellucid applies that
 bounded static view automatically after the scientific dataset is published.
 Other startup/data-source paths are not probed.
@@ -57,9 +58,10 @@ Scheduled eagerly:
 - **Camera state** (position/orbit target/navigation mode, etc.)
   - Locked cameras: one global camera state
   - Unlocked cameras: per-view camera states (live + each snapshot view)
-- **Dimension levels**
-  - Live view dimension level
-  - Each snapshot view’s dimension level (so each view returns to the correct embedding)
+- **Representations**
+  - The embedding reference the live view shows (`liveEmbedding`)
+  - The embedding reference each snapshot view shows (`embedding`); a view’s
+    dimension is its representation’s and is not stored separately
 - **Views / multiview**
   - Layout mode (single/grid)
   - Active view id (which view is focused)
@@ -146,7 +148,7 @@ These are the chunk IDs you will see inside a `.cellucid-session` file:
 | Chunk id | Priority | Dataset dependent | Contains |
 |---|---:|---:|---|
 | `core/field-overlays` | eager | yes | rename/delete registries + user-defined field definitions (metadata only) |
-| `core/state` | eager | yes | camera + UI controls + dimension + filters + active fields + multiview descriptors |
+| `core/state` | eager | yes | camera + UI controls + each view's representation + filters + active fields + multiview descriptors |
 | `ui/dockable-layout` | eager | no | floating non-analysis panels geometry + open/closed |
 | `analysis/windows` | eager | yes | open analysis windows descriptors (settings + geometry) |
 | `highlights/meta` | eager | yes | highlight pages + group shells (no cellIndices) |
@@ -170,7 +172,7 @@ reordered, or dishonestly described chunks are rejected before success.
 The official published-default path is deliberately different. It accepts
 exactly the first five static gzip/JSON chunks through `highlights/meta`, in
 that order, only after catalog manifest and SHA-256 verification. It contains
-no cinematic/cache data and is not accepted by generic **Load State**.
+no cinematic/cache data and is not accepted by the generic Session file **Load**.
 
 ---
 
@@ -181,20 +183,38 @@ cell identifiers. Those indices are only meaningful against one ordering of the
 dataset, so the manifest fingerprint has to pin that ordering, not just the
 dataset.
 
-`datasetFingerprint` has exactly five fields:
+`datasetFingerprint` has exactly six fields:
 
 | Field | Derived from | Shape |
 |---|---|---|
 | `sourceType` | `dataSourceManager.getCurrentSourceType()` | string or `null` |
 | `datasetId` | `dataSourceManager.getCurrentDatasetId()` | string or `null` |
 | `cellCount` | `state.pointCount` | safe integer |
-| `varCount` | `state.varData.fields.length` | safe integer |
-| `cellOrder` | see below | `{ dimension, digest }` |
+| `varCount` | source var fields in `state.varData.fields` (user-defined fields excluded) | safe integer |
+| `cellOrder` | see below | `{ embedding, dimension, digest }` |
+| `dataMapping` | `state.getDataMapping()` | a canonical DataMapping (`data/data-mapping.js`) |
 
-`cellOrder.dimension` is `state.getViewDimensionLevel('live')`, exactly 1, 2, or
-3. `cellOrder.digest` is 16 lowercase hex characters produced by
-`digestCellOrder(state.positionsArray)` in
-`cellucid/assets/js/app/session/session-context.js`.
+`dataMapping` names the stored arrays the dataset is shown with: the embeddings
+that are on (`embeddings.enabled`, any number of each dimension), the default
+of each dimension (`embeddings.defaults`), and the vector bindings, and for an
+AnnData source the
+neighbour graph, gene names, expression matrix and latent space. It is resolved
+once per load by `data/dataset-mapping.js` (from `dataset_identity.json` for a
+prepared export, from the AnnData candidate catalog for an `.h5ad` or Zarr file
+opened in the browser or an object a Python server serves) and changed in the
+Session › Data mapping panel (`state/managers/mapping-manager.js`). The panel
+changes only the embeddings (which are on, and each dimension's default); the
+other groups are fixed for the session.
+
+`cellOrder.embedding` names the layout the live view shows: an export's
+embedding id with `columns: null`, or an AnnData `obsm` key with its 0-based
+columns. `cellOrder.dimension` is that layout's dimension, exactly 1, 2, or 3.
+`cellOrder.digest` is 16 lowercase hex characters produced by
+`digestCellOrder(state.positionsArray, dimension)` in
+`cellucid/assets/js/app/session/session-context.js`. The digest is defined over
+XYZ triples: the live positions hold only the embedding's own components per
+cell, and the axes a 1D or 2D embedding does not have are folded in as zero
+words, so the digest does not depend on the in-memory layout.
 
 Why the coordinates:
 - The four scalars all survive a row permutation. Re-export a dataset at the
@@ -205,11 +225,12 @@ Why the coordinates:
 - Positions are the only per-cell payload the viewer always holds in memory, and
   a re-ordered export permutes them.
 
-Why the dimension travels with the digest:
-- The 1D, 2D, and 3D embeddings are separate exported files, normalized
-  independently, so a digest is comparable only within one of them.
-- Recording the dimension is what lets a mismatch be attributed to the view on
-  screen rather than to the data.
+Why the embedding travels with the digest:
+- Every embedding is a separate payload, normalized on its own, so a digest is
+  comparable only within one of them.
+- A restore verifies the digest against the very layout the session names,
+  loading it (pinned, without touching any view) whichever layout is on screen,
+  so a session saved in 2D opens while 3D is shown.
 
 Cost and memoization:
 - 4.3 ms for the digest and 5.6 ms for the complete fingerprint on 842k cells
@@ -218,28 +239,40 @@ Cost and memoization:
   never rewritten, on every dataset and dimension change, so the per-contributor
   re-derivations during one capture cost 0.06 ms in total.
 
-Four refusals, four distinct messages surfaced verbatim by the session controls:
+Restore is verify-then-apply (`verifySessionFingerprint()`): every check below
+runs before any chunk touches state, and each refusal has its own message,
+surfaced verbatim by the session controls:
 
 | Cause | Where it is raised | What the user is told |
 |---|---|---|
 | Fingerprint with only the four pre-`cellOrder` keys | `assertDatasetFingerprint()`, during manifest validation | the file was saved before Cellucid recorded which cells a selection contains, so its selections can never be confirmed; re-create them and save again |
-| Any of the four scalars differs | `describeDatasetFingerprintMismatch()` | it is a different dataset, with both saved and current cell/gene counts named |
-| `cellOrder.dimension` differs | `describeDatasetFingerprintMismatch()` | both dimensions are named; switching back to the saved one resolves it |
-| `cellOrder.digest` differs, everything else matches | `describeDatasetFingerprintMismatch()` | same name and counts, different cell order, so every saved selection would mark the wrong cells |
+| Fingerprint with `cellOrder` but no `dataMapping` | `assertDatasetFingerprint()`, during manifest validation | the file was saved by an earlier release, before sessions recorded the data mapping; re-create the view and save again |
+| Any of the four scalars differs | `verifySessionFingerprint()` | it is a different dataset, with both saved and current cell/gene counts named |
+| `dataMapping` differs in a group the viewer cannot change (graph, gene names, expression, latent space, vector fields), or turns on an embedding this dataset cannot show | `verifySessionFingerprint()` | the group or the embedding is named, by its embedding id or `obsm` key |
+| `cellOrder.embedding` names no layout of this dataset | `verifySessionFingerprint()` | the embedding is named |
+| `cellOrder.digest` differs, everything else matches | `verifySessionFingerprint()` | same name and counts, different cell order, so every saved selection would mark the wrong cells |
+
+A session whose embeddings differ from the open dataset's, but which the
+dataset can show, is not refused: before any chunk restores a view, the
+restore turns on the union of the session's and the dataset's enabled
+embeddings, so every view the session names can be shown; at commit the
+session's exact mapping (its enabled set and defaults) is applied, as a
+participant of the restore transaction whose rollback restores the previous
+mapping.
 
 Attributing a refusal to the wrong cause is itself an integrity failure: telling
-someone their data was re-ordered when they only switched the view teaches them
-to distrust a sound dataset. Keep the four causes separate when changing this
-code.
+someone their data was re-ordered when the session only named another embedding
+teaches them to distrust a sound dataset. Keep the causes separate when changing
+this code.
 
 A file carrying only the four scalars is refused, not accepted. Accepting it
 would preserve exactly the unverifiable state the record exists to eliminate,
 permanently, for every file already written.
 
 The published-default path is not exempt. `restorePublishedDefaultState()`
-shares `validateManifest()` and the same fingerprint comparison, so an
-advertised `default.cellucid-session` must carry `cellOrder` and must have been
-saved on the dimension the dataset publishes as its default.
+shares `validateManifest()` and the same fingerprint verification, so an
+advertised `default.cellucid-session` must carry `cellOrder` and `dataMapping`,
+and must have been captured in the generation's default data mapping.
 
 ---
 
@@ -352,9 +385,30 @@ detectable event. See
 controls to the **end of the same restore call** and returns a function that
 applies them. It orders controls against each other, not against the bootstrap;
 `session/contributors/core-state.js` uses it so `render-mode` is replayed last,
-after the snapshot graph is rebuilt.
+after the snapshot graph is rebuilt. `withholdControlIds` names controls that
+are validated and never applied (a smoke session on a device that cannot run
+smoke: the mode is reported instead).
+
+A subtree marked `data-state-serializer-after-embedding="true"` holds controls
+whose *choices* follow the embedding the active view shows: the vector-field
+block, where a field is bound to one embedding and the select lists different
+fields, or none, per view layout. Those controls stay in the inventory, their
+records are checked for shape with every other control, but their values are
+checked against the interface and applied only by the returned function, which
+`core-state.js` calls after the embeddings, the kept views and the active view
+are back. Checked earlier, a session saved on one embedding was refused on a
+page showing another (`Session UI select option "" is not available in current
+control "velocity-field"`); applied earlier, the saved field was overwritten
+when the embedding changed under it. `embeddingDependentControlIds()` lists
+them.
 
 Explicit exclusions:
+- Any control whose id was minted on the page by `createDomId`
+  (`ui/components/dom-id.js`, `isGeneratedDomId`) is ignored. Such an id is
+  unique to that page, so a session that recorded it could never be loaded on
+  another one; what the control shows is saved by the state that renders it.
+  The continuous legend's range sliders (`minimum-1b`, …) are the case that
+  made saved sessions unloadable.
 - Any subtree marked with `data-state-serializer-skip="true"` is ignored.
   - Figure Export root is skipped in `cellucid/index.html`
   - Figure Export controls subtree is also skipped in `cellucid/assets/js/app/ui/modules/figure-export/figure-export-ui.js`
@@ -369,7 +423,10 @@ Explicit exclusions:
   - Active field selectors: `categorical-field`, `continuous-field`, `gene-expression-search`
   - Outlier slider: `outlier-filter` (restored after active field is set)
   - Navigation mode: `navigation-mode` (restored by camera restore)
-  - Dimension select: `dimension-select` (restored explicitly to avoid async handler races)
+  - Representation picker: `view-representation-select` (what each view
+    shows is restored by `core/state` as `liveEmbedding` and by the multiview
+    descriptors as each snapshot's `embedding`; the picker redraws from the
+    state)
   - Dataset/connection controls: `dataset-select`, `remote-server-url`, `github-repo-url` (sessions assume the dataset is already loaded)
   - Pointer capture: `pointer-lock` is not restored by anything. It is not a
     preference — it mirrors the browser's live pointer-lock state, and
@@ -386,6 +443,9 @@ Categorical fields:
 - category color overrides (`_categoryColors`), recorded as `categoryName`
 - filter enabled/disabled (`_categoryFilterEnabled`)
 - colormap override (`_colormapId`)
+- outlier enabled + threshold (`_outlierFilterEnabled`, `_outlierThreshold`);
+  the export writes latent outlier quantiles only for categorical fields, so
+  this is the only entry kind that carries them
 
 Fields are recorded by `source:key` and categories by name, never by position.
 A position in the obs/var inventory or in `field.categories` is not pinned by
@@ -402,7 +462,6 @@ Continuous fields:
 - filter enabled/disabled (`_filterEnabled`)
 - log scale (`_useLogScale`)
 - color-range follows filter (`_useFilterColorRange`)
-- outlier enabled + threshold (`_outlierFilterEnabled`, `_outlierThreshold`)
 - colormap override (`_colormapId`)
 
 Restore behavior:
@@ -434,11 +493,19 @@ Per snapshot, this restores:
 - view label/meta
 - per-view filters + active fields (drives coloring/filtering)
 - per-view outlier threshold
-- per-view dimension level
+- per-view representation (its embedding reference)
 - per-view camera state when cameras are unlocked
 
-Important detail:
-- Snapshot dimension restoration uses `state.setDimensionLevel(level, { viewId })` so each view renders the correct embedding.
+Important details:
+- Snapshot representation restoration uses `state.restoreViewEmbedding(viewId, ref)`, which resolves the saved reference to the layout the view shows; a view that shows its dimension's default follows it again.
+- The live camera is verified with `cameraStatesHaveSamePose()` from
+  `rendering/camera-state-contract.js`: exactly the half the navigation mode
+  drives, never the derived half, whose `Math.sin`/`atan2`/`asin` bits differ
+  between browser engines. Comparing it refused every Safari-saved session in
+  Chrome and Firefox.
+- A failed replay rolls the graph back to the live camera and camera lock the
+  restore *found*, not to the saved camera it was replaying — that one may be
+  exactly what just proved unreachable.
 
 ---
 

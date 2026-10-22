@@ -251,7 +251,7 @@ test('CEL-0058: every analysis preview renders one real Expand button', async ()
         const [button] = buttons;
         assert.equal(button.tagName, 'BUTTON', modeCase.label);
         assert.equal(button.type, 'button', modeCase.label);
-        assert.equal(button.textContent, '⤢ Expand', modeCase.label);
+        assert.equal(button.textContent, 'Expand', modeCase.label);
         assert.ok(button.title.length > 0, `${modeCase.label} button has a tooltip`);
 
         // The preview itself is no longer a mouse-only pseudo control.

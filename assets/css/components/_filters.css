@@ -4,175 +4,23 @@
 
 #filter-count,
 #highlight-count {
-  font-size: var(--text-sm);
-  font-family: Georgia, "Times New Roman", serif;
-  margin-bottom: var(--space-1-5);
-  color: var(--color-text-secondary);
+  margin: var(--space-0-5) 0 var(--space-1);
 }
 
-#active-filters-container {
-  margin-top: 0;
-}
-
+/* The active filter and highlighted group lists scroll inside their list
+   boxes (`.list-box`) instead of growing the panel. */
 #active-filters {
-  margin-top: var(--space-0-5);
   min-height: var(--space-10);
   max-height: 300px;
   overflow-y: auto;
-  padding: var(--space-1-5) var(--space-2);
-  border: var(--border-width-1) solid color-mix(in srgb, var(--color-border-strong) 18%, transparent);
-  border-radius: 0;
-  background: var(--color-surface-secondary);
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
-  box-shadow: var(--shadow-sm);
-}
-
-.filter-info-block {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-0-5);
-}
-
-/* Filter chips */
-.filter-item,
-.highlight-item {
-  display: flex;
-  align-items: center;
-  gap: var(--space-1-5);
-  padding: var(--space-1) var(--space-1-5);
-  border-radius: var(--radius-md);
-  background: var(--color-border-light);
-  border: var(--border-width-1) solid var(--color-border-default);
-  transition: var(--transition-colors), opacity var(--duration-fast) var(--easing-standard);
-}
-
-.filter-item:hover,
-.highlight-item:hover {
-  background: var(--color-border-default);
-}
-
-.filter-item.disabled,
-.highlight-item.disabled {
-  opacity: var(--opacity-60);
-  background: var(--color-surface-tertiary);
-  border-style: dashed;
-}
-
-.filter-item.disabled:hover,
-.highlight-item.disabled:hover {
-  background: var(--color-border-light);
-}
-
-/* Checkbox inside filter chip */
-.filter-checkbox,
-.highlight-checkbox {
-  width: var(--space-3-5);
-  height: var(--space-3-5);
-  margin: 0;
-  cursor: pointer;
-  flex-shrink: 0;
-  accent-color: var(--color-interactive-primary);
-}
-
-/* Filter text */
-.filter-text,
-.highlight-text {
-  flex: 1;
-  font-size: var(--text-xs);
-  color: var(--color-text-secondary);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.filter-item.disabled .filter-text,
-.highlight-item.disabled .highlight-text {
-  color: var(--color-text-tertiary);
-  text-decoration: line-through;
-}
-
-/* Remove “x” button on chip */
-.filter-remove-btn,
-.highlight-remove-btn {
-  background: var(--color-surface-elevated);
-  border-radius: var(--radius-full);
-  border: var(--border-width-1) solid var(--color-text-tertiary);
-  cursor: pointer;
-  font-size: 13px;
-  line-height: 1;
-  color: var(--color-text-secondary);
-  padding: 0 calc(var(--space-1) + var(--space-px));
-  flex-shrink: 0;
-  transition: var(--transition-colors);
-  box-shadow: var(--shadow-xs);
-}
-
-.filter-remove-btn:hover,
-.highlight-remove-btn:hover {
-  color: var(--color-text-inverse);
-  background: var(--color-danger-dark);
-  border-color: var(--color-danger-dark);
-  box-shadow: var(--shadow-sm);
 }
 
 /* ========================================================================
    Highlighted Cells UI
    ===================================================================== */
 
-#highlight-count {
-  position: static;
-  padding: 0;
-  border: none;
-  background: transparent;
-  box-shadow: none;
-  font-weight: 400;
-  letter-spacing: 0;
-  font-size: var(--text-sm);
-  font-family: var(--font-sans);
-}
-
-#highlight-count::before {
-  display: none;
-  content: "";
-}
-
-#highlight-mode-description,
-#highlight-hint {
-  color: var(--color-text-secondary);
-}
-
-.highlight-mode-note {
-  color: var(--color-text-secondary);
-  font-size: var(--text-xs);
-}
-
-.highlight-count-inline {
-  margin-top: var(--space-1);
-}
-
-#active-filters .filter-info {
-  font-size: var(--text-sm);
-  letter-spacing: 0;
-  font-weight: 400;
-  font-family: var(--font-sans);
-}
-
-#highlighted-groups {
-  margin-top: var(--space-0-5);
-  padding: var(--space-1-5) var(--space-2);
-  border: var(--border-width-1) solid color-mix(in srgb, var(--color-border-strong) 18%, transparent);
-  border-radius: 0;
-  background: var(--color-surface-secondary);
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1-5);
-  box-shadow: var(--shadow-sm);
-}
-
+/* No reserved height: an empty page's box is its one status line. */
 #highlighted-groups-list {
-  min-height: var(--space-10);
   max-height: 280px;
   overflow-y: auto;
   display: flex;
@@ -186,31 +34,6 @@
   align-items: center;
   justify-content: space-between;
   gap: var(--space-2);
-  margin-bottom: var(--space-1);
-}
-
-#clear-all-highlights {
-  display: none;
-}
-
-.highlight-clear-btn {
-  font-family: var(--font-display);
-  font-size: var(--text-2xs);
-  text-transform: uppercase;
-  letter-spacing: 0.1em;
-  padding: var(--space-0-5) var(--space-1-5);
-  border: var(--border-width-1) solid var(--color-border-default);
-  background: var(--color-surface-secondary);
-  color: var(--color-text-secondary);
-  cursor: pointer;
-  border-radius: var(--radius-sm);
-  transition: var(--transition-all);
-}
-
-.highlight-clear-btn:hover {
-  background: var(--color-danger-soft);
-  border-color: var(--color-danger);
-  color: var(--color-danger-text);
 }
 
 /* ========================================================================
@@ -223,12 +46,11 @@
   background: var(--color-interactive-primary);
   color: var(--color-text-inverse);
   padding: var(--space-1) var(--space-2);
-  border-radius: 0;
-  font-size: var(--text-md);
-  font-family: var(--font-mono);
+  border-radius: var(--radius-none);
+  font-size: var(--type-label);
+  font-variant-numeric: tabular-nums;
   white-space: nowrap;
   z-index: var(--z-max);
-  display: none;
   transform: translate(var(--space-3), -50%);
   box-shadow: var(--shadow-md);
 }
@@ -237,8 +59,7 @@
 #highlight-pages-container {
   display: flex;
   align-items: center;
-  gap: 3px;
-  margin: var(--space-1-5) 0 var(--space-1);
+  gap: var(--space-1);
   padding: var(--space-1-5) 0 0;
   border-top: var(--border-default);
 }
@@ -246,49 +67,23 @@
 #highlight-pages-tabs {
   display: flex;
   flex-wrap: wrap;
-  gap: 3px;
+  gap: var(--space-1);
   flex: 1;
   min-width: 0;
 }
 
 .highlight-page-tab {
-  display: flex;
-  align-items: center;
-  gap: 3px;
-  padding: 4px 7px;
-  border-radius: 0;
-  background: var(--color-surface-tertiary);
-  border: var(--border-default);
-  cursor: pointer;
-  font-family: var(--font-display);
-  font-size: var(--text-xs);
-  font-weight: 400;
-  letter-spacing: 0.04em;
-  color: var(--color-text-secondary);
-  transition: var(--transition-all);
+  gap: var(--space-0-5);
   max-width: 110px;
-  min-width: 0;
-}
-
-.highlight-page-tab:hover {
-  background: var(--color-border-light);
-  border-color: var(--color-border-default);
-}
-
-.highlight-page-tab.active {
-  background: var(--color-interactive-primary);
-  color: var(--color-text-inverse);
-  border-color: var(--color-interactive-primary);
-  font-weight: 500;
-  box-shadow: var(--shadow-xs);
 }
 
 .highlight-page-tab-activate {
   display: flex;
   align-items: center;
-  gap: 3px;
+  gap: var(--space-1);
   flex: 1;
-  min-width: 0;
+  min-width: var(--control-target-min);
+  min-height: var(--control-target-min);
   padding: 0;
   border: 0;
   background: none;
@@ -299,62 +94,7 @@
   text-align: left;
 }
 
-.highlight-page-color {
-  width: 10px;
-  height: 10px;
-  border-radius: 0;
-  flex-shrink: 0;
-  border: var(--border-width-1) solid var(--color-border-default);
-  background-color: var(--highlight-page-color, var(--color-border-default));
-  cursor: pointer;
-  position: relative;
-}
-
-.highlight-page-color:hover {
-  border-color: var(--color-border-strong);
-}
-
-.highlight-page-tab.active .highlight-page-color {
-  border-color: color-mix(in srgb, var(--color-text-inverse) 30%, transparent);
-}
-
-.highlight-page-tab.active .highlight-page-color:hover {
-  border-color: color-mix(in srgb, var(--color-text-inverse) 50%, transparent);
-}
-
-.highlight-page-color-input {
-  position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
-  display: block;
-  min-width: 0;
-  min-height: 0;
-  border: none;
-  padding: 0;
-  appearance: none;
-  -webkit-appearance: none;
-  background: transparent;
-  cursor: pointer;
-  opacity: 0;
-}
-
-.highlight-page-tab-name {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  flex: 1;
-  min-width: 0;
-}
-
-.highlight-page-tab-count {
-  font-size: var(--text-2xs);
-  opacity: var(--opacity-65);
-  flex-shrink: 0;
-  font-family: var(--font-mono);
-}
-
-.highlight-page-tab.active .highlight-page-tab-count {
+.highlight-page-tab[data-state="selected"] .chip-count {
   opacity: var(--opacity-80);
 }
 
@@ -363,13 +103,23 @@
   background: none;
   border: none;
   cursor: pointer;
-  font-size: 12px;
-  line-height: 1;
+  font-size: var(--control-glyph-sm);
+  line-height: var(--leading-none);
   color: inherit;
   opacity: var(--opacity-50);
-  padding: 0 2px;
+  padding: 0 var(--space-0-5);
+  min-width: var(--control-target-min);
+  min-height: var(--control-target-min);
   flex-shrink: 0;
   transition: opacity var(--duration-fast) var(--easing-standard);
+}
+
+/* On a coarse pointer a tab may take the whole row, for room beside its two
+   44px buttons. */
+@media (pointer: coarse) {
+  .highlight-page-tab {
+    max-width: 100%;
+  }
 }
 
 .highlight-page-tab-combine:hover {
@@ -379,8 +129,7 @@
 .highlight-page-tab-activate:focus-visible,
 .highlight-page-tab-combine:focus-visible,
 .highlight-page-tab-delete:focus-visible {
-  outline: 2px solid currentColor;
-  outline-offset: 2px;
+  outline-color: currentColor;
 }
 
 .highlight-page-tab-combine:focus-visible,
@@ -393,25 +142,11 @@
   color: var(--color-danger-text);
 }
 
+/* The add-page button keeps a dashed outline: it stands for a page that
+   does not exist yet. */
 .highlight-page-add-btn {
-  background: var(--color-surface-elevated);
-  border: var(--border-width-1) dashed var(--color-text-tertiary);
-  border-radius: 0;
-  cursor: pointer;
-  font-size: 12px;
-  font-weight: 400;
-  line-height: 1;
-  color: var(--color-text-secondary);
-  padding: 4px 6px;
-  flex-shrink: 0;
-  transition: var(--transition-all);
-}
-
-.highlight-page-add-btn:hover {
-  background: var(--color-surface-tertiary);
-  border-color: var(--color-border-default);
-  border-style: solid;
-  color: var(--color-text-primary);
+  border-style: dashed;
+  border-color: var(--color-text-tertiary);
 }
 
 /* Page tab name input (inline editing) */
@@ -445,7 +180,7 @@
   color: var(--color-text-inverse);
   border-color: var(--color-accent-strong);
   transform: scale(1.05);
-  box-shadow: var(--shadow-soft-md);
+  box-shadow: var(--shadow-md);
 }
 
 .highlight-page-tab[draggable="true"] {
@@ -457,26 +192,26 @@
   position: fixed;
   z-index: var(--z-popover);
   background: var(--color-surface-elevated);
-  border: var(--border-strong);
-  border-radius: var(--radius-md);
-  box-shadow: var(--shadow-soft-lg);
-  padding: 4px 0;
+  border: var(--border-default);
+  border-radius: var(--radius-none);
+  box-shadow: var(--shadow-lg);
+  padding: var(--space-1) 0;
   min-width: 140px;
-  max-width: calc(100vw - 16px);
+  max-width: calc(100vw - var(--space-4));
   overflow-y: auto;
 }
 
 .page-combine-option {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-2);
   width: 100%;
-  padding: 8px 12px;
+  padding: var(--space-2) var(--space-3);
   background: none;
   border: none;
   cursor: pointer;
   font-family: inherit;
-  font-size: 12px;
+  font-size: var(--type-control);
   color: var(--color-text-primary);
   text-align: left;
   overflow-wrap: anywhere;
@@ -488,13 +223,6 @@
   background: var(--color-surface-tertiary);
 }
 
-.page-combine-icon {
-  font-size: 16px;
-  font-weight: bold;
-  width: 20px;
-  text-align: center;
-}
-
 /* Selection cursor for canvas - active drag states */
 #glcanvas.selecting {
   cursor: cell !important;
@@ -502,12 +230,6 @@
 
 #glcanvas.selecting-continuous {
   cursor: ns-resize !important;
-}
-
-/* Highlight mode classes (cursor is controlled via JS based on Alt key) */
-#glcanvas.highlight-categorical,
-#glcanvas.highlight-continuous {
-  /* Classes used for JS to track mode, cursor set dynamically */
 }
 
 /* Lasso selection mode */
@@ -537,65 +259,22 @@
   margin-top: var(--space-1-5);
 }
 
-.lasso-step-controls .btn-small {
-  font-family: var(--font-display);
-  font-size: var(--text-2xs);
-  font-weight: 400;
-  text-transform: uppercase;
-  letter-spacing: var(--tracking-wide);
-  border-radius: var(--radius-full);
-  padding: var(--space-1) var(--space-2);
-  cursor: pointer;
-  background: var(--color-surface-secondary);
-  color: var(--color-text-primary);
-  border: var(--border-strong);
-  box-shadow: var(--shadow-sm);
-  transition: var(--transition-colors), transform var(--duration-fast) var(--easing-standard);
-}
-
-.lasso-step-controls .btn-small:hover {
-  background: var(--color-border-light);
-  transform: translate(-1px, -1px);
-  box-shadow: var(--shadow-md);
-}
-
-.lasso-step-controls .btn-small:active {
-  transform: translate(0, 0);
-  box-shadow: var(--shadow-xs);
-  background: var(--color-border-default);
-}
-
-/* Undo/Redo buttons */
+/* Undo and redo draw an arrow glyph, one size up from the compact text. */
 .lasso-step-controls .btn-undo,
-.lasso-step-controls .btn-redo {
-  padding: 4px 6px;
-  font-size: 12px;
-  min-width: 24px;
-}
-
-.lasso-step-controls .btn-undo:disabled,
-.lasso-step-controls .btn-redo:disabled,
-.lasso-step-controls .lasso-confirm:disabled {
-  opacity: var(--opacity-50);
-  cursor: not-allowed;
-  pointer-events: none;
-  background: var(--color-surface-tertiary);
-  box-shadow: none;
-  transform: none;
-  border-color: var(--color-border-default);
+.lasso-step-controls .btn-redo,
+.select-bar-actions .btn-undo {
+  font-size: var(--type-button);
 }
 
 /* Selection mode indicator tags (used across all highlight modes) */
 .lasso-mode-tag {
   display: inline-block;
-  padding: 2px 6px;
-  border-radius: 3px;
-  font-size: 9px;
-  font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
-  margin-left: 6px;
-  border: 1px solid currentColor;
+  padding: var(--space-0-5) var(--space-1-5);
+  border-radius: var(--radius-sm);
+  font-size: var(--type-compact);
+  font-weight: var(--font-weight-semibold);
+  margin-left: var(--space-1-5);
+  border: var(--border-width-1) solid currentColor;
 }
 
 .lasso-mode-tag.union,
@@ -610,82 +289,36 @@
    Outlier controls, centroid toggles, smoke panel
    ===================================================================== */
 
-#outlier-filter-container {
-  display: none;
-}
-
-#outlier-filter-container.visible {
-  display: block;
-}
-
-/* Centroids controls block */
-#centroid-controls {
-  display: none;
-}
-
-#centroid-controls.visible {
-  display: block;
-}
-
 /* Points controls visibility toggle */
 #points-controls {
   display: none;
-  margin-top: var(--space-1-5);
 }
 
-#points-controls.visible {
-  display: block;
-}
-
-/* Volumetric smoke controls panel */
+/* Volumetric smoke settings: three groups, shown in smoke mode only. They
+   are top-level groups of the panel, spaced like its other groups. */
 #smoke-controls {
   display: none;
-  margin-top: var(--space-1);
-  padding: var(--space-2) var(--space-2-5);
-  border-radius: 0;
-  border: var(--border-width-1) dashed var(--color-border-strong);
-  background: var(--color-surface-secondary);
 }
 
 #smoke-controls.visible {
-  display: block;
+  display: flex;
+  flex-direction: column;
+  gap: var(--control-group-gap);
 }
 
-/* Depth perception controls panel */
-#depth-controls {
-  margin-top: var(--space-1);
-  padding: var(--space-2) var(--space-2-5);
-  border-radius: 0;
-  border: var(--border-width-1) dashed var(--color-border-strong);
-  background: var(--color-surface-secondary);
+#smoke-controls > .control-block {
+  margin-top: 0;
 }
 
-/* Renderer settings controls panel */
-#renderer-controls {
-  margin-top: var(--space-1);
-  padding: var(--space-2) var(--space-2-5);
-  border-radius: 0;
-  border: var(--border-width-1) dashed var(--color-border-strong);
-  background: var(--color-surface-secondary);
+/* Points mode only: the same group rhythm as the panel. */
+#points-controls.visible {
+  display: flex;
+  flex-direction: column;
+  gap: var(--control-group-gap);
 }
 
-.nav-mode-box {
-  margin-top: var(--space-3-5);
-  padding: var(--space-2) var(--space-2-5);
-  border-radius: 0;
-  border: var(--border-width-1) dashed var(--color-border-strong);
-  background: var(--color-surface-secondary);
-}
-
-.highlight-mode-box {
-  margin-bottom: var(--space-2-5);
-  padding: 0;
-  border: none;
-  background: transparent;
-}
-
-.highlight-mode-box .section-title {
-  margin-bottom: var(--space-1-5);
+#points-controls > .control-block {
+  margin-top: 0;
 }
 
 .highlight-mode-buttons {
@@ -696,59 +329,77 @@
   margin-bottom: var(--space-1-5);
 }
 
-.highlight-mode-btn {
-  width: 100%;
-  text-align: center;
-  padding: var(--space-1-5) var(--space-2-5);
+/* Select mode: the on-screen stand-in for a held Alt key. It changes how
+   every tool is triggered, so it leads the Selection group and is drawn as an
+   input setting — a switch and a segmented control — never as a pill like the
+   tools below it. The same switch and segmented control appear in the
+   selection bar over the plot (components/_select-bar.css); everything here
+   styles both. */
+.highlight-select-mode-row {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  align-items: center;
+  column-gap: var(--space-2);
+  row-gap: var(--space-1);
 }
 
-.highlight-mode-box .toggle-switch {
-  padding: var(--space-1) var(--space-2);
-  font-size: var(--text-2xs);
-  box-shadow: var(--shadow-xs);
+/* The combine choice sits under the switch. */
+.highlight-select-mode-row > .switch {
+  grid-column: 1 / -1;
 }
 
-/* Display options box in Filtering accordion */
-.display-options-box {
-  margin-top: var(--space-2);
-  padding: var(--space-2) var(--space-2-5);
-  border-radius: 0;
-  border: var(--border-width-1) dashed var(--color-border-strong);
-  background: var(--color-surface-secondary);
-  display: none; /* shown via JS when a field is active */
+.highlight-select-mode-row > .highlight-select-combine {
+  grid-column: 1 / -1;
+  margin-top: var(--space-1);
 }
 
-.display-options-box .section-title {
-  margin-bottom: var(--space-2);
+.select-combine-label {
+  font-size: var(--type-hint);
+  color: var(--color-text-secondary);
 }
 
-.display-options-box #legend {
-  margin-top: var(--space-2);
+/* The combine choice: one square segmented control, so it reads as a setting
+   of the switch beside it and not as a row of tools. */
+.select-combine {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
 }
 
-.display-options-box .legend-group {
-  border: none;
-  box-shadow: none;
-  padding: 0;
-  background: transparent;
+/* In the sidebar "Combine" is a field label above its control, like "Tool",
+   and the three segments share the full row equally instead of sizing to
+   their text, so no segment is truncated and the control never runs past the
+   panel's right edge at any sidebar width or type size. */
+.highlight-select-combine {
+  flex-direction: column;
+  align-items: stretch;
+  gap: var(--control-row-gap);
 }
 
-/* Compact buttons inside display options box */
-.display-options-box .legend-controls,
-.display-options-box .legend-actions {
-  gap: var(--space-1);
+.highlight-select-combine > .select-combine-label {
+  margin: 0;
+  font-size: var(--type-label);
+  font-weight: var(--font-weight-medium);
 }
 
-.display-options-box .legend-controls button,
-.display-options-box .legend-actions button,
-.display-options-box .toggle-switch {
-  padding: var(--space-1) var(--space-2);
-  font-size: var(--text-2xs);
-  box-shadow: var(--shadow-xs);
+.highlight-select-combine > .segmented {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
-.display-options-box .toggle-switch {
-  min-width: 50px;
+.highlight-select-combine .segmented-btn {
+  min-width: 0;
+  padding-inline: var(--space-1);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The Legend group: the legend sits under its centroid options. */
+#display-options-container #legend {
+  margin-top: var(--control-block-gap);
 }
 
 /* Half-res checkbox inherits checkbox-inline for consistency */

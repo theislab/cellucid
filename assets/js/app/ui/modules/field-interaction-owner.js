@@ -9,13 +9,13 @@
  * @module ui/modules/field-interaction-owner
  */
 
-export const FIELD_INTERACTION_SUPERSEDED_CODE =
+const FIELD_INTERACTION_SUPERSEDED_CODE =
   'CELLUCID_FIELD_INTERACTION_SUPERSEDED';
 
 const tokenControllers = new WeakMap();
 const intentOwners = new WeakMap();
 
-export function createFieldInteractionSupersededError() {
+function createFieldInteractionSupersededError() {
   const error = new Error(
     'Field interaction was superseded by a newer intent.'
   );

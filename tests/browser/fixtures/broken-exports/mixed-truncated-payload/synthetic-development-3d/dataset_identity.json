@@ -1,10 +1,10 @@
 {
-  "version": 2,
+  "version": 3,
   "id": "synthetic-development-3d",
   "name": "Synthetic branching development \u2014 3D",
   "description": "A synthetic two-lineage 3D progression for orbit navigation, temporal metadata, fate markers, graph context, and a velocity-style vector field.",
   "created_at": "2026-07-27T00:00:00Z",
-  "cellucid_data_version": "0.9.1",
+  "cellucid_data_version": "0.9.2",
   "stats": {
     "n_cells": 96,
     "n_genes": 10,
@@ -15,12 +15,24 @@
     "n_edges": 187
   },
   "embeddings": {
-    "available_dimensions": [
-      3
-    ],
     "default_dimension": 3,
-    "files": {
-      "3d": "points_3d.bin.gz"
+    "defaults": {
+      "3d": "branches"
+    },
+    "items": {
+      "branches": {
+        "label": "Branch layout",
+        "dimension": 3,
+        "file": "embeddings/0_3d.bin.gz",
+        "source": {
+          "key": null,
+          "columns": [
+            0,
+            1,
+            2
+          ]
+        }
+      }
     }
   },
   "obs_fields": [
@@ -59,18 +71,13 @@
     "url": "https://github.com/theislab/cellucid-demo-custom-datasets"
   },
   "vector_fields": {
-    "default_field": "velocity_umap",
+    "default_field": "velocity",
     "fields": {
-      "velocity_umap": {
-        "label": "velocity_umap",
-        "available_dimensions": [
-          3
-        ],
-        "default_dimension": 3,
+      "velocity": {
+        "label": "velocity",
         "files": {
-          "3d": "vectors/0_3d.bin.gz"
-        },
-        "basis": "umap"
+          "branches": "vectors/0_0.bin.gz"
+        }
       }
     }
   }

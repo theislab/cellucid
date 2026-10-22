@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="130" height="20" role="img" aria-label="Open in Cellucid" viewBox="0 0 130 20">
+  <title>Open in Cellucid</title>
+  <linearGradient id="shine" x2="0" y2="100%">
+    <stop offset="0" stop-color="#ffffff" stop-opacity=".12"/>
+    <stop offset="1" stop-opacity=".1"/>
+  </linearGradient>
+  <clipPath id="round">
+    <rect width="130" height="20" rx="3" fill="#fff"/>
+  </clipPath>
+  <g clip-path="url(#round)">
+    <rect width="70" height="20" fill="#374151"/>
+    <rect x="70" width="60" height="20" fill="#111827"/>
+    <rect width="130" height="20" fill="url(#shine)"/>
+  </g>
+  <g fill="none" stroke="#e5e7eb" stroke-width="1.2">
+    <circle cx="11" cy="10" r="5.2"/>
+    <ellipse cx="11" cy="10" rx="7.6" ry="3" transform="rotate(-28 11 10)" stroke-opacity=".7"/>
+  </g>
+  <circle cx="11" cy="10" r="1.9" fill="#f9fafb"/>
+  <g fill="#ffffff" text-anchor="middle" font-family="Verdana,Geneva,DejaVu Sans,sans-serif" font-size="11">
+    <text x="44.5" y="15" fill="#010101" fill-opacity=".3">Open in</text>
+    <text x="44.5" y="14">Open in</text>
+    <text x="100" y="15" fill="#010101" fill-opacity=".3">Cellucid</text>
+    <text x="100" y="14">Cellucid</text>
+  </g>
+</svg>

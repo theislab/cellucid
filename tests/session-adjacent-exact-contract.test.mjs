@@ -70,6 +70,9 @@ import {
   SessionSerializer,
 } from '../assets/js/app/session/session-serializer.js';
 import {
+  createInMemoryDimensionManager,
+} from '../assets/js/data/dimension-manager.js';
+import {
   getNotificationCenter,
 } from '../assets/js/app/notification-center.js';
 import {
@@ -90,6 +93,7 @@ import {
 import {
   restoreMultiview,
 } from '../assets/js/app/state-serializer/multiview.js';
+import { untilEntered } from './helpers/entered.mjs';
 
 const dockableSource = await readFile(
   new URL('../assets/js/app/session/contributors/dockable-layout.js', import.meta.url),
@@ -385,6 +389,38 @@ test('bundle framing rejects chunk-count mismatches and trailing bytes', async (
   );
 });
 
+/**
+ * The export data mapping of a dataset whose one embedding is an in-memory 3D
+ * layout (keyed "3d").
+ */
+const IN_MEMORY_3D_MAPPING = Object.freeze({
+  kind: 'export',
+  embeddings: {
+    enabled: [{ key: '3d', columns: null }],
+    defaults: { '1d': null, '2d': null, '3d': { key: '3d', columns: null } },
+  },
+  geneNames: 'index',
+  vectorFields: [],
+});
+
+/**
+ * What a session fingerprint reads from a DataState besides its counts: the
+ * live positions, the dimension manager that owns them as the live view's 3D
+ * layout, the live layout key and the dataset's data mapping.
+ */
+function fingerprintOwners(positionsArray) {
+  const dimensionManager = createInMemoryDimensionManager({
+    positions: positionsArray,
+    dimension: 3,
+  });
+  return {
+    positionsArray,
+    dimensionManager,
+    getDataMapping: () => IN_MEMORY_3D_MAPPING,
+    getViewLayoutKey: viewId => dimensionManager.getViewLayout(viewId),
+  };
+}
+
 async function rewriteSessionBundle(blob, mutate) {
   const { manifest, chunkStream } = await readBundle(blob, {
     signal: null,
@@ -403,7 +439,7 @@ function makeSessionSerializer(contributors, pointCount = 3) {
       obsData: { fields: [] },
       pointCount,
       getViewDimensionLevel: () => 3,
-      positionsArray: new Float32Array(pointCount * 3),
+      ...fingerprintOwners(new Float32Array(pointCount * 3)),
       varData: { fields: [] },
     },
     viewer: {},
@@ -470,8 +506,6 @@ function categoricalSessionMeta(id, key) {
     isPurged: false,
     codesLength: 3,
     codesType: 'Uint8Array',
-    centroidsByDim: {},
-    normalizedDims: [],
     sourceField: null,
     operation: null,
     sourcePages: [],
@@ -489,7 +523,7 @@ function makeHighlightSessionState({ pages, activePageId, events }) {
   state.getViewDimensionLevel = () => 3;
   state.obsData = { fields: [] };
   state.pointCount = 4;
-  state.positionsArray = new Float32Array(12);
+  Object.assign(state, fingerprintOwners(new Float32Array(12)));
   state.varData = { fields: [] };
   state.highlightPages = pages;
   state.activePageId = activePageId;
@@ -749,7 +783,72 @@ test('dataset mismatch rejects atomically before any contributor restore', async
   assert.equal(restoreCalls, 0);
 });
 
-test('generic Blob and pre-delegation URL cancellation dismiss exactly once', async () => {
+test('a failed restore releases the session file it was reading', async () => {
+  const contributorId = 'exact-contributor';
+  const bundle = await makeSessionSerializer([{
+    id: contributorId,
+    capture() {
+      return [exactSessionChunk(contributorId)];
+    },
+    restore() {},
+  }], 3).createSessionBundle();
+
+  // A Blob whose stream records whether its reader was released by cancel.
+  const sources = [];
+  class TrackedBlob extends Blob {
+    stream() {
+      const inner = super.stream().getReader();
+      const record = { cancelled: false };
+      sources.push(record);
+      return new ReadableStream({
+        async pull(controller) {
+          const { value, done } = await inner.read();
+          if (done) controller.close();
+          else controller.enqueue(value);
+        },
+        cancel(reason) {
+          record.cancelled = true;
+          return inner.cancel(reason);
+        },
+      }, { highWaterMark: 0 });
+    }
+  }
+  const tracked = new TrackedBlob([await bundle.arrayBuffer()]);
+
+  // The fingerprint refusal happens after the manifest is read and before
+  // any chunk is: the source must still be released.
+  const serializer = makeSessionSerializer([{
+    id: contributorId,
+    capture() {
+      return [];
+    },
+    restore() {},
+  }], 4);
+  await withNotificationHarness(async () => {
+    await assert.rejects(serializer.restoreFromBlob(tracked), RangeError);
+  });
+  assert.equal(sources.length, 1);
+  assert.equal(sources[0].cancelled, true);
+
+  // A contributor failure mid-stream releases it too.
+  const failure = new Error('contributor refused its chunk');
+  const failing = makeSessionSerializer([{
+    id: contributorId,
+    capture() {
+      return [];
+    },
+    restore() {
+      throw failure;
+    },
+  }], 3);
+  await withNotificationHarness(async () => {
+    await assert.rejects(failing.restoreFromBlob(tracked), failure);
+  });
+  assert.equal(sources.length, 2);
+  assert.equal(sources[1].cancelled, true);
+});
+
+test('generic Blob cancellation dismisses exactly once', async () => {
   const contributorId = 'cancel-probe';
   const bundle = await makeSessionSerializer([{
     id: contributorId,
@@ -788,61 +887,7 @@ test('generic Blob and pre-delegation URL cancellation dismiss exactly once', as
         && isSessionRestoreCanceledError(error)
       ),
     );
-    await blobEntered;
-    controls.cancel('generic-session-1');
-    await rejection;
-    assert.deepEqual(
-      events.filter(event => event.id === 'generic-session-1'),
-      [
-        { id: 'generic-session-1', kind: 'start' },
-        { id: 'generic-session-1', kind: 'dismiss' },
-      ],
-    );
-  });
-
-  let urlEnteredResolve;
-  const urlEntered = new Promise(resolve => {
-    urlEnteredResolve = resolve;
-  });
-  const urlSerializer = new SessionSerializer({
-    state: {
-      getViewDimensionLevel: () => 3,
-      pointCount: 3,
-      positionsArray: new Float32Array(9),
-      varData: { fields: [] },
-    },
-    viewer: {},
-    sidebar: {},
-    dataSourceManager: {
-      fetch(_url, options) {
-        urlEnteredResolve();
-        return new Promise((resolve, reject) => {
-          options.signal.addEventListener(
-            'abort',
-            () => reject(new DOMException('Aborted', 'AbortError')),
-            { once: true },
-          );
-        });
-      },
-    },
-    comparisonModule: null,
-    analysisWindowManager: null,
-    cinematicCamera: null,
-    contributors: [],
-  });
-  await withSessionNotificationRecorder(async (events, controls) => {
-    const restore = urlSerializer.restoreFromUrl(
-      'https://example.invalid/session.cellucid-session',
-      { cache: 'no-store' },
-    );
-    const rejection = assert.rejects(
-      restore,
-      error => (
-        error?.name === 'AbortError'
-        && isSessionRestoreCanceledError(error)
-      ),
-    );
-    await urlEntered;
+    await untilEntered(blobEntered, restore, 'the contributor restore');
     controls.cancel('generic-session-1');
     await rejection;
     assert.deepEqual(
@@ -910,6 +955,12 @@ test('session controls treat exact cancel and supersession as silent no-ops', as
     let afterLoads = 0;
     initSessionControls({
       dom: { loadBtn: loadButton },
+      // No dataset change is in flight, so a chosen session restores at once.
+      datasetChanges: {
+        recordAction: () => 1,
+        settled: true,
+        whenSettled: async () => {},
+      },
       sessionSerializer: serializer,
       onAfterLoad() {
         afterLoads += 1;
@@ -924,7 +975,7 @@ test('session controls treat exact cancel and supersession as silent no-ops', as
     try {
       await withSessionNotificationRecorder(async (events, controls) => {
         const click = loadButton.click();
-        await entered;
+        await untilEntered(entered, click, 'the contributor restore');
         let replacement = null;
         if (mode === 'cancel') {
           controls.cancel('generic-session-1');
@@ -1223,7 +1274,7 @@ test('dataset fingerprints are complete exact identities, never partial matches'
     state: {
       getViewDimensionLevel: () => 3,
       pointCount: 3,
-      positionsArray,
+      ...fingerprintOwners(positionsArray),
       varData: { fields: [{}, {}] },
     },
   });
@@ -1233,9 +1284,11 @@ test('dataset fingerprints are complete exact identities, never partial matches'
     cellCount: 3,
     varCount: 2,
     cellOrder: {
+      embedding: { key: '3d', columns: null },
       dimension: 3,
       digest: fingerprint.cellOrder.digest,
     },
+    dataMapping: IN_MEMORY_3D_MAPPING,
   });
   assert.match(fingerprint.cellOrder.digest, /^[0-9a-f]{16}$/);
   assert.equal(datasetFingerprintMatches(fingerprint, { ...fingerprint }), true);
@@ -1244,14 +1297,37 @@ test('dataset fingerprints are complete exact identities, never partial matches'
     { sourceType: 'local-user', datasetId: 'dataset-a' },
     { ...fingerprint, cellCount: '3' },
     { ...fingerprint, legacyDatasetName: 'A' },
-    { ...fingerprint, cellOrder: { dimension: 3 } },
-    { ...fingerprint, cellOrder: { dimension: 4, digest: fingerprint.cellOrder.digest } },
-    { ...fingerprint, cellOrder: { dimension: 3, digest: 'NOTHEX0123456789' } },
+    { ...fingerprint, cellOrder: { ...fingerprint.cellOrder, digest: undefined } },
+    { ...fingerprint, cellOrder: { ...fingerprint.cellOrder, dimension: 4 } },
+    { ...fingerprint, cellOrder: { ...fingerprint.cellOrder, digest: 'NOTHEX0123456789' } },
+    { ...fingerprint, cellOrder: { dimension: 3, digest: fingerprint.cellOrder.digest } },
+    {
+      ...fingerprint,
+      cellOrder: { ...fingerprint.cellOrder, embedding: { key: '3d', columns: [0, 1, 2] } },
+    },
+    { ...fingerprint, dataMapping: { ...IN_MEMORY_3D_MAPPING, latent: null } },
+    { ...fingerprint, dataMapping: null },
   ]) {
     assert.throws(
       () => datasetFingerprintMatches(fingerprint, incomplete),
-      /fingerprint|exact|cellCount|dimension|hexadecimal/i,
+      /fingerprint|exact|cellCount|dimension|hexadecimal|embedding|dataMapping/i,
     );
+  }
+  // Every one of the six fields is part of the identity, the embedding and
+  // the data mapping included.
+  for (const different of [
+    { ...fingerprint, sourceType: 'remote' },
+    { ...fingerprint, datasetId: 'dataset-b' },
+    { ...fingerprint, cellCount: 4 },
+    { ...fingerprint, varCount: 3 },
+    {
+      ...fingerprint,
+      cellOrder: { ...fingerprint.cellOrder, embedding: { key: 'X_umap_3d', columns: null } },
+    },
+    { ...fingerprint, cellOrder: { ...fingerprint.cellOrder, digest: '0123456789abcdef' } },
+    { ...fingerprint, dataMapping: { ...IN_MEMORY_3D_MAPPING, geneNames: 'column:symbol' } },
+  ]) {
+    assert.equal(datasetFingerprintMatches(fingerprint, different), false);
   }
 
   // A record carrying only the four scalars is a session written before cell
@@ -1489,8 +1565,6 @@ test('filter restore cancels every deferred preload before batch mutation', asyn
         colorRange: null,
         useLogScale: null,
         useFilterColorRange: null,
-        outlierFilterEnabled: null,
-        outlierThreshold: null,
         colormapId: null,
       },
       'var:GAPDH': {
@@ -1500,8 +1574,6 @@ test('filter restore cancels every deferred preload before batch mutation', asyn
         colorRange: null,
         useLogScale: null,
         useFilterColorRange: null,
-        outlierFilterEnabled: null,
-        outlierThreshold: null,
         colormapId: null,
       },
     },
@@ -1570,8 +1642,6 @@ test('filter restore retires and drains sibling preloads after one exact failure
       colorRange: null,
       useLogScale: null,
       useFilterColorRange: null,
-      outlierFilterEnabled: null,
-      outlierThreshold: null,
       colormapId: null,
     },
     'var:GAPDH': {
@@ -1581,8 +1651,6 @@ test('filter restore retires and drains sibling preloads after one exact failure
       colorRange: null,
       useLogScale: null,
       useFilterColorRange: null,
-      outlierFilterEnabled: null,
-      outlierThreshold: null,
       colormapId: null,
     },
   });
@@ -1657,8 +1725,6 @@ test('field-overlay rollback reconstructs exact categorical user-defined codes',
     isPurged: false,
     codesLength: 3,
     codesType: 'Uint8Array',
-    centroidsByDim: {},
-    normalizedDims: [],
     sourceField: null,
     operation: null,
     sourcePages: [],
@@ -1965,8 +2031,8 @@ test('cinematic transaction stops stale RAF and resumes exact old timeline after
 
   function pathFrom(first, second, defaultSpeed) {
     const store = createKeyframeStore();
-    store.add(first);
-    store.add(second);
+    store.add(first, undefined, null);
+    store.add(second, undefined, null);
     const exported = store.exportAll();
     return exactCameraPathState({
       autoplay: false,
@@ -2395,7 +2461,7 @@ test('user-defined codes reject trailing bytes and dataset length mismatch befor
       loaded: false,
       _codesLengthHint: pointCount,
       _codesTypeHint: 'Uint8Array',
-      centroidsByDim: {},
+      centroidsByLayout: new Map(),
     };
     return {
       template,
@@ -2470,7 +2536,7 @@ test('dynamic code and highlight chunks reject each dishonest metadata field bef
     loaded: false,
     _codesLengthHint: 3,
     _codesTypeHint: 'Uint8Array',
-    centroidsByDim: {},
+    centroidsByLayout: new Map(),
   };
   const codeState = {
     pointCount: 3,
@@ -2592,8 +2658,6 @@ test('user-defined categorical hydration publishes no placeholder codes and beco
     isPurged: false,
     codesLength: 3,
     codesType: 'Uint8Array',
-    centroidsByDim: {},
-    normalizedDims: [],
     sourceField: null,
     operation: null,
     sourcePages: [],
@@ -2616,8 +2680,14 @@ test('user-defined categorical hydration publishes no placeholder codes and beco
   );
 
   const injected = { ...template };
+  const owners = fingerprintOwners(Float32Array.from([
+    0, 0, 0,
+    1, 2, 3,
+    4, 4, 4,
+  ]));
   const state = {
     pointCount: 3,
+    dimensionManager: owners.dimensionManager,
     activeFieldSource: null,
     activeFieldIndex: -1,
     activeVarFieldIndex: -1,
@@ -2647,10 +2717,21 @@ test('user-defined categorical hydration publishes no placeholder codes and beco
   assert.equal(injected.loaded, true);
   assert.equal(Object.hasOwn(injected, '_codesLengthHint'), false);
   assert.equal(Object.hasOwn(injected, '_codesTypeHint'), false);
+  // The record carried no centroids: restoring the codes computed them from
+  // the resident layout's positions, and every copy shares them.
+  assert.deepEqual([...template._normalizedLayouts], ['3d']);
+  assert.deepEqual(template.centroidsByLayout.get('3d'), [
+    { category: 'A', position: [2, 2, 2], n_points: 2 },
+    { category: 'B', position: [1, 2, 3], n_points: 1 },
+  ]);
+  assert.strictEqual(injected.centroidsByLayout, template.centroidsByLayout);
+  assert.strictEqual(injected._normalizedLayouts, template._normalizedLayouts);
 
   const [metadata] = registry.toSessionMeta();
   assert.equal(metadata.codesLength, 3);
   assert.equal(metadata.codesType, 'Uint8Array');
+  assert.equal(Object.hasOwn(metadata, 'centroidsByDim'), false);
+  assert.equal(Object.hasOwn(metadata, 'normalizedDims'), false);
 
   const [chunk] = captureUserDefinedCodes({
     state: {
@@ -2699,8 +2780,10 @@ test('field overlays require every categorical code chunk with truthful active p
       deleted: [],
       purged: [],
     });
+    const { dimensionManager } = fingerprintOwners(new Float32Array(9));
     const state = {
       pointCount: 3,
+      dimensionManager,
       activeFieldSource: null,
       activeFieldIndex: -1,
       activeVarFieldIndex: -1,
@@ -2723,6 +2806,9 @@ test('field overlays require every categorical code chunk with truthful active p
       buildCentroidsForField() {},
       getActiveViewId() {
         return 'live';
+      },
+      getViewLayoutKey(viewId) {
+        return dimensionManager.getViewLayout(viewId);
       },
       _pushColorsToViewer() {},
       _pushCentroidsToViewer() {},
@@ -2919,7 +3005,7 @@ test('generic restore rejects reordered same-priority user code chunks and rolls
   });
   const state = {
     pointCount: 3,
-    positionsArray: new Float32Array(9),
+    ...fingerprintOwners(new Float32Array(9)),
     getViewDimensionLevel: () => 3,
     activeFieldSource: null,
     activeFieldIndex: -1,
@@ -3079,7 +3165,7 @@ test('generic restore rolls back cinematic state and analysis cache after a late
       obsData: { fields: [] },
       pointCount: 3,
       getViewDimensionLevel: () => 3,
-      positionsArray: new Float32Array(9),
+      ...fingerprintOwners(new Float32Array(9)),
       varData: { fields: [] },
     },
     viewer: {},
@@ -3173,7 +3259,7 @@ test('generic restore rolls back cinematic state and analysis cache after a late
     state: {
       getViewDimensionLevel: () => 3,
       pointCount: 3,
-      positionsArray: new Float32Array(9),
+      ...fingerprintOwners(new Float32Array(9)),
       varData: { fields: [] },
     },
     viewer: {},
@@ -3226,7 +3312,7 @@ test('generic empty analysis inventory replaces stale cache and cannot be omitte
       obsData: { fields: [] },
       pointCount: 3,
       getViewDimensionLevel: () => 3,
-      positionsArray: new Float32Array(9),
+      ...fingerprintOwners(new Float32Array(9)),
       varData: { fields: [] },
     },
     viewer: {},
@@ -3280,7 +3366,7 @@ test('generic empty analysis inventory replaces stale cache and cannot be omitte
     state: {
       getViewDimensionLevel: () => 3,
       pointCount: 3,
-      positionsArray: new Float32Array(9),
+      ...fingerprintOwners(new Float32Array(9)),
       varData: { fields: [] },
     },
     viewer: {},

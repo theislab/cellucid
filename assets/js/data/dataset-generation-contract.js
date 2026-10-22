@@ -112,6 +112,39 @@ function obsSummariesMatch(identitySummaries, manifestSummaries) {
   );
 }
 
+/**
+ * Every categorical field's `centroidsByEmbedding` keys name embeddings
+ * `dataset_identity.json` declares, and every centroid position has exactly
+ * that embedding's dimension.
+ *
+ * @param {Object} identity - A validated dataset identity.
+ * @param {Object} obsManifest - An expanded obs manifest.
+ */
+export function validateCentroidEmbeddings(identity, obsManifest) {
+  const items = identity.embeddings.items;
+  for (const field of obsManifest.fields) {
+    if (field.kind !== 'category') continue;
+    for (const [embeddingId, centroids] of Object.entries(
+      field.centroidsByEmbedding
+    )) {
+      if (!Object.hasOwn(items, embeddingId)) {
+        throw new Error(
+          `obs_manifest.json field "${field.key}" has centroids for ` +
+          `embedding "${embeddingId}", which dataset_identity.json does not declare`
+        );
+      }
+      const dimension = items[embeddingId].dimension;
+      if (centroids.some(centroid => centroid.position.length !== dimension)) {
+        throw new Error(
+          `obs_manifest.json field "${field.key}" centroids for ` +
+          `"${embeddingId}" must have ${dimension} coordinates, the ` +
+          'dimension of that embedding'
+        );
+      }
+    }
+  }
+}
+
 function validateConnectivitySummary(identity, manifest) {
   const { stats } = identity;
   if (manifest === null) {
@@ -164,7 +197,6 @@ function validateConnectivitySummary(identity, manifest) {
  * cross-file identity, count, ordering, and declared-absence agreement.
  *
  * @param {{
- *   signal: AbortSignal,
  *   expectedIdentityId: string,
  *   identity: Object,
  *   obsManifest: Object,
@@ -220,6 +252,7 @@ export function validateDatasetGeneration(generation) {
       'obs_manifest.json in order, kind, and n_categories'
     );
   }
+  validateCentroidEmbeddings(identity, obsManifest);
 
   if (varManifest === null) {
     if (identity.stats.n_genes !== 0) {

@@ -21,8 +21,31 @@ import { BaseAnalysisUI } from '../base-analysis-ui.js';
 import { debug, debugWarn } from '../../shared/debug-utils.js';
 
 import { createMultiSelectDropdown } from '../components/multi-select-dropdown.js';
-import { MAX_CATEGORICAL_CATEGORIES } from '../../../../data/categorical-storage-contract.js';
-import { createDisclosureHeader } from '../../shared/dom-utils.js';
+import {
+  MAX_CATEGORICAL_CATEGORIES,
+  isCategoricalCodes,
+  missingCategoryCode
+} from '../../../../data/categorical-storage-contract.js';
+import { selectSorted } from '../../compute/math-utils.js';
+import { getComputeManager } from '../../compute/compute-manager.js';
+import { OperationType } from '../../compute/operations.js';
+import { createSlicedYield } from '../../shared/concurrency-utils.js';
+
+/**
+ * Finite values from which Quick's quartiles and median are selected by an
+ * analysis worker instead of on this thread.
+ */
+const ORDER_STATISTICS_WORKER_MIN = 500_000;
+import {
+  createVisibilityGatedRender,
+  isPanelShown
+} from '../../../ui/core/visibility-gate.js';
+import {
+  createEmptyState,
+  createStatusLine,
+  createDisclosure
+} from '../../../ui/components/controls.js';
+import { formatCells, formatCount } from '../../../ui/components/display-format.js';
 import { PageSelectorComponent, PAGE_MODE } from '../shared/page-selector.js';
 
 /**
@@ -100,6 +123,7 @@ export class QuickInsights extends BaseAnalysisUI {
 
     // Pending update flag (for when accordion is closed during highlight changes)
     this._pendingUpdateWhenVisible = false;
+    this._visibilityGate = null;
     this._destroyPromise = null;
 
     // Content container (for insights, separate from page selector)
@@ -188,23 +212,27 @@ export class QuickInsights extends BaseAnalysisUI {
    * @private
    */
   _updateModeIndicator() {
-    const modeIndicator = this._container?.querySelector('.insights-page-mode-indicator');
+    const modeIndicator = this._container?.querySelector(
+      '.insights-page-selector-section > .disclosure-header > .disclosure-desc'
+    );
     if (!modeIndicator) return;
+    modeIndicator.textContent = this._describePageMode();
+  }
 
+  /**
+   * The page-selection summary shown beside the "Page selection" title.
+   * @private
+   * @returns {string}
+   */
+  _describePageMode() {
     if (this._pageMode === PAGE_MODE.DYNAMIC) {
       const activePageId = this.dataLayer?.getActiveHighlightPageId?.();
-      const pageName = activePageId ? this._getPageName(activePageId) : null;
-      modeIndicator.textContent = pageName ? `(${pageName})` : '(Dynamic)';
-    } else {
-      const selectedCount = this._manuallySelectedPages.length;
-      if (selectedCount === 0) {
-        modeIndicator.textContent = '(None)';
-      } else if (selectedCount === 1) {
-        modeIndicator.textContent = `(${this._getPageName(this._manuallySelectedPages[0])})`;
-      } else {
-        modeIndicator.textContent = `(${selectedCount} pages)`;
-      }
+      return activePageId ? this._getPageName(activePageId) : 'Dynamic';
     }
+    const selectedCount = this._manuallySelectedPages.length;
+    if (selectedCount === 0) return 'None';
+    if (selectedCount === 1) return this._getPageName(this._manuallySelectedPages[0]);
+    return `${formatCount(selectedCount)} pages`;
   }
 
   /**
@@ -233,24 +261,14 @@ export class QuickInsights extends BaseAnalysisUI {
   }
 
   /**
-   * Check if this UI is currently visible (accordion open or floating window expanded)
+   * Whether this panel can be seen: its mode region is expanded and every
+   * enclosing `<details>` (the Analysis section, a floating window) is open.
    * @private
    */
   _isVisible() {
-    // Check sidebar accordion item
-    const accordionItem = this._container?.closest('.analysis-accordion-item');
-    if (accordionItem) {
-      return accordionItem.classList.contains('open');
-    }
-
-    // Check floating window (uses <details> element)
-    const floatingDetails = this._container?.closest('details.analysis-window-panel');
-    if (floatingDetails) {
-      return floatingDetails.open;
-    }
-
-    // Unknown container type - assume visible
-    return true;
+    if (this._container === null) return true;
+    const region = this._container.closest('.analysis-mode-content');
+    return (region === null || !region.hidden) && isPanelShown(this._container);
   }
 
   /**
@@ -289,6 +307,13 @@ export class QuickInsights extends BaseAnalysisUI {
     // Skip fetch if not visible - will refresh when accordion opens
     if (!this._isVisible()) {
       this._pendingUpdateWhenVisible = true;
+      this._setBusy(false);
+      // A collapsed section or window reopens through the gate; a closed mode
+      // row reopens through the comparison module, which calls
+      // onVisibilityChanged(true) itself.
+      if (this._container !== null && !isPanelShown(this._container)) {
+        this._visibilityGate?.request();
+      }
       return;
     }
     this._pendingUpdateWhenVisible = false;
@@ -298,6 +323,10 @@ export class QuickInsights extends BaseAnalysisUI {
       this._renderEmpty();
       return;
     }
+
+    // The region is about to be replaced; say so from the moment the update
+    // is owed, not only once the debounced computation starts.
+    this._setBusy(true);
 
     // Debounce rapid changes
     this._debounceTimer = setTimeout(() => {
@@ -403,24 +432,12 @@ export class QuickInsights extends BaseAnalysisUI {
       this._container = container;
     }
     this._render();
-    this._setupVisibilityListener();
-  }
-
-  /**
-   * Setup listener for floating window toggle events
-   * @private
-   */
-  _setupVisibilityListener() {
-    // Listen for floating window expand/collapse
-    const floatingDetails = this._container?.closest('details.analysis-window-panel');
-    if (floatingDetails && !this._detailsToggleListener) {
-      this._detailsToggleListener = () => {
-        if (floatingDetails.open) {
-          this.onVisibilityChanged(true);
-        }
-      };
-      floatingDetails.addEventListener('toggle', this._detailsToggleListener);
-    }
+    // An update deferred while the panel was collapsed runs when it is shown.
+    this._visibilityGate?.destroy();
+    this._visibilityGate = createVisibilityGatedRender(
+      this._container,
+      () => this.onVisibilityChanged(true)
+    );
   }
 
   /**
@@ -557,27 +574,29 @@ export class QuickInsights extends BaseAnalysisUI {
    * Render empty state
    */
   _renderEmpty() {
+    this._setBusy(false);
     if (!this._contentContainer) return;
     this._destroyFieldPickers();
-    this._contentContainer.innerHTML = `
-      <div class="quick-insights-empty">
-        <p class="insights-help">Quick Insights shows stats for the active highlight page.</p>
-        <p class="insights-help">Switch highlight pages or add highlighted cells to see insights.</p>
-      </div>
-    `;
+    this._contentContainer.replaceChildren(
+      createEmptyState(
+        'Quick Insights shows statistics for the active highlight page. '
+        + 'Switch highlight pages or highlight cells to see insights.'
+      )
+    );
   }
 
   /**
    * Render loading state
    */
   _renderLoading() {
+    this._setBusy(true);
     if (!this._contentContainer) return;
     this._destroyFieldPickers();
     this._contentContainer.innerHTML = `
-      <div class="quick-insights-loading">
-        <div class="insights-spinner"></div>
-        <span>Computing insights...</span>
-      </div>
+      <p class="quick-insights-loading">
+        <span class="spinner" aria-hidden="true"></span>
+        <span>Computing insights…</span>
+      </p>
     `;
   }
 
@@ -585,18 +604,15 @@ export class QuickInsights extends BaseAnalysisUI {
    * Render error state
    */
   _renderError(message) {
+    this._setBusy(false);
     if (!this._contentContainer) return;
     this._destroyFieldPickers();
-    this._contentContainer.innerHTML = '';
-
-    const wrapper = document.createElement('div');
-    wrapper.className = 'quick-insights-error';
-
-    const text = document.createElement('span');
-    text.textContent = `Failed to compute insights: ${message || 'Unknown error'}`;
-    wrapper.appendChild(text);
-
-    this._contentContainer.appendChild(wrapper);
+    this._contentContainer.replaceChildren(
+      createStatusLine({
+        tone: 'danger',
+        text: `Failed to compute insights: ${message || 'Unknown error'}`
+      }).root
+    );
   }
 
   /**
@@ -746,7 +762,7 @@ export class QuickInsights extends BaseAnalysisUI {
         );
       }
       const fieldData = bulkData.fields[fieldKey];
-      const summary = this._summarizeCategoricalAcrossPages(fieldKey, fieldData, validPageIds, bulkData.pageData, signal);
+      const summary = await this._summarizeCategoricalAcrossPages(fieldKey, fieldData, validPageIds, bulkData.pageData, signal);
       if (summary) insights.categoricalSummaries.push(summary);
     }
 
@@ -757,7 +773,7 @@ export class QuickInsights extends BaseAnalysisUI {
         );
       }
       const fieldData = bulkData.fields[fieldKey];
-      const summary = this._summarizeContinuousAcrossPages(fieldKey, fieldData, validPageIds, bulkData.pageData, signal);
+      const summary = await this._summarizeContinuousAcrossPages(fieldKey, fieldData, validPageIds, bulkData.pageData, signal);
       if (summary) insights.continuousSummaries.push(summary);
     }
 
@@ -831,26 +847,31 @@ export class QuickInsights extends BaseAnalysisUI {
    * @param {string[]} pageIds
    * @param {Record<string, { cellIndices: number[] }>} pageData
    * @param {AbortSignal} [signal]
-   * @returns {{ field: string, total: number, topCategories: { name: string, count: number, percent: string }[] } | null}
+   * @returns {Promise<{ field: string, total: number, topCategories: { name: string, count: number, percent: string }[] } | null>}
    */
-  _summarizeCategoricalAcrossPages(fieldName, fieldData, pageIds, pageData, signal) {
+  async _summarizeCategoricalAcrossPages(fieldName, fieldData, pageIds, pageData, signal) {
     const categories = fieldData?.categories;
     const codes = fieldData?.codes;
-    if (!(codes instanceof Uint16Array) || !Array.isArray(categories)) {
+    if (!isCategoricalCodes(codes) || !Array.isArray(categories)) {
       throw new TypeError(
         `Quick Insights categorical field "${fieldName}" requires ` +
-        'Uint16Array codes and categories'
+        'categorical codes and categories'
       );
     }
     if (categories.length > MAX_CATEGORICAL_CATEGORIES) {
       throw new RangeError(
         `Quick Insights categorical field "${fieldName}" exceeds ` +
-        `${MAX_CATEGORICAL_CATEGORIES.toLocaleString('en-US')} categories`
+        `${formatCount(MAX_CATEGORICAL_CATEGORIES)} categories`
       );
     }
 
-    const missingIndex = categories.length;
-    const counts = new Float64Array(categories.length + 1);
+    // Missing cells are excluded: they are neither a category nor part of the
+    // denominator the composition percentages are taken over. The pass walks
+    // every selected cell on this thread, so it hands the event loop back
+    // between slices of a large selection.
+    const yieldIfSliceSpent = createSlicedYield();
+    const missingCode = missingCategoryCode(codes);
+    const counts = new Float64Array(categories.length);
     let total = 0;
     let iter = 0;
     for (const pageId of pageIds) {
@@ -868,19 +889,20 @@ export class QuickInsights extends BaseAnalysisUI {
           );
         }
         const code = codes[cellIdx];
-        if (code === 65_535) {
-          counts[missingIndex]++;
-        } else if (code >= categories.length) {
-          throw new RangeError(
-            `Category code ${code} for "${fieldName}" is outside ` +
-            `${categories.length} categories`
-          );
-        } else {
+        if (code !== missingCode) {
+          if (code >= categories.length) {
+            throw new RangeError(
+              `Category code ${code} for "${fieldName}" is outside ` +
+              `${categories.length} categories`
+            );
+          }
           counts[code]++;
+          total++;
         }
-        total++;
-        if ((++iter & 0x3fff) === 0 && signal?.aborted) {
-          throw new DOMException('Aborted', 'AbortError');
+        if ((++iter & 0x3fff) === 0) {
+          if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+          const pending = yieldIfSliceSpent();
+          if (pending !== undefined) await pending;
         }
       }
     }
@@ -893,7 +915,7 @@ export class QuickInsights extends BaseAnalysisUI {
       field: fieldName,
       total,
       topCategories: top.map(({ index, count }) => ({
-        name: index === missingIndex ? '(missing)' : categories[index],
+        name: categories[index],
         count,
         percent: ((count / total) * 100).toFixed(1)
       }))
@@ -909,10 +931,13 @@ export class QuickInsights extends BaseAnalysisUI {
    * @param {string[]} pageIds
    * @param {Record<string, { cellIndices: ArrayLike<number> }>} pageData
    * @param {AbortSignal} [signal]
-   * @returns {{ field: string, count: number, missingCount: number, mean: number|null, median: number|null, min: number|null, max: number|null, std: number|null, q1: number|null, q3: number|null, approximate: false } | null}
+   * @returns {Promise<{ field: string, count: number, missingCount: number, mean: number|null, median: number|null, min: number|null, max: number|null, std: number|null, q1: number|null, q3: number|null, approximate: false } | null>}
    */
-  _summarizeContinuousAcrossPages(fieldName, fieldData, pageIds, pageData, signal) {
+  async _summarizeContinuousAcrossPages(fieldName, fieldData, pageIds, pageData, signal) {
     const rawValues = fieldData?.values;
+    // Both passes walk every selected cell on this thread, so they hand the
+    // event loop back between slices of a large selection.
+    const yieldIfSliceSpent = createSlicedYield();
     if (!(rawValues instanceof Float32Array)) {
       throw new TypeError(
         `Continuous field "${fieldName}" requires a Float32Array values payload`
@@ -961,8 +986,10 @@ export class QuickInsights extends BaseAnalysisUI {
           if (value > max) max = value;
         }
 
-        if ((++iter & 0x3fff) === 0 && signal?.aborted) {
-          throw new DOMException('Aborted', 'AbortError');
+        if ((++iter & 0x3fff) === 0) {
+          if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+          const pending = yieldIfSliceSpent();
+          if (pending !== undefined) await pending;
         }
       }
     }
@@ -985,28 +1012,53 @@ export class QuickInsights extends BaseAnalysisUI {
       };
     }
 
-    const sorted = new Float32Array(count);
-    let sortedIndex = 0;
+    const finite = new Float32Array(count);
+    let finiteIndex = 0;
     iter = 0;
     for (const pageId of pageIds) {
       const cellIndices = this._requirePageCellIndices(pageData, pageId);
       for (let i = 0; i < cellIndices.length; i++) {
         const value = rawValues[cellIndices[i]];
         if (!Number.isNaN(value)) {
-          sorted[sortedIndex++] = value;
+          finite[finiteIndex++] = value;
         }
-        if ((++iter & 0x3fff) === 0 && signal?.aborted) {
-          throw new DOMException('Aborted', 'AbortError');
+        if ((++iter & 0x3fff) === 0) {
+          if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+          const pending = yieldIfSliceSpent();
+          if (pending !== undefined) await pending;
         }
       }
     }
     if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
 
-    sorted.sort();
+    // Four positions of the ascending order, selected in linear time — the
+    // same numbers a sorted copy holds there.
+    // A large selection is handed to an analysis worker (the copy is
+    // transferred, not cloned).
     const middle = Math.floor(count / 2);
+    const positions = [
+      count % 2 === 0 ? middle - 1 : middle,
+      middle,
+      Math.floor(count * 0.25),
+      Math.floor(count * 0.75)
+    ];
+    let selected;
+    if (count >= ORDER_STATISTICS_WORKER_MIN) {
+      const manager = getComputeManager();
+      await manager.init();
+      ({ selected } = await manager.execute(
+        OperationType.COMPUTE_ORDER_STATISTICS,
+        { values: finite, positions },
+        { transfer: true }
+      ));
+      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+    } else {
+      selected = selectSorted(finite, positions);
+    }
+    const [lowerMiddle, upperMiddle, q1, q3] = selected;
     const median = count % 2 === 0
-      ? (sorted[middle - 1] + sorted[middle]) / 2
-      : sorted[middle];
+      ? (lowerMiddle + upperMiddle) / 2
+      : upperMiddle;
 
     return {
       field: fieldName,
@@ -1017,8 +1069,8 @@ export class QuickInsights extends BaseAnalysisUI {
       min,
       max,
       std: Math.sqrt(m2 / count),
-      q1: sorted[Math.floor(count * 0.25)],
-      q3: sorted[Math.floor(count * 0.75)],
+      q1,
+      q3,
       approximate: false
     };
   }
@@ -1028,7 +1080,7 @@ export class QuickInsights extends BaseAnalysisUI {
    */
   _render() {
     if (!this._container) return;
-    // Use classList.add to preserve original classes (e.g., analysis-accordion-content)
+    // Use classList.add to preserve original classes (e.g., analysis-mode-content)
     this._container.classList.add('quick-insights-panel');
     this._container.innerHTML = '';
 
@@ -1048,6 +1100,7 @@ export class QuickInsights extends BaseAnalysisUI {
    * Render computed insights
    */
   _renderInsights(insights) {
+    this._setBusy(false);
     if (!this._contentContainer) return;
 
     // Validate insights object
@@ -1085,12 +1138,12 @@ export class QuickInsights extends BaseAnalysisUI {
         const strong = document.createElement('strong');
         strong.textContent = page?.name || 'Page';
         summary.appendChild(strong);
-        summary.appendChild(document.createTextNode(`: ${(insights.totalCells || 0).toLocaleString()} cells`));
+        summary.appendChild(document.createTextNode(`: ${formatCells(insights.totalCells || 0)}`));
       } else {
         const strong = document.createElement('strong');
         strong.textContent = `${insights.pages.length} pages`;
         summary.appendChild(strong);
-        summary.appendChild(document.createTextNode(`: ${(insights.totalCells || 0).toLocaleString()} cells total`));
+        summary.appendChild(document.createTextNode(`: ${formatCells(insights.totalCells || 0)} total`));
 
         const pageNames = insights.pages.map(p => p?.name || '').join(', ');
         const pageList = document.createElement('div');
@@ -1161,13 +1214,11 @@ export class QuickInsights extends BaseAnalysisUI {
     catSection.appendChild(catTitle);
 
     if (!insights.categoricalSummaries || insights.categoricalSummaries.length === 0) {
-      const empty = document.createElement('div');
-      empty.className = 'insights-section-empty';
-      empty.textContent =
+      catSection.appendChild(createEmptyState(
         this._selectedCategoricalObsKeys.length === 0
           ? 'No composition fields selected.'
-          : 'No composition data available.';
-      catSection.appendChild(empty);
+          : 'No composition data available.'
+      ));
     } else {
       for (const summary of insights.categoricalSummaries) {
         const fieldDiv = document.createElement('div');
@@ -1249,13 +1300,11 @@ export class QuickInsights extends BaseAnalysisUI {
     contSection.appendChild(contTitle);
 
     if (!insights.continuousSummaries || insights.continuousSummaries.length === 0) {
-      const empty = document.createElement('div');
-      empty.className = 'insights-section-empty';
-      empty.textContent =
+      contSection.appendChild(createEmptyState(
         this._selectedContinuousObsKeys.length === 0
           ? 'No statistics fields selected.'
-          : 'No statistics data available.';
-      contSection.appendChild(empty);
+          : 'No statistics data available.'
+      ));
     } else {
       const table = document.createElement('table');
       table.className = 'insights-stats-table';
@@ -1314,63 +1363,15 @@ export class QuickInsights extends BaseAnalysisUI {
     // Note: We render the section even when there are no pages,
     // because the Dynamic tab should always be available and pages may be added later.
 
-    // Create collapsible section container
-    const section = document.createElement('div');
-    section.className = 'insights-section insights-page-selector-section';
-
-    // Create collapsible header
-    const header = document.createElement('div');
-    header.className = 'insights-collapsible-header';
-
-    const toggleIcon = document.createElement('span');
-    toggleIcon.className = 'insights-collapsible-toggle';
-    toggleIcon.textContent = this._pageSelectorExpanded ? '▼' : '▶';
-
-    const headerText = document.createElement('span');
-    headerText.className = 'insights-collapsible-title';
-    headerText.textContent = 'Page Selection';
-
-    // Show current mode indicator
-    const modeIndicator = document.createElement('span');
-    modeIndicator.className = 'insights-page-mode-indicator';
-    if (this._pageMode === PAGE_MODE.DYNAMIC) {
-      modeIndicator.textContent = '(Dynamic)';
-    } else {
-      const selectedCount = this._manuallySelectedPages.length;
-      modeIndicator.textContent = selectedCount === 1
-        ? `(${this._getPageName(this._manuallySelectedPages[0])})`
-        : `(${selectedCount} pages)`;
-    }
-
-    header.appendChild(toggleIcon);
-    header.appendChild(headerText);
-    header.appendChild(modeIndicator);
-
-    // Create content container
-    const content = document.createElement('div');
-    content.className = 'insights-collapsible-content';
-
-    // The caret is decoration: it repeats what aria-expanded already carries,
-    // and reading "▶ Page Selection" aloud helps nobody.
-    const announce = createDisclosureHeader({
-      header,
-      content,
+    const { root: section, content } = createDisclosure({
+      title: 'Page selection',
+      description: this._describePageMode(),
       expanded: this._pageSelectorExpanded,
-      glyph: toggleIcon,
-      contentId: `${this._controlScope}-page-selection`
+      onToggle: expanded => {
+        this._pageSelectorExpanded = expanded;
+      },
+      className: 'disclosure-inline insights-page-selector-section'
     });
-
-    // Toggle handler
-    const toggleContent = () => {
-      this._pageSelectorExpanded = !this._pageSelectorExpanded;
-      toggleIcon.textContent = this._pageSelectorExpanded ? '▼' : '▶';
-      announce(this._pageSelectorExpanded);
-    };
-
-    header.addEventListener('click', toggleContent);
-
-    section.appendChild(header);
-    section.appendChild(content);
 
     // Create page selector container inside content
     this._pageSelectorContainer = document.createElement('div');
@@ -1406,7 +1407,6 @@ export class QuickInsights extends BaseAnalysisUI {
       supportsDynamicMode: true,
       initialDynamicMode: this._pageMode === PAGE_MODE.DYNAMIC,
       dynamicLabel: 'Dynamic',
-      dynamicHelpText: 'Follows the active highlight page',
 
       // Multi-select support
       allowMultiSelect: true,
@@ -1419,8 +1419,7 @@ export class QuickInsights extends BaseAnalysisUI {
       showCellCounts: true,
       showSelectAll: true,
       showHeader: false,   // Collapsible header already provides title/mode
-      showHelpText: false, // Avoid duplicate explanation text inside collapsible
-      label: '',
+      label: 'Pages to analyze',
 
       // Use dataLayer's cell count function for proper wildcard handling
       getCellCountForPageId: (pageId) => this.dataLayer.getCellCountForPageId?.(pageId) || 0,
@@ -1649,28 +1648,17 @@ export class QuickInsights extends BaseAnalysisUI {
       }
     };
     run(() => this._beginUpdateIntent());
+    run(() => this._setBusy(false));
 
     // Clear cache
     run(() => this._cache.clear());
 
     run(() => this._destroyFieldPickers());
     run(() => this._destroyPageSelector());
-
-    // Remove floating window toggle listener
-    if (this._detailsToggleListener) {
-      run(() => {
-        const floatingDetails = this._container?.closest(
-          'details.analysis-window-panel'
-        );
-        if (floatingDetails) {
-          floatingDetails.removeEventListener(
-            'toggle',
-            this._detailsToggleListener
-          );
-        }
-      });
-      this._detailsToggleListener = null;
-    }
+    run(() => {
+      this._visibilityGate?.destroy();
+      this._visibilityGate = null;
+    });
 
     const parentTask = super.destroy();
     if (errors.length === 0) {
@@ -1703,5 +1691,3 @@ export function createQuickInsights(options) {
   insights.init();
   return insights;
 }
-
-export default QuickInsights;

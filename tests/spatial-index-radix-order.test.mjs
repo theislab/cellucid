@@ -3,10 +3,9 @@ import { performance } from 'node:perf_hooks';
 import test from 'node:test';
 
 import {
-  HIERARCHICAL_RADIX_SIZE,
-  LOCALITY_BITS_BY_DIMENSION,
   SpatialIndex,
 } from '../assets/js/rendering/high-perf/spatial-index.js';
+import { HIERARCHICAL_RADIX_SIZE, LOCALITY_BITS_BY_DIMENSION, buildHierarchicalOrder } from '../assets/js/rendering/high-perf/draw-order.js';
 
 const FIXED_BOUNDS = Object.freeze({
   minX: -512,
@@ -108,6 +107,22 @@ function referenceHierarchicalOrder(positions, bounds, dimensionLevel) {
   return order;
 }
 
+/**
+ * Fixtures are written as XYZ triples. A d-dimensional embedding holds only
+ * its first d components per point, which is the layout the index reads.
+ */
+function toEmbeddingLayout(xyz, dimensionLevel) {
+  const pointCount = xyz.length / 3;
+  const positions = new Float32Array(pointCount * dimensionLevel);
+  for (let pointIndex = 0; pointIndex < pointCount; pointIndex++) {
+    for (let axis = 0; axis < dimensionLevel; axis++) {
+      positions[pointIndex * dimensionLevel + axis] =
+        xyz[pointIndex * 3 + axis];
+    }
+  }
+  return positions;
+}
+
 function makeOrderOwner(
   positions,
   dimensionLevel,
@@ -119,17 +134,14 @@ function makeOrderOwner(
       bounds,
       dimensionLevel,
       pointCount: positions.length / 3,
-      positions,
+      positions: toEmbeddingLayout(positions, dimensionLevel),
     },
   );
 }
 
 function buildOrder(positions, dimensionLevel, bounds = FIXED_BOUNDS) {
-  return makeOrderOwner(
-    positions,
-    dimensionLevel,
-    bounds,
-  )._buildHierarchicalOrder();
+  const owner = makeOrderOwner(positions, dimensionLevel, bounds);
+  return buildHierarchicalOrder(owner.positions, owner.bounds, owner.dimensionLevel);
 }
 
 function createRandomPositions(pointCount, seed) {
@@ -347,7 +359,7 @@ test('locality bits stay inside one Uint32 for every dimension level', () => {
   }
 });
 
-test('hierarchical order retains only one exact typed owner and prefix views share it', () => {
+test('the hierarchical order is build scratch: one typed result and nothing retained', () => {
   const positions = createRandomPositions(4097, 0xdecafbad);
   const owner = makeOrderOwner(positions, 3);
   const NativeUint32Array = globalThis.Uint32Array;
@@ -363,7 +375,7 @@ test('hierarchical order retains only one exact typed owner and prefix views sha
   globalThis.Uint32Array = TrackingUint32Array;
   let order;
   try {
-    order = owner._buildHierarchicalOrder();
+    order = buildHierarchicalOrder(owner.positions, owner.bounds, owner.dimensionLevel);
   } finally {
     globalThis.Uint32Array = NativeUint32Array;
   }
@@ -389,20 +401,19 @@ test('hierarchical order retains only one exact typed owner and prefix views sha
     ),
     'one priority array, two ID arrays, and one bounded radix-count array',
   );
+  // The order is returned, never retained: `_generateLODLevels` rewrites it
+  // in place into the draw order the levels are views of.
   assert.deepEqual(
     Object.entries(owner).filter(([, value]) => (
       allocations.includes(value)
     )),
-    [['_hierarchicalOrder', order]],
-    'priority, scratch IDs, and radix counts must not escape the build',
+    [],
+    'priority, scratch IDs, radix counts and the order must not escape the build',
   );
-  assert.equal(owner._buildHierarchicalOrder(), order);
-
-  const prefix = owner._stratifiedSample(1000);
-  assert.equal(prefix.buffer, order.buffer);
-  assert.equal(prefix.byteOffset, order.byteOffset);
-  assert.equal(prefix.length, 1000);
-  assert.deepEqual(prefix, order.subarray(0, 1000));
+  // A second build is a second, identical result.
+  const again = buildHierarchicalOrder(owner.positions, owner.bounds, owner.dimensionLevel);
+  assert.notEqual(again, order);
+  assert.deepEqual(Array.from(again), Array.from(order));
 });
 
 test('allocation failures never publish a partial hierarchy and retry succeeds', () => {
@@ -426,7 +437,7 @@ test('allocation failures never publish a partial hierarchy and retry succeeds',
     globalThis.Uint32Array = FailingUint32Array;
     try {
       assert.throws(
-        () => owner._buildHierarchicalOrder(),
+        () => buildHierarchicalOrder(owner.positions, owner.bounds, owner.dimensionLevel),
         new RegExp(`synthetic allocation ${failingAllocation} failure`),
       );
     } finally {
@@ -439,7 +450,7 @@ test('allocation failures never publish a partial hierarchy and retry succeeds',
       `allocation ${failingAllocation} published partial state`,
     );
     assert.deepEqual(
-      owner._buildHierarchicalOrder(),
+      buildHierarchicalOrder(owner.positions, owner.bounds, owner.dimensionLevel),
       referenceHierarchicalOrder(positions, FIXED_BOUNDS, 3),
     );
   }
@@ -450,7 +461,7 @@ test('production hierarchy uses stable typed radix passes without boxed sorting'
   // the method that actually runs, so it cannot pass on stale source and does
   // not have to be updated when the method changes file.
   const methodSource =
-    SpatialIndex.prototype._buildHierarchicalOrder.toString();
+    buildHierarchicalOrder.toString();
 
   assert.doesNotMatch(methodSource, /new Array\s*\(|\.sort\s*\(|ranked|{\s*idx\s*:/);
   assert.match(methodSource, /new Uint32Array\(n\)/);

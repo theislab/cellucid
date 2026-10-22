@@ -40,7 +40,7 @@ const MIB = 1024 * 1024;
 // 5M/10M/20M/30M curve measured on Chromium (ANGLE Metal, Apple M1 Pro).
 // Retained by the build: 79.8 - 51.9 B a point. Transient scratch live at the
 // same time: 12 (hierarchical ordering) + 8.6 (leaves and child chain) + 16
-// (shared packing scratch).
+// (the calibration-time packing scratch, kept as margin).
 const RETAINED_BYTES_PER_POINT = 27.9;
 const TRANSIENT_BYTES_PER_POINT = 36.6;
 const BUILD_FIXED_BYTES = 4 * MIB;
@@ -123,6 +123,31 @@ function recordCalculationNotifications(t) {
   return started;
 }
 
+/** Record every error notification posted during one test. */
+function recordErrorNotifications(t) {
+  const notifications = getNotificationCenter();
+  const previous = notifications.error;
+  const posted = [];
+  notifications.error = message => {
+    posted.push(message);
+    return 'lod-admission-error';
+  };
+  t.after(() => {
+    notifications.error = previous;
+  });
+  return posted;
+}
+
+/**
+ * Turn LOD on, then make the request the view's next frame makes: the
+ * build is admitted there, off the toggle (no worker here, so an admitted
+ * build runs inline).
+ */
+function enableLodAndRequest(renderer) {
+  renderer.setAdaptiveLOD(true);
+  renderer._requestSpatialIndex({ kind: 'live' }, true);
+}
+
 function makePositions(pointCount) {
   const positions = new Float32Array(pointCount * 3);
   for (let index = 0; index < pointCount; index++) {
@@ -146,23 +171,18 @@ function makeRenderer({
   geometryPoints = 8,
   pointCount = 8,
 } = {}) {
-  const staged = [];
   const renderer = Object.assign(
     Object.create(HighPerfRenderer.prototype),
     {
       _colors: new Uint8Array(geometryPoints * 4),
       _contextLost: false,
-      _dirtyLodDimensions: new Set(),
       _disposed: false,
       _liveGeometryGeneration: 1,
-      _lodIndexTexturesByDimension: new Map(),
-      _lodResourceOwnersByDimension: new Map(),
       _perViewState: new Map(),
       _positions: makePositions(geometryPoints),
       _snapshotGeometryPools: new Map(),
       currentDimensionLevel: 3,
       forceLODLevel: -1,
-      lodBuffersByDimension: new Map(),
       options: { LOD_MAX_DEPTH: 8, LOD_MAX_POINTS_PER_NODE: 1000 },
       pointCount,
       snapshotBuffers: new Map(),
@@ -172,15 +192,24 @@ function makeRenderer({
       useFrustumCulling: frustumCulling,
     },
   );
-  // The GPU projection of a LOD tree needs a real context; the admission check
-  // sits upstream of it, so recording the call is enough to prove the CPU build
-  // ran and produced levels.
-  renderer._ensureLodResourcesForDimension = (dimensionLevel, candidate) => {
-    staged.push({ candidate, dimensionLevel });
-    return null;
-  };
   renderer._invalidateViewStateRecord = () => {};
   renderer._refreshGpuMemoryStats = () => {};
+  // A LOD build is CPU work that publishes a tree carrying levels; its GPU
+  // draw order is adopted at the next render. The trees with levels are the
+  // builds that ran.
+  const staged = {
+    get length() {
+      return [...renderer.spatialIndices].filter(
+        ([, tree]) => Array.isArray(tree.lodLevels) && tree.lodLevels.length > 0,
+      ).length;
+    },
+    get 0() {
+      const entry = [...renderer.spatialIndices].find(
+        ([, tree]) => Array.isArray(tree.lodLevels) && tree.lodLevels.length > 0,
+      );
+      return entry === undefined ? undefined : { dimensionLevel: entry[0], candidate: entry[1] };
+    },
+  };
   return { renderer, staged };
 }
 
@@ -193,15 +222,12 @@ test(
       usedBytes: measuredPreBuildBytes(pointCount),
     });
     const started = recordCalculationNotifications(t);
+    const errors = recordErrorNotifications(t);
     const { renderer, staged } = makeRenderer({ pointCount });
 
-    assert.throws(
-      () => renderer.setAdaptiveLOD(true),
-      (error) => {
-        assert.ok(
-          error instanceof RangeError,
-          `expected a RangeError, received ${error?.name}`,
-        );
+    enableLodAndRequest(renderer);
+    assert.equal(errors.length, 1, 'the refusal is reported once');
+    ((error) => {
         // Built with `toLocaleString` so the assertion holds under whatever
         // locale the runner carries, exactly as the renderer formats it.
         const affordable = Math.floor(
@@ -236,14 +262,16 @@ test(
           projectedBuildBytes(pointCount) >
           MEASURED_CHROMIUM_HEAP_LIMIT_BYTES,
         );
-        return true;
-      },
-    );
+      })({ message: errors[0] });
 
-    assert.equal(renderer.useAdaptiveLOD, false);
+    // The flag is the user's: it stays on, and the view draws full detail.
+    assert.equal(renderer.useAdaptiveLOD, true);
     assert.equal(renderer.spatialIndices.size, 0);
     assert.equal(staged.length, 0);
-    assert.deepEqual(started, []);
+    assert.deepEqual(started, [], 'no build was started');
+    // A refused build is not retried every frame.
+    renderer._requestSpatialIndex({ kind: 'live' }, true);
+    assert.equal(errors.length, 1);
   },
 );
 
@@ -255,9 +283,10 @@ test(
       limitBytes: MEASURED_CHROMIUM_HEAP_LIMIT_BYTES,
       usedBytes: measuredPreBuildBytes(pointCount),
     });
+    recordCalculationNotifications(t);
     const { renderer, staged } = makeRenderer({ pointCount });
 
-    renderer.setAdaptiveLOD(true);
+    enableLodAndRequest(renderer);
 
     assert.equal(renderer.useAdaptiveLOD, true);
     assert.equal(staged.length, 1);
@@ -282,7 +311,8 @@ test('the admission boundary is exact to the byte', (t) => {
 
   const admitting = makeRenderer({ pointCount });
   simulateHeap(t, { limitBytes: usedBytes + projected, usedBytes });
-  admitting.renderer.setAdaptiveLOD(true);
+  recordCalculationNotifications(t);
+  enableLodAndRequest(admitting.renderer);
   assert.equal(admitting.renderer.useAdaptiveLOD, true);
   assert.equal(admitting.staged.length, 1);
 });
@@ -294,20 +324,13 @@ test('one byte less headroom refuses the same build', (t) => {
 
   const refusing = makeRenderer({ pointCount });
   simulateHeap(t, { limitBytes: usedBytes + projected - 1, usedBytes });
-  assert.throws(
-    () => refusing.renderer.setAdaptiveLOD(true),
-    (error) => {
-      assert.ok(error instanceof RangeError);
-      assert.ok(
-        error.message.includes(
-          `level-of-detail index for ${pointCount.toLocaleString()} points`,
-        ),
-        error.message,
-      );
-      return true;
-    },
+  const errors = recordErrorNotifications(t);
+  enableLodAndRequest(refusing.renderer);
+  assert.equal(errors.length, 1);
+  assert.ok(
+    errors[0].includes(`level-of-detail index for ${pointCount.toLocaleString()} points`),
+    errors[0],
   );
-  assert.equal(refusing.renderer.useAdaptiveLOD, false);
   assert.equal(refusing.staged.length, 0);
 });
 
@@ -318,9 +341,10 @@ test(
     // build Chromium hangs on and Firefox refuses it with a real WebGL error,
     // so neither may be refused against a limit this renderer invented.
     simulateHeap(t, null);
+    recordCalculationNotifications(t);
     const { renderer, staged } = makeRenderer({ pointCount: 40_000_000 });
 
-    renderer.setAdaptiveLOD(true);
+    enableLodAndRequest(renderer);
 
     assert.equal(renderer.useAdaptiveLOD, true);
     assert.equal(staged.length, 1);
@@ -332,9 +356,11 @@ test('the plain path is never refused by the LOD admission check', (t) => {
   // levels, so none of the projected heap applies. The limit here is far below
   // anything a LOD build of this size could fit in.
   simulateHeap(t, { limitBytes: 1, usedBytes: 0 });
+  recordCalculationNotifications(t);
   const { renderer, staged } = makeRenderer({ pointCount: 40_000_000 });
 
   renderer.setFrustumCulling(true);
+  renderer._requestSpatialIndex({ kind: 'live' }, false);
 
   assert.equal(renderer.useFrustumCulling, true);
   assert.equal(staged.length, 0);
@@ -378,14 +404,16 @@ test(
 );
 
 test('every LOD tree construction is admitted first', async () => {
-  // A seventh construction site added without an admission check would restore
-  // the unbounded path for one entry point while the others stayed bounded.
+  // A construction site added without an admission check would restore the
+  // unbounded path for one entry point while the others stayed bounded. A
+  // build request (`_buildSpatialTreeJob`, worker or inline) is a LOD build
+  // like any other.
   const source = await readFile(RENDERER_SOURCE_PATH, 'utf8');
   const events = [];
   const pattern =
-    /(?<definition>function\s+)?requireLodBuildHeapHeadroom\(|new SpatialIndex\(/g;
+    /(?<definition>function\s+)?requireLodBuildHeapHeadroom\(|new SpatialIndex\(|this\._buildSpatialTreeJob\(|\.ensureLODLevels\(\)/g;
   for (const match of source.matchAll(pattern)) {
-    if (match[0].startsWith('new SpatialIndex')) {
+    if (match[0].startsWith('new SpatialIndex') || match[0].startsWith('this._buildSpatialTreeJob') || match[0] === '.ensureLODLevels()') {
       events.push('construct');
     } else if (match.groups.definition === undefined) {
       events.push('admit');
@@ -393,7 +421,7 @@ test('every LOD tree construction is admitted first', async () => {
   }
   const constructions = events.filter((e) => e === 'construct').length;
   assert.ok(
-    constructions >= 6,
+    constructions >= 3,
     `expected the known LOD construction sites, found ${constructions}`,
   );
   assert.deepEqual(

@@ -1,6 +1,11 @@
 /**
  * @fileoverview Download tracking mixin for NotificationCenter.
  *
+ * A tracker follows bytes into the page from any source — a network fetch, a
+ * file picked from disk, an AnnData file already in memory — so its titles say
+ * "Loading", "Loaded" and "Loading failed", which are true for all of them, and
+ * a tracker's name names the thing being loaded, not the verb.
+ *
  * Split out of the main NotificationCenter module to keep the core rendering
  * and lifecycle methods small and easy to maintain.
  *
@@ -94,7 +99,7 @@ export const downloadTrackingMethods = {
         ? NotificationType.PROGRESS
         : NotificationType.LOADING,
       category: 'download',
-      title: 'Downloading',
+      title: 'Loading',
       message: name,
       progress: initialProgress,
       speed: 0,
@@ -185,7 +190,7 @@ export const downloadTrackingMethods = {
     const finalMessage = message ??
       `${tracker.name} (${formatBytes(tracker.loadedBytes)} in ${formatDuration(duration)})`;
 
-    this.complete(`download-${id}`, finalMessage);
+    this.complete(`download-${id}`, finalMessage, { title: 'Loaded' });
     this.downloadTrackers.delete(id);
   },
 
@@ -198,7 +203,9 @@ export const downloadTrackingMethods = {
     const tracker = requireTracker(this, id);
     requireNonEmptyString(errorMessage, 'Download error message');
 
-    this.fail(`download-${id}`, `${tracker.name}: ${errorMessage}`);
+    this.fail(`download-${id}`, `${tracker.name}: ${errorMessage}`, {
+      title: 'Loading failed'
+    });
     this.downloadTrackers.delete(id);
   },
 

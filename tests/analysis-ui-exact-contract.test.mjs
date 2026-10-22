@@ -26,6 +26,7 @@ import {
   restore as restoreAnalysisWindows,
 } from '../assets/js/app/session/contributors/analysis-windows.js';
 import { SessionSerializer } from '../assets/js/app/session/session-serializer.js';
+import { createInMemoryDimensionManager } from '../assets/js/data/dimension-manager.js';
 import { getNotificationCenter } from '../assets/js/app/notification-center.js';
 import { ComparisonModule } from '../assets/js/app/analysis/comparison-module.js';
 import { createPageComparisonSelector } from '../assets/js/app/analysis/ui/components/selectors.js';
@@ -238,15 +239,16 @@ test('PageSelectorComponent disables zero-cell pages and defaults to a non-empty
     const tabs = [];
     const visit = element => {
       if (element.dataset?.pageId) tabs.push(element);
-      for (const child of element.children) visit(child);
+      for (const child of element.children ?? []) visit(child);
     };
     visit(container);
     const emptyTab = tabs.find(tab => tab.dataset.pageId === 'page_1');
     const restTab = tabs.find(tab => tab.dataset.pageId === 'restof__page_1');
-    assert.ok(emptyTab.className.includes('disabled'));
+    // Availability and selection are carried by ARIA, which the shared chip
+    // style reads: no parallel class records them.
     assert.equal(emptyTab.attributes.get('aria-disabled'), 'true');
-    assert.equal(emptyTab.className.includes('selected'), false);
-    assert.ok(restTab.className.includes('selected'));
+    assert.equal(emptyTab.attributes.get('aria-pressed'), 'false');
+    assert.equal(restTab.attributes.get('aria-pressed'), 'true');
 
     assert.throws(
       () => selector.setSelectedPages(['page_1']),
@@ -436,6 +438,19 @@ class FakeElement {
     return child;
   }
 
+  append(...nodes) {
+    for (const node of nodes) this.appendChild(node);
+  }
+
+  replaceChildren(...nodes) {
+    this.children = [];
+    this.append(...nodes);
+  }
+
+  get ownerDocument() {
+    return globalThis.document;
+  }
+
   setAttribute(name, value) {
     this.attributes.set(name, String(value));
   }
@@ -516,6 +531,9 @@ async function withFakeDOM(run) {
     createElement(tagName) {
       return new FakeElement(tagName);
     },
+    createTextNode(text) {
+      return { nodeType: 3, textContent: String(text) };
+    },
     getElementById() {
       return null;
     },
@@ -581,7 +599,9 @@ test('Form plot-option events observe and drain work while direct callers retain
     try {
       const optionsContainer = new FakeElement('div');
       ui._renderModalOptions(optionsContainer);
-      const checkbox = optionsContainer.children[0]?.children[0] ?? null;
+      // row > label.checkbox-inline > input: the option text labels the
+      // checkbox it wraps.
+      const checkbox = optionsContainer.children[0]?.children[0]?.children[0] ?? null;
       assert.equal(
         checkbox?.tagName,
         'INPUT',
@@ -764,10 +784,13 @@ test('AnalysisWindowManager requires the exact settings export API', async () =>
   await withFakeDOM(() => {
     const { manager } = createWindowManagerHarness();
     const details = new FakeElement('details');
+    const frame = new FakeElement('div');
+    frame.appendChild(details);
     manager._windows.set('window-a', {
       id: 'window-a',
       modeId: 'exact',
       details,
+      frame,
       ui: {
         getSelectedPages() {
           return ['page-a'];
@@ -777,7 +800,6 @@ test('AnalysisWindowManager requires the exact settings export API', async () =>
         },
       },
       headerTitle: 'Exact',
-      headerDesc: '',
       floatConstraints: {
         minWidth: 180,
         maxWidth: 600,
@@ -807,6 +829,9 @@ test('AnalysisWindowManager propagates dockable registration failure and rolls b
         floatCalls += 1;
       },
       unregister() {},
+      panelFrame() {
+        return null;
+      },
     });
     const { manager } = createWindowManagerHarness();
 
@@ -934,16 +959,48 @@ test('analysis-window session restore is terminal on invalid boundaries and mana
   assert.equal(restoreCalls, 1, 'restore must stop at the first failed descriptor');
 });
 
+/**
+ * The smallest DataState a session fingerprint can be taken from: one
+ * in-memory 3D layout (keyed "3d"), shown by the live view, and the export
+ * data mapping that names it.
+ */
+function createFingerprintState() {
+  const positionsArray = new Float32Array(9);
+  const dimensionManager = createInMemoryDimensionManager({
+    positions: positionsArray,
+    dimension: 3,
+  });
+  const dataMapping = Object.freeze({
+    kind: 'export',
+    embeddings: {
+    enabled: [{ key: '3d', columns: null }],
+    defaults: { '1d': null, '2d': null, '3d': { key: '3d', columns: null } },
+  },
+    geneNames: 'index',
+    vectorFields: [],
+  });
+  return {
+    getDatasetGeneration: () => 0,
+    obsData: { fields: [] },
+    pointCount: 3,
+    dimensionManager,
+    getDataMapping: () => dataMapping,
+    getDataMappingOrigin: () => 'default',
+    describeEmbeddingRefusal: () => null,
+    describeMappingChoiceRefusal: () => null,
+    applyDataMapping: async () => {
+      throw new Error('A session on the same mapping applies no mapping.');
+    },
+    getViewDimensionLevel: () => 3,
+    getViewLayoutKey: () => dimensionManager.getViewLayout('live'),
+    positionsArray,
+    varData: { fields: [] },
+  };
+}
+
 function createSessionSerializer(contributors) {
   return new SessionSerializer({
-    state: {
-      getDatasetGeneration: () => 0,
-      obsData: { fields: [] },
-      pointCount: 3,
-      getViewDimensionLevel: () => 3,
-      positionsArray: new Float32Array(9),
-      varData: { fields: [] },
-    },
+    state: createFingerprintState(),
     viewer: {},
     sidebar: {},
     dataSourceManager: null,
@@ -1102,9 +1159,6 @@ test('SessionSerializer public restore promise propagates lazy contributor failu
       () => ({ status: 'resolved' }),
       error => ({ status: 'rejected', error }),
     );
-    if (serializer._activeLazyTask) {
-      await serializer._activeLazyTask.catch(() => {});
-    }
   });
   assert.equal(outcome.status, 'rejected');
   assert.equal(outcome.error, restoreError);
@@ -1279,7 +1333,7 @@ test('analysis previews invoke their required full-view modal owner', async () =
           ) {
             clickTarget = element;
           }
-          for (const child of element.children) visit(child);
+          for (const child of element.children ?? []) visit(child);
         };
         visit(ui._resultContainer);
         assert.ok(

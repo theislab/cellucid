@@ -1,6 +1,7 @@
 import { expect, test } from './helpers/test.mjs';
 import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
+import { openCollapsedPanels } from './helpers/panels.mjs';
 
 const PREPARED_DATASET_URL =
   `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=info-popovers-ci`;
@@ -40,6 +41,7 @@ test('compact information popovers are accessible, exclusive, and viewport-safe'
   const productErrors = observeProductErrors(page);
   await page.goto(PREPARED_DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
+  await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
     'Current UI prepared fixture'
   );
@@ -47,10 +49,10 @@ test('compact information popovers are accessible, exclusive, and viewport-safe'
   await page.locator('#theme-select').selectOption('dark');
   await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark');
   await expect.poll(
-    () => page.locator('.sidebar-brand').evaluate(element => (
-      getComputedStyle(element).backgroundColor
+    () => page.locator('.sidebar-logo').evaluate(element => (
+      getComputedStyle(element).filter
     ))
-  ).toBe('rgb(255, 255, 255)');
+  ).toBe('invert(1) hue-rotate(180deg)');
   await page.locator('#theme-select').selectOption('light');
   await expect(page.locator('html')).toHaveAttribute('data-theme', 'light');
 
@@ -96,15 +98,26 @@ test('compact information popovers are accessible, exclusive, and viewport-safe'
   await expect(localPopover).toBeVisible();
   await expect(localPopover).toBeFocused();
   await expect(localPopover).toContainText(
-    'Zarr ZIP: Load a .zarr.zip or .zip archive'
+    'Zarr ZIP: a .zarr.zip or .zip holding one AnnData Zarr store'
   );
   expect(
     await localPopover.evaluate(popover => popover.parentElement === document.body)
   ).toBe(true);
   await expectInsideViewport(localPopover, page);
 
+  // Tab walks the tip: its close button, then each docs link, then on past
+  // the trigger.
   await page.keyboard.press('Tab');
-  await expect(localPopover.locator('a')).toBeFocused();
+  await expect(localPopover.locator('.info-tip-close')).toBeFocused();
+  const links = localPopover.locator('a.info-tip-link');
+  await expect(links).toHaveCount(2);
+  for (const link of await links.all()) {
+    await expect(link).toHaveAttribute('target', '_blank');
+    await expect(link).toHaveAttribute('rel', /noopener/);
+    await expect(link).toHaveAttribute('href', /^https:\/\/docs\.cellucid\.com\/en\/latest\/user_guide\/web_app\/[a-z0-9_/]+\.html#[a-z0-9-]+$/);
+    await page.keyboard.press('Tab');
+    await expect(link).toBeFocused();
+  }
   await page.keyboard.press('Tab');
   await expect(localPopover).toBeHidden();
   await expect(localButton).toHaveAttribute('aria-expanded', 'false');
@@ -128,6 +141,14 @@ test('compact information popovers are accessible, exclusive, and viewport-safe'
   await expect(page.locator('#session-state-info-tooltip')).toBeHidden();
   await expect(sessionButton).toBeFocused();
 
+  // The close button in the tip's title row dismisses it as Escape does.
+  await sessionButton.click();
+  const sessionPopover = page.locator('#session-state-info-tooltip');
+  await expect(sessionPopover.locator('.info-tip-title')).toHaveText('Session file');
+  await sessionPopover.locator('.info-tip-close').click();
+  await expect(sessionPopover).toBeHidden();
+  await expect(sessionButton).toBeFocused();
+
   const communityButton = page.getByRole('button', {
     name: 'About community annotation'
   });
@@ -136,7 +157,7 @@ test('compact information popovers are accessible, exclusive, and viewport-safe'
   await communityButton.click();
   await expect(page.locator('#community-annotation-info-1')).toBeVisible();
   await expect(page.locator('#community-annotation-info-1')).toContainText(
-    'Connect an annotation repo'
+    'Connect an annotation repository to start'
   );
   await page.keyboard.press('Escape');
   await expect(communityButton).toBeFocused();

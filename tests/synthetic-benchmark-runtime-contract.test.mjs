@@ -13,6 +13,11 @@ function createViewer({ rejectPositions = null } = {}) {
     clearSnapshotViews() {
       calls.push(['clearSnapshotViews']);
     },
+    // The seeded scene shows the 3D layout of the previous dataset.
+    getViewLayoutKey(viewId) {
+      assert.equal(viewId, 'live');
+      return '3d';
+    },
     resetVectorFieldOverlay() {
       calls.push(['resetVectorFieldOverlay']);
     },
@@ -52,13 +57,13 @@ function seedState(viewer) {
   });
   state.pointCount = 2;
   state.positionsArray = new Float32Array([0, 0, 0, 1, 1, 1]);
+  state.positionsDimension = 3;
   state.colorsArray = new Uint8Array([
     1, 2, 3, 255,
     4, 5, 6, 255
   ]);
-  state.categoryTransparency = new Float32Array([1, 0]);
-  state.cellVisibilityMask = new Float32Array([1, 0]);
-  state.outlierQuantilesArray = new Float32Array([-1, 0.5]);
+  state.categoryTransparency = new Uint8Array([1, 0]);
+  state.cellVisibilityMask = new Uint8Array([1, 0]);
   state.highlightArray = new Uint8Array([255, 0]);
   state.highlightPages = [{
     id: 'page_1',
@@ -88,12 +93,13 @@ function seedState(viewer) {
 }
 
 function createCandidate(pointCount = 5, dimensionLevel = 3) {
-  const positions = new Float32Array(pointCount * 3);
+  // Exactly `dimensionLevel` position components per point.
+  const positions = new Float32Array(pointCount * dimensionLevel);
   const colors = new Uint8Array(pointCount * 4);
   for (let index = 0; index < pointCount; index += 1) {
-    positions[index * 3] = index / pointCount;
-    positions[index * 3 + 1] = index / (pointCount + 1);
-    positions[index * 3 + 2] = index / (pointCount + 2);
+    for (let axis = 0; axis < dimensionLevel; axis += 1) {
+      positions[index * dimensionLevel + axis] = index / (pointCount + axis);
+    }
     colors[index * 4] = index;
     colors[index * 4 + 1] = 100;
     colors[index * 4 + 2] = 200;
@@ -119,16 +125,33 @@ test('in-memory dimensions publish one exact cached coordinate generation', asyn
   );
   assert.equal(candidate.dimensionManager.getDefaultDimension(), 2);
   assert.equal(
-    await candidate.dimensionManager.getPositions3D(2),
+    await candidate.dimensionManager.getPositions('2d'),
     candidate.positions
+  );
+  // Its one layout is enabled and is its dimension's default.
+  assert.deepEqual(candidate.dimensionManager.getEnabledLayoutKeys(), ['2d']);
+  assert.equal(candidate.dimensionManager.getDefaultLayout(2), '2d');
+  assert.equal(candidate.dimensionManager.getDefaultLayoutKey(), '2d');
+  assert.equal(candidate.dimensionManager.getViewLayout('live'), '2d');
+  assert.equal(candidate.dimensionManager.getLayout('2d').path, null);
+  await assert.rejects(
+    candidate.dimensionManager.loadLayout('2d'),
+    /exist only in memory/
   );
 
   assert.throws(
     () => createInMemoryDimensionManager({
-      positions: new Float32Array([0, Number.NaN, 0]),
+      positions: new Float32Array([0, Number.NaN, 0, 0]),
       dimension: 2
     }),
     /position 1 must be finite/
+  );
+  assert.throws(
+    () => createInMemoryDimensionManager({
+      positions: new Float32Array(6 + 1),
+      dimension: 2
+    }),
+    /2 values per cell/
   );
   assert.throws(
     () => createInMemoryDimensionManager({
@@ -152,9 +175,13 @@ test('synthetic benchmark publication replaces every count-coupled state owner',
   });
   assert.equal(state.pointCount, 5);
   assert.equal(state.positionsArray, candidate.positions);
+  assert.equal(state.positionsArray.length, 10);
+  assert.equal(state.positionsDimension, 2);
   assert.equal(state.colorsArray, candidate.colors);
   assert.equal(state.dimensionManager, candidate.dimensionManager);
-  assert.equal(state.activeDimensionLevel, 2);
+  // The active dimension is the dimension of the representation it shows.
+  assert.equal(state.getDimensionLevel(), 2);
+  assert.equal(Object.hasOwn(state, 'activeDimensionLevel'), false);
   assert.deepEqual(state.obsData, { fields: [] });
   assert.equal(state.varData, null);
   assert.equal(state.fieldLoader, null);
@@ -167,8 +194,7 @@ test('synthetic benchmark publication replaces every count-coupled state owner',
   assert.deepEqual([...state.categoryTransparency], [1, 1, 1, 1, 1]);
   assert.equal(state.cellVisibilityMask.length, 5);
   assert.deepEqual([...state.cellVisibilityMask], [1, 1, 1, 1, 1]);
-  assert.equal(state.outlierQuantilesArray.length, 5);
-  assert.deepEqual([...state.outlierQuantilesArray], [-1, -1, -1, -1, -1]);
+  assert.equal(Object.hasOwn(state, 'outlierQuantilesArray'), false);
   assert.equal(state.highlightArray.length, 5);
   assert.deepEqual([...state.highlightArray], [0, 0, 0, 0, 0]);
   assert.equal(state.highlightPages.length, 1);
@@ -186,6 +212,7 @@ test('synthetic benchmark publication replaces every count-coupled state owner',
   assert.equal(rendererPublication[1].colors, candidate.colors);
   assert.equal(rendererPublication[1].transparency.length, 5);
   assert.equal(rendererPublication[1].dimensionLevel, 2);
+  assert.equal(rendererPublication[1].layoutKey, '2d');
   const highlightPublication = viewer.calls.find(
     ([name, payload]) =>
       name === 'updateHighlight' && payload === state.highlightArray
@@ -253,4 +280,5 @@ test('renderer rejection restores the previous payload without publishing state'
   assert.equal(setDataCalls.length, 2);
   assert.equal(setDataCalls[0][1].positions, candidate.positions);
   assert.equal(setDataCalls[1][1].positions, previous.positions);
+  assert.equal(setDataCalls[1][1].layoutKey, '3d');
 });

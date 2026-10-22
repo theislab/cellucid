@@ -6,7 +6,6 @@
  *
  * @module state/core/data-state
  */
-import { LRUCache } from '../../../data/sparse-utils.js';
 import { EventEmitter } from '../../utils/event-emitter.js';
 import { RenameRegistry } from '../../registries/rename-registry.js';
 import { DeleteRegistry } from '../../registries/delete-registry.js';
@@ -17,6 +16,10 @@ import { FieldManager, DataStateFieldMethods } from '../managers/field-manager.j
 import { FilterManager, DataStateFilterMethods } from '../managers/filter-manager.js';
 import { ColorManager, DataStateColorMethods } from '../managers/color-manager.js';
 import { ViewManager, DataStateViewMethods } from '../managers/view-manager.js';
+import { DataStateMappingMethods } from '../managers/mapping-manager.js';
+import { DataStateMappingGroupMethods } from '../managers/mapping-groups.js';
+import { DataStateVarAxisMethods } from '../managers/var-axis.js';
+import { DataStateLatentSpaceMethods } from '../managers/latent-space.js';
 
 export function createDataState({ viewer, labelLayer }) {
   return new DataState(viewer, labelLayer);
@@ -31,11 +34,18 @@ export class DataState extends EventEmitter {
     this.varFieldLoader = null;
 
     this.pointCount = 0;
-    this.positionsArray = new Float32Array(0); // normalized positions used for smoke density
+    // Live view's normalized positions, `positionsDimension` components per
+    // cell (see rendering/position-layout.js). The two are assigned together.
+    this.positionsArray = new Float32Array(0);
+    this.positionsDimension = 3;
     this.colorsArray = new Uint8Array(0);
-    this.outlierQuantilesArray = new Float32Array(0);
-    this.categoryTransparency = new Float32Array(0);
-    this.cellVisibilityMask = new Float32Array(0);
+    // Per-cell visibility of the active view: exactly 0 (hidden) or 1
+    // (shown). Every filter is a binary predicate, so one byte a cell holds
+    // every value this array can take; see rendering/alpha-visibility.js.
+    this.categoryTransparency = new Uint8Array(0);
+    // Per-cell user mask (setCellVisibility), exactly 0 or 1, ANDed into
+    // `categoryTransparency` by computeGlobalVisibility().
+    this.cellVisibilityMask = new Uint8Array(0);
     this.obsData = null;
     this.varData = null;
     this._obsFieldDescriptors = Object.freeze([]);
@@ -54,20 +64,42 @@ export class DataState extends EventEmitter {
     this.centroidLabels = [];
     this.centroidOutliers = new Float32Array(0);
 
-    this._visibilityScratch = null; // reusable mask for connectivity visibility
     this._activeCategoryCounts = null;
     this.activeViewId = 'live';
     this.viewContexts = new Map(); // viewId -> per-view context (arrays + field state)
-    // LRU caches for field data to prevent unbounded memory growth
-    // Obs fields: max 50 (each ~10 bytes × pointCount)
-    // Var fields: max 20 (gene expressions, each ~4 bytes × pointCount, typically larger access pattern)
-    this._fieldDataCache = new LRUCache(50); // field.key -> loaded arrays (shared across views)
-    this._varFieldDataCache = new LRUCache(20); // var.field.key -> loaded arrays
+    // Loaded field arrays by cache key (shared across views). Their bound is
+    // in bytes, not entries: see state/managers/field/residency.js, which
+    // releases inactive fields from these maps and from every field object.
+    this._fieldDataCache = new Map(); // obs field key -> loaded arrays
+    this._varFieldDataCache = new Map(); // gene key -> loaded arrays
 
     // Multi-dimensional embedding support
-    this.dimensionManager = null; // Set via setDimensionManager()
-    this.activeDimensionLevel = 3; // Current dimension level for live view (1, 2, or 3)
-    this._dimensionChangeLock = null; // Serializes async dimension changes to prevent cross-await state corruption
+    // The layout registry, and the one owner of the representation each view
+    // shows (see getViewLayoutKey / getViewDimensionLevel). Set via
+    // setDimensionManager().
+    this.dimensionManager = null;
+    this._dimensionChangeLock = null; // Serializes representation changes to prevent cross-await state corruption
+
+    // The data mapping the loaded dataset is shown with (see
+    // data/dataset-mapping.js), recorded in every session fingerprint. Null
+    // when no dataset is loaded. Owned by state/managers/mapping-manager.js:
+    // published with publishDatasetMapping(), changed with applyDataMapping().
+    this.dataMapping = null;
+    this._mappingCandidates = null;
+    this._mappingOrigin = null;
+    this._mappingPublicationOrigin = null;
+    // Embeddings that failed their load-time check: obsm key or export id ->
+    // reason. They stay unusable for the rest of the dataset's session.
+    this._unusableEmbeddings = new Map();
+    this._mappingChangeLock = null;
+    // The other mapping groups (state/managers/mapping-groups.js): choices
+    // refused at load time this session (group -> key -> reason), and the
+    // owners outside DataState a mapping transaction publishes through.
+    this._unusableMappingChoices = new Map();
+    this._mappingRuntime = null;
+    // Replacements of the var axis since the dataset was published
+    // (state/managers/var-axis.js).
+    this._varAxisGeneration = 0;
 
     // Optional per-cell vector fields (e.g., velocity, CellRank drift) tied to embedding dimensions.
     // Set via views.setVectorFieldManager() from the app bootstrap when available.
@@ -115,6 +147,10 @@ function applyMixin(targetProto, mixinProto) {
 }
 
 applyMixin(DataState.prototype, DataStateViewMethods.prototype);
+applyMixin(DataState.prototype, DataStateMappingMethods.prototype);
+applyMixin(DataState.prototype, DataStateMappingGroupMethods.prototype);
+applyMixin(DataState.prototype, DataStateVarAxisMethods.prototype);
+applyMixin(DataState.prototype, DataStateLatentSpaceMethods.prototype);
 applyMixin(DataState.prototype, DataStateFieldMethods.prototype);
 applyMixin(DataState.prototype, DataStateColorMethods.prototype);
 applyMixin(DataState.prototype, DataStateFilterMethods.prototype);

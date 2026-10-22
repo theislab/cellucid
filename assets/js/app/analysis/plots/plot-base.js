@@ -4,7 +4,7 @@
  * Provides shared functionality for all plot types:
  * - Common hover label styling
  * - Page color management
- * - Numeric value filtering
+ * - Global value ranges
  * - Consistent render/update pattern
  * - Standard CSV export structure
  *
@@ -12,7 +12,7 @@
  * and maintain consistent behavior across the module.
  */
 
-import { PlotHelpers, getPageColor, PAGE_COLORS } from '../core/plugin-contract.js';
+import { PlotHelpers, getPageColor } from '../core/plugin-contract.js';
 import { createMinimalPlotly, getPlotlyConfig } from './plotly-loader.js';
 import { isFiniteNumber } from '../shared/number-utils.js';
 import { getPlotTheme } from '../shared/plot-theme.js';
@@ -79,15 +79,6 @@ export class BasePlot {
   // ===========================================================================
   // Static Utility Methods (can be used without extending)
   // ===========================================================================
-
-  /**
-   * Filter values to numeric only
-   * @param {any[]} values - Array of values
-   * @returns {number[]} Filtered numeric values
-   */
-  static filterNumeric(values) {
-    return values.filter(v => isFiniteNumber(v));
-  }
 
   /**
    * Get color for a page
@@ -231,13 +222,6 @@ export class BasePlot {
   // ===========================================================================
 
   /**
-   * Filter values to numeric only (instance method)
-   */
-  filterNumeric(values) {
-    return BasePlot.filterNumeric(values);
-  }
-
-  /**
    * Get page color (instance method)
    */
   getPageColor(layoutEngine, pageId, index) {
@@ -329,63 +313,8 @@ export class BasePlot {
 }
 
 // ===========================================================================
-// Helper Functions for Plot Development
-// ===========================================================================
-
-/**
- * Create a plot definition using BasePlot utilities
- *
- * This is a convenience function for creating plot definitions
- * without extending BasePlot class.
- *
- * @param {Object} definition - Plot definition with custom render/update/export
- * @returns {Object} Complete plot definition with base utilities
- */
-export function createPlotDefinition(definition) {
-  const base = {
-    supportedTypes: ['continuous'],
-    supportedLayouts: ['side-by-side'],
-    defaultOptions: {},
-    optionSchema: {}
-  };
-
-  // Merge with base
-  const merged = { ...base, ...definition };
-
-  // Add utility references
-  merged._utils = {
-    filterNumeric: BasePlot.filterNumeric,
-    getPageColor: BasePlot.getPageColor,
-    getGlobalRange: BasePlot.getGlobalRange,
-    getHoverLabel: BasePlot.getHoverLabel,
-    createLayout: BasePlot.createLayout,
-    getPlotlyConfig: BasePlot.getPlotlyConfig,
-    loadPlotly: BasePlot.loadPlotly,
-    getVariableName: BasePlot.getVariableName
-  };
-
-  if (typeof merged.render !== 'function' || typeof merged.update !== 'function') {
-    throw new TypeError('Plot definitions require explicit render and update functions');
-  }
-
-  if (typeof merged.exportCSV !== 'function') {
-    throw new TypeError('Plot definitions require an explicit exportCSV function');
-  }
-
-  return merged;
-}
-
-// ===========================================================================
 // Exports
 // ===========================================================================
 
-export default BasePlot;
-
 // Re-export commonly used utilities for convenience
-export {
-  PlotHelpers,
-  getPageColor,
-  PAGE_COLORS,
-  createMinimalPlotly,
-  getPlotlyConfig
-};
+export { createMinimalPlotly, getPlotlyConfig };

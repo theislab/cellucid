@@ -9,6 +9,16 @@ import { MarkerDiscoveryEngine } from '../assets/js/app/analysis/genes-panel/mar
 import { ProgressTracker } from '../assets/js/app/analysis/shared/progress-tracker.js';
 import { GenesPanelUI } from '../assets/js/app/analysis/ui/analysis-types/genes-panel-ui.js';
 
+// The data mapping of the open dataset: marker results are cached per gene
+// list, so every controller reads it from its data layer's state.
+const EXPORT_MAPPING = Object.freeze({
+  kind: 'export',
+  embeddings: { '1d': null, '2d': { key: 'umap', columns: null }, '3d': null },
+  geneNames: 'index',
+  vectorFields: [],
+});
+const getDataMapping = () => EXPORT_MAPPING;
+
 function deferred() {
   let resolve;
   let reject;
@@ -73,14 +83,23 @@ function createMarkerDataLayer(gene, values) {
   return {
     state: {
       pointCount: values.length,
+      getDataMapping,
     },
     getAvailableVariables(kind) {
       assert.equal(kind, 'gene_expression');
       return [{ key: gene, name: gene }];
     },
+    // A local source: nothing is downloaded ahead.
+    async prefetchGenePayload() {
+      return null;
+    },
     async ensureGeneExpressionLoaded(requestedGene, options) {
       assert.equal(requestedGene, gene);
-      assert.deepEqual(options, { silent: true });
+      // One of a long run's loads, under the run's own download signal.
+      assert.deepEqual(Object.keys(options).sort(), ['priority', 'signal', 'silent']);
+      assert.equal(options.silent, true);
+      assert.equal(options.priority, 'bulk');
+      assert.ok(options.signal instanceof AbortSignal);
       return { values };
     },
     unloadGeneExpression(requestedGene) {
@@ -628,7 +647,7 @@ test('concurrent controller initialization creates one engine and cache set', as
   });
 
   try {
-    const controller = new GenesPanelController({ dataLayer: {} });
+    const controller = new GenesPanelController({ dataLayer: { state: { getDataMapping } } });
     controller._getDatasetId = () => 'init-lifecycle-dataset';
 
     const firstInit = controller.init();
@@ -676,7 +695,7 @@ test('controller close is idempotent and waits for every active public operation
   const matrixGate = deferred();
   const groupsStarted = deferred();
   const groupsGate = deferred();
-  const controller = new GenesPanelController({ dataLayer: {} });
+  const controller = new GenesPanelController({ dataLayer: { state: { getDataMapping } } });
   let cacheCloseCount = 0;
 
   controller._initialized = true;
@@ -734,7 +753,7 @@ test('controller close is idempotent and waits for every active public operation
 
 for (const lifecycle of ['abort', 'close']) {
   test(`controller ${lifecycle} owns a run synchronously before initialization awaits`, async () => {
-    const controller = new GenesPanelController({ dataLayer: {} });
+    const controller = new GenesPanelController({ dataLayer: { state: { getDataMapping } } });
     let groupAccesses = 0;
     let cacheCloseCount = 0;
     controller._initialized = true;
@@ -743,7 +762,7 @@ for (const lifecycle of ['abort', 'close']) {
       throw new Error('a canceled run reached group loading');
     };
     controller._cache = {
-      setDatasetId() {},
+      setIdentity() {},
       close() {
         cacheCloseCount++;
       },
@@ -776,6 +795,7 @@ test('custom marker analysis rechecks cancellation after a matrix await', async 
   const matrixGate = deferred();
   const controller = new GenesPanelController({
     dataLayer: {
+      state: { getDataMapping },
       getAvailableVariables(kind) {
         assert.equal(kind, 'gene_expression');
         return [{ key: 'GENE' }];
@@ -784,7 +804,7 @@ test('custom marker analysis rechecks cancellation after a matrix await', async 
   });
   controller._initialized = true;
   controller._cache = {
-    setDatasetId() {},
+    setIdentity() {},
     close() {},
   };
   controller._getDatasetId = () => 'custom-cancel';
@@ -815,7 +835,7 @@ test('custom marker analysis rechecks cancellation after a matrix await', async 
 });
 
 test('final marker progress cannot abort and then publish a fulfilled result', async () => {
-  const controller = new GenesPanelController({ dataLayer: {} });
+  const controller = new GenesPanelController({ dataLayer: { state: { getDataMapping } } });
   controller._initialized = true;
   controller._getDatasetId = () => 'final-progress-cancel';
   controller._getGroupsFromCategory = async () => ({
@@ -826,7 +846,7 @@ test('final marker progress cannot abort and then publish a fulfilled result', a
     obsCodes: Uint16Array.from([0, 1]),
   });
   controller._cache = {
-    setDatasetId() {},
+    setIdentity() {},
     async get() {
       return {
         groups: {
@@ -868,6 +888,7 @@ test('controller snapshots custom genes and batch configuration before its first
   const seen = [];
   const controller = new GenesPanelController({
     dataLayer: {
+      state: { getDataMapping },
       getAvailableVariables() {
         return [{ key: 'GENE' }];
       },
@@ -875,7 +896,7 @@ test('controller snapshots custom genes and batch configuration before its first
   });
   controller._initialized = true;
   controller._cache = {
-    setDatasetId() {},
+    setIdentity() {},
     close() {},
   };
   controller._getDatasetId = () => 'owned-controller-options';
@@ -939,7 +960,7 @@ test('controller snapshots matrix-helper inputs before initialization awaits', a
     onProgress: firstProgress,
     signal: firstAbort.signal,
   };
-  const controller = new GenesPanelController({ dataLayer: {} });
+  const controller = new GenesPanelController({ dataLayer: { state: { getDataMapping } } });
   controller.init = () => initGate.promise;
   controller._matrixBuilder = {
     async buildMatrix(ownedOptions) {
@@ -987,7 +1008,7 @@ test('controller snapshots group-helper callbacks before initialization awaits',
     onProgress: firstProgress,
     signal: firstAbort.signal,
   };
-  const controller = new GenesPanelController({ dataLayer: {} });
+  const controller = new GenesPanelController({ dataLayer: { state: { getDataMapping } } });
   controller.init = () => initGate.promise;
   let observedOptions = null;
   controller._getGroupsFromCategory = async (_category, ownedOptions) => {
@@ -1035,7 +1056,7 @@ test('controller snapshots recluster inputs before initialization awaits', async
   const observed = [];
   const clustering = { rowOrder: [1, 0], colOrder: [0, 1] };
   const orderedMatrix = { ordered: true };
-  const controller = new GenesPanelController({ dataLayer: {} });
+  const controller = new GenesPanelController({ dataLayer: { state: { getDataMapping } } });
   controller.init = () => initGate.promise;
   controller._clusteringEngine = {
     async clusterMatrix(ownedOptions) {
@@ -1117,7 +1138,7 @@ test('Genes Panel invalidation during controller init cannot start stale discove
 
   const ui = new GenesPanelUI({
     comparisonModule: {},
-    dataLayer: {},
+    dataLayer: { state: { getDataMapping } },
   });
   ui._getFormValues = () => ({
     obsCategory: 'category',
@@ -1170,7 +1191,7 @@ test('Genes Panel invalidation aborts its active discovery owner', async () => {
 
   const ui = new GenesPanelUI({
     comparisonModule: {},
-    dataLayer: {},
+    dataLayer: { state: { getDataMapping } },
   });
   ui._controller = {
     runAnalysis() {
@@ -1221,7 +1242,7 @@ function createMarkerCacheKeyAuditController(minCells, observedParams) {
     },
   };
   const controller = new GenesPanelController({
-    dataLayer: {},
+    dataLayer: { state: { getDataMapping } },
     config: { minCells },
   });
   controller._initialized = true;
@@ -1231,7 +1252,7 @@ function createMarkerCacheKeyAuditController(minCells, observedParams) {
     obsCodes: Uint16Array.from([0, 1]),
   });
   controller._cache = {
-    setDatasetId() {},
+    setIdentity() {},
     async get(_category, params) {
       observedParams.push(structuredClone(params));
       return markers;
@@ -1280,7 +1301,7 @@ test('marker hot cache isolates mutable result envelopes from UI threshold rebui
     groupingDigest: computeCategoryGroupingDigest(Uint16Array.from([0, 1])),
   };
   const cache = new MarkerCache({
-    datasetId: 'cache-ownership-audit',
+    identity: { key: 'cache-ownership-audit', persistent: false },
     maxCategories: 1,
   });
 
@@ -1383,7 +1404,7 @@ function createMarkerGroupingAuditController(obsCodes, observedParams) {
     },
   };
   const controller = new GenesPanelController({
-    dataLayer: {},
+    dataLayer: { state: { getDataMapping } },
     config: { minCells: 1 },
   });
   controller._initialized = true;
@@ -1393,7 +1414,7 @@ function createMarkerGroupingAuditController(obsCodes, observedParams) {
     obsCodes,
   });
   controller._cache = {
-    setDatasetId() {},
+    setIdentity() {},
     async get(_category, params) {
       observedParams.push({ ...params });
       return markers;
@@ -1440,17 +1461,33 @@ test('category grouping digest is the exact per-cell code assignment', () => {
     'cells moved to unassigned must change the digest',
   );
 
-  for (const invalid of [null, undefined, new Uint16Array(0), [0, 1], Uint32Array.from([0, 1])]) {
+  // One partition has one digest at every code width: the missing code of
+  // each width is folded as the same value.
+  assert.equal(
+    computeCategoryGroupingDigest(Uint8Array.from([0, 0, 1, 1, 255, 255])),
+    computeCategoryGroupingDigest(Uint16Array.from([0, 0, 1, 1, 65535, 65535])),
+  );
+  assert.equal(
+    computeCategoryGroupingDigest(Uint16Array.from([0, 0, 1, 1, 65535, 65535])),
+    computeCategoryGroupingDigest(Uint32Array.from([0, 0, 1, 1, 4294967295, 4294967295])),
+  );
+  // Codes above 65,535 are folded whole, not truncated to 16 bits.
+  assert.notEqual(
+    computeCategoryGroupingDigest(Uint32Array.from([0, 1, 65_536])),
+    computeCategoryGroupingDigest(Uint32Array.from([0, 1, 0])),
+  );
+
+  for (const invalid of [null, undefined, new Uint16Array(0), [0, 1], Int32Array.from([0, 1])]) {
     assert.throws(
       () => computeCategoryGroupingDigest(invalid),
-      /non-empty Uint16Array/i,
+      /non-empty per-cell categorical codes/i,
     );
   }
 });
 
 test('marker cache entries are addressed by the grouping they were computed over', async () => {
   const cache = new MarkerCache({
-    datasetId: 'grouping-identity-audit',
+    identity: { key: 'grouping-identity-audit', persistent: false },
     maxCategories: 4,
   });
   const baseParams = {
@@ -1530,9 +1567,10 @@ test('controller marker cache keys own grouping identity', async () => {
 // A group is compared against the rest one gene at a time, and data-worker.js
 // runs that comparison only when the group and the rest each hold at least
 // max(2, minCells) cells with a measured value for the gene. Otherwise it leaves
-// NaN. Direct AnnData reaches the panel through getGeneExpression, which passes
-// X through without a finiteness check, so a gene with missing values is an
-// ordinary input rather than a corrupt one.
+// NaN. Direct AnnData reaches the panel through getGeneValues (the reader's
+// getMatrixColumn), which passes the expression matrix through without a
+// finiteness check, so a gene with missing values is an ordinary input rather
+// than a corrupt one.
 //
 // Every constant below is the value SciPy 1.16.3 produces on the same fixture:
 //   scipy.stats.mannwhitneyu(group, rest, alternative='two-sided',
@@ -1596,13 +1634,21 @@ function createUntestableMarkerFixture() {
   }));
 
   const dataLayer = {
-    state: { pointCount: totalCells },
+    state: { pointCount: totalCells, getDataMapping },
     getAvailableVariables(kind) {
       assert.equal(kind, 'gene_expression');
       return geneKeys.map(key => ({ key, name: key }));
     },
+    // A local source: nothing is downloaded ahead.
+    async prefetchGenePayload() {
+      return null;
+    },
     async ensureGeneExpressionLoaded(gene, options) {
-      assert.deepEqual(options, { silent: true });
+      // One of a long run's loads, under the run's own download signal.
+      assert.deepEqual(Object.keys(options).sort(), ['priority', 'signal', 'silent']);
+      assert.equal(options.silent, true);
+      assert.equal(options.priority, 'bulk');
+      assert.ok(options.signal instanceof AbortSignal);
       return { values: Float32Array.from(UNTESTABLE_GENES[gene]) };
     },
     unloadGeneExpression() {
@@ -1867,9 +1913,11 @@ test('the genes panel states the denominator each marker group was corrected ove
     { genesTested: 2000, genesUntestable: 0 },
     10,
   );
+  // Grouped with a comma whatever the browser locale: interface counts go
+  // through ui/components/display-format.js.
   assert.equal(
     complete.textContent,
-    `${(2000).toLocaleString()} genes tested (FDR denominator)`,
+    '2,000 genes tested (FDR denominator)',
   );
 
   // Partial emissions have corrected nothing yet and must claim no denominator.

@@ -23,18 +23,25 @@ import {
   assertNullableString,
   assertPlainRecord,
   assertSafeInteger,
+  DUPLICATE_CATEGORY_POSITION,
   describeCategory,
+  indexCategoryPositions,
   requireMethod
 } from '../session/schema-contract.js';
 
 const COLOR_EPSILON = 1e-4;
 const RANGE_EPSILON = 1e-6;
+// The outlier filter lives with categorical fields: the prepared export writes
+// latent outlier quantiles only for categoricals, and the filter manager
+// refuses an outlier filter on any other field kind.
 const CATEGORY_KEYS = [
   'kind',
   'filterEnabled',
   'visibility',
   'colors',
-  'colormapId'
+  'colormapId',
+  'outlierFilterEnabled',
+  'outlierThreshold'
 ];
 const CONTINUOUS_KEYS = [
   'kind',
@@ -43,8 +50,6 @@ const CONTINUOUS_KEYS = [
   'colorRange',
   'useLogScale',
   'useFilterColorRange',
-  'outlierFilterEnabled',
-  'outlierThreshold',
   'colormapId'
 ];
 
@@ -182,24 +187,20 @@ function categoryNameAt(field, categoryIndex, context) {
  * category now sits at the old position.
  *
  * @param {object} field
+ * @param {Map<string|number|boolean, number>} positions - `indexCategoryPositions(field.categories)`
  * @param {string|number|boolean} categoryName
  * @param {string} context
  * @returns {number}
  */
-function resolveCategoryIndex(field, categoryName, context) {
-  if (!Array.isArray(field.categories)) {
-    throw new TypeError(
-      `${context} requires the category inventory of "${field.key}".`
-    );
-  }
-  const categoryIndex = field.categories.indexOf(categoryName);
-  if (categoryIndex < 0) {
+function resolveCategoryIndex(field, positions, categoryName, context) {
+  const categoryIndex = positions.get(categoryName);
+  if (categoryIndex === undefined) {
     throw new RangeError(
       `${context} names the category ${describeCategory(categoryName)}, `
       + `which "${field.key}" no longer has.`
     );
   }
-  if (field.categories.lastIndexOf(categoryName) !== categoryIndex) {
+  if (categoryIndex === DUPLICATE_CATEGORY_POSITION) {
     throw new TypeError(
       `${context} names the category ${describeCategory(categoryName)}, `
       + `and "${field.key}" lists it more than once.`
@@ -242,6 +243,20 @@ function explicitBooleanChange(value, changedValue, context) {
 function explicitNullableColormap(value, unchangedId, context) {
   if (value === undefined || value === null || value === unchangedId) return null;
   return assertNonEmptyString(value, context);
+}
+
+function changedOutlierThreshold(field) {
+  if (field._outlierThreshold === undefined || field._outlierThreshold === null) {
+    return null;
+  }
+  const threshold = assertFiniteNumber(
+    field._outlierThreshold,
+    `Category outlierThreshold for "${field.key}"`
+  );
+  if (threshold < 0 || threshold > 1) {
+    throw new RangeError(`Category outlierThreshold for "${field.key}" must be from 0 through 1.`);
+  }
+  return threshold < 0.9999 ? threshold : null;
 }
 
 function serializeCategoryFilter(field) {
@@ -308,13 +323,21 @@ function serializeCategoryFilter(field) {
       field._colormapId,
       null,
       `Category colormapId for "${field.key}"`
-    )
+    ),
+    outlierFilterEnabled: explicitBooleanChange(
+      field._outlierFilterEnabled,
+      false,
+      `Category outlierFilterEnabled for "${field.key}"`
+    ),
+    outlierThreshold: changedOutlierThreshold(field)
   };
   const changed = (
     entry.filterEnabled !== null
     || entry.visibility.length > 0
     || entry.colors.length > 0
     || entry.colormapId !== null
+    || entry.outlierFilterEnabled !== null
+    || entry.outlierThreshold !== null
   );
   return changed ? entry : null;
 }
@@ -331,18 +354,6 @@ function changedRange(candidate, stats, context) {
 }
 
 function serializeContinuousFilter(field) {
-  let outlierThreshold = null;
-  if (field._outlierThreshold !== undefined && field._outlierThreshold !== null) {
-    const threshold = assertFiniteNumber(
-      field._outlierThreshold,
-      `Continuous outlierThreshold for "${field.key}"`
-    );
-    if (threshold < 0 || threshold > 1) {
-      throw new RangeError(`Continuous outlierThreshold for "${field.key}" must be from 0 through 1.`);
-    }
-    if (threshold < 0.9999) outlierThreshold = threshold;
-  }
-
   const filter = changedRange(
     field._continuousFilter,
     field._continuousStats,
@@ -380,12 +391,6 @@ function serializeContinuousFilter(field) {
       false,
       `Continuous useFilterColorRange for "${field.key}"`
     ),
-    outlierFilterEnabled: explicitBooleanChange(
-      field._outlierFilterEnabled,
-      false,
-      `Continuous outlierFilterEnabled for "${field.key}"`
-    ),
-    outlierThreshold,
     colormapId: explicitNullableColormap(
       field._colormapId,
       'viridis',
@@ -438,11 +443,23 @@ function validateCategoryEntry(entry, field, fieldId) {
   }
   assertNullableBoolean(entry.filterEnabled, `Category filter "${fieldId}" filterEnabled`);
   assertNullableString(entry.colormapId, `Category filter "${fieldId}" colormapId`);
+  assertNullableBoolean(
+    entry.outlierFilterEnabled,
+    `Category filter "${fieldId}" outlierFilterEnabled`
+  );
+  const threshold = assertNullableFiniteNumber(
+    entry.outlierThreshold,
+    `Category filter "${fieldId}" outlierThreshold`
+  );
+  if (threshold !== null && (threshold < 0 || threshold > 1)) {
+    throw new RangeError(`Category filter "${fieldId}" outlierThreshold must be from 0 through 1.`);
+  }
   assertArray(entry.visibility, `Category filter "${fieldId}" visibility`);
   assertArray(entry.colors, `Category filter "${fieldId}" colors`);
   if (!Array.isArray(field.categories)) {
     throw new TypeError(`Current category field "${fieldId}" requires a category inventory.`);
   }
+  const positions = indexCategoryPositions(field.categories);
 
   const visibilityIndices = new Set();
   const resolvedVisibility = [];
@@ -458,6 +475,7 @@ function validateCategoryEntry(entry, field, fieldId) {
     );
     const categoryIndex = resolveCategoryIndex(
       field,
+      positions,
       change.categoryName,
       `Category filter "${fieldId}" visibility change`
     );
@@ -485,6 +503,7 @@ function validateCategoryEntry(entry, field, fieldId) {
     );
     const categoryIndex = resolveCategoryIndex(
       field,
+      positions,
       change.categoryName,
       `Category filter "${fieldId}" color change`
     );
@@ -501,6 +520,8 @@ function validateCategoryEntry(entry, field, fieldId) {
     && entry.visibility.length === 0
     && entry.colors.length === 0
     && entry.colormapId === null
+    && entry.outlierFilterEnabled === null
+    && entry.outlierThreshold === null
   ) {
     throw new TypeError(`Category filter "${fieldId}" must contain an explicit change.`);
   }
@@ -520,17 +541,6 @@ function validateContinuousEntry(entry, fieldId) {
     entry.useFilterColorRange,
     `Continuous filter "${fieldId}" useFilterColorRange`
   );
-  assertNullableBoolean(
-    entry.outlierFilterEnabled,
-    `Continuous filter "${fieldId}" outlierFilterEnabled`
-  );
-  const threshold = assertNullableFiniteNumber(
-    entry.outlierThreshold,
-    `Continuous filter "${fieldId}" outlierThreshold`
-  );
-  if (threshold !== null && (threshold < 0 || threshold > 1)) {
-    throw new RangeError(`Continuous filter "${fieldId}" outlierThreshold must be from 0 through 1.`);
-  }
   assertNullableString(entry.colormapId, `Continuous filter "${fieldId}" colormapId`);
   if (
     entry.filterEnabled === null
@@ -538,8 +548,6 @@ function validateContinuousEntry(entry, fieldId) {
     && entry.colorRange === null
     && entry.useLogScale === null
     && entry.useFilterColorRange === null
-    && entry.outlierFilterEnabled === null
-    && entry.outlierThreshold === null
     && entry.colormapId === null
   ) {
     throw new TypeError(`Continuous filter "${fieldId}" must contain an explicit change.`);
@@ -732,6 +740,12 @@ export function createFilterSerializer({ state }) {
           if (entry.colormapId !== null) {
             field._colormapId = entry.colormapId;
           }
+          if (entry.outlierFilterEnabled !== null) {
+            field._outlierFilterEnabled = entry.outlierFilterEnabled;
+          }
+          if (entry.outlierThreshold !== null) {
+            field._outlierThreshold = entry.outlierThreshold;
+          }
           continue;
         }
 
@@ -749,12 +763,6 @@ export function createFilterSerializer({ state }) {
         }
         if (entry.useFilterColorRange !== null) {
           field._useFilterColorRange = entry.useFilterColorRange;
-        }
-        if (entry.outlierFilterEnabled !== null) {
-          field._outlierFilterEnabled = entry.outlierFilterEnabled;
-        }
-        if (entry.outlierThreshold !== null) {
-          field._outlierThreshold = entry.outlierThreshold;
         }
         if (entry.colormapId !== null) {
           field._colormapId = entry.colormapId;

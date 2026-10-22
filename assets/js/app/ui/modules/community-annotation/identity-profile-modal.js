@@ -27,6 +27,7 @@ import {
 } from '../../../community-annotations/orcid-client.js';
 import { el, hasAtLeastUnicodeCodePoints } from './dom.js';
 import { createDomId } from '../../components/dom-id.js';
+import { createInfoTip } from '../../components/controls.js';
 import { runExactCleanup } from './cleanup.js';
 import {
   COMMUNITY_MODAL_ESCAPE_OWNER,
@@ -36,6 +37,16 @@ import {
   assertExactAnnotationUserKey,
   assertExactGitHubLogin,
 } from './identity-assertions.js';
+
+/** Quiet period after the last keystroke before an ORCID lookup starts. */
+export const ORCID_SEARCH_DEBOUNCE_MS = 250;
+/**
+ * Delay between a combobox blur and hiding its suggestion popup, so a
+ * suggestion's pointerdown can cancel the hide before its click selects it.
+ */
+export const ORCID_SUGGESTION_HIDE_DELAY_MS = 150;
+/** Deadline for one ORCID registry request before it is aborted. */
+export const ORCID_REQUEST_TIMEOUT_MS = 6500;
 
 /**
  * Build the identity modal opener for one community annotation controls
@@ -98,21 +109,34 @@ export function createIdentityProfileModal({
 
         const modalRef = showOwnedCommunityModal({
           title: 'Your identity',
+          // Every close path (Close, Escape, backdrop, Cancel, Save,
+          // replacement) settles the flow. The settlement waits a microtask:
+          // Save closes the dialog first and resolves with the saved profile
+          // straight after, and that result must win over this null.
+          onClosed: () => queueMicrotask(() => resolveOnce(null)),
           modalClassName: 'community-annotation-modal--narrow',
           returnFocusTo,
           returnFocusResolver,
           buildContent: (content) => {
-            const note = el('div', { className: 'legend-help' });
-            note.appendChild(document.createTextNode('Saved locally (like votes) until you Publish; Publish writes it into your GitHub user file. '));
-            const optionalEm = document.createElement('em');
-            optionalEm.textContent = 'All fields are optional.';
-            note.appendChild(optionalEm);
-            content.appendChild(note);
+            // Where the profile is saved and when it is published is the (i).
+            const info = createInfoTip({ tip: 'community-profile', label: 'About your profile' });
+            content.appendChild(el('div', { className: 'field-label-row' }, [
+              el('span', { className: 'status-line', text: 'All fields are optional.' }),
+              info.button
+            ]));
+            content.appendChild(info.popover);
 
-          if (reason) content.appendChild(el('div', { className: 'legend-help', text: `⚠ ${String(reason)}` }));
+          if (reason) {
+            content.appendChild(el('p', {
+              className: 'status-line',
+              'data-tone': 'warning',
+              text: String(reason),
+            }));
+          }
 
-          const status = el('div', {
-            className: 'legend-help',
+          const status = el('p', {
+            className: 'status-line',
+            'data-tone': 'danger',
             role: 'status',
             'aria-live': 'polite',
             text: '',
@@ -120,11 +144,11 @@ export function createIdentityProfileModal({
           content.appendChild(status);
 
             if (suggested) {
-              content.appendChild(el('div', { className: 'legend-help', text: `GitHub: @${suggested}` }));
+              content.appendChild(el('p', { className: 'status-line', text: `GitHub: @${suggested}` }));
             } else {
-              content.appendChild(el('div', {
-                className: 'legend-help',
-                text: 'GitHub account not available. Sign in to set identity.'
+              content.appendChild(el('p', {
+                className: 'status-line',
+                text: 'Not signed in to GitHub.'
             }));
           }
 
@@ -146,15 +170,13 @@ export function createIdentityProfileModal({
               'public ORCID registry. Requests omit credentials and referrer information.',
           }));
           content.appendChild(el('label', {
-            className: 'legend-help',
             for: nameInputId,
-            text: 'Name:'
+            text: 'Name'
           }));
           const nameInput = el('input', {
             id: nameInputId,
             type: 'text',
-            className: 'community-annotation-text-input',
-              'aria-label': 'Name',
+            className: 'obs-select',
             'aria-describedby': orcidDisclosureId,
             role: 'combobox',
             'aria-autocomplete': 'list',
@@ -169,15 +191,13 @@ export function createIdentityProfileModal({
           content.appendChild(nameInput);
 
           content.appendChild(el('label', {
-            className: 'legend-help',
             for: titleInputId,
-            text: 'Affiliation / role:'
+            text: 'Affiliation / role'
           }));
           const titleInput = el('input', {
             id: titleInputId,
             type: 'text',
-            className: 'community-annotation-text-input',
-            'aria-label': 'Affiliation / role',
+            className: 'obs-select',
             name: 'cellucid_identity_affiliation',
             autocomplete: 'off',
             placeholder: 'e.g. Theis Lab, Postdoc',
@@ -186,15 +206,13 @@ export function createIdentityProfileModal({
           content.appendChild(titleInput);
 
           content.appendChild(el('label', {
-            className: 'legend-help',
             for: linkedinInputId,
-            text: 'LinkedIn:'
+            text: 'LinkedIn'
           }));
           const linkedinInput = el('input', {
             id: linkedinInputId,
             type: 'text',
-            className: 'community-annotation-text-input',
-            'aria-label': 'LinkedIn',
+            className: 'obs-select',
             name: 'cellucid_identity_linkedin',
             autocomplete: 'off',
             autocorrect: 'off',
@@ -207,16 +225,14 @@ export function createIdentityProfileModal({
           content.appendChild(linkedinInput);
 
             content.appendChild(el('label', {
-              className: 'legend-help',
               for: orcidInputId,
-              text: 'ORCID:'
+              text: 'ORCID'
             }));
             const orcidInputName = createDomId('cellucid_identity_orcid');
             const orcidInput = el('input', {
               id: orcidInputId,
               type: 'text',
-              className: 'community-annotation-text-input',
-              'aria-label': 'ORCID',
+              className: 'obs-select',
               'aria-describedby': orcidDisclosureId,
               role: 'combobox',
               'aria-autocomplete': 'list',
@@ -240,6 +256,7 @@ export function createIdentityProfileModal({
               role: 'listbox',
               'aria-label': 'ORCID search suggestions'
             });
+            suggestionBox.hidden = true;
             orcidSuggestPopupEl = suggestionBox;
             orcidSuggestAnchorEl = orcidInput;
             let profileModalClosed = false;
@@ -311,7 +328,7 @@ export function createIdentityProfileModal({
             const hideSuggestions = () => {
               suggestionsOpen = false;
               activeSuggestionIndex = -1;
-              suggestionBox.style.display = 'none';
+              suggestionBox.hidden = true;
               publishSuggestionState();
             };
 
@@ -429,7 +446,7 @@ export function createIdentityProfileModal({
                 suggestionBox.appendChild(row);
               }
               suggestionsOpen = true;
-              suggestionBox.style.display = 'block';
+              suggestionBox.hidden = false;
               publishSuggestionState();
               if (positionFrame !== null) {
                 cancelAnimationFrame(positionFrame);
@@ -521,11 +538,11 @@ export function createIdentityProfileModal({
                 renderSuggestions([], { loading: true });
                 const timeout = setTimeout(() => {
                   const error = new Error(
-                    'ORCID request timed out after 6.5 seconds'
+                    `ORCID request timed out after ${ORCID_REQUEST_TIMEOUT_MS / 1000} seconds`
                   );
                   error.name = 'TimeoutError';
                   ctrl.abort(error);
-                }, 6500);
+                }, ORCID_REQUEST_TIMEOUT_MS);
                 activeSearchTimeout = timeout;
                 try {
                   const items = await searchOrcid(q, { signal: ctrl.signal });
@@ -569,7 +586,7 @@ export function createIdentityProfileModal({
                     activeSearch = null;
                   }
                 }
-                }, 250);
+                }, ORCID_SEARCH_DEBOUNCE_MS);
               };
 
           const onAnyInput = (event) => {
@@ -635,7 +652,7 @@ export function createIdentityProfileModal({
             hideTimer = setTimeout(() => {
               hideTimer = null;
               hideSuggestions();
-            }, 150);
+            }, ORCID_SUGGESTION_HIDE_DELAY_MS);
           };
           const cancelHide = () => {
             if (hideTimer) clearTimeout(hideTimer);
@@ -779,8 +796,8 @@ export function createIdentityProfileModal({
             };
 
           const actions = el('div', { className: 'community-annotation-suggestion-actions' });
-          const saveBtn = el('button', { type: 'button', className: 'btn-small', text: 'Save' });
-          const cancelBtn = el('button', { type: 'button', className: 'btn-small', text: 'Cancel' });
+          const saveBtn = el('button', { type: 'button', className: 'btn', text: 'Save' });
+          const cancelBtn = el('button', { type: 'button', className: 'btn', text: 'Cancel' });
           actions.appendChild(saveBtn);
           actions.appendChild(cancelBtn);
           content.appendChild(actions);
@@ -847,17 +864,6 @@ export function createIdentityProfileModal({
         if (orcidSuggestPopupEl) {
           overlay.appendChild(orcidSuggestPopupEl);
         }
-        const observer = new MutationObserver(() => {
-          if (resolved) {
-            observer.disconnect();
-            return;
-          }
-        if (!document.body.contains(overlay)) {
-          observer.disconnect();
-          resolveOnce(null);
-        }
-      });
-      observer.observe(document.body, { childList: true, subtree: true });
     });
   }
 

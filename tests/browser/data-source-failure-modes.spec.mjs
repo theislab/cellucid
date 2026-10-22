@@ -19,6 +19,7 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { expect, test } from './helpers/test.mjs';
+import { chooseDirectory } from './helpers/directory-upload.mjs';
 import { APP_ORIGIN as ORIGIN } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 
@@ -152,7 +153,7 @@ async function expectRenders(page, dataset) {
     String(dataset.cells),
   );
   await expect(page.locator('#filter-count')).toHaveText(
-    `Showing all ${dataset.cells} points`,
+    `Showing all ${dataset.cells} cells`,
   );
   await expect
     .poll(() => page.evaluate(
@@ -240,11 +241,10 @@ for (const failure of CATALOG_FAILURES) {
       ).toHaveText(['No datasets found']);
 
       // The user can still load their own data without reloading the page.
-      await page
-        .locator('#user-data-file-input')
-        .setInputFiles(path.join(
-          fixturesDirectory, 'demo-custom-exports', GOOD_DATASET.id,
-        ));
+      await chooseDirectory(
+        page.locator('#user-data-file-input'),
+        path.join(fixturesDirectory, 'demo-custom-exports', GOOD_DATASET.id),
+      );
       await expectRenders(page, GOOD_DATASET);
     },
   );
@@ -347,11 +347,10 @@ for (const label of PAYLOAD_FAILURES) {
         optionValue(MIXED_DEFAULT.id),
       );
       await expect(page.locator(STARTUP_FAILURE)).toHaveCount(0);
-      await page
-        .locator('#user-data-file-input')
-        .setInputFiles(path.join(
-          fixturesDirectory, 'demo-custom-exports', GOOD_DATASET.id,
-        ));
+      await chooseDirectory(
+        page.locator('#user-data-file-input'),
+        path.join(fixturesDirectory, 'demo-custom-exports', GOOD_DATASET.id),
+      );
       await expectRenders(page, GOOD_DATASET);
     },
   );
@@ -471,7 +470,15 @@ test('a load cancelled by switching datasets leaves the winner rendered', async 
 
   // Slow every payload for the 3D dataset, start it, then immediately choose
   // the 1D dataset. The last request must win and the first must not resurface.
-  await page.route(`${GOOD_EXPORTS}synthetic-development-3d/**`, async route => {
+  const supersededPrefix = `${GOOD_EXPORTS}synthetic-development-3d/`;
+  const superseded = { settled: 0, started: 0 };
+  const settleSuperseded = request => {
+    if (request.url().startsWith(supersededPrefix)) superseded.settled += 1;
+  };
+  page.on('requestfinished', settleSuperseded);
+  page.on('requestfailed', settleSuperseded);
+  await page.route(`${supersededPrefix}**`, async route => {
+    superseded.started += 1;
     await new Promise(resolve => setTimeout(resolve, 1_500));
     await route.continue();
   });
@@ -491,7 +498,24 @@ test('a load cancelled by switching datasets leaves the winner rendered', async 
       () => window._cellucidViewer.getPointCount(),
     ))
     .toBe(48);
-  // Give the superseded 3-D load time to land if it were going to.
+  // Let the superseded 3-D load land if it were going to: every request it
+  // issued has been answered or abandoned, and the page has run its
+  // continuations without the load issuing another one.
+  await expect.poll(async () => {
+    const startedBefore = superseded.started;
+    if (startedBefore === 0 || superseded.settled !== startedBefore) {
+      return false;
+    }
+    await page.evaluate(() => new Promise(resolve => {
+      setTimeout(() => {
+        requestAnimationFrame(() => requestAnimationFrame(resolve));
+      }, 0);
+    }));
+    return (
+      superseded.started === startedBefore &&
+      superseded.settled === startedBefore
+    );
+  }).toBe(true);
   await expect(page.locator('#dataset-name')).toHaveText(
     'Synthetic trajectory — 1D',
   );
@@ -610,9 +634,10 @@ test('a prepared directory chosen one level too high fails bounded', async ({
 
   // Picking the parent of an export instead of the export itself is the
   // mistake a first-time user makes with a directory picker.
-  await page
-    .locator('#user-data-file-input')
-    .setInputFiles(path.join(fixturesDirectory, 'demo-custom-exports'));
+  await chooseDirectory(
+    page.locator('#user-data-file-input'),
+    path.join(fixturesDirectory, 'demo-custom-exports'),
+  );
 
   const errors = await captureFirstErrorNotification(page);
   await testInfo.attach('user-facing-failure-prepared-parent-directory.json', {

@@ -14,7 +14,7 @@
  * @param {WebGL2RenderingContext} gl
  * @param {number} itemCount
  */
-export function computePackedDims(gl, itemCount) {
+function computePackedDims(gl, itemCount) {
   if (!Number.isSafeInteger(itemCount) || itemCount < 0) {
     throw new RangeError(
       'Packed texture itemCount must be a non-negative safe integer.'
@@ -256,6 +256,103 @@ export function createOrUpdatePackedFloatTexture(gl, options) {
     }
   );
   return { texture, width, height, components: comps };
+}
+
+/**
+ * Create or replace the packed per-cell visibility texture (R32F) from point
+ * transparency: one byte a cell, exactly 0 or 1 (rendering/alpha-visibility.js).
+ *
+ * The shader reads the texel as a float, so each row is widened through one
+ * row-sized Float32 scratch on its way to the GPU; no dataset-sized Float32
+ * copy of the transparency is ever made.
+ *
+ * @param {WebGL2RenderingContext} gl
+ * @param {object} options
+ * @param {WebGLTexture|null} options.texture
+ * @param {Uint8Array} options.data
+ * @param {number} options.itemCount
+ * @returns {{ texture: WebGLTexture, width: number, height: number, components: number }}
+ */
+export function createOrUpdatePackedVisibilityTexture(gl, options) {
+  if (
+    options === null ||
+    typeof options !== 'object' ||
+    Array.isArray(options) ||
+    Object.getPrototypeOf(options) !== Object.prototype ||
+    Object.keys(options).sort().join(',') !== 'data,itemCount,texture'
+  ) {
+    throw new TypeError(
+      'Packed visibility texture options must contain exactly data, itemCount, and texture.'
+    );
+  }
+  const { texture: existing, data, itemCount: count } = options;
+  if (existing !== null && typeof existing !== 'object') {
+    throw new TypeError('Packed visibility texture must be a WebGLTexture or null.');
+  }
+  if (!Number.isSafeInteger(count) || count < 0) {
+    throw new RangeError(
+      'Packed visibility texture itemCount must be a non-negative safe integer.'
+    );
+  }
+  if (!(data instanceof Uint8Array)) {
+    throw new TypeError('Packed visibility texture data must be a Uint8Array.');
+  }
+  if (data.length !== count) {
+    throw new RangeError(
+      `Packed visibility texture data must contain exactly ${count} values; received ${data.length}.`
+    );
+  }
+
+  const { width, height } = computePackedDims(gl, count);
+
+  const texture = uploadStagedTexture(
+    gl,
+    existing,
+    'packed visibility texture',
+    () => {
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+      gl.texImage2D(
+        gl.TEXTURE_2D,
+        0,
+        gl.R32F,
+        width,
+        height,
+        0,
+        gl.RED,
+        gl.FLOAT,
+        null
+      );
+
+      const row = new Float32Array(width);
+      let remaining = count;
+      let srcOffset = 0;
+      for (let y = 0; y < height && remaining > 0; y++) {
+        const rowItems = Math.min(width, remaining);
+        for (let index = 0; index < rowItems; index++) {
+          row[index] = data[srcOffset + index];
+        }
+        gl.texSubImage2D(
+          gl.TEXTURE_2D,
+          0,
+          0,
+          y,
+          rowItems,
+          1,
+          gl.RED,
+          gl.FLOAT,
+          row.subarray(0, rowItems)
+        );
+        remaining -= rowItems;
+        srcOffset += rowItems;
+      }
+    }
+  );
+  return { texture, width, height, components: 1 };
 }
 
 /**

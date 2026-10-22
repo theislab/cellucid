@@ -5,6 +5,7 @@
  */
 
 import { createUiControlSerializer } from '../../state-serializer/ui-controls.js';
+import { reportSmokeUnavailable } from '../../ui/modules/smoke-availability.js';
 import {
   createFilterSerializer,
   serializeFiltersForFields,
@@ -37,12 +38,24 @@ import {
 import {
   getSessionRestoreSnapshot
 } from '../session-context.js';
+import { requireRepresentationRef } from '../../../data/dimension-manager.js';
 
 export const id = 'core-state';
 
+/**
+ * A JSON copy of the embedding reference of the representation one view
+ * shows. The view's dimension is the representation's, so it is not stored.
+ * @param {unknown} ref
+ * @returns {{key: string, columns: number[]|null}}
+ */
+export function cloneEmbeddingRef(ref) {
+  const exact = requireRepresentationRef(ref);
+  return { key: exact.key, columns: exact.columns === null ? null : [...exact.columns] };
+}
+
 const CORE_PAYLOAD_KEYS = [
   'camera',
-  'liveDimensionLevel',
+  'liveEmbedding',
   'uiControls',
   'filters',
   'activeFields',
@@ -66,10 +79,6 @@ function assertAbortSignal(signal) {
     throw new TypeError('Core-state abortSignal must be an AbortSignal or null.');
   }
   return signal;
-}
-
-function assertDimensionLevel(value, context) {
-  return assertSafeInteger(value, context, { minimum: 1, maximum: 3 });
 }
 
 function assertFieldArray(data, context) {
@@ -141,11 +150,50 @@ function assertSnapshotMeta(meta, snapshotId) {
   };
 }
 
+/**
+ * The field selection and filters of one view, read from the owner that holds
+ * them now.
+ *
+ * DataState's top-level field inventory belongs to whichever view is selected;
+ * every other view's inventory is parked in its `viewContexts` entry until it is
+ * selected again. A capture therefore has to choose the owner per view: reading
+ * the top level for the live view recorded the selected kept view's field and
+ * filters as the live view's whenever a kept view was selected at save time.
+ *
+ * @param {object} state
+ * @param {string} viewId
+ * @returns {{activeFields: object, filters: object}}
+ */
+function serializeViewFieldState(state, viewId) {
+  if (viewId === state.getActiveViewId()) {
+    return {
+      activeFields: serializeActiveFields(state),
+      filters: createFilterSerializer({ state }).serializeFilters()
+    };
+  }
+  const context = state.viewContexts.get(viewId);
+  if (context === undefined || context === null || typeof context !== 'object') {
+    throw new RangeError(`DataState context for view "${viewId}" was not found.`);
+  }
+  return {
+    activeFields: serializeContextActiveFields(context, viewId),
+    filters: {
+      ...serializeFiltersForFields(
+        assertFieldArray(context.obsData, `View "${viewId}" obs data`),
+        'obs'
+      ),
+      ...serializeFiltersForFields(
+        assertFieldArray(context.varData, `View "${viewId}" var data`),
+        'var'
+      )
+    }
+  };
+}
+
 function serializeMultiviewDescriptors({
   state,
   viewer,
-  camerasLocked,
-  currentCamera
+  camerasLocked
 }) {
   requireMethod(viewer, 'getViewLayout', 'Core-state viewer');
   requireMethod(viewer, 'getSnapshotViews', 'Core-state viewer');
@@ -170,7 +218,7 @@ function serializeMultiviewDescriptors({
     if (context === undefined || context === null || typeof context !== 'object') {
       throw new RangeError(`DataState context for snapshot "${snapshotId}" was not found.`);
     }
-    const activeFields = serializeContextActiveFields(context, snapshotId);
+    const { activeFields, filters } = serializeViewFieldState(state, snapshotId);
     const fieldKey = snapshot.fieldKey;
     const fieldKind = snapshot.fieldKind;
     if (fieldKey !== activeFields.activeFieldKey) {
@@ -195,42 +243,24 @@ function serializeMultiviewDescriptors({
       fieldKey,
       fieldKind,
       meta: assertSnapshotMeta(snapshot.meta, snapshotId),
-      dimensionLevel: assertDimensionLevel(
-        context.dimensionLevel,
-        `Snapshot "${snapshotId}" dimensionLevel`
+      embedding: cloneEmbeddingRef(state.getViewEmbeddingRef(snapshotId)),
+      // Every view's own camera; linked views report the shared one.
+      cameraState: assertCameraState(
+        viewer.getViewCameraState(snapshotId),
+        `Snapshot session camera state for "${snapshotId}"`
       ),
-      cameraState: camerasLocked
-        ? cloneCameraState(
-          currentCamera,
-          `Locked snapshot session camera state for "${snapshotId}"`
-        )
-        : assertCameraState(
-          viewer.getViewCameraState(snapshotId),
-          `Snapshot session camera state for "${snapshotId}"`
-        ),
       activeFields,
-      filters: {
-        ...serializeFiltersForFields(
-          assertFieldArray(context.obsData, `Snapshot "${snapshotId}" obs data`),
-          'obs'
-        ),
-        ...serializeFiltersForFields(
-          assertFieldArray(context.varData, `Snapshot "${snapshotId}" var data`),
-          'var'
-        )
-      }
+      filters
     };
   });
 
   const multiview = {
     layout,
     camerasLocked,
-    liveCameraState: camerasLocked
-      ? cloneCameraState(currentCamera, 'Locked live-view session camera state')
-      : assertCameraState(
-        viewer.getViewCameraState('live'),
-        'Live-view session camera state'
-      ),
+    liveCameraState: assertCameraState(
+      viewer.getViewCameraState('live'),
+      'Live-view session camera state'
+    ),
     snapshots
   };
   return assertMultiviewState(state, multiview);
@@ -238,7 +268,6 @@ function serializeMultiviewDescriptors({
 
 function pushViewerState(state) {
   for (const method of [
-    'updateOutlierQuantiles',
     'computeGlobalVisibility',
     '_pushColorsToViewer',
     '_pushTransparencyToViewer',
@@ -247,7 +276,6 @@ function pushViewerState(state) {
   ]) {
     requireMethod(state, method, 'Core-state viewer synchronization owner');
   }
-  state.updateOutlierQuantiles();
   state.computeGlobalVisibility();
   state._pushColorsToViewer();
   state._pushTransparencyToViewer();
@@ -281,7 +309,7 @@ function getOwners(ctx, operation) {
 function assertCorePayload(state, payload) {
   assertExactKeys(payload, CORE_PAYLOAD_KEYS, 'Core-state payload');
   assertCameraState(payload.camera, 'Restored session camera state');
-  assertDimensionLevel(payload.liveDimensionLevel, 'Core-state liveDimensionLevel');
+  requireRepresentationRef(payload.liveEmbedding);
   assertPlainRecord(payload.uiControls, 'Core-state uiControls');
   validateFiltersForState(state, payload.filters);
   validateActiveFieldsForState(state, payload.activeFields);
@@ -297,29 +325,29 @@ export function capture(ctx) {
   ]) {
     requireMethod(viewer, method, 'Core-state capture viewer');
   }
-  requireMethod(state, 'getViewDimensionLevel', 'Core-state capture owner');
+  requireMethod(state, 'getViewEmbeddingRef', 'Core-state capture owner');
+  requireMethod(state, 'getActiveViewId', 'Core-state capture owner');
+  if (!(state.viewContexts instanceof Map)) {
+    throw new TypeError('Core-state capture requires the current viewContexts Map.');
+  }
   const camerasLocked = viewer.getCamerasLocked();
   assertBoolean(camerasLocked, 'Core-state camerasLocked');
   const ui = createUiControlSerializer({ sidebar });
-  const filters = createFilterSerializer({ state });
+  const live = serializeViewFieldState(state, 'live');
   const camera = cloneCameraState(
     viewer.getCameraState(),
     'Session camera state'
   );
   const payload = {
     camera,
-    liveDimensionLevel: assertDimensionLevel(
-      state.getViewDimensionLevel('live'),
-      'Core-state live dimension'
-    ),
+    liveEmbedding: cloneEmbeddingRef(state.getViewEmbeddingRef('live')),
     uiControls: ui.collectUIControls(),
-    filters: filters.serializeFilters(),
-    activeFields: serializeActiveFields(state),
+    filters: live.filters,
+    activeFields: live.activeFields,
     multiview: serializeMultiviewDescriptors({
       state,
       viewer,
-      camerasLocked,
-      currentCamera: camera
+      camerasLocked
     })
   };
   assertCorePayload(state, payload);
@@ -346,7 +374,6 @@ function requireElement(idValue) {
 
 function requireRestoreDom() {
   const elements = {
-    dimensionSelect: requireElement('dimension-select'),
     renderModeSelect: requireElement('render-mode'),
     categoricalSelect: requireElement('categorical-field'),
     continuousSelect: requireElement('continuous-field'),
@@ -419,31 +446,22 @@ function syncDomainControls(state, viewer, dom) {
   dom.outlierSlider.value = String(percentage);
   dom.outlierDisplay.textContent = `${percentage}%`;
 
-  const activeViewId = state.getActiveViewId();
-  const dimensionLevel = assertDimensionLevel(
-    state.getViewDimensionLevel(activeViewId),
-    `Restored active view "${activeViewId}" dimension`
-  );
-  const dimensionValue = String(dimensionLevel);
-  assertSelectOption(dom.dimensionSelect, dimensionValue, 'Dimension selector');
-  dom.dimensionSelect.value = dimensionValue;
-
   const camera = assertCameraState(
     viewer.getCameraState(),
     'Restored active camera state'
   );
   assertSelectOption(dom.navigationSelect, camera.navigationMode, 'Navigation selector');
   dom.navigationSelect.value = camera.navigationMode;
-  dom.freeflyControls.style.display = camera.navigationMode === 'free' ? 'block' : 'none';
-  dom.orbitControls.style.display = camera.navigationMode === 'orbit' ? 'block' : 'none';
-  dom.planarControls.style.display = camera.navigationMode === 'planar' ? 'block' : 'none';
+  dom.freeflyControls.hidden = camera.navigationMode !== 'free';
+  dom.orbitControls.hidden = camera.navigationMode !== 'orbit';
+  dom.planarControls.hidden = camera.navigationMode !== 'planar';
 }
 
 async function applyCorePayload(ctx, payload, signalOverride) {
   const { state, viewer, sidebar } = getOwners(ctx, 'restore');
   for (const method of [
-    'setDimensionLevel',
-    'getViewDimensionLevel',
+    'restoreViewEmbedding',
+    'getViewEmbeddingRef',
     'getActiveViewId',
     'setActiveView',
     '_notifyVisibilityChange',
@@ -465,11 +483,6 @@ async function applyCorePayload(ctx, payload, signalOverride) {
   const filters = createFilterSerializer({ state });
   const dom = requireRestoreDom();
   const sessionState = assertCorePayload(state, payload);
-  assertSelectOption(
-    dom.dimensionSelect,
-    String(sessionState.liveDimensionLevel),
-    'Live dimension selector'
-  );
 
   ui.validateUIControls(sessionState.uiControls);
   const savedRenderMode = getSavedRenderMode(sessionState.uiControls);
@@ -482,9 +495,32 @@ async function applyCorePayload(ctx, payload, signalOverride) {
     );
   }
 
-  let restoreDeferredUiControls = () => {};
+  // A smoke session restored on a device that cannot run smoke opens in
+  // Points with the same plain message a direct choice gets; every other
+  // control is restored as saved.
+  const smokeSupport = savedRenderMode === 'smoke'
+    ? viewer.getSmokeSupport()
+    : null;
+  // Every restore defers the controls whose choices follow the embedding
+  // (`data-state-serializer-after-embedding`) until the embeddings and the
+  // active view are back; `restoreDeferredUiControls` applies them last.
+  let restoreDeferredUiControls;
+  let reportWithheldRenderMode = () => {};
   if (savedRenderMode === null) {
-    ui.restoreUIControls(sessionState.uiControls, { abortSignal: signal });
+    restoreDeferredUiControls = ui.restoreUIControls(
+      sessionState.uiControls,
+      { abortSignal: signal }
+    );
+  } else if (smokeSupport !== null && !smokeSupport.supported) {
+    publishRenderModeControl(dom.renderModeSelect, 'points');
+    restoreDeferredUiControls = ui.restoreUIControls(
+      sessionState.uiControls,
+      {
+        abortSignal: signal,
+        withholdControlIds: ['render-mode']
+      }
+    );
+    reportWithheldRenderMode = () => reportSmokeUnavailable(smokeSupport);
   } else {
     // Points is the neutral replay mode: it cannot allocate a smoke volume
     // from retiring state and it permits the saved snapshot graph to rebuild.
@@ -503,11 +539,12 @@ async function applyCorePayload(ctx, payload, signalOverride) {
   if (activeViewResult !== 'live') {
     throw new Error('DataState rejected the live view before core-state restore.');
   }
-  await state.setDimensionLevel(sessionState.liveDimensionLevel, {
-    viewId: 'live'
-  });
-  if (state.getViewDimensionLevel('live') !== sessionState.liveDimensionLevel) {
-    throw new Error('DataState did not apply the restored live dimension.');
+  await state.restoreViewEmbedding('live', sessionState.liveEmbedding);
+  if (
+    JSON.stringify(state.getViewEmbeddingRef('live'))
+    !== JSON.stringify(sessionState.liveEmbedding)
+  ) {
+    throw new Error('DataState did not apply the restored live embedding.');
   }
   throwIfAborted(signal);
 
@@ -536,14 +573,13 @@ async function applyCorePayload(ctx, payload, signalOverride) {
   }, sessionState.multiview);
   throwIfAborted(signal);
 
-  if (sessionState.multiview.camerasLocked) {
-    const sessionCamera = assertCameraState(
-      sessionState.camera,
-      'Restored session camera state'
-    );
-    viewer.setNavigationMode(sessionCamera.navigationMode);
-    viewer.setCameraState(sessionCamera);
-  }
+  // The focused view's camera, last: every view already holds its own.
+  const sessionCamera = assertCameraState(
+    sessionState.camera,
+    'Restored session camera state'
+  );
+  viewer.setNavigationMode(sessionCamera.navigationMode);
+  viewer.setCameraState(sessionCamera);
 
   pushViewerState(state);
   syncDomainControls(state, viewer, dom);
@@ -552,6 +588,7 @@ async function applyCorePayload(ctx, payload, signalOverride) {
   state.updateFilterSummary();
   throwIfAborted(signal);
   restoreDeferredUiControls();
+  reportWithheldRenderMode();
   throwIfAborted(signal);
 }
 

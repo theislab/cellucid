@@ -6,7 +6,7 @@
  * Refactored to use PlotFactory for reduced code duplication.
  */
 
-import { PlotFactory, PlotRegistry, BasePlot, COMMON_HOVER_STYLE, createMinimalPlotly } from '../plot-factory.js';
+import { PlotFactory, PlotRegistry, BasePlot, COMMON_HOVER_STYLE, createMinimalPlotly, PlotHelpers } from '../plot-factory.js';
 import { getPlotTheme } from '../../shared/plot-theme.js';
 import { escapeHtml } from '../../../utils/dom-utils.js';
 
@@ -14,10 +14,7 @@ import { escapeHtml } from '../../../utils/dom-utils.js';
  * Process categories for a page (count, sort, limit)
  */
 function processCategories(values, options) {
-  const counts = new Map();
-  for (const val of values) counts.set(val, (counts.get(val) || 0) + 1);
-
-  let entries = Array.from(counts.entries());
+  let entries = Array.from(PlotHelpers.countCategories(values).entries());
   if (options.sortByValue) entries.sort((a, b) => b[1] - a[1]);
 
   if (entries.length > options.maxCategories) {
@@ -119,7 +116,7 @@ const pieplotDefinition = {
         y: yStart + ySize + 0.02,
         xref: 'paper', yref: 'paper',
         showarrow: false,
-        font: { family: 'Oswald, system-ui, sans-serif', size: 11, color: theme.textStrong }
+        font: { family: theme.fontFamily, size: 11, color: theme.textStrong }
       };
     });
 

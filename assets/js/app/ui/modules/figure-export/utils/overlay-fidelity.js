@@ -102,16 +102,3 @@ export function buildOverlayFidelityWarnings({
 
   return warnings;
 }
-
-/**
- * Viewer chrome a figure never carries, stated up front in the dialog.
- *
- * These are interaction aids rather than measurements: dropping them is the
- * correct figure, but it should never be a surprise.
- */
-export const NON_EXPORTED_VIEWER_CHROME = Object.freeze([
-  'orbit compass',
-  'lasso and selection radius indicators',
-  'multiview panel title chips',
-  'projectile sandbox',
-]);

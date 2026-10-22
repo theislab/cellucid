@@ -11,7 +11,7 @@
  *   index list is a `Uint32Array` from the moment a group is created until the
  *   packer reads it, and validation happens in the pass that writes it.
  * - The reported GPU memory must include the highlight buffers, which are the
- *   largest allocation in the context after the interleaved point buffer.
+ *   largest allocation in the context after the point position stream.
  *
  * None of this may change what a highlight *is*: the cells, their order, and
  * the packed bytes are asserted against an independent reference.
@@ -45,6 +45,8 @@ function makeAlphaGl() {
     UNSIGNED_BYTE: 0x1401,
     NO_ERROR: 0,
     MAX_TEXTURE_SIZE: 0x0d33,
+    MAX_ARRAY_TEXTURE_LAYERS: 0x88ff,
+    TEXTURE_2D_ARRAY: 0x8c1a,
     TEXTURE_MIN_FILTER: 0x2801,
     TEXTURE_MAG_FILTER: 0x2800,
     TEXTURE_WRAP_S: 0x2802,
@@ -54,6 +56,7 @@ function makeAlphaGl() {
     UNPACK_ALIGNMENT: 0x0cf5,
     getParameter(parameter) {
       if (parameter === this.MAX_TEXTURE_SIZE) return 4096;
+      if (parameter === this.MAX_ARRAY_TEXTURE_LAYERS) return 256;
       if (parameter === this.UNPACK_ALIGNMENT) return 4;
       return 0;
     },
@@ -63,9 +66,11 @@ function makeAlphaGl() {
     bindTexture() {},
     texParameteri() {},
     texImage2D() {},
-    texSubImage2D(_target, _level, _x, _y, _w, _h, _format, _type, data) {
+    // The alpha texture is a linear texture (2D array): counted the same.
+    texStorage3D() {},
+    texSubImage3D(_target, _level, _x, _y, _z, w, h) {
       calls.texSubImage2D += 1;
-      calls.uploadedBytes += data.length;
+      calls.uploadedBytes += w * h;
     },
     getError() { return this.NO_ERROR; },
   };
@@ -78,8 +83,9 @@ function makeHighPerfRenderer() {
     gl,
     pointCount: POINT_COUNT,
     stats: { gpuMemoryMB: 0 },
-    buffers: { interleaved: null },
-    _interleavedGpuByteLength: 0,
+    buffers: { colors: null, positions: null },
+    _colorGpuByteLength: 0,
+    _positionGpuByteLength: 0,
     _alphaTexture: null,
     _alphaTexData: null,
     _alphaTexStagingData: null,
@@ -90,7 +96,6 @@ function makeHighPerfRenderer() {
     _dummyLodIndexTextureByteLength: 0,
     _useAlphaTexture: false,
     _currentAlphas: null,
-    _lodResourceOwnersByDimension: new Map(),
     _pendingDataRetirements: new Set(),
     _pendingSnapshotRetirements: new Set(),
     _perViewState: new Map(),
@@ -121,12 +126,15 @@ function makeHighlightGl() {
     deleteVertexArray() {},
     enableVertexAttribArray() {},
     getError() { return this.NO_ERROR; },
-    bufferData(_target, source) {
-      uploads.push(new Uint8Array(
-        source.buffer,
-        source.byteOffset,
-        source.byteLength,
-      ).slice());
+    bufferData(_target, byteLength) {
+      // Each publication sizes the store, then fills it chunk by chunk.
+      uploads.push(new Uint8Array(byteLength));
+    },
+    bufferSubData(_target, offset, source, sourceOffset, length) {
+      uploads.at(-1).set(
+        new Uint8Array(source.buffer, source.byteOffset + sourceOffset, length),
+        offset,
+      );
     },
     vertexAttribPointer() {},
   };
@@ -166,7 +174,7 @@ function makeFixture({ hpRenderer = null } = {}) {
     positions[index * 3 + 1] = index * -0.25;
     positions[index * 3 + 2] = (index % 5) * 1.25;
   }
-  const transparency = new Float32Array(POINT_COUNT).fill(1);
+  const transparency = new Uint8Array(POINT_COUNT).fill(1);
 
   const page = {
     id: 'page_1',
@@ -204,7 +212,7 @@ function makeFixture({ hpRenderer = null } = {}) {
       positions,
       'live',
       transparency,
-      2,
+      3,
     ),
     tools,
     transparency,
@@ -248,7 +256,7 @@ function referencePackedBytes({
 
 test('an unmoved alpha generation is reported, so a no-op filter change repacks nothing', () => {
   const { alphaCalls, renderer } = makeHighPerfRenderer();
-  const alphas = new Float32Array(POINT_COUNT).fill(1);
+  const alphas = new Uint8Array(POINT_COUNT).fill(1);
 
   assert.equal(
     renderer.updateAlphas(alphas),
@@ -257,7 +265,7 @@ test('an unmoved alpha generation is reported, so a no-op filter change repacks 
   );
   const afterCreate = alphaCalls.texSubImage2D;
 
-  const identical = new Float32Array(POINT_COUNT).fill(1);
+  const identical = new Uint8Array(POINT_COUNT).fill(1);
   assert.equal(
     renderer.updateAlphas(identical),
     false,
@@ -269,18 +277,14 @@ test('an unmoved alpha generation is reported, so a no-op filter change repacks 
     'a no-op publication must not upload the alpha texture either'
   );
 
-  // A float change too small to move the R8 byte cannot cross the visibility
-  // boundary, because that boundary is defined on the byte.
-  const subQuantum = new Float32Array(POINT_COUNT).fill(1);
-  subQuantum[3] = 1 - 1 / 1020;
-  assert.equal(Math.round(subQuantum[3] * 255), 255);
-  assert.equal(
-    renderer.updateAlphas(subQuantum),
-    false,
-    'a float move that rounds to the same byte is not a new generation'
+  // Point transparency is binary, so no fractional value exists to round:
+  // a Float32 owner is refused instead of quantized.
+  assert.throws(
+    () => renderer.updateAlphas(new Float32Array(POINT_COUNT).fill(1)),
+    /alpha values must be a Uint8Array/
   );
 
-  const moved = new Float32Array(POINT_COUNT).fill(1);
+  const moved = new Uint8Array(POINT_COUNT).fill(1);
   moved[3] = 0;
   assert.equal(
     renderer.updateAlphas(moved),
@@ -322,7 +326,7 @@ test('a no-op filter change uploads zero highlight bytes through the composed pa
     type: 'lasso',
   });
 
-  const alphas = new Float32Array(POINT_COUNT).fill(1);
+  const alphas = new Uint8Array(POINT_COUNT).fill(1);
   renderer.updateAlphas(alphas);
   fixture.sync();
   const packedUploads = fixture.uploads.length;
@@ -336,14 +340,14 @@ test('a no-op filter change uploads zero highlight bytes through the composed pa
     return moved;
   };
 
-  assert.equal(publish(new Float32Array(POINT_COUNT).fill(1)), false);
+  assert.equal(publish(new Uint8Array(POINT_COUNT).fill(1)), false);
   assert.equal(
     fixture.uploads.length,
     packedUploads,
     'a filter change that moves no byte must not re-upload the highlight buffer'
   );
 
-  const hidden = new Float32Array(POINT_COUNT).fill(1);
+  const hidden = new Uint8Array(POINT_COUNT).fill(1);
   hidden[3] = 0;
   assert.equal(publish(hidden), true);
   fixture.transparency[3] = 0;
@@ -370,13 +374,19 @@ test('the live transparency publication gates the highlight invalidation', async
 
   assert.match(
     body,
-    /const\s+alphaGenerationMoved\s*=\s*hpRenderer\.updateAlphas\(alphaArray\)/,
+    /alphaGenerationMoved\s*=\s*hpRenderer\.updateAlphas\(alphaArray\)/,
     'the live path must keep the result of the alpha publication'
   );
   assert.match(
     body,
     /if\s*\(alphaGenerationMoved\)\s*\{\s*highlightTools\.handleTransparencyChange\(LIVE_VIEW_ID\);/,
     'handleTransparencyChange must run only when the alpha generation moved'
+  );
+  // Shown connectivity edges are re-selected only after a successful
+  // publication that moved the generation.
+  assert.match(
+    body,
+    /transparencyArray\.set\(alphaArray\);[\s\S]*if\s*\(alphaGenerationMoved && edgeLayer\.hasView\(LIVE_VIEW_ID\)\)/,
   );
 });
 
@@ -728,4 +738,26 @@ test('a GPU allocation reporter must be a function', () => {
     ),
     TypeError,
   );
+});
+
+test('the scanned highlight cache is one exact Uint32Array of visible cells', () => {
+  const renderer = Object.assign(Object.create(HighlightRenderer.prototype), {
+    _highlightDataRef: null,
+    _highlightDataVersion: 0,
+    _highlightedIndicesCache: null,
+  });
+  const highlightData = Uint8Array.from([0, 255, 3, 0, 128, 255]);
+  renderer.updateHighlightCache(highlightData);
+  const cache = renderer._highlightedIndicesCache;
+  assert.ok(cache instanceof Uint32Array);
+  const expected = [];
+  for (let index = 0; index < highlightData.length; index++) {
+    if (highlightData[index] >= MIN_VISIBLE_ALPHA_BYTE) expected.push(index);
+  }
+  assert.deepEqual(Array.from(cache), expected);
+  assert.equal(cache.buffer.byteLength, expected.length * 4);
+
+  renderer.updateHighlightCache(null);
+  assert.ok(renderer._highlightedIndicesCache instanceof Uint32Array);
+  assert.equal(renderer._highlightedIndicesCache.length, 0);
 });

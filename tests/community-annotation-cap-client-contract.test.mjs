@@ -2,9 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
-  getCommunityFeedback,
   searchCellTypes,
-  searchDatasets,
 } from '../assets/js/app/community-annotations/cap-api.js';
 import { getGitHubWorkerOrigin } from '../assets/js/app/community-annotations/github-auth.js';
 import {
@@ -268,23 +266,7 @@ test('CAP preserves non-success HTTP outcomes with arbitrary bodies', async (t) 
   }
 });
 
-test('CAP feedback derives its total and preserves omission metadata', async () => {
-  const envelope = await withFetch(
-    async () => capResponse([capResult()], 3),
-    () => getCommunityFeedback('T cell')
-  );
-  assert.deepEqual(envelope, {
-    results: [{
-      name: 'T cell',
-      feedback: { agree: 7, disagree: 2, idk: 1 },
-      total: 10,
-      agreePercent: 70,
-    }],
-    omittedInvalidCount: 3,
-  });
-});
-
-test('CAP client rejects stale-worker envelopes above each route ceiling', async (t) => {
+test('CAP client rejects stale-worker envelopes above the lookup ceiling', async (t) => {
   await t.test('lookup ceiling', async () => {
     await withFetch(
       async () => capResponse(
@@ -295,36 +277,6 @@ test('CAP client rejects stale-worker envelopes above each route ceiling', async
       () => assert.rejects(
         () => searchCellTypes('T cell', 25),
         /at most 25 items/
-      )
-    );
-  });
-
-  await t.test('dataset ceiling', async () => {
-    const results = Array.from({ length: 11 }, (_, index) => ({
-      id: `dataset-${index}`,
-      name: `Dataset ${index}`,
-      cellCount: index,
-    }));
-    await withFetch(
-      async () => capResponse(results),
-      () => assert.rejects(
-        () => searchDatasets({ search: 'immune', limit: 10 }),
-        /at most 10 items/
-      )
-    );
-  });
-
-  await t.test('caller dataset limit', async () => {
-    const results = Array.from({ length: 2 }, (_, index) => ({
-      id: `dataset-${index}`,
-      name: `Dataset ${index}`,
-      cellCount: index,
-    }));
-    await withFetch(
-      async () => capResponse(results),
-      () => assert.rejects(
-        () => searchDatasets({ search: 'immune', limit: 1 }),
-        /at most 1 items/
       )
     );
   });
@@ -342,37 +294,6 @@ test('CAP client rejects stale-worker envelopes above each route ceiling', async
         /results plus omittedInvalidCount must not exceed 25/
       )
     );
-  });
-});
-
-test('CAP dataset search uses the fixed dataset route and exact body', async () => {
-  let captured = null;
-  const result = await withFetch(
-    async (url, init) => {
-      captured = { url: String(url), init };
-      return capResponse([{
-        id: 'dataset-1',
-        name: 'Immune atlas',
-        cellCount: 123,
-      }], 1);
-    },
-    () => searchDatasets({ search: 'immune', limit: 7 })
-  );
-  assert.equal(
-    captured.url,
-    `${getGitHubWorkerOrigin()}/cap/search-datasets`
-  );
-  assert.deepEqual(JSON.parse(captured.init.body), {
-    search: 'immune',
-    limit: 7,
-  });
-  assert.deepEqual(result, {
-    results: [{
-      id: 'dataset-1',
-      name: 'Immune atlas',
-      cellCount: 123,
-    }],
-    omittedInvalidCount: 1,
   });
 });
 

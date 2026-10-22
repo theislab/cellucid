@@ -20,6 +20,12 @@ const DEPLOY_ONLY_SOCIAL_PREVIEW_PATH = 'assets/img/og-preview.jpg';
 const DEPLOY_ONLY_SOCIAL_PREVIEW_PATHSPEC =
   `:(top,exclude)${DEPLOY_ONLY_SOCIAL_PREVIEW_PATH}`;
 const REQUIRED_ROOT_ASSETS = Object.freeze([
+  // The page a missing path answers with (GitHub Pages serves it with a 404
+  // status); it is built from the shipped stylesheet and theme bootstrap.
+  '404.html',
+  // The in-app Cite dialog reads the citation from here at runtime, so a
+  // server that serves a cached build must carry it too.
+  'CITATION.cff',
   'browserconfig.xml',
   'index.html',
   'site.webmanifest',
@@ -28,6 +34,9 @@ const REQUIRED_ROOT_ASSET_SET = new Set(REQUIRED_ROOT_ASSETS);
 const BUILD_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const WINDOWS_DEVICE_NAME = /^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/;
 const MIME_BY_EXTENSION = Object.freeze({
+  // What GitHub Pages serves a .cff file as; the cache must agree with the
+  // origin it copies.
+  '.cff': 'application/octet-stream',
   '.css': 'text/css; charset=utf-8',
   '.glb': 'model/gltf-binary',
   '.html': 'text/html; charset=utf-8',
@@ -106,6 +115,80 @@ function extractBuildId(indexBytes) {
     throw new TypeError('The cellucid web build id is not canonical.');
   }
   return buildId;
+}
+
+// The build id is `<date>.<digest>`: the digest names the exact shipped
+// bytes, so the id changes whenever any asset does and never otherwise, and the
+// date is the day it last changed. index.html carries the id itself, so its
+// bytes are hashed with the id replaced by a fixed placeholder.
+const BUILD_ID_META = /(<meta\s+name="cellucid-web-build-id"\s+content=")([^"]+)("\s*\/?>)/;
+const BUILD_ID_DIGEST_LENGTH = 8;
+export const STAMPED_BUILD_ID_PATTERN = /^\d{4}-\d{2}-\d{2}\.[0-9a-f]{8}$/;
+
+function normalizeIndexForDigest(indexBytes) {
+  const html = indexBytes.toString('utf8');
+  if (!BUILD_ID_META.test(html)) {
+    throw new TypeError('index.html must carry the cellucid web build id meta tag.');
+  }
+  return Buffer.from(html.replace(BUILD_ID_META, '$1BUILD$3'), 'utf8');
+}
+
+/**
+ * The digest the build id names: SHA-256 over every inventoried path and its
+ * bytes, index.html taken with its own id normalized away.
+ */
+export async function computeBuildDigest({ rootDir, paths }) {
+  const exactRoot = resolve(rootDir);
+  const hash = createHash('sha256');
+  for (const path of [...new Set(paths)].sort()) {
+    if (path === INVENTORY_FILENAME) continue;
+    let bytes = await readFile(join(exactRoot, ...path.split('/')));
+    if (path === 'index.html') bytes = normalizeIndexForDigest(bytes);
+    hash.update(path).update('\0').update(createHash('sha256').update(bytes).digest('hex')).update('\n');
+  }
+  return hash.digest('hex').slice(0, BUILD_ID_DIGEST_LENGTH);
+}
+
+/**
+ * Stamp index.html with the build id for the current bytes. The id is kept when
+ * the digest it names still matches, so regenerating without a change is a
+ * no-op; otherwise it gets today's UTC date and the new digest.
+ */
+export async function stampBuildId({ rootDir, paths, today = new Date() }) {
+  const indexPath = join(resolve(rootDir), 'index.html');
+  const html = (await readFile(indexPath)).toString('utf8');
+  const current = html.match(BUILD_ID_META)?.[2];
+  const digest = await computeBuildDigest({ rootDir, paths });
+  if (current !== undefined && STAMPED_BUILD_ID_PATTERN.test(current) && current.endsWith(`.${digest}`)) {
+    return current;
+  }
+  const buildId = `${today.toISOString().slice(0, 10)}.${digest}`;
+  await writeFile(indexPath, html.replace(BUILD_ID_META, `$1${buildId}$3`));
+  return buildId;
+}
+
+// The site is one page, so its sitemap lists one URL. Its <lastmod> is the
+// date half of the build id: the day the shipped bytes last changed, which is
+// when the page a crawler fetches last changed. The generator writes it beside
+// the inventory, and --check refuses a sitemap that names another day.
+const SITEMAP_FILENAME = 'sitemap.xml';
+export const SITE_URL = 'https://www.cellucid.com/';
+
+export function renderSitemap(buildId) {
+  if (!STAMPED_BUILD_ID_PATTERN.test(buildId)) {
+    throw new TypeError(`Cannot date the sitemap from build id "${buildId}".`);
+  }
+  const lastmod = buildId.slice(0, 10);
+  return Buffer.from(
+    '<?xml version="1.0" encoding="UTF-8"?>\n'
+      + '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
+      + '  <url>\n'
+      + `    <loc>${SITE_URL}</loc>\n`
+      + `    <lastmod>${lastmod}</lastmod>\n`
+      + '  </url>\n'
+      + '</urlset>\n',
+    'utf8'
+  );
 }
 
 export async function buildWebAssetInventory({ rootDir, paths }) {
@@ -270,16 +353,24 @@ async function writeInventoryAtomically(outputPath, bytes) {
 async function runCli() {
   const rootDir = resolve(fileURLToPath(new URL('..', import.meta.url)));
   const paths = await listSourceControlledAssets(rootDir);
+  const args = process.argv.slice(2);
+  if (args.length === 0) await stampBuildId({ rootDir, paths });
   const inventory = await buildWebAssetInventory({ rootDir, paths });
   const bytes = serializeWebAssetInventory(inventory);
   const outputPath = join(rootDir, INVENTORY_FILENAME);
-  const args = process.argv.slice(2);
+  const sitemapBytes = renderSitemap(inventory.build_id);
+  const sitemapPath = join(rootDir, SITEMAP_FILENAME);
 
   if (args.length === 1 && args[0] === '--check') {
     const current = await readFile(outputPath);
     if (!current.equals(bytes)) {
       throw new Error(
         `${INVENTORY_FILENAME} does not match the exact current web source.`
+      );
+    }
+    if (!(await readFile(sitemapPath)).equals(sitemapBytes)) {
+      throw new Error(
+        `${SITEMAP_FILENAME} does not carry the current build date.`
       );
     }
     return;
@@ -290,6 +381,7 @@ async function runCli() {
     );
   }
   await writeInventoryAtomically(outputPath, bytes);
+  await writeInventoryAtomically(sitemapPath, sitemapBytes);
 }
 
 export async function isDirectModuleInvocation({

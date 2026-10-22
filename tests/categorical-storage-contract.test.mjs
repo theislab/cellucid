@@ -22,8 +22,8 @@ import {
 } from '../assets/js/data/categorical-storage-contract.js';
 
 test('each code width reserves its terminal code and keeps the rest', () => {
-  assert.deepEqual([...CATEGORICAL_CODE_DTYPES], ['uint8', 'uint16']);
-  assert.equal(MAX_CATEGORICAL_CATEGORIES, 65_535);
+  assert.deepEqual([...CATEGORICAL_CODE_DTYPES], ['uint8', 'uint16', 'uint32']);
+  assert.equal(MAX_CATEGORICAL_CATEGORIES, 4_294_967_295);
 
   const uint8 = categoricalStorageForDtype('uint8', 'Field');
   assert.deepEqual({ ...uint8 }, {
@@ -41,9 +41,17 @@ test('each code width reserves its terminal code and keeps the rest', () => {
     maxCategories: 65_535,
   });
 
+  const uint32 = categoricalStorageForDtype('uint32', 'Field');
+  assert.deepEqual({ ...uint32 }, {
+    dtype: 'uint32',
+    TypedArrayClass: Uint32Array,
+    missingValue: 4_294_967_295,
+    maxCategories: 4_294_967_295,
+  });
+
   // The pairing that matters: the sentinel is exactly one past the last real
   // code, so the widest legal code and the sentinel can never collide.
-  for (const storage of [uint8, uint16]) {
+  for (const storage of [uint8, uint16, uint32]) {
     assert.equal(storage.missingValue, storage.maxCategories);
     assert.equal(
       storage.missingValue,
@@ -61,13 +69,13 @@ test('each code width reserves its terminal code and keeps the rest', () => {
 
 test('a declared code width must be one the format defines', () => {
   for (const rejected of [
-    'uint32', 'int8', 'u8', 'UINT8', '', 'uint8 ',
+    'uint64', 'int8', 'u8', 'UINT8', '', 'uint8 ',
     8, null, undefined, ['uint8'], { dtype: 'uint8' },
     'toString', 'constructor', '__proto__',
   ]) {
     assert.throws(
       () => categoricalStorageForDtype(rejected, 'Field "label"'),
-      /Field "label" must use one of the exact categorical code widths uint8 or uint16/,
+      /Field "label" must use one of the exact categorical code widths uint8, uint16, uint32/,
       `dtype ${String(rejected)} must be refused`
     );
   }
@@ -86,10 +94,13 @@ test('the narrowest width that fits is chosen at the exact boundary', () => {
   // 256 does not, because code 255 is spoken for.
   assert.equal(categoricalStorageForCount(256, 'Field').dtype, 'uint16');
   assert.equal(categoricalStorageForCount(65_535, 'Field').dtype, 'uint16');
+  // Past 65,535 a column needs uint32; every narrower column keeps its width.
+  assert.equal(categoricalStorageForCount(65_536, 'Field').dtype, 'uint32');
+  assert.equal(categoricalStorageForCount(4_294_967_295, 'Field').dtype, 'uint32');
 
   assert.throws(
-    () => categoricalStorageForCount(65_536, 'Field "label"'),
-    /Field "label" has 65,536 categories, but Cellucid supports at most 65,535/
+    () => categoricalStorageForCount(4_294_967_296, 'Field "label"'),
+    /Field "label" has 4,294,967,296 categories, but Cellucid supports at most 4,294,967,295/
   );
   for (const rejected of [-1, 1.5, NaN, Infinity, '3', null, undefined]) {
     assert.throws(
@@ -199,19 +210,25 @@ test('the reader contract matches both exporters', async () => {
   // and skipped explicitly when they are not.
   const writers = [
     {
-      path: new URL(
-        '../../cellucid-python/src/cellucid/anndata_adapter.py',
-        import.meta.url
-      ),
-      expected: [/n_categories > 65_535/, /n_categories <= 255/, /"uint8", 255/, /"uint16", 65_535/],
+      // One table of widths; the server picks the narrowest that fits and
+      // the exporter checks the declared one against it.
+      // The checkout under test: CELLUCID_PYTHON_ROOT, or the sibling.
+      path: process.env.CELLUCID_PYTHON_ROOT
+        ? new URL(`file://${process.env.CELLUCID_PYTHON_ROOT.replace(/\/$/, '')}/src/cellucid/_contracts.py`)
+        : new URL('../../cellucid-python/src/cellucid/_contracts.py', import.meta.url),
+      expected: [
+        /"uint8": CategoricalCodeWidth\("u8", 1, 255\)/,
+        /"uint16": CategoricalCodeWidth\("u16", 2, 65_535\)/,
+        /"uint32": CategoricalCodeWidth\("u32", 4, 4_294_967_295\)/,
+      ],
     },
     {
       path: new URL('../../cellucid-r/R/obs.R', import.meta.url),
       expected: [
-        /n_categories > 255L/,
-        /dtype = "uint8", missing_value = 255L/,
-        /n_categories > 65535L/,
-        /dtype = "uint16", missing_value = 65535L/,
+        /uint8 = list\(dtype = "uint8", missing_value = 255L\)/,
+        /uint16 = list\(dtype = "uint16", missing_value = 65535L\)/,
+        /uint32 = list\(dtype = "uint32", missing_value = 4294967295\)/,
+        /if \(n_categories > width\$missing_value\)/,
       ],
     },
   ];

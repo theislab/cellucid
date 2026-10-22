@@ -2,6 +2,8 @@
  * Apply authenticated Python commands to the current browser-owned state.
  */
 
+import { hasDuplicateIndex } from './utils/cell-set.js';
+
 function requireMethod(owner, key, label) {
   if (
     owner === null ||
@@ -17,7 +19,6 @@ function requireCellIndices(cells, label, { allowEmpty = true } = {}) {
   if (!Array.isArray(cells) || (!allowEmpty && cells.length === 0)) {
     throw new TypeError(`${label} must be ${allowEmpty ? 'an' : 'a non-empty'} array`);
   }
-  const seen = new Set();
   for (let index = 0; index < cells.length; index++) {
     if (
       !Object.hasOwn(cells, index) ||
@@ -28,10 +29,10 @@ function requireCellIndices(cells, label, { allowEmpty = true } = {}) {
         `${label}[${index}] must be a non-negative integer`
       );
     }
-    if (seen.has(cells[index])) {
-      throw new TypeError(`${label} must not contain duplicates`);
-    }
-    seen.add(cells[index]);
+  }
+  // No Set: it refuses more than 2^24 entries.
+  if (hasDuplicateIndex(cells)) {
+    throw new TypeError(`${label} must not contain duplicates`);
   }
   return cells;
 }
@@ -41,26 +42,33 @@ function requireCellIndices(cells, label, { allowEmpty = true } = {}) {
  *   state: Object,
  *   viewer: Object,
  *   refreshUi: () => void,
+ *   reportDataMapping: (report: {origin: 'notebook', requestId: string, mapping: Object}) => Promise<boolean>,
  * }} options
+ *   `reportDataMapping` answers a `setDataMapping` command with the mapping
+ *   the viewer shows once it is applied.
  */
 export function createJupyterCommandHandlers(options) {
   if (
     options === null ||
     typeof options !== 'object' ||
     Array.isArray(options) ||
-    Object.keys(options).length !== 3 ||
+    Object.keys(options).length !== 4 ||
     !Object.hasOwn(options, 'state') ||
     !Object.hasOwn(options, 'viewer') ||
-    !Object.hasOwn(options, 'refreshUi')
+    !Object.hasOwn(options, 'refreshUi') ||
+    !Object.hasOwn(options, 'reportDataMapping')
   ) {
     throw new TypeError(
-      'Jupyter command handlers require exactly state, viewer, and refreshUi'
+      'Jupyter command handlers require exactly state, viewer, refreshUi, and reportDataMapping'
     );
   }
   if (typeof options.refreshUi !== 'function') {
     throw new TypeError('Jupyter command refreshUi must be a function');
   }
-  const { state, viewer, refreshUi } = options;
+  if (typeof options.reportDataMapping !== 'function') {
+    throw new TypeError('Jupyter command reportDataMapping must be a function');
+  }
+  const { state, viewer, refreshUi, reportDataMapping } = options;
 
   function handleHighlight(cells, color) {
     if (color === null) {
@@ -206,6 +214,27 @@ export function createJupyterCommandHandlers(options) {
           'Jupyter set-visibility command'
         )(message.cells, message.visible);
         return;
+
+      case 'setDataMapping': {
+        // Applied as one transaction: a mapping the viewer refuses leaves it
+        // unchanged, and the failure reaches the notebook as command_error.
+        await requireMethod(
+          state,
+          'applyDataMapping',
+          'Jupyter set-data-mapping command'
+        )(message.mapping, { origin: 'notebook' });
+        refreshUi();
+        await reportDataMapping({
+          origin: 'notebook',
+          requestId: message.requestId,
+          mapping: requireMethod(
+            state,
+            'getDataMapping',
+            'Jupyter set-data-mapping command'
+          )()
+        });
+        return;
+      }
 
       case 'resetCamera':
         requireMethod(

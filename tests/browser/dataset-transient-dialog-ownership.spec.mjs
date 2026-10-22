@@ -173,7 +173,7 @@ test('dataset replacement retires deleted-field purge confirmation ownership', a
   ).toHaveCount(1);
 
   await page
-    .locator('#deleted-fields-accordion-item .analysis-accordion-header')
+    .locator('#deleted-fields-accordion-item .disclosure-header')
     .click();
   await page
     .locator('button[data-action="purge-field"][data-source="obs"]')

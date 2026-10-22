@@ -81,7 +81,7 @@ test('zero-visible highlight rebuilds retire dataset-sized GPU storage before pu
     Float32Array.from([0, 0, 0]),
     null,
     'live',
-    Float32Array.from([1]),
+    Uint8Array.from([1]),
     1,
     3,
     0
@@ -481,7 +481,6 @@ test('highlight tools disposal fences callbacks and attempts every DOM/GPU owner
     'getViewportInfoAtScreen',
     'getRenderContext',
     'getNavigationState',
-    'getViewPositions',
     'getViewTransparency',
     'getSpatialQueryOwner',
   ];

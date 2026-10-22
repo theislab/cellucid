@@ -2,6 +2,7 @@ import { expect, test } from './helpers/test.mjs';
 
 import { APP_ORIGIN } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
+import { WORKER_EXPOSED_RESPONSE_HEADERS } from './helpers/worker-exposed-headers.mjs';
 
 const WORKER_ORIGIN = 'https://worker.example';
 const EXPORTS_ROOT =
@@ -34,7 +35,6 @@ function workerCapabilityDocument() {
       '/auth/installations',
       '/auth/installation-repos',
       '/cap/lookup-cells',
-      '/cap/search-datasets',
       '/api/repos/*',
     ],
   };
@@ -88,8 +88,10 @@ async function installAutoPullTimerProbe(page, preferences = null) {
     const nativeStorageSetItem = Storage.prototype.setItem;
     const trackedDelays = new Set([600_000, 900_000, 3_600_000]);
     const active = new Map();
+    const callbacks = new Map();
     const probe = {
       active,
+      callbacks,
       clears: 0,
       creates: 0,
       failNextPreferenceWrite: false,
@@ -135,10 +137,12 @@ async function installAutoPullTimerProbe(page, preferences = null) {
       if (trackedDelays.has(Number(delay))) {
         probe.creates += 1;
         active.set(id, Number(delay));
+        callbacks.set(id, callback);
       }
       return id;
     };
     window.clearInterval = function clearAutoPullInterval(id) {
+      callbacks.delete(id);
       if (active.delete(id)) probe.clears += 1;
       return nativeClearInterval.call(this, id);
     };
@@ -182,6 +186,16 @@ async function installStoredAuthentication(page) {
   }, {
     workerOrigin: WORKER_ORIGIN,
     user: AUTH_USER,
+  });
+  // Lowest precedence: Playwright consults the newest route first. A worker
+  // request no mock answers would otherwise go to the real network for a host
+  // that does not exist, and whether its DNS failure or the test's teardown
+  // came first decided the outcome. It fails the test by name instead.
+  await page.route(`${WORKER_ORIGIN}/**`, route => {
+    const request = route.request();
+    throw new Error(
+      `Unmocked worker request: ${request.method()} ${new URL(request.url()).pathname}`,
+    );
   });
   await installWorkerCapability(page);
   await page.route(`${WORKER_ORIGIN}/auth/user`, async route => {
@@ -397,7 +411,11 @@ async function installGitHubApi(
       await route.fulfill({
         status: response.status ?? 200,
         contentType: 'application/json',
-        headers: response.headers,
+        headers: {
+          'access-control-expose-headers':
+            WORKER_EXPOSED_RESPONSE_HEADERS.join(', '),
+          ...response.headers,
+        },
         body: JSON.stringify(response.body),
       });
       return;
@@ -1580,7 +1598,7 @@ test(
     );
 
     await expect(step2Status).toHaveText(
-      'Showing 1–100 of 10000 repositories. Page 1 of 100.',
+      'Showing 1–100 of 10,000 repositories. Page 1 of 100.',
       { timeout: 15_000 }
     );
     await expect(
@@ -1644,20 +1662,19 @@ test(
 
     await filter.fill('focus-100');
     await expect(step3Status).toHaveText(
-      'Showing 1–1 of 1 repositories. Page 1 of 1.'
+      'Showing 1–1 of 1 repository. Page 1 of 1.'
     );
     await expect(
       step3Grid.locator('.community-annotation-repo-card')
     ).toHaveCount(1);
     await expect(filter).toBeFocused();
     await filter.fill('repository-that-does-not-exist');
-    await expect(step3Status).toHaveText('No repositories to display.');
+    // The reason is said once, in the pager's live status line.
+    await expect(step3Status).toHaveText('No repositories match this filter.');
     await expect(
       step3Grid.locator('.community-annotation-repo-card')
     ).toHaveCount(0);
-    await expect(step3Grid).toContainText(
-      'No repositories match this filter.'
-    );
+    await expect(step3Grid).toHaveText('');
 
     await filter.fill('');
     const firstCard = step3Grid.locator(
@@ -1689,7 +1706,7 @@ test(
       modal.locator('.community-annotation-repo-card')
     ).toHaveCount(100);
     await expect(
-      modal.locator('.legend-help').filter({
+      modal.locator('.status-line').filter({
         hasText: 'Selected: large-team/focus-000',
       })
     ).toBeVisible();
@@ -1936,9 +1953,7 @@ test(
     await expect(page.locator('.notification-warning').last()).toContainText(
       'repository connection was preserved',
     );
-    await expect.poll(() => runtimeSnapshot(page), {
-      timeout: 10_000,
-    }).toMatchObject({
+    await expect.poll(() => runtimeSnapshot(page)).toMatchObject({
       authenticated: true,
       role: 'unknown',
       cacheMode: 'indexeddb',
@@ -2092,9 +2107,7 @@ test(
     }));
 
     await openPreparedDeepLink(page);
-    await expect.poll(() => runtimeSnapshot(page), {
-      timeout: 10_000,
-    }).toMatchObject({
+    await expect.poll(() => runtimeSnapshot(page)).toMatchObject({
       authenticated: true,
       role: 'annotator',
       currentRepo: `${FIRST_REPO}@main`,
@@ -2164,9 +2177,7 @@ test(
       body: repoInfo(fullName, { author: true }),
     }));
     await openPreparedDeepLink(page);
-    await expect.poll(() => runtimeSnapshot(page), {
-      timeout: 10_000,
-    }).toMatchObject({
+    await expect.poll(() => runtimeSnapshot(page)).toMatchObject({
       role: 'author',
       currentRepo: `${FIRST_REPO}@main`,
     });
@@ -2329,14 +2340,15 @@ test(
         const { getCommunityAnnotationFileCache } = await import(
           '/assets/js/app/community-annotations/file-cache.js'
         );
-        const cached =
-          await getCommunityAnnotationFileCache().getAllJsonForRepo({
-            datasetId,
-            repoRef,
-            userId,
-            prefixes: ['annotations/moderation/'],
-          });
-        return Object.keys(cached);
+        const paths = [];
+        await getCommunityAnnotationFileCache().forEachJsonForRepo({
+          datasetId,
+          repoRef,
+          userId,
+          prefixes: ['annotations/moderation/'],
+          onRecord: path => paths.push(path),
+        });
+        return paths;
       },
       {
         datasetId: FIRST_DATASET_ID,
@@ -2393,9 +2405,7 @@ test(
       },
     );
     await openPreparedDeepLink(page);
-    await expect.poll(() => runtimeSnapshot(page), {
-      timeout: 10_000,
-    }).toMatchObject({
+    await expect.poll(() => runtimeSnapshot(page)).toMatchObject({
       role: 'author',
       currentRepo: `${FIRST_REPO}@main`,
     });
@@ -2561,9 +2571,7 @@ test(
     }));
 
     await openPreparedDeepLink(page);
-    await expect.poll(() => runtimeSnapshot(page), {
-      timeout: 10_000,
-    }).toMatchObject({
+    await expect.poll(() => runtimeSnapshot(page)).toMatchObject({
       authenticated: true,
       role: 'author',
       currentRepo: `${FIRST_REPO}@main`,
@@ -2649,6 +2657,95 @@ test(
 );
 
 test(
+  'GitHub sync dialog follows a background auto-pull and never reports a sync that did not run',
+  async ({ page }) => {
+    const productErrors = observeProductErrors(page);
+    await installStoredAuthentication(page);
+    await installAutoPullTimerProbe(page, {
+      [`${FIRST_DATASET_ID}|team%2Flabels|main|${AUTH_USER.id}`]: {
+        enabled: true,
+        intervalMs: 600_000,
+      },
+    });
+    let holdRepositoryInfo = null;
+    const backgroundPullEntered = deferred();
+    await installGitHubApi(page, async fullName => {
+      if (holdRepositoryInfo !== null) {
+        backgroundPullEntered.resolve();
+        await holdRepositoryInfo.promise;
+      }
+      return { body: repoInfo(fullName, { author: true }) };
+    });
+
+    await openPreparedDeepLink(page);
+    await expect.poll(() => runtimeSnapshot(page)).toMatchObject({
+      authenticated: true,
+      role: 'author',
+      currentRepo: `${FIRST_REPO}@main`,
+    });
+    await expect.poll(() => autoPullTimerSnapshot(page)).toMatchObject({
+      active: 1,
+      activeDelays: [600_000],
+    });
+
+    const section = page.locator('#community-annotation-section');
+    if (!(await section.evaluate(element => element.open))) {
+      await section.locator(':scope > summary').click();
+    }
+    await section.getByRole('button', {
+      name: 'GitHub sync…',
+      exact: true,
+    }).click();
+    const modal = page.getByRole('dialog', {
+      name: 'GitHub sync',
+      exact: true,
+    });
+    const pull = modal.getByRole('button', {
+      name: 'Pull latest',
+      exact: true,
+    });
+    const publish = modal.getByRole('button', {
+      name: 'Publish',
+      exact: true,
+    });
+    const status = modal.locator('.community-annotation-wizard-status');
+    await expect(pull).toBeEnabled();
+    await expect(publish).toBeEnabled();
+
+    holdRepositoryInfo = deferred();
+    await page.evaluate(() => {
+      const probe = window.__cellucidAutoPullTimerProbe;
+      const [tick] = [...probe.callbacks.values()];
+      if (typeof tick !== 'function') {
+        throw new Error('Auto-pull interval callback is unavailable');
+      }
+      tick();
+    });
+    await backgroundPullEntered.promise;
+    await expect(pull).toBeDisabled();
+    await expect(publish).toBeDisabled();
+    await expect(status).toHaveText('');
+
+    const release = holdRepositoryInfo;
+    holdRepositoryInfo = null;
+    release.resolve();
+    await expect(pull).toBeEnabled({ timeout: 10_000 });
+    await expect(publish).toBeEnabled({ timeout: 10_000 });
+    await expect(status).toHaveText('');
+    await modal.getByRole('button', {
+      name: 'Close',
+      exact: true,
+    }).click();
+    await expect(modal).toHaveCount(0);
+    await expect(
+      section.getByRole('button', { name: 'GitHub sync…', exact: true })
+    ).toBeFocused();
+    await expect(page.locator('.notification-error')).toHaveCount(0);
+    expect(productErrors).toEqual([]);
+  },
+);
+
+test(
   'auto-pull storage and timer failures restore one coherent durable runtime and UI state',
   async ({ page }) => {
     const productErrors = observeProductErrors(page);
@@ -2666,9 +2763,7 @@ test(
     }));
 
     await openPreparedDeepLink(page);
-    await expect.poll(() => runtimeSnapshot(page), {
-      timeout: 10_000,
-    }).toMatchObject({
+    await expect.poll(() => runtimeSnapshot(page)).toMatchObject({
       authenticated: true,
       role: 'author',
       currentRepo: `${FIRST_REPO}@main`,
@@ -2783,6 +2878,9 @@ test(
     const productErrors = observeProductErrors(page);
     await installStoredAuthentication(page);
     await installAutoPullTimerProbe(page);
+    await installGitHubApi(page, async fullName => ({
+      body: repoInfo(fullName, { author: true }),
+    }));
     await page.goto(
       '/tests/browser/fixtures/community-annotation-harness.html',
       { waitUntil: 'domcontentloaded' }
@@ -2927,17 +3025,48 @@ test(
   async ({ page }) => {
     const productErrors = observeProductErrors(page);
     await installStoredAuthentication(page);
+    // Observe the owner retry timer itself. Its due time alone does not prove
+    // it fired while the pull was active: a loaded runner can deliver the
+    // timer late, after the pull below has already been released, and the
+    // contract would then exercise a different interleaving.
+    await page.addInitScript(() => {
+      const nativeSetTimeout = window.setTimeout;
+      const probe = { armed: 0, fired: 0 };
+      window.setTimeout = function observeRoleRetryTimer(
+        callback,
+        delay,
+        ...args
+      ) {
+        if (
+          typeof callback === 'function' &&
+          /scheduleTransientRoleRetry/.test(new Error().stack ?? '')
+        ) {
+          probe.armed += 1;
+          const observed = (...callbackArgs) => {
+            try {
+              return callback(...callbackArgs);
+            } finally {
+              probe.fired += 1;
+            }
+          };
+          return nativeSetTimeout.call(this, observed, delay, ...args);
+        }
+        return nativeSetTimeout.call(this, callback, delay, ...args);
+      };
+      window.__cellucidRoleRetryTimerProbe = probe;
+    });
     const activePullEntered = deferred();
     const releaseActivePull = deferred();
+    const retryAfterSeconds = 5;
     let repoRequestCount = 0;
     let retryDueAt = 0;
     await installGitHubApi(page, async fullName => {
       repoRequestCount += 1;
       if (repoRequestCount === 1) {
-        retryDueAt = Date.now() + 5_000;
+        retryDueAt = Date.now() + retryAfterSeconds * 1000;
         return {
           status: 503,
-          headers: { 'retry-after': '5' },
+          headers: { 'retry-after': String(retryAfterSeconds) },
           body: { error: 'synthetic retry before active pull' },
         };
       }
@@ -2954,6 +3083,8 @@ test(
     await expect(page.locator('.notification-warning').last()).toContainText(
       'repository connection was preserved',
     );
+    // The panel is drawn when its section opens (a closed panel defers its
+    // render), so the section is opened and the drawn button awaited first.
     await page.evaluate(() => {
       const section = document.querySelector(
         '#community-annotation-section',
@@ -2962,6 +3093,17 @@ test(
         throw new Error('Community annotation section is unavailable');
       }
       section.open = true;
+    });
+    await expect(
+      page.locator('#community-annotation-section').getByRole('button', {
+        name: 'GitHub sync…',
+        exact: true,
+      }),
+    ).toBeVisible();
+    await page.evaluate(() => {
+      const section = document.querySelector(
+        '#community-annotation-section',
+      );
       const openSync = [...section.querySelectorAll('button')].find(
         button => button.textContent === 'GitHub sync…',
       );
@@ -2983,7 +3125,16 @@ test(
     expect(repoRequestCount).toBe(2);
 
     // The owner retry is due while the explicit pull owns syncBusy. It must be
-    // queued, not consumed into a null-timer state.
+    // queued, not consumed into a null-timer state. Wait until it has really
+    // fired, then keep the original margin past its due time so a request it
+    // wrongly issued would have reached the route handler.
+    expect(await page.evaluate(
+      () => window.__cellucidRoleRetryTimerProbe.armed,
+    )).toBe(1);
+    await expect.poll(
+      () => page.evaluate(() => window.__cellucidRoleRetryTimerProbe.fired),
+      { timeout: retryAfterSeconds * 1000 + 30_000 },
+    ).toBe(1);
     await page.waitForTimeout(
       Math.max(0, retryDueAt + 400 - Date.now()),
     );
@@ -3065,9 +3216,7 @@ test(
     releaseFirstRequest.resolve();
 
     await expect.poll(() => repoRequestCount, { timeout: 10_000 }).toBe(2);
-    await expect.poll(() => runtimeSnapshot(page), {
-      timeout: 10_000,
-    }).toMatchObject({
+    await expect.poll(() => runtimeSnapshot(page)).toMatchObject({
       authenticated: true,
       role: 'author',
       cacheMode: 'indexeddb',
@@ -3167,9 +3316,7 @@ test(
     }));
 
     await openPreparedDeepLink(page);
-    await expect.poll(() => runtimeSnapshot(page), {
-      timeout: 10_000,
-    }).toMatchObject({
+    await expect.poll(() => runtimeSnapshot(page)).toMatchObject({
       role: 'author',
       currentDatasetId: FIRST_DATASET_ID,
       currentRepo: `${FIRST_REPO}@main`,
@@ -3191,14 +3338,14 @@ test(
       await section.locator('summary').click();
     }
     const manageHeader = section.locator(
-      '.analysis-accordion-header',
-      { hasText: 'MANAGE ANNOTATION' },
+      '.disclosure-header',
+      { hasText: 'Annotated columns' },
     );
     if ((await manageHeader.getAttribute('aria-expanded')) !== 'true') {
       await manageHeader.click();
     }
     let settings = section.locator(
-      '.community-annotation-settings.relative',
+      '.community-annotation-annotatable-settings',
     );
     await expect(settings).toBeVisible();
     await expect(settings.locator('input[type="range"]')).toHaveValue('50');
@@ -3208,7 +3355,7 @@ test(
       input.dispatchEvent(new Event('change', { bubbles: true }));
     });
     settings = section.locator(
-      '.community-annotation-settings.relative',
+      '.community-annotation-annotatable-settings',
     );
     await expect(settings.locator('input[type="range"]')).toHaveValue('80');
     await expect(
@@ -3256,7 +3403,7 @@ test(
       await manageHeader.click();
     }
     settings = section.locator(
-      '.community-annotation-settings.relative',
+      '.community-annotation-annotatable-settings',
     );
     await expect(settings).toBeVisible();
     await expect(settings.locator('input[type="range"]')).toHaveValue('25');
@@ -3318,9 +3465,7 @@ test(
     );
 
     await openPreparedDeepLink(page);
-    await expect.poll(() => runtimeSnapshot(page), {
-      timeout: 10_000,
-    }).toMatchObject({
+    await expect.poll(() => runtimeSnapshot(page)).toMatchObject({
       role: 'author',
       currentDatasetId: FIRST_DATASET_ID,
       currentRepo: `${FIRST_REPO}@main`,
@@ -3342,8 +3487,8 @@ test(
       await section.locator('summary').click();
     }
     const manageHeader = section.locator(
-      '.analysis-accordion-header',
-      { hasText: 'MANAGE ANNOTATION' },
+      '.disclosure-header',
+      { hasText: 'Annotated columns' },
     );
     if ((await manageHeader.getAttribute('aria-expanded')) !== 'true') {
       await manageHeader.click();
@@ -3353,7 +3498,7 @@ test(
     ).toHaveValue('__proto__');
 
     let settings = section.locator(
-      '.community-annotation-settings.relative',
+      '.community-annotation-annotatable-settings',
     );
     await expect(settings).toBeVisible();
     await expect(settings.locator('input[type="range"]')).toHaveValue('50');
@@ -3364,19 +3509,19 @@ test(
       input.dispatchEvent(new Event('change', { bubbles: true }));
     });
     settings = section.locator(
-      '.community-annotation-settings.relative',
+      '.community-annotation-annotatable-settings',
     );
     await settings.locator('input[type="number"]').fill('3');
     await settings.locator('input[type="number"]').press('Tab');
     settings = section.locator(
-      '.community-annotation-settings.relative',
+      '.community-annotation-annotatable-settings',
     );
     await settings.getByRole('button', {
       name: 'Reset',
       exact: true,
     }).click();
     settings = section.locator(
-      '.community-annotation-settings.relative',
+      '.community-annotation-annotatable-settings',
     );
     await expect(settings.locator('input[type="range"]')).toHaveValue('50');
     await expect(settings.locator('input[type="number"]')).toHaveValue('1');
@@ -3386,12 +3531,12 @@ test(
       input.dispatchEvent(new Event('change', { bubbles: true }));
     });
     settings = section.locator(
-      '.community-annotation-settings.relative',
+      '.community-annotation-annotatable-settings',
     );
     await settings.locator('input[type="number"]').fill('3');
     await settings.locator('input[type="number"]').press('Tab');
     settings = section.locator(
-      '.community-annotation-settings.relative',
+      '.community-annotation-annotatable-settings',
     );
     await settings.getByRole('button', {
       name: 'Apply',
@@ -3437,14 +3582,14 @@ test(
       exact: true,
     }).click();
     await expect(
-      section.locator('.community-annotation-settings.relative'),
+      section.locator('.community-annotation-annotatable-settings'),
     ).toHaveCount(0);
     await manageActions.getByRole('button', {
       name: 'Add',
       exact: true,
     }).click();
     settings = section.locator(
-      '.community-annotation-settings.relative',
+      '.community-annotation-annotatable-settings',
     );
     await expect(settings).toBeVisible();
     await expect(settings.locator('input[type="range"]')).toHaveValue('50');
@@ -3564,9 +3709,7 @@ test(
     );
 
     await openPreparedDeepLink(page);
-    await expect.poll(() => runtimeSnapshot(page), {
-      timeout: 10_000,
-    }).toMatchObject({
+    await expect.poll(() => runtimeSnapshot(page)).toMatchObject({
       authenticated: true,
       role: 'annotator',
       currentRepo: `${FIRST_REPO}@main`,
@@ -3658,9 +3801,7 @@ test(
     );
 
     await openPreparedDeepLink(page);
-    await expect.poll(() => runtimeSnapshot(page), {
-      timeout: 10_000,
-    }).toMatchObject({
+    await expect.poll(() => runtimeSnapshot(page)).toMatchObject({
       authenticated: true,
       role: 'annotator',
       currentRepo: `${FIRST_REPO}@main`,
@@ -3740,9 +3881,7 @@ test(
     );
 
     await openPreparedDeepLink(page);
-    await expect.poll(() => runtimeSnapshot(page), {
-      timeout: 10_000,
-    }).toMatchObject({
+    await expect.poll(() => runtimeSnapshot(page)).toMatchObject({
       authenticated: true,
       role: 'annotator',
       currentRepo: `${FIRST_REPO}@main`,
@@ -3890,9 +4029,7 @@ test(
     );
 
     await openPreparedDeepLink(page);
-    await expect.poll(() => runtimeSnapshot(page), {
-      timeout: 10_000,
-    }).toMatchObject({
+    await expect.poll(() => runtimeSnapshot(page)).toMatchObject({
       authenticated: true,
       role: 'author',
       currentRepo: `${FIRST_REPO}@main`,
@@ -3975,9 +4112,7 @@ test(
     );
 
     await openPreparedDeepLink(page);
-    await expect.poll(() => runtimeSnapshot(page), {
-      timeout: 10_000,
-    }).toMatchObject({
+    await expect.poll(() => runtimeSnapshot(page)).toMatchObject({
       authenticated: true,
       role: 'author',
       currentRepo: `${FIRST_REPO}@main`,
@@ -4061,9 +4196,7 @@ test(
     );
 
     await openPreparedDeepLink(page);
-    await expect.poll(() => runtimeSnapshot(page), {
-      timeout: 10_000,
-    }).toMatchObject({
+    await expect.poll(() => runtimeSnapshot(page)).toMatchObject({
       authenticated: true,
       role: 'author',
       currentRepo: `${FIRST_REPO}@main`,
@@ -4184,9 +4317,7 @@ test(
     }));
 
     await openPreparedDeepLink(page);
-    await expect.poll(() => runtimeSnapshot(page), {
-      timeout: 10_000,
-    }).toMatchObject({
+    await expect.poll(() => runtimeSnapshot(page)).toMatchObject({
       role: 'author',
       currentRepo: `${FIRST_REPO}@main`,
     });

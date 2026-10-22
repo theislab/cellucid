@@ -274,7 +274,7 @@ test('velocity disposal detaches vector texture descriptors into the retry queue
   };
   overlay._fieldsById.set(
     'field-a',
-    new Map([[3, entry]]),
+    new Map([['3d', entry]]),
   );
 
   assert.throws(
@@ -885,6 +885,7 @@ test('a positive particle-count change force-initializes every active slot and c
   const particle = {
     ...createParticleState('live', 8),
     capacity: 16,
+    layoutKey: '3d',
     dimensionLevel: 3,
     fieldId: 'velocity',
     positionsRef: positions,
@@ -904,7 +905,7 @@ test('a positive particle-count change force-initializes every active slot and c
   const overlay = Object.assign(Object.create(VelocityOverlay.prototype), {
     _activeFieldId: 'velocity',
     _fieldsById: new Map([
-      ['velocity', new Map([[3, { cellCount: 1 }]])],
+      ['velocity', new Map([['3d', { cellCount: 1 }]])],
     ]),
     _fboByView: new Map([['live', trails]]),
     _particleByView: new Map([['live', particle]]),
@@ -923,6 +924,7 @@ test('a positive particle-count change force-initializes every active slot and c
   });
 
   overlay._doUpdate(1 / 60, {
+    layoutKey: '3d',
     dimensionLevel: 3,
     frameId: 7,
     getViewPositions: () => positions,
@@ -941,6 +943,7 @@ test('a positive particle-count change force-initializes every active slot and c
 test('field transitions reuse exact same-cell spawn ownership and inactive publication causes no view churn', () => {
   const spawn = {
     cellCount: 2,
+    layoutKey: '3d',
     dimensionLevel: 3,
     dirty: false,
     ready: true,
@@ -948,15 +951,16 @@ test('field transitions reuse exact same-cell spawn ownership and inactive publi
   };
   const particle = {
     ...createParticleState('live', 8),
+    layoutKey: '3d',
     dimensionLevel: 3,
   };
   const overlay = Object.assign(Object.create(VelocityOverlay.prototype), {
     _activeFieldId: 'field-a',
     _fboByView: new Map(),
     _fieldsById: new Map([
-      ['field-a', new Map([[3, { cellCount: 2 }]])],
-      ['field-b', new Map([[3, { cellCount: 2 }]])],
-      ['field-c', new Map([[3, { cellCount: 3 }]])],
+      ['field-a', new Map([['3d', { cellCount: 2 }]])],
+      ['field-b', new Map([['3d', { cellCount: 2 }]])],
+      ['field-c', new Map([['3d', { cellCount: 3 }]])],
     ]),
     _particleByView: new Map([['live', particle]]),
     _spawnByView: new Map([['live', spawn]]),
@@ -971,7 +975,7 @@ test('field transitions reuse exact same-cell spawn ownership and inactive publi
   assert.equal(particle.activeParticleCount, 0);
   assert.equal(particle.forceRespawn, true);
 
-  overlay._invalidateActiveFieldDimension(3, 2);
+  overlay._invalidateActiveFieldLayout('3d', 2);
   assert.equal(spawn.dirty, false);
   assert.equal(spawn.version, 4);
 
@@ -989,16 +993,16 @@ test('field transitions reuse exact same-cell spawn ownership and inactive publi
       _activeFieldId: 'field-a',
       _disposed: false,
       _fieldsById: new Map([
-        ['field-a', new Map([[3, { cellCount: 2, texture: {} }]])],
+        ['field-a', new Map([['3d', { cellCount: 2, texture: {} }]])],
       ]),
       _initialized: true,
-      _invalidateActiveFieldDimension() {
+      _invalidateActiveFieldLayout() {
         activeInvalidations++;
       },
       gl: fixture.gl,
     },
   );
-  publicationOverlay.setVectorFieldData('field-b', 3, {
+  publicationOverlay.setVectorFieldData('field-b', '3d', {
     cellCount: 2,
     components: 3,
     maxMagnitude: 1,
@@ -1007,7 +1011,7 @@ test('field transitions reuse exact same-cell spawn ownership and inactive publi
 
   assert.equal(activeInvalidations, 0);
   assert.equal(
-    publicationOverlay.hasFieldForDimension('field-b', 3),
+    publicationOverlay.hasFieldForLayout('field-b', '3d'),
     true,
   );
   assert.match(
@@ -1048,7 +1052,7 @@ test('velocity field replacement publishes before retrying a delete-then-throw r
     _disposed: false,
     _fieldsById: new Map([
       ['field-a', new Map([[
-        3,
+        '3d',
         {
           cellCount: 2,
           components: 3,
@@ -1061,12 +1065,12 @@ test('velocity field replacement publishes before retrying a delete-then-throw r
     ]),
     _initialized: true,
     _pendingDerivedTextureDeletes: new Map(),
-    _invalidateActiveFieldDimension() {},
+    _invalidateActiveFieldLayout() {},
     gl: fixture.gl,
   });
 
   assert.doesNotThrow(() => {
-    overlay.setVectorFieldData('field-a', 3, {
+    overlay.setVectorFieldData('field-a', '3d', {
       cellCount: 2,
       components: 3,
       maxMagnitude: 2,
@@ -1074,7 +1078,7 @@ test('velocity field replacement publishes before retrying a delete-then-throw r
     });
   });
 
-  const published = overlay._fieldsById.get('field-a').get(3);
+  const published = overlay._fieldsById.get('field-a').get('3d');
   assert.notEqual(published.texture, existingTexture);
   assert.equal(fixture.textureBinding, published.texture);
   assert.equal(overlay._pendingDerivedTextureDeletes.has(existingTexture), true);
@@ -1136,7 +1140,7 @@ test('null velocity field retires derived view textures and same-null publicatio
     _activeFieldId: 'field-a',
     _fboByView: new Map(),
     _fieldsById: new Map([
-      ['field-a', new Map([[3, { texture: vectorTexture }]])],
+      ['field-a', new Map([['3d', { texture: vectorTexture }]])],
     ]),
     _particleByView: new Map(),
     _pendingDerivedTextureDeletes: new Map(),
@@ -1164,7 +1168,7 @@ test('null velocity field retires derived view textures and same-null publicatio
   );
 
   assert.equal(overlay.getActiveFieldId(), null);
-  assert.equal(overlay._fieldsById.get('field-a').get(3).texture, vectorTexture);
+  assert.equal(overlay._fieldsById.get('field-a').get('3d').texture, vectorTexture);
   assert.equal(overlay._positionTexturePool.size, 0);
   assert.equal(overlay._positionsRefByView.size, 0);
   assert.equal(spawn.textureInfo, null);
@@ -1292,8 +1296,8 @@ test('shared position-array mutation republishes one view without corrupting sna
     _spawnByView: new Map(),
   });
 
-  const oldTexture = overlay._ensurePositionTexture('live', positions);
-  const sharedTexture = overlay._ensurePositionTexture('snap_1', positions);
+  const oldTexture = overlay._ensurePositionTexture('live', positions, 3);
+  const sharedTexture = overlay._ensurePositionTexture('snap_1', positions, 3);
   const oldEntry = overlay._positionsRefByView.get('snap_1');
   assert.equal(sharedTexture, oldTexture);
   assert.equal(oldEntry.refs, 2);
@@ -1306,7 +1310,7 @@ test('shared position-array mutation republishes one view without corrupting sna
   assert.equal(overlay._positionTexturePool.has(positions), false);
   assert.equal(fixture.deletedTextures.includes(oldTexture.texture), false);
 
-  const newTexture = overlay._ensurePositionTexture('live', positions);
+  const newTexture = overlay._ensurePositionTexture('live', positions, 3);
   const newEntry = overlay._positionsRefByView.get('live');
   assert.notEqual(newTexture.texture, oldTexture.texture);
   assert.notEqual(newEntry, oldEntry);
@@ -1316,7 +1320,28 @@ test('shared position-array mutation republishes one view without corrupting sna
   assert.equal(fixture.deletedTextures.includes(oldTexture.texture), false);
 });
 
-test('dimension-only sampling invalidation retains and reuses the exact position texture generation', () => {
+test('a 2D or 1D view uploads one position channel per embedding axis', () => {
+  for (const dimension of [1, 2]) {
+    const fixture = createPositionTextureGl();
+    const positions = new Float32Array(3 * dimension).map((_, i) => i);
+    const overlay = Object.assign(Object.create(VelocityOverlay.prototype), {
+      gl: fixture.gl,
+      _fboByView: new Map(),
+      _particleByView: new Map(),
+      _pendingDerivedTextureDeletes: new Map(),
+      _positionTexturePool: new Map(),
+      _positionsRefByView: new Map(),
+      _residentFBOBytes: 0n,
+      _spawnByView: new Map(),
+    });
+    const textureInfo =
+      overlay._ensurePositionTexture('live', positions, dimension);
+    assert.equal(textureInfo.components, dimension);
+    assert.equal(textureInfo.itemCount ?? 3, 3);
+  }
+});
+
+test('layout-only sampling invalidation retains and reuses the exact position texture generation', () => {
   const fixture = createPositionTextureGl();
   const positions = new Float32Array([0, 1, 2, 3, 4, 5]);
   const spawn = {
@@ -1336,12 +1361,12 @@ test('dimension-only sampling invalidation retains and reuses the exact position
     _spawnByView: new Map([['live', spawn]]),
   });
 
-  const textureInfo = overlay._ensurePositionTexture('live', positions);
+  const textureInfo = overlay._ensurePositionTexture('live', positions, 3);
   const uploadedRowCount = fixture.uploadedRows.length;
   const entry = overlay._positionsRefByView.get('live');
 
-  overlay.markDimensionDirty('live');
-  const reused = overlay._ensurePositionTexture('live', positions);
+  overlay.markLayoutDirty('live');
+  const reused = overlay._ensurePositionTexture('live', positions, 3);
 
   assert.equal(reused, textureInfo);
   assert.equal(overlay._positionsRefByView.get('live'), entry);
@@ -1577,7 +1602,7 @@ test('disable retires every derived view texture exactly and retries failed dele
 test('viewer settles velocity preparation and context construction failures, including non-rendering branches', () => {
   const renderStart = viewerSource.indexOf('  function render() {');
   const renderEnd = viewerSource.indexOf(
-    '\n\t\t  function renderSingleView(',
+    '\n  function renderSingleView(',
     renderStart,
   );
   assert.ok(renderStart >= 0 && renderEnd > renderStart);
@@ -1594,7 +1619,7 @@ test('viewer settles velocity preparation and context construction failures, inc
   );
 
   const singleStart = viewerSource.indexOf(
-    '\t\t  function renderSingleView(',
+    '  function renderSingleView(',
     renderEnd,
   );
   const singleEnd = viewerSource.indexOf(
@@ -1622,7 +1647,7 @@ test('dirty or empty visibility generations cannot render stale velocity particl
   const overlay = Object.assign(Object.create(VelocityOverlay.prototype), {
     _activeFieldId: 'velocity',
     _fieldsById: new Map([
-      ['velocity', new Map([[3, {}]])],
+      ['velocity', new Map([['3d', {}]])],
     ]),
     _particleByView: new Map([['live', particle]]),
     _spawnByView: new Map([
@@ -1649,7 +1674,7 @@ test('dirty or empty visibility generations cannot render stale velocity particl
   });
 
   overlay.markVisibilityDirty('live');
-  overlay._doRender({ dimensionLevel: 3, viewId: 'live' });
+  overlay._doRender({ dimensionLevel: 3, layoutKey: '3d', viewId: 'live' });
 
   assert.equal(overlay._spawnByView.get('live').ready, false);
   assert.equal(particle.activeParticleCount, 0);
@@ -1668,7 +1693,7 @@ test('dirty or empty visibility generations cannot render stale velocity particl
   spawn.textureInfo = null;
   spawn.visibilityTextureInfo = null;
 
-  overlay._doRender({ dimensionLevel: 3, viewId: 'live' });
+  overlay._doRender({ dimensionLevel: 3, layoutKey: '3d', viewId: 'live' });
 });
 
 test('committed empty visibility retires the prior full-resolution trail generation', () => {
@@ -1690,7 +1715,7 @@ test('committed empty visibility retires the prior full-resolution trail generat
   const overlay = Object.assign(Object.create(VelocityOverlay.prototype), {
     _activeFieldId: 'velocity',
     _fieldsById: new Map([
-      ['velocity', new Map([[3, { cellCount: 1 }]])],
+      ['velocity', new Map([['3d', { cellCount: 1 }]])],
     ]),
     _fboByView: new Map([['live', generation]]),
     _particleByView: new Map([['live', createParticleState('live')]]),
@@ -1716,6 +1741,7 @@ test('committed empty visibility retires the prior full-resolution trail generat
   });
 
   overlay._doUpdate(1 / 60, {
+    layoutKey: '3d',
     dimensionLevel: 3,
     frameId: 1,
     getViewPositions: () => new Float32Array(3),

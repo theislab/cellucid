@@ -17,8 +17,10 @@
  *
  * Performance Notes:
  * - Distance matrix computation: O(n²)
- * - Hierarchical clustering: O(n² log n)
- * - Safe for matrices up to ~500 rows/cols
+ * - Hierarchical clustering: O(n² log n) time, about 100 bytes per item pair
+ *   of memory (`clusteringWorkingSetBytes`); clustering an axis whose working
+ *   set does not fit the analysis memory budget is refused with that reason,
+ *   before anything is allocated (never silently left unclustered)
  *
  * @module genes-panel/clustering-engine
  */
@@ -30,7 +32,49 @@ import {
   transposeMatrix
 } from '../shared/matrix-utils.js';
 import { isFiniteNumber } from '../shared/number-utils.js';
+import { createSlicedYield } from '../shared/concurrency-utils.js';
 import { DEFAULTS, ANALYSIS_PHASES } from './constants.js';
+
+/**
+ * Memory the clustering of n items holds, per item pair (n²): the n × n
+ * Float32 distance matrix, the working copy the linkage updates, and the
+ * lazy-deletion heap of candidate pairs, which receives every initial pair
+ * and n more on each merge. Measured as peak resident memory of
+ * `computeDistanceMatrix` + `_hierarchicalCluster` (average linkage, 12
+ * columns): 428 MB at 2,000 items, 796 MB at 3,000, 1,636 MB at 4,000, which is
+ * 101 bytes per pair at 4,000. A nearest-neighbour-chain linkage over a
+ * condensed matrix would need about 4 (plans/network-performance.md §7).
+ */
+const CLUSTERING_BYTES_PER_ITEM_PAIR = 104;
+
+/**
+ * Bytes clustering `itemCount` rows (or columns) needs at its peak.
+ * @param {number} itemCount
+ * @returns {number}
+ */
+export function clusteringWorkingSetBytes(itemCount) {
+  return CLUSTERING_BYTES_PER_ITEM_PAIR * itemCount * itemCount;
+}
+
+/**
+ * Why clustering an axis was refused, in the words a user reads.
+ *
+ * @param {'rows'|'columns'} axis
+ * @param {number} count
+ * @param {number} requiredBytes
+ * @param {number} budgetBytes
+ * @returns {string}
+ */
+function clusteringRefusal(axis, count, requiredBytes, budgetBytes) {
+  const megabytes = bytes => Math.ceil(bytes / 2 ** 20).toLocaleString('en-US');
+  const items = axis === 'rows' ? 'genes' : 'groups';
+  return (
+    `Clustering ${count.toLocaleString('en-US')} ${items} needs about ` +
+    `${megabytes(requiredBytes)} MB of memory, more than the ` +
+    `${megabytes(budgetBytes)} MB analysis memory budget. Raise the budget in ` +
+    `Performance settings, use fewer ${items}, or turn clustering of ${items} off.`
+  );
+}
 
 // =============================================================================
 // CLUSTERING ENGINE
@@ -79,6 +123,8 @@ export class ClusteringEngine {
    * @param {boolean} [options.clusterCols=true] - Whether to cluster columns (groups)
    * @param {'correlation'|'euclidean'|'cosine'} [options.distance='correlation'] - Distance metric
    * @param {'average'|'complete'|'single'} [options.linkage='average'] - Linkage method
+   * @param {number} options.memoryBudgetBytes - The analysis memory budget;
+   *   clustering an axis whose working set exceeds it is refused
    * @param {Function} [options.onProgress] - Progress callback
    * @returns {Promise<ClusteringResult>} Clustering result with reordered indices
    */
@@ -89,9 +135,13 @@ export class ClusteringEngine {
       clusterCols = this._config.clusterCols,
       distance = this._config.distance,
       linkage = this._config.linkage,
+      memoryBudgetBytes,
       onProgress,
       signal
     } = options;
+    if (!Number.isSafeInteger(memoryBudgetBytes) || memoryBudgetBytes <= 0) {
+      throw new TypeError('[ClusteringEngine] memoryBudgetBytes must be a positive integer');
+    }
 
     if (!matrix || (!Array.isArray(matrix.values) && !ArrayBuffer.isView(matrix.values))) {
       throw new TypeError('[ClusteringEngine] matrix with numeric values is required');
@@ -132,20 +182,19 @@ export class ClusteringEngine {
     let rowDendrogram = null;
     let colDendrogram = null;
 
-    // Hierarchical clustering is O(n²) in memory and time.
-    const MAX_CLUSTER_DIM = 500;
-    if (clusterRows && nRows > MAX_CLUSTER_DIM) {
-      throw new RangeError(
-        `[ClusteringEngine] row clustering requested for ${nRows} rows; maximum is ${MAX_CLUSTER_DIM}`
-      );
-    }
-    if (clusterCols && nCols > MAX_CLUSTER_DIM) {
-      throw new RangeError(
-        `[ClusteringEngine] column clustering requested for ${nCols} columns; maximum is ${MAX_CLUSTER_DIM}`
-      );
-    }
-    const doClusterRows = clusterRows && nRows > 1;
-    const doClusterCols = clusterCols && nCols > 1;
+    // Clustering is O(n²) in memory. A requested axis whose working set does
+    // not fit the analysis memory budget is refused before anything is
+    // allocated, with the reason; it is never returned unclustered.
+    const admit = (requested, axis, count) => {
+      if (!requested || count <= 1) return false;
+      const requiredBytes = clusteringWorkingSetBytes(count);
+      if (requiredBytes > memoryBudgetBytes) {
+        throw new RangeError(clusteringRefusal(axis, count, requiredBytes, memoryBudgetBytes));
+      }
+      return true;
+    };
+    const doClusterRows = admit(clusterRows, 'rows', nRows);
+    const doClusterCols = admit(clusterCols, 'columns', nCols);
 
     if (!doClusterRows && !doClusterCols) {
       return {
@@ -298,10 +347,6 @@ export class ClusteringEngine {
   // ===========================================================================
   // PRIVATE METHODS
   // ===========================================================================
-
-  _sleep0() {
-    return new Promise(resolve => setTimeout(resolve, 0));
-  }
 
   _linkageDistance(linkage, dIK, dJK, sizeI, sizeJ) {
     if (!isFiniteNumber(dIK) || !isFiniteNumber(dJK)) {
@@ -463,9 +508,10 @@ export class ClusteringEngine {
     for (let i = 0; i < n; i++) nodeIdByCluster[i] = i;
 
     const heap = this._createPairHeap();
+    const yieldIfSliceSpent = createSlicedYield();
 
-    // Initialize heap with every pair distance.
-    // For n<=500 this is safe and keeps clustering O(n^2 log n) without UI lock-ups.
+    // Initialize heap with every pair distance (clusterMatrix admitted n for
+    // the memory this takes); the loop yields between slices.
     for (let i = 0; i < n; i++) {
       for (let j = i + 1; j < n; j++) {
         const d = dist[i * n + j];
@@ -477,10 +523,8 @@ export class ClusteringEngine {
         heap.push(d, i, j, 0, 0);
       }
 
-      if (i > 0 && i % 64 === 0) {
-        throwIfAborted();
-        await this._sleep0();
-      }
+      throwIfAborted();
+      await yieldIfSliceSpent();
     }
 
     if (heap.size() === 0) {
@@ -571,9 +615,7 @@ export class ClusteringEngine {
       }
 
       // Yield periodically to keep the UI responsive.
-      if (merges % 8 === 0) {
-        await this._sleep0();
-      }
+      await yieldIfSliceSpent();
     }
 
     // Find the remaining active cluster as root.
@@ -623,19 +665,3 @@ export class ClusteringEngine {
     return [...leftOrder, ...rightOrder];
   }
 }
-
-// =============================================================================
-// FACTORY FUNCTION
-// =============================================================================
-
-/**
- * Create a ClusteringEngine instance
- *
- * @param {Object} [options] - Same options as ClusteringEngine constructor
- * @returns {ClusteringEngine}
- */
-export function createClusteringEngine(options) {
-  return new ClusteringEngine(options);
-}
-
-export default ClusteringEngine;

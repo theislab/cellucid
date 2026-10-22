@@ -486,7 +486,6 @@ test('Genes modal replaces an inherited-only stale group selection', t => {
   });
 
   const ui = createUI();
-  ui._modalAnnotationsRenderRevision = 0;
   ui._modalSelectedGroupId = 'constructor';
   ui._lastResult = {
     markers: {

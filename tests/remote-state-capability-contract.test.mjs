@@ -19,7 +19,7 @@ function jsonResponse(value, status = 200) {
 
 function identity() {
   return {
-    version: 2,
+    version: 3,
     id: 'cells',
     name: 'Cells',
     description: 'Remote state capability fixture',
@@ -34,9 +34,16 @@ function identity() {
       n_edges: null,
     },
     embeddings: {
-      available_dimensions: [2],
       default_dimension: 2,
-      files: { '2d': 'points_2d.bin' },
+      defaults: { '2d': 'X_umap' },
+      items: {
+        X_umap: {
+          label: 'X_umap',
+          dimension: 2,
+          file: 'embeddings/0_2d.bin',
+          source: { key: 'X_umap', columns: [0, 1] },
+        },
+      },
     },
     obs_fields: [],
   };
@@ -116,6 +123,7 @@ test('remote catalogs accept and preserve one strict paired state capability wit
     ...baseEntry(),
     state_manifest: STATE_MANIFEST,
     state_sha256: STATE_SHA256,
+    state_bytes: 3268,
   };
   const requests = installServer(t, advertised);
   const source = new RemoteDataSource();
@@ -140,12 +148,12 @@ test('remote catalogs reject partial and malformed state capabilities before ado
     {
       label: 'manifest only',
       entry: { ...baseEntry(), state_manifest: STATE_MANIFEST },
-      match: /state_manifest.*state_sha256|together|pair/i,
+      match: /state_manifest.*state_sha256.*state_bytes|together|pair/i,
     },
     {
       label: 'digest only',
       entry: { ...baseEntry(), state_sha256: STATE_SHA256 },
-      match: /state_manifest.*state_sha256|together|pair/i,
+      match: /state_manifest.*state_sha256.*state_bytes|together|pair/i,
     },
     {
       label: 'alternate manifest',
@@ -153,6 +161,7 @@ test('remote catalogs reject partial and malformed state capabilities before ado
         ...baseEntry(),
         state_manifest: 'other.json',
         state_sha256: STATE_SHA256,
+        state_bytes: 3268,
       },
       match: /state_manifest.*state-snapshots\.json/i,
     },
@@ -162,6 +171,7 @@ test('remote catalogs reject partial and malformed state capabilities before ado
         ...baseEntry(),
         state_manifest: 'states/state-snapshots.json',
         state_sha256: STATE_SHA256,
+        state_bytes: 3268,
       },
       match: /state_manifest.*state-snapshots\.json/i,
     },
@@ -171,6 +181,7 @@ test('remote catalogs reject partial and malformed state capabilities before ado
         ...baseEntry(),
         state_manifest: STATE_MANIFEST,
         state_sha256: STATE_SHA256.toUpperCase(),
+        state_bytes: 3268,
       },
       match: /state_sha256.*lowercase.*sha-256/i,
     },
@@ -180,6 +191,7 @@ test('remote catalogs reject partial and malformed state capabilities before ado
         ...baseEntry(),
         state_manifest: STATE_MANIFEST,
         state_sha256: 'a'.repeat(63),
+        state_bytes: 3268,
       },
       match: /state_sha256.*lowercase.*sha-256/i,
     },
@@ -189,8 +201,24 @@ test('remote catalogs reject partial and malformed state capabilities before ado
         ...baseEntry(),
         state_manifest: STATE_MANIFEST,
         state_sha256: 7,
+        state_bytes: 3268,
       },
       match: /state_sha256.*lowercase.*sha-256/i,
+    },
+    {
+      label: 'manifest and digest without a length',
+      entry: { ...baseEntry(), state_manifest: STATE_MANIFEST, state_sha256: STATE_SHA256 },
+      match: /together/i,
+    },
+    {
+      label: 'zero length',
+      entry: {
+        ...baseEntry(),
+        state_manifest: STATE_MANIFEST,
+        state_sha256: STATE_SHA256,
+        state_bytes: 0,
+      },
+      match: /state_bytes.*positive byte length/i,
     },
   ];
 
@@ -215,6 +243,7 @@ test('remote catalog state support does not open the entry schema', async t => {
     ...baseEntry(),
     state_manifest: STATE_MANIFEST,
     state_sha256: STATE_SHA256,
+    state_bytes: 3268,
     state_url: 'default.cellucid-session',
   });
   const source = new RemoteDataSource();

@@ -5,7 +5,7 @@
  * - Apply the persisted theme to `documentElement.dataset.theme` as early as possible
  *   to avoid a flash of the wrong theme while CSS is still downloading.
  * - Apply the persisted viewer background mode early as well (`data-viewer-background`)
- *   since it is part of the overall visual theme (grid vs plain, light vs dark).
+ *   since it is part of the overall visual theme (grid, studio or plain; light or dark).
  *
  * Notes:
  * - This file is loaded directly from `index.html` (not bundled).
@@ -23,7 +23,24 @@
     }
 
     const validThemes = new Set(['light', 'dark']);
-    const validBackgrounds = new Set(['grid', 'grid-dark', 'white', 'black']);
+    // Restates `rendering/viewer-backgrounds.js`, which a classic script
+    // cannot import; tests/viewer-background-enum-contract.test.mjs holds the
+    // two to the same list.
+    const validBackgrounds = new Set([
+      'white',
+      'grid',
+      'studio',
+      'atelier',
+      'abyss',
+      'aurora',
+      'black',
+      'grid-dark',
+      'studio-dark',
+      'nebula',
+      'abyss-dark',
+      'aurora-dark',
+    ]);
+    const backgroundList = [...validBackgrounds].map((mode) => `"${mode}"`).join(', ');
     const declaredTheme = root.dataset.theme;
     const declaredBackground = root.dataset.viewerBackground;
     if (!validThemes.has(declaredTheme)) {
@@ -31,7 +48,7 @@
     }
     if (!validBackgrounds.has(declaredBackground)) {
       throw new TypeError(
-        'Declared viewer background must be exactly "grid", "grid-dark", "white", or "black".',
+        `Declared viewer background must be exactly one of ${backgroundList}.`,
       );
     }
 
@@ -42,7 +59,7 @@
     }
     if (storedBackground !== null && !validBackgrounds.has(storedBackground)) {
       throw new TypeError(
-        'Stored viewer background must be exactly "grid", "grid-dark", "white", or "black".',
+        `Stored viewer background must be exactly one of ${backgroundList}.`,
       );
     }
 

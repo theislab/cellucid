@@ -7,7 +7,7 @@
  * @module ui/modules/highlight/highlight-pages-ui
  */
 
-import { formatCellCount as formatDataNumber } from '../../../../data/data-source.js';
+import { formatCompactCount } from '../../components/display-format.js';
 import { StyleManager } from '../../../../utils/style-manager.js';
 import {
   requireDomElement,
@@ -442,7 +442,11 @@ export function initHighlightPagesUI(options) {
         }
 
         const isActive = pageId === activePageId;
-        tab.classList.toggle('active', isActive);
+        if (isActive) {
+          tab.dataset.state = 'selected';
+        } else {
+          delete tab.dataset.state;
+        }
         const activation = tab.querySelector(
           '.highlight-page-tab-activate'
         );
@@ -475,7 +479,7 @@ export function initHighlightPagesUI(options) {
           );
         }
         const count = pageCounts.get(pageId);
-        const next = count > 0 ? formatDataNumber(count) : '(0)';
+        const next = count > 0 ? formatCompactCount(count) : '(0)';
         if (countSpan.textContent !== next) countSpan.textContent = next;
         activation.setAttribute(
           'aria-label',
@@ -484,7 +488,7 @@ export function initHighlightPagesUI(options) {
         );
 
         const colorEl = tab.querySelector('.highlight-page-color');
-        const colorInput = tab.querySelector('.highlight-page-color-input');
+        const colorInput = tab.querySelector('.color-swatch-input');
         if (colorEl === null || colorInput === null) {
           throw new Error(
             `Highlight page "${pageId}" is missing its color controls.`
@@ -492,7 +496,7 @@ export function initHighlightPagesUI(options) {
         }
         StyleManager.setVariable(
           colorEl,
-          '--highlight-page-color',
+          '--swatch-color',
           page.color
         );
         if (colorInput.value !== page.color) colorInput.value = page.color;
@@ -532,7 +536,8 @@ export function initHighlightPagesUI(options) {
       const isActive = page.id === activePageId;
 
       const tab = documentOwner.createElement('div');
-      tab.className = 'highlight-page-tab' + (isActive ? ' active' : '');
+      tab.className = 'chip highlight-page-tab';
+      if (isActive) tab.dataset.state = 'selected';
       tab.dataset.pageId = page.id;
 
       tab.draggable = true;
@@ -582,17 +587,17 @@ export function initHighlightPagesUI(options) {
       });
 
       const colorIndicator = documentOwner.createElement('span');
-      colorIndicator.className = 'highlight-page-color';
+      colorIndicator.className = 'color-swatch highlight-page-color';
       StyleManager.setVariable(
         colorIndicator,
-        '--highlight-page-color',
+        '--swatch-color',
         page.color
       );
       colorIndicator.title = 'Click to change color';
 
       const colorInput = documentOwner.createElement('input');
       colorInput.type = 'color';
-      colorInput.className = 'highlight-page-color-input';
+      colorInput.className = 'color-swatch-input';
       colorInput.value = page.color;
       colorInput.title = 'Click to change color';
       colorInput.setAttribute(
@@ -608,7 +613,7 @@ export function initHighlightPagesUI(options) {
         );
         StyleManager.setVariable(
           colorIndicator,
-          '--highlight-page-color',
+          '--swatch-color',
           newColor
         );
       });
@@ -627,7 +632,7 @@ export function initHighlightPagesUI(options) {
       activation.tabIndex = isActive ? 0 : -1;
 
       const nameSpan = documentOwner.createElement('span');
-      nameSpan.className = 'highlight-page-tab-name';
+      nameSpan.className = 'chip-name highlight-page-tab-name';
       nameSpan.textContent = page.name;
       nameSpan.title = page.name;
 
@@ -646,9 +651,9 @@ export function initHighlightPagesUI(options) {
       activation.appendChild(nameSpan);
 
       const countSpan = documentOwner.createElement('span');
-      countSpan.className = 'highlight-page-tab-count';
+      countSpan.className = 'chip-count highlight-page-tab-count';
       const count = pageCounts.get(page.id);
-      countSpan.textContent = count > 0 ? formatDataNumber(count) : '(0)';
+      countSpan.textContent = count > 0 ? formatCompactCount(count) : '(0)';
       activation.setAttribute(
         'aria-label',
         `${page.name}, ${count} highlighted ` +

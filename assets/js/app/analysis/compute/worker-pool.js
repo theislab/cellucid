@@ -5,11 +5,56 @@
  * transport failure, running-task timeout, or running-task abort invalidates
  * the entire pool because transferred buffers and worker execution state can
  * no longer be proven complete.
+ *
+ * A terminal pool is never revived and never replaces its own workers. It
+ * retires itself from the shared `getWorkerPool()` slot the moment it closes,
+ * so the next owner that asks for the shared pool receives a fresh one instead
+ * of the terminal error forever.
  */
 
 import { debug, debugError } from '../shared/debug-utils.js';
 
 const POOL_OPTION_KEYS = new Set(['poolSize', 'defaultTimeout']);
+
+/**
+ * Payload bytes this thread copies into workers within one task. A payload
+ * that is not transferred is structured-cloned by `postMessage`, at about
+ * 9 GB/s: the density plot of a ten-million-cell page hands each of eight
+ * workers its support and weights, about 1 GB in one task (114 ms) when every
+ * slice is dispatched at once. Past this budget the next dispatch waits for a
+ * task of its own, so no task copies much more than this (about 10 ms).
+ */
+export const DISPATCH_CLONE_BYTES_PER_TASK = 96 * 1024 * 1024;
+
+/**
+ * Bytes `postMessage` copies for a payload sent without transfer: the typed
+ * arrays it holds (each buffer once).
+ * @param {unknown} value
+ * @returns {number}
+ */
+function clonedPayloadBytes(value) {
+  let bytes = 0;
+  const seenBuffers = new Set();
+  const seenObjects = new Set();
+  const scan = candidate => {
+    if (candidate === null || typeof candidate !== 'object') return;
+    if (ArrayBuffer.isView(candidate) || candidate instanceof ArrayBuffer) {
+      const buffer = candidate instanceof ArrayBuffer ? candidate : candidate.buffer;
+      if (!seenBuffers.has(buffer)) {
+        seenBuffers.add(buffer);
+        bytes += candidate.byteLength;
+      }
+      return;
+    }
+    if (seenObjects.has(candidate)) return;
+    seenObjects.add(candidate);
+    for (const item of Array.isArray(candidate) ? candidate : Object.values(candidate)) {
+      scan(item);
+    }
+  };
+  scan(value);
+  return bytes;
+}
 const EXECUTION_OPTION_KEYS = new Set(['timeout', 'signal', 'transfer']);
 
 let poolInstance = null;
@@ -136,6 +181,13 @@ export class WorkerPool {
     this._initPromise = null;
     this._initializationAcks = new Map();
     this._nextWorkerIndex = 0;
+    // Dispatch pacing (DISPATCH_CLONE_BYTES_PER_TASK): bytes cloned in the
+    // current task, dispatches waiting for a task of their own, and the
+    // channel whose messages start those tasks.
+    this._clonedThisTask = 0;
+    this._pacedDispatches = [];
+    this._pacingChannel = null;
+    this._pacingScheduled = false;
 
     this._handleMessage = this._handleMessage.bind(this);
     this._handleError = this._handleError.bind(this);
@@ -200,7 +252,7 @@ export class WorkerPool {
 
         worker.postMessage({
           type: 'INIT',
-          payload: { id: index, poolSize: this.poolSize }
+          payload: { id: index }
         });
       }
 
@@ -357,6 +409,7 @@ export class WorkerPool {
     this._lifecycle = lifecycle;
     this.initialized = false;
     this._terminalError = primaryError;
+    if (poolInstance === this) poolInstance = null;
 
     const cleanupErrors = [];
     for (const worker of this.workers) {
@@ -399,6 +452,10 @@ export class WorkerPool {
       }
       queue.length = 0;
     }
+    for (const { task } of this._pacedDispatches) task.reject(terminalError);
+    this._pacedDispatches = [];
+    this._pacingChannel?.port1.close();
+    this._pacingChannel = null;
 
     this.workers = [];
     this.workerStates = [];
@@ -422,7 +479,71 @@ export class WorkerPool {
     this._dispatchToWorker(workerIndex, queue.shift());
   }
 
+  /**
+   * Dispatch a task to an idle worker, in a later task when this one has
+   * already cloned its budget of payload bytes.
+   */
   _dispatchToWorker(workerIndex, task) {
+    const bytes = task.transfer ? 0 : clonedPayloadBytes(task.payload);
+    if (
+      bytes > 0 &&
+      this._clonedThisTask > 0 &&
+      this._clonedThisTask + bytes > DISPATCH_CLONE_BYTES_PER_TASK
+    ) {
+      // The worker is reserved for this task until its turn comes.
+      this.workerStates[workerIndex] = 'busy';
+      this._pacedDispatches.push({ workerIndex, task, bytes });
+      this._schedulePacing();
+      return;
+    }
+    if (bytes > 0) {
+      this._clonedThisTask += bytes;
+      this._schedulePacing();
+    }
+    this._postToWorker(workerIndex, task);
+  }
+
+  /** Start a new task that resets the clone budget and posts paced dispatches. */
+  _schedulePacing() {
+    if (this._pacingScheduled) return;
+    this._pacingScheduled = true;
+    if (this._pacingChannel === null) {
+      this._pacingChannel = new MessageChannel();
+      this._pacingChannel.port1.onmessage = () => this._runPacedDispatches();
+    }
+    // Node keeps a process alive while a port is referenced: exactly while a
+    // pacing task is pending (a browser has no such notion).
+    this._pacingChannel.port1.ref?.();
+    this._pacingChannel.port2.postMessage(null);
+  }
+
+  _runPacedDispatches() {
+    this._pacingScheduled = false;
+    this._clonedThisTask = 0;
+    while (this._pacedDispatches.length > 0) {
+      const { bytes } = this._pacedDispatches[0];
+      if (
+        this._clonedThisTask > 0 &&
+        this._clonedThisTask + bytes > DISPATCH_CLONE_BYTES_PER_TASK
+      ) {
+        break;
+      }
+      const { workerIndex, task } = this._pacedDispatches.shift();
+      if (this._lifecycle !== 'ready') {
+        task.reject(this._terminalError ?? createAbortError());
+        continue;
+      }
+      this._clonedThisTask += bytes;
+      this._postToWorker(workerIndex, task);
+    }
+    if (this._pacedDispatches.length > 0 || this._clonedThisTask > 0) {
+      this._schedulePacing();
+    } else {
+      this._pacingChannel?.port1.unref?.();
+    }
+  }
+
+  _postToWorker(workerIndex, task) {
     const {
       type,
       payload,
@@ -435,6 +556,8 @@ export class WorkerPool {
     } = task;
 
     if (signal?.aborted) {
+      // A paced dispatch reserved the worker; it is free again.
+      this.workerStates[workerIndex] = 'idle';
       reject(createAbortError());
       queueMicrotask(() => this._processQueue(workerIndex));
       return;
@@ -631,27 +754,6 @@ export class WorkerPool {
     return results.map(entry => entry.result);
   }
 
-  async executeBatch(tasks, timeout = this.defaultTimeout) {
-    if (!Array.isArray(tasks)) {
-      throw new TypeError('Worker batch tasks must be an array');
-    }
-    requirePositiveSafeInteger(timeout, 'Worker batch timeout');
-    const exactTasks = tasks.map((task, index) => {
-      requireRecord(task, `Worker batch task ${index}`);
-      requireExactKeys(
-        task,
-        new Set(['type', 'payload']),
-        `Worker batch task ${index}`
-      );
-      requireTaskType(task.type);
-      requireRecord(task.payload, `Worker batch task ${index} payload`);
-      return task;
-    });
-    return Promise.all(
-      exactTasks.map(task => this.execute(task.type, task.payload, { timeout }))
-    );
-  }
-
   getStats() {
     const busyWorkers = this.workerStates.filter(state => state === 'busy').length;
     return {
@@ -671,7 +773,6 @@ export class WorkerPool {
     if (this._lifecycle !== 'failed' && this._lifecycle !== 'terminated') {
       this._close('terminated', new Error('Worker pool terminated'));
     }
-    if (poolInstance === this) poolInstance = null;
   }
 
   isReady() {
@@ -684,8 +785,12 @@ export class WorkerPool {
     return this._lifecycle === 'failed' ? this._terminalError : null;
   }
 
-  getPendingCount() {
-    return this.pendingRequests.size;
+  /**
+   * Whether this pool has closed for good (failed or terminated).
+   * @returns {boolean}
+   */
+  isTerminal() {
+    return this._lifecycle === 'failed' || this._lifecycle === 'terminated';
   }
 }
 
@@ -697,9 +802,3 @@ export function getWorkerPool(options) {
   }
   return poolInstance;
 }
-
-export function createWorkerPool(options) {
-  return new WorkerPool(options);
-}
-
-export default WorkerPool;

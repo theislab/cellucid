@@ -77,17 +77,22 @@ test('the density volume is addressed only through the splat index map', () => {
     'export const SMOKE_COMPOSITE_VS'
   );
 
-  // Reader: normalized volume position -> texture coordinate.
-  const readerMap =
-    'return (clamp(p01, 0.0, 1.0) * (grid - 1.0) + 0.5) / grid;';
-  assert.ok(
-    marchSource.includes(readerMap),
-    'densityTexCoord no longer implements the splat index map'
-  );
+  // Reader: normalized volume position -> texture coordinate, the affine map
+  // (clamp(p01) * (grid - 1) + 0.5) / grid with its scale and offset derived
+  // once per pixel.
+  for (const readerMap of [
+    'g_densityTexMap = vec2((grid - 1.0) / grid, 0.5 / grid);',
+    'return clamp(p01, 0.0, 1.0) * g_densityTexMap.x + g_densityTexMap.y;',
+  ]) {
+    assert.ok(
+      marchSource.includes(readerMap),
+      'densityTexCoord no longer implements the splat index map'
+    );
+  }
 
   // Writer: world position in [-1,1] -> splat index.
   const writerMap =
-    'vec3 fp = (a_position + halfExtent) / (2.0 * halfExtent) * (gridSize - 1.0);';
+    'vec3 fp = (position + halfExtent) / (2.0 * halfExtent) * (gridSize - 1.0);';
   assert.ok(
     read(DENSITY_SHADERS).includes(writerMap),
     'the splat no longer maps positions onto (gridSize - 1) index space'
@@ -115,19 +120,35 @@ test('the density volume is addressed only through the splat index map', () => {
     }
   }
 
-  // Both the full sample and the conservative empty-space skip must go through
-  // it; a skip on a half-texel-shifted copy is not conservative about the
-  // voxels the full sample then reads.
+  // Every density read goes through it, at level 0.
   const densityReads = marchSource
     .split('\n')
-    .filter(line => line.includes('u_densityTex3D') && line.includes('textureLod'));
-  assert.equal(densityReads.length, 2, 'expected exactly two density reads');
-  for (const line of densityReads) {
-    assert.ok(
-      line.includes('densityTexCoord('),
-      `density read does not go through densityTexCoord: ${line.trim()}`
-    );
-  }
+    .filter(line => line.includes('u_densityTex3D') && /texture|texel/.test(line));
+  assert.equal(densityReads.length, 1, 'expected exactly one density read');
+  assert.ok(
+    densityReads[0].includes('textureLod(u_densityTex3D, densityTexCoord(p01), 0.0)'),
+    `density read is not a level-0 read through densityTexCoord: ${densityReads[0].trim()}`
+  );
+});
+
+test('the empty-space skip uses the occupancy block the volume build wrote', async () => {
+  const { OCCUPANCY_BLOCK, OCCUPANCY_FS } = await import(
+    '../assets/js/rendering/shaders/density-shaders.js'
+  );
+  const { SMOKE_FS_SOURCE } = await import(
+    '../assets/js/rendering/shaders/smoke-shaders.js'
+  );
+  assert.equal(OCCUPANCY_BLOCK, 4);
+  assert.match(SMOKE_FS_SOURCE, /const float OCCUPANCY_BLOCK = 4\.0;/);
+  // The block's maximum covers its own voxels plus the next one on each axis:
+  // exactly the voxels a trilinear sample inside the block interpolates.
+  assert.match(OCCUPANCY_FS, /for \(int z = 0; z <= 4; z\+\+\)/);
+  assert.match(OCCUPANCY_FS, /maximum = max\(maximum, texelFetch\(u_density, voxel, 0\)\.r\);/);
+  // The march addresses blocks in the same splat index space as the volume.
+  assert.match(
+    SMOKE_FS_SOURCE,
+    /vec3 index = clamp\(p01, 0\.0, 1\.0\) \* \(grid - 1\.0\);\n\s*vec3 block = floor\(index \/ OCCUPANCY_BLOCK\);/,
+  );
 });
 
 test('the upsample composite gates on alpha, where the silhouette is', () => {

@@ -309,13 +309,13 @@ test('highlight teardown releases DOM, observer, callbacks, and GPU ownership re
       pickCellAtScreen: () => -1,
       screenToRay: () => null,
       getViewportInfoAtScreen: () => null,
+      getViewIdAtCanvasPoint: () => null,
       getRenderContext: () => null,
       getNavigationState: () => ({
         navigationMode: 'orbit',
         isDragging: false,
       }),
-      getViewPositions: () => new Float32Array(),
-      getViewTransparency: () => new Float32Array(),
+      getViewTransparency: () => new Uint8Array(),
       getSpatialQueryOwner: () => ({}),
     });
     const program = tools.highlightRenderer.program;
@@ -335,7 +335,7 @@ test('highlight teardown releases DOM, observer, callbacks, and GPU ownership re
     tools.setKnnPreviewCallback(callback);
     tools.setKnnStepCallback(callback);
     tools.setKnnEdgeLoadCallback(callback);
-    tools.setHighlightMode('continuous');
+    tools.setViewFieldKindSource(() => 'continuous');
     tools.setLassoEnabled(true);
     tools.setProximityEnabled(true);
     tools.setKnnEnabled(true);
@@ -384,7 +384,9 @@ test('highlight teardown releases DOM, observer, callbacks, and GPU ownership re
           tools.proximityCallback === null &&
           tools.knnCallback === null &&
           tools.pickCellAtScreen === null &&
-          tools.getViewPositions === null,
+          tools.getViewTransparency === null &&
+          tools.getViewFieldKind === null &&
+          tools.getViewIdAtCanvasPoint === null,
         canvasDetached: tools.canvas === null,
         classes: [...canvas.classList],
         cursor: canvas.style.cursor,
@@ -478,13 +480,13 @@ test('coexisting highlight overlays retain their shared parent positioning until
         pickCellAtScreen: () => -1,
         screenToRay: () => null,
         getViewportInfoAtScreen: () => null,
+        getViewIdAtCanvasPoint: () => null,
         getRenderContext: () => null,
         getNavigationState: () => ({
           navigationMode: 'orbit',
           isDragging: false,
         }),
-        getViewPositions: () => new Float32Array(),
-        getViewTransparency: () => new Float32Array(),
+        getViewTransparency: () => new Uint8Array(),
         getSpatialQueryOwner: () => ({}),
       });
     };

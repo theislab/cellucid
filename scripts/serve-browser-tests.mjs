@@ -206,6 +206,17 @@ function handle(request, response) {
 const server = createServer(handle);
 const sampleServer = createServer(handle);
 
+// Node closes an idle keep-alive connection after five seconds by default. A
+// client that reuses that connection at the same moment gets `ECONNRESET`;
+// browsers retry such a request transparently, but Playwright's `route.fetch`
+// does not, so a spec proxying through it failed at random. Idle connections
+// are kept far longer than any spec waits between requests, and the header
+// deadline must exceed the keep-alive one.
+for (const activeServer of [server, sampleServer]) {
+  activeServer.keepAliveTimeout = 120_000;
+  activeServer.headersTimeout = 121_000;
+}
+
 function reportListenFailure(error, role, listenPort, variable) {
   if (error.code === 'EADDRINUSE') {
     process.stderr.write(`${describePortInUse(role, listenPort, variable)}\n`);

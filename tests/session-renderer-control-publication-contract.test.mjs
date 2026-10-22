@@ -25,6 +25,7 @@ import test from 'node:test';
 
 import { createUiControlSerializer } from '../assets/js/app/state-serializer/ui-controls.js';
 import { initRenderControls } from '../assets/js/app/ui/modules/render-controls.js';
+import { SHADER_QUALITIES } from '../assets/js/rendering/shader-quality.js';
 import {
   POINT_SIZE_SLIDER_MINIMUM,
 } from '../assets/js/rendering/point-size-scale.js';
@@ -168,7 +169,7 @@ function makeRendererControls() {
       id: 'hp-shader-quality',
       tagName: 'SELECT',
       value: 'full',
-      options: ['full', 'light', 'ultralight'],
+      options: [...SHADER_QUALITIES],
     }),
     hpLodForceInput: new FakeElement({
       id: 'hp-lod-force',
@@ -201,6 +202,7 @@ function makeDom(renderer) {
     depthControls: new FakeElement(),
     rendererControls: new FakeElement(),
     pointsControls: new FakeElement(),
+    pointsPerformanceControls: new FakeElement(),
     smokeControls: new FakeElement(),
     ...renderer,
   };
@@ -224,7 +226,7 @@ function makeViewer(overrides = {}) {
     setSmokeParams: () => calls.push(['setSmokeParams']),
     setCloudResolutionScale: () => calls.push(['setCloudResolutionScale']),
     setNoiseTextureResolution: () => calls.push(['setNoiseTextureResolution']),
-    getAdaptiveScaleFactor: () => 1,
+    getSmokeSupport: () => ({ supported: true, reason: null, message: null, detail: null }),
     hasSnapshots: () => false,
     setShaderQuality: value => calls.push(['setShaderQuality', value]),
     setAdaptiveLOD: value => calls.push(['setAdaptiveLOD', value]),
@@ -368,6 +370,29 @@ test('a restored session publishes every renderer setting to the viewer', t => {
   );
 });
 
+test('every shader quality restores from a session and reaches the viewer', () => {
+  // A select restores only values its options carry, so a quality missing from
+  // the markup or the viewer contract would be refused here. The panel opens
+  // on the default, which a restore of the default leaves unpublished.
+  for (const quality of SHADER_QUALITIES.filter(value => value !== 'full')) {
+    const restore = installDocument();
+    try {
+      const { rendererCalls } = bootstrapAndRestore({
+        ...structuredClone(SAVED_SESSION),
+        'hp-shader-quality': { type: 'select', value: quality },
+      });
+      assert.ok(
+        rendererCalls.some(
+          ([method, value]) => method === 'setShaderQuality' && value === quality
+        ),
+        `the restored shader quality "${quality}" must reach the viewer`
+      );
+    } finally {
+      restore();
+    }
+  }
+});
+
 test('the forced LOD level survives the adaptive-LOD toggle that precedes it', t => {
   t.after(installDocument());
 
@@ -393,8 +418,8 @@ test('the forced LOD level survives the adaptive-LOD toggle that precedes it', t
     'the forced-level readout must agree with the published level'
   );
   assert.equal(
-    renderer.hpLodForceContainer.style.display,
-    'block',
+    renderer.hpLodForceContainer.hidden,
+    false,
     'the forced-level row must be shown when adaptive LOD is on'
   );
 });
@@ -453,13 +478,15 @@ test('renderer control ownership stays out of the bootstrap tail', () => {
     );
   }
 
+  // The advertised dataset state is restored by the dataset load, and the
+  // startup selection loads only once `initUI` has built its controls.
   const initUi = mainSource.indexOf('ui = initUI({');
-  const initialRestore = mainSource.lastIndexOf(
-    'stateOutcome = await restoreAdvertisedDatasetState({'
+  const startupLoad = mainSource.indexOf(
+    'await ui.loadStartupDataset(startupSelection)'
   );
   assert.ok(initUi > 0, 'the bootstrap must still initialize the UI');
   assert.ok(
-    initialRestore > initUi,
+    startupLoad > initUi,
     'the advertised dataset state must be restored after the UI owns its controls'
   );
 });
@@ -503,15 +530,10 @@ test('the markup the renderer controls are validated against still holds', () =>
     /<option value="full"/,
     'the first shader-quality option must be the renderer default "full"'
   );
-  for (const value of ['full', 'light', 'ultralight']) {
-    assert.ok(
-      shaderQuality.includes(`value="${value}"`),
-      `the shader-quality selector must offer "${value}"`
-    );
-  }
-  assert.equal(
-    (shaderQuality.match(/<option /g) ?? []).length,
-    3,
-    'the shader-quality selector must offer exactly the three the viewer accepts'
+  // The markup offers exactly the qualities the viewer accepts, in order.
+  assert.deepEqual(
+    [...shaderQuality.matchAll(/<option value="([^"]+)"/g)].map(match => match[1]),
+    [...SHADER_QUALITIES],
+    'the shader-quality selector must offer exactly the qualities the viewer accepts'
   );
 });

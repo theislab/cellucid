@@ -134,6 +134,10 @@ export class DataSourceManager {
 
     /** @type {string|null} */
     this.activeIdentityId = null;
+    // The address the published dataset was loaded from, fixed when the
+    // selection commits. It does not ask the source again, so a remote
+    // dataset whose connection was lost still names where it came from.
+    this.activeBaseUrl = null;
 
     /** @type {DatasetMetadata|null} */
     this.activeDatasetMetadata = null;
@@ -326,7 +330,8 @@ export class DataSourceManager {
    *
    * Failures stay cached on their source, so a catalog is never re-fetched
    * implicitly. Pass `{ refresh: true }` — a user-visible retry — to clear
-   * them and probe again.
+   * them and probe again. A source whose refresh itself fails reports that
+   * failure on its entry, alongside any catalog it still holds.
    *
    * @param {Object} [options]
    * @param {boolean} [options.refresh=false] - Clear cached source state first
@@ -351,11 +356,27 @@ export class DataSourceManager {
       sources: [...this.sources.keys()],
     });
 
-    if (refresh) await this.refreshAll();
+    const refreshErrors = new Map();
+    if (refresh) {
+      for (const { sourceType, error } of await this.refreshAll()) {
+        if (error !== null) refreshErrors.set(sourceType, error);
+      }
+    }
 
     const allResults = await Promise.all(
       [...this.sources.entries()].map(
-        ([sourceType, source]) => this._probeSource(sourceType, source)
+        async ([sourceType, source]) => {
+          const result = await this._probeSource(sourceType, source);
+          // A source whose refresh failed reports that failure, even when it
+          // still lists the catalog it held before: the reload did not happen.
+          const refreshError = refreshErrors.get(sourceType) ?? null;
+          if (refreshError === null) return result;
+          return {
+            sourceType,
+            datasets: result === null ? [] : result.datasets,
+            error: refreshError,
+          };
+        }
       )
     );
     const results = allResults.filter(result => result !== null);
@@ -383,69 +404,6 @@ export class DataSourceManager {
       );
     }
     return source.listDatasets();
-  }
-
-  /**
-   * Switch to a different dataset
-   * @param {string} sourceType - Source type
-   * @param {string} datasetId - Dataset ID
-   * @param {Object} [options]
-   * @param {boolean} [options.silent=false] - Don't notify listeners
-   * @param {string} [options.loadMethod] - Analytics hint for how the dataset was chosen
-   * @returns {Promise<{baseUrl: string, metadata: DatasetMetadata}>}
-   */
-  async switchToDataset(sourceType, datasetId, options = {}) {
-    const exactOptions = requireExactOptionRecord(
-      options,
-      ['loadMethod', 'silent'],
-      'Dataset switch options'
-    );
-    const silent = Object.hasOwn(exactOptions, 'silent')
-      ? exactOptions.silent
-      : false;
-    if (typeof silent !== 'boolean') {
-      throw new TypeError('Dataset switch silent must be a boolean.');
-    }
-    const loadMethod = requireLoadMethod(
-      Object.hasOwn(exactOptions, 'loadMethod')
-        ? exactOptions.loadMethod
-        : null,
-      'Dataset switch loadMethod'
-    );
-    const stage = await this.stageDatasetSelection(
-      sourceType,
-      datasetId,
-      { loadMethod }
-    );
-    const publication = this.commitDatasetSelection(stage);
-    let publicationError = null;
-    if (!silent) {
-      try {
-        this.publishDatasetSelection(publication);
-      } catch (error) {
-        publicationError = error;
-      }
-    } else {
-      datasetSelectionPublications.get(publication).state = 'published';
-    }
-    let finalizationError = null;
-    try {
-      this.finalizeDatasetSelection(publication);
-    } catch (error) {
-      finalizationError = error;
-    }
-    if (publicationError !== null && finalizationError !== null) {
-      throw new AggregateError(
-        [publicationError, finalizationError],
-        'Dataset selection publication and prior-source cleanup failed.'
-      );
-    }
-    if (publicationError !== null) throw publicationError;
-    if (finalizationError !== null) throw finalizationError;
-    return {
-      baseUrl: stage.baseUrl,
-      metadata: stage.metadata
-    };
   }
 
   /**
@@ -592,6 +550,7 @@ export class DataSourceManager {
       activeDatasetId: this.activeDatasetId,
       activeDatasetMetadata: this.activeDatasetMetadata,
       activeIdentityId: this.activeIdentityId,
+      activeBaseUrl: this.activeBaseUrl,
       activeSource: this.activeSource,
       lastLoadMethod: this.lastLoadMethod
     });
@@ -604,6 +563,7 @@ export class DataSourceManager {
     this.activeSource = owner.source;
     this.activeDatasetId = stage.datasetId;
     this.activeIdentityId = stage.identityId;
+    this.activeBaseUrl = stage.baseUrl;
     this.activeDatasetMetadata = stage.metadata;
     this.lastLoadMethod = stage.loadMethod;
     this._selectionRevision++;
@@ -689,6 +649,7 @@ export class DataSourceManager {
     this.activeSource = owner.previousState.activeSource;
     this.activeDatasetId = owner.previousState.activeDatasetId;
     this.activeIdentityId = owner.previousState.activeIdentityId;
+    this.activeBaseUrl = owner.previousState.activeBaseUrl;
     this.activeDatasetMetadata =
       owner.previousState.activeDatasetMetadata;
     this.lastLoadMethod = owner.previousState.lastLoadMethod;
@@ -936,6 +897,7 @@ export class DataSourceManager {
       activeDatasetId: this.activeDatasetId,
       activeDatasetMetadata: this.activeDatasetMetadata,
       activeIdentityId: this.activeIdentityId,
+      activeBaseUrl: this.activeBaseUrl,
       activeSource: this.activeSource,
       lastLoadMethod: this.lastLoadMethod
     });
@@ -943,6 +905,7 @@ export class DataSourceManager {
     this.activeSource = null;
     this.activeDatasetId = null;
     this.activeIdentityId = null;
+    this.activeBaseUrl = null;
     this.activeDatasetMetadata = null;
     this.lastLoadMethod = null;
     this._selectionRevision++;
@@ -970,12 +933,14 @@ export class DataSourceManager {
   }
 
   /**
-   * Get the base URL for the current dataset
+   * The base URL the current dataset was published from, as its selection
+   * committed it. It is not re-derived from the source, whose transport may
+   * since have closed.
    * @returns {string|null}
    */
   getCurrentBaseUrl() {
     if (!this.activeSource || !this.activeDatasetId) return null;
-    return this.activeSource.getBaseUrl(this.activeDatasetId);
+    return this.activeBaseUrl;
   }
 
   /**
@@ -1007,10 +972,10 @@ export class DataSourceManager {
       || typeof sourceDescriptor !== 'object'
       || Array.isArray(sourceDescriptor)
       || Object.keys(sourceDescriptor).sort().join(',')
-        !== 'manifestUrl,stateSha256'
+        !== 'manifestUrl,stateBytes,stateSha256'
     ) {
       throw new TypeError(
-        'Active dataset state descriptor must contain exactly manifestUrl and stateSha256.'
+        'Active dataset state descriptor must contain exactly manifestUrl, stateBytes and stateSha256.'
       );
     }
     const baseUrl = this.getCurrentBaseUrl();
@@ -1031,6 +996,11 @@ export class DataSourceManager {
         'Active dataset state SHA-256 must be one lowercase digest.'
       );
     }
+    if (!Number.isSafeInteger(sourceDescriptor.stateBytes) || sourceDescriptor.stateBytes < 1) {
+      throw new TypeError(
+        'Active dataset state byte length must be a positive safe integer.'
+      );
+    }
     if (
       typeof this.activeIdentityId !== 'string'
       || this.activeIdentityId.length === 0
@@ -1047,6 +1017,7 @@ export class DataSourceManager {
       manifestUrl: sourceDescriptor.manifestUrl,
       selectionRevision: this._selectionRevision,
       sourceType: 'local-demo',
+      stateBytes: sourceDescriptor.stateBytes,
       stateSha256: sourceDescriptor.stateSha256,
     };
   }
@@ -1073,6 +1044,16 @@ export class DataSourceManager {
    */
   getCurrentDatasetId() {
     return this.activeDatasetId;
+  }
+
+  /**
+   * Count of committed dataset selections in this page. Every load, including
+   * a reload of the same dataset id, publishes a new revision, so a value
+   * derived from the loaded data can be keyed to the load that produced it.
+   * @returns {number}
+   */
+  getCurrentSelectionRevision() {
+    return this._selectionRevision;
   }
 
   /**
@@ -1366,27 +1347,6 @@ export class DataSourceManager {
     throwIfMetadataAborted(signal, 'Staged URL resolution');
     return resolvedUrl;
   }
-
-  /**
-   * Fetch a URL, handling custom protocols automatically.
-   *
-   * Reached only through a string-literal method lookup in
-   * `app/session/session-serializer.js` (`requireMethod(ctx.dataSourceManager,
-   * 'fetch', ...)`), which is how session restore-from-URL downloads a bundle
-   * that may live behind a custom protocol. A plain call-site search will not
-   * find that caller.
-   *
-   * @param {string} url - URL to fetch (may be custom protocol)
-   * @param {RequestInit} [options] - Fetch options
-   * @returns {Promise<Response>}
-   */
-  async fetch(url, options = {}) {
-    const resolvedUrl = await this.resolveUrl(
-      url,
-      options.signal ?? null
-    );
-    return fetch(resolvedUrl, options);
-  }
 }
 
 // Singleton instance
@@ -1401,12 +1361,4 @@ export function getDataSourceManager() {
     _instance = new DataSourceManager();
   }
   return _instance;
-}
-
-/**
- * Create a new DataSourceManager (for testing or custom instances)
- * @returns {DataSourceManager}
- */
-export function createDataSourceManager() {
-  return new DataSourceManager();
 }

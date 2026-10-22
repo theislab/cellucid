@@ -5,6 +5,7 @@ import {
 } from './helpers/test.mjs';
 import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
+import { openCollapsedPanels } from './helpers/panels.mjs';
 
 const VIEWPORT = { width: 1440, height: 1000 };
 const HARNESS_MODULE_PATH = '/assets/js/app/ui/modules/benchmark/index.js';
@@ -91,8 +92,9 @@ test.describe.serial('GLB benchmark runtime publication', () => {
       { waitUntil: 'domcontentloaded' }
     );
     await dismissWelcome(page);
+    await openCollapsedPanels(page);
     await expect(page.locator('#filter-count')).toHaveText(
-      'Showing all 120 points'
+      'Showing all 120 cells'
     );
     // The filter count publishes dataset readiness before the linear bootstrap
     // reaches the benchmark listeners. Use the benchmark control's production
@@ -233,11 +235,10 @@ test.describe.serial('GLB benchmark runtime publication', () => {
         colors: state.colorsArray.length,
         transparency: state.categoryTransparency.length,
         visibility: state.cellVisibilityMask.length,
-        outliers: state.outlierQuantilesArray.length,
         highlights: state.highlightArray.length,
         highlightPages: state.highlightPages.length,
         viewContexts: state.viewContexts.size,
-        dimension: state.activeDimensionLevel,
+        dimension: state.getDimensionLevel(),
         navigationMode: document.getElementById('navigation-mode').value,
         webglError: document
           .getElementById('glcanvas')
@@ -252,7 +253,6 @@ test.describe.serial('GLB benchmark runtime publication', () => {
       colors: 4000,
       transparency: 1000,
       visibility: 1000,
-      outliers: 1000,
       highlights: 1000,
       highlightPages: 1,
       viewContexts: 1,

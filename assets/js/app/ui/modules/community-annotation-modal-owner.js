@@ -52,16 +52,3 @@ export function releaseCommunityAnnotationModal(close) {
   activeClose = null;
   return true;
 }
-
-/**
- * Close the currently published primary modal, if any.
- *
- * @param {object} [options]
- * @returns {boolean} whether an owner existed
- */
-export function closeActiveCommunityAnnotationModal(options) {
-  const close = activeClose;
-  if (close === null) return false;
-  close(options);
-  return true;
-}

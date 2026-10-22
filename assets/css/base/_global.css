@@ -12,19 +12,38 @@ html, body {
   color: var(--color-text-primary);
 }
 
+/* Native checkboxes, radios and progress bars take the theme's ink instead of
+   the browser's blue, so every one of them matches the filled pressed buttons
+   beside it in light and dark alike. `accent-color` inherits, so this single
+   declaration covers the sidebar, floating panels, modals and analysis
+   windows; no component restates it. */
+:root {
+  accent-color: var(--color-interactive-primary);
+}
+
 /* Viewer background modes (controlled by JS via data attribute). */
 :root[data-viewer-background="grid"] body { background: var(--viewer-bg-grid); }
 :root[data-viewer-background="grid-dark"] body { background: var(--viewer-bg-grid-dark); }
+:root[data-viewer-background="studio"] body { background: var(--viewer-bg-studio); }
+:root[data-viewer-background="studio-dark"] body { background: var(--viewer-bg-studio-dark); }
+:root[data-viewer-background="atelier"] body { background: var(--viewer-bg-atelier); }
+:root[data-viewer-background="abyss"] body { background: var(--viewer-bg-abyss); }
+:root[data-viewer-background="aurora"] body { background: var(--viewer-bg-aurora); }
+:root[data-viewer-background="nebula"] body { background: var(--viewer-bg-nebula); }
+:root[data-viewer-background="abyss-dark"] body { background: var(--viewer-bg-abyss-dark); }
+:root[data-viewer-background="aurora-dark"] body { background: var(--viewer-bg-aurora-dark); }
 :root[data-viewer-background="black"] body { background: var(--black); }
 :root[data-viewer-background="white"] body { background: var(--white); }
 
 body.dock-dragging,
 body.dock-dragging * {
+  -webkit-user-select: none !important;
   user-select: none !important;
 }
 
 body.dock-resizing,
 body.dock-resizing * {
+  -webkit-user-select: none !important;
   user-select: none !important;
 }
 
@@ -43,6 +62,24 @@ body.dock-resizing * {
   height: 100%;
   display: block;
   cursor: grab;
+  /* Every finger on the plot is the viewer's: one orbits, pans, or selects,
+     two pinch and pan. Left to the browser they would scroll or zoom the page
+     and cancel the gesture the viewer was running. */
+  touch-action: none;
+}
+
+/* The plot and the controls that sit on it are touch surfaces, not text. On
+   iOS a press held on them otherwise starts a text selection, which with no
+   text under the finger grows to the whole page, or opens the callout menu,
+   instead of reaching the viewer's own gestures (Cell info's press-and-hold,
+   Select mode, the camera). Safari honours only the -webkit- user-select. */
+#glcanvas,
+.select-bar,
+.split-view-badges,
+.view-title-chip {
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
 }
 
 #glcanvas.dragging {
@@ -53,32 +90,3 @@ body.dock-resizing * {
   cursor: crosshair;
 }
 
-/* ========================================================================
-   Small global utilities
-   ===================================================================== */
-
-/* Filter base text (also used when no filters) */
-.filter-info {
-  font-size: var(--text-xs);
-  color: var(--color-text-secondary);
-  margin-top: var(--space-0-5);
-}
-
-/* Background renderer status text */
-#stats {
-  font-size: var(--text-sm);
-  opacity: var(--opacity-80);
-  margin-top: var(--space-1);
-  display: none;
-}
-
-/* Volumetric smoke rebuild button base (visual already overridden) */
-#smoke-rebuild-btn {
-  margin-top: var(--space-1);
-  font-size: var(--text-sm);
-}
-
-/* Default legend group spacing (already overridden higher) */
-.legend-group {
-  margin-top: var(--space-1);
-}

@@ -19,6 +19,7 @@
  * a success (CEL-0220).
  */
 
+import './helpers/anndata-reader-in-process.mjs';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
@@ -76,6 +77,18 @@ class FakeElement {
     this.children.unshift(child);
     return child;
   }
+
+  append(...children) {
+    this.children.push(...children);
+  }
+
+  replaceChildren(...children) {
+    this.children = children;
+  }
+
+  addEventListener() {}
+
+  remove() {}
 
   setAttribute(name, value) {
     this.attributes.set(name, value);
@@ -252,13 +265,18 @@ test('a repeating failure cannot fill the screen, sticky or not', t => {
     new Set([NotificationType.ERROR]),
     'the survivors are the most recent failures, not a mixed backlog'
   );
+  // Every failure retired to make room is still listed, so none is lost.
+  assert.equal(
+    center.overflowMessages.length + center.notifications.size,
+    20
+  );
 });
 
 test('work in progress is never evicted to make room for a sticky error', t => {
   const { center } = createRecordingCenter(t);
   center.maxNotifications = 3;
 
-  const download = center.loading('Loading points_3d.bin...', {
+  const download = center.loading('Loading embeddings/0_3d.bin...', {
     category: 'download',
   });
   for (let attempt = 0; attempt < 10; attempt++) {
@@ -275,7 +293,7 @@ test('work in progress is never evicted to make room for a sticky error', t => {
 /*
  * Removing the timer exposed a defect the timer had been hiding: a session
  * restore that fails publishes the message twice — once by failing its own
- * "Loading session" progress notification, once by the load button's catch
+ * "Session file" progress notification, once by the load button's catch
  * re-announcing the rethrown error. With one copy living 4000 ms and the other
  * 6000 ms, the duplicate looked like a flicker, and the browser test that
  * counts them went green as soon as the shorter one expired. With neither
@@ -302,8 +320,9 @@ test('a restore failure the serializer already published is not announced twice'
   const publications = [
     ...serializer.matchAll(/notifications\.failDownload\([\s\S]*?\);/g),
   ];
+  // The bundle restore publishes a canceled and a failed outcome.
   assert.ok(
-    publications.length >= 4,
+    publications.length >= 2,
     `the restore paths must still publish their failures (${publications.length})`
   );
   for (const match of publications) {

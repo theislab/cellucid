@@ -26,6 +26,29 @@ export function escapeHtml(value) {
 }
 
 /**
+ * Characters XML 1.0 cannot carry at all, not even as a character reference:
+ * C0 controls other than tab, line feed and carriage return, the
+ * noncharacters U+FFFE and U+FFFF, and unpaired UTF-16 surrogates.
+ */
+const XML_UNREPRESENTABLE =
+  /[\u0000-\u0008\u000B\u000C\u000E-\u001F\uFFFE\uFFFF]|[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
+
+/**
+ * Escape text for an XML document such as an exported SVG.
+ *
+ * Markup characters are escaped as in `escapeHtml()`. Characters XML cannot
+ * represent are replaced with U+FFFD, so a label taken from the data (a
+ * category name containing a control character, for example) can never make
+ * the whole document unparseable.
+ *
+ * @param {*} value
+ * @returns {string}
+ */
+export function escapeXml(value) {
+  return escapeHtml(value).replace(XML_UNREPRESENTABLE, '\uFFFD');
+}
+
+/**
  * Create an element with attributes/properties and children.
  * @param {string} tag
  * @param {Object} [attrs]
@@ -68,48 +91,4 @@ export function clearElement(el) {
   while (el?.firstChild) {
     el.removeChild(el.firstChild);
   }
-}
-
-/**
- * Show an element.
- * @param {HTMLElement} el
- * @param {string} [display='block']
- */
-export function showElement(el, display = 'block') {
-  if (el) el.style.display = display;
-}
-
-/**
- * Hide an element.
- * @param {HTMLElement} el
- */
-export function hideElement(el) {
-  if (el) el.style.display = 'none';
-}
-
-/**
- * Toggle element visibility.
- * @param {HTMLElement} el
- * @param {boolean} [visible]
- * @param {string} [display='block']
- */
-export function toggleElement(el, visible, display = 'block') {
-  if (!el) return;
-  if (visible === undefined) {
-    visible = el.style.display === 'none';
-  }
-  el.style.display = visible ? display : 'none';
-}
-
-/**
- * Add an event listener and return a cleanup function.
- * @param {EventTarget} target
- * @param {string} event
- * @param {Function} handler
- * @param {Object} [options]
- * @returns {Function}
- */
-export function addListener(target, event, handler, options) {
-  target.addEventListener(event, handler, options);
-  return () => target.removeEventListener(event, handler, options);
 }

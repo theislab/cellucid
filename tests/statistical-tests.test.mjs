@@ -2,7 +2,6 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
-  chiSquaredCDF,
   chiSquaredPValue,
   fDistributionPValue,
   mannWhitneyU as coreMannWhitneyU,
@@ -13,16 +12,10 @@ import {
   welchTTestFromMoments
 } from '../assets/js/app/analysis/compute/math-utils.js';
 import { computeCorrelation } from '../assets/js/app/analysis/compute/operation-handlers.js';
-import { computeQuickDifferentialExpression } from '../assets/js/app/analysis/stats/quick-stats.js';
 import {
-  applyMultipleTestingCorrection,
-  benjaminiHochberg,
   benjaminiHochbergAdjusted,
   benjaminiHochbergTestable,
-  bonferroniCorrection,
   chiSquaredTest,
-  confidenceInterval,
-  computeFoldChange,
   fisherExactTest,
   formatStatisticalResult,
   kruskalWallis,
@@ -229,30 +222,6 @@ test('scatter correlation uses the Student t reference probability', () => {
   assertClose(result.pValue, 0.0373860734685);
 });
 
-test('quick differential expression delegates p-values to Welch inference', async () => {
-  const dataLayer = {
-    getAvailableVariables: () => [{ key: 'GENE', name: 'Gene' }],
-    getDataForPages: async () => [
-      { values: [0, 1] },
-      { values: [2, 3] }
-    ]
-  };
-
-  const quick = await computeQuickDifferentialExpression(
-    dataLayer,
-    'page-a',
-    'page-b',
-    1
-  );
-  // scipy.stats.ttest_ind([0, 1], [2, 3], equal_var=False) -> pvalue 0.10557...
-  const [result] = quick.results;
-  assertClose(result.pValue, 0.10557280900008414);
-  // A family of one: the correction cannot move the probability.
-  assert.equal(quick.genesTested, 1);
-  assert.equal(quick.genesUntestable, 0);
-  assertClose(result.adjustedPValue, 0.10557280900008414);
-});
-
 test('chi-square upper tails use the exact gamma relationship', () => {
   assertClose(chiSquaredPValue(3.84, 1), 0.0500435212487051);
   assertClose(chiSquaredPValue(10, 2), 0.006737946999085467);
@@ -262,11 +231,6 @@ test('chi-square upper tails use the exact gamma relationship', () => {
   const boundedFallback = chiSquaredPValue(1e12, 1e12);
   assert.ok(Number.isFinite(boundedFallback));
   assert.ok(Math.abs(boundedFallback - 0.5) < 1e-5);
-  assertClose(
-    chiSquaredCDF(1e12, 1e12) + boundedFallback,
-    1,
-    1e-12
-  );
   assert.ok(Number.isNaN(chiSquaredPValue(0, 0)));
 });
 
@@ -463,59 +427,6 @@ test('statistical APIs reject alternate schemas and preserve numeric zero', () =
     () => oneWayANOVA([[1, '2'], [3, 4]]),
     /numeric value at every index/i
   );
-
-  assert.deepEqual(
-    confidenceInterval([0]),
-    {
-      mean: 0,
-      lower: NaN,
-      upper: NaN,
-      se: NaN,
-      n: 1,
-      confidenceLevel: 0.95
-    }
-  );
-  assert.throws(
-    () => confidenceInterval([1, 2], 1),
-    /confidence level.*strictly between/i
-  );
-  assert.throws(
-    () => computeFoldChange(-1, 2),
-    /meanA.*non-negative/i
-  );
-});
-
-test('multiple-testing correction has one exact method and probability contract', () => {
-  assert.deepEqual(
-    benjaminiHochberg([0.01, 0.04, 0.03]),
-    {
-      adjustedPValues: [0.03, 0.04, 0.04],
-      significant: [true, true, true],
-      threshold: 0.04,
-      significantCount: 3
-    }
-  );
-  assert.deepEqual(
-    bonferroniCorrection([]),
-    {
-      adjustedPValues: [],
-      significant: [],
-      threshold: null,
-      significantCount: 0
-    }
-  );
-  assert.throws(
-    () => benjaminiHochberg([0.1, NaN]),
-    /p-value 2.*finite and between/i
-  );
-  assert.throws(
-    () => bonferroniCorrection([1.1]),
-    /p-value 1.*between 0 and 1/i
-  );
-  assert.throws(
-    () => applyMultipleTestingCorrection([{ pValue: 0.1 }], 'automatic'),
-    /method must be exactly/i
-  );
 });
 
 test('marker worker uses centered moments and preserves extreme p-values', async () => {
@@ -536,7 +447,7 @@ test('marker worker uses centered moments and preserves extreme p-values', async
   lowSpreadCodes.fill(1, lowSpreadSize);
   runWorker('MARKERS_SET_CONTEXT', {
     codes: lowSpreadCodes,
-    codeToGroupIndex: new Int16Array([0, 1]),
+    codeToGroupIndex: new Int32Array([0, 1]),
     groupCount: 2
   }, 'low-spread-context');
 
@@ -568,7 +479,7 @@ test('marker worker uses centered moments and preserves extreme p-values', async
   tailCodes.fill(1, tailSize);
   runWorker('MARKERS_SET_CONTEXT', {
     codes: tailCodes,
-    codeToGroupIndex: new Int16Array([0, 1]),
+    codeToGroupIndex: new Int32Array([0, 1]),
     groupCount: 2
   }, 'tail-context');
   const tailValues = new Float32Array(tailSize * 2);
@@ -775,37 +686,13 @@ test('Benjamini-Hochberg matches scipy.stats.false_discovery_control', () => {
       assertRelative(adjusted[index], scipy[index], 1e-12);
     }
 
-    // All three public entry points must be the same procedure.
-    const wrapper = benjaminiHochberg(p, 0.05);
+    // Both public entry points must be the same procedure.
     const testable = benjaminiHochbergTestable(Float64Array.from(p));
     for (let index = 0; index < scipy.length; index++) {
-      assertRelative(wrapper.adjustedPValues[index], scipy[index], 1e-12);
       assertRelative(testable.adjustedPValues[index], scipy[index], 1e-12);
     }
     assert.equal(testable.testedCount, p.length, name);
     assert.equal(testable.untestableCount, 0, name);
-
-    // The rejection set is exactly the step-up rule it claims to implement:
-    // reject the k* smallest ordered p-values, k* = max{k : p(k) <= k*alpha/m}.
-    const m = p.length;
-    const ordered = [...p].sort((left, right) => left - right);
-    let kStar = 0;
-    for (let rank = 0; rank < m; rank++) {
-      if (ordered[rank] <= ((rank + 1) * 0.05) / m) kStar = rank + 1;
-    }
-    assert.equal(wrapper.significantCount, kStar, name);
-    assert.equal(
-      wrapper.threshold,
-      kStar === 0 ? null : ordered[kStar - 1],
-      name
-    );
-    for (let index = 0; index < m; index++) {
-      assert.equal(
-        wrapper.significant[index],
-        kStar > 0 && p[index] <= ordered[kStar - 1],
-        `${name} @ ${index}`
-      );
-    }
   }
 
   // An untested gene is not a member of the family being corrected, so it is
@@ -893,7 +780,7 @@ test('marker worker one-vs-rest Wilcoxon ranks against the whole pooled sample',
   ]);
   runWorker('MARKERS_SET_CONTEXT', {
     codes,
-    codeToGroupIndex: Int16Array.from([0, 1, 2]),
+    codeToGroupIndex: Int32Array.from([0, 1, 2]),
     groupCount: 3
   }, 'one-vs-rest-context');
 
@@ -935,7 +822,7 @@ test('marker worker one-vs-rest Wilcoxon ranks against the whole pooled sample',
   // A gene that is zero in every cell is a fully tied pool: no evidence, p = 1.
   runWorker('MARKERS_SET_CONTEXT', {
     codes: Uint16Array.from([0, 0, 0, 0, 1, 1, 1, 1]),
-    codeToGroupIndex: Int16Array.from([0, 1]),
+    codeToGroupIndex: Int32Array.from([0, 1]),
     groupCount: 2
   }, 'all-zero-context');
   const allZero = runWorker('MARKERS_COMPUTE_GENE', {
@@ -991,7 +878,7 @@ test('rank inference is invariant to the export quantisation it reads', async ()
   }
   runWorker('MARKERS_SET_CONTEXT', {
     codes: groupCodes,
-    codeToGroupIndex: Int16Array.from([0, 1]),
+    codeToGroupIndex: Int32Array.from([0, 1]),
     groupCount: 2
   }, 'quantisation-context');
 
@@ -1156,7 +1043,7 @@ test('the marker worker publishes probabilities and effects, never a test statis
 
   runWorker('MARKERS_SET_CONTEXT', {
     codes,
-    codeToGroupIndex: Int16Array.from([0, 1]),
+    codeToGroupIndex: Int32Array.from([0, 1]),
     groupCount: 2
   }, 'statistic-free-context');
   const result = runWorker('MARKERS_COMPUTE_GENE', {
@@ -1209,76 +1096,62 @@ test('the marker worker publishes probabilities and effects, never a test statis
   delete globalThis.self;
 });
 
-test('quick differential expression corrects over every gene it examined', async () => {
-  // Fifty genes are examined. One separates the pages; the other forty-nine are
-  // identical between them, so they carry no effect and are never listed - but
-  // they were tested, and they are part of the family.
-  const FAMILY_SIZE = 50;
-  const separated = { page1: [1, 2, 3, 4, 5, 6], page2: [4, 5, 6, 7, 8, 9] };
-  const identical = { page1: [1, 2, 3, 4, 5, 6], page2: [1, 2, 3, 4, 5, 6] };
-
-  const dataLayer = {
-    getAvailableVariables: () => Array.from(
-      { length: FAMILY_SIZE },
-      (_unused, index) => ({ key: `GENE_${index}`, name: `Gene ${index}` })
-    ),
-    async getDataForPages({ variableKey }) {
-      const source = variableKey === 'GENE_0' ? separated : identical;
-      return [{ values: source.page1 }, { values: source.page2 }];
-    }
+test('marker worker one-vs-rest Wilcoxon equals the shared two-sample kernel exactly', async () => {
+  // The worker tabulates every cell once per gene and ranks all groups from
+  // that one table. Each group's test is the two-sample test of the group
+  // against the rest of the pooled sample, so its p-value must be the very
+  // number the shared Mann-Whitney kernel gives for that split — on the
+  // tabulated (few distinct values) and the sorted (many) strategy alike.
+  const messages = [];
+  globalThis.self = { postMessage: message => messages.push(message) };
+  await import('../assets/js/app/analysis/compute/data-worker.js?shared-kernel-identity');
+  const runWorker = (type, payload, requestId) => {
+    globalThis.self.onmessage({ data: { type, payload, requestId } });
+    const message = messages.at(-1);
+    assert.equal(message.success, true, message.error);
+    return message.result;
   };
 
-  const quick = await computeQuickDifferentialExpression(
-    dataLayer,
-    'page-a',
-    'page-b',
-    FAMILY_SIZE
-  );
+  let seed = 12345;
+  const random = () => {
+    seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+    return seed / 4294967296;
+  };
+  const cellCount = 6000;
+  const groupCount = 5;
+  const codes = new Uint16Array(cellCount);
+  for (let i = 0; i < cellCount; i++) {
+    codes[i] = random() < 0.05 ? 65535 : Math.floor(random() * groupCount);
+  }
+  runWorker('MARKERS_SET_CONTEXT', {
+    codes,
+    codeToGroupIndex: Int32Array.from({ length: groupCount }, (_, g) => g),
+    groupCount
+  }, 'identity-context');
 
-  // The denominator is the family, not the reported subset.
-  assert.equal(quick.genesTested, FAMILY_SIZE);
-  assert.equal(quick.genesUntestable, 0);
-  assert.equal(quick.effectSizeThreshold, 0.2);
-
-  // Only the separated gene clears |Cohen's d| > 0.2, so only it is listed.
-  // Reporting is a selection; testing is not.
-  assert.deepEqual(quick.results.map(row => row.gene), ['GENE_0']);
-  const [row] = quick.results;
-
-  // scipy.stats.ttest_ind([1,2,3,4,5,6], [4,5,6,7,8,9], equal_var=False)
-  //   -> statistic=-2.7774602993176547, df=10.0, pvalue=0.019535605462663135
-  assertRelative(row.pValue, 0.019535605462663135, 1e-12);
-
-  // scipy.stats.false_discovery_control([0.019535605462663135] + [1.0] * 49,
-  //                                     method='bh')[0]
-  //   -> 0.9767802731331567
-  // Nominal 0.0195 reads as significant at 0.05; the FDR over the fifty genes
-  // that were actually examined is 0.977. Those are the two numbers the caller
-  // must be able to tell apart.
-  assertRelative(row.adjustedPValue, 0.9767802731331567, 1e-12);
-  assert.ok(row.pValue < 0.05);
-  assert.ok(row.adjustedPValue > 0.9);
-
-  // numpy: pooled sd = 1.8708286933869707, Cohen's d = -1.6035674514745464,
-  // log2(3.5 / 6.5) = -0.8930847960834881
-  assertRelative(row.effectSize, -1.6035674514745464, 1e-12);
-  assertRelative(row.effectSizeCiLow, -2.9043877055194063, 1e-12);
-  assertRelative(row.effectSizeCiHigh, -0.3027471974296867, 1e-12);
-  assertRelative(row.log2FC, -0.8930847960834881, 1e-12);
-  assert.equal(row.mean1, 3.5);
-  assert.equal(row.mean2, 6.5);
-
-  // An empty inventory still declares an empty family rather than nothing.
-  const empty = await computeQuickDifferentialExpression(
-    { getAvailableVariables: () => [], getDataForPages: async () => [] },
-    'page-a',
-    'page-b',
-    FAMILY_SIZE
-  );
-  assert.deepEqual(empty, {
-    genesTested: 0,
-    genesUntestable: 0,
-    effectSizeThreshold: 0.2,
-    results: []
-  });
+  for (const [label, draw] of [
+    ['quantized', () => (random() < 0.6 ? 0 : Math.fround(Math.floor(random() * 40) * 0.25))],
+    ['continuous', () => Math.fround(random() * 100)],
+  ]) {
+    const values = new Float32Array(cellCount);
+    for (let i = 0; i < cellCount; i++) values[i] = draw();
+    const result = runWorker('MARKERS_COMPUTE_GENE', {
+      values,
+      method: 'wilcox',
+      minCells: 2
+    }, `identity-${label}`);
+    for (let group = 0; group < groupCount; group++) {
+      const inGroup = [];
+      const rest = [];
+      for (let i = 0; i < cellCount; i++) {
+        if (codes[i] === 65535) continue;
+        (codes[i] === group ? inGroup : rest).push(values[i]);
+      }
+      const reference = coreMannWhitneyU(inGroup, rest);
+      assert.ok(
+        Object.is(result.pValues[group], reference.pValue),
+        `${label} group ${group}: ${result.pValues[group]} !== ${reference.pValue}`
+      );
+    }
+  }
 });

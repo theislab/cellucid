@@ -312,22 +312,42 @@ test('HTML declares the exact theme and background defaults before bootstrap', a
   const html = await readFile(INDEX_URL, 'utf8');
   assert.match(
     html,
-    /<html\s+lang="en"\s+data-theme="light"\s+data-viewer-background="grid">/,
+    /<html\s+lang="en"\s+data-theme="light"\s+data-viewer-background="studio">/,
   );
 });
 
-test('dark theme keeps the fixed dark wordmark on a light brand card', async () => {
-  const css = await readFile(SIDEBAR_CSS_URL, 'utf8');
+test('the wordmark follows the theme instead of pinning a light surface', async () => {
+  // The wordmark is grey-scale ink drawn for a light surface. Its two surfaces
+  // (the sidebar card and the welcome header) used to opt into the light theme,
+  // which left a white block in the dark sidebar. Now the surfaces follow the
+  // theme and the dark theme inverts the artwork itself.
+  const [html, css] = await Promise.all([
+    readFile(INDEX_URL, 'utf8'),
+    readFile(SIDEBAR_CSS_URL, 'utf8'),
+  ]);
+  const logos = [...html.matchAll(/<img\b[^>]*cellucid-logo\.svg[^>]*>/g)];
+  assert.ok(logos.length >= 2, 'the sidebar and the welcome dialog both show it');
+  for (const logo of logos) {
+    const before = html.slice(0, logo.index);
+    const stack = [];
+    for (const match of before.matchAll(/<(\/?)div\b([^>]*)>/g)) {
+      if (match[1] === '/') stack.pop();
+      else stack.push(match[2]);
+    }
+    assert.doesNotMatch(
+      stack.join(' '),
+      /\bdata-theme=/,
+      `no surface holding ${logo[0]} may pin a theme`,
+    );
+  }
   assert.match(
     css,
-    /\[data-theme="dark"\]\s+\.sidebar-brand\s*\{\s*background:\s*var\(--white\);\s*\}/,
+    /:root\[data-theme="dark"\] \.sidebar-logo,\s*:root\[data-theme="dark"\] \.welcome-logo \{\s*filter: invert\(1\) hue-rotate\(180deg\);/,
+    'the dark theme inverts both wordmarks',
   );
-  assert.match(
+  assert.doesNotMatch(
     css,
-    /\[data-theme="dark"\]\s+\.sidebar-brand-link:hover\s*\{\s*background:\s*var\(--gray-100\);\s*\}/,
-  );
-  assert.match(
-    css,
-    /\[data-theme="dark"\]\s+\.sidebar-brand-link:active\s*\{\s*background:\s*var\(--gray-200\);\s*\}/,
+    /\[data-theme="dark"\]\s+\.sidebar-brand/,
+    'no dark-only repaint of the brand card',
   );
 });

@@ -4,7 +4,9 @@
  * @module session/contributors/user-defined-codes
  */
 
+import { yieldToMacrotask } from '../../../utils/yield-macrotask.js';
 import { decodeUvarint, pushUvarint } from '../codecs/varint.js';
+import { computeAllLayoutCentroids } from '../../registries/user-defined-fields/centroids.js';
 import {
   assertArray,
   assertExactKeys,
@@ -18,6 +20,7 @@ import {
   USER_DEFINED_CODES_RESTORE_TRANSACTION_ID
 } from './user-defined-code-inventory.js';
 import { requireCategoryCodes } from '../../registries/user-defined-fields.js';
+import { isCategoricalCodes } from '../../../data/categorical-storage-contract.js';
 
 export const id = 'user-defined-codes';
 
@@ -25,6 +28,24 @@ const ENC_RAW_U8 = 0;
 const ENC_RAW_U16 = 1;
 const ENC_RLE_U8 = 2;
 const ENC_RLE_U16 = 3;
+const ENC_RAW_U32 = 4;
+const ENC_RLE_U32 = 5;
+
+/** Each code width's encodings, element size and largest value. */
+const CODE_WIDTHS = Object.freeze({
+  Uint8Array: Object.freeze({ raw: ENC_RAW_U8, rle: ENC_RLE_U8, bytes: 1, ArrayType: Uint8Array, maximum: 0xff }),
+  Uint16Array: Object.freeze({ raw: ENC_RAW_U16, rle: ENC_RLE_U16, bytes: 2, ArrayType: Uint16Array, maximum: 0xffff }),
+  Uint32Array: Object.freeze({ raw: ENC_RAW_U32, rle: ENC_RLE_U32, bytes: 4, ArrayType: Uint32Array, maximum: 0xffff_ffff }),
+});
+
+function codeWidthOfEncoding(encoding) {
+  for (const [codesType, width] of Object.entries(CODE_WIDTHS)) {
+    if (width.raw === encoding || width.rle === encoding) {
+      return { codesType, width, rle: width.rle === encoding };
+    }
+  }
+  return null;
+}
 const CHUNK_PREFIX = 'user-defined/codes/';
 const COOPERATIVE_DECODE_BUDGET = 64 * 1024;
 const CHUNK_META_KEYS = Object.freeze([
@@ -45,17 +66,6 @@ function throwIfAborted(signal) {
   }
 }
 
-function yieldToMacrotask() {
-  return new Promise(resolve => {
-    const channel = new MessageChannel();
-    channel.port1.onmessage = () => {
-      channel.port1.close();
-      channel.port2.close();
-      resolve();
-    };
-    channel.port2.postMessage(null);
-  });
-}
 
 function assertSignal(signal) {
   if (
@@ -74,26 +84,30 @@ function encodeRawCodes(codes) {
   if (codes instanceof Uint8Array) {
     return new Uint8Array(codes);
   }
-  const bytes = new Uint8Array(codes.length * 2);
+  const width = codes.BYTES_PER_ELEMENT;
+  const bytes = new Uint8Array(codes.length * width);
   const view = new DataView(bytes.buffer);
   for (let index = 0; index < codes.length; index++) {
-    view.setUint16(index * 2, codes[index], true);
+    if (width === 2) view.setUint16(index * 2, codes[index], true);
+    else view.setUint32(index * 4, codes[index], true);
   }
   return bytes;
 }
 
 function encodeCodesBinary(codes) {
-  if (!(codes instanceof Uint8Array) && !(codes instanceof Uint16Array)) {
-    throw new TypeError('User-defined codes must be Uint8Array or Uint16Array.');
+  if (!isCategoricalCodes(codes)) {
+    throw new TypeError('User-defined codes must be Uint8Array, Uint16Array or Uint32Array.');
   }
   const codesLength = assertSafeInteger(
     codes.length,
     'User-defined codes length',
     { maximum: 0xffff_ffff }
   );
-  const isU16 = codes instanceof Uint16Array;
+  const width = codes instanceof Uint8Array
+    ? CODE_WIDTHS.Uint8Array
+    : codes instanceof Uint16Array ? CODE_WIDTHS.Uint16Array : CODE_WIDTHS.Uint32Array;
 
-  const rawHeader = [isU16 ? ENC_RAW_U16 : ENC_RAW_U8];
+  const rawHeader = [width.raw];
   pushUvarint(codesLength, rawHeader);
   const rawBytes = encodeRawCodes(codes);
   const rawOut = new Uint8Array(rawHeader.length + rawBytes.byteLength);
@@ -122,7 +136,7 @@ function encodeCodesBinary(codes) {
     pushUvarint(run, rlePairsBytes);
   }
 
-  const rleHeader = [isU16 ? ENC_RLE_U16 : ENC_RLE_U8];
+  const rleHeader = [width.rle];
   pushUvarint(codesLength, rleHeader);
   pushUvarint(pairCount, rleHeader);
   const rleOut = new Uint8Array(rleHeader.length + rlePairsBytes.length);
@@ -153,10 +167,7 @@ async function decodeCodesBinary(bytes, options) {
     'User-defined codes expectedLength',
     { maximum: 0xffff_ffff }
   );
-  if (
-    options.expectedCodesType !== 'Uint8Array'
-    && options.expectedCodesType !== 'Uint16Array'
-  ) {
+  if (!Object.hasOwn(CODE_WIDTHS, options.expectedCodesType)) {
     throw new TypeError('User-defined codes expectedCodesType is unsupported.');
   }
 
@@ -171,12 +182,12 @@ async function decodeCodesBinary(bytes, options) {
     );
   }
 
-  const isU8 = encoding === ENC_RAW_U8 || encoding === ENC_RLE_U8;
-  const isU16 = encoding === ENC_RAW_U16 || encoding === ENC_RLE_U16;
-  if (!isU8 && !isU16) {
+  const decodedWidth = codeWidthOfEncoding(encoding);
+  if (decodedWidth === null) {
     throw new TypeError(`Invalid user-defined codes encoding type ${encoding}.`);
   }
-  const actualCodesType = isU8 ? 'Uint8Array' : 'Uint16Array';
+  const actualCodesType = decodedWidth.codesType;
+  const { ArrayType, bytes: elementBytes, maximum: maximumValue } = decodedWidth.width;
   if (actualCodesType !== options.expectedCodesType) {
     throw new TypeError(
       `User-defined codes encoding type ${actualCodesType} does not match field metadata ${options.expectedCodesType}.`
@@ -210,15 +221,17 @@ async function decodeCodesBinary(bytes, options) {
     return codes;
   }
 
-  if (encoding === ENC_RAW_U16) {
-    if (bytes.byteLength - offset !== length * 2) {
-      throw new Error('Invalid raw-u16 user-defined codes byte length or trailing bytes.');
+  if (encoding === ENC_RAW_U16 || encoding === ENC_RAW_U32) {
+    if (bytes.byteLength - offset !== length * elementBytes) {
+      throw new Error(`Invalid raw-u${elementBytes * 8} user-defined codes byte length or trailing bytes.`);
     }
-    const codes = new Uint16Array(length);
-    const view = new DataView(bytes.buffer, bytes.byteOffset + offset, length * 2);
+    const codes = new ArrayType(length);
+    const view = new DataView(bytes.buffer, bytes.byteOffset + offset, length * elementBytes);
     for (let index = 0; index < length; index++) {
       throwIfAborted(signal);
-      codes[index] = view.getUint16(index * 2, true);
+      codes[index] = elementBytes === 2
+        ? view.getUint16(index * 2, true)
+        : view.getUint32(index * 4, true);
       if (
         index + 1 < length
         && (index + 1) % COOPERATIVE_DECODE_BUDGET === 0
@@ -240,10 +253,9 @@ async function decodeCodesBinary(bytes, options) {
     throw new Error('Invalid user-defined RLE pair count.');
   }
 
-  const codes = isU8 ? new Uint8Array(length) : new Uint16Array(length);
+  const codes = new ArrayType(length);
   let decodedLength = 0;
   let previousValue = null;
-  const maximumValue = isU8 ? 0xff : 0xffff;
   let workSinceYield = 0;
   for (let pairIndex = 0; pairIndex < pairCount; pairIndex++) {
     throwIfAborted(signal);
@@ -357,7 +369,7 @@ export function capture(ctx) {
       `User-defined field "${fieldId}" key`
     );
     const codes = field.codes;
-    if (!(codes instanceof Uint8Array) && !(codes instanceof Uint16Array)) {
+    if (!isCategoricalCodes(codes)) {
       throw new TypeError(`User-defined field "${fieldId}" requires exact typed codes.`);
     }
     if (codes.length !== pointCount) {
@@ -542,13 +554,15 @@ export async function restore(ctx, chunkMeta, payload) {
   if (
     template._codesTypeHint !== 'Uint8Array'
     && template._codesTypeHint !== 'Uint16Array'
+    && template._codesTypeHint !== 'Uint32Array'
   ) {
     throw new TypeError(`User-defined field "${fieldId}" metadata code type is unsupported.`);
   }
-  assertPlainRecord(
-    template.centroidsByDim,
-    `User-defined field "${fieldId}" centroidsByDim`
-  );
+  if (!(template.centroidsByLayout instanceof Map)) {
+    throw new TypeError(
+      `User-defined field "${fieldId}" centroidsByLayout must be a Map.`
+    );
+  }
   const copies = collectInjectedFields(state, fieldId);
   const active = state.getActiveField();
   const isActive = (
@@ -564,6 +578,7 @@ export async function restore(ctx, chunkMeta, payload) {
       'updateColorsCategorical',
       'buildCentroidsForField',
       'getActiveViewId',
+      'getViewLayoutKey',
       '_pushColorsToViewer',
       '_pushCentroidsToViewer',
       'computeGlobalVisibility'
@@ -596,21 +611,34 @@ export async function restore(ctx, chunkMeta, payload) {
     `User-defined field "${fieldId}"`
   );
 
+  // A session stores codes, never centroids: compute them for every layout
+  // whose positions are resident, as a field built in this session has them.
+  const { centroidsByLayout, normalizedLayouts } = computeAllLayoutCentroids(
+    codes,
+    template.categories,
+    state
+  );
   template.codes = codes;
   template.loaded = true;
+  template.centroidsByLayout = centroidsByLayout;
+  template._normalizedLayouts = normalizedLayouts;
   delete template._codesLengthHint;
   delete template._codesTypeHint;
   for (const field of copies) {
     field.codes = codes;
     field.loaded = true;
-    field.centroidsByDim = template.centroidsByDim;
+    field.centroidsByLayout = template.centroidsByLayout;
+    field._normalizedLayouts = template._normalizedLayouts;
     delete field._codesLengthHint;
     delete field._codesTypeHint;
   }
 
   if (isActive) {
     state.updateColorsCategorical(active);
-    state.buildCentroidsForField(active, { viewId: state.getActiveViewId() });
+    state.buildCentroidsForField(active, {
+      viewId: state.getActiveViewId(),
+      layoutKey: state.getViewLayoutKey(state.getActiveViewId())
+    });
     state._pushColorsToViewer();
     state._pushCentroidsToViewer();
     state.computeGlobalVisibility();

@@ -1,9 +1,9 @@
 <!DOCTYPE html>
-<html lang="en" data-theme="light" data-viewer-background="grid">
+<html lang="en" data-theme="light" data-viewer-background="studio">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>cellucid - Interactive Single-Cell Data Visualization</title>
+  <title>Cellucid — Interactive Single-Cell Data Visualization</title>
 
   <!--
     CELLUCID_WEB_BUILD_ID
@@ -14,7 +14,13 @@
     Release validation owns this immutable value and changes it only together
     with the exact web-asset inventory after the complete build is accepted.
   -->
-  <meta name="cellucid-web-build-id" content="2026-07-27.24" />
+  <meta name="cellucid-web-build-id" content="2026-10-21.046a66a9" />
+  <!--
+    The release version the web app shares with the Python and R packages. A
+    deployment is still identified by the build id above; the version names
+    the release line the three ship together, and the footer prints both.
+  -->
+  <meta name="cellucid-version" content="0.9.4" /> <!-- CELLUCID_VERSION -->
 
   <!--
     CELLUCID_EXPORTS_BASE_URL
@@ -32,7 +38,7 @@
     Every sample artifact uses one direct HTTP request. Cross-origin sample
     hosts must publish the matching CORS response headers.
   -->
-  <meta name="cellucid-exports-base-url" content="https://theislab.github.io/cellucid-datasets/exports/" />
+  <meta name="cellucid-exports-base-url" content="https://theislab.github.io/cellucid-datasets/exports-v3/" />
 
 	  <!-- Security policy for the static application shell -->
 	  <!--
@@ -40,13 +46,14 @@
     The `sha256-...` in `script-src` allowlists the inline JSON-LD `<script type="application/ld+json">`
     block below (SEO structured data) without enabling `'unsafe-inline'`. `wasm-unsafe-eval` permits
     compilation of the bundled h5wasm module without granting general JavaScript `unsafe-eval`.
-    If you change that JSON, the hash must be regenerated or the browser will block the block.
+    If you change that JSON, regenerate the hash or the browser blocks the block;
+    tests/seo-head-contract.test.mjs recomputes it and fails while they disagree.
   -->
   <meta http-equiv="Content-Security-Policy" content="
     default-src 'self';
     base-uri 'none';
     object-src 'none';
-    script-src 'self' 'wasm-unsafe-eval' https://www.googletagmanager.com 'sha256-+9zlP/wQVfV23S04wl/L4pHtJlWnuGrS2YNU0z7yjJQ=';
+    script-src 'self' 'wasm-unsafe-eval' https://www.googletagmanager.com 'sha256-4y3wF9J5HFXyJveARnyuajDo7heTbmBXPU8rXS5xifQ=';
     style-src 'self' 'unsafe-inline';
     img-src 'self' data: https:;
     font-src 'self' data:;
@@ -56,64 +63,85 @@
   " />
 
   <!-- SEO Meta Tags -->
-  <meta name="description" content="Every cell tells a story. Navigate through millions of them, uncover hidden patterns, and see your data come alive." />
-  <meta name="keywords" content="single-cell, scRNA-seq, UMAP, visualization, WebGL, bioinformatics, gene expression, 3D visualization, cell atlas" />
+  <meta name="description" content="Interactive single-cell data visualization in your browser: explore millions of cells in 2D and 3D UMAP, from Scanpy/AnnData or Seurat. Free and open source." />
+  <meta name="keywords" content="single-cell, scRNA-seq, single-cell visualization, UMAP, 3D UMAP, AnnData, h5ad, Scanpy, Seurat, gene expression, cell atlas, WebGL, bioinformatics" />
   <meta name="author" content="Kemal Inecik" />
   <meta name="robots" content="index, follow" />
-  <link rel="canonical" href="https://www.cellucid.com" />
+  <link rel="canonical" href="https://www.cellucid.com/" />
 
-  <!-- Preconnect to external services for faster initial connection -->
-  <link rel="preconnect" href="https://theislab.github.io" crossorigin />
+  <!-- Preconnect to the sample-catalog origin, unless the page was told another one -->
+  <script src="assets/js/app/ui/core/preconnect-init.js"></script>
 
   <!-- Open Graph / Social Media -->
-  <meta property="og:title" content="cellucid - Interactive Single-Cell Data Visualization" />
-  <meta property="og:description" content="Every cell tells a story. Navigate through millions of them, uncover hidden patterns, and see your data come alive." />
+  <meta property="og:title" content="Cellucid — Interactive Single-Cell Data Visualization" />
+  <meta property="og:description" content="Interactive single-cell data visualization in your browser: explore millions of cells in 2D and 3D UMAP, from Scanpy/AnnData or Seurat. Free and open source." />
   <meta property="og:type" content="website" />
-  <meta property="og:url" content="https://www.cellucid.com" />
+  <meta property="og:site_name" content="Cellucid" />
+  <meta property="og:locale" content="en_US" />
+  <meta property="og:url" content="https://www.cellucid.com/" />
   <meta property="og:image" content="https://www.cellucid.com/assets/img/og-preview.jpg" />
   <meta property="og:image:width" content="1200" />
   <meta property="og:image:height" content="630" />
+  <meta property="og:image:type" content="image/jpeg" />
+  <meta property="og:image:alt" content="A 3D view of a single-cell atlas in Cellucid: thousands of cells drawn as spheres, colored by cell type, receding into depth." />
 
   <!-- Twitter Card -->
   <meta name="twitter:card" content="summary_large_image" />
-  <meta name="twitter:title" content="cellucid - Interactive Single-Cell Data Visualization" />
-  <meta name="twitter:description" content="Every cell tells a story. Navigate through millions of them, uncover hidden patterns, and see your data come alive." />
+  <meta name="twitter:title" content="Cellucid — Interactive Single-Cell Data Visualization" />
+  <meta name="twitter:description" content="Interactive single-cell data visualization in your browser: explore millions of cells in 2D and 3D UMAP, from Scanpy/AnnData or Seurat. Free and open source." />
   <meta name="twitter:image" content="https://www.cellucid.com/assets/img/og-preview.jpg" />
+  <meta name="twitter:image:alt" content="A 3D view of a single-cell atlas in Cellucid: thousands of cells drawn as spheres, colored by cell type, receding into depth." />
 
-	  <!-- Structured Data for Search Engines -->
-	  <script type="application/ld+json">{
-	    "@context": "https://schema.org",
-	    "@type": "WebApplication",
-	    "name": "cellucid",
-	    "description": "GPU-powered single-cell atlas viewer with real-time filtering, gene expression overlays, vector field animation, and collaborative community annotation.",
-	    "url": "https://www.cellucid.com",
-	    "image": "https://www.cellucid.com/assets/img/og-preview.jpg",
-	    "logo": "https://www.cellucid.com/assets/img/android-chrome-512x512.png",
-	    "applicationCategory": "Scientific Software",
-	    "operatingSystem": "Any (Web Browser)",
-	    "browserRequirements": "Requires WebGL2",
-	    "isAccessibleForFree": true,
-	    "offers": {
-	      "@type": "Offer",
-	      "price": "0",
-	      "priceCurrency": "USD"
-	    },
-	    "author": {
-	      "@type": "Person",
-	      "name": "Kemal Inecik",
-	      "url": "https://kemalinecik.com"
-	    },
-	    "featureList": [
-	      "Real-time rendering of millions of cells with adaptive level of detail (LOD)",
-	      "Gene expression overlays with efficient sparse matrix handling",
-	      "Categorical and continuous cell metadata coloring, filtering, and selection",
-	      "Multi-dimensional support (1D timelines, 2D, 3D embeddings)",
-	      "Animated vector field overlays (velocity / drift) with GPU particle flow",
-	      "KNN connectivity edge visualization",
-	      "Publication export: SVG (vector) + PNG (high-DPI)",
-	      "Collaborative community annotation voting with optional GitHub sync"
-	    ]
-	  }</script>
+  <!-- Structured Data for Search Engines -->
+  <script type="application/ld+json">{
+    "@context": "https://schema.org",
+    "@type": "WebApplication",
+    "name": "Cellucid",
+    "alternateName": "cellucid",
+    "description": "Free, open-source web app for interactive single-cell data visualization: millions of cells in 1D, 2D and 3D embeddings such as UMAP, gene expression and metadata coloring, filtering, RNA-velocity overlays, figure export and community annotation. Opens AnnData (.h5ad) files directly, and exports prepared with the Python package (Scanpy/AnnData) or the R package (Seurat, SingleCellExperiment).",
+    "url": "https://www.cellucid.com/",
+    "image": "https://www.cellucid.com/assets/img/og-preview.jpg",
+    "applicationCategory": "ScientificApplication",
+    "applicationSubCategory": "Single-cell data visualization",
+    "operatingSystem": "Web browser",
+    "softwareVersion": "0.9.4",
+    "browserRequirements": "Requires WebGL2",
+    "isAccessibleForFree": true,
+    "license": "https://opensource.org/licenses/BSD-3-Clause",
+    "inLanguage": "en",
+    "offers": {
+      "@type": "Offer",
+      "price": "0",
+      "priceCurrency": "USD"
+    },
+    "author": {
+      "@type": "Person",
+      "name": "Kemal Inecik",
+      "url": "https://kemalinecik.com"
+    },
+    "softwareHelp": {
+      "@type": "CreativeWork",
+      "url": "https://docs.cellucid.com/en/latest/"
+    },
+    "sameAs": [
+      "https://github.com/theislab/cellucid",
+      "https://docs.cellucid.com/en/latest/",
+      "https://pypi.org/project/cellucid/",
+      "https://github.com/theislab/cellucid-python",
+      "https://github.com/theislab/cellucid-r",
+      "https://theislab.github.io/cellucid-r/"
+    ],
+    "featureList": [
+      "Real-time rendering of millions of cells with adaptive level of detail (LOD)",
+      "1D, 2D and 3D embeddings such as UMAP, several per dataset",
+      "Gene expression overlays with efficient sparse matrix handling",
+      "Categorical and continuous cell metadata coloring, filtering, and selection",
+      "Animated vector field overlays (RNA velocity / drift) with GPU particle flow",
+      "KNN connectivity edge visualization",
+      "Publication export: SVG (vector) + PNG (high-DPI)",
+      "Collaborative community annotation voting with optional GitHub sync"
+    ]
+  }</script>
 
   <!-- Analytics is initialized only on the declared production hosts. -->
   <script src="assets/js/app/ui/core/ga-init.js"></script>
@@ -141,60 +169,79 @@
 
   <!-- Apply persisted theme early to avoid a flash when loading CSS -->
   <script src="assets/js/app/ui/core/theme-init.js"></script>
+  <!-- iOS only: stop the focus zoom into small field text (see the file). -->
+  <script src="assets/js/app/ui/core/viewport-init.js"></script>
+  <!-- Reports a module that failed to download, which the module graph cannot -->
+  <script src="assets/js/app/ui/core/code-load-watch.js"></script>
+  <!-- A file dropped anywhere on the page never makes the browser leave it -->
+  <script src="assets/js/app/ui/core/file-drop-guard.js"></script>
 
-  <!-- Fonts are now self-hosted in assets/fonts/ for better performance -->
+  <!-- The one self-hosted interface font: requested now rather than after the
+       CSS @import chain that declares it has been fetched and parsed. -->
+  <link rel="preload" href="assets/fonts/inter-latin.woff2" as="font" type="font/woff2" crossorigin />
   <link rel="stylesheet" href="assets/css/main.css" />
 </head>
 <body>
-	  <!-- SEO: Semantic content for search engines and screen readers (hidden visually) -->
-	  <main class="sr-only" aria-label="About cellucid">
-	    <h1>cellucid - Interactive Single-Cell Data Visualization</h1>
-	    <p>GPU-powered atlas viewer for single-cell data with fast rendering, real-time filtering, and collaborative annotation.</p>
-	    <h2>Key Features</h2>
-	    <ul>
-	      <li>Real-time rendering of millions of cells with adaptive level of detail (LOD)</li>
-	      <li>Gene expression overlays with efficient sparse matrix handling</li>
-	      <li>Categorical and continuous cell metadata coloring, filtering, and selection</li>
-	      <li>Multi-dimensional support (1D timelines, 2D, 3D embeddings)</li>
-	      <li>Animated vector field overlay (velocity / drift) with GPU particle flow</li>
-	      <li>Community annotation voting with optional GitHub sync</li>
-	      <li>Connectivity edge visualization (KNN graph)</li>
-	      <li>Publication export: SVG (vector) + PNG (high-DPI)</li>
-	    </ul>
-	    <h2>Data Sources</h2>
-	    <p>Load prepared exports, AnnData <code>.h5ad</code> files, or portable <code>.zarr.zip</code> archives directly in the browser, from a Python server, or from a Jupyter notebook.</p>
-	    <h2>Use Cases</h2>
-	    <p>Explore scRNA-seq atlases, query marker genes, compare embeddings, visualize trajectories, and build consensus community annotations.</p>
-	  </main>
+  <!-- What Cellucid is, for search engines and screen readers (hidden
+       visually; the app UI is the visible page). Its links are out of the Tab
+       order, so the plot stays the first Tab stop. -->
+  <main class="sr-only" aria-label="About Cellucid">
+    <h1>Cellucid — Interactive Single-Cell Data Visualization</h1>
+    <p>Cellucid is a free, open-source, GPU-accelerated web app for interactive single-cell data visualization. It shows millions of cells in your browser, in 1D, 2D and 3D embeddings such as UMAP, colored by gene expression or cell metadata.</p>
+    <h2>Key features</h2>
+    <ul>
+      <li>Real-time rendering of millions of cells with adaptive level of detail (LOD)</li>
+      <li>1D, 2D and 3D embeddings such as UMAP, several per dataset, side by side</li>
+      <li>Gene expression overlays with efficient sparse matrix handling</li>
+      <li>Categorical and continuous cell metadata coloring, filtering, and selection</li>
+      <li>Animated vector field overlays (RNA velocity / drift) with GPU particle flow</li>
+      <li>Connectivity edge visualization (KNN graph)</li>
+      <li>Publication export: SVG (vector) + PNG (high-DPI)</li>
+      <li>Community annotation voting with optional GitHub sync</li>
+    </ul>
+    <h2>Data sources</h2>
+    <p>Open an AnnData <code>.h5ad</code> file or a <code>.zarr.zip</code> archive directly in the browser, or prepare an export from Scanpy/AnnData with the <code>cellucid</code> Python package or from Seurat and SingleCellExperiment with the <code>cellucid</code> R package. Data can also be served from a Python server or a Jupyter notebook.</p>
+    <h2>Use cases</h2>
+    <p>Explore scRNA-seq atlases, query marker genes, compare embeddings, visualize trajectories, and build consensus community annotations.</p>
+    <h2>Learn more</h2>
+    <ul>
+      <li><a href="https://docs.cellucid.com/en/latest/" tabindex="-1">Cellucid documentation</a></li>
+      <li><a href="https://github.com/theislab/cellucid" tabindex="-1">Source code on GitHub</a></li>
+      <li><a href="https://docs.cellucid.com/en/latest/citing.html" tabindex="-1">Citing Cellucid</a></li>
+    </ul>
+  </main>
 
-	  <noscript>
-	    <div class="noscript-message">
-	      <h1>cellucid - Interactive Single-Cell Data Visualization</h1>
-	      <p>Cellucid requires JavaScript and WebGL2 to run. Please enable JavaScript in your browser to use this application.</p>
-	      <h2>About cellucid</h2>
-	      <p>GPU-powered atlas viewer for single-cell data with fast rendering, real-time filtering, and collaborative annotation.</p>
-	      <h3>Features</h3>
-	      <ul>
-	        <li>Real-time rendering of millions of cells with adaptive level of detail (LOD)</li>
-	        <li>Gene expression overlays</li>
-	        <li>Categorical and continuous cell metadata coloring, filtering, and selection</li>
-	        <li>Multi-dimensional support (1D timelines, 2D, 3D embeddings)</li>
-	        <li>Animated vector field overlays (velocity / drift)</li>
-	        <li>Community annotation voting with optional GitHub sync</li>
-	        <li>Connectivity edge visualization (KNN graph)</li>
-	        <li>Publication export: SVG (vector) + PNG (high-DPI)</li>
-	      </ul>
-	      <p>Created by <a href="https://kemalinecik.com">Kemal Inecik</a></p>
-	    </div>
-	  </noscript>
+  <noscript>
+    <div class="noscript-message">
+      <h1>Cellucid — Interactive Single-Cell Data Visualization</h1>
+      <p>Cellucid requires JavaScript and WebGL2 to run. Please enable JavaScript in your browser to use this application.</p>
+      <h2>About Cellucid</h2>
+      <p>Cellucid is a free, open-source, GPU-accelerated web app for interactive single-cell data visualization: millions of cells in 1D, 2D and 3D embeddings such as UMAP, from Scanpy/AnnData or Seurat.</p>
+      <h3>Features</h3>
+      <ul>
+        <li>Real-time rendering of millions of cells with adaptive level of detail (LOD)</li>
+        <li>Gene expression overlays</li>
+        <li>Categorical and continuous cell metadata coloring, filtering, and selection</li>
+        <li>Multi-dimensional support (1D timelines, 2D, 3D embeddings)</li>
+        <li>Animated vector field overlays (velocity / drift)</li>
+        <li>Community annotation voting with optional GitHub sync</li>
+        <li>Connectivity edge visualization (KNN graph)</li>
+        <li>Publication export: SVG (vector) + PNG (high-DPI)</li>
+      </ul>
+      <p><a href="https://docs.cellucid.com/en/latest/">Documentation</a> · <a href="https://github.com/theislab/cellucid">GitHub</a> · <a href="https://docs.cellucid.com/en/latest/citing.html">Cite</a></p>
+      <p>Created by <a href="https://kemalinecik.com">Kemal Inecik</a></p>
+    </div>
+  </noscript>
 
   <!-- Welcome Modal (ordinary catalog startup only; hidden until exact startup intent is resolved) -->
-  <div id="welcome-modal" class="welcome-modal hidden" role="dialog" aria-modal="true" aria-labelledby="welcome-title">
+  <div id="welcome-modal" class="welcome-modal hidden" role="dialog" aria-modal="true" aria-labelledby="welcome-title" tabindex="-1">
     <div class="welcome-backdrop"></div>
     <div class="welcome-content">
+      <!-- The wordmark is fixed dark ink, so every surface it sits on stays in
+           the light theme whatever theme the page is in. -->
       <div class="welcome-header">
         <img src="assets/img/cellucid-logo.svg" alt="cellucid" class="welcome-logo" />
-        <h2 id="welcome-title" class="welcome-tagline">Interactive Single-Cell Visualization</h2>
+        <h2 id="welcome-title" class="welcome-tagline">Interactive single-cell visualization</h2>
       </div>
 
       <div class="welcome-body">
@@ -204,15 +251,15 @@
           <button type="button" class="welcome-btn welcome-btn-primary" id="welcome-demo-btn">
             <span class="welcome-btn-icon">◈</span>
             <span class="welcome-btn-text">
-              <span class="welcome-btn-title">Choose a Dataset</span>
+              <span class="welcome-btn-title">Choose a dataset</span>
               <span class="welcome-btn-desc">Open the data controls</span>
             </span>
           </button>
 
-          <a href="https://cellucid.readthedocs.io" target="_blank" rel="noopener noreferrer" class="welcome-btn welcome-btn-link">
+          <a href="https://docs.cellucid.com/en/latest/" target="_blank" rel="noopener noreferrer" class="welcome-btn welcome-btn-link">
             <span class="welcome-btn-icon">→</span>
             <span class="welcome-btn-text">
-              <span class="welcome-btn-title">Learn More</span>
+              <span class="welcome-btn-title">Learn more</span>
               <span class="welcome-btn-desc">Guides and documentation</span>
             </span>
           </a>
@@ -226,6 +273,74 @@
       </div>
     </div>
   </div>
+
+  <!-- Cite Cellucid: filled at runtime from the deployed CITATION.cff
+       (assets/js/app/ui/modules/cite-dialog.js). -->
+  <dialog id="cite-dialog" class="app-dialog" aria-labelledby="cite-dialog-title">
+    <div class="app-dialog-header">
+      <div class="app-dialog-title-row">
+        <h2 id="cite-dialog-title">Cite Cellucid</h2>
+        <button type="button" id="cite-info-btn" class="info-btn" aria-label="About citing Cellucid" aria-controls="cite-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
+      </div>
+      <button type="button" class="app-dialog-close" data-dialog-close aria-label="Close">&times;</button>
+    </div>
+    <div id="cite-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="cite-info-btn" tabindex="-1" data-info-tip="cite" hidden></div>
+    <div class="app-dialog-body">
+      <p class="cite-placeholder" id="cite-placeholder" hidden></p>
+      <p class="cite-reference" id="cite-reference" aria-live="polite">Loading…</p>
+      <pre class="cite-bibtex" tabindex="0" aria-label="BibTeX" hidden><code id="cite-bibtex"></code></pre>
+      <div class="app-dialog-actions">
+        <button type="button" class="btn btn-compact" id="cite-copy-reference" disabled>Copy reference</button>
+        <button type="button" class="btn btn-compact" id="cite-copy-bibtex" disabled>Copy BibTeX</button>
+      </div>
+    </div>
+  </dialog>
+
+  <!-- Share this dataset: a link, an "Open in Cellucid" badge and an embed
+       snippet for a dataset that a URL can reopen
+       (assets/js/app/ui/modules/share-dialog.js). -->
+  <dialog id="share-dialog" class="app-dialog" aria-labelledby="share-dialog-title">
+    <div class="app-dialog-header">
+      <h2 id="share-dialog-title">Share this dataset</h2>
+      <button type="button" class="app-dialog-close" data-dialog-close aria-label="Close">&times;</button>
+    </div>
+    <div class="app-dialog-body">
+      <div class="share-item">
+        <div class="field-label-row">
+          <label for="share-link">Link</label>
+          <button type="button" id="share-link-info-btn" class="info-btn" aria-label="About the share link" aria-controls="share-link-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
+        </div>
+        <div id="share-link-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="share-link-info-btn" tabindex="-1" data-info-tip="share-link" hidden></div>
+        <div class="share-row">
+          <input type="text" id="share-link" class="obs-select" readonly />
+          <button type="button" class="btn btn-compact" data-copy-from="share-link">Copy</button>
+        </div>
+      </div>
+      <div class="share-item">
+        <div class="field-label-row">
+          <label for="share-badge">Badge</label>
+          <button type="button" id="share-badge-info-btn" class="info-btn" aria-label="About the badge" aria-controls="share-badge-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
+          <img class="share-badge-preview" src="assets/img/open-in-cellucid.svg" alt="Open in Cellucid" width="130" height="20" />
+        </div>
+        <div id="share-badge-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="share-badge-info-btn" tabindex="-1" data-info-tip="share-badge" hidden></div>
+        <div class="share-row">
+          <textarea id="share-badge" class="obs-select" rows="2" readonly></textarea>
+          <button type="button" class="btn btn-compact" data-copy-from="share-badge">Copy</button>
+        </div>
+      </div>
+      <div class="share-item">
+        <div class="field-label-row">
+          <label for="share-embed">Embed</label>
+          <button type="button" id="share-embed-info-btn" class="info-btn" aria-label="About embedding" aria-controls="share-embed-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
+        </div>
+        <div id="share-embed-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="share-embed-info-btn" tabindex="-1" data-info-tip="share-embed" hidden></div>
+        <div class="share-row">
+          <textarea id="share-embed" class="obs-select" rows="3" readonly></textarea>
+          <button type="button" class="btn btn-compact" data-copy-from="share-embed">Copy</button>
+        </div>
+      </div>
+    </div>
+  </dialog>
 
   <!-- License Modal -->
   <div id="license-modal" class="license-modal hidden" role="dialog" aria-modal="true" aria-labelledby="license-title">
@@ -281,6 +396,47 @@
   <!-- Sidebar toggle button -->
   <button id="sidebar-toggle" class="sidebar-open" title="Toggle sidebar">✕</button>
 
+  <!-- The selection bar: Select mode's controls on the plot itself, so a
+       selection can be made, combined, confirmed, discarded and cleared
+       without the menu, which covers the whole screen on a phone. Every
+       control here is a second surface of one in the Highlighting panel and
+       runs the same code: the switch and the combine buttons are wired with the
+       panel's (mode-ui.js), the step row mirrors the active tool's step
+       controls and presses them (step-controls.js), and the count and Clear
+       are drawn and handled with the panel's (highlight-summary-ui.js).
+       Rows top to bottom: what is being selected now (or how to start), the
+       last gesture's outcome, what is saved on this page, and the switch with
+       its combine choice. Touch screens always show it (only the switch while
+       Select mode is off); a mouse shows it while Select mode is on. -->
+  <section id="select-bar" class="select-bar" aria-label="Selection">
+    <div class="select-bar-card">
+      <div class="select-bar-row select-bar-steps" id="select-bar-steps" data-tool="" hidden>
+        <span class="select-bar-status" id="select-bar-selection" aria-live="polite"></span>
+        <div class="select-bar-actions">
+          <button type="button" class="btn btn-compact btn-undo" id="select-bar-undo" data-step-action="undo" aria-label="Undo last selection step" title="Undo last selection step">↩</button>
+          <button type="button" class="btn btn-compact lasso-cancel" id="select-bar-cancel" data-step-action="cancel" aria-keyshortcuts="Escape" title="Discard this selection (Esc)">Cancel</button>
+          <button type="button" class="btn btn-compact btn-primary lasso-confirm" id="select-bar-confirm" data-step-action="confirm" title="Save this selection to the active highlight page">Confirm</button>
+        </div>
+      </div>
+      <p class="select-bar-row select-bar-hint" id="select-bar-hint"></p>
+      <p class="select-bar-notice" id="select-bar-notice" aria-live="polite" hidden></p>
+      <div class="select-bar-row select-bar-page" id="select-bar-page">
+        <span class="select-bar-status" id="select-bar-count">No cells highlighted</span>
+        <button type="button" class="btn btn-compact" id="select-bar-clear" aria-label="Clear highlights on this page" title="Clear highlights on this page" hidden>Clear</button>
+      </div>
+      <div class="select-bar-row select-bar-controls">
+        <button type="button" role="switch" class="switch" id="select-bar-mode" data-select-mode-switch aria-checked="false"><span class="switch-track" aria-hidden="true"></span><span class="switch-label">Select mode</span></button>
+        <div class="select-combine" id="select-bar-combine" role="group" aria-label="How each selection gesture combines" hidden>
+          <div class="segmented">
+            <button type="button" class="segmented-btn" id="select-bar-combine-intersect" data-combine="intersect" aria-pressed="true">Intersect</button>
+            <button type="button" class="segmented-btn" id="select-bar-combine-union" data-combine="union" aria-pressed="false">Add</button>
+            <button type="button" class="segmented-btn" id="select-bar-combine-subtract" data-combine="subtract" aria-pressed="false">Subtract</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
 		  <div id="sidebar">
 		    <div id="sidebar-resize-handle" title="Drag to resize"></div>
 		    <div class="sidebar-scroll">
@@ -294,310 +450,264 @@
       <details class="accordion-section" id="session-section" open>
         <summary>Session</summary>
         <div class="accordion-content">
-          <!-- Dataset info display -->
-          <div id="dataset-info" class="dataset-info">
-            <div class="dataset-info-row">
-              <span class="dataset-info-label">Dataset</span>
-              <span id="dataset-name" class="dataset-info-value">–</span>
+          <div class="control-block" id="dataset-facts" role="group" aria-labelledby="dataset-facts-title">
+            <div class="control-group-header">
+              <h3 class="section-title" id="dataset-facts-title">Dataset</h3>
+              <button type="button" id="dataset-facts-info-btn" class="info-btn" aria-label="About the dataset" aria-controls="dataset-facts-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
+              <button type="button" id="share-dataset-btn" class="btn btn-compact control-group-action" aria-haspopup="dialog" hidden>Share</button>
             </div>
-            <div class="dataset-info-row">
-              <span class="dataset-info-label">Description</span>
-              <span id="dataset-description" class="dataset-info-value dataset-info-ellipsis" title="—">—</span>
-            </div>
-            <div class="dataset-info-row">
-              <span class="dataset-info-label">Source</span>
-              <span id="dataset-source" class="dataset-info-value">–</span>
-            </div>
-            <div class="dataset-info-row">
-              <span class="dataset-info-label">URL</span>
-              <span id="dataset-url" class="dataset-info-value dataset-info-ellipsis" title="—">—</span>
-            </div>
-            <div class="dataset-info-row">
-              <span class="dataset-info-label">Cells</span>
-              <span id="dataset-cells" class="dataset-info-value">–</span>
-            </div>
-            <div class="dataset-info-row">
-              <span class="dataset-info-label">Genes</span>
-              <span id="dataset-genes" class="dataset-info-value">–</span>
-            </div>
-            <div class="dataset-info-row">
-              <span class="dataset-info-label">Obs fields</span>
-              <span id="dataset-obs" class="dataset-info-value">–</span>
-            </div>
-            <div class="dataset-info-row">
-              <span class="dataset-info-label">Connectivity</span>
-              <span id="dataset-connectivity" class="dataset-info-value">–</span>
+            <div id="dataset-facts-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="dataset-facts-info-btn" tabindex="-1" data-info-tip="dataset" hidden></div>
+            <div id="dataset-info" class="control-box dataset-info">
+              <div class="dataset-info-row">
+                <span class="dataset-info-label">Name</span>
+                <span id="dataset-name" class="dataset-info-value">–</span>
+              </div>
+              <div class="dataset-info-row">
+                <span class="dataset-info-label">Description</span>
+                <span id="dataset-description" class="dataset-info-value dataset-info-ellipsis" title="—">—</span>
+              </div>
+              <div class="dataset-info-row">
+                <span class="dataset-info-label">Source</span>
+                <span id="dataset-source" class="dataset-info-value">–</span>
+              </div>
+              <div class="dataset-info-row">
+                <span class="dataset-info-label">URL</span>
+                <span id="dataset-url" class="dataset-info-value dataset-info-ellipsis" title="—">—</span>
+              </div>
+              <div class="dataset-info-row">
+                <span class="dataset-info-label">Cells</span>
+                <span id="dataset-cells" class="dataset-info-value">–</span>
+              </div>
+              <div class="dataset-info-row">
+                <span class="dataset-info-label">Genes</span>
+                <span id="dataset-genes" class="dataset-info-value">–</span>
+              </div>
+              <div class="dataset-info-row">
+                <span class="dataset-info-label">Obs fields</span>
+                <span id="dataset-obs" class="dataset-info-value">–</span>
+              </div>
+              <div class="dataset-info-row">
+                <span class="dataset-info-label">Connectivity</span>
+                <span id="dataset-connectivity" class="dataset-info-value">–</span>
+              </div>
             </div>
           </div>
-
-          <!-- Dataset Selector -->
-	          <div class="control-block" data-state-serializer-skip="true">
-	            <label for="dataset-select">Sample datasets:</label>
-	            <select id="dataset-select" class="obs-select" disabled aria-describedby="data-source-status">
-	              <option value="" disabled selected>Loading...</option>
-	            </select>
-	          </div>
 
           <!--
-            Every data-source control below ships disabled: the listeners that
-            act on them are attached by initUI(), which does not run until the
-            first dataset has loaded. Until then a click would be discarded
-            without a request or a message, so the controls say plainly that
-            they are not ready yet. ui-coordinator.js admits them, and rewrites
-            this live region, the moment those listeners exist.
+            Every data-source control below ships disabled: the listeners that act on
+            them are attached by initUI(), which runs once startup has read its health
+            endpoint and dataset catalog. Until then a click would be discarded without
+            a request or a message, so the controls say plainly that they are not ready
+            yet. ui-coordinator.js admits them, and rewrites this live region, the
+            moment those listeners exist. The startup dataset loads only after that,
+            so a choice made here while it loads replaces it.
           -->
-          <p id="data-source-status" class="dataset-info loading" role="status" aria-live="polite">Starting Cellucid — the data controls below open as soon as it is ready.</p>
-
-          <!-- Local data selectors -->
-	          <div class="control-block mt-1 relative" id="user-data-block" data-state-serializer-skip="true">
-            <div class="d-flex items-center gap-1">
-              <label>Local data:</label>
-              <button
-                type="button"
-                id="user-data-info-btn"
-                class="info-btn"
-                aria-label="About local data loading"
-                aria-controls="user-data-info-tooltip"
-                aria-haspopup="dialog"
-                aria-expanded="false"
-              ><span aria-hidden="true">i</span></button>
+          <div class="control-block" id="open-data-controls" role="group" aria-labelledby="open-data-title">
+            <div class="control-group-header">
+              <h3 class="section-title" id="open-data-title">Open data</h3>
+              <button type="button" id="open-data-info-btn" class="info-btn" aria-label="About opening data" aria-controls="open-data-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
             </div>
-            <div
-              id="user-data-info-tooltip"
-              class="info-tooltip"
-              role="dialog"
-              aria-labelledby="user-data-info-btn"
-              tabindex="-1"
-              hidden
-            >
-              <div class="info-tooltip-content">
-                <div class="info-step">H5AD: Load .h5ad files directly in browser</div>
-                <div class="info-step">Zarr ZIP: Load a <code>.zarr.zip</code> or <code>.zip</code> archive in Safari, Chrome, Edge, or Firefox</div>
-                <div class="info-step">Prepared: Load optimized data via <span class="info-cmd">cellucid prepare</span></div>
-                <div class="info-step">Docs: <a href="https://cellucid.readthedocs.io" target="_blank" rel="noopener noreferrer" class="info-cmd">cellucid.readthedocs.io</a></div>
+            <div id="open-data-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="open-data-info-btn" tabindex="-1" data-info-tip="open-data" hidden></div>
+            <p id="data-source-status" class="control-box dataset-info loading" role="status" aria-live="polite">Starting Cellucid — the data controls below open as soon as it is ready.</p>
+            <div class="control-block" data-state-serializer-skip="true">
+              <label for="dataset-select">Sample dataset</label>
+              <select id="dataset-select" class="obs-select" disabled aria-describedby="data-source-status">
+                <option value="" disabled selected>Loading…</option>
+              </select>
+            </div>
+            <div class="control-block relative" id="user-data-block" data-state-serializer-skip="true" role="group" aria-labelledby="user-data-title">
+              <div class="field-label-row">
+                <span class="field-label" id="user-data-title">Files</span>
+                <button type="button" id="user-data-info-btn" class="info-btn" aria-label="About opening files" aria-controls="user-data-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
               </div>
+              <div id="user-data-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="user-data-info-btn" tabindex="-1" data-info-tip="local-files" hidden></div>
+              <div class="user-data-grid">
+                <button type="button" id="user-data-h5ad-btn" class="btn data-btn" title="Load single .h5ad file" disabled aria-describedby="data-source-status">H5AD</button>
+                <button type="button" id="user-data-zarr-archive-btn" class="btn data-btn" title="Load a portable Zarr ZIP archive in any supported browser" disabled aria-describedby="data-source-status">Zarr ZIP</button>
+                <button type="button" id="user-data-browse-btn" class="btn data-btn data-btn-wide" title="Load prepared directory" disabled aria-describedby="data-source-status">Prepared</button>
+                <!-- Hidden file inputs -->
+                <input type="file" id="user-data-file-input" class="file-input-hidden" webkitdirectory directory multiple disabled />
+                <input type="file" id="user-data-h5ad-input" class="file-input-hidden" accept=".h5ad" disabled />
+                <input type="file" id="user-data-zarr-archive-input" class="file-input-hidden" accept=".zarr.zip,.zip,application/zip" disabled />
+              </div>
+
             </div>
-            <div class="user-data-grid">
-              <button id="user-data-h5ad-btn" class="reset-btn data-btn" title="Load single .h5ad file" disabled aria-describedby="data-source-status">H5AD</button>
-              <button id="user-data-zarr-archive-btn" class="reset-btn data-btn" title="Load a portable Zarr ZIP archive in any supported browser" disabled aria-describedby="data-source-status">Zarr ZIP</button>
-              <button id="user-data-browse-btn" class="reset-btn data-btn data-btn-wide" title="Load prepared directory" disabled aria-describedby="data-source-status">Prepared</button>
-              <!-- Hidden file inputs -->
-              <input type="file" id="user-data-file-input" class="file-input-hidden" webkitdirectory directory multiple disabled />
-              <input type="file" id="user-data-h5ad-input" class="file-input-hidden" accept=".h5ad" disabled />
-              <input type="file" id="user-data-zarr-archive-input" class="file-input-hidden" accept=".zarr.zip,.zip,application/zip" disabled />
+            <div class="control-block relative" id="remote-server-block" data-state-serializer-skip="true">
+              <div class="field-label-row">
+                <label for="remote-server-url" id="remote-title">Server</label>
+                <button type="button" id="remote-info-btn" class="info-btn" aria-label="About server connections" aria-controls="remote-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
+              </div>
+              <div id="remote-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="remote-info-btn" tabindex="-1" data-info-tip="remote-server" hidden></div>
+              <div class="user-data-row">
+                <input type="text" id="remote-server-url" class="obs-select" aria-labelledby="remote-title"
+                       placeholder="http://localhost:8765" disabled
+                       aria-describedby="data-source-status" />
+                <button type="button" id="remote-connect-btn" class="btn" disabled aria-describedby="data-source-status">Connect</button>
+              </div>
+              <div id="remote-disconnect-container" class="user-data-row" hidden>
+                <button type="button" id="remote-disconnect-btn" class="btn" disabled aria-describedby="data-source-status">Disconnect</button>
+              </div>
+
+            </div>
+            <div class="control-block relative" id="github-repo-block" data-state-serializer-skip="true">
+              <div class="field-label-row">
+                <label for="github-repo-url" id="github-title">GitHub</label>
+                <button type="button" id="github-info-btn" class="info-btn" aria-label="About GitHub data" aria-controls="github-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
+              </div>
+              <div id="github-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="github-info-btn" tabindex="-1" data-info-tip="github-data" hidden></div>
+              <div class="user-data-row">
+                <input type="text" id="github-repo-url" class="obs-select" aria-labelledby="github-title"
+                       placeholder="owner/repo/path/to/exports" disabled
+                       aria-describedby="data-source-status" />
+                <button type="button" id="github-connect-btn" class="btn" disabled aria-describedby="data-source-status">Connect</button>
+              </div>
+              <div id="github-disconnect-container" class="user-data-row" hidden>
+                <button type="button" id="github-disconnect-btn" class="btn" disabled aria-describedby="data-source-status">Disconnect</button>
+              </div>
+
             </div>
           </div>
 
-          <!-- Remote server connection -->
-	          <div class="control-block mt-0-5 relative" id="remote-server-block" data-state-serializer-skip="true">
-            <div class="d-flex items-center gap-1">
-              <label>Remote server:</label>
-              <button
-                type="button"
-                id="remote-info-btn"
-                class="info-btn"
-                aria-label="About remote server loading"
-                aria-controls="remote-info-tooltip"
-                aria-haspopup="dialog"
-                aria-expanded="false"
-              ><span aria-hidden="true">i</span></button>
+          <div class="control-block" id="session-state-controls" role="group" aria-labelledby="session-state-title">
+            <div class="control-group-header">
+              <h3 class="section-title" id="session-state-title">Session file</h3>
+              <button type="button" id="session-state-info-btn" class="info-btn" aria-label="About session files" aria-controls="session-state-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
             </div>
-            <div
-              id="remote-info-tooltip"
-              class="info-tooltip"
-              role="dialog"
-              aria-labelledby="remote-info-btn"
-              tabindex="-1"
-              hidden
-            >
-              <div class="info-tooltip-content">
-                <div class="info-step">Stream data from a local or remote server.</div>
-                <div class="info-step">Local: <span class="info-cmd">cellucid serve /path/to/data</span></div>
-                <div class="info-step">AnnData: <span class="info-cmd">cellucid serve file.h5ad</span></div>
-                <div class="info-step">Remote: <span class="info-cmd">ssh -L 8765:localhost:8765 user@host</span></div>
-              </div>
-            </div>
-            <div class="user-data-row">
-              <input type="text" id="remote-server-url" class="user-data-path"
-                     placeholder="http://localhost:8765" disabled
-                     aria-describedby="data-source-status" />
-              <button id="remote-connect-btn" class="reset-btn" disabled aria-describedby="data-source-status">Connect</button>
-            </div>
-            <div id="remote-disconnect-container" class="user-data-row mt-1">
-              <button id="remote-disconnect-btn" class="reset-btn" disabled aria-describedby="data-source-status">Disconnect</button>
+            <div id="session-state-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="session-state-info-btn" tabindex="-1" data-info-tip="session-file" hidden></div>
+            <div class="d-flex gap-2">
+              <button type="button" id="save-state-btn" class="btn flex-1">Save</button>
+              <button type="button" id="load-state-btn" class="btn flex-1">Load</button>
             </div>
           </div>
 
-          <!-- GitHub repository data loading -->
-	          <div class="control-block mt-0-5 relative" id="github-repo-block" data-state-serializer-skip="true">
-            <div class="d-flex items-center gap-1">
-              <label>GitHub data:</label>
-              <button
-                type="button"
-                id="github-info-btn"
-                class="info-btn"
-                aria-label="About GitHub data loading"
-                aria-controls="github-info-tooltip"
-                aria-haspopup="dialog"
-                aria-expanded="false"
-              ><span aria-hidden="true">i</span></button>
+          <div class="control-block" id="data-mapping-controls" role="group" aria-labelledby="data-mapping-title">
+            <div class="control-group-header">
+              <h3 class="section-title" id="data-mapping-title">Data mapping</h3>
+              <button type="button" id="data-mapping-info-btn" class="info-btn" aria-label="About the data mapping" aria-controls="data-mapping-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
             </div>
-            <div
-              id="github-info-tooltip"
-              class="info-tooltip"
-              role="dialog"
-              aria-labelledby="github-info-btn"
-              tabindex="-1"
-              hidden
-            >
-              <div class="info-tooltip-content">
-                <div class="info-step">Load prepared data from a public GitHub repository.</div>
-                <div class="info-step">Format: <span class="info-cmd">owner/repo/path/to/data</span></div>
-              </div>
-            </div>
-            <div class="user-data-row">
-              <input type="text" id="github-repo-url" class="user-data-path"
-                     placeholder="owner/repo/path/to/exports" disabled
-                     aria-describedby="data-source-status" />
-              <button id="github-connect-btn" class="reset-btn" disabled aria-describedby="data-source-status">Connect</button>
-            </div>
-            <div id="github-disconnect-container" class="user-data-row mt-1">
-              <button id="github-disconnect-btn" class="reset-btn" disabled aria-describedby="data-source-status">Disconnect</button>
-            </div>
-          </div>
-
-          <!-- Session state save/load -->
-          <div class="control-block mt-0" id="session-state-controls">
-            <div class="d-flex items-center gap-1">
-              <label>Session state:</label>
-              <button
-                type="button"
-                id="session-state-info-btn"
-                class="info-btn"
-                aria-label="About session state"
-                aria-controls="session-state-info-tooltip"
-                aria-haspopup="dialog"
-                aria-expanded="false"
-              ><span aria-hidden="true">i</span></button>
-            </div>
-            <div
-              id="session-state-info-tooltip"
-              class="info-tooltip"
-              role="dialog"
-              aria-labelledby="session-state-info-btn"
-              tabindex="-1"
-              hidden
-            >
-              <div class="info-tooltip-content">
-                Save or load camera, filters, highlights, and visualization settings.
-              </div>
-            </div>
-            <div class="control-block d-flex gap-2">
-              <button id="save-state-btn" class="reset-btn flex-1">Save State</button>
-              <button id="load-state-btn" class="reset-btn flex-1">Load State</button>
-            </div>
+            <div id="data-mapping-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="data-mapping-info-btn" tabindex="-1" data-info-tip="data-mapping" hidden></div>
+            <!-- Built by ui/modules/data-mapping-controls.js. The mapping is saved
+                 in the session's dataset fingerprint, not as UI controls. -->
+            <div id="data-mapping-root" data-state-serializer-skip="true"></div>
           </div>
         </div>
       </details>
 
-      <details class="accordion-section" id="visualization-section" open>
+      <details class="accordion-section" id="visualization-section">
         <summary>Visualization</summary>
         <div class="accordion-content">
-          <!-- Theme -->
-          <div class="control-block" id="theme-controls">
-            <label for="theme-select">Theme:</label>
-            <select id="theme-select" class="obs-select">
-              <option value="light" selected>Light</option>
-              <option value="dark">Dark</option>
-            </select>
-          </div>
-
-          <!-- Background -->
-          <div class="control-block">
-            <label for="background-select">Background:</label>
-            <select id="background-select">
-              <option value="white">White</option>
-              <option value="grid" selected>Grid (light)</option>
-              <option value="grid-dark">Grid (dark)</option>
-              <option value="black">Black</option>
-            </select>
-          </div>
-
-          <!--
-            Render mode. The maturity tag is shown only while the mode it
-            describes is the selected one, so it reads as a property of that
-            option rather than of the control. The option text carries the same
-            word, because that is the only place a native <option> can carry it
-            and it has to be visible before the mode is chosen.
-          -->
-          <div class="control-block">
-            <div class="d-flex items-center gap-1">
-              <label for="render-mode">Render mode:</label>
-              <span
-                id="render-mode-maturity-tag"
-                class="maturity-tag"
-                title="Volumetric smoke cloud is in alpha: it is still changing, it is slower than points, and figure export cannot reproduce it."
-                hidden
-              >Alpha</span>
+          <div class="control-block" id="display-controls" role="group" aria-labelledby="display-title">
+            <div class="control-group-header">
+              <h3 class="section-title" id="display-title">Display</h3>
+              <button type="button" id="display-info-btn" class="info-btn" aria-label="About display settings" aria-controls="display-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
             </div>
-            <select id="render-mode" class="obs-select">
-              <option value="points">Points</option>
-              <option value="smoke">Volumetric smoke cloud (alpha)</option>
-            </select>
-          </div>
-
-          <!-- Depth Perception controls -->
-          <div class="control-block" id="depth-controls">
-            <div class="d-flex items-center gap-1">
-              <label>Depth perception:</label>
-              <button
-                type="button"
-                id="depth-perception-info-btn"
-                class="info-btn"
-                aria-label="About depth perception"
-                aria-controls="depth-perception-info-tooltip"
-                aria-haspopup="dialog"
-                aria-expanded="false"
-              ><span aria-hidden="true">i</span></button>
-            </div>
-            <div
-              id="depth-perception-info-tooltip"
-              class="info-tooltip"
-              role="dialog"
-              aria-labelledby="depth-perception-info-btn"
-              tabindex="-1"
-              hidden
-            >
-              <div class="info-tooltip-content">
-                Lighting, fog, and perspective scaling provide spatial cues in 3D.
-              </div>
+            <div id="display-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="display-info-btn" tabindex="-1" data-info-tip="display" hidden></div>
+            <div class="control-block" id="theme-controls">
+              <label for="theme-select">Theme</label>
+              <select id="theme-select" class="obs-select">
+                <option value="light" selected>Light</option>
+                <option value="dark">Dark</option>
+              </select>
             </div>
             <div class="control-block">
-              <label for="point-size">Point size (log):</label>
-              <div class="slider-row">
-                <input id="point-size" type="range" min="-24" max="100" step="0.5" value="16.5" />
-                <span id="point-size-display" class="slider-value">0.75</span>
+              <label for="background-select">Background</label>
+              <select id="background-select" class="obs-select">
+                <optgroup label="Light">
+                  <option value="white">White</option>
+                  <option value="grid">Grid (light)</option>
+                  <option value="studio" selected>Studio (light)</option>
+                  <option value="atelier">Atelier (light)</option>
+                  <option value="abyss">Abyss (light)</option>
+                  <option value="aurora">Aurora (light)</option>
+                </optgroup>
+                <optgroup label="Dark">
+                  <option value="black">Black</option>
+                  <option value="grid-dark">Grid (dark)</option>
+                  <option value="studio-dark">Studio (dark)</option>
+                  <option value="nebula">Nebula (dark)</option>
+                  <option value="abyss-dark">Abyss (dark)</option>
+                  <option value="aurora-dark">Aurora (dark)</option>
+                </optgroup>
+              </select>
+            </div>
+          </div>
+
+          <div class="control-block" id="cells-controls" role="group" aria-labelledby="cells-title">
+            <div class="control-group-header">
+              <h3 class="section-title" id="cells-title">Cells</h3>
+              <button type="button" id="cells-info-btn" class="info-btn" aria-label="About how cells are drawn" aria-controls="cells-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
+            </div>
+            <div id="cells-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="cells-info-btn" tabindex="-1" data-info-tip="cells" hidden></div>
+            <!--
+              Render mode. The maturity tag is shown only while the mode it
+              describes is the selected one, so it reads as a property of that
+              option rather than of the control. The option text carries the same
+              word, because that is the only place a native <option> can carry it
+              and it has to be visible before the mode is chosen.
+            -->
+            <div class="control-block">
+              <div class="field-label-row">
+                <label for="render-mode">Render mode</label>
+                <span
+                  id="render-mode-maturity-tag"
+                  class="maturity-tag"
+                  title="Volumetric smoke cloud is in beta: it is slower than points, and figure export cannot reproduce it."
+                  hidden
+                >Beta</span>
+              </div>
+              <select id="render-mode" class="obs-select">
+                <option value="points">Points</option>
+                <option value="smoke">Volumetric smoke cloud (beta)</option>
+              </select>
+            </div>
+            <!-- Point drawing settings: hidden in volumetric smoke mode. -->
+            <div id="renderer-controls">
+              <div class="control-block">
+                <div class="field-label-row">
+                  <label for="hp-shader-quality">Shader quality</label>
+                  <button type="button" id="shader-quality-info-btn" class="info-btn" aria-label="About shader quality" aria-controls="shader-quality-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
+                </div>
+                <div id="shader-quality-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="shader-quality-info-btn" tabindex="-1" data-info-tip="shader-quality" hidden></div>
+                <select id="hp-shader-quality" class="obs-select">
+                  <option value="full">Full (lighting + fog)</option>
+                  <option value="sculpted">Sculpted (soft 3D light)</option>
+                  <option value="light">Light (circular, no lighting)</option>
+                  <option value="ultralight">Ultra-light (square points)</option>
+                </select>
+              </div>
+              <div class="control-block">
+                <label for="point-size">Point size</label>
+                <div class="slider-row">
+                  <input id="point-size" type="range" min="-24" max="100" step="0.5" value="16.5" />
+                  <span id="point-size-display" class="slider-value">0.75</span>
+                </div>
               </div>
             </div>
+          </div>
 
+          <!-- Depth cues: hidden in volumetric smoke mode. -->
+          <div class="control-block" id="depth-controls" role="group" aria-labelledby="depth-perception-title">
+            <div class="control-group-header">
+              <h3 class="section-title" id="depth-perception-title">Depth cues</h3>
+              <button type="button" id="depth-perception-info-btn" class="info-btn" aria-label="About depth cues" aria-controls="depth-perception-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
+            </div>
+            <div id="depth-perception-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="depth-perception-info-btn" tabindex="-1" data-info-tip="depth-cues" hidden></div>
             <div class="control-block">
-              <label for="lighting-strength">3D lighting:</label>
+              <label for="lighting-strength">3D lighting</label>
               <div class="slider-row">
                 <input id="lighting-strength" type="range" min="0" max="100" step="1" value="60" />
                 <span id="lighting-strength-display" class="slider-value">60</span>
               </div>
             </div>
-
             <div class="control-block">
-              <label for="fog-density">Atmospheric fog:</label>
+              <label for="fog-density">Atmospheric fog</label>
               <div class="slider-row">
                 <input id="fog-density" type="range" min="0" max="100" step="1" value="50" />
                 <span id="fog-density-display" class="slider-value">50</span>
               </div>
             </div>
-
             <div class="control-block">
-              <label for="size-attenuation">Perspective size scaling:</label>
+              <label for="size-attenuation">Perspective size scaling</label>
               <div class="slider-row">
                 <input id="size-attenuation" type="range" min="0" max="100" step="1" value="80" />
                 <span id="size-attenuation-display" class="slider-value">80</span>
@@ -605,323 +715,184 @@
             </div>
           </div>
 
-          <!-- Renderer Settings -->
-          <div class="control-block" id="renderer-controls">
-            <div class="control-block mt-0 mb-2">
-              <div class="d-flex items-center gap-1">
-                <label for="hp-shader-quality">Shader quality:</label>
-                <button
-                  type="button"
-                  id="shader-quality-info-btn"
-                  class="info-btn"
-                  aria-label="About shader quality"
-                  aria-controls="shader-quality-info-tooltip"
-                  aria-haspopup="dialog"
-                  aria-expanded="false"
-                ><span aria-hidden="true">i</span></button>
+          <!-- Volumetric smoke settings: shown in smoke mode only. -->
+          <div id="smoke-controls" role="group" aria-labelledby="smoke-quality-title">
+            <div class="control-block" role="group" aria-labelledby="smoke-quality-title">
+              <div class="control-group-header">
+                <h3 class="section-title" id="smoke-quality-title">Smoke quality</h3>
+                <button type="button" id="smoke-info-btn" class="info-btn" aria-label="About smoke quality" aria-controls="smoke-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
               </div>
+              <div id="smoke-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="smoke-info-btn" tabindex="-1" data-info-tip="smoke-quality" hidden></div>
+              <div class="control-block">
+                <label for="smoke-grid">Grid density</label>
+                <div class="slider-row">
+                  <input id="smoke-grid" type="range" min="0" max="100" step="1" value="80" />
+                  <span id="smoke-grid-display" class="slider-value">128³</span>
+                </div>
+              </div>
+              <div class="control-block">
+                <label for="smoke-steps">Ray quality</label>
+                <div class="slider-row">
+                  <input id="smoke-steps" type="range" min="0" max="100" step="1" value="75" />
+                  <span id="smoke-steps-display" class="slider-value">High</span>
+                </div>
+              </div>
+              <div class="control-block">
+                <label for="cloud-resolution">Render resolution</label>
+                <div class="slider-row">
+                  <input id="cloud-resolution" type="range" min="0" max="100" step="1" value="33" />
+                  <span id="cloud-resolution-display" class="slider-value">0.50×</span>
+                </div>
+              </div>
+              <div class="control-block">
+                <label for="noise-resolution">Noise detail</label>
+                <div class="slider-row">
+                  <input id="noise-resolution" type="range" min="0" max="100" step="1" value="80" />
+                  <span id="noise-resolution-display" class="slider-value">128³</span>
+                </div>
+              </div>
+            </div>
+            <div class="control-block" role="group" aria-labelledby="smoke-shape-title">
+              <div class="control-group-header">
+                <h3 class="section-title" id="smoke-shape-title">Smoke shape</h3>
+                <button type="button" id="smoke-shape-info-btn" class="info-btn" aria-label="About smoke shape" aria-controls="smoke-shape-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
+              </div>
+              <div id="smoke-shape-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="smoke-shape-info-btn" tabindex="-1" data-info-tip="smoke-shape" hidden></div>
+              <div class="control-block">
+                <label for="smoke-density">Cloud density</label>
+                <div class="slider-row">
+                  <input id="smoke-density" type="range" min="0" max="100" step="1" value="65" />
+                  <span id="smoke-density-display" class="slider-value">1.00</span>
+                </div>
+              </div>
+              <div class="control-block">
+                <label for="smoke-detail">Fine detail</label>
+                <div class="slider-row">
+                  <input id="smoke-detail" type="range" min="0" max="100" step="1" value="40" />
+                  <span id="smoke-detail-display" class="slider-value">2.0</span>
+                </div>
+              </div>
+              <div class="control-block">
+                <label for="smoke-warp">Turbulence</label>
+                <div class="slider-row">
+                  <input id="smoke-warp" type="range" min="0" max="100" step="1" value="10" />
+                  <span id="smoke-warp-display" class="slider-value">10%</span>
+                </div>
+              </div>
+              <div class="control-block">
+                <label for="smoke-speed">Animation speed</label>
+                <div class="slider-row">
+                  <input id="smoke-speed" type="range" min="0" max="100" step="1" value="40" />
+                  <span id="smoke-speed-display" class="slider-value">1.00</span>
+                </div>
+              </div>
+              <div class="control-block">
+                <label for="smoke-edge">Edge softness</label>
+                <div class="slider-row">
+                  <input id="smoke-edge" type="range" min="0" max="100" step="1" value="15" />
+                  <span id="smoke-edge-display" class="slider-value">0.3</span>
+                </div>
+              </div>
+            </div>
+            <div class="control-block" role="group" aria-labelledby="smoke-lighting-title">
+              <div class="control-group-header">
+                <h3 class="section-title" id="smoke-lighting-title">Smoke lighting</h3>
+                <button type="button" id="smoke-lighting-info-btn" class="info-btn" aria-label="About smoke lighting" aria-controls="smoke-lighting-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
+              </div>
+              <div id="smoke-lighting-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="smoke-lighting-info-btn" tabindex="-1" data-info-tip="smoke-lighting" hidden></div>
+              <div class="control-block">
+                <label for="smoke-absorption">Light absorption</label>
+                <div class="slider-row">
+                  <input id="smoke-absorption" type="range" min="0" max="100" step="1" value="50" />
+                  <span id="smoke-absorption-display" class="slider-value">1.0</span>
+                </div>
+              </div>
+              <div class="control-block">
+                <label for="smoke-scatter">Light scattering</label>
+                <div class="slider-row">
+                  <input id="smoke-scatter" type="range" min="0" max="100" step="1" value="50" />
+                  <span id="smoke-scatter-display" class="slider-value">1.0</span>
+                </div>
+              </div>
+              <div class="control-block">
+                <label for="smoke-direct-light">Direct lighting</label>
+                <div class="slider-row">
+                  <input id="smoke-direct-light" type="range" min="0" max="100" step="1" value="50" />
+                  <span id="smoke-direct-light-display" class="slider-value">1.00×</span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="control-block" id="render-performance-controls" role="group" aria-labelledby="renderer-settings-title">
+            <div class="control-group-header">
+              <h3 class="section-title" id="renderer-settings-title">Performance</h3>
+              <button type="button" id="renderer-settings-info-btn" class="info-btn" aria-label="About rendering performance" aria-controls="renderer-settings-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
+            </div>
+            <div id="renderer-settings-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="renderer-settings-info-btn" tabindex="-1" data-info-tip="render-performance" hidden></div>
+            <!-- Level of detail and frustum culling: points mode only. -->
+            <div id="points-performance-controls">
+              <div class="control-block">
+                <label class="checkbox-inline">
+                  <input type="checkbox" id="hp-lod-enabled" />
+                  Level of detail (LOD)
+                </label>
+              </div>
+              <div class="control-block ml-4" id="lod-force-container" hidden>
+                <label for="hp-lod-force">Force LOD level</label>
+                <div class="slider-row">
+                  <input id="hp-lod-force" type="range" min="-1" max="17" step="1" value="-1" />
+                  <span id="hp-lod-force-label" class="slider-value">Auto</span>
+                </div>
+              </div>
+              <div class="control-block">
+                <label class="checkbox-inline">
+                  <input type="checkbox" id="hp-frustum-culling" />
+                  Frustum culling
+                </label>
+              </div>
+            </div>
+            <!-- Antialiasing governs the drawing buffer in both render modes,
+                 so it stays visible in smoke mode with the group around it. -->
+            <div class="control-block" id="antialias-controls">
+              <div class="checkbox-info-row">
+                <label class="checkbox-inline">
+                  <input type="checkbox" id="hp-antialias" checked />
+                  Antialiasing
+                </label>
+                <button type="button" id="antialias-info-btn" class="info-btn" aria-label="About antialiasing" aria-controls="antialias-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
+              </div>
+              <div id="antialias-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="antialias-info-btn" tabindex="-1" data-info-tip="antialiasing" hidden></div>
               <div
-                id="shader-quality-info-tooltip"
-                class="info-tooltip"
-                role="dialog"
-                aria-labelledby="shader-quality-info-btn"
-                tabindex="-1"
-                hidden
-              >
-                <div class="info-tooltip-content">
-                  <div class="info-step">
-                    This changes what a point looks like, not how fast it draws.
-                    Full adds lighting and fog, Light drops both, Ultra-light
-                    draws squares instead of round dots.
-                  </div>
-                  <div class="info-step">
-                    The three measured the same frame time at every point size
-                    tested on one Apple M1 Pro. Depth writes discard most
-                    overlapping fragments before the shader runs, so simplifying
-                    it has nothing left to save.
-                  </div>
-                  <div class="info-step">
-                    For speed, reach for Point size, a smaller window, filtering,
-                    or Image quality below.
-                  </div>
-                </div>
-              </div>
-              <select id="hp-shader-quality" class="obs-select">
-                <option value="full">Full (lighting + fog)</option>
-                <option value="light">Light (circular, no lighting)</option>
-                <option value="ultralight">Ultra-light (square points)</option>
-              </select>
-            </div>
-
-            <div class="d-flex items-center gap-1">
-              <label>Renderer settings:</label>
-              <button
-                type="button"
-                id="renderer-settings-info-btn"
-                class="info-btn"
-                aria-label="About renderer settings"
-                aria-controls="renderer-settings-info-tooltip"
-                aria-haspopup="dialog"
-                aria-expanded="false"
-              ><span aria-hidden="true">i</span></button>
-            </div>
-            <div
-              id="renderer-settings-info-tooltip"
-              class="info-tooltip"
-              role="dialog"
-              aria-labelledby="renderer-settings-info-btn"
-              tabindex="-1"
-              hidden
-            >
-              <div class="info-tooltip-content">
-                Level-of-detail and frustum culling reduce work for large datasets or limited hardware.
-              </div>
-            </div>
-            <div class="control-block">
-              <label class="checkbox-inline">
-                <input type="checkbox" id="hp-lod-enabled" />
-                Level-of-Detail (LOD)
-              </label>
-            </div>
-
-            <div class="control-block mt-1 ml-4" id="lod-force-container">
-              <label for="hp-lod-force">Force LOD level:</label>
-              <div class="slider-row">
-                <input id="hp-lod-force" type="range" min="-1" max="17" step="1" value="-1" />
-                <span id="hp-lod-force-label" class="slider-value">Auto</span>
-              </div>
-            </div>
-
-            <div class="control-block">
-              <label class="checkbox-inline">
-                <input type="checkbox" id="hp-frustum-culling" />
-                Frustum culling
-              </label>
+                id="hp-antialias-status"
+                class="status-line"
+                data-tone="muted"
+                role="status"
+                aria-live="polite"
+              ></div>
             </div>
           </div>
-
-          <!--
-            Antialiasing sits outside #renderer-controls on purpose: that block
-            is hidden in volumetric smoke mode, and this setting governs the
-            whole drawing buffer in both modes.
-          -->
-          <div class="control-block" id="antialias-controls">
-            <div class="d-flex items-center gap-1">
-              <label for="hp-antialias">Image quality:</label>
-              <button
-                type="button"
-                id="antialias-info-btn"
-                class="info-btn"
-                aria-label="About antialiasing"
-                aria-controls="antialias-info-tooltip"
-                aria-haspopup="dialog"
-                aria-expanded="false"
-              ><span aria-hidden="true">i</span></button>
-            </div>
-            <div
-              id="antialias-info-tooltip"
-              class="info-tooltip"
-              role="dialog"
-              aria-labelledby="antialias-info-btn"
-              tabindex="-1"
-              hidden
-            >
-              <div class="info-tooltip-content">
-                <div class="info-step">
-                  Antialiasing smooths the edge of every point. Turning it off
-                  measured 19% faster at point size 0.75 and 34% faster at
-                  large point sizes, on 10 million points on one Apple M1
-                  Pro. Expect the shape, not the exact numbers, on other GPUs.
-                </div>
-                <div class="info-step">
-                  It is not free to turn off: 18% of pixels change at point
-                  size 0.75, and 32% with Ultra-light square points.
-                  Small dots are almost all edge, so this is the setting that
-                  changes what a dense cloud looks like.
-                </div>
-                <div class="info-step">
-                  Until you set it yourself, it follows the dataset: on below
-                  five million cells, off at or above, re-decided whenever a
-                  dataset is opened. Setting it here ends that and applies to
-                  the next frame.
-                </div>
-              </div>
-            </div>
-            <div class="control-block">
-              <label class="checkbox-inline">
-                <input type="checkbox" id="hp-antialias" checked />
-                Antialiasing (smooth point edges)
-              </label>
-            </div>
-            <div
-              id="hp-antialias-status"
-              class="legend-help"
-              role="status"
-              aria-live="polite"
-            ></div>
-          </div>
-
-          <!-- Volumetric smoke controls -->
-          <div class="control-block" id="smoke-controls">
-            <div class="d-flex items-center gap-1">
-              <label>Volumetric smoke:</label>
-              <button
-                type="button"
-                id="smoke-info-btn"
-                class="info-btn"
-                aria-label="About volumetric smoke"
-                aria-controls="smoke-info-tooltip"
-                aria-haspopup="dialog"
-                aria-expanded="false"
-              ><span aria-hidden="true">i</span></button>
-            </div>
-            <div
-              id="smoke-info-tooltip"
-              class="info-tooltip"
-              role="dialog"
-              aria-labelledby="smoke-info-btn"
-              tabindex="-1"
-              hidden
-            >
-              <div class="info-tooltip-content">
-                Physically based ray-marched smoke; controls scale with grid and noise detail.
-              </div>
-            </div>
-
-            <label>Quality & performance:</label>
-            <div class="control-block">
-              <label for="smoke-grid">Grid density:</label>
-              <div class="slider-row">
-                <input id="smoke-grid" type="range" min="0" max="100" step="1" value="80" />
-                <span id="smoke-grid-display" class="slider-value">128³</span>
-              </div>
-            </div>
-            <div class="control-block">
-              <label for="smoke-steps">Ray quality:</label>
-              <div class="slider-row">
-                <input id="smoke-steps" type="range" min="0" max="100" step="1" value="75" />
-                <span id="smoke-steps-display" class="slider-value">High</span>
-              </div>
-            </div>
-            <div class="control-block">
-              <label for="cloud-resolution">Render resolution:</label>
-              <div class="slider-row">
-                <input id="cloud-resolution" type="range" min="0" max="100" step="1" value="15" />
-                <span id="cloud-resolution-display" class="slider-value">0.51x</span>
-              </div>
-            </div>
-            <div class="control-block">
-              <label for="noise-resolution">Noise detail:</label>
-              <div class="slider-row">
-                <input id="noise-resolution" type="range" min="0" max="100" step="1" value="58" />
-                <span id="noise-resolution-display" class="slider-value">128³</span>
-              </div>
-            </div>
-
-            <label>Shape & motion:</label>
-            <div class="control-block">
-              <label for="smoke-density">Cloud density:</label>
-              <div class="slider-row">
-                <input id="smoke-density" type="range" min="0" max="100" step="1" value="56" />
-                <span id="smoke-density-display" class="slider-value">9</span>
-              </div>
-            </div>
-            <div class="control-block">
-              <label for="smoke-detail">Fine detail:</label>
-              <div class="slider-row">
-                <input id="smoke-detail" type="range" min="0" max="100" step="1" value="60" />
-                <span id="smoke-detail-display" class="slider-value">3.8</span>
-              </div>
-            </div>
-            <div class="control-block">
-              <label for="smoke-warp">Turbulence:</label>
-              <div class="slider-row">
-                <input id="smoke-warp" type="range" min="0" max="100" step="1" value="10" />
-                <span id="smoke-warp-display" class="slider-value">10%</span>
-              </div>
-            </div>
-            <div class="control-block">
-              <label for="smoke-speed">Animation speed:</label>
-              <div class="slider-row">
-                <input id="smoke-speed" type="range" min="0" max="100" step="1" value="40" />
-                <span id="smoke-speed-display" class="slider-value">1.00</span>
-              </div>
-            </div>
-            <div class="control-block">
-              <label for="smoke-edge">Edge softness:</label>
-              <div class="slider-row">
-                <input id="smoke-edge" type="range" min="0" max="100" step="1" value="0" />
-                <span id="smoke-edge-display" class="slider-value">0.2</span>
-              </div>
-            </div>
-
-            <label>Lighting:</label>
-            <div class="control-block">
-              <label for="smoke-absorption">Light absorption:</label>
-              <div class="slider-row">
-                <input id="smoke-absorption" type="range" min="0" max="100" step="1" value="65" />
-                <span id="smoke-absorption-display" class="slider-value">1.5</span>
-              </div>
-            </div>
-            <div class="control-block">
-              <label for="smoke-scatter">Light scattering:</label>
-              <div class="slider-row">
-                <input id="smoke-scatter" type="range" min="0" max="100" step="1" value="50" />
-                <span id="smoke-scatter-display" class="slider-value">0.8</span>
-              </div>
-            </div>
-            <div class="control-block">
-              <label for="smoke-direct-light">Direct lighting:</label>
-              <div class="slider-row">
-                <input id="smoke-direct-light" type="range" min="0" max="100" step="1" value="50" />
-                <span id="smoke-direct-light-display" class="slider-value">0.75x</span>
-              </div>
-            </div>
-
-          </div>
-
-          <!-- Point rendering controls (points mode only) -->
+          <!-- Points mode only: level of detail and the overlays. -->
           <div id="points-controls" class="visible">
-            <!-- KNN Connectivity Section -->
-            <div class="control-block" id="connectivity-controls">
-              <div class="d-flex items-center gap-1">
-                <label>KNN Connectivity:</label>
-                <button
-                  type="button"
-                  id="connectivity-help-btn"
-                  class="info-btn"
-                  aria-label="About KNN connectivity"
-                  aria-controls="connectivity-help-tooltip"
-                  aria-haspopup="dialog"
-                  aria-expanded="false"
-                ><span aria-hidden="true">i</span></button>
+            <div class="control-block" id="connectivity-controls" hidden role="group" aria-labelledby="connectivity-title">
+              <div class="control-group-header">
+                <h3 class="section-title" id="connectivity-title">Connectivity</h3>
+                <button type="button" id="connectivity-help-btn" class="info-btn" aria-label="About KNN connectivity" aria-controls="connectivity-help-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
               </div>
-              <div
-                id="connectivity-help-tooltip"
-                class="info-tooltip"
-                role="dialog"
-                aria-labelledby="connectivity-help-btn"
-                tabindex="-1"
-                hidden
-              >
-                <div class="info-tooltip-content">
-                  Connectivity edges are drawn only between currently visible cells.
-                </div>
-              </div>
-
+              <div id="connectivity-help-tooltip" class="info-tooltip" role="dialog" aria-labelledby="connectivity-help-btn" tabindex="-1" data-info-tip="connectivity" hidden></div>
               <label class="checkbox-inline">
                 <input type="checkbox" id="toggle-connectivity" />
                 Show connectivity edges
               </label>
 
-              <div id="connectivity-sliders" class="nav-mode-box">
+              <div id="connectivity-sliders" class="control-box" hidden>
                 <div class="control-block">
-                  <label for="connectivity-color">Edge color:</label>
+                  <label for="connectivity-color">Edge color</label>
                   <input type="color" id="connectivity-color" class="connectivity-color-picker" />
                 </div>
 
                 <div class="control-block">
-                  <label for="connectivity-alpha">Edge opacity:</label>
+                  <label for="connectivity-alpha">Edge opacity</label>
                   <div class="slider-row">
                     <input id="connectivity-alpha" type="range" min="1" max="100" step="1" value="60" />
                     <span id="connectivity-alpha-display" class="slider-value">0.60</span>
@@ -929,7 +900,7 @@
                 </div>
 
                 <div class="control-block">
-                  <label for="connectivity-width">Line width:</label>
+                  <label for="connectivity-width">Line width</label>
                   <div class="slider-row">
                     <input id="connectivity-width" type="range" min="1" max="50" step="1" value="10" />
                     <span id="connectivity-width-display" class="slider-value">1.0</span>
@@ -937,57 +908,36 @@
                 </div>
 
                 <div class="control-block">
-                  <label for="connectivity-limit">Max edges:</label>
+                  <label for="connectivity-limit">Max edges</label>
                   <div class="slider-row">
                     <input id="connectivity-limit" type="range" min="1000" max="1000000" step="1000" value="250000" />
                     <span id="connectivity-limit-display" class="slider-value">250k</span>
                   </div>
                 </div>
 
-                <div id="connectivity-info" class="legend-help mt-2 tabular-nums"></div>
+                <div id="connectivity-info" class="field-help tabular-nums"></div>
               </div>
+
             </div>
-
-            <!-- Velocity overlay (GPU particle flow) -->
-            <div class="control-block mt-1" id="velocity-overlay-controls" style="display: none;">
-              <div class="d-flex items-center gap-1">
-                <label>Vector Field Overlay:</label>
-                <button
-                  type="button"
-                  id="vector-field-help-btn"
-                  class="info-btn"
-                  aria-label="About vector field overlays"
-                  aria-controls="vector-field-help-tooltip"
-                  aria-haspopup="dialog"
-                  aria-expanded="false"
-                ><span aria-hidden="true">i</span></button>
+            <div class="control-block" id="velocity-overlay-controls" hidden role="group" aria-labelledby="vector-field-title" data-state-serializer-after-embedding="true">
+              <div class="control-group-header">
+                <h3 class="section-title" id="vector-field-title">Vector field</h3>
+                <button type="button" id="vector-field-help-btn" class="info-btn" aria-label="About vector field overlays" aria-controls="vector-field-help-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
               </div>
-              <div
-                id="vector-field-help-tooltip"
-                class="info-tooltip"
-                role="dialog"
-                aria-labelledby="vector-field-help-btn"
-                tabindex="-1"
-                hidden
-              >
-                <div class="info-tooltip-content">
-                  Animated particle flow uses the selected dimension-specific per-cell velocity or drift vectors.
-                </div>
-              </div>
-
+              <div id="vector-field-help-tooltip" class="info-tooltip" role="dialog" aria-labelledby="vector-field-help-btn" tabindex="-1" data-info-tip="vector-field" hidden></div>
               <label class="checkbox-inline">
                 <input type="checkbox" id="velocity-overlay-enabled" />
                 Show overlay
               </label>
 
-              <div id="velocity-overlay-settings" class="nav-mode-box" style="display: none;">
+              <div id="velocity-overlay-settings" class="control-box" hidden>
                 <div class="control-block">
-                  <label for="velocity-field">Vector field:</label>
+                  <label for="velocity-field">Vector field</label>
                   <select id="velocity-field" class="obs-select"></select>
                 </div>
 
                 <div class="control-block">
-                  <label for="velocity-density">Particle density:</label>
+                  <label for="velocity-density">Particle density</label>
                   <div class="slider-row">
                     <input id="velocity-density" type="range" min="1" max="500" step="1" value="15" />
                     <span id="velocity-density-display" class="slider-value">15K</span>
@@ -995,7 +945,7 @@
                 </div>
 
                 <div class="control-block">
-                  <label for="velocity-speed">Flow speed:</label>
+                  <label for="velocity-speed">Flow speed</label>
                   <div class="slider-row">
                     <input id="velocity-speed" type="range" min="5" max="500" step="1" value="300" />
                     <span id="velocity-speed-display" class="slider-value">3.0×</span>
@@ -1003,23 +953,23 @@
                 </div>
 
                 <div class="control-block">
-                  <label for="velocity-lifetime">Trail length:</label>
+                  <label for="velocity-lifetime">Trail length</label>
                   <div class="slider-row">
                     <input id="velocity-lifetime" type="range" min="10" max="1500" step="10" value="800" />
-                    <span id="velocity-lifetime-display" class="slider-value">8.0s</span>
+                    <span id="velocity-lifetime-display" class="slider-value">8.0 s</span>
                   </div>
                 </div>
 
                 <div class="control-block">
-                  <label for="velocity-size">Particle size:</label>
+                  <label for="velocity-size">Particle size</label>
                   <div class="slider-row">
                     <input id="velocity-size" type="range" min="0.5" max="30" step="0.5" value="1" />
-                    <span id="velocity-size-display" class="slider-value">1</span>
+                    <span id="velocity-size-display" class="slider-value">1.0</span>
                   </div>
                 </div>
 
                 <div class="control-block">
-                  <label for="velocity-opacity">Opacity:</label>
+                  <label for="velocity-opacity">Opacity</label>
                   <div class="slider-row">
                     <input id="velocity-opacity" type="range" min="0" max="100" step="1" value="60" />
                     <span id="velocity-opacity-display" class="slider-value">60%</span>
@@ -1027,7 +977,7 @@
                 </div>
 
                 <div class="control-block">
-                  <label for="velocity-colormap">Color scheme:</label>
+                  <label for="velocity-colormap">Color scheme</label>
                   <select id="velocity-colormap" class="obs-select">
                     <option value="viridis" selected>Viridis</option>
                     <option value="plasma">Plasma</option>
@@ -1043,16 +993,19 @@
                   Sync with LOD
                 </label>
 
-                <!-- Advanced Visual Settings (collapsible) -->
-                <details class="mt-2">
-                  <summary class="cursor-pointer">Advanced Visual Settings</summary>
-                  <div class="mt-1">
+                <!-- Advanced visual settings (collapsible) -->
+                <div class="disclosure disclosure-inline" data-static-disclosure>
+                  <button type="button" class="disclosure-header" aria-expanded="false" aria-controls="velocity-advanced-settings">
+                    <span class="disclosure-title">Advanced visual settings</span>
+                    <span class="disclosure-chevron" aria-hidden="true"></span>
+                  </button>
+                  <div class="disclosure-content" id="velocity-advanced-settings" hidden>
 
                     <!-- Particle Rendering -->
-                    <div class="legend-help font-medium mb-1">Particle Rendering</div>
+                    <h3 class="section-title">Particle rendering</h3>
 
                     <div class="control-block">
-                      <label for="velocity-intensity">Intensity:</label>
+                      <label for="velocity-intensity">Intensity</label>
                       <div class="slider-row">
                         <input id="velocity-intensity" type="range" min="0.05" max="1.5" step="0.05" value="0.25" />
                         <span id="velocity-intensity-display" class="slider-value">0.25</span>
@@ -1060,34 +1013,34 @@
                     </div>
 
                     <div class="control-block">
-                      <label for="velocity-glow">Glow amount:</label>
+                      <label for="velocity-glow">Glow amount</label>
                       <div class="slider-row">
                         <input id="velocity-glow" type="range" min="0" max="1" step="0.05" value="0.3" />
-                        <span id="velocity-glow-display" class="slider-value">0.3</span>
+                        <span id="velocity-glow-display" class="slider-value">0.30</span>
                       </div>
                     </div>
 
                     <div class="control-block">
-                      <label for="velocity-comet-stretch">Comet stretch:</label>
+                      <label for="velocity-comet-stretch">Comet stretch</label>
                       <div class="slider-row">
                         <input id="velocity-comet-stretch" type="range" min="0" max="2" step="0.05" value="0.6" />
-                        <span id="velocity-comet-stretch-display" class="slider-value">0.6</span>
+                        <span id="velocity-comet-stretch-display" class="slider-value">0.60</span>
                       </div>
                     </div>
 
                     <div class="control-block">
-                      <label for="velocity-core-sharpness">Core sharpness:</label>
+                      <label for="velocity-core-sharpness">Core sharpness</label>
                       <div class="slider-row">
                         <input id="velocity-core-sharpness" type="range" min="0" max="1" step="0.05" value="0.7" />
-                        <span id="velocity-core-sharpness-display" class="slider-value">0.7</span>
+                        <span id="velocity-core-sharpness-display" class="slider-value">0.70</span>
                       </div>
                     </div>
 
                     <!-- Trail Settings -->
-                    <div class="legend-help font-medium mb-1 mt-2">Trail Settings</div>
+                    <h3 class="section-title">Trail settings</h3>
 
                     <div class="control-block">
-                      <label for="velocity-trail-fade">Trail persistence:</label>
+                      <label for="velocity-trail-fade">Trail persistence</label>
                       <div class="slider-row">
                         <input id="velocity-trail-fade" type="range" min="0.9" max="0.995" step="0.005" value="0.925" />
                         <span id="velocity-trail-fade-display" class="slider-value">0.925</span>
@@ -1095,34 +1048,34 @@
                     </div>
 
                     <div class="control-block">
-                      <label for="velocity-chromatic-fade">Chromatic fade:</label>
+                      <label for="velocity-chromatic-fade">Chromatic fade</label>
                       <div class="slider-row">
                         <input id="velocity-chromatic-fade" type="range" min="0" max="1" step="0.05" value="0" />
-                        <span id="velocity-chromatic-fade-display" class="slider-value">0</span>
+                        <span id="velocity-chromatic-fade-display" class="slider-value">0.00</span>
                       </div>
                     </div>
 
                     <div class="control-block">
-                      <label for="velocity-turbulence">Turbulence:</label>
+                      <label for="velocity-turbulence">Turbulence</label>
                       <div class="slider-row">
                         <input id="velocity-turbulence" type="range" min="0" max="1" step="0.05" value="0.3" />
-                        <span id="velocity-turbulence-display" class="slider-value">0.3</span>
+                        <span id="velocity-turbulence-display" class="slider-value">0.30</span>
                       </div>
                     </div>
 
                     <!-- HDR & Bloom -->
-                    <div class="legend-help font-medium mb-1 mt-2">HDR & Bloom</div>
+                    <h3 class="section-title">HDR and bloom</h3>
 
                     <div class="control-block">
-                      <label for="velocity-exposure">Exposure:</label>
+                      <label for="velocity-exposure">Exposure</label>
                       <div class="slider-row">
                         <input id="velocity-exposure" type="range" min="0.1" max="2" step="0.05" value="0.5" />
-                        <span id="velocity-exposure-display" class="slider-value">0.5</span>
+                        <span id="velocity-exposure-display" class="slider-value">0.50</span>
                       </div>
                     </div>
 
                     <div class="control-block">
-                      <label for="velocity-bloom-strength">Bloom strength:</label>
+                      <label for="velocity-bloom-strength">Bloom strength</label>
                       <div class="slider-row">
                         <input id="velocity-bloom-strength" type="range" min="0" max="0.5" step="0.01" value="0.08" />
                         <span id="velocity-bloom-strength-display" class="slider-value">0.08</span>
@@ -1130,7 +1083,7 @@
                     </div>
 
                     <div class="control-block">
-                      <label for="velocity-bloom-threshold">Bloom threshold:</label>
+                      <label for="velocity-bloom-threshold">Bloom threshold</label>
                       <div class="slider-row">
                         <input id="velocity-bloom-threshold" type="range" min="0.1" max="1" step="0.05" value="0.75" />
                         <span id="velocity-bloom-threshold-display" class="slider-value">0.75</span>
@@ -1138,7 +1091,7 @@
                     </div>
 
                     <div class="control-block">
-                      <label for="velocity-anamorphic">Anamorphic ratio:</label>
+                      <label for="velocity-anamorphic">Anamorphic ratio</label>
                       <div class="slider-row">
                         <input id="velocity-anamorphic" type="range" min="1" max="3" step="0.1" value="1.2" />
                         <span id="velocity-anamorphic-display" class="slider-value">1.2</span>
@@ -1146,10 +1099,10 @@
                     </div>
 
                     <!-- Color Grading -->
-                    <div class="legend-help font-medium mb-1 mt-2">Color Grading</div>
+                    <h3 class="section-title">Color grading</h3>
 
                     <div class="control-block">
-                      <label for="velocity-saturation">Saturation:</label>
+                      <label for="velocity-saturation">Saturation</label>
                       <div class="slider-row">
                         <input id="velocity-saturation" type="range" min="0.5" max="2" step="0.05" value="1.15" />
                         <span id="velocity-saturation-display" class="slider-value">1.15</span>
@@ -1157,7 +1110,7 @@
                     </div>
 
                     <div class="control-block">
-                      <label for="velocity-contrast">Contrast:</label>
+                      <label for="velocity-contrast">Contrast</label>
                       <div class="slider-row">
                         <input id="velocity-contrast" type="range" min="0.5" max="2" step="0.05" value="1.05" />
                         <span id="velocity-contrast-display" class="slider-value">1.05</span>
@@ -1165,7 +1118,7 @@
                     </div>
 
                     <div class="control-block">
-                      <label for="velocity-highlights">Highlights:</label>
+                      <label for="velocity-highlights">Highlights</label>
                       <div class="slider-row">
                         <input id="velocity-highlights" type="range" min="0.5" max="1.5" step="0.05" value="0.85" />
                         <span id="velocity-highlights-display" class="slider-value">0.85</span>
@@ -1173,7 +1126,7 @@
                     </div>
 
                     <div class="control-block">
-                      <label for="velocity-shadows">Shadows:</label>
+                      <label for="velocity-shadows">Shadows</label>
                       <div class="slider-row">
                         <input id="velocity-shadows" type="range" min="0.5" max="1.5" step="0.05" value="1.05" />
                         <span id="velocity-shadows-display" class="slider-value">1.05</span>
@@ -1181,191 +1134,70 @@
                     </div>
 
                     <!-- Cinematic Effects -->
-                    <div class="legend-help font-medium mb-1 mt-2">Cinematic Effects</div>
+                    <h3 class="section-title">Cinematic effects</h3>
 
                     <div class="control-block">
-                      <label for="velocity-vignette">Vignette:</label>
+                      <label for="velocity-vignette">Vignette</label>
                       <div class="slider-row">
                         <input id="velocity-vignette" type="range" min="0" max="1" step="0.05" value="0" />
-                        <span id="velocity-vignette-display" class="slider-value">0</span>
+                        <span id="velocity-vignette-display" class="slider-value">0.00</span>
                       </div>
                     </div>
 
                     <div class="control-block">
-                      <label for="velocity-film-grain">Film grain:</label>
+                      <label for="velocity-film-grain">Film grain</label>
                       <div class="slider-row">
                         <input id="velocity-film-grain" type="range" min="0" max="0.1" step="0.002" value="0" />
-                        <span id="velocity-film-grain-display" class="slider-value">0</span>
+                        <span id="velocity-film-grain-display" class="slider-value">0.000</span>
                       </div>
                     </div>
 
                     <div class="control-block">
-                      <label for="velocity-chromatic-aberration">Chromatic aberr.:</label>
+                      <label for="velocity-chromatic-aberration">Chromatic aberration</label>
                       <div class="slider-row">
                         <input id="velocity-chromatic-aberration" type="range" min="0" max="1" step="0.05" value="0" />
-                        <span id="velocity-chromatic-aberration-display" class="slider-value">0</span>
+                        <span id="velocity-chromatic-aberration-display" class="slider-value">0.00</span>
                       </div>
                     </div>
 
                   </div>
-                </details>
+                </div>
 
-                <div id="velocity-overlay-info" class="legend-help mt-2 tabular-nums"></div>
+                <div id="velocity-overlay-info" class="field-help tabular-nums"></div>
               </div>
-            </div>
-          </div>
 
-          <!-- Reset Camera -->
-          <div class="control-block">
-            <button id="reset-camera-btn" class="reset-btn">Reset Camera</button>
+            </div>
           </div>
         </div>
       </details>
 
-      <details class="accordion-section" id="compare-views-section" open>
-        <summary>Compare Views</summary>
+      <details class="accordion-section" id="navigation-section">
+        <summary>Navigation</summary>
         <div class="accordion-content">
-          <!-- Multiview controls -->
-          <div class="control-block" id="split-view-controls">
-            <div class="d-flex items-center gap-1">
-              <label>Multiview:</label>
-              <button
-                type="button"
-                id="multiview-info-btn"
-                class="info-btn"
-                aria-label="About multiview"
-                aria-controls="multiview-info-tooltip"
-                aria-haspopup="dialog"
-                aria-expanded="false"
-              ><span aria-hidden="true">i</span></button>
+          <div class="control-block" id="navigation-controls" role="group" aria-labelledby="navigation-title">
+            <!-- With more than one view open, which view these settings drive:
+                 the camera-focused view, or every view while cameras are
+                 linked. Drawn with the Compare views badge, read-only. -->
+            <div id="navigation-view-target" class="navigation-view-target" hidden>
+              <span class="field-label" id="navigation-view-target-label">Applies to</span>
+              <div id="navigation-view-target-badge" class="view-target-badge" aria-labelledby="navigation-view-target-label" role="status"></div>
             </div>
-            <div
-              id="multiview-info-tooltip"
-              class="info-tooltip"
-              role="dialog"
-              aria-labelledby="multiview-info-btn"
-              tabindex="-1"
-              hidden
-            >
-              <div class="info-tooltip-content">
-                Snapshots keep independent coloring and filters. Choose Edit selected view before changing one panel; changes do not propagate to other panels.
-              </div>
+            <div class="field-label-row">
+              <label for="navigation-mode" id="navigation-title">Mode</label>
+              <button type="button" id="navigation-info-btn" class="info-btn" aria-label="About navigation modes" aria-controls="navigation-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
             </div>
-
-            <div class="split-view-row">
-              <button
-                id="split-keep-view-btn"
-                class="reset-btn"
-                title="Freeze current coloring & filters as a new panel"
-              >
-                Keep view
-              </button>
-              <button
-                id="camera-lock-btn"
-                class="toggle-switch camera-lock-btn"
-                type="button"
-                aria-pressed="false"
-                title="Cameras independent (click to link)"
-              >
-                Locked Cam
-              </button>
-            </div>
-
-            <div id="split-view-badges-box" class="split-view-badges-box">
-              <div id="split-view-badges-list" class="split-view-badges"></div>
-              <div class="split-view-hint legend-help"></div>
-              <div class="legend-actions compact split-view-actions">
-                <div class="d-flex items-center gap-1-5">
-                  <span class="legend-help m-0">Layout:</span>
-                  <select id="view-layout-mode" class="obs-select">
-                    <option value="grid">Grid compare</option>
-                    <option value="single">Edit selected view</option>
-                  </select>
-                </div>
-                <button
-                  id="split-clear-btn"
-                  class="reset-btn"
-                  title="Remove all kept views"
-                >
-                  Clear
-                </button>
-              </div>
-            </div>
-          </div>
-
-          <!-- Dimension Level Selector -->
-          <div id="dimension-controls" class="control-block dimension-controls">
-            <div class="d-flex items-center gap-1">
-              <label for="dimension-select">Dimension:</label>
-              <button
-                type="button"
-                id="dimension-info-btn"
-                class="info-btn"
-                aria-label="About embedding dimensions"
-                aria-controls="dimension-info-tooltip"
-                aria-haspopup="dialog"
-                aria-expanded="false"
-              ><span aria-hidden="true">i</span></button>
-            </div>
-            <div
-              id="dimension-info-tooltip"
-              class="info-tooltip"
-              role="dialog"
-              aria-labelledby="dimension-info-btn"
-              tabindex="-1"
-              hidden
-            >
-              <div class="info-tooltip-content">
-                Switch the selected view between the dataset's available embeddings.
-              </div>
-            </div>
-            <div class="control-block">
-              <select id="dimension-select" class="obs-select">
-                <!-- Options are dynamically generated based on available dimensions -->
-              </select>
-            </div>
-          </div>
-
-          <!-- Navigation controls -->
-          <div class="control-block" id="navigation-controls">
-            <div class="d-flex items-center gap-1">
-              <label>Navigation:</label>
-              <button
-                type="button"
-                id="navigation-info-btn"
-                class="info-btn"
-                aria-label="About navigation modes"
-                aria-controls="navigation-info-tooltip"
-                aria-haspopup="dialog"
-                aria-expanded="false"
-              ><span aria-hidden="true">i</span></button>
-            </div>
-            <div
-              id="navigation-info-tooltip"
-              class="info-tooltip"
-              role="dialog"
-              aria-labelledby="navigation-info-btn"
-              tabindex="-1"
-              hidden
-            >
-              <div class="info-tooltip-content">
-                Orbit explores 3D embeddings, planar navigates 2D embeddings, and free-fly enables immersive movement.
-              </div>
-            </div>
-            <div class="control-block">
-              <label for="navigation-mode">Mode:</label>
-              <select id="navigation-mode" class="obs-select">
-                <option value="orbit">Orbit</option>
-                <option value="planar">Planar</option>
-                <option value="free">Free-fly</option>
-              </select>
-            </div>
-            <div id="orbit-controls" class="nav-mode-box">
+            <div id="navigation-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="navigation-info-btn" tabindex="-1" data-info-tip="navigation-mode" hidden></div>
+            <select id="navigation-mode" class="obs-select">
+              <option value="orbit">Orbit</option>
+              <option value="planar">Planar</option>
+              <option value="free">Free-fly</option>
+            </select>
+            <div id="orbit-controls" class="control-box">
               <div class="control-block">
-                <label for="orbit-key-speed">Keyboard speed:</label>
+                <label for="orbit-key-speed">Keyboard speed</label>
                 <div class="slider-row">
                   <input id="orbit-key-speed" type="range" min="1" max="100" step="1" value="40" />
-                  <span id="orbit-key-speed-display" class="slider-value">0.40x</span>
+                  <span id="orbit-key-speed-display" class="slider-value">0.40×</span>
                 </div>
               </div>
               <label class="checkbox-inline">
@@ -1377,33 +1209,33 @@
                 Show orbit anchor
               </label>
             </div>
-            <div id="planar-controls" class="nav-mode-box">
+            <div id="planar-controls" class="control-box" hidden>
               <div class="control-block">
-                <label for="planar-pan-speed">Keyboard speed:</label>
+                <label for="planar-pan-speed">Keyboard speed</label>
                 <div class="slider-row">
                   <input id="planar-pan-speed" type="range" min="1" max="100" step="1" value="100" />
-                  <span id="planar-pan-speed-display" class="slider-value">0.0075x</span>
+                  <span id="planar-pan-speed-display" class="slider-value">0.0075×</span>
                 </div>
               </div>
               <label class="checkbox-inline">
                 <input type="checkbox" id="planar-zoom-to-cursor" checked />
-                Zoom to cursor (pinch-style)
+                Zoom to cursor
               </label>
               <label class="checkbox-inline">
                 <input type="checkbox" id="planar-invert-axes" />
                 Invert axes
               </label>
             </div>
-            <div id="freefly-controls" class="nav-mode-box">
+            <div id="freefly-controls" class="control-box" hidden>
               <div class="control-block">
-                <label for="look-sensitivity">Look sensitivity:</label>
+                <label for="look-sensitivity">Look sensitivity</label>
                 <div class="slider-row">
                   <input id="look-sensitivity" type="range" min="1" max="30" step="1" value="5" />
-                  <span id="look-sensitivity-display" class="slider-value">0.05x</span>
+                  <span id="look-sensitivity-display" class="slider-value">0.05×</span>
                 </div>
               </div>
               <div class="control-block">
-                <label for="move-speed">Move speed:</label>
+                <label for="move-speed">Move speed</label>
                 <div class="slider-row">
                   <input id="move-speed" type="range" min="1" max="500" step="1" value="100" />
                   <span id="move-speed-display" class="slider-value">1.00 u/s</span>
@@ -1422,7 +1254,7 @@
                 </label>
               </div>
               <div class="control-block">
-                <div class="d-flex items-center gap-1">
+                <div class="checkbox-info-row">
                   <label class="checkbox-inline">
                     <input type="checkbox" id="pointer-lock" />
                     Capture pointer
@@ -1430,59 +1262,132 @@
                   <button
                     type="button"
                     id="pointer-lock-info-btn"
-                    class="info-btn mt-1"
+                    class="info-btn"
                     aria-label="About pointer capture"
                     aria-controls="pointer-lock-info-tooltip"
                     aria-haspopup="dialog"
                     aria-expanded="false"
                   ><span aria-hidden="true">i</span></button>
                 </div>
-                <div
-                  id="pointer-lock-info-tooltip"
-                  class="info-tooltip"
-                  role="dialog"
-                  aria-labelledby="pointer-lock-info-btn"
-                  tabindex="-1"
-                  hidden
-                >
-                  <div class="info-tooltip-content">
-                    Pointer capture hides the cursor and enables looking without dragging. Press Esc to release it.
-                  </div>
-                </div>
+                <div id="pointer-lock-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="pointer-lock-info-btn" tabindex="-1" data-info-tip="pointer-lock" hidden></div>
               </div>
+            </div>
+
+          </div>
+          <div class="control-block">
+            <button type="button" id="reset-camera-btn" class="btn">Reset camera</button>
+          </div>
+        </div>
+      </details>
+
+      <details class="accordion-section" id="compare-views-section">
+        <summary>Compare views</summary>
+        <div class="accordion-content">
+          <div class="control-block" id="split-view-controls" role="group" aria-labelledby="multiview-title">
+            <div class="control-group-header">
+              <h3 class="section-title" id="multiview-title">Views</h3>
+              <button
+                type="button"
+                id="multiview-info-btn"
+                class="info-btn"
+                aria-label="About multiview"
+                aria-controls="multiview-info-tooltip"
+                aria-haspopup="dialog"
+                aria-expanded="false"
+              ><span aria-hidden="true">i</span></button>
+            </div>
+            <div id="multiview-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="multiview-info-btn" tabindex="-1" data-info-tip="multiview" hidden></div>
+
+            <div id="split-view-badges-box" class="list-box split-view-badges-box" hidden>
+              <div id="split-view-badges-list" class="split-view-badges" role="list" aria-label="Open views"></div>
+            </div>
+
+            <!-- The picker edits the view selected above; built from the
+                 representations the data mapping turns on. -->
+            <div id="representation-controls" class="control-block representation-controls" hidden>
+              <div class="field-label-row">
+                <label for="view-representation-select" id="view-representation-label">Shows</label>
+                <button type="button" id="view-representation-info-btn" class="info-btn" aria-label="About what a view shows" aria-controls="view-representation-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
+              </div>
+              <div id="view-representation-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="view-representation-info-btn" tabindex="-1" data-info-tip="view-representation" hidden></div>
+              <select id="view-representation-select" class="obs-select" data-state-serializer-skip="true"></select>
+            </div>
+
+            <div class="split-view-row">
+              <button
+                type="button"
+                id="split-keep-view-btn"
+                class="btn"
+                title="Add a view: a copy of the selected one, with its own colours, filters and embedding"
+              >
+                Keep view
+              </button>
+              <button
+                id="camera-lock-btn"
+                class="btn camera-lock-btn"
+                type="button"
+                aria-pressed="false"
+                title="Cameras independent (click to link)"
+              >
+                Link cameras
+              </button>
+              <button type="button" id="camera-link-info-btn" class="info-btn" aria-label="About linked cameras" aria-controls="camera-link-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
+            </div>
+            <div id="camera-link-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="camera-link-info-btn" tabindex="-1" data-info-tip="camera-link" hidden></div>
+
+            <div id="split-view-layout-row" class="legend-actions split-view-actions" hidden>
+              <div class="d-flex items-center gap-1-5 flex-1 min-w-0">
+                <label for="view-layout-mode">Layout</label>
+                <select id="view-layout-mode" class="obs-select">
+                  <option value="grid">Grid compare</option>
+                  <option value="single">Edit selected view</option>
+                </select>
+              </div>
+              <button
+                type="button"
+                id="split-clear-btn"
+                class="btn btn-compact"
+                title="Remove all kept views"
+              >
+                Clear
+              </button>
             </div>
           </div>
         </div>
       </details>
 
       <details class="accordion-section" id="coloring-filtering-section" open>
-        <summary>Coloring & Filtering</summary>
+        <summary>Coloring & filtering</summary>
         <div class="accordion-content">
-          <!-- Color by obs -->
-          <div class="control-block">
+          <div class="control-block" id="color-by-controls" role="group" aria-labelledby="color-by-title">
+            <div class="control-group-header">
+              <h3 class="section-title" id="color-by-title">Color by</h3>
+              <button type="button" id="color-by-info-btn" class="info-btn" aria-label="About coloring by a field" aria-controls="color-by-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
+            </div>
+            <div id="color-by-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="color-by-info-btn" tabindex="-1" data-info-tip="color-by" hidden></div>
             <div class="field-select">
-              <label for="categorical-field">Categorical obs:</label>
+              <label for="categorical-field">Categorical obs</label>
               <div class="field-selector-row" id="categorical-field-row">
                 <select id="categorical-field" class="obs-select"></select>
                 <div class="field-actions" role="group" aria-label="Categorical field actions">
-                  <button type="button" class="field-action-btn" id="copy-categorical-field" title="Duplicate the selected categorical obs field" aria-label="Duplicate the selected categorical obs field" disabled>
+                  <button type="button" class="icon-btn" id="copy-categorical-field" title="Duplicate the selected categorical obs field" aria-label="Duplicate the selected categorical obs field" disabled>
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
                       <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
                       <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
                     </svg>
                   </button>
-                  <button type="button" class="field-action-btn" id="rename-categorical-field" title="Rename the selected categorical obs field" aria-label="Rename the selected categorical obs field" disabled>
+                  <button type="button" class="icon-btn" id="rename-categorical-field" title="Rename the selected categorical obs field" aria-label="Rename the selected categorical obs field" disabled>
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
                       <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
                       <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
                     </svg>
                   </button>
-                  <button type="button" class="field-action-btn field-delete-btn" id="delete-categorical-field" title="Delete the selected categorical obs field" aria-label="Delete the selected categorical obs field" disabled>
+                  <button type="button" class="icon-btn icon-btn-danger" id="delete-categorical-field" title="Delete the selected categorical obs field" aria-label="Delete the selected categorical obs field" disabled>
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
                       <path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
                     </svg>
                   </button>
-                  <button type="button" class="field-action-btn" id="clear-categorical-field" title="Clear the categorical obs selection" aria-label="Clear the categorical obs selection" disabled>
+                  <button type="button" class="icon-btn" id="clear-categorical-field" title="Clear the categorical obs selection" aria-label="Clear the categorical obs selection" disabled>
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
                       <path d="M18 6L6 18M6 6l12 12"/>
                     </svg>
@@ -1491,28 +1396,28 @@
               </div>
             </div>
             <div class="field-select">
-              <label for="continuous-field">Continuous obs:</label>
+              <label for="continuous-field">Continuous obs</label>
               <div class="field-selector-row" id="continuous-field-row">
                 <select id="continuous-field" class="obs-select"></select>
                 <div class="field-actions" role="group" aria-label="Continuous field actions">
-                  <button type="button" class="field-action-btn" id="copy-continuous-field" title="Duplicate the selected continuous obs field" aria-label="Duplicate the selected continuous obs field" disabled>
+                  <button type="button" class="icon-btn" id="copy-continuous-field" title="Duplicate the selected continuous obs field" aria-label="Duplicate the selected continuous obs field" disabled>
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
                       <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
                       <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
                     </svg>
                   </button>
-                  <button type="button" class="field-action-btn" id="rename-continuous-field" title="Rename the selected continuous obs field" aria-label="Rename the selected continuous obs field" disabled>
+                  <button type="button" class="icon-btn" id="rename-continuous-field" title="Rename the selected continuous obs field" aria-label="Rename the selected continuous obs field" disabled>
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
                       <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
                       <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
                     </svg>
                   </button>
-                  <button type="button" class="field-action-btn field-delete-btn" id="delete-continuous-field" title="Delete the selected continuous obs field" aria-label="Delete the selected continuous obs field" disabled>
+                  <button type="button" class="icon-btn icon-btn-danger" id="delete-continuous-field" title="Delete the selected continuous obs field" aria-label="Delete the selected continuous obs field" disabled>
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
                       <path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
                     </svg>
                   </button>
-                  <button type="button" class="field-action-btn" id="clear-continuous-field" title="Clear the continuous obs selection" aria-label="Clear the continuous obs selection" disabled>
+                  <button type="button" class="icon-btn" id="clear-continuous-field" title="Clear the continuous obs selection" aria-label="Clear the continuous obs selection" disabled>
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
                       <path d="M18 6L6 18M6 6l12 12"/>
                     </svg>
@@ -1521,38 +1426,38 @@
               </div>
             </div>
             <!-- Gene Expression (searchable dropdown with field-style actions) -->
-            <div class="field-select" id="gene-expression-container">
-              <label for="gene-expression-search">Gene Expression:</label>
+            <div class="field-select" id="gene-expression-container" hidden>
+              <label for="gene-expression-search">Gene expression</label>
               <div class="field-selector-row" id="gene-expression-row">
                 <div class="searchable-dropdown">
                   <input
                     type="text"
                     id="gene-expression-search"
-                    class="search-input"
-                    placeholder="Search genes..."
+                    class="obs-select"
+                    placeholder="Search genes…"
                     autocomplete="off"
                   />
-                  <div id="gene-expression-dropdown" class="dropdown-list"></div>
+                  <div id="gene-expression-dropdown" class="dropdown-list" hidden></div>
                 </div>
                 <div class="field-actions" role="group" aria-label="Gene expression actions">
-                  <button type="button" class="field-action-btn" id="copy-gene-expression" title="Duplicate the selected gene expression field" aria-label="Duplicate the selected gene expression field" disabled>
+                  <button type="button" class="icon-btn" id="copy-gene-expression" title="Duplicate the selected gene expression field" aria-label="Duplicate the selected gene expression field" disabled>
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
                       <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
                       <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
                     </svg>
                   </button>
-                  <button type="button" class="field-action-btn" id="rename-gene-expression" title="Rename the selected gene expression field" aria-label="Rename the selected gene expression field" disabled>
+                  <button type="button" class="icon-btn" id="rename-gene-expression" title="Rename the selected gene expression field" aria-label="Rename the selected gene expression field" disabled>
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
                       <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
                       <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
                     </svg>
                   </button>
-                  <button type="button" class="field-action-btn field-delete-btn" id="delete-gene-expression" title="Delete the selected gene expression field" aria-label="Delete the selected gene expression field" disabled>
+                  <button type="button" class="icon-btn icon-btn-danger" id="delete-gene-expression" title="Delete the selected gene expression field" aria-label="Delete the selected gene expression field" disabled>
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
                       <path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
                     </svg>
                   </button>
-                  <button type="button" class="field-action-btn" id="clear-gene-expression" title="Clear the gene expression selection" aria-label="Clear the gene expression selection" disabled>
+                  <button type="button" class="icon-btn" id="clear-gene-expression" title="Clear the gene expression selection" aria-label="Clear the gene expression selection" disabled>
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
                       <path d="M18 6L6 18M6 6l12 12"/>
                     </svg>
@@ -1560,23 +1465,33 @@
                 </div>
               </div>
             </div>
+
           </div>
-
-          <!-- Display Options (dashed box) -->
-          <div class="display-options-box" id="display-options-container">
-            <label>Display options:</label>
-
-            <!-- Outlier Filter (only shown for categorical fields) -->
-            <div class="control-block" id="outlier-filter-container">
-              <label for="outlier-filter">Outlier filter (latent space):</label>
-              <div class="slider-row">
-                <input id="outlier-filter" type="range" min="0" max="100" step="1" value="100" />
-                <span id="outlier-filter-display" class="slider-value">100%</span>
-              </div>
+          <div class="control-block" id="cell-info-controls">
+            <div class="checkbox-info-row">
+              <label class="checkbox-inline">
+                <input type="checkbox" id="cell-info-toggle" checked />
+                Show cell info
+              </label>
+              <button type="button" id="cell-info-info-btn" class="info-btn" aria-label="About cell info" aria-controls="cell-info-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
             </div>
-
-            <!-- Centroid controls (categorical fields only) -->
-            <div class="control-block" id="centroid-controls">
+            <div id="cell-info-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="cell-info-info-btn" tabindex="-1" data-info-tip="cell-info" hidden></div>
+            <div class="checkbox-info-row ml-4">
+              <label class="checkbox-inline">
+                <input type="checkbox" id="cell-info-categories-toggle" />
+                Show recent fields
+              </label>
+              <button type="button" id="cell-info-categories-info-btn" class="info-btn" aria-label="About recent fields on the cell card" aria-controls="cell-info-categories-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
+            </div>
+            <div id="cell-info-categories-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="cell-info-categories-info-btn" tabindex="-1" data-info-tip="cell-info-categories" hidden></div>
+          </div>
+          <div class="control-block" id="display-options-container" role="group" aria-labelledby="display-options-title" hidden>
+            <div class="control-group-header">
+              <h3 class="section-title" id="display-options-title">Legend</h3>
+              <button type="button" id="legend-info-btn" class="info-btn" aria-label="About the legend" aria-controls="legend-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
+            </div>
+            <div id="legend-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="legend-info-btn" tabindex="-1" data-info-tip="legend" hidden></div>
+            <div class="control-block" id="centroid-controls" hidden>
               <label class="checkbox-inline">
                 <input type="checkbox" id="toggle-centroid-points" />
                 Show centroids
@@ -1586,41 +1501,31 @@
                 Show labels
               </label>
             </div>
-
-            <!-- Legend / category controls -->
-            <div id="legend"></div>
-          </div>
-          <div class="control-block" id="active-filters-container">
-            <div class="d-flex items-center gap-1">
-              <label>Active filters (selected view only):</label>
-              <button
-                type="button"
-                id="active-filter-scope-btn"
-                class="info-btn"
-                aria-label="About per-view filters"
-                aria-controls="active-filter-scope-tooltip"
-                aria-haspopup="dialog"
-                aria-expanded="false"
-              ><span aria-hidden="true">i</span></button>
-            </div>
-            <div
-              id="active-filter-scope-tooltip"
-              class="info-tooltip"
-              role="dialog"
-              aria-labelledby="active-filter-scope-btn"
-              tabindex="-1"
-              hidden
-            >
-              <div class="info-tooltip-content">
-                Filters stay with the selected panel when its coloring changes; other panels remain unchanged.
+            <!-- Outlier filter: shown for categorical fields whose export has outlier scores. -->
+            <div class="control-block" id="outlier-filter-container" hidden>
+              <div class="field-label-row">
+                <label for="outlier-filter">Outlier filter</label>
+                <button type="button" id="outlier-filter-info-btn" class="info-btn" aria-label="About the outlier filter" aria-controls="outlier-filter-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
+              </div>
+              <div id="outlier-filter-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="outlier-filter-info-btn" tabindex="-1" data-info-tip="outlier-filter" hidden></div>
+              <div class="slider-row">
+                <input id="outlier-filter" type="range" min="0" max="100" step="1" value="100" />
+                <span id="outlier-filter-display" class="slider-value">100%</span>
               </div>
             </div>
-            <div id="filter-count" class="filter-info">Showing all points</div>
-            <div id="active-filters" class="filter-info-block">
-              <div class="filter-info">No filters active</div>
+            <div id="legend"></div>
+          </div>
+          <div class="control-block" id="active-filters-container" role="group" aria-labelledby="active-filter-scope-title">
+            <div class="control-group-header">
+              <h3 class="section-title" id="active-filter-scope-title">Filters</h3>
+              <button type="button" id="active-filter-scope-btn" class="info-btn" aria-label="About filters" aria-controls="active-filter-scope-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
+            </div>
+            <div id="active-filter-scope-tooltip" class="info-tooltip" role="dialog" aria-labelledby="active-filter-scope-btn" tabindex="-1" data-info-tip="filters" hidden></div>
+            <p id="filter-count" class="status-line">Showing all cells</p>
+            <div id="active-filters" class="list-box">
+              <p class="empty-state">No filters active.</p>
             </div>
           </div>
-
           <!-- Deleted fields restore UI (hidden when empty) -->
           <div id="deleted-fields-section" class="deleted-fields-section" hidden></div>
         </div>
@@ -1628,7 +1533,7 @@
 
       <!-- Community Annotation is network/auth-driven and intentionally excluded from session bundles. -->
       <details class="accordion-section" id="community-annotation-section" data-state-serializer-skip="true">
-        <summary>Community Annotation</summary>
+        <summary>Community annotation</summary>
         <div class="accordion-content">
           <div id="community-annotation-controls"></div>
         </div>
@@ -1637,36 +1542,67 @@
       <details class="accordion-section" open id="highlighted-cells-section">
         <summary>Highlighting</summary>
         <div class="accordion-content">
-          <div class="highlight-mode-box">
-            <label>Highlight mode:</label>
-            <div class="highlight-mode-buttons" role="group" aria-label="Highlight mode selection" id="highlight-mode" data-state-serializer-pressed-group>
-              <button type="button" class="toggle-switch highlight-mode-btn" id="highlight-mode-annotation" data-mode="annotation" aria-pressed="true">Annotation based</button>
-              <button type="button" class="toggle-switch highlight-mode-btn" id="highlight-mode-knn" data-mode="knn">KNN drag</button>
-              <button type="button" class="toggle-switch highlight-mode-btn" id="highlight-mode-proximity" data-mode="proximity">Proximity drag</button>
-              <button type="button" class="toggle-switch highlight-mode-btn" id="highlight-mode-lasso" data-mode="lasso">Lasso</button>
+          <div class="control-block highlight-mode-box" role="group" aria-labelledby="highlight-selection-title">
+            <div class="control-group-header">
+              <h3 class="section-title" id="highlight-selection-title">Selection</h3>
+              <button type="button" id="highlight-selection-info-btn" class="info-btn" aria-label="About selecting cells" aria-controls="highlight-selection-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
             </div>
-            <div id="highlight-mode-description" class="legend-help">
-              Alt+click a cell to highlight its group. Alt+drag to select a range.
+            <div id="highlight-selection-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="highlight-selection-info-btn" tabindex="-1" data-info-tip="selection" hidden></div>
+            <div class="control-block">
+              <span class="field-label" id="highlight-mode-title">Tool</span>
+              <div class="highlight-mode-buttons" role="group" aria-labelledby="highlight-mode-title" id="highlight-mode" data-state-serializer-pressed-group>
+                <button type="button" class="btn btn-compact highlight-mode-btn" id="highlight-mode-annotation" data-mode="annotation" aria-pressed="true">Annotation</button>
+                <button type="button" class="btn btn-compact highlight-mode-btn" id="highlight-mode-knn" data-mode="knn">KNN drag</button>
+                <button type="button" class="btn btn-compact highlight-mode-btn" id="highlight-mode-proximity" data-mode="proximity">Proximity drag</button>
+                <button type="button" class="btn btn-compact highlight-mode-btn" id="highlight-mode-lasso" data-mode="lasso">Lasso</button>
+              </div>
+              <div id="highlight-mode-description" class="field-help">
+                Alt+click a cell to highlight its group. Alt+drag to select a range.
+              </div>
+            </div>
+            <!-- Select mode stands in for a held Alt key, so a touch screen can
+                 select at all: while it is on a plain tap, click, or drag runs
+                 the active tool, and the combine buttons stand in for Shift
+                 (Add) and Ctrl (Subtract). It is an input setting like holding
+                 Alt, not session state, so neither group carries
+                 data-state-serializer-pressed-group. The same switch and
+                 combine buttons sit in the selection bar over the plot
+                 (#select-bar). -->
+            <div class="control-block highlight-select-mode-row">
+              <button type="button" role="switch" class="switch" id="highlight-select-mode" data-select-mode-switch aria-checked="false"><span class="switch-track" aria-hidden="true"></span><span class="switch-label">Select mode</span></button>
+              <div class="select-combine highlight-select-combine" id="highlight-select-combine" role="group" aria-label="How each selection gesture combines" hidden>
+                <span class="field-label select-combine-label" aria-hidden="true">Combine</span>
+                <div class="segmented">
+                  <button type="button" class="segmented-btn" id="highlight-select-combine-intersect" data-combine="intersect" aria-pressed="true">Intersect</button>
+                  <button type="button" class="segmented-btn" id="highlight-select-combine-union" data-combine="union" aria-pressed="false">Add</button>
+                  <button type="button" class="segmented-btn" id="highlight-select-combine-subtract" data-combine="subtract" aria-pressed="false">Subtract</button>
+                </div>
+              </div>
             </div>
           </div>
-          <!-- Page selector tabs -->
-          <div id="highlight-pages-container">
-            <div id="highlight-pages-tabs" role="tablist" aria-label="Highlight pages" aria-orientation="horizontal">
-              <!-- Page tabs will be added here dynamically -->
+          <div class="control-block" id="highlights-controls" role="group" aria-labelledby="highlights-title">
+            <div class="control-group-header">
+              <h3 class="section-title" id="highlights-title">Highlights</h3>
+              <button type="button" id="highlights-info-btn" class="info-btn" aria-label="About highlight pages and groups" aria-controls="highlights-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
             </div>
-            <button type="button" class="highlight-page-add-btn" id="add-highlight-page" title="Add new page" aria-label="Add highlight page">+</button>
+            <div id="highlights-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="highlights-info-btn" tabindex="-1" data-info-tip="highlights" hidden></div>
+            <div id="highlight-pages-container">
+              <div id="highlight-pages-tabs" role="tablist" aria-label="Highlight pages" aria-orientation="horizontal">
+                <!-- Page tabs will be added here dynamically -->
+              </div>
+              <button type="button" class="icon-btn highlight-page-add-btn" id="add-highlight-page" title="Add highlight page" aria-label="Add highlight page"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true" focusable="false"><path d="M12 5v14M5 12h14"/></svg></button>
+            </div>
+            <div id="highlighted-groups" class="list-box">
+              <div class="highlighted-groups-header">
+                <p id="highlight-count" class="status-line">No cells highlighted</p>
+                <button type="button" class="btn btn-compact" id="clear-all-highlights" title="Clear highlights on this page" hidden>Clear</button>
+              </div>
+              <div id="highlighted-groups-list">
+                <!-- Highlighted group items will be added here dynamically -->
+              </div>
+            </div>
           </div>
-          <div id="highlighted-groups" class="highlighted-groups-box">
-            <div class="highlighted-groups-header">
-              <div id="highlight-count" class="filter-info highlight-count-inline">No cells highlighted</div>
-              <button type="button" class="highlight-clear-btn" id="clear-all-highlights">Clear</button>
-            </div>
-            <div id="highlighted-groups-list">
-              <!-- Highlighted group items will be added here dynamically -->
-            </div>
-          </div>
-
-          <!-- Category builder (TASK 3) -->
+          <!-- Category builder -->
           <div id="category-builder-container" data-state-serializer-skip></div>
         </div>
       </details>
@@ -1679,159 +1615,36 @@
       </details>
 
       <details class="accordion-section" id="cinematic-camera-section" data-state-serializer-skip="true">
-        <summary>Camera Path</summary>
+        <summary>Camera path</summary>
         <div class="accordion-content">
-
-          <!-- Navigation controls (the same viewer navigation state as the
-               Compare Views block; either surface drives the active view) -->
-          <div class="control-block" id="cinematic-navigation-controls">
-            <div class="d-flex items-center gap-1">
-              <label>Navigation:</label>
-              <button
-                type="button"
-                id="cinematic-navigation-info-btn"
-                class="info-btn"
-                aria-label="About camera path navigation modes"
-                aria-controls="cinematic-navigation-info-tooltip"
-                aria-haspopup="dialog"
-                aria-expanded="false"
-              ><span aria-hidden="true">i</span></button>
+          <div class="control-block" role="group" aria-labelledby="cinematic-keyframes-title">
+            <div class="control-group-header cinematic-keyframes-header">
+              <h3 class="section-title" id="cinematic-keyframes-title">Keyframes</h3>
+              <button type="button" id="camera-path-info-btn" class="info-btn" aria-label="About camera path keyframes" aria-controls="camera-path-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
+              <button id="cinematic-clear-btn" class="btn btn-compact" type="button">Clear all</button>
             </div>
-            <div
-              id="cinematic-navigation-info-tooltip"
-              class="info-tooltip"
-              role="dialog"
-              aria-labelledby="cinematic-navigation-info-btn"
-              tabindex="-1"
-              hidden
-            >
-              <div class="info-tooltip-content">
-                The same navigation mode as the Compare Views panel. Each keyframe records the mode it was saved in.
-              </div>
-            </div>
-            <div class="control-block">
-              <label for="cinematic-nav-mode">Mode:</label>
-              <select id="cinematic-nav-mode" class="obs-select">
-                <option value="orbit">Orbit</option>
-                <option value="planar">Planar</option>
-                <option value="free">Free-fly</option>
-              </select>
-            </div>
-            <div id="cinematic-orbit-controls" class="nav-mode-box">
-              <div class="control-block">
-                <label for="cinematic-orbit-key-speed">Keyboard speed:</label>
-                <div class="slider-row">
-                  <input id="cinematic-orbit-key-speed" type="range" min="1" max="100" step="1" value="40" />
-                  <span id="cinematic-orbit-key-speed-display" class="slider-value">0.40x</span>
-                </div>
-              </div>
-              <label class="checkbox-inline">
-                <input type="checkbox" id="cinematic-orbit-reverse" checked />
-                Google Earth-style drag
-              </label>
-              <label class="checkbox-inline">
-                <input type="checkbox" id="cinematic-show-orbit-anchor" checked />
-                Show orbit anchor
-              </label>
-            </div>
-            <div id="cinematic-planar-controls" class="nav-mode-box">
-              <div class="control-block">
-                <label for="cinematic-planar-pan-speed">Keyboard speed:</label>
-                <div class="slider-row">
-                  <input id="cinematic-planar-pan-speed" type="range" min="1" max="100" step="1" value="100" />
-                  <span id="cinematic-planar-pan-speed-display" class="slider-value">0.0075x</span>
-                </div>
-              </div>
-              <label class="checkbox-inline">
-                <input type="checkbox" id="cinematic-planar-zoom-to-cursor" checked />
-                Zoom to cursor
-              </label>
-              <label class="checkbox-inline">
-                <input type="checkbox" id="cinematic-planar-invert-axes" />
-                Invert axes
-              </label>
-            </div>
-            <div id="cinematic-freefly-controls" class="nav-mode-box">
-              <div class="control-block">
-                <label for="cinematic-look-sensitivity">Look sensitivity:</label>
-                <div class="slider-row">
-                  <input id="cinematic-look-sensitivity" type="range" min="1" max="30" step="1" value="5" />
-                  <span id="cinematic-look-sensitivity-display" class="slider-value">0.05x</span>
-                </div>
-              </div>
-              <div class="control-block">
-                <label for="cinematic-move-speed">Move speed:</label>
-                <div class="slider-row">
-                  <input id="cinematic-move-speed" type="range" min="1" max="500" step="1" value="100" />
-                  <span id="cinematic-move-speed-display" class="slider-value">1.00 u/s</span>
-                </div>
-              </div>
-              <label class="checkbox-inline">
-                <input type="checkbox" id="cinematic-invert-look" />
-                Invert look axes
-              </label>
-              <label class="checkbox-inline">
-                <input type="checkbox" id="cinematic-pointer-lock" />
-                Capture pointer
-              </label>
-            </div>
-          </div>
-
-          <!-- Save position button -->
-          <div class="control-block">
-            <div class="d-flex items-center gap-1">
-              <label class="mt-0">Save Keyframe</label>
-              <button
-                type="button"
-                id="camera-path-info-btn"
-                class="info-btn"
-                aria-label="About camera paths"
-                aria-controls="camera-path-info-tooltip"
-                aria-haspopup="dialog"
-                aria-expanded="false"
-              ><span aria-hidden="true">i</span></button>
-            </div>
-            <div
-              id="camera-path-info-tooltip"
-              class="info-tooltip"
-              role="dialog"
-              aria-labelledby="camera-path-info-btn"
-              tabindex="-1"
-              hidden
-            >
-              <div class="info-tooltip-content">
-                Save at least two positions to enable the top playback bar. Autoplay is opt-in.
-              </div>
-            </div>
-            <button id="cinematic-save-btn" class="reset-btn w-full" type="button">
-              Save Position
-            </button>
-          </div>
-
-          <!-- Keyframe list + transition timing (unified scrollable box) -->
-          <div class="control-block">
-            <div class="d-flex items-center cinematic-keyframes-header">
-              <label class="m-0">Keyframes</label>
-              <button id="cinematic-clear-btn" class="cinematic-clear-btn" type="button">Clear All</button>
-            </div>
+            <div id="camera-path-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="camera-path-info-btn" tabindex="-1" data-info-tip="keyframes" hidden></div>
+            <button id="cinematic-save-btn" class="btn w-full" type="button">Save position</button>
             <div id="cinematic-keyframe-list" class="cinematic-keyframe-list">
-              <div class="cinematic-empty-state">No keyframes saved yet.</div>
+              <p class="empty-state">No keyframes saved yet.</p>
             </div>
-            <div id="cinematic-timing-actions" class="cinematic-timing-actions" style="display:none;">
-              <label for="cinematic-set-all-duration" class="m-0">Set all:</label>
-              <input id="cinematic-set-all-duration" type="number" class="cinematic-duration-input"
-                     min="0.1" max="60" step="0.1" placeholder="auto" />
+            <div id="cinematic-timing-actions" class="cinematic-timing-actions" hidden>
+              <label for="cinematic-set-all-duration" class="m-0">Set all</label>
+              <input id="cinematic-set-all-duration" type="number" class="obs-select cinematic-duration-input"
+                     min="0.1" step="0.1" placeholder="auto" />
               <span class="cinematic-timing-unit">s</span>
-              <button id="cinematic-set-all-btn" class="btn-small" type="button">Apply</button>
+              <button id="cinematic-set-all-btn" class="btn btn-compact" type="button">Apply</button>
             </div>
           </div>
-
-          <!-- Interpolation / playback settings (dashed box) -->
-          <div id="cinematic-interpolation-settings" class="cinematic-settings-box">
-            <label>Settings</label>
+          <div id="cinematic-interpolation-settings" class="control-block" role="group" aria-labelledby="cinematic-settings-title">
+            <div class="control-group-header">
+              <h3 class="section-title" id="cinematic-settings-title">Playback</h3>
+              <button type="button" id="cinematic-playback-info-btn" class="info-btn" aria-label="About camera path playback" aria-controls="cinematic-playback-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
+            </div>
+            <div id="cinematic-playback-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="cinematic-playback-info-btn" tabindex="-1" data-info-tip="playback" hidden></div>
             <div class="control-block">
-              <div class="d-flex items-center gap-1">
-                <label for="cinematic-default-speed">Default speed:</label>
+              <div class="field-label-row">
+                <label for="cinematic-default-speed">Default speed</label>
                 <button
                   type="button"
                   id="camera-speed-info-btn"
@@ -1841,256 +1654,239 @@
                   aria-haspopup="dialog"
                   aria-expanded="false"
                 ><span aria-hidden="true">i</span></button>
-              </div>
-              <div
-                id="camera-speed-info-tooltip"
-                class="info-tooltip"
-                role="dialog"
-                aria-labelledby="camera-speed-info-btn"
-                tabindex="-1"
-                hidden
-              >
-                <div class="info-tooltip-content">
-                  Default speed controls travel between keyframes whose timing is set to auto.
-                </div>
-              </div>
+            </div>
+              <div id="camera-speed-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="camera-speed-info-btn" tabindex="-1" data-info-tip="default-speed" hidden></div>
               <div class="slider-row">
                 <input id="cinematic-default-speed" type="range" min="1" max="100" step="1" value="30" />
                 <span id="cinematic-default-speed-display" class="slider-value">Slow</span>
               </div>
             </div>
             <div class="control-block">
-              <label for="cinematic-position-interp">Position interpolation:</label>
+              <label for="cinematic-position-interp">Position interpolation</label>
               <select id="cinematic-position-interp" class="obs-select">
-                <option value="catmull-rom" selected>Catmull-Rom Spline</option>
+                <option value="catmull-rom" selected>Catmull-Rom spline</option>
                 <option value="linear">Linear</option>
                 <option value="bezier">Bezier</option>
               </select>
             </div>
             <div class="control-block">
-              <label for="cinematic-rotation-interp">Rotation interpolation:</label>
+              <label for="cinematic-rotation-interp">Rotation interpolation</label>
               <select id="cinematic-rotation-interp" class="obs-select">
-                <option value="slerp" selected>SLERP (Smooth)</option>
+                <option value="slerp" selected>SLERP (smooth)</option>
                 <option value="linear">Linear (Euler)</option>
               </select>
             </div>
             <div class="control-block">
-              <label for="cinematic-easing">Easing:</label>
+              <label for="cinematic-easing">Easing</label>
               <select id="cinematic-easing" class="obs-select">
                 <option value="linear" selected>Linear</option>
-                <option value="ease-in-out">Ease In-Out</option>
-                <option value="ease-in">Ease In</option>
-                <option value="ease-out">Ease Out</option>
+                <option value="ease-in-out">Ease in-out</option>
+                <option value="ease-in">Ease in</option>
+                <option value="ease-out">Ease out</option>
               </select>
             </div>
             <div class="control-block">
-              <label class="mt-0 d-flex items-center gap-1-5">
+              <label class="checkbox-inline">
                 <input type="checkbox" id="cinematic-loop" />
                 Loop playback
               </label>
-              <label class="mt-1-5 d-flex items-center gap-1-5">
+              <label class="checkbox-inline">
                 <input type="checkbox" id="cinematic-autoplay" />
                 Autoplay
               </label>
             </div>
-          </div>
 
+          </div>
         </div>
       </details>
 
       <details class="accordion-section" id="figure-export-section" data-state-serializer-skip="true">
-        <summary>Figure Export</summary>
+        <summary>Figure export</summary>
         <div class="accordion-content">
           <div id="figure-export-controls"></div>
         </div>
       </details>
 
       <details class="accordion-section" id="shortcuts-section">
-        <summary>Keyboard Shortcuts</summary>
+        <summary>Keyboard shortcuts</summary>
         <div class="accordion-content">
-          <div class="shortcuts-list">
-            <div class="shortcut-item"><kbd>R</kbd><span>Reset camera</span></div>
-            <div class="shortcut-item"><kbd>F</kbd><span>Fullscreen</span></div>
-            <div class="shortcut-item"><kbd>H</kbd><span>Toggle sidebar</span></div>
-            <div class="shortcut-item"><kbd>1</kbd><kbd>2</kbd><kbd>3</kbd><span>Switch dimension</span></div>
-            <div class="shortcut-item"><kbd>O</kbd><kbd>P</kbd><kbd>G</kbd><span>Orbit / Planar / Free-fly</span></div>
-            <div class="shortcut-item"><kbd>?</kbd><span>Show shortcuts</span></div>
+          <div class="shortcuts-list" role="group" aria-labelledby="shortcuts-general-title">
+            <div class="control-group-header">
+              <h3 class="section-title" id="shortcuts-general-title">General</h3>
+              <button type="button" id="shortcuts-general-title-info-btn" class="info-btn" aria-label="About general shortcuts" aria-controls="shortcuts-general-title-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
+            </div>
+            <div id="shortcuts-general-title-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="shortcuts-general-title-info-btn" tabindex="-1" data-info-tip="shortcuts-general" hidden></div>
+            <div class="shortcut-item"><span class="shortcut-desc">Reset camera</span><span class="shortcut-keys"><kbd>R</kbd></span></div>
+            <div class="shortcut-item"><span class="shortcut-desc">Fullscreen</span><span class="shortcut-keys"><kbd>F</kbd></span></div>
+            <div class="shortcut-item"><span class="shortcut-desc">Toggle sidebar</span><span class="shortcut-keys"><kbd>H</kbd></span></div>
+            <div class="shortcut-item"><span class="shortcut-desc" title="Shows that dimension's default embedding in the selected view; press again for its next embedding">1D, 2D, 3D embedding · again: next</span><span class="shortcut-keys"><kbd>1</kbd><kbd>2</kbd><kbd>3</kbd></span></div>
+            <div class="shortcut-item"><span class="shortcut-desc">Navigation mode</span><span class="shortcut-keys"><kbd>O</kbd><kbd>P</kbd><kbd>G</kbd></span></div>
+            <div class="shortcut-item"><span class="shortcut-desc">Show shortcuts</span><span class="shortcut-keys"><kbd>?</kbd></span></div>
           </div>
           <!-- Every row here is checked against the handler that implements it
                by tests/keyboard-shortcut-panel-contract.test.mjs. A row that
                names a gesture the code rejects is worse than no row: it spends
                the user's time proving the app is broken. -->
-          <div class="shortcuts-list mt-2">
-            <div class="shortcut-group-title">Navigation (Orbit / Planar / Free-fly)</div>
-            <div class="shortcut-item"><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd><span>Orbit / pan / move</span></div>
-            <div class="shortcut-item"><kbd>Shift</kbd><span>Move faster</span></div>
+          <div class="shortcuts-list" role="group" aria-labelledby="shortcuts-navigation-title">
+            <div class="control-group-header">
+              <h3 class="section-title" id="shortcuts-navigation-title">Navigation</h3>
+              <button type="button" id="shortcuts-navigation-title-info-btn" class="info-btn" aria-label="About navigation keys" aria-controls="shortcuts-navigation-title-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
+            </div>
+            <div id="shortcuts-navigation-title-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="shortcuts-navigation-title-info-btn" tabindex="-1" data-info-tip="shortcuts-navigation" hidden></div>
+            <div class="shortcut-item"><span class="shortcut-desc">Orbit / pan / move</span><span class="shortcut-keys"><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd></span></div>
+            <div class="shortcut-item"><span class="shortcut-desc">Move faster</span><span class="shortcut-keys"><kbd>Shift</kbd></span></div>
           </div>
-          <div class="shortcuts-list">
-            <div class="shortcut-group-title">Orbit and Planar only</div>
-            <div class="shortcut-item"><kbd>=</kbd><kbd>]</kbd><span>Zoom in</span></div>
-            <div class="shortcut-item"><kbd>-</kbd><kbd>[</kbd><span>Zoom out</span></div>
+          <div class="shortcuts-list" role="group" aria-labelledby="shortcuts-zoom-title">
+            <div class="control-group-header">
+              <h3 class="section-title" id="shortcuts-zoom-title">Zoom</h3>
+              <button type="button" id="shortcuts-zoom-title-info-btn" class="info-btn" aria-label="About zoom keys" aria-controls="shortcuts-zoom-title-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
+            </div>
+            <div id="shortcuts-zoom-title-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="shortcuts-zoom-title-info-btn" tabindex="-1" data-info-tip="shortcuts-zoom" hidden></div>
+            <div class="shortcut-item"><span class="shortcut-desc">Zoom in</span><span class="shortcut-keys"><kbd>=</kbd><kbd>]</kbd></span></div>
+            <div class="shortcut-item"><span class="shortcut-desc">Zoom out</span><span class="shortcut-keys"><kbd>-</kbd><kbd>[</kbd></span></div>
           </div>
-          <div class="shortcuts-list">
-            <div class="shortcut-group-title">Free-fly specific</div>
-            <div class="shortcut-item"><kbd>E</kbd><kbd>Q</kbd><span>Up / down</span></div>
-            <div class="shortcut-item"><kbd>Esc</kbd><span>Exit pointer lock</span></div>
+          <div class="shortcuts-list" role="group" aria-labelledby="shortcuts-free-fly-title">
+            <div class="control-group-header">
+              <h3 class="section-title" id="shortcuts-free-fly-title">Free-fly</h3>
+              <button type="button" id="shortcuts-free-fly-title-info-btn" class="info-btn" aria-label="About free-fly keys" aria-controls="shortcuts-free-fly-title-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
+            </div>
+            <div id="shortcuts-free-fly-title-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="shortcuts-free-fly-title-info-btn" tabindex="-1" data-info-tip="shortcuts-free-fly" hidden></div>
+            <div class="shortcut-item"><span class="shortcut-desc">Up / down</span><span class="shortcut-keys"><kbd>E</kbd><kbd>Q</kbd></span></div>
+            <div class="shortcut-item"><span class="shortcut-desc">Release pointer</span><span class="shortcut-keys"><kbd>Esc</kbd></span></div>
           </div>
-          <div class="shortcuts-list mt-2">
-            <div class="shortcut-group-title">Highlighting</div>
-            <div class="shortcut-item"><kbd>Alt</kbd>+click<span>Highlight group</span></div>
-            <div class="shortcut-item"><kbd>Alt</kbd>+drag<span>Drag with the active tool</span></div>
-            <div class="shortcut-item"><kbd>Shift</kbd>+<kbd>Alt</kbd>+click<span>Add to selection</span></div>
-            <div class="shortcut-item"><kbd>Ctrl</kbd>+<kbd>Alt</kbd>+click<span>Subtract from selection</span></div>
-            <div class="shortcut-item"><kbd>Esc</kbd><span>Cancel selection in progress</span></div>
-            <div class="shortcut-item"><kbd>X</kbd><span>Clear highlights</span></div>
+          <div class="shortcuts-list" role="group" aria-labelledby="shortcuts-selection-title">
+            <div class="control-group-header">
+              <h3 class="section-title" id="shortcuts-selection-title">Selection</h3>
+              <button type="button" id="shortcuts-selection-title-info-btn" class="info-btn" aria-label="About selection keys" aria-controls="shortcuts-selection-title-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
+            </div>
+            <div id="shortcuts-selection-title-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="shortcuts-selection-title-info-btn" tabindex="-1" data-info-tip="shortcuts-selection" hidden></div>
+            <div class="shortcut-item"><span class="shortcut-desc">Highlight group</span><span class="shortcut-keys"><kbd>Alt</kbd>+click</span></div>
+            <div class="shortcut-item"><span class="shortcut-desc">Drag with the active tool</span><span class="shortcut-keys"><kbd>Alt</kbd>+drag</span></div>
+            <div class="shortcut-item"><span class="shortcut-desc">Add to selection</span><span class="shortcut-keys"><kbd>Shift</kbd>+<kbd>Alt</kbd>+click</span></div>
+            <div class="shortcut-item"><span class="shortcut-desc">Subtract from selection</span><span class="shortcut-keys"><kbd>Ctrl</kbd>+<kbd>Alt</kbd>+click</span></div>
+            <div class="shortcut-item"><span class="shortcut-desc">Cancel selection</span><span class="shortcut-keys"><kbd>Esc</kbd></span></div>
+            <div class="shortcut-item"><span class="shortcut-desc">Leave Select mode</span><span class="shortcut-keys"><kbd>Esc</kbd></span></div>
+            <div class="shortcut-item"><span class="shortcut-desc">Clear highlights</span><span class="shortcut-keys"><kbd>X</kbd></span></div>
           </div>
         </div>
       </details>
 
       <details class="accordion-section" id="benchmark-section" data-state-serializer-skip="true">
-        <summary>Performance Benchmark</summary>
+        <summary>Benchmark</summary>
         <div class="accordion-content">
-          <!-- Quick presets -->
-          <div class="control-block">
-            <div class="d-flex items-center gap-1">
-              <label>Quick test:</label>
-              <button
-                type="button"
-                id="benchmark-info-btn"
-                class="info-btn"
-                aria-label="About performance benchmarks"
-                aria-controls="benchmark-info-tooltip"
-                aria-haspopup="dialog"
-                aria-expanded="false"
-              ><span aria-hidden="true">i</span></button>
+          <div class="control-block" role="group" aria-labelledby="benchmark-title">
+            <div class="control-group-header">
+              <h3 class="section-title" id="benchmark-title">Synthetic data</h3>
+              <button type="button" id="benchmark-info-btn" class="info-btn" aria-label="About synthetic benchmark data" aria-controls="benchmark-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
             </div>
-            <div
-              id="benchmark-info-tooltip"
-              class="info-tooltip"
-              role="dialog"
-              aria-labelledby="benchmark-info-btn"
-              tabindex="-1"
-              hidden
-            >
-              <div class="info-tooltip-content">
-                Test rendering limits with synthetic data. Adjust renderer settings in Visualization; reload the page to restore the original data.
-              </div>
-            </div>
-            <div class="benchmark-presets">
-              <button class="btn-small benchmark-preset" data-count="100000">100K</button>
-              <button class="btn-small benchmark-preset" data-count="500000">500K</button>
-              <button class="btn-small benchmark-preset" data-count="1000000">1M</button>
-              <button class="btn-small benchmark-preset" data-count="5000000">5M</button>
-              <button class="btn-small benchmark-preset" data-count="10000000">10M</button>
-              <button class="btn-small benchmark-preset" data-count="20000000">20M</button>
-            </div>
-          </div>
-
-          <!-- Custom count -->
-          <div class="control-block mt-2">
-            <label for="benchmark-count">Custom point count:</label>
-            <!--
-              min/max/step are MIN_SYNTHETIC_COUNT, MAX_SYNTHETIC_COUNT and one
-              exact point, from app/ui/modules/benchmark/generation-contract.js.
-              `benchmark-generation-contract.test.mjs` fails if they drift; this
-              is static markup, so the constant cannot be interpolated here.
-            -->
-            <input type="number" id="benchmark-count" value="1000000" min="1" max="250000000" step="1" class="obs-select benchmark-count-input" />
-          </div>
-
-          <!-- Pattern selection -->
-          <div class="control-block mt-2">
-            <label for="benchmark-pattern">Data pattern:</label>
-            <select id="benchmark-pattern" class="obs-select">
-              <option value="glb" selected>Model Surface</option>
-              <option value="atlas">Atlas-like</option>
-              <option value="batches">Batch Effects</option>
-              <option value="clusters">Gaussian Clusters</option>
-              <option value="uniform">Uniform Random</option>
-              <option value="octopus">Octopus</option>
-              <option value="spirals">3D Spirals</option>
-              <option value="flatumap">Flat UMAP</option>
-            </select>
-          </div>
-
-          <!-- Run button -->
-          <div class="control-block mt-2-5">
-            <button id="benchmark-run" class="btn-small benchmark-run-btn">
-              Load Synthetic Data
-            </button>
-          </div>
-
-          <!-- Stats display -->
-          <div id="benchmark-stats" class="benchmark-stats">
-            <div class="benchmark-stats-grid">
-              <div class="benchmark-stat">
-                <div class="benchmark-stat-label">Points</div>
-                <div id="bench-points" class="benchmark-stat-value benchmark-stat-value--headline">-</div>
-              </div>
-              <div class="benchmark-stat">
-                <div class="benchmark-stat-label">FPS</div>
-                <div id="bench-fps" class="benchmark-stat-value benchmark-stat-value--headline">-</div>
-              </div>
-              <div class="benchmark-stat">
-                <div class="benchmark-stat-label">Frame Time</div>
-                <div id="bench-frametime" class="benchmark-stat-value">-</div>
-              </div>
-              <div class="benchmark-stat">
-                <div class="benchmark-stat-label">GPU Memory</div>
-                <div id="bench-memory" class="benchmark-stat-value">-</div>
-              </div>
-              <div class="benchmark-stat">
-                <div class="benchmark-stat-label">LOD Level</div>
-                <div id="bench-lod" class="benchmark-stat-value">-</div>
-              </div>
-              <div class="benchmark-stat">
-                <div class="benchmark-stat-label">Visible Points</div>
-                <div id="bench-visible" class="benchmark-stat-value">-</div>
-              </div>
-            </div>
-            <!-- Detailed timing stats -->
-            <div id="bench-timing-details" class="benchmark-timing-details">
-              <div class="benchmark-stat-label mb-1">Timing Details</div>
-              <div class="benchmark-timing-grid">
-                <div><span class="text-tertiary">min:</span> <span id="bench-min-ft">-</span></div>
-                <div><span class="text-tertiary">p95:</span> <span id="bench-p95-ft">-</span></div>
-                <div><span class="text-tertiary">max:</span> <span id="bench-max-ft">-</span></div>
-              </div>
-            </div>
-            <!-- Data generation info -->
-            <div id="bench-gen-info" class="benchmark-gen-info">
-              Generated in <span id="bench-gen-time">-</span>ms
-            </div>
-          </div>
-
-          <div class="control-block mt-2-5">
-            <button id="benchmark-report-btn" class="btn-small benchmark-run-btn">
-              Copy Situation Report
-            </button>
-            <textarea id="benchmark-report-output" readonly></textarea>
-          </div>
-
-          <!-- Bottleneck Analysis Section -->
-          <div class="bottleneck-section">
-            <div class="bottleneck-title">Why is it slow?</div>
-
-            <!-- Single Analysis Button -->
+            <div id="benchmark-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="benchmark-info-btn" tabindex="-1" data-info-tip="synthetic-data" hidden></div>
             <div class="control-block">
-              <button id="bottleneck-analyze-btn" class="btn-small bottleneck-analyze-btn">
-                Analyze Performance
+              <span class="field-label" id="benchmark-presets-label">Presets</span>
+              <div class="benchmark-presets" role="group" aria-labelledby="benchmark-presets-label">
+                <button type="button" class="btn btn-compact benchmark-preset" data-count="500000">500K</button>
+                <button type="button" class="btn btn-compact benchmark-preset" data-count="1000000">1M</button>
+                <button type="button" class="btn btn-compact benchmark-preset" data-count="5000000">5M</button>
+                <button type="button" class="btn btn-compact benchmark-preset" data-count="10000000">10M</button>
+                <button type="button" class="btn btn-compact benchmark-preset" data-count="20000000">20M</button>
+                <button type="button" class="btn btn-compact benchmark-preset" data-count="40000000">40M</button>
+              </div>
+            </div>
+            <div class="control-block">
+              <label for="benchmark-count">Point count</label>
+              <!--
+                min/max/step are MIN_SYNTHETIC_COUNT, MAX_SYNTHETIC_COUNT and one
+                exact point, from app/ui/modules/benchmark/generation-contract.js.
+                `benchmark-generation-contract.test.mjs` fails if they drift; this
+                is static markup, so the constant cannot be interpolated here.
+              -->
+              <input type="number" id="benchmark-count" value="1000000" min="1" max="250000000" step="1" class="obs-select benchmark-count-input" />
+            </div>
+            <div class="control-block">
+              <label for="benchmark-pattern">Pattern</label>
+              <select id="benchmark-pattern" class="obs-select">
+                <option value="glb" selected>Model surface</option>
+                <option value="atlas">Atlas-like</option>
+                <option value="batches">Batch effects</option>
+                <option value="clusters">Gaussian clusters</option>
+                <option value="uniform">Uniform random</option>
+                <option value="octopus">Octopus</option>
+                <option value="spirals">3D spirals</option>
+                <option value="flatumap">Flat UMAP</option>
+              </select>
+            </div>
+            <div class="control-block">
+              <label for="benchmark-representations">Embeddings</label>
+              <select id="benchmark-representations" class="obs-select" title="Five derives two more 3D and two 2D embeddings from the generated points, each produced when a view first shows it">
+                <option value="one" selected>One, as generated</option>
+                <option value="five">Five: 3 in 3D, 2 in 2D</option>
+              </select>
+            </div>
+            <div class="control-block">
+              <button type="button" id="benchmark-run" class="btn btn-primary benchmark-run-btn">
+                Load synthetic data
               </button>
             </div>
-
-            <!-- Analysis Progress -->
-            <div id="bottleneck-progress" class="bottleneck-progress">
-              <div class="d-flex items-center gap-2">
-                <span class="bottleneck-spinner" aria-hidden="true"></span>
-                <span id="bottleneck-progress-text">Measuring performance...</span>
+            <div id="benchmark-stats" class="benchmark-stats" hidden>
+              <div class="benchmark-stats-grid">
+                <div class="benchmark-stat">
+                  <div class="benchmark-stat-label">Points</div>
+                  <div id="bench-points" class="benchmark-stat-value benchmark-stat-value--headline">-</div>
+                </div>
+                <div class="benchmark-stat">
+                  <div class="benchmark-stat-label">FPS</div>
+                  <div id="bench-fps" class="benchmark-stat-value benchmark-stat-value--headline">-</div>
+                </div>
+                <div class="benchmark-stat">
+                  <div class="benchmark-stat-label">Frame time</div>
+                  <div id="bench-frametime" class="benchmark-stat-value">-</div>
+                  <div id="bench-rendertime" class="benchmark-stat-note" hidden></div>
+                </div>
+                <div class="benchmark-stat">
+                  <div class="benchmark-stat-label">GPU memory</div>
+                  <div id="bench-memory" class="benchmark-stat-value">-</div>
+                </div>
+                <div class="benchmark-stat">
+                  <div class="benchmark-stat-label">LOD level</div>
+                  <div id="bench-lod" class="benchmark-stat-value">-</div>
+                </div>
+                <div class="benchmark-stat">
+                  <div class="benchmark-stat-label">Visible points</div>
+                  <div id="bench-visible" class="benchmark-stat-value">-</div>
+                </div>
+              </div>
+              <!-- Detailed timing stats -->
+              <div id="bench-timing-details" class="benchmark-timing-details" hidden>
+                <div class="benchmark-stat-label mb-1">Timing details</div>
+                <div class="benchmark-timing-grid">
+                  <div><span class="text-tertiary">min:</span> <span id="bench-min-ft">-</span></div>
+                  <div><span class="text-tertiary">p95:</span> <span id="bench-p95-ft">-</span></div>
+                  <div><span class="text-tertiary">max:</span> <span id="bench-max-ft">-</span></div>
+                </div>
+              </div>
+              <!-- Data generation info -->
+              <div id="bench-gen-info" class="benchmark-gen-info" hidden>
+                Generated in <span id="bench-gen-time">-</span>ms
               </div>
             </div>
-
-            <!-- Analysis Results Panel -->
-            <div id="bottleneck-results" class="bottleneck-results">
+          </div>
+          <div class="control-block bottleneck-section" role="group" aria-labelledby="diagnostics-title">
+            <div class="control-group-header">
+              <h3 class="section-title" id="diagnostics-title">Diagnostics</h3>
+              <button type="button" id="diagnostics-info-btn" class="info-btn" aria-label="About performance diagnostics" aria-controls="diagnostics-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
+            </div>
+            <div id="diagnostics-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="diagnostics-info-btn" tabindex="-1" data-info-tip="diagnostics" hidden></div>
+            <div class="control-block">
+              <button type="button" id="bottleneck-analyze-btn" class="btn bottleneck-analyze-btn">
+                Analyze performance
+              </button>
+            </div>
+            <div id="bottleneck-progress" class="bottleneck-progress" role="status" hidden>
+              <div class="d-flex items-center gap-2">
+                <span class="spinner" aria-hidden="true"></span>
+                <span id="bottleneck-progress-text">Measuring performance…</span>
+              </div>
+            </div>
+            <div id="bottleneck-results" class="bottleneck-results" hidden>
 
               <!-- Verdict Box -->
               <div id="bn-verdict-box" class="bn-verdict" data-status="warning">
@@ -2119,20 +1915,23 @@
 
               <!-- Problem List -->
               <div id="bn-problems" class="bn-section">
-                <div class="bn-section-title">Problems Found:</div>
+                <h3 class="section-title">Problems found</h3>
                 <div id="bn-problem-list" class="bn-list"></div>
               </div>
 
               <!-- What To Do -->
               <div id="bn-fixes" class="bn-section bn-section--success">
-                <div class="bn-section-title">What to do:</div>
+                <h3 class="section-title">What to do</h3>
                 <div id="bn-fix-list" class="bn-list"></div>
               </div>
 
               <!-- Stats (collapsed by default) -->
-              <details class="bn-details">
-                <summary class="bn-details-summary">Show detailed stats</summary>
-                <div class="bn-details-body">
+              <div class="disclosure disclosure-inline bn-details" data-static-disclosure>
+                <button type="button" class="disclosure-header" aria-expanded="false" aria-controls="bn-details-body">
+                  <span class="disclosure-title">Detailed stats</span>
+                  <span class="disclosure-chevron" aria-hidden="true"></span>
+                </button>
+                <div class="disclosure-content bn-details-body" id="bn-details-body" hidden>
                   <div class="bn-details-grid">
                     <div>Points: <span id="bn-visible-points" class="bn-details-value">--</span></div>
                     <div>GPU Mem: <span id="bn-gpu-memory" class="bn-details-value">--</span></div>
@@ -2152,10 +1951,15 @@
                     <div>CPU health: <span id="bn-cpu-health" class="bn-details-value">--</span></div>
                   </div>
                 </div>
-              </details>
+              </div>
+            </div>
+            <div class="control-block">
+              <button type="button" id="benchmark-report-btn" class="btn benchmark-run-btn">
+                Copy situation report
+              </button>
+              <textarea id="benchmark-report-output" class="obs-select" aria-label="Situation report" readonly hidden></textarea>
             </div>
           </div>
-
         </div>
       </details>
 
@@ -2164,7 +1968,10 @@
     <div id="stats" class="sr-only">Loading data…</div>
 
       <div id="copyright">
-        © Kemal Inecik · <a href="https://kemalinecik.com" target="_blank" rel="noopener noreferrer">kemalinecik.com</a> · <a href="#" id="license-link">BSD 3-Clause</a> · Build <span id="web-build-version" aria-label="Website build version"></span>
+        <p>© <a href="https://kemalinecik.com" target="_blank" rel="noopener noreferrer">Kemal Inecik</a> · <a href="https://www.helmholtz-munich.de/en/icb/research-groups/theis-lab" target="_blank" rel="noopener noreferrer">Theis Lab</a></p>
+        <p><a href="https://docs.cellucid.com/en/latest/" target="_blank" rel="noopener noreferrer">Docs</a> · <a href="https://docs.cellucid.com/en/latest/citing.html" target="_blank" rel="noopener noreferrer" id="footer-cite-link" data-cite-open>Cite</a> · <a href="https://github.com/theislab/cellucid" target="_blank" rel="noopener noreferrer">GitHub</a></p>
+        <p><a href="#" id="license-link">BSD 3-Clause license</a></p>
+        <p>Version <span id="web-version" aria-label="Cellucid version"></span> · Build <span id="web-build-version" aria-label="Website build version"></span></p>
       </div>
 		  </div>
 	  </div>
@@ -2173,6 +1980,24 @@
   <div id="label-layer"></div>
   <!-- Titles for small multiple viewports -->
   <div id="view-title-layer"></div>
+
+  <!--
+    Shown across the viewer while files are dragged over the page
+    (ui/modules/dataset-drop.js). Purely visual: keyboard and screen-reader
+    users open data with the H5AD, Zarr ZIP and Prepared buttons, and the
+    outcome of a drop is announced by the notification it produces.
+  -->
+  <div id="dataset-drop-overlay" class="dataset-drop-overlay" aria-hidden="true" hidden>
+    <div class="dataset-drop-panel">
+      <svg class="dataset-drop-icon" width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M12 3v12"/>
+        <path d="M7 10l5 5 5-5"/>
+        <path d="M4 15v4a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-4"/>
+      </svg>
+      <p class="dataset-drop-title">Drop to open</p>
+      <p class="dataset-drop-hint">One .h5ad file, one .zarr.zip archive, or one prepared export folder</p>
+    </div>
+  </div>
 
   <!-- glMatrix for matrix math (self-hosted, defer ensures it loads before ES modules) -->
   <script defer src="assets/external/gl-matrix-min.js"></script>

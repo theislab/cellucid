@@ -16,12 +16,16 @@ const cameraControlsSource = await readFile(
   new URL('../assets/js/app/ui/modules/camera-controls.js', import.meta.url),
   'utf8'
 );
-const dimensionControlsSource = await readFile(
-  new URL('../assets/js/app/ui/modules/dimension-controls.js', import.meta.url),
+const representationControlsSource = await readFile(
+  new URL('../assets/js/app/ui/modules/representation-controls.js', import.meta.url),
   'utf8'
 );
 const cinematicCameraSource = await readFile(
   new URL('../assets/js/app/ui/modules/cinematic-camera/index.js', import.meta.url),
+  'utf8'
+);
+const navigationSettingsSource = await readFile(
+  new URL('../assets/js/app/ui/modules/navigation-settings.js', import.meta.url),
   'utf8'
 );
 const viewControlsSource = await readFile(
@@ -42,63 +46,34 @@ const domCacheSource = await readFile(
 );
 const indexHtml = await readFile(new URL('../index.html', import.meta.url), 'utf8');
 
-test('every Camera Path navigation control is cached, required, and read', () => {
-  /* The Camera Path navigation block mirrors the Compare Views block; both
-     drive the same viewer. It has been mistaken for dead markup, so pin the
-     whole chain: markup id -> dom-cache entry -> REQUIRED_DOM_KEYS -> a read
-     in the module body. */
-  const blockStart = indexHtml.indexOf('id="cinematic-navigation-controls"');
-  assert.ok(blockStart > 0, 'the Camera Path navigation block must exist');
-  const blockEnd = indexHtml.indexOf('id="cinematic-save-btn"', blockStart);
-  assert.ok(blockEnd > blockStart);
-  /* The block container and its info popover are owned by the shared
-     info-popovers component, not by the Camera Path DOM cache. */
-  const NOT_DOM_CACHED = new Set([
-    'cinematic-navigation-controls',
-    'cinematic-navigation-info-btn',
-    'cinematic-navigation-info-tooltip',
-  ]);
-  const markupIds = [
-    ...new Set(
-      Array.from(
-        indexHtml.slice(blockStart, blockEnd).matchAll(/\bid="(cinematic-[a-z-]+)"/g),
-        match => match[1],
-      ),
-    ),
-  ].filter(id => !NOT_DOM_CACHED.has(id));
-  assert.ok(
-    markupIds.length >= 18,
-    `expected the full navigation block, found ${markupIds.length} ids`,
+test('navigation has one home: the Navigation panel', () => {
+  /* Compare Views and Camera Path each used to carry a copy of the mode select
+     and its settings. Navigation is now its own panel, and Camera Path keeps
+     the panel in step through camera-controls.js instead of a mirror. */
+  const section = indexHtml.slice(
+    indexHtml.indexOf('id="navigation-section"'),
+    indexHtml.indexOf('</details>', indexHtml.indexOf('id="navigation-section"'))
   );
+  for (const id of ['navigation-mode', 'orbit-controls', 'planar-controls', 'freefly-controls', 'reset-camera-btn']) {
+    assert.ok(section.includes(`id="${id}"`), `#${id} belongs to the Navigation panel`);
+  }
+  assert.doesNotMatch(indexHtml, /id="cinematic-(?:nav-mode|navigation-controls|orbit-controls|planar-controls|freefly-controls|pointer-lock)"/);
+  const compareViews = indexHtml.slice(
+    indexHtml.indexOf('id="compare-views-section"'),
+    indexHtml.indexOf('</details>', indexHtml.indexOf('id="compare-views-section"'))
+  );
+  assert.doesNotMatch(compareViews, /id="navigation-mode"/);
 
   const cacheStart = domCacheSource.indexOf('    cinematicCamera: {');
-  const cacheEnd = domCacheSource.indexOf('\n    },', cacheStart);
-  assert.ok(cacheStart >= 0 && cacheEnd > cacheStart);
-  const cacheBlock = domCacheSource.slice(cacheStart, cacheEnd);
+  const cacheBlock = domCacheSource.slice(cacheStart, domCacheSource.indexOf('\n    },', cacheStart));
+  assert.doesNotMatch(cacheBlock, /byId\('cinematic-(?:nav|orbit|planar|look|move|invert|pointer|show)/);
 
-  const requiredStart = cinematicCameraSource.indexOf('const REQUIRED_DOM_KEYS = [');
-  const requiredEnd = cinematicCameraSource.indexOf('];', requiredStart);
-  assert.ok(requiredStart >= 0 && requiredEnd > requiredStart);
-  const requiredKeys = cinematicCameraSource.slice(requiredStart, requiredEnd);
-
-  const orphans = [];
-  for (const id of markupIds) {
-    const cached = cacheBlock.match(
-      new RegExp(`(\\w+):\\s*byId\\('${id}'\\)`),
-    );
-    if (cached === null) {
-      orphans.push(`${id} is not collected by dom-cache`);
-      continue;
-    }
-    const key = cached[1];
-    if (!new RegExp(`'${key}'`).test(requiredKeys)) {
-      orphans.push(`${key} is not in REQUIRED_DOM_KEYS`);
-    }
-    if (!new RegExp(`\\bdom\\.${key}\\b`).test(cinematicCameraSource)) {
-      orphans.push(`dom.${key} is never read by the Camera Path module`);
-    }
-  }
-  assert.deepEqual(orphans, [], orphans.join('\n'));
+  assert.doesNotMatch(cinematicCameraSource, /wireNavigationSettings/);
+  assert.match(cinematicCameraSource, /navigation\.syncNavigationMode\(mode\)/);
+  assert.match(cinematicCameraSource, /\.\.\.navigation\.exportSettings\(\)/);
+  assert.match(cinematicCameraSource, /navigation\.restoreSettings\(data\)/);
+  assert.match(uiCoordinatorSource, /initCinematicCamera\(\{[\s\S]*?navigation: cameraControls,/);
+  assert.match(cameraControlsSource, /wireNavigationSettings\(\{/);
 });
 
 test('fresh 1D/2D views use planar navigation and fresh 3D views use orbit', () => {
@@ -192,92 +167,92 @@ test('camera range inputs reject coercive or partial numeric strings', async () 
   );
 });
 
-test('dimension defaults stop applying after an explicit shared or per-view choice', () => {
-  const perView = createNavigationModeOwnership();
-  assert.equal(perView.hasExplicitUserChoice('live'), false);
-  perView.recordViewUserChoice('live', 'free');
-  assert.equal(perView.hasExplicitUserChoice('live'), true);
-  assert.equal(perView.hasExplicitUserChoice('snap_1'), false);
-  assert.equal(perView.promoteViewUserChoice('snap_1', 'orbit'), false);
-  assert.equal(perView.promoteViewUserChoice('live', 'free'), true);
-  assert.equal(perView.hasExplicitUserChoice('snap_1'), true);
+test('a navigation choice is recorded per view and per dimension', () => {
+  // Every view navigates by its own dimension; a choice that differs from the
+  // default belongs to one view at the dimension it was made for, so a view
+  // set to free-fly in 3D flies again whenever it shows a 3D representation
+  // and pans whenever it shows a 2D one.
+  const owner = createNavigationModeOwnership();
+  assert.equal(owner.choiceFor('live', 3), null);
+  owner.record('live', 3, 'free');
+  assert.equal(owner.choiceFor('live', 3), 'free');
+  assert.equal(owner.choiceFor('live', 2), null, 'a 3D choice says nothing about 2D');
+  assert.equal(owner.choiceFor('snap_1', 3), null, 'a choice belongs to one view');
+  owner.record('live', 2, 'orbit');
+  assert.equal(owner.choiceFor('live', 2), 'orbit');
+  assert.equal(owner.choiceFor('live', 3), 'free', 'dimensions are independent');
 
-  const shared = createNavigationModeOwnership();
-  shared.recordSharedUserChoice('planar');
-  assert.equal(shared.hasExplicitUserChoice('live'), true);
-  assert.equal(shared.hasExplicitUserChoice('snap_1'), true);
-
-  assert.throws(
-    () => perView.recordViewUserChoice('live', 'teleport'),
-    /navigation mode/i
-  );
-  assert.throws(
-    () => perView.recordViewUserChoice('', 'orbit'),
-    /view id/i
-  );
+  assert.throws(() => owner.record('live', 3, 'teleport'), /navigation mode/i);
+  assert.throws(() => owner.record('', 3, 'orbit'), /view id/i);
+  for (const dimension of [0, 4, 2.5, '3', null]) {
+    assert.throws(() => owner.record('live', dimension, 'orbit'), /dimension/i);
+    assert.throws(() => owner.choiceFor('live', dimension), /dimension/i);
+    assert.throws(() => owner.release('live', dimension), /dimension/i);
+  }
 });
 
-test('releasing navigation ownership hands the view back to the dimension rule', () => {
-  const perView = createNavigationModeOwnership();
-  perView.recordViewUserChoice('live', 'free');
-  perView.recordViewUserChoice('snap_1', 'planar');
-  perView.releaseViewUserChoice('live', 'orbit');
-  assert.equal(perView.hasExplicitUserChoice('live'), false);
-  assert.equal(
-    perView.hasExplicitUserChoice('snap_1'),
-    true,
-    'releasing one view must not release its neighbours'
-  );
-  assert.equal(
-    perView.promoteViewUserChoice('live', 'orbit'),
-    false,
-    'a released view has no choice left to promote'
-  );
+test('releasing a choice hands that view and dimension back to the dimension rule', () => {
+  const owner = createNavigationModeOwnership();
+  owner.record('live', 3, 'free');
+  owner.record('live', 2, 'orbit');
+  owner.record('snap_1', 3, 'planar');
+  owner.release('live', 3);
+  assert.equal(owner.choiceFor('live', 3), null);
+  assert.equal(owner.choiceFor('live', 2), 'orbit', 'releasing one dimension keeps the other');
+  assert.equal(owner.choiceFor('snap_1', 3), 'planar', 'releasing one view keeps its neighbours');
+  // Releasing what was never chosen is a no-op, not an error.
+  owner.release('snap_2', 1);
+  assert.equal(owner.choiceFor('snap_2', 1), null);
+  assert.throws(() => owner.release('', 3), /view id/i);
+});
 
-  // A locked-camera publication reaches every view, so releasing it clears the
-  // per-view overrides it just overwrote.
-  const shared = createNavigationModeOwnership();
-  shared.recordViewUserChoice('snap_1', 'free');
-  shared.recordSharedUserChoice('planar');
-  shared.releaseSharedUserChoice('orbit');
-  assert.equal(shared.hasExplicitUserChoice('live'), false);
-  assert.equal(shared.hasExplicitUserChoice('snap_1'), false);
+test('a kept view inherits the choices of its source view, and a removed view loses its own', () => {
+  const owner = createNavigationModeOwnership();
+  owner.record('live', 3, 'free');
+  owner.record('live', 2, 'orbit');
+  owner.copyView('live', 'snap_1');
+  assert.equal(owner.choiceFor('snap_1', 3), 'free');
+  assert.equal(owner.choiceFor('snap_1', 2), 'orbit');
+  // The copy is the kept view's own: changing it leaves the source alone.
+  owner.record('snap_1', 3, 'planar');
+  assert.equal(owner.choiceFor('live', 3), 'free');
+  // A source without choices leaves its copy without any, even over a stale
+  // record for the same id.
+  owner.copyView('snap_9', 'snap_1');
+  assert.equal(owner.choiceFor('snap_1', 3), null);
+  assert.equal(owner.choiceFor('snap_1', 2), null);
 
-  assert.throws(
-    () => perView.releaseViewUserChoice('live', 'teleport'),
-    /navigation mode/i
-  );
-  assert.throws(
-    () => perView.releaseViewUserChoice('', 'orbit'),
-    /view id/i
-  );
-  assert.throws(
-    () => perView.releaseSharedUserChoice('teleport'),
-    /navigation mode/i
-  );
+  owner.deleteView('live');
+  assert.equal(owner.choiceFor('live', 3), null);
+  owner.record('snap_2', 1, 'orbit');
+  owner.clear();
+  assert.equal(owner.choiceFor('snap_2', 1), null);
+  assert.throws(() => owner.copyView('', 'snap_1'), /view id/i);
+  assert.throws(() => owner.copyView('live', ''), /view id/i);
+  assert.throws(() => owner.deleteView(''), /view id/i);
 });
 
 test('every applied navigation mode is weighed against the dimension default', () => {
   // The viewer cannot see whether a caller is a person or a restore, so it
   // decides ownership from the mode itself: only a mode that differs from the
-  // view's dimension default takes navigation away from the dimension rule.
-  // Without this, a dataset's advertised starting state — which pins the very
-  // mode the dimension already implies — silently ended the coupling for the
-  // whole session.
-  for (const owner of [
-    'settleViewNavigationOwnership',
-    'settleSharedNavigationOwnership'
-  ]) {
-    const start = viewerSource.indexOf(`  function ${owner}(viewId, mode)`);
-    assert.ok(start >= 0, `viewer must define ${owner}`);
-    const body = viewerSource.slice(start, viewerSource.indexOf('\n  }\n', start));
-    assert.match(body, /getPublishedDimensionLevel\(/);
-    assert.match(body, /mode === getDefaultNavigationMode\(dimensionLevel\)/);
-    assert.match(body, /navigationModeOwnership\.release/);
-    assert.match(body, /navigationModeOwnership\.record/);
-  }
+  // view's dimension default is recorded as that view's choice for that
+  // dimension. Without this, a dataset's advertised starting state -- which
+  // pins the very mode the dimension already implies -- would be remembered
+  // as a choice for the whole session.
+  const start = viewerSource.indexOf('  function settleViewNavigationOwnership(viewId, mode)');
+  assert.ok(start >= 0, 'viewer must define settleViewNavigationOwnership');
+  const body = viewerSource.slice(start, viewerSource.indexOf('\n  }\n', start));
+  assert.match(body, /getPublishedDimensionLevel\(/);
+  assert.match(body, /mode === getDefaultNavigationMode\(dimensionLevel\)/);
+  assert.match(body, /navigationModeOwnership\.release\(exactViewId, dimensionLevel\)/);
+  assert.match(body, /navigationModeOwnership\.record\(exactViewId, dimensionLevel, mode\)/);
+  assert.doesNotMatch(
+    viewerSource,
+    /function settleSharedNavigationOwnership|recordSharedUserChoice|promoteViewUserChoice/,
+    'there is no shared navigation choice: each view owns its mode'
+  );
 
-  // Every publication boundary goes through those helpers; none may record
+  // Every publication boundary goes through that helper; none may record
   // ownership on its own.
   for (const [label, signature] of [
     ['setNavigationMode', '    setNavigationMode(mode) {'],
@@ -290,36 +265,69 @@ test('every applied navigation mode is weighed against the dimension default', (
     const body = viewerSource.slice(start, viewerSource.indexOf('\n    },', start));
     assert.match(
       body,
-      /settle(View|Shared)NavigationOwnership\(/,
+      /settleViewNavigationOwnership\(/,
       `${label} must weigh its mode against the dimension default`
     );
     assert.doesNotMatch(
       body,
-      /navigationModeOwnership\.record(Shared|View)UserChoice\(/,
+      /navigationModeOwnership\.record\(/,
       `${label} must not claim ownership unconditionally`
     );
   }
+
+  // The focused view's mode is shared only with the views linked to its
+  // camera, and each of them records it for itself.
+  const navStart = viewerSource.indexOf('    setNavigationMode(mode) {');
+  const navBody = viewerSource.slice(navStart, viewerSource.indexOf('\n    },', navStart));
+  assert.match(
+    navBody,
+    /for \(const viewId of cameraFollowers\) \{[\s\S]*?settleViewNavigationOwnership\(viewId, exactMode\)/
+  );
+  // A kept view starts from its source's choices in every dimension.
+  const snapStart = viewerSource.indexOf('    createSnapshotView(config) {');
+  const snapBody = viewerSource.slice(snapStart, viewerSource.indexOf('\n    },', snapStart));
+  assert.match(snapBody, /navigationModeOwnership\.copyView\(sourceViewId, id\)/);
 });
 
-test('viewer applies dimension-derived defaults only at data/dimension publication boundaries', () => {
+test('a view showing another dimension navigates by its recorded choice or that dimension\'s default', () => {
+  const start = viewerSource.indexOf('  function applyDimensionNavigationDefault(viewId, dimensionLevel)');
+  assert.ok(start >= 0);
+  const body = viewerSource.slice(start, viewerSource.indexOf('\n  }\n', start));
+  assert.match(
+    body,
+    /navigationModeOwnership\.choiceFor\(exactViewId, dimensionLevel\)\s*\?\?\s*getDefaultNavigationMode\(dimensionLevel\)/
+  );
+  assert.match(body, /applyViewNavigationMode\(exactViewId, mode\)/);
+  assert.doesNotMatch(
+    body,
+    /camerasLocked/,
+    'linking cameras never decides one view\'s mode for another view of another dimension'
+  );
+});
+
+test('viewer applies dimension-derived defaults only at data and dimension-changing embedding boundaries', () => {
   const setDataStart = viewerSource.indexOf('setData(payload)');
   const setDataEnd = viewerSource.indexOf('\n    updateColors(', setDataStart);
-  const setViewDimensionStart = viewerSource.indexOf('setViewDimension(viewId, level)');
-  const setViewDimensionEnd = viewerSource.indexOf('\n    /**', setViewDimensionStart + 1);
+  const setViewEmbeddingStart = viewerSource.indexOf('setViewEmbedding(viewId, embedding)');
+  const setViewEmbeddingEnd = viewerSource.indexOf('\n    /**', setViewEmbeddingStart + 1);
   const setNavigationStart = viewerSource.indexOf('setNavigationMode(mode)');
   const setNavigationEnd = viewerSource.indexOf('\n    getNavigationMode()', setNavigationStart);
 
   assert.ok(setDataStart >= 0 && setDataEnd > setDataStart);
-  assert.ok(setViewDimensionStart >= 0 && setViewDimensionEnd > setViewDimensionStart);
+  assert.ok(setViewEmbeddingStart >= 0 && setViewEmbeddingEnd > setViewEmbeddingStart);
   assert.ok(setNavigationStart >= 0 && setNavigationEnd > setNavigationStart);
 
   assert.match(
     viewerSource.slice(setDataStart, setDataEnd),
     /applyDimensionNavigationDefault\(LIVE_VIEW_ID,\s*dimensionLevel\)/
   );
+  // Every layout is normalized to the same extent, so switching between two
+  // representations of one dimension keeps the camera and its navigation
+  // mode; a dimension change applies the view's choice for, or the default
+  // of, the new dimension.
   assert.match(
-    viewerSource.slice(setViewDimensionStart, setViewDimensionEnd),
-    /applyDimensionNavigationDefault\(vid,\s*level\)/
+    viewerSource.slice(setViewEmbeddingStart, setViewEmbeddingEnd),
+    /if \(oldLevel !== level\) \{\s*applyDimensionNavigationDefault\(vid,\s*level\);\s*\}/
   );
   assert.doesNotMatch(
     viewerSource.slice(setNavigationStart, setNavigationEnd),
@@ -333,7 +341,7 @@ test('viewer applies dimension-derived defaults only at data/dimension publicati
   );
 });
 
-test('both sidebar navigation selectors forward exact values to the viewer', () => {
+test('the navigation selector forwards exact values to the viewer', () => {
   assert.doesNotMatch(
     cameraControlsSource,
     /selectValue === 'free'\s*\?\s*'free'[\s\S]*?'orbit'/
@@ -343,17 +351,8 @@ test('both sidebar navigation selectors forward exact values to the viewer', () 
     /viewer\.setNavigationMode\(navigationModeSelect\.value\)/
   );
 
-  assert.doesNotMatch(
-    cinematicCameraSource,
-    /navModeSelect\.value === 'free'\s*\?\s*'free'[\s\S]*?'orbit'/
-  );
-  assert.match(
-    cinematicCameraSource,
-    /viewer\.setNavigationMode\(dom\.navModeSelect\.value\)/
-  );
-
   for (const [label, source] of [
-    ['Compare Views camera controls', cameraControlsSource],
+    ['Navigation controls', cameraControlsSource],
     ['Camera Path controls', cinematicCameraSource]
   ]) {
     assert.doesNotMatch(source, /parseFloat\s*\(/, `${label} must parse exact range strings`);
@@ -365,11 +364,17 @@ test('both sidebar navigation selectors forward exact values to the viewer', () 
   }
 });
 
-test('dimension, view-badge, and session boundaries preserve exact camera ownership', () => {
-  assert.doesNotMatch(dimensionControlsSource, /parseInt\(e\.target\.value/);
+test('representation, view-row, and session boundaries preserve exact camera ownership', () => {
+  // The picker forwards the exact layout key it lists; the keyboard forwards
+  // the exact dimension its key names. Neither parses or coerces.
+  assert.doesNotMatch(representationControlsSource, /parseInt\(|Number\(select\.value\)/);
   assert.match(
-    dimensionControlsSource,
-    /\['1',\s*'2',\s*'3'\]\.includes\(rawDimension\)/
+    representationControlsSource,
+    /state\.setViewRepresentation\(viewId, layoutKey, \{ followsDefault: false \}\)/
+  );
+  assert.match(
+    representationControlsSource,
+    /state\.cycleRepresentation\(state\.getActiveViewId\(\), dimension\)/
   );
   assert.match(
     viewControlsSource,
@@ -381,7 +386,7 @@ test('dimension, view-badge, and session boundaries preserve exact camera owners
   );
 });
 
-test('dataset-derived navigation changes synchronize both sidebar selectors once', () => {
+test('dataset-derived navigation changes synchronize the Navigation panel once', () => {
   assert.match(
     viewerSource,
     /setNavigationModeChangeHandler\(fn\)/
@@ -394,9 +399,10 @@ test('dataset-derived navigation changes synchronize both sidebar selectors once
     uiCoordinatorSource,
     /setNavigationModeChangeHandler\([\s\S]*?syncNavigationUiForView/
   );
-  assert.match(
+  assert.doesNotMatch(
     uiCoordinatorSource,
-    /cinematicCamera\.syncNavigationMode\(mode\)/
+    /cinematicCamera\.syncNavigationMode/,
+    'Camera Path has no navigation controls of its own to synchronize'
   );
 });
 
@@ -413,7 +419,7 @@ test('navigation UI synchronization preserves exact view identity and required c
   assert.doesNotMatch(syncBody, /\|\|\s*LIVE_VIEW_ID/);
   assert.doesNotMatch(syncBody, /cameraControls\.toggleNavigationPanels\?\./);
   assert.match(syncBody, /viewer\.getViewNavigationMode\(viewId\)/);
-  assert.match(syncBody, /cameraControls\.toggleNavigationPanels\(mode\)/);
+  assert.match(syncBody, /cameraControls\.syncNavigationMode\(viewer\.getViewNavigationMode\(viewId\)\)/);
   assert.doesNotMatch(
     uiCoordinatorSource,
     /syncNavigationUiForView\(state\.getActiveViewId\(\)\s*\|\|/

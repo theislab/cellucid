@@ -1,4 +1,6 @@
+import './helpers/anndata-reader-in-process.mjs';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import { gzipSync } from 'node:zlib';
 
@@ -260,86 +262,32 @@ test('connectivity summaries preserve an explicit empty graph exactly', () => {
   );
 });
 
-test('connectivity capacity includes canonical and render-owned weighted edges', async t => {
-  const browserLimit = 512 * 1024 * 1024;
-  const fixtures = [
-    {
-      name: 'prepared uint16',
-      context: CONNECTIVITY_MANIFEST_CONTEXT.FILE,
-      nCells: 65_536,
-      bytesPerEdge:
-        2 * Uint16Array.BYTES_PER_ELEMENT +
-        6 * Uint32Array.BYTES_PER_ELEMENT +
-        2 * Float64Array.BYTES_PER_ELEMENT +
-        Float32Array.BYTES_PER_ELEMENT,
-      createManifest(nEdges) {
-        return {
-          ...FILE_MANIFEST,
-          n_cells: this.nCells,
-          n_edges: nEdges,
-          max_neighbors: this.nCells - 1,
-        };
-      },
-    },
-    {
-      name: 'prepared uint32',
-      context: CONNECTIVITY_MANIFEST_CONTEXT.FILE,
-      nCells: 100_000,
-      bytesPerEdge:
-        6 * Uint32Array.BYTES_PER_ELEMENT +
-        2 * Float64Array.BYTES_PER_ELEMENT +
-        Float32Array.BYTES_PER_ELEMENT,
-      createManifest(nEdges) {
-        return {
-          ...FILE_MANIFEST,
-          n_cells: this.nCells,
-          n_edges: nEdges,
-          max_neighbors: this.nCells - 1,
-          index_dtype: 'uint32',
-          index_bytes: Uint32Array.BYTES_PER_ELEMENT,
-        };
-      },
-    },
-    {
-      name: 'direct uint32',
-      context: CONNECTIVITY_MANIFEST_CONTEXT.DIRECT,
-      nCells: 100_000,
-      bytesPerEdge:
-        6 * Uint32Array.BYTES_PER_ELEMENT +
-        2 * Float64Array.BYTES_PER_ELEMENT +
-        Float32Array.BYTES_PER_ELEMENT,
-      createManifest(nEdges) {
-        return {
-          ...DIRECT_MANIFEST,
-          n_cells: this.nCells,
-          n_edges: nEdges,
-          max_neighbors: this.nCells - 1,
-        };
-      },
-    },
-  ];
-
-  for (const fixture of fixtures) {
-    await t.test(fixture.name, () => {
-      const degreeBytes =
-        fixture.nCells * Uint32Array.BYTES_PER_ELEMENT;
-      const boundaryEdges = Math.floor(
-        (browserLimit - degreeBytes) / fixture.bytesPerEdge
-      );
-      const boundary = fixture.createManifest(boundaryEdges);
-      assert.strictEqual(
-        validateConnectivityManifest(boundary, fixture.context),
-        boundary
-      );
-      assert.throws(
-        () => validateConnectivityManifest(
-          fixture.createManifest(boundaryEdges + 1),
-          fixture.context
-        ),
-        /browser working-set limit/i
-      );
-    });
+test('no fixed working-set cap refuses a large graph: a k = 15 graph over 10M and 50M cells validates', () => {
+  // A k = 15 neighbour graph has about 11 undirected edges a cell. The
+  // manifest is checked for consistency only; memory is the engine's to
+  // grant when the edges load (a refusal there is a connectivity error, never
+  // a failed dataset).
+  for (const [context, base] of [
+    [CONNECTIVITY_MANIFEST_CONTEXT.FILE, FILE_MANIFEST],
+    [CONNECTIVITY_MANIFEST_CONTEXT.DIRECT, DIRECT_MANIFEST],
+  ]) {
+    for (const nCells of [10_000_000, 50_000_000]) {
+      const manifest = {
+        ...base,
+        n_cells: nCells,
+        n_edges: nCells * 11,
+        max_neighbors: 40,
+        index_dtype: 'uint32',
+        index_bytes: Uint32Array.BYTES_PER_ELEMENT,
+      };
+      assert.strictEqual(validateConnectivityManifest(manifest, context), manifest);
+    }
   }
+  const source = readFileSync(
+    new URL('../assets/js/data/connectivity-manifest-contract.js', import.meta.url),
+    'utf8'
+  );
+  assert.doesNotMatch(source, /MAX_CONNECTIVITY_WORKING_BYTES|working-set limit/);
 });
 
 test('file connectivity paths and scalar values reject every malformed form', async t => {
@@ -634,9 +582,15 @@ test('file edge payloads are exact before rendering or KNN use', async t => {
             'https://cellucid.test/data/connectivity/edges.weights.f64.bin',
           ]
         );
+        // The three payloads share one signal derived from the load owner,
+        // so the owner, or a failed sibling, ends all of them.
         assert.ok(
-          calls.every(call => call.signal === EDGE_SIGNAL),
-          'every aligned payload fetch must use the exact load owner'
+          calls.every(call => (
+            call.signal instanceof AbortSignal
+            && call.signal === calls[0].signal
+            && call.signal.aborted === false
+          )),
+          'every aligned payload fetch must follow the one load owner'
         );
       }
     );
@@ -1508,11 +1462,14 @@ test('connectivity edge loading requires and propagates one exact owner signal',
         { signal: controller.signal }
       );
       await started.promise;
-      assert.deepEqual(
-        receivedSignals,
-        [controller.signal, controller.signal, controller.signal]
-      );
+      assert.equal(new Set(receivedSignals).size, 1);
+      assert.equal(receivedSignals[0].aborted, false);
       controller.abort();
+      assert.equal(
+        receivedSignals[0].aborted,
+        true,
+        'the payloads follow the owner signal'
+      );
       await assert.rejects(
         loading,
         error => error?.name === 'AbortError'
@@ -1521,4 +1478,43 @@ test('connectivity edge loading requires and propagates one exact owner signal',
       globalThis.fetch = originalFetch;
     }
   });
+});
+
+test('a failed edge payload aborts its sibling downloads', async () => {
+  const manifestUrl = 'https://cellucid.test/data/connectivity_manifest.json';
+  const failingUrl = new URL(FILE_MANIFEST.sourcesPath, manifestUrl).href;
+  const originalFetch = globalThis.fetch;
+  const hadWindow = Object.hasOwn(globalThis, 'window');
+  if (!hadWindow) {
+    globalThis.window = { location: { href: 'https://cellucid.test/' } };
+  }
+  const aborted = [];
+  globalThis.fetch = async (url, init) => {
+    const href = String(url);
+    if (href === failingUrl) {
+      return new Response('missing', { status: 404, statusText: 'Not Found' });
+    }
+    // The siblings never answer on their own: only an abort ends them.
+    return new Promise((_resolve, reject) => {
+      init.signal.addEventListener('abort', () => {
+        aborted.push(href);
+        reject(init.signal.reason);
+      }, { once: true });
+    });
+  };
+  try {
+    await assert.rejects(
+      loadEdges(manifestUrl, FILE_MANIFEST, {
+        signal: new AbortController().signal,
+      }),
+      /404|not found/i
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (!hadWindow) delete globalThis.window;
+  }
+  assert.deepEqual(aborted.sort(), [
+    new URL(FILE_MANIFEST.destinationsPath, manifestUrl).href,
+    new URL(FILE_MANIFEST.weightsPath, manifestUrl).href,
+  ].sort());
 });

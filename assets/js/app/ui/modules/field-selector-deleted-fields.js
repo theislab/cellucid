@@ -9,6 +9,8 @@ import { showConfirmDialog } from '../components/confirm-dialog.js';
 import { getFieldRegistry } from '../../utils/field-registry.js';
 import { FieldSource } from '../../utils/field-constants.js';
 import { StateValidator } from '../../utils/state-validator.js';
+import { createButton, createDisclosure } from '../components/controls.js';
+import { formatCountOf } from '../components/display-format.js';
 
 const INIT_KEYS = new Set(['state', 'deletedFieldsSection']);
 
@@ -337,10 +339,10 @@ export function initDeletedFieldsPanel(options) {
     };
   }
 
-  function createElement(tagName, className, textContent = null) {
+  function createText(tagName, className, textContent) {
     const element = ownerDocument.createElement(tagName);
-    if (className.length > 0) element.className = className;
-    if (textContent !== null) element.textContent = textContent;
+    element.className = className;
+    element.textContent = textContent;
     return element;
   }
 
@@ -355,104 +357,57 @@ export function initDeletedFieldsPanel(options) {
       return;
     }
 
-    const open = readPanelOpen(deletedFieldsSection);
     deletedFieldsSection.hidden = false;
-    const wrapper = createElement(
-      'div',
-      'analysis-accordion deleted-fields-wrapper'
-    );
-    const item = createElement(
-      'div',
-      `analysis-accordion-item${open ? ' open' : ''}`
-    );
-    item.id = 'deleted-fields-accordion-item';
-    const toggle = createElement(
-      'button',
-      'analysis-accordion-header'
-    );
-    toggle.type = 'button';
-    toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
-    toggle.appendChild(
-      createElement('span', 'analysis-accordion-title', 'Deleted Fields')
-    );
-    toggle.appendChild(
-      createElement(
-        'span',
-        'analysis-accordion-desc',
-        `${total} restorable item${total === 1 ? '' : 's'}`
-      )
-    );
-    const chevron = createElement(
-      'span',
-      'analysis-accordion-chevron'
-    );
-    chevron.setAttribute('aria-hidden', 'true');
-    toggle.appendChild(chevron);
-
-    const content = createElement('div', 'analysis-accordion-content');
-    content.appendChild(
-      createElement(
-        'div',
-        'deleted-fields-hint',
-        'Restore soft-deleted fields, or confirm deletion to remove restore capability.'
-      )
-    );
-    const list = createElement('div', 'deleted-fields-list');
+    const wrapper = ownerDocument.createElement('div');
+    wrapper.className = 'disclosure-list deleted-fields-wrapper';
+    const disclosure = createDisclosure({
+      title: 'Deleted fields',
+      description: `${formatCountOf(total, 'restorable item')}`,
+      tip: 'deleted-fields',
+      expanded: readPanelOpen(deletedFieldsSection),
+      onToggle: expanded => {
+        deletedFieldsSection.dataset.open = expanded ? 'true' : 'false';
+      }
+    });
+    disclosure.root.id = 'deleted-fields-accordion-item';
+    const list = ownerDocument.createElement('div');
+    list.className = 'deleted-fields-list';
     list.id = 'deleted-fields-list';
-    content.appendChild(list);
-    item.appendChild(toggle);
-    item.appendChild(content);
-    wrapper.appendChild(item);
-
-    toggle.addEventListener('click', () => {
-      const next = !readPanelOpen(deletedFieldsSection);
-      deletedFieldsSection.dataset.open = next ? 'true' : 'false';
-      toggle.setAttribute('aria-expanded', next ? 'true' : 'false');
-      item.classList.toggle('open', next);
-    }, { signal: lifecycle.signal });
+    disclosure.content.appendChild(list);
+    wrapper.appendChild(disclosure.root);
 
     function addGroup(title, entries, source) {
       if (entries.length === 0) return;
-      list.appendChild(
-        createElement('div', 'deleted-fields-group-title', title)
-      );
+      list.appendChild(createText('h3', 'section-title', title));
       for (const { field, index } of entries) {
-        const row = createElement('div', 'deleted-field-row');
+        const row = ownerDocument.createElement('div');
+        row.className = 'deleted-field-row';
         let fieldLabel = field.key;
         if (Object.hasOwn(field, '_originalKey')) {
           StateValidator.validateFieldKey(field._originalKey);
           fieldLabel = `${field.key} *`;
         }
-        const name = createElement(
-          'span',
-          'deleted-field-name',
-          fieldLabel
-        );
+        const name = createText('span', 'deleted-field-name', fieldLabel);
         if (Object.hasOwn(field, '_originalKey')) {
           name.title = `Original: ${field._originalKey}`;
         }
-        const buttons = createElement('div', 'deleted-field-actions');
-        const restoreButton = createElement(
-          'button',
-          'deleted-field-restore-btn',
-          'Restore'
-        );
-        restoreButton.type = 'button';
+        const buttons = ownerDocument.createElement('div');
+        buttons.className = 'deleted-field-actions';
+        const restoreButton = createButton({
+          label: 'Restore',
+          className: 'btn-compact'
+        });
         restoreButton.dataset.action = 'restore-field';
         restoreButton.dataset.source = source;
         restoreButton.dataset.index = String(index);
-        const purgeButton = createElement(
-          'button',
-          'deleted-field-confirm-btn',
-          'Confirm'
-        );
-        purgeButton.type = 'button';
+        const purgeButton = createButton({
+          label: 'Confirm',
+          className: 'btn-compact',
+          title: 'Permanently confirm deletion (cannot be restored)'
+        });
         purgeButton.dataset.action = 'purge-field';
         purgeButton.dataset.source = source;
         purgeButton.dataset.index = String(index);
-        purgeButton.title = (
-          'Permanently confirm deletion (cannot be restored)'
-        );
         if (index === -1) {
           const userDefinedId = requireIdentifier(
             field._userDefinedId,

@@ -18,7 +18,6 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
-  benjaminiHochberg,
   benjaminiHochbergAdjusted,
   benjaminiHochbergTestable,
 } from '../assets/js/app/analysis/stats/statistical-tests.js';
@@ -66,9 +65,9 @@ function assertAllClose(actual, expected, label, tolerance = 1e-12) {
 // =============================================================================
 
 /**
- * Pre-consolidation `stats/statistical-tests.js` step-up, verbatim.
+ * Pre-consolidation `stats/statistical-tests.js` step-up adjustment.
  */
-function legacyCoreBenjaminiHochberg(pValues, alpha = 0.05) {
+function legacyCoreBenjaminiHochberg(pValues) {
   const n = pValues.length;
   const indexed = Array.from(pValues, (p, i) => ({ pValue: p, originalIndex: i }));
   const m = indexed.length;
@@ -82,24 +81,11 @@ function legacyCoreBenjaminiHochberg(pValues, alpha = 0.05) {
   for (let i = 0; i < m; i++) {
     adjustedValid[i] = Math.min(adjustedValid[i], 1);
   }
-  let threshold = null;
-  for (let i = 0; i < m; i++) {
-    const criticalValue = (i + 1) * alpha / m;
-    if (indexed[i].pValue <= criticalValue) threshold = indexed[i].pValue;
-  }
   const adjustedPValues = new Array(n).fill(null);
-  const significant = new Array(n).fill(false);
   for (let i = 0; i < m; i++) {
-    const origIdx = indexed[i].originalIndex;
-    adjustedPValues[origIdx] = adjustedValid[i];
-    significant[origIdx] = adjustedValid[i] <= alpha;
+    adjustedPValues[indexed[i].originalIndex] = adjustedValid[i];
   }
-  return {
-    adjustedPValues,
-    significant,
-    threshold,
-    significantCount: significant.filter(s => s).length,
-  };
+  return { adjustedPValues };
 }
 
 /**
@@ -171,19 +157,19 @@ const DENSE_FIXTURES = [
 test('Benjamini-Hochberg matches R p.adjust(method = "BH") on hand-checked families', () => {
   // p.adjust(c(0.01, 0.04, 0.03), "BH") -> 0.030 0.040 0.040
   assertAllClose(
-    benjaminiHochberg([0.01, 0.04, 0.03]).adjustedPValues,
+    benjaminiHochbergAdjusted(Float64Array.from([0.01, 0.04, 0.03])).adjustedPValues,
     [0.03, 0.04, 0.04],
     'unsorted family',
   );
   // p.adjust(c(0, 0.001, 0.001, 0.5, 1, 0.75), "BH") -> 0 0.002 0.002 0.75 1 0.90
   assertAllClose(
-    benjaminiHochberg([0, 0.001, 0.001, 0.5, 1, 0.75]).adjustedPValues,
+    benjaminiHochbergAdjusted(Float64Array.from([0, 0.001, 0.001, 0.5, 1, 0.75])).adjustedPValues,
     [0, 0.002, 0.002, 0.75, 1, 0.9],
     'ties and boundaries',
   );
   // p.adjust(c(0.01, 0.02, 0.03, 0.04, 0.05), "BH") -> all 0.05
   assertAllClose(
-    benjaminiHochberg([0.01, 0.02, 0.03, 0.04, 0.05]).adjustedPValues,
+    benjaminiHochbergAdjusted(Float64Array.from([0.01, 0.02, 0.03, 0.04, 0.05])).adjustedPValues,
     [0.05, 0.05, 0.05, 0.05, 0.05],
     'uniformly critical family',
   );
@@ -191,42 +177,14 @@ test('Benjamini-Hochberg matches R p.adjust(method = "BH") on hand-checked famil
 
 test('the surviving Benjamini-Hochberg reproduces the replaced core implementation', () => {
   for (const { label, pValues } of DENSE_FIXTURES) {
-    for (const alpha of [0.01, 0.05, 0.1]) {
-      const expected = pValues.length === 0
-        ? {
-          adjustedPValues: [],
-          significant: [],
-          threshold: null,
-          significantCount: 0,
-        }
-        : legacyCoreBenjaminiHochberg(pValues, alpha);
-      const actual = benjaminiHochberg(pValues, alpha);
-
-      assertAllClose(
-        actual.adjustedPValues,
-        expected.adjustedPValues,
-        `${label} @ alpha=${alpha} adjusted`,
-      );
-      assert.deepEqual(
-        actual.significant,
-        expected.significant,
-        `${label} @ alpha=${alpha} significance flags diverged`,
-      );
-      assert.equal(
-        actual.significantCount,
-        expected.significantCount,
-        `${label} @ alpha=${alpha} significant count diverged`,
-      );
-      if (expected.threshold === null) {
-        assert.equal(actual.threshold, null, `${label} @ alpha=${alpha} threshold`);
-      } else {
-        assertClose(
-          actual.threshold,
-          expected.threshold,
-          `${label} @ alpha=${alpha} threshold`,
-        );
-      }
-    }
+    const expected = pValues.length === 0
+      ? []
+      : legacyCoreBenjaminiHochberg(pValues).adjustedPValues;
+    assertAllClose(
+      benjaminiHochbergAdjusted(Float64Array.from(pValues)).adjustedPValues,
+      expected,
+      `${label} adjusted`,
+    );
   }
 });
 

@@ -30,10 +30,10 @@ export class OverlayManager {
     if (typeof overlay.id !== 'string' || overlay.id.length === 0) {
       throw new TypeError('OverlayManager.register requires a non-empty string id.');
     }
-    for (const method of ['init', 'update', 'render', 'dispose']) {
+    for (const method of ['init', 'update', 'render', 'dispose', 'needsContinuousFrames']) {
       if (typeof overlay[method] !== 'function') {
         throw new TypeError(
-          'OverlayManager.register requires the complete init, update, render, and dispose lifecycle.'
+          'OverlayManager.register requires the complete init, update, render, dispose, and needsContinuousFrames lifecycle.'
         );
       }
     }
@@ -132,6 +132,18 @@ export class OverlayManager {
   hasEnabledOverlays() {
     for (const overlay of this._overlays.values()) {
       if (overlay?.enabled) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Whether any overlay animates: an enabled overlay with nothing to draw
+   * (no field for the layout, nothing visible, particles off at this level
+   * of detail) lets a still scene settle.
+   */
+  needsContinuousFrames() {
+    for (const overlay of this._overlays.values()) {
+      if (overlay.enabled && overlay.needsContinuousFrames()) return true;
     }
     return false;
   }

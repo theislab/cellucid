@@ -43,21 +43,8 @@ function createRenderParams(useAlphaTexture = false) {
   };
 }
 
-function createRenderer({
-  liveActive = true,
-  liveTexture = { owner: 'live' },
-  liveWidth = 17,
-  viewActive = true,
-  viewTexture = { owner: 'snapshot' },
-  viewWidth = 19,
-} = {}) {
+function createRenderer() {
   return {
-    getAlphaTexture: () => liveTexture,
-    getAlphaTextureWidth: () => liveWidth,
-    isAlphaTextureActive: () => liveActive,
-    getAlphaTextureForView: () => viewTexture,
-    getAlphaTextureWidthForView: () => viewWidth,
-    isAlphaTextureActiveForView: () => viewActive,
     getFogNear: () => 0,
     getFogFar: () => 10,
     getCurrentLODLevel: () => -1,
@@ -80,6 +67,7 @@ function createContextOptions({
     deltaTimeSeconds: 1 / 60,
     isSnapshot,
     dimensionLevel: 3,
+    layoutKey: '3d',
     devicePixelRatio: 2,
     viewportX: 0,
     viewportY: 0,
@@ -101,12 +89,15 @@ test('snapshot attribute publication uses the narrowest renderer transaction for
   );
   assert.match(
     source,
-    /else if\s*\(\s*colorsChanged\s*\)\s*\{[\s\S]*?updateSnapshotColors\(\s*exactId,\s*colors\s*\)/,
+    /if\s*\(\s*colorsChanged\s*\)\s*\{[\s\S]*?updateSnapshotColors\(\s*exactId,\s*colors\s*\)/,
   );
+  // An alpha-only publication reports whether a byte moved.
   assert.match(
     source,
-    /else\s*\{[\s\S]*?updateSnapshotAlphas\(\s*exactId,\s*transparency\s*\)/,
+    /return hpRenderer\.updateSnapshotAlphas\(\s*exactId,\s*transparency\s*\)/,
   );
+  assert.match(source, /if \(visibilityMoved\) \{\n\s*highlightTools\.handleTransparencyChange\(exactId\);/);
+  assert.match(source, /if \(transparencyChanged\) snap\.transparency\.set\(nextTransparency\);/);
   assert.equal(
     source.match(/publishSnapshotPointAttributes\(/g)?.length,
     2,
@@ -122,90 +113,15 @@ test('snapshot attribute publication uses the narrowest renderer transaction for
   );
 });
 
-test('live overlay context exposes the active live alpha owner even without a snapshot override flag', () => {
-  const liveTexture = { owner: 'live' };
-  const ctx = buildOverlayContext(createContextOptions({
-    hpRenderer: createRenderer({
-      liveTexture,
-      liveWidth: 23,
-    }),
-    isSnapshot: false,
-    viewId: 'live',
-  }));
-
-  assert.strictEqual(ctx.alphaTexture, liveTexture);
-  assert.equal(ctx.alphaTexWidth, 23);
-  assert.equal(ctx.useAlphaTexture, true);
-});
-
-test('snapshot overlay context exposes its exact immutable R8 owner', () => {
-  const liveTexture = { owner: 'live' };
-  const snapshotTexture = { owner: 'snapshot-a' };
-  const ctx = buildOverlayContext(createContextOptions({
-    hpRenderer: createRenderer({
-      liveTexture,
-      liveWidth: 17,
-      viewTexture: snapshotTexture,
-      viewWidth: 29,
-    }),
-    isSnapshot: true,
-    viewId: 'snapshot-a',
-  }));
-
-  assert.strictEqual(ctx.alphaTexture, snapshotTexture);
-  assert.notStrictEqual(ctx.alphaTexture, liveTexture);
-  assert.equal(ctx.alphaTexWidth, 29);
-  assert.equal(ctx.useAlphaTexture, true);
-});
-
-test('snapshot explicit live-alpha override is reflected in its overlay context', () => {
-  const liveTexture = { owner: 'live' };
-  const snapshotTexture = { owner: 'snapshot-a' };
-  const ctx = buildOverlayContext(createContextOptions({
-    hpRenderer: createRenderer({
-      liveTexture,
-      liveWidth: 31,
-      viewTexture: snapshotTexture,
-      viewWidth: 37,
-    }),
-    isSnapshot: true,
-    renderParams: createRenderParams(true),
-    viewId: 'snapshot-a',
-  }));
-
-  assert.strictEqual(ctx.alphaTexture, liveTexture);
-  assert.notStrictEqual(ctx.alphaTexture, snapshotTexture);
-  assert.equal(ctx.alphaTexWidth, 31);
-  assert.equal(ctx.useAlphaTexture, true);
-});
-
-test('snapshot overlay context fails closed when its selected alpha owner is unavailable', () => {
-  assert.throws(
-    () => buildOverlayContext(createContextOptions({
-      hpRenderer: createRenderer({
-        viewActive: false,
-        viewTexture: null,
-        viewWidth: 0,
-      }),
-      isSnapshot: true,
-      viewId: 'snapshot-a',
-    })),
-    /requires the published alpha texture/,
-  );
-});
-
-test('live overlay context accurately reports an inactive live alpha owner', () => {
-  const ctx = buildOverlayContext(createContextOptions({
-    hpRenderer: createRenderer({
-      liveActive: false,
-      liveTexture: null,
-      liveWidth: 0,
-    }),
-    isSnapshot: false,
-    viewId: 'live',
-  }));
-
-  assert.equal(ctx.alphaTexture, null);
-  assert.equal(ctx.alphaTexWidth, 0);
-  assert.equal(ctx.useAlphaTexture, false);
+test('the overlay context carries no point-alpha owner (overlays keep their own visibility)', () => {
+  for (const [viewId, isSnapshot] of [['live', false], ['snapshot-a', true]]) {
+    const ctx = buildOverlayContext(createContextOptions({
+      hpRenderer: createRenderer(),
+      isSnapshot,
+      viewId,
+    }));
+    for (const key of ['alphaTexture', 'alphaTexWidth', 'useAlphaTexture']) {
+      assert.equal(Object.hasOwn(ctx, key), false, `${viewId} ${key}`);
+    }
+  }
 });

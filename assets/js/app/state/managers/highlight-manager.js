@@ -6,13 +6,16 @@
  * @module state/managers/highlight-manager
  */
 
+import { hasDuplicateCellIndex } from '../../utils/cell-set.js';
 import { BaseManager } from '../core/base-manager.js';
 import { getPageColor } from '../../utils/page-colors.js';
 import { highlightAccessorMethods } from './highlight-accessors.js';
 import {
   MIN_VISIBLE_ALPHA_BYTE,
   POINT_VISIBILITY_THRESHOLD,
+  requirePointTransparency,
 } from '../../../rendering/alpha-visibility.js';
+import { isCategoricalCodes } from '../../../data/categorical-storage-contract.js';
 
 function requireFieldSource(source) {
   if (source !== 'obs' && source !== 'var') {
@@ -21,6 +24,12 @@ function requireFieldSource(source) {
   return source;
 }
 
+/**
+ * Resolve the categorical field `(fieldIndex, source)` names in the owner's own
+ * inventory. Only the legend's "highlight this category" path addresses a
+ * field by index; selection gestures hold the field object of the pane they
+ * landed in and go straight to `requireCategoryOfField`.
+ */
 function requireCategorySelection(owner, fieldIndex, categoryIndex, source) {
   requireFieldSource(source);
   if (!Number.isSafeInteger(fieldIndex) || fieldIndex < 0) {
@@ -43,6 +52,17 @@ function requireCategorySelection(owner, fieldIndex, categoryIndex, source) {
     throw new RangeError('Highlight category field index is outside the field inventory.');
   }
   const field = data.fields[fieldIndex];
+  return { field, categoryName: requireCategoryOfField(field, categoryIndex) };
+}
+
+/**
+ * Validate one category of one categorical field object and return its name.
+ *
+ * @param {unknown} field
+ * @param {unknown} categoryIndex
+ * @returns {string|number|boolean}
+ */
+function requireCategoryOfField(field, categoryIndex) {
   if (
     field === null
     || typeof field !== 'object'
@@ -75,7 +95,7 @@ function requireCategorySelection(owner, fieldIndex, categoryIndex, source) {
       'Highlight category must be a string, finite number, or boolean.'
     );
   }
-  return { field, categoryName };
+  return categoryName;
 }
 
 function requireCategoryFieldKey(field) {
@@ -146,19 +166,22 @@ function requireCreatedCellIndices(cellIndices, pointCount) {
       'Category highlight requires at least one currently visible cell.'
     );
   }
-  const seen = new Set();
   for (const cellIndex of cellIndices) {
     if (
       !Number.isSafeInteger(cellIndex)
       || cellIndex < 0
       || cellIndex >= pointCount
-      || seen.has(cellIndex)
     ) {
       throw new RangeError(
         'Category highlight cell indices must be unique and inside the current dataset.'
       );
     }
-    seen.add(cellIndex);
+  }
+  // One bit a cell, not a Set (a Set refuses more than 2^24 entries).
+  if (hasDuplicateCellIndex(cellIndices, pointCount)) {
+    throw new RangeError(
+      'Category highlight cell indices must be unique and inside the current dataset.'
+    );
   }
   return cellIndices;
 }
@@ -380,26 +403,11 @@ function publishedHighlightIndices(cells, written) {
 }
 
 function requireSelectionTransparency(transparency, pointCount) {
-  if (
-    !(transparency instanceof Float32Array)
-    || transparency.length !== pointCount
-  ) {
-    throw new TypeError(
-      'Highlight selection requires the complete Float32Array transparency for its view.'
-    );
-  }
-  for (let index = 0; index < transparency.length; index++) {
-    if (
-      !Number.isFinite(transparency[index])
-      || transparency[index] < 0
-      || transparency[index] > 1
-    ) {
-      throw new RangeError(
-        `Highlight view transparency ${index} must be from 0 through 1.`
-      );
-    }
-  }
-  return transparency;
+  return requirePointTransparency(
+    transparency,
+    pointCount,
+    'Highlight selection view transparency'
+  );
 }
 
 export const highlightStateMethods = {
@@ -480,7 +488,12 @@ export const highlightStateMethods = {
     if (!page) return 0;
 
     const label = `Highlight page "${pageId}"`;
-    const cells = new Uint32Array(enabledPageCellCapacity(page, label));
+    const capacity = enabledPageCellCapacity(page, label);
+    // A page with no enabled cells counts zero without a dataset-length
+    // deduplication buffer: every page starts empty, and the page list is
+    // counted as soon as a dataset loads.
+    if (capacity === 0) return 0;
+    const cells = new Uint32Array(capacity);
     const membership = this._borrowHighlightMembershipScratch();
     let written;
     try {
@@ -610,43 +623,62 @@ export const highlightStateMethods = {
     const page2 = this.highlightPages.find((p) => p.id === pageId2);
     if (!page1 || !page2) return null;
 
-    // Collect all highlighted cell indices from each page, using the one
-    // definition of a page's cells so a combination can never include a cell
-    // the source page does not render.
+    // Both pages are read through the one definition of a page's cells, so a
+    // combination can never include a cell a source page does not render. The
+    // borrowed membership bytes double as the set: no structure scales with
+    // anything but the point count, which keeps a whole-dataset combination
+    // exact and linear.
     const membership = this._borrowHighlightMembershipScratch();
-    const collect = (page) => {
-      const label = `Highlight page "${page.id}"`;
-      const cells = new Uint32Array(enabledPageCellCapacity(page, label));
-      let written;
+    const label1 = `Highlight page "${page1.id}"`;
+    const label2 = `Highlight page "${page2.id}"`;
+    const capacity1 = enabledPageCellCapacity(page1, label1);
+    const capacity2 = enabledPageCellCapacity(page2, label2);
+    const collectInto = (page, label, cells, offset) => {
       try {
-        written = collectEnabledPageCells(
+        return collectEnabledPageCells(
           page,
           this.pointCount,
           membership,
           label,
           cells,
-          0
+          offset
         );
       } catch (error) {
+        // The buffer holds a partial page. Retire it rather than hand a dirty
+        // deduplication structure to the next reader.
         this._highlightMembershipScratch = null;
         throw error;
       }
-      for (let i = 0; i < written; i++) membership[cells[i]] = 0;
-      return new Set(cells.subarray(0, written));
     };
-
-    const set1 = collect(page1);
-    const set2 = collect(page2);
+    const clearMarks = (cells, count) => {
+      for (let i = 0; i < count; i++) membership[cells[i]] = 0;
+    };
 
     let resultIndices;
     let operationSymbol;
     if (operation === 'intersection') {
-      // Cells that are in BOTH pages
-      resultIndices = [...set1].filter((idx) => set2.has(idx));
+      // Page 1's cells in first-seen order, then mark page 2 and keep the
+      // page 1 cells it marked.
+      const cells1 = new Uint32Array(capacity1);
+      const written1 = collectInto(page1, label1, cells1, 0);
+      clearMarks(cells1, written1);
+      const cells2 = new Uint32Array(capacity2);
+      const written2 = collectInto(page2, label2, cells2, 0);
+      let kept = 0;
+      for (let i = 0; i < written1; i++) {
+        const cellIndex = cells1[i];
+        if (membership[cellIndex] !== 0) cells1[kept++] = cellIndex;
+      }
+      clearMarks(cells2, written2);
+      resultIndices = publishedHighlightIndices(cells1, kept);
       operationSymbol = '∩';
     } else {
-      // Union: cells that are in EITHER page
-      resultIndices = [...new Set([...set1, ...set2])];
+      // Page 1's cells, then the page 2 cells page 1 did not already mark.
+      const cells = new Uint32Array(capacity1 + capacity2);
+      const written1 = collectInto(page1, label1, cells, 0);
+      const written2 = collectInto(page2, label2, cells, written1);
+      clearMarks(cells, written1 + written2);
+      resultIndices = publishedHighlightIndices(cells, written1 + written2);
       operationSymbol = '∪';
     }
 
@@ -722,24 +754,24 @@ export const highlightStateMethods = {
   },
 
   /**
-   * Get cell indices for a categorical selection.
-   * Only includes cells that are currently visible (pass all active filters).
-   * @param {number} fieldIndex - Field index in obs/var data
-   * @param {number} categoryIndex - Category index to match
-   * @param {string} source - Data source ('obs' or 'var')
-   * @param {Float32Array} viewTransparency - Exact per-view transparency array.
-   * @returns {number[]} Array of cell indices matching the category and passing filters
+   * Cells of one category of `field` that are visible in one view.
+   *
+   * Keyed by the field object rather than an index into this state's own
+   * inventory: a selection gesture resolves the field of the pane it landed
+   * in (`getFieldForView`), which is not the focused view's field when the
+   * pane is not focused.
+   *
+   * @param {object} field - Categorical field metadata with loaded codes.
+   * @param {number} categoryIndex - Category index to match.
+   * @param {Uint8Array} viewTransparency - Exact per-view transparency array
+   *   of the view the cells must be visible in.
+   * @returns {number[]} Visible cells whose code is `categoryIndex`.
    */
-  getCellIndicesForCategory(fieldIndex, categoryIndex, source, viewTransparency) {
-    const { field } = requireCategorySelection(
-      this,
-      fieldIndex,
-      categoryIndex,
-      source
-    );
+  getCellIndicesForCategory(field, categoryIndex, viewTransparency) {
+    requireCategoryOfField(field, categoryIndex);
     const codes = field.codes;
     if (
-      (!(codes instanceof Uint8Array) && !(codes instanceof Uint16Array))
+      !isCategoricalCodes(codes)
       || codes.length !== this.pointCount
     ) {
       throw new TypeError('Highlight category codes must match the current point count.');
@@ -758,17 +790,18 @@ export const highlightStateMethods = {
   },
 
   /**
-   * Get cell indices for a continuous range selection.
-   * Only includes cells that are currently visible (pass all active filters).
-   * @param {number} fieldIndex - Field index in obs/var data
+   * Cells of a continuous `field` whose value lies in `[minVal, maxVal]` and
+   * that are visible in one view. Keyed by the field object for the same
+   * reason as `getCellIndicesForCategory`.
+   *
+   * @param {object} field - Continuous field metadata with loaded values.
    * @param {number} minVal - Minimum value for range
    * @param {number} maxVal - Maximum value for range
-   * @param {string} source - Data source ('obs' or 'var')
-   * @param {Float32Array} viewTransparency - Exact per-view transparency array.
-   * @returns {number[]} Array of cell indices within range and passing filters
+   * @param {Uint8Array} viewTransparency - Exact per-view transparency array
+   *   of the view the cells must be visible in.
+   * @returns {number[]} Visible cells within the range.
    */
-  getCellIndicesForRange(fieldIndex, minVal, maxVal, source, viewTransparency) {
-    requireFieldSource(source);
+  getCellIndicesForRange(field, minVal, maxVal, viewTransparency) {
     if (
       !Number.isFinite(minVal)
       || !Number.isFinite(maxVal)
@@ -776,11 +809,13 @@ export const highlightStateMethods = {
     ) {
       throw new RangeError('Highlight range must contain ordered finite bounds.');
     }
-    const field = source === 'var'
-      ? this.varData?.fields?.[fieldIndex]
-      : this.obsData?.fields?.[fieldIndex];
-    if (!field || field.kind !== 'continuous') {
-      throw new RangeError('Highlight continuous field was not found.');
+    if (
+      field === null
+      || typeof field !== 'object'
+      || Array.isArray(field)
+      || field.kind !== 'continuous'
+    ) {
+      throw new TypeError('Highlight range field must be continuous.');
     }
     const values = field.values;
     if (
@@ -793,7 +828,7 @@ export const highlightStateMethods = {
     const transparency = requireSelectionTransparency(viewTransparency, this.pointCount);
     for (let i = 0; i < values.length; i++) {
       const v = values[i];
-      if (v !== null && !Number.isNaN(v) && v >= minVal && v <= maxVal) {
+      if (!Number.isNaN(v) && v >= minVal && v <= maxVal) {
         // Only include cells that are currently visible (not filtered out in the target view)
         if (transparency[i] >= POINT_VISIBILITY_THRESHOLD) {
           indices.push(i);
@@ -929,9 +964,8 @@ export const highlightStateMethods = {
     const targetGroups = requireActiveHighlightGroups(this);
     const cellIndices = requireCreatedCellIndices(
       this.getCellIndicesForCategory(
-        fieldIndex,
+        field,
         categoryIndex,
-        source,
         this.categoryTransparency
       ),
       this.pointCount
@@ -967,10 +1001,9 @@ export const highlightStateMethods = {
     if (!field || field.kind !== 'continuous') return null;
 
     const cellIndices = this.getCellIndicesForRange(
-      fieldIndex,
+      field,
       minVal,
       maxVal,
-      source,
       this.categoryTransparency
     );
     if (cellIndices.length === 0) return null;

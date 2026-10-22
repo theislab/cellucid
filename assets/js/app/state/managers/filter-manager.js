@@ -9,8 +9,15 @@
  */
 
 import { rgbToCss, COLOR_PICKER_PALETTE } from '../../../data/palettes.js';
-import { NEUTRAL_GRAY_UINT8 } from '../core/constants.js';
+import { fillNeutralGray } from '../core/constants.js';
 import { BaseManager } from '../core/base-manager.js';
+import { requireCategoryCodesInInventory } from './category-codes.js';
+import {
+  writableCellVisibilityMask,
+  writableColors,
+  writableTransparency,
+} from './per-cell-array-ownership.js';
+import { isCategoricalCodes, missingCategoryCode } from '../../../data/categorical-storage-contract.js';
 
 function requireCategoryFieldAndIndex(field, index) {
   if (
@@ -76,6 +83,130 @@ function parseExactFilterId(filterId) {
   return { source, type, fieldIndex };
 }
 
+/**
+ * Structured filter rows of one view: the active view (DataState itself) or
+ * a stored view context. Every consumer - the Active filters list, the view
+ * label, figure-export provenance - derives from this one definition, so a
+ * view's filters never depend on whether it happens to be focused.
+ *
+ * @param {{obsData: object|null, varData: object|null, activeFieldSource: string|null,
+ *   activeFieldIndex: number, activeVarFieldIndex: number}} view
+ */
+export function collectViewFilters(view) {
+  if (!view.obsData || !view.obsData.fields) return [];
+  const fields = view.obsData.fields;
+  const filters = [];
+
+  for (let fi = 0; fi < fields.length; fi++) {
+    const field = fields[fi];
+    if (!field) continue;
+    if (field._isDeleted === true) continue;
+    const key = field.key || `Field ${fi + 1}`;
+
+    // Continuous field filter
+    if (field.kind === 'continuous' && field._continuousStats && field._continuousFilter) {
+      const stats = field._continuousStats;
+      const filter = field._continuousFilter;
+      const fullRange = isContinuousFilterFullRange(filter, stats);
+      if (!fullRange) {
+        const enabled = field._filterEnabled !== false; // default true
+        const disabledSuffix = enabled ? '' : ' (disabled)';
+        filters.push({
+          id: `obs-continuous-${fi}`,
+          type: 'continuous',
+          source: 'obs',
+          fieldIndex: fi,
+          fieldKey: key,
+          enabled: enabled,
+          text: `${key}: ${filter.min.toFixed(2)} – ${filter.max.toFixed(2)}${disabledSuffix}`
+        });
+      }
+    }
+    
+    // Categorical field hidden categories
+    if (field.kind === 'category') {
+      const categories = field.categories || [];
+      const visibleMap = field._categoryVisible || {};
+      const hiddenNames = [];
+      for (let i = 0; i < categories.length; i++) {
+        const name = String(categories[i]);
+        const isVisible = visibleMap[i] !== false;
+        if (!isVisible) hiddenNames.push(name);
+      }
+      if (hiddenNames.length > 0) {
+        const enabled = field._categoryFilterEnabled !== false; // default true
+        const preview = hiddenNames.slice(0, 4).join(', ');
+        const extra = hiddenNames.length > 4 ? ` +${hiddenNames.length - 4} more` : '';
+        const disabledSuffix = enabled ? '' : ' (disabled)';
+        filters.push({
+          id: `obs-category-${fi}`,
+          type: 'category',
+          source: 'obs',
+          fieldIndex: fi,
+          fieldKey: key,
+          enabled: enabled,
+          hiddenCount: hiddenNames.length,
+          text: `${key}: hiding ${preview}${extra}${disabledSuffix}`
+        });
+      }
+      
+      // Outlier filter
+      if (
+        view.activeFieldSource === 'obs'
+        && view.activeFieldIndex === fi
+        && field.outlierQuantiles
+        && field.outlierQuantiles.length
+      ) {
+        const threshold = field._outlierThreshold != null ? field._outlierThreshold : 1.0;
+        if (threshold < 0.9999) {
+          const enabled = field._outlierFilterEnabled !== false; // default true
+          const pct = Math.round(threshold * 100);
+          const disabledSuffix = enabled ? '' : ' (disabled)';
+          filters.push({
+            id: `obs-outlier-${fi}`,
+            type: 'outlier',
+            source: 'obs',
+            fieldIndex: fi,
+            fieldKey: key,
+            enabled: enabled,
+            text: `${key}: outlier ≤ ${pct}%${disabledSuffix}`
+          });
+        }
+      }
+    }
+  }
+  
+  // Var field (gene expression) filter
+  if (
+    view.activeFieldSource === 'var' &&
+    view.activeVarFieldIndex >= 0 &&
+    view.varData &&
+    view.varData.fields
+  ) {
+    const field = view.varData.fields[view.activeVarFieldIndex];
+    if (field && field._isDeleted !== true && field.kind === 'continuous' && field._continuousStats && field._continuousFilter) {
+      const stats = field._continuousStats;
+      const filter = field._continuousFilter;
+      const fullRange = isContinuousFilterFullRange(filter, stats);
+      if (!fullRange) {
+        const enabled = field._filterEnabled !== false; // default true
+        const disabledSuffix = enabled ? '' : ' (disabled)';
+        filters.push({
+          id: `var-continuous-${view.activeVarFieldIndex}`,
+          type: 'continuous',
+          source: 'var',
+          fieldIndex: view.activeVarFieldIndex,
+          fieldKey: field.key,
+          enabled: enabled,
+          text: `${field.key}: ${filter.min.toFixed(2)} – ${filter.max.toFixed(2)}${disabledSuffix}`
+        });
+      }
+    }
+  }
+
+  return filters;
+}
+
 export class DataStateFilterMethods {
   computeGlobalVisibility() {
     if (this.pointCount === 0 && this.obsData === null) return;
@@ -87,9 +218,9 @@ export class DataStateFilterMethods {
         this.obsData.count !== 0 ||
         !Array.isArray(this.obsData.fields) ||
         this.obsData.fields.length !== 0 ||
-        !(this.categoryTransparency instanceof Float32Array) ||
+        !(this.categoryTransparency instanceof Uint8Array) ||
         this.categoryTransparency.length !== 0 ||
-        !(this.cellVisibilityMask instanceof Float32Array) ||
+        !(this.cellVisibilityMask instanceof Uint8Array) ||
         this.cellVisibilityMask.length !== 0 ||
         !(this.colorsArray instanceof Uint8Array) ||
         this.colorsArray.length !== 0
@@ -111,9 +242,9 @@ export class DataStateFilterMethods {
     const fields = this.obsData.fields;
     const pointCount = this.pointCount;
     if (
-      !(this.categoryTransparency instanceof Float32Array)
+      !(this.categoryTransparency instanceof Uint8Array)
       || this.categoryTransparency.length !== pointCount
-      || !(this.cellVisibilityMask instanceof Float32Array)
+      || !(this.cellVisibilityMask instanceof Uint8Array)
       || this.cellVisibilityMask.length !== pointCount
       || !(this.colorsArray instanceof Uint8Array)
       || this.colorsArray.length !== pointCount * 4
@@ -122,9 +253,12 @@ export class DataStateFilterMethods {
         'Visibility computation requires complete color, transparency, and cell-mask buffers.'
       );
     }
-    for (let index = 0; index < pointCount; index++) {
-      if (this.cellVisibilityMask[index] !== 0 && this.cellVisibilityMask[index] !== 1) {
-        throw new TypeError(`Cell visibility mask entry ${index} must be exactly 0 or 1.`);
+    {
+      const mask = this.cellVisibilityMask;
+      for (let index = 0; index < pointCount; index++) {
+        if (mask[index] > 1) {
+          throw new TypeError(`Cell visibility mask entry ${index} must be exactly 0 or 1.`);
+        }
       }
     }
 
@@ -165,20 +299,12 @@ export class DataStateFilterMethods {
         !Number.isFinite(outlierThreshold)
         || outlierThreshold < 0
         || outlierThreshold > 1
-        || !(this.outlierQuantilesArray instanceof Float32Array)
-        || this.outlierQuantilesArray.length !== pointCount
       ) {
-        throw new TypeError('Active outlier filtering requires exact threshold and quantile data.');
+        throw new TypeError('Active outlier filtering requires an exact threshold.');
       }
-      outliers = this.outlierQuantilesArray;
-      for (let index = 0; index < pointCount; index++) {
-        const quantile = outliers[index];
-        if (!Number.isFinite(quantile) || quantile < -1 || quantile > 1) {
-          throw new RangeError(
-            `Outlier quantile ${index} must be -1 or a finite value from 0 through 1.`
-          );
-        }
-      }
+      // The active field's own quantiles, proven -1 or within [0, 1] once
+      // per decoded array.
+      outliers = this.getActiveOutlierQuantiles();
     }
 
     const categoryFilters = [];
@@ -194,37 +320,44 @@ export class DataStateFilterMethods {
       if (field.kind === 'category' && field._categoryVisible !== undefined) {
         this.ensureCategoryMetadata(field);
         if (
-          (!(field.codes instanceof Uint8Array) && !(field.codes instanceof Uint16Array))
+          !isCategoricalCodes(field.codes)
           || field.codes.length !== pointCount
         ) {
           throw new TypeError(`Observation category field ${f} requires exact dataset-length codes.`);
         }
         const categories = field.categories;
         const numCats = categories.length;
-        const missingCode = field.codes instanceof Uint8Array ? 255 : 65_535;
-        for (let index = 0; index < pointCount; index++) {
-          const code = field.codes[index];
-          if (code >= numCats && code !== missingCode) {
-            throw new RangeError(
-              `Category filter code ${index} is outside the category inventory.`
-            );
-          }
-        }
+        requireCategoryCodesInInventory(
+          field.codes,
+          numCats,
+          index => `Category filter code ${index} is outside the category inventory.`
+        );
         if (field._categoryFilterEnabled) {
           const visibleMap = field._categoryVisible;
+          // One byte per code, so the per-cell test is a single typed load.
+          // For uint8 and uint16 codes the table spans every code the dtype
+          // can hold and the missing code reads 1 (never hidden). A uint32
+          // table spans the inventory only (2^32 bytes would not fit), and
+          // the missing code is tested by value. Every other code is proven
+          // inside the inventory above.
+          const missingCode = missingCategoryCode(field.codes);
+          const spansDtype = missingCode <= 0xffff;
+          const visibleByCode = new Uint8Array(spansDtype ? missingCode + 1 : numCats);
+          if (spansDtype) visibleByCode[missingCode] = 1;
           let hasHidden = false;
           for (let c = 0; c < numCats; c++) {
-            if (visibleMap[c] === false) {
+            if (visibleMap[c]) {
+              visibleByCode[c] = 1;
+            } else {
               hasHidden = true;
-              break;
             }
           }
           if (hasHidden) {
             categoryFilters.push({
               codes: field.codes,
-              visibleMap,
-              numCats,
-              missingCode
+              visibleByCode,
+              missingCode,
+              spansDtype
             });
           }
         }
@@ -282,20 +415,47 @@ export class DataStateFilterMethods {
     // Both arrays are exactly `pointCount` long (checked above). Hoisting them
     // out of the loop removes one property load per point per pass.
     const cellVisibilityMask = this.cellVisibilityMask;
-    const transparency = this.categoryTransparency;
+    // Every branch below rewrites every entry; a kept view still sharing the
+    // array keeps the old one (per-cell-array-ownership.js).
+    const transparency = writableTransparency(this);
 
     if (!hasAnyFilter) {
       // Every mask entry is exactly 0 or 1, so with no filter active the
       // published alpha *is* the mask. One typed-array copy replaces a
       // dataset-length fill followed by a second dataset-length pass.
       transparency.set(cellVisibilityMask);
+    } else if (
+      categoryFilters.length === 1 &&
+      continuousFilters.length === 0 &&
+      !activeVarFilterEnabled &&
+      !applyOutlierFilter
+    ) {
+      // The commonest filter -- categories hidden on one field -- with the
+      // per-code table read straight into the alpha: it holds exactly the 0
+      // or 1 the general loop below writes, at half its cost at 10,000,000
+      // cells.
+      const { codes, visibleByCode, missingCode, spansDtype } = categoryFilters[0];
+      if (spansDtype) {
+        for (let i = 0; i < pointCount; i++) {
+          transparency[i] = cellVisibilityMask[i] === 0
+            ? 0
+            : visibleByCode[codes[i]];
+        }
+      } else {
+        for (let i = 0; i < pointCount; i++) {
+          const code = codes[i];
+          transparency[i] = cellVisibilityMask[i] === 0
+            ? 0
+            : code === missingCode ? 1 : visibleByCode[code];
+        }
+      }
     } else {
       for (let i = 0; i < pointCount; i++) {
         // The mask is tested first. No filter can make a cell the mask already
         // hides visible again, so its predicates are never evaluated — that is
         // also what keeps this one pass equal to the two it replaces.
         if (cellVisibilityMask[i] === 0) {
-          transparency[i] = 0.0;
+          transparency[i] = 0;
           continue;
         }
         let visible = true;
@@ -303,8 +463,10 @@ export class DataStateFilterMethods {
         for (let cf = 0; cf < categoryFilters.length; cf++) {
           const filter = categoryFilters[cf];
           const code = filter.codes[i];
-          if (code === filter.missingCode) continue;
-          if (!filter.visibleMap[code]) {
+          if (
+            (filter.spansDtype || code !== filter.missingCode)
+            && filter.visibleByCode[code] === 0
+          ) {
             visible = false;
             break;
           }
@@ -314,7 +476,7 @@ export class DataStateFilterMethods {
           for (let cf = 0; cf < continuousFilters.length; cf++) {
             const filter = continuousFilters[cf];
             const v = filter.values[i];
-            if (Number.isNaN(v) || v < filter.min || v > filter.max) {
+            if (v !== v || v < filter.min || v > filter.max) {
               visible = false;
               break;
             }
@@ -323,7 +485,7 @@ export class DataStateFilterMethods {
 
         if (visible && activeVarFilterEnabled) {
           const v = activeVarValues[i];
-          if (Number.isNaN(v) || v < activeVarFilterMin || v > activeVarFilterMax) {
+          if (v !== v || v < activeVarFilterMin || v > activeVarFilterMax) {
             visible = false;
           }
         }
@@ -334,7 +496,7 @@ export class DataStateFilterMethods {
           if (q >= 0 && q > outlierThreshold) visible = false;
         }
 
-        transparency[i] = visible ? 1.0 : 0.0;
+        transparency[i] = visible ? 1 : 0;
       }
     }
 
@@ -362,119 +524,7 @@ export class DataStateFilterMethods {
   }
 
   getActiveFiltersStructured() {
-    // Returns structured filter data with id, type, enabled state, and display text
-    if (!this.obsData || !this.obsData.fields) return [];
-    const fields = this.obsData.fields;
-    const filters = [];
-
-    for (let fi = 0; fi < fields.length; fi++) {
-      const field = fields[fi];
-      if (!field) continue;
-      if (field._isDeleted === true) continue;
-      const key = field.key || `Field ${fi + 1}`;
-
-      // Continuous field filter
-      if (field.kind === 'continuous' && field._continuousStats && field._continuousFilter) {
-        const stats = field._continuousStats;
-        const filter = field._continuousFilter;
-        const fullRange = isContinuousFilterFullRange(filter, stats);
-        if (!fullRange) {
-          const enabled = field._filterEnabled !== false; // default true
-          const disabledSuffix = enabled ? '' : ' (disabled)';
-          filters.push({
-            id: `obs-continuous-${fi}`,
-            type: 'continuous',
-            source: 'obs',
-            fieldIndex: fi,
-            fieldKey: key,
-            enabled: enabled,
-            text: `${key}: ${filter.min.toFixed(2)} – ${filter.max.toFixed(2)}${disabledSuffix}`
-          });
-        }
-      }
-      
-      // Categorical field hidden categories
-      if (field.kind === 'category') {
-        const categories = field.categories || [];
-        const visibleMap = field._categoryVisible || {};
-        const hiddenNames = [];
-        for (let i = 0; i < categories.length; i++) {
-          const name = String(categories[i]);
-          const isVisible = visibleMap[i] !== false;
-          if (!isVisible) hiddenNames.push(name);
-        }
-        if (hiddenNames.length > 0) {
-          const enabled = field._categoryFilterEnabled !== false; // default true
-          const preview = hiddenNames.slice(0, 4).join(', ');
-          const extra = hiddenNames.length > 4 ? ` +${hiddenNames.length - 4} more` : '';
-          const disabledSuffix = enabled ? '' : ' (disabled)';
-          filters.push({
-            id: `obs-category-${fi}`,
-            type: 'category',
-            source: 'obs',
-            fieldIndex: fi,
-            fieldKey: key,
-            enabled: enabled,
-            hiddenCount: hiddenNames.length,
-            text: `${key}: hiding ${preview}${extra}${disabledSuffix}`
-          });
-        }
-        
-        // Outlier filter
-        if (
-          this.activeFieldSource === 'obs'
-          && this.activeFieldIndex === fi
-          && field.outlierQuantiles
-          && field.outlierQuantiles.length
-        ) {
-          const threshold = field._outlierThreshold != null ? field._outlierThreshold : 1.0;
-          if (threshold < 0.9999) {
-            const enabled = field._outlierFilterEnabled !== false; // default true
-            const pct = Math.round(threshold * 100);
-            const disabledSuffix = enabled ? '' : ' (disabled)';
-            filters.push({
-              id: `obs-outlier-${fi}`,
-              type: 'outlier',
-              source: 'obs',
-              fieldIndex: fi,
-              fieldKey: key,
-              enabled: enabled,
-              text: `${key}: outlier ≤ ${pct}%${disabledSuffix}`
-            });
-          }
-        }
-      }
-    }
-    
-    // Var field (gene expression) filter
-    if (
-      this.activeFieldSource === 'var' &&
-      this.activeVarFieldIndex >= 0 &&
-      this.varData &&
-      this.varData.fields
-    ) {
-      const field = this.varData.fields[this.activeVarFieldIndex];
-      if (field && field._isDeleted !== true && field.kind === 'continuous' && field._continuousStats && field._continuousFilter) {
-        const stats = field._continuousStats;
-        const filter = field._continuousFilter;
-        const fullRange = isContinuousFilterFullRange(filter, stats);
-        if (!fullRange) {
-          const enabled = field._filterEnabled !== false; // default true
-          const disabledSuffix = enabled ? '' : ' (disabled)';
-          filters.push({
-            id: `var-continuous-${this.activeVarFieldIndex}`,
-            type: 'continuous',
-            source: 'var',
-            fieldIndex: this.activeVarFieldIndex,
-            fieldKey: field.key,
-            enabled: enabled,
-            text: `${field.key}: ${filter.min.toFixed(2)} – ${filter.max.toFixed(2)}${disabledSuffix}`
-          });
-        }
-      }
-    }
-
-    return filters;
+    return collectViewFilters(this);
   }
 
   toggleFilterEnabled(filterId, enabled) {
@@ -517,6 +567,18 @@ export class DataStateFilterMethods {
       field._continuousFilter.min = metadata.stats.min;
       field._continuousFilter.max = metadata.stats.max;
       field._filterEnabled = true;
+      // With "rescale colors to filter" on, the colour range tracks the
+      // range sliders, which this removal returns to the full data range.
+      if (field._useFilterColorRange === true) {
+        field._continuousColorRange = {
+          min: metadata.stats.min,
+          max: metadata.stats.max
+        };
+        if (field === this.getActiveField()) {
+          this.updateColorsContinuous(field);
+          this._pushColorsToViewer();
+        }
+      }
     } else if (type === 'category') {
       this.ensureCategoryMetadata(field);
       const categories = field.categories;
@@ -549,11 +611,16 @@ export class DataStateFilterMethods {
   /**
    * Update color array for a category field without triggering visibility recomputation.
    * Used by batch mode to defer the expensive computeGlobalVisibility() call.
+   *
+   * The point colours belong to the active field alone. A filter on another
+   * field (listed in Active filters, edited in batch, restored from a session)
+   * changes only visibility, so its palette must never reach the canvas.
    */
   _reapplyCategoryColorsNoRecompute(field) {
     if (!field || field.kind !== 'category') {
       throw new TypeError('Category color refresh requires a category field.');
     }
+    if (field !== this.getActiveField()) return;
     const n = this.pointCount;
     const categories = field.categories;
     const codes = field.codes;
@@ -562,45 +629,24 @@ export class DataStateFilterMethods {
     const numCats = categories.length;
     if (
       (!Array.isArray(categories))
-      || (!(codes instanceof Uint8Array) && !(codes instanceof Uint16Array))
+      || !isCategoricalCodes(codes)
       || codes.length !== n
       || !Array.isArray(catColors)
       || catColors.length !== numCats
       || !(this.colorsArray instanceof Uint8Array)
       || this.colorsArray.length !== n * 4
-      || !(this.categoryTransparency instanceof Float32Array)
+      || !(this.categoryTransparency instanceof Uint8Array)
       || this.categoryTransparency.length !== n
     ) {
       throw new TypeError('Category color refresh requires complete typed field buffers.');
     }
-    const missingCode = codes instanceof Uint8Array ? 255 : 65_535;
-
-    for (let i = 0; i < n; i++) {
-      const code = codes[i];
-      let r, g, b;
-      if (code === missingCode) {
-        r = NEUTRAL_GRAY_UINT8; g = NEUTRAL_GRAY_UINT8; b = NEUTRAL_GRAY_UINT8;
-      } else if (code >= numCats) {
-        throw new RangeError(`Category code ${i} is outside the category inventory.`);
-      } else {
-        const isVisible = catVisible[code];
-        const c = catColors[code];
-        if (!isVisible) {
-          // Gray out hidden categories (visual indicator), but don't set transparency here
-          r = g = b = 128; // gray in uint8
-        } else {
-          // Convert from 0-1 float to 0-255 uint8
-          r = Math.round(c[0] * 255);
-          g = Math.round(c[1] * 255);
-          b = Math.round(c[2] * 255);
-        }
-      }
-      const j = i * 4;
-      this.colorsArray[j] = r;
-      this.colorsArray[j + 1] = g;
-      this.colorsArray[j + 2] = b;
-    }
-    this._syncColorsAlpha();
+    // The alpha bytes are left as the table wrote them: every caller recomputes
+    // visibility next (`reapplyCategoryColors`, `removeFilter`, `endBatch`),
+    // and `computeGlobalVisibility` publishes the alpha bytes from the new
+    // transparency. Syncing them here first was a dataset-length pass whose
+    // result was overwritten before anything read it; the GPU color stream's
+    // alpha byte is not read while the alpha texture carries visibility.
+    this._writeCategoryColors(field, false);
     this._pushColorsToViewer();
   }
 
@@ -660,7 +706,7 @@ export class DataStateFilterMethods {
       );
     }
     if (
-      !(this.cellVisibilityMask instanceof Float32Array) ||
+      !(this.cellVisibilityMask instanceof Uint8Array) ||
       this.cellVisibilityMask.length !== this.pointCount
     ) {
       throw new TypeError(
@@ -716,15 +762,15 @@ export class DataStateFilterMethods {
       }
     }
 
-    const nextValue = visible ? 1.0 : 0.0;
+    const nextValue = visible ? 1 : 0;
     if (selectedBits === null) {
-      this.cellVisibilityMask.fill(nextValue);
+      writableCellVisibilityMask(this).fill(nextValue);
     } else {
       // Driving the write from the validated bits reads every input element
       // exactly once, so no value can differ between validation and write. The
       // loop bound is the buffer length so V8 keeps the elided-bounds-check
       // fast path; a narrower "touched range" bound measured 4x slower here.
-      const mask = this.cellVisibilityMask;
+      const mask = writableCellVisibilityMask(this);
       for (let bucket = 0; bucket < selectedBits.length; bucket++) {
         const bits = selectedBits[bucket];
         if (bits === 0) continue;
@@ -800,22 +846,13 @@ export class DataStateFilterMethods {
     this.activeVarFieldIndex = -1;
     this.activeFieldSource = null;
     if (this.colorsArray) {
-      // Fill with neutral gray (RGB) and full alpha
-      for (let i = 0; i < this.pointCount; i++) {
-        const idx = i * 4;
-        this.colorsArray[idx] = NEUTRAL_GRAY_UINT8;
-        this.colorsArray[idx + 1] = NEUTRAL_GRAY_UINT8;
-        this.colorsArray[idx + 2] = NEUTRAL_GRAY_UINT8;
-        this.colorsArray[idx + 3] = 255;
-      }
+      // Neutral gray (RGB) and full alpha.
+      fillNeutralGray(writableColors(this).subarray(0, this.pointCount * 4));
     }
     if (!this.categoryTransparency || this.categoryTransparency.length !== this.pointCount) {
-      this.categoryTransparency = new Float32Array(this.pointCount);
+      this.categoryTransparency = new Uint8Array(this.pointCount);
     }
-    this.categoryTransparency.fill(1.0);
-    if (this.outlierQuantilesArray) {
-      this.outlierQuantilesArray.fill(-1.0);
-    }
+    writableTransparency(this).fill(1);
     this._pushColorsToViewer();
     this.clearCentroids();
     this.computeGlobalVisibility();
@@ -829,7 +866,16 @@ export class DataStateFilterMethods {
     };
   }
 
-  // Snapshot payload for small multiples (Keep view)
+  /**
+   * Snapshot payload for small multiples (Keep view).
+   *
+   * `colors` is the kept view's own copy: the viewer and renderer keep it by
+   * reference and the new view context adopts it (it is never written again;
+   * a recolor of that view publishes a new array). `transparency` is the
+   * active view's array, lent for one synchronous publication
+   * (`publishSnapshotView`): the viewer copies it, and the new context shares
+   * it with this view until either one writes.
+   */
   getSnapshotPayload() {
     const {
       label,
@@ -844,12 +890,7 @@ export class DataStateFilterMethods {
       fieldKey,
       fieldKind,
       colors: this.colorsArray ? new Uint8Array(this.colorsArray) : null,
-      transparency: this.categoryTransparency
-        ? new Float32Array(this.categoryTransparency)
-        : null,
-      outlierQuantiles: this.outlierQuantilesArray
-        ? new Float32Array(this.outlierQuantilesArray)
-        : null,
+      transparency: this.categoryTransparency ?? null,
       centroidPositions: this.centroidPositions
         ? new Float32Array(this.centroidPositions)
         : null,
@@ -861,7 +902,8 @@ export class DataStateFilterMethods {
         : null,
       outlierThreshold: this.getCurrentOutlierThreshold(),
       filtersText,
-      dimensionLevel: this.activeDimensionLevel // Include dimension level for Keep View
+      // Stride of the kept view's positions: the source view's representation.
+      dimensionLevel: this.getDimensionLevel()
     };
   }
 }

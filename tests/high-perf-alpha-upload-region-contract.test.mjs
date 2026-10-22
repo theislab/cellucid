@@ -40,12 +40,13 @@ function createTextureMemoryGl(maxTextureSize) {
   const unpack = new Map();
   const images = new Map();
   const uploads = [];
-  const counters = { getErrorCalls: 0, texImage2D: 0, texSubImage2D: 0 };
+  const counters = { getErrorCalls: 0, texStorage3D: 0, texSubImage3D: 0 };
   const fail = { texSubImageAt: null };
 
   const gl = {
     CLAMP_TO_EDGE: 0x812f,
     INVALID_OPERATION: 0x0502,
+    MAX_ARRAY_TEXTURE_LAYERS: 0x88ff,
     MAX_TEXTURE_SIZE: 0x0d33,
     NEAREST: 0x2600,
     NO_ERROR: 0,
@@ -53,7 +54,7 @@ function createTextureMemoryGl(maxTextureSize) {
     PIXEL_UNPACK_BUFFER_BINDING: 0x88ef,
     R8: 0x8229,
     RED: 0x1903,
-    TEXTURE_2D: 0x0de1,
+    TEXTURE_2D_ARRAY: 0x8c1a,
     UNPACK_ALIGNMENT: 0x0cf5,
     UNPACK_IMAGE_HEIGHT: 0x806e,
     UNPACK_ROW_LENGTH: 0x0cf2,
@@ -67,7 +68,7 @@ function createTextureMemoryGl(maxTextureSize) {
       boundPixelUnpackBuffer = buffer;
     },
     bindTexture(target, texture) {
-      assert.equal(target, this.TEXTURE_2D);
+      assert.equal(target, this.TEXTURE_2D_ARRAY);
       boundTexture = texture;
     },
     createTexture() {
@@ -85,6 +86,7 @@ function createTextureMemoryGl(maxTextureSize) {
     },
     getParameter(parameter) {
       if (parameter === this.MAX_TEXTURE_SIZE) return maxTextureSize;
+      if (parameter === this.MAX_ARRAY_TEXTURE_LAYERS) return 256;
       if (parameter === this.PIXEL_UNPACK_BUFFER_BINDING) {
         return boundPixelUnpackBuffer;
       }
@@ -100,36 +102,29 @@ function createTextureMemoryGl(maxTextureSize) {
       }
       unpack.set(parameter, value);
     },
-    texImage2D(
-      target, level, internalFormat, width, height, border, format, type, data,
-    ) {
-      counters.texImage2D++;
-      assert.equal(target, this.TEXTURE_2D);
-      assert.equal(level, 0);
-      assert.equal(border, 0);
+    texStorage3D(target, levels, internalFormat, width, height, depth) {
+      counters.texStorage3D++;
+      assert.equal(target, this.TEXTURE_2D_ARRAY);
+      assert.equal(levels, 1);
       assert.equal(internalFormat, this.R8);
-      assert.equal(format, this.RED);
-      assert.equal(type, this.UNSIGNED_BYTE);
-      assert.ok(boundTexture, 'texImage2D requires a bound texture');
-      const image = new Uint8Array(width * height);
-      if (data !== null) {
-        assert.equal(data.length, width * height);
-        image.set(data);
-      }
-      images.set(boundTexture, { height, image, width });
+      assert.equal(depth, 1, 'these fixtures fit one layer');
+      assert.ok(boundTexture, 'texStorage3D requires a bound texture');
+      images.set(boundTexture, { height, image: new Uint8Array(width * height), width });
     },
     texParameteri() {},
-    texSubImage2D(
-      target, level, xOffset, yOffset, width, height, format, type, data,
+    texSubImage3D(
+      target, level, xOffset, yOffset, zOffset, width, height, depth, format, type, data,
       srcOffset = 0,
     ) {
-      counters.texSubImage2D++;
-      assert.equal(target, this.TEXTURE_2D);
+      counters.texSubImage3D++;
+      assert.equal(target, this.TEXTURE_2D_ARRAY);
+      assert.equal(zOffset, 0);
+      assert.equal(depth, 1);
       assert.equal(level, 0);
       assert.equal(format, this.RED);
       assert.equal(type, this.UNSIGNED_BYTE);
       const resident = images.get(boundTexture);
-      assert.ok(resident, 'texSubImage2D requires an allocated texture');
+      assert.ok(resident, 'texSubImage3D requires an allocated texture');
       // Everything this renderer sends is full rows at neutral unpack state.
       assert.equal(unpack.get(this.UNPACK_ALIGNMENT), 1);
       assert.equal(unpack.get(this.UNPACK_ROW_LENGTH), 0);
@@ -147,9 +142,10 @@ function createTextureMemoryGl(maxTextureSize) {
         'source range escapes the supplied buffer',
       );
       uploads.push({ bytes: width * height, height, width, xOffset, yOffset });
-      if (counters.texSubImage2D === fail.texSubImageAt) {
-        pendingError = this.INVALID_OPERATION;
-        return;
+      if (counters.texSubImage3D === fail.texSubImageAt) {
+        // A write into accepted storage fails synchronously or not at all
+        // (WebGL throws for arguments it rejects); nothing is read back.
+        throw new TypeError('WebGL rejected the alpha texSubImage3D publication.');
       }
       for (let row = 0; row < height; row++) {
         const source = srcOffset + row * width;
@@ -185,16 +181,14 @@ function createAlphaRenderer(pointCount, maxTextureSize) {
       _alphaTextureByteLength: 0,
       _dummyLodIndexTexture: null,
       _dummyLodIndexTextureByteLength: 0,
-      _interleavedGpuByteLength: 0,
-      _lodIndexTexturesByDimension: new Map(),
-      _lodResourceOwnersByDimension: new Map(),
+      _colorGpuByteLength: 0,
+      _positionGpuByteLength: 0,
       _pendingDataRetirements: new Set(),
       _pendingSnapshotRetirements: new Set(),
       _perViewState: new Map(),
       _useAlphaTexture: false,
       buffers: {},
       gl,
-      lodBuffersByDimension: new Map(),
       pointCount,
       snapshotBuffers: new Map(),
       stats: { gpuMemoryMB: 0 },
@@ -214,8 +208,8 @@ function expectedImage(alphas, width, height) {
 }
 
 function shapes(pointCount) {
-  const all = value => Float32Array.from({ length: pointCount }, () => value);
-  const hide = predicate => Float32Array.from(
+  const all = value => Uint8Array.from({ length: pointCount }, () => value);
+  const hide = predicate => Uint8Array.from(
     { length: pointCount },
     (_, index) => (predicate(index) ? 0 : 1),
   );
@@ -336,12 +330,12 @@ test('a scattered selection never sends more than the full texture', () => {
   assert.equal(renderer._alphaTexWidth, 64);
   assert.equal(renderer._alphaTexHeight, 64);
 
-  const opaque = new Float32Array(pointCount).fill(1);
+  const opaque = new Uint8Array(pointCount).fill(1);
   renderer._updateAlphaTexture(opaque);
 
   // Every row dirty but with clean rows nowhere: the region set degenerates to
   // the whole texture rather than to sixty-four separate calls.
-  const everyRow = Float32Array.from(
+  const everyRow = Uint8Array.from(
     { length: pointCount },
     (_, index) => (index % 64 === 7 ? 0 : 1),
   );
@@ -358,10 +352,10 @@ test('a scattered selection never sends more than the full texture', () => {
   );
 });
 
-test('one alpha publication costs exactly three synchronous error checks', () => {
-  // Identity guard against the obvious way to make a region-addressed upload
-  // worse than the full one: three `getError` stalls per region instead of
-  // three per publication.
+test('an alpha publication reads no WebGL error back', () => {
+  // `getError()` waits for every queued command, the previous frame's point
+  // draws included. Rows written into the accepted texture allocate nothing,
+  // so nothing can be refused: the publication only fences on a lost context.
   const pointCount = 47;
   const { gl, renderer } = createAlphaRenderer(pointCount, 8);
   const catalogue = shapes(pointCount);
@@ -371,14 +365,10 @@ test('one alpha publication costs exactly three synchronous error checks', () =>
     renderer._updateAlphaTexture(catalogue.nothing);
     gl._counters.getErrorCalls = 0;
     gl._uploads.length = 0;
-    const changed = renderer._updateAlphaTexture(alphas);
-    if (!changed) {
-      assert.equal(gl._counters.getErrorCalls, 0, `${name} idle publication`);
-      continue;
-    }
+    renderer._updateAlphaTexture(alphas);
     assert.equal(
       gl._counters.getErrorCalls,
-      3,
+      0,
       `${name} published ${gl._uploads.length} region(s)`,
     );
   }
@@ -402,7 +392,7 @@ test('a failed multi-region publication restores the accepted image exactly', ()
   );
 
   // Fail the very next region upload, whichever region that is.
-  gl._fail.texSubImageAt = gl._counters.texSubImage2D + 1;
+  gl._fail.texSubImageAt = gl._counters.texSubImage3D + 1;
   assert.throws(
     () => renderer._updateAlphaTexture(catalogue.twoDistantCells),
     /WebGL|alpha|publication/i,
@@ -435,7 +425,7 @@ test('a partial final row is published without disturbing its padding', () => {
   const catalogue = shapes(pointCount);
   renderer._updateAlphaTexture(catalogue.nothing);
 
-  const lastOnly = Float32Array.from(
+  const lastOnly = Uint8Array.from(
     { length: pointCount },
     (_, index) => (index === pointCount - 1 ? 0 : 1),
   );

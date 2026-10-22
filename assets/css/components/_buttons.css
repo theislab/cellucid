@@ -1,62 +1,156 @@
 /* ========================================================================
-   Buttons – consistent pill style across the sidebar
+   Buttons — the one button family (see "Sidebar control standard" in
+   assets/css/README.md). Builders: createButton / createIconButton in
+   assets/js/app/ui/components/controls.js.
+
+   .btn               secondary pill: every ordinary action
+   .btn.btn-primary   filled: the one action that commits a panel's work
+   .btn.btn-compact   the same pill, one size down, for actions inside a
+                      list, a box or a row of several
+   .btn[aria-pressed] a toggle or a tool choice; pressed is filled
+   .btn.btn-danger    filled red: the confirmation that destroys something
+   .icon-btn          square icon-only action, named by aria-label and title
+   .icon-btn-danger   an icon action that deletes
    ===================================================================== */
 
-/* Primary sidebar button family */
-.reset-btn,
-.toggle-switch,
-.btn-small,
-.benchmark-preset,
-.legend-controls button,
-.legend-actions button {
-  font-family: var(--font-display);
-  font-size: var(--text-xs);
-  text-transform: uppercase;
-  letter-spacing: var(--tracking-wider);
+.btn {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-1);
+  min-height: max(var(--control-height), var(--control-target-min));
+  box-sizing: border-box;
+  margin: 0;
+  font-size: var(--type-button);
+  font-weight: var(--font-weight-medium);
+  line-height: var(--leading-tight);
+  text-align: center;
   border-radius: var(--radius-full);
-  padding: var(--space-1-5) var(--space-2-5);
-  border: var(--border-strong);
-  background-color: var(--color-surface-secondary);
+  padding: var(--control-button-padding-y) var(--control-button-padding-x);
+  border: var(--border-control);
+  background-color: var(--color-surface-elevated);
   color: var(--color-text-primary);
   cursor: pointer;
-  box-shadow: var(--shadow-sm);
-  transition: var(--transition-colors), transform var(--duration-fast) var(--easing-standard);
+  transition: var(--transition-colors);
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
 }
 
-.reset-btn:hover,
-.toggle-switch:hover,
-.btn-small:hover,
-.benchmark-preset:hover,
-.legend-controls button:hover,
-.legend-actions button:hover {
-  background-color: var(--color-border-light);
-  transform: translate(-1px, -1px);
-  box-shadow: var(--shadow-md);
+.btn:hover:not(:disabled) {
+  background-color: var(--color-interactive-secondary-hover);
+  border-color: var(--color-text-tertiary);
 }
 
-.reset-btn:active,
-.toggle-switch:active,
-.btn-small:active,
-.benchmark-preset:active,
-.legend-controls button:active,
-.legend-actions button:active {
-  transform: translate(0, 0);
-  box-shadow: var(--shadow-xs);
-  background-color: var(--color-border-default);
+.btn:active:not(:disabled) {
+  background-color: var(--color-interactive-secondary-active);
 }
 
-.reset-btn:disabled,
-.toggle-switch:disabled,
-.btn-small:disabled,
-.benchmark-preset:disabled {
-  opacity: var(--opacity-50);
+.btn:disabled {
+  opacity: var(--control-disabled-opacity);
   cursor: not-allowed;
-  background-color: var(--color-surface-tertiary);
-  box-shadow: none;
-  transform: none;
 }
 
-/* Info button (small circular "i" icon) */
+.btn-compact {
+  min-height: max(var(--control-compact-height), var(--control-target-min));
+  padding: var(--control-button-compact-padding-y) var(--control-button-compact-padding-x);
+}
+
+/* The hit area. On a coarse pointer a button, an icon button and a segment
+   are drawn compact and reach --control-hit-extend past their drawn box above
+   and below (0 on a mouse layout), so a fingertip gets a full target without
+   the control looking inflated. Only leaf controls carry it: a box holding
+   other controls must not lay its extension over them. */
+.btn::after,
+.icon-btn::after,
+.segmented-btn::after {
+  content: '';
+  position: absolute;
+  /* Measured from the padding box, so the border is added back. */
+  inset: calc(-1 * (var(--control-hit-extend) + var(--border-width-1)))
+    calc(-1 * var(--border-width-1));
+}
+
+.btn-primary,
+.btn[aria-pressed="true"] {
+  background-color: var(--color-interactive-primary);
+  border-color: var(--color-interactive-primary);
+  color: var(--color-text-inverse);
+}
+
+.btn-primary:hover:not(:disabled),
+.btn[aria-pressed="true"]:hover:not(:disabled) {
+  background-color: var(--color-interactive-primary-hover);
+  border-color: var(--color-interactive-primary-hover);
+}
+
+.btn-primary:active:not(:disabled),
+.btn[aria-pressed="true"]:active:not(:disabled) {
+  background-color: var(--color-interactive-primary-active);
+}
+
+/* A confirmation that destroys something. */
+.btn-danger {
+  background-color: var(--color-danger);
+  border-color: var(--color-danger);
+  color: var(--color-text-inverse);
+}
+
+.btn-danger:hover:not(:disabled),
+.btn-danger:active:not(:disabled) {
+  background-color: var(--color-danger-text);
+  border-color: var(--color-danger-text);
+}
+
+/* Icon-only buttons */
+.icon-btn {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  box-sizing: border-box;
+  width: var(--control-icon-button-size);
+  height: var(--control-icon-button-size);
+  margin: 0;
+  padding: 0;
+  border: var(--border-width-1) solid var(--color-border-subtle);
+  border-radius: var(--radius-none);
+  background: transparent;
+  color: var(--color-text-tertiary);
+  cursor: pointer;
+  transition: var(--transition-colors);
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+
+.icon-btn svg {
+  width: var(--control-icon-size);
+  height: var(--control-icon-size);
+  flex: none;
+}
+
+.icon-btn:hover:not(:disabled) {
+  background: var(--color-interactive-secondary-hover);
+  color: var(--color-text-primary);
+}
+
+.icon-btn:active:not(:disabled) {
+  background: var(--color-interactive-secondary-active);
+}
+
+.icon-btn:disabled {
+  opacity: var(--control-disabled-opacity);
+  cursor: not-allowed;
+}
+
+.icon-btn-danger:hover:not(:disabled) {
+  color: var(--color-danger-text);
+}
+
+/* Info button (small circular "i" icon). It keeps its 14px circle on every
+   pointer and widens an invisible hit ring instead, so a larger box cannot
+   reach the control under it. */
 .info-btn {
   position: relative;
   display: inline-flex;
@@ -66,29 +160,27 @@
   height: var(--space-3-5);
   min-width: var(--space-3-5);
   min-height: var(--space-3-5);
-  font-family: var(--font-display);
-  font-size: var(--text-2xs);
+  font-size: var(--type-compact);
   font-weight: var(--font-weight-medium);
-  line-height: 1;
+  line-height: var(--leading-none);
   margin: 0;
   padding: 0;
-  border-radius: 50%;
+  border-radius: var(--radius-full);
   border: var(--border-width-1) solid var(--color-text-tertiary);
   background: transparent;
   color: var(--color-text-tertiary);
   cursor: pointer;
   appearance: none;
   -webkit-appearance: none;
-  transition: var(--transition-all);
+  transition: var(--transition-colors);
   flex-shrink: 0;
-  text-transform: lowercase;
 }
 
 .info-btn::before {
   content: '';
   position: absolute;
   inset: calc(-1 * var(--space-1-5));
-  border-radius: 50%;
+  border-radius: var(--radius-full);
 }
 
 .info-btn:hover,
@@ -98,92 +190,120 @@
   background: var(--color-surface-secondary);
 }
 
-.info-btn:focus-visible {
-  outline-offset: var(--space-1);
-}
-
 /* Info tooltip popup - uses fixed positioning to escape accordion overflow.
    JS sets top/left dynamically based on button position. */
+/* A tip is a dialog the user opened on purpose, so it stacks above the
+   notification cards; on a phone they cover the lower half of the screen. */
 .info-tooltip {
   position: fixed;
-  z-index: var(--z-tooltip);
+  z-index: calc(var(--z-notification) + 1);
   background: var(--color-surface-elevated);
-  border: var(--border-strong);
-  box-shadow: var(--shadow-md);
-  width: min(240px, calc(100vw - var(--space-4)));
+  border: var(--border-default);
+  box-shadow: var(--shadow-lg);
+  width: min(300px, calc(100vw - var(--space-4)));
   max-height: calc(100vh - var(--space-4));
   overflow: auto;
   box-sizing: border-box;
   color: var(--color-text-secondary);
 }
 
-.info-tooltip[hidden] {
-  display: none;
-}
-
+/* A tip: a title row with its close button, short paragraphs or a list, and
+   the links to the documentation. Text comes from ui/components/info-tips.js. */
 .info-tooltip-content {
-  padding: var(--space-2) var(--space-2-5);
-  font-size: var(--text-xs);
-  line-height: 1.45;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-2-5) var(--space-3) var(--space-3);
+  font-size: var(--type-body);
+  line-height: var(--leading-relaxed);
   color: var(--color-text-secondary);
 }
 
-.info-tooltip-content .info-step {
-  margin-bottom: var(--space-1);
+.info-tip-header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
 }
 
-.info-tooltip-content .info-step:last-child {
-  margin-bottom: 0;
+.info-tip-title {
+  flex: 1;
+  margin: 0;
+  font-size: var(--type-heading);
+  font-weight: var(--font-weight-semibold);
+  line-height: var(--leading-tight);
+  color: var(--color-text-primary);
 }
 
-.info-tooltip-content .info-cmd {
+.info-tip-close {
+  position: relative;
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--space-5);
+  height: var(--space-5);
+  margin: calc(-1 * var(--space-1)) calc(-1 * var(--space-1)) calc(-1 * var(--space-1)) 0;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-full);
+  background: transparent;
+  color: var(--color-text-tertiary);
+  font-size: var(--control-glyph-md);
+  line-height: 1;
+  cursor: pointer;
+}
+
+.info-tip-close:hover {
+  background: var(--color-interactive-secondary-hover);
+  color: var(--color-text-primary);
+}
+
+/* A finger reaches the close button past its drawn circle. */
+.info-tip-close::after {
+  content: '';
+  position: absolute;
+  inset: calc(-1 * var(--control-hit-extend));
+}
+
+.info-tip-text {
+  margin: 0;
+}
+
+.info-tip-list {
+  margin: 0;
+  padding-left: var(--space-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.info-tip-links {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-0-5) var(--space-1-5);
+  margin: 0;
+  padding-top: var(--space-2);
+  border-top: var(--border-light);
+}
+
+.info-tip-links-lead {
   color: var(--color-text-tertiary);
 }
 
-.info-tooltip-content .info-link {
-  color: var(--color-text-secondary);
-  text-decoration: none;
+.info-tip-links-separator {
+  color: var(--color-text-tertiary);
 }
 
-.info-tooltip-content .info-link:hover {
+.info-tip-link {
+  color: var(--color-text-link);
+  font-weight: var(--font-weight-medium);
   text-decoration: underline;
+  text-decoration-color: color-mix(in srgb, currentColor 35%, transparent);
+  text-underline-offset: 2px;
 }
 
-/* Toggle switch pressed state */
-.toggle-switch {
-  min-width: 60px;
-  text-align: center;
-  background: var(--color-surface-elevated);
-}
-
-.toggle-switch[aria-pressed="true"] {
-  background-color: var(--color-text-primary);
-  color: var(--color-text-inverse);
-  border-color: var(--color-text-primary);
-}
-
-/* Disabled state (legend action “Filter” when live mode on) */
-.legend-actions button:disabled,
-.legend-actions button.button-disabled {
-  opacity: var(--opacity-50);
-  cursor: not-allowed;
-  background-color: var(--color-surface-tertiary);
-  box-shadow: none;
-}
-
-/* Camera / smoke buttons reuse reset-btn */
-
-/* Smoke rebuild “dirty” state */
-#smoke-rebuild-btn.smoke-dirty {
-  background-color: var(--color-text-primary);
-  color: var(--color-text-inverse);
-  border-color: var(--color-text-primary);
-  box-shadow: var(--shadow-md);
-}
-
-/* Smoke rebuild disabled */
-#smoke-rebuild-btn:disabled {
-  opacity: var(--opacity-55);
-  cursor: default;
-  box-shadow: none;
+.info-tip-link:hover {
+  color: var(--color-text-link-hover);
+  text-decoration-color: currentColor;
 }

@@ -35,6 +35,7 @@ import {
   categoricalStorageForCount
 } from '../assets/js/data/categorical-storage-contract.js';
 import { getCategoryColor } from '../assets/js/data/palettes.js';
+import { viewContextCoreMethods } from '../assets/js/app/state/managers/view-context-core.js';
 
 const POINTS = 24;
 
@@ -69,9 +70,21 @@ function categoricalField(key, categories, pointCount) {
  * A DataState carrying the real field mixins and the three real registries.
  * Only the collaborators the field methods call are stubbed.
  */
+/** The single 2D layout ("2d") the current metadata contract registers. */
+function oneLayoutManager(residentPositions) {
+  const layout = { layoutKey: '2d', dimension: 2 };
+  return {
+    getResidentPositions: layoutKey => residentPositions.get(layoutKey) ?? null,
+    getLayout: () => layout,
+    getRegisteredLayouts: () => [layout],
+    getLayoutsForDimension: dimension => (dimension === 2 ? [layout] : []),
+    getDefaultLayout: dimension => (dimension === 2 ? '2d' : null),
+  };
+}
+
 function makeState({ pointCount = POINTS, obsFields = [] } = {}) {
   const state = Object.create(DataStateFieldMethods.prototype);
-  const positionCache = new Map([[2, positions(pointCount, 2)]]);
+  const residentPositions = new Map([['2d', positions(pointCount, 2)]]);
 
   state.pointCount = pointCount;
   state.obsData = { fields: obsFields };
@@ -82,17 +95,17 @@ function makeState({ pointCount = POINTS, obsFields = [] } = {}) {
   state.activeViewId = 'live';
   state.viewContexts = new Map();
   state.highlightPages = [];
-  state.positionsArray = positionCache.get(2);
-  state.dimensionManager = {
-    positionCache,
-    getAvailableDimensions: () => [2]
-  };
+  state.positionsArray = residentPositions.get('2d');
+  state.dimensionManager = oneLayoutManager(residentPositions);
   state._renameRegistry = new RenameRegistry();
   state._deleteRegistry = new DeleteRegistry();
   state._userDefinedFields = new UserDefinedFieldsRegistry();
   state.getDatasetGeneration = () => 0;
 
   state._syncActiveContext = () => {};
+  state._propagateRenameToViewContexts =
+    viewContextCoreMethods._propagateRenameToViewContexts;
+  state._refreshInactiveViewLabels = viewContextCoreMethods._refreshInactiveViewLabels;
   state._notifyFieldChange = () => {};
   state._notifyHighlightChange = () => {};
   state.updateFilterSummary = () => {};
@@ -374,23 +387,21 @@ test('an uncovered cell with no label carries the width\'s reserved missing code
   }
 });
 
-test('the ceiling a user-defined field refuses is the contract ceiling', () => {
+test('a user-defined field past 65,535 categories is kept, with uint32 codes', () => {
   const registry = new UserDefinedFieldsRegistry();
-  const tooMany = MAX_CATEGORICAL_CATEGORIES + 1;
-  assert.throws(
-    () => registry.createFromCategoricalCodes(
-      {
-        key: 'k',
-        categories: Array.from({ length: tooMany }, (_v, i) => `c${i}`),
-        codes: new Uint16Array(2),
-        source: 'obs'
-      },
-      { pointCount: 2 }
-    ),
-    new RegExp(
-      `${MAX_CATEGORICAL_CATEGORIES.toLocaleString('en-US')}`
-    )
+  const count = 70_000;
+  const codes = Uint32Array.from([0, count - 1]);
+  const field = registry.createFromCategoricalCodes(
+    {
+      key: 'k',
+      categories: Array.from({ length: count }, (_v, i) => `c${i}`),
+      codes,
+      source: 'obs'
+    },
+    { pointCount: 2, dimensionManager: oneLayoutManager(new Map()) }
   );
+  assert.ok(field);
+  assert.equal(MAX_CATEGORICAL_CATEGORIES, 4_294_967_295);
 });
 
 // ---------------------------------------------------------------------------
@@ -497,10 +508,7 @@ test('a categorical update that changes the inventory still validates every code
     },
     {
       pointCount: 4,
-      dimensionManager: {
-        positionCache: new Map(),
-        getAvailableDimensions: () => [2]
-      }
+      dimensionManager: oneLayoutManager(new Map())
     }
   );
   assert.throws(

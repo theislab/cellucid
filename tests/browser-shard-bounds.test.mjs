@@ -248,7 +248,6 @@ test('native-GPU stress files declare every test process-intensive', async () =>
     'benchmark-harness-entry-point.spec.mjs',
     'benchmark-harness.spec.mjs',
     'benchmark-runtime.spec.mjs',
-    'edge-texture-publication.spec.mjs',
     'velocity-multiview-lifecycle.spec.mjs',
   ]) {
     const source = await readFile(

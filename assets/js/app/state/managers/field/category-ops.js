@@ -21,14 +21,15 @@ import {
   buildMergeCategoriesTransform,
   applyCategoryIndexMapping
 } from '../../../utils/categorical-ops.js';
+import { isCategoricalCodes } from '../../../../data/categorical-storage-contract.js';
 
 function requireEditableCodes(codes, pointCount) {
   if (
-    (!(codes instanceof Uint8Array) && !(codes instanceof Uint16Array))
+    !isCategoricalCodes(codes)
     || codes.length !== pointCount
   ) {
     throw new TypeError(
-      'Category editing requires Uint8Array or Uint16Array codes matching the dataset.'
+      'Category editing requires Uint8Array, Uint16Array or Uint32Array codes matching the dataset.'
     );
   }
   return codes;
@@ -184,7 +185,7 @@ export class FieldCategoryOpsMethods {
         newVisible[newIdx] = oldVisible[oldIdx];
       }
 
-      const nextCentroidsByDim = this._userDefinedFields.computeCentroidsByDim(
+      const nextCentroids = this._userDefinedFields.computeCentroidsByLayout(
         nextCodes,
         nextCategories,
         this
@@ -203,7 +204,10 @@ export class FieldCategoryOpsMethods {
       sourceField.codes = nextCodes;
       sourceField._categoryColors = newColors;
       sourceField._categoryVisible = newVisible;
-      sourceField.centroidsByDim = nextCentroidsByDim;
+      // Freshly computed centroids are already in each layout's normalized
+      // space, and recorded as such.
+      sourceField.centroidsByLayout = nextCentroids.centroidsByLayout;
+      sourceField._normalizedLayouts = nextCentroids.normalizedLayouts;
 
       delete sourceField._originalCategories;
       delete sourceField.outlierQuantiles;
@@ -219,7 +223,8 @@ export class FieldCategoryOpsMethods {
       // Keep serialized template in sync for persistence.
       template.categories = nextCategories;
       template.codes = sourceField.codes;
-      template.centroidsByDim = sourceField.centroidsByDim;
+      template.centroidsByLayout = sourceField.centroidsByLayout;
+      template._normalizedLayouts = sourceField._normalizedLayouts;
       template._operation = sourceField._operation;
 
       // Remap any category-based highlight groups referencing this field.
@@ -432,7 +437,7 @@ export class FieldCategoryOpsMethods {
         newVisible[newIdx] = oldVisible[oldIdx];
       }
 
-      const nextCentroidsByDim = this._userDefinedFields.computeCentroidsByDim(
+      const nextCentroids = this._userDefinedFields.computeCentroidsByLayout(
         nextCodes,
         nextCategories,
         this
@@ -451,7 +456,10 @@ export class FieldCategoryOpsMethods {
       sourceField.codes = nextCodes;
       sourceField._categoryColors = newColors;
       sourceField._categoryVisible = newVisible;
-      sourceField.centroidsByDim = nextCentroidsByDim;
+      // Freshly computed centroids are already in each layout's normalized
+      // space, and recorded as such.
+      sourceField.centroidsByLayout = nextCentroids.centroidsByLayout;
+      sourceField._normalizedLayouts = nextCentroids.normalizedLayouts;
 
       delete sourceField._originalCategories;
       delete sourceField.outlierQuantiles;
@@ -469,7 +477,8 @@ export class FieldCategoryOpsMethods {
       // Keep serialized template in sync for persistence.
       template.categories = nextCategories;
       template.codes = sourceField.codes;
-      template.centroidsByDim = sourceField.centroidsByDim;
+      template.centroidsByLayout = sourceField.centroidsByLayout;
+      template._normalizedLayouts = sourceField._normalizedLayouts;
       template._operation = sourceField._operation;
 
       // Remap any category-based highlight groups referencing this field.

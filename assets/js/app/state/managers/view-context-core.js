@@ -8,12 +8,25 @@
  */
 
 import { FieldSource } from '../../utils/field-constants.js';
+import { collectViewFilters } from './filter-manager.js';
 import { getFieldRegistry } from '../../utils/field-registry.js';
+import { markSnapshotPublishedColors } from './per-cell-array-ownership.js';
 import {
   POINT_VISIBILITY_THRESHOLD,
+  requirePointTransparency,
 } from '../../../rendering/alpha-visibility.js';
 
-function cloneSnapshotPointAttributes(config, pointCount) {
+/**
+ * Validate a kept view's point attributes and adopt them by reference.
+ *
+ * `colors` is the kept view's own array, which the viewer just published for
+ * the snapshot by reference (it is frozen from here on), and `transparency`
+ * is the source view's current array: the new context shares it until either
+ * view's next visibility write, which copies first (see
+ * per-cell-array-ownership.js). Centroid arrays are a few bytes per category
+ * and are written in place, so they are copied.
+ */
+function adoptSnapshotPointAttributes(config, pointCount) {
   if (
     config === null ||
     typeof config !== 'object' ||
@@ -31,22 +44,11 @@ function cloneSnapshotPointAttributes(config, pointCount) {
       'Snapshot context colors must be an exact dataset-length Uint8 RGBA array.'
     );
   }
-  if (
-    !(config.transparency instanceof Float32Array) ||
-    config.transparency.length !== pointCount
-  ) {
-    throw new TypeError(
-      'Snapshot context transparency must be an exact dataset-length Float32 array.'
-    );
-  }
-  for (let index = 0; index < config.transparency.length; index += 1) {
-    const alpha = config.transparency[index];
-    if (!Number.isFinite(alpha) || alpha < 0 || alpha > 1) {
-      throw new RangeError(
-        `Snapshot context transparency ${index} must be finite and in [0, 1].`
-      );
-    }
-  }
+  requirePointTransparency(
+    config.transparency,
+    pointCount,
+    'Snapshot context transparency'
+  );
 
   const hasCentroidPositions = config.centroidPositions !== null;
   const hasCentroidColors = config.centroidColors !== null;
@@ -89,9 +91,10 @@ function cloneSnapshotPointAttributes(config, pointCount) {
     centroidPositions = new Float32Array(config.centroidPositions);
     centroidColors = new Uint8Array(config.centroidColors);
   }
+  markSnapshotPublishedColors(config.colors);
   return {
-    colors: new Uint8Array(config.colors),
-    transparency: new Float32Array(config.transparency),
+    colors: config.colors,
+    transparency: config.transparency,
     centroidPositions,
     centroidColors,
   };
@@ -110,6 +113,45 @@ function exactTypedArrayEqual(left, right) {
     if (left[index] !== right[index]) return false;
   }
   return true;
+}
+
+function composeViewLabel(field, filters) {
+  const firstFilter = filters && filters.length ? filters[0] : null;
+  const labelParts = [];
+  if (field && field.key) labelParts.push(field.key);
+  if (firstFilter && !/No filters active/i.test(firstFilter)) {
+    labelParts.push(firstFilter);
+  }
+  const label = labelParts.join(' • ') || 'All cells';
+  return {
+    label,
+    fieldKey: field ? field.key : null,
+    fieldKind: field ? field.kind : null,
+    filtersText: filters || []
+  };
+}
+
+function activeFieldOfContext(ctx) {
+  if (ctx.activeFieldSource === FieldSource.OBS) {
+    return ctx.obsData?.fields?.[ctx.activeFieldIndex] ?? null;
+  }
+  if (ctx.activeFieldSource === FieldSource.VAR) {
+    return ctx.varData?.fields?.[ctx.activeVarFieldIndex] ?? null;
+  }
+  return null;
+}
+
+function sameFieldIdentity(candidate, renamed) {
+  if (candidate === null || typeof candidate !== 'object') return false;
+  if (renamed._isUserDefined === true) {
+    return candidate._isUserDefined === true
+      && candidate._userDefinedId === renamed._userDefinedId;
+  }
+  if (candidate._isUserDefined === true) return false;
+  const originalOf = (field) => (
+    Object.hasOwn(field, '_originalKey') ? field._originalKey : field.key
+  );
+  return originalOf(candidate) === originalOf(renamed);
 }
 
 export const viewContextCoreMethods = {
@@ -136,11 +178,15 @@ export const viewContextCoreMethods = {
     if (field._outlierFilterEnabled != null) clone._outlierFilterEnabled = field._outlierFilterEnabled;
     if (field._outlierThreshold != null) clone._outlierThreshold = field._outlierThreshold;
     if (field._categoryCounts) {
-      clone._categoryCounts = {
-        visible: field._categoryCounts.visible ? [...field._categoryCounts.visible] : null,
-        total: field._categoryCounts.total ? [...field._categoryCounts.total] : null,
-        visibleTotal: field._categoryCounts.visibleTotal || 0
-      };
+      // Copy the whole count record: every array (total/available/visible)
+      // and every scalar total. A partial copy left `available` behind and the
+      // Active filters row of a view read "N / 0 cells" after a view switch.
+      clone._categoryCounts = Object.fromEntries(
+        Object.entries(field._categoryCounts).map(([key, value]) => [
+          key,
+          Array.isArray(value) ? [...value] : value
+        ])
+      );
     }
     clone._loadingPromise = null;
     return clone;
@@ -166,23 +212,20 @@ export const viewContextCoreMethods = {
       activeFieldIndex: this.activeFieldIndex,
       activeVarFieldIndex: this.activeVarFieldIndex,
       activeFieldSource: this.activeFieldSource,
-      dimensionLevel: this.activeDimensionLevel
+      // A new context shows its dimension's default until a representation
+      // is chosen for it.
+      followsDefault: true
     };
 
     const wrap = (arr) => {
       if (!arr) return null;
-      return cloneArrays ? new Float32Array(arr) : arr;
+      return cloneArrays ? arr.slice() : arr;
     };
-    ctx.colorsArray = this.colorsArray
-      ? (cloneArrays ? new Uint8Array(this.colorsArray) : this.colorsArray)
-      : null;
+    ctx.colorsArray = wrap(this.colorsArray);
     ctx.categoryTransparency = wrap(this.categoryTransparency);
     ctx.cellVisibilityMask = wrap(this.cellVisibilityMask);
-    ctx.outlierQuantilesArray = wrap(this.outlierQuantilesArray);
     ctx.centroidPositions = wrap(this.centroidPositions);
-    ctx.centroidColors = this.centroidColors
-      ? (cloneArrays ? new Uint8Array(this.centroidColors) : this.centroidColors)
-      : null;
+    ctx.centroidColors = wrap(this.centroidColors);
     ctx.centroidOutliers = wrap(this.centroidOutliers);
     ctx.centroidLabels = this.centroidLabels ? [...this.centroidLabels] : [];
     ctx.filteredCount = this.filteredCount
@@ -191,7 +234,17 @@ export const viewContextCoreMethods = {
     return ctx;
   },
 
-  _cloneViewContext(source, id, { cloneArrays = true } = {}) {
+  /**
+   * A new context with the field state of `source`.
+   *
+   * The per-cell arrays (colors, transparency, cell mask) are shared, not
+   * copied: whichever view writes one next copies it first
+   * (per-cell-array-ownership.js), so
+   * a kept view costs no per-cell bytes until it actually diverges. The
+   * centroid arrays are a few bytes per category and are written in place, so
+   * they are copied.
+   */
+  _cloneViewContext(source, id) {
     if (
       source === null ||
       typeof source !== 'object' ||
@@ -204,23 +257,14 @@ export const viewContextCoreMethods = {
         'View-context cloning requires one exact published source context.'
       );
     }
-    const wrapFloat32 = value => {
+    const exactBuffer = (value, Type, copy) => {
       if (value === null || value === undefined) return null;
-      if (!(value instanceof Float32Array)) {
+      if (!(value instanceof Type)) {
         throw new TypeError(
-          `View "${source.id}" contains a non-Float32 numeric context buffer.`
+          `View "${source.id}" contains a non-${Type.name} context buffer.`
         );
       }
-      return cloneArrays ? new Float32Array(value) : value;
-    };
-    const wrapUint8 = value => {
-      if (value === null || value === undefined) return null;
-      if (!(value instanceof Uint8Array)) {
-        throw new TypeError(
-          `View "${source.id}" contains a non-Uint8 color context buffer.`
-        );
-      }
-      return cloneArrays ? new Uint8Array(value) : value;
+      return copy ? new Type(value) : value;
     };
     return {
       id,
@@ -229,14 +273,15 @@ export const viewContextCoreMethods = {
       activeFieldIndex: source.activeFieldIndex,
       activeVarFieldIndex: source.activeVarFieldIndex,
       activeFieldSource: source.activeFieldSource,
-      dimensionLevel: source.dimensionLevel,
-      colorsArray: wrapUint8(source.colorsArray),
-      categoryTransparency: wrapFloat32(source.categoryTransparency),
-      cellVisibilityMask: wrapFloat32(source.cellVisibilityMask),
-      outlierQuantilesArray: wrapFloat32(source.outlierQuantilesArray),
-      centroidPositions: wrapFloat32(source.centroidPositions),
-      centroidColors: wrapUint8(source.centroidColors),
-      centroidOutliers: wrapFloat32(source.centroidOutliers),
+      // The representation itself is the dimension manager's (copyViewLayout);
+      // whether it was chosen or followed is the view's.
+      followsDefault: source.followsDefault === true,
+      colorsArray: exactBuffer(source.colorsArray, Uint8Array, false),
+      categoryTransparency: exactBuffer(source.categoryTransparency, Uint8Array, false),
+      cellVisibilityMask: exactBuffer(source.cellVisibilityMask, Uint8Array, false),
+      centroidPositions: exactBuffer(source.centroidPositions, Float32Array, true),
+      centroidColors: exactBuffer(source.centroidColors, Uint8Array, true),
+      centroidOutliers: exactBuffer(source.centroidOutliers, Float32Array, true),
       centroidLabels: Array.isArray(source.centroidLabels)
         ? source.centroidLabels.map(label => (
             label === null || label === undefined
@@ -262,9 +307,8 @@ export const viewContextCoreMethods = {
     this.activeVarFieldIndex = ctx.activeVarFieldIndex ?? -1;
     this.activeFieldSource = ctx.activeFieldSource ?? null;
     this.colorsArray = ctx.colorsArray ? new Uint8Array(ctx.colorsArray) : null;
-    this.categoryTransparency = ctx.categoryTransparency ? new Float32Array(ctx.categoryTransparency) : null;
-    this.cellVisibilityMask = ctx.cellVisibilityMask ? new Float32Array(ctx.cellVisibilityMask) : null;
-    this.outlierQuantilesArray = ctx.outlierQuantilesArray ? new Float32Array(ctx.outlierQuantilesArray) : null;
+    this.categoryTransparency = ctx.categoryTransparency ? new Uint8Array(ctx.categoryTransparency) : null;
+    this.cellVisibilityMask = ctx.cellVisibilityMask ? new Uint8Array(ctx.cellVisibilityMask) : null;
     this.centroidPositions = ctx.centroidPositions ? new Float32Array(ctx.centroidPositions) : null;
     this.centroidColors = ctx.centroidColors ? new Uint8Array(ctx.centroidColors) : null;
     this.centroidOutliers = ctx.centroidOutliers ? new Float32Array(ctx.centroidOutliers) : null;
@@ -284,8 +328,16 @@ export const viewContextCoreMethods = {
     getFieldRegistry().invalidate();
 
     if (preserveSnapshots) {
+      // A context holds the view's data state; which representation it shows
+      // is the dimension manager's, and whether it follows its dimension's
+      // default stays what the live view has. A fresh context claims it
+      // follows, and a later mapping change then moved a live view that
+      // shows a representation it was turned to (a session restore did).
+      const followsDefault = this.viewContexts.get('live')?.followsDefault ?? true;
       this.activeViewId = 'live';
-      this.viewContexts.set('live', this._buildContextFromCurrent('live', { cloneArrays: false }));
+      const live = this._buildContextFromCurrent('live', { cloneArrays: false });
+      live.followsDefault = followsDefault === true;
+      this.viewContexts.set('live', live);
     } else {
       this._resetViewContexts();
     }
@@ -297,6 +349,16 @@ export const viewContextCoreMethods = {
     this.updateFilterSummary();
   },
 
+  /**
+   * Point the active view's context at the current state.
+   *
+   * The active context shares the state's per-cell arrays instead of copying
+   * them: this runs after every coloring, filtering and centroid change, and a
+   * copy of four per-cell arrays each time was hundreds of megabytes of
+   * transient memory while one large dataset loaded. A context needs arrays of
+   * its own only once its view stops being active, and `setActiveView` hands
+   * the outgoing arrays to it at exactly that point.
+   */
   _syncActiveContext() {
     const ctx = this.viewContexts.get(String(this.activeViewId));
     if (!ctx) return;
@@ -305,16 +367,14 @@ export const viewContextCoreMethods = {
     ctx.activeFieldIndex = this.activeFieldIndex;
     ctx.activeVarFieldIndex = this.activeVarFieldIndex;
     ctx.activeFieldSource = this.activeFieldSource;
-    ctx.colorsArray = this.colorsArray ? new Uint8Array(this.colorsArray) : null;
-    ctx.categoryTransparency = this.categoryTransparency ? new Float32Array(this.categoryTransparency) : null;
-    ctx.cellVisibilityMask = this.cellVisibilityMask ? new Float32Array(this.cellVisibilityMask) : null;
-    ctx.outlierQuantilesArray = this.outlierQuantilesArray ? new Float32Array(this.outlierQuantilesArray) : null;
-    ctx.centroidPositions = this.centroidPositions ? new Float32Array(this.centroidPositions) : null;
-    ctx.centroidColors = this.centroidColors ? new Uint8Array(this.centroidColors) : null;
-    ctx.centroidOutliers = this.centroidOutliers ? new Float32Array(this.centroidOutliers) : null;
+    ctx.colorsArray = this.colorsArray ?? null;
+    ctx.categoryTransparency = this.categoryTransparency ?? null;
+    ctx.cellVisibilityMask = this.cellVisibilityMask ?? null;
+    ctx.centroidPositions = this.centroidPositions ?? null;
+    ctx.centroidColors = this.centroidColors ?? null;
+    ctx.centroidOutliers = this.centroidOutliers ?? null;
     ctx.centroidLabels = this.centroidLabels ? [...this.centroidLabels] : [];
     ctx.filteredCount = this.filteredCount ? { ...this.filteredCount } : { shown: 0, total: 0 };
-    ctx.dimensionLevel = this.activeDimensionLevel;
   },
 
   _resetViewContexts() {
@@ -329,19 +389,113 @@ export const viewContextCoreMethods = {
     const filters = Array.isArray(filtersOverride)
       ? filtersOverride
       : this.getFilterSummaryLines();
-    const firstFilter = filters && filters.length ? filters[0] : null;
-    const labelParts = [];
-    if (field && field.key) labelParts.push(field.key);
-    if (firstFilter && !/No filters active/i.test(firstFilter)) {
-      labelParts.push(firstFilter);
+    return composeViewLabel(field, filters);
+  },
+
+  /**
+   * Re-publish the label and filter text of every view that is not focused.
+   *
+   * Renames are dataset-wide, so a rename made from one view changes what
+   * every other view's label and filter summary say. These are the same
+   * strings the focused view publishes (`_computeActiveViewLabel`), which a
+   * saved session replays and compares exactly.
+   */
+  _refreshInactiveViewLabels() {
+    if (!this.viewer || !(this.viewContexts instanceof Map)) return;
+    const activeId = String(this.activeViewId);
+    for (const [viewId, ctx] of this.viewContexts) {
+      if (viewId === activeId) continue;
+      const rows = collectViewFilters(ctx);
+      const filters = rows.length > 0
+        ? rows.map((row) => row.text)
+        : ['No filters active'];
+      const { label, fieldKey, fieldKind, filtersText } =
+        composeViewLabel(activeFieldOfContext(ctx), filters);
+      if (viewId === 'live') {
+        if (typeof this.viewer.setLiveViewLabel === 'function') {
+          this.viewer.setLiveViewLabel(label);
+        }
+        continue;
+      }
+      if (typeof this.viewer.updateSnapshotAttributes === 'function') {
+        this.viewer.updateSnapshotAttributes(viewId, {
+          label,
+          fieldKey,
+          fieldKind,
+          meta: { filtersText }
+        });
+      }
     }
-    const label = labelParts.join(' • ') || 'All cells';
-    return {
-      label,
-      fieldKey: field ? field.key : null,
-      fieldKind: field ? field.kind : null,
-      filtersText: filters || []
-    };
+  },
+
+  /**
+   * Carry a dataset-wide rename of one field into every stored view context.
+   *
+   * View contexts hold shallow clones of the field inventory, so a rename in
+   * the focused view reached only that view's objects: a kept view went on
+   * naming the field by its old key (and saved it so), and lacked the
+   * original key/categories a later revert needs. The rename-owned
+   * properties are copied from the renamed field onto the same field in every
+   * other view, and those views' centroid labels follow a category rename.
+   *
+   * @param {'obs'|'var'} source
+   * @param {object} renamed - The focused view's renamed field.
+   * @param {{previousLabel: unknown, newLabel: unknown}|null} categoryRename
+   */
+  _propagateRenameToViewContexts(source, renamed, categoryRename = null) {
+    if (!(this.viewContexts instanceof Map)) return;
+    const activeId = String(this.activeViewId);
+    for (const [viewId, ctx] of this.viewContexts) {
+      if (viewId === activeId) continue;
+      const inventory = source === FieldSource.VAR ? ctx.varData : ctx.obsData;
+      if (!inventory || !Array.isArray(inventory.fields)) continue;
+      const fieldIndex = inventory.fields.findIndex(
+        (candidate) => sameFieldIdentity(candidate, renamed)
+      );
+      if (fieldIndex < 0) continue;
+      const target = inventory.fields[fieldIndex];
+      target.key = renamed.key;
+      if (Object.hasOwn(renamed, '_originalKey')) {
+        target._originalKey = renamed._originalKey;
+      } else {
+        delete target._originalKey;
+      }
+      if (Array.isArray(renamed.categories)) {
+        if (target.categories !== renamed.categories) {
+          target.categories = [...renamed.categories];
+        }
+        if (Array.isArray(renamed._originalCategories)) {
+          target._originalCategories = [...renamed._originalCategories];
+        } else {
+          delete target._originalCategories;
+        }
+      }
+      const showsField = source === FieldSource.OBS
+        ? ctx.activeFieldSource === FieldSource.OBS
+          && ctx.activeFieldIndex === fieldIndex
+        : ctx.activeFieldSource === FieldSource.VAR
+          && ctx.activeVarFieldIndex === fieldIndex;
+      if (
+        categoryRename !== null
+        && showsField
+        && Array.isArray(ctx.centroidLabels)
+      ) {
+        const previousText = String(categoryRename.previousLabel);
+        let relabelled = false;
+        for (const entry of ctx.centroidLabels) {
+          if (entry?.el && entry.el.textContent === previousText) {
+            entry.el.textContent = String(categoryRename.newLabel);
+            relabelled = true;
+          }
+        }
+        if (
+          relabelled
+          && typeof this.viewer?.setCentroidLabels === 'function'
+        ) {
+          this.viewer.setCentroidLabels(ctx.centroidLabels, viewId);
+        }
+      }
+    }
   },
 
   _pushActiveViewLabelToViewer(filtersOverride) {
@@ -403,9 +557,9 @@ export const viewContextCoreMethods = {
       throw new TypeError(`Current active view "${prevKey}" has an invalid context.`);
     }
     if (
-      !(this.cellVisibilityMask instanceof Float32Array)
+      !(this.cellVisibilityMask instanceof Uint8Array)
       || this.cellVisibilityMask.length !== this.pointCount
-      || !(ctx.cellVisibilityMask instanceof Float32Array)
+      || !(ctx.cellVisibilityMask instanceof Uint8Array)
       || ctx.cellVisibilityMask.length !== this.pointCount
     ) {
       throw new TypeError(
@@ -415,24 +569,28 @@ export const viewContextCoreMethods = {
     if (prevKey === key) {
       return key;
     }
-    const previousCellVisibilityMask = new Float32Array(this.cellVisibilityMask);
-    const nextCellVisibilityMask = new Float32Array(ctx.cellVisibilityMask);
-
+    // The arrays move instead of being copied: the outgoing context takes the
+    // state's arrays, which the state stops writing to as it adopts the
+    // incoming context's, and that context, now active, shares them as
+    // `_syncActiveContext` would.
     prevCtx.obsData = this._cloneObsData(this.obsData);
     prevCtx.varData = this._cloneVarData(this.varData);
     prevCtx.activeFieldIndex = this.activeFieldIndex;
     prevCtx.activeVarFieldIndex = this.activeVarFieldIndex;
     prevCtx.activeFieldSource = this.activeFieldSource;
-    prevCtx.colorsArray = this.colorsArray ? new Uint8Array(this.colorsArray) : null;
-    prevCtx.categoryTransparency = this.categoryTransparency ? new Float32Array(this.categoryTransparency) : null;
-    prevCtx.cellVisibilityMask = previousCellVisibilityMask;
-    prevCtx.outlierQuantilesArray = this.outlierQuantilesArray ? new Float32Array(this.outlierQuantilesArray) : null;
-    prevCtx.centroidPositions = this.centroidPositions ? new Float32Array(this.centroidPositions) : null;
-    prevCtx.centroidColors = this.centroidColors ? new Uint8Array(this.centroidColors) : null;
-    prevCtx.centroidOutliers = this.centroidOutliers ? new Float32Array(this.centroidOutliers) : null;
+    prevCtx.colorsArray = this.colorsArray ?? null;
+    prevCtx.categoryTransparency = this.categoryTransparency ?? null;
+    prevCtx.cellVisibilityMask = this.cellVisibilityMask;
+    prevCtx.centroidPositions = this.centroidPositions ?? null;
+    prevCtx.centroidColors = this.centroidColors ?? null;
+    prevCtx.centroidOutliers = this.centroidOutliers ?? null;
     prevCtx.centroidLabels = this.centroidLabels ? this.centroidLabels.map(c => c ? { ...c } : c) : [];
     prevCtx.filteredCount = this.filteredCount ? { ...this.filteredCount } : { shown: this.pointCount, total: this.pointCount };
-    prevCtx.dimensionLevel = this.activeDimensionLevel;
+    // The outgoing and incoming layouts, as their owner published them.
+    const layoutOf = (viewKey) => (
+      this.dimensionManager ? this.dimensionManager.getViewLayout(viewKey) : null
+    );
+    const previousActiveLayoutKey = layoutOf(prevKey);
 
     this.activeViewId = key;
     if (this.viewer && typeof this.viewer.setViewLayout === 'function') {
@@ -451,13 +609,12 @@ export const viewContextCoreMethods = {
     this.activeFieldIndex = ctx.activeFieldIndex ?? -1;
     this.activeVarFieldIndex = ctx.activeVarFieldIndex ?? -1;
     this.activeFieldSource = ctx.activeFieldSource ?? null;
-    this.colorsArray = ctx.colorsArray ? new Uint8Array(ctx.colorsArray) : null;
-    this.categoryTransparency = ctx.categoryTransparency ? new Float32Array(ctx.categoryTransparency) : null;
-    this.cellVisibilityMask = nextCellVisibilityMask;
-    this.outlierQuantilesArray = ctx.outlierQuantilesArray ? new Float32Array(ctx.outlierQuantilesArray) : null;
-    this.centroidPositions = ctx.centroidPositions ? new Float32Array(ctx.centroidPositions) : null;
-    this.centroidColors = ctx.centroidColors ? new Uint8Array(ctx.centroidColors) : null;
-    this.centroidOutliers = ctx.centroidOutliers ? new Float32Array(ctx.centroidOutliers) : null;
+    this.colorsArray = ctx.colorsArray ?? null;
+    this.categoryTransparency = ctx.categoryTransparency ?? null;
+    this.cellVisibilityMask = ctx.cellVisibilityMask;
+    this.centroidPositions = ctx.centroidPositions ?? null;
+    this.centroidColors = ctx.centroidColors ?? null;
+    this.centroidOutliers = ctx.centroidOutliers ?? null;
     this.centroidLabels = ctx.centroidLabels ? ctx.centroidLabels.map(c => c ? { ...c } : c) : [];
     this.filteredCount = ctx.filteredCount ? { ...ctx.filteredCount } : { shown: this.pointCount, total: this.pointCount };
 
@@ -473,13 +630,8 @@ export const viewContextCoreMethods = {
     this._ensureActiveSelectionNotDeleted();
     getFieldRegistry().invalidate();
 
-    const viewDimLevel = ctx.dimensionLevel ?? this.dimensionManager?.getDefaultDimension() ?? 3;
-    if (viewDimLevel !== this.activeDimensionLevel) {
-      this.activeDimensionLevel = viewDimLevel;
-      if (this.dimensionManager) {
-        this.dimensionManager.setViewDimension(ctx.id, viewDimLevel);
-      }
-      this._notifyDimensionChange();
+    if (layoutOf(key) !== previousActiveLayoutKey) {
+      this._notifyRepresentationChange(key, previousActiveLayoutKey);
     }
 
     this._reinitializeActiveField();
@@ -548,8 +700,7 @@ export const viewContextCoreMethods = {
     const ctx = viewContextCoreMethods._cloneViewContext.call(
       this,
       source,
-      viewId,
-      { cloneArrays: true }
+      viewId
     );
     this.viewContexts.set(viewId, ctx);
     return ctx;
@@ -592,7 +743,7 @@ export const viewContextCoreMethods = {
         'Snapshot context publication requires a non-negative point count.'
       );
     }
-    const attributes = cloneSnapshotPointAttributes(
+    const attributes = adoptSnapshotPointAttributes(
       config,
       this.pointCount
     );

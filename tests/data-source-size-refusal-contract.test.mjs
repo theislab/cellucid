@@ -1,10 +1,11 @@
 /**
  * A payload refused for its size must be reported as a size refusal.
  *
- * The byte ceilings in `data-source.js` are the only thing standing between the
- * browser and an untrusted dataset that declares gigabytes, so they fire on
- * perfectly well-formed exports that are simply too big. Every advice the app
- * can give about a size refusal is wrong unless it says so:
+ * Binary payloads have no fixed ceiling: one is refused for its size only when
+ * the browser cannot allocate it, which happens to perfectly well-formed
+ * exports that are simply too big for this machine. Metadata keeps a fixed
+ * ceiling. Every advice the app can give about a size refusal is wrong unless
+ * it says so:
  *
  * - "Re-export it with cellucid prepare" (the `unreadable` row) sends the user
  *   to regenerate a valid file and meet the identical wall again;
@@ -13,12 +14,13 @@
  * - the unclassified shape ("Try again; if it keeps failing…") offers a retry
  *   that is guaranteed to fail, and pastes the raw byte-count diagnostic in.
  *
- * The ceiling is owned by `readBoundedBody()` and `requirePayloadBudget()`, so
+ * The refusal is owned by `readBoundedBody()` and `allocatePayloadBytes()`, so
  * that is where the cause is named. Everything downstream — `fetchJson()`, the
  * remote transport, the failure sentence — reads the published code rather than
  * re-deriving it (CEL-0219).
  */
 
+import './helpers/anndata-reader-in-process.mjs';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
@@ -26,11 +28,10 @@ import {
   DataSourceError,
   DataSourceErrorCode,
   ERROR_MESSAGES,
-  MAX_METADATA_JSON_BYTES,
-  MAX_PREPARED_BROWSER_BYTES,
+  allocatePayloadBytes,
   fetchJson,
   readBoundedBody,
-  requirePayloadBudget,
+  requireDeclaredPayloadLength,
 } from '../assets/js/data/data-source.js';
 import { RemoteDataSource } from '../assets/js/data/remote-source.js';
 import {
@@ -53,26 +54,23 @@ function installFetch(t, handler) {
   });
 }
 
-/** A JSON response whose body streams past the metadata ceiling. */
-function oversizedJsonResponse(counter) {
-  const filler = new Uint8Array(MEGABYTE).fill(0x20);
-  const chunks = MAX_METADATA_JSON_BYTES / MEGABYTE + 4;
-  return new Response(
-    new ReadableStream({
-      start(controller) {
-        controller.enqueue(Uint8Array.of(0x7b));
-        for (let index = 0; index < chunks; index++) {
-          controller.enqueue(filler);
-        }
-        controller.enqueue(Uint8Array.of(0x7d));
-        controller.close();
-      },
-      cancel() {
-        if (counter) counter.cancelled = true;
-      },
-    }),
-    { status: 200, headers: { 'Content-Type': 'application/json' } }
-  );
+/** A JSON response, read while text decoding is made to hit the engine's
+ * longest-string limit, the one real limit left on a metadata document. */
+function longestTextJsonResponse() {
+  return new Response('{"padding": "x"}', {
+    status: 200,
+    headers: { 'Content-Type': 'application/json' },
+  });
+}
+
+function hitLongestString(t) {
+  const decode = TextDecoder.prototype.decode;
+  TextDecoder.prototype.decode = function decodePastLongestString() {
+    throw new RangeError('Invalid string length');
+  };
+  t.after(() => {
+    TextDecoder.prototype.decode = decode;
+  });
 }
 
 test('the layer that owns the byte ceiling names the cause it refused for', async () => {
@@ -83,10 +81,10 @@ test('the layer that owns the byte ceiling names the cause it refused for', asyn
     'every code must carry a user-facing fallback message'
   );
 
-  // Declared up front, before a single byte is requested.
-  const declared = () => requirePayloadBudget(
-    MAX_PREPARED_BROWSER_BYTES + 1,
-    'Payload points_3d.bin'
+  // A declared length the browser cannot hold, at its allocation.
+  const declared = () => allocatePayloadBytes(
+    2 ** 52,
+    'Payload embeddings/0_3d.bin'
   );
   assert.throws(declared, DataSourceError);
   assert.throws(declared, error => {
@@ -97,12 +95,12 @@ test('the layer that owns the byte ceiling names the cause it refused for', asyn
   // A declared length that is not a length at all remains a caller-contract
   // violation, not a size refusal: nothing was measured against the ceiling.
   assert.throws(
-    () => requirePayloadBudget(-1, 'Payload points_3d.bin'),
+    () => requireDeclaredPayloadLength(-1, 'Payload embeddings/0_3d.bin'),
     RangeError
   );
   assert.equal(
     classifyDataSourceFailure(
-      new RangeError('Payload points_3d.bin: declared payload length must be')
+      new RangeError('Payload embeddings/0_3d.bin: declared payload length must be')
     ),
     null,
     'a caller-contract violation still publishes no cause'
@@ -128,9 +126,9 @@ test('the layer that owns the byte ceiling names the cause it refused for', asyn
   );
 });
 
-test('an over-ceiling metadata body keeps its size cause through fetchJson', async t => {
-  const counter = { cancelled: false };
-  installFetch(t, async () => oversizedJsonResponse(counter));
+test('a metadata body past the longest string keeps its size cause through fetchJson', async t => {
+  installFetch(t, async () => longestTextJsonResponse());
+  hitLongestString(t);
 
   await assert.rejects(
     fetchJson('https://untrusted.test/exports/datasets.json', 'github-repo'),
@@ -141,16 +139,17 @@ test('an over-ceiling metadata body keeps its size cause through fetchJson', asy
         DataSourceErrorCode.TOO_LARGE,
         'fetchJson must not relabel a size refusal as a network error'
       );
+      assert.match(error.message, /longest text this browser can hold/);
       return true;
     }
   );
-  assert.ok(counter.cancelled, 'the oversized body must be cancelled, not buffered');
 });
 
-test('the remote transport reports its own ceiling as a size refusal', async t => {
+test('the remote transport reports the longest-string limit as a size refusal', async t => {
   // The real connect() path: the health document is the first thing read, and
   // `requestJson` is the reader that tells the four body-read outcomes apart.
-  installFetch(t, async () => oversizedJsonResponse());
+  installFetch(t, async () => longestTextJsonResponse());
+  hitLongestString(t);
 
   const source = new RemoteDataSource();
   await assert.rejects(
@@ -181,16 +180,22 @@ test('a prepared directory refused for its size is not called malformed', async 
     return blob;
   };
 
+  // A metadata file longer than the engine's longest string: reading it as
+  // text is what fails, not a fixed cap.
+  const longestTextFile = path => {
+    const blob = file(path, '{}');
+    blob.text = async () => {
+      throw new RangeError('Invalid string length');
+    };
+    return blob;
+  };
+
   const source = new LocalUserDirDataSource();
   await assert.rejects(
     source.loadFromPreparedDirectory([
-      file(
-        'oversized/dataset_identity.json',
-        '{}',
-        MAX_METADATA_JSON_BYTES + 1
-      ),
+      longestTextFile('oversized/dataset_identity.json'),
       file('oversized/obs_manifest.json', '{}'),
-      file('oversized/points_2d.bin', new Uint8Array(16)),
+      file('oversized/embeddings/0_2d.bin', new Uint8Array(16)),
     ]),
     error => {
       assert.ok(error instanceof DataSourceError);

@@ -62,6 +62,7 @@ test('Jupyter commands mutate the exact current viewer state', async () => {
     state,
     viewer,
     refreshUi,
+    reportDataMapping: async () => false,
   });
 
   handlers.handleHighlight([1, 2], '#00ff00');
@@ -110,6 +111,7 @@ test('Jupyter highlight uses the current DataState highlight contract', () => {
     state,
     viewer: {},
     refreshUi() {},
+    reportDataMapping: async () => false,
   });
 
   handlers.handleHighlight([1, 3], '#123abc');
@@ -147,6 +149,7 @@ test('Jupyter color-by rejects absent or ambiguous fields atomically', async () 
     },
     viewer: { resetCamera() {} },
     refreshUi() {},
+    reportDataMapping: async () => false,
   });
 
   await assert.rejects(
@@ -184,8 +187,8 @@ test('manual Jupyter visibility composes with current filters', () => {
         0, 0, 0, 255,
         0, 0, 0, 255,
       ]),
-      categoryTransparency: new Float32Array([1, 1, 1]),
-      cellVisibilityMask: new Float32Array([1, 1, 1]),
+      categoryTransparency: new Uint8Array([1, 1, 1]),
+      cellVisibilityMask: new Uint8Array([1, 1, 1]),
       isOutlierFilterEnabledForActiveField: () => false,
       getCurrentOutlierThreshold: () => 1,
       _syncColorsAlpha() {},
@@ -208,5 +211,88 @@ test('manual Jupyter visibility composes with current filters', () => {
   assert.throws(
     () => state.setCellVisibility([3], false),
     /outside.*point count/i,
+  );
+});
+
+const NOTEBOOK_MAPPING = Object.freeze({
+  kind: 'anndata',
+  embeddings: { '1d': null, '2d': { key: 'X_pca', columns: [0, 1] }, '3d': null },
+  knn: null,
+  geneNames: 'index',
+  expression: 'X',
+  latent: null,
+  vectorFields: [],
+});
+
+test('setDataMapping applies one transaction, then answers the request it names', async () => {
+  const calls = [];
+  let current = null;
+  const handlers = createJupyterCommandHandlers({
+    state: {
+      async applyDataMapping(mapping, options) {
+        calls.push(['apply', mapping, options]);
+        current = mapping;
+        return true;
+      },
+      getDataMapping() {
+        return current;
+      },
+    },
+    viewer: {},
+    refreshUi() {
+      calls.push('refresh-ui');
+    },
+    async reportDataMapping(report) {
+      calls.push(['report', report]);
+      return true;
+    },
+  });
+  await handlers.handleMessage({
+    type: 'setDataMapping',
+    requestId: 'req-1',
+    mapping: NOTEBOOK_MAPPING,
+    viewerId: 'viewer-1',
+    viewerToken: 'secret-1',
+  });
+  assert.deepEqual(calls, [
+    ['apply', NOTEBOOK_MAPPING, { origin: 'notebook' }],
+    'refresh-ui',
+    ['report', { origin: 'notebook', requestId: 'req-1', mapping: NOTEBOOK_MAPPING }],
+  ]);
+});
+
+test('a refused setDataMapping reports nothing and rejects for command_error', async () => {
+  let reported = 0;
+  const handlers = createJupyterCommandHandlers({
+    state: {
+      async applyDataMapping() {
+        throw new RangeError('obsp[\'distances\'] is not symmetric');
+      },
+      getDataMapping: () => NOTEBOOK_MAPPING,
+    },
+    viewer: {},
+    refreshUi() {},
+    async reportDataMapping() {
+      reported += 1;
+      return true;
+    },
+  });
+  await assert.rejects(
+    handlers.handleMessage({
+      type: 'setDataMapping',
+      requestId: 'req-2',
+      mapping: NOTEBOOK_MAPPING,
+      viewerId: 'viewer-1',
+      viewerToken: 'secret-1',
+    }),
+    /not symmetric/,
+  );
+  assert.equal(reported, 0);
+});
+
+test('Jupyter command handlers require the data-mapping reporter', () => {
+  assert.throws(
+    () => createJupyterCommandHandlers({ state: {}, viewer: {}, refreshUi() {} }),
+    /reportDataMapping/,
   );
 });

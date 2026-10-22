@@ -14,9 +14,9 @@ import {
   SELECTION_NOTICE,
   selectionNoticeHtml
 } from './mode-copy.js';
-import { MAX_HISTORY_STEPS, selectionUnchanged } from './selection-state.js';
+import { pushHistoryStep, selectionUnchanged } from './selection-state.js';
 import { viewerNeedsUiRetirement } from '../../core/viewer-lifecycle.js';
-import { getStepControls, removeStepControls } from './step-controls.js';
+import { removeStepControls, showStepControls } from './step-controls.js';
 import {
   deliverSelectionToJupyter,
   showSelectionDeliveryFailure
@@ -37,6 +37,7 @@ import {
   requireSelectionStepEvent,
   requireUnifiedSelectionState
 } from './exact-contract.js';
+import { formatCount } from '../../components/display-format.js';
 
 /**
  * @param {object} options
@@ -125,7 +126,7 @@ export function initProximitySelection(options) {
     const stepsLabel = proximityEvent.steps > 1 ? ` (${proximityEvent.steps} drags)` : '';
     const savedGroup = state.addHighlightDirect({
       type: 'proximity',
-      label: `Proximity${stepsLabel} (${proximityEvent.cellCount.toLocaleString()} cells)`,
+      label: `Proximity${stepsLabel} (${formatCount(proximityEvent.cellCount)} cells)`,
       cellIndices: proximityEvent.cellIndices
     });
     requireSavedHighlightGroup(
@@ -216,13 +217,10 @@ export function initProximitySelection(options) {
     // The empty state before the first step is recorded like any other, so
     // Undo can reach it — the annotation tool has always done this, and a
     // greyed-out Undo immediately after dragging reads as a broken control.
-    selectionState.proximityHistory.push({
+    pushHistoryStep(selectionState, 'proximityHistory', {
       candidates: selectionState.lastProximityCandidates ? [...selectionState.lastProximityCandidates] : null,
       step: selectionState.lastProximityStep
     });
-    if (selectionState.proximityHistory.length > MAX_HISTORY_STEPS) {
-      selectionState.proximityHistory.shift();
-    }
     selectionState.proximityRedoStack = [];
 
     selectionState.lastProximityCandidates = [...stepEvent.candidates];
@@ -331,8 +329,12 @@ export function initProximitySelection(options) {
     }
   }
 
-  function getProximityControls() {
-    return getStepControls({
+  /**
+   * Publish the step controls for a selection of `candidateCount` cells, on
+   * the panel and the selection bar alike.
+   */
+  function showProximityControls(candidateCount, notice) {
+    showStepControls({
       documentOwner,
       tool: 'proximity',
       parent: highlightModeDescriptionEl.parentElement,
@@ -347,6 +349,12 @@ export function initProximitySelection(options) {
         cancel: () => {
           viewer.cancelProximitySelection();
         }
+      },
+      readout: {
+        candidateCount,
+        canUndo: selectionState.proximityHistory.length > 0,
+        canRedo: selectionState.proximityRedoStack.length > 0,
+        notice
       }
     });
   }
@@ -390,7 +398,8 @@ export function initProximitySelection(options) {
       removeStepControls(
         documentOwner,
         'proximity',
-        highlightModeDescriptionEl.parentElement
+        highlightModeDescriptionEl.parentElement,
+        notice
       );
       return;
     }
@@ -399,14 +408,7 @@ export function initProximitySelection(options) {
       const stepInfo =
         '<strong>No selection</strong><br><small>Alt to intersect, Shift+Alt to add, Ctrl+Alt to subtract</small>';
 
-      const {
-        undoButton,
-        redoButton,
-        confirmButton
-      } = getProximityControls();
-      undoButton.disabled = selectionState.proximityHistory.length === 0;
-      redoButton.disabled = selectionState.proximityRedoStack.length === 0;
-      confirmButton.disabled = true;
+      showProximityControls(0, notice);
 
       highlightModeDescriptionEl.innerHTML = `${stepInfo}${noticeHtml}`;
       return;
@@ -423,16 +425,9 @@ export function initProximitySelection(options) {
       modeLabel = ' <span class="lasso-mode-tag intersect">intersected</span>';
     }
 
-    const stepInfo = `<strong>Step ${stepEvent.step}:</strong> ${stepEvent.candidateCount.toLocaleString()} cells${modeLabel}<br><small>Alt to intersect, Shift+Alt to add, Ctrl+Alt to subtract</small>`;
+    const stepInfo = `<strong>Step ${stepEvent.step}:</strong> ${formatCount(stepEvent.candidateCount)} cells${modeLabel}<br><small>Alt to intersect, Shift+Alt to add, Ctrl+Alt to subtract</small>`;
 
-    const {
-      undoButton,
-      redoButton,
-      confirmButton
-    } = getProximityControls();
-    undoButton.disabled = selectionState.proximityHistory.length === 0;
-    redoButton.disabled = selectionState.proximityRedoStack.length === 0;
-    confirmButton.disabled = stepEvent.candidateCount === 0;
+    showProximityControls(stepEvent.candidateCount, notice);
 
     highlightModeDescriptionEl.innerHTML = `${stepInfo}${noticeHtml}`;
   }

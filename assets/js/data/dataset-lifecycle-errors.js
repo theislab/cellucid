@@ -32,10 +32,17 @@ export function isDatasetReloadSupersededError(error) {
 }
 
 /**
+ * Combine an operation's failure with a failure in its cleanup or reporting.
+ *
+ * A superseded operation is returned unchanged: its caller discards the result
+ * by recognising the supersession code, which an aggregate would hide, turning
+ * a cancelled open into a reported failure. The secondary failure is logged
+ * instead.
+ *
  * @param {Error} primaryFailure
  * @param {unknown} secondaryFailure
  * @param {string} message
- * @returns {AggregateError}
+ * @returns {Error} The superseded primary failure, or an AggregateError
  */
 export function combineDatasetLifecycleFailures(
   primaryFailure,
@@ -58,6 +65,10 @@ export function combineDatasetLifecycleFailures(
         'The secondary dataset lifecycle failure was not an Error.',
         { cause: secondaryFailure }
       );
+  if (isDatasetReloadSupersededError(primaryFailure)) {
+    console.error(`[Cellucid] ${message}`, secondaryError);
+    return primaryFailure;
+  }
   return new AggregateError(
     [primaryFailure, secondaryError],
     message,

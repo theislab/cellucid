@@ -1,26 +1,31 @@
 /**
- * @fileoverview Exact vector-field loader for dimension-specific displacement data.
+ * @fileoverview Exact vector-field loader for layout-bound displacement data.
  *
- * Vector values are scaled by the DimensionManager normalization scale so they
- * inhabit the same render space as the corresponding embedding. Metadata,
- * dimensions, file mappings, and numerical payloads are never inferred,
- * coerced, repaired, or substituted.
+ * A vector field is bound to embeddings: one payload per layout (embedding)
+ * the field is bound to. The data mapping says which bindings are in use
+ * (`resolveVectorFields`): a prepared export's are the payloads its dataset
+ * identity declares, an AnnData file's are read through the mapping route
+ * `_cellucid/mapping/vectors/...` of each binding. Vector values are scaled by
+ * the bound layout's DimensionManager normalization scale so they inhabit the
+ * same render space as its positions. Metadata, bindings, file mappings, and
+ * numerical payloads are never inferred, coerced, repaired, or substituted.
  *
  * @module data/vector-field-manager
  */
 
 import { loadPointsBinary } from './data-loaders.js';
 import {
+  anndataLoadVectors,
   getActiveAnnDataBinding,
   isAnnDataUrl,
 } from './anndata-provider.js';
 import {
+  identityPayloadCompression,
   resolveUrl,
   validateVectorFieldsMetadata,
 } from './data-source.js';
-
-const SUPPORTED_DIMENSIONS = Object.freeze([1, 2, 3]);
-const SUPPORTED_DIMENSION_SET = new Set(SUPPORTED_DIMENSIONS);
+import { ANNDATA_KIND } from './data-mapping.js';
+import { resolveVectorBinding } from './data-mapping-candidates.js';
 
 function isPlainRecord(value) {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
@@ -54,49 +59,45 @@ function requireNonEmptyString(value, label) {
   return value;
 }
 
-function requireDimension(value, label) {
-  if (!Number.isInteger(value) || !SUPPORTED_DIMENSION_SET.has(value)) {
-    throw new RangeError(`${label} must be exactly 1, 2, or 3.`);
-  }
-  return value;
-}
-
 /**
- * Freeze one already-validated `vector_fields` object into the runtime shape.
+ * Freeze one identity's `vector_fields` into the runtime shape.
  *
  * The rule itself lives in exactly one place — validateVectorFieldsMetadata()
  * in data-source.js — so the runtime manager, the hosted-catalog reader, and
  * the local prepared-export reader cannot disagree about what a vector field
- * is. `files` is the only path map the format has: the in-browser H5AD/Zarr
- * adapters publish `files` too and resolve their own obsm keys privately, so
- * this module routes a direct-AnnData read by the dataset's protocol, never by
- * the shape of its metadata.
+ * is. A prepared export's vector fields are read from these `files`.
  *
- * @param {unknown} value
+ * @param {Object} identity - A dataset identity (version 3).
  * @returns {Readonly<{defaultField: string|null, fields: Map<string, Object>}>}
  */
-function parseMetadata(value) {
-  if (value === null) {
+function identityVectorFields(identity) {
+  if (
+    !isPlainRecord(identity) ||
+    !isPlainRecord(identity.embeddings) ||
+    !isPlainRecord(identity.embeddings.items)
+  ) {
+    throw new TypeError(
+      'VectorFieldManager identity must be a dataset identity with embedding items.'
+    );
+  }
+  if (!Object.hasOwn(identity, 'vector_fields')) {
     return Object.freeze({
       defaultField: null,
       fields: new Map(),
     });
   }
-  validateVectorFieldsMetadata(value, { sourceType: 'vector-field-manager' });
+  const value = identity.vector_fields;
+  validateVectorFieldsMetadata(value, {
+    embeddingItems: identity.embeddings.items,
+    compression: identityPayloadCompression(identity),
+    sourceType: 'vector-field-manager',
+  });
 
   const fields = new Map();
   for (const [fieldId, field] of Object.entries(value.fields)) {
-    const dimensions = Object.freeze([...field.available_dimensions]);
-    const files = {};
-    for (const dimension of dimensions) {
-      files[`${dimension}d`] = field.files[`${dimension}d`];
-    }
     fields.set(fieldId, Object.freeze({
       label: field.label,
-      basis: field.basis,
-      available_dimensions: dimensions,
-      default_dimension: field.default_dimension,
-      files: Object.freeze(files),
+      files: Object.freeze({ ...field.files }),
     }));
   }
 
@@ -106,10 +107,83 @@ function parseMetadata(value) {
   });
 }
 
+/**
+ * The vector fields a data mapping uses, in the runtime shape the manager
+ * takes: field id -> `{label, files: {layoutKey: path}}`.
+ *
+ * - A prepared export uses the bindings of its dataset identity that the
+ *   mapping lists.
+ * - An AnnData file uses each binding of the mapping, read through its
+ *   mapping route; `<field>_umap_<d>d` keys of every dimension are one field
+ *   (`vectorFieldIdOf`). The bound embedding's layout is the one the
+ *   dimension manager registers for it.
+ *
+ * A binding that cannot be drawn throws a RangeError naming it.
+ *
+ * @param {{identity: Object, mapping: Object, candidates: Object|null, dimensionManager: Object}} options
+ * @returns {Readonly<{defaultField: string|null, fields: Map<string, Object>}>}
+ */
+export function resolveVectorFields({ identity, mapping, candidates, dimensionManager }) {
+  if (mapping.kind !== ANNDATA_KIND) {
+    const declared = identityVectorFields(identity);
+    const used = new Set(
+      mapping.vectorFields.map(binding => JSON.stringify([binding.field, binding.embedding.key]))
+    );
+    const fields = new Map();
+    for (const [fieldId, entry] of declared.fields) {
+      const files = Object.fromEntries(
+        Object.entries(entry.files).filter(([layoutKey]) => used.has(JSON.stringify([fieldId, layoutKey])))
+      );
+      if (Object.keys(files).length > 0) {
+        fields.set(fieldId, Object.freeze({ label: entry.label, files: Object.freeze(files) }));
+      }
+    }
+    return Object.freeze({
+      defaultField: fields.has(declared.defaultField) ? declared.defaultField : null,
+      fields,
+    });
+  }
+  const byField = new Map();
+  for (const binding of mapping.vectorFields) {
+    const resolved = resolveVectorBinding(candidates, binding);
+    if (!resolved.ok) {
+      throw new RangeError(`Vector field obsm['${binding.key}'] cannot be drawn: ${resolved.reason}.`);
+    }
+    const layoutKey = dimensionManager.resolveProvenanceLayout(
+      binding.embedding.key,
+      [...binding.embedding.columns]
+    );
+    if (layoutKey === null) {
+      throw new RangeError(
+        `Vector field obsm['${binding.key}'] is bound to obsm['${binding.embedding.key}'], which cannot be plotted.`
+      );
+    }
+    let files = byField.get(resolved.fieldId);
+    if (files === undefined) {
+      files = {};
+      byField.set(resolved.fieldId, files);
+    }
+    if (Object.hasOwn(files, layoutKey)) {
+      throw new RangeError(
+        `Two vector arrays are the vector field "${resolved.fieldId}" of ${layoutKey}; bind only one.`
+      );
+    }
+    files[layoutKey] = resolved.path;
+  }
+  const fields = new Map(
+    [...byField].sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+      .map(([fieldId, files]) => [fieldId, Object.freeze({ label: fieldId, files: Object.freeze(files) })])
+  );
+  return Object.freeze({
+    defaultField: fields.size === 1 ? [...fields.keys()][0] : null,
+    fields,
+  });
+}
+
 function requireManagerOptions(options) {
   requireExactKeys(
     options,
-    ['baseUrl', 'vectorFieldsMetadata', 'dimensionManager'],
+    ['baseUrl', 'vectorFields', 'dimensionManager'],
     [],
     'VectorFieldManager options'
   );
@@ -123,17 +197,27 @@ function requireManagerOptions(options) {
   if (
     dimensionManager === null ||
     typeof dimensionManager !== 'object' ||
-    typeof dimensionManager.getPositions3D !== 'function' ||
-    typeof dimensionManager.getNormTransform !== 'function'
+    typeof dimensionManager.getPositions !== 'function' ||
+    typeof dimensionManager.getNormTransform !== 'function' ||
+    typeof dimensionManager.getLayout !== 'function' ||
+    typeof dimensionManager.hasLayout !== 'function'
   ) {
     throw new TypeError(
-      'VectorFieldManager dimensionManager must provide getPositions3D() and getNormTransform().'
+      'VectorFieldManager dimensionManager must provide getPositions(), getNormTransform(), getLayout(), and hasLayout().'
     );
+  }
+  const vectorFields = options.vectorFields;
+  if (
+    !isPlainRecord(vectorFields) ||
+    !(vectorFields.fields instanceof Map) ||
+    (vectorFields.defaultField !== null && !vectorFields.fields.has(vectorFields.defaultField))
+  ) {
+    throw new TypeError('VectorFieldManager vectorFields must come from resolveVectorFields().');
   }
   return {
     baseUrl,
     dimensionManager,
-    metadata: parseMetadata(options.vectorFieldsMetadata),
+    metadata: vectorFields,
   };
 }
 
@@ -159,8 +243,40 @@ export class VectorFieldManager {
     this._fields = parsed.metadata.fields;
     this._defaultField = parsed.metadata.defaultField;
 
-    /** @type {Map<string, Map<number, Promise<object>>>} */
+    // Each payload belongs to the layout of the embedding it is bound to:
+    // fieldId -> layoutKey -> dimension. An embedding id is the layout key of
+    // that embedding, and every declared embedding is a registered layout.
+    /** @type {Map<string, Map<string, number>>} */
+    this._bindings = new Map();
+    for (const [fieldId, entry] of this._fields) {
+      const bound = new Map();
+      for (const layoutKey of Object.keys(entry.files)) {
+        if (!this.dimensionManager.hasLayout(layoutKey)) {
+          throw new Error(
+            `Vector field "${fieldId}" is bound to embedding "${layoutKey}", ` +
+            'which the dimension manager has not registered.'
+          );
+        }
+        bound.set(layoutKey, this.dimensionManager.getLayout(layoutKey).dimension);
+      }
+      this._bindings.set(fieldId, bound);
+    }
+
+    /** @type {Map<string, Map<string, Promise<object>>>} */
     this._loading = new Map();
+
+    /** Owns every download this manager starts; aborted by dispose(). */
+    this._lifetime = new AbortController();
+  }
+
+  /**
+   * Retire this manager: its dataset was replaced, so any vector payload
+   * still downloading is aborted rather than finished for nobody.
+   */
+  dispose() {
+    this._lifetime.abort(
+      new DOMException('The vector-field manager was replaced.', 'AbortError')
+    );
   }
 
   hasAny() {
@@ -172,16 +288,20 @@ export class VectorFieldManager {
   }
 
   /**
-   * @returns {{ id: string, label: string, availableDimensions: number[], defaultDimension: number }[]}
+   * One descriptor per field. `layoutKeys` are the embeddings the field is
+   * bound to, in embedding order: a field is drawn only in a view showing one
+   * of them, and each one's dimension is that embedding's.
+   *
+   * @returns {{ id: string, label: string, layoutKeys: string[] }[]}
    */
   getAvailableFields() {
     const result = [];
     for (const [id, entry] of this._fields.entries()) {
+      const bound = this._bindings.get(id);
       result.push(Object.freeze({
         id,
         label: entry.label,
-        availableDimensions: entry.available_dimensions,
-        defaultDimension: entry.default_dimension,
+        layoutKeys: Object.freeze([...bound.keys()]),
       }));
     }
     const defaultId = this._defaultField;
@@ -203,44 +323,42 @@ export class VectorFieldManager {
     );
   }
 
-  hasFieldDimension(fieldId, dimension) {
+  hasFieldLayout(fieldId, layoutKey) {
     const id = requireNonEmptyString(fieldId, 'VectorFieldManager fieldId');
-    const dim = requireDimension(
-      dimension,
-      'VectorFieldManager dimension'
-    );
-    const entry = this._fields.get(id);
-    return entry !== undefined &&
-      entry.available_dimensions.includes(dim);
+    const key = requireNonEmptyString(layoutKey, 'VectorFieldManager layoutKey');
+    const bound = this._bindings.get(id);
+    return bound !== undefined && bound.has(key);
   }
 
   /**
-   * Load vectors for an exact field and dimension, then apply the embedding
-   * normalization scale. The returned buffer always has `dimension`
-   * components per cell.
+   * Load vectors for an exact field and bound layout, then apply that
+   * layout's normalization scale. The returned buffer always has the
+   * layout's dimension of components per cell.
    *
    * @param {string} fieldId
-   * @param {number} dimension
+   * @param {string} layoutKey
    * @param {{ showProgress: boolean }} options
    * @returns {Promise<{ vectors: Float32Array, components: 1|2|3, cellCount: number, maxMagnitude: number }>}
    */
-  async loadField(fieldId, dimension, options) {
+  async loadField(fieldId, layoutKey, options) {
     const id = requireNonEmptyString(
       fieldId,
       'VectorFieldManager fieldId'
     );
-    const dim = requireDimension(
-      dimension,
-      'VectorFieldManager dimension'
+    const key = requireNonEmptyString(
+      layoutKey,
+      'VectorFieldManager layoutKey'
     );
     const showProgress = requireLoadOptions(options);
+    if (this._lifetime.signal.aborted) throw this._lifetime.signal.reason;
     const entry = this._fields.get(id);
     if (entry === undefined) {
       throw new Error(`VectorFieldManager.loadField: unknown field "${id}".`);
     }
-    if (!entry.available_dimensions.includes(dim)) {
+    const dim = this._bindings.get(id).get(key);
+    if (dim === undefined) {
       throw new Error(
-        `VectorFieldManager.loadField: field "${id}" does not declare ${dim}D data.`
+        `VectorFieldManager.loadField: field "${id}" declares no data for layout "${key}".`
       );
     }
 
@@ -249,37 +367,37 @@ export class VectorFieldManager {
       perField = new Map();
       this._loading.set(id, perField);
     }
-    const activeLoad = perField.get(dim);
+    const activeLoad = perField.get(key);
     if (activeLoad !== undefined) {
       return activeLoad;
     }
 
-    const promise = this._loadExactField(id, entry, dim, showProgress);
-    perField.set(dim, promise);
+    const promise = this._loadExactField(id, entry, key, dim, showProgress);
+    perField.set(key, promise);
     try {
       return await promise;
     } finally {
-      perField.delete(dim);
+      perField.delete(key);
       if (perField.size === 0) {
         this._loading.delete(id);
       }
     }
   }
 
-  async _loadExactField(id, entry, dimension, showProgress) {
-    const positions3D = await this.dimensionManager.getPositions3D(dimension);
+  async _loadExactField(id, entry, layoutKey, dimension, showProgress) {
+    const positions = await this.dimensionManager.getPositions(layoutKey);
     if (
-      !(positions3D instanceof Float32Array) ||
-      positions3D.length === 0 ||
-      positions3D.length % 3 !== 0
+      !(positions instanceof Float32Array) ||
+      positions.length === 0 ||
+      positions.length % dimension !== 0
     ) {
       throw new Error(
-        'VectorFieldManager.loadField: getPositions3D() must return a non-empty Float32Array with three components per cell.'
+        `VectorFieldManager.loadField: getPositions() must return a non-empty Float32Array with ${dimension} components per cell.`
       );
     }
-    const cellCount = positions3D.length / 3;
+    const cellCount = positions.length / dimension;
 
-    const transform = this.dimensionManager.getNormTransform(dimension);
+    const transform = this.dimensionManager.getNormTransform(layoutKey);
     if (
       !isPlainRecord(transform) ||
       !Object.hasOwn(transform, 'scale') ||
@@ -293,22 +411,13 @@ export class VectorFieldManager {
     }
     const scale = transform.scale;
 
+    const filename = entry.files[layoutKey];
     let vectors;
     if (isAnnDataUrl(this.baseUrl)) {
-      // An h5ad:// or zarr:// dataset publishes declarative `files` paths that
-      // no transport can fetch; the adapter owns the obsm resolution behind
-      // getVectorField(). Routing on the protocol keeps the metadata shape the
-      // same as an on-disk export's.
+      // An h5ad:// or zarr:// dataset id is not a URL host, so the payload
+      // path is resolved textually; its adapter answers the mapping route.
       const binding = getActiveAnnDataBinding(this.baseUrl);
-      if (typeof binding.adapter.getVectorField !== 'function') {
-        throw new Error(
-          'VectorFieldManager.loadField: the active AnnData adapter must provide getVectorField().'
-        );
-      }
-      const adapterVectors = await binding.adapter.getVectorField(
-        id,
-        dimension
-      );
+      const adapterVectors = await anndataLoadVectors(`${this.baseUrl}${filename}`, dimension);
       const currentBinding = getActiveAnnDataBinding(this.baseUrl);
       if (
         currentBinding.adapter !== binding.adapter ||
@@ -320,12 +429,11 @@ export class VectorFieldManager {
       }
       if (!(adapterVectors instanceof Float32Array)) {
         throw new Error(
-          'VectorFieldManager.loadField: AnnData getVectorField() must return Float32Array.'
+          'VectorFieldManager.loadField: an AnnData vector payload must be a Float32Array.'
         );
       }
       vectors = new Float32Array(adapterVectors);
     } else {
-      const filename = entry.files[`${dimension}d`];
       vectors = await loadPointsBinary(
         resolveUrl(this.baseUrl, filename),
         {
@@ -334,7 +442,7 @@ export class VectorFieldManager {
           dimension,
           expectedBytes:
             cellCount * dimension * Float32Array.BYTES_PER_ELEMENT,
-          signal: null,
+          signal: this._lifetime.signal,
           progressTrackerId: null,
         }
       );

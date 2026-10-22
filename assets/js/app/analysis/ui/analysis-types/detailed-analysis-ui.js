@@ -12,6 +12,7 @@
  * adds detailed-specific features like plot options.
  */
 
+import { createStatusLine } from '../../../ui/components/controls.js';
 import { BaseAnalysisUI } from '../base-analysis-ui.js';
 // Import PlotRegistry from canonical shared directory
 import { PlotRegistry } from '../../shared/plot-registry-utils.js';
@@ -21,6 +22,7 @@ import {
   openModal,
   closeModal,
   renderPlotOptions,
+  preparePageStatistics,
   renderSummaryStats,
   renderStatisticalAnnotations,
   createExpandButton
@@ -31,6 +33,7 @@ import { loadPlotly } from '../../plots/plotly-loader.js';
 import { createLayoutEngine } from '../../plots/layout-engine.js';
 import { PlotlyRenderSlot } from '../../shared/plotly-render-slot.js';
 import { setOwnDataProperty } from '../../../../utils/exact-record.js';
+import { excludeMissingCategoricalValues } from '../../data/data-layer.js';
 
 function combineErrors(errors, message) {
   const present = [...new Set(errors.filter(Boolean))];
@@ -114,8 +117,12 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
     // Session-only saved options per plot type
     this._savedPlotOptions = new Map();
 
-    // Layout engine for plots
-    this._layoutEngine = null;
+    // The last committed result: the exact config snapshot a run started from,
+    // the data it fetched for that config, and its layout engine. The expanded
+    // view draws from this snapshot, never from `_currentConfig`, which the
+    // controls change before the debounced run fetches matching data.
+    /** @type {{config: Object, pageData: Object[], layoutEngine: Object}|null} */
+    this._committedView = null;
     this._previewPlotSlot = null;
     this._modalPlotSlot = null;
     this._pendingModalCloseTasks = new Set();
@@ -135,17 +142,8 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
    */
   _render() {
     this._container.innerHTML = '';
-    // Use classList.add to preserve original classes (e.g., analysis-accordion-content)
+    // Use classList.add to preserve original classes (e.g., analysis-mode-content)
     this._container.classList.add('detailed-analysis-ui');
-
-    // Intro section (matches other analysis panels)
-    const intro = document.createElement('div');
-    intro.className = 'analysis-intro';
-    intro.innerHTML = `
-      <h3>Detailed</h3>
-      <p>Full control over variables, plots, and customization across selected pages.</p>
-    `;
-    this._container.appendChild(intro);
 
     // Controls container
     this._controlsContainer = document.createElement('div');
@@ -160,7 +158,7 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
     // Actions container
     this._actionsContainer = document.createElement('div');
     this._actionsContainer.className = 'analysis-actions';
-    this._actionsContainer.style.display = 'none';
+    this._actionsContainer.hidden = true;
     this._container.appendChild(this._actionsContainer);
 
     // Render controls
@@ -178,16 +176,17 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
       pages = this.dataLayer.getPages();
     } catch (err) {
       console.error('[DetailedAnalysisUI] Failed to get pages:', err);
-      this._controlsContainer.innerHTML = `
-        <div class="analysis-error">Failed to load pages. Please try refreshing.</div>
-      `;
+      this._controlsContainer.replaceChildren(createStatusLine({
+        tone: 'danger',
+        text: 'Failed to load pages. Please try refreshing.'
+      }).root);
       return;
     }
 
     // If no pages, show message
     if (pages.length === 0) {
       this._controlsContainer.innerHTML = `
-        <div class="legend-help">Create highlight pages first using the Highlighted Cells section above.</div>
+        <p class="empty-state">Create highlight pages first in the Highlighting section above.</p>
       `;
       const invalidationRequestId = this._invalidateAnalysisRequest();
       this._trackInteractiveTask(
@@ -239,7 +238,7 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
         container: selectorContainer,
         allowedTypes: ['categorical', 'continuous', 'gene'],
         idPrefix: this._idPrefix,
-        typeLabel: 'Variable:',
+        typeLabel: 'Variable',
         initialSelection: this._currentConfig.dataSource.type ? {
           type: this._currentConfig.dataSource.type,
           variable: this._currentConfig.dataSource.variable
@@ -248,10 +247,10 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
       });
     } catch (err) {
       console.error('[DetailedAnalysisUI] Failed to load variables:', err);
-      const notice = document.createElement('div');
-      notice.className = 'legend-help text-danger';
-      notice.textContent = 'Some variables could not be loaded.';
-      variableBlock.appendChild(notice);
+      variableBlock.appendChild(createStatusLine({
+        tone: 'danger',
+        text: 'Some variables could not be loaded.'
+      }).root);
       // Leave the block unowned so the next render can try again.
       return;
     }
@@ -300,7 +299,7 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
         : undefined,
       includeDerivedPages: true,
       getCellCountForPageId: (pageId) => this.dataLayer.getCellCountForPageId(pageId),
-      label: 'Compare pages:'
+      label: 'Compare pages'
     });
     this._selectedPages = this._pageSelector.getSelectedPages();
     this._currentConfig.pages = [...this._selectedPages];
@@ -413,6 +412,7 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
     this._scheduleUpdate();
 
     if (this._modal?._optionsContent) {
+      this._modal._optionsPlotType = plotTypeId;
       renderPlotOptions(
         this._modal._optionsContent,
         plotTypeId,
@@ -462,7 +462,7 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
     }
     this._notifications.error(
       `${context} failed: ${error.message}`,
-      { category: 'analysis', title: 'Analysis Error' }
+      { category: 'analysis', title: 'Analysis error' }
     );
   }
 
@@ -547,6 +547,14 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
    */
   async _runAnalysis(requestId) {
     if (!this._isCurrentAnalysisRequest(requestId)) return;
+    await this._whileBusy(
+      this._previewContainer,
+      () => this._runPreviewAnalysis(requestId)
+    );
+  }
+
+  /** @private */
+  async _runPreviewAnalysis(requestId) {
     const config = structuredClone(this._currentConfig);
     const pageIds = [...this._selectedPages];
     const customColors = new Map(
@@ -562,11 +570,16 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
       if (!this._isCurrentAnalysisRequest(requestId)) return;
 
       // Fetch data
-      const pageData = await this.dataLayer.getDataForPages({
+      const fetchedPageData = await this.dataLayer.getDataForPages({
         type: config.dataSource.type,
         variableKey: config.dataSource.variable,
         pageIds
       });
+      // Missing categories are excluded per variable, before any plot,
+      // summary table or categorical test sees the page.
+      const pageData = config.dataSource.type === 'categorical_obs'
+        ? excludeMissingCategoricalValues(fetchedPageData)
+        : fetchedPageData;
 
       if (!this._isCurrentAnalysisRequest(requestId)) return;
       if (pageData.length === 0) {
@@ -616,21 +629,14 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
       this._previewContainer.classList.remove('loading');
       this._previewContainer.classList.remove('empty');
       this._currentPageData = pageData;
-      this._layoutEngine = layoutEngine;
+      this._committedView = Object.freeze({ config, pageData, layoutEngine });
 
       // Show actions
       this._renderActions();
 
       // Update modal if open
       if (this._modal?._plotContainer) {
-        await this._updateModal(
-          plotType,
-          mergedOptions,
-          pageData,
-          layoutEngine,
-          config,
-          requestId
-        );
+        await this._updateModal(plotType, mergedOptions, requestId);
       }
 
     } catch (err) {
@@ -641,18 +647,22 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
     }
   }
 
-  async _updateModal(
-    plotType,
-    options,
-    pageData,
-    layoutEngine,
-    config,
-    requestId
-  ) {
+  async _updateModal(plotType, options, requestId) {
     if (!this._isCurrentAnalysisRequest(requestId)) return;
     const modal = this._modal;
     const plotContainer = modal?._plotContainer;
     if (!plotContainer) return;
+    const committed = this._committedView;
+    await this._whileBusy(
+      modal._body,
+      () => this._redrawModal(modal, committed, plotType, options, requestId)
+    );
+  }
+
+  /** @private */
+  async _redrawModal(modal, committed, plotType, options, requestId) {
+    const { config, pageData, layoutEngine } = committed;
+    this._renderModalHeading(modal, config);
 
     const slot = this._ensureModalPlotSlot(modal);
     await slot.waitForCommittedLeases();
@@ -681,6 +691,17 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
       }
     );
     if (candidate === null) return;
+
+    // Large pages' summary and tests are computed by the analysis workers.
+    if (modal._statsContent || modal._annotationsContent) {
+      await preparePageStatistics(pageData, config.dataSource.type);
+      if (
+        !this._isCurrentAnalysisRequest(requestId) ||
+        this._modal !== modal
+      ) {
+        return;
+      }
+    }
 
     const modalAfter = this._modal;
     if (!modalAfter) return;
@@ -714,8 +735,8 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
     if (this._previewContainer) {
       for (const child of [...this._previewContainer.children]) {
         if (
-          child.classList.contains('analysis-error') ||
-          child.classList.contains('analysis-empty-message')
+          child.classList.contains('status-line') ||
+          child.classList.contains('empty-state')
         ) {
           child.remove();
         }
@@ -724,7 +745,7 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
       this._previewContainer.classList.remove('loading');
     }
     if (this._actionsContainer) {
-      this._actionsContainer.style.display = 'none';
+      this._actionsContainer.hidden = true;
     }
     return true;
   }
@@ -741,14 +762,13 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
       return false;
     }
     if (this._previewContainer) {
-      const errorEl = document.createElement('div');
-      errorEl.className = 'analysis-error';
-      errorEl.textContent = message ?? '';
-      this._previewContainer.appendChild(errorEl);
+      this._previewContainer.appendChild(
+        createStatusLine({ tone: 'danger', text: message ?? '' }).root
+      );
     }
     this._notifications.error(
       message,
-      { category: 'data', title: 'Analysis Error' }
+      { category: 'data', title: 'Analysis error' }
     );
     return true;
   }
@@ -780,7 +800,7 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
     );
     if (publicationCurrent) {
       this._currentPageData = null;
-      this._layoutEngine = null;
+      this._committedView = null;
       if (this._modal === modal && modal !== null) {
         for (const content of [
           modal._statsContent,
@@ -808,7 +828,7 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
    */
   _renderActions() {
     this._actionsContainer.innerHTML = '';
-    this._actionsContainer.style.display = 'flex';
+    this._actionsContainer.hidden = false;
 
     const expandBtn = createExpandButton(() => {
       this._trackInteractiveTask(
@@ -823,12 +843,30 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
   // Modal / Expanded View
   // ===========================================================================
 
-  async _openExpandedView() {
-    if (!this._canRunAnalysis()) return;
+  /**
+   * Title and options panel for the committed result the modal shows. The
+   * options panel is rebuilt only when the committed plot type changes, so an
+   * option being edited in the modal keeps its focus across redraws.
+   * @private
+   */
+  _renderModalHeading(modal, config) {
+    if (modal._title) {
+      modal._title.textContent = `Comparing: ${config.dataSource.variable}`;
+    }
+    if (modal._optionsContent && modal._optionsPlotType !== config.plotType) {
+      modal._optionsPlotType = config.plotType;
+      renderPlotOptions(
+        modal._optionsContent,
+        config.plotType,
+        config.plotOptions,
+        this._handlePlotOptionChange
+      );
+    }
+  }
 
-    const pageData = this._currentPageData;
-    const layoutEngine = this._layoutEngine;
-    const config = structuredClone(this._currentConfig);
+  async _openExpandedView() {
+    const committed = this._committedView;
+    if (committed === null) return;
     const generation = ++this._modalRenderGeneration;
     let modal = null;
     modal = createAnalysisModal({
@@ -853,85 +891,92 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
       )
     });
     this._modal = modal;
-
-    if (modal._title) {
-      modal._title.textContent = `Comparing: ${config.dataSource.variable}`;
-    }
-
-    if (modal._optionsContent) {
-      renderPlotOptions(
-        modal._optionsContent,
-        config.plotType,
-        config.plotOptions,
-        this._handlePlotOptionChange
+    this._renderModalHeading(modal, committed.config);
+    openModal(modal);
+    if (modal._plotContainer) {
+      await this._whileBusy(
+        modal._body,
+        () => this._drawExpandedView(modal, committed, generation)
       );
     }
+  }
 
-    openModal(modal);
+  /** @private */
+  async _drawExpandedView(modal, committed, generation) {
+    const { config, pageData, layoutEngine } = committed;
+    try {
+      await loadPlotly();
 
-    if (pageData && modal._plotContainer) {
-      try {
-        await loadPlotly();
+      const plotType = PlotRegistry.get(config.plotType);
+      if (!plotType) {
+        throw new RangeError(`Unknown plot type: ${config.plotType}`);
+      }
+      const mergedOptions = PlotRegistry.mergeOptions(
+        config.plotType,
+        config.plotOptions
+      );
 
-        const plotType = PlotRegistry.get(config.plotType);
-        if (!plotType) {
-          throw new RangeError(`Unknown plot type: ${config.plotType}`);
-        }
-        const mergedOptions = PlotRegistry.mergeOptions(
-          config.plotType,
-          config.plotOptions
-        );
-
-        const slot = this._ensureModalPlotSlot(modal);
-        const candidate = await slot.render(
-          {
+      const slot = this._ensureModalPlotSlot(modal);
+      const candidate = await slot.render(
+        {
+          pageData,
+          variableName: config.dataSource.variable,
+          render: plotCandidate => plotType.render(
             pageData,
-            variableName: config.dataSource.variable,
-            render: plotCandidate => plotType.render(
-              pageData,
-              mergedOptions,
-              plotCandidate,
-              layoutEngine
-            )
-          },
-          {
-            isCurrent: () => (
-              !this._isDestroyed &&
-              this._modal === modal &&
-              generation === this._modalRenderGeneration
-            )
-          }
-        );
-        if (candidate === null) return;
-
-        if (modal._statsContent) {
-          renderSummaryStats(
-            modal._statsContent,
-            pageData,
-            config.dataSource.variable
-          );
+            mergedOptions,
+            plotCandidate,
+            layoutEngine
+          )
+        },
+        {
+          isCurrent: () => (
+            !this._isDestroyed &&
+            this._modal === modal &&
+            generation === this._modalRenderGeneration
+          )
         }
+      );
+      if (candidate === null) return;
 
-        if (modal._annotationsContent) {
-          renderStatisticalAnnotations(
-            modal._annotationsContent,
-            pageData,
-            config.dataSource.type
-          );
-        }
-      } catch (err) {
+      // Large pages' summary and tests are computed by the analysis workers.
+      if (modal._statsContent || modal._annotationsContent) {
+        await preparePageStatistics(pageData, config.dataSource.type);
         if (
-          this._modal === modal &&
-          generation === this._modalRenderGeneration
+          this._isDestroyed ||
+          this._modal !== modal ||
+          generation !== this._modalRenderGeneration
         ) {
-          console.error('[DetailedAnalysisUI] Modal render failed:', err);
-          await modal._analysisPlotSlot?.invalidate();
-          modal._plotContainer.innerHTML = '';
-          const errorEl = document.createElement('div');
-          errorEl.className = 'analysis-error';
-          errorEl.textContent = `Failed to render: ${err?.message || err}`;
-          modal._plotContainer.appendChild(errorEl);
+          return;
         }
+      }
+
+      if (modal._statsContent) {
+        renderSummaryStats(
+          modal._statsContent,
+          pageData,
+          config.dataSource.variable
+        );
+      }
+
+      if (modal._annotationsContent) {
+        renderStatisticalAnnotations(
+          modal._annotationsContent,
+          pageData,
+          config.dataSource.type
+        );
+      }
+    } catch (err) {
+      if (
+        this._modal === modal &&
+        generation === this._modalRenderGeneration
+      ) {
+        console.error('[DetailedAnalysisUI] Modal render failed:', err);
+        await modal._analysisPlotSlot?.invalidate();
+        modal._plotContainer.innerHTML = '';
+        modal._plotContainer.appendChild(createStatusLine({
+          tone: 'danger',
+          text: `Failed to render: ${err?.message || err}`
+        }).root);
       }
     }
   }
@@ -1004,16 +1049,9 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
   }
 
   _saveOptionsForPlotType(plotTypeId, options) {
+    // One entry per plot type: the registry bounds it, so every plot type
+    // the user configured keeps its options.
     this._savedPlotOptions.set(plotTypeId, { ...options });
-    this._trimSavedOptions();
-  }
-
-  _trimSavedOptions() {
-    const MAX_SAVED = 10;
-    if (this._savedPlotOptions.size > MAX_SAVED) {
-      const entries = Array.from(this._savedPlotOptions.entries());
-      this._savedPlotOptions = new Map(entries.slice(-MAX_SAVED));
-    }
   }
 
   // ===========================================================================
@@ -1022,14 +1060,6 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
 
   // _cleanupPreviousAnalysis(), onPagesChanged(), onHighlightChanged(),
   // getConfig(), setConfig() - inherited from BaseAnalysisUI
-
-  /**
-   * Override to use PageSelectorComponent's updateCounts method
-   * @override
-   */
-  _updatePageSelectorCounts() {
-    this._pageSelector?.updateCounts();
-  }
 
   /**
    * Destroy and cleanup
@@ -1129,7 +1159,7 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
       this._previewPlotSlot = null;
       this._modalPlotSlot = null;
       this._modal = null;
-      this._layoutEngine = null;
+      this._committedView = null;
       try {
         await super.destroy();
       } catch (error) {
@@ -1154,5 +1184,3 @@ export function createDetailedAnalysisUI(options) {
   ui.init(options.container);
   return ui;
 }
-
-export default DetailedAnalysisUI;

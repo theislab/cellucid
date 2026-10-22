@@ -14,7 +14,8 @@
  */
 
 import { getNotificationCenter } from '../../../notification-center.js';
-import { buildExportFilename, downloadBlob, formatTimestampForFilename } from './utils/export-helpers.js';
+import { buildExportFilename, formatTimestampForFilename } from './utils/export-helpers.js';
+import { downloadBlob } from '../../../utils/download.js';
 import { createFigureExportZip } from './utils/zip-archive.js';
 import { cloneCameraState } from '../../../../rendering/camera-state-contract.js';
 import {
@@ -150,6 +151,22 @@ function cloneRenderState(renderState, antialias, context) {
     // multisampling, and the screen the figure claims to reproduce is the one
     // that was actually drawn.
     antialias,
+    backdrop: {
+      centerY: renderState.backdrop.centerY,
+      extentX: renderState.backdrop.extentX,
+      extentY: renderState.backdrop.extentY,
+      extentZ: renderState.backdrop.extentZ,
+      flat: renderState.backdrop.flat,
+      floorY: renderState.backdrop.floorY,
+      glowCenterX: renderState.backdrop.glowCenterX,
+      pixelRatio: renderState.backdrop.pixelRatio,
+      planarity: renderState.backdrop.planarity,
+      stageX: renderState.backdrop.stageX,
+      stageZ: renderState.backdrop.stageZ,
+      // Frozen and never mutated by the viewer (a new bake publishes new
+      // arrays), so the export may hold it as is.
+      look: renderState.backdrop.look ?? null,
+    },
     bgColor: new Float32Array(renderState.bgColor),
     cameraDistance: renderState.cameraDistance,
     cameraPosition: Array.from(renderState.cameraPosition),
@@ -422,6 +439,7 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
     }
     if (
       typeof state.getViewDimensionLevel !== 'function' ||
+      typeof state.getViewLayoutKey !== 'function' ||
       typeof state.getFieldForView !== 'function' ||
       typeof state.getFilterSummaryForView !== 'function' ||
       typeof state.getLegendModel !== 'function' ||
@@ -433,6 +451,7 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
     }
 
     const stateDimensionLevel = state.getViewDimensionLevel(vid);
+    const stateLayoutKey = state.getViewLayoutKey(vid);
     throwIfFigureExportAborted(signal);
     const field = state.getFieldForView(vid);
     throwIfFigureExportAborted(signal);
@@ -478,7 +497,7 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
       );
     }
     const normTransform = state.dimensionManager.getNormTransform(
-      stateDimensionLevel
+      stateLayoutKey
     );
     throwIfFigureExportAborted(signal);
     if (
@@ -528,8 +547,9 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
       if (
         !(borrowed.positions instanceof Float32Array) ||
         !(borrowed.colors instanceof Uint8Array) ||
-        !(borrowed.transparency instanceof Float32Array) ||
-        borrowed.positions.length !== borrowed.pointCount * 3 ||
+        !(borrowed.transparency instanceof Uint8Array) ||
+        borrowed.positions.length !==
+          borrowed.pointCount * stateDimensionLevel ||
         borrowed.colors.length !== borrowed.pointCount * 4 ||
         borrowed.transparency.length !== borrowed.pointCount
       ) {
@@ -552,8 +572,13 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
       const transparency = cloneTypedOwner(
         borrowed.transparency,
         ownedCopies.transparency,
-        Float32Array
+        Uint8Array
       );
+      // The pane's full-detail draw order, so the figure overlaps
+      // translucent points exactly as the pane does.
+      const drawOrder = borrowed.drawOrder === null
+        ? null
+        : cloneTypedOwner(borrowed.drawOrder, ownedCopies.drawOrder, Uint32Array);
       let lodMembership = null;
       if (borrowed.lodMembership !== null) {
         lodMembership = ownedCopies.lodMembership.get(
@@ -602,6 +627,7 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
         scientificState: {
           datasetGeneration,
           dimensionLevel: stateDimensionLevel,
+          drawOrder,
           fieldKey,
           fieldKind,
           filters: [...filters],
@@ -803,6 +829,7 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
 
     const ownedCopies = {
       colors: new WeakMap(),
+      drawOrder: new WeakMap(),
       lodMembership: new WeakMap(),
       positions: new WeakMap(),
       transparency: new WeakMap(),

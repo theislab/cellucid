@@ -13,40 +13,6 @@ import {
 } from '../figure-export-contract.js';
 
 /**
- * Download a Blob by creating an Object URL and clicking an anchor.
- * Mirrors the pattern used by the state serializer.
- *
- * @param {Blob} blob
- * @param {string} filename
- * @param {object} [options]
- * @param {AbortSignal|null} [options.signal]
- */
-export function downloadBlob(blob, filename, { signal = null } = {}) {
-  throwIfFigureExportAborted(signal);
-  const url = URL.createObjectURL(blob);
-  let anchor = null;
-  let appended = false;
-  try {
-    throwIfFigureExportAborted(signal);
-    anchor = document.createElement('a');
-    anchor.href = url;
-    anchor.download = filename;
-    document.body.appendChild(anchor);
-    appended = true;
-    throwIfFigureExportAborted(signal);
-    anchor.click();
-  } finally {
-    try {
-      // Element.remove() is idempotent if a reentrant teardown already
-      // detached the committed download owner.
-      if (appended) anchor.remove();
-    } finally {
-      URL.revokeObjectURL(url);
-    }
-  }
-}
-
-/**
  * Encode a canvas while letting teardown settle the export immediately. The
  * browser's native encoder is not cancellable, so a callback that arrives after
  * abort is ignored.
@@ -113,7 +79,7 @@ export function canvasToBlob(
  * @param {unknown} value
  * @returns {string}
  */
-export function sanitizeFilenamePart(value) {
+function sanitizeFilenamePart(value) {
   const raw = String(value ?? '').trim();
   if (!raw) return 'untitled';
   return raw
@@ -142,6 +108,8 @@ export function formatTimestampForFilename(date = new Date()) {
 /**
  * Build a conservative, cross-platform filename.
  *
+ * The view segment is left out when it would only repeat the field segment.
+ *
  * @param {object} parts
  * @param {string|null} [parts.datasetName]
  * @param {string|null} [parts.fieldKey]
@@ -155,7 +123,10 @@ export function buildExportFilename({ datasetName, fieldKey, viewLabel, variant,
   const ts = timestamp || formatTimestampForFilename();
   const base = sanitizeFilenamePart(datasetName || 'cellucid');
   const field = fieldKey ? sanitizeFilenamePart(fieldKey) : null;
-  const view = viewLabel ? sanitizeFilenamePart(viewLabel) : null;
+  // A view nobody renamed is labelled with its colour field, so naming both
+  // wrote the field twice ("..._cell_type_cell_type_...").
+  const viewPart = viewLabel ? sanitizeFilenamePart(viewLabel) : null;
+  const view = viewPart === field ? null : viewPart;
   const extra = variant ? sanitizeFilenamePart(variant) : null;
 
   const segments = [base, field, view, extra, ts].filter(Boolean);

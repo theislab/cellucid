@@ -280,14 +280,49 @@ test('combining pages reads the same membership the pages render', () => {
     'page_2',
     'intersection'
   );
-  assert.deepEqual(intersection.highlightedGroups[0].cellIndices, [3]);
+  assert.ok(intersection.highlightedGroups[0].cellIndices instanceof Uint32Array);
+  assert.deepEqual([...intersection.highlightedGroups[0].cellIndices], [3]);
 
   const union = state.combineHighlightPages('page_1', 'page_2', 'union');
+  assert.ok(union.highlightedGroups[0].cellIndices instanceof Uint32Array);
   assert.deepEqual(
-    [...union.highlightedGroups[0].cellIndices].sort((a, b) => a - b),
+    [...union.highlightedGroups[0].cellIndices],
     [1, 2, 3, 4, 7],
-    'a disabled group contributes to neither the count nor the combination'
+    'a disabled group contributes to neither the count nor the combination; '
+    + 'the union lists page 1 first, then what page 2 adds'
   );
+  assert.equal(union.highlightedGroups[0].cellCount, 5);
+  assert.ok(
+    state._highlightMembershipScratch.every(value => value === 0),
+    'combining returns the borrowed membership scratch clean'
+  );
+});
+
+test('combining whole-dataset pages stays exact past the Set size limit', () => {
+  // A Set cannot hold more than 2^24 entries in V8; a page can hold every
+  // cell of a dataset larger than that.
+  const pointCount = (1 << 24) + 8;
+  const all = new Uint32Array(pointCount);
+  for (let index = 0; index < pointCount; index++) all[index] = index;
+  const evens = new Uint32Array(pointCount >>> 1);
+  for (let index = 0; index < evens.length; index++) evens[index] = index * 2;
+  const { state } = createHighlightState({
+    pointCount,
+    activePageId: 'page_1',
+    pages: [
+      createPage('page_1', [createGroup('highlight_1', all)]),
+      createPage('page_2', [createGroup('highlight_2', evens)]),
+    ],
+  });
+
+  const intersection = state.combineHighlightPages('page_1', 'page_2', 'intersection');
+  const intersected = intersection.highlightedGroups[0].cellIndices;
+  assert.equal(intersected.length, evens.length);
+  assert.equal(intersected[1], 2);
+  assert.equal(intersected.at(-1), pointCount - 2);
+
+  const union = state.combineHighlightPages('page_1', 'page_2', 'union');
+  assert.equal(union.highlightedGroups[0].cellIndices.length, pointCount);
 });
 
 test('clearing highlights empties exactly the active page', () => {
@@ -359,6 +394,6 @@ test('highlight accessors expose no second definition of page membership', () =>
   );
   assert.deepEqual(
     Object.keys(highlightAccessorMethods).sort(),
-    ['getCategoryForCell', 'getCellAtScreenPosition', 'getValueForCell']
+    ['getCellAtScreenPosition']
   );
 });

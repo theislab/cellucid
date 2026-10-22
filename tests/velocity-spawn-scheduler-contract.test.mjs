@@ -162,7 +162,7 @@ test('incremental velocity spawn sampling is multi-slice and bit-identical to th
     config: { spawnTableSize: 1_024 },
   });
   const cellCount = 140_000;
-  const transparency = Float32Array.from(
+  const transparency = Uint8Array.from(
     { length: cellCount },
     (_, index) => {
       if (index % 7 === 0) return 0;
@@ -199,15 +199,23 @@ test('incremental velocity spawn sampling is multi-slice and bit-identical to th
   }
 });
 
-test('velocity visibility threshold includes alpha exactly 0.01', () => {
+test('velocity spawns exactly from the cells whose transparency is 1', () => {
   const overlay = Object.assign(Object.create(VelocityOverlay.prototype), {
     config: { spawnTableSize: 8 },
   });
-  const transparency = new Float32Array([0, 0.009, 0.01, 0.011, 1]);
+  const transparency = new Uint8Array([0, 1, 0, 1, 1]);
 
   assert.deepEqual(
     overlay._buildSpawnTable(transparency, transparency.length, null),
-    new Uint32Array([2, 3, 4])
+    new Uint32Array([1, 3, 4])
+  );
+  assert.throws(
+    () => overlay._buildSpawnTable(
+      new Float32Array([0, 1, 0, 1, 1]),
+      5,
+      null
+    ),
+    /one Uint8 transparency value per cell/
   );
   const build = overlay._createSpawnTableBuild(
     transparency,
@@ -220,7 +228,7 @@ test('velocity visibility threshold includes alpha exactly 0.01', () => {
   );
   assert.deepEqual(
     overlay._finishSpawnTableBuild(build),
-    new Uint32Array([2, 3, 4])
+    new Uint32Array([1, 3, 4])
   );
 });
 
@@ -230,7 +238,7 @@ test('all-hidden velocity generations complete across idle slices without publis
     const state = createSpawnState(4);
     const overlay = createSpawnOverlay(state, deletedTextures);
     const cellCount = 150_000;
-    const transparency = new Float32Array(cellCount);
+    const transparency = new Uint8Array(cellCount);
     let transparencyReads = 0;
     let lodReads = 0;
 
@@ -290,7 +298,7 @@ test('visibility invalidation cancels a partial spawn build before stale GL publ
     const state = createSpawnState(7);
     const overlay = createSpawnOverlay(state, deletedTextures);
     const cellCount = 150_000;
-    const transparency = new Float32Array(cellCount);
+    const transparency = new Uint8Array(cellCount);
     let transparencyReads = 0;
     const context = {
       getLodIndices: () => null,
@@ -364,7 +372,7 @@ test('stale spawn cancellation absorbs a notification dismissal failure', t => {
       {
         getLodIndices: () => null,
         getLodLevel: () => -1,
-        getViewTransparency: () => new Float32Array(150_000),
+        getViewTransparency: () => new Uint8Array(150_000),
       },
       150_000,
     );
@@ -396,7 +404,7 @@ test('disabling velocity fences a partial build and retires only published deriv
       {
         getLodIndices: () => null,
         getLodLevel: () => -1,
-        getViewTransparency: () => new Float32Array(cellCount),
+        getViewTransparency: () => new Uint8Array(cellCount),
       },
       cellCount
     );
@@ -457,7 +465,7 @@ test('spawn failure does not terminally update the notification dismissed by shu
           getLodLevel: () => -1,
           // The scheduled build must report this contract failure through the
           // overlay circuit instead of leaking a second notification failure.
-          getViewTransparency: () => new Float32Array(0),
+          getViewTransparency: () => new Uint8Array(0),
         },
         1,
       );
@@ -509,7 +517,7 @@ test('spawn publication remains ready when notification pressure evicts its load
         {
           getLodIndices: () => null,
           getLodLevel: () => -1,
-          getViewTransparency: () => new Float32Array(1),
+          getViewTransparency: () => new Uint8Array(1),
         },
         1,
       );
@@ -560,7 +568,7 @@ test('committed empty spawn generation retains failed old-texture retirement for
       {
         getLodIndices: () => null,
         getLodLevel: () => -1,
-        getViewTransparency: () => new Float32Array(1),
+        getViewTransparency: () => new Uint8Array(1),
       },
       1,
     );
@@ -613,7 +621,7 @@ test('committed non-empty spawn replacement stays ready while old retirement ret
       {
         getLodIndices: () => null,
         getLodLevel: () => -1,
-        getViewTransparency: () => new Float32Array([1]),
+        getViewTransparency: () => new Uint8Array([1]),
       },
       1,
     );

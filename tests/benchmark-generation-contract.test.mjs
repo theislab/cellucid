@@ -148,7 +148,7 @@ test('the point-count control and both validators enforce one rule', async () =>
   assert.equal(assertSyntheticCount(defaultValue), defaultValue);
 
   const presets = [
-    ...indexHtml.matchAll(/class="btn-small benchmark-preset" data-count="(\d+)"/g)
+    ...indexHtml.matchAll(/class="btn btn-compact benchmark-preset" data-count="(\d+)"/g)
   ].map(match => Number(match[1]));
   assert.ok(presets.length > 0, 'the benchmark presets must publish counts');
   for (const preset of presets) {
@@ -243,9 +243,21 @@ test('a response is checked against the exact lengths publication demands', () =
   );
 });
 
-test('the two-dimensional pattern keeps its own dimension level', () => {
-  const response = validResponse(4, { dimensionLevel: 2 });
+test('the two-dimensional pattern keeps its own dimension level and layout', () => {
+  // A 2-D pattern publishes two position components per point, never a
+  // zero-padded third.
+  const response = validResponse(4, {
+    dimensionLevel: 2,
+    positions: new Float32Array(8),
+  });
   assert.equal(assertGenerationResponse(response, 4).dimensionLevel, 2);
+  assert.throws(
+    () => assertGenerationResponse(
+      validResponse(4, { dimensionLevel: 2 }),
+      4
+    ),
+    /8 Float32 position components/
+  );
 });
 
 test('the worker module imports only what a worker thread can evaluate', async () => {

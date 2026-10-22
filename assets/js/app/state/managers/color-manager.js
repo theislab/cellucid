@@ -14,10 +14,11 @@ import {
   CONTINUOUS_COLORMAPS,
   DEFAULT_COLORMAP_ID,
   getCategoryColor,
-  getCssStopsForColormap,
-  sampleContinuousColormap
+  getCssStopsForColormap
 } from '../../../data/palettes.js';
 import { NEUTRAL_GRAY_UINT8 } from '../core/constants.js';
+import { requireCategoryCodesInInventory } from './category-codes.js';
+import { computeCentroidsForDimension } from '../../registries/user-defined-fields/centroids.js';
 import {
   UndrawableContinuousPayloadError,
   createNonFiniteTally,
@@ -26,6 +27,62 @@ import {
 } from '../../../data/continuous-payload-diagnosis.js';
 import { BaseManager } from '../core/base-manager.js';
 import { colorOutlierMethods } from './color-outliers.js';
+import {
+  writableColorAlphaBytes,
+  writableColors,
+  writableTransparency,
+} from './per-cell-array-ownership.js';
+import { isCategoricalCodes, missingCategoryCode } from '../../../data/categorical-storage-contract.js';
+
+/**
+ * One range scan per continuous values array.
+ *
+ * `ensureContinuousMetadata` runs from coloring, filtering, the legend and the
+ * color domain, several times per field switch, and each run used to scan
+ * every value: at 5,000,000 cells that was most of a switch's main-thread time.
+ * A field's values are never written in place — loading new values produces a
+ * new array — so the scan is a pure function of the array and is kept for as
+ * long as the array is. An undrawable scan is kept too, so every caller gets
+ * the same refusal.
+ */
+const CONTINUOUS_VALUE_SCANS = new WeakMap();
+
+function scanContinuousValues(values) {
+  let scan = CONTINUOUS_VALUE_SCANS.get(values);
+  if (scan !== undefined) return scan;
+  let min = Infinity;
+  let max = -Infinity;
+  let minPositive = Infinity;
+  let maxPositive = -Infinity;
+  // The range scan is also the diagnosis scan. Reporting on the first
+  // offending value would name one flat index and nothing else; counting them
+  // here costs one pass that was already being made, and turns the refusal
+  // into something the person looking at the screen can act on.
+  const tally = createNonFiniteTally(values.length);
+  for (let index = 0; index < values.length; index++) {
+    const value = values[index];
+    if (!Number.isFinite(value)) {
+      recordNonFiniteValue(tally, value, index);
+      continue;
+    }
+    if (value < min) min = value;
+    if (value > max) max = value;
+    if (value > 0) {
+      if (value < minPositive) minPositive = value;
+      if (value > maxPositive) maxPositive = value;
+    }
+  }
+  scan = Object.freeze({
+    drawable: !hasUndrawableValues(tally) && min !== Infinity,
+    tally,
+    min,
+    max,
+    minPositive,
+    maxPositive,
+  });
+  CONTINUOUS_VALUE_SCANS.set(values, scan);
+  return scan;
+}
 
 function requireBoolean(value, context) {
   if (typeof value !== 'boolean') {
@@ -147,9 +204,12 @@ function computeContinuousDomain(field, meta, useLog) {
     domainMin = Math.max(domainMin, positive.min);
     domainMax = Math.min(domainMax, positive.max);
     if (domainMin > domainMax) {
-      throw new RangeError(
-        'Log color scale requires the selected color range to include a positive value.'
-      );
+      // A slider-tracked range can lie entirely at or below zero (Max dragged
+      // under the smallest positive value). Every cell in it is non-positive
+      // and draws grey under a log scale, so the domain collapses onto the
+      // smallest positive value instead of refusing a legitimate UI state.
+      domainMin = positive.min;
+      domainMax = positive.min;
     }
   }
 
@@ -215,34 +275,14 @@ export class DataStateColorMethods {
       throw new RangeError('Continuous field values must match the current point count.');
     }
 
-    let min = Infinity;
-    let max = -Infinity;
-    let minPositive = Infinity;
-    let maxPositive = -Infinity;
-    // The range scan is also the diagnosis scan. Reporting on the first
-    // offending value would name one flat index and nothing else; counting them
-    // here costs one pass that was already being made, and turns the refusal
-    // into something the person looking at the screen can act on.
-    const tally = createNonFiniteTally(field.values.length);
-    for (let index = 0; index < field.values.length; index++) {
-      const value = field.values[index];
-      if (!Number.isFinite(value)) {
-        recordNonFiniteValue(tally, value, index);
-        continue;
-      }
-      if (value < min) min = value;
-      if (value > max) max = value;
-      if (value > 0) {
-        if (value < minPositive) minPositive = value;
-        if (value > maxPositive) maxPositive = value;
-      }
-    }
-    if (hasUndrawableValues(tally) || min === Infinity) {
+    const scan = scanContinuousValues(field.values);
+    if (!scan.drawable) {
       throw new UndrawableContinuousPayloadError({
         subject: this.describeContinuousFieldSubject(field),
-        tally,
+        tally: scan.tally,
       });
     }
+    const { min, max, minPositive, maxPositive } = scan;
 
     const computedStats = { min, max };
     let stats;
@@ -390,15 +430,17 @@ export class DataStateColorMethods {
     if (
       !(this.colorsArray instanceof Uint8Array)
       || this.colorsArray.length !== n * 4
-      || !(this.categoryTransparency instanceof Float32Array)
+      || !(this.categoryTransparency instanceof Uint8Array)
       || this.categoryTransparency.length !== n
     ) {
       throw new TypeError('Continuous coloring requires complete color and transparency buffers.');
     }
     if (resetTransparency) {
-      this.categoryTransparency.fill(1.0);
+      writableTransparency(this).fill(1);
     }
+    const colors = writableColors(this);
 
+    const sample = [0, 0, 0];
     for (let i = 0; i < n; i++) {
       const v = values[i];
       let r, g, b;
@@ -413,16 +455,16 @@ export class DataStateColorMethods {
         } else {
           t = (v - domainMin) / denom;
         }
-        const c = sampleContinuousColormap(colormap.id, t);
+        const c = colormap.sampleInto(t, sample);
         // Convert from 0-1 float to 0-255 uint8
         r = Math.round(c[0] * 255);
         g = Math.round(c[1] * 255);
         b = Math.round(c[2] * 255);
       }
       const j = i * 4;
-      this.colorsArray[j] = r;
-      this.colorsArray[j + 1] = g;
-      this.colorsArray[j + 2] = b;
+      colors[j] = r;
+      colors[j + 1] = g;
+      colors[j + 2] = b;
       // Alpha will be synced from categoryTransparency in syncColorsAlpha
     }
     this._syncColorsAlpha();
@@ -435,16 +477,25 @@ export class DataStateColorMethods {
     if (
       !(this.colorsArray instanceof Uint8Array)
       || this.colorsArray.length !== n * 4
-      || !(alpha instanceof Float32Array)
+      || !(alpha instanceof Uint8Array)
       || alpha.length !== n
     ) {
       throw new TypeError('Color alpha synchronization requires complete typed buffers.');
     }
-    for (let i = 0; i < n; i++) {
-      if (!Number.isFinite(alpha[i]) || alpha[i] < 0 || alpha[i] > 1) {
-        throw new RangeError(`Transparency value ${i} must be from 0 through 1.`);
+    const published = this.colorsArray;
+    const colors = writableColorAlphaBytes(this);
+    for (let i = 0, j = 3; i < n; i++, j += 4) {
+      const value = alpha[i];
+      if (value > 1) {
+        throw new RangeError(`Transparency value ${i} must be exactly 0 or 1.`);
       }
-      this.colorsArray[i * 4 + 3] = Math.round(alpha[i] * 255);
+      colors[j] = value * 255;
+    }
+    if (colors !== published && String(this.activeViewId) === 'live') {
+      // The live viewer and renderer hold the state's colors by reference;
+      // a copy-on-write moved the state to a new array, so it is republished.
+      // A snapshot's renderer reads its alpha from its own R8 texture only.
+      this._pushColorsToViewer();
     }
   }
 
@@ -521,52 +572,89 @@ export class DataStateColorMethods {
     const numCats = categories.length;
 
     if (
-      (!(codes instanceof Uint8Array) && !(codes instanceof Uint16Array))
+      !isCategoricalCodes(codes)
       || codes.length !== n
       || !(this.colorsArray instanceof Uint8Array)
       || this.colorsArray.length !== n * 4
-      || !(this.categoryTransparency instanceof Float32Array)
+      || !(this.categoryTransparency instanceof Uint8Array)
       || this.categoryTransparency.length !== n
     ) {
       throw new TypeError('Category coloring requires complete category, color, and transparency buffers.');
     }
     this.ensureCategoryMetadata(field);
+    this._writeCategoryColors(field, true);
+  }
+
+  /**
+   * Write every cell's category color; with `writeTransparency`, also its
+   * visibility (hidden categories get alpha 0). Without it the alpha bytes are
+   * left for `_syncColorsAlpha` to restore from `categoryTransparency`.
+   *
+   * @param {object} field Category field with resolved colors and visibility.
+   * @param {boolean} writeTransparency
+   */
+  _writeCategoryColors(field, writeTransparency) {
+    const n = this.pointCount;
+    const codes = field.codes;
+    const numCats = field.categories.length;
     const catColors = field._categoryColors;
     const catVisible = field._categoryVisible;
-    const missingCode = codes instanceof Uint8Array ? 255 : 65_535;
-    for (let i = 0; i < n; i++) {
-      const code = codes[i];
-      if (code >= numCats && code !== missingCode) {
-        throw new RangeError(`Category code ${i} is outside the category inventory.`);
-      }
-    }
+    requireCategoryCodesInInventory(
+      codes,
+      numCats,
+      index => `Category code ${index} is outside the category inventory.`
+    );
+    const missingCode = missingCategoryCode(codes);
 
+    // One RGBA word and one alpha per code, resolved once: every cell of a
+    // category gets identical bytes, so the per-cell loop is two table reads.
+    // Slot `numCats` holds the missing-value color.
+    const rgbaBytes = new Uint8Array((numCats + 1) * 4);
+    const alphaByCode = new Uint8Array(numCats + 1);
+    for (let code = 0; code <= numCats; code++) {
+      let r, g, b, alpha;
+      if (code === numCats) {
+        r = NEUTRAL_GRAY_UINT8; g = NEUTRAL_GRAY_UINT8; b = NEUTRAL_GRAY_UINT8;
+        alpha = 1;
+      } else if (!catVisible[code]) {
+        r = g = b = 128; // gray in uint8
+        alpha = 0;
+      } else {
+        // Convert from 0-1 float to 0-255 uint8
+        const c = catColors[code];
+        r = Math.round(c[0] * 255);
+        g = Math.round(c[1] * 255);
+        b = Math.round(c[2] * 255);
+        alpha = 1;
+      }
+      const j = code * 4;
+      rgbaBytes[j] = r;
+      rgbaBytes[j + 1] = g;
+      rgbaBytes[j + 2] = b;
+      rgbaBytes[j + 3] = alpha * 255;
+      alphaByCode[code] = alpha;
+    }
+    // Byte-identical words in both views, so platform byte order is moot.
+    const rgbaWords = new Uint32Array(rgbaBytes.buffer);
+    const colors = writableColors(this);
+    const colorWords = colors.byteOffset % 4 === 0
+      ? new Uint32Array(colors.buffer, colors.byteOffset, n)
+      : null;
+    const transparency = writeTransparency ? writableTransparency(this) : null;
     for (let i = 0; i < n; i++) {
       const code = codes[i];
-      let r, g, b, alpha;
-      if (code === missingCode) {
-        r = NEUTRAL_GRAY_UINT8; g = NEUTRAL_GRAY_UINT8; b = NEUTRAL_GRAY_UINT8;
-        alpha = 1.0;
+      const slot = code === missingCode ? numCats : code;
+      if (colorWords !== null) {
+        colorWords[i] = rgbaWords[slot];
       } else {
-        const isVisible = catVisible[code];
-        const c = catColors[code];
-        if (!isVisible) {
-          r = g = b = 128; // gray in uint8
-          alpha = 0.0;
-        } else {
-          // Convert from 0-1 float to 0-255 uint8
-          r = Math.round(c[0] * 255);
-          g = Math.round(c[1] * 255);
-          b = Math.round(c[2] * 255);
-          alpha = 1.0;
-        }
+        const j = i * 4;
+        const k = slot * 4;
+        colors[j] = rgbaBytes[k];
+        colors[j + 1] = rgbaBytes[k + 1];
+        colors[j + 2] = rgbaBytes[k + 2];
+        colors[j + 3] = rgbaBytes[k + 3];
       }
-      const j = i * 4;
-      this.colorsArray[j] = r;
-      this.colorsArray[j + 1] = g;
-      this.colorsArray[j + 2] = b;
-      this.colorsArray[j + 3] = Math.round(alpha * 255);
-      this.categoryTransparency[i] = alpha;
+      if (writeTransparency) transparency[i] = alphaByCode[slot];
     }
   }
 
@@ -590,33 +678,65 @@ export class DataStateColorMethods {
       options === null
       || typeof options !== 'object'
       || Array.isArray(options)
-      || Object.keys(options).join(',') !== 'viewId'
+      || Object.keys(options).sort().join(',') !== 'layoutKey,viewId'
       || typeof options.viewId !== 'string'
       || options.viewId.length === 0
+      || typeof options.layoutKey !== 'string'
+      || options.layoutKey.length === 0
     ) {
-      throw new TypeError('Centroid construction requires exactly one nonempty viewId.');
+      throw new TypeError(
+        'Centroid construction requires exactly one nonempty viewId and layoutKey.'
+      );
     }
-    // Get dimension-specific centroids based on current dimension level
-    const currentDim = this.activeDimensionLevel;
-    if (!Number.isInteger(currentDim) || currentDim < 1 || currentDim > 3) {
-      throw new RangeError('Centroid construction requires dimension 1, 2, or 3.');
-    }
-    const centroidsByDim = field.centroidsByDim;
     if (
-      centroidsByDim === null
-      || typeof centroidsByDim !== 'object'
-      || Array.isArray(centroidsByDim)
+      !this.dimensionManager
+      || typeof this.dimensionManager.getLayout !== 'function'
+      || typeof this.dimensionManager.getNormTransform !== 'function'
     ) {
-      throw new TypeError('Category field centroidsByDim must be an object.');
+      throw new TypeError('Centroid construction requires the current DimensionManager.');
+    }
+    // Centroids belong to the layout they are built for, and carry exactly
+    // its dimension's coordinates.
+    const layoutKey = options.layoutKey;
+    const currentDim = this.dimensionManager.getLayout(layoutKey).dimension;
+    const centroidsByLayout = field.centroidsByLayout;
+    if (!(centroidsByLayout instanceof Map)) {
+      throw new TypeError('Category field centroidsByLayout must be a Map.');
     }
 
-    // Get centroids for current dimension
-    const dimensionKey = String(currentDim);
-    const centroids = Object.hasOwn(centroidsByDim, dimensionKey)
-      ? centroidsByDim[dimensionKey]
+    // A dataset field without centroids for this layout (an embedding the
+    // data mapping enabled, a synthetic representation) gets them from its
+    // codes and the layout's resident normalized positions, once; they are
+    // cached on the field like the dataset's own. User-defined fields
+    // recompute through their registry before this runs.
+    if (
+      !centroidsByLayout.has(layoutKey) &&
+      field._isUserDefined !== true &&
+      typeof this.dimensionManager.getResidentPositions === 'function'
+    ) {
+      const positions = this.dimensionManager.getResidentPositions(layoutKey);
+      const codes = field.codes;
+      if (
+        positions instanceof Float32Array &&
+        isCategoricalCodes(codes) &&
+        codes.length === this.pointCount &&
+        positions.length === this.pointCount * currentDim
+      ) {
+        centroidsByLayout.set(
+          layoutKey,
+          computeCentroidsForDimension(codes, field.categories, positions, currentDim)
+        );
+        if (!(field._normalizedLayouts instanceof Set)) field._normalizedLayouts = new Set();
+        field._normalizedLayouts.add(layoutKey);
+      }
+    }
+
+    // Get centroids for this layout
+    const centroids = centroidsByLayout.has(layoutKey)
+      ? centroidsByLayout.get(layoutKey)
       : [];
     if (!Array.isArray(centroids)) {
-      throw new TypeError(`Category centroids for ${currentDim}D must be an array.`);
+      throw new TypeError(`Category centroids for layout "${layoutKey}" must be an array.`);
     }
     const categories = field.categories;
     this.ensureCategoryMetadata(field);
@@ -655,30 +775,20 @@ export class DataStateColorMethods {
       }
     }
 
-    // Lazy normalization: normalize centroids for this dimension if not already done.
-    // Each dimension has its own normalization transform, so we track per-dimension.
-    // This ensures centroids are correctly positioned regardless of which dimension
-    // was loaded first or when switching between dimensions.
-    //
-    // centroidsByDim: per-dimension arrays, each normalized with its own transform
+    // Lazy normalization: normalize this layout's centroids if not already
+    // done. Each layout has its own normalization transform, so the record is
+    // per layout. This keeps centroids correctly positioned regardless of
+    // which layout was loaded first or when switching between layouts.
     if (centroids.length > 0) {
-      if (field._normalizedDims === null || field._normalizedDims === undefined) {
-        field._normalizedDims = new Set();
-      } else if (!(field._normalizedDims instanceof Set)) {
+      if (field._normalizedLayouts === null || field._normalizedLayouts === undefined) {
+        field._normalizedLayouts = new Set();
+      } else if (!(field._normalizedLayouts instanceof Set)) {
         throw new TypeError('Centroid normalization state must be a Set.');
       }
 
-      const dimKey = String(currentDim);
-
       // Check if this centroid array needs normalization
-      if (!field._normalizedDims.has(dimKey)) {
-        if (
-          !this.dimensionManager
-          || typeof this.dimensionManager.getNormTransform !== 'function'
-        ) {
-          throw new TypeError('Centroid normalization requires the current DimensionManager.');
-        }
-        const normTransform = this.dimensionManager.getNormTransform(currentDim);
+      if (!field._normalizedLayouts.has(layoutKey)) {
+        const normTransform = this.dimensionManager.getNormTransform(layoutKey);
         if (
           !normTransform
           || typeof normTransform !== 'object'
@@ -701,7 +811,7 @@ export class DataStateColorMethods {
           if (p.length >= 3) p[2] = (p[2] - cz) * scale;
         }
 
-        field._normalizedDims.add(dimKey);
+        field._normalizedLayouts.add(layoutKey);
       }
     }
 

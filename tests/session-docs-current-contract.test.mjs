@@ -24,7 +24,7 @@ test('session maintainer reference describes only the atomic current format', as
     'one compact binary membership chunk per advertised group',
     'the complete restore rejects and rolls back',
     'no dataset-agnostic layout subset is salvaged',
-    'not accepted by generic **Load State**',
+    'not accepted by the generic Session file **Load**',
     'do not add a reader for an older shape',
   ]) {
     assert.match(normalized, new RegExp(

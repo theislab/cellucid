@@ -1,12 +1,10 @@
+import './helpers/anndata-reader-in-process.mjs';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { deflateRawSync, inflateRawSync } from 'node:zlib';
 
 import * as zarrArchiveModule from '../assets/js/data/zarr-archive.js';
-import {
-  prepareZarrArrayAllocation,
-  ZarrLoader,
-} from '../assets/js/data/zarr.js';
+import { ZarrLoader } from '../assets/js/data/zarr-loader.js';
 
 const { readZarrZipArchive } = zarrArchiveModule;
 
@@ -360,108 +358,6 @@ test('inflates deflate entries through the injected raw-DEFLATE seam', async () 
   }]);
 });
 
-test('CEL-AUDIT-0108 ZIP extraction participates in the portable array working-set plan', async t => {
-  const mebibyte = 1024 * 1024;
-  const estimateArchiveWorkingBytes =
-    zarrArchiveModule.estimateZarrZipEntryExtractionWorkingBytes;
-  await t.test('exposes the archive-layer extraction lifetime', () => {
-    assert.equal(typeof estimateArchiveWorkingBytes, 'function');
-  });
-  const archiveChunkWorkingBytes =
-    typeof estimateArchiveWorkingBytes === 'function'
-      ? estimateArchiveWorkingBytes({
-          method: 8,
-          compressedSize: 64 * mebibyte,
-          uncompressedSize: 64 * mebibyte,
-        })
-      : 192n * BigInt(mebibyte);
-  assert.equal(archiveChunkWorkingBytes, 192n * BigInt(mebibyte));
-
-  const metadata = resultMebibytes => ({
-    zarr_format: 2,
-    shape: [(resultMebibytes * mebibyte) / 4],
-    chunks: [16_777_216],
-    dtype: '<u4',
-    compressor: null,
-    fill_value: 0,
-    filters: null,
-    order: 'C',
-  });
-
-  await t.test('preserves the exact non-archive 383/384 MiB boundary', () => {
-    assert.doesNotThrow(() => prepareZarrArrayAllocation(metadata(383)));
-    assert.throws(
-      () => prepareZarrArrayAllocation(metadata(384)),
-      /peak working set.*browser limit/i
-    );
-  });
-
-  await t.test('uses the maximum inner-or-archive chunk lifetime', () => {
-    assert.doesNotThrow(
-      () => prepareZarrArrayAllocation(
-        metadata(320),
-        archiveChunkWorkingBytes
-      )
-    );
-    assert.throws(
-      () => prepareZarrArrayAllocation(
-        {
-          ...metadata(320),
-          shape: [((320 * mebibyte) / 4) + 1],
-        },
-        archiveChunkWorkingBytes
-      ),
-      /ZIP extraction.*working set.*browser limit/i
-    );
-    assert.throws(
-      () => prepareZarrArrayAllocation(
-        metadata(383),
-        archiveChunkWorkingBytes
-      ),
-      /ZIP extraction.*working set.*browser limit/i
-    );
-  });
-
-  await t.test('rejects an indexed archive chunk before payload inflation or result allocation', async () => {
-    if (typeof estimateArchiveWorkingBytes !== 'function') {
-      assert.fail('archive extraction plan seam is unavailable');
-    }
-    const archive = buildZip([
-      {
-        name: 'bounded.zarr/.zarray',
-        content: zarrArrayMetadata({
-          shape: [(383 * mebibyte) / 4],
-          chunks: [16_777_216],
-          dtype: '<u4',
-        }),
-      },
-      {
-        name: 'bounded.zarr/0',
-        content: Uint8Array.of(0),
-        compressed: Uint8Array.of(0),
-        method: 8,
-        declaredCompressedSize: 64 * mebibyte,
-        declaredSize: 64 * mebibyte,
-      },
-    ]);
-    let inflateCalls = 0;
-    const { files } = await readZarrZipArchive(archive.bytes, {
-      inflateRaw() {
-        inflateCalls++;
-        throw new Error('oversized archive chunk must not inflate');
-      },
-    });
-    const loader = new ZarrLoader();
-    loader._files = files;
-
-    await assert.rejects(
-      loader._readArray(''),
-      /ZIP extraction.*working set.*browser limit/i
-    );
-    assert.equal(inflateCalls, 0);
-  });
-});
-
 test('reads ZIP64 footer and per-entry size/offset metadata safely', async () => {
   const bytes = buildSmallZip64({
     name: 'zip64.zarr/.zgroup',
@@ -637,7 +533,7 @@ test('feeds an archived Zarr store through ZarrLoader.openFileMap', async () => 
   assert.equal(loader.nObs, 1);
   assert.equal(loader.nVars, 1);
   assert.deepEqual(loader.varNames, ['GeneA']);
-  assert.deepEqual(Array.from(await loader.getGeneExpression('GeneA')), [3.5]);
+  assert.deepEqual(Array.from(await loader.getMatrixColumn('X', 0)), [3.5]);
 });
 
 for (const [label, name] of [
@@ -693,7 +589,7 @@ test('rejects encrypted, unsupported, multi-disk, and oversized archives', async
     await assert.rejects(readZarrZipArchive(bytes), /multi-disk ZIP/i);
   });
 
-  await t.test('unsafe declared entry size', async () => {
+  await t.test('a declared entry size the archive cannot hold', async () => {
     const { bytes } = buildZip([{
       name: 'bad.zarr/.zgroup',
       content: '{}',
@@ -701,7 +597,7 @@ test('rejects encrypted, unsupported, multi-disk, and oversized archives', async
     }]);
     await assert.rejects(
       readZarrZipArchive(bytes),
-      /uncompressed size.*browser limit/i
+      /contradictory compressed and uncompressed sizes|more uncompressed bytes than DEFLATE can encode|more than the archive holds/i
     );
   });
 });

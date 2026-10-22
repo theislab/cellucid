@@ -1,8 +1,19 @@
 /**
  * @fileoverview Sidebar toggle + resize wiring.
  *
- * Keeps sidebar open/close state, updates ARIA attributes, and manages the
+ * Keeps sidebar open/close state, updates ARIA attributes, makes the hidden
+ * sidebar `inert` (nothing in it is focusable or tabbable), and manages the
  * resize drag handle by updating the desktop `--sidebar-user-width` input.
+ *
+ * It is also the one owner of the presented area: the part of the canvas the
+ * sidebar does not cover. It publishes that area as the fraction of the
+ * canvas covered from the left (`onViewportOcclusionChange(ratio)`), and the
+ * viewer lays every view out inside the rest. The ratio is republished on
+ * every geometry change: a toggle (and again when its slide animation ends;
+ * while it slides, the area stays the one beside the open sidebar), a live
+ * resize drag, a window or canvas resize, and a responsive breakpoint. On
+ * the phone layout the open sidebar is a full-screen sheet the user closes
+ * to reach the plot, not a panel beside it, so it occludes nothing.
  *
  * @module ui/modules/sidebar-controls
  */
@@ -54,6 +65,9 @@ export function initSidebarControls({ dom, onViewportOcclusionChange }) {
   if (typeof ResizeObserver !== 'function') {
     throw new Error('Sidebar controls require ResizeObserver support.');
   }
+  if (typeof sidebar.getAnimations !== 'function') {
+    throw new Error('Sidebar controls require Web Animations getAnimations().');
+  }
   const responsiveResizeMedia = ownerWindow.matchMedia('(max-width: 900px)');
   let destroyed = false;
   const occlusionGeometry = {
@@ -64,31 +78,65 @@ export function initSidebarControls({ dom, onViewportOcclusionChange }) {
     sidebarVisible: false,
   };
 
+  // The open/close slide is a CSS transform, which no ResizeObserver sees.
+  // While it runs, the presented area stays the one beside the *open*
+  // sidebar: on opening it shrinks at once, before the sidebar slides into
+  // the space; on closing it grows only when the sidebar has finished
+  // sliding away. The panes are therefore never under the moving sidebar,
+  // every pane keeps the same visible area in every frame, and nothing is
+  // republished per frame. One rAF poll per frame watches for the end.
+  let transitionFrame = 0;
+  const isSidebarTransitionRunning = () => sidebar.getAnimations().length > 0;
+
+  // A sidebar at least as wide as the canvas is the phone sheet: it hides the
+  // plot instead of sitting beside it, and the plot is used with it closed.
+  const captureSidebarGeometry = () => {
+    occlusionGeometry.sidebarLeft = sidebar.offsetLeft;
+    occlusionGeometry.sidebarWidth = sidebar.offsetWidth;
+    occlusionGeometry.sidebarVisible =
+      sidebar.offsetWidth < occlusionGeometry.canvasWidth &&
+      (!sidebar.classList.contains('hidden') || isSidebarTransitionRunning());
+  };
+
+  const publishOcclusionGeometry = () => {
+    onViewportOcclusionChange(
+      computeLeftOcclusionRatio(occlusionGeometry)
+    );
+  };
+
   const publishViewportOcclusion = () => {
     if (destroyed) return;
     const canvasRect = canvas.getBoundingClientRect();
     occlusionGeometry.canvasLeft = canvasRect.left;
     occlusionGeometry.canvasWidth = canvasRect.width;
-    occlusionGeometry.sidebarLeft = sidebar.offsetLeft;
-    occlusionGeometry.sidebarWidth = sidebar.offsetWidth;
-    occlusionGeometry.sidebarVisible = !sidebar.classList.contains('hidden');
-    onViewportOcclusionChange(
-      computeLeftOcclusionRatio(occlusionGeometry)
-    );
+    captureSidebarGeometry();
+    publishOcclusionGeometry();
   };
 
   const publishCachedViewportOcclusion = (sidebarWidth) => {
     if (destroyed) return;
     occlusionGeometry.sidebarWidth = sidebarWidth;
-    occlusionGeometry.sidebarVisible = !sidebar.classList.contains('hidden');
-    onViewportOcclusionChange(
-      computeLeftOcclusionRatio(occlusionGeometry)
-    );
+    publishOcclusionGeometry();
+  };
+
+  const awaitSidebarTransitionEnd = () => {
+    transitionFrame = 0;
+    if (destroyed) return;
+    if (isSidebarTransitionRunning()) {
+      transitionFrame = ownerWindow.requestAnimationFrame(
+        awaitSidebarTransitionEnd
+      );
+      return;
+    }
+    publishViewportOcclusion();
   };
 
   const syncSidebarToggleState = () => {
     if (destroyed) return;
     const isHidden = sidebar.classList.contains('hidden');
+    // A hidden sidebar is off screen: none of its controls may take focus,
+    // be tabbed to, or be reached by assistive technology until it reopens.
+    sidebar.inert = isHidden;
     sidebarToggle.classList.toggle('sidebar-open', !isHidden);
     sidebarToggle.textContent = isHidden ? '☰' : '✕';
     sidebarToggle.setAttribute('aria-expanded', isHidden ? 'false' : 'true');
@@ -114,6 +162,11 @@ export function initSidebarControls({ dom, onViewportOcclusionChange }) {
     sidebar.classList.toggle('hidden');
     syncSidebarToggleState();
     publishViewportOcclusion();
+    if (transitionFrame === 0) {
+      transitionFrame = ownerWindow.requestAnimationFrame(
+        awaitSidebarTransitionEnd
+      );
+    }
   };
   sidebarToggle.addEventListener('click', handleSidebarToggle);
 
@@ -127,6 +180,7 @@ export function initSidebarControls({ dom, onViewportOcclusionChange }) {
     sidebar.classList.remove('resizing');
     ownerDocument.body.style.cursor = '';
     ownerDocument.body.style.userSelect = '';
+    ownerDocument.body.style.webkitUserSelect = '';
   };
 
   const updateSidebarWidth = (width) => {
@@ -158,7 +212,9 @@ export function initSidebarControls({ dom, onViewportOcclusionChange }) {
     startWidth = sidebar.offsetWidth;
     sidebar.classList.add('resizing');
     ownerDocument.body.style.cursor = 'ew-resize';
+    // Safari honours only the -webkit- property.
     ownerDocument.body.style.userSelect = 'none';
+    ownerDocument.body.style.webkitUserSelect = 'none';
     event.preventDefault();
   };
   sidebarResizeHandle.addEventListener(
@@ -199,6 +255,10 @@ export function initSidebarControls({ dom, onViewportOcclusionChange }) {
     destroy() {
       if (destroyed) return;
       destroyed = true;
+      if (transitionFrame !== 0) {
+        ownerWindow.cancelAnimationFrame(transitionFrame);
+        transitionFrame = 0;
+      }
       finishSidebarResize();
       sidebarToggle.removeEventListener('click', handleSidebarToggle);
       sidebarResizeHandle.removeEventListener(

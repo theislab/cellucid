@@ -8,77 +8,160 @@
 
 import { PlotFactory, PlotRegistry, BasePlot, COMMON_HOVER_STYLE } from '../plot-factory.js';
 import { PLOTLY_2D_SCATTER_TRACE_TYPE } from '../plotly-loader.js';
-import { filterFiniteNumbers, getFiniteMinMax, mean, std } from '../../shared/number-utils.js';
+import { adoptFiniteNumbers, finiteNumbers, mean } from '../../shared/number-utils.js';
+import { kernelDensityAt } from '../../compute/math-utils.js';
+import {
+  curveOf,
+  densityCurveOrPlan,
+  getBandwidthMultiplier,
+  planDensity
+} from '../density-curve.js';
+import { getComputeManager } from '../../compute/compute-manager.js';
+import { OperationType } from '../../compute/operations.js';
 import { escapeHtml } from '../../../utils/dom-utils.js';
 
 /**
- * Simple kernel density estimation using Gaussian kernel
- * @param {number[]} data - Data points
- * @param {number} bandwidth - Kernel bandwidth (or 'auto')
- * @param {number} nPoints - Number of points for the output curve
- * @returns {Object} { x: number[], y: number[] }
+ * Kernel terms below which a curve is summed on the calling thread: about
+ * 40 ms of work, within one main-thread task. Past it the sum is handed to
+ * the analysis workers even where that is not faster end to end (a
+ * 25,000-value page drew in 66 ms on the main thread and 105 ms through the
+ * workers), because the main thread stays free: a 100,000-value continuous
+ * page held it for 135 ms at the earlier threshold of 20 million terms.
  */
-function kernelDensity(data, bandwidth = 'auto', nPoints = 100) {
-  if (!data || data.length === 0) return { x: [], y: [] };
+const PARALLEL_MIN_KERNEL_TERMS = 3_000_000;
 
-  const validData = filterFiniteNumbers(data);
-  if (validData.length === 0) return { x: [], y: [] };
+/**
+ * Density curves already computed, per page-values array and bandwidth
+ * multiplier. A curve depends on nothing else, while the plot is redrawn for
+ * every option change — fill, mean line, log axes — and once more for CSV
+ * export; each redraw used to re-run the kernel sum, a full pass of 100
+ * kernel evaluations per cell. Page-data arrays are never edited once
+ * published, and the map holds them weakly.
+ * @type {WeakMap<ArrayLike<number>, Map<number, {x: number[], y: number[]}>>}
+ */
+const densityCurveCache = new WeakMap();
 
-  const n = validData.length;
-  const { min, max } = getFiniteMinMax(validData);
-  const range = max - min;
+/**
+ * Values in a page from which its density is also planned by an analysis
+ * worker: filtering, the bandwidth and the support count are passes over every
+ * value.
+ */
+const WORKER_MIN_VALUES = 200_000;
 
-  if (range === 0) return { x: [min], y: [1] };
+/**
+ * Each page's mean, as `ensurePageDensities` computed it for the mean line.
+ * @type {WeakMap<ArrayLike<number>, number>}
+ */
+const pageMeans = new WeakMap();
 
-  // Calculate bandwidth using Silverman's rule of thumb if auto
-  let h = bandwidth;
-  if (bandwidth === 'auto') {
-    const stdVal = std(validData);
-    h = 1.06 * stdVal * Math.pow(n, -0.2);
-    if (h <= 0 || !Number.isFinite(h)) h = range / 10;
+/** @returns {Map<number, {x: number[], y: number[]}>} */
+function curvesFor(pageValues) {
+  let curves = densityCurveCache.get(pageValues);
+  if (curves === undefined) {
+    curves = new Map();
+    densityCurveCache.set(pageValues, curves);
   }
+  return curves;
+}
 
-  // Generate evaluation points
-  const padding = h * 3;
-  const x = [];
-  const step = (range + 2 * padding) / (nPoints - 1);
-  for (let i = 0; i < nPoints; i++) x.push(min - padding + i * step);
+/**
+ * The density curve of a page's finite values, summed on this thread unless
+ * `ensurePageDensities` already computed it.
+ * @param {ArrayLike<number>} pageValues - A page's `values`, as published
+ * @param {number} bandwidthMult
+ * @returns {{x: number[], y: number[]}}
+ */
+function pageDensity(pageValues, bandwidthMult) {
+  const curves = curvesFor(pageValues);
+  let curve = curves.get(bandwidthMult);
+  if (curve === undefined) {
+    const plan = planDensity(finiteNumbers(pageValues), bandwidthMult);
+    curve = plan.curve ?? curveOf(
+      plan,
+      kernelDensityAt(plan.support, plan.weights, plan.x, plan.h, plan.n)
+    );
+    curves.set(bandwidthMult, curve);
+  }
+  return curve;
+}
 
-  // Evaluate density at each point (Gaussian kernel)
-  const y = x.map(xi => {
-    let sum = 0;
-    for (const d of validData) {
-      const u = (xi - d) / h;
-      sum += Math.exp(-0.5 * u * u) / Math.sqrt(2 * Math.PI);
+/**
+ * Compute every page's density curve before the plot is drawn. A large page's
+ * kernel sum (a hundred evaluations per distinct value: 1.4 s on the main
+ * thread for a million-cell continuous field) is split by evaluation point
+ * across the analysis workers; each point is the same `kernelDensityAt` loop
+ * wherever it runs, so the curve is identical to the one-thread sum.
+ *
+ * @param {Array<{values: ArrayLike<number>}>} pageData
+ * @param {number} bandwidthMult
+ */
+async function ensurePageDensities(pageData, bandwidthMult) {
+  const work = [];
+  const planned = [];
+  for (const pd of pageData) {
+    const curves = curvesFor(pd.values);
+    if (curves.has(bandwidthMult)) continue;
+    if (pd.values.length >= WORKER_MIN_VALUES) {
+      planned.push({ curves, pd });
+      continue;
     }
-    return sum / (n * h);
-  });
-
-  return { x, y };
-}
-
-/**
- * Get bandwidth multiplier from option
- */
-function getBandwidthMultiplier(bandwidth) {
-  if (bandwidth === 'narrow') return 0.5;
-  if (bandwidth === 'wide') return 2;
-  return 1;
-}
-
-/**
- * Calculate density curve for data with bandwidth multiplier
- */
-function calculateDensity(values, bandwidthMult) {
-  let { x, y } = kernelDensity(values, 'auto');
-  if (bandwidthMult !== 1 && values.length > 0) {
-    const stdVal = std(values);
-    const h = 1.06 * stdVal * Math.pow(values.length, -0.2) * bandwidthMult;
-    const recalc = kernelDensity(values, h);
-    x = recalc.x;
-    y = recalc.y;
+    const { mean: pageMean, curve, plan } = densityCurveOrPlan(
+      pd.values,
+      bandwidthMult,
+      PARALLEL_MIN_KERNEL_TERMS
+    );
+    pageMeans.set(pd.values, pageMean);
+    if (curve !== undefined) curves.set(bandwidthMult, curve);
+    else work.push({ curves, plan });
   }
-  return { x, y };
+  if (work.length === 0 && planned.length === 0) return;
+
+  const manager = getComputeManager();
+  await manager.init();
+  // A large page is planned (filtered, its bandwidth and grid chosen, its
+  // support counted) by a worker too, so no pass over it runs here.
+  await Promise.all(planned.map(async ({ curves, pd }) => {
+    const { mean: pageMean, curve, plan, finiteCount, finite } = await manager.execute(
+      OperationType.COMPUTE_DENSITY_PLAN,
+      {
+        values: ArrayBuffer.isView(pd.values) ? pd.values : Float64Array.from(pd.values),
+        bandwidthMult,
+        maxKernelTerms: PARALLEL_MIN_KERNEL_TERMS
+      },
+      { transfer: false }
+    );
+    adoptFiniteNumbers(pd.values, finiteCount, finite);
+    pageMeans.set(pd.values, pageMean);
+    if (curve !== undefined) {
+      if (!curves.has(bandwidthMult)) curves.set(bandwidthMult, curve);
+    } else {
+      work.push({ curves, plan });
+    }
+  }));
+  if (work.length === 0) return;
+
+  const workers = manager.getStatus().worker.stats?.poolSize ?? 1;
+  await Promise.all(work.map(async ({ curves, plan }) => {
+    const xs = Float64Array.from(plan.x);
+    const slices = Math.max(1, Math.min(workers, xs.length));
+    const size = Math.ceil(xs.length / slices);
+    const parts = await Promise.all(Array.from({ length: slices }, (_, slice) => (
+      manager.execute(
+        OperationType.COMPUTE_KERNEL_DENSITY,
+        {
+          support: plan.support,
+          weights: plan.weights,
+          xs: xs.slice(slice * size, (slice + 1) * size),
+          bandwidth: plan.h,
+          count: plan.n
+        },
+        { transfer: false }
+      )
+    )));
+    const density = new Float64Array(xs.length);
+    parts.forEach((part, slice) => density.set(part.density, slice * size));
+    if (!curves.has(bandwidthMult)) curves.set(bandwidthMult, curveOf(plan, density));
+  }));
 }
 
 const densityplotDefinition = {
@@ -118,8 +201,8 @@ const densityplotDefinition = {
 
     return PlotFactory.createTraces({
       pageData, options, layoutEngine, filterNumeric: true, minValues: 1,
-      traceBuilder: (pd, color, _i, _opts) => {
-        const { x, y } = calculateDensity(pd.values, bandwidthMult);
+      traceBuilder: (pd, color, i, _opts) => {
+        const { x, y } = pageDensity(pageData[i].values, bandwidthMult);
         if (x.length === 0) return null;
 
         // Cross-browser SVG density curve.
@@ -150,9 +233,12 @@ const densityplotDefinition = {
     if (options.showMean) {
       layout.shapes = [];
       pageData.forEach((pd, i) => {
-        const values = BasePlot.filterNumeric(pd.values);
-        if (values.length === 0) return;
-        const meanVal = mean(values);
+        let meanVal = pageMeans.get(pd.values);
+        if (meanVal === undefined) {
+          const values = finiteNumbers(pd.values);
+          meanVal = values.length === 0 ? NaN : mean(values);
+        }
+        if (Number.isNaN(meanVal)) return;
         const color = BasePlot.getPageColor(layoutEngine, pd.pageId, i);
         layout.shapes.push({
           type: 'line',
@@ -167,10 +253,12 @@ const densityplotDefinition = {
   },
 
   async render(pageData, options, container, layoutEngine) {
+    await ensurePageDensities(pageData, getBandwidthMultiplier(options.bandwidth));
     return PlotFactory.render({ definition: this, pageData, options, container, layoutEngine });
   },
 
   async update(figure, pageData, options, layoutEngine) {
+    await ensurePageDensities(pageData, getBandwidthMultiplier(options.bandwidth));
     return PlotFactory.update({ definition: this, figure, pageData, options, layoutEngine });
   },
 
@@ -179,10 +267,9 @@ const densityplotDefinition = {
     const rows = [];
 
     for (const pd of pageData) {
-      const values = BasePlot.filterNumeric(pd.values);
-      if (values.length === 0) continue;
+      const { x, y } = pageDensity(pd.values, bandwidthMult);
+      if (x.length === 0) continue;
 
-      const { x, y } = calculateDensity(values, bandwidthMult);
       for (let i = 0; i < x.length; i++) {
         rows.push({ page: pd.pageName, x: x[i].toFixed(4), density: y[i].toFixed(6) });
       }

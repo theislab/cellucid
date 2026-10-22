@@ -41,7 +41,7 @@
  * @param {number} bytes
  * @returns {number}
  */
-export function bytesToMB(bytes) {
+function bytesToMB(bytes) {
   return bytes / (1024 * 1024);
 }
 
@@ -122,9 +122,3 @@ export async function measureUserAgentSpecificMemory() {
     };
   }
 }
-
-export default {
-  bytesToMB,
-  getHeapMemoryUsage,
-  measureUserAgentSpecificMemory
-};

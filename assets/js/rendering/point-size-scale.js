@@ -39,7 +39,7 @@
  */
 
 /** The point size at slider position 0. The curve's anchor, not its minimum. */
-export const POINT_SIZE_AT_SLIDER_ZERO = 0.25;
+const POINT_SIZE_AT_SLIDER_ZERO = 0.25;
 
 /** The point size at slider position 100. */
 export const MAXIMUM_POINT_SIZE = 200;
@@ -51,7 +51,7 @@ export const POINT_SIZE_SLIDER_MINIMUM = -24;
 export const POINT_SIZE_SLIDER_MAXIMUM = 100;
 
 /** The slider's step, in slider positions. */
-export const POINT_SIZE_SLIDER_STEP = 0.5;
+const POINT_SIZE_SLIDER_STEP = 0.5;
 
 /**
  * The cell count and size that fix the automatic curve.
@@ -60,8 +60,8 @@ export const POINT_SIZE_SLIDER_STEP = 0.5;
  * for a dataset of around 400,000 cells, and scales in both directions from
  * there.
  */
-export const POINT_SIZE_REFERENCE_CELLS = 100_000;
-export const POINT_SIZE_REFERENCE_SIZE = 1.5;
+const POINT_SIZE_REFERENCE_CELLS = 100_000;
+const POINT_SIZE_REFERENCE_SIZE = 1.5;
 
 /**
  * The largest size the automatic curve may choose.

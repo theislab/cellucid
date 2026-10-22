@@ -9,13 +9,10 @@
  * - Use the standard figure modal grid with interactive plot options
  */
 
+import { createStatusLine } from '../../../ui/components/controls.js';
+import { formatCount } from '../../../ui/components/display-format.js';
 import { FormBasedAnalysisUI } from './base/form-based-analysis.js';
-import { PlotRegistry } from '../../shared/plot-registry-utils.js';
-import {
-  createFormRow,
-  createFormSelect,
-  NONE_VALUE
-} from '../../shared/dom-utils.js';
+import { createSelectField, NONE_VALUE } from '../../shared/dom-utils.js';
 import { correlationResultsToCSV, downloadCSV } from '../../shared/analysis-utils.js';
 import { createVariableSelectorComponent } from '../shared/variable-selector.js';
 import { PageSelectorComponent } from '../shared/page-selector.js';
@@ -143,10 +140,6 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
     return 'Correlation';
   }
 
-  _getDescription() {
-    return 'Compute correlation between two variables across selected pages.';
-  }
-
   _getClassName() {
     return 'correlation-analysis';
   }
@@ -242,6 +235,7 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
 
     const requestId = this._startAnalysisRequest(scheduledRequestId);
     if (requestId === null) return;
+    const releaseBusy = this._claimBusy();
     try {
       const result = await this._runAnalysisImpl(formValues, requestId);
 
@@ -256,6 +250,7 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
       console.error('[CorrelationAnalysisUI] Analysis failed:', err);
       await this._showError('Analysis failed: ' + err.message, requestId);
     } finally {
+      releaseBusy();
       this._finishAnalysisRequest(requestId);
     }
   }
@@ -279,11 +274,10 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
       return false;
     }
     if (this._resultContainer) {
-      this._resultContainer.classList.remove('hidden');
-      const errorEl = document.createElement('div');
-      errorEl.className = 'analysis-error';
-      errorEl.textContent = message;
-      this._resultContainer.appendChild(errorEl);
+      this._resultContainer.hidden = false;
+      this._resultContainer.appendChild(
+        createStatusLine({ tone: 'danger', text: message }).root
+      );
     }
     this._notifications?.error?.(message, { category: 'analysis' });
     return true;
@@ -299,19 +293,21 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
    * @override
    */
   onHighlightChanged() {
+    // This mode recalculates by itself, so a highlight change re-runs it
+    // (deferred while the panel is hidden) instead of discarding the result
+    // the way the run-button forms do.
+    this._applyHighlightChangeWhenShown();
+  }
+
+  /**
+   * @override
+   */
+  _applyHighlightChange() {
     this._updatePageSelectorCounts();
 
     if (this._canRunAnalysis()) {
       this._scheduleUpdate();
     }
-  }
-
-  /**
-   * Override to use PageSelectorComponent's updateCounts method
-   * @override
-   */
-  _updatePageSelectorCounts() {
-    this._pageSelector?.updateCounts();
   }
 
   /**
@@ -324,14 +320,14 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
     const carriedValues = this._captureFormControlValues();
     this._formContainer.innerHTML = '';
 
-    // Validate page requirements
-    const validation = this.validatePages(this._selectedPages);
+    // Validate requirements
+    const validation = this.validateRequirements(this._selectedPages);
 
     if (!validation.valid) {
-      const notice = document.createElement('div');
-      notice.className = 'analysis-notice';
-      notice.textContent = validation.error || this.getRequirementText();
-      this._formContainer.appendChild(notice);
+      this._formContainer.appendChild(createStatusLine({
+        tone: 'warning',
+        text: validation.error || this.getRequirementText()
+      }).root);
       return;
     }
 
@@ -370,7 +366,7 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
       container: xContainer,
       allowedTypes: ['continuous', 'gene'],
       idPrefix: this._xIdPrefix,
-      typeLabel: 'X Axis Variable:',
+      typeLabel: 'X axis variable',
       onVariableChange: () => this._scheduleUpdate()
     });
 
@@ -385,7 +381,7 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
       container: yContainer,
       allowedTypes: ['continuous', 'gene'],
       idPrefix: this._yIdPrefix,
-      typeLabel: 'Y Axis Variable:',
+      typeLabel: 'Y axis variable',
       onVariableChange: () => this._scheduleUpdate()
     });
 
@@ -396,12 +392,16 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
     this._renderColorBySelector(wrapper);
 
     // Correlation method selector
-    const methodSelect = createFormSelect('method', [
-      { value: 'pearson', label: 'Pearson (linear)', selected: true },
-      { value: 'spearman', label: 'Spearman (rank)' }
-    ]);
-    methodSelect.addEventListener('change', () => this._scheduleUpdate());
-    wrapper.appendChild(createFormRow('Correlation method:', methodSelect));
+    wrapper.appendChild(createSelectField({
+      label: 'Correlation method',
+      name: 'method',
+      tip: 'correlation-method',
+      options: [
+        { value: 'pearson', label: 'Pearson (linear)', selected: true },
+        { value: 'spearman', label: 'Spearman (rank)' }
+      ],
+      onChange: () => this._scheduleUpdate()
+    }).root);
   }
 
   /**
@@ -440,7 +440,7 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
         : undefined,
       includeDerivedPages: true,
       getCellCountForPageId: (pageId) => this.dataLayer.getCellCountForPageId(pageId),
-      label: 'Compare pages:'
+      label: 'Compare pages'
     });
     this._selectedPages = this._pageSelector.getSelectedPages();
     this._currentConfig.pages = [...this._selectedPages];
@@ -460,22 +460,22 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
 
     if (categoricalVars.length === 0) return;
 
-    const colorBySelect = createFormSelect('colorBy', [
-      { value: NONE_VALUE, label: 'None (color by page)', selected: !this._colorByVariable },
-      ...categoricalVars.map(v => ({
-        value: v.key,
-        label: v.key,
-        selected: this._colorByVariable === v.key
-      }))
-    ]);
-
-    colorBySelect.addEventListener('change', () => {
-      const value = colorBySelect.value;
-      this._colorByVariable = (value && value !== NONE_VALUE) ? value : null;
-      this._scheduleUpdate();
-    });
-
-    wrapper.appendChild(createFormRow('Color by:', colorBySelect));
+    wrapper.appendChild(createSelectField({
+      label: 'Color by',
+      name: 'colorBy',
+      options: [
+        { value: NONE_VALUE, label: 'None (color by page)', selected: !this._colorByVariable },
+        ...categoricalVars.map(v => ({
+          value: v.key,
+          label: v.key,
+          selected: this._colorByVariable === v.key
+        }))
+      ],
+      onChange: value => {
+        this._colorByVariable = (value && value !== NONE_VALUE) ? value : null;
+        this._scheduleUpdate();
+      }
+    }).root);
   }
 
   /**
@@ -656,7 +656,7 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
   _renderModalStats(container) {
     const results = this._lastResult?.data;
     if (!Array.isArray(results) || results.length === 0) {
-      container.innerHTML = '<p class="modal-stats-placeholder">Statistics not available</p>';
+      container.innerHTML = '<p class="empty-state">Statistics not available</p>';
       return;
     }
 
@@ -682,8 +682,8 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
       const r2Val = isFiniteNumber(r?.rSquared) ? r.rSquared.toFixed(4) : 'N/A';
       const pVal = isFiniteNumber(r?.pValue) ? r.pValue.toExponential(3) : 'N/A';
       const nVal = typeof r?.n === 'number'
-        ? r.n.toLocaleString()
-        : (Array.isArray(r?.xValues) ? r.xValues.length.toLocaleString() : 'N/A');
+        ? formatCount(r.n)
+        : (Array.isArray(r?.xValues) ? formatCount(r.xValues.length) : 'N/A');
 
       const tr = document.createElement('tr');
 
@@ -717,11 +717,9 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
   _renderModalAnnotations(container) {
     const results = this._lastResult?.data;
     if (!Array.isArray(results) || results.length === 0) {
-      container.innerHTML = '<p class="modal-annotations-placeholder">No correlation results</p>';
+      container.innerHTML = '<p class="empty-state">No correlation results</p>';
       return;
     }
-
-    const method = this._lastResult?.metadata?.method || 'pearson';
 
     container.innerHTML = '';
 
@@ -805,11 +803,6 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
 
     table.appendChild(tbody);
     container.appendChild(table);
-
-    const note = document.createElement('p');
-    note.className = 'interpretation-note';
-    note.textContent = `Interpreting ${method} correlation: |r| ≥ 0.8 (very strong), ≥ 0.6 (strong), ≥ 0.4 (moderate), ≥ 0.2 (weak).`;
-    container.appendChild(note);
   }
 
   _exportModalCSV() {
@@ -1004,5 +997,3 @@ export function createCorrelationAnalysisUI(options) {
   ui.init(options.container);
   return ui;
 }
-
-export default CorrelationAnalysisUI;

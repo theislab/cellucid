@@ -1,7 +1,7 @@
 // Dockable accordions: drag a section header to tear it off into a floating window.
 // REDESIGN v2: Drag ghost pattern for zero-lag dragging.
 
-import { clampFloatingPosition } from './dockable-accordions/geometry.js';
+import { clampFloatingPosition, clearOfOpenHeaders } from './dockable-accordions/geometry.js';
 import { StyleManager } from '../utils/style-manager.js';
 import { isFiniteNumber } from './utils/number-utils.js';
 import { createAccordionInteractions } from './dockable-accordions/interactions.js';
@@ -52,11 +52,52 @@ function readLayer(element) {
 }
 
 /**
+ * The frame a panel stands in.
+ *
+ * A `<summary>` is itself the disclosure button, so the window controls a panel
+ * carries in its header (undock, dock, copy, close) cannot live inside it: a
+ * button nested in a button is announced badly, and its clicks and keys reach
+ * the toggle as well. They cannot live elsewhere in the `<details>` either,
+ * because a closed `<details>` renders nothing but its summary — and a closed
+ * panel still has to be undockable, a closed floating panel still dockable.
+ *
+ * So every panel is a frame: an `.accordion-panel` holding an
+ * `.accordion-panel-actions` bar and the `<details>`, with the bar laid over
+ * the right end of the summary row (`css/components/_accordion.css`). The frame
+ * is the unit that floats — it carries `accordion-floating`, the `--pos-*` box
+ * and `--z-layer`, and it is what moves between the sidebar and the floating
+ * root. The `<details>` keeps the panel's identity (its id), its open state and
+ * its card.
+ *
+ * The frame is read off the DOM rather than remembered, so nothing here can
+ * disagree with what the page shows.
+ *
+ * @param {HTMLElement} details
+ * @returns {HTMLElement|null}
+ */
+function panelFrame(details) {
+  const frame = details?.parentElement ?? null;
+  return frame !== null && frame.classList.contains('accordion-panel')
+    ? frame
+    : null;
+}
+
+/**
+ * The header action bar of a frame.
+ *
+ * @param {HTMLElement} frame
+ * @returns {HTMLElement|null}
+ */
+function panelActions(frame) {
+  return frame.querySelector(':scope > .accordion-panel-actions');
+}
+
+/**
  * Whether this panel is floating.
  *
- * The class is the owner. The stylesheet keys the entire floating presentation
- * off it, and the session contributor reads it as the truth about what is in
- * the floating root (`session/contributors/dockable-layout.js`). A
+ * The frame's class is the owner. The stylesheet keys the entire floating
+ * presentation off it, and the session contributor reads it as the truth about
+ * what is in the floating root (`session/contributors/dockable-layout.js`). A
  * `state.isFloating` field beside it was a second copy of the same fact, and
  * `unregister()` could drop the record while the class stayed on the element —
  * leaving a panel that was visibly floating and that `dock()` refused to bring
@@ -66,7 +107,66 @@ function readLayer(element) {
  * @returns {boolean}
  */
 function isFloating(details) {
-  return details.classList.contains('accordion-floating');
+  return panelFrame(details)?.classList.contains('accordion-floating') === true;
+}
+
+/**
+ * Run the frame's own keyframe animation that `className` names, and drop the
+ * class once that animation is over.
+ *
+ * `animationend` bubbles, and the card inside the frame runs a shadow
+ * animation of its own, so only an event whose target is the frame itself
+ * ends it; a `{ once: true }` listener took whichever event came first, a
+ * descendant's included. A cancelled animation (a dock replacing the lift)
+ * ends it as well, so the class never outlives the motion it stands for.
+ *
+ * @param {HTMLElement} frame
+ * @param {string} className
+ */
+function playFrameAnimation(frame, className) {
+  frame.classList.add(className);
+  const finish = event => {
+    if (event.target !== frame) return;
+    frame.classList.remove(className);
+    frame.removeEventListener('animationend', finish);
+    frame.removeEventListener('animationcancel', finish);
+  };
+  frame.addEventListener('animationend', finish);
+  frame.addEventListener('animationcancel', finish);
+}
+
+/**
+ * Stand a panel in its frame, building the frame the first time.
+ *
+ * The frame takes the panel's place in the DOM, so a docked panel keeps its
+ * position in the sidebar and a window built into the floating root stays
+ * there.
+ *
+ * @param {HTMLElement} details
+ * @returns {HTMLElement}
+ */
+function ensurePanelFrame(details) {
+  const existing = panelFrame(details);
+  if (existing !== null) {
+    if (panelActions(existing) === null) {
+      throw new TypeError('Accordion panel frame is missing its header action bar.');
+    }
+    return existing;
+  }
+  const parent = details.parentElement;
+  if (parent === null) {
+    throw new TypeError('An accordion panel must be in the document to be framed.');
+  }
+  const frame = document.createElement('div');
+  frame.className = 'accordion-panel';
+  const actions = document.createElement('div');
+  actions.className = 'accordion-panel-actions';
+  parent.insertBefore(frame, details);
+  // The bar comes first so its controls are reached by Tab before the panel's
+  // own contents, which can be long; each control names its panel.
+  frame.appendChild(actions);
+  frame.appendChild(details);
+  return frame;
 }
 
 function ensureFloatingRoot() {
@@ -110,7 +210,7 @@ export function initDockableAccordions({ sidebar } = {}) {
   }
 
   /**
-   * The highest layer any *other* floating panel declares.
+   * The highest layer any *other* floating frame declares.
    *
    * Analysis windows share the floating root with torn-off sidebar panels, so
    * they share one stack; asking the root is what keeps both kinds ordered
@@ -130,25 +230,19 @@ export function initDockableAccordions({ sidebar } = {}) {
   }
 
   /**
-   * Put this panel above every other floating panel.
+   * Put this panel's frame above every other floating frame.
    *
    * A panel that is already above all of them is left untouched, so repeatedly
    * clicking inside the front window writes nothing and the layer numbers stay
    * bounded by the number of panels instead of by the number of clicks.
    *
-   * @param {HTMLElement} details
+   * @param {HTMLElement} frame
    */
-  function raiseToTop(details) {
-    const highest = highestLayerBelow(details);
-    const current = readLayer(details);
+  function raiseToTop(frame) {
+    const highest = highestLayerBelow(frame);
+    const current = readLayer(frame);
     if (current !== null && current > highest) return;
-    StyleManager.setLayer(details, highest + 1);
-  }
-
-  function setFloating(details, floating) {
-    details.classList.toggle('accordion-floating', floating);
-    const summary = details.querySelector(':scope > summary');
-    if (summary) syncPanelWindowButtons(summary, details);
+    StyleManager.setLayer(frame, highest + 1);
   }
 
   function panelTitle(summary) {
@@ -170,69 +264,71 @@ export function initDockableAccordions({ sidebar } = {}) {
   // the only place it can go: this is the degenerate case of the shared
   // "pick up, aim, drop" grammar (see `ui/keyboard-move.js`) where there is one
   // destination and the control commits on activation.
+  //
+  // Both buttons live in the frame's header action bar, beside the summary
+  // rather than inside it (see `panelFrame`). Which one shows is the
+  // stylesheet's call, keyed off the frame's `accordion-floating` class.
   // ═══════════════════════════════════════════════════════════════════════════
 
-  function ensurePanelButton(summary, selector, className, label, signal, onActivate) {
-    const existing = summary.querySelector(selector);
+  function ensurePanelButton(actions, selector, className, label, signal, onActivate) {
+    const existing = actions.querySelector(selector);
     if (existing) return existing;
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.className = className;
     btn.setAttribute('aria-label', label);
     btn.title = label;
-    btn.addEventListener('click', (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      onActivate();
-    }, { signal });
-    summary.appendChild(btn);
+    btn.addEventListener('click', () => onActivate(), { signal });
+    actions.appendChild(btn);
     return btn;
   }
 
-  function syncPanelWindowButtons(summary, details) {
+  function removePanelWindowButtons(actions) {
+    actions.querySelector('.accordion-dock-btn')?.remove();
+    actions.querySelector('.accordion-undock-btn')?.remove();
+  }
+
+  function syncPanelWindowButtons(summary, details, actions) {
     const state = getState(details);
     if (!state.dockable) {
-      summary.querySelector('.accordion-dock-btn')?.remove();
-      summary.querySelector('.accordion-undock-btn')?.remove();
+      removePanelWindowButtons(actions);
       return;
     }
 
     // `.accordion-copy-btn` is this app's existing "show this panel as its own
     // floating window" control — the analysis accordions already use it for
     // exactly that, and it carries the ⧉ glyph. `.accordion-undock-btn` is the
-    // behavioural hook. Both stylesheet rules hide the button unless its panel
-    // is already floating, which is the state this button exists to leave, so
-    // the module states its own visibility here. The durable home for those two
-    // declarations is `assets/css/components/_accordion.css`.
+    // behavioural hook.
     const signal = state.controller?.signal;
-    const undockBtn = ensurePanelButton(
-      summary,
+    const title = panelTitle(summary);
+    ensurePanelButton(
+      actions,
       '.accordion-undock-btn',
       'accordion-copy-btn accordion-undock-btn',
-      'Undock panel into a floating window',
+      `Undock ${title} panel into a floating window`,
       signal,
       () => undockFromButton(summary, details)
     );
-    const dockBtn = ensurePanelButton(
-      summary,
+    ensurePanelButton(
+      actions,
       '.accordion-dock-btn',
       'accordion-dock-btn',
-      'Dock panel back into sidebar',
+      `Dock ${title} panel back into sidebar`,
       signal,
       () => dockFromButton(summary, details)
     );
-    const floating = isFloating(details);
-    undockBtn.style.display = floating ? 'none' : 'inline-flex';
-    dockBtn.style.display = floating ? 'inline-flex' : 'none';
   }
 
   function undockFromButton(summary, details) {
     const state = getState(details);
     if (isFloating(details) || !state.dockable) return;
-    const rect = details.getBoundingClientRect();
+    const frame = panelFrame(details);
+    const rect = frame.getBoundingClientRect();
     const sidebarRect = sidebar.getBoundingClientRect();
-    undock(details, sidebarRect.right + 24, rect.top);
-    summary.querySelector('.accordion-dock-btn')?.focus();
+    undock(details, sidebarRect.right + 24, rect.top, { besideOpenWindows: true });
+    // The control that was activated is hidden now; focus moves to the one
+    // that reverses it, in the same bar.
+    panelActions(frame)?.querySelector('.accordion-dock-btn')?.focus();
     announceKeyboardMove(
       document,
       `${panelTitle(summary)} is now a floating window. `
@@ -244,7 +340,7 @@ export function initDockableAccordions({ sidebar } = {}) {
     const state = getState(details);
     if (!isFloating(details) || !state.dockable) return;
     dock(details);
-    summary.querySelector('.accordion-undock-btn')?.focus();
+    panelActions(panelFrame(details))?.querySelector('.accordion-undock-btn')?.focus();
     announceKeyboardMove(
       document,
       `${panelTitle(summary)} is docked in the sidebar again.`
@@ -256,9 +352,16 @@ export function initDockableAccordions({ sidebar } = {}) {
   // ═══════════════════════════════════════════════════════════════════════════
 
   function applyFloatingLayout(details, targetLeft, targetTop, options = {}) {
-    const { preferredSize = null, constraints = null } = options;
+    // `besideOpenWindows`: a window the user opens now (not one restored to a
+    // saved place) keeps clear of the sidebar where the viewport allows and
+    // never covers the header of a window already open.
+    const { preferredSize = null, constraints = null, besideOpenWindows = false } = options;
     const state = getState(details);
     if (isFloating(details)) return;
+    const frame = panelFrame(details);
+    if (frame === null) {
+      throw new TypeError('Only a registered accordion panel can float.');
+    }
 
     // Where the panel sits right now is what says whether it has a slot to go
     // back to: a docked accordion is a child of the sidebar, and a window built
@@ -268,7 +371,7 @@ export function initDockableAccordions({ sidebar } = {}) {
     // panel that is standing in the sidebar, and passing "no placeholder"
     // because that path happens to share an entry point with analysis windows
     // dropped the panel at the end of the sidebar the first time it was docked.
-    const dockHome = details.parentElement;
+    const dockHome = frame.parentElement;
     const hasDockHome = dockHome !== null && dockHome !== floatingRoot;
 
     // Measuring forces a layout, and both callers that matter — a session
@@ -276,7 +379,7 @@ export function initDockableAccordions({ sidebar } = {}) {
     // the panel is measured only for the questions its own measurements answer.
     let measuredRect = null;
     const measure = () => {
-      if (measuredRect === null) measuredRect = details.getBoundingClientRect();
+      if (measuredRect === null) measuredRect = frame.getBoundingClientRect();
       return measuredRect;
     };
     const summary = details.querySelector(':scope > summary');
@@ -303,27 +406,56 @@ export function initDockableAccordions({ sidebar } = {}) {
     const naturalHeight = headerHeight + contentScrollHeight + 24;
     const requestedHeight = isFiniteNumber(preferredSize?.height) ? preferredSize.height : naturalHeight;
 
+    // A new window goes beside a visible sidebar, narrowed (never below its
+    // minimum) when the viewport leaves less room than it asked for.
+    const sidebarRight = besideOpenWindows && !sidebar.classList.contains('hidden')
+      ? sidebar.getBoundingClientRect().right
+      : 0;
+    const roomBesideSidebar = viewportWidth - sidebarRight - 16;
+    const widthLimit = roomBesideSidebar >= minWidth
+      ? Math.min(viewportMaxWidth, roomBesideSidebar)
+      : viewportMaxWidth;
+
     // Calculate panel dimensions
     const initialWidth = Math.min(
       Math.max(minWidth, requestedWidth),
-      Math.min(maxWidth, viewportMaxWidth)
+      Math.min(maxWidth, widthLimit)
     );
-    const initialHeight = Math.min(
+    let initialHeight = Math.min(
       Math.max(minHeight, requestedHeight),
       Math.min(maxHeight, viewportMaxHeight)
     );
-    const contentMaxHeight = Math.max(0, initialHeight - headerHeight - 12);
 
     // Clamp position through the one owner, so tearing off, dragging and a
     // viewport resize cannot disagree about where a panel may sit.
-    const { x: clampedLeft, y: clampedTop } = clampFloatingPosition({
-      left: targetLeft,
+    const placement = {
+      left: besideOpenWindows && roomBesideSidebar >= minWidth
+        ? Math.max(targetLeft, sidebarRight + 8)
+        : targetLeft,
       top: targetTop,
       width: initialWidth,
       height: initialHeight,
       viewportWidth,
       viewportHeight
-    });
+    };
+    let clampedLeft;
+    let clampedTop;
+    if (besideOpenWindows) {
+      const placed = clearOfOpenHeaders({
+        ...placement,
+        minHeight,
+        headers: [...floatingRoot.querySelectorAll(
+          ':scope > .accordion-floating > .accordion-section > summary'
+        )].map(header => header.getBoundingClientRect()),
+        step: Math.max(headerHeight, 24)
+      });
+      clampedLeft = placed.x;
+      clampedTop = placed.y;
+      initialHeight = placed.height;
+    } else {
+      ({ x: clampedLeft, y: clampedTop } = clampFloatingPosition(placement));
+    }
+    const contentMaxHeight = Math.max(0, initialHeight - headerHeight - 12);
 
     // Store position
     state.floatLeft = clampedLeft;
@@ -337,23 +469,22 @@ export function initDockableAccordions({ sidebar } = {}) {
       }
       state.dockPlaceholder.style.height = `${measure().height}px`;
       state.dockPlaceholder.hidden = false;
-      dockHome.insertBefore(state.dockPlaceholder, details);
+      dockHome.insertBefore(state.dockPlaceholder, frame);
     } else {
       state.dockPlaceholder?.remove();
       state.dockPlaceholder = null;
     }
 
     // Apply floating styles
-    setFloating(details, true);
-    StyleManager.setPosition(details, {
+    frame.classList.add('accordion-floating');
+    StyleManager.setPosition(frame, {
       x: clampedLeft,
       y: clampedTop,
       width: Math.round(initialWidth),
       height: Math.round(initialHeight),
     });
-    raiseToTop(details);
-    StyleManager.setVariable(details, '--floating-header-height', `${headerHeight}px`);
-    StyleManager.setVariable(details, '--floating-content-max-height', `${contentMaxHeight}px`);
+    raiseToTop(frame);
+    StyleManager.setVariable(frame, '--floating-content-max-height', `${contentMaxHeight}px`);
 
     // Set content scroll containment
     if (content) {
@@ -363,7 +494,7 @@ export function initDockableAccordions({ sidebar } = {}) {
     }
 
     // Move to floating root
-    floatingRoot.appendChild(details);
+    floatingRoot.appendChild(frame);
     details.open = true;
 
     state.baseFloatSize = { width: initialWidth, height: initialHeight };
@@ -371,13 +502,9 @@ export function initDockableAccordions({ sidebar } = {}) {
       min: minWidth,
       max: isFiniteNumber(constraints?.maxWidth) ? constraints.maxWidth : (initialWidth * FLOAT_MAX_SCALE)
     };
-    details.style.visibility = '';
 
     // Trigger lift animation
-    details.classList.add('floating-enter');
-    details.addEventListener('animationend', () => {
-      details.classList.remove('floating-enter');
-    }, { once: true });
+    playFrameAnimation(frame, 'floating-enter');
 
     interactions.syncResizeHandles(details, {
       left: clampedLeft,
@@ -395,10 +522,10 @@ export function initDockableAccordions({ sidebar } = {}) {
     }
   }
 
-  function undock(details, targetLeft, targetTop) {
+  function undock(details, targetLeft, targetTop, options = {}) {
     if (isFloating(details)) return;
     if (!getState(details).dockable) return;
-    applyFloatingLayout(details, targetLeft, targetTop);
+    applyFloatingLayout(details, targetLeft, targetTop, options);
   }
 
   function floatPanel(details, targetLeft, targetTop, options = {}) {
@@ -431,28 +558,24 @@ export function initDockableAccordions({ sidebar } = {}) {
     const parent = placeholder?.parentElement ?? null;
     const accordion = parent?.closest?.('.accordion') || sidebar.querySelector('.accordion');
 
+    const frame = panelFrame(details);
     const targetParent = parent || accordion || sidebar;
     if (targetParent) {
       const beforeNode = placeholder?.parentElement === targetParent ? placeholder : null;
-      if (beforeNode) targetParent.insertBefore(details, beforeNode);
-      else targetParent.appendChild(details);
+      if (beforeNode) targetParent.insertBefore(frame, beforeNode);
+      else targetParent.appendChild(frame);
     }
 
     placeholder?.remove();
     state.dockPlaceholder = null;
 
-    setFloating(details, false);
-    details.classList.remove('dragging');
-    StyleManager.clearPosition(details);
-    StyleManager.removeVariable(details, '--z-layer');
-    StyleManager.removeVariable(details, '--floating-header-height');
-    StyleManager.removeVariable(details, '--floating-content-max-height');
+    frame.classList.remove('accordion-floating', 'dragging');
+    StyleManager.clearPosition(frame);
+    StyleManager.removeVariable(frame, '--z-layer');
+    StyleManager.removeVariable(frame, '--floating-content-max-height');
 
     // Trigger settle animation
-    details.classList.add('dock-settle');
-    details.addEventListener('animationend', () => {
-      details.classList.remove('dock-settle');
-    }, { once: true });
+    playFrameAnimation(frame, 'dock-settle');
   }
 
   const interactions = createAccordionInteractions({
@@ -460,6 +583,7 @@ export function initDockableAccordions({ sidebar } = {}) {
     StyleManager,
     isFiniteNumber,
     getState,
+    panelFrame,
     isFloating,
     raiseToTop,
     undock,
@@ -477,12 +601,26 @@ export function initDockableAccordions({ sidebar } = {}) {
   // Initialize
   // ═══════════════════════════════════════════════════════════════════════════
 
+  /**
+   * Make a panel dockable, floatable and draggable.
+   *
+   * `options.actions` are the caller's own header controls (an analysis
+   * window's copy and close buttons), placed in the frame's header action bar
+   * beside the summary. They stay with the frame for its lifetime.
+   *
+   * @param {HTMLElement} details
+   * @param {{ dockable?: boolean, actions?: Element[] }} [options]
+   */
   function register(details, options = {}) {
     if (!(details instanceof HTMLElement)) return;
     if (!details.matches?.('details.accordion-section')) return;
 
     const summary = details.querySelector(':scope > summary');
     if (!summary) return;
+
+    const frame = ensurePanelFrame(details);
+    const actions = panelActions(frame);
+    for (const action of options.actions ?? []) actions.appendChild(action);
 
     const state = getState(details);
     state.dockable = options.dockable !== false;
@@ -498,7 +636,8 @@ export function initDockableAccordions({ sidebar } = {}) {
       state.controller = new AbortController();
       const { signal } = state.controller;
 
-      details.addEventListener('pointerdown', () => {
+      // On the frame, so a press on a header action raises its window too.
+      frame.addEventListener('pointerdown', () => {
         const s = stateByDetails.get(details);
         if (!s) return;
         // A suppression armed by the previous gesture belongs to that gesture.
@@ -506,7 +645,7 @@ export function initDockableAccordions({ sidebar } = {}) {
         // it survived to swallow the user's next real click on the header.
         s.suppressNextClick = false;
         if (!isFloating(details)) return;
-        raiseToTop(details);
+        raiseToTop(frame);
       }, { capture: true, signal });
 
       // Suppress click after drag
@@ -523,7 +662,7 @@ export function initDockableAccordions({ sidebar } = {}) {
       interactions.setupFloatingDrag(summary, details, signal);
     }
 
-    syncPanelWindowButtons(summary, details);
+    syncPanelWindowButtons(summary, details, actions);
     interactions.ensureResizeHandles(details, state.controller.signal);
   }
 
@@ -534,11 +673,14 @@ export function initDockableAccordions({ sidebar } = {}) {
     try { state.dockPlaceholder?.remove(); } catch {}
     // The handle and the two window buttons are this module's own elements and
     // carry its listeners; leaving them behind would leave a re-registered
-    // panel with controls nothing is listening to.
+    // panel with controls nothing is listening to. The frame itself stays: a
+    // floating panel is floating by its frame, and must still be dockable.
     try { interactions.removeResizeHandles(details); } catch {}
-    const summary = details.querySelector?.(':scope > summary');
-    try { summary?.querySelector('.accordion-undock-btn')?.remove(); } catch {}
-    try { summary?.querySelector('.accordion-dock-btn')?.remove(); } catch {}
+    const frame = panelFrame(details);
+    const actions = frame === null ? null : panelActions(frame);
+    if (actions !== null) {
+      try { removePanelWindowButtons(actions); } catch {}
+    }
     stateByDetails.delete(details);
   }
 
@@ -559,32 +701,44 @@ export function initDockableAccordions({ sidebar } = {}) {
   // This module owns the floating root for the life of the page and exposes no
   // teardown, so the listener is page-scoped too rather than carrying a
   // controller nothing would ever abort.
+  // A window resize fires many times per frame; the panels are re-clamped
+  // once per frame. Every panel is measured before any is moved, so one
+  // panel's write never forces the next panel's read to lay out again.
+  let resizeFrame = null;
   window.addEventListener('resize', () => {
-    const viewportWidth = window.innerWidth;
-    const viewportHeight = window.innerHeight;
-    for (const details of [...floatingRoot.children]) {
-      const state = stateByDetails.get(details);
-      if (!state) continue;
-      const rect = details.getBoundingClientRect();
-      const clamped = clampFloatingPosition({
-        left: state.floatLeft,
-        top: state.floatTop,
-        width: rect.width,
-        height: rect.height,
-        viewportWidth,
-        viewportHeight
-      });
-      if (clamped.x === state.floatLeft && clamped.y === state.floatTop) continue;
-      state.floatLeft = clamped.x;
-      state.floatTop = clamped.y;
-      StyleManager.setPosition(details, { x: clamped.x, y: clamped.y });
-    }
+    if (resizeFrame !== null) return;
+    resizeFrame = requestAnimationFrame(() => {
+      resizeFrame = null;
+      const viewportWidth = window.innerWidth;
+      const viewportHeight = window.innerHeight;
+      const measured = [];
+      for (const frame of [...floatingRoot.children]) {
+        const details = frame.querySelector(':scope > details.accordion-section');
+        const state = details === null ? undefined : stateByDetails.get(details);
+        if (!state) continue;
+        measured.push({ frame, state, rect: frame.getBoundingClientRect() });
+      }
+      for (const { frame, state, rect } of measured) {
+        const clamped = clampFloatingPosition({
+          left: state.floatLeft,
+          top: state.floatTop,
+          width: rect.width,
+          height: rect.height,
+          viewportWidth,
+          viewportHeight
+        });
+        if (clamped.x === state.floatLeft && clamped.y === state.floatTop) continue;
+        state.floatLeft = clamped.x;
+        state.floatTop = clamped.y;
+        StyleManager.setPosition(frame, { x: clamped.x, y: clamped.y });
+      }
+    });
   });
 
   return {
     dock,
     undock: (details) => {
-      const rect = details.getBoundingClientRect();
+      const rect = panelFrame(details).getBoundingClientRect();
       undock(details, rect.left, rect.top);
     },
     float: (details, leftOrOptions, top, options = {}) => {
@@ -593,7 +747,7 @@ export function initDockableAccordions({ sidebar } = {}) {
       // both, and neither should pay for a measurement it throws away.
       let measuredRect = null;
       const measure = () => {
-        if (measuredRect === null) measuredRect = details.getBoundingClientRect();
+        if (measuredRect === null) measuredRect = panelFrame(details).getBoundingClientRect();
         return measuredRect;
       };
       if (isFiniteNumber(leftOrOptions)) {
@@ -615,6 +769,7 @@ export function initDockableAccordions({ sidebar } = {}) {
     },
     register,
     unregister,
+    panelFrame,
     floatingRoot
   };
 }

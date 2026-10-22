@@ -4,6 +4,8 @@
  * @module ui/category-builder/intersections
  */
 
+import { formatCells } from '../components/display-format.js';
+
 /**
  * Produce a default label for an intersection bitmask, e.g. "A & B".
  * @param {number} mask
@@ -184,11 +186,11 @@ export function renderIntersectionLabelInputs(options) {
 
     const meta = ownerDocument.createElement('div');
     meta.className = 'cat-builder-intersection-meta';
-    meta.textContent = `${row.count.toLocaleString()} cells`;
+    meta.textContent = formatCells(row.count);
 
     const input = ownerDocument.createElement('input');
     input.type = 'text';
-    input.className = 'cat-builder-intersection-input';
+    input.className = 'obs-select cat-builder-intersection-input';
     input.value = labelsByMask[maskKey];
     input.dataset.mask = maskKey;
     input.addEventListener('input', () => {

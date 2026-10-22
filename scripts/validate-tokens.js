@@ -3,7 +3,8 @@
 
 /**
  * Validates that design-token-looking `var(--...)` references resolve to a
- * custom property defined in `assets/css/tokens` or `assets/css/themes`.
+ * custom property defined in `assets/css/tokens` or `assets/css/themes`, and
+ * that component CSS names its font family through a `--font-*` token.
  *
  * Usage:
  *   node cellucid/scripts/validate-tokens.js
@@ -41,6 +42,8 @@ const DESIGN_PREFIXES = [
   'sidebar-',
   'accordion-',
   'header-',
+  'control-',
+  'type-',
   // Typography
   'font-',
   'text-',
@@ -149,6 +152,34 @@ function validateFile(filePath, defined) {
   return errors;
 }
 
+const FONT_FACE_FILE = path.join(PROJECT_ROOT, 'assets', 'css', 'base', '_fonts.css');
+
+/**
+ * A component names its typeface through `--font-sans`, `--font-display` or
+ * `--font-mono`, never by spelling a stack out: a spelled-out stack drifts
+ * from the tokens (one panel fell back to Georgia while every other read Inter)
+ * and a theme can no longer change the face in one place. `@font-face` in
+ * `base/_fonts.css` is where the families are declared, so it is exempt.
+ *
+ * @param {string} filePath
+ * @returns {Array<{ file: string; token: string }>}
+ */
+function validateFontFamilies(filePath) {
+  if (!filePath.endsWith('.css') || filePath === FONT_FACE_FILE) return [];
+  if (DEFINITIONS_DIRS.some((dir) => filePath.startsWith(dir + path.sep))) return [];
+  const text = readText(filePath).replace(/\/\*[\s\S]*?\*\//g, '');
+  /** @type {Array<{ file: string; token: string }>} */
+  const errors = [];
+  const familyRe = /font-family\s*:\s*([^;}]+)/g;
+  let match;
+  while ((match = familyRe.exec(text))) {
+    const value = match[1].trim();
+    if (value === 'inherit' || /^var\(--font-(sans|display|mono)\)(\s*!important)?$/.test(value)) continue;
+    errors.push({ file: filePath, token: `font-family: ${value}` });
+  }
+  return errors;
+}
+
 function main() {
   const defined = collectDefinedTokens();
   if (defined.size === 0) {
@@ -163,10 +194,11 @@ function main() {
   const errors = [];
   for (const file of scanFiles) {
     errors.push(...validateFile(file, defined));
+    errors.push(...validateFontFamilies(file));
   }
 
   if (errors.length > 0) {
-    console.error('[validate-tokens] Unknown design token references found:'); // eslint-disable-line no-console
+    console.error('[validate-tokens] Unknown design token references or literal font stacks found:'); // eslint-disable-line no-console
     for (const { file, token } of errors) {
       console.error(`- ${path.relative(PROJECT_ROOT, file)}: ${token}`); // eslint-disable-line no-console
     }

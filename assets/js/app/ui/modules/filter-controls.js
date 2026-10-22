@@ -5,8 +5,17 @@
  * provides remove controls. This module does not render the legend itself; it
  * delegates cross-module refresh via callbacks.
  *
+ * The list's two interactions are delegated to the list element, so a render
+ * only builds rows. Counting a filter's cells is a pass over the dataset per
+ * filter, so the list is drawn only while its panel is shown and catches up
+ * when the panel opens; the one-line total above it is always current.
+ *
  * @module ui/modules/filter-controls
  */
+
+import { createEmptyState, createListItem } from '../components/controls.js';
+import { formatCount } from '../components/display-format.js';
+import { createVisibilityGatedRender } from '../core/visibility-gate.js';
 
 /**
  * @typedef {object} FilterCallbacks
@@ -26,86 +35,87 @@
 export function initFilterControls({ state, viewer, dom, callbacks = {} }) {
   const filterCountEl = dom?.countEl || null;
   const activeFiltersEl = dom?.activeFiltersEl || null;
-  let renderLifecycleController = new AbortController();
+  const lifecycle = new AbortController();
   let destroyed = false;
 
-  function listen(target, eventName, listener) {
-    target.addEventListener(eventName, (...args) => {
-      if (destroyed) return;
-      listener(...args);
-    }, { signal: renderLifecycleController.signal });
+  function rowFilterId(target) {
+    const item = typeof target?.closest === 'function'
+      ? target.closest('.list-item')
+      : null;
+    if (item === null || !activeFiltersEl.contains(item)) return null;
+    const id = item.dataset.filterId;
+    if (typeof id !== 'string' || id.length === 0) {
+      throw new TypeError('Active filter row requires its filter id');
+    }
+    return id;
   }
+
+  function afterChange() {
+    callbacks.onFiltersChanged?.();
+    render();
+  }
+
+  if (activeFiltersEl) {
+    activeFiltersEl.addEventListener('change', (event) => {
+      if (destroyed) return;
+      const id = rowFilterId(event.target);
+      if (id === null) return;
+      state.toggleFilterEnabled?.(id, event.target.checked);
+      afterChange();
+    }, { signal: lifecycle.signal });
+    activeFiltersEl.addEventListener('click', (event) => {
+      if (destroyed) return;
+      const button = typeof event.target?.closest === 'function'
+        ? event.target.closest('.list-item-remove')
+        : null;
+      if (button === null) return;
+      const id = rowFilterId(button);
+      if (id === null) return;
+      event.stopPropagation();
+      state.removeFilter?.(id);
+      afterChange();
+    }, { signal: lifecycle.signal });
+  }
+
+  function renderList() {
+    if (destroyed || !activeFiltersEl) return;
+    const filters = state.getActiveFiltersStructured ? state.getActiveFiltersStructured() : [];
+    if (filters.length === 0) {
+      activeFiltersEl.replaceChildren(createEmptyState('No filters active.'));
+      return;
+    }
+    const rows = filters.map((filter) => {
+      const counts = state.getFilterCellCounts ? state.getFilterCellCounts(filter) : null;
+      const countText =
+        counts && Number.isFinite(counts.visible) && Number.isFinite(counts.available)
+          ? ` • ${formatCount(counts.visible)} / ${formatCount(counts.available)} cells`
+          : '';
+      const { root } = createListItem({
+        text: filter.text + countText,
+        enabled: filter.enabled,
+        noun: 'filter'
+      });
+      root.dataset.filterId = filter.id;
+      return root;
+    });
+    activeFiltersEl.replaceChildren(...rows);
+  }
+
+  const listGate = activeFiltersEl
+    ? createVisibilityGatedRender(activeFiltersEl, renderList)
+    : null;
 
   function render() {
     if (destroyed) return;
-    renderLifecycleController.abort();
-    renderLifecycleController = new AbortController();
     if (!activeFiltersEl || !filterCountEl) return;
-
-    const filters = state.getActiveFiltersStructured ? state.getActiveFiltersStructured() : [];
-    activeFiltersEl.innerHTML = '';
-
-    if (filters.length === 0) {
-      const line = document.createElement('div');
-      line.className = 'filter-info';
-      line.textContent = 'No filters active';
-      activeFiltersEl.appendChild(line);
-    } else {
-      filters.forEach((filter) => {
-        const item = document.createElement('div');
-        item.className = 'filter-item' + (filter.enabled ? '' : ' disabled');
-        item.dataset.filterId = filter.id;
-
-        const checkbox = document.createElement('input');
-        checkbox.type = 'checkbox';
-        checkbox.className = 'filter-checkbox';
-        checkbox.checked = filter.enabled;
-        checkbox.title = filter.enabled ? 'Disable this filter' : 'Enable this filter';
-        listen(checkbox, 'change', () => {
-          const enabled = checkbox.checked;
-          state.toggleFilterEnabled?.(filter.id, enabled);
-          callbacks.onFiltersChanged?.();
-          render();
-        });
-
-        const textSpan = document.createElement('span');
-        textSpan.className = 'filter-text';
-        const counts = state.getFilterCellCounts ? state.getFilterCellCounts(filter) : null;
-        const countText =
-          counts && Number.isFinite(counts.visible) && Number.isFinite(counts.available)
-            ? ` • ${counts.visible.toLocaleString()} / ${counts.available.toLocaleString()} cells`
-            : '';
-        const fullText = filter.text + countText;
-        textSpan.textContent = fullText;
-        textSpan.title = fullText;
-
-        const removeBtn = document.createElement('button');
-        removeBtn.type = 'button';
-        removeBtn.className = 'filter-remove-btn';
-        removeBtn.innerHTML = '×';
-        removeBtn.title = 'Remove this filter';
-        listen(removeBtn, 'click', (e) => {
-          e.stopPropagation();
-          state.removeFilter?.(filter.id);
-          callbacks.onFiltersChanged?.();
-          render();
-        });
-
-        item.appendChild(checkbox);
-        item.appendChild(textSpan);
-        item.appendChild(removeBtn);
-        activeFiltersEl.appendChild(item);
-      });
-    }
+    listGate.request();
 
     const counts = state.getFilteredCount ? state.getFilteredCount() : { shown: 0, total: 0 };
     const shown = counts?.shown ?? 0;
     const total = counts?.total ?? 0;
-    if (shown === total) {
-      filterCountEl.textContent = `Showing all ${total.toLocaleString()} points`;
-    } else {
-      filterCountEl.textContent = `Showing ${shown.toLocaleString()} of ${total.toLocaleString()} points`;
-    }
+    filterCountEl.textContent = shown === total
+      ? `Showing all ${formatCount(total)} cells`
+      : `Showing ${formatCount(shown)} of ${formatCount(total)} cells`;
 
     if (viewer?.hasSnapshots && viewer.hasSnapshots()) {
       callbacks.onViewBadgesMaybeChanged?.();
@@ -115,7 +125,8 @@ export function initFilterControls({ state, viewer, dom, callbacks = {} }) {
   function destroy() {
     if (destroyed) return;
     destroyed = true;
-    renderLifecycleController.abort();
+    lifecycle.abort();
+    listGate?.destroy();
   }
 
   return { render, destroy };

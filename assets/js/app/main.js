@@ -13,6 +13,8 @@
  * @module main
  */
 import { createViewer } from '../rendering/viewer.js';
+import { CONNECTIVITY_DEFAULT_VISIBLE_TARGET } from '../rendering/connectivity-edge-layer.js';
+import { initSidebarLayout } from './ui/core/sidebar-layout.js';
 import {
   MAX_SMOKE_GRID_SIZE
 } from '../rendering/smoke-cloud/smoke-density-contract.js';
@@ -33,7 +35,6 @@ import {
   createLatestDatasetPublicationContinuationOwner,
   createLatestDatasetReloadCoordinator,
   handleDatasetReloadFailure,
-  settleInitialPublishedDatasetStateOutcome,
   settlePublishedDatasetStateOutcome,
   settlePublishedDatasetUi,
   stageDatasetPositionPayload
@@ -49,13 +50,21 @@ import {
   loadConnectivityManifest,
   loadEdges,
   loadDatasetIdentity,
+  loadMappingCandidates,
   getEmbeddingsMetadata
 } from '../data/data-loaders.js';
+import {
+  MAPPING_CANDIDATES_PATH,
+  resolveAnnDataMapping,
+  resolveExportDataMapping
+} from '../data/dataset-mapping.js';
 import {
   createDimensionManager,
   createInMemoryDimensionManager
 } from '../data/dimension-manager.js';
-import { createVectorFieldManager } from '../data/vector-field-manager.js';
+import { syntheticRepresentations } from './ui/modules/benchmark/representations.js';
+import { createMappingLayoutProvider } from './state/managers/mapping-manager.js';
+import { createVectorFieldManager, resolveVectorFields } from '../data/vector-field-manager.js';
 import {
   loadDatasetGeneration
 } from '../data/dataset-generation-contract.js';
@@ -83,29 +92,18 @@ import {
   createJupyterPointerDelivery
 } from './jupyter-pointer-delivery.js';
 // benchmark module is lazy-loaded when needed
-import {
-  fetchSampleArtifact,
-  formatCellCount as formatNumber
-} from '../data/data-source.js';
+import { DataSourceErrorCode, fetchSampleArtifact } from '../data/data-source.js';
+import { formatCompactCount as formatNumber } from './ui/components/display-format.js';
 import { createComparisonModule } from './analysis/comparison-module.js';
 import { ThemeManager } from '../utils/theme-manager.js';
 import { debug } from '../utils/debug.js';
 import { clamp } from './utils/number-utils.js';
-import { shuffleConnectivityEdges } from './utils/random-utils.js';
 import { getGitHubAuthSession } from './community-annotations/github-auth.js';
 import { initKeyboardShortcuts, initWelcomeModal, showWelcomeModal } from './ui/onboarding/index.js';
 import { publishWebBuildVersion } from './ui/core/build-version.js';
 import { retireDeferredControls } from './ui/core/deferred-control-readiness.js';
-import {
-  initAnalytics,
-  trackDataLoadMethod,
-  beginDataLoad,
-  cancelDataLoad,
-  completeDataLoadSuccess,
-  completeDataLoadFailure,
-  DATA_LOAD_METHODS
-} from '../analytics/tracker.js';
-import { initPerformanceAnalytics } from '../analytics/performance.js';
+import { DATA_LOAD_METHODS } from './data-load-methods.js';
+import { analytics } from './optional-analytics.js';
 import {
   classifySameOriginHealthAdvertisement,
   resolveStartupUrlIntent,
@@ -117,13 +115,16 @@ import {
   publishStartupFailure
 } from './startup-failure.js';
 import {
+  STARTUP_STALL_CODE,
+  createStartupPhaseOwner
+} from './startup-phase.js';
+import {
   prepareUrlForDatasetSelection,
   prepareUrlForDataSource
 } from './url-state.js';
 
 debug.log('Starting…');
 
-const FAST_BINARY_FETCH_INIT = { cache: 'force-cache' };
 const BENCHMARK_GPU_ESTIMATE_BYTES_PER_POINT = 28;
 const MEBIBYTE = 1024 * 1024;
 
@@ -161,11 +162,19 @@ function getVarManifestUrl(baseUrl) { return `${baseUrl}var_manifest.json`; }
 function getConnectivityManifestUrl(baseUrl) { return `${baseUrl}connectivity_manifest.json`; }
 function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.json`; }
 
+// Requested before anything else so it loads in parallel with startup. It is
+// never awaited: calls made before it arrives are queued, so it never blocks
+// or breaks startup.
+void analytics.load();
+
 (async function bootstrap() {
   let statsEl = null;
-  let currentDatasetLoadToken = null;
-  let buildDatasetAnalyticsContext = () => ({});
   let destroyApplication = null;
+  // Every startup await on the network runs through this owner: it publishes
+  // `data-startup-phase` and bounds request/response steps with a deadline.
+  const startup = createStartupPhaseOwner({
+    root: document.documentElement
+  });
 
   try {
     ThemeManager.init();
@@ -206,30 +215,23 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
       });
     }
 
-    const datasetSelect = document.getElementById('dataset-select');
-    if (!(datasetSelect instanceof HTMLSelectElement)) {
-      throw new Error('Sample selection requires the dataset controls.');
-    }
-    let datasetCatalogReady = null;
-    let datasetSelectFocusRequested = false;
-    function fulfillDatasetSelectFocusRequest() {
-      const ownedCatalogReady = datasetCatalogReady;
-      if (!datasetSelectFocusRequested || ownedCatalogReady === null) return;
-      void ownedCatalogReady.then(catalogOutcome => {
-        if (
-          ownedCatalogReady !== datasetCatalogReady ||
-          !datasetSelectFocusRequested
-        ) {
-          return;
-        }
-        datasetSelectFocusRequested = false;
-        if (catalogOutcome?.status === 'ready') datasetSelect.focus();
-      });
+    const sessionSection = document.getElementById('session-section');
+    const sessionSummary = sessionSection?.querySelector(':scope > summary');
+    if (
+      !(sessionSection instanceof HTMLDetailsElement) ||
+      !(sessionSummary instanceof HTMLElement)
+    ) {
+      throw new Error('Onboarding requires the Session panel and its heading.');
     }
     initWelcomeModal({
-      onExplore() {
-        datasetSelectFocusRequested = true;
-        fulfillDatasetSelectFocusRequest();
+      // "Choose a dataset" leads to the data controls without choosing for
+      // the user: the Session panel opens. The Sample dataset dropdown is
+      // never focused or opened for them. A keyboard user's focus lands on the
+      // panel heading, one Tab before its controls; a pointer user's stays
+      // where the dialog leaves it, so nothing on the page is ringed.
+      onExplore({ fromKeyboard }) {
+        sessionSection.open = true;
+        if (fromKeyboard) sessionSummary.focus();
       }
     });
     if (shouldShowWelcome) {
@@ -249,6 +251,7 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
     const connectivityLimitDisplay = document.getElementById('connectivity-limit-display');
     const connectivityInfo = document.getElementById('connectivity-info');
     let ui = null;
+    let sidebarLayout = null;
     let comparisonModule = null;
     let applicationRetired = false;
     let stopPerfMonitoring = () => {};
@@ -256,8 +259,8 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
     debug.log('[Main] Creating viewer...');
     // Antialiasing is not a construction argument. It is a live setting owned by
     // `render-controls.js`, which reads the stored preference, resolves it
-    // against the dataset, and publishes it before `viewer.start()` draws the
-    // first frame — see `ui/core/antialias-preference.js`.
+    // against each dataset as that dataset is published — see
+    // `ui/core/antialias-preference.js`.
     const viewer = createViewer({
       canvas,
       labelLayer,
@@ -287,6 +290,7 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
           ? []
           : [() => comparisonModule.destroy()]),
         ...(ui === null ? [] : [() => ui.destroy()]),
+        ...(sidebarLayout === null ? [] : [() => sidebarLayout.destroy()]),
         () => viewer.dispose()
       ],
       failureMessage: 'Application teardown was incomplete.'
@@ -300,7 +304,27 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
     window._cellucidDispose = destroyApplication;
     window.addEventListener('pagehide', retireApplicationOnPageHide);
 
+    // The sidebar toggle is painted with the first frame, and on a phone it is
+    // the only way out of the full-screen menu, so it works from now on rather
+    // than from the end of the first dataset load.
+    sidebarLayout = initSidebarLayout({ documentOwner: document, viewer });
+
     const state = createDataState({ viewer, labelLayer });
+
+    // A page left hidden for ten minutes gives back the positions and GPU
+    // geometry of every representation no view shows; they load again when
+    // shown.
+    const HIDDEN_RELEASE_MS = 10 * 60 * 1000;
+    let hiddenReleaseTimer = null;
+    document.addEventListener('visibilitychange', () => {
+      clearTimeout(hiddenReleaseTimer);
+      hiddenReleaseTimer = null;
+      if (document.visibilityState === 'hidden') {
+        hiddenReleaseTimer = setTimeout(() => {
+          state.dimensionManager?.releaseUnderPressure?.();
+        }, HIDDEN_RELEASE_MS);
+      }
+    });
     debug.log('[Main] State created successfully');
 
     // Expose state globally for dev tools
@@ -317,8 +341,11 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
     // boundary so storage/configuration failures cannot leave a blank page.
     const githubAuthSession = getGitHubAuthSession();
     try {
-      const signInResult =
-        await githubAuthSession.completeSignInFromRedirect();
+      const signInResult = await startup.step(
+        'sign-in',
+        'the GitHub sign-in exchange',
+        () => githubAuthSession.completeSignInFromRedirect()
+      );
       if (signInResult !== null) {
         notifications.success(
           `Signed in with GitHub as @${signInResult.user.login}.`,
@@ -365,37 +392,33 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
         };
       }
     );
-    initAnalytics({ dataSourceManager });
-
-    buildDatasetAnalyticsContext = (overrides = {}) => {
-      const metadata = overrides.metadata ?? dataSourceManager.getCurrentMetadata?.();
-      const datasetId = overrides.datasetId ?? dataSourceManager.getCurrentDatasetId?.();
-      const datasetName = overrides.datasetName ?? metadata?.name;
-      const sourceType = overrides.sourceType ?? dataSourceManager.getCurrentSourceType?.();
-      return {
-        metadata,
-        datasetId,
-        datasetName,
-        sourceType,
-        previousDatasetId: overrides.previousDatasetId,
-        previousSource: overrides.previousSource,
-        reload: overrides.reload
-      };
-    };
-
-    const startDatasetLoad = (methodOverride = null, ctxOverrides = {}) => {
-      const method = methodOverride || dataSourceManager.getLastLoadMethod?.() || DATA_LOAD_METHODS.DEFAULT_DEMO;
-      return beginDataLoad(method, buildDatasetAnalyticsContext(ctxOverrides));
-    };
-
+    // The one dataset startup opens. The catalog phase below only resolves
+    // it; it is loaded once the interface and every control exist, through
+    // the same dataset-change transaction as every later choice, so a choice
+    // the user makes while it is still loading replaces it instead of being
+    // discarded behind it. When two startup intents resolve, the later one is
+    // the selection, exactly as successive switches would have left it.
+    let startupSelection = null;
+    function selectStartupDataset(sourceType, datasetId, loadMethod) {
+      for (const [label, value] of [
+        ['source type', sourceType],
+        ['id', datasetId],
+        ['load method', loadMethod]
+      ]) {
+        if (typeof value !== 'string' || value.length === 0) {
+          throw new TypeError(
+            `Startup dataset ${label} must be a non-empty string.`
+          );
+        }
+      }
+      startupSelection = Object.freeze({ datasetId, loadMethod, sourceType });
+      debug.log(
+        `[Main] Startup dataset selection: ${sourceType}/${datasetId}`
+      );
+    }
+    analytics.init();
     const startPerfAnalytics = () => {
-      initPerformanceAnalytics({
-        sampleRate: 1,
-        contextProvider: () => ({
-          datasetId: dataSourceManager.getCurrentDatasetId?.(),
-          sourceType: dataSourceManager.getCurrentSourceType?.()
-        })
-      });
+      analytics.startPerformance({ dataSourceManager });
     };
     if (typeof window.requestIdleCallback === 'function') {
       window.requestIdleCallback(startPerfAnalytics, { timeout: 2000 });
@@ -405,7 +428,7 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
 
     // Helper functions for onboarding callbacks (defined early, used later)
     let toggleSidebarVisibility = null;
-    let setDimensionLevel = null;
+    let cycleRepresentation = null;
     let clearAllHighlights = null;
     let setNavigationMode = null;
 
@@ -414,8 +437,8 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
       onToggleSidebar: () => {
         if (toggleSidebarVisibility) toggleSidebarVisibility();
       },
-      onSetDimension: (dim) => {
-        if (setDimensionLevel) setDimensionLevel(dim);
+      onCycleRepresentation: (dim) => {
+        if (cycleRepresentation) cycleRepresentation(dim);
       },
       onShowHelp: () => {
         const shortcutsSection = document.getElementById('shortcuts-section');
@@ -447,7 +470,11 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
       jupyterSource = createJupyterBridgeDataSource(jupyterConfig);
       dataSourceManager.registerSource('jupyter', jupyterSource);
 
-      const jupyterInitialized = await jupyterSource.initialize();
+      const jupyterInitialized = await startup.step(
+        'health',
+        'the Jupyter Python server',
+        () => jupyterSource.initialize()
+      );
       if (jupyterInitialized !== true) {
         throw new Error(
           'Jupyter context must initialize one authenticated Python server'
@@ -708,32 +735,41 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
         }
       });
 
-      const jupyterDatasets = await jupyterSource.listDatasets();
+      const jupyterDatasets = await startup.step(
+        'catalog',
+        'the Jupyter dataset catalog',
+        () => jupyterSource.listDatasets()
+      );
       const jupyterDatasetId = selectIntentDatasetId(
         jupyterDatasets,
         requestedDataset,
         'The authenticated Python server'
       );
-      await dataSourceManager.switchToDataset(
+      selectStartupDataset(
         'jupyter',
         jupyterDatasetId,
-        { loadMethod: DATA_LOAD_METHODS.JUPYTER_AUTO }
-      );
-      debug.log(
-        `[Main] Switched to Jupyter dataset: ${jupyterDatasetId}`
+        DATA_LOAD_METHODS.JUPYTER_AUTO
       );
     }
 
     // An explicit remote URL is a terminal source request.
     if (remoteUrlParam !== null) {
       debug.log(`[Main] Remote server URL from param: ${remoteUrlParam}`);
-      await remoteSource.connect({ url: remoteUrlParam });
+      await startup.step(
+        'health',
+        remoteUrlParam,
+        () => remoteSource.connect({ url: remoteUrlParam })
+      );
       if (remoteSource.isConnected() !== true) {
         throw new Error(
           'The requested remote source did not publish a connected state.'
         );
       }
-      const remoteDatasets = await remoteSource.listDatasets();
+      const remoteDatasets = await startup.step(
+        'catalog',
+        remoteUrlParam,
+        () => remoteSource.listDatasets()
+      );
       const remoteDatasetId = selectIntentDatasetId(
         remoteDatasets,
         requestedDataset,
@@ -749,13 +785,10 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
           { duration: 12000 }
         );
       }
-      await dataSourceManager.switchToDataset(
+      selectStartupDataset(
         'remote',
         remoteDatasetId,
-        { loadMethod: DATA_LOAD_METHODS.REMOTE_URL_PARAM }
-      );
-      debug.log(
-        `[Main] Switched to remote dataset: ${remoteDatasetId}`
+        DATA_LOAD_METHODS.REMOTE_URL_PARAM
       );
     }
 
@@ -780,9 +813,11 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
         const selfBase = new URL('.', window.location.href)
           .toString()
           .replace(/\/$/, '');
-        const healthResponse = await fetch(
-          `${selfBase}/_cellucid/health`,
-          { cache: 'no-store' }
+        const healthUrl = `${selfBase}/_cellucid/health`;
+        const healthResponse = await startup.step(
+          'health',
+          healthUrl,
+          signal => fetch(healthUrl, { cache: 'no-store', signal })
         );
         if (
           healthResponse.status === 404 &&
@@ -799,7 +834,11 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
               `${healthResponse.status}.`
             );
           }
-          const healthAdvertisement = await healthResponse.json();
+          const healthAdvertisement = await startup.step(
+            'health',
+            healthUrl,
+            () => healthResponse.json()
+          );
           const healthKind = classifySameOriginHealthAdvertisement(
             healthAdvertisement
           );
@@ -817,13 +856,21 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
               `[Main] Cellucid server endpoint detected at ${selfBase}; ` +
               'validating the complete remote contract.'
             );
-            await remoteSource.connect({ url: selfBase });
+            await startup.step(
+              'health',
+              selfBase,
+              () => remoteSource.connect({ url: selfBase })
+            );
             if (remoteSource.isConnected() !== true) {
               throw new Error(
                 'Same-origin Cellucid source did not publish a connected state.'
               );
             }
-            const datasets = await remoteSource.listDatasets();
+            const datasets = await startup.step(
+              'catalog',
+              selfBase,
+              () => remoteSource.listDatasets()
+            );
             const remoteDatasetId = selectConnectedDatasetId(
               datasets,
               requestedDataset,
@@ -837,7 +884,6 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
               );
             }
             if (remoteDatasetId === null) {
-              datasetSelectFocusRequested = true;
               notifications.info(
                 `Connected to ${datasets.length} server datasets. Choose one ` +
                 `from Sample datasets.`,
@@ -848,13 +894,10 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
                 }
               );
             } else {
-              await dataSourceManager.switchToDataset(
+              selectStartupDataset(
                 'remote',
                 remoteDatasetId,
-                { loadMethod: DATA_LOAD_METHODS.SERVER_AUTO }
-              );
-              debug.log(
-                `[Main] Auto-connected to server dataset: ${remoteDatasetId}`
+                DATA_LOAD_METHODS.SERVER_AUTO
               );
             }
           }
@@ -863,11 +906,15 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
     }
 
     // Register current sources before resolving the exact startup selection.
-    await dataSourceManager.initialize({
-      // Jupyter mode owns one authenticated Python dataset source, so it does
-      // not register the unrelated sample catalog.
-      registerDemoCatalog: !inJupyter
-    });
+    await startup.step(
+      'catalog',
+      'the dataset source registry',
+      () => dataSourceManager.initialize({
+        // Jupyter mode owns one authenticated Python dataset source, so it
+        // does not register the unrelated sample catalog.
+        registerDemoCatalog: !inJupyter
+      })
+    );
 
     const useDefaultDemo =
       !inJupyter
@@ -875,7 +922,7 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
       && githubPathParam === null
       && requestedDataset === null
       && (sourceParam === null || sourceParam === 'local-demo')
-      && dataSourceManager.hasActiveDataset() === false;
+      && startupSelection === null;
     if (useDefaultDemo) {
       const localDemoSource = dataSourceManager.getSource('local-demo');
       if (
@@ -887,28 +934,38 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
           'Default sample startup requires the registered catalog default owner.'
         );
       }
+      const sampleCatalog =
+        localDemoSource.manifestUrl ?? 'the sample catalog';
       let demoCatalogAvailable = false;
       try {
-        demoCatalogAvailable = await localDemoSource.isAvailable();
+        demoCatalogAvailable = await startup.step(
+          'catalog',
+          sampleCatalog,
+          () => localDemoSource.isAvailable()
+        );
       } catch (error) {
         if (!(error instanceof Error)) {
           throw new TypeError(
             'Default sample catalog availability rejected with a non-Error value.'
           );
         }
+        // An unreachable catalog only leaves startup without a default; a
+        // stalled one is a startup failure that names where it stopped.
+        if (error.code === STARTUP_STALL_CODE) throw error;
         debug.log(
           `[Main] Default sample catalog is unavailable: ${error.message}`
         );
       }
       if (demoCatalogAvailable) {
-        const defaultDatasetId = await localDemoSource.getDefaultDatasetId();
-        await dataSourceManager.switchToDataset(
+        const defaultDatasetId = await startup.step(
+          'catalog',
+          sampleCatalog,
+          () => localDemoSource.getDefaultDatasetId()
+        );
+        selectStartupDataset(
           'local-demo',
           defaultDatasetId,
-          { loadMethod: DATA_LOAD_METHODS.DEFAULT_DEMO }
-        );
-        debug.log(
-          `[Main] Loaded catalog default dataset: ${defaultDatasetId}`
+          DATA_LOAD_METHODS.DEFAULT_DEMO
         );
       }
     }
@@ -923,8 +980,11 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
           'Explicit GitHub startup requires the registered GitHub source.'
         );
       }
-      const githubConnection =
-        await githubSource.connect(githubPathParam);
+      const githubConnection = await startup.step(
+        'catalog',
+        githubPathParam,
+        () => githubSource.connect(githubPathParam)
+      );
       if (
         githubConnection === null ||
         typeof githubConnection !== 'object' ||
@@ -940,13 +1000,10 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
         requestedDataset,
         'The requested GitHub repository'
       );
-      await dataSourceManager.switchToDataset(
+      selectStartupDataset(
         'github-repo',
         githubDatasetId,
-        { loadMethod: DATA_LOAD_METHODS.GITHUB_URL_PARAM }
-      );
-      debug.log(
-        `[Main] Switched to GitHub dataset: ${githubDatasetId}`
+        DATA_LOAD_METHODS.GITHUB_URL_PARAM
       );
 
       const githubRepoInput =
@@ -964,7 +1021,7 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
     const requestedSource = sourceParam === null
       ? 'local-demo'
       : sourceParam;
-    const currentSourceType = dataSourceManager.getCurrentSourceType();
+    const currentSourceType = startupSelection?.sourceType ?? null;
     const skipUrlDataset = currentSourceType === 'remote' || currentSourceType === 'jupyter' || currentSourceType === 'github-repo';
 
     if (requestedDataset !== null && !skipUrlDataset) {
@@ -979,28 +1036,22 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
           `Requested source '${requestedSource}' must implement hasDataset().`
         );
       }
-      if (!await targetSource.hasDataset(requestedDataset)) {
+      const requestedCatalog = `the ${requestedSource} dataset catalog`;
+      const requestedExists = await startup.step(
+        'catalog',
+        requestedCatalog,
+        () => targetSource.hasDataset(requestedDataset)
+      );
+      if (!requestedExists) {
         throw new Error(
           `Requested dataset '${requestedDataset}' was not found in '${requestedSource}'.`
         );
       }
-      await dataSourceManager.switchToDataset(
+      selectStartupDataset(
         requestedSource,
         requestedDataset,
-        { loadMethod: DATA_LOAD_METHODS.DATASET_URL_PARAM }
+        DATA_LOAD_METHODS.DATASET_URL_PARAM
       );
-      debug.log(
-        `[Main] Loaded dataset from URL param: ` +
-        `${requestedSource}/${requestedDataset}`
-      );
-    }
-
-    const selectedBaseUrl = dataSourceManager.getCurrentBaseUrl();
-    EXPORT_BASE_URL = selectedBaseUrl === null ? '' : selectedBaseUrl;
-    debug.log(`[Main] Using dataset base URL: ${EXPORT_BASE_URL}`);
-
-    if (!currentDatasetLoadToken && dataSourceManager.hasActiveDataset()) {
-      currentDatasetLoadToken = startDatasetLoad();
     }
 
     // The live manager is replaced only when a complete dataset generation and
@@ -1014,10 +1065,27 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
     let datasetPublicationGeneration = 0;
     let activeDatasetPublication = null;
 
+    // The empty runtime publishes `{runtimeKind: 'empty'}`; a dataset or a
+    // synthetic benchmark publishes the stage that carries its cells.
+    function publicationHasCells(publication) {
+      if (publication === null || typeof publication !== 'object') {
+        throw new TypeError('Cell presence requires one runtime publication.');
+      }
+      const runtimeKind = publication.stage?.runtimeKind
+        ?? publication.runtimeKind;
+      if (!['dataset', 'empty', 'synthetic'].includes(runtimeKind)) {
+        throw new TypeError(
+          `Runtime publication has unknown kind "${runtimeKind}".`
+        );
+      }
+      return runtimeKind !== 'empty';
+    }
+
     function publishRuntimeContinuation(details) {
       const publication = datasetPublicationOwner.publish(details);
       datasetPublicationGeneration = publication.generation;
       activeDatasetPublication = publication;
+      ui?.publishCellPresence(publicationHasCells(publication));
       return publication;
     }
 
@@ -1095,13 +1163,14 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
       dimensionManager = createDimensionManager({ baseUrl: '' });
       obs = null;
       connectivityManifest = null;
+      connectivityManifestUrl = null;
       positions = null;
       state.setDimensionManager(dimensionManager);
       state.setFieldLoader(null);
       state.setVarFieldLoader(null);
-      state.varData = null;
-      state._varFieldDescriptors = Object.freeze([]);
+      state.initVarData({ fields: [] });
       state.setVectorFieldManager(null);
+      state.publishDatasetMapping({ mapping: null, candidates: null, origin: null });
       state.initScene(new Float32Array(), { fields: [], count: 0 });
       state.clearActiveField();
       state.clearAllHighlights();
@@ -1117,10 +1186,96 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
         : publishRuntimeContinuation({ runtimeKind: 'empty' });
     }
 
+    // A reload is bounded by its own transaction signal and publishes no
+    // startup phase; only the startup load runs under the startup owner.
+    const RELOAD_STAGE_PHASES = Object.freeze({
+      enter() {},
+      step: (_phase, _target, operation) => operation(null)
+    });
+    const UNCHANGED_URL_PUBLICATION = Object.freeze({
+      commit() {},
+      rollback() {}
+    });
+
+    function requireDatasetChangeTransaction(transaction) {
+      if (
+        transaction === null ||
+        typeof transaction !== 'object' ||
+        !(transaction.signal instanceof AbortSignal) ||
+        typeof transaction.assertCurrent !== 'function' ||
+        typeof transaction.isCurrent !== 'function' ||
+        typeof transaction.isLatest !== 'function'
+      ) {
+        throw new TypeError(
+          'A dataset change requires the transaction its caller began.'
+        );
+      }
+      return transaction;
+    }
+
+    /**
+     * The data mapping one staged generation is shown with, the AnnData
+     * candidate catalog it was resolved from, and whether it was guessed. A
+     * prepared export states its mapping in its own metadata; an AnnData
+     * dataset -- a file opened in the browser, or one a Python server serves
+     * -- states it in its catalog, because its graph and expression matrix
+     * are not visible in the identity.
+     *
+     * `datasetSource` is the source the staged dataset comes from. It is never
+     * the source currently on screen: while a newer choice stages, the shown
+     * dataset's source may be disconnected or of another kind entirely.
+     */
+    async function resolveStagedDataMapping({
+      baseUrl,
+      candidateAnnDataBinding,
+      datasetSource,
+      generation,
+      signal,
+      stagedSource
+    }) {
+      const readInBrowser = isAnnDataUrl(baseUrl);
+      const served = !readInBrowser &&
+        typeof datasetSource.servesAnnData === 'function' &&
+        datasetSource.servesAnnData() === true;
+      if (!readInBrowser && !served) {
+        return Object.freeze({
+          mapping: resolveExportDataMapping(
+            generation.identity,
+            generation.varManifest
+          ),
+          candidates: null,
+          origin: 'default'
+        });
+      }
+      let candidates;
+      try {
+        candidates = await loadMappingCandidates(
+          `${baseUrl}${MAPPING_CANDIDATES_PATH}`,
+          { candidateAnnDataBinding, signal, stagedSource }
+        );
+      } catch (error) {
+        if (signal.aborted || readInBrowser) throw error;
+        throw new Error(
+          'This Cellucid server cannot report which AnnData arrays it serves ' +
+          `(${error?.message || error}). Update it with pip install -U cellucid.`,
+          { cause: error }
+        );
+      }
+      return Object.freeze({
+        mapping: resolveAnnDataMapping(candidates, generation.identity),
+        candidates,
+        origin: candidates.guessed.some(group => group.startsWith('embeddings.'))
+          ? 'best_guess'
+          : 'default'
+      });
+    }
+
     async function stageDatasetRuntime({
       baseUrl,
       candidateAnnDataBinding,
+      datasetSource,
       expectedIdentityId,
+      phases,
       showProgress,
       signal,
       stagedSource
@@ -1147,6 +1302,11 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
           'Dataset runtime staging requires one owner AbortSignal.'
         );
       }
+      if (datasetSource === null || typeof datasetSource !== 'object') {
+        throw new TypeError(
+          'Dataset runtime staging requires the source the dataset is staged from.'
+        );
+      }
       const candidateDimensionManager = createDimensionManager({
         baseUrl,
         candidateAnnDataBinding,
@@ -1154,48 +1314,72 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
       });
 
       try {
-        const generation = await loadDatasetGeneration({
-          expectedIdentityId,
+        const generation = await phases.step(
+          'identity',
+          getDatasetIdentityUrl(baseUrl),
+          stepSignal => loadDatasetGeneration({
+            expectedIdentityId,
+            signal: stepSignal === null
+              ? signal
+              : AbortSignal.any([signal, stepSignal]),
+            loadIdentity: generationSignal =>
+              loadDatasetIdentity(
+                getDatasetIdentityUrl(baseUrl),
+                {
+                  candidateAnnDataBinding,
+                  signal: generationSignal,
+                  stagedSource
+                }
+              ),
+            loadObsManifest: generationSignal =>
+              loadObsManifest(
+                getObsManifestUrl(baseUrl),
+                {
+                  candidateAnnDataBinding,
+                  signal: generationSignal,
+                  stagedSource
+                }
+              ),
+            loadVarManifest: generationSignal =>
+              loadVarManifest(
+                getVarManifestUrl(baseUrl),
+                {
+                  candidateAnnDataBinding,
+                  signal: generationSignal,
+                  stagedSource
+                }
+              ),
+            loadConnectivityManifest: generationSignal =>
+              loadConnectivityManifest(
+                getConnectivityManifestUrl(baseUrl),
+                {
+                  candidateAnnDataBinding,
+                  signal: generationSignal,
+                  stagedSource
+                }
+              ),
+          })
+        );
+        const mapping = await resolveStagedDataMapping({
+          baseUrl,
+          candidateAnnDataBinding,
+          datasetSource,
+          generation,
           signal,
-          loadIdentity: generationSignal =>
-            loadDatasetIdentity(
-              getDatasetIdentityUrl(baseUrl),
-              {
-                candidateAnnDataBinding,
-                signal: generationSignal,
-                stagedSource
-              }
-            ),
-          loadObsManifest: generationSignal =>
-            loadObsManifest(
-              getObsManifestUrl(baseUrl),
-              {
-                candidateAnnDataBinding,
-                signal: generationSignal,
-                stagedSource
-              }
-            ),
-          loadVarManifest: generationSignal =>
-            loadVarManifest(
-              getVarManifestUrl(baseUrl),
-              {
-                candidateAnnDataBinding,
-                signal: generationSignal,
-                stagedSource
-              }
-            ),
-          loadConnectivityManifest: generationSignal =>
-            loadConnectivityManifest(
-              getConnectivityManifestUrl(baseUrl),
-              {
-                candidateAnnDataBinding,
-                signal: generationSignal,
-                stagedSource
-              }
-            ),
+          stagedSource
         });
+        phases.enter('positions');
         const embeddingsMetadata = getEmbeddingsMetadata(generation.identity);
         candidateDimensionManager.initFromMetadata(embeddingsMetadata);
+        // An AnnData source -- a file read in the browser, or an object a
+        // Python server serves (`_cellucid/mapping/embeddings/...`) -- can
+        // plot any obsm array on request, so the embeddings its mapping turns
+        // on beyond the identity's are registered as layouts by reference.
+        if (mapping.candidates !== null) {
+          candidateDimensionManager.setLayoutProvider(
+            createMappingLayoutProvider(mapping.candidates)
+          );
+        }
         // loadDatasetGeneration has already proved this count against
         // obs_manifest.json, var_manifest.json, and connectivity_manifest.json,
         // so it is the dataset's exact cell axis. publishCellCount enforces the
@@ -1212,37 +1396,32 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
         // Every obs and var payload is one value per cell, and the generation
         // contract has already proved both manifests declare exactly
         // stats.n_cells points. Passing that count turns each field fetch into
-        // an exact-length transport check instead of a 512 MiB ceiling.
+        // an exact-length transport check.
         const fieldLoader = createObsFieldLoader(
           getObsManifestUrl(baseUrl),
-          {
-            fetchInit: FAST_BINARY_FETCH_INIT,
-            pointCount: generation.obsManifest.n_points
-          }
+          { pointCount: generation.obsManifest.n_points }
         );
         const varFieldLoader = generation.varManifest
           ? createVarFieldLoader(
               getVarManifestUrl(baseUrl),
-              {
-                fetchInit: FAST_BINARY_FETCH_INIT,
-                pointCount: generation.varManifest.n_points
-              }
+              { pointCount: generation.varManifest.n_points }
             )
           : null;
         const vectorFieldManager = createVectorFieldManager({
           baseUrl,
-          vectorFieldsMetadata: Object.hasOwn(
-            generation.identity,
-            'vector_fields'
-          )
-            ? generation.identity.vector_fields
-            : null,
+          vectorFields: resolveVectorFields({
+            identity: generation.identity,
+            mapping: mapping.mapping,
+            candidates: mapping.candidates,
+            dimensionManager: candidateDimensionManager
+          }),
           dimensionManager: candidateDimensionManager
         });
 
         return Object.freeze({
           baseUrl,
           dimensionManager: candidateDimensionManager,
+          mapping,
           embeddingsMetadata,
           fieldLoader,
           generation,
@@ -1267,8 +1446,46 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
 
     let obs = null;
     let connectivityManifest = null;
+    // Where the graph in use is read from: the dataset's own
+    // connectivity_manifest.json, or a mapped graph's under
+    // _cellucid/mapping/knn/{p}/ once the data mapping names another one.
+    let connectivityManifestUrl = null;
     let positions = null;
     const connectivityRuntimeOwner = initializeConnectivityControls();
+    // A data-mapping transaction reads the chosen arrays under the open
+    // dataset's base and publishes a new neighbour graph through its owner.
+    state.setMappingRuntime({
+      getBaseUrl: () => EXPORT_BASE_URL,
+      // The vector fields one mapping uses, for the dataset that is shown.
+      createVectorFieldManager: mapping => {
+        if (activeRuntimeStage === null) {
+          throw new Error('No dataset is shown to draw vector fields for.');
+        }
+        const dimensionManager = state.getDimensionManager();
+        return createVectorFieldManager({
+          baseUrl: EXPORT_BASE_URL,
+          vectorFields: resolveVectorFields({
+            identity: activeRuntimeStage.generation.identity,
+            mapping,
+            candidates: state.getMappingCandidates(),
+            dimensionManager
+          }),
+          dimensionManager
+        });
+      },
+      getConnectivityGraph: connectivityRuntimeOwner.getConnectivityGraph,
+      replaceConnectivityGraph: connectivityRuntimeOwner.replaceConnectivityGraph,
+      // Results computed from the previous gene list are not kept: analysis
+      // windows close and their caches clear, as for a new dataset.
+      resetGeneAnalysis: () => {
+        const comparisonModule = window._comparisonModule ?? null;
+        if (comparisonModule === null) return;
+        void comparisonModule.resetForDatasetReload({ reason: 'var-axis' })
+          .catch(error => {
+            console.error('[Main] Analysis reset after a gene-list change failed:', error);
+          });
+      }
+    });
     if (
       typeof connectivityRuntimeOwner.prepareDatasetReplacement !==
       'function' ||
@@ -1317,20 +1534,22 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
       obs = stage.generation.obsManifest;
       positions = stage.positions;
       connectivityManifest = stage.generation.connectivityManifest;
+      connectivityManifestUrl = connectivityManifest === null
+        ? null
+        : getConnectivityManifestUrl(stage.baseUrl);
 
       state.setDimensionManager(dimensionManager);
       state.setFieldLoader(stage.fieldLoader);
       state.setVarFieldLoader(stage.varFieldLoader);
-      if (stage.generation.varManifest) {
-        state.initVarData(stage.generation.varManifest);
-      } else {
-        state.varData = null;
-        state._varFieldDescriptors = Object.freeze([]);
-      }
+      // A dataset without genes publishes no var manifest; it still has a var
+      // inventory, an empty one, so everything that reads it (session
+      // capture, filters, user-defined fields) treats it like any dataset.
+      state.initVarData(stage.generation.varManifest ?? { fields: [] });
       state.initScene(positions, obs);
       state.clearActiveField();
       state.clearAllHighlights();
       state.setVectorFieldManager(stage.vectorFieldManager);
+      state.publishDatasetMapping(stage.mapping);
       activeRuntimeStage = stage;
 
       return restorationPublication !== null
@@ -1385,13 +1604,17 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
       // browser-test fixture publishes 120 cells, so its 120,000-point
       // benchmark cloud was drawn at the size chosen for 120 of them. The count
       // is authoritative here — `initSyntheticScene` measures the same
-      // `positions.length / 3`.
-      ui?.applyDatasetRenderDefaults?.(stage.positions.length / 3);
+      // `positions.length / dimensionLevel`.
+      ui?.applyDatasetRenderDefaults?.(
+        stage.positions.length / stage.dimensionLevel,
+        stage.dimensionLevel
+      );
       EXPORT_BASE_URL = '';
       dimensionManager = stage.dimensionManager;
       obs = state.obsData;
       positions = stage.positions;
       connectivityManifest = null;
+      connectivityManifestUrl = null;
       activeRuntimeStage = stage;
       return restorationPublication !== null
         ? requireRestorablePublication(restorationPublication)
@@ -1544,12 +1767,23 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
             );
           }
           ui.refreshDatasetUI(activeMetadata);
+          // The notebook learns the mapping each dataset opens with.
+          if (jupyterSource !== null && state.getDataMapping() !== null) {
+            void jupyterSource.notifyDataMapping({
+              origin: state.getDataMappingOrigin(),
+              requestId: null,
+              mapping: state.getDataMapping()
+            }).catch(error => {
+              console.error('[Main] Jupyter data-mapping report failed:', error);
+            });
+          }
           // The cell count is the one thing a sensible opening point size
           // depends on, and it is known here for the first time. Applied before
           // `restoreAdvertisedDatasetState`, so a saved session or a published
           // preset still overrides it.
           ui.applyDatasetRenderDefaults(
-            publication.stage.generation.identity.stats.n_cells
+            publication.stage.generation.identity.stats.n_cells,
+            publication.stage.generation.identity.embeddings.default_dimension
           );
         },
         finalize: () => {
@@ -1579,80 +1813,44 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
       });
     }
 
-    const hasInitialDataset =
-      dataSourceManager.hasActiveDataset() === true;
-    let initialPublication = null;
-    if (hasInitialDataset) {
-      // Capture the exact selected id and URL before any asynchronous metadata
-      // or payload work. A loader may not derive identity from a later source.
-      const initialExpectedIdentityId =
-        dataSourceManager.getCurrentIdentityId();
-      const initialBaseUrl = dataSourceManager.getCurrentBaseUrl();
-      const initialLoadController = new AbortController();
-      let initialStage = null;
-      try {
-        initialStage = await stageDatasetRuntime({
-          baseUrl: initialBaseUrl,
-          candidateAnnDataBinding: null,
-          expectedIdentityId: initialExpectedIdentityId,
-          showProgress: true,
-          signal: initialLoadController.signal,
-          stagedSource: null
-        });
-        initialPublication = commitDatasetRuntimeStage(initialStage);
-      } catch (error) {
-        let exactError = error;
-        if (
-          initialStage !== null &&
-          activeRuntimeStage !== initialStage
-        ) {
-          try {
-            runtimeRetirementOwner.retire(
-              initialStage.dimensionManager
-            );
-          } catch (retirementError) {
-            exactError = new AggregateError(
-              [error, retirementError],
-              'Initial dataset publication and candidate retirement failed.'
-            );
-          }
-        }
-        if (currentDatasetLoadToken) {
-          completeDataLoadFailure(currentDatasetLoadToken, {
-            ...buildDatasetAnalyticsContext(),
-            error: exactError
-          });
-          currentDatasetLoadToken = null;
-        }
-        throw exactError;
-      }
-    } else {
-      // No explicit selection: publish the empty runtime while the catalog is
-      // listed independently in the data controls.
-      const unusedDimensionManager = dimensionManager;
-      publishEmptyDatasetRuntime({ clearViews: false });
-      runtimeRetirementOwner.retire(unusedDimensionManager);
-    }
+    // Startup publishes the empty runtime and builds the whole interface
+    // before any dataset is staged. The startup selection is then loaded as
+    // one ordinary dataset change (see the end of this bootstrap), so every
+    // data control is live while it loads and can replace it.
+    const unusedDimensionManager = dimensionManager;
+    publishEmptyDatasetRuntime({ clearViews: false });
+    runtimeRetirementOwner.retire(unusedDimensionManager);
 
     // Stage one exact manager/source/runtime/URL generation before publishing
     // any of it. This also activates not-yet-registered Remote/GitHub
     // connection candidates without replacing the prior transport early.
+    //
+    // `transaction` is the dataset-change transaction the caller began when
+    // the user acted (see createLatestDatasetReloadCoordinator), so work the
+    // caller did before this call — reading a file, connecting a server — is
+    // already owned by it. `startup` marks the one load the bootstrap starts:
+    // its network awaits run as deadline-bound startup steps, its progress is
+    // shown, it does not rewrite the address the page was opened with, and a
+    // failure that no newer choice superseded is the terminal startup failure.
     async function reloadActiveDatasetInPlace(selection) {
       const activationKeys = [
         'datasetId',
         'loadMethod',
         'source',
-        'sourceType'
+        'sourceType',
+        'startup',
+        'transaction'
       ];
+      const activationShapeMessage =
+        'Dataset activation must contain exactly datasetId, loadMethod, ' +
+        'source, sourceType, startup, and transaction.';
       if (
         selection === null ||
         typeof selection !== 'object' ||
         Array.isArray(selection) ||
         Object.getPrototypeOf(selection) !== Object.prototype
       ) {
-        throw new TypeError(
-          'Dataset activation must contain exactly datasetId, loadMethod, source, and sourceType.'
-        );
+        throw new TypeError(activationShapeMessage);
       }
       const ownActivationKeys = Reflect.ownKeys(selection);
       if (
@@ -1663,9 +1861,7 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
             !activationKeys.includes(key)
         )
       ) {
-        throw new TypeError(
-          'Dataset activation must contain exactly datasetId, loadMethod, source, and sourceType.'
-        );
+        throw new TypeError(activationShapeMessage);
       }
       for (const key of activationKeys) {
         const descriptor =
@@ -1684,32 +1880,47 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
         datasetId,
         loadMethod,
         source,
-        sourceType
+        sourceType,
+        startup: isStartupLoad,
+        transaction: reloadTransaction
       } = selection;
-      const reloadTransaction = datasetReloadCoordinator.begin();
+      if (typeof isStartupLoad !== 'boolean') {
+        throw new TypeError('Dataset activation startup must be a boolean.');
+      }
+      requireDatasetChangeTransaction(reloadTransaction);
       reloadTransaction.assertCurrent();
 
-      const loadToken = startDatasetLoad(loadMethod, {
-        datasetId,
-        reload: true,
-        sourceType
-      });
+      const dataLoad = isStartupLoad
+        ? analytics.beginDataLoad(loadMethod, sourceType, {
+            fromNavigation: true,
+            datasetId
+          })
+        : analytics.beginDataLoad(loadMethod, sourceType);
+      const stagePhases = isStartupLoad ? startup : RELOAD_STAGE_PHASES;
       let selectionStage = null;
       let runtimeStage = null;
       let urlPublication = null;
 
       try {
-        selectionStage = await dataSourceManager.stageDatasetSelection(
-          sourceType,
-          datasetId,
-          { loadMethod, source }
+        selectionStage = await stagePhases.step(
+          'identity',
+          `the ${sourceType} dataset "${datasetId}"`,
+          () => dataSourceManager.stageDatasetSelection(
+            sourceType,
+            datasetId,
+            { loadMethod, source }
+          )
         );
         reloadTransaction.assertCurrent();
-        urlPublication = prepareUrlForDatasetSelection({
-          datasetId,
-          source,
-          sourceType
-        });
+        // The address the page was opened with already names the startup
+        // selection (or names nothing, for the catalog default).
+        urlPublication = isStartupLoad
+          ? UNCHANGED_URL_PUBLICATION
+          : prepareUrlForDatasetSelection({
+              datasetId,
+              source,
+              sourceType
+            });
         const candidateAnnDataBinding =
           isAnnDataUrl(selectionStage.baseUrl)
             ? createCandidateAnnDataBinding(
@@ -1727,8 +1938,11 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
         runtimeStage = await stageDatasetRuntime({
           baseUrl: selectionStage.baseUrl,
           candidateAnnDataBinding,
+          // The same source `stageDatasetSelection` staged the dataset from.
+          datasetSource: source ?? dataSourceManager.getSource(sourceType),
           expectedIdentityId: selectionStage.identityId,
-          showProgress: false,
+          phases: stagePhases,
+          showProgress: isStartupLoad,
           signal: reloadTransaction.signal,
           stagedSource
         });
@@ -1762,17 +1976,19 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
         return handleDatasetReloadFailure({
           error: exactError,
           transaction: reloadTransaction,
-          cancel: () => cancelDataLoad(loadToken),
+          cancel: () => dataLoad.cancel(),
           reportFailure: failure => {
-            console.error('[Main] Failed to reload dataset in-place:', failure);
-            completeDataLoadFailure(loadToken, {
-              ...buildDatasetAnalyticsContext({
-                metadata: selectionStage?.metadata ?? null,
-                datasetId,
-                datasetName: selectionStage?.metadata?.name,
-                reload: true
-              }),
-              error: failure
+            // A failed startup load is logged once, by the terminal startup
+            // failure it becomes.
+            if (!isStartupLoad) {
+              console.error(
+                '[Main] Failed to reload dataset in-place:',
+                failure
+              );
+            }
+            dataLoad.fail(failure, {
+              datasetId,
+              metadata: selectionStage?.metadata ?? null
             });
           }
         });
@@ -1821,17 +2037,12 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
         return handleDatasetReloadFailure({
           error: exactError,
           transaction: reloadTransaction,
-          cancel: () => cancelDataLoad(loadToken),
+          cancel: () => dataLoad.cancel(),
           reportFailure: failure => {
             console.error('[Main] Failed to publish dataset selection:', failure);
-            completeDataLoadFailure(loadToken, {
-              ...buildDatasetAnalyticsContext({
-                metadata: selectionStage.metadata,
-                datasetId,
-                datasetName: selectionStage.metadata.name,
-                reload: true
-              }),
-              error: failure
+            dataLoad.fail(failure, {
+              datasetId,
+              metadata: selectionStage.metadata
             });
           }
         });
@@ -1895,20 +2106,15 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
         return handleDatasetReloadFailure({
           error: exactError,
           transaction: reloadTransaction,
-          cancel: () => cancelDataLoad(loadToken),
+          cancel: () => dataLoad.cancel(),
           reportFailure: failure => {
             console.error(
               '[Main] Failed to publish dataset runtime:',
               failure
             );
-            completeDataLoadFailure(loadToken, {
-              ...buildDatasetAnalyticsContext({
-                metadata: selectionStage.metadata,
-                datasetId,
-                datasetName: selectionStage.metadata.name,
-                reload: true
-              }),
-              error: failure
+            dataLoad.fail(failure, {
+              datasetId,
+              metadata: selectionStage.metadata
             });
           }
         });
@@ -1938,7 +2144,7 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
             'Dataset reload was superseded during UI synchronization.'
           ),
           transaction: publication,
-          cancel: () => cancelDataLoad(loadToken),
+          cancel: () => dataLoad.cancel(),
           reportFailure() {
             throw new Error(
               'A superseded publication must not report reload failure.'
@@ -1981,23 +2187,28 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
           }
         );
       }
+      // The published sample view belongs to the dataset now on screen, so
+      // it ends with that publication — not with a newer request, which may
+      // still fail and leave this dataset in place. Startup's sidecar
+      // requests are deadline-bound startup steps; an interactive switch's
+      // end with the publication that owns them.
       const stateOutcome = await restoreAdvertisedDatasetState({
+        requestStep: isStartupLoad
+          ? (url, operation) => startup.step('session', url, operation)
+          : (_url, operation) => operation(publication.signal),
         signal: publication.signal
       });
       const settledStateOutcome =
         await settlePublishedDatasetStateOutcome({
           outcome: stateOutcome,
           transaction: publication,
-          cancel: () => cancelDataLoad(loadToken),
-          complete: () => completeDataLoadSuccess(
-            loadToken,
-            buildDatasetAnalyticsContext({
-              metadata: selectionStage.metadata,
-              datasetId,
-              datasetName: selectionStage.metadata.name,
-              reload: true
-            })
-          )
+          cancel: () => dataLoad.cancel(),
+          complete: () => dataLoad.succeed({
+            datasetId,
+            metadata: selectionStage.metadata,
+            stateStatus: stateOutcome.status,
+            mapping: state.getMappingAnalytics()
+          })
         });
       debug.log(
         `[Main] Published dataset state outcome: ` +
@@ -2007,8 +2218,8 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
         synchronizationOutcome.status === 'ready-ui-error';
     }
 
-    async function clearActiveDatasetInPlace() {
-      const reloadTransaction = datasetReloadCoordinator.begin();
+    async function clearActiveDatasetInPlace(reloadTransaction) {
+      requireDatasetChangeTransaction(reloadTransaction);
       reloadTransaction.assertCurrent();
       await cancelPublishedDatasetStateAndWait();
       reloadTransaction.assertCurrent();
@@ -2216,9 +2427,10 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
         || Array.isArray(source)
         || Object.getPrototypeOf(source) !== Object.prototype
         || Object.keys(source).sort().join(',') !==
-          'alpha,outlierQuantiles,outlierThreshold,positions'
+          'alpha,colors,dimension,outlierQuantiles,outlierThreshold,positions'
         || !(source.positions instanceof Float32Array)
-        || source.positions.length % 3 !== 0
+        || ![1, 2, 3].includes(source.dimension)
+        || source.positions.length % source.dimension !== 0
       ) {
         throw new TypeError(
           'Smoke density rebuild requires one exact zero-copy dataset source.'
@@ -2232,10 +2444,12 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
 
       debug.log(
         `Building smoke volume at ${gridSize}^3 from ` +
-        `${source.positions.length / 3} dataset points with bounded ` +
+        `${source.positions.length / source.dimension} dataset points with bounded ` +
         `visibility streaming (GPU)…`
       );
       viewer.buildSmokeVolumeGPU(source.positions, {
+        colors: source.colors,
+        dimension: source.dimension,
         gridSize,
         gamma: 0.7,
         visibility: {
@@ -2267,10 +2481,15 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
       }
     }
 
-    async function restoreAdvertisedDatasetState({ signal }) {
+    async function restoreAdvertisedDatasetState({ requestStep, signal }) {
       if (!(signal instanceof AbortSignal)) {
         throw new TypeError(
           'Published dataset state requires one owner AbortSignal.'
+        );
+      }
+      if (typeof requestStep !== 'function') {
+        throw new TypeError(
+          'Published dataset state requires one request step runner.'
         );
       }
       if (activePublishedStateTask !== null) {
@@ -2295,6 +2514,7 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
             fetchArtifact: fetchSampleArtifact,
             getPublicationRevision: () => datasetPublicationGeneration,
             refreshUi: ui.refreshUiAfterStateLoad,
+            requestStep,
             sessionSerializer,
             signal: controller.signal
           });
@@ -2307,6 +2527,9 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
               ownerAborted: controller.signal.aborted
             });
           if (classified !== null) return classified;
+          // A startup request that stalled ends startup on its failure
+          // surface, naming the phase and URL, not as a missing sample view.
+          if (error?.code === STARTUP_STALL_CODE) throw error;
           const message = error instanceof Error
             ? error.message
             : String(error);
@@ -2363,6 +2586,7 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
       });
     }
 
+    startup.enter('ui');
     ui = initUI({
       state,
       viewer,
@@ -2371,19 +2595,34 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
       },
       clearActiveDataset: clearActiveDatasetInPlace,
       reloadActiveDataset: reloadActiveDatasetInPlace,
+      datasetChanges: datasetReloadCoordinator,
       sessionSerializer,
       dataSourceManager,
       jupyterSource
     });
     window._cellucidUi = ui;
-    datasetCatalogReady = ui.datasetCatalogReady;
-    fulfillDatasetSelectFocusRequest();
+    // Every runtime publication so far reached no UI.
+    ui.publishCellPresence(publicationHasCells(activeDatasetPublication));
 
     if (jupyterSource !== null) {
       const jupyterCommandHandlers = createJupyterCommandHandlers({
         state,
         viewer,
-        refreshUi: ui.refreshUiAfterStateLoad
+        refreshUi: ui.refreshUiAfterStateLoad,
+        reportDataMapping: report => jupyterSource.notifyDataMapping(report)
+      });
+      // Every mapping change reaches the notebook, except an answer to its
+      // own setDataMapping, which the command handler sends with the request
+      // id it names.
+      state.on('mapping:changed', ({ mapping, origin }) => {
+        if (origin === 'notebook') return;
+        void jupyterSource.notifyDataMapping({
+          origin,
+          requestId: null,
+          mapping
+        }).catch(error => {
+          console.error('[Main] Jupyter data-mapping report failed:', error);
+        });
       });
       jupyterSource.onHighlight(
         jupyterCommandHandlers.handleHighlight
@@ -2395,14 +2634,6 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
 
     // Allow session serializer to capture/restore cinematic camera state.
     sessionSerializer.setCinematicCameraRef(ui.cinematicCamera);
-
-    // Jupyter: publish readiness only after the complete dataset and UI exist.
-    if (jupyterSource !== null) {
-      await jupyterSource.notifyReady({
-        nCells: state.pointCount,
-        dimensions: state.activeDimensionLevel
-      });
-    }
 
     // Initialize Page Analysis / Comparison Module
     const pageAnalysisSection = document.getElementById('page-analysis-section');
@@ -2421,98 +2652,27 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
       });
     }
 
-    if (hasInitialDataset) {
-      if (initialPublication === null) {
-        throw new Error(
-          'Initial dataset state requires one runtime publication.'
-        );
-      }
-      if (currentDatasetLoadToken === null) {
-        throw new Error(
-          'Initial dataset state requires one analytics load token.'
-        );
-      }
-      let stateOutcome = { status: 'superseded' };
-      if (initialPublication.isCurrent()) {
-        const synchronizationOutcome = await synchronizePublishedDatasetUi(
-          dataSourceManager.getCurrentMetadata(),
-          initialPublication
-        );
-        if (
-          synchronizationOutcome.status !== 'superseded' &&
-          initialPublication.isCurrent()
-        ) {
-          assertCurrentDatasetPublication(initialPublication);
-          let fieldActivationError = null;
-          try {
-            await ui.activateField(-1);
-          } catch (error) {
-            fieldActivationError = error;
-          }
-          if (initialPublication.isCurrent()) {
-            assertCurrentDatasetPublication(initialPublication);
-            if (fieldActivationError !== null) {
-              throw fieldActivationError;
-            }
-            stateOutcome = await restoreAdvertisedDatasetState({
-              signal: initialPublication.signal
-            });
-          }
-        }
-      }
-      const initialLoadToken = currentDatasetLoadToken;
-      const settledStateOutcome =
-        await settleInitialPublishedDatasetStateOutcome({
-          outcome: stateOutcome,
-          transaction: initialPublication,
-          cancel: () => cancelDataLoad(initialLoadToken),
-          complete: () => completeDataLoadSuccess(
-            initialLoadToken,
-            buildDatasetAnalyticsContext()
-          )
-        });
-      currentDatasetLoadToken = null;
-      debug.log(
-        `[Main] Initial dataset state outcome: ` +
-        `${settledStateOutcome.status}`
-      );
-    } else if (currentDatasetLoadToken !== null) {
-      throw new Error(
-        'Dataset analytics token exists without an initial dataset.'
-      );
-    }
-
     // Setup connectivity controls
     // NOTE: Handlers are ALWAYS set up so they work for datasets loaded dynamically (h5ad/zarr)
     // The handlers check if connectivityManifest is available before doing anything
     function initializeConnectivityControls() {
       // Show connectivity controls if data is available at bootstrap
       if (connectivityManifest !== null && connectivityControls) {
-        connectivityControls.style.display = 'block';
+        connectivityControls.hidden = false;
       }
 
       // Use getter to always get current edge count (supports dynamic manifest updates)
       const getTotalEdges = () =>
         connectivityManifest === null ? 0 : connectivityManifest.n_edges;
-      const EDGE_UI_CAP = 100000000;  // 100M edges max in UI
-      // Retain the exact shuffled endpoints for KNN publication. Edge-prefix
-      // counting itself belongs to the viewer's accepted per-view R8 owner.
+      // Retain the exact endpoints for KNN publication. Which edges a pane
+      // shows, and how many are visible, belongs to the viewer's edge layer.
       let edgeSources = null;
       let edgeDestinations = null;
 
       // UI statistics describe only the active pane, while every pane owns its
-      // exact raw shuffled prefix inside the viewer.
+      // own selection of shown edges inside the viewer.
       let activeConnectivityStatsViewId = null;
       let actualVisibleEdges = getTotalEdges();
-
-      /**
-       * Fisher-Yates shuffle for edge arrays (in-place, synchronized).
-       * Uses seeded RNG for reproducibility across sessions.
-       * This ensures "first N edges" is a truly random sample.
-       */
-      function shuffleEdges(sources, destinations, weights) {
-        shuffleConnectivityEdges(sources, destinations, weights);
-      }
 
       /**
        * Validate one immutable SpatialIndex-owned LOD admission descriptor.
@@ -2556,12 +2716,12 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
 
       /**
        * Resolve one exact compositional visibility owner.
-       * An endpoint is visible only when its per-view Float32 transparency
-       * passes the scatter threshold and its current LOD admits the source ID.
+       * An endpoint is visible only when its per-view transparency passes the
+       * scatter threshold and its current LOD admits the source ID.
        *
        * @param {string} viewId - Exact live or snapshot view ID.
        * @param {number} dimensionLevel - Exact view dimension.
-       * @returns {{transparency: Float32Array, lodMembership: object|null, pointCount: number}}
+       * @returns {{transparency: Uint8Array, lodMembership: object|null, pointCount: number}}
        */
       function getConnectivityVisibilityOwner(viewId, dimensionLevel) {
         if (typeof viewId !== 'string' || viewId.length === 0) {
@@ -2578,23 +2738,17 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
             'Connectivity visibility requires an exact 1D, 2D, or 3D dimension.'
           );
         }
-        // Get filter transparency:
-        // - For live view: use state.getVisibilityArray()
-        // - For snapshots: use snapshot's transparency if it has its own filters
-        let transparency;
-        if (viewId === 'live') {
-          transparency = state.getVisibilityArray();
-        } else {
-          transparency = viewer.getViewTransparency(viewId);
-        }
+        // The view's published transparency already carries every filter,
+        // the outlier filter included, for the live view and snapshots alike.
+        const transparency = viewer.getViewTransparency(viewId);
 
         if (
-          !(transparency instanceof Float32Array) ||
+          !(transparency instanceof Uint8Array) ||
           connectivityManifest === null ||
           transparency.length !== connectivityManifest.n_cells
         ) {
           throw new TypeError(
-            'Connectivity filtering requires one exact Float32 visibility ' +
+            'Connectivity filtering requires one exact Uint8 visibility ' +
             'value per cell.'
           );
         }
@@ -2626,7 +2780,7 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
       }
 
       // Track current state - user's preference, NOT auto-adjusted by visibility changes
-      let currentEdgeLimit = Math.min(250000, getTotalEdges());  // User's desired edge count (stable)
+      let currentEdgeLimit = Math.min(CONNECTIVITY_DEFAULT_VISIBLE_TARGET, getTotalEdges());  // User's desired edge count (stable)
 
       /**
        * Update slider range based on visible edges.
@@ -2636,8 +2790,8 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
        */
       function updateSliderRange(visibleEdges) {
         if (!connectivityLimitInput) return;
-        const cappedMax = Math.min(visibleEdges, EDGE_UI_CAP);
-        if (cappedMax === 0) {
+        const maxEdges = visibleEdges;
+        if (maxEdges === 0) {
           connectivityLimitInput.max = 0;
           connectivityLimitInput.min = 0;
           connectivityLimitInput.value = 0;
@@ -2647,15 +2801,15 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
           return;
         }
         const minVal = Math.min(
-          cappedMax,
-          clamp(Math.round(cappedMax * 0.01), 100, 1000)
+          maxEdges,
+          clamp(Math.round(maxEdges * 0.01), 100, 1000)
         );
 
-        connectivityLimitInput.max = cappedMax;
+        connectivityLimitInput.max = maxEdges;
         connectivityLimitInput.min = minVal;
 
         // Slider shows achievable value, but preference stays unchanged
-        const achievable = Math.min(currentEdgeLimit, cappedMax);
+        const achievable = Math.min(currentEdgeLimit, maxEdges);
         connectivityLimitInput.value = Math.max(minVal, achievable);
 
         if (connectivityLimitDisplay) {
@@ -2681,34 +2835,40 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
        */
       function applyEdgeLodLimit() {
         const activeViewId = state.getActiveViewId();
-        const currentStats =
-          viewer.getEdgePrefixStatsForView(activeViewId);
-        if (currentStats === null || currentStats.current !== true) {
-          throw new Error(
-            `Exact edge LOD requires the current active-view prefix owner ` +
-            `for "${activeViewId}".`
-          );
-        }
-
-        // One stable user target is resolved transactionally into a separate
-        // exact raw prefix for every current pane.
-        viewer.setEdgeVisibleTarget(currentEdgeLimit);
+        // One stable user target: every pane shows the first
+        // `currentEdgeLimit` of its own visible edges.
+        viewer.setEdgeVisibleTarget(
+          Math.min(currentEdgeLimit, getTotalEdges())
+        );
         const acceptedStats =
-          viewer.getEdgePrefixStatsForView(activeViewId);
-        if (
-          acceptedStats === null ||
-          acceptedStats.current !== true ||
-          acceptedStats.visibleCount !== actualVisibleEdges
-        ) {
+          viewer.getEdgeSelectionStatsForView(activeViewId);
+        if (acceptedStats === null || acceptedStats.current !== true) {
           throw new Error(
             `Connectivity target publication for view "${activeViewId}" was incomplete.`
           );
         }
         updateConnectivityInfo(
           actualVisibleEdges,
-          Math.min(currentEdgeLimit, actualVisibleEdges)
+          acceptedStats.shownCount
         );
       }
+
+      // A pane's visible-edge count lands after its selection (it is one
+      // pass over the graph, run in slices); the active pane's count sets the
+      // slider's range when it does.
+      viewer.onConnectivityVisibleCount((viewId, stats) => {
+        if (
+          !edgesLoaded ||
+          viewId !== state.getActiveViewId() ||
+          stats.visibleCount === null
+        ) {
+          return;
+        }
+        activeConnectivityStatsViewId = viewId;
+        actualVisibleEdges = stats.visibleCount;
+        updateSliderRange(actualVisibleEdges);
+        updateConnectivityInfo(actualVisibleEdges, stats.shownCount);
+      });
 
       // Initial slider setup and info display
       updateSliderRange(actualVisibleEdges);
@@ -2716,6 +2876,9 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
 
       // Edge loading state
       let edgesLoaded = false;
+      // Bumped whenever the data mapping replaces the graph in use, so a KNN
+      // load started on the previous graph is never published.
+      let connectivityGraphGeneration = 0;
       let loadedEdgeData = null;
       let edgeLoadOwner = null;
       let connectivityToggleGeneration = 0;
@@ -2761,6 +2924,7 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
           controller: new AbortController(),
           publicationGeneration: datasetPublicationGeneration,
           manifest: connectivityManifest,
+          manifestUrl: connectivityManifestUrl,
           exportBaseUrl: EXPORT_BASE_URL,
           sourceType,
           datasetId,
@@ -2778,6 +2942,7 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
           owner.controller.signal.aborted ||
           owner.publicationGeneration !== datasetPublicationGeneration ||
           owner.manifest !== connectivityManifest ||
+          owner.manifestUrl !== connectivityManifestUrl ||
           owner.exportBaseUrl !== EXPORT_BASE_URL ||
           owner.sourceType !== dataSourceManager.getCurrentSourceType() ||
           owner.datasetId !== dataSourceManager.getCurrentDatasetId() ||
@@ -2831,32 +2996,26 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
 
       function synchronizeDatasetPublication() {
         actualVisibleEdges = getTotalEdges();
-        currentEdgeLimit = Math.min(250000, getTotalEdges());
+        currentEdgeLimit = Math.min(CONNECTIVITY_DEFAULT_VISIBLE_TARGET, getTotalEdges());
         if (connectivityCheckbox) {
           connectivityCheckbox.checked = false;
           connectivityCheckbox.disabled = false;
         }
         if (connectivitySliders) {
-          connectivitySliders.style.display = 'none';
+          connectivitySliders.hidden = true;
         }
         updateSliderRange(actualVisibleEdges);
         updateConnectivityInfo(actualVisibleEdges, Math.min(currentEdgeLimit, actualVisibleEdges));
         if (connectivityControls) {
-          connectivityControls.style.display =
-            connectivityManifest === null ? 'none' : 'block';
+          connectivityControls.hidden = connectivityManifest === null;
         }
       }
 
       function publishConnectivityEdges(owner, edgeData) {
         assertCurrentConnectivityLoadOwner(owner);
-        // The loader result is a private, unpublished generation. Shuffle its
-        // typed owners directly instead of retaining a second 16-byte-per-edge
-        // copy at the 100M-edge ceiling.
-        shuffleEdges(
-          edgeData.sources,
-          edgeData.destinations,
-          edgeData.weights
-        );
+        // The loader result is a private, unpublished generation: the viewer
+        // keeps its endpoints as they are (the shown order is computed, not
+        // stored) and reads the Float64 weights once.
         const renderEdgeData = Object.freeze({
           destinations: edgeData.destinations,
           nCells: edgeData.nCells,
@@ -2904,7 +3063,7 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
             'The viewer rejected live connectivity visibility.'
           );
         }
-        const liveStats = viewer.refreshEdgePrefixForView('live');
+        const liveStats = viewer.refreshEdgeSelectionForView('live');
         let activeStats =
           activeViewId === 'live' ? liveStats : null;
         for (const snapshot of existingSnapshots) {
@@ -2928,7 +3087,7 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
             );
           }
           const snapshotStats =
-            viewer.refreshEdgePrefixForView(snapshot.id);
+            viewer.refreshEdgeSelectionForView(snapshot.id);
           if (snapshot.id === activeViewId) {
             activeStats = snapshotStats;
           }
@@ -2940,14 +3099,16 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
           );
         }
         activeConnectivityStatsViewId = activeViewId;
-        actualVisibleEdges = activeStats.visibleCount;
+        // The count may still be running; it lands through
+        // onConnectivityVisibleCount.
+        actualVisibleEdges = activeStats.visibleCount ?? actualVisibleEdges;
         updateSliderRange(actualVisibleEdges);
         applyEdgeLodLimit();
 
-        // Float64 weights are needed only for the one GPU normalization/upload
-        // above. The retained lifecycle/KNN owner aliases the already-shuffled
-        // endpoints and lets the 8-byte-per-edge weight generation be
-        // collected immediately after this publication returns.
+        // Float64 weights are needed only for the strength normalization
+        // above. The retained lifecycle/KNN owner aliases the endpoints as
+        // loaded and lets the 8-byte-per-edge weight generation be collected
+        // immediately after this publication returns.
         const publishedEdgeData = Object.freeze({
           destinations: edgeDestinations,
           nCells: edgeData.nCells,
@@ -2974,7 +3135,7 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
         edgeDestinations = null;
         activeConnectivityStatsViewId = null;
         actualVisibleEdges = getTotalEdges();
-        currentEdgeLimit = Math.min(250000, actualVisibleEdges);
+        currentEdgeLimit = Math.min(CONNECTIVITY_DEFAULT_VISIBLE_TARGET, actualVisibleEdges);
         stopLodTracking();
         if (edgeVisibilityThrottleTimer !== null) {
           clearTimeout(edgeVisibilityThrottleTimer);
@@ -3007,7 +3168,7 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
         owner.promise = (async () => {
           try {
             const edgeData = await loadEdges(
-              getConnectivityManifestUrl(owner.exportBaseUrl),
+              owner.manifestUrl,
               owner.manifest,
               { signal: owner.controller.signal }
             );
@@ -3075,7 +3236,14 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
                 return;
               }
               console.error('Failed to load connectivity data:', err);
-              notifications.fail(connNotifId, 'Failed to load connectivity');
+              // A graph larger than the memory the browser grants is a
+              // connectivity failure only: the dataset stays loaded.
+              notifications.fail(
+                connNotifId,
+                err?.code === DataSourceErrorCode.TOO_LARGE || err instanceof RangeError
+                  ? 'Connectivity needs more memory than this browser could allocate; the dataset stays loaded without edges'
+                  : 'Failed to load connectivity'
+              );
               connectivityCheckbox.checked = false;
               return;
             }
@@ -3091,7 +3259,7 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
               connectivityCheckbox.checked = false;
               viewer.setShowConnectivity(false);
               if (connectivitySliders) {
-                connectivitySliders.style.display = 'none';
+                connectivitySliders.hidden = true;
               }
               stopLodTracking();
               notifications.error(
@@ -3104,7 +3272,7 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
 
           viewer.setShowConnectivity(show);
           if (connectivitySliders) {
-            connectivitySliders.style.display = show ? 'block' : 'none';
+            connectivitySliders.hidden = !show;
           }
 
           // Start/stop LOD tracking based on visibility
@@ -3148,7 +3316,7 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
             `"${viewId}".`
           );
         }
-        const stats = viewer.refreshEdgePrefixForView(viewId);
+        const stats = viewer.refreshEdgeSelectionForView(viewId);
         if (publishActive) {
           publishActiveConnectivityCounts(viewId, stats);
         }
@@ -3163,11 +3331,11 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
           stats.viewId !== viewId
         ) {
           throw new Error(
-            `Connectivity UI requires current prefix statistics for view "${viewId}".`
+            `Connectivity UI requires current edge statistics for view "${viewId}".`
           );
         }
         activeConnectivityStatsViewId = viewId;
-        actualVisibleEdges = stats.visibleCount;
+        actualVisibleEdges = stats.visibleCount ?? actualVisibleEdges;
         updateSliderRange(actualVisibleEdges);
         if (connectivityCheckbox?.checked) {
           applyEdgeLodLimit();
@@ -3177,7 +3345,7 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
       function updateActiveConnectivityCounts() {
         if (!edgesLoaded) return;
         const activeViewId = state.getActiveViewId();
-        const stats = viewer.refreshEdgePrefixForView(activeViewId);
+        const stats = viewer.refreshEdgeSelectionForView(activeViewId);
         publishActiveConnectivityCounts(
           activeViewId,
           stats
@@ -3326,7 +3494,7 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
             connectivityCheckbox.checked = false;
             viewer.setShowConnectivity(false);
             if (connectivitySliders) {
-              connectivitySliders.style.display = 'none';
+              connectivitySliders.hidden = true;
             }
             stopLodTracking();
             notifications.error(
@@ -3407,26 +3575,24 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
         });
       }
 
-      // Whether a dataset ships a neighbour graph is fixed for the whole life
-      // of its publication, so it is worth saying exactly once. The renderer
-      // asks for KNN edges when the mode is entered and again on every
-      // Alt+drag, so announcing the absence per call stacks identical toasts
-      // over one unchanged fact. This records the generation the absence was
-      // announced for; the next publication carries a different generation and
-      // therefore arms the announcement again, including for a dataset that
-      // still has no neighbour graph.
+      // Whether a dataset has a neighbour graph changes only with its
+      // publication or its data mapping, so it is worth saying exactly once
+      // per graph. The renderer asks for KNN edges when the mode is entered
+      // and again on every Alt+drag, so announcing the absence per call stacks
+      // identical toasts over one unchanged fact. This records the publication
+      // and graph generation the absence was announced for; the next
+      // publication, or a mapping that changes the graph, arms the
+      // announcement again, including when there is still no graph.
       let announcedMissingConnectivityGeneration = null;
 
       // Set up KNN edge load callback - triggers when KNN mode needs edges
       // This loads edges on-demand when user first tries to use KNN drag
       viewer.setKnnEdgeLoadCallback(() => {
         if (connectivityManifest === null) {
-          if (
-            announcedMissingConnectivityGeneration !==
-            datasetPublicationGeneration
-          ) {
-            announcedMissingConnectivityGeneration =
-              datasetPublicationGeneration;
+          const graphGeneration =
+            `${datasetPublicationGeneration}:${connectivityGraphGeneration}`;
+          if (announcedMissingConnectivityGeneration !== graphGeneration) {
+            announcedMissingConnectivityGeneration = graphGeneration;
             console.warn(
               '[Main] KNN mode requested but no connectivity manifest available'
             );
@@ -3445,6 +3611,7 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
         }
 
         const requestGeneration = datasetPublicationGeneration;
+        const requestGraphGeneration = connectivityGraphGeneration;
         const knnNotifId = notifications.loading(
           'Loading neighbor graph for KNN mode',
           { category: 'connectivity' }
@@ -3455,6 +3622,7 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
             const edgeData = await ensureConnectivityEdgesLoaded();
             if (
               requestGeneration !== datasetPublicationGeneration ||
+              requestGraphGeneration !== connectivityGraphGeneration ||
               edgesLoaded !== true ||
               loadedEdgeData !== edgeData
             ) {
@@ -3479,7 +3647,8 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
           } catch (err) {
             if (
               isDatasetReloadSupersededError(err) ||
-              requestGeneration !== datasetPublicationGeneration
+              requestGeneration !== datasetPublicationGeneration ||
+              requestGraphGeneration !== connectivityGraphGeneration
             ) {
               notifications.dismiss(knnNotifId);
               return;
@@ -3499,8 +3668,47 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
         });
       });
 
+      /**
+       * The neighbour graph in use: its manifest (null for none) and where it
+       * is read from.
+       */
+      function getConnectivityGraph() {
+        return Object.freeze({
+          manifest: connectivityManifest,
+          manifestUrl: connectivityManifestUrl
+        });
+      }
+
+      /**
+       * Replace the neighbour graph in use, as one step of a data-mapping
+       * transaction: the edges and the KNN tool's graph are released, the
+       * new manifest is published, and the edges are drawn again from the new
+       * graph if they were shown. Applying the previous graph rolls it back.
+       *
+       * @param {{manifest: Object|null, manifestUrl: string|null}} graph
+       */
+      function replaceConnectivityGraph({ manifest, manifestUrl }) {
+        if ((manifest === null) !== (manifestUrl === null)) {
+          throw new TypeError(
+            'A neighbour graph is a manifest with its URL, or neither.'
+          );
+        }
+        const wasShown = connectivityCheckbox?.checked === true;
+        prepareDatasetReplacement();
+        connectivityManifest = manifest;
+        connectivityManifestUrl = manifestUrl;
+        connectivityGraphGeneration++;
+        synchronizeDatasetPublication();
+        if (wasShown && manifest !== null && connectivityCheckbox) {
+          connectivityCheckbox.checked = true;
+          connectivityCheckbox.dispatchEvent(new Event('change'));
+        }
+      }
+
       return Object.freeze({
+        getConnectivityGraph,
         prepareDatasetReplacement,
+        replaceConnectivityGraph,
         synchronizeDatasetPublication
       });
     }
@@ -3511,6 +3719,7 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
     const benchmarkRunBtn = document.getElementById('benchmark-run');
     const benchmarkCountInput = document.getElementById('benchmark-count');
     const benchmarkPatternSelect = document.getElementById('benchmark-pattern');
+    const benchmarkRepresentationsSelect = document.getElementById('benchmark-representations');
     const benchmarkStatsEl = document.getElementById('benchmark-stats');
     const benchPresets = document.querySelectorAll('.benchmark-preset');
     const benchmarkReportBtn = document.getElementById('benchmark-report-btn');
@@ -3519,6 +3728,7 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
     const benchPointsEl = document.getElementById('bench-points');
     const benchFpsEl = document.getElementById('bench-fps');
     const benchFrametimeEl = document.getElementById('bench-frametime');
+    const benchRendertimeEl = document.getElementById('bench-rendertime');
     const benchMemoryEl = document.getElementById('bench-memory');
     const benchLodEl = document.getElementById('bench-lod');
     const benchVisibleEl = document.getElementById('bench-visible');
@@ -3736,7 +3946,7 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
 
     const ensureBenchmarkStatsVisible = () => {
       if (benchmarkStatsEl) {
-        benchmarkStatsEl.style.display = 'block';
+        benchmarkStatsEl.hidden = false;
       }
     };
 
@@ -3758,9 +3968,9 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
       if (benchGenInfoEl && benchGenTimeEl) {
         if (generationMs != null) {
           benchGenTimeEl.textContent = generationMs;
-          benchGenInfoEl.style.display = 'block';
+          benchGenInfoEl.hidden = false;
         } else {
-          benchGenInfoEl.style.display = 'none';
+          benchGenInfoEl.hidden = true;
         }
       }
 
@@ -3773,24 +3983,31 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
           benchFpsEl.textContent = displayFps ?? '-';
         }
         if (benchFrametimeEl) {
-          const frameText = displayFrameTime != null ? `${displayFrameTime} ms` : '-';
-          benchFrametimeEl.textContent = renderFrameTime ? `${frameText} (render ${renderFrameTime} ms)` : frameText;
+          benchFrametimeEl.textContent = displayFrameTime != null ? `${displayFrameTime} ms` : '-';
+        }
+        if (benchRendertimeEl) {
+          // Main-thread time spent issuing the last frame, not GPU time. Under
+          // the page's coarse timer it often reads 0.00, which says nothing.
+          const cpuShown = renderFrameTime != null && renderFrameTime !== '0.00';
+          benchRendertimeEl.textContent = cpuShown ? `CPU ${renderFrameTime} ms` : '';
+          benchRendertimeEl.hidden = !cpuShown;
         }
 
         if (stats.samples >= 30 && benchTimingDetailsEl) {
-          benchTimingDetailsEl.style.display = 'block';
+          benchTimingDetailsEl.hidden = false;
           // Format timing values with 2 decimal places
           const formatTiming = (val) => typeof val === 'number' ? val.toFixed(2) : val;
           if (benchMinFtEl) benchMinFtEl.textContent = formatTiming(stats.minFrameTime) + ' ms';
           if (benchP95FtEl) benchP95FtEl.textContent = formatTiming(stats.p95FrameTime) + ' ms';
           if (benchMaxFtEl) benchMaxFtEl.textContent = formatTiming(stats.maxFrameTime) + ' ms';
         } else if (benchTimingDetailsEl) {
-          benchTimingDetailsEl.style.display = 'none';
+          benchTimingDetailsEl.hidden = true;
         }
       } else {
         if (benchFpsEl) benchFpsEl.textContent = '-';
         if (benchFrametimeEl) benchFrametimeEl.textContent = '-';
-        if (benchTimingDetailsEl) benchTimingDetailsEl.style.display = 'none';
+        if (benchRendertimeEl) benchRendertimeEl.hidden = true;
+        if (benchTimingDetailsEl) benchTimingDetailsEl.hidden = true;
       }
 
       if (hpStats) {
@@ -3989,8 +4206,26 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
       return false;
     }
 
+    // A run is a dataset change like any other: it supersedes the load in
+    // flight when the user starts it, and a later choice supersedes it.
     async function runBenchmark(pointCount, pattern) {
       const syntheticTransaction = datasetReloadCoordinator.begin();
+      try {
+        return await runSyntheticBenchmark(
+          syntheticTransaction,
+          pointCount,
+          pattern
+        );
+      } finally {
+        syntheticTransaction.finish();
+      }
+    }
+
+    async function runSyntheticBenchmark(
+      syntheticTransaction,
+      pointCount,
+      pattern
+    ) {
       // Ensure benchmark module is loaded before running
       const moduleLoaded = await ensureBenchmarkModule();
       if (!syntheticTransaction.isCurrent()) return reportSupersededBenchmark();
@@ -4042,8 +4277,9 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
       ensureBenchmarkStatsVisible();
       if (benchFpsEl) benchFpsEl.textContent = '-';
       if (benchFrametimeEl) benchFrametimeEl.textContent = '-';
-      if (benchTimingDetailsEl) benchTimingDetailsEl.style.display = 'none';
-      if (benchGenInfoEl) benchGenInfoEl.style.display = 'none';
+      if (benchRendertimeEl) benchRendertimeEl.hidden = true;
+      if (benchTimingDetailsEl) benchTimingDetailsEl.hidden = true;
+      if (benchGenInfoEl) benchGenInfoEl.hidden = true;
 
       // Generate off the main thread. Every pattern costs six to twenty-five
       // transcendental calls per point in one uninterruptible loop, so running
@@ -4085,19 +4321,26 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
         if (
           !Number.isSafeInteger(pointCount) ||
           pointCount < 1 ||
+          ![1, 2, 3].includes(data.dimensionLevel) ||
           !(data.positions instanceof Float32Array) ||
-          data.positions.length !== pointCount * 3 ||
+          data.positions.length !== pointCount * data.dimensionLevel ||
           !(data.colors instanceof Uint8Array) ||
           data.colors.length !== pointCount * 4
         ) {
           throw new TypeError(
             'Synthetic benchmark data must contain exact dataset-length ' +
-            'Float32 XYZ and Uint8 RGBA arrays.'
+            'Float32 positions (dimensionLevel values per point) and ' +
+            'Uint8 RGBA arrays.'
           );
         }
         candidateDimensionManager = createInMemoryDimensionManager({
           positions: data.positions,
-          dimension: data.dimensionLevel
+          dimension: data.dimensionLevel,
+          representations: syntheticRepresentations(
+            data.positions,
+            data.dimensionLevel,
+            benchmarkRepresentationsSelect?.value ?? 'one'
+          )
         });
       } catch (error) {
         console.error('Failed to stage benchmark data:', error);
@@ -4203,6 +4446,8 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
           }
           connectivityRuntimeOwner.prepareDatasetReplacement();
           connectivityRuntimeOwner.synchronizeDatasetPublication();
+          // A synthetic scene has no data mapping; the panel says so.
+          ui?.refreshDataMapping?.();
           if (window._comparisonModule) {
             try {
               await window._comparisonModule.resetForDatasetReload({
@@ -4259,7 +4504,7 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
       // Show generation time
       if (benchGenInfoEl && benchGenTimeEl) {
         benchGenTimeEl.textContent = genTime;
-        benchGenInfoEl.style.display = 'block';
+        benchGenInfoEl.hidden = false;
       }
 
       const syntheticDimLevel = data.dimensionLevel;
@@ -4272,17 +4517,6 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
         visiblePoints: pointCount,
         dimensionLevel: syntheticDimLevel
       };
-
-      trackDataLoadMethod(DATA_LOAD_METHODS.BENCHMARK_SYNTHETIC, {
-        datasetId: `synthetic-${pattern}`,
-        datasetName: `Synthetic ${pattern}`,
-        sourceType: 'benchmark',
-        cellCount: pointCount,
-        obsFieldCount: 0,
-        edgeCount: 0,
-        durationMs: genTime,
-        success: 1
-      });
 
       const gpuMemEstimateMB =
         estimateBenchmarkGpuMemoryMB(pointCount);
@@ -4298,7 +4532,17 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
       return true;
     }
 
+    // The situation report and the bottleneck analysis both measure drawn
+    // cells, and None leaves none to draw: no frame would ever publish the
+    // renderer statistics they read.
+    const NO_CELLS_TO_MEASURE =
+      'Load a dataset or generate benchmark data first.';
+
     async function generateSituationReport() {
+      if (viewer.getPointCount() === 0) {
+        notifications.info(NO_CELLS_TO_MEASURE, { category: 'benchmark' });
+        return;
+      }
       const [runtimeLoaded, supportModule] = await Promise.all([
         ensureBenchmarkModule(),
         ensureBenchmarkSupportModule()
@@ -4350,7 +4594,7 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
       const yamlOutput = report.yaml();
       if (benchmarkReportOutput) {
         benchmarkReportOutput.value = yamlOutput;
-        benchmarkReportOutput.style.display = 'block';
+        benchmarkReportOutput.hidden = false;
       }
 
       let copiedToClipboard = false;
@@ -4456,11 +4700,11 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
 
     if (bottleneckAnalyzeBtn) {
       bottleneckAnalyzeBtn.addEventListener('click', async () => {
-        const hpRenderer = viewer.getHPRenderer();
-        if (!hpRenderer) {
-          alert('Load some data first before analyzing performance.');
+        if (viewer.getPointCount() === 0) {
+          notifications.info(NO_CELLS_TO_MEASURE, { category: 'benchmark' });
           return;
         }
+        const hpRenderer = viewer.getHPRenderer();
 
         const [runtimeLoaded, supportModule] = await Promise.all([
           ensureBenchmarkModule(),
@@ -4489,11 +4733,11 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
         // Show progress
         bottleneckAnalyzeBtn.disabled = true;
         bottleneckAnalyzeBtn.textContent = 'Analyzing...';
-        if (bottleneckProgress) bottleneckProgress.style.display = 'block';
-        if (bottleneckResults) bottleneckResults.style.display = 'none';
+        if (bottleneckProgress) bottleneckProgress.hidden = false;
+        if (bottleneckResults) bottleneckResults.hidden = true;
 
         try {
-          const analyzer = new BottleneckAnalyzer(gl, hpRenderer);
+          const analyzer = new BottleneckAnalyzer(gl, hpRenderer, viewer);
 
           const results = await analyzer.runAnalysis({
             warmupFrames: 30,
@@ -4501,8 +4745,8 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
           });
 
           // Hide progress, show results
-          if (bottleneckProgress) bottleneckProgress.style.display = 'none';
-          if (bottleneckResults) bottleneckResults.style.display = 'block';
+          if (bottleneckProgress) bottleneckProgress.hidden = true;
+          if (bottleneckResults) bottleneckResults.hidden = false;
 
           const s = results.summary;
           const b = results.bottleneckType;
@@ -4688,7 +4932,7 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
 
         } catch (err) {
           console.error('[Bottleneck] Analysis failed:', err);
-          if (bottleneckProgress) bottleneckProgress.style.display = 'none';
+          if (bottleneckProgress) bottleneckProgress.hidden = true;
           alert('Analysis failed: ' + err.message);
         } finally {
           bottleneckAnalyzeBtn.disabled = false;
@@ -4710,16 +4954,10 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
       }
     };
 
-    setDimensionLevel = (dim) => {
-      const dimensionSelect = document.getElementById('dimension-select');
-      if (dimensionSelect) {
-        // Check if the dimension is available
-        const option = dimensionSelect.querySelector(`option[value="${dim}"]`);
-        if (option && !option.disabled) {
-          dimensionSelect.value = String(dim);
-          dimensionSelect.dispatchEvent(new Event('change', { bubbles: true }));
-        }
-      }
+    // 1, 2 and 3: the dimension's default in the selected view, then each of
+    // its other enabled representations in turn.
+    cycleRepresentation = (dim) => {
+      void ui?.cycleRepresentation?.(dim);
     };
 
     clearAllHighlights = () => {
@@ -4737,8 +4975,37 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
     };
 
     viewer.start();
+
+    // Every control and the render loop now exist, so the startup selection
+    // loads as one ordinary dataset change: its progress is the data
+    // controls' own, and any dataset choice the user makes while it loads —
+    // a sample, None, a file, a connection, the benchmark — supersedes it.
+    // Only a failure that no newer choice superseded ends startup.
+    let startupOutcome = 'none';
+    if (startupSelection !== null) {
+      startupOutcome = await ui.loadStartupDataset(startupSelection);
+      // Jupyter: Python is told the viewer is ready only once its own
+      // dataset is on screen. A dataset the user chose instead in this
+      // viewer is not the one Python's indices describe.
+      if (jupyterSource !== null && startupOutcome === 'ready') {
+        await startup.step(
+          'ui',
+          'the Jupyter Python server',
+          () => jupyterSource.notifyReady({
+            nCells: state.pointCount,
+            dimensions: state.getDimensionLevel()
+          })
+        );
+      }
+    }
+    startup.enter('ready');
+    analytics.trackAppReady({
+      viewer,
+      hasDataset: startupOutcome === 'ready'
+    });
   } catch (thrown) {
     const startupError = normalizeStartupError(thrown);
+    startup.retire(startupError);
     console.error('[Main] Terminal startup failure:', startupError);
     if (destroyApplication !== null) {
       void destroyApplication().catch(error => {
@@ -4750,19 +5017,9 @@ function getDatasetIdentityUrl(baseUrl) { return `${baseUrl}dataset_identity.jso
       error: startupError,
       statsElement: statsEl
     });
-    if (currentDatasetLoadToken) {
-      try {
-        completeDataLoadFailure(currentDatasetLoadToken, {
-          ...buildDatasetAnalyticsContext(),
-          error: startupError
-        });
-        currentDatasetLoadToken = null;
-      } catch (analyticsError) {
-        console.error(
-          '[Main] Startup analytics failure reporting also failed:',
-          analyticsError
-        );
-      }
-    }
+    analytics.trackStartupFailure({
+      phase: startup.phase,
+      error: startupError
+    });
   }
 })();

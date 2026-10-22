@@ -7,14 +7,16 @@
 
 import { assertCameraState } from '../../../../rendering/camera-state-contract.js';
 import { assertCropRect01 } from './utils/crop.js';
-import { assertLodMembership } from './utils/lod-membership.js';
+import { assertDrawOrder, assertLodMembership } from './utils/lod-membership.js';
 import { assertReferenceGridAppearance } from './utils/viewer-background.js';
+import { SHADER_QUALITIES } from '../../../../rendering/shader-quality.js';
+import { isBackdropLook } from '../../../../rendering/backdrops/backdrop-looks.js';
 
 const FORMATS = new Set(['png', 'svg']);
 const STRATEGIES = new Set(['full-vector', 'optimized-vector', 'hybrid']);
 const LEGEND_POSITIONS = new Set(['right', 'bottom']);
 const BACKGROUNDS = new Set(['viewer', 'white', 'transparent', 'custom']);
-const SHADER_QUALITIES = new Set(['full', 'light', 'ultralight']);
+const SHADER_QUALITY_SET = new Set(SHADER_QUALITIES);
 
 const BASE_REQUEST_KEYS = Object.freeze([
   'axisLabelFontSizePx',
@@ -95,6 +97,7 @@ const SELECTION_KEYS = Object.freeze([
 const SCIENTIFIC_STATE_KEYS = Object.freeze([
   'datasetGeneration',
   'dimensionLevel',
+  'drawOrder',
   'fieldKey',
   'fieldKind',
   'filters',
@@ -114,6 +117,7 @@ const META_VIEW_KEYS = Object.freeze([
 const NORM_TRANSFORM_KEYS = Object.freeze(['center', 'scale']);
 const RENDER_STATE_KEYS = Object.freeze([
   'antialias',
+  'backdrop',
   'bgColor',
   'cameraDistance',
   'cameraPosition',
@@ -136,6 +140,64 @@ const RENDER_STATE_KEYS = Object.freeze([
   'viewportHeight',
   'viewportWidth',
 ]);
+
+const BACKDROP_KEYS = Object.freeze([
+  'centerY',
+  'extentX',
+  'extentY',
+  'extentZ',
+  'flat',
+  'floorY',
+  'glowCenterX',
+  'look',
+  'pixelRatio',
+  'planarity',
+  'stageX',
+  'stageZ',
+]);
+
+const BACKDROP_LOOK_KEYS = Object.freeze(['ambient', 'id', 'shadow', 'time', 'tints']);
+const BACKDROP_LOOK_SHADOW_KEYS = Object.freeze(['packed', 'size', 'window']);
+
+/**
+ * The pane's backdrop look as the screen shows it (`getExportState()` of
+ * `rendering/backdrops/backdrop-look-renderer.js`), or null without one.
+ */
+function assertBackdropLook(look, context) {
+  if (look === null) return;
+  assertExactKeys(look, BACKDROP_LOOK_KEYS, context);
+  if (!isBackdropLook(look.id)) {
+    throw new TypeError(`${context}.id must name a background look.`);
+  }
+  if (!Array.isArray(look.tints) || look.tints.length !== 3) {
+    throw new TypeError(`${context}.tints must be three colours.`);
+  }
+  look.tints.forEach((tint, index) => {
+    if (!Array.isArray(tint) || tint.length !== 3) {
+      throw new TypeError(`${context}.tints[${index}] must be an RGB triple.`);
+    }
+    tint.forEach((channel, k) => assertFiniteNumber(channel, `${context}.tints[${index}][${k}]`, 0));
+  });
+  assertFiniteNumber(look.time, `${context}.time`, 0);
+  if (look.ambient !== 0 && look.ambient !== 1) {
+    throw new TypeError(`${context}.ambient must be exactly 0 or 1.`);
+  }
+  if (look.shadow === null) return;
+  assertExactKeys(look.shadow, BACKDROP_LOOK_SHADOW_KEYS, `${context}.shadow`);
+  if (!Number.isSafeInteger(look.shadow.size) || look.shadow.size <= 0) {
+    throw new TypeError(`${context}.shadow.size must be a positive integer.`);
+  }
+  if (
+    !(look.shadow.packed instanceof Uint16Array)
+    || look.shadow.packed.length !== look.shadow.size * look.shadow.size * 2
+  ) {
+    throw new TypeError(`${context}.shadow.packed must be the size² × 2 half-float map.`);
+  }
+  if (!Array.isArray(look.shadow.window) || look.shadow.window.length !== 3) {
+    throw new TypeError(`${context}.shadow.window must be [centre u, centre v, half size].`);
+  }
+  look.shadow.window.forEach((value, k) => assertFiniteNumber(value, `${context}.shadow.window[${k}]`));
+}
 
 function assertPlainObject(value, context) {
   if (
@@ -210,7 +272,7 @@ function readFigureExportAbortState(signal, context) {
  * @param {string} [context]
  * @returns {AbortSignal}
  */
-export function assertFigureExportSignal(
+function assertFigureExportSignal(
   signal,
   context = 'Figure export signal'
 ) {
@@ -560,8 +622,32 @@ function assertOwnedLegendValue(value, context, seen = new Set()) {
   seen.delete(value);
 }
 
+/**
+ * The studio backdrop geometry the viewer drew the pane with
+ * (`getPresentedViewState().renderState.backdrop`).
+ */
+function assertBackdrop(backdrop, context) {
+  assertExactKeys(backdrop, BACKDROP_KEYS, context);
+  if (typeof backdrop.flat !== 'boolean') {
+    throw new TypeError(`${context}.flat must be an exact boolean.`);
+  }
+  for (const key of ['centerY', 'floorY', 'stageX', 'stageZ']) {
+    assertFiniteNumber(backdrop[key], `${context}.${key}`);
+  }
+  for (const key of ['extentX', 'extentY', 'extentZ']) {
+    assertFiniteNumber(backdrop[key], `${context}.${key}`, 0);
+  }
+  assertFiniteNumber(backdrop.glowCenterX, `${context}.glowCenterX`, -1, 1);
+  assertFiniteNumber(backdrop.pixelRatio, `${context}.pixelRatio`, Number.MIN_VALUE);
+  if (backdrop.planarity !== 0 && backdrop.planarity !== 1) {
+    throw new TypeError(`${context}.planarity must be exactly 0 or 1.`);
+  }
+  assertBackdropLook(backdrop.look, `${context}.look`);
+}
+
 function assertRenderState(renderState, context) {
   assertExactKeys(renderState, RENDER_STATE_KEYS, context);
+  assertBackdrop(renderState.backdrop, `${context}.backdrop`);
   for (const key of ['mvpMatrix', 'viewMatrix', 'modelMatrix', 'projectionMatrix']) {
     assertFloat32Array(renderState[key], 16, `${context}.${key}`);
   }
@@ -601,7 +687,7 @@ function assertRenderState(renderState, context) {
   if (typeof renderState.antialias !== 'boolean') {
     throw new TypeError(`${context}.antialias must be an exact boolean.`);
   }
-  if (!SHADER_QUALITIES.has(renderState.shaderQuality)) {
+  if (!SHADER_QUALITY_SET.has(renderState.shaderQuality)) {
     throw new TypeError(`${context}.shaderQuality is not a current shader quality.`);
   }
   if (
@@ -614,21 +700,27 @@ function assertRenderState(renderState, context) {
   }
 }
 
-function assertViewData(data, context) {
+/**
+ * @param {object} data
+ * @param {number} dimensionLevel - The view's dimension, which is also the
+ *   number of position components per point.
+ * @param {string} context
+ */
+function assertViewData(data, dimensionLevel, context) {
   assertExactKeys(data, VIEW_DATA_KEYS, context);
   assertInteger(data.pointCount, `${context}.pointCount`, 0);
+  assertInteger(dimensionLevel, `${context} dimensionLevel`, 1, 3);
   assertFloat32Array(
     data.positions,
-    data.pointCount * 3,
+    data.pointCount * dimensionLevel,
     `${context}.positions`,
     { checkValues: false }
   );
   assertUint8Array(data.colors, data.pointCount * 4, `${context}.colors`);
-  assertFloat32Array(
+  assertUint8Array(
     data.transparency,
     data.pointCount,
-    `${context}.transparency`,
-    { checkValues: false }
+    `${context}.transparency`
   );
   assertExactKeys(data.centroidFlags, CENTROID_FLAG_KEYS, `${context}.centroidFlags`);
   assertBoolean(data.centroidFlags.points, `${context}.centroidFlags.points`);
@@ -753,6 +845,10 @@ function assertScientificState(scientificState, data, context) {
     pointCount: data.pointCount,
     dimensionLevel: scientificState.dimensionLevel,
     label: `${context}.lodMembership`,
+  });
+  assertDrawOrder(scientificState.drawOrder, {
+    pointCount: data.pointCount,
+    label: `${context}.drawOrder`,
   });
   assertFiniteNumber(
     scientificState.lodSizeMultiplier,
@@ -882,7 +978,11 @@ export function assertFigureExportPayload(payload) {
       throw new Error(`Figure export payload contains duplicate view "${view.id}".`);
     }
     viewIds.add(view.id);
-    assertViewData(view.data, `${context}.data`);
+    assertViewData(
+      view.data,
+      view.scientificState?.dimensionLevel,
+      `${context}.data`
+    );
     if (view.data.pointCount !== pointCount) {
       throw new RangeError(
         `${context}.data.pointCount must match every exported view.`

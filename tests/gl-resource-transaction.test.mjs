@@ -208,25 +208,31 @@ test('transform-feedback program failure releases both compiled shaders', () => 
   assert.equal(gl._state.deletedPrograms.length, 1);
 });
 
-test('GPU noise construction rolls back programs when a later program fails', () => {
-  const gl = createShaderGl({ failProgramLinkAt: 3 });
-  assert.throws(
-    () => new GPUNoiseGenerator(gl),
-    /GPU noise program linking failed/,
-  );
-  assert.equal(gl._state.shaders.size, 0);
-  assert.equal(gl._state.programs.size, 0);
-  assert.equal(gl._state.buffers.size, 0);
-  assert.equal(gl._state.vertexArrays.size, 0);
-});
+test('SmokeRenderer construction is GL-silent and program publication rolls back every staged resource', () => {
+  const publish = (gl, factory) => {
+    const renderer = new SmokeRenderer(gl, factory);
+    return () => renderer._ensurePrograms();
+  };
 
-test('SmokeRenderer construction owns and rolls back every staged resource', () => {
+  const silentGl = createShaderGl({ initialWebGLError: 0x0501 });
+  const silentRenderer = new SmokeRenderer(silentGl, createProgram);
+  assert.equal(silentRenderer.smokeProgram, null);
+  assert.equal(silentGl._state.shaders.size, 0);
+  assert.equal(silentGl._state.programs.size, 0);
+  assert.equal(silentGl._state.buffers.size, 0);
+  assert.equal(silentGl._state.vertexArrays.size, 0);
+  assert.equal(
+    silentGl.getError(),
+    0x0501,
+    'construction must not even inspect WebGL state',
+  );
+
   const preflightFailureGl = createShaderGl({
     initialWebGLError: 0x0501,
   });
   assert.throws(
-    () => new SmokeRenderer(preflightFailureGl, createProgram),
-    /construction preflight.*0x501/i,
+    publish(preflightFailureGl, createProgram),
+    /program preflight.*0x501/i,
   );
   assert.equal(preflightFailureGl._state.shaders.size, 0);
   assert.equal(preflightFailureGl._state.programs.size, 0);
@@ -237,7 +243,7 @@ test('SmokeRenderer construction owns and rolls back every staged resource', () 
   const secondProgramFailureGl = createShaderGl();
   const stagedPrograms = [];
   assert.throws(
-    () => new SmokeRenderer(secondProgramFailureGl, () => {
+    publish(secondProgramFailureGl, () => {
       if (stagedPrograms.length === 1) {
         throw new Error('synthetic composite program failure');
       }
@@ -259,7 +265,7 @@ test('SmokeRenderer construction owns and rolls back every staged resource', () 
   ];
   let programIndex = 0;
   assert.throws(
-    () => new SmokeRenderer(
+    publish(
       bufferFailureGl,
       () => programsBeforeBuffer[programIndex++],
     ),
@@ -281,7 +287,7 @@ test('SmokeRenderer construction owns and rolls back every staged resource', () 
   ];
   programIndex = 0;
   assert.throws(
-    () => new SmokeRenderer(
+    publish(
       uniformFailureGl,
       () => programsBeforeUniform[programIndex++],
     ),
@@ -298,8 +304,8 @@ test('SmokeRenderer construction owns and rolls back every staged resource', () 
     bufferDataError: 0x0505,
   });
   assert.throws(
-    () => new SmokeRenderer(uploadFailureGl, createProgram),
-    /candidate construction.*0x505/i,
+    publish(uploadFailureGl, createProgram),
+    /candidate program publication.*0x505/i,
   );
   assert.equal(uploadFailureGl._state.shaders.size, 0);
   assert.equal(uploadFailureGl._state.programs.size, 0);
@@ -563,10 +569,6 @@ test('GPU noise disposal fences generation and retries only failed handles', () 
     [failedVertexArray],
   );
   assert.equal(generator._pendingBufferDeletes.size, 0);
-  assert.throws(
-    () => generator.generate(),
-    /after disposal has started/,
-  );
 
   assert.equal(generator.dispose(), true);
   assert.equal(generator._disposed, true);

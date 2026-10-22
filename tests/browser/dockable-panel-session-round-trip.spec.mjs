@@ -40,13 +40,22 @@ async function openPreparedDataset(page) {
   );
 }
 
+/** The frame a panel stands in: the element that floats and carries its controls. */
+function panelFrame(page, panelId) {
+  return page.locator(`.accordion-panel:has(> #${panelId})`);
+}
+
+function headerControl(page, panelId, className) {
+  return panelFrame(page, panelId).locator(
+    `> .accordion-panel-actions > .${className}`
+  );
+}
+
 async function undockFromHeader(page, panelId) {
-  const button = page.locator(`#${panelId} > summary .accordion-undock-btn`);
+  const button = headerControl(page, panelId, 'accordion-undock-btn');
   await expect(button).toBeVisible();
   await button.click();
-  await expect(page.locator(`#${panelId}`)).toHaveClass(
-    /accordion-floating/
-  );
+  await expect(panelFrame(page, panelId)).toHaveClass(/accordion-floating/);
 }
 
 function captureLayout(page) {
@@ -81,9 +90,11 @@ function restoreLayout(page, payload) {
 
 function panelLayer(page, panelId) {
   return page.evaluate((id) => {
-    const panel = document.getElementById(id);
-    if (panel === null) throw new Error(`Panel ${id} is absent`);
-    const raw = getComputedStyle(panel).getPropertyValue('--z-layer').trim();
+    const frame = document.getElementById(id)?.parentElement ?? null;
+    if (frame === null || !frame.classList.contains('accordion-panel')) {
+      throw new Error(`Panel ${id} is not standing in its frame`);
+    }
+    const raw = getComputedStyle(frame).getPropertyValue('--z-layer').trim();
     return raw === '' ? null : Number(raw);
   }, panelId);
 }
@@ -93,8 +104,8 @@ function sidebarPanelOrder(page) {
     const accordion = document.querySelector('#sidebar .accordion');
     if (accordion === null) throw new Error('Sidebar accordion is absent');
     return [...accordion.children]
-      .filter(child => child.matches('details.accordion-section'))
-      .map(child => child.id);
+      .filter(child => child.matches('.accordion-panel'))
+      .map(child => child.querySelector(':scope > details.accordion-section').id);
   });
 }
 
@@ -146,11 +157,12 @@ test('a panel collapsed before the capture reopens at its own height', async ({
   expect(openHeight).toBeGreaterThan(100);
 
   /* `_accordion.css`:
-     `.accordion-section.accordion-floating:not([open]) { height: auto }` —
+     `.accordion-panel.accordion-floating:has(> .accordion-section:not([open]))
+      { height: auto }` —
      so the rendered box is now the header, and the panel's own height is not. */
   await setPanelOpen(page, FIRST_PANEL, false);
-  const renderedHeight = await page.locator(`#${FIRST_PANEL}`).evaluate(
-    panel => panel.getBoundingClientRect().height
+  const renderedHeight = await panelFrame(page, FIRST_PANEL).evaluate(
+    frame => frame.getBoundingClientRect().height
   );
   expect(renderedHeight).toBeLessThan(openHeight);
 
@@ -212,12 +224,12 @@ test('a restored panel docks back into its own place in the sidebar', async ({
 
   /* Restoring re-floats a panel that is standing in the sidebar. */
   await restoreLayout(page, captured.payload);
-  await expect(page.locator(`#${SECOND_PANEL}`)).toHaveClass(
+  await expect(panelFrame(page, SECOND_PANEL)).toHaveClass(
     /accordion-floating/
   );
 
-  await page.locator(`#${SECOND_PANEL} > summary .accordion-dock-btn`).click();
-  await expect(page.locator(`#${SECOND_PANEL}`)).not.toHaveClass(
+  await headerControl(page, SECOND_PANEL, 'accordion-dock-btn').click();
+  await expect(panelFrame(page, SECOND_PANEL)).not.toHaveClass(
     /accordion-floating/
   );
 

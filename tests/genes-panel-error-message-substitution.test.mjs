@@ -8,7 +8,6 @@ import {
   ERROR_MESSAGES as GENES_PANEL_ERROR_MESSAGES,
   formatError
 } from '../assets/js/app/analysis/genes-panel/constants.js';
-import { ERROR_MESSAGES as SHARED_ANALYSIS_ERROR_MESSAGES } from '../assets/js/app/analysis/shared/error-utils.js';
 import { ERROR_MESSAGES as DATA_SOURCE_ERROR_MESSAGES } from '../assets/js/data/data-source.js';
 import { GenesPanelController } from '../assets/js/app/analysis/genes-panel/genes-panel-controller.js';
 
@@ -19,20 +18,16 @@ const ANALYSIS_ROOT = fileURLToPath(
 const PLACEHOLDER = /\{(\w+)\}/;
 
 /**
- * The two message tables that are read by direct key lookup — `getErrorMessage`
- * in shared/error-utils.js and `DataSourceError.getUserMessage` in
- * data/data-source.js — have no substitution step at all, so a placeholder in
- * either one reaches the user verbatim with no code change required.
+ * The message table read by direct key lookup — `DataSourceError.getUserMessage`
+ * in data/data-source.js — has no substitution step at all, so a placeholder in
+ * it reaches the user verbatim with no code change required.
  */
 const DIRECT_LOOKUP_TABLES = Object.freeze([
-  ['assets/js/app/analysis/shared/error-utils.js', SHARED_ANALYSIS_ERROR_MESSAGES],
   ['assets/js/data/data-source.js', DATA_SOURCE_ERROR_MESSAGES]
 ]);
 
 const IMPORTED_TABLES = Object.freeze({
-  './constants.js': GENES_PANEL_ERROR_MESSAGES,
-  '../shared/error-utils.js': SHARED_ANALYSIS_ERROR_MESSAGES,
-  './error-utils.js': SHARED_ANALYSIS_ERROR_MESSAGES
+  './constants.js': GENES_PANEL_ERROR_MESSAGES
 });
 
 function* walkJavaScript(directory) {
@@ -48,8 +43,8 @@ function* walkJavaScript(directory) {
 
 /**
  * Resolve which ERROR_MESSAGES table a module's `ERROR_MESSAGES.KEY` references
- * name. Two different tables carry that identifier inside the analysis tree, so
- * the scan reads the import rather than guessing from the key name.
+ * name. The scan reads the import rather than guessing from the key name, so a
+ * module that imports some other table of that name is not misattributed.
  */
 function resolveTable(source) {
   const importLine = source.match(

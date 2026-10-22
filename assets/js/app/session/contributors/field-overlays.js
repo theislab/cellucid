@@ -21,6 +21,7 @@ import {
   getCriticalUserDefinedFieldIds,
   USER_DEFINED_CODES_RESTORE_TRANSACTION_ID
 } from './user-defined-code-inventory.js';
+import { isCategoricalCodes } from '../../../data/categorical-storage-contract.js';
 
 export const id = 'field-overlays';
 
@@ -125,8 +126,6 @@ function assertUserDefinedMetaItem(item, index) {
         'isPurged',
         'codesLength',
         'codesType',
-        'centroidsByDim',
-        'normalizedDims',
         'sourceField',
         'operation',
         'sourcePages',
@@ -140,15 +139,8 @@ function assertUserDefinedMetaItem(item, index) {
     );
     assertPrimitiveCategoryArray(item.categories, `${commonContext} categories`);
     assertSafeInteger(item.codesLength, `${commonContext} codesLength`);
-    if (item.codesType !== 'Uint8Array' && item.codesType !== 'Uint16Array') {
-      throw new TypeError(`${commonContext} codesType must be Uint8Array or Uint16Array.`);
-    }
-    assertPlainRecord(item.centroidsByDim, `${commonContext} centroidsByDim`);
-    assertArray(item.normalizedDims, `${commonContext} normalizedDims`);
-    for (const dimension of item.normalizedDims) {
-      assertSafeInteger(dimension, `${commonContext} normalized dimension`, {
-        minimum: 2
-      });
+    if (!['Uint8Array', 'Uint16Array', 'Uint32Array'].includes(item.codesType)) {
+      throw new TypeError(`${commonContext} codesType must be Uint8Array, Uint16Array or Uint32Array.`);
     }
     assertArray(item.sourcePages, `${commonContext} sourcePages`);
     if (
@@ -228,7 +220,11 @@ function getOwners(state, operation) {
       ownerName
     );
   }
-  return { renameRegistry, deleteRegistry, userDefinedRegistry };
+  return {
+    renameRegistry,
+    deleteRegistry,
+    userDefinedRegistry
+  };
 }
 
 function capturePayload(owners) {
@@ -268,10 +264,7 @@ function captureCategoricalCodes(userDefinedRegistry, payload) {
     if (
       field === null
       || typeof field !== 'object'
-      || (
-        !(field.codes instanceof Uint8Array)
-        && !(field.codes instanceof Uint16Array)
-      )
+      || !isCategoricalCodes(field.codes)
     ) {
       throw new TypeError(
         `User-defined field "${metadata.id}" requires exact rollback codes.`
@@ -415,16 +408,7 @@ export function capture(ctx) {
   if (ctx === null || typeof ctx !== 'object' || ctx.state === null || typeof ctx.state !== 'object') {
     throw new TypeError('Field-overlay capture requires the current DataState owner.');
   }
-  const {
-    renameRegistry,
-    deleteRegistry,
-    userDefinedRegistry
-  } = getOwners(ctx.state, 'capture');
-  const payload = capturePayload({
-    renameRegistry,
-    deleteRegistry,
-    userDefinedRegistry
-  });
+  const payload = capturePayload(getOwners(ctx.state, 'capture'));
 
   return [{
     id: 'core/field-overlays',

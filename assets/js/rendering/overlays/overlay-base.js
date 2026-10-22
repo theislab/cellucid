@@ -63,6 +63,21 @@ export class OverlayBase {
   }
 
   /**
+   * Whether the next frame can differ from the last with nothing else
+   * changing. An enabled overlay animates unless it says otherwise; an
+   * overlay with nothing to draw overrides this so a still scene settles.
+   * @returns {boolean}
+   */
+  needsContinuousFrames() {
+    return (
+      this.enabled
+      && this._initialized
+      && !this._disposeRequested
+      && !this._disposed
+    );
+  }
+
+  /**
    * @param {object} context
    */
   render(context) {

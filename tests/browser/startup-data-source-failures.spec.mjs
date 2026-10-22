@@ -12,6 +12,7 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { expect, test } from './helpers/test.mjs';
+import { chooseDirectory } from './helpers/directory-upload.mjs';
 import { APP_ORIGIN as ORIGIN } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 
@@ -221,11 +222,10 @@ test('a damaged dataset payload leads with the dataset, not the file', async ({
 
   // The session survives, and other data still loads from the same controls.
   await expect(page.locator('#dataset-name')).toHaveText(OTHER_DATASET.name);
-  await page
-    .locator('#user-data-file-input')
-    .setInputFiles(path.join(
-      fixturesDirectory, 'demo-custom-exports', GOOD_DATASET.id,
-    ));
+  await chooseDirectory(
+    page.locator('#user-data-file-input'),
+    path.join(fixturesDirectory, 'demo-custom-exports', GOOD_DATASET.id),
+  );
   await expect(page.locator('#dataset-name')).toHaveText(GOOD_DATASET.name);
   // Loading a dataset successfully retires the failure it replaced.
   await expect(page.locator(NOTICE)).toBeHidden();

@@ -26,22 +26,24 @@ async function openPreparedDataset(page) {
     'Current UI prepared fixture'
   );
   await expect(page.locator('#filter-count')).toHaveText(
-    'Showing all 120 points'
+    'Showing all 120 cells'
   );
 }
 
 /**
  * Colour by `cell_type` and wait until the field is actually live.
  *
- * The field loads asynchronously; an Alt gesture issued before the viewer has
- * left `highlightMode === 'none'` is discarded before any tool sees it.
+ * The field loads asynchronously; an Alt gesture issued before the state holds
+ * it lands in a pane colored by no field and selects nothing.
  */
 async function colourByCellType(page) {
   await page.locator('#categorical-field').selectOption({ label: 'cell_type' });
   await expect(page.locator('.legend-item')).toHaveCount(3);
+  // An annotation press reads the pressed pane's field from the state, so
+  // the field is live for Alt+click once the state holds it.
   await expect.poll(
-    () => page.evaluate(() => window._cellucidViewer.getHighlightMode()),
-  ).toBe('categorical');
+    () => page.evaluate(() => window._cellucidState.getActiveField()?.kind),
+  ).toBe('category');
 }
 
 /** Screen point the viewer's own picker resolves to no cell at all. */
@@ -90,12 +92,19 @@ async function altClick(page, point) {
   await page.mouse.move(point.x + 40, point.y + 40);
 }
 
+/**
+ * Draw a lasso through `corners` with Alt held. Each edge is two moves: the
+ * polygon is the corners whatever lies between them on a straight edge, so
+ * more moves would not change what the lasso encloses. They would only add
+ * lasso previews, each redrawing the scene, and every pointer move waits for
+ * that frame where a renderer takes a second or more to draw one.
+ */
 async function altDraw(page, corners) {
   await page.mouse.move(corners[0][0], corners[0][1]);
   await page.keyboard.down('Alt');
   await page.mouse.down();
   for (const [x, y] of corners.slice(1)) {
-    await page.mouse.move(x, y, { steps: 8 });
+    await page.mouse.move(x, y, { steps: 2 });
   }
   await page.mouse.up();
   await page.keyboard.up('Alt');
@@ -115,20 +124,33 @@ async function altDrag(page, from, to) {
   await page.keyboard.up('Alt');
 }
 
+// How long a gesture that did land may take to arm its tool before it counts
+// as dropped. Generous on purpose: judging a slow-but-landed gesture dropped
+// would repeat it, and a repeated gesture changes what the tool holds.
+const GESTURE_LANDING_TIMEOUT_MS = 3_000;
+
 /**
  * Repeat a gesture until it actually arms the tool.
  *
  * A synthetic pointer sequence can land while the renderer is still settling
  * its first frames, and is then dropped before any tool sees it. Retrying keeps
  * the environment's timing out of the assertions below, which are about what
- * the tool does once a gesture has landed.
+ * the tool does once a gesture has landed. Each attempt waits for the tool to
+ * arm before deciding the gesture was dropped, so a loaded runner that arms it
+ * late is never handed a second gesture on top of the first.
  */
 async function armSelection(page, tool, gesture) {
   const controls = page.locator(`#${tool}-step-controls`);
   for (let attempt = 0; attempt < 8; attempt++) {
     await gesture();
-    if (await controls.count() > 0) return;
-    await page.waitForTimeout(250);
+    const armed = await controls.waitFor({
+      state: 'attached',
+      timeout: GESTURE_LANDING_TIMEOUT_MS,
+    }).then(() => true, error => {
+      if (error?.name !== 'TimeoutError') throw error;
+      return false;
+    });
+    if (armed) return;
   }
   await expect(controls).toBeVisible();
 }
@@ -208,7 +230,7 @@ test(
     await expect(page.locator('#categorical-field')).toHaveValue('-1');
     await expect(page.locator('#continuous-field')).toHaveValue('-1');
     await expect(page.locator(MODE_DESCRIPTION)).toContainText(
-      'Annotation selection needs an active field',
+      'Color by a field first',
     );
     await expect(page.locator(MODE_DESCRIPTION)).not.toContainText(
       'Alt+click a cell to select',
@@ -217,7 +239,7 @@ test(
     const points = await findCellPoints(page, 1);
     await altClick(page, points[0]);
     await expect(page.locator(MODE_DESCRIPTION)).toContainText(
-      'Annotation selection needs an active field',
+      'Color by a field first',
     );
 
     await page.locator('#categorical-field').selectOption({ label: 'cell_type' });
@@ -225,12 +247,12 @@ test(
       'Alt+click a cell to select',
     );
     await expect(page.locator(MODE_DESCRIPTION)).not.toContainText(
-      'needs an active field',
+      'Color by a field first',
     );
 
     await page.locator('#categorical-field').selectOption({ label: 'None' });
     await expect(page.locator(MODE_DESCRIPTION)).toContainText(
-      'Annotation selection needs an active field',
+      'Color by a field first',
     );
 
     expect(productErrors).toEqual([]);

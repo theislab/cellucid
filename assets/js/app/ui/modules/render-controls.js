@@ -28,11 +28,9 @@
  * @module ui/modules/render-controls
  */
 
-import {
-  isFiniteNumber,
-  parseFiniteNumberInRange
-} from '../../utils/number-utils.js';
+import { parseFiniteNumberInRange } from '../../utils/number-utils.js';
 import { getNotificationCenter } from '../../notification-center.js';
+import { formatCount, formatDecimal } from '../components/display-format.js';
 import {
   antialiasingInForce,
   resolveAntialiasPreference,
@@ -40,9 +38,28 @@ import {
 } from '../core/antialias-preference.js';
 import {
   MAX_SMOKE_GRID_SIZE,
-  SMOKE_GRID_SIZES,
   SmokeDensityBuildError,
+  SmokeUnsupportedError,
 } from '../../../rendering/smoke-cloud/smoke-density-contract.js';
+import { reportSmokeUnavailable } from './smoke-availability.js';
+import {
+  describeShaderQualities,
+  isShaderQuality,
+} from '../../../rendering/shader-quality.js';
+import {
+  smokeAbsorptionScale,
+  smokeDensityScale,
+  smokeDetailScale,
+  smokeDirectLightScale,
+  smokeEdgeScale,
+  smokeGridScale,
+  smokeNoiseScale,
+  smokeRayQualityScale,
+  smokeResolutionScale,
+  smokeScatterScale,
+  smokeSpeedScale,
+  smokeTurbulenceScale,
+} from './smoke-control-scales.js';
 import {
   formatPointSize,
   pointSizeSliderPositionForCellCount,
@@ -51,8 +68,11 @@ import {
   POINT_SIZE_SLIDER_MAXIMUM,
   POINT_SIZE_SLIDER_MINIMUM,
 } from '../../../rendering/point-size-scale.js';
+import {
+  VIEWER_BACKGROUND_ERROR_MESSAGE,
+  isViewerBackground,
+} from '../../../rendering/viewer-backgrounds.js';
 
-const VIEWER_BACKGROUNDS = Object.freeze(['grid', 'grid-dark', 'white', 'black']);
 const RENDER_MODES = Object.freeze(['points', 'smoke']);
 const VIEWER_BACKGROUND_STORAGE_KEY = 'cellucid_viewer_background';
 
@@ -104,7 +124,7 @@ const VIEWER_METHODS = Object.freeze([
   'setSmokeParams',
   'setCloudResolutionScale',
   'setNoiseTextureResolution',
-  'getAdaptiveScaleFactor',
+  'getSmokeSupport',
   'hasSnapshots',
   'setShaderQuality',
   'setAdaptiveLOD',
@@ -115,7 +135,6 @@ const VIEWER_METHODS = Object.freeze([
   'isAntialiasingAvailable'
 ]);
 
-const SHADER_QUALITIES = Object.freeze(['full', 'light', 'ultralight']);
 
 /** The forced-LOD slider range, matching `index.html` and the renderer. */
 const FORCED_LOD_MINIMUM = -1;
@@ -177,9 +196,9 @@ function assertToggleControl(control, label) {
 }
 
 function assertShaderQuality(value) {
-  if (!SHADER_QUALITIES.includes(value)) {
+  if (!isShaderQuality(value)) {
     throw new TypeError(
-      'Shader quality must be exactly "full", "light", or "ultralight".'
+      `Shader quality must be exactly ${describeShaderQualities()}.`
     );
   }
   return value;
@@ -276,10 +295,8 @@ function readExactRange(control, label, expectedStep, expectedMinimum = 0) {
 }
 
 function assertViewerBackground(value) {
-  if (!VIEWER_BACKGROUNDS.includes(value)) {
-    throw new TypeError(
-      'Viewer background must be exactly "grid", "grid-dark", "white", or "black".'
-    );
+  if (!isViewerBackground(value)) {
+    throw new TypeError(VIEWER_BACKGROUND_ERROR_MESSAGE);
   }
   return value;
 }
@@ -287,13 +304,6 @@ function assertViewerBackground(value) {
 function assertRenderMode(value) {
   if (!RENDER_MODES.includes(value)) {
     throw new TypeError('Render mode must be exactly "points" or "smoke".');
-  }
-  return value;
-}
-
-function assertAdaptiveScale(value) {
-  if (!isFiniteNumber(value) || value <= 0) {
-    throw new TypeError('Viewer adaptive scale factor must be one positive finite number.');
   }
   return value;
 }
@@ -320,6 +330,7 @@ function assertSmokeGridSize(value) {
  * @param {HTMLElement|null} options.dom.depthControls
  * @param {HTMLElement|null} options.dom.rendererControls
  * @param {HTMLElement|null} options.dom.pointsControls
+ * @param {HTMLElement|null} options.dom.pointsPerformanceControls
  * @param {HTMLElement|null} options.dom.smokeControls
  * @param {HTMLInputElement|null} options.dom.pointSizeInput
  * @param {HTMLElement|null} options.dom.pointSizeDisplay
@@ -379,6 +390,7 @@ export function initRenderControls(options) {
     depthControls,
     rendererControls,
     pointsControls,
+    pointsPerformanceControls,
     smokeControls,
     pointSizeInput,
     pointSizeDisplay,
@@ -428,6 +440,7 @@ export function initRenderControls(options) {
   assertHideableElement(renderModeMaturityTag, 'Render-mode maturity tag');
   assertContainer(rendererControls, 'Renderer controls');
   assertContainer(pointsControls, 'Point controls');
+  assertContainer(pointsPerformanceControls, 'Point performance controls');
   assertContainer(smokeControls, 'Smoke controls');
   assertEventControl(hpShaderQualitySelect, 'Shader quality selector');
   assertShaderQuality(hpShaderQualitySelect.value);
@@ -461,8 +474,7 @@ export function initRenderControls(options) {
   // Volumetric smoke UI state
   let smokeDirty = false;
   let smokeBuiltOnce = false;
-  let smokeGridSize = 128;
-  let noiseResolutionScale = assertAdaptiveScale(viewer.getAdaptiveScaleFactor());
+  let smokeGridSize = MAX_SMOKE_GRID_SIZE;
   let destroyed = false;
   const domLifecycle = new AbortController();
 
@@ -602,12 +614,16 @@ export function initRenderControls(options) {
   function syncRenderModeUi(mode) {
     renderModeSelect.value = mode;
     // The tag names the maturity of the selected mode, so it is present exactly
-    // when that mode is. `Points` is not in alpha and must not wear the tag.
+    // when that mode is. `Points` is not in beta and must not wear the tag.
     renderModeMaturityTag.hidden = mode !== 'smoke';
     smokeControls.classList.toggle('visible', mode === 'smoke');
     pointsControls.classList.toggle('visible', mode === 'points');
     depthControls.style.display = mode === 'smoke' ? 'none' : 'block';
     rendererControls.style.display = mode === 'smoke' ? 'none' : 'block';
+    // Level of detail and frustum culling drive the point renderer only; the
+    // Performance group stays, because antialiasing below them governs the
+    // drawing buffer in both modes.
+    pointsPerformanceControls.hidden = mode === 'smoke';
     currentRenderMode = mode;
   }
 
@@ -625,23 +641,30 @@ export function initRenderControls(options) {
     smokeDirty = true;
     syncRenderModeUi('points');
     notifyRenderModeChange('points');
+    // Handled: the headline below is the user-facing report, the exact
+    // failure is kept for bug reports.
+    console.warn('[RenderControls] Smoke rendering failed:', exactError);
     getNotificationCenter().error(
-      `Smoke rendering failed: ${exactError.message}`,
-      { category: 'rendering' }
+      'Volumetric smoke stopped rendering, so the view is back in Points.',
+      { category: 'rendering', title: 'Volumetric smoke stopped' }
     );
   }
 
   function settleSmokeBuildFailure(error) {
     if (destroyed) return;
     smokeDirty = true;
-    if (!(error instanceof SmokeDensityBuildError)) {
-      const message = error instanceof Error
-        ? error.message
-        : String(error);
-      getNotificationCenter().error(
-        `Smoke density could not be built: ${message}`,
-        { category: 'rendering' }
-      );
+    if (error instanceof SmokeUnsupportedError) {
+      reportSmokeUnavailable(viewer.getSmokeSupport());
+    } else {
+      console.warn('[RenderControls] Smoke density could not be built:', error);
+      // A SmokeDensityBuildError has already failed its own progress
+      // notification with the same headline.
+      if (!(error instanceof SmokeDensityBuildError)) {
+        getNotificationCenter().error(
+          'Volumetric smoke could not be built. Points rendering works as usual.',
+          { category: 'rendering' }
+        );
+      }
     }
     publishRenderMode('points');
   }
@@ -649,6 +672,16 @@ export function initRenderControls(options) {
   function applyRenderMode(mode) {
     if (destroyed) return false;
     const exactMode = assertRenderMode(mode);
+    // A device that cannot run smoke is told so in plain words and stays in
+    // Points: nothing is built, nothing half-published.
+    if (exactMode === 'smoke') {
+      const support = viewer.getSmokeSupport();
+      if (!support.supported) {
+        reportSmokeUnavailable(support);
+        publishRenderMode('points');
+        return false;
+      }
+    }
     if (exactMode === 'smoke' && viewer.hasSnapshots()) {
       throw new RangeError('Smoke render mode is unavailable while snapshots exist.');
     }
@@ -669,131 +702,88 @@ export function initRenderControls(options) {
 
   // ---------------------------------------------------------------------------
   // Smoke parameter sliders
+  //
+  // Each slider publishes exactly one renderer value through its fixed scale in
+  // smoke-control-scales.js. No slider rescales another: the readout beside a
+  // slider means the same thing at every grid and noise resolution.
   // ---------------------------------------------------------------------------
 
-  function getResolutionAdaptiveFactor(power) {
-    const baseGrid = 128;
-    const gridFactor = Math.pow(smokeGridSize / baseGrid, power);
-    return gridFactor * noiseResolutionScale;
+  function publishSmokeSlider(input, display, label, scale, publish) {
+    const { value, readout } = scale(readExactRange(input, label, '1'));
+    display.textContent = readout;
+    publish(value);
   }
 
   function updateSmokeStepSlider() {
-    const t = readExactRange(
-      smokeStepsInput,
-      'Smoke ray quality',
-      '1'
-    ) / 100;
-    const label = t < 0.33 ? 'Fast' : (t < 0.66 ? 'Balanced' : (t < 0.9 ? 'High' : 'Ultra'));
-    smokeStepsDisplay.textContent = label;
-
-    const eased = Math.pow(t, 3);
-    const adaptive = getResolutionAdaptiveFactor(0.35);
-    const stepMultiplier = (0.5 + 4.0 * eased) * adaptive;
-    viewer.setSmokeParams({ stepMultiplier });
-  }
-
-  function getAdaptiveDensityRange() {
-    const scaleFactor = getResolutionAdaptiveFactor(0.5);
-    const minDensity = 0.4 * scaleFactor;
-    const maxDensity = 8.0 * scaleFactor * 1.4;
-    return { min: minDensity, max: maxDensity };
+    publishSmokeSlider(
+      smokeStepsInput, smokeStepsDisplay, 'Smoke ray quality',
+      smokeRayQualityScale,
+      stepMultiplier => viewer.setSmokeParams({ stepMultiplier })
+    );
   }
 
   function updateSmokeDensitySlider() {
-    const t = readExactRange(
-      smokeDensityInput,
-      'Smoke density',
-      '1'
-    ) / 100;
-    const { min, max } = getAdaptiveDensityRange();
-    const density = min + t * (max - min);
-    smokeDensityDisplay.textContent = density.toFixed(1);
-    viewer.setSmokeParams({ density });
+    publishSmokeSlider(
+      smokeDensityInput, smokeDensityDisplay, 'Smoke density',
+      smokeDensityScale,
+      density => viewer.setSmokeParams({ density })
+    );
   }
 
   function updateSmokeSpeedSlider() {
-    const t = readExactRange(
-      smokeSpeedInput,
-      'Smoke animation speed',
-      '1'
-    ) / 100;
-    const animationSpeed = t * 2.5;
-    smokeSpeedDisplay.textContent = animationSpeed.toFixed(2);
-    viewer.setSmokeParams({ animationSpeed });
-  }
-
-  function getAdaptiveDetailRange() {
-    const scaleFactor = getResolutionAdaptiveFactor(0.35);
-    const maxDetail = 5.0 * scaleFactor;
-    return { min: 0, max: maxDetail };
+    publishSmokeSlider(
+      smokeSpeedInput, smokeSpeedDisplay, 'Smoke animation speed',
+      smokeSpeedScale,
+      animationSpeed => viewer.setSmokeParams({ animationSpeed })
+    );
   }
 
   function updateSmokeDetailSlider() {
-    const t = readExactRange(
-      smokeDetailInput,
-      'Smoke detail',
-      '1'
-    ) / 100;
-    const { min, max } = getAdaptiveDetailRange();
-    const detailLevel = min + t * (max - min);
-    smokeDetailDisplay.textContent = detailLevel.toFixed(1);
-    viewer.setSmokeParams({ detailLevel });
+    publishSmokeSlider(
+      smokeDetailInput, smokeDetailDisplay, 'Smoke detail',
+      smokeDetailScale,
+      detailLevel => viewer.setSmokeParams({ detailLevel })
+    );
   }
 
   function updateSmokeWarpSlider() {
-    const t = readExactRange(
-      smokeWarpInput,
-      'Smoke turbulence',
-      '1'
-    ) / 100;
-    const warpStrength = t * 2.0;
-    smokeWarpDisplay.textContent = (t * 100).toFixed(0) + '%';
-    viewer.setSmokeParams({ warpStrength });
+    publishSmokeSlider(
+      smokeWarpInput, smokeWarpDisplay, 'Smoke turbulence',
+      smokeTurbulenceScale,
+      warpStrength => viewer.setSmokeParams({ warpStrength })
+    );
   }
 
   function updateSmokeAbsorptionSlider() {
-    const t = readExactRange(
-      smokeAbsorptionInput,
-      'Smoke light absorption',
-      '1'
-    ) / 100;
-    const adaptive = getResolutionAdaptiveFactor(0.2);
-    const lightAbsorption = (t * 2.0) * adaptive;
-    smokeAbsorptionDisplay.textContent = lightAbsorption.toFixed(1);
-    viewer.setSmokeParams({ lightAbsorption });
+    publishSmokeSlider(
+      smokeAbsorptionInput, smokeAbsorptionDisplay, 'Smoke light absorption',
+      smokeAbsorptionScale,
+      lightAbsorption => viewer.setSmokeParams({ lightAbsorption })
+    );
   }
 
   function updateSmokeScatterSlider() {
-    const t = readExactRange(
-      smokeScatterInput,
-      'Smoke light scattering',
-      '1'
-    ) / 100;
-    const scatterStrength = (t * 2.0) * getResolutionAdaptiveFactor(0.15);
-    smokeScatterDisplay.textContent = scatterStrength.toFixed(1);
-    viewer.setSmokeParams({ scatterStrength });
+    publishSmokeSlider(
+      smokeScatterInput, smokeScatterDisplay, 'Smoke light scattering',
+      smokeScatterScale,
+      scatterStrength => viewer.setSmokeParams({ scatterStrength })
+    );
   }
 
   function updateSmokeEdgeSlider() {
-    const t = readExactRange(
-      smokeEdgeInput,
-      'Smoke edge softness',
-      '1'
-    ) / 100;
-    const edgeSoftness = 0.2 + t * 1.8;
-    smokeEdgeDisplay.textContent = edgeSoftness.toFixed(1);
-    viewer.setSmokeParams({ edgeSoftness });
+    publishSmokeSlider(
+      smokeEdgeInput, smokeEdgeDisplay, 'Smoke edge softness',
+      smokeEdgeScale,
+      edgeSoftness => viewer.setSmokeParams({ edgeSoftness })
+    );
   }
 
   function updateSmokeDirectLightSlider() {
-    const t = readExactRange(
-      smokeDirectLightInput,
-      'Smoke direct light',
-      '1'
-    ) / 100;
-    const directLightIntensity = t * 1.5;
-    smokeDirectLightDisplay.textContent = directLightIntensity.toFixed(2) + 'x';
-    viewer.setSmokeParams({ directLightIntensity });
+    publishSmokeSlider(
+      smokeDirectLightInput, smokeDirectLightDisplay, 'Smoke direct light',
+      smokeDirectLightScale,
+      directLightIntensity => viewer.setSmokeParams({ directLightIntensity })
+    );
   }
 
   updateSmokeStepSlider();
@@ -815,75 +805,43 @@ export function initRenderControls(options) {
   updateSmokeDirectLightSlider();
   listen(smokeDirectLightInput, 'input', updateSmokeDirectLightSlider);
 
-  function sliderToGridSize(sliderValue) {
-    if (!isFiniteNumber(sliderValue) || sliderValue < 0 || sliderValue > 100) {
-      throw new RangeError('Smoke grid density must be a finite number between 0 and 100.');
-    }
-    const t = sliderValue / 100;
-    const idx = Math.min(
-      SMOKE_GRID_SIZES.length - 1,
-      Math.floor(t * SMOKE_GRID_SIZES.length)
-    );
-    return SMOKE_GRID_SIZES[idx];
-  }
-
+  // The grid is the one smoke control that rebuilds the volume, so its
+  // readout follows the slider at once and the rebuild waits for the drag to
+  // settle.
   function updateSmokeGridSlider() {
-    const raw = readExactRange(
-      smokeGridInput,
-      'Smoke grid density',
-      '1'
+    const { value: size, readout } = smokeGridScale(
+      readExactRange(smokeGridInput, 'Smoke grid density', '1')
     );
-    const size = sliderToGridSize(raw);
-    smokeGridDisplay.textContent = size + '³';
+    smokeGridDisplay.textContent = readout;
     if (size !== smokeGridSize) {
       smokeGridSize = size;
-      updateSmokeDensitySlider();
-      updateSmokeDetailSlider();
-      updateSmokeWarpSlider();
-      updateSmokeAbsorptionSlider();
-      updateSmokeScatterSlider();
-      updateSmokeStepSlider();
       scheduleSliderSmokeRebuild();
     }
   }
 
-  smokeGridSize = sliderToGridSize(
-    readExactRange(smokeGridInput, 'Smoke grid density', '1')
-  );
-  smokeGridDisplay.textContent = smokeGridSize + '³';
+  {
+    const { value, readout } = smokeGridScale(
+      readExactRange(smokeGridInput, 'Smoke grid density', '1')
+    );
+    smokeGridSize = value;
+    smokeGridDisplay.textContent = readout;
+  }
   listen(smokeGridInput, 'input', updateSmokeGridSlider);
 
   function updateCloudResolutionSlider() {
-    const raw = readExactRange(
-      cloudResolutionInput,
-      'Smoke render resolution',
-      '1'
+    publishSmokeSlider(
+      cloudResolutionInput, cloudResolutionDisplay, 'Smoke render resolution',
+      smokeResolutionScale,
+      scale => viewer.setCloudResolutionScale(scale)
     );
-    const scale = raw === 43
-      ? 1
-      : 0.25 + (raw / 100) * 1.75;
-    cloudResolutionDisplay.textContent = scale.toFixed(2) + 'x';
-    viewer.setCloudResolutionScale(scale);
   }
 
   function updateNoiseResolutionSlider() {
-    const t = readExactRange(
-      noiseResolutionInput,
-      'Smoke noise resolution',
-      '1'
-    ) / 100;
-    const steps = [32, 48, 64, 96, 128, 192, 256];
-    const idx = Math.min(steps.length - 1, Math.floor(t * steps.length));
-    const size = steps[idx];
-    noiseResolutionDisplay.textContent = size + '³';
-    viewer.setNoiseTextureResolution(size);
-    noiseResolutionScale = assertAdaptiveScale(viewer.getAdaptiveScaleFactor());
-    updateSmokeDensitySlider();
-    updateSmokeDetailSlider();
-    updateSmokeWarpSlider();
-    updateSmokeAbsorptionSlider();
-    updateSmokeScatterSlider();
-    updateSmokeStepSlider();
+    publishSmokeSlider(
+      noiseResolutionInput, noiseResolutionDisplay, 'Smoke noise resolution',
+      smokeNoiseScale,
+      size => viewer.setNoiseTextureResolution(size)
+    );
   }
 
   updateCloudResolutionSlider();
@@ -946,7 +904,7 @@ export function initRenderControls(options) {
       '1'
     );
     viewer.setLightingStrength(raw / 100);
-    lightingStrengthDisplay.textContent = lightingStrengthInput.value;
+    lightingStrengthDisplay.textContent = formatDecimal(raw, 0);
   }
 
   function updateFogDensity() {
@@ -956,7 +914,7 @@ export function initRenderControls(options) {
       '1'
     );
     viewer.setFogDensity(raw / 100);
-    fogDensityDisplay.textContent = fogDensityInput.value;
+    fogDensityDisplay.textContent = formatDecimal(raw, 0);
   }
 
   function updateSizeAttenuation() {
@@ -966,7 +924,7 @@ export function initRenderControls(options) {
       '1'
     );
     viewer.setSizeAttenuation(raw / 100);
-    sizeAttenuationDisplay.textContent = sizeAttenuationInput.value;
+    sizeAttenuationDisplay.textContent = formatDecimal(raw, 0);
   }
 
   listen(lightingStrengthInput, 'input', updateLightingStrength);
@@ -1007,7 +965,7 @@ export function initRenderControls(options) {
   }
 
   function syncForcedLodUi() {
-    hpLodForceContainer.style.display = acceptedLodEnabled ? 'block' : 'none';
+    hpLodForceContainer.hidden = !acceptedLodEnabled;
     hpLodForceDisplay.textContent = formatForcedLodLevel(
       assertForcedLodLevel(hpLodForceInput.value, 'Forced LOD level')
     );
@@ -1145,6 +1103,7 @@ export function initRenderControls(options) {
   const storedAntialias = resolveAntialiasPreference(localStorage);
   let antialiasPreferenceMode = storedAntialias.mode;
   let datasetCellCount = null;
+  let viewDimension = null;
 
   function syncAntialiasStatus() {
     if (!antialiasingAvailable) {
@@ -1158,7 +1117,7 @@ export function initRenderControls(options) {
       ? (
         datasetCellCount === null
           ? 'Chosen automatically from the size of the dataset.'
-          : `Chosen automatically: ${datasetCellCount.toLocaleString()} cells.`
+          : `Chosen automatically: ${formatCount(datasetCellCount)} cells in ${viewDimension}D.`
       )
       : '';
   }
@@ -1171,7 +1130,7 @@ export function initRenderControls(options) {
   }
 
   publishAntialiasing(
-    antialiasingInForce(antialiasPreferenceMode, datasetCellCount)
+    antialiasingInForce(antialiasPreferenceMode, datasetCellCount, viewDimension)
   );
 
   if (storedAntialias.discarded !== null) {
@@ -1205,9 +1164,10 @@ export function initRenderControls(options) {
    * eighteen million.
    *
    * @param {number} cellCount
+   * @param {1|2|3} dimension The dimension the dataset opens in.
    * @returns {boolean} What is in force afterwards.
    */
-  function applyDatasetAntialiasing(cellCount) {
+  function applyDatasetAntialiasing(cellCount, dimension) {
     if (destroyed) {
       throw new Error(
         'Automatic antialiasing cannot be published after teardown.'
@@ -1219,9 +1179,37 @@ export function initRenderControls(options) {
       );
     }
     datasetCellCount = cellCount;
+    viewDimension = requireViewDimension(dimension);
     return publishAntialiasing(
-      antialiasingInForce(antialiasPreferenceMode, datasetCellCount)
+      antialiasingInForce(antialiasPreferenceMode, datasetCellCount, viewDimension)
     );
+  }
+
+  /**
+   * Re-decide automatic antialiasing when the active view changes dimension.
+   * A flat view costs far more to antialias than a 3D one (see
+   * `AUTOMATIC_ANTIALIAS_CELL_LIMIT_FLAT`), so `auto` follows the view being
+   * worked in. An explicit choice is left alone.
+   *
+   * @param {1|2|3} dimension
+   * @returns {boolean} What is in force afterwards.
+   */
+  function applyViewDimensionAntialiasing(dimension) {
+    if (destroyed) return viewer.getAntialiasing();
+    viewDimension = requireViewDimension(dimension);
+    if (datasetCellCount === null) return viewer.getAntialiasing();
+    return publishAntialiasing(
+      antialiasingInForce(antialiasPreferenceMode, datasetCellCount, viewDimension)
+    );
+  }
+
+  function requireViewDimension(dimension) {
+    if (dimension !== 1 && dimension !== 2 && dimension !== 3) {
+      throw new RangeError(
+        'Automatic antialiasing requires a view dimension of 1, 2, or 3.'
+      );
+    }
+    return dimension;
   }
 
   listen(hpAntialiasCheckbox, 'change', () => {
@@ -1265,6 +1253,7 @@ export function initRenderControls(options) {
     applyPointSizeFromSlider,
     applyAutomaticPointSize,
     applyDatasetAntialiasing,
+    applyViewDimensionAntialiasing,
     pointSizeSliderPositionForCellCount,
     pointSizeToSlider: pointSizeToSliderPosition,
     getSmokeGridSize: () => smokeGridSize,

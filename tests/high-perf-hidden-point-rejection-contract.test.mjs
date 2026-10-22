@@ -6,8 +6,12 @@ import { fileURLToPath } from 'node:url';
 
 import {
   HP_FS_FULL,
+  HP_FS_FULL_NO_DEPTH,
   HP_FS_HIGHLIGHT,
   HP_FS_LIGHT,
+  HP_FS_LIGHT_NO_DEPTH,
+  HP_FS_SCULPTED,
+  HP_FS_SCULPTED_NO_DEPTH,
   HP_FS_ULTRALIGHT,
   HP_VS_FULL,
   HP_VS_HIGHLIGHT,
@@ -297,6 +301,7 @@ const LIVE_POINT_VERTEX_SHADERS = Object.freeze({
  */
 const DISCARDING_FRAGMENT_SHADERS = Object.freeze({
   HP_FS_FULL,
+  HP_FS_SCULPTED,
   HP_FS_LIGHT,
   HP_FS_HIGHLIGHT,
   CENTROID_FS,
@@ -357,9 +362,12 @@ test('the fragment shaders that discard still do, and the one that does not is n
   // discards and a correctness fix where it does not. Both facts are load
   // bearing, so both are pinned.
   for (const [name, source] of Object.entries(DISCARDING_FRAGMENT_SHADERS)) {
+    // The hidden-point test may share its discard with the disc test
+    // (`if (v_alpha < 0.01 || r2 > 1.0) discard;`): one discard site costs
+    // measurably less than two, and discards the same fragments.
     assert.match(
       source,
-      /if \(v_alpha < 0\.01\) discard;/,
+      /if \(v_alpha < 0\.01(?: \|\| [^)]+)?\) discard;/,
       `${name} is the second line of defence behind its vertex shader's `
         + 'rejection; losing it would put a hidden point one code change away '
         + 'from writing depth over a visible one again',
@@ -370,6 +378,39 @@ test('the fragment shaders that discard still do, and the one that does not is n
     /discard/,
     'HP_FS_ULTRALIGHT discarding would change why the vertex rejection matters there',
   );
+});
+
+test('the no-depth shaders blend a hidden point to nothing instead of discarding it', () => {
+  // HP_FS_LIGHT_NO_DEPTH runs only in passes without depth, where a
+  // zero-alpha fragment under the straight-alpha blend leaves the pixel as it
+  // was. Its second line of defence is therefore a zero output under exactly
+  // HP_FS_LIGHT's discard conditions, and it must never discard: the absence
+  // of a discard is the whole reason it exists.
+  // The disc test is the antialiased rim's coverage: zero exactly where
+  // HP_FS_LIGHT's `r2 > 1.0` would discard a whole pixel's worth of disc.
+  for (const [name, source] of Object.entries({
+    HP_FS_LIGHT_NO_DEPTH,
+    HP_FS_FULL_NO_DEPTH,
+    HP_FS_SCULPTED_NO_DEPTH,
+  })) {
+    assert.doesNotMatch(source, /\bdiscard\b/, `${name} must never discard`);
+    assert.match(
+      source,
+      /bool covered = v_alpha >= 0\.01 && coverage > 0\.0;/,
+      `${name} must blend a hidden point to nothing`,
+    );
+    assert.match(
+      source,
+      /fragColor = covered \? vec4\([^;]*\) : vec4\(0\.0\);/,
+      `${name} must output zero for an uncovered fragment`,
+    );
+  }
+  assert.match(
+    HP_FS_LIGHT_NO_DEPTH,
+    /fragColor = covered \? vec4\(v_color, v_alpha \* coverage\) : vec4\(0\.0\);/,
+  );
+  assert.match(HP_FS_LIGHT, /if \(v_alpha < 0\.01 \|\| r2 > 1\.0\) discard;/);
+  assert.match(HP_FS_LIGHT, /fragColor = vec4\(v_color, v_alpha\);/);
 });
 
 test('no shader in the tree hides a point by shrinking it alone', async () => {

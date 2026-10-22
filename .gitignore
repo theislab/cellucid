@@ -16,30 +16,9 @@ venv/
 .idea/
 .vscode/
 
-# Jupyter
-.ipynb_checkpoints/
+# Local Cloudflare Worker builds and Miniflare state (`wrangler dev`)
+/.wrangler/
 
-# Data artifacts (keep directory sentinels)
-data/raw/**
-/markdown/*
-!data/raw/.gitkeep
-data/experiments/**
-!data/experiments/.gitkeep
-
-# Viewer exports live in a separate repo (cellucid-datasets).
-assets/exports/**
-!assets/exports/.gitkeep
-# exports/_**
-# python/exports/**
-data/_exports/**
-
-# Python packaging artifacts
-python/dist/
-python/build/
-python/*.egg-info
-
-project_context.txt
-/assets/exports/_*/
 /.playwright-cli
 /node_modules/
 /playwright-report/

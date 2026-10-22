@@ -58,13 +58,17 @@ async function openDataset(page) {
   );
 }
 
-const panelFor = mode => `.analysis-accordion-content[data-mode="${mode}"]`;
+const panelFor = mode => `.analysis-mode-content[data-mode="${mode}"]`;
 
 async function openMode(page, mode) {
   const header = page.locator(`#analysis-header-${mode}`);
   await header.click();
   await expect(header).toHaveAttribute('aria-expanded', 'true');
-  await expect(page.locator(panelFor(mode))).toBeVisible();
+  const panel = page.locator(panelFor(mode));
+  await expect(panel).toBeVisible();
+  // A panel that fills in asynchronously is `aria-busy` until it settles;
+  // every header below it moves when it does.
+  await expect(panel).not.toHaveAttribute('aria-busy', 'true');
   return header;
 }
 
@@ -119,8 +123,25 @@ test('every analysis accordion header controls a region that exists', async ({
   const productErrors = observeProductErrors(page);
   await openDataset(page);
 
+  // Headers are native disclosure buttons with no control nested inside
+  // them, and the accordion does not claim a tablist it does not implement.
+  expect(await page.evaluate(() => ({
+    tablists: document.querySelectorAll('.analysis-mode-list[role="tablist"]').length,
+    headers: [...document.querySelectorAll('.analysis-mode-list .disclosure-header')]
+      .filter(header => header.id.startsWith('analysis-header-'))
+      .map(header => ({
+        tag: header.tagName,
+        nested: header.querySelectorAll('button, input, select, textarea, [tabindex]').length,
+        copySibling: header.parentElement
+          .querySelector(':scope > .analysis-mode-copy-btn') !== null,
+      })),
+  }))).toEqual({
+    tablists: 0,
+    headers: MODES.map(() => ({ tag: 'BUTTON', nested: 0, copySibling: true })),
+  });
+
   const relationships = await page.evaluate(() =>
-    [...document.querySelectorAll('.analysis-accordion .analysis-accordion-header')]
+    [...document.querySelectorAll('.analysis-mode-list .disclosure-header')]
       .filter(header => header.id.startsWith('analysis-header-'))
       .map(header => ({
         header: header.id,
@@ -164,39 +185,49 @@ test('page chips are operable and announced without a mouse', async ({ page }) =
   await openDataset(page);
   await openMode(page, 'detailed');
 
-  const chips = page.locator(`${panelFor('detailed')} .analysis-page-tab`);
+  const chips = page.locator(`${panelFor('detailed')} .analysis-page-tabs .chip`);
   await expect(chips).toHaveCount(2);
 
   // The empty page cannot be selected and says so.
   const empty = chips.first();
-  await expect(empty).toHaveAttribute('role', 'button');
+  await expect(empty).toHaveRole('button');
   await expect(empty).toHaveAttribute('aria-disabled', 'true');
   await expect(empty).toHaveAttribute('tabindex', '-1');
   await expect(empty).toHaveAccessibleName(/no cells, cannot be selected/);
 
   // The populated page is a toggle button carrying its cell count.
   const populated = chips.nth(1);
-  await expect(populated).toHaveAttribute('role', 'button');
+  await expect(populated).toHaveRole('button');
   await expect(populated).toHaveAttribute('tabindex', '0');
   await expect(populated).toHaveAccessibleName(/120 cells/);
   await expect(populated).toHaveAttribute('aria-pressed', 'true');
 
   await populated.focus();
   await page.keyboard.press('Enter');
-  const afterEnter = page.locator(`${panelFor('detailed')} .analysis-page-tab`).nth(1);
+  const afterEnter = page.locator(`${panelFor('detailed')} .analysis-page-tabs .chip`).nth(1);
   await expect(afterEnter).toHaveAttribute('aria-pressed', 'false');
-  // Toggling rebuilds the chips; focus must land back on the same chip.
+  // Toggling updates the chips in place; focus stays on the same chip.
   await expect(afterEnter).toBeFocused();
 
   await page.keyboard.press(' ');
-  const afterSpace = page.locator(`${panelFor('detailed')} .analysis-page-tab`).nth(1);
+  const afterSpace = page.locator(`${panelFor('detailed')} .analysis-page-tabs .chip`).nth(1);
   await expect(afterSpace).toHaveAttribute('aria-pressed', 'true');
   await expect(afterSpace).toBeFocused();
 
-  // The colour picker is a separate, individually named control.
+  // The colour picker is a separate, individually named control, and no
+  // interactive control is nested inside the chip's toggle button.
   await expect(
-    page.locator(`${panelFor('detailed')} .analysis-page-color-input`)
+    page.locator(`${panelFor('detailed')} .color-swatch-input`)
   ).toHaveAccessibleName(/^Colour for /);
+  expect(await page.evaluate(selector => (
+    [...document.querySelectorAll(`${selector} .analysis-page-tabs .chip`)].map(chip => ({
+      tag: chip.tagName,
+      nested: chip.querySelectorAll('button, input, select, textarea, [tabindex]').length,
+    }))
+  ), panelFor('detailed'))).toEqual([
+    { tag: 'BUTTON', nested: 0 },
+    { tag: 'BUTTON', nested: 0 },
+  ]);
 
   expect(productErrors).toEqual([]);
 });
@@ -206,12 +237,14 @@ test('collapsible settings sections open from the keyboard', async ({ page }) =>
   await openDataset(page);
   await openMode(page, 'genesPanel');
 
-  const headers = page.locator(`${panelFor('genesPanel')} .analysis-perf-header`);
+  const headers = page.locator(
+    `${panelFor('genesPanel')} .disclosure-inline .disclosure-header`
+  );
   await expect(headers).toHaveCount(2);
 
   for (let index = 0; index < 2; index++) {
     const header = headers.nth(index);
-    await expect(header).toHaveAttribute('role', 'button');
+    await expect(header).toHaveRole('button');
     await expect(header).toHaveAttribute('aria-expanded', 'false');
     const regionId = await header.getAttribute('aria-controls');
     expect(regionId).toBeTruthy();
@@ -232,11 +265,11 @@ test('collapsible settings sections open from the keyboard', async ({ page }) =>
   await page.locator('#analysis-header-genesPanel').click();
   await openMode(page, 'simple');
   const insights = page.locator(
-    `${panelFor('simple')} .insights-collapsible-header`
+    `${panelFor('simple')} .insights-page-selector-section > .disclosure-header`
   );
-  await expect(insights).toHaveAttribute('role', 'button');
+  await expect(insights).toHaveRole('button');
   await expect(insights).toHaveAttribute('aria-expanded', 'false');
-  await expect(insights).toHaveAccessibleName(/^Page Selection/);
+  await expect(insights).toHaveAccessibleName(/^Page selection/);
   await insights.focus();
   await page.keyboard.press('Enter');
   await expect(insights).toHaveAttribute('aria-expanded', 'true');
@@ -257,7 +290,7 @@ test('the multi-select popup takes focus, keeps it, and hands it back', async ({
   await page.keyboard.press('Enter');
   await expect(trigger).toHaveAttribute('aria-expanded', 'true');
 
-  const panel = page.locator('.multi-select-dropdown-panel.open');
+  const panel = page.locator('.multi-select-dropdown-panel:not([hidden])');
   await expect(panel).toBeVisible();
   await expect(panel.locator('.multi-select-dropdown-search')).toBeFocused();
 
@@ -284,7 +317,7 @@ test('a copied analysis window owns its own controls', async ({ page }) => {
   await openMode(page, 'genesPanel');
 
   await page
-    .locator('.analysis-accordion-item[data-mode="genesPanel"] .analysis-accordion-copy-btn')
+    .locator('.analysis-mode[data-mode="genesPanel"] .analysis-mode-copy-btn')
     .click({ force: true });
   const floating = page.locator('#floating-panels-root .analysis-window-panel');
   await expect(floating).toHaveCount(1);
@@ -391,7 +424,7 @@ test('analysis settings survive collapsing and reopening the panel', async ({
     await expect(page.locator(`${form} select[name="method"]`)).toHaveValue('ttest');
     await expect(page.locator(`${form} input[name="useCache"]`)).not.toBeChecked();
     // 'ranked' hides the clustering section; the mode and the sections agree.
-    await expect(page.locator(`${form} .cluster-params`)).toHaveClass(/hidden/);
+    await expect(page.locator(`${form} .cluster-params`)).toBeHidden();
   };
   await expectCarried();
 
@@ -407,5 +440,45 @@ test('analysis settings survive collapsing and reopening the panel', async ({
   );
   await expectCarried();
 
+  expect(productErrors).toEqual([]);
+});
+
+test('choosing a DE comparison page keeps focus on the dropdown', async ({ page }) => {
+  const productErrors = observeProductErrors(page);
+  await openDataset(page);
+  await page.evaluate(async () => {
+    const { createPageComparisonSelector } = await import(
+      '/assets/js/app/analysis/ui/components/selectors.js'
+    );
+    const selector = createPageComparisonSelector({
+      pages: [
+        { id: 'page_a', name: 'Alpha' },
+        { id: 'page_b', name: 'Beta' },
+        { id: 'page_c', name: 'Gamma' },
+      ],
+      selectedIds: ['page_a', 'page_b'],
+      includeDerivedPages: false,
+      getCellCountForPageId: () => 10,
+      onChange(pageIds) {
+        window.__comparisonChanges.push(pageIds);
+      },
+    });
+    window.__comparisonChanges = [];
+    selector.id = 'comparison-focus-probe';
+    document.body.appendChild(selector);
+  });
+  const pageA = page.getByRole('combobox', { name: 'Page A' });
+  const pageB = page.getByRole('combobox', { name: 'Page B' });
+  await pageA.focus();
+  await pageA.selectOption('page_c');
+  await expect(pageA).toBeFocused();
+  await expect(pageA).toHaveValue('page_c');
+  expect(await pageB.evaluate(select => (
+    [...select.options].map(option => [option.value, option.disabled])
+  ))).toEqual([['page_a', false], ['page_b', false], ['page_c', true]]);
+  expect(await page.evaluate(() => window.__comparisonChanges)).toEqual([
+    ['page_c', 'page_b'],
+  ]);
+  await page.evaluate(() => document.getElementById('comparison-focus-probe').remove());
   expect(productErrors).toEqual([]);
 });

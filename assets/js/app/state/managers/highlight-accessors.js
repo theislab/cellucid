@@ -4,6 +4,12 @@
  * Kept in a dedicated module so `highlight-manager.js` can stay focused on page
  * and group state transitions while remaining under the refactoring size limit.
  *
+ * A cell's code or value on a field is read from the field object itself
+ * (`ui/modules/highlight/annotation-cells.js`), never through an index into
+ * this state's inventory: in a grid of views the field a selection gesture
+ * reads is the one of the pane it landed in, which need not be the focused
+ * view's.
+ *
  * @module state/managers/highlight-accessors
  */
 
@@ -14,28 +20,5 @@ export const highlightAccessorMethods = {
       return this.viewer.pickCellAtScreen(x, y);
     }
     return -1;
-  },
-
-  // Get category index for a cell.
-  getCategoryForCell(cellIndex, fieldIndex, source = 'obs') {
-    const field = source === 'var'
-      ? this.varData?.fields?.[fieldIndex]
-      : this.obsData?.fields?.[fieldIndex];
-    if (!field || field.kind !== 'category') return -1;
-    const codes = field.codes || [];
-    if (cellIndex < 0 || cellIndex >= codes.length) return -1;
-    return codes[cellIndex];
-  },
-
-  // Get value for a cell in a continuous field.
-  getValueForCell(cellIndex, fieldIndex, source = 'obs') {
-    const field = source === 'var'
-      ? this.varData?.fields?.[fieldIndex]
-      : this.obsData?.fields?.[fieldIndex];
-    if (!field || field.kind !== 'continuous') return null;
-    const values = field.values || [];
-    if (cellIndex < 0 || cellIndex >= values.length) return null;
-    return values[cellIndex];
   }
 };
-

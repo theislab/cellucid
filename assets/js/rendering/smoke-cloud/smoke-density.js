@@ -3,18 +3,33 @@
 // ============================================================================
 
 import {
+  LIGHT_VOLUME_FS,
   NORMALIZE_FS,
+  OCCUPANCY_BLOCK,
+  OCCUPANCY_FS,
   NORMALIZE_VS,
   REDUCE_MAX_FS,
+  SPLAT_COLOR_FS,
+  SPLAT_COLOR_VS,
   SPLAT_FS,
   SPLAT_VS,
 } from '../shaders/density-shaders.js';
 import { POINT_VISIBILITY_THRESHOLD } from '../alpha-visibility.js';
-import { MAX_SMOKE_GRID_SIZE } from './smoke-density-contract.js';
+import { requireCleanWebGLState } from '../gl-errors.js';
+import { createProgram } from '../gl-utils.js';
+import {
+  MAX_SMOKE_GRID_SIZE,
+  SmokeUnsupportedError,
+} from './smoke-density-contract.js';
+import { detectSmokeSupport } from './smoke-capabilities.js';
 
 const gpuSplatResourcesByContext = new WeakMap();
 export const MAX_SPLAT_POINTS_PER_BATCH = 262_144;
 const MIN_NORMAL_FLOAT32 = 2 ** -126;
+// World half-thickness of the soft slab a flat cloud -- a 1D or 2D embedding,
+// or a planar 3D one -- is spread over along its flat axes (see SPLAT_VS);
+// about four voxels of the finest grid.
+export const SMOKE_SLAB_HALF_THICKNESS = 0.06;
 
 function deleteCachedGPUSplatResources(gl, resources) {
   const failures = [];
@@ -34,8 +49,11 @@ function deleteCachedGPUSplatResources(gl, resources) {
   }
   for (const key of [
     'splatProgram',
+    'colorSplatProgram',
     'reduceMaxProgram',
     'normalizeProgram',
+    'lightProgram',
+    'occupancyProgram',
   ]) {
     const program = resources[key];
     if (!program) continue;
@@ -65,8 +83,11 @@ function cachedGPUSplatResourcesAreCurrent(gl, resources) {
   return (
     resources.retiring !== true
     && gl.isProgram(resources.splatProgram)
+    && gl.isProgram(resources.colorSplatProgram)
     && gl.isProgram(resources.reduceMaxProgram)
     && gl.isProgram(resources.normalizeProgram)
+    && gl.isProgram(resources.lightProgram)
+    && gl.isProgram(resources.occupancyProgram)
     && gl.isBuffer(resources.cornerBuffer)
     && gl.isBuffer(resources.quadBuffer)
   );
@@ -110,48 +131,10 @@ function getOrCreateGPUSplatResources(gl) {
   const createdPrograms = [];
   const createdBuffers = [];
 
-  function compileShader(type, source) {
-    const shader = gl.createShader(type);
-    if (!shader) {
-      throw new Error('Smoke density shader allocation failed.');
-    }
-    gl.shaderSource(shader, source);
-    gl.compileShader(shader);
-    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
-      const log = gl.getShaderInfoLog(shader);
-      gl.deleteShader(shader);
-      throw new Error(`Smoke density shader compilation failed: ${log}`);
-    }
-    return shader;
-  }
-
   function createProgramFromSources(vsSource, fsSource) {
-    let vertexShader = null;
-    let fragmentShader = null;
-    let program = null;
-    try {
-      vertexShader = compileShader(gl.VERTEX_SHADER, vsSource);
-      fragmentShader = compileShader(gl.FRAGMENT_SHADER, fsSource);
-      program = gl.createProgram();
-      if (!program) {
-        throw new Error('Smoke density program allocation failed.');
-      }
-      gl.attachShader(program, vertexShader);
-      gl.attachShader(program, fragmentShader);
-      gl.linkProgram(program);
-      if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
-        const log = gl.getProgramInfoLog(program);
-        throw new Error(`Smoke density program linking failed: ${log}`);
-      }
-      createdPrograms.push(program);
-      return program;
-    } catch (error) {
-      if (program !== null) gl.deleteProgram(program);
-      throw error;
-    } finally {
-      if (vertexShader !== null) gl.deleteShader(vertexShader);
-      if (fragmentShader !== null) gl.deleteShader(fragmentShader);
-    }
+    const program = createProgram(gl, vsSource, fsSource);
+    createdPrograms.push(program);
+    return program;
   }
 
   function requireAttribute(program, name) {
@@ -171,22 +154,12 @@ function getOrCreateGPUSplatResources(gl) {
   }
 
   function requireCurrentBufferStore(expectedBytes, label) {
-    const uploadErrors = collectWebGLErrors(gl);
-    if (uploadErrors.length > 0) {
-      throw new Error(
-        `Smoke density ${label} upload produced WebGL error(s) ${formatWebGLErrors(uploadErrors)}.`
-      );
-    }
+    requireCleanWebGLState(gl, `Smoke density ${label} upload`);
     const actualBytes = gl.getBufferParameter(
       gl.ARRAY_BUFFER,
       gl.BUFFER_SIZE
     );
-    const queryErrors = collectWebGLErrors(gl);
-    if (queryErrors.length > 0) {
-      throw new Error(
-        `Smoke density ${label} validation produced WebGL error(s) ${formatWebGLErrors(queryErrors)}.`
-      );
-    }
+    requireCleanWebGLState(gl, `Smoke density ${label} validation`);
     if (actualBytes !== expectedBytes) {
       throw new Error(
         `Smoke density ${label} store is ${actualBytes} bytes; expected exactly ${expectedBytes}.`
@@ -196,6 +169,20 @@ function getOrCreateGPUSplatResources(gl) {
 
   try {
     const splatProgram = createProgramFromSources(SPLAT_VS, SPLAT_FS);
+    const colorSplatProgram = createProgramFromSources(
+      SPLAT_COLOR_VS,
+      SPLAT_COLOR_FS
+    );
+    const colorSplatLocs = {
+      a_position: requireAttribute(colorSplatProgram, 'a_position'),
+      a_color: requireAttribute(colorSplatProgram, 'a_color'),
+      u_gridSize: requireUniform(colorSplatProgram, 'u_gridSize'),
+      u_flatAxes: requireUniform(colorSplatProgram, 'u_flatAxes'),
+      u_slabHalfThickness: requireUniform(colorSplatProgram, 'u_slabHalfThickness'),
+      u_atlasWidth: requireUniform(colorSplatProgram, 'u_atlasWidth'),
+      u_atlasHeight: requireUniform(colorSplatProgram, 'u_atlasHeight'),
+      u_slicesPerRow: requireUniform(colorSplatProgram, 'u_slicesPerRow'),
+    };
     const reduceMaxProgram = createProgramFromSources(
       NORMALIZE_VS,
       REDUCE_MAX_FS
@@ -208,6 +195,8 @@ function getOrCreateGPUSplatResources(gl) {
       a_position: requireAttribute(splatProgram, 'a_position'),
       a_cornerIndex: requireAttribute(splatProgram, 'a_cornerIndex'),
       u_gridSize: requireUniform(splatProgram, 'u_gridSize'),
+      u_flatAxes: requireUniform(splatProgram, 'u_flatAxes'),
+      u_slabHalfThickness: requireUniform(splatProgram, 'u_slabHalfThickness'),
       u_atlasWidth: requireUniform(splatProgram, 'u_atlasWidth'),
       u_atlasHeight: requireUniform(splatProgram, 'u_atlasHeight'),
       u_slicesPerRow: requireUniform(splatProgram, 'u_slicesPerRow'),
@@ -222,6 +211,31 @@ function getOrCreateGPUSplatResources(gl) {
       u_atlas: requireUniform(normalizeProgram, 'u_atlas'),
       u_maxAtlas: requireUniform(normalizeProgram, 'u_maxAtlas'),
       u_gamma: requireUniform(normalizeProgram, 'u_gamma'),
+      u_colorAtlas: requireUniform(normalizeProgram, 'u_colorAtlas'),
+      u_gridSize: requireUniform(normalizeProgram, 'u_gridSize'),
+      u_slicesPerRow: requireUniform(normalizeProgram, 'u_slicesPerRow'),
+    };
+    const lightProgram = createProgramFromSources(
+      NORMALIZE_VS,
+      LIGHT_VOLUME_FS
+    );
+    const lightLocs = {
+      a_position: requireAttribute(lightProgram, 'a_position'),
+      u_density: requireUniform(lightProgram, 'u_density'),
+      u_gridSize: requireUniform(lightProgram, 'u_gridSize'),
+      u_lightGridSize: requireUniform(lightProgram, 'u_lightGridSize'),
+      u_layer: requireUniform(lightProgram, 'u_layer'),
+      u_lightDir: requireUniform(lightProgram, 'u_lightDir'),
+    };
+    const occupancyProgram = createProgramFromSources(
+      NORMALIZE_VS,
+      OCCUPANCY_FS
+    );
+    const occupancyLocs = {
+      a_position: requireAttribute(occupancyProgram, 'a_position'),
+      u_density: requireUniform(occupancyProgram, 'u_density'),
+      u_gridSize: requireUniform(occupancyProgram, 'u_gridSize'),
+      u_layer: requireUniform(occupancyProgram, 'u_layer'),
     };
 
     const cornerBuffer = gl.createBuffer();
@@ -256,21 +270,22 @@ function getOrCreateGPUSplatResources(gl) {
       'quad buffer'
     );
 
-    const initializationErrors = collectWebGLErrors(gl);
-    if (initializationErrors.length > 0) {
-      throw new Error(
-        `Smoke density pipeline initialization produced WebGL error(s) ${formatWebGLErrors(initializationErrors)}.`
-      );
-    }
+    requireCleanWebGLState(gl, 'Smoke density pipeline initialization');
 
     const resources = {
       gl,
       splatProgram,
+      colorSplatProgram,
       reduceMaxProgram,
       normalizeProgram,
+      lightProgram,
+      occupancyProgram,
       splatLocs,
+      colorSplatLocs,
       reduceMaxLocs,
       normalizeLocs,
+      lightLocs,
+      occupancyLocs,
       cornerBuffer,
       quadBuffer,
       retiring: false,
@@ -296,11 +311,10 @@ function getOrCreateGPUSplatResources(gl) {
       failures,
       'cached program'
     );
-    const cleanupErrors = collectWebGLErrors(gl);
-    if (cleanupErrors.length > 0) {
-      failures.push(new Error(
-        `Smoke density pipeline cleanup produced WebGL error(s) ${formatWebGLErrors(cleanupErrors)}.`
-      ));
+    try {
+      requireCleanWebGLState(gl, 'Smoke density pipeline cleanup');
+    } catch (error) {
+      failures.push(error);
     }
     if (failures.length === 1) throw failures[0];
     throw new AggregateError(
@@ -312,7 +326,7 @@ function getOrCreateGPUSplatResources(gl) {
 
 function captureTextureBindings(gl) {
   const activeTexture = gl.getParameter(gl.ACTIVE_TEXTURE);
-  const units = [gl.TEXTURE0, gl.TEXTURE1];
+  const units = [gl.TEXTURE0, gl.TEXTURE1, gl.TEXTURE2];
   if (!units.includes(activeTexture)) units.push(activeTexture);
   const bindings = [];
   for (const unit of units) {
@@ -397,7 +411,7 @@ function restorePipelineState(gl, state) {
   gl.activeTexture(state.activeTexture);
 }
 
-function createAtlasTexture(gl, internalFormat, width, height, type) {
+function createAtlasTexture(gl, internalFormat, width, height, format, type) {
   const texture = gl.createTexture();
   if (!texture) {
     throw new Error('GPU smoke density atlas texture allocation failed.');
@@ -411,7 +425,7 @@ function createAtlasTexture(gl, internalFormat, width, height, type) {
       width,
       height,
       0,
-      gl.RED,
+      format,
       type,
       null
     );
@@ -460,16 +474,30 @@ function createQuadVertexArray(gl, buffer, attributeLocation, label) {
   }
 }
 
-function requireExactPositionArray(positions) {
+function requireExactPositionArray(positions, dimension) {
+  if (dimension !== 1 && dimension !== 2 && dimension !== 3) {
+    throw new RangeError(
+      'GPU smoke density dimension must be exactly 1, 2, or 3.'
+    );
+  }
   if (
     !(positions instanceof Float32Array)
     || positions.length === 0
-    || positions.length % 3 !== 0
+    || positions.length % dimension !== 0
   ) {
     throw new TypeError(
-      'GPU smoke density positions must be a non-empty Float32Array with exactly three values per point.'
+      'GPU smoke density positions must be a non-empty Float32Array with exactly dimension values per point.'
     );
   }
+}
+
+function requireExactColors(colors, pointCount) {
+  if (!(colors instanceof Uint8Array) || colors.length !== pointCount * 4) {
+    throw new TypeError(
+      'GPU smoke density colors must be an exact point-count RGBA Uint8Array.'
+    );
+  }
+  return colors;
 }
 
 function requireExactVisibility(visibility, pointCount) {
@@ -486,11 +514,11 @@ function requireExactVisibility(visibility, pointCount) {
     );
   }
   if (
-    !(visibility.alpha instanceof Float32Array)
+    !(visibility.alpha instanceof Uint8Array)
     || visibility.alpha.length !== pointCount
   ) {
     throw new TypeError(
-      'GPU smoke density visibility alpha must be an exact point-count Float32Array.'
+      'GPU smoke density visibility alpha must be an exact point-count Uint8Array.'
     );
   }
   const hasOutliers = visibility.outlierQuantiles !== null;
@@ -526,19 +554,22 @@ function requireExactVisibility(visibility, pointCount) {
   return visibility;
 }
 
-function inspectDensitySource(positions, visibility) {
-  const pointCount = positions.length / 3;
+function inspectDensitySource(positions, dimension, visibility) {
+  const pointCount = positions.length / dimension;
   const alpha = visibility?.alpha ?? null;
   const outlierQuantiles = visibility?.outlierQuantiles ?? null;
   const outlierThreshold = visibility?.outlierThreshold ?? null;
   let containsVisibleInBoundsPoint = false;
   let visiblePointCount = 0;
+  const minimum = [Infinity, Infinity, Infinity];
+  const maximum = [-Infinity, -Infinity, -Infinity];
 
   for (let pointIndex = 0; pointIndex < pointCount; pointIndex++) {
-    const positionIndex = pointIndex * 3;
+    const positionIndex = pointIndex * dimension;
     const x = positions[positionIndex];
-    const y = positions[positionIndex + 1];
-    const z = positions[positionIndex + 2];
+    // Axes the embedding does not have are exactly zero.
+    const y = dimension > 1 ? positions[positionIndex + 1] : 0;
+    const z = dimension > 2 ? positions[positionIndex + 2] : 0;
     if (!Number.isFinite(x)) {
       throw new RangeError(
         `GPU smoke density position component ${positionIndex} must be finite.`
@@ -587,6 +618,12 @@ function inspectDensitySource(positions, visibility) {
     if (!visible) continue;
 
     visiblePointCount++;
+    if (x < minimum[0]) minimum[0] = x;
+    if (x > maximum[0]) maximum[0] = x;
+    if (y < minimum[1]) minimum[1] = y;
+    if (y > maximum[1]) maximum[1] = y;
+    if (z < minimum[2]) minimum[2] = z;
+    if (z > maximum[2]) maximum[2] = z;
     if (
       x >= -1
       && x <= 1
@@ -604,23 +641,22 @@ function inspectDensitySource(positions, visibility) {
       'GPU smoke density requires at least one visible point inside the exact [-1, 1] volume.'
     );
   }
-  return visiblePointCount;
+  return {
+    visiblePointCount,
+    extent: [0, 1, 2].map(axis => maximum[axis] - minimum[axis]),
+  };
 }
 
-function collectWebGLErrors(gl) {
-  const errors = [];
-  let errorCode = gl.getError();
-  while (errorCode !== gl.NO_ERROR) {
-    errors.push(errorCode);
-    errorCode = gl.getError();
-  }
-  return errors;
-}
-
-function formatWebGLErrors(errorCodes) {
-  return errorCodes
-    .map(errorCode => `0x${errorCode.toString(16)}`)
-    .join(', ');
+/**
+ * Axes along which the visible cloud is thinner than two voxels of `gridSize`
+ * (1) or not (0). The splat spreads those into a soft slab (SPLAT_VS): a 2D
+ * embedding becomes a slab, a 1D one a soft tube. A cloud thin along every
+ * axis is a single blob of cells, not a sheet, and is splatted as it is.
+ */
+export function smokeFlatAxes(extent, gridSize) {
+  const twoVoxels = 4 / (gridSize - 1);
+  const flat = extent.map(size => (size < twoVoxels ? 1 : 0));
+  return flat.every(axis => axis === 1) ? [0, 0, 0] : flat;
 }
 
 function asError(value, message) {
@@ -653,9 +689,13 @@ function releaseTrackedResource(gl, resources, resource, deleteMethod, label) {
 }
 
 /**
- * Builds one native R8 density texture without synchronizing pixels through
+ * Builds one native RGBA8 density volume without synchronizing pixels through
  * JavaScript. All intermediate work stays on the GPU:
- * R32F splat atlas -> max reduction -> normalized R8 atlas -> 3D slice copies.
+ * R32F density atlas + RGBA32F colour atlas -> max reduction -> normalized
+ * RGBA8 atlas -> 3D slice copies. Red is the normalized density; green, blue
+ * and alpha are the mean display colour of the cells there, premultiplied by
+ * that density (see density-shaders.js), so the cloud carries the active
+ * field's colours.
  *
  * The caller must provide a clean WebGL error state. Every mutable binding and
  * capability touched by this transaction is restored on success and failure;
@@ -669,7 +709,6 @@ export function buildDensityTextureGPU(gl, positions, options = {}) {
   if (!gl || typeof gl !== 'object') {
     throw new TypeError('GPU smoke density requires a WebGL2 rendering context.');
   }
-  requireExactPositionArray(positions);
   if (
     !options
     || typeof options !== 'object'
@@ -680,13 +719,28 @@ export function buildDensityTextureGPU(gl, positions, options = {}) {
   }
   const optionKeys = Object.keys(options);
   const unexpectedOption = optionKeys.find(
-    key => key !== 'gamma' && key !== 'gridSize' && key !== 'visibility'
+    key =>
+      key !== 'colors' &&
+      key !== 'dimension' &&
+      key !== 'gamma' &&
+      key !== 'gridSize' &&
+      key !== 'visibility'
   );
   if (unexpectedOption !== undefined) {
     throw new RangeError(
       `GPU smoke density option "${unexpectedOption}" is unknown.`
     );
   }
+  // Positions hold exactly as many components per cell as the embedding has
+  // (rendering/position-layout.js); the splat attribute reads that many and
+  // the shader's vec3 input receives zero for the rest.
+  if (!Object.hasOwn(options, 'dimension')) {
+    throw new TypeError(
+      'GPU smoke density requires the positions dimension.'
+    );
+  }
+  const dimension = options.dimension;
+  requireExactPositionArray(positions, dimension);
   const gridSize = Object.hasOwn(options, 'gridSize') ? options.gridSize : 128;
   if (
     !Number.isInteger(gridSize)
@@ -709,13 +763,24 @@ export function buildDensityTextureGPU(gl, positions, options = {}) {
       'GPU smoke density gamma must remain a finite positive normal Float32 value.'
     );
   }
-  const pointCount = positions.length / 3;
+  const pointCount = positions.length / dimension;
+  if (!Object.hasOwn(options, 'colors')) {
+    throw new TypeError(
+      'GPU smoke density requires the per-point display colors.'
+    );
+  }
+  const colors = requireExactColors(options.colors, pointCount);
   const visibility = requireExactVisibility(
     Object.hasOwn(options, 'visibility') ? options.visibility : null,
     pointCount
   );
-  const visiblePointCount = inspectDensitySource(positions, visibility);
+  const { visiblePointCount, extent } = inspectDensitySource(
+    positions,
+    dimension,
+    visibility
+  );
   if (visiblePointCount === 0) return null;
+  const flatAxes = smokeFlatAxes(extent, gridSize);
   if (typeof gl.isContextLost !== 'function') {
     throw new TypeError(
       'GPU smoke density requires the exact WebGL2 context-loss contract.'
@@ -726,22 +791,9 @@ export function buildDensityTextureGPU(gl, positions, options = {}) {
       'GPU smoke density cannot build while the WebGL2 context is lost.'
     );
   }
-  if (!gl.getExtension('EXT_color_buffer_float')) {
-    throw new Error(
-      'GPU smoke density requires EXT_color_buffer_float for exact R32F accumulation.'
-    );
-  }
-  if (!gl.getExtension('EXT_float_blend')) {
-    throw new Error(
-      'GPU smoke density requires EXT_float_blend for exact R32F accumulation.'
-    );
-  }
-  const priorErrors = collectWebGLErrors(gl);
-  if (priorErrors.length > 0) {
-    throw new Error(
-      `GPU smoke density requires a clean WebGL error state; clear pending error(s) ${formatWebGLErrors(priorErrors)} before building.`
-    );
-  }
+  const support = detectSmokeSupport(gl);
+  if (!support.supported) throw new SmokeUnsupportedError(support);
+  requireCleanWebGLState(gl, 'GPU smoke density build preflight');
 
   const slicesPerRow = Math.ceil(Math.sqrt(gridSize));
   const numRows = Math.ceil(gridSize / slicesPerRow);
@@ -794,6 +846,7 @@ export function buildDensityTextureGPU(gl, positions, options = {}) {
     }
     gl.bindSampler(0, null);
     gl.bindSampler(1, null);
+    gl.bindSampler(2, null);
     gl.colorMask(true, true, true, true);
     gl.clearColor(0, 0, 0, 0);
 
@@ -802,6 +855,11 @@ export function buildDensityTextureGPU(gl, positions, options = {}) {
       throw new Error('GPU smoke density framebuffer allocation failed.');
     }
     transientFramebuffers.push(framebuffer);
+    const colorFramebuffer = gl.createFramebuffer();
+    if (!colorFramebuffer) {
+      throw new Error('GPU smoke density colour framebuffer allocation failed.');
+    }
+    transientFramebuffers.push(colorFramebuffer);
 
     gl.activeTexture(gl.TEXTURE0);
     const accumulationAtlas = createAtlasTexture(
@@ -809,6 +867,7 @@ export function buildDensityTextureGPU(gl, positions, options = {}) {
       gl.R32F,
       atlasWidth,
       atlasHeight,
+      gl.RED,
       gl.FLOAT
     );
     transientTextures.push(accumulationAtlas);
@@ -819,6 +878,17 @@ export function buildDensityTextureGPU(gl, positions, options = {}) {
       'accumulation'
     );
     gl.viewport(0, 0, atlasWidth, atlasHeight);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    const colorAtlas = createAtlasTexture(
+      gl,
+      gl.RGBA32F,
+      atlasWidth,
+      atlasHeight,
+      gl.RGBA,
+      gl.FLOAT
+    );
+    transientTextures.push(colorAtlas);
+    attachColorTarget(gl, colorFramebuffer, colorAtlas, 'colour accumulation');
     gl.clear(gl.COLOR_BUFFER_BIT);
 
     const positionBuffer = gl.createBuffer();
@@ -833,10 +903,18 @@ export function buildDensityTextureGPU(gl, positions, options = {}) {
     );
     gl.bufferData(
       gl.ARRAY_BUFFER,
-      splatBatchCapacity * 3 * Float32Array.BYTES_PER_ELEMENT,
+      splatBatchCapacity * dimension * Float32Array.BYTES_PER_ELEMENT,
       gl.STREAM_DRAW
     );
+    const colorBuffer = gl.createBuffer();
+    if (!colorBuffer) {
+      throw new Error('GPU smoke density color-buffer allocation failed.');
+    }
+    transientBuffers.push(colorBuffer);
+    gl.bindBuffer(gl.ARRAY_BUFFER, colorBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, splatBatchCapacity * 4, gl.STREAM_DRAW);
 
+    // Density pass: one instance per cell, eight corner vertices each.
     const splatVertexArray = gl.createVertexArray();
     if (!splatVertexArray) {
       throw new Error('GPU smoke density splat VAO allocation failed.');
@@ -847,7 +925,7 @@ export function buildDensityTextureGPU(gl, positions, options = {}) {
     gl.enableVertexAttribArray(resources.splatLocs.a_position);
     gl.vertexAttribPointer(
       resources.splatLocs.a_position,
-      3,
+      dimension,
       gl.FLOAT,
       false,
       0,
@@ -866,41 +944,103 @@ export function buildDensityTextureGPU(gl, positions, options = {}) {
     );
     gl.vertexAttribDivisor(resources.splatLocs.a_cornerIndex, 0);
 
-    gl.useProgram(resources.splatProgram);
-    gl.uniform1f(resources.splatLocs.u_gridSize, gridSize);
-    gl.uniform1f(resources.splatLocs.u_atlasWidth, atlasWidth);
-    gl.uniform1f(resources.splatLocs.u_atlasHeight, atlasHeight);
-    gl.uniform1f(resources.splatLocs.u_slicesPerRow, slicesPerRow);
+    // Colour pass: one point vertex per cell.
+    const colorVertexArray = gl.createVertexArray();
+    if (!colorVertexArray) {
+      throw new Error('GPU smoke density colour VAO allocation failed.');
+    }
+    transientVertexArrays.push(colorVertexArray);
+    gl.bindVertexArray(colorVertexArray);
+    gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+    gl.enableVertexAttribArray(resources.colorSplatLocs.a_position);
+    gl.vertexAttribPointer(
+      resources.colorSplatLocs.a_position,
+      dimension,
+      gl.FLOAT,
+      false,
+      0,
+      0
+    );
+    gl.bindBuffer(gl.ARRAY_BUFFER, colorBuffer);
+    gl.enableVertexAttribArray(resources.colorSplatLocs.a_color);
+    gl.vertexAttribPointer(
+      resources.colorSplatLocs.a_color,
+      4,
+      gl.UNSIGNED_BYTE,
+      true,
+      0,
+      0
+    );
+
+    for (const [program, locations] of [
+      [resources.splatProgram, resources.splatLocs],
+      [resources.colorSplatProgram, resources.colorSplatLocs],
+    ]) {
+      gl.useProgram(program);
+      gl.uniform1f(locations.u_gridSize, gridSize);
+      gl.uniform1f(locations.u_atlasWidth, atlasWidth);
+      gl.uniform1f(locations.u_atlasHeight, atlasHeight);
+      gl.uniform1f(locations.u_slicesPerRow, slicesPerRow);
+      gl.uniform3f(locations.u_flatAxes, ...flatAxes);
+      gl.uniform1f(
+        locations.u_slabHalfThickness,
+        SMOKE_SLAB_HALF_THICKNESS
+      );
+    }
     gl.enable(gl.BLEND);
     gl.blendEquationSeparate(gl.FUNC_ADD, gl.FUNC_ADD);
     gl.blendFuncSeparate(gl.ONE, gl.ONE, gl.ONE, gl.ONE);
+
+    const submitBatch = (
+      positionSource,
+      positionOffset,
+      colorSource,
+      colorOffset,
+      batchPointCount
+    ) => {
+      gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+      gl.bufferSubData(
+        gl.ARRAY_BUFFER,
+        0,
+        positionSource,
+        positionOffset,
+        batchPointCount * dimension
+      );
+      gl.bindBuffer(gl.ARRAY_BUFFER, colorBuffer);
+      gl.bufferSubData(
+        gl.ARRAY_BUFFER,
+        0,
+        colorSource,
+        colorOffset,
+        batchPointCount * 4
+      );
+      gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+      gl.useProgram(resources.splatProgram);
+      gl.bindVertexArray(splatVertexArray);
+      gl.drawArraysInstanced(gl.POINTS, 0, 8, batchPointCount);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, colorFramebuffer);
+      gl.useProgram(resources.colorSplatProgram);
+      gl.bindVertexArray(colorVertexArray);
+      gl.drawArrays(gl.POINTS, 0, batchPointCount);
+    };
+
     if (visiblePointCount === pointCount) {
       for (
         let pointOffset = 0;
         pointOffset < pointCount;
         pointOffset += MAX_SPLAT_POINTS_PER_BATCH
       ) {
-        const batchPointCount = Math.min(
-          MAX_SPLAT_POINTS_PER_BATCH,
-          pointCount - pointOffset
-        );
-        gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
-        gl.bufferSubData(
-          gl.ARRAY_BUFFER,
-          0,
+        submitBatch(
           positions,
-          pointOffset * 3,
-          batchPointCount * 3
-        );
-        gl.drawArraysInstanced(
-          gl.POINTS,
-          0,
-          8,
-          batchPointCount
+          pointOffset * dimension,
+          colors,
+          pointOffset * 4,
+          Math.min(MAX_SPLAT_POINTS_PER_BATCH, pointCount - pointOffset)
         );
       }
     } else {
-      const batchPositions = new Float32Array(splatBatchCapacity * 3);
+      const batchPositions = new Float32Array(splatBatchCapacity * dimension);
+      const batchColors = new Uint8Array(splatBatchCapacity * 4);
       const alpha = visibility.alpha;
       const outlierQuantiles = visibility.outlierQuantiles;
       const outlierThreshold = visibility.outlierThreshold;
@@ -912,46 +1052,25 @@ export function buildDensityTextureGPU(gl, positions, options = {}) {
           const quantile = outlierQuantiles[pointIndex];
           if (quantile >= 0 && quantile > outlierThreshold) continue;
         }
-        const sourceOffset = pointIndex * 3;
-        const batchOffset = batchPointCount * 3;
-        batchPositions[batchOffset] = positions[sourceOffset];
-        batchPositions[batchOffset + 1] = positions[sourceOffset + 1];
-        batchPositions[batchOffset + 2] = positions[sourceOffset + 2];
+        const sourceOffset = pointIndex * dimension;
+        const batchOffset = batchPointCount * dimension;
+        for (let axis = 0; axis < dimension; axis++) {
+          batchPositions[batchOffset + axis] = positions[sourceOffset + axis];
+        }
+        const colorSource = pointIndex * 4;
+        const colorOffset = batchPointCount * 4;
+        batchColors[colorOffset] = colors[colorSource];
+        batchColors[colorOffset + 1] = colors[colorSource + 1];
+        batchColors[colorOffset + 2] = colors[colorSource + 2];
         batchPointCount++;
         if (batchPointCount !== splatBatchCapacity) continue;
 
-        gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
-        gl.bufferSubData(
-          gl.ARRAY_BUFFER,
-          0,
-          batchPositions,
-          0,
-          batchPointCount * 3
-        );
-        gl.drawArraysInstanced(
-          gl.POINTS,
-          0,
-          8,
-          batchPointCount
-        );
+        submitBatch(batchPositions, 0, batchColors, 0, batchPointCount);
         submittedPointCount += batchPointCount;
         batchPointCount = 0;
       }
       if (batchPointCount > 0) {
-        gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
-        gl.bufferSubData(
-          gl.ARRAY_BUFFER,
-          0,
-          batchPositions,
-          0,
-          batchPointCount * 3
-        );
-        gl.drawArraysInstanced(
-          gl.POINTS,
-          0,
-          8,
-          batchPointCount
-        );
+        submitBatch(batchPositions, 0, batchColors, 0, batchPointCount);
         submittedPointCount += batchPointCount;
       }
       if (submittedPointCount !== visiblePointCount) {
@@ -961,6 +1080,7 @@ export function buildDensityTextureGPU(gl, positions, options = {}) {
       }
     }
     gl.disable(gl.BLEND);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
 
     const reductionVertexArray = createQuadVertexArray(
       gl,
@@ -982,6 +1102,7 @@ export function buildDensityTextureGPU(gl, positions, options = {}) {
         gl.R32F,
         nextWidth,
         nextHeight,
+        gl.RED,
         gl.FLOAT
       );
       transientTextures.push(nextTexture);
@@ -1021,9 +1142,10 @@ export function buildDensityTextureGPU(gl, positions, options = {}) {
     gl.activeTexture(gl.TEXTURE0);
     const normalizedAtlas = createAtlasTexture(
       gl,
-      gl.R8,
+      gl.RGBA8,
       atlasWidth,
       atlasHeight,
+      gl.RGBA,
       gl.UNSIGNED_BYTE
     );
     transientTextures.push(normalizedAtlas);
@@ -1048,15 +1170,28 @@ export function buildDensityTextureGPU(gl, positions, options = {}) {
     gl.activeTexture(gl.TEXTURE1);
     gl.bindTexture(gl.TEXTURE_2D, maximumTexture);
     gl.uniform1i(resources.normalizeLocs.u_maxAtlas, 1);
+    gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_2D, colorAtlas);
+    gl.uniform1i(resources.normalizeLocs.u_colorAtlas, 2);
     gl.uniform1f(resources.normalizeLocs.u_gamma, gammaFloat32);
+    gl.uniform1i(resources.normalizeLocs.u_gridSize, gridSize);
+    gl.uniform1i(resources.normalizeLocs.u_slicesPerRow, slicesPerRow);
     gl.bindVertexArray(normalizationVertexArray);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    gl.bindTexture(gl.TEXTURE_2D, null);
     releaseTrackedResource(
       gl,
       transientTextures,
       accumulationAtlas,
       'deleteTexture',
       'completed accumulation atlas'
+    );
+    releaseTrackedResource(
+      gl,
+      transientTextures,
+      colorAtlas,
+      'deleteTexture',
+      'completed colour atlas'
     );
     releaseTrackedResource(
       gl,
@@ -1075,12 +1210,12 @@ export function buildDensityTextureGPU(gl, positions, options = {}) {
     gl.texImage3D(
       gl.TEXTURE_3D,
       0,
-      gl.R8,
+      gl.RGBA8,
       gridSize,
       gridSize,
       gridSize,
       0,
-      gl.RED,
+      gl.RGBA,
       gl.UNSIGNED_BYTE,
       null
     );
@@ -1111,12 +1246,7 @@ export function buildDensityTextureGPU(gl, positions, options = {}) {
     }
     gl.generateMipmap(gl.TEXTURE_3D);
 
-    const pipelineErrors = collectWebGLErrors(gl);
-    if (pipelineErrors.length > 0) {
-      throw new Error(
-        `GPU smoke density publication failed with WebGL error(s) ${formatWebGLErrors(pipelineErrors)}.`
-      );
-    }
+    requireCleanWebGLState(gl, 'GPU smoke density publication');
     result = Object.freeze({
       boundsMax: Object.freeze([1, 1, 1]),
       boundsMin: Object.freeze([-1, -1, -1]),
@@ -1169,12 +1299,7 @@ export function buildDensityTextureGPU(gl, positions, options = {}) {
     ));
   }
   try {
-    const settlementErrorCodes = collectWebGLErrors(gl);
-    if (settlementErrorCodes.length > 0) {
-      settlementFailures.push(new Error(
-        `GPU smoke density settlement produced WebGL error(s) ${formatWebGLErrors(settlementErrorCodes)}.`
-      ));
-    }
+    requireCleanWebGLState(gl, 'GPU smoke density settlement');
   } catch (error) {
     settlementFailures.push(asError(
       error,
@@ -1197,12 +1322,7 @@ export function buildDensityTextureGPU(gl, positions, options = {}) {
       }
     }
     try {
-      const candidateCleanupErrorCodes = collectWebGLErrors(gl);
-      if (candidateCleanupErrorCodes.length > 0) {
-        failures.push(new Error(
-          `GPU smoke density candidate cleanup produced WebGL error(s) ${formatWebGLErrors(candidateCleanupErrorCodes)}.`
-        ));
-      }
+      requireCleanWebGLState(gl, 'GPU smoke density candidate cleanup');
     } catch (error) {
       failures.push(asError(
         error,
@@ -1263,8 +1383,9 @@ export function createDensityTexture3D(gl, volumeDesc) {
     );
   }
 
-  // Convert float [0,1] to uint8 [0,255]
-  const texData = new Uint8Array(gridSize * gridSize * gridSize);
+  // Convert float [0,1] to the GPU build's RGBA8 layout: density in red and
+  // white, density-premultiplied, in the colour channels.
+  const texData = new Uint8Array(gridSize * gridSize * gridSize * 4);
   for (let i = 0; i < volume.length; i++) {
     const value = volume[i];
     if (!Number.isFinite(value) || value < 0 || value > 1) {
@@ -1272,7 +1393,8 @@ export function createDensityTexture3D(gl, volumeDesc) {
         `Smoke density texture value ${i} must be finite and between 0 and 1.`
       );
     }
-    texData[i] = Math.floor(value * 255 + 0.5);
+    const byte = Math.floor(value * 255 + 0.5);
+    texData.fill(byte, i * 4, i * 4 + 4);
   }
 
   const priorError = gl.getError();
@@ -1293,10 +1415,10 @@ export function createDensityTexture3D(gl, volumeDesc) {
     gl.texImage3D(
       gl.TEXTURE_3D,
       0,
-      gl.R8,
+      gl.RGBA8,
       gridSize, gridSize, gridSize,
       0,
-      gl.RED,
+      gl.RGBA,
       gl.UNSIGNED_BYTE,
       texData
     );
@@ -1362,4 +1484,250 @@ export function createDensityTexture3D(gl, volumeDesc) {
     gridSize,
     is3D: true
   };
+}
+
+// ============================================================================
+// Derived volumes: lighting (key-light shadow + sky occlusion) and occupancy
+// ============================================================================
+
+function allocateVolumeTexture(gl, internalFormat, format, type, size, filter) {
+  const texture = gl.createTexture();
+  if (!texture) {
+    throw new Error('Smoke derived-volume texture allocation failed.');
+  }
+  gl.bindTexture(gl.TEXTURE_3D, texture);
+  gl.texImage3D(
+    gl.TEXTURE_3D, 0, internalFormat, size, size, size, 0, format, type, null
+  );
+  gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, filter);
+  gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, filter);
+  gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_R, gl.CLAMP_TO_EDGE);
+  gl.bindTexture(gl.TEXTURE_3D, null);
+  return texture;
+}
+
+function drawVolumeLayers(gl, framebuffer, texture, size, drawLayer, label) {
+  gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+  gl.viewport(0, 0, size, size);
+  for (let layer = 0; layer < size; layer++) {
+    gl.framebufferTextureLayer(
+      gl.FRAMEBUFFER,
+      gl.COLOR_ATTACHMENT0,
+      texture,
+      0,
+      layer
+    );
+    if (
+      layer === 0
+      && gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE
+    ) {
+      throw new Error(`Smoke ${label} framebuffer is incomplete.`);
+    }
+    drawLayer(layer);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  }
+  gl.framebufferTextureLayer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, null, 0, 0);
+}
+
+/** Edge length of the lighting volume for a density grid of `gridSize`. */
+export function smokeLightGridSize(gridSize) {
+  return Math.max(8, Math.ceil(gridSize / 2));
+}
+
+/** Edge length of the occupancy volume for a density grid of `gridSize`. */
+export function smokeOccupancyGridSize(gridSize) {
+  return Math.ceil(gridSize / OCCUPANCY_BLOCK);
+}
+
+/**
+ * Derives the two volumes the ray march reads beside the density, once per
+ * published density volume and light direction:
+ *
+ * - lighting (RG16F, half the grid): the density integrated towards the key
+ *   light and over the sky (LIGHT_VOLUME_FS). It replaces the shadow ray the
+ *   march used to cast from every sample of every frame: one filtered fetch
+ *   instead of a loop, and the shadow now crosses the whole cloud rather than
+ *   the first few voxels;
+ * - occupancy (R8, one texel per 4³ block): the largest density a sample in
+ *   each block can read (OCCUPANCY_FS), so the march crosses empty blocks in
+ *   one step.
+ *
+ * Every binding and capability it touches is restored, exactly as for the
+ * density build. Ownership of both returned textures transfers to the caller.
+ */
+export function buildDerivedVolumesGPU(gl, densityTexture, options) {
+  if (!gl || typeof gl !== 'object') {
+    throw new TypeError('Smoke derived volumes require a WebGL2 rendering context.');
+  }
+  if (!densityTexture) {
+    throw new TypeError('Smoke derived volumes require a density texture.');
+  }
+  if (
+    !options
+    || typeof options !== 'object'
+    || Object.keys(options).sort().join(',') !== 'gridSize,lightDir'
+  ) {
+    throw new TypeError(
+      'Smoke derived-volume options must contain exactly gridSize and lightDir.'
+    );
+  }
+  const { gridSize, lightDir } = options;
+  if (
+    !Number.isInteger(gridSize)
+    || gridSize < 8
+    || gridSize > MAX_SMOKE_GRID_SIZE
+  ) {
+    throw new RangeError(
+      `Smoke derived-volume gridSize must be an integer from 8 through ${MAX_SMOKE_GRID_SIZE}.`
+    );
+  }
+  if (
+    !(Array.isArray(lightDir) || lightDir instanceof Float32Array)
+    || lightDir.length !== 3
+    || Array.from(lightDir).some(value => !Number.isFinite(value))
+    || Math.hypot(...lightDir) < 1e-6
+  ) {
+    throw new TypeError(
+      'Smoke derived-volume lightDir must be three finite numbers of non-zero length.'
+    );
+  }
+  const support = detectSmokeSupport(gl);
+  if (!support.supported) throw new SmokeUnsupportedError(support);
+  requireCleanWebGLState(gl, 'Smoke derived-volume preflight');
+  const lightGridSize = smokeLightGridSize(gridSize);
+  const occupancyGridSize = smokeOccupancyGridSize(gridSize);
+  const previousState = capturePipelineState(gl);
+  const transientVertexArrays = [];
+  const transientFramebuffers = [];
+  const candidates = [];
+  let lightTexture = null;
+  let occupancyTexture = null;
+  let primaryFailure = null;
+  try {
+    const resources = getOrCreateGPUSplatResources(gl);
+    for (const capability of [
+      gl.BLEND,
+      gl.CULL_FACE,
+      gl.DEPTH_TEST,
+      gl.DITHER,
+      gl.RASTERIZER_DISCARD,
+      gl.SCISSOR_TEST,
+      gl.STENCIL_TEST,
+    ]) {
+      gl.disable(capability);
+    }
+    gl.bindSampler(0, null);
+    gl.bindSampler(1, null);
+    gl.colorMask(true, true, true, true);
+
+    gl.activeTexture(gl.TEXTURE1);
+    lightTexture = allocateVolumeTexture(
+      gl, gl.RG16F, gl.RG, gl.HALF_FLOAT, lightGridSize, gl.LINEAR
+    );
+    candidates.push(lightTexture);
+    occupancyTexture = allocateVolumeTexture(
+      gl, gl.R8, gl.RED, gl.UNSIGNED_BYTE, occupancyGridSize, gl.NEAREST
+    );
+    candidates.push(occupancyTexture);
+
+    const framebuffer = gl.createFramebuffer();
+    if (!framebuffer) {
+      throw new Error('Smoke derived-volume framebuffer allocation failed.');
+    }
+    transientFramebuffers.push(framebuffer);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_3D, densityTexture);
+
+    const lightVertexArray = createQuadVertexArray(
+      gl,
+      resources.quadBuffer,
+      resources.lightLocs.a_position,
+      'light-volume'
+    );
+    transientVertexArrays.push(lightVertexArray);
+    gl.useProgram(resources.lightProgram);
+    gl.uniform1i(resources.lightLocs.u_density, 0);
+    gl.uniform1f(resources.lightLocs.u_gridSize, gridSize);
+    gl.uniform1f(resources.lightLocs.u_lightGridSize, lightGridSize);
+    const length = Math.hypot(...lightDir);
+    gl.uniform3f(
+      resources.lightLocs.u_lightDir,
+      lightDir[0] / length,
+      lightDir[1] / length,
+      lightDir[2] / length
+    );
+    gl.bindVertexArray(lightVertexArray);
+    drawVolumeLayers(gl, framebuffer, lightTexture, lightGridSize, layer => {
+      gl.uniform1f(resources.lightLocs.u_layer, (layer + 0.5) / lightGridSize);
+    }, 'light-volume');
+
+    const occupancyVertexArray = createQuadVertexArray(
+      gl,
+      resources.quadBuffer,
+      resources.occupancyLocs.a_position,
+      'occupancy'
+    );
+    transientVertexArrays.push(occupancyVertexArray);
+    gl.useProgram(resources.occupancyProgram);
+    gl.uniform1i(resources.occupancyLocs.u_density, 0);
+    gl.uniform1i(resources.occupancyLocs.u_gridSize, gridSize);
+    gl.bindVertexArray(occupancyVertexArray);
+    drawVolumeLayers(gl, framebuffer, occupancyTexture, occupancyGridSize, layer => {
+      gl.uniform1i(resources.occupancyLocs.u_layer, layer);
+    }, 'occupancy');
+    requireCleanWebGLState(gl, 'Smoke derived-volume publication');
+  } catch (error) {
+    primaryFailure = asError(
+      error,
+      'Smoke derived volumes failed with a non-Error value.'
+    );
+  }
+
+  const failures = primaryFailure === null ? [] : [primaryFailure];
+  deleteResources(
+    gl,
+    transientVertexArrays,
+    'deleteVertexArray',
+    failures,
+    'derived-volume vertex-array'
+  );
+  deleteResources(
+    gl,
+    transientFramebuffers,
+    'deleteFramebuffer',
+    failures,
+    'derived-volume framebuffer'
+  );
+  try {
+    restorePipelineState(gl, previousState);
+  } catch (error) {
+    failures.push(asError(
+      error,
+      'Smoke derived-volume state restoration failed with a non-Error value.'
+    ));
+  }
+  try {
+    requireCleanWebGLState(gl, 'Smoke derived-volume settlement');
+  } catch (error) {
+    failures.push(asError(
+      error,
+      'Smoke derived-volume settlement inspection failed with a non-Error value.'
+    ));
+  }
+  if (failures.length > 0) {
+    deleteResources(gl, candidates, 'deleteTexture', failures, 'derived-volume candidate');
+    if (failures.length === 1) throw failures[0];
+    throw new AggregateError(
+      failures,
+      'Smoke derived-volume publication and settlement failed.'
+    );
+  }
+  return Object.freeze({
+    lightTexture,
+    lightGridSize,
+    occupancyTexture,
+    occupancyGridSize,
+  });
 }

@@ -12,7 +12,7 @@
 //                   = NaN and every y/z becomes 0: the entire embedding
 //                   collapses onto a degenerate line, silently.
 //
-// A single 0x7F800000 word anywhere in `points_3d.bin` is enough. The staged
+// A single 0x7F800000 word anywhere in `embeddings/0_3d.bin` is enough. The staged
 // `local-user://` transaction, the direct h5ad/Zarr adapters, and the in-memory
 // DimensionManager already refuse non-finite coordinates at their own ingest
 // boundary; these tests hold the remaining decode boundary — the one every
@@ -112,7 +112,7 @@ test('a single non-finite Float32 word is refused at every position of every dim
         const label =
           `${valueLabel} at the ${positionLabel} position of a ${dimension}D payload`;
         await t.test(label, async subtest => {
-          const url = `${BASE_URL}points_${dimension}d.bin`;
+          const url = `${BASE_URL}embeddings/0_${dimension}d.bin`;
           serveBytes(
             subtest,
             payloadWith(nCells, dimension, flatIndex, value).buffer
@@ -148,7 +148,7 @@ test('the raw 0x7F800000 word is refused, whatever produced it', async t => {
   serveBytes(t, words.buffer);
 
   await assert.rejects(
-    loadPointsBinary(`${BASE_URL}points_2d.bin`, {
+    loadPointsBinary(`${BASE_URL}embeddings/0_2d.bin`, {
       dimension: 2,
       expectedBytes: words.length * FLOAT32_BYTES,
     }),
@@ -157,15 +157,29 @@ test('the raw 0x7F800000 word is refused, whatever produced it', async t => {
 });
 
 test('non-finite coordinates never reach normalizePositions through DimensionManager', async t => {
-  // The genuinely uncovered path: a runtime dimension switch. Only the default
-  // dimension is checked by stageDatasetPositionPayload() on first load, so
-  // every other advertised embedding arrives here unvalidated.
+  // The genuinely uncovered path: a runtime layout switch. Only the default
+  // layout is checked by stageDatasetPositionPayload() on first load, so every
+  // other declared embedding — here a second 2D one — arrives here
+  // unvalidated.
   const requestedUrls = [];
   const dimensionManager = createDimensionManager({ baseUrl: BASE_URL });
   dimensionManager.initFromMetadata({
-    available_dimensions: [2],
     default_dimension: 2,
-    files: { '2d': 'points_2d.bin' },
+    defaults: { '2d': 'X_umap' },
+    items: {
+      X_pca: {
+        label: 'PCA',
+        dimension: 2,
+        file: 'embeddings/0_2d.bin',
+        source: { key: 'X_pca', columns: [0, 1] },
+      },
+      X_umap: {
+        label: 'UMAP',
+        dimension: 2,
+        file: 'embeddings/1_2d.bin',
+        source: { key: 'X_umap', columns: [0, 1] },
+      },
+    },
   });
 
   serveBytes(
@@ -175,13 +189,13 @@ test('non-finite coordinates never reach normalizePositions through DimensionMan
   );
 
   await assert.rejects(
-    dimensionManager.getPositions3D(2, { showProgress: false }),
-    /points_2d\.bin: position 4 is not a finite Float32 value/,
-    'the padding and normalization transaction must never run on this payload'
+    dimensionManager.getPositions('X_pca', { showProgress: false }),
+    /embeddings\/0_2d\.bin: position 4 is not a finite Float32 value/,
+    'the normalization transaction must never run on this payload'
   );
-  assert.deepEqual(requestedUrls, [`${BASE_URL}points_2d.bin`]);
+  assert.deepEqual(requestedUrls, [`${BASE_URL}embeddings/0_2d.bin`]);
   assert.equal(
-    dimensionManager.paddedPositionCache.size,
+    dimensionManager.normalizedPositionCache.size,
     0,
     'no normalized buffer may be published from a refused payload'
   );
@@ -197,7 +211,7 @@ test('a clean payload still loads unchanged, compressed shape and all', async t 
   serveBytes(t, clean.buffer);
 
   assert.deepEqual(
-    Array.from(await loadPointsBinary(`${BASE_URL}points_2d.bin`, {
+    Array.from(await loadPointsBinary(`${BASE_URL}embeddings/0_2d.bin`, {
       dimension: 2,
       expectedBytes: clean.length * FLOAT32_BYTES,
     })),
@@ -212,7 +226,7 @@ test('signed zero and subnormal coordinates are finite and stay accepted', async
   const edge = Float32Array.of(-0, 0, 1.401298464324817e-45, 3.4028234663852886e38);
   serveBytes(t, edge.buffer);
 
-  const loaded = await loadPointsBinary(`${BASE_URL}points_2d.bin`, {
+  const loaded = await loadPointsBinary(`${BASE_URL}embeddings/0_2d.bin`, {
     dimension: 2,
     expectedBytes: edge.length * FLOAT32_BYTES,
   });
@@ -225,7 +239,7 @@ test('an empty advertised payload carries no coordinate to reject', async t => {
   serveBytes(t, new ArrayBuffer(0));
 
   assert.equal(
-    (await loadPointsBinary(`${BASE_URL}points_2d.bin`, {
+    (await loadPointsBinary(`${BASE_URL}embeddings/0_2d.bin`, {
       dimension: 2,
       expectedBytes: 0,
     })).length,
@@ -240,7 +254,27 @@ test('a byte length that is not a multiple of 4 is still refused first', async t
   serveBytes(t, new Uint8Array([0, 0, 128, 127, 0, 0, 127]).buffer);
 
   await assert.rejects(
-    loadPointsBinary(`${BASE_URL}points_2d.bin`, { expectedBytes: null }),
+    loadPointsBinary(`${BASE_URL}embeddings/0_2d.bin`, {
+      dimension: 2,
+      expectedBytes: null,
+    }),
     /byte length must be a multiple of 4/
   );
+});
+
+test('a published positions array is proven finite once: a switch back to it scans nothing', async () => {
+  const { assertFiniteFloat32Array } = await import('../assets/js/rendering/viewer/viewer-contracts.js');
+  const positions = new Float32Array([0, 1, 2, 3, 4, 5]);
+  assert.strictEqual(assertFiniteFloat32Array(positions, 6, 'Positions'), positions);
+  // Published arrays are never written; writing one here shows the proof is
+  // remembered rather than re-derived by a fresh O(N) scan.
+  positions[3] = Number.NaN;
+  assert.strictEqual(assertFiniteFloat32Array(positions, 6, 'Positions'), positions);
+  // A new array is scanned.
+  assert.throws(
+    () => assertFiniteFloat32Array(new Float32Array([0, Number.POSITIVE_INFINITY]), 2, 'Positions'),
+    /value 1 must be finite/,
+  );
+  // The length contract is still checked every time.
+  assert.throws(() => assertFiniteFloat32Array(positions, 9, 'Positions'), /exactly 9 values/);
 });

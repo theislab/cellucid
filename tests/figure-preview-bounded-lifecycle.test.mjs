@@ -86,6 +86,7 @@ test('large-N preview reads and retains only bounded sampled ownership', () => {
 
   const reduced = reducePointsByDensity({
     positions,
+    dimension: 3,
     colors,
     highlightArray,
     highlightedIndices: hugeSparseOwner,
@@ -150,6 +151,7 @@ test('large-N preview reads and retains only bounded sampled ownership', () => {
   }
   const sparseVisible = reducePointsByDensity({
     positions: positionsOwner,
+    dimension: 3,
     colors: colorsOwner,
     highlightArray: sparseHighlightArray,
     highlightedIndices: sparseHighlightIds,
@@ -177,6 +179,7 @@ test('preview sampling consumes the exact cap just above its boundary', () => {
 
   const reduced = reducePointsByDensity({
     positions,
+    dimension: 3,
     colors,
     renderState: renderState(),
     targetCount: 10,
@@ -191,6 +194,7 @@ test('preview sampling consumes the exact cap just above its boundary', () => {
   assert.throws(
     () => reducePointsByDensity({
       positions,
+      dimension: 3,
       colors,
       renderState: renderState(),
       targetCount: 10,
@@ -220,6 +224,7 @@ test('small sparse highlights preserve exact source positions and sampled owners
 
   const reduced = reducePointsByDensity({
     positions,
+    dimension: 3,
     colors,
     highlightArray,
     highlightedIndices,
@@ -275,6 +280,7 @@ test('crop mapping subtracts its source origin exactly once', () => {
 
   const reduced = reducePointsByDensity({
     positions: Float32Array.from([0, 0, 0]),
+    dimension: 3,
     colors: Uint8Array.from([10, 20, 30, 255]),
     renderState: renderState(),
     targetCount: 1,
@@ -365,6 +371,7 @@ test('preview epoch and certificate fences reject stale or closed work', () => {
 test('empty and fully cropped reductions publish deterministic empty owners', () => {
   const empty = reducePointsByDensity({
     positions: new Float32Array(0),
+    dimension: 3,
     colors: new Uint8Array(0),
     renderState: renderState({
       viewportHeight: 80,
@@ -399,6 +406,7 @@ test('empty and fully cropped reductions publish deterministic empty owners', ()
 
   const cropped = reducePointsByDensity({
     positions: Float32Array.from([-0.9, -0.9, 0]),
+    dimension: 3,
     colors: Uint8Array.from([255, 255, 255, 255]),
     renderState: renderState(),
     targetCount: 1,
@@ -451,7 +459,7 @@ test('preview UI borrows N-sized data and fences every retained lifecycle owner'
     'field:changed',
     'visibility:changed',
     'highlight:changed',
-    'dimension:changed',
+    'view:representation-changed',
     'view:changed',
     'page:changed',
   ]) {
@@ -545,5 +553,22 @@ test('figure-export UI exposes its stable idempotent cleanup owner', async () =>
     /const destroy = \(\) => \{\s*if \(cleanupComplete\) return;/
   );
   assert.match(source, /container\.__cellucidCleanup = destroy;/);
-  assert.match(source, /return \{ destroy \};\s*\n\}/);
+  assert.match(source, /return \{ setCellsPresent, destroy \};\s*\n\}/);
+});
+
+test('figure-export Export is offered only while the runtime has cells', async () => {
+  const source = await readFile(
+    new URL(
+      '../assets/js/app/ui/modules/figure-export/figure-export-ui.js',
+      import.meta.url
+    ),
+    'utf8'
+  );
+
+  assert.match(source, /let cellsPresent = false;/);
+  assert.match(source, /exportBtn\.disabled = exportBusy \|\| !cellsPresent;/);
+  assert.match(
+    source,
+    /exportBtn\.title = cellsPresent \? '' : 'Load a dataset to export a figure';/
+  );
 });

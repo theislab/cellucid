@@ -51,15 +51,25 @@
 	import {
 	  buildReferenceGridModel,
 	  drawCanvasReferenceGrid,
-	  resolveReferenceGridSurfaceRgb,
+	  resolveReferenceGridSurface,
 	} from '../components/reference-grid.js';
+	import {
+	  figureDrawsBackdropLook,
+	  renderBackdropLookForPlot,
+	} from '../components/backdrop-look-export.js';
 	import {
 	  computeVisibleCameraBounds,
 	  computeVisibleRealBounds,
 	} from '../utils/coordinate-mapper.js';
-	import { assertCropRect01, cropRect01ToPx } from '../utils/crop.js';
+	import {
+	  assertCropRect01,
+	  cropRect01ToPx,
+	  fitCropIntoRect,
+	  planCropRaster,
+	} from '../utils/crop.js';
 	import { embedPngTextChunks } from '../utils/png-metadata.js';
 import {
+  exportSpriteZoomLimit,
   rasterizePointsWebgl,
   releaseWebglRasterCanvas,
 } from '../utils/webgl-point-rasterizer.js';
@@ -86,6 +96,126 @@ import {
   buildSelectionBadge,
   countHighlightedVisiblePoints,
 } from '../utils/selection-badge.js';
+
+/**
+ * The device pixels a plot rectangle covers on the export canvas, snapped to
+ * whole pixels.
+ *
+ * The plot rectangle is laid out in CSS pixels and the canvas is scaled by
+ * `dpi / 96`, so its edges land between device pixels (at 300 dpi a plot at
+ * x = 82 starts at 256.25). A point raster drawn into that fractional
+ * rectangle was resampled by the 2D canvas: every pixel of it was blended
+ * with its neighbours (a quarter-pixel blur), and the bytes depended on how
+ * the browser resampled. On the macOS Firefox runners one unchanged view,
+ * exported before and after a kept view came and went, differed by one level
+ * at the same few antialiased point edges in every run. The raster is
+ * therefore rendered at exactly the snapped size and copied one to one onto
+ * these pixels.
+ *
+ * @param {CanvasRenderingContext2D} ctx - with a scale-and-translate transform
+ * @param {{x: number, y: number, width: number, height: number}} rect - CSS px
+ * @returns {{x: number, y: number, width: number, height: number}} device px
+ */
+function snapPlotRectToDevicePixels(ctx, rect) {
+  const m = ctx.getTransform();
+  if (m.b !== 0 || m.c !== 0) {
+    throw new Error('PNG export plot rectangles must not be rotated or skewed.');
+  }
+  const left = Math.round(m.a * rect.x + m.e);
+  const top = Math.round(m.d * rect.y + m.f);
+  const right = Math.round(m.a * (rect.x + rect.width) + m.e);
+  const bottom = Math.round(m.d * (rect.y + rect.height) + m.f);
+  return {
+    x: left,
+    y: top,
+    width: Math.max(1, right - left),
+    height: Math.max(1, bottom - top),
+  };
+}
+
+/**
+ * Copy a point raster rendered at `deviceRect`'s size onto those device
+ * pixels, one to one (see `snapPlotRectToDevicePixels`).
+ *
+ * @param {CanvasRenderingContext2D} ctx
+ * @param {HTMLCanvasElement} raster
+ * @param {{x: number, y: number, width: number, height: number}} deviceRect
+ */
+function drawRasterAtDevicePixels(ctx, raster, deviceRect) {
+  if (raster.width !== deviceRect.width || raster.height !== deviceRect.height) {
+    throw new Error('PNG export point raster must match its device rectangle.');
+  }
+  ctx.save();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.drawImage(raster, deviceRect.x, deviceRect.y);
+  ctx.restore();
+}
+
+/**
+ * Where a plot's point raster goes and how it is drawn.
+ *
+ * Unframed, the raster covers the plot's device pixels and letterboxes the
+ * whole view (its letterbox scale in raster pixels per viewer pixel). Framed, it
+ * covers only the crop's place in the plot (`fitCropIntoRect`) and draws
+ * just the crop at those pixels (`planCropRaster`; the rasterizer's
+ * `viewRect01`), so a frame is as sharp as an unframed figure of the same
+ * size instead of a magnified part of one.
+ *
+ * @returns {{deviceRect: object, width: number, height: number, zoom: number,
+ *   exact: boolean, viewRect01: object|null}}
+ */
+function planPointRaster(ctx, plotRect, crop01, renderState) {
+  const viewportWidth = renderState.viewportWidth;
+  const viewportHeight = renderState.viewportHeight;
+  if (crop01 === null) {
+    const deviceRect = snapPlotRectToDevicePixels(ctx, plotRect);
+    const zoom = computeLetterboxedRect({
+      srcWidth: viewportWidth,
+      srcHeight: viewportHeight,
+      dstWidth: deviceRect.width,
+      dstHeight: deviceRect.height,
+    }).scale;
+    return {
+      deviceRect,
+      width: deviceRect.width,
+      height: deviceRect.height,
+      zoom,
+      exact: true,
+      viewRect01: null,
+    };
+  }
+  const deviceRect = snapPlotRectToDevicePixels(
+    ctx,
+    fitCropIntoRect({ crop01, viewportWidth, viewportHeight, destRect: plotRect })
+  );
+  const plan = planCropRaster({
+    crop01,
+    viewportWidth,
+    viewportHeight,
+    deviceRect,
+    zoomLimit: exportSpriteZoomLimit(),
+  });
+  return { deviceRect, ...plan, viewRect01: crop01 };
+}
+
+/** Copy a planned point raster onto its device pixels. */
+function drawPointRaster(ctx, raster, plan) {
+  if (plan.exact) {
+    drawRasterAtDevicePixels(ctx, raster, plan.deviceRect);
+    return;
+  }
+  // Only a crop zoomed past the GPU's sprite range is scaled at the copy.
+  ctx.save();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.drawImage(
+    raster,
+    plan.deviceRect.x,
+    plan.deviceRect.y,
+    plan.deviceRect.width,
+    plan.deviceRect.height
+  );
+  ctx.restore();
+}
 
 function drawCanvasSelectionBadge(ctx, badge, fontFamily, fontSize, ink) {
   ctx.save();
@@ -228,7 +358,7 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
   // The reference grid is a viewer-owned background layer: it sits behind the
   // points in every panel, exactly as `drawGrid()` does on screen.
   const referenceGrid = opts.referenceGrid;
-  const referenceGridSurfaceRgb = resolveReferenceGridSurfaceRgb({
+  const referenceGridSurface = resolveReferenceGridSurface({
     appearance: referenceGrid,
     background,
     backgroundColor,
@@ -331,6 +461,9 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
     const navMode = singleNavMode;
     const axesEligible = singleAxesEligible;
     const lodMembership = view.scientificState.lodMembership;
+    // The order the pane draws at full detail (a reduced level draws a
+    // prefix of it, `lodMembership.indices`).
+    const drawOrder = view.scientificState.drawOrder;
     const pointDiameterViewportPx =
       renderState.pointSize * view.scientificState.lodSizeMultiplier;
     const includeCentroidPoints = typeof opts.includeCentroidPoints === 'boolean'
@@ -376,6 +509,7 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
     const visibleBounds = useCameraAxes
       ? computeVisibleCameraBounds({
         positions,
+        dimension: dim,
         transparency,
         lodMembership,
         mvpMatrix: renderState.mvpMatrix,
@@ -386,6 +520,7 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
       })
       : computeVisibleRealBounds({
         positions,
+        dimension: dim,
         transparency,
         lodMembership,
         mvpMatrix: renderState.mvpMatrix,
@@ -416,20 +551,24 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
         renderState,
         plotRect,
         crop,
-        surfaceRgb: referenceGridSurfaceRgb,
+        surface: referenceGridSurface,
       }),
     });
+    if (figureDrawsBackdropLook(referenceGrid, referenceGridSurface, renderState)) {
+      const lookRect = snapPlotRectToDevicePixels(ctx, plotRect);
+      const lookRaster = await renderBackdropLookForPlot({
+        renderState,
+        plotRect,
+        crop,
+        width: lookRect.width,
+        height: lookRect.height,
+        signal,
+      });
+      throwIfFigureExportAborted(signal);
+      drawRasterAtDevicePixels(ctx, lookRaster, lookRect);
+    }
 
-    const outW = Math.max(1, Math.round(plotRect.width * scale));
-    const outH = Math.max(1, Math.round(plotRect.height * scale));
-    const srcViewportW = renderState.viewportWidth;
-    const srcViewportH = renderState.viewportHeight;
-    const viewportScale = computeLetterboxedRect({
-      srcWidth: srcViewportW,
-      srcHeight: srcViewportH,
-      dstWidth: outW,
-      dstHeight: outH
-    }).scale;
+    const rasterPlan = planPointRaster(ctx, plotRect, crop01, renderState);
     const centroidDiameterViewportPx = renderState.pointSize * 4;
 
     const renderStateForPoints = applyExportBackgroundToRenderState(
@@ -439,15 +578,18 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
     );
     const webglCanvas = rasterizePointsWebgl({
       positions,
+      dimension: dim,
       colors,
       transparency,
       renderState: renderStateForPoints,
       lodMembership,
-      outputWidthPx: outW,
-      outputHeightPx: outH,
+      drawOrder,
+      outputWidthPx: rasterPlan.width,
+      outputHeightPx: rasterPlan.height,
+      viewRect01: rasterPlan.viewRect01,
       pointSizePx: scalePointDiameterToRaster(
         pointDiameterViewportPx,
-        viewportScale
+        rasterPlan.zoom
       ),
       overlayPoints: (includeCentroidPoints && hasCentroidPoints)
         ? {
@@ -455,7 +597,7 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
           colors: centroidColors,
           pointSizePx: scalePointDiameterToRaster(
             centroidDiameterViewportPx,
-            viewportScale
+            rasterPlan.zoom
           ),
         }
         : null,
@@ -466,37 +608,7 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
 
     centroidPointsRasterized = includeCentroidPoints && hasCentroidPoints;
     try {
-      if (crop01) {
-        const vp = computeLetterboxedRect({
-          srcWidth: renderState.viewportWidth,
-          srcHeight: renderState.viewportHeight,
-          dstWidth: webglCanvas.width,
-          dstHeight: webglCanvas.height
-        });
-        const sx = vp.x + crop01.x * vp.width;
-        const sy = vp.y + crop01.y * vp.height;
-        const sw = crop01.width * vp.width;
-        const sh = crop01.height * vp.height;
-        ctx.drawImage(
-          webglCanvas,
-          sx,
-          sy,
-          sw,
-          sh,
-          plotRect.x,
-          plotRect.y,
-          plotRect.width,
-          plotRect.height
-        );
-      } else {
-        ctx.drawImage(
-          webglCanvas,
-          plotRect.x,
-          plotRect.y,
-          plotRect.width,
-          plotRect.height
-        );
-      }
+      drawPointRaster(ctx, webglCanvas, rasterPlan);
     } finally {
       // Canvas2D may retain native work sourced from this WebGL canvas until
       // PNG encoding settles. The function-level terminal owner releases the
@@ -730,9 +842,22 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
           renderState,
           plotRect,
           crop,
-          surfaceRgb: referenceGridSurfaceRgb,
+          surface: referenceGridSurface,
         }),
       });
+      if (figureDrawsBackdropLook(referenceGrid, referenceGridSurface, renderState)) {
+        const lookRect = snapPlotRectToDevicePixels(ctx, plotRect);
+        const lookRaster = await renderBackdropLookForPlot({
+          renderState,
+          plotRect,
+          crop,
+          width: lookRect.width,
+          height: lookRect.height,
+          signal,
+        });
+        throwIfFigureExportAborted(signal);
+        drawRasterAtDevicePixels(ctx, lookRaster, lookRect);
+      }
 
       const dim = view.scientificState.dimensionLevel;
       const cameraState = assertCameraState(
@@ -741,6 +866,9 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
       );
       const navMode = cameraState.navigationMode;
       const lodMembership = view.scientificState.lodMembership;
+      // The order the pane draws at full detail (a reduced level draws a
+      // prefix of it, `lodMembership.indices`).
+      const drawOrder = view.scientificState.drawOrder;
       const pointDiameterViewportPx =
         renderState.pointSize * view.scientificState.lodSizeMultiplier;
       const useCameraAxes =
@@ -750,6 +878,7 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
       const visibleBounds = useCameraAxes
         ? computeVisibleCameraBounds({
           positions,
+          dimension: dim,
           transparency,
           lodMembership,
           mvpMatrix: renderState.mvpMatrix,
@@ -760,6 +889,7 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
         })
         : computeVisibleRealBounds({
           positions,
+          dimension: dim,
           transparency,
           lodMembership,
           mvpMatrix: renderState.mvpMatrix,
@@ -781,11 +911,9 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
         centroidColors instanceof Uint8Array &&
         centroidColors.length === (centroidPositions.length / 3) * 4;
 
-      const outW = Math.max(1, Math.round(plotRect.width * scale));
-      const outH = Math.max(1, Math.round(plotRect.height * scale));
+      const rasterPlan = planPointRaster(ctx, plotRect, crop01, renderState);
       const srcViewportW = renderState.viewportWidth;
       const srcViewportH = renderState.viewportHeight;
-      const viewportScale = computeLetterboxedRect({ srcWidth: srcViewportW, srcHeight: srcViewportH, dstWidth: outW, dstHeight: outH }).scale;
       const cropPx = cropRect01ToPx(crop01, srcViewportW, srcViewportH);
       const cropW = cropPx ? cropPx.width : srcViewportW;
       const cropH = cropPx ? cropPx.height : srcViewportH;
@@ -797,15 +925,18 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
       const renderStateForPoints = applyExportBackgroundToRenderState(renderState, background, backgroundColor);
       const webglCanvas = rasterizePointsWebgl({
         positions,
+        dimension: dim,
         colors,
         transparency,
         renderState: renderStateForPoints,
         lodMembership,
-        outputWidthPx: outW,
-        outputHeightPx: outH,
+        drawOrder,
+        outputWidthPx: rasterPlan.width,
+        outputHeightPx: rasterPlan.height,
+        viewRect01: rasterPlan.viewRect01,
         pointSizePx: scalePointDiameterToRaster(
           pointDiameterViewportPx,
-          viewportScale
+          rasterPlan.zoom
         ),
         overlayPoints: (includeCentroidPoints && hasCentroidPoints)
           ? {
@@ -813,7 +944,7 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
             colors: centroidColors,
             pointSizePx: scalePointDiameterToRaster(
               centroidDiameterViewportPx,
-              viewportScale
+              rasterPlan.zoom
             ),
           }
           : null,
@@ -824,37 +955,7 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
 
       centroidPointsRasterized = includeCentroidPoints && hasCentroidPoints;
       try {
-        if (crop01) {
-          const vp = computeLetterboxedRect({
-            srcWidth: renderState.viewportWidth,
-            srcHeight: renderState.viewportHeight,
-            dstWidth: webglCanvas.width,
-            dstHeight: webglCanvas.height
-          });
-          const sx = vp.x + crop01.x * vp.width;
-          const sy = vp.y + crop01.y * vp.height;
-          const sw = crop01.width * vp.width;
-          const sh = crop01.height * vp.height;
-          ctx.drawImage(
-            webglCanvas,
-            sx,
-            sy,
-            sw,
-            sh,
-            plotRect.x,
-            plotRect.y,
-            plotRect.width,
-            plotRect.height
-          );
-        } else {
-          ctx.drawImage(
-            webglCanvas,
-            plotRect.x,
-            plotRect.y,
-            plotRect.width,
-            plotRect.height
-          );
-        }
+        drawPointRaster(ctx, webglCanvas, rasterPlan);
       } finally {
         rasterCanvases.add(webglCanvas);
       }

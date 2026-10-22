@@ -28,9 +28,8 @@
  * demand a thinning far more aggressive than the glyphs need.
  */
 import { expect, test } from './helpers/test.mjs';
-import { appUrl } from './helpers/origins.mjs';
+import { openPlotHarness } from './helpers/plot-harness.mjs';
 
-const HARNESS_URL = appUrl('/tests/browser/fixtures/analysis-plot-harness.html');
 
 /**
  * The two boxes an analysis plot is drawn into.
@@ -213,7 +212,7 @@ function describeQuad(corners) {
 
 test.describe('analysis plot label collisions', () => {
   test.beforeEach(async ({ page }) => {
-    await page.goto(HARNESS_URL, { waitUntil: 'domcontentloaded' });
+    await openPlotHarness(page);
   });
 
   for (const surface of SURFACES) {

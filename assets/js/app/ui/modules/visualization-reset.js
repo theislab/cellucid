@@ -9,6 +9,7 @@
  */
 
 import { getDefaultNavigationMode } from '../../../rendering/viewer/viewer-contracts.js';
+import { VIEWER_BACKGROUNDS } from '../../../rendering/viewer-backgrounds.js';
 import { parseRangeInput } from '../core/numeric-input-contract.js';
 import {
   POINT_SIZE_SLIDER_MAXIMUM,
@@ -112,7 +113,6 @@ const CAMERA_CONTROL_METHODS = Object.freeze([
   'updatePlanarPanSpeed'
 ]);
 
-const BACKGROUND_MODES = Object.freeze(['grid', 'grid-dark', 'white', 'black']);
 const RENDER_MODES = Object.freeze(['points', 'smoke']);
 
 function assertRecord(value, label) {
@@ -319,7 +319,7 @@ export function initVisualizationReset(options) {
     initialUIState = Object.freeze({
       background: assertChoice(
         backgroundSelect.value,
-        BACKGROUND_MODES,
+        VIEWER_BACKGROUNDS,
         'Visualization background'
       ),
       renderMode: assertChoice(

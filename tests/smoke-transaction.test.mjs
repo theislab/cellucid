@@ -5,28 +5,31 @@ import test from 'node:test';
 import {
   buildDensityTextureGPU,
 } from '../assets/js/rendering/smoke-cloud/smoke-density.js';
+import { SmokeUnsupportedError } from '../assets/js/rendering/smoke-cloud/smoke-density-contract.js';
+import { detectSmokeSupport } from '../assets/js/rendering/smoke-cloud/smoke-capabilities.js';
 import {
   MIN_VISIBLE_ALPHA_BYTE,
   POINT_VISIBILITY_THRESHOLD,
 } from '../assets/js/rendering/alpha-visibility.js';
-import { SmokeRenderer } from '../assets/js/rendering/smoke-cloud/smoke-renderer.js';
+import {
+  MAX_SMOKE_TARGET_PIXELS,
+  SmokeRenderer,
+  smokeTargetSize,
+} from '../assets/js/rendering/smoke-cloud/smoke-renderer.js';
 import {
   getResolutionScaleFactor,
 } from '../assets/js/rendering/smoke-cloud/noise-textures.js';
 import {
-  MAX_SMOKE_LIGHT_SAMPLES,
+  MAX_SMOKE_MARCH_STEPS,
   SMOKE_FS_SOURCE,
 } from '../assets/js/rendering/shaders/smoke-shaders.js';
 import {
   viewContextViewerSyncMethods,
 } from '../assets/js/app/state/managers/view-context-viewer-sync.js';
 
-function nextFloat32(value, direction) {
-  const view = new DataView(new ArrayBuffer(4));
-  view.setFloat32(0, value, true);
-  const bits = view.getUint32(0, true);
-  view.setUint32(0, bits + direction, true);
-  return view.getFloat32(0, true);
+// Per-point display colours for a source of `count` points.
+function colorsFor(count) {
+  return new Uint8Array(count * 4).fill(255);
 }
 
 test('GPU smoke density never synchronizes a volume through product readback', async () => {
@@ -50,7 +53,7 @@ test('GPU smoke density rejects invalid positions before touching WebGL', () => 
     () => buildDensityTextureGPU(
       gl,
       new Float32Array([Number.NaN, 0, 0]),
-      { gridSize: 8 },
+      { colors: colorsFor(1), dimension: 3, gridSize: 8 },
     ),
     /component 0 must be finite/,
   );
@@ -58,7 +61,7 @@ test('GPU smoke density rejects invalid positions before touching WebGL', () => 
     () => buildDensityTextureGPU(
       gl,
       new Float32Array([2, 2, 2]),
-      { gridSize: 8 },
+      { colors: colorsFor(1), dimension: 3, gridSize: 8 },
     ),
     /at least one visible point inside.*\[-1, 1\]/,
   );
@@ -76,7 +79,7 @@ test('GPU smoke density rejects scalar contracts before scanning point contents'
     () => buildDensityTextureGPU(
       gl,
       positionsWithInvalidContent,
-      { gridSize: 129 },
+      { dimension: 3, gridSize: 129 },
     ),
     /gridSize.*8 through 128/i,
   );
@@ -84,7 +87,7 @@ test('GPU smoke density rejects scalar contracts before scanning point contents'
     () => buildDensityTextureGPU(
       gl,
       positionsWithInvalidContent,
-      { gamma: Number.MIN_VALUE, gridSize: 8 },
+      { dimension: 3, gamma: Number.MIN_VALUE, gridSize: 8 },
     ),
     /gamma.*normal Float32/i,
   );
@@ -92,7 +95,7 @@ test('GPU smoke density rejects scalar contracts before scanning point contents'
     () => buildDensityTextureGPU(
       gl,
       positionsWithInvalidContent,
-      { gamma: Number.MAX_VALUE, gridSize: 8 },
+      { dimension: 3, gamma: Number.MAX_VALUE, gridSize: 8 },
     ),
     /gamma.*normal Float32/i,
   );
@@ -100,7 +103,7 @@ test('GPU smoke density rejects scalar contracts before scanning point contents'
     () => buildDensityTextureGPU(
       gl,
       positionsWithInvalidContent,
-      { gridSize: 8, surprise: true },
+      { dimension: 3, gridSize: 8, surprise: true },
     ),
     /option "surprise" is unknown/i,
   );
@@ -111,26 +114,83 @@ test('smoke density source retains dataset arrays without an O(n) position copy'
     -0.5, 0, 0.5,
     0.5, 0, -0.5,
   ]);
-  const alpha = new Float32Array([1, 0]);
+  const alpha = new Uint8Array([1, 0]);
   const outlierQuantiles = new Float32Array([0.2, -1]);
+  const colors = new Uint8Array([200, 10, 10, 255, 10, 10, 200, 255]);
   const source = viewContextViewerSyncMethods.getSmokeDensitySource.call({
     categoryTransparency: alpha,
+    colorsArray: colors,
+    getActiveOutlierQuantiles() {
+      return outlierQuantiles;
+    },
     getCurrentOutlierThreshold() {
       return 0.75;
     },
     isOutlierFilterEnabledForActiveField() {
       return true;
     },
-    outlierQuantilesArray: outlierQuantiles,
     pointCount: 2,
     positionsArray: positions,
+    positionsDimension: 3,
   });
 
   assert.equal(Object.isFrozen(source), true);
   assert.strictEqual(source.positions, positions);
+  assert.equal(source.dimension, 3);
   assert.strictEqual(source.alpha, alpha);
+  // The cloud is coloured by the active field: the source hands over the
+  // dataset's own colour array, again without a copy.
+  assert.strictEqual(source.colors, colors);
   assert.strictEqual(source.outlierQuantiles, outlierQuantiles);
   assert.equal(source.outlierThreshold, 0.75);
+});
+
+test('smoke density reads a 2D or 1D source in its own layout, with zero for the missing axes', () => {
+  const gl = new Proxy({}, {
+    get(_target, property) {
+      throw new Error(`WebGL must not be touched during preflight: ${String(property)}`);
+    },
+  });
+  // Two values per point: point 1's y is non-finite, which only a 2-component
+  // read reports as component 3 (a 3-component read would call it component 2).
+  assert.throws(
+    () => buildDensityTextureGPU(
+      gl,
+      new Float32Array([0, 0, 0, Number.NaN]),
+      { colors: colorsFor(2), dimension: 2, gridSize: 8 },
+    ),
+    /component 3 must be finite/,
+  );
+  assert.throws(
+    () => buildDensityTextureGPU(
+      gl,
+      new Float32Array([0, 0, 0]),
+      { dimension: 2, gridSize: 8 },
+    ),
+    /exactly dimension values per point/,
+  );
+  assert.throws(
+    () => buildDensityTextureGPU(gl, new Float32Array([0, 0, 0]), { gridSize: 8 }),
+    /requires the positions dimension/,
+  );
+  for (const [dimension, positions] of [
+    [2, new Float32Array([-0.5, 0.5, 0.5, -0.5])],
+    [1, new Float32Array([-0.5, 0.5])],
+  ]) {
+    assert.equal(
+      buildDensityTextureGPU(gl, positions, {
+        colors: colorsFor(2),
+        dimension,
+        gridSize: 8,
+        visibility: {
+          alpha: new Uint8Array([0, 0]),
+          outlierQuantiles: null,
+          outlierThreshold: null,
+        },
+      }),
+      null,
+    );
+  }
 });
 
 test('an all-hidden smoke source settles empty before touching WebGL', () => {
@@ -146,9 +206,11 @@ test('an all-hidden smoke source settles empty before touching WebGL', () => {
       0.5, 0, -0.5,
     ]),
     {
+      colors: colorsFor(2),
+      dimension: 3,
       gridSize: 8,
       visibility: {
-        alpha: new Float32Array([0, 0]),
+        alpha: new Uint8Array([0, 0]),
         outlierQuantiles: null,
         outlierThreshold: null,
       },
@@ -157,22 +219,17 @@ test('an all-hidden smoke source settles empty before touching WebGL', () => {
   assert.equal(result, null);
 });
 
-test('smoke preparation admits exactly Float32 alpha values encoding to visible R8 bytes', async () => {
-  const byte3Alpha = POINT_VISIBILITY_THRESHOLD;
-  const byte2Alpha = nextFloat32(byte3Alpha, -1);
-  assert.equal(
-    Math.round(byte2Alpha * 255),
-    MIN_VISIBLE_ALPHA_BYTE - 1,
-  );
-  assert.equal(
-    Math.round(byte3Alpha * 255),
-    MIN_VISIBLE_ALPHA_BYTE,
-  );
+test('smoke preparation admits exactly the transparency bytes that encode to visible R8 bytes', async () => {
+  // Point transparency is 0 or 1; the R8 boundary sits strictly between them.
+  assert.equal(Math.round(0 * 255) < MIN_VISIBLE_ALPHA_BYTE, true);
+  assert.equal(Math.round(1 * 255) >= MIN_VISIBLE_ALPHA_BYTE, true);
+  assert.equal(0 < POINT_VISIBILITY_THRESHOLD, true);
+  assert.equal(1 >= POINT_VISIBILITY_THRESHOLD, true);
 
   const untouchedGl = new Proxy({}, {
     get(_target, property) {
       throw new Error(
-        `WebGL must not be touched for R8 byte 2: ${String(property)}`,
+        `WebGL must not be touched for a hidden point: ${String(property)}`,
       );
     },
   });
@@ -181,9 +238,11 @@ test('smoke preparation admits exactly Float32 alpha values encoding to visible 
       untouchedGl,
       new Float32Array([0, 0, 0]),
       {
+        colors: colorsFor(1),
+        dimension: 3,
         gridSize: 8,
         visibility: {
-          alpha: Float32Array.of(byte2Alpha),
+          alpha: Uint8Array.of(0),
           outlierQuantiles: null,
           outlierThreshold: null,
         },
@@ -203,9 +262,11 @@ test('smoke preparation admits exactly Float32 alpha values encoding to visible 
       },
       new Float32Array([0, 0, 0]),
       {
+        colors: colorsFor(1),
+        dimension: 3,
         gridSize: 8,
         visibility: {
-          alpha: Float32Array.of(byte3Alpha),
+          alpha: Uint8Array.of(1),
           outlierQuantiles: null,
           outlierThreshold: null,
         },
@@ -435,8 +496,10 @@ function createRendererState(gl) {
   renderer.scatterStrength = 0;
   renderer.edgeSoftness = 0.3;
   renderer.directLight = 0.06;
-  renderer.lightSamples = 6;
   renderer.resolutionScale = 0.5;
+  renderer.derivedVolumes = null;
+  renderer._derivedVolumesSource = null;
+  renderer._derivedVolumesDirection = null;
   renderer.framebuffer = null;
   renderer.colorTex = null;
   renderer.targetWidth = 0;
@@ -457,15 +520,20 @@ function createVolume(overrides = {}) {
 test('smoke parameter patches preflight completely before committing', () => {
   const renderer = createRendererState(createFakeGl());
   assert.throws(
-    () => renderer.setParams({ density: 2, lightSamples: 1.5 }),
-    /lightSamples must be an integer/,
+    () => renderer.setParams({ density: 2, directLightIntensity: 3 }),
+    /directLightIntensity must be between 0 and 2/,
   );
   assert.equal(renderer.density, 8);
-  assert.equal(renderer.lightSamples, 6);
+  assert.equal(renderer.directLight, 0.06);
 
-  renderer.setParams({ density: 2, lightSamples: 4 });
+  renderer.setParams({ density: 2, directLightIntensity: 1.5 });
   assert.equal(renderer.density, 2);
-  assert.equal(renderer.lightSamples, 4);
+  assert.equal(renderer.directLight, 1.5);
+  // Shadow rays were replaced by the pre-integrated lighting volume.
+  assert.throws(
+    () => renderer.setParams({ lightSamples: 4 }),
+    /parameter "lightSamples" is unknown/,
+  );
 });
 
 test('smoke resolution scaling is a pure exact-size contract', () => {
@@ -474,36 +542,72 @@ test('smoke resolution scaling is a pure exact-size contract', () => {
   assert.equal(getResolutionScaleFactor(32), 3);
   assert.throws(
     () => getResolutionScaleFactor(),
-    /resolution must be an integer between 32 and 256/,
+    /resolution must be an integer between 32 and 128/,
   );
   assert.throws(
-    () => getResolutionScaleFactor(257),
-    /resolution must be an integer between 32 and 256/,
+    () => getResolutionScaleFactor(129),
+    /resolution must be an integer between 32 and 128/,
   );
 });
 
-test('smoke CPU validation and shader share the exact light-sample ceiling', () => {
-  assert.equal(MAX_SMOKE_LIGHT_SAMPLES, 12);
-  assert.match(
-    SMOKE_FS_SOURCE,
-    new RegExp(
-      `for \\(int i = 1; i <= ${MAX_SMOKE_LIGHT_SAMPLES}; i\\+\\+\\)`,
-    ),
-  );
+test('smoke CPU and shader share the exact march-step ceiling', () => {
+  assert.equal(MAX_SMOKE_MARCH_STEPS, 512);
+  assert.match(SMOKE_FS_SOURCE, /const int MAX_STEPS = 512;/);
+  assert.match(SMOKE_FS_SOURCE, /for \(int i = 0; i < MAX_STEPS; i\+\+\)/);
+});
 
+test('smoke ray-march target never exceeds the per-frame ray budget', () => {
+  // Below the budget the target is exactly the requested fraction.
+  assert.deepEqual(smokeTargetSize(1280, 800, 0.5), { width: 640, height: 400 });
+  assert.deepEqual(smokeTargetSize(1280, 800, 1), { width: 1280, height: 800 });
+  // A 4K canvas at native scale, and a retina 5K canvas, are held to the
+  // budget with their aspect ratio: no single frame can grow without bound.
+  for (const [width, height] of [[3840, 2160], [5120, 2880], [7680, 4320]]) {
+    const target = smokeTargetSize(width, height, 1);
+    assert.ok(target.width * target.height <= MAX_SMOKE_TARGET_PIXELS);
+    assert.ok(target.width * target.height > MAX_SMOKE_TARGET_PIXELS * 0.99);
+    assert.ok(Math.abs(target.width / target.height - width / height) < 0.01);
+  }
+  assert.equal(MAX_SMOKE_TARGET_PIXELS, 2560 * 1440);
+});
+
+test('smoke render resolution is bounded to 0.25x through native', () => {
   const renderer = createRendererState(createFakeGl());
-  renderer.setParams({ lightSamples: MAX_SMOKE_LIGHT_SAMPLES });
-  assert.equal(renderer.lightSamples, MAX_SMOKE_LIGHT_SAMPLES);
-  assert.throws(
-    () => renderer.setParams({
-      lightSamples: MAX_SMOKE_LIGHT_SAMPLES + 1,
-    }),
-    /lightSamples must be between 1 and 12/,
-  );
-  assert.equal(renderer.lightSamples, MAX_SMOKE_LIGHT_SAMPLES);
+  renderer._pendingTextureDeletes = new Set();
+  renderer._pendingFramebufferDeletes = new Set();
+  renderer._pendingBufferDeletes = new Set();
+  renderer._pendingVertexArrayDeletes = new Set();
+  renderer._pendingProgramDeletes = new Set();
+  for (const scale of [0.2, 1.05, 2]) {
+    assert.throws(
+      () => renderer.setResolutionScale(scale),
+      /resolutionScale must be between 0.25 and 1/,
+    );
+  }
+  assert.equal(renderer.resolutionScale, 0.5);
+  renderer.setResolutionScale(0.25);
+  assert.equal(renderer.resolutionScale, 0.25);
+});
 
-  renderer.setQualityPreset('ultra');
-  assert.equal(renderer.lightSamples, MAX_SMOKE_LIGHT_SAMPLES);
+test('a still smoke view asks for no frames once its noise exists', () => {
+  const renderer = createRendererState(createFakeGl());
+  renderer.contextLost = false;
+  renderer.disposed = false;
+  renderer._disposeStarted = false;
+  renderer.noiseTextures = null;
+  renderer.animationSpeed = 0;
+  // Nothing to show: no frames.
+  assert.equal(renderer.needsContinuousFrames(), false);
+  // A volume waiting for its noise keeps frames coming until it can draw.
+  renderer.textureInfo = { texture: {}, gridSize: 8, is3D: true };
+  assert.equal(renderer.needsContinuousFrames(), true);
+  renderer.noiseTextures = { shape: {}, detail: {}, blueNoise: {} };
+  assert.equal(renderer.needsContinuousFrames(), false);
+  // Animated smoke changes every frame.
+  renderer.animationSpeed = 0.4;
+  assert.equal(renderer.needsContinuousFrames(), true);
+  renderer.contextLost = true;
+  assert.equal(renderer.needsContinuousFrames(), false);
 });
 
 test('smoke volume validation and upload failures preserve the published volume', () => {
@@ -555,7 +659,7 @@ test('clearing smoke volume releases the exact texture and is idempotent', () =>
   assert.deepEqual(gl._state.deletedTextures, [existing]);
 });
 
-test('float smoke accumulation explicitly requires both WebGL extensions', () => {
+test('a device without float blending is refused in plain words before any allocation', () => {
   const requestedExtensions = [];
   const gl = {
     isContextLost() {
@@ -571,9 +675,15 @@ test('float smoke accumulation explicitly requires both WebGL extensions', () =>
     () => buildDensityTextureGPU(
       gl,
       new Float32Array([0, 0, 0]),
-      { gridSize: 8 },
+      { colors: colorsFor(1), dimension: 3, gridSize: 8 },
     ),
-    /requires EXT_float_blend/,
+    error => (
+      error instanceof SmokeUnsupportedError
+      && error.reason === 'float-blend'
+      && error.detail === 'WebGL2 extension EXT_float_blend is unavailable.'
+      && /^Volumetric smoke isn't available on this device: its graphics driver can't blend high-precision colour/.test(error.message)
+      && !/EXT_|R32F|WebGL/.test(error.message)
+    ),
   );
   assert.deepEqual(requestedExtensions, [
     'EXT_color_buffer_float',
@@ -760,22 +870,65 @@ test('smoke resource retirement retries only resources still live after deletion
   assert.deepEqual(gl._state.deletedTextures, [texture]);
 });
 
-test('native quality presets release targets through the exact resolution owner', () => {
-  for (const preset of ['quality', 'ultra']) {
-    const gl = createFakeGl();
-    const renderer = createRendererState(gl);
-    const texture = gl.createTexture();
-    const framebuffer = gl.createFramebuffer();
-    renderer.colorTex = texture;
-    renderer.framebuffer = framebuffer;
-    renderer.targetWidth = 320;
-    renderer.targetHeight = 180;
 
-    renderer.setQualityPreset(preset);
-    assert.equal(renderer.resolutionScale, 1);
-    assert.equal(renderer.colorTex, null);
-    assert.equal(renderer.framebuffer, null);
-    assert.deepEqual(gl._state.deletedTextures, [texture]);
-    assert.deepEqual(gl._state.deletedFramebuffers, [framebuffer]);
+
+function capabilityGl({ extensions, max3D = 2048, max2D = 16384 }) {
+  return {
+    MAX_3D_TEXTURE_SIZE: 0x8073,
+    MAX_TEXTURE_SIZE: 0x0D33,
+    getExtension(name) {
+      return extensions.includes(name) ? {} : null;
+    },
+    getParameter(parameter) {
+      if (parameter === 0x8073) return max3D;
+      if (parameter === 0x0D33) return max2D;
+      throw new Error(`unexpected parameter ${parameter}`);
+    },
+  };
+}
+
+test('smoke support names the first missing capability in plain words', () => {
+  const full = ['EXT_color_buffer_float', 'EXT_float_blend'];
+  assert.deepEqual(
+    { ...detectSmokeSupport(capabilityGl({ extensions: full })) },
+    { supported: true, reason: null, message: null, detail: null },
+  );
+  const cases = [
+    [{ extensions: ['EXT_float_blend'] }, 'color-buffer-float', /EXT_color_buffer_float/],
+    // iOS Safari and many Android GPUs: float render targets, no float blending.
+    [{ extensions: ['EXT_color_buffer_float'] }, 'float-blend', /EXT_float_blend/],
+    [{ extensions: full, max3D: 64 }, 'texture-3d-size', /MAX_3D_TEXTURE_SIZE is 64/],
+    [{ extensions: full, max2D: 1024 }, 'texture-size', /MAX_TEXTURE_SIZE is 1024/],
+  ];
+  for (const [capabilities, reason, detail] of cases) {
+    const support = detectSmokeSupport(capabilityGl(capabilities));
+    assert.equal(support.supported, false);
+    assert.equal(support.reason, reason);
+    assert.match(support.detail, detail);
+    assert.match(support.message, /^Volumetric smoke isn't available on this device: /);
+    assert.match(support.message, /Points rendering works as usual\.$/);
+    assert.doesNotMatch(support.message, /EXT_|R32F|RG16F|WebGL|MAX_/);
   }
+});
+
+test('smoke never samples a float32 texture through filtering', async () => {
+  // OES_texture_float_linear is absent on iOS; a LINEAR float32 texture is
+  // incomplete there and reads as black. Every float32 texture smoke creates
+  // is NEAREST and read with texelFetch.
+  const { NORMALIZE_FS, REDUCE_MAX_FS } = await import(
+    '../assets/js/rendering/shaders/density-shaders.js'
+  );
+  for (const source of [NORMALIZE_FS, REDUCE_MAX_FS]) {
+    assert.doesNotMatch(source, /(?<![A-Za-z])texture\s*\(/);
+  }
+  const density = await readFile(
+    new URL('../assets/js/rendering/smoke-cloud/smoke-density.js', import.meta.url),
+    'utf8',
+  );
+  const atlas = density.slice(
+    density.indexOf('function createAtlasTexture('),
+    density.indexOf('function attachColorTarget('),
+  );
+  assert.match(atlas, /TEXTURE_MIN_FILTER, gl\.NEAREST/);
+  assert.match(atlas, /TEXTURE_MAG_FILTER, gl\.NEAREST/);
 });

@@ -4,8 +4,10 @@
  * Owns UI state for:
  * - Active view selection (live vs snapshot)
  * - View layout mode (grid vs single)
- * - Snapshot creation/removal and camera lock toggles
- * - Badge rendering (with per-view dimension + nav indicators)
+ * - Snapshot creation/removal and the "Link cameras" toggle, which links
+ *   only views that show the same representation
+ * - One row per view: what it shows ("UMAP · 3D"), its colouring field, its
+ *   navigation mode, and whether its camera is linked
  *
  * Cross-module refresh (field selectors, legends, filters) is delegated via
  * callbacks whenever the active view changes.
@@ -24,11 +26,15 @@ import { viewerNeedsUiRetirement } from '../core/viewer-lifecycle.js';
 const LIVE_VIEW_ID = 'live';
 const VIEW_LAYOUT_MODES = new Set(['grid', 'single']);
 const RENDER_MODES = new Set(['points', 'smoke']);
-const SUPPORTED_DIMENSIONS = new Set([1, 2, 3]);
 const NAV_MODE_LABELS = Object.freeze({
-  orbit: 'Orb',
-  planar: 'Pan',
-  free: 'Fly',
+  orbit: 'Orbit',
+  planar: 'Planar',
+  free: 'Free-fly',
+});
+const NAV_MODE_NAMES = Object.freeze({
+  orbit: 'Orbit',
+  planar: 'Planar',
+  free: 'Free-fly',
 });
 const NAV_MODE_CYCLE = Object.freeze(['orbit', 'planar', 'free']);
 
@@ -52,13 +58,6 @@ function requireMethod(owner, methodName, label) {
 function requireBoolean(value, label) {
   if (typeof value !== 'boolean') {
     throw new TypeError(`${label} must be exactly true or false.`);
-  }
-  return value;
-}
-
-function requireDimension(value, label = 'Dimension') {
-  if (!SUPPORTED_DIMENSIONS.has(value)) {
-    throw new RangeError(`${label} must be exactly 1, 2, or 3.`);
   }
   return value;
 }
@@ -158,15 +157,9 @@ function requireSnapshotPayload(payload) {
   );
   requireTypedArray(
     payload.transparency,
-    Float32Array,
+    Uint8Array,
     pointCount,
     'Snapshot transparency'
-  );
-  requireTypedArray(
-    payload.outlierQuantiles,
-    Float32Array,
-    pointCount,
-    'Snapshot outlier quantiles'
   );
   requireNullableTypedArray(
     payload.centroidPositions,
@@ -233,7 +226,9 @@ function requireSnapshotPayload(payload) {
   ) {
     throw new TypeError('Snapshot filtersText must be an array of strings.');
   }
-  requireDimension(payload.dimensionLevel, 'Snapshot dimension');
+  if (![1, 2, 3].includes(payload.dimensionLevel)) {
+    throw new RangeError('Snapshot dimension must be exactly 1, 2, or 3.');
+  }
   return payload;
 }
 
@@ -264,7 +259,6 @@ function requireSnapshotInventory(viewer) {
 /**
  * @typedef {object} ViewCallbacks
  * @property {(viewId: string) => void} onActiveViewChanged
- * @property {(viewId: string, nextDim: number) => Promise<void>} onCycleViewDimension
  * @property {(viewId: string) => void} onNavigationUiSyncRequested
  */
 
@@ -273,10 +267,9 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
     'clearSnapshotViews',
     'createViewFromSource',
     'getActiveViewId',
-    'getAvailableDimensions',
     'getDimensionManager',
     'getSnapshotPayload',
-    'getViewDimensionLevel',
+    'describeViewEmbedding',
     'removeView',
     'setActiveView',
     'syncSnapshotContexts',
@@ -286,6 +279,7 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
   for (const methodName of [
     'clearSnapshotViews',
     'createSnapshotView',
+    'getCameraLinkGroups',
     'getCamerasLocked',
     'getFocusedViewId',
     'getLiveViewHidden',
@@ -300,12 +294,12 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
     'setViewFocusHandler',
     'setViewLayout',
     'setViewNavigationMode',
+    'setViewTitlePrefixes',
   ]) {
     requireMethod(viewer, methodName, 'View-control viewer');
   }
   for (const callbackName of [
     'onActiveViewChanged',
-    'onCycleViewDimension',
     'onNavigationUiSyncRequested',
   ]) {
     if (
@@ -337,6 +331,9 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
     ['layout selector', dom.layoutModeSelect, HTMLSelectElement],
     ['badges box', dom.badgesBox, HTMLElement],
     ['badges list', dom.badgesList, HTMLElement],
+    ['layout row', dom.layoutRow, HTMLElement],
+    ['navigation target row', dom.navigationTarget, HTMLElement],
+    ['navigation target badge', dom.navigationTargetBadge, HTMLElement],
     ['render mode selector', renderDom.renderModeSelect, HTMLSelectElement],
   ];
   for (const [label, element, ElementType] of domEntries) {
@@ -356,7 +353,13 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
   const viewLayoutModeSelect = dom.layoutModeSelect;
   const splitViewBadgesBox = dom.badgesBox;
   const splitViewBadges = dom.badgesList;
+  const layoutRow = dom.layoutRow;
+  const navigationTarget = dom.navigationTarget;
+  const navigationTargetBadge = dom.navigationTargetBadge;
   const renderModeSelect = renderDom.renderModeSelect;
+  // Whether the runtime has cells to keep. The coordinator publishes it on
+  // every runtime publication (`ui-coordinator.js` `publishCellPresence`).
+  let cellsPresent = false;
 
   /**
    * The three pieces of view state this module draws are read from their
@@ -386,9 +389,7 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
     );
   }
   let destroyed = false;
-  let lifecycleGeneration = 0;
   let destructionPromise = null;
-  const pendingDimensionBadgeTasks = new Set();
 
   function reportUiFailure(action, error) {
     getNotificationCenter().error(
@@ -502,138 +503,21 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
     return after;
   }
 
-  let dimensionBadgeBusy = false;
-  function createDimensionIndicator(viewId, currentDim) {
-    const availableDims = state.getAvailableDimensions();
-    if (
-      !Array.isArray(availableDims) ||
-      availableDims.some(dimension => !SUPPORTED_DIMENSIONS.has(dimension)) ||
-      new Set(availableDims).size !== availableDims.length
-    ) {
-      throw new TypeError(
-        'Available dimensions must be unique integers 1, 2, or 3.'
-      );
-    }
-    const exactViewId = requireViewId(viewId);
-    requireDimension(currentDim, `View "${exactViewId}" dimension`);
-    if (
-      availableDims.length > 0 &&
-      !availableDims.includes(currentDim)
-    ) {
-      throw new RangeError(
-        `View "${exactViewId}" uses unavailable dimension ${currentDim}D.`
-      );
-    }
-    const usableDims = [...availableDims];
-    if (usableDims.length <= 1) return null;
-
-    const dimIndicator = ownerDocument.createElement('span');
-    dimIndicator.className = 'split-badge-dim';
-    dimIndicator.textContent = `${currentDim}D`;
-    dimIndicator.title = 'Click to cycle dimension (1D/2D/3D)';
-    dimIndicator.dataset.viewId = exactViewId;
-    dimIndicator.setAttribute('role', 'button');
-    dimIndicator.setAttribute('tabindex', '0');
-
-    const cycleDimension = async (e) => {
-      if (destroyed) return;
-      const ownerGeneration = lifecycleGeneration;
-      e.preventDefault();
-      e.stopPropagation();
-      if (dimensionBadgeBusy) return;
-
-      const targetViewId = requireViewId(
-        e.currentTarget.dataset.viewId,
-        'Dimension badge view id'
-      );
-      const freshCurrentDim = requireDimension(
-        state.getViewDimensionLevel(targetViewId),
-        `View "${targetViewId}" dimension`
-      );
-      const sortedDims = [...usableDims].sort((a, b) => b - a);
-      const currentIdx = sortedDims.indexOf(freshCurrentDim);
-      if (currentIdx < 0) {
-        throw new RangeError(
-          `View "${targetViewId}" dimension is not available.`
-        );
-      }
-      const nextIdx = (currentIdx + 1) % sortedDims.length;
-      const nextDim = sortedDims[nextIdx];
-
-      dimensionBadgeBusy = true;
-      dimIndicator.setAttribute('aria-disabled', 'true');
-      try {
-        await callbacks.onCycleViewDimension(targetViewId, nextDim);
-        if (
-          destroyed ||
-          ownerGeneration !== lifecycleGeneration
-        ) {
-          return;
-        }
-        dimIndicator.removeAttribute('aria-invalid');
-        renderSplitViewBadges();
-      } catch (error) {
-        if (
-          destroyed ||
-          ownerGeneration !== lifecycleGeneration
-        ) {
-          return;
-        }
-        dimIndicator.setAttribute('aria-invalid', 'true');
-        dimIndicator.title =
-          `Dimension change failed: ${describeError(error)}`;
-      } finally {
-        dimensionBadgeBusy = false;
-        if (
-          !destroyed &&
-          ownerGeneration === lifecycleGeneration
-        ) {
-          dimIndicator.removeAttribute('aria-disabled');
-        }
-      }
-    };
-    const startDimensionCycle = event => {
-      if (destroyed) return;
-      let task;
-      task = cycleDimension(event)
-        .catch(error => {
-          if (!destroyed) {
-            reportUiFailure('Dimension change failed', error);
-          }
-        })
-        .finally(() => {
-          pendingDimensionBadgeTasks.delete(task);
-        });
-      pendingDimensionBadgeTasks.add(task);
-    };
-    dimIndicator.addEventListener('click', event => {
-      startDimensionCycle(event);
-    });
-    dimIndicator.addEventListener('keydown', event => {
-      if (event.key === 'Enter' || event.key === ' ') {
-        startDimensionCycle(event);
-      }
-    });
-
-    return dimIndicator;
-  }
-
   function createNavigationIndicator(viewId, currentMode) {
     const exactViewId = requireViewId(viewId);
     const exactMode = requireNavigationMode(currentMode);
-    const camerasLocked = requireBoolean(
-      viewer.getCamerasLocked(),
-      'Viewer camera lock'
-    );
-    if (camerasLocked) return null;
 
-    const navIndicator = ownerDocument.createElement('span');
+    const navIndicator = ownerDocument.createElement('button');
+    navIndicator.type = 'button';
     navIndicator.className = 'split-badge-nav';
     navIndicator.textContent = NAV_MODE_LABELS[exactMode];
-    navIndicator.title = 'Click to cycle navigation mode (Orbit/Planar/Free-fly)';
+    navIndicator.title =
+      `Navigation: ${NAV_MODE_NAMES[exactMode]}. Press to switch (Orbit, Planar, Free-fly).`;
+    navIndicator.setAttribute(
+      'aria-label',
+      `Navigation of this view: ${NAV_MODE_NAMES[exactMode]}. Switch.`
+    );
     navIndicator.dataset.viewId = exactViewId;
-    navIndicator.setAttribute('role', 'button');
-    navIndicator.setAttribute('tabindex', '0');
 
     const cycleNavigation = (e) => {
       e.preventDefault();
@@ -671,253 +555,380 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
     navIndicator.addEventListener('click', event => {
       runUiAction('Navigation change failed', () => cycleNavigation(event));
     });
-    navIndicator.addEventListener('keydown', event => {
-      if (event.key === 'Enter' || event.key === ' ') {
-        runUiAction('Navigation change failed', () => cycleNavigation(event));
-      }
-    });
 
     return navIndicator;
   }
 
+  /**
+   * One view's row: its number, what it shows ("UMAP · 3D") with its colouring
+   * field under it, whether its camera is linked, its navigation mode, and
+   * (when the view can be removed) its remove button. The row is a list item;
+   * its main part is the button that selects the view, so the picker below
+   * and every other view control edit it.
+   */
+  function createViewBadge({
+    viewId,
+    index,
+    label,
+    shows,
+    showsTitle,
+    linkedWith,
+    active,
+    cameraFocused,
+    navigationMode,
+    onRemove
+  }) {
+    const badge = ownerDocument.createElement('div');
+    badge.className = 'split-badge';
+    badge.setAttribute('role', 'listitem');
+    badge.dataset.viewId = viewId;
+    if (active) badge.classList.add('active');
+    if (cameraFocused) badge.classList.add('active-camera');
+    const select = () => {
+      runUiAction('View selection failed', () => {
+        activateView(viewId);
+        pushViewLayoutToViewer();
+        renderSplitViewBadges();
+        callbacks.onNavigationUiSyncRequested(viewId);
+      });
+    };
+    badge.addEventListener('click', select);
+
+    const main = ownerDocument.createElement('button');
+    main.type = 'button';
+    main.className = 'split-badge-select';
+    main.setAttribute('aria-pressed', active ? 'true' : 'false');
+    main.setAttribute('aria-label', `View ${index}: ${shows}, coloured by ${label}`);
+    main.title = `${showsTitle}\nColoured by ${label}`;
+    main.addEventListener('click', event => {
+      event.stopPropagation();
+      select();
+    });
+
+    const pill = ownerDocument.createElement('span');
+    pill.className = 'split-badge-pill';
+    pill.textContent = String(index);
+
+    const cameraIndicator = ownerDocument.createElement('span');
+    cameraIndicator.className = 'split-badge-camera';
+    cameraIndicator.setAttribute('aria-hidden', 'true');
+    cameraIndicator.textContent = '\u2316';
+
+    const representation = ownerDocument.createElement('span');
+    representation.className = 'split-badge-label';
+    representation.textContent = shows;
+    main.append(pill, cameraIndicator, representation);
+    badge.appendChild(main);
+
+    // Second line: the field the view is coloured by, whether its camera is
+    // linked, and its navigation mode. The first line keeps its full width
+    // for what the view shows.
+    const meta = ownerDocument.createElement('div');
+    meta.className = 'split-badge-meta';
+    const field = ownerDocument.createElement('span');
+    field.className = 'split-badge-sub';
+    field.textContent = label;
+    field.title = `Coloured by ${label}`;
+    meta.appendChild(field);
+
+    if (linkedWith.length > 0) {
+      const link = ownerDocument.createElement('span');
+      link.className = 'split-badge-link';
+      link.textContent = 'linked';
+      const others = linkedWith.length === 1
+        ? `view ${linkedWith[0]}`
+        : `views ${linkedWith.slice(0, -1).join(', ')} and ${linkedWith[linkedWith.length - 1]}`;
+      link.title = `Shares one camera with ${others}: they show the same embedding.`;
+      meta.appendChild(link);
+    }
+    meta.appendChild(createNavigationIndicator(viewId, navigationMode));
+
+    if (onRemove !== null) {
+      const removeBtn = ownerDocument.createElement('button');
+      removeBtn.type = 'button';
+      removeBtn.className = 'split-badge-remove';
+      removeBtn.setAttribute('aria-label', `Remove view ${index}`);
+      removeBtn.title = 'Remove this view';
+      removeBtn.textContent = '×';
+      removeBtn.addEventListener('mousedown', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+      });
+      removeBtn.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        onRemove();
+      });
+      badge.appendChild(removeBtn);
+    }
+    badge.appendChild(meta);
+    return badge;
+  }
+
+  function removeLiveView() {
+    runUiAction('View removal failed', () => {
+      const currentSnapshots = requireSnapshotInventory(viewer);
+      if (currentSnapshots.length === 0) {
+        throw new Error('The live-view removal control requires a snapshot.');
+      }
+
+      if (currentSnapshots.length === 1) {
+        removeSnapshot(currentSnapshots[0].id);
+        activateView(LIVE_VIEW_ID);
+        pushViewLayoutToViewer();
+      } else {
+        if (currentActiveViewId() === LIVE_VIEW_ID) {
+          activateView(currentSnapshots[0].id);
+          pushViewLayoutToViewer();
+        }
+        viewer.setLiveViewHidden(true);
+      }
+      renderSplitViewBadges();
+      updateSplitViewUI();
+    });
+  }
+
+  function removeSnapshotView(snapId) {
+    runUiAction('Snapshot removal failed', () => {
+      const removedActiveView = snapId === currentActiveViewId();
+      const remainingSnaps = removeSnapshot(snapId);
+      const remainingActiveViewId = currentActiveViewId();
+      const activeStillExists =
+        remainingActiveViewId === LIVE_VIEW_ID ||
+        remainingSnaps.some(
+          snapshot => snapshot.id === remainingActiveViewId
+        );
+      if (removedActiveView || !activeStillExists) {
+        if (isLiveViewHidden()) {
+          if (remainingSnaps.length === 0) {
+            throw new Error(
+              'Viewer kept the live view hidden without any snapshot.'
+            );
+          }
+          activateView(remainingSnaps[0].id);
+        } else {
+          activateView(LIVE_VIEW_ID);
+        }
+        pushViewLayoutToViewer();
+      }
+      renderSplitViewBadges();
+      updateSplitViewUI();
+    });
+  }
+
+  // The badges are rebuilt from scratch, and the coordinator asks for that on
+  // every visibility frame (each filter or highlight change). A rebuild with
+  // the same views, labels, modes and focus would only replace the list with
+  // an identical one, so it is skipped.
+  let renderedBadgeKey = null;
+  let renderedPrefixKey = null;
+
+  /**
+   * The open views in row order, each with what it shows. Read from the
+   * owners on every call.
+   */
+  function describeOpenViews(snapshots = requireCurrentInventory()) {
+    const liveViewHidden = isLiveViewHidden();
+    const views = [];
+    const describe = (viewId, label, onRemove) => {
+      const embedding = state.describeViewEmbedding(viewId);
+      views.push({
+        viewId,
+        label,
+        shows: embedding === null ? '—' : `${embedding.name} · ${embedding.dimension}D`,
+        showsTitle: embedding === null
+          ? 'No dataset'
+          : `Shows ${embedding.name} (${embedding.label}), ${embedding.dimension}D` +
+            (embedding.isDefault ? `, the dataset's ${embedding.dimension}D default` : ''),
+        layoutKey: embedding?.layoutKey ?? null,
+        navigationMode: requireNavigationMode(viewer.getViewNavigationMode(viewId)),
+        onRemove,
+      });
+    };
+    if (!liveViewHidden) {
+      describe(
+        LIVE_VIEW_ID,
+        requireNonEmptyText(viewer.getLiveViewLabel(), 'Live-view label'),
+        snapshots.length > 0 ? removeLiveView : null
+      );
+    }
+    for (const snap of snapshots) {
+      const snapId = snap.id;
+      describe(
+        snapId,
+        requireNonEmptyText(snap.label, `Snapshot "${snapId}" label`),
+        !liveViewHidden || snapshots.length > 1
+          ? () => removeSnapshotView(snapId)
+          : null
+      );
+    }
+    return views;
+  }
+
+  /**
+   * "View 2" for an open view while several are open, else null: the name
+   * the representation picker and the Navigation panel give the view they
+   * edit.
+   *
+   * @param {string} viewId
+   * @returns {string|null}
+   */
+  function describeViewPosition(viewId) {
+    if (destroyed) return null;
+    const views = describeOpenViews();
+    if (views.length <= 1) return null;
+    const position = views.findIndex(view => view.viewId === viewId);
+    return position === -1 ? null : `View ${position + 1}`;
+  }
+
+  /** Whether any two open views show the same representation. */
+  function hasLinkableViews(views) {
+    const seen = new Set();
+    for (const view of views) {
+      if (view.layoutKey === null) continue;
+      if (seen.has(view.layoutKey)) return true;
+      seen.add(view.layoutKey);
+    }
+    return false;
+  }
+
   function renderSplitViewBadges() {
     if (destroyed) return false;
-    splitViewBadges.innerHTML = '';
     const snapshots = requireCurrentInventory();
     // One read of each owner for one render pass. Every handler attached below
     // reads its own, because it runs long after this pass finished.
     const activeViewId = currentActiveViewId();
-    const liveViewHidden = isLiveViewHidden();
+    const camerasLocked = requireBoolean(
+      viewer.getCamerasLocked(),
+      'Viewer camera lock'
+    );
+    const focusedId = requireViewId(
+      viewer.getFocusedViewId(),
+      'Focused view id'
+    );
+    const views = describeOpenViews(snapshots);
+    const positionOf = new Map(views.map((view, position) => [view.viewId, position + 1]));
+    const linkGroups = viewer.getCameraLinkGroups();
+    const linkedWith = viewId => {
+      const group = linkGroups.find(members => members.includes(viewId));
+      return group === undefined
+        ? []
+        : group.filter(member => member !== viewId)
+          .map(member => positionOf.get(member))
+          .filter(position => position !== undefined);
+    };
 
-    let badgeIndex = 1;
-
-    if (!liveViewHidden) {
-      const liveLabel = requireNonEmptyText(
-        viewer.getLiveViewLabel(),
-        'Live-view label'
-      );
-
-      const liveBadge = ownerDocument.createElement('div');
-      liveBadge.className = 'split-badge';
-      if (activeViewId === LIVE_VIEW_ID) {
-        liveBadge.classList.add('active');
-      }
-
-      const camerasLocked = requireBoolean(
-        viewer.getCamerasLocked(),
-        'Viewer camera lock'
-      );
-      const focusedId = requireViewId(
-        viewer.getFocusedViewId(),
-        'Focused view id'
-      );
-      if (!camerasLocked && focusedId === LIVE_VIEW_ID) {
-        liveBadge.classList.add('active-camera');
-      }
-
-      liveBadge.addEventListener('click', () => {
-        runUiAction('View selection failed', () => {
-          activateView(LIVE_VIEW_ID);
-          pushViewLayoutToViewer();
-          renderSplitViewBadges();
-          callbacks.onNavigationUiSyncRequested(LIVE_VIEW_ID);
-        });
+    const badgeKey = JSON.stringify([
+      activeViewId,
+      camerasLocked,
+      focusedId,
+      linkGroups,
+      views.map(view => [
+        view.viewId,
+        view.label,
+        view.shows,
+        view.showsTitle,
+        view.navigationMode,
+        view.onRemove !== null
+      ])
+    ]);
+    if (badgeKey !== renderedBadgeKey || splitViewBadges.children.length !== views.length) {
+      const focusedElementView = ownerDocument.activeElement?.closest?.('.split-badge')?.dataset.viewId ?? null;
+      const focusedClass = ownerDocument.activeElement?.className ?? null;
+      splitViewBadges.innerHTML = '';
+      views.forEach((view, position) => {
+        splitViewBadges.appendChild(createViewBadge({
+          ...view,
+          index: position + 1,
+          linkedWith: linkedWith(view.viewId),
+          active: view.viewId === activeViewId,
+          cameraFocused: views.length > 1 && focusedId === view.viewId
+        }));
       });
-
-      const livePill = ownerDocument.createElement('span');
-      livePill.className = 'split-badge-pill';
-      livePill.textContent = String(badgeIndex);
-
-      const liveCameraIndicator = ownerDocument.createElement('span');
-      liveCameraIndicator.className = 'split-badge-camera';
-      liveCameraIndicator.textContent = '\u2316';
-
-      const liveText = ownerDocument.createElement('span');
-      liveText.className = 'split-badge-label';
-      liveText.textContent = liveLabel;
-
-      const liveDim = requireDimension(
-        state.getViewDimensionLevel(LIVE_VIEW_ID),
-        'Live-view dimension'
-      );
-      const liveDimIndicator = createDimensionIndicator(LIVE_VIEW_ID, liveDim);
-
-      const liveNavMode = requireNavigationMode(
-        viewer.getViewNavigationMode(LIVE_VIEW_ID)
-      );
-      const liveNavIndicator = createNavigationIndicator(LIVE_VIEW_ID, liveNavMode);
-
-      if (snapshots.length > 0) {
-        const liveRemoveBtn = ownerDocument.createElement('button');
-        liveRemoveBtn.type = 'button';
-        liveRemoveBtn.className = 'split-badge-remove';
-        liveRemoveBtn.title = 'Remove this view';
-        liveRemoveBtn.textContent = '×';
-        liveRemoveBtn.addEventListener('mousedown', (e) => {
-          e.preventDefault();
-          e.stopPropagation();
-        });
-        liveRemoveBtn.addEventListener('click', (e) => {
-          e.preventDefault();
-          e.stopPropagation();
-          runUiAction('View removal failed', () => {
-            const currentSnapshots = requireSnapshotInventory(viewer);
-            if (currentSnapshots.length === 0) {
-              throw new Error('The live-view removal control requires a snapshot.');
-            }
-
-            if (currentSnapshots.length === 1) {
-              removeSnapshot(currentSnapshots[0].id);
-              activateView(LIVE_VIEW_ID);
-              pushViewLayoutToViewer();
-            } else {
-              if (currentActiveViewId() === LIVE_VIEW_ID) {
-                activateView(currentSnapshots[0].id);
-                pushViewLayoutToViewer();
-              }
-              viewer.setLiveViewHidden(true);
-            }
-            renderSplitViewBadges();
-            updateSplitViewUI();
-          });
-        });
-
-        liveBadge.appendChild(livePill);
-        liveBadge.appendChild(liveCameraIndicator);
-        liveBadge.appendChild(liveText);
-        if (liveDimIndicator) liveBadge.appendChild(liveDimIndicator);
-        if (liveNavIndicator) liveBadge.appendChild(liveNavIndicator);
-        liveBadge.appendChild(liveRemoveBtn);
-      } else {
-        liveBadge.appendChild(livePill);
-        liveBadge.appendChild(liveCameraIndicator);
-        liveBadge.appendChild(liveText);
-        if (liveDimIndicator) liveBadge.appendChild(liveDimIndicator);
-        if (liveNavIndicator) liveBadge.appendChild(liveNavIndicator);
+      renderedBadgeKey = badgeKey;
+      // A rebuilt row keeps keyboard focus on the control that had it.
+      if (focusedElementView !== null && typeof focusedClass === 'string') {
+        const row = splitViewBadges.querySelector(
+          `.split-badge[data-view-id="${focusedElementView}"]`
+        );
+        const target = row?.querySelector(`.${focusedClass.split(' ')[0]}`);
+        target?.focus({ preventScroll: true });
       }
-
-      splitViewBadges.appendChild(liveBadge);
-      badgeIndex++;
     }
-
-    snapshots.forEach((snap) => {
-      const badge = ownerDocument.createElement('div');
-      badge.className = 'split-badge';
-      const snapId = snap.id;
-      if (snapId === activeViewId) {
-        badge.classList.add('active');
-      }
-
-      const camerasLockedSnap = requireBoolean(
-        viewer.getCamerasLocked(),
-        'Viewer camera lock'
-      );
-      const focusedIdSnap = requireViewId(
-        viewer.getFocusedViewId(),
-        'Focused view id'
-      );
-      if (!camerasLockedSnap && focusedIdSnap === snapId) {
-        badge.classList.add('active-camera');
-      }
-
-      badge.addEventListener('click', () => {
-        runUiAction('View selection failed', () => {
-          activateView(snapId);
-          pushViewLayoutToViewer();
-          renderSplitViewBadges();
-          callbacks.onNavigationUiSyncRequested(snapId);
-        });
-      });
-
-      const pill = ownerDocument.createElement('span');
-      pill.className = 'split-badge-pill';
-      pill.textContent = String(badgeIndex);
-
-      const cameraIndicator = ownerDocument.createElement('span');
-      cameraIndicator.className = 'split-badge-camera';
-      cameraIndicator.textContent = '\u2316';
-
-      const text = ownerDocument.createElement('span');
-      text.className = 'split-badge-label';
-      text.textContent = requireNonEmptyText(
-        snap.label,
-        `Snapshot "${snapId}" label`
-      );
-
-      const snapDim = requireDimension(
-        state.getViewDimensionLevel(snapId),
-        `Snapshot "${snapId}" dimension`
-      );
-      const snapDimIndicator = createDimensionIndicator(snapId, snapDim);
-
-      const snapNavMode = requireNavigationMode(
-        viewer.getViewNavigationMode(snapId)
-      );
-      const snapNavIndicator = createNavigationIndicator(snapId, snapNavMode);
-
-      badge.appendChild(pill);
-      badge.appendChild(cameraIndicator);
-      badge.appendChild(text);
-      if (snapDimIndicator) badge.appendChild(snapDimIndicator);
-      if (snapNavIndicator) badge.appendChild(snapNavIndicator);
-
-      if (!liveViewHidden || snapshots.length > 1) {
-        const removeBtn = ownerDocument.createElement('button');
-        removeBtn.type = 'button';
-        removeBtn.className = 'split-badge-remove';
-        removeBtn.title = 'Remove this view';
-        removeBtn.textContent = '×';
-        removeBtn.addEventListener('mousedown', (e) => {
-          e.preventDefault();
-          e.stopPropagation();
-        });
-        removeBtn.addEventListener('click', (e) => {
-          e.preventDefault();
-          e.stopPropagation();
-          runUiAction('Snapshot removal failed', () => {
-            const removedActiveView = snapId === currentActiveViewId();
-            const remainingSnaps = removeSnapshot(snapId);
-            const remainingActiveViewId = currentActiveViewId();
-            const activeStillExists =
-              remainingActiveViewId === LIVE_VIEW_ID ||
-              remainingSnaps.some(
-                snapshot => snapshot.id === remainingActiveViewId
-              );
-            if (removedActiveView || !activeStillExists) {
-              if (isLiveViewHidden()) {
-                if (remainingSnaps.length === 0) {
-                  throw new Error(
-                    'Viewer kept the live view hidden without any snapshot.'
-                  );
-                }
-                activateView(remainingSnaps[0].id);
-              } else {
-                activateView(LIVE_VIEW_ID);
-              }
-              pushViewLayoutToViewer();
-            }
-            renderSplitViewBadges();
-            updateSplitViewUI();
-          });
-        });
-        badge.appendChild(removeBtn);
-      }
-
-      splitViewBadges.appendChild(badge);
-      badgeIndex++;
-    });
+    renderNavigationTarget(views, focusedId, linkedWith(focusedId));
+    updateCameraLockUI(views);
+    // The pane chips on the plot name each view the way its row does.
+    const prefixes = views.length > 1
+      ? views.map((view, position) => [view.viewId, `${position + 1} · ${view.shows.replace(' · ', ' ')}`])
+      : [];
+    const prefixKey = JSON.stringify(prefixes);
+    if (prefixKey !== renderedPrefixKey) {
+      renderedPrefixKey = prefixKey;
+      viewer.setViewTitlePrefixes(new Map(prefixes));
+    }
 
     syncActiveViewSelectOptions();
   }
 
-  function updateCameraLockUI() {
+  /**
+   * The Navigation panel's "Applies to" row. With one view there is nothing to
+   * say. With several, its settings drive the camera-focused view -- and the
+   * views linked to its camera, which show the same embedding; the row names
+   * that target with the same number and text as its Compare views row.
+   */
+  function renderNavigationTarget(views, focusedId, linkedPositions) {
+    if (views.length <= 1) {
+      navigationTarget.hidden = true;
+      navigationTargetBadge.replaceChildren();
+      return;
+    }
+    const position = views.findIndex(view => view.viewId === focusedId);
+    if (position === -1) {
+      throw new Error(`Focused view "${focusedId}" is not an open view.`);
+    }
+    const pill = ownerDocument.createElement('span');
+    pill.className = 'split-badge-pill';
+    pill.textContent = String(position + 1);
+    const text = ownerDocument.createElement('span');
+    text.className = 'split-badge-label';
+    text.textContent = linkedPositions.length === 0
+      ? views[position].shows
+      : `${views[position].shows} · with ${linkedPositions.length === 1 ? 'view' : 'views'} ${linkedPositions.join(', ')}`;
+    // The same camera mark and ring as the focused view's own row.
+    const cameraIndicator = ownerDocument.createElement('span');
+    cameraIndicator.className = 'split-badge-camera';
+    cameraIndicator.setAttribute('aria-hidden', 'true');
+    cameraIndicator.textContent = '\u2316';
+    navigationTargetBadge.classList.add('active-camera');
+    navigationTargetBadge.replaceChildren(pill, cameraIndicator, text);
+    navigationTarget.hidden = false;
+  }
+
+  /**
+   * "Link cameras" links only views that show the same representation, so it
+   * is available only when two open views do; otherwise it says why.
+   */
+  function updateCameraLockUI(views = describeOpenViews()) {
     const locked = requireBoolean(
       viewer.getCamerasLocked(),
       'Viewer camera lock'
     );
-    cameraLockBtn.setAttribute('aria-pressed', locked ? 'true' : 'false');
-    cameraLockBtn.textContent = locked ? 'Locked Cam' : 'Unlocked Cam';
-    cameraLockBtn.title = locked ? 'Cameras linked (click to unlink)' : 'Cameras independent (click to link)';
+    const linkable = hasLinkableViews(views);
+    cameraLockBtn.disabled = !linkable;
+    // A toggle button keeps one name; its pressed state says whether it is on.
+    // Unavailable, it shows as off: no two views share a camera.
+    cameraLockBtn.setAttribute('aria-pressed', linkable && locked ? 'true' : 'false');
+    cameraLockBtn.textContent = 'Link cameras';
+    if (views.length <= 1) {
+      cameraLockBtn.title = 'Keep a view first: linking needs two views of the same embedding.';
+    } else if (!linkable) {
+      cameraLockBtn.title =
+        'No two views show the same embedding. Cameras link only between views of one embedding.';
+    } else {
+      cameraLockBtn.title = locked
+        ? 'Views of the same embedding share one camera. Press to give each view its own.'
+        : 'Each view has its own camera. Press to link views that show the same embedding.';
+    }
   }
 
   function syncRenderModeState(mode, publishLayout) {
@@ -945,11 +956,27 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
       }
       viewLayoutModeSelect.value = 'single';
     }
-    splitKeepViewBtn.disabled = !modeIsPoints;
-    splitKeepViewBtn.title = modeIsPoints
-      ? 'Freeze the current view as a panel'
-      : 'Switch to “Points” mode to keep views';
+    splitKeepViewBtn.disabled = !modeIsPoints || !cellsPresent;
+    splitKeepViewBtn.title = !cellsPresent
+      ? 'Load a dataset to keep views'
+      : modeIsPoints
+        ? 'Freeze the current view as a panel'
+        : 'Switch to “Points” mode to keep views';
     viewLayoutModeSelect.disabled = !modeIsPoints;
+  }
+
+  /**
+   * A view of no cells cannot be kept, so Keep view follows the runtime.
+   *
+   * @param {boolean} present
+   */
+  function setCellsPresent(present) {
+    if (typeof present !== 'boolean') {
+      throw new TypeError('View-control cell presence must be one boolean.');
+    }
+    if (destroyed) return;
+    cellsPresent = present;
+    syncRenderModeState(requireRenderMode(renderModeSelect.value), false);
   }
 
   function syncRenderModeUI(mode) {
@@ -970,18 +997,16 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
 
     const hasSnaps = snapshots.length > 0;
     const hasMultipleViews = snapshots.length > 0;
-    splitViewBadgesBox.style.display = hasMultipleViews ? '' : 'none';
+    splitViewBadgesBox.hidden = !hasMultipleViews;
+    layoutRow.hidden = !hasMultipleViews;
     syncActiveViewSelectOptions();
 
     syncRenderModeState(renderMode, false);
     splitClearBtn.disabled = !hasSnaps;
-    cameraLockBtn.disabled = !hasMultipleViews;
-    // Keep the button label/aria state in sync in case camera lock is toggled
+    splitClearBtn.title = hasSnaps ? 'Remove all kept views' : 'No kept views to remove.';
+    // Keep the button state in sync when linking or the views change
     // programmatically (e.g., session restore).
     updateCameraLockUI();
-    if (!hasMultipleViews) {
-      cameraLockBtn.title = 'Add a kept view to link cameras';
-    }
 
     if (!modeIsPoints) {
       viewLayoutModeSelect.value = 'single';
@@ -1008,6 +1033,9 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
   function handleKeepView() {
     if (requireRenderMode(renderModeSelect.value) !== 'points') {
       throw new Error('Kept views are available only in Points render mode.');
+    }
+    if (!cellsPresent) {
+      throw new Error('Kept views require published cells.');
     }
     const sourceViewId = currentActiveViewId();
     const sourceLayoutMode = currentLayoutMode();
@@ -1155,7 +1183,6 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
         'Viewer camera lock'
       );
       viewer.setCamerasLocked(newLocked);
-      updateCameraLockUI();
       renderSplitViewBadges();
       callbacks.onNavigationUiSyncRequested(currentActiveViewId());
     });
@@ -1227,13 +1254,14 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
 
   return {
     renderSplitViewBadges,
+    describeViewPosition,
+    setCellsPresent,
     syncRenderModeUI,
     updateSplitViewUI,
     syncFromStateAndViewer,
     destroy() {
       if (destructionPromise !== null) return destructionPromise;
       destroyed = true;
-      lifecycleGeneration += 1;
       const failures = [];
       const cleanup = operation => {
         try {
@@ -1261,14 +1289,8 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
       if (viewerNeedsUiRetirement(viewer)) {
         cleanup(() => viewer.setViewFocusHandler(() => {}));
       }
-      destructionPromise = Promise
-        .allSettled([...pendingDimensionBadgeTasks])
-        .then(outcomes => {
-          for (const outcome of outcomes) {
-            if (outcome.status === 'rejected') {
-              failures.push(outcome.reason);
-            }
-          }
+      destructionPromise = Promise.resolve()
+        .then(() => {
           const exactFailures = [...new Set(failures)];
           if (exactFailures.length === 1) throw exactFailures[0];
           if (exactFailures.length > 1) {

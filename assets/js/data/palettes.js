@@ -6,8 +6,12 @@ export function rgbToCss(color) {
   return `rgb(${r}, ${g}, ${b})`;
 }
 
-function makeColormapSampler(stops) {
-  return (t) => {
+/**
+ * Sample a colormap into a caller-owned `[r, g, b]`, allocating nothing:
+ * coloring samples once per cell, millions of times per field switch.
+ */
+function makeColormapSamplerInto(stops) {
+  return (t, out) => {
     const clamped = Math.max(0, Math.min(1, t));
     const n = stops.length - 1;
     const x = clamped * n;
@@ -16,15 +20,14 @@ function makeColormapSampler(stops) {
     const f = x - i0;
     const c0 = stops[i0];
     const c1 = stops[i1];
-    return [
-      c0[0] + (c1[0] - c0[0]) * f,
-      c0[1] + (c1[1] - c0[1]) * f,
-      c0[2] + (c1[2] - c0[2]) * f
-    ];
+    out[0] = c0[0] + (c1[0] - c0[0]) * f;
+    out[1] = c0[1] + (c1[1] - c0[1]) * f;
+    out[2] = c0[2] + (c1[2] - c0[2]) * f;
+    return out;
   };
 }
 
-export const VIRIDIS_COLORS = [
+const VIRIDIS_COLORS = [
   [0.267, 0.004, 0.329],
   [0.283, 0.141, 0.458],
   [0.254, 0.265, 0.530],
@@ -569,12 +572,14 @@ const ORRD_COLORS = [
 ];
 
 function buildColormap(id, label, colors) {
+  const sampleInto = makeColormapSamplerInto(colors);
   return {
     id,
     label,
     colors,
     cssStops: colors.map(rgbToCss),
-    sample: makeColormapSampler(colors)
+    sampleInto,
+    sample: t => sampleInto(t, [0, 0, 0])
   };
 }
 
@@ -639,24 +644,14 @@ export function getColormap(id) {
   return COLORMAP_LOOKUP.get(id) || COLORMAP_LOOKUP.get(DEFAULT_COLORMAP_ID);
 }
 
-export function sampleContinuousColormap(id, t) {
-  return getColormap(id).sample(t);
-}
-
 export function getCssStopsForColormap(id) {
   return getColormap(id).cssStops;
 }
 
-export function colormapViridis(t) {
-  return sampleContinuousColormap('viridis', t);
-}
-
-export const VIRIDIS_CSS_STOPS = getCssStopsForColormap('viridis');
-
 // Vibrant colorblind-friendly palette (PROTAN/DEUTAN safe).
 // Optimized for 3D visualization: high saturation, max adjacent contrast.
 // Sources: Okabe-Ito (boosted), IBM Design, Paul Tol bright.
-export const CATEGORY_PALETTE = [
+const CATEGORY_PALETTE = [
   [1.000, 0.600, 0.000],  // #FF9900 - Bright orange
   [0.000, 0.467, 0.784],  // #0077C8 - Vivid cerulean
   [0.678, 0.314, 0.878],  // #AD50E0 - Electric violet

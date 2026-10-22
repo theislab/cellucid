@@ -634,19 +634,26 @@ export class CommunityAnnotationFileCache {
   }
 
   /**
-   * Fetch all cached JSON docs for a cache scope (optionally filtered by path prefixes).
+   * Stream every cached JSON doc of a cache scope (optionally filtered by
+   * path prefixes) to `onRecord`, one record at a time from one IndexedDB
+   * cursor, so a Pull rebuilds from the cache without holding every file.
    *
-   * This is optimized for the "rebuild from scratch on Pull" flow where we want
-   * all user files without issuing thousands of individual IndexedDB `get()` calls.
+   * `onRecord(path, sha, json)` runs synchronously inside the cursor (an
+   * IndexedDB transaction cannot outlive an awaited callback); a throw aborts
+   * the scan and rejects.
    *
    * @param {object} params
    * @param {string} params.datasetId
    * @param {string} params.repoRef - "owner/repo@branch"
    * @param {number|string} params.userId - GitHub numeric user id
    * @param {string[]|string|null} [params.prefixes]
-   * @returns {Promise<Record<string, {sha:string, json:any}>>}
+   * @param {(path: string, sha: string, json: any) => void} params.onRecord
+   * @returns {Promise<number>} How many records were streamed.
    */
-  async getAllJsonForRepo({ datasetId, repoRef, userId, prefixes = null } = {}) {
+  async forEachJsonForRepo({ datasetId, repoRef, userId, prefixes = null, onRecord } = {}) {
+    if (typeof onRecord !== 'function') {
+      throw new TypeError('Community annotation cache scan requires onRecord');
+    }
     await this.init();
     const scope = { datasetId, repoRef, userId };
     const scopeKey = toCacheScopeKey(scope);
@@ -655,8 +662,7 @@ export class CommunityAnnotationFileCache {
 
     const pfxList = assertCachePrefixes(prefixes);
 
-    /** @type {Record<string, {sha:string, json:any}>} */
-    const out = {};
+    const seen = new Set();
 
     const range = (typeof IDBKeyRange !== 'undefined') ? IDBKeyRange.only(scopeKey) : null;
     if (!range) throw new Error('IDBKeyRange is unavailable');
@@ -698,14 +704,15 @@ export class CommunityAnnotationFileCache {
             }
             const okPrefix = !pfxList || pfxList.some((pfx) => path.startsWith(pfx));
             if (okPrefix) {
-              if (Object.hasOwn(out, path)) {
+              if (seen.has(path)) {
                 const invalid = new Error(
                   `Community annotation IndexedDB cache contains duplicate path ${JSON.stringify(path)}`
                 );
                 invalid.code = 'LOCAL_RAW_CACHE_CORRUPT';
                 throw invalid;
               }
-              out[path] = { sha, json };
+              seen.add(path);
+              onRecord(path, sha, json);
             }
             cursor.continue();
           } catch (error) {
@@ -726,7 +733,7 @@ export class CommunityAnnotationFileCache {
       }
     });
 
-    return out;
+    return seen.size;
   }
 
   /**

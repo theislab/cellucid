@@ -4,6 +4,7 @@ import test from 'node:test';
 import {
   HighPerfRenderer,
 } from '../assets/js/rendering/high-perf-renderer.js';
+import { planLinearTexture } from '../assets/js/rendering/linear-texture.js';
 
 function identityMatrix() {
   const matrix = new Float32Array(16);
@@ -150,7 +151,6 @@ function makeRenderer({
   });
   const spatialIndex = {
     dimensionLevel,
-    ensureLodNodeMappings() {},
     lodLevels: [{
       indices: Uint32Array.of(0),
       isFullDetail: false,
@@ -161,22 +161,19 @@ function makeRenderer({
   const renderer = Object.assign(
     Object.create(HighPerfRenderer.prototype),
     {
-      _bufferDirty: false,
-      _dirtyLodDimensions: new Set(),
+      _colorsDirty: false,
       _dummyLodIndexTexture: dummyLodIndexTexture,
       _firstRenderDone: true,
-      _lodIndexTexturesByDimension: new Map(),
-      _lodResourceOwnersByDimension: new Map(),
+      _liveOrder: null,
       activeProgram: {},
       activeQuality: 'full',
+      programs: { full: {}, fullNoDepth: {} },
       buffers: {
-        interleaved: {},
+        colors: {},
+        positions: {},
       },
       forceLODLevel: -1,
       gl,
-      lodBuffersByDimension: new Map([
-        [dimensionLevel, spatialIndex.lodLevels],
-      ]),
       pointCount: 1,
       snapshotBuffers: new Map(),
       spatialIndices: new Map([
@@ -185,40 +182,29 @@ function makeRenderer({
       stats: {},
       uniformLocations: new Map([
         ['full', {}],
+        ['fullNoDepth', {}],
       ]),
       useAdaptiveLOD: false,
       useFrustumCulling: frustum,
-      _ensureLodResourcesForDimension() {},
-      _getLodBuffersForDimension() {
-        return spatialIndex.lodLevels;
-      },
       _getOrBuildSpatialIndexForDimension() {
         return spatialIndex;
       },
       _getViewState() {
         return viewState;
       },
-      _renderFullDetail() {
+      // Every live and snapshot pass, direct or culled, full or reduced,
+      // draws through the one draw seam.
+      _drawPoints() {
         throw new Error('synthetic point render failure');
       },
-      _renderLOD() {
-        throw new Error('synthetic point render failure');
+      _ensureStoreDrawOrder() {
+        return null;
       },
-      _renderLODWithFrustumCulling() {
-        throw new Error('synthetic point render failure');
+      _ensureLiveColorsInOrder() {},
+      _ensureSnapshotDrawOrder() {
+        return null;
       },
-      _renderSnapshotWithFrustumCulling() {
-        throw new Error('synthetic point render failure');
-      },
-      _renderSnapshotWithLOD() {
-        throw new Error('synthetic point render failure');
-      },
-      _renderSnapshotLODWithFrustumCulling() {
-        throw new Error('synthetic point render failure');
-      },
-      _renderWithFrustumCulling() {
-        throw new Error('synthetic point render failure');
-      },
+      _ensureSnapshotColorsInOrder() {},
       _snapshotUsesLiveGeometry() {
         return true;
       },
@@ -236,6 +222,7 @@ function makeRenderer({
       alphaTexture: Object.freeze({
         id: 'snapshot-alpha-texture',
       }),
+      alphaTexPlan: planLinearTexture(alphaTexData.length, 16384, 256),
       alphaTextureByteLength: alphaTexData.byteLength,
       dimensionLevel,
       geometryGeneration: 1,

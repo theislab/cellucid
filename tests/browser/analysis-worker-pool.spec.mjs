@@ -28,18 +28,21 @@ test('analysis worker pool initializes and computes the exact result', async ({ 
   );
 
   const proof = await page.evaluate(async () => {
-    const { createWorkerPool } = await import(
+    const { WorkerPool } = await import(
       '/assets/js/app/analysis/compute/worker-pool.js'
     );
-    const pool = createWorkerPool({
+    const pool = new WorkerPool({
       poolSize: 1,
       defaultTimeout: 10_000
     });
     try {
       await pool.init();
       const result = await pool.execute(
-        'COMPUTE_STATS',
-        { values: new Float32Array([1, 2, 3, 4]) },
+        'COMPUTE_CORRELATION',
+        {
+          xValues: new Float32Array([1, 2, 3, 4]),
+          yValues: new Float32Array([2, 4, 6, 8])
+        },
         { transfer: false }
       );
       return {
@@ -52,17 +55,13 @@ test('analysis worker pool initializes and computes the exact result', async ({ 
   });
 
   expect(proof.result).toEqual({
-    count: 4,
-    min: 1,
-    max: 4,
-    mean: 2.5,
-    median: 2.5,
-    std: Math.sqrt(1.25),
-    q1: 2,
-    q3: 4,
-    iqr: 2,
-    sum: 10,
-    variance: 1.25
+    r: 1,
+    rSquared: 1,
+    pValue: 0,
+    n: 4,
+    method: 'pearson',
+    slope: 2,
+    intercept: 0
   });
   expect(proof.stats).toEqual({
     poolSize: 1,

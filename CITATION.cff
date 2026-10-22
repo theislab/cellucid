@@ -1,12 +1,12 @@
 cff-version: 1.2.0
-message: "If you use Cellucid in your work, please cite this software."
+message: "If you use Cellucid in your work, please cite the reference under preferred-citation."
 type: software
 title: "Cellucid: GPU-accelerated single-cell atlas viewer"
-# No `version:` field, by design. The web app is a continuously deployed static
-# site with no released versions; a deployment is identified only by the build
-# id shown in the application footer, which changes on every deploy. The
-# versioned companions are the Python (theislab/cellucid-python) and R
-# (theislab/cellucid-r) packages, whose CITATION.cff files do carry `version:`.
+# The release version the web app shares with the Python
+# (theislab/cellucid-python) and R (theislab/cellucid-r) packages, bumped
+# together at every CELLUCID_VERSION marker. A deployment is additionally
+# identified by the build id printed beside it in the application footer.
+version: 0.9.4  # CELLUCID_VERSION
 authors:
   - family-names: Inecik
     given-names: Kemal
@@ -14,4 +14,27 @@ authors:
 repository-code: "https://github.com/theislab/cellucid"
 url: "https://www.cellucid.com"
 license: "BSD-3-Clause"
-
+# BEGIN cellucid preferred-citation
+# The single source of the Cellucid citation. It is written only in
+# theislab/cellucid/CITATION.cff and copied verbatim into every other Cellucid
+# repository's CITATION.cff; the README citations, the documentation's
+# "Citing Cellucid" page, and the R package's inst/CITATION are generated from
+# it. Never edit a copy.
+#
+# PLACEHOLDER while there is no `doi:`. Every generated citation says so for as
+# long as `doi:` is absent. When the bioRxiv preprint is published:
+#   1. set the real `title`, the full `authors` list, `doi`, and `year`, and
+#      change `status` to `preprint`;
+#   2. from the workspace, run
+#        python cellucid-private/scripts/sync_citation.py
+#      then `python cellucid-private/scripts/sync_citation.py --check`;
+#   3. commit every repository it changed.
+preferred-citation:
+  type: article
+  status: in-preparation
+  title: "PLACEHOLDER: Cellucid preprint, title to be announced (forthcoming on bioRxiv)"
+  authors:
+    - family-names: "Inecik"
+      given-names: "Kemal"
+  journal: "bioRxiv"
+# END cellucid preferred-citation

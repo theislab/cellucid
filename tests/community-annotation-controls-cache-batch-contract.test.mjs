@@ -17,27 +17,27 @@ const setupGuide = readFileSync(
   'utf8'
 );
 
-test('one Pull generation commits all changed raw files through one cache batch', () => {
+test('a Pull caches changed raw files a batch at a time and folds the cache as it streams', () => {
   const start = source.indexOf('async function pullFromGitHub');
   const end = source.indexOf('async function pushToGitHub', start);
   assert.ok(start >= 0 && end > start);
   const pull = source.slice(start, end);
+  // One cache write per fetched batch, one for the moderation file.
   assert.equal(
     [...pull.matchAll(/fileCache\.setManyJson\s*\(/g)].length,
-    1
+    2
   );
+  assert.match(pull, /const cacheUserRecords = async \(records\) =>/);
+  assert.match(pull, /onRecords: cacheUserRecords,/);
   assert.match(
     pull,
-    /const changedCacheRecords = fetchedUserRecords\.map/
+    /records: cacheRecords,[\s\S]*?signal: opAbort\.signal/
   );
-  assert.match(
-    pull,
-    /changedCacheRecords\.push\(\{[\s\S]*?moderationResult\.path/
-  );
-  assert.match(
-    pull,
-    /records: changedCacheRecords,[\s\S]*?signal: opAbort\.signal/
-  );
+  // The merge input is folded from one cache cursor, never collected first.
+  assert.doesNotMatch(pull, /getAllJsonForRepo/);
+  assert.match(pull, /const remoteUserFiles = session\.createRemoteUserFiles\(\);/);
+  assert.match(pull, /fileCache\.forEachJsonForRepo\(\{[\s\S]*?remoteUserFiles\.add\(json\);/);
+  assert.match(pull, /session\.applyPulledRepositoryState\(\{\s*remoteUserFiles,/);
 });
 
 test('cache corruption invalidates its exact resolved scope before disconnect', () => {

@@ -10,9 +10,6 @@ import {
   BasePluginRegistry,
 } from '../assets/js/app/analysis/core/plugin-contract.js';
 import {
-  parseOptionsFromForm,
-} from '../assets/js/app/analysis/core/transform-registry.js';
-import {
   getFormValues,
   getTypedFormValues,
 } from '../assets/js/app/analysis/shared/analysis-utils.js';
@@ -426,18 +423,12 @@ test('analysis form value publishers preserve every prototype-named key', () => 
     ]),
   );
 
-  const transformValues = parseOptionsFromForm(form, schema);
-  assertExactOrdinaryRecord(
-    transformValues,
-    PROTOTYPE_PROPERTY_NAMES,
-  );
   const plainValues = getFormValues(form, PROTOTYPE_PROPERTY_NAMES);
   assertExactOrdinaryRecord(plainValues, PROTOTYPE_PROPERTY_NAMES);
   const typedValues = getTypedFormValues(form, schema);
   assertExactOrdinaryRecord(typedValues, PROTOTYPE_PROPERTY_NAMES);
   for (const [index, key] of PROTOTYPE_PROPERTY_NAMES.entries()) {
     const expected = `value-${index}`;
-    assert.equal(transformValues[key], expected, key);
     assert.equal(plainValues[key], expected, key);
     assert.equal(typedValues[key], expected, key);
   }
@@ -682,7 +673,7 @@ test('plot option rendering rejects invalid post-registration record mutations',
     { idPrefix: 'valid-empty-schema' },
   );
   assert.equal(emptyContainer.children.length, 1);
-  assert.equal(emptyContainer.children[0].className, 'legend-help');
+  assert.equal(emptyContainer.children[0].className, 'empty-state');
   assert.equal(
     emptyContainer.children[0].textContent,
     'No customization options available.',

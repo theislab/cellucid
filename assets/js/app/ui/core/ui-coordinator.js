@@ -12,17 +12,20 @@
 
 import { collectDOMReferences } from './dom-cache.js';
 import { viewerNeedsUiRetirement } from './viewer-lifecycle.js';
-import { initSidebarControls } from '../modules/sidebar-controls.js';
 import { initStatsDisplay } from '../modules/stats-display.js';
 import { initRenderControls } from '../modules/render-controls.js';
 import { initVelocityOverlayControls } from '../modules/velocity-overlay-controls.js';
 import { initCameraControls } from '../modules/camera-controls.js';
+import { initCellInfo } from '../modules/cell-info.js';
+import { initCiteDialog } from '../modules/cite-dialog.js';
+import { initShareDialog } from '../modules/share-dialog.js';
 import { initLegendRenderer } from '../modules/legend-renderer.js';
 import { initFilterControls } from '../modules/filter-controls.js';
 import { initHighlightControls } from '../modules/highlight-controls.js';
 import { initFieldSelector } from '../modules/field-selector.js';
 import { initViewControls } from '../modules/view-controls.js';
-import { initDimensionControls } from '../modules/dimension-controls.js';
+import { initRepresentationControls } from '../modules/representation-controls.js';
+import { initDataMappingControls } from '../modules/data-mapping-controls.js';
 import { initDatasetControls } from '../modules/dataset-controls.js';
 import { initSessionControls } from '../modules/session-controls.js';
 import { initCommunityAnnotationControls } from '../modules/community-annotation-controls.js';
@@ -30,6 +33,7 @@ import { initVisualizationReset } from '../modules/visualization-reset.js';
 import { initFigureExport } from '../modules/figure-export/index.js';
 import { initCinematicCamera } from '../modules/cinematic-camera/index.js';
 import { initInfoPopovers } from '../components/info-popovers.js';
+import { bindDisclosure } from '../components/controls.js';
 import {
   clearPublishedSnapshotViews,
   publishSnapshotView,
@@ -142,11 +146,15 @@ export function createStableTerminalDestroy({
  *
  * `index.html` ships every data-source control disabled and this line visible,
  * because the listeners that act on those controls are attached by `initUI()`
- * — which does not run until the initial dataset has finished loading, tens of
- * seconds on a slow link. A control offered before its listener exists takes a
- * click and discards it without a request, a message or a record, so no control
- * is offered until this line says the listeners are there. Saying it through a
+ * — which runs only once startup has read its health endpoint and dataset
+ * catalog. A control offered before its listener exists takes a click and
+ * discards it without a request, a message or a record, so no control is
+ * offered until this line says the listeners are there. Saying it through a
  * live region is what makes the change announced rather than merely drawn.
+ *
+ * The startup dataset itself loads only after this, as an ordinary dataset
+ * change, so every control here is live while it loads and a choice made
+ * then replaces it (`dataset-controls.js`).
  */
 const DATA_SOURCE_STATUS_ID = 'data-source-status';
 const DATA_SOURCE_STATUS_READY =
@@ -197,8 +205,11 @@ function publishDataSourceReadiness(documentOwner) {
  * @param {object} options.viewer
  * @param {{ rebuildSmokeDensity?: (gridSize?: number) => void } | null} [options.smoke]
  * @param {import('../../../data/data-source-manager.js').DataSourceManager | null} [options.dataSourceManager]
- * @param {() => Promise<boolean>} options.clearActiveDataset
+ * @param {(transaction: Object) => Promise<boolean>} options.clearActiveDataset
  * @param {(selection: Object) => Promise<boolean>} options.reloadActiveDataset
+ * @param {object} options.datasetChanges The dataset-change coordinator every
+ *   dataset change begins its transaction with
+ *   (`createLatestDatasetReloadCoordinator`).
  * @param {object|null} [options.sessionSerializer]
  * @param {any|null} [options.jupyterSource]
  */
@@ -209,6 +220,7 @@ export function initUI({
   dataSourceManager = null,
   clearActiveDataset,
   reloadActiveDataset = null,
+  datasetChanges,
   sessionSerializer = null,
   jupyterSource = null
 }) {
@@ -216,14 +228,22 @@ export function initUI({
 
   const dom = collectDOMReferences(document);
   const infoPopovers = initInfoPopovers({ root: document });
+  // Collapsible sub-sections written in index.html share the builder's
+  // behaviour: aria-expanded on the header, `hidden` on the region.
+  const staticDisclosures = new AbortController();
+  for (const header of document.querySelectorAll(
+    '[data-static-disclosure] > .disclosure-header'
+  )) {
+    bindDisclosure({
+      header,
+      content: document.getElementById(header.getAttribute('aria-controls')),
+      expanded: header.getAttribute('aria-expanded') === 'true',
+      signal: staticDisclosures.signal
+    });
+  }
   let viewControls = null;
   let cinematicCamera = null;
   let destroyed = false;
-
-  const sidebarControls = initSidebarControls({
-    dom: dom.sidebar,
-    onViewportOcclusionChange: viewer.setViewportLeftOcclusionRatio,
-  });
 
   const statsDisplay = initStatsDisplay({ dom: dom.stats });
   const renderControls = initRenderControls({
@@ -244,12 +264,28 @@ export function initUI({
     }
   });
 
+  const cellInfo = initCellInfo({
+    viewer,
+    state,
+    toggle: dom.cellInfo.toggle,
+    categoriesToggle: dom.cellInfo.categoriesToggle,
+    canvas: dom.cellInfo.canvas
+  });
+
   const legend = initLegendRenderer({ state, viewer, dom: dom.display, dataSourceManager });
   const filterControls = initFilterControls({
     state,
     viewer,
     dom: dom.filter,
     callbacks: {
+      // Enabling, disabling or removing a filter from Active filters changes
+      // state the legend's own controls display (range sliders, category
+      // checkboxes, the outlier slider). Without a redraw they kept the old
+      // bound, and the next slider nudge re-applied the removed filter. The
+      // one active-field publication redraws every surface from state.
+      onFiltersChanged: () => {
+        if (!destroyed) handleActiveFieldChanged();
+      },
       onViewBadgesMaybeChanged: () => viewControls?.renderSplitViewBadges?.()
     }
   });
@@ -261,12 +297,17 @@ export function initUI({
     infoPopovers
   });
 
-  const dimensionControls = initDimensionControls({
+  const representationControls = initRepresentationControls({
     state,
-    dom: dom.dimension,
+    dom: dom.representation,
     callbacks: {
+      viewLabel: viewId => viewControls?.describeViewPosition?.(viewId) ?? null,
       onViewBadgesMaybeChanged: () => viewControls?.renderSplitViewBadges?.()
     }
+  });
+  const dataMappingControls = initDataMappingControls({
+    state,
+    root: dom.dataMapping.root
   });
 
   const scheduleFrame = typeof requestAnimationFrame === 'function'
@@ -339,16 +380,7 @@ export function initUI({
 
   function syncNavigationUiForView(viewId) {
     if (destroyed) return;
-    const navSelect = dom.camera.navigationModeSelect;
-    const mode = viewer.getViewNavigationMode(viewId);
-
-    if (navSelect.value !== mode) {
-      navSelect.value = mode;
-    }
-    cameraControls.toggleNavigationPanels(mode);
-    if (cinematicCamera !== null) {
-      cinematicCamera.syncNavigationMode(mode);
-    }
+    cameraControls.syncNavigationMode(viewer.getViewNavigationMode(viewId));
   }
   viewer.setNavigationModeChangeHandler((viewId) => {
     syncNavigationUiForView(viewId);
@@ -379,7 +411,6 @@ export function initUI({
     const info = fieldInfo || buildStatsInfoFromState();
     legend.render?.(info.field);
     legend.handleOutlierUI?.(info.field);
-    highlightControls.updateHighlightMode?.();
     communityAnnotationControls.render?.();
   }
 
@@ -401,7 +432,7 @@ export function initUI({
     handleActiveFieldChanged();
     filterControls.render?.();
     highlightControls.renderHighlightSummary?.();
-    dimensionControls.updateDimensionSelectUI?.();
+    representationControls.render();
     syncNavigationUiForView(viewId);
     renderControls.markSmokeDirty?.();
   }
@@ -438,13 +469,6 @@ export function initUI({
     renderDom: dom.render,
     callbacks: {
       onActiveViewChanged: (viewId) => refreshViewDependentSurfaces(viewId),
-      onCycleViewDimension: async (viewId, nextDim) => {
-        await dimensionControls.handleDimensionChange(
-          nextDim,
-          viewId,
-          { silent: false }
-        );
-      },
       onNavigationUiSyncRequested: (viewId) => syncNavigationUiForView(viewId)
     }
   });
@@ -453,6 +477,11 @@ export function initUI({
   });
   viewer.setSmokeRenderFailureHandler((error) => {
     renderControls.settleSmokeRenderFailure(error);
+  });
+  // Recolouring (a colormap, a category colour) and dimension switches reach
+  // the viewer without a visibility change; the smoke volume carries both.
+  viewer.setSmokeSourceChangeHandler(() => {
+    renderControls.markSmokeDirty();
   });
   viewer.setVelocityRenderFailureHandler?.((error) => {
     velocityOverlayControls.settleRenderFailure(error);
@@ -469,13 +498,14 @@ export function initUI({
     filterControls.render?.();
     highlightControls.renderHighlightPages?.();
     highlightControls.renderHighlightSummary?.();
-    dimensionControls.updateDimensionSelectUI?.();
+    representationControls.render();
     syncNavigationUiForView(state.getActiveViewId());
   }
 
   const sessionControls = initSessionControls({
     dom: dom.session,
     sessionSerializer,
+    datasetChanges,
     onAfterLoad: refreshUiAfterStateLoad
   });
   const { showSessionStatus } = sessionControls;
@@ -485,6 +515,7 @@ export function initUI({
     dataSourceManager,
     clearDataset: clearActiveDataset,
     reloadDataset: reloadActiveDataset,
+    datasetChanges,
     callbacks: {
       renderFieldSelects: fieldSelector.renderFieldSelects,
       renderDeletedFieldsSection: fieldSelector.renderDeletedFieldsSection,
@@ -496,14 +527,22 @@ export function initUI({
         viewControls?.syncFromStateAndViewer?.();
         refreshViewDependentSurfaces(state.getActiveViewId());
       },
-      updateDimensionSelectUI: dimensionControls.updateDimensionSelectUI,
+      renderRepresentationPicker: representationControls.render,
       showSessionStatus
     }
   });
-  const {
-    catalogReady: datasetCatalogReady,
-    refreshDatasetUI
-  } = datasetControls;
+  const { refreshDatasetUI: refreshDatasetControls } = datasetControls;
+  const citeDialog = initCiteDialog({ ownerDocument: document });
+  const shareDialog = dataSourceManager === null
+    ? null
+    : initShareDialog({ ownerDocument: document, dataSourceManager });
+  // A newly published dataset decides whether there is anything to share.
+  function refreshDatasetUI(...args) {
+    const result = refreshDatasetControls(...args);
+    shareDialog?.refresh();
+    dataMappingControls.datasetPublished();
+    return result;
+  }
 
   const figureExportControls = initFigureExport({
     state,
@@ -515,7 +554,16 @@ export function initUI({
   cinematicCamera = initCinematicCamera({
     viewer,
     dom: dom.cinematicCamera,
-    dataSourceManager
+    navigation: cameraControls,
+    dataSourceManager,
+    // What the focused view shows, for keyframes to record: its embedding
+    // reference and short name, or null without a dataset mapping.
+    focusedRepresentation: () => {
+      const viewId = viewer.getFocusedViewId();
+      const shown = state.describeViewEmbedding(viewId);
+      if (shown === null || state.getDataMapping() === null) return null;
+      return { ref: state.getViewEmbeddingRef(viewId), name: `${shown.name} ${shown.dimension}D` };
+    }
   });
   syncNavigationUiForView(state.getActiveViewId());
 
@@ -544,20 +592,47 @@ export function initUI({
     'field:changed',
     handleFieldChanged
   );
-  const handleDimensionChanged = () => {
-    publishStatsLine();
+  const handleRepresentationChanged = ({ viewId, dimension }) => {
+    if (viewId === state.activeViewId) {
+      renderControls.applyViewDimensionAntialiasing(dimension);
+      publishStatsLine();
+    }
     viewControls?.renderSplitViewBadges?.();
   };
   const unsubscribeDimension = state.on(
-    'dimension:changed',
-    handleDimensionChanged
+    'view:representation-changed',
+    handleRepresentationChanged
+  );
+  // A changed mapping (an embedding turned on or off, another default)
+  // relabels the rows of the views that show or follow it, and a changed
+  // graph or gene list is the one the dataset facts count.
+  const unsubscribeMapping = state.on(
+    'mapping:changed',
+    () => {
+      viewControls?.renderSplitViewBadges?.();
+      datasetControls.updateMappedDatasetFacts({
+        connectivityEdges: state.getConnectivityEdgeCount(),
+        genes: state.getVarAxisGeneCount(),
+      });
+    }
+  );
+  // A new gene list (another expression matrix or other gene names) is
+  // listed, searched and shown exactly as after a session load.
+  const unsubscribeVarAxis = state.on(
+    'var-axis:changed',
+    () => refreshUiAfterStateLoad()
+  );
+  // Another latent space adds or removes outlier filters.
+  const unsubscribeLatentSpace = state.on(
+    'latent-space:changed',
+    () => refreshUiAfterStateLoad()
   );
 
   // Initial render pass
   fieldSelector.renderFieldSelects?.();
   fieldSelector.initGeneExpressionDropdown?.();
   fieldSelector.renderDeletedFieldsSection?.();
-  dimensionControls.updateDimensionSelectUI?.();
+  representationControls.render();
   filterControls.render?.();
   highlightControls.renderHighlightPages?.();
   highlightControls.renderHighlightSummary?.();
@@ -675,11 +750,18 @@ export function initUI({
     },
     getOperations: () => [
       retireDataSourceReadiness,
+      () => staticDisclosures.abort(),
       unsubscribeVisibility,
       unsubscribeField,
       unsubscribeDimension,
+      unsubscribeMapping,
+      unsubscribeVarAxis,
+      unsubscribeLatentSpace,
       () => renderControls.destroy(),
       () => cameraControls.destroy(),
+      () => cellInfo.destroy(),
+      () => citeDialog.destroy(),
+      () => shareDialog?.destroy(),
       () => legend.destroy(),
       () => filterControls.destroy(),
       () => highlightControls.destroy(),
@@ -693,6 +775,7 @@ export function initUI({
       () => {
         if (viewerNeedsUiRetirement(viewer)) {
           viewer.setSmokeRenderFailureHandler(() => {});
+          viewer.setSmokeSourceChangeHandler(() => {});
         }
       },
       () => {
@@ -711,14 +794,14 @@ export function initUI({
         }
       },
       () => velocityOverlayControls.destroy(),
-      () => dimensionControls.destroy(),
+      () => representationControls.destroy(),
+      () => dataMappingControls.destroy(),
       () => datasetControls.destroy(),
       () => {
         if (typeof figureExportControls.destroy === 'function') {
           return figureExportControls.destroy();
         }
       },
-      () => sidebarControls.destroy(),
       () => viewControls.destroy(),
       () => cinematicCamera?.destroy?.(),
       () => communityAnnotationControls.destroy?.(),
@@ -729,24 +812,44 @@ export function initUI({
   });
 
   /**
+   * Publish whether the runtime has cells: a dataset or synthetic benchmark
+   * data, rather than the empty runtime None leaves. Keeping a view, exporting
+   * a figure and saving a session all act on cells, so without them they are
+   * unavailable and say why.
+   *
+   * @param {boolean} present
+   */
+  function publishCellPresence(present) {
+    if (typeof present !== 'boolean') {
+      throw new TypeError('Runtime cell presence must be one boolean.');
+    }
+    // A retired UI has no controls left to gate.
+    if (destroyed) return;
+    viewControls.setCellsPresent(present);
+    sessionControls.setCellsPresent(present);
+    figureExportControls.setCellsPresent?.(present);
+  }
+
+  /**
    * Open a newly published dataset with the render settings its size wants.
    *
    * Two settings depend on nothing but the cell count, and both were single
    * shipped constants that could not be right for a 3,696-cell trajectory and an
    * 18-million-cell atlas at once: the point size, and whether to antialias.
    *
-   * Called once per dataset publication, before any saved state is replayed, so a
-   * session or a published preset still overrides the point size, and before
-   * `viewer.start()` on the first dataset, so no frame is drawn with the wrong
-   * one. `Reset` is re-captured afterwards: a reset should return to what this
-   * dataset opened with, not to the markup, which belongs to no dataset.
+   * Called once per dataset publication, while it synchronizes the controls and
+   * before any saved state is replayed, so a session or a published preset
+   * still overrides the point size. `Reset` is re-captured afterwards: a reset
+   * should return to what this dataset opened with, not to the markup, which
+   * belongs to no dataset.
    *
    * @param {number} cellCount
+   * @param {1|2|3} dimension The dimension the dataset opens in.
    * @returns {{pointSize: number, antialiasing: boolean}}
    */
-  function applyDatasetRenderDefaults(cellCount) {
+  function applyDatasetRenderDefaults(cellCount, dimension) {
     const pointSize = renderControls.applyAutomaticPointSize(cellCount);
-    const antialiasing = renderControls.applyDatasetAntialiasing(cellCount);
+    const antialiasing = renderControls.applyDatasetAntialiasing(cellCount, dimension);
     visualizationReset.captureInitialState();
     return { pointSize, antialiasing };
   }
@@ -755,12 +858,15 @@ export function initUI({
     activateField: fieldSelector.activateField,
     applyRenderMode: renderControls.applyRenderMode,
     applyDatasetRenderDefaults,
+    loadStartupDataset: datasetControls.loadStartupDataset,
     prepareDatasetReplacement: fieldSelector.prepareDatasetReplacement,
+    publishCellPresence,
     refreshUiAfterStateLoad,
     showSessionStatus,
     refreshDatasetUI,
+    refreshDataMapping: dataMappingControls.datasetPublished,
+    cycleRepresentation: representationControls.cycle,
     settleFieldInteractions: fieldSelector.settleAllInteractions,
-    datasetCatalogReady,
     cinematicCamera,
     publishSnapshotView: publishOwnedSnapshot,
     retireSnapshotView: retireOwnedSnapshot,

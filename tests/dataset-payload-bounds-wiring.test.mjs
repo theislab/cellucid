@@ -28,7 +28,8 @@ const mainSource = readFileSync(
 const N_POINTS = 7;
 const FLOAT32_BYTES = 4;
 const BASE_URL = 'https://catalog.cellucid.test/exports/demo/';
-const FAST_BINARY_FETCH_INIT = { cache: 'force-cache' };
+const EMBEDDING_ID = 'X_umap';
+const EMBEDDING_FILE = 'embeddings/0_2d.bin';
 
 /**
  * The exact `name(...)` call expression main.js writes, extracted by balanced
@@ -73,7 +74,7 @@ function installFetch(t, handler) {
 
 function obsManifest() {
   return expandObsManifest({
-    _format: 'compact_v1',
+    _format: 'compact_v2',
     n_points: N_POINTS,
     centroid_outlier_quantile: null,
     latent_key: null,
@@ -93,9 +94,8 @@ function obsManifest() {
 
 function varManifest() {
   return expandVarManifest({
-    _format: 'compact_v1',
+    _format: 'compact_v2',
     n_points: N_POINTS,
-    var_gene_id_column: null,
     compression: null,
     quantization: null,
     _varSchema: {
@@ -106,14 +106,24 @@ function varManifest() {
       quantized: false,
     },
     fields: [[0, 'Gene A']],
+    gene_name_sets: [
+      { source: null, filled_from_index: 0, renamed: [], names: null },
+    ],
   });
 }
 
 function embeddingsMetadata() {
   return {
-    available_dimensions: [2],
     default_dimension: 2,
-    files: { '2d': 'points_2d.bin' },
+    defaults: { '2d': EMBEDDING_ID },
+    items: {
+      [EMBEDDING_ID]: {
+        label: EMBEDDING_ID,
+        dimension: 2,
+        file: EMBEDDING_FILE,
+        source: { key: EMBEDDING_ID, columns: [0, 1] },
+      },
+    },
   };
 }
 
@@ -134,7 +144,6 @@ test('main.js gives the obs field loader the manifest-declared point count', asy
     'createObsFieldLoader',
     'getObsManifestUrl',
     'baseUrl',
-    'FAST_BINARY_FETCH_INIT',
     'generation',
     `return ${extractCallExpression('createObsFieldLoader')};`
   );
@@ -142,7 +151,6 @@ test('main.js gives the obs field loader the manifest-declared point count', asy
     createObsFieldLoader,
     base => `${base}obs_manifest.json`,
     BASE_URL,
-    FAST_BINARY_FETCH_INIT,
     generation
   );
 
@@ -173,7 +181,6 @@ test('main.js gives the var field loader the manifest-declared point count', asy
     'createVarFieldLoader',
     'getVarManifestUrl',
     'baseUrl',
-    'FAST_BINARY_FETCH_INIT',
     'generation',
     `return ${extractCallExpression('createVarFieldLoader')};`
   );
@@ -181,7 +188,6 @@ test('main.js gives the var field loader the manifest-declared point count', asy
     createVarFieldLoader,
     base => `${base}var_manifest.json`,
     BASE_URL,
-    FAST_BINARY_FETCH_INIT,
     generation
   );
 
@@ -211,7 +217,6 @@ test('an exactly declared obs payload still loads', async t => {
     'createObsFieldLoader',
     'getObsManifestUrl',
     'baseUrl',
-    'FAST_BINARY_FETCH_INIT',
     'generation',
     `return ${extractCallExpression('createObsFieldLoader')};`
   );
@@ -219,18 +224,21 @@ test('an exactly declared obs payload still loads', async t => {
     createObsFieldLoader,
     base => `${base}obs_manifest.json`,
     BASE_URL,
-    FAST_BINARY_FETCH_INIT,
     generation
   );
 
-  installFetch(t, async () => new Response(
-    new Uint8Array(N_POINTS * FLOAT32_BYTES),
-    { status: 200 }
-  ));
+  const caches = [];
+  installFetch(t, async (url, init) => {
+    caches.push(init?.cache);
+    return new Response(new Uint8Array(N_POINTS * FLOAT32_BYTES), { status: 200 });
+  });
 
   const loaded = await loader(generation.obsManifest.fields[0]);
   assert.equal(loaded.loaded, true);
   assert.equal(loaded.values.length, N_POINTS);
+  // A payload is never reused from cache without asking the origin: a
+  // re-export at the same path can hold another field of the same length.
+  assert.deepEqual(caches, ['no-cache']);
 });
 
 // ---------------------------------------------------------------------------
@@ -245,6 +253,7 @@ test('main.js publishes the identity cell axis before the first dimension loads'
     'candidateDimensionManager',
     'embeddingsMetadata',
     'generation',
+    'mapping',
     `candidateDimensionManager.initFromMetadata(embeddingsMetadata);${
       extractStatements(
         'candidateDimensionManager.initFromMetadata(embeddingsMetadata);',
@@ -254,9 +263,11 @@ test('main.js publishes the identity cell axis before the first dimension loads'
   );
 
   const dimensionManager = createDimensionManager({ baseUrl: BASE_URL });
+  // A prepared export has no candidate catalog, so it installs no layout
+  // provider.
   publishCellAxis(dimensionManager, embeddingsMetadata(), {
     identity: datasetIdentity(),
-  });
+  }, { candidates: null });
   assert.equal(
     dimensionManager.getCellCount(),
     N_POINTS,
@@ -274,14 +285,14 @@ test('main.js publishes the identity cell axis before the first dimension loads'
   });
 
   await assert.rejects(
-    dimensionManager.loadDimension(2, { showProgress: false }),
+    dimensionManager.loadLayout(EMBEDDING_ID, { showProgress: false }),
     new RegExp(
       `transfer of at least ${(N_POINTS + 1) * 2 * FLOAT32_BYTES} bytes ` +
       `exceeds its ${N_POINTS * 2 * FLOAT32_BYTES}-byte ceiling`
     ),
     'the first embedding must be bounded by n_cells × dimension × float32'
   );
-  assert.deepEqual(requestedUrls, [`${BASE_URL}points_2d.bin`]);
+  assert.deepEqual(requestedUrls, [`${BASE_URL}${EMBEDDING_FILE}`]);
 });
 
 test('an unpublished cell axis leaves the first embedding ceiling-bounded', async t => {
@@ -297,7 +308,7 @@ test('an unpublished cell axis leaves the first embedding ceiling-bounded', asyn
     { status: 200 }
   ));
 
-  const positions = await dimensionManager.loadDimension(2, {
+  const positions = await dimensionManager.loadLayout(EMBEDDING_ID, {
     showProgress: false,
   });
   assert.equal(positions.length, (N_POINTS + 1) * 2);

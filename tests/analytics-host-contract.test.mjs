@@ -25,7 +25,9 @@ function executeGaInit(hostname) {
   const window = {
     location: {
       hostname,
-      search: '',
+      origin: `https://${hostname}`,
+      pathname: '/',
+      search: '?remote=http%3A%2F%2F10.1.2.3%3A8765&dataset=donor7',
     },
   };
   const document = {
@@ -82,6 +84,12 @@ test('analytics is absent on localhost and loaded exactly once on production', (
   assert.equal(production.window.dataLayer.length, 2);
   assert.equal(production.window.dataLayer[1][0], 'config');
   assert.equal(production.window.dataLayer[1][1], MEASUREMENT_ID);
+  // The automatic page_view names the page, never what it was asked to open,
+  // and carries no legacy Universal Analytics fields as event parameters.
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(production.window.dataLayer[1][2])),
+    { page_location: 'https://www.cellucid.com/' }
+  );
 
   assert.match(
     trackerSource,

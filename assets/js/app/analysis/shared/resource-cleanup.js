@@ -139,8 +139,3 @@ export function cleanupAnalysisResources(params) {
     );
   }
 }
-
-export default {
-  clearActiveSourceCaches,
-  cleanupAnalysisResources,
-};

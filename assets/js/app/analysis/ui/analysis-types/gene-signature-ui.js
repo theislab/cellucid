@@ -10,12 +10,11 @@
  * Extends FormBasedAnalysisUI for form + results pattern.
  */
 
+import { formatCount } from '../../../ui/components/display-format.js';
+import { createStatusLine } from '../../../ui/components/controls.js';
 import { FormBasedAnalysisUI } from './base/form-based-analysis.js';
-import {
-  createFormRow,
-  createFormSelect,
-  createFormTextarea
-} from '../../shared/dom-utils.js';
+import { createSelectField } from '../../shared/dom-utils.js';
+import { createField } from '../../../ui/components/controls.js';
 import {
   signatureScoresToCSV,
   downloadCSV
@@ -24,7 +23,12 @@ import {
 import { isFiniteNumber } from '../../shared/number-utils.js';
 import { PageSelectorComponent } from '../shared/page-selector.js';
 import { applyFormControlAccessibility } from '../components/control-accessibility.js';
-import { renderSummaryStats, renderStatisticalAnnotations } from '../components/stats-display.js';
+import {
+  preparePageStatistics,
+  renderSummaryStats,
+  renderStatisticalAnnotations
+} from '../components/stats-display.js';
+import { createSlicedYield } from '../../shared/concurrency-utils.js';
 
 /**
  * Gene Signature Score UI Component
@@ -96,8 +100,14 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
 
     const requestId = this._startAnalysisRequest(scheduledRequestId);
     if (requestId === null) return;
+    const releaseBusy = this._claimBusy();
     try {
       const formValues = structuredClone(this._getFormValues());
+      const validation = this._validateForm(formValues);
+      if (!validation.valid) {
+        await this._showError(validation.error, requestId);
+        return;
+      }
       const result = await this._runAnalysisImpl(formValues, requestId);
 
       if (!this._isCurrentAnalysisRequest(requestId)) return;
@@ -111,6 +121,7 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
       console.error('[GeneSignatureUI] Analysis failed:', err);
       await this._showError('Analysis failed: ' + err.message, requestId);
     } finally {
+      releaseBusy();
       this._finishAnalysisRequest(requestId);
     }
   }
@@ -134,11 +145,10 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
       return false;
     }
     if (this._resultContainer) {
-      this._resultContainer.classList.remove('hidden');
-      const errorEl = document.createElement('div');
-      errorEl.className = 'analysis-error';
-      errorEl.textContent = message;
-      this._resultContainer.appendChild(errorEl);
+      this._resultContainer.hidden = false;
+      this._resultContainer.appendChild(
+        createStatusLine({ tone: 'danger', text: message }).root
+      );
     }
     this._notifications?.error?.(message, { category: 'analysis' });
     return true;
@@ -150,19 +160,21 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
    * @override
    */
   onHighlightChanged() {
+    // This mode recalculates by itself, so a highlight change re-runs it
+    // (deferred while the panel is hidden) instead of discarding the result
+    // the way the run-button forms do.
+    this._applyHighlightChangeWhenShown();
+  }
+
+  /**
+   * @override
+   */
+  _applyHighlightChange() {
     this._updatePageSelectorCounts();
 
     if (this._canRunAnalysis()) {
       this._scheduleUpdate();
     }
-  }
-
-  /**
-   * Override to use PageSelectorComponent's updateCounts method
-   * @override
-   */
-  _updatePageSelectorCounts() {
-    this._pageSelector?.updateCounts();
   }
 
   // ===========================================================================
@@ -172,7 +184,7 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
   /**
    * Get page requirements for gene signature
    * @static
-   * @returns {{ minPages: number, maxPages: number|null, description: string }}
+   * @returns {{ minPages: number, maxPages: number|null, description: string, geneExpression: true }}
    */
   static getRequirements() {
     return {
@@ -180,7 +192,8 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
       // when the global page selection is empty.
       minPages: 0,
       maxPages: null, // No limit
-      description: 'Select pages to analyze'
+      description: 'Select pages to analyze',
+      geneExpression: true
     };
   }
 
@@ -189,15 +202,7 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
    * @returns {string}
    */
   _getTitle() {
-    return 'Gene Signature Score';
-  }
-
-  /**
-   * Get the analysis description
-   * @returns {string}
-   */
-  _getDescription() {
-    return 'Compute and compare a gene signature score across pages.';
+    return 'Gene signature score';
   }
 
   /**
@@ -235,14 +240,14 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
     const carriedValues = this._captureFormControlValues();
     this._formContainer.innerHTML = '';
 
-    // Validate page requirements
-    const validation = this.validatePages(this._selectedPages);
+    // Validate requirements
+    const validation = this.validateRequirements(this._selectedPages);
 
     if (!validation.valid) {
-      const notice = document.createElement('div');
-      notice.className = 'analysis-notice';
-      notice.textContent = validation.error || this.getRequirementText();
-      this._formContainer.appendChild(notice);
+      this._formContainer.appendChild(createStatusLine({
+        tone: 'warning',
+        text: validation.error || this.getRequirementText()
+      }).root);
       return;
     }
 
@@ -270,15 +275,13 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
    * @param {HTMLElement} wrapper - Form wrapper element
    */
   _renderFormControls(wrapper) {
-    // Gene list input. The row comes from the shared factory, which binds the
-    // label to the textarea; the textarea's only accessible name used to be its
-    // placeholder, which vanishes as soon as anything is typed.
-    const geneListInput = createFormTextarea({
-      name: 'genes',
-      className: 'gene-list-input',
-      placeholder: 'Enter genes (comma-separated):\nCD3E, CD4, CD8A, FOXP3...',
-      rows: 4
-    });
+    // Gene list input, named by its visible label: a placeholder vanishes as
+    // soon as anything is typed.
+    const geneListInput = document.createElement('textarea');
+    geneListInput.name = 'genes';
+    geneListInput.className = 'obs-select gene-list-input';
+    geneListInput.placeholder = 'CD3E, CD4, CD8A, FOXP3…';
+    geneListInput.rows = 4;
     // Restore persisted gene list value
     if (this._savedGeneList) {
       geneListInput.value = this._savedGeneList;
@@ -288,39 +291,49 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
       this._savedGeneList = geneListInput.value;
       this._scheduleUpdate();
     });
-    wrapper.appendChild(createFormRow('Signature Genes:', geneListInput, {
-      className: 'gene-list-row'
+    wrapper.appendChild(createField({
+      label: 'Signature genes',
+      control: geneListInput,
+      tip: 'gene-signature-genes'
     }));
 
     // Page selector (matching Detailed and Correlation analysis modes)
     this._renderPageSelector(wrapper);
 
-    // Method selector
-    const methodSelect = createFormSelect('method', [
-      { value: 'mean', label: 'Mean expression', selected: true },
-      { value: 'sum', label: 'Sum expression' },
-      { value: 'median', label: 'Median expression' }
-    ]);
-    methodSelect.addEventListener('change', () => this._scheduleUpdate());
-    wrapper.appendChild(createFormRow('Scoring method:', methodSelect));
+    const scheduleUpdate = () => this._scheduleUpdate();
+    wrapper.appendChild(createSelectField({
+      label: 'Scoring method',
+      name: 'method',
+      tip: 'gene-signature-scoring',
+      options: [
+        { value: 'mean', label: 'Mean expression', selected: true },
+        { value: 'sum', label: 'Sum expression' },
+        { value: 'median', label: 'Median expression' }
+      ],
+      onChange: scheduleUpdate
+    }).root);
 
-    // Normalization
-    const normalizeSelect = createFormSelect('normalize', [
-      { value: 'none', label: 'None', selected: true },
-      { value: 'zscore', label: 'Z-score' },
-      { value: 'minmax', label: 'Min-Max (0-1)' }
-    ]);
-    normalizeSelect.addEventListener('change', () => this._scheduleUpdate());
-    wrapper.appendChild(createFormRow('Normalization:', normalizeSelect));
+    wrapper.appendChild(createSelectField({
+      label: 'Normalization',
+      name: 'normalize',
+      options: [
+        { value: 'none', label: 'None', selected: true },
+        { value: 'zscore', label: 'Z-score' },
+        { value: 'minmax', label: 'Min-Max (0-1)' }
+      ],
+      onChange: scheduleUpdate
+    }).root);
 
-    // Plot type
-    const plotTypeSelect = createFormSelect('plotType', [
-      { value: 'violinplot', label: 'Violin plot', selected: true },
-      { value: 'boxplot', label: 'Box plot' },
-      { value: 'histogram', label: 'Histogram' }
-    ]);
-    plotTypeSelect.addEventListener('change', () => this._scheduleUpdate());
-    wrapper.appendChild(createFormRow('Visualization:', plotTypeSelect));
+    wrapper.appendChild(createSelectField({
+      label: 'Visualization',
+      name: 'plotType',
+      options: [
+        { value: 'violinplot', label: 'Violin plot', selected: true },
+        { value: 'boxplot', label: 'Box plot' },
+        { value: 'histogram', label: 'Histogram' }
+      ],
+      onChange: scheduleUpdate
+    }).root);
   }
 
   /**
@@ -359,7 +372,7 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
         : undefined,
       includeDerivedPages: true,
       getCellCountForPageId: (pageId) => this.dataLayer.getCellCountForPageId(pageId),
-      label: 'Compare pages:'
+      label: 'Compare pages'
     });
     this._selectedPages = this._pageSelector.getSelectedPages();
     this._currentConfig.pages = [...this._selectedPages];
@@ -404,6 +417,16 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
     if (!formValues.genes || formValues.genes.length === 0) {
       return { valid: false, error: 'Please enter at least one gene' };
     }
+    const seenGenes = new Set();
+    for (const gene of formValues.genes) {
+      if (seenGenes.has(gene)) {
+        return {
+          valid: false,
+          error: `Gene "${gene}" is listed more than once; list each gene once`
+        };
+      }
+      seenGenes.add(gene);
+    }
     if (!['mean', 'sum', 'median'].includes(formValues.method)) {
       return { valid: false, error: 'Select mean, sum, or median signature scoring' };
     }
@@ -445,25 +468,32 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
 
     // Apply normalization if requested
     if (formValues.normalize !== 'none') {
-      this._normalizeResults(signatureResults, formValues.normalize);
+      await this._normalizeResults(signatureResults, formValues.normalize);
+      if (requestId !== null && !this._isCurrentAnalysisRequest(requestId)) return null;
     }
+
+    const data = signatureResults.map(sr => ({
+      pageId: sr.pageId,
+      pageName: sr.pageName,
+      // Keep raw scores to avoid duplicating large arrays; plots/stats filter as needed.
+      values: sr.scores,
+      variableInfo: { name: 'Signature Score', kind: 'continuous' }
+    }));
+    // The summary and tests the expanded view shows, computed by the analysis
+    // workers for large pages so that drawing the view only reads them.
+    await preparePageStatistics(data, 'continuous_obs');
+    if (requestId !== null && !this._isCurrentAnalysisRequest(requestId)) return null;
 
     // Format for visualization
     return {
       type: 'signature',
       plotType: formValues.plotType,
-      data: signatureResults.map(sr => ({
-        pageId: sr.pageId,
-        pageName: sr.pageName,
-        // Keep raw scores to avoid duplicating large arrays; plots/stats filter as needed.
-        values: sr.scores,
-        variableInfo: { name: 'Signature Score', kind: 'continuous' }
-      })),
+      data,
       options: {
         showPoints: 'outliers',
         showMean: true
       },
-      title: 'Gene Signature Score',
+      title: 'Gene signature score',
       subtitle: `${formValues.genes.length} genes: ${formValues.genes.slice(0, 5).join(', ')}${formValues.genes.length > 5 ? '...' : ''}`,
       metadata: {
         genes: formValues.genes,
@@ -483,7 +513,14 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
    * @param {string} method
    * @returns {Object[]}
    */
-  _normalizeResults(results, method) {
+  async _normalizeResults(results, method) {
+    // Every pass walks every score on this thread, so it hands the event loop
+    // back between slices of a large page.
+    const yieldIfSliceSpent = createSlicedYield();
+    const pause = async () => {
+      const pending = yieldIfSliceSpent();
+      if (pending !== undefined) await pending;
+    };
     if (method === 'zscore') {
       // Z-score normalization across all values (streaming; avoids huge temporary arrays)
       let count = 0;
@@ -493,6 +530,7 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
       for (const r of results) {
         const scores = r?.scores || [];
         for (let i = 0; i < scores.length; i++) {
+          if ((i & 0xffff) === 0xffff) await pause();
           const x = scores[i];
           if (!isFiniteNumber(x)) continue;
           count++;
@@ -510,6 +548,7 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
       for (const r of results) {
         const scores = r?.scores || [];
         for (let i = 0; i < scores.length; i++) {
+          if ((i & 0xffff) === 0xffff) await pause();
           const x = scores[i];
           scores[i] = isFiniteNumber(x) ? (x - meanVal) / denom : NaN;
         }
@@ -525,6 +564,7 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
       for (const r of results) {
         const scores = r?.scores || [];
         for (let i = 0; i < scores.length; i++) {
+          if ((i & 0xffff) === 0xffff) await pause();
           const x = scores[i];
           if (!isFiniteNumber(x)) continue;
           count++;
@@ -539,6 +579,7 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
       for (const r of results) {
         const scores = r?.scores || [];
         for (let i = 0; i < scores.length; i++) {
+          if ((i & 0xffff) === 0xffff) await pause();
           const x = scores[i];
           scores[i] = isFiniteNumber(x) ? (x - min) / range : NaN;
         }
@@ -581,7 +622,7 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
     const pageData = result?.data;
 
     if (!pageData || pageData.length === 0) {
-      container.innerHTML = '<p class="modal-stats-placeholder">Statistics not available</p>';
+      container.innerHTML = '<p class="empty-state">Statistics not available</p>';
       return;
     }
 
@@ -606,7 +647,7 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
       statsSection.className = 'modal-statistical-analysis';
 
       const statsTitle = document.createElement('h5');
-      statsTitle.textContent = 'Statistical Analysis';
+      statsTitle.textContent = 'Statistical analysis';
       statsSection.appendChild(statsTitle);
 
       const statsContainer = document.createElement('div');
@@ -616,20 +657,19 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
 
       container.appendChild(statsSection);
     } else if (pageData && pageData.length < 2) {
-      const help = document.createElement('div');
-      help.className = 'analysis-annotations-help';
-      help.textContent = 'Select at least 2 pages to see statistical comparisons.';
-      container.appendChild(help);
+      const empty = document.createElement('p');
+      empty.className = 'empty-state';
+      empty.textContent = 'Select 2+ pages for statistics.';
+      container.appendChild(empty);
     }
 
     // Gene list section
     if (genes && genes.length > 0) {
       const geneSection = document.createElement('div');
       geneSection.className = 'modal-gene-section';
-      geneSection.style.marginTop = '1rem';
 
       const geneTitle = document.createElement('h5');
-      geneTitle.textContent = `Genes in Signature (${genes.length})`;
+      geneTitle.textContent = `Genes in signature (${formatCount(genes.length)})`;
       geneSection.appendChild(geneTitle);
 
       const chips = document.createElement('div');
@@ -649,7 +689,7 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
     }
 
     if (container.innerHTML === '') {
-      container.innerHTML = '<p class="modal-annotations-placeholder">No annotations available</p>';
+      container.innerHTML = '<p class="empty-state">No annotations available</p>';
     }
   }
 
@@ -826,5 +866,3 @@ export function createGeneSignatureUI(options) {
   ui.init(options.container);
   return ui;
 }
-
-export default GeneSignatureUI;

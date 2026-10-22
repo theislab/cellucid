@@ -741,6 +741,36 @@ export function planBrowserBatchPorts(
   return Object.freeze(plan);
 }
 
+/**
+ * A Windows batch that fails on a loopback network error
+ * (`ERR_NO_BUFFER_SPACE` loading a module) has run out of a host resource,
+ * and the job-level evidence step runs only minutes later, after every
+ * batch, when the sockets of the failing one have drained. Print the picture
+ * now: sockets per TCP state, the dynamic port range and free memory. On
+ * other hosts the job-level step is enough.
+ */
+function recordHostStateAfterFailure(environment) {
+  const windows = environment.RUNNER_OS === undefined
+    ? process.platform === 'win32'
+    : environment.RUNNER_OS === 'Windows';
+  if (!windows) return;
+  const snapshot = spawnSync(
+    'powershell',
+    [
+      '-NoProfile',
+      '-Command',
+      "netstat -ano -p tcp | Select-Object -Skip 4 | ForEach-Object { ($_ -split '\\s+')[4] } | Group-Object | Sort-Object Count -Descending | ForEach-Object { \"$($_.Name) $($_.Count)\" }; netsh int ipv4 show dynamicport tcp; Get-CimInstance Win32_OperatingSystem | ForEach-Object { \"FreePhysicalMemoryKB $($_.FreePhysicalMemory) FreeVirtualMemoryKB $($_.FreeVirtualMemory)\" }",
+    ],
+    { encoding: 'utf8', timeout: 30_000 },
+  );
+  const text = [snapshot.stdout, snapshot.stderr]
+    .filter(value => typeof value === 'string' && value.trim() !== '')
+    .join('\n');
+  console.log(
+    `[bounded] host state right after the failed batch:\n${text || '(unavailable)'}`,
+  );
+}
+
 function runBatch(project, files, ports, headed, environment) {
   const childEnvironment = {
     ...environmentWithoutForcedColour(environment),
@@ -813,6 +843,7 @@ export function runBoundedBrowserShard(
         files: batch.files,
         termination: result.error?.message ?? result.signal ?? result.status,
       });
+      recordHostStateAfterFailure(environment);
     }
   });
 

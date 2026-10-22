@@ -27,7 +27,7 @@ import {
   buildReferenceGridModel,
   drawCanvasReferenceGrid,
   renderSvgReferenceGrid,
-  resolveReferenceGridSurfaceRgb,
+  resolveReferenceGridSurface,
 } from '../assets/js/app/ui/modules/figure-export/components/reference-grid.js';
 import {
   assertReferenceGridAppearance,
@@ -42,7 +42,6 @@ import {
 } from '../assets/js/app/ui/modules/figure-export/utils/overlay-fidelity.js';
 import {
   applyFogAlpha,
-  applyFogChannel,
   createFogEvaluator,
 } from '../assets/js/app/ui/modules/figure-export/utils/fog.js';
 import {
@@ -171,6 +170,20 @@ function cameraRenderState(eye, overrides = {}) {
   const mvp = multiplyMat4(multiplyMat4(projection, view), model);
   return {
     antialias: true,
+    backdrop: {
+      centerY: 0,
+      extentX: 1,
+      extentY: 1,
+      extentZ: 1,
+      flat: false,
+      floorY: -1.12,
+      glowCenterX: 0,
+      look: null,
+      pixelRatio: 1,
+      planarity: 0,
+      stageX: 0,
+      stageZ: 0,
+    },
     bgColor: Float32Array.from([0.965, 0.965, 0.970]),
     cameraDistance: Math.hypot(eye[0], eye[1], eye[2]),
     cameraPosition: [...eye],
@@ -230,7 +243,7 @@ function gridModel({ appearance = LIGHT_GRID, renderState = lookDownZRenderState
     renderState,
     plotRect: PLOT_RECT,
     crop: null,
-    surfaceRgb: resolveReferenceGridSurfaceRgb({
+    surface: resolveReferenceGridSurface({
       appearance,
       background: 'viewer',
       backgroundColor: '#f6f6f7',
@@ -243,7 +256,7 @@ function gridModel({ appearance = LIGHT_GRID, renderState = lookDownZRenderState
 // ---------------------------------------------------------------------------
 
 test('the viewer background is read from the control that owns it', () => {
-  for (const value of ['grid', 'grid-dark', 'white', 'black']) {
+  for (const value of ['white', 'grid', 'grid-dark', 'studio', 'studio-dark', 'black']) {
     assert.equal(
       readActiveViewerBackground(documentWith({ 'background-select': { value } })),
       value
@@ -257,9 +270,16 @@ test('the viewer background is read from the control that owns it', () => {
   assert.equal(readActiveViewerBackground(null), null);
 });
 
-test('only the two grid backgrounds publish a reference grid', () => {
-  assert.notEqual(LIGHT_GRID, null);
-  assert.notEqual(DARK_GRID, null);
+test('only the grid and studio backgrounds publish a reference layer', () => {
+  assert.equal(LIGHT_GRID.kind, 'grid');
+  assert.equal(DARK_GRID.kind, 'grid');
+  for (const value of ['studio', 'studio-dark']) {
+    const appearance = readActiveReferenceGridAppearance(
+      documentWith({ 'background-select': { value } })
+    );
+    assert.equal(appearance.kind, 'studio');
+    assert.equal(appearance.mode, value);
+  }
   for (const value of ['white', 'black']) {
     assert.equal(
       readActiveReferenceGridAppearance(
@@ -279,7 +299,7 @@ test('an unreadable background blocks instead of guessing whether a grid exists'
     const warnings = buildViewerBackgroundFidelityWarnings(documentRef);
     assert.equal(warnings.length, 1);
     assert.match(warnings[0].title, /Active viewer background unavailable/);
-    assert.match(warnings[0].detail, /reference grid/i);
+    assert.match(warnings[0].detail, /reference layer/i);
   }
   assert.deepEqual(
     buildViewerBackgroundFidelityWarnings(
@@ -503,7 +523,7 @@ test('the dark grid is lighter than its background and the light grid darker', (
     renderState: darkState,
     plotRect: PLOT_RECT,
     crop: null,
-    surfaceRgb: resolveReferenceGridSurfaceRgb({
+    surface: resolveReferenceGridSurface({
       appearance: DARK_GRID,
       background: 'viewer',
       backgroundColor: '#141719',
@@ -521,7 +541,7 @@ test('a light viewer grid is not exported as the dark one', () => {
       renderState: lookDownZRenderState(),
       plotRect: PLOT_RECT,
       crop: null,
-      surfaceRgb: resolveReferenceGridSurfaceRgb({
+      surface: resolveReferenceGridSurface({
         appearance: DARK_GRID,
         background: 'viewer',
         backgroundColor: '#141719',
@@ -544,7 +564,7 @@ test('the grid honours a framing crop and takes raw crop input', () => {
     renderState: lookDownZRenderState(),
     plotRect: PLOT_RECT,
     crop,
-    surfaceRgb: [1, 1, 1],
+    surface: { rgb: [1, 1, 1], viewerPaper: false },
   });
   assert.notEqual(framed, null);
   // A half-size crop fills the same plot rect, so every rule is twice as wide.
@@ -557,7 +577,7 @@ test('the grid honours a framing crop and takes raw crop input', () => {
       renderState: lookDownZRenderState(),
       plotRect: PLOT_RECT,
       crop: { x: 0.25, y: 0.25, width: 0.5, height: 0.5 },
-      surfaceRgb: [1, 1, 1],
+      surface: { rgb: [1, 1, 1], viewerPaper: false },
     }),
     /must contain exactly/
   );
@@ -565,23 +585,31 @@ test('the grid honours a framing crop and takes raw crop input', () => {
 
 test('a transparent figure composites the rules over the viewer background', () => {
   assert.deepEqual(
-    resolveReferenceGridSurfaceRgb({
+    resolveReferenceGridSurface({
       appearance: LIGHT_GRID,
       background: 'transparent',
       backgroundColor: '#ffffff',
     }),
-    [0.965, 0.965, 0.970]
+    { rgb: [0.965, 0.965, 0.970], viewerPaper: false }
   );
   assert.deepEqual(
-    resolveReferenceGridSurfaceRgb({
+    resolveReferenceGridSurface({
       appearance: LIGHT_GRID,
       background: 'white',
       backgroundColor: '#ffffff',
     }),
-    [1, 1, 1]
+    { rgb: [1, 1, 1], viewerPaper: false }
   );
   assert.equal(
-    resolveReferenceGridSurfaceRgb({
+    resolveReferenceGridSurface({
+      appearance: LIGHT_GRID,
+      background: 'viewer',
+      backgroundColor: '#f6f6f7',
+    }).viewerPaper,
+    true
+  );
+  assert.equal(
+    resolveReferenceGridSurface({
       appearance: null,
       background: 'white',
       backgroundColor: '#ffffff',
@@ -596,7 +624,7 @@ test('a transparent figure composites the rules over the viewer background', () 
 
 test('SVG and Canvas2D emit the identical set of rules', () => {
   const model = gridModel();
-  const svg = renderSvgReferenceGrid(model);
+  const svg = renderSvgReferenceGrid(model, 'reference_layer');
   const lines = [...svg.matchAll(
     /<line x1="([-\d.]+)" y1="([-\d.]+)" x2="([-\d.]+)" y2="([-\d.]+)" stroke="(#[0-9a-f]{6})" stroke-width="([\d.]+)"\/>/g
   )];
@@ -619,7 +647,7 @@ test('SVG and Canvas2D emit the identical set of rules', () => {
     assert.equal(Number(lines[i][6]), Number(segment.widthPx.toFixed(3)));
   }
 
-  assert.equal(renderSvgReferenceGrid(null), '');
+  assert.equal(renderSvgReferenceGrid(null, 'reference_layer'), '');
   const empty = recordingLineContext();
   drawCanvasReferenceGrid({ ctx: empty.ctx, model: null });
   assert.equal(empty.record.strokes.length, 0);
@@ -648,7 +676,7 @@ function gridPayload({ referenceGrid, strategy = 'full-vector', background = 'vi
       pointCount: 2,
       // One point close to the camera, one far behind it inside the fog span.
       positions: Float32Array.from([0, 0, 1.5, 0, 0, -1.5]),
-      transparency: Float32Array.from([1, 1]),
+      transparency: Uint8Array.from([1, 1]),
     },
     id: 'live',
     label: 'Live',
@@ -662,6 +690,7 @@ function gridPayload({ referenceGrid, strategy = 'full-vector', background = 'vi
       geometryGeneration: 5,
       legendModel: null,
       lodMembership: null,
+      drawOrder: null,
       lodSizeMultiplier: 1,
       normTransform: { center: [0, 0, 0], scale: 1 },
     },
@@ -768,12 +797,12 @@ test('the payload contract accepts only appearances the viewer publishes', () =>
   ]) {
     assert.throws(
       () => assertReferenceGridAppearance(invalid, 'ctx'),
-      /published viewer reference-grid appearance/
+      /published viewer reference-layer appearance/
     );
   }
   assert.throws(
     () => assertFigureExportPayload(gridPayload({ referenceGrid: { mode: 'grid' } })),
-    /published viewer reference-grid appearance/
+    /published viewer reference-layer appearance/
   );
 });
 
@@ -782,17 +811,18 @@ test('the payload contract accepts only appearances the viewer publishes', () =>
 // ---------------------------------------------------------------------------
 
 test('the fog evaluator reproduces the shader formula', async () => {
+  const fogSource = await readRepoFile(
+    'assets/js/rendering/shaders/fog-shaders.js'
+  );
   const shaderSource = await readRepoFile(
     'assets/js/rendering/shaders/high-perf-shaders.js'
   );
-  assert.match(shaderSource, /float fogSpan = max\(u_fogFar - u_fogNear, 0\.0001\);/);
-  assert.match(
-    shaderSource,
-    /float normalizedDistance = max\(v_viewDistance - u_fogNear, 0\.0\) \/ fogSpan;/
-  );
-  assert.match(shaderSource, /float extinction = u_fogDensity \* u_fogDensity \* 0\.6;/);
-  assert.match(shaderSource, /float transmittance = exp\(-extinction \* normalizedDistance\);/);
-  assert.match(shaderSource, /float alpha = \(0\.1 \+ 0\.9 \* transmittance\) \* v_alpha;/);
+  // One model, evaluated once per point in HP_VS_FULL.
+  assert.match(fogSource, /return exp2\(-u_fogScale \* max\(viewDistance - u_fogNear, 0\.0\)\);/);
+  assert.match(fogSource, /return transmittance \* \(0\.1 \+ 0\.9 \* transmittance\);/);
+  assert.match(shaderSource, /v_fogT = fogTransmittance\(length\(eyePos\.xyz\)\);/);
+  assert.match(shaderSource, /v_fogOpacity = fogOpacity\(v_fogT\);/);
+  assert.match(shaderSource, /fragColor = vec4\(shadedColor, v_alpha \* v_fogOpacity\);/);
 
   const fog = createFogEvaluator(lookDownZRenderState());
   assert.notEqual(fog, null);
@@ -806,10 +836,13 @@ test('the fog evaluator reproduces the shader formula', async () => {
   assert.ok(Math.abs(fog.transmittanceAt(0, 0, -1.5) - far) < 1e-6);
   assert.ok(far < near, 'the farther point must be more attenuated');
 
+  // Over a backdrop of the fog colour the opacity law draws exactly what the
+  // colour-mixing law drew: a T c + (1 - a T) bg with a = 0.1 + 0.9 T.
+  for (const t of [0, 0.3, 0.75, 1]) {
+    assert.ok(Math.abs(applyFogAlpha(t, 0.8) - (0.1 + 0.9 * t) * t * 0.8) < 1e-12);
+  }
   assert.equal(applyFogAlpha(1, 0.8), 0.8);
-  assert.ok(Math.abs(applyFogAlpha(0, 0.8) - 0.08) < 1e-12);
-  assert.equal(applyFogChannel(200, 100, 1), 100);
-  assert.equal(applyFogChannel(200, 100, 0), 200);
+  assert.equal(applyFogAlpha(0, 0.8), 0);
 });
 
 test('shader qualities without fog get no fog', () => {
@@ -823,6 +856,20 @@ test('shader qualities without fog get no fog', () => {
   assert.equal(createFogEvaluator(null), null);
 });
 
+test('sculpted points take the fog colour but stay opaque', () => {
+  // HP_FS_SCULPTED fades the colour toward the fog colour and never thins the
+  // point; `full` does both. The vector strategies must follow each.
+  const sculpted = createFogEvaluator(lookDownZRenderState({ shaderQuality: 'sculpted' }));
+  const full = createFogEvaluator(lookDownZRenderState({ shaderQuality: 'full' }));
+  assert.notEqual(sculpted, null);
+  assert.equal(sculpted.fadesAlpha, false);
+  assert.equal(full.fadesAlpha, true);
+  assert.equal(
+    sculpted.transmittanceAt(0, 0, -1.5),
+    full.transmittanceAt(0, 0, -1.5)
+  );
+});
+
 test('full-vector SVG fades distant points exactly as the viewer does', async () => {
   const payload = gridPayload({ referenceGrid: null, strategy: 'full-vector' });
   const svg = await new Response(
@@ -833,28 +880,22 @@ test('full-vector SVG fades distant points exactly as the viewer does', async ()
   )];
   assert.equal(circles.length, 2, 'both points are drawn');
 
+  // Fog thins a circle toward the paper; its colour is its own.
   const fog = createFogEvaluator(lookDownZRenderState());
   const expected = [
     { z: 1.5, rgb: [220, 30, 30] },
     { z: -1.5, rgb: [30, 30, 220] },
-  ].map(({ z, rgb }) => {
-    const t = fog.transmittanceAt(0, 0, z);
-    return {
-      rgb: rgb.map((channel) => applyFogChannel(
-        Math.round(0.965 * 255),
-        channel,
-        t
-      )),
-      alpha: applyFogAlpha(t, 1),
-    };
-  });
+  ].map(({ z, rgb }) => ({
+    rgb,
+    alpha: applyFogAlpha(fog.transmittanceAt(0, 0, z), 1),
+  }));
 
   const drawn = circles.map((match) => ({
     rgb: [Number(match[1]), Number(match[2]), Number(match[3])],
     alpha: match[4] === undefined ? 1 : Number(match[4]),
   }));
 
-  // Before the fix both circles carried their raw colour at full opacity.
+  // Before fog was reproduced both circles were drawn at full opacity.
   for (const point of expected) {
     const hit = drawn.find(
       (candidate) =>
@@ -863,9 +904,8 @@ test('full-vector SVG fades distant points exactly as the viewer does', async ()
     );
     assert.ok(hit, `no circle matched fogged ${JSON.stringify(point)}`);
   }
-  assert.notDeepEqual(drawn[0].rgb, [220, 30, 30]);
-  assert.notDeepEqual(drawn[1].rgb, [30, 30, 220]);
   assert.ok(drawn.every((point) => point.alpha < 1));
+  assert.ok(drawn[0].alpha !== drawn[1].alpha, 'the farther circle is fainter');
 });
 
 test('optimized-vector SVG carries the same fog as full-vector', async () => {
@@ -875,15 +915,14 @@ test('optimized-vector SVG carries the same fog as full-vector', async () => {
         payload: gridPayload({ referenceGrid: null, strategy }),
       })
     ).text();
-    return [...svg.matchAll(/fill="rgb\((\d+),(\d+),(\d+)\)"/g)]
-      .map((m) => `${m[1]},${m[2]},${m[3]}`)
+    return [...svg.matchAll(/fill="rgb\((\d+),(\d+),(\d+)\)"(?: fill-opacity="([\d.]+)")?/g)]
+      .map((m) => `${m[1]},${m[2]},${m[3]}@${m[4] ?? '1'}`)
       .sort();
   };
   const optimized = await read('optimized-vector');
   assert.deepEqual(optimized, await read('full-vector'));
-  // Both strategies used to emit the source colours untouched.
-  assert.equal(optimized.includes('220,30,30'), false);
-  assert.equal(optimized.includes('30,30,220'), false);
+  // Both strategies used to emit the source colours at full opacity.
+  assert.equal(optimized.some((entry) => entry.endsWith('@1')), false);
 });
 
 test('the PNG renderer draws the same reference grid the SVG does', async () => {
@@ -895,7 +934,7 @@ test('the PNG renderer draws the same reference grid the SVG does', async () => 
   );
   for (const source of [png, svg]) {
     assert.match(source, /buildReferenceGridModel\(\{/);
-    assert.match(source, /resolveReferenceGridSurfaceRgb\(\{/);
+    assert.match(source, /resolveReferenceGridSurface\(\{/);
     assert.match(source, /appearance: referenceGrid,/);
     // Single view and every panel of a grid export, both formats.
     assert.equal(
@@ -908,20 +947,18 @@ test('the PNG renderer draws the same reference grid the SVG does', async () => 
 });
 
 test('a white figure fogs toward the paper, not the viewer background', async () => {
+  // Fog is opacity, so whatever the paper is, a fogged circle fades into it:
+  // the circle keeps its own colour and carries the fog in fill-opacity.
   const svg = await new Response(
     await renderFigureToSvgBlob({
       payload: gridPayload({ referenceGrid: null, background: 'white' }),
     })
   ).text();
   const fog = createFogEvaluator(lookDownZRenderState());
-  const t = fog.transmittanceAt(0, 0, -1.5);
-  const expected = [30, 30, 220].map(
-    (channel) => applyFogChannel(255, channel, t)
-  );
-  assert.match(
-    svg,
-    new RegExp(`fill="rgb\\(${expected[0]},${expected[1]},${expected[2]}\\)"`)
-  );
+  const alpha = applyFogAlpha(fog.transmittanceAt(0, 0, -1.5), 1);
+  const match = svg.match(/fill="rgb\(30,30,220\)" fill-opacity="([\d.]+)"/);
+  assert.ok(match, 'the far circle keeps its colour');
+  assert.ok(Math.abs(Number(match[1]) - alpha) < 0.001);
 });
 
 // ---------------------------------------------------------------------------

@@ -17,11 +17,13 @@ import {
 import { isCameraPathReady } from './keyframe-store.js';
 import { readCameraBooleanOption } from '../camera-input-contract.js';
 import { parseIntegerInput } from '../../core/numeric-input-contract.js';
+import { coalesceToFrame } from '../../components/controls.js';
 
 /* Idle time before the bar fades out. Long enough to survive a pause while
    composing a keyframe in the sidebar; playback additionally suppresses the
-   hide entirely (see hide()). */
-const HIDE_DELAY = 10000; // ms
+   hide entirely (see hide()). Exported so the browser contract that straddles
+   this deadline derives its windows from the product value. */
+export const TRANSPORT_BAR_HIDE_DELAY_MS = 10_000;
 
 // SVG icon helpers (matches the feather-style 2 px stroke used elsewhere)
 const ICON_PLAY = `<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" stroke="none"><polygon points="8,5 19,12 8,19"/></svg>`;
@@ -72,6 +74,7 @@ export function createTransportBar({ playbackController, keyframeStore, getInter
   let hideTimeout = null;
   let isPointerOverBar = false;
   let isScrubbing = false;
+  let seekFrame = null;
   let isVisible = false;
   let wasPlayingBeforeScrub = false;
   let sidebarObserver = null;
@@ -90,8 +93,8 @@ export function createTransportBar({ playbackController, keyframeStore, getInter
     barEl.setAttribute('aria-label', 'Camera path playback');
     barEl.innerHTML = `
       <div class="cinematic-transport-inner">
-        <button class="cinematic-transport-btn" data-action="stop" title="Stop (reset to start)">${ICON_STOP}</button>
-        <button class="cinematic-transport-btn cinematic-play-btn" data-action="play" title="Play / Pause">${ICON_PLAY}</button>
+        <button type="button" class="cinematic-transport-btn" data-action="stop" aria-label="Stop and return to the start" title="Stop and return to the start">${ICON_STOP}</button>
+        <button type="button" class="cinematic-transport-btn cinematic-play-btn" data-action="play" aria-label="Play" title="Play">${ICON_PLAY}</button>
         <div class="cinematic-timeline-container">
           <div class="cinematic-timeline-track">
             <div class="cinematic-timeline-progress"></div>
@@ -154,18 +157,23 @@ export function createTransportBar({ playbackController, keyframeStore, getInter
       if (wasPlayingBeforeScrub) playbackController.pause();
     });
 
+    // A drag fires several `input` events per frame and a seek moves the
+    // camera, so the seeks are coalesced to one per frame with the latest
+    // position.
+    seekFrame = coalesceToFrame(globalT => playbackController.seekTo(globalT));
     scrubberEl.addEventListener('input', () => {
       const globalT = parseIntegerInput(scrubberEl.value, {
         minimum: 0,
         maximum: 1000,
         label: 'Camera path timeline position'
       }) / 1000;
-      playbackController.seekTo(globalT);
+      seekFrame(globalT);
     });
 
     const endScrub = (event) => {
       if (!isScrubbing) return;
       isScrubbing = false;
+      seekFrame?.flush();
       if (scrubberEl.hasPointerCapture(event.pointerId)) {
         scrubberEl.releasePointerCapture(event.pointerId);
       }
@@ -271,7 +279,7 @@ export function createTransportBar({ playbackController, keyframeStore, getInter
     // there is. Clearing the timer on mouseenter alone is not enough: the
     // mousemove that lands the pointer on the bar re-arms it immediately.
     if (isPointerOverBar) return;
-    hideTimeout = setTimeout(() => hide({ force: false }), HIDE_DELAY);
+    hideTimeout = setTimeout(() => hide({ force: false }), TRANSPORT_BAR_HIDE_DELAY_MS);
   }
 
   function onMouseActivity() {
@@ -382,11 +390,13 @@ export function createTransportBar({ playbackController, keyframeStore, getInter
       }
       playBtn.innerHTML = ICON_PAUSE;
       playBtn.title = 'Pause';
+      playBtn.setAttribute('aria-label', 'Pause');
       show();
       clearTimeout(hideTimeout);
     } else {
       playBtn.innerHTML = ICON_PLAY;
       playBtn.title = 'Play';
+      playBtn.setAttribute('aria-label', 'Play');
       if (playbackState === 'STOPPED') {
         updateProgress(0);
         updateTimeReadout(0, 0);
@@ -404,6 +414,8 @@ export function createTransportBar({ playbackController, keyframeStore, getInter
 
   function unmount() {
     clearTimeout(hideTimeout);
+    seekFrame?.cancel();
+    seekFrame = null;
     document.removeEventListener('mousemove', onMouseActivity);
     document.removeEventListener('pointerdown', onMouseActivity);
     document.removeEventListener('keydown', onKeyboardActivity);

@@ -1,4 +1,11 @@
-/** Google Analytics bootstrap for the declared production hosts. */
+/**
+ * Google Analytics bootstrap for the declared production hosts.
+ *
+ * The one automatic `page_view` reports origin and path only. The query string
+ * names what the page opens (`dataset`, `remote`, `github`, `exportsBaseUrl`)
+ * and can carry a private server address, so it is never part of
+ * `page_location`. Every other event is declared in `analytics/schema.js`.
+ */
 (() => {
   const MEASUREMENT_ID = 'G-K4774ZWGEQ';
   const PRODUCTION_HOSTS = new Set([
@@ -29,8 +36,7 @@
   };
   window.gtag('js', new Date());
   window.gtag('config', MEASUREMENT_ID, {
-    anonymize_ip: true,
-    transport_type: 'beacon',
+    page_location: `${window.location.origin}${window.location.pathname}`,
   });
 
   const script = document.createElement('script');

@@ -11,14 +11,12 @@ import {
 } from '../assets/js/app/ui/modules/figure-export/utils/density-reducer.js';
 import {
   assertLodMembership,
+  drawnSequence,
   matchesLodMembershipPresentation,
 } from '../assets/js/app/ui/modules/figure-export/utils/lod-membership.js';
 import {
   forEachProjectedPoint,
 } from '../assets/js/app/ui/modules/figure-export/utils/point-projector.js';
-import {
-  getLodMembership,
-} from '../assets/js/app/ui/modules/figure-export/utils/point-size.js';
 import {
   rasterizePointsWebgl,
 } from '../assets/js/app/ui/modules/figure-export/utils/webgl-point-rasterizer.js';
@@ -227,39 +225,16 @@ test('figure-export validates one exact frozen LOD membership owner', () => {
   );
 });
 
-test('point-size accessor preserves descriptor identity and exact view ownership', () => {
-  const membership = createMembership();
-  const calls = [];
-  const viewer = {
-    getCurrentLodMembership(viewId, dimensionLevel) {
-      calls.push([viewId, dimensionLevel]);
-      return membership;
-    },
-  };
-
-  assert.equal(
-    getLodMembership({ viewer, viewId: 7, dimensionLevel: 2 }),
-    membership
-  );
-  assert.deepEqual(calls, [['7', 2]]);
-  assert.throws(
-    () => getLodMembership({
-      viewer: {},
-      viewId: 'live',
-      dimensionLevel: 2,
-    }),
-    /requires viewer\.getCurrentLodMembership/
-  );
-});
-
 test('projection admits source points at or below the active LOD level', () => {
   const membership = createMembership();
   for (const sortByDepth of [false, true]) {
     const indices = [];
     const result = forEachProjectedPoint({
       positions: POSITIONS,
+      dimension: 3,
       colors: COLORS,
       lodMembership: membership,
+      drawOrder: null,
       renderState: renderState(),
       plotRect: { x: 0, y: 0, width: 100, height: 100 },
       sortByDepth,
@@ -275,8 +250,10 @@ test('projection admits source points at or below the active LOD level', () => {
   const fullDetailIndices = [];
   forEachProjectedPoint({
     positions: POSITIONS,
+    dimension: 3,
     colors: COLORS,
     lodMembership: null,
+    drawOrder: null,
     renderState: renderState(),
     plotRect: { x: 0, y: 0, width: 100, height: 100 },
     onPoint(_x, _y, _r, _g, _b, _a, _radius, index) {
@@ -299,6 +276,7 @@ test('depth-sorted projection packs only in-crop points before assigning bins', 
 
   const result = forEachProjectedPoint({
     positions,
+    dimension: 3,
     colors,
     renderState: renderState(),
     plotRect: { x: 0, y: 0, width: 100, height: 100 },
@@ -329,8 +307,10 @@ test('density reduction and coordinate bounds share exact LOD admission semantic
   const membership = createMembership();
   const reduced = reducePointsByDensity({
     positions: POSITIONS,
+    dimension: 3,
     colors: COLORS,
     lodMembership: membership,
+    drawOrder: null,
     renderState: renderState(),
     targetCount: 100,
     gridSize: 32,
@@ -340,7 +320,9 @@ test('density reduction and coordinate bounds share exact LOD admission semantic
 
   const realBounds = computeVisibleRealBounds({
     positions: POSITIONS,
+    dimension: 3,
     lodMembership: membership,
+    drawOrder: null,
     mvpMatrix: IDENTITY_MATRIX,
     viewportWidth: 100,
     viewportHeight: 100,
@@ -355,7 +337,9 @@ test('density reduction and coordinate bounds share exact LOD admission semantic
 
   const cameraBounds = computeVisibleCameraBounds({
     positions: POSITIONS,
+    dimension: 3,
     lodMembership: membership,
+    drawOrder: null,
     mvpMatrix: IDENTITY_MATRIX,
     viewMatrix: IDENTITY_MATRIX,
     viewportWidth: 100,
@@ -365,8 +349,10 @@ test('density reduction and coordinate bounds share exact LOD admission semantic
 
   const fullDetail = reducePointsByDensity({
     positions: POSITIONS,
+    dimension: 3,
     colors: COLORS,
     lodMembership: null,
+    drawOrder: null,
     renderState: renderState(),
     targetCount: 100,
     gridSize: 32,
@@ -395,8 +381,10 @@ test('optimized reduction and coordinate bounds reject the full depth clip volum
     const projectedIndices = [];
     forEachProjectedPoint({
       positions,
+      dimension: 3,
       colors,
       lodMembership: membership,
+      drawOrder: null,
       renderState: renderState(),
       plotRect: { x: 0, y: 0, width: 100, height: 100 },
       sortByDepth,
@@ -409,8 +397,10 @@ test('optimized reduction and coordinate bounds reject the full depth clip volum
 
   const reduced = reducePointsByDensity({
     positions,
+    dimension: 3,
     colors,
     lodMembership: membership,
+    drawOrder: null,
     renderState: renderState(),
     targetCount: 10,
     gridSize: 32,
@@ -427,7 +417,9 @@ test('optimized reduction and coordinate bounds reject the full depth clip volum
   assert.deepEqual(
     computeVisibleRealBounds({
       positions,
+      dimension: 3,
       lodMembership: membership,
+      drawOrder: null,
       mvpMatrix: IDENTITY_MATRIX,
       viewportWidth: 100,
       viewportHeight: 100,
@@ -438,7 +430,9 @@ test('optimized reduction and coordinate bounds reject the full depth clip volum
   assert.deepEqual(
     computeVisibleCameraBounds({
       positions,
+      dimension: 3,
       lodMembership: membership,
+      drawOrder: null,
       mvpMatrix: IDENTITY_MATRIX,
       viewMatrix: IDENTITY_MATRIX,
       viewportWidth: 100,
@@ -465,6 +459,7 @@ test('density reduction apportions an exact deterministic 1000-point grid target
 
   const options = {
     positions,
+    dimension: 3,
     colors,
     renderState: renderState(),
     targetCount: 1000,
@@ -507,6 +502,7 @@ test('density reduction cannot sample away visible highlighted points', () => {
 
   const reduced = reducePointsByDensity({
     positions,
+    dimension: 3,
     colors,
     highlightArray,
     highlightedIndices,
@@ -543,6 +539,7 @@ test('highlight overflow uses one exact deterministic density-bounded budget', (
   }
   const options = {
     positions,
+    dimension: 3,
     colors,
     highlightArray,
     highlightedIndices: Array.from({ length: 20 }, (_, index) => index),
@@ -604,6 +601,7 @@ test('fast density preview preserves only renderer-visible sparse highlights out
 
   const reduced = reducePointsByDensity({
     positions,
+    dimension: 3,
     colors,
     transparency,
     lodMembership,
@@ -653,6 +651,7 @@ test('compact LOD preview never leaks an unadmitted sparse highlight', () => {
 
   const reduced = reducePointsByDensity({
     positions,
+    dimension: 3,
     colors,
     transparency,
     lodMembership,
@@ -711,8 +710,10 @@ test('reduced figure export consumes only the exact K-point prefix for large N',
   const projected = [];
   const projection = forEachProjectedPoint({
     positions,
+    dimension: 3,
     colors,
     lodMembership: membership,
+    drawOrder: null,
     renderState: renderState(),
     plotRect: { x: 0, y: 0, width: 100, height: 100 },
     onPoint(_x, _y, _r, _g, _b, _a, _radius, index) {
@@ -721,8 +722,10 @@ test('reduced figure export consumes only the exact K-point prefix for large N',
   });
   const reduced = reducePointsByDensity({
     positions,
+    dimension: 3,
     colors,
     lodMembership: membership,
+    drawOrder: null,
     renderState: renderState(),
     targetCount: 100,
     gridSize: 32,
@@ -759,18 +762,21 @@ test('WebGL packing compacts only the admitted prefix and borrows presented fog'
   assert.notEqual(start, -1);
   assert.notEqual(end, -1);
   const packBuffers = new Function(
+    'drawnSequence',
     `${rasterizerSource.slice(start, end)}
      return packBuffers;`
-  )();
+  )(drawnSequence);
 
   const membership = createMembership({
     admissionLevels: [0, 2, 1, 255],
   });
   const packed = packBuffers({
     positions: POSITIONS,
+    dimension: 3,
     colors: COLORS,
     transparency: null,
     lodMembership: membership,
+    drawOrder: null,
     highlightArray: null,
     emphasizeSelection: false,
     selectionMutedOpacity: 0.15,
@@ -795,9 +801,11 @@ test('WebGL packing compacts only the admitted prefix and borrows presented fog'
 
   const fullDetail = packBuffers({
     positions: POSITIONS,
+    dimension: 3,
     colors: COLORS,
     transparency: null,
     lodMembership: null,
+    drawOrder: null,
     highlightArray: null,
     emphasizeSelection: false,
     selectionMutedOpacity: 0.15,
@@ -813,7 +821,8 @@ test('WebGL packing compacts only the admitted prefix and borrows presented fog'
     150_000,
     largePointCount - 1,
   ]);
-  const largePositions = new Float32Array(largePointCount * 3);
+  // A 2D view: two position components per point.
+  const largePositions = new Float32Array(largePointCount * 2);
   const largeColors = new Uint8Array(largePointCount * 4);
   largeColors.fill(255);
   let positionReads = 0;
@@ -843,6 +852,7 @@ test('WebGL packing compacts only the admitted prefix and borrows presented fog'
   });
   const compact = packBuffers({
     positions: observedPositions,
+    dimension: 2,
     colors: observedColors,
     transparency: null,
     lodMembership: largeMembership,
@@ -852,7 +862,7 @@ test('WebGL packing compacts only the admitted prefix and borrows presented fog'
     alphaThreshold: 0.01,
   });
   assert.equal(compact.count, admittedIds.length);
-  assert.equal(positionReads, admittedIds.length * 3);
+  assert.equal(positionReads, admittedIds.length * 2);
   assert.equal(colorReads, admittedIds.length * 4);
 });
 
@@ -863,6 +873,7 @@ test('WebGL export rejects a descriptor from a different point generation', () =
   assert.throws(
     () => rasterizePointsWebgl({
       positions: Float32Array.from([0, 0, 0]),
+      dimension: 3,
       colors: Uint8Array.from([255, 255, 255, 255]),
       lodMembership: wrongGeneration,
       renderState: renderState(),
@@ -882,11 +893,17 @@ test('figure-export source has no dense LOD mask API or hot-loop conversion', as
     combined,
     /visibilityMask|getLodVisibilityMask|getLodVisibilityArray/
   );
-  assert.match(combined, /getCurrentLodMembership\(/);
   assert.ok(
-    (combined.match(/lodMembership\?\.indices/g) ?? []).length >= 6,
+    (combined.match(/lodMembership\?\.indices|drawnSequence\(lodMembership, drawOrder\)/g) ?? []).length >= 6,
     'all sequential exporter hot paths must consume the exact admitted prefix'
   );
+  // Every pass whose output depends on paint order draws the pane's order:
+  // the admitted prefix of a reduced level, else the full draw order.
+  for (const file of ['utils/webgl-point-rasterizer.js', 'utils/point-projector.js']) {
+    const source = await readFile(new URL(file, figureExportRoot), 'utf8');
+    assert.doesNotMatch(source, /lodMembership\?\.indices/, file);
+    assert.match(source, /drawnSequence\(lodMembership, drawOrder\)/, file);
+  }
   assert.doesNotMatch(
     combined,
     /const admissionLevels\s*=\s*lodMembership/,
@@ -913,7 +930,7 @@ test('preview invalidation stays scan-capped and only current ownership commits'
     'field:changed',
     'visibility:changed',
     'highlight:changed',
-    'dimension:changed',
+    'view:representation-changed',
     'view:changed',
     'page:changed',
   ]) {
@@ -979,4 +996,46 @@ test('preview invalidation stays scan-capped and only current ownership commits'
     builderSource,
     /visibleCount\s*>=\s*PREVIEW_AUTOBUILD_THRESHOLD/
   );
+});
+
+test('full detail packs points in the pane draw order, and a reduced level in its admitted prefix', async () => {
+  const rasterizerSource = await readFile(
+    new URL('utils/webgl-point-rasterizer.js', figureExportRoot),
+    'utf8'
+  );
+  const start = rasterizerSource.indexOf('function packBuffers(');
+  const end = rasterizerSource.indexOf('/**\n * Render a point cloud', start);
+  const packBuffers = new Function(
+    'drawnSequence',
+    `${rasterizerSource.slice(start, end)}
+     return packBuffers;`
+  )(drawnSequence);
+  const pack = (lodMembership, drawOrder) => packBuffers({
+    positions: POSITIONS,
+    dimension: 3,
+    colors: COLORS,
+    transparency: null,
+    lodMembership,
+    drawOrder,
+    highlightArray: null,
+    emphasizeSelection: false,
+    selectionMutedOpacity: 0.15,
+    alphaThreshold: 0.01,
+  });
+  const order = Uint32Array.from([3, 1, 0, 2]);
+  const fullDetail = pack(null, order);
+  const expected = [];
+  for (const index of order) expected.push(...POSITIONS.slice(index * 3, index * 3 + 3));
+  assert.deepEqual(Array.from(fullDetail.positions), expected);
+  // Source order without a draw order.
+  assert.deepEqual(Array.from(pack(null, null).positions), Array.from(POSITIONS));
+  // A reduced level draws its admitted prefix whatever the full order is.
+  const membership = createMembership({ admissionLevels: [0, 2, 1, 255] });
+  assert.deepEqual(
+    Array.from(pack(membership, order).positions),
+    Array.from(pack(membership, null).positions)
+  );
+  assert.equal(drawnSequence(null, null), null);
+  assert.equal(drawnSequence(null, order), order);
+  assert.equal(drawnSequence(membership, order), membership.indices);
 });

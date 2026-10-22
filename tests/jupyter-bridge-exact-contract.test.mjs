@@ -3,9 +3,11 @@ import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
 import {
+  JUPYTER_HEALTH_TIMEOUT_MS,
   JupyterBridgeDataSource,
   describeJupyterCommandFailure,
   describeJupyterCommandType,
+  encodeJupyterSelectionCells,
   getJupyterConfig,
   uploadJupyterSessionBundle,
 } from '../assets/js/data/jupyter-source.js';
@@ -13,12 +15,59 @@ import {
   getNotificationCenter,
 } from '../assets/js/app/notification-center.js';
 import {
-  createDataSourceManager,
+  DataSourceManager,
 } from '../assets/js/data/data-source-manager.js';
 import {
   createJupyterHealthMonitor,
   createJupyterPointerDelivery,
 } from '../assets/js/app/jupyter-pointer-delivery.js';
+
+// Every test here talks to a current notebook server, which answers
+// `/_cellucid/protocol` with the event and command lists below (the copy of
+// `cellucid.jupyter._wire` is pinned against the original further down).
+// Tests that exercise the protocol request itself set
+// `protocolFixture.passthrough` so their own fetch answers it.
+// The sibling cellucid-python checkout whose wire module the copies here are
+// pinned against: beside this repository, or CELLUCID_PYTHON_ROOT.
+const PYTHON_WIRE_PATH = process.env.CELLUCID_PYTHON_ROOT
+  ? new URL(`file://${process.env.CELLUCID_PYTHON_ROOT.replace(/\/$/, '')}/src/cellucid/jupyter/_wire.py`)
+  : new URL('../../cellucid-python/src/cellucid/jupyter/_wire.py', import.meta.url);
+
+const CURRENT_PROTOCOL = Object.freeze({
+  events: [
+    'click', 'command_error', 'data_mapping', 'debug_snapshot', 'hover',
+    'pong', 'ready', 'selection', 'session_bundle',
+  ],
+  commands: [
+    'clearHighlights', 'debug_snapshot', 'freeze', 'highlight', 'ping',
+    'requestSessionBundle', 'resetCamera', 'setColorBy', 'setDataMapping',
+    'setVisibility',
+  ],
+});
+const protocolFixture = { passthrough: false, document: CURRENT_PROTOCOL };
+const nativeFetch = globalThis.fetch;
+let assignedFetch = nativeFetch;
+function fixtureFetch(input, init) {
+  if (
+    !protocolFixture.passthrough &&
+    String(input).endsWith('/_cellucid/protocol')
+  ) {
+    return Promise.resolve(new Response(JSON.stringify(protocolFixture.document), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }));
+  }
+  return assignedFetch(input, init);
+}
+Object.defineProperty(globalThis, 'fetch', {
+  configurable: true,
+  get() {
+    return fixtureFetch;
+  },
+  set(value) {
+    assignedFetch = value === fixtureFetch ? nativeFetch : value;
+  },
+});
 
 function installWindow(search) {
   const href = `http://127.0.0.1:8765/viewer/${search}`;
@@ -221,6 +270,47 @@ test('Jupyter initialization validates both exact Python health variants', async
   }
 });
 
+test('a Jupyter health request that never answers fails within its deadline', async t => {
+  installWindow('?jupyter=true&viewerId=viewer-1&viewerToken=secret-1');
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  // The deadline is an ordinary timer, so mock time drives it exactly.
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  let fetchSignal = null;
+  globalThis.fetch = (_url, init) => {
+    fetchSignal = init.signal;
+    return new Promise((_resolve, reject) => {
+      init.signal.addEventListener('abort', () => reject(init.signal.reason), {
+        once: true,
+      });
+    });
+  };
+  const source = new JupyterBridgeDataSource();
+  let settled = false;
+  const initialization = source.initialize().finally(() => {
+    settled = true;
+  });
+  initialization.catch(() => {});
+  const turn = () => new Promise(resolve => setImmediate(resolve));
+  await turn();
+  assert.notEqual(fetchSignal, null, 'the health request must be in flight');
+
+  t.mock.timers.tick(JUPYTER_HEALTH_TIMEOUT_MS - 1);
+  await turn();
+  assert.equal(settled, false, 'the request may run until its deadline');
+
+  t.mock.timers.tick(1);
+  await assert.rejects(
+    initialization,
+    /did not answer http:\/\/127\.0\.0\.1:8765.*\/_cellucid\/health within 30 s/
+  );
+  assert.equal(JUPYTER_HEALTH_TIMEOUT_MS, 30_000);
+  assert.equal(fetchSignal.aborted, true);
+  assert.equal(source.isConnected(), false);
+});
+
 test('Jupyter events carry exact token routing and propagate HTTP failure', async t => {
   installWindow('?jupyter=true&viewerId=viewer-1&viewerToken=secret-1');
   const source = new JupyterBridgeDataSource();
@@ -241,25 +331,29 @@ test('Jupyter events carry exact token routing and propagate HTTP failure', asyn
     };
 
     await source._postEventToPython({
-      type: 'selection',
-      cells: [1, 2],
+      type: 'pong',
+      requestId: 'ping-1',
+      t: 7,
     });
     assert.equal(
       captured.url,
       'http://127.0.0.1:8765/viewer/_cellucid/events',
     );
     assert.deepEqual(JSON.parse(captured.init.body), {
-      type: 'selection',
-      cells: [1, 2],
+      type: 'pong',
+      requestId: 'ping-1',
+      t: 7,
       viewerId: 'viewer-1',
       viewerToken: 'secret-1',
     });
+    // keepalive bodies share one 64 KiB budget and are refused above it.
+    assert.equal(Object.hasOwn(captured.init, 'keepalive'), false);
   });
 
   await t.test('server rejection', async () => {
     globalThis.fetch = async () => new Response('denied', { status: 403 });
     await assert.rejects(
-      source._postEventToPython({ type: 'selection', cells: [] }),
+      source._postEventToPython({ type: 'pong', requestId: 'ping-1', t: 7 }),
       /Jupyter event delivery failed.*403/i,
     );
   });
@@ -713,9 +807,9 @@ test('Jupyter dataset listing publishes one complete exact generation', async ()
   );
   assert.equal(
     await source.resolveUrl(
-      'jupyter://viewer-1/current-ui-prepared/points_2d.bin',
+      'jupyter://viewer-1/current-ui-prepared/embeddings/0_2d.bin',
     ),
-    'http://127.0.0.1:8765/viewer/current-ui-prepared/points_2d.bin',
+    'http://127.0.0.1:8765/viewer/current-ui-prepared/embeddings/0_2d.bin',
   );
   assert.throws(
     () => source.getBaseUrl('undeclared'),
@@ -723,7 +817,7 @@ test('Jupyter dataset listing publishes one complete exact generation', async ()
   );
   await assert.rejects(
     source.resolveUrl(
-      'jupyter://other-viewer/current-ui-prepared/points_2d.bin',
+      'jupyter://other-viewer/current-ui-prepared/embeddings/0_2d.bin',
     ),
     /viewer id/i,
   );
@@ -1244,8 +1338,15 @@ test('Jupyter browser notifications publish only exact current payloads', async 
   source._config = getJupyterConfig();
   source._connected = true;
   const delivered = [];
-  globalThis.fetch = async (_url, init) => {
-    delivered.push(JSON.parse(init.body));
+  globalThis.fetch = async (url, init) => {
+    if (new URL(url).pathname.endsWith('/_cellucid/selection')) {
+      delivered.push({
+        type: 'selection',
+        cells: Array.from(decodeSelectionBody(init.body)),
+      });
+    } else {
+      delivered.push(JSON.parse(init.body));
+    }
     return new Response(
       JSON.stringify({ status: 'ok', delivered: true }),
       { status: 200 },
@@ -1289,6 +1390,164 @@ test('Jupyter browser notifications publish only exact current payloads', async 
   assert.equal(delivered.length, callsBeforeInvalid);
 });
 
+/** Read one `POST /_cellucid/selection` body the way Python does. */
+function decodeSelectionBody(body) {
+  assert.ok(body instanceof Uint8Array, 'the selection body must be bytes');
+  assert.equal(body.byteLength % 4, 0);
+  const view = new DataView(body.buffer, body.byteOffset, body.byteLength);
+  const cells = new Array(body.byteLength / 4);
+  for (let index = 0; index < cells.length; index++) {
+    cells[index] = view.getUint32(index * 4, true);
+  }
+  return cells;
+}
+
+test('a selection travels as exact little-endian uint32 bytes on its own route', async t => {
+  installWindow('?jupyter=true&viewerId=viewer-1&viewerToken=secret-1');
+  const source = new JupyterBridgeDataSource();
+  source._config = getJupyterConfig();
+  source._connected = true;
+  const requests = [];
+  globalThis.fetch = async (url, init) => {
+    requests.push({ url: new URL(url), init });
+    return new Response(
+      JSON.stringify({ status: 'ok', delivered: true }),
+      { status: 200, headers: { 'Content-Type': 'application/json' } },
+    );
+  };
+
+  await t.test('the wire form is pinned byte for byte', async () => {
+    requests.length = 0;
+    await source.notifySelection([42, 0, 10], 'lasso');
+    assert.equal(requests.length, 1);
+    const [{ url, init }] = requests;
+    assert.equal(url.origin + url.pathname, 'http://127.0.0.1:8765/viewer/_cellucid/selection');
+    assert.deepEqual([...url.searchParams.entries()], [
+      ['viewerId', 'viewer-1'],
+      ['viewerToken', 'secret-1'],
+      ['source', 'lasso'],
+    ]);
+    assert.equal(init.method, 'POST');
+    assert.deepEqual(init.headers, { 'Content-Type': 'application/octet-stream' });
+    assert.equal(Object.hasOwn(init, 'keepalive'), false);
+    assert.deepEqual(
+      Array.from(init.body),
+      [0, 0, 0, 0, 10, 0, 0, 0, 42, 0, 0, 0],
+    );
+  });
+
+  await t.test('a selection far above 64 KiB round-trips exactly', async () => {
+    // 1,000,000 cells: 4 MB as uint32, well past the 64 KiB keepalive budget
+    // and the 1 MiB JSON event limit that stopped selections before. The
+    // input is unordered; Python receives the same set, ascending.
+    const count = 1_000_000;
+    const cells = new Array(count);
+    for (let index = 0; index < count; index++) {
+      cells[index] = (index * 7_919) % 4_000_003;
+    }
+    cells[count - 1] = 0xFFFFFFFF;
+    requests.length = 0;
+    await source.notifySelection(cells, 'annotation');
+    const [{ init }] = requests;
+    assert.equal(init.body.byteLength, count * 4);
+    assert.ok(init.body.byteLength > 64 * 1024);
+    assert.equal(Object.hasOwn(init, 'keepalive'), false);
+    const expected = Float64Array.from(cells).sort();
+    const decoded = decodeSelectionBody(init.body);
+    assert.equal(decoded.length, expected.length);
+    for (let index = 0; index < decoded.length; index++) {
+      if (decoded[index] !== expected[index]) {
+        assert.fail(`cell ${index} decoded as ${decoded[index]}, expected ${expected[index]}`);
+      }
+    }
+  });
+
+  await t.test('invalid selections are refused before any request', async () => {
+    requests.length = 0;
+    const holey = [1, 2];
+    holey.length = 3;
+    for (const [cells, pattern] of [
+      [[], /at least one cell/],
+      [[3, 1, 3], /duplicate/],
+      [[1, -1], /\[1\] must be a non-negative integer/],
+      [[1, 1.5], /\[1\] must be a non-negative integer/],
+      [[1, '2'], /\[1\] must be a non-negative integer/],
+      [holey, /holes/],
+      [[0x1_0000_0000], /largest selectable cell index/],
+      [new Uint32Array([1, 2]), /must be an array/],
+    ]) {
+      await assert.rejects(source.notifySelection(cells, 'lasso'), pattern);
+    }
+    await assert.rejects(source.notifySelection([1], ''), /source/);
+    assert.equal(requests.length, 0);
+  });
+
+  await t.test('a refused delivery names its route and status', async () => {
+    globalThis.fetch = async () => new Response('Viewer is not registered', { status: 404 });
+    await assert.rejects(
+      source.notifySelection([1], 'lasso'),
+      /Jupyter selection delivery failed with HTTP 404/,
+    );
+  });
+});
+
+test('selection encoding and cell validation build no per-cell hash set', () => {
+  // A JavaScript Set or Map holds at most 2^24 entries, and a selection can
+  // exceed 16,777,216 cells; one of either on this path caps every selection.
+  const source = readFileSync(
+    new URL('../assets/js/data/jupyter-source.js', import.meta.url),
+    'utf8',
+  );
+  const notification = readFileSync(
+    new URL('../assets/js/app/ui/modules/highlight/selection-notification.js', import.meta.url),
+    'utf8',
+  );
+  const bodyOf = (text, signature) => {
+    const start = text.indexOf(signature);
+    assert.ok(start >= 0, `${signature} must exist`);
+    const end = text.indexOf('\n}\n', start);
+    return text.slice(start, end);
+  };
+  for (const body of [
+    bodyOf(source, 'export function encodeJupyterSelectionCells('),
+    bodyOf(source, 'function requireCellIndices('),
+    bodyOf(notification, 'function requireDelivery('),
+  ]) {
+    assert.doesNotMatch(body, /new (?:Set|Map)\b/);
+  }
+  assert.doesNotMatch(source, /keepalive\s*:/);
+
+  const many = new Array(17_000_000);
+  for (let index = 0; index < many.length; index++) many[index] = index;
+  const encoded = encodeJupyterSelectionCells(many);
+  assert.equal(encoded.byteLength, many.length * 4);
+  const view = new DataView(encoded.buffer);
+  assert.equal(view.getUint32((many.length - 1) * 4, true), many.length - 1);
+});
+
+test('the selection wire matches the Python reader', () => {
+  // Python reads the body in `cellucid.jupyter._wire` and serves the route in
+  // `cellucid._server_base`; both are pinned here when the sibling checkout
+  // is present.
+  let wireSource = null;
+  let serverSource = null;
+  try {
+    wireSource = readFileSync(PYTHON_WIRE_PATH, 'utf8');
+    serverSource = readFileSync(new URL('../_server_base.py', PYTHON_WIRE_PATH), 'utf8');
+  } catch (error) {
+    assert.equal(error.code, 'ENOENT');
+  }
+  if (wireSource === null || serverSource === null) return;
+  assert.match(wireSource, /^_SELECTION_CELL_DTYPE = np\.dtype\("<u4"\)$/m);
+  assert.match(wireSource, /np\.all\(cells\[1:\] > cells\[:-1\]\)/);
+  assert.match(serverSource, /if parsed\.path != "\/_cellucid\/selection":/);
+  assert.match(
+    serverSource,
+    /frozenset\(\{"viewerId", "viewerToken", "source"\}\)/,
+  );
+  assert.match(serverSource, /_require_exact_content_type\(headers, "application\/octet-stream"\)/);
+});
+
 test('the viewer publishes only event types Python accepts', async () => {
   // `_postEventToPython` is the single outbound door, and Python is the reader:
   // `_require_inbound_jupyter_event` looks the type up in `_INBOUND_EVENT_FIELDS`
@@ -1306,6 +1565,7 @@ test('the viewer publishes only event types Python accepts', async () => {
     'debug_snapshot',
     'session_bundle',
     'command_error',
+    'data_mapping',
   ]);
 
   const source = readFileSync(
@@ -1343,13 +1603,7 @@ test('the viewer publishes only event types Python accepts', async () => {
   // it is not.
   let wireSource = null;
   try {
-    wireSource = readFileSync(
-      new URL(
-        '../../cellucid-python/src/cellucid/jupyter/_wire.py',
-        import.meta.url
-      ),
-      'utf8'
-    );
+    wireSource = readFileSync(PYTHON_WIRE_PATH, 'utf8');
   } catch (error) {
     assert.equal(error.code, 'ENOENT');
   }
@@ -1372,7 +1626,7 @@ test('the viewer publishes only event types Python accepts', async () => {
 });
 
 test('Jupyter mode does not register or enumerate the unrelated demo catalog', async () => {
-  const manager = createDataSourceManager();
+  const manager = new DataSourceManager();
   let jupyterAvailabilityCalls = 0;
   let jupyterListingCalls = 0;
   manager.registerSource('jupyter', {
@@ -1886,6 +2140,7 @@ test('Jupyter command labels are drawn from the exact command set', () => {
     'resetCamera',
     'freeze',
     'requestSessionBundle',
+    'setDataMapping',
   ]) {
     assert.equal(describeJupyterCommandType({ type }), type);
   }
@@ -1911,7 +2166,17 @@ test(
     const runtime = installWindow(
       '?jupyter=true&viewerId=viewer-1&viewerToken=secret-1',
     );
-    globalThis.fetch = async () => jupyterHealthResponse();
+    const posted = [];
+    globalThis.fetch = async (url, init = {}) => {
+      if (String(url).endsWith('/_cellucid/events')) {
+        posted.push(JSON.parse(init.body));
+        return new Response(JSON.stringify({ status: 'ok', delivered: true }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      return jupyterHealthResponse();
+    };
     const source = new JupyterBridgeDataSource(getJupyterConfig());
     await source.initialize();
 
@@ -1974,6 +2239,15 @@ test(
     // The developer trace is kept alongside the user-facing notice.
     assert.equal(logged.length, 1);
     assert.match(logged[0][0], /^\[JupyterBridge\] The notebook "setColorBy"/);
+    // The notebook lists command_error in /_cellucid/protocol, so it learns
+    // the failure too, with the same bounded reason.
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(posted.map(event => [event.type, event.command, event.reason]), [[
+      'command_error',
+      'setColorBy',
+      'Jupyter set-color-by command requires exactly one field "CD8A"',
+    ]]);
+    posted.length = 0;
 
     // An asynchronous rejection reaches the same surface.
     raised.length = 0;
@@ -2053,3 +2327,200 @@ test(
     );
   },
 );
+
+test('the protocol fixture is cellucid-python\'s published document', () => {
+  let wireSource = null;
+  try {
+    wireSource = readFileSync(PYTHON_WIRE_PATH, 'utf8');
+  } catch (error) {
+    assert.equal(error.code, 'ENOENT');
+  }
+  if (wireSource === null) return;
+  const names = declaration => {
+    const start = wireSource.indexOf(`${declaration}: dict[str, frozenset[str]] = {`);
+    assert.ok(start >= 0, `${declaration} must still be findable`);
+    const body = wireSource.slice(start, wireSource.indexOf('\n}\n', start));
+    return [...body.matchAll(/^ {4}"([A-Za-z_]+)": frozenset\(/gm)].map(match => match[1]).sort();
+  };
+  assert.deepEqual(names('_INBOUND_EVENT_FIELDS'), [...CURRENT_PROTOCOL.events].sort());
+  assert.deepEqual(names('_COMMAND_MESSAGE_FIELDS'), [...CURRENT_PROTOCOL.commands].sort());
+});
+
+function protocolServer(protocolResponse, posted = []) {
+  return async (url, init = {}) => {
+    const text = String(url);
+    if (text.endsWith('/_cellucid/health')) return jupyterHealthResponse();
+    if (text.endsWith('/_cellucid/protocol')) return protocolResponse();
+    if (text.endsWith('/_cellucid/events')) {
+      posted.push(JSON.parse(init.body));
+      return new Response(JSON.stringify({ status: 'ok', delivered: true }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+    throw new Error(`unexpected request ${text}`);
+  };
+}
+
+const REPORTED_MAPPING = Object.freeze({
+  kind: 'anndata',
+  embeddings: {
+    enabled: [{ key: 'X_umap', columns: [0, 1] }],
+    defaults: { '1d': null, '2d': { key: 'X_umap', columns: [0, 1] }, '3d': null },
+  },
+  knn: 'connectivities',
+  geneNames: 'index',
+  expression: 'X',
+  latent: null,
+  vectorFields: [],
+});
+
+test('initialization reads the notebook protocol and gates events on it', async t => {
+  installWindow('?jupyter=true&viewerId=viewer-1&viewerToken=secret-1');
+  protocolFixture.passthrough = true;
+  t.after(() => {
+    protocolFixture.passthrough = false;
+  });
+  const posted = [];
+  const requested = [];
+  const server = protocolServer(() => new Response(JSON.stringify(CURRENT_PROTOCOL), {
+    status: 200,
+    headers: { 'Content-Type': 'application/json' },
+  }), posted);
+  globalThis.fetch = async (url, init) => {
+    requested.push(String(url));
+    return server(url, init);
+  };
+  const source = new JupyterBridgeDataSource(getJupyterConfig());
+  assert.equal(await source.initialize(), true);
+  assert.deepEqual(requested, [
+    'http://127.0.0.1:8765/viewer/_cellucid/health',
+    'http://127.0.0.1:8765/viewer/_cellucid/protocol',
+  ]);
+  assert.equal(source.acceptsEvent('data_mapping'), true);
+  assert.equal(
+    await source.notifyDataMapping({ origin: 'user', requestId: null, mapping: REPORTED_MAPPING }),
+    true
+  );
+  assert.equal(
+    await source.notifyDataMapping({ origin: 'notebook', requestId: 'req-9', mapping: REPORTED_MAPPING }),
+    true
+  );
+  assert.deepEqual(posted.map(event => [event.type, event.origin, event.requestId]), [
+    ['data_mapping', 'user', null],
+    ['data_mapping', 'notebook', 'req-9'],
+  ]);
+  assert.deepEqual(posted[0].mapping, REPORTED_MAPPING);
+  await assert.rejects(
+    source.notifyDataMapping({ origin: 'notebook', requestId: null, mapping: REPORTED_MAPPING }),
+    /requestId/
+  );
+  await assert.rejects(
+    source.notifyDataMapping({ origin: 'user', requestId: 'req-1', mapping: REPORTED_MAPPING }),
+    /requestId must be null/
+  );
+  await assert.rejects(
+    source.notifyDataMapping({ origin: 'url', requestId: null, mapping: REPORTED_MAPPING }),
+    /origin must be one of/
+  );
+  source.disconnect();
+});
+
+test('a notebook server without the protocol route accepts no new event', async t => {
+  installWindow('?jupyter=true&viewerId=viewer-1&viewerToken=secret-1');
+  protocolFixture.passthrough = true;
+  t.after(() => {
+    protocolFixture.passthrough = false;
+  });
+  const posted = [];
+  globalThis.fetch = protocolServer(() => new Response('missing', { status: 404 }), posted);
+  const source = new JupyterBridgeDataSource(getJupyterConfig());
+  assert.equal(await source.initialize(), true);
+  assert.equal(source.acceptsEvent('data_mapping'), false);
+  assert.equal(source.acceptsEvent('command_error'), false);
+  assert.equal(
+    await source.notifyDataMapping({ origin: 'default', requestId: null, mapping: REPORTED_MAPPING }),
+    false
+  );
+  assert.deepEqual(posted, []);
+  source.disconnect();
+});
+
+test('a malformed protocol document fails initialization', async t => {
+  installWindow('?jupyter=true&viewerId=viewer-1&viewerToken=secret-1');
+  protocolFixture.passthrough = true;
+  t.after(() => {
+    protocolFixture.passthrough = false;
+  });
+  for (const body of [
+    { events: ['ready'] },
+    { events: ['ready', 'ready'], commands: [] },
+    { events: ['ready'], commands: [7] },
+    { events: 'ready', commands: [] },
+    { events: [], commands: [], version: '1' },
+  ]) {
+    globalThis.fetch = protocolServer(() => new Response(JSON.stringify(body), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }));
+    const source = new JupyterBridgeDataSource(getJupyterConfig());
+    await assert.rejects(source.initialize(), /Jupyter protocol/);
+    assert.equal(source.isConnected(), false);
+  }
+  globalThis.fetch = protocolServer(() => new Response('down', { status: 503 }));
+  const source = new JupyterBridgeDataSource(getJupyterConfig());
+  await assert.rejects(source.initialize(), /HTTP 503/);
+});
+
+test('setDataMapping is validated before delivery, and a failure reaches the notebook', async t => {
+  const runtime = installWindow('?jupyter=true&viewerId=viewer-1&viewerToken=secret-1');
+  protocolFixture.passthrough = true;
+  const notifications = getNotificationCenter();
+  const originalNotify = notifications.error;
+  const originalConsoleError = console.error;
+  notifications.error = () => 'notice';
+  console.error = () => {};
+  t.after(() => {
+    protocolFixture.passthrough = false;
+    notifications.error = originalNotify;
+    console.error = originalConsoleError;
+  });
+  const posted = [];
+  globalThis.fetch = protocolServer(() => new Response(JSON.stringify(CURRENT_PROTOCOL), {
+    status: 200,
+    headers: { 'Content-Type': 'application/json' },
+  }), posted);
+  const source = new JupyterBridgeDataSource(getJupyterConfig());
+  await source.initialize();
+  const delivered = [];
+  source.onMessage(message => {
+    delivered.push(message);
+    if (message.type === 'setDataMapping') {
+      throw new RangeError("obsp['distances'] is not symmetric — choose a connectivities matrix");
+    }
+  });
+  const send = data => runtime.dispatch('message', {
+    data: { ...data, viewerId: 'viewer-1', viewerToken: 'secret-1' },
+    origin: 'https://notebook.example',
+    source: runtime.parent,
+  });
+  // A mapping that is not canonical never reaches a handler.
+  send({ type: 'setDataMapping', requestId: 'req-1', mapping: { kind: 'anndata' } });
+  assert.equal(delivered.length, 0);
+  send({ type: 'setDataMapping', requestId: 'req-2', mapping: REPORTED_MAPPING, extra: 1 });
+  assert.equal(delivered.length, 0);
+  send({ type: 'setDataMapping', requestId: 'req-3', mapping: REPORTED_MAPPING });
+  assert.equal(delivered.length, 1);
+  await new Promise(resolve => setImmediate(resolve));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(
+    posted.map(event => [event.type, event.command]),
+    [
+      ['command_error', 'setDataMapping'],
+      ['command_error', 'setDataMapping'],
+      ['command_error', 'setDataMapping'],
+    ]
+  );
+  assert.match(posted[2].reason, /not symmetric/);
+  source.disconnect();
+});

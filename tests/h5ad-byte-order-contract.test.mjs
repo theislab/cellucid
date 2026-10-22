@@ -14,13 +14,16 @@
  * compare exact values, never shapes or counts.
  */
 
+import './helpers/anndata-reader-in-process.mjs';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
+import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
 import { getNotificationCenter } from '../assets/js/app/notification-center.js';
-import { classifyH5WasmDtype, H5adDataSource } from '../assets/js/data/h5ad.js';
+import { H5adDataSource } from '../assets/js/data/h5ad.js';
+import { classifyH5WasmDtype } from '../assets/js/data/h5ad-loader.js';
 
 const BIG_ENDIAN_FIXTURE = fileURLToPath(
   new URL('./browser/fixtures/byte-order-big-endian.h5ad', import.meta.url)
@@ -134,7 +137,7 @@ function bytesOf(buffer) {
  */
 async function readEverything(t, fixturePath) {
   const bytes = await readFile(fixturePath);
-  const file = new File([bytes], fixturePath.split('/').pop(), {
+  const file = new File([bytes], path.basename(fixturePath), {
     type: 'application/x-hdf5',
   });
   const source = new H5adDataSource();
@@ -147,17 +150,21 @@ async function readEverything(t, fixturePath) {
 
   const embeddings = {};
   for (const key of ['X_umap_2d', 'X_umap_3d']) {
-    const embedding = await loader.getEmbedding(key);
+    const nDims = Number(key.at(-2));
+    const columns = Array.from({ length: nDims }, (_, column) => column);
+    const data = await loader.readObsmColumns(key, columns);
     embeddings[key] = {
-      data: Array.from(embedding.data),
-      shape: embedding.shape,
-      nDims: embedding.nDims,
+      data: Array.from(data),
+      shape: [data.length / nDims, nDims],
+      nDims,
     };
   }
 
   const genes = {};
   for (const name of Object.keys(EXPECTED.genes)) {
-    genes[name] = Array.from(await loader.getGeneExpression(name));
+    const index = loader.varNames.indexOf(name);
+    assert.notEqual(index, -1, `gene ${name} is on the var index`);
+    genes[name] = Array.from(await loader.getMatrixColumn('X', index));
   }
 
   const obs = {};
@@ -173,16 +180,26 @@ async function readEverything(t, fixturePath) {
   // and the manifests built from them. These are what actually reach the GPU
   // and the UI, so they are compared as raw bytes.
   const published = {
-    embedding2d: Array.from(await source.getEmbedding(2)),
-    embedding3d: Array.from(await source.getEmbedding(3)),
+    embedding2d: Array.from(
+      await source.getAdapter().getEmbeddingPayload('embeddings/0_2d.bin', 2)
+    ),
+    embedding3d: Array.from(
+      await source.getAdapter().getEmbeddingPayload('embeddings/1_3d.bin', 3)
+    ),
+    candidates: JSON.stringify(source.getAdapter().getMappingCandidates()),
     genes: {},
     obs: {},
     obsManifest: JSON.stringify(source.getObsManifest()),
-    varManifest: JSON.stringify(source.getVarManifest()),
+    varManifest: JSON.stringify(await source.getVarManifest()),
     connectivityManifest: JSON.stringify(await source.getConnectivityManifest()),
   };
+  const varManifest = JSON.parse(published.varManifest);
   for (const name of Object.keys(EXPECTED.genes)) {
-    published.genes[name] = Array.from(await source.getGeneExpression(name));
+    const field = varManifest.fields.find(([, fieldName]) => fieldName === name);
+    assert.ok(field, `gene ${name} is in the var manifest`);
+    published.genes[name] = Array.from(
+      await source.getAdapter().getGeneValues(`var/${field[0]}.values.f32`)
+    );
   }
   for (const key of [...Object.keys(EXPECTED.obs), 'cell_type']) {
     const field = await source.getObsFieldData(key);

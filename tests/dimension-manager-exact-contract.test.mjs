@@ -3,139 +3,482 @@ import test from 'node:test';
 
 import {
   DimensionManager,
+  parseEmbeddingMetadata,
+  requireRepresentationRef,
 } from '../assets/js/data/dimension-manager.js';
 
-function metadata(filename, dimension = 2) {
+function axes(dimension) {
+  return Array.from({ length: dimension }, (_, index) => index);
+}
+
+/**
+ * Version-3 `embeddings` metadata. `entries` are `[id, dimension, options]`
+ * in item order; `options.sourceKey` and `options.columns` are the item's
+ * provenance and `options.label` its display label.
+ */
+function embeddings(entries, defaults, defaultDimension) {
+  const items = {};
+  entries.forEach(([id, dimension, options = {}], index) => {
+    items[id] = {
+      label: options.label ?? id,
+      dimension,
+      file: `embeddings/${index}_${dimension}d.bin`,
+      source: {
+        key: options.sourceKey ?? null,
+        columns: options.columns ?? axes(dimension),
+      },
+    };
+  });
   return {
-    available_dimensions: [dimension],
-    default_dimension: dimension,
-    files: {
-      [`${dimension}d`]: filename,
-    },
+    default_dimension: defaultDimension,
+    defaults,
+    items,
   };
+}
+
+function metadata(id = 'X_umap', dimension = 2) {
+  return embeddings([[id, dimension]], { [`${dimension}d`]: id }, dimension);
+}
+
+/** Several embeddings per dimension, the case version 3 exists for. */
+function multiLayoutMetadata() {
+  return embeddings(
+    [
+      ['X_pca', 2, { label: 'PCA', sourceKey: 'X_pca', columns: [0, 1] }],
+      ['X_pca_23', 2, { label: 'PCA 3/4', sourceKey: 'X_pca', columns: [2, 3] }],
+      ['X_umap', 2, { label: 'UMAP', sourceKey: 'X_umap', columns: [0, 1] }],
+      ['X_umap_3d', 3],
+    ],
+    { '2d': 'X_umap', '3d': 'X_umap_3d' },
+    3
+  );
 }
 
 test('valid embedding metadata replacement invalidates all prior coordinate state', () => {
   const manager = new DimensionManager({
-    embeddingsMetadata: metadata('old.bin'),
+    embeddingsMetadata: metadata('X_umap', 2),
   });
   const oldRaw = new Float32Array([1, 2, 3, 4]);
   const oldPadded = new Float32Array([1, 2, 0, 3, 4, 0]);
   let aborted = false;
 
-  manager.positionCache.set(2, oldRaw);
-  manager.paddedPositionCache.set(2, oldPadded);
-  manager.normTransformCache.set(2, {
+  manager.positionCache.set('X_umap', oldRaw);
+  manager.normalizedPositionCache.set('X_umap', oldPadded);
+  manager.normTransformCache.set('X_umap', {
     center: [2, 3, 0],
     scale: 1,
   });
-  manager.loadingPromises.set(2, Promise.resolve(oldRaw));
-  manager.paddedLoadingPromises.set(2, Promise.resolve(oldPadded));
-  manager.loadingControllers.set(2, {
+  manager.loadingPromises.set('X_umap', Promise.resolve(oldRaw));
+  manager.normalizedLoadingPromises.set('X_umap', Promise.resolve(oldPadded));
+  manager.loadingControllers.set('X_umap', {
     abort() {
       aborted = true;
     },
   });
-  manager.viewDimensions.set('main', 2);
+  manager.viewLayouts.set('main', 'X_umap');
+  manager.pinLayout('X_umap');
   manager.nCells = 2;
   const priorGeneration = manager._generation;
 
-  manager.initFromMetadata(metadata('new.bin', 3));
+  manager.initFromMetadata(metadata('X_umap_3d', 3));
 
   assert.equal(aborted, true);
   assert.ok(manager._generation > priorGeneration);
-  assert.deepEqual(manager.availableDimensions, [3]);
-  assert.equal(manager.defaultDimension, 3);
-  assert.deepEqual(manager.dimensionFiles, { '3d': 'new.bin' });
+  assert.deepEqual(manager.getAvailableDimensions(), [3]);
+  assert.equal(manager.getDefaultDimension(), 3);
+  assert.equal(manager.hasLayout('X_umap'), false);
+  assert.deepEqual(manager.getEnabledLayoutKeys(), ['X_umap_3d']);
+  assert.equal(manager.getDefaultLayout(3), 'X_umap_3d');
+  assert.equal(manager.getDefaultLayout(2), null);
+  assert.equal(manager.getDefaultLayoutKey(), 'X_umap_3d');
+  assert.equal(manager.getLayout('X_umap_3d').path, 'embeddings/0_3d.bin');
   assert.equal(manager.positionCache.size, 0);
-  assert.equal(manager.paddedPositionCache.size, 0);
+  assert.equal(manager.normalizedPositionCache.size, 0);
   assert.equal(manager.normTransformCache.size, 0);
   assert.equal(manager.loadingPromises.size, 0);
-  assert.equal(manager.paddedLoadingPromises.size, 0);
+  assert.equal(manager.normalizedLoadingPromises.size, 0);
   assert.equal(manager.loadingControllers.size, 0);
-  assert.equal(manager.viewDimensions.size, 0);
+  assert.equal(manager.viewLayouts.size, 0);
+  assert.equal(manager._layoutPins.size, 0);
   assert.equal(manager.nCells, 0);
 });
 
-test('invalid view dimensions reject without substituting or mutating state', () => {
+test('invalid view layouts reject without substituting or mutating state', () => {
   const manager = new DimensionManager({
-    embeddingsMetadata: metadata('points.bin'),
+    embeddingsMetadata: metadata(),
   });
-  manager.setViewDimension('main', 2);
+  manager.setViewLayout('main', 'X_umap');
 
   assert.throws(
-    () => manager.setViewDimension('main', 3),
-    /3D.*not available|available.*2D/i
+    () => manager.setViewLayout('main', 'X_umap_3d'),
+    /layout "X_umap_3d" is not registered/i
   );
+  // A dimension name is not a layout key: the layout key is the embedding id.
+  assert.throws(
+    () => manager.setViewLayout('main', '2d'),
+    /layout "2d" is not registered/i
+  );
+  // No 3D representation is enabled: there is none to open on, and no
+  // reference names one.
+  assert.equal(manager.getOpeningLayout(3), null);
+  assert.equal(manager.hasDimension(3), false);
+  assert.throws(
+    () => manager.resolveRepresentation({ key: 'X_umap_3d', columns: null }),
+    /no embedding "X_umap_3d"/i
+  );
+  assert.equal(manager.getViewLayout('main'), 'X_umap');
   assert.equal(manager.getViewDimension('main'), 2);
-  assert.equal(manager.viewDimensions.get('main'), 2);
+  assert.equal(manager.viewLayouts.get('main'), 'X_umap');
 });
 
 test('dimension metadata and configuration reject coercive normalization', () => {
   assert.throws(
     () => new DimensionManager({
       embeddingsMetadata: {
-        ...metadata('points.bin'),
+        ...metadata(),
         umap_resolution: {
           source_key: 'X_umap',
           action: 'used_as',
         },
       },
     }),
-    /embeddings metadata.*unsupported field.*umap_resolution/i
+    /exactly default_dimension, defaults, and items/i
+  );
+  // The version-2 shape is not read at all.
+  assert.throws(
+    () => new DimensionManager({
+      embeddingsMetadata: {
+        available_dimensions: [2],
+        default_dimension: 2,
+        files: { '2d': 'points_2d.bin' },
+      },
+    }),
+    /exactly default_dimension, defaults, and items/i
+  );
+  // Slots are listed ascending, exactly one per dimension the items cover.
+  const twoDimensions = embeddings(
+    [['X_umap', 2], ['X_umap_3d', 3]],
+    { '2d': 'X_umap', '3d': 'X_umap_3d' },
+    3
   );
   assert.throws(
     () => new DimensionManager({
       embeddingsMetadata: {
-        available_dimensions: [3, 2],
-        default_dimension: 2,
-        files: {
-          '2d': 'points-2d.bin',
-          '3d': 'points-3d.bin',
-        },
+        ...twoDimensions,
+        defaults: { '3d': 'X_umap_3d', '2d': 'X_umap' },
       },
     }),
-    /available_dimensions.*increasing|order/i
+    /defaults must name exactly one embedding per dimension/i
   );
   assert.throws(
     () => new DimensionManager({
-      keepRawPositions: 'false',
+      embeddingsMetadata: { ...twoDimensions, defaults: { '3d': 'X_umap_3d' } },
     }),
-    /keepRawPositions.*boolean/i
+    /defaults must name exactly one embedding per dimension/i
   );
+  assert.throws(
+    () => new DimensionManager({
+      embeddingsMetadata: {
+        ...twoDimensions,
+        defaults: { '2d': 'X_umap_3d', '3d': 'X_umap_3d' },
+      },
+    }),
+    /default for 2D must name a 2D embedding item/i
+  );
+  assert.throws(
+    () => new DimensionManager({
+      embeddingsMetadata: {
+        ...twoDimensions,
+        defaults: { '2d': 'X_missing', '3d': 'X_umap_3d' },
+      },
+    }),
+    /default for 2D must name a 2D embedding item/i
+  );
+  assert.throws(
+    () => new DimensionManager({
+      embeddingsMetadata: { ...twoDimensions, default_dimension: 1 },
+    }),
+    /default_dimension must be a dimension the embeddings defaults name/i
+  );
+  assert.throws(
+    () => new DimensionManager({
+      embeddingsMetadata: { ...twoDimensions, default_dimension: '3' },
+    }),
+    /default_dimension must be a dimension the embeddings defaults name/i
+  );
+  assert.throws(
+    () => new DimensionManager({
+      embeddingsMetadata: { ...metadata(), items: {} },
+    }),
+    /items must be a non-empty object/i
+  );
+  const item = metadata().items.X_umap;
+  for (const rejected of [
+    { ...item, basis: 'umap' },
+    { label: item.label, dimension: item.dimension, file: item.file },
+    { ...item, source: { key: null } },
+    { ...item, source: { ...item.source, extra: true } },
+  ]) {
+    assert.throws(
+      () => new DimensionManager({
+        embeddingsMetadata: { ...metadata(), items: { X_umap: rejected } },
+      }),
+      /exactly label, dimension, file, and source|source must be exactly \{ key, columns \}/
+    );
+  }
+  for (const rejected of [
+    { ...item, dimension: 4 },
+    { ...item, label: '' },
+    { ...item, file: '' },
+    { ...item, source: { key: 'X_umap', columns: [0] } },
+    { ...item, source: { key: 'X_umap', columns: [1, 1] } },
+    { ...item, source: { key: '', columns: [0, 1] } },
+  ]) {
+    assert.throws(
+      () => new DimensionManager({
+        embeddingsMetadata: { ...metadata(), items: { X_umap: rejected } },
+      })
+    );
+  }
 
   const manager = new DimensionManager({
-    embeddingsMetadata: metadata('points.bin'),
+    embeddingsMetadata: metadata(),
   });
   assert.throws(
-    () => manager.setViewDimension('', 2),
+    () => manager.setViewLayout('', 'X_umap'),
     /view.*id.*non-empty/i
   );
   assert.throws(
-    () => manager.getViewDimension(''),
+    () => manager.getViewLayout(''),
     /view.*id.*non-empty/i
   );
-  assert.equal(manager.viewDimensions.size, 0);
+  assert.equal(manager.viewLayouts.size, 0);
 });
 
-test('per-view dimension lookup requires an explicitly published view', () => {
+test('per-view layout lookup requires an explicitly published view', () => {
   const manager = new DimensionManager({
-    embeddingsMetadata: metadata('points.bin'),
+    embeddingsMetadata: metadata(),
   });
 
   assert.throws(
-    () => manager.getViewDimension('missing'),
-    /dimension.*not published.*missing/i,
+    () => manager.getViewLayout('missing'),
+    /layout.*not published.*missing/i,
   );
   assert.throws(
-    () => manager.copyViewDimension('missing', 'snapshot'),
-    /dimension.*not published.*missing/i,
+    () => manager.getViewDimension('missing'),
+    /layout.*not published.*missing/i,
   );
-  assert.equal(manager.viewDimensions.size, 0);
+  assert.throws(
+    () => manager.copyViewLayout('missing', 'snapshot'),
+    /layout.*not published.*missing/i,
+  );
+  assert.equal(manager.viewLayouts.size, 0);
+});
+
+test('the current metadata contract registers one layout per embedding item, several per dimension', () => {
+  const parsed = parseEmbeddingMetadata(multiLayoutMetadata());
+  assert.equal(parsed.defaultDimension, 3);
+  assert.deepEqual(
+    parsed.layouts.map(layout => layout.layoutKey),
+    ['X_pca', 'X_pca_23', 'X_umap', 'X_umap_3d'],
+  );
+  assert.deepEqual([...parsed.defaults], [[2, 'X_umap'], [3, 'X_umap_3d']]);
+
+  const manager = new DimensionManager({
+    embeddingsMetadata: multiLayoutMetadata(),
+  });
+
+  assert.deepEqual(
+    manager.getLayoutsForDimension(2).map(layout => layout.layoutKey),
+    ['X_pca', 'X_pca_23', 'X_umap'],
+  );
+  assert.deepEqual(
+    manager.getLayoutsForDimension(3).map(layout => layout.layoutKey),
+    ['X_umap_3d'],
+  );
+  assert.deepEqual(manager.getLayoutsForDimension(1), []);
+  assert.deepEqual(
+    manager.getRegisteredLayouts().map(layout => layout.layoutKey),
+    ['X_pca', 'X_pca_23', 'X_umap', 'X_umap_3d'],
+  );
+  assert.deepEqual(manager.getLayout('X_pca_23'), {
+    layoutKey: 'X_pca_23',
+    dimension: 2,
+    label: 'PCA 3/4',
+    path: 'embeddings/1_2d.bin',
+    provenance: { key: 'X_pca', columns: [2, 3] },
+    origin: 'identity',
+  });
+  // An item whose source key is null has no addressable provenance.
+  assert.deepEqual(manager.getLayout('X_umap_3d'), {
+    layoutKey: 'X_umap_3d',
+    dimension: 3,
+    label: 'X_umap_3d',
+    path: 'embeddings/3_3d.bin',
+    provenance: null,
+    origin: 'identity',
+  });
+  // Every declared embedding is enabled, in item order: three 2D
+  // representations and one 3D one, any of which a view can show.
+  assert.deepEqual(
+    manager.getEnabledLayoutKeys(),
+    ['X_pca', 'X_pca_23', 'X_umap', 'X_umap_3d'],
+  );
+  assert.ok(Object.isFrozen(manager.getEnabledLayoutKeys()));
+  assert.equal(manager.isEnabled('X_pca_23'), true);
+  assert.deepEqual(
+    manager.getEnabledLayoutsForDimension(2).map(layout => layout.layoutKey),
+    ['X_pca', 'X_pca_23', 'X_umap'],
+  );
+  // Each dimension's default is the item `defaults` names, not the first item.
+  assert.equal(manager.getDefaultLayout(1), null);
+  assert.equal(manager.getDefaultLayout(2), 'X_umap');
+  assert.equal(manager.getDefaultLayout(3), 'X_umap_3d');
+  assert.equal(manager.getOpeningLayout(1), null);
+  assert.equal(manager.getOpeningLayout(2), 'X_umap');
+  assert.equal(manager.getDefaultDimension(), 3);
+  assert.equal(manager.getDefaultLayoutKey(), 'X_umap_3d');
+  assert.deepEqual(manager.getAvailableDimensions(), [2, 3]);
+  assert.equal(manager.hasDimension(1), false);
+  assert.equal(manager.hasDimension(2), true);
+  assert.ok(Object.isFrozen(manager.getLayout('X_umap')));
+  assert.ok(Object.isFrozen(manager.getLayout('X_pca').provenance));
+  assert.ok(Object.isFrozen(manager.getLayout('X_pca').provenance.columns));
+});
+
+test('an embedding reference resolves by embedding id or by provenance, never by guess', () => {
+  const manager = new DimensionManager({
+    embeddingsMetadata: multiLayoutMetadata(),
+  });
+
+  // `columns: null` names an export embedding by its id (= layout key); the
+  // dimension is the layout's, never asked of the caller.
+  assert.equal(manager.resolveRepresentation({ key: 'X_pca', columns: null }), 'X_pca');
+  assert.equal(manager.resolveRepresentation({ key: 'X_pca_23', columns: null }), 'X_pca_23');
+  assert.equal(manager.resolveRepresentation({ key: 'X_umap_3d', columns: null }), 'X_umap_3d');
+  assert.equal(manager.getLayout(manager.resolveRepresentation({ key: 'X_umap_3d', columns: null })).dimension, 3);
+
+  // Columns name a source array and the columns plotted: the provenance.
+  assert.equal(manager.resolveRepresentation({ key: 'X_pca', columns: [2, 3] }), 'X_pca_23');
+  assert.equal(manager.resolveRepresentation({ key: 'X_pca', columns: [0, 1] }), 'X_pca');
+  assert.equal(manager.findLayoutByProvenance('X_umap', [0, 1]), 'X_umap');
+  assert.equal(manager.findLayoutByProvenance('X_pca', [2, 3]), 'X_pca_23');
+  // Column order is part of the provenance.
+  assert.equal(manager.findLayoutByProvenance('X_pca', [1, 0]), null);
+  assert.throws(
+    () => manager.resolveRepresentation({ key: 'X_pca', columns: [1, 0] }),
+    /cannot plot obsm\['X_pca'\] columns \[1, 0\]/,
+  );
+  // An embedding id is not a provenance key: X_pca_23 was read from X_pca.
+  assert.throws(
+    () => manager.resolveRepresentation({ key: 'X_pca_23', columns: [2, 3] }),
+    /cannot plot obsm\['X_pca_23'\] columns \[2, 3\]/,
+  );
+  // A null source key is not addressable by provenance.
+  assert.equal(manager.findLayoutByProvenance('X_umap_3d', [0, 1, 2]), null);
+  assert.throws(
+    () => manager.resolveRepresentation({ key: 'X_missing', columns: null }),
+    /no embedding "X_missing"/,
+  );
+  for (const malformed of [
+    { key: 'X_pca' },
+    { key: 'X_pca', columns: null, extra: 1 },
+    { key: '', columns: null },
+    { key: 'X_pca', columns: [] },
+    { key: 'X_pca', columns: [0, 0] },
+    { key: 'X_pca', columns: [-1, 0] },
+    { key: 'X_pca', columns: [0, 1, 2, 3] },
+    { key: 'X_pca', columns: [0.5, 1] },
+    ['X_pca', null],
+    null,
+  ]) {
+    assert.throws(() => manager.resolveRepresentation(malformed), TypeError);
+    assert.throws(() => requireRepresentationRef(malformed), TypeError);
+  }
+  // A valid reference comes back frozen, with a frozen copy of its columns.
+  const columns = [2, 3];
+  const ref = requireRepresentationRef({ key: 'X_pca', columns });
+  assert.ok(Object.isFrozen(ref) && Object.isFrozen(ref.columns));
+  assert.notEqual(ref.columns, columns);
+  assert.deepEqual(requireRepresentationRef({ key: 'X_pca', columns: null }), { key: 'X_pca', columns: null });
+});
+
+test('layout registration validates the whole batch before publishing any', () => {
+  const manager = new DimensionManager({ embeddingsMetadata: metadata() });
+  const valid = {
+    layoutKey: 'tsne',
+    dimension: 2,
+    label: 't-SNE',
+    path: 'tsne.bin',
+    provenance: { key: 'X_tsne', columns: [0, 1] },
+    origin: 'mapping',
+  };
+  for (const rejected of [
+    [valid, { ...valid }],
+    [valid, { ...valid, layoutKey: 'X_umap' }],
+    [valid, { ...valid, layoutKey: 'x', dimension: 4 }],
+    [valid, { ...valid, layoutKey: 'x', origin: 'guess' }],
+    [valid, { ...valid, layoutKey: 'x', provenance: { key: 'X', columns: [0] } }],
+    [valid, { ...valid, layoutKey: 'x', provenance: { key: 'X', columns: [1, 1] } }],
+    [valid, { ...valid, layoutKey: 'x', extra: true }],
+    [],
+  ]) {
+    assert.throws(() => manager.registerLayouts(rejected));
+    assert.equal(manager.hasLayout('tsne'), false);
+  }
+  assert.deepEqual(manager.registerLayouts([valid]), ['tsne']);
+  assert.deepEqual(
+    manager.getLayoutsForDimension(2).map(layout => layout.layoutKey),
+    ['X_umap', 'tsne'],
+  );
+  // Registering is not enabling: a second layout of a dimension is neither
+  // offered to views nor the default until the mapping says so.
+  assert.equal(manager.isEnabled('tsne'), false);
+  assert.equal(manager.getDefaultLayout(2), 'X_umap');
+  assert.throws(
+    () => manager.setRepresentations(['X_umap', 'tsne'], new Map([[3, 'tsne']])),
+    /2D and cannot be the 3D default/,
+  );
+  manager.setRepresentations(['X_umap', 'tsne'], new Map([[2, 'tsne']]));
+  assert.equal(manager.isEnabled('tsne'), true);
+  assert.equal(manager.getDefaultLayout(2), 'tsne');
+  // The registered provenance is addressable like an identity item's.
+  assert.equal(manager.findLayoutByProvenance('X_tsne', [0, 1]), 'tsne');
+});
+
+test('a reference names exactly one registered layout', () => {
+  const manager = new DimensionManager({ embeddingsMetadata: metadata() });
+  manager.registerLayouts([{
+    layoutKey: 'tsne',
+    dimension: 2,
+    label: 't-SNE',
+    path: 'tsne.bin',
+    provenance: null,
+    origin: 'mapping',
+  }]);
+
+  assert.equal(manager.resolveRepresentation({ key: 'X_umap', columns: null }), 'X_umap');
+  // Resolving names a registered layout whether or not it is enabled; the
+  // data state refuses to show one that is not.
+  assert.equal(manager.resolveRepresentation({ key: 'tsne', columns: null }), 'tsne');
+  assert.equal(manager.isEnabled('tsne'), false);
+  assert.throws(
+    () => manager.resolveRepresentation({ key: 'missing', columns: null }),
+    /no embedding "missing"/,
+  );
+  // A layout without provenance cannot be named by columns.
+  assert.throws(
+    () => manager.resolveRepresentation({ key: 'tsne', columns: [0, 1] }),
+    /cannot plot obsm\['tsne'\] columns \[0, 1\]/,
+  );
+  assert.throws(
+    () => manager.resolveRepresentation({ key: 'tsne' }),
+    /exactly \{ key, columns \}/,
+  );
 });
 
 test('the cell axis is published through one validating seam', () => {
-  const manager = new DimensionManager({ embeddingsMetadata: metadata('a.bin') });
+  const manager = new DimensionManager({ embeddingsMetadata: metadata() });
 
   // Nothing is known before an identity states it or an embedding teaches it,
   // and that zero is what leaves the first payload ceiling-bounded.
@@ -183,29 +526,246 @@ test('publishing the cell axis before the metadata is refused, not discarded', (
   const manager = new DimensionManager();
   manager.publishCellCount(120);
   assert.throws(
-    () => manager.initFromMetadata(metadata('a.bin')),
+    () => manager.initFromMetadata(metadata()),
     /must be installed before the cell axis is published/
   );
   assert.equal(manager.getCellCount(), 120, 'the refused call must not clear');
 
   // The correct order is unaffected.
   const ordered = new DimensionManager();
-  ordered.initFromMetadata(metadata('a.bin'));
+  ordered.initFromMetadata(metadata());
   ordered.publishCellCount(120);
   assert.equal(ordered.getCellCount(), 120);
-  assert.deepEqual(ordered.availableDimensions, [2]);
+  assert.deepEqual(ordered.getAvailableDimensions(), [2]);
 
   // A construction site that supplies metadata up front is already past the
   // hazard, so it may publish immediately.
   const constructed = new DimensionManager({
-    embeddingsMetadata: metadata('a.bin'),
+    embeddingsMetadata: metadata(),
   });
   assert.equal(constructed.publishCellCount(120), 120);
 
   // An axis learned from a decoded payload is downstream of the metadata and
   // does not pin the ordering.
-  const learned = new DimensionManager({ embeddingsMetadata: metadata('a.bin') });
+  const learned = new DimensionManager({ embeddingsMetadata: metadata() });
   learned.nCells = 120;
-  assert.equal(learned.initFromMetadata(metadata('b.bin', 3)), undefined);
+  assert.equal(learned.initFromMetadata(metadata('X_umap_3d', 3)), undefined);
   assert.equal(learned.getCellCount(), 0);
+});
+
+test('position caches are keyed by layout and every shown or pinned layout survives eviction', async () => {
+  const cells = 4;
+  const bytesPerLayout = cells * 2 * Float32Array.BYTES_PER_ELEMENT;
+  const manager = new DimensionManager({
+    embeddingsMetadata: metadata(),
+    // Room for two resident 2D layouts, not for a third beside them.
+    maxPositionBytes: bytesPerLayout * 3 - 1,
+  });
+  manager.registerLayouts(['tsne', 'pca'].map(layoutKey => ({
+    layoutKey,
+    dimension: 2,
+    label: layoutKey,
+    path: `${layoutKey}.bin`,
+    provenance: null,
+    origin: 'mapping',
+  })));
+  const raw = new Map([
+    ['X_umap', Float32Array.from([0, 0, 1, 1, 2, 2, 3, 3])],
+    ['tsne', Float32Array.from([0, 0, 10, 10, 20, 20, 30, 30])],
+    ['pca', Float32Array.from([0, 0, 2, 4, 4, 8, 6, 12])],
+  ]);
+  manager.loadLayout = async layoutKey => raw.get(layoutKey);
+
+  manager.setViewLayout('live', 'X_umap');
+  const umap = await manager.getPositions('X_umap', { showProgress: false });
+  const releaseTsne = manager.pinLayout('tsne');
+  const tsne = await manager.getPositions('tsne', { showProgress: false });
+  assert.notStrictEqual(umap, tsne);
+  assert.notDeepEqual(manager.getNormTransform('X_umap'), manager.getNormTransform('tsne'));
+
+  // Both resident layouts are protected: the live view shows one, a caller
+  // pinned the other. The budget is a residency policy, so a third layout is
+  // still loaded beside them; nothing in use is evicted for it.
+  await manager.getPositions('pca', { showProgress: false });
+  assert.ok(manager.normalizedPositionCache.has('X_umap'));
+  assert.ok(manager.normalizedPositionCache.has('tsne'));
+  assert.ok(manager.normalizedPositionCache.has('pca'));
+  manager.evictUnpinned();
+  assert.deepEqual([...manager.normalizedPositionCache.keys()], ['X_umap', 'tsne']);
+
+  // Released, the pinned layout is the least recently used evictable one.
+  releaseTsne();
+  releaseTsne();
+  await manager.getPositions('pca', { showProgress: false });
+  assert.deepEqual([...manager.normalizedPositionCache.keys()], ['X_umap', 'pca']);
+
+  // A layout no view shows and nobody pinned is released explicitly.
+  assert.deepEqual(manager.evictUnpinned(), ['pca']);
+  assert.deepEqual([...manager.normalizedPositionCache.keys()], ['X_umap']);
+  // The transform outlives eviction: centroids normalized with it stay valid.
+  assert.ok(manager.getNormTransform('pca'));
+});
+
+test('a layout provider registers an AnnData reference once, as a mapping layout', () => {
+  const manager = new DimensionManager({
+    embeddingsMetadata: embeddings(
+      [['X_umap', 2, { sourceKey: 'X_umap', columns: [0, 1] }]],
+      { '2d': 'X_umap' },
+      2
+    ),
+  });
+  assert.equal(manager.hasLayoutProvider(), false);
+  // Without a provider an unknown reference names nothing.
+  assert.equal(manager.resolveProvenanceLayout('X_pca', [2, 3]), null);
+
+  const calls = [];
+  manager.setLayoutProvider(ref => {
+    calls.push(ref);
+    if (ref.key === 'X_df') throw new RangeError('obsm table, not an array');
+    return {
+      layoutKey: `${ref.key}[${ref.columns.join(',')}]`,
+      dimension: ref.columns.length,
+      label: `${ref.key}[${ref.columns.join(',')}]`,
+      path: `_cellucid/mapping/embeddings/1/${ref.columns.join('-')}.bin`,
+      provenance: { key: ref.key, columns: [...ref.columns] },
+      origin: 'mapping',
+    };
+  });
+  assert.equal(manager.hasLayoutProvider(), true);
+  // A registered provenance never reaches the provider.
+  assert.equal(manager.resolveProvenanceLayout('X_umap', [0, 1]), 'X_umap');
+  assert.deepEqual(calls, []);
+
+  assert.equal(manager.resolveProvenanceLayout('X_pca', [2, 3]), 'X_pca[2,3]');
+  assert.equal(manager.getLayout('X_pca[2,3]').origin, 'mapping');
+  assert.deepEqual(manager.getLayout('X_pca[2,3]').provenance, { key: 'X_pca', columns: [2, 3] });
+  // A second request finds the registered layout and does not register again.
+  assert.equal(manager.resolveProvenanceLayout('X_pca', [2, 3]), 'X_pca[2,3]');
+  assert.equal(calls.length, 1);
+  assert.equal(
+    manager.resolveRepresentation({ key: 'X_pca', columns: [2, 3] }),
+    'X_pca[2,3]'
+  );
+
+  // A refusal by the provider is "cannot plot", not a crash.
+  assert.equal(manager.resolveProvenanceLayout('X_df', [0, 1]), null);
+  assert.throws(
+    () => manager.resolveRepresentation({ key: 'X_df', columns: [0, 1] }),
+    /cannot plot obsm\['X_df'\] columns \[0, 1\]/
+  );
+
+  // A provider that describes anything but the requested reference is a bug.
+  for (const wrong of [
+    ref => ({ layoutKey: 'w1', dimension: 2, label: 'w1', path: 'w1.bin', provenance: { key: 'X_other', columns: ref.columns }, origin: 'mapping' }),
+    ref => ({ layoutKey: 'w2', dimension: 2, label: 'w2', path: 'w2.bin', provenance: { key: ref.key, columns: [1, 0] }, origin: 'mapping' }),
+    ref => ({ layoutKey: 'w3', dimension: 2, label: 'w3', path: 'w3.bin', provenance: { key: ref.key, columns: ref.columns }, origin: 'identity' }),
+  ]) {
+    manager.setLayoutProvider(wrong);
+    assert.throws(
+      () => manager.resolveProvenanceLayout('X_tsne', [0, 1]),
+      /describe exactly the requested reference/
+    );
+  }
+  assert.equal(manager.hasLayout('w1') || manager.hasLayout('w2') || manager.hasLayout('w3'), false);
+  assert.throws(() => manager.setLayoutProvider('nope'), /function or null/);
+
+  // Installing new metadata drops the provider of the previous dataset.
+  manager.initFromMetadata(metadata());
+  assert.equal(manager.hasLayoutProvider(), false);
+});
+
+test('representations are published as one validated replacement', () => {
+  const manager = new DimensionManager({ embeddingsMetadata: multiLayoutMetadata() });
+  const before = () => ({
+    enabled: [...manager.getEnabledLayoutKeys()],
+    defaults: [1, 2, 3].map(dimension => manager.getDefaultLayout(dimension)),
+  });
+  const original = before();
+
+  for (const [enabled, defaults, pattern] of [
+    [[], new Map([[2, 'X_umap']]), /At least one representation/],
+    ['X_umap', new Map([[2, 'X_umap']]), /At least one representation/],
+    [['X_umap', 'X_umap'], new Map([[2, 'X_umap']]), /enabled twice/],
+    [['X_umap', 'nope'], new Map([[2, 'X_umap']]), /"nope" is not registered/],
+    [['X_umap'], new Map(), /non-empty Map/],
+    [['X_umap'], { 2: 'X_umap' }, /non-empty Map/],
+    [['X_umap'], new Map([[2, 'X_pca']]), /2D default "X_pca" is not enabled/],
+    [['X_umap', 'X_umap_3d'], new Map([[3, 'X_umap']]), /2D and cannot be the 3D default/],
+    [['X_umap'], new Map([[4, 'X_umap']]), /dimension/i],
+  ]) {
+    assert.throws(() => manager.setRepresentations(enabled, defaults), pattern);
+    assert.deepEqual(before(), original, 'a refused replacement changes nothing');
+  }
+
+  // Any number of representations of any dimension; a dimension may have
+  // enabled layouts and no default, and then opens on its first one.
+  manager.setRepresentations(
+    ['X_pca_23', 'X_pca', 'X_umap_3d'],
+    new Map([[3, 'X_umap_3d']])
+  );
+  assert.deepEqual(manager.getEnabledLayoutKeys(), ['X_pca_23', 'X_pca', 'X_umap_3d']);
+  assert.equal(manager.isEnabled('X_umap'), false);
+  assert.equal(manager.getDefaultLayout(2), null);
+  assert.equal(manager.getOpeningLayout(2), 'X_pca_23');
+  assert.deepEqual(manager.getAvailableDimensions(), [2, 3]);
+  assert.equal(manager.getDefaultDimension(), 3);
+
+  // The identity opens on 3D; while 3D has no default the dataset opens on
+  // the highest dimension that has one, and returns to 3D when it has one
+  // again.
+  manager.setRepresentations(['X_pca', 'X_umap_3d'], new Map([[2, 'X_pca']]));
+  assert.equal(manager.getDefaultDimension(), 2);
+  assert.equal(manager.getDefaultLayoutKey(), 'X_pca');
+  assert.equal(manager.hasDimension(3), true, '3D is still enabled, only not a default');
+  manager.setRepresentations(['X_pca'], new Map([[2, 'X_pca']]));
+  assert.deepEqual(manager.getAvailableDimensions(), [2]);
+  assert.equal(manager.hasDimension(3), false);
+  manager.setRepresentations(['X_pca', 'X_umap_3d'], new Map([[2, 'X_pca'], [3, 'X_umap_3d']]));
+  assert.equal(manager.getDefaultDimension(), 3);
+  assert.equal(manager.getDefaultLayoutKey(), 'X_umap_3d');
+
+  // Views are not the registry's to police: the data state moves every view
+  // off a layout before disabling it.
+  manager.setViewLayout('live', 'X_pca_23');
+  manager.setRepresentations(['X_pca'], new Map([[2, 'X_pca']]));
+  assert.equal(manager.getViewLayout('live'), 'X_pca_23');
+});
+
+test('before any representation is published there is nothing to open on', () => {
+  const manager = new DimensionManager();
+  assert.deepEqual(manager.getEnabledLayoutKeys(), []);
+  assert.deepEqual(manager.getAvailableDimensions(), []);
+  assert.equal(manager.getDefaultLayoutKey(), null);
+  assert.equal(manager.getOpeningLayout(2), null);
+  assert.equal(manager.getDefaultDimension(), 3, 'the placeholder dimension');
+});
+
+
+test('the position budget never refuses the layouts the views show plus the one being shown', async () => {
+  const cells = 4;
+  const bytesPerLayout = cells * 2 * Float32Array.BYTES_PER_ELEMENT;
+  const manager = new DimensionManager({
+    embeddingsMetadata: metadata(),
+    // Smaller than one layout: a browser that reports little memory.
+    maxPositionBytes: bytesPerLayout - 1,
+  });
+  manager.registerLayouts([{
+    layoutKey: 'tsne',
+    dimension: 2,
+    label: 'tsne',
+    path: 'tsne.bin',
+    provenance: null,
+    origin: 'mapping',
+  }]);
+  const raw = new Map([
+    ['X_umap', Float32Array.from([0, 0, 1, 1, 2, 2, 3, 3])],
+    ['tsne', Float32Array.from([0, 0, 10, 10, 20, 20, 30, 30])],
+  ]);
+  manager.loadLayout = async layoutKey => raw.get(layoutKey);
+  manager.setViewLayout('live', 'X_umap');
+  await manager.getPositions('X_umap', { showProgress: false });
+  // A second view shows t-SNE beside UMAP: both are shown, so both stay.
+  manager.setViewLayout('snapshot-1', 'tsne');
+  await manager.getPositions('tsne', { showProgress: false });
+  assert.deepEqual([...manager.normalizedPositionCache.keys()].sort(), ['X_umap', 'tsne']);
 });

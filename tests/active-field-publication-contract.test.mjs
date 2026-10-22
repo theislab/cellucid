@@ -39,11 +39,14 @@ test('the active-field publication names the field everywhere it is shown', () =
   for (const surface of [
     /legend\.render\?\.\(info\.field\)/,
     /legend\.handleOutlierUI\?\.\(info\.field\)/,
-    /highlightControls\.updateHighlightMode\?\.\(\)/,
     /communityAnnotationControls\.render\?\.\(\)/
   ]) {
     assert.match(body, surface);
   }
+  // The renderer reads each pane's field kind from the state when it needs it
+  // (`viewer.setViewFieldKindSource`), so there is no highlight mode for this
+  // publication to push and none may come back.
+  assert.doesNotMatch(body, /highlightControls\./);
   // Called with nothing, it must rebuild the field info from current state so
   // a state-driven refresh reports the same thing a click does.
   assert.match(body, /const info = fieldInfo \|\| buildStatsInfoFromState\(\)/);
@@ -76,7 +79,6 @@ test('every active-field refresh path uses that one publication', () => {
       /statsDisplay\./,
       /legend\.render/,
       /legend\.handleOutlierUI/,
-      /highlightControls\.updateHighlightMode/,
       /communityAnnotationControls\.render/
     ]) {
       assert.doesNotMatch(
@@ -113,9 +115,9 @@ test('the statistics line follows a signal, not a list of refresh sites', () => 
   // `setActiveField`, `setActiveVarField` and `clearActiveField` all end in
   // `computeGlobalVisibility()` and `setActiveView` ends in
   // `_notifyVisibilityChange()`, so `visibility:changed` reaches every one of
-  // them — the same signal `highlight-controls.js` follows for the renderer's
-  // highlight mode. A dimension change is the other input, because it moves the
-  // centroid count.
+  // them — the same signal the annotation panel follows for its idle copy. A
+  // change of the active view's representation is the other input, because it
+  // moves the centroid count.
   const batched = readFunctionBody(
     '  function scheduleVisibilityUiUpdate() {',
     '\n  }\n'
@@ -125,14 +127,19 @@ test('the statistics line follows a signal, not a list of refresh sites', () => 
     /publishStatsLine\(\)/,
     'the visibility signal must republish the statistics line'
   );
-  const dimension = readFunctionBody(
-    '  const handleDimensionChanged = () => {',
+  const representation = readFunctionBody(
+    '  const handleRepresentationChanged = ({ viewId, dimension }) => {',
     '\n  };\n'
   );
   assert.match(
-    dimension,
-    /publishStatsLine\(\)/,
-    'a dimension change must republish the statistics line'
+    representation,
+    /if \(viewId === state\.activeViewId\) \{[^}]*publishStatsLine\(\)/,
+    'a change of the active view\'s representation must republish the statistics line'
+  );
+  assert.match(
+    coordinatorSource,
+    /state\.on\(\s*'view:representation-changed',\s*handleRepresentationChanged\s*\)/,
+    'the statistics line must follow the representation signal'
   );
 
   // One writer. Anything else naming `statsDisplay` is a second list that can

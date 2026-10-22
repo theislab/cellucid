@@ -7,6 +7,8 @@
   --duration-fast: 150ms;
   --duration-normal: 300ms;
   --duration-slow: 450ms;
+  /* One turn of a loading spinner. */
+  --duration-spin: 900ms;
 
   --easing-linear: linear;
   --easing-standard: ease;
@@ -14,7 +16,6 @@
   --easing-out: cubic-bezier(0.16, 1, 0.3, 1);
 
   /* Common composites. */
-  --transition-all: all var(--duration-fast) var(--easing-standard);
   --transition-colors: background-color var(--duration-fast) var(--easing-standard),
     color var(--duration-fast) var(--easing-standard),
     border-color var(--duration-fast) var(--easing-standard),

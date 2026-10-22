@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import worker from '../assets/js/app/community-annotations/_worker-code.js';
 import { parseExactJson } from '../assets/js/app/community-annotations/wire-contract.js';
+import { withMockedFetch } from './helpers/worker-fetch.mjs';
 
 const ENV = Object.freeze({
   ALLOWED_ORIGINS: 'https://app.example,http://localhost:8000',
@@ -84,16 +85,6 @@ async function responseDocument(response) {
   return parseExactJson(await response.text(), {
     path: `Worker HTTP ${response.status} response`,
   });
-}
-
-async function withMockedFetch(mockFetch, callback) {
-  const previousFetch = globalThis.fetch;
-  globalThis.fetch = mockFetch;
-  try {
-    return await callback();
-  } finally {
-    globalThis.fetch = previousFetch;
-  }
 }
 
 function installFakeTimers() {

@@ -384,36 +384,38 @@ export class FieldOverlayInternalMethods {
         'Current centroid category inventory must contain unique identities'
       );
     }
-    if (!Object.hasOwn(field, 'centroidsByDim')) return;
-    const byDimension = field.centroidsByDim;
-    requireRecord(byDimension, 'Category field centroidsByDim');
+    if (!Object.hasOwn(field, 'centroidsByLayout')) return;
+    const byLayout = field.centroidsByLayout;
+    if (!(byLayout instanceof Map)) {
+      throw new TypeError('Category field centroidsByLayout must be a Map');
+    }
     const pendingUpdates = [];
-    for (const [dimension, centroids] of Object.entries(byDimension)) {
-      if (!/^[1-3]$/.test(dimension)) {
+    for (const [layoutKey, centroids] of byLayout) {
+      if (typeof layoutKey !== 'string' || layoutKey.length === 0) {
         throw new TypeError(
-          'Category centroid dimension keys must be 1, 2, or 3'
+          'Category centroid layout keys must be non-empty strings'
         );
       }
       if (!Array.isArray(centroids)) {
         throw new TypeError(
-          `Category centroid dimension ${dimension} must be an array`
+          `Category centroids of layout "${layoutKey}" must be an array`
         );
       }
       const seenCategories = new Set();
       for (let centroidIndex = 0; centroidIndex < centroids.length; centroidIndex++) {
         const centroid = requireRecord(
           centroids[centroidIndex],
-          `Category centroid ${dimension}:${centroidIndex}`
+          `Category centroid ${layoutKey}:${centroidIndex}`
         );
         StateValidator.validateCategoryLabel(centroid.category);
         if (!categoryMapping.has(centroid.category)) {
           throw new TypeError(
-            `Category centroid dimension ${dimension} references an unknown category identity`
+            `Category centroids of layout "${layoutKey}" reference an unknown category identity`
           );
         }
         if (seenCategories.has(centroid.category)) {
           throw new TypeError(
-            `Category centroid dimension ${dimension} duplicates a category identity`
+            `Category centroids of layout "${layoutKey}" duplicate a category identity`
           );
         }
         seenCategories.add(centroid.category);
@@ -527,27 +529,37 @@ export class FieldOverlayInternalMethods {
     this._notifyHighlightChange();
   }
 
-  _ensureUserDefinedCentroidsForDim(field, dim) {
-    requireField(field, 'Dimension field');
+  /**
+   * Give a user-defined categorical centroids for a layout it has none for.
+   *
+   * `positions` are the layout's normalized positions, the ones the view is
+   * about to draw: the caller has already loaded and pinned them, so the
+   * centroids are computed from exactly that geometry and are normalized from
+   * birth. Built-in fields carry their own manifest centroids and are left
+   * alone.
+   *
+   * @param {object} field
+   * @param {string} layoutKey
+   * @param {Float32Array} positions - normalized positions, stride = dimension
+   */
+  _ensureUserDefinedCentroidsForLayout(field, layoutKey, positions) {
+    requireField(field, 'Layout field');
     if (field._isUserDefined !== true) return;
     if (field.kind !== FieldKind.CATEGORY) return;
     const fieldId = requireIdentifier(
       field._userDefinedId,
       'User-defined centroid field id'
     );
-    const dimension = requireIndex(dim, 'Centroid dimension');
-    if (dimension < 1 || dimension > 3) {
-      throw new RangeError('Centroid dimension must be from 1 through 3');
+    const key = requireIdentifier(layoutKey, 'Centroid layout key');
+    if (!(field.centroidsByLayout instanceof Map)) {
+      throw new TypeError(
+        'User-defined field centroidsByLayout must be a Map'
+      );
     }
-    requireRecord(
-      field.centroidsByDim,
-      'User-defined field centroidsByDim'
-    );
-    const dimensionKey = String(dimension);
-    if (Object.hasOwn(field.centroidsByDim, dimensionKey)) {
-      if (!Array.isArray(field.centroidsByDim[dimensionKey])) {
+    if (field.centroidsByLayout.has(key)) {
+      if (!Array.isArray(field.centroidsByLayout.get(key))) {
         throw new TypeError(
-          `User-defined centroid dimension ${dimensionKey} must be an array`
+          `User-defined centroids of layout "${key}" must be an array`
         );
       }
       return;
@@ -555,46 +567,40 @@ export class FieldOverlayInternalMethods {
     if (
       this.dimensionManager === null
       || typeof this.dimensionManager !== 'object'
-      || !(this.dimensionManager.positionCache instanceof Map)
+      || typeof this.dimensionManager.getLayout !== 'function'
     ) {
       throw new TypeError(
-        'User-defined centroid computation requires DimensionManager positionCache'
+        'User-defined centroid computation requires the current DimensionManager'
       );
     }
-    if (!this.dimensionManager.positionCache.has(dimension)) {
-      throw new Error(
-        `Raw ${dimension}D positions are unavailable for centroid computation`
-      );
-    }
-    const rawPositions = this.dimensionManager.positionCache.get(dimension);
+    const dimension = this.dimensionManager.getLayout(key).dimension;
     if (
-      !(rawPositions instanceof Float32Array)
-      || rawPositions.length !== this.pointCount * dimension
+      !(positions instanceof Float32Array)
+      || positions.length !== this.pointCount * dimension
     ) {
       throw new TypeError(
-        `Raw ${dimension}D positions must exactly match the current dataset`
+        `Normalized ${dimension}D positions must exactly match the current dataset`
       );
     }
     requireMethod(
       this._userDefinedFields,
-      'recomputeCentroidsForDimension',
+      'recomputeCentroidsForLayout',
       'User-defined field registry'
     );
-    this._userDefinedFields.recomputeCentroidsForDimension(
+    this._userDefinedFields.recomputeCentroidsForLayout(
       fieldId,
+      key,
       dimension,
-      rawPositions
+      positions
     );
-    if (!Object.hasOwn(field.centroidsByDim, dimensionKey)) {
+    if (
+      !field.centroidsByLayout.has(key)
+      || !(field._normalizedLayouts instanceof Set)
+      || !field._normalizedLayouts.has(key)
+    ) {
       throw new Error(
-        `User-defined centroid dimension ${dimensionKey} was not published`
+        `Normalized user-defined centroids of layout "${key}" were not published`
       );
     }
-    if (!(field._normalizedDims instanceof Set)) {
-      throw new TypeError(
-        'User-defined centroid normalization state must be a Set'
-      );
-    }
-    field._normalizedDims.delete(dimensionKey);
   }
 }

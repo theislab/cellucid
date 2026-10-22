@@ -100,8 +100,8 @@ test('canvas sizing returns one generation-owned view instead of a per-frame tup
   );
   const trackerSource = extractSourceRange(
     source,
-    'export function createCanvasResizeObserver(canvas)',
-    'export function normalizePositions(positions)',
+    'export function createCanvasResizeObserver(canvas, onChange = null)',
+    'export function normalizePositions(positions, dimension = 3)',
   );
 
   assert.match(

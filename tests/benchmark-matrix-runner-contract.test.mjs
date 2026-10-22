@@ -3,8 +3,7 @@ import test from 'node:test';
 
 import {
   createBenchmarkMatrixRunner,
-  expandMatrix,
-  MAX_BENCHMARK_VIEWS
+  expandMatrix
 } from '../assets/js/app/ui/modules/benchmark/matrix-runner.js';
 import { instrumentGlUploads } from '../assets/js/app/ui/modules/benchmark/gl-upload-counter.js';
 
@@ -65,7 +64,7 @@ function createElement(id) {
   };
 }
 
-function createHarnessDouble({ lodLevels = [4] } = {}) {
+function createHarnessDouble({ lodLevels = [4], geometrySettledAfter = 0 } = {}) {
   const keepViewButton = createElement('split-keep-view-btn');
   const clearButton = createElement('split-clear-btn');
   const layoutSelect = createElement('view-layout-mode');
@@ -78,6 +77,7 @@ function createHarnessDouble({ lodLevels = [4] } = {}) {
     adaptiveLod: [],
     frustumCulling: [],
     forceLod: [],
+    geometryPolls: 0,
     cameraPublications: 0,
     cameraStates: new Set()
   };
@@ -122,6 +122,10 @@ function createHarnessDouble({ lodLevels = [4] } = {}) {
     },
     getSnapshotViews() {
       return snapshots.slice();
+    },
+    isPresentedGeometrySettled() {
+      record.geometryPolls++;
+      return record.geometryPolls > geometrySettledAfter;
     },
     getViewLayout() {
       return { mode: layoutMode, activeId: 'live', liveViewHidden: false };
@@ -192,12 +196,10 @@ test('a forced LOD probe is never scheduled with adaptive LOD off', () => {
   assert.equal(cells.filter(cell => cell.lod === false).length, 2);
 });
 
-test('the view-count axis stops at the viewer snapshot ceiling', () => {
-  assert.equal(MAX_BENCHMARK_VIEWS, 4);
-  assert.throws(
-    () => expandMatrix({ viewCount: [5] }),
-    /exceeds the viewer ceiling of 4 views/
-  );
+test('the view-count axis takes any number of views', () => {
+  // The viewer keeps any number of views, so the harness drives any number.
+  assert.equal(expandMatrix({ viewCount: [12] }).every(cell => cell.viewCount === 12), true);
+  assert.throws(() => expandMatrix({ viewCount: [0] }), /positive/i);
   assert.throws(() => expandMatrix({ lod: [] }), /non-empty array/);
   assert.throws(() => expandMatrix({ regime: ['spin'] }), /Matrix regime/);
   assert.throws(() => expandMatrix({ lod: ['yes'] }), /exact boolean/);
@@ -231,7 +233,7 @@ test('view count is driven through the application controls and verified', async
   assert.equal(viewer.getSnapshotViews().length, 0);
 });
 
-test('a view count beyond the ceiling is refused before anything is clicked', async () => {
+test('any view count is reached through the keep-view control', async () => {
   const scheduler = createScheduler();
   const { viewer, ownerDocument, keepViewButton } = createHarnessDouble();
   const runner = createBenchmarkMatrixRunner({
@@ -240,11 +242,9 @@ test('a view count beyond the ceiling is refused before anything is clicked', as
     requestFrame: scheduler.requestFrame,
     cancelFrame: scheduler.cancelFrame
   });
-  await assert.rejects(
-    () => runner.ensureViewCount(5),
-    /exceeds the viewer ceiling/
-  );
-  assert.equal(keepViewButton.clicks, 0);
+  await runner.ensureViewCount(6);
+  assert.equal(keepViewButton.clicks, 5);
+  assert.equal(viewer.getSnapshotViews().length, 5);
 });
 
 test('a disabled keep-view control fails loudly instead of measuring one view', async () => {
@@ -416,6 +416,49 @@ test('a configuration applies every axis and reports what it achieved', async ()
   assert.ok(cell.cameraPath.distanceBounds.farDistance > cell.cameraPath.distanceBounds.nearDistance);
 });
 
+test('a window starts only once every presented view draws from its final geometry', async () => {
+  // The trees a toggle asks for land in later frames and re-order their
+  // stores on the GPU; a window that began before that measured the landing.
+  const scheduler = createScheduler();
+  const { viewer, ownerDocument, record } = createHarnessDouble({
+    geometrySettledAfter: 5
+  });
+  const runner = createBenchmarkMatrixRunner({
+    viewer,
+    document: ownerDocument,
+    requestFrame: scheduler.requestFrame,
+    cancelFrame: scheduler.cancelFrame
+  });
+  const publicationsBefore = record.cameraPublications;
+  await runner.applyConfiguration({
+    viewCount: 1,
+    lod: true,
+    frustumCulling: true,
+    forceLodLevel: -1,
+    regime: 'static'
+  });
+  assert.equal(record.geometryPolls, 6, 'polled once a frame until it held');
+  assert.equal(record.cameraPublications, publicationsBefore, 'no window frame ran');
+
+  const never = createHarnessDouble({ geometrySettledAfter: Number.POSITIVE_INFINITY });
+  const stuck = createBenchmarkMatrixRunner({
+    viewer: never.viewer,
+    document: never.ownerDocument,
+    requestFrame: scheduler.requestFrame,
+    cancelFrame: scheduler.cancelFrame
+  });
+  await assert.rejects(
+    stuck.applyConfiguration({
+      viewCount: 1,
+      lod: true,
+      frustumCulling: true,
+      forceLodLevel: -1,
+      regime: 'static'
+    }),
+    /every presented view to draw from its final geometry/
+  );
+});
+
 test('the runner refuses a viewer that cannot drive the axes', () => {
   assert.throws(
     () => createBenchmarkMatrixRunner({ viewer: null }),
@@ -441,4 +484,40 @@ test('the runner refuses a viewer that cannot drive the axes', () => {
       }),
     /instrumentGlUploads/
   );
+});
+
+test('every matrix cell runs the one path fitted to the camera before the sweep', async () => {
+  const scheduler = createScheduler();
+  const { viewer, ownerDocument } = createHarnessDouble();
+  // A real viewer reports back the pose the previous cell published.
+  let published = null;
+  const initial = viewer.getCameraState();
+  const publish = viewer.setCameraState;
+  viewer.setCameraState = state => {
+    publish(state);
+    published = structuredClone(state);
+  };
+  viewer.getCameraState = () => structuredClone(published ?? initial);
+  const runner = createBenchmarkMatrixRunner({
+    viewer,
+    document: ownerDocument,
+    requestFrame: scheduler.requestFrame,
+    cancelFrame: scheduler.cancelFrame
+  });
+  const results = await runner.runMatrix({
+    axes: {
+      lod: [true, false],
+      frustumCulling: [true],
+      viewCount: [1],
+      regime: ['static', 'orbit']
+    },
+    warmupFrames: 2,
+    measureFrames: 12
+  });
+
+  assert.equal(results.length, 4);
+  for (const cell of results) {
+    assert.equal(cell.cameraPath.baseRadius, initial.orbit.radius);
+    assert.deepEqual(cell.cameraPath, results[0].cameraPath);
+  }
 });

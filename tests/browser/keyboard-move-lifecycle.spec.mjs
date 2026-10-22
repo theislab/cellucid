@@ -2,6 +2,7 @@ import { expect, test } from './helpers/test.mjs';
 import { dispatchAppDrag } from './helpers/app-drag.mjs';
 import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
+import { openCollapsedPanels } from './helpers/panels.mjs';
 
 /* Cellucid moves things with the pointer in three places: a sidebar panel is
    torn off into a floating window, highlight pages are dropped into the
@@ -35,18 +36,24 @@ function observeProductErrors(page) {
 async function openPreparedDataset(page) {
   await page.goto(PREPARED_DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
+  await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
     'Current UI prepared fixture'
   );
 }
 
+/* A panel floats by its frame — the element that holds the card and the
+   header controls beside its summary — so that is what moves and what carries
+   the floating class. */
 function panelFloatingState(page) {
   return page.evaluate(() => {
-    const panel = document.getElementById('visualization-section');
-    if (panel === null) throw new Error('Visualization panel is absent');
+    const frame = document.getElementById('visualization-section')?.parentElement;
+    if (!frame?.classList.contains('accordion-panel')) {
+      throw new Error('Visualization panel is not standing in its frame');
+    }
     return {
-      floating: panel.classList.contains('accordion-floating'),
-      parentId: panel.parentElement === null ? '' : panel.parentElement.id,
+      floating: frame.classList.contains('accordion-floating'),
+      parentId: frame.parentElement === null ? '' : frame.parentElement.id,
     };
   });
 }
@@ -65,15 +72,18 @@ test('a sidebar panel undocks and docks from the keyboard, and still from the po
   await openPreparedDataset(page);
 
   const summary = page.locator('#visualization-section > summary');
-  const undockButton = summary.locator('.accordion-undock-btn');
-  const dockButton = summary.locator('.accordion-dock-btn');
+  const actions = page.locator(
+    '.accordion-panel:has(> #visualization-section) > .accordion-panel-actions'
+  );
+  const undockButton = actions.locator('> .accordion-undock-btn');
+  const dockButton = actions.locator('> .accordion-dock-btn');
 
   /* The way out has to exist before you are through the door: the undock
      control is present and reachable while the panel is still docked. */
   await expect(undockButton).toBeVisible();
   await expect(undockButton).toHaveAttribute(
     'aria-label',
-    'Undock panel into a floating window'
+    'Undock Visualization panel into a floating window'
   );
   await expect(dockButton).toBeHidden();
   expect(await panelFloatingState(page)).toEqual({
@@ -120,9 +130,9 @@ test('a sidebar panel undocks and docks from the keyboard, and still from the po
     floating: true,
     parentId: 'floating-panels-root',
   });
-  await expect(page.locator('#visualization-section')).not.toHaveClass(
-    /floating-enter/,
-  );
+  await expect(
+    page.locator('.accordion-panel:has(> #visualization-section)')
+  ).not.toHaveClass(/floating-enter/);
 
   /* The floating panel's only size control was pointer-only and
      `aria-hidden`. It is a focusable window splitter now. */
@@ -190,7 +200,7 @@ async function openCategoryBuilder(page, extraPages) {
   const addPage = page.getByRole('button', { name: 'Add highlight page' });
   for (let index = 0; index < extraPages; index++) await addPage.click();
   const header = page.locator(
-    '#cat-builder-accordion-item .analysis-accordion-header'
+    '#cat-builder-accordion-item .disclosure-header'
   );
   await header.scrollIntoViewIfNeeded();
   await header.click();

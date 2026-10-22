@@ -1,22 +1,24 @@
 /**
  * @fileoverview Camera Path — main UI module.
  *
- * Wires the "Camera Path" accordion: navigation mode controls (mirroring the
- * Compare Views navigation block), save-position button, a unified scrollable
- * keyframe + timing list, interpolation settings, and the viewport transport
- * bar.
+ * Wires the "Camera path" accordion: the save-position button, a unified
+ * scrollable keyframe + timing list, playback settings, and the viewport
+ * transport bar. Navigation itself lives in the Navigation panel; a keyframe
+ * goto, playback and a restore move the mode through that panel's
+ * `syncNavigationMode`, and the navigation settings a path records are read
+ * and restored through its `exportSettings` / `restoreSettings`.
  *
  * Follows the same factory-function pattern as camera-controls.js.
  *
  * @module ui/modules/cinematic-camera/index
  */
 
+import { representationName } from '../../../../data/representation-names.js';
 import {
   createKeyframeStore,
   isCameraPathReady,
   isValidCameraKeyframe,
-  MAX_KEYFRAMES,
-  MAX_TRANSITION_DURATION_SECONDS
+  MIN_TRANSITION_DURATION_SECONDS
 } from './keyframe-store.js';
 import {
   createPlaybackController,
@@ -35,13 +37,15 @@ import {
   parseRangeInput
 } from '../../core/numeric-input-contract.js';
 import { escapeHtml } from '../../../utils/dom-utils.js';
+import { ICONS } from '../../components/controls.js';
 
-// SVG icons (12 × 12, 2 px stroke, matching field-action-btn icons)
-const SVG_UP = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="18 15 12 9 6 15"/></svg>`;
-const SVG_DOWN = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>`;
-const SVG_GOTO = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>`;
-const SVG_DELETE = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>`;
-const LOOP_BACK_LABEL = '\u21A9 Return to Start';
+// Keyframe action glyphs. They are drawn at the shared icon-button size
+// (`.icon-btn svg`); delete uses the one shared delete glyph.
+const SVG_UP = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="18 15 12 9 6 15"/></svg>`;
+const SVG_DOWN = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>`;
+const SVG_GOTO = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>`;
+const SVG_DELETE = ICONS.delete.replace('<svg ', '<svg aria-hidden="true" ');
+const LOOP_BACK_LABEL = '\u21A9 Return to start';
 const CAMERA_PATH_SESSION_KEYS = [
   'autoplay',
   'defaultSpeed',
@@ -65,24 +69,6 @@ const CAMERA_PATH_SESSION_KEYS = [
 ];
 const PLAYBACK_SNAPSHOT_KEYS = ['camera', 'globalT', 'state'];
 const REQUIRED_DOM_KEYS = [
-  'navModeSelect',
-  'orbitControls',
-  'planarControls',
-  'freeflyControls',
-  'orbitKeySpeedInput',
-  'orbitKeySpeedDisplay',
-  'orbitReverseCheckbox',
-  'showOrbitAnchorCheckbox',
-  'planarPanSpeedInput',
-  'planarPanSpeedDisplay',
-  'planarZoomToCursorCheckbox',
-  'planarInvertAxesCheckbox',
-  'lookSensitivityInput',
-  'lookSensitivityDisplay',
-  'moveSpeedInput',
-  'moveSpeedDisplay',
-  'invertLookCheckbox',
-  'pointerLockCheckbox',
   'saveBtn',
   'keyframeList',
   'clearBtn',
@@ -144,7 +130,6 @@ export function assertCameraPathSessionState(data) {
   }
   if (
     !Array.isArray(data.keyframes) ||
-    data.keyframes.length > MAX_KEYFRAMES ||
     !data.keyframes.every(isValidCameraKeyframe)
   ) {
     throw new TypeError('Camera Path session state contains invalid keyframes.');
@@ -258,15 +243,29 @@ export function assertCameraPathPlaybackSnapshot(value) {
  * @param {Object} options
  * @param {Object} options.viewer   Viewer API.
  * @param {Object} options.dom      Cached DOM references (cinematicCamera block).
+ * @param {Object} options.navigation The Navigation panel (camera-controls.js):
+ *   `syncNavigationMode`, `exportSettings`, `restoreSettings`.
  * @param {Object} options.dataSourceManager Dataset lifecycle source.
  */
 export function initCinematicCamera({
   viewer,
   dom,
-  dataSourceManager
+  navigation,
+  dataSourceManager,
+  focusedRepresentation
 }) {
+  if (typeof focusedRepresentation !== 'function') {
+    throw new TypeError(
+      'Camera Path requires focusedRepresentation(): the embedding the focused view shows.'
+    );
+  }
   if (!dom || typeof dom !== 'object' || Array.isArray(dom)) {
     throw new TypeError('Camera Path requires a DOM reference object.');
+  }
+  for (const method of ['syncNavigationMode', 'exportSettings', 'restoreSettings']) {
+    if (typeof navigation?.[method] !== 'function') {
+      throw new TypeError(`Camera Path requires the Navigation panel's ${method}().`);
+    }
   }
   for (const key of REQUIRED_DOM_KEYS) {
     if (!dom[key]) {
@@ -356,164 +355,20 @@ export function initCinematicCamera({
 
     if (loopBackActive || getNonLoopBackCount() < 2) return;
 
-    if (keyframeStore.getCount() >= keyframeStore.MAX_KEYFRAMES) {
-      getNotificationCenter().warning(
-        `Maximum ${keyframeStore.MAX_KEYFRAMES} keyframes reached.`,
-        { category: 'cinematic', duration: 3000 }
-      );
-      return;
-    }
-
     const first = keyframeStore.getAll().find((kf) => kf.id !== loopBackKeyframeId);
     if (!first) return;
     loopBackKeyframeId = keyframeStore.add(
       { navigationMode: first.navigationMode, orbit: first.orbit, freefly: first.freefly },
-      LOOP_BACK_LABEL
+      LOOP_BACK_LABEL,
+      first.representation
     );
-  }
-
-  // =========================================================================
-  // Navigation controls (mirrors camera-controls.js wiring)
-  // =========================================================================
-
-  function toggleNavigationPanels(mode) {
-    if (destroyed) return;
-    dom.freeflyControls.style.display = mode === 'free' ? 'block' : 'none';
-    dom.orbitControls.style.display = mode === 'orbit' ? 'block' : 'none';
-    dom.planarControls.style.display = mode === 'planar' ? 'block' : 'none';
   }
 
   function syncNavigationMode(mode) {
     if (destroyed) return;
     assertNavigationMode(mode);
-    dom.navModeSelect.value = mode;
-    toggleNavigationPanels(mode);
-    // The viewer releases pointer lock whenever navigation leaves free-fly, and
-    // Compare Views clears its own copy of this control when that happens. This
-    // mirror has to agree whatever moved the mode — this select, Compare Views,
-    // a Go-to, playback, or a restore — or it goes on claiming a lock the
-    // viewer no longer holds and the next click on it turns pointer lock off
-    // instead of on.
-    if (mode !== 'free') dom.pointerLockCheckbox.checked = false;
+    navigation.syncNavigationMode(mode);
   }
-
-  // Sync dropdown → viewer on change
-  listen(dom.navModeSelect, 'change', () => {
-    viewer.setNavigationMode(dom.navModeSelect.value);
-    const mode = dom.navModeSelect.value;
-    syncNavigationMode(mode);
-    dom.navModeSelect.blur();
-  });
-
-  // Sync viewer → dropdown on init
-  syncNavigationMode(viewer.getNavigationMode());
-
-  // ---- Orbit controls ----
-
-  function updateOrbitKeySpeed() {
-    if (destroyed) return;
-    const rawValue = parseRangeInput(dom.orbitKeySpeedInput.value, {
-      minimum: 1,
-      maximum: 100,
-      label: 'Camera Path orbit keyboard speed'
-    });
-    const value = rawValue / 100;
-    dom.orbitKeySpeedDisplay.textContent = value.toFixed(2) + 'x';
-    viewer.setOrbitKeySpeed(value);
-  }
-
-  updateOrbitKeySpeed();
-  listen(dom.orbitKeySpeedInput, 'input', updateOrbitKeySpeed);
-
-  viewer.setOrbitInvertRotation(dom.orbitReverseCheckbox.checked);
-  listen(dom.orbitReverseCheckbox, 'change', () => {
-    viewer.setOrbitInvertRotation(dom.orbitReverseCheckbox.checked);
-  });
-
-  viewer.setShowOrbitAnchor(dom.showOrbitAnchorCheckbox.checked);
-  listen(dom.showOrbitAnchorCheckbox, 'change', () => {
-    viewer.setShowOrbitAnchor(dom.showOrbitAnchorCheckbox.checked);
-  });
-
-  // ---- Planar controls ----
-
-  function updatePlanarPanSpeed() {
-    if (destroyed) return;
-    const rawValue = parseRangeInput(dom.planarPanSpeedInput.value, {
-      minimum: 1,
-      maximum: 100,
-      label: 'Camera Path planar keyboard pan speed'
-    });
-    const t = (rawValue - 1) / 99;
-    const value = 0.001 + t * (0.0075 - 0.001);
-    dom.planarPanSpeedDisplay.textContent = value.toFixed(4) + 'x';
-    viewer.setPlanarPanSpeed(value);
-  }
-
-  updatePlanarPanSpeed();
-  listen(dom.planarPanSpeedInput, 'input', updatePlanarPanSpeed);
-
-  viewer.setPlanarZoomToCursor(dom.planarZoomToCursorCheckbox.checked);
-  listen(dom.planarZoomToCursorCheckbox, 'change', () => {
-    viewer.setPlanarZoomToCursor(dom.planarZoomToCursorCheckbox.checked);
-  });
-
-  viewer.setPlanarInvertAxes(dom.planarInvertAxesCheckbox.checked);
-  listen(dom.planarInvertAxesCheckbox, 'change', () => {
-    viewer.setPlanarInvertAxes(dom.planarInvertAxesCheckbox.checked);
-  });
-
-  // ---- Free-fly controls ----
-
-  function updateLookSensitivity() {
-    if (destroyed) return;
-    const v = parseRangeInput(dom.lookSensitivityInput.value, {
-      minimum: 1,
-      maximum: 30,
-      label: 'Camera Path look sensitivity'
-    });
-    const sensitivity = v * 0.0005;
-    dom.lookSensitivityDisplay.textContent = (v / 100).toFixed(2) + 'x';
-    viewer.setLookSensitivity(sensitivity);
-  }
-
-  function updateMoveSpeed() {
-    if (destroyed) return;
-    const v = parseRangeInput(dom.moveSpeedInput.value, {
-      minimum: 1,
-      maximum: 500,
-      label: 'Camera Path move speed'
-    });
-    const speed = v / 100;
-    dom.moveSpeedDisplay.textContent = speed.toFixed(2) + ' u/s';
-    viewer.setMoveSpeed(speed);
-  }
-
-  updateLookSensitivity();
-  listen(dom.lookSensitivityInput, 'input', updateLookSensitivity);
-
-  updateMoveSpeed();
-  listen(dom.moveSpeedInput, 'input', updateMoveSpeed);
-
-  const applyInvertLook = (value) => {
-    if (destroyed) return;
-    viewer.setInvertLookY(value);
-    viewer.setInvertLookX(value);
-  };
-  applyInvertLook(dom.invertLookCheckbox.checked);
-  listen(dom.invertLookCheckbox, 'change', () => {
-    applyInvertLook(dom.invertLookCheckbox.checked);
-  });
-
-  dom.pointerLockCheckbox.checked = false;
-  listen(dom.pointerLockCheckbox, 'change', () => {
-    const mode = dom.navModeSelect.value;
-    if (mode !== 'free') {
-      dom.pointerLockCheckbox.checked = false;
-      return;
-    }
-    viewer.setPointerLockEnabled(dom.pointerLockCheckbox.checked);
-  });
 
   // =========================================================================
   // Default speed slider
@@ -567,12 +422,42 @@ export function initCinematicCamera({
 
   // Keep the nav mode UI in sync when playback changes modes (cross-mode paths)
   // or when playback stops (which jumps to the first keyframe's mode).
+  // A path replays camera poses. Recorded on one representation and played on
+  // a view that shows another, it still plays; this says so once per play.
+  let previousPlaybackState = 'STOPPED';
   playbackController.on('stateChange', (newState) => {
     if (destroyed) return;
-    if (newState === 'STOPPED' && dom.navModeSelect) {
+    if (newState === 'PLAYING' && previousPlaybackState === 'STOPPED') {
+      noteRepresentationMismatch();
+    }
+    previousPlaybackState = newState;
+    if (newState === 'STOPPED') {
       syncNavigationMode(viewer.getNavigationMode());
     }
   });
+
+  function noteRepresentationMismatch() {
+    const recorded = keyframeStore.getAll()[0]?.representation ?? null;
+    const current = focusedRepresentation();
+    if (
+      recorded === null ||
+      current === null ||
+      current.ref === null ||
+      (recorded.key === current.ref.key &&
+        JSON.stringify(recorded.columns) === JSON.stringify(current.ref.columns))
+    ) {
+      return;
+    }
+    const recordedName = representationName({
+      layoutKey: recorded.key,
+      label: recorded.key,
+      provenance: recorded.columns === null ? null : { key: recorded.key, columns: recorded.columns },
+    });
+    getNotificationCenter().info(
+      `This camera path was recorded on ${recordedName}; the view shows ${current.name}.`,
+      { category: 'cinematic', duration: 5000 }
+    );
+  }
 
   function startAutoplay() {
     if (destroyed) return false;
@@ -649,16 +534,13 @@ export function initCinematicCamera({
 
   listen(dom.saveBtn, 'click', () => {
     const loopBackWasActive = hasLoopBackKeyframe();
-    if (keyframeStore.getCount() >= keyframeStore.MAX_KEYFRAMES) {
-      getNotificationCenter().warning(
-        `Maximum ${keyframeStore.MAX_KEYFRAMES} keyframes reached.`,
-        { category: 'cinematic', duration: 3000 }
-      );
-      return;
-    }
 
     // Capture the viewer's current camera state (uses whatever mode is active)
-    const newId = keyframeStore.add(viewer.getCameraState());
+    const newId = keyframeStore.add(
+      viewer.getCameraState(),
+      undefined,
+      focusedRepresentation()?.ref ?? null
+    );
     if (loopBackWasActive && newId) {
       keyframeStore.reorder(newId, -1);
     }
@@ -678,34 +560,118 @@ export function initCinematicCamera({
   // Set All Timing
   // =========================================================================
 
+  /**
+   * Read a typed transition duration. Out-of-range or malformed text is the
+   * viewer's input, not a programming error: the field reports why it was
+   * rejected, shows `revertValue` again, and nothing is stored.
+   *
+   * @param {HTMLInputElement} input
+   * @param {string} revertValue
+   * @returns {{ valid: true, value: number|null } | { valid: false }}
+   */
+  function readTransitionDurationInput(input, revertValue) {
+    let value;
+    try {
+      if (input.validity?.badInput) {
+        throw new TypeError('Camera Path transition duration must be a number.');
+      }
+      value = input.value === ''
+        ? null
+        : parseRangeInput(input.value, {
+            minimum: MIN_TRANSITION_DURATION_SECONDS,
+            // No longest transition: any finite number of seconds.
+            maximum: Number.MAX_VALUE,
+            label: 'Camera Path transition duration'
+          });
+    } catch (error) {
+      if (!(error instanceof RangeError || error instanceof TypeError)) {
+        throw error;
+      }
+      input.value = revertValue;
+      input.setCustomValidity(
+        `Enter a duration of at least ${MIN_TRANSITION_DURATION_SECONDS} ` +
+        'seconds, or leave it empty for auto.'
+      );
+      input.reportValidity();
+      return { valid: false };
+    }
+    input.setCustomValidity('');
+    return { valid: true, value };
+  }
+
+  // A rejected entry stays flagged only until the viewer edits it again.
+  listen(dom.setAllDuration, 'input', () => {
+    dom.setAllDuration.setCustomValidity('');
+  });
+
   listen(dom.setAllBtn, 'click', () => {
-    const raw = dom.setAllDuration.value;
-    const value = raw === ''
-      ? null
-      : parseRangeInput(raw, {
-          minimum: 0.1,
-          maximum: MAX_TRANSITION_DURATION_SECONDS,
-          label: 'Camera Path transition duration'
-        });
-    keyframeStore.setAllDurations(value);
+    const duration = readTransitionDurationInput(dom.setAllDuration, '');
+    if (!duration.valid) return;
+    keyframeStore.setAllDurations(duration.value);
   });
 
   // =========================================================================
   // Unified keyframe + timing list rendering
   // =========================================================================
 
+  /**
+   * Identify the list control that holds focus, so a rebuild of the list can
+   * put focus back on the equivalent control instead of dropping it to body.
+   */
+  function captureKeyframeListFocus(listEl) {
+    const active = document.activeElement;
+    if (!active || active === listEl || !listEl.contains(active)) return null;
+    if (active.classList.contains('cinematic-loopback-list-toggle')) {
+      return { selector: '.cinematic-loopback-list-toggle' };
+    }
+    const pairIndex = active.dataset.pairIndex;
+    if (pairIndex !== undefined) {
+      return { selector: `.cinematic-duration-input[data-pair-index="${pairIndex}"]` };
+    }
+    const item = active.closest('.cinematic-keyframe-item');
+    const action = active.dataset.action;
+    if (item && action) {
+      return {
+        itemId: item.dataset.id,
+        selector: `[data-action="${action}"]`
+      };
+    }
+    return item ? { itemId: item.dataset.id, selector: '[data-action="rename"]' } : null;
+  }
+
+  function restoreKeyframeListFocus(listEl, snapshot) {
+    if (snapshot === null) return;
+    let scope = listEl;
+    if (snapshot.itemId !== undefined) {
+      scope = [...listEl.querySelectorAll('.cinematic-keyframe-item')]
+        .find(item => item.dataset.id === snapshot.itemId) ?? null;
+      if (scope === null) return;
+    }
+    // A move button that became disabled (the keyframe reached an end) hands
+    // focus to the keyframe's first enabled action button instead.
+    const candidates = [
+      scope.querySelector(`${snapshot.selector}:not(:disabled)`),
+      scope.querySelector('.icon-btn:not(:disabled)'),
+      scope.querySelector('[data-action]:not(:disabled)'),
+    ];
+    const target = candidates.find(candidate => candidate !== null) ?? null;
+    target?.focus({ preventScroll: true });
+  }
+
   function renderKeyframeList() {
     if (destroyed) return;
     const listEl = dom.keyframeList;
     if (!listEl) return;
+    const focusSnapshot = captureKeyframeListFocus(listEl);
 
     const keyframes = keyframeStore.getAll();
     const hasLoopBack = hasLoopBackKeyframe();
     const nonLoopBackCount = getNonLoopBackCount();
 
     if (keyframes.length === 0) {
-      listEl.innerHTML = '<div class="cinematic-empty-state">No keyframes saved yet.</div>';
-      if (dom.timingActions) dom.timingActions.style.display = 'none';
+      listEl.innerHTML = '<p class="empty-state">No keyframes saved yet.</p>';
+      if (dom.timingActions) dom.timingActions.hidden = true;
+      if (focusSnapshot !== null) dom.saveBtn.focus({ preventScroll: true });
       return;
     }
 
@@ -717,14 +683,16 @@ export function initCinematicCamera({
       const actionButtons = isLoopBack
         ? ''
         : `<div class="cinematic-keyframe-actions">
-    <button class="cinematic-kf-btn" data-action="up" title="Move up"${i === 0 ? ' disabled' : ''}>${SVG_UP}</button>
-    <button class="cinematic-kf-btn" data-action="down" title="Move down"${i >= lastMovableIndex ? ' disabled' : ''}>${SVG_DOWN}</button>
-    <button class="cinematic-kf-btn" data-action="goto" title="Go to position">${SVG_GOTO}</button>
-    <button class="cinematic-kf-btn cinematic-kf-delete" data-action="delete" title="Delete">${SVG_DELETE}</button>
+    <button type="button" class="icon-btn" data-action="up" aria-label="Move up" title="Move up"${i === 0 ? ' disabled' : ''}>${SVG_UP}</button>
+    <button type="button" class="icon-btn" data-action="down" aria-label="Move down" title="Move down"${i >= lastMovableIndex ? ' disabled' : ''}>${SVG_DOWN}</button>
+    <button type="button" class="icon-btn" data-action="goto" aria-label="Go to position" title="Go to position">${SVG_GOTO}</button>
+    <button type="button" class="icon-btn icon-btn-danger" data-action="delete" aria-label="Delete keyframe" title="Delete keyframe">${SVG_DELETE}</button>
   </div>`;
       html += `<div class="cinematic-keyframe-item${isLoopBack ? ' cinematic-keyframe-item-loopback' : ''}" data-id="${escapeHtml(kf.id)}">
   <span class="cinematic-keyframe-index">${i + 1}</span>
-  <span class="cinematic-keyframe-label${isLoopBack ? ' cinematic-keyframe-label-static' : ''}"${isLoopBack ? '' : ' data-action="rename" title="Click to rename"'}>${escapeHtml(kf.label)}</span>
+  ${isLoopBack
+    ? `<span class="cinematic-keyframe-label cinematic-keyframe-label-static">${escapeHtml(kf.label)}</span>`
+    : `<button type="button" class="cinematic-keyframe-label" data-action="rename" title="${escapeHtml(kf.label)} (click to rename)" aria-label="Rename keyframe ${escapeHtml(kf.label)}">${escapeHtml(kf.label)}</button>`}
   ${actionButtons}
 </div>`;
 
@@ -733,24 +701,25 @@ export function initCinematicCamera({
         const dur = kf.transitionDuration;
         const val = dur != null ? dur : '';
         html += `<div class="cinematic-timing-row" data-pair="${i}">
-  <span class="cinematic-timing-label">${escapeHtml(kf.label)} → ${escapeHtml(keyframes[i + 1].label)}</span>
-  <input type="number" class="cinematic-duration-input" min="0.1" max="60" step="0.1"
+  <span class="cinematic-timing-label" title="${escapeHtml(kf.label)} → ${escapeHtml(keyframes[i + 1].label)}">${escapeHtml(kf.label)} → ${escapeHtml(keyframes[i + 1].label)}</span>
+  <input type="number" class="obs-select cinematic-duration-input" min="0.1" step="0.1"
          value="${val}" placeholder="auto" data-pair-index="${i}" title="Duration in seconds (leave empty for auto)" />
   <span class="cinematic-timing-unit">s</span>
 </div>`;
       }
     }
     if (nonLoopBackCount >= 2) {
-      html += `<div class="cinematic-loopback-row">
-  <span class="cinematic-loopback-row-label">${LOOP_BACK_LABEL}</span>
-  <input type="checkbox" class="cinematic-loopback-list-toggle" aria-label="Toggle return to start keyframe"${hasLoopBack ? ' checked' : ''} />
-</div>`;
+      html += `<label class="checkbox-inline cinematic-loopback-row">
+  <input type="checkbox" class="cinematic-loopback-list-toggle"${hasLoopBack ? ' checked' : ''} />
+  End with a return to the first keyframe
+</label>`;
     }
     listEl.innerHTML = html;
+    restoreKeyframeListFocus(listEl, focusSnapshot);
 
     // Show the "Set all" actions row when ≥ 2 keyframes
     if (dom.timingActions) {
-      dom.timingActions.style.display = keyframes.length >= 2 ? '' : 'none';
+      dom.timingActions.hidden = keyframes.length < 2;
     }
 
     // Toggle scroll-fade mask only when content overflows
@@ -819,18 +788,21 @@ export function initCinematicCamera({
       if (!input) return;
       const pairIndex = parseIntegerInput(input.dataset.pairIndex, {
         minimum: 0,
-        maximum: keyframeStore.MAX_KEYFRAMES - 1,
+        maximum: Math.max(0, keyframeStore.getCount() - 2),
         label: 'Camera Path keyframe pair index'
       });
-      const raw = input.value;
-      const value = raw === ''
-        ? null
-        : parseRangeInput(raw, {
-            minimum: 0.1,
-            maximum: MAX_TRANSITION_DURATION_SECONDS,
-            label: 'Camera Path transition duration'
-          });
-      keyframeStore.setDuration(pairIndex, value);
+      const stored = keyframeStore.getAll()[pairIndex]?.transitionDuration;
+      const duration = readTransitionDurationInput(
+        input,
+        stored == null ? '' : String(stored)
+      );
+      if (!duration.valid) return;
+      keyframeStore.setDuration(pairIndex, duration.value);
+    });
+
+    listen(dom.keyframeList, 'input', (e) => {
+      const input = e.target.closest('.cinematic-duration-input');
+      if (input) input.setCustomValidity('');
     });
   }
 
@@ -847,34 +819,45 @@ export function initCinematicCamera({
 
     const input = document.createElement('input');
     input.type = 'text';
-    input.className = 'cinematic-keyframe-rename';
+    input.className = 'obs-select cinematic-keyframe-rename';
+    input.setAttribute('aria-label', `Rename keyframe ${kf.label}`);
     input.value = kf.label;
-    input.maxLength = 40;
 
-    labelEl.style.display = 'none';
+    labelEl.hidden = true;
     labelEl.parentElement.insertBefore(input, labelEl.nextSibling);
     input.focus();
     input.select();
 
-    const commit = () => {
+    // A committed rename rebuilds the list while the input still holds focus,
+    // so the rebuild returns focus to the renamed keyframe's label. Every
+    // other ending puts focus back on the label explicitly.
+    const commit = ({ focusLabel }) => {
       const newLabel = input.value.trim();
       if (newLabel && newLabel !== kf.label) {
         keyframeStore.rename(kfId, newLabel);
-      } else {
-        labelEl.style.display = '';
-        input.remove();
+        return;
       }
+      labelEl.hidden = false;
+      if (focusLabel) labelEl.focus({ preventScroll: true });
+      input.remove();
     };
 
-    const ownedCommit = listen(input, 'blur', commit, { once: true });
+    const ownedCommit = listen(
+      input,
+      'blur',
+      () => commit({ focusLabel: false }),
+      { once: true }
+    );
     listen(input, 'keydown', (e) => {
       if (e.key === 'Enter') {
         e.preventDefault();
-        input.blur();
+        input.removeEventListener('blur', ownedCommit);
+        commit({ focusLabel: true });
       } else if (e.key === 'Escape') {
         e.preventDefault();
-        labelEl.style.display = '';
         input.removeEventListener('blur', ownedCommit);
+        labelEl.hidden = false;
+        labelEl.focus({ preventScroll: true });
         input.remove();
       }
     });
@@ -949,15 +932,7 @@ export function initCinematicCamera({
       easing: dom.easingSelect.value,
       defaultSpeed: dom.defaultSpeedInput.value,
       // Navigation interaction settings
-      invertLook: dom.invertLookCheckbox.checked,
-      lookSensitivity: dom.lookSensitivityInput.value,
-      moveSpeed: dom.moveSpeedInput.value,
-      orbitKeySpeed: dom.orbitKeySpeedInput.value,
-      orbitReverse: dom.orbitReverseCheckbox.checked,
-      planarInvertAxes: dom.planarInvertAxesCheckbox.checked,
-      planarPanSpeed: dom.planarPanSpeedInput.value,
-      planarZoomToCursor: dom.planarZoomToCursorCheckbox.checked,
-      showOrbitAnchor: dom.showOrbitAnchorCheckbox.checked,
+      ...navigation.exportSettings(),
       // Navigation mode
       navigationMode: viewer.getNavigationMode()
     };
@@ -994,28 +969,7 @@ export function initCinematicCamera({
       viewer.setNavigationMode(data.navigationMode);
       syncNavigationMode(data.navigationMode);
 
-      dom.orbitKeySpeedInput.value = data.orbitKeySpeed;
-      updateOrbitKeySpeed();
-      dom.orbitReverseCheckbox.checked = data.orbitReverse;
-      viewer.setOrbitInvertRotation(data.orbitReverse);
-      dom.showOrbitAnchorCheckbox.checked = data.showOrbitAnchor;
-      viewer.setShowOrbitAnchor(data.showOrbitAnchor);
-
-      dom.planarPanSpeedInput.value = data.planarPanSpeed;
-      updatePlanarPanSpeed();
-      dom.planarZoomToCursorCheckbox.checked = data.planarZoomToCursor;
-      viewer.setPlanarZoomToCursor(data.planarZoomToCursor);
-      dom.planarInvertAxesCheckbox.checked = data.planarInvertAxes;
-      viewer.setPlanarInvertAxes(data.planarInvertAxes);
-
-      dom.lookSensitivityInput.value = data.lookSensitivity;
-      updateLookSensitivity();
-      dom.moveSpeedInput.value = data.moveSpeed;
-      updateMoveSpeed();
-      dom.invertLookCheckbox.checked = data.invertLook;
-      applyInvertLook(data.invertLook);
-      dom.pointerLockCheckbox.checked = false;
-      viewer.setPointerLockEnabled(false);
+      navigation.restoreSettings(data);
 
       syncLoopBackState();
       renderKeyframeList();
@@ -1078,7 +1032,6 @@ export function initCinematicCamera({
     restorePlaybackSnapshot,
     startAutoplay,
     stopAutoplay,
-    syncNavigationMode,
     resetCameraPath,
     destroy
   };

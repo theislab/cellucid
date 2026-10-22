@@ -2,6 +2,7 @@ import { expect, test } from './helpers/test.mjs';
 
 import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
+import { sceneQuietness } from './helpers/frame-scheduling.mjs';
 
 const DATASET_URL =
   `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=presented-state-events-ci`;
@@ -17,6 +18,10 @@ test('camera motion publishes one bounded burst and unsubscribe is exact', async
   await expect(page.locator('#dataset-name')).toHaveText(
     'Current UI prepared fixture',
   );
+  // The dataset's first frames publish its presented state (its LOD among
+  // it); on a slow renderer they can still be coming after the name shows.
+  // Subscribe once the scene has settled.
+  await expect.poll(() => sceneQuietness(page)).toBe('quiet');
 
   await page.evaluate(async () => {
     const waitForFrames = count => new Promise(resolve => {

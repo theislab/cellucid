@@ -7,12 +7,96 @@
  */
 
 import { runStatisticalTests, formatStatisticalResult } from '../../stats/statistical-tests.js';
-import {
-  filterFiniteNumbers,
-  mean as computeMean,
-  std as computeStd,
-  median as computeMedian
-} from '../../shared/number-utils.js';
+import { categoryCounts } from '../../shared/category-counts.js';
+import { computeStats } from '../../shared/number-utils.js';
+import { getComputeManager } from '../../compute/compute-manager.js';
+import { OperationType } from '../../compute/operations.js';
+
+// =============================================================================
+// LARGE PAGES: STATISTICS ON THE ANALYSIS WORKERS
+// =============================================================================
+
+/**
+ * Finite values (over all pages) from which the summary and the tests of
+ * continuous pages are computed by an analysis worker before they are shown:
+ * their order statistics and tests are linear-time but still take tens of
+ * milliseconds per million values on the thread that draws the interface.
+ */
+const WORKER_MIN_VALUES = 200_000;
+
+/** @type {WeakMap<ArrayLike<number>, ReturnType<typeof computeStats>>} */
+const summaryCache = new WeakMap();
+
+/**
+ * Test results per first page-values array: the arrays, names and data type
+ * they were computed for, and the results.
+ * @type {WeakMap<ArrayLike<unknown>, {arrays: ArrayLike<unknown>[], names: string[], dataType: string, results: Object[]}>}
+ */
+const testsCache = new WeakMap();
+
+const CONTINUOUS_TYPES = new Set(['continuous', 'continuous_obs', 'gene_expression']);
+
+function cachedTests(pageData, dataType) {
+  if (!Array.isArray(pageData) || pageData.length === 0) return null;
+  const entry = testsCache.get(pageData[0].values);
+  if (
+    entry === undefined ||
+    entry.dataType !== dataType ||
+    entry.arrays.length !== pageData.length ||
+    entry.arrays.some((values, i) => values !== pageData[i].values) ||
+    entry.names.some((name, i) => name !== pageData[i].pageName)
+  ) {
+    return null;
+  }
+  return entry.results;
+}
+
+function typedCopy(values) {
+  return ArrayBuffer.isView(values) ? values : Float64Array.from(values);
+}
+
+/**
+ * Compute the summary statistics and the statistical tests of large
+ * continuous pages on the analysis workers, so that `renderSummaryStats` and
+ * `renderStatisticalAnnotations` only read them. Each is the same function
+ * wherever it runs (`computeStats`, `runStatisticalTests`), so the numbers are
+ * the ones this thread would compute. Categorical pages need nothing: their
+ * counts are taken as the page values are built.
+ *
+ * @param {Object[]} pageData
+ * @param {string} dataType
+ */
+export async function preparePageStatistics(pageData, dataType) {
+  if (!Array.isArray(pageData) || !CONTINUOUS_TYPES.has(dataType)) return;
+  let total = 0;
+  for (const pd of pageData) total += pd.values.length;
+  if (total < WORKER_MIN_VALUES) return;
+  const manager = getComputeManager();
+  await manager.init();
+  const work = [];
+  for (const pd of pageData) {
+    if (summaryCache.has(pd.values)) continue;
+    work.push(manager.execute(
+      OperationType.COMPUTE_SUMMARY_STATISTICS,
+      { values: typedCopy(pd.values) },
+      { transfer: !ArrayBuffer.isView(pd.values) }
+    ).then(({ _compute, ...stats }) => summaryCache.set(pd.values, stats)));
+  }
+  if (pageData.length >= 2 && cachedTests(pageData, dataType) === null) {
+    const pages = pageData.map(pd => ({ pageName: pd.pageName, values: typedCopy(pd.values) }));
+    work.push(manager.execute(
+      OperationType.COMPUTE_STATISTICAL_TESTS,
+      { pages, dataType },
+      { transfer: false }
+    ).then(({ results }) => testsCache.set(pageData[0].values, {
+      arrays: pageData.map(pd => pd.values),
+      names: pageData.map(pd => pd.pageName),
+      dataType,
+      results
+    })));
+  }
+  await Promise.all(work);
+}
 
 // =============================================================================
 // SUMMARY STATISTICS
@@ -35,10 +119,12 @@ export function renderSummaryStats(container, pageData, variableName) {
   table.className = 'analysis-stats-table';
 
   if (isCategorial) {
-    // Show category counts per page
+    // Show category counts per page, read from each page's counts (taken once
+    // per values array).
+    const pageCounts = pageData.map(pd => categoryCounts(pd.values));
     const allCategories = new Set();
-    for (const pd of pageData) {
-      for (const val of pd.values) {
+    for (const counts of pageCounts) {
+      for (const val of counts.keys()) {
         allCategories.add(val);
       }
     }
@@ -65,8 +151,9 @@ export function renderSummaryStats(container, pageData, variableName) {
       labelCell.textContent = cat ?? '';
       row.appendChild(labelCell);
 
-      for (const pd of pageData) {
-        const count = pd.values.filter(v => v === cat).length;
+      for (let pageIndex = 0; pageIndex < pageData.length; pageIndex++) {
+        const pd = pageData[pageIndex];
+        const count = pageCounts[pageIndex].get(cat) ?? 0;
         const pct = pd.cellCount > 0 ? ((count / pd.cellCount) * 100).toFixed(1) : '0';
         const td = document.createElement('td');
         td.textContent = `${count} (${pct}%)`;
@@ -85,25 +172,14 @@ export function renderSummaryStats(container, pageData, variableName) {
     }
     table.appendChild(tbody);
   } else {
-    // Show continuous stats using centralized utilities
+    // Per-page statistics: computed by an analysis worker beforehand for a
+    // large page (preparePageStatistics), on this thread otherwise.
     const statsByPage = pageData.map(pd => {
-      const vals = filterFiniteNumbers(pd.values);
-      const n = vals.length;
-      if (n === 0) {
+      const stats = summaryCache.get(pd.values) ?? computeStats(pd.values);
+      if (stats.count === 0) {
         return { count: 0, mean: null, median: null, min: null, max: null, std: null };
       }
-
-      // Sort once for min/max
-      const sorted = [...vals].sort((a, b) => a - b);
-
-      return {
-        count: n,
-        mean: computeMean(vals),
-        median: computeMedian(vals),
-        min: sorted[0],
-        max: sorted[n - 1],
-        std: computeStd(vals)
-      };
+      return stats;
     });
 
     const thead = document.createElement('thead');
@@ -163,15 +239,15 @@ export function renderStatisticalAnnotations(container, pageData, dataType) {
   container.innerHTML = '';
 
   if (!pageData || pageData.length < 2) {
-    const help = document.createElement('div');
-    help.className = 'analysis-annotations-help';
-    help.textContent = 'Select at least 2 pages to see statistical comparisons.';
-    container.appendChild(help);
+    const empty = document.createElement('p');
+    empty.className = 'empty-state';
+    empty.textContent = 'Select 2+ pages for statistics.';
+    container.appendChild(empty);
     return;
   }
 
-  // Run statistical tests
-  const results = runStatisticalTests(pageData, dataType);
+  // Run statistical tests (already run by an analysis worker for large pages).
+  const results = cachedTests(pageData, dataType) ?? runStatisticalTests(pageData, dataType);
 
   // Create results display
   const resultsDiv = document.createElement('div');
@@ -262,12 +338,3 @@ export function renderStatisticalAnnotations(container, pageData, dataType) {
   `;
   container.appendChild(legend);
 }
-
-// =============================================================================
-// EXPORTS
-// =============================================================================
-
-export default {
-  renderSummaryStats,
-  renderStatisticalAnnotations
-};

@@ -230,7 +230,7 @@ export function invalidatePlotThemeCache() {
  * @param {PlotTheme} [theme]
  * @returns {Record<string, any>}
  */
-export function buildPlotlyThemeRelayout(plotElement, theme = getPlotTheme()) {
+function buildPlotlyThemeRelayout(plotElement, theme = getPlotTheme()) {
   const update = /** @type {Record<string, any>} */ ({
     plot_bgcolor: theme.plotBg,
     paper_bgcolor: 'transparent',
@@ -320,7 +320,7 @@ export function buildPlotlyThemeRelayout(plotElement, theme = getPlotTheme()) {
  * @param {HTMLElement} plotElement
  * @returns {Promise<void>}
  */
-export async function applyThemeToPlotlyPlot(plotElement) {
+async function applyThemeToPlotlyPlot(plotElement) {
   if (!plotElement || typeof plotElement !== 'object') {
     throw new TypeError('A rendered Plotly element is required');
   }

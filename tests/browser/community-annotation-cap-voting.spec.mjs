@@ -349,7 +349,7 @@ test('CAP voting exposes every bounded item and applies current results atomical
     name: 'Edit',
     exact: true,
   }).click();
-  await firstExpandedComment.getByPlaceholder('Edit comment...')
+  await firstExpandedComment.getByPlaceholder('Edit comment…')
     .fill('Edited expanded contract comment');
   await firstExpandedComment.getByRole('button', {
     name: 'Save',
@@ -390,7 +390,7 @@ test('CAP voting exposes every bounded item and applies current results atomical
   let firstCard = cards.first();
   await firstCard.locator('.community-annotation-suggestion-actions').first()
     .getByRole('button', { name: 'Edit', exact: true }).click();
-  let editBox = firstCard.locator('.community-annotation-dashed-box')
+  let editBox = firstCard.locator('.control-box')
     .filter({ hasText: 'Edit suggestion' });
   await editBox.getByRole('button', { name: 'Save' }).click();
   await expect(cards.first().locator(
@@ -413,11 +413,10 @@ test('CAP voting exposes every bounded item and applies current results atomical
   firstCard = cards.first();
   await firstCard.locator('.community-annotation-suggestion-actions').first()
     .getByRole('button', { name: 'Edit', exact: true }).click();
-  editBox = firstCard.locator('.community-annotation-dashed-box')
+  editBox = firstCard.locator('.control-box')
     .filter({ hasText: 'Edit suggestion' });
-  await editBox.getByPlaceholder(
-    'Marker genes (optional, comma-separated)'
-  ).fill('STAT2');
+  await editBox.getByRole('textbox', { name: 'Marker genes', exact: true })
+    .fill('STAT2');
   await editBox.getByRole('button', { name: 'Save' }).click();
   await expect(page.locator('.confirm-dialog-title')).toHaveText(
     'Remove marker statistics?'
@@ -433,12 +432,10 @@ test('CAP voting exposes every bounded item and applies current results atomical
   expect(convertedMarkers).toEqual(['STAT2']);
 
   const label = primary.getByPlaceholder('Label (required)').last();
-  const ontology = primary.getByPlaceholder(
-    'Ontology id (optional, e.g. CL:0000625)'
-  ).last();
-  const markers = primary.getByPlaceholder(
-    'Marker genes (optional, comma-separated)'
-  ).last();
+  const ontology = primary.getByRole('textbox', { name: 'Ontology id', exact: true })
+    .last();
+  const markers = primary.getByRole('textbox', { name: 'Marker genes', exact: true })
+    .last();
   await label.fill('Slow cell');
   await primary.getByRole('button', { name: 'Search CAP' }).click();
   await label.fill('Quick cell');
@@ -493,7 +490,7 @@ test('CAP voting exposes every bounded item and applies current results atomical
   });
 
   await ontology.fill('CL:0000084');
-  await primary.getByRole('button', { name: 'Search Ontology' }).click();
+  await primary.getByRole('button', { name: 'Search ontology' }).click();
   await expect(primary.locator('.cap-search-results')).toBeVisible();
   expect(lookupBodies).toContainEqual({
     kind: 'ontology',
@@ -502,11 +499,11 @@ test('CAP voting exposes every bounded item and applies current results atomical
   });
   await primary.locator('.cap-search-close').click();
   await expect(primary.getByRole('button', {
-    name: 'Search Ontology',
+    name: 'Search ontology',
   })).toBeFocused();
 
   await markers.fill('MS4A1, CD3D, LST1');
-  await primary.getByRole('button', { name: 'Search Markers' }).click();
+  await primary.getByRole('button', { name: 'Search markers' }).click();
   await expect(primary.locator('.cap-search-results')).toBeVisible();
   expect(lookupBodies).toContainEqual({
     kind: 'marker',
@@ -515,7 +512,7 @@ test('CAP voting exposes every bounded item and applies current results atomical
   });
   await primary.locator('.cap-search-close').click();
   await expect(primary.getByRole('button', {
-    name: 'Search Markers',
+    name: 'Search markers',
   })).toBeFocused();
 
   const localMarkers = Array.from(
@@ -808,5 +805,306 @@ test('owned confirms cannot survive destroy, replacement, sign-out, or dataset s
   await expectNoTransientDialogs();
   await expect(page.locator('.community-annotation-modal-overlay'))
     .toHaveCount(0);
+  expect(productErrors).toEqual([]);
+});
+
+test('inline comment Escape cancels only the editor and drafts survive session re-renders', async ({
+  page,
+}) => {
+  const productErrors = observeProductErrors(page);
+  await prepareVotingHarness(page, { suggestionCount: 2 });
+  const primary = page.locator('.community-annotation-modal-overlay');
+  const cards = primary.locator('.community-annotation-suggestion-card');
+  await expect(cards).toHaveCount(2);
+  const preview = cards
+    .first()
+    .locator('.community-annotation-comment-preview-item')
+    .first();
+  await preview.getByRole('button', { name: 'Edit', exact: true }).click();
+  const editor = preview.getByPlaceholder('Edit comment…');
+  await expect(editor).toBeFocused();
+  await editor.press('Escape');
+  await expect(primary).toHaveCount(1);
+  await expect(editor).toHaveCount(0);
+  await expect(
+    preview.getByRole('button', { name: 'Edit', exact: true })
+  ).toBeFocused();
+
+  const newSuggestion = primary.locator('.community-annotation-new');
+  const label = newSuggestion.getByRole('textbox', { name: 'Label', exact: true });
+  const evidence = newSuggestion.getByRole('textbox', { name: 'Evidence', exact: true });
+  const firstSuggestionId = await page.evaluate(async () => {
+    const { getCommunityAnnotationSession } = await import(
+      '/assets/js/app/community-annotations/session.js'
+    );
+    return getCommunityAnnotationSession().getSuggestions(
+      window.__capVotingHarness.fieldKey,
+      0
+    )[0].id;
+  });
+  const compose = primary.locator(
+    `textarea[data-community-modal-focus-key*=${JSON.stringify(firstSuggestionId)}]` +
+    '[data-community-modal-focus-key$=":comment-compose"]'
+  );
+  await label.fill('Draft label survives');
+  await evidence.fill('Draft evidence survives');
+  await compose.fill('Draft comment survives');
+
+  await page.evaluate(() => {
+    return import('/assets/js/app/community-annotations/session.js').then(
+      ({ getCommunityAnnotationSession }) => {
+        getCommunityAnnotationSession().addSuggestion(
+          window.__capVotingHarness.fieldKey,
+          0,
+          { label: 'Background re-render' }
+        );
+      }
+    );
+  });
+  await expect(cards).toHaveCount(3);
+  await expect(label).toHaveValue('Draft label survives');
+  await expect(evidence).toHaveValue('Draft evidence survives');
+  await expect(compose).toHaveValue('Draft comment survives');
+  await expect(compose).toBeFocused();
+
+  await newSuggestion.getByRole('button', { name: 'Clear', exact: true }).click();
+  await page.evaluate(() => {
+    return import('/assets/js/app/community-annotations/session.js').then(
+      ({ getCommunityAnnotationSession }) => {
+        getCommunityAnnotationSession().addSuggestion(
+          window.__capVotingHarness.fieldKey,
+          0,
+          { label: 'Second background re-render' }
+        );
+      }
+    );
+  });
+  await expect(cards).toHaveCount(4);
+  await expect(label).toHaveValue('');
+  await expect(evidence).toHaveValue('');
+  await expect(compose).toHaveValue('Draft comment survives');
+  expect(productErrors).toEqual([]);
+});
+
+async function addBackgroundSuggestion(page, label) {
+  await page.evaluate(async suggestionLabel => {
+    const { getCommunityAnnotationSession } = await import(
+      '/assets/js/app/community-annotations/session.js'
+    );
+    getCommunityAnnotationSession().addSuggestion(
+      window.__capVotingHarness.fieldKey,
+      0,
+      { label: suggestionLabel }
+    );
+  }, label);
+}
+
+async function focusedTextState(page) {
+  return page.evaluate(() => {
+    const active = document.activeElement;
+    return {
+      key: active?.getAttribute('data-community-modal-focus-key') ?? null,
+      value: active?.value ?? null,
+      selectionStart: active?.selectionStart ?? null,
+      selectionEnd: active?.selectionEnd ?? null,
+    };
+  });
+}
+
+test('open inline edits of existing items survive session re-renders', async ({
+  page,
+}) => {
+  const productErrors = observeProductErrors(page);
+  await prepareVotingHarness(page, { suggestionCount: 2 });
+  const primary = page.locator('.community-annotation-modal-overlay');
+  const cards = primary.locator('.community-annotation-suggestion-card');
+  await expect(cards).toHaveCount(2);
+  const ids = await page.evaluate(async () => {
+    const { getCommunityAnnotationSession } = await import(
+      '/assets/js/app/community-annotations/session.js'
+    );
+    const session = getCommunityAnnotationSession();
+    const fieldKey = window.__capVotingHarness.fieldKey;
+    const [first, second] = session.getSuggestions(fieldKey, 0);
+    return { first: first.id, second: second.id };
+  });
+  const cardFor = id => cards.filter({
+    has: page.locator(
+      `[data-community-modal-focus-key*=${JSON.stringify(id)}]` +
+      '[data-community-modal-focus-key$=":vote-up"]'
+    ),
+  });
+
+  // An open edit of an existing comment keeps its text, focus and caret when
+  // another user's change rebuilds the content.
+  const previewItem = cardFor(ids.first)
+    .locator('.community-annotation-comment-preview-item')
+    .first();
+  await previewItem.getByRole('button', { name: 'Edit', exact: true }).click();
+  const previewEditor = primary.getByPlaceholder('Edit comment…');
+  await expect(previewEditor).toBeFocused();
+  await previewEditor.fill('Half-typed comment edit');
+  await previewEditor.evaluate(input => input.setSelectionRange(5, 10));
+  const editorKey = await previewEditor.getAttribute(
+    'data-community-modal-focus-key'
+  );
+  await addBackgroundSuggestion(page, 'Arrived during edit');
+  await expect(cards).toHaveCount(3);
+  await expect(previewEditor).toHaveValue('Half-typed comment edit');
+  await expect(previewEditor).toBeFocused();
+  expect(await focusedTextState(page)).toEqual({
+    key: editorKey,
+    value: 'Half-typed comment edit',
+    selectionStart: 5,
+    selectionEnd: 10,
+  });
+
+  // The viewer's own vote on another card rebuilds the content too.
+  const secondUpvote = cardFor(ids.second)
+    .getByRole('button', { name: /^Upvote / });
+  const pressedBefore = await secondUpvote.getAttribute('aria-pressed');
+  await secondUpvote.click();
+  await expect(secondUpvote).toHaveAttribute(
+    'aria-pressed',
+    pressedBefore === 'true' ? 'false' : 'true'
+  );
+  await expect(secondUpvote).toBeFocused();
+  await expect(previewEditor).toHaveValue('Half-typed comment edit');
+  await previewEditor.focus();
+  await previewEditor.press('Escape');
+  await expect(previewEditor).toHaveCount(0);
+
+  // An open edit of an existing suggestion keeps every field.
+  const firstCard = cardFor(ids.first);
+  await firstCard.locator('.community-annotation-suggestion-actions').first()
+    .getByRole('button', { name: 'Edit', exact: true }).click();
+  const editBox = firstCard.locator('.control-box')
+    .filter({ hasText: 'Edit suggestion' });
+  const editLabel = editBox.getByPlaceholder('Label (required)');
+  const editEvidence = editBox.getByPlaceholder('Evidence (optional)');
+  await editLabel.fill('Renamed while others vote');
+  await editEvidence.fill('Evidence typed before the Pull');
+  await addBackgroundSuggestion(page, 'Second arrival');
+  await expect(cards).toHaveCount(4);
+  await expect(editBox).toBeVisible();
+  await expect(editLabel).toHaveValue('Renamed while others vote');
+  await expect(editEvidence).toHaveValue('Evidence typed before the Pull');
+  await expect(editEvidence).toBeFocused();
+  await expect(
+    firstCard.locator('.community-annotation-suggestion-actions').first()
+      .getByRole('button', { name: 'Edit', exact: true })
+  ).toHaveAttribute('aria-expanded', 'true');
+  await editBox.getByRole('button', { name: 'Cancel', exact: true }).click();
+  await expect(editBox).toBeHidden();
+
+  // A comment deleted while it is being edited closes the editor and says
+  // that the text was not saved.
+  await previewItem.getByRole('button', { name: 'Edit', exact: true }).click();
+  await expect(previewEditor).toBeFocused();
+  await previewEditor.fill('Text for a comment that disappears');
+  const deletedCommentId = await page.evaluate(async suggestionId => {
+    const { getCommunityAnnotationSession } = await import(
+      '/assets/js/app/community-annotations/session.js'
+    );
+    const session = getCommunityAnnotationSession();
+    const fieldKey = window.__capVotingHarness.fieldKey;
+    const editorKey = document.activeElement.getAttribute(
+      'data-community-modal-focus-key'
+    );
+    const commentId = session.getComments(fieldKey, 0, suggestionId)
+      .find(c => editorKey.includes(JSON.stringify(c.id))).id;
+    session.deleteComment(fieldKey, 0, suggestionId, commentId);
+    return commentId;
+  }, ids.first);
+  expect(typeof deletedCommentId).toBe('string');
+  await expect(previewEditor).toHaveCount(0);
+  await expect(page.getByText(
+    /Edit not saved: the comment you were editing is no longer shown here/
+  )).toBeVisible();
+
+  // The expanded comment list keeps its editor too, and follows it onto the
+  // next page when a new comment shifts it there.
+  await cardFor(ids.first)
+    .getByRole('button', { name: /View all \d+ comments/ })
+    .click();
+  const secondary = page.locator('.community-annotation-secondary-overlay');
+  const expanded = secondary.locator('.community-annotation-comment');
+  await expect(expanded).toHaveCount(25);
+  await expanded.nth(24).getByRole('button', { name: 'Edit', exact: true })
+    .click();
+  const expandedEditor = secondary.getByPlaceholder('Edit comment…');
+  await expect(expandedEditor).toBeFocused();
+  await expandedEditor.fill('Expanded edit survives');
+  await page.evaluate(async suggestionId => {
+    const { getCommunityAnnotationSession } = await import(
+      '/assets/js/app/community-annotations/session.js'
+    );
+    getCommunityAnnotationSession().addComment(
+      window.__capVotingHarness.fieldKey,
+      0,
+      suggestionId,
+      'Newest comment'
+    );
+  }, ids.first);
+  await expect(secondary.getByText(/Page 2 of 2 · 31 comments/))
+    .toBeVisible();
+  await expect(expandedEditor).toHaveValue('Expanded edit survives');
+  await expect(expandedEditor).toBeFocused();
+  await secondary.getByRole('button', { name: 'Save', exact: true }).click();
+  await expect(expandedEditor).toHaveCount(0);
+  await expect(secondary.getByText('Expanded edit survives')).toBeVisible();
+  expect(productErrors).toEqual([]);
+});
+
+test('an open merge note edit survives merged-suggestion re-renders', async ({
+  page,
+}) => {
+  const productErrors = observeProductErrors(page);
+  await prepareVotingHarness(page, { suggestionCount: 2 });
+  const primary = page.locator('.community-annotation-modal-overlay');
+  await page.evaluate(async () => {
+    const { getCommunityAnnotationSession } = await import(
+      '/assets/js/app/community-annotations/session.js'
+    );
+    const session = getCommunityAnnotationSession();
+    const fieldKey = window.__capVotingHarness.fieldKey;
+    const [into, from] = session.getSuggestions(fieldKey, 0);
+    session.addModerationMerge({
+      fieldKey,
+      catIdx: 0,
+      fromSuggestionId: from.id,
+      intoSuggestionId: into.id,
+      note: 'Original note',
+    });
+  });
+  await primary.getByRole('button', { name: 'View merged (1)' }).click();
+  const secondary = page.locator('.community-annotation-secondary-overlay');
+  const mergeRow = secondary.locator('.community-annotation-merge-row');
+  await expect(mergeRow).toHaveCount(1);
+  await mergeRow.getByRole('button', { name: 'Edit', exact: true }).click();
+  const noteEditor = mergeRow.getByPlaceholder('Merge note (optional)…');
+  await expect(noteEditor).toBeFocused();
+  await noteEditor.fill('Note typed during a Pull');
+  await noteEditor.evaluate(input => input.setSelectionRange(5, 10));
+
+  await addBackgroundSuggestion(page, 'Arrived during note edit');
+  await expect(
+    primary.locator('.community-annotation-suggestion-card')
+  ).toHaveCount(2);
+  await expect(noteEditor).toHaveValue('Note typed during a Pull');
+  await expect(noteEditor).toBeFocused();
+  expect(await focusedTextState(page)).toMatchObject({
+    value: 'Note typed during a Pull',
+    selectionStart: 5,
+    selectionEnd: 10,
+  });
+
+  await noteEditor.press('Escape');
+  await expect(noteEditor).toHaveCount(0);
+  await expect(secondary).toHaveCount(1);
+  await expect(
+    mergeRow.getByRole('button', { name: 'Edit', exact: true })
+  ).toBeFocused();
+  await expect(mergeRow).toContainText('Original note');
   expect(productErrors).toEqual([]);
 });

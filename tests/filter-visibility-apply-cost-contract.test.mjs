@@ -61,10 +61,9 @@ function continuousState({ mask, values, filter }) {
     activeFieldSource: null,
     activeFieldIndex: -1,
     activeVarFieldIndex: -1,
-    categoryTransparency: new Float32Array(pointCount).fill(1),
-    cellVisibilityMask: Float32Array.from(mask),
+    categoryTransparency: new Uint8Array(pointCount).fill(1),
+    cellVisibilityMask: Uint8Array.from(mask),
     colorsArray: new Uint8Array(pointCount * 4).fill(255),
-    outlierQuantilesArray: new Float32Array(pointCount).fill(-1),
     _syncColorsAlpha: DataStateColorMethods.prototype._syncColorsAlpha,
     ensureContinuousMetadata:
       DataStateColorMethods.prototype.ensureContinuousMetadata,
@@ -119,10 +118,9 @@ test('the unfiltered publication copies the mask instead of filling and then re-
     activeFieldSource: null,
     activeFieldIndex: -1,
     activeVarFieldIndex: -1,
-    categoryTransparency: new Float32Array(pointCount).fill(1),
-    cellVisibilityMask: Float32Array.from(mask),
+    categoryTransparency: new Uint8Array(pointCount).fill(1),
+    cellVisibilityMask: Uint8Array.from(mask),
     colorsArray: new Uint8Array(pointCount * 4).fill(255),
-    outlierQuantilesArray: new Float32Array(pointCount).fill(-1),
     _syncColorsAlpha: DataStateColorMethods.prototype._syncColorsAlpha,
     isOutlierFilterEnabledForActiveField: () => false,
     getCurrentOutlierThreshold: () => 1,
@@ -135,23 +133,23 @@ test('the unfiltered publication copies the mask instead of filling and then re-
     _notifyVisibilityChange() {},
   });
 
-  const nativeFill = Float32Array.prototype.fill;
-  const nativeSet = Float32Array.prototype.set;
+  const nativeFill = Uint8Array.prototype.fill;
+  const nativeSet = Uint8Array.prototype.set;
   const fills = [];
   const sets = [];
-  Float32Array.prototype.fill = function countingFill(...args) {
+  Uint8Array.prototype.fill = function countingFill(...args) {
     fills.push({ args, target: this });
     return nativeFill.apply(this, args);
   };
-  Float32Array.prototype.set = function countingSet(...args) {
+  Uint8Array.prototype.set = function countingSet(...args) {
     sets.push({ args, target: this });
     return nativeSet.apply(this, args);
   };
   try {
     state.computeGlobalVisibility();
   } finally {
-    Float32Array.prototype.fill = nativeFill;
-    Float32Array.prototype.set = nativeSet;
+    Uint8Array.prototype.fill = nativeFill;
+    Uint8Array.prototype.set = nativeSet;
   }
 
   const transparencyFills = fills.filter(
@@ -225,7 +223,7 @@ test('every mask and filter shape produces the identical published generation', 
 });
 
 test('a mask value that is neither zero nor one is still rejected before anything is published', () => {
-  const mask = [1, 1, 0.5, 1];
+  const mask = [1, 1, 2, 1];
   const { state } = continuousState({
     filter: { max: 3, min: 0 },
     mask,

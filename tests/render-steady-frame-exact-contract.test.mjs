@@ -156,7 +156,7 @@ test('failed frustum extraction cannot publish cache keys', () => {
   );
 });
 
-test('snapshot LOD/frustum consumes the caller-owned cache transition', async () => {
+test('live and snapshot passes hand the caller-owned frustum transition to the draw seam', async () => {
   const source = await readFile(
     new URL(
       '../assets/js/rendering/high-perf-renderer.js',
@@ -164,35 +164,17 @@ test('snapshot LOD/frustum consumes the caller-owned cache transition', async ()
     ),
     'utf8',
   );
-  const snapshotRender = extractSourceRange(
-    source,
-    'renderWithSnapshot(',
-    '/**\n   * Render snapshot with frustum culling',
-  );
-  const snapshotLodFrustum =
-    HighPerfRenderer.prototype
-      ._renderSnapshotLODWithFrustumCulling
-      .toString();
-  const snapshotLodOnly =
-    HighPerfRenderer.prototype
-      ._renderSnapshotWithLOD
-      .toString();
-
-  assert.match(
-    snapshotRender,
-    /lodBuffersForDim,\s*frustumChanged\s*\)/,
-  );
-  assert.match(
-    snapshotLodFrustum,
-    /lodBuffersForDim,\s*frustumChanged\s*\)/,
-  );
-  assert.doesNotMatch(
-    snapshotLodOnly.slice(
-      0,
-      snapshotLodOnly.indexOf(') {'),
-    ),
-    /frustumChanged/,
-  );
+  const liveRender = extractSourceRange(source, '  render(params', '  _validateSpatialOwnerOnce(');
+  const snapshotRender = extractSourceRange(source, '  renderWithSnapshot(', '\n  }\n');
+  for (const pass of [liveRender, snapshotRender]) {
+    // The pass computes the transition once and the draw consumes it.
+    assert.match(pass, /frustumChanged = this\._prepareFrustumCache\(/);
+    assert.match(pass, /this\._drawPoints\(\{[\s\S]*?\bfrustumChanged,[\s\S]*?\}\)/);
+  }
+  // Leaf runs are re-collected only on that transition (or a new tree);
+  // a steady frame reuses the accepted runs and ranges.
+  const draw = HighPerfRenderer.prototype._drawPoints.toString();
+  assert.match(draw, /if \(draw\.frustumChanged \|\| treeChanged\)/);
 });
 
 test('viewer opts out of detached stats records and hot render branches publish scalar stats', async () => {
@@ -216,13 +198,13 @@ test('viewer opts out of detached stats records and hot render branches publish 
   );
   const liveRender = extractSourceRange(
     rendererSource,
-    'render(params',
-    '_renderWithFrustumCulling(',
+    '  render(params',
+    '  _validateSpatialOwnerOnce(',
   );
   const snapshotRender = extractSourceRange(
     rendererSource,
-    'renderWithSnapshot(',
-    '/**\n   * Render snapshot with frustum culling',
+    '  renderWithSnapshot(',
+    '\n  }\n',
   );
 
   assert.match(singleView, /hpRenderer\.render\(renderParams,\s*false\)/);
@@ -397,7 +379,7 @@ test('all panes share one frame phase and highlight success does not allocate fa
   );
 });
 
-test('multiview lookup and connectivity texture reads avoid pane-cadence callbacks and records', async () => {
+test('multiview lookup and connectivity draws avoid pane-cadence callbacks and records', async () => {
   const source = await readFile(
     new URL('../assets/js/rendering/viewer.js', import.meta.url),
     'utf8',
@@ -412,30 +394,20 @@ test('multiview lookup and connectivity texture reads avoid pane-cadence callbac
     'function renderSingleView(',
     'function setBackground(',
   );
-  const edgeLookup = extractSourceRange(
+  const edgeDraw = extractSourceRange(
     source,
-    'function getEdgeTexturesForView(',
-    '/**\n   * Check if a view has per-view edge textures',
+    'function drawConnectivityLines(',
+    'function drawCentroids(',
   );
 
   assert.doesNotMatch(renderSource, /_renderAllViews\.find\(/);
   assert.doesNotMatch(singleView, /snapshotViews\.find\(/);
-  assert.match(
-    source,
-    /const\s+edgeTextureLookupScratch\s*=\s*\{/,
-    'serial pane rendering can reuse one texture lookup record',
-  );
-  assert.doesNotMatch(
-    edgeLookup,
-    /const\s+validateAndReturn\s*=\s*\(/,
-    'texture validation must not create a closure per pane',
-  );
-  assert.doesNotMatch(
-    edgeLookup,
-    /return\s*\{\s*posTexture:/,
-    'texture lookup must not create a result record per pane',
-  );
+  // One reused frame record carries the edge pass's uniforms for every pane.
+  assert.match(source, /const\s+edgeFrame\s*=\s*\{/);
+  assert.match(edgeDraw, /edgeLayer\.draw\(viewId, edgeFrame\)/);
+  assert.doesNotMatch(edgeDraw, /=>|\{\s*mvpMatrix:/, 'no closure or record per pane');
 });
+
 
 test('centroid snapshot readiness uses exact position and color owners without hot fingerprints', async () => {
   const source = await readFile(

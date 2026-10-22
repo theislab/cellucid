@@ -40,8 +40,8 @@ export const ANTIALIAS_MODES = Object.freeze(['auto', 'on', 'off']);
  * What an absent or unusable stored value means.
  *
  * `auto` rather than `on`: the cell count is a better predictor of the right
- * answer than any constant, and it is known by the time the first frame is
- * drawn.
+ * answer than any constant, and it is known as soon as a dataset is
+ * published.
  */
 export const DEFAULT_ANTIALIAS_MODE = 'auto';
 
@@ -56,6 +56,20 @@ export const DEFAULT_ANTIALIAS_MODE = 'auto';
  * the smoothing they would receive, and there is little left for it to smooth.
  */
 export const AUTOMATIC_ANTIALIAS_CELL_LIMIT = 5_000_000;
+
+/**
+ * The cell count at which automatic antialiasing turns off for a 1D or 2D view.
+ *
+ * A flat view draws without depth testing, so every overlapping point is shaded
+ * and blended in order — per sample under multisampling. Measured on an Apple
+ * M1 Pro (ANGLE Metal) orbiting a 1,000,000-cell 2D view, antialiasing took
+ * the GPU timer total from 11.6 to 25.5 ms a frame with `full` (2.2×) and from
+ * 9.9 to 17.5 ms with `ultralight` (`scripts/render-scenarios.mjs --antialias`),
+ * against a 20–35% cost in 3D, where depth testing rejects most fragments
+ * first. The cost grows with the cell count, so at this many cells the
+ * antialiased frame fits a 120 Hz budget on far smaller GPUs.
+ */
+export const AUTOMATIC_ANTIALIAS_CELL_LIMIT_FLAT = 200_000;
 
 function assertStorage(storage, operation) {
   if (
@@ -134,28 +148,40 @@ export function writeAntialiasPreference(storage, mode) {
 }
 
 /**
- * Whether a dataset of this many cells should be drawn antialiased.
+ * Whether a view of this many cells, drawn in this dimension, should be
+ * antialiased.
  *
  * @param {number} cellCount
+ * @param {1|2|3} dimension The dimension of the view being drawn.
  * @returns {boolean}
  */
-export function automaticAntialiasingForCellCount(cellCount) {
+export function automaticAntialiasing(cellCount, dimension) {
   if (!Number.isSafeInteger(cellCount) || cellCount <= 0) {
     throw new RangeError(
       'Automatic antialiasing requires one positive safe integer cell count.'
     );
   }
-  return cellCount < AUTOMATIC_ANTIALIAS_CELL_LIMIT;
+  if (dimension !== 1 && dimension !== 2 && dimension !== 3) {
+    throw new RangeError(
+      'Automatic antialiasing requires a view dimension of 1, 2, or 3.'
+    );
+  }
+  const limit = dimension === 3
+    ? AUTOMATIC_ANTIALIAS_CELL_LIMIT
+    : AUTOMATIC_ANTIALIAS_CELL_LIMIT_FLAT;
+  return cellCount < limit;
 }
 
 /**
- * Resolve one mode and one cell count into what the renderer should do.
+ * Resolve one mode, cell count and view dimension into what the renderer
+ * should do.
  *
  * @param {'auto'|'on'|'off'} mode
  * @param {number|null} cellCount Null while no dataset is open.
+ * @param {1|2|3|null} dimension Null while no dataset is open.
  * @returns {boolean}
  */
-export function antialiasingInForce(mode, cellCount) {
+export function antialiasingInForce(mode, cellCount, dimension) {
   if (!ANTIALIAS_MODES.includes(mode)) {
     throw new TypeError(
       'Antialiasing preference must be exactly "auto", "on", or "off".'
@@ -166,5 +192,5 @@ export function antialiasingInForce(mode, cellCount) {
   // With no dataset there is nothing to measure and nothing on screen to
   // smooth, so the answer is the one a small dataset would get.
   if (cellCount === null) return true;
-  return automaticAntialiasingForCellCount(cellCount);
+  return automaticAntialiasing(cellCount, dimension);
 }

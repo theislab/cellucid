@@ -30,6 +30,11 @@ export class PresentedCameraSettlementTracker {
     this._unchangedFrameCount = 0;
   }
 
+  /** Whether a changing burst still needs unchanged frames to settle. */
+  isPending() {
+    return this._pending;
+  }
+
   /**
    * Observe one renderer-owned frame.
    *

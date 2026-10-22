@@ -68,6 +68,8 @@ test('GPU smoke density bounds uploads and draw submissions for large point sets
     const startedAt = performance.now();
     try {
       candidate = buildDensityTextureGPU(gl, positions, {
+        colors: new Uint8Array(pointCount * 4).fill(255),
+        dimension: 3,
         gamma: 0.7,
         gridSize: 8,
       });
@@ -97,16 +99,23 @@ test('GPU smoke density bounds uploads and draw submissions for large point sets
     };
   });
 
+  // One position staging buffer and one RGBA8 colour staging buffer, each
+  // sized to one batch; every batch uploads its positions then its colours.
   expect(proof.numericBufferAllocations).toEqual([
     proof.maxBatch * 3 * Float32Array.BYTES_PER_ELEMENT,
+    proof.maxBatch * 4,
   ]);
   expect(proof.uploadedElementCounts).toEqual([
     proof.maxBatch * 3,
+    proof.maxBatch * 4,
     3,
+    4,
   ]);
   expect(proof.uploadedSourceOffsets).toEqual([
     0,
+    0,
     proof.maxBatch * 3,
+    proof.maxBatch * 4,
   ]);
   expect(proof.drawInstanceCounts).toEqual([proof.maxBatch, 1]);
   expect(
@@ -177,7 +186,7 @@ test('GPU smoke density streams filtered positions through one bounded staging b
 
     const pointCount = MAX_SPLAT_POINTS_PER_BATCH + 2;
     const positions = new Float32Array(pointCount * 3);
-    const alpha = new Float32Array(pointCount);
+    const alpha = new Uint8Array(pointCount);
     alpha.fill(1);
     alpha[1] = 0;
     positions[3] = -0.875;
@@ -188,6 +197,8 @@ test('GPU smoke density streams filtered positions through one bounded staging b
     let candidate = null;
     try {
       candidate = buildDensityTextureGPU(gl, positions, {
+        colors: new Uint8Array(pointCount * 4).fill(255),
+        dimension: 3,
         gamma: 0.7,
         gridSize: 8,
         visibility: {
@@ -216,9 +227,28 @@ test('GPU smoke density streams filtered positions through one bounded staging b
 
   expect(proof.numericBufferAllocations).toEqual([
     proof.maxBatch * 3 * Float32Array.BYTES_PER_ELEMENT,
+    proof.maxBatch * 4,
   ]);
   expect(proof.drawInstanceCounts).toEqual([proof.maxBatch, 1]);
-  expect(proof.uploads).toEqual([
+  // Colours stream through their own batch-sized staging array beside the
+  // positions: rgb copied per visible cell, alpha unused.
+  expect(proof.uploads.filter(upload => upload.sourceLength === proof.maxBatch * 4)).toEqual([
+    {
+      elementCount: proof.maxBatch * 4,
+      first: [255, 255, 255],
+      sourceLength: proof.maxBatch * 4,
+      sourceOffset: 0,
+      tail: [255, 255, 0],
+    },
+    {
+      elementCount: 4,
+      first: [255, 255, 255],
+      sourceLength: proof.maxBatch * 4,
+      sourceOffset: 0,
+      tail: [255, 255, 0],
+    },
+  ]);
+  expect(proof.uploads.filter(upload => upload.sourceLength === proof.maxBatch * 3)).toEqual([
     {
       elementCount: proof.maxBatch * 3,
       first: [0, 0, 0],
@@ -281,7 +311,7 @@ test('GPU smoke density discards a failed pipeline cache before the next build',
         buildDensityTextureGPU(
           gl,
           new Float32Array([0, 0, 0]),
-          { gamma: 0.7, gridSize: 8 },
+          { colors: new Uint8Array(4).fill(255), dimension: 3, gamma: 0.7, gridSize: 8 },
         );
       } catch (error) {
         firstFailure = error instanceof Error ? error.message : String(error);
@@ -289,7 +319,7 @@ test('GPU smoke density discards a failed pipeline cache before the next build',
       secondCandidate = buildDensityTextureGPU(
         gl,
         new Float32Array([0, 0, 0]),
-        { gamma: 0.7, gridSize: 8 },
+        { colors: new Uint8Array(4).fill(255), dimension: 3, gamma: 0.7, gridSize: 8 },
       );
       gl.deleteTexture(secondCandidate.texture);
       secondCandidate = null;
@@ -501,7 +531,7 @@ test('failed GPU smoke builds restore exact GL state and release every resource'
       buildDensityTextureGPU(
         gl,
         new Float32Array([0, 0, 0, 0.25, -0.25, 0.25]),
-        { gamma: 0.7, gridSize: 8 },
+        { colors: new Uint8Array(8).fill(255), dimension: 3, gamma: 0.7, gridSize: 8 },
       );
     } catch (error) {
       failureMessage = error instanceof Error ? error.message : String(error);
@@ -642,7 +672,7 @@ test('viewer publishes smoke atomically before completion and returns no owned t
     try {
       summary = viewer.buildSmokeVolumeGPU(
         new Float32Array([0, 0, 0, 0.25, -0.25, 0.25]),
-        { gamma: 0.7, gridSize: 8 },
+        { colors: new Uint8Array(8).fill(255), dimension: 3, gamma: 0.7, gridSize: 8 },
       );
     } finally {
       notifications.completeCalculation = originalComplete;
@@ -661,7 +691,7 @@ test('viewer publishes smoke atomically before completion and returns no owned t
     try {
       viewer.buildSmokeVolumeGPU(
         new Float32Array([-0.5, 0.5, 0, 0.5, -0.5, 0]),
-        { gamma: 0.7, gridSize: 8 },
+        { colors: new Uint8Array(8).fill(255), dimension: 3, gamma: 0.7, gridSize: 8 },
       );
     } catch (error) {
       replacementFailure = error instanceof Error
@@ -725,6 +755,8 @@ test('viewer invalidates smoke resources and requires reload after WebGL context
       throw new Error('Smoke context lifecycle requires WEBGL_lose_context');
     }
     viewer.buildSmokeVolumeGPU(new Float32Array([0, 0, 0]), {
+      colors: new Uint8Array(4).fill(255),
+      dimension: 3,
       gamma: 0.7,
       gridSize: 8,
     });

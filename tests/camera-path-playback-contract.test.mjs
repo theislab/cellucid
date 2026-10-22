@@ -44,6 +44,7 @@ function keyframe(index, transitionDuration = 1) {
       yaw: -Math.PI / 2,
       pitch: 0
     },
+    representation: null,
     transitionDuration
   };
 }
@@ -443,13 +444,7 @@ test('pointer activity keeps the transport alive without re-deriving the path', 
 // ---------------------------------------------------------------------------
 
 const CINEMATIC_DOM_KEYS = [
-  'navModeSelect', 'orbitControls', 'planarControls', 'freeflyControls',
-  'orbitKeySpeedInput', 'orbitKeySpeedDisplay', 'orbitReverseCheckbox',
-  'showOrbitAnchorCheckbox', 'planarPanSpeedInput', 'planarPanSpeedDisplay',
-  'planarZoomToCursorCheckbox', 'planarInvertAxesCheckbox',
-  'lookSensitivityInput', 'lookSensitivityDisplay', 'moveSpeedInput',
-  'moveSpeedDisplay', 'invertLookCheckbox', 'pointerLockCheckbox', 'saveBtn',
-  'keyframeList', 'clearBtn', 'timingActions', 'setAllDuration', 'setAllBtn',
+  'saveBtn', 'keyframeList', 'clearBtn', 'timingActions', 'setAllDuration', 'setAllBtn',
   'defaultSpeedInput', 'defaultSpeedDisplay', 'positionInterp',
   'rotationInterp', 'easingSelect', 'loopCheckbox', 'autoplayCheckbox'
 ];
@@ -533,18 +528,11 @@ function createStubElement({ checked = false, value = '' } = {}) {
 
 function createCinematicDom() {
   const seeds = {
-    navModeSelect: { value: 'orbit' },
-    orbitKeySpeedInput: { value: '40' },
-    planarPanSpeedInput: { value: '100' },
-    lookSensitivityInput: { value: '5' },
-    moveSpeedInput: { value: '100' },
     defaultSpeedInput: { value: '30' },
     positionInterp: { value: 'catmull-rom' },
     rotationInterp: { value: 'slerp' },
     easingSelect: { value: 'linear' },
-    setAllDuration: { value: '' },
-    orbitReverseCheckbox: { checked: true },
-    showOrbitAnchorCheckbox: { checked: true }
+    setAllDuration: { value: '' }
   };
   const dom = {};
   for (const key of CINEMATIC_DOM_KEYS) dom[key] = createStubElement(seeds[key]);
@@ -664,12 +652,51 @@ function createStubDatasetSource() {
   };
 }
 
+/**
+ * The Navigation panel as Camera Path sees it: it records every mode it is
+ * asked to show, and holds the navigation settings a path saves and restores.
+ */
+function createStubNavigation() {
+  let settings = {
+    invertLook: false,
+    lookSensitivity: '5',
+    moveSpeed: '100',
+    orbitKeySpeed: '40',
+    orbitReverse: true,
+    planarInvertAxes: false,
+    planarPanSpeed: '100',
+    planarZoomToCursor: true,
+    showOrbitAnchor: true
+  };
+  const modes = [];
+  return {
+    modes,
+    syncNavigationMode(mode) {
+      modes.push(mode);
+    },
+    exportSettings: () => ({ ...settings }),
+    restoreSettings(data) {
+      settings = Object.fromEntries(Object.keys(settings).map(key => [key, data[key]]));
+    },
+    setSetting(key, value) {
+      settings[key] = value;
+    }
+  };
+}
+
 function mountCinematicCamera() {
   const dom = createCinematicDom();
   const viewer = createStubViewer();
+  const navigation = createStubNavigation();
   const dataSourceManager = createStubDatasetSource();
-  const camera = initCinematicCamera({ viewer, dom, dataSourceManager });
-  return { camera, dom, viewer, dataSourceManager };
+  const camera = initCinematicCamera({
+    viewer,
+    dom,
+    navigation,
+    dataSourceManager,
+    focusedRepresentation: () => null,
+  });
+  return { camera, dom, viewer, navigation, dataSourceManager };
 }
 
 test('a recorded path survives save and restore field for field', () => {
@@ -686,7 +713,7 @@ test('a recorded path survives save and restore field for field', () => {
       [0, 'orbit'], [1, 'free'], [2, 'planar'], [3, 'orbit']
     ]) {
       source.viewer.place(index, mode);
-      store.add(source.viewer.getCameraState());
+      store.add(source.viewer.getCameraState(), undefined, null);
     }
     const ids = store.getAll().map(({ id }) => id);
     store.remove(ids[3]);
@@ -698,6 +725,8 @@ test('a recorded path survives save and restore field for field', () => {
     source.dom.positionInterp.value = 'bezier';
     source.dom.rotationInterp.value = 'linear';
     source.dom.easingSelect.value = 'ease-in-out';
+    source.navigation.setSetting('orbitKeySpeed', '63');
+    source.navigation.setSetting('planarInvertAxes', true);
     source.dom.defaultSpeedInput.value = '77';
     source.dom.defaultSpeedInput.dispatchEvent(new globalThis.Event('input'));
     environment.drainFrames();
@@ -724,7 +753,7 @@ test('a recorded path survives save and restore field for field', () => {
     const dirty = mountCinematicCamera();
     for (const index of [7, 8]) {
       dirty.viewer.place(index, 'orbit');
-      dirty.camera.getKeyframeStore().add(dirty.viewer.getCameraState());
+      dirty.camera.getKeyframeStore().add(dirty.viewer.getCameraState(), undefined, null);
     }
     environment.drainFrames();
     dirty.camera.restoreSessionState(structuredClone(saved));
@@ -738,7 +767,7 @@ test('a recorded path survives save and restore field for field', () => {
     // The label counter is restored too, so the next keyframe continues the
     // saved numbering instead of colliding with an existing label.
     dirty.viewer.place(9, 'orbit');
-    dirty.camera.getKeyframeStore().add(dirty.viewer.getCameraState());
+    dirty.camera.getKeyframeStore().add(dirty.viewer.getCameraState(), undefined, null);
     assert.equal(
       dirty.camera.getKeyframeStore().getAll().at(-1).label,
       `KF ${saved.nextIndex}`
@@ -759,7 +788,7 @@ test('the return-to-start keyframe does not consume a user keyframe number', () 
     const store = module.camera.getKeyframeStore();
     for (const index of [0, 1]) {
       module.viewer.place(index, 'orbit');
-      store.add(module.viewer.getCameraState());
+      store.add(module.viewer.getCameraState(), undefined, null);
     }
     environment.drainFrames();
 
@@ -782,7 +811,7 @@ test('the return-to-start keyframe does not consume a user keyframe number', () 
     );
 
     module.viewer.place(2, 'orbit');
-    store.add(module.viewer.getCameraState());
+    store.add(module.viewer.getCameraState(), undefined, null);
     const labels = store.getAll().map(({ label }) => label);
     assert.deepEqual(
       labels.filter(label => label.startsWith('KF ')),
@@ -796,39 +825,27 @@ test('the return-to-start keyframe does not consume a user keyframe number', () 
   }
 });
 
-test('leaving free-fly clears the Camera Path pointer-lock control', () => {
+test('Camera Path moves the mode through the Navigation panel', () => {
+  // Navigation lives in one panel. A keyframe goto, playback stopping, and a
+  // restore change the mode, and each must show it there rather than in a
+  // second copy of the controls.
   const environment = installModuleEnvironment();
   try {
     const module = mountCinematicCamera();
+    const store = module.camera.getKeyframeStore();
+    module.viewer.place(0, 'free');
+    store.add(module.viewer.getCameraState(), undefined, null);
+    module.viewer.place(1, 'planar');
+    store.add(module.viewer.getCameraState(), undefined, null);
+    const saved = structuredClone(module.camera.exportSessionState());
 
-    module.dom.navModeSelect.value = 'free';
-    const [onNavigationChange] = module.dom.navModeSelect.listeners('change');
-    onNavigationChange();
-    module.dom.pointerLockCheckbox.checked = true;
-    const [onPointerLockChange] =
-      module.dom.pointerLockCheckbox.listeners('change');
-    onPointerLockChange();
-    assert.equal(module.viewer.pointerLock.enabled, true);
-
-    // The viewer drops pointer lock whenever navigation leaves free-fly, and
-    // the Compare Views mirror of this control clears itself when it does. The
-    // Camera Path mirror must agree, whichever surface changed the mode.
-    module.dom.navModeSelect.value = 'orbit';
-    onNavigationChange();
-    assert.equal(
-      module.dom.pointerLockCheckbox.checked,
-      false,
-      'the pointer-lock control must not claim a lock the viewer has released'
-    );
-
-    module.dom.navModeSelect.value = 'free';
-    onNavigationChange();
-    module.camera.syncNavigationMode('planar');
-    assert.equal(
-      module.dom.pointerLockCheckbox.checked,
-      false,
-      'a mode change published by another surface must clear it too'
-    );
+    module.viewer.place(2, 'orbit');
+    module.navigation.modes.length = 0;
+    module.camera.restoreSessionState(saved);
+    assert.equal(module.viewer.getNavigationMode(), 'planar');
+    // Stopping playback first shows the mode the viewer had; the restored
+    // mode is the last one the panel is asked to show.
+    assert.equal(module.navigation.modes.at(-1), saved.navigationMode);
 
     module.camera.destroy();
   } finally {

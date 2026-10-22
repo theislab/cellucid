@@ -5,7 +5,9 @@
  * Uses history.replaceState() for smooth updates without reload.
  *
  * URL Format:
- * - ?dataset=suo                    → Demo dataset
+ * - ?source=local-demo&dataset=suo  → Sample dataset (the source is explicit:
+ *                                     on a page served by the Python server a
+ *                                     bare `dataset` names a server dataset)
  * - ?remote=http://localhost:8765&dataset=served
  *                                   → Remote server dataset
  * - ?github=owner/repo/path&dataset=atlas
@@ -18,21 +20,6 @@ import { validateDatasetId } from '../data/data-source.js';
 import { validateRemoteServerUrl } from '../data/remote-source.js';
 
 let latestPublicationGeneration = 0;
-
-/**
- * Update browser URL to reflect current data source.
- * Uses replaceState (no history entry, no reload).
- *
- * @param {'local-demo'|'remote'|'github-repo'|'local-user'|'jupyter'|null} sourceType
- * @param {Object} sourceInfo - Exact source-specific record:
- *   - local-demo: { datasetId }
- *   - remote: { serverUrl, datasetId }
- *   - github-repo: { path, datasetId }
- *   - local-user/jupyter/null: {}
- */
-export function updateUrlForDataSource(sourceType, sourceInfo) {
-  return prepareUrlForDataSource(sourceType, sourceInfo).commit();
-}
 
 /**
  * Prepare URL publication from the exact source instance whose dataset is
@@ -148,7 +135,9 @@ export function prepareUrlForDataSource(sourceType, sourceInfo) {
         );
       }
       const nextUrl = new URL(browser.location.href);
-      for (const name of ['dataset', 'source', 'remote', 'github']) {
+      // `anndata` is the Python AnnData server's startup instruction for its
+      // own origin; it describes the source being replaced, so it goes too.
+      for (const name of DATA_SOURCE_URL_PARAMETERS) {
         nextUrl.searchParams.delete(name);
       }
       for (const [name, value] of sourceState.entries) {
@@ -199,6 +188,31 @@ export function prepareUrlForDataSource(sourceType, sourceInfo) {
 }
 
 const URL_FREE_SOURCE_TYPES = new Set(['local-user', 'jupyter']);
+const DATA_SOURCE_URL_PARAMETERS = Object.freeze([
+  'dataset',
+  'source',
+  'remote',
+  'github',
+  'anndata'
+]);
+
+/**
+ * The data-source parameters of a page URL, and nothing else: what a shared
+ * link needs to reopen the same dataset. Display parameters and the
+ * annotation repository are left out.
+ *
+ * @param {string} href
+ * @returns {URLSearchParams}
+ */
+export function readDataSourceUrlParameters(href) {
+  const source = new URL(href).searchParams;
+  const out = new URLSearchParams();
+  for (const name of DATA_SOURCE_URL_PARAMETERS) {
+    const value = source.get(name);
+    if (value !== null) out.set(name, value);
+  }
+  return out;
+}
 
 function requirePlainDataRecord(value, expectedKeys, label) {
   if (
@@ -259,13 +273,16 @@ function requireUrlSourceState(sourceType, sourceInfo) {
       'Local demo URL state'
     );
     return {
-      entries: [[
-        'dataset',
-        validateDatasetId(
-          record.datasetId,
-          'Local demo URL state datasetId'
-        )
-      ]]
+      entries: [
+        ['source', 'local-demo'],
+        [
+          'dataset',
+          validateDatasetId(
+            record.datasetId,
+            'Local demo URL state datasetId'
+          )
+        ]
+      ]
     };
   }
   if (sourceType === 'remote') {
@@ -337,14 +354,6 @@ function requireBrowserHistoryOwner() {
     );
   }
   return window;
-}
-
-/**
- * Clear all data-related URL params.
- * Convenience function for disconnect/clear operations.
- */
-export function clearUrlDataSource() {
-  updateUrlForDataSource(null, {});
 }
 
 /**

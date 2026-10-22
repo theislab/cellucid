@@ -13,8 +13,24 @@
   }
 }
 
+/* A touch tablet gets a wider sidebar than a mouse would at this width: its
+   controls are 44px (see the coarse-pointer rules below), and in 260px a
+   field select or a legend label was squeezed to two or three letters. */
+@media (max-width: 900px) and (min-width: 721px) and (pointer: coarse) {
+  :root {
+    --sidebar-width: 340px;
+  }
+}
+
 /* Mobile layout: pin sidebar to the viewport edges for maximum usable space. */
 @media (max-width: 720px) {
+  /* The selection bar belongs to the plot: while the sidebar covers the
+     whole screen it would float over the menu and catch the swipes meant to
+     scroll it. */
+  body:has(#sidebar:not(.hidden)) .select-bar {
+    display: none;
+  }
+
   :root {
     --sidebar-width: 100vw;
     --sidebar-min-width: 100vw;
@@ -26,7 +42,9 @@
     left: 0;
     bottom: 0;
     max-height: 100vh;
-    border-radius: 0;
+    border-radius: var(--radius-none);
+    /* The strip the close control sits in, so it covers no sidebar content. */
+    padding-top: var(--sidebar-toggle-height);
   }
 
   #sidebar-toggle {
@@ -34,7 +52,162 @@
     left: 0;
   }
 
+  /* Notification cards lie over the bottom of the full-screen menu; its
+     scroll end grows by their height so the last controls scroll clear. */
+  .sidebar-scroll {
+    padding-bottom: calc(var(--space-2-5) + var(--notification-stack-block-size, 0px));
+  }
+
+  /* A full-width sidebar leaves no edge beside it, so the close control moves
+     inside the viewport, above the sidebar; beside it, it would sit just past
+     the screen and the plot behind the sidebar could not be reached. */
   #sidebar-toggle.sidebar-open {
-    left: var(--sidebar-width);
+    left: auto;
+    right: 0;
+    z-index: calc(var(--z-sidebar) + 1);
+    border-radius: var(--radius-full) 0 0 var(--radius-full);
+  }
+}
+
+/* Touch input. Every control is drawn for a cursor: 24px fields and
+   buttons, 16px icon buttons, 14px checkboxes. A fingertip needs about 44px
+   (WCAG 2.5.5, Apple HIG), but drawing every field and button 44px tall made
+   the touch sidebar look inflated. So on a coarse pointer (tokens in
+   tokens/_controls.css):
+
+   - boxed controls (fields, buttons, chips, segments, icon buttons) are drawn
+     --control-target-min (36px) tall, and the leaf ones reach a further
+     --control-hit-extend (3px) above and below their drawn box with an
+     invisible ::after (_buttons.css), so a finger gets 42px; between stacked
+     boxed controls the 6px gap is exactly the two extensions, so no hit area
+     overlaps its neighbour. A one-line field cannot carry a pseudo-element,
+     so its border box grows by the same 3px above and below in transparent
+     border and its frame is drawn inset (components/_controls.css);
+   - option rows (a checkbox and its text, a switch) are drawn
+     --control-row-min (36px) tall and carry the same 3px extension, and
+     stacked rows keep 6px between them; a disclosure header is a full-width
+     36px row whose neighbours are rows of the same list;
+   - the type scale moves up one step, so text stays readable at arm's length
+     and keeps its flat shape (title one step above the base, secondary text
+     one step below).
+
+   No panel lists its own controls here. The "i" buttons keep their visible
+   14px circle and widen the invisible hit ring they already carry; a wider
+   ring would reach the control under them. Mouse layouts are unchanged.
+
+   Field text is not raised to 16px. iOS Safari zooms the page into a focused
+   field (input, select or textarea) whose text is under 16px, and that zoom
+   threw the full-screen menu off the side of the screen. Instead,
+   ui/core/viewport-init.js adds maximum-scale=1 to the viewport on iOS and
+   iPadOS only: there it stops the focus zoom while Safari still honours the
+   user's own pinch zoom (it ignores maximum-scale for pinch since iOS 10).
+   Android Chrome would lose page pinch zoom under maximum-scale, an
+   accessibility cost, so it never gets it; it does not zoom on focus. */
+@media (pointer: coarse) {
+  :root {
+    --sidebar-toggle-width: var(--space-11);
+    --sidebar-toggle-height: var(--space-11);
+    --control-target-min: var(--space-9);
+    --control-row-min: var(--space-9);
+    --control-hit-extend: 3px;
+    --control-icon-button-size: var(--space-9);
+    --control-check-size: var(--space-4);
+
+    --type-title: var(--text-xl);
+    --type-heading: var(--text-lg);
+    --type-body: var(--text-lg);
+    --type-label: var(--text-lg);
+    --type-control: var(--text-lg);
+    --type-button: var(--text-lg);
+    --type-hint: var(--text-md);
+    --type-readout: var(--text-md);
+    --type-compact: var(--text-sm);
+  }
+
+  .notification-dismiss,
+  .disclosure-header-row > .accordion-copy-btn {
+    min-width: var(--space-9);
+    min-height: var(--space-9);
+  }
+
+  /* At fingertip size a boxed glyph reads as a heavy square beside the row's
+     (i); the glyph alone marks the target. */
+  .disclosure-header-row > .accordion-copy-btn {
+    border-color: transparent;
+  }
+
+  /* Panel header controls take their size from the frame, which keeps the
+     summary's slot for them the same size. */
+  .accordion-panel,
+  .accordion-panel.analysis-window-frame {
+    --panel-action-size: var(--space-9);
+  }
+
+  .info-btn::before {
+    inset: calc(-1 * var(--space-2-5));
+  }
+
+  .legend-checkbox,
+  .legend-swatch {
+    width: var(--space-5);
+    height: var(--space-5);
+  }
+
+  /* A category's name is what a finger drags; it fills the row. */
+  .legend-label:not(.legend-label-multiline) {
+    line-height: var(--control-row-min);
+  }
+
+  .color-swatch {
+    width: var(--space-4);
+    height: var(--space-4);
+  }
+
+  .info-tip-close {
+    width: var(--space-8);
+    height: var(--space-8);
+  }
+
+  /* Four 44px field actions leave a narrow sidebar (a tablet, a phone on its
+     side) too little room for the field name, so there the actions move under
+     the select instead of squeezing it to a few letters. */
+  .field-selector-row {
+    container: field-row / inline-size;
+    flex-wrap: wrap;
+  }
+
+  .field-selector-row > .obs-select,
+  .field-selector-row > .searchable-dropdown {
+    flex: 1 1 0;
+  }
+
+  .field-selector-row > .field-actions {
+    margin-left: auto;
+  }
+
+  @container field-row (max-width: 326px) {
+    .field-selector-row > .obs-select,
+    .field-selector-row > .searchable-dropdown {
+      flex-basis: 100%;
+    }
+  }
+}
+
+/* No hover. Controls that wait at reduced strength for a pointer to come near
+   would look disabled forever on a touch screen, and the plot toolbar, shown
+   only on hover, would never appear. Without hover they show at the strength
+   a hover gives them. */
+@media (hover: none) {
+  .disclosure-header-row > .accordion-copy-btn,
+  .analysis-window-frame > .accordion-panel-actions > .accordion-copy-btn,
+  .analysis-window-frame > .accordion-panel-actions > .accordion-close-btn {
+    opacity: var(--opacity-90);
+  }
+
+  .highlight-page-tab-combine,
+  .highlight-page-tab-delete,
+  .analysis-preview-plot .modebar,
+  .analysis-modal-plot .modebar {
+    opacity: 1;
   }
 }

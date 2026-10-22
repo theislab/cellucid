@@ -17,12 +17,14 @@ import { initProximitySelection } from './proximity-selection.js';
 import { initKnnSelection } from './knn-selection.js';
 import { initContinuousSelectionPreview } from './continuous-selection-preview.js';
 import {
+  pickSelectModeDom,
   requireCallback,
   requireDomElement,
   requireExactKeys,
   requireJupyterSource,
   requireMethods,
-  requireModeButtons
+  requireModeButtons,
+  SELECT_MODE_DOM_KEYS
 } from './exact-contract.js';
 
 const REQUIRED_SELECTION_STATE_METHODS = Object.freeze([
@@ -30,11 +32,10 @@ const REQUIRED_SELECTION_STATE_METHODS = Object.freeze([
   'clearPreviewHighlight',
   'getActiveField',
   'getActiveViewId',
-  'getCategoryForCell',
   'getCellIndicesForCategory',
   'getCellIndicesForRange',
+  'getFieldForView',
   'getHighlightedGroups',
-  'getValueForCell',
   'on',
   'setPreviewHighlightFromIndices'
 ]);
@@ -120,7 +121,11 @@ export function initHighlightSelectionTools(options) {
   requireCallback(renderHighlightPages, 'Highlight pages renderer');
   requireExactKeys(
     dom,
-    ['modeButtons', 'modeDescription'],
+    [
+      'modeButtons',
+      'modeDescription',
+      ...SELECT_MODE_DOM_KEYS
+    ],
     'Highlight selection DOM'
   );
   requireModeButtons(dom.modeButtons);
@@ -197,7 +202,8 @@ export function initHighlightSelectionTools(options) {
     viewer,
     dom: {
       modeButtons: dom.modeButtons,
-      modeDescription: ui.modeDescriptionEl
+      modeDescription: ui.modeDescriptionEl,
+      ...pickSelectModeDom(dom)
     },
     selectionState,
     modeHandlers: {

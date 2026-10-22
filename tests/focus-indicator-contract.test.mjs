@@ -110,7 +110,7 @@ test('every outline suppression in the stylesheet is an approved one', () => {
 });
 
 test('range sliders do not redeclare the outline they must inherit', async () => {
-  const css = await readFile(path.join(CSS_ROOT, 'components/_forms.css'), 'utf8');
+  const css = await readFile(path.join(CSS_ROOT, 'components/_controls.css'), 'utf8');
   const block = css.match(/\.slider-row input\[type="range"\]\s*\{([^}]*)\}/);
   assert.notEqual(block, null, '.slider-row input[type="range"] rule is missing');
   assert.doesNotMatch(
@@ -122,23 +122,30 @@ test('range sliders do not redeclare the outline they must inherit', async () =>
 });
 
 test('range sliders expose a pointer target the painted thumb fits inside', async () => {
-  const css = await readFile(path.join(CSS_ROOT, 'components/_forms.css'), 'utf8');
+  const css = await readFile(path.join(CSS_ROOT, 'components/_controls.css'), 'utf8');
+  const tokens = await readFile(path.join(CSS_ROOT, 'tokens/_controls.css'), 'utf8');
   const block = css.match(/\.slider-row input\[type="range"\]\s*\{([^}]*)\}/);
   assert.notEqual(block, null, '.slider-row input[type="range"] rule is missing');
   /* WCAG 2.2 SC 2.5.8 Target Size (Minimum) is 24x24 CSS px, and the painted
-     thumb is --space-3-5 (14px) tall, so a 3px control box hides part of what
-     the user can see. --space-6 is the 24px primitive; the negative block
-     margins collapse the margin box back to the 3px track so rows keep their
+     thumb is 14px tall, so a 3px control box hides part of what the user can
+     see. The hit height is the 24px primitive; the negative block margins
+     collapse the margin box back to the 3px track so rows keep their
      density. */
-  assert.match(block[1], /height:\s*var\(--space-6\);/);
-  assert.match(block[1], /margin-block:\s*calc\(\(3px - var\(--space-6\)\) \/ 2\);/);
+  assert.match(tokens, /--control-slider-hit-height:\s*var\(--space-6\);/);
+  assert.match(tokens, /--control-slider-track-height:\s*3px;/);
+  assert.match(tokens, /--control-slider-thumb-size:\s*var\(--space-3-5\);/);
+  assert.match(block[1], /height:\s*var\(--control-slider-hit-height\);/);
   assert.match(
-    css,
-    /\.slider-row input\[type="range"\]::-webkit-slider-runnable-track\s*\{[^}]*height:\s*3px;/,
+    block[1],
+    /margin-block:\s*calc\(\(var\(--control-slider-thumb-size\) - var\(--control-slider-hit-height\)\) \/ 2\);/,
   );
   assert.match(
     css,
-    /\.slider-row input\[type="range"\]::-moz-range-track\s*\{[^}]*height:\s*3px;/,
+    /\.slider-row input\[type="range"\]::-webkit-slider-runnable-track\s*\{[^}]*height:\s*var\(--control-slider-track-height\);/,
+  );
+  assert.match(
+    css,
+    /\.slider-row input\[type="range"\]::-moz-range-track\s*\{[^}]*height:\s*var\(--control-slider-track-height\);/,
   );
 });
 

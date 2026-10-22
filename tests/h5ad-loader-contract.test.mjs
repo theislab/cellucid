@@ -1,14 +1,28 @@
+import './helpers/anndata-reader-in-process.mjs';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import { getNotificationCenter } from '../assets/js/app/notification-center.js';
 import { BaseAnnDataAdapter } from '../assets/js/data/base-anndata-adapter.js';
-import * as h5adModule from '../assets/js/data/h5ad.js';
+import * as h5adSourceModule from '../assets/js/data/h5ad.js';
+import * as h5adLoaderModule from '../assets/js/data/h5ad-loader.js';
+import { BytesRangeSource } from '../assets/js/data/range-source.js';
+import { AnnDataReaderClient } from '../assets/js/data/anndata-reader-client.js';
+import {
+  combineDatasetLifecycleFailures,
+  createDatasetReloadSupersededError,
+  isDatasetReloadSupersededError,
+} from '../assets/js/data/dataset-lifecycle-errors.js';
 import {
   extractConnectivityEdges,
 } from '../assets/js/data/sparse-utils.js';
+import {
+  EmbeddingLoadError,
+  describeAnnDataProbes,
+} from '../assets/js/data/data-mapping-candidates.js';
 
+const h5adModule = { ...h5adSourceModule, ...h5adLoaderModule };
 const {
   H5adDataSource,
   H5adLoader,
@@ -103,11 +117,31 @@ function dataset(value, {
       ).map(([key, attrValue]) => [key, attribute(attrValue)])
     ),
   };
+  const read = valueGetter ?? (() => value);
   Object.defineProperty(result, 'value', {
     configurable: true,
     enumerable: true,
-    get: valueGetter ?? (() => value),
+    get: read,
   });
+  // h5wasm's hyperslab read: row-major, one [start, stop) range per axis.
+  result.slice = ranges => {
+    const all = read();
+    if (shape.length <= 1) {
+      const [start, stop] = ranges[0];
+      return all.slice(start, stop);
+    }
+    const [[rowStart, rowStop], [colStart, colStop] = [0, shape[1]]] = ranges;
+    const width = colStop - colStart;
+    const out = ArrayBuffer.isView(all)
+      ? new all.constructor((rowStop - rowStart) * width)
+      : new Array((rowStop - rowStart) * width);
+    for (let row = rowStart; row < rowStop; row++) {
+      for (let col = colStart; col < colStop; col++) {
+        out[(row - rowStart) * width + col - colStart] = all[row * shape[1] + col];
+      }
+    }
+    return out;
+  };
   return result;
 }
 
@@ -204,10 +238,6 @@ function loaderWithSparseX(X, {
   loader._nObs = nObs;
   loader._nVars = nVars;
   loader._varNames = [...varNames];
-  loader._varNameIndex = new Map(
-    varNames.map((name, index) => [name, index])
-  );
-  loader._xIsSparse = true;
   return loader;
 }
 
@@ -221,15 +251,89 @@ function loaderWithObs(fields, nObs) {
   return loader;
 }
 
-function loaderWithEmbedding(embedding, nObs) {
+function loaderWithEmbedding(embedding, nObs, key = 'X_umap_2d') {
   const loader = new H5adLoader();
   loader._file = group({
-    obsm: currentMapping({ X_umap_2d: embedding }),
+    obsm: currentMapping({ [key]: embedding }),
+    var: currentStringFrame(['gene']),
   });
   loader._filename = 'embedding.h5ad';
   loader._nObs = nObs;
-  loader._obsmKeys = ['X_umap_2d'];
+  loader._nVars = 1;
   return loader;
+}
+
+/**
+ * Mapping probes for a file whose obsm holds dense arrays of the given widths
+ * (a width of null is a one-dimensional array).
+ */
+function obsmProbes(nObs, widths) {
+  return {
+    nObs,
+    nVars: 0,
+    obsm: Object.entries(widths).map(([key, width]) => ({
+      key,
+      storage: 'dense',
+      shape: width === null ? [nObs] : [nObs, width],
+      dtype: 'float32',
+      numeric: true,
+      nnz: null,
+    })),
+    obsp: [],
+    varColumns: [],
+    X: null,
+    layers: [],
+    raw: null,
+  };
+}
+
+/** Distinct values per cell and column: 10 * cell + column. */
+function obsmValues(nObs, columns) {
+  return Float64Array.from(
+    { length: nObs * columns.length },
+    (_, index) => 10 * Math.floor(index / columns.length) +
+      columns[index % columns.length]
+  );
+}
+
+/**
+ * Give a loader plottable mapping metadata: its probes list `widths`, and its
+ * obsm reads return distinct values.
+ */
+function stubPlottableObsm(loader, nObs, widths = { X_umap_2d: 2 }) {
+  const reads = [];
+  loader.getDatasetMetadata = async () => ({
+    stats: { n_cells: nObs, n_genes: 0 },
+    probes: obsmProbes(nObs, widths),
+    obs_fields: [],
+  });
+  loader.readObsmColumns = async (key, columns) => {
+    reads.push([key, [...columns]]);
+    return obsmValues(nObs, columns);
+  };
+  return reads;
+}
+
+/** An adapter initialized over obsm entries of the given widths. */
+async function initializeOverObsm(nObs, widths) {
+  const loader = {
+    nObs,
+    obsKeys: [],
+    hasExpressionMatrix: false,
+    close() {},
+  };
+  const reads = stubPlottableObsm(loader, nObs, widths);
+  const adapter = new BaseAnnDataAdapter(loader);
+  await adapter.initialize();
+  return { adapter, reads };
+}
+
+/** An adapter whose obsm entries are described from the loader's probes. */
+async function adapterWithDescribedObsm(loader, options = {}) {
+  const adapter = new BaseAnnDataAdapter(loader, options);
+  adapter._describedObsm =
+    describeAnnDataProbes(await loader.probeMapping()).obsm;
+  return adapter;
 }
 
 function nullableField(encodingType, values, mask, {
@@ -406,23 +510,15 @@ function captureDownloadNotifications(t) {
   return events;
 }
 
-test('H5AD direct-file size accepts the exact 512 MiB metadata boundary', () => {
-  const browserLimit = 512 * 1024 * 1024;
-  assert.equal(
-    typeof h5adModule.validateH5adBrowserFileSize,
-    'function'
-  );
-  assert.equal(
-    h5adModule.validateH5adBrowserFileSize({
-      name: 'boundary.h5ad',
-      size: browserLimit,
-    }),
-    browserLimit
-  );
+test('H5AD direct files have no size ceiling', () => {
+  // The file is read by ranges, never copied: its size alone refuses nothing.
+  for (const size of [512 * 1024 * 1024 + 1, 64 * 1024 ** 3, Number.MAX_SAFE_INTEGER]) {
+    assert.equal(h5adModule.validateH5adSourceSize({ name: 'big.h5ad', size }), size);
+  }
+  assert.equal(h5adModule.validateH5adBrowserFileSize, undefined);
 });
 
-test('H5AD rejects invalid direct-file sizes before browser or h5wasm access', async t => {
-  const browserLimit = 512 * 1024 * 1024;
+test('H5AD rejects a source without a positive exact size before reading it', async t => {
   const cases = [
     ['missing', undefined],
     ['zero', 0],
@@ -430,27 +526,25 @@ test('H5AD rejects invalid direct-file sizes before browser or h5wasm access', a
     ['fractional', 1.5],
     ['NaN', Number.NaN],
     ['non-safe', Number.MAX_SAFE_INTEGER + 1],
-    ['over limit', browserLimit + 1],
   ];
   for (const [name, size] of cases) {
     await t.test(name, async () => {
       let payloadAccesses = 0;
-      const file = {
+      const source = {
         name: `${name}.h5ad`,
         size,
-        arrayBuffer() {
+        identity: {},
+        readInto() {
           payloadAccesses++;
-          throw new Error('arrayBuffer sentinel');
-        },
-        slice() {
-          payloadAccesses++;
-          throw new Error('slice sentinel');
+          throw new Error('readInto sentinel');
         },
       };
       const loader = new H5adLoader();
       await assert.rejects(
-        loader.open(file),
-        /512 MiB.*server or prepared format/i
+        loader.open(source),
+        name === 'zero'
+          ? /empty or does not report its size/i
+          : /(range source needs an exact size|empty or does not report its size)/i
       );
       assert.equal(payloadAccesses, 0);
     });
@@ -484,38 +578,21 @@ test('H5AD validates the standard HDF5 signature before opening h5wasm state', a
 
   await t.test('open reports an actionable format error', async () => {
     const bytes = new TextEncoder().encode('not-an-hdf5-file');
-    const file = {
-      name: 'corrupt.h5ad',
-      size: bytes.byteLength,
-      async arrayBuffer() {
-        return bytes.slice().buffer;
-      },
-      slice(start, end) {
-        return new Blob([bytes.slice(start, end)]);
-      },
-    };
+    const file = new BytesRangeSource(bytes, { name: 'corrupt.h5ad' });
     const loader = new H5adLoader();
     await assert.rejects(
-      loader.open(file, { showProgress: false }),
+      loader.open(file),
       /not a valid HDF5\/H5AD file/i
     );
   });
 
   await t.test('open translates a structurally unreadable HDF5 handle', async () => {
-    const bytes = signature.slice();
-    const file = {
-      name: 'truncated.h5ad',
-      size: bytes.byteLength,
-      async arrayBuffer() {
-        return bytes.slice().buffer;
-      },
-      slice(start, end) {
-        return new Blob([bytes.slice(start, end)]);
-      },
-    };
+    const bytes = new Uint8Array(64);
+    bytes.set(signature);
+    const file = new BytesRangeSource(bytes, { name: 'truncated.h5ad' });
     const loader = new H5adLoader();
     await assert.rejects(
-      loader.open(file, { showProgress: false }),
+      loader.open(file),
       /H5AD file could not be read.*corrupted or truncated/i
     );
   });
@@ -528,7 +605,7 @@ test('H5AD sparse matrices require explicit standard encoding and shape metadata
     X.attrs.shape = inheritedAttribute(new BigUint64Array([1n, 1n]));
     const loader = loaderWithSparseX(X);
     assert.deepEqual(
-      Array.from(await loader.getGeneExpression('gene')),
+      Array.from(await loader.getMatrixColumn('X', 0)),
       [1]
     );
   });
@@ -536,7 +613,7 @@ test('H5AD sparse matrices require explicit standard encoding and shape metadata
   await t.test('missing encoding-type is rejected', async () => {
     const loader = loaderWithSparseX(sparseGroup({ includeEncoding: false }));
     await assert.rejects(
-      loader.getGeneExpression('gene'),
+      loader.getMatrixColumn('X', 0),
       /encoding-type.*csr_matrix.*csc_matrix/i
     );
   });
@@ -546,7 +623,7 @@ test('H5AD sparse matrices require explicit standard encoding and shape metadata
       sparseGroup({ encodingType: 'compressed_matrix' })
     );
     await assert.rejects(
-      loader.getGeneExpression('gene'),
+      loader.getMatrixColumn('X', 0),
       /encoding-type.*csr_matrix.*csc_matrix/i
     );
   });
@@ -554,7 +631,7 @@ test('H5AD sparse matrices require explicit standard encoding and shape metadata
   await t.test('missing shape is rejected', async () => {
     const loader = loaderWithSparseX(sparseGroup({ includeShape: false }));
     await assert.rejects(
-      loader.getGeneExpression('gene'),
+      loader.getMatrixColumn('X', 0),
       /shape.*required/i
     );
   });
@@ -586,7 +663,7 @@ test('H5AD sparse matrices reject malformed structure without clamping', async t
       indices: new Int32Array([0]),
     }));
     await assert.rejects(
-      loader.getGeneExpression('gene'),
+      loader.getMatrixColumn('X', 0),
       /data and indices lengths differ/i
     );
   });
@@ -599,7 +676,7 @@ test('H5AD sparse matrices reject malformed structure without clamping', async t
       shape: [2, 1],
     }), { nObs: 2 });
     await assert.rejects(
-      loader.getGeneExpression('gene'),
+      loader.getMatrixColumn('X', 0),
       /indptr.*monotonic/i
     );
   });
@@ -609,8 +686,8 @@ test('H5AD sparse matrices reject malformed structure without clamping', async t
       indices: new BigInt64Array([2147483648n]),
     }));
     await assert.rejects(
-      loader.getGeneExpression('gene'),
-      /(index|int32).*range/i
+      loader.getMatrixColumn('X', 0),
+      /index.*(range|outside)/i
     );
   });
 });
@@ -822,9 +899,6 @@ test('CEL-AUDIT-0119 H5AD structure requires the one current AnnData dataframe c
     loader._nVars = 23;
     loader._obsKeys = ['old_obs'];
     loader._varNames = ['old_gene'];
-    loader._varNameIndex = new Map([['old_gene', 0]]);
-    loader._obsmKeys = ['old_embedding'];
-    loader._xIsSparse = true;
     loader._file = currentAnnData({
       X: dataset(new Float32Array([1]), {
         dtype: '<f4',
@@ -843,13 +917,10 @@ test('CEL-AUDIT-0119 H5AD structure requires the one current AnnData dataframe c
     assert.equal(loader.nVars, 23);
     assert.deepEqual(loader.obsKeys, ['old_obs']);
     assert.deepEqual(loader.varNames, ['old_gene']);
-    assert.deepEqual([...loader._varNameIndex], [['old_gene', 0]]);
-    assert.deepEqual(loader.obsmKeys, ['old_embedding']);
-    assert.equal(loader._xIsSparse, true);
   });
 });
 
-test('H5AD opening enforces X axes and unique variable names', async t => {
+test('H5AD opening enforces X axes and keeps variable names as stored', async t => {
   function frame(indexValues) {
     return currentDataFrame({
       index: dataset(indexValues, { dtype: 'O' }),
@@ -920,17 +991,21 @@ test('H5AD opening enforces X axes and unique variable names', async t => {
     );
   });
 
-  await t.test('duplicate variable names are rejected', async () => {
+  await t.test('duplicate variable names open and are kept as stored', async () => {
+    // The loader does not refuse a repeated var name: the adapter makes the
+    // gene list unique with the data-mapping rule (`makeUniqueNames`).
     const loader = new H5adLoader();
     loader._file = currentAnnData({
       X: emptySparse([1, 2]),
       obs: frame(['cell']),
       var: frame(['duplicate', 'duplicate']),
     });
-    await assert.rejects(
-      loader._readStructure(),
-      /duplicate.*variable|variable.*duplicate/i
-    );
+    await loader._readStructure();
+    assert.equal(loader.nVars, 2);
+    assert.deepEqual(loader.varNames, ['duplicate', 'duplicate']);
+    const names = await loader.readVarNames('X', null);
+    assert.deepEqual([...names.index], ['duplicate', 'duplicate']);
+    assert.deepEqual([...names.values], ['duplicate', 'duplicate']);
   });
 
   await t.test(
@@ -1017,11 +1092,14 @@ test('H5AD X=None does not advertise gene-expression fields', async () => {
 
   const adapter = new BaseAnnDataAdapter(loader);
   await adapter.initialize();
-  assert.deepEqual(adapter.getVarManifest().fields, []);
-  assert.deepEqual(adapter.getGeneNames(), []);
+  assert.deepEqual((await adapter.getVarManifest()).fields, []);
   await assert.rejects(
-    adapter.getGeneExpression('A'),
-    /does not contain an X expression matrix|no X expression matrix/i
+    adapter.getGeneValues('var/0.values.f32'),
+    /no expression matrix; gene expression is unavailable/i
+  );
+  await assert.rejects(
+    loader.getMatrixColumn('X', 0),
+    /no X expression matrix/i
   );
 });
 
@@ -1036,24 +1114,24 @@ test('H5AD sparse gene columns sum duplicate coordinates', async () => {
   }), { nObs: 2 });
 
   assert.deepEqual(
-    Array.from(await loader.getGeneExpression('gene')),
+    Array.from(await loader.getMatrixColumn('X', 0)),
     [3, 4]
   );
 });
 
-test('H5AD integer sparse gene values remain exact when narrowed to Float32', async t => {
-  await t.test('an unsafe source integer is rejected', async () => {
+// Both writers store expression as Float32 and round integers above 2^24 to
+// the nearest Float32, so a file read directly reads the same values.
+test('H5AD integer sparse gene values round to Float32 as the writers export them', async t => {
+  await t.test('an integer above 2^24 rounds to its nearest Float32', async () => {
     const loader = loaderWithSparseX(sparseGroup({
       data: new BigInt64Array([16777217n]),
       dataDtype: '<i8',
     }));
-    await assert.rejects(
-      loader.getGeneExpression('gene'),
-      /integer.*exactly.*Float32/i
-    );
+    const values = await loader.getMatrixColumn('X', 0);
+    assert.deepEqual(Array.from(values), [16_777_216]);
   });
 
-  await t.test('an unsafe duplicate integer sum is rejected', async () => {
+  await t.test('a duplicate integer sum rounds to its nearest Float32', async () => {
     const loader = loaderWithSparseX(sparseGroup({
       data: new Int32Array([16777216, 1]),
       dataDtype: '<i4',
@@ -1061,109 +1139,267 @@ test('H5AD integer sparse gene values remain exact when narrowed to Float32', as
       indices: new Int32Array([0, 0]),
       indptr: new Int32Array([0, 2]),
     }));
-    await assert.rejects(
-      loader.getGeneExpression('gene'),
-      /integer sum.*exactly.*Float32/i
-    );
+    const values = await loader.getMatrixColumn('X', 0);
+    assert.deepEqual(Array.from(values), [Math.fround(16_777_216 + 1)]);
   });
 });
 
-test('H5AD embeddings validate cell axes and reject finite Float64 overflow', async t => {
-  await t.test('cell-axis mismatch is rejected before caching', async () => {
+test('H5AD embeddings validate cell axes and reject values that cannot be plotted', async t => {
+  await t.test('cell-axis mismatch is rejected by the column read', async () => {
     const loader = loaderWithEmbedding(dataset(
       new Float64Array([0, 0, 1, 1]),
       { dtype: '<f8', shape: [2, 2] }
     ), 1);
     await assert.rejects(
-      loader.getEmbedding('X_umap_2d'),
-      /embedding.*rows.*1 cell/i
+      loader.readObsmColumns('X_umap_2d', [0, 1]),
+      /obsm\['X_umap_2d'\] has 2 rows but the dataset has 1 cells/
     );
     assert.equal(loader._cache.size, 0);
   });
 
-  await t.test('finite overflow is rejected before caching', async () => {
-    const loader = loaderWithEmbedding(dataset(
-      new Float64Array([1e308, 0]),
-      { dtype: '<f8', shape: [1, 2] }
-    ), 1);
-    await assert.rejects(
-      loader.getEmbedding('X_umap_2d'),
-      /embedding.*Float32 range/i
-    );
-    assert.equal(loader._cache.size, 0);
-  });
-
-  for (const [name, value] of [
-    ['NaN', Number.NaN],
-    ['positive infinity', Number.POSITIVE_INFINITY],
-    ['negative infinity', Number.NEGATIVE_INFINITY]
+  for (const [name, values, reason] of [
+    ['finite Float64 overflow', [1e308, 0, 0, 1], 'not representable as float32 at cell 0'],
+    ['a non-zero value that narrows to zero', [0, 0, 1e-60, 1], 'not representable as float32 at cell 1'],
+    ['NaN', [0, 0, Number.NaN, 1], 'NaN at cell 1'],
+    ['positive infinity', [Number.POSITIVE_INFINITY, 0, 0, 1], 'Infinity at cell 0'],
+    ['negative infinity', [0, 0, Number.NEGATIVE_INFINITY, 1], '-Infinity at cell 1'],
+    ['constant coordinates', [2, 3, 2, 3], 'no coordinate variation'],
   ]) {
-    await t.test(`${name} is rejected before caching`, async () => {
+    await t.test(`${name} is refused before normalization or caching`, async () => {
       const loader = loaderWithEmbedding(dataset(
-        new Float32Array([value, 0]),
-        { dtype: '<f4', shape: [1, 2] }
-      ), 1);
-      await assert.rejects(
-        loader.getEmbedding('X_umap_2d'),
-        /embedding.*X_umap_2d.*non-finite.*component/i
+        new Float64Array(values),
+        { dtype: '<f8', shape: [2, 2] }
+      ), 2);
+      const adapter = await adapterWithDescribedObsm(loader);
+      let normalizationCalls = 0;
+      const normalize = adapter._normalizeEmbedding.bind(adapter);
+      adapter._normalizeEmbedding = (...args) => {
+        normalizationCalls++;
+        return normalize(...args);
+      };
+      const error = await adapter
+        .getEmbeddingForRef({ key: 'X_umap_2d', columns: [0, 1] })
+        .then(() => null, rejection => rejection);
+      assert.ok(error instanceof EmbeddingLoadError);
+      assert.equal(error.key, 'X_umap_2d');
+      assert.deepEqual(error.columns, [0, 1]);
+      assert.equal(error.reason, reason);
+      assert.equal(
+        error.message,
+        `Embedding 'X_umap_2d' cannot be plotted: ${reason}.`
       );
-      assert.equal(loader._cache.size, 0);
+      assert.equal(normalizationCalls, 0);
+      assert.equal(adapter._embeddingCache.size, 0);
+      assert.equal(adapter._normInfo.size, 0);
+      assert.equal(adapter._coordinateCacheBytes, 0n);
     });
   }
 });
 
-test('H5AD releases only the exact requested raw embedding cache entry', () => {
+test('H5AD mapping probes describe every element from metadata, with the catalog reasons', async () => {
+  const unreadable = () => {
+    throw new Error('probes must not read array values');
+  };
   const loader = new H5adLoader();
-  const consumed = {
-    data: Float32Array.from([0, 1]),
-    nDims: 2
-  };
-  const newer = {
-    data: Float32Array.from([2, 3]),
-    nDims: 2
-  };
-  const unrelated = { marker: 'keep' };
-  loader._cache.set('obsm:X_umap_2d', newer);
-  loader._cache.set('obs:group', unrelated);
+  loader._file = currentAnnData({
+    X: dataset(new Float32Array(3), { dtype: '<f4', shape: [3, 1], valueGetter: unreadable }),
+    obs: currentStringFrame(['c0', 'c1', 'c2']),
+    var: currentStringFrame(['gene'], {
+      columns: {
+        gene_symbols: dataset(['G'], { dtype: 'O' }),
+        score: dataset(new Float32Array([1]), { dtype: '<f4' }),
+      },
+    }),
+    obsm: currentMapping({
+      X_umap: dataset(new Float32Array(6), { dtype: '<f4', shape: [3, 2], valueGetter: unreadable }),
+      X_sparse: sparseGroup({ shape: [3, 5] }),
+      X_df: currentStringFrame(['c0', 'c1', 'c2']),
+      pseudotime: dataset(new Int32Array(3), { dtype: '<i4', shape: [3], valueGetter: unreadable }),
+      labels: dataset(['a', 'b', 'c'], { dtype: 'O', valueGetter: unreadable }),
+      X_short: dataset(new Float64Array(4), { dtype: '<f8', shape: [2, 2], valueGetter: unreadable }),
+    }),
+    obsp: currentMapping({
+      connectivities: sparseGroup({
+        data: new Float32Array([1, 1]),
+        indices: new Int32Array([1, 0]),
+        indptr: new Int32Array([0, 1, 2, 2]),
+        shape: [3, 3],
+      }),
+      distances: dataset(new Float32Array(6), { dtype: '<f4', shape: [3, 2], valueGetter: unreadable }),
+    }),
+    layers: currentMapping({
+      counts: sparseGroup({ data: new Int32Array([1]), dataDtype: '<i4', shape: [3, 1] }),
+      wide: dataset(new Float32Array(6), { dtype: '<f4', shape: [3, 2], valueGetter: unreadable }),
+    }),
+    raw: group({
+      X: sparseGroup({ shape: [3, 4] }),
+      var: currentStringFrame(['a', 'b', 'c', 'd']),
+    }),
+  });
+  await loader._readStructure();
 
-  loader.releaseEmbedding('X_umap_2d', consumed);
-  assert.strictEqual(loader._cache.get('obsm:X_umap_2d'), newer);
-
-  loader.releaseEmbedding('X_umap_2d', newer);
-  assert.equal(loader._cache.has('obsm:X_umap_2d'), false);
-  assert.strictEqual(loader._cache.get('obs:group'), unrelated);
+  const probes = await loader.probeMapping();
+  assert.equal(probes.nObs, 3);
+  assert.equal(probes.nVars, 1);
+  const described = describeAnnDataProbes(probes);
+  assert.deepEqual(
+    described.obsm.map(({ key, storage, shape, dtype, usable, reason }) =>
+      [key, storage, shape, dtype, usable, reason]),
+    [
+      ['X_umap', 'dense', [3, 2], 'float32', true, null],
+      ['X_sparse', 'csr', [3, 5], 'float32', false, 'sparse obsm arrays cannot be plotted'],
+      ['X_df', 'dataframe', [3, 0], 'object', false, 'obsm table, not an array'],
+      ['pseudotime', 'dense', [3], 'int32', true, null],
+      ['labels', 'dense', [3], 'string', false, 'not a numeric array'],
+      ['X_short', 'dense', [2, 2], 'float64', false, 'has 2 rows, the dataset has 3 cells'],
+    ]
+  );
+  assert.deepEqual(
+    described.obsp.map(({ key, storage, nnz, usable, reason }) =>
+      [key, storage, nnz, usable, reason]),
+    [
+      ['connectivities', 'csr', 2, true, null],
+      ['distances', 'dense', null, false, 'not square'],
+    ]
+  );
+  assert.deepEqual(described.var, {
+    n_vars: 1,
+    columns: [
+      { key: 'gene_symbols', dtype: 'string', usable: true, reason: null },
+      { key: 'score', dtype: 'float32', usable: false, reason: 'floating-point values cannot name genes' },
+    ],
+  });
+  assert.deepEqual(described.X, { storage: 'dense', dtype: 'float32' });
+  assert.deepEqual(
+    described.layers.map(({ key, usable, reason }) => [key, usable, reason]),
+    [
+      ['counts', true, null],
+      ['wide', false, 'has shape 3 x 2, expected 3 x 1'],
+    ]
+  );
+  assert.deepEqual(described.raw, {
+    n_vars: 4,
+    X: { storage: 'csr', dtype: 'float32' },
+    var: { columns: [] },
+  });
 });
 
-test('H5AD adapter enforces the raw plus normalized coordinate ceiling and releases the loader cache', async () => {
+test('H5AD obsm column reads return fresh arrays the loader does not retain', async () => {
   const loader = loaderWithEmbedding(dataset(
-    new Float32Array([0, 1]),
-    { dtype: '<f4', shape: [1, 2] }
-  ), 1);
-  const adapter = new BaseAnnDataAdapter(loader, {
-    maxMaterializedBytes: 8
-  });
-  adapter._metadata = {
-    embeddings: {
-      obsm_keys: { '2d': 'X_umap_2d' }
-    }
-  };
-  adapter._embeddingKeysByDimension = {
-    '2d': 'X_umap_2d'
-  };
-  let normalizationCalls = 0;
-  const normalize = adapter._normalizeEmbedding.bind(adapter);
-  adapter._normalizeEmbedding = (...args) => {
-    normalizationCalls++;
-    return normalize(...args);
-  };
+    new Float32Array([0, 1, 2, 3]),
+    { dtype: '<f4', shape: [2, 2] }
+  ), 2);
+  const first = await loader.readObsmColumns('X_umap_2d', [0, 1]);
+  const second = await loader.readObsmColumns('X_umap_2d', [0, 1]);
+  assert.ok(first instanceof Float64Array);
+  assert.deepEqual(Array.from(first), [0, 1, 2, 3]);
+  assert.notStrictEqual(first, second);
+  first[0] = 99;
+  assert.equal(second[0], 0);
+  assert.equal(loader._cache.size, 0);
+});
 
-  await assert.rejects(
-    adapter.getEmbedding(2),
-    /embedding.*8-byte browser limit.*current coordinate results/i
+test('H5AD obsm column reads select the narrowest hyperslabs', async t => {
+  // A 3-cell x 6-column array whose value is 10 * row + column.
+  const nRows = 3;
+  const width = 6;
+  const values = Float32Array.from(
+    { length: nRows * width },
+    (_, index) => 10 * Math.floor(index / width) + (index % width)
   );
-  assert.equal(normalizationCalls, 0);
-  assert.equal(loader._cache.has('obsm:X_umap_2d'), false);
-  assert.equal(adapter._coordinateCacheBytes, 0n);
+  function slicingDataset() {
+    const reads = [];
+    const node = dataset(values, { dtype: '<f4', shape: [nRows, width] });
+    const fullValue = Object.getOwnPropertyDescriptor(node, 'value').get;
+    Object.defineProperty(node, 'value', {
+      configurable: true,
+      enumerable: true,
+      get() {
+        reads.push('value');
+        return fullValue();
+      },
+    });
+    node.slice = ranges => {
+      const [[r0, r1], [c0, c1]] = ranges;
+      reads.push(`slice ${c0}-${c1}`);
+      const out = new Float32Array((r1 - r0) * (c1 - c0));
+      for (let row = r0; row < r1; row++) {
+        for (let column = c0; column < c1; column++) {
+          out[(row - r0) * (c1 - c0) + column - c0] = values[row * width + column];
+        }
+      }
+      return out;
+    };
+    return { node, reads };
+  }
+
+  for (const [name, columns, expectedReads] of [
+    ['adjacent columns are one hyperslab', [0, 1, 2], ['slice 0-3']],
+    ['a narrow slab is one hyperslab', [3, 2], ['slice 2-4']],
+    ['a wide span is one hyperslab per column', [5, 1], ['slice 5-6', 'slice 1-2']],
+  ]) {
+    await t.test(name, async () => {
+      const { node, reads } = slicingDataset();
+      const loader = loaderWithEmbedding(node, nRows, 'X_pca');
+      const result = await loader.readObsmColumns('X_pca', columns);
+      assert.deepEqual(reads, expectedReads);
+      const expected = [];
+      for (let row = 0; row < nRows; row++) {
+        for (const column of columns) expected.push(10 * row + column);
+      }
+      assert.deepEqual(Array.from(result), expected);
+    });
+  }
+
+  await t.test('a selection spanning the whole array is one hyperslab, never a whole-array read', async () => {
+    const node = dataset(Float32Array.from([0, 1, 10, 11]), {
+      dtype: '<f4',
+      shape: [2, 2],
+    });
+    Object.defineProperty(node, 'value', {
+      get() {
+        throw new Error('a whole-array read would stage the array in the WASM heap');
+      },
+    });
+    const loader = loaderWithEmbedding(node, 2);
+    assert.deepEqual(
+      Array.from(await loader.readObsmColumns('X_umap_2d', [1, 0])),
+      [1, 0, 11, 10]
+    );
+  });
+
+  await t.test('a one-dimensional array is one column', async () => {
+    const loader = loaderWithEmbedding(dataset(
+      new Int32Array([4, 5, 6]),
+      { dtype: '<i4', shape: [3] }
+    ), 3, 'pseudotime');
+    assert.deepEqual(
+      Array.from(await loader.readObsmColumns('pseudotime', [0])),
+      [4, 5, 6]
+    );
+  });
+
+  await t.test('columns outside the array or repeated are refused', async () => {
+    const { node } = slicingDataset();
+    const loader = loaderWithEmbedding(node, nRows, 'X_pca');
+    await assert.rejects(loader.readObsmColumns('X_pca', [0, 6]), /reads distinct columns between 0 and 5/);
+    await assert.rejects(loader.readObsmColumns('X_pca', [1, 1]), /distinct columns/);
+    await assert.rejects(loader.readObsmColumns('X_missing', [0, 1]), /obsm\['X_missing'\] does not exist/);
+  });
+});
+
+test('H5AD adapter loads an embedding whose raw plus normalized peak exceeds its cache budget', async () => {
+  const loader = loaderWithEmbedding(dataset(
+    new Float32Array([0, 1, 2, 3]),
+    { dtype: '<f4', shape: [2, 2] }
+  ), 2);
+  // 16 bytes hold the normalized Float32 result, not the Float64 read alive
+  // while it is produced: the budget is a policy, so it still loads.
+  const adapter = await adapterWithDescribedObsm(loader, {
+    cacheBudgetBytes: 16
+  });
+  const embedding = await adapter.getEmbeddingForRef({ key: 'X_umap_2d', columns: [0, 1] });
+  assert.ok(embedding instanceof Float32Array);
   assert.equal(adapter._coordinateReservedOutputBytes, 0n);
 });
 
@@ -1175,8 +1411,6 @@ test('H5AD dense X validates shape and rejects finite Float64 overflow', async t
     loader._nObs = nObs;
     loader._nVars = nVars;
     loader._varNames = ['gene'];
-    loader._varNameIndex = new Map([['gene', 0]]);
-    loader._xIsSparse = false;
     return loader;
   }
 
@@ -1186,10 +1420,11 @@ test('H5AD dense X validates shape and rejects finite Float64 overflow', async t
       { dtype: '<f8', shape: [1, 1] }
     ), 2, 1);
     await assert.rejects(
-      loader.getGeneExpression('gene'),
+      loader.getMatrixColumn('X', 0),
       /dense X.*shape.*2.*1/i
     );
-    assert.equal(loader._denseX, null);
+    assert.equal(loader._matrix.element, 'X');
+    assert.equal(loader._matrix.columns, null);
   });
 
   await t.test('finite overflow is rejected before caching', async () => {
@@ -1198,40 +1433,171 @@ test('H5AD dense X validates shape and rejects finite Float64 overflow', async t
       { dtype: '<f8', shape: [1, 1] }
     ));
     await assert.rejects(
-      loader.getGeneExpression('gene'),
+      loader.getMatrixColumn('X', 0),
       /dense X.*Float32 range/i
     );
-    assert.equal(loader._denseX, null);
+    assert.equal(loader._matrix.element, 'X');
+    assert.equal(loader._matrix.columns, null);
   });
 });
 
-test('H5AD preflights a sliced dense gene column before calling Dataset.slice', async () => {
-  let sliceCalls = 0;
+test('H5AD transposes a contiguous dense X once, in row slabs, and serves every gene from it', async () => {
+  const nObs = 3;
+  const nVars = 4;
+  const values = Float32Array.from({ length: nObs * nVars }, (_, index) => index);
+  const X = dataset(values, {
+    dtype: '<f4',
+    shape: [nObs, nVars],
+    valueGetter() {
+      throw new Error('a whole-matrix read would stage it in the WASM heap');
+    },
+  });
+  const slices = [];
+  const slice = X.slice;
+  X.slice = ranges => {
+    slices.push(ranges);
+    return values.slice(ranges[0][0] * nVars, ranges[0][1] * nVars);
+  };
+  const loader = new H5adLoader();
+  loader._file = group({ X });
+  loader._filename = 'contiguous-dense.h5ad';
+  loader._nObs = nObs;
+  loader._nVars = nVars;
+  loader._varNames = ['A', 'B', 'C', 'D'];
+  for (let gene = 0; gene < nVars; gene++) {
+    assert.deepEqual(
+      Array.from(await loader.getMatrixColumn('X', gene)),
+      [gene, gene + nVars, gene + 2 * nVars]
+    );
+  }
+  // One row slab covers the whole matrix; no gene re-reads it.
+  assert.deepEqual(slices, [[[0, 3], [0, 4]]]);
+  assert.equal(typeof slice, 'function');
+});
+
+function chunkedDenseLoader({ failFirstBlockAt = null } = {}) {
+  // Float32 output beyond the full-matrix cache, so genes are sliced; HDF5
+  // chunks of 2 rows × 4 columns put genes 0-3 in one strip.
+  const nObs = 4;
+  const nVars = 20_000_000;
+  const slices = [];
   const X = dataset(new Float32Array(0), {
     dtype: '<f4',
-    shape: [140_000_000, 2],
+    metadata: { chunks: [2, 4], size: 4 },
+    shape: [nObs, nVars],
     valueGetter() {
       throw new Error('full payload sentinel');
     },
   });
-  X.slice = () => {
-    sliceCalls++;
-    throw new Error('slice sentinel');
+  let failurePending = failFirstBlockAt !== null;
+  X.slice = ([[rowStart, rowEnd], [colStart, colEnd]]) => {
+    slices.push([rowStart, rowEnd, colStart, colEnd]);
+    if (failurePending && rowStart === failFirstBlockAt) {
+      failurePending = false;
+      throw new Error('block read failed');
+    }
+    const width = colEnd - colStart;
+    const values = new Float32Array((rowEnd - rowStart) * width);
+    for (let row = rowStart; row < rowEnd; row++) {
+      for (let col = colStart; col < colEnd; col++) {
+        values[(row - rowStart) * width + (col - colStart)] = row * 10 + col;
+      }
+    }
+    return values;
   };
   const loader = new H5adLoader();
   loader._file = group({ X });
-  loader._filename = 'wide-dense.h5ad';
-  loader._nObs = 140_000_000;
-  loader._nVars = 2;
-  loader._varNames = ['GeneA', 'GeneB'];
-  loader._varNameIndex = new Map([['GeneA', 0], ['GeneB', 1]]);
-  loader._xIsSparse = false;
+  loader._filename = 'chunked-dense.h5ad';
+  loader._nObs = nObs;
+  loader._nVars = nVars;
+  loader._varNames = ['GeneA', 'GeneB', 'GeneC'];
+  return { loader, slices };
+}
 
-  await assert.rejects(
-    loader.getGeneExpression('GeneA'),
-    /dense X column.*working set.*server or prepared format/i
+test('H5AD genes of one dense chunk strip read each chunk block once', async () => {
+  const { loader, slices } = chunkedDenseLoader();
+  assert.deepEqual(
+    Array.from(await loader.getMatrixColumn('X', 0)),
+    [0, 10, 20, 30]
   );
-  assert.equal(sliceCalls, 0);
+  assert.deepEqual(
+    Array.from(await loader.getMatrixColumn('X', 1)),
+    [1, 11, 21, 31]
+  );
+  assert.deepEqual(slices, [[0, 2, 0, 4], [2, 4, 0, 4]]);
+  assert.equal(loader._decodedXBlocks.retainedBytes, 2 * 2 * 4 * 4);
+
+  // Concurrent genes of the same strip share one read per block.
+  loader._decodedXBlocks.clear();
+  slices.length = 0;
+  const [geneA, geneC] = await Promise.all([
+    loader.getMatrixColumn('X', 0),
+    loader.getMatrixColumn('X', 2),
+  ]);
+  assert.deepEqual(Array.from(geneA), [0, 10, 20, 30]);
+  assert.deepEqual(Array.from(geneC), [2, 12, 22, 32]);
+  assert.deepEqual(slices, [[0, 2, 0, 4], [2, 4, 0, 4]]);
+
+  loader.clearCache();
+  assert.equal(loader._decodedXBlocks.retainedBytes, 0);
+  assert.equal(loader._decodedXBlocks.size, 0);
+});
+
+test('H5AD does not retain a failed dense chunk block read', async () => {
+  const { loader, slices } = chunkedDenseLoader({ failFirstBlockAt: 2 });
+  await assert.rejects(loader.getMatrixColumn('X', 0), /block read failed/);
+  assert.deepEqual(
+    Array.from(await loader.getMatrixColumn('X', 0)),
+    [0, 10, 20, 30]
+  );
+  assert.deepEqual(slices, [[0, 2, 0, 4], [2, 4, 0, 4], [2, 4, 0, 4]]);
+});
+
+test('H5AD chunk-block column reads match h5wasm column slices', async () => {
+  const hdf5 = await import('../assets/external/hdf5_hl.js');
+  await hdf5.ready;
+  const path = '/chunk-block-column-contract.h5';
+  const nObs = 7;
+  const nVars = 5;
+  const values = Float32Array.from(
+    { length: nObs * nVars },
+    (unused, index) => index * 0.5
+  );
+  const writer = new hdf5.File(path, 'w');
+  writer.create_dataset({
+    name: 'X',
+    data: values,
+    shape: [nObs, nVars],
+    dtype: '<f4',
+    chunks: [3, 2],
+    compression: 'gzip',
+    compression_opts: [4],
+  });
+  writer.close();
+  const reader = new hdf5.File(path, 'r');
+  try {
+    const X = reader.get('X');
+    assert.deepEqual(X.metadata.chunks, [3, 2]);
+    const loader = new H5adLoader();
+    for (let gene = 0; gene < nVars; gene++) {
+      const column = await loader._readChunkedDenseColumn(
+        X,
+        [nObs, nVars],
+        [3, 2],
+        gene,
+        loader._generation
+      );
+      assert.deepEqual(
+        Array.from(column),
+        Array.from(X.slice([[0, nObs], [gene, gene + 1]]))
+      );
+    }
+    // Three column strips (2 + 2 + 1 columns) × three row blocks.
+    assert.equal(loader._decodedXBlocks.size, 9);
+  } finally {
+    reader.close();
+    hdf5.FS.unlink(path);
+  }
 });
 
 test('H5AD reads official nullable integer and boolean observation groups', async () => {
@@ -1280,59 +1646,6 @@ test('H5AD reads official nullable integer and boolean observation groups', asyn
   assert.equal(unsignedCount.dtype, 'uint');
   assert.equal(unsignedCount.values[0], 7);
   assert.equal(Number.isNaN(unsignedCount.values[1]), true);
-});
-
-test('H5AD preflights primitive observation output before reading payloads', async t => {
-  const cases = [
-    {
-      dtype: '<f8',
-      length: 50_000_000,
-      metadata: { size: 8 },
-      name: 'numeric',
-      value: new Float64Array(0),
-    },
-    {
-      dtype: '|b1',
-      length: 60_000_000,
-      metadata: {
-        enum_type: { members: { FALSE: 0, TRUE: 1 } },
-        size: 1,
-      },
-      name: 'boolean',
-      value: new Uint8Array(0),
-    },
-    {
-      dtype: 'O',
-      length: 7_000_000,
-      metadata: { cset: 1, size: 4, vlen: true },
-      name: 'string',
-      value: [],
-    },
-  ];
-
-  for (const scenario of cases) {
-    await t.test(scenario.name, async () => {
-      let payloadReads = 0;
-      const field = dataset(scenario.value, {
-        dtype: scenario.dtype,
-        metadata: scenario.metadata,
-        shape: [scenario.length],
-        valueGetter() {
-          payloadReads++;
-          throw new Error('observation payload sentinel');
-        },
-      });
-      const loader = loaderWithObs(
-        { [scenario.name]: field },
-        scenario.length
-      );
-      await assert.rejects(
-        loader.getObsField(scenario.name),
-        /observation field.*working set.*server or prepared format/i
-      );
-      assert.equal(payloadReads, 0);
-    });
-  }
 });
 
 test('AnnData string arrays require variable-length UTF-8 HDF5 storage', async t => {
@@ -1384,49 +1697,6 @@ test('AnnData string arrays require variable-length UTF-8 HDF5 storage', async t
   });
 });
 
-test('H5AD preflights nullable-string JavaScript output before payload access', async () => {
-  const length = 7_000_000;
-  let valueReads = 0;
-  let maskReads = 0;
-  const values = dataset([], {
-    dtype: 'O',
-    metadata: { cset: 1, size: 8, vlen: true },
-    shape: [length],
-    valueGetter() {
-      valueReads++;
-      throw new Error('nullable string values payload sentinel');
-    },
-  });
-  const mask = dataset(new Uint8Array(0), {
-    dtype: '|b1',
-    metadata: {
-      enum_type: { members: { FALSE: 0, TRUE: 1 } },
-      size: 1,
-    },
-    shape: [length],
-    valueGetter() {
-      maskReads++;
-      throw new Error('nullable string mask payload sentinel');
-    },
-  });
-  const loader = loaderWithObs({
-    label: group(
-      { values, mask },
-      {
-        'encoding-type': 'nullable-string-array',
-        'encoding-version': '0.1.0',
-      }
-    ),
-  }, length);
-
-  await assert.rejects(
-    loader.getObsField('label'),
-    /nullable field.*working set.*server or prepared format/i
-  );
-  assert.equal(valueReads, 0);
-  assert.equal(maskReads, 0);
-});
-
 test('H5AD mask-only nullable observation indices do not budget unread values', async () => {
   const length = 7_000_000;
   let valueReads = 0;
@@ -1476,39 +1746,6 @@ test('H5AD mask-only nullable observation indices do not budget unread values', 
   );
   assert.equal(maskReads, 1);
   assert.equal(valueReads, 0);
-});
-
-test('H5AD measures actual nullable-string lengths before output allocation', async () => {
-  const length = 610_000;
-  const longValue = 'x'.repeat(400);
-  const rawValues = new Proxy(
-    { length },
-    {
-      get(target, property) {
-        if (typeof property === 'string' && /^\d+$/.test(property)) {
-          return longValue;
-        }
-        return Reflect.get(target, property);
-      }
-    }
-  );
-  const loader = loaderWithObs({
-    label: nullableField(
-      'nullable-string-array',
-      rawValues,
-      new Uint8Array(length),
-      {
-        valuesDtype: 'O',
-        valuesMetadata: { cset: 1, size: 8, vlen: true }
-      }
-    ),
-  }, length);
-
-  await assert.rejects(
-    loader.getObsField('label'),
-    /nullable string field.*working set.*server or prepared format/i
-  );
-  assert.equal(loader._cache.has('obs:label'), false);
 });
 
 test('H5AD reads categorical labels from nested nullable-string groups', async () => {
@@ -1643,15 +1880,7 @@ test('H5AD categorical ordered is one exact scalar HDF5 boolean and is preserved
     assert.equal(info.ordered, true);
     assert.equal((await loader.getObsField('label')).ordered, true);
 
-    loader.getDatasetMetadata = async () => ({
-      version: 2,
-      stats: { n_cells: 2, n_genes: 0 },
-      embeddings: {
-        available_dimensions: [],
-        default_dimension: null,
-        obsm_keys: {}
-      }
-    });
+    stubPlottableObsm(loader, 2);
     const adapter = new BaseAnnDataAdapter(loader);
     await adapter.initialize();
     assert.equal(adapter._obsFieldsMetadata[0].ordered, true);
@@ -1672,123 +1901,129 @@ test('H5AD dataset metadata counts categorical fields without label payloads', a
     label: categoricalField(new Int8Array([0]), categories),
   }, 1);
   loader._filename = 'metadata-only.h5ad';
-  loader._obsmKeys = ['X_umap_2d'];
-  loader.getEmbeddingShape = () => ({ shape: [1, 2], nDims: 2 });
+  const probes = obsmProbes(1, { X_umap_2d: 2 });
+  loader.probeMapping = async () => probes;
   loader.hasConnectivities = async () => false;
 
   const metadata = await loader.getDatasetMetadata();
   assert.equal(metadata.stats.n_categorical_fields, 1);
+  assert.strictEqual(metadata.probes, probes);
+  assert.equal(Object.hasOwn(metadata, 'embeddings'), false);
   assert.equal(categoryReads, 0);
 });
 
-test('H5AD metadata resolves dimension-suffixed keys, and a plain X_umap by width', async t => {
+test('direct AnnData slots follow the default rule, and a plain X_umap by width', async t => {
   await t.test('an unsuffixed X_umap array is read at its own column count', async () => {
-    const loader = loaderWithObs({}, 2);
-    loader._obsmKeys = ['X_umap'];
-    const shapeReads = [];
-    loader.getEmbeddingShape = key => {
-      shapeReads.push(key);
-      return { shape: [2, 2], nDims: 2 };
-    };
-    loader.hasConnectivities = async () => false;
-
-    const metadata = await loader.getDatasetMetadata();
-    assert.deepEqual(shapeReads, ['X_umap']);
-    assert.deepEqual(metadata.embeddings, {
-      available_dimensions: [2],
-      default_dimension: 2,
-      obsm_keys: { '2d': 'X_umap' },
+    const { adapter, reads } = await initializeOverObsm(2, { X_umap: 2 });
+    assert.deepEqual(adapter._slots, {
+      '1d': null,
+      '2d': { key: 'X_umap', columns: [0, 1] },
+      '3d': null,
     });
+    assert.deepEqual(adapter.getMappingCandidates().guessed, []);
+    assert.deepEqual(reads, [['X_umap', [0, 1]]]);
   });
 
-  await t.test('an unsuffixed X_umap of an unreadable width is refused', async () => {
-    const loader = loaderWithObs({}, 2);
-    loader._obsmKeys = ['X_umap'];
-    loader.getEmbeddingShape = () => ({ shape: [2, 10], nDims: 10 });
-
-    await assert.rejects(
-      loader.getDatasetMetadata(),
-      /X_umap_1d.*X_umap_2d.*X_umap_3d/i
-    );
+  await t.test('an unsuffixed X_umap of a width no dimension has is best-guessed at its first columns', async () => {
+    const { adapter } = await initializeOverObsm(2, { X_umap: 10 });
+    assert.deepEqual(adapter._slots['2d'], { key: 'X_umap', columns: [0, 1] });
+    assert.deepEqual(adapter.getMappingCandidates().guessed, ['embeddings.2d']);
   });
 
-  await t.test('an explicit key is resolved without alias metadata', async () => {
-    const loader = loaderWithObs({}, 2);
-    loader._obsmKeys = ['X_umap', 'X_umap_2d'];
-    const shapeReads = [];
-    loader.getEmbeddingShape = key => {
-      shapeReads.push(key);
-      return { shape: [2, 2], nDims: 2 };
-    };
-    loader.hasConnectivities = async () => false;
-
-    const metadata = await loader.getDatasetMetadata();
-    assert.deepEqual(shapeReads, ['X_umap_2d']);
-    assert.deepEqual(metadata.embeddings, {
-      available_dimensions: [2],
-      default_dimension: 2,
-      obsm_keys: { '2d': 'X_umap_2d' },
+  await t.test('dimension-suffixed keys alone fill their slots', async () => {
+    const { adapter, reads } = await initializeOverObsm(2, {
+      X_umap: 2,
+      X_umap_2d: 2,
+      X_tsne: 2,
     });
+    assert.deepEqual(adapter._slots, {
+      '1d': null,
+      '2d': { key: 'X_umap_2d', columns: [0, 1] },
+      '3d': null,
+    });
+    // Only the default dimension's embedding is read while opening.
+    assert.deepEqual(reads, [['X_umap_2d', [0, 1]]]);
   });
 
-  await t.test('a malformed explicit key cannot be skipped for another dimension', async () => {
-    const loader = loaderWithObs({}, 2);
-    loader._obsmKeys = ['X_umap_2d', 'X_umap_3d'];
-    loader.getEmbeddingShape = key => (
-      key === 'X_umap_2d'
-        ? { shape: [2, 3], nDims: 3 }
-        : { shape: [2, 3], nDims: 3 }
-    );
-
+  await t.test('a malformed suffixed key cannot be skipped for another dimension', async () => {
     await assert.rejects(
-      loader.getDatasetMetadata(),
-      /X_umap_2d.*3 columns.*2D suffix/i
+      initializeOverObsm(2, { X_umap_2d: 3, X_umap_3d: 3 }),
+      /Embedding 'X_umap_2d' must have exactly 2 columns; got 3/
     );
   });
 });
 
-test('direct AnnData vector discovery requires dimension-suffixed obsm keys', async () => {
-  const shapeReads = [];
-  const adapter = new BaseAnnDataAdapter({
-    obsmKeys: [
-      'velocity_umap',
-      'velocity_umap_2d',
-      'drift_umap',
-    ],
-    getEmbeddingShape(key) {
-      shapeReads.push(key);
-      return { shape: [2, 2], nDims: 2 };
-    },
+test('direct AnnData vector discovery requires dimension-suffixed obsm keys bound by the default rule', async t => {
+  async function discover(widths) {
+    const { adapter } = await initializeOverObsm(2, widths);
+    // The bindings stay private: the public vector_fields block is built
+    // only by finalizeDirectIdentity(), keyed by embedding id.
+    assert.equal(Object.hasOwn(adapter._metadata, 'vector_fields'), false);
+    return Object.fromEntries(
+      [...adapter._vectorBindings].map(([fieldId, byEmbedding]) => [
+        fieldId,
+        Object.fromEntries(byEmbedding),
+      ])
+    );
+  }
+
+  await t.test('only <field>_umap_<d>d keys are vector fields', async () => {
+    const bindings = await discover({
+      X_umap_2d: 2,
+      velocity_umap: 2,
+      velocity_umap_2d: 2,
+      drift_umap: 2,
+    });
+    // X_umap_2d matches the vector grammar but is an embedding, never a vector.
+    assert.deepEqual(bindings, {
+      velocity_umap: { X_umap_2d: 'velocity_umap_2d' },
+    });
   });
-  adapter._metadata = {};
 
-  await adapter._computeVectorFieldsMetadata();
+  await t.test('a vector binds only where its slot shows X_umap_<d>d or X_umap', async () => {
+    const bindings = await discover({
+      X_umap: 2,
+      X_pca_3d: 3,
+      velocity_umap_2d: 2,
+      velocity_umap_3d: 3,
+      drift_umap_1d: 1,
+    });
+    // The default rule fills only 2D (from X_umap): neither the 3D nor the
+    // 1D vector has a slot to bind to.
+    assert.deepEqual(bindings, {
+      velocity_umap: { X_umap: 'velocity_umap_2d' },
+    });
+  });
 
-  assert.deepEqual(shapeReads, ['velocity_umap_2d']);
-  assert.deepEqual(adapter._metadata.vector_fields, {
-    default_field: 'velocity_umap',
-    fields: {
-      velocity_umap: {
-        label: 'Velocity (UMAP)',
-        basis: 'umap',
-        available_dimensions: [2],
-        default_dimension: 2,
-        obsm_keys: { '2d': 'velocity_umap_2d' },
-      },
-    },
+  await t.test('several fields are recorded in code-point order', async () => {
+    const bindings = await discover({
+      X_umap_2d: 2,
+      velocity_umap_2d: 2,
+      T_fwd_umap_2d: 2,
+      drift_umap_2d: 2,
+    });
+    assert.deepEqual(Object.keys(bindings), [
+      'T_fwd_umap',
+      'drift_umap',
+      'velocity_umap',
+    ]);
+  });
+
+  await t.test('a bound key of the wrong width is refused', async () => {
+    await assert.rejects(
+      initializeOverObsm(2, { X_umap_2d: 2, velocity_umap_2d: 3 }),
+      /Vector field 'velocity_umap_2d' has 3 columns, but its 2D suffix requires exactly 2/
+    );
   });
 });
 
 test('H5WASM initialization preserves the failure and leaves a later caller independent', async () => {
   const source = (await readFile(
-    new URL('../assets/js/data/h5ad.js', import.meta.url),
+    new URL('../assets/js/data/h5ad-loader.js', import.meta.url),
     'utf8'
   )).replaceAll('\r\n', '\n');
   const start = source.indexOf('async function initH5wasm()');
-  const end = source.indexOf(
-    '/**\n * Check if h5wasm is available',
-    start
-  );
+  const end = source.indexOf('function isBooleanEnum(metadata)', start);
   assert.ok(start >= 0 && end > start);
   const initialization = source.slice(start, end);
 
@@ -1814,15 +2049,7 @@ test('H5WASM initialization preserves the failure and leaves a later caller inde
 
 test('H5AD adapter reuses retained categories after loader cache clearing', async () => {
   const scenario = loaderWithCountedCategories('modern-string');
-  scenario.loader.getDatasetMetadata = async () => ({
-    version: 2,
-    stats: { n_cells: 3, n_genes: 0 },
-    embeddings: {
-      available_dimensions: [],
-      default_dimension: null,
-      obsm_keys: {}
-    }
-  });
+  stubPlottableObsm(scenario.loader, 3);
   const adapter = new BaseAnnDataAdapter(scenario.loader);
   await adapter.initialize();
   const canonicalCategories =
@@ -1925,7 +2152,7 @@ test('CEL-AUDIT-0088 H5AD category ceiling rejects direct metadata before payloa
   let payloadReads = 0;
   const categories = dataset([], {
     dtype: 'O',
-    shape: [65_536],
+    shape: [4_294_967_296],
     valueGetter() {
       payloadReads++;
       throw new Error('oversized direct categories payload sentinel');
@@ -1937,7 +2164,7 @@ test('CEL-AUDIT-0088 H5AD category ceiling rejects direct metadata before payloa
 
   await assert.rejects(
     loader.getObsFieldInfo('label'),
-    /65,536 categories.*at most 65,535.*reduce or merge/i
+    /4,294,967,296 categories.*at most 4,294,967,295.*reduce or merge/i
   );
   assert.equal(payloadReads, 0);
 });
@@ -1948,7 +2175,7 @@ test('CEL-AUDIT-0088 H5AD category ceiling rejects nullable metadata before payl
   const categories = group({
     values: dataset([], {
       dtype: 'O',
-      shape: [65_536],
+      shape: [4_294_967_296],
       valueGetter() {
         valueReads++;
         throw new Error('oversized nullable values payload sentinel');
@@ -1960,7 +2187,7 @@ test('CEL-AUDIT-0088 H5AD category ceiling rejects nullable metadata before payl
         enum_type: { members: { FALSE: 0, TRUE: 1 } },
         size: 1,
       },
-      shape: [65_536],
+      shape: [4_294_967_296],
       valueGetter() {
         maskReads++;
         throw new Error('oversized nullable mask payload sentinel');
@@ -1976,7 +2203,7 @@ test('CEL-AUDIT-0088 H5AD category ceiling rejects nullable metadata before payl
 
   await assert.rejects(
     loader.getObsFieldInfo('label'),
-    /65,536 categories.*at most 65,535.*reduce or merge/i
+    /4,294,967,296 categories.*at most 4,294,967,295.*reduce or merge/i
   );
   assert.equal(valueReads, 0);
   assert.equal(maskReads, 0);
@@ -2016,124 +2243,7 @@ test('CEL-AUDIT-0088 H5AD category ceiling accepts nullable 65,535 boundary', as
   assert.equal(info.categories.length, 65_535);
 });
 
-test('CEL-AUDIT-0111 direct H5AD variable names include actual UTF-16 payload in the working set', async () => {
-  const repeatedLongName = 'x'.repeat(4_096);
-  const names = new Array(65_535).fill(repeatedLongName);
-  let payloadReads = 0;
-  const loader = new H5adLoader();
-  loader._file = currentAnnData({
-    obs: currentStringFrame([]),
-    var: currentDataFrame({
-      _index: dataset(names, {
-        dtype: 'O',
-        valueGetter() {
-          payloadReads++;
-          return names;
-        },
-      }),
-    }, { indexKey: '_index', columnOrder: [] }),
-  });
-
-  await assert.rejects(
-    loader._readStructure(),
-    /variable index.*working set.*server or prepared format/i
-  );
-  assert.equal(payloadReads, 1);
-  assert.deepEqual(loader.varNames, []);
-});
-
-test('CEL-AUDIT-0111 nullable H5AD variable names include actual UTF-16 payload in the working set', async () => {
-  const repeatedLongName = 'x'.repeat(4_096);
-  const names = new Array(65_535).fill(repeatedLongName);
-  let valueReads = 0;
-  const loader = new H5adLoader();
-  loader._file = currentAnnData({
-    obs: currentStringFrame([]),
-    var: currentDataFrame({
-      _index: group({
-        values: dataset(names, {
-          dtype: 'O',
-          valueGetter() {
-            valueReads++;
-            return names;
-          },
-        }),
-        mask: dataset(new Uint8Array(65_535), {
-          dtype: '|b1',
-          metadata: {
-            enum_type: { members: { FALSE: 0, TRUE: 1 } },
-            size: 1,
-          },
-        }),
-      }, {
-        'encoding-type': 'nullable-string-array',
-        'encoding-version': '0.1.0',
-      }),
-    }, { indexKey: '_index', columnOrder: [] }),
-  });
-
-  await assert.rejects(
-    loader._readStructure(),
-    /variable index.*working set.*server or prepared format/i
-  );
-  assert.equal(valueReads, 1);
-  assert.deepEqual(loader.varNames, []);
-});
-
-test('CEL-AUDIT-0111 direct H5AD categories include actual UTF-16 payload at the 65,535 boundary', async () => {
-  const repeatedLongLabel = 'x'.repeat(4_096);
-  const labels = new Array(65_535).fill(repeatedLongLabel);
-  let payloadReads = 0;
-  const loader = loaderWithObs({
-    label: categoricalField(
-      new Int8Array([0]),
-      dataset(labels, {
-        dtype: 'O',
-        valueGetter() {
-          payloadReads++;
-          return labels;
-        },
-      })
-    ),
-  }, 1);
-
-  await assert.rejects(
-    loader.getObsFieldInfo('label'),
-    /categorical categories.*working set.*server or prepared format/i
-  );
-  assert.equal(payloadReads, 1);
-  assert.equal(loader._cache.has('obs_categories:label'), false);
-});
-
-test('H5AD preflights categorical codes before reading their payload', async () => {
-  let codeReads = 0;
-  const codes = dataset(new Int8Array(0), {
-    dtype: '|b1',
-    shape: [110_000_000],
-    valueGetter() {
-      codeReads++;
-      throw new Error('categorical code sentinel');
-    },
-  });
-  const loader = loaderWithObs({
-    label: group({
-      categories: dataset(['alpha'], { dtype: 'O' }),
-      codes,
-    }, {
-      'encoding-type': 'categorical',
-      'encoding-version': '0.2.0',
-      ordered: false,
-    }),
-  }, 110_000_000);
-
-  await assert.rejects(
-    loader.getObsField('label'),
-    /categorical codes.*working set.*server or prepared format/i
-  );
-  assert.equal(codeReads, 0);
-});
-
-test('CEL-AUDIT-0122 H5AD rejects PCA-only data instead of silently substituting it for UMAP', async () => {
+function pcaOnlyLoader(obsm) {
   const loader = new H5adLoader();
   loader._file = currentAnnData({
     X: dataset(new Float32Array([1, 2]), {
@@ -2142,52 +2252,100 @@ test('CEL-AUDIT-0122 H5AD rejects PCA-only data instead of silently substituting
     }),
     obs: currentStringFrame(['cell-a', 'cell-b']),
     var: currentStringFrame(['gene']),
-    obsm: currentMapping({
-      X_pca: dataset(
-        new Float32Array([0, 0, 2, 2]),
-        { dtype: '<f4', shape: [2, 2] }
-      ),
-    }),
+    obsm: currentMapping(obsm),
   });
   loader._filename = 'pca-only.h5ad';
+  return loader;
+}
+
+test('CEL-AUDIT-0122 H5AD best-guesses a PCA-only file and records the guess', async () => {
+  const loader = pcaOnlyLoader({
+    X_pca: dataset(
+      new Float32Array([0, 1, 5, 2, 3, 7]),
+      { dtype: '<f4', shape: [2, 3] }
+    ),
+  });
+  await loader._readStructure();
+  const adapter = new BaseAnnDataAdapter(loader);
+  await adapter.initialize();
+
+  // No UMAP: the one narrow candidate is 3 columns wide, so it fills 3D.
+  assert.deepEqual(adapter._slots, {
+    '1d': null,
+    '2d': null,
+    '3d': { key: 'X_pca', columns: [0, 1, 2] },
+  });
+  const candidates = adapter.getMappingCandidates();
+  assert.deepEqual(candidates.guessed, ['embeddings.3d']);
+  assert.deepEqual(candidates.defaults.embeddings.defaults['3d'], {
+    key: 'X_pca',
+    columns: [0, 1, 2],
+  });
+  // The guessed default is the one representation enabled.
+  assert.deepEqual(candidates.defaults.embeddings.enabled, [
+    { key: 'X_pca', columns: [0, 1, 2] },
+  ]);
+});
+
+test('CEL-AUDIT-0122 H5AD reads a wide PCA at its first two columns', async () => {
+  const values = Float32Array.from({ length: 10 }, (_, index) => index * index);
+  const pca = dataset(values, { dtype: '<f4', shape: [2, 5] });
+  const slices = [];
+  pca.slice = ([[r0, r1], [c0, c1]]) => {
+    slices.push([c0, c1]);
+    const out = new Float32Array((r1 - r0) * (c1 - c0));
+    for (let row = r0; row < r1; row++) {
+      for (let column = c0; column < c1; column++) {
+        out[(row - r0) * (c1 - c0) + column - c0] = values[row * 5 + column];
+      }
+    }
+    return out;
+  };
+  const loader = pcaOnlyLoader({ X_pca: pca });
+  await loader._readStructure();
+  const adapter = new BaseAnnDataAdapter(loader);
+  await adapter.initialize();
+
+  assert.deepEqual(adapter._slots['2d'], { key: 'X_pca', columns: [0, 1] });
+  assert.deepEqual(adapter.getMappingCandidates().guessed, ['embeddings.2d']);
+  // Only the two columns plotted are read, never the whole array.
+  assert.deepEqual(slices, [[0, 2]]);
+  const identity = await adapter.finalizeDirectIdentity({
+    id: 'pca-only',
+    name: 'pca-only',
+    description: '',
+    cellucidDataVersion: 'h5ad_loader',
+    source: { name: 'H5AD file' },
+  });
+  assert.deepEqual(identity.embeddings.defaults, { '2d': 'X_pca[0,1]' });
+  assert.deepEqual(identity.embeddings.items['X_pca[0,1]'].source, {
+    key: 'X_pca',
+    columns: [0, 1],
+  });
+});
+
+test('H5AD with nothing plottable is refused with what obsm holds', async () => {
+  const loader = pcaOnlyLoader({
+    X_df: currentStringFrame(['cell-a', 'cell-b']),
+    spatial: dataset(
+      new Float32Array([0, 1, Number.NaN, 2]),
+      { dtype: '<f4', shape: [2, 2] }
+    ),
+  });
   await loader._readStructure();
   const adapter = new BaseAnnDataAdapter(loader);
 
-  await assert.rejects(
-    adapter.initialize(),
-    /no UMAP embedding this viewer can read.*X_umap_1d.*X_umap_2d.*X_umap_3d/i
+  const error = await adapter.initialize().then(() => null, rejection => rejection);
+  assert.ok(error instanceof Error);
+  assert.equal(error.name, 'DataSourceError');
+  assert.equal(error.code, 'NO_PLOTTABLE_EMBEDDING');
+  assert.equal(
+    error.message,
+    'Cellucid found nothing to plot. It needs an obsm array with one row per ' +
+    'cell (2) and at least one numeric column. obsm holds: X_df (table), ' +
+    'spatial (2 × 2, NaN at cell 1).'
   );
   assert.equal(adapter.getMetadata(), null);
-});
-
-test('H5AD preflights retained loader and normalized public embedding storage', async () => {
-  const nObs = 40_000_000;
-  let payloadReads = 0;
-  const loader = new H5adLoader();
-  loader._file = group({
-    obsm: currentMapping({
-      X_umap_2d: dataset(new Int8Array(0), {
-        dtype: '|i1',
-        shape: [nObs, 2],
-        valueGetter() {
-          payloadReads++;
-          throw new Error('embedding payload sentinel');
-        },
-      }),
-    }),
-  });
-  loader._filename = 'oversized-public-embedding.h5ad';
-  loader._nObs = nObs;
-  loader._nVars = 0;
-  loader._obsKeys = [];
-  loader._obsmKeys = ['X_umap_2d'];
-  const adapter = new BaseAnnDataAdapter(loader);
-
-  await assert.rejects(
-    adapter.initialize(),
-    /embedding.*public working set.*server or prepared format/i
-  );
-  assert.equal(payloadReads, 0);
 });
 
 test('H5AD preserves official numeric and boolean categorical labels', async t => {
@@ -2337,153 +2495,54 @@ test('H5AD rejects missing categorical labels and out-of-bounds codes', async t 
 test('clearing an H5AD loader invalidates delayed sparse work without stale cache publication', async () => {
   const loader = loaderWithSparseX(sparseGroup());
   const pending = deferred();
-  loader._sparseXLoadPromise = pending.promise;
+  const state = {
+    element: 'X',
+    columns: null,
+    loadPromise: pending.promise,
+  };
+  loader._matrix = state;
 
-  const stale = loader.getGeneExpression('gene');
+  const stale = loader.getMatrixColumn('X', 0);
   const staleAssertion = assert.rejects(stale, INVALIDATED_REQUEST);
   loader.clearCache();
-  pending.resolve({
-    cscData: null,
-    data: new Float32Array([7]),
-    exactInteger: false,
-    format: 'csc',
-    indices: new Int32Array([0]),
-    indptr: new Int32Array([0, 1]),
-    shape: [1, 1],
-  });
+  pending.resolve({ column: () => new Float32Array([7]) });
 
   await staleAssertion;
-  assert.equal(loader._sparseX, null);
-  assert.equal(loader._geneCache.size, 0);
+  assert.equal(loader._matrix, null);
+  assert.equal(state.columns, null, 'the stale load is not published to the released matrix');
 });
 
-test('H5AD gene LRU is bounded by retained bytes and resets its accounting', async () => {
-  const X = dataset(new Float32Array([1, 2]), {
-    dtype: '<f4',
-    shape: [1, 2],
-  });
-  const loader = new H5adLoader();
-  loader._file = group({ X });
-  loader._filename = 'gene-lru.h5ad';
-  loader._nObs = 1;
-  loader._nVars = 2;
-  loader._varNames = ['GeneA', 'GeneB'];
-  loader._varNameIndex = new Map([['GeneA', 0], ['GeneB', 1]]);
-  loader._xIsSparse = false;
-  loader._geneCache.set('GeneA', {
-    byteLength: 256 * 1024 * 1024,
-  });
-  loader._geneCacheBytes = 256 * 1024 * 1024;
-
-  assert.deepEqual(
-    Array.from(await loader.getGeneExpression('GeneB')),
-    [2]
-  );
-  assert.deepEqual(Array.from(loader._geneCache.keys()), ['GeneB']);
-  assert.equal(loader._geneCacheBytes, 4);
-
-  loader.clearCache();
-  assert.equal(loader._geneCache.size, 0);
-  assert.equal(loader._geneCacheBytes, 0);
-});
-
-test('transactional H5AD loader adoption transfers gene-cache byte accounting', () => {
-  const active = new H5adLoader();
-  let activeCloseCalls = 0;
-  active._file = {
-    close() {
-      activeCloseCalls++;
-    },
-  };
-  active._geneCache.set('old', { byteLength: 123 });
-  active._geneCacheBytes = 123;
-
-  const candidate = new H5adLoader();
-  const adoptedGene = { byteLength: 456 };
-  candidate._file = { close() {} };
-  candidate._filename = 'candidate.h5ad';
-  candidate._geneCache.set('new', adoptedGene);
-  candidate._geneCacheBytes = 456;
-
-  assert.equal(typeof active._adoptCandidate, 'function');
-  active._adoptCandidate(candidate);
-  assert.equal(activeCloseCalls, 1);
-  assert.deepEqual(Array.from(active._geneCache.entries()), [
-    ['new', adoptedGene],
-  ]);
-  assert.equal(active._geneCacheBytes, 456);
-  assert.equal(candidate._file, null);
-});
-
-test('H5AD rejects a wide CSR conversion peak before payload access', async () => {
-  let payloadReads = 0;
-  const unreadable = () => {
-    payloadReads++;
-    throw new Error('payload sentinel');
-  };
-  const X = group({
-    data: dataset(new Float32Array(0), {
-      dtype: '<f4',
-      shape: [1],
-      valueGetter: unreadable,
-    }),
-    indices: dataset(new Int32Array(0), {
-      dtype: '<i4',
-      shape: [1],
-      valueGetter: unreadable,
-    }),
-    indptr: dataset(new Int32Array(0), {
-      dtype: '<i4',
-      shape: [2],
-      valueGetter: unreadable,
-    }),
-  }, {
-    'encoding-type': 'csr_matrix',
-    'encoding-version': '0.1.0',
-    shape: [1, 50_000_000],
-  });
-  const loader = loaderWithSparseX(X, {
-    nObs: 1,
-    nVars: 50_000_000,
-  });
-
-  await assert.rejects(
-    loader.getGeneExpression('gene'),
-    /sparse X.*working set.*browser limit/i
-  );
-  assert.equal(payloadReads, 0);
-});
-
-function sourceMetadata(name) {
+function sourceMetadata() {
   return {
-    cellucid_data_version: 'h5ad_loader',
-    description: 'test',
-    embeddings: {
-      available_dimensions: [2],
-      default_dimension: 2,
-      obsm_keys: { '2d': 'X_umap_2d' },
-    },
-    id: name,
-    name,
     obs_fields: [],
-    source: { filename: name, type: 'h5ad_loader' },
+    probes: obsmProbes(2, { X_umap_2d: 2 }),
     stats: {
       has_connectivity: false,
       n_categorical_fields: 0,
-      n_cells: 1,
+      n_cells: 2,
       n_continuous_fields: 0,
       n_genes: 0,
       n_obs_fields: 0,
     },
-    version: 2,
   };
 }
 
+function fakeEngine(name) {
+  const engine = new H5adLoader();
+  engine._file = { close() {}, keys() { return []; } };
+  engine._filename = name;
+  engine._nObs = 2;
+  engine._nVars = 0;
+  engine._obsKeys = [];
+  engine._varNames = [];
+  return engine;
+}
+
 async function withFakeH5adOpen(run) {
-  const originalOpen = H5adLoader.prototype.open;
+  const originalOpen = AnnDataReaderClient.prototype.open;
   const notificationCenter = getNotificationCenter();
   const notificationMethods = [
-    'warning',
+    'info',
     'startDownload',
     'updateDownload',
     'completeDownload',
@@ -2497,51 +2556,46 @@ async function withFakeH5adOpen(run) {
   const records = new Map();
   const warnings = [];
 
-  notificationCenter.warning = (...args) => {
+  notificationCenter.info = (...args) => {
     warnings.push(args);
-    return `warning-${warnings.length}`;
+    return `info-${warnings.length}`;
   };
   notificationCenter.startDownload = () => 'fake-download';
   notificationCenter.updateDownload = () => {};
   notificationCenter.completeDownload = () => {};
   notificationCenter.failDownload = () => {};
   notificationCenter.dismissDownload = () => {};
-  H5adLoader.prototype.open = async function fakeOpen(file) {
+  AnnDataReaderClient.prototype.open = async function fakeOpen(file) {
     const record = {
       closeCalls: 0,
       loader: this,
       name: file.name,
     };
     records.set(file.name, record);
-    this._file = {
-      close() {
-        record.closeCalls++;
-      },
-      keys() {
-        return [];
-      },
+    const close = this.close.bind(this);
+    this.close = () => {
+      if (!this._closed) record.closeCalls++;
+      close();
     };
-    this._filename = file.name;
-    this._nObs = 1;
-    this._nVars = 0;
-    this._obsKeys = [];
-    this._obsmKeys = ['X_umap_2d'];
-    this._varNames = [];
-    this.getDatasetMetadata = async () => sourceMetadata(file.name);
-    this.getEmbeddingShape = async key => {
-      assert.equal(key, 'X_umap_2d');
-      return { shape: [1, 2], nDims: 2 };
+    this._snapshot = {
+      nObs: 2,
+      nVars: 0,
+      obsKeys: [],
+      varNames: [],
+      hasExpressionMatrix: false,
+      isOpen: true,
     };
-    this.getEmbedding = async key => {
+    // The calls reach a reader configured as the fixture, in-process.
+    const engine = fakeEngine(file.name);
+    this._call = async (method, ...args) => engine[method](...args);
+    this.getDatasetMetadata = async () => sourceMetadata();
+    this.readObsmColumns = async (key, columns) => {
       assert.equal(key, 'X_umap_2d');
+      assert.deepEqual(columns, [0, 1]);
       if (file.corruptEmbedding) {
         throw new Error(`corrupt embedding payload in ${file.name}`);
       }
-      return {
-        data: new Float32Array([0, 0]),
-        shape: [1, 2],
-        nDims: 2
-      };
+      return new Float64Array([0, 0, 1, 1]);
     };
 
     if (file.fail) throw new Error(`invalid ${file.name}`);
@@ -2552,7 +2606,7 @@ async function withFakeH5adOpen(run) {
   try {
     await run({ pendingByName, records, warnings });
   } finally {
-    H5adLoader.prototype.open = originalOpen;
+    AnnDataReaderClient.prototype.open = originalOpen;
     for (const [name, method] of originalNotifications) {
       if (method === undefined) delete notificationCenter[name];
       else notificationCenter[name] = method;
@@ -2610,8 +2664,10 @@ test('H5adDataSource preserves a working dataset when required embedding bytes a
     assert.equal(source.getAdapter(), workingAdapter);
     assert.equal(await source.isAvailable(), true);
     assert.deepEqual(
-      Array.from(await source.getEmbedding(2)),
-      [0, 0]
+      Array.from(
+        await source.getAdapter().getEmbeddingPayload('embeddings/0_2d.bin', 2)
+      ),
+      [-1, -1, 1, 1]
     );
     source.clear();
   });
@@ -2641,47 +2697,30 @@ test('H5adDataSource makes overlapping selections latest-wins', async () => {
 test('H5AD notification owner spans validation and dismisses a stale candidate', async t => {
   const notifications = getNotificationCenter();
   const events = captureDownloadNotifications(t);
-  const originalOpen = H5adLoader.prototype.open;
-  const originalWarning = notifications.warning;
+  const originalOpen = AnnDataReaderClient.prototype.open;
+  const originalInfo = notifications.info;
   const olderGate = deferred();
-  const openOptions = new Map();
-  notifications.warning = () => {};
+  notifications.info = () => {};
   t.after(() => {
-    H5adLoader.prototype.open = originalOpen;
-    notifications.warning = originalWarning;
+    AnnDataReaderClient.prototype.open = originalOpen;
+    notifications.info = originalInfo;
   });
 
-  H5adLoader.prototype.open = async function (file, options = {}) {
-    openOptions.set(file.name, options);
-    const ownsProgress = options.showProgress !== false;
-    const trackerId = ownsProgress
-      ? notifications.startDownload(`inner:${file.name}`)
-      : null;
-    this._file = {
-      close() {},
-      keys() {
-        return [];
-      },
+  AnnDataReaderClient.prototype.open = async function (file) {
+    this._snapshot = {
+      nObs: 2,
+      nVars: 0,
+      obsKeys: [],
+      varNames: [],
+      hasExpressionMatrix: false,
+      isOpen: true,
     };
-    this._filename = file.name;
-    this._nObs = 1;
-    this._nVars = 0;
-    this._obsKeys = [];
-    this._obsmKeys = ['X_umap_2d'];
-    this._varNames = [];
-    this.getDatasetMetadata = async () => sourceMetadata(file.name);
-    this.getEmbeddingShape = async () => ({
-      shape: [1, 2],
-      nDims: 2,
-    });
-    this.getEmbedding = async () => ({
-      data: new Float32Array([0, 0]),
-      shape: [1, 2],
-      nDims: 2,
-    });
+    const engine = fakeEngine(file.name);
+    this._call = async (method, ...args) => engine[method](...args);
+    this.getDatasetMetadata = async () => sourceMetadata();
+    this.readObsmColumns = async () => new Float64Array([0, 0, 1, 1]);
 
     if (file.name === 'older.h5ad') await olderGate.promise;
-    if (trackerId) notifications.completeDownload(trackerId);
   };
 
   const source = new H5adDataSource();
@@ -2693,8 +2732,6 @@ test('H5AD notification owner spans validation and dismisses a stale candidate',
 
   await assert.rejects(older, /superseded/i);
   assert.equal(newer.id, 'h5ad_newer');
-  assert.equal(openOptions.get('older.h5ad').showProgress, false);
-  assert.equal(openOptions.get('newer.h5ad').showProgress, false);
   assert.deepEqual(
     events
       .filter(event => event.kind !== 'update')
@@ -2709,73 +2746,34 @@ test('H5AD notification owner spans validation and dismisses a stale candidate',
   assert.equal(completedId, newerStart.id);
 });
 
-test('H5AD low-level open keeps direct progress opt-in by default', async t => {
-  assert.equal(
-    typeof H5adLoader.prototype._populateCandidateFromFile,
-    'function',
-    'public open needs a testable candidate-population seam'
-  );
+test('H5AD low-level open publishes no notifications and a newer open supersedes an older one', async t => {
   const events = captureDownloadNotifications(t);
   const configure = (loader, gate = null) => {
-    loader._populateCandidateFromFile = async (
-      candidate,
-      file,
-      _totalBytes,
-      _requestId,
-      reportProgress
-    ) => {
+    loader._populateCandidate = async (candidate, source) => {
       candidate._file = { close() {} };
-      candidate._filename = file.name;
+      candidate._filename = source.name;
       candidate._nObs = 1;
       candidate._nVars = 0;
-      reportProgress(1, 1);
-      if (gate) await gate.promise;
+      if (gate && source.name === 'older.h5ad') await gate.promise;
     };
   };
-
-  const silent = new H5adLoader();
-  configure(silent);
-  await silent.open(
-    { name: 'silent.h5ad', size: 1 },
-    { showProgress: false }
-  );
-  assert.deepEqual(events, []);
+  const source = name => ({ name, size: 1, identity: {}, readInto() {} });
 
   const direct = new H5adLoader();
   configure(direct);
-  await direct.open({ name: 'direct.h5ad', size: 1 });
-  assert.deepEqual(
-    events.map(event => event.kind),
-    ['start', 'update', 'complete']
-  );
+  await direct.open(source('direct.h5ad'));
+  assert.deepEqual(events, [], 'the reader runs in a worker; the data source owns notifications');
 
-  events.length = 0;
   const overlapping = new H5adLoader();
   const olderGate = deferred();
-  configure(overlapping);
-  overlapping._populateCandidateFromFile = async (
-    candidate,
-    file,
-    _totalBytes,
-    _requestId,
-    reportProgress
-  ) => {
-    candidate._file = { close() {} };
-    candidate._filename = file.name;
-    candidate._nObs = 1;
-    candidate._nVars = 0;
-    reportProgress(1, 1);
-    if (file.name === 'older.h5ad') await olderGate.promise;
-  };
-  const older = overlapping.open({ name: 'older.h5ad', size: 1 });
+  configure(overlapping, olderGate);
+  const older = overlapping.open(source('older.h5ad'));
   await Promise.resolve();
-  await overlapping.open({ name: 'newer.h5ad', size: 1 });
+  await overlapping.open(source('newer.h5ad'));
   olderGate.resolve();
   await assert.rejects(older, /superseded/i);
-  assert.deepEqual(
-    events.map(event => event.kind),
-    ['start', 'update', 'start', 'update', 'complete', 'dismiss']
-  );
+  assert.equal(overlapping._filename, 'newer.h5ad');
+  assert.deepEqual(events, []);
 });
 
 test('H5adDataSource has one loader owner and closes it once', async () => {
@@ -2849,7 +2847,7 @@ test('H5AD connectivity requires exact obsp mapping identity', async t => {
         1
       );
       mutate(loader._file.get('obsp'), loader);
-      await assert.rejects(loader.hasConnectivities(), expected);
+      await assert.rejects(loader.hasConnectivities('connectivities'), expected);
     });
   }
 });
@@ -2884,7 +2882,7 @@ test('H5AD discovers sparse connectivity from metadata without reading payloads'
   const loader = loaderWithConnectivity(connectivities, 2);
 
   assert.equal(typeof loader.hasConnectivities, 'function');
-  assert.equal(await loader.hasConnectivities(), true);
+  assert.equal(await loader.hasConnectivities('connectivities'), true);
   assert.equal(payloadReads, 0);
 });
 
@@ -2899,8 +2897,8 @@ test('H5AD supports bounded dense connectivity matrices', async () => {
   );
   const loader = loaderWithConnectivity(connectivities, 3);
 
-  assert.equal(await loader.hasConnectivities(), true);
-  const result = await loader.getConnectivities();
+  assert.equal(await loader.hasConnectivities('connectivities'), true);
+  const result = await loader.getConnectivities('connectivities');
   assert.equal(result.format, 'dense');
   assert.deepEqual(result.shape, [3, 3]);
   assert.deepEqual(Array.from(result.data), [
@@ -2924,7 +2922,7 @@ test('H5AD preserves exact connectivity weights through graph extraction', async
       ),
       2
     );
-    const result = await loader.getConnectivities();
+    const result = await loader.getConnectivities('connectivities');
     assert.equal(result.data instanceof Float64Array, true);
     assert.equal(result.data[1], weighted);
     const edges = extractConnectivityEdges(result, 2);
@@ -2942,7 +2940,7 @@ test('H5AD preserves exact connectivity weights through graph extraction', async
       }),
       2
     );
-    const result = await loader.getConnectivities();
+    const result = await loader.getConnectivities('connectivities');
     assert.equal(result.data instanceof Float64Array, true);
     assert.equal(result.data[0], weighted);
     const edges = extractConnectivityEdges(result, 2);
@@ -2950,48 +2948,151 @@ test('H5AD preserves exact connectivity weights through graph extraction', async
   });
 });
 
-test('H5AD rejects oversized dense connectivity before materializing it', async () => {
-  let payloadReads = 0;
-  const connectivities = dataset(new Float32Array(0), {
-    dtype: '<f4',
-    shape: [20_000, 20_000],
-    valueGetter() {
-      payloadReads++;
-      throw new Error('payload sentinel');
-    },
-  });
-  const loader = loaderWithConnectivity(connectivities, 20_000);
+test('an H5AD open superseded before its file is mounted rejects as superseded', async () => {
+  const hdf5 = await import('../assets/external/hdf5_hl.js');
+  await hdf5.ready;
+  const bytes = new Uint8Array(4096);
+  bytes.set([0x89, 0x48, 0x44, 0x46, 0x0d, 0x0a, 0x1a, 0x0a], 0);
+  const file = new BytesRangeSource(bytes, { name: 'superseded.h5ad' });
+  const before = new Set(hdf5.FS.readdir('/'));
 
-  await assert.rejects(
-    loader.getConnectivities(),
-    /(working set|browser limit|too large)/i
-  );
-  assert.equal(payloadReads, 0);
+  const loader = new H5adLoader();
+  // The signature check is synchronous; the open then waits for h5wasm, and
+  // a close in that window supersedes it before anything is mounted.
+  const opening = loader.open(file);
+  loader.close();
+
+  await assert.rejects(opening, error => {
+    assert.equal(
+      isDatasetReloadSupersededError(error),
+      true,
+      `expected the superseded error itself, received ${error?.name}: ${error?.message}`
+    );
+    assert.equal(error instanceof AggregateError, false);
+    return true;
+  });
+  const leftovers = hdf5.FS.readdir('/').filter(entry => !before.has(entry));
+  assert.deepEqual(leftovers, []);
 });
 
-test('large dense H5AD gene access requires current slice support', async () => {
-  let payloadReads = 0;
-  const X = dataset(new Uint8Array(0), {
-    dtype: '<B',
-    shape: [20_000_000, 4],
+test('a superseded failure is never folded into a cleanup aggregate', () => {
+  const superseded = createDatasetReloadSupersededError('Request superseded.');
+  const originalError = console.error;
+  const logged = [];
+  console.error = (...args) => logged.push(args);
+  try {
+    assert.strictEqual(
+      combineDatasetLifecycleFailures(
+        superseded,
+        new Error('cleanup failed'),
+        'Opening and cleanup both failed.'
+      ),
+      superseded
+    );
+  } finally {
+    console.error = originalError;
+  }
+  assert.equal(logged.length, 1);
+  assert.match(String(logged[0][1]?.message), /cleanup failed/);
+
+  const ordinary = combineDatasetLifecycleFailures(
+    new Error('open failed'),
+    new Error('cleanup failed'),
+    'Opening and cleanup both failed.'
+  );
+  assert.ok(ordinary instanceof AggregateError);
+});
+
+test('H5AD does not keep the raw connectivity matrix once it is read', async () => {
+  const loader = loaderWithConnectivity(
+    dataset(
+      new Float32Array([0, 1, 1, 0]),
+      { dtype: '<f4', shape: [2, 2] }
+    ),
+    2
+  );
+  const first = await loader.getConnectivities('connectivities');
+  assert.equal(first.format, 'dense');
+  for (const [key, value] of loader._cache) {
+    assert.notStrictEqual(value, first, `cache entry "${key}" retains the raw matrix`);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// No size ceiling: every array is read in bounded hyperslabs, and gene
+// columns are reached without holding the whole matrix.
+// ---------------------------------------------------------------------------
+
+function slabCountingDataset(length, elementBytes, valueAt) {
+  const slices = [];
+  const node = dataset(new Float64Array(0), {
+    dtype: '<f8',
+    // A large element size makes the 64 MiB slab hold only a few elements,
+    // so slabbing is observable on a tiny array.
+    metadata: { size: elementBytes },
+    shape: [length],
     valueGetter() {
-      payloadReads++;
-      throw new Error('dense payload sentinel');
+      throw new Error('a whole-array read would stage the array in the WASM heap');
     },
   });
-  const loader = new H5adLoader();
-  loader._file = group({ X });
-  loader._filename = 'large-dense.h5ad';
-  loader._nObs = 20_000_000;
-  loader._nVars = 4;
-  loader._varNames = ['A', 'B', 'C', 'D'];
-  loader._varNameIndex = new Map(
-    loader._varNames.map((name, index) => [name, index])
-  );
+  node.slice = ([[start, stop]]) => {
+    slices.push([start, stop]);
+    return Float64Array.from({ length: stop - start }, (_, i) => valueAt(start + i));
+  };
+  return { node, slices };
+}
 
-  await assert.rejects(
-    loader.getGeneExpression('A'),
-    /dense X.*slice.*required|slice.*dense X.*required/i
-  );
-  assert.equal(payloadReads, 0);
+test('H5AD observation fields of any length are read in bounded slabs, never whole', async () => {
+  const length = 20;
+  const { node, slices } = slabCountingDataset(length, 8 * 1024 * 1024, i => i * 0.5);
+  const loader = loaderWithObs({ score: node }, length);
+  const field = await loader.getObsField('score');
+  assert.deepEqual(Array.from(field.values), Array.from({ length }, (_, i) => i * 0.5));
+  // 64 MiB / 8 MiB per element = 8 elements per slab.
+  assert.deepEqual(slices, [[0, 8], [8, 16], [16, 20]]);
+});
+
+test('H5AD CSC gene columns read only that gene\'s entries', async () => {
+  // 3 cells x 3 genes, CSC: gene g has entries indptr[g]..indptr[g+1].
+  const data = new Float32Array([1, 2, 3, 4]);
+  const indices = new Int32Array([0, 2, 1, 1]);
+  const indptr = new Int32Array([0, 2, 3, 4]);
+  const X = sparseGroup({ data, indices, indptr, encodingType: 'csc_matrix', shape: [3, 3] });
+  const reads = [];
+  for (const key of ['data', 'indices']) {
+    const node = X.get(key);
+    const slice = node.slice;
+    node.slice = ranges => {
+      reads.push([key, ...ranges[0]]);
+      return slice(ranges);
+    };
+    Object.defineProperty(node, 'value', {
+      get() { throw new Error('a CSC gene read must not read the whole matrix'); },
+    });
+  }
+  const loader = loaderWithSparseX(X, { nObs: 3, nVars: 3, varNames: ['a', 'b', 'c'] });
+  assert.deepEqual(Array.from(await loader.getMatrixColumn('X', 0)), [1, 0, 2]);
+  assert.deepEqual(Array.from(await loader.getMatrixColumn('X', 2)), [0, 4, 0]);
+  assert.deepEqual(reads, [
+    ['indices', 0, 2], ['data', 0, 2],
+    ['indices', 3, 4], ['data', 3, 4],
+  ]);
+});
+
+test('H5AD CSR gene index is a streaming transpose that never reads the matrix whole', async () => {
+  // 4 cells x 3 genes, CSR, with a duplicate coordinate in cell 1.
+  const data = new Float32Array([1, 2, 3, 0.5, 4, 5]);
+  const indices = new Int32Array([0, 2, 1, 1, 0, 2]);
+  const indptr = new Int32Array([0, 2, 4, 5, 6]);
+  const X = sparseGroup({ data, indices, indptr, shape: [4, 3] });
+  for (const key of ['data', 'indices', 'indptr']) {
+    Object.defineProperty(X.get(key), 'value', {
+      get() { throw new Error('the CSR matrix must never be read whole'); },
+    });
+  }
+  const loader = loaderWithSparseX(X, { nObs: 4, nVars: 3, varNames: ['a', 'b', 'c'] });
+  const [a, b, c] = await Promise.all([0, 1, 2].map(g => loader.getMatrixColumn('X', g)));
+  assert.deepEqual(Array.from(a), [1, 0, 4, 0]);
+  assert.deepEqual(Array.from(b), [0, Math.fround(3 + 0.5), 0, 0]);
+  assert.deepEqual(Array.from(c), [2, 0, 0, 5]);
 });

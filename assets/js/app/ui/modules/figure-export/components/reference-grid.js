@@ -52,11 +52,27 @@
  *   the export paints the last-drawn class instead of the sum of the two.
  * None of these carry a data claim; all are far below print tolerance.
  *
+ * THE STUDIO BACKDROP
+ * `buildReferenceGridModel()` is the one entry point for the viewer's
+ * reference layer: a `kind: 'studio'` appearance (`Studio (light)`,
+ * `Studio (dark)`) is reproduced by `components/studio-backdrop-export.js`,
+ * and the two render functions here draw either model.
+ *
  * @module ui/modules/figure-export/components/reference-grid
  */
 
-import { assertCropRect01, cropRect01ToPx } from '../utils/crop.js';
 import { hexToRgb01, rgb01ToHex } from '../utils/color-utils.js';
+import {
+  clipSegmentDepthRange,
+  createPlotProjection,
+  lerpPoint,
+  toClipSpace,
+} from '../utils/plot-projection.js';
+import {
+  buildStudioBackdropModel,
+  drawCanvasStudioBackdrop,
+  renderSvgStudioBackdrop,
+} from './studio-backdrop-export.js';
 
 /**
  * Line-strength curves, exactly as written in `GRID_FS_SOURCE`.
@@ -141,59 +157,6 @@ function assertRgb01(value, context) {
     throw new TypeError(`${context} must contain exactly three 0..1 numbers.`);
   }
   return [value[0], value[1], value[2]];
-}
-
-/**
- * Project a model-space point with a column-major MVP matrix.
- *
- * @param {Float32Array} mvp
- * @param {number[]} p
- * @returns {{ x: number; y: number; z: number; w: number }}
- */
-function toClipSpace(mvp, p) {
-  const [x, y, z] = p;
-  return {
-    x: mvp[0] * x + mvp[4] * y + mvp[8] * z + mvp[12],
-    y: mvp[1] * x + mvp[5] * y + mvp[9] * z + mvp[13],
-    z: mvp[2] * x + mvp[6] * y + mvp[10] * z + mvp[14],
-    w: mvp[3] * x + mvp[7] * y + mvp[11] * z + mvp[15],
-  };
-}
-
-/**
- * The sub-range of a segment that survives the near and far clip planes.
- * Clip coordinates are linear in the model-space parameter, so clipping in `t`
- * is exact rather than an approximation.
- *
- * @returns {[number, number]|null}
- */
-function clipSegmentDepthRange(c0, c1) {
-  let tMin = 0;
-  let tMax = 1;
-  const distances = [
-    [c0.z + c0.w, c1.z + c1.w],
-    [c0.w - c0.z, c1.w - c1.z],
-  ];
-  for (const [d0, d1] of distances) {
-    if (d0 < 0 && d1 < 0) return null;
-    if (d0 === d1) continue;
-    const t = d0 / (d0 - d1);
-    if (d0 < 0) {
-      if (t > tMin) tMin = t;
-    } else if (d1 < 0) {
-      if (t < tMax) tMax = t;
-    }
-  }
-  if (!(tMax > tMin)) return null;
-  return [tMin, tMax];
-}
-
-function lerpPoint(a, b, t) {
-  return [
-    a[0] + (b[0] - a[0]) * t,
-    a[1] + (b[1] - a[1]) * t,
-    a[2] + (b[2] - a[2]) * t,
-  ];
 }
 
 /**
@@ -287,30 +250,37 @@ function buildRuleBands({
 }
 
 /**
- * The colour the grid rules composite over.
+ * The surface the reference layer composites over.
  *
- * A transparent figure has no paper for the grid to sit on, so its rules are
- * composited over the viewer's own background — they then look exactly as they
- * do on screen, and everything between them stays transparent.
+ * `rgb` is the colour its marks are composited onto. A transparent figure has
+ * no paper for the layer to sit on, so its marks are composited over the
+ * viewer's own background — they then look exactly as they do on screen, and
+ * everything between them stays transparent.
+ *
+ * `viewerPaper` is true when the figure's paper is exactly the viewer's own
+ * surface colour (`Background: Match viewer`, or a custom colour equal to
+ * it): only then is the studio backdrop's glow, a lightening of that surface,
+ * part of the picture.
  *
  * @param {object} options
  * @param {object|null} options.appearance
  * @param {string} options.background
  * @param {string} options.backgroundColor - exact #RRGGBB
- * @returns {number[]|null}
+ * @returns {Readonly<{ rgb: number[]; viewerPaper: boolean }>|null}
  */
-export function resolveReferenceGridSurfaceRgb({
+export function resolveReferenceGridSurface({
   appearance,
   background,
   backgroundColor,
 }) {
   if (appearance === null || appearance === undefined) return null;
+  const viewerSurface = [
+    appearance.surfaceColor[0],
+    appearance.surfaceColor[1],
+    appearance.surfaceColor[2],
+  ];
   if (background === 'transparent') {
-    return [
-      appearance.surfaceColor[0],
-      appearance.surfaceColor[1],
-      appearance.surfaceColor[2],
-    ];
+    return Object.freeze({ rgb: viewerSurface, viewerPaper: false });
   }
   const rgb = hexToRgb01(backgroundColor);
   if (rgb === null) {
@@ -318,28 +288,45 @@ export function resolveReferenceGridSurfaceRgb({
       'Reference grid export requires an exact #RRGGBB figure background.'
     );
   }
-  return rgb;
+  return Object.freeze({
+    rgb,
+    viewerPaper: rgb01ToHex(rgb) === rgb01ToHex(viewerSurface),
+  });
 }
 
 /**
- * Build the plot-space line model of the viewer's reference grid.
+ * Build the plot-space model of the viewer's reference layer: the grid box's
+ * rules, or the studio backdrop (`components/studio-backdrop-export.js`).
  *
  * @param {object} options
  * @param {object|null} options.appearance - from `utils/viewer-background.js`
  * @param {{ mvpMatrix: Float32Array; viewMatrix: Float32Array; viewportWidth: number; viewportHeight: number }} options.renderState
  * @param {{ x: number; y: number; width: number; height: number }} options.plotRect
  * @param {object|null} [options.crop]
- * @param {number[]|Float32Array} options.surfaceRgb - what the grid composites over, 0..1
- * @returns {{ segments: { x1: number; y1: number; x2: number; y2: number; widthPx: number; color: string }[] }|null}
+ * @param {{ rgb: number[]; viewerPaper: boolean }|null} options.surface - from
+ *   `resolveReferenceGridSurface`
+ * @returns {{ segments: { x1: number; y1: number; x2: number; y2: number; widthPx: number; color: string }[] }|object|null}
  */
 export function buildReferenceGridModel({
   appearance,
   renderState,
   plotRect,
   crop = null,
-  surfaceRgb,
+  surface: layerSurface,
 }) {
   if (appearance === null || appearance === undefined) return null;
+  // A backdrop look is a raster drawn by `backdrop-look-export.js`; it has no
+  // vector reference layer.
+  if (appearance.kind === 'look') return null;
+  if (appearance.kind === 'studio') {
+    return buildStudioBackdropModel({
+      appearance,
+      renderState,
+      plotRect,
+      crop,
+      surface: layerSurface,
+    });
+  }
   if (
     !(renderState?.mvpMatrix instanceof Float32Array) ||
     renderState.mvpMatrix.length !== 16 ||
@@ -359,7 +346,7 @@ export function buildReferenceGridModel({
     throw new TypeError('Reference grid export requires a positive plot rectangle.');
   }
 
-  const surface = assertRgb01(surfaceRgb, 'Reference grid surface colour');
+  const surface = assertRgb01(layerSurface?.rgb, 'Reference grid surface colour');
   const lineColor = assertRgb01(appearance.lineColor, 'Reference grid line colour');
   const axisColors = {
     x: assertRgb01(appearance.axisColors.x, 'Reference grid X-axis colour'),
@@ -386,39 +373,7 @@ export function buildReferenceGridModel({
 
   const mvp = renderState.mvpMatrix;
   const view = renderState.viewMatrix;
-  const viewportW = Math.max(1, renderState.viewportWidth || 1);
-  const viewportH = Math.max(1, renderState.viewportHeight || 1);
-
-  const crop01 = assertCropRect01(crop);
-  const cropPx = cropRect01ToPx(crop01, viewportW, viewportH);
-  const hasCrop = Boolean(
-    cropPx &&
-    (
-      cropPx.width < viewportW - 0.5 ||
-      cropPx.height < viewportH - 0.5 ||
-      cropPx.x > 0.5 ||
-      cropPx.y > 0.5
-    )
-  );
-  const srcX0 = hasCrop && cropPx ? cropPx.x : 0;
-  const srcY0 = hasCrop && cropPx ? cropPx.y : 0;
-  const srcW = hasCrop && cropPx ? cropPx.width : viewportW;
-  const srcH = hasCrop && cropPx ? cropPx.height : viewportH;
-  const scale = Math.min(plotRect.width / srcW, plotRect.height / srcH);
-  const offsetX = plotRect.x + (plotRect.width - srcW * scale) / 2;
-  const offsetY = plotRect.y + (plotRect.height - srcH * scale) / 2;
-
-  const toPlot = (clip) => {
-    if (!(clip.w > 1e-9)) return null;
-    const ndcX = clip.x / clip.w;
-    const ndcY = clip.y / clip.w;
-    const vx = (ndcX * 0.5 + 0.5) * viewportW;
-    const vy = (-ndcY * 0.5 + 0.5) * viewportH;
-    return {
-      x: offsetX + (vx - srcX0) * scale,
-      y: offsetY + (vy - srcY0) * scale,
-    };
-  };
+  const { toPlot } = createPlotProjection({ renderState, plotRect, crop });
 
   // The view matrix's third row is the camera's backward axis in world space;
   // `drawGrid()` negates it to get the direction the camera looks along.
@@ -534,15 +489,18 @@ export function buildReferenceGridModel({
   }
 
   if (segments.length === 0) return null;
-  return { segments };
+  return { kind: 'grid', segments };
 }
 
 /**
- * @param {{ segments: { x1: number; y1: number; x2: number; y2: number; widthPx: number; color: string }[] }|null} model
+ * @param {object|null} model - from `buildReferenceGridModel`
+ * @param {string} idPrefix - unique within the document; names the studio
+ *   backdrop's gradient definitions
  * @returns {string}
  */
-export function renderSvgReferenceGrid(model) {
+export function renderSvgReferenceGrid(model, idPrefix) {
   if (model === null) return '';
+  if (model.kind === 'studio') return renderSvgStudioBackdrop(model, idPrefix);
   const parts = ['<g class="cellucid-reference-grid" fill="none" stroke-linecap="butt">'];
   for (const segment of model.segments) {
     parts.push(
@@ -558,10 +516,14 @@ export function renderSvgReferenceGrid(model) {
 /**
  * @param {object} options
  * @param {CanvasRenderingContext2D} options.ctx
- * @param {{ segments: { x1: number; y1: number; x2: number; y2: number; widthPx: number; color: string }[] }|null} options.model
+ * @param {object|null} options.model - from `buildReferenceGridModel`
  */
 export function drawCanvasReferenceGrid({ ctx, model }) {
   if (model === null) return;
+  if (model.kind === 'studio') {
+    drawCanvasStudioBackdrop({ ctx, model });
+    return;
+  }
   ctx.save();
   ctx.lineCap = 'butt';
   for (const segment of model.segments) {

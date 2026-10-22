@@ -1,8 +1,9 @@
 // Who owns the navigation mode: the dimension rule, or the user?
 //
 // The viewer selects Orbit for a 3-D embedding and Planar for 1-D and 2-D, and
-// keeps re-selecting it every time the dimension changes — until the user picks
-// a mode themselves, after which their choice is preserved. These specs pin
+// keeps re-selecting it every time a view's dimension changes — until the user
+// picks another mode for that view in that dimension, which the view keeps
+// whenever it shows that dimension again. These specs pin
 // both halves of that rule and, in particular, that a mode *published* by
 // something other than the user (a dataset's advertised starting state, the
 // Reset Camera button) does not silently end the coupling.
@@ -22,6 +23,7 @@ import {
 
 import { appUrl } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
+import { openCollapsedPanels } from './helpers/panels.mjs';
 
 const FIXTURE_ROOT = appUrl('/tests/browser/fixtures/generated-dimensions/');
 const DATASET_ID = 'deterministic-dimensions';
@@ -32,7 +34,7 @@ const CATEGORIES = Object.freeze(['Progenitor', 'Differentiated']);
 const STATE_FILENAME = 'default.cellucid-session';
 
 const identity = {
-  version: 2,
+  version: 3,
   id: DATASET_ID,
   name: DATASET_NAME,
   description: 'Exact synthetic fixture for navigation-mode ownership',
@@ -48,12 +50,31 @@ const identity = {
     n_edges: null,
   },
   embeddings: {
-    available_dimensions: [1, 2, 3],
     default_dimension: 3,
-    files: {
-      '1d': 'points_1d.bin',
-      '2d': 'points_2d.bin',
-      '3d': 'points_3d.bin',
+    defaults: {
+      '1d': 'layout_1d',
+      '2d': 'layout_2d',
+      '3d': 'layout_3d',
+    },
+    items: {
+      layout_1d: {
+        label: 'Layout 1D',
+        dimension: 1,
+        file: 'embeddings/0_1d.bin',
+        source: { key: null, columns: [0] },
+      },
+      layout_2d: {
+        label: 'Layout 2D',
+        dimension: 2,
+        file: 'embeddings/1_2d.bin',
+        source: { key: null, columns: [0, 1] },
+      },
+      layout_3d: {
+        label: 'Layout 3D',
+        dimension: 3,
+        file: 'embeddings/2_3d.bin',
+        source: { key: null, columns: [0, 1, 2] },
+      },
     },
   },
   obs_fields: [{
@@ -84,7 +105,7 @@ function centroidsFor(dimension) {
 }
 
 const obsManifest = {
-  _format: 'compact_v1',
+  _format: 'compact_v2',
   n_points: CELL_COUNT,
   centroid_outlier_quantile: null,
   latent_key: null,
@@ -105,7 +126,11 @@ const obsManifest = {
     CATEGORIES,
     'uint8',
     255,
-    { 1: centroidsFor(1), 2: centroidsFor(2), 3: centroidsFor(3) },
+    {
+      layout_1d: centroidsFor(1),
+      layout_2d: centroidsFor(2),
+      layout_3d: centroidsFor(3),
+    },
   ]],
 };
 
@@ -113,9 +138,8 @@ const obsManifest = {
 // fixture publishes one gene rather than none.
 const GENE_KEY = 'Marker1';
 const varManifest = {
-  _format: 'compact_v1',
+  _format: 'compact_v2',
   n_points: CELL_COUNT,
-  var_gene_id_column: 'gene_name',
   compression: null,
   quantization: 8,
   _varSchema: {
@@ -127,6 +151,12 @@ const varManifest = {
     quantizationBits: 8,
   },
   fields: [[0, GENE_KEY, 0, 1]],
+  gene_name_sets: [{
+    source: null,
+    filled_from_index: 0,
+    renamed: [],
+    names: null,
+  }],
 };
 
 const geneBytes = Buffer.from(
@@ -273,21 +303,22 @@ async function installFixture(page, publishedState = null) {
       { body: geneBytes, contentType: 'application/octet-stream' },
     ],
     [
-      `${DATASET_ID}/points_1d.bin`,
+      `${DATASET_ID}/embeddings/0_1d.bin`,
       { body: positionBytes(1), contentType: 'application/octet-stream' },
     ],
     [
-      `${DATASET_ID}/points_2d.bin`,
+      `${DATASET_ID}/embeddings/1_2d.bin`,
       { body: positionBytes(2), contentType: 'application/octet-stream' },
     ],
     [
-      `${DATASET_ID}/points_3d.bin`,
+      `${DATASET_ID}/embeddings/2_3d.bin`,
       { body: positionBytes(3), contentType: 'application/octet-stream' },
     ],
   ]);
 
   if (publishedState !== null) {
     catalogEntry.state_manifest = 'state-snapshots.json';
+    catalogEntry.state_bytes = publishedState.byteLength;
     catalogEntry.state_sha256 = createHash('sha256')
       .update(publishedState)
       .digest('hex');
@@ -346,10 +377,25 @@ function fixtureUrl(acceptance) {
 async function openFixture(page, acceptance) {
   await page.goto(fixtureUrl(acceptance), { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
+  await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(DATASET_NAME);
   await expect(page.locator('#filter-count')).toHaveText(
-    `Showing all ${CELL_COUNT} points`,
+    `Showing all ${CELL_COUNT} cells`,
   );
+}
+
+/**
+ * Show the representation of one dimension (this fixture has one per
+ * dimension) in the selected view, through the "Shows" picker.
+ */
+async function showDimension(page, dimension) {
+  const option = page
+    .locator(`#view-representation-select optgroup[label="${dimension}D"] option`)
+    .first();
+  await page.selectOption('#view-representation-select', await option.getAttribute('value'));
+  await expect.poll(
+    () => page.evaluate(() => window._cellucidState.getDimensionLevel())
+  ).toBe(dimension);
 }
 
 test('the dimension rule keeps re-selecting a mode nobody chose', async ({
@@ -358,7 +404,8 @@ test('the dimension rule keeps re-selecting a mode nobody chose', async ({
   await installFixture(page);
   await openFixture(page, 'navigation-ownership-default');
 
-  await expect(page.locator('#dimension-select')).toHaveValue('3');
+  await expect(page.locator('#view-representation-select option:checked'))
+    .toHaveText(/ · 3D$/);
   await expect(page.locator('#navigation-mode')).toHaveValue('orbit');
 
   // A restore publishing the mode the dimension already implies is not a user
@@ -369,42 +416,50 @@ test('the dimension rule keeps re-selecting a mode nobody chose', async ({
     window._cellucidViewer.setNavigationMode('orbit');
   });
 
-  await page.selectOption('#dimension-select', '2');
+  await showDimension(page, 2);
   await expect(page.locator('#navigation-mode')).toHaveValue('planar');
 
-  await page.selectOption('#dimension-select', '1');
+  await showDimension(page, 1);
   await expect(page.locator('#navigation-mode')).toHaveValue('planar');
 
-  await page.selectOption('#dimension-select', '3');
+  await showDimension(page, 3);
   await expect(page.locator('#navigation-mode')).toHaveValue('orbit');
 });
 
-test('a mode the user picked survives every later dimension change', async ({
+test('a mode the user picked is remembered for the dimension it was picked in', async ({
   page,
 }) => {
   await installFixture(page);
   await openFixture(page, 'navigation-ownership-explicit');
 
-  // Free-fly is never a dimension default, so choosing it always takes
-  // ownership.
+  // Free-fly is never a dimension default, so choosing it in 3D is a choice
+  // for 3D: a 2D or 1D representation pans, and 3D flies again.
   await page.selectOption('#navigation-mode', 'free');
   await expect(page.locator('#navigation-mode')).toHaveValue('free');
-  await page.selectOption('#dimension-select', '2');
-  await expect(page.locator('#navigation-mode')).toHaveValue('free');
-  await page.selectOption('#dimension-select', '1');
+  await showDimension(page, 2);
+  await expect(page.locator('#navigation-mode')).toHaveValue('planar');
+  await showDimension(page, 1);
+  await expect(page.locator('#navigation-mode')).toHaveValue('planar');
+  await showDimension(page, 3);
   await expect(page.locator('#navigation-mode')).toHaveValue('free');
 
-  // Orbit is the 3-D default but an override at 2-D, so it takes ownership
-  // there and survives the move to 1-D.
-  await page.selectOption('#dimension-select', '2');
+  // Orbit is the 3-D default: choosing it hands 3D back to the rule. In 2D it
+  // is a choice for 2D, which 1D does not inherit and 2D keeps.
   await page.selectOption('#navigation-mode', 'orbit');
-  await page.selectOption('#dimension-select', '1');
+  await showDimension(page, 2);
+  await expect(page.locator('#navigation-mode')).toHaveValue('planar');
+  await page.selectOption('#navigation-mode', 'orbit');
+  await showDimension(page, 1);
+  await expect(page.locator('#navigation-mode')).toHaveValue('planar');
+  await showDimension(page, 2);
   await expect(page.locator('#navigation-mode')).toHaveValue('orbit');
 
   // Choosing the dimension's own default hands navigation back to the rule.
   await page.selectOption('#navigation-mode', 'planar');
-  await page.selectOption('#dimension-select', '3');
+  await showDimension(page, 3);
   await expect(page.locator('#navigation-mode')).toHaveValue('orbit');
+  await showDimension(page, 2);
+  await expect(page.locator('#navigation-mode')).toHaveValue('planar');
 });
 
 test('Reset Camera restores the mode this dimension defaults to', async ({
@@ -413,7 +468,7 @@ test('Reset Camera restores the mode this dimension defaults to', async ({
   await installFixture(page);
   await openFixture(page, 'navigation-ownership-reset');
 
-  await page.selectOption('#dimension-select', '2');
+  await showDimension(page, 2);
   await expect(page.locator('#navigation-mode')).toHaveValue('planar');
 
   await page.selectOption('#navigation-mode', 'orbit');
@@ -426,8 +481,10 @@ test('Reset Camera restores the mode this dimension defaults to', async ({
   await expect(page.locator('#navigation-mode')).toHaveValue('planar');
 
   // And navigation is back under the dimension rule.
-  await page.selectOption('#dimension-select', '3');
+  await showDimension(page, 3);
   await expect(page.locator('#navigation-mode')).toHaveValue('orbit');
+  await showDimension(page, 2);
+  await expect(page.locator('#navigation-mode')).toHaveValue('planar');
 });
 
 test('a published starting state reports its field and leaves the dimension rule alone', async ({
@@ -459,6 +516,7 @@ test('a published starting state reports its field and leaves the dimension rule
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(visitor);
+  await openCollapsedPanels(visitor);
   await expect(visitor.locator('#dataset-name')).toHaveText(DATASET_NAME);
 
   // The restored field colours the plot, so the statistics line must name it.
@@ -471,7 +529,7 @@ test('a published starting state reports its field and leaves the dimension rule
   // The starting state pinned Orbit because the dataset opens in 3-D, not
   // because anyone chose Orbit — so 2-D still gets Planar.
   await expect(visitor.locator('#navigation-mode')).toHaveValue('orbit');
-  await visitor.selectOption('#dimension-select', '2');
+  await showDimension(visitor, 2);
   await expect(visitor.locator('#navigation-mode')).toHaveValue('planar');
 
   await closePageWithApplicationRetirement(visitor);

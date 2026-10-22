@@ -38,7 +38,7 @@ function createKnnTools() {
     knnStepCount: 0,
     lassoCtx,
   });
-  tools.updateCursorForHighlightMode = () => {
+  tools.updateSelectionCursor = () => {
     canvas.style.cursor = 'default';
   };
   return { canvas, removedClasses, tools };
@@ -48,23 +48,49 @@ test('KNN edge ownership accepts only exact normalized arrays including empty gr
   const { tools } = createKnnTools();
 
   assert.throws(
-    () => tools.loadKnnEdges([0], [1]),
+    () => tools.loadKnnEdges([0], [1], 2),
     /Uint32Array/
   );
   assert.throws(
     () => tools.loadKnnEdges(
       Uint32Array.from([0, 1]),
-      Uint32Array.from([1])
+      Uint32Array.from([1]),
+      3
     ),
     /equal length/
   );
+  // Edges must follow the connectivity contract: ordered by source, then
+  // source < destination < cellCount.
+  assert.throws(
+    () => tools.loadKnnEdges(Uint32Array.from([1, 0]), Uint32Array.from([2, 1]), 3),
+    /ordered by source/
+  );
 
   assert.equal(
-    tools.loadKnnEdges(new Uint32Array(0), new Uint32Array(0)),
+    tools.loadKnnEdges(new Uint32Array(0), new Uint32Array(0), 4),
     true
   );
   assert.equal(tools.isKnnEdgesLoaded(), true);
-  assert.deepEqual(tools.knnAdjacencyList, new Map());
+  assert.deepEqual(Array.from(tools.knnAdjacencyList.forwardOffsets), [0, 0, 0, 0, 0]);
+  assert.deepEqual(Array.from(tools.knnAdjacencyList.reverseOffsets), [0, 0, 0, 0, 0]);
+});
+
+test('the KNN adjacency lists every neighbour of every cell, both directions, without a Map', () => {
+  const { tools } = createKnnTools();
+  // Edges 0-1, 0-3, 1-2, 2-3 (ordered by source).
+  tools.loadKnnEdges(Uint32Array.from([0, 0, 1, 2]), Uint32Array.from([1, 3, 2, 3]), 4);
+  const adjacency = tools.knnAdjacencyList;
+  assert.ok(!(adjacency instanceof Map));
+  const neighbours = cell => {
+    const out = [];
+    for (let j = adjacency.forwardOffsets[cell]; j < adjacency.forwardOffsets[cell + 1]; j++) out.push(adjacency.destinations[j]);
+    for (let j = adjacency.reverseOffsets[cell]; j < adjacency.reverseOffsets[cell + 1]; j++) out.push(adjacency.reverseSources[j]);
+    return out.sort();
+  };
+  assert.deepEqual(neighbours(0), [1, 3]);
+  assert.deepEqual(neighbours(1), [0, 2]);
+  assert.deepEqual(neighbours(2), [1, 3]);
+  assert.deepEqual(neighbours(3), [0, 2]);
 });
 
 test('dataset replacement clears every KNN graph and interaction owner', t => {
@@ -81,7 +107,8 @@ test('dataset replacement clears every KNN graph and interaction owner', t => {
   const { canvas, removedClasses, tools } = createKnnTools();
   tools.loadKnnEdges(
     Uint32Array.from([0, 1]),
-    Uint32Array.from([1, 2])
+    Uint32Array.from([1, 2]),
+    3
   );
   tools.isKnnDragging = true;
   tools.knnSeedCell = { cellIndex: 1 };
@@ -102,194 +129,25 @@ test('dataset replacement clears every KNN graph and interaction owner', t => {
   assert.ok(removedClasses.includes('knn-dragging'));
 });
 
-test('viewer edge teardown releases every dataset-owned GPU edge state', async () => {
+test('viewer connectivity lifecycle routes through the edge layer', async () => {
   const source = await readFile(
     new URL('../assets/js/rendering/viewer.js', import.meta.url),
     'utf8'
   );
-  const clearStart = source.indexOf('function detachEdgeResourcesV2()');
-  const nextFunction = source.indexOf(
-    'function createPositionTextureV2ForView',
-    clearStart
-  );
-  assert.ok(clearStart >= 0 && nextFunction > clearStart);
-  const clearSource = source.slice(clearStart, nextFunction);
-  assert.match(
-    clearSource,
-    /if \(edgeTextureV2 !== null\) retiringTextures\.add\(edgeTextureV2\)/
-  );
-  assert.match(
-    clearSource,
-    /retiringTextures\.add\(edgeWeightTextureV2\)/
-  );
-  assert.match(clearSource, /edgePositionTexturePoolV2\.clear\(\)/);
-  assert.match(clearSource, /edgePositionTexturesV2\.clear\(\)/);
-  assert.match(clearSource, /edgeVisibilityTexturesV2\.clear\(\)/);
-  assert.match(clearSource, /nEdgesV2 = 0/);
-  assert.match(clearSource, /nCellsV2 = 0/);
-  assert.match(clearSource, /hasEdgeDataV2 = false/);
-  assert.match(clearSource, /useInstancedEdges = false/);
-  assert.match(clearSource, /edgeSourcesV2 = null/);
-  assert.match(clearSource, /edgeDestinationsV2 = null/);
-  assert.match(clearSource, /edgePrefixOwnersV2\.clear\(\)/);
-  assert.match(clearSource, /edgePrefixCheckpointStaging = null/);
-  assert.match(clearSource, /edgeAllVisiblePrefixOwner = null/);
-  assert.match(clearSource, /edgeVisibleTarget = 0/);
-  assert.match(
-    clearSource,
-    /for \(const texture of retiringTextures\) \{\s*queueEdgeTextureRetirement\(texture\)/
-  );
-  assert.match(
-    clearSource,
-    /failures\.push\(\.\.\.drainEdgeTextureRetirements\(\)\)/
-  );
-  assert.match(
-    clearSource,
-    /throw new AggregateError\(\s*failures,\s*'Connectivity resources were detached with pending texture retirement failures\.'/
-  );
-  const detachIndex = clearSource.indexOf('edgeTextureV2 = null;');
-  const queueIndex = clearSource.indexOf(
-    'queueEdgeTextureRetirement(texture);'
-  );
-  const drainIndex = clearSource.indexOf('drainEdgeTextureRetirements()');
-  assert.ok(detachIndex >= 0 && detachIndex < queueIndex);
-  assert.ok(queueIndex < drainIndex);
-
-  const queueStart = source.indexOf(
-    'function queueEdgeTextureRetirement(texture)'
-  );
-  const retirementEnd = source.indexOf(
-    'function reportCommittedRetirementFailures',
-    queueStart
-  );
-  assert.ok(queueStart >= 0 && retirementEnd > queueStart);
-  const retirementSource = source.slice(queueStart, retirementEnd);
-  assert.match(
-    retirementSource,
-    /pendingEdgeTextureRetirements\.add\(texture\)/
-  );
-  assert.match(
-    retirementSource,
-    /return drainExactTextureRetirements\(\s*gl,\s*pendingEdgeTextureRetirements/
-  );
-  const exactRetirementStart = source.indexOf(
-    'export function drainExactTextureRetirements'
-  );
-  const exactRetirementEnd = source.indexOf(
-    'function assertNonEmptyTrimmedString',
-    exactRetirementStart
-  );
-  const exactRetirementSource = source.slice(
-    exactRetirementStart,
-    exactRetirementEnd
-  );
-  assert.match(
-    exactRetirementSource,
-    /for \(const texture of Array\.from\(pending\)\)/
-  );
-  assert.match(
-    exactRetirementSource,
-    /gl\.deleteTexture\(texture\);\s*pending\.delete\(texture\)/
-  );
-  assert.match(
-    exactRetirementSource,
-    /definitelyRetired = gl\.isTexture\(texture\) === false/
-  );
-  assert.match(
-    exactRetirementSource,
-    /if \(definitelyRetired\) \{\s*pending\.delete\(texture\)/
-  );
-  assert.match(
-    exactRetirementSource,
-    /else \{\s*failures\.push\(exactError\)/
-  );
+  // A new dataset drops the graph and every pane's records at once.
   assert.match(
     source,
-    /clearEdgesV2\(\) \{\s*clearEdgeResourcesV2\(\);\s*\}/
+    /hpRenderer\.loadData\([\s\S]+?edgeLayer\.clear\(\);\s*useInstancedEdges = false;/
   );
-  assert.match(
-    source,
-    /hpRenderer\.loadData\([\s\S]+?reportCommittedRetirementFailures\(\s*detachEdgeResourcesV2\(\),\s*'Connectivity resources from the prior committed dataset generation could not be fully retired\.'\s*\)/
-  );
-
-  const setupStart = source.indexOf(
-    'setupEdgesV2(edgeData, positions = null)'
-  );
-  assert.ok(setupStart >= 0);
-  const updateStart = source.indexOf(
-    'updateEdgeVisibilityV2(visibility)',
-    setupStart
-  );
-  const setupSource = source.slice(setupStart, updateStart);
-  assert.doesNotMatch(setupSource, /nEdges === 0/);
-  assert.match(setupSource, /weights instanceof Float64Array/);
-  assert.match(setupSource, /createEdgeTexturesV2\(/);
-  assert.match(setupSource, /hasEdgeDataV2 = true/);
-  assert.match(
-    source,
-    /hasConnectivityData\(\) \{ return hasEdgeDataV2; \}/
-  );
+  assert.match(source, /clearEdgesV2\(\) \{\s*edgeLayer\.clear\(\);\s*useInstancedEdges = false;\s*\}/);
+  // Context loss forgets handles; disposal deletes them.
+  assert.match(source, /edgeLayer\.abandon\(\);/);
+  assert.match(source, /edgeLayer\.dispose\(\);/);
+  // Removing a kept view removes its edge records.
+  assert.match(source, /edgeLayer\.deleteView\(exactId\)/);
+  // No per-edge or per-cell texture is left in the viewer.
   assert.doesNotMatch(
     source,
-    /enableEdgesV2\(\)[\s\S]{0,300}nEdgesV2 > 0/
-  );
-  assert.match(
-    source,
-    /return updateVisibilityTextureV2ForView\(\s*LIVE_VIEW_ID,\s*visibility\s*\)/
-  );
-  assert.doesNotMatch(
-    source,
-    /updateEdgeVisibilityV2ForView[\s\S]{0,500}Update live view's visibility/
-  );
-
-  const textureLookupStart = source.indexOf(
-    'function getEdgeTexturesForView(viewId)'
-  );
-  const textureLookupEnd = source.indexOf(
-    'function hasEdgeTexturesForView',
-    textureLookupStart
-  );
-  assert.ok(
-    textureLookupStart >= 0 && textureLookupEnd > textureLookupStart
-  );
-  const textureLookupSource = source.slice(
-    textureLookupStart,
-    textureLookupEnd
-  );
-  assert.doesNotMatch(textureLookupSource, /String\(viewId\)/);
-  assert.doesNotMatch(textureLookupSource, /fallback|legacy/i);
-  assert.doesNotMatch(
-    textureLookupSource,
-    /edgeVisibilityTexturesV2\.get\(vid\)\s*\|\|/
-  );
-  assert.match(
-    textureLookupSource,
-    /edgePositionTexturesV2\.get\(vid\)/
-  );
-  assert.match(
-    textureLookupSource,
-    /edgeVisibilityTexturesV2\.get\(vid\)/
-  );
-  assert.doesNotMatch(
-    textureLookupSource,
-    /sharesLiveTransparency/
-  );
-
-  const perViewSetupStart = source.indexOf('setupEdgesV2ForView(');
-  const perViewUpdateStart = source.indexOf(
-    'updateEdgeVisibilityV2ForView(viewId, visibility)',
-    perViewSetupStart
-  );
-  const perViewSetupSource = source.slice(
-    perViewSetupStart,
-    perViewUpdateStart
-  );
-  assert.match(
-    perViewSetupSource,
-    /if \(!createPositionTextureV2ForView[\s\S]+return false;/
-  );
-  assert.doesNotMatch(
-    perViewSetupSource,
-    /if \(!createPositionTextureV2ForView[\s\S]{0,160}deleteEdgeTexturesForView/
+    /edgeTextureV2|edgePositionTexture|edgeVisibilityTexture|EdgePrefix|nEdgesV2|hasEdgeDataV2/
   );
 });

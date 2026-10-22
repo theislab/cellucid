@@ -1,0 +1,962 @@
+/* ========================================================================
+   Controls — the one rule set for every sidebar control pattern.
+
+   The standard, the builder for each pattern and the wording rules are in
+   "Sidebar control standard" in assets/css/README.md. Builders live in
+   assets/js/app/ui/components/controls.js; static markup in index.html uses
+   the same elements and classes.
+   ===================================================================== */
+
+/* ------------------------------------------------------------------------
+   Blocks and groups
+   --------------------------------------------------------------------- */
+
+/* One labelled control, or one row of controls. Inside a group or a box,
+   blocks are spaced by their own top margin. A panel's direct children are
+   spaced by the panel's gap (--control-group-gap) alone: block, group and box
+   margins are zero-specificity (:where) so `.accordion-content > *` clears
+   them there. */
+:where(.control-block) {
+  margin-top: var(--control-block-gap);
+}
+
+/* The first block of a panel, a box or a group starts flush: the container's
+   own padding is the space above it. */
+:where(.accordion-content, .control-box, .control-group-body, .disclosure-content) > :first-child {
+  margin-top: 0;
+}
+
+/* A sub-section inside a panel: a heading (with an optional info button)
+   and the controls it names. */
+:where(.control-group) {
+  margin-top: var(--control-block-gap);
+}
+
+.control-group-header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  margin: var(--control-block-gap) 0 var(--control-row-gap);
+}
+
+.control-group-header:first-child {
+  margin-top: 0;
+}
+
+/* One action at the end of a heading row (Share beside Dataset). */
+.control-group-header > .control-group-action {
+  margin-left: auto;
+}
+
+/* Sub-section heading. Section headings are the panel summaries
+   (`.accordion-section > summary`); field labels are `label`. */
+.section-title {
+  margin: 0;
+  font-size: var(--type-heading);
+  font-weight: var(--font-weight-semibold);
+  line-height: var(--leading-tight);
+  color: var(--color-text-primary);
+  /* A heading that wraps splits into even lines, so a narrow panel never
+     leaves one word (or half of "free-fly") alone on the last line. */
+  text-wrap: balance;
+}
+
+/* A set of controls that belongs to the choice above it (navigation mode
+   settings, display options, playback settings): one quiet tinted box. */
+:where(.control-box) {
+  margin-top: var(--control-block-gap);
+}
+
+.control-box {
+  padding: var(--control-box-padding-y) var(--control-box-padding-x);
+  border: var(--border-light);
+  border-radius: var(--radius-none);
+  background: var(--color-surface-secondary);
+}
+
+/* A list the user adds to and removes from (active filters, highlighted
+   groups, kept views, keyframes): one solid box. */
+:where(.list-box) {
+  margin-top: var(--control-row-gap);
+}
+
+.list-box {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: var(--control-box-padding-y) var(--control-box-padding-x);
+  border: var(--border-light);
+  border-radius: var(--radius-none);
+  background: var(--color-surface-secondary);
+}
+
+/* One row of a list box: enable checkbox, text, remove button. */
+.list-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: max(var(--control-list-row-height), var(--control-target-min));
+  padding: var(--space-1) var(--space-2);
+  border: var(--border-light);
+  border-radius: var(--radius-none);
+  background: var(--color-surface-elevated);
+  transition: var(--transition-colors);
+}
+
+.list-item:hover {
+  background: var(--color-interactive-secondary-hover);
+}
+
+.list-item[data-disabled="true"] {
+  background: var(--color-surface-tertiary);
+}
+
+.list-item-text {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--type-control);
+  color: var(--color-text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.list-item[data-disabled="true"] .list-item-text {
+  color: var(--color-text-tertiary);
+  text-decoration: line-through;
+}
+
+/* ------------------------------------------------------------------------
+   Labels and text
+   --------------------------------------------------------------------- */
+
+/* A field label: the caption above the control it names. It is always a
+   `<label for>`; the text is sentence case without a colon, medium weight in
+   the secondary text colour. Zero specificity, so a component that needs a different
+   label (an option label, below) overrides it without a fight. A composite
+   control that no single <label> can name (a group of page chips, a pair of
+   selects) takes the same caption as `span.field-label`, referenced by the
+   group's aria-labelledby. */
+:where(label:not(.checkbox-inline), .field-label) {
+  display: block;
+  margin: 0 0 var(--control-row-gap);
+  font-size: var(--type-label);
+  font-weight: var(--font-weight-medium);
+  line-height: var(--leading-tight);
+  color: var(--color-text-secondary);
+}
+
+/* A label that shares its row with an info button. */
+.field-label-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  margin-bottom: var(--control-row-gap);
+}
+
+.field-label-row > label,
+.field-label-row > .field-label {
+  margin: 0;
+}
+
+/* A checkbox option that shares its row with an info button. */
+.checkbox-info-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1-5);
+}
+
+.checkbox-info-row > .checkbox-inline {
+  margin-top: 0;
+}
+
+/* Stacked rows keep the room stacked checkbox rows keep for both hit
+   extensions (an info tip between them takes no room while closed). */
+.checkbox-info-row + .checkbox-info-row,
+.checkbox-info-row + .info-tooltip + .checkbox-info-row {
+  margin-top: max(var(--control-row-gap), 2 * var(--control-hit-extend));
+}
+
+/* One line of help under a control. */
+.field-help {
+  margin: var(--space-0-5) 0 0;
+  font-size: var(--type-hint);
+  line-height: var(--leading-normal);
+  color: var(--color-text-tertiary);
+}
+
+/* A live status line: what just happened to the control above it. */
+.status-line {
+  margin: var(--space-0-5) 0 0;
+  font-family: var(--font-sans);
+  font-size: var(--type-hint);
+  line-height: var(--leading-normal);
+  color: var(--color-text-secondary);
+}
+
+/* A live region has to stay in the accessibility tree while it is empty, or
+   the first message written into it is not announced: an empty status line
+   stays rendered and simply takes no room. */
+.status-line:empty {
+  margin: 0;
+}
+
+.status-line[data-tone="muted"] { color: var(--color-text-tertiary); }
+.status-line[data-tone="success"] { color: var(--color-success-text); }
+.status-line[data-tone="warning"] { color: var(--color-warning-text); }
+.status-line[data-tone="danger"] { color: var(--color-danger-text); }
+
+/* What an empty list or panel shows, and what to do about it. */
+.empty-state {
+  margin: 0;
+  padding: var(--space-1-5) var(--space-2);
+  font-family: var(--font-sans);
+  font-size: var(--type-hint);
+  line-height: var(--leading-normal);
+  color: var(--color-text-tertiary);
+  text-align: center;
+}
+
+/* ------------------------------------------------------------------------
+   Field boxes: selects, text and number inputs, textareas
+   --------------------------------------------------------------------- */
+
+.obs-select {
+  /* The frame colour, one property so a state (invalid) recolours the frame
+     however it is drawn (a border here, an inset ring on touch below). */
+  --field-frame: var(--color-border-control);
+  display: block;
+  width: 100%;
+  min-height: max(var(--control-height), var(--control-target-min));
+  box-sizing: border-box;
+  margin: 0;
+  padding: var(--control-padding-y) var(--control-padding-x);
+  font-family: var(--font-sans);
+  font-size: var(--type-control);
+  line-height: var(--leading-tight);
+  border-radius: var(--radius-none);
+  border: var(--border-width-1) solid var(--field-frame);
+  background-color: var(--color-surface-elevated);
+  color: var(--color-text-primary);
+  transition: var(--transition-colors);
+}
+
+.obs-select:hover:not(:disabled) {
+  --field-frame: var(--color-text-tertiary);
+}
+
+.obs-select::placeholder {
+  color: var(--color-text-tertiary);
+}
+
+.obs-select:focus-visible {
+  outline: var(--border-width-2) solid var(--color-border-focus);
+  outline-offset: var(--space-px);
+}
+
+.obs-select:disabled {
+  opacity: var(--control-disabled-opacity);
+  cursor: not-allowed;
+}
+
+textarea.obs-select {
+  min-height: calc(3 * var(--space-6));
+  resize: vertical;
+}
+
+/* Touch hit area of a one-line field. A select or an input is a replaced
+   element and cannot carry the ::after extension the buttons use, so on a
+   coarse pointer its border box is the hit area: transparent borders of
+   --control-hit-extend above and below make it 42px, the frame is drawn as
+   an inset ring at the drawn 36px box, and the focus ring hugs that box. The
+   drawn field is the same 36px as a button beside it. */
+@media (pointer: coarse) {
+  .obs-select:not(textarea) {
+    min-height: calc(var(--control-target-min) + 2 * var(--control-hit-extend));
+    border-width: var(--control-hit-extend) 0;
+    border-color: transparent;
+    background-clip: padding-box;
+    box-shadow: inset 0 0 0 var(--border-width-1) var(--field-frame);
+  }
+
+  .obs-select:not(textarea):hover:not(:disabled),
+  .obs-select:not(textarea):disabled {
+    box-shadow: inset 0 0 0 var(--border-width-1) var(--field-frame);
+  }
+
+  .obs-select:not(textarea):focus-visible {
+    outline-offset: calc(var(--space-px) - var(--control-hit-extend));
+    box-shadow: inset 0 0 0 var(--border-width-1) var(--field-frame);
+  }
+}
+
+/* The one drawn dropdown chevron. Only a native <select> gets it — on a text
+   field it promised a list that is not there — and its text stops short of
+   the chevron instead of running underneath it. The chevron is centred on the
+   control's own height, so a taller or shorter select needs no override. */
+select.obs-select {
+  padding-right: var(--space-6);
+  text-overflow: ellipsis;
+  appearance: none;
+  -webkit-appearance: none;
+  -moz-appearance: none;
+  cursor: pointer;
+  background-image: linear-gradient(45deg, transparent 50%, currentColor 50%),
+                    linear-gradient(135deg, currentColor 50%, transparent 50%);
+  background-position: calc(100% - var(--space-3-5)) 50%, calc(100% - var(--space-2-5)) 50%;
+  background-size: var(--space-1) var(--space-1), var(--space-1) var(--space-1);
+  background-repeat: no-repeat;
+}
+
+/* ------------------------------------------------------------------------
+   Checkboxes
+   --------------------------------------------------------------------- */
+
+/* A checkbox and its option text. The label wraps the input, so the whole
+   row is the target; the text is plain sentence case, like an <option>. */
+.checkbox-inline {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1-5);
+  width: fit-content;
+  min-height: var(--control-row-min);
+  /* Stacked option rows keep room for both hit extensions between them. */
+  margin: max(var(--control-row-gap), 2 * var(--control-hit-extend)) 0 0;
+  font-family: var(--font-sans);
+  font-size: var(--type-control);
+  line-height: var(--leading-tight);
+  color: var(--color-text-primary);
+  cursor: pointer;
+}
+
+input[type="checkbox"] {
+  width: var(--control-check-size);
+  height: var(--control-check-size);
+  margin: 0;
+  flex: none;
+  cursor: pointer;
+}
+
+input[type="checkbox"]:disabled,
+.checkbox-inline:has(> input:disabled) {
+  opacity: var(--control-disabled-opacity);
+  cursor: not-allowed;
+}
+
+/* ------------------------------------------------------------------------
+   Switch: a setting that takes effect immediately
+   --------------------------------------------------------------------- */
+
+.switch {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: max(var(--space-6), var(--control-row-min));
+  margin: 0;
+  padding: var(--space-0-5) var(--space-1) var(--space-0-5) 0;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: none;
+  color: var(--color-text-primary);
+  font-family: var(--font-sans);
+  font-size: var(--type-control);
+  font-weight: var(--font-weight-medium);
+  line-height: var(--leading-tight);
+  text-align: left;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+/* An option row reaches a fingertip like a boxed control: drawn
+   --control-row-min tall, with the same --control-hit-extend above and below
+   (the boxed controls' rule is in _buttons.css). */
+.checkbox-inline,
+.switch {
+  position: relative;
+}
+
+.checkbox-inline::after,
+.switch::after {
+  content: '';
+  position: absolute;
+  inset: calc(-1 * var(--control-hit-extend)) 0;
+}
+
+/* The checkbox is its own element inside the label: the extension lies
+   behind it (an isolated layer under the label's content), so a press on
+   the box itself reaches the box. */
+.checkbox-inline {
+  isolation: isolate;
+}
+
+.checkbox-inline::after {
+  z-index: -1;
+}
+
+.switch-track {
+  position: relative;
+  flex: none;
+  box-sizing: border-box;
+  width: var(--control-switch-track-width);
+  height: var(--control-switch-track-height);
+  border: var(--border-control);
+  border-radius: var(--radius-full);
+  background: var(--color-surface-tertiary);
+  transition: var(--transition-colors);
+}
+
+.switch-track::after {
+  content: '';
+  position: absolute;
+  top: calc(var(--control-switch-inset) - var(--border-width-1));
+  left: calc(var(--control-switch-inset) - var(--border-width-1));
+  width: var(--control-switch-knob-size);
+  height: var(--control-switch-knob-size);
+  box-sizing: border-box;
+  border: var(--border-control);
+  border-radius: var(--radius-full);
+  background: var(--color-surface-elevated);
+  box-shadow: var(--shadow-xs);
+  transition:
+    transform var(--duration-normal) var(--easing-out),
+    background-color var(--duration-fast) var(--easing-standard),
+    border-color var(--duration-fast) var(--easing-standard);
+}
+
+.switch:hover:not(:disabled) .switch-track {
+  border-color: var(--color-text-primary);
+}
+
+.switch[aria-checked="true"] .switch-track {
+  background: var(--color-interactive-primary);
+  border-color: var(--color-interactive-primary);
+}
+
+.switch[aria-checked="true"] .switch-track::after {
+  border-color: transparent;
+  background: var(--color-text-inverse);
+  transform: translateX(calc(
+    var(--control-switch-track-width) - var(--control-switch-knob-size)
+    - 2 * var(--control-switch-inset)
+  ));
+}
+
+.switch:disabled {
+  opacity: var(--control-disabled-opacity);
+  cursor: not-allowed;
+}
+
+/* A compact switch inside a list or a dense box. */
+.switch-compact {
+  gap: var(--space-1-5);
+  font-weight: var(--font-weight-regular);
+  --control-switch-track-width: 26px;
+  --control-switch-track-height: var(--space-4);
+  --control-switch-knob-size: var(--space-2-5);
+}
+
+/* ------------------------------------------------------------------------
+   Segmented control: two to four mutually exclusive settings
+   --------------------------------------------------------------------- */
+
+.segmented {
+  display: inline-flex;
+  border: var(--border-control);
+  background: var(--color-surface-primary);
+}
+
+.segmented-btn {
+  position: relative;
+  min-height: max(var(--space-6), var(--control-target-min));
+  padding: var(--space-1) var(--space-2-5);
+  border: 0;
+  border-left: var(--border-control);
+  background: transparent;
+  color: var(--color-text-primary);
+  font-family: var(--font-sans);
+  font-size: var(--type-control);
+  font-weight: var(--font-weight-medium);
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+  transition: var(--transition-colors);
+}
+
+.segmented-btn:first-child {
+  border-left: 0;
+}
+
+.segmented-btn:hover:not(:disabled) {
+  background: var(--color-interactive-secondary-hover);
+}
+
+.segmented-btn[aria-pressed="true"] {
+  background: var(--color-interactive-primary);
+  color: var(--color-text-inverse);
+}
+
+.segmented-btn:disabled {
+  opacity: var(--control-disabled-opacity);
+  cursor: not-allowed;
+}
+
+.segmented-btn:focus-visible {
+  outline-offset: calc(-1 * var(--border-width-2));
+}
+
+/* ------------------------------------------------------------------------
+   Range slider and its readout
+   --------------------------------------------------------------------- */
+
+.slider-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1-5);
+}
+
+/* The control box is a full --control-slider-hit-height (24px) tall so the
+   pointer target matches WCAG 2.2 SC 2.5.8 and actually covers the thumb the
+   user can see. Symmetric negative block margins collapse the margin box to
+   the thumb's height: the row is exactly as tall as what is drawn, so the
+   label above and the field below keep their full gap. (Collapsing to the
+   3px track let the thumb overhang both neighbours.) The track is painted by
+   the track pseudo-elements, not by the input background. */
+.slider-row input[type="range"] {
+  flex: 1;
+  min-width: 0;
+  -webkit-appearance: none;
+  appearance: none;
+  height: var(--control-slider-hit-height);
+  margin-block: calc((var(--control-slider-thumb-size) - var(--control-slider-hit-height)) / 2);
+  margin-inline: 0;
+  background: transparent;
+  cursor: pointer;
+}
+
+/* Ring is inset so it brackets the track and thumb instead of spilling into the
+   neighbouring rows that the 24px hit area overlaps. */
+.slider-row input[type="range"]:focus-visible {
+  outline-offset: calc(-1 * var(--space-1));
+}
+
+.slider-row input[type="range"]:disabled {
+  opacity: var(--control-disabled-opacity);
+  cursor: not-allowed;
+}
+
+.slider-row input[type="range"]::-webkit-slider-runnable-track {
+  height: var(--control-slider-track-height);
+  border-radius: var(--radius-full);
+  background: var(--color-border-light);
+}
+
+.slider-row input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: var(--control-slider-thumb-size);
+  height: var(--control-slider-thumb-size);
+  border-radius: var(--radius-full);
+  background: var(--color-text-primary);
+  border: var(--border-width-1) solid var(--color-surface-elevated);
+  box-shadow: var(--shadow-sm);
+  margin-top: calc((var(--control-slider-track-height) - var(--control-slider-thumb-size)) / 2);
+  cursor: pointer;
+}
+
+.slider-row input[type="range"]::-moz-range-track {
+  height: var(--control-slider-track-height);
+  border-radius: var(--radius-full);
+  background: var(--color-border-light);
+}
+
+.slider-row input[type="range"]::-moz-range-thumb {
+  width: var(--control-slider-thumb-size);
+  height: var(--control-slider-thumb-size);
+  border-radius: var(--radius-full);
+  background: var(--color-text-primary);
+  border: var(--border-width-1) solid var(--color-surface-elevated);
+  box-shadow: var(--shadow-sm);
+  cursor: pointer;
+}
+
+/* The readout: tabular figures, right-aligned and wide enough for its
+   longest value, so the track does not jump while the number changes. */
+.slider-value {
+  flex: none;
+  min-width: 5ch;
+  font-size: var(--type-readout);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  color: var(--color-text-secondary);
+}
+
+/* ------------------------------------------------------------------------
+   Chips: a page, group or category the user can select
+   --------------------------------------------------------------------- */
+
+.chip {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  max-width: 100%;
+  min-width: 0;
+  min-height: var(--control-target-min);
+  box-sizing: border-box;
+  padding: var(--control-chip-padding-y) var(--control-chip-padding-x);
+  font-size: var(--type-control);
+  font-weight: var(--font-weight-regular);
+  text-align: left;
+  color: var(--color-text-secondary);
+  background: var(--color-surface-tertiary);
+  border: var(--border-default);
+  border-radius: var(--radius-none);
+  cursor: pointer;
+  transition: var(--transition-colors);
+}
+
+.chip:hover {
+  background: var(--color-interactive-secondary-hover);
+  border-color: var(--color-text-tertiary);
+}
+
+.chip[aria-pressed="true"],
+.chip[aria-selected="true"],
+.chip[data-state="selected"] {
+  background: var(--color-interactive-primary);
+  color: var(--color-text-inverse);
+  border-color: var(--color-interactive-primary);
+  font-weight: var(--font-weight-medium);
+}
+
+.chip[aria-disabled="true"],
+.chip:disabled {
+  opacity: var(--control-disabled-opacity);
+  cursor: not-allowed;
+}
+
+.chip-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chip-count {
+  flex: none;
+  font-variant-numeric: tabular-nums;
+  font-size: var(--type-hint);
+  opacity: var(--opacity-70);
+}
+
+/* A colour swatch, and the invisible native colour input laid over it. */
+.color-swatch {
+  position: relative;
+  flex: none;
+  width: var(--space-2-5);
+  height: var(--space-2-5);
+  border: var(--border-width-1) solid var(--color-border-default);
+  border-radius: var(--radius-none);
+  background-color: var(--swatch-color, var(--color-border-default));
+  cursor: pointer;
+}
+
+.color-swatch:hover {
+  border-color: var(--color-border-strong);
+}
+
+.color-swatch-input {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  min-width: 0;
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+  border: none;
+  appearance: none;
+  -webkit-appearance: none;
+  background: transparent;
+  opacity: 0;
+  cursor: pointer;
+}
+
+/* ------------------------------------------------------------------------
+   Disclosure: a collapsible sub-section inside a panel
+   --------------------------------------------------------------------- */
+
+.disclosure-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-px);
+  background: var(--color-border-light);
+}
+
+.disclosure {
+  container: disclosure / inline-size;
+  background: var(--color-surface-elevated);
+}
+
+/* A header row pairs the disclosure button with sibling actions (copy), so
+   no interactive control is nested inside another. */
+.disclosure-header-row {
+  display: flex;
+  align-items: center;
+  transition: background-color var(--duration-fast) var(--easing-standard);
+}
+
+.disclosure-header-row > .disclosure-header {
+  flex: 1;
+  min-width: 0;
+}
+
+.disclosure-header {
+  width: 100%;
+  min-height: max(var(--control-list-row-height), var(--control-row-min));
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-1-5) var(--space-2-5);
+  margin: 0;
+  background: transparent;
+  border: none;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  text-align: left;
+  transition: background-color var(--duration-fast) var(--easing-standard);
+}
+
+.disclosure-header:hover,
+.disclosure-header-row:hover {
+  background: var(--color-surface-secondary);
+}
+
+.disclosure-header:focus-visible {
+  outline-offset: calc(-1 * var(--border-width-2));
+}
+
+/* A long title wraps inside the header instead of running out of it. */
+.disclosure-title {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-size: var(--type-heading);
+  font-weight: var(--font-weight-medium);
+  color: var(--color-text-primary);
+}
+
+.disclosure-desc {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--type-hint);
+  color: var(--color-text-tertiary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.disclosure-chevron {
+  position: relative;
+  flex-shrink: 0;
+  width: var(--space-3);
+  height: var(--space-3);
+  margin-left: auto;
+  opacity: var(--opacity-40);
+  transition: transform var(--duration-fast) var(--easing-standard),
+    opacity var(--duration-fast) var(--easing-standard);
+}
+
+.disclosure-chevron::before {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 5px;
+  height: 5px;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  transform: translate(-50%, -70%) rotate(45deg);
+  color: var(--color-text-secondary);
+}
+
+.disclosure-header:hover .disclosure-chevron {
+  opacity: var(--opacity-70);
+}
+
+.disclosure-content {
+  padding: var(--space-2) var(--space-2-5) var(--space-2-5);
+  background: var(--color-surface-secondary);
+  border-top: var(--border-width-1) solid var(--color-border-light);
+}
+
+/* Open. Every rule reaches only the disclosure's own header (child
+   combinators): its content can hold another disclosure that draws the same
+   chevron, and a descendant selector turned that nested chevron while its
+   own section was still closed. */
+.disclosure > .disclosure-header[aria-expanded="true"],
+.disclosure > .disclosure-header-row:has(> .disclosure-header[aria-expanded="true"]) {
+  background: var(--color-surface-tertiary);
+}
+
+.disclosure-header[aria-expanded="true"] > .disclosure-title {
+  /* A zero basis keeps the chevron on the title's line when the header
+     wraps; the description takes the next line. */
+  flex: 1 1 0;
+  color: var(--color-text-primary);
+  font-weight: var(--font-weight-semibold);
+}
+
+/* A closed header in a wide panel (a floating window) shows its description
+   on the title's line, cut to fit. In the narrow sidebar the cut left a few
+   letters and an ellipsis beside every title, so there a closed header shows
+   its title alone. Opening a header always shows the whole sentence on its
+   own line under the title: hover titles do not exist on touch, so this is
+   where a phone or tablet user reads it. */
+@container disclosure (max-width: 320px) {
+  .disclosure-header[aria-expanded="false"] > .disclosure-desc {
+    display: none;
+  }
+}
+
+.disclosure-header[aria-expanded="true"] {
+  flex-wrap: wrap;
+}
+
+.disclosure-header[aria-expanded="true"] > .disclosure-desc {
+  order: 1;
+  flex-basis: 100%;
+  color: var(--color-text-secondary);
+  white-space: normal;
+}
+
+.disclosure-header[aria-expanded="true"] > .disclosure-chevron {
+  transform: rotate(180deg);
+  opacity: var(--opacity-80);
+}
+
+/* A disclosure set flush inside a box or a panel body (no row background). */
+.disclosure-inline > .disclosure-header {
+  padding-inline: 0;
+}
+
+.disclosure-inline,
+.disclosure-inline > .disclosure-header:hover,
+.disclosure-inline > .disclosure-header[aria-expanded="true"] {
+  background: transparent;
+}
+
+.disclosure-inline > .disclosure-content {
+  padding: var(--space-1) 0 0;
+  background: transparent;
+  border-top: 0;
+}
+
+/* ------------------------------------------------------------------------
+   Loading
+   --------------------------------------------------------------------- */
+
+.spinner {
+  display: inline-block;
+  flex: none;
+  width: var(--space-3);
+  height: var(--space-3);
+  box-sizing: border-box;
+  border: var(--border-width-2) solid var(--color-border-light);
+  border-top-color: var(--color-text-secondary);
+  border-radius: var(--radius-full);
+  animation: spin var(--duration-spin) linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+/* ------------------------------------------------------------------------
+   Press feedback
+   A touch screen has no hover, so every pressable surface that is not a
+   .btn or .icon-btn (those press in _buttons.css) darkens while it is held,
+   from the moment the finger lands. A pressed (selected) chip or segment
+   keeps its selected fill.
+   --------------------------------------------------------------------- */
+
+.segmented-btn:active:not(:disabled):not([aria-pressed="true"]),
+.chip:active:not([aria-pressed="true"]):not([aria-selected="true"]),
+.disclosure-header:active,
+.accordion-section > summary:active,
+.view-title-chip:active:not(.active),
+.cap-search-item:active,
+.community-annotation-repo-card:active,
+.license-close:active,
+.analysis-modal-close:active {
+  background-color: var(--color-interactive-secondary-active);
+}
+
+.switch:active:not(:disabled) .switch-track {
+  border-color: var(--color-text-primary);
+  box-shadow: inset 0 0 0 var(--border-width-1) var(--color-text-primary);
+}
+
+/* ------------------------------------------------------------------------
+   Inner scroll areas
+   One scrollbar for every scroll area inside a panel or dialog: thin, a
+   quiet track and a pill thumb that darkens under the pointer.
+   --------------------------------------------------------------------- */
+
+:is(
+  .accordion-floating > .accordion-section .accordion-content,
+  .legend-items-scrollable,
+  .cinematic-keyframe-list,
+  .community-annotation-modal-body
+) {
+  scrollbar-width: thin;
+  scrollbar-color:
+    color-mix(in srgb, var(--color-text-primary) 35%, transparent)
+    color-mix(in srgb, var(--color-text-primary) 8%, transparent);
+}
+
+:is(
+  .accordion-floating > .accordion-section .accordion-content,
+  .legend-items-scrollable,
+  .cinematic-keyframe-list,
+  .community-annotation-modal-body
+)::-webkit-scrollbar {
+  width: var(--space-2);
+  height: var(--space-2);
+}
+
+:is(
+  .accordion-floating > .accordion-section .accordion-content,
+  .legend-items-scrollable,
+  .cinematic-keyframe-list,
+  .community-annotation-modal-body
+)::-webkit-scrollbar-track {
+  background: color-mix(in srgb, var(--color-text-primary) 8%, transparent);
+  border-radius: var(--radius-full);
+}
+
+:is(
+  .accordion-floating > .accordion-section .accordion-content,
+  .legend-items-scrollable,
+  .cinematic-keyframe-list,
+  .community-annotation-modal-body
+)::-webkit-scrollbar-thumb {
+  min-height: var(--space-8);
+  background: color-mix(in srgb, var(--color-text-primary) 35%, transparent);
+  border-radius: var(--radius-full);
+}
+
+:is(
+  .accordion-floating > .accordion-section .accordion-content,
+  .legend-items-scrollable,
+  .cinematic-keyframe-list,
+  .community-annotation-modal-body
+)::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--color-text-primary) 50%, transparent);
+}

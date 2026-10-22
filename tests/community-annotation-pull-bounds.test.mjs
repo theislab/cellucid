@@ -3,8 +3,7 @@ import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
 import {
-  COMMUNITY_ANNOTATION_MAX_PULL_USER_FILES,
-  COMMUNITY_ANNOTATION_MAX_PULL_UTF8_BYTES,
+  COMMUNITY_ANNOTATION_PULL_BATCH_BYTES,
   CommunityAnnotationGitHubSync,
 } from '../assets/js/app/community-annotations/github-sync.js';
 
@@ -72,7 +71,7 @@ async function pullFromTree(tree, options = {}) {
   try {
     return {
       requests,
-      result: await createSync().pullAllUsers(options),
+      result: await createSync().pullAllUsers({ onRecords: async () => {}, ...options }),
     };
   } finally {
     globalThis.fetch = previousFetch;
@@ -92,7 +91,6 @@ test('the pristine template sentinel is exact inventory metadata, never a user b
 
   assert.equal(requests.length, 1, 'the sentinel must not trigger a blob fetch');
   assert.deepEqual(result, {
-    docs: [],
     shas: {},
     fetchedCount: 0,
     totalCount: 0,
@@ -104,10 +102,12 @@ test('the pristine template sentinel is exact inventory metadata, never a user b
   );
 });
 
-test('the template sentinel is excluded from user-count and decoded-byte bounds', async (t) => {
+test('a Pull has no user-file count or aggregate byte limit', async (t) => {
+  // Far past the former 10,000-file and 64 MB caps; every file is already
+  // cached, so only the tree is read.
   await t.test('user count', async () => {
     const users = Array.from(
-      { length: COMMUNITY_ANNOTATION_MAX_PULL_USER_FILES },
+      { length: 25_000 },
       (_, index) => userTreeEntry(index + 1, { size: 0 })
     );
     const knownShas = Object.fromEntries(
@@ -119,11 +119,7 @@ test('the template sentinel is excluded from user-count and decoded-byte bounds'
     );
     assert.equal(requests.length, 1);
     assert.equal(result.fetchedCount, 0);
-    assert.equal(
-      result.totalCount,
-      COMMUNITY_ANNOTATION_MAX_PULL_USER_FILES
-    );
-    assert.equal(Object.keys(result.shas).length, result.totalCount);
+    assert.equal(result.totalCount, users.length);
     assert.equal(
       Object.hasOwn(result.shas, EMPTY_USERS_SENTINEL_PATH),
       false
@@ -131,13 +127,10 @@ test('the template sentinel is excluded from user-count and decoded-byte bounds'
   });
 
   await t.test('decoded bytes', async () => {
-    const users = [];
-    let remaining = COMMUNITY_ANNOTATION_MAX_PULL_UTF8_BYTES;
-    for (let id = 1; remaining > 0; id += 1) {
-      const size = Math.min(1_000_000, remaining);
-      users.push(userTreeEntry(id, { size }));
-      remaining -= size;
-    }
+    const users = Array.from(
+      { length: 200 },
+      (_, index) => userTreeEntry(index + 1, { size: 1_000_000 })
+    );
     const knownShas = Object.fromEntries(
       users.map(({ path, sha }) => [path, sha])
     );
@@ -146,14 +139,58 @@ test('the template sentinel is excluded from user-count and decoded-byte bounds'
       { knownShas }
     );
     assert.equal(requests.length, 1);
-    assert.equal(result.fetchedCount, 0);
     assert.equal(result.totalCount, users.length);
-    assert.equal(Object.keys(result.shas).length, users.length);
-    assert.equal(
-      Object.hasOwn(result.shas, EMPTY_USERS_SENTINEL_PATH),
-      false
-    );
   });
+});
+
+test('changed user files reach the sink in bounded batches, each before the next is fetched', async () => {
+  const previousFetch = globalThis.fetch;
+  // Files just under GitHub's 1 MB Contents limit; a batch holds as many as
+  // fit its byte budget.
+  const fileBytes = 900_000;
+  const perBatch = Math.floor(COMMUNITY_ANNOTATION_PULL_BATCH_BYTES / fileBytes);
+  const fileCount = 2 * perBatch + 1;
+  const users = Array.from({ length: fileCount }, (_, index) => ({
+    ...userTreeEntry(index + 1, { size: fileBytes }),
+    sha: String(index + 1).padStart(40, '0'),
+  }));
+  const body = id => {
+    const text = JSON.stringify({ version: 1, username: `ghid_${id}`, githubUserId: id, updatedAt: '2026-07-30T01:02:03.456Z', suggestions: {}, votes: {} });
+    return text + ' '.repeat(fileBytes - Buffer.byteLength(text));
+  };
+  let blobsFetched = 0;
+  const fetchedAtSink = [];
+  globalThis.fetch = async (rawUrl) => {
+    const url = new URL(rawUrl);
+    if (url.pathname.includes('/git/trees/')) {
+      return new Response(JSON.stringify({ tree: [usersDirectoryEntry(), ...users], truncated: false }), { status: 200 });
+    }
+    const id = Number(url.pathname.split('/').pop());
+    blobsFetched += 1;
+    return new Response(JSON.stringify({
+      encoding: 'base64',
+      content: Buffer.from(body(id), 'utf8').toString('base64'),
+    }), { status: 200 });
+  };
+  const batches = [];
+  try {
+    const result = await createSync().pullAllUsers({
+      onRecords: async records => {
+        fetchedAtSink.push(blobsFetched);
+        batches.push(records.map(record => record.doc.githubUserId));
+      },
+    });
+    assert.equal(result.fetchedCount, fileCount);
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+  // Each batch reaches the sink before the next is fetched.
+  assert.deepEqual(batches.map(batch => batch.length), [perBatch, perBatch, 1]);
+  assert.deepEqual(fetchedAtSink, [perBatch, 2 * perBatch, fileCount]);
+  assert.deepEqual(
+    batches.flat().sort((a, b) => a - b),
+    Array.from({ length: fileCount }, (_, index) => index + 1),
+  );
 });
 
 test('users inventory evidence accepts an exact parent tree or canonical user child', async (t) => {
@@ -245,7 +282,7 @@ test('setup guide states the bounded empty-users inventory contract', () => {
   assert.match(setupGuide, new RegExp(EMPTY_USERS_SENTINEL_SHA));
   assert.match(
     setupGuide,
-    /never downloaded or included in user SHAs, counts, or decoded-byte\s+limits\./
+    /never downloaded or included in user SHAs or counts\./
   );
   assert.match(
     setupGuide,
@@ -271,8 +308,7 @@ test('an unrelated canonical Git submodule does not break annotation Pull', asyn
     }), { status: 200 });
   };
   try {
-    assert.deepEqual(await createSync().pullAllUsers(), {
-      docs: [],
+    assert.deepEqual(await createSync().pullAllUsers({ onRecords: async () => {} }), {
       shas: {},
       fetchedCount: 0,
       totalCount: 0,
@@ -281,67 +317,6 @@ test('an unrelated canonical Git submodule does not break annotation Pull', asyn
     assert.equal(requests, 1);
   } finally {
     globalThis.fetch = previousFetch;
-  }
-});
-
-test('user-file count and aggregate decoded bytes are bounded from the tree before blob reads', async t => {
-  for (const scenario of [
-    {
-      name: 'user-file count',
-      tree: Array.from(
-        { length: COMMUNITY_ANNOTATION_MAX_PULL_USER_FILES + 1 },
-        (_, index) => userTreeEntry(index + 1, { size: 0 })
-      ),
-      kind: 'user-files',
-      actual: COMMUNITY_ANNOTATION_MAX_PULL_USER_FILES + 1,
-      maximum: COMMUNITY_ANNOTATION_MAX_PULL_USER_FILES,
-    },
-    {
-      name: 'aggregate decoded bytes',
-      tree: Array.from(
-        {
-          length:
-            Math.floor(
-              COMMUNITY_ANNOTATION_MAX_PULL_UTF8_BYTES / 1_000_000
-            ) + 1,
-        },
-        (_, index) => userTreeEntry(index + 1, { size: 1_000_000 })
-      ),
-      kind: 'decoded-bytes',
-      actual: COMMUNITY_ANNOTATION_MAX_PULL_UTF8_BYTES + 1_000_000,
-      maximum: COMMUNITY_ANNOTATION_MAX_PULL_UTF8_BYTES,
-    },
-  ]) {
-    await t.test(scenario.name, async () => {
-      const previousFetch = globalThis.fetch;
-      let requests = 0;
-      globalThis.fetch = async () => {
-        requests += 1;
-        return new Response(JSON.stringify({
-          tree: scenario.tree,
-          truncated: false,
-        }), { status: 200 });
-      };
-      try {
-        await assert.rejects(
-          () => createSync().pullAllUsers(),
-          error => {
-            assert.equal(
-              error?.code,
-              'COMMUNITY_ANNOTATION_PULL_LIMIT'
-            );
-            assert.equal(error?.phase, 'remote-tree-preflight');
-            assert.equal(error?.kind, scenario.kind);
-            assert.equal(error?.actual, scenario.actual);
-            assert.equal(error?.maximum, scenario.maximum);
-            return true;
-          }
-        );
-        assert.equal(requests, 1);
-      } finally {
-        globalThis.fetch = previousFetch;
-      }
-    });
   }
 });
 
@@ -384,7 +359,7 @@ test('one invalid blob stops claims, aborts its active batch, and retains the fi
 
   try {
     await assert.rejects(
-      () => createSync().pullAllUsers(),
+      () => createSync().pullAllUsers({ onRecords: async () => {} }),
       error => {
         assert.equal(
           error?.code,

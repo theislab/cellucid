@@ -7,6 +7,8 @@
  * @module state-serializer/ui-controls
  */
 
+import { isGeneratedDomId } from '../ui/components/dom-id.js';
+
 const SERIALIZABLE_INPUT_TYPES = new Set([
   'checkbox',
   'range',
@@ -35,6 +37,18 @@ const SERIALIZABLE_INPUT_TYPES = new Set([
  */
 const PRESSED_GROUP_SELECTOR = '[data-state-serializer-pressed-group]';
 
+/**
+ * A control whose choices follow the embedding the active view shows (the
+ * vector-field controls: a field is bound to one embedding, so the select
+ * lists different fields, or none, per view layout). Its record is checked
+ * for shape with every other control up front, but its value is checked and
+ * applied only once the restore has put the embeddings and the active view
+ * back: checked earlier, a session saved on one embedding was refused on a
+ * page showing another ("option is not available"), and applied earlier its
+ * value was overwritten when the embedding changed under it.
+ */
+const AFTER_EMBEDDING_SELECTOR = '[data-state-serializer-after-embedding]';
+
 // These controls are serialized by their feature owners, never by the generic
 // DOM-control contributor.
 const DOMAIN_OWNED_IDS = new Set([
@@ -43,7 +57,7 @@ const DOMAIN_OWNED_IDS = new Set([
   'continuous-field',
   'outlier-filter',
   'gene-expression-search',
-  'dimension-select',
+  'view-representation-select',
   'dataset-select',
   'pointer-lock',
   'remote-server-url',
@@ -100,11 +114,22 @@ function queryAll(sidebar, selector) {
   return out;
 }
 
+/**
+ * Whether a control stays out of the session's control inventory: anything
+ * inside a `data-state-serializer-skip` subtree, and any control whose id was
+ * minted on this page (`createDomId`). A minted id names nothing on another
+ * page, so a session that recorded one could not be loaded there; what such
+ * a control shows (a legend's range sliders, for one) is saved by the state
+ * that renders it.
+ */
 function isStateSerializerSkipped(element) {
   if (typeof element.closest !== 'function') {
     throw new TypeError('Every serialized UI element must support ancestor lookup.');
   }
-  return element.closest('[data-state-serializer-skip]') !== null;
+  return (
+    element.closest('[data-state-serializer-skip]') !== null
+    || isGeneratedDomId(element.id)
+  );
 }
 
 function assertStableId(id, context) {
@@ -118,7 +143,19 @@ function registerInventoryEntry(inventory, key, entry) {
   if (inventory.has(key)) {
     throw new TypeError(`Session UI control id "${key}" is not unique.`);
   }
-  inventory.set(key, entry);
+  inventory.set(key, {
+    ...entry,
+    afterEmbedding: entry.element.closest(AFTER_EMBEDDING_SELECTOR) !== null,
+  });
+}
+
+/** The ids of the controls restored after the embeddings, in inventory order. */
+function afterEmbeddingControlIds(inventory) {
+  const ids = [];
+  for (const [id, entry] of inventory) {
+    if (entry.afterEmbedding) ids.push(id);
+  }
+  return ids;
 }
 
 /**
@@ -270,7 +307,13 @@ function assertFiniteNumericControlValue(element, value, id) {
   }
 }
 
-function validateControlRecord(id, record, inventoryEntry) {
+/**
+ * Check one control's record against the current interface. With
+ * `valueAgainstCurrent` false only the record's shape is checked: a select's
+ * option, a slider's range, are compared to the control later, once the
+ * state its choices follow has been restored.
+ */
+function validateControlRecord(id, record, inventoryEntry, valueAgainstCurrent = true) {
   assertPlainRecord(record, `Session UI control "${id}"`);
   const { element, type } = inventoryEntry;
 
@@ -324,6 +367,7 @@ function validateControlRecord(id, record, inventoryEntry) {
     throw new TypeError(`Session UI control "${id}" value must be a string.`);
   }
 
+  if (!valueAgainstCurrent) return;
   if (type === 'select') {
     const options = Array.from(element.options);
     const optionExists = options.some(
@@ -344,7 +388,7 @@ function validateControlRecord(id, record, inventoryEntry) {
   }
 }
 
-function validateCompleteControls(controls, inventory) {
+function validateCompleteControls(controls, inventory, laterValueIds = new Set()) {
   assertPlainRecord(controls, 'Session UI controls');
   const candidateKeys = Object.keys(controls).sort();
   const currentKeys = [...inventory.keys()].sort();
@@ -366,7 +410,7 @@ function validateCompleteControls(controls, inventory) {
   }
 
   for (const key of currentKeys) {
-    validateControlRecord(key, controls[key], inventory.get(key));
+    validateControlRecord(key, controls[key], inventory.get(key), !laterValueIds.has(key));
   }
 }
 
@@ -499,6 +543,9 @@ function assertRestoreOptions(options) {
   if (Object.hasOwn(options, 'deferControlIds')) {
     expectedKeys.push('deferControlIds');
   }
+  if (Object.hasOwn(options, 'withholdControlIds')) {
+    expectedKeys.push('withholdControlIds');
+  }
   assertExactKeys(
     options,
     expectedKeys,
@@ -511,16 +558,20 @@ function assertRestoreOptions(options) {
   ) {
     throw new TypeError('Session UI abortSignal must expose a boolean aborted state.');
   }
-  if (Object.hasOwn(options, 'deferControlIds')) {
-    if (!Array.isArray(options.deferControlIds)) {
-      throw new TypeError('Session UI deferControlIds must be an array.');
+  for (const [key, label] of [
+    ['deferControlIds', 'deferred'],
+    ['withholdControlIds', 'withheld'],
+  ]) {
+    if (!Object.hasOwn(options, key)) continue;
+    if (!Array.isArray(options[key])) {
+      throw new TypeError(`Session UI ${key} must be an array.`);
     }
     const ids = new Set();
-    for (const id of options.deferControlIds) {
-      assertStableId(id, 'Every deferred session UI control id');
+    for (const id of options[key]) {
+      assertStableId(id, `Every ${label} session UI control id`);
       if (ids.has(id)) {
         throw new TypeError(
-          `Session UI deferControlIds contains duplicate id "${id}".`,
+          `Session UI ${key} contains duplicate id "${id}".`,
         );
       }
       ids.add(id);
@@ -553,22 +604,52 @@ export function createUiControlSerializer({ sidebar }) {
 
   function validateUIControls(controls) {
     const inventory = buildCurrentInventory(sidebar);
-    validateCompleteControls(controls, inventory);
+    validateCompleteControls(
+      controls,
+      inventory,
+      new Set(afterEmbeddingControlIds(inventory)),
+    );
   }
 
+  /** The ids of the controls whose choices follow the embedding, in order. */
+  function embeddingDependentControlIds() {
+    return afterEmbeddingControlIds(buildCurrentInventory(sidebar));
+  }
+
+  /**
+   * Apply every control now except the deferred ones, and return the function
+   * that applies those: the caller's `deferControlIds`, and every control
+   * whose choices follow the embedding, whose values are checked against the
+   * interface only then. `withholdControlIds` are checked now and never
+   * applied (a mode the device cannot run, reported instead).
+   */
   function restoreUIControls(controls, options = {}) {
     assertRestoreOptions(options);
     const abortSignal = Object.hasOwn(options, 'abortSignal')
       ? options.abortSignal
       : null;
-    const deferredIds = new Set(options.deferControlIds ?? []);
+    const withheldIds = new Set(options.withholdControlIds ?? []);
     if (abortSignal?.aborted) {
       throw new DOMException('Aborted', 'AbortError');
     }
 
     const inventory = buildCurrentInventory(sidebar);
-    validateCompleteControls(controls, inventory);
+    const deferredIds = new Set([
+      ...(options.deferControlIds ?? []),
+      ...afterEmbeddingControlIds(inventory),
+    ]);
     for (const id of deferredIds) {
+      if (withheldIds.has(id)) {
+        throw new TypeError(
+          `Session UI control "${id}" cannot be both deferred and withheld.`,
+        );
+      }
+    }
+    const laterValueIds = new Set(
+      [...deferredIds].filter(id => inventory.get(id)?.afterEmbedding === true),
+    );
+    validateCompleteControls(controls, inventory, laterValueIds);
+    for (const id of [...deferredIds, ...withheldIds]) {
       if (!inventory.has(id)) {
         throw new RangeError(
           `Deferred session UI control "${id}" does not exist in the current interface.`,
@@ -602,8 +683,8 @@ export function createUiControlSerializer({ sidebar }) {
           if (staged.entry.type !== type) continue;
           if (deferredIds.has(id) !== restoreDeferred) continue;
           // Captured and validated, but never applied - see
-          // DEVICE_PREFERENCE_CONTROL_IDS.
-          if (DEVICE_PREFERENCE_CONTROL_IDS.has(id)) continue;
+          // DEVICE_PREFERENCE_CONTROL_IDS and `withholdControlIds`.
+          if (DEVICE_PREFERENCE_CONTROL_IDS.has(id) || withheldIds.has(id)) continue;
           if (abortSignal?.aborted) {
             throw new DOMException('Aborted', 'AbortError');
           }
@@ -612,11 +693,20 @@ export function createUiControlSerializer({ sidebar }) {
       }
     }
     restoreMatchingControls(false);
-    return () => restoreMatchingControls(true);
+    return () => {
+      // The embedding-dependent values are checked against the controls as
+      // they are now, after the embeddings and the active view came back,
+      // before any of the deferred controls is touched.
+      for (const id of laterValueIds) {
+        validateControlRecord(id, controls[id], stagedControls.get(id).entry);
+      }
+      restoreMatchingControls(true);
+    };
   }
 
   return {
     collectUIControls,
+    embeddingDependentControlIds,
     restoreUIControls,
     validateUIControls,
   };

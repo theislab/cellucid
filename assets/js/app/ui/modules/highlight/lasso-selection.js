@@ -14,9 +14,9 @@ import {
   SELECTION_NOTICE,
   selectionNoticeHtml
 } from './mode-copy.js';
-import { MAX_HISTORY_STEPS, selectionUnchanged } from './selection-state.js';
+import { pushHistoryStep, selectionUnchanged } from './selection-state.js';
 import { viewerNeedsUiRetirement } from '../../core/viewer-lifecycle.js';
-import { getStepControls, removeStepControls } from './step-controls.js';
+import { removeStepControls, showStepControls } from './step-controls.js';
 import {
   deliverSelectionToJupyter,
   showSelectionDeliveryFailure
@@ -36,6 +36,7 @@ import {
   requireSelectionStepEvent,
   requireUnifiedSelectionState
 } from './exact-contract.js';
+import { formatCount } from '../../components/display-format.js';
 
 /**
  * @param {object} options
@@ -120,7 +121,7 @@ export function initLassoSelection(options) {
     const stepsLabel = lassoEvent.steps > 1 ? ` (${lassoEvent.steps} views)` : '';
     const savedGroup = state.addHighlightDirect({
       type: 'lasso',
-      label: `Lasso${stepsLabel} (${lassoEvent.cellCount.toLocaleString()} cells)`,
+      label: `Lasso${stepsLabel} (${formatCount(lassoEvent.cellCount)} cells)`,
       cellIndices: lassoEvent.cellIndices
     });
     requireSavedHighlightGroup(
@@ -184,13 +185,10 @@ export function initLassoSelection(options) {
     // The empty state before the first step is recorded like any other, so
     // Undo can reach it — the annotation tool has always done this, and a
     // greyed-out Undo immediately after drawing reads as a broken control.
-    selectionState.lassoHistory.push({
+    pushHistoryStep(selectionState, 'lassoHistory', {
       candidates: selectionState.lastLassoCandidates ? [...selectionState.lastLassoCandidates] : null,
       step: selectionState.lastLassoStep
     });
-    if (selectionState.lassoHistory.length > MAX_HISTORY_STEPS) {
-      selectionState.lassoHistory.shift();
-    }
     selectionState.lassoRedoStack = [];
 
     selectionState.lastLassoCandidates = [...stepEvent.candidates];
@@ -295,8 +293,12 @@ export function initLassoSelection(options) {
     }
   }
 
-  function getLassoControls() {
-    return getStepControls({
+  /**
+   * Publish the step controls for a selection of `candidateCount` cells, on
+   * the panel and the selection bar alike.
+   */
+  function showLassoControls(candidateCount, notice) {
+    showStepControls({
       documentOwner,
       tool: 'lasso',
       parent: highlightModeDescriptionEl.parentElement,
@@ -311,6 +313,12 @@ export function initLassoSelection(options) {
         cancel: () => {
           viewer.cancelLassoSelection();
         }
+      },
+      readout: {
+        candidateCount,
+        canUndo: selectionState.lassoHistory.length > 0,
+        canRedo: selectionState.lassoRedoStack.length > 0,
+        notice
       }
     });
   }
@@ -351,7 +359,8 @@ export function initLassoSelection(options) {
       removeStepControls(
         documentOwner,
         'lasso',
-        highlightModeDescriptionEl.parentElement
+        highlightModeDescriptionEl.parentElement,
+        notice
       );
       return;
     }
@@ -360,10 +369,7 @@ export function initLassoSelection(options) {
       const stepInfo =
         '<strong>No selection</strong><br><small>Alt to intersect, Shift+Alt to add, Ctrl+Alt to subtract</small>';
 
-      const { undoButton, redoButton, confirmButton } = getLassoControls();
-      undoButton.disabled = selectionState.lassoHistory.length === 0;
-      redoButton.disabled = selectionState.lassoRedoStack.length === 0;
-      confirmButton.disabled = true;
+      showLassoControls(0, notice);
 
       highlightModeDescriptionEl.innerHTML = `${stepInfo}${noticeHtml}`;
       return;
@@ -380,12 +386,9 @@ export function initLassoSelection(options) {
       modeLabel = ' <span class="lasso-mode-tag intersect">intersected</span>';
     }
 
-    const stepInfo = `<strong>Step ${stepEvent.step}:</strong> ${stepEvent.candidateCount.toLocaleString()} cells${modeLabel}<br><small>Alt to intersect, Shift+Alt to add, Ctrl+Alt to subtract</small>`;
+    const stepInfo = `<strong>Step ${stepEvent.step}:</strong> ${formatCount(stepEvent.candidateCount)} cells${modeLabel}<br><small>Alt to intersect, Shift+Alt to add, Ctrl+Alt to subtract</small>`;
 
-    const { undoButton, redoButton, confirmButton } = getLassoControls();
-    undoButton.disabled = selectionState.lassoHistory.length === 0;
-    redoButton.disabled = selectionState.lassoRedoStack.length === 0;
-    confirmButton.disabled = stepEvent.candidateCount === 0;
+    showLassoControls(stepEvent.candidateCount, notice);
 
     highlightModeDescriptionEl.innerHTML = `${stepInfo}${noticeHtml}`;
   }

@@ -16,7 +16,7 @@ test('velocity spawn tables are deterministic samples without replacement', () =
   const overlay = Object.assign(Object.create(VelocityOverlay.prototype), {
     config: { spawnTableSize: 128 },
   });
-  const transparency = new Float32Array(512).fill(1);
+  const transparency = new Uint8Array(512).fill(1);
   const originalNow = Date.now;
 
   try {
@@ -83,7 +83,8 @@ test('snapshot rendering requires its owned GPU buffer', async () => {
     /requireSnapshotBufferId\(view\.id\)/g
   ) ?? [];
 
-  assert.equal(resolverCalls.length, 3);
+  // One single-view pane and one per grid pane.
+  assert.equal(resolverCalls.length, 2);
   assert.match(
     viewerSource,
     /function requireSnapshotBufferId\(viewId\)[\s\S]{0,500}has no published snapshot GPU buffer/

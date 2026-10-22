@@ -11,25 +11,6 @@ import {
   formatCompactNumber,
   formatDuration,
 } from '../assets/js/app/notification-center/formatters.js';
-import {
-  AnalysisHistoryTracker,
-} from '../assets/js/app/analysis/core/analysis-history.js';
-import {
-  createPlotContainer,
-} from '../assets/js/app/analysis/shared/result-renderer.js';
-import {
-  PlotRegistry,
-} from '../assets/js/app/analysis/shared/plot-registry-utils.js';
-
-function currentConfig() {
-  return {
-    analysisType: 'differential-expression',
-    pageIds: ['treated', 'control'],
-    variable: 'condition',
-    plotType: 'volcanoplot',
-    options: {},
-  };
-}
 
 function createCancelButton() {
   const attributes = new Map();
@@ -43,54 +24,6 @@ function createCancelButton() {
       attributes.delete(name);
     },
   };
-}
-
-class FakeElement {
-  constructor(tagName) {
-    this.tagName = tagName;
-    this.children = [];
-    this.className = '';
-    this.id = '';
-    this._textContent = '';
-  }
-
-  appendChild(child) {
-    this.children.push(child);
-    return child;
-  }
-
-  set textContent(value) {
-    this._textContent = value;
-    if (value === '') this.children = [];
-  }
-
-  get textContent() {
-    return this._textContent;
-  }
-}
-
-async function withDocument(documentValue, operation) {
-  const hadDocument = Object.hasOwn(globalThis, 'document');
-  const originalDocument = globalThis.document;
-  globalThis.document = documentValue;
-  try {
-    return await operation();
-  } finally {
-    if (hadDocument) globalThis.document = originalDocument;
-    else delete globalThis.document;
-  }
-}
-
-function withSessionStorage(storage, operation) {
-  const hadStorage = Object.hasOwn(globalThis, 'sessionStorage');
-  const originalStorage = globalThis.sessionStorage;
-  globalThis.sessionStorage = storage;
-  try {
-    return operation();
-  } finally {
-    if (hadStorage) globalThis.sessionStorage = originalStorage;
-    else delete globalThis.sessionStorage;
-  }
 }
 
 test('notification cancellation publishes rejection and restores the control', async () => {
@@ -278,157 +211,11 @@ test('stale auto-dismiss timers cannot dismiss a newer id generation', async () 
   assert.equal(center.notifications.get('shared-id'), newer);
 });
 
-test('analysis history accepts only the current config record', () => {
-  const tracker = new AnalysisHistoryTracker();
-  const id = tracker.record({
-    datasetId: 'synthetic-dataset',
-    config: currentConfig(),
-    resultSummary: { cellCount: 8 },
-    durationMs: 12.5,
-  });
-
-  assert.match(id, /^ah_/);
-  assert.equal(tracker.getHistory()[0].config.analysisType, 'differential-expression');
-
-  assert.throws(
-    () => tracker.record({
-      datasetId: 'synthetic-dataset',
-      config: {
-        type: 'differential-expression',
-        pageIds: [],
-        variableKey: 'condition',
-        plotType: 'volcanoplot',
-        options: {},
-      },
-    }),
-    /config must contain exactly/i,
-  );
-});
-
-test('analysis timing is an exact one-shot JSON record owner', () => {
-  const tracker = new AnalysisHistoryTracker();
-  const finish = tracker.startTiming({
-    datasetId: 'synthetic-dataset',
-    config: currentConfig(),
-  });
-  const id = finish({ cellCount: 0 });
-  assert.match(id, /^ah_\d+_\d+$/);
-  assert.throws(
-    () => finish({ cellCount: 0 }),
-    /exactly once/,
-  );
-  assert.throws(
-    () => tracker.record({
-      datasetId: 'synthetic-dataset',
-      config: {
-        ...currentConfig(),
-        options: { unsupported: 1n },
-      },
-    }),
-    /only JSON values/,
-  );
-});
-
-test('analysis history rejects corrupt storage instead of opening empty', () => {
-  withSessionStorage({
-    getItem() {
-      return '{not-json';
-    },
-    setItem() {},
-  }, () => {
-    assert.throws(
-      () => new AnalysisHistoryTracker({ persistToStorage: true }),
-      SyntaxError,
-    );
-  });
-});
-
-test('analysis history persistence failure leaves memory unchanged', () => {
-  withSessionStorage({
-    getItem() {
-      return null;
-    },
-    setItem() {
-      throw new Error('synthetic storage failure');
-    },
-  }, () => {
-    const tracker = new AnalysisHistoryTracker({ persistToStorage: true });
-    assert.throws(
-      () => tracker.record({
-        datasetId: 'synthetic-dataset',
-        config: currentConfig(),
-      }),
-      /synthetic storage failure/i,
-    );
-    assert.deepEqual(tracker.getHistory(), []);
-  });
-});
-
-test('analysis history listener failures are aggregated after every listener runs', () => {
-  const tracker = new AnalysisHistoryTracker();
-  const calls = [];
-  tracker.on('record', () => {
-    calls.push('first');
-    throw new Error('first observer failed');
-  });
-  tracker.on('record', () => {
-    calls.push('second');
-    throw new Error('second observer failed');
-  });
-
-  assert.throws(
-    () => tracker.record({
-      datasetId: 'synthetic-dataset',
-      config: currentConfig(),
-    }),
-    error => (
-      error instanceof AggregateError &&
-      error.errors.length === 2
-    ),
-  );
-  assert.deepEqual(calls, ['first', 'second']);
-  assert.equal(tracker.getHistory().length, 1);
-});
-
-test('plot container shows and propagates the exact renderer failure', async () => {
-  await withDocument({
-    createElement(tagName) {
-      return new FakeElement(tagName);
-    },
-  }, async () => {
-    const parent = new FakeElement('div');
-    const container = createPlotContainer(parent, { id: 'exact-plot' });
-    const failure = new Error('synthetic plot failure');
-    const originalGet = PlotRegistry.get;
-    PlotRegistry.get = () => ({
-      async render() {
-        throw failure;
-      },
-    });
-    try {
-      await assert.rejects(
-        container.render('synthetic-plot', [], {}),
-        error => error === failure,
-      );
-    } finally {
-      PlotRegistry.get = originalGet;
-    }
-
-    assert.equal(container.element.children.length, 1);
-    assert.equal(
-      container.element.children[0].textContent,
-      'Failed to render plot: synthetic plot failure',
-    );
-  });
-});
-
-test('owned notification and analysis files contain no swallowed console failure path', async () => {
+test('owned notification files contain no swallowed console failure path', async () => {
   const urls = [
     '../assets/js/app/notification-center.js',
     '../assets/js/app/notification-center/download-tracking.js',
     '../assets/js/app/notification-center/benchmark-notifications.js',
-    '../assets/js/app/analysis/core/analysis-history.js',
-    '../assets/js/app/analysis/shared/result-renderer.js',
   ].map(path => new URL(path, import.meta.url));
   const source = (await Promise.all(urls.map(url => readFile(url, 'utf8')))).join('\n');
 
@@ -478,4 +265,25 @@ test('a notification renders the line breaks its message carries', async () => {
     2,
     'the multi-line list messages must still be the reason for the rule'
   );
+});
+
+test('a card retired to make room is kept in the overflow list, never lost', () => {
+  const center = new NotificationCenter();
+  center.maxNotifications = 1;
+  center.dismiss = id => center.notifications.delete(id);
+  center.notifications.set('first-error', {
+    dismissTimer: null,
+    element: {},
+    options: { type: NotificationType.ERROR, title: 'Load failed', message: 'Disk full' },
+  });
+  center.notifications.set('second', {
+    dismissTimer: null,
+    element: {},
+    options: { type: NotificationType.SUCCESS, message: 'Saved' },
+  });
+  center._evictNonActiveUntil(center.maxNotifications);
+  assert.deepEqual(center.overflowMessages, [
+    { type: NotificationType.ERROR, title: 'Load failed', message: 'Disk full' },
+  ]);
+  assert.equal(center.hasNotification('second'), true);
 });

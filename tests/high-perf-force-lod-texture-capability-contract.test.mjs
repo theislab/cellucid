@@ -9,18 +9,20 @@ import {
   RendererConfig,
 } from '../assets/js/rendering/high-perf-renderer.js';
 import { SpatialIndex } from '../assets/js/rendering/high-perf/spatial-index.js';
+import { createCpuPermuter } from './helpers/cpu-permuter.mjs';
+import { planLinearTexture } from '../assets/js/rendering/linear-texture.js';
 
 const DIMENSION = 2;
 
+// A 2D embedding: DIMENSION components per point.
 function makePositions(pointCount, offset = 0) {
-  const positions = new Float32Array(pointCount * 3);
+  const positions = new Float32Array(pointCount * DIMENSION);
   for (let index = 0; index < pointCount; index++) {
-    const positionOffset = index * 3;
+    const positionOffset = index * DIMENSION;
     positions[positionOffset] = offset + index / Math.max(pointCount, 1);
     positions[positionOffset + 1] =
       offset + ((index * 7) % Math.max(pointCount, 1)) /
         Math.max(pointCount, 1);
-    positions[positionOffset + 2] = 0;
   }
   return positions;
 }
@@ -37,7 +39,7 @@ function makeColors(pointCount) {
   return colors;
 }
 
-function createTrackingGl(maxTextureSize = 8192) {
+function createTrackingGl(maxTextureSize = 8192, maxArrayLayers = 256) {
   let nextId = 1;
   let boundArrayBuffer = null;
   let boundElementBuffer = null;
@@ -59,6 +61,7 @@ function createTrackingGl(maxTextureSize = 8192) {
     vertexArrays: [],
   };
   const uploads = [];
+  const copyBindings = new Map();
 
   const adopt = (kind, label = null) => {
     const handle = Object.freeze({
@@ -75,11 +78,14 @@ function createTrackingGl(maxTextureSize = 8192) {
     ARRAY_BUFFER: 0x8892,
     BLEND: 0x0be2,
     CLAMP_TO_EDGE: 0x812f,
+    COPY_READ_BUFFER: 0x8f36,
+    COPY_WRITE_BUFFER: 0x8f37,
     DEPTH_TEST: 0x0b71,
     DYNAMIC_DRAW: 0x88e8,
     ELEMENT_ARRAY_BUFFER: 0x8893,
     FLOAT: 0x1406,
     FUNC_ADD: 0x8006,
+    MAX_ARRAY_TEXTURE_LAYERS: 0x88ff,
     MAX_TEXTURE_SIZE: 0x0d33,
     NEAREST: 0x2600,
     NO_ERROR: 0,
@@ -93,6 +99,7 @@ function createTrackingGl(maxTextureSize = 8192) {
     STATIC_DRAW: 0x88e4,
     SRC_ALPHA: 0x0302,
     TEXTURE_2D: 0x0de1,
+    TEXTURE_2D_ARRAY: 0x8c1a,
     TEXTURE_MAG_FILTER: 0x2800,
     TEXTURE_MIN_FILTER: 0x2801,
     TEXTURE_WRAP_S: 0x2802,
@@ -103,13 +110,23 @@ function createTrackingGl(maxTextureSize = 8192) {
     bindBuffer(target, handle) {
       if (target === this.ARRAY_BUFFER) {
         boundArrayBuffer = handle;
+      } else if (target === this.COPY_READ_BUFFER || target === this.COPY_WRITE_BUFFER) {
+        copyBindings.set(target, handle);
       } else {
         assert.equal(target, this.ELEMENT_ARRAY_BUFFER);
         boundElementBuffer = handle;
       }
     },
+    copyBufferSubData(readTarget, writeTarget, readOffset, writeOffset, size) {
+      uploads.push({
+        byteLength: size,
+        from: copyBindings.get(readTarget),
+        kind: 'copy',
+        to: copyBindings.get(writeTarget),
+      });
+    },
     bindTexture(target, handle) {
-      assert.equal(target, this.TEXTURE_2D);
+      assert.ok(target === this.TEXTURE_2D || target === this.TEXTURE_2D_ARRAY);
       boundTexture = handle;
     },
     bindVertexArray(handle) {
@@ -122,12 +139,13 @@ function createTrackingGl(maxTextureSize = 8192) {
         buffer: target === this.ARRAY_BUFFER
           ? boundArrayBuffer
           : boundElementBuffer,
-        byteLength: data.byteLength,
+        byteLength: typeof data === 'number' ? data : data.byteLength,
         kind: 'buffer',
         target,
         usage,
       });
     },
+    bufferSubData() {},
     createBuffer() {
       const handle = adopt('buffer');
       creates.buffers.push(handle);
@@ -162,6 +180,7 @@ function createTrackingGl(maxTextureSize = 8192) {
       return this.NO_ERROR;
     },
     getParameter(parameter) {
+      if (parameter === this.MAX_ARRAY_TEXTURE_LAYERS) return maxArrayLayers;
       assert.equal(parameter, this.MAX_TEXTURE_SIZE);
       return maxTextureSize;
     },
@@ -201,6 +220,21 @@ function createTrackingGl(maxTextureSize = 8192) {
         width,
       });
     },
+    texStorage2D(target, levels, internalFormat, width, height) {
+      assert.equal(target, this.TEXTURE_2D);
+      assert.notEqual(boundTexture, null);
+      uploads.push({
+        byteLength: 0,
+        data: null,
+        height,
+        internalFormat,
+        kind: 'texture',
+        level: 0,
+        levels,
+        texture: boundTexture,
+        width,
+      });
+    },
     texSubImage2D(
       target,
       level,
@@ -229,7 +263,57 @@ function createTrackingGl(maxTextureSize = 8192) {
         yOffset,
       });
     },
+    texStorage3D(target, levels, internalFormat, width, height, depth) {
+      assert.equal(target, this.TEXTURE_2D_ARRAY);
+      assert.notEqual(boundTexture, null);
+      uploads.push({
+        byteLength: 0,
+        data: null,
+        depth,
+        height,
+        internalFormat,
+        kind: 'texture',
+        level: 0,
+        levels,
+        texture: boundTexture,
+        width,
+      });
+    },
+    texSubImage3D(
+      target,
+      level,
+      xOffset,
+      yOffset,
+      zOffset,
+      width,
+      height,
+      depth,
+      format,
+      type,
+      data,
+      srcOffset = 0,
+    ) {
+      assert.equal(target, this.TEXTURE_2D_ARRAY);
+      assert.notEqual(boundTexture, null);
+      assert.ok(ArrayBuffer.isView(data));
+      const view = data.subarray(srcOffset, srcOffset + width * height * depth);
+      uploads.push({
+        byteLength: view.byteLength,
+        data: new data.constructor(view),
+        format,
+        height,
+        kind: 'texture-subimage',
+        level,
+        texture: boundTexture,
+        type,
+        width,
+        xOffset,
+        yOffset,
+        zOffset,
+      });
+    },
     texParameteri() {},
+    uniform2i() {},
     vertexAttribPointer() {},
 
     _adoptBuffer(label) {
@@ -243,6 +327,9 @@ function createTrackingGl(maxTextureSize = 8192) {
     },
     _setMaxTextureSize(value) {
       maxTextureSize = value;
+    },
+    _setMaxArrayLayers(value) {
+      maxArrayLayers = value;
     },
     _state: {
       get boundVertexArray() {
@@ -315,7 +402,8 @@ function createRendererState(
     liveGeometryGeneration = 3,
   } = {},
 ) {
-  const mainBuffer = gl._adoptBuffer('main-buffer');
+  const mainPositionBuffer = gl._adoptBuffer('main-position-buffer');
+  const mainColorBuffer = gl._adoptBuffer('main-color-buffer');
   const mainVao = gl._adoptVertexArray('main-vao');
   return Object.assign(
     Object.create(HighPerfRenderer.prototype),
@@ -324,22 +412,19 @@ function createRendererState(
       _alphaTexHeight: 0,
       _alphaTexWidth: 0,
       _alphaTexture: null,
-      _bufferDirty: false,
+      _permuter: createCpuPermuter(gl),
+      _colorsDirty: false,
       _colors: colors,
+      _colorGpuByteLength: colors.byteLength,
       _currentAlphas: null,
-      _dirtyLodDimensions: new Set(),
+      _liveOrder: null,
+      _liveColorOrder: null,
       _dummyLodIndexTexture:
         gl._adoptTexture('dummy-lod-index-texture'),
       _dummyLodIndexTextureByteLength:
         Uint32Array.BYTES_PER_ELEMENT,
       _firstRenderDone: true,
-      _interleavedArrayBuffer: null,
-      _interleavedColorView: null,
-      _interleavedPositionView: null,
       _liveGeometryGeneration: liveGeometryGeneration,
-      _lodArrayBuffers: null,
-      _lodIndexTexturesByDimension: new Map(),
-      _lodResourceOwnersByDimension: new Map(),
       _nextGeometryGeneration: liveGeometryGeneration + 1,
       _pendingDataRetirements: new Set(),
       _pendingSnapshotRetirements: new Set(),
@@ -347,26 +432,23 @@ function createRendererState(
       _positions: positions,
       _snapshotGeometryPools: new Map(),
       _useAlphaTexture: false,
-      _validatedLodNodeMappings: new WeakMap(),
       _validatedSpatialIndices: new WeakSet(),
       activeProgram: Object.freeze({ id: 'program' }),
       activeQuality: 'full',
+      programs: { full: Object.freeze({ id: 'program' }) },
       buffers: {
-        alphas: null,
-        colors: null,
-        interleaved: mainBuffer,
-        positions: null,
+        colors: mainColorBuffer,
+        positions: mainPositionBuffer,
       },
       currentDimensionLevel: DIMENSION,
       forceLODLevel: -1,
       gl,
-      lodBuffersByDimension: new Map(),
       options: {
         ...RendererConfig,
         USE_FRUSTUM_CULLING: false,
         USE_LOD: false,
       },
-      pointCount: positions.length / 3,
+      pointCount: positions.length / DIMENSION,
       snapshotBuffers: new Map(),
       spatialIndices: new Map(),
       stats: {
@@ -387,31 +469,6 @@ function createRendererState(
   );
 }
 
-function makeSpatialOwner(positions, maximumIndices) {
-  return {
-    dimensionLevel: DIMENSION,
-    lodLevels: [
-      {
-        depth: 0,
-        indices: maximumIndices,
-        isFullDetail: false,
-        pointCount: maximumIndices.length,
-        sizeMultiplier: 1.5,
-      },
-      {
-        depth: 1,
-        isFullDetail: true,
-        pointCount: positions.length / 3,
-        positions,
-        sizeMultiplier: 1,
-      },
-    ],
-    pointCount: positions.length / 3,
-    positions,
-    ensureLODLevels() {},
-  };
-}
-
 test('explicit live forceLOD lazily builds one exact LOD generation when all LOD defaults are disabled', t => {
   replaceCalculationNotifications(t);
   assert.equal(
@@ -428,38 +485,32 @@ test('explicit live forceLOD lazily builds one exact LOD generation when all LOD
     lastLodLevel: -1,
     prevLodLevel: undefined,
   };
-  let renderedLevel = null;
+  let draw = null;
   renderer._getViewState = () => viewState;
-  renderer._renderLOD = level => {
-    renderedLevel = level;
+  renderer._drawPoints = request => {
+    draw = request;
   };
   renderer._publishFrameTiming = () => {};
-  renderer.getStats = () => ({ renderedLevel });
+  renderer.getStats = () => ({ renderedLevel: draw?.lodLevel ?? null });
 
   const result = renderer.render(renderParams('live', 0));
   const spatialIndex = renderer.spatialIndices.get(DIMENSION);
-  const owner =
-    renderer._lodResourceOwnersByDimension.get(DIMENSION);
 
   assert.equal(renderer.useAdaptiveLOD, false);
   assert.equal(renderer.options.USE_LOD, false);
   assert.ok(spatialIndex instanceof SpatialIndex);
   assert.ok(spatialIndex.lodLevels.length > 1);
   assert.strictEqual(spatialIndex.positions, positions);
-  assert.strictEqual(owner.spatialIndex, spatialIndex);
-  assert.equal(
-    owner.liveGeometryGeneration,
-    renderer._liveGeometryGeneration,
-  );
-  assert.equal(
-    renderer.lodBuffersByDimension.get(DIMENSION).length,
-    spatialIndex.lodLevels.length,
-  );
-  assert.equal(renderedLevel, 0);
+  // The live store adopted the new tree's banded draw order before the draw.
+  assert.strictEqual(renderer._liveOrder.drawOrder, spatialIndex.drawOrder);
+  assert.equal(spatialIndex.drawOrder.bandCount, spatialIndex.lodLevels.length);
+  assert.strictEqual(draw.tree, spatialIndex);
+  assert.strictEqual(draw.order, renderer._liveOrder);
+  assert.equal(draw.lodLevel, 0);
   assert.deepEqual(result, { renderedLevel: 0 });
 });
 
-test('explicit snapshot forceLOD promotes the exact pooled tree when all LOD defaults are disabled', t => {
+test('explicit snapshot forceLOD replaces a frustum-only pooled tree with one carrying LOD levels', t => {
   replaceCalculationNotifications(t);
   const gl = createTrackingGl();
   const livePositions = makePositions(4);
@@ -477,11 +528,7 @@ test('explicit snapshot forceLOD promotes the exact pooled tree when all LOD def
     DIMENSION,
     renderer.options.LOD_MAX_POINTS_PER_NODE,
     renderer.options.LOD_MAX_DEPTH,
-    {
-      buildLOD: false,
-      buildLodNodeMappings: false,
-      computeNodeStats: false,
-    },
+    { buildLOD: false },
   );
   const geometryGeneration = 9;
   const alphaTexData = new Uint8Array(4);
@@ -494,9 +541,11 @@ test('explicit snapshot forceLOD promotes the exact pooled tree when all LOD def
     alphaTexWidth: 4,
     alphaTexture:
       gl._adoptTexture('snapshot-alpha-texture'),
+    alphaTexPlan: planLinearTexture(alphaTexData.length, 16384, 256),
     alphaTextureByteLength: alphaTexData.byteLength,
     bounds: HighPerfRenderer.computeBoundsFromPositions(
       snapshotPositions,
+      DIMENSION,
     ),
     buffer: snapshotBuffer,
     bufferByteLength: 4 * 3,
@@ -529,18 +578,17 @@ test('explicit snapshot forceLOD promotes the exact pooled tree when all LOD def
   let draw = null;
   renderer._getViewState = () => viewState;
   renderer.invalidateViewState = () => true;
-  renderer._renderSnapshotWithLOD = (
-    exactSnapshot,
-    lodLevel,
-    _params,
-    _viewState,
-    _useAlphaTexture,
-    exactSpatialIndex,
-  ) => {
+  // The geometry already holds the tree's order (adoption is pinned elsewhere).
+  renderer._ensureSnapshotDrawOrder = (_snapshot, tree) => (
+    tree === null ? null : { drawOrder: tree.ensureDrawOrder() }
+  );
+  renderer._ensureSnapshotColorsInOrder = () => {};
+  renderer._drawPoints = request => {
     draw = {
-      exactSnapshot,
-      exactSpatialIndex,
-      lodLevel,
+      exactSnapshot: renderer.snapshotBuffers.get(request.params.viewId),
+      exactSpatialIndex: request.tree,
+      lodLevel: request.lodLevel,
+      vao: request.vao,
     };
   };
   renderer._publishFrameTiming = () => {};
@@ -553,17 +601,23 @@ test('explicit snapshot forceLOD promotes the exact pooled tree when all LOD def
 
   assert.equal(renderer.useAdaptiveLOD, false);
   assert.equal(renderer.options.USE_LOD, false);
-  assert.strictEqual(snapshot.spatialIndex, spatialIndex);
+  // The tree with levels was built as one job (inline here: no worker) and
+  // replaced the frustum-only one in the geometry's pool.
+  const promoted = snapshot.spatialIndex;
+  assert.notStrictEqual(promoted, spatialIndex);
+  assert.strictEqual(promoted.positions, snapshotPositions);
   assert.strictEqual(
     renderer._snapshotGeometryPools
       .get(geometryGeneration)
       .spatialIndices
       .get(DIMENSION),
-    spatialIndex,
+    promoted,
   );
-  assert.ok(spatialIndex.lodLevels.length > 1);
+  assert.ok(promoted.lodLevels.length > 1);
+  assert.equal(spatialIndex.lodLevels.length, 0, 'the old tree is not promoted in place');
   assert.strictEqual(draw.exactSnapshot, snapshot);
-  assert.strictEqual(draw.exactSpatialIndex, spatialIndex);
+  assert.strictEqual(draw.vao, snapshot.vao);
+  assert.strictEqual(draw.exactSpatialIndex, promoted);
   assert.equal(draw.lodLevel, 0);
   assert.deepEqual(result, { lodLevel: 0 });
 });
@@ -581,6 +635,7 @@ test('explicit snapshot forceLOD builds an exact missing pooled LOD tree when de
   );
   const snapshotPositions = makePositions(3, 20);
   const geometryGeneration = 19;
+  // Three points in a linear texture of one row, exactly three texels wide.
   const alphaTexData = new Uint8Array(3);
   alphaTexData.fill(255);
   const snapshotBuffer =
@@ -591,9 +646,11 @@ test('explicit snapshot forceLOD builds an exact missing pooled LOD tree when de
     alphaTexWidth: 3,
     alphaTexture:
       gl._adoptTexture('unindexed-snapshot-alpha-texture'),
+    alphaTexPlan: planLinearTexture(3, 16384, 256),
     alphaTextureByteLength: alphaTexData.byteLength,
     bounds: HighPerfRenderer.computeBoundsFromPositions(
       snapshotPositions,
+      DIMENSION,
     ),
     buffer: snapshotBuffer,
     bufferByteLength: 3 * 3,
@@ -626,15 +683,13 @@ test('explicit snapshot forceLOD builds an exact missing pooled LOD tree when de
   let draw = null;
   renderer._getViewState = () => viewState;
   renderer.invalidateViewState = () => true;
-  renderer._renderSnapshotWithLOD = (
-    _snapshot,
-    lodLevel,
-    _params,
-    _viewState,
-    _useAlphaTexture,
-    spatialIndex,
-  ) => {
-    draw = { lodLevel, spatialIndex };
+  // The geometry already holds the tree's order (adoption is pinned elsewhere).
+  renderer._ensureSnapshotDrawOrder = (_snapshot, tree) => (
+    tree === null ? null : { drawOrder: tree.ensureDrawOrder() }
+  );
+  renderer._ensureSnapshotColorsInOrder = () => {};
+  renderer._drawPoints = request => {
+    draw = { lodLevel: request.lodLevel, spatialIndex: request.tree };
   };
   renderer._publishFrameTiming = () => {};
   renderer.getStats = () => ({ lodLevel: draw?.lodLevel ?? null });
@@ -658,611 +713,9 @@ test('explicit snapshot forceLOD builds an exact missing pooled LOD tree when de
   assert.deepEqual(result, { lodLevel: 0 });
 });
 
-test('same-length LOD metadata cannot hide a stale spatial or maximum-prefix owner', () => {
-  const gl = createTrackingGl();
-  const positions = makePositions(4);
-  const colors = makeColors(4);
-  const renderer = createRendererState(gl, positions, colors);
-  const acceptedIndices = Uint32Array.from([0, 1]);
-  const currentIndices = Uint32Array.from([2, 3]);
-  const acceptedSpatial = makeSpatialOwner(
-    positions,
-    acceptedIndices,
-  );
-  const currentSpatial = makeSpatialOwner(
-    positions,
-    currentIndices,
-  );
-  const generationToken = Object.freeze({});
-  const staleBuffers = [
-    {
-      generationToken,
-      isFullDetail: false,
-      pointCount: 2,
-    },
-    {
-      generationToken: null,
-      isFullDetail: true,
-      pointCount: 4,
-    },
-  ];
-  const staleTextures = [
-    { generationToken },
-    { generationToken: null },
-  ];
-  const staleOwner = {
-    generationToken,
-    liveGeometryGeneration: renderer._liveGeometryGeneration,
-    maximumIndices: acceptedIndices,
-    pointCount: 4,
-    spatialIndex: acceptedSpatial,
-  };
-  renderer._lodResourceOwnersByDimension.set(
-    DIMENSION,
-    staleOwner,
-  );
-  renderer.lodBuffersByDimension.set(DIMENSION, staleBuffers);
-  renderer._lodIndexTexturesByDimension.set(
-    DIMENSION,
-    staleTextures,
-  );
-
-  const rebuilds = [];
-  const replacement = Object.freeze([{ id: 'replacement' }]);
-  renderer._createLODResourcesForDimension = (
-    dimensionLevel,
-    spatialIndex,
-  ) => {
-    rebuilds.push({ dimensionLevel, spatialIndex });
-    return replacement;
-  };
-
-  assert.strictEqual(
-    renderer._ensureLodResourcesForDimension(
-      DIMENSION,
-      currentSpatial,
-    ),
-    replacement,
-  );
-  assert.deepEqual(rebuilds, [{
-    dimensionLevel: DIMENSION,
-    spatialIndex: currentSpatial,
-  }]);
-
-  rebuilds.length = 0;
-  staleOwner.spatialIndex = currentSpatial;
-  assert.strictEqual(
-    renderer._ensureLodResourcesForDimension(
-      DIMENSION,
-      currentSpatial,
-    ),
-    replacement,
-    'a same-sized replacement prefix is a new topology owner',
-  );
-  assert.deepEqual(rebuilds, [{
-    dimensionLevel: DIMENSION,
-    spatialIndex: currentSpatial,
-  }]);
-
-  rebuilds.length = 0;
-  staleOwner.maximumIndices = currentIndices;
-  staleBuffers[0].generationToken = Object.freeze({});
-  assert.strictEqual(
-    renderer._ensureLodResourcesForDimension(
-      DIMENSION,
-      currentSpatial,
-    ),
-    replacement,
-    'reduced draw metadata must project the exact owner token',
-  );
-  assert.deepEqual(rebuilds, [{
-    dimensionLevel: DIMENSION,
-    spatialIndex: currentSpatial,
-  }]);
-
-  rebuilds.length = 0;
-  staleBuffers[0].generationToken = generationToken;
-  staleTextures[0].generationToken = Object.freeze({});
-  assert.strictEqual(
-    renderer._ensureLodResourcesForDimension(
-      DIMENSION,
-      currentSpatial,
-    ),
-    replacement,
-    'R32UI metadata must project the exact owner token',
-  );
-  assert.deepEqual(rebuilds, [{
-    dimensionLevel: DIMENSION,
-    spatialIndex: currentSpatial,
-  }]);
-});
-
-test('LOD ensure validates exact handles, bytes, texture geometry, token, and full-detail projections', () => {
-  const gl = createTrackingGl();
-  const positions = makePositions(4);
-  const colors = makeColors(4);
-  const renderer = createRendererState(gl, positions, colors);
-  const spatialIndex = makeSpatialOwner(
-    positions,
-    Uint32Array.from([2, 0]),
-  );
-  renderer.spatialIndices.set(DIMENSION, spatialIndex);
-  const acceptedMetadata =
-    renderer._createLODResourcesForDimension(
-      DIMENSION,
-      spatialIndex,
-    );
-  const acceptedOwner =
-    renderer._lodResourceOwnersByDimension.get(DIMENSION);
-  const acceptedTextureMetadata =
-    renderer._lodIndexTexturesByDimension.get(DIMENSION);
-  let owner = acceptedOwner;
-  let reducedMetadata = acceptedMetadata[0];
-  let fullMetadata = acceptedMetadata.at(-1);
-  let textureMetadata = acceptedTextureMetadata[0];
-  let fullTextureMetadata = acceptedTextureMetadata.at(-1);
-
-  let rebuilds = 0;
-  const replacement = Object.freeze([{ id: 'replacement' }]);
-  renderer._createLODResourcesForDimension = (
-    dimensionLevel,
-    exactSpatialIndex,
-  ) => {
-    assert.equal(dimensionLevel, DIMENSION);
-    assert.strictEqual(exactSpatialIndex, spatialIndex);
-    rebuilds += 1;
-    return replacement;
-  };
-
-  assert.strictEqual(
-    renderer._ensureLodResourcesForDimension(
-      DIMENSION,
-      spatialIndex,
-    ),
-    acceptedMetadata,
-    'an exact accepted projection must remain allocation-free',
-  );
-  assert.equal(rebuilds, 0);
-
-  const cases = [
-    {
-      label: 'compact buffer handle',
-      mutate() {
-        const previousOwner = owner.compactBuffer;
-        const previousMetadata = reducedMetadata.buffer;
-        owner.compactBuffer = null;
-        reducedMetadata.buffer = null;
-        return () => {
-          owner.compactBuffer = previousOwner;
-          reducedMetadata.buffer = previousMetadata;
-        };
-      },
-    },
-    {
-      label: 'compact VAO handle',
-      mutate() {
-        const previousOwner = owner.compactVao;
-        const previousMetadata = reducedMetadata.vao;
-        owner.compactVao = null;
-        reducedMetadata.vao = null;
-        return () => {
-          owner.compactVao = previousOwner;
-          reducedMetadata.vao = previousMetadata;
-        };
-      },
-    },
-    {
-      label: 'original-index buffer handle',
-      mutate() {
-        const previousOwner =
-          owner.topologyOwner.originalIndexBuffer;
-        const previousMetadata =
-          reducedMetadata.originalIndexBuffer;
-        owner.topologyOwner.originalIndexBuffer = null;
-        reducedMetadata.originalIndexBuffer = null;
-        return () => {
-          owner.topologyOwner.originalIndexBuffer =
-            previousOwner;
-          reducedMetadata.originalIndexBuffer =
-            previousMetadata;
-        };
-      },
-    },
-    {
-      label: 'R32UI texture handle',
-      mutate() {
-        const previousOwner = owner.topologyOwner.indexTexture;
-        const previousMetadata = textureMetadata.texture;
-        owner.topologyOwner.indexTexture = null;
-        textureMetadata.texture = null;
-        return () => {
-          owner.topologyOwner.indexTexture = previousOwner;
-          textureMetadata.texture = previousMetadata;
-        };
-      },
-    },
-    {
-      label: 'compact byte length',
-      mutate() {
-        const previous = owner.compactByteLength;
-        owner.compactByteLength = previous - 1;
-        return () => {
-          owner.compactByteLength = previous;
-        };
-      },
-    },
-    {
-      label: 'original-index byte length',
-      mutate() {
-        const previous =
-          owner.topologyOwner.originalIndexByteLength;
-        owner.topologyOwner.originalIndexByteLength =
-          previous - 1;
-        return () => {
-          owner.topologyOwner.originalIndexByteLength =
-            previous;
-        };
-      },
-    },
-    {
-      label: 'R32UI byte length',
-      mutate() {
-        const previous =
-          owner.topologyOwner.indexTextureByteLength;
-        owner.topologyOwner.indexTextureByteLength =
-          previous - Uint32Array.BYTES_PER_ELEMENT;
-        return () => {
-          owner.topologyOwner.indexTextureByteLength =
-            previous;
-        };
-      },
-    },
-    {
-      label: 'aggregate GPU byte length',
-      mutate() {
-        const previous = owner.gpuByteLength;
-        owner.gpuByteLength = previous - 1;
-        return () => {
-          owner.gpuByteLength = previous;
-        };
-      },
-    },
-    {
-      label: 'canonical texture geometry',
-      mutate() {
-        const previousWidth = owner.topologyOwner.textureWidth;
-        const previousHeight =
-          owner.topologyOwner.textureHeight;
-        const previousMetadataWidth = textureMetadata.width;
-        const previousMetadataHeight = textureMetadata.height;
-        owner.topologyOwner.textureWidth = 1;
-        owner.topologyOwner.textureHeight = 2;
-        textureMetadata.width = 1;
-        textureMetadata.height = 2;
-        return () => {
-          owner.topologyOwner.textureWidth = previousWidth;
-          owner.topologyOwner.textureHeight = previousHeight;
-          textureMetadata.width = previousMetadataWidth;
-          textureMetadata.height = previousMetadataHeight;
-        };
-      },
-    },
-    {
-      label: 'immutable generation token',
-      mutate() {
-        const previousOwner = owner.generationToken;
-        const previousMetadata =
-          reducedMetadata.generationToken;
-        const previousTexture =
-          textureMetadata.generationToken;
-        const mutableToken = {};
-        owner.generationToken = mutableToken;
-        reducedMetadata.generationToken = mutableToken;
-        textureMetadata.generationToken = mutableToken;
-        return () => {
-          owner.generationToken = previousOwner;
-          reducedMetadata.generationToken = previousMetadata;
-          textureMetadata.generationToken = previousTexture;
-        };
-      },
-    },
-    {
-      label: 'full-detail main-buffer projection',
-      mutate() {
-        const previous = fullMetadata.buffer;
-        fullMetadata.buffer = owner.compactBuffer;
-        return () => {
-          fullMetadata.buffer = previous;
-        };
-      },
-    },
-    {
-      label: 'full-detail topology projection',
-      mutate() {
-        const previousBuffer =
-          fullMetadata.originalIndexBuffer;
-        const previousCount =
-          fullMetadata.originalIndexCount;
-        const previousTexture =
-          fullTextureMetadata.texture;
-        fullMetadata.originalIndexBuffer =
-          owner.topologyOwner.originalIndexBuffer;
-        fullMetadata.originalIndexCount = 1;
-        fullTextureMetadata.texture =
-          owner.topologyOwner.indexTexture;
-        return () => {
-          fullMetadata.originalIndexBuffer =
-            previousBuffer;
-          fullMetadata.originalIndexCount = previousCount;
-          fullTextureMetadata.texture = previousTexture;
-        };
-      },
-    },
-  ];
-
-  for (const exactCase of cases) {
-    const mutableMetadata = acceptedMetadata.map(
-      metadata => ({ ...metadata }),
-    );
-    const mutableTextureMetadata = acceptedTextureMetadata.map(
-      metadata => ({ ...metadata }),
-    );
-    owner = {
-      ...acceptedOwner,
-      topologyOwner: {
-        ...acceptedOwner.topologyOwner,
-      },
-    };
-    reducedMetadata = mutableMetadata[0];
-    fullMetadata = mutableMetadata.at(-1);
-    textureMetadata = mutableTextureMetadata[0];
-    fullTextureMetadata = mutableTextureMetadata.at(-1);
-    renderer._lodResourceOwnersByDimension.set(DIMENSION, owner);
-    renderer.lodBuffersByDimension.set(DIMENSION, mutableMetadata);
-    renderer._lodIndexTexturesByDimension.set(
-      DIMENSION,
-      mutableTextureMetadata,
-    );
-    const restore = exactCase.mutate();
-    const before = rebuilds;
-    try {
-      assert.strictEqual(
-        renderer._ensureLodResourcesForDimension(
-          DIMENSION,
-          spatialIndex,
-        ),
-        replacement,
-        `${exactCase.label} corruption must rebuild`,
-      );
-      assert.equal(
-        rebuilds,
-        before + 1,
-        `${exactCase.label} corruption must rebuild exactly once`,
-      );
-    } finally {
-      restore();
-      renderer._lodResourceOwnersByDimension.set(
-        DIMENSION,
-        acceptedOwner,
-      );
-      renderer.lodBuffersByDimension.set(
-        DIMENSION,
-        acceptedMetadata,
-      );
-      renderer._lodIndexTexturesByDimension.set(
-        DIMENSION,
-        acceptedTextureMetadata,
-      );
-    }
-  }
-
-  assert.strictEqual(
-    renderer._ensureLodResourcesForDimension(
-      DIMENSION,
-      spatialIndex,
-    ),
-    acceptedMetadata,
-    'restoring every exact projection must restore no-churn reuse',
-  );
-});
-
-test('a full-detail-only spatial generation retains one zero-byte owner without repeated rebuilds', () => {
-  const gl = createTrackingGl();
-  const positions = makePositions(3);
-  const colors = makeColors(3);
-  const renderer = createRendererState(gl, positions, colors);
-  const spatialIndex = {
-    dimensionLevel: DIMENSION,
-    ensureLODLevels() {},
-    lodLevels: [{
-      depth: 0,
-      isFullDetail: true,
-      pointCount: 3,
-      positions,
-      sizeMultiplier: 1,
-    }],
-    pointCount: 3,
-    positions,
-  };
-  renderer.spatialIndices.set(DIMENSION, spatialIndex);
-  const createCounts = {
-    buffers: gl._state.creates.buffers.length,
-    textures: gl._state.creates.textures.length,
-    vertexArrays: gl._state.creates.vertexArrays.length,
-  };
-
-  const acceptedMetadata =
-    renderer._createLODResourcesForDimension(
-      DIMENSION,
-      spatialIndex,
-    );
-  const acceptedTextures =
-    renderer._lodIndexTexturesByDimension.get(DIMENSION);
-  const owner =
-    renderer._lodResourceOwnersByDimension.get(DIMENSION);
-
-  assert.ok(owner);
-  assert.strictEqual(owner.spatialIndex, spatialIndex);
-  assert.equal(owner.maximumIndices, null);
-  assert.equal(owner.pointCount, 3);
-  assert.equal(
-    owner.liveGeometryGeneration,
-    renderer._liveGeometryGeneration,
-  );
-  assert.ok(Object.isFrozen(owner.generationToken));
-  assert.equal(owner.compactBuffer, null);
-  assert.equal(owner.compactVao, null);
-  assert.equal(owner.compactByteLength, 0);
-  assert.equal(owner.topologyOwner.originalIndexBuffer, null);
-  assert.equal(owner.topologyOwner.originalIndexByteLength, 0);
-  assert.equal(owner.topologyOwner.indexTexture, null);
-  assert.equal(owner.topologyOwner.indexTextureByteLength, 0);
-  assert.equal(owner.topologyOwner.textureWidth, 0);
-  assert.equal(owner.topologyOwner.textureHeight, 0);
-  assert.equal(owner.gpuByteLength, 0);
-  assert.equal(acceptedMetadata.length, 1);
-  assert.strictEqual(
-    acceptedMetadata[0].vao,
-    renderer.vao,
-  );
-  assert.strictEqual(
-    acceptedMetadata[0].buffer,
-    renderer.buffers.interleaved,
-  );
-  assert.equal(acceptedMetadata[0].isFullDetail, true);
-  assert.equal(acceptedMetadata[0].generationToken, null);
-  assert.deepEqual(acceptedTextures, [{
-    texture: null,
-    width: 0,
-    height: 0,
-    generationToken: null,
-  }]);
-  assert.deepEqual(
-    {
-      buffers: gl._state.creates.buffers.length,
-      textures: gl._state.creates.textures.length,
-      vertexArrays: gl._state.creates.vertexArrays.length,
-    },
-    createCounts,
-    'a zero-reduced-level generation owns no additional GL handles',
-  );
-
-  let rebuilds = 0;
-  renderer._createLODResourcesForDimension = () => {
-    rebuilds += 1;
-    throw new Error(
-      'a retained full-detail-only owner must not rebuild',
-    );
-  };
-  assert.strictEqual(
-    renderer._ensureLodResourcesForDimension(
-      DIMENSION,
-      spatialIndex,
-    ),
-    acceptedMetadata,
-  );
-  assert.strictEqual(
-    renderer._ensureLodResourcesForDimension(
-      DIMENSION,
-      spatialIndex,
-    ),
-    acceptedMetadata,
-  );
-  assert.equal(rebuilds, 0);
-  assert.strictEqual(
-    renderer._lodResourceOwnersByDimension.get(DIMENSION),
-    owner,
-  );
-  assert.strictEqual(
-    renderer.lodBuffersByDimension.get(DIMENSION),
-    acceptedMetadata,
-  );
-  assert.strictEqual(
-    renderer._lodIndexTexturesByDimension.get(DIMENSION),
-    acceptedTextures,
-  );
-});
-
-test('internal certified LOD readiness is O(1) while external owners retain deep validation', () => {
-  const gl = createTrackingGl();
-  const positions = makePositions(4);
-  const colors = makeColors(4);
-  const renderer = createRendererState(gl, positions, colors);
-  const spatialIndex = makeSpatialOwner(
-    positions,
-    Uint32Array.from([2, 0]),
-  );
-  renderer.spatialIndices.set(DIMENSION, spatialIndex);
-  const acceptedMetadata =
-    renderer._createLODResourcesForDimension(
-      DIMENSION,
-      spatialIndex,
-    );
-
-  const originalDeepEnsure =
-    renderer._ensureLodResourcesForDimension;
-  let deepValidations = 0;
-  renderer._ensureLodResourcesForDimension = function (...args) {
-    deepValidations += 1;
-    return originalDeepEnsure.apply(this, args);
-  };
-  assert.strictEqual(
-    renderer._getCertifiedLodResourcesForDimension(
-      DIMENSION,
-      spatialIndex,
-    ),
-    acceptedMetadata,
-  );
-  assert.strictEqual(
-    renderer._getCertifiedLodResourcesForDimension(
-      DIMENSION,
-      spatialIndex,
-    ),
-    acceptedMetadata,
-  );
-  assert.equal(
-    deepValidations,
-    0,
-    'an accepted renderer-owned generation must not scan its levels again',
-  );
-
-  const externalOwner = {
-    dimensionLevel: DIMENSION,
-    spatialIndex,
-  };
-  renderer._lodResourceOwnersByDimension.set(
-    DIMENSION,
-    externalOwner,
-  );
-  const replacement = Object.freeze([{ id: 'replacement' }]);
-  renderer._ensureLodResourcesForDimension = (
-    dimensionLevel,
-    exactSpatialIndex,
-  ) => {
-    assert.equal(dimensionLevel, DIMENSION);
-    assert.strictEqual(exactSpatialIndex, spatialIndex);
-    deepValidations += 1;
-    return replacement;
-  };
-  assert.strictEqual(
-    renderer._getCertifiedLodResourcesForDimension(
-      DIMENSION,
-      spatialIndex,
-    ),
-    replacement,
-  );
-  assert.equal(
-    deepValidations,
-    1,
-    'an external or malformed owner must route through deep validation',
-  );
-});
-
-test('alpha and R32UI packing consume runtime texture width beyond 4096', () => {
+test('alpha and draw-order R32UI linear textures use the runtime width beyond 4096', () => {
   const pointCount = 4097;
   const gl = createTrackingGl(8192);
-  const positions = makePositions(pointCount);
-  const colors = makeColors(pointCount);
 
   const alphaRenderer = Object.assign(
     Object.create(HighPerfRenderer.prototype),
@@ -1277,57 +730,53 @@ test('alpha and R32UI packing consume runtime texture width beyond 4096', () => 
   );
   alphaRenderer._createAlphaTexture(pointCount);
 
-  const lodRenderer = createRendererState(
+  const orderRenderer = createRendererState(
     gl,
-    positions,
-    colors,
+    makePositions(pointCount),
+    makeColors(pointCount),
   );
-  const maximumIndices = Uint32Array.from(
+  const indices = Uint32Array.from(
     { length: pointCount },
-    (_value, index) => index,
+    (_value, index) => pointCount - 1 - index,
   );
-  const spatialIndex = makeSpatialOwner(
-    positions,
-    maximumIndices,
-  );
-  lodRenderer.spatialIndices.set(DIMENSION, spatialIndex);
-  lodRenderer._createLODResourcesForDimension(
-    DIMENSION,
-    spatialIndex,
+  const record = orderRenderer._createDrawOrderRecord(
+    Object.freeze({ indices, pointCount }),
+    'test draw order',
   );
 
   const alphaUpload = gl._state.uploads.find(
-    upload => (
-      upload.kind === 'texture' &&
-      upload.internalFormat === gl.R8
-    ),
+    upload => upload.kind === 'texture' && upload.internalFormat === gl.R8,
   );
   const indexUpload = gl._state.uploads.find(
-    upload => (
-      upload.kind === 'texture' &&
-      upload.internalFormat === gl.R32UI
-    ),
+    upload => upload.kind === 'texture' && upload.internalFormat === gl.R32UI,
   );
-  const topologyOwner =
-    lodRenderer._lodResourceOwnersByDimension
-      .get(DIMENSION)
-      .topologyOwner;
+  const indexRows = gl._state.uploads.filter(
+    upload => upload.kind === 'texture-subimage' && upload.texture === record.texture,
+  );
 
+  // One row exactly as wide as the points (addressed with a 2^13 shift), in
+  // one layer: the first upload covers the whole image.
   assert.equal(alphaRenderer._alphaTexWidth, pointCount);
   assert.equal(alphaRenderer._alphaTexHeight, 1);
-  assert.equal(alphaUpload.width, pointCount);
-  assert.equal(alphaUpload.height, 1);
-  assert.equal(indexUpload.width, pointCount);
-  assert.equal(indexUpload.height, 1);
-  assert.equal(topologyOwner.textureWidth, pointCount);
-  assert.equal(topologyOwner.textureHeight, 1);
+  assert.deepEqual([alphaUpload.width, alphaUpload.height, alphaUpload.depth], [pointCount, 1, 1]);
+  assert.deepEqual([indexUpload.width, indexUpload.height, indexUpload.depth], [pointCount, 1, 1]);
+  assert.equal(record.plan.width, pointCount);
+  assert.equal(record.plan.widthShift, 13);
+  assert.equal(record.plan.layers, 1);
+  assert.equal(record.byteLength, pointCount * 4);
+  // Rows stream straight from the order: no padded host duplicate.
+  assert.equal(indexRows.length, 1);
+  assert.equal(indexRows[0].width, pointCount);
+  assert.deepEqual(indexRows[0].data, indices);
 });
 
 test('invalid texture capabilities reject before allocation and preserve exact accepted publications', () => {
-  for (const invalidCapability of [0, -1, 8192.5, Number.NaN]) {
-    const gl = createTrackingGl(invalidCapability);
-    const acceptedAlphaTexture =
-      gl._adoptTexture(`accepted-alpha-${String(invalidCapability)}`);
+  for (const [invalidSize, invalidLayers] of [
+    [0, 256], [-1, 256], [8192.5, 256], [Number.NaN, 256], [8192, 0], [8192, Number.NaN],
+  ]) {
+    const gl = createTrackingGl(invalidSize, invalidLayers);
+    const label = `${String(invalidSize)}/${String(invalidLayers)}`;
+    const acceptedAlphaTexture = gl._adoptTexture(`accepted-alpha-${label}`);
     const acceptedAlphaData = Uint8Array.from([255, 127]);
     const alphaRenderer = Object.assign(
       Object.create(HighPerfRenderer.prototype),
@@ -1343,83 +792,72 @@ test('invalid texture capabilities reject before allocation and preserve exact a
 
     assert.throws(
       () => alphaRenderer._createAlphaTexture(3),
-      /invalid MAX_TEXTURE_SIZE capability/,
+      /needs a positive MAX_(TEXTURE_SIZE|ARRAY_TEXTURE_LAYERS)/,
     );
-    assert.strictEqual(
-      alphaRenderer._alphaTexture,
-      acceptedAlphaTexture,
-    );
-    assert.strictEqual(
-      alphaRenderer._alphaTexData,
-      acceptedAlphaData,
-    );
+    assert.strictEqual(alphaRenderer._alphaTexture, acceptedAlphaTexture);
+    assert.strictEqual(alphaRenderer._alphaTexData, acceptedAlphaData);
     assert.equal(alphaRenderer._alphaTexWidth, 2);
     assert.equal(alphaRenderer._alphaTexHeight, 1);
     assert.equal(gl._state.creates.textures.length, 0);
     assert.equal(gl._state.deletes.textures.length, 0);
 
-    const positions = makePositions(3);
-    const colors = makeColors(3);
-    const lodRenderer = createRendererState(
-      gl,
-      positions,
-      colors,
-    );
-    const spatialIndex = makeSpatialOwner(
-      positions,
-      Uint32Array.from([0, 1, 2]),
-    );
-    const acceptedOwner = Object.freeze({
-      id: `accepted-owner-${String(invalidCapability)}`,
-    });
-    const acceptedBuffers = Object.freeze([
-      Object.freeze({ id: 'accepted-buffer-view' }),
-    ]);
-    const acceptedTextures = Object.freeze([
-      Object.freeze({ id: 'accepted-texture-view' }),
-    ]);
-    const acceptedOwnersMap = new Map([
-      [DIMENSION, acceptedOwner],
-    ]);
-    const acceptedBuffersMap = new Map([
-      [DIMENSION, acceptedBuffers],
-    ]);
-    const acceptedTexturesMap = new Map([
-      [DIMENSION, acceptedTextures],
-    ]);
-    lodRenderer._lodResourceOwnersByDimension =
-      acceptedOwnersMap;
-    lodRenderer.lodBuffersByDimension = acceptedBuffersMap;
-    lodRenderer._lodIndexTexturesByDimension =
-      acceptedTexturesMap;
-
+    const orderRenderer = createRendererState(gl, makePositions(3), makeColors(3));
+    const acceptedOrder = Object.freeze({ id: `accepted-order-${label}` });
+    orderRenderer._liveOrder = acceptedOrder;
     assert.throws(
-      () => lodRenderer._createLODResourcesForDimension(
-        DIMENSION,
-        spatialIndex,
+      () => orderRenderer._createDrawOrderRecord(
+        Object.freeze({ indices: Uint32Array.from([2, 0, 1]), pointCount: 3 }),
+        'test draw order',
       ),
-      /invalid MAX_TEXTURE_SIZE capability/,
+      /needs a positive MAX_(TEXTURE_SIZE|ARRAY_TEXTURE_LAYERS)/,
     );
-    assert.strictEqual(
-      lodRenderer._lodResourceOwnersByDimension,
-      acceptedOwnersMap,
-    );
-    assert.strictEqual(
-      lodRenderer.lodBuffersByDimension,
-      acceptedBuffersMap,
-    );
-    assert.strictEqual(
-      lodRenderer._lodIndexTexturesByDimension,
-      acceptedTexturesMap,
-    );
+    assert.strictEqual(orderRenderer._liveOrder, acceptedOrder);
     assert.equal(gl._state.creates.buffers.length, 0);
     assert.equal(gl._state.creates.vertexArrays.length, 0);
     assert.equal(gl._state.creates.textures.length, 0);
   }
 });
 
-test('texture-capacity failures preserve accepted alpha and R32UI publications', () => {
-  const gl = createTrackingGl(4);
+test('per-point textures hold more than MAX_TEXTURE_SIZE^2 points in layers', () => {
+  // A 4x4 texture holds 16 texels; 17 points take a second layer instead of
+  // being refused (Firefox reports 8192: 67.1M texels a layer).
+  const gl = createTrackingGl(4, 256);
+  const alphaRenderer = Object.assign(
+    Object.create(HighPerfRenderer.prototype),
+    {
+      _alphaTexData: null,
+      _alphaTexHeight: 0,
+      _alphaTexWidth: 0,
+      _alphaTexture: null,
+      _useAlphaTexture: false,
+      gl,
+    },
+  );
+  alphaRenderer._createAlphaTexture(17);
+  assert.equal(alphaRenderer._alphaTexPlan.layers, 2);
+  assert.equal(alphaRenderer._alphaTexPlan.rowsPerLayer, 3);
+  const orderRenderer = createRendererState(gl, makePositions(17), makeColors(17));
+  const indices = Uint32Array.from({ length: 17 }, (_value, index) => 16 - index);
+  const record = orderRenderer._createDrawOrderRecord(
+    Object.freeze({ indices, pointCount: 17 }),
+    'test draw order',
+  );
+  assert.equal(record.plan.layers, 2);
+  // Every index lands in its texel: the rows written cover the order exactly.
+  const rows = gl._state.uploads.filter(
+    upload => upload.kind === 'texture-subimage' && upload.texture === record.texture,
+  );
+  const written = new Uint32Array(17);
+  for (const row of rows) {
+    const first = (row.zOffset * 3 + row.yOffset) * 4 + row.xOffset;
+    written.set(row.data, first);
+  }
+  assert.deepEqual(written, indices);
+});
+
+test('texture-capacity failures preserve accepted alpha and draw-order publications', () => {
+  // 17 points need 2 layers of a 4x4 texture; this GPU allows 1.
+  const gl = createTrackingGl(4, 1);
   const acceptedAlphaTexture =
     gl._adoptTexture('accepted-alpha');
   const acceptedAlphaData = Uint8Array.from([255, 127, 63, 31]);
@@ -1437,7 +875,7 @@ test('texture-capacity failures preserve accepted alpha and R32UI publications',
 
   assert.throws(
     () => alphaRenderer._createAlphaTexture(17),
-    /exact 4x4 texture capacity/,
+    /17 items need 2 texture layers; this GPU allows 1/,
   );
   assert.strictEqual(
     alphaRenderer._alphaTexture,
@@ -1456,36 +894,9 @@ test('texture-capacity failures preserve accepted alpha and R32UI publications',
   );
   assert.equal(gl._state.deletes.textures.length, 0);
 
-  const positions = makePositions(17);
-  const colors = makeColors(17);
-  const lodRenderer = createRendererState(gl, positions, colors);
-  const spatialIndex = makeSpatialOwner(
-    positions,
-    Uint32Array.from(
-      { length: 17 },
-      (_value, index) => index,
-    ),
-  );
-  const acceptedOwner = Object.freeze({ id: 'accepted-owner' });
-  const acceptedBuffers = Object.freeze([
-    Object.freeze({ id: 'accepted-buffer-view' }),
-  ]);
-  const acceptedTextures = Object.freeze([
-    Object.freeze({ id: 'accepted-texture-view' }),
-  ]);
-  const acceptedOwnersMap = new Map([
-    [DIMENSION, acceptedOwner],
-  ]);
-  const acceptedBuffersMap = new Map([
-    [DIMENSION, acceptedBuffers],
-  ]);
-  const acceptedTexturesMap = new Map([
-    [DIMENSION, acceptedTextures],
-  ]);
-  lodRenderer._lodResourceOwnersByDimension = acceptedOwnersMap;
-  lodRenderer.lodBuffersByDimension = acceptedBuffersMap;
-  lodRenderer._lodIndexTexturesByDimension =
-    acceptedTexturesMap;
+  const orderRenderer = createRendererState(gl, makePositions(17), makeColors(17));
+  const acceptedOrder = Object.freeze({ id: 'accepted-order' });
+  orderRenderer._liveOrder = acceptedOrder;
   const createCounts = {
     buffers: gl._state.creates.buffers.length,
     textures: gl._state.creates.textures.length,
@@ -1493,24 +904,16 @@ test('texture-capacity failures preserve accepted alpha and R32UI publications',
   };
 
   assert.throws(
-    () => lodRenderer._createLODResourcesForDimension(
-      DIMENSION,
-      spatialIndex,
+    () => orderRenderer._createDrawOrderRecord(
+      Object.freeze({
+        indices: Uint32Array.from({ length: 17 }, (_value, index) => index),
+        pointCount: 17,
+      }),
+      'test draw order',
     ),
-    /exact 4x4 R32UI texture capacity/,
+    /17 items need 2 texture layers; this GPU allows 1/,
   );
-  assert.strictEqual(
-    lodRenderer._lodResourceOwnersByDimension,
-    acceptedOwnersMap,
-  );
-  assert.strictEqual(
-    lodRenderer.lodBuffersByDimension,
-    acceptedBuffersMap,
-  );
-  assert.strictEqual(
-    lodRenderer._lodIndexTexturesByDimension,
-    acceptedTexturesMap,
-  );
+  assert.strictEqual(orderRenderer._liveOrder, acceptedOrder);
   assert.deepEqual(
     {
       buffers: gl._state.creates.buffers.length,

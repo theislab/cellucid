@@ -31,6 +31,9 @@ export function normalizeStartupError(thrown) {
   return error;
 }
 
+export const STARTUP_TROUBLESHOOTING_URL =
+  'https://docs.cellucid.com/en/latest/user_guide/web_app/b_data_loading/08_troubleshooting_data_loading.html';
+
 function requireStartupFailureOptions(options) {
   if (
     options === null ||
@@ -62,6 +65,17 @@ function requireStartupFailureOptions(options) {
   ) {
     throw new TypeError(
       'Startup failure publication requires the current document body.'
+    );
+  }
+  const location = documentOwner.location;
+  if (
+    location === null ||
+    typeof location !== 'object' ||
+    typeof location.pathname !== 'string' ||
+    typeof location.search !== 'string'
+  ) {
+    throw new TypeError(
+      'Startup failure publication requires the current document location.'
     );
   }
   if (
@@ -166,7 +180,36 @@ export function publishStartupFailure(options) {
     color: '#4b5968'
   });
 
-  card.append(title, message, action);
+  // A failure is never a dead end. A link that carried launch settings (a
+  // dataset, a repository, a server) can be dropped to open the app as it
+  // starts by default, and the troubleshooting guide covers each failure.
+  const links = documentOwner.createElement('p');
+  applyStyles(links, {
+    margin: '16px 0 0',
+    display: 'flex',
+    flexWrap: 'wrap',
+    gap: '8px 20px',
+    fontSize: '14px',
+    lineHeight: '1.45'
+  });
+  const exits = [];
+  if (documentOwner.location.search !== '') {
+    exits.push([documentOwner.location.pathname, 'Open Cellucid without this link\u2019s settings']);
+  }
+  exits.push([STARTUP_TROUBLESHOOTING_URL, 'Troubleshooting data loading']);
+  for (const [href, label] of exits) {
+    const link = documentOwner.createElement('a');
+    link.setAttribute('href', href);
+    link.textContent = label;
+    applyStyles(link, {
+      color: '#18212b',
+      textDecoration: 'underline',
+      textUnderlineOffset: '2px'
+    });
+    links.append(link);
+  }
+
+  card.append(title, message, action, links);
   surface.appendChild(card);
   documentOwner.body.appendChild(surface);
   // Retracting onboarding takes focus off a control that no longer exists, so

@@ -760,7 +760,7 @@ export function initFieldSelector(options) {
     let releaseTransient = () => {};
     const closeDialog = showConfirmDialog({
       title: 'Delete field',
-      message: `Delete "${field.key}"? You can restore it from Deleted Fields.`,
+      message: `Delete "${field.key}"? You can restore it from Deleted fields.`,
       confirmText: 'Delete',
       onConfirm: () => {
         releaseTransient();
@@ -1177,6 +1177,7 @@ export function initFieldSelector(options) {
         ? `Disable annotation voting for "${field.key}"? (Votes remain in local storage.)`
         : `Enable annotation voting for "${field.key}"? You will see 🗳️ next to the field name and can click category labels to vote in a popup.`,
       confirmText: enabled ? 'Disable' : 'Enable',
+      tone: 'primary',
       onConfirm: () => {
         releaseTransient();
         if (
@@ -1446,7 +1447,15 @@ export function initFieldSelector(options) {
       if (destroyed) return;
       forceDisableFieldSelects = false;
       geneSelector.updateGeneActionButtons(false);
-      syncFromState();
+      // A restore replaces the field inventory without a field event (a
+      // user-defined field it brings back is new to the page), so the
+      // selectors are rebuilt from the restored inventory before the active
+      // field is synced into them. A capture changes no field.
+      if (retireCurrent) {
+        renderFieldSelects();
+      } else {
+        syncFromState();
+      }
       updateFieldSelectDisabledStates();
     };
     try {

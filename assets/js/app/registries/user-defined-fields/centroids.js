@@ -10,6 +10,7 @@
 import {
   categoricalStorageForCodes
 } from '../../../data/categorical-storage-contract.js';
+import { isCategoricalCodes } from '../../../data/categorical-storage-contract.js';
 
 function requireCategoryInventory(categories) {
   if (!Array.isArray(categories) || categories.length === 0) {
@@ -36,20 +37,31 @@ function requireCategoryInventory(categories) {
 }
 
 /**
- * Compute per-dimension centroids for all available dimensions (up to 3D).
+ * Compute centroids for every registered layout whose normalized positions are
+ * resident, keyed by layout.
  *
- * The returned structure matches the registry's serialized format:
- * `{ "1": [...], "2": [...], "3": [...] }` where each entry is an array of
- * `{ category, position, n_points }`.
+ * The positions are the ones the viewer draws, so every centroid is born in
+ * normalized space and its layout is recorded in `normalizedLayouts`; nothing
+ * downstream normalizes it again. Normalization is affine per axis
+ * (`(p - center) * scale`), so the mean of normalized positions is the
+ * normalized mean of the raw positions, up to Float32 rounding of the stored
+ * coordinates. A layout that is not resident has no centroids yet; they are
+ * computed from its positions when a view switches to it.
+ *
+ * Each entry is an array of `{ category, position, n_points }` with the
+ * layout's dimension of coordinates.
  *
  * @param {Uint8Array|Uint16Array} codes
  * @param {(string|number|boolean)[]} categories
- * @param {object} state - DataState (needs `dimensionManager`, `positionsArray`, `activeDimensionLevel`)
- * @returns {Record<string, Array<{category: string|number|boolean, position: number[], n_points: number}>>}
+ * @param {object} state - DataState (needs `dimensionManager` and `pointCount`)
+ * @returns {{
+ *   centroidsByLayout: Map<string, Array<{category: string|number|boolean, position: number[], n_points: number}>>,
+ *   normalizedLayouts: Set<string>
+ * }}
  */
-export function computeAllDimensionCentroids(codes, categories, state) {
-  if (!(codes instanceof Uint8Array) && !(codes instanceof Uint16Array)) {
-    throw new TypeError('Centroid category codes must be Uint8Array or Uint16Array');
+export function computeAllLayoutCentroids(codes, categories, state) {
+  if (!isCategoricalCodes(codes)) {
+    throw new TypeError('Centroid category codes must be Uint8Array, Uint16Array or Uint32Array');
   }
   requireCategoryInventory(categories);
   const { missingValue: missingCode } = categoricalStorageForCodes(
@@ -73,44 +85,41 @@ export function computeAllDimensionCentroids(codes, categories, state) {
   const dimensionManager = state.dimensionManager;
   if (
     !dimensionManager
-    || typeof dimensionManager.getAvailableDimensions !== 'function'
-    || !(dimensionManager.positionCache instanceof Map)
+    || typeof dimensionManager.getRegisteredLayouts !== 'function'
+    || typeof dimensionManager.getResidentPositions !== 'function'
   ) {
     throw new TypeError('Centroid computation requires the current DimensionManager');
   }
-  const availableDims = dimensionManager.getAvailableDimensions();
-  if (!Array.isArray(availableDims) || availableDims.length === 0) {
-    throw new TypeError('Centroid computation requires available dimensions');
-  }
-  const seenDimensions = new Set();
-  for (const dim of availableDims) {
-    if (!Number.isSafeInteger(dim) || dim < 1 || dim > 3 || seenDimensions.has(dim)) {
-      throw new TypeError('Available centroid dimensions must be unique integers from 1 through 3');
-    }
-    seenDimensions.add(dim);
+
+  // Every representation whose positions are resident now gets its centroids
+  // eagerly; any other is computed when a view first shows it
+  // (field/overlay-internals.js).
+  const centroidsByLayout = new Map();
+  const normalizedLayouts = new Set();
+  for (const { layoutKey, dimension: dim } of dimensionManager.getRegisteredLayouts()) {
+    const positions = dimensionManager.getResidentPositions(layoutKey);
+    if (positions === null) continue;
+    centroidsByLayout.set(
+      layoutKey,
+      computeCentroidsForDimension(codes, categories, positions, dim)
+    );
+    normalizedLayouts.add(layoutKey);
   }
 
-  const centroidsByDim = {};
-  for (const dim of availableDims) {
-    if (!dimensionManager.positionCache.has(dim)) continue;
-    const positions = dimensionManager.positionCache.get(dim);
-    centroidsByDim[String(dim)] = computeCentroidsForDimension(codes, categories, positions, dim);
-  }
-
-  return centroidsByDim;
+  return { centroidsByLayout, normalizedLayouts };
 }
 
 /**
  * Compute centroid objects for a single dimension.
  * @param {Uint8Array|Uint16Array} codes
  * @param {(string|number|boolean)[]} categories
- * @param {Float32Array} positions - raw positions with stride = dim (unless overridden)
+ * @param {Float32Array} positions - one layout's normalized positions, stride = dim
  * @param {number} dim
  * @returns {Array<{category: string|number|boolean, position: number[], n_points: number}>}
  */
 export function computeCentroidsForDimension(codes, categories, positions, dim) {
-  if (!(codes instanceof Uint8Array) && !(codes instanceof Uint16Array)) {
-    throw new TypeError('Centroid category codes must be Uint8Array or Uint16Array');
+  if (!isCategoricalCodes(codes)) {
+    throw new TypeError('Centroid category codes must be Uint8Array, Uint16Array or Uint32Array');
   }
   requireCategoryInventory(categories);
   if (!Number.isSafeInteger(dim) || dim < 1 || dim > 3) {

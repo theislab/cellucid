@@ -10,12 +10,6 @@
  */
 
 const REQUIRED_RENDERER_METHODS = Object.freeze([
-  'getAlphaTexture',
-  'getAlphaTextureWidth',
-  'isAlphaTextureActive',
-  'getAlphaTextureForView',
-  'getAlphaTextureWidthForView',
-  'isAlphaTextureActiveForView',
   'getFogNear',
   'getFogFar',
   'getCurrentLODLevel',
@@ -49,6 +43,8 @@ const VECTOR3_RENDER_PARAM_KEYS = Object.freeze([
  * @property {number} deltaTime
  * @property {boolean} isSnapshot
  * @property {number} dimensionLevel
+ * @property {string|null} layoutKey - Identity of the embedding the view's
+ *   positions belong to; null while the view shows no dataset.
  * @property {number} devicePixelRatio
  * @property {Float32Array} mvpMatrix
  * @property {Float32Array} viewMatrix
@@ -68,11 +64,9 @@ const VECTOR3_RENDER_PARAM_KEYS = Object.freeze([
  * @property {number} fogFar
  * @property {number[]} cameraPosition
  * @property {number} cameraDistance
- * @property {WebGLTexture|null} alphaTexture
- * @property {number} alphaTexWidth
- * @property {boolean} useAlphaTexture
- * @property {() => Float32Array|null} getViewPositions
- * @property {() => Float32Array|null} getViewTransparency
+ * @property {() => Float32Array|null} getViewPositions - The view's
+ *   positions, `dimensionLevel` components per cell (no padded axis).
+ * @property {() => Uint8Array|null} getViewTransparency
  * @property {() => number} getLodLevel
  * @property {() => Uint32Array|null} getLodIndices
  */
@@ -92,14 +86,16 @@ const VECTOR3_RENDER_PARAM_KEYS = Object.freeze([
  * @param {number} options.deltaTimeSeconds
  * @param {boolean} options.isSnapshot
  * @param {number} options.dimensionLevel
+ * @param {string|null} options.layoutKey
  * @param {number} options.devicePixelRatio
  * @param {number} options.viewportX
  * @param {number} options.viewportY
  * @param {boolean} options.scissorEnabled
  * @param {WebGLFramebuffer|null} options.outputFramebuffer
  * @param {object} options.hpRenderer
- * @param {() => Float32Array|null} options.getViewPositions
- * @param {() => Float32Array|null} options.getViewTransparency
+ * @param {() => Float32Array|null} options.getViewPositions - `dimensionLevel`
+ *   components per cell
+ * @param {() => Uint8Array|null} options.getViewTransparency
  * @param {OverlayContext|object} options.target - Stable output object owned by this view
  * @returns {OverlayContext}
  */
@@ -116,6 +112,7 @@ export function buildOverlayContext(options) {
     deltaTimeSeconds,
     isSnapshot,
     dimensionLevel,
+    layoutKey,
     devicePixelRatio,
     viewportX,
     viewportY,
@@ -130,6 +127,14 @@ export function buildOverlayContext(options) {
   if (!Number.isInteger(dimensionLevel) || dimensionLevel < 1 || dimensionLevel > 3) {
     throw new RangeError(
       `Overlay context dimensionLevel is required and must be exactly 1, 2, or 3; received ${String(dimensionLevel)}.`
+    );
+  }
+  if (
+    layoutKey !== null &&
+    (typeof layoutKey !== 'string' || layoutKey.length === 0)
+  ) {
+    throw new TypeError(
+      'Overlay context layoutKey must be a non-empty string or exact null.'
     );
   }
   if (typeof viewId !== 'string' || viewId.length === 0) {
@@ -238,6 +243,7 @@ export function buildOverlayContext(options) {
   ctx.deltaTime = deltaTimeSeconds;
   ctx.isSnapshot = isSnapshot;
   ctx.dimensionLevel = dimensionLevel;
+  ctx.layoutKey = layoutKey;
   ctx.devicePixelRatio = devicePixelRatio;
   ctx.viewportX = viewportX;
   ctx.viewportY = viewportY;
@@ -260,40 +266,6 @@ export function buildOverlayContext(options) {
   ctx.cameraPosition = renderParams.cameraPosition;
   ctx.cameraDistance = renderParams.cameraDistance;
 
-  // Snapshot points normally draw from their immutable per-view R8 owner.
-  // renderParams.useAlphaTexture is the explicit live-state override that asks a
-  // snapshot to follow the current live alpha publication instead.
-  const useLiveAlphaOwner =
-    !isSnapshot || renderParams.useAlphaTexture;
-  const alphaTexture = useLiveAlphaOwner
-    ? hpRenderer.getAlphaTexture()
-    : hpRenderer.getAlphaTextureForView(viewId);
-  const alphaTexWidth = useLiveAlphaOwner
-    ? hpRenderer.getAlphaTextureWidth()
-    : hpRenderer.getAlphaTextureWidthForView(viewId);
-  const alphaActive = useLiveAlphaOwner
-    ? hpRenderer.isAlphaTextureActive()
-    : hpRenderer.isAlphaTextureActiveForView(viewId);
-  if (typeof alphaActive !== 'boolean') {
-    throw new TypeError('Overlay context alpha-texture activity must be a boolean.');
-  }
-  if (!Number.isInteger(alphaTexWidth) || alphaTexWidth < 0) {
-    throw new RangeError(
-      'Overlay context alpha texture width must be a non-negative integer.'
-    );
-  }
-  if (
-    (isSnapshot || renderParams.useAlphaTexture) &&
-    (!alphaActive || !alphaTexture || alphaTexWidth === 0)
-  ) {
-    throw new Error(
-      `Overlay context for view "${viewId}" requires the published alpha texture.`
-    );
-  }
-  ctx.useAlphaTexture = alphaActive;
-  ctx.alphaTexture = alphaTexture;
-  ctx.alphaTexWidth = alphaTexWidth;
-
   ctx.fogNear = hpRenderer.getFogNear();
   ctx.fogFar = hpRenderer.getFogFar();
   if (!Number.isFinite(ctx.fogNear) || !Number.isFinite(ctx.fogFar)) {
@@ -310,8 +282,10 @@ export function buildOverlayContext(options) {
   // that wants "how coarse is this" has to measure from the top. Publishing the
   // count is what lets it do that without hardcoding the ladder length.
   if (typeof ctx.getLodLevelCount !== 'function') {
+    // The ladder of the tree this view draws with, which for a view of
+    // another representation is its own, not the live view's.
     ctx.getLodLevelCount = () => (
-      ctx._hpRenderer.getLODLevelCount(ctx.dimensionLevel)
+      ctx._hpRenderer.getViewLODLevelCount(ctx.viewId, ctx.dimensionLevel)
     );
   }
   if (typeof ctx.getLodIndices !== 'function') {

@@ -20,14 +20,13 @@
  * drawn at the ends of a narrow box actually clear each other.
  */
 import { expect, test } from './helpers/test.mjs';
-import { appUrl } from './helpers/origins.mjs';
+import { openPlotHarness } from './helpers/plot-harness.mjs';
 
-const HARNESS_URL = appUrl('/tests/browser/fixtures/analysis-plot-harness.html');
 
 /** The accordion preview: `--analysis-panel-width` less its padding. */
 const SIDEBAR = Object.freeze({ width: 224, height: 180 });
 
-// exports/pancreas/obs_manifest.json, field `cell_type`, in descending count
+// cellucid-datasets exports-v3/pancreas/obs_manifest.json, field `cell_type`, in descending count
 // order so `PlotFactory.getSortedCategories(pageData, 'count')` reproduces it.
 const PANCREAS_CELL_TYPES = Object.freeze([
   'Ductal', 'Ngn3 high EP', 'Pre-endocrine', 'Beta',
@@ -121,7 +120,7 @@ async function measureCategoricalTicks(page, { values, width, height }) {
 
 test.describe('categorical tick anchoring', () => {
   test.beforeEach(async ({ page }) => {
-    await page.goto(HARNESS_URL, { waitUntil: 'domcontentloaded' });
+    await openPlotHarness(page);
   });
 
   test('eight upright cell types keep both ends of the sidebar axis', async ({ page }) => {

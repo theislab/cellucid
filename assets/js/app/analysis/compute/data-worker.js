@@ -2,10 +2,9 @@
  * Data Processing Web Worker
  *
  * Handles computationally intensive data operations off the main thread:
- * - Value extraction from large cell arrays
- * - Statistical computations
  * - Correlation analysis
- * - Data aggregation
+ * - Differential expression statistics
+ * - Marker gene statistics for the genes panel
  *
  * This prevents UI blocking when processing large single-cell datasets (100K+ cells)
  *
@@ -22,15 +21,24 @@
 // Import shared operation handlers and math utilities
 // These are ES modules that work in both main thread and worker context
 import { executeOperation } from './operation-handlers.js';
-import { OperationType } from './operations.js';
-import { mannWhitneyPValue, welchTTestFromMoments } from './math-utils.js';
+import {
+  DistinctValueIndex,
+  ascendingOrder,
+  LOG2_FOLD_CHANGE_PSEUDOCOUNT,
+  log2FoldChangeOfMeans,
+  mannWhitneyPValue,
+  welchTTestFromMoments
+} from './math-utils.js';
+import {
+  isCategoricalCodes,
+  missingCategoryCode
+} from '../../../data/categorical-storage-contract.js';
 
 // ============================================================================
 // Worker Pool State
 // ============================================================================
 
 let workerId = null;
-let poolSize = 1;
 
 // ============================================================================
 // Marker Genes Panel (Genes Panel) Worker State
@@ -42,7 +50,7 @@ let poolSize = 1;
  *
  * @type {{
  *   groupCount: number,
- *   cellGroupIndex: Int16Array|null,
+ *   cellGroupIndex: Int16Array|Int32Array|null,
  *   orderScratch: Uint32Array|null
  * }|null}
  */
@@ -58,17 +66,17 @@ function setMarkerContext(payload) {
   }
   const { codes, codeToGroupIndex, groupCount } = payload;
 
-  if (!(codes instanceof Uint16Array) || codes.length === 0) {
+  if (!isCategoricalCodes(codes) || codes.length === 0) {
     throw new TypeError(
-      'MARKERS_SET_CONTEXT: codes must be a non-empty Uint16Array'
+      'MARKERS_SET_CONTEXT: codes must be non-empty categorical codes'
     );
   }
   if (
-    !(codeToGroupIndex instanceof Int16Array) ||
+    !(codeToGroupIndex instanceof Int32Array) ||
     codeToGroupIndex.length === 0
   ) {
     throw new TypeError(
-      'MARKERS_SET_CONTEXT: codeToGroupIndex must be a non-empty Int16Array'
+      'MARKERS_SET_CONTEXT: codeToGroupIndex must be a non-empty Int32Array'
     );
   }
   if (!Number.isSafeInteger(groupCount) || groupCount <= 0) {
@@ -85,15 +93,19 @@ function setMarkerContext(payload) {
     }
   }
 
-  // Build per-cell group index lookup (-1 for invalid/missing).
+  // Build per-cell group index lookup (-1 for invalid/missing). It is two
+  // bytes per cell while the group indices fit, four past 32,767 groups.
   const nCells = codes.length;
-  const cellGroupIndex = new Int16Array(nCells);
+  const cellGroupIndex = groupCount <= 0x7fff
+    ? new Int16Array(nCells)
+    : new Int32Array(nCells);
   cellGroupIndex.fill(-1);
 
+  const missingCode = missingCategoryCode(codes);
   const mapLen = codeToGroupIndex.length;
   for (let i = 0; i < nCells; i++) {
     const code = codes[i];
-    if (code >= 0 && code < mapLen) {
+    if (code !== missingCode && code < mapLen) {
       const gi = codeToGroupIndex[code];
       cellGroupIndex[i] = gi;
     }
@@ -124,7 +136,7 @@ function computeGeneMarkers(payload) {
     values,
     method,
     minCells,
-    pseudocount = 0.01
+    pseudocount = LOG2_FOLD_CHANGE_PSEUDOCOUNT
   } = payload;
 
   if (!(values instanceof Float32Array)) {
@@ -167,15 +179,26 @@ function computeGeneMarkers(payload) {
   let runningMeanAll = 0;
   let runningM2All = 0;
   let exprAll = 0;
+  // Minimum over every measured cell: one-vs-rest compares all of them.
+  let minAll = Infinity;
 
   // Wilcoxon owns one exact rank representation. Quantized data normally has
   // low value cardinality, so exact per-value counts avoid a full cell sort.
-  // High-cardinality inputs use the same exact ranks through index sorting.
+  // High-cardinality inputs use the same exact ranks through a linear-time
+  // ascending order of the measured cells.
+  //
+  // The per-value counts are rows of one flat table indexed by the value's
+  // dense number from `DistinctValueIndex`, not a `Map` of per-value records:
+  // the lookup runs once per cell, and the `Map` lookup was most of this
+  // kernel's time on a 500,000-cell gene.
   const orderScratch = method === 'wilcox'
     ? markerContext.orderScratch
     : null;
-  const MAX_EXACT_COUNTED_VALUES = 4096;
-  let countsByValue = method === 'wilcox' ? new Map() : null;
+  let valueIndex = method === 'wilcox' ? new DistinctValueIndex() : null;
+  let rowCapacity = 256;
+  let countsByValue = valueIndex === null
+    ? null
+    : new Uint32Array(rowCapacity * groupCount);
   let validCount = 0;
 
   for (let i = 0; i < values.length; i++) {
@@ -186,6 +209,7 @@ function computeGeneMarkers(payload) {
     if (!Number.isFinite(v)) continue;
 
     nAll++;
+    if (v < minAll) minAll = v;
     const totalDelta = v - runningMeanAll;
     runningMeanAll += totalDelta / nAll;
     runningM2All += totalDelta * (v - runningMeanAll);
@@ -199,22 +223,20 @@ function computeGeneMarkers(payload) {
 
     if (orderScratch) {
       orderScratch[validCount++] = i;
-      if (countsByValue !== null) {
-        let entry = countsByValue.get(v);
-        if (entry === undefined) {
-          if (countsByValue.size >= MAX_EXACT_COUNTED_VALUES) {
-            countsByValue = null;
-          } else {
-            entry = {
-              total: 0,
-              byGroup: new Uint32Array(groupCount)
-            };
-            countsByValue.set(v, entry);
+      if (valueIndex !== null) {
+        const row = valueIndex.numberOf(v);
+        if (row === -1) {
+          // Past the tabulation bound: rank through the index sort instead.
+          valueIndex = null;
+          countsByValue = null;
+        } else {
+          if (row === rowCapacity) {
+            rowCapacity *= 2;
+            const grown = new Uint32Array(rowCapacity * groupCount);
+            grown.set(countsByValue);
+            countsByValue = grown;
           }
-        }
-        if (entry !== undefined) {
-          entry.total++;
-          entry.byGroup[gi]++;
+          countsByValue[row * groupCount + gi]++;
         }
       }
     }
@@ -281,7 +303,7 @@ function computeGeneMarkers(payload) {
     meanOutGroup[g] = Number.isFinite(meanB) ? meanB : NaN;
 
     log2FoldChange[g] = (Number.isFinite(meanA) && Number.isFinite(meanB))
-      ? Math.log2((meanA + pseudocount) / (meanB + pseudocount))
+      ? log2FoldChangeOfMeans(meanA, meanB, minAll, pseudocount)
       : NaN;
 
     percentInGroup[g] = nA > 0 ? (exprIn[g] / nA) * 100 : 0;
@@ -335,31 +357,41 @@ function computeGeneMarkers(payload) {
   const rankSum = new Float64Array(groupCount);
   let wilcoxTieTerm = 0;
 
-  if (countsByValue !== null) {
-    const sortedValues = [...countsByValue.keys()].sort((a, b) => a - b);
+  if (valueIndex !== null) {
+    const ascending = valueIndex.ascendingNumbers();
     let valuesBelow = 0;
-    for (const value of sortedValues) {
-      const entry = countsByValue.get(value);
-      const tieCount = entry.total;
+    for (let k = 0; k < ascending.length; k++) {
+      const rowStart = ascending[k] * groupCount;
+      let tieCount = 0;
+      for (let groupIndex = 0; groupIndex < groupCount; groupIndex++) {
+        tieCount += countsByValue[rowStart + groupIndex];
+      }
       if (tieCount > 1) {
         wilcoxTieTerm += tieCount ** 3 - tieCount;
       }
       const averageRank = valuesBelow + (tieCount + 1) / 2;
       for (let groupIndex = 0; groupIndex < groupCount; groupIndex++) {
         rankSum[groupIndex] +=
-          entry.byGroup[groupIndex] * averageRank;
+          countsByValue[rowStart + groupIndex] * averageRank;
       }
       valuesBelow += tieCount;
     }
   } else {
-    const order = markerContext.orderScratch.subarray(0, validCount);
-    order.sort((a, b) => values[a] - values[b]);
+    // Past the tabulation bound: order the measured cells by value in linear
+    // time. Rank blocks are found in ascending order exactly as an index sort
+    // left them, so the tie term is added in the same order; a block's ranks
+    // are exact half-integers, so rank sums do not depend on the order within
+    // a block.
+    const cells = markerContext.orderScratch.subarray(0, validCount);
+    const measured = new Float32Array(validCount);
+    for (let k = 0; k < validCount; k++) measured[k] = values[cells[k]];
+    const order = ascendingOrder(measured);
 
     let i = 0;
     while (i < validCount) {
       let j = i + 1;
-      const v = values[order[i]];
-      while (j < validCount && values[order[j]] === v) j++;
+      const v = measured[order[i]];
+      while (j < validCount && measured[order[j]] === v) j++;
 
       const tieCount = j - i;
       if (tieCount > 1) {
@@ -368,8 +400,7 @@ function computeGeneMarkers(payload) {
 
       const avgRank = (i + j + 1) / 2; // 1-based
       for (let k = i; k < j; k++) {
-        const idx = order[k];
-        const gi = cellGroupIndex[idx];
+        const gi = cellGroupIndex[cells[order[k]]];
         if (gi >= 0) rankSum[gi] += avgRank;
       }
 
@@ -412,6 +443,32 @@ function computeGeneMarkers(payload) {
 // Message Handler
 // ============================================================================
 
+/**
+ * The buffers of a result's typed arrays. Every result array is created for
+ * the one request it answers and kept by nothing here, so it is moved to the
+ * calling thread rather than copied.
+ *
+ * @param {Object} result
+ * @returns {ArrayBuffer[]}
+ */
+function resultBuffers(result) {
+  const buffers = [];
+  const collect = (value, depth) => {
+    if (ArrayBuffer.isView(value)) {
+      if (value.buffer instanceof ArrayBuffer && !buffers.includes(value.buffer)) {
+        buffers.push(value.buffer);
+      }
+      return;
+    }
+    if (depth === 0 || value === null || typeof value !== 'object') return;
+    for (const item of Array.isArray(value) ? value : Object.values(value)) {
+      collect(item, depth - 1);
+    }
+  };
+  collect(result, 3);
+  return buffers;
+}
+
 self.onmessage = function(e) {
   const { type, payload, requestId } = e.data;
 
@@ -421,27 +478,12 @@ self.onmessage = function(e) {
       payload === null ||
       typeof payload !== 'object' ||
       !Number.isSafeInteger(payload.id) ||
-      payload.id < 0 ||
-      !Number.isSafeInteger(payload.poolSize) ||
-      payload.poolSize <= 0
+      payload.id < 0
     ) {
-      throw new TypeError(
-        'DataWorker INIT requires exact non-negative id and positive poolSize'
-      );
+      throw new TypeError('DataWorker INIT requires an exact non-negative id');
     }
     workerId = payload.id;
-    poolSize = payload.poolSize;
     self.postMessage({ type: 'INIT_ACK', workerId });
-    return;
-  }
-
-  // Handle GET_WORKER_INFO special case
-  if (type === 'GET_WORKER_INFO') {
-    self.postMessage({
-      requestId,
-      success: true,
-      result: { workerId, poolSize }
-    });
     return;
   }
 
@@ -455,14 +497,14 @@ self.onmessage = function(e) {
 
     if (type === 'MARKERS_COMPUTE_GENE') {
       const result = computeGeneMarkers(payload);
-      self.postMessage({ requestId, success: true, result });
+      self.postMessage({ requestId, success: true, result }, resultBuffers(result));
       return;
     }
 
     // Use the shared operation handler
     const result = executeOperation(type, payload);
 
-    self.postMessage({ requestId, success: true, result });
+    self.postMessage({ requestId, success: true, result }, resultBuffers(result));
 
   } catch (error) {
     self.postMessage({
@@ -480,10 +522,3 @@ self.onmessage = function(e) {
 self.onerror = function(error) {
   console.error('[DataWorker] Unhandled error:', error);
 };
-
-// ============================================================================
-// Export for testing (optional)
-// ============================================================================
-
-// Make OperationType available for direct worker testing
-export { OperationType };

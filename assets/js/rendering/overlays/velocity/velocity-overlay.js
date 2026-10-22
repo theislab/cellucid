@@ -22,10 +22,10 @@
  */
 
 import { OverlayBase } from '../overlay-base.js';
+import { writeFogUniforms } from '../../shaders/fog-shaders.js';
 import {
   configureStraightAlphaBlending,
-  createProgram,
-  createTransformFeedbackProgram,
+  createProgramBatch,
 } from '../../gl-utils.js';
 import { getNotificationCenter } from '../../../app/notification-center.js';
 import { getColormap } from '../../../data/palettes.js';
@@ -41,7 +41,11 @@ import {
   THRESHOLD_FS,
   ANAMORPHIC_BLUR_FS
 } from './velocity-shaders.js';
-import { createOrUpdatePackedFloatTexture, createOrUpdatePackedUintTexture } from '../shared/packed-texture.js';
+import {
+  createOrUpdatePackedFloatTexture,
+  createOrUpdatePackedUintTexture,
+  createOrUpdatePackedVisibilityTexture,
+} from '../shared/packed-texture.js';
 import { POINT_VISIBILITY_THRESHOLD } from '../../alpha-visibility.js';
 
 // =============================================================================
@@ -119,8 +123,6 @@ const CONFIG = Object.freeze({
 });
 
 export const DEFAULT_VELOCITY_PARTICLE_CAPACITY = CONFIG.particleCapacity;
-export const DEFAULT_VELOCITY_RENDER_TARGET_BYTE_BUDGET =
-  CONFIG.renderTargetByteBudget;
 
 // Particle data layout: position (vec3) + velocity (vec3) + age (float) + cellIndex (uint)
 // = 3 + 3 + 1 + 1 = 8 floats worth (28 bytes with padding)
@@ -530,13 +532,13 @@ export function validateActiveVelocityFieldId(fieldId) {
   return fieldId === null ? null : validateVelocityFieldId(fieldId);
 }
 
-export function validateVelocityFieldData(
+function validateVelocityFieldData(
   fieldId,
-  dimensionLevel,
+  layoutKey,
   fieldData
 ) {
   const id = validateVelocityFieldId(fieldId);
-  const dimension = requireDimensionLevel(dimensionLevel);
+  const key = requireLayoutKey(layoutKey);
   if (
     fieldData === null ||
     typeof fieldData !== 'object' ||
@@ -579,7 +581,7 @@ export function validateVelocityFieldData(
   requireNumber(maxMagnitude, 'maxMagnitude', 0, Number.MAX_VALUE);
   return {
     id,
-    dimension,
+    layoutKey: key,
     vectors,
     components,
     cellCount,
@@ -591,6 +593,15 @@ function readStringOption(options, key) {
   return Object.hasOwn(options, key)
     ? requireNonEmptyString(options[key], key)
     : CONFIG[key];
+}
+
+function requireLayoutKey(value) {
+  if (typeof value !== 'string' || value.length === 0) {
+    throw new TypeError(
+      'VelocityOverlay layoutKey must be a non-empty string.'
+    );
+  }
+  return value;
 }
 
 function requireDimensionLevel(value) {
@@ -730,7 +741,8 @@ export class VelocityOverlay extends OverlayBase {
     }
     this.config = config;
 
-    // Vector field storage: fieldId -> dimensionLevel -> field data
+    // Vector field storage: fieldId -> layoutKey -> field data. A view shows a
+    // field's vectors only for the exact layout its positions belong to.
     this._fieldsById = new Map();
     this._activeFieldId = null;
 
@@ -778,6 +790,9 @@ export class VelocityOverlay extends OverlayBase {
     this._pendingFBORetirements = new Set();
     this._residentFBOBytes = 0n;
     this._activeRenderViewCount = 1;
+    // The views the last frame presented (prepareFrame); work for any other
+    // view never runs, so it never keeps frames going.
+    this._presentedViewIds = new Set();
 
     // Texture format detection
     this._textureFormat = null;
@@ -817,10 +832,10 @@ export class VelocityOverlay extends OverlayBase {
       ...this._fboByView.keys(),
     ]);
     if (nextFieldId !== null) {
-      const nextFieldByDimension = this._fieldsById.get(nextFieldId);
+      const nextFieldByLayout = this._fieldsById.get(nextFieldId);
       for (const [viewId, spawn] of this._spawnByView) {
-        const nextField = Number.isInteger(spawn.dimensionLevel)
-          ? nextFieldByDimension?.get(spawn.dimensionLevel)
+        const nextField = typeof spawn.layoutKey === 'string'
+          ? nextFieldByLayout?.get(spawn.layoutKey)
           : null;
         // Spawn indices and exact visibility are independent of vector values.
         // Preserve a ready generation whenever the next field has the same
@@ -900,11 +915,11 @@ export class VelocityOverlay extends OverlayBase {
     this._failureHandler = handler;
   }
 
-  setVectorFieldData(fieldId, dimensionLevel, fieldData) {
+  setVectorFieldData(fieldId, layoutKey, fieldData) {
     this._assertMutableLifecycle('publish vector-field data');
     const validated = validateVelocityFieldData(
       fieldId,
-      dimensionLevel,
+      layoutKey,
       fieldData
     );
     this.init();
@@ -914,7 +929,7 @@ export class VelocityOverlay extends OverlayBase {
       perField = new Map();
     }
 
-    const existing = perField.get(validated.dimension);
+    const existing = perField.get(validated.layoutKey);
     const replacedBinding =
       existing !== undefined &&
       this.gl.getParameter(this.gl.TEXTURE_BINDING_2D) === existing.texture;
@@ -963,7 +978,7 @@ export class VelocityOverlay extends OverlayBase {
       }
     }
 
-    perField.set(validated.dimension, {
+    perField.set(validated.layoutKey, {
       ...textureInfo,
       cellCount: validated.cellCount,
       maxMagnitude: validated.maxMagnitude
@@ -996,25 +1011,25 @@ export class VelocityOverlay extends OverlayBase {
       }
       this._reportDerivedRetirementFailures(
         retirementFailures,
-        `VelocityOverlay field "${validated.id}" ${validated.dimension}D retirement was incomplete.`
+        `VelocityOverlay field "${validated.id}" layout "${validated.layoutKey}" retirement was incomplete.`
       );
     }
 
     if (this._activeFieldId === null) {
       this.setActiveField(validated.id);
     } else if (this._activeFieldId === validated.id) {
-      this._invalidateActiveFieldDimension(
-        validated.dimension,
+      this._invalidateActiveFieldLayout(
+        validated.layoutKey,
         validated.cellCount
       );
     }
   }
 
-  hasFieldForDimension(fieldId, dimensionLevel) {
+  hasFieldForLayout(fieldId, layoutKey) {
     const id = validateVelocityFieldId(fieldId);
-    const dim = requireDimensionLevel(dimensionLevel);
+    const key = requireLayoutKey(layoutKey);
     const fields = this._fieldsById.get(id);
-    return fields !== undefined && fields.has(dim);
+    return fields !== undefined && fields.has(key);
   }
 
   markVisibilityDirty(viewId) {
@@ -1029,8 +1044,8 @@ export class VelocityOverlay extends OverlayBase {
     this._invalidateViewGeneration(key);
   }
 
-  markDimensionDirty(viewId) {
-    this._assertMutableLifecycle('invalidate a dimension');
+  markLayoutDirty(viewId) {
+    this._assertMutableLifecycle('invalidate a layout');
     const key = requireViewId(viewId);
     const state = this._spawnByView.get(key);
     if (state) {
@@ -1038,7 +1053,7 @@ export class VelocityOverlay extends OverlayBase {
       state.version++;
       state.ready = false;
     }
-    // Dimension/sampling transitions can change visibility and LOD ownership,
+    // Layout/sampling transitions can change visibility and LOD ownership,
     // but the renderer-owned position snapshot remains reusable when its exact
     // Float32 identity is unchanged.
     this._invalidateViewGeneration(key);
@@ -1152,6 +1167,7 @@ export class VelocityOverlay extends OverlayBase {
     }
     if (this._contextLost) return;
     this._activeRenderViewCount = Math.max(1, viewIds.length);
+    this._presentedViewIds = new Set(viewIds);
 
     let failures = null;
     for (const key of this._fboByView.keys()) {
@@ -1174,6 +1190,34 @@ export class VelocityOverlay extends OverlayBase {
       failures,
       'VelocityOverlay dormant view retirement was incomplete.'
     );
+  }
+
+  /**
+   * Frames are needed while particles flow in a presented view, or while a
+   * presented view's spawn table is being built or must be rebuilt (the next
+   * frame starts or adopts it). With no field for the layout, nothing
+   * visible, particles off at this level of detail, or in smoke mode (no view
+   * presented), the overlay draws nothing and the scene settles.
+   * @returns {boolean}
+   */
+  needsContinuousFrames() {
+    if (!super.needsContinuousFrames() || this._contextLost || this._disposePending) {
+      return false;
+    }
+    for (const viewId of this._presentedViewIds) {
+      // A particle state flows, or is owed the update that settles it (a
+      // table emptied by a filter disposes it there).
+      if (this._particleByView.has(viewId)) return true;
+      const spawn = this._spawnByView.get(viewId);
+      // A table serves frames only while its view wants particles (a field
+      // for the layout, particles on at this level of detail): one being
+      // built, one to rebuild, or one just published whose particles the
+      // next update creates.
+      if (spawn === undefined || !(spawn.targetCount > 0)) continue;
+      if (spawn.building || spawn.dirty) return true;
+      if (spawn.ready && spawn.tableSize > 0) return true;
+    }
+    return false;
   }
 
   handleContextLost() {
@@ -1402,21 +1446,31 @@ export class VelocityOverlay extends OverlayBase {
     this._releaseInitializationResources();
 
     try {
-      // Create simulation program with transform feedback
-      this._programUpdate = createTransformFeedbackProgram(
-        gl,
-        PARTICLE_UPDATE_VS,
-        PARTICLE_UPDATE_FS,
-        ['v_position', 'v_velocity', 'v_age', 'v_cellIndex']
-      );
-
-      // Create rendering programs
-      this._programRender = createProgram(gl, PARTICLE_RENDER_VS, PARTICLE_RENDER_FS);
-      this._programFade = createProgram(gl, FULLSCREEN_VS, TRAIL_FADE_FS);
-      this._programThreshold = createProgram(gl, FULLSCREEN_VS, THRESHOLD_FS);
-      this._programBlur = createProgram(gl, FULLSCREEN_VS, BLUR_FS);
-      this._programAnamorphic = createProgram(gl, FULLSCREEN_VS, ANAMORPHIC_BLUR_FS);
-      this._programComposite = createProgram(gl, FULLSCREEN_VS, COMPOSITE_FS);
+      // The simulation (transform feedback) and every render program, in one
+      // batch: the fullscreen vertex shader is compiled once for five, and
+      // the driver overlaps the work instead of finishing each in turn.
+      [
+        this._programUpdate,
+        this._programRender,
+        this._programFade,
+        this._programThreshold,
+        this._programBlur,
+        this._programAnamorphic,
+        this._programComposite,
+      ] = createProgramBatch(gl, [
+        {
+          label: 'velocity simulation',
+          vs: PARTICLE_UPDATE_VS,
+          fs: PARTICLE_UPDATE_FS,
+          varyings: ['v_position', 'v_velocity', 'v_age', 'v_cellIndex'],
+        },
+        { label: 'velocity particles', vs: PARTICLE_RENDER_VS, fs: PARTICLE_RENDER_FS },
+        { label: 'velocity trail fade', vs: FULLSCREEN_VS, fs: TRAIL_FADE_FS },
+        { label: 'velocity bloom threshold', vs: FULLSCREEN_VS, fs: THRESHOLD_FS },
+        { label: 'velocity bloom blur', vs: FULLSCREEN_VS, fs: BLUR_FS },
+        { label: 'velocity anamorphic blur', vs: FULLSCREEN_VS, fs: ANAMORPHIC_BLUR_FS },
+        { label: 'velocity composite', vs: FULLSCREEN_VS, fs: COMPOSITE_FS },
+      ]);
 
       this._cacheUniforms();
 
@@ -1457,11 +1511,14 @@ export class VelocityOverlay extends OverlayBase {
       );
     }
     const dim = requireDimensionLevel(ctx.dimensionLevel);
-    const field = this._activeFieldId
-      ? this._fieldsById.get(this._activeFieldId)?.get(dim)
+    const field = this._activeFieldId && typeof ctx.layoutKey === 'string'
+      ? this._fieldsById.get(this._activeFieldId)?.get(ctx.layoutKey)
       : null;
 
     if (!field) {
+      // No field for this layout: nothing this view's table could draw.
+      const dormantSpawn = this._spawnByView.get(viewId);
+      if (dormantSpawn !== undefined) dormantSpawn.targetCount = 0;
       this._invalidateViewGeneration(viewId);
       this._disposeParticleState(viewId);
       this._disposeFBOs(viewId);
@@ -1509,6 +1566,9 @@ export class VelocityOverlay extends OverlayBase {
       }
     }
     if (targetCount <= 0) {
+      // Particles off at this level of detail.
+      const idleSpawn = this._spawnByView.get(viewId);
+      if (idleSpawn !== undefined) idleSpawn.targetCount = 0;
       this._disposeParticleState(viewId);
       this._disposeFBOs(viewId);
       return;
@@ -1517,18 +1577,22 @@ export class VelocityOverlay extends OverlayBase {
     if (typeof ctx.getViewPositions !== 'function') {
       throw new TypeError('VelocityOverlay context getViewPositions() is required.');
     }
+    // A view's positions carry exactly its dimension's components per cell.
     const positions = ctx.getViewPositions();
     if (
       !(positions instanceof Float32Array) ||
-      positions.length !== field.cellCount * 3
+      positions.length !== field.cellCount * dim
     ) {
       throw new TypeError(
-        `VelocityOverlay positions for view "${viewId}" must be a Float32Array with exactly three values for each field cell.`
+        `VelocityOverlay positions for view "${viewId}" must be a Float32Array with exactly ${dim} values for each field cell.`
       );
     }
 
-    const posTexture = this._ensurePositionTexture(viewId, positions);
+    const posTexture = this._ensurePositionTexture(viewId, positions, dim);
     const spawnState = this._ensureSpawnTable(viewId, ctx, field.cellCount);
+    // The particle count this view's table serves, read by
+    // needsContinuousFrames.
+    if (spawnState) spawnState.targetCount = targetCount;
     if (
       !spawnState?.ready ||
       spawnState.dirty ||
@@ -1553,12 +1617,12 @@ export class VelocityOverlay extends OverlayBase {
     const particleState = this._ensureParticleState(viewId, targetCount);
     const identityChanged =
       particleState.fieldId !== this._activeFieldId ||
-      particleState.dimensionLevel !== dim ||
+      particleState.layoutKey !== ctx.layoutKey ||
       particleState.positionsRef !== positions ||
       particleState.readyGeneration !== spawnState.generation;
     if (identityChanged) {
       particleState.fieldId = this._activeFieldId;
-      particleState.dimensionLevel = dim;
+      particleState.layoutKey = ctx.layoutKey;
       particleState.positionsRef = positions;
       particleState.readyGeneration = spawnState.generation;
       particleState.forceRespawn = true;
@@ -1597,9 +1661,9 @@ export class VelocityOverlay extends OverlayBase {
     }
     if (this._contextLost) return;
     const viewId = requireViewId(ctx.viewId);
-    const dim = requireDimensionLevel(ctx.dimensionLevel);
-    const field = this._activeFieldId
-      ? this._fieldsById.get(this._activeFieldId)?.get(dim)
+    requireDimensionLevel(ctx.dimensionLevel);
+    const field = this._activeFieldId && typeof ctx.layoutKey === 'string'
+      ? this._fieldsById.get(this._activeFieldId)?.get(ctx.layoutKey)
       : null;
     const particleState = this._particleByView.get(viewId);
     const spawnState = this._spawnByView.get(viewId);
@@ -1963,8 +2027,8 @@ export class VelocityOverlay extends OverlayBase {
       cameraMotionAmount: 0,
       capacity,
       currentBuffer: 0,
-      dimensionLevel: null,
       fieldId: null,
+      layoutKey: null,
       forceRespawn: true,
       lastAdvancedFrameId: -1,
       lastCameraPosition: null,
@@ -2573,10 +2637,14 @@ export class VelocityOverlay extends OverlayBase {
     );
 
     // Fog
-    gl.uniform1f(u.u_fogNear, ctx.fogNear);
-    gl.uniform1f(u.u_fogFar, ctx.fogFar);
-    gl.uniform1f(u.u_fogDensity, ctx.fogDensity);
-    gl.uniform3fv(u.u_fogColor, ctx.fogColor);
+    writeFogUniforms(
+      gl,
+      u.u_fogNear,
+      u.u_fogScale,
+      ctx.fogDensity,
+      ctx.fogNear,
+      ctx.fogFar
+    );
 
     // Bind textures
     gl.activeTexture(gl.TEXTURE1);
@@ -3657,12 +3725,12 @@ export class VelocityOverlay extends OverlayBase {
     return total;
   }
 
-  _invalidateActiveFieldDimension(dimensionLevel, cellCount) {
-    const dimension = requireDimensionLevel(dimensionLevel);
+  _invalidateActiveFieldLayout(layoutKey, cellCount) {
+    const key = requireLayoutKey(layoutKey);
     requirePositiveSafeInteger(cellCount, 'active field cellCount');
     const viewIds = new Set();
     for (const [viewId, spawn] of this._spawnByView) {
-      if (spawn.dimensionLevel !== dimension) continue;
+      if (spawn.layoutKey !== key) continue;
       if (
         Number.isSafeInteger(spawn.cellCount) &&
         spawn.cellCount !== cellCount
@@ -3674,7 +3742,7 @@ export class VelocityOverlay extends OverlayBase {
       viewIds.add(viewId);
     }
     for (const [viewId, particle] of this._particleByView) {
-      if (particle.dimensionLevel === dimension) viewIds.add(viewId);
+      if (particle.layoutKey === key) viewIds.add(viewId);
     }
 
     let failures = null;
@@ -3687,7 +3755,7 @@ export class VelocityOverlay extends OverlayBase {
     }
     throwCollectedFailures(
       failures,
-      `VelocityOverlay ${dimension}D field publication invalidation was incomplete.`
+      `VelocityOverlay layout "${key}" field publication invalidation was incomplete.`
     );
   }
 
@@ -3832,9 +3900,7 @@ export class VelocityOverlay extends OverlayBase {
       u_useAlphaTex: gl.getUniformLocation(this._programRender, 'u_useAlphaTex'),
       u_colormapTex: gl.getUniformLocation(this._programRender, 'u_colormapTex'),
       u_fogNear: gl.getUniformLocation(this._programRender, 'u_fogNear'),
-      u_fogFar: gl.getUniformLocation(this._programRender, 'u_fogFar'),
-      u_fogDensity: gl.getUniformLocation(this._programRender, 'u_fogDensity'),
-      u_fogColor: gl.getUniformLocation(this._programRender, 'u_fogColor')
+      u_fogScale: gl.getUniformLocation(this._programRender, 'u_fogScale')
     };
 
     this._uniformsFade = {
@@ -4118,11 +4184,15 @@ export class VelocityOverlay extends OverlayBase {
     }
   }
 
-  _ensurePositionTexture(viewId, positions3D) {
+  /**
+   * One float channel per embedding axis (R32F, RG32F or RGB32F); the
+   * shader's `.rgb` read receives 0 for the axes a 1-D or 2-D view lacks.
+   */
+  _ensurePositionTexture(viewId, positions, dimension) {
     const key = requireViewId(viewId);
     const prev = this._positionsRefByView.get(key);
 
-    if (prev?.source === positions3D) {
+    if (prev?.source === positions) {
       if (!prev.textureInfo) {
         throw new Error(
           `VelocityOverlay position texture ownership is invalid for view "${key}".`
@@ -4131,16 +4201,16 @@ export class VelocityOverlay extends OverlayBase {
       return prev.textureInfo;
     }
 
-    let entry = this._positionTexturePool.get(positions3D);
+    let entry = this._positionTexturePool.get(positions);
     if (!entry) {
       const textureInfo = createOrUpdatePackedFloatTexture(this.gl, {
         texture: null,
-        data: positions3D,
-        itemCount: positions3D.length / 3,
-        components: 3
+        data: positions,
+        itemCount: positions.length / dimension,
+        components: dimension
       });
-      entry = { source: positions3D, textureInfo, refs: 0 };
-      this._positionTexturePool.set(positions3D, entry);
+      entry = { source: positions, textureInfo, refs: 0 };
+      this._positionTexturePool.set(positions, entry);
     }
     this._positionsRefByView.set(key, entry);
     entry.refs++;
@@ -4184,13 +4254,13 @@ export class VelocityOverlay extends OverlayBase {
 
   _createSpawnTableBuild(transparency, cellCount, lodIndices) {
     if (
-      !(transparency instanceof Float32Array) ||
+      !(transparency instanceof Uint8Array) ||
       !Number.isSafeInteger(cellCount) ||
       cellCount < 0 ||
       transparency.length !== cellCount
     ) {
       throw new TypeError(
-        'VelocityOverlay spawn sampling requires exactly one Float32 transparency value per cell.'
+        'VelocityOverlay spawn sampling requires exactly one Uint8 transparency value per cell.'
       );
     }
     if (lodIndices !== null && !(lodIndices instanceof Uint32Array)) {
@@ -4369,16 +4439,12 @@ export class VelocityOverlay extends OverlayBase {
         ready: false,
         generation: -1,
         cellCount: null,
-        dimensionLevel: null,
+        layoutKey: null,
       };
       this._spawnByView.set(key, state);
     }
-    if (
-      Number.isInteger(ctx.dimensionLevel) &&
-      ctx.dimensionLevel >= 1 &&
-      ctx.dimensionLevel <= 3
-    ) {
-      state.dimensionLevel = ctx.dimensionLevel;
+    if (typeof ctx.layoutKey === 'string' && ctx.layoutKey.length > 0) {
+      state.layoutKey = ctx.layoutKey;
     }
 
     // Check LOD change
@@ -4563,11 +4629,11 @@ export class VelocityOverlay extends OverlayBase {
           }
           const transparency = ctx.getViewTransparency();
           if (
-            !(transparency instanceof Float32Array) ||
+            !(transparency instanceof Uint8Array) ||
             transparency.length !== cellCount
           ) {
             throw new TypeError(
-              `VelocityOverlay transparency for view "${key}" must contain exactly one Float32 value per field cell.`
+              `VelocityOverlay transparency for view "${key}" must contain exactly one Uint8 value per field cell.`
             );
           }
 
@@ -4648,11 +4714,10 @@ export class VelocityOverlay extends OverlayBase {
           let visibilityTextureInfo = null;
           let textureInfo = null;
           try {
-            visibilityTextureInfo = createOrUpdatePackedFloatTexture(this.gl, {
+            visibilityTextureInfo = createOrUpdatePackedVisibilityTexture(this.gl, {
               texture: null,
               data: build.transparency,
               itemCount: cellCount,
-              components: 1,
             });
             textureInfo = createOrUpdatePackedUintTexture(this.gl, {
               texture: null,
@@ -4768,13 +4833,13 @@ export class VelocityOverlay extends OverlayBase {
 
   _buildSpawnTable(transparency, cellCount, lodIndices) {
     if (
-      !(transparency instanceof Float32Array) ||
+      !(transparency instanceof Uint8Array) ||
       !Number.isSafeInteger(cellCount) ||
       cellCount < 0 ||
       transparency.length !== cellCount
     ) {
       throw new TypeError(
-        'VelocityOverlay spawn sampling requires exactly one Float32 transparency value per cell.'
+        'VelocityOverlay spawn sampling requires exactly one Uint8 transparency value per cell.'
       );
     }
     if (lodIndices !== null && !(lodIndices instanceof Uint32Array)) {

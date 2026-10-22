@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { UNCHANGEABLE_GROUP_CLAUSE } from '../assets/js/data/dataset-mapping.js';
 
 import {
   readBundle,
@@ -19,51 +20,265 @@ import {
 } from '../assets/js/app/state/managers/highlight-manager.js';
 import {
   SESSION_WITHOUT_CELL_IDENTITY_MESSAGE,
+  SESSION_WITHOUT_DATA_MAPPING_MESSAGE,
+  assertDatasetFingerprint,
   datasetFingerprintMatches,
-  describeDatasetFingerprintMismatch,
+  describeDataMappingMismatch,
+  digestCellOrder,
   getDatasetFingerprint,
+  verifySessionFingerprint,
 } from '../assets/js/app/session/session-context.js';
 import {
   SessionSerializer,
 } from '../assets/js/app/session/session-serializer.js';
+import {
+  DimensionManager,
+} from '../assets/js/data/dimension-manager.js';
+import {
+  validateDataMapping,
+} from '../assets/js/data/data-mapping.js';
+import { installDataMappingMethods } from './helpers/data-mapping-state.mjs';
 
 const CELL_COUNT = 6;
 const VAR_COUNT = 4;
 const SELECTED_ROWS = [0, 2];
+const IDENTITY_ORDER = [0, 1, 2, 3, 4, 5];
 
 /**
- * One coordinate triple per cell, distinct per cell, so a row permutation is
- * observable in the bytes exactly as it is in a real export.
+ * The layouts of a prepared export: an embedding id names each one; the
+ * mapping enables every one and names each dimension's default. `X_tsne_2d`
+ * is a second 2D embedding a view can show beside the 2D default.
+ */
+const EXPORT_LAYOUTS = Object.freeze([
+  Object.freeze({ layoutKey: 'X_umap_2d', dimension: 2, scale: 1, provenance: null }),
+  Object.freeze({ layoutKey: 'X_tsne_2d', dimension: 2, scale: 3, provenance: null }),
+  Object.freeze({ layoutKey: 'X_umap_3d', dimension: 3, scale: 1, provenance: null }),
+]);
+
+/**
+ * The layouts of an AnnData source: each one is named by the obsm key and the
+ * columns it plots, whatever its layout key is.
+ */
+const ANNDATA_LAYOUTS = Object.freeze([
+  Object.freeze({
+    layoutKey: 'X_umap',
+    dimension: 2,
+    scale: 1,
+    provenance: { key: 'X_umap', columns: [0, 1] },
+  }),
+  Object.freeze({
+    layoutKey: 'X_pca:3,1',
+    dimension: 2,
+    scale: 5,
+    provenance: { key: 'X_pca', columns: [3, 1] },
+  }),
+  Object.freeze({
+    layoutKey: 'X_umap_3d',
+    dimension: 3,
+    scale: 1,
+    provenance: { key: 'X_umap_3d', columns: [0, 1, 2] },
+  }),
+]);
+
+/** The embeddings group of an export mapping: enabled ids and defaults. */
+function exportEmbeddings(enabled, { d2 = null, d3 = null } = {}) {
+  return {
+    enabled: enabled.map(key => ({ key, columns: null })),
+    defaults: {
+      '1d': null,
+      '2d': d2 === null ? null : { key: d2, columns: null },
+      '3d': d3 === null ? null : { key: d3, columns: null },
+    },
+  };
+}
+
+function exportMapping(overrides = {}) {
+  return validateDataMapping({
+    kind: 'export',
+    embeddings: exportEmbeddings(
+      ['X_tsne_2d', 'X_umap_2d', 'X_umap_3d'],
+      { d2: 'X_umap_2d', d3: 'X_umap_3d' },
+    ),
+    geneNames: 'index',
+    vectorFields: [],
+    ...overrides,
+  });
+}
+
+const ANNDATA_REFS = Object.freeze({
+  pca: Object.freeze({ key: 'X_pca', columns: Object.freeze([3, 1]) }),
+  umap: Object.freeze({ key: 'X_umap', columns: Object.freeze([0, 1]) }),
+  umap3d: Object.freeze({ key: 'X_umap_3d', columns: Object.freeze([0, 1, 2]) }),
+});
+
+/** The embeddings group of an AnnData mapping, from ANNDATA_REFS names. */
+function anndataEmbeddings(enabled, { d2 = null, d3 = null } = {}) {
+  const ref = name => structuredClone(ANNDATA_REFS[name]);
+  return {
+    enabled: enabled.map(ref),
+    defaults: {
+      '1d': null,
+      '2d': d2 === null ? null : ref(d2),
+      '3d': d3 === null ? null : ref(d3),
+    },
+  };
+}
+
+function anndataMapping(overrides = {}) {
+  return validateDataMapping({
+    kind: 'anndata',
+    embeddings: anndataEmbeddings(['pca', 'umap', 'umap3d'], { d2: 'umap', d3: 'umap3d' }),
+    knn: 'connectivities',
+    geneNames: 'index',
+    expression: 'X',
+    latent: null,
+    vectorFields: [],
+    ...overrides,
+  });
+}
+
+/**
+ * One coordinate per embedding axis per cell, distinct per cell, so a row
+ * permutation is observable in the bytes exactly as it is in a real export.
+ * The viewer holds exactly `dimension` components per cell; `scale` makes
+ * two embeddings of one dimension hold different coordinates.
  *
  * @param {readonly number[]} cellOrder Original cell id at each dataset row.
+ * @param {number} [dimension=3]
+ * @param {number} [scale=1]
  * @returns {Float32Array}
  */
-function positionsForCellOrder(cellOrder) {
-  const positions = new Float32Array(cellOrder.length * 3);
+function positionsForCellOrder(cellOrder, dimension = 3, scale = 1) {
+  const axisScale = [0.125, 0.25, 0.5];
+  const positions = new Float32Array(cellOrder.length * dimension);
   for (let row = 0; row < cellOrder.length; row++) {
     const cellId = cellOrder[row];
-    positions[row * 3] = (cellId + 1) * 0.125;
-    positions[row * 3 + 1] = (cellId + 1) * 0.25;
-    positions[row * 3 + 2] = (cellId + 1) * 0.5;
+    for (let axis = 0; axis < dimension; axis++) {
+      positions[row * dimension + axis] = (cellId + 1) * axisScale[axis] * scale;
+    }
   }
   return positions;
+}
+
+/**
+ * A real DimensionManager holding the given layouts. Only the live layout's
+ * positions are resident; every other layout is "fetched" by `getPositions`
+ * the first time it is asked for, which the manager records in `log`.
+ */
+function makeDimensionManager({
+  cellOrder,
+  layouts,
+  mapping,
+  liveLayoutKey,
+  positionsOverride = null,
+  deferLoads = false,
+}) {
+  const manager = new DimensionManager();
+  manager.registerLayouts(layouts.map(layout => ({
+    layoutKey: layout.layoutKey,
+    dimension: layout.dimension,
+    label: layout.layoutKey,
+    path: null,
+    provenance: layout.provenance,
+    origin: 'identity',
+  })));
+  // The representations the mapping enables, as far as these layouts plot
+  // them: a test dataset may lack one its mapping names.
+  const layoutOf = ref => layouts.find(candidate => (
+    ref.columns === null
+      ? candidate.layoutKey === ref.key
+      : candidate.provenance?.key === ref.key
+        && candidate.provenance.columns.join(',') === ref.columns.join(',')
+  ));
+  const enabled = mapping.embeddings.enabled
+    .map(layoutOf)
+    .filter(layout => layout !== undefined)
+    .map(layout => layout.layoutKey);
+  const defaults = new Map();
+  for (const slot of ['1d', '2d', '3d']) {
+    const ref = mapping.embeddings.defaults[slot];
+    const layout = ref === null ? undefined : layoutOf(ref);
+    if (layout !== undefined) defaults.set(Number(slot[0]), layout.layoutKey);
+  }
+  manager.setRepresentations(enabled, defaults);
+  manager.publishCellCount(cellOrder.length);
+  const stored = new Map(layouts.map(layout => [
+    layout.layoutKey,
+    positionsOverride?.[layout.layoutKey]
+      ?? positionsForCellOrder(cellOrder, layout.dimension, layout.scale),
+  ]));
+  manager.normalizedPositionCache.set(liveLayoutKey, stored.get(liveLayoutKey));
+  manager.viewLayouts.set('live', liveLayoutKey);
+
+  const log = [];
+  const pendingLoads = [];
+  const prototypePin = DimensionManager.prototype.pinLayout;
+  const prototypeGet = DimensionManager.prototype.getPositions;
+  manager.pinLayout = layoutKey => {
+    log.push(['pin', layoutKey]);
+    const release = prototypePin.call(manager, layoutKey);
+    return () => {
+      log.push(['release', layoutKey]);
+      release();
+    };
+  };
+  manager.getPositions = async (layoutKey, options) => {
+    log.push(['getPositions', layoutKey, { ...options }]);
+    if (!manager.normalizedPositionCache.has(layoutKey)) {
+      log.push(['load', layoutKey]);
+      if (deferLoads) {
+        await new Promise(resolve => pendingLoads.push(resolve));
+      }
+      manager.normalizedPositionCache.set(layoutKey, stored.get(layoutKey));
+    }
+    return prototypeGet.call(manager, layoutKey, options);
+  };
+  return { manager, log, pendingLoads, stored };
 }
 
 function makeDatasetState({
   cellOrder,
   pages,
   activePageId = 'page_1',
-  dimension = 3,
+  kind = 'export',
+  mapping = kind === 'export' ? exportMapping() : anndataMapping(),
+  layouts = kind === 'export' ? EXPORT_LAYOUTS : ANNDATA_LAYOUTS,
+  liveLayoutKey = 'X_umap_3d',
+  positionsOverride = null,
+  deferLoads = false,
 }) {
+  const { manager, log, pendingLoads } = makeDimensionManager({
+    cellOrder,
+    layouts,
+    mapping,
+    liveLayoutKey,
+    positionsOverride,
+    deferLoads,
+  });
   const state = Object.create(highlightStateMethods);
   state.getDatasetGeneration = () => 0;
   state.obsData = { fields: [] };
   state.pointCount = cellOrder.length;
-  state.positionsArray = positionsForCellOrder(cellOrder);
+  state.dimensionManager = manager;
+  state.positionsArray = manager.normalizedPositionCache.get(liveLayoutKey);
   state.varData = { fields: Array.from({ length: VAR_COUNT }, () => ({})) };
+  installDataMappingMethods(state, { mapping });
+  // The embedding transaction itself is DataState's (mapping-manager tests);
+  // here it records what a restore asks for and publishes it.
+  state.appliedMappings = [];
+  state.applyDataMapping = async (next, { origin }) => {
+    state.appliedMappings.push({ mapping: next, origin });
+    state.dataMapping = next;
+    state._mappingOrigin = origin;
+    return true;
+  };
   state.getViewDimensionLevel = viewId => {
     assert.equal(viewId, 'live');
-    return dimension;
+    return manager.getViewDimension('live');
+  };
+  state.getViewLayoutKey = viewId => {
+    assert.equal(viewId, 'live');
+    return manager.getViewLayout('live');
   };
   state.highlightPages = pages;
   state.activePageId = activePageId;
@@ -76,6 +291,8 @@ function makeDatasetState({
   state._notifyHighlightChange = () => {};
   // The cell ids the dataset rows actually carry, used only by assertions.
   state.cellOrder = [...cellOrder];
+  state.dimensionLog = log;
+  state.pendingLoads = pendingLoads;
   return state;
 }
 
@@ -99,6 +316,13 @@ function makeSerializer(state) {
       highlightsMetaContributor,
       highlightsCellsContributor,
     ],
+  });
+}
+
+function fingerprintOf(state) {
+  return getDatasetFingerprint({
+    dataSourceManager: makeDataSourceManager(),
+    state,
   });
 }
 
@@ -171,10 +395,22 @@ async function rewriteSessionBundle(blob, mutate) {
   return writeBundle({ manifest, chunks });
 }
 
-async function captureSelectionBundle() {
+async function readManifest(blob) {
+  const { manifest, chunkStream } = await readBundle(blob, {
+    signal: null,
+    onProgress: null,
+  });
+  for await (const _chunk of chunkStream) {
+    // Drain the stream so the reader settles.
+  }
+  return manifest;
+}
+
+async function captureSelectionBundle(options = {}) {
   const source = makeDatasetState({
-    cellOrder: [0, 1, 2, 3, 4, 5],
+    cellOrder: IDENTITY_ORDER,
     pages: selectionPages(SELECTED_ROWS),
+    ...options,
   });
   return {
     bundle: await makeSerializer(source).createSessionBundle(),
@@ -188,6 +424,25 @@ function restoredSelection(state) {
   ));
 }
 
+function heldPins(state) {
+  return state.dimensionManager._layoutPins.size;
+}
+
+async function refusal(state, bundle) {
+  let message = null;
+  await withNotificationHarness(async () => {
+    await assert.rejects(
+      makeSerializer(state).restoreFromBlob(bundle),
+      error => {
+        assert.ok(error instanceof RangeError);
+        message = error.message;
+        return true;
+      },
+    );
+  });
+  return message;
+}
+
 test(
   're-exported dataset with permuted rows cannot silently restore a selection',
   async () => {
@@ -196,8 +451,8 @@ test(
     const selectedCells = SELECTED_ROWS.map(row => source.cellOrder[row]);
     assert.deepEqual(selectedCells, [0, 2]);
 
-    // Same dataset id, same cell count, same gene count, re-exported from
-    // re-sorted input: only the row order changed.
+    // Same dataset id, same cell count, same gene count, same data mapping,
+    // re-exported from re-sorted input: only the row order changed.
     const permutedOrder = [5, 4, 3, 2, 1, 0];
     const destination = makeDatasetState({
       cellOrder: permutedOrder,
@@ -215,29 +470,22 @@ test(
     );
 
     const untouchedPages = destination.highlightPages;
-    await withNotificationHarness(async () => {
-      await assert.rejects(
-        makeSerializer(destination).restoreFromBlob(bundle),
-        error => {
-          assert.ok(error instanceof RangeError);
-          assert.match(error.message, /coordinates differ/);
-          assert.match(error.message, /different order/);
-          // Row order is one of the two things a coordinate difference can
-          // mean, so it is offered, never asserted.
-          assert.match(error.message, /Either the cells are stored/);
-          return true;
-        },
-      );
-    });
+    const message = await refusal(destination, bundle);
+    assert.match(message, /coordinates differ/);
+    assert.match(message, /different order/);
+    // Row order is one of the two things a coordinate difference can mean,
+    // so it is offered, never asserted.
+    assert.match(message, /Either the cells are stored/);
     assert.strictEqual(destination.highlightPages, untouchedPages);
     assert.deepEqual(restoredSelection(destination), []);
+    assert.equal(heldPins(destination), 0);
   },
 );
 
 test('an unchanged dataset restores the exact selected set', async () => {
   const { bundle } = await captureSelectionBundle();
   const destination = makeDatasetState({
-    cellOrder: [0, 1, 2, 3, 4, 5],
+    cellOrder: IDENTITY_ORDER,
     pages: emptyPages(),
   });
 
@@ -258,13 +506,29 @@ test('an unchanged dataset restores the exact selected set', async () => {
     destination.highlightPages[0].highlightedGroups[0].label,
     'CD8 T cells',
   );
+  // The live layout was digested from its resident positions, pinned for the
+  // duration and released.
+  assert.deepEqual(destination.dimensionLog, [
+    ['pin', 'X_umap_3d'],
+    ['getPositions', 'X_umap_3d', { showProgress: false }],
+    ['release', 'X_umap_3d'],
+  ]);
+  assert.equal(heldPins(destination), 0);
 });
 
 test('a session written without cell identity is refused, not trusted', async () => {
   const { bundle } = await captureSelectionBundle();
   const legacy = await rewriteSessionBundle(bundle, manifest => {
-    // Exactly the fingerprint every already-published session file carries.
+    // Exactly the four-key fingerprint every session file written before
+    // cell-order identity carries.
     delete manifest.datasetFingerprint.cellOrder;
+    delete manifest.datasetFingerprint.dataMapping;
+    assert.deepEqual(Object.keys(manifest.datasetFingerprint).sort(), [
+      'cellCount',
+      'datasetId',
+      'sourceType',
+      'varCount',
+    ]);
   });
   const destination = makeDatasetState({
     cellOrder: [5, 4, 3, 2, 1, 0],
@@ -281,37 +545,471 @@ test('a session written without cell identity is refused, not trusted', async ()
     );
   });
   assert.deepEqual(restoredSelection(destination), []);
+  assert.deepEqual(destination.dimensionLog, []);
+});
+
+test('a session written before data mappings is refused with its own message', async () => {
+  const { bundle } = await captureSelectionBundle();
+  const preMapping = await rewriteSessionBundle(bundle, manifest => {
+    // Exactly the fingerprint the release before data mappings wrote: a
+    // cell order with only its dimension and digest, and no data mapping.
+    delete manifest.datasetFingerprint.dataMapping;
+    delete manifest.datasetFingerprint.cellOrder.embedding;
+    assert.deepEqual(
+      Object.keys(manifest.datasetFingerprint.cellOrder).sort(),
+      ['digest', 'dimension'],
+    );
+  });
+  const destination = makeDatasetState({
+    cellOrder: IDENTITY_ORDER,
+    pages: emptyPages(),
+  });
+
+  await withNotificationHarness(async () => {
+    await assert.rejects(
+      makeSerializer(destination).restoreFromBlob(preMapping),
+      error => {
+        assert.equal(error.message, SESSION_WITHOUT_DATA_MAPPING_MESSAGE);
+        return true;
+      },
+    );
+  });
+  assert.notEqual(
+    SESSION_WITHOUT_DATA_MAPPING_MESSAGE,
+    SESSION_WITHOUT_CELL_IDENTITY_MESSAGE,
+  );
+  assert.deepEqual(restoredSelection(destination), []);
+  // Refused during manifest validation: no layout was even looked at.
+  assert.deepEqual(destination.dimensionLog, []);
 });
 
 test(
-  'a different embedding on screen is reported as such, not as re-ordered data',
+  'a session saved in 3D opens while 2D is shown: the saved layout is loaded, not the live one',
   async () => {
     const { bundle } = await captureSelectionBundle();
-    const destination = makeDatasetState({
-      cellOrder: [0, 1, 2, 3, 4, 5],
-      pages: emptyPages(),
-      dimension: 2,
+    const manifest = await readManifest(bundle);
+    assert.deepEqual(manifest.datasetFingerprint.cellOrder.embedding, {
+      key: 'X_umap_3d',
+      columns: null,
     });
-    // The 2D embedding is a separate normalized export, so its coordinates
-    // differ from the 3D ones even for an identical cell order.
-    destination.positionsArray = destination.positionsArray.map(
-      value => value * 0.5,
+    assert.equal(manifest.datasetFingerprint.cellOrder.dimension, 3);
+
+    const destination = makeDatasetState({
+      cellOrder: IDENTITY_ORDER,
+      pages: emptyPages(),
+      liveLayoutKey: 'X_umap_2d',
+    });
+    const livePositions = destination.positionsArray;
+    assert.equal(
+      destination.dimensionManager.getResidentPositions('X_umap_3d'),
+      null,
     );
 
     await withNotificationHarness(async () => {
-      await assert.rejects(
-        makeSerializer(destination).restoreFromBlob(bundle),
-        error => {
-          assert.match(error.message, /3D view was shown/);
-          assert.match(error.message, /2D view is shown now/);
-          assert.doesNotMatch(error.message, /different order|wrong cells/);
-          return true;
-        },
-      );
+      await makeSerializer(destination).restoreFromBlob(bundle);
     });
-    assert.deepEqual(restoredSelection(destination), []);
+
+    assert.deepEqual(restoredSelection(destination), [SELECTED_ROWS]);
+    // The 3D layout the session names was pinned, loaded without progress UI,
+    // digested and released; the live view kept showing its 2D layout.
+    assert.deepEqual(destination.dimensionLog, [
+      ['pin', 'X_umap_3d'],
+      ['getPositions', 'X_umap_3d', { showProgress: false }],
+      ['load', 'X_umap_3d'],
+      ['release', 'X_umap_3d'],
+    ]);
+    assert.equal(heldPins(destination), 0);
+    assert.equal(destination.dimensionManager.getViewLayout('live'), 'X_umap_2d');
+    assert.strictEqual(destination.positionsArray, livePositions);
   },
 );
+
+test(
+  'a session saved on a non-default embedding verifies that embedding, whatever is shown',
+  async () => {
+    // The session was saved while the live 2D view showed X_tsne_2d, not
+    // the 2D default X_umap_2d.
+    const { bundle } = await captureSelectionBundle({ liveLayoutKey: 'X_tsne_2d' });
+    const manifest = await readManifest(bundle);
+    assert.deepEqual(manifest.datasetFingerprint.cellOrder, {
+      embedding: { key: 'X_tsne_2d', columns: null },
+      dimension: 2,
+      digest: digestCellOrder(positionsForCellOrder(IDENTITY_ORDER, 2, 3), 2),
+    });
+    // The mapping records the enabled set and the defaults, not what one view
+    // shows.
+    assert.deepEqual(manifest.datasetFingerprint.dataMapping, exportMapping());
+
+    const destination = makeDatasetState({
+      cellOrder: IDENTITY_ORDER,
+      pages: emptyPages(),
+    });
+    await withNotificationHarness(async () => {
+      await makeSerializer(destination).restoreFromBlob(bundle);
+    });
+    assert.deepEqual(restoredSelection(destination), [SELECTED_ROWS]);
+    assert.deepEqual(destination.dimensionLog.map(entry => entry.slice(0, 2)), [
+      ['pin', 'X_tsne_2d'],
+      ['getPositions', 'X_tsne_2d'],
+      ['load', 'X_tsne_2d'],
+      ['release', 'X_tsne_2d'],
+    ]);
+    assert.equal(destination.dimensionManager.getViewLayout('live'), 'X_umap_3d');
+
+    // The same check refuses that embedding when only it was re-ordered.
+    const permutedTsne = makeDatasetState({
+      cellOrder: IDENTITY_ORDER,
+      pages: emptyPages(),
+      positionsOverride: {
+        X_tsne_2d: positionsForCellOrder([1, 0, 2, 3, 4, 5], 2, 3),
+      },
+    });
+    const message = await refusal(permutedTsne, bundle);
+    assert.match(message, /coordinates differ/);
+    assert.deepEqual(restoredSelection(permutedTsne), []);
+    assert.equal(heldPins(permutedTsne), 0);
+  },
+);
+
+test('a session naming an embedding this dataset does not have is refused by name', async () => {
+  const { bundle } = await captureSelectionBundle({ liveLayoutKey: 'X_tsne_2d' });
+  // The same data mapping, but the dataset has no X_tsne_2d layout.
+  const destination = makeDatasetState({
+    cellOrder: IDENTITY_ORDER,
+    pages: emptyPages(),
+    layouts: EXPORT_LAYOUTS.filter(layout => layout.layoutKey !== 'X_tsne_2d'),
+  });
+  const message = await refusal(destination, bundle);
+  assert.equal(
+    message,
+    "This session recorded its cell order on embedding 'X_tsne_2d' in 2D, "
+      + 'which this dataset does not have. The session was not opened.'
+      + ' Open the dataset version the session was saved on, then load the session again.',
+  );
+  assert.deepEqual(restoredSelection(destination), []);
+  assert.deepEqual(destination.dimensionLog, []);
+
+  // A layout of that name in another dimension is not the one recorded.
+  const wrongDimension = await rewriteSessionBundle(bundle, manifest => {
+    manifest.datasetFingerprint.cellOrder.embedding = {
+      key: 'X_umap_3d',
+      columns: null,
+    };
+  });
+  const sameLayouts = makeDatasetState({
+    cellOrder: IDENTITY_ORDER,
+    pages: emptyPages(),
+  });
+  assert.match(
+    await refusal(sameLayouts, wrongDimension),
+    /^This session recorded its cell order on embedding 'X_umap_3d' in 2D, which this dataset does not have\./,
+  );
+  assert.deepEqual(sameLayouts.dimensionLog, []);
+});
+
+test('a session restores the embeddings it names, before its views', async () => {
+  const { bundle } = await captureSelectionBundle();
+  const saved = (await readManifest(bundle)).datasetFingerprint.dataMapping;
+
+  // The dataset defaults to X_tsne_2d in 2D now; the session was saved with
+  // X_umap_2d as that default, which this dataset also has, so the session
+  // restores it.
+  const otherSlot = makeDatasetState({
+    cellOrder: IDENTITY_ORDER,
+    pages: emptyPages(),
+    mapping: exportMapping({
+      embeddings: exportEmbeddings(
+        ['X_tsne_2d', 'X_umap_2d', 'X_umap_3d'],
+        { d2: 'X_tsne_2d', d3: 'X_umap_3d' },
+      ),
+    }),
+  });
+  await withNotificationHarness(async () => {
+    await makeSerializer(otherSlot).restoreFromBlob(bundle);
+  });
+  assert.deepEqual(restoredSelection(otherSlot), [SELECTED_ROWS]);
+  assert.deepEqual(otherSlot.appliedMappings, [{ mapping: saved, origin: 'session' }]);
+  assert.deepEqual(otherSlot.getDataMapping(), saved);
+});
+
+test('a data mapping mismatch is refused naming the group, before any layout loads', async () => {
+  const { bundle } = await captureSelectionBundle();
+
+  // An enabled embedding this dataset does not have is refused by name.
+  const missingSlot = makeDatasetState({
+    cellOrder: IDENTITY_ORDER,
+    pages: emptyPages(),
+    layouts: EXPORT_LAYOUTS.filter(layout => layout.layoutKey !== 'X_umap_2d'),
+    mapping: exportMapping({
+      embeddings: exportEmbeddings(
+        ['X_tsne_2d', 'X_umap_3d'],
+        { d2: 'X_tsne_2d', d3: 'X_umap_3d' },
+      ),
+    }),
+  });
+  assert.equal(
+    await refusal(missingSlot, bundle),
+    "This session shows embedding 'X_umap_2d', which this dataset does not "
+      + 'have. The session was not opened.'
+      + ' Open the dataset version the session was saved on, then load the session again.',
+  );
+  assert.deepEqual(missingSlot.dimensionLog, []);
+  assert.deepEqual(missingSlot.appliedMappings, []);
+  assert.deepEqual(restoredSelection(missingSlot), []);
+
+  const otherGenes = makeDatasetState({
+    cellOrder: IDENTITY_ORDER,
+    pages: emptyPages(),
+    mapping: exportMapping({ geneNames: 'column:gene_symbols' }),
+  });
+  assert.equal(
+    await refusal(otherGenes, bundle),
+    'This session was saved with the var index as its gene names, and this '
+      + "dataset is shown with var column 'gene_symbols'. The session was not opened."
+      + ' Open the dataset version the session was saved on, then load the session again.',
+  );
+  assert.deepEqual(otherGenes.dimensionLog, []);
+
+  // An export's vector bindings are chosen among those it was exported
+  // with: a session saved without this one turns it off.
+  const otherVectors = makeDatasetState({
+    cellOrder: IDENTITY_ORDER,
+    pages: emptyPages(),
+    mapping: exportMapping({
+      vectorFields: [{ field: 'velocity', embedding: { key: 'X_umap_2d', columns: null } }],
+    }),
+  });
+  await withNotificationHarness(async () => {
+    await makeSerializer(otherVectors).restoreFromBlob(bundle);
+  });
+  assert.deepEqual(otherVectors.getDataMapping().vectorFields, []);
+  assert.deepEqual(otherVectors.appliedMappings.map(entry => entry.origin), ['session']);
+});
+
+test('every data mapping group is named the way the person loading the session knows it', () => {
+  const base = anndataMapping();
+  // The readers of a dataset that can show any embedding / none, and that
+  // cannot change any other group.
+  const fixed = () => UNCHANGEABLE_GROUP_CLAUSE;
+  const canShowAny = { describeEmbeddingRefusal: () => null, describeChoiceRefusal: fixed };
+  const hasNone = {
+    describeEmbeddingRefusal: () => 'this dataset does not have',
+    describeChoiceRefusal: fixed,
+  };
+  assert.equal(describeDataMappingMismatch(base, anndataMapping(), hasNone), null);
+  const cases = [
+    [
+      anndataMapping({ knn: null }),
+      "This session was saved with obsp['connectivities'] as its neighbour graph, "
+        + 'and this dataset is shown with none. The session was not opened.'
+      + ' Open the dataset version the session was saved on, then load the session again.',
+    ],
+    [
+      anndataMapping({ expression: 'layer:log1p' }),
+      'This session was saved with X as its expression matrix, and this dataset '
+        + "is shown with layers['log1p']. The session was not opened."
+      + ' Open the dataset version the session was saved on, then load the session again.',
+    ],
+    [
+      anndataMapping({ latent: 'X_pca' }),
+      'This session was saved with none as its latent space, and this dataset '
+        + "is shown with obsm['X_pca']. The session was not opened."
+      + ' Open the dataset version the session was saved on, then load the session again.',
+    ],
+    [
+      anndataMapping({
+        embeddings: anndataEmbeddings(['pca', 'umap3d'], { d2: 'pca', d3: 'umap3d' }),
+      }),
+      "This session shows obsm['X_umap'] columns [0, 1], which this dataset "
+        + 'does not have. The session was not opened.'
+      + ' Open the dataset version the session was saved on, then load the session again.',
+    ],
+    [
+      anndataMapping({
+        embeddings: anndataEmbeddings(['pca', 'umap'], { d2: 'umap' }),
+      }),
+      "This session shows obsm['X_umap_3d'] columns [0, 1, 2], which this "
+        + 'dataset does not have. The session was not opened.'
+      + ' Open the dataset version the session was saved on, then load the session again.',
+    ],
+    [
+      exportMapping(),
+      'This session was saved on an AnnData file, and a prepared export is open '
+        + 'now. Open the dataset the session was saved on, then load the session again.',
+    ],
+  ];
+  for (const [current, expected] of cases) {
+    assert.equal(describeDataMappingMismatch(base, current, hasNone), expected);
+  }
+  // Embeddings the dataset can show are restored, not refused.
+  for (const [current] of cases.slice(3, 5)) {
+    assert.equal(describeDataMappingMismatch(base, current, canShowAny), null);
+  }
+  // A session that enables fewer embeddings than the dataset shows now is
+  // restored: every embedding it names is one this dataset has.
+  assert.equal(
+    describeDataMappingMismatch(
+      anndataMapping({
+        embeddings: anndataEmbeddings(['umap'], { d2: 'umap' }),
+      }),
+      base,
+      hasNone,
+    ),
+    null,
+  );
+  assert.throws(() => describeDataMappingMismatch(base, base), /embedding and a choice refusal reader/);
+
+  // A group the dataset can change is restored when it can use the saved
+  // choice, and refused, naming it, when it cannot.
+  const changeable = refusal => ({
+    describeEmbeddingRefusal: () => null,
+    describeChoiceRefusal: (group, value) => (group === 'knn' ? refusal(value) : fixed()),
+  });
+  assert.equal(
+    describeDataMappingMismatch(base, anndataMapping({ knn: 'scvi_connectivities' }), changeable(() => null)),
+    null,
+  );
+  assert.equal(
+    describeDataMappingMismatch(
+      base,
+      anndataMapping({ knn: null }),
+      changeable(() => 'this dataset does not have'),
+    ),
+    "This session uses obsp['connectivities'] as its neighbour graph, which this dataset "
+      + 'does not have. The session was not opened.'
+      + ' Open the dataset version the session was saved on, then load the session again.',
+  );
+  assert.equal(
+    describeDataMappingMismatch(
+      anndataMapping({ knn: 'distances' }),
+      base,
+      changeable(() => 'this dataset cannot use (not symmetric — choose a connectivities matrix)'),
+    ),
+    "This session uses obsp['distances'] as its neighbour graph, which this dataset cannot "
+      + 'use (not symmetric — choose a connectivities matrix). The session was not opened.'
+      + ' Open the dataset version the session was saved on, then load the session again.',
+  );
+});
+
+test('nothing is applied before verification passes', async () => {
+  const { bundle } = await captureSelectionBundle();
+
+  async function restoreWhileLoading(destination, settle) {
+    const untouchedPages = destination.highlightPages;
+    await withNotificationHarness(async () => {
+      const restore = makeSerializer(destination).restoreFromBlob(bundle);
+      restore.catch(() => {});
+      while (destination.pendingLoads.length === 0) {
+        await new Promise(resolve => setImmediate(resolve));
+      }
+      // The saved layout is still loading: the session is not verified, so
+      // no contributor has run and no state has changed.
+      for (let tick = 0; tick < 5; tick++) {
+        await new Promise(resolve => setImmediate(resolve));
+      }
+      assert.strictEqual(destination.highlightPages, untouchedPages);
+      assert.deepEqual(restoredSelection(destination), []);
+      assert.equal(heldPins(destination), 1);
+      destination.pendingLoads.shift()();
+      await settle(restore);
+    });
+    assert.equal(heldPins(destination), 0);
+  }
+
+  // A saved layout whose rows differ: refused once loaded, and nothing was
+  // applied while it loaded or after.
+  const permuted = makeDatasetState({
+    cellOrder: IDENTITY_ORDER,
+    pages: emptyPages(),
+    liveLayoutKey: 'X_umap_2d',
+    positionsOverride: {
+      X_umap_3d: positionsForCellOrder([5, 4, 3, 2, 1, 0], 3),
+    },
+    deferLoads: true,
+  });
+  await restoreWhileLoading(permuted, restore => assert.rejects(
+    restore,
+    error => error instanceof RangeError && /coordinates differ/.test(error.message),
+  ));
+  assert.deepEqual(restoredSelection(permuted), []);
+
+  // The same wait on a matching layout ends in the restore.
+  const matching = makeDatasetState({
+    cellOrder: IDENTITY_ORDER,
+    pages: emptyPages(),
+    liveLayoutKey: 'X_umap_2d',
+    deferLoads: true,
+  });
+  await restoreWhileLoading(matching, restore => restore);
+  assert.deepEqual(restoredSelection(matching), [SELECTED_ROWS]);
+});
+
+test('verifySessionFingerprint checks identity, then mapping, then the digest', async () => {
+  const source = makeDatasetState({ cellOrder: IDENTITY_ORDER, pages: emptyPages() });
+  const saved = fingerprintOf(source);
+  const ctx = state => ({ dataSourceManager: makeDataSourceManager(), state });
+
+  const same = makeDatasetState({
+    cellOrder: IDENTITY_ORDER,
+    pages: emptyPages(),
+    liveLayoutKey: 'X_tsne_2d',
+  });
+  assert.equal(await verifySessionFingerprint(ctx(same), saved), null);
+  assert.equal(same.dimensionManager.getViewLayout('live'), 'X_tsne_2d');
+
+  // A count difference wins over a mapping difference, which wins over the
+  // digest: each refusal names the first thing that differs.
+  const everythingDiffers = makeDatasetState({
+    cellOrder: [0, 1, 2, 3, 4],
+    pages: emptyPages(),
+    mapping: exportMapping({ geneNames: 'column:symbol' }),
+  });
+  assert.match(
+    await verifySessionFingerprint(ctx(everythingDiffers), saved),
+    /6 cells and 4 genes when it was saved, 5 cells and 4 genes now/,
+  );
+  assert.deepEqual(everythingDiffers.dimensionLog, []);
+
+  const mappingAndRows = makeDatasetState({
+    cellOrder: [5, 4, 3, 2, 1, 0],
+    pages: emptyPages(),
+    mapping: exportMapping({ geneNames: 'column:symbol' }),
+  });
+  assert.match(
+    await verifySessionFingerprint(ctx(mappingAndRows), saved),
+    /as its gene names/,
+  );
+  assert.deepEqual(mappingAndRows.dimensionLog, []);
+
+  const otherCopy = makeDatasetState({ cellOrder: IDENTITY_ORDER, pages: emptyPages() });
+  assert.match(
+    await verifySessionFingerprint(
+      {
+        dataSourceManager: {
+          getCurrentSourceType: () => 'remote',
+          getCurrentDatasetId: () => 'pancreas-mirror',
+        },
+        state: otherCopy,
+      },
+      saved,
+    ),
+    /different copy of this dataset.*"pancreas" and "pancreas-mirror" is open now/,
+  );
+
+  // Validation precedes everything: a pre-mapping record never reaches the
+  // dataset.
+  await assert.rejects(
+    verifySessionFingerprint(ctx(same), {
+      sourceType: saved.sourceType,
+      datasetId: saved.datasetId,
+      cellCount: saved.cellCount,
+      varCount: saved.varCount,
+      cellOrder: { dimension: 3, digest: saved.cellOrder.digest },
+    }),
+    error => error instanceof RangeError
+      && error.message === SESSION_WITHOUT_DATA_MAPPING_MESSAGE,
+  );
+});
 
 test(
   'a re-computed embedding at the same dimension is not called a re-ordering',
@@ -321,69 +1019,76 @@ test(
     // the coordinates moved and the digest changed. Nothing here re-ordered
     // any row, and the refusal must not say that it did.
     const destination = makeDatasetState({
-      cellOrder: [0, 1, 2, 3, 4, 5],
+      cellOrder: IDENTITY_ORDER,
       pages: emptyPages(),
+      positionsOverride: {
+        X_umap_3d: positionsForCellOrder(IDENTITY_ORDER, 3).map(
+          value => value + 0.0009765625,
+        ),
+      },
     });
-    destination.positionsArray = destination.positionsArray.map(
-      value => value + 0.0009765625,
-    );
 
-    await withNotificationHarness(async () => {
-      await assert.rejects(
-        makeSerializer(destination).restoreFromBlob(bundle),
-        error => {
-          assert.ok(error instanceof RangeError);
-          // The one thing the digest establishes.
-          assert.match(error.message, /coordinates differ/);
-          // Both causes it cannot separate, offered as alternatives.
-          assert.match(error.message, /Either the cells are stored in a different order/);
-          assert.match(error.message, /re-computed embedding/);
-          // Never the old claim that a re-ordering is what happened.
-          assert.doesNotMatch(error.message, /would mark the wrong cells/);
-          assert.doesNotMatch(
-            error.message,
-            /but its cells are stored in a different order/,
-          );
-          return true;
-        },
-      );
-    });
+    const message = await refusal(destination, bundle);
+    // The one thing the digest establishes.
+    assert.match(message, /coordinates differ/);
+    // Both causes it cannot separate, offered as alternatives.
+    assert.match(message, /Either the cells are stored in a different order/);
+    assert.match(message, /re-computed embedding/);
+    // Never the old claim that a re-ordering is what happened.
+    assert.doesNotMatch(message, /would mark the wrong cells/);
+    assert.doesNotMatch(message, /but its cells are stored in a different order/);
     assert.deepEqual(restoredSelection(destination), []);
   },
 );
 
-test('dataset fingerprints carry a cell-order digest over every cell', () => {
+test('dataset fingerprints are exactly six fields with a cell-order digest over every cell', () => {
   const state = makeDatasetState({
-    cellOrder: [0, 1, 2, 3, 4, 5],
+    cellOrder: IDENTITY_ORDER,
     pages: emptyPages(),
   });
-  const fingerprint = getDatasetFingerprint({
-    dataSourceManager: makeDataSourceManager(),
-    state,
-  });
+  const fingerprint = fingerprintOf(state);
   assert.deepEqual(Object.keys(fingerprint).sort(), [
     'cellCount',
     'cellOrder',
+    'dataMapping',
     'datasetId',
     'sourceType',
     'varCount',
   ]);
+  assert.equal(fingerprint.sourceType, 'local-demo');
+  assert.equal(fingerprint.datasetId, 'pancreas');
   assert.equal(fingerprint.cellCount, CELL_COUNT);
   assert.equal(fingerprint.varCount, VAR_COUNT);
+  assert.deepEqual(Object.keys(fingerprint.cellOrder), ['embedding', 'dimension', 'digest']);
+  assert.deepEqual(fingerprint.cellOrder.embedding, { key: 'X_umap_3d', columns: null });
   assert.equal(fingerprint.cellOrder.dimension, 3);
   assert.match(fingerprint.cellOrder.digest, /^[0-9a-f]{16}$/);
+  assert.equal(
+    fingerprint.cellOrder.digest,
+    digestCellOrder(positionsForCellOrder(IDENTITY_ORDER, 3), 3),
+  );
   assert.equal(Object.isFrozen(fingerprint.cellOrder), true);
+  assert.equal(Object.isFrozen(fingerprint.cellOrder.embedding), true);
+  // The mapping is the canonical one, key order included, so its JSON is the
+  // same bytes on every writer.
+  assert.equal(
+    JSON.stringify(fingerprint.dataMapping),
+    JSON.stringify(validateDataMapping(exportMapping())),
+  );
+  assert.deepEqual(Object.keys(fingerprint.dataMapping), [
+    'kind',
+    'embeddings',
+    'geneNames',
+    'vectorFields',
+  ]);
+  assert.strictEqual(assertDatasetFingerprint(fingerprint, 'Fingerprint'), fingerprint);
 
   // Swapping the two last cells is enough to change the digest: the check is
   // not a sample.
-  const swapped = makeDatasetState({
+  const swappedFingerprint = fingerprintOf(makeDatasetState({
     cellOrder: [0, 1, 2, 3, 5, 4],
     pages: emptyPages(),
-  });
-  const swappedFingerprint = getDatasetFingerprint({
-    dataSourceManager: makeDataSourceManager(),
-    state: swapped,
-  });
+  }));
   assert.equal(swappedFingerprint.cellCount, fingerprint.cellCount);
   assert.equal(swappedFingerprint.varCount, fingerprint.varCount);
   assert.notEqual(
@@ -394,38 +1099,248 @@ test('dataset fingerprints carry a cell-order digest over every cell', () => {
   assert.equal(
     datasetFingerprintMatches(
       fingerprint,
-      getDatasetFingerprint({
-        dataSourceManager: makeDataSourceManager(),
-        state: makeDatasetState({
-          cellOrder: [0, 1, 2, 3, 4, 5],
-          pages: emptyPages(),
-        }),
-      }),
+      fingerprintOf(makeDatasetState({ cellOrder: IDENTITY_ORDER, pages: emptyPages() })),
     ),
     true,
+  );
+  // The embedding and the mapping are part of the identity.
+  assert.equal(
+    datasetFingerprintMatches(
+      fingerprint,
+      fingerprintOf(makeDatasetState({
+        cellOrder: IDENTITY_ORDER,
+        pages: emptyPages(),
+        mapping: exportMapping({ geneNames: 'column:symbol' }),
+      })),
+    ),
+    false,
+  );
+
+  // The fingerprint needs the mapping the dataset is shown with.
+  const unmapped = makeDatasetState({ cellOrder: IDENTITY_ORDER, pages: emptyPages() });
+  unmapped.getDataMapping = () => null;
+  assert.throws(() => fingerprintOf(unmapped), /requires the loaded data mapping/);
+  const noLayoutKey = makeDatasetState({ cellOrder: IDENTITY_ORDER, pages: emptyPages() });
+  delete noLayoutKey.getViewLayoutKey;
+  assert.throws(() => fingerprintOf(noLayoutKey), /getViewLayoutKey/);
+});
+
+test('cellOrder.embedding names the live layout by export id or by obsm key and columns', () => {
+  const exportFingerprint = fingerprintOf(makeDatasetState({
+    cellOrder: IDENTITY_ORDER,
+    pages: emptyPages(),
+    liveLayoutKey: 'X_tsne_2d',
+  }));
+  assert.deepEqual(exportFingerprint.cellOrder.embedding, { key: 'X_tsne_2d', columns: null });
+  assert.equal(exportFingerprint.cellOrder.dimension, 2);
+
+  const anndataFingerprint = fingerprintOf(makeDatasetState({
+    cellOrder: IDENTITY_ORDER,
+    pages: emptyPages(),
+    kind: 'anndata',
+    liveLayoutKey: 'X_pca:3,1',
+  }));
+  assert.deepEqual(anndataFingerprint.cellOrder.embedding, { key: 'X_pca', columns: [3, 1] });
+  assert.equal(anndataFingerprint.cellOrder.dimension, 2);
+  assert.deepEqual(anndataFingerprint.dataMapping, anndataMapping());
+  assert.deepEqual(Object.keys(anndataFingerprint.dataMapping), [
+    'kind',
+    'embeddings',
+    'knn',
+    'geneNames',
+    'expression',
+    'latent',
+    'vectorFields',
+  ]);
+
+  // An AnnData layout with no obsm provenance cannot be named in a session.
+  const unnamed = makeDatasetState({
+    cellOrder: IDENTITY_ORDER,
+    pages: emptyPages(),
+    kind: 'anndata',
+    layouts: [
+      ...ANNDATA_LAYOUTS,
+      { layoutKey: 'scratch', dimension: 2, scale: 7, provenance: null },
+    ],
+    liveLayoutKey: 'scratch',
+  });
+  assert.throws(() => fingerprintOf(unnamed), /no AnnData obsm provenance/);
+});
+
+test('an AnnData session is verified on the obsm columns it names', async () => {
+  const { bundle } = await captureSelectionBundle({
+    kind: 'anndata',
+    liveLayoutKey: 'X_pca:3,1',
+  });
+  const manifest = await readManifest(bundle);
+  assert.deepEqual(manifest.datasetFingerprint.cellOrder.embedding, {
+    key: 'X_pca',
+    columns: [3, 1],
+  });
+
+  // The same obsm columns registered under another layout key resolve by
+  // their provenance, while the live view shows the 3D UMAP.
+  const destination = makeDatasetState({
+    cellOrder: IDENTITY_ORDER,
+    pages: emptyPages(),
+    kind: 'anndata',
+    layouts: ANNDATA_LAYOUTS.map(layout => (
+      layout.layoutKey === 'X_pca:3,1' ? { ...layout, layoutKey: 'pca-view' } : layout
+    )),
+  });
+  await withNotificationHarness(async () => {
+    await makeSerializer(destination).restoreFromBlob(bundle);
+  });
+  assert.deepEqual(restoredSelection(destination), [SELECTED_ROWS]);
+  assert.deepEqual(destination.dimensionLog.map(entry => entry.slice(0, 2)), [
+    ['pin', 'pca-view'],
+    ['getPositions', 'pca-view'],
+    ['load', 'pca-view'],
+    ['release', 'pca-view'],
+  ]);
+
+  // Other columns of the same array are another embedding.
+  const otherColumns = makeDatasetState({
+    cellOrder: IDENTITY_ORDER,
+    pages: emptyPages(),
+    kind: 'anndata',
+    layouts: ANNDATA_LAYOUTS.map(layout => (
+      layout.layoutKey === 'X_pca:3,1'
+        ? { ...layout, provenance: { key: 'X_pca', columns: [1, 3] } }
+        : layout
+    )),
+  });
+  assert.equal(
+    await refusal(otherColumns, bundle),
+    "This session recorded its cell order on obsm['X_pca'] columns [3, 1] in 2D, "
+      + 'which this dataset does not have. The session was not opened.'
+      + ' Open the dataset version the session was saved on, then load the session again.',
+  );
+  assert.deepEqual(otherColumns.dimensionLog, []);
+
+  // An AnnData session opened on a prepared export is a different source.
+  const exportDestination = makeDatasetState({
+    cellOrder: IDENTITY_ORDER,
+    pages: emptyPages(),
+  });
+  assert.match(
+    await refusal(exportDestination, bundle),
+    /^This session was saved on an AnnData file, and a prepared export is open now\./,
+  );
+});
+
+test('a fingerprint record must be exact and its data mapping canonical', () => {
+  const exportFingerprint = fingerprintOf(makeDatasetState({
+    cellOrder: IDENTITY_ORDER,
+    pages: emptyPages(),
+  }));
+  const anndataFingerprint = fingerprintOf(makeDatasetState({
+    cellOrder: IDENTITY_ORDER,
+    pages: emptyPages(),
+    kind: 'anndata',
+  }));
+  const clone = value => structuredClone({
+    ...value,
+    cellOrder: { ...value.cellOrder },
+  });
+  const rejects = (mutate, pattern, base = exportFingerprint) => {
+    const record = clone(base);
+    mutate(record);
+    assert.throws(
+      () => assertDatasetFingerprint(record, 'Saved dataset fingerprint'),
+      error => error instanceof TypeError && pattern.test(error.message),
+    );
+  };
+
+  assert.doesNotThrow(() => assertDatasetFingerprint(clone(exportFingerprint), 'Saved'));
+  assert.doesNotThrow(() => assertDatasetFingerprint(clone(anndataFingerprint), 'Saved'));
+
+  // Exact top-level and cellOrder keys.
+  rejects(record => { record.legacyDimension = 3; }, /exact keys|legacyDimension/);
+  rejects(record => { record.cellOrder.layoutKey = 'X_umap_3d'; }, /cellOrder/);
+  // A record with a mapping but a cell order without its embedding is a
+  // schema violation, not the pre-mapping file.
+  rejects(record => { delete record.cellOrder.embedding; }, /cellOrder/);
+  rejects(record => { record.cellOrder.digest = 'ABCDEF0123456789'; }, /hexadecimal/);
+  rejects(record => { record.cellOrder.dimension = 4; }, /dimension/);
+  // An export names its embedding by id alone; AnnData by key and columns,
+  // one column per axis.
+  rejects(
+    record => { record.cellOrder.embedding = { key: 'X_umap_3d', columns: [0, 1, 2] }; },
+    /columns must be null/,
+  );
+  rejects(
+    record => { record.cellOrder.embedding = { key: 'X_umap_3d', columns: [0, 1] }; },
+    /exactly 3 columns/,
+    anndataFingerprint,
+  );
+  rejects(
+    record => { record.cellOrder.embedding = { key: 'X_umap_3d', columns: null }; },
+    /must be a list/,
+    anndataFingerprint,
+  );
+  // The mapping must validate and already be canonical.
+  rejects(record => { record.dataMapping.kind = 'h5ad'; }, /kind/);
+  rejects(
+    record => {
+      const { kind, embeddings, geneNames, vectorFields } = record.dataMapping;
+      record.dataMapping = { kind, geneNames, embeddings, vectorFields };
+    },
+    /canonical form/,
+  );
+  rejects(
+    record => {
+      record.dataMapping.vectorFields = [
+        { field: 'velocity', embedding: { key: 'X_umap_3d', columns: null } },
+        { field: 'drift', embedding: { key: 'X_umap_2d', columns: null } },
+      ];
+    },
+    /sorted/,
+  );
+  rejects(
+    record => {
+      record.dataMapping.embeddings.defaults = { '1d': null, '2d': null, '3d': null };
+    },
+    /at least one default/,
+  );
+  rejects(
+    record => {
+      record.dataMapping.embeddings = record.dataMapping.embeddings.defaults;
+    },
+    /missing defaults, enabled/,
+  );
+
+  // The two records written by earlier releases get the messages a person
+  // can act on, not a schema error.
+  const fourKeys = clone(exportFingerprint);
+  delete fourKeys.cellOrder;
+  delete fourKeys.dataMapping;
+  assert.throws(
+    () => assertDatasetFingerprint(fourKeys, 'Saved'),
+    error => error instanceof RangeError
+      && error.message === SESSION_WITHOUT_CELL_IDENTITY_MESSAGE,
+  );
+  const preMapping = clone(exportFingerprint);
+  delete preMapping.dataMapping;
+  delete preMapping.cellOrder.embedding;
+  assert.throws(
+    () => assertDatasetFingerprint(preMapping, 'Saved'),
+    error => error instanceof RangeError
+      && error.message === SESSION_WITHOUT_DATA_MAPPING_MESSAGE,
   );
 });
 
 test('cell-order digests are stable and dataset-wide', () => {
   const cellOrder = Array.from({ length: 4096 }, (_value, index) => index);
-  const first = getDatasetFingerprint({
-    dataSourceManager: makeDataSourceManager(),
-    state: makeDatasetState({ cellOrder, pages: emptyPages() }),
-  });
-  const second = getDatasetFingerprint({
-    dataSourceManager: makeDataSourceManager(),
-    state: makeDatasetState({ cellOrder, pages: emptyPages() }),
-  });
+  const first = fingerprintOf(makeDatasetState({ cellOrder, pages: emptyPages() }));
+  const second = fingerprintOf(makeDatasetState({ cellOrder, pages: emptyPages() }));
   assert.equal(second.cellOrder.digest, first.cellOrder.digest);
 
   for (const row of [0, 1, 2047, 4094, 4095]) {
     const moved = [...cellOrder];
     const other = row === 0 ? 1 : row - 1;
     [moved[row], moved[other]] = [moved[other], moved[row]];
-    const mutated = getDatasetFingerprint({
-      dataSourceManager: makeDataSourceManager(),
-      state: makeDatasetState({ cellOrder: moved, pages: emptyPages() }),
-    });
+    const mutated = fingerprintOf(makeDatasetState({ cellOrder: moved, pages: emptyPages() }));
     assert.notEqual(
       mutated.cellOrder.digest,
       first.cellOrder.digest,
@@ -434,36 +1349,137 @@ test('cell-order digests are stable and dataset-wide', () => {
   }
 });
 
-test('mismatch messages are written for the person loading the session', () => {
-  const base = getDatasetFingerprint({
-    dataSourceManager: makeDataSourceManager(),
-    state: makeDatasetState({
-      cellOrder: [0, 1, 2, 3, 4, 5],
+async function verifyRefusals() {
+  const saved = fingerprintOf(makeDatasetState({
+    cellOrder: IDENTITY_ORDER,
+    pages: emptyPages(),
+    liveLayoutKey: 'X_tsne_2d',
+  }));
+  const verify = (state, manager = makeDataSourceManager()) => (
+    verifySessionFingerprint({ dataSourceManager: manager, state }, saved)
+  );
+  return {
+    counts: await verify(makeDatasetState({ cellOrder: [0, 1, 2, 3, 4], pages: emptyPages() })),
+    copy: await verify(
+      makeDatasetState({ cellOrder: IDENTITY_ORDER, pages: emptyPages() }),
+      { getCurrentSourceType: () => 'remote', getCurrentDatasetId: () => null },
+    ),
+    kind: await verify(makeDatasetState({
+      cellOrder: IDENTITY_ORDER,
       pages: emptyPages(),
-    }),
-  });
-  assert.equal(describeDatasetFingerprintMismatch(base, { ...base }), null);
+      kind: 'anndata',
+    })),
+    slot: await verify(makeDatasetState({
+      cellOrder: IDENTITY_ORDER,
+      pages: emptyPages(),
+      layouts: EXPORT_LAYOUTS.filter(layout => layout.layoutKey !== 'X_umap_2d'),
+      mapping: exportMapping({
+        embeddings: exportEmbeddings(
+          ['X_tsne_2d', 'X_umap_3d'],
+          { d2: 'X_tsne_2d', d3: 'X_umap_3d' },
+        ),
+      }),
+    })),
+    group: await verify(makeDatasetState({
+      cellOrder: IDENTITY_ORDER,
+      pages: emptyPages(),
+      mapping: exportMapping({ geneNames: 'column:symbol' }),
+    })),
+    missingEmbedding: await verify(makeDatasetState({
+      cellOrder: IDENTITY_ORDER,
+      pages: emptyPages(),
+      layouts: EXPORT_LAYOUTS.filter(layout => layout.layoutKey !== 'X_tsne_2d'),
+    })),
+    digest: await verify(makeDatasetState({
+      cellOrder: [5, 4, 3, 2, 1, 0],
+      pages: emptyPages(),
+    })),
+    // Choosing None leaves zero cells open: no dataset at all.
+    none: await verify(
+      { pointCount: 0, varData: { fields: [] } },
+      { getCurrentSourceType: () => null, getCurrentDatasetId: () => null },
+    ),
+    withoutCellIdentity: SESSION_WITHOUT_CELL_IDENTITY_MESSAGE,
+    withoutDataMapping: SESSION_WITHOUT_DATA_MAPPING_MESSAGE,
+  };
+}
 
-  const messages = [
-    describeDatasetFingerprintMismatch(base, { ...base, cellCount: 5 }),
-    describeDatasetFingerprintMismatch(base, {
-      ...base,
-      cellOrder: { dimension: 2, digest: base.cellOrder.digest },
-    }),
-    describeDatasetFingerprintMismatch(base, {
-      ...base,
-      cellOrder: { dimension: 3, digest: '0123456789abcdef' },
-    }),
-    SESSION_WITHOUT_CELL_IDENTITY_MESSAGE,
-  ];
-  for (const message of messages) {
-    assert.equal(typeof message, 'string');
+test('mismatch messages are written for the person loading the session', async () => {
+  const refusals = await verifyRefusals();
+  for (const [cause, message] of Object.entries(refusals)) {
+    assert.equal(typeof message, 'string', cause);
     assert.doesNotMatch(
       message,
       /fingerprint|digest|hash|manifest|chunk|serializ|null|undefined|[A-Z]{4,}/,
+      cause,
     );
-    assert.match(message, /\.$/);
-    // Every refusal has to tell the user what to do next.
-    assert.match(message, /Open the dataset|Switch back|Load the version|Re-create/);
+    assert.match(message, /\.$/, cause);
   }
+  // Each cause has its own sentence.
+  assert.equal(new Set(Object.values(refusals)).size, Object.keys(refusals).length);
+});
+
+test('with no dataset open there are no counts to compare, only a dataset to name', async () => {
+  const { none } = await verifyRefusals();
+  assert.match(none, /^No dataset is open\. /);
+  assert.doesNotMatch(none, /\b0 cells\b/);
+});
+
+test('every refusal tells the person loading the session what to do next', async () => {
+  const refusals = await verifyRefusals();
+  const withoutNextStep = Object.entries(refusals)
+    .filter(([, message]) => !/Open the dataset|Load the version|Re-create/.test(message))
+    .map(([cause, message]) => `${cause}: ${message}`);
+  assert.deepEqual(withoutNextStep, []);
+});
+
+test('a session saved with a duplicated gene restores on the reloaded dataset', async () => {
+  // Duplicating a gene appends a user-defined var field. That field is session
+  // content, restored from the session itself, so it is not part of the
+  // dataset the fingerprint describes: the reloaded dataset, which has only
+  // its source genes, must still be accepted.
+  const source = makeDatasetState({
+    cellOrder: IDENTITY_ORDER,
+    pages: selectionPages(SELECTED_ROWS),
+  });
+  source.varData.fields.push({
+    key: 'GENE_A (copy)',
+    _isUserDefined: true,
+    _userDefinedId: 'user_var_1',
+    _fieldSource: 'var',
+  });
+  const savedFingerprint = fingerprintOf(source);
+  assert.equal(savedFingerprint.varCount, VAR_COUNT);
+  const bundle = await makeSerializer(source).createSessionBundle();
+
+  const reloaded = makeDatasetState({
+    cellOrder: IDENTITY_ORDER,
+    pages: emptyPages(),
+  });
+  assert.equal(reloaded.varData.fields.length, VAR_COUNT);
+  await withNotificationHarness(async () => {
+    await makeSerializer(reloaded).restoreFromBlob(bundle);
+  });
+  assert.deepEqual(restoredSelection(reloaded), [SELECTED_ROWS]);
+});
+
+test('the digest of a compact 1D/2D embedding equals the digest of its zero-padded XYZ triples', () => {
+  for (const dimension of [1, 2]) {
+    const compact = positionsForCellOrder([3, 0, 5, 1, 4, 2], dimension);
+    const padded = new Float32Array((compact.length / dimension) * 3);
+    for (let cell = 0; cell < compact.length / dimension; cell++) {
+      for (let axis = 0; axis < dimension; axis++) {
+        padded[cell * 3 + axis] = compact[cell * dimension + axis];
+      }
+    }
+    assert.equal(
+      digestCellOrder(compact, dimension),
+      digestCellOrder(padded, 3),
+      `${dimension}D digest must not depend on the in-memory layout`,
+    );
+  }
+  assert.throws(
+    () => digestCellOrder(new Float32Array(5), 2),
+    /2 values per cell/,
+  );
 });

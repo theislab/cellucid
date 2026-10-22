@@ -1,8 +1,7 @@
 /**
  * Unified Plugin Contract System
  *
- * Standardizes plugin registration, validation, and lifecycle across all
- * plugin types: plots, transforms, and statistical tests.
+ * Standardizes plot plugin registration, validation, and lifecycle.
  *
  * This module provides:
  * - A common base registry class for all plugin types
@@ -12,6 +11,7 @@
  * - Plugin discovery and introspection
  */
 
+import { categoryCounts } from '../shared/category-counts.js';
 import {
   validatePluginContract,
   validateOptionsAgainstSchema,
@@ -22,9 +22,6 @@ import { debug, debugWarn, debugError } from '../shared/debug-utils.js';
 import { getPlotTheme } from '../shared/plot-theme.js';
 import { getPageColor, PAGE_COLORS } from '../../utils/page-colors.js';
 import { setOwnDataProperty } from '../../../utils/exact-record.js';
-
-// Re-export validation functions for index.js
-export { validatePluginContract, validateOptionsAgainstSchema, mergeOptions };
 
 // =============================================================================
 // BASE REGISTRY CLASS
@@ -38,7 +35,7 @@ export class BasePluginRegistry {
    /**
    * @param {Object} options
    * @param {string} options.name - Registry name for logging
-   * @param {string} options.pluginType - Plugin type for validation ('plot' | 'transform' | 'stat')
+   * @param {string} options.pluginType - Plugin type for validation ('plot')
    * @param {string[]} [options.requiredMethods] - Method names that plugins must implement
    */
   constructor(options) {
@@ -407,341 +404,6 @@ export class PlotPluginRegistry extends BasePluginRegistry {
   }
 }
 
-/**
- * Transform Plugin Registry
- *
- * Unified registry for data transforms with pre-execution backend selection.
- */
-export class TransformPluginRegistry extends BasePluginRegistry {
-  constructor() {
-    super({
-      name: 'TransformRegistry',
-      pluginType: 'transform',
-      requiredMethods: ['execute']
-    });
-
-    this._gpuAvailable = false;
-    this._workerAvailable = false;
-    this._gpuCompute = null;
-    this._workerPool = null;
-  }
-
-  /**
-   * Initialize the registry and check backend availability
-   * @returns {Promise<void>}
-   */
-  async init() {
-    if (this._initialized) return;
-
-    // Check GPU availability
-    try {
-      const { getGPUCompute } = await import('../compute/gpu-compute.js');
-      const gpu = getGPUCompute();
-      await gpu.init();
-      this._gpuAvailable = gpu._initialized;
-      if (this._gpuAvailable) {
-        this._gpuCompute = gpu;
-      }
-    } catch (e) {
-      this._gpuAvailable = false;
-    }
-
-    // Check worker availability via WorkerPool
-    try {
-      const { getWorkerPool } = await import('../compute/worker-pool.js');
-      const pool = getWorkerPool();
-      await pool.init();
-      this._workerAvailable = pool.isReady();
-      if (this._workerAvailable) {
-        this._workerPool = pool;
-      }
-    } catch (e) {
-      this._workerAvailable = false;
-    }
-
-    this._initialized = true;
-    debug('TransformRegistry', `Initialized (GPU: ${this._gpuAvailable}, Worker: ${this._workerAvailable})`);
-    this._emit('init');
-  }
-
-  _normalizePlugin(plugin) {
-    const normalized = super._normalizePlugin(plugin);
-
-    // Add transform-specific properties
-    normalized.gpuMethod = (
-      Object.hasOwn(plugin, 'gpuMethod') &&
-      plugin.gpuMethod
-    ) ? plugin.gpuMethod : null;
-    normalized.workerMethod = (
-      Object.hasOwn(plugin, 'workerMethod') &&
-      plugin.workerMethod
-    ) ? plugin.workerMethod : null;
-
-    return normalized;
-  }
-
-  /**
-   * Select one supported backend before a transform starts.
-   * Priority without an explicit request is GPU, Worker, then CPU.
-   * @param {Object} plugin - Transform plugin
-   * @param {string} [preferredBackend] - Preferred backend override
-   * @returns {string} 'gpu' | 'worker' | 'cpu'
-   */
-  selectBackend(plugin, preferredBackend = null) {
-    if (
-      preferredBackend !== null &&
-      preferredBackend !== 'gpu' &&
-      preferredBackend !== 'worker' &&
-      preferredBackend !== 'cpu'
-    ) {
-      throw new TypeError(
-        'preferredBackend must be exactly "gpu", "worker", "cpu", or null'
-      );
-    }
-    if (preferredBackend !== null) {
-      const supported = preferredBackend === 'cpu' ||
-        (
-          preferredBackend === 'gpu' &&
-          this._gpuAvailable &&
-          Boolean(plugin.gpuMethod)
-        ) ||
-        (
-          preferredBackend === 'worker' &&
-          this._workerAvailable &&
-          Boolean(plugin.workerMethod)
-        );
-      if (!supported) {
-        throw new Error(
-          `Requested transform backend "${preferredBackend}" is unavailable`
-        );
-      }
-      return preferredBackend;
-    }
-
-    if (plugin.gpuMethod && this._gpuAvailable) {
-      return 'gpu';
-    }
-    if (plugin.workerMethod && this._workerAvailable) {
-      return 'worker';
-    }
-    return 'cpu';
-  }
-
-  /**
-   * Get GPU compute instance
-   * @returns {Object|null}
-   */
-  getGPU() {
-    return this._gpuCompute;
-  }
-
-  /**
-   * Get worker pool instance
-   * @returns {Object|null}
-   */
-  getWorkerPool() {
-    return this._workerPool;
-  }
-
-  /**
-   * Check if GPU is available
-   * @returns {boolean}
-   */
-  isGPUAvailable() {
-    return this._gpuAvailable;
-  }
-
-  /**
-   * Check if workers are available
-   * @returns {boolean}
-   */
-  isWorkerAvailable() {
-    return this._workerAvailable;
-  }
-
-  /**
-   * Execute a transform with automatic backend selection
-   * @param {string} id - Transform ID
-   * @param {Object} data - Input data
-   * @param {Object} options - Transform options
-   * @param {Object} [context] - Execution context
-   * @returns {Promise<Object>} Transformed data
-   */
-  async execute(id, data, options = {}, context = {}) {
-    const plugin = this.get(id);
-    if (!plugin) {
-      throw new Error(`Unknown transform: ${id}`);
-    }
-
-    const mergedOptions = this.getOptions(id, options);
-
-    // Validate options
-    const validation = this.validateOptions(id, mergedOptions);
-    if (!validation.valid) {
-      throw new Error(`Invalid options: ${validation.errors.join(', ')}`);
-    }
-
-    // Run custom validation if present
-    if (plugin.validate) {
-      const customValidation = plugin.validate(data, mergedOptions);
-      if (customValidation !== true && customValidation?.valid === false) {
-        throw new Error(`Validation failed: ${customValidation.errors?.join(', ')}`);
-      }
-    }
-
-    // Select backend
-    const backend = this.selectBackend(plugin, context.preferredBackend);
-
-    const startTime = performance.now();
-    const result = await plugin.execute(data, mergedOptions, {
-      ...context,
-      backend,
-      registry: this
-    });
-
-    const elapsed = performance.now() - startTime;
-
-    // Add execution metadata
-    return {
-      ...result,
-      _meta: {
-        transformId: id,
-        backend,
-        elapsedMs: elapsed,
-        inputCount: data.values?.length || 0,
-        outputCount: result.values?.length || 0
-      }
-    };
-  }
-}
-
-/**
- * Statistical Test Plugin Registry
- */
-export class StatPluginRegistry extends BasePluginRegistry {
-  constructor() {
-    super({
-      name: 'StatRegistry',
-      pluginType: 'stat',
-      requiredMethods: ['compute']
-    });
-  }
-
-  _normalizePlugin(plugin) {
-    const normalized = super._normalizePlugin(plugin);
-
-    // Add stat-specific properties
-    normalized.testType = (
-      Object.hasOwn(plugin, 'testType') &&
-      plugin.testType
-    ) ? plugin.testType : 'generic'; // 'parametric', 'nonparametric', 'correlation'
-    normalized.assumptions = (
-      Object.hasOwn(plugin, 'assumptions') &&
-      plugin.assumptions
-    ) ? plugin.assumptions : [];
-
-    return normalized;
-  }
-
-  /**
-   * Compute statistical test
-   * @param {string} id - Test ID
-   * @param {Object} data - Test data
-   * @param {Object} options - Test options
-   * @returns {Promise<Object>} Test result
-   */
-  async compute(id, data, options = {}) {
-    const plugin = this.get(id);
-    if (!plugin) {
-      throw new Error(`Unknown statistical test: ${id}`);
-    }
-
-    const mergedOptions = this.getOptions(id, options);
-
-    // Run custom validation if present
-    if (plugin.validate) {
-      const validation = plugin.validate(data, mergedOptions);
-      if (validation !== true && validation?.valid === false) {
-        throw new Error(`Validation failed: ${validation.errors?.join(', ')}`);
-      }
-    }
-
-    return plugin.compute(data, mergedOptions);
-  }
-
-  /**
-   * Get tests by type
-   * @param {string} testType - Test type filter
-   * @returns {Object[]}
-   */
-  getByTestType(testType) {
-    return this.getAll().filter(t => t.testType === testType);
-  }
-}
-
-// =============================================================================
-// UNIFIED PLUGIN MANAGER
-// =============================================================================
-
-/**
- * Unified Plugin Manager
- * Provides a single access point for all plugin registries
- */
-class PluginManager {
-  constructor() {
-    this.plots = new PlotPluginRegistry();
-    this.transforms = new TransformPluginRegistry();
-    this.stats = new StatPluginRegistry();
-
-    this._initialized = false;
-  }
-
-  /**
-   * Initialize all registries
-   */
-  async init() {
-    if (this._initialized) return;
-
-    await Promise.all([
-      this.plots.init(),
-      this.transforms.init(),
-      this.stats.init()
-    ]);
-
-    this._initialized = true;
-    debug('PluginManager', 'All registries initialized');
-  }
-
-  /**
-   * Get overall statistics
-   */
-  getStats() {
-    return {
-      plots: this.plots.getStats(),
-      transforms: this.transforms.getStats(),
-      stats: this.stats.getStats()
-    };
-  }
-
-  /**
-   * Find plugins by name/description search
-   * @param {string} query - Search query
-   * @returns {Object} { plots, transforms, stats }
-   */
-  search(query) {
-    const q = query.toLowerCase();
-    const matches = (plugin) =>
-      plugin.name.toLowerCase().includes(q) ||
-      (plugin.description && plugin.description.toLowerCase().includes(q));
-
-    return {
-      plots: this.plots.getAll().filter(matches),
-      transforms: this.transforms.getAll().filter(matches),
-      stats: this.stats.getAll().filter(matches)
-    };
-  }
-}
-
 // Re-export the shared page color palette.
 export { getPageColor, PAGE_COLORS };
 
@@ -752,6 +414,24 @@ export { getPageColor, PAGE_COLORS };
 /**
  * Shared utility functions for plot types
  */
+const CATEGORY_NAME_TYPE_ORDER = { boolean: 0, number: 1, string: 2 };
+
+function compareCategoryLabelsByName(left, right) {
+  const leftType = typeof left;
+  const rightType = typeof right;
+  if (
+    !Object.hasOwn(CATEGORY_NAME_TYPE_ORDER, leftType)
+    || !Object.hasOwn(CATEGORY_NAME_TYPE_ORDER, rightType)
+  ) {
+    throw new TypeError('Category labels must be strings, numbers, or booleans');
+  }
+  if (leftType !== rightType) {
+    return CATEGORY_NAME_TYPE_ORDER[leftType] - CATEGORY_NAME_TYPE_ORDER[rightType];
+  }
+  if (leftType === 'string') return left.localeCompare(right);
+  return Number(left) - Number(right);
+}
+
 export const PlotHelpers = {
   /**
    * Get color for page
@@ -781,16 +461,14 @@ export const PlotHelpers = {
   },
 
   /**
-   * Count categorical values
+   * Count categorical values, in first-occurrence order (see
+   * shared/category-counts.js: counted once per page-values array, shared,
+   * read only).
    * @param {string[]} values
    * @returns {Map<string, number>}
    */
   countCategories(values) {
-    const counts = new Map();
-    for (const v of values) {
-      counts.set(v, (counts.get(v) || 0) + 1);
-    }
-    return counts;
+    return categoryCounts(values);
   },
 
   /**
@@ -806,7 +484,9 @@ export const PlotHelpers = {
         entries.sort((a, b) => b[1] - a[1]);
         break;
       case 'name':
-        entries.sort((a, b) => a[0].localeCompare(b[0]));
+        // Category labels are strings, finite numbers or booleans. Booleans
+        // sort before numbers before strings; numbers sort numerically.
+        entries.sort((a, b) => compareCategoryLabelsByName(a[0], b[0]));
         break;
       // 'none' - keep original order
     }
@@ -947,43 +627,18 @@ export const PlotHelpers = {
 };
 
 // =============================================================================
-// SINGLETON EXPORTS
+// SINGLETON
 // =============================================================================
 
-let pluginManagerInstance = null;
+let plotRegistryInstance = null;
 
 /**
- * Get the singleton plugin manager
- * @returns {PluginManager}
+ * Get the singleton plot plugin registry.
+ * @returns {PlotPluginRegistry}
  */
-export function getPluginManager() {
-  if (!pluginManagerInstance) {
-    pluginManagerInstance = new PluginManager();
-  }
-  return pluginManagerInstance;
-}
-
-/**
- * Initialize the plugin manager
- * @returns {Promise<PluginManager>}
- */
-export async function initPluginManager() {
-  const manager = getPluginManager();
-  await manager.init();
-  return manager;
-}
-
-// Helper functions for direct registry access
 export function getPlotRegistry() {
-  return getPluginManager().plots;
+  if (!plotRegistryInstance) {
+    plotRegistryInstance = new PlotPluginRegistry();
+  }
+  return plotRegistryInstance;
 }
-
-export function getTransformRegistry() {
-  return getPluginManager().transforms;
-}
-
-export function getStatRegistry() {
-  return getPluginManager().stats;
-}
-
-export default PluginManager;

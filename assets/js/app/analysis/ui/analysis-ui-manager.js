@@ -720,5 +720,3 @@ export class AnalysisUIManager {
 export function createAnalysisUIManager(options) {
   return new AnalysisUIManager(options);
 }
-
-export default AnalysisUIManager;

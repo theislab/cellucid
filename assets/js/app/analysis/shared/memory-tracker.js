@@ -96,8 +96,3 @@ export function startMemoryTracking(category, label, options = {}) {
 
   return { end, snapshot };
 }
-
-export default {
-  startMemoryTracking
-};
-

@@ -1,0 +1,197 @@
+/* components/_cell-info.css
+   The Cell info card: what the cell under the pointer is (ui/modules/cell-info.js).
+   It follows the pointer, so it is drawn above the plot and the panels, takes no
+   pointer events, and moves only by transform. */
+
+.cell-info-card {
+  position: fixed;
+  top: 0;
+  left: 0;
+  z-index: var(--z-tooltip);
+  box-sizing: border-box;
+  /* One 240 px column; a card with more loaded fields than the window's
+     height holds takes more (ui/modules/cell-info.js fitCard). */
+  max-width: calc(240px * var(--cell-info-columns, 1));
+  padding: var(--space-1-5) var(--space-2);
+  border: var(--border-light);
+  /* Solid, not frosted: a backdrop filter over the WebGL canvas would be
+     recomposited on every frame the plot or the card moves. */
+  background: var(--color-surface-elevated);
+  box-shadow: var(--shadow-md);
+  color: var(--color-text-primary);
+  font-family: var(--font-sans);
+  font-size: var(--type-label);
+  line-height: var(--leading-tight);
+  pointer-events: none;
+  opacity: 0;
+  will-change: transform, opacity;
+  transition: opacity var(--duration-fast) var(--easing-out);
+}
+
+.cell-info-card[hidden] {
+  display: none;
+}
+
+.cell-info-card.is-visible {
+  opacity: 1;
+}
+
+/* One line: colour dot, value, and (for a category) its visible count. */
+.cell-info-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1-5);
+}
+
+.cell-info-swatch {
+  flex: none;
+  width: var(--space-2);
+  height: var(--space-2);
+  border-radius: var(--radius-full);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--color-text-primary) 18%, transparent);
+}
+
+.cell-info-swatch[hidden] {
+  display: none;
+}
+
+.cell-info-value {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  font-size: var(--type-label);
+  font-weight: var(--font-weight-semibold);
+  font-variant-numeric: tabular-nums;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cell-info-field {
+  margin-top: var(--space-0-5);
+  overflow: hidden;
+  color: var(--color-text-secondary);
+  font-size: var(--type-hint);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cell-info-value.is-missing,
+.cell-info-rows dd.is-missing {
+  color: var(--color-text-tertiary);
+  font-style: italic;
+}
+
+/* Where the value sits on the field's colour scale. */
+.cell-info-scale {
+  margin-top: var(--space-1-5);
+}
+
+.cell-info-scale[hidden] {
+  display: none;
+}
+
+.cell-info-scale-bar {
+  position: relative;
+  height: var(--space-1);
+  border-radius: var(--radius-full);
+  background: linear-gradient(to right, var(--cell-info-stops, transparent));
+}
+
+.cell-info-scale-marker {
+  position: absolute;
+  top: 50%;
+  left: calc(var(--cell-info-t, 0.5) * 100%);
+  width: var(--space-2);
+  height: var(--space-2);
+  box-sizing: border-box;
+  border: 2px solid var(--color-surface-elevated);
+  border-radius: var(--radius-full);
+  background: var(--color-text-primary);
+  box-shadow: var(--shadow-xs);
+  transform: translate(-50%, -50%);
+}
+
+.cell-info-scale-ends {
+  display: flex;
+  justify-content: space-between;
+  margin-top: var(--space-0-5);
+  color: var(--color-text-tertiary);
+  font-size: var(--type-readout);
+  font-variant-numeric: tabular-nums;
+}
+
+.cell-info-rows {
+  column-count: var(--cell-info-columns, 1);
+  column-gap: var(--space-3);
+  margin: var(--space-1-5) 0 0;
+  padding-top: var(--space-1-5);
+  border-top: var(--border-light);
+}
+
+.cell-info-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  column-gap: var(--space-2);
+  padding-bottom: var(--space-0-5);
+  break-inside: avoid;
+}
+
+.cell-info-more {
+  margin: var(--space-1) 0 0;
+  color: var(--color-text-tertiary);
+  font-size: var(--type-hint);
+}
+
+.cell-info-more[hidden] {
+  display: none;
+}
+
+.cell-info-rows[hidden] {
+  display: none;
+}
+
+.cell-info-rows dt {
+  overflow: hidden;
+  color: var(--color-text-secondary);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cell-info-rows dd {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1-5);
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  text-align: right;
+  justify-content: flex-end;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cell-info-dot {
+  flex: none;
+  width: var(--space-2);
+  height: var(--space-2);
+  border-radius: var(--radius-full);
+}
+
+.cell-info-count[hidden] {
+  display: none;
+}
+
+/* How many cells of this category are visible in the pane. */
+.cell-info-count {
+  flex: none;
+  margin-left: var(--space-2);
+  color: var(--color-text-secondary);
+  font-size: var(--type-hint);
+  font-variant-numeric: tabular-nums;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cell-info-card {
+    transition: none;
+  }
+}

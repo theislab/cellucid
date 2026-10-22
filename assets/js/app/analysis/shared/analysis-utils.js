@@ -11,13 +11,8 @@
  * @module shared/analysis-utils
  */
 
-import {
-  filterFiniteNumbers,
-  mean as computeMean,
-  std as computeStd,
-  median as computeMedian
-} from './number-utils.js';
 import { setOwnDataProperty } from '../../../utils/exact-record.js';
+import { downloadBlob } from '../../utils/download.js';
 
 // =============================================================================
 // LOADING STATE MANAGEMENT
@@ -151,49 +146,6 @@ export async function runAnalysisWithLoadingState(options) {
   }
 }
 
-/**
- * Create a managed loading state for a component
- * Returns helpers for managing loading without the full wrapper
- *
- * @param {Object} component - The UI component
- * @returns {Object} { start, complete, fail, isLoading }
- */
-export function createLoadingState(component) {
-  let isLoading = false;
-  let currentNotifId = null;
-
-  return {
-    get isLoading() {
-      return isLoading;
-    },
-
-    start(message, category = 'calculation') {
-      if (isLoading) return false;
-      isLoading = true;
-      currentNotifId = component._notifications?.loading(message, { category });
-      return true;
-    },
-
-    complete(message) {
-      if (!isLoading) return;
-      if (component._notifications && currentNotifId) {
-        component._notifications.complete(currentNotifId, message);
-      }
-      isLoading = false;
-      currentNotifId = null;
-    },
-
-    fail(message) {
-      if (!isLoading) return;
-      if (component._notifications && currentNotifId) {
-        component._notifications.fail(currentNotifId, message);
-      }
-      isLoading = false;
-      currentNotifId = null;
-    }
-  };
-}
-
 // =============================================================================
 // PAGE REQUIREMENTS VALIDATION
 // =============================================================================
@@ -204,6 +156,7 @@ export function createLoadingState(component) {
  * @property {number} [minPages=1] - Minimum number of pages required
  * @property {number} [maxPages] - Maximum number of pages allowed (null = unlimited)
  * @property {string} [description] - Human-readable requirement description
+ * @property {boolean} [geneExpression] - Whether the mode needs gene expression data
  */
 
 /**
@@ -354,15 +307,7 @@ export function toCSV(data, options = {}) {
  * @param {Object} [notifications] - Notification center for success message
  */
 export function downloadCSV(csv, filename, notifications) {
-  const blob = new Blob([csv], { type: 'text/csv' });
-  const url = URL.createObjectURL(blob);
-
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = `${filename}.csv`;
-  a.click();
-
-  URL.revokeObjectURL(url);
+  downloadBlob(new Blob([csv], { type: 'text/csv' }), `${filename}.csv`);
 
   if (notifications) {
     notifications.success('Data exported as CSV', { category: 'download' });
@@ -570,118 +515,3 @@ export function getTypedFormValues(formContainer, fieldConfig) {
 
   return values;
 }
-
-// =============================================================================
-// STATISTICS HELPERS
-// =============================================================================
-
-/**
- * Compute basic statistics for a numeric array
- * Optimized for performance with streaming for large arrays
- *
- * @param {number[]} values - Numeric values
- * @returns {Object} { count, mean, median, std, min, max, q1, q3 }
- */
-export function computeBasicStats(values) {
-  const valid = filterFiniteNumbers(values);
-  const n = valid.length;
-
-  if (n === 0) {
-    return { count: 0, mean: null, median: null, std: null, min: null, max: null };
-  }
-
-  // Sort once for quartiles and min/max
-  const sorted = [...valid].sort((a, b) => a - b);
-
-  return {
-    count: n,
-    mean: computeMean(valid),
-    median: computeMedian(valid),
-    std: computeStd(valid),
-    min: sorted[0],
-    max: sorted[n - 1],
-    q1: sorted[Math.floor(n * 0.25)],
-    q3: sorted[Math.floor(n * 0.75)]
-  };
-}
-
-/**
- * Compute Cohen's d effect size between two groups
- *
- * @param {number[]} group1 - First group values
- * @param {number[]} group2 - Second group values
- * @returns {Object} { effectSize, interpretation, mean1, mean2, std1, std2, n1, n2 }
- */
-export function computeEffectSize(group1, group2) {
-  const valid1 = filterFiniteNumbers(group1);
-  const valid2 = filterFiniteNumbers(group2);
-
-  const n1 = valid1.length;
-  const n2 = valid2.length;
-
-  if (n1 < 2 || n2 < 2) {
-    return { effectSize: 0, interpretation: 'insufficient data' };
-  }
-
-  const mean1 = computeMean(valid1);
-  const mean2 = computeMean(valid2);
-
-  // Sample variance uses (n-1) denominator (Bessel's correction) for unbiased estimate
-  const var1 = valid1.reduce((a, b) => a + (b - mean1) ** 2, 0) / (n1 - 1);
-  const var2 = valid2.reduce((a, b) => a + (b - mean2) ** 2, 0) / (n2 - 1);
-
-  // Pooled standard deviation
-  const pooledVar = ((n1 - 1) * var1 + (n2 - 1) * var2) / (n1 + n2 - 2);
-  const pooledStd = Math.sqrt(pooledVar);
-
-  if (pooledStd === 0) {
-    return { effectSize: 0, interpretation: 'no variance', mean1, mean2 };
-  }
-
-  // Cohen's d
-  const d = (mean1 - mean2) / pooledStd;
-
-  // Interpretation
-  const absD = Math.abs(d);
-  let interpretation;
-  if (absD < 0.2) interpretation = 'negligible';
-  else if (absD < 0.5) interpretation = 'small';
-  else if (absD < 0.8) interpretation = 'medium';
-  else interpretation = 'large';
-
-  return {
-    effectSize: d,
-    interpretation,
-    mean1,
-    mean2,
-    std1: Math.sqrt(var1),
-    std2: Math.sqrt(var2),
-    n1,
-    n2
-  };
-}
-
-// =============================================================================
-// DEFAULT EXPORT
-// =============================================================================
-
-export default {
-  // Loading state
-  runAnalysisWithLoadingState,
-  createLoadingState,
-  // Validation
-  validatePageRequirements,
-  getRequirementText,
-  // CSV export
-  downloadCSV,
-  pageDataToCSV,
-  deResultsToCSV,
-  signatureScoresToCSV,
-  correlationResultsToCSV,
-  // Form values
-  getFormValues,
-  getTypedFormValues,
-  // Statistics
-  computeBasicStats,
-  computeEffectSize
-};

@@ -35,7 +35,8 @@ export function formatBytes(bytes, decimals = 1) {
 }
 
 /**
- * Format a duration in milliseconds.
+ * Format a duration in milliseconds. The one duration format every
+ * user-facing message uses: "850ms", "1.2s", "3m 5s", "2h 4m".
  * @param {number} ms
  * @returns {string}
  */
@@ -45,9 +46,15 @@ export function formatDuration(ms) {
       'duration must be a finite non-negative number of milliseconds no greater than Number.MAX_SAFE_INTEGER.'
     );
   }
-  if (ms < 1000) return `${Math.round(ms)}ms`;
-  if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`;
-  return `${Math.floor(ms / 60000)}m ${Math.round((ms % 60000) / 1000)}s`;
+  // Each unit hands over before rounding could print the next one's ceiling
+  // ("1000ms", "60.0s", "1m 60s").
+  if (ms < 999.5) return `${Math.round(ms)}ms`;
+  if (ms < 59_950) return `${(ms / 1000).toFixed(1)}s`;
+  const totalSeconds = Math.round(ms / 1000);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  if (hours > 0) return `${hours}h ${minutes}m`;
+  return `${minutes}m ${totalSeconds % 60}s`;
 }
 
 /**

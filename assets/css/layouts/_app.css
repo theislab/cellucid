@@ -10,6 +10,8 @@
   height: 100%;
   pointer-events: none;
   z-index: var(--z-overlay);
+  /* Centroid labels are part of the plot, not the interface: they keep one
+     size on every pointer, the size figure export reproduces. */
   font-size: var(--text-sm);
   color: var(--color-text-primary);
 }
@@ -28,13 +30,12 @@
   position: fixed;
   pointer-events: none;
   z-index: var(--z-tooltip);
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
-  letter-spacing: 0.04em;
+  font-variant-numeric: tabular-nums;
+  font-size: var(--type-readout);
   white-space: nowrap;
   transition: opacity var(--duration-fast) var(--easing-standard), left 0.05s ease, top 0.05s ease;
   line-height: 1.4;
-  box-shadow: var(--shadow-soft-md);
+  box-shadow: var(--shadow-md);
 }
 
 /* View title overlay for small multiples */
@@ -46,25 +47,55 @@
   height: 100%;
   pointer-events: none;
   z-index: var(--z-overlay);
-  font-size: var(--text-sm);
+  font-size: var(--type-label);
   color: var(--color-text-primary);
+  /* The sidebar and its toggle tab overlay the left of the plot. No title chip
+     may start left of this edge, or it sits under them, unreadable and
+     unclickable. */
+  --view-title-safe-left: calc(
+    var(--space-2-5) + var(--sidebar-width) + var(--sidebar-toggle-width) + var(--space-2)
+  );
 }
 
+body:has(#sidebar.hidden) #view-title-layer {
+  --view-title-safe-left: calc(
+    var(--space-2-5) + var(--sidebar-toggle-width) + var(--space-2)
+  );
+}
+
+/* Centred on its cell (the viewer publishes the centre as --view-title-x/-y),
+   but never left of the safe edge: the horizontal shift is the centring -50%
+   unless that would cross --view-title-safe-left, in which case the chip's
+   left edge sits on it. */
 .view-title-chip {
   position: absolute;
-  transform: translate(-50%, -50%);
+  left: var(--view-title-x);
+  top: var(--view-title-y);
+  translate: max(-50%, calc(var(--view-title-safe-left) - var(--view-title-x))) -50%;
+  /* A long label in a narrow pane ends in an ellipsis inside its own pane
+     rather than running into the next pane's chip; the full label is the
+     chip's title. Centred, it may span the pane less a gap each side; pushed
+     right of the safe edge, it may reach from there to the pane's right edge
+     less a gap. */
+  box-sizing: border-box;
+  max-width: min(
+    calc(var(--view-title-pane-width, 100vw) - 2 * var(--space-2)),
+    calc(
+      var(--view-title-x) + var(--view-title-pane-width, 100vw) / 2
+        - var(--space-2) - var(--view-title-safe-left)
+    )
+  );
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
   padding: calc(var(--space-0-5) + var(--space-px)) var(--space-2);
   border-radius: var(--radius-full);
   background-color: color-mix(in srgb, var(--color-surface-elevated) 90%, transparent);
   border: var(--border-width-1) solid color-mix(in srgb, var(--color-border-strong) 35%, transparent);
   box-shadow: var(--shadow-sm);
-  font-family: var(--font-display);
-  letter-spacing: var(--tracking-wide);
-  text-transform: uppercase;
   pointer-events: auto;
   cursor: pointer;
-  transition: var(--transition-colors), transform var(--duration-fast) var(--easing-standard);
+  transition: var(--transition-colors);
 }
 
 .view-title-chip:hover {

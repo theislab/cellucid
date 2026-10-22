@@ -18,6 +18,7 @@ import {
   requireSelectionStepEvent,
   requireUnifiedSelectionState
 } from '../assets/js/app/ui/modules/highlight/exact-contract.js';
+import { createSelectModeDom } from './helpers/select-mode-dom.mjs';
 
 const MAIN_SOURCE_URL = new URL(
   '../assets/js/app/main.js',
@@ -359,6 +360,9 @@ function createUnifiedCandidateViewer() {
     onLodChanged() {
       return () => {};
     },
+    onPresentedLayoutChange() {
+      return () => {};
+    },
     restoreKnnState() {},
     restoreLassoState(candidates, step) {
       viewer.restoreUnifiedState(candidates, step);
@@ -376,6 +380,7 @@ function createUnifiedCandidateViewer() {
     setKnnEnabled() {},
     setLassoEnabled() {},
     setProximityEnabled() {},
+    setSelectMode() {},
     updateHighlight() {}
   };
   for (const [method, key] of [
@@ -440,20 +445,17 @@ function createHighlightStateStub(pointCount) {
     getActiveViewId() {
       return 'live';
     },
-    getCategoryForCell() {
-      return 0;
-    },
     getCellIndicesForCategory() {
       return [];
     },
     getCellIndicesForRange() {
       return [];
     },
+    getFieldForView() {
+      return null;
+    },
     getHighlightedGroups() {
       return this.savedGroups;
-    },
-    getValueForCell() {
-      return Number.NaN;
     },
     on() {
       return () => {};
@@ -491,7 +493,7 @@ function runCrossDatasetLasso(retirements) {
       state,
       viewer,
       jupyterSource: null,
-      dom: { modeButtons: buttons, modeDescription },
+      dom: { ...createSelectModeDom(), modeButtons: buttons, modeDescription },
       renderHighlightSummary() {},
       renderHighlightPages() {}
     });

@@ -123,11 +123,10 @@ test('both implementations agree across every padding regime', () => {
   }
 });
 
-test('a state at the published size bound hashes correctly', () => {
-  // MAX_STATE_BYTES in session/dataset-state-manifest.js. The digest this
-  // module exists to compute is taken over a payload of exactly this size at
-  // most, so the largest one it will ever see is checked here.
-  const bytes = new Uint8Array(32768);
+test('a large published state hashes correctly', () => {
+  // A published state has no size limit; one well past the former 32 KiB
+  // bound is hashed exactly as Node's own SHA-256 does.
+  const bytes = new Uint8Array(1024 * 1024 + 7);
   for (let index = 0; index < bytes.length; index++) {
     bytes[index] = (index * 251 + 7) & 0xff;
   }

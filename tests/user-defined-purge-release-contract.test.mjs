@@ -36,8 +36,8 @@ function registryWithCategoricalField() {
     {
       pointCount: POINT_COUNT,
       dimensionManager: {
-        positionCache: new Map(),
-        getAvailableDimensions: () => [2]
+        getResidentPositions: () => null,
+        getRegisteredLayouts: () => [{ layoutKey: '2d', dimension: 2 }]
       }
     }
   );
@@ -127,8 +127,8 @@ test('a purged field contributes no codes chunk to a session', async () => {
     {
       pointCount: POINT_COUNT,
       dimensionManager: {
-        positionCache: new Map(),
-        getAvailableDimensions: () => [2]
+        getResidentPositions: () => null,
+        getRegisteredLayouts: () => [{ layoutKey: '2d', dimension: 2 }]
       }
     }
   );

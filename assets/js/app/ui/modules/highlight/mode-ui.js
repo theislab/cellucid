@@ -4,8 +4,12 @@
  * @module ui/modules/highlight/mode-ui
  */
 
-import { HIGHLIGHT_MODE_COPY } from './mode-copy.js';
-import { STEP_CONTROL_TOOLS, removeStepControls } from './step-controls.js';
+import { HIGHLIGHT_MODE_COPY, SELECT_BAR_HINT } from './mode-copy.js';
+import {
+  publishSelectBarHint,
+  removeStepControls,
+  STEP_CONTROL_TOOLS
+} from './step-controls.js';
 import {
   requireDomElement,
   requireExactKeys,
@@ -13,8 +17,13 @@ import {
   requireHighlightSelectionState,
   requireMethods,
   requireModeButtons,
+  requireSelectModeControls,
   requireUnifiedSelectionState
 } from './exact-contract.js';
+import {
+  requireSelectMode,
+  SELECT_MODE_COMBINES
+} from '../../../../rendering/select-mode.js';
 
 const MODE_HANDLER_NAMES = Object.freeze({
   annotation: 'restoreAnnotationSelection',
@@ -117,6 +126,11 @@ function requireModeHandlers(modeHandlers) {
  * @param {object} options.dom
  * @param {HTMLElement[]} options.dom.modeButtons
  * @param {HTMLElement} options.dom.modeDescription
+ * @param {HTMLElement[]} options.dom.selectModeSwitches every Select mode switch
+ * @param {HTMLElement[]} options.dom.selectCombineGroups every combine group
+ * @param {HTMLElement[]} options.dom.selectCombineButtons every combine button
+ * @param {HTMLElement} options.dom.selectBarSteps the selection bar's step row
+ * @param {HTMLElement[]} options.dom.selectBarStepButtons its Undo, Cancel, Confirm
  * @param {ReturnType<import('./selection-state.js').createHighlightSelectionState>} options.selectionState
  * @param {object} options.modeHandlers
  */
@@ -137,14 +151,49 @@ export function initHighlightModeUI(options) {
       'restoreUnifiedState',
       'setKnnEnabled',
       'setLassoEnabled',
-      'setProximityEnabled'
+      'setProximityEnabled',
+      'setSelectMode'
     ]
   );
   requireExactKeys(
     dom,
-    ['modeButtons', 'modeDescription'],
+    [
+      'modeButtons',
+      'modeDescription',
+      'selectModeSwitches',
+      'selectCombineGroups',
+      'selectCombineButtons',
+      'selectBarSteps',
+      'selectBarStepButtons'
+    ],
     'Highlight mode DOM'
   );
+  const markedSelectMode = requireSelectModeControls(
+    {
+      switches: dom.selectModeSwitches,
+      combineGroups: dom.selectCombineGroups,
+      combineButtons: dom.selectCombineButtons
+    },
+    SELECT_MODE_COMBINES
+  );
+  const selectBarSteps = requireDomElement(
+    dom.selectBarSteps,
+    'Selection bar step row'
+  );
+  if (!Array.isArray(dom.selectBarStepButtons)) {
+    throw new TypeError('Selection bar step buttons must be an array.');
+  }
+  const selectBarActions = dom.selectBarStepButtons.map(button => {
+    requireDomElement(button, 'Selection bar step button', ['addEventListener']);
+    requireDomElement(button.dataset, 'Selection bar step button dataset');
+    return button.dataset.stepAction;
+  });
+  if (selectBarActions.slice().sort().join(',') !== 'cancel,confirm,undo') {
+    throw new TypeError(
+      'Selection bar needs exactly one undo, cancel and confirm button.'
+    );
+  }
+
   const {
     buttons: highlightModeButtonsList,
     pressedMode
@@ -176,6 +225,7 @@ export function initHighlightModeUI(options) {
   const lifecycleController = new AbortController();
   let destroyed = false;
   let activeHighlightMode = pressedMode;
+  let selectMode = requireSelectMode(markedSelectMode);
 
   function listen(target, eventName, listener) {
     target.addEventListener(eventName, (...args) => {
@@ -189,7 +239,8 @@ export function initHighlightModeUI(options) {
       removeStepControls(
         documentOwner,
         tool,
-        highlightModeDescriptionEl.parentElement
+        highlightModeDescriptionEl.parentElement,
+        ''
       );
     }
   }
@@ -218,7 +269,7 @@ export function initHighlightModeUI(options) {
         viewer.cancelUnifiedSelection();
       } else {
         viewer.restoreUnifiedState(
-          [...selectionState.annotationCandidateSet],
+          selectionState.annotationCandidateSet.toArray(),
           selectionState.annotationStepCount
         );
       }
@@ -247,7 +298,7 @@ export function initHighlightModeUI(options) {
 
     removeAllStepControls();
     highlightModeDescriptionEl.textContent = HIGHLIGHT_MODE_COPY[exactMode];
-    highlightModeDescriptionEl.style.display = 'block';
+    publishSelectBarHint(documentOwner, SELECT_BAR_HINT[exactMode]);
     restoreModeSelection(exactMode, unifiedState);
   }
 
@@ -270,18 +321,81 @@ export function initHighlightModeUI(options) {
     return true;
   }
 
+  /**
+   * Publish Select mode and paint every control that shows it.
+   *
+   * The viewer is told first, so a switch can never read as on while a tap
+   * still orbits. Every switch carries the same `aria-checked`, and the
+   * combine buttons are shown only while the mode is on, because Shift and
+   * Ctrl keep choosing the combine for an Alt gesture.
+   *
+   * @param {{enabled: boolean, combine: string}} next
+   */
+  function setSelectMode(next) {
+    if (destroyed) return;
+    const exact = requireSelectMode(next);
+    viewer.setSelectMode(exact);
+    selectMode = exact;
+    for (const control of dom.selectModeSwitches) {
+      control.setAttribute('aria-checked', exact.enabled ? 'true' : 'false');
+    }
+    for (const button of dom.selectCombineButtons) {
+      button.setAttribute(
+        'aria-pressed',
+        button.dataset.combine === exact.combine ? 'true' : 'false'
+      );
+    }
+    for (const group of dom.selectCombineGroups) {
+      group.hidden = !exact.enabled;
+    }
+  }
+
+  /**
+   * Leave Select mode, as releasing Alt would. Escape reaches this only when
+   * there is no selection in progress to abandon first.
+   */
+  function leaveSelectMode() {
+    if (!selectMode.enabled) return false;
+    setSelectMode({ enabled: false, combine: selectMode.combine });
+    return true;
+  }
+
   for (const button of highlightModeButtonsList) {
     listen(button, 'click', () => {
       setHighlightModeUI(button.dataset.mode);
     });
   }
+  for (const control of dom.selectModeSwitches) {
+    listen(control, 'click', () => {
+      setSelectMode({ enabled: !selectMode.enabled, combine: selectMode.combine });
+    });
+  }
+  // The selection bar's Undo, Cancel and Confirm press the panel's buttons for
+  // the tool whose controls they mirror (step-controls.js), so each action
+  // keeps one handler, and a disabled panel button stays inert from the bar.
+  dom.selectBarStepButtons.forEach((button, index) => {
+    listen(button, 'click', () => {
+      const tool = selectBarSteps.dataset.tool;
+      if (!STEP_CONTROL_TOOLS.includes(tool)) return;
+      const target = documentOwner.getElementById(
+        `${tool}-${selectBarActions[index]}-btn`
+      );
+      if (target !== null) target.click();
+    });
+  });
+  for (const button of dom.selectCombineButtons) {
+    listen(button, 'click', () => {
+      setSelectMode({ enabled: selectMode.enabled, combine: button.dataset.combine });
+    });
+  }
   listen(documentOwner, 'keydown', event => {
     if (!isUnclaimedEscape(event)) return;
-    if (!cancelActiveSelection()) return;
+    if (!cancelActiveSelection() && !leaveSelectMode()) return;
     event.preventDefault();
     event.stopPropagation();
   });
   setHighlightModeUI(pressedMode);
+  setSelectMode(selectMode);
 
   function destroy() {
     if (destroyed) return;
@@ -310,6 +424,8 @@ export function initHighlightModeUI(options) {
   return {
     setHighlightModeUI,
     getActiveMode: () => activeHighlightMode,
+    setSelectMode,
+    getSelectMode: () => selectMode,
     destroy
   };
 }

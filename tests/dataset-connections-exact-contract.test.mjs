@@ -2,13 +2,14 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
-import { DATA_LOAD_METHODS } from '../assets/js/analytics/tracker.js';
+import { DATA_LOAD_METHODS } from '../assets/js/app/data-load-methods.js';
 import {
   createDatasetReloadSupersededError
 } from '../assets/js/app/dataset-reload-outcome.js';
 import { getNotificationCenter } from '../assets/js/app/notification-center.js';
-import { updateUrlForDataSource } from '../assets/js/app/url-state.js';
+import { prepareUrlForDataSource } from '../assets/js/app/url-state.js';
 import { initDatasetConnections } from '../assets/js/app/ui/modules/dataset-connections.js';
+import { createTestDatasetIntents } from './helpers/dataset-intents.mjs';
 
 function createButton() {
   const listeners = new Map();
@@ -127,8 +128,10 @@ function captureNotifications(t) {
   notifications.dismiss = id => {
     events.push({ id, kind: 'dismiss' });
   };
-  notifications.error = message => {
-    events.push({ kind: 'error', message });
+  notifications.error = (message, options = {}) => {
+    const id = options.id ?? `connection-${++nextId}`;
+    events.push({ id, kind: 'error', message });
+    return id;
   };
   notifications.fail = (id, message) => {
     events.push({ id, kind: 'fail', message });
@@ -142,7 +145,7 @@ function captureNotifications(t) {
 
 function dataset(index) {
   return {
-    version: 2,
+    version: 3,
     id: `dataset-${index}`,
     name: `Dataset ${index}`,
     description: '',
@@ -157,9 +160,16 @@ function dataset(index) {
       n_edges: null,
     },
     embeddings: {
-      available_dimensions: [2],
       default_dimension: 2,
-      files: { '2d': 'points_2d.bin' },
+      defaults: { '2d': 'X_umap' },
+      items: {
+        X_umap: {
+          label: 'X_umap',
+          dimension: 2,
+          file: 'embeddings/0_2d.bin',
+          source: { key: 'X_umap', columns: [0, 1] },
+        },
+      },
     },
     obs_fields: [],
   };
@@ -489,8 +499,7 @@ function makeLifecycleHarness(
   const clearCalls = [];
   const populationCalls = [];
 
-  const connectionControls = initDatasetConnections({
-    activateDataset: async (
+  const datasetIntents = createTestDatasetIntents(async (
       datasetId,
       sourceType,
       loadMethod,
@@ -520,7 +529,9 @@ function makeLifecycleHarness(
       if (activationMakesActive) currentSourceType = sourceType;
       priorSource.disconnect();
       return true;
-    },
+    });
+  const connectionControls = initDatasetConnections({
+    datasetIntents,
     clearDataset: async () => {
       clearCalls.push(currentSourceType);
       const result = typeof clearResult === 'function'
@@ -556,6 +567,7 @@ function makeLifecycleHarness(
     clearCalls,
     connectButton:
       type === 'remote' ? dom.remoteConnectBtn : dom.githubConnectBtn,
+    datasetIntents,
     disconnectButton:
       type === 'remote'
         ? dom.remoteDisconnectBtn
@@ -641,7 +653,7 @@ function makeHarness(t, type, count) {
   const infoUpdates = [];
 
   initDatasetConnections({
-    activateDataset: async (
+    datasetIntents: createTestDatasetIntents(async (
       datasetId,
       sourceType,
       loadMethod,
@@ -653,18 +665,18 @@ function makeHarness(t, type, count) {
       priorSource.disconnect();
       const connectionInfo = candidate.getConnectionInfo();
       if (sourceType === 'remote') {
-        updateUrlForDataSource('remote', {
+        prepareUrlForDataSource('remote', {
           datasetId,
           serverUrl: connectionInfo.url,
-        });
+        }).commit();
       } else {
-        updateUrlForDataSource('github-repo', {
+        prepareUrlForDataSource('github-repo', {
           datasetId,
           path: connectionInfo.inputPath,
-        });
+        }).commit();
       }
       return true;
-    },
+    }),
     clearDataset: async () => true,
     dataSourceManager: manager,
     dom,
@@ -821,6 +833,43 @@ test('active Remote and GitHub reconnects are rejected before candidate mutation
       );
       assert.equal(errors.length, 1);
       assert.match(errors[0].message, /active.*disconnect.*reconnect/i);
+    });
+  }
+});
+
+test('a typed address the source cannot read is refused before any connection starts', async t => {
+  // A malformed GitHub path used to start a connection, fail inside the source,
+  // and come back classified as unreadable data: "what is published there is
+  // not in a format Cellucid can read. Re-export it with cellucid prepare" -
+  // advice that cannot help someone who mistyped a path. Empty input asked to
+  // "Enter one remote server". Both are now refused with one sentence about
+  // the input itself, and no candidate is created.
+  const cases = [
+    ['remote', '', /^Enter a remote server address, such as http:\/\/localhost:8765, before connecting\.$/],
+    ['remote', 'https://remote.test/', /^The remote server address was not tried: remote server URL .*trailing slash\. Use the bare address the server prints as Local URL\.$/],
+    ['remote', 'localhost:8765', /^The remote server address was not tried: .*HTTP\(S\).*\. Use the bare address the server prints as Local URL\.$/],
+    ['github-repo', '   ', /^Enter a GitHub repository path, such as owner\/repo\/exports, before connecting\.$/],
+    ['github-repo', 'not a repo', /^Invalid GitHub path\. Use format: owner\/repo\/exports/],
+  ];
+  for (const [type, value, expected] of cases) {
+    await t.test(`${type} ${JSON.stringify(value)}`, async t => {
+      const harness = makeLifecycleHarness(t, type, 1);
+      const input = type === 'remote'
+        ? harness.dom.remoteServerUrl
+        : harness.dom.githubRepoUrl;
+      input.value = value;
+      await harness.connectButton.activate();
+
+      assert.equal(harness.factory.creationCount, 0);
+      assert.deepEqual(harness.activations, []);
+      assert.equal(harness.connectButton.disabled, false);
+      assert.deepEqual(
+        harness.notifications.map(event => event.kind),
+        ['error'],
+        'one refusal, no loading notification and no connection failure'
+      );
+      assert.match(harness.notifications[0].message, expected);
+      assert.doesNotMatch(harness.notifications[0].message, /re-export/i);
     });
   }
 });
@@ -1079,6 +1128,64 @@ test('Remote connection loss clears only active science and retires transport on
       );
     });
   }
+
+  await t.test('a newer choice still loading is never superseded by recovery', async t => {
+    for (const newerChoicePublishes of [true, false]) {
+      await t.test(
+        newerChoicePublishes ? 'the choice replaces it' : 'the choice fails',
+        async t => {
+          const harness = makeLifecycleHarness(t, 'remote', 1, {
+            activationMakesActive: true,
+          });
+          await harness.connectButton.activate();
+          const lost = harness.factory.candidates[0];
+          // The user chose another dataset, which is still loading.
+          const newerChoice = harness.datasetIntents.begin({
+            label: 'Loading another dataset…',
+            value: null,
+          });
+          lost.loseConnection();
+          await new Promise(resolve => setImmediate(resolve));
+          await new Promise(resolve => setImmediate(resolve));
+          // The loss is said at once, while recovery waits for the choice.
+          const lossNotices = harness.notifications.filter(
+            event => event.kind === 'error' && /connection was lost\.$/.test(event.message)
+          );
+          assert.equal(lossNotices.length, 1);
+          assert.deepEqual(harness.clearCalls, []);
+          assert.equal(newerChoice.transaction.signal.aborted, false);
+          assert.equal(lost.disconnectCalls, 0);
+
+          if (newerChoicePublishes) harness.setCurrentSourceType('local-demo');
+          harness.datasetIntents.settle(newerChoice);
+          await waitFor(
+            () => harness.notifications.some(
+              event =>
+                event.kind === 'error' &&
+                /connection was lost.*reconnect/i.test(event.message)
+            ),
+            'connection-loss completion'
+          );
+          // Recovery completes that same notice.
+          assert.equal(
+            harness.notifications.find(
+              event => event.kind === 'error' && /connection was lost.*reconnect/i.test(event.message)
+            ).id,
+            lossNotices[0].id
+          );
+          // Only a lost dataset still on screen is cleared, and only after
+          // the newer choice settled.
+          assert.deepEqual(
+            harness.clearCalls,
+            newerChoicePublishes ? [] : ['remote']
+          );
+          assert.equal(newerChoice.transaction.signal.aborted, false);
+          assert.equal(lost.disconnectCalls, 1);
+          assert.deepEqual(harness.unregistrations, ['remote']);
+        }
+      );
+    }
+  });
 
   await t.test('active clear failure blocks recovery without teardown', async t => {
     const harness = makeLifecycleHarness(t, 'remote', 1, {

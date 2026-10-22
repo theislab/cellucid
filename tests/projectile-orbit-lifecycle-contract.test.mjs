@@ -70,13 +70,22 @@ function increment(map, key) {
   map.set(key, (map.get(key) ?? 0) + 1);
 }
 
-function createProjectileHarness({ failedBufferIds = [] } = {}) {
+function createProjectileHarness({
+  failedBufferIds = [],
+  getCollisionStage = () => null,
+} = {}) {
   let nextBufferId = 1;
   const deleteAttempts = new Map();
   const failuresRemaining = new Set(failedBufferIds);
   const calls = {
     bufferData: 0,
     drawArrays: 0,
+  };
+  const vertexArrays = {
+    bound: null,
+    created: [],
+    deleteAttempts: new Map(),
+    drawnWith: [],
   };
   const gl = {
     ARRAY_BUFFER: 0x8892,
@@ -110,8 +119,19 @@ function createProjectileHarness({ failedBufferIds = [] } = {}) {
     bufferData() {
       calls.bufferData += 1;
     },
+    bindVertexArray(vao) {
+      vertexArrays.bound = vao;
+    },
     createBuffer() {
       return { id: nextBufferId++ };
+    },
+    createVertexArray() {
+      const vao = { id: `vao-${vertexArrays.created.length + 1}` };
+      vertexArrays.created.push(vao);
+      return vao;
+    },
+    deleteVertexArray(vao) {
+      increment(vertexArrays.deleteAttempts, vao.id);
     },
     deleteBuffer(buffer) {
       increment(deleteAttempts, buffer.id);
@@ -121,9 +141,15 @@ function createProjectileHarness({ failedBufferIds = [] } = {}) {
     },
     drawArrays() {
       calls.drawArrays += 1;
+      vertexArrays.drawnWith.push(vertexArrays.bound);
     },
     enable() {},
-    enableVertexAttribArray() {},
+    enableVertexAttribArray() {
+      assert.ok(
+        vertexArrays.created.includes(vertexArrays.bound),
+        'projectile attribute state must only change on its own vertex arrays',
+      );
+    },
     uniform1f() {},
     uniformMatrix4fv() {},
     useProgram() {},
@@ -182,8 +208,7 @@ function createProjectileHarness({ failedBufferIds = [] } = {}) {
     getLassoCtx: () => null,
     getPointerLockActive: () => true,
     getNavigationMode: () => 'free',
-    getGridBounds: () => null,
-    isGridVisible: () => false,
+    getCollisionStage,
   });
   const drawParams = {
     basePointSize: 4,
@@ -203,6 +228,7 @@ function createProjectileHarness({ failedBufferIds = [] } = {}) {
     deleteAttempts,
     drawParams,
     system,
+    vertexArrays,
     viewportInfo,
   };
 }
@@ -217,9 +243,11 @@ const orbitBufferProperties = [
   'lineColorBuffer',
 ];
 
+const orbitVertexArrayProperties = ['meshVao', 'lineVao'];
+
 function createOrbitState(prefix) {
   return Object.fromEntries(
-    orbitBufferProperties.map(property => [
+    [...orbitBufferProperties, ...orbitVertexArrayProperties].map(property => [
       property,
       { id: `${prefix}:${property}` },
     ])
@@ -232,6 +260,7 @@ function createOrbitHarness({
   failedProgramIds = [],
 } = {}) {
   const bufferDeleteAttempts = new Map();
+  const vertexArrayDeleteAttempts = new Map();
   const programDeleteAttempts = new Map();
   const bufferFailuresRemaining = new Set(failedBufferIds);
   const programFailuresRemaining = new Set(failedProgramIds);
@@ -251,6 +280,14 @@ function createOrbitHarness({
         throw new Error(`synthetic ${buffer.id} deletion failure`);
       }
     },
+    deleteVertexArray(vao) {
+      assert.equal(
+        renderer.viewStates.size,
+        0,
+        'every logical view must detach before disposal deletes any vertex array'
+      );
+      increment(vertexArrayDeleteAttempts, vao.id);
+    },
     deleteProgram(program) {
       increment(programDeleteAttempts, program.id);
       if (programFailuresRemaining.delete(program.id)) {
@@ -264,13 +301,13 @@ function createOrbitHarness({
     _pendingViewRetirements: new Map(),
     _disposeRequested: false,
     _disposed: false,
-    program3D: { id: 'program-3d' },
-    program2D: { id: 'program-2d' },
+    program: { id: 'program-3d' },
   });
   return {
     bufferDeleteAttempts,
     programDeleteAttempts,
     renderer,
+    vertexArrayDeleteAttempts,
   };
 }
 
@@ -279,6 +316,7 @@ test('projectile disable pauses simulation and hides every draw until exact re-e
     calls,
     drawParams,
     system,
+    vertexArrays,
     viewportInfo,
   } = createProjectileHarness();
 
@@ -300,6 +338,8 @@ test('projectile disable pauses simulation and hides every draw until exact re-e
   system.draw(drawParams);
   assert.equal(calls.drawArrays, 1);
   assert.ok(calls.bufferData > 0);
+  assert.deepEqual(vertexArrays.drawnWith, [vertexArrays.created[0]]);
+  assert.equal(vertexArrays.bound, null, 'the pass must leave no vertex array bound');
 
   system.startCharging(viewportInfo);
   assert.equal(system.isCharging(), true);
@@ -325,12 +365,68 @@ test('projectile disable pauses simulation and hides every draw until exact re-e
   assert.equal(system.dispose(), true);
 });
 
+/**
+ * Fire one projectile straight ahead (-z, slightly lofted) and record its
+ * flight at 60 steps a second until it leaves the range or the time is up.
+ */
+function flyOneProjectile(getCollisionStage, seconds = 1.2) {
+  const { system, viewportInfo } = createProjectileHarness({ getCollisionStage });
+  system.setEnabled(true);
+  system.spawn({ navigationMode: 'free', pointerLockActive: true, viewportInfo });
+  const heights = [];
+  for (let step = 0; step < seconds * 60; step++) {
+    system.update(1 / 60);
+    const [position] = system.getProjectilePositions();
+    if (!position) break;
+    heights.push(position[1]);
+  }
+  system.dispose();
+  return heights;
+}
+
+test('the studio floor stops a projectile over the stage and lets it fall past the edge', () => {
+  const floorY = -0.3;
+  const floor = radius => ({ kind: 'floor', y: floorY, centerX: 0, centerZ: 0, radius });
+  const free = flyOneProjectile(() => null);
+  assert.ok(Math.min(...free) < floorY - 0.1, 'without a floor the projectile falls past its height');
+
+  // Long enough to land, settle and lie on the floor.
+  const landed = flyOneProjectile(() => floor(8.5), 6);
+  assert.ok(landed.length > 30, 'the projectile stays in flight long enough to land');
+  assert.ok(
+    Math.min(...landed) >= floorY,
+    `a projectile over the stage never passes below the floor (lowest ${Math.min(...landed)})`
+  );
+  assert.ok(
+    landed.some(y => y < floorY + 0.05),
+    'the projectile reaches the floor within the flight'
+  );
+  assert.ok(
+    landed.slice(-30).every(y => y < floorY + 0.05),
+    'the projectile comes to rest on the floor and stays there'
+  );
+
+  // A stage too small to reach: the projectile is past its edge when it
+  // comes down, so it keeps falling.
+  const offStage = flyOneProjectile(() => floor(0.25));
+  assert.ok(Math.min(...offStage) < floorY - 0.1);
+});
+
+test('the grid box holds a projectile in on every wall', () => {
+  const box = { kind: 'box', min: -0.3, max: 0.3 };
+  const heights = flyOneProjectile(() => box, 3);
+  assert.ok(heights.length > 0);
+  assert.ok(Math.min(...heights) >= box.min, 'the floor of the box holds');
+  assert.ok(Math.max(...heights) <= box.max, 'the ceiling of the box holds');
+});
+
 test('projectile disposal attempts every buffer and retries only failed handles', () => {
   const {
     calls,
     deleteAttempts,
     drawParams,
     system,
+    vertexArrays,
   } = createProjectileHarness({
     failedBufferIds: [1, 3],
   });
@@ -361,6 +457,10 @@ test('projectile disposal attempts every buffer and retries only failed handles'
   assert.deepEqual(
     Object.fromEntries(deleteAttempts),
     { 1: 2, 2: 1, 3: 2, 4: 1 }
+  );
+  assert.deepEqual(
+    Object.fromEntries(vertexArrays.deleteAttempts),
+    { 'vao-1': 1, 'vao-2': 1 }
   );
   assert.equal(system.dispose(), false);
 });
@@ -442,8 +542,7 @@ test('orbit context loss drops every invalid handle without GL retirement', () =
   assert.equal(renderer.handleContextLost(), false);
   assert.equal(renderer.viewStates.size, 0);
   assert.equal(renderer._pendingViewRetirements.size, 0);
-  assert.equal(renderer.program3D, null);
-  assert.equal(renderer.program2D, null);
+  assert.equal(renderer.program, null);
   assert.equal(bufferDeleteAttempts.size, 0);
   assert.equal(programDeleteAttempts.size, 0);
   assert.equal(renderer.dispose(), false);
@@ -462,6 +561,7 @@ test('orbit disposal detaches all views and attempts every program and buffer', 
     bufferDeleteAttempts,
     programDeleteAttempts,
     renderer,
+    vertexArrayDeleteAttempts,
   } = createOrbitHarness({
     states: [
       ['first', first],
@@ -484,10 +584,14 @@ test('orbit disposal detaches all views and attempts every program and buffer', 
     orbitBufferProperties.length * 2
   );
   assert.deepEqual(
+    [...vertexArrayDeleteAttempts.values()],
+    [1, 1, 1, 1],
+    'each view retires its own mesh and line vertex arrays exactly once'
+  );
+  assert.deepEqual(
     Object.fromEntries(programDeleteAttempts),
     {
       'program-3d': 1,
-      'program-2d': 1,
     }
   );
   assert.throws(
@@ -507,7 +611,6 @@ test('orbit disposal detaches all views and attempts every program and buffer', 
     Object.fromEntries(programDeleteAttempts),
     {
       'program-3d': 2,
-      'program-2d': 1,
     }
   );
   assert.equal(renderer.dispose(), false);

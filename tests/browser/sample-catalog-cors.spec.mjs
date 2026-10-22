@@ -36,24 +36,27 @@ test('direct CORS catalog startup adopts its explicit default sample', async ({ 
     launchUrl(CORS_SAMPLE_ROOT, 'sample-cors-catalog'),
     { waitUntil: 'domcontentloaded' },
   );
-  await page.getByRole('button', { name: /Choose a Dataset/ }).click();
+  await page.getByRole('button', { name: /Choose a dataset/ }).click();
 
   const datasetSelect = page.locator('#dataset-select');
   await expect(
     datasetSelect.locator(`option[value="${CORS_SAMPLE_SELECTION}"]`),
   ).toHaveText(/Current UI prepared fixture/);
   await expect(datasetSelect).toHaveValue(CORS_SAMPLE_SELECTION);
-  await expect(datasetSelect).toBeFocused();
+  // Onboarding leads to the Session panel, never into the dropdown itself;
+  // a click moves no focus, so nothing is ringed.
+  await expect(page.locator('#session-section > summary')).not.toBeFocused();
+  await expect(datasetSelect).not.toBeFocused();
   await expect(page.locator('#dataset-name')).toHaveText(
     'Current UI prepared fixture',
   );
   await expect(page.locator('#filter-count')).toHaveText(
-    'Showing all 120 points',
+    'Showing all 120 cells',
   );
-  await expect(page.locator('#dimension-select')).toHaveValue('2');
+  await expect(page.locator('#view-representation-select option:checked')).toHaveText(/ · 2D$/);
   await expect(page.locator('#navigation-mode')).toHaveValue('planar');
   const categoryBuilderToggle = page.locator(
-    '#cat-builder-accordion-item > .analysis-accordion-header',
+    '#cat-builder-accordion-item .disclosure-header',
   );
   await expect(categoryBuilderToggle).toBeEnabled();
   await expect(categoryBuilderToggle).toHaveAttribute(
@@ -76,7 +79,7 @@ test('direct CORS catalog startup adopts its explicit default sample', async ({ 
   ).toHaveLength(1);
   for (const requiredUrl of [
     `${CORS_SAMPLE_ROOT}current-ui-prepared/dataset_identity.json`,
-    `${CORS_SAMPLE_ROOT}current-ui-prepared/points_2d.bin`,
+    `${CORS_SAMPLE_ROOT}current-ui-prepared/embeddings/0_2d.bin`,
     `${CORS_SAMPLE_ROOT}current-ui-prepared/obs_manifest.json`,
   ]) {
     expect(sampleRequests.some(request => request.url === requiredUrl)).toBe(true);
@@ -97,7 +100,7 @@ test('a failed direct CORS catalog is explained inline and stays recoverable', a
     launchUrl(missingRoot, 'sample-cors-failure'),
     { waitUntil: 'domcontentloaded' },
   );
-  await page.getByRole('button', { name: /Choose a Dataset/ }).click();
+  await page.getByRole('button', { name: /Choose a dataset/ }).click();
 
   // One unreachable sample catalog is that catalog's failure. The selector
   // stays usable so a dataset opened from disk still needs no network at all.

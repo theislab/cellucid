@@ -1,325 +1,500 @@
-// Lightweight Google Analytics helpers to track dataset loads and UI interactions
-// without impacting rendering performance.
+/**
+ * Google Analytics delivery for Cellucid.
+ *
+ * Every event is built from coarse descriptors, validated against
+ * `analytics/schema.js`, and only then handed to `gtag`. Validation runs on
+ * every host, so a malformed event is caught in development and tests even
+ * though nothing is sent there; on a production host an invalid event is
+ * dropped whole, never trimmed into something half-true.
+ *
+ * Application code reaches this module only through `app/optional-analytics.js`,
+ * which loads it with a dynamic import and keeps the application independent
+ * of whether a privacy blocker lets it load.
+ *
+ * @module analytics/tracker
+ */
 
-const ANALYTICS_ID_MAX = 60;
-const BUTTON_SELECTOR = 'button, [role="button"], a, input[type="button"], input[type="submit"]';
+import {
+  FEATURES,
+  SOURCE_TYPES,
+  countBucket,
+  describeError,
+  dimensionsDescriptor,
+  embeddingCandidateBucket,
+  durationBucket,
+  metricRating,
+  validateEvent,
+  validateUserProperties,
+} from './schema.js';
+import { DATA_CONFIG } from '../data/data-source.js';
+import {
+  SOFTWARE_RASTERIZER_MARKERS,
+} from '../app/ui/modules/benchmark/renderer-identity.js';
+import { detectSmokeSupport } from '../rendering/smoke-cloud/smoke-capabilities.js';
 
-export const DATA_LOAD_METHODS = {
-  DEFAULT_DEMO: 'default-demo',
-  SERVER_AUTO: 'server-auto',
-  DATASET_DROPDOWN: 'dataset-dropdown',
-  DATASET_URL_PARAM: 'dataset-url-param',
-  SAMPLE_DEMO: 'sample-demo',
-  LOCAL_PREPARED: 'local-user-prepared',
-  LOCAL_H5AD: 'local-user-h5ad',
-  LOCAL_ZARR_DIRECTORY: 'local-user-zarr-directory',
-  LOCAL_ZARR_ZIP: 'local-user-zarr-zip',
-  REMOTE_URL_PARAM: 'remote-url-param',
-  REMOTE_CONNECT: 'remote-connect',
-  GITHUB_URL_PARAM: 'github-url-param',
-  GITHUB_CONNECT: 'github-connect',
-  JUPYTER_AUTO: 'jupyter-auto',
-  BENCHMARK_SYNTHETIC: 'benchmark-synthetic',
-  STATE_RESTORE_FILE: 'state-restore-file',
-  STATE_RESTORE_URL: 'state-restore-url',
-  STATE_RESTORE_AUTO: 'state-restore-auto'
-};
+const EXPORTS_META_SELECTOR = 'meta[name="cellucid-exports-base-url"]';
+const VERSION_PATTERN = /^\d{1,3}\.\d{1,3}\.\d{1,3}$/;
 
-const KNOWN_BUTTON_IDS = {
-  'welcome-demo-btn': 'hero:start-exploring',
-  'save-state-btn': 'session:save',
-  'load-state-btn': 'session:load',
-  'user-data-h5ad-btn': 'data:load-h5ad',
-  'user-data-zarr-btn': 'data:load-zarr',
-  'user-data-browse-btn': 'data:load-prepared',
-  'remote-connect-btn': 'data:remote-connect',
-  'remote-disconnect-btn': 'data:remote-disconnect',
-  'github-connect-btn': 'data:github-connect',
-  'github-disconnect-btn': 'data:github-disconnect',
-  'add-highlight-page': 'highlight:add-page',
-  'clear-all-highlights': 'highlight:clear',
-  'benchmark-run': 'benchmark:load-synthetic',
-  'benchmark-report-btn': 'benchmark:copy-report',
-  'bottleneck-analyze-btn': 'benchmark:analyze'
-};
+let initialized = false;
+let publicSampleCatalog = false;
+let smokeSupported = null;
+let appReadyReported = false;
+let startupFailureReported = false;
+const reportedFeatures = new Set();
 
-let buttonTrackingAttached = false;
-const loadSessions = new Map();
-
-const clampString = (value, maxLen = 120) => {
-  if (value === undefined || value === null) return undefined;
-  const s = String(value).replace(/\s+/g, ' ').trim();
-  if (!s) return undefined;
-  return s.length > maxLen ? s.slice(0, maxLen) : s;
-};
-
-function isAnalyticsEnabled() {
+function analyticsEnabled() {
   return (
     typeof window !== 'undefined' &&
     window.cellucidAnalyticsEnabled === true
   );
 }
 
-function safeNumber(value) {
-  const n = Number(value);
-  return Number.isFinite(n) ? n : undefined;
+/**
+ * A schema violation is a defect in Cellucid, not in the user's data. In
+ * production the event is dropped; everywhere else the violation is raised as
+ * an uncaught error so tests and development see it, without throwing into
+ * the application code that asked for the event.
+ */
+function reportViolation(error) {
+  if (analyticsEnabled()) {
+    console.warn('[Cellucid] Dropped an invalid analytics event:', error.message);
+    return;
+  }
+  if (typeof globalThis.reportError === 'function') {
+    globalThis.reportError(error);
+    return;
+  }
+  queueMicrotask(() => {
+    throw error;
+  });
 }
 
-function normalizeAnalyticsId(rawId) {
-  if (!rawId) return null;
-  return rawId
-    .trim()
-    .replace(/\s+/g, '-')
-    .replace(/[^a-zA-Z0-9:_-]/g, '')
-    .slice(0, ANALYTICS_ID_MAX);
-}
-
-function sendEvent(name, params = {}) {
-  if (!name) return;
-  if (!isAnalyticsEnabled()) return;
+function deliver(command, name, payload) {
+  if (!analyticsEnabled()) return;
   if (typeof window.gtag !== 'function') {
-    throw new Error(
-      'Analytics is enabled but the production bootstrap is incomplete'
-    );
+    console.error('[Cellucid] Analytics is enabled but gtag is missing.');
+    return;
   }
+  if (command === 'event') window.gtag('event', name, payload);
+  else window.gtag('set', 'user_properties', payload);
+}
 
-  // Drop empty/undefined values to keep payload lean
-  const cleaned = {};
-  for (const [key, val] of Object.entries(params)) {
-    if (val === undefined || val === null || val === '') continue;
-    cleaned[key] = val;
+function send(name, params) {
+  let payload;
+  try {
+    payload = validateEvent(name, params);
+  } catch (error) {
+    reportViolation(error);
+    return;
   }
-  cleaned.transport_type = cleaned.transport_type || 'beacon';
-
-  window.gtag('event', name, cleaned);
+  deliver('event', name, payload);
 }
 
-function tagKnownButtons() {
-  Object.entries(KNOWN_BUTTON_IDS).forEach(([id, analyticsId]) => {
-    const el = document.getElementById(id);
-    if (!el) return;
-    if (!el.dataset.analyticsId) {
-      el.dataset.analyticsId = analyticsId;
-    }
-  });
-}
-
-function getClickType(event) {
-  if (event.button === 1) return 'middle';
-  if (event.button === 2) return 'secondary';
-  return 'primary';
-}
-
-export function trackButtonClick(controlId, meta = {}) {
-  if (!controlId) return;
-  sendEvent('ui_button_click', {
-    control_id: clampString(controlId, ANALYTICS_ID_MAX),
-    control_type: clampString(meta.controlType, 32),
-    click_type: clampString(meta.clickType, 16),
-    pointer_type: clampString(meta.pointerType, 16),
-    dataset_id: clampString(meta.datasetId, 120),
-    modifiers: clampString(meta.modifiers, 40)
-  });
-}
-
-export function trackDataLoadMethod(method, context = {}) {
-  if (!method) return;
-  const payload = {
-    load_method: clampString(method, 64),
-    ...buildDatasetStatsPayload(context),
-    duration_ms: safeNumber(context.durationMs),
-    error_code: clampString(context.errorCode, 80),
-    http_status: safeNumber(context.httpStatus),
-    failure_reason: clampString(context.failureReason, 160)
-  };
-
-  if (context.success !== undefined && context.success !== null) {
-    payload.success = context.success ? 1 : 0;
+function setUserProperties(properties) {
+  let payload;
+  try {
+    payload = validateUserProperties(properties);
+  } catch (error) {
+    reportViolation(error);
+    return;
   }
-
-  sendEvent('data_load', payload);
+  deliver('set', null, payload);
 }
 
-export function beginDataLoad(method, context = {}) {
-  const token = `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
-  loadSessions.set(token, {
-    method,
-    start: typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now(),
-    context
-  });
-  return token;
+function isCount(value) {
+  return Number.isSafeInteger(value) && value >= 0;
 }
 
-function getDuration(start) {
-  const end = typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
-  return start != null ? end - start : undefined;
+// --------------------------------------------------------------------------
+// Environment
+// --------------------------------------------------------------------------
+
+function inputClass() {
+  const media = query => (
+    typeof window.matchMedia === 'function' && window.matchMedia(query).matches
+  );
+  const fine = media('(any-pointer: fine)');
+  const coarse = media('(any-pointer: coarse)');
+  if (fine && coarse) return 'hybrid';
+  if (coarse) return 'touch';
+  return 'mouse';
 }
 
-function sanitizeError(err) {
-  if (!err) return { errorCode: undefined, httpStatus: undefined, failureReason: undefined };
-  const httpStatus = safeNumber(err.status || err.statusCode || err.response?.status);
-  const errorCode = err.code || err.name || err.type;
-  const failureReason = (err.message || '').slice(0, 160) || undefined;
-  return { errorCode, httpStatus, failureReason };
-}
-
-function buildDatasetStatsPayload(context = {}) {
-  const stats = context.metadata?.stats || {};
-  const cellCount = safeNumber(stats.n_cells ?? context.cellCount);
-  const geneCount = safeNumber(stats.n_genes ?? context.geneCount);
-  const obsCount = safeNumber(stats.n_obs_fields ?? context.obsFieldCount);
-  const edgeCount = safeNumber(stats.n_edges ?? context.edgeCount);
-
-  return {
-    source_type: clampString(context.sourceType, 64),
-    dataset_id: clampString(context.datasetId || context.metadata?.id, 120),
-    dataset_name: clampString(context.datasetName || context.metadata?.name, 120),
-    cell_count: cellCount,
-    gene_count: geneCount,
-    obs_field_count: obsCount,
-    edge_count: edgeCount,
-    has_connectivity: stats.has_connectivity != null ? Number(!!stats.has_connectivity) : undefined,
-    previous_source: clampString(context.previousSource, 64),
-    previous_dataset_id: clampString(context.previousDatasetId, 120),
-    reload: context.reload ? 1 : 0,
-    sample_dataset: context.sourceType === 'local-demo' ? 1 : undefined
-  };
-}
-
-export function completeDataLoadSuccess(token, context = {}) {
-  const session = loadSessions.get(token);
-  const durationMs = session ? getDuration(session.start) : undefined;
-  const base = session ? session.context : {};
-  trackDataLoadMethod(session?.method || context.loadMethod, {
-    ...base,
-    ...context,
-    durationMs,
-    success: 1
-  });
-  loadSessions.delete(token);
-}
-
-export function completeDataLoadFailure(token, context = {}) {
-  const session = loadSessions.get(token);
-  const durationMs = session ? getDuration(session.start) : undefined;
-  const base = session ? session.context : {};
-  const { errorCode, httpStatus, failureReason } = sanitizeError(context.error || context);
-  trackDataLoadMethod(session?.method || context.loadMethod, {
-    ...base,
-    ...context,
-    durationMs,
-    success: 0,
-    errorCode: context.errorCode || errorCode,
-    httpStatus: context.httpStatus || httpStatus,
-    failureReason: context.failureReason || failureReason
-  });
-  loadSessions.delete(token);
+function viewportClass() {
+  const width = window.innerWidth;
+  if (width < 600) return 'phone';
+  if (width < 1024) return 'tablet';
+  if (width < 1920) return 'desktop';
+  return 'wide';
 }
 
 /**
- * Discard an in-flight load session without recording success or failure.
- * Used when a newer dataset request supersedes work before it owns any result.
- *
- * @param {string} token
+ * Only whether WebGL runs on a CPU rasterizer. The renderer string is a
+ * fingerprinting surface: it is classified here and never leaves this
+ * function. Chromium masks `RENDERER` as "WebKit WebGL", so the debug
+ * extension is consulted only then; Firefox already reports a sanitized
+ * renderer and is never asked for the extension, which it is retiring.
  */
-export function cancelDataLoad(token) {
-  loadSessions.delete(token);
+function rendererClass(gl) {
+  if (gl === null || typeof gl?.getParameter !== 'function') return 'unknown';
+  try {
+    let text = `${gl.getParameter(gl.RENDERER)} ${gl.getParameter(gl.VENDOR)}`;
+    if (/^webkit webgl\b/i.test(text)) {
+      const debugInfo = gl.getExtension?.('WEBGL_debug_renderer_info') ?? null;
+      if (debugInfo === null) return 'unknown';
+      text = `${gl.getParameter(debugInfo.UNMASKED_RENDERER_WEBGL)} ` +
+        `${gl.getParameter(debugInfo.UNMASKED_VENDOR_WEBGL)}`;
+    }
+    const lower = text.toLowerCase();
+    return SOFTWARE_RASTERIZER_MARKERS.some(marker => lower.includes(marker))
+      ? 'software'
+      : 'hardware';
+  } catch {
+    return 'unknown';
+  }
 }
 
-export function trackPerformanceMetric(metricName, value, context = {}) {
-  if (!metricName || value == null) return;
-  const numericValue = safeNumber(value);
-  if (numericValue === undefined) return;
-
-  sendEvent('web_vital', {
-    metric_name: metricName,
-    metric_value: numericValue,
-    navigation_type: context.navigationType,
-    dataset_id: context.datasetId,
-    source_type: context.sourceType
-  });
+/**
+ * Whether a dataset id is public: only the sample catalog the deployment
+ * itself declares. A catalog chosen with `?exportsBaseUrl=` can be anyone's.
+ */
+function readPublicSampleCatalog() {
+  const metas = document.querySelectorAll(EXPORTS_META_SELECTOR);
+  return (
+    metas.length === 1 &&
+    typeof DATA_CONFIG.EXPORTS_BASE_URL === 'string' &&
+    DATA_CONFIG.EXPORTS_BASE_URL === metas[0].getAttribute('content')
+  );
 }
 
-export function trackDatasetSelected(method, context = {}) {
-  if (!method) return;
-  sendEvent('dataset_selected', {
-    load_method: clampString(method, 64),
-    ...buildDatasetStatsPayload(context)
-  });
+// --------------------------------------------------------------------------
+// Feature adoption
+// --------------------------------------------------------------------------
+
+/**
+ * Developer-declared controls, by element id, mapped to `[feature, variant]`.
+ * A control is identified only by an id or attribute a developer wrote; its
+ * label, value or text is never read, because those carry dataset content.
+ */
+const CLICK_CONTROLS = Object.freeze({
+  'save-state-btn': ['session_save'],
+  'load-state-btn': ['session_load'],
+  'figure-export-btn': ['figure_export'],
+  'add-highlight-page': ['highlight_page', 'add'],
+  'select-bar-confirm': ['highlight_selection'],
+  'split-keep-view-btn': ['multiview', 'keep_view'],
+  'cinematic-save-btn': ['camera_path'],
+  'benchmark-run': ['benchmark'],
+  'highlight-mode-lasso': ['highlight_tool', 'lasso'],
+  'highlight-mode-proximity': ['highlight_tool', 'proximity'],
+  'highlight-mode-knn': ['highlight_tool', 'knn'],
+  'highlight-mode-annotation': ['highlight_tool', 'annotation'],
+  'analysis-header-simple': ['analysis', 'simple'],
+  'analysis-header-detailed': ['analysis', 'detailed'],
+  'analysis-header-correlation': ['analysis', 'correlation'],
+  'analysis-header-differential': ['analysis', 'differential'],
+  'analysis-header-signature': ['analysis', 'signature'],
+  'analysis-header-genesPanel': ['analysis', 'genes_panel'],
+  'gene-expression-dropdown': ['color_by_gene'],
+});
+
+/** `data-analytics-id` values declared on generated controls. */
+const DECLARED_CONTROLS = Object.freeze({
+  'data-mapping:default': ['data_mapping', 'default'],
+  'data-mapping:add-columns': ['data_mapping', 'embedding_columns'],
+  'legend:toggle-category': ['filter', 'category'],
+  'legend:highlight-category': ['legend_highlight'],
+  'highlight:delete-page': ['highlight_page', 'delete'],
+});
+
+/** `data-community-annotation-action` values. */
+const ANNOTATION_ACTIONS = Object.freeze({
+  'github-connection': ['community_annotation', 'github_connection'],
+});
+
+/**
+ * Controls counted on `change`. A select's variant comes from its option
+ * value only where those values are a fixed developer vocabulary; field
+ * selects carry dataset field names and are never read.
+ */
+const CHANGE_CONTROLS = Object.freeze({
+  'categorical-field': () => ['color_by_category'],
+  'continuous-field': () => ['color_by_continuous'],
+  'outlier-filter': () => ['filter', 'outlier'],
+  'toggle-connectivity': el => (el.checked ? ['connectivity'] : null),
+  'velocity-overlay-enabled': el => (el.checked ? ['vector_field'] : null),
+  'render-mode': el => {
+    if (el.value === 'points') return ['render_mode', 'points'];
+    if (el.value !== 'smoke') return null;
+    return ['render_mode', smokeSupported === false ? 'smoke_unsupported' : 'smoke'];
+  },
+  'view-layout-mode': el => (
+    el.value === 'grid' || el.value === 'single'
+      ? ['multiview', `layout_${el.value}`]
+      : null
+  ),
+  'navigation-mode': el => (
+    FEATURES.navigation_mode.includes(el.value)
+      ? ['navigation_mode', el.value]
+      : null
+  ),
+  // The representation picker: which dimension a view was switched to (its
+  // option group); the option value is a dataset key and is never read.
+  'view-representation-select': el => {
+    const dimension = el.selectedOptions?.[0]?.parentElement?.label?.[0];
+    return FEATURES.dimension.includes(dimension) ? ['dimension', dimension] : null;
+  },
+});
+
+/**
+ * `data-analytics-id` values declared on generated selects, counted on
+ * `change` (their option values are dataset keys and are never read).
+ */
+const DECLARED_CHANGE_CONTROLS = Object.freeze({
+  'data-mapping:embedding': ['data_mapping', 'embedding'],
+  'data-mapping:embedding-columns': ['data_mapping', 'embedding_columns'],
+  'data-mapping:knn': ['data_mapping', 'knn'],
+  'data-mapping:gene-names': ['data_mapping', 'gene_names'],
+  'data-mapping:expression': ['data_mapping', 'expression'],
+  'data-mapping:latent': ['data_mapping', 'latent'],
+  'data-mapping:vector-fields': ['data_mapping', 'vector_fields'],
+});
+
+
+const MAX_ANCESTOR_DEPTH = 8;
+
+function resolveClick(target) {
+  let element = target;
+  for (let depth = 0; element && depth < MAX_ANCESTOR_DEPTH; depth++) {
+    const declared = element.dataset?.analyticsId;
+    if (declared !== undefined) {
+      return Object.hasOwn(DECLARED_CONTROLS, declared)
+        ? DECLARED_CONTROLS[declared]
+        : null;
+    }
+    const action = element.dataset?.communityAnnotationAction;
+    if (action !== undefined) {
+      return Object.hasOwn(ANNOTATION_ACTIONS, action)
+        ? ANNOTATION_ACTIONS[action]
+        : null;
+    }
+    if (element.id && Object.hasOwn(CLICK_CONTROLS, element.id)) {
+      return CLICK_CONTROLS[element.id];
+    }
+    element = element.parentElement;
+  }
+  return null;
 }
 
-function attachDatasetChangeAnalytics(dataSourceManager) {
-  if (!dataSourceManager?.onDatasetChange) return;
-
-  dataSourceManager.onDatasetChange((event) => {
-    if (!event?.metadata) return;
-    const meta = event.metadata;
-    const method = event.loadMethod || dataSourceManager.getLastLoadMethod?.() || 'unspecified';
-    trackDatasetSelected(method, {
-      metadata: meta,
-      sourceType: event.sourceType,
-      datasetId: event.datasetId,
-      datasetName: meta.name,
-      previousDatasetId: event.previousDatasetId,
-      previousSource: event.previousSourceType
-    });
-  });
+function recordFeature(resolved) {
+  if (resolved === null) return;
+  const [feature, variant] = resolved;
+  const key = `${feature}:${variant ?? ''}`;
+  if (reportedFeatures.has(key)) return;
+  reportedFeatures.add(key);
+  send('feature_used', { feature, variant });
 }
 
-function setupButtonTracking({ dataSourceManager } = {}) {
-  if (buttonTrackingAttached || typeof document === 'undefined') return;
-  buttonTrackingAttached = true;
-
-  document.addEventListener('click', (event) => {
-    const target = event.target?.closest(BUTTON_SELECTOR);
-    if (!target) return;
-
-    // An analytics identifier is declared, never read off the control. Every
-    // content surface on a control here - its accessible name, its value, its
-    // text - is built from the loaded data or from something the user typed,
-    // so inferring an id from any of them sends that content to Google
-    // Analytics. The legend's per-category buttons are named after the
-    // categories of whichever dataset is open, and the highlight page buttons
-    // after names the user wrote. A control that declares nothing is counted
-    // by its element type instead.
-    const analyticsId = normalizeAnalyticsId(
-      target.dataset.analyticsId || target.id
-    ) || `button:${(target.tagName || 'unknown').toLowerCase()}`;
-    if (!analyticsId) return;
-
-    const datasetId = typeof dataSourceManager?.getCurrentDatasetId === 'function'
-      ? dataSourceManager.getCurrentDatasetId()
-      : undefined;
-
-    trackButtonClick(analyticsId, {
-      controlType: target.tagName?.toLowerCase(),
-      clickType: getClickType(event),
-      pointerType: event.pointerType || 'mouse',
-      datasetId,
-      modifiers: [
-        event.altKey ? 'alt' : '',
-        event.ctrlKey ? 'ctrl' : '',
-        event.metaKey ? 'meta' : '',
-        event.shiftKey ? 'shift' : ''
-      ].filter(Boolean).join('+') || undefined
-    });
+function attachFeatureListeners() {
+  // Only user-initiated events count: the application dispatches synthetic
+  // `change` events while it restores state, and those are not adoption.
+  document.addEventListener('click', event => {
+    if (!event.isTrusted) return;
+    recordFeature(resolveClick(event.target));
+  }, { capture: true, passive: true });
+  document.addEventListener('change', event => {
+    if (!event.isTrusted) return;
+    const target = event.target;
+    const declared = target?.dataset?.analyticsId;
+    if (declared !== undefined && Object.hasOwn(DECLARED_CHANGE_CONTROLS, declared)) {
+      recordFeature(DECLARED_CHANGE_CONTROLS[declared]);
+      return;
+    }
+    if (!target?.id || !Object.hasOwn(CHANGE_CONTROLS, target.id)) return;
+    recordFeature(CHANGE_CONTROLS[target.id](target));
   }, { capture: true, passive: true });
 }
 
-export function initAnalytics({ dataSourceManager } = {}) {
-  tagKnownButtons();
-  setupButtonTracking({ dataSourceManager });
-  attachDatasetChangeAnalytics(dataSourceManager);
+// --------------------------------------------------------------------------
+// Entry points
+// --------------------------------------------------------------------------
 
-  // If a dataset is already active (e.g., loaded before analytics init), emit one snapshot.
-  if (dataSourceManager?.hasActiveDataset?.()) {
-    const metadata = dataSourceManager.getCurrentMetadata?.();
-    if (metadata) {
-      trackDatasetSelected(dataSourceManager.getLastLoadMethod?.() || DATA_LOAD_METHODS.DEFAULT_DEMO, {
-        metadata,
-        sourceType: dataSourceManager.getCurrentSourceType?.(),
-        datasetId: dataSourceManager.getCurrentDatasetId?.()
-      });
-    }
+/**
+ * Start analytics for this page: environment user properties and feature
+ * listeners. Called once.
+ */
+export function initAnalytics() {
+  if (initialized) {
+    throw new Error('Cellucid analytics was initialized twice.');
+  }
+  initialized = true;
+  publicSampleCatalog = readPublicSampleCatalog();
+  setUserProperties({
+    input_class: inputClass(),
+    viewport_class: viewportClass(),
+  });
+  attachFeatureListeners();
+}
+
+function probeSmokeSupport(gl) {
+  if (gl === null || typeof gl?.getExtension !== 'function') return false;
+  try {
+    return detectSmokeSupport(gl).supported === true;
+  } catch {
+    return false;
   }
 }
+
+/**
+ * Report the viewer running for the first time.
+ *
+ * The device classes are probed only where they are sent, and with the pure
+ * capability check rather than the viewer's own: the viewer detects smoke
+ * support when smoke is first chosen, and analytics must observe the
+ * application, never move its work earlier.
+ *
+ * @param {{viewer: Object, hasDataset: boolean}} options
+ */
+export function trackAppReady({ viewer, hasDataset }) {
+  if (appReadyReported) return;
+  appReadyReported = true;
+  if (analyticsEnabled()) {
+    const gl = viewer.getGLContext();
+    smokeSupported = probeSmokeSupport(gl);
+    setUserProperties({
+      renderer_class: rendererClass(gl),
+      smoke_supported: smokeSupported ? 'yes' : 'no',
+    });
+  }
+  const startupMs = Math.round(performance.now());
+  send('app_ready', {
+    startup_ms: startupMs,
+    startup_bucket: durationBucket(startupMs),
+    has_dataset: hasDataset ? 1 : 0,
+  });
+}
+
+/**
+ * The source the page URL asked for. Only the presence of a parameter is
+ * read, never its value, except `source`, which must be a declared type.
+ */
+function requestedSourceType() {
+  const params = new URLSearchParams(window.location.search);
+  if (params.has('remote')) return 'remote';
+  if (params.has('github')) return 'github-repo';
+  const source = params.get('source');
+  return source !== null && SOURCE_TYPES.includes(source)
+    ? source
+    : 'local-demo';
+}
+
+/**
+ * Report the terminal startup failure.
+ *
+ * @param {{phase: string|null, error: unknown}} options
+ */
+export function trackStartupFailure({ phase, error }) {
+  if (startupFailureReported) return;
+  startupFailureReported = true;
+  send('startup_failure', {
+    startup_phase: phase === null ? 'boot' : phase,
+    source_type: requestedSourceType(),
+    ...describeError(error),
+  });
+}
+
+const STATE_RESTORES = Object.freeze({
+  ready: 'none',
+  'ready-state-restored': 'restored',
+  'ready-state-error': 'failed',
+  'ready-state-canceled': 'canceled',
+  'ready-state-replaced': 'replaced',
+});
+
+/**
+ * Report one dataset request's outcome.
+ *
+ * @param {{
+ *   loadMethod: string,
+ *   sourceType: string,
+ *   outcome: 'success'|'failure',
+ *   durationMs: number,
+ *   datasetId?: string|null,
+ *   metadata?: Object|null,
+ *   stateStatus?: string,
+ *   mapping?: {origin: 'default'|'best_guess', embeddingCandidates: number, enabledRepresentations: number}|null,
+ *   error?: unknown
+ * }} load
+ */
+export function trackDataLoad(load) {
+  const metadata = load.metadata ?? null;
+  const stats = metadata?.stats ?? null;
+  const vectorFields = metadata?.vector_fields?.fields;
+  const durationMs = Math.max(0, Math.round(load.durationMs));
+  send('data_load', {
+    load_method: load.loadMethod,
+    source_type: load.sourceType,
+    outcome: load.outcome,
+    duration_ms: durationMs,
+    duration_bucket: durationBucket(durationMs),
+    dataset_id:
+      load.sourceType === 'local-demo' &&
+      publicSampleCatalog &&
+      typeof load.datasetId === 'string'
+        ? load.datasetId
+        : undefined,
+    cell_bucket: isCount(stats?.n_cells) ? countBucket(stats.n_cells) : undefined,
+    gene_bucket: isCount(stats?.n_genes) ? countBucket(stats.n_genes) : undefined,
+    field_count: isCount(stats?.n_obs_fields) ? stats.n_obs_fields : undefined,
+    dimensions: dimensionsDescriptor(
+      metadata?.embeddings?.defaults
+    ),
+    has_connectivity: typeof stats?.has_connectivity === 'boolean'
+      ? Number(stats.has_connectivity)
+      : undefined,
+    has_vector_field: metadata === null
+      ? undefined
+      : Number(
+        vectorFields !== null &&
+        typeof vectorFields === 'object' &&
+        Object.keys(vectorFields).length > 0
+      ),
+    data_version: VERSION_PATTERN.test(metadata?.cellucid_data_version ?? '')
+      ? metadata.cellucid_data_version
+      : undefined,
+    state_restore: load.outcome === 'success'
+      ? STATE_RESTORES[load.stateStatus]
+      : undefined,
+    mapping_origin: load.outcome === 'success' && load.mapping
+      ? load.mapping.origin
+      : undefined,
+    embedding_candidates: load.outcome === 'success' && load.mapping
+      ? embeddingCandidateBucket(load.mapping.embeddingCandidates)
+      : undefined,
+    enabled_representations: load.outcome === 'success' && load.mapping
+      ? embeddingCandidateBucket(load.mapping.enabledRepresentations)
+      : undefined,
+    ...(load.outcome === 'failure' ? describeError(load.error) : {}),
+  });
+}
+
+/**
+ * Report one performance metric. `performance.js` calls this once per metric.
+ *
+ * @param {string} metricName
+ * @param {number} value
+ * @param {{navigationType: string, sourceType: string|null}} context
+ */
+export function trackWebVital(metricName, value, { navigationType, sourceType }) {
+  const rounded = metricName === 'CLS'
+    ? Math.round(value * 1000) / 1000
+    : Math.round(value);
+  send('web_vital', {
+    metric_name: metricName,
+    metric_value: rounded,
+    metric_rating: metricRating(metricName, value),
+    navigation_type: navigationType,
+    source_type: sourceType ?? undefined,
+  });
+}
+

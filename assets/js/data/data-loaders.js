@@ -5,28 +5,31 @@
 
 import { getDataSourceManager } from './data-source-manager.js';
 import {
-  MAX_PREPARED_BROWSER_BYTES,
   fetchSampleArtifact,
   isLocalUserUrl,
   maxGzipTransferBytes,
+  payloadTooLargeError,
   readBoundedBody,
   readBoundedJson,
-  requirePayloadBudget,
+  requireDeclaredPayloadLength,
   resolveUrl,
 } from './data-source.js';
 import { getNotificationCenter } from '../app/notification-center.js';
+import { fetchPriorityHint, requirePriority } from './fetch-scheduler.js';
+import { PayloadTransferCache } from './payload-transfer-cache.js';
 import {
+  CATEGORICAL_CODE_DTYPES,
   categoricalStorageForDtype,
 } from './categorical-storage-contract.js';
 import { gzipDecompress } from '../app/session/codecs/gzip.js';
-import { setOwnDataProperty } from '../utils/exact-record.js';
+import { StateValidator } from '../app/utils/state-validator.js';
 import {
   QUANTIZATION_BACKEND,
   dequantizeToFloat32InWorker,
   selectQuantizationBackend,
 } from './quantization-worker-pool.js';
 import {
-  isConstantQuantizationRange,
+  decodeQuantizedToFloat32,
   validateQuantizationMetadata,
 } from './quantization-contract.js';
 import {
@@ -36,6 +39,7 @@ import {
 } from './connectivity-manifest-contract.js';
 import {
   getMetadataLoadSignal,
+  loadMetadataBatchAtomically,
   throwIfMetadataAborted,
 } from './metadata-load-contract.js';
 // Unified AnnData provider handles both h5ad and zarr sources
@@ -45,11 +49,17 @@ import {
   anndataGetObsManifest,
   anndataGetVarManifest,
   anndataLoadObsField,
-  anndataLoadGeneExpression,
+  anndataLoadGeneValues,
+  anndataLoadOutlierQuantiles,
   anndataLoadConnectivity,
   anndataGetConnectivityManifest,
   anndataGetDatasetIdentity,
+  anndataGetMappingCandidates,
 } from './anndata-provider.js';
+import {
+  MAPPING_ROUTE_PREFIX,
+  mappingRefusalFromBody,
+} from './data-mapping-candidates.js';
 // Note: remote:// and jupyter:// protocols are handled by DataSourceManager.resolveUrl()
 // via the registered protocol handlers - no explicit imports needed here.
 
@@ -227,17 +237,18 @@ function requireGzipDecompressionStream(url) {
 const GZIP_MINIMUM_MEMBER_BYTES = 18;
 
 /**
- * Resolve the transfer ceiling for one payload.
+ * Resolve the transfer ceiling for one payload: its declared length, or no
+ * ceiling but the browser's memory when no manifest declares one (a gzip
+ * payload is then still bounded exactly by its envelope).
  *
  * @param {number|null} expectedBytes - Manifest-declared decoded length, or
- *   exact null when no manifest advertises one and only the browser ceiling
- *   applies.
+ *   exact null when no manifest advertises one.
  * @param {string} label
  * @returns {number}
  */
 function payloadCeiling(expectedBytes, label) {
-  if (expectedBytes === null) return MAX_PREPARED_BROWSER_BYTES;
-  return requirePayloadBudget(expectedBytes, label);
+  if (expectedBytes === null) return Number.MAX_SAFE_INTEGER;
+  return requireDeclaredPayloadLength(expectedBytes, label);
 }
 
 /**
@@ -287,16 +298,11 @@ function requireGzipEnvelope(compressed, expectedBytes, label) {
     (compressed[trailerOffset + 3] << 24)
   ) >>> 0;
 
+  // ISIZE is the decoded length modulo 2^32 (RFC 1952).
   if (expectedBytes === null) {
-    if (declaredBytes > MAX_PREPARED_BROWSER_BYTES) {
-      throw new RangeError(
-        `${label}: gzip declares ${declaredBytes} bytes after decompression, ` +
-        'which exceeds the 512 MiB browser limit'
-      );
-    }
     return declaredBytes;
   }
-  if (declaredBytes !== expectedBytes) {
+  if (declaredBytes !== expectedBytes % 0x1_0000_0000) {
     throw new Error(
       `${label}: expected ${expectedBytes} bytes after decompression, ` +
       `but gzip declares ${declaredBytes} bytes`
@@ -316,12 +322,19 @@ function toExactArrayBuffer(bytes) {
 }
 
 /**
- * Materialize one binary payload under a hard byte ceiling.
+ * @typedef {{ bytes: Uint8Array, gzipOutputBytes: number|null }} BinaryTransfer
+ *   One payload exactly as transferred. `gzipOutputBytes` is null for a plain
+ *   payload and the exact inflated length for a gzip member whose envelope has
+ *   already been checked against the declared size.
+ */
+
+/**
+ * Read one binary payload's transfer under a hard byte ceiling, without
+ * decoding it.
  *
- * Compression is determined solely by the advertised filename, exactly as
- * before. The gzip branch delegates the bounded inflate to the session gzip
- * codec, whose reader cancels its stream on overflow and asserts the exact
- * output length.
+ * Compression is determined solely by the advertised filename. A gzip
+ * transfer is bounded by its compressed ceiling and its envelope is checked
+ * here, so whichever thread inflates it receives an exact output bound.
  *
  * @param {Object} options
  * @param {Response} options.response
@@ -330,9 +343,9 @@ function toExactArrayBuffer(bytes) {
  * @param {AbortSignal|null} [options.signal]
  * @param {((loadedBytes: number, totalBytes: number|null) => void)|null} [options.onProgress]
  * @param {number|null} [options.totalBytes]
- * @returns {Promise<ArrayBuffer>}
+ * @returns {Promise<BinaryTransfer>}
  */
-async function materializeBinaryPayload(options) {
+async function readBinaryTransfer(options) {
   const {
     response,
     url,
@@ -358,27 +371,67 @@ async function materializeBinaryPayload(options) {
         `received ${bytes.byteLength}`
       );
     }
-    return toExactArrayBuffer(bytes);
+    return { bytes, gzipOutputBytes: null };
   }
 
   requireGzipDecompressionStream(url);
+  // An undeclared gzip payload has no transfer ceiling; its trailer then
+  // bounds the inflate exactly.
   const compressed = await readBoundedBody(response, {
     label,
-    maxBytes: maxGzipTransferBytes(ceiling),
+    maxBytes: expectedBytes === null ? ceiling : maxGzipTransferBytes(ceiling),
     onProgress,
     signal,
     totalBytes,
   });
-  const decompressedBytes = requireGzipEnvelope(
+  const gzipOutputBytes = requireGzipEnvelope(
     compressed,
     expectedBytes,
     label
   );
-  const inflated = await gzipDecompress(compressed, {
-    maxOutputBytes: decompressedBytes,
-    signal,
-  });
+  return { bytes: compressed, gzipOutputBytes };
+}
+
+/**
+ * Inflate a transfer on this thread when it is gzip.
+ *
+ * The gzip branch delegates the bounded inflate to the session gzip codec,
+ * whose reader cancels its stream on overflow and asserts the exact output
+ * length.
+ *
+ * @param {BinaryTransfer} transfer
+ * @param {AbortSignal|null} signal
+ * @returns {Promise<ArrayBuffer>}
+ */
+async function inflateBinaryTransfer(transfer, signal) {
+  if (transfer.gzipOutputBytes === null) {
+    return toExactArrayBuffer(transfer.bytes);
+  }
+  let inflated;
+  try {
+    inflated = await gzipDecompress(transfer.bytes, {
+      maxOutputBytes: transfer.gzipOutputBytes,
+      signal,
+    });
+  } catch (error) {
+    // Its output did not fit in memory: a size refusal, not a bad payload.
+    if (error instanceof RangeError && /^Decompressed data needs/.test(error.message)) {
+      throw payloadTooLargeError(error.message, { declaredBytes: transfer.gzipOutputBytes });
+    }
+    throw error;
+  }
   return toExactArrayBuffer(inflated);
+}
+
+/**
+ * Materialize one binary payload under a hard byte ceiling.
+ *
+ * @param {Parameters<typeof readBinaryTransfer>[0]} options
+ * @returns {Promise<ArrayBuffer>}
+ */
+async function materializeBinaryPayload(options) {
+  const transfer = await readBinaryTransfer(options);
+  return inflateBinaryTransfer(transfer, options.signal ?? null);
 }
 
 /**
@@ -401,52 +454,6 @@ function dtypeByteSize(dtype, label) {
     default:
       throw new Error(`Unsupported dtype "${dtype}" for ${label}`);
   }
-}
-
-/**
- * Exact observation count advertised by an expanded manifest.
- *
- * Manifests produced by `expandObsManifest`/`expandVarManifest` always carry a
- * validated `n_points`. A manifest that advertises none bounds its payloads by
- * the browser ceiling alone.
- *
- * @param {Object} manifest
- * @param {string} label
- * @returns {number|null}
- */
-function manifestPointCount(manifest, label) {
-  if (!Object.hasOwn(manifest, 'n_points')) return null;
-  const value = manifest.n_points;
-  if (!Number.isSafeInteger(value) || value < 0) {
-    throw new Error(
-      `${label}: n_points must be a non-negative safe integer`
-    );
-  }
-  return value;
-}
-
-/**
- * Exact cell count advertised by a dataset identity.
- *
- * @param {Object} identity
- * @returns {number|null}
- */
-function identityCellCount(identity) {
-  const stats = identity?.stats;
-  if (
-    stats === null ||
-    typeof stats !== 'object' ||
-    !Object.hasOwn(stats, 'n_cells')
-  ) {
-    return null;
-  }
-  const value = stats.n_cells;
-  if (!Number.isSafeInteger(value) || value < 0) {
-    throw new Error(
-      'dataset_identity.json: stats.n_cells must be a non-negative safe integer'
-    );
-  }
-  return value;
 }
 
 /**
@@ -493,20 +500,18 @@ function typedArrayFromBuffer(buffer, dtype, url) {
   }
 }
 
-// Every categorical field is widened to uint16 once it is in memory, so a
-// uint8 field's terminal sentinel has to be remapped to the uint16 one as it
-// loads. Both widths come from the one storage contract so the pair can never
-// drift apart and turn a missing cell into category 255.
-const RUNTIME_CODE_STORAGE = categoricalStorageForDtype(
-  'uint16',
-  'Runtime categorical codes'
-);
+/** The payload extension of each categorical code width. */
+const CATEGORICAL_CODES_EXTENSION = Object.freeze({
+  uint8: 'u8',
+  uint16: 'u16',
+  uint32: 'u32',
+});
 
 function validateCategoricalCodesDtype(dtype, fieldKey) {
-  if (dtype !== 'uint8' && dtype !== 'uint16') {
+  if (!CATEGORICAL_CODE_DTYPES.includes(dtype)) {
     throw new Error(
       `Unsupported categorical codes dtype "${dtype}" for field "${fieldKey}"; ` +
-      'expected "uint8" or "uint16". Reduce or merge categories before loading.'
+      `expected one of ${CATEGORICAL_CODE_DTYPES.map(name => `"${name}"`).join(', ')}.`
     );
   }
   return dtype;
@@ -585,35 +590,7 @@ function dequantize(quantized, minValue, maxValue, bits) {
     minValue,
     maxValue,
   }, 'Field quantization codec');
-  const n = quantized.length;
-  const result = new Float32Array(n);
-
-  // Determine max quantized value and NaN marker
-  const maxQuant = bits === 8 ? 254 : 65534;
-  const nanMarker = bits === 8 ? 255 : 65535;
-
-  if (isConstantQuantizationRange(minValue, maxValue)) {
-    // compact_v1's constant-field case: equal bounds, every code 0. Return the
-    // constant itself instead of scaling by a range of zero, so the value the
-    // writer published comes back exactly.
-    for (let i = 0; i < n; i++) {
-      result[i] = quantized[i] === nanMarker ? NaN : minValue;
-    }
-    return result;
-  }
-
-  const scale = (maxValue - minValue) / maxQuant;
-
-  for (let i = 0; i < n; i++) {
-    const q = quantized[i];
-    if (q === nanMarker) {
-      result[i] = NaN;
-    } else {
-      result[i] = minValue + q * scale;
-    }
-  }
-
-  return result;
+  return decodeQuantizedToFloat32(quantized, minValue, maxValue, bits);
 }
 
 /**
@@ -672,15 +649,20 @@ async function dequantizeToFloat32(options) {
   }
   const {
     backend,
-    buffer,
+    transfer,
+    signal = null,
     dtype,
     minValue,
     maxValue,
     bits,
   } = options;
 
-  if (!(buffer instanceof ArrayBuffer)) {
-    throw new Error('dequantizeToFloat32: missing ArrayBuffer');
+  if (
+    transfer === null ||
+    typeof transfer !== 'object' ||
+    !(transfer.bytes instanceof Uint8Array)
+  ) {
+    throw new Error('dequantizeToFloat32: missing payload transfer');
   }
   validateQuantizationMetadata({
     dtype,
@@ -690,13 +672,18 @@ async function dequantizeToFloat32(options) {
   }, 'Field quantization codec');
 
   if (backend === QUANTIZATION_BACKEND.WORKER) {
-    return dequantizeToFloat32InWorker({
-      buffer,
+    // The inflate travels with the dequantization: the compressed transfer is
+    // handed over as-is, so no per-payload decode work is left on this thread.
+    const values = await dequantizeToFloat32InWorker({
+      buffer: toExactArrayBuffer(transfer.bytes),
+      gzipOutputBytes: transfer.gzipOutputBytes,
       dtype,
       minValue,
       maxValue,
       bits,
     });
+    throwIfAborted(signal);
+    return values;
   }
   if (backend !== QUANTIZATION_BACKEND.MAIN_THREAD) {
     throw new Error(
@@ -704,10 +691,10 @@ async function dequantizeToFloat32(options) {
     );
   }
 
+  const buffer = await inflateBinaryTransfer(transfer, signal);
   const raw = dtype === 'uint8' ? new Uint8Array(buffer) : new Uint16Array(buffer);
   return dequantize(raw, minValue, maxValue, bits);
 }
-
 
 /**
  * The most of an error body worth reading back.
@@ -773,6 +760,18 @@ async function describeFailedResponse(response, url) {
     && response.statusText.length > 0
     ? response.statusText
     : `HTTP ${response.status}`;
+  // A mapping route refuses an entry whose values fail their load-time check
+  // with 422 and `{"error", "key", "reason"}`: a refusal of one choice, which
+  // the viewer marks unusable and keeps every other, not a transport failure.
+  const route = String(url).split(/[?#]/)[0];
+  const routeStart = route.indexOf(MAPPING_ROUTE_PREFIX);
+  if (response.status === 422 && routeStart >= 0) {
+    const refusal = mappingRefusalFromBody(detail, route.slice(routeStart));
+    if (refusal !== null) {
+      refusal.status = 422;
+      return refusal;
+    }
+  }
   const error = new Error(
     `Failed to load ${url}: ${statusText}`
     + (detail === null ? '' : ` — ${detail}`)
@@ -803,9 +802,47 @@ async function fetchOk(url, init, stagedSource = null) {
 }
 
 /**
+ * Fetch one binary payload's transfer (still compressed when the URL ends with
+ * .gz). Supports local-user:// protocol for user directories.
+ *
+ * @param {string} url - URL to fetch
+ * @param {RequestInit} [init]
+ * @param {number|null} expectedBytes - Manifest-declared decoded length, or
+ *   exact null when no manifest advertises one
+ * @param {Object|null} [stagedSource]
+ * @param {((loadedBytes: number, totalBytes: number|null) => void)|null} [onProgress]
+ *   Called as the body arrives (see `transferTotalBytes` for the total)
+ * @returns {Promise<BinaryTransfer>}
+ */
+async function fetchBinaryTransfer(
+  url,
+  init,
+  expectedBytes,
+  stagedSource = null,
+  onProgress = null
+) {
+  const declaredBytes = requireDeclaredLength(
+    expectedBytes,
+    `Binary loader for ${url}`
+  );
+  // Refuse an over-declared payload before it costs any network traffic.
+  payloadCeiling(declaredBytes, `Payload ${url}`);
+  const response = await fetchOk(url, init, stagedSource);
+  return readBinaryTransfer({
+    expectedBytes: declaredBytes,
+    onProgress,
+    response,
+    signal: init?.signal ?? null,
+    totalBytes: onProgress === null
+      ? null
+      : transferTotalBytes(response, url, declaredBytes),
+    url,
+  });
+}
+
+/**
  * Fetch binary data, automatically decompressing gzip if URL ends with .gz
  * Uses the browser DecompressionStream API.
- * Supports local-user:// protocol for user directories.
  *
  * @param {string} url - URL to fetch
  * @param {RequestInit} [init]
@@ -814,19 +851,13 @@ async function fetchOk(url, init, stagedSource = null) {
  * @returns {Promise<ArrayBuffer>} Decompressed binary data
  */
 async function fetchBinary(url, init, expectedBytes, stagedSource = null) {
-  const declaredBytes = requireDeclaredLength(
-    expectedBytes,
-    `Binary loader for ${url}`
-  );
-  // Refuse an over-declared payload before it costs any network traffic.
-  payloadCeiling(declaredBytes, `Payload ${url}`);
-  const response = await fetchOk(url, init, stagedSource);
-  return materializeBinaryPayload({
-    expectedBytes: declaredBytes,
-    response,
-    signal: init?.signal ?? null,
+  const transfer = await fetchBinaryTransfer(
     url,
-  });
+    init,
+    expectedBytes,
+    stagedSource
+  );
+  return inflateBinaryTransfer(transfer, init?.signal ?? null);
 }
 
 /**
@@ -836,6 +867,8 @@ async function fetchBinary(url, init, expectedBytes, stagedSource = null) {
  *
  * @param {string} url - URL to fetch
  * @param {Object} options - Optional settings
+ * @param {1|2|3} options.dimension - Required. Components per cell, from the
+ *   layout or vector binding the payload belongs to.
  * @param {number|null} options.expectedBytes - Required. Manifest-declared
  *   decoded length (`n_cells * dimension * 4`), or exact null when no manifest
  *   advertises a cell count yet and only the browser ceiling applies.
@@ -849,11 +882,16 @@ export async function loadPointsBinary(url, options = {}) {
     candidateAnnDataBinding = null,
     showProgress = false,
     displayName = null,
-    dimension = 3,
     signal = null,
     progressTrackerId = null,
     stagedSource = null
   } = options;
+  const dimension = options.dimension;
+  if (dimension !== 1 && dimension !== 2 && dimension !== 3) {
+    throw new TypeError(
+      'Cell position loader requires the payload dimension: exactly 1, 2, or 3.'
+    );
+  }
   if (!Object.hasOwn(options, 'expectedBytes')) {
     throw new TypeError(
       'Cell position loader requires an explicit expectedBytes: the ' +
@@ -884,18 +922,13 @@ export async function loadPointsBinary(url, options = {}) {
     try {
       throwIfAborted(signal);
 
-      // Extract dimension from URL if not provided (e.g., points_3d.bin -> 3)
-      let dim = dimension;
-      const dimMatch = url.match(/points_(\d)d\.bin/);
-      if (dimMatch) {
-        dim = parseInt(dimMatch[1], 10);
-      }
-
-      // H5AD/Zarr adapters do not currently accept an AbortSignal. Race the
-      // decoder with the caller's signal so dataset replacement can reject
-      // promptly; the detached decoder is still observed by waitForAbort().
+      // The caller's layout descriptor states the dimension; a payload path
+      // never does. H5AD/Zarr adapters do not currently accept an
+      // AbortSignal. Race the decoder with the caller's signal so dataset
+      // replacement can reject promptly; the detached decoder is still
+      // observed by waitForAbort().
       const result = await waitForAbort(
-        anndataLoadPoints(url, dim, candidateAnnDataBinding),
+        anndataLoadPoints(url, dimension, candidateAnnDataBinding),
         signal
       );
       throwIfAborted(signal);
@@ -1040,13 +1073,6 @@ function waitForAbort(promise, signal) {
   });
 }
 
-function rethrowIfAborted(error, signal) {
-  if (error?.name === 'AbortError' || signal?.aborted) {
-    if (error?.name === 'AbortError') throw error;
-    throw createAbortError();
-  }
-}
-
 function finishOwnedTrackerWithError({
   error,
   notifications,
@@ -1059,6 +1085,54 @@ function finishOwnedTrackerWithError({
   } else {
     notifications.failDownload(trackerId, error?.message || String(error));
   }
+}
+
+/**
+ * The total a payload's download progress counts toward.
+ *
+ * Progress counts the bytes the body reader yields, so the total has to be
+ * measured in the same units — and which unit that is depends on who does the
+ * decompressing.
+ *
+ * A `.gz` URL is a gzip *file* transferred as-is: the reader yields the
+ * compressed bytes and this module inflates them afterwards, so the transfer
+ * length is the total and `Content-Length` is exactly it. The caller's
+ * declared length is the *decoded* size and is the wrong number here.
+ *
+ * Any other URL may be transport-compressed, and there the reader yields
+ * decoded bytes while `Content-Length` counts compressed ones. Telling the two
+ * apart by reading `Content-Encoding` works only same-origin: the header is
+ * not CORS-safelisted, so a cross-origin reader is handed `null` whether or
+ * not the body is gzipped. Treating that `null` as "then Content-Length is the
+ * decoded size" is what made every compressed payload from `cellucid serve`
+ * abort the moment decoded bytes passed compressed ones —
+ * `Download loadedBytes 59240 exceeds totalBytes 55003`, and a dataset that
+ * never opened. The caller's declared length is the decoded size and needs no
+ * header at all, so on that path it wins.
+ *
+ * @param {Response} response
+ * @param {string} url
+ * @param {number|null} expectedBytes - Declared decoded length
+ * @returns {number|null}
+ */
+function transferTotalBytes(response, url, expectedBytes) {
+  const contentEncoding = response.headers.get('content-encoding');
+  const contentLength = response.headers.get('content-length');
+  const transferIsAlreadyDecoded = url.endsWith('.gz');
+  let totalBytes = transferIsAlreadyDecoded ? null : expectedBytes;
+  if (
+    totalBytes === null &&
+    contentLength !== null &&
+    (transferIsAlreadyDecoded || contentEncoding === null)
+  ) {
+    totalBytes = Number(contentLength);
+    if (!Number.isSafeInteger(totalBytes) || totalBytes < 0) {
+      throw new Error(
+        `Invalid Content-Length for ${url}: ${contentLength}`
+      );
+    }
+  }
+  return totalBytes;
 }
 
 /**
@@ -1092,41 +1166,7 @@ async function fetchBinaryWithProgressInternal(
     throw await describeFailedResponse(response, url);
   }
 
-  // Progress counts the bytes the body reader yields, so the total has to be
-  // measured in the same units — and which unit that is depends on who does the
-  // decompressing.
-  //
-  // A `.gz` URL is a gzip *file* transferred as-is: the reader yields the
-  // compressed bytes and this module inflates them afterwards, so the transfer
-  // length is the total and `Content-Length` is exactly it. The caller's
-  // declared length is the *decoded* size and is the wrong number here.
-  //
-  // Any other URL may be transport-compressed, and there the reader yields
-  // decoded bytes while `Content-Length` counts compressed ones. Telling the two
-  // apart by reading `Content-Encoding` works only same-origin: the header is
-  // not CORS-safelisted, so a cross-origin reader is handed `null` whether or
-  // not the body is gzipped. Treating that `null` as "then Content-Length is the
-  // decoded size" is what made every compressed payload from `cellucid serve`
-  // abort the moment decoded bytes passed compressed ones —
-  // `Download loadedBytes 59240 exceeds totalBytes 55003`, and a dataset that
-  // never opened. The caller's declared length is the decoded size and needs no
-  // header at all, so on that path it wins.
-  const contentEncoding = response.headers.get('content-encoding');
-  const contentLength = response.headers.get('content-length');
-  const transferIsAlreadyDecoded = url.endsWith('.gz');
-  let totalBytes = transferIsAlreadyDecoded ? null : expectedBytes;
-  if (
-    totalBytes === null &&
-    contentLength !== null &&
-    (transferIsAlreadyDecoded || contentEncoding === null)
-  ) {
-    totalBytes = Number(contentLength);
-    if (!Number.isSafeInteger(totalBytes) || totalBytes < 0) {
-      throw new Error(
-        `Invalid Content-Length for ${url}: ${contentLength}`
-      );
-    }
-  }
+  const totalBytes = transferTotalBytes(response, url, expectedBytes);
 
   // The bounded reader owns the transfer, so progress is reported from the
   // same pass that enforces the ceiling: no chunk is buffered twice and no
@@ -1159,7 +1199,7 @@ function isRecord(value) {
 
 function requireRecord(value, label) {
   if (!isRecord(value)) {
-    throw new Error(`Invalid compact_v1 ${label}: expected an object`);
+    throw new Error(`Invalid compact_v2 ${label}: expected an object`);
   }
 }
 
@@ -1178,7 +1218,7 @@ function requireExactKeys(value, expectedKeys, label) {
       details.push(`unexpected ${extra.join(', ')}`);
     }
     throw new Error(
-      `Invalid compact_v1 ${label} properties: ${details.join('; ')}`
+      `Invalid compact_v2 ${label} properties: ${details.join('; ')}`
     );
   }
 }
@@ -1186,7 +1226,7 @@ function requireExactKeys(value, expectedKeys, label) {
 function requirePositivePointCount(value, label) {
   if (!Number.isSafeInteger(value) || value <= 0) {
     throw new Error(
-      `Invalid compact_v1 ${label}: n_points must be a positive safe integer`
+      `Invalid compact_v2 ${label}: n_points must be a positive safe integer`
     );
   }
 }
@@ -1197,7 +1237,7 @@ function requireCompression(value, label) {
     (!Number.isInteger(value) || value < 1 || value > 9)
   ) {
     throw new Error(
-      `Invalid compact_v1 ${label}: compression must be null or an integer from 1 to 9`
+      `Invalid compact_v2 ${label}: compression must be null or an integer from 1 to 9`
     );
   }
 }
@@ -1214,7 +1254,7 @@ function requireRelativePayloadPath(path, label) {
     /^[A-Za-z][A-Za-z0-9+.-]*:/.test(path)
   ) {
     throw new Error(
-      `Invalid compact_v1 ${label}: payload path must be a relative POSIX path`
+      `Invalid compact_v2 ${label}: payload path must be a relative POSIX path`
     );
   }
   const components = path.split('/');
@@ -1227,7 +1267,7 @@ function requireRelativePayloadPath(path, label) {
     )
   ) {
     throw new Error(
-      `Invalid compact_v1 ${label}: payload path contains an invalid component`
+      `Invalid compact_v2 ${label}: payload path contains an invalid component`
     );
   }
 }
@@ -1241,7 +1281,7 @@ function validatePathTemplate({
 }) {
   if (typeof template !== 'string' || template.length === 0) {
     throw new Error(
-      `Invalid compact_v1 ${label}: path template must be a non-empty string`
+      `Invalid compact_v2 ${label}: path template must be a non-empty string`
     );
   }
 
@@ -1257,7 +1297,7 @@ function validatePathTemplate({
     template.replace(/\{[^{}]*\}/g, '').includes('}')
   ) {
     throw new Error(
-      `Invalid compact_v1 ${label}: expected exactly the placeholders ` +
+      `Invalid compact_v2 ${label}: expected exactly the placeholders ` +
       placeholders.map(value => `{${value}}`).join(', ')
     );
   }
@@ -1265,7 +1305,7 @@ function validatePathTemplate({
   const gzipSuffix = compression === null ? '' : '.gz';
   if (!template.endsWith(`${requiredTail}${gzipSuffix}`)) {
     throw new Error(
-      `Invalid compact_v1 ${label}: path must end with ` +
+      `Invalid compact_v2 ${label}: path must end with ` +
       `"${requiredTail}${gzipSuffix}" and match compression metadata`
     );
   }
@@ -1298,7 +1338,7 @@ function validateContinuousSchema(schema, {
   requireRecord(schema, label);
   if (typeof schema.quantized !== 'boolean') {
     throw new Error(
-      `Invalid compact_v1 ${label}: quantized must be a boolean`
+      `Invalid compact_v2 ${label}: quantized must be a boolean`
     );
   }
 
@@ -1311,7 +1351,7 @@ function validateContinuousSchema(schema, {
   requireExactKeys(schema, expectedKeys, label);
   if (includeKind && schema.kind !== 'continuous') {
     throw new Error(
-      `Invalid compact_v1 ${label}: kind must be "continuous"`
+      `Invalid compact_v2 ${label}: kind must be "continuous"`
     );
   }
 
@@ -1327,13 +1367,13 @@ function validateContinuousSchema(schema, {
       schema.ext !== expected.ext
     ) {
       throw new Error(
-        `Invalid compact_v1 ${label}: quantizationBits, dtype, and ext ` +
+        `Invalid compact_v2 ${label}: quantizationBits, dtype, and ext ` +
         'must be exactly 8/uint8/u8 or 16/uint16/u16'
       );
     }
   } else if (schema.dtype !== 'float32' || schema.ext !== 'f32') {
     throw new Error(
-      `Invalid compact_v1 ${label}: an unquantized schema must use float32/f32`
+      `Invalid compact_v2 ${label}: an unquantized schema must use float32/f32`
     );
   }
 
@@ -1357,7 +1397,7 @@ function validateCategoricalSchema(schema, compression) {
   ], label);
   if (typeof schema.outlierQuantized !== 'boolean') {
     throw new Error(
-      `Invalid compact_v1 ${label}: outlierQuantized must be a boolean`
+      `Invalid compact_v2 ${label}: outlierQuantized must be a boolean`
     );
   }
 
@@ -1382,13 +1422,13 @@ function validateCategoricalSchema(schema, compression) {
   );
   if (hasPartialOutlierPayload && !hasNoOutlierPayload) {
     throw new Error(
-      `Invalid compact_v1 ${label}: outlier path, ext, and dtype must be ` +
+      `Invalid compact_v2 ${label}: outlier path, ext, and dtype must be ` +
       'all present or all null'
     );
   }
   if (hasNoOutlierPayload && schema.outlierQuantized !== false) {
     throw new Error(
-      `Invalid compact_v1 ${label}: absent outlier data requires ` +
+      `Invalid compact_v2 ${label}: absent outlier data requires ` +
       'outlierQuantized false'
     );
   }
@@ -1410,7 +1450,7 @@ function validateCategoricalSchema(schema, compression) {
       (schema.outlierDtype === 'uint16' && schema.outlierExt === 'u16');
     if (!validPair) {
       throw new Error(
-        `Invalid compact_v1 ${label}: quantized outliers must use ` +
+        `Invalid compact_v2 ${label}: quantized outliers must use ` +
         'uint8/u8 or uint16/u16'
       );
     }
@@ -1419,7 +1459,7 @@ function validateCategoricalSchema(schema, compression) {
     schema.outlierExt !== 'f32'
   ) {
     throw new Error(
-      `Invalid compact_v1 ${label}: unquantized outliers must use float32/f32`
+      `Invalid compact_v2 ${label}: unquantized outliers must use float32/f32`
     );
   }
 
@@ -1433,10 +1473,13 @@ function validateCategoricalSchema(schema, compression) {
 }
 
 /**
- * Validate one field's sole identity: a non-empty name, unique on its axis.
+ * Validate one field's sole identity: drawable text, unique on its axis.
  *
- * A name is no longer a path component, so nothing here constrains its
- * characters. It only has to be exact text the app can draw and match.
+ * A name is no longer a path component, so no filename rule applies. It does
+ * have to be exact text the app can draw and match, which is the writers'
+ * display-text rule (StateValidator.validateFieldKey): every field inventory
+ * reader in DataState applies it, so a name that passed here and failed there
+ * adopted the dataset and then made every field listing throw.
  */
 function validateFieldName(name, {
   names,
@@ -1444,12 +1487,21 @@ function validateFieldName(name, {
 }) {
   if (typeof name !== 'string' || name.length === 0) {
     throw new Error(
-      `Invalid compact_v1 ${label}: field name must be a non-empty string`
+      `Invalid compact_v2 ${label}: field name must be a non-empty string`
+    );
+  }
+  try {
+    StateValidator.validateFieldKey(name);
+  } catch (error) {
+    throw new Error(
+      `Invalid compact_v2 ${label}: field name ${JSON.stringify(name)} ` +
+      `cannot be displayed exactly: ${error.message}`,
+      { cause: error }
     );
   }
   if (names.has(name)) {
     throw new Error(
-      `Invalid compact_v1 ${label}: field name "${name}" is duplicated`
+      `Invalid compact_v2 ${label}: field name "${name}" is duplicated`
     );
   }
   names.add(name);
@@ -1462,7 +1514,7 @@ function validateFieldName(name, {
 function requirePayloadIndex(value, label) {
   if (!Number.isSafeInteger(value) || value < 0) {
     throw new Error(
-      `Invalid compact_v1 ${label}: payload index must be a non-negative ` +
+      `Invalid compact_v2 ${label}: payload index must be a non-negative ` +
       'safe integer, declared as element 0 of the field entry'
     );
   }
@@ -1482,7 +1534,7 @@ function requireDensePayloadIndices(indices, label) {
   for (let position = 0; position < sorted.length; position++) {
     if (sorted[position] !== position) {
       throw new Error(
-        `Invalid compact_v1 ${label}: payload indices must be exactly ` +
+        `Invalid compact_v2 ${label}: payload indices must be exactly ` +
         `0..${sorted.length - 1}, each used once`
       );
     }
@@ -1492,39 +1544,47 @@ function requireDensePayloadIndices(indices, label) {
 function requireQuantizedBounds(minValue, maxValue, label) {
   if (!Number.isFinite(minValue) || !Number.isFinite(maxValue)) {
     throw new Error(
-      `Invalid compact_v1 ${label}: quantization bounds must be finite`
+      `Invalid compact_v2 ${label}: quantization bounds must be finite`
     );
   }
-  // Equal bounds are compact_v1's constant-field case: the payload carries one
+  // Equal bounds are compact_v2's constant-field case: the payload carries one
   // value, published as every code 0. Rejecting it here would discard the whole
   // manifest over a gene a lineage subset left undetected.
   if (!(minValue <= maxValue)) {
     throw new Error(
-      `Invalid compact_v1 ${label}: minValue must not exceed maxValue`
+      `Invalid compact_v2 ${label}: minValue must not exceed maxValue`
     );
   }
 }
 
-function validateCentroids(centroidsByDim, categories, nPoints, fieldKey) {
+/**
+ * Validate a categorical field's `centroidsByEmbedding`: an object keyed by
+ * embedding id, each value a list of exact `{category, position, n_points}`
+ * centroids with at most one entry per declared category. Every position of
+ * one embedding has the same length, 1 to 3. Which ids exist, and that each
+ * position has its embedding's dimension, is a cross-file rule checked against
+ * dataset_identity.json by `validateDatasetGeneration`.
+ */
+function validateCentroids(centroidsByEmbedding, categories, nPoints, fieldKey) {
   requireRecord(
-    centroidsByDim,
-    `categorical field "${fieldKey}" centroids`
+    centroidsByEmbedding,
+    `categorical field "${fieldKey}" centroidsByEmbedding`
   );
   const categorySet = new Set(categories);
-  for (const [dimensionKey, centroids] of Object.entries(centroidsByDim)) {
-    if (!/^[123]$/.test(dimensionKey)) {
+  for (const [embeddingId, centroids] of Object.entries(centroidsByEmbedding)) {
+    if (embeddingId.length === 0) {
       throw new Error(
-        `Invalid compact_v1 categorical field "${fieldKey}" centroid ` +
-        `dimension "${dimensionKey}": expected 1, 2, or 3`
+        `Invalid compact_v2 categorical field "${fieldKey}" centroids: ` +
+        'embedding id must be a non-empty string'
       );
     }
     if (!Array.isArray(centroids)) {
       throw new Error(
-        `Invalid compact_v1 categorical field "${fieldKey}" centroids for ` +
-        `${dimensionKey}D: expected an array`
+        `Invalid compact_v2 categorical field "${fieldKey}" centroids for ` +
+        `"${embeddingId}": expected an array`
       );
     }
-    const dimension = Number(dimensionKey);
+    let dimension = null;
     const seenCategories = new Set();
     for (const centroid of centroids) {
       requireExactKeys(
@@ -1537,28 +1597,32 @@ function validateCentroids(centroidsByDim, categories, nPoints, fieldKey) {
         seenCategories.has(centroid.category)
       ) {
         throw new Error(
-          `Invalid compact_v1 categorical field "${fieldKey}" centroid ` +
+          `Invalid compact_v2 categorical field "${fieldKey}" centroid ` +
           'category must reference one unique declared category'
         );
       }
       seenCategories.add(centroid.category);
       if (
         !Array.isArray(centroid.position) ||
-        centroid.position.length !== dimension ||
+        centroid.position.length < 1 ||
+        centroid.position.length > 3 ||
+        (dimension !== null && centroid.position.length !== dimension) ||
         centroid.position.some(value => !Number.isFinite(value))
       ) {
         throw new Error(
-          `Invalid compact_v1 categorical field "${fieldKey}" centroid ` +
-          `position must contain exactly ${dimension} finite values`
+          `Invalid compact_v2 categorical field "${fieldKey}" centroid ` +
+          `position for "${embeddingId}" must contain one to three finite ` +
+          'values, the same number for every centroid of that embedding'
         );
       }
+      dimension = centroid.position.length;
       if (
         !Number.isSafeInteger(centroid.n_points) ||
         centroid.n_points < 0 ||
         centroid.n_points > nPoints
       ) {
         throw new Error(
-          `Invalid compact_v1 categorical field "${fieldKey}" centroid ` +
+          `Invalid compact_v2 categorical field "${fieldKey}" centroid ` +
           'n_points must be a non-negative safe integer no greater than n_points'
         );
       }
@@ -1577,9 +1641,9 @@ function validateObsManifestHeader(manifest) {
     '_continuousFields',
     '_categoricalFields',
   ], 'obs manifest');
-  if (manifest._format !== 'compact_v1') {
+  if (manifest._format !== 'compact_v2') {
     throw new Error(
-      'Invalid obs manifest: expected the current compact_v1 contract'
+      'Invalid obs manifest: expected the current compact_v2 contract'
     );
   }
   requirePositivePointCount(manifest.n_points, 'obs manifest');
@@ -1593,7 +1657,7 @@ function validateObsManifestHeader(manifest) {
     )
   ) {
     throw new Error(
-      'Invalid compact_v1 obs manifest: centroid_outlier_quantile must be null or a finite number between 0 and 1'
+      'Invalid compact_v2 obs manifest: centroid_outlier_quantile must be null or a finite number between 0 and 1'
     );
   }
   if (
@@ -1604,18 +1668,18 @@ function validateObsManifestHeader(manifest) {
     )
   ) {
     throw new Error(
-      'Invalid compact_v1 obs manifest: latent_key must be null or a non-empty string'
+      'Invalid compact_v2 obs manifest: latent_key must be null or a non-empty string'
     );
   }
   requireRecord(manifest._obsSchemas, 'obs schemas');
   if (!Array.isArray(manifest._continuousFields)) {
     throw new Error(
-      'Invalid compact_v1 obs manifest: _continuousFields must be an array'
+      'Invalid compact_v2 obs manifest: _continuousFields must be an array'
     );
   }
   if (!Array.isArray(manifest._categoricalFields)) {
     throw new Error(
-      'Invalid compact_v1 obs manifest: _categoricalFields must be an array'
+      'Invalid compact_v2 obs manifest: _categoricalFields must be an array'
     );
   }
 
@@ -1637,44 +1701,142 @@ function validateVarManifestHeader(manifest) {
   requireExactKeys(manifest, [
     '_format',
     'n_points',
-    'var_gene_id_column',
     'compression',
     'quantization',
     '_varSchema',
     'fields',
+    'gene_name_sets',
   ], 'var manifest');
-  if (manifest._format !== 'compact_v1') {
+  if (manifest._format !== 'compact_v2') {
     throw new Error(
-      'Invalid var manifest: expected the current compact_v1 contract'
+      'Invalid var manifest: expected the current compact_v2 contract'
     );
   }
   requirePositivePointCount(manifest.n_points, 'var manifest');
   requireCompression(manifest.compression, 'var manifest');
-  if (
-    manifest.var_gene_id_column !== null &&
-    (
-      typeof manifest.var_gene_id_column !== 'string' ||
-      manifest.var_gene_id_column.length === 0
-    )
-  ) {
-    throw new Error(
-      'Invalid compact_v1 var manifest: var_gene_id_column must be null or a non-empty string'
-    );
-  }
   if (
     manifest.quantization !== null &&
     manifest.quantization !== 8 &&
     manifest.quantization !== 16
   ) {
     throw new Error(
-      'Invalid compact_v1 var manifest: quantization must be null, 8, or 16'
+      'Invalid compact_v2 var manifest: quantization must be null, 8, or 16'
     );
   }
   if (!Array.isArray(manifest.fields)) {
     throw new Error(
-      'Invalid compact_v1 var manifest: fields must be an array'
+      'Invalid compact_v2 var manifest: fields must be an array'
     );
   }
+}
+
+/**
+ * Validate `gene_name_sets` and resolve every set's complete name list.
+ *
+ * Set 0 is the default: its names are the `fields` names (`names` is null),
+ * and its `source` is the var column they came from or null for the var
+ * index. Every later set is one alternative column: `names[i]` is gene `i`'s
+ * name in that set, or null where it equals the default name. Every resolved
+ * set must be distinct names a reader can draw exactly.
+ *
+ * @param {unknown} sets
+ * @param {string[]} defaultNames - The `fields` names, in field order.
+ * @returns {{source: string|null, names: string[], filledFromIndex: number,
+ *   renamed: [string, string][]}[]}
+ */
+function resolveGeneNameSets(sets, defaultNames) {
+  if (!Array.isArray(sets) || sets.length === 0) {
+    throw new Error(
+      'Invalid compact_v2 var manifest: gene_name_sets must be a non-empty array'
+    );
+  }
+  const sources = new Set();
+  return sets.map((set, setIndex) => {
+    const label = `gene_name_sets[${setIndex}]`;
+    requireExactKeys(
+      set,
+      ['source', 'filled_from_index', 'renamed', 'names'],
+      `var manifest ${label}`
+    );
+    const isDefault = setIndex === 0;
+    if (
+      set.source === null
+        ? !isDefault
+        : typeof set.source !== 'string' || set.source.length === 0
+    ) {
+      throw new Error(
+        `Invalid compact_v2 var manifest: ${label}.source must be ` +
+        (isDefault ? 'null or a non-empty string' : 'a non-empty string')
+      );
+    }
+    if (set.source !== null && sources.has(set.source)) {
+      throw new Error(
+        `Invalid compact_v2 var manifest: ${label}.source ` +
+        `${JSON.stringify(set.source)} names a column another set already uses`
+      );
+    }
+    if (set.source !== null) sources.add(set.source);
+    if (
+      !Number.isSafeInteger(set.filled_from_index) ||
+      set.filled_from_index < 0 ||
+      set.filled_from_index > defaultNames.length ||
+      (set.source === null && set.filled_from_index !== 0)
+    ) {
+      throw new Error(
+        `Invalid compact_v2 var manifest: ${label}.filled_from_index must ` +
+        'count exported genes, and be 0 for names from the var index'
+      );
+    }
+    if (
+      !Array.isArray(set.renamed) ||
+      set.renamed.some(pair =>
+        !Array.isArray(pair) ||
+        pair.length !== 2 ||
+        pair.some(name => typeof name !== 'string' || name.length === 0)
+      )
+    ) {
+      throw new Error(
+        `Invalid compact_v2 var manifest: ${label}.renamed must list ` +
+        '[from, to] name pairs'
+      );
+    }
+    let names;
+    if (isDefault) {
+      if (set.names !== null) {
+        throw new Error(
+          'Invalid compact_v2 var manifest: gene_name_sets[0].names must be ' +
+          'null, because the default names are the fields names'
+        );
+      }
+      names = defaultNames;
+    } else {
+      if (!Array.isArray(set.names) || set.names.length !== defaultNames.length) {
+        throw new Error(
+          `Invalid compact_v2 var manifest: ${label}.names must hold one ` +
+          'entry per field'
+        );
+      }
+      const seen = new Set();
+      names = set.names.map((name, index) => {
+        if (name === defaultNames[index]) {
+          throw new Error(
+            `Invalid compact_v2 var manifest: ${label}.names[${index}] ` +
+            'repeats the default name; the writer stores null there'
+          );
+        }
+        return validateFieldName(name === null ? defaultNames[index] : name, {
+          names: seen,
+          label: `var manifest ${label}`,
+        });
+      });
+    }
+    return Object.freeze({
+      source: set.source,
+      names: Object.freeze([...names]),
+      filledFromIndex: set.filled_from_index,
+      renamed: Object.freeze(set.renamed.map(pair => Object.freeze([...pair]))),
+    });
+  });
 }
 
 /**
@@ -1697,7 +1859,7 @@ export function expandVarManifest(manifest) {
     : null;
   if (manifest.quantization !== expectedQuantization) {
     throw new Error(
-      'Invalid compact_v1 var manifest: quantization must exactly match the var schema'
+      'Invalid compact_v2 var manifest: quantization must exactly match the var schema'
     );
   }
 
@@ -1710,7 +1872,7 @@ export function expandVarManifest(manifest) {
       fieldTuple.length !== (schema.quantized ? 4 : 2)
     ) {
       throw new Error(
-        `Invalid compact_v1 var field tuple: expected exactly ` +
+        `Invalid compact_v2 var field tuple: expected exactly ` +
         (schema.quantized
           ? '[payloadIndex, name, minValue, maxValue]'
           : '[payloadIndex, name]')
@@ -1745,10 +1907,14 @@ export function expandVarManifest(manifest) {
     fields.push(field);
   }
   requireDensePayloadIndices(payloadIndices, 'var manifest');
+  const geneNameSets = resolveGeneNameSets(
+    manifest.gene_name_sets,
+    fields.map(field => field.key)
+  );
 
   return {
     n_points: manifest.n_points,
-    var_gene_id_column: manifest.var_gene_id_column,
+    geneNameSets,
     compression: manifest.compression,
     quantization: manifest.quantization,
     fields,
@@ -1783,7 +1949,7 @@ export function expandObsManifest(manifest) {
         fieldTuple.length !== (contSchema.quantized ? 4 : 2)
       ) {
         throw new Error(
-          `Invalid compact_v1 continuous field tuple: expected exactly ` +
+          `Invalid compact_v2 continuous field tuple: expected exactly ` +
           (contSchema.quantized
             ? '[payloadIndex, key, minValue, maxValue]'
             : '[payloadIndex, key]')
@@ -1802,6 +1968,7 @@ export function expandObsManifest(manifest) {
       const field = {
         key,
         kind: 'continuous',
+        payloadIndex,
         valuesPath: expandPayloadPattern(contSchema.pathPattern, payloadIndex),
         valuesDtype: contSchema.dtype,
         quantized: contSchema.quantized,
@@ -1833,10 +2000,10 @@ export function expandObsManifest(manifest) {
         fieldTuple.length !== (catSchema.outlierQuantized ? 8 : 6)
       ) {
         throw new Error(
-          `Invalid compact_v1 categorical field tuple: expected exactly ` +
+          `Invalid compact_v2 categorical field tuple: expected exactly ` +
           (catSchema.outlierQuantized
-            ? '[payloadIndex, key, categories, codesDtype, codesMissingValue, centroidsByDim, outlierMinValue, outlierMaxValue]'
-            : '[payloadIndex, key, categories, codesDtype, codesMissingValue, centroidsByDim]')
+            ? '[payloadIndex, key, categories, codesDtype, codesMissingValue, centroidsByEmbedding, outlierMinValue, outlierMaxValue]'
+            : '[payloadIndex, key, categories, codesDtype, codesMissingValue, centroidsByEmbedding]')
         );
       }
       const payloadIndex = requirePayloadIndex(
@@ -1865,11 +2032,12 @@ export function expandObsManifest(manifest) {
         key
       );
 
-      const codesExt = codesDtype === 'uint8' ? 'u8' : 'u16';
+      const codesExt = CATEGORICAL_CODES_EXTENSION[codesDtype];
 
       const field = {
         key,
         kind: 'category',
+        payloadIndex,
         categories,
         codesPath: expandPayloadPattern(
           catSchema.codesPathPattern,
@@ -1882,7 +2050,7 @@ export function expandObsManifest(manifest) {
           : expandPayloadPattern(catSchema.outlierPathPattern, payloadIndex),
         outlierDtype: catSchema.outlierDtype,
         outlierQuantized: catSchema.outlierQuantized,
-        centroidsByDim: centroidsData,
+        centroidsByEmbedding: centroidsData,
       };
 
       if (catSchema.outlierQuantized) {
@@ -1922,13 +2090,16 @@ function validateExpandedContinuousField(
     'valuesDtype',
     'quantized',
     ...(observationField
-      ? ['centroids', 'outlierQuantilesPath']
+      ? ['payloadIndex', 'centroids', 'outlierQuantilesPath']
       : []),
     ...(field?.quantized
       ? ['quantizationBits', 'minValue', 'maxValue']
       : []),
   ];
   requireExactKeys(field, expectedKeys, label);
+  if (observationField) {
+    requirePayloadIndex(field.payloadIndex, label);
+  }
   if (
     typeof field.key !== 'string' ||
     field.key.length === 0 ||
@@ -1980,6 +2151,7 @@ function validateExpandedCategoricalField(field, label) {
   requireExactKeys(field, [
     'key',
     'kind',
+    'payloadIndex',
     'categories',
     'codesPath',
     'codesDtype',
@@ -1987,11 +2159,12 @@ function validateExpandedCategoricalField(field, label) {
     'outlierQuantilesPath',
     'outlierDtype',
     'outlierQuantized',
-    'centroidsByDim',
+    'centroidsByEmbedding',
     ...(field?.outlierQuantized
       ? ['outlierMinValue', 'outlierMaxValue']
       : []),
   ], label);
+  requirePayloadIndex(field.payloadIndex, label);
   if (
     typeof field.key !== 'string' ||
     field.key.length === 0 ||
@@ -2011,7 +2184,7 @@ function validateExpandedCategoricalField(field, label) {
     missingValue: field.codesMissingValue,
     fieldKey: field.key,
   });
-  requireRecord(field.centroidsByDim, `${label} centroidsByDim`);
+  requireRecord(field.centroidsByEmbedding, `${label} centroidsByEmbedding`);
 
   const hasNoOutlierPayload =
     field.outlierQuantilesPath === null &&
@@ -2142,6 +2315,77 @@ export async function loadObsManifest(url, options = {}) {
 }
 
 /**
+ * Load the outlier quantiles of one categorical obs field: the payload its
+ * descriptor names, relative to the obs manifest. An AnnData file computes
+ * them from the latent space the path names; any other source fetches them
+ * (float32, or quantized and decoded here).
+ *
+ * @param {string} manifestUrl - The obs manifest the descriptor belongs to.
+ * @param {Object} field - An expanded categorical descriptor with an outlier path.
+ * @param {{fetchInit?: RequestInit, pointCount: number}} options
+ * @returns {Promise<Float32Array>} One quantile per cell.
+ */
+export async function loadOutlierQuantiles(manifestUrl, field, { fetchInit, pointCount }) {
+  validateExpandedCategoricalField(field, `obs field "${field.key}"`);
+  if (field.outlierQuantilesPath === null) {
+    throw new Error(`Obs field "${field.key}" has no outlier quantiles.`);
+  }
+  const declaredPoints = requireDeclaredLength(
+    pointCount,
+    `Outlier loader for "${field.key}"`
+  );
+  if (shouldUseAnnData(manifestUrl)) {
+    // The dataset id of an AnnData URL is not a host, so the payload path is
+    // resolved textually, as gene payloads are.
+    const quantiles = await anndataLoadOutlierQuantiles(
+      `${manifestUrl.slice(0, manifestUrl.lastIndexOf('/') + 1)}${field.outlierQuantilesPath}`
+    );
+    validateLoadedOutlierLength(quantiles, declaredPoints, field.key);
+    return adoptRuntimeOutlierQuantiles(quantiles, field.key);
+  }
+  const url = resolveUrl(manifestUrl, field.outlierQuantilesPath);
+  const quantizationBackend = field.outlierQuantized
+    ? await selectQuantizationBackend()
+    : null;
+  const dtype = field.outlierDtype;
+  // One outlier quantile per observation.
+  const transfer = await fetchBinaryTransfer(
+    url,
+    fetchInit,
+    declaredPayloadBytes(declaredPoints, dtype, url)
+  );
+
+  let decodedOutlierQuantiles;
+  if (field.outlierQuantized) {
+    const bits = dtype === 'uint8' ? 8 : 16;
+    decodedOutlierQuantiles = await dequantizeToFloat32({
+      backend: quantizationBackend,
+      transfer,
+      signal: fetchInit?.signal ?? null,
+      dtype,
+      minValue: field.outlierMinValue,
+      maxValue: field.outlierMaxValue,
+      bits,
+    });
+  } else {
+    decodedOutlierQuantiles = typedArrayFromBuffer(
+      await inflateBinaryTransfer(transfer, fetchInit?.signal ?? null),
+      dtype,
+      url
+    );
+  }
+  return adoptRuntimeOutlierQuantiles(decodedOutlierQuantiles, field.key);
+}
+
+function validateLoadedOutlierLength(quantiles, pointCount, key) {
+  if (!(quantiles instanceof Float32Array) || quantiles.length !== pointCount) {
+    throw new Error(
+      `Outlier quantiles of "${key}" must be one float32 per cell (${pointCount}).`
+    );
+  }
+}
+
+/**
  * Load obs field data with automatic dequantization for quantized fields.
  * Handles gzip-compressed files automatically.
  * 
@@ -2225,8 +2469,10 @@ export async function loadObsFieldData(manifestUrl, field, options = {}) {
           `Invalid direct AnnData categorical payload for field "${field.key}"`
         );
       }
-      const TypedArrayClass =
-        codesDtype === 'uint8' ? Uint8Array : Uint16Array;
+      const { TypedArrayClass } = categoricalStorageForDtype(
+        codesDtype,
+        `Categorical field "${field.key}"`
+      );
       const raw = new TypedArrayClass(anndataData.data);
       validateCategoricalCodeValues({
         codes: raw,
@@ -2234,25 +2480,21 @@ export async function loadObsFieldData(manifestUrl, field, options = {}) {
         missingValue: anndataData.missingValue,
         fieldKey: field.key,
       });
-
-      // Convert uint8 to uint16 for consistency
-      if (codesDtype === 'uint8') {
-        const u16 = new Uint16Array(raw.length);
-        const missingU8 = anndataData.missingValue;
-        const missingU16 = RUNTIME_CODE_STORAGE.missingValue;
-        for (let i = 0; i < raw.length; i++) {
-          u16[i] = raw[i] === missingU8 ? missingU16 : raw[i];
-        }
-        outputs.codes = u16;
-      } else {
-        outputs.codes = raw;
-      }
+      // Codes stay in their declared width: every runtime reader resolves the
+      // missing code from the array's own storage (categorical-storage-contract).
+      outputs.codes = raw;
     } else {
       throw new Error(
         `Invalid direct AnnData field "${field.key}": payload kind must match the adopted manifest`
       );
     }
 
+    if (hasCodes && field.outlierQuantilesPath !== null) {
+      outputs.outlierQuantiles = await loadOutlierQuantiles(manifestUrl, field, {
+        fetchInit,
+        pointCount: declaredPoints,
+      });
+    }
     return outputs;
   }
 
@@ -2266,7 +2508,7 @@ export async function loadObsFieldData(manifestUrl, field, options = {}) {
       ? await selectQuantizationBackend()
       : null;
     const dtype = field.valuesDtype;
-    const buffer = await fetchBinary(
+    const transfer = await fetchBinaryTransfer(
       url,
       fetchInit,
       declaredPayloadBytes(declaredPoints, dtype, url)
@@ -2275,7 +2517,8 @@ export async function loadObsFieldData(manifestUrl, field, options = {}) {
     if (field.quantized) {
       outputs.values = await dequantizeToFloat32({
         backend: quantizationBackend,
-        buffer,
+        transfer,
+        signal: fetchInit?.signal ?? null,
         dtype,
         minValue: field.minValue,
         maxValue: field.maxValue,
@@ -2283,7 +2526,11 @@ export async function loadObsFieldData(manifestUrl, field, options = {}) {
       });
     } else {
       // Non-quantized or already float32
-      outputs.values = typedArrayFromBuffer(buffer, dtype, url);
+      outputs.values = typedArrayFromBuffer(
+        await inflateBinaryTransfer(transfer, fetchInit?.signal ?? null),
+        dtype,
+        url
+      );
     }
   }
 
@@ -2306,53 +2553,16 @@ export async function loadObsFieldData(manifestUrl, field, options = {}) {
       missingValue: field.codesMissingValue,
       fieldKey: field.key,
     });
-
-    // If uint8 codes, convert to uint16 for consistency with rest of app
-    if (dtype === 'uint8') {
-      const u16 = new Uint16Array(raw.length);
-      const missingU8 = field.codesMissingValue;
-      const missingU16 = RUNTIME_CODE_STORAGE.missingValue;
-      for (let i = 0; i < raw.length; i++) {
-        u16[i] = raw[i] === missingU8 ? missingU16 : raw[i];
-      }
-      outputs.codes = u16;
-    } else {
-      outputs.codes = raw;
-    }
+    // Codes stay in their declared width: every runtime reader resolves the
+    // missing code from the array's own storage (categorical-storage-contract).
+    outputs.codes = raw;
   }
 
-  // Load outlier quantiles
-  if (field.outlierQuantilesPath) {
-    const url = resolveUrl(manifestUrl, field.outlierQuantilesPath);
-    const quantizationBackend = field.outlierQuantized
-      ? await selectQuantizationBackend()
-      : null;
-    const dtype = field.outlierDtype;
-    // One outlier quantile per observation.
-    const buffer = await fetchBinary(
-      url,
+  if (field.outlierQuantilesPath !== null) {
+    outputs.outlierQuantiles = await loadOutlierQuantiles(manifestUrl, field, {
       fetchInit,
-      declaredPayloadBytes(declaredPoints, dtype, url)
-    );
-
-    let decodedOutlierQuantiles;
-    if (field.outlierQuantized) {
-      const bits = dtype === 'uint8' ? 8 : 16;
-      decodedOutlierQuantiles = await dequantizeToFloat32({
-        backend: quantizationBackend,
-        buffer,
-        dtype,
-        minValue: field.outlierMinValue,
-        maxValue: field.outlierMaxValue,
-        bits,
-      });
-    } else {
-      decodedOutlierQuantiles = typedArrayFromBuffer(buffer, dtype, url);
-    }
-    outputs.outlierQuantiles = adoptRuntimeOutlierQuantiles(
-      decodedOutlierQuantiles,
-      field.key
-    );
+      pointCount: declaredPoints,
+    });
   }
 
   return outputs;
@@ -2383,7 +2593,7 @@ export async function loadVarManifest(url, options = {}) {
 
   // Handle AnnData source (h5ad or zarr) - unified handling
   if (shouldUseAnnData(url)) {
-    const manifest = anndataGetVarManifest(
+    const manifest = await anndataGetVarManifest(
       url,
       { signal },
       candidateAnnDataBinding
@@ -2427,25 +2637,44 @@ export async function loadVarFieldData(manifestUrl, field, options = {}) {
   const {
     fetchInit,
     pointCount = null,
-    signal = fetchInit?.signal ?? null
+    signal = fetchInit?.signal ?? null,
+    priority = 'normal',
+    transfers = null,
+    prefetchOnly = false,
+    onProgress = null
   } = options || {};
+  if (onProgress !== null && typeof onProgress !== 'function') {
+    throw new TypeError('Var field onProgress must be a function or null.');
+  }
+  requirePriority(priority);
+  if (typeof prefetchOnly !== 'boolean') {
+    throw new TypeError('Var field prefetchOnly must be exactly boolean.');
+  }
+  if (transfers !== null && !(transfers instanceof PayloadTransferCache)) {
+    throw new TypeError('Var field transfers must be a PayloadTransferCache or null.');
+  }
   const declaredPoints = requireDeclaredLength(
     pointCount,
     `Var field loader for "${field.key}"`
   );
   throwIfAborted(signal);
 
-  // Handle AnnData source (h5ad or zarr) - unified handling
+  validateExpandedContinuousField(field, `var field "${field.key}"`);
+
+  // Handle AnnData source (h5ad or zarr) - unified handling: the gene is
+  // addressed by its payload path, as on every other source.
   if (shouldUseAnnData(manifestUrl)) {
-    const values = await anndataLoadGeneExpression(
-      manifestUrl,
-      field.key
+    // An h5ad:// or zarr:// dataset id is not a URL host, so the payload is
+    // resolved against the manifest's directory as text; validation above
+    // proved valuesPath one relative payload path.
+    // The file is local: there is nothing to download ahead.
+    if (prefetchOnly) return { loaded: false };
+    const values = await anndataLoadGeneValues(
+      `${manifestUrl.slice(0, manifestUrl.lastIndexOf('/') + 1)}${field.valuesPath}`
     );
     throwIfAborted(signal);
     return { loaded: true, values };
   }
-
-  validateExpandedContinuousField(field, `var field "${field.key}"`);
 
   // Note: Notifications are handled by the caller (state.js) to avoid duplicates
   const outputs = { loaded: true };
@@ -2455,23 +2684,52 @@ export async function loadVarFieldData(manifestUrl, field, options = {}) {
     ? await selectQuantizationBackend()
     : null;
   const dtype = field.valuesDtype;
-  const buffer = await fetchBinary(
+  const declaredBytes = declaredPayloadBytes(declaredPoints, dtype, url);
+  // The download kept for this dataset load, the one already under way, or a
+  // new one (payload-transfer-cache.js), with the browser told how urgent it
+  // is (the field loader schedules it: app/state/managers/field/loading.js).
+  // Each caller gets its own copy: decoding may hand the bytes to a worker.
+  const download = () => fetchBinaryTransfer(
     url,
-    fetchInit,
-    declaredPayloadBytes(declaredPoints, dtype, url)
+    { ...fetchInit, priority: fetchPriorityHint(priority) },
+    declaredBytes,
+    null,
+    onProgress
   );
+  if (prefetchOnly) {
+    // A long run's download ahead of decoding: the bytes are kept (evicting
+    // older entries if need be, so they survive until decoded), and nothing
+    // is decoded yet.
+    if (transfers === null) {
+      throw new TypeError('A var field prefetch needs the loader\'s payload cache.');
+    }
+    const { kept, byteLength } = await transfers.fetch(url, { evict: true, decode: false }, signal, download);
+    throwIfAborted(signal);
+    return { loaded: false, kept, byteLength, budget: transfers.budget };
+  }
+  // A gene the user asked for may make room; one of a long run's decoded at
+  // once is kept only while there is room (payload-transfer-cache.js).
+  const transfer = transfers === null
+    ? await download()
+    : await transfers.fetch(url, { evict: priority !== 'bulk' }, signal, download);
+  throwIfAborted(signal);
 
   if (field.quantized) {
     outputs.values = await dequantizeToFloat32({
       backend: quantizationBackend,
-      buffer,
+      transfer,
+      signal: fetchInit?.signal ?? null,
       dtype,
       minValue: field.minValue,
       maxValue: field.maxValue,
       bits: field.quantizationBits,
     });
   } else {
-    outputs.values = typedArrayFromBuffer(buffer, dtype, url);
+    outputs.values = typedArrayFromBuffer(
+      await inflateBinaryTransfer(transfer, fetchInit?.signal ?? null),
+      dtype,
+      url
+    );
   }
 
   return outputs;
@@ -2534,10 +2792,16 @@ function mergeFieldLoaderOptions(baseOptions, runtimeOptions) {
           ? baseFetchInit
           : { ...baseFetchInit, signal }
       );
+  const priority = requirePriority(runtimeOptions?.priority ?? 'normal');
+  const prefetchOnly = runtimeOptions?.prefetchOnly ?? false;
+  const onProgress = runtimeOptions?.onProgress ?? null;
   return {
     ...baseOptions,
     fetchInit,
-    signal
+    signal,
+    priority,
+    prefetchOnly,
+    onProgress
   };
 }
 
@@ -2562,10 +2826,13 @@ export function createObsFieldLoader(manifestUrl, options = {}) {
  * @returns {(field: any) => Promise<any>}
  */
 export function createVarFieldLoader(manifestUrl, options = {}) {
+  // The downloads of this dataset load (payload-transfer-cache.js): a gene
+  // evicted from memory is decoded again from them instead of requested again.
+  const transfers = new PayloadTransferCache();
   return (field, runtimeOptions = {}) => loadVarFieldData(
     manifestUrl,
     field,
-    mergeFieldLoaderOptions(options, runtimeOptions)
+    { ...mergeFieldLoaderOptions(options, runtimeOptions), transfers }
   );
 }
 
@@ -2769,25 +3036,33 @@ export async function loadEdges(manifestUrl, manifest, options) {
     };
   }
 
-  const [rawSources, rawDestinations, weights] = await Promise.all([
-    loadFileConnectivityIndices(
-      manifestUrl,
-      validated.manifest,
-      validated.manifest.sourcesPath,
-      signal
-    ),
-    loadFileConnectivityIndices(
-      manifestUrl,
-      validated.manifest,
-      validated.manifest.destinationsPath,
-      signal
-    ),
-    loadFileConnectivityWeights(
-      manifestUrl,
-      validated.manifest,
-      signal
-    ),
-  ]);
+  // The three payloads are only useful together: the first failure aborts
+  // its siblings instead of leaving them downloading for nobody.
+  const [rawSources, rawDestinations, weights] =
+    await loadMetadataBatchAtomically(
+      [
+        siblingSignal => loadFileConnectivityIndices(
+          manifestUrl,
+          validated.manifest,
+          validated.manifest.sourcesPath,
+          siblingSignal
+        ),
+        siblingSignal => loadFileConnectivityIndices(
+          manifestUrl,
+          validated.manifest,
+          validated.manifest.destinationsPath,
+          siblingSignal
+        ),
+        siblingSignal => loadFileConnectivityWeights(
+          manifestUrl,
+          validated.manifest,
+          siblingSignal
+        ),
+      ],
+      signal,
+      (load, siblingSignal) => load(siblingSignal),
+      'Connectivity edge loading'
+    );
   throwIfMetadataAborted(signal, 'Connectivity edge loading');
   const edgeData = {
     sources: normalizeConnectivityIndices(rawSources),
@@ -2869,6 +3144,44 @@ export async function loadDatasetIdentity(url, options = {}) {
 }
 
 /**
+ * Load the data-mapping candidate catalog of an AnnData dataset
+ * (`_cellucid/mapping/candidates.json` under its base): the one a Python
+ * AnnData server publishes, or the one this viewer built for an `.h5ad` or
+ * Zarr file it opened. A prepared export has none.
+ *
+ * @param {string} url - The catalog URL under the dataset base.
+ * @param {{candidateAnnDataBinding: null, signal: AbortSignal|null, stagedSource: Object|null}} options
+ * @returns {Promise<Object>}
+ */
+export async function loadMappingCandidates(url, options = {}) {
+  const {
+    candidateAnnDataBinding,
+    signal,
+    stagedSource,
+  } = getStagedMetadataLoadOwner(
+    options,
+    'Data-mapping catalog loader'
+  );
+  requireStagedOwnerForUrl(
+    url,
+    candidateAnnDataBinding,
+    stagedSource,
+    'Data-mapping catalog loader'
+  );
+  throwIfMetadataAborted(signal, 'Data-mapping catalog loading');
+  if (shouldUseAnnData(url)) {
+    return anndataGetMappingCandidates(url, { signal }, candidateAnnDataBinding);
+  }
+  const catalog = await fetchJsonWithProtocol(
+    url,
+    signal ? { signal } : undefined,
+    stagedSource
+  );
+  throwIfMetadataAborted(signal, 'Data-mapping catalog loading');
+  return catalog;
+}
+
+/**
  * Extract embeddings metadata from dataset identity
  * @param {Object} identity - Dataset identity object
  * @returns {Object|null} Embeddings metadata or null if not present
@@ -2878,646 +3191,4 @@ export function getEmbeddingsMetadata(identity) {
     throw new Error('dataset_identity.json is missing required embeddings metadata');
   }
   return identity.embeddings;
-}
-
-// ============================================================================
-// ANALYSIS-SPECIFIC BULK DATA LOADER
-// ============================================================================
-
-function requireExactAnalysisLoadOptions(
-  options,
-  requiredKeys,
-  optionalKeys,
-  label
-) {
-  if (
-    options === null ||
-    typeof options !== 'object' ||
-    Array.isArray(options)
-  ) {
-    throw new TypeError(`${label} options must be an object`);
-  }
-  const allowed = new Set([...requiredKeys, ...optionalKeys]);
-  const missing = requiredKeys.filter(key => !Object.hasOwn(options, key));
-  const unexpected = Object.keys(options).filter(key => !allowed.has(key));
-  if (missing.length > 0 || unexpected.length > 0) {
-    throw new TypeError(
-      `${label} options must contain the exact current keys; ` +
-      `missing=[${missing.join(', ')}], unexpected=[${unexpected.join(', ')}]`
-    );
-  }
-}
-
-function requireAnalysisManifestSelection({
-  manifest,
-  requestedKeys,
-  variableLabel,
-  manifestLabel,
-}) {
-  if (
-    manifest === null ||
-    typeof manifest !== 'object' ||
-    Array.isArray(manifest) ||
-    !Array.isArray(manifest.fields)
-  ) {
-    throw new TypeError(`${manifestLabel} must contain a fields array`);
-  }
-  if (!Array.isArray(requestedKeys) || requestedKeys.length === 0) {
-    throw new TypeError(
-      `${variableLabel} list must be a non-empty array`
-    );
-  }
-
-  const fieldsByKey = new Map();
-  for (const [index, field] of manifest.fields.entries()) {
-    if (
-      field === null ||
-      typeof field !== 'object' ||
-      Array.isArray(field) ||
-      typeof field.key !== 'string' ||
-      field.key.length === 0 ||
-      field.key !== field.key.trim()
-    ) {
-      throw new TypeError(
-        `${manifestLabel} fields[${index}].key must be exact non-empty text`
-      );
-    }
-    if (fieldsByKey.has(field.key)) {
-      throw new Error(
-        `${manifestLabel} contains duplicate field "${field.key}"`
-      );
-    }
-    fieldsByKey.set(field.key, field);
-  }
-
-  const seen = new Set();
-  for (const [index, key] of requestedKeys.entries()) {
-    if (
-      typeof key !== 'string' ||
-      key.length === 0 ||
-      key !== key.trim()
-    ) {
-      throw new TypeError(
-        `Requested ${variableLabel} at index ${index} must be exact non-empty text`
-      );
-    }
-    if (seen.has(key)) {
-      throw new Error(`Requested ${variableLabel} "${key}" is duplicated`);
-    }
-    seen.add(key);
-    if (!fieldsByKey.has(key)) {
-      throw new Error(
-        `Requested ${variableLabel} "${key}" is not declared by ${manifestLabel}`
-      );
-    }
-  }
-  return fieldsByKey;
-}
-
-function requireAnalysisBatchOptions({
-  manifestUrl,
-  batchSize,
-  onProgress,
-  suppressNotifications,
-  label,
-}) {
-  if (
-    typeof manifestUrl !== 'string' ||
-    manifestUrl.length === 0 ||
-    manifestUrl !== manifestUrl.trim()
-  ) {
-    throw new TypeError(`${label} manifestUrl must be exact non-empty text`);
-  }
-  if (!Number.isSafeInteger(batchSize) || batchSize <= 0) {
-    throw new TypeError(`${label} batchSize must be a positive safe integer`);
-  }
-  if (onProgress !== undefined && typeof onProgress !== 'function') {
-    throw new TypeError(`${label} onProgress must be a function or undefined`);
-  }
-  if (typeof suppressNotifications !== 'boolean') {
-    throw new TypeError(`${label} suppressNotifications must be a boolean`);
-  }
-}
-
-/**
- * Load bulk analysis data: multiple gene expressions in parallel batches.
- * Optimized for analysis workflows requiring many genes at once.
- * Uses notification center for progress tracking.
- *
- * @param {Object} options
- * @param {string} options.manifestUrl - Base URL for var manifest
- * @param {Object} options.varManifest - Pre-loaded var manifest (fields array)
- * @param {string[]} options.geneList - Genes to load
- * @param {number} [options.batchSize=20] - Number of genes to load in parallel
- * @param {Function} [options.onProgress] - Progress callback (0-100)
- * @returns {Promise<Object>} { genes: { geneName: Float32Array }, loadedCount }
- */
-export async function loadAnalysisBulkData(options) {
-  requireExactAnalysisLoadOptions(
-    options,
-    ['manifestUrl', 'varManifest', 'geneList'],
-    ['batchSize', 'onProgress', 'suppressNotifications'],
-    'Bulk gene loader'
-  );
-  const {
-    manifestUrl,
-    varManifest,
-    geneList,
-    batchSize = 20,
-    onProgress,
-    suppressNotifications = false
-  } = options;
-  requireAnalysisBatchOptions({
-    manifestUrl,
-    batchSize,
-    onProgress,
-    suppressNotifications,
-    label: 'Bulk gene loader',
-  });
-  const fieldsByKey = requireAnalysisManifestSelection({
-    manifest: varManifest,
-    requestedKeys: geneList,
-    variableLabel: 'gene',
-    manifestLabel: 'var_manifest.json',
-  });
-
-  const notifications = suppressNotifications ? null : getNotificationCenter();
-  const trackerId = notifications?.show({
-    type: 'progress',
-    category: 'data',
-    title: 'Loading Gene Expression',
-    message: `Preparing ${geneList.length} genes...`,
-    progress: 0
-  }) ?? null;
-  const result = {
-    genes: {},
-    loadedCount: 0,
-  };
-
-  try {
-    let loadedCount = 0;
-    const totalGenes = geneList.length;
-
-    for (let i = 0; i < geneList.length; i += batchSize) {
-      const batch = geneList.slice(i, i + batchSize);
-      const batchResults = await Promise.all(
-        batch.map(async geneName => {
-          const data = await loadVarFieldData(
-            manifestUrl,
-            fieldsByKey.get(geneName),
-            {
-              pointCount: manifestPointCount(
-                varManifest,
-                'var_manifest.json'
-              ),
-            }
-          );
-          if (!(data.values instanceof Float32Array)) {
-            throw new TypeError(
-              `Gene "${geneName}" must load as a Float32Array`
-            );
-          }
-          return { geneName, values: data.values };
-        })
-      );
-
-      for (const res of batchResults) {
-        setOwnDataProperty(result.genes, res.geneName, res.values);
-        result.loadedCount++;
-      }
-
-      loadedCount += batch.length;
-      const progress = Math.round((loadedCount / totalGenes) * 100);
-      notifications?.updateProgress(trackerId, progress, {
-        message: `Loaded ${loadedCount} of ${totalGenes} genes...`
-      });
-      onProgress?.(progress);
-    }
-
-    notifications?.complete(
-      trackerId,
-      `Loaded ${result.loadedCount} genes`
-    );
-    return result;
-  } catch (error) {
-    notifications?.fail(trackerId, `Failed: ${error.message}`);
-    throw error;
-  }
-}
-
-/**
- * Load latent embeddings for analysis (e.g., for clustering, UMAP visualization).
- * Supports multiple embedding types (PCA, UMAP, t-SNE, etc.)
- *
- * @param {Object} options
- * @param {string} options.baseUrl - Base URL for data files
- * @param {Object} options.identity - Dataset identity object
- * @param {number} [options.dimension=2] - Dimension to load (1, 2, or 3)
- * @returns {Promise<Object>} { points: Float32Array, dimension, cellCount }
- */
-export async function loadLatentEmbeddings(options) {
-  const { baseUrl, identity, dimension = 2 } = options;
-
-  if (!Number.isInteger(dimension) || dimension < 1 || dimension > 3) {
-    throw new Error(
-      `Requested embedding dimension must be exactly 1, 2, or 3; received ${String(dimension)}`
-    );
-  }
-
-  const embeddings = getEmbeddingsMetadata(identity);
-  const available = embeddings.available_dimensions;
-  if (
-    !Array.isArray(available) ||
-    available.length === 0 ||
-    available.some(
-      value => !Number.isInteger(value) || value < 1 || value > 3
-    ) ||
-    new Set(available).size !== available.length
-  ) {
-    throw new Error(
-      'Embeddings metadata must declare unique numeric available_dimensions from 1, 2, or 3'
-    );
-  }
-  if (!available.includes(dimension)) {
-    throw new Error(
-      `Requested ${dimension}D embedding is not available; ` +
-      `available dimensions: ${available.map(value => `${value}D`).join(', ')}`
-    );
-  }
-
-  const dimKey = `${dimension}d`;
-  const files = embeddings.files;
-  const filePath = files?.[dimKey];
-  if (
-    !files ||
-    typeof files !== 'object' ||
-    Array.isArray(files) ||
-    !Object.hasOwn(files, dimKey) ||
-    typeof filePath !== 'string' ||
-    filePath.length === 0
-  ) {
-    throw new Error(
-      `Embeddings metadata for ${dimension}D must advertise one non-empty file path`
-    );
-  }
-
-  const declaredCells = identityCellCount(identity);
-  const notifications = getNotificationCenter();
-  const trackerId = notifications.startDownload(`${dimension}D Embeddings`);
-  try {
-    const url = resolveUrl(baseUrl, filePath);
-
-    // Load the points
-    const points = await loadPointsBinary(url, {
-      dimension,
-      expectedBytes: declaredPayloadBytes(
-        declaredCells === null ? null : declaredCells * dimension,
-        'float32',
-        url
-      ),
-      showProgress: false
-    });
-
-    // An embedding is one complete coordinate tuple per cell, so a length that
-    // is not a whole number of tuples is a truncated payload, never a dataset
-    // with a fractional cell. `Math.floor` would absorb the remainder and hand
-    // back a cell count that silently disagrees with obs_manifest.json — every
-    // legend total, category count, and selection index downstream would then be
-    // computed against a different population than the one on screen.
-    // DimensionManager already refuses exactly this; the two peers divide the
-    // same payload and must judge it the same way.
-    if (points.length % dimension !== 0) {
-      throw new Error(
-        `${url}: ${dimension}D embedding has ${points.length} values, ` +
-        `which is not a whole number of ${dimension}-value cell coordinates`
-      );
-    }
-    const cellCount = points.length / dimension;
-    if (declaredCells !== null && cellCount !== declaredCells) {
-      throw new Error(
-        `${url}: ${dimension}D embedding carries ${cellCount} cells, but ` +
-        `dataset_identity.json declares ${declaredCells}`
-      );
-    }
-
-    notifications.completeDownload(trackerId);
-
-    return {
-      points,
-      dimension,
-      cellCount
-    };
-
-  } catch (error) {
-    notifications.failDownload(trackerId, error.message);
-    throw error;
-  }
-}
-
-/**
- * Load analysis data for specific cell indices only.
- * More efficient when analyzing a subset of cells (e.g., highlighted pages).
- *
- * @param {Object} options
- * @param {string} options.manifestUrl - Base URL for var manifest
- * @param {Object} options.varManifest - Pre-loaded var manifest
- * @param {string[]} options.geneList - Genes to load
- * @param {number[]} options.cellIndices - Cell indices to extract
- * @param {number} [options.batchSize=20] - Batch size for parallel loading
- * @param {Function} [options.onProgress] - Progress callback
- * @param {boolean} [options.suppressNotifications=false] - Suppress progress UI
- * @returns {Promise<Object>} { genes: { geneName: { values, indices } }, cellCount }
- */
-export async function loadAnalysisSubset(options) {
-  requireExactAnalysisLoadOptions(
-    options,
-    ['manifestUrl', 'varManifest', 'geneList', 'cellIndices'],
-    ['batchSize', 'onProgress', 'suppressNotifications'],
-    'Analysis subset loader'
-  );
-  const {
-    manifestUrl,
-    varManifest,
-    geneList,
-    cellIndices,
-    batchSize = 20,
-    onProgress,
-    suppressNotifications = false
-  } = options;
-
-  requireAnalysisBatchOptions({
-    manifestUrl,
-    batchSize,
-    onProgress,
-    suppressNotifications,
-    label: 'Analysis subset loader',
-  });
-  if (!Array.isArray(cellIndices)) {
-    throw new TypeError(
-      'Analysis subset loader cellIndices must be an array'
-    );
-  }
-  const seenCellIndices = new Set();
-  for (const [index, cellIndex] of cellIndices.entries()) {
-    if (!Number.isSafeInteger(cellIndex) || cellIndex < 0) {
-      throw new TypeError(
-        `Analysis subset loader cellIndices[${index}] must be a non-negative safe integer`
-      );
-    }
-    if (seenCellIndices.has(cellIndex)) {
-      throw new Error(
-        `Analysis subset loader cell index ${cellIndex} is duplicated`
-      );
-    }
-    seenCellIndices.add(cellIndex);
-  }
-
-  const notifications = suppressNotifications ? null : getNotificationCenter();
-  const trackerId = notifications?.show({
-    type: 'progress',
-    category: 'data',
-    title: 'Loading Subset Data',
-    message: `Loading ${geneList.length} genes for ${cellIndices.length} cells...`,
-    progress: 0
-  }) ?? null;
-
-  try {
-    // First load all gene data
-    const bulkResult = await loadAnalysisBulkData({
-      manifestUrl,
-      varManifest,
-      geneList,
-      batchSize,
-      suppressNotifications: true,
-      onProgress: (p) => {
-        notifications?.updateProgress(trackerId, Math.round(p * 0.8), {
-          message: `Loading genes (${Math.round(p)}%)...`
-        });
-        onProgress?.(Math.round(p * 0.8));
-      }
-    });
-
-    // Extract values for specified cell indices
-    notifications?.updateProgress(trackerId, 85, {
-      message: 'Extracting cell values...'
-    });
-
-    const loadedGenes = Object.keys(bulkResult.genes);
-    if (
-      loadedGenes.length !== geneList.length ||
-      geneList.some(geneName => !Object.hasOwn(bulkResult.genes, geneName))
-    ) {
-      throw new Error(
-        'Analysis subset loader did not receive every requested gene'
-      );
-    }
-    for (const geneName of geneList) {
-      const fullValues = bulkResult.genes[geneName];
-      if (!(fullValues instanceof Float32Array)) {
-        throw new TypeError(
-          `Analysis subset gene "${geneName}" must be a Float32Array`
-        );
-      }
-      for (const cellIndex of cellIndices) {
-        if (cellIndex >= fullValues.length) {
-          throw new RangeError(
-            `Cell index ${cellIndex} is outside gene "${geneName}" values length ` +
-            `${fullValues.length}`
-          );
-        }
-      }
-    }
-
-    const result = {
-      genes: {},
-      cellCount: cellIndices.length,
-      cellIndices: [...cellIndices]
-    };
-
-    const indexArray = [...cellIndices];
-    for (const geneName of geneList) {
-      const fullValues = bulkResult.genes[geneName];
-      const subsetValues = new Float32Array(cellIndices.length);
-
-      for (let i = 0; i < indexArray.length; i++) {
-        const cellIdx = indexArray[i];
-        subsetValues[i] = fullValues[cellIdx];
-      }
-
-      setOwnDataProperty(result.genes, geneName, {
-        values: subsetValues,
-        indices: [...indexArray]
-      });
-    }
-
-    notifications?.complete(trackerId,
-      `Loaded ${Object.keys(result.genes).length} genes for ${cellIndices.length} cells`
-    );
-
-    onProgress?.(100);
-
-    return result;
-
-  } catch (error) {
-    notifications?.fail(trackerId, `Failed: ${error.message}`);
-    throw error;
-  }
-}
-
-// ============================================================================
-// ANALYSIS-SPECIFIC BULK OBS LOADER
-// ============================================================================
-//
-// This function is integrated into EnhancedDataLayer.fetchMultiFieldData()
-// in enhanced-data-layer.js for multi-variable analysis workflows.
-// ============================================================================
-
-/**
- * Load bulk observation field data: multiple obs fields in parallel.
- * Optimized for analysis workflows requiring many obs fields at once.
- * Uses notification center for progress tracking.
- *
- * Supports all data sources:
- * - HTTP/HTTPS (standard web)
- * - local-user:// (user's local filesystem)
- * - remote:// (remote server sources)
- * - jupyter:// (Jupyter notebook server)
- * - h5ad files (via shouldUseAnnData check in loadObsFieldData)
- * - zarr directories (via shouldUseAnnData check in loadObsFieldData)
- *
- * @param {Object} options
- * @param {string} options.manifestUrl - Base URL for obs manifest
- * @param {Object} options.obsManifest - Pre-loaded obs manifest (fields array)
- * @param {string[]} options.fieldList - Field keys to load
- * @param {number} [options.batchSize=10] - Number of fields to load in parallel (lower than genes due to larger data)
- * @param {Function} [options.onProgress] - Progress callback (0-100)
- * @returns {Promise<Object>} { fields: { fieldKey: { values?, codes?, categories?, kind } }, loadedCount }
- */
-export async function loadAnalysisBulkObsData(options) {
-  requireExactAnalysisLoadOptions(
-    options,
-    ['manifestUrl', 'obsManifest', 'fieldList'],
-    ['batchSize', 'onProgress', 'suppressNotifications'],
-    'Bulk observation loader'
-  );
-  const {
-    manifestUrl,
-    obsManifest,
-    fieldList,
-    batchSize = 10,
-    onProgress,
-    suppressNotifications = false
-  } = options;
-  requireAnalysisBatchOptions({
-    manifestUrl,
-    batchSize,
-    onProgress,
-    suppressNotifications,
-    label: 'Bulk observation loader',
-  });
-  const fieldsByKey = requireAnalysisManifestSelection({
-    manifest: obsManifest,
-    requestedKeys: fieldList,
-    variableLabel: 'observation field',
-    manifestLabel: 'obs_manifest.json',
-  });
-
-  const notifications = suppressNotifications ? null : getNotificationCenter();
-  const trackerId = notifications ? notifications.show({
-    type: 'progress',
-    category: 'data',
-    title: 'Loading Observation Fields',
-    message: `Preparing ${fieldList.length} fields...`,
-    progress: 0
-  }) : null;
-
-  const result = {
-    fields: {},
-    loadedCount: 0,
-  };
-
-  try {
-    let loadedCount = 0;
-    const totalFields = fieldList.length;
-
-    for (let i = 0; i < fieldList.length; i += batchSize) {
-      const batch = fieldList.slice(i, i + batchSize);
-      const batchResults = await Promise.all(
-        batch.map(async fieldKey => {
-          const field = fieldsByKey.get(fieldKey);
-          const data = await loadObsFieldData(manifestUrl, field, {
-            pointCount: manifestPointCount(
-              obsManifest,
-              'obs_manifest.json'
-            ),
-          });
-          if (field.kind !== 'continuous' && field.kind !== 'category') {
-            throw new TypeError(
-              `Observation field "${fieldKey}" must declare its exact kind`
-            );
-          }
-          if (
-            field.kind === 'continuous' &&
-            !(data.values instanceof Float32Array)
-          ) {
-            throw new TypeError(
-              `Continuous observation field "${fieldKey}" must load as Float32Array`
-            );
-          }
-          if (
-            field.kind === 'category' &&
-            (!(data.codes instanceof Uint16Array) ||
-              !Array.isArray(field.categories))
-          ) {
-            throw new TypeError(
-              `Categorical observation field "${fieldKey}" must load exact codes and categories`
-            );
-          }
-          const fieldResult = {
-            kind: field.kind,
-            categories: field.kind === 'category' ? field.categories : null
-          };
-
-          if (field.kind === 'continuous') {
-            fieldResult.values = data.values;
-          } else {
-            fieldResult.codes = data.codes;
-          }
-
-          return { fieldKey, data: fieldResult };
-        })
-      );
-
-      for (const res of batchResults) {
-        setOwnDataProperty(result.fields, res.fieldKey, res.data);
-        result.loadedCount++;
-      }
-
-      loadedCount += batch.length;
-      const progress = Math.round((loadedCount / totalFields) * 100);
-
-      if (notifications && trackerId) {
-        notifications.updateProgress(trackerId, progress, {
-          message: `Loaded ${loadedCount} of ${totalFields} fields...`
-        });
-      }
-
-      onProgress?.(progress);
-    }
-
-    if (notifications && trackerId) {
-      notifications.complete(
-        trackerId,
-        `Loaded ${result.loadedCount} fields`
-      );
-    }
-
-    return result;
-
-  } catch (error) {
-    if (notifications && trackerId) {
-      notifications.fail(trackerId, `Failed: ${error.message}`);
-    }
-    throw error;
-  }
 }

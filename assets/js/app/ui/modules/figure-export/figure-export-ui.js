@@ -8,6 +8,9 @@
  */
 
 import { createElement, clearElement } from '../../../utils/dom-utils.js';
+import { createDisclosure, createGroup, createInfoTip } from '../../components/controls.js';
+import { formatCount } from '../../components/display-format.js';
+import { createVisibilityGatedRender } from '../../core/visibility-gate.js';
 import { clamp, parseFiniteNumberInRange } from '../../../utils/number-utils.js';
 import { confirmExportFidelityWarnings } from './components/fidelity-warning-dialog.js';
 import { reportFigureExportFailure } from './figure-export-engine.js';
@@ -27,8 +30,12 @@ import { drawCanvasOrientationIndicator } from './components/orientation-indicat
 import {
   buildReferenceGridModel,
   drawCanvasReferenceGrid,
-  resolveReferenceGridSurfaceRgb,
+  resolveReferenceGridSurface,
 } from './components/reference-grid.js';
+import {
+  figureDrawsBackdropLook,
+  peekBackdropLookPreview,
+} from './components/backdrop-look-export.js';
 import { applyColorblindSimulationToImageData } from './utils/colorblindness.js';
 import { assertCropRect01 } from './utils/crop.js';
 import { rgb01ToHex } from './utils/color-utils.js';
@@ -40,7 +47,6 @@ import {
 } from './utils/viewer-background.js';
 import {
   buildOverlayFidelityWarnings,
-  NON_EXPORTED_VIEWER_CHROME,
 } from './utils/overlay-fidelity.js';
 import {
   assertCameraState,
@@ -276,15 +282,16 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     { label: '1920 × 1080', value: '1920x1080' },
   ];
 
-  const header = createElement('div', { className: 'legend-help' }, [
-    'Export the current view as publication-ready SVG or high-DPI PNG.'
-  ]);
+  const headerInfo = createInfoTip({ tip: 'figure-export', label: 'About figure export' });
+  const headerGroup = createGroup({ title: 'Export', info: headerInfo.button });
+  headerGroup.body.append(headerInfo.popover);
+  const header = headerGroup.root;
 
   // ─────────────────────────────────────────────────────────────────────────
   // Plot size + framing
   // ─────────────────────────────────────────────────────────────────────────
   const sizeRow = createElement('div', { className: 'control-block' });
-  sizeRow.appendChild(createElement('label', {}, ['Plot size:']));
+  sizeRow.appendChild(createElement('span', { className: 'field-label' }, ['Plot size']));
 
   const presetSelect = createElement('select', { className: 'obs-select', ariaLabel: 'Export size preset' });
   presets.forEach((p) => {
@@ -293,8 +300,9 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   presetSelect.value = 'screen-half';
 
   const widthInput = createElement('input', {
+    id: 'figure-export-width',
     type: 'number',
-    className: 'figure-input figure-input-sm',
+    className: 'obs-select figure-input-sm',
     value: String(DEFAULT_SIZE.width),
     min: '100',
     max: '20000',
@@ -303,8 +311,9 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     ariaLabel: 'Export width (px)'
   });
   const heightInput = createElement('input', {
+    id: 'figure-export-height',
     type: 'number',
-    className: 'figure-input figure-input-sm',
+    className: 'obs-select figure-input-sm',
     value: String(DEFAULT_SIZE.height),
     min: '100',
     max: '20000',
@@ -317,11 +326,11 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     presetSelect,
     createElement('div', { className: 'figure-export-dimensions' }, [
       createElement('div', { className: 'figure-export-dim-field' }, [
-        createElement('span', { className: 'figure-export-label' }, ['W']),
+        createElement('label', { className: 'figure-export-inline-label', htmlFor: widthInput.id }, ['W']),
         widthInput,
       ]),
       createElement('div', { className: 'figure-export-dim-field' }, [
-        createElement('span', { className: 'figure-export-label' }, ['H']),
+        createElement('label', { className: 'figure-export-inline-label', htmlFor: heightInput.id }, ['H']),
         heightInput,
       ]),
     ])
@@ -330,9 +339,9 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
 
   const cropEnabledCheckbox = createElement('input', { type: 'checkbox', id: 'figure-export-crop-enabled' });
   const cropLockCheckbox = createElement('input', { type: 'checkbox', id: 'figure-export-crop-lock' });
-  const cropResetBtn = createElement('button', { type: 'button', className: 'toggle-switch figure-export-framing-btn' }, ['Reset']);
-  const cropConfirmBtn = createElement('button', { type: 'button', className: 'toggle-switch figure-export-framing-btn', ariaPressed: 'false' }, ['Confirm']);
-  const cropFitPlotBtn = createElement('button', { type: 'button', className: 'toggle-switch figure-export-framing-btn' }, ['Fit plot']);
+  const cropResetBtn = createElement('button', { type: 'button', className: 'btn btn-compact figure-export-framing-btn' }, ['Reset']);
+  const cropConfirmBtn = createElement('button', { type: 'button', className: 'btn btn-compact figure-export-framing-btn', ariaPressed: 'false' }, ['Confirm']);
+  const cropFitPlotBtn = createElement('button', { type: 'button', className: 'btn btn-compact figure-export-framing-btn' }, ['Fit plot']);
   const cropAspectHint = createElement('span', { className: 'figure-export-crop-aspect' }, ['Aspect: —']);
 
   const frameExportToggleLabel = createElement('label', { className: 'checkbox-inline', htmlFor: cropEnabledCheckbox.id }, [
@@ -341,7 +350,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   ]);
   const lockAspectBtn = createElement('button', {
     type: 'button',
-    className: 'toggle-switch figure-export-framing-btn',
+    className: 'btn btn-compact figure-export-framing-btn',
     ariaPressed: 'false',
   }, ['Lock aspect']);
   const framingActionGrid = createElement('div', { className: 'figure-export-framing-grid' }, [
@@ -359,12 +368,8 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   // Style section
   // ─────────────────────────────────────────────────────────────────────────
   const styleSection = createElement('div', { className: 'control-block' });
-  styleSection.appendChild(createElement('label', {}, ['Style:']));
-  styleSection.appendChild(createElement('div', { className: 'figure-export-hint' }, [
-    'Background color and font settings.'
-  ]));
 
-  const backgroundSelect = createElement('select', { className: 'obs-select', ariaLabel: 'Background' });
+  const backgroundSelect = createElement('select', { id: 'figure-export-background', className: 'obs-select' });
   backgroundSelect.appendChild(createElement('option', { value: 'viewer' }, ['Match viewer']));
   backgroundSelect.appendChild(createElement('option', { value: 'white' }, ['White BG']));
   backgroundSelect.appendChild(createElement('option', { value: 'transparent' }, ['Transparent']));
@@ -373,7 +378,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   const backgroundColorInput = createElement('input', { type: 'color', className: 'figure-color-picker', value: initialViewerBg || '#ffffff', ariaLabel: 'Custom background color' });
   backgroundSelect.value = 'viewer';
 
-  const fontSelect = createElement('select', { className: 'obs-select', ariaLabel: 'Font family' });
+  const fontSelect = createElement('select', { id: 'figure-export-font', className: 'obs-select' });
   [
     { label: 'Arial', value: 'Arial, Helvetica, sans-serif' },
     { label: 'Helvetica', value: 'Helvetica, Arial, sans-serif' },
@@ -381,8 +386,9 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   ].forEach((f) => fontSelect.appendChild(createElement('option', { value: f.value }, [f.label])));
 
   const fontSizeInput = createElement('input', {
+    id: 'figure-export-font-size',
     type: 'number',
-    className: 'figure-input figure-input-sm',
+    className: 'obs-select figure-input-sm',
     value: '12',
     min: '6',
     max: '24',
@@ -394,8 +400,9 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   const autoTextSizingCheckbox = createElement('input', { type: 'checkbox', id: 'figure-export-text-auto', checked: true });
 
   const legendFontSizeInput = createElement('input', {
+    id: 'figure-export-legend-font-size',
     type: 'number',
-    className: 'figure-input figure-input-sm',
+    className: 'obs-select figure-input-sm',
     value: '12',
     min: '6',
     max: '24',
@@ -404,8 +411,9 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     ariaLabel: 'Legend font size (px)'
   });
   const tickFontSizeInput = createElement('input', {
+    id: 'figure-export-tick-font-size',
     type: 'number',
-    className: 'figure-input figure-input-sm',
+    className: 'obs-select figure-input-sm',
     value: '12',
     min: '6',
     max: '24',
@@ -414,8 +422,9 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     ariaLabel: 'Tick font size (px)'
   });
   const axisLabelFontSizeInput = createElement('input', {
+    id: 'figure-export-axis-font-size',
     type: 'number',
-    className: 'figure-input figure-input-sm',
+    className: 'obs-select figure-input-sm',
     value: '12',
     min: '6',
     max: '36',
@@ -424,8 +433,9 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     ariaLabel: 'Axis label font size (px)'
   });
   const titleFontSizeInput = createElement('input', {
+    id: 'figure-export-title-font-size',
     type: 'number',
-    className: 'figure-input figure-input-sm',
+    className: 'obs-select figure-input-sm',
     value: '15',
     min: '8',
     max: '48',
@@ -434,8 +444,9 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     ariaLabel: 'Title font size (px)'
   });
   const centroidLabelFontSizeInput = createElement('input', {
+    id: 'figure-export-centroid-font-size',
     type: 'number',
-    className: 'figure-input figure-input-sm',
+    className: 'obs-select figure-input-sm',
     value: '12',
     min: '6',
     max: '36',
@@ -453,57 +464,57 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     ]),
   ]);
 
-  const autoTextBox = createElement('div', { className: 'figure-export-dashed-box figure-export-auto-text-box' }, [
+  const autoTextBox = createElement('div', { className: 'control-box figure-export-auto-text-box' }, [
     createElement('div', { className: 'figure-export-sizes-grid' }, [
       createElement('div', { className: 'figure-export-size-item' }, [
-        createElement('span', { className: 'figure-export-label' }, ['Base']),
+        createElement('label', { className: 'figure-export-inline-label', htmlFor: fontSizeInput.id }, ['Base']),
         fontSizeInput,
       ]),
       createElement('div', { className: 'figure-export-size-item' }, [
-        createElement('span', { className: 'figure-export-label' }, ['Legend']),
+        createElement('label', { className: 'figure-export-inline-label', htmlFor: legendFontSizeInput.id }, ['Legend']),
         legendFontSizeInput,
       ]),
       createElement('div', { className: 'figure-export-size-item' }, [
-        createElement('span', { className: 'figure-export-label' }, ['Ticks']),
+        createElement('label', { className: 'figure-export-inline-label', htmlFor: tickFontSizeInput.id }, ['Ticks']),
         tickFontSizeInput,
       ]),
       createElement('div', { className: 'figure-export-size-item' }, [
-        createElement('span', { className: 'figure-export-label' }, ['Axis']),
+        createElement('label', { className: 'figure-export-inline-label', htmlFor: axisLabelFontSizeInput.id }, ['Axis']),
         axisLabelFontSizeInput,
       ]),
       createElement('div', { className: 'figure-export-size-item' }, [
-        createElement('span', { className: 'figure-export-label' }, ['Title']),
+        createElement('label', { className: 'figure-export-inline-label', htmlFor: titleFontSizeInput.id }, ['Title']),
         titleFontSizeInput,
       ]),
       createElement('div', { className: 'figure-export-size-item' }, [
-        createElement('span', { className: 'figure-export-label' }, ['Centroids']),
+        createElement('label', { className: 'figure-export-inline-label', htmlFor: centroidLabelFontSizeInput.id }, ['Centroids']),
         centroidLabelFontSizeInput,
       ]),
     ]),
   ]);
 
   const styleBox = createElement('div', { className: 'figure-export-style-box' }, [
-    createElement('div', { className: 'section-title' }, ['Background']),
+    createElement('label', { htmlFor: backgroundSelect.id }, ['Background']),
     createElement('div', { className: 'figure-export-style-row' }, [
       backgroundSelect,
       backgroundColorInput,
     ]),
-    createElement('div', { className: 'section-title' }, ['Font']),
+    createElement('label', { htmlFor: fontSelect.id }, ['Font']),
     createElement('div', { className: 'figure-export-style-row' }, [
       fontSelect,
     ]),
-    createElement('div', { className: 'section-title' }, ['Text sizes']),
+    createElement('span', { className: 'field-label' }, ['Text sizes']),
     autoTextToggleRow,
     autoTextBox,
   ]);
   styleSection.appendChild(styleBox);
 
   const titleRow = createElement('div', { className: 'control-block' });
-  titleRow.appendChild(createElement('label', { htmlFor: 'figure-export-title' }, ['Title:']));
+  titleRow.appendChild(createElement('label', { htmlFor: 'figure-export-title' }, ['Title']));
   const titleInput = createElement('input', {
     id: 'figure-export-title',
     type: 'text',
-    className: 'figure-input',
+    className: 'obs-select',
     placeholder: 'Optional figure title',
     ariaLabel: 'Figure title'
   });
@@ -512,7 +523,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   const xLabelInput = createElement('input', {
     id: 'figure-export-xlabel',
     type: 'text',
-    className: 'figure-input figure-export-axis-input',
+    className: 'obs-select figure-export-axis-input',
     value: 'X',
     placeholder: 'e.g., UMAP_1',
     ariaLabel: 'X axis label'
@@ -521,7 +532,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   const yLabelInput = createElement('input', {
     id: 'figure-export-ylabel',
     type: 'text',
-    className: 'figure-input figure-export-axis-input',
+    className: 'obs-select figure-export-axis-input',
     value: 'Y',
     placeholder: 'e.g., UMAP_2',
     ariaLabel: 'Y axis label'
@@ -531,10 +542,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   // Annotations section
   // ─────────────────────────────────────────────────────────────────────────
   const annotationSection = createElement('div', { className: 'control-block' });
-  annotationSection.appendChild(createElement('label', {}, ['Annotations:']));
-  annotationSection.appendChild(createElement('div', { className: 'figure-export-hint' }, [
-    'Extra elements to include in the export.'
-  ]));
+  annotationSection.appendChild(createElement('span', { className: 'field-label' }, ['Annotations']));
   const includeAxesCheckbox = createElement('input', { type: 'checkbox', id: 'figure-export-axes', checked: true });
   const includeLegendCheckbox = createElement('input', { type: 'checkbox', id: 'figure-export-legend', checked: true });
   const showOrientationCheckbox = createElement('input', { type: 'checkbox', id: 'figure-export-orientation', checked: true });
@@ -557,20 +565,17 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   ]);
   const axisLabelGrid = createElement('div', { className: 'figure-export-axis-label-grid' }, [
     createElement('div', { className: 'figure-export-axis-label-field' }, [
-      createElement('span', { className: 'figure-export-label' }, ['X']),
+      createElement('label', { className: 'figure-export-inline-label', htmlFor: xLabelInput.id }, ['X']),
       xLabelInput,
     ]),
     createElement('div', { className: 'figure-export-axis-label-field' }, [
-      createElement('span', { className: 'figure-export-label' }, ['Y']),
+      createElement('label', { className: 'figure-export-inline-label', htmlFor: yLabelInput.id }, ['Y']),
       yLabelInput,
     ]),
   ]);
   const axisLabelSettings = createElement('div', { className: 'figure-export-axes-settings' }, [
-    createElement('label', {}, ['Axis labels:']),
+    createElement('span', { className: 'field-label' }, ['Axis labels']),
     axisLabelGrid,
-    createElement('div', { className: 'figure-export-hint figure-export-hint--tight' }, [
-      'Clear X/Y to hide axis labels.'
-    ]),
   ]);
 
   const legendPosSelect = createElement('select', { className: 'obs-select', ariaLabel: 'Legend position' });
@@ -580,23 +585,15 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   const legendSettingsRow = createElement('div', { className: 'figure-export-style-row figure-export-legend-settings' }, [
     legendPosSelect,
   ]);
-  // Interaction chrome is deliberately absent from every figure. Saying so here
-  // means it is never discovered only after the file has been opened.
-  const chromeDisclosure = createElement(
-    'div',
-    { className: 'figure-export-hint figure-export-hint--tight' },
-    [`Never exported: ${NON_EXPORTED_VIEWER_CHROME.join(', ')}.`]
-  );
-  const annotationBox = createElement('div', { className: 'figure-export-dashed-box figure-export-annotations-box' }, [
+  const annotationBox = createElement('div', { className: 'control-box figure-export-annotations-box' }, [
     annotationChecks,
     axisLabelSettings,
     legendSettingsRow,
-    chromeDisclosure,
   ]);
   annotationSection.appendChild(annotationBox);
 
   /**
-   * The reference-grid appearance the viewer is drawing right now, or null.
+   * The reference-layer appearance the viewer is drawing right now, or null.
    * Read on every use because the viewer background can change while the
    * export dialog is open.
    */
@@ -614,14 +611,16 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   }
 
   function syncAnnotationUi() {
-    axisLabelSettings.style.display = includeAxesCheckbox.checked ? 'grid' : 'none';
-    legendSettingsRow.style.display = includeLegendCheckbox.checked ? 'flex' : 'none';
+    axisLabelSettings.hidden = !includeAxesCheckbox.checked;
+    legendSettingsRow.hidden = !includeLegendCheckbox.checked;
     const appearance = readViewerReferenceGridAppearance();
     const available = appearance !== null;
     referenceGridCheckbox.disabled = !available;
-    referenceGridLabel.title = available
-      ? `Include the viewer's ${VIEWER_BACKGROUND_LABELS[appearance.mode]} reference grid.`
-      : 'The viewer background draws no reference grid.';
+    referenceGridLabel.title = !available
+      ? 'The viewer background draws no reference grid.'
+      : appearance.kind === 'studio'
+        ? `Include the viewer's ${VIEWER_BACKGROUND_LABELS[appearance.mode]} floor and dots.`
+        : `Include the viewer's ${VIEWER_BACKGROUND_LABELS[appearance.mode]} reference grid.`;
   }
   listen(includeAxesCheckbox, 'change', syncAnnotationUi);
   listen(includeLegendCheckbox, 'change', syncAnnotationUi);
@@ -634,8 +633,9 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   const selectionRow = createElement('div', { className: 'control-block figure-export-row' });
   const emphasizeSelectionCheckbox = createElement('input', { type: 'checkbox', id: 'figure-export-selection-emphasis' });
   const selectionMutedOpacityInput = createElement('input', {
+    id: 'figure-export-muted-opacity',
     type: 'number',
-    className: 'figure-input figure-input-sm',
+    className: 'obs-select figure-input-sm',
     value: '0.15',
     min: '0',
     max: '1',
@@ -648,14 +648,14 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     ' Emphasize selection'
   ]));
   selectionRow.appendChild(createElement('div', { className: 'figure-export-inline' }, [
-    createElement('span', { className: 'figure-export-label' }, ['α']),
+    createElement('label', { className: 'figure-export-inline-label', htmlFor: selectionMutedOpacityInput.id }, ['α']),
     selectionMutedOpacityInput,
   ]));
 
   const previewRow = createElement('div', { className: 'control-block' });
-  previewRow.appendChild(createElement('label', {}, ['Preview:']));
+  previewRow.appendChild(createElement('span', { className: 'field-label' }, ['Preview']));
   const previewEnabledCheckbox = createElement('input', { type: 'checkbox', id: 'figure-export-preview-enabled' });
-  const previewRefreshBtn = createElement('button', { type: 'button', className: 'toggle-switch figure-export-framing-btn' }, ['Refresh']);
+  const previewRefreshBtn = createElement('button', { type: 'button', className: 'btn btn-compact figure-export-framing-btn' }, ['Refresh']);
   const previewModeSelect = createElement('select', { className: 'obs-select figure-export-colorblind-select', ariaLabel: 'Colorblind preview' });
   previewModeSelect.appendChild(createElement('option', { value: 'none' }, ['Normal']));
   previewModeSelect.appendChild(createElement('option', { value: 'deuteranopia' }, ['Deuteranopia']));
@@ -669,12 +669,10 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     ])
   ]);
   previewRow.appendChild(previewControls);
-  previewRow.appendChild(createElement('div', { className: 'figure-export-hint figure-export-hint--tight' }, [
-    'Shows an export-style preview (required for framing).'
-  ]));
 
-  const previewStatus = createElement('div', {
-    className: 'figure-export-preview-status',
+  const previewStatus = createElement('p', {
+    className: 'status-line figure-export-preview-status',
+    'data-tone': 'muted',
     role: 'status',
     ariaLive: 'polite',
     ariaAtomic: 'true',
@@ -694,16 +692,13 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     previewStatus,
   ]);
 
-  const previewSettingsBox = createElement('div', { className: 'figure-export-dashed-box figure-export-preview-settings' }, [
+  const previewSettingsBox = createElement('div', { className: 'control-box figure-export-preview-settings' }, [
     createElement('div', { className: 'figure-export-preview-settings-top' }, [
       previewModeSelect,
       previewRefreshBtn,
     ]),
     createElement('div', { className: 'figure-export-preview-settings-row figure-export-preview-settings-row--toggles' }, [
       frameExportToggleLabel,
-    ]),
-    createElement('div', { className: 'figure-export-hint figure-export-hint--tight' }, [
-      'Crop the export by dragging the frame in the preview.'
     ]),
     framingActionGrid,
     cropAspectHint,
@@ -715,10 +710,6 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   // Advanced & Export section
   // ─────────────────────────────────────────────────────────────────────────
   const advancedSection = createElement('div', { className: 'control-block' });
-  advancedSection.appendChild(createElement('label', {}, ['Download:']));
-  advancedSection.appendChild(createElement('div', { className: 'figure-export-hint' }, [
-    'Format and resolution for the exported file.'
-  ]));
 
   const downloadSelect = createElement('select', { className: 'obs-select', ariaLabel: 'Download format' });
   downloadSelect.appendChild(createElement('option', { value: 'svg' }, ['SVG']));
@@ -745,8 +736,9 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   strategySelect.appendChild(createElement('option', { value: 'hybrid' }, ['Hybrid']));
 
   const optimizedTargetCountInput = createElement('input', {
+    id: 'figure-export-target-count',
     type: 'number',
-    className: 'figure-input figure-input-sm',
+    className: 'obs-select figure-input-sm',
     value: '100000',
     min: '1000',
     max: '5000000',
@@ -755,16 +747,11 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     ariaLabel: 'Optimized vector target points'
   });
   const targetGroup = createElement('div', { className: 'figure-export-inline', id: 'figure-export-target-group' }, [
-    createElement('span', { className: 'figure-export-label' }, ['Keep']),
+    createElement('label', { className: 'figure-export-inline-label', htmlFor: optimizedTargetCountInput.id }, ['Keep']),
     optimizedTargetCountInput,
   ]);
   const densitySettingsRow = createElement('div', { className: 'figure-export-style-row', id: 'figure-export-density-settings' }, [
     targetGroup,
-  ]);
-  const densityHint = createElement('div', { className: 'figure-export-hint' }, [
-    'Full Vector writes every point; Optimized Vector writes the exact chosen target count; Hybrid embeds the shader-rendered point pass. '
-    + 'Vector points carry the viewer’s atmospheric fog but are flat discs: '
-    + 'only Hybrid and PNG reproduce the 3D sphere lighting.'
   ]);
 
   const advancedGrid = createElement('div', { className: 'figure-export-style-row' }, [
@@ -774,7 +761,6 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   ]);
   advancedSection.appendChild(advancedGrid);
   advancedSection.appendChild(densitySettingsRow);
-  advancedSection.appendChild(densityHint);
 
   const exportAllViewsCheckbox = createElement('input', { type: 'checkbox', id: 'figure-export-all-views' });
   advancedSection.appendChild(createElement('label', { className: 'checkbox-inline', htmlFor: exportAllViewsCheckbox.id }, [
@@ -783,7 +769,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   ]));
 
   const actionsRow = createElement('div', { className: 'figure-export-actions' });
-  const exportBtn = createElement('button', { type: 'button', className: 'btn-small', id: 'figure-export-btn' }, ['Export']);
+  const exportBtn = createElement('button', { type: 'button', className: 'btn btn-primary', id: 'figure-export-btn' }, ['Export']);
   actionsRow.appendChild(exportBtn);
 
   function syncFormatDependentUi() {
@@ -793,18 +779,17 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     const multiPng = mode === 'png-multi' || mode === 'all';
 
     const strategy = strategySelect.value;
-    densitySettingsRow.style.display = needsSvg && strategy === 'optimized-vector' ? 'flex' : 'none';
-    densityHint.style.display = needsSvg ? 'block' : 'none';
-    targetGroup.style.display = strategy === 'optimized-vector' ? 'inline-flex' : 'none';
+    densitySettingsRow.hidden = !(needsSvg && strategy === 'optimized-vector');
+    targetGroup.hidden = strategy !== 'optimized-vector';
 
-    dpiSelect.style.display = needsPng && !multiPng ? 'block' : 'none';
-    strategySelect.style.display = needsSvg ? 'block' : 'none';
-    backgroundColorInput.style.display = backgroundSelect.value === 'custom' ? 'block' : 'none';
-    selectionMutedOpacityInput.parentElement.style.display = emphasizeSelectionCheckbox.checked ? 'inline-flex' : 'none';
+    dpiSelect.hidden = !(needsPng && !multiPng);
+    strategySelect.hidden = !needsSvg;
+    backgroundColorInput.hidden = backgroundSelect.value !== 'custom';
+    selectionMutedOpacityInput.parentElement.hidden = !emphasizeSelectionCheckbox.checked;
 
     const previewOn = previewEnabledCheckbox.checked;
-    previewBox.style.display = previewOn ? 'grid' : 'none';
-    previewSettingsBox.style.display = previewOn ? 'grid' : 'none';
+    previewBox.hidden = !previewOn;
+    previewSettingsBox.hidden = !previewOn;
     if (!previewOn) {
       previewStatus.textContent = 'Preview is off.';
     }
@@ -1255,7 +1240,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     title: true,
   });
   subscribePreviewInvalidation('highlight:changed');
-  subscribePreviewInvalidation('dimension:changed');
+  subscribePreviewInvalidation('view:representation-changed');
   subscribePreviewInvalidation('view:changed', {
     title: true,
   });
@@ -1268,7 +1253,11 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     );
   }
   const lodCleanup = viewer.onLodChanged(() => {
-    if (!previewDisposed) invalidatePreviewSamples();
+    if (previewDisposed) return;
+    // Levels of detail step while the camera moves: drop the sample, and let
+    // the camera's settling rebuild it once instead of once per step.
+    if (viewer.isCameraInMotion()) invalidatePreviewSamples({ rebuild: false });
+    else invalidatePreviewSamples();
   });
   if (typeof lodCleanup !== 'function') {
     throw new TypeError(
@@ -1288,6 +1277,10 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
       if (event?.reason === 'camera-settled') {
         // Viewer-side settling is authoritative; rebuild on the next task.
         invalidatePreviewSamples();
+        return;
+      }
+      if (event?.reason === 'lod' && viewer.isCameraInMotion()) {
+        invalidatePreviewSamples({ rebuild: false });
         return;
       }
       // Discrete layout/style publications can arrive in short bursts.
@@ -1313,10 +1306,34 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
 
   // Point radius is now taken directly from viewer's renderState (WYSIWYG)
 
+  // A figure of no cells is empty, so Export follows the runtime's cells as
+  // well as the export in flight.
+  let exportBusy = false;
+  let cellsPresent = false;
+
+  function syncExportAvailability() {
+    exportBtn.disabled = exportBusy || !cellsPresent;
+    exportBtn.title = cellsPresent ? '' : 'Load a dataset to export a figure';
+  }
+
   function setBusy(busy) {
-    exportBtn.disabled = busy;
+    exportBusy = busy;
+    syncExportAvailability();
     exportBtn.textContent = busy ? 'Exporting…' : 'Export';
   }
+
+  /**
+   * @param {boolean} present
+   */
+  function setCellsPresent(present) {
+    if (typeof present !== 'boolean') {
+      throw new TypeError('Figure-export cell presence must be one boolean.');
+    }
+    if (cleanupComplete) return;
+    cellsPresent = present;
+    syncExportAvailability();
+  }
+  syncExportAvailability();
 
   function inferVisiblePointCount() {
     const viewerCount = viewer.getPointCount();
@@ -1361,9 +1378,9 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   const PREVIEW_TARGET_POINTS = 15000;
   const PREVIEW_MAX_SCAN_POINTS = 250000;
 
-  /** @type {{ viewId: string; renderState: any; reduced: any; dim: number; cameraState: any; navMode: string; certificate: any; ticket: any; mode: 'full' } | null} */
+  /** @type {{ viewId: string; renderState: any; reduced: any; dim: number; layoutKey: string; cameraState: any; navMode: string; certificate: any; ticket: any; mode: 'full' } | null} */
   let previewSampleFull = null;
-  /** @type {{ viewId: string; renderState: any; reduced: any; dim: number; cameraState: any; navMode: string; certificate: any; ticket: any; mode: 'crop'; crop: any } | null} */
+  /** @type {{ viewId: string; renderState: any; reduced: any; dim: number; layoutKey: string; cameraState: any; navMode: string; certificate: any; ticket: any; mode: 'crop'; crop: any } | null} */
   let previewSampleCrop = null;
   /** @type {'edit'|'applied'} */
   let previewFramingMode = 'edit';
@@ -1419,7 +1436,20 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     });
   }
 
+  // A preview the user cannot see (Figure Export collapsed, or the sidebar
+  // hidden) is not rebuilt on every filter, highlight or camera change; the
+  // last request runs once when the panel is shown again.
+  let previewRebuildGate = null;
+
   function queuePreviewRebuild(delayMs = 0) {
+    if (previewRebuildGate === null) {
+      startPreviewRebuild(delayMs);
+      return;
+    }
+    previewRebuildGate.request(delayMs);
+  }
+
+  function startPreviewRebuild(delayMs) {
     if (
       cleanupComplete ||
       previewDisposed ||
@@ -1524,8 +1554,8 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     lockAspectBtn.disabled = !cropEnabled;
     lockAspectBtn.setAttribute('aria-pressed', cropLockCheckbox.checked ? 'true' : 'false');
 
-    framingActionGrid.style.display = cropEnabled ? 'grid' : 'none';
-    cropAspectHint.style.display = cropEnabled ? '' : 'none';
+    framingActionGrid.hidden = !cropEnabled;
+    cropAspectHint.hidden = !cropEnabled;
 
     const isApplied = previewFramingMode === 'applied';
     cropConfirmBtn.textContent = isApplied ? 'Edit' : 'Confirm';
@@ -1590,7 +1620,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     }
 
     if (!keyboardEditable) {
-      previewCanvas.style.cursor = 'default';
+      delete previewCanvas.dataset.cropCursor;
     }
   }
 
@@ -1867,13 +1897,13 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
       }) => {
         if (
           !(positions instanceof Float32Array) ||
-          positions.length !== pointCount * 3 ||
+          positions.length !== pointCount * dimensionLevel ||
           !(colors instanceof Uint8Array) ||
           colors.length !== pointCount * 4 ||
           (
             transparency !== null &&
             (
-              !(transparency instanceof Float32Array) ||
+              !(transparency instanceof Uint8Array) ||
               transparency.length !== pointCount
             )
           ) ||
@@ -1937,6 +1967,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
           wantsCrop ? getCropOptionForExport() : null;
         const reduced = reducePointsByDensity({
           positions,
+          dimension: dimensionLevel,
           colors,
           transparency,
           lodMembership,
@@ -1954,6 +1985,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
           certificate,
           crop,
           dim: dimensionLevel,
+          layoutKey: state.getViewLayoutKey(viewId),
           mode,
           navMode: cameraState.navigationMode,
           pointDiameterViewportPx:
@@ -2002,14 +2034,14 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
       candidate.reduced.scannedSourceCount <
       candidate.reduced.candidateSourceCount;
     const sampleNote = cappedSample
-      ? ` • ${candidate.reduced.scannedSourceCount.toLocaleString()} of ${candidate.reduced.candidateSourceCount.toLocaleString()} source IDs scanned`
+      ? ` • ${formatCount(candidate.reduced.scannedSourceCount)} of ${formatCount(candidate.reduced.candidateSourceCount)} source IDs scanned`
       : '';
     const label = wantsCrop ? 'Framed preview' : 'Preview sample';
     const sampleCount = candidate.reduced.x.length;
     const emptyNote =
       sampleCount === 0 ? ' • no visible points' : '';
     previewStatus.textContent =
-      `${label}: ${sampleCount.toLocaleString()} points` +
+      `${label}: ${formatCount(sampleCount)} points` +
       `${sampleNote}${emptyNote}`;
     return true;
   }
@@ -2225,6 +2257,16 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     // omitted it would misdescribe the file the button is about to write.
     const previewReferenceGrid = resolveExportReferenceGrid();
     if (previewReferenceGrid !== null && rs?.mvpMatrix && rs?.viewMatrix) {
+      // The raw crop input, not a normalized rect: `assertCropRect01()`
+      // returns a four-key rect that is not itself valid crop input.
+      const previewCrop = cropEnabled && previewFramingMode === 'applied'
+        ? { enabled: true, ...cropRect01 }
+        : null;
+      const previewSurface = resolveReferenceGridSurface({
+        appearance: previewReferenceGrid,
+        background,
+        backgroundColor,
+      });
       ctx.save();
       ctx.beginPath();
       ctx.rect(plotRect.x, plotRect.y, plotRect.width, plotRect.height);
@@ -2235,18 +2277,24 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
           appearance: previewReferenceGrid,
           renderState: rs,
           plotRect,
-          // The raw crop input, not a normalized rect: `assertCropRect01()`
-          // returns a four-key rect that is not itself valid crop input.
-          crop: cropEnabled && previewFramingMode === 'applied'
-            ? { enabled: true, ...cropRect01 }
-            : null,
-          surfaceRgb: resolveReferenceGridSurfaceRgb({
-            appearance: previewReferenceGrid,
-            background,
-            backgroundColor,
-          }),
+          crop: previewCrop,
+          surface: previewSurface,
         }),
       });
+      // A backdrop look is drawn offscreen; the preview shows the last
+      // raster for this exact state and redraws when a new one lands.
+      if (figureDrawsBackdropLook(previewReferenceGrid, previewSurface, rs)) {
+        const raster = peekBackdropLookPreview({
+          renderState: rs,
+          plotRect,
+          crop: previewCrop,
+          width: Math.max(1, Math.round(plotRect.width * s)),
+          height: Math.max(1, Math.round(plotRect.height * s)),
+        }, schedulePreviewDraw);
+        if (raster !== null) {
+          ctx.drawImage(raster, plotRect.x, plotRect.y, plotRect.width, plotRect.height);
+        }
+      }
       ctx.restore();
     }
 
@@ -2426,7 +2474,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     if (emphasizeSelection && typeof state?.getHighlightedCellCount === 'function') {
       const count = state.getHighlightedCellCount();
       if (count > 0) {
-        const label = `n = ${count.toLocaleString()} selected`;
+        const label = `n = ${formatCount(count)} selected`;
         const boxPad = 6;
         const boxH = Math.max(16, Math.round(baseFontSizePx * 1.35));
         const boxW = Math.min(
@@ -2488,7 +2536,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
           })
           : computeApproxBoundsFromSample({
             reduced: sample.reduced,
-            normTransform: state.dimensionManager.getNormTransform(sample.dim),
+            normTransform: state.dimensionManager.getNormTransform(sample.layoutKey),
             cropPx: appliedFraming && !usingCropSample ? cropPxForBounds : null
           })
       );
@@ -2708,13 +2756,14 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     };
   }
 
+  // The pointer over the frame says what a drag will do; CSS draws it from
+  // this state attribute.
   function updateCropCursor(mode) {
     if (!mode) {
-      previewCanvas.style.cursor = 'default';
+      delete previewCanvas.dataset.cropCursor;
       return;
     }
-    if (mode === 'move') previewCanvas.style.cursor = 'move';
-    else previewCanvas.style.cursor = 'nwse-resize';
+    previewCanvas.dataset.cropCursor = mode === 'move' ? 'move' : 'resize';
   }
 
   function resizeCropFromKeyboard(key, step) {
@@ -3193,83 +3242,56 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
 
   }
 
-  function buildSubAccordionItem({ title, desc, open = false, content = [] }) {
-    const safeTitle = String(title || '').trim() || 'Section';
-    const safeDesc = String(desc || '').trim();
-    const item = createElement('div', { className: `analysis-accordion-item${open ? ' open' : ''}` });
-    const contentId = `figure-export-${safeTitle.toLowerCase().replace(/[^a-z0-9]+/g, '-')}-panel`;
-    const toggle = createElement(
-      'button',
-      {
-        type: 'button',
-        className: 'analysis-accordion-header',
-        ariaExpanded: open ? 'true' : 'false',
-        ariaControls: contentId
-      },
-      [
-        createElement('span', { className: 'analysis-accordion-title' }, [safeTitle]),
-        createElement('span', { className: 'analysis-accordion-desc' }, [safeDesc]),
-        createElement('span', { className: 'analysis-accordion-chevron', ariaHidden: 'true' })
-      ]
-    );
-    const panel = createElement('div', { className: 'analysis-accordion-content', id: contentId }, content);
-    listen(toggle, 'click', () => {
-      const next = !item.classList.contains('open');
-      if (next) {
-        const parent = item.parentElement;
-        const siblings = parent ? Array.from(parent.children) : [];
-        for (const sibling of siblings) {
-          if (!(sibling instanceof HTMLElement)) continue;
-          if (sibling === item) continue;
-          if (!sibling.classList.contains('analysis-accordion-item')) continue;
-          if (!sibling.classList.contains('open')) continue;
-          sibling.classList.remove('open');
-          const siblingToggle = sibling.firstElementChild;
-          if (siblingToggle && siblingToggle.classList.contains('analysis-accordion-header')) {
-            siblingToggle.setAttribute('aria-expanded', 'false');
-          }
+  // The four sections are one exclusive disclosure list: opening one closes
+  // the others, so the panel never grows taller than one section.
+  const subAccordion = createElement('div', { className: 'disclosure-list figure-export-accordion' });
+  const sections = [
+    {
+      title: 'Framing',
+      tip: 'export-framing',
+      content: [plotAndFrameRow, previewRow]
+    },
+    {
+      title: 'Labels and annotations',
+      tip: 'export-labels',
+      content: [titleRow, annotationSection, selectionRow]
+    },
+    {
+      title: 'Style',
+      tip: 'export-style',
+      content: [styleSection]
+    },
+    {
+      title: 'Download',
+      tip: 'export-download',
+      content: [advancedSection]
+    }
+  ];
+  const disclosures = sections.map(section => {
+    const disclosure = createDisclosure({
+      title: section.title,
+      tip: section.tip,
+      onToggle: expanded => {
+        if (!expanded || cleanupComplete) return;
+        for (const other of disclosures) {
+          if (other !== disclosure) other.setExpanded(false);
         }
       }
-      item.classList.toggle('open', next);
-      toggle.setAttribute('aria-expanded', next ? 'true' : 'false');
     });
-    item.appendChild(toggle);
-    item.appendChild(panel);
-    return { item, toggle, panel };
-  }
-
-  const subAccordion = createElement('div', { className: 'analysis-accordion figure-export-accordion' });
-  subAccordion.appendChild(buildSubAccordionItem({
-    title: 'Framing',
-    desc: 'Plot size, frame export, preview',
-    open: false,
-    content: [plotAndFrameRow, previewRow]
-  }).item);
-  subAccordion.appendChild(buildSubAccordionItem({
-    title: 'Labels & Annotations',
-    desc: 'Title, axes, legend, selection, 3D orientation',
-    open: false,
-    content: [titleRow, annotationSection, selectionRow]
-  }).item);
-  subAccordion.appendChild(buildSubAccordionItem({
-    title: 'Style',
-    desc: 'Background and typography',
-    open: false,
-    content: [styleSection]
-  }).item);
-  subAccordion.appendChild(buildSubAccordionItem({
-    title: 'Download',
-    desc: 'Format, DPI, explicit SVG strategy',
-    open: false,
-    content: [advancedSection]
-  }).item);
+    for (const node of section.content) disclosure.content.appendChild(node);
+    subAccordion.appendChild(disclosure.root);
+    return disclosure;
+  });
 
   container.appendChild(header);
   container.appendChild(subAccordion);
   container.appendChild(actionsRow);
 
+  previewRebuildGate = createVisibilityGatedRender(previewCanvas, startPreviewRebuild);
+  cleanupFns.push(() => previewRebuildGate.destroy());
+
   syncFormatDependentUi();
   syncCropUi();
 
-  return { destroy };
+  return { setCellsPresent, destroy };
 }

@@ -11,6 +11,10 @@ import {
 import {
   createSessionRestoreCanceledError,
 } from '../assets/js/app/session/session-serializer.js';
+import {
+  STARTUP_STALL_CODE,
+  createStartupPhaseOwner,
+} from '../assets/js/app/startup-phase.js';
 
 const STATE_BYTES = Uint8Array.from([1, 2, 3, 4]);
 const STATE_SHA256 = createHash('sha256').update(STATE_BYTES).digest('hex');
@@ -48,6 +52,7 @@ function createManager({
   identityId = 'suo-generation',
   selectionRevision = 7,
   stateSha256 = STATE_SHA256,
+  stateBytes = STATE_BYTES.byteLength,
   advertised = true,
 } = {}) {
   let descriptor = (
@@ -61,6 +66,7 @@ function createManager({
         manifestUrl,
         selectionRevision,
         sourceType,
+        stateBytes,
         stateSha256,
       }
     : null;
@@ -72,6 +78,27 @@ function createManager({
       descriptor = nextDescriptor;
     },
   };
+}
+
+// Past startup, a request step is the request itself under the restore's
+// own signal.
+const directRequestStep = (_url, operation) =>
+  operation(new AbortController().signal);
+
+/**
+ * The request carries the exact transport options and a signal that follows
+ * the restore owner (the request step may abort it too).
+ */
+function assertRequestInit(init, accept, owner) {
+  const { signal, ...options } = init;
+  assert.deepEqual(options, {
+    headers: { accept },
+    method: 'GET',
+  });
+  assert.ok(signal instanceof AbortSignal);
+  assert.equal(signal.aborted, false);
+  owner.abort();
+  assert.equal(signal.aborted, true);
 }
 
 function createFetchArtifact(responses) {
@@ -129,6 +156,7 @@ test('current local demos resolve one exact bounded state manifest', async () =>
   const target = await loadCurrentDatasetStateTarget({
     dataSourceManager: manager,
     fetchArtifact: transport.fetchArtifact,
+    requestStep: directRequestStep,
     signal: controller.signal,
   });
 
@@ -140,19 +168,17 @@ test('current local demos resolve one exact bounded state manifest', async () =>
       'https://datasets.example/exports/suo/state-snapshots.json',
     selectionRevision: 7,
     sourceType: 'local-demo',
+    stateBytes: STATE_BYTES.byteLength,
     stateSha256: STATE_SHA256,
     stateUrl:
       'https://datasets.example/exports/suo/default.cellucid-session',
   });
-  assert.deepEqual(transport.calls, [{
-    url: 'https://datasets.example/exports/suo/state-snapshots.json',
-    init: {
-      cache: 'no-store',
-      headers: { accept: 'application/json' },
-      method: 'GET',
-      signal: controller.signal,
-    },
-  }]);
+  assert.equal(transport.calls.length, 1);
+  assert.equal(
+    transport.calls[0].url,
+    'https://datasets.example/exports/suo/state-snapshots.json',
+  );
+  assertRequestInit(transport.calls[0].init, 'application/json', controller);
 });
 
 test('unadvertised and non-demo sources never probe for publication state', async () => {
@@ -168,6 +194,7 @@ test('unadvertised and non-demo sources never probe for publication state', asyn
       await loadCurrentDatasetStateTarget({
         dataSourceManager: manager,
         fetchArtifact: transport.fetchArtifact,
+        requestStep: directRequestStep,
         signal: new AbortController().signal,
       }),
       null,
@@ -186,6 +213,7 @@ test('state URLs cannot escape the exact advertised dataset generation', async (
     loadCurrentDatasetStateTarget({
       dataSourceManager: manager,
       fetchArtifact: transport.fetchArtifact,
+      requestStep: directRequestStep,
       signal: new AbortController().signal,
     }),
     /exact dataset.*state-snapshots\.json|manifest URL/i,
@@ -204,6 +232,7 @@ test('a verified local-demo state refreshes UI only after exact restore', async 
   const restored = await restoreCurrentDatasetState({
     dataSourceManager: manager,
     fetchArtifact: transport.fetchArtifact,
+    requestStep: directRequestStep,
     getPublicationRevision: FIXED_PUBLICATION_REVISION,
     refreshUi() {
       calls.push('refresh');
@@ -235,12 +264,11 @@ test('a verified local-demo state refreshes UI only after exact restore', async 
     transport.calls[1].url,
     'https://datasets.example/exports/suo/default.cellucid-session',
   );
-  assert.deepEqual(transport.calls[1].init, {
-    cache: 'no-store',
-    headers: { accept: 'application/octet-stream' },
-    method: 'GET',
-    signal: controller.signal,
-  });
+  assertRequestInit(
+    transport.calls[1].init,
+    'application/octet-stream',
+    controller,
+  );
 });
 
 test('caller abort reaches the session owner before stale state can apply', async () => {
@@ -259,6 +287,7 @@ test('caller abort reaches the session owner before stale state can apply', asyn
   const restorePromise = restoreCurrentDatasetState({
     dataSourceManager: manager,
     fetchArtifact: transport.fetchArtifact,
+    requestStep: directRequestStep,
     getPublicationRevision: FIXED_PUBLICATION_REVISION,
     refreshUi() {
       rollbackRefreshes += 1;
@@ -317,6 +346,7 @@ test('same-id runtime and selection replacements reject before state mutation', 
       restoreCurrentDatasetState({
         dataSourceManager: manager,
         fetchArtifact,
+        requestStep: directRequestStep,
         getPublicationRevision: () => publicationRevision,
         refreshUi() {
           throw new Error('stale state must not refresh');
@@ -345,6 +375,7 @@ test('dataset state manifest and integrity failures remain public failures', asy
     loadCurrentDatasetStateTarget({
       dataSourceManager: createManager(),
       fetchArtifact: httpTransport.fetchArtifact,
+      requestStep: directRequestStep,
       signal: new AbortController().signal,
     }),
     /state-snapshots\.json.*404/i,
@@ -357,6 +388,7 @@ test('dataset state manifest and integrity failures remain public failures', asy
     loadCurrentDatasetStateTarget({
       dataSourceManager: createManager(),
       fetchArtifact: malformedTransport.fetchArtifact,
+      requestStep: directRequestStep,
       signal: new AbortController().signal,
     }),
     /state manifest|states|exact/i,
@@ -369,6 +401,7 @@ test('dataset state manifest and integrity failures remain public failures', asy
     loadCurrentDatasetStateTarget({
       dataSourceManager: createManager(),
       fetchArtifact: oversizedTransport.fetchArtifact,
+      requestStep: directRequestStep,
       signal: new AbortController().signal,
     }),
     /4096 bytes/i,
@@ -376,12 +409,13 @@ test('dataset state manifest and integrity failures remain public failures', asy
 
   const corruptStateTransport = createFetchArtifact([
     manifestResponse(),
-    new Response(Uint8Array.from([9, 9, 9]), { status: 200 }),
+    new Response(Uint8Array.from([9, 9, 9, 9]), { status: 200 }),
   ]);
   await assert.rejects(
     restoreCurrentDatasetState({
       dataSourceManager: createManager(),
       fetchArtifact: corruptStateTransport.fetchArtifact,
+      requestStep: directRequestStep,
       getPublicationRevision: FIXED_PUBLICATION_REVISION,
       refreshUi() {},
       sessionSerializer: {
@@ -394,14 +428,38 @@ test('dataset state manifest and integrity failures remain public failures', asy
     /SHA-256/i,
   );
 
+  // The catalog declares the state's exact length: a shorter state is
+  // refused by length, a longer one is cut off past the declared length.
+  const shortStateTransport = createFetchArtifact([
+    manifestResponse(),
+    new Response(Uint8Array.from([1, 2, 3]), { status: 200 }),
+  ]);
+  await assert.rejects(
+    restoreCurrentDatasetState({
+      dataSourceManager: createManager(),
+      fetchArtifact: shortStateTransport.fetchArtifact,
+      requestStep: directRequestStep,
+      getPublicationRevision: FIXED_PUBLICATION_REVISION,
+      refreshUi() {},
+      sessionSerializer: {
+        async restorePublishedDefaultState() {
+          throw new Error('length must reject before session restore');
+        },
+      },
+      signal: new AbortController().signal,
+    }),
+    /3 bytes; the catalog declares 4/,
+  );
+
   const oversizedStateTransport = createFetchArtifact([
     manifestResponse(),
-    new Response(new Uint8Array(32769), { status: 200 }),
+    new Response(new Uint8Array(5), { status: 200 }),
   ]);
   await assert.rejects(
     restoreCurrentDatasetState({
       dataSourceManager: createManager(),
       fetchArtifact: oversizedStateTransport.fetchArtifact,
+      requestStep: directRequestStep,
       getPublicationRevision: FIXED_PUBLICATION_REVISION,
       refreshUi() {},
       sessionSerializer: {
@@ -411,6 +469,80 @@ test('dataset state manifest and integrity failures remain public failures', asy
       },
       signal: new AbortController().signal,
     }),
-    /32768 bytes/i,
+    /4 bytes/i,
   );
+});
+
+function stalledFetch(signals) {
+  return (url, init) => {
+    signals.push(init.signal);
+    return new Promise((_resolve, reject) => {
+      init.signal.addEventListener(
+        'abort',
+        () => reject(init.signal.reason),
+        { once: true },
+      );
+    });
+  };
+}
+
+function stallingBodyResponse() {
+  return new Response(new ReadableStream({ pull() {} }), { status: 200 });
+}
+
+test('a stalled startup sidecar request ends at the startup deadline naming phase and URL', async () => {
+  for (const [stalledUrl, fetchFor] of [
+    [
+      'https://datasets.example/exports/suo/state-snapshots.json',
+      signals => stalledFetch(signals),
+    ],
+    [
+      'https://datasets.example/exports/suo/default.cellucid-session',
+      signals => {
+        let calls = 0;
+        return (url, init) => {
+          calls++;
+          if (calls === 1) return Promise.resolve(manifestResponse());
+          // The state response arrives, but its body never ends.
+          signals.push(init.signal);
+          return Promise.resolve(stallingBodyResponse());
+        };
+      },
+    ],
+  ]) {
+    const root = { dataset: {} };
+    const startup = createStartupPhaseOwner({ root, deadlineMs: 20 });
+    const signals = [];
+    await assert.rejects(
+      restoreCurrentDatasetState({
+        dataSourceManager: createManager(),
+        fetchArtifact: fetchFor(signals),
+        getPublicationRevision: FIXED_PUBLICATION_REVISION,
+        refreshUi() {
+          throw new Error('a stalled restore must not refresh');
+        },
+        requestStep: (url, operation) =>
+          startup.step('session', url, operation),
+        sessionSerializer: {
+          async restorePublishedDefaultState() {
+            throw new Error('a stalled restore must not apply');
+          },
+        },
+        signal: new AbortController().signal,
+      }),
+      error => {
+        assert.equal(error.code, STARTUP_STALL_CODE);
+        assert.equal(error.phase, 'session');
+        assert.equal(error.target, stalledUrl);
+        assert.match(
+          error.message,
+          /reading the published default session: .* did not answer within 0\.02 s/,
+        );
+        return true;
+      },
+    );
+    assert.equal(root.dataset.startupPhase, 'session');
+    assert.ok(signals.length > 0);
+    assert.equal(signals.at(-1).aborted, true, 'the stalled request is aborted');
+  }
 });

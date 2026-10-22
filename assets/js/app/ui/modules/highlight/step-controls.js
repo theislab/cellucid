@@ -7,10 +7,23 @@
  * when they are removed identical across the tools instead of drifting apart in
  * four copies of the same markup.
  *
+ * The selection bar over the plot (`#select-bar` in index.html) shows the same
+ * controls a second time, for a screen where the panel is out of sight. It is a
+ * mirror, not a copy: it is drawn here, from the same state, every time the
+ * panel's block is, and its buttons press the panel's (see mode-ui.js), so each
+ * action still has exactly one handler.
+ *
  * @module ui/modules/highlight/step-controls
  */
 
-import { requireDomElement, requireMethods } from './exact-contract.js';
+import {
+  requireDomElement,
+  requireExactKeys,
+  requireMethods,
+  requireSafeInteger
+} from './exact-contract.js';
+import { selectBarNotice } from './mode-copy.js';
+import { formatCount } from '../../components/display-format.js';
 
 /** Every tool that owns a step-control block, in toolbelt order. */
 export const STEP_CONTROL_TOOLS = Object.freeze([
@@ -20,7 +33,7 @@ export const STEP_CONTROL_TOOLS = Object.freeze([
   'lasso'
 ]);
 
-export function stepControlsId(tool) {
+function stepControlsId(tool) {
   if (!STEP_CONTROL_TOOLS.includes(tool)) {
     throw new TypeError(`Unknown selection step-control tool: ${tool}.`);
   }
@@ -47,6 +60,61 @@ function restoreFocusToActiveMode(parent) {
 }
 
 /**
+ * The selection bar's mirror of the step controls, or null on a page that has
+ * no selection bar. The panel is the canonical surface, so its absence never
+ * stops a tool.
+ *
+ * @param {Document} documentOwner
+ */
+function selectBarMirror(documentOwner) {
+  const steps = documentOwner.getElementById('select-bar-steps');
+  if (steps === null) return null;
+  const mirror = {
+    steps,
+    selection: documentOwner.getElementById('select-bar-selection'),
+    undo: documentOwner.getElementById('select-bar-undo'),
+    confirm: documentOwner.getElementById('select-bar-confirm'),
+    notice: documentOwner.getElementById('select-bar-notice')
+  };
+  for (const [name, element] of Object.entries(mirror)) {
+    requireDomElement(element, `Selection bar ${name}`);
+  }
+  return mirror;
+}
+
+/**
+ * Show one gesture's outcome on the selection bar: the short form of the
+ * panel's notice, or nothing.
+ */
+function publishSelectBarNotice(mirror, notice) {
+  const text = selectBarNotice(notice);
+  mirror.notice.textContent = text;
+  mirror.notice.hidden = text === '';
+}
+
+/**
+ * Say on the selection bar what a tap or drag will do now. The owner of the
+ * panel's idle copy calls this beside it: mode-ui.js when the tool changes,
+ * and the annotation tool when its precondition (a coloured field) changes.
+ *
+ * @param {Document} documentOwner
+ * @param {string} hint
+ */
+export function publishSelectBarHint(documentOwner, hint) {
+  if (typeof hint !== 'string' || hint.length === 0) {
+    throw new TypeError('Selection bar hint must be a nonempty string.');
+  }
+  const element = documentOwner.getElementById('select-bar-hint');
+  if (element === null) return;
+  requireDomElement(element, 'Selection bar hint');
+  element.textContent = hint;
+}
+
+function cellCountText(count) {
+  return `${formatCount(count)} ${count === 1 ? 'cell' : 'cells'} selected`;
+}
+
+/**
  * Remove a tool's step controls, keeping keyboard focus somewhere usable.
  *
  * Focus is only moved when the controls actually held it; a mouse user who
@@ -55,8 +123,17 @@ function restoreFocusToActiveMode(parent) {
  * @param {Document} documentOwner
  * @param {string} tool
  * @param {HTMLElement} parent Element the step controls were appended to.
+ * @param {string} notice "" or the SELECTION_NOTICE the panel shows with them
  */
-export function removeStepControls(documentOwner, tool, parent) {
+export function removeStepControls(documentOwner, tool, parent, notice) {
+  const mirror = selectBarMirror(documentOwner);
+  if (mirror !== null) {
+    publishSelectBarNotice(mirror, notice);
+    if (mirror.steps.dataset.tool === tool) {
+      mirror.steps.hidden = true;
+      mirror.steps.dataset.tool = '';
+    }
+  }
   const controls = documentOwner.getElementById(stepControlsId(tool));
   if (controls === null) return false;
   const focused = documentOwner.activeElement;
@@ -71,7 +148,8 @@ export function removeStepControls(documentOwner, tool, parent) {
 }
 
 /**
- * Build (or look up) one tool's step controls.
+ * Build (or update) one tool's step controls, and their mirror on the
+ * selection bar.
  *
  * @param {object} options
  * @param {Document} options.documentOwner
@@ -79,10 +157,11 @@ export function removeStepControls(documentOwner, tool, parent) {
  * @param {HTMLElement} options.parent
  * @param {(target: any, event: string, listener: () => void) => void} options.listen
  * @param {{undo: () => void, redo: () => void, confirm: () => void, cancel: () => void}} options.handlers
- * @returns {{undoButton: any, redoButton: any, confirmButton: any}}
+ * @param {{candidateCount: number, canUndo: boolean, canRedo: boolean, notice: string}} options.readout
+ *   what the selection holds now; Confirm is offered only for a nonempty one
  */
-export function getStepControls(options) {
-  const { documentOwner, tool, parent, listen, handlers } = options;
+export function showStepControls(options) {
+  const { documentOwner, tool, parent, listen, handlers, readout } = options;
   const controlsId = stepControlsId(tool);
   requireMethods(
     documentOwner,
@@ -100,6 +179,17 @@ export function getStepControls(options) {
       );
     }
   }
+  requireExactKeys(
+    readout,
+    ['candidateCount', 'canUndo', 'canRedo', 'notice'],
+    'Selection step readout'
+  );
+  requireSafeInteger(readout.candidateCount, 'Selection step candidate count', 0);
+  for (const name of ['canUndo', 'canRedo']) {
+    if (typeof readout[name] !== 'boolean') {
+      throw new TypeError(`Selection step ${name} must be a boolean.`);
+    }
+  }
 
   let controls = documentOwner.getElementById(controlsId);
   const created = controls === null;
@@ -112,10 +202,10 @@ export function getStepControls(options) {
     // arrow character. Cancel advertises Escape because that is now a real
     // binding and nothing else in the panel would reveal it.
     controls.innerHTML = `
-        <button type="button" class="btn-small lasso-confirm" id="${tool}-confirm-btn" title="Save this selection to the active highlight page">Confirm</button>
-        <button type="button" class="btn-small btn-undo" id="${tool}-undo-btn" aria-label="Undo last selection step" title="Undo last selection step">↩</button>
-        <button type="button" class="btn-small btn-redo" id="${tool}-redo-btn" aria-label="Redo last selection step" title="Redo last selection step">↪</button>
-        <button type="button" class="btn-small lasso-cancel" id="${tool}-cancel-btn" aria-keyshortcuts="Escape" title="Discard this selection (Esc)">Cancel</button>
+        <button type="button" class="btn btn-compact btn-primary lasso-confirm" id="${tool}-confirm-btn" title="Save this selection to the active highlight page">Confirm</button>
+        <button type="button" class="btn btn-compact btn-undo" id="${tool}-undo-btn" aria-label="Undo last selection step" title="Undo last selection step">↩</button>
+        <button type="button" class="btn btn-compact btn-redo" id="${tool}-redo-btn" aria-label="Redo last selection step" title="Redo last selection step">↪</button>
+        <button type="button" class="btn btn-compact lasso-cancel" id="${tool}-cancel-btn" aria-keyshortcuts="Escape" title="Discard this selection (Esc)">Cancel</button>
       `;
     parent.appendChild(controls);
   }
@@ -145,5 +235,19 @@ export function getStepControls(options) {
     listen(confirmButton, 'click', handlers.confirm);
     listen(cancelButton, 'click', handlers.cancel);
   }
-  return { undoButton, redoButton, confirmButton };
+  undoButton.disabled = !readout.canUndo;
+  redoButton.disabled = !readout.canRedo;
+  confirmButton.disabled = readout.candidateCount === 0;
+
+  const mirror = selectBarMirror(documentOwner);
+  if (mirror !== null) {
+    mirror.steps.dataset.tool = tool;
+    mirror.steps.hidden = false;
+    mirror.selection.textContent = readout.candidateCount === 0
+      ? 'No cells selected'
+      : cellCountText(readout.candidateCount);
+    mirror.undo.disabled = undoButton.disabled;
+    mirror.confirm.disabled = confirmButton.disabled;
+    publishSelectBarNotice(mirror, readout.notice);
+  }
 }

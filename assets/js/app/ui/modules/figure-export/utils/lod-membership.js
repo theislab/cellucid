@@ -183,3 +183,34 @@ export function matchesLodMembershipPresentation(
     presented.pointCount === membership.pointCount
   );
 }
+
+/**
+ * Assert one view's full-detail draw order: null (the view draws in source
+ * order) or a Uint32Array holding every source index once, in the order the
+ * renderer stores and draws the view's points (`getViewDrawOrder`).
+ *
+ * @param {unknown} drawOrder
+ * @param {{ pointCount: number, label?: string }} options
+ * @returns {Uint32Array|null}
+ */
+export function assertDrawOrder(drawOrder, { pointCount, label = 'Figure export draw order' }) {
+  if (drawOrder === null) return null;
+  if (!(drawOrder instanceof Uint32Array) || drawOrder.length !== pointCount) {
+    throw new TypeError(`${label} must be null or a Uint32Array of ${pointCount} source indices.`);
+  }
+  return drawOrder;
+}
+
+/**
+ * The source indices a figure draws, in the order the pane draws them: the
+ * admitted prefix of a reduced LOD level, else the full draw order, else
+ * null for every point in source order. Order matters wherever translucent
+ * points overlap, so every point pass and vector writer iterates this.
+ *
+ * @param {LodMembership|null} lodMembership
+ * @param {Uint32Array|null} drawOrder
+ * @returns {Uint32Array|null}
+ */
+export function drawnSequence(lodMembership, drawOrder) {
+  return lodMembership?.indices ?? drawOrder ?? null;
+}

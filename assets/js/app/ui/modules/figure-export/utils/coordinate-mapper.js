@@ -8,6 +8,7 @@
  * @module ui/modules/figure-export/utils/coordinate-mapper
  */
 
+import { requirePositionArray } from '../../../../../rendering/position-layout.js';
 import { assertCropRect01, cropRect01ToPx } from './crop.js';
 import {
   assertLodMembership,
@@ -64,8 +65,9 @@ export function denormalizeXY(x, y, transform) {
  * corners, but matches what is actually drawn (after filtering + clipping).
  *
  * @param {object} options
- * @param {Float32Array|null} options.positions - normalized positions (n*3)
- * @param {Float32Array|null} [options.transparency] - per-point alpha (0..1)
+ * @param {Float32Array|null} options.positions - normalized positions (n*dimension)
+ * @param {1|2|3} options.dimension - components per position
+ * @param {Uint8Array|null} [options.transparency] - per-point visibility (0 or 1)
  * @param {import('./lod-membership.js').LodMembership|null} [options.lodMembership]
  * @param {Float32Array} options.mvpMatrix
  * @param {number} [options.viewportWidth]
@@ -76,6 +78,7 @@ export function denormalizeXY(x, y, transform) {
  */
 export function computeVisibleRealBounds({
   positions,
+  dimension,
   transparency = null,
   lodMembership = null,
   mvpMatrix,
@@ -86,7 +89,12 @@ export function computeVisibleRealBounds({
 }) {
   if (!positions || !mvpMatrix) return null;
 
-  const n = Math.floor(positions.length / 3);
+  const n = requirePositionArray(
+    positions,
+    dimension,
+    'Figure-export positions',
+    { allowEmpty: true }
+  );
   assertLodMembership(lodMembership, { pointCount: n });
   const admittedIndices = lodMembership?.indices ?? null;
   const candidateCount = admittedIndices?.length ?? n;
@@ -120,10 +128,10 @@ export function computeVisibleRealBounds({
     else if (alpha > 1) alpha = 1;
     if (alpha < POINT_VISIBILITY_THRESHOLD) continue;
 
-    const ix = i * 3;
+    const ix = i * dimension;
     const x = positions[ix];
-    const y = positions[ix + 1];
-    const z = positions[ix + 2];
+    const y = dimension > 1 ? positions[ix + 1] : 0;
+    const z = dimension > 2 ? positions[ix + 2] : 0;
 
     const clipX = m[0] * x + m[4] * y + m[8] * z + m[12];
     const clipY = m[1] * x + m[5] * y + m[9] * z + m[13];
@@ -172,8 +180,9 @@ export function computeVisibleRealBounds({
  * (before perspective projection).
  *
  * @param {object} options
- * @param {Float32Array|null} options.positions - normalized positions (n*3)
- * @param {Float32Array|null} [options.transparency] - per-point alpha (0..1)
+ * @param {Float32Array|null} options.positions - normalized positions (n*dimension)
+ * @param {1|2|3} options.dimension - components per position
+ * @param {Uint8Array|null} [options.transparency] - per-point visibility (0 or 1)
  * @param {import('./lod-membership.js').LodMembership|null} [options.lodMembership]
  * @param {Float32Array} options.mvpMatrix
  * @param {Float32Array} options.viewMatrix
@@ -184,6 +193,7 @@ export function computeVisibleRealBounds({
  */
 export function computeVisibleCameraBounds({
   positions,
+  dimension,
   transparency = null,
   lodMembership = null,
   mvpMatrix,
@@ -194,7 +204,12 @@ export function computeVisibleCameraBounds({
 }) {
   if (!positions || !mvpMatrix || !viewMatrix) return null;
 
-  const n = Math.floor(positions.length / 3);
+  const n = requirePositionArray(
+    positions,
+    dimension,
+    'Figure-export positions',
+    { allowEmpty: true }
+  );
   assertLodMembership(lodMembership, { pointCount: n });
   const admittedIndices = lodMembership?.indices ?? null;
   const candidateCount = admittedIndices?.length ?? n;
@@ -229,10 +244,10 @@ export function computeVisibleCameraBounds({
     else if (alpha > 1) alpha = 1;
     if (alpha < POINT_VISIBILITY_THRESHOLD) continue;
 
-    const ix = i * 3;
+    const ix = i * dimension;
     const x = positions[ix];
-    const y = positions[ix + 1];
-    const z = positions[ix + 2];
+    const y = dimension > 1 ? positions[ix + 1] : 0;
+    const z = dimension > 2 ? positions[ix + 2] : 0;
 
     const clipX = m[0] * x + m[4] * y + m[8] * z + m[12];
     const clipY = m[1] * x + m[5] * y + m[9] * z + m[13];

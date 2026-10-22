@@ -19,7 +19,7 @@ function observeBrowserErrors(page) {
 }
 
 test(
-  'analysis exact-key records survive codecs, worker execution, and cache lifecycles',
+  'analysis exact-key records survive codecs and cache lifecycles',
   async ({ page }) => {
     const browserErrors = observeBrowserErrors(page);
     await page.goto('/tests/browser/fixtures/webgl-harness.html');
@@ -170,20 +170,15 @@ test(
 
       const [
         { encodeTable, decodeTable },
-        { executeOperation },
-        { createWorkerPool },
         { DataLayer },
         { getMemoryMonitor },
       ] = await Promise.all([
         import('/assets/js/app/session/codecs/table-codec.js'),
-        import('/assets/js/app/analysis/compute/operation-handlers.js'),
-        import('/assets/js/app/analysis/compute/worker-pool.js'),
         import('/assets/js/app/analysis/data/data-layer.js'),
         import('/assets/js/app/analysis/shared/memory-monitor.js'),
       ]);
 
       const layers = new Set();
-      let pool = null;
       try {
         const codecCases = [
           {
@@ -224,128 +219,6 @@ test(
             );
           }
         }
-
-        const variables = exactNames.map((key, index) => ({
-          key,
-          rawValues: Float32Array.of(index + 0.5, index + 1.5),
-        }));
-        const conditions = exactNames.map(field => ({
-          field,
-          operator: 'is_not_null',
-          value: null,
-          logic: 'AND',
-        }));
-        const ownFields = Object.fromEntries(
-          exactNames.map(name => [name, Float32Array.of(1)]),
-        );
-        const extractionPayload = {
-          cellIndices: [0, 1],
-          variables,
-        };
-        const ownFilterPayload = {
-          cellIndices: [0],
-          conditions,
-          fieldsData: ownFields,
-        };
-        const missingFilterPayload = {
-          cellIndices: [0],
-          conditions,
-          fieldsData: {},
-        };
-        const missingNegatedFilterPayload = {
-          cellIndices: [0],
-          conditions: conditions.map(condition => ({
-            ...condition,
-            negate: true,
-          })),
-          fieldsData: {},
-        };
-
-        const directBatch = executeOperation(
-          'BATCH_EXTRACT',
-          extractionPayload,
-        );
-        assertOwnRecord(directBatch, exactNames, 'direct BATCH_EXTRACT');
-        for (let index = 0; index < exactNames.length; index++) {
-          assertArray(
-            directBatch[exactNames[index]].values,
-            [index + 0.5, index + 1.5],
-            `direct BATCH_EXTRACT.${exactNames[index]}`,
-          );
-        }
-        assertArray(
-          executeOperation('FILTER_CELLS', ownFilterPayload).filtered,
-          [0],
-          'direct FILTER_CELLS own fields',
-        );
-        assertArray(
-          executeOperation('FILTER_CELLS', missingFilterPayload).filtered,
-          [],
-          'direct FILTER_CELLS inherited fields',
-        );
-        assertArray(
-          executeOperation(
-            'FILTER_CELLS',
-            missingNegatedFilterPayload,
-          ).filtered,
-          [],
-          'direct FILTER_CELLS negated inherited fields',
-        );
-
-        pool = createWorkerPool({
-          poolSize: 1,
-          defaultTimeout: 10_000,
-        });
-        await pool.init();
-        const workerBatch = await pool.execute(
-          'BATCH_EXTRACT',
-          extractionPayload,
-          { transfer: false },
-        );
-        assertOwnRecord(workerBatch, exactNames, 'worker BATCH_EXTRACT');
-        for (let index = 0; index < exactNames.length; index++) {
-          assertArray(
-            workerBatch[exactNames[index]].values,
-            [index + 0.5, index + 1.5],
-            `worker BATCH_EXTRACT.${exactNames[index]}`,
-          );
-        }
-        assertArray(
-          (
-            await pool.execute(
-              'FILTER_CELLS',
-              ownFilterPayload,
-              { transfer: false },
-            )
-          ).filtered,
-          [0],
-          'worker FILTER_CELLS own fields',
-        );
-        assertArray(
-          (
-            await pool.execute(
-              'FILTER_CELLS',
-              missingFilterPayload,
-              { transfer: false },
-            )
-          ).filtered,
-          [],
-          'worker FILTER_CELLS inherited fields',
-        );
-        assertArray(
-          (
-            await pool.execute(
-              'FILTER_CELLS',
-              missingNegatedFilterPayload,
-              { transfer: false },
-            )
-          ).filtered,
-          [],
-          'worker FILTER_CELLS negated inherited fields',
-        );
-        const workerStats = pool.getStats();
-        pool.terminate();
-        pool = null;
 
         const monitor = getMemoryMonitor();
         const baselineCleanupHandlers = monitor.getCleanupHandlerCount();
@@ -486,10 +359,8 @@ test(
           cacheArtifacts: artifacts.length,
           codecCases: codecCases.length,
           exactNames: exactNames.length,
-          workerState: workerStats.state,
         };
       } finally {
-        if (pool !== null) pool.terminate();
         for (const layer of [...layers]) {
           await layer.destroy();
         }
@@ -501,7 +372,6 @@ test(
       cacheArtifacts: proof.exactNames ** 2,
       codecCases: 3,
       exactNames: proof.exactNames,
-      workerState: 'ready',
     });
     expect(proof.exactNames).toBeGreaterThan(0);
     expect(browserErrors).toEqual([]);

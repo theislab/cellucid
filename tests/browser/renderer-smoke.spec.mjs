@@ -1,6 +1,10 @@
 import { expect, test } from './helpers/test.mjs';
 import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
+import { openCollapsedPanels } from './helpers/panels.mjs';
+import {
+  PROJECTILE_MIN_CHARGE_SECONDS,
+} from '../../assets/js/rendering/projectiles.js';
 
 const CURRENT_UI_DATASET =
   '/tests/browser/fixtures/exports/current-ui-prepared/';
@@ -75,6 +79,7 @@ test('volumetric smoke completes its exact GPU density and noise path', async ({
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
+  await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
   await page.locator('#smoke-grid').evaluate(input => {
     input.value = '0';
@@ -169,6 +174,7 @@ test('render-mode switch cancels one pending noise transaction and restarts clea
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
+  await openCollapsedPanels(page);
   await page.locator('#smoke-grid').evaluate(input => {
     input.value = '0';
     input.dispatchEvent(new Event('input', { bubbles: true }));
@@ -259,7 +265,6 @@ test('smoke noise resolution remains isolated between renderer instances', async
     try {
       first.renderer.setNoiseTextureResolution(32);
       const secondDefault = {
-        adaptiveScale: second.renderer.getAdaptiveScaleFactor(),
         noiseResolution: second.renderer.getNoiseTextureResolution(),
         noiseScale: second.renderer.noiseScale,
       };
@@ -340,14 +345,13 @@ test('smoke noise resolution remains isolated between renderer instances', async
       },
     },
     secondDefault: {
-      adaptiveScale: 0.75,
       noiseResolution: 128,
       noiseScale: 0.75,
     },
   });
 });
 
-test('smoke shader consumes the exact CPU light-sample ceiling', async ({
+test('a still smoke frame is reproducible and every live control reaches the shader', async ({
   page,
 }) => {
   await page.goto(WEBGL_HARNESS);
@@ -355,11 +359,9 @@ test('smoke shader consumes the exact CPU light-sample ceiling', async ({
     const [
       { createProgram },
       { SmokeRenderer },
-      { MAX_SMOKE_LIGHT_SAMPLES },
     ] = await Promise.all([
       import('/assets/js/rendering/gl-utils.js'),
       import('/assets/js/rendering/smoke-cloud/smoke-renderer.js'),
-      import('/assets/js/rendering/shaders/smoke-shaders.js'),
     ]);
     const canvas = document.createElement('canvas');
     canvas.width = 64;
@@ -370,7 +372,7 @@ test('smoke shader consumes the exact CPU light-sample ceiling', async ({
       preserveDrawingBuffer: true,
     });
     if (!(gl instanceof WebGL2RenderingContext)) {
-      throw new Error('Smoke light-sample proof requires WebGL2');
+      throw new Error('Smoke still-frame proof requires WebGL2');
     }
     const renderer = new SmokeRenderer(gl, createProgram);
     let disposed = false;
@@ -423,10 +425,11 @@ test('smoke shader consumes the exact CPU light-sample ceiling', async ({
       return texture;
     };
     try {
+      // Uniform density 96/255 in white: the GPU build's RGBA8 layout.
       const densityTexture = createTexture3D(
-        gl.R8,
-        gl.RED,
-        1,
+        gl.RGBA8,
+        gl.RGBA,
+        4,
         96,
       );
       const shapeTexture = createTexture3D(
@@ -469,7 +472,7 @@ test('smoke shader consumes the exact CPU light-sample ceiling', async ({
       );
 
       renderer.textureInfo = {
-        gridSize: 128,
+        gridSize: 8,
         is3D: true,
         texture: densityTexture,
       };
@@ -481,14 +484,14 @@ test('smoke shader consumes the exact CPU light-sample ceiling', async ({
       renderer.setResolutionScale(1);
       renderer.setParams({
         animationSpeed: 0,
-        density: 0.02,
+        density: 0.5,
         detailLevel: 0,
         directLightIntensity: 2,
         edgeSoftness: 0,
         lightAbsorption: 2,
         noiseScale: 1,
         scatterStrength: 1,
-        stepMultiplier: 4,
+        stepMultiplier: 1,
         warpStrength: 0,
       });
 
@@ -504,28 +507,15 @@ test('smoke shader consumes the exact CPU light-sample ceiling', async ({
         lightDir: new Float32Array([1, 0, 0]),
         width: 64,
       };
-      const frames = new Map();
-      for (const lightSamples of [
-        7,
-        8,
-        MAX_SMOKE_LIGHT_SAMPLES,
-      ]) {
-        renderer.setParams({ lightSamples });
+      const draw = params => {
+        if (params) renderer.setParams(params);
         gl.clearColor(0, 0, 0, 0);
         gl.clear(gl.COLOR_BUFFER_BIT);
         renderer.render(renderArgs);
         const pixels = new Uint8Array(64 * 64 * 4);
-        gl.readPixels(
-          0,
-          0,
-          64,
-          64,
-          gl.RGBA,
-          gl.UNSIGNED_BYTE,
-          pixels,
-        );
-        frames.set(lightSamples, pixels);
-      }
+        gl.readPixels(0, 0, 64, 64, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+        return pixels;
+      };
       const differingBytes = (left, right) => {
         let count = 0;
         for (let index = 0; index < left.length; index++) {
@@ -533,15 +523,33 @@ test('smoke shader consumes the exact CPU light-sample ceiling', async ({
         }
         return count;
       };
+      const still = draw();
+      // No temporal jitter and no animation: the same frame, byte for byte.
+      // This is what lets the viewer stop drawing a still smoke view.
+      const stillAgain = draw();
+      const moreSamples = draw({ stepMultiplier: 2 });
+      const unshadowed = draw({ stepMultiplier: 1, lightAbsorption: 0 });
+      const noKeyLight = draw({ lightAbsorption: 2, directLightIntensity: 0 });
+      // Procedural time advances only while the smoke animates.
+      const timeBeforeAnimation = renderer.animationTime;
+      renderer.setParams({ directLightIntensity: 2, animationSpeed: 2 });
+      for (let frame = 0; frame < 2; frame++) {
+        await new Promise(resolve => setTimeout(resolve, 40));
+        draw();
+      }
       const result = {
         error: gl.getError(),
-        maximum: MAX_SMOKE_LIGHT_SAMPLES,
-        sevenToEight: differingBytes(frames.get(7), frames.get(8)),
-        eightToMaximum: differingBytes(
-          frames.get(8),
-          frames.get(MAX_SMOKE_LIGHT_SAMPLES),
-        ),
+        painted: still.some((value, index) => index % 4 === 3 && value > 0),
+        repeatDifference: differingBytes(still, stillAgain),
+        stepDifference: differingBytes(still, moreSamples),
+        shadowDifference: differingBytes(still, unshadowed),
+        keyLightDifference: differingBytes(still, noKeyLight),
+        stillTimeAdvanced: timeBeforeAnimation !== 0,
+        animatedTimeAdvanced: renderer.animationTime > timeBeforeAnimation,
+        continuousWhileAnimated: renderer.needsContinuousFrames(),
       };
+      renderer.setParams({ animationSpeed: 0 });
+      result.continuousWhenStill = renderer.needsContinuousFrames();
       disposed = renderer.dispose();
       return {
         ...result,
@@ -552,9 +560,15 @@ test('smoke shader consumes the exact CPU light-sample ceiling', async ({
     }
   });
 
-  expect(proof.maximum).toBe(12);
-  expect(proof.sevenToEight).toBeGreaterThan(0);
-  expect(proof.eightToMaximum).toBeGreaterThan(0);
+  expect(proof.painted).toBe(true);
+  expect(proof.repeatDifference).toBe(0);
+  expect(proof.stepDifference).toBeGreaterThan(0);
+  expect(proof.shadowDifference).toBeGreaterThan(0);
+  expect(proof.keyLightDifference).toBeGreaterThan(0);
+  expect(proof.stillTimeAdvanced).toBe(false);
+  expect(proof.animatedTimeAdvanced).toBe(true);
+  expect(proof.continuousWhileAnimated).toBe(true);
+  expect(proof.continuousWhenStill).toBe(false);
   expect(proof.error).toBe(0);
   expect(proof.disposed).toBe(true);
 });
@@ -734,8 +748,11 @@ test('half-resolution smoke overwrites its private target without corrupting per
 
     const renderer = Object.create(SmokeRenderer.prototype);
     Object.assign(renderer, {
+      _derivedVolumesDirection: [0, 0, 1],
+      _derivedVolumesSource: densityTexture,
+      _lastRenderTime: null,
       animationSpeed: 0,
-      color: new Float32Array([1, 1, 1]),
+      animationTime: 0,
       colorTex: null,
       compositeAttribLocations: { position: compositePosition },
       compositeProgram,
@@ -746,14 +763,17 @@ test('half-resolution smoke overwrites its private target without corrupting per
       },
       compositeVertexArray,
       density: 1,
+      // The fixture shader samples nothing; any texture satisfies the binding.
+      derivedVolumes: {
+        lightTexture: densityTexture,
+        occupancyTexture: densityTexture,
+      },
       detailLevel: 1,
       directLight: 0,
       edgeSoftness: 0,
-      frameIndex: 0,
       framebuffer: null,
       gl,
       lightAbsorption: 1,
-      lightSamples: 1,
       noiseGenerationError: null,
       noiseGenerationInProgress: false,
       noiseScale: 1,
@@ -768,10 +788,7 @@ test('half-resolution smoke overwrites its private target without corrupting per
       smokeAttribLocations: { position: smokePosition },
       smokeProgram,
       smokeUniformLocations: Object.fromEntries([
-        'animationSpeed',
-        'bgColor',
         'blueNoise',
-        'blueNoiseOffset',
         'cameraPos',
         'densityMultiplier',
         'densityTex3D',
@@ -783,11 +800,11 @@ test('half-resolution smoke overwrites its private target without corrupting per
         'invViewProj',
         'lightAbsorption',
         'lightDir',
-        'lightSamples',
+        'lightTex3D',
         'noiseScale',
+        'occupancyTex3D',
         'scatterStrength',
         'shapeNoise',
-        'smokeColor',
         'stepMultiplier',
         'time',
         'volumeMax',
@@ -795,7 +812,6 @@ test('half-resolution smoke overwrites its private target without corrupting per
         'warpStrength',
       ].map(name => [name, null])),
       smokeVertexArray,
-      startTime: performance.now(),
       stepMultiplier: 1,
       targetHeight: 0,
       targetWidth: 0,
@@ -839,7 +855,8 @@ test('half-resolution smoke overwrites its private target without corrupting per
     const firstPixel = readOwnedPixel();
     renderer.render(renderArgs);
     const secondPixel = readOwnedPixel();
-    const frameIndexBeforeFailure = renderer.frameIndex;
+    renderer.animationSpeed = 1;
+    const animationTimeBeforeFailure = renderer.animationTime;
     const prototype = WebGL2RenderingContext.prototype;
     const originalDrawArrays = prototype.drawArrays;
     let rejectNextDraw = true;
@@ -866,7 +883,7 @@ test('half-resolution smoke overwrites its private target without corrupting per
       clearColor: Array.from(gl.getParameter(gl.COLOR_CLEAR_VALUE)),
       depth: gl.isEnabled(gl.DEPTH_TEST),
       error: gl.getError(),
-      frameIndex: renderer.frameIndex,
+      animationTime: renderer.animationTime,
       framebufferIsDefault:
         gl.getParameter(gl.FRAMEBUFFER_BINDING) === null,
       viewport: Array.from(gl.getParameter(gl.VIEWPORT)),
@@ -898,7 +915,7 @@ test('half-resolution smoke overwrites its private target without corrupting per
       failure,
       failureState,
       firstPixel,
-      frameIndexBeforeFailure,
+      animationTimeBeforeFailure,
       retryPixel,
       secondPixel,
       state: {
@@ -927,7 +944,8 @@ test('half-resolution smoke overwrites its private target without corrupting per
     clearColor: proof.clearColorBefore,
     depth: true,
     error: 0,
-    frameIndex: proof.frameIndexBeforeFailure,
+    // A failed frame publishes no procedural time.
+    animationTime: proof.animationTimeBeforeFailure,
     framebufferIsDefault: true,
     viewport: [0, 0, 4, 4],
   });
@@ -1309,330 +1327,6 @@ test('terminal smoke noise cancellation is synchronous, retry-owned, and context
   });
 });
 
-test('GPU noise generation restores hostile caller state and rolls back every failed resource', async ({
-  page,
-}) => {
-  await page.goto(WEBGL_HARNESS);
-  const proof = await page.evaluate(async () => {
-    const { generateCloudNoiseTexturesGPU } = await import(
-      '/assets/js/rendering/smoke-cloud/gpu-noise-generator.js'
-    );
-    const canvas = document.createElement('canvas');
-    canvas.width = 16;
-    canvas.height = 16;
-    const gl = canvas.getContext('webgl2', {
-      alpha: true,
-      antialias: false,
-      depth: true,
-    });
-    if (!(gl instanceof WebGL2RenderingContext)) {
-      throw new Error('GPU noise transaction proof requires WebGL2');
-    }
-
-    const compile = (type, source) => {
-      const shader = gl.createShader(type);
-      if (!shader) throw new Error('Noise state shader allocation failed');
-      gl.shaderSource(shader, source);
-      gl.compileShader(shader);
-      if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
-        throw new Error(
-          gl.getShaderInfoLog(shader) || 'Noise state shader compile failed'
-        );
-      }
-      return shader;
-    };
-    const vertexShader = compile(
-      gl.VERTEX_SHADER,
-      '#version 300 es\nvoid main(){gl_Position=vec4(0.0);}',
-    );
-    const fragmentShader = compile(
-      gl.FRAGMENT_SHADER,
-      '#version 300 es\nprecision highp float;out vec4 c;void main(){c=vec4(1.0);}',
-    );
-    const priorProgram = gl.createProgram();
-    if (!priorProgram) throw new Error('Noise state program allocation failed');
-    gl.attachShader(priorProgram, vertexShader);
-    gl.attachShader(priorProgram, fragmentShader);
-    gl.linkProgram(priorProgram);
-    gl.deleteShader(vertexShader);
-    gl.deleteShader(fragmentShader);
-    if (!gl.getProgramParameter(priorProgram, gl.LINK_STATUS)) {
-      throw new Error(
-        gl.getProgramInfoLog(priorProgram) || 'Noise state program link failed'
-      );
-    }
-    const priorDrawFramebuffer = gl.createFramebuffer();
-    const priorReadFramebuffer = gl.createFramebuffer();
-    const priorVertexArray = gl.createVertexArray();
-    const priorBuffer = gl.createBuffer();
-    const priorPixelUnpackBuffer = gl.createBuffer();
-    const priorTexture2D = gl.createTexture();
-    const priorTexture3D = gl.createTexture();
-    if (
-      !priorDrawFramebuffer
-      || !priorReadFramebuffer
-      || !priorVertexArray
-      || !priorBuffer
-      || !priorPixelUnpackBuffer
-      || !priorTexture2D
-      || !priorTexture3D
-    ) {
-      throw new Error('Noise state fixture allocation failed');
-    }
-    gl.activeTexture(gl.TEXTURE2);
-    gl.bindTexture(gl.TEXTURE_2D, priorTexture2D);
-    gl.bindTexture(gl.TEXTURE_3D, priorTexture3D);
-    gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, priorDrawFramebuffer);
-    gl.bindFramebuffer(gl.READ_FRAMEBUFFER, priorReadFramebuffer);
-    gl.bindVertexArray(priorVertexArray);
-    gl.bindBuffer(gl.ARRAY_BUFFER, priorBuffer);
-    gl.bindBuffer(gl.PIXEL_UNPACK_BUFFER, priorPixelUnpackBuffer);
-    gl.bufferData(gl.PIXEL_UNPACK_BUFFER, 16, gl.STATIC_DRAW);
-    gl.useProgram(priorProgram);
-    gl.viewport(1, 2, 7, 8);
-    gl.colorMask(false, true, false, true);
-    gl.enable(gl.BLEND);
-    gl.disable(gl.CULL_FACE);
-    gl.enable(gl.DEPTH_TEST);
-    gl.disable(gl.DITHER);
-    gl.enable(gl.RASTERIZER_DISCARD);
-    gl.enable(gl.SAMPLE_ALPHA_TO_COVERAGE);
-    gl.enable(gl.SAMPLE_COVERAGE);
-    gl.enable(gl.SCISSOR_TEST);
-    gl.enable(gl.STENCIL_TEST);
-
-    const capabilities = [
-      gl.BLEND,
-      gl.CULL_FACE,
-      gl.DEPTH_TEST,
-      gl.DITHER,
-      gl.RASTERIZER_DISCARD,
-      gl.SAMPLE_ALPHA_TO_COVERAGE,
-      gl.SAMPLE_COVERAGE,
-      gl.SCISSOR_TEST,
-      gl.STENCIL_TEST,
-    ];
-    const snapshotState = () => ({
-      activeTexture: gl.getParameter(gl.ACTIVE_TEXTURE),
-      arrayBuffer: gl.getParameter(gl.ARRAY_BUFFER_BINDING),
-      capabilities: capabilities.map(capability => (
-        gl.isEnabled(capability)
-      )),
-      colorMask: Array.from(gl.getParameter(gl.COLOR_WRITEMASK)),
-      drawFramebuffer: gl.getParameter(gl.DRAW_FRAMEBUFFER_BINDING),
-      pixelUnpackBuffer: gl.getParameter(
-        gl.PIXEL_UNPACK_BUFFER_BINDING,
-      ),
-      program: gl.getParameter(gl.CURRENT_PROGRAM),
-      readFramebuffer: gl.getParameter(gl.READ_FRAMEBUFFER_BINDING),
-      texture2D: gl.getParameter(gl.TEXTURE_BINDING_2D),
-      texture3D: gl.getParameter(gl.TEXTURE_BINDING_3D),
-      vertexArray: gl.getParameter(gl.VERTEX_ARRAY_BINDING),
-      viewport: Array.from(gl.getParameter(gl.VIEWPORT)),
-    });
-    const stateMatches = (actual, expected) => (
-      actual.activeTexture === expected.activeTexture
-      && actual.arrayBuffer === expected.arrayBuffer
-      && actual.capabilities.every(
-        (value, index) => value === expected.capabilities[index]
-      )
-      && actual.colorMask.every(
-        (value, index) => value === expected.colorMask[index]
-      )
-      && actual.drawFramebuffer === expected.drawFramebuffer
-      && actual.pixelUnpackBuffer === expected.pixelUnpackBuffer
-      && actual.program === expected.program
-      && actual.readFramebuffer === expected.readFramebuffer
-      && actual.texture2D === expected.texture2D
-      && actual.texture3D === expected.texture3D
-      && actual.vertexArray === expected.vertexArray
-      && actual.viewport.every(
-        (value, index) => value === expected.viewport[index]
-      )
-    );
-    const stateBefore = snapshotState();
-
-    const prototype = WebGL2RenderingContext.prototype;
-    const resourceMethods = [
-      ['Shader', 'shader'],
-      ['Program', 'program'],
-      ['Buffer', 'buffer'],
-      ['VertexArray', 'vertexArray'],
-      ['Texture', 'texture'],
-      ['Framebuffer', 'framebuffer'],
-    ];
-    const originals = {};
-    const live = Object.fromEntries(
-      resourceMethods.map(([, name]) => [name, new Set()]),
-    );
-    for (const [suffix, name] of resourceMethods) {
-      const createName = `create${suffix}`;
-      const deleteName = `delete${suffix}`;
-      originals[createName] = prototype[createName];
-      originals[deleteName] = prototype[deleteName];
-      prototype[createName] = function (...args) {
-        const resource = Reflect.apply(
-          originals[createName],
-          this,
-          args,
-        );
-        if (this === gl && resource) live[name].add(resource);
-        return resource;
-      };
-      prototype[deleteName] = function (resource) {
-        if (this === gl) live[name].delete(resource);
-        return Reflect.apply(originals[deleteName], this, [resource]);
-      };
-    }
-    const originalDrawArrays = prototype.drawArrays;
-    const originalCheckFramebufferStatus =
-      prototype.checkFramebufferStatus;
-    originals.drawArrays = originalDrawArrays;
-    originals.checkFramebufferStatus = originalCheckFramebufferStatus;
-    let failNextDraw = true;
-    let framebufferChecks = 0;
-    let drawState = null;
-    prototype.drawArrays = function (...args) {
-      if (this === gl && failNextDraw) {
-        failNextDraw = false;
-        drawState = {
-          blend: gl.isEnabled(gl.BLEND),
-          colorMask: Array.from(gl.getParameter(gl.COLOR_WRITEMASK)),
-          cull: gl.isEnabled(gl.CULL_FACE),
-          depth: gl.isEnabled(gl.DEPTH_TEST),
-          dither: gl.isEnabled(gl.DITHER),
-          pixelUnpackBufferIsNull:
-            gl.getParameter(gl.PIXEL_UNPACK_BUFFER_BINDING) === null,
-          rasterizerDiscard: gl.isEnabled(gl.RASTERIZER_DISCARD),
-          scissor: gl.isEnabled(gl.SCISSOR_TEST),
-          stencil: gl.isEnabled(gl.STENCIL_TEST),
-          viewport: Array.from(gl.getParameter(gl.VIEWPORT)),
-        };
-        throw new Error('synthetic GPU noise slice draw failure');
-      }
-      return Reflect.apply(originalDrawArrays, this, args);
-    };
-    prototype.checkFramebufferStatus = function (...args) {
-      if (this === gl) framebufferChecks++;
-      return Reflect.apply(originalCheckFramebufferStatus, this, args);
-    };
-
-    let failureMessage = null;
-    let failureStateRestored = false;
-    let failureLiveCounts = null;
-    let successStateRestored = false;
-    let successFramebufferChecks = null;
-    let successLiveCounts = null;
-    let textures = null;
-    try {
-      try {
-        generateCloudNoiseTexturesGPU(gl, 32, 32);
-      } catch (error) {
-        failureMessage = error.message;
-      }
-      failureStateRestored = stateMatches(snapshotState(), stateBefore);
-      failureLiveCounts = Object.fromEntries(
-        Object.entries(live).map(([name, resources]) => [
-          name,
-          resources.size,
-        ]),
-      );
-
-      const checksBeforeSuccess = framebufferChecks;
-      textures = generateCloudNoiseTexturesGPU(gl, 32, 32);
-      successFramebufferChecks = framebufferChecks - checksBeforeSuccess;
-      successStateRestored = stateMatches(snapshotState(), stateBefore);
-      gl.deleteTexture(textures.shape);
-      gl.deleteTexture(textures.detail);
-      gl.deleteTexture(textures.blueNoise);
-      textures = null;
-      successLiveCounts = Object.fromEntries(
-        Object.entries(live).map(([name, resources]) => [
-          name,
-          resources.size,
-        ]),
-      );
-    } finally {
-      if (textures) {
-        gl.deleteTexture(textures.shape);
-        gl.deleteTexture(textures.detail);
-        gl.deleteTexture(textures.blueNoise);
-      }
-      for (const [suffix] of resourceMethods) {
-        prototype[`create${suffix}`] = originals[`create${suffix}`];
-        prototype[`delete${suffix}`] = originals[`delete${suffix}`];
-      }
-      prototype.drawArrays = originals.drawArrays;
-      prototype.checkFramebufferStatus =
-        originals.checkFramebufferStatus;
-    }
-
-    const webglError = gl.getError();
-    gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, null);
-    gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null);
-    gl.bindVertexArray(null);
-    gl.bindBuffer(gl.ARRAY_BUFFER, null);
-    gl.bindBuffer(gl.PIXEL_UNPACK_BUFFER, null);
-    gl.useProgram(null);
-    gl.bindTexture(gl.TEXTURE_2D, null);
-    gl.bindTexture(gl.TEXTURE_3D, null);
-    gl.deleteProgram(priorProgram);
-    gl.deleteFramebuffer(priorDrawFramebuffer);
-    gl.deleteFramebuffer(priorReadFramebuffer);
-    gl.deleteVertexArray(priorVertexArray);
-    gl.deleteBuffer(priorBuffer);
-    gl.deleteBuffer(priorPixelUnpackBuffer);
-    gl.deleteTexture(priorTexture2D);
-    gl.deleteTexture(priorTexture3D);
-    return {
-      drawState,
-      failureLiveCounts,
-      failureMessage,
-      failureStateRestored,
-      successFramebufferChecks,
-      successLiveCounts,
-      successStateRestored,
-      webglError,
-    };
-  });
-
-  expect(proof.failureMessage).toContain(
-    'synthetic GPU noise slice draw failure',
-  );
-  expect(proof.drawState).toEqual({
-    blend: false,
-    colorMask: [true, true, true, true],
-    cull: false,
-    depth: false,
-    dither: false,
-    pixelUnpackBufferIsNull: true,
-    rasterizerDiscard: false,
-    scissor: false,
-    stencil: false,
-    viewport: [0, 0, 32, 32],
-  });
-  expect(proof.failureStateRestored).toBe(true);
-  expect(proof.failureLiveCounts).toEqual({
-    buffer: 0,
-    framebuffer: 0,
-    program: 0,
-    shader: 0,
-    texture: 0,
-    vertexArray: 0,
-  });
-  expect(proof.successStateRestored).toBe(true);
-  expect(proof.successFramebufferChecks).toBe(3);
-  expect(proof.successLiveCounts).toEqual({
-    buffer: 0,
-    framebuffer: 0,
-    program: 0,
-    shader: 0,
-    texture: 0,
-    vertexArray: 0,
-  });
-  expect(proof.webglError).toBe(0);
-});
-
 test('disposing smoke before its first scheduled noise batch allocates nothing', async ({
   page,
 }) => {
@@ -1728,7 +1422,7 @@ test('disposing smoke before its first scheduled noise batch allocates nothing',
   });
 });
 
-test('unavailable smoke mode rolls back the selector and retries cleanly', async ({
+test('smoke on a device without float blending stays in Points with a plain message, detected once', async ({
   page,
 }) => {
   const browserErrors = [];
@@ -1750,6 +1444,7 @@ test('unavailable smoke mode rolls back the selector and retries cleanly', async
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
+  await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
     'Current UI prepared fixture',
   );
@@ -1765,37 +1460,36 @@ test('unavailable smoke mode rolls back the selector and retries cleanly', async
     }
     const prototype = WebGL2RenderingContext.prototype;
     const original = prototype.getExtension;
-    let rejectFloatBlend = true;
+    window.__floatBlendQueries = 0;
     prototype.getExtension = function (name) {
-      if (
-        this === gl
-        && rejectFloatBlend
-        && name === 'EXT_float_blend'
-      ) {
-        rejectFloatBlend = false;
+      if (this === gl && name === 'EXT_float_blend') {
+        window.__floatBlendQueries++;
         return null;
       }
       return Reflect.apply(original, this, [name]);
     };
-    window.__restoreSmokeExtensionProbe = () => {
-      prototype.getExtension = original;
-      delete window.__restoreSmokeExtensionProbe;
-    };
   });
 
-  await page.locator('#render-mode').selectOption('smoke');
-  await expect(page.locator('#render-mode')).toHaveValue('points');
-  await expect(page.locator('#smoke-controls')).not.toHaveClass(/\bvisible\b/);
-  await expect(page.locator('#points-controls')).toHaveClass(/\bvisible\b/);
-  await expect(page.locator('#notification-center')).toContainText(
-    'Smoke density unavailable',
-  );
-  await page.evaluate(() => window.__restoreSmokeExtensionProbe());
-
-  await page.locator('#render-mode').selectOption('smoke');
-  await expect(page.locator('#render-mode')).toHaveValue('smoke');
-  await expect(page.locator('#smoke-controls')).toHaveClass(/\bvisible\b/);
-  await expect(page.locator('#points-controls')).not.toHaveClass(/\bvisible\b/);
+  const message = "Volumetric smoke isn't available on this device: its graphics "
+    + "driver can't blend high-precision colour, which the smoke cloud needs to "
+    + 'add up the cells. Points rendering works as usual.';
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    await page.locator('#render-mode').selectOption('smoke');
+    await expect(page.locator('#render-mode')).toHaveValue('points');
+    await expect(page.locator('#smoke-controls')).not.toHaveClass(/\bvisible\b/);
+    await expect(page.locator('#points-controls')).toHaveClass(/\bvisible\b/);
+    await expect(
+      page.locator('#notification-center .notification-warning')
+        .filter({ hasText: message }),
+    ).toHaveCount(attempt);
+  }
+  // A device's capabilities do not change: they are queried once, and nothing
+  // was built or half-published.
+  expect(await page.evaluate(() => ({
+    queries: window.__floatBlendQueries,
+    volume: window._cellucidViewer.hasSmokeVolume(),
+  }))).toEqual({ queries: 1, volume: false });
+  await expect(page.locator('.notification-error')).toHaveCount(0);
   expect(browserErrors).toEqual([]);
 });
 
@@ -1828,6 +1522,7 @@ test('runtime smoke noise failure settles once to points and retries cleanly', a
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
+  await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
     'Current UI prepared fixture',
   );
@@ -1924,7 +1619,7 @@ test('runtime smoke noise failure settles once to points and retries cleanly', a
     () => window.__getSmokeModeLayoutPublications(),
   )).toEqual([['single', 'live']]);
   const runtimeNotifications = page.locator('.notification-error').filter({
-    hasText: 'Smoke rendering failed:',
+    hasText: 'Volumetric smoke stopped rendering, so the view is back in Points.',
   });
   await expect(runtimeNotifications).toHaveCount(1);
   await page.waitForTimeout(500);
@@ -1973,6 +1668,7 @@ test('GPU smoke density matches its prior GPU reference without product readback
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
+  await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
     'Current UI prepared fixture',
   );
@@ -2269,6 +1965,8 @@ test('GPU smoke density matches its prior GPU reference without product readback
       gl.bindFramebuffer(gl.READ_FRAMEBUFFER, priorReadFramebuffer);
       const readbacksBeforeProduct = window.__cellucidReadPixelsCalls;
       const candidate = buildDensityTextureGPU(gl, testCase.positions, {
+        colors: new Uint8Array((testCase.positions.length / 3) * 4).fill(255),
+        dimension: 3,
         gamma: testCase.gamma,
         gridSize: testCase.gridSize,
       });
@@ -2295,7 +1993,10 @@ test('GPU smoke density matches its prior GPU reference without product readback
         throw new Error('Product smoke oracle framebuffer allocation failed');
       }
       gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+      // The product volume is RGBA8 with density in red; RGBA is the one
+      // readback format every engine guarantees for it.
       const actual = new Uint8Array(testCase.gridSize ** 3);
+      const layerPixels = new Uint8Array(testCase.gridSize ** 2 * 4);
       for (let z = 0; z < testCase.gridSize; z++) {
         gl.framebufferTextureLayer(
           gl.FRAMEBUFFER,
@@ -2317,11 +2018,13 @@ test('GPU smoke density matches its prior GPU reference without product readback
           0,
           testCase.gridSize,
           testCase.gridSize,
-          gl.RED,
+          gl.RGBA,
           gl.UNSIGNED_BYTE,
-          actual,
-          z * testCase.gridSize * testCase.gridSize,
+          layerPixels,
         );
+        for (let texel = 0; texel < testCase.gridSize ** 2; texel++) {
+          actual[z * testCase.gridSize ** 2 + texel] = layerPixels[texel * 4];
+        }
       }
       const diagnostic = binary64Diagnostic(testCase);
       results.push({
@@ -2416,6 +2119,7 @@ test('smoke owns an empty filtered view without errors or stale density', async 
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
+  await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
     'Current UI prepared fixture',
   );
@@ -2432,9 +2136,9 @@ test('smoke owns an empty filtered view without errors or stale density', async 
   await page.locator('#categorical-field').selectOption({ label: 'cell_type' });
 
   const legend = page.locator('#legend');
-  await legend.getByRole('button', { name: 'Hide All', exact: true }).click();
+  await legend.getByRole('button', { name: 'Hide all', exact: true }).click();
   await expect(page.locator('#filter-count')).toHaveText(
-    'Showing 0 of 120 points',
+    'Showing 0 of 120 cells',
   );
 
   const renderMode = page.locator('#render-mode');
@@ -2442,21 +2146,25 @@ test('smoke owns an empty filtered view without errors or stale density', async 
   await expect(renderMode).toHaveValue('smoke');
   await expect(page.locator('#smoke-controls')).toHaveClass(/visible/);
   await expect(page.locator('#points-controls')).not.toHaveClass(/visible/);
+  // Level of detail and frustum culling are point-renderer settings; the
+  // antialiasing below them governs the drawing buffer in both modes.
+  await expect(page.locator('#points-performance-controls')).toBeHidden();
+  await expect(page.locator('#hp-antialias')).toBeVisible();
   expect(await page.evaluate(
     () => window._cellucidViewer.hasSmokeVolume(),
   )).toBe(false);
 
-  await legend.getByRole('button', { name: 'Show All', exact: true }).click();
+  await legend.getByRole('button', { name: 'Show all', exact: true }).click();
   await expect(page.locator('#filter-count')).toHaveText(
-    'Showing all 120 points',
+    'Showing all 120 cells',
   );
   await expect.poll(
     () => page.evaluate(() => window._cellucidViewer.hasSmokeVolume()),
   ).toBe(true);
 
-  await legend.getByRole('button', { name: 'Hide All', exact: true }).click();
+  await legend.getByRole('button', { name: 'Hide all', exact: true }).click();
   await expect(page.locator('#filter-count')).toHaveText(
-    'Showing 0 of 120 points',
+    'Showing 0 of 120 cells',
   );
   await expect.poll(
     () => page.evaluate(() => window._cellucidViewer.hasSmokeVolume()),
@@ -2523,11 +2231,8 @@ test('every visible velocity slider endpoint reaches the GPU unchanged', async (
         fields: {
           velocity_umap: {
             label: 'velocity_umap',
-            basis: 'umap',
-            available_dimensions: [2],
-            default_dimension: 2,
             files: {
-              '2d': 'vectors/0_2d.bin',
+              X_umap_2d: 'vectors/0_0.bin',
             },
           },
         },
@@ -2536,7 +2241,7 @@ test('every visible velocity slider endpoint reaches the GPU unchanged', async (
     },
   );
   await page.route(
-    `**${CURRENT_UI_DATASET}vectors/0_2d.bin`,
+    `**${CURRENT_UI_DATASET}vectors/0_0.bin`,
     route => route.fulfill({
       status: 200,
       contentType: 'application/octet-stream',
@@ -2549,6 +2254,7 @@ test('every visible velocity slider endpoint reaches the GPU unchanged', async (
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
+  await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
     'Current UI prepared fixture',
   );
@@ -2578,7 +2284,7 @@ test('every visible velocity slider endpoint reaches the GPU unchanged', async (
   }
 
   await expect(page.locator('#velocity-speed-display')).toHaveText('0.05×');
-  await expect(page.locator('#velocity-lifetime-display')).toHaveText('0.1s');
+  await expect(page.locator('#velocity-lifetime-display')).toHaveText('0.1 s');
   await expect(page.locator('#velocity-size-display')).toHaveText('0.5');
   await expect(page.locator('#velocity-intensity-display')).toHaveText('0.05');
   await expect(page.locator('#velocity-exposure-display')).toHaveText('0.10');
@@ -2639,13 +2345,14 @@ test('recoloring and position changes retain the published filter generation', a
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
+  await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
     'Current UI prepared fixture',
   );
 
   const result = await page.evaluate(async () => {
     const viewer = window._cellucidViewer;
-    const transparency = new Float32Array(viewer.getPointCount()).fill(1);
+    const transparency = new Uint8Array(viewer.getPointCount()).fill(1);
     transparency[0] = 0;
     viewer.updateTransparency(transparency);
 
@@ -2713,6 +2420,7 @@ test('projectiles use the published full-resolution collision index', async ({ p
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
+  await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
 
   await page.locator('#navigation-mode').selectOption('free');
@@ -2728,10 +2436,24 @@ test('projectiles use the published full-resolution collision index', async ({ p
     bounds.x + bounds.width * 0.75,
     bounds.y + bounds.height * 0.5,
   );
+  // Hold past the charge threshold so this fires a charged shot. A loaded
+  // runner can only lengthen the hold, never shorten it.
   await page.mouse.down();
-  await page.waitForTimeout(120);
+  await page.waitForTimeout(Math.ceil(PROJECTILE_MIN_CHARGE_SECONDS * 1000 * 1.5));
   await page.mouse.up();
-  await page.waitForTimeout(750);
+  // Let the shot fly through the collision index. The simulation advances
+  // once per drawn frame, so count frames rather than milliseconds: 45 frames
+  // are three quarters of a second of flight at 60 Hz and more on a runner
+  // whose slower frames each step the clamped, longer frame time.
+  await page.evaluate(frameCount => new Promise(resolve => {
+    let remaining = frameCount;
+    const advance = () => {
+      remaining -= 1;
+      if (remaining === 0) resolve();
+      else requestAnimationFrame(advance);
+    };
+    requestAnimationFrame(advance);
+  }), 45);
 
   const webglError = await page.locator('#glcanvas').evaluate(canvas => (
     canvas.getContext('webgl2').getError()
@@ -2763,6 +2485,7 @@ test('spatial-index construction failures settle every owned notification', asyn
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
+  await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
 
   const result = await page.evaluate(async () => {

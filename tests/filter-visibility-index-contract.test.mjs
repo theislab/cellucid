@@ -15,7 +15,7 @@ import {
 function stubState(pointCount, maskValues = null) {
   const state = Object.assign(Object.create(DataStateFilterMethods.prototype), {
     pointCount,
-    cellVisibilityMask: new Float32Array(pointCount).fill(1),
+    cellVisibilityMask: new Uint8Array(pointCount).fill(1),
     recomputes: 0,
     computeGlobalVisibility() {
       this.recomputes++;
@@ -33,10 +33,9 @@ function liveState(pointCount) {
     activeFieldSource: null,
     activeFieldIndex: -1,
     activeVarFieldIndex: -1,
-    categoryTransparency: new Float32Array(pointCount).fill(1),
-    cellVisibilityMask: new Float32Array(pointCount).fill(1),
+    categoryTransparency: new Uint8Array(pointCount).fill(1),
+    cellVisibilityMask: new Uint8Array(pointCount).fill(1),
     colorsArray: new Uint8Array(pointCount * 4).fill(255),
-    outlierQuantilesArray: new Float32Array(pointCount).fill(-1),
     _syncColorsAlpha: DataStateColorMethods.prototype._syncColorsAlpha,
     isOutlierFilterEnabledForActiveField: () => false,
     getCurrentOutlierThreshold: () => 1,
@@ -63,7 +62,7 @@ test('cell visibility keeps rejecting every malformed boxed-array selection', ()
   );
 
   const shortMask = stubState(8);
-  shortMask.cellVisibilityMask = new Float32Array(4);
+  shortMask.cellVisibilityMask = new Uint8Array(4);
   assert.throws(
     () => shortMask.setCellVisibility([0], true),
     /Cell visibility requires a complete current dataset mask\./,

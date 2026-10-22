@@ -13,6 +13,7 @@
  * @module session/codecs/delta-varint
  */
 
+import { yieldToMacrotask } from '../../../utils/yield-macrotask.js';
 import { decodeUvarint, pushUvarint } from './varint.js';
 import {
   assertExactKeys,
@@ -28,17 +29,6 @@ function throwIfAborted(signal) {
   }
 }
 
-function yieldToMacrotask() {
-  return new Promise(resolve => {
-    const channel = new MessageChannel();
-    channel.port1.onmessage = () => {
-      channel.port1.close();
-      channel.port2.close();
-      resolve();
-    };
-    channel.port2.postMessage(null);
-  });
-}
 
 /**
  * Ensure indices are a sorted Uint32Array.

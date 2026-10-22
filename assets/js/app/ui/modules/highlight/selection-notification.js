@@ -34,19 +34,18 @@ function requireDelivery(options) {
   if (!Array.isArray(options.cellIndices)) {
     throw new TypeError('Selection delivery cellIndices must be an array');
   }
-  const seen = new Set();
-  for (let index = 0; index < options.cellIndices.length; index++) {
-    if (
-      !Object.hasOwn(options.cellIndices, index)
-      || !Number.isSafeInteger(options.cellIndices[index])
-      || options.cellIndices[index] < 0
-      || seen.has(options.cellIndices[index])
-    ) {
+  // One tight loop and no hash set: a JavaScript Set holds at most 2^24
+  // entries, and a selection can be larger. Uniqueness is the transport's
+  // contract -- the Jupyter bridge sorts the cells once and refuses a
+  // duplicate while it encodes them.
+  const cellIndices = options.cellIndices;
+  for (let index = 0; index < cellIndices.length; index++) {
+    const cellIndex = cellIndices[index];
+    if (!Number.isSafeInteger(cellIndex) || cellIndex < 0) {
       throw new TypeError(
-        'Selection delivery cellIndices must contain unique non-negative integers'
+        'Selection delivery cellIndices must contain non-negative integers'
       );
     }
-    seen.add(options.cellIndices[index]);
   }
   if (!SELECTION_SOURCES.has(options.source)) {
     throw new TypeError(`Unknown selection delivery source: ${options.source}`);

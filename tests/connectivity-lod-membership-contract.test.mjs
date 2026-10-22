@@ -8,6 +8,11 @@ import {
 import {
   viewContextViewerSyncMethods,
 } from '../assets/js/app/state/managers/view-context-viewer-sync.js';
+import {
+  countVisibleConnectivityEdges,
+  createConnectivityEdgeOrder,
+  selectVisibleConnectivityEdges,
+} from '../assets/js/rendering/connectivity-edge-selection.js';
 
 const mainSource = await readFile(
   new URL('../assets/js/app/main.js', import.meta.url),
@@ -84,11 +89,6 @@ const edgePublicationSource = extractSource(
   'function publishConnectivityEdges(owner, edgeData)',
   'function clearPublishedConnectivityEdges()'
 );
-const visibilityTextureSource = extractSource(
-  viewerSource,
-  'function updateVisibilityTextureV2ForView(',
-  '/**\n   * Delete edge textures for a specific view'
-);
 
 test('connectivity validates the exact immutable compact LOD owner', () => {
   const requireMembership = new Function(
@@ -148,7 +148,7 @@ test('connectivity validates the exact immutable compact LOD owner', () => {
   );
 });
 
-test('connectivity R8 publication keeps the byte-3 threshold and LOD admission boundary', () => {
+test('an edge is visible exactly when both endpoints pass the point threshold and the LOD admission boundary', () => {
   const belowThreshold = nextFloat32(
     POINT_VISIBILITY_THRESHOLD,
     -1
@@ -157,44 +157,42 @@ test('connectivity R8 publication keeps the byte-3 threshold and LOD admission b
     POINT_VISIBILITY_THRESHOLD,
     1
   );
-
   assert.equal(MIN_VISIBLE_ALPHA_BYTE, 3);
-  assert.equal(
-    Math.round(belowThreshold * 255),
-    MIN_VISIBLE_ALPHA_BYTE - 1
-  );
-  assert.equal(
-    Math.round(POINT_VISIBILITY_THRESHOLD * 255),
-    MIN_VISIBLE_ALPHA_BYTE
-  );
-  assert.equal(
-    Math.round(aboveThreshold * 255),
-    MIN_VISIBLE_ALPHA_BYTE
-  );
-  assert.match(
-    visibilityTextureSource,
-    /alpha >= POINT_VISIBILITY_THRESHOLD/
-  );
-  assert.match(
-    visibilityTextureSource,
-    /lodVisibility\.admissionLevels\[index\] <=\s*lodVisibility\.lodLevel/
-  );
-  assert.match(
-    visibilityTextureSource,
-    /\)\s*\?\s*255\s*:\s*0/
-  );
+  assert.equal(Math.round(belowThreshold * 255), MIN_VISIBLE_ALPHA_BYTE - 1);
+  assert.equal(Math.round(POINT_VISIBILITY_THRESHOLD * 255), MIN_VISIBLE_ALPHA_BYTE);
+  assert.equal(Math.round(aboveThreshold * 255), MIN_VISIBLE_ALPHA_BYTE);
+
+  // Transparency bytes are 0 or 1 (alpha-visibility.js): 1 passes the shared
+  // threshold, 0 does not. Admission level <= the pane's level passes LOD.
+  const sources = Uint32Array.from([0, 0, 1, 2]);
+  const destinations = Uint32Array.from([1, 2, 3, 3]);
+  const transparency = Uint8Array.from([1, 1, 1, 0]);
+  const admissionLevels = Uint8Array.from([0, 1, 2, 0]);
+  const order = createConnectivityEdgeOrder(4);
+  const visibleAt = (lodMembership, lodLevel) => {
+    const visibility = { transparency, admissionLevels: lodMembership, lodLevel };
+    const output = new Uint32Array(4);
+    const selected = selectVisibleConnectivityEdges(order, sources, destinations, visibility, 4, output);
+    assert.equal(selected, countVisibleConnectivityEdges(sources, destinations, visibility, 0, 4));
+    return Array.from(output.subarray(0, selected)).sort();
+  };
+  // Cell 3 is hidden: edges 1-3 and 2-3 are not visible.
+  assert.deepEqual(visibleAt(null, -1), [0, 1]);
+  // LOD level 1 admits cells 0, 1 and 3: edge 0-2 (cell 2 at level 2) goes.
+  assert.deepEqual(visibleAt(admissionLevels, 1), [0]);
+  assert.deepEqual(visibleAt(admissionLevels, 2), [0, 1]);
 });
 
-test('each updated view refreshes its viewer-owned prefix and active UI consumes those stats', () => {
+test('each updated view refreshes its viewer-owned edge selection and active UI consumes those stats', () => {
   const visibilityByView = Object.freeze({
     live: Object.freeze({
-      transparency: Float32Array.of(1),
+      transparency: Uint8Array.of(1),
       lodMembership: null,
       pointCount: 1,
       visibleCount: 99
     }),
     snap_1: Object.freeze({
-      transparency: Float32Array.of(1),
+      transparency: Uint8Array.of(1),
       lodMembership: null,
       pointCount: 1,
       visibleCount: 88
@@ -248,7 +246,7 @@ test('each updated view refreshes its viewer-owned prefix and active UI consumes
         calls.push(['texture', viewId]);
         return true;
       },
-      refreshEdgePrefixForView: (viewId) => {
+      refreshEdgeSelectionForView: (viewId) => {
         calls.push(['prefix', viewId]);
         return statsByView[viewId];
       }
@@ -294,16 +292,19 @@ test('full connectivity refresh completes every pane before publishing one share
   const statsByView = Object.freeze({
     live: Object.freeze({
       current: true,
+      shownCount: 5,
       viewId: 'live',
       visibleCount: 11
     }),
     snap_1: Object.freeze({
       current: true,
+      shownCount: 5,
       viewId: 'snap_1',
       visibleCount: 9
     }),
     snap_2: Object.freeze({
       current: true,
+      shownCount: 5,
       viewId: 'snap_2',
       visibleCount: 7
     })
@@ -321,6 +322,7 @@ test('full connectivity refresh completes every pane before publishing one share
       let activeConnectivityStatsViewId = null;
       let actualVisibleEdges = 0;
       let currentEdgeLimit = 5;
+      const getTotalEdges = () => 20;
       const connectivityCheckbox = { checked: true };
       function updateEdgeVisibilityForView(viewId, publishActive) {
         calls.push(['refresh', viewId, publishActive]);
@@ -342,14 +344,15 @@ test('full connectivity refresh completes every pane before publishing one share
         { id: 'snap_1' },
         { id: 'snap_2' }
       ],
-      getEdgePrefixStatsForView: (viewId) => {
+      getEdgeSelectionStatsForView: (viewId) => {
         calls.push(['stats', viewId]);
         return statsByView[viewId];
       },
       setEdgeVisibleTarget: (target) => {
         calls.push(['target', target]);
         return true;
-      }
+      },
+      onConnectivityVisibleCount: () => () => {}
     },
     (visibleCount) => calls.push(['slider', visibleCount]),
     (visibleCount, shownCount) => {
@@ -365,7 +368,6 @@ test('full connectivity refresh completes every pane before publishing one share
     ['refresh', 'snap_1', false],
     ['refresh', 'snap_2', false],
     ['slider', 7],
-    ['stats', 'snap_2'],
     ['target', 5],
     ['stats', 'snap_2'],
     ['info', 7, 5]
@@ -395,7 +397,7 @@ test('main connectivity lifecycle uses compact APIs and owns no dense LOD mask',
   );
   assert.match(
     targetedVisibilitySource,
-    /const stats = viewer\.refreshEdgePrefixForView\(viewId\)/
+    /const stats = viewer\.refreshEdgeSelectionForView\(viewId\)/
   );
   assert.match(
     targetedVisibilitySource,
@@ -407,11 +409,11 @@ test('main connectivity lifecycle uses compact APIs and owns no dense LOD mask',
   );
   assert.match(
     activeCountsSource,
-    /actualVisibleEdges = stats\.visibleCount/
+    /actualVisibleEdges = stats\.visibleCount \?\? actualVisibleEdges/
   );
   assert.match(
     updateActiveCountsSource,
-    /viewer\.refreshEdgePrefixForView\(activeViewId\)/
+    /viewer\.refreshEdgeSelectionForView\(activeViewId\)/
   );
   assert.match(
     visibilityCoreSource,
@@ -427,7 +429,7 @@ test('main connectivity lifecycle uses compact APIs and owns no dense LOD mask',
   );
   assert.match(
     edgeLimitSource,
-    /viewer\.setEdgeVisibleTarget\(currentEdgeLimit\)/
+    /viewer\.setEdgeVisibleTarget\(\s*Math\.min\(currentEdgeLimit, getTotalEdges\(\)\)\s*\)/
   );
   assert.doesNotMatch(
     edgeLimitSource,
@@ -491,8 +493,8 @@ test('main connectivity lifecycle uses compact APIs and owns no dense LOD mask',
 });
 
 test('application transparency rolls back to the accepted viewer owner on publication failure', () => {
-  const accepted = Float32Array.from([1, 0.25, 0]);
-  const categoryTransparency = Float32Array.from([0, 0, 1]);
+  const accepted = Uint8Array.from([1, 1, 0]);
+  const categoryTransparency = Uint8Array.from([0, 0, 1]);
   const publicationError = new Error('synthetic GPU upload failure');
   let alphaSyncs = 0;
   let countSyncs = 0;

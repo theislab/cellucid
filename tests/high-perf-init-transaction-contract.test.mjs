@@ -45,7 +45,10 @@ function createInitializationGl(overrides = {}) {
     COMPILE_STATUS: 0x8b81,
     LINK_STATUS: 0x8b82,
     CURRENT_PROGRAM: 0x8b8d,
+    MAX_ARRAY_TEXTURE_LAYERS: 0x88ff,
+    MAX_TEXTURE_SIZE: 0x0d33,
     TEXTURE_2D: 0x0de1,
+    TEXTURE_2D_ARRAY: 0x8c1a,
     R32UI: 0x8236,
     RED_INTEGER: 0x8d94,
     UNSIGNED_INT: 0x1405,
@@ -161,7 +164,9 @@ function createInitializationGl(overrides = {}) {
       return handle;
     },
     bindTexture() {},
-    texImage2D() {
+    // The dummy permutation is a one-texel linear texture (2D array).
+    texStorage3D() {},
+    texSubImage3D() {
       if (overrides.textureUploadError) {
         nextError = gl.INVALID_OPERATION;
       }
@@ -218,6 +223,8 @@ function createInitializationGl(overrides = {}) {
       return error;
     },
     getParameter(parameter) {
+      if (parameter === gl.MAX_TEXTURE_SIZE) return 4096;
+      if (parameter === gl.MAX_ARRAY_TEXTURE_LAYERS) return 256;
       assert.equal(parameter, gl.CURRENT_PROGRAM);
       return currentProgram;
     },
@@ -252,10 +259,12 @@ test('renderer initialization publishes one complete resource generation', () =>
   const renderer = new HighPerfRenderer(gl);
 
   assert.equal(gl._state.live.shaders.size, 0);
-  assert.equal(gl._state.live.programs.size, 3);
+  // One program per shader quality, plus the no-depth programs of full, light
+  // and sculpted.
+  assert.equal(gl._state.live.programs.size, 7);
   assert.equal(gl._state.live.textures.size, 1);
   assert.equal(gl._state.live.vertexArrays.size, 1);
-  assert.equal(renderer.uniformLocations.size, 3);
+  assert.equal(renderer.uniformLocations.size, 7);
   assert.equal(renderer.activeProgram, renderer.programs.full);
   assert.equal(gl._state.currentProgram, renderer.programs.full);
 
@@ -282,7 +291,8 @@ test('renderer initialization publishes one complete resource generation', () =>
 for (const scenario of [
   {
     name: 'partial shader allocation',
-    overrides: { nullShaderAt: 3 },
+    // Shared vertex shaders: full VS, full FS, full no-depth FS, light VS.
+    overrides: { nullShaderAt: 4 },
     error: /light.*vertex shader/i,
   },
   {
@@ -292,7 +302,7 @@ for (const scenario of [
   },
   {
     name: 'partial program link',
-    overrides: { linkFailureAt: 2 },
+    overrides: { linkFailureAt: 3 },
     error: /light.*link failed/i,
   },
   {
@@ -354,8 +364,12 @@ test('program disposal detaches first and retries only the deletion that remains
   assert.equal(renderer.activeProgram, null);
   assert.deepEqual(renderer.programs, {
     full: null,
+    fullNoDepth: null,
     light: null,
+    lightNoDepth: null,
     ultralight: null,
+    sculpted: null,
+    sculptedNoDepth: null,
   });
   assert.equal(gl._state.currentProgram, null);
   assert.equal(gl._state.live.programs.size, 1);
@@ -459,4 +473,24 @@ test('disposal preserves a current program owned by another shared-context rende
   renderer.dispose();
   assert.equal(gl._state.currentProgram, externalProgram);
   assertNoLiveInitializationResources(gl);
+});
+
+test('point programs compile each distinct shader once and wait for status once, after every link', () => {
+  const gl = createInitializationGl();
+  const order = [];
+  for (const name of ['compileShader', 'linkProgram', 'getProgramParameter', 'getShaderParameter']) {
+    const original = gl[name].bind(gl);
+    gl[name] = (...args) => {
+      order.push(name);
+      return original(...args);
+    };
+  }
+  const renderer = new HighPerfRenderer(gl);
+  const compiles = order.filter(name => name === 'compileShader').length;
+  // 2 vertex shaders (full, light) and 7 fragment shaders.
+  assert.equal(compiles, 9);
+  const firstStatus = order.findIndex(name => name === 'getProgramParameter' || name === 'getShaderParameter');
+  assert.equal(order.slice(firstStatus).includes('linkProgram'), false, 'every link is issued before any status is read');
+  assert.equal(order.includes('getShaderParameter'), false, 'compile status is read only to diagnose a failed link');
+  renderer.dispose();
 });

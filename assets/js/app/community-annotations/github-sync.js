@@ -44,8 +44,13 @@ const GITHUB_RENAMED_FORK_LOOKUP_MAX_ITEMS =
 const GITHUB_RENAMED_FORK_LOOKUP_TIMEOUT_MS = 10_000;
 const DEFAULT_USER_PULL_CONCURRENCY = 8;
 const MAX_TREE_ITEMS = 100_000;
-export const COMMUNITY_ANNOTATION_MAX_PULL_USER_FILES = 10_000;
-export const COMMUNITY_ANNOTATION_MAX_PULL_UTF8_BYTES = 64_000_000;
+/**
+ * Changed user files are fetched and handed on in batches of about this many
+ * decoded bytes, so a Pull holds one batch at a time however many files the
+ * repository has. A scheduling size, not a limit: a larger file is its own
+ * batch.
+ */
+export const COMMUNITY_ANNOTATION_PULL_BATCH_BYTES = 32 * 1024 * 1024;
 const GITHUB_SHA = /^[0-9a-f]{40}$/;
 const ANNOTATION_USERS_DIRECTORY_PATH = 'annotations/users';
 const ANNOTATION_USERS_PATH_PREFIX =
@@ -65,24 +70,6 @@ const OPERATION_OUTCOMES = new Set([
   'not-applied',
   'unknown',
 ]);
-
-export class CommunityAnnotationPullLimitError extends Error {
-  constructor(kind, actual, maximum) {
-    const isFiles = kind === 'user-files';
-    const unit = isFiles ? 'user files' : 'decoded UTF-8 bytes';
-    super(
-      `Community annotation Pull contains ${actual} ${unit}; the browser ` +
-      `safety limit is ${maximum}. Archive old user files or split the ` +
-      'annotation repository before pulling again.'
-    );
-    this.name = 'CommunityAnnotationPullLimitError';
-    this.code = 'COMMUNITY_ANNOTATION_PULL_LIMIT';
-    this.phase = 'remote-tree-preflight';
-    this.kind = kind;
-    this.actual = actual;
-    this.maximum = maximum;
-  }
-}
 
 function assertExactNonblankString(value, label, { max = 2048 } = {}) {
   if (
@@ -3166,7 +3153,22 @@ export class CommunityAnnotationGitHubSync {
     );
   }
 
-  async pullAllUsers({ knownShas = null, signal = null } = {}) {
+  /**
+   * Fetch every user file whose SHA changed, a batch at a time: each batch of
+   * validated `{ path, sha, doc }` records goes to `onRecords` (which caches
+   * it) before the next batch is fetched, so no Pull holds more than one batch
+   * of raw files.
+   *
+   * @param {object} options
+   * @param {Record<string, string>|null} [options.knownShas]
+   * @param {(records: Array<{path: string, sha: string, doc: object}>) => Promise<void>} options.onRecords
+   * @param {AbortSignal|null} [options.signal]
+   * @returns {Promise<{ shas: Record<string, string>, fetchedCount: number, totalCount: number, concurrency: number }>}
+   */
+  async pullAllUsers({ knownShas = null, onRecords, signal = null } = {}) {
+    if (typeof onRecords !== 'function') {
+      throw new TypeError('Annotation users pull requires an onRecords sink');
+    }
     const requestSignal = assertAbortSignalOrNull(
       signal,
       'Annotation users pull signal'
@@ -3260,21 +3262,9 @@ export class CommunityAnnotationGitHubSync {
         `Git tree does not contain the required ${ANNOTATION_USERS_DIRECTORY_PATH} inventory`
       );
     }
-    if (
-      userBlobs.length >
-      COMMUNITY_ANNOTATION_MAX_PULL_USER_FILES
-    ) {
-      throw new CommunityAnnotationPullLimitError(
-        'user-files',
-        userBlobs.length,
-        COMMUNITY_ANNOTATION_MAX_PULL_USER_FILES
-      );
-    }
-
     /** @type {Record<string, string>} */
     const nextShas = {};
     const userBlobSizes = new Map();
-    let totalDecodedBytes = 0;
     for (const f of userBlobs) {
       const path = f.path;
       if (!Number.isSafeInteger(f.size) || f.size < 0) {
@@ -3289,7 +3279,6 @@ export class CommunityAnnotationGitHubSync {
           { phase: 'remote-tree-preflight' }
         );
       }
-      totalDecodedBytes += f.size;
       const sha = assertGitHubSha(
         f.sha,
         `Git tree SHA for ${JSON.stringify(path)}`
@@ -3300,17 +3289,6 @@ export class CommunityAnnotationGitHubSync {
       nextShas[path] = sha;
       userBlobSizes.set(path, f.size);
     }
-    if (
-      totalDecodedBytes >
-      COMMUNITY_ANNOTATION_MAX_PULL_UTF8_BYTES
-    ) {
-      throw new CommunityAnnotationPullLimitError(
-        'decoded-bytes',
-        totalDecodedBytes,
-        COMMUNITY_ANNOTATION_MAX_PULL_UTF8_BYTES
-      );
-    }
-
     if (
       knownShas !== null &&
       (
@@ -3343,37 +3321,50 @@ export class CommunityAnnotationGitHubSync {
     const toFetch = allPaths.filter((path) => needsFetch(path, nextShas[path]));
 
     const concurrency = DEFAULT_USER_PULL_CONCURRENCY;
-    const out = await mapWithConcurrency(
-      toFetch,
-      concurrency,
-      async (path, _index, batchSignal) => {
-        const sha = nextShas[path] || null;
-        const filename = path.split('/').pop();
-        const { decodedByteLength, json } = await getGitBlobJson({
-          workerOrigin,
-          owner: this.owner,
-          repo: this.repo,
-          token,
-          sha,
-          path,
-          signal: batchSignal,
-        });
-        const expectedDecodedByteLength =
-          userBlobSizes.get(path) ?? null;
-        if (decodedByteLength !== expectedDecodedByteLength) {
-          throw new Error(
-            `Git blob ${JSON.stringify(path)} decoded byte length changed ` +
-            'from the recursive tree; start a new Pull'
-          );
-        }
-        assertUserDocument(json, { path, filename });
-        return { path, sha, doc: json };
-      },
-      { signal: requestSignal }
-    );
+    const fetchRecord = async (path, _index, batchSignal) => {
+      const sha = nextShas[path] || null;
+      const filename = path.split('/').pop();
+      const { decodedByteLength, json } = await getGitBlobJson({
+        workerOrigin,
+        owner: this.owner,
+        repo: this.repo,
+        token,
+        sha,
+        path,
+        signal: batchSignal,
+      });
+      const expectedDecodedByteLength =
+        userBlobSizes.get(path) ?? null;
+      if (decodedByteLength !== expectedDecodedByteLength) {
+        throw new Error(
+          `Git blob ${JSON.stringify(path)} decoded byte length changed ` +
+          'from the recursive tree; start a new Pull'
+        );
+      }
+      assertUserDocument(json, { path, filename });
+      return { path, sha, doc: json };
+    };
+    for (let start = 0; start < toFetch.length;) {
+      let end = start;
+      let batchBytes = 0;
+      do {
+        batchBytes += userBlobSizes.get(toFetch[end]);
+        end += 1;
+      } while (
+        end < toFetch.length
+        && batchBytes + userBlobSizes.get(toFetch[end]) <= COMMUNITY_ANNOTATION_PULL_BATCH_BYTES
+      );
+      const records = await mapWithConcurrency(
+        toFetch.slice(start, end),
+        concurrency,
+        fetchRecord,
+        { signal: requestSignal }
+      );
+      await onRecords(records);
+      start = end;
+    }
 
     return {
-      docs: out,
       shas: nextShas,
       fetchedCount: toFetch.length,
       totalCount: allPaths.length,
@@ -3664,25 +3655,4 @@ export async function resolveAnnotationRepositoryFromUrlParam({
     repoRef: parsed.ownerRepoRef,
     branchMode: 'explicit',
   };
-}
-
-export async function setDatasetAnnotationRepoFromUrlParamAsync({
-  datasetId,
-  urlParamValue,
-  username = 'local',
-  tokenOverride = null,
-  signal = null,
-} = {}) {
-  const resolved = await resolveAnnotationRepositoryFromUrlParam({
-    urlParamValue,
-    tokenOverride,
-    signal,
-  });
-  if (resolved === null || resolved === false) return false;
-  return setAnnotationRepoForDataset(
-    datasetId,
-    resolved.repoRef,
-    username,
-    { branchMode: resolved.branchMode }
-  );
 }

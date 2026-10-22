@@ -4,11 +4,13 @@
  * @module ui/modules/field-selector-gene-expression
  */
 
+import { createIntentPrefetcher } from '../../utils/intent-prefetch.js';
 import { getNotificationCenter } from '../../notification-center.js';
 import {
   explainContinuousPayloadFailure,
 } from '../../../data/continuous-payload-diagnosis.js';
 import { FieldSource } from '../../utils/field-constants.js';
+import { formatCount } from '../components/display-format.js';
 import { StateValidator } from '../../utils/state-validator.js';
 import {
   createDatasetFieldLoadSupersededError,
@@ -70,7 +72,7 @@ const RETURN_KEYS = new Set([
    there. It must never assert that a searched gene was removed, nor guess how
    many genes are absent: the app cannot know either one.
    --------------------------------------------------------------------------- */
-const GENE_PANEL_HELP_URL = 'https://cellucid.readthedocs.io/en/latest/'
+const GENE_PANEL_HELP_URL = 'https://docs.cellucid.com/en/latest/'
   + 'user_guide/web_app/d_fields_coloring_legends/'
   + '05_troubleshooting_fields_legends.html'
   + '#symptom-gene-search-returns-nothing-enter-selects-the-wrong-gene';
@@ -189,7 +191,7 @@ function countPublishedGenes(inventory) {
  */
 function formatGenePanelNote(publishedGeneCount) {
   const noun = publishedGeneCount === 1 ? 'gene name' : 'gene names';
-  return `This dataset publishes ${publishedGeneCount.toLocaleString()} ${noun}, `
+  return `This dataset publishes ${formatCount(publishedGeneCount)} ${noun}, `
     + 'chosen when it was prepared and possibly a subset of the source data. '
     + 'Check for typos too.';
 }
@@ -281,9 +283,6 @@ function requireDuplicateResult(value, state) {
   return value;
 }
 
-/**
- * @param {object} options
- */
 export function initGeneExpressionSelector(options) {
   requireExactKeys(options, INIT_KEYS, 'Gene expression selector options');
   const {
@@ -372,6 +371,9 @@ export function initGeneExpressionSelector(options) {
   let destroyed = false;
   let hasGeneExpressionFields = false;
   let geneFieldList = [];
+  // Lower-cased keys, built once per inventory, so a keystroke filters a
+  // 30,000-gene panel without allocating 30,000 strings.
+  let geneSearchKeys = [];
   let publishedGeneCount = 0;
   let selectedGeneOriginalIdx = -1;
   let forceDisabled = false;
@@ -385,6 +387,77 @@ export function initGeneExpressionSelector(options) {
   geneSearchStatus.setAttribute('role', 'status');
   geneSearchStatus.setAttribute('aria-live', 'polite');
   geneContainer.appendChild(geneSearchStatus);
+
+  /* The search box and its results follow the ARIA combobox/listbox pattern:
+     focus stays in the box, ArrowUp/ArrowDown move an active option that
+     `aria-activedescendant` announces, and Enter chooses that option. */
+  const geneOptionIdPrefix = `${
+    geneDropdown.getAttribute('id') ?? 'gene-expression-dropdown'
+  }-option`;
+  let activeGeneOptionIndex = -1;
+  /**
+   * Every gene that matches the search is listed. The options are built a
+   * page at a time -- the first page when the list opens, the next when it is
+   * scrolled or arrowed to its end -- so a search matching tens of thousands
+   * of genes opens as fast as one matching a hundred.
+   */
+  const GENE_OPTION_PAGE = 100;
+  /** @type {Array<{ field: any, originalIdx: number }>} */
+  let geneResults = [];
+  let renderedGeneResults = 0;
+
+  geneSearch.setAttribute('role', 'combobox');
+  geneSearch.setAttribute('aria-autocomplete', 'list');
+  geneSearch.setAttribute('aria-expanded', 'false');
+  if (geneDropdown.getAttribute('id') !== null) {
+    geneSearch.setAttribute('aria-controls', geneDropdown.getAttribute('id'));
+  }
+  geneDropdown.setAttribute('role', 'listbox');
+  geneDropdown.hidden = true;
+  geneDropdown.setAttribute('aria-label', 'Matching genes');
+
+  function geneOptions() {
+    return [...geneDropdown.children].filter(
+      child => child.classList.contains('dropdown-item')
+    );
+  }
+
+  // Prefetch on intent (utils/intent-prefetch.js): the gene kept active or
+  // under the pointer is loaded before it is chosen.
+  const genePrefetch = createIntentPrefetcher((originalIdx, signal) => (
+    interactionOwner.isSuspended()
+      ? undefined
+      : state.ensureVarFieldLoaded(originalIdx, { signal, priority: 'low' })
+  ));
+  const scheduleGenePrefetch = originalIdx => {
+    if (!destroyed) genePrefetch.intend(originalIdx);
+  };
+  const cancelGenePrefetch = () => genePrefetch.cancel();
+
+  function setActiveGeneOption(index) {
+    // An option past the built ones is built first (with every one before
+    // it), so arrowing or End reaches every match.
+    if (index >= renderedGeneResults && index < geneResults.length) {
+      renderMoreGeneResults(index);
+    }
+    const options = geneOptions();
+    activeGeneOptionIndex = options.length === 0
+      ? -1
+      : Math.max(-1, Math.min(index, options.length - 1));
+    options.forEach((option, optionIndex) => {
+      const active = optionIndex === activeGeneOptionIndex;
+      option.classList.toggle('active', active);
+      option.setAttribute('aria-selected', active ? 'true' : 'false');
+    });
+    const active = options[activeGeneOptionIndex] ?? null;
+    if (active === null) {
+      geneSearch.removeAttribute('aria-activedescendant');
+      return;
+    }
+    geneSearch.setAttribute('aria-activedescendant', active.getAttribute('id'));
+    active.scrollIntoView?.({ block: 'nearest' });
+    scheduleGenePrefetch(Number(active.dataset.originalIdx));
+  }
 
   function assertAlive() {
     if (destroyed) {
@@ -498,8 +571,9 @@ export function initGeneExpressionSelector(options) {
       inventory
     );
     publishedGeneCount = countPublishedGenes(inventory);
+    geneSearchKeys = geneFieldList.map(({ field }) => field.key.toLowerCase());
     hasGeneExpressionFields = geneFieldList.length > 0;
-    geneContainer.classList.toggle('visible', hasGeneExpressionFields);
+    geneContainer.hidden = !hasGeneExpressionFields;
     if (
       selectedGeneOriginalIdx >= 0
       && !geneFieldList.some(
@@ -511,6 +585,38 @@ export function initGeneExpressionSelector(options) {
     updateGeneActionButtons();
   }
 
+  function buildGeneOption({ field, originalIdx }) {
+    const item = ownerDocument.createElement('div');
+    item.className = 'dropdown-item';
+    item.setAttribute('role', 'option');
+    item.setAttribute('id', `${geneOptionIdPrefix}-${originalIdx}`);
+    item.setAttribute('aria-selected', 'false');
+    if (originalIdx === selectedGeneOriginalIdx) {
+      item.classList.add('selected');
+    }
+    let label = field.key;
+    if (Object.hasOwn(field, '_originalKey')) {
+      StateValidator.validateFieldKey(field._originalKey);
+      label = `${field.key} *`;
+      item.title = `Original: ${field._originalKey}`;
+    }
+    item.textContent = label;
+    item.dataset.originalIdx = String(originalIdx);
+    return item;
+  }
+
+  /** Append the next page of matches, or every match through `through`. */
+  function renderMoreGeneResults(through = renderedGeneResults + GENE_OPTION_PAGE - 1) {
+    const end = Math.min(geneResults.length, through + 1);
+    if (end <= renderedGeneResults) return;
+    const fragment = ownerDocument.createDocumentFragment();
+    for (let index = renderedGeneResults; index < end; index++) {
+      fragment.appendChild(buildGeneOption(geneResults[index]));
+    }
+    geneDropdown.appendChild(fragment);
+    renderedGeneResults = end;
+  }
+
   function renderGeneDropdownResults(query) {
     assertAlive();
     if (typeof query !== 'string') {
@@ -519,17 +625,21 @@ export function initGeneExpressionSelector(options) {
     const normalizedQuery = query.toLowerCase().trim();
     const filtered = normalizedQuery.length === 0
       ? geneFieldList
-      : geneFieldList.filter(({ field }) => (
-          field.key.toLowerCase().includes(normalizedQuery)
+      : geneFieldList.filter((_entry, index) => (
+          geneSearchKeys[index].includes(normalizedQuery)
         ));
     const fragment = ownerDocument.createDocumentFragment();
-    const results = filtered.slice(0, 100);
+    geneResults = filtered;
+    renderedGeneResults = 0;
+    // A new search starts at the top; a list left scrolled from an earlier,
+    // longer search would otherwise build its next page unasked.
+    geneDropdown.scrollTop = 0;
 
-    if (results.length === 0) {
+    if (filtered.length === 0) {
       const noResults = ownerDocument.createElement('div');
       if (normalizedQuery.length === 0) {
         noResults.className = 'dropdown-no-results';
-        noResults.textContent = 'Type to search genes...';
+        noResults.textContent = 'Type to search genes…';
         geneSearchStatus.textContent = '';
       } else {
         noResults.className = 'dropdown-no-results text-left';
@@ -562,44 +672,22 @@ export function initGeneExpressionSelector(options) {
       fragment.appendChild(noResults);
     } else {
       geneSearchStatus.textContent = '';
-      for (const { field, originalIdx } of results) {
-        const item = ownerDocument.createElement('div');
-        item.className = 'dropdown-item';
-        if (originalIdx === selectedGeneOriginalIdx) {
-          item.classList.add('selected');
-        }
-        let label = field.key;
-        if (Object.hasOwn(field, '_originalKey')) {
-          StateValidator.validateFieldKey(field._originalKey);
-          label = `${field.key} *`;
-          item.title = `Original: ${field._originalKey}`;
-        }
-        item.textContent = label;
-        item.dataset.originalIdx = String(originalIdx);
-        item.addEventListener('click', () => {
-          reportGeneSelectionFailure(selectGene(originalIdx), field.key);
-        }, { signal: lifecycle.signal });
-        fragment.appendChild(item);
-      }
-      if (filtered.length > 100) {
-        const more = ownerDocument.createElement('div');
-        more.className = 'dropdown-no-results';
-        more.textContent = (
-          `...and ${filtered.length - 100} more. Type to narrow results.`
-        );
-        fragment.appendChild(more);
-      }
     }
     geneDropdown.replaceChildren(fragment);
+    if (filtered.length > 0) renderMoreGeneResults();
+    setActiveGeneOption(-1);
   }
 
   function showGeneDropdown() {
     renderGeneDropdownResults(geneSearch.value);
-    geneDropdown.classList.add('visible');
+    geneDropdown.hidden = false;
+    geneSearch.setAttribute('aria-expanded', 'true');
   }
 
   function hideGeneDropdown() {
-    geneDropdown.classList.remove('visible');
+    geneDropdown.hidden = true;
+    geneSearch.setAttribute('aria-expanded', 'false');
+    setActiveGeneOption(-1);
   }
 
   function findGeneEntry(originalIdx) {
@@ -661,6 +749,9 @@ export function initGeneExpressionSelector(options) {
     const datasetGeneration = readDatasetGeneration();
     return interactionOwner.run(async token => {
       const { field, originalIdx: index } = findGeneEntry(originalIdx);
+      // A prefetch of this gene is shared by the load below; one of another
+      // gene is no longer wanted.
+      if (genePrefetch.current() !== index) cancelGenePrefetch();
       hideGeneDropdown();
       selectedGeneOriginalIdx = index;
       categoricalSelect.value = noneFieldValue;
@@ -670,7 +761,8 @@ export function initGeneExpressionSelector(options) {
       callbacks.onBusyChanged(true);
       try {
         await state.ensureVarFieldLoaded(index, {
-          signal: token.signal
+          signal: token.signal,
+          priority: 'high'
         });
         interactionOwner.assertCurrent(token);
         if (
@@ -818,14 +910,47 @@ export function initGeneExpressionSelector(options) {
     );
   }, { signal: lifecycle.signal });
 
+  geneDropdown.addEventListener('scroll', () => {
+    if (renderedGeneResults >= geneResults.length) return;
+    const first = geneDropdown.firstElementChild;
+    const rowHeight = first instanceof view.HTMLElement && first.offsetHeight > 0
+      ? first.offsetHeight
+      : 24;
+    if (
+      geneDropdown.scrollTop + geneDropdown.clientHeight
+      >= geneDropdown.scrollHeight - 2 * rowHeight
+    ) {
+      renderMoreGeneResults();
+    }
+  }, { signal: lifecycle.signal });
+
+  geneDropdown.addEventListener('pointerover', (event) => {
+    const item = event.target instanceof view.Element
+      ? event.target.closest('.dropdown-item[data-original-idx]')
+      : null;
+    if (item === null || !geneDropdown.contains(item)) return;
+    scheduleGenePrefetch(Number(item.dataset.originalIdx));
+  }, { signal: lifecycle.signal });
+
+  // Options carry no listeners: the list handles the click.
+  geneDropdown.addEventListener('click', (event) => {
+    const item = event.target instanceof view.Element
+      ? event.target.closest('.dropdown-item[data-original-idx]')
+      : null;
+    if (item === null || !geneDropdown.contains(item)) return;
+    const entry = findGeneEntry(Number(item.dataset.originalIdx));
+    reportGeneSelectionFailure(selectGene(entry.originalIdx), entry.field.key);
+  }, { signal: lifecycle.signal });
+
   geneSearch.addEventListener('focus', () => {
     geneSearch.select();
     showGeneDropdown();
   }, { signal: lifecycle.signal });
   geneSearch.addEventListener('input', () => {
     renderGeneDropdownResults(geneSearch.value);
-    if (!geneDropdown.classList.contains('visible')) {
-      geneDropdown.classList.add('visible');
+    if (geneDropdown.hidden) {
+      geneDropdown.hidden = false;
+      geneSearch.setAttribute('aria-expanded', 'true');
     }
   }, { signal: lifecycle.signal });
   geneSearch.addEventListener('keydown', (event) => {
@@ -834,14 +959,36 @@ export function initGeneExpressionSelector(options) {
       geneSearch.blur();
       return;
     }
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      event.preventDefault();
+      if (geneDropdown.hidden) {
+        showGeneDropdown();
+      }
+      const step = event.key === 'ArrowDown' ? 1 : -1;
+      // ArrowUp with nothing active wraps to the last match, not the last
+      // built option.
+      const start = activeGeneOptionIndex < 0 && step < 0
+        ? geneResults.length
+        : activeGeneOptionIndex;
+      setActiveGeneOption(Math.max(0, start + step));
+      return;
+    }
+    if ((event.key === 'Home' || event.key === 'End') && !geneDropdown.hidden && geneResults.length > 0) {
+      event.preventDefault();
+      setActiveGeneOption(event.key === 'Home' ? 0 : geneResults.length - 1);
+      return;
+    }
     if (event.key !== 'Enter') return;
-    const firstItem = geneDropdown.querySelector('.dropdown-item');
-    if (firstItem === null) return;
-    if (!(firstItem instanceof view.HTMLElement)) {
+    // Enter chooses the active option; with none active it chooses the best
+    // (first) match for what was typed.
+    const chosenItem = geneOptions()[Math.max(0, activeGeneOptionIndex)] ?? null;
+    if (chosenItem === null) return;
+    if (!(chosenItem instanceof view.HTMLElement)) {
       throw new TypeError('Gene dropdown item must be an HTMLElement');
     }
+    event.preventDefault?.();
     const originalIdx = parseIndex(
-      firstItem.dataset.originalIdx,
+      chosenItem.dataset.originalIdx,
       'Gene dropdown index'
     );
     reportGeneSelectionFailure(
@@ -868,6 +1015,7 @@ export function initGeneExpressionSelector(options) {
 
   function destroy() {
     if (destroyed) return;
+    cancelGenePrefetch();
     destroyed = true;
     lifecycle.abort();
     geneDropdown.replaceChildren();

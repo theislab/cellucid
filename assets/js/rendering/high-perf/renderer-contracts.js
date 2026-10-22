@@ -7,8 +7,13 @@
  * it depends on neither.
  */
 
+import {
+  describeShaderQualities,
+  SHADER_QUALITIES,
+} from '../shader-quality.js';
+
 const SUPPORTED_DIMENSION_LEVELS = new Set([1, 2, 3]);
-const SUPPORTED_SHADER_QUALITIES = new Set(['full', 'light', 'ultralight']);
+const SUPPORTED_SHADER_QUALITIES = new Set(SHADER_QUALITIES);
 const REQUIRED_RENDER_SCALAR_KEYS = Object.freeze([
   'pointSize',
   'sizeAttenuation',
@@ -47,7 +52,7 @@ function requireViewId(value, owner = 'Renderer viewId') {
 function requireShaderQuality(value, owner = 'Renderer quality') {
   if (!SUPPORTED_SHADER_QUALITIES.has(value)) {
     throw new RangeError(
-      `${owner} must be exactly "full", "light", or "ultralight"; received ${String(value)}.`
+      `${owner} must be exactly ${describeShaderQualities()}; received ${String(value)}.`
     );
   }
   return value;
@@ -115,7 +120,14 @@ function requireRenderContract(params, snapshotId = null) {
       );
     }
   }
-  for (const key of REQUIRED_RENDER_SCALAR_KEYS) {
+  // Indexed, like the vector loop above: this runs for every pane of every
+  // frame, and an array iterator is a per-call allocation.
+  for (
+    let index = 0;
+    index < REQUIRED_RENDER_SCALAR_KEYS.length;
+    index++
+  ) {
+    const key = REQUIRED_RENDER_SCALAR_KEYS[index];
     const value = params[key];
     if (!Number.isFinite(value)) {
       throw new TypeError(
@@ -136,6 +148,16 @@ function requireRenderContract(params, snapshotId = null) {
   if (typeof params.useAlphaTexture !== 'boolean') {
     throw new TypeError(
       `${getRenderContractOwner(snapshotId)} useAlphaTexture must be a boolean.`
+    );
+  }
+  // Optional: whether the pass draws into a multisampled target. Absent means
+  // single-sampled, which is what a caller that never multisamples draws into.
+  if (
+    params.multisampled !== undefined &&
+    typeof params.multisampled !== 'boolean'
+  ) {
+    throw new TypeError(
+      `${getRenderContractOwner(snapshotId)} multisampled must be a boolean when given.`
     );
   }
   if (!SUPPORTED_SHADER_QUALITIES.has(params.quality)) {
@@ -162,16 +184,21 @@ function requireRenderContract(params, snapshotId = null) {
 function requireSnapshotPointData(
   pointCount,
   positions,
+  dimensionLevel,
   colors,
   alphas,
   owner
 ) {
+  const dimension = requireDimensionLevel(
+    dimensionLevel,
+    `${owner} dimensionLevel`
+  );
   if (
     !(positions instanceof Float32Array) ||
-    positions.length !== pointCount * 3
+    positions.length !== pointCount * dimension
   ) {
     throw new TypeError(
-      `${owner} positions must be a Float32Array with exactly ${pointCount * 3} values.`
+      `${owner} positions must be a Float32Array with exactly ${pointCount * dimension} values (${dimension} per point).`
     );
   }
   if (!(colors instanceof Uint8Array) || colors.length !== pointCount * 4) {
@@ -181,11 +208,11 @@ function requireSnapshotPointData(
   }
   if (alphas !== null) {
     if (
-      !(alphas instanceof Float32Array) ||
+      !(alphas instanceof Uint8Array) ||
       alphas.length !== pointCount
     ) {
       throw new TypeError(
-        `${owner} alpha values must be null or a Float32Array with exactly ${pointCount} entries.`
+        `${owner} alpha values must be null or a Uint8Array with exactly ${pointCount} entries.`
       );
     }
   }
@@ -211,30 +238,14 @@ function requireSnapshotColors(pointCount, colors, owner) {
 
 function requireSnapshotAlphas(pointCount, alphas, owner) {
   if (
-    !(alphas instanceof Float32Array) ||
+    !(alphas instanceof Uint8Array) ||
     alphas.length !== pointCount
   ) {
     throw new TypeError(
-      `${owner} alpha values must be a Float32Array with exactly ${pointCount} entries.`
+      `${owner} alpha values must be a Uint8Array with exactly ${pointCount} entries.`
     );
   }
   return alphas;
 }
 
-export {
-  SUPPORTED_DIMENSION_LEVELS,
-  SUPPORTED_SHADER_QUALITIES,
-  REQUIRED_RENDER_SCALAR_KEYS,
-  REQUIRED_RENDER_VECTOR_CONTRACTS,
-  requireDimensionLevel,
-  requireViewId,
-  requireShaderQuality,
-  requireFiniteNumber,
-  requireNumericVector,
-  getRenderContractOwner,
-  hasExactFiniteVector,
-  requireRenderContract,
-  requireSnapshotPointData,
-  requireSnapshotColors,
-  requireSnapshotAlphas,
-};
+export { requireDimensionLevel, requireViewId, requireShaderQuality, requireFiniteNumber, requireNumericVector, requireRenderContract, requireSnapshotPointData, requireSnapshotColors, requireSnapshotAlphas };

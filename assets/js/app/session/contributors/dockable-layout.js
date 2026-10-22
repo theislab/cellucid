@@ -3,7 +3,9 @@
  *
  * Analysis windows are owned by their dedicated contributor. Every serialized
  * accordion uses its stable nonempty DOM id; visible summary copy is never an
- * identity.
+ * identity. The id and the open state are the `<details>`'s; whether the panel
+ * floats, its box and its layer are its frame's, the element the dockable owner
+ * moves (`panelFrame()` in `dockable-accordions.js`).
  *
  * @module session/contributors/dockable-layout
  */
@@ -79,10 +81,26 @@ function readPanelLength(details, property, context) {
 }
 
 /**
+ * The frame the dockable owner floats this panel in.
+ *
+ * @param {object} dockable
+ * @param {HTMLDetailsElement} details
+ * @param {string} context
+ * @returns {HTMLElement}
+ */
+function requirePanelFrame(dockable, details, context) {
+  const frame = dockable.panelFrame(details);
+  if (frame === null || typeof frame !== 'object') {
+    throw new TypeError(`${context} must stand in its dockable panel frame.`);
+  }
+  return frame;
+}
+
+/**
  * The geometry the panel *has*, which is not always the geometry it shows.
  *
- * A floating panel's box is `--pos-x/y/width/height`, set by the dockable owner
- * and read back here. `getBoundingClientRect()` reports what the stylesheet
+ * A floating panel's box is `--pos-x/y/width/height` on its frame, set by the
+ * dockable owner and read back here. `getBoundingClientRect()` reports what the stylesheet
  * finally drew, and the stylesheet overrides that box in two places: a
  * collapsed panel is forced to `height: auto` and a panel wider than the window
  * is capped by `max-width` (`css/components/_accordion.css`). Measuring
@@ -91,15 +109,15 @@ function readPanelLength(details, property, context) {
  * threw away the size it would reopen at, and every save/restore cycle on a
  * narrow window ratcheted a wide panel narrower.
  *
- * @param {HTMLDetailsElement} details
+ * @param {HTMLElement} frame
  * @param {string} context
  */
-function readPanelRect(details, context) {
+function readPanelRect(frame, context) {
   const rect = {
-    left: readPanelLength(details, '--pos-x', `${context} left`),
-    top: readPanelLength(details, '--pos-y', `${context} top`),
-    width: readPanelLength(details, '--pos-width', `${context} width`),
-    height: readPanelLength(details, '--pos-height', `${context} height`)
+    left: readPanelLength(frame, '--pos-x', `${context} left`),
+    top: readPanelLength(frame, '--pos-y', `${context} top`),
+    width: readPanelLength(frame, '--pos-width', `${context} width`),
+    height: readPanelLength(frame, '--pos-height', `${context} height`)
   };
   if (rect.width <= 0 || rect.height <= 0) {
     throw new RangeError(`${context} width and height must be positive.`);
@@ -107,8 +125,8 @@ function readPanelRect(details, context) {
   return rect;
 }
 
-function readPanelLayer(details, context) {
-  const raw = StyleManager.getVariable(details, '--z-layer');
+function readPanelLayer(frame, context) {
+  const raw = StyleManager.getVariable(frame, '--z-layer');
   if (typeof raw !== 'string' || !/^(0|[1-9]\d*)$/.test(raw)) {
     throw new TypeError(`${context} must have an exact non-negative integer z layer.`);
   }
@@ -147,6 +165,7 @@ function getDockableOwner(ctx, operation) {
 
 export function capture(ctx) {
   const dockable = getDockableOwner(ctx, 'capture');
+  requireMethod(dockable, 'panelFrame', 'Dockable layout capture owner');
   const floatingRoot = dockable.floatingRoot;
   if (
     floatingRoot === null
@@ -160,7 +179,8 @@ export function capture(ctx) {
   const ids = new Set();
   for (const candidate of floatingRoot.querySelectorAll('details.accordion-section')) {
     const details = assertDetailsElement(candidate, 'Floating accordion');
-    if (!details.classList.contains('accordion-floating')) {
+    const frame = requirePanelFrame(dockable, details, 'Floating accordion');
+    if (!frame.classList.contains('accordion-floating')) {
       throw new TypeError('Every accordion in the floating root must be marked floating.');
     }
     if (isExcluded(details)) continue;
@@ -172,8 +192,8 @@ export function capture(ctx) {
     panels.push({
       id: panelId,
       open: details.open === true,
-      rect: readPanelRect(details, `Floating accordion "${panelId}" geometry`),
-      z: readPanelLayer(details, `Floating accordion "${panelId}"`)
+      rect: readPanelRect(frame, `Floating accordion "${panelId}" geometry`),
+      z: readPanelLayer(frame, `Floating accordion "${panelId}"`)
     });
   }
   panels.sort((a, b) => a.z - b.z || a.id.localeCompare(b.id));
@@ -194,6 +214,7 @@ function applyLayout(ctx, payload) {
   const dockable = getDockableOwner(ctx, 'restore');
   requireMethod(dockable, 'dock', 'Dockable layout restore owner');
   requireMethod(dockable, 'float', 'Dockable layout restore owner');
+  requireMethod(dockable, 'panelFrame', 'Dockable layout restore owner');
   assertExactKeys(payload, ['panels'], 'Dockable layout payload');
   assertArray(payload.panels, 'Dockable layout panels');
 
@@ -246,13 +267,18 @@ function applyLayout(ctx, payload) {
       'Current floating accordion'
     );
     if (isExcluded(details)) continue;
-    if (!details.classList.contains('accordion-floating')) {
+    const frame = requirePanelFrame(
+      dockable,
+      details,
+      'Current floating accordion'
+    );
+    if (!frame.classList.contains('accordion-floating')) {
       throw new TypeError(
         'Every accordion in the floating root must be marked floating.'
       );
     }
     dockable.dock(details);
-    if (details.classList.contains('accordion-floating')) {
+    if (frame.classList.contains('accordion-floating')) {
       throw new Error(
         `Dockable owner failed to dock current panel "${details.id}".`
       );
@@ -268,11 +294,16 @@ function applyLayout(ctx, payload) {
         height: panel.rect.height
       }
     });
-    if (!details.classList.contains('accordion-floating')) {
+    const frame = requirePanelFrame(
+      dockable,
+      details,
+      `Dockable layout panel "${panel.id}"`
+    );
+    if (!frame.classList.contains('accordion-floating')) {
       throw new Error(`Dockable owner failed to float current panel "${panel.id}".`);
     }
     details.open = panel.open;
-    StyleManager.setLayer(details, panel.z);
+    StyleManager.setLayer(frame, panel.z);
   }
 }
 

@@ -6,14 +6,12 @@ import {
 } from '../assets/js/rendering/high-perf-renderer.js';
 import { SpatialIndex } from '../assets/js/rendering/high-perf/spatial-index.js';
 import {
+  buildKnnAdjacency,
   findKnnNeighborsUpToDegree,
   HighlightRenderer,
   HighlightTools,
   resetKnnCache,
 } from '../assets/js/rendering/highlight-renderer.js';
-import {
-  POINT_VISIBILITY_THRESHOLD,
-} from '../assets/js/rendering/alpha-visibility.js';
 
 const FULL_DETAIL_ADMISSION = 0xff;
 const PROJECTED_POINT_COUNT = 30_000_000;
@@ -23,15 +21,14 @@ function makeNestedSpatialIndex({
   order = [5, 1, 7, 0, 3, 6, 2, 4],
 } = {}) {
   const pointCount = order.length;
-  const positions = new Float32Array(pointCount * 3);
+  // Exactly `dimensionLevel` components per point.
+  const positions = new Float32Array(pointCount * dimensionLevel);
   const colors = new Uint8Array(pointCount * 4);
   for (let pointId = 0; pointId < pointCount; pointId++) {
-    const positionOffset = pointId * 3;
-    positions[positionOffset] = pointId;
-    positions[positionOffset + 1] = pointId * 2;
-    positions[positionOffset + 2] = dimensionLevel === 3
-      ? pointId * 3
-      : 0;
+    const positionOffset = pointId * dimensionLevel;
+    for (let axis = 0; axis < dimensionLevel; axis++) {
+      positions[positionOffset + axis] = pointId * (axis + 1);
+    }
     colors.fill(255, pointId * 4, pointId * 4 + 4);
   }
 
@@ -41,14 +38,12 @@ function makeNestedSpatialIndex({
     dimensionLevel,
     pointCount,
     1,
-    {
-      buildLOD: false,
-      buildLodNodeMappings: false,
-      computeNodeStats: false,
-    },
+    { buildLOD: false },
   );
+  // The levels are prefixes of the draw order (here an explicit fixture
+  // order, so membership is checked against known sets).
   const hierarchicalOrder = Uint32Array.from(order);
-  spatialIndex._hierarchicalOrder = hierarchicalOrder;
+  spatialIndex.drawOrder = Object.freeze({ indices: hierarchicalOrder, pointCount });
   spatialIndex.lodLevels = [
     {
       depth: 0,
@@ -289,7 +284,10 @@ test('hostile LOD membership construction is atomic and retryable', async t => {
       const repairedOrder = Uint32Array.from([
         5, 1, 7, 0, 3, 6, 2, 4,
       ]);
-      spatialIndex._hierarchicalOrder = repairedOrder;
+      spatialIndex.drawOrder = Object.freeze({
+        indices: repairedOrder,
+        pointCount: spatialIndex.pointCount,
+      });
       spatialIndex.lodLevels[0] = {
         ...spatialIndex.lodLevels[0],
         indices: repairedOrder.subarray(0, 2),
@@ -415,8 +413,9 @@ test('renderer resolves shared and custom LOD membership from exact geometry own
 
 function makeStaleZeroHighlightFixture() {
   const pointCount = 8;
-  const positions = new Float32Array(pointCount * 3);
-  const transparency = new Float32Array(pointCount).fill(1);
+  // These panes publish 2D positions: two components per point.
+  const positions = new Float32Array(pointCount * 2);
+  const transparency = new Uint8Array(pointCount).fill(1);
   const staleBuffers = new Map(
     ['live', 'pane-a', 'pane-b', 'pane-c'].map(
       (viewId, index) => [
@@ -465,6 +464,7 @@ function makeStaleZeroHighlightFixture() {
     bufferData() {
       bufferUploads++;
     },
+    bufferSubData() {},
     drawArrays() {
       drawCalls++;
     },
@@ -592,15 +592,6 @@ test('zero highlights clear stale pane counts without requesting or allocating L
   assert.equal(fixture.drawCalls, 0);
 });
 
-function nextFloat32(value, direction) {
-  const buffer = new ArrayBuffer(4);
-  const floats = new Float32Array(buffer);
-  const words = new Uint32Array(buffer);
-  floats[0] = Math.fround(value);
-  words[0] += direction;
-  return floats[0];
-}
-
 function makeMembershipDescriptor({
   admittedIds,
   dimensionLevel,
@@ -658,36 +649,40 @@ function makeHighlightPublicationFixture() {
     positions[offset + 1] = 100 + pointId;
     positions[offset + 2] = 200 + pointId;
   }
-  const threshold = POINT_VISIBILITY_THRESHOLD;
-  const transparency = new Float32Array(pointCount).fill(1);
-  transparency[1] = threshold;
-  transparency[2] = nextFloat32(threshold, -1);
-  transparency[3] = nextFloat32(threshold, 1);
+  // The same cells' 2D embedding: two components per point.
+  const positions2D = new Float32Array(pointCount * 2);
+  for (let pointId = 0; pointId < pointCount; pointId++) {
+    positions2D[pointId * 2] = pointId;
+    positions2D[pointId * 2 + 1] = 100 + pointId;
+  }
+  const transparency = new Uint8Array(pointCount).fill(1);
+  transparency[2] = 0;
 
   const memberships = {
-    dimension2: makeMembershipDescriptor({
+    dimension3: makeMembershipDescriptor({
       admittedIds: [1, 2, 3],
-      dimensionLevel: 2,
-      label: 'dimension-2',
+      dimensionLevel: 3,
+      label: 'dimension-3',
       pointCount,
     }),
-    dimension3A: makeMembershipDescriptor({
+    dimension2A: makeMembershipDescriptor({
       admittedIds: [4],
-      dimensionLevel: 3,
-      label: 'dimension-3-a',
+      dimensionLevel: 2,
+      label: 'dimension-2-a',
       pointCount,
     }),
-    dimension3B: makeMembershipDescriptor({
+    dimension2B: makeMembershipDescriptor({
       admittedIds: [3],
-      dimensionLevel: 3,
-      label: 'dimension-3-b',
+      dimensionLevel: 2,
+      label: 'dimension-2-b',
       pointCount,
     }),
   };
-  let activeMembership = memberships.dimension2;
+  let activeMembership = memberships.dimension3;
   let geometryGeneration = 7;
   let legacyVisibilityCalls = 0;
   const uploads = [];
+  let store = null;
   const gl = {
     ARRAY_BUFFER: 0x8892,
     DYNAMIC_DRAW: 0x88e8,
@@ -708,18 +703,21 @@ function makeHighlightPublicationFixture() {
     getError() {
       return this.NO_ERROR;
     },
-    bufferData(target, source, usage) {
+    bufferData(target, byteLength, usage) {
+      // Each publication sizes the store, then fills it chunk by chunk.
       assert.equal(target, this.ARRAY_BUFFER);
+      assert.equal(typeof byteLength, 'number');
       assert.equal(usage, this.DYNAMIC_DRAW);
-      const sourceBytes = source instanceof ArrayBuffer
-        ? new Uint8Array(source)
-        : new Uint8Array(
-            source.buffer,
-            source.byteOffset,
-            source.byteLength,
-          );
-      const copied = sourceBytes.slice();
-      const packed = new Float32Array(copied.buffer);
+      store = new Uint8Array(byteLength);
+      uploads.push([]);
+    },
+    bufferSubData(target, offset, source, sourceOffset, length) {
+      assert.equal(target, this.ARRAY_BUFFER);
+      store.set(
+        new Uint8Array(source.buffer, source.byteOffset + sourceOffset, length),
+        offset,
+      );
+      const packed = new Float32Array(store.slice().buffer);
       const packedPositions = [];
       for (
         let floatOffset = 0;
@@ -732,7 +730,7 @@ function makeHighlightPublicationFixture() {
           packed[floatOffset + 2],
         ]);
       }
-      uploads.push(packedPositions);
+      uploads[uploads.length - 1] = packedPositions;
     },
     vertexAttribPointer() {},
   };
@@ -815,6 +813,7 @@ function makeHighlightPublicationFixture() {
     memberships,
     pointCount,
     positions,
+    positions2D,
     tools,
     transparency,
     uploads,
@@ -823,22 +822,23 @@ function makeHighlightPublicationFixture() {
 
 test('highlight publication keys exact geometry, dimension, and membership while preserving the R8 alpha boundary', () => {
   const fixture = makeHighlightPublicationFixture();
+  // A view's positions carry exactly its dimension's components.
   const sync = dimensionLevel =>
     fixture.tools.syncHighlightBufferForLod(
-      fixture.positions,
+      dimensionLevel === 2 ? fixture.positions2D : fixture.positions,
       'live',
       fixture.transparency,
       dimensionLevel,
     );
 
-  sync(2);
+  sync(3);
   assert.deepEqual(
     fixture.uploads.shift(),
     [
       [1, 101, 201],
       [3, 103, 203],
     ],
-    'alpha immediately below the first R8-visible Float32 must be excluded',
+    'a hidden cell (transparency 0) must be excluded',
   );
   assert.equal(
     fixture.legacyVisibilityCalls,
@@ -846,7 +846,7 @@ test('highlight publication keys exact geometry, dimension, and membership while
     'highlight rendering must not request a dense LOD mask',
   );
 
-  sync(2);
+  sync(3);
   assert.equal(
     fixture.uploads.length,
     0,
@@ -864,7 +864,7 @@ test('highlight publication keys exact geometry, dimension, and membership while
     'the adversarial same-reference mutation must evade both retired sparse hashes',
   );
   fixture.generation = 8;
-  sync(2);
+  sync(3);
   assert.deepEqual(
     fixture.uploads.shift(),
     [
@@ -874,34 +874,35 @@ test('highlight publication keys exact geometry, dimension, and membership while
     'an exact geometry generation change must republish unsampled coordinates',
   );
 
-  sync(2);
+  sync(3);
   assert.equal(fixture.uploads.length, 0);
 
-  fixture.membership = fixture.memberships.dimension3A;
-  sync(3);
+  fixture.membership = fixture.memberships.dimension2A;
+  sync(2);
   assert.deepEqual(
     fixture.uploads.shift(),
-    [[4, 104, 204]],
-    'dimension is part of the exact membership cache key',
+    [[4, 104, 0]],
+    'dimension is part of the exact membership cache key; a 2D view packs z = 0',
   );
 
-  fixture.membership = fixture.memberships.dimension3B;
-  sync(3);
+  fixture.membership = fixture.memberships.dimension2B;
+  sync(2);
   assert.deepEqual(
     fixture.uploads.shift(),
-    [[3, 103, 203]],
+    [[3, 103, 0]],
     'a replacement spatial owner must invalidate the same numeric LOD',
   );
   assert.equal(fixture.uploads.length, 0);
 });
 
 test('transparency publication exactly retires same-reference KNN paths', () => {
-  const adjacency = new Map([
-    [0, Uint32Array.from([1])],
-    [1, Uint32Array.from([0, 2])],
-    [2, Uint32Array.from([1])],
-  ]);
-  const transparency = Float32Array.from([1, 1, 1]);
+  // Edges 0-1 and 1-2.
+  const adjacency = buildKnnAdjacency(
+    Uint32Array.from([0, 1]),
+    Uint32Array.from([1, 2]),
+    3,
+  );
+  const transparency = Uint8Array.from([1, 1, 1]);
   resetKnnCache();
   assert.deepEqual(
     [...findKnnNeighborsUpToDegree(
@@ -937,6 +938,7 @@ test('transparency publication exactly retires same-reference KNN paths', () => 
 });
 
 function makeHighlightUploadFailureFixture() {
+  const subUploads = [];
   const errors = [];
   const createdBuffers = [];
   const createdVertexArrays = [];
@@ -982,12 +984,12 @@ function makeHighlightUploadFailureFixture() {
     },
     bindBuffer() {},
     bindVertexArray() {},
-    bufferData(target, data, usage, sourceOffset) {
+    bufferData(target, data, usage) {
       uploadAttempts++;
       uploadContracts.push({
         argumentCount: arguments.length,
         data,
-        sourceOffset,
+        errorsPendingAtSubData: null,
         target,
         usage,
       });
@@ -995,6 +997,11 @@ function makeHighlightUploadFailureFixture() {
         failNextUpload = false;
         errors.push(this.OUT_OF_MEMORY);
       }
+    },
+    bufferSubData(target, offset, source, sourceOffset, length) {
+      // A chunk may only be written once the sizing call was validated.
+      assert.equal(errors.length, 0);
+      subUploads.push({ length, offset, source, sourceOffset, target });
     },
     deleteBuffer(buffer) {
       deletedBuffers.push(buffer);
@@ -1061,12 +1068,16 @@ function makeHighlightUploadFailureFixture() {
       return uploadAttempts;
     },
     renderer,
+    subUploads,
     uploadContracts,
   };
 }
 
-function publishSingleHighlight(renderer, geometryGeneration) {
-  const highlightData = Uint8Array.from([255, 0]);
+// `cellCount` highlighted cells of two. A publication can only be refused for
+// memory when it asks for more than the buffer has already been verified to
+// hold, so the replacement-failure cases grow the selection.
+function publishSingleHighlight(renderer, geometryGeneration, cellCount = 1) {
+  const highlightData = Uint8Array.from(cellCount === 2 ? [255, 255] : [255, 0]);
   const positions = Float32Array.from([
     geometryGeneration,
     2,
@@ -1075,7 +1086,7 @@ function publishSingleHighlight(renderer, geometryGeneration) {
     5,
     6,
   ]);
-  const transparency = Float32Array.from([1, 1]);
+  const transparency = Uint8Array.from([1, 1]);
   renderer.rebuildBuffer(
     highlightData,
     positions,
@@ -1083,7 +1094,7 @@ function publishSingleHighlight(renderer, geometryGeneration) {
     'live',
     transparency,
     geometryGeneration,
-    2,
+    3,
     0,
   );
 }
@@ -1142,7 +1153,7 @@ test('highlight upload OOM never certifies a failed new or replacement buffer', 
     retainedRecord.highlightGeneration;
   replacementFailure.failNextUpload();
   assert.throws(
-    () => publishSingleHighlight(replacementFailure.renderer, 2),
+    () => publishSingleHighlight(replacementFailure.renderer, 2, 2),
     /0x505/,
   );
   assert.equal(retainedRecord.buffer, retainedBuffer);
@@ -1169,16 +1180,47 @@ test('highlight upload OOM never certifies a failed new or replacement buffer', 
     true,
   );
 
-  publishSingleHighlight(replacementFailure.renderer, 2);
+  publishSingleHighlight(replacementFailure.renderer, 2, 2);
   assert.equal(retainedRecord.buffer, retainedBuffer);
   assert.equal(retainedRecord.vertexArray, retainedVertexArray);
   assert.equal(retainedRecord.geometryGeneration, 2);
-  assert.equal(retainedRecord.pointCount, 1);
+  assert.equal(retainedRecord.pointCount, 2);
   assert.equal(replacementFailure.createdBuffers.length, 1);
   assert.equal(replacementFailure.createdVertexArrays.length, 1);
 });
 
-test('highlight upload selects the preserving WebGL2 view overload and configures its VAO once', () => {
+test('highlight republication at a verified size never drains the GL error queue', () => {
+  // `getError()` waits for every queued GPU command, including the previous
+  // frame's point draws. A republication that fits a store WebGL has already
+  // accepted for this buffer cannot be refused for memory, so it must not pay
+  // that round trip; a first allocation and any growth must.
+  const fixture = makeHighlightUploadFailureFixture();
+  const gl = fixture.renderer.gl;
+  const drainErrors = gl.getError;
+  let errorReads = 0;
+  gl.getError = function getError() {
+    errorReads++;
+    return drainErrors.call(this);
+  };
+
+  publishSingleHighlight(fixture.renderer, 1);
+  assert.ok(errorReads > 0, 'the first allocation is verified');
+
+  errorReads = 0;
+  publishSingleHighlight(fixture.renderer, 2);
+  assert.equal(errorReads, 0, 'same-size republication');
+
+  errorReads = 0;
+  publishSingleHighlight(fixture.renderer, 3, 2);
+  assert.ok(errorReads > 0, 'growth beyond the verified size is verified');
+
+  errorReads = 0;
+  publishSingleHighlight(fixture.renderer, 4);
+  assert.equal(errorReads, 0, 'shrinking below the verified size');
+  assert.equal(fixture.renderer._viewBuffers.get('live').pointCount, 1);
+});
+
+test('highlight upload sizes the store, validates it, then fills it, and configures its VAO once', () => {
   const fixture = makeHighlightUploadFailureFixture();
 
   publishSingleHighlight(fixture.renderer, 1);
@@ -1204,14 +1246,24 @@ test('highlight upload selects the preserving WebGL2 view overload and configure
   );
   assert.equal(fixture.uploadContracts.length, 2);
   for (const upload of fixture.uploadContracts) {
-    assert.equal(upload.argumentCount, 4);
+    assert.equal(upload.argumentCount, 3);
     assert.equal(upload.target, 0x8892);
     assert.equal(upload.usage, 0x88e8);
-    assert.equal(upload.sourceOffset, 0);
-    assert.ok(upload.data instanceof Uint8Array);
-    assert.equal(upload.data.byteOffset, 0);
-    assert.equal(upload.data.byteLength, upload.data.buffer.byteLength);
+    assert.equal(upload.data, 16, 'one highlighted cell sizes a 16-byte store');
   }
+  assert.equal(fixture.subUploads.length, 2);
+  for (const upload of fixture.subUploads) {
+    assert.equal(upload.target, 0x8892);
+    assert.equal(upload.offset, 0);
+    assert.equal(upload.sourceOffset, 0);
+    assert.equal(upload.length, 16);
+    assert.ok(upload.source instanceof Uint8Array);
+  }
+  assert.strictEqual(
+    fixture.subUploads[0].source.buffer,
+    fixture.subUploads[1].source.buffer,
+    'every publication packs through the same fixed staging block',
+  );
 });
 
 test('hostile highlight VAO allocation or configuration retires the complete unpublished pair', () => {
@@ -1293,14 +1345,17 @@ test('highlight upload OOM is fenced per view until one exact semantic generatio
     ['live', 1],
     ['snapshot-1', 1],
   ]);
-  const highlightData = Uint8Array.from([255, 0]);
+  // Both cells are highlighted and one is visible per pane, so the failing
+  // publication below can grow the live pane to two cells: only an allocation
+  // larger than the one the buffer was verified at can be refused for memory.
+  const highlightData = Uint8Array.from([255, 255]);
   const positionsByView = new Map([
     ['live', Float32Array.from([1, 2, 3, 4, 5, 6])],
     ['snapshot-1', Float32Array.from([7, 8, 9, 10, 11, 12])],
   ]);
   const transparencyByView = new Map([
-    ['live', Float32Array.from([1, 1])],
-    ['snapshot-1', Float32Array.from([1, 1])],
+    ['live', Uint8Array.from([1, 0])],
+    ['snapshot-1', Uint8Array.from([1, 0])],
   ]);
   const tools = Object.assign(
     Object.create(HighlightTools.prototype),
@@ -1326,7 +1381,7 @@ test('highlight upload OOM is fenced per view until one exact semantic generatio
     positionsByView.get(viewId),
     viewId,
     transparencyByView.get(viewId),
-    2,
+    3,
   );
 
   sync('live');
@@ -1338,6 +1393,7 @@ test('highlight upload OOM is fenced per view until one exact semantic generatio
 
   geometryGenerations.set('live', 2);
   geometryGenerations.set('snapshot-1', 2);
+  transparencyByView.set('live', Uint8Array.from([1, 1]));
   fixture.failNextUpload();
   assert.throws(() => sync('live'), /0x505/);
   assert.equal(fixture.uploadAttempts, 3);
@@ -1354,7 +1410,7 @@ test('highlight upload OOM is fenced per view until one exact semantic generatio
     'the other pane remains published while the failed pane is suppressed',
   );
   assert.equal(
-    fixture.renderer.needsRefresh(null, 'live', 2, 2, 0),
+    fixture.renderer.needsRefresh(null, 'live', 2, 3, 0),
     false,
     'the exact failed generation must not allocate again on the next RAF',
   );
@@ -1379,16 +1435,16 @@ test('highlight upload OOM is fenced per view until one exact semantic generatio
   assert.equal(retainedLiveRecord.geometryGeneration, 3);
   assert.equal(retainedLiveRecord.failedPublication, null);
   assert.equal(retainedLiveRecord.buffer, retainedLiveBuffer);
-  assert.equal(retainedLiveRecord.pointCount, 1);
+  assert.equal(retainedLiveRecord.pointCount, 2);
 });
 
-test('CPU highlight source allocation failure preserves the accepted generation without per-frame retries', {
+test('highlight republication allocates no client store proportional to the selection', {
   concurrency: false,
 }, () => {
   const fixture = makeHighlightUploadFailureFixture();
   const geometryGenerations = new Map([['live', 1]]);
   const positions = Float32Array.from([1, 2, 3, 4, 5, 6]);
-  const transparency = Float32Array.from([1, 1]);
+  const transparency = Uint8Array.from([1, 1]);
   const tools = Object.assign(
     Object.create(HighlightTools.prototype),
     {
@@ -1410,48 +1466,30 @@ test('CPU highlight source allocation failure preserves the accepted generation 
     positions,
     'live',
     transparency,
-    2,
+    3,
   );
 
   sync();
-  const acceptedRecord = fixture.renderer._viewBuffers.get('live');
-  const acceptedBuffer = acceptedRecord.buffer;
   assert.equal(fixture.uploadAttempts, 1);
 
   geometryGenerations.set('live', 2);
   const NativeArrayBuffer = globalThis.ArrayBuffer;
   let sourceAllocationAttempts = 0;
   globalThis.ArrayBuffer = class HostileHighlightArrayBuffer {
-    constructor(byteLength) {
+    constructor() {
       sourceAllocationAttempts++;
-      if (byteLength === 16) {
-        throw new RangeError('synthetic highlight source allocation failure');
-      }
-      return new NativeArrayBuffer(byteLength);
+      throw new RangeError('synthetic highlight source allocation');
     }
   };
   try {
-    assert.throws(sync, /synthetic highlight source allocation failure/);
+    sync();
   } finally {
     globalThis.ArrayBuffer = NativeArrayBuffer;
   }
 
-  assert.equal(sourceAllocationAttempts, 1);
-  assert.equal(fixture.uploadAttempts, 1);
-  assert.equal(acceptedRecord.buffer, acceptedBuffer);
-  assert.equal(acceptedRecord.geometryGeneration, 1);
-  assert.equal(
-    fixture.renderer.needsRefresh(null, 'live', 2, 2, 0),
-    false,
-  );
-
-  assert.doesNotThrow(sync);
-  assert.equal(fixture.uploadAttempts, 1);
-  assert.equal(acceptedRecord.geometryGeneration, 1);
-
-  geometryGenerations.set('live', 3);
-  assert.doesNotThrow(sync);
+  assert.equal(sourceAllocationAttempts, 0);
   assert.equal(fixture.uploadAttempts, 2);
-  assert.equal(acceptedRecord.geometryGeneration, 3);
-  assert.equal(acceptedRecord.failedPublication, null);
+  const accepted = fixture.renderer._viewBuffers.get('live');
+  assert.equal(accepted.geometryGeneration, 2);
+  assert.equal(accepted.failedPublication, null);
 });

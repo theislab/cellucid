@@ -1,9 +1,11 @@
+import './helpers/anndata-reader-in-process.mjs';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { BaseAnnDataAdapter } from '../assets/js/data/base-anndata-adapter.js';
 import { H5adDataSource } from '../assets/js/data/h5ad.js';
 import { ZarrDataSource } from '../assets/js/data/zarr.js';
+import { connectivityEdgesOf } from '../assets/js/data/sparse-utils.js';
 
 const isAbortError = error => error?.name === 'AbortError';
 
@@ -56,9 +58,10 @@ async function settleBackgroundWork() {
  * One dense ring graph behind a gated loader read.
  *
  * The connectivity payload is exposed through a getter, so the scenario counts
- * every read of the matrix. Only the adapter's edge-extraction stage reads it,
- * which makes a non-zero count after a cancellation exact proof that the
- * extraction kept running for a caller that had already walked away.
+ * every read of the matrix. The reader extracts the edges where it holds the
+ * matrix (the AnnData reader worker in the browser), off the page, so a read
+ * already under way finishes there; what cancellation owes the page is that
+ * nothing is published and nothing is left in flight.
  */
 function createGatedConnectivityLoader(nCells = 6) {
   const matrix = new Float32Array(nCells * nCells);
@@ -79,7 +82,10 @@ function createGatedConnectivityLoader(nCells = 6) {
     hasExpressionMatrix: false,
     clearCache() {},
     close() {},
-    async getConnectivities() {
+    async getConnectivityEdges() {
+      return connectivityEdgesOf(await this.readConnectivityMatrix(), this.nObs);
+    },
+    async readConnectivityMatrix() {
       const gate = deferred();
       state.gates.push(gate);
       state.loaderCalls++;
@@ -115,7 +121,7 @@ function createGatedConnectivityLoader(nCells = 6) {
 }
 
 test(
-  'cancelling a connectivity request stops the extraction instead of only the wait',
+  'a cancelled connectivity request publishes nothing and leaves nothing in flight',
   async () => {
     const scenario = createGatedConnectivityLoader();
     const adapter = new BaseAnnDataAdapter(scenario.loader);
@@ -144,19 +150,13 @@ test(
       `expected an AbortError, received ${String(outcome.reason)}`
     );
 
-    // The loader read the caller no longer wants still completes: the
-    // extraction that follows it is the work cancellation has to stop.
+    // The reader's read and extraction, off the page, still complete.
     scenario.openGate();
     await settleBackgroundWork();
 
     assert.equal(
-      scenario.state.matrixReads,
-      0,
-      'cancelled connectivity work must never reach the edge extraction'
-    );
-    assert.equal(
-      adapter._connectivityCache,
-      undefined,
+      adapter._connectivityCache.has('connectivities'),
+      false,
       'a cancelled extraction must publish no adapter payload'
     );
     assert.equal(
@@ -188,7 +188,7 @@ test(
       'a pre-cancelled request must not start loader work'
     );
     assert.equal(scenario.state.matrixReads, 0);
-    assert.equal(adapter._connectivityCache, undefined);
+    assert.equal(adapter._connectivityCache.has('connectivities'), false);
     assert.equal(adapter._connectivityInFlight.size, 0);
   }
 );
@@ -213,7 +213,7 @@ test(
       scenario.state.matrixReads > 0,
       'a completed request must run the extraction'
     );
-    assert.notEqual(adapter._connectivityCache, undefined);
+    assert.equal(adapter._connectivityCache.has('connectivities'), true);
 
     // The warm cache still answers a second request without new loader work.
     const cached = await adapter.getConnectivityEdges({
@@ -255,7 +255,7 @@ test(
     assert.equal(edges.nEdges, scenario.expectedEdges);
     assert.deepEqual(Array.from(edges.sources), [0, 0, 1, 2, 3, 4]);
     assert.deepEqual(Array.from(edges.destinations), [1, 5, 2, 3, 4, 5]);
-    assert.strictEqual(adapter._connectivityCache, edges);
+    assert.strictEqual(adapter._connectivityCache.get('connectivities'), edges);
   }
 );
 
@@ -334,7 +334,7 @@ test(
     assert.equal(outcome.status, 'rejected');
     assert.ok(isAbortError(outcome.reason));
     assert.strictEqual(
-      adapter._connectivityCache,
+      adapter._connectivityCache.get('connectivities'),
       edges,
       'a cancelled read must not disturb the warm cache'
     );
@@ -367,12 +367,8 @@ for (const [label, SourceClass] of [
 
       assert.equal(outcome.status, 'rejected');
       assert.ok(isAbortError(outcome.reason));
-      assert.equal(
-        scenario.state.matrixReads,
-        0,
-        `${label} cancellation must stop the extraction`
-      );
-      assert.equal(adapter._connectivityCache, undefined);
+      assert.equal(adapter._connectivityCache.has('connectivities'), false);
+      assert.equal(adapter._connectivityInFlight.size, 0);
     }
   );
 

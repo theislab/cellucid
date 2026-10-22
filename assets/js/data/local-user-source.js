@@ -9,14 +9,14 @@ import {
   DATA_CONFIG,
   DataSourceError,
   DataSourceErrorCode,
-  MAX_METADATA_JSON_BYTES,
-  MAX_PREPARED_BROWSER_BYTES,
   isLocalUserUrl,
+  identityPayloadCompression,
   validateDatasetIdentity,
   validateVectorFieldsMetadata
 } from './data-source.js';
 import { expandObsManifest, expandVarManifest } from './data-loaders.js';
 import {
+  CATEGORICAL_CODE_DTYPES,
   MAX_CATEGORICAL_CATEGORIES,
   categoricalStorageForDtype,
 } from './categorical-storage-contract.js';
@@ -34,6 +34,7 @@ import {
   waitForMetadata,
 } from './metadata-load-contract.js';
 import { parseEmbeddingMetadata } from './dimension-manager.js';
+import { validateCentroidEmbeddings } from './dataset-generation-contract.js';
 import { isH5adFile, H5adDataSource, createH5adDataSource } from './h5ad.js';
 import { ZarrDataSource, createZarrDataSource } from './zarr.js';
 import { getNotificationCenter } from '../app/notification-center.js';
@@ -42,7 +43,7 @@ import { getNotificationCenter } from '../app/notification-center.js';
  * @typedef {import('./data-source.js').DatasetMetadata} DatasetMetadata
  */
 
-function isZarrZipArchive(file) {
+export function isZarrZipArchive(file) {
   return Boolean(
     file &&
     typeof file.name === 'string' &&
@@ -246,40 +247,7 @@ function checkedPreparedBytes(count, width, label, source) {
       { count, width }
     );
   }
-  const bytes = count * width;
-  if (bytes > MAX_PREPARED_BROWSER_BYTES) {
-    throw preparedTooLargeError(
-      `${label} requires more than the 512 MiB browser working-set limit; use the Cellucid server instead`,
-      source,
-      { bytes, limit: MAX_PREPARED_BROWSER_BYTES }
-    );
-  }
-  return bytes;
-}
-
-function checkedPreparedWorkingSet(parts, label, source) {
-  let total = 0n;
-  for (const part of parts) {
-    if (!Number.isSafeInteger(part) || part < 0) {
-      throw preparedDataError(
-        `${label} has an invalid working-set plan`,
-        source,
-        { parts }
-      );
-    }
-    total += BigInt(part);
-  }
-  if (total > BigInt(MAX_PREPARED_BROWSER_BYTES)) {
-    throw preparedTooLargeError(
-      `${label} working set exceeds the 512 MiB browser limit; use the Cellucid server instead`,
-      source,
-      {
-        bytes: total.toString(),
-        limit: MAX_PREPARED_BROWSER_BYTES,
-      }
-    );
-  }
-  return Number(total);
+  return count * width;
 }
 
 function createPreparedAbortError() {
@@ -445,13 +413,10 @@ function validatePreparedIdentityExportContract(identity, source) {
     'dataset_identity.json export_settings.obs_continuous_quantization',
     source
   );
-  if (
-    settings.obs_categorical_dtype !== 'uint8' &&
-    settings.obs_categorical_dtype !== 'uint16'
-  ) {
+  if (!CATEGORICAL_CODE_DTYPES.includes(settings.obs_categorical_dtype)) {
     throw preparedDataError(
       'dataset_identity.json export_settings.obs_categorical_dtype ' +
-      'must be exactly "uint8" or "uint16".',
+      'must be exactly "uint8", "uint16" or "uint32".',
       source,
       { value: settings.obs_categorical_dtype }
     );
@@ -471,42 +436,32 @@ function getPreparedEmbeddingPlans(identity, compression, source) {
       { cause }
     );
   }
-  if (parsed.pathMapKind !== 'files') {
-    throw preparedDataError(
-      'Prepared dataset embeddings must use the exact files path map.',
-      source
-    );
-  }
 
   return {
     defaultDimension: parsed.defaultDimension,
     nCells,
-    plans: parsed.availableDimensions.map(dimension => {
-      const key = `${dimension}d`;
+    plans: parsed.layouts.map(({ layoutKey, dimension, path }) => {
       const filename = validatePreparedPath(
-        parsed.dimensionFiles[key],
-        `Embedding file for ${dimension}D`,
+        path,
+        `Embedding file for "${layoutKey}"`,
         source
       );
       validatePreparedPathCompression(
         filename,
         compression,
-        `Embedding file for ${dimension}D`,
+        `Embedding file for "${layoutKey}"`,
         source
       );
       return {
+        layoutKey,
         dimension,
         filename,
+        // The decoded embedding is normalized in place and rendered as is,
+        // so its file payload is its whole working set.
         expectedBytes: checkedPreparedBytes(
           nCells,
           dimension * FLOAT32_BYTES,
           filename,
-          source
-        ),
-        paddedBytes: checkedPreparedBytes(
-          nCells,
-          3 * FLOAT32_BYTES,
-          `${filename} padded rendering coordinates`,
           source
         ),
       };
@@ -548,7 +503,7 @@ function validatePreparedPayloadPathUniqueness(
   }
 
   for (const plan of embeddingPlan.plans) {
-    claim(plan.filename, `${plan.dimension}D embedding`);
+    claim(plan.filename, `embedding "${plan.layoutKey}"`);
   }
   for (const field of obsManifest.fields) {
     if (field.kind === 'continuous') {
@@ -589,10 +544,10 @@ function validatePreparedPayloadPathUniqueness(
   for (const [fieldId, field] of Object.entries(
     vectorFields?.fields || {}
   )) {
-    for (const dimension of field.available_dimensions) {
+    for (const [embeddingId, path] of Object.entries(field.files)) {
       claim(
-        field.files[`${dimension}d`],
-        `vector field "${fieldId}" ${dimension}D`
+        path,
+        `vector field "${fieldId}" on "${embeddingId}"`
       );
     }
   }
@@ -602,8 +557,7 @@ function validatePreparedPayloadPathUniqueness(
  * @param {Object} rawManifest
  * @param {Object} identity
  * @param {Object|null} settings - Declared export_settings, or null when the
- *   optional block is absent. `obs_manifest.json` is required, so its own
- *   `compression` is the export's compression either way.
+ *   optional block is absent (the export is then uncompressed).
  * @param {string} source
  */
 function validatePreparedObsManifest(rawManifest, identity, settings, source) {
@@ -655,6 +609,16 @@ function validatePreparedObsManifest(rawManifest, identity, settings, source) {
         manifestCompression: compression,
         exportCompression: settings.compression,
       }
+    );
+  }
+
+  try {
+    validateCentroidEmbeddings(identity, manifest);
+  } catch (cause) {
+    throw preparedDataError(
+      `Invalid obs_manifest.json: ${cause?.message || cause}`,
+      source,
+      { cause }
     );
   }
 
@@ -1256,22 +1220,20 @@ export class LocalUserDirDataSource {
         { filename, size: file.size }
       );
     }
-    if (file.size > MAX_METADATA_JSON_BYTES) {
+    let text;
+    try {
+      text = await file.text();
+    } catch (error) {
+      if (!(error instanceof RangeError)) throw error;
+      // The engine's longest string is the only limit on a metadata file.
       throw preparedTooLargeError(
-        `${filename} exceeds the ${MAX_METADATA_JSON_BYTES}-byte metadata limit`,
+        `${filename} (${file.size.toLocaleString('en-US')} bytes) is longer than ` +
+        'the longest text this browser can hold',
         this.type,
         { filename, size: file.size }
       );
     }
-    const text = await file.text();
     throwIfPreparedAborted(signal);
-    if (text.length > MAX_METADATA_JSON_BYTES) {
-      throw preparedTooLargeError(
-        `${filename} exceeds the ${MAX_METADATA_JSON_BYTES}-character metadata limit`,
-        this.type,
-        { filename, length: text.length }
-      );
-    }
     return text;
   }
 
@@ -1316,13 +1278,6 @@ export class LocalUserDirDataSource {
     if (!Number.isSafeInteger(file.size) || file.size < 0) {
       throw preparedDataError(
         `${filename}: does not report a readable byte length`,
-        this.type,
-        { filename, actualBytes: file.size }
-      );
-    }
-    if (file.size > MAX_PREPARED_BROWSER_BYTES) {
-      throw preparedTooLargeError(
-        `${filename}: compressed or binary file size exceeds the 512 MiB browser limit`,
         this.type,
         { filename, actualBytes: file.size }
       );
@@ -1543,6 +1498,12 @@ export class LocalUserDirDataSource {
           );
         }
 
+        // A length-only scan (no `validateValue`) needs the byte count and
+        // nothing else: decoding every element through a DataView just to
+        // discard it cost a gene payload one function call per cell on top of
+        // its inflate.
+        if (!validateValue) continue;
+
         let bytes = chunk;
         if (carry.byteLength > 0) {
           bytes = new Uint8Array(carry.byteLength + chunk.byteLength);
@@ -1562,16 +1523,17 @@ export class LocalUserDirDataSource {
           offset < completeBytes;
           offset += dtypeInfo.bytes
         ) {
-          const parsed = dtypeInfo.read(values, offset);
-          if (validateValue) {
-            validateValue(parsed, valueIndex);
-          }
+          validateValue(dtypeInfo.read(values, offset), valueIndex);
           valueIndex++;
         }
         carry = bytes.slice(completeBytes);
       }
 
-      if (totalBytes !== expectedBytes || carry.byteLength !== 0) {
+      if (
+        totalBytes !== expectedBytes ||
+        totalBytes % dtypeInfo.bytes !== 0 ||
+        carry.byteLength !== 0
+      ) {
         throw preparedDataError(
           `${filename}: expected ${expectedBytes} bytes, decompressed to ${totalBytes}`,
           this.type,
@@ -1661,9 +1623,9 @@ export class LocalUserDirDataSource {
           this.type
         );
         const codesDtype = field.codesDtype;
-        if (codesDtype !== 'uint8' && codesDtype !== 'uint16') {
+        if (!CATEGORICAL_CODE_DTYPES.includes(codesDtype)) {
           throw preparedDataError(
-            `Observation codes for "${field.key}" must use uint8 or uint16`,
+            `Observation codes for "${field.key}" must use uint8, uint16 or uint32`,
             this.type
           );
         }
@@ -2137,32 +2099,6 @@ export class LocalUserDirDataSource {
       'Connectivity weight array',
       this.type
     );
-    const normalizedIndexBytes = checkedPreparedBytes(
-      manifest.n_edges,
-      Uint32Array.BYTES_PER_ELEMENT,
-      'Connectivity normalized edge arrays',
-      this.type
-    );
-    const degreeBytes = checkedPreparedBytes(
-      manifest.n_cells,
-      Uint32Array.BYTES_PER_ELEMENT,
-      'Connectivity degree summary',
-      this.type
-    );
-    checkedPreparedWorkingSet(
-      [
-        expectedBytes,
-        expectedBytes,
-        normalizedIndexBytes,
-        normalizedIndexBytes,
-        normalizedIndexBytes,
-        normalizedIndexBytes,
-        expectedWeightBytes,
-        degreeBytes,
-      ],
-      'Connectivity edge arrays',
-      this.type
-    );
     if (stats.n_edges !== manifest.n_edges) {
       throw preparedDataError(
         `dataset_identity.json stats.n_edges (${stats.n_edges}) does not match connectivity_manifest.json (${manifest.n_edges})`,
@@ -2296,14 +2232,14 @@ export class LocalUserDirDataSource {
   ) {
     const metadata = identity.vector_fields;
     if (metadata == null) return null;
-    // The shape — exact key sets, dimension ordering, the embeddings subset
-    // rule, one file per advertised dimension, and default_dimension being the
-    // largest advertised one — is owned by validateVectorFieldsMetadata() in
-    // data-source.js, so a local folder and a hosted catalog answer with the
-    // same rule. Only the export-file rules below are specific to reading a
-    // prepared export off disk.
+    // The shape — exact key sets, code-point field order, label equal to the
+    // id, the embeddings subset in item order, and every exact producer path —
+    // is owned by validateVectorFieldsMetadata() in data-source.js, so a local
+    // folder and a hosted catalog answer with the same rule. Only the payload
+    // checks below are specific to reading a prepared export off disk.
     validateVectorFieldsMetadata(metadata, {
-      availableDimensions: identity.embeddings.available_dimensions,
+      embeddingItems: identity.embeddings.items,
+      compression,
       sourceType: this.type,
     });
     if (metadata.default_field === null) {
@@ -2313,65 +2249,22 @@ export class LocalUserDirDataSource {
       );
     }
 
-    // A vector payload filename is the field's integer index, so the index is
-    // taken from the declaration order the producer wrote the fields in.
-    const vectorFieldEntries = Object.entries(metadata.fields);
-    for (
-      let payloadIndex = 0;
-      payloadIndex < vectorFieldEntries.length;
-      payloadIndex++
-    ) {
-      const [fieldId, field] = vectorFieldEntries[payloadIndex];
-      throwIfPreparedAborted(signal);
-      // Both writers derive these two: label is the field id character for
-      // character and basis is always "umap". A vector field id is not a path
-      // component, so it carries no filename rule beyond naming one field.
-      if (field.label !== fieldId || field.basis !== 'umap') {
-        throw preparedDataError(
-          `Invalid vector field "${fieldId}" id, label, or basis ` +
-          'in dataset_identity.json.',
-          this.type
-        );
-      }
-      const dimensions = field.available_dimensions;
-      for (const dimension of dimensions) {
-        const filename = validatePreparedPath(
-          field.files[`${dimension}d`],
-          `Vector field "${fieldId}" ${dimension}D`,
-          this.type
-        );
-        const expectedFilename =
-          `vectors/${payloadIndex}_${dimension}d.bin` +
-          (compression === null ? '' : '.gz');
-        if (filename !== expectedFilename) {
-          throw preparedDataError(
-            `Vector field "${fieldId}" ${dimension}D must use exact ` +
-            `producer path "${expectedFilename}".`,
-            this.type,
-            { filename, expectedFilename }
-          );
-        }
+    for (const [fieldId, field] of Object.entries(metadata.fields)) {
+      for (const [embeddingId, path] of Object.entries(field.files)) {
+        throwIfPreparedAborted(signal);
+        const label = `Vector field "${fieldId}" on "${embeddingId}"`;
+        const dimension = identity.embeddings.items[embeddingId].dimension;
+        const filename = validatePreparedPath(path, label, this.type);
         validatePreparedPathCompression(
           filename,
           compression,
-          `Vector field "${fieldId}" ${dimension}D`,
+          label,
           this.type
         );
         const expectedBytes = checkedPreparedBytes(
           identity.stats.n_cells,
           dimension * FLOAT32_BYTES,
           filename,
-          this.type
-        );
-        const paddedPositionBytes = checkedPreparedBytes(
-          identity.stats.n_cells,
-          3 * FLOAT32_BYTES,
-          `${fieldId} position cache`,
-          this.type
-        );
-        checkedPreparedWorkingSet(
-          [expectedBytes, paddedPositionBytes],
-          `Vector field "${fieldId}" ${dimension}D`,
           this.type
         );
         await this._validatePreparedFileLength(
@@ -2491,25 +2384,27 @@ export class LocalUserDirDataSource {
       exportSettings,
       this.type
     );
-    // obs_manifest.json is required and self-consistent: expandObsManifest()
-    // has already matched its declared compression against the .gz suffix of
-    // every path pattern it carries. It is therefore the export's compression,
-    // and the optional export_settings block only has to agree with it.
-    const exportCompression = obsManifest.compression;
+    // The identity's payload paths are derived from export_settings: `.gz`
+    // exactly when it declares a compression, and never when the block is
+    // absent. obs_manifest.json is required and self-consistent (its path
+    // patterns already match its own compression), so it has to agree.
+    const exportCompression = identityPayloadCompression(identity);
+    if (obsManifest.compression !== exportCompression) {
+      throw preparedDataError(
+        'obs_manifest.json compression must exactly match the compression ' +
+        'dataset_identity.json export_settings declares (none when absent).',
+        this.type,
+        {
+          manifestCompression: obsManifest.compression,
+          exportCompression,
+        }
+      );
+    }
     const embeddingPlan = getPreparedEmbeddingPlans(
       identity,
       exportCompression,
       this.type
     );
-    for (const plan of embeddingPlan.plans) {
-      checkedPreparedWorkingSet(
-        plan.dimension === 3
-          ? [plan.expectedBytes]
-          : [plan.expectedBytes, plan.paddedBytes],
-        `${plan.filename} embedding`,
-        this.type
-      );
-    }
 
     const missingEmbeddingFiles = embeddingPlan.plans
       .map(plan => plan.filename)
@@ -2890,24 +2785,43 @@ export class LocalUserDirDataSource {
   }
 
   /**
-   * Refresh (re-validate and reload metadata)
+   * Re-validate the adopted prepared directory and publish its metadata.
+   *
+   * H5AD and Zarr selections are immutable once read, so only a prepared
+   * directory is re-validated. Validation runs on an isolated candidate over
+   * the same files, exactly as `loadFromPreparedDirectory()` does, so a failed
+   * or superseded refresh leaves the working source untouched; only a refresh
+   * that is still current when it finishes publishes its result.
    */
   async refresh() {
-    // In h5ad mode, metadata is immutable (from h5ad file)
-    // No refresh needed - reload would require re-reading the file
-    if (this._sourceMode === 'h5ad') {
-      console.log('[LocalUserDirDataSource] Refresh not applicable for h5ad mode');
+    if (this._sourceMode !== 'directory' || this._files.size === 0) {
       return;
     }
-    // In zarr mode, metadata is immutable (from zarr directory)
-    // No refresh needed - reload would require re-reading the files
-    if (this._sourceMode === 'zarr') {
-      console.log('[LocalUserDirDataSource] Refresh not applicable for zarr mode');
-      return;
-    }
-    // In directory mode, re-validate and reload metadata
-    if (this._files.size > 0) {
-      await this._validateAndLoadMetadata();
+    const selectionEpoch = this._selectionEpoch;
+    const adoptionEpoch = this._adoptionEpoch;
+    const signal = this._selectionController?.signal ?? null;
+    const candidateSource = new LocalUserDirDataSource();
+    candidateSource._sourceMode = 'directory';
+    candidateSource.directoryPath = this.directoryPath;
+    candidateSource._files = new Map(this._files);
+    try {
+      await candidateSource._validateAndLoadMetadata({ signal });
+      if (adoptionEpoch !== this._adoptionEpoch) {
+        throw this._createSupersededSelectionError();
+      }
+      this._assertSelectionCurrent(selectionEpoch, signal);
+
+      // The files and their object URLs are the ones already adopted; only
+      // what validation derived from them is replaced.
+      this._preparedLazyValidationPlans =
+        candidateSource._preparedLazyValidationPlans;
+      candidateSource._preparedLazyValidationPlans = new Map();
+      this._preparedLazyValidationPromises.clear();
+      this.datasetId = candidateSource.datasetId;
+      this._metadata = candidateSource._metadata;
+      this._identityId = candidateSource._identityId;
+    } finally {
+      candidateSource._cleanup();
     }
   }
 

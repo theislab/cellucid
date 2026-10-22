@@ -1,0 +1,136 @@
+/**
+ * @fileoverview Copy-on-write ownership of the per-cell view arrays.
+ *
+ * Every view context (the live view and each kept view) owns three per-cell
+ * arrays: RGBA colors, transparency and the cell visibility mask. A kept view
+ * starts out sharing all three with the view it was kept from, so keeping a
+ * view costs no per-cell bytes until one of the views actually diverges. Each
+ * writer asks this module for a writable array first, and an array another
+ * view still holds is copied at that moment, so no view ever observes another
+ * view's write.
+ *
+ * Colors carry one more rule. The viewer and renderer keep a snapshot's colors
+ * by reference (the renderer's snapshot store never copies them), so an array
+ * once handed to a snapshot is frozen: it is never written again, and any view
+ * that recolors from it writes a copy.
+ *
+ * @module state/managers/per-cell-array-ownership
+ */
+
+/** Colors arrays handed to a snapshot view; never written again. */
+const SNAPSHOT_PUBLISHED_COLORS = new WeakSet();
+
+/**
+ * Record that `colors` was handed to a snapshot view.
+ *
+ * @param {Uint8Array} colors
+ */
+export function markSnapshotPublishedColors(colors) {
+  SNAPSHOT_PUBLISHED_COLORS.add(colors);
+}
+
+/**
+ * Whether a stored view context other than the active one holds `array`.
+ *
+ * @param {{viewContexts?: Map<string, object>, activeViewId?: string}} state
+ * @param {ArrayBufferView} array
+ * @returns {boolean}
+ */
+function isHeldByInactiveView(state, array) {
+  const contexts = state.viewContexts;
+  if (!(contexts instanceof Map)) return false;
+  const activeId = String(state.activeViewId);
+  for (const [viewId, ctx] of contexts) {
+    if (viewId === activeId || ctx === null || typeof ctx !== 'object') continue;
+    if (
+      ctx.colorsArray === array
+      || ctx.categoryTransparency === array
+      || ctx.cellVisibilityMask === array
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * The active view's colors, safe to write in place.
+ *
+ * @param {object} state - DataState (or an equivalent view owner).
+ * @returns {Uint8Array}
+ */
+export function writableColors(state) {
+  const colors = state.colorsArray;
+  if (
+    SNAPSHOT_PUBLISHED_COLORS.has(colors)
+    || isHeldByInactiveView(state, colors)
+  ) {
+    state.colorsArray = new Uint8Array(colors);
+  }
+  return state.colorsArray;
+}
+
+/**
+ * The active view's colors, safe for rewriting only their alpha bytes.
+ *
+ * The alpha byte of a colors array mirrors that view's own transparency. A
+ * snapshot's renderer reads alpha from its own R8 texture and never from the
+ * colors it keeps by reference, so a snapshot-held array may take its own
+ * view's alpha bytes in place; only an array another view still holds is
+ * copied first.
+ *
+ * @param {object} state
+ * @returns {Uint8Array}
+ */
+export function writableColorAlphaBytes(state) {
+  const colors = state.colorsArray;
+  if (isHeldByInactiveView(state, colors)) {
+    state.colorsArray = new Uint8Array(colors);
+  }
+  return state.colorsArray;
+}
+
+/**
+ * The active view's transparency, safe to write in place. The viewer copies
+ * every transparency it accepts, so only stored contexts can share this array.
+ *
+ * @param {object} state
+ * @returns {Uint8Array}
+ */
+export function writableTransparency(state) {
+  const transparency = state.categoryTransparency;
+  if (isHeldByInactiveView(state, transparency)) {
+    state.categoryTransparency = new Uint8Array(transparency);
+  }
+  // Every transparency write goes through here, so this counter moves on
+  // every write: results derived from the array (category counts) compare it
+  // instead of rescanning the array.
+  state._transparencyEpoch = transparencyEpoch(state) + 1;
+  return state.categoryTransparency;
+}
+
+/**
+ * How many times the state's transparency has been handed out for writing.
+ *
+ * @param {object} state
+ * @returns {number}
+ */
+export function transparencyEpoch(state) {
+  return Number.isSafeInteger(state._transparencyEpoch)
+    ? state._transparencyEpoch
+    : 0;
+}
+
+/**
+ * The active view's cell visibility mask, safe to write in place.
+ *
+ * @param {object} state
+ * @returns {Uint8Array}
+ */
+export function writableCellVisibilityMask(state) {
+  const mask = state.cellVisibilityMask;
+  if (isHeldByInactiveView(state, mask)) {
+    state.cellVisibilityMask = new Uint8Array(mask);
+  }
+  return state.cellVisibilityMask;
+}

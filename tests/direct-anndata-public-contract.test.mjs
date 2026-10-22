@@ -1,8 +1,10 @@
+import './helpers/anndata-reader-in-process.mjs';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 
 import { BaseAnnDataAdapter } from '../assets/js/data/base-anndata-adapter.js';
+import { loaderMetadata, selectColumns } from './helpers/anndata-mapping-mocks.mjs';
 import {
   loadConnectivityManifest,
   loadDatasetIdentity,
@@ -22,6 +24,7 @@ import {
 } from '../assets/js/data/anndata-provider.js';
 import { H5adDataSource } from '../assets/js/data/h5ad.js';
 import { ZarrDataSource } from '../assets/js/data/zarr.js';
+import { connectivityEdgesOf } from '../assets/js/data/sparse-utils.js';
 
 const EDGE_SIGNAL = new AbortController().signal;
 
@@ -39,7 +42,6 @@ function denseConnectivity() {
 
 function createDirectLoader() {
   const embeddingCalls = [];
-  const shapeCalls = [];
   const embeddings = {
     X_umap_2d: {
       data: Float32Array.from([
@@ -87,36 +89,21 @@ function createDirectLoader() {
       'nullable_boolean',
       'nullable_string',
     ],
-    obsmKeys: Object.keys(embeddings),
     embeddingCalls,
-    shapeCalls,
     connectivityCalls: 0,
     async getDatasetMetadata() {
-      return {
-        version: 2,
-        name: 'private-loader-metadata',
-        description: '',
-        cellucid_data_version: 'private-loader',
-        stats: {
-          n_cells: this.nObs,
-          n_genes: this.nVars,
-          n_obs_fields: 0,
-          n_categorical_fields: 0,
-          n_continuous_fields: 0,
-          has_connectivity: true,
-          n_edges: null,
-        },
-        embeddings: {
-          available_dimensions: [3, 2],
-          default_dimension: 3,
-          obsm_keys: {
-            '3d': 'X_umap_3d',
-            '2d': 'X_umap_2d',
-          },
-          has_expression_matrix: false,
-        },
-        obs_fields: [],
-      };
+      // The private adapter-construction descriptor H5AD/Zarr loaders
+      // return; it is never published. The adapter resolves its obsm probes
+      // into the public version-3 identity in finalizeDirectIdentity().
+      return loaderMetadata({
+        nObs: this.nObs,
+        nVars: this.nVars,
+        obsm: Object.fromEntries(
+          Object.entries(embeddings).map(([key, value]) => [key, value.nDims])
+        ),
+        connectivities: true,
+        stats: { n_genes: this.nVars, n_edges: null },
+      });
     },
     async getObsFieldInfo(key) {
       if (key === 'numeric_category') {
@@ -182,34 +169,25 @@ function createDirectLoader() {
       throw new Error(`Unexpected observation field "${key}"`);
     },
     releaseObsField() {},
-    async getEmbeddingShape(key) {
-      shapeCalls.push(key);
-      const embedding = embeddings[key];
-      if (!embedding) {
-        throw new Error(`Unexpected embedding shape request "${key}"`);
-      }
-      return {
-        nCells: this.nObs,
-        nDims: embedding.nDims,
-      };
-    },
-    async getEmbedding(key) {
+    async readObsmColumns(key, columns) {
       embeddingCalls.push(key);
       const embedding = embeddings[key];
       if (!embedding) {
-        throw new Error(`Unexpected embedding payload request "${key}"`);
+        throw new Error(`Unexpected obsm payload request "${key}"`);
       }
-      return {
-        data: embedding.data.slice(),
-        nDims: embedding.nDims,
-      };
+      return selectColumns(embedding.data, embedding.nDims, columns);
     },
-    releaseEmbedding() {},
-    async getConnectivities() {
+    async getConnectivityEdges() {
+      return connectivityEdgesOf(await this.readConnectivityMatrix(), this.nObs);
+    },
+    async readConnectivityMatrix() {
       this.connectivityCalls++;
       return denseConnectivity();
     },
-    async getGeneExpression() {
+    async readVarNames() {
+      throw new Error('X=None must not read gene names');
+    },
+    async getMatrixColumn() {
       throw new Error('X=None must not expose gene expression');
     },
     close() {},
@@ -227,10 +205,10 @@ async function createDirectSource(format, id) {
     ['X_umap_3d'],
     'initial validation materializes only the advertised maximum/default embedding'
   );
+  // Vector discovery reads the obsm probes, never a vector payload.
   assert.deepEqual(
-    loader.shapeCalls.sort(),
-    ['velocity_umap_2d', 'velocity_umap_3d'],
-    'vector discovery is shape-only'
+    adapter.getMappingCandidates().defaults.vectorFields.map(binding => binding.key),
+    ['velocity_umap_2d', 'velocity_umap_3d']
   );
 
   const filename = format === 'h5ad'
@@ -269,6 +247,15 @@ async function createDirectSource(format, id) {
   return { adapter, identity, loader, source };
 }
 
+/** Every payload path a public identity declares. */
+function publicPathsOf(identity) {
+  const paths = Object.values(identity.embeddings.items).map(item => item.file);
+  for (const field of Object.values(identity.vector_fields?.fields ?? {})) {
+    paths.push(...Object.values(field.files));
+  }
+  return paths;
+}
+
 function createLocalAnnDataCandidate(format, fixture) {
   return {
     datasetId: fixture.id,
@@ -290,7 +277,7 @@ function createLocalAnnDataCandidate(format, fixture) {
   };
 }
 
-test('H5AD and Zarr publish one exact v2 identity before direct adoption', async t => {
+test('H5AD and Zarr publish one exact v3 identity before direct adoption', async t => {
   for (const format of ['h5ad', 'zarr']) {
     await t.test(format, async () => {
       const id = `direct-${format}-a`;
@@ -313,14 +300,45 @@ test('H5AD and Zarr publish one exact v2 identity before direct adoption', async
         'vector_fields',
         'version',
       ]);
+      assert.equal(identity.version, 3);
+      // One item per resolved obsm embedding, keyed by its canonical id (the
+      // obsm key), in (dimension, id) order, on the uncompressed producer
+      // path: a dataset opened straight from AnnData records no
+      // export_settings, so nothing it declares ends in .gz.
       assert.deepEqual(identity.embeddings, {
-        available_dimensions: [2, 3],
         default_dimension: 3,
-        files: {
-          '2d': 'points_2d.bin',
-          '3d': 'points_3d.bin',
+        defaults: {
+          '2d': 'X_umap_2d',
+          '3d': 'X_umap_3d',
+        },
+        items: {
+          X_umap_2d: {
+            label: 'X_umap_2d',
+            dimension: 2,
+            file: 'embeddings/0_2d.bin',
+            source: { key: 'X_umap_2d', columns: [0, 1] },
+          },
+          X_umap_3d: {
+            label: 'X_umap_3d',
+            dimension: 3,
+            file: 'embeddings/1_3d.bin',
+            source: { key: 'X_umap_3d', columns: [0, 1, 2] },
+          },
         },
       });
+      assert.deepEqual(
+        Object.keys(identity.embeddings.items),
+        ['X_umap_2d', 'X_umap_3d']
+      );
+      assert.equal(Object.hasOwn(identity, 'export_settings'), false);
+      assert.equal(publicPathsOf(identity).some(path => path.endsWith('.gz')), false);
+      for (const path of publicPathsOf(identity)) {
+        assert.match(
+          path,
+          /^(embeddings\/\d+_[123]d|vectors\/\d+_\d+)\.bin$/,
+          `${path} is declared on the embeddings/ or vectors/ axis`
+        );
+      }
       assert.deepEqual(identity.obs_fields, [
         { key: 'nullable_integer', kind: 'continuous' },
         {
@@ -353,35 +371,52 @@ test('H5AD and Zarr publish one exact v2 identity before direct adoption', async
         has_connectivity: true,
         n_edges: 2,
       });
+      // velocity_umap_<d>d binds to the <d>D slot by the data-mapping default
+      // rule (the slot shows X_umap_<d>d). The field id is `velocity_umap`,
+      // its label is that id exactly, and each payload is keyed by the bound
+      // embedding id at vectors/{fieldIndex}_{embeddingIndex}.bin.
       assert.deepEqual(identity.vector_fields, {
         default_field: 'velocity_umap',
         fields: {
           velocity_umap: {
-            label: 'Velocity (UMAP)',
-            basis: 'umap',
-            available_dimensions: [2, 3],
-            default_dimension: 3,
+            label: 'velocity_umap',
             files: {
-              '2d': 'vectors/0_2d.bin',
-              '3d': 'vectors/0_3d.bin',
+              X_umap_2d: 'vectors/0_0.bin',
+              X_umap_3d: 'vectors/0_1.bin',
             },
           },
         },
       });
 
-      const publicIdentity = JSON.stringify(identity);
-      for (const privateMember of [
-        'obsm_keys',
-        'has_expression_matrix',
-        '_h5ad_loader',
-        '_zarr_loader',
-      ]) {
-        assert.equal(
-          publicIdentity.includes(privateMember),
-          false,
-          `${privateMember} must remain private`
-        );
+      // Both direct manifests are compact_v2: categorical centroids are keyed
+      // by embedding id (none are computed for a direct read), and the var
+      // manifest carries the default gene-name set instead of
+      // var_gene_id_column.
+      const obsManifest = adapter.getObsManifest();
+      assert.equal(obsManifest._format, 'compact_v2');
+      for (const entry of obsManifest._categoricalFields) {
+        assert.deepEqual(entry[5], {});
       }
+      const varManifest = await adapter.getVarManifest();
+      assert.equal(varManifest._format, 'compact_v2');
+      assert.equal(Object.hasOwn(varManifest, 'var_gene_id_column'), false);
+      assert.deepEqual(varManifest.gene_name_sets, [
+        { source: null, filled_from_index: 0, renamed: [], names: null },
+      ]);
+
+      // The loader's adapter-construction descriptor carries the mapping
+      // probes beside the stats; they decide the embeddings and never reach
+      // the published identity.
+      assert.equal(
+        Object.hasOwn(identity, 'probes'),
+        false,
+        'the loader descriptor probes must remain private'
+      );
+      assert.equal(
+        JSON.stringify(identity).includes('"probes"'),
+        false,
+        'no identity member may carry the loader descriptor probes'
+      );
 
       assert.equal(loader.nVars, 5);
       assert.deepEqual(
@@ -390,13 +425,13 @@ test('H5AD and Zarr publish one exact v2 identity before direct adoption', async
         'X=None retains the private var axis'
       );
       assert.deepEqual(
-        adapter.getVarManifest().fields,
+        (await adapter.getVarManifest()).fields,
         [],
         'X=None publishes zero expression fields'
       );
       await assert.rejects(
-        adapter.getGeneExpression('G0'),
-        /does not contain an X expression matrix/
+        adapter.getGeneValues('var/0.values.f32'),
+        /has no expression matrix; gene expression is unavailable/
       );
 
       assert.strictEqual(await source.getMetadata(id), identity);
@@ -491,7 +526,7 @@ test('direct dispatch requires the exact protocol and adopted dataset id', async
         fixture.identity
       );
       const points = await loadPointsBinary(
-        `${baseUrl}points_2d.bin`,
+        `${baseUrl}${fixture.identity.embeddings.items.X_umap_2d.file}`,
         { dimension: 2, expectedBytes: 24 }
       );
       assert.equal(points.length, 6);
@@ -711,7 +746,7 @@ test(
       );
 
       const points = await loadPointsBinary(
-        `${baseUrl}points_2d.bin`,
+        `${baseUrl}${fixture.identity.embeddings.items.X_umap_2d.file}`,
         {
           candidateAnnDataBinding: binding,
           dimension: 2,
@@ -868,7 +903,7 @@ test('progress-tracked cross-origin points use one direct streaming CORS request
       moduleUrl('assets/js/data/data-loaders.js')
     );
     const values = await loaders.loadPointsBinary(
-      'https://datasets.example/exports/demo/points_2d.bin',
+      'https://datasets.example/exports/demo/embeddings/0_2d.bin',
       {
         dimension: 2,
         expectedBytes: 16,
@@ -880,10 +915,10 @@ test('progress-tracked cross-origin points use one direct streaming CORS request
     assert.equal(directRequests.length, 1);
     assert.equal(
       directRequests[0].url,
-      'https://datasets.example/exports/demo/points_2d.bin'
+      'https://datasets.example/exports/demo/embeddings/0_2d.bin'
     );
     assert.equal(directRequests[0].init.method, 'GET');
-    assert.equal(directRequests[0].init.cache, 'default');
+    assert.equal(directRequests[0].init.cache, 'no-cache');
     assert.deepEqual(directRequests[0].init.headers, []);
     assert.equal(directRequests[0].init.mode, 'cors');
     assert.equal(directRequests[0].init.credentials, 'omit');

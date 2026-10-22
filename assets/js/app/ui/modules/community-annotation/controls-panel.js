@@ -1,7 +1,9 @@
 /**
  * @fileoverview The community annotation sidebar panel.
  *
- * Rebuilds the whole section on every `render()`: the offline and sign-in
+ * Rebuilds the whole section on every `render()` while the section is open
+ * (a closed section only records that it is stale, and renders when it is
+ * opened): the offline and sign-in
  * gating, the GitHub sync block, the profile block, the per-field annotation
  * settings, the derived consensus column, and the exports/cache accordion.
  *
@@ -23,18 +25,32 @@ import {
   isAnnotationRepoConnected,
   isSimulateRepoConnectedEnabled,
 } from '../../../community-annotations/access-store.js';
-import { downloadJsonAsFile, el, toCleanString } from './dom.js';
+import {
+  createStatusIcon,
+  createStatusRow,
+  downloadJsonAsFile,
+  el,
+  toCleanString,
+} from './dom.js';
 import { createDomId } from '../../components/dom-id.js';
+import {
+  createButton,
+  createDisclosure,
+  createGroup,
+  createIconButton,
+  createSliderField,
+  createStatusLine,
+} from '../../components/controls.js';
 import { confirmAsync } from './modal-shell.js';
 import { assertExactGitHubLogin } from './identity-assertions.js';
 import {
-  clampConsensusThreshold11,
   clampInt,
   formatPctSigned11,
   sliderValueToThreshold,
   thresholdToSliderValue,
 } from './consensus-math.js';
 import { copyTextToClipboard } from './browser-integration.js';
+import { createVisibilityGatedRender } from '../../core/visibility-gate.js';
 
 const CONSENSUS_SNAPSHOT_FILENAME = 'cellucid-consensus.json';
 
@@ -81,6 +97,7 @@ export function createControlsPanel(controller) {
   }
   const {
     container,
+    lifecycleSignal,
     state,
     dataSourceManager,
     infoPopovers,
@@ -113,10 +130,11 @@ export function createControlsPanel(controller) {
     typeof infoPopovers !== 'object' ||
     annotatableSettingsDraft === null ||
     typeof annotatableSettingsDraft !== 'object' ||
-    !(annotatableSettingsDirty instanceof Set)
+    !(annotatableSettingsDirty instanceof Set) ||
+    !(lifecycleSignal instanceof AbortSignal)
   ) {
     throw new TypeError(
-      'The community annotation panel requires its container, the visualization state, the information popover controller, and the annotatable settings draft'
+      'The community annotation panel requires its container, its lifecycle signal, the visualization state, the information popover controller, and the annotatable settings draft'
     );
   }
 
@@ -126,7 +144,7 @@ export function createControlsPanel(controller) {
   let consensusColumnMinAnnotators = 1;
   let consensusColumnKey = 'community_cell_type';
   let consensusSourceFieldKey = null;
-  // Community annotation internal accordions: closed by default; only one may be open at a time.
+  // Community annotation collapsibles: closed by default; only one may be open at a time.
   /** @type {'consensus-column'|'manage'|'exports-cache'|null} */
   let openAccordionKey = null;
 
@@ -134,70 +152,43 @@ export function createControlsPanel(controller) {
 
   let infoPopoverSequence = 0;
 
-  function createInfoTooltip(label, steps) {
-    if (!Array.isArray(steps) || steps.length === 0) {
-      throw new TypeError(
-        'Community annotation information requires at least one exact step'
-      );
-    }
+  function createInfoTooltip(label, tip) {
     const btn = el(
       'button',
       { className: 'info-btn' },
       [el('span', { 'aria-hidden': 'true', text: 'i' })]
     );
     const tooltip = el('div', { className: 'info-tooltip' });
-    const content = el('div', { className: 'info-tooltip-content' });
-    for (const step of steps) {
-      if (
-        typeof step !== 'string'
-        || !step
-        || step.trim() !== step
-      ) {
-        throw new TypeError(
-          'Community annotation information steps must be exact strings'
-        );
-      }
-      content.appendChild(el('div', { className: 'info-step', text: step }));
-    }
-    tooltip.appendChild(content);
     infoPopoverSequence += 1;
     infoPopovers.configurePair(btn, tooltip, {
       id: `community-annotation-info-${infoPopoverSequence}`,
-      label
+      label,
+      tip
     });
 
     return { btn, tooltip };
   }
 
   /**
-   * A section caption with its info popover trigger.
+   * A sub-section of the panel: a heading with its info popover trigger, and
+   * the controls it names, grouped under it (`role="group"` labelled by the
+   * heading).
    *
-   * Pass `controlId` whenever the caption names one form control, so clicking
-   * the caption text focuses that control. Without it the caption is a heading
-   * over a group of controls (or over no control at all), and the `<label>`
-   * carries no association because there is nothing single to associate it
-   * with. The element stays a `<label>` in that case because `#sidebar label`
-   * in `assets/css/components/_sidebar.css` is what gives every caption in this
-   * panel its type treatment.
-   *
-   * @param {string} text
-   * @param {{btn: HTMLElement}} info
-   * @param {{controlId?: string|null}} [options]
+   * @param {string} title
+   * @param {{btn: HTMLElement, tooltip: HTMLElement}} info
+   * @returns {HTMLElement}
    */
-  function createInfoLabel(text, info, { controlId = null } = {}) {
-    if (
-      controlId !== null &&
-      (typeof controlId !== 'string' || controlId !== controlId.trim() || !controlId)
-    ) {
-      throw new TypeError(
-        'Community annotation info label control id must be an exact id or null'
-      );
-    }
-    return el('div', { className: 'd-flex items-center gap-1' }, [
-      el('label', controlId === null ? { text } : { for: controlId, text }),
-      info.btn
-    ]);
+  function createInfoGroup(title, info) {
+    const group = createGroup({ title, info: info.btn });
+    group.root.appendChild(info.tooltip);
+    return group.root;
   }
+
+  // The panel is rebuilt on every session change and every active field
+  // change, and its section is closed by default: while it cannot be seen a
+  // render only marks the panel stale, and showing it renders once.
+  const gatedRender = createVisibilityGatedRender(container, renderNow);
+  lifecycleSignal.addEventListener('abort', () => gatedRender.destroy(), { once: true });
 
   function resolveIdentityModalFocus() {
     if (controller.isContextDestroyed()) return null;
@@ -229,6 +220,10 @@ export function createControlsPanel(controller) {
   }
 
   function render() {
+    gatedRender.request();
+  }
+
+  function renderNow() {
     if (controller.isContextDestroyed()) return;
     identityEditButton = null;
     infoPopovers.closeWithin(container);
@@ -244,31 +239,37 @@ export function createControlsPanel(controller) {
         ? navigator.onLine !== false
         : true;
     if (!repoConnectedForGating) {
-      const introBlock = el('div', { className: 'control-block relative' });
-      const introInfo = createInfoTooltip('About community annotation', [
-        'Connect an annotation repo to enable community voting and GitHub sync.',
-        'Voting UI is hidden elsewhere until a repo is connected.'
-      ]);
-      introBlock.appendChild(createInfoLabel('Community annotation', introInfo));
-      introBlock.appendChild(introInfo.tooltip);
-      introBlock.appendChild(el('div', { className: 'legend-help', text: 'No annotation repo connected.' }));
+      const introInfo = createInfoTooltip('About community annotation', 'community-intro');
+      const introBlock = createInfoGroup('Repository', introInfo);
+      introBlock.appendChild(el('p', { className: 'status-line', text: 'Not connected.' }));
 
       const actions = el('div', { className: 'community-annotation-suggestion-actions' });
-      if (!online) {
-        introBlock.appendChild(el('div', {
-          className: 'legend-help',
+      // A repository is connected per dataset, so None has nothing to
+      // connect it to.
+      if (datasetId === null) {
+        introBlock.appendChild(el('p', {
+          className: 'status-line',
+          role: 'status',
+          text: 'Load a dataset to connect a repository.',
+        }));
+      } else if (!online) {
+        introBlock.appendChild(el('p', {
+          className: 'status-line',
+          role: 'status',
+          'data-tone': 'warning',
           text: 'Offline: GitHub actions are disabled.',
         }));
       }
       const connectBtn = el('button', {
         type: 'button',
-        className: 'btn-small',
+        className: 'btn',
         text: 'Connect repo',
-        disabled: controller.isSyncBusy() || !online,
+        disabled: datasetId === null || controller.isSyncBusy() || !online,
+        'data-community-annotation-action': 'github-connection',
       });
       connectBtn.addEventListener('click', () => {
         startBackgroundTask(
-          () => connectRepoFlow({ reason: null, defaultPullNow: true }),
+          () => connectRepoFlow({ reason: null }),
           { label: 'Unable to open GitHub annotation connection' },
         );
       });
@@ -278,84 +279,26 @@ export function createControlsPanel(controller) {
       return;
     }
 
-    const introBlock = el('div', { className: 'control-block relative' });
-    const introInfo = createInfoTooltip('About community voting', [
-      'Offline-first: votes/suggestions are saved locally first.',
-      'Annotatable columns are chosen by repo authors (maintain/admin) via the annotation repo config.',
-      'Connecting an annotation repo is required to participate (voting UI is hidden otherwise).',
-      'Pull/Publish to GitHub is optional after connecting.'
-    ]);
-    introBlock.appendChild(createInfoLabel('Community voting', introInfo));
-    introBlock.appendChild(introInfo.tooltip);
-    container.appendChild(introBlock);
-
-    // GitHub sync
+    // GitHub sync. The panel opens on it: a separate "Community voting"
+    // heading above it held nothing but its info button.
     const isAuthed = githubAuth.isAuthenticated();
     const authedUser = githubAuth.getUser();
     const login =
       authedUser === null
         ? ''
         : assertExactGitHubLogin(authedUser.login, 'Authenticated GitHub login');
-    const syncBlock = el('div', { className: 'control-block relative' });
-    const syncInfo = createInfoTooltip('About GitHub annotation sync', [
-      'Open GitHub sync to sign in, install the app, pick a repo, and pull/publish.',
-      'Your sign-in token is stored only in sessionStorage (clears on tab close).',
-      'The GitHub App has no repo access by default; you choose which repos to enable.'
-    ]);
-    syncBlock.appendChild(createInfoLabel('GitHub sync', syncInfo));
-    syncBlock.appendChild(syncInfo.tooltip);
-
-    const svgEl = (tag) => document.createElementNS('http://www.w3.org/2000/svg', tag);
-    const icon = (d, { viewBox = '0 0 24 24' } = {}) => {
-      const svg = svgEl('svg');
-      svg.setAttribute('viewBox', viewBox);
-      svg.setAttribute('aria-hidden', 'true');
-      svg.classList.add('community-annotation-status-icon');
-      const path = svgEl('path');
-      path.setAttribute('d', d);
-      path.setAttribute('fill', 'none');
-      path.setAttribute('stroke', 'currentColor');
-      path.setAttribute('stroke-width', '1.8');
-      path.setAttribute('stroke-linecap', 'round');
-      path.setAttribute('stroke-linejoin', 'round');
-      svg.appendChild(path);
-      return svg;
-    };
-
-    const datasetIcon = icon('M4 6c0-1.7 3.6-3 8-3s8 1.3 8 3-3.6 3-8 3-8-1.3-8-3zm0 6c0 1.7 3.6 3 8 3s8-1.3 8-3m-16 6c0 1.7 3.6 3 8 3s8-1.3 8-3');
-    const githubIcon = icon('M12 12a4 4 0 1 0-4-4 4 4 0 0 0 4 4zm-8 9a8 8 0 0 1 16 0');
-    const repoIcon = icon('M4 7a3 3 0 0 1 3-3h10a3 3 0 0 1 3 3v10a3 3 0 0 1-3 3H7a3 3 0 0 1-3-3zM8 8h8M8 12h8M8 16h6');
-    const copyIcon = icon('M8 8h12v12H8zM4 4h12v12H4z');
-
-    const toneClass = (tone) => {
-      if (tone === 'ok') return 'community-annotation-status-chip community-annotation-status-chip--ok';
-      if (tone === 'danger') return 'community-annotation-status-chip community-annotation-status-chip--danger';
-      return 'community-annotation-status-chip community-annotation-status-chip--warn';
-    };
-
-    const makeStatusRow = ({ iconEl, tone = 'warn', key = '', value = '', actions = [] } = {}) => {
-      const keyEl = el('span', { className: 'community-annotation-status-key', text: key || '' });
-      const valueEl = el('span', { className: 'community-annotation-status-val', text: value || '' });
-      const textEl = el('div', { className: 'community-annotation-status-text' }, [keyEl, valueEl]);
-      const chip = el('div', { className: toneClass(tone) }, [iconEl || null, textEl]);
-      const rowChildren = [chip];
-      if (Array.isArray(actions) && actions.length) {
-        rowChildren.push(el('div', { className: 'community-annotation-status-actions' }, actions));
-      }
-      return el('div', { className: 'community-annotation-status-row' }, rowChildren);
-    };
+    const syncInfo = createInfoTooltip('About community voting and GitHub sync', 'community-sync');
+    const syncBlock = createInfoGroup('GitHub sync', syncInfo);
 
     const storedRepoName = repo ? String(repo).split('@')[0] : '';
     const connectedName = isAuthed ? storedRepoName : '';
 
     const copyShareLinkBtn = (() => {
       if (!repo) return null;
-      const btn = el('button', {
-        type: 'button',
-        className: 'community-annotation-status-action',
-        title: 'Copy share link (includes @branch)',
-        'aria-label': 'Copy share link'
-      }, [copyIcon]);
+      const btn = createIconButton({
+        label: 'Copy share link (includes @branch)',
+        icon: createStatusIcon('copy').outerHTML,
+      });
       btn.disabled = controller.isSyncBusy();
       btn.addEventListener('click', () => {
         startBackgroundTask(async () => {
@@ -369,55 +312,61 @@ export function createControlsPanel(controller) {
       return btn;
     })();
 
-    const statusList = el('div', { className: 'community-annotation-status-list community-annotation-status-panel community-annotation-dashed-box community-annotation-dashed-box--prose' });
-    statusList.appendChild(makeStatusRow({
-      iconEl: datasetIcon,
+    const statusList = el('div', { className: 'control-box community-annotation-status-list community-annotation-status-panel' });
+    statusList.appendChild(createStatusRow({
+      icon: 'dataset',
       tone: datasetId ? 'ok' : 'warn',
       key: 'Dataset',
       value: datasetId ? ` ${datasetId}` : ' —',
-      actions: []
-    }));
-    statusList.appendChild(makeStatusRow({
-      iconEl: githubIcon,
+    }).row);
+    statusList.appendChild(createStatusRow({
+      icon: 'github',
       tone: isAuthed ? 'ok' : 'warn',
       key: 'GitHub',
       value: isAuthed ? (login ? ` @${login}` : ' signed in') : ' not connected',
-      actions: []
-    }));
-    statusList.appendChild(makeStatusRow({
-      iconEl: repoIcon,
+    }).row);
+    statusList.appendChild(createStatusRow({
+      icon: 'repo',
       tone: connectedName ? 'ok' : 'warn',
       key: 'Repo',
       value: connectedName ? ` ${connectedName}` : (storedRepoName && !isAuthed ? ` ${storedRepoName} (sign in)` : ' not connected'),
       actions: copyShareLinkBtn ? [copyShareLinkBtn] : []
-    }));
+    }).row);
 
     syncBlock.appendChild(statusList);
 
     if (!online) {
-      syncBlock.appendChild(el('div', { className: 'legend-help', text: 'Offline: GitHub actions are disabled.' }));
+      syncBlock.appendChild(createStatusLine({
+        tone: 'warning',
+        text: 'Offline: GitHub actions are disabled.',
+      }).root);
     }
 
     const currentSyncError = controller.getSyncError();
     if (currentSyncError) {
-      syncBlock.appendChild(el('div', { className: 'legend-help', text: `⚠ ${currentSyncError}` }));
+      syncBlock.appendChild(createStatusLine({
+        tone: 'danger',
+        text: currentSyncError,
+      }).root);
     }
 
     const syncActions = el('div', { className: 'community-annotation-sync-actions' });
     const openBtnText = !isAuthed ? 'Connect GitHub…' : (!repo ? 'Choose repo…' : 'GitHub sync…');
-    const openSyncBtn = el('button', { type: 'button', className: 'btn-small', text: openBtnText });
+    const openSyncBtn = el('button', {
+      type: 'button',
+      className: 'btn',
+      text: openBtnText,
+      'data-community-annotation-action': 'github-connection',
+    });
     openSyncBtn.disabled = controller.isSyncBusy() || !online;
     openSyncBtn.addEventListener('click', () => {
       observeBackgroundTask(
         openGitHubConnectionFlow({
-          mode: 'repo',
-          focus: 'overview',
           reason: null,
           datasetId,
           cacheUser: cacheUsername,
           login,
           currentRepo: repo,
-          defaultPullNow: true
         }),
         { label: 'Unable to open GitHub annotation sync' },
       );
@@ -432,29 +381,25 @@ export function createControlsPanel(controller) {
       return;
     }
 
-    // Community annotation internal accordions:
-    // - closed by default
-    // - only one open at a time
-    const accordionPeers = [];
-    const registerAccordionPeer = (key, itemEl, headerEl) => {
-      if (!key || !itemEl || !headerEl) return;
-      accordionPeers.push({ key, itemEl, headerEl });
-    };
-    const syncAccordionPeers = () => {
-      for (const { key, itemEl, headerEl } of accordionPeers) {
-        const isOpen = openAccordionKey === key;
-        itemEl.classList.toggle('open', isOpen);
-        headerEl.setAttribute('aria-expanded', String(isOpen));
-      }
-    };
-    const toggleAccordionPeer = (key) => {
-      openAccordionKey = (openAccordionKey === key) ? null : key;
-      syncAccordionPeers();
+    // Community annotation collapsibles: closed by default, at most one open.
+    const disclosures = new Map();
+    const createPeerDisclosure = (key, title, tip) => {
+      const disclosure = createDisclosure({
+        title,
+        tip,
+        expanded: openAccordionKey === key,
+        onToggle: (expanded) => {
+          openAccordionKey = expanded ? key : null;
+          for (const [peerKey, peer] of disclosures) {
+            if (peerKey !== key) peer.setExpanded(openAccordionKey === peerKey);
+          }
+        },
+      });
+      disclosures.set(key, disclosure);
+      return disclosure;
     };
 
     container.appendChild(syncBlock);
-
-    const consensusBlock = el('div', { className: 'control-block relative' });
 
     const catFieldsForConsensus = (state.getFields?.() || []).filter((f) => f?.kind === 'category' && f?._isDeleted !== true);
     const allKeysForConsensus = catFieldsForConsensus.map((f) => f.key).filter(Boolean);
@@ -463,49 +408,20 @@ export function createControlsPanel(controller) {
       consensusSourceFieldKey = annotatableKeysForConsensus[0] || null;
     }
 
-    const accordion = el('div', { className: 'analysis-accordion' });
-    const consensusAccordionKey = 'consensus-column';
-    const item = el('div', { className: `analysis-accordion-item${openAccordionKey === consensusAccordionKey ? ' open' : ''}` });
-    const header = el('div', {
-      className: 'analysis-accordion-header',
-      role: 'button',
-      tabIndex: '0',
-      'aria-expanded': String(openAccordionKey === consensusAccordionKey)
-    }, [
-      el('span', { className: 'analysis-accordion-title', text: 'DERIVED CONSENSUS COLUMN' }),
-      el('span', { className: 'analysis-accordion-desc', text: 'Optional: build an obs column from current votes' }),
-      el('span', { className: 'analysis-accordion-chevron', 'aria-hidden': 'true' })
-    ]);
-    const content = el('div', { className: 'analysis-accordion-content' });
-
-    registerAccordionPeer(consensusAccordionKey, item, header);
-    const toggleOpen = () => toggleAccordionPeer(consensusAccordionKey);
-    header.addEventListener('click', () => toggleOpen());
-    header.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter' || e.key === ' ') {
-        e.preventDefault();
-        toggleOpen();
-      }
-    });
+    const consensusDisclosure = createPeerDisclosure(
+      'consensus-column',
+      'Consensus column',
+      'community-consensus-column'
+    );
+    const content = consensusDisclosure.content;
 
     // Source annotatable column selector
-    const srcWrap = el('div', { className: 'field-select relative' });
-    const consensusInfo = createInfoTooltip('About derived consensus columns', [
-      'This does not change the voting rules or publish anything to GitHub.',
-      'It only creates/updates a local derived obs column in the dataset for visualization.',
-      'Each cluster becomes: a consensus label, Disputed, or Pending.'
-    ]);
+    const srcWrap = el('div', { className: 'control-block' });
     const srcSelectId = createDomId('community-annotation-consensus-source');
-    srcWrap.appendChild(createInfoLabel(
-      'Annotatable column:',
-      consensusInfo,
-      { controlId: srcSelectId }
-    ));
-    srcWrap.appendChild(consensusInfo.tooltip);
+    srcWrap.appendChild(el('label', { for: srcSelectId, text: 'Annotatable column' }));
     const srcSelect = el('select', {
       id: srcSelectId,
-      className: 'obs-select',
-      'aria-label': 'Annotatable column'
+      className: 'obs-select'
     });
     if (!annotatableKeysForConsensus.length) {
       srcSelect.appendChild(el('option', { value: '', text: '(no annotatable columns)' }));
@@ -521,19 +437,18 @@ export function createControlsPanel(controller) {
     content.appendChild(srcWrap);
 
     // Consensus column key
-    const consensusKeyWrap = el('div', { className: 'field-select' });
+    const consensusKeyWrap = el('div', { className: 'control-block' });
     const consensusKeyInputId = createDomId(
       'community-annotation-consensus-key'
     );
     consensusKeyWrap.appendChild(el('label', {
       for: consensusKeyInputId,
-      text: 'New column key:'
+      text: 'New column key'
     }));
     const consensusKeyInput = el('input', {
       id: consensusKeyInputId,
       type: 'text',
-      className: 'community-annotation-text-input community-annotation-input',
-      'aria-label': 'New column key',
+      className: 'obs-select',
       placeholder: 'community_cell_type'
     });
     consensusKeyInput.value = consensusColumnKey;
@@ -544,42 +459,30 @@ export function createControlsPanel(controller) {
     content.appendChild(consensusKeyWrap);
 
     // Consensus threshold + min annotators
-    const consensusSettings = el('div', { className: 'control-block community-annotation-settings' });
-    const thresholdInputId = createDomId(
-      'community-annotation-consensus-threshold'
-    );
-    const thresholdLabel = el('label', {
-      for: thresholdInputId,
-      text: 'Consensus threshold:'
+    const consensusSettings = el('div', { className: 'community-annotation-settings' });
+    const threshold = createSliderField({
+      label: 'Consensus threshold',
+      min: -100,
+      max: 100,
+      step: 1,
+      value: Number(thresholdToSliderValue(consensusColumnThreshold)),
+      format: (value) => formatPctSigned11(sliderValueToThreshold(value)),
+      onInput: (value) => {
+        consensusColumnThreshold = sliderValueToThreshold(value);
+      },
     });
-    const thresholdInput = el('input', {
-      id: thresholdInputId,
-      type: 'range',
-      'aria-label': 'Consensus threshold',
-      min: '-100',
-      max: '100',
-      step: '1',
-      value: thresholdToSliderValue(consensusColumnThreshold)
-    });
-    const thresholdDisplay = el('span', { className: 'slider-value', text: formatPctSigned11(consensusColumnThreshold) });
-    thresholdInput.addEventListener('input', () => {
-      consensusColumnThreshold = sliderValueToThreshold(thresholdInput.value);
-      thresholdDisplay.textContent = formatPctSigned11(consensusColumnThreshold);
-    });
-    const thresholdRow = el('div', { className: 'slider-row' }, [thresholdInput, thresholdDisplay]);
-    consensusSettings.appendChild(thresholdLabel);
-    consensusSettings.appendChild(thresholdRow);
+    consensusSettings.appendChild(threshold.root);
 
+    const minWrap = el('div', { className: 'control-block' });
     const minInputId = createDomId('community-annotation-consensus-min');
-    const minLabel = el('label', {
+    minWrap.appendChild(el('label', {
       for: minInputId,
-      text: 'Min annotators:'
-    });
+      text: 'Min annotators'
+    }));
     const minInput = el('input', {
       id: minInputId,
       type: 'number',
       className: 'obs-select',
-      'aria-label': 'Min annotators',
       value: String(consensusColumnMinAnnotators),
       min: '0',
       max: '50',
@@ -589,42 +492,34 @@ export function createControlsPanel(controller) {
       consensusColumnMinAnnotators = clampInt(Number(minInput.value), 0, 50);
       minInput.value = String(consensusColumnMinAnnotators);
     });
-    consensusSettings.appendChild(minLabel);
-    consensusSettings.appendChild(minInput);
+    minWrap.appendChild(minInput);
+    consensusSettings.appendChild(minWrap);
     content.appendChild(consensusSettings);
 
     const applyActions = el('div', { className: 'community-annotation-consensus-actions' });
-    const applyBtn = el('button', { type: 'button', className: 'btn-small', text: 'Build derived column' });
-    applyBtn.disabled = controller.isSyncBusy() || !consensusSourceFieldKey;
-    applyBtn.addEventListener('click', () => {
-      startBackgroundTask(
-        () => applyConsensusColumn(readConsensusColumnSettings),
-        { label: 'Unable to build the community consensus column' },
-      );
+    const applyBtn = createButton({
+      label: 'Build derived column',
+      variant: 'primary',
+      onClick: () => {
+        startBackgroundTask(
+          () => applyConsensusColumn(readConsensusColumnSettings),
+          { label: 'Unable to build the community consensus column' },
+        );
+      },
     });
+    applyBtn.disabled = controller.isSyncBusy() || !consensusSourceFieldKey;
     applyActions.appendChild(applyBtn);
     content.appendChild(applyActions);
 
-    item.appendChild(header);
-    item.appendChild(content);
-    accordion.appendChild(item);
-    consensusBlock.appendChild(accordion);
-
     // Profile (asked once per GitHub username; editable)
     const profile = session.getProfile();
-      const identityBlock = el('div', { className: 'control-block relative' });
-      const identityInfo = createInfoTooltip('About annotation profiles', [
-        'Profile fields are optional and saved locally (like votes) until you Publish.',
-        'Publish writes them into your GitHub user file; Pull reloads them from GitHub.',
-        'Your GitHub username comes from sign-in.'
-      ]);
-    identityBlock.appendChild(createInfoLabel('Profile (optional)', identityInfo));
-    identityBlock.appendChild(identityInfo.tooltip);
+    const identityInfo = createInfoTooltip('About annotation profiles', 'community-profile');
+    const identityBlock = createInfoGroup('Profile', identityInfo);
 
     const authedLogin = getGitHubLogin();
     // Allow editing when signed in OR when dev override is enabled
     const canEdit = Boolean(githubAuth.isAuthenticated?.() && authedLogin) || isSimulateRepoConnectedEnabled();
-    const profileBox = el('div', { className: 'community-annotation-dashed-box community-annotation-profile-box' });
+    const profileBox = el('div', { className: 'control-box community-annotation-profile-box' });
     const addProfileRow = (key, value) => {
       profileBox.appendChild(el('div', { className: 'community-annotation-profile-row' }, [
         el('span', { className: 'community-annotation-profile-key', text: String(key || '') }),
@@ -640,13 +535,12 @@ export function createControlsPanel(controller) {
     identityBlock.appendChild(profileBox);
 
     const identityActions = el('div', { className: 'community-annotation-identity-actions' });
-    const editBtn = el('button', {
-      type: 'button',
-      className: 'btn-small community-annotation-profile-edit',
-      text: 'Edit'
+    const editBtn = createButton({
+      label: 'Edit',
+      className: 'community-annotation-profile-edit',
     });
     identityEditButton = editBtn;
-    const clearBtn = el('button', { type: 'button', className: 'btn-small', text: 'Clear' });
+    const clearBtn = createButton({ label: 'Clear' });
     identityActions.appendChild(editBtn);
     identityActions.appendChild(clearBtn);
     identityBlock.appendChild(identityActions);
@@ -656,57 +550,57 @@ export function createControlsPanel(controller) {
     editBtn.title = editBtn.disabled ? 'Sign in first.' : 'Edit your attribution info (published in your GitHub user file).';
     clearBtn.title = clearBtn.disabled ? 'Sign in first.' : 'Clear your profile fields (Publish to update GitHub).';
 
-      editBtn.addEventListener('click', (event) => {
-        const returnFocusTo = event.currentTarget;
-        if (!(returnFocusTo instanceof HTMLButtonElement)) {
-          throw new TypeError(
-            'Community annotation profile edit requires its button owner'
-          );
-        }
-        startBackgroundTask(async () => {
-          if (!canEdit) return;
-          const loginOrLocal = authedLogin || 'local';
-          await ensureIdentityForUserKey({ userKey: getCacheUserKey(), login: loginOrLocal, githubUserId: githubAuth.getUser?.()?.id ?? null, promptIfMissing: false });
-            await editIdentityFlow({
-            suggestedUsername: loginOrLocal,
-            returnFocusTo,
-            returnFocusResolver: resolveIdentityModalFocus
-          });
-        }, { label: 'Unable to edit the annotation profile' });
-      });
-
-      clearBtn.addEventListener('click', () => {
+    editBtn.addEventListener('click', (event) => {
+      const returnFocusTo = event.currentTarget;
+      if (!(returnFocusTo instanceof HTMLButtonElement)) {
+        throw new TypeError(
+          'Community annotation profile edit requires its button owner'
+        );
+      }
       startBackgroundTask(async () => {
-          if (!canEdit) return;
+        if (!canEdit) return;
+        const loginOrLocal = authedLogin || 'local';
+        await ensureIdentityForUserKey({ userKey: getCacheUserKey(), login: loginOrLocal, githubUserId: githubAuth.getUser?.()?.id ?? null, promptIfMissing: false });
+        await editIdentityFlow({
+          suggestedUsername: loginOrLocal,
+          returnFocusTo,
+          returnFocusResolver: resolveIdentityModalFocus
+        });
+      }, { label: 'Unable to edit the annotation profile' });
+    });
+
+    clearBtn.addEventListener('click', () => {
+      startBackgroundTask(async () => {
+        if (!canEdit) return;
         const owner = publishContextOwner(getCacheContext({}));
-          const loginOrLocal = authedLogin || 'local';
-          const ok = await confirmAsync({
-            title: 'Clear profile?',
-            message: `Clear your profile fields for @${loginOrLocal} in this session?\n\nPublish to update your GitHub user file.`,
-            confirmText: 'Clear',
-            signal: owner.signal,
-          });
-          if (!ok || !isContextOwnerCurrent(owner)) return;
-          const currentProfile = session.getProfile();
-          session.setProfile({
-            ...currentProfile,
-            login: loginOrLocal,
-            displayName: '',
-            title: '',
-            orcid: '',
-            linkedin: '',
-          });
+        const loginOrLocal = authedLogin || 'local';
+        const ok = await confirmAsync({
+          title: 'Clear profile?',
+          message: `Clear your profile fields for @${loginOrLocal} in this session?\n\nPublish to update your GitHub user file.`,
+          confirmText: 'Clear',
+          signal: owner.signal,
+        });
+        if (!ok || !isContextOwnerCurrent(owner)) return;
+        const currentProfile = session.getProfile();
+        session.setProfile({
+          ...currentProfile,
+          login: loginOrLocal,
+          displayName: '',
+          title: '',
+          orcid: '',
+          linkedin: '',
+        });
         render();
       }, { label: 'Unable to clear the annotation profile' });
-      });
+    });
 
-      container.appendChild(identityBlock);
-      // Collapsibles are appended at the bottom of this section.
+    container.appendChild(identityBlock);
+    // Collapsibles are appended at the bottom of this section.
 
-      // ─────────────────────────────────────────────────────────────────────────
-      // MANAGE ANNOTATION - author-only when connected to a repo
-      // ─────────────────────────────────────────────────────────────────────────
-      const annotated = session.getAnnotatedFields();
+    // ─────────────────────────────────────────────────────────────────────────
+    // MANAGE ANNOTATION - author-only when connected to a repo
+    // ─────────────────────────────────────────────────────────────────────────
+    const annotated = session.getAnnotatedFields();
     const catFields = (state.getFields?.() || []).filter((f) => f?.kind === 'category' && f?._isDeleted !== true);
     const allKeys = catFields.map((f) => f.key).filter(Boolean);
     if (!selectedFieldKey || !allKeys.includes(selectedFieldKey)) {
@@ -718,341 +612,262 @@ export function createControlsPanel(controller) {
     const canManageAnnotatable = hasSelection && access.isAuthor();
     const role = access.getEffectiveRole?.() || access.getRole?.() || 'unknown';
 
-    const manageBlock = el('div', { className: 'control-block relative' });
+    const manageDisclosure = createPeerDisclosure(
+      'manage',
+      'Annotated columns',
+      'community-annotated-columns'
+    );
+    const manageContent = manageDisclosure.content;
 
-    const manageAccordionKey = 'manage';
-    const manageAccordion = el('div', { className: 'analysis-accordion' });
-    const manageItem = el('div', { className: `analysis-accordion-item${openAccordionKey === manageAccordionKey ? ' open' : ''}` });
-    const manageHeaderBtn = el('div', {
-      className: 'analysis-accordion-header',
-      role: 'button',
-      tabIndex: '0',
-      'aria-expanded': String(openAccordionKey === manageAccordionKey)
-    }, [
-      el('span', { className: 'analysis-accordion-title', text: 'MANAGE ANNOTATION' }),
-      el('span', { className: 'analysis-accordion-desc', text: 'Add/remove columns from annotation (author)' }),
-      el('span', { className: 'analysis-accordion-chevron', 'aria-hidden': 'true' })
-    ]);
-    const manageContent = el('div', { className: 'analysis-accordion-content' });
+    if (role !== 'author') {
+      const msg = role === 'unknown'
+        ? 'Role: checking repo permissions…'
+        : `Role: ${role}. Only authors can change this.`;
+      manageContent.appendChild(el('p', { className: 'status-line', text: msg }));
+    }
 
-    registerAccordionPeer(manageAccordionKey, manageItem, manageHeaderBtn);
+    // Field selector dropdown
+    const fieldSelectWrap = el('div', { className: 'control-block' });
+    const fieldSelectId = createDomId(
+      'community-annotation-categorical-obs'
+    );
+    fieldSelectWrap.appendChild(el('label', {
+      for: fieldSelectId,
+      text: 'Categorical obs'
+    }));
+    const fieldSelect = el('select', {
+      id: fieldSelectId,
+      className: 'obs-select'
+    });
+    fieldSelect.appendChild(el('option', { value: '', text: allKeys.length ? 'None' : '(no categorical obs fields)' }));
+    for (const key of allKeys) {
+      const enabled = annotated.includes(key);
+      const closed = enabled ? Boolean(session.isFieldClosed(key)) : false;
+      const prefix = enabled ? (closed ? '🗳️🏁 ' : '🗳️ ') : '';
+      fieldSelect.appendChild(el('option', { value: key, text: prefix ? `${prefix}${key}` : key }));
+    }
+    if (selectedFieldKey) fieldSelect.value = selectedFieldKey;
+    fieldSelect.addEventListener('change', () => {
+      selectedFieldKey = fieldSelect.value || null;
+      render();
+    });
+    fieldSelectWrap.appendChild(fieldSelect);
+    manageContent.appendChild(fieldSelectWrap);
 
-    const toggleManageOpen = () => toggleAccordionPeer(manageAccordionKey);
-    manageHeaderBtn.addEventListener('click', () => toggleManageOpen());
-    manageHeaderBtn.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter' || e.key === ' ') {
-        e.preventDefault();
-        toggleManageOpen();
+    const manageActions = el('div', { className: 'community-annotation-consensus-actions', role: 'group', 'aria-label': 'Manage annotation actions' });
+
+    const lockedReason = !hasSelection
+      ? 'Select a categorical obs field first.'
+      : (repoConnectedForGating && !access.isAuthor() ? 'Author (maintain/admin) required.' : '');
+    const addBtn = createButton({ label: 'Add', title: lockedReason || 'Mark this column as annotatable' });
+    addBtn.disabled = !canManageAnnotatable;
+    const removeBtn = createButton({ label: 'Remove', title: lockedReason || 'Remove this column from annotation' });
+    removeBtn.disabled = !canManageAnnotatable;
+    const isAnnotatable = hasSelection && annotated.includes(selectedFieldKey);
+    const isClosed = isAnnotatable ? Boolean(session.isFieldClosed(selectedFieldKey)) : false;
+    const closeBtn = isAnnotatable
+      ? createButton({
+        label: isClosed ? 'Reopen' : 'Close',
+        title: isClosed ? 'Reopen this annotatable column for community voting.' : 'Close this annotatable column (voting disabled for annotators).',
+      })
+      : null;
+    if (closeBtn !== null) closeBtn.disabled = repoConnectedForGating && !access.isAuthor();
+
+    addBtn.addEventListener('click', () => {
+      if (!selectedFieldKey) return;
+      if (repoConnectedForGating && !access.isAuthor()) return;
+      if (annotated.includes(selectedFieldKey)) {
+        notifications.error(`"${selectedFieldKey}" is already in annotation list`, { category: 'annotation', duration: 2200 });
+        return;
       }
+      session.setFieldAnnotated(selectedFieldKey, true);
+      notifications.success(`Added "${selectedFieldKey}" to annotation`, { category: 'annotation', duration: 2200 });
+      render();
     });
 
-      if (role !== 'author') {
-        const msg = role === 'unknown'
-          ? 'Role: unknown (checking repo permissions). If this cannot be resolved, the repo will be disconnected.'
-          : `Role: ${role}. Only authors (maintain/admin) can change repo annotation settings.`;
-        manageContent.appendChild(el('div', { className: 'legend-help', text: msg }));
+    removeBtn.addEventListener('click', () => {
+      if (!selectedFieldKey) return;
+      if (repoConnectedForGating && !access.isAuthor()) return;
+      if (!annotated.includes(selectedFieldKey)) {
+        notifications.error(`"${selectedFieldKey}" is not in annotation list`, { category: 'annotation', duration: 2200 });
+        return;
       }
+      session.setFieldAnnotated(selectedFieldKey, false);
+      notifications.success(`Removed "${selectedFieldKey}" from annotation`, { category: 'annotation', duration: 2200 });
+      render();
+    });
 
-    manageContent.appendChild(el('div', {
-      className: 'legend-help',
-      text: 'Add or remove categorical columns from the annotation list. When connected to a repo, only authors can change this.'
-    }));
+    manageActions.appendChild(addBtn);
+    manageActions.appendChild(removeBtn);
+    if (closeBtn) {
+      closeBtn.addEventListener('click', () => {
+        if (!selectedFieldKey) return;
+        if (repoConnectedForGating && !access.isAuthor()) return;
+        const next = !Boolean(session.isFieldClosed(selectedFieldKey));
+        session.setFieldClosed(selectedFieldKey, next);
+        notifications.success(next ? `Closed "${selectedFieldKey}"` : `Reopened "${selectedFieldKey}"`, { category: 'annotation', duration: 2200 });
+        render();
+      });
+      manageActions.appendChild(closeBtn);
+    }
+    manageContent.appendChild(manageActions);
 
-      // Field selector dropdown
-      const fieldSelectWrap = el('div', { className: 'field-select' });
-      const fieldSelectId = createDomId(
-        'community-annotation-categorical-obs'
+    // Per-annotatable voting consensus settings (author-controlled, per field; only shown once the field is annotatable).
+    if (isAnnotatable) {
+      const info = createInfoTooltip('About consensus settings', 'community-consensus-settings');
+
+      const block = createInfoGroup('Consensus settings', info);
+      block.classList.add('community-annotation-annotatable-settings');
+
+      const canEditSettings = !repoConnectedForGating || access.isAuthor();
+      const applied = session.getAnnotatableConsensusSettings(selectedFieldKey);
+      if (!applied) {
+        throw new Error(
+          `Missing consensus settings for annotatable field ${JSON.stringify(selectedFieldKey)}`
+        );
+      }
+      if (
+        !annotatableSettingsDirty.has(selectedFieldKey) ||
+        !Object.hasOwn(annotatableSettingsDraft, selectedFieldKey)
+      ) {
+        annotatableSettingsDraft[selectedFieldKey] = { ...applied };
+      }
+      const draft = annotatableSettingsDraft[selectedFieldKey];
+
+      const annotatableThreshold = createSliderField({
+        label: 'Threshold',
+        min: -100,
+        max: 100,
+        step: 1,
+        value: Number(thresholdToSliderValue(draft.threshold)),
+        format: (value) => formatPctSigned11(sliderValueToThreshold(value)),
+        onCommit: (value) => {
+          if (!canEditSettings) return;
+          annotatableSettingsDraft[selectedFieldKey] = {
+            ...annotatableSettingsDraft[selectedFieldKey],
+            threshold: sliderValueToThreshold(value),
+          };
+          annotatableSettingsDirty.add(selectedFieldKey);
+          render();
+        },
+      });
+      annotatableThreshold.input.disabled = !canEditSettings;
+      block.appendChild(annotatableThreshold.root);
+
+      const annotatableMinWrap = el('div', { className: 'control-block' });
+      const minInputId = createDomId(
+        'community-annotation-annotatable-min'
       );
-      fieldSelectWrap.appendChild(el('label', {
-        for: fieldSelectId,
-        text: 'Categorical obs:'
+      annotatableMinWrap.appendChild(el('label', {
+        for: minInputId,
+        text: 'Min annotators'
       }));
-      const fieldSelect = el('select', {
-        id: fieldSelectId,
+      const minInput = el('input', {
+        id: minInputId,
+        type: 'number',
         className: 'obs-select',
-        'aria-label': 'Categorical obs'
+        value: String(draft.minAnnotators),
+        min: '0',
+        max: '50',
+        step: '1',
+        disabled: !canEditSettings
       });
-      fieldSelect.appendChild(el('option', { value: '', text: allKeys.length ? 'None' : '(no categorical obs fields)' }));
-      for (const key of allKeys) {
-        const enabled = annotated.includes(key);
-        const closed = enabled ? Boolean(session.isFieldClosed(key)) : false;
-        const prefix = enabled ? (closed ? '🗳️🏁 ' : '🗳️ ') : '';
-        fieldSelect.appendChild(el('option', { value: key, text: prefix ? `${prefix}${key}` : key }));
-      }
-      if (selectedFieldKey) fieldSelect.value = selectedFieldKey;
-      fieldSelect.addEventListener('change', () => {
-        selectedFieldKey = fieldSelect.value || null;
+      minInput.addEventListener('change', () => {
+        if (!canEditSettings) return;
+        const nextMin = clampInt(Number(minInput.value), 0, 50);
+        minInput.value = String(nextMin);
+        annotatableSettingsDraft[selectedFieldKey] = { ...annotatableSettingsDraft[selectedFieldKey], minAnnotators: nextMin };
+        annotatableSettingsDirty.add(selectedFieldKey);
         render();
       });
-      fieldSelectWrap.appendChild(fieldSelect);
-      manageContent.appendChild(fieldSelectWrap);
+      annotatableMinWrap.appendChild(minInput);
+      block.appendChild(annotatableMinWrap);
 
-      const manageActions = el('div', { className: 'community-annotation-consensus-actions', 'aria-label': 'Manage annotation actions' });
-
-      const lockedReason = !hasSelection
-        ? 'Select a categorical obs field first.'
-        : (repoConnectedForGating && !access.isAuthor() ? 'Author (maintain/admin) required.' : '');
-      const addBtn = el('button', { type: 'button', className: 'btn-small', text: 'Add', title: lockedReason || 'Mark this column as annotatable', disabled: !canManageAnnotatable });
-      const removeBtn = el('button', { type: 'button', className: 'btn-small', text: 'Remove', title: lockedReason || 'Remove this column from annotation', disabled: !canManageAnnotatable });
-      const isAnnotatable = hasSelection && annotated.includes(selectedFieldKey);
-      const isClosed = isAnnotatable ? Boolean(session.isFieldClosed(selectedFieldKey)) : false;
-      const closeBtn = isAnnotatable
-        ? el('button', {
-          type: 'button',
-          className: 'btn-small',
-          text: isClosed ? 'Reopen' : 'Close',
-          title: isClosed ? 'Reopen this annotatable column for community voting.' : 'Close this annotatable column (voting disabled for annotators).',
-          disabled: repoConnectedForGating && !access.isAuthor()
-        })
-        : null;
-
-      addBtn.addEventListener('click', () => {
-        if (!selectedFieldKey) return;
-        if (repoConnectedForGating && !access.isAuthor()) return;
-        if (annotated.includes(selectedFieldKey)) {
-          notifications.error(`"${selectedFieldKey}" is already in annotation list`, { category: 'annotation', duration: 2200 });
-          return;
-        }
-        session.setFieldAnnotated(selectedFieldKey, true);
-        notifications.success(`Added "${selectedFieldKey}" to annotation`, { category: 'annotation', duration: 2200 });
+      const actions = el('div', { className: 'community-annotation-consensus-actions', role: 'group', 'aria-label': 'Consensus settings actions' });
+      const settingsDirty = annotatableSettingsDirty.has(selectedFieldKey);
+      const apply = createButton({ label: 'Apply', variant: 'primary' });
+      apply.disabled = !canEditSettings || !settingsDirty;
+      const reset = createButton({ label: 'Reset' });
+      reset.disabled = !canEditSettings || !settingsDirty;
+      apply.addEventListener('click', () => {
+        if (!canEditSettings) return;
+        const next = Object.hasOwn(
+          annotatableSettingsDraft,
+          selectedFieldKey
+        )
+          ? annotatableSettingsDraft[selectedFieldKey]
+          : applied;
+        session.setAnnotatableConsensusSettings(selectedFieldKey, next);
+        annotatableSettingsDirty.delete(selectedFieldKey);
+        notifications.success('Consensus settings applied (local)', { category: 'annotation', duration: 1800 });
         render();
       });
-
-      removeBtn.addEventListener('click', () => {
-        if (!selectedFieldKey) return;
-        if (repoConnectedForGating && !access.isAuthor()) return;
-        if (!annotated.includes(selectedFieldKey)) {
-          notifications.error(`"${selectedFieldKey}" is not in annotation list`, { category: 'annotation', duration: 2200 });
-          return;
-        }
-        session.setFieldAnnotated(selectedFieldKey, false);
-        notifications.success(`Removed "${selectedFieldKey}" from annotation`, { category: 'annotation', duration: 2200 });
+      reset.addEventListener('click', () => {
+        if (!canEditSettings) return;
+        annotatableSettingsDraft[selectedFieldKey] = { ...applied };
+        annotatableSettingsDirty.delete(selectedFieldKey);
         render();
       });
+      actions.appendChild(apply);
+      actions.appendChild(reset);
+      block.appendChild(actions);
 
-      manageActions.appendChild(addBtn);
-      manageActions.appendChild(removeBtn);
-      if (closeBtn) {
-        closeBtn.addEventListener('click', () => {
-          if (!selectedFieldKey) return;
-          if (repoConnectedForGating && !access.isAuthor()) return;
-          const next = !Boolean(session.isFieldClosed(selectedFieldKey));
-          session.setFieldClosed(selectedFieldKey, next);
-          notifications.success(next ? `Closed "${selectedFieldKey}"` : `Reopened "${selectedFieldKey}"`, { category: 'annotation', duration: 2200 });
-          render();
-        });
-        manageActions.appendChild(closeBtn);
-      }
-      manageContent.appendChild(manageActions);
-
-      // Per-annotatable voting consensus settings (author-controlled, per field; only shown once the field is annotatable).
-      if (isAnnotatable) {
-        const info = createInfoTooltip('About consensus settings', [
-          'These settings control the voting consensus for this annotatable column (per column).',
-          'Changes are staged locally until you click Apply; Publish (as author) writes them to annotations/config.json.'
-        ]);
-
-        const block = el('div', { className: 'control-block community-annotation-settings relative' });
-        block.appendChild(el('div', { className: 'd-flex items-center gap-1' }, [
-          el('div', { className: 'legend-help', text: 'Annotatable consensus settings' }),
-          info.btn
-        ]));
-        block.appendChild(info.tooltip);
-
-        const canEditSettings = !repoConnectedForGating || access.isAuthor();
-        const applied = session.getAnnotatableConsensusSettings(selectedFieldKey);
-        if (!applied) {
-          throw new Error(
-            `Missing consensus settings for annotatable field ${JSON.stringify(selectedFieldKey)}`
-          );
-        }
-        if (
-          !annotatableSettingsDirty.has(selectedFieldKey) ||
-          !Object.hasOwn(annotatableSettingsDraft, selectedFieldKey)
-        ) {
-          annotatableSettingsDraft[selectedFieldKey] = { ...applied };
-        }
-        const draft = annotatableSettingsDraft[selectedFieldKey];
-
-        const thInputId = createDomId(
-          'community-annotation-annotatable-threshold'
-        );
-        const thLabel = el('label', {
-          for: thInputId,
-          text: 'Threshold:'
-        });
-        const thInput = el('input', {
-          id: thInputId,
-          type: 'range',
-          'aria-label': 'Annotatable consensus threshold',
-          min: '-100',
-          max: '100',
-          step: '1',
-          value: thresholdToSliderValue(draft.threshold),
-          disabled: !canEditSettings
-        });
-        const thDisplay = el('span', { className: 'slider-value', text: formatPctSigned11(clampConsensusThreshold11(Number(draft.threshold))) });
-        thInput.addEventListener('input', () => {
-          const v = sliderValueToThreshold(thInput.value);
-          thDisplay.textContent = formatPctSigned11(v);
-        });
-        thInput.addEventListener('change', () => {
-          if (!canEditSettings) return;
-          const v = sliderValueToThreshold(thInput.value);
-          annotatableSettingsDraft[selectedFieldKey] = { ...annotatableSettingsDraft[selectedFieldKey], threshold: v };
-          annotatableSettingsDirty.add(selectedFieldKey);
-          render();
-        });
-        block.appendChild(thLabel);
-        block.appendChild(el('div', { className: 'slider-row' }, [thInput, thDisplay]));
-
-        const minInputId = createDomId(
-          'community-annotation-annotatable-min'
-        );
-        const minLabel = el('label', {
-          for: minInputId,
-          text: 'Min annotators:'
-        });
-        const minInput = el('input', {
-          id: minInputId,
-          type: 'number',
-          className: 'obs-select',
-          'aria-label': 'Annotatable min annotators',
-          value: String(draft.minAnnotators),
-          min: '0',
-          max: '50',
-          step: '1',
-          disabled: !canEditSettings
-        });
-        minInput.addEventListener('change', () => {
-          if (!canEditSettings) return;
-          const nextMin = clampInt(Number(minInput.value), 0, 50);
-          minInput.value = String(nextMin);
-          annotatableSettingsDraft[selectedFieldKey] = { ...annotatableSettingsDraft[selectedFieldKey], minAnnotators: nextMin };
-          annotatableSettingsDirty.add(selectedFieldKey);
-          render();
-        });
-        block.appendChild(minLabel);
-        block.appendChild(minInput);
-
-        const actions = el('div', { className: 'community-annotation-consensus-actions', 'aria-label': 'Annotatable consensus settings actions' });
-        const apply = el('button', { type: 'button', className: 'btn-small', text: 'Apply', disabled: !canEditSettings || !annotatableSettingsDirty.has(selectedFieldKey) });
-        const reset = el('button', { type: 'button', className: 'btn-small', text: 'Reset', disabled: !canEditSettings || !annotatableSettingsDirty.has(selectedFieldKey) });
-        apply.addEventListener('click', () => {
-          if (!canEditSettings) return;
-          const next = Object.hasOwn(
-            annotatableSettingsDraft,
-            selectedFieldKey
-          )
-            ? annotatableSettingsDraft[selectedFieldKey]
-            : applied;
-          session.setAnnotatableConsensusSettings(selectedFieldKey, next);
-          annotatableSettingsDirty.delete(selectedFieldKey);
-          notifications.success('Consensus settings applied (local)', { category: 'annotation', duration: 1800 });
-          render();
-        });
-        reset.addEventListener('click', () => {
-          if (!canEditSettings) return;
-          annotatableSettingsDraft[selectedFieldKey] = { ...applied };
-          annotatableSettingsDirty.delete(selectedFieldKey);
-          render();
-        });
-        actions.appendChild(apply);
-        actions.appendChild(reset);
-        block.appendChild(actions);
-
-        manageContent.appendChild(block);
-      }
-
-    manageItem.appendChild(manageHeaderBtn);
-    manageItem.appendChild(manageContent);
-    manageAccordion.appendChild(manageItem);
-    manageBlock.appendChild(manageAccordion);
+      manageContent.appendChild(block);
+    }
 
     // ─────────────────────────────────────────────────────────────────────────
     // CONSENSUS SNAPSHOT + LOCAL CACHE (one collapsible)
     // ─────────────────────────────────────────────────────────────────────────
-    const exportsCacheBlock = el('div', { className: 'control-block relative' });
+    const exportsDisclosure = createPeerDisclosure(
+      'exports-cache',
+      'Snapshot and cache',
+      'community-snapshot'
+    );
+    const exportsContent = exportsDisclosure.content;
 
-    const exportsAccordionKey = 'exports-cache';
-    const exportsAccordion = el('div', { className: 'analysis-accordion' });
-    const exportsItem = el('div', { className: `analysis-accordion-item${openAccordionKey === exportsAccordionKey ? ' open' : ''}` });
-    const exportsHeaderBtn = el('div', {
-      className: 'analysis-accordion-header',
-      role: 'button',
-      tabIndex: '0',
-      'aria-expanded': String(openAccordionKey === exportsAccordionKey)
-    }, [
-      el('span', { className: 'analysis-accordion-title', text: 'CONSENSUS SNAPSHOT + LOCAL CACHE' }),
-      el('span', { className: 'analysis-accordion-desc', text: 'Download cellucid-consensus.json and manage local cache' }),
-      el('span', { className: 'analysis-accordion-chevron', 'aria-hidden': 'true' })
-    ]);
-    const exportsContent = el('div', { className: 'analysis-accordion-content' });
-
-    registerAccordionPeer(exportsAccordionKey, exportsItem, exportsHeaderBtn);
-    const toggleExportsOpen = () => toggleAccordionPeer(exportsAccordionKey);
-    exportsHeaderBtn.addEventListener('click', () => toggleExportsOpen());
-    exportsHeaderBtn.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter' || e.key === ' ') {
-        e.preventDefault();
-        toggleExportsOpen();
-      }
+    // Consensus snapshot. Its (i) is the disclosure's, above; the file name
+    // is on the button's title.
+    const consensusDownloadBlock = el('div', { className: 'control-block' });
+    const consensusDownloadActions = el('div', { className: 'community-annotation-cache-actions', role: 'group', 'aria-label': 'Consensus snapshot actions' });
+    const downloadBtn = createButton({
+      label: 'Download',
+      title: 'Download cellucid-consensus.json',
+      onClick: () => {
+        try {
+          const doc = session.buildConsensusDocument({ includeComments: false, includeMergedFrom: false });
+          if (!doc) throw new Error('Consensus snapshot unavailable');
+          downloadJsonAsFile(CONSENSUS_SNAPSHOT_FILENAME, doc);
+          notifications.success(
+            `Downloaded ${CONSENSUS_SNAPSHOT_FILENAME}`,
+            { category: 'annotation', duration: 2200 }
+          );
+        } catch (err) {
+          notifications.error(err?.message || 'Failed to build cellucid-consensus.json', { category: 'annotation', duration: 6000 });
+        }
+      },
     });
-
-    // Consensus snapshot (cellucid-consensus.json)
-    const consensusDownloadBlock = el('div', { className: 'control-block relative' });
-    const consensusDownloadInfo = createInfoTooltip('About consensus snapshots', [
-      'Downloads a cellucid-consensus.json snapshot of the current merged view.',
-      'Tip: Pull first to refresh the locally cached raw files from GitHub.',
-      'This is generated in your browser and is never written back to GitHub.'
-    ]);
-    consensusDownloadBlock.appendChild(createInfoLabel(
-      'Consensus snapshot (cellucid-consensus.json)',
-      consensusDownloadInfo
-    ));
-    consensusDownloadBlock.appendChild(consensusDownloadInfo.tooltip);
-    const consensusDownloadActions = el('div', { className: 'community-annotation-cache-actions', 'aria-label': 'Consensus snapshot actions' });
-    const downloadBtn = el('button', { type: 'button', className: 'btn-small', text: 'Download', disabled: controller.isSyncBusy() });
-    downloadBtn.title = 'Download cellucid-consensus.json';
-    downloadBtn.addEventListener('click', () => {
-      try {
-        const doc = session.buildConsensusDocument({ includeComments: false, includeMergedFrom: false });
-        if (!doc) throw new Error('Consensus snapshot unavailable');
-        downloadJsonAsFile(CONSENSUS_SNAPSHOT_FILENAME, doc);
-        notifications.success(
-          `Downloaded ${CONSENSUS_SNAPSHOT_FILENAME}`,
-          { category: 'annotation', duration: 2200 }
-        );
-      } catch (err) {
-        notifications.error(err?.message || 'Failed to build cellucid-consensus.json', { category: 'annotation', duration: 6000 });
-      }
-    });
+    downloadBtn.disabled = controller.isSyncBusy();
     consensusDownloadActions.appendChild(downloadBtn);
     consensusDownloadBlock.appendChild(consensusDownloadActions);
     exportsContent.appendChild(consensusDownloadBlock);
 
     // Local cache
-    const cacheBlock = el('div', { className: 'control-block relative' });
-    const cacheInfo = createInfoTooltip('About local annotation data', [
-      'Session state stores your local votes/suggestions/comments until you Publish.',
-      'Downloaded files cache stores raw GitHub files (annotations/users/* and optional annotations/moderation/merges.json) to speed up Pull.',
-      'Clearing caches never writes anything to GitHub.'
-    ]);
-    cacheBlock.appendChild(createInfoLabel('Local cache', cacheInfo));
-    cacheBlock.appendChild(cacheInfo.tooltip);
+    const cacheInfo = createInfoTooltip('About local annotation data', 'community-cache');
+    const cacheBlock = createInfoGroup('Local cache', cacheInfo);
 
-    const cacheActions = el('div', { className: 'community-annotation-cache-actions', 'aria-label': 'Local cache actions' });
-      const clearSessionBtn = el('button', { type: 'button', className: 'btn-small', text: 'Clear session', disabled: controller.isSyncBusy() });
-      clearSessionBtn.addEventListener('click', () => {
-        startBackgroundTask(async () => {
-          const owner = publishContextOwner(getCacheContext({}));
-          const ok = await confirmAsync({
-            title: 'Clear local session?',
-            message: 'This clears your local session state (votes, suggestions, comments, and annotatable-column selections) for the current dataset/repo/branch in this browser.',
-            confirmText: 'Clear session',
-            signal: owner.signal,
-          });
-          if (!ok || !isContextOwnerCurrent(owner)) return;
+    const cacheActions = el('div', { className: 'community-annotation-cache-actions', role: 'group', 'aria-label': 'Local cache actions' });
+    const clearSessionBtn = createButton({ label: 'Clear session' });
+    clearSessionBtn.disabled = controller.isSyncBusy();
+    clearSessionBtn.addEventListener('click', () => {
+      startBackgroundTask(async () => {
+        const owner = publishContextOwner(getCacheContext({}));
+        const ok = await confirmAsync({
+          title: 'Clear local session?',
+          message: 'This clears your local session state (votes, suggestions, comments, and annotatable-column selections) for the current dataset/repo/branch in this browser.',
+          confirmText: 'Clear session',
+          signal: owner.signal,
+        });
+        if (!ok || !isContextOwnerCurrent(owner)) return;
         session.clearLocalCache({ keepVotingMode: false });
         notifications.success('Local session cleared', { category: 'annotation', duration: 2200 });
         render();
@@ -1063,27 +878,23 @@ export function createControlsPanel(controller) {
     const cacheUser = getCacheUserKey();
     const cacheUserId = getCacheUserId();
     const repoRef = getAnnotationRepoForDataset(cacheDatasetId, cacheUser) || null;
-    const clearFilesBtn = el('button', {
-      type: 'button',
-      className: 'btn-small',
-      text: 'Clear downloads',
-      disabled: controller.isSyncBusy() || !(cacheDatasetId && repoRef && cacheUserId)
-    });
-      clearFilesBtn.addEventListener('click', () => {
-        startBackgroundTask(async () => {
-          if (!cacheDatasetId || !repoRef || !cacheUserId) return;
-          const owner = publishContextOwner(getCacheContext({}));
-          const ok = await confirmAsync({
+    const clearFilesBtn = createButton({ label: 'Clear downloads' });
+    clearFilesBtn.disabled = controller.isSyncBusy() || !(cacheDatasetId && repoRef && cacheUserId);
+    clearFilesBtn.addEventListener('click', () => {
+      startBackgroundTask(async () => {
+        if (!cacheDatasetId || !repoRef || !cacheUserId) return;
+        const owner = publishContextOwner(getCacheContext({}));
+        const ok = await confirmAsync({
           title: 'Clear downloaded files?',
           message:
             `This clears locally cached copies of raw files under annotations/users/ and annotations/moderation/.\n\n` +
             `Tip: Pull again to re-download what you need.`,
-            confirmText: 'Clear downloads',
-            signal: owner.signal,
-          });
-          if (!ok || !isContextOwnerCurrent(owner)) return;
-          await fileCache.clearRepo({ datasetId: cacheDatasetId, repoRef, userId: cacheUserId });
-          if (!isContextOwnerCurrent(owner)) return;
+          confirmText: 'Clear downloads',
+          signal: owner.signal,
+        });
+        if (!ok || !isContextOwnerCurrent(owner)) return;
+        await fileCache.clearRepo({ datasetId: cacheDatasetId, repoRef, userId: cacheUserId });
+        if (!isContextOwnerCurrent(owner)) return;
         notifications.success('Downloaded file cache cleared', { category: 'annotation', duration: 2200 });
         render();
       }, { label: 'Unable to clear downloaded annotation files' });
@@ -1094,17 +905,13 @@ export function createControlsPanel(controller) {
     cacheBlock.appendChild(cacheActions);
     exportsContent.appendChild(cacheBlock);
 
-    exportsItem.appendChild(exportsHeaderBtn);
-    exportsItem.appendChild(exportsContent);
-    exportsAccordion.appendChild(exportsItem);
-    exportsCacheBlock.appendChild(exportsAccordion);
-
-    // Collapsibles: always at the bottom of the section.
-    container.appendChild(manageBlock);
-    container.appendChild(consensusBlock);
-    container.appendChild(exportsCacheBlock);
-    syncAccordionPeers();
-
+    // Collapsibles: always at the bottom of the section, in one list.
+    const collapsibles = el('div', { className: 'control-block disclosure-list community-annotation-disclosures' }, [
+      manageDisclosure.root,
+      consensusDisclosure.root,
+      exportsDisclosure.root,
+    ]);
+    container.appendChild(collapsibles);
     // Popup handles per-category voting/suggestions; keep the sidebar compact.
   }
 

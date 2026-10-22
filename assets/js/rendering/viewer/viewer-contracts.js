@@ -12,10 +12,13 @@
  */
 
 import { cloneCameraState } from '../camera-state-contract.js';
+import {
+  VIEWER_BACKGROUND_ERROR_MESSAGE,
+  isViewerBackground
+} from '../viewer-backgrounds.js';
 
 const VALID_DIMENSION_LEVELS = new Set([1, 2, 3]);
 
-const VALID_VIEWER_BACKGROUNDS = new Set(['grid', 'grid-dark', 'white', 'black']);
 const VALID_RENDER_MODES = new Set(['points', 'smoke']);
 
 /**
@@ -121,13 +124,23 @@ function assertExactFloat32Array(value, expectedLength, label) {
   return value;
 }
 
+/**
+ * Float32 arrays already proven finite. A published positions or centroid
+ * array is never written after publication, so it is scanned once, the
+ * first time it is published: a representation switch back to a layout the
+ * viewer has shown costs no O(N) pass (a full scan is 30-60 ms at 10M 3D).
+ */
+const PROVEN_FINITE_FLOAT32_ARRAYS = new WeakSet();
+
 function assertFiniteFloat32Array(value, expectedLength, label) {
   const exact = assertExactFloat32Array(value, expectedLength, label);
+  if (PROVEN_FINITE_FLOAT32_ARRAYS.has(exact)) return exact;
   for (let index = 0; index < exact.length; index += 1) {
     if (!Number.isFinite(exact[index])) {
       throw new RangeError(`${label} value ${index} must be finite.`);
     }
   }
+  PROVEN_FINITE_FLOAT32_ARRAYS.add(exact);
   return exact;
 }
 
@@ -143,17 +156,40 @@ function assertExactUint8Array(value, expectedLength, label) {
   return value;
 }
 
+/**
+ * Point transparency: one byte a cell, exactly 0 (hidden) or 1 (shown).
+ * See rendering/alpha-visibility.js.
+ */
 function assertTransparencyArray(value, expectedLength, label) {
-  const exact = assertExactFloat32Array(value, expectedLength, label);
+  const exact = assertExactUint8Array(value, expectedLength, label);
   for (let index = 0; index < exact.length; index += 1) {
-    const alpha = exact[index];
-    if (!Number.isFinite(alpha) || alpha < 0 || alpha > 1) {
+    if (exact[index] > 1) {
       throw new RangeError(
-        `${label} value ${index} must be finite and between 0 and 1.`
+        `${label} value ${index} must be exactly 0 or 1.`
       );
     }
   }
   return exact;
+}
+
+/**
+ * A view's layout key: the identity of the embedding its positions belong
+ * to, or exact null for a view with no dataset.
+ *
+ * @param {unknown} layoutKey
+ * @param {string} label
+ * @returns {string|null}
+ */
+function assertViewLayoutKey(layoutKey, label) {
+  if (
+    layoutKey !== null &&
+    (typeof layoutKey !== 'string' || layoutKey.length === 0)
+  ) {
+    throw new TypeError(
+      `${label} layoutKey must be a non-empty string or exact null.`
+    );
+  }
+  return layoutKey;
 }
 
 function assertViewerDataPayload(payload) {
@@ -163,24 +199,33 @@ function assertViewerDataPayload(payload) {
       'positions',
       'colors',
       'transparency',
-      'dimensionLevel'
+      'dimensionLevel',
+      'layoutKey'
     ],
     'Viewer data'
   );
   const dimensionLevel = exact.dimensionLevel;
   getDefaultNavigationMode(dimensionLevel);
-  if (
-    !(exact.positions instanceof Float32Array) ||
-    exact.positions.length % 3 !== 0
-  ) {
+  const layoutKey = assertViewLayoutKey(exact.layoutKey, 'Viewer data');
+  if (layoutKey === null && exact.positions?.length !== 0) {
     throw new TypeError(
-      'Viewer positions must be a Float32Array with exactly three values per point.'
+      'Viewer data with points must name the layout its positions belong to.'
     );
   }
-  const pointCount = exact.positions.length / 3;
+  // Positions carry exactly the embedding's components per point, so the
+  // published dimension is also their stride (rendering/position-layout.js).
+  if (
+    !(exact.positions instanceof Float32Array) ||
+    exact.positions.length % dimensionLevel !== 0
+  ) {
+    throw new TypeError(
+      'Viewer positions must be a Float32Array with exactly dimensionLevel values per point.'
+    );
+  }
+  const pointCount = exact.positions.length / dimensionLevel;
   assertFiniteFloat32Array(
     exact.positions,
-    pointCount * 3,
+    pointCount * dimensionLevel,
     'Viewer positions'
   );
   assertExactUint8Array(exact.colors, pointCount * 4, 'Viewer colors');
@@ -194,6 +239,7 @@ function assertViewerDataPayload(payload) {
     colors: exact.colors,
     transparency: exact.transparency,
     dimensionLevel,
+    layoutKey,
     pointCount
   };
 }
@@ -340,8 +386,13 @@ function assertSnapshotConfig(config, sourcePointCount) {
     label: exact.label,
     fieldKey: exact.fieldKey,
     fieldKind: exact.fieldKind,
-    colors: new Uint8Array(exact.colors),
-    transparency: new Float32Array(exact.transparency),
+    // A snapshot's colors are kept by reference: the application never writes
+    // into an array it has handed to a snapshot (a recolor publishes a new
+    // one), which is the same contract the renderer's snapshot store states.
+    // Transparency is copied, because the viewer must keep the accepted
+    // generation to restore when a later publication fails.
+    colors: exact.colors,
+    transparency: new Uint8Array(exact.transparency),
     centroidPositions: allCentroidsNull
       ? null
       : new Float32Array(exact.centroidPositions),
@@ -399,10 +450,8 @@ function assertCentroidLabelEntries(labels) {
 }
 
 function assertViewerBackground(mode) {
-  if (!VALID_VIEWER_BACKGROUNDS.has(mode)) {
-    throw new TypeError(
-      'Viewer background must be exactly "grid", "grid-dark", "white", or "black".'
-    );
+  if (!isViewerBackground(mode)) {
+    throw new TypeError(VIEWER_BACKGROUND_ERROR_MESSAGE);
   }
   return mode;
 }
@@ -433,5 +482,6 @@ export {
   assertViewId,
   assertViewerBackground,
   assertViewerDataPayload,
+  assertViewLayoutKey,
   cloneSnapshotMeta,
 };

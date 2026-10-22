@@ -18,8 +18,8 @@
 .cursor-not-allowed { cursor: not-allowed !important; }
 
 /* User select */
-.select-none { user-select: none !important; }
-.select-text { user-select: text !important; }
-.select-all { user-select: all !important; }
-.select-auto { user-select: auto !important; }
+.select-none { -webkit-user-select: none !important; user-select: none !important; }
+.select-text { -webkit-user-select: text !important; user-select: text !important; }
+.select-all { -webkit-user-select: all !important; user-select: all !important; }
+.select-auto { -webkit-user-select: auto !important; user-select: auto !important; }
 

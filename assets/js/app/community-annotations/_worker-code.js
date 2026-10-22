@@ -31,23 +31,20 @@ const CAP_REQUEST_BODY_MAX_BYTES = 4 * 1024;
 const CAP_RESPONSE_BODY_MAX_BYTES = 8 * 1024 * 1024;
 const CAP_OUTPUT_BODY_MAX_BYTES = 8 * 1024 * 1024;
 const CAP_LOOKUP_LIMIT_MAX = 25;
-const CAP_DATASET_LIMIT_MAX = 10;
 const CAP_PREFLIGHT_MAX_AGE_SECONDS = 600;
 const CAP_TERM_MAX_CODE_POINTS = 256;
 const CAP_MARKER_TERM_MAX_CODE_POINTS = (50 * 64) + 49;
-const CAP_ID_MAX_CODE_POINTS = 64;
-const CAP_TEXT_MAX_CODE_POINTS = 512;
-const CAP_GENE_MAX_CODE_POINTS = 64;
-const CAP_SYNONYM_MAX_ITEMS = 100;
-const CAP_MARKER_MAX_ITEMS = 200;
+// An upstream result's own strings and arrays have no length limit: a result
+// is kept whole, and the whole upstream body is bounded by
+// CAP_RESPONSE_BODY_MAX_BYTES (and what the gateway returns by
+// CAP_OUTPUT_BODY_MAX_BYTES).
+const CAP_RESULT_UNBOUNDED = Number.MAX_SAFE_INTEGER;
 const GITHUB_STANDARD_RESPONSE_BODY_MAX_BYTES = 1_500_000;
 const GITHUB_COLLECTION_PAGE_MAX_BYTES = 1_500_000;
 const GITHUB_CONTENT_RESPONSE_MAX_BYTES = 1_500_000;
 const GITHUB_TREE_RESPONSE_MAX_BYTES = 7_500_000;
 const CAP_LOOKUP_APQ_HASH =
   '7669f4698d1243244b365018dc60a69b61969791659814e0b4ad1b65385ddaab';
-const CAP_DATASET_APQ_HASH =
-  '84226dc93685478baaabbc0687bb8c85fd24ea280c9d1db957d332dc8a9bff57';
 const OPERATION_ID_HEADER = 'X-Cellucid-Operation-Id';
 const OPERATION_OUTCOME_HEADER = 'X-Cellucid-Operation-Outcome';
 const OPERATION_ID =
@@ -62,7 +59,6 @@ const CAP_LOOKUP_KINDS = new Set([
   'name',
   'ontology',
   'marker',
-  'feedback',
 ]);
 const CAP_ONTOLOGY_LOOKUP_FIELDS = Object.freeze(['ontologyTermId']);
 const CAP_MARKER_LOOKUP_FIELDS = Object.freeze([
@@ -659,9 +655,7 @@ export default {
           403
         );
       }
-      const isCapLookup = url.pathname === '/cap/lookup-cells';
-      const isCapDatasetSearch = url.pathname === '/cap/search-datasets';
-      const isCapRoute = isCapLookup || isCapDatasetSearch;
+      const isCapRoute = url.pathname === '/cap/lookup-cells';
       const isCapNamespace =
         url.pathname === '/cap' || url.pathname.startsWith('/cap/');
       if (isCapNamespace && !isCapRoute) {
@@ -697,14 +691,7 @@ export default {
       if (isCapRoute) {
         requireMethod(request, 'POST');
         requestScope = createWorkerRequestScope(request);
-        return isCapLookup
-          ? await handleCapLookup(request, url, corsHeaders, requestScope)
-          : await handleCapDatasetSearch(
-              request,
-              url,
-              corsHeaders,
-              requestScope
-            );
+        return await handleCapLookup(request, url, corsHeaders, requestScope);
       }
       if (!ALLOWED_METHODS.has(request.method)) {
         throw new WorkerHttpError(405, `Method is not allowed: ${request.method}`);
@@ -765,7 +752,6 @@ export default {
               '/auth/installations',
               '/auth/installation-repos',
               '/cap/lookup-cells',
-              '/cap/search-datasets',
               '/api/repos/*',
             ],
           },
@@ -1992,7 +1978,9 @@ async function executeCapPersistedQuery(
           createCapPersistedQueryDocument(operationName, hash, variables)
         ),
         credentials: 'omit',
-        redirect: 'error',
+        // The Workers runtime rejects `redirect: 'error'` outright. A manual
+        // redirect arrives as a non-2xx response, which the preflight refuses.
+        redirect: 'manual',
       },
       'CAP GraphQL request',
       requestScope
@@ -2041,15 +2029,12 @@ function assertCapNonnegativeSafeInteger(value, label) {
   return value;
 }
 
-function projectCapStringArray(value, label, maxItems, maxCodePoints) {
-  if (!Array.isArray(value) || value.length > maxItems) {
-    throw new WorkerHttpError(
-      502,
-      `${label} must be an array with at most ${maxItems} items`
-    );
+function projectCapStringArray(value, label) {
+  if (!Array.isArray(value)) {
+    throw new WorkerHttpError(502, `${label} must be an array`);
   }
   return value.map((entry, index) =>
-    assertCapString(entry, `${label}[${index}]`, maxCodePoints)
+    assertCapString(entry, `${label}[${index}]`, CAP_RESULT_UNBOUNDED)
   );
 }
 
@@ -2076,68 +2061,45 @@ function projectCapLookupItem(value, index) {
     );
   }
   return {
-    id: assertCapString(item.id, `${label}.id`, CAP_ID_MAX_CODE_POINTS),
+    id: assertCapString(item.id, `${label}.id`, CAP_RESULT_UNBOUNDED),
     name: assertCapString(
       item.name,
       `${label}.name`,
-      CAP_TEXT_MAX_CODE_POINTS
+      CAP_RESULT_UNBOUNDED
     ),
     fullName: assertCapString(
       item.fullName,
       `${label}.fullName`,
-      CAP_TEXT_MAX_CODE_POINTS
+      CAP_RESULT_UNBOUNDED
     ),
     ontologyTerm: assertNullableCapString(
       item.ontologyTerm,
       `${label}.ontologyTerm`,
-      CAP_TEXT_MAX_CODE_POINTS
+      CAP_RESULT_UNBOUNDED
     ),
     ontologyTermId: assertNullableCapString(
       item.ontologyTermId,
       `${label}.ontologyTermId`,
-      CAP_ID_MAX_CODE_POINTS
+      CAP_RESULT_UNBOUNDED
     ),
     synonyms: projectCapStringArray(
       item.synonyms,
-      `${label}.synonyms`,
-      CAP_SYNONYM_MAX_ITEMS,
-      CAP_TEXT_MAX_CODE_POINTS
+      `${label}.synonyms`
     ),
     markerGenes: projectCapStringArray(
       item.markerGenes,
-      `${label}.markerGenes`,
-      CAP_MARKER_MAX_ITEMS,
-      CAP_GENE_MAX_CODE_POINTS
+      `${label}.markerGenes`
     ),
     canonicalMarkerGenes: projectCapStringArray(
       item.canonicalMarkerGenes,
-      `${label}.canonicalMarkerGenes`,
-      CAP_MARKER_MAX_ITEMS,
-      CAP_GENE_MAX_CODE_POINTS
+      `${label}.canonicalMarkerGenes`
     ),
     count: assertCapNonnegativeSafeInteger(item.count, `${label}.count`),
     scores: { agree, disagree, idk },
   };
 }
 
-function projectCapDatasetItem(value, index) {
-  const label = `CAP dataset result[${index}]`;
-  const item = assertUpstreamRecord(value, label);
-  return {
-    id: assertCapString(item.id, `${label}.id`, CAP_ID_MAX_CODE_POINTS),
-    name: assertCapString(
-      item.name,
-      `${label}.name`,
-      CAP_TEXT_MAX_CODE_POINTS
-    ),
-    cellCount: assertCapNonnegativeSafeInteger(
-      item.cellCount,
-      `${label}.cellCount`
-    ),
-  };
-}
-
-function projectCapGraphQlResults(document, field, limit, projectItem) {
+function projectCapLookupResults(document, limit) {
   const response = assertUpstreamRecord(document, 'CAP GraphQL response');
   if (Object.hasOwn(response, 'errors')) {
     if (!Array.isArray(response.errors) || response.errors.length !== 0) {
@@ -2148,11 +2110,11 @@ function projectCapGraphQlResults(document, field, limit, projectItem) {
     response.data,
     'CAP GraphQL response.data'
   );
-  const rawResults = data[field];
+  const rawResults = data.lookupCells;
   if (!Array.isArray(rawResults) || rawResults.length > limit) {
     throw new WorkerHttpError(
       502,
-      `CAP GraphQL response.data.${field} is invalid`
+      'CAP GraphQL response.data.lookupCells is invalid'
     );
   }
 
@@ -2160,7 +2122,7 @@ function projectCapGraphQlResults(document, field, limit, projectItem) {
   let omittedInvalidCount = 0;
   for (let index = 0; index < rawResults.length; index += 1) {
     try {
-      results.push(projectItem(rawResults[index], index));
+      results.push(projectCapLookupItem(rawResults[index], index));
     } catch (error) {
       if (!(error instanceof WorkerHttpError) || error.status !== 502) {
         throw error;
@@ -2209,7 +2171,7 @@ async function handleCapLookup(request, url, corsHeaders, requestScope) {
   if (!CAP_LOOKUP_KINDS.has(kind)) {
     throw new WorkerHttpError(
       400,
-      'CAP lookup kind must be name, ontology, marker, or feedback'
+      'CAP lookup kind must be name, ontology, or marker'
     );
   }
   const term = assertExactString(body.term, 'CAP lookup term', {
@@ -2230,58 +2192,7 @@ async function handleCapLookup(request, url, corsHeaders, requestScope) {
     requestScope
   );
   return capGatewayResponse(
-    projectCapGraphQlResults(
-      document,
-      'lookupCells',
-      limit,
-      projectCapLookupItem
-    ),
-    corsHeaders
-  );
-}
-
-async function handleCapDatasetSearch(
-  request,
-  url,
-  corsHeaders,
-  requestScope
-) {
-  assertNoQuery(url, 'CAP dataset search route');
-  assertCapRequestHasNoCredentials(request);
-  const body = await readExactRequestObject(
-    request,
-    'CAP dataset search request',
-    ['search', 'limit'],
-    requestScope,
-    CAP_REQUEST_BODY_MAX_BYTES
-  );
-  let search = null;
-  if (body.search !== null) {
-    search = assertExactString(body.search, 'CAP dataset search', {
-      max: CAP_TERM_MAX_CODE_POINTS,
-    });
-  }
-  const limit = assertCapLimit(
-    body.limit,
-    CAP_DATASET_LIMIT_MAX,
-    'CAP dataset limit'
-  );
-  const document = await executeCapPersistedQuery(
-    'SearchDatasets',
-    CAP_DATASET_APQ_HASH,
-    {
-      options: { limit },
-      search: search === null ? null : { name: search },
-    },
-    requestScope
-  );
-  return capGatewayResponse(
-    projectCapGraphQlResults(
-      document,
-      'results',
-      limit,
-      projectCapDatasetItem
-    ),
+    projectCapLookupResults(document, limit),
     corsHeaders
   );
 }

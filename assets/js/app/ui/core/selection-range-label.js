@@ -31,6 +31,7 @@ function ensureRangeLabelElement(id) {
   if (existing) return existing;
   const el = document.createElement('div');
   el.id = id;
+  el.hidden = true;
   document.body.appendChild(el);
   return el;
 }
@@ -50,11 +51,11 @@ export function getSelectionRangeLabel(options = {}) {
     element.textContent = `${formatRangeValue(minVal)} → ${formatRangeValue(maxVal)}`;
     element.style.left = `${x}px`;
     element.style.top = `${y}px`;
-    element.style.display = 'block';
+    element.hidden = false;
   }
 
   function hide() {
-    element.style.display = 'none';
+    element.hidden = true;
   }
 
   return { element, show, hide };

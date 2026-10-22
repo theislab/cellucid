@@ -40,10 +40,11 @@ test('snapshot R8 alpha stays exact through every draw and resource lifecycle', 
       deleteBuffer: prototype.deleteBuffer,
       deleteTexture: prototype.deleteTexture,
       deleteVertexArray: prototype.deleteVertexArray,
-      getError: prototype.getError,
       getParameter: prototype.getParameter,
       texImage2D: prototype.texImage2D,
       texSubImage2D: prototype.texSubImage2D,
+      texStorage3D: prototype.texStorage3D,
+      texSubImage3D: prototype.texSubImage3D,
     };
     const calls = {
       bufferData: [],
@@ -60,7 +61,6 @@ test('snapshot R8 alpha stays exact through every draw and resource lifecycle', 
     const textureMirrors = new Map();
     const controlledMaxTextureSize = 64;
     let injectedTexture = null;
-    let syntheticErrorPending = false;
 
     const byteLengthOf = value => {
       if (typeof value === 'number') return value;
@@ -162,10 +162,27 @@ test('snapshot R8 alpha stays exact through every draw and resource lifecycle', 
       }
       return result;
     };
+    // A rejected write into an accepted texture fails synchronously (WebGL
+    // throws for arguments it rejects) and writes nothing; it is counted.
+    const rejectInjected = (context, texture, record) => {
+      if (context !== gl || texture === null || texture !== injectedTexture) return;
+      injectedTexture = null;
+      calls.texSubImage2D.push(record);
+      throw new TypeError('WebGL rejected the snapshot alpha texture upload.');
+    };
     prototype.texSubImage2D = function (...args) {
       const texture = this === gl
         ? this.getParameter(this.TEXTURE_BINDING_2D)
         : null;
+      rejectInjected(this, texture, {
+        format: args[6],
+        height: args[5],
+        texture,
+        type: args[7],
+        width: args[4],
+        x: args[2],
+        y: args[3],
+      });
       const result = Reflect.apply(
         originals.texSubImage2D,
         this,
@@ -203,19 +220,79 @@ test('snapshot R8 alpha stays exact through every draw and resource lifecycle', 
             );
           }
         }
-        if (texture !== null && texture === injectedTexture) {
-          injectedTexture = null;
-          syntheticErrorPending = true;
-        }
       }
       return result;
     };
-    prototype.getError = function (...args) {
-      if (this === gl && syntheticErrorPending) {
-        syntheticErrorPending = false;
-        return this.OUT_OF_MEMORY;
+    // Per-point textures are linear textures (rendering/linear-texture.js):
+    // TEXTURE_2D_ARRAY storage, then rows. An R8 allocation counts as the
+    // allocation (texImage2D) and every row write as an upload (texSubImage2D),
+    // mirrored the same way.
+    prototype.texStorage3D = function (...args) {
+      const texture = this === gl
+        ? this.getParameter(this.TEXTURE_BINDING_2D_ARRAY)
+        : null;
+      const result = Reflect.apply(originals.texStorage3D, this, args);
+      if (this === gl && args[2] === this.R8) {
+        calls.texImage2D.push({
+          format: this.RED,
+          height: args[4],
+          internalFormat: args[2],
+          texture,
+          type: this.UNSIGNED_BYTE,
+          width: args[3],
+        });
+        textureMirrors.set(texture, {
+          bytes: new Uint8Array(args[3] * args[4] * args[5]),
+          height: args[4],
+          width: args[3],
+        });
       }
-      return Reflect.apply(originals.getError, this, args);
+      return result;
+    };
+    prototype.texSubImage3D = function (...args) {
+      const texture = this === gl
+        ? this.getParameter(this.TEXTURE_BINDING_2D_ARRAY)
+        : null;
+      rejectInjected(this, texture, {
+        format: args[8],
+        height: args[6],
+        texture,
+        type: args[9],
+        width: args[5],
+        x: args[2],
+        y: args[3],
+      });
+      const result = Reflect.apply(originals.texSubImage3D, this, args);
+      if (this === gl) {
+        // (target, level, x, y, z, width, height, depth, format, type, data, offset)
+        calls.texSubImage2D.push({
+          format: args[8],
+          height: args[6],
+          texture,
+          type: args[9],
+          width: args[5],
+          x: args[2],
+          y: args[3],
+        });
+        const mirror = textureMirrors.get(texture);
+        const source = args[10];
+        if (
+          mirror &&
+          args[8] === this.RED &&
+          args[9] === this.UNSIGNED_BYTE &&
+          source instanceof Uint8Array
+        ) {
+          const sourceOffset = Number.isSafeInteger(args[11]) ? args[11] : 0;
+          for (let row = 0; row < args[6]; row++) {
+            const sourceStart = sourceOffset + row * args[5];
+            mirror.bytes.set(
+              source.subarray(sourceStart, sourceStart + args[5]),
+              (args[4] * mirror.height + args[3] + row) * mirror.width + args[2],
+            );
+          }
+        }
+      }
+      return result;
     };
     prototype.getParameter = function (parameter) {
       if (
@@ -289,29 +366,29 @@ test('snapshot R8 alpha stays exact through every draw and resource lifecycle', 
       );
       const pointCount = 1025;
       const gridSide = 32;
-      const positions = new Float32Array(pointCount * 3);
+      // A 2D embedding: two position components per point.
+      const positions = new Float32Array(pointCount * 2);
       const colors = new Uint8Array(pointCount * 4);
-      const initialAlphas = new Float32Array(pointCount);
+      const initialAlphas = new Uint8Array(pointCount);
       for (let index = 0; index < pointCount; index++) {
         const column = index % gridSide;
         const row = Math.floor(index / gridSide);
         // The final eight columns are outside the identity frustum so both
         // indexed frustum branches must reject real geometry.
-        positions[index * 3] = column < 24
+        positions[index * 2] = column < 24
           ? ((column + 0.5) / 24) * 1.8 - 0.9
           : 1.35 + (column - 24) * 0.04;
-        positions[index * 3 + 1] =
+        positions[index * 2 + 1] =
           ((row + 0.5) / gridSide) * 1.8 - 0.9;
-        positions[index * 3 + 2] = 0;
         colors[index * 4] = 32 + ((index * 17) % 208);
         colors[index * 4 + 1] =
           32 + ((index * 29) % 208);
         colors[index * 4 + 2] =
           32 + ((index * 43) % 208);
-        // Deliberately disagree with the authoritative Float alpha owner.
+        // Deliberately disagree with the authoritative transparency owner.
         colors[index * 4 + 3] = 255;
         initialAlphas[index] =
-          [0, 0.25, 0.5, 0.75, 1][index % 5];
+          [0, 1, 1, 0, 1][index % 5];
       }
 
       renderer = new HighPerfRenderer(gl, {
@@ -322,7 +399,6 @@ test('snapshot R8 alpha stays exact through every draw and resource lifecycle', 
       });
       renderer.loadData(positions, colors, {
         alphaValues: initialAlphas,
-        buildSpatialIndex: false,
         dimensionLevel: 2,
       });
 
@@ -438,23 +514,24 @@ test('snapshot R8 alpha stays exact through every draw and resource lifecycle', 
             colorAttribute.type === gl.UNSIGNED_BYTE,
         },
         colorBytesExact:
-          snapshot.bufferByteLength === pointCount * 3,
-        noPerSnapshotColorOwner:
-          !Object.hasOwn(snapshot, 'colors'),
+          snapshot.bufferByteLength === pointCount * 4,
+        // The published RGBA array is retained by reference, never copied:
+        // it is the source of the GPU colour gather.
+        noPerSnapshotColorCopy: snapshot.colors === colors,
         noPerSnapshotFloatAlphaOwner:
           !Object.values(snapshot).some(
             value =>
               value instanceof Float32Array &&
               value.length === pointCount,
           ),
-        sharedColorScratch:
-          renderer._snapshotColorStagingData
-            instanceof Uint8Array &&
-          renderer._snapshotColorStagingData.length ===
-            pointCount * 3,
+        // RGB is packed on the GPU, never in a point-sized CPU scratch.
+        noPointSizedColorScratch:
+          !Object.hasOwn(renderer, '_snapshotColorStagingData') &&
+          !Object.hasOwn(renderer, '_gatherChunkBuffer'),
         sharedGeometryPositionBytes:
           geometry.positionBufferByteLength ===
-            pointCount * 12,
+            pointCount * 8 &&
+          geometry.positionBuffer === renderer.buffers.positions,
       };
 
       const identity = () => Float32Array.from([
@@ -572,6 +649,14 @@ test('snapshot R8 alpha stays exact through every draw and resource lifecycle', 
           },
         };
       };
+      // The tree with its levels is built off the main thread: ask for it
+      // with one forced-level frame, then wait until it has landed.
+      renderPair({ forceLOD: 0, frustum: true, name: 'prime' });
+      for (let attempt = 0; attempt < 500; attempt++) {
+        const tree = renderer.spatialIndices.get(renderer.currentDimensionLevel);
+        if (Array.isArray(tree?.lodLevels) && tree.lodLevels.length > 0) break;
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
       const drawBranches = [
         renderPair({
           forceLOD: -1,
@@ -598,10 +683,14 @@ test('snapshot R8 alpha stays exact through every draw and resource lifecycle', 
       // Build the previous split-RGBA/baked-alpha layout against the same
       // pooled position owner. It is diagnostic-only, but its exact pixels
       // prove the new RGB+R8 publication preserves the old visual contract.
-      const legacyColors = colors.slice();
-      for (let index = 0; index < pointCount; index++) {
-        legacyColors[index * 4 + 3] =
-          expectedInitialBytes[index];
+      // The pooled store holds its points in its tree's draw order, so the
+      // baked colours are laid out in that order too.
+      const drawOrder = renderer.getViewDrawOrder('snapshot-r8');
+      const legacyColors = new Uint8Array(colors.length);
+      for (let slot = 0; slot < pointCount; slot++) {
+        const index = drawOrder === null ? slot : drawOrder[slot];
+        legacyColors.set(colors.subarray(index * 4, index * 4 + 3), slot * 4);
+        legacyColors[slot * 4 + 3] = expectedInitialBytes[index];
       }
       legacyBuffer = gl.createBuffer();
       legacyVao = gl.createVertexArray();
@@ -617,12 +706,13 @@ test('snapshot R8 alpha stays exact through every draw and resource lifecycle', 
         geometry.positionBuffer,
       );
       gl.enableVertexAttribArray(0);
+      // The shared geometry store holds the 2D positions: two components.
       gl.vertexAttribPointer(
         0,
-        3,
+        2,
         gl.FLOAT,
         false,
-        12,
+        8,
         0,
       );
       gl.bindBuffer(gl.ARRAY_BUFFER, legacyBuffer);
@@ -668,7 +758,7 @@ test('snapshot R8 alpha stays exact through every draw and resource lifecycle', 
         if (renderer._dummyLodIndexTexture) {
           gl.activeTexture(gl.TEXTURE1);
           gl.bindTexture(
-            gl.TEXTURE_2D,
+            gl.TEXTURE_2D_ARRAY,
             renderer._dummyLodIndexTexture,
           );
           if (uniforms.u_lodIndexTex !== null) {
@@ -751,12 +841,12 @@ test('snapshot R8 alpha stays exact through every draw and resource lifecycle', 
       };
       const configureProduction = () => {
         gl.useProgram(program);
-        renderer._bindSnapshotAlphaTexture(
+        renderer._bindPointAlpha(
           gl,
           uniforms,
-          snapshot,
-          false,
-          2,
+          snapshot.alphaTexture,
+          snapshot.alphaTexPlan,
+          renderer._ensureSnapshotDrawOrder(snapshot, null),
         );
       };
       // Warm shaders, texture sampling, and both attribute layouts.
@@ -833,7 +923,7 @@ test('snapshot R8 alpha stays exact through every draw and resource lifecycle', 
       // snapshot attribute operation under test.
       const beforeNoOp = captureCounts();
       const r8EquivalentAlphas =
-        Float32Array.from(expectedInitialBytes, value =>
+        Uint8Array.from(expectedInitialBytes, value =>
           value / 255
         );
       renderer.updateSnapshotAlphas(
@@ -845,7 +935,7 @@ test('snapshot R8 alpha stays exact through every draw and resource lifecycle', 
         captureCounts(),
       );
 
-      const changedAlphas = Float32Array.from(
+      const changedAlphas = Uint8Array.from(
         initialAlphas,
         value => 1 - value,
       );
@@ -1020,8 +1110,14 @@ test('snapshot R8 alpha stays exact through every draw and resource lifecycle', 
         alphaTexturePreserved:
           snapshot.alphaTexture ===
             alphaTextureBeforePositions,
+        // The colour store survives a position change: drawn again when the
+        // new geometry holds the same draw order, else kept (under its own
+        // order) while the view draws a store gathered into the new one.
         colorBufferPreserved:
-          snapshot.buffer === colorBufferBeforePositions,
+          snapshot.buffer === colorBufferBeforePositions ||
+          [...(snapshot.colorCache?.values() ?? [])].some(
+            entry => entry.buffer === colorBufferBeforePositions,
+          ),
         geometryAdvanced:
           snapshot.geometryGeneration !==
             generationBeforePositions,
@@ -1039,7 +1135,13 @@ test('snapshot R8 alpha stays exact through every draw and resource lifecycle', 
         buffer: snapshot.buffer,
         vao: snapshot.vao,
       };
+      const retiredGeometry = renderer._snapshotGeometryPools.get(
+        snapshot.geometryGeneration,
+      );
+      const retiredPositionBuffer = retiredGeometry.positionBuffer;
       const lifecycleStart = lifecycle.length;
+      // Colour stores the view kept for other draw orders go with it.
+      const keptColorStores = snapshot.colorCache?.size ?? 0;
       const beforeDelete = captureCounts();
       renderer.deleteSnapshotBuffer('snapshot-r8');
       const deleteDelta = countDelta(
@@ -1075,6 +1177,42 @@ test('snapshot R8 alpha stays exact through every draw and resource lifecycle', 
           alphaRetirementIndex > vaoRetirementIndex,
         vaoDeleted: vaoRetirementIndex >= 0,
       };
+      // No view shows the snapshot's positions any more: they stay retained,
+      // within the retention budget, until evicted.
+      const positionBufferDeleted = events => events.some(
+        event =>
+          event.kind === 'deleteBuffer' &&
+          event.handle === retiredPositionBuffer,
+      );
+      const retention = {
+        pooled:
+          renderer._snapshotGeometryPools.get(
+            retiredGeometry.generation,
+          ) === retiredGeometry,
+        positionBufferDeleted:
+          positionBufferDeleted(retirementEvents),
+        positionBufferHeld:
+          retiredGeometry.positionBuffer ===
+            retiredPositionBuffer,
+        refCount: retiredGeometry.refCount,
+        retained: retiredGeometry.retained,
+      };
+      const evictionStart = lifecycle.length;
+      const beforeEviction = captureCounts();
+      renderer.evictRetainedGeometry(Infinity);
+      const evictionDelta = countDelta(
+        beforeEviction,
+        captureCounts(),
+      );
+      const eviction = {
+        pooled: renderer._snapshotGeometryPools.has(
+          retiredGeometry.generation,
+        ),
+        positionBufferDeleted: positionBufferDeleted(
+          lifecycle.slice(evictionStart),
+        ),
+        retained: retiredGeometry.retained,
+      };
 
       return {
         createDelta,
@@ -1088,17 +1226,20 @@ test('snapshot R8 alpha stays exact through every draw and resource lifecycle', 
         noOpDelta,
         ownership,
         positionPublication,
+        keptColorStores,
         retryDelta,
         retryPublication,
         changedDelta,
         changedPublication,
         retirement,
+        retention,
+        eviction,
+        evictionDelta,
         supported: true,
         timingDiagnostic,
       };
     } finally {
       injectedTexture = null;
-      syntheticErrorPending = false;
       if (legacyVao !== null) {
         try {
           gl.deleteVertexArray(legacyVao);
@@ -1125,11 +1266,12 @@ test('snapshot R8 alpha stays exact through every draw and resource lifecycle', 
         prototype.deleteTexture = originals.deleteTexture;
         prototype.deleteVertexArray =
           originals.deleteVertexArray;
-        prototype.getError = originals.getError;
         prototype.getParameter = originals.getParameter;
         prototype.texImage2D = originals.texImage2D;
         prototype.texSubImage2D =
           originals.texSubImage2D;
+        prototype.texStorage3D = originals.texStorage3D;
+        prototype.texSubImage3D = originals.texSubImage3D;
       }
     }
   });
@@ -1145,27 +1287,33 @@ test('snapshot R8 alpha stays exact through every draw and resource lifecycle', 
       bufferMatches: true,
       normalized: true,
       offset: 0,
-      size: 3,
-      stride: 3,
+      size: 4,
+      stride: 4,
       typeIsUnsignedByte: true,
     },
     colorBytesExact: true,
-    noPerSnapshotColorOwner: true,
+    noPerSnapshotColorCopy: true,
     noPerSnapshotFloatAlphaOwner: true,
     paddedTailOpaque: true,
-    sharedColorScratch: true,
+    noPointSizedColorScratch: true,
     sharedGeometryPositionBytes: true,
   });
+  // One RGBA8 colour store: a snapshot of the live generation borrows the
+  // live position store instead of uploading a second copy of it. In source
+  // order the colour store is the colours' own bytes, uploaded directly (no
+  // gather pass, so no transient texture or pass objects). The R8 alpha
+  // texture is a linear texture: its storage (counted as texImage2D) and one
+  // write of its padded rows (counted as texSubImage2D).
   expect(proof.createDelta).toEqual({
-    bufferData: 2,
-    createBuffer: 2,
+    bufferData: 1,
+    createBuffer: 1,
     createTexture: 1,
     createVertexArray: 1,
     deleteBuffer: 0,
     deleteTexture: 0,
     deleteVertexArray: 0,
     texImage2D: 1,
-    texSubImage2D: 0,
+    texSubImage2D: 1,
   });
 
   expect(
@@ -1286,10 +1434,8 @@ test('snapshot R8 alpha stays exact through every draw and resource lifecycle', 
     acceptedBytesRestored: true,
     acceptedOwnerPreserved: true,
     failure: {
-      message: expect.stringMatching(
-        /snapshot.*alpha.*WebGL error/i,
-      ),
-      name: 'Error',
+      message: expect.stringMatching(/rejected the snapshot alpha texture upload/),
+      name: 'TypeError',
     },
     resourcesStable: true,
   });
@@ -1327,7 +1473,24 @@ test('snapshot R8 alpha stays exact through every draw and resource lifecycle', 
   });
   expect(proof.deleteDelta.deleteTexture).toBe(1);
   expect(proof.deleteDelta.deleteVertexArray).toBe(1);
-  expect(proof.deleteDelta.deleteBuffer).toBeGreaterThanOrEqual(2);
+  // The colour buffers only (its own and any it kept for another draw
+  // order): the position buffer is retained.
+  expect(proof.deleteDelta.deleteBuffer).toBe(1 + proof.keptColorStores);
+  expect(proof.retention).toEqual({
+    pooled: true,
+    positionBufferDeleted: false,
+    positionBufferHeld: true,
+    refCount: 0,
+    retained: true,
+  });
+  expect(proof.eviction).toEqual({
+    pooled: false,
+    positionBufferDeleted: true,
+    retained: false,
+  });
+  expect(proof.evictionDelta.deleteBuffer).toBe(1);
+  expect(proof.evictionDelta.deleteTexture).toBe(0);
+  expect(proof.evictionDelta.deleteVertexArray).toBe(0);
   expect(proof.glError).toBe(0);
   expect(proof.timingDiagnostic).toMatchObject({
     drawsPerBatch: 8,

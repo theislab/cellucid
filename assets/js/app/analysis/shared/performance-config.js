@@ -70,8 +70,6 @@ const BATCH_DEFAULTS = {
   networkConcurrency: 12,
   /** Number of genes to keep ready for compute ahead of current */
   computeAheadBuffer: 50,
-  /** Yield to UI every N genes processed */
-  uiYieldInterval: 25,
   /** Progress update interval (genes) */
   progressUpdateInterval: 10
 };
@@ -528,7 +526,7 @@ class PerformanceConfigManager {
    * Get UI-friendly options for batch size selector
    * @param {number} cellCount - Cells in dataset
    * @param {number} geneCount - Genes in dataset
-   * @returns {Array<{value: number, label: string, description: string, selected?: boolean}>}
+   * @returns {Array<{value: number, label: string, selected?: boolean}>}
    */
   getBatchSizeOptions(cellCount, geneCount) {
     const recommended = this.getRecommendedSettings(
@@ -557,35 +555,30 @@ class PerformanceConfigManager {
       label: value === recommended
         ? `${value} genes (recommended)`
         : `${value} genes`,
-      description: value === recommended
-        ? `Exact recommendation for ${cellCount.toLocaleString()} cells and ${geneCount.toLocaleString()} genes.`
-        : `Load ${value} genes per bounded batch.`,
       selected: value === recommended
     }));
   }
 
   /**
    * Get UI-friendly options for memory budget selector
-   * @returns {Array<{value: number, label: string, description: string, selected?: boolean}>}
+   * @returns {Array<{value: number, label: string, selected?: boolean}>}
    */
   getMemoryBudgetOptions() {
     return [256, 512, 1024, 2048, 4096].map(value => ({
       value,
       label: value < 1024 ? `${value} MB` : `${value / 1024} GB`,
-      description: `Bound analysis-owned working memory to ${value} MB.`,
       selected: value === this.memory.defaultBudgetMB
     }));
   }
 
   /**
    * Get UI-friendly options for network concurrency selector
-   * @returns {Array<{value: number, label: string, description: string, selected?: boolean}>}
+   * @returns {Array<{value: number, label: string, selected?: boolean}>}
    */
   getNetworkConcurrencyOptions() {
     return [2, 4, 6, 12, 16, 24].map(value => ({
       value,
       label: `${value} parallel`,
-      description: `Use exactly ${value} concurrent gene requests.`,
       selected: value === this.batch.networkConcurrency
     }));
   }
@@ -632,5 +625,3 @@ export const PerformanceConfig = {
   getMemoryBudgetOptions: () => getPerformanceConfig().getMemoryBudgetOptions(),
   getNetworkConcurrencyOptions: (r) => getPerformanceConfig().getNetworkConcurrencyOptions(r)
 };
-
-export default PerformanceConfig;

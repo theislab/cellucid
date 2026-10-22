@@ -11,12 +11,12 @@
  * Extends FormBasedAnalysisUI for form + results pattern.
  */
 
+import { formatCount } from '../../../ui/components/display-format.js';
 import { FormBasedAnalysisUI } from './base/form-based-analysis.js';
 import { PlotRegistry } from '../../shared/plot-registry-utils.js';
 import {
-  createFormRow,
-  createFormSelect,
   createPerformanceSettings,
+  createSelectField,
   getPerformanceFormValues
 } from '../../shared/dom-utils.js';
 import {
@@ -42,7 +42,7 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
   /**
    * Get page requirements for differential expression
    * @static
-   * @returns {{ minPages: number, maxPages: number, description: string }}
+   * @returns {{ minPages: number, maxPages: number, description: string, geneExpression: true }}
    */
   static getRequirements() {
     return {
@@ -50,7 +50,8 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
       // when the global page selection is empty.
       minPages: 0,
       maxPages: null, // Allow any number of pages; user selects which 2 to compare
-      description: 'Select pages to compare'
+      description: 'Select pages to compare',
+      geneExpression: true
     };
   }
 
@@ -72,12 +73,6 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
      */
     this._modalGeneListMode = 'top5';
 
-    /**
-     * Incremented per modal-annotations render to cancel async chunk rendering.
-     * @type {number}
-     * @private
-     */
-    this._modalAnnotationsRenderRevision = 0;
 
     // Bind handlers
     this._handleComparisonChange = this._handleComparisonChange.bind(this);
@@ -126,15 +121,7 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
    * @returns {string}
    */
   _getTitle() {
-    return 'Differential Expression';
-  }
-
-  /**
-   * Get the analysis description
-   * @returns {string}
-   */
-  _getDescription() {
-    return 'Find genes differentially expressed between two pages.';
+    return 'Differential expression';
   }
 
   /**
@@ -166,7 +153,7 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
    * @returns {string}
    */
   _getRunButtonText() {
-    return 'Run Differential Expression';
+    return 'Run differential expression';
   }
 
   /**
@@ -189,11 +176,15 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
     wrapper.appendChild(pageSelector);
 
     // Method selector
-    const methodSelect = createFormSelect('method', [
-      { value: 'wilcox', label: 'Wilcoxon', description: 'Rank-based test, robust to outliers and non-normal distributions.', selected: true },
-      { value: 'ttest', label: 't-test', description: 'Parametric test, assumes normally distributed expression data.' }
-    ]);
-    wrapper.appendChild(createFormRow('Statistical method:', methodSelect));
+    wrapper.appendChild(createSelectField({
+      label: 'Statistical method',
+      name: 'method',
+      tip: 'analysis-test-method',
+      options: [
+        { value: 'wilcox', label: 'Wilcoxon', selected: true },
+        { value: 'ttest', label: 't-test' }
+      ]
+    }).root);
 
     // Note: Significance and fold change thresholds are now in the results view
     // where they can be adjusted dynamically after analysis
@@ -302,7 +293,7 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
         useAdjustedPValue: true,
         labelTopN: 15
       },
-      title: 'Differential Expression',
+      title: 'Differential expression',
       subtitle: `${deResults.metadata.pageAName} vs ${deResults.metadata.pageBName}`
     };
   }
@@ -341,7 +332,7 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
     const progressTracker = new ProgressTracker({
       totalItems: 1,
       phases: ['Loading & Computing', 'Multiple Testing Correction'],
-      title: 'Differential Expression',
+      title: 'Differential expression',
       category: 'calculation',
       showNotification: true
     });
@@ -460,7 +451,7 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
     const options = PlotRegistry.mergeOptions('volcanoplot', result?.options || {});
 
     if (!results || results.length === 0) {
-      container.innerHTML = '<p class="modal-stats-placeholder">Statistics not available</p>';
+      container.innerHTML = '<p class="empty-state">Statistics not available</p>';
       return;
     }
     if (
@@ -512,23 +503,23 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
       <table class="analysis-stats-table de-modal-stats">
         <tr>
           <td>Genes tested (FDR denominator)</td>
-          <td><strong>${summary.genesTested.toLocaleString()}</strong></td>
+          <td><strong>${formatCount(summary.genesTested)}</strong></td>
         </tr>
         <tr>
-          <td title="Genes skipped before testing: one of the two groups had fewer than ${summary.minCells} cells with a measured value for that gene, so no p-value exists and the gene is not part of the FDR correction.">Not tested (&lt; ${summary.minCells.toLocaleString()} cells with a value)</td>
-          <td><strong>${summary.genesUntestable.toLocaleString()}</strong></td>
+          <td title="Genes skipped before testing: one of the two groups had fewer than ${summary.minCells} cells with a measured value for that gene, so no p-value exists and the gene is not part of the FDR correction.">Not tested (&lt; ${formatCount(summary.minCells)} cells with a value)</td>
+          <td><strong>${formatCount(summary.genesUntestable)}</strong></td>
         </tr>
         <tr>
           <td>Significant (${pLabel} ≤ ${pValueThreshold}, |log₂FC| ≥ ${foldChangeThreshold})</td>
-          <td class="significant"><strong>${significantTotal.toLocaleString()}</strong></td>
+          <td class="significant"><strong>${formatCount(significantTotal)}</strong></td>
         </tr>
         <tr>
           <td>Upregulated</td>
-          <td class="up"><strong>${upregulated.toLocaleString()}</strong></td>
+          <td class="up"><strong>${formatCount(upregulated)}</strong></td>
         </tr>
         <tr>
           <td>Downregulated</td>
-          <td class="down"><strong>${downregulated.toLocaleString()}</strong></td>
+          <td class="down"><strong>${formatCount(downregulated)}</strong></td>
         </tr>
       </table>
     `;
@@ -544,11 +535,9 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
     const options = PlotRegistry.mergeOptions('volcanoplot', result?.options || {});
 
     if (!results || results.length === 0) {
-      container.innerHTML = '<p class="modal-annotations-placeholder">No significant genes found</p>';
+      container.innerHTML = '<p class="empty-state">No significant genes found</p>';
       return;
     }
-
-    const renderRevision = ++this._modalAnnotationsRenderRevision;
 
     const {
       pValueThreshold = 0.05,
@@ -593,7 +582,7 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
 
     if (genesToShow.length === 0) {
       container.innerHTML = `
-        <p class="modal-annotations-placeholder">
+        <p class="empty-state">
           No genes passed the current thresholds (p ≤ ${pValueThreshold}, |log2FC| ≥ ${foldChangeThreshold}).
         </p>
       `;
@@ -606,11 +595,12 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
     headerRow.className = 'de-modal-genes-header';
 
     const title = document.createElement('h5');
-    title.textContent = 'Top Differentially Expressed Genes';
+    title.textContent = 'Top differentially expressed genes';
     headerRow.appendChild(title);
 
     const select = document.createElement('select');
     select.className = 'obs-select';
+    select.setAttribute('aria-label', 'Genes to list');
     select.innerHTML = `
       <option value="top5">Top 5</option>
       <option value="top10">Top 10</option>
@@ -678,36 +668,9 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
       return tr;
     };
 
-    const shouldChunkRender = geneListMode === 'all' && genesToShow.length > 500;
-    if (!shouldChunkRender) {
-      for (const row of genesToShow) {
-        tbody.appendChild(createRowEl(row));
-      }
-      return;
-    }
-
-    const CHUNK = 250;
-    let cursor = 0;
-
-    const renderChunk = () => {
-      if (renderRevision !== this._modalAnnotationsRenderRevision) return;
-
-      const end = Math.min(genesToShow.length, cursor + CHUNK);
-      const frag = document.createDocumentFragment();
-
-      for (let i = cursor; i < end; i++) {
-        frag.appendChild(createRowEl(genesToShow[i]));
-      }
-
-      tbody.appendChild(frag);
-      cursor = end;
-
-      if (cursor < genesToShow.length) {
-        setTimeout(renderChunk, 0);
-      }
-    };
-
-    renderChunk();
+    this._renderTableRows(tbody, genesToShow, createRowEl, {
+      chunked: geneListMode === 'all' && genesToShow.length > 500
+    });
   }
 
   /**
@@ -833,5 +796,3 @@ export function createDEAnalysisUI(options) {
   ui.init(options.container);
   return ui;
 }
-
-export default DEAnalysisUI;

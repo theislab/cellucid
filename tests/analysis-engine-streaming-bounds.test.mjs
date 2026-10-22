@@ -14,8 +14,9 @@ import test from 'node:test';
 
 import { StreamingGeneLoader } from '../assets/js/app/analysis/data/streaming-gene-loader.js';
 import {
-  gatherComplementFloat32,
-  gatherFloat32
+  complementGatherPlan,
+  gatherFloat32,
+  indexGatherPlan
 } from '../assets/js/app/analysis/shared/typed-array-utils.js';
 import { getPerformanceConfig } from '../assets/js/app/analysis/shared/performance-config.js';
 import { DEFAULTS } from '../assets/js/app/analysis/genes-panel/constants.js';
@@ -51,8 +52,9 @@ function sortedUniqueIndices(total, count, seed) {
  * DataLayer stand-in: every gene is a distinct, index-identifying signal, so a
  * mis-ordered or mis-selected cell is impossible to miss.
  */
-function createDataLayer({ pointCount, geneCount, latency = null }) {
+function createDataLayer({ pointCount, geneCount, latency = null, payloads = null, resident = new Set() }) {
   const released = [];
+  const prefetched = [];
   const invalidated = [];
   let concurrent = 0;
   let peakConcurrent = 0;
@@ -66,7 +68,18 @@ function createDataLayer({ pointCount, geneCount, latency = null }) {
     state: { pointCount },
     released,
     invalidated,
+    prefetched,
     getPeakConcurrent: () => peakConcurrent,
+    // A local source has nothing to download ahead; a served one keeps the
+    // payload (`payloads`: its byte length and the cache budget).
+    async prefetchGenePayload(gene, { signal }) {
+      if (payloads === null) return null;
+      if (resident.has(gene)) return { resident: true };
+      prefetched.push(gene);
+      await new Promise(resolve => setTimeout(resolve, 1));
+      signal?.throwIfAborted();
+      return { kept: true, byteLength: payloads.byteLength, budget: payloads.budget };
+    },
     async ensureGeneExpressionLoaded(gene) {
       concurrent++;
       if (concurrent > peakConcurrent) peakConcurrent = concurrent;
@@ -339,11 +352,14 @@ test('gather helpers select exactly the requested cells', () => {
   for (let i = 0; i < source.length; i++) source[i] = i;
 
   const indices = sortedUniqueIndices(1000, 250, 55);
-  const gathered = gatherFloat32(source, indices);
+  const gathered = gatherFloat32(source, indexGatherPlan(indices));
   assert.equal(gathered.length, indices.length);
   for (let i = 0; i < indices.length; i++) assert.equal(gathered[i], indices[i]);
 
-  const complement = gatherComplementFloat32(source, indices);
+  const complement = gatherFloat32(
+    source,
+    complementGatherPlan(indices, source.length)
+  );
   assert.equal(complement.length, source.length - indices.length);
   const excluded = new Set(indices);
   let write = 0;
@@ -355,7 +371,7 @@ test('gather helpers select exactly the requested cells', () => {
 
   // Unsorted, arbitrary order is honoured position by position.
   const arbitrary = [7, 3, 999, 0, 512];
-  const arbitraryGathered = gatherFloat32(source, arbitrary);
+  const arbitraryGathered = gatherFloat32(source, indexGatherPlan(arbitrary));
   assert.deepEqual(Array.from(arbitraryGathered), arbitrary);
 });
 
@@ -393,4 +409,80 @@ test('the gene-request concurrency defaults agree across the analysis engine', (
       `the ${preset} preset value must be reachable from the selector`
     );
   }
+});
+
+test('a served run downloads payloads ahead of decoding, without changing what it streams', async () => {
+  const pointCount = 500;
+  const geneCount = 200;
+  const selection = sortedUniqueIndices(pointCount, 100, 7);
+  const other = Uint32Array.from(
+    Array.from({ length: pointCount }, (_, i) => i).filter(i => !new Set(selection).has(i))
+  );
+  const genes = Array.from({ length: geneCount }, (_, g) => `GENE${g}`);
+  const config = { preloadCount: 4, networkConcurrency: 2, memoryBudgetMB: 128 };
+  const run = async payloads => {
+    const dataLayer = createDataLayer({ pointCount, geneCount, latency: 1, payloads });
+    const loader = new StreamingGeneLoader({ dataLayer, config });
+    const digest = [];
+    let maxAhead = 0;
+    for await (const { gene, valuesA, valuesB } of loader.streamGenes(
+      genes,
+      { isRestOf: false, cellIndices: selection },
+      { isRestOf: false, cellIndices: other }
+    )) {
+      digest.push(`${gene}:${valuesA[0]}:${valuesB.at(-1)}`);
+      maxAhead = Math.max(maxAhead, dataLayer.prefetched.length - digest.length);
+    }
+    return { digest, prefetched: dataLayer.prefetched, maxAhead };
+  };
+  const local = await run(null);
+  const served = await run({ byteLength: 1000, budget: 64 * 1024 * 1024 });
+  assert.deepEqual(served.digest, local.digest, 'the same genes and values, in the same order');
+  assert.equal(local.prefetched.length, 0);
+  assert.ok(served.prefetched.length > 0);
+  assert.ok(served.maxAhead >= 16, `payloads ran ${served.maxAhead} genes ahead of decoding (decode window 4)`);
+  assert.equal(new Set(served.prefetched).size, served.prefetched.length, 'each payload is downloaded ahead once');
+});
+
+test('the payload window never holds more than half the payload cache', async () => {
+  const pointCount = 50;
+  const geneCount = 120;
+  const genes = Array.from({ length: geneCount }, (_, g) => `GENE${g}`);
+  const dataLayer = createDataLayer({
+    pointCount, geneCount, latency: 1, payloads: { byteLength: 1000, budget: 20_000 },
+  });
+  const loader = new StreamingGeneLoader({ dataLayer, config: { preloadCount: 2, networkConcurrency: 1, memoryBudgetMB: 128 } });
+  let decoded = 0;
+  let maxAhead = 0;
+  for await (const _ of loader.streamGenesRaw(genes)) {
+    decoded++;
+    maxAhead = Math.max(maxAhead, dataLayer.prefetched.length - decoded);
+  }
+  assert.equal(decoded, geneCount);
+  // budget / 2 / byteLength = 10 payloads (the first round may start 8 more
+  // before any size is known).
+  assert.ok(maxAhead <= 10 + 8, `at most half the cache ahead (${maxAhead})`);
+});
+
+test('a gene already in memory does not stop the run downloading the next ones ahead', async () => {
+  // The user looked at a few genes before the run: they need no download, and
+  // the genes after them still do.
+  const pointCount = 50;
+  const geneCount = 200;
+  const genes = Array.from({ length: geneCount }, (_, g) => `GENE${g}`);
+  const resident = new Set(['GENE0', 'GENE3', 'GENE40']);
+  const dataLayer = createDataLayer({
+    pointCount, geneCount, latency: 1, payloads: { byteLength: 1000, budget: 64 * 1024 * 1024 }, resident,
+  });
+  const loader = new StreamingGeneLoader({ dataLayer, config: { preloadCount: 4, networkConcurrency: 2, memoryBudgetMB: 128 } });
+  let decoded = 0;
+  let maxAhead = 0;
+  for await (const _ of loader.streamGenesRaw(genes)) {
+    decoded++;
+    maxAhead = Math.max(maxAhead, dataLayer.prefetched.length - decoded);
+  }
+  assert.equal(decoded, geneCount);
+  assert.ok(maxAhead >= 16, `payloads ran ${maxAhead} genes ahead of decoding past the resident genes`);
+  assert.equal(dataLayer.prefetched.some(gene => resident.has(gene)), false);
+  assert.ok(dataLayer.prefetched.length >= geneCount - resident.size - 8, `${dataLayer.prefetched.length} payloads downloaded ahead`);
 });

@@ -52,8 +52,8 @@ test('real WebGL loss is a permanent owner fence with no restoration or disposal
       );
     }
 
-    // Move through the public dimension contract to an as-yet unbuilt tree.
-    // setDimensionLevel is intentionally lazy, so the same task can enqueue
+    // Move through the public viewer contract to an as-yet unbuilt tree.
+    // A representation switch is intentionally lazy, so the same task can enqueue
     // projectile preparation and lose the context before the next frame
     // builds the 1D index.
     if (renderer.hasSpatialIndex(1)) {
@@ -61,7 +61,22 @@ test('real WebGL loss is a permanent owner fence with no restoration or disposal
         'Terminal projectile fixture unexpectedly prebuilt its 1D index.',
       );
     }
-    viewer.setViewDimension('live', 1);
+    // A view's dimension is its position layout: publish the live cells'
+    // 1D positions (one component each), then the dimension.
+    {
+      const livePositions = viewer.getPositions();
+      const liveDimension = viewer.getViewDimension('live');
+      const pointCount = livePositions.length / liveDimension;
+      const oneDimensional = new Float32Array(pointCount);
+      for (let point = 0; point < pointCount; point++) {
+        oneDimensional[point] = livePositions[point * liveDimension];
+      }
+      viewer.updatePositions(oneDimensional, 1);
+    }
+    viewer.setViewEmbedding('live', {
+      dimension: 1,
+      layoutKey: 'terminal-disposal-1d',
+    });
     const projectileCompletions = [];
     viewer.setProjectilesEnabled(true, result => {
       projectileCompletions.push({
@@ -177,7 +192,19 @@ test('real WebGL loss is a permanent owner fence with no restoration or disposal
     });
     canvas.dispatchEvent(repeatedLoss);
 
-    await new Promise(resolve => setTimeout(resolve, 40));
+    // The viewer draws only from its animation-frame loop, so a fence that
+    // let start()/resume() through would touch GL on the next frames. Watch
+    // frames, not milliseconds: a loaded runner may produce no frame at all in
+    // a fixed interval, and then the window would prove nothing.
+    await new Promise(resolve => {
+      let remaining = 3;
+      const advance = () => {
+        remaining -= 1;
+        if (remaining === 0) resolve();
+        else requestAnimationFrame(advance);
+      };
+      requestAnimationFrame(advance);
+    });
     const overlayCount = document.querySelectorAll(
       '#cellucid-webgl-context-overlay',
     ).length;
@@ -322,7 +349,22 @@ test('physical context loss cancels projectile readiness before its event task',
         'Physical-loss projectile fixture unexpectedly prebuilt its 1D index.',
       );
     }
-    viewer.setViewDimension('live', 1);
+    // A view's dimension is its position layout: publish the live cells'
+    // 1D positions (one component each), then the dimension.
+    {
+      const livePositions = viewer.getPositions();
+      const liveDimension = viewer.getViewDimension('live');
+      const pointCount = livePositions.length / liveDimension;
+      const oneDimensional = new Float32Array(pointCount);
+      for (let point = 0; point < pointCount; point++) {
+        oneDimensional[point] = livePositions[point * liveDimension];
+      }
+      viewer.updatePositions(oneDimensional, 1);
+    }
+    viewer.setViewEmbedding('live', {
+      dimension: 1,
+      layoutKey: 'terminal-disposal-1d',
+    });
 
     const prototype = WebGL2RenderingContext.prototype;
     const originalIsContextLost = prototype.isContextLost;
@@ -357,13 +399,13 @@ test('velocity reset detaches before hostile retirement and recreates the same I
   page.on('pageerror', error => pageErrors.push(error.message));
   const proof = await page.evaluate(() => {
     const viewer = window._cellucidViewer;
-    const { dimensionLevel, fieldData } = (() => {
+    const { layoutKey, fieldData } = (() => {
       const cellCount = viewer.getPointCount();
       const components = viewer.getViewDimension('live');
       const vectors = new Float32Array(cellCount * components);
       vectors.fill(0.01);
       return {
-        dimensionLevel: components,
+        layoutKey: viewer.getViewLayoutKey('live'),
         fieldData: {
           cellCount,
           components,
@@ -384,7 +426,7 @@ test('velocity reset detaches before hostile retirement and recreates the same I
     };
     viewer.setVectorFieldData(
       'retry_field',
-      dimensionLevel,
+      layoutKey,
       fieldData,
     );
     capturePrograms = false;
@@ -406,22 +448,22 @@ test('velocity reset detaches before hostile retirement and recreates the same I
         name: error.name,
       };
     }
-    const detachedAfterFailure = !viewer.hasVectorFieldForDimension(
+    const detachedAfterFailure = !viewer.hasVectorFieldForLayout(
       'retry_field',
-      dimensionLevel,
+      layoutKey,
     );
     viewer.resetVectorFieldOverlay();
 
     capturePrograms = true;
     viewer.setVectorFieldData(
       'retry_field',
-      dimensionLevel,
+      layoutKey,
       fieldData,
     );
     capturePrograms = false;
-    const recreated = viewer.hasVectorFieldForDimension(
+    const recreated = viewer.hasVectorFieldForLayout(
       'retry_field',
-      dimensionLevel,
+      layoutKey,
     );
     prototype.createProgram = originalCreateProgram;
     prototype.deleteProgram = originalDeleteProgram;
@@ -455,13 +497,14 @@ test('viewer disposal fences RAF, attempts all owners, and retries only failures
     const state = window._cellucidState;
     const renderer = viewer.getHPRenderer();
     const canvas = document.querySelector('#glcanvas');
-    const { dimensionLevel, fieldData } = (() => {
+    const { dimensionLevel, layoutKey, fieldData } = (() => {
       const cellCount = viewer.getPointCount();
       const components = viewer.getViewDimension('live');
       const vectors = new Float32Array(cellCount * components);
       vectors.fill(0.01);
       return {
         dimensionLevel: components,
+        layoutKey: viewer.getViewLayoutKey('live'),
         fieldData: {
           cellCount,
           components,
@@ -472,7 +515,7 @@ test('viewer disposal fences RAF, attempts all owners, and retries only failures
     })();
     const dataPositions = viewer.getPositions();
     const dataColors = viewer.getColors();
-    const dataTransparency = new Float32Array(
+    const dataTransparency = new Uint8Array(
       viewer.getViewTransparency('live'),
     );
     const snapshotPayload = state.getSnapshotPayload();
@@ -532,7 +575,7 @@ test('viewer disposal fences RAF, attempts all owners, and retries only failures
     };
     viewer.setVectorFieldData(
       'terminal_field',
-      dimensionLevel,
+      layoutKey,
       fieldData,
     );
     capturePrograms = false;
@@ -678,6 +721,7 @@ test('viewer disposal fences RAF, attempts all owners, and retries only failures
         colors: dataColors,
         transparency: dataTransparency,
         dimensionLevel,
+        layoutKey,
       });
     });
     attemptTerminalMutation('createSnapshotView', () => {
@@ -698,7 +742,7 @@ test('viewer disposal fences RAF, attempts all owners, and retries only failures
     attemptTerminalMutation('setVectorFieldData', () => {
       viewer.setVectorFieldData(
         'terminal_field',
-        dimensionLevel,
+        layoutKey,
         fieldData,
       );
     });
@@ -711,7 +755,24 @@ test('viewer disposal fences RAF, attempts all owners, and retries only failures
     viewer.start();
     viewer.resume();
     viewer.pause();
-    await new Promise(resolve => setTimeout(resolve, 50));
+    // A restart that escaped the disposal fence could only draw on an
+    // animation frame; watch several frames rather than a fixed interval.
+    // Use the unaudited scheduler so the watch is not itself a post-fence
+    // frame request.
+    await new Promise(resolve => {
+      let remaining = 3;
+      const nextFrame = callback => Reflect.apply(
+        originalRequestAnimationFrame,
+        window,
+        [callback],
+      );
+      const advance = () => {
+        remaining -= 1;
+        if (remaining === 0) resolve();
+        else nextFrame(advance);
+      };
+      nextFrame(advance);
+    });
     const drawsAfterRestartAttempt = drawCalls;
     const postFenceAllocations = Object.values(allocationCalls).reduce(
       (total, count) => total + count,

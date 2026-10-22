@@ -181,10 +181,10 @@ test('Quick Insights preserves prototype-named field and page cross-products', a
   }
 });
 
-test('Quick Insights categorical summaries require exact raw codes and categories', () => {
+test('Quick Insights categorical summaries require exact raw codes and categories', async () => {
   const insights = Object.create(QuickInsights.prototype);
 
-  assert.throws(
+  await assert.rejects(
     () => insights._summarizeCategoricalAcrossPages(
       'cell_type',
       {
@@ -199,10 +199,10 @@ test('Quick Insights categorical summaries require exact raw codes and categorie
         },
       },
     ),
-    /cell_type.*Uint16Array.*categories/i,
+    /cell_type.*categorical codes and categories/i,
   );
 
-  assert.throws(
+  await assert.rejects(
     () => insights._summarizeCategoricalAcrossPages(
       'cell_type',
       {
@@ -220,13 +220,13 @@ test('Quick Insights categorical summaries require exact raw codes and categorie
   );
 });
 
-test('Quick Insights computes one deterministic exact continuous contract at every size', () => {
+test('Quick Insights computes one deterministic exact continuous contract at every size', async () => {
   const count = 50_001;
   const values = Float32Array.from({ length: count }, (_, index) => index);
   const cellIndices = Uint32Array.from({ length: count }, (_, index) => index);
   const insights = Object.create(QuickInsights.prototype);
 
-  const first = insights._summarizeContinuousAcrossPages(
+  const first = await insights._summarizeContinuousAcrossPages(
     'score',
     { values },
     ['page-1'],
@@ -236,7 +236,7 @@ test('Quick Insights computes one deterministic exact continuous contract at eve
       },
     },
   );
-  const second = insights._summarizeContinuousAcrossPages(
+  const second = await insights._summarizeContinuousAcrossPages(
     'score',
     { values },
     ['page-1'],
@@ -364,4 +364,51 @@ test('Quick Insights page, destroy, and dataset-reset intents own all later publ
       pageGenerationAdvanced: true,
     },
   );
+});
+
+test('Quick Insights is aria-busy from an owed update until a result renders', () => {
+  const attributes = new Map();
+  let open = true;
+  const container = {
+    setAttribute: (name, value) => attributes.set(name, value),
+    removeAttribute: name => attributes.delete(name),
+    parentElement: null,
+    closest: selector => (
+      selector === '.analysis-mode-content' ? { hidden: !open } : null
+    ),
+  };
+  const insights = Object.create(QuickInsights.prototype);
+  Object.assign(insights, {
+    _container: container,
+    _contentContainer: null,
+    _currentRequestId: 0,
+    _abortController: null,
+    _debounceTimer: null,
+    _pendingUpdateWhenVisible: false,
+    _getEffectivePageIds: () => ['page-1'],
+  });
+
+  // An opened panel owes an update: busy before the debounce even starts.
+  insights._triggerUpdate();
+  clearTimeout(insights._debounceTimer);
+  assert.equal(attributes.get('aria-busy'), 'true');
+
+  // Every terminal render settles the region.
+  for (const settle of [
+    () => insights._renderInsights({ pages: [] }),
+    () => insights._renderEmpty(),
+    () => insights._renderError('failed'),
+  ]) {
+    insights._renderLoading();
+    assert.equal(attributes.get('aria-busy'), 'true');
+    settle();
+    assert.equal(attributes.has('aria-busy'), false);
+  }
+
+  // A closed panel defers its update and is not busy meanwhile.
+  insights._renderLoading();
+  open = false;
+  insights._triggerUpdate();
+  assert.equal(insights._pendingUpdateWhenVisible, true);
+  assert.equal(attributes.has('aria-busy'), false);
 });

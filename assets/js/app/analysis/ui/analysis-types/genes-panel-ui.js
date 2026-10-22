@@ -16,15 +16,19 @@
  * @module ui/analysis-types/genes-panel-ui
  */
 
+import { formatCount } from '../../../ui/components/display-format.js';
 import { FormBasedAnalysisUI } from './base/form-based-analysis.js';
+import { formatDuration } from '../../../notification-center/formatters.js';
 import {
-  createCollapsibleSection,
-  createFormSelect,
-  createFormRow,
-  createFormCheckbox,
   createPerformanceSettings,
+  createSelectField,
   getPerformanceFormValues
 } from '../../shared/dom-utils.js';
+import {
+  createCheckbox,
+  createDisclosure,
+  createField
+} from '../../../ui/components/controls.js';
 import { GenesPanelController } from '../../genes-panel/genes-panel-controller.js';
 import { encodeGroupName } from '../../genes-panel/expression-matrix-builder.js';
 import { HoverContext } from '../components/hover-context.js';
@@ -52,13 +56,14 @@ import { setOwnDataProperty } from '../../../../utils/exact-record.js';
 export class GenesPanelUI extends FormBasedAnalysisUI {
   /**
    * Get page requirements for this analysis type
-   * @returns {{ minPages: number, maxPages: number, description: string }}
+   * @returns {{ minPages: number, maxPages: number, description: string, geneExpression: true }}
    */
   static getRequirements() {
     return {
       minPages: 0,
       maxPages: null,
-      description: 'Discover and visualize marker genes across cell groups'
+      description: 'Discover and visualize marker genes across cell groups',
+      geneExpression: true
     };
   }
 
@@ -114,12 +119,6 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
      */
     this._modalGeneListMode = 'top5';
 
-    /**
-     * Incremented per modal-annotations render to cancel async chunk rendering.
-     * @type {number}
-     * @private
-     */
-    this._modalAnnotationsRenderRevision = 0;
 
     /** @type {any|null} Full (unsliced) heatmap matrix from last run */
     this._fullMatrix = null;
@@ -148,14 +147,7 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
    * @override
    */
   _getTitle() {
-    return 'Marker Genes';
-  }
-
-  /**
-   * @override
-   */
-  _getDescription() {
-    return 'Discover marker genes for each group and visualize as a clustered heatmap.';
+    return 'Marker genes';
   }
 
   /**
@@ -169,7 +161,7 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
    * @override
    */
   _getRunButtonText() {
-    return 'Discover Markers';
+    return 'Discover markers';
   }
 
   /**
@@ -196,104 +188,102 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
       : [{ value: '', label: 'No categorical fields available' }];
 
     // Category selection
-    const categorySelectEl = createFormSelect('obsCategory', categoryOptions);
-    const categoryRow = createFormRow('Group By:', categorySelectEl, {
-      description: ''
-    });
-    form.appendChild(categoryRow);
+    form.appendChild(createSelectField({
+      label: 'Group by',
+      name: 'obsCategory',
+      options: categoryOptions
+    }).root);
 
-    // Use cache (placed next to Group By as it affects data loading)
-    const useCacheCheckbox = createFormCheckbox({
+    // Use cache (placed next to Group by as it affects data loading)
+    form.appendChild(createCheckbox({
       label: 'Use cached results',
       name: 'useCache',
       checked: true
+    }).root);
+
+    // Mode selection
+    const { root: modeField, select: modeSelectEl } = createSelectField({
+      label: 'Mode',
+      name: 'mode',
+      tip: 'marker-genes-mode',
+      options: MODE_OPTIONS.map(o => ({
+        value: o.value,
+        label: o.label,
+        selected: o.value === 'clustered'
+      })),
+      onChange: this._handleModeChange
     });
-    form.appendChild(useCacheCheckbox);
+    form.appendChild(modeField);
 
-    // Mode selection - using positional API with onChange for reliability
-    const modeSelectEl = createFormSelect('mode', MODE_OPTIONS.map(o => ({
-      value: o.value,
-      label: o.label,
-      description: o.description,
-      selected: o.value === 'clustered'
-    })), { onChange: this._handleModeChange });
-    // Statistical method selector (placed next to Mode; thresholds are adjusted in the figure modal)
-    const methodSelectEl = createFormSelect('method', [
-      { value: 'wilcox', label: 'Wilcoxon', description: 'Rank-based test, robust to outliers and non-normal distributions.', selected: true },
-      { value: 'ttest', label: 't-test', description: 'Parametric test, assumes normally distributed expression data.' }
-    ]);
+    // Statistical method selector (thresholds are adjusted in the figure
+    // modal). It has its own labelled field, like the Differential Expression
+    // method: sharing Mode's row left it with no visible label once the
+    // panel was too narrow to keep the two selects side by side.
+    form.appendChild(createSelectField({
+      label: 'Statistical method',
+      name: 'method',
+      tip: 'analysis-test-method',
+      options: [
+        { value: 'wilcox', label: 'Wilcoxon', selected: true },
+        { value: 'ttest', label: 't-test' }
+      ]
+    }).root);
 
-    // The row's visible label reads "Mode:", so the second select sharing that
-    // row needs to say what it is on its own.
-    const methodControl = methodSelectEl.querySelector('select') ?? methodSelectEl;
-    methodControl.setAttribute('aria-label', 'Statistical method');
-
-    const modeAndMethod = document.createElement('div');
-    modeAndMethod.className = 'page-comparison-row';
-    modeSelectEl.classList.add('page-select');
-    methodSelectEl.classList.add('page-select');
-    modeAndMethod.appendChild(modeSelectEl);
-    modeAndMethod.appendChild(methodSelectEl);
-
-    const modeRow = createFormRow('Mode:', modeAndMethod, { description: '' });
-    form.appendChild(modeRow);
-
-    // Custom genes input (hidden by default)
-    const customGenesGroup = document.createElement('div');
-    customGenesGroup.className = 'form-section custom-genes-group hidden';
-    const customGenesLabel = document.createElement('div');
-    customGenesLabel.className = 'section-title';
-    customGenesLabel.textContent = 'Custom Genes';
-    customGenesGroup.appendChild(customGenesLabel);
+    // Custom genes input (hidden unless mode is 'custom')
     const customGenesTextarea = document.createElement('textarea');
     customGenesTextarea.name = 'customGenes';
-    customGenesTextarea.className = 'analysis-form-textarea';
+    customGenesTextarea.className = 'obs-select gene-list-input';
     customGenesTextarea.placeholder = 'Enter gene symbols, one per line or comma-separated';
     customGenesTextarea.rows = 4;
-    customGenesTextarea.style.cssText = 'width: 100%; font-family: monospace; font-size: 12px;';
-    customGenesGroup.appendChild(customGenesTextarea);
+    const customGenesGroup = document.createElement('div');
+    customGenesGroup.className = 'custom-genes-group';
+    customGenesGroup.hidden = true;
+    customGenesGroup.appendChild(createField({
+      label: 'Custom genes',
+      control: customGenesTextarea
+    }));
     this._customGenesInput = customGenesTextarea;
     form.appendChild(customGenesGroup);
 
     // Clustering section (collapsible, closed by default as detailed settings, hidden when mode='ranked')
-    const { container: clusterSection, content: clusterContent } = this._createCollapsibleSection({
+    const { root: clusterSection, content: clusterContent } = createDisclosure({
       title: 'Clustering',
-      className: 'cluster-params',
-      expanded: false
+      tip: 'marker-genes-clustering',
+      expanded: false,
+      className: 'disclosure-inline cluster-params'
     });
 
-    // Distance metric
-    const distanceSelectEl = createFormSelect('distance', DISTANCE_OPTIONS.map(o => ({
-      value: o.value,
-      label: o.label,
-      description: o.description,
-      selected: o.selected
-    })));
-    clusterContent.appendChild(createFormRow('Distance Metric:', distanceSelectEl));
+    clusterContent.appendChild(createSelectField({
+      label: 'Distance metric',
+      name: 'distance',
+      options: DISTANCE_OPTIONS.map(o => ({
+        value: o.value,
+        label: o.label,
+        selected: o.selected
+      }))
+    }).root);
 
-    // Linkage method
-    const linkageSelectEl = createFormSelect('linkage', LINKAGE_OPTIONS.map(o => ({
-      value: o.value,
-      label: o.label,
-      description: o.description,
-      selected: o.selected
-    })));
-    clusterContent.appendChild(createFormRow('Linkage Method:', linkageSelectEl));
+    clusterContent.appendChild(createSelectField({
+      label: 'Linkage method',
+      name: 'linkage',
+      options: LINKAGE_OPTIONS.map(o => ({
+        value: o.value,
+        label: o.label,
+        selected: o.selected
+      }))
+    }).root);
 
-    // Cluster options
-    const clusterRowsCheckbox = createFormCheckbox({
-      label: 'Cluster Genes (rows)',
+    clusterContent.appendChild(createCheckbox({
+      label: 'Cluster genes (rows)',
       name: 'clusterRows',
       checked: DEFAULTS.clusterRows
-    });
-    clusterContent.appendChild(clusterRowsCheckbox);
+    }).root);
 
-    const clusterColsCheckbox = createFormCheckbox({
-      label: 'Cluster Groups (columns)',
+    clusterContent.appendChild(createCheckbox({
+      label: 'Cluster groups (columns)',
       name: 'clusterCols',
       checked: DEFAULTS.clusterCols
-    });
-    clusterContent.appendChild(clusterColsCheckbox);
+    }).root);
 
     form.appendChild(clusterSection);
 
@@ -309,9 +299,7 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
     // Initialize section visibility from the mode the form actually shows.
     // Hard-coding 'clustered' contradicted the select whenever the form was
     // rebuilt with a carried-over mode.
-    this._handleModeChange(
-      (modeSelectEl.querySelector('select') ?? modeSelectEl).value
-    );
+    this._handleModeChange(modeSelectEl.value);
   }
 
   /**
@@ -430,7 +418,7 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
         ANALYSIS_PHASES.CLUSTERING,
         ANALYSIS_PHASES.RENDER
       ],
-      title: 'Marker Genes Discovery',
+      title: 'Marker gene discovery',
       category: 'calculation',
       showNotification: true
     });
@@ -643,7 +631,7 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
           showValues: false,
           reverseColorscale: true
         },
-        title: 'Marker Genes',
+        title: 'Marker genes',
         subtitle: formValues.obsCategory,
         markers: resultMarkers,
         clustering,
@@ -991,8 +979,12 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
     addRow('Groups', Number.isFinite(metadata.groupCount) ? String(metadata.groupCount) : String(metadata.groupCount || 'N/A'));
     addRow('Genes', Number.isFinite(metadata.geneCount) ? String(metadata.geneCount) : String(metadata.geneCount || 'N/A'));
 
-    const durationSec = Number.isFinite(metadata.duration) ? (metadata.duration / 1000).toFixed(1) : null;
-    addRow('Duration', durationSec ? `${durationSec}s` : 'N/A');
+    addRow(
+      'Duration',
+      Number.isFinite(metadata.duration) && metadata.duration >= 0
+        ? formatDuration(metadata.duration)
+        : 'N/A'
+    );
 
     container.appendChild(table);
   }
@@ -1015,7 +1007,7 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
       // Custom mode: no marker discovery; show the gene list used in the heatmap.
       const genes = result?.data?.matrix?.genes || result?.matrix?.genes || [];
       if (!genes || genes.length === 0) {
-        container.innerHTML = '<p class="modal-annotations-placeholder">No marker genes available.</p>';
+        container.innerHTML = '<p class="empty-state">No marker genes available.</p>';
         return;
       }
 
@@ -1024,13 +1016,12 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
       headerRow.className = 'de-modal-genes-header';
 
       const title = document.createElement('h5');
-      title.textContent = 'Genes in Heatmap';
+      title.textContent = 'Genes in heatmap';
       headerRow.appendChild(title);
       container.appendChild(headerRow);
 
       const pre = document.createElement('div');
-      pre.className = 'analysis-empty-message';
-      pre.style.whiteSpace = 'pre-wrap';
+      pre.className = 'analysis-gene-list';
       pre.textContent = genes.join('\n');
       container.appendChild(pre);
       return;
@@ -1038,7 +1029,7 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
 
     const groupIds = Object.keys(groups);
     if (groupIds.length === 0) {
-      container.innerHTML = '<p class="modal-annotations-placeholder">No marker genes available.</p>';
+      container.innerHTML = '<p class="empty-state">No marker genes available.</p>';
       return;
     }
 
@@ -1049,19 +1040,18 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
       this._modalSelectedGroupId = groupIds[0];
     }
 
-    const renderRevision = ++this._modalAnnotationsRenderRevision;
-
     container.innerHTML = '';
 
     const headerRow = document.createElement('div');
     headerRow.className = 'de-modal-genes-header';
 
     const title = document.createElement('h5');
-    title.textContent = 'Top Marker Genes';
+    title.textContent = 'Top marker genes';
     headerRow.appendChild(title);
 
     const topSelect = document.createElement('select');
     topSelect.className = 'obs-select';
+    topSelect.setAttribute('aria-label', 'Genes to list');
     topSelect.innerHTML = `
       <option value="top5">Top 5</option>
       <option value="top10">Top 10</option>
@@ -1085,6 +1075,7 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
 
     const groupSelect = document.createElement('select');
     groupSelect.className = 'obs-select';
+    groupSelect.setAttribute('aria-label', 'Group');
     for (const id of groupIds) {
       // The group id is a synthetic handle, `category-code:<code>`, and it is
       // what `markers.groups`, the heatmap columns, the hover lookup and the
@@ -1118,7 +1109,7 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
     const markers = selectedGroup?.markers || [];
     if (markers.length === 0) {
       const empty = document.createElement('p');
-      empty.className = 'modal-annotations-placeholder';
+      empty.className = 'empty-state';
       empty.textContent = selectedGroup?.genesTested === 0
         ? 'No gene could be tested for this group, so it has no markers.'
         : 'No markers for selected group at the current thresholds.';
@@ -1170,34 +1161,9 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
       return tr;
     };
 
-    const shouldChunkRender = this._modalGeneListMode === 'all' && genesToShow.length > 500;
-    if (!shouldChunkRender) {
-      for (const m of genesToShow) {
-        tbody.appendChild(createRowEl(m));
-      }
-      return;
-    }
-
-    const CHUNK = 250;
-    let cursor = 0;
-
-    const renderChunk = () => {
-      if (renderRevision !== this._modalAnnotationsRenderRevision) return;
-
-      const end = Math.min(genesToShow.length, cursor + CHUNK);
-      const frag = document.createDocumentFragment();
-      for (let i = cursor; i < end; i++) {
-        frag.appendChild(createRowEl(genesToShow[i]));
-      }
-      tbody.appendChild(frag);
-      cursor = end;
-
-      if (cursor < genesToShow.length) {
-        setTimeout(renderChunk, 0);
-      }
-    };
-
-    renderChunk();
+    this._renderTableRows(tbody, genesToShow, createRowEl, {
+      chunked: this._modalGeneListMode === 'all' && genesToShow.length > 500
+    });
   }
 
   /**
@@ -1216,7 +1182,7 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
    */
   _createGroupTestingSummary(group, minCellsPerSide) {
     const summary = document.createElement('p');
-    summary.className = 'modal-annotations-placeholder';
+    summary.className = 'field-help';
 
     const genesTested = group?.genesTested;
     const genesUntestable = group?.genesUntestable;
@@ -1231,16 +1197,16 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
     }
 
     const tested = document.createElement('strong');
-    tested.textContent = genesTested.toLocaleString();
+    tested.textContent = formatCount(genesTested);
     summary.append(tested, ' genes tested (FDR denominator)');
 
     if (genesUntestable > 0) {
       const untested = document.createElement('strong');
-      untested.textContent = genesUntestable.toLocaleString();
+      untested.textContent = formatCount(genesUntestable);
       summary.append(' · ', untested, ' not tested');
       if (Number.isSafeInteger(minCellsPerSide)) {
         summary.append(
-          ` (fewer than ${minCellsPerSide.toLocaleString()} cells with a measured value in this group or in the rest)`
+          ` (fewer than ${formatCount(minCellsPerSide)} cells with a measured value in this group or in the rest)`
         );
       }
     }
@@ -1894,7 +1860,7 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
             );
           }
           const empty = ownerDocument.createElement('div');
-          empty.className = 'analysis-empty-message';
+          empty.className = 'empty-state';
           empty.setAttribute('role', 'status');
           empty.textContent =
             'No marker genes match the current thresholds.';
@@ -2090,25 +2056,6 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
   }
 
   /**
-   * Create a collapsible section matching Performance Settings design
-   *
-   * @private
-   * @param {Object} options
-   * @param {string} options.title - Section title
-   * @param {string} options.className - CSS class for the section
-   * @param {boolean} [options.expanded=true] - Whether section starts expanded
-   * @returns {{ container: HTMLElement, content: HTMLElement }}
-   */
-  _createCollapsibleSection({ title, className, expanded = true }) {
-    const { container, content } = createCollapsibleSection({
-      title: String(title ?? ''),
-      expanded,
-      containerClassName: `form-section ${className}`
-    });
-    return { container, content };
-  }
-
-  /**
    * Handle mode selection change
    * Updates form section visibility based on selected mode:
    * - 'ranked': Hide clustering, show discovery params
@@ -2133,18 +2080,18 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
 
     // Custom genes input: only visible in 'custom' mode
     if (customGenesGroup) {
-      customGenesGroup.classList.toggle('hidden', mode !== 'custom');
+      customGenesGroup.hidden = mode !== 'custom';
     }
 
     // Discovery parameters: visible in 'ranked' and 'clustered' modes
     if (discoverySection) {
-      discoverySection.classList.toggle('hidden', mode === 'custom');
+      discoverySection.hidden = mode === 'custom';
     }
 
     // Clustering section: only visible when mode is 'clustered' or 'custom'
     // Hidden entirely for 'ranked' mode as per user requirement
     if (clusterSection) {
-      clusterSection.classList.toggle('hidden', mode === 'ranked');
+      clusterSection.hidden = mode === 'ranked';
     }
   }
 
@@ -2695,5 +2642,3 @@ export function createGenesPanelUI(options) {
   ui.init(options.container);
   return ui;
 }
-
-export default GenesPanelUI;

@@ -15,6 +15,7 @@
 
 import { expect, test } from './helpers/test.mjs';
 import { sampleUrl } from './helpers/origins.mjs';
+import { openCollapsedPanels } from './helpers/panels.mjs';
 
 const SAMPLE_ROOT = sampleUrl('/tests/browser/fixtures/exports/');
 
@@ -38,7 +39,7 @@ test('the statistics line names the active field of the view being shown', async
   });
 
   await page.goto(launchUrl(), { waitUntil: 'domcontentloaded' });
-  await page.getByRole('button', { name: /Choose a Dataset/ }).click();
+  await page.getByRole('button', { name: /Choose a dataset/ }).click();
   await expect(page.locator('#dataset-name')).toHaveText(
     'Current UI prepared fixture',
   );
@@ -54,6 +55,7 @@ test('the statistics line names the active field of the view being shown', async
 
   // Keep the coloured view. The kept view becomes active and carries the field
   // it was kept with.
+  await openCollapsedPanels(page);
   await page.locator('#split-keep-view-btn').click();
   await expect.poll(() => activeViewId(page)).toBe('snap_1');
   await expect(page.locator('.split-badge')).toHaveCount(2);

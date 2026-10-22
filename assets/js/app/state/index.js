@@ -7,5 +7,4 @@
  * @module state/index
  */
 
-export { DataState, createDataState } from './core/data-state.js';
-
+export { createDataState } from './core/data-state.js';

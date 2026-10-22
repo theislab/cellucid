@@ -12,13 +12,18 @@
 import { getComputeManager } from '../compute/compute-manager.js';
 import { OperationType } from '../compute/operations.js';
 import { getNotificationCenter } from '../../notification-center.js';
+import { formatDuration } from '../../notification-center/formatters.js';
 import { getBasePageIdFromRestOf, isRestOfPageId } from '../shared/page-derivation-utils.js';
-import { waitForAvailableSlot } from '../shared/concurrency-utils.js';
+import {
+  createSlicedYield,
+  waitForAvailableSlot
+} from '../shared/concurrency-utils.js';
 import { StreamingGeneLoader } from '../data/streaming-gene-loader.js';
 import { PerformanceConfig } from '../shared/performance-config.js';
 import { ProgressTracker } from '../shared/progress-tracker.js';
 import { isFiniteNumber, mean } from '../shared/number-utils.js';
 import { benjaminiHochbergTestable } from './statistical-tests.js';
+import { medianInPlace, selectSorted } from '../compute/math-utils.js';
 import { startMemoryTracking } from '../shared/memory-tracker.js';
 import { cleanupAnalysisResources } from '../shared/resource-cleanup.js';
 
@@ -125,9 +130,15 @@ function createNotificationOwner({
 /**
  * Multi-Variable Analysis class
  */
+/**
+ * Finite values from which an order statistic is selected by an analysis
+ * worker instead of on this thread.
+ */
+const ORDER_STATISTICS_WORKER_MIN = 500_000;
+
 export class MultiVariableAnalysis {
   /**
-   * @param {EnhancedDataLayer} dataLayer - Enhanced data layer instance
+   * @param {import('../data/data-layer.js').DataLayer} dataLayer - Analysis data layer
    */
   constructor(dataLayer) {
     this.dataLayer = dataLayer;
@@ -136,13 +147,17 @@ export class MultiVariableAnalysis {
   }
 
   /**
-   * Get or initialize the exact-backend compute manager.
+   * Get the exact-backend compute manager, initialized for this run.
+   *
+   * `init()` is awaited on every call: it returns immediately while the
+   * backends are healthy and discovers a fresh worker pool after a terminal
+   * worker failure retired the previous one.
    */
   async _getComputeManager() {
     if (!this._computeManager) {
       this._computeManager = getComputeManager();
-      await this._computeManager.init();
     }
+    await this._computeManager.init();
     return this._computeManager;
   }
 
@@ -319,7 +334,7 @@ export class MultiVariableAnalysis {
         }
 
         // Align values by cell index (including color if available)
-        const { xAligned, yAligned, colorAligned, xPlot, yPlot, colorPlot, sampled } = this._alignValuesByIndex(
+        const { xAligned, yAligned, colorAligned, xPlot, yPlot, colorPlot, sampled } = await this._alignValuesByIndex(
           pageX.cellIndices, pageX.values,
           pageY.cellIndices, pageY.values,
           { maxPlotPoints, colorIndices: pageColor?.cellIndices, colorValues: pageColor?.values }
@@ -398,10 +413,15 @@ export class MultiVariableAnalysis {
    * @param {ArrayLike<number>} indicesB
    * @param {ArrayLike<number>} valuesB
    * @param {{ maxPlotPoints?: number, colorIndices?: ArrayLike<number>, colorValues?: ArrayLike<string> }} [options]
-   * @returns {{ xAligned: Float32Array, yAligned: Float32Array, colorAligned?: string[], xPlot: Float32Array, yPlot: Float32Array, colorPlot?: string[], sampled: boolean }}
+   * @returns {Promise<{ xAligned: Float32Array, yAligned: Float32Array, colorAligned?: string[], xPlot: Float32Array, yPlot: Float32Array, colorPlot?: string[], sampled: boolean }>}
   * @private
   */
-  _alignValuesByIndex(indicesA, valuesA, indicesB, valuesB, options = {}) {
+  async _alignValuesByIndex(indicesA, valuesA, indicesB, valuesB, options = {}) {
+    // Every pass walks every paired cell on this thread, so the passes hand
+    // the event loop back between slices of a large page.
+    const yieldIfSliceSpent = createSlicedYield();
+    let steps = 0;
+    const pause = () => yieldIfSliceSpent();
     if (!options || typeof options !== 'object' || Array.isArray(options)) {
       throw new TypeError('Correlation alignment options must be an object');
     }
@@ -411,7 +431,7 @@ export class MultiVariableAnalysis {
     if (!Number.isSafeInteger(maxPlotPoints) || maxPlotPoints <= 0) {
       throw new TypeError('maxPlotPoints must be a positive safe integer');
     }
-    const requireAlignedPayload = (indices, values, owner) => {
+    const requireAlignedPayload = async (indices, values, owner) => {
       if (
         indices === null ||
         indices === undefined ||
@@ -427,6 +447,10 @@ export class MultiVariableAnalysis {
       }
       let previous = -1;
       for (let index = 0; index < indices.length; index++) {
+        if ((++steps & 0xfffff) === 0) {
+          const pending = pause();
+          if (pending !== undefined) await pending;
+        }
         const cellIndex = indices[index];
         if (
           !Number.isSafeInteger(cellIndex) ||
@@ -440,14 +464,14 @@ export class MultiVariableAnalysis {
         previous = cellIndex;
       }
     };
-    requireAlignedPayload(indicesA, valuesA, 'varX');
-    requireAlignedPayload(indicesB, valuesB, 'varY');
+    await requireAlignedPayload(indicesA, valuesA, 'varX');
+    await requireAlignedPayload(indicesB, valuesB, 'varY');
 
     const { colorIndices, colorValues } = options;
     const hasColor =
       colorIndices !== undefined || colorValues !== undefined;
     if (hasColor) {
-      requireAlignedPayload(colorIndices, colorValues, 'colorBy');
+      await requireAlignedPayload(colorIndices, colorValues, 'colorBy');
       if (colorIndices.length === 0) {
         throw new RangeError(
           'Requested correlation color data cannot be empty'
@@ -455,13 +479,10 @@ export class MultiVariableAnalysis {
       }
     }
 
-    // Build color lookup map if colorBy is provided
-    const colorMap = new Map();
-    if (hasColor) {
-      for (let c = 0; c < colorIndices.length; c++) {
-        colorMap.set(colorIndices[c], colorValues[c]);
-      }
-    }
+    // Every index list is sorted and unique (checked above), so the color of
+    // a paired cell is found by advancing a third cursor through the color
+    // indices alongside the merge — no per-cell lookup table.
+    let colorCursor = 0;
 
     const lenA = indicesA.length;
     const lenB = indicesB.length;
@@ -472,6 +493,10 @@ export class MultiVariableAnalysis {
     let count = 0;
 
     while (i < lenA && j < lenB) {
+      if ((++steps & 0xfffff) === 0) {
+        const pending = pause();
+        if (pending !== undefined) await pending;
+      }
       const idxA = indicesA[i];
       const idxB = indicesB[j];
 
@@ -500,6 +525,10 @@ export class MultiVariableAnalysis {
     let k = 0;
 
     while (i < lenA && j < lenB) {
+      if ((++steps & 0xfffff) === 0) {
+        const pending = pause();
+        if (pending !== undefined) await pending;
+      }
       const idxA = indicesA[i];
       const idxB = indicesB[j];
 
@@ -510,12 +539,21 @@ export class MultiVariableAnalysis {
           xAligned[k] = x;
           yAligned[k] = y;
           if (hasColor) {
-            if (!colorMap.has(idxA)) {
+            while (
+              colorCursor < colorIndices.length &&
+              colorIndices[colorCursor] < idxA
+            ) {
+              colorCursor++;
+            }
+            if (
+              colorCursor === colorIndices.length ||
+              colorIndices[colorCursor] !== idxA
+            ) {
               throw new RangeError(
                 `Correlation color data is missing cell index ${idxA}`
               );
             }
-            colorAligned[k] = colorMap.get(idxA);
+            colorAligned[k] = colorValues[colorCursor];
           }
           k++;
         }
@@ -758,7 +796,7 @@ export class MultiVariableAnalysis {
     // unify progress UX across analysis types, so keep this tracker silent.
     const progressTracker = new ProgressTracker({
       totalItems: genesToTest.length,
-      title: 'Differential Expression',
+      title: 'Differential expression',
       phases: ['Loading & Computing', 'Multiple Testing Correction'],
       showNotification: false,
       onUpdate: (stats) => {
@@ -1217,7 +1255,7 @@ export class MultiVariableAnalysis {
 
       const duration = performance.now() - startTime;
       const stats = progressTracker.complete(
-        `${significantCount} significant genes found (${(duration / 1000).toFixed(1)}s)`
+        `${significantCount} significant genes found (${formatDuration(duration)})`
       );
 
       memScope.end({
@@ -1400,6 +1438,13 @@ export class MultiVariableAnalysis {
       }
 
       const results = [];
+      // Scoring walks every gene over every cell of a page on this thread, so
+      // it hands the event loop back whenever a slice of that work is spent.
+      const yieldIfSliceSpent = createSlicedYield();
+      const resumeAfterYield = async pending => {
+        await pending;
+        return isCurrent();
+      };
 
       for (const pageId of ownedPageIds) {
         if (!isCurrent()) {
@@ -1449,33 +1494,39 @@ export class MultiVariableAnalysis {
               `Signature gene ${gene} does not align with page ${pageId}`
             );
           }
-          for (let index = 0; index < cellCount; index++) {
-            if (genePageData.cellIndices[index] !== firstGeneData.cellIndices[index]) {
-              throw new RangeError(
-                `Signature gene ${gene} has a different cell order on page ${pageId}`
-              );
+          // Genes read for one page version share its index array; only a
+          // distinct array needs comparing cell by cell.
+          if (genePageData.cellIndices !== firstGeneData.cellIndices) {
+            for (let index = 0; index < cellCount; index++) {
+              if (genePageData.cellIndices[index] !== firstGeneData.cellIndices[index]) {
+                throw new RangeError(
+                  `Signature gene ${gene} has a different cell order on page ${pageId}`
+                );
+              }
             }
           }
           return genePageData;
         });
 
         if (method === 'median') {
-          const valuesForCell = [];
+          const valuesForCell = new Float64Array(pageGeneData.length);
+          const geneValues = pageGeneData.map(genePageData => genePageData.values);
           for (let cellIndex = 0; cellIndex < cellCount; cellIndex++) {
-            valuesForCell.length = 0;
-            for (const genePageData of pageGeneData) {
-              const value = genePageData.values[cellIndex];
-              if (isFiniteNumber(value)) valuesForCell.push(value);
+            let present = 0;
+            for (let gene = 0; gene < geneValues.length; gene++) {
+              const value = geneValues[gene][cellIndex];
+              if (isFiniteNumber(value)) valuesForCell[present++] = value;
             }
-            if (valuesForCell.length === 0) {
-              scores[cellIndex] = NaN;
-              continue;
+            // NaN when no gene carried a value for this cell.
+            scores[cellIndex] = medianInPlace(valuesForCell, present);
+            if ((cellIndex & 0x3fff) === 0x3fff) {
+              const pending = yieldIfSliceSpent();
+              if (pending !== undefined && !(await resumeAfterYield(pending))) {
+                notification.dismiss();
+                memScope.end({ method, stale: true });
+                return null;
+              }
             }
-            valuesForCell.sort((a, b) => a - b);
-            const middle = Math.floor(valuesForCell.length / 2);
-            scores[cellIndex] = valuesForCell.length % 2 === 0
-              ? (valuesForCell[middle - 1] + valuesForCell[middle]) / 2
-              : valuesForCell[middle];
           }
         } else {
           for (const genePageData of pageGeneData) {
@@ -1485,10 +1536,32 @@ export class MultiVariableAnalysis {
                 scores[i] += val;
                 validCounts[i]++;
               }
+              if ((i & 0xfffff) === 0xfffff) {
+                const pending = yieldIfSliceSpent();
+                if (pending !== undefined && !(await resumeAfterYield(pending))) {
+                  notification.dismiss();
+                  memScope.end({ method, stale: true });
+                  return null;
+                }
+              }
+            }
+            const pending = yieldIfSliceSpent();
+            if (pending !== undefined && !(await resumeAfterYield(pending))) {
+              notification.dismiss();
+              memScope.end({ method, stale: true });
+              return null;
             }
           }
 
           for (let i = 0; i < cellCount; i++) {
+            if ((i & 0xfffff) === 0xfffff) {
+              const pending = yieldIfSliceSpent();
+              if (pending !== undefined && !(await resumeAfterYield(pending))) {
+                notification.dismiss();
+                memScope.end({ method, stale: true });
+                return null;
+              }
+            }
             const count = validCounts[i];
             if (count === 0) {
               scores[i] = NaN;
@@ -1501,7 +1574,12 @@ export class MultiVariableAnalysis {
         }
 
         // Compute statistics
-        const stats = this._computeBasicStats(scores);
+        const stats = await this._computeBasicStats(scores);
+        if (!isCurrent()) {
+          notification.dismiss();
+          memScope.end({ method, stale: true });
+          return null;
+        }
 
         results.push({
           pageId,
@@ -1548,10 +1626,16 @@ export class MultiVariableAnalysis {
   }
 
   /**
-   * Exact basic statistics helper.
+   * Exact basic statistics of signature scores: Welford mean and population
+   * standard deviation, minimum, maximum and median of the finite scores.
+   *
+   * The pass over the scores hands the event loop back between slices, and
+   * the median of a large page is selected by an analysis worker from a
+   * transferred copy of the finite scores — the same `selectSorted` either way.
+   *
    * @param {ArrayLike<number>} values
    */
-  _computeBasicStats(values) {
+  async _computeBasicStats(values) {
     if (!values || !Number.isSafeInteger(values.length) || values.length < 0) {
       throw new TypeError('Signature statistics require an array-like value collection');
     }
@@ -1561,10 +1645,19 @@ export class MultiVariableAnalysis {
     let min = Infinity;
     let max = -Infinity;
 
-    /** @type {number[]} */
-    const finiteValues = [];
+    // The finite values at their own width: a Float32 score array is copied
+    // as Float32 (half the bytes, and the order statistics read its bits
+    // directly).
+    const finiteValues = values instanceof Float32Array
+      ? new Float32Array(values.length)
+      : new Float64Array(values.length);
+    const yieldIfSliceSpent = createSlicedYield();
 
     for (let i = 0; i < values.length; i++) {
+      if ((i & 0xfffff) === 0xfffff) {
+        const pending = yieldIfSliceSpent();
+        if (pending !== undefined) await pending;
+      }
       const x = values[i];
       if (!Number.isFinite(x)) continue;
 
@@ -1579,7 +1672,7 @@ export class MultiVariableAnalysis {
       if (x < min) min = x;
       if (x > max) max = x;
 
-      finiteValues.push(x);
+      finiteValues[count - 1] = x;
     }
 
     if (count === 0) {
@@ -1592,11 +1685,25 @@ export class MultiVariableAnalysis {
     }
     const stdVal = Math.sqrt(variance);
 
-    finiteValues.sort((a, b) => a - b);
-    const mid = Math.floor(finiteValues.length / 2);
-    const medianVal = finiteValues.length % 2 === 0
-      ? (finiteValues[mid - 1] + finiteValues[mid]) / 2
-      : finiteValues[mid];
+    // The median is two positions of the ascending order.
+    const mid = Math.floor(count / 2);
+    const positions = [mid > 0 ? mid - 1 : 0, mid];
+    const finite = finiteValues.subarray(0, count);
+    let lowerMid;
+    let upperMid;
+    if (count >= ORDER_STATISTICS_WORKER_MIN) {
+      const computeManager = await this._getComputeManager();
+      ({ selected: [lowerMid, upperMid] } = await computeManager.execute(
+        OperationType.COMPUTE_ORDER_STATISTICS,
+        { values: finite, positions },
+        { transfer: true }
+      ));
+    } else {
+      [lowerMid, upperMid] = selectSorted(finite, positions);
+    }
+    const medianVal = count % 2 === 0
+      ? (lowerMid + upperMid) / 2
+      : upperMid;
 
     return {
       count,
@@ -1616,5 +1723,3 @@ export class MultiVariableAnalysis {
 export function createMultiVariableAnalysis(dataLayer) {
   return new MultiVariableAnalysis(dataLayer);
 }
-
-export default MultiVariableAnalysis;

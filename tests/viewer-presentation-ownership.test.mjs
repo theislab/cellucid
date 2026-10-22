@@ -4,7 +4,8 @@ import test from 'node:test';
 
 import { HighPerfRenderer } from '../assets/js/rendering/high-perf-renderer.js';
 import {
-  resolvePresentedViewLayout,
+  getPresentedPane,
+  resolvePresentedLayout,
   runSynchronousBorrowedViewDataCallback,
   selectPresentedCameraState,
 } from '../assets/js/rendering/viewer.js';
@@ -172,137 +173,166 @@ test('borrowed view callbacks are synchronous and validate every exit path', asy
 test('presented layout mirrors exact odd-sized framebuffer grid arithmetic', () => {
   const canvasWidth = 1441;
   const canvasHeight = 1001;
-  for (let viewCount = 1; viewCount <= 6; viewCount += 1) {
-    const viewIds = Array.from(
-      { length: viewCount },
-      (_, index) => `view_${index}`,
-    );
-    const expectedCols = viewCount === 1
-      ? 1
-      : viewCount <= 3
-        ? viewCount
-        : Math.ceil(Math.sqrt(viewCount));
-    const expectedRows = Math.ceil(viewCount / expectedCols);
-    for (let viewIndex = 0; viewIndex < viewCount; viewIndex += 1) {
-      const layout = resolvePresentedViewLayout({
+  const cssWidth = 720.5;
+  const cssHeight = 500.5;
+  for (const leftOcclusionRatio of [0, 0.2]) {
+    const presentedLeft = Math.ceil(leftOcclusionRatio * canvasWidth - 1e-6);
+    for (let viewCount = 1; viewCount <= 6; viewCount += 1) {
+      const viewIds = Array.from(
+        { length: viewCount },
+        (_, index) => `view_${index}`,
+      );
+      const expectedCols = viewCount === 1
+        ? 1
+        : viewCount <= 3
+          ? viewCount
+          : Math.ceil(Math.sqrt(viewCount));
+      const expectedRows = Math.ceil(viewCount / expectedCols);
+      const layout = resolvePresentedLayout({
         canvasHeight,
         canvasWidth,
+        cssHeight,
+        cssWidth,
         focusedViewId: viewIds[0],
+        leftOcclusionRatio,
         mode: 'grid',
-        viewId: viewIds[viewIndex],
         viewIds,
       });
-      const gridMultiview = viewCount > 1;
-      const cols = gridMultiview ? expectedCols : 1;
-      const rows = gridMultiview ? expectedRows : 1;
-      const viewportWidth = gridMultiview
-        ? Math.floor(canvasWidth / cols)
-        : canvasWidth;
-      const viewportHeight = gridMultiview
-        ? Math.floor(canvasHeight / rows)
-        : canvasHeight;
-      const col = gridMultiview ? viewIndex % cols : 0;
-      const row = gridMultiview ? Math.floor(viewIndex / cols) : 0;
-
-      assert.equal(layout.cols, cols);
-      assert.equal(layout.rows, rows);
-      assert.equal(layout.viewportWidth, viewportWidth);
-      assert.equal(layout.viewportHeight, viewportHeight);
-      assert.equal(layout.viewportX, col * viewportWidth);
-      assert.equal(
-        layout.viewportY,
-        (rows - 1 - row) * viewportHeight,
-      );
-      assert.equal(layout.paneLeftRatio, col / cols);
-      assert.equal(layout.paneWidthRatio, 1 / cols);
-      assert.equal(layout.scissorEnabled, gridMultiview);
       assert.ok(Object.isFrozen(layout));
+      assert.ok(Object.isFrozen(layout.panes));
+      const gridMultiview = viewCount > 1;
+      assert.equal(layout.gridMultiview, gridMultiview);
+      assert.equal(layout.cols, gridMultiview ? expectedCols : 1);
+      assert.equal(layout.rows, gridMultiview ? expectedRows : 1);
+      for (let viewIndex = 0; viewIndex < viewCount; viewIndex += 1) {
+        if (!gridMultiview) break;
+        const pane = getPresentedPane(layout, viewIds[viewIndex]);
+        const cols = expectedCols;
+        const rows = expectedRows;
+        const viewportWidth = Math.floor((canvasWidth - presentedLeft) / cols);
+        const viewportHeight = Math.floor(canvasHeight / rows);
+        const col = viewIndex % cols;
+        const row = Math.floor(viewIndex / cols);
+        assert.equal(pane.viewportWidth, viewportWidth);
+        assert.equal(pane.viewportHeight, viewportHeight);
+        assert.equal(pane.viewportX, presentedLeft + col * viewportWidth);
+        assert.equal(
+          pane.viewportY,
+          canvasHeight - (row + 1) * viewportHeight,
+        );
+        assert.equal(pane.cssLeft, pane.viewportX * cssWidth / canvasWidth);
+        assert.equal(pane.cssWidth, viewportWidth * cssWidth / canvasWidth);
+        assert.equal(pane.scissorEnabled, true);
+        assert.ok(Object.isFrozen(pane));
+      }
+      if (!gridMultiview) {
+        const pane = layout.panes[0];
+        assert.equal(pane.viewportWidth, canvasWidth);
+        assert.equal(pane.viewportHeight, canvasHeight);
+        assert.equal(pane.scissorEnabled, false);
+        assert.equal(pane.projectionCenterNdcX, leftOcclusionRatio);
+      }
     }
   }
 
   const viewIds = ['live', 'snap_1'];
-  assert.throws(
-    () => resolvePresentedViewLayout({
-      canvasHeight,
-      canvasWidth,
-      focusedViewId: 'snap_1',
-      mode: 'single',
-      viewId: 'live',
-      viewIds,
-    }),
-    /not presented/i,
-  );
-  const focused = resolvePresentedViewLayout({
+  const single = resolvePresentedLayout({
     canvasHeight,
     canvasWidth,
+    cssHeight,
+    cssWidth,
     focusedViewId: 'snap_1',
+    leftOcclusionRatio: 0,
     mode: 'single',
-    viewId: 'snap_1',
     viewIds,
   });
+  assert.throws(
+    () => getPresentedPane(single, 'live'),
+    /not presented/i,
+  );
+  const focused = getPresentedPane(single, 'snap_1');
   assert.equal(focused.viewportWidth, canvasWidth);
   assert.equal(focused.viewportHeight, canvasHeight);
   assert.equal(focused.scissorEnabled, false);
 
   assert.throws(
-    () => resolvePresentedViewLayout({
+    () => resolvePresentedLayout({
       canvasHeight,
       canvasWidth,
+      cssHeight,
+      cssWidth,
       focusedViewId: 'live',
+      leftOcclusionRatio: 0,
       mode: 'grid',
-      viewId: 'live',
       viewIds: ['live', 'live'],
     }),
     /unique/i,
   );
   assert.throws(
-    () => resolvePresentedViewLayout({
+    () => resolvePresentedLayout({
       canvasHeight,
       canvasWidth,
-      focusedViewId: 'live',
-      mode: 'grid',
-      viewId: 'missing',
+      cssHeight,
+      cssWidth,
+      focusedViewId: 'missing',
+      leftOcclusionRatio: 0,
+      mode: 'single',
       viewIds: ['live'],
     }),
     /absent/i,
   );
+  assert.throws(
+    () => resolvePresentedLayout({
+      canvasHeight,
+      canvasWidth,
+      cssHeight,
+      cssWidth,
+      focusedViewId: 'live',
+      leftOcclusionRatio: 1.5,
+      mode: 'grid',
+      viewIds: ['live'],
+    }),
+    /occlusion/i,
+  );
 });
 
-test('presented camera selection follows focused, locked, and grid owners', () => {
+test('presented camera selection follows the focused camera, its linked followers, and grid owners', () => {
   const globalCameraState = cameraState(1, 'planar');
   const storedCameraState = cameraState(10, 'free');
 
   for (const options of [
+    // A pane linked to the focused camera (same representation, cameras
+    // linked) is drawn from the global camera.
     {
-      camerasLocked: true,
-      focusedViewId: 'live',
+      followsFocusedCamera: true,
       globalCameraState,
       gridMultiview: true,
       storedCameraState,
       viewId: 'snap_1',
       expected: globalCameraState,
     },
+    // The focused pane itself follows the global camera.
     {
-      camerasLocked: false,
-      focusedViewId: 'live',
+      followsFocusedCamera: true,
       globalCameraState,
       gridMultiview: true,
       storedCameraState,
       viewId: 'live',
       expected: globalCameraState,
     },
+    // Any other grid pane -- another representation, or cameras unlinked --
+    // is drawn from its own stored camera, navigation mode included.
     {
-      camerasLocked: false,
-      focusedViewId: 'live',
+      followsFocusedCamera: false,
       globalCameraState,
       gridMultiview: true,
       storedCameraState,
       viewId: 'snap_1',
       expected: storedCameraState,
     },
+    // Outside a grid only the focused pane is presented.
     {
-      camerasLocked: false,
-      focusedViewId: 'live',
+      followsFocusedCamera: false,
       globalCameraState,
       gridMultiview: false,
       storedCameraState,
@@ -310,22 +340,22 @@ test('presented camera selection follows focused, locked, and grid owners', () =
       expected: globalCameraState,
     },
   ]) {
-    const selected = selectPresentedCameraState(options);
-    assert.deepEqual(selected, options.expected);
-    assert.notEqual(selected, options.expected);
-    assert.notEqual(selected.orbit, options.expected.orbit);
+    const { expected, ...selection } = options;
+    const selected = selectPresentedCameraState(selection);
+    assert.deepEqual(selected, expected);
+    assert.notEqual(selected, expected);
+    assert.notEqual(selected.orbit, expected.orbit);
     assert.notEqual(
       selected.freefly.position,
-      options.expected.freefly.position,
+      expected.freefly.position,
     );
     selected.orbit.target[0] = -999;
-    assert.notEqual(options.expected.orbit.target[0], -999);
+    assert.notEqual(expected.orbit.target[0], -999);
   }
 
   assert.throws(
     () => selectPresentedCameraState({
-      camerasLocked: false,
-      focusedViewId: 'live',
+      followsFocusedCamera: false,
       globalCameraState,
       gridMultiview: true,
       storedCameraState: null,
@@ -333,6 +363,19 @@ test('presented camera selection follows focused, locked, and grid owners', () =
     }),
     /camera state/i,
   );
+  // The selection is driven by one exact boolean, never by a truthy value.
+  for (const followsFocusedCamera of [1, 'true', null, undefined]) {
+    assert.throws(
+      () => selectPresentedCameraState({
+        followsFocusedCamera,
+        globalCameraState,
+        gridMultiview: true,
+        storedCameraState,
+        viewId: 'snap_1',
+      }),
+      /following/i,
+    );
+  }
 });
 
 test('view fog ranges use exact live and snapshot owners without mutation', () => {
@@ -523,9 +566,10 @@ test('presented state owns renderer-equivalent layout, camera, fog, and LOD cert
     'getPresentedViewState(viewId)',
     '// HP renderer controls',
   );
-  assert.match(presentedSource, /resolvePresentedViewLayout\(\{/);
+  assert.match(presentedSource, /getPresentedLayout\(\)/);
+  assert.match(presentedSource, /getPresentedPane\(layout, owner\.viewId\)/);
   assert.match(presentedSource, /selectPresentedCameraState\(\{/);
-  assert.match(presentedSource, /configureInteractiveProjection\(/);
+  assert.match(presentedSource, /getPresentedPaneProjection\(layout, paneIndex\)/);
   assert.match(presentedSource, /hpRenderer\.getViewFogRange\(/);
   assert.match(
     presentedSource,

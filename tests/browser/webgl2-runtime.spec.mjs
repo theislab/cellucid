@@ -51,6 +51,10 @@ test('browser runtime provides the working WebGL2 contract Cellucid requires', a
     body: Buffer.from(`${JSON.stringify(runtime, null, 2)}\n`),
     contentType: 'application/json',
   });
+  // The attachment stays in the report; the CI log of every cell must name
+  // the GL implementation it ran on (a software rasterizer on a hosted
+  // runner explains a timing failure that no spec change would).
+  console.log(`[webgl2-runtime] ${JSON.stringify(runtime)}`);
 
   expect(runtime.supported, JSON.stringify(runtime)).toBe(true);
   expect(runtime.isWebGL2).toBe(true);

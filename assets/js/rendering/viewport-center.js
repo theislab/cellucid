@@ -1,6 +1,9 @@
 /**
- * Pure geometry for keeping target-based cameras centered in the canvas area
- * that is not covered by the sidebar.
+ * Pure geometry for the presented area: the part of the canvas the sidebar
+ * does not cover. The sidebar owner measures it (computeLeftOcclusionRatio)
+ * and the viewer lays every pane out inside it (presented-view-layout.js);
+ * applyHorizontalProjectionCenter shifts a pane's projection so its
+ * principal point sits at the centre of what the pane presents.
  */
 
 function assertPlainObject(value, label) {
@@ -22,23 +25,13 @@ function assertFiniteNumber(value, label) {
   return value;
 }
 
-function assertRatio(value, label, allowOne = true) {
-  if (typeof allowOne !== 'boolean') {
-    throw new TypeError('Ratio upper-bound ownership must be one boolean.');
-  }
-  assertFiniteNumber(value, label);
-  const upperBoundValid = allowOne ? value <= 1 : value < 1;
-  if (value < 0 || !upperBoundValid) {
-    throw new RangeError(
-      `${label} must be between 0 and ${allowOne ? '1' : 'less than 1'}.`,
-    );
-  }
-  return value;
-}
-
 /**
  * Convert sidebar layout geometry to the fraction of the canvas covered from
- * its left edge. Geometry is captured by the UI owner, never by the renderer.
+ * its left edge. Geometry is captured by the UI owner, never by the renderer:
+ * `sidebarLeft`/`sidebarWidth` are the sidebar's layout box (without its
+ * open/close slide transform), and `sidebarVisible` is false when the sidebar
+ * occludes nothing: closed and settled, or the full-screen phone sheet, which
+ * the user closes to reach the plot.
  */
 export function computeLeftOcclusionRatio(options) {
   const exact = assertPlainObject(options, 'Sidebar occlusion geometry');
@@ -62,46 +55,8 @@ export function computeLeftOcclusionRatio(options) {
 }
 
 /**
- * Return the horizontal NDC coordinate where the pane's camera target should
- * appear. `null` means the pane is completely occluded.
- */
-export function computePaneCenterNdcX(
-  paneLeftRatio,
-  paneWidthRatio,
-  leftOcclusionRatio
-) {
-  const exactPaneLeftRatio = assertRatio(
-    paneLeftRatio,
-    'Pane left ratio',
-    false,
-  );
-  const exactPaneWidthRatio = assertFiniteNumber(
-    paneWidthRatio,
-    'Pane width ratio',
-  );
-  const exactLeftOcclusionRatio = assertRatio(
-    leftOcclusionRatio,
-    'Left occlusion ratio',
-  );
-  if (exactPaneWidthRatio <= 0 || exactPaneWidthRatio > 1) {
-    throw new RangeError('Pane width ratio must be greater than 0 and at most 1.');
-  }
-  const paneRightRatio = exactPaneLeftRatio + exactPaneWidthRatio;
-  if (paneRightRatio > 1) {
-    throw new RangeError('Viewport pane must remain within canvas bounds.');
-  }
-
-  const visibleLeftRatio = Math.max(
-    exactPaneLeftRatio,
-    exactLeftOcclusionRatio
-  );
-  if (visibleLeftRatio >= paneRightRatio) return null;
-  return (visibleLeftRatio - exactPaneLeftRatio) / exactPaneWidthRatio;
-}
-
-/**
- * Shift a standard perspective matrix so a target on the view axis projects
- * to the requested horizontal NDC coordinate.
+ * Shift a standard perspective matrix so a point on the view axis (the
+ * principal point) projects to the requested horizontal NDC coordinate.
  */
 export function applyHorizontalProjectionCenter(projectionMatrix, centerNdcX) {
   if (
@@ -110,11 +65,12 @@ export function applyHorizontalProjectionCenter(projectionMatrix, centerNdcX) {
   ) {
     throw new TypeError('Projection matrix must be one 16-element Float32Array.');
   }
-  const exactCenter = assertRatio(
-    centerNdcX,
-    'Projection center NDC X',
-    false,
-  );
-  projectionMatrix[8] = exactCenter === 0 ? 0 : -exactCenter;
+  assertFiniteNumber(centerNdcX, 'Projection center NDC X');
+  if (centerNdcX < 0 || centerNdcX >= 1) {
+    throw new RangeError(
+      'Projection center NDC X must be between 0 and less than 1.',
+    );
+  }
+  projectionMatrix[8] = centerNdcX === 0 ? 0 : -centerNdcX;
   return projectionMatrix;
 }

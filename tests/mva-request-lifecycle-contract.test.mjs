@@ -186,6 +186,10 @@ function createDEBoundaryProbe(indicesByPage, pointCount = 6) {
     getCellIndicesForPage(pageId) {
       return indicesByPage[pageId];
     },
+    // A local source: nothing is downloaded ahead.
+    async prefetchGenePayload() {
+      return null;
+    },
     async ensureGeneExpressionLoaded() {
       calls.expressionRead += 1;
       throw new Error('gene expression read reached');
@@ -394,6 +398,10 @@ function createDEExecutionHarness(computeResult, genes = ['Gene A']) {
         ? Uint32Array.of(0, 1, 2)
         : Uint32Array.of(3, 4, 5);
     },
+    // A local source: nothing is downloaded ahead.
+    async prefetchGenePayload() {
+      return null;
+    },
     async ensureGeneExpressionLoaded(gene) {
       calls.expressionReads.push(gene);
       return {
@@ -589,6 +597,10 @@ test('DE invalidation aborts streaming, starts no later gene, drains compute, an
       return pageId === 'page-A'
         ? Uint32Array.of(0, 1, 2)
         : Uint32Array.of(3, 4, 5);
+    },
+    // A local source: nothing is downloaded ahead.
+    async prefetchGenePayload() {
+      return null;
     },
     async ensureGeneExpressionLoaded(gene) {
       startedGenes.push(gene);

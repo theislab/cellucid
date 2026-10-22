@@ -35,15 +35,11 @@ const STORAGE_VERSION = 1;
 const MAX_LABEL_LEN = 120;
 const MAX_ONTOLOGY_LEN = 64;
 const MAX_EVIDENCE_LEN = 2000;
-const MAX_SUGGESTIONS_PER_CLUSTER = 200;
 const MAX_COMMENT_LEN = 500;
-const MAX_COMMENTS_PER_SUGGESTION = 800;
 const MAX_MERGE_NOTE_LEN = 512;
-const MAX_MARKERS_PER_SUGGESTION = 50;
 
 const DEFAULT_MIN_ANNOTATORS = 1;
 const DEFAULT_CONSENSUS_THRESHOLD = 0.5;
-const MAX_TRACKED_DATASETS = 200;
 
 // Bucket and vote keys use ":" as a delimiter. Field keys can contain ":" in other
 // parts of the app, so we escape fieldKey only when needed to keep keys unambiguous
@@ -113,7 +109,9 @@ function assertStringLength(text, maxLen, fieldName = 'value') {
   if (typeof text !== 'string') {
     throw new Error(`[CommunityAnnotationSession] ${fieldName} must be a string`);
   }
-  if (Array.from(text).length > maxLen) {
+  // `maxLen` null: a key the exporters write (a category label) has no length
+  // limit; the annotation file's byte cap bounds it.
+  if (maxLen !== null && Array.from(text).length > maxLen) {
     throw new Error(
       `[CommunityAnnotationSession] ${fieldName} must be at most ${maxLen} characters`
     );
@@ -302,12 +300,6 @@ function mergeDatasetAccessMaps(left, right) {
     out[datasetId] = nextMs >= prevMs ? entry : prev;
   }
 
-  const count = Object.keys(out).length;
-  if (count > MAX_TRACKED_DATASETS) {
-    throw new Error(
-      `[CommunityAnnotationSession] datasets must contain at most ${MAX_TRACKED_DATASETS} entries`
-    );
-  }
   return out;
 }
 
@@ -443,11 +435,10 @@ function normalizeConsensusSettings(input) {
   }
   if (
     !Number.isSafeInteger(input.minAnnotators) ||
-    input.minAnnotators < 0 ||
-    input.minAnnotators > 50
+    input.minAnnotators < 0
   ) {
     throw new Error(
-      '[CommunityAnnotationSession] minAnnotators must be an integer from 0 through 50'
+      '[CommunityAnnotationSession] minAnnotators must be a non-negative integer'
     );
   }
   if (
@@ -467,11 +458,6 @@ function normalizeMarkers(input) {
   if (input === null || input === undefined) return null;
   if (!Array.isArray(input)) {
     throw new Error('[CommunityAnnotationSession] markers must be an array or null');
-  }
-  if (input.length > MAX_MARKERS_PER_SUGGESTION) {
-    throw new Error(
-      `[CommunityAnnotationSession] markers must contain at most ${MAX_MARKERS_PER_SUGGESTION} items`
-    );
   }
   const out = [];
   for (const raw of input) {
@@ -613,11 +599,6 @@ function normalizeComment(input, { authorUsername } = {}) {
 function normalizeCommentArray(comments) {
   if (!Array.isArray(comments)) {
     throw new Error('[CommunityAnnotationSession] comments must be an array');
-  }
-  if (comments.length > MAX_COMMENTS_PER_SUGGESTION) {
-    throw new Error(
-      `[CommunityAnnotationSession] comments must contain at most ${MAX_COMMENTS_PER_SUGGESTION} items`
-    );
   }
   const out = [];
   const seenIds = new Set();
@@ -1049,18 +1030,12 @@ function assertLocalPersistenceDocument(value, { scopeUserId = null } = {}) {
   if (!Array.isArray(document.annotationFields)) {
     throw new Error('$ local state.annotationFields: must be an array');
   }
-  if (document.annotationFields.length > ANNOTATION_LIMITS.fields) {
-    throw new Error(
-      `$ local state.annotationFields: must contain at most ${ANNOTATION_LIMITS.fields} items`
-    );
-  }
   const annotationFieldSet = new Set();
   document.annotationFields.forEach((field, index) => {
     if (
       typeof field !== 'string' ||
       !/\S/.test(field) ||
-      /^\s|\s$/.test(field) ||
-      Array.from(field).length > 256
+      /^\s|\s$/.test(field)
     ) {
       throw new Error(
         `$ local state.annotationFields[${index}]: must be a nonblank string`
@@ -1256,6 +1231,141 @@ function assertLocalPersistenceDocument(value, { scopeUserId = null } = {}) {
   return document;
 }
 
+/**
+ * The remote user files of one Pull, folded one file at a time as they
+ * stream in, so a Pull holds what the merged view needs rather than every raw
+ * file at once. Each file is validated on arrival; the merge with local state
+ * happens in `CommunityAnnotationSession#_mergeRemoteUserFilesExact`.
+ *
+ * What is kept: each user's public profile, the current user's own file (for
+ * multi-device hydration), deletion markers, the newest copy of every
+ * suggestion, and every other user's votes and comments.
+ */
+export class RemoteUserFiles {
+  /**
+   * @param {{ ownUsername: string }} options - The current user's exact key.
+   */
+  constructor({ ownUsername }) {
+    this.ownUsername = normalizeUsername(ownUsername);
+    this.count = 0;
+    /** @type {Record<string, object>} */
+    this.knownProfiles = {};
+    /** @type {any|null} */
+    this.ownDoc = null;
+    /** @type {Array<[string, string, string]>} bucket, suggestion id, owner */
+    this.deletions = [];
+    /** @type {Map<string, { bucket: string, suggestion: object, sourceUser: string, path: string }>} */
+    this.suggestions = new Map();
+    /** @type {Map<string, Map<string, 'up'|'down'>>} suggestion id -> user -> direction */
+    this.votes = new Map();
+    /** @type {Map<string, Map<string, object>>} suggestion id -> author and comment id -> comment */
+    this.comments = new Map();
+    this._usernames = new Set();
+    /** @type {Map<string, { bucket: string, proposedBy: string }>} */
+    this._identity = new Map();
+  }
+
+  /** @param {object} document - One parsed `annotations/users/*.json`. */
+  add(document) {
+    const index = this.count;
+    const path = `$ user documents[${index}]`;
+    assertUserDocument(document, { path });
+    if (this._usernames.has(document.username)) {
+      throw new Error(
+        `${path}.username: duplicate user file identity ` +
+        `${JSON.stringify(document.username)}`
+      );
+    }
+    for (const [bucket, list] of Object.entries(document.suggestions)) {
+      list.forEach((suggestion, listIndex) => {
+        const previous = this._identity.get(suggestion.id);
+        if (
+          previous !== undefined &&
+          (previous.bucket !== bucket || previous.proposedBy !== suggestion.proposedBy)
+        ) {
+          throw new Error(
+            `${path}.suggestions[${JSON.stringify(bucket)}][${listIndex}].id: ` +
+            `${JSON.stringify(suggestion.id)} conflicts with the suggestion owned by ` +
+            `${JSON.stringify(previous.proposedBy)} in bucket ` +
+            `${JSON.stringify(previous.bucket)}`
+          );
+        }
+      });
+    }
+    const docUser = document.username;
+    this._usernames.add(docUser);
+    this.count += 1;
+
+    const profile = sanitizeKnownUserProfile(document);
+    if (profile) this.knownProfiles[docUser] = profile;
+    if (docUser === this.ownUsername) this.ownDoc = document;
+
+    for (const [bucket, ids] of Object.entries(document.deletedSuggestions ?? {})) {
+      for (const id of ids) this.deletions.push([bucket, id, docUser]);
+    }
+
+    // The newest copy of each suggestion wins, as in mergeSuggestionMeta(); a
+    // tie goes to another user's copy over the current user's.
+    const preferIncoming = docUser !== this.ownUsername;
+    for (const [bucket, list] of Object.entries(document.suggestions)) {
+      list.forEach((suggestion, listIndex) => {
+        this._identity.set(suggestion.id, { bucket, proposedBy: suggestion.proposedBy });
+        const previous = this.suggestions.get(suggestion.id);
+        let incomingWins = true;
+        if (previous !== undefined) {
+          const leftTime = Date.parse(previous.suggestion.editedAt || previous.suggestion.proposedAt);
+          const rightTime = Date.parse(suggestion.editedAt || suggestion.proposedAt);
+          incomingWins = rightTime > leftTime || (rightTime === leftTime && preferIncoming);
+        }
+        if (!incomingWins) return;
+        this.suggestions.set(suggestion.id, {
+          bucket,
+          suggestion: cloneWireSuggestion(suggestion),
+          sourceUser: docUser,
+          path: `${path}.suggestions[${JSON.stringify(bucket)}][${listIndex}]`,
+        });
+      });
+    }
+
+    if (docUser !== this.ownUsername) {
+      for (const [suggestionId, direction] of Object.entries(document.votes)) {
+        if (!this.votes.has(suggestionId)) this.votes.set(suggestionId, new Map());
+        this.votes.get(suggestionId).set(docUser, direction);
+      }
+      for (const [suggestionId, commentList] of Object.entries(document.comments ?? {})) {
+        if (!this.comments.has(suggestionId)) this.comments.set(suggestionId, new Map());
+        const byAuthorAndId = this.comments.get(suggestionId);
+        for (const comment of commentList) {
+          const normalized = normalizeComment({ ...comment, authorUsername: docUser });
+          byAuthorAndId.set(`${normalized.authorUsername}\u0000${normalized.id}`, normalized);
+        }
+      }
+    }
+  }
+
+  /**
+   * Refuse a local suggestion whose id another user's file assigns to another
+   * bucket or owner.
+   *
+   * @param {Record<string, object[]>} localSuggestions
+   */
+  assertNoConflictWith(localSuggestions) {
+    for (const [bucket, list] of Object.entries(localSuggestions)) {
+      for (const suggestion of list) {
+        const remote = this.suggestions.get(suggestion.id);
+        if (remote === undefined) continue;
+        if (remote.bucket !== bucket || remote.suggestion.proposedBy !== suggestion.proposedBy) {
+          throw new Error(
+            `${remote.path}.id: ${JSON.stringify(suggestion.id)} conflicts with the ` +
+            `suggestion owned by ${JSON.stringify(suggestion.proposedBy)} in bucket ` +
+            `${JSON.stringify(bucket)}`
+          );
+        }
+      }
+    }
+  }
+}
+
 export class CommunityAnnotationSession extends EventEmitter {
   constructor() {
     super();
@@ -1275,6 +1385,18 @@ export class CommunityAnnotationSession extends EventEmitter {
     this._saveTimer = null;
     this._loadedForKey = null;
     this._pullApplicationTransactionActive = false;
+    // A pending debounced save is written before the page goes away. These
+    // listeners are registered here, before the scope lock is ever acquired,
+    // so on pagehide they run ahead of the lock's own release listener and the
+    // write still holds the lock it requires.
+    if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+      window.addEventListener('pagehide', () => this.flushPendingSave());
+    }
+    if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'hidden') this.flushPendingSave();
+      });
+    }
     this._scopeLock.on('lost', (evt) => {
       if (!evt || typeof evt !== 'object' || Array.isArray(evt)) {
         throw new Error(
@@ -1297,6 +1419,28 @@ export class CommunityAnnotationSession extends EventEmitter {
       });
     });
     this._ensureLoaded();
+  }
+
+  /**
+   * Does the current user's own remote file hold intent this session has not
+   * seen yet?
+   *
+   * The own file is a source of new local state only when it is not the
+   * version this session last published or pulled (for example, after a
+   * Publish from another device). A file at the recorded SHA is already
+   * reflected locally, so anything missing from local state was retracted here
+   * (a vote cleared, a comment deleted) and must not be filled back in.
+   *
+   * @param {Record<string, string>} remoteFileShas - SHAs of the files being merged.
+   * @returns {boolean}
+   */
+  ownUserFileNeedsHydration(remoteFileShas) {
+    const incoming = assertRemoteFileShaMap(remoteFileShas, '$ merged file SHAs');
+    const userKey = this._getEffectiveUserKey();
+    if (!/^ghid_[1-9][0-9]*$/.test(userKey)) return true;
+    const path = `annotations/users/${userKey}.json`;
+    const known = this.getRemoteFileShas()[path];
+    return !(typeof known === 'string' && known === incoming[path]);
   }
 
   _getEffectiveUserKey() {
@@ -1561,11 +1705,6 @@ export class CommunityAnnotationSession extends EventEmitter {
     if (!Array.isArray(fieldsToAnnotate)) {
       throw new Error('[CommunityAnnotationSession] fieldsToAnnotate must be an array');
     }
-    if (fieldsToAnnotate.length > ANNOTATION_LIMITS.fields) {
-      throw new Error(
-        `[CommunityAnnotationSession] fieldsToAnnotate must contain at most ${ANNOTATION_LIMITS.fields} items`
-      );
-    }
     const exactFields = fieldsToAnnotate.map((field, index) => {
       return assertSessionFieldKey(
         field,
@@ -1582,12 +1721,6 @@ export class CommunityAnnotationSession extends EventEmitter {
     ) {
       throw new Error(
         '[CommunityAnnotationSession] datasets state must be an object'
-      );
-    }
-    if (!Object.hasOwn(this._state.datasets, did) &&
-        Object.keys(this._state.datasets).length >= MAX_TRACKED_DATASETS) {
-      throw new Error(
-        `[CommunityAnnotationSession] datasets must contain at most ${MAX_TRACKED_DATASETS} entries`
       );
     }
     this._state.datasets[did] = {
@@ -1677,11 +1810,6 @@ export class CommunityAnnotationSession extends EventEmitter {
     if (on === existing) return true;
 
     if (on) {
-      if (this._state.annotationFields.length >= ANNOTATION_LIMITS.fields) {
-        throw new Error(
-          `[CommunityAnnotationSession] annotationFields must contain at most ${ANNOTATION_LIMITS.fields} items`
-        );
-      }
       if (
         !this._state.annotatableSettings ||
         typeof this._state.annotatableSettings !== 'object' ||
@@ -1777,11 +1905,6 @@ export class CommunityAnnotationSession extends EventEmitter {
       throw new Error('[CommunityAnnotationSession] closed fields must be an array');
     }
     const list = nextList;
-    if (list.length > ANNOTATION_LIMITS.fields) {
-      throw new Error(
-        `[CommunityAnnotationSession] closed fields must contain at most ${ANNOTATION_LIMITS.fields} items`
-      );
-    }
     const next = createExactRecord();
     for (const k of list) {
       const key = assertSessionFieldKey(k, 'closed field');
@@ -2156,9 +2279,6 @@ export class CommunityAnnotationSession extends EventEmitter {
     if (!suggestion) throw new Error('[CommunityAnnotationSession] label required');
 
     if (!this._state.suggestions[key]) this._state.suggestions[key] = [];
-    if (this._state.suggestions[key].length >= MAX_SUGGESTIONS_PER_CLUSTER) {
-      throw new Error('[CommunityAnnotationSession] too many suggestions for this cluster');
-    }
 
     // Auto-upvote by proposer
     const myUserKey = this._getEffectiveUserKey();
@@ -2295,11 +2415,6 @@ export class CommunityAnnotationSession extends EventEmitter {
     if (!this._state.deletedSuggestions || typeof this._state.deletedSuggestions !== 'object') this._state.deletedSuggestions = {};
     const existing = Array.isArray(this._state.deletedSuggestions[bucket]) ? this._state.deletedSuggestions[bucket] : [];
     const nextDeleted = uniqueStrings(existing.concat([id]));
-    if (nextDeleted.length > ANNOTATION_LIMITS.deletedPerBucket) {
-      throw new Error(
-        `[CommunityAnnotationSession] deleted suggestions must contain at most ${ANNOTATION_LIMITS.deletedPerBucket} ids per bucket`
-      );
-    }
     this._state.deletedSuggestions[bucket] = nextDeleted;
 
     this._state.suggestions[bucket] = list.filter((x) => toCleanString(x?.id) !== id);
@@ -2465,11 +2580,6 @@ export class CommunityAnnotationSession extends EventEmitter {
     if (!suggestion) return null;
 
     if (!Array.isArray(suggestion.comments)) suggestion.comments = [];
-    if (suggestion.comments.length >= MAX_COMMENTS_PER_SUGGESTION) {
-      throw new Error(
-        `[CommunityAnnotationSession] comments must contain at most ${MAX_COMMENTS_PER_SUGGESTION} items per suggestion`
-      );
-    }
 
     const comment = normalizeComment(
       { text },
@@ -2690,12 +2800,6 @@ export class CommunityAnnotationSession extends EventEmitter {
       return m.fromSuggestionId !== entry.fromSuggestionId;
     });
     this._state.moderationMerges.push(entry);
-    if (this._state.moderationMerges.length > ANNOTATION_LIMITS.merges) {
-      this._state.moderationMerges.pop();
-      throw new Error(
-        `[CommunityAnnotationSession] moderation merges must contain at most ${ANNOTATION_LIMITS.merges} items`
-      );
-    }
     // Votes/comments are auto-combined at runtime from the merge mapping.
     this._touch();
     return true;
@@ -2986,7 +3090,7 @@ export class CommunityAnnotationSession extends EventEmitter {
       );
       const catKey = assertExactNonblankString(
         parts.catKey,
-        ANNOTATION_LIMITS.bucket,
+        null,
         'consensus category'
       );
       return { fieldKey, catKey, bucket: bucketKey(fieldKey, catKey) };
@@ -3276,18 +3380,31 @@ export class CommunityAnnotationSession extends EventEmitter {
    * 2) clears the compiled/merged suggestion view,
    * 3) runs `mergeFromUserFiles()` against the complete inputs.
    *
-   * @param {object[]} remoteUserDocs - parsed docs from `annotations/users/*.json`
+   * @param {RemoteUserFiles} remoteUserFiles - every `annotations/users/*.json`
+   *   of the Pull, folded by `createRemoteUserFiles()`
    * @param {object} [options]
    * @param {boolean} [options.preferLocalVotes=true]
+   * @param {boolean} [options.hydrateFromOwnFile=true] - Fill local votes,
+   *   comments, deletions and dataset access from the current user's own file.
    */
-  rebuildMergedViewFromUserFiles(remoteUserDocs, options = {}) {
+  /**
+   * An empty fold of one Pull's remote user files for this session's user;
+   * the Pull adds each file to it as the file streams out of the cache.
+   *
+   * @returns {RemoteUserFiles}
+   */
+  createRemoteUserFiles() {
+    return new RemoteUserFiles({ ownUsername: this._getEffectiveUserKey() });
+  }
+
+  rebuildMergedViewFromUserFiles(remoteUserFiles, options = {}) {
     const preferLocalVotes = options.preferLocalVotes !== false;
-    if (!Array.isArray(remoteUserDocs)) {
-      throw new Error('[CommunityAnnotationSession] remote user documents must be an array');
+    const hydrateFromOwnFile = options.hydrateFromOwnFile !== false;
+    if (!(remoteUserFiles instanceof RemoteUserFiles)) {
+      throw new TypeError(
+        '[CommunityAnnotationSession] remote user files must come from createRemoteUserFiles()'
+      );
     }
-    remoteUserDocs.forEach((document, index) => {
-      assertUserDocument(document, { path: `$ remote user documents[${index}]` });
-    });
 
     const localUser = this._getEffectiveUserKey();
     const localSuggestions = {};
@@ -3305,7 +3422,10 @@ export class CommunityAnnotationSession extends EventEmitter {
 
     if (this._pullApplicationTransactionActive) {
       this._state.suggestions = localSuggestions;
-      this._mergeFromUserFilesExact(remoteUserDocs, { preferLocalVotes });
+      this._mergeRemoteUserFilesExact(remoteUserFiles, {
+        preferLocalVotes,
+        hydrateFromOwnFile,
+      });
       return;
     }
 
@@ -3316,7 +3436,10 @@ export class CommunityAnnotationSession extends EventEmitter {
     );
     try {
       this._state.suggestions = localSuggestions;
-      this.mergeFromUserFiles(remoteUserDocs, { preferLocalVotes });
+      this._mergeRemoteUserFilesExact(remoteUserFiles, {
+        preferLocalVotes,
+        hydrateFromOwnFile,
+      });
     } catch (error) {
       this._state = previousState;
       this._profile = previousProfile;
@@ -3382,7 +3505,7 @@ export class CommunityAnnotationSession extends EventEmitter {
    * votes, comments, and unpublished moderation merges remain authoritative.
    *
    * @param {object} options
-   * @param {object[]} options.remoteUserDocs
+   * @param {RemoteUserFiles} options.remoteUserFiles - from createRemoteUserFiles()
    * @param {object|null} options.moderationDocument
    * @param {string[]} options.categoricalFieldKeys
    * @param {string[]} options.fieldsToAnnotate
@@ -3393,7 +3516,7 @@ export class CommunityAnnotationSession extends EventEmitter {
    * @param {AbortSignal|null} [options.signal]
    */
   applyPulledRepositoryState({
-    remoteUserDocs,
+    remoteUserFiles,
     moderationDocument = null,
     categoricalFieldKeys,
     fieldsToAnnotate,
@@ -3465,8 +3588,9 @@ export class CommunityAnnotationSession extends EventEmitter {
       }
       throwIfAborted();
 
-      this.rebuildMergedViewFromUserFiles(remoteUserDocs, {
+      this.rebuildMergedViewFromUserFiles(remoteUserFiles, {
         preferLocalVotes: true,
+        hydrateFromOwnFile: this.ownUserFileNeedsHydration(remoteFileShas),
       });
       throwIfAborted();
 
@@ -3506,6 +3630,7 @@ export class CommunityAnnotationSession extends EventEmitter {
    * @param {object[]} userDocs
    * @param {object} [options]
    * @param {boolean} [options.preferLocalVotes=true] - Local `myVotes` wins over pulled votes for the current user.
+   * @param {boolean} [options.hydrateFromOwnFile=true] - Fill local state gaps from the current user's own file.
    */
   mergeFromUserFiles(userDocs, options = {}) {
     const previousState = cloneStateForTransaction(this._state);
@@ -3525,43 +3650,22 @@ export class CommunityAnnotationSession extends EventEmitter {
     if (!Array.isArray(userDocs)) {
       throw new Error('[CommunityAnnotationSession] user documents must be an array');
     }
-    userDocs.forEach((document, index) => {
-      assertUserDocument(document, { path: `$ user documents[${index}]` });
-    });
-    const documentUsers = new Set();
-    userDocs.forEach((document, index) => {
-      if (documentUsers.has(document.username)) {
-        throw new Error(
-          `$ user documents[${index}].username: duplicate user file identity ` +
-          `${JSON.stringify(document.username)}`
-        );
-      }
-      documentUsers.add(document.username);
-    });
+    const remote = new RemoteUserFiles({ ownUsername: this._getEffectiveUserKey() });
+    for (const document of userDocs) remote.add(document);
+    return this._mergeRemoteUserFilesExact(remote, options);
+  }
 
-    const suggestionIdentityById = new Map();
-    const inspectSuggestionBuckets = (suggestions, path) => {
-      for (const [bucket, list] of Object.entries(suggestions)) {
-        list.forEach((suggestion, index) => {
-          const previous = suggestionIdentityById.get(suggestion.id);
-          if (
-            previous !== undefined &&
-            (previous.bucket !== bucket || previous.proposedBy !== suggestion.proposedBy)
-          ) {
-            throw new Error(
-              `${path}[${JSON.stringify(bucket)}][${index}].id: ` +
-              `${JSON.stringify(suggestion.id)} conflicts with the suggestion owned by ` +
-              `${JSON.stringify(previous.proposedBy)} in bucket ` +
-              `${JSON.stringify(previous.bucket)}`
-            );
-          }
-          suggestionIdentityById.set(suggestion.id, {
-            bucket,
-            proposedBy: suggestion.proposedBy,
-          });
-        });
-      }
-    };
+  /**
+   * Merge one Pull's remote user files, already folded by `RemoteUserFiles`
+   * as they streamed in, with this session's local state.
+   *
+   * @param {RemoteUserFiles} remote
+   * @param {object} [options]
+   */
+  _mergeRemoteUserFilesExact(remote, options = {}) {
+    if (!(remote instanceof RemoteUserFiles)) {
+      throw new TypeError('[CommunityAnnotationSession] remote user files must be a RemoteUserFiles');
+    }
     for (const [bucket, list] of Object.entries(this._state.suggestions)) {
       if (!Array.isArray(list)) {
         throw new Error(
@@ -3569,36 +3673,28 @@ export class CommunityAnnotationSession extends EventEmitter {
         );
       }
     }
-    inspectSuggestionBuckets(this._state.suggestions, '$ local suggestions');
-    userDocs.forEach((document, index) => {
-      inspectSuggestionBuckets(document.suggestions, `$ user documents[${index}].suggestions`);
-    });
+    remote.assertNoConflictWith(this._state.suggestions);
 
     const preferLocalVotes = options.preferLocalVotes !== false;
+    const hydrateFromOwnFile = options.hydrateFromOwnFile !== false;
     const myUsername = this._getEffectiveUserKey();
     const myUserLower = normalizeUsername(myUsername);
-    const knownProfiles = {};
-
-    const getCachedDocUser = (doc) => doc.username;
-
-    // 0) Capture optional public profile info from user docs (displayName/title/orcid/linkedin).
-    // This is local-only UI metadata (not pushed anywhere by the app).
-    const docsList = userDocs;
-    for (const doc of docsList) {
-      const u = getCachedDocUser(doc);
-      const cleaned = sanitizeKnownUserProfile(doc || {});
-      if (!cleaned) continue;
-      knownProfiles[u] = cleaned;
+    if (remote.ownUsername !== myUserLower) {
+      throw new Error(
+        '[CommunityAnnotationSession] remote user files were folded for another user'
+      );
     }
-    this._knownProfiles = knownProfiles;
+
+    // 0) Optional public profile info from user docs (displayName/title/orcid/linkedin).
+    // This is local-only UI metadata (not pushed anywhere by the app).
+    this._knownProfiles = { ...remote.knownProfiles };
 
     // Hydrate my profile fields from my GitHub user file if we don't have them yet.
     const mine = this._profile || sanitizeProfile({});
     const hasAny = Boolean(mine.displayName || mine.title || mine.orcid || mine.linkedin);
-    if (!hasAny) {
-      for (const doc of docsList) {
-        const docUser = getCachedDocUser(doc);
-        if (docUser !== myUserLower) continue;
+    if (!hasAny && remote.ownDoc !== null) {
+      {
+        const doc = remote.ownDoc;
         this._profile = sanitizeProfile({
           username: doc.username,
           githubUserId: doc.githubUserId,
@@ -3609,7 +3705,6 @@ export class CommunityAnnotationSession extends EventEmitter {
           linkedin: doc.linkedin || ''
         });
         this._state.profile = { ...this._profile };
-        break;
       }
     }
 
@@ -3680,33 +3775,15 @@ export class CommunityAnnotationSession extends EventEmitter {
       for (const s of list) addSuggestion(bucket, s);
     }
 
-    const remoteDocs = userDocs;
     // The current user's remote doc is special: we may need to hydrate local persisted state
     // (votes/comments/deletions) for multi-device usage. Local intent still wins.
-    /** @type {any|null} */
-    let myRemoteDoc = null;
-    for (const doc of remoteDocs) {
-      const docUser = getCachedDocUser(doc);
-      if (docUser === myUserLower) {
-        myRemoteDoc = doc;
-        break;
-      }
-    }
+    const myRemoteDoc = remote.ownDoc;
 
     // remote deletion markers
-    for (const doc of remoteDocs) {
-      const docUser = getCachedDocUser(doc);
-      const deleted = doc.deletedSuggestions ?? {};
-      for (const [bucket, ids] of Object.entries(deleted)) {
-        for (const id of ids) addDeleted(bucket, id, docUser);
-      }
-    }
+    for (const [bucket, id, docUser] of remote.deletions) addDeleted(bucket, id, docUser);
 
-    for (const doc of remoteDocs) {
-      const docUser = getCachedDocUser(doc);
-      for (const [bucket, list] of Object.entries(doc.suggestions)) {
-        for (const s of list) addSuggestion(bucket, s, { sourceUser: docUser });
-      }
+    for (const { bucket, suggestion, sourceUser } of remote.suggestions.values()) {
+      addSuggestion(bucket, suggestion, { sourceUser });
     }
 
     // Apply deletion markers now that we have suggestion metadata (including proposedBy).
@@ -3761,7 +3838,9 @@ export class CommunityAnnotationSession extends EventEmitter {
 
     // Hydrate persisted local state from the user's own remote user file (multi-device Pull/Publish).
     // Only fill gaps: if local state has a vote/comment/deletion, it remains authoritative.
-    if (myRemoteDoc && myUserLower) {
+    // A Pull skips this when the file is the version this session already
+    // published or pulled, so a local retraction is never filled back in.
+    if (hydrateFromOwnFile && myRemoteDoc && myUserLower) {
         // 0) Dataset access metadata (informational): union per-user map.
         if (myRemoteDoc.datasets != null) {
           this._state.datasets = mergeDatasetAccessMaps(this._state.datasets, myRemoteDoc.datasets);
@@ -3893,12 +3972,12 @@ export class CommunityAnnotationSession extends EventEmitter {
       if (direction === 'down') downvotesById.get(sid).add(u);
     };
 
-    for (const doc of remoteDocs) {
-      const docUser = getCachedDocUser(doc);
-      if (preferLocalVotes && docUser === myUserLower) continue;
-
-      for (const [sid, dir] of Object.entries(doc.votes)) {
-        applyVote(sid, docUser, dir);
+    for (const [sid, votes] of remote.votes) {
+      for (const [docUser, dir] of votes) applyVote(sid, docUser, dir);
+    }
+    if (!preferLocalVotes && myRemoteDoc !== null) {
+      for (const [sid, dir] of Object.entries(myRemoteDoc.votes)) {
+        applyVote(sid, myRemoteDoc.username, dir);
       }
     }
 
@@ -3935,18 +4014,10 @@ export class CommunityAnnotationSession extends EventEmitter {
       commentsById.get(sid).set(aggregateKey, normalized);
     };
 
-    // Collect comments from remote user docs
-    for (const doc of remoteDocs) {
-      const docUsername = getCachedDocUser(doc);
-      // Skip local user's remote comments (prefer local state)
-      if (docUsername === myUserLower) continue;
-
-      const comments = doc.comments ?? {};
-      for (const [suggestionId, commentList] of Object.entries(comments)) {
-        for (const c of commentList) {
-          addComment(suggestionId, { ...c, authorUsername: docUsername });
-        }
-      }
+    // Comments from the other users' remote docs (the local user's own come
+    // from local state below).
+    for (const [suggestionId, comments] of remote.comments) {
+      for (const comment of comments.values()) addComment(suggestionId, comment);
     }
 
     // Apply local user's comments last (local wins)
@@ -4121,28 +4192,42 @@ export class CommunityAnnotationSession extends EventEmitter {
   _scheduleSave() {
     if (!this._persistenceOk) return;
     if (this._saveTimer !== null) return;
-    this._saveTimer = setTimeout(() => {
+    this._saveTimer = setTimeout(() => this._runScheduledSave(), 150);
+  }
+
+  /**
+   * Write a save that is still waiting for its debounce now. Called when the
+   * page is hidden or unloaded, where the debounce timer would never fire.
+   */
+  flushPendingSave() {
+    if (this._saveTimer === null) return;
+    this._runScheduledSave();
+  }
+
+  _runScheduledSave() {
+    if (this._saveTimer !== null) {
+      clearTimeout(this._saveTimer);
       this._saveTimer = null;
-      try {
-        this._saveNow();
-      } catch (error) {
-        if (
-          error?.code !== 'LOCAL_ANNOTATION_STATE_INVALID' &&
-          error?.code !== 'LOCAL_ANNOTATION_PERSISTENCE_FAILED'
-        ) {
-          this._persistenceOk = false;
-          this.emit('persistence:error', {
-            datasetId: this._datasetId,
-            repoRef: this._repoRef,
-            userId: this._cacheUserId,
-            message:
-              typeof error?.message === 'string' && error.message
-                ? error.message
-                : 'Scheduled community annotation persistence failed',
-          });
-        }
+    }
+    try {
+      this._saveNow();
+    } catch (error) {
+      if (
+        error?.code !== 'LOCAL_ANNOTATION_STATE_INVALID' &&
+        error?.code !== 'LOCAL_ANNOTATION_PERSISTENCE_FAILED'
+      ) {
+        this._persistenceOk = false;
+        this.emit('persistence:error', {
+          datasetId: this._datasetId,
+          repoRef: this._repoRef,
+          userId: this._cacheUserId,
+          message:
+            typeof error?.message === 'string' && error.message
+              ? error.message
+              : 'Scheduled community annotation persistence failed',
+        });
       }
-    }, 150);
+    }
   }
 
   _saveNow() {

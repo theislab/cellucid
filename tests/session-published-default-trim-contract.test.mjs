@@ -51,9 +51,12 @@ import {
 import {
   SessionSerializer,
 } from '../assets/js/app/session/session-serializer.js';
+import {
+  createInMemoryDimensionManager,
+} from '../assets/js/data/dimension-manager.js';
 
 const PRESET_REPOSITORY_URL = new URL('../../cellucid-datasets/', import.meta.url);
-const PRESET_EXPORTS_URL = new URL('exports/', PRESET_REPOSITORY_URL);
+const PRESET_EXPORTS_URL = new URL('exports-v3/', PRESET_REPOSITORY_URL);
 const PRESET_FILENAME = 'default.cellucid-session';
 
 const KEPT_IDS = PUBLISHED_DEFAULT_STATIC_CHUNK_PROFILE.map(
@@ -165,6 +168,20 @@ test('every chunk a save can drop has a fixture that says what empty means', () 
  * @param {{ profile: object, payload: any }[]} emissions
  * @param {{ sourceType: string, datasetId: string }|null} [identity]
  */
+/**
+ * The export data mapping of the serializer's dataset, whose one embedding is
+ * an in-memory 3D layout (keyed "3d").
+ */
+const IN_MEMORY_3D_MAPPING = Object.freeze({
+  kind: 'export',
+  embeddings: {
+    enabled: [{ key: '3d', columns: null }],
+    defaults: { '1d': null, '2d': null, '3d': { key: '3d', columns: null } },
+  },
+  geneNames: 'index',
+  vectorFields: [],
+});
+
 function makeSerializer(emissions, identity = null) {
   const byContributor = new Map();
   for (const emission of emissions) {
@@ -181,13 +198,21 @@ function makeSerializer(emissions, identity = null) {
     restore: () => {},
   }));
 
+  const positionsArray = new Float32Array(9);
+  const dimensionManager = createInMemoryDimensionManager({
+    positions: positionsArray,
+    dimension: 3,
+  });
   return new SessionSerializer({
     state: {
       getDatasetGeneration: () => 0,
       obsData: { fields: [] },
       pointCount: 3,
       getViewDimensionLevel: () => 3,
-      positionsArray: new Float32Array(9),
+      positionsArray,
+      dimensionManager,
+      getDataMapping: () => IN_MEMORY_3D_MAPPING,
+      getViewLayoutKey: viewId => dimensionManager.getViewLayout(viewId),
       varData: { fields: [] },
     },
     viewer: {},
@@ -439,16 +464,50 @@ test('the trim refuses a dropped chunk whose payload shape is unrecognised', asy
  * Five presets shipped that way.
  * ------------------------------------------------------------------ */
 
-test('publishing rebinds a local capture to the identity it ships under', async () => {
-  const captured = {
+/**
+ * The data mapping of a prepared export that enables PCA beside UMAP and
+ * defaults to UMAP in 2D and 3D.
+ */
+function suoDataMapping() {
+  return {
+    kind: 'export',
+    embeddings: {
+      enabled: [
+        { key: 'X_pca', columns: null },
+        { key: 'X_umap_2d', columns: null },
+        { key: 'X_umap_3d', columns: null },
+      ],
+      defaults: {
+        '1d': null,
+        '2d': { key: 'X_umap_2d', columns: null },
+        '3d': { key: 'X_umap_3d', columns: null },
+      },
+    },
+    geneNames: 'index',
+    vectorFields: [],
+  };
+}
+
+/** A capture of the Suo generation, served locally, on its 3D UMAP. */
+function suoCapture() {
+  return {
     sourceType: 'local-user',
     datasetId: 'local-user:suo',
     cellCount: 561_947,
     varCount: 5_103,
-    cellOrder: { dimension: 3, digest: 'a229f7d3347dbb46' },
+    cellOrder: {
+      embedding: { key: 'X_umap_3d', columns: null },
+      dimension: 3,
+      digest: 'a229f7d3347dbb46',
+    },
+    dataMapping: suoDataMapping(),
   };
+}
+
+test('publishing rebinds a local capture to the identity it ships under', async () => {
+  const captured = suoCapture();
   const rebound = rebindPublishedDefaultFingerprint(captured, {
-    ...captured,
+    ...structuredClone(captured),
     sourceType: PUBLISHED_DEFAULT_SOURCE_TYPE,
     datasetId: 'suo',
   });
@@ -458,8 +517,17 @@ test('publishing rebinds a local capture to the identity it ships under', async 
     datasetId: 'suo',
     cellCount: 561_947,
     varCount: 5_103,
-    cellOrder: { dimension: 3, digest: 'a229f7d3347dbb46' },
+    cellOrder: {
+      embedding: { key: 'X_umap_3d', columns: null },
+      dimension: 3,
+      digest: 'a229f7d3347dbb46',
+    },
+    dataMapping: suoDataMapping(),
   });
+  // The embedding and the mapping are carried as copies, never shared with
+  // the capture they were read from.
+  assert.notStrictEqual(rebound.cellOrder.embedding, captured.cellOrder.embedding);
+  assert.notStrictEqual(rebound.dataMapping, captured.dataMapping);
   assert.notEqual(
     rebound.datasetId,
     captured.datasetId,
@@ -469,26 +537,32 @@ test('publishing rebinds a local capture to the identity it ships under', async 
 });
 
 test('publishing refuses to restate what a capture was taken against', async () => {
-  const captured = {
-    sourceType: 'local-user',
-    datasetId: 'local-user:suo',
-    cellCount: 561_947,
-    varCount: 5_103,
-    cellOrder: { dimension: 3, digest: 'a229f7d3347dbb46' },
-  };
+  const captured = suoCapture();
   const published = {
-    ...captured,
+    ...suoCapture(),
     sourceType: PUBLISHED_DEFAULT_SOURCE_TYPE,
     datasetId: 'suo',
   };
+  const cellOrder = changes => ({ cellOrder: { ...captured.cellOrder, ...changes } });
 
   // Each describing field, one at a time, so a rule that checked only some of
   // them fails here naming the one it skipped.
   const corruptions = [
     ['cell count', { cellCount: 561_946 }],
     ['gene count', { varCount: 5_102 }],
-    ['embedding dimension', { cellOrder: { dimension: 2, digest: 'a229f7d3347dbb46' } }],
-    ['cell-order digest', { cellOrder: { dimension: 3, digest: '0000000000000000' } }],
+    ['cell-order embedding', cellOrder({ embedding: { key: 'X_umap_2d', columns: null } })],
+    ['embedding dimension', cellOrder({ dimension: 2 })],
+    ['cell-order digest', cellOrder({ digest: '0000000000000000' })],
+    ['data mapping', { dataMapping: { ...suoDataMapping(), geneNames: 'column:gene_symbols' } }],
+    [
+      'data mapping',
+      {
+        dataMapping: {
+          ...suoDataMapping(),
+          vectorFields: [{ field: 'velocity', embedding: { key: 'X_umap_3d', columns: null } }],
+        },
+      },
+    ],
   ];
   for (const [label, override] of corruptions) {
     assert.throws(
@@ -504,13 +578,37 @@ test('publishing refuses to restate what a capture was taken against', async () 
   }
 });
 
+test('publishing refuses a capture taken before sessions recorded a data mapping', async () => {
+  // The fingerprint every session written before data mappings carries: a
+  // cell order with no embedding, and no mapping. Such a capture cannot be
+  // rebound, because there is no embedding or mapping to verify and the
+  // reader refuses the file whatever identity it is given.
+  const { dataMapping: _dataMapping, ...withoutMapping } = suoCapture();
+  const preMapping = {
+    ...withoutMapping,
+    cellOrder: { dimension: 3, digest: 'a229f7d3347dbb46' },
+  };
+  assert.throws(
+    () => rebindPublishedDefaultFingerprint(preMapping, {
+      ...suoCapture(),
+      sourceType: PUBLISHED_DEFAULT_SOURCE_TYPE,
+      datasetId: 'suo',
+    }),
+    error => error instanceof RangeError
+      && /before sessions recorded which stored embeddings/.test(error.message),
+  );
+});
+
 test('publishing refuses an identity a published default is never read under', async () => {
   const captured = {
-    sourceType: 'local-user',
-    datasetId: 'local-user:suo',
+    ...suoCapture(),
     cellCount: 3,
     varCount: 0,
-    cellOrder: { dimension: 3, digest: '0123456789abcdef' },
+    cellOrder: {
+      embedding: { key: 'X_umap_3d', columns: null },
+      dimension: 3,
+      digest: '0123456789abcdef',
+    },
   };
   assert.throws(
     () => rebindPublishedDefaultFingerprint(captured, {

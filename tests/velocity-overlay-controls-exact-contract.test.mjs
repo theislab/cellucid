@@ -125,6 +125,12 @@ function makeState(overrides = {}) {
     getAvailableVectorFields: () => [],
     getDefaultVectorFieldId: () => null,
     getDimensionLevel: () => 2,
+    getActiveViewId: () => 'live',
+    getViewLayoutKey: () => 'X_umap',
+    viewContexts: new Map([['live', { id: 'live' }]]),
+    getDimensionManager: () => ({
+      getLayout: layoutKey => ({ layoutKey, label: 'UMAP', dimension: 2 }),
+    }),
     off() {},
     on() {},
   }, overrides);
@@ -197,7 +203,17 @@ test('renderer accepts every endpoint exposed by the visible velocity sliders', 
   }
 });
 
-test('minimum flow speed is displayed and published without rounding away its value', () => {
+test('minimum flow speed is displayed and published without rounding away its value', (t) => {
+  // Slider work is coalesced to one animation frame; the test owns the frame.
+  const frames = [];
+  const previousRequestAnimationFrame = globalThis.requestAnimationFrame;
+  const previousCancelAnimationFrame = globalThis.cancelAnimationFrame;
+  globalThis.requestAnimationFrame = callback => frames.push(callback);
+  globalThis.cancelAnimationFrame = () => {};
+  t.after(() => {
+    globalThis.requestAnimationFrame = previousRequestAnimationFrame;
+    globalThis.cancelAnimationFrame = previousCancelAnimationFrame;
+  });
   let onSpeedInput = null;
   const speedInput = makeElement('5');
   speedInput.addEventListener = (event, handler) => {
@@ -218,6 +234,9 @@ test('minimum flow speed is displayed and published without rounding away its va
   dom.velocityEnabledCheckbox.checked = true;
   assert.equal(typeof onSpeedInput, 'function');
   onSpeedInput();
+  onSpeedInput();
+  assert.equal(frames.length, 1, 'two input events in one frame schedule one frame');
+  frames.shift()();
   assert.equal(dom.velocitySpeedDisplay.textContent, '0.05×');
   assert.deepEqual(updates, [['speedMultiplier', 0.05]]);
   controls.destroy();
@@ -282,14 +301,12 @@ test('multiple vector fields require an explicit sidebar selection', () => {
           {
             id: 'drift_umap',
             label: 'Drift (UMAP)',
-            availableDimensions: [2],
-            defaultDimension: 2,
+            layoutKeys: ['X_umap'],
           },
           {
             id: 'velocity_umap',
             label: 'Velocity (UMAP)',
-            availableDimensions: [2],
-            defaultDimension: 2,
+            layoutKeys: ['X_umap'],
           },
         ],
       }),
@@ -298,14 +315,44 @@ test('multiple vector fields require an explicit sidebar selection', () => {
 
     assert.equal(dom.velocityFieldSelect.value, '');
     assert.equal(dom.velocityEnabledCheckbox.disabled, true);
-    assert.equal(dom.velocitySettings.style.display, 'block');
+    assert.equal(dom.velocitySettings.hidden, false);
     assert.match(dom.velocityInfo.textContent, /select a vector field/i);
 
     dom.velocityFieldSelect.value = 'velocity_umap';
     controls.syncAvailability();
     assert.equal(dom.velocityEnabledCheckbox.disabled, false);
-    assert.equal(dom.velocitySettings.style.display, 'none');
+    assert.equal(dom.velocitySettings.hidden, true);
     controls.destroy();
+  } finally {
+    if (previousDocument === undefined) {
+      delete globalThis.document;
+    } else {
+      globalThis.document = previousDocument;
+    }
+  }
+});
+
+test('a vector-field descriptor must name the distinct embeddings it is bound to', () => {
+  const previousDocument = globalThis.document;
+  globalThis.document = {
+    createElement() {
+      return makeElement();
+    },
+  };
+  try {
+    for (const layoutKeys of [undefined, [], ['X_umap', 'X_umap'], ['']]) {
+      const field = { id: 'velocity', label: 'velocity' };
+      if (layoutKeys !== undefined) field.layoutKeys = layoutKeys;
+      assert.throws(
+        () => initVelocityOverlayControls({
+          dom: makeDom(),
+          state: makeState({ getAvailableVectorFields: () => [field] }),
+          viewer: makeViewer(),
+        }),
+        /complete current descriptor|distinct embedding ids/,
+        `layoutKeys ${JSON.stringify(layoutKeys)} is refused`
+      );
+    }
   } finally {
     if (previousDocument === undefined) {
       delete globalThis.document;
@@ -327,8 +374,7 @@ test('dataset replacement clears the prior vector-field select inventory', () =>
     let fields = [{
       id: 'velocity_umap',
       label: 'Velocity (UMAP)',
-      availableDimensions: [2],
-      defaultDimension: 2,
+      layoutKeys: ['X_umap'],
     }];
     const fieldSelect = makeSelectElement(['velocity_umap']);
     fieldSelect.value = 'velocity_umap';
@@ -410,8 +456,7 @@ test('velocity enable failure settles visibly without an unhandled event rejecti
       getAvailableVectorFields: () => [{
         id: 'velocity_umap',
         label: 'Velocity (UMAP)',
-        availableDimensions: [2],
-        defaultDimension: 2,
+        layoutKeys: ['X_umap'],
       }],
       getDefaultVectorFieldId: () => 'velocity_umap',
     }),
@@ -424,7 +469,7 @@ test('velocity enable failure settles visibly without an unhandled event rejecti
   await assert.doesNotReject(onEnabledChange());
 
   assert.equal(enabledCheckbox.checked, false);
-  assert.equal(dom.velocitySettings.style.display, 'none');
+  assert.equal(dom.velocitySettings.hidden, true);
   assert.equal(dom.velocityInfo.textContent, 'Failed to load vector field.');
   assert.deepEqual(notificationEvents, [[
     initializationFailure.message,
@@ -467,8 +512,7 @@ test('velocity control destruction fences an in-flight field load before viewer 
       getAvailableVectorFields: () => [{
         id: 'velocity_umap',
         label: 'Velocity (UMAP)',
-        availableDimensions: [2],
-        defaultDimension: 2,
+        layoutKeys: ['X_umap'],
       }],
       getDefaultVectorFieldId: () => 'velocity_umap',
     }),
@@ -531,8 +575,7 @@ test('dataset replacement releases an invalidated in-flight velocity enable owne
   let fields = [{
     id: 'velocity_umap',
     label: 'Velocity (UMAP)',
-    availableDimensions: [2],
-    defaultDimension: 2,
+    layoutKeys: ['X_umap'],
   }];
   let finishFieldLoad;
   const fieldLoad = new Promise(resolve => {
@@ -616,7 +659,7 @@ test('runtime velocity failure settlement remains coherent when cleanup retry fa
   });
 
   dom.velocityEnabledCheckbox.checked = true;
-  dom.velocitySettings.style.display = 'block';
+  dom.velocitySettings.hidden = false;
   failCleanup = true;
   const renderFailure = new AggregateError(
     [new Error('draw failed'), new Error('initial cleanup failed')],
@@ -630,7 +673,7 @@ test('runtime velocity failure settlement remains coherent when cleanup retry fa
 
   assert.equal(cleanupCalls, 1);
   assert.equal(dom.velocityEnabledCheckbox.checked, false);
-  assert.equal(dom.velocitySettings.style.display, 'none');
+  assert.equal(dom.velocitySettings.hidden, true);
   assert.equal(dom.velocityInfo.textContent, 'Velocity rendering unavailable.');
   assert.deepEqual(notificationEvents, [[
     'Velocity rendering stopped: Velocity rendering failed and shutdown was incomplete.',
@@ -662,4 +705,77 @@ test('velocity controls expose no clamp, coercion, or first-field substitution p
   assert.doesNotMatch(source, /Boolean\(syncLodCheckbox\.checked\)/);
   assert.doesNotMatch(source, /\?\./);
   assert.doesNotMatch(source, /console\.warn|err\?\.message/);
+});
+
+test('the overlay loads a field once for every representation an open view shows that the field is bound to', async t => {
+  const previousDocument = globalThis.document;
+  globalThis.document = {
+    createElement() {
+      return makeElement();
+    },
+  };
+  t.after(() => {
+    if (previousDocument === undefined) {
+      delete globalThis.document;
+    } else {
+      globalThis.document = previousDocument;
+    }
+  });
+  let onEnabledChange = null;
+  const enabledCheckbox = makeElement();
+  enabledCheckbox.addEventListener = (event, handler) => {
+    if (event === 'change') onEnabledChange = handler;
+  };
+  // Four open views: two show UMAP, one t-SNE (both bound), one PCA (not
+  // bound). The selected view shows UMAP.
+  const shown = new Map([
+    ['live', 'X_umap'],
+    ['snap_1', 'X_tsne'],
+    ['snap_2', 'X_pca'],
+    ['snap_3', 'X_umap'],
+  ]);
+  const loads = [];
+  const viewerCalls = [];
+  const controls = initVelocityOverlayControls({
+    dom: makeDom({
+      velocityEnabledCheckbox: enabledCheckbox,
+      velocityFieldSelect: makeSelectElement(),
+    }),
+    state: makeState({
+      viewContexts: new Map([...shown.keys()].map(id => [id, { id }])),
+      getViewLayoutKey: viewId => shown.get(viewId),
+      async ensureVectorField(fieldId, layoutKey, options) {
+        loads.push([fieldId, layoutKey, options]);
+        return true;
+      },
+      getAvailableVectorFields: () => [{
+        id: 'velocity',
+        label: 'Velocity',
+        layoutKeys: ['X_tsne', 'X_umap'],
+      }],
+      getDefaultVectorFieldId: () => 'velocity',
+    }),
+    viewer: makeViewer({
+      setActiveVectorField(fieldId) {
+        viewerCalls.push(['field', fieldId]);
+      },
+      setVectorFieldOverlayEnabled(enabled) {
+        viewerCalls.push(['enabled', enabled]);
+      },
+    }),
+  });
+  t.after(() => controls.destroy());
+
+  enabledCheckbox.checked = true;
+  await onEnabledChange();
+
+  assert.deepEqual(
+    loads.sort((left, right) => left[1].localeCompare(right[1])),
+    [
+      ['velocity', 'X_tsne', { silent: false }],
+      ['velocity', 'X_umap', { silent: false }],
+    ],
+    'each bound representation is loaded once; the unbound PCA view loads nothing'
+  );
+  assert.deepEqual(viewerCalls, [['field', 'velocity'], ['enabled', true]]);
 });

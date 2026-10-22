@@ -5,94 +5,54 @@
  * Point rendering is handled by the high-performance renderer.
  */
 
+import { FOG_GLSL } from './fog-shaders.js';
+
 // ============================================================================
 // GPU-INSTANCED EDGE SHADER
 // ============================================================================
-// Optimized for rendering millions of edges with:
-// - Edge data stored in texture (no per-edge vertex buffer)
-// - Position lookup from texture
-// - Visibility filtering in shader (no CPU filtering)
-// - Instanced rendering (6 vertices shared across all edges)
+// One 4-vertex triangle strip per shown edge. A pane's shown edges are
+// gathered on the CPU into one instance record each (both endpoints'
+// positions and the edge's relative strength, rendering/connectivity-edge-layer.js),
+// so the vertex shader fetches nothing: no texture reads, no index
+// arithmetic, and no per-instance visibility test (hidden edges are never in
+// the records). Fog is evaluated per vertex with the shared model
+// (fog-shaders.js): it depends only on distance, which a line's two
+// endpoints bound, and it thins the line toward what is behind it rather than
+// tinting it.
 
 export const LINE_INSTANCED_VS_SOURCE = `#version 300 es
 precision highp float;
-precision highp int;
-precision highp usampler2D;
 
-// Shared quad geometry (6 vertices for 2 triangles)
+// Shared quad geometry (4 vertices of one triangle strip)
 // x: -1 = source endpoint, +1 = destination endpoint
 // y: -1 = left side of line, +1 = right side of line
-in vec2 a_quadPos;
-
-// Edge data texture (RG32UI: source index, dest index)
-uniform highp usampler2D u_edgeTexture;
-// Relative edge strength (R32F), deterministically derived from canonical
-// Float64 weights by dividing every weight by the graph maximum.
-uniform highp sampler2D u_edgeWeightTexture;
-uniform ivec2 u_edgeTexDims;
-
-// Position texture (RGB32F: x, y, z)
-uniform highp sampler2D u_positionTexture;
-uniform ivec2 u_posTexDims;
-
-// Binary R8 visibility texture (normalized 0.0 = hidden, 1.0 = visible)
-uniform highp sampler2D u_visibilityTexture;
+// Location 0 explicitly: a draw whose attribute 0 is not an enabled array
+// makes Firefox on desktop OpenGL emulate one per vertex, at real cost.
+layout(location = 0) in vec2 a_quadPos;
+// Per instance: the endpoints (missing axes are 0) and the relative edge
+// strength, derived from canonical Float64 weights by dividing every weight
+// by the graph maximum.
+layout(location = 1) in vec3 a_source;
+layout(location = 2) in vec3 a_destination;
+layout(location = 3) in float a_strength;
 
 // Transform uniforms
 uniform mat4 u_mvpMatrix;
-uniform mat4 u_viewMatrix;
-uniform mat4 u_modelMatrix;
+uniform mat4 u_modelViewMatrix;
 uniform vec2 u_viewportSize;
 uniform float u_lineWidth;
 
-// LOD control - limit number of edges rendered
-uniform int u_maxEdges;
-
-out float v_viewDistance;
-flat out float v_edgeStrength;
-
-// Convert linear index to 2D texture coordinate
-ivec2 idxToCoord(int idx, ivec2 dims) {
-  return ivec2(idx % dims.x, idx / dims.x);
-}
+// Line opacity, thinned by the shared fog model at each endpoint.
+uniform float u_lineAlpha;
+${FOG_GLSL}
+// The final opacity, linear along the line.
+out float v_alpha;
 
 void main() {
-  int edgeIdx = gl_InstanceID;
-  v_edgeStrength = 0.0;
-
-  // LOD: skip edges beyond limit (degenerate triangle)
-  if (edgeIdx >= u_maxEdges) {
-    gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
-    return;
-  }
-
-  // Fetch edge (source, destination cell indices)
-  ivec2 edgeCoord = idxToCoord(edgeIdx, u_edgeTexDims);
-  uvec4 edgeData = texelFetch(u_edgeTexture, edgeCoord, 0);
-  int srcIdx = int(edgeData.r);
-  int dstIdx = int(edgeData.g);
-  v_edgeStrength = texelFetch(u_edgeWeightTexture, edgeCoord, 0).r;
-
-  // Fetch visibility for both endpoints
-  ivec2 srcCoord = idxToCoord(srcIdx, u_posTexDims);
-  ivec2 dstCoord = idxToCoord(dstIdx, u_posTexDims);
-  float srcVis = texelFetch(u_visibilityTexture, srcCoord, 0).r;
-  float dstVis = texelFetch(u_visibilityTexture, dstCoord, 0).r;
-
-  // Skip if either endpoint is hidden (degenerate triangle)
-  if (srcVis < 0.5 || dstVis < 0.5) {
-    gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
-    return;
-  }
-
-  // Fetch positions
-  vec3 srcPos = texelFetch(u_positionTexture, srcCoord, 0).rgb;
-  vec3 dstPos = texelFetch(u_positionTexture, dstCoord, 0).rgb;
-
   // Determine which endpoint this vertex belongs to
   // a_quadPos.x: -1 = source, +1 = destination
-  vec3 myPos = a_quadPos.x < 0.0 ? srcPos : dstPos;
-  vec3 otherPos = a_quadPos.x < 0.0 ? dstPos : srcPos;
+  vec3 myPos = a_quadPos.x < 0.0 ? a_source : a_destination;
+  vec3 otherPos = a_quadPos.x < 0.0 ? a_destination : a_source;
 
   // Project both endpoints to clip space
   vec4 clipMy = u_mvpMatrix * vec4(myPos, 1.0);
@@ -119,39 +79,24 @@ void main() {
   gl_Position = clipMy;
   gl_Position.xy += offsetNdc * clipMy.w;
 
-  // Compute view distance for fog
-  vec4 eyePos = u_viewMatrix * u_modelMatrix * vec4(myPos, 1.0);
-  v_viewDistance = length(eyePos.xyz);
+  // Fog from this endpoint's distance to the eye
+  vec4 eyePos = u_modelViewMatrix * vec4(myPos, 1.0);
+  v_alpha = u_lineAlpha * a_strength * fogOpacity(fogTransmittance(length(eyePos.xyz)));
 }
 `;
 
 // Fragment shader for instanced edges
 export const LINE_INSTANCED_FS_SOURCE = `#version 300 es
-precision highp float;
+precision mediump float;
 
-in float v_viewDistance;
-flat in float v_edgeStrength;
+in float v_alpha;
 
 uniform vec3 u_lineColor;
-uniform float u_lineAlpha;
-uniform float u_fogDensity;
-uniform float u_fogNearMean;
-uniform float u_fogFarMean;
-uniform vec3 u_fogColor;
 
 out vec4 fragColor;
 
 void main() {
-  // Apply fog for depth perception
-  float fogSpan = max(u_fogFarMean - u_fogNearMean, 0.0001);
-  float normalizedDistance = max(v_viewDistance - u_fogNearMean, 0.0) / fogSpan;
-  float extinction = u_fogDensity * u_fogDensity * 0.6;
-  float transmittance = exp(-extinction * normalizedDistance);
-
-  vec3 finalColor = mix(u_fogColor, u_lineColor, transmittance);
-  float alpha = u_lineAlpha * v_edgeStrength * (0.2 + 0.8 * transmittance);
-
-  fragColor = vec4(finalColor, alpha);
+  fragColor = vec4(u_lineColor, v_alpha);
 }
 `;
 
@@ -159,24 +104,19 @@ void main() {
 export const GRID_VS_SOURCE = `#version 300 es
 precision highp float;
 
-in vec3 a_position;
+layout(location = 0) in vec3 a_position;
 
 uniform mat4 u_mvpMatrix;
-uniform mat4 u_viewMatrix;
 uniform mat4 u_modelMatrix;
 uniform float u_gridSize;
 
 out vec3 v_worldPos;
 out vec3 v_localPos;
-out float v_viewDistance;
 
 void main() {
   vec4 worldPos = u_modelMatrix * vec4(a_position, 1.0);
   v_worldPos = worldPos.xyz;
   v_localPos = a_position / u_gridSize; // Normalized -1 to 1
-
-  vec4 eyePos = u_viewMatrix * worldPos;
-  v_viewDistance = length(eyePos.xyz);
 
   gl_Position = u_mvpMatrix * vec4(a_position, 1.0);
 }
@@ -187,7 +127,6 @@ precision highp float;
 
 in vec3 v_worldPos;
 in vec3 v_localPos;
-in float v_viewDistance;
 
 uniform vec3 u_gridColor;
 uniform vec3 u_bgColor;
@@ -196,9 +135,6 @@ uniform float u_gridLineWidth;
 uniform float u_gridOpacity;
 uniform float u_planeAlpha;      // Per-plane visibility (smooth fade)
 uniform int u_planeType;         // 0=XY, 1=XZ, 2=YZ
-uniform float u_fogDensity;
-uniform float u_fogNearMean;
-uniform float u_fogFarMean;
 uniform vec3 u_axisXColor;       // Axis colors for scientific look
 uniform vec3 u_axisYColor;
 uniform vec3 u_axisZColor;

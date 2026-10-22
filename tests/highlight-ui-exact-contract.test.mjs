@@ -26,6 +26,7 @@ import {
 import {
   createSessionRestoreTransaction
 } from '../assets/js/app/session/session-context.js';
+import { createSelectModeDom } from './helpers/select-mode-dom.mjs';
 
 const HIGHLIGHT_MODULE_ROOT = new URL(
   '../assets/js/app/ui/modules/highlight/',
@@ -111,11 +112,38 @@ function createEventElement() {
     children: [],
     dataset: {},
     style: {},
+    attributes: {},
+    parentElement: null,
+    className: '',
+    setAttribute(name, value) {
+      this.attributes[name] = String(value);
+    },
     addEventListener(name, listener) {
       listeners.set(name, listener);
     },
     appendChild(child) {
+      child.parentElement = this;
       this.children.push(child);
+      return child;
+    },
+    replaceChildren(...children) {
+      this.children = [];
+      for (const child of children) this.appendChild(child);
+    },
+    contains(node) {
+      for (let current = node; current; current = current.parentElement) {
+        if (current === this) return true;
+      }
+      return false;
+    },
+    closest(selector) {
+      const className = selector.slice(1);
+      for (let current = this; current; current = current.parentElement) {
+        if (String(current.className).split(/\s+/).includes(className)) {
+          return current;
+        }
+      }
+      return null;
     },
     dispatch(name, event = {}) {
       return listeners.get(name)(event);
@@ -144,7 +172,8 @@ function createModeViewer() {
     restoreUnifiedState() {},
     setKnnEnabled() {},
     setLassoEnabled() {},
-    setProximityEnabled() {}
+    setProximityEnabled() {},
+    setSelectMode() {}
   };
 }
 
@@ -165,7 +194,7 @@ function createCategoryHighlightState() {
     pointCount: 5,
     obsData: { fields: [field] },
     varData: { fields: [] },
-    categoryTransparency: Float32Array.from([1, 1, 1, 1, 1]),
+    categoryTransparency: Uint8Array.from([1, 1, 1, 1, 1]),
     highlightPages: [page],
     activePageId: page.id,
     _highlightIdCounter: 0,
@@ -321,9 +350,9 @@ test('category highlights preserve primitive identity through save, restore, and
     const { renderHighlightSummary } = initHighlightSummaryUI({
       state: restoredState,
       dom: {
-        countEl,
+        countEls: [countEl],
         groupsEl,
-        clearAllBtn: clearButton
+        clearButtons: [clearButton]
       }
     });
     renderHighlightSummary();
@@ -474,20 +503,17 @@ test('selection-tool destruction retires subscriptions and fences retained callb
     getActiveViewId() {
       return 'live';
     },
-    getCategoryForCell() {
-      return 0;
-    },
     getCellIndicesForCategory() {
       return [];
     },
     getCellIndicesForRange() {
       return [];
     },
+    getFieldForView() {
+      return null;
+    },
     getHighlightedGroups() {
       return [];
-    },
-    getValueForCell() {
-      return Number.NaN;
     },
     on(eventName, listener) {
       stateListeners.set(eventName, listener);
@@ -540,6 +566,10 @@ test('selection-tool destruction retires subscriptions and fences retained callb
       viewerCallbacks.set('lod', listener);
       return () => unsubscribeCalls.push('lod');
     },
+    onPresentedLayoutChange(listener) {
+      viewerCallbacks.set('presentedLayout', listener);
+      return () => unsubscribeCalls.push('presentedLayout');
+    },
     restoreKnnState() {},
     restoreLassoState() {},
     restoreProximityState() {},
@@ -571,6 +601,7 @@ test('selection-tool destruction retires subscriptions and fences retained callb
     setProximityCallback(listener) {
       viewerCallbacks.set('proximity', listener);
     },
+    setSelectMode() {},
     setProximityEnabled() {
       mutations.push('proximityMode');
     },
@@ -603,6 +634,7 @@ test('selection-tool destruction retires subscriptions and fences retained callb
       viewer,
       jupyterSource: null,
       dom: {
+        ...createSelectModeDom(),
         modeButtons: buttons,
         modeDescription: {
           innerHTML: '',
@@ -627,13 +659,20 @@ test('selection-tool destruction retires subscriptions and fences retained callb
 
     assert.deepEqual(
       unsubscribeCalls.sort(),
-      ['highlight:changed', 'lod', 'page:changed', 'visibility:changed']
+      [
+        'highlight:changed',
+        'lod',
+        'page:changed',
+        'presentedLayout',
+        'visibility:changed'
+      ]
     );
     assert.equal(buttons[1].listeners('click').length, 0);
 
     stateListeners.get('highlight:changed')();
     stateListeners.get('page:changed')();
     retained.get('lod')({ malformed: true });
+    retained.get('presentedLayout')({ panes: [{ viewId: 'live' }] });
     retained.get('annotationStep')({ malformed: true });
     retained.get('continuousPreview')({ malformed: true });
     retained.get('lasso')({ malformed: true });
@@ -666,9 +705,8 @@ test('active-view switches invalidate visible-highlight counts for the new trans
     activeDimensionLevel: 2,
     activeViewId: 'live',
     colorsArray: new Uint8Array(pointCount * 4),
-    categoryTransparency: Float32Array.from([1, 1, 1, 1]),
-    cellVisibilityMask: Float32Array.from([1, 1, 1, 1]),
-    outlierQuantilesArray: Float32Array.from([-1, -1, -1, -1]),
+    categoryTransparency: Uint8Array.from([1, 1, 1, 1]),
+    cellVisibilityMask: Uint8Array.from([1, 1, 1, 1]),
     centroidPositions: new Float32Array(),
     centroidColors: new Uint8Array(),
     centroidOutliers: new Float32Array(),
@@ -718,16 +756,16 @@ test('active-view switches invalidate visible-highlight counts for the new trans
   const liveContext = state._buildContextFromCurrent('live', {
     cloneArrays: true
   });
-  state.categoryTransparency = Float32Array.from([0, 0, 1, 1]);
-  state.cellVisibilityMask = Float32Array.from([0, 0, 1, 1]);
+  state.categoryTransparency = Uint8Array.from([0, 0, 1, 1]);
+  state.cellVisibilityMask = Uint8Array.from([0, 0, 1, 1]);
   state.filteredCount = { shown: 2, total: pointCount };
   const snapshotContext = state._buildContextFromCurrent('snapshot_1', {
     cloneArrays: true
   });
-  state.categoryTransparency = Float32Array.from(
+  state.categoryTransparency = Uint8Array.from(
     liveContext.categoryTransparency
   );
-  state.cellVisibilityMask = Float32Array.from(liveContext.cellVisibilityMask);
+  state.cellVisibilityMask = Uint8Array.from(liveContext.cellVisibilityMask);
   state.filteredCount = { ...liveContext.filteredCount };
   state.viewContexts.set('live', liveContext);
   state.viewContexts.set('snapshot_1', snapshotContext);
@@ -860,22 +898,23 @@ test('highlight summary rejects state-operation no-ops instead of accepting them
     const { renderHighlightSummary } = initHighlightSummaryUI({
       state,
       dom: {
-        countEl,
+        countEls: [countEl],
         groupsEl,
-        clearAllBtn: clearButton
+        clearButtons: [clearButton]
       }
     });
     renderHighlightSummary();
     const renderedGroup = groupsEl.children[0];
     const checkbox = renderedGroup.children[0];
     checkbox.checked = false;
+    // The list delegates both row interactions.
     assert.throws(
-      () => checkbox.dispatch('change'),
+      () => groupsEl.dispatch('change', { target: checkbox }),
       /toggle.*rejected/i
     );
     const removeButton = renderedGroup.children[2];
     assert.throws(
-      () => removeButton.dispatch('click', { stopPropagation() {} }),
+      () => groupsEl.dispatch('click', { target: removeButton, stopPropagation() {} }),
       /removal.*rejected/i
     );
   });
@@ -922,9 +961,9 @@ test('highlight summary rejects alternate group schemas before mutating the DOM'
     const { renderHighlightSummary } = initHighlightSummaryUI({
       state,
       dom: {
-        countEl,
+        countEls: [countEl],
         groupsEl,
-        clearAllBtn: clearButton
+        clearButtons: [clearButton]
       }
     });
     assert.throws(
@@ -970,6 +1009,7 @@ test('selection-tool composition preflights every viewer capability before regis
         viewer,
         jupyterSource: null,
         dom: {
+          ...createSelectModeDom(),
           modeButtons: buttons,
           modeDescription: {
             parentElement: { appendChild() {} }
@@ -1004,6 +1044,7 @@ test('highlight mode rejects an unknown mode before mutating selection state', (
       state: { pointCount: 0 },
       viewer: createModeViewer(),
       dom: {
+        ...createSelectModeDom(),
         modeButtons: buttons,
         modeDescription: description
       },
@@ -1044,6 +1085,7 @@ test('highlight mode requires exactly one explicitly pressed current-mode button
         state: { pointCount: 0 },
         viewer: createModeViewer(),
         dom: {
+          ...createSelectModeDom(),
           modeButtons: buttons,
           modeDescription: description
         },
@@ -1263,19 +1305,13 @@ test('annotation undo republishes the exact candidate state to the unified rende
   };
   const state = {
     pointCount: 4,
-    activeFieldIndex: 0,
-    activeFieldSource: 'obs',
-    activeVarFieldIndex: -1,
     addHighlightDirect() {},
     clearPreviewHighlight() {},
     getActiveField() {
       return field;
     },
-    getCategoryForCell(cellIndex) {
-      return field.codes[cellIndex];
-    },
-    getCellIndicesForCategory(_fieldIndex, categoryIndex) {
-      return field.codes.reduce((indices, code, cellIndex) => {
+    getCellIndicesForCategory(lookupField, categoryIndex) {
+      return lookupField.codes.reduce((indices, code, cellIndex) => {
         if (code === categoryIndex) indices.push(cellIndex);
         return indices;
       }, []);
@@ -1283,8 +1319,8 @@ test('annotation undo republishes the exact candidate state to the unified rende
     getCellIndicesForRange() {
       return [];
     },
-    getValueForCell() {
-      return Number.NaN;
+    getFieldForView() {
+      return field;
     },
     on() {
       return () => {};
@@ -1297,6 +1333,9 @@ test('annotation undo republishes the exact candidate state to the unified rende
     confirmAnnotationSelection() {},
     getViewTransparency() {
       return Float32Array.from([1, 1, 1, 1]);
+    },
+    onPresentedLayoutChange() {
+      return () => {};
     },
     restoreUnifiedState(candidates, step) {
       restoreCalls.push({ candidates: [...candidates], step });
@@ -1359,16 +1398,7 @@ test('continuous preview rejects missing published statistics before querying ce
   initContinuousSelectionPreview({
     state: {
       pointCount: 4,
-      activeFieldIndex: 0,
-      activeFieldSource: 'obs',
-      activeVarFieldIndex: null,
       clearPreviewHighlight() {},
-      getActiveField() {
-        return { kind: 'continuous' };
-      },
-      getCategoryForCell() {
-        return 0;
-      },
       getCellIndicesForCategory() {
         return [];
       },
@@ -1376,8 +1406,11 @@ test('continuous preview rejects missing published statistics before querying ce
         rangeCalls += 1;
         return [];
       },
-      getValueForCell() {
-        return 2;
+      getFieldForView() {
+        return {
+          kind: 'continuous',
+          values: Float32Array.from([2, 2, 2, 2])
+        };
       },
       setPreviewHighlightFromIndices() {}
     },
@@ -1420,20 +1453,14 @@ test('continuous preview preflights the exact shared selection state before call
       state: {
         pointCount: 0,
         clearPreviewHighlight() {},
-        getActiveField() {
-          return null;
-        },
-        getCategoryForCell() {
-          return 0;
-        },
         getCellIndicesForCategory() {
           return [];
         },
         getCellIndicesForRange() {
           return [];
         },
-        getValueForCell() {
-          return Number.NaN;
+        getFieldForView() {
+          return null;
         },
         setPreviewHighlightFromIndices() {}
       },

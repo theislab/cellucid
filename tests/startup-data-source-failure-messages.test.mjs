@@ -64,7 +64,7 @@ const LOADER_FAILURES = Object.freeze({
   ),
   offlinePayload: new TypeError('Failed to fetch'),
   corruptPayload: new Error(
-    'Payload https://catalog.cellucid.test/exports/a/points_2d.bin.gz: '
+    'Payload https://catalog.cellucid.test/exports/a/embeddings/0_2d.bin.gz: '
     + 'invalid gzip header'
   )
 });

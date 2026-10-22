@@ -31,7 +31,14 @@ import {
   readAutoPullPreferences,
   writeAutoPullPreferences,
 } from './auto-pull-storage.js';
-import { el } from './dom.js';
+import {
+  createStatusIcon,
+  createStatusRow,
+  el,
+  setStatusTone,
+} from './dom.js';
+import { createIconButton } from '../../components/controls.js';
+import { formatCount, formatCountOf } from '../../components/display-format.js';
 import { removeOwningCommunityModal } from './modal-shell.js';
 import {
   assertExactAnnotationUserKey,
@@ -49,6 +56,44 @@ import {
 } from './browser-integration.js';
 
 const GITHUB_REPOSITORY_DISCOVERY_MAX_ITEMS = 10_000;
+const SYNC_SKIPPED_MESSAGE =
+  'Another GitHub sync is still running. Wait for it to finish, then try again.';
+
+/**
+ * Status text for one Pull or Publish outcome returned by the controls.
+ *
+ * Only a `done` outcome produces the success text; a transaction that never
+ * ran (`skipped`) or ended without completing says so explicitly.
+ *
+ * @param {{status: string, error?: string}} outcome
+ * @param {string} doneText
+ * @returns {string}
+ */
+export function describeSyncOutcome(outcome, doneText) {
+  if (typeof doneText !== 'string' || !doneText) {
+    throw new TypeError('Sync outcome success text must be a non-empty string');
+  }
+  if (outcome === null || typeof outcome !== 'object') {
+    throw new TypeError('GitHub sync must return an explicit outcome');
+  }
+  switch (outcome.status) {
+    case 'done':
+      return doneText;
+    case 'skipped':
+      return SYNC_SKIPPED_MESSAGE;
+    case 'cancelled':
+      return 'Cancelled.';
+    case 'failed':
+      if (typeof outcome.error !== 'string' || !outcome.error) {
+        throw new TypeError('A failed GitHub sync outcome must carry its error message');
+      }
+      return `⚠ ${outcome.error}`;
+    default:
+      throw new TypeError(
+        `Unknown GitHub sync outcome status: ${String(outcome.status)}`
+      );
+  }
+}
 const GITHUB_REPOSITORY_PAGE_SIZE = 100;
 
 /**
@@ -59,7 +104,8 @@ const GITHUB_REPOSITORY_PAGE_SIZE = 100;
  */
 const REQUIRED_CONTROLLER_MEMBERS = Object.freeze([
   'isSyncBusy',
-  'getSyncError',
+  'subscribeSyncBusy',
+  'resolveConnectionTrigger',
   'getLastRepoInfo',
   'setLastRepoInfo',
   'getLastAutoPullPreferenceError',
@@ -134,14 +180,11 @@ export function createGitHubConnectionFlow(controller) {
   }
 
   async function openGitHubConnectionFlow({
-    mode = 'repo',
-    focus = 'overview',
     reason = null,
     datasetId = null,
     cacheUser = null,
     login = null,
     currentRepo = null,
-    defaultPullNow = true
   } = {}) {
     const appInstallUrl = 'https://github.com/apps/cellucid-community-annotations/installations/new';
     const settingsUrl = 'https://github.com/settings/installations';
@@ -157,8 +200,15 @@ export function createGitHubConnectionFlow(controller) {
         resolve(value);
       };
 
+      // Replaced once the dialog is up; a close during construction leaves
+      // nothing to settle here (the missing overlay below settles it).
+      let settleClosed = () => {};
       const modalRef = showOwnedCommunityModal({
         title: 'GitHub sync',
+        onClosed: () => settleClosed(),
+        // The panel re-renders while the wizard is open, so the opening
+        // button is usually detached by the time the wizard closes.
+        returnFocusResolver: () => controller.resolveConnectionTrigger(),
         buildContent: (content) => {
           const modalAbort = new AbortController();
           // Allow outer scope to stop listeners when modal closes.
@@ -198,90 +248,53 @@ export function createGitHubConnectionFlow(controller) {
           let repoFocusRequestFullName = null;
           let repoRenderSnapshot = null;
 
-          const svgEl = (tag) => document.createElementNS('http://www.w3.org/2000/svg', tag);
-          const icon = (d, { viewBox = '0 0 24 24' } = {}) => {
-            const svg = svgEl('svg');
-            svg.setAttribute('viewBox', viewBox);
-            svg.setAttribute('aria-hidden', 'true');
-            svg.classList.add('community-annotation-status-icon');
-            const path = svgEl('path');
-            path.setAttribute('d', d);
-            path.setAttribute('fill', 'none');
-            path.setAttribute('stroke', 'currentColor');
-            path.setAttribute('stroke-width', '1.8');
-            path.setAttribute('stroke-linecap', 'round');
-            path.setAttribute('stroke-linejoin', 'round');
-            svg.appendChild(path);
-            return svg;
-          };
-
           const statusList = el('div', { className: 'community-annotation-status-list' });
-          const makeStatusRow = ({ iconEl, tone = 'warn', key = '', value = '', actions = [] } = {}) => {
-            const keyEl = el('span', { className: 'community-annotation-status-key', text: key || '' });
-            const valueEl = el('span', { className: 'community-annotation-status-val', text: value || '' });
-            const textEl = el('div', { className: 'community-annotation-status-text' }, [keyEl, valueEl]);
-            const chip = el('div', { className: `community-annotation-status-chip community-annotation-status-chip--${tone}` }, [
-              iconEl || null,
-              textEl
-            ]);
-            const actionsWrap = el('div', { className: 'community-annotation-status-actions' }, actions);
-            const row = el('div', { className: 'community-annotation-status-row' }, [chip, actionsWrap]);
-            return { row, chip, actionsWrap, keyEl, valueEl };
-          };
+          const statusAction = (label, icon) => createIconButton({
+            label,
+            icon: createStatusIcon(icon).outerHTML,
+          });
+          const githubSettingsBtn = statusAction('GitHub settings', 'gear');
+          const disconnectGitHubBtn = statusAction('Disconnect GitHub', 'disconnect');
+          const disconnectRepoBtn = statusAction('Disconnect repository', 'disconnect');
 
-          const datasetIcon = icon('M4 6c0-1.7 3.6-3 8-3s8 1.3 8 3-3.6 3-8 3-8-1.3-8-3zm0 6c0 1.7 3.6 3 8 3s8-1.3 8-3m-16 6c0 1.7 3.6 3 8 3s8-1.3 8-3');
-          const githubIcon = icon('M12 12a4 4 0 1 0-4-4 4 4 0 0 0 4 4zm-8 9a8 8 0 0 1 16 0');
-          const repoIcon = icon('M4 7a3 3 0 0 1 3-3h10a3 3 0 0 1 3 3v10a3 3 0 0 1-3 3H7a3 3 0 0 1-3-3zM8 8h8M8 12h8M8 16h6');
-          const gearIcon = icon('M12 15.5a3.5 3.5 0 1 0-3.5-3.5 3.5 3.5 0 0 0 3.5 3.5zm7-3.5a7.8 7.8 0 0 0-.1-1l2-1.5-2-3.4-2.4 1a8.4 8.4 0 0 0-1.7-1l-.3-2.6H9.5L9.2 6.1a8.4 8.4 0 0 0-1.7 1l-2.4-1-2 3.4 2 1.5a7.8 7.8 0 0 0 0 2l-2 1.5 2 3.4 2.4-1a8.4 8.4 0 0 0 1.7 1l.3 2.6h5l.3-2.6a8.4 8.4 0 0 0 1.7-1l2.4 1 2-3.4-2-1.5a7.8 7.8 0 0 0 .1-1z');
-          const disconnectIcon = icon('M10 17l5-5-5-5M15 12H3M15 4h3a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-3');
-
-          const githubSettingsBtn = el('button', { type: 'button', className: 'community-annotation-status-action', title: 'GitHub settings', 'aria-label': 'GitHub settings' }, [gearIcon]);
-          const disconnectGitHubBtn = el('button', { type: 'button', className: 'community-annotation-status-action', title: 'Disconnect GitHub', 'aria-label': 'Disconnect GitHub' }, [disconnectIcon.cloneNode(true)]);
-          const disconnectRepoBtn = el('button', { type: 'button', className: 'community-annotation-status-action', title: 'Disconnect repository', 'aria-label': 'Disconnect repository' }, [disconnectIcon.cloneNode(true)]);
-
-          const datasetRow = makeStatusRow({ iconEl: datasetIcon, tone: 'warn', key: 'Dataset', value: '' });
-          const githubRow = makeStatusRow({ iconEl: githubIcon, tone: 'warn', key: 'GitHub', value: '', actions: [githubSettingsBtn, disconnectGitHubBtn] });
-          const repoRow = makeStatusRow({ iconEl: repoIcon, tone: 'warn', key: 'Repo', value: '', actions: [disconnectRepoBtn] });
+          const datasetRow = createStatusRow({ icon: 'dataset', key: 'Dataset' });
+          const githubRow = createStatusRow({ icon: 'github', key: 'GitHub', actions: [githubSettingsBtn, disconnectGitHubBtn] });
+          const repoRow = createStatusRow({ icon: 'repo', key: 'Repo', actions: [disconnectRepoBtn] });
 
           statusList.appendChild(datasetRow.row);
           statusList.appendChild(githubRow.row);
           statusList.appendChild(repoRow.row);
           content.appendChild(statusList);
 
-          const step1Desc = [
-            'This redirects you to GitHub to sign you in. ',
-            el('strong', { text: 'Cellucid does not get access to your repositories by default.' }),
-            ' You decide later whether to install the GitHub App and which repositories to enable.'
-          ];
-
+          // One short line per step; the panel's (i) tip ('community-sync')
+          // carries the detail. The access statement stays visible: it is
+          // what the user agrees to before leaving for GitHub.
           const stepDefs = [
             {
-              title: 'Sign in with GitHub',
-              descParts: step1Desc
-            },
-            {
-              title: 'Install the GitHub App',
+              title: 'Sign in',
               descParts: [
-                'Install the GitHub App on your account/org and select which repositories it can access. ',
-                'Use “Add repo” to open GitHub, then come back and click “Reload”.'
+                el('strong', { text: 'Cellucid gets no repository access' }),
+                ' until you install its GitHub App on repositories you choose.'
               ]
             },
             {
-              title: 'Select an annotation repository',
+              title: 'Install app',
               descParts: [
-                'Pick a repository where the app is installed. ',
-                'This connection is saved locally per dataset (',
+                'Add repo opens GitHub to choose repositories; then Reload.'
+              ]
+            },
+            {
+              title: 'Choose repository',
+              descParts: [
+                'Remembered for this dataset (',
                 el('code', { text: String(did || 'default') }),
-                ') and per GitHub account. ',
-                'Cellucid will validate the repo, connect it to this dataset, and pull the latest annotations.'
+                ') and account.'
               ]
             },
             {
-              title: 'Sync (pull / publish)',
+              title: 'Sync',
               descParts: [
-                'Use Pull to fetch updates from GitHub. ',
-                'Cellucid selects one publication route from the repository permissions before publishing: a direct write for writers, or a fork Pull Request for contributors. A failed route is reported and is never replaced by another route. ',
-                'Optional: enable Auto pull to periodically refresh from GitHub.'
+                'Pull fetches the latest votes; Publish writes them for everyone.'
               ]
             }
           ];
@@ -298,18 +311,17 @@ export function createGitHubConnectionFlow(controller) {
           const stepper = el('div', { className: 'community-annotation-stepper', role: 'list' }, stepEls);
           content.appendChild(stepper);
 
+          // The stepper above names the step; the intro says only what it does.
           const stepIntro = el('div', { className: 'community-annotation-step-intro' });
-          const stepIntroTitle = el('div', { className: 'community-annotation-step-intro-title', text: '' });
           const stepIntroDesc = el('div', { className: 'community-annotation-step-intro-desc' });
-          stepIntro.appendChild(stepIntroTitle);
           stepIntro.appendChild(stepIntroDesc);
           content.appendChild(stepIntro);
 
           const step1Panel = el('div', { className: 'community-annotation-step-panel' });
-          const step1Help = el('div', { className: 'legend-help', text: '' });
+          const step1Help = el('div', { className: 'status-line', text: '' });
           step1Panel.appendChild(step1Help);
           const step1Actions = el('div', { className: 'community-annotation-step1-actions' });
-          const step1SignInBtn = el('button', { type: 'button', className: 'btn-small', text: 'Continue with GitHub' });
+          const step1SignInBtn = el('button', { type: 'button', className: 'btn', text: 'Continue with GitHub' });
           step1Actions.appendChild(step1SignInBtn);
           step1Panel.appendChild(step1Actions);
           content.appendChild(step1Panel);
@@ -317,7 +329,7 @@ export function createGitHubConnectionFlow(controller) {
           const createRepoPager = (label) => {
             const previous = el('button', {
               type: 'button',
-              className: 'btn-small',
+              className: 'btn',
               text: 'Previous',
               'aria-label': `Previous ${label} page`,
             });
@@ -330,7 +342,7 @@ export function createGitHubConnectionFlow(controller) {
             });
             const next = el('button', {
               type: 'button',
-              className: 'btn-small',
+              className: 'btn',
               text: 'Next',
               'aria-label': `Next ${label} page`,
             });
@@ -345,11 +357,11 @@ export function createGitHubConnectionFlow(controller) {
 
           // Step 2: add/refresh repos (no selection).
           const step2Panel = el('div', { className: 'community-annotation-step-panel' });
-          const step2Help = el('div', { className: 'legend-help', text: '' });
+          const step2Help = el('div', { className: 'status-line', text: '' });
           step2Panel.appendChild(step2Help);
           const step2Actions = el('div', { className: 'community-annotation-suggestion-actions' });
-          const addRepoBtn = el('button', { type: 'button', className: 'btn-small', text: 'Add repo' });
-          const reloadReposBtn = el('button', { type: 'button', className: 'btn-small community-annotation-reload-btn', text: 'Reload' });
+          const addRepoBtn = el('button', { type: 'button', className: 'btn community-annotation-repo-action', text: 'Add repo' });
+          const reloadReposBtn = el('button', { type: 'button', className: 'btn community-annotation-repo-action', text: 'Reload' });
           step2Actions.appendChild(addRepoBtn);
           step2Actions.appendChild(reloadReposBtn);
           step2Panel.appendChild(step2Actions);
@@ -364,13 +376,13 @@ export function createGitHubConnectionFlow(controller) {
 
           // Step 3: pick repo (selection + connect).
           const step3Panel = el('div', { className: 'community-annotation-step-panel' });
-          const step3Help = el('div', { className: 'legend-help', text: 'Select an annotation repository to connect.' });
+          const step3Help = el('div', { className: 'status-line', text: '' });
           step3Panel.appendChild(step3Help);
 
-          const filterRow = el('div', { className: 'legend-help', text: '' });
+          const filterRow = el('div', { className: 'control-block', hidden: true });
           const filterInput = el('input', {
             type: 'text',
-            className: 'community-annotation-text-input',
+            className: 'obs-select',
             'aria-label': 'Filter repositories',
             autocomplete: 'off',
             maxlength: '256',
@@ -389,7 +401,7 @@ export function createGitHubConnectionFlow(controller) {
           step3Panel.appendChild(repoPagerStep3.root);
 
           const step3Selection = el('div', {
-            className: 'legend-help',
+            className: 'status-line',
             'aria-live': 'polite',
             'aria-atomic': 'true',
             text: '',
@@ -398,22 +410,21 @@ export function createGitHubConnectionFlow(controller) {
           content.appendChild(step3Panel);
 
           const syncBlock = el('div', { className: 'community-annotation-step-panel' });
-          syncBlock.appendChild(el('div', { className: 'legend-help', text: 'Sync' }));
           const syncTopRow = el('div', { className: 'community-annotation-sync-toprow' });
           const syncActions = el('div', { className: 'community-annotation-suggestion-actions' });
-          const pullBtn = el('button', { type: 'button', className: 'btn-small', text: 'Pull latest' });
-          const publishBtn = el('button', { type: 'button', className: 'btn-small', text: 'Publish' });
+          const pullBtn = el('button', { type: 'button', className: 'btn', text: 'Pull latest' });
+          const publishBtn = el('button', { type: 'button', className: 'btn', text: 'Publish' });
           syncActions.appendChild(pullBtn);
           syncActions.appendChild(publishBtn);
           syncTopRow.appendChild(syncActions);
 
           const autoPullRow = el('div', { className: 'community-annotation-auto-pull-row' });
-          const autoPullToggle = el('label', { className: 'community-annotation-auto-pull-toggle' });
+          const autoPullToggle = el('label', { className: 'checkbox-inline community-annotation-auto-pull-toggle' });
           const autoPullCheckbox = el('input', { type: 'checkbox' });
           autoPullToggle.appendChild(autoPullCheckbox);
-          autoPullToggle.appendChild(el('span', { text: 'Auto pull' }));
+          autoPullToggle.appendChild(document.createTextNode('Auto pull'));
             const autoPullSelect = el('select', {
-              className: 'community-annotation-auto-pull-select',
+              className: 'obs-select community-annotation-auto-pull-select',
               'aria-label': 'Auto pull interval'
             });
             const autoPullOptions = [
@@ -431,7 +442,7 @@ export function createGitHubConnectionFlow(controller) {
           content.appendChild(syncBlock);
 
           const status = el('div', {
-            className: 'community-annotation-wizard-status',
+            className: 'status-line community-annotation-wizard-status',
             role: 'status',
             'aria-live': 'polite',
             text: String(reason || '')
@@ -439,9 +450,9 @@ export function createGitHubConnectionFlow(controller) {
           content.appendChild(status);
 
           const wizardNav = el('div', { className: 'community-annotation-wizard-nav' });
-          const prevBtn = el('button', { type: 'button', className: 'btn-small community-annotation-wizard-prev', text: 'Back' });
+          const prevBtn = el('button', { type: 'button', className: 'btn community-annotation-wizard-prev', text: 'Back' });
           const stepCount = el('div', { className: 'community-annotation-wizard-stepcount', text: '' });
-          const nextBtn = el('button', { type: 'button', className: 'btn-small community-annotation-wizard-next', text: 'Next' });
+          const nextBtn = el('button', { type: 'button', className: 'btn community-annotation-wizard-next', text: 'Next' });
           wizardNav.appendChild(prevBtn);
           wizardNav.appendChild(stepCount);
           wizardNav.appendChild(nextBtn);
@@ -758,20 +769,18 @@ export function createGitHubConnectionFlow(controller) {
             );
             const visibleRepos = source.slice(pageStart, pageEnd);
 
-            if (visibleRepos.length === 0) {
-              const emptyMessage =
-                isReloadingRepos && !repoListLoaded
-                  ? 'Loading repositories…'
-                  : (
-                    selectable && q
-                      ? 'No repositories match this filter.'
-                      : 'No repositories found.'
-                  );
-              fragment.appendChild(el('div', {
-                className: 'legend-help',
-                text: emptyMessage,
-              }));
-            } else {
+            // An empty page says why once, in the pager's live status line
+            // below the grid (the step help already says "Loading…" while
+            // the list loads).
+            const emptyMessage =
+              isReloadingRepos && !repoListLoaded
+                ? ''
+                : (
+                  selectable && q
+                    ? 'No repositories match this filter.'
+                    : 'No repositories found.'
+                );
+            if (visibleRepos.length > 0) {
               for (const repo of visibleRepos) {
                 const full = repo.full_name;
                 const isConnected = Boolean(connected && full === connected);
@@ -851,12 +860,13 @@ export function createGitHubConnectionFlow(controller) {
             pager.next.hidden = !hasMultiplePages;
             pager.previous.disabled = page === 0;
             pager.next.disabled = page >= pageCount - 1;
+            pager.pageStatus.dataset.empty = String(source.length === 0);
             pager.pageStatus.textContent =
               source.length === 0
-                ? 'No repositories to display.'
+                ? emptyMessage
                 : (
-                  `Showing ${pageStart + 1}–${pageEnd} of ` +
-                  `${source.length} repositories. ` +
+                  `Showing ${formatCount(pageStart + 1)}–${formatCount(pageEnd)} of ` +
+                  `${formatCountOf(source.length, 'repository', 'repositories')}. ` +
                   `Page ${page + 1} of ${pageCount}.`
                 );
             repoRenderSnapshot = {
@@ -970,29 +980,21 @@ export function createGitHubConnectionFlow(controller) {
               }
             }
 
-            const toneToClass = (tone) => {
-              const t = String(tone || '').trim();
-              if (t === 'ok') return 'community-annotation-status-chip--ok';
-              if (t === 'danger') return 'community-annotation-status-chip--danger';
-              return 'community-annotation-status-chip--warn';
-            };
-
-            datasetRow.chip.className = `community-annotation-status-chip ${toneToClass(did ? 'ok' : 'warn')}`;
+            setStatusTone(datasetRow.chip, did ? 'ok' : 'warn');
             datasetRow.valueEl.textContent = did ? ` ${did}` : ' —';
 
-            githubRow.chip.className = `community-annotation-status-chip ${toneToClass(authed ? 'ok' : 'warn')}`;
+            setStatusTone(githubRow.chip, authed ? 'ok' : 'warn');
             githubRow.valueEl.textContent = authed ? (who ? ` @${who}` : ' signed in') : ' not connected';
             githubSettingsBtn.disabled = !authed;
             disconnectGitHubBtn.disabled = !authed;
 
-            const repoTone = connectedName ? 'ok' : (storedRepoName ? 'warn' : 'warn');
-            repoRow.chip.className = `community-annotation-status-chip ${toneToClass(repoTone)}`;
+            setStatusTone(repoRow.chip, connectedName ? 'ok' : 'warn');
             repoRow.valueEl.textContent =
               connectedName ? ` ${connectedName}` : (storedRepoName && !authed ? ` ${storedRepoName} (sign in)` : ' not connected');
             disconnectRepoBtn.disabled = !(authed && connectedName);
 
             const showFilter = repoListLoaded && allRepos.length > 20;
-            filterRow.style.display = authed && uiStep === 3 && showFilter ? '' : 'none';
+            filterRow.hidden = !(authed && uiStep === 3 && showFilter);
 
             addRepoBtn.disabled = !authed;
             reloadReposBtn.disabled = !authed || isReloadingRepos;
@@ -1027,20 +1029,19 @@ export function createGitHubConnectionFlow(controller) {
             autoPullSelect.value = `${assertAutoPullIntervalMs(autoPullIntervalMs)}`;
             autoPullSelect.disabled = busy || !canSync || !autoPullEnabled;
 
-            step1Panel.style.display = uiStep === 1 ? '' : 'none';
-            step2Panel.style.display = authed && uiStep === 2 ? '' : 'none';
-            step3Panel.style.display = authed && uiStep === 3 ? '' : 'none';
-            syncBlock.style.display = authed && uiStep === 4 ? '' : 'none';
+            step1Panel.hidden = uiStep !== 1;
+            step2Panel.hidden = !(authed && uiStep === 2);
+            step3Panel.hidden = !(authed && uiStep === 3);
+            syncBlock.hidden = !(authed && uiStep === 4);
 
             if (uiStep === 1) {
-              step1Help.textContent = authed
-                ? 'You’re already signed in. Click Next to continue.'
-                : 'Click “Continue with GitHub” to sign in. You will be redirected to GitHub and then returned here.';
-              step1Actions.style.display = authed ? 'none' : '';
+              step1Help.textContent = authed ? 'Signed in. Press Next.' : '';
+              step1Help.hidden = !authed;
+              step1Actions.hidden = authed;
               step1SignInBtn.disabled = busy;
               step1SignInBtn.textContent = isSigningIn ? 'Redirecting…' : 'Continue with GitHub';
             } else {
-              step1Actions.style.display = 'none';
+              step1Actions.hidden = true;
             }
 
             if (authed && uiStep === 2) {
@@ -1050,8 +1051,8 @@ export function createGitHubConnectionFlow(controller) {
                   ? 'Loading repositories…'
                   : (
                     n
-                      ? `${n} repos available. Click Next to choose one, or Add repo to enable more.`
-                      : 'No repos available yet. Click Add repo, choose repos in GitHub, then come back (or click Reload).'
+                      ? `${formatCount(n)} repos available.`
+                      : 'No repos yet: Add repo, then Reload.'
                   );
             }
 
@@ -1059,10 +1060,11 @@ export function createGitHubConnectionFlow(controller) {
               if (isReloadingRepos) {
                 step3Help.textContent = 'Loading repositories…';
               } else if (repoListLoaded && allRepos.length === 0) {
-                step3Help.textContent = 'No repositories available yet. Go back to step 2 to add repos, then reload.';
+                step3Help.textContent = 'No repos yet: go back a step to add one.';
               } else {
-                step3Help.textContent = 'Select an annotation repository to connect.';
+                step3Help.textContent = '';
               }
+              step3Help.hidden = step3Help.textContent === '';
             }
 
             if (authed && uiStep === 3) {
@@ -1074,13 +1076,11 @@ export function createGitHubConnectionFlow(controller) {
                 selectionParts.push(`Connected: ${connectedName}`);
               }
               step3Selection.textContent = selectionParts.join(' · ');
-              step3Selection.style.display =
-                selectionParts.length > 0 ? '' : 'none';
+              step3Selection.hidden = selectionParts.length === 0;
             }
 
             // Step intro content.
             const def = stepDefs[Math.max(0, Math.min(stepDefs.length - 1, uiStep - 1))] || null;
-            stepIntroTitle.textContent = def?.title || '';
             stepIntroDesc.innerHTML = '';
             const parts = Array.isArray(def?.descParts) ? def.descParts : [];
             for (const part of parts) {
@@ -1092,30 +1092,37 @@ export function createGitHubConnectionFlow(controller) {
             stepCount.textContent = `Step ${uiStep} of ${stepDefs.length}`;
             prevBtn.disabled = busy || uiStep <= 1;
 
+            // A disabled Next says why in its title, so the step's blocker is
+            // never a silent grey button.
             let nextText = 'Next';
-            let nextEnabled = !busy;
+            let nextBlocker = busy ? 'Wait for the current GitHub request to finish.' : '';
             if (uiStep === 1) {
               nextText = 'Next';
-              nextEnabled = nextEnabled && authed;
+              if (!nextBlocker && !authed) nextBlocker = 'Sign in with GitHub first.';
             } else if (uiStep === 2) {
               nextText = 'Next';
-              nextEnabled = nextEnabled && (Boolean(connectedName) || (repoListLoaded && allRepos.length > 0));
+              if (!nextBlocker && !(Boolean(connectedName) || (repoListLoaded && allRepos.length > 0))) {
+                nextBlocker = 'Enable at least one repo with Add repo, then Reload.';
+              }
             } else if (uiStep === 3) {
               const selected = String(selectedRepoFullName || '').trim();
               const wantsSwitch = Boolean(connectedName && selected && selected !== connectedName);
               const needsConnect = Boolean(!connectedName);
               if (wantsSwitch || needsConnect) {
                 nextText = isConnectingRepo ? (wantsSwitch ? 'Switching…' : 'Connecting…') : (wantsSwitch ? 'Switch repo' : 'Connect');
-                nextEnabled = nextEnabled && Boolean(selected) && (!connectedName || selected !== connectedName);
+                if (!nextBlocker && !selected) nextBlocker = 'Select a repository first.';
               } else {
                 nextText = 'Next';
               }
             } else if (uiStep === 4) {
               nextText = 'Done';
             }
+            const nextEnabled = nextBlocker === '';
 
             nextBtn.textContent = nextText;
             nextBtn.disabled = !nextEnabled;
+            if (nextEnabled) nextBtn.removeAttribute('title');
+            else nextBtn.title = nextBlocker;
             canGoNext = Boolean(nextEnabled);
 
             ensureAutoPullTimer();
@@ -1134,10 +1141,10 @@ export function createGitHubConnectionFlow(controller) {
               updateUi();
               return;
             }
-            isReloadingRepos = true;
-            updateUi();
-            status.textContent = uiStep === 3 ? 'Loading repositories…' : '';
             try {
+              isReloadingRepos = true;
+              updateUi();
+              status.textContent = '';
               const instData = await githubAuth.listInstallations({
                 signal: modalAbort.signal,
               });
@@ -1199,7 +1206,9 @@ export function createGitHubConnectionFlow(controller) {
               });
               resetRepoViewState();
               repoListLoaded = true;
-              status.textContent = allRepos.length ? '' : 'No repositories available yet. Install the app and select repos, then reload.';
+              // The step help states an empty list; the status line is for
+              // what went wrong.
+              status.textContent = '';
             } catch (err) {
               if (!isModalOwnerCurrent()) return;
               repoListLoaded = false;
@@ -1243,10 +1252,10 @@ export function createGitHubConnectionFlow(controller) {
               return;
             }
 
-            status.textContent = 'Connecting…';
-            isConnectingRepo = true;
-            updateUi();
             try {
+              isConnectingRepo = true;
+              status.textContent = 'Connecting…';
+              updateUi();
               const authedUserKey = toGitHubUserKey(githubAuth.getUser?.()) || null;
               const authedLogin = login || getGitHubLogin() || '';
               if (authedUserKey) {
@@ -1266,14 +1275,13 @@ export function createGitHubConnectionFlow(controller) {
                 signal: modalAbort.signal,
               });
               if (!isModalOwnerCurrent()) return;
-              if (result?.ok) {
+              status.textContent = describeSyncOutcome(
+                result,
+                'Connected and up to date.'
+              );
+              if (result.status === 'done') {
                 selectedRepoFullName = '';
-                status.textContent = 'Connected and up to date.';
                 uiStep = 4;
-              } else if (result?.cancelled) {
-                status.textContent = 'Cancelled.';
-              } else {
-                status.textContent = controller.getSyncError() ? `⚠ ${controller.getSyncError()}` : 'Failed to connect.';
               }
             } finally {
               isConnectingRepo = false;
@@ -1283,25 +1291,25 @@ export function createGitHubConnectionFlow(controller) {
 
           const signIn = async () => {
             if (isSigningIn) return;
-            isSigningIn = true;
-            status.textContent = 'Redirecting to GitHub sign-in…';
-            updateUi();
+            let signInError = null;
             try {
+              isSigningIn = true;
+              status.textContent = 'Redirecting to GitHub sign-in…';
+              updateUi();
               await githubAuth.signIn?.({
                 signal: modalAbort.signal,
               });
-              if (isModalOwnerCurrent()) {
-                isSigningIn = false;
-                status.textContent =
-                  'GitHub sign-in navigation was requested.';
-                updateUi();
-              }
             } catch (err) {
-              if (modalAbort.signal.aborted) return;
+              signInError = err;
+            } finally {
               isSigningIn = false;
-              status.textContent = String(err?.message || 'Sign-in failed');
-              updateUi();
             }
+            if (!isModalOwnerCurrent()) return;
+            status.textContent =
+              signInError === null
+                ? 'GitHub sign-in navigation was requested.'
+                : String(signInError?.message || 'Sign-in failed');
+            updateUi();
           };
 
           const closeModal = () => removeOwningCommunityModal(content);
@@ -1455,45 +1463,43 @@ export function createGitHubConnectionFlow(controller) {
             }
           });
 
-          pullBtn.addEventListener('click', () => {
-            startBackgroundTask(async () => {
-              pullBtn.disabled = true;
-              status.textContent = 'Pulling latest annotations…';
-              try {
-                const promise = pullFromGitHub({
-                  signal: modalAbort.signal,
-                });
-                updateUi();
-                await promise;
-                if (!isModalOwnerCurrent()) return;
-                status.textContent = controller.getSyncError() ? `⚠ ${controller.getSyncError()}` : 'Pulled latest annotations.';
-              } finally {
-                if (isModalOwnerCurrent()) {
-                  pullBtn.disabled = false;
-                  updateUi();
-                }
+          // Pull and Publish report the outcome the controls returned. The
+          // buttons themselves follow `syncBusy` through the subscription
+          // below, including transactions this dialog did not start.
+          const runSyncAction = async (pendingText, run, doneText) => {
+            status.textContent = pendingText;
+            let outcome;
+            try {
+              outcome = await run({ signal: modalAbort.signal });
+            } catch (error) {
+              if (isModalOwnerCurrent()) {
+                status.textContent =
+                  `⚠ ${String(error?.message || 'GitHub sync failed')}`;
               }
-            }, { label: 'GitHub annotation pull action failed' });
+              throw error;
+            }
+            if (!isModalOwnerCurrent()) return;
+            status.textContent = describeSyncOutcome(outcome, doneText);
+          };
+          pullBtn.addEventListener('click', () => {
+            startBackgroundTask(
+              () => runSyncAction(
+                'Pulling latest annotations…',
+                pullFromGitHub,
+                'Pulled latest annotations.'
+              ),
+              { label: 'GitHub annotation pull action failed' },
+            );
           });
           publishBtn.addEventListener('click', () => {
-            startBackgroundTask(async () => {
-              publishBtn.disabled = true;
-              status.textContent = 'Publishing…';
-              try {
-                const promise = pushToGitHub({
-                  signal: modalAbort.signal,
-                });
-                updateUi();
-                await promise;
-                if (!isModalOwnerCurrent()) return;
-                status.textContent = controller.getSyncError() ? `⚠ ${controller.getSyncError()}` : 'Publish complete.';
-              } finally {
-                if (isModalOwnerCurrent()) {
-                  publishBtn.disabled = false;
-                  updateUi();
-                }
-              }
-            }, { label: 'GitHub annotation publish action failed' });
+            startBackgroundTask(
+              () => runSyncAction(
+                'Publishing…',
+                pushToGitHub,
+                'Publish complete.'
+              ),
+              { label: 'GitHub annotation publish action failed' },
+            );
           });
 
           githubSettingsBtn.addEventListener('click', () => {
@@ -1527,6 +1533,12 @@ export function createGitHubConnectionFlow(controller) {
 
           // Initial state.
           updateUi();
+          const unsubscribeSyncBusy = controller.subscribeSyncBusy(() => {
+            if (isModalOwnerCurrent()) updateUi();
+          });
+          modalAbort.signal.addEventListener('abort', unsubscribeSyncBusy, {
+            once: true,
+          });
 
           // Convenience: after returning from GitHub (Add repo), refresh list automatically.
           window.addEventListener('focus', () => {
@@ -1556,40 +1568,25 @@ export function createGitHubConnectionFlow(controller) {
         resolveOnce(null);
         return;
       }
-      const cleanup = () => {
-        modalRef?.content?.__cellucidCleanup?.();
+      settleClosed = () => {
+        modalRef.content.__cellucidCleanup?.();
+        controller.releaseActiveConnectionClose(setupClose);
+        resolveOnce(null);
       };
-      const observer = new MutationObserver(() => {
-        if (resolved) {
-          observer.disconnect();
-          cleanup();
-          return;
-        }
-        if (!document.body.contains(overlay)) {
-          observer.disconnect();
-          cleanup();
-          controller.releaseActiveConnectionClose(setupClose);
-          resolveOnce(mode === 'auth' ? Boolean(githubAuth.isAuthenticated?.()) : null);
-        }
-      });
-      observer.observe(document.body, { childList: true, subtree: true });
     });
   }
 
-  async function connectRepoFlow({ reason = null, defaultPullNow = true } = {}) {
+  async function connectRepoFlow({ reason = null } = {}) {
     const datasetId = dataSourceManager?.getCurrentDatasetId?.() || null;
     const login = getGitHubLogin();
     const cacheUser = getCacheUserKey();
     const currentRepo = getAnnotationRepoForDataset(datasetId, cacheUser);
     return openGitHubConnectionFlow({
-      mode: 'repo',
-      focus: 'repo',
       reason,
       datasetId,
       cacheUser,
       login,
       currentRepo,
-      defaultPullNow
     });
   }
 

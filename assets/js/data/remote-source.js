@@ -389,9 +389,10 @@ function requireDatasetCatalogPath(value, label) {
 function requireDatasetStateCapability(entry, label) {
   const hasStateManifest = Object.hasOwn(entry, 'state_manifest');
   const hasStateSha256 = Object.hasOwn(entry, 'state_sha256');
-  if (hasStateManifest !== hasStateSha256) {
+  const hasStateBytes = Object.hasOwn(entry, 'state_bytes');
+  if (hasStateManifest !== hasStateSha256 || hasStateManifest !== hasStateBytes) {
     throw new TypeError(
-      `${label} state_manifest and state_sha256 must be declared together`
+      `${label} state_manifest, state_sha256 and state_bytes must be declared together`
     );
   }
   if (!hasStateManifest) return null;
@@ -408,9 +409,15 @@ function requireDatasetStateCapability(entry, label) {
       `${label}.state_sha256 must be one lowercase SHA-256 digest`
     );
   }
+  if (!Number.isSafeInteger(entry.state_bytes) || entry.state_bytes < 1) {
+    throw new TypeError(
+      `${label}.state_bytes must be the default state's exact positive byte length`
+    );
+  }
   return Object.freeze({
     state_manifest: entry.state_manifest,
-    state_sha256: entry.state_sha256
+    state_sha256: entry.state_sha256,
+    state_bytes: entry.state_bytes
   });
 }
 
@@ -432,7 +439,7 @@ function requireDatasetCatalogPayload(payload) {
     requireExactKeys(
       entry,
       ['id', 'path', 'name'],
-      ['state_manifest', 'state_sha256'],
+      ['state_manifest', 'state_sha256', 'state_bytes'],
       label
     );
     const id = requireExactText(
@@ -589,16 +596,6 @@ export function isRemoteUrl(value) {
     typeof value === 'string' &&
     (value.startsWith('remote://') || value.startsWith('remotes://'))
   );
-}
-
-/**
- * Check whether a value declares the exact secure remote protocol prefix.
- *
- * @param {unknown} value
- * @returns {boolean}
- */
-export function isSecureRemoteUrl(value) {
-  return typeof value === 'string' && value.startsWith('remotes://');
 }
 
 /**
@@ -779,6 +776,21 @@ export class RemoteDataSource {
       throw error;
     }
     return socket;
+  }
+
+  /**
+   * Whether the connected server serves an AnnData object (`cellucid serve`
+   * of an .h5ad or .zarr, or `serve_anndata()`) rather than prepared exports.
+   * Such a server publishes the data mapping it serves at
+   * `_cellucid/mapping/candidates.json` under the dataset base.
+   *
+   * @returns {boolean}
+   */
+  servesAnnData() {
+    if (!this._connected || this._serverInfo === null) {
+      throw new Error('Remote data source is not connected.');
+    }
+    return this._serverInfo.type === 'anndata';
   }
 
   /**

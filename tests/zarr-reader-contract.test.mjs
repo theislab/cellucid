@@ -1,4 +1,6 @@
+import './helpers/anndata-reader-in-process.mjs';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
 import * as zarrCodecs from '../assets/js/data/zarr-codecs.js';
@@ -7,8 +9,12 @@ import {
   decodeVLenUtf8,
   getZarrDtypeInfo
 } from '../assets/js/data/zarr-codecs.js';
-import * as zarrModule from '../assets/js/data/zarr.js';
-import { ZarrDataSource, ZarrLoader } from '../assets/js/data/zarr.js';
+import * as zarrSourceModule from '../assets/js/data/zarr.js';
+import * as zarrLoaderModule from '../assets/js/data/zarr-loader.js';
+import { ZarrDataSource } from '../assets/js/data/zarr.js';
+import { ZarrLoader } from '../assets/js/data/zarr-loader.js';
+
+const zarrModule = { ...zarrSourceModule, ...zarrLoaderModule };
 import { BaseAnnDataAdapter } from '../assets/js/data/base-anndata-adapter.js';
 import { getNotificationCenter } from '../assets/js/app/notification-center.js';
 import {
@@ -16,6 +22,92 @@ import {
   extractConnectivityEdges,
   getSparseColumn
 } from '../assets/js/data/sparse-utils.js';
+import {
+  EmbeddingLoadError,
+  describeAnnDataProbes,
+} from '../assets/js/data/data-mapping-candidates.js';
+import { connectivityEdgesOf } from '../assets/js/data/sparse-utils.js';
+
+/** One gene's column of X, found by its stored var name. */
+function geneColumnByName(loader, name) {
+  const index = loader.varNames.indexOf(name);
+  assert.notEqual(index, -1, `gene '${name}' is on the var index`);
+  return loader.getMatrixColumn('X', index);
+}
+
+/** One gene's values through a data source's adapter, found in its var manifest. */
+async function sourceGeneValuesByName(source, name) {
+  const manifest = await source.getVarManifest();
+  const field = manifest.fields.find(([, fieldName]) => fieldName === name);
+  assert.ok(field, `gene '${name}' is in the var manifest`);
+  return source.getAdapter().getGeneValues(`var/${field[0]}.values.f32`);
+}
+
+/**
+ * Call a private X column reader the way `getMatrixColumn` does: with the
+ * resident X state (created when none is resident) and X's description.
+ */
+function readXColumn(loader, index, { sparse }) {
+  loader._requireMatrixElement = async element => {
+    assert.equal(element, 'X');
+    return { path: 'X', label: 'X', sparse, nVars: loader._nVars };
+  };
+  return loader.getMatrixColumn('X', index);
+}
+
+/** Describe X without reading store metadata, for loaders built from stubs. */
+function stubXElement(loader, { sparse, nVars }) {
+  loader._requireMatrixElement = async element => {
+    assert.equal(element, 'X');
+    return { path: 'X', label: 'X', sparse, nVars };
+  };
+}
+
+/** An adapter whose obsm entries are described from the loader's probes. */
+async function adapterWithDescribedObsm(loader, options = {}) {
+  const adapter = new BaseAnnDataAdapter(loader, options);
+  adapter._describedObsm =
+    describeAnnDataProbes(await loader.probeMapping()).obsm;
+  return adapter;
+}
+
+/** Mapping probes for an obsm of dense arrays with the given widths. */
+function obsmProbes(nObs, widths) {
+  return {
+    nObs,
+    nVars: 0,
+    obsm: Object.entries(widths).map(([key, width]) => ({
+      key,
+      storage: 'dense',
+      shape: [nObs, width],
+      dtype: 'float32',
+      numeric: true,
+      nnz: null,
+    })),
+    obsp: [],
+    varColumns: [],
+    X: null,
+    layers: [],
+    raw: null,
+  };
+}
+
+/**
+ * Give a loader plottable mapping metadata: one 2-column X_umap_2d whose
+ * reads return distinct values per cell.
+ */
+function stubPlottableObsm(loader, nObs) {
+  loader.getDatasetMetadata = async () => ({
+    stats: { n_cells: nObs, n_genes: 0 },
+    probes: obsmProbes(nObs, { X_umap_2d: 2 }),
+    obs_fields: [],
+  });
+  loader.readObsmColumns = async (_key, columns) => Float64Array.from(
+    { length: nObs * columns.length },
+    (_, index) => 10 * Math.floor(index / columns.length) +
+      columns[index % columns.length]
+  );
+}
 
 const CANONICAL_SPLIT_BLOSC_BASE64 =
   'AgEhBAAEAAAABAAARQEAABQAAAAAAQAAAAECAwQFBgcICQoLDA0ODxAREhMUFRYX' +
@@ -777,7 +869,6 @@ function embeddingLoader({
   loader._files = files;
   loader._rootName = 'fixture.zarr';
   loader._nObs = nObs;
-  loader._obsmKeys = [key, ...extraArrays.map(array => array.key)];
   return loader;
 }
 
@@ -834,11 +925,14 @@ test('Zarr X=None does not advertise gene-expression fields', async () => {
 
   const adapter = new BaseAnnDataAdapter(loader);
   await adapter.initialize();
-  assert.deepEqual(adapter.getVarManifest().fields, []);
-  assert.deepEqual(adapter.getGeneNames(), []);
+  assert.deepEqual((await adapter.getVarManifest()).fields, []);
   await assert.rejects(
-    adapter.getGeneExpression('A'),
-    /does not contain an X expression matrix|no X expression matrix/i
+    adapter.getGeneValues('var/0.values.f32'),
+    /no expression matrix; gene expression is unavailable/i
+  );
+  await assert.rejects(
+    loader.getMatrixColumn('X', 0),
+    /no X expression matrix/i
   );
 });
 
@@ -869,8 +963,9 @@ test('rejects directory selections that omit required Zarr v2 metadata', async (
   notifications.dismissDownload = () => {};
 
   try {
+    const { files, rootName } = zarrModule.zarrStoreFromFileList(fileList);
     await assert.rejects(
-      loader.open(fileList),
+      loader.openFileMap(files, rootName),
       error => {
         assert.match(error.message, /browser.*omit|required.*metadata/i);
         assert.match(error.message, /Zarr ZIP/i);
@@ -1050,24 +1145,9 @@ test('rejects unsupported dtypes and filters instead of returning plausible corr
   );
   assert.throws(
     () => zarrCodecs.validateZarrArrayMetadata(metadata({
-      shape: [100_001],
-      chunks: [1]
-    })),
-    /chunk count.*browser limit/i
-  );
-  assert.throws(
-    () => zarrCodecs.validateZarrArrayMetadata(metadata({
       dtype: '|S9007199254740993'
     })),
     /fixed string.*too large/i
-  );
-  assert.throws(
-    () => zarrCodecs.validateZarrArrayMetadata(metadata({
-      shape: [1],
-      chunks: [16_777_217],
-      dtype: '<i4'
-    })),
-    /chunk.*browser limit/i
   );
 });
 
@@ -1383,98 +1463,6 @@ test('requires a signed-integer dtype for categorical codes', async () => {
   );
 });
 
-test('preflights ordinary numeric observation conversion before payload access', async () => {
-  const nObs = 70_000_000;
-  const loader = new ZarrLoader();
-  loader._files = new Map([
-    ['obs/count/.zarray', memoryFile('{}')],
-    ['obs/count/.zattrs', memoryFile('{}')]
-  ]);
-  loader._nObs = nObs;
-  loader._readAttrs = async () => ({
-    'encoding-type': 'array',
-    'encoding-version': '0.2.0'
-  });
-  loader._readArrayMeta = async () => metadata({
-    shape: [nObs],
-    chunks: [1000],
-    dtype: '<i4'
-  });
-  let payloadTouched = false;
-  loader._readArray = async () => {
-    payloadTouched = true;
-    throw new Error('ordinary observation payload touched before conversion preflight');
-  };
-
-  for (const read of [
-    () => loader.getObsFieldInfo('count'),
-    () => loader.getObsField('count')
-  ]) {
-    await assert.rejects(
-      read(),
-      /observation field.*working set.*browser limit/i
-    );
-  }
-  assert.equal(payloadTouched, false);
-});
-
-test('preflights categorical code conversion before either payload access', async () => {
-  const nObs = 70_000_000;
-  const loader = new ZarrLoader();
-  loader._files = new Map([
-    ['obs/group/.zgroup', memoryFile('{"zarr_format":2}')],
-    ['obs/group/.zattrs', memoryFile(JSON.stringify({
-      'encoding-type': 'categorical',
-      'encoding-version': '0.2.0',
-      ordered: false
-    }))],
-    ['obs/group/codes/.zarray', memoryFile('{}')],
-    ['obs/group/categories/.zarray', memoryFile('{}')]
-  ]);
-  loader._nObs = nObs;
-  loader._readAttrs = async path => path === 'obs/group'
-    ? {
-        'encoding-type': 'categorical',
-        'encoding-version': '0.2.0',
-        ordered: false
-      }
-    : {
-        'encoding-type': path.endsWith('/categories')
-          ? 'array'
-          : 'array',
-        'encoding-version': '0.2.0'
-      };
-  loader._readArrayMeta = async path => metadata(
-    path.endsWith('/codes')
-      ? {
-          shape: [nObs],
-          chunks: [1000],
-          dtype: '<i4'
-        }
-      : {
-          shape: [2],
-          chunks: [2],
-          dtype: '|b1'
-        }
-  );
-  const payloadPaths = [];
-  loader._readArray = async path => {
-    payloadPaths.push(path);
-    throw new Error(`categorical payload '${path}' touched before conversion preflight`);
-  };
-
-  for (const read of [
-    () => loader.getObsFieldInfo('group'),
-    () => loader.getObsField('group')
-  ]) {
-    await assert.rejects(
-      read(),
-      /categorical field.*working set.*browser limit/i
-    );
-  }
-  assert.deepEqual(payloadPaths, []);
-});
-
 test('rejects oversized category dictionaries before code or label payloads', async () => {
   const loader = new ZarrLoader();
   loader._files = new Map([
@@ -1506,8 +1494,8 @@ test('rejects oversized category dictionaries before code or label payloads', as
           dtype: '|i1'
         }
       : {
-          shape: [65_536],
-          chunks: [1024],
+          shape: [4_294_967_296],
+          chunks: [1_048_576],
           dtype: '<i4'
         }
   );
@@ -1523,7 +1511,7 @@ test('rejects oversized category dictionaries before code or label payloads', as
   ]) {
     await assert.rejects(
       read(),
-      /65,536 categories.*at most 65,535.*reduce or merge/i
+      /4,294,967,296 categories.*at most 4,294,967,295.*reduce or merge/i
     );
   }
   assert.deepEqual(payloadPaths, []);
@@ -1632,11 +1620,8 @@ test('Zarr dataset metadata counts categorical fields without label payloads', a
   loader._rootName = 'metadata-only.zarr';
   loader._nObs = 1;
   loader._obsKeys = ['label'];
-  loader._obsmKeys = ['X_umap_2d'];
-  loader.getEmbeddingShape = async () => ({
-    shape: [1, 2],
-    nDims: 2
-  });
+  const probes = obsmProbes(1, { X_umap_2d: 2 });
+  loader.probeMapping = async () => probes;
   loader.hasConnectivities = async () => false;
   let categoryReads = 0;
   loader._readCategoricalCategories = async () => {
@@ -1646,6 +1631,8 @@ test('Zarr dataset metadata counts categorical fields without label payloads', a
 
   const dataset = await loader.getDatasetMetadata();
   assert.equal(dataset.stats.n_categorical_fields, 1);
+  assert.strictEqual(dataset.probes, probes);
+  assert.equal(Object.hasOwn(dataset, 'embeddings'), false);
   assert.equal(categoryReads, 0);
 });
 
@@ -1659,8 +1646,8 @@ test('Zarr adapter reuses retained categories after loader cache clearing', asyn
       ordered: true
     }))],
     ['obs/label/codes/.zarray', memoryFile(JSON.stringify(metadata({
-      shape: [1],
-      chunks: [1],
+      shape: [2],
+      chunks: [2],
       dtype: '|i1'
     })))],
     ['obs/label/codes/.zattrs', memoryFile(JSON.stringify({
@@ -1679,17 +1666,10 @@ test('Zarr adapter reuses retained categories after loader cache clearing', asyn
     }))]
   ]);
   loader._rootName = 'retained-categories.zarr';
-  loader._nObs = 1;
+  // Two cells: one cell has no coordinate variation to plot.
+  loader._nObs = 2;
   loader._obsKeys = ['label'];
-  loader.getDatasetMetadata = async () => ({
-    version: 2,
-    stats: { n_cells: 1, n_genes: 0 },
-    embeddings: {
-      available_dimensions: [],
-      default_dimension: null,
-      obsm_keys: {}
-    }
-  });
+  stubPlottableObsm(loader, 2);
   let categoryReads = 0;
   loader._readArray = async path => {
     if (path.endsWith('/categories')) {
@@ -1697,8 +1677,8 @@ test('Zarr adapter reuses retained categories after loader cache clearing', asyn
       return { data: ['A'], shape: [1], dtype: '|O' };
     }
     return {
-      data: Int8Array.from([0]),
-      shape: [1],
+      data: Int8Array.from([0, 0]),
+      shape: [2],
       dtype: '|i1'
     };
   };
@@ -2011,111 +1991,54 @@ test('rejects unpaired surrogates in fixed-Unicode fill metadata', async () => {
   );
 });
 
-test('preflights VLen counts, materialization size, and file size before allocation', async t => {
+test('VLen item counts are bounded by their payload, and chunks by their declared shape alone', async t => {
   assert.throws(
     () => decodeVLenUtf8(bytesFromHex('ffffff7f'), 0x7fffffff),
     /item count exceeds payload bounds/i
   );
 
-  await t.test('array materialization', () => {
-    assert.equal(typeof zarrCodecs.validateZarrMaterialization, 'function');
-    assert.throws(
-      () => zarrCodecs.validateZarrMaterialization(
-        metadata({ shape: [600_000_000], chunks: [1], dtype: '|u1' }),
-        getZarrDtypeInfo('|u1')
-      ),
-      /array.*browser limit/i
-    );
+  await t.test('no array size, chunk count or chunk size is refused for being large', () => {
+    for (const meta of [
+      metadata({ shape: [600_000_000], chunks: [1], dtype: '|u1' }),
+      metadata({ shape: [134_217_728], chunks: [16_777_216], dtype: '<f4' }),
+      metadata({ shape: [40_000_000], chunks: [8_000_000], dtype: '|S8' }),
+      metadata({ shape: [100_001], chunks: [1] }),
+      metadata({ shape: [1], chunks: [16_777_217], dtype: '<i4' }),
+    ]) {
+      assert.doesNotThrow(() => zarrCodecs.validateZarrArrayMetadata(meta));
+    }
+    assert.equal(zarrCodecs.validateZarrMaterialization, undefined);
+    assert.equal(zarrCodecs.MAX_ZARR_CHUNK_BYTES, undefined);
   });
 
-  await t.test('fixed-string pointer materialization', () => {
-    assert.throws(
-      () => zarrCodecs.validateZarrMaterialization(
-        metadata({ shape: [70_000_000], chunks: [1], dtype: '|S1' }),
-        getZarrDtypeInfo('|S1')
-      ),
-      /array.*browser limit/i
-    );
-  });
-
-  await t.test('fixed-string peak working set', () => {
-    assert.throws(
-      () => zarrCodecs.validateZarrMaterialization(
-        metadata({
-          shape: [60_000_000],
-          chunks: [60_000_000],
-          dtype: '|S1'
-        }),
-        getZarrDtypeInfo('|S1')
-      ),
-      /string array.*working set.*browser limit/i
-    );
-  });
-
-  await t.test('numeric result plus chunk working set', () => {
-    assert.throws(
-      () => zarrCodecs.validateZarrMaterialization(
-        metadata({
-          shape: [134_217_728],
-          chunks: [16_777_216],
-          dtype: '<f4'
-        }),
-        getZarrDtypeInfo('<f4')
-      ),
-      /array.*working set.*browser limit/i
-    );
-  });
-
-  await t.test('fixed-string retained payload plus chunk working set', () => {
-    assert.throws(
-      () => zarrCodecs.validateZarrMaterialization(
-        metadata({
-          shape: [40_000_000],
-          chunks: [8_000_000],
-          dtype: '|S8'
-        }),
-        getZarrDtypeInfo('|S8')
-      ),
-      /string array.*working set.*browser limit/i
-    );
-  });
-
-  await t.test('encoded chunk file', async () => {
-    let readAttempted = false;
-    const loader = arrayLoader(
-      'values',
-      metadata({ shape: [1], chunks: [1], dtype: '|u1' }),
-      {}
-    );
-    loader._files.set('values/0', {
-      size: 65 * 1024 * 1024,
-      async arrayBuffer() {
-        readAttempted = true;
-        throw new Error('oversized file must not be read');
-      }
-    });
-
-    await assert.rejects(loader._readArray('values'), /chunk file.*browser limit/i);
-    assert.equal(readAttempted, false);
-  });
-
-  await t.test('decoded object chunk', async () => {
-    const oversized = new Uint8Array(zarrCodecs.MAX_ZARR_CHUNK_BYTES + 1);
-    new DataView(oversized.buffer).setUint32(0, 1, true);
+  await t.test('a fixed-width chunk decodes to exactly its declared size', async () => {
+    const meta = metadata({ shape: [4], chunks: [4], dtype: '<i4', compressor: null });
     await assert.rejects(
-      zarrCodecs.decodeZarrChunk(
-        oversized,
-        metadata({
-          shape: [1],
-          chunks: [1],
-          dtype: '|O',
-          filters: [{ id: 'vlen-utf8' }]
-        }),
-        getZarrDtypeInfo('|O'),
-        1
-      ),
-      /chunk exceeds.*browser limit/i
+      zarrCodecs.decodeZarrChunk(new Uint8Array(12), meta, getZarrDtypeInfo('<i4'), 4),
+      /decoded 12 bytes; expected 16/i
     );
+  });
+
+  await t.test('a compressed string chunk is bounded by its codec, not a constant', async () => {
+    const { gzipSync } = await import('node:zlib');
+    const payload = new Uint8Array(4 + 4 + 3);
+    const view = new DataView(payload.buffer);
+    view.setUint32(0, 1, true);
+    view.setUint32(4, 3, true);
+    payload.set([0x61, 0x62, 0x63], 8);
+    const decoded = await zarrCodecs.decodeZarrChunk(
+      gzipSync(payload),
+      metadata({
+        shape: [1],
+        chunks: [1],
+        dtype: '|O',
+        filters: [{ id: 'vlen-utf8' }],
+        compressor: { id: 'gzip', level: 1 },
+      }),
+      getZarrDtypeInfo('|O'),
+      1
+    );
+    assert.deepEqual(decoded, ['abc']);
   });
 });
 
@@ -2161,7 +2084,7 @@ test('converts safe dense int64 gene expression and rejects lossy values', async
   );
   safe._nObs = 2;
   safe._nVars = 1;
-  assert.deepEqual(Array.from(await safe._getDenseColumn(0)), [1, 2]);
+  assert.deepEqual(Array.from(await readXColumn(safe, 0, { sparse: false })), [1, 2]);
 
   const unsafe = arrayLoader(
     'X',
@@ -2173,97 +2096,101 @@ test('converts safe dense int64 gene expression and rejects lossy values', async
   unsafe._nObs = 1;
   unsafe._nVars = 1;
   await assert.rejects(
-    unsafe._getDenseColumn(0),
+    readXColumn(unsafe, 0, { sparse: false }),
     /dense X.*safe numeric range/i
   );
 });
 
-test('preflights dense column output before allocating it', async () => {
-  const nRows = Number.MAX_SAFE_INTEGER;
+function streamedDenseStripLoader() {
+  // Float32 output beyond the full-matrix cache, so genes stream by strip:
+  // two chunk rows of one 700-column strip hold genes 0-699.
+  const nRows = 4;
+  const nCols = 35_000_000;
+  const chunk = rowOffset => Uint8Array.from(
+    { length: 2 * 700 },
+    (unused, index) => (rowOffset + Math.floor(index / 700)) * 10 + (index % 700) % 10
+  );
   const loader = arrayLoader(
     'X',
     metadata({
-      shape: [nRows, 1],
-      chunks: [nRows, 1],
+      shape: [nRows, nCols],
+      chunks: [2, 700],
       dtype: '|u1'
     }),
-    {}
+    { '0.0': chunk(0), '1.0': chunk(2) }
   );
   loader._nObs = nRows;
-  loader._nVars = 1;
-
-  await assert.rejects(
-    loader._getDenseColumn(0),
-    /dense X(?: column| decoded chunk).*browser limit/i
-  );
-});
-
-test('chooses dense streaming by Float32 cache size rather than source width', async () => {
-  const loader = arrayLoader(
-    'X',
-    metadata({
-      shape: [1, 70_000_000],
-      chunks: [1, 700],
-      dtype: '|u1'
-    }),
-    {}
-  );
-  loader._nObs = 1;
-  loader._nVars = 70_000_000;
-  let fullReadAttempted = false;
+  loader._nVars = nCols;
+  const chunkReads = [];
+  const readChunkFile = loader._readChunkFile.bind(loader);
+  loader._readChunkFile = path => {
+    chunkReads.push(path);
+    return readChunkFile(path);
+  };
   loader._readArray = async () => {
-    fullReadAttempted = true;
     throw new Error('full dense cache must not be materialized');
   };
+  return { chunkReads, loader };
+}
 
-  assert.deepEqual(Array.from(await loader._getDenseColumn(0)), [0]);
-  assert.equal(fullReadAttempted, false);
-});
+test('genes of one dense chunk strip decode each chunk once', async () => {
+  const { chunkReads, loader } = streamedDenseStripLoader();
 
-test('bounds the gene LRU by retained bytes as well as entry count', async () => {
-  const loader = new ZarrLoader();
-  loader._files = new Map([['sentinel', memoryFile('')]]);
-  loader._varNameIndex.set('GeneA', 0);
-  loader._varNameIndex.set('GeneB', 1);
-  loader._getDenseColumn = async index => ({
-    byteLength: 200 * 1024 * 1024,
-    index
-  });
-
-  await loader.getGeneExpression('GeneA');
-  await loader.getGeneExpression('GeneB');
-  assert.deepEqual(Array.from(loader._geneCache.keys()), ['GeneB']);
-  assert.equal(loader._geneCacheBytes, 200 * 1024 * 1024);
-});
-
-test('serializes concurrent initialization of the full dense cache', async () => {
-  const loader = arrayLoader(
-    'X',
-    metadata({ shape: [2, 2], chunks: [2, 2], dtype: '<f4' }),
-    {}
+  assert.deepEqual(
+    Array.from(await loader.getMatrixColumn('X', 0)),
+    [0, 10, 20, 30]
   );
-  loader._nObs = 2;
-  loader._nVars = 2;
-  loader._varNameIndex.set('GeneA', 0);
-  loader._varNameIndex.set('GeneB', 1);
-  let fullReadCount = 0;
-  loader._readArray = async () => {
-    fullReadCount++;
-    await Promise.resolve();
-    return {
-      data: new Float32Array([1, 2, 3, 4]),
-      shape: [2, 2],
-      dtype: '<f4'
-    };
-  };
+  assert.deepEqual(
+    Array.from(await loader.getMatrixColumn('X', 1)),
+    [1, 11, 21, 31]
+  );
+  assert.deepEqual(chunkReads, ['X/0.0', 'X/1.0']);
+  assert.equal(loader._decodedXBlocks.retainedBytes, 2 * 2 * 700);
 
-  const [geneA, geneB] = await Promise.all([
-    loader.getGeneExpression('GeneA'),
-    loader.getGeneExpression('GeneB')
+  // Concurrent genes of the same strip share the retained chunks too.
+  loader._decodedXBlocks.clear();
+  chunkReads.length = 0;
+  const [geneA, geneC] = await Promise.all([
+    loader.getMatrixColumn('X', 0),
+    loader.getMatrixColumn('X', 2)
   ]);
-  assert.equal(fullReadCount, 1);
-  assert.deepEqual(Array.from(geneA), [1, 3]);
-  assert.deepEqual(Array.from(geneB), [2, 4]);
+  assert.deepEqual(Array.from(geneA), [0, 10, 20, 30]);
+  assert.deepEqual(Array.from(geneC), [2, 12, 22, 32]);
+  assert.deepEqual(chunkReads, ['X/0.0', 'X/1.0']);
+});
+
+test('a failed dense chunk decode is not retained for the next gene', async () => {
+  const { chunkReads, loader } = streamedDenseStripLoader();
+  const readChunkFile = loader._readChunkFile;
+  let failNext = true;
+  loader._readChunkFile = path => {
+    if (failNext && path === 'X/1.0') {
+      failNext = false;
+      chunkReads.push(path);
+      return Promise.reject(new Error('chunk read failed'));
+    }
+    return readChunkFile(path);
+  };
+  await assert.rejects(loader.getMatrixColumn('X', 0), /chunk read failed/);
+  assert.deepEqual(
+    Array.from(await loader.getMatrixColumn('X', 0)),
+    [0, 10, 20, 30]
+  );
+  assert.deepEqual(chunkReads, ['X/0.0', 'X/1.0', 'X/1.0']);
+});
+
+test('decoded dense chunks are released when the dataset is cleared or closed', async () => {
+  const { loader } = streamedDenseStripLoader();
+  await loader.getMatrixColumn('X', 0);
+  assert.ok(loader._decodedXBlocks.retainedBytes > 0);
+  loader.clearCache();
+  assert.equal(loader._decodedXBlocks.retainedBytes, 0);
+
+  const { loader: closing } = streamedDenseStripLoader();
+  await closing.getMatrixColumn('X', 0);
+  closing.close();
+  assert.equal(closing._decodedXBlocks.retainedBytes, 0);
+  assert.equal(closing._decodedXBlocks.size, 0);
 });
 
 test('sums duplicate sparse coordinates in direct CSC and converted CSR columns', async t => {
@@ -2278,7 +2205,7 @@ test('sums duplicate sparse coordinates in direct CSC and converted CSR columns'
       });
       loader._nObs = 2;
       loader._nVars = 1;
-      assert.deepEqual(Array.from(await loader._getSparseColumn(0)), [5, 0]);
+      assert.deepEqual(Array.from(await readXColumn(loader, 0, { sparse: true })), [5, 0]);
     });
   }
 });
@@ -2294,7 +2221,7 @@ test('rejects finite duplicate sums that overflow Float32 sparse output', async 
   directCsc._nObs = 1;
   directCsc._nVars = 1;
   await assert.rejects(
-    directCsc._getSparseColumn(0),
+    readXColumn(directCsc, 0, { sparse: true }),
     /sparse X column.*Float32 range/i
   );
 
@@ -2330,8 +2257,8 @@ test('rejects out-of-range sparse columns instead of returning plausible zeros',
       loader._nObs = 2;
       loader._nVars = 2;
       await assert.rejects(
-        loader._getSparseColumn(2),
-        /sparse X column index.*out of bounds/i
+        readXColumn(loader, 2, { sparse: true }),
+        /X has no gene column 2/i
       );
     });
   }
@@ -2414,57 +2341,6 @@ test('rejects a shared sparse column before allocating its output', () => {
   );
 });
 
-test('preflights embedding Float32 expansion before reading the array', async () => {
-  const loader = arrayLoader(
-    'obsm/X_umap',
-    metadata({
-      shape: [200_000_000, 1],
-      chunks: [2000, 1],
-      dtype: '|u1'
-    }),
-    {}
-  );
-  setCurrentMapping(loader._files, 'obsm');
-  loader._nObs = 200_000_000;
-  let fullReadAttempted = false;
-  loader._readArray = async () => {
-    fullReadAttempted = true;
-    throw new Error('oversized embedding must not be read');
-  };
-
-  await assert.rejects(
-    loader.getEmbedding('X_umap'),
-    /embedding.*browser limit/i
-  );
-  assert.equal(fullReadAttempted, false);
-});
-
-test('preflights retained raw and normalized public embedding storage', async () => {
-  const nObs = 70_000_000;
-  const loader = arrayLoader(
-    'obsm/X_umap',
-    metadata({
-      shape: [nObs, 1],
-      chunks: [1000, 1],
-      dtype: '<f4'
-    }),
-    {}
-  );
-  setCurrentMapping(loader._files, 'obsm');
-  loader._nObs = nObs;
-  let payloadTouched = false;
-  loader._readArray = async () => {
-    payloadTouched = true;
-    throw new Error('embedding payload touched before public working-set preflight');
-  };
-
-  await assert.rejects(
-    loader.getEmbedding('X_umap'),
-    /embedding.*public working set.*browser limit/i
-  );
-  assert.equal(payloadTouched, false);
-});
-
 test('rejects finite values that overflow during Float32 conversion', async () => {
   const embedding = arrayLoader(
     'obsm/X_umap',
@@ -2473,10 +2349,19 @@ test('rejects finite values that overflow during Float32 conversion', async () =
   );
   setCurrentMapping(embedding._files, 'obsm');
   embedding._nObs = 1;
-  await assert.rejects(
-    embedding.getEmbedding('X_umap'),
-    /embedding.*Float32 range/i
+  // The column read returns the stored value; the adapter's load-time check
+  // refuses it before any Float32 coordinate is produced.
+  assert.deepEqual(
+    Array.from(await embedding.readObsmColumns('X_umap', [0])),
+    [1e308]
   );
+  const adapter = await adapterWithDescribedObsm(embedding);
+  await assert.rejects(
+    adapter.getEmbeddingForRef({ key: 'X_umap', columns: [0] }),
+    error => error instanceof EmbeddingLoadError &&
+      error.reason === 'not representable as float32 at cell 0'
+  );
+  assert.equal(adapter._embeddingCache.size, 0);
 
   const denseFill = arrayLoader(
     'X',
@@ -2491,7 +2376,7 @@ test('rejects finite values that overflow during Float32 conversion', async () =
   denseFill._nObs = 1;
   denseFill._nVars = 70_000_000;
   await assert.rejects(
-    denseFill._getDenseColumn(0),
+    readXColumn(denseFill, 0, { sparse: false }),
     /dense X.*Float32 range/i
   );
 
@@ -2516,74 +2401,238 @@ test('rejects every non-finite embedding component before caching', async t => {
   ]) {
     await t.test(name, async () => {
       const loader = embeddingLoader({
-        shape: [1, 2],
-        chunks: [1, 2],
-        values: [value, 0],
-        nObs: 1
+        shape: [2, 2],
+        chunks: [2, 2],
+        values: [0, 0, value, 1],
+        nObs: 2
       });
-      await assert.rejects(
-        loader.getEmbedding('X_umap_2d'),
-        /embedding.*X_umap_2d.*non-finite.*component/i
+      const adapter = await adapterWithDescribedObsm(loader);
+      const error = await adapter
+        .getEmbeddingForRef({ key: 'X_umap_2d', columns: [0, 1] })
+        .then(() => null, rejection => rejection);
+      assert.ok(error instanceof EmbeddingLoadError);
+      assert.equal(
+        error.message,
+        `Embedding 'X_umap_2d' cannot be plotted: ${
+          name === 'NaN' ? 'NaN' : value > 0 ? 'Infinity' : '-Infinity'
+        } at cell 1.`
       );
-      assert.equal(loader._cache.has('obsm:X_umap_2d'), false);
+      assert.equal(adapter._embeddingCache.size, 0);
+      assert.equal(adapter._normInfo.size, 0);
     });
   }
 });
 
-test('Zarr releases only the exact requested raw embedding cache entry', () => {
-  const loader = new ZarrLoader();
-  const consumed = {
-    data: Float32Array.from([0, 1]),
-    nDims: 2
+/**
+ * A 3-cell x 4-column obsm array in 2 x 2 chunks whose value is
+ * 10 * row + column, in C or Fortran chunk order.
+ */
+function chunkedObsmLoader({ order = 'C', fill_value = 0, absent = [] } = {}) {
+  const nRows = 3;
+  const width = 4;
+  const [chunkRows, chunkCols] = [2, 2];
+  const meta = metadata({
+    shape: [nRows, width],
+    chunks: [chunkRows, chunkCols],
+    dtype: '<f4',
+    order,
+    fill_value,
+  });
+  const chunkFiles = {};
+  for (let chunkRow = 0; chunkRow < 2; chunkRow++) {
+    for (let chunkColumn = 0; chunkColumn < 2; chunkColumn++) {
+      const key = `${chunkRow}.${chunkColumn}`;
+      if (absent.includes(key)) continue;
+      const values = new Array(chunkRows * chunkCols).fill(0);
+      for (let r = 0; r < chunkRows; r++) {
+        for (let c = 0; c < chunkCols; c++) {
+          const row = chunkRow * chunkRows + r;
+          const column = chunkColumn * chunkCols + c;
+          const value = row < nRows ? 10 * row + column : 0;
+          values[order === 'F' ? c * chunkRows + r : r * chunkCols + c] = value;
+        }
+      }
+      chunkFiles[key] = littleEndianBytes(values, 'setFloat32', 4);
+    }
+  }
+  const loader = arrayLoader('obsm/X_pca', meta, chunkFiles);
+  setCurrentMapping(loader._files, 'obsm');
+  loader._nObs = nRows;
+  const chunkReads = [];
+  const readChunkFile = loader._readChunkFile.bind(loader);
+  loader._readChunkFile = path => {
+    chunkReads.push(path);
+    return readChunkFile(path);
   };
-  const newer = {
-    data: Float32Array.from([2, 3]),
-    nDims: 2
-  };
-  const unrelated = { marker: 'keep' };
-  loader._cache.set('obsm:X_umap_2d', newer);
-  loader._cache.set('obs:group', unrelated);
+  return { loader, chunkReads };
+}
 
-  loader.releaseEmbedding('X_umap_2d', consumed);
-  assert.strictEqual(loader._cache.get('obsm:X_umap_2d'), newer);
+test('Zarr obsm column reads decode only the chunks that hold a selected column', async t => {
+  for (const order of ['C', 'F']) {
+    await t.test(`${order} order, columns in two chunk columns`, async () => {
+      const { loader, chunkReads } = chunkedObsmLoader({ order });
+      assert.deepEqual(
+        Array.from(await loader.readObsmColumns('X_pca', [3, 0])),
+        [3, 0, 13, 10, 23, 20]
+      );
+      assert.deepEqual(chunkReads.sort(), [
+        'obsm/X_pca/0.0',
+        'obsm/X_pca/0.1',
+        'obsm/X_pca/1.0',
+        'obsm/X_pca/1.1',
+      ]);
+    });
 
-  loader.releaseEmbedding('X_umap_2d', newer);
-  assert.equal(loader._cache.has('obsm:X_umap_2d'), false);
-  assert.strictEqual(loader._cache.get('obs:group'), unrelated);
+    await t.test(`${order} order, columns in one chunk column`, async () => {
+      const { loader, chunkReads } = chunkedObsmLoader({ order });
+      assert.deepEqual(
+        Array.from(await loader.readObsmColumns('X_pca', [2, 3])),
+        [2, 3, 12, 13, 22, 23]
+      );
+      assert.deepEqual(chunkReads.sort(), ['obsm/X_pca/0.1', 'obsm/X_pca/1.1']);
+    });
+  }
+
+  await t.test('an absent chunk reads as its fill value', async () => {
+    const { loader } = chunkedObsmLoader({ fill_value: 5, absent: ['1.1'] });
+    assert.deepEqual(
+      Array.from(await loader.readObsmColumns('X_pca', [1, 3])),
+      [1, 3, 11, 13, 21, 5]
+    );
+  });
+
+  await t.test('an absent chunk with no fill value is refused', async () => {
+    const { loader } = chunkedObsmLoader({ fill_value: null, absent: ['1.1'] });
+    await assert.rejects(
+      loader.readObsmColumns('X_pca', [1, 3]),
+      /obsm\['X_pca'\] has an absent chunk while fill_value is null/
+    );
+  });
 });
 
-test('Zarr adapter enforces the raw plus normalized coordinate ceiling and releases the loader cache', async () => {
-  const loader = embeddingLoader({
-    shape: [1, 2],
-    chunks: [1, 2],
-    values: [0, 1],
-    nObs: 1
-  });
-  const adapter = new BaseAnnDataAdapter(loader, {
-    maxMaterializedBytes: 8
-  });
-  adapter._metadata = {
-    embeddings: {
-      obsm_keys: { '2d': 'X_umap_2d' }
-    }
+test('Zarr mapping probes describe every element from metadata, with the catalog reasons', async () => {
+  const files = new Map();
+  const json = value => memoryFile(JSON.stringify(value));
+  const denseArray = (path, shape, dtype = '<f4', extra = {}) => {
+    const meta = metadata({ shape, chunks: shape.map(size => Math.max(1, size)), dtype, ...extra });
+    files.set(`${path}/.zarray`, json(meta));
+    setCurrentArrayAttrs(files, path, meta);
   };
-  adapter._embeddingKeysByDimension = {
-    '2d': 'X_umap_2d'
+  const sparse = (path, shape, nnz, dtype = '<f4') => {
+    setCurrentGroup(files, path, {
+      'encoding-type': 'csr_matrix',
+      'encoding-version': '0.1.0',
+      shape,
+    });
+    files.set(`${path}/data/.zarray`, json(metadata({ shape: [nnz], chunks: [Math.max(1, nnz)], dtype })));
   };
-  let normalizationCalls = 0;
-  const normalize = adapter._normalizeEmbedding.bind(adapter);
-  adapter._normalizeEmbedding = (...args) => {
-    normalizationCalls++;
-    return normalize(...args);
+  const dataframe = (path, rows, columnOrder = []) => {
+    setCurrentGroup(files, path, {
+      'encoding-type': 'dataframe',
+      'encoding-version': '0.2.0',
+      _index: '_index',
+      'column-order': columnOrder,
+    });
+    denseArray(`${path}/_index`, [rows], '|O', { filters: [{ id: 'vlen-utf8' }] });
   };
 
-  await assert.rejects(
-    adapter.getEmbedding(2),
-    /embedding.*8-byte browser limit.*current coordinate results/i
+  denseArray('X', [3, 1]);
+  dataframe('var', 1, ['gene_symbols', 'score']);
+  denseArray('var/gene_symbols', [1], '|O', { filters: [{ id: 'vlen-utf8' }] });
+  denseArray('var/score', [1]);
+  setCurrentMapping(files, 'obsm');
+  denseArray('obsm/X_umap', [3, 2]);
+  sparse('obsm/X_sparse', [3, 5], 4);
+  dataframe('obsm/X_df', 3);
+  denseArray('obsm/pseudotime', [3], '<i4');
+  denseArray('obsm/labels', [3], '|O', { filters: [{ id: 'vlen-utf8' }] });
+  denseArray('obsm/flags', [3, 2], '|b1');
+  setCurrentMapping(files, 'obsp');
+  sparse('obsp/connectivities', [3, 3], 2);
+  denseArray('obsp/distances', [3, 2]);
+  setCurrentMapping(files, 'layers');
+  sparse('layers/counts', [3, 1], 1, '<i4');
+  denseArray('layers/wide', [3, 2]);
+  sparse('raw/X', [3, 4], 0);
+  dataframe('raw/var', 4);
+
+  const loader = new ZarrLoader();
+  loader._files = files;
+  loader._rootName = 'probes.zarr';
+  loader._nObs = 3;
+  loader._nVars = 1;
+  let chunkReads = 0;
+  loader._readChunkFile = async () => {
+    chunkReads++;
+    throw new Error('probes must not read chunks');
+  };
+
+  const described = describeAnnDataProbes(await loader.probeMapping());
+  assert.equal(chunkReads, 0);
+  // A Zarr store lists its children in code-point order.
+  assert.deepEqual(
+    described.obsm.map(({ key, storage, shape, dtype, usable, reason }) =>
+      [key, storage, shape, dtype, usable, reason]),
+    [
+      ['X_df', 'dataframe', [3, 0], 'object', false, 'obsm table, not an array'],
+      ['X_sparse', 'csr', [3, 5], 'float32', false, 'sparse obsm arrays cannot be plotted'],
+      ['X_umap', 'dense', [3, 2], 'float32', true, null],
+      ['flags', 'dense', [3, 2], 'bool', false, 'not a numeric array'],
+      ['labels', 'dense', [3], 'string', false, 'not a numeric array'],
+      ['pseudotime', 'dense', [3], 'int32', true, null],
+    ]
   );
-  assert.equal(normalizationCalls, 0);
-  assert.equal(loader._cache.has('obsm:X_umap_2d'), false);
-  assert.equal(adapter._coordinateCacheBytes, 0n);
+  assert.deepEqual(
+    described.obsp.map(({ key, storage, nnz, usable, reason }) =>
+      [key, storage, nnz, usable, reason]),
+    [
+      ['connectivities', 'csr', 2, true, null],
+      ['distances', 'dense', null, false, 'not square'],
+    ]
+  );
+  assert.deepEqual(described.var, {
+    n_vars: 1,
+    columns: [
+      { key: 'gene_symbols', dtype: 'string', usable: true, reason: null },
+      { key: 'score', dtype: 'float32', usable: false, reason: 'floating-point values cannot name genes' },
+    ],
+  });
+  assert.deepEqual(described.X, { storage: 'dense', dtype: 'float32' });
+  assert.deepEqual(
+    described.layers.map(({ key, dtype, usable, reason }) => [key, dtype, usable, reason]),
+    [
+      ['counts', 'int32', true, null],
+      ['wide', 'float32', false, 'has shape 3 x 2, expected 3 x 1'],
+    ]
+  );
+  assert.deepEqual(described.raw, {
+    n_vars: 4,
+    X: { storage: 'csr', dtype: 'float32' },
+    var: { columns: [] },
+  });
+});
+
+test('Zarr obsm column reads return fresh arrays the loader does not retain', async () => {
+  const loader = embeddingLoader();
+  const first = await loader.readObsmColumns('X_umap_2d', [0, 1]);
+  const second = await loader.readObsmColumns('X_umap_2d', [0, 1]);
+  assert.ok(first instanceof Float64Array);
+  assert.deepEqual(Array.from(first), [0, 0, 2, 4]);
+  assert.notStrictEqual(first, second);
+  first[0] = 99;
+  assert.equal(second[0], 0);
+  assert.equal(loader._cache.size, 0);
+});
+
+test('Zarr adapter loads an embedding whose raw plus normalized peak exceeds its cache budget', async () => {
+  const loader = embeddingLoader();
+  // 16 bytes hold the normalized Float32 result, not the Float64 read alive
+  // while it is produced: the budget is a policy, so it still loads.
+  const adapter = await adapterWithDescribedObsm(loader, {
+    cacheBudgetBytes: 16
+  });
+  const embedding = await adapter.getEmbeddingForRef({ key: 'X_umap_2d', columns: [0, 1] });
+  assert.ok(embedding instanceof Float32Array);
   assert.equal(adapter._coordinateReservedOutputBytes, 0n);
 });
 
@@ -2609,19 +2658,7 @@ test('rejects finite Float32 fill overflow while preserving explicit infinity', 
   );
 });
 
-test('caps cumulative decoded string storage rather than only pointer count', () => {
-  assert.equal(typeof zarrCodecs.accountZarrStringStorage, 'function');
-  const oneMiB = 'x'.repeat(1024 * 1024);
-  assert.throws(
-    () => zarrCodecs.accountZarrStringStorage(
-      0,
-      new Array(257).fill(oneMiB)
-    ),
-    /string array.*browser limit/i
-  );
-});
-
-test('preflights sparse component dtypes and aggregate working memory', () => {
+test('sparse components are checked for kind and length, never for size', () => {
   assert.equal(typeof zarrModule.validateSparseArrayContract, 'function');
 
   assert.throws(
@@ -2635,27 +2672,14 @@ test('preflights sparse component dtypes and aggregate working memory', () => {
     /indices.*integer dtype/i
   );
 
-  assert.throws(
+  assert.doesNotThrow(
     () => zarrModule.validateSparseArrayContract({
       format: 'csr',
       shape: [50_000_000, 50_000_000],
-      dataMeta: metadata({
-        shape: [50_000_000],
-        chunks: [1000],
-        dtype: '<f4'
-      }),
-      indicesMeta: metadata({
-        shape: [50_000_000],
-        chunks: [1000],
-        dtype: '<i4'
-      }),
-      indptrMeta: metadata({
-        shape: [50_000_001],
-        chunks: [1000],
-        dtype: '<i4'
-      })
-    }),
-    /sparse.*working set.*browser limit/i
+      dataMeta: metadata({ shape: [500_000_000], chunks: [1_000_000], dtype: '<f4' }),
+      indicesMeta: metadata({ shape: [500_000_000], chunks: [1_000_000], dtype: '<i4' }),
+      indptrMeta: metadata({ shape: [50_000_001], chunks: [1_000_000], dtype: '<i8' })
+    })
   );
 });
 
@@ -2816,11 +2840,17 @@ test('rejects X dimensions that disagree with obs or var, including zero axes', 
   }
 });
 
-test('rejects duplicate var names instead of silently selecting the last column', async () => {
-  await assert.rejects(
-    denseStructureLoader({ varNames: ['A', 'A'] })._readStructure(),
-    /duplicate.*var.*A.*var_names_make_unique/i
-  );
+test('keeps duplicate var names as stored for the adapter to make unique', async () => {
+  // The loader no longer refuses a repeated var name: the adapter makes the
+  // gene list unique with the data-mapping rule (`makeUniqueNames`), so each
+  // name still selects exactly one column by position.
+  const loader = denseStructureLoader({ varNames: ['A', 'A'] });
+  await loader._readStructure();
+  assert.equal(loader.nVars, 2);
+  assert.deepEqual(loader.varNames, ['A', 'A']);
+  const names = await loader.readVarNames('X', null);
+  assert.deepEqual([...names.index], ['A', 'A']);
+  assert.deepEqual([...names.values], ['A', 'A']);
 });
 
 test('requires canonical AnnData Zarr root identity without replacing working data', async t => {
@@ -2910,11 +2940,11 @@ test('requires canonical AnnData Zarr root identity without replacing working da
       );
       assert.equal(loader._rootName, 'working.zarr');
       assert.deepEqual(
-        Array.from((await loader.getEmbedding('X_umap_2d')).data),
+        Array.from(await loader.readObsmColumns('X_umap_2d', [0, 1])),
         [0, 0, 2, 4]
       );
       assert.deepEqual(
-        Array.from(await loader.getGeneExpression('A')),
+        Array.from(await geneColumnByName(loader, 'A')),
         [1, 3]
       );
     });
@@ -2992,7 +3022,7 @@ test('requires exact AnnData mapping identity before enumerating obsm', async t 
       );
       assert.equal(loader._rootName, 'working.zarr');
       assert.deepEqual(
-        Array.from((await loader.getEmbedding('X_umap_2d')).data),
+        Array.from(await loader.readObsmColumns('X_umap_2d', [0, 1])),
         [0, 0, 2, 4]
       );
     });
@@ -3158,11 +3188,11 @@ test('requires the canonical AnnData obs dataframe contract without replacing wo
       );
       assert.equal(loader._rootName, 'working.zarr');
       assert.deepEqual(
-        Array.from((await loader.getEmbedding('X_umap_2d')).data),
+        Array.from(await loader.readObsmColumns('X_umap_2d', [0, 1])),
         [0, 0, 2, 4]
       );
       assert.deepEqual(
-        Array.from(await loader.getGeneExpression('A')),
+        Array.from(await geneColumnByName(loader, 'A')),
         [1, 3]
       );
     });
@@ -3309,11 +3339,11 @@ test('validates every observation column declared by column-order before adoptio
       );
       assert.equal(loader._rootName, 'working.zarr');
       assert.deepEqual(
-        Array.from((await loader.getEmbedding('X_umap_2d')).data),
+        Array.from(await loader.readObsmColumns('X_umap_2d', [0, 1])),
         [0, 0, 2, 4]
       );
       assert.deepEqual(
-        Array.from(await loader.getGeneExpression('A')),
+        Array.from(await geneColumnByName(loader, 'A')),
         [1, 3]
       );
     });
@@ -3490,11 +3520,11 @@ test('requires the canonical AnnData var dataframe contract without replacing wo
       );
       assert.equal(loader._rootName, 'working.zarr');
       assert.deepEqual(
-        Array.from((await loader.getEmbedding('X_umap_2d')).data),
+        Array.from(await loader.readObsmColumns('X_umap_2d', [0, 1])),
         [0, 0, 2, 4]
       );
       assert.deepEqual(
-        Array.from(await loader.getGeneExpression('A')),
+        Array.from(await geneColumnByName(loader, 'A')),
         [1, 3]
       );
     });
@@ -3619,11 +3649,11 @@ test('validates every variable column declared by column-order before adoption',
       );
       assert.equal(loader._rootName, 'working.zarr');
       assert.deepEqual(
-        Array.from((await loader.getEmbedding('X_umap_2d')).data),
+        Array.from(await loader.readObsmColumns('X_umap_2d', [0, 1])),
         [0, 0, 2, 4]
       );
       assert.deepEqual(
-        Array.from(await loader.getGeneExpression('A')),
+        Array.from(await geneColumnByName(loader, 'A')),
         [1, 3]
       );
     });
@@ -3632,8 +3662,8 @@ test('validates every variable column declared by column-order before adoption',
 
 test('public Zarr loading rejects X with no canonical var and preserves the working source', async () => {
   const notifications = getNotificationCenter();
-  const originalWarning = notifications.warning;
-  notifications.warning = () => 'warning';
+  const originalWarning = notifications.info;
+  notifications.info = () => 'warning';
 
   const source = new ZarrDataSource();
   try {
@@ -3705,16 +3735,18 @@ test('public Zarr loading rejects X with no canonical var and preserves the work
     assert.equal(source.dirname, 'working.zarr');
     assert.equal(source.getAdapter(), workingAdapter);
     assert.deepEqual(
-      Array.from(await source.getGeneExpression('A')),
+      Array.from(await sourceGeneValuesByName(source, 'A')),
       [1, 2]
     );
     assert.deepEqual(
-      Array.from(await source.getEmbedding(2)),
+      Array.from(
+        await source.getAdapter().getEmbeddingPayload('embeddings/0_2d.bin', 2)
+      ),
       [-1, -1, 1, 1]
     );
   } finally {
     source.clear();
-    notifications.warning = originalWarning;
+    notifications.info = originalWarning;
   }
 });
 
@@ -3901,7 +3933,7 @@ test('propagates malformed connectivity and enforces obs-aligned square shape', 
       indptr: [0, 1, 1]
     });
     await assert.rejects(
-      loader.getConnectivities(),
+      loader.getConnectivities('connectivities'),
       /data.*indices.*length/i
     );
   });
@@ -3914,7 +3946,7 @@ test('propagates malformed connectivity and enforces obs-aligned square shape', 
       indptr: [0, 1, 1, 1]
     }, 2);
     await assert.rejects(
-      loader.getConnectivities(),
+      loader.getConnectivities('connectivities'),
       /connectivity.*shape.*3.*2 cells/i
     );
   });
@@ -3922,7 +3954,10 @@ test('propagates malformed connectivity and enforces obs-aligned square shape', 
   await t.test('adapter propagation', async () => {
     const adapter = new BaseAnnDataAdapter({
       nObs: 2,
-      async getConnectivities() {
+      async getConnectivityEdges() {
+      return connectivityEdgesOf(await this.readConnectivityMatrix(), this.nObs);
+    },
+    async readConnectivityMatrix() {
         throw new Error('malformed connectivity payload');
       }
     });
@@ -3933,72 +3968,49 @@ test('propagates malformed connectivity and enforces obs-aligned square shape', 
   });
 });
 
-test('public Zarr loading requires explicit UMAP and never substitutes another embedding', async t => {
+test('public Zarr loading best-guesses a file without a UMAP and records the guess', async t => {
   const notifications = getNotificationCenter();
-  const originalWarning = notifications.warning;
-  notifications.warning = () => 'warning';
+  const originalWarning = notifications.info;
+  notifications.info = () => 'warning';
+
+  function renamedEmbeddingStore(key) {
+    const store = completeZarrStoreFiles({
+      embeddingValues: [9, 9, 10, 10],
+      geneValues: [9, 0, 10, 0]
+    });
+    for (const file of ['.zarray', '.zattrs', '0.0']) {
+      store.set(`obsm/${key}/${file}`, store.get(`obsm/X_umap_2d/${file}`));
+      store.delete(`obsm/X_umap_2d/${file}`);
+    }
+    return store;
+  }
 
   try {
     for (const substituteKey of ['X_pca', 'X_tsne', 'X_phate']) {
       await t.test(substituteKey, async () => {
         const source = new ZarrDataSource();
         try {
-          await source.loadFromFileList(
+          const identity = await source.loadFromFileList(
             fileListFromMap(
-              completeZarrStoreFiles({
-                embeddingValues: [0, 0, 1, 1],
-                geneValues: [1, 0, 2, 0]
-              }),
-              'working.zarr'
+              renamedEmbeddingStore(substituteKey),
+              `${substituteKey.slice(2)}-only.zarr`
             ),
             { showProgress: false }
           );
-          const workingAdapter = source.getAdapter();
-
-          const replacement = completeZarrStoreFiles({
-            embeddingValues: [9, 9, 10, 10],
-            geneValues: [9, 0, 10, 0]
+          const candidates = source.getAdapter().getMappingCandidates();
+          assert.deepEqual(candidates.guessed, ['embeddings.2d']);
+          assert.deepEqual(candidates.defaults.embeddings.defaults['2d'], {
+            key: substituteKey,
+            columns: [0, 1]
           });
-          const embeddingMeta =
-            replacement.get('obsm/X_umap_2d/.zarray');
-          const embeddingAttrs =
-            replacement.get('obsm/X_umap_2d/.zattrs');
-          const embeddingChunk =
-            replacement.get('obsm/X_umap_2d/0.0');
-          replacement.delete('obsm/X_umap_2d/.zarray');
-          replacement.delete('obsm/X_umap_2d/.zattrs');
-          replacement.delete('obsm/X_umap_2d/0.0');
-          replacement.set(
-            `obsm/${substituteKey}/.zarray`,
-            embeddingMeta
-          );
-          replacement.set(
-            `obsm/${substituteKey}/.zattrs`,
-            embeddingAttrs
-          );
-          replacement.set(
-            `obsm/${substituteKey}/0.0`,
-            embeddingChunk
-          );
-
-          await assert.rejects(
-            source.loadFromFileList(
-              fileListFromMap(
-                replacement,
-                `${substituteKey.slice(2)}-only.zarr`
-              ),
-              { showProgress: false }
+          assert.deepEqual(candidates.defaults.embeddings.enabled, [
+            { key: substituteKey, columns: [0, 1] }
+          ]);
+          assert.deepEqual(identity.embeddings.defaults, { '2d': substituteKey });
+          assert.deepEqual(
+            Array.from(
+              await source.getAdapter().getEmbeddingPayload('embeddings/0_2d.bin', 2)
             ),
-            /requires a UMAP embedding in obsm/i
-          );
-          assert.equal(source.dirname, 'working.zarr');
-          assert.equal(source.getAdapter(), workingAdapter);
-          assert.deepEqual(
-            Array.from(await source.getGeneExpression('A')),
-            [1, 2]
-          );
-          assert.deepEqual(
-            Array.from(await source.getEmbedding(2)),
             [-1, -1, 1, 1]
           );
         } finally {
@@ -4006,78 +4018,102 @@ test('public Zarr loading requires explicit UMAP and never substitutes another e
         }
       });
     }
+
+    await t.test('a file with nothing plottable is refused and the working source kept', async () => {
+      const source = new ZarrDataSource();
+      try {
+        await source.loadFromFileList(
+          fileListFromMap(
+            completeZarrStoreFiles({
+              embeddingValues: [0, 0, 1, 1],
+              geneValues: [1, 0, 2, 0]
+            }),
+            'working.zarr'
+          ),
+          { showProgress: false }
+        );
+        const workingAdapter = source.getAdapter();
+        const constant = completeZarrStoreFiles({
+          embeddingValues: [3, 3, 3, 3],
+          geneValues: [9, 0, 10, 0]
+        });
+        for (const file of ['.zarray', '.zattrs', '0.0']) {
+          constant.set(`obsm/X_spatial/${file}`, constant.get(`obsm/X_umap_2d/${file}`));
+          constant.delete(`obsm/X_umap_2d/${file}`);
+        }
+        const error = await source.loadFromFileList(
+          fileListFromMap(constant, 'constant.zarr'),
+          { showProgress: false }
+        ).then(() => null, rejection => rejection);
+        assert.equal(error?.code, 'NO_PLOTTABLE_EMBEDDING');
+        assert.equal(
+          error.message,
+          'Cellucid found nothing to plot. It needs an obsm array with one ' +
+          'row per cell (2) and at least one numeric column. obsm holds: ' +
+          'X_spatial (2 × 2, no coordinate variation).'
+        );
+        assert.equal(source.dirname, 'working.zarr');
+        assert.equal(source.getAdapter(), workingAdapter);
+      } finally {
+        source.clear();
+      }
+    });
   } finally {
-    notifications.warning = originalWarning;
+    notifications.info = originalWarning;
   }
 });
 
-test('Zarr metadata resolves suffixed keys, and a plain X_umap by width', async t => {
+test('Zarr slots follow the default rule, and a plain X_umap by width', async t => {
+  async function initialized(loader) {
+    const adapter = new BaseAnnDataAdapter(loader);
+    await adapter.initialize();
+    return adapter;
+  }
+
   await t.test('an unsuffixed X_umap array is read at its own column count', async () => {
-    const loader = embeddingLoader({ key: 'X_umap' });
-    const shapeReads = [];
-    loader.getEmbeddingShape = async key => {
-      shapeReads.push(key);
-      return { shape: [2, 2], nDims: 2 };
-    };
-    loader.hasConnectivities = async () => false;
-
-    const metadata = await loader.getDatasetMetadata();
-    assert.deepEqual(shapeReads, ['X_umap']);
-    assert.deepEqual(metadata.embeddings.available_dimensions, [2]);
-    assert.deepEqual(metadata.embeddings.obsm_keys, { '2d': 'X_umap' });
+    const adapter = await initialized(embeddingLoader({ key: 'X_umap' }));
+    assert.deepEqual(adapter._slots, {
+      '1d': null,
+      '2d': { key: 'X_umap', columns: [0, 1] },
+      '3d': null,
+    });
+    assert.deepEqual(adapter.getMappingCandidates().guessed, []);
   });
 
-  await t.test('an unsuffixed X_umap of an unreadable width is refused', async () => {
-    const loader = embeddingLoader({ key: 'X_umap' });
-    loader.getEmbeddingShape = async () => ({ shape: [2, 10], nDims: 10 });
-
-    await assert.rejects(
-      loader.getDatasetMetadata(),
-      /X_umap_1d.*X_umap_2d.*X_umap_3d/i
-    );
+  await t.test('an unsuffixed X_umap of a width no dimension has is best-guessed at its first columns', async () => {
+    const adapter = await initialized(embeddingLoader({
+      key: 'X_umap',
+      shape: [2, 10],
+      values: Array.from({ length: 20 }, (_, index) => index),
+    }));
+    assert.deepEqual(adapter._slots['2d'], { key: 'X_umap', columns: [0, 1] });
+    assert.deepEqual(adapter.getMappingCandidates().guessed, ['embeddings.2d']);
   });
 
-  await t.test('an explicit key is resolved without alias metadata', async () => {
-    const loader = embeddingLoader({
+  await t.test('dimension-suffixed keys alone fill their slots', async () => {
+    const adapter = await initialized(embeddingLoader({
       extraArrays: [{
         key: 'X_umap',
         shape: [2, 2],
         values: [4, 4, 5, 5],
       }],
-    });
-    const getEmbeddingShape =
-      loader.getEmbeddingShape.bind(loader);
-    const shapeReads = [];
-    loader.getEmbeddingShape = async key => {
-      shapeReads.push(key);
-      return getEmbeddingShape(key);
-    };
-    loader.hasConnectivities = async () => false;
-
-    const metadata = await loader.getDatasetMetadata();
-    assert.deepEqual(shapeReads, ['X_umap_2d']);
-    assert.deepEqual(metadata.embeddings, {
-      available_dimensions: [2],
-      default_dimension: 2,
-      obsm_keys: { '2d': 'X_umap_2d' },
-    });
+    }));
+    assert.deepEqual(adapter._slots['2d'], { key: 'X_umap_2d', columns: [0, 1] });
   });
 
-  await t.test('a malformed explicit key cannot be skipped for another dimension', async () => {
-    const loader = embeddingLoader({
-      key: 'X_umap_2d',
-      shape: [2, 3],
-      values: [0, 0, 0, 1, 1, 1],
-      extraArrays: [{
-        key: 'X_umap_3d',
-        shape: [2, 3],
-        values: [2, 2, 2, 3, 3, 3],
-      }],
-    });
-
+  await t.test('a malformed suffixed key cannot be skipped for another dimension', async () => {
     await assert.rejects(
-      loader.getDatasetMetadata(),
-      /X_umap_2d.*3 columns.*2D suffix/i
+      initialized(embeddingLoader({
+        key: 'X_umap_2d',
+        shape: [2, 3],
+        values: [0, 0, 0, 1, 1, 1],
+        extraArrays: [{
+          key: 'X_umap_3d',
+          shape: [2, 3],
+          values: [2, 2, 2, 3, 3, 3],
+        }],
+      })),
+      /Embedding 'X_umap_2d' must have exactly 2 columns; got 3/
     );
   });
 });
@@ -4087,12 +4123,8 @@ test('centralizes the numeric, rank, width, and observation-axis embedding contr
     [
       'zero columns',
       embeddingLoader({ key: 'X_umap', shape: [2, 0], chunks: [2, 1] }),
-      /embedding.*positive.*columns|embedding.*1.*3/i
-    ],
-    [
-      'wrong rank',
-      embeddingLoader({ key: 'X_umap', shape: [2], chunks: [2] }),
-      /embedding.*two-dimensional/i
+      'has no columns',
+      /reads distinct columns/i
     ],
     [
       'wrong row count',
@@ -4102,7 +4134,8 @@ test('centralizes the numeric, rank, width, and observation-axis embedding contr
         chunks: [1, 2],
         values: [0, 1]
       }),
-      /embedding.*rows.*2 cells/i
+      'has 1 rows, the dataset has 2 cells',
+      /obsm\['X_umap'\] has 1 rows but the dataset has 2 cells/
     ],
     [
       'nonnumeric dtype',
@@ -4111,29 +4144,54 @@ test('centralizes the numeric, rank, width, and observation-axis embedding contr
         shape: [2, 2],
         dtype: '|S1'
       }),
-      /embedding.*encoding-type.*array|embedding.*numeric dtype/i
+      'not a numeric array',
+      /obsm\['X_umap'\].*encoding-type.*array|numeric dtype/i
+    ],
+    [
+      // A boolean is not a coordinate; the H5AD reader refuses the same
+      // content, so the Zarr reader must too.
+      'boolean dtype',
+      embeddingLoader({
+        key: 'X_umap',
+        shape: [2, 2],
+        dtype: '|b1',
+        values: [0, 1, 1, 0]
+      }),
+      'not a numeric array',
+      /obsm\['X_umap'\] must use a numeric dtype/
     ]
   ];
 
-  for (const [name, loader, expectedError] of cases) {
+  for (const [name, loader, listedReason, readError] of cases) {
     await t.test(name, async () => {
-      await assert.rejects(loader.getEmbeddingShape('X_umap'), expectedError);
+      const [entry] = describeAnnDataProbes(await loader.probeMapping()).obsm;
+      assert.equal(entry.usable, false);
+      assert.equal(entry.reason, listedReason);
+      await assert.rejects(loader.readObsmColumns('X_umap', [0, 1]), readError);
     });
   }
 
-  const direct = embeddingLoader({
-    key: 'X_umap',
-    shape: [1, 2],
-    chunks: [1, 2],
-    values: [0, 1]
+  await t.test('a one-dimensional array is one usable column', async () => {
+    const loader = arrayLoader(
+      'obsm/pseudotime',
+      metadata({ shape: [2], chunks: [2], dtype: '<f4' }),
+      { 0: littleEndianBytes([3, 7], 'setFloat32', 4) }
+    );
+    setCurrentMapping(loader._files, 'obsm');
+    loader._nObs = 2;
+    const [entry] = describeAnnDataProbes(await loader.probeMapping()).obsm;
+    assert.deepEqual(
+      [entry.key, entry.shape, entry.usable],
+      ['pseudotime', [2], true]
+    );
+    assert.deepEqual(
+      Array.from(await loader.readObsmColumns('pseudotime', [0])),
+      [3, 7]
+    );
   });
-  await assert.rejects(
-    direct.getEmbedding('X_umap'),
-    /embedding.*rows.*2 cells/i
-  );
 });
 
-test('rejects a dimension-suffixed vector field with the wrong cell axis', async () => {
+test('a dimension-suffixed vector field with the wrong cell axis is listed unusable and never bound', async () => {
   const loader = embeddingLoader({
     extraArrays: [{
       key: 'velocity_umap_2d',
@@ -4142,11 +4200,13 @@ test('rejects a dimension-suffixed vector field with the wrong cell axis', async
     }]
   });
   const adapter = new BaseAnnDataAdapter(loader);
-  await assert.rejects(
-    adapter.initialize(),
-    /velocity_umap_2d.*1 rows.*2 cells/i
-  );
-  assert.equal(adapter.getMetadata(), null);
+  await adapter.initialize();
+  assert.equal(adapter._vectorBindings.size, 0);
+  const entry = adapter.getMappingCandidates().obsm
+    .find(item => item.key === 'velocity_umap_2d');
+  assert.equal(entry.usable, false);
+  assert.equal(entry.reason, 'has 1 rows, the dataset has 2 cells');
+  assert.deepEqual(adapter.getMappingCandidates().defaults.vectorFields, []);
 });
 
 test('extracts exact symmetric CSC connectivity and rejects duplicate coordinates', () => {
@@ -4225,7 +4285,7 @@ test('Zarr connectivity requires exact obsp mapping identity', async t => {
     await t.test(name, async () => {
       const loader = connectivityLoader({ shape: [2, 2] }, 2);
       mutate(loader._files);
-      await assert.rejects(loader.hasConnectivities(), expected);
+      await assert.rejects(loader.hasConnectivities('connectivities'), expected);
     });
   }
 });
@@ -4312,7 +4372,7 @@ test('rejects mixed dense and sparse connectivity representations', async () => 
   );
 
   await assert.rejects(
-    loader.hasConnectivities(),
+    loader.hasConnectivities('connectivities'),
     /exactly one dense or sparse representation/i
   );
 });
@@ -4331,7 +4391,7 @@ test('Zarr preserves exact sparse connectivity weights through extraction', asyn
     indices: [1, 0],
     indptr: [0, 1, 2],
   }, 2);
-  const result = await loader.getConnectivities();
+  const result = await loader.getConnectivities('connectivities');
   assert.equal(result.data instanceof Float64Array, true);
   assert.equal(result.data[0], weighted);
   const edges = extractConnectivityEdges(result, 2);
@@ -4350,7 +4410,6 @@ test('preserves an explicitly present empty connectivity matrix', async () => {
     connLoader._files.set(path, file);
   }
   connLoader._rootName = 'empty-connectivity.zarr';
-  connLoader._obsmKeys = ['X_umap_2d'];
 
   const adapter = new BaseAnnDataAdapter(connLoader);
   await adapter.initialize();
@@ -4366,26 +4425,21 @@ test('preserves an explicitly present empty connectivity matrix', async () => {
 
 test('a later sparse X caller starts clean after an earlier rejected invocation', async () => {
   const loader = new ZarrLoader();
+  loader._files = new Map([['.zattrs', memoryFile('{}')]]);
   loader._nObs = 2;
+  loader._nVars = 1;
   let calls = 0;
-  loader._readSparseMatrix = async () => {
+  loader._openMatrixColumns = async () => {
     calls++;
     if (calls === 1) throw new Error('transient sparse read failure');
-    return {
-      format: 'csc',
-      shape: [2, 1],
-      data: Float32Array.from([4]),
-      indices: Int32Array.from([0]),
-      indptr: Int32Array.from([0, 1]),
-      cscData: null
-    };
+    return { column: () => Float32Array.from([4, 0]) };
   };
 
   await assert.rejects(
-    loader._getSparseColumn(0),
+    readXColumn(loader, 0, { sparse: true }),
     /transient sparse read failure/i
   );
-  assert.deepEqual(Array.from(await loader._getSparseColumn(0)), [4, 0]);
+  assert.deepEqual(Array.from(await readXColumn(loader, 0, { sparse: true })), [4, 0]);
   assert.equal(calls, 2);
 });
 
@@ -4410,8 +4464,8 @@ test('opens and replaces Zarr stores transactionally without stale caches', asyn
     }),
     'first.zarr'
   );
-  assert.deepEqual(Array.from((await loader.getEmbedding('X_umap_2d')).data), [0, 0, 2, 4]);
-  assert.deepEqual(Array.from(await loader.getGeneExpression('A')), [1, 3]);
+  assert.deepEqual(Array.from(await loader.readObsmColumns('X_umap_2d', [0, 1])), [0, 0, 2, 4]);
+  assert.deepEqual(Array.from(await geneColumnByName(loader, 'A')), [1, 3]);
 
   await loader.openFileMap(
     completeZarrStoreFiles({
@@ -4421,10 +4475,10 @@ test('opens and replaces Zarr stores transactionally without stale caches', asyn
     'second.zarr'
   );
   assert.deepEqual(
-    Array.from((await loader.getEmbedding('X_umap_2d')).data),
+    Array.from(await loader.readObsmColumns('X_umap_2d', [0, 1])),
     [10, 20, 30, 40]
   );
-  assert.deepEqual(Array.from(await loader.getGeneExpression('A')), [5, 7]);
+  assert.deepEqual(Array.from(await geneColumnByName(loader, 'A')), [5, 7]);
 
   await assert.rejects(
     loader.openFileMap(malformed, 'replacement.zarr'),
@@ -4432,13 +4486,13 @@ test('opens and replaces Zarr stores transactionally without stale caches', asyn
   );
   assert.equal(loader.isOpen, true);
   assert.deepEqual(
-    Array.from((await loader.getEmbedding('X_umap_2d')).data),
+    Array.from(await loader.readObsmColumns('X_umap_2d', [0, 1])),
     [10, 20, 30, 40]
   );
-  assert.deepEqual(Array.from(await loader.getGeneExpression('A')), [5, 7]);
+  assert.deepEqual(Array.from(await geneColumnByName(loader, 'A')), [5, 7]);
 });
 
-test('rejects categorical dictionaries that would require uint32 buffers', async () => {
+test('a categorical dictionary past 65,535 categories is served with uint32 codes', async () => {
   const categories = Array.from({ length: 65_536 }, (_, index) => `C${index}`);
   const adapter = new BaseAnnDataAdapter({
     nObs: 2,
@@ -4456,14 +4510,11 @@ test('rejects categorical dictionaries that would require uint32 buffers', async
     categories
   }];
 
-  assert.throws(
-    () => adapter.getObsManifest(),
-    /65,536 categories.*at most 65,535.*reduce or merge/i
-  );
-  await assert.rejects(
-    adapter.getObsFieldData('large_category'),
-    /65,536 categories.*at most 65,535.*reduce or merge/i
-  );
+  assert.doesNotThrow(() => adapter.getObsManifest());
+  const payload = await adapter.getObsFieldData('large_category');
+  assert.equal(payload.dtype, 'uint32');
+  assert.equal(payload.missingValue, 4_294_967_295);
+  assert.deepEqual(Array.from(new Uint32Array(payload.data)), [65_535, 4_294_967_295]);
 });
 
 test('loads standard nullable integer and boolean observation groups with missing values', async () => {
@@ -4610,160 +4661,63 @@ test('loads standard nullable integer and boolean observation groups with missin
   assert.deepEqual(Array.from(new Uint8Array(label.data)), [0, 255, 1]);
 });
 
-test('rejects big-endian and temporary-string peaks before allocating chunks', () => {
-  const bigEndian = metadata({
-    shape: [100_000_000],
-    chunks: [16_777_216],
-    dtype: '>f4'
-  });
-  assert.throws(
-    () => zarrCodecs.validateZarrMaterialization(
-      bigEndian,
-      getZarrDtypeInfo(bigEndian.dtype)
-    ),
-    /peak working set.*browser limit/i
+test('connectivity extraction refuses no graph for its size', () => {
+  // The only limit on a graph is the memory the engine grants when the
+  // arrays are allocated; a large graph is never refused by a fixed cap.
+  const source = readFileSync(
+    new URL('../assets/js/data/sparse-utils.js', import.meta.url),
+    'utf8'
   );
-
-  const fixedEdgeChunk = metadata({
-    shape: [1],
-    chunks: [16_000_000],
-    dtype: '|S4',
-    fill_value: ''
-  });
-  assert.throws(
-    () => zarrCodecs.validateZarrMaterialization(
-      fixedEdgeChunk,
-      getZarrDtypeInfo(fixedEdgeChunk.dtype)
-    ),
-    /string array peak working set.*browser limit/i
-  );
-
-  const vlenEdgeChunk = metadata({
-    shape: [1],
-    chunks: [8_000_000],
-    dtype: '|O',
-    filters: [{ id: 'vlen-utf8' }],
-    fill_value: ''
-  });
-  assert.throws(
-    () => zarrCodecs.validateZarrMaterialization(
-      vlenEdgeChunk,
-      getZarrDtypeInfo(vlenEdgeChunk.dtype)
-    ),
-    /string array peak working set.*browser limit/i
-  );
-});
-
-test('preflights dense and sparse connectivity edge storage before payload access', () => {
-  let denseTouched = false;
-  const denseData = new Proxy(
-    {
-      // A plausible 6000×6000 Float64 payload fits with one canonical edge
-      // pair, but not with the additional render-owned pair.
-      length: 36_000_000,
-      byteLength: 288_000_000,
-    },
-    {
-      get(target, property) {
-        if (/^\d+$/.test(String(property))) {
-          denseTouched = true;
-          throw new Error('dense payload touched before capacity validation');
-        }
-        return target[property];
-      }
-    }
-  );
-  assert.throws(
-    () => extractConnectivityEdges({
-      format: 'dense',
-      shape: [6_000, 6_000],
-      data: denseData
-    }, 6_000),
-    /connectivity edge working set.*browser limit/i
-  );
-  assert.equal(denseTouched, false);
-
-  let sparseTouched = false;
-  const sparseIndices = new Proxy(
-    { length: 40_000_000, byteLength: 160_000_000 },
-    {
-      get(target, property) {
-        if (/^\d+$/.test(String(property))) {
-          sparseTouched = true;
-          throw new Error('sparse payload touched before capacity validation');
-        }
-        return target[property];
-      }
-    }
-  );
-  const sparseData = new Proxy(
-    { length: 40_000_000, byteLength: 160_000_000 },
-    {
-      get(target, property) {
-        if (/^\d+$/.test(String(property))) {
-          sparseTouched = true;
-          throw new Error('sparse payload touched before capacity validation');
-        }
-        return target[property];
-      }
-    }
-  );
-  assert.throws(
-    () => extractConnectivityEdges({
-      format: 'csr',
-      shape: [2, 2],
-      data: sparseData,
-      indptr: Int32Array.from([0, 40_000_000, 40_000_000]),
-      indices: sparseIndices
-    }, 2),
-    /connectivity edge working set.*browser limit/i
-  );
-  assert.equal(sparseTouched, false);
+  assert.doesNotMatch(source, /MAX_CONNECTIVITY_WORKING_BYTES|working set exceeds|browser limit/i);
+  // A valid symmetric CSR graph extracts its unique upper-triangle edges.
+  const edges = extractConnectivityEdges({
+    format: 'csr',
+    shape: [3, 3],
+    data: Float32Array.from([1, 1, 2, 2]),
+    indptr: Int32Array.from([0, 1, 3, 4]),
+    indices: Int32Array.from([1, 0, 2, 1]),
+  }, 3);
+  assert.deepEqual(Array.from(edges.sources), [0, 1]);
+  assert.deepEqual(Array.from(edges.destinations), [1, 2]);
 });
 
 test('does not publish an invalidated in-flight sparse matrix into replacement state', async () => {
   const loader = new ZarrLoader();
+  loader._files = new Map([['.zattrs', memoryFile('{}')]]);
   loader._nObs = 1;
+  loader._nVars = 1;
   let resolveOld;
   let calls = 0;
   const oldRead = new Promise(resolve => {
     resolveOld = resolve;
   });
-  loader._readSparseMatrix = async () => {
+  loader._openMatrixColumns = async () => {
     calls++;
     if (calls === 1) return oldRead;
-    return {
-      format: 'csc',
-      shape: [1, 1],
-      data: Float32Array.from([9]),
-      indices: Int32Array.from([0]),
-      indptr: Int32Array.from([0, 1]),
-      cscData: null
-    };
+    return { column: () => Float32Array.from([9]) };
   };
 
-  const oldColumn = loader._getSparseColumn(0);
+  const oldColumn = readXColumn(loader, 0, { sparse: true });
   const staleAssertion = assert.rejects(
     oldColumn,
     /dataset.*(changed|superseded)|superseded.*dataset/i
   );
-  await Promise.resolve();
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const staleState = loader._matrix;
   loader.clearCache();
-  resolveOld({
-    format: 'csc',
-    shape: [1, 1],
-    data: Float32Array.from([7]),
-    indices: Int32Array.from([0]),
-    indptr: Int32Array.from([0, 1]),
-    cscData: null
-  });
+  assert.equal(loader._matrix, null, 'clearing releases the resident matrix');
+  resolveOld({ column: () => Float32Array.from([7]) });
 
   await staleAssertion;
-  assert.deepEqual(Array.from(await loader._getSparseColumn(0)), [9]);
+  assert.equal(staleState.columns, null, 'the stale load is not published');
+  assert.deepEqual(Array.from(await readXColumn(loader, 0, { sparse: true })), [9]);
+  assert.notStrictEqual(loader._matrix, staleState);
   assert.equal(calls, 2);
 });
 
-test('rejects integer observation values that Float32 cannot represent exactly', async () => {
+// Both writers store every continuous value as Float32 and round integers
+// above 2^24 to the nearest Float32, so a file read directly reads the same.
+test('integer observation values round to Float32 exactly as the writers export them', async () => {
   const loader = arrayLoader(
     'obs/count',
     metadata({ shape: [1], chunks: [1], dtype: '<i8' }),
@@ -4773,10 +4727,9 @@ test('rejects integer observation values that Float32 cannot represent exactly',
   const adapter = new BaseAnnDataAdapter(loader);
   adapter._obsFieldsMetadata = [{ key: 'count', kind: 'continuous' }];
 
-  await assert.rejects(
-    adapter.getObsFieldData('count'),
-    /observation field.*count.*exactly.*Float32|precision/i
-  );
+  const field = await adapter.getObsFieldData('count');
+  assert.equal(field.kind, 'continuous');
+  assert.deepEqual(Array.from(new Float32Array(field.data)), [16_777_216]);
 });
 
 test('rejects duplicate connectivity coordinates instead of summing them', () => {
@@ -4807,7 +4760,7 @@ test('rejects async results from a superseded Zarr dataset generation', async t 
     oldStore.set('X/0.0', delayed.file);
     await loader.openFileMap(oldStore, 'old-dense.zarr');
 
-    const staleRequest = loader.getGeneExpression('A');
+    const staleRequest = geneColumnByName(loader, 'A');
     const staleAssertion = assert.rejects(staleRequest, supersededPattern);
     await delayed.started;
     await loader.openFileMap(
@@ -4820,7 +4773,7 @@ test('rejects async results from a superseded Zarr dataset generation', async t 
     delayed.release();
 
     await staleAssertion;
-    assert.deepEqual(Array.from(await loader.getGeneExpression('A')), [9, 10]);
+    assert.deepEqual(Array.from(await geneColumnByName(loader, 'A')), [9, 10]);
   });
 
   await t.test('embedding cache', async () => {
@@ -4835,7 +4788,7 @@ test('rejects async results from a superseded Zarr dataset generation', async t 
     oldStore.set('obsm/X_umap_2d/0.0', delayed.file);
     await loader.openFileMap(oldStore, 'old-embedding.zarr');
 
-    const staleRequest = loader.getEmbedding('X_umap_2d');
+    const staleRequest = loader.readObsmColumns('X_umap_2d', [0, 1]);
     const staleAssertion = assert.rejects(staleRequest, supersededPattern);
     await delayed.started;
     await loader.openFileMap(
@@ -4849,7 +4802,7 @@ test('rejects async results from a superseded Zarr dataset generation', async t 
 
     await staleAssertion;
     assert.deepEqual(
-      Array.from((await loader.getEmbedding('X_umap_2d')).data),
+      Array.from(await loader.readObsmColumns('X_umap_2d', [0, 1])),
       [9, 10, 11, 12]
     );
   });
@@ -4861,8 +4814,7 @@ test('rejects async results from a superseded Zarr dataset generation', async t 
     loader._nObs = 1;
     loader._nVars = 1;
     loader._varNames = ['A'];
-    loader._varNameIndex = new Map([['A', 0]]);
-    loader._xIsSparse = true;
+    stubXElement(loader, { sparse: true, nVars: 1 });
 
     let markStarted;
     let releaseOld;
@@ -4873,37 +4825,23 @@ test('rejects async results from a superseded Zarr dataset generation', async t 
       releaseOld = resolve;
     });
     let calls = 0;
-    loader._readSparseMatrix = async () => {
+    loader._openMatrixColumns = async () => {
       calls++;
       if (calls === 1) {
         markStarted();
         return oldRead;
       }
-      return {
-        format: 'csc',
-        shape: [1, 1],
-        data: Float32Array.from([9]),
-        indices: Int32Array.from([0]),
-        indptr: Int32Array.from([0, 1]),
-        cscData: null
-      };
+      return { column: () => Float32Array.from([9]) };
     };
 
-    const staleRequest = loader.getGeneExpression('A');
+    const staleRequest = geneColumnByName(loader, 'A');
     const staleAssertion = assert.rejects(staleRequest, supersededPattern);
     await started;
     loader.clearCache();
-    releaseOld({
-      format: 'csc',
-      shape: [1, 1],
-      data: Float32Array.from([7]),
-      indices: Int32Array.from([0]),
-      indptr: Int32Array.from([0, 1]),
-      cscData: null
-    });
+    releaseOld({ column: () => Float32Array.from([7]) });
 
     await staleAssertion;
-    assert.deepEqual(Array.from(await loader.getGeneExpression('A')), [9]);
+    assert.deepEqual(Array.from(await geneColumnByName(loader, 'A')), [9]);
     assert.equal(calls, 2);
   });
 
@@ -5027,7 +4965,7 @@ test('rejects async results from a superseded Zarr dataset generation', async t 
       return oldMeta;
     };
 
-    const staleRequest = loader.hasConnectivities();
+    const staleRequest = loader.hasConnectivities('connectivities');
     const staleAssertion = assert.rejects(staleRequest, supersededPattern);
     await started;
     loader._files = new Map([['.zattrs', memoryFile('{}')]]);
@@ -5039,7 +4977,7 @@ test('rejects async results from a superseded Zarr dataset generation', async t 
     }));
 
     await staleAssertion;
-    assert.equal(await loader.hasConnectivities(), false);
+    assert.equal(await loader.hasConnectivities('connectivities'), false);
   });
 
   await t.test('connectivity payload cache', async () => {
@@ -5072,7 +5010,7 @@ test('rejects async results from a superseded Zarr dataset generation', async t 
       return oldArray;
     };
 
-    const staleRequest = loader.getConnectivities();
+    const staleRequest = loader.getConnectivities('connectivities');
     const staleAssertion = assert.rejects(staleRequest, supersededPattern);
     await started;
     loader._files = new Map([['.zattrs', memoryFile('{}')]]);
@@ -5083,7 +5021,7 @@ test('rejects async results from a superseded Zarr dataset generation', async t 
     });
 
     await staleAssertion;
-    assert.equal(await loader.getConnectivities(), null);
+    assert.equal(await loader.getConnectivities('connectivities'), null);
   });
 });
 
@@ -5139,17 +5077,7 @@ test('reads official categorical v0.2 layouts with nullable-string categories', 
   loader._nObs = 3;
   loader._nVars = 0;
   loader._obsKeys = ['label'];
-  loader.getDatasetMetadata = async () => ({
-    version: 2,
-    id: 'nullable-categories',
-    name: 'nullable-categories',
-    stats: { n_cells: 3, n_genes: 0 },
-    embeddings: {
-      available_dimensions: [],
-      default_dimension: null,
-      obsm_keys: {}
-    }
-  });
+  stubPlottableObsm(loader, 3);
 
   const adapter = new BaseAnnDataAdapter(loader);
   await adapter.initialize();
@@ -5162,45 +5090,6 @@ test('reads official categorical v0.2 layouts with nullable-string categories', 
   assert.equal(field.kind, 'category');
   assert.deepEqual(field.categories, ['A', 'C']);
   assert.deepEqual(Array.from(new Uint8Array(field.data)), [0, 255, 1]);
-});
-
-test('preflights nullable fields as one working set before reading payloads', async () => {
-  const nObs = 50_000_000;
-  const loader = new ZarrLoader();
-  loader._files = new Map([
-    ['obs/count/.zgroup', memoryFile('{"zarr_format":2}')],
-    ['obs/count/.zattrs', memoryFile(JSON.stringify({
-      'encoding-type': 'nullable-integer',
-      'encoding-version': '0.1.0'
-    }))]
-  ]);
-  loader._nObs = nObs;
-  loader._readAttrs = async path => path === 'obs/count'
-    ? {
-        'encoding-type': 'nullable-integer',
-        'encoding-version': '0.1.0'
-      }
-    : {
-        'encoding-type': 'array',
-        'encoding-version': '0.2.0'
-      };
-  loader._readArrayMeta = async path => metadata({
-    shape: [nObs],
-    chunks: [1_000_000],
-    dtype: path.endsWith('/mask') ? '|b1' : '<i8',
-    fill_value: path.endsWith('/mask') ? false : 0
-  });
-  let payloadTouched = false;
-  loader._readArray = async () => {
-    payloadTouched = true;
-    throw new Error('nullable payload touched before aggregate preflight');
-  };
-
-  await assert.rejects(
-    loader.getObsField('count'),
-    /nullable.*working set.*browser limit/i
-  );
-  assert.equal(payloadTouched, false);
 });
 
 test('accepts a small Blosc-compressed nullable string working set', async () => {
@@ -5298,50 +5187,6 @@ test('reads nullable values and masks without overlapping decoder peaks', async 
 
   assert.equal(overlapped, false);
   assert.deepEqual(field.values, ['A', null]);
-});
-
-test('includes transient strings in the combined nullable working set', async () => {
-  // At this size the string array still fits independently, while its retained
-  // values plus mask and public nullable output exceed the combined ceiling.
-  const nObs = 1_755_000;
-  const loader = new ZarrLoader();
-  loader._files = new Map([
-    ['obs/label/.zgroup', memoryFile('{"zarr_format":2}')],
-    ['obs/label/.zattrs', memoryFile(JSON.stringify({
-      'encoding-type': 'nullable-string-array',
-      'encoding-version': '0.1.0'
-    }))]
-  ]);
-  loader._nObs = nObs;
-  loader._readAttrs = async path => path === 'obs/label'
-    ? {
-        'encoding-type': 'nullable-string-array',
-        'encoding-version': '0.1.0'
-      }
-    : {
-        'encoding-type': path.endsWith('/values')
-          ? 'string-array'
-          : 'array',
-        'encoding-version': '0.2.0'
-      };
-  loader._readArrayMeta = async path => metadata({
-    shape: [nObs],
-    chunks: [nObs],
-    dtype: path.endsWith('/mask') ? '|b1' : '|O',
-    fill_value: path.endsWith('/mask') ? false : 0,
-    filters: path.endsWith('/mask') ? null : [{ id: 'vlen-utf8' }]
-  });
-  let payloadTouched = false;
-  loader._readArray = async () => {
-    payloadTouched = true;
-    throw new Error('nullable string payload touched before aggregate preflight');
-  };
-
-  await assert.rejects(
-    loader.getObsField('label'),
-    /nullable.*working set.*browser limit/i
-  );
-  assert.equal(payloadTouched, false);
 });
 
 test('ignores semantically irrelevant masked nullable integer backing values', async () => {
@@ -5457,9 +5302,9 @@ test('opens official-writer float16 X and embedding through public methods', asy
 
   const loader = new ZarrLoader();
   await loader.openFileMap(files, 'float16-writer.zarr');
-  assert.deepEqual(Array.from(await loader.getGeneExpression('A')), [1, 3]);
+  assert.deepEqual(Array.from(await geneColumnByName(loader, 'A')), [1, 3]);
   assert.deepEqual(
-    Array.from((await loader.getEmbedding('X_umap_2d')).data),
+    Array.from(await loader.readObsmColumns('X_umap_2d', [0, 1])),
     [0, 0, 1, 1]
   );
 });
@@ -5509,35 +5354,20 @@ test('keeps the latest concurrent Zarr open request', async () => {
 
   await firstAssertion;
   assert.equal(loader._rootName, 'second-fast.zarr');
-  assert.deepEqual(Array.from(await loader.getGeneExpression('A')), [9, 10]);
+  assert.deepEqual(Array.from(await geneColumnByName(loader, 'A')), [9, 10]);
 });
 
-test('Zarr low-level directory open is silent when nested and neutral when stale', async t => {
+test('the Zarr reader publishes no notifications and a newer store supersedes an older one', async t => {
   const events = captureDownloadNotifications(t);
   const createStore = values => completeZarrStoreFiles({
     embeddingValues: values,
     geneValues: [1, 0, 2, 0],
   });
 
-  const silent = new ZarrLoader();
-  await silent.open(
-    fileListFromMap(createStore([0, 0, 1, 1]), 'silent.zarr'),
-    { showProgress: false }
-  );
-  assert.deepEqual(events, []);
-
   const direct = new ZarrLoader();
-  await direct.open(
-    fileListFromMap(createStore([0, 0, 1, 1]), 'direct.zarr')
-  );
-  assert.equal(events[0].kind, 'start');
-  assert.equal(events.at(-1).kind, 'complete');
-  assert.equal(
-    events.some(event => event.kind === 'fail' || event.kind === 'dismiss'),
-    false
-  );
+  await direct.openFileMap(createStore([0, 0, 1, 1]), 'direct.zarr');
+  assert.deepEqual(events, [], 'the reader runs in a worker; the data source owns notifications');
 
-  events.length = 0;
   const firstStore = createStore([1, 2, 3, 4]);
   let markStarted;
   let releaseFirst;
@@ -5562,29 +5392,20 @@ test('Zarr low-level directory open is silent when nested and neutral when stale
   });
 
   const overlapping = new ZarrLoader();
-  const older = overlapping.open(
-    fileListFromMap(firstStore, 'older.zarr')
-  );
+  const older = overlapping.openFileMap(firstStore, 'older.zarr');
   const olderAssertion = assert.rejects(older, /superseded/i);
   await firstStarted;
-  await overlapping.open(
-    fileListFromMap(createStore([9, 10, 11, 12]), 'newer.zarr')
-  );
+  await overlapping.openFileMap(createStore([9, 10, 11, 12]), 'newer.zarr');
   releaseFirst();
   await olderAssertion;
-
-  assert.deepEqual(
-    events
-      .filter(event => event.kind !== 'update')
-      .map(event => event.kind),
-    ['start', 'start', 'complete', 'dismiss']
-  );
+  assert.equal(overlapping._rootName, 'newer.zarr');
+  assert.deepEqual(events, []);
 });
 
 test('keeps the latest concurrent ZarrDataSource selection', async () => {
   const notifications = getNotificationCenter();
   const notificationMethods = [
-    'warning',
+    'info',
     'startDownload',
     'updateDownload',
     'completeDownload',
@@ -5594,7 +5415,7 @@ test('keeps the latest concurrent ZarrDataSource selection', async () => {
   const originals = new Map(
     notificationMethods.map(name => [name, notifications[name]])
   );
-  notifications.warning = () => 'warning';
+  notifications.info = () => 'warning';
   notifications.startDownload = () => 'download';
   notifications.updateDownload = () => {};
   notifications.completeDownload = () => {};
@@ -5651,7 +5472,7 @@ test('keeps the latest concurrent ZarrDataSource selection', async () => {
     await firstAssertion;
     assert.equal(source.dirname, 'second-fast.zarr');
     assert.deepEqual(
-      Array.from(await source.getGeneExpression('A')),
+      Array.from(await sourceGeneValuesByName(source, 'A')),
       [9, 10]
     );
   } finally {
@@ -5666,14 +5487,14 @@ test('keeps the latest concurrent ZarrDataSource selection', async () => {
 test('Zarr direct-load warning is published only after successful adoption', async t => {
   captureDownloadNotifications(t);
   const notifications = getNotificationCenter();
-  const originalWarning = notifications.warning;
+  const originalWarning = notifications.info;
   const warnings = [];
-  notifications.warning = (...args) => {
+  notifications.info = (...args) => {
     warnings.push(args);
     return `warning-${warnings.length}`;
   };
   t.after(() => {
-    notifications.warning = originalWarning;
+    notifications.info = originalWarning;
   });
 
   const source = new ZarrDataSource();
@@ -5719,10 +5540,10 @@ test('Zarr direct-load warning is published only after successful adoption', asy
 
 test('ZarrDataSource owns one terminal event across overlapping candidates', async t => {
   const notifications = getNotificationCenter();
-  const originalWarning = notifications.warning;
-  notifications.warning = () => {};
+  const originalWarning = notifications.info;
+  notifications.info = () => {};
   t.after(() => {
-    notifications.warning = originalWarning;
+    notifications.info = originalWarning;
   });
   const events = captureDownloadNotifications(t);
   const firstStore = completeZarrStoreFiles({
@@ -5787,7 +5608,7 @@ test('ZarrDataSource owns one terminal event across overlapping candidates', asy
 test('ZarrDataSource preserves a working source when required embedding bytes are corrupt', async () => {
   const notifications = getNotificationCenter();
   const notificationMethods = [
-    'warning',
+    'info',
     'startDownload',
     'updateDownload',
     'completeDownload',
@@ -5796,7 +5617,7 @@ test('ZarrDataSource preserves a working source when required embedding bytes ar
   const originals = new Map(
     notificationMethods.map(name => [name, notifications[name]])
   );
-  notifications.warning = () => 'warning';
+  notifications.info = () => 'warning';
   notifications.startDownload = () => 'download';
   notifications.updateDownload = () => {};
   notifications.completeDownload = () => {};
@@ -5832,11 +5653,13 @@ test('ZarrDataSource preserves a working source when required embedding bytes ar
     assert.equal(source.dirname, 'working.zarr');
     assert.equal(source.getAdapter(), workingAdapter);
     assert.deepEqual(
-      Array.from(await source.getGeneExpression('A')),
+      Array.from(await sourceGeneValuesByName(source, 'A')),
       [1, 2]
     );
     assert.deepEqual(
-      Array.from(await source.getEmbedding(2)),
+      Array.from(
+        await source.getAdapter().getEmbeddingPayload('embeddings/0_2d.bin', 2)
+      ),
       [-1, -1, 1, 1]
     );
   } finally {
@@ -5847,7 +5670,7 @@ test('ZarrDataSource preserves a working source when required embedding bytes ar
   }
 });
 
-test('rejects non-exact duplicate integer sparse sums', async t => {
+test('duplicate integer sparse coordinates sum in Float32', async t => {
   for (const format of ['csc', 'csr']) {
     await t.test(format.toUpperCase(), async () => {
       const loader = sparseLoader({
@@ -5864,10 +5687,9 @@ test('rejects non-exact duplicate integer sparse sums', async t => {
         indptr: [0, 2]
       });
       loader._nObs = 1;
-      await assert.rejects(
-        loader._getSparseColumn(0),
-        /sparse.*exactly.*Float32|sparse.*precision/i
-      );
+      loader._nVars = 1;
+      const column = await readXColumn(loader, 0, { sparse: true });
+      assert.deepEqual(Array.from(column), [Math.fround(16_777_216 + 1)]);
     });
   }
 });
@@ -5896,4 +5718,45 @@ test('Zarr observation dtype metadata cannot be replaced by value inference', as
     loader.getObsField('score'),
     /dtype|unsupported/i
   );
+});
+
+test('Zarr and H5AD share one value-kind contract for dense X and booleans', async () => {
+  const { validateDenseColumnContract } = zarrModule;
+  assert.throws(
+    () => validateDenseColumnContract(metadata({
+      shape: [2, 2],
+      chunks: [2, 2],
+      dtype: '|b1',
+    })),
+    /Dense X has unsupported dtype: \|b1/
+  );
+  assert.doesNotThrow(() => validateDenseColumnContract(metadata({
+    shape: [2, 2],
+    chunks: [2, 2],
+    dtype: '<f4',
+  })));
+
+  const { decodeAnnDataBoolean } = await import(
+    '../assets/js/data/anndata-value-kinds.js'
+  );
+  for (const [stored, decoded] of [[0, false], [1, true], [false, false], [true, true], [1n, true]]) {
+    assert.equal(decodeAnnDataBoolean(stored, 'bad'), decoded);
+  }
+  for (const corrupt of [2, -1, 255, 0.5, '1', null, Number.NaN]) {
+    assert.throws(() => decodeAnnDataBoolean(corrupt, 'not a boolean'), /not a boolean/);
+  }
+});
+
+test('Zarr does not keep the raw connectivity matrix once it is read', async () => {
+  const loader = connectivityLoader({
+    shape: [2, 2],
+    data: [1, 1],
+    indices: [1, 0],
+    indptr: [0, 1, 2],
+  }, 2);
+  const first = await loader.getConnectivities('connectivities');
+  assert.equal(first.indices.length, 2);
+  for (const [key, value] of loader._cache) {
+    assert.notStrictEqual(value, first, `cache entry "${key}" retains the raw matrix`);
+  }
 });

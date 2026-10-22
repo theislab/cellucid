@@ -16,6 +16,9 @@
  * Provides comprehensive metrics including percentiles, jank detection,
  * standard deviation, and performance budget tracking.
  */
+const OVER_BUDGET_FLAG = 1;
+const JANK_FLAG = 2;
+
 export class PerformanceTracker {
   /**
    * @param {Object} options - Configuration options
@@ -32,6 +35,9 @@ export class PerformanceTracker {
 
     // Circular buffer for O(1) insertions
     this._buffer = new Float64Array(this.maxSamples);
+    // Per-sample jank / over-budget flags, so the window counts can drop a
+    // sample's contribution when it is evicted with its frame time.
+    this._flags = new Uint8Array(this.maxSamples);
     this._head = 0;
     this._count = 0;
 
@@ -48,7 +54,7 @@ export class PerformanceTracker {
     this._min = Infinity;
     this._max = -Infinity;
 
-    // Jank tracking
+    // Jank tracking (counts cover the same rolling window as the samples)
     this._jankFrames = 0;
     this._consecutiveJanks = 0;
     this._maxConsecutiveJanks = 0;
@@ -77,6 +83,7 @@ export class PerformanceTracker {
    */
   reset() {
     this._buffer.fill(0);
+    this._flags.fill(0);
     this._head = 0;
     this._count = 0;
     this._sum = 0;
@@ -125,18 +132,17 @@ export class PerformanceTracker {
     const prevAvg = prevCount > 0 ? this._sum / prevCount : this.targetFrameTime;
     const jankThreshold = prevAvg * this.jankThreshold;
 
-    // Add to circular buffer
-    this._addSample(frameTime);
-
-    // Update budget tracking
-    if (frameTime > this.targetFrameTime) {
-      this._overBudgetFrames++;
-    }
-
+    const isOverBudget = frameTime > this.targetFrameTime;
     // Detect jank using the previous average (before this frame was added)
     const isJank = frameTime > jankThreshold;
+
+    // Add to circular buffer; the window counts follow the samples in it.
+    this._addSample(
+      frameTime,
+      (isOverBudget ? OVER_BUDGET_FLAG : 0) | (isJank ? JANK_FLAG : 0)
+    );
+
     if (isJank) {
-      this._jankFrames++;
       this._consecutiveJanks++;
       this._maxConsecutiveJanks = Math.max(this._maxConsecutiveJanks, this._consecutiveJanks);
     } else {
@@ -175,7 +181,7 @@ export class PerformanceTracker {
    * Add a sample to the circular buffer
    * @private
    */
-  _addSample(frameTime) {
+  _addSample(frameTime, flags) {
     // Track if we need to recalculate min/max
     let needsMinMaxRecalc = false;
 
@@ -184,6 +190,9 @@ export class PerformanceTracker {
       const oldValue = this._buffer[this._head];
       this._sum -= oldValue;
       this._sumSquares -= oldValue * oldValue;
+      const oldFlags = this._flags[this._head];
+      if (oldFlags & OVER_BUDGET_FLAG) this._overBudgetFrames--;
+      if (oldFlags & JANK_FLAG) this._jankFrames--;
 
       // If we're removing the current min or max, we need to recalculate
       // Use small epsilon for floating point comparison
@@ -196,6 +205,9 @@ export class PerformanceTracker {
 
     // Add new value
     this._buffer[this._head] = frameTime;
+    this._flags[this._head] = flags;
+    if (flags & OVER_BUDGET_FLAG) this._overBudgetFrames++;
+    if (flags & JANK_FLAG) this._jankFrames++;
     this._head = (this._head + 1) % this.maxSamples;
 
     // Update cumulative stats

@@ -16,23 +16,24 @@
  */
 
 import { BasePlot, COMMON_HOVER_STYLE, createMinimalPlotly, getPlotlyConfig } from './plot-base.js';
-import { PlotHelpers, getPageColor, PAGE_COLORS } from '../core/plugin-contract.js';
+import { PlotHelpers } from '../core/plugin-contract.js';
 import {
   PLOTLY_2D_SCATTER_TRACE_TYPE,
-  getHeatmapTraceType,
-  requireWebGL2
+  getHeatmapTraceType
 } from './plotly-loader.js';
-import { mean, std, median } from '../shared/number-utils.js';
+import { finiteNumbers, mean, std } from '../shared/number-utils.js';
+import { selectSorted } from '../compute/math-utils.js';
 import { applyLegendPosition } from '../shared/legend-utils.js';
 import { getPlotTheme } from '../shared/plot-theme.js';
 import { escapeHtml } from '../../utils/dom-utils.js';
+import { isPlotlyPrecomputable, plotlyBoxSummary, sortLikePlotly } from './plotly-box-statistics.js';
 
 // Tick-label metrics, in multiples of the tick font size.
 //
 // Plotly measures text after it draws it; a layout has to decide how many
 // labels to ask for before that. These ratios are the conservative estimate the
-// fit uses: `Oswald`/system UI at the analysis tick sizes averages a little
-// under 0.6em per character, and a line of tick text occupies about 1.3em.
+// fit uses: the plot theme's family (`--font-sans`, Inter) at the analysis tick
+// sizes averages a little under 0.6em per character, and a line of tick text occupies about 1.3em.
 const TICK_CHARACTER_WIDTH_RATIO = 0.58;
 const TICK_LINE_HEIGHT_RATIO = 1.3;
 const TICK_LABEL_GAP = 6;
@@ -405,10 +406,12 @@ export class PlotFactory {
       const pd = pageData[i];
       const color = BasePlot.getPageColor(layoutEngine, pd.pageId, i);
 
-      // Optionally pre-filter to numeric values
+      // Optionally pre-filter to finite values. A page whose values are all
+      // finite is passed through as is — typed, not copied into a boxed
+      // array — and a builder that hands values to Plotly converts them there.
       let values = pd.values;
       if (filterNumeric) {
-        values = BasePlot.filterNumeric(pd.values);
+        values = finiteNumbers(pd.values);
         if (values.length < minValues) continue;
       }
 
@@ -441,9 +444,15 @@ export class PlotFactory {
    * @param {Object} config.pd - Page data
    * @param {string} config.color - Page color
    * @param {Object} config.options - Plot options
+   * @param {import('./plotly-box-statistics.js').PlotlyBoxSummary|null} [config.boxSummary]
+   *   The page's box statistics and drawn points, already computed for these
+   *   options (by an analysis worker for a large page); computed here when null
+   * @param {{sorted: Float64Array, kde: Object|null}|null} [config.violinInput]
+   *   A violin's values in Plotly's sort order and its precomputed density
+   *   (plotly-violin-density.js); Plotly sorts and sums them itself when null
    * @returns {Object|null} Plotly trace object or null if empty
    */
-  static buildDistributionTrace({ type, pd, color, options }) {
+  static buildDistributionTrace({ type, pd, color, options, boxSummary = null, violinInput = null }) {
     const {
       orientation = 'vertical',
       showPoints = 'outliers',
@@ -452,7 +461,7 @@ export class PlotFactory {
       showGrid = true
     } = options;
 
-    const numericValues = BasePlot.filterNumeric(pd.values);
+    const numericValues = finiteNumbers(pd.values);
     if (numericValues.length === 0) return null;
 
     const isVertical = orientation === 'vertical';
@@ -462,11 +471,34 @@ export class PlotFactory {
     // legend name and in category axis tick labels, so escape before display.
     const safePageName = escapeHtml(pd.pageName);
 
+    // When a box draws points, Plotly is given the box statistics and only the
+    // points it draws instead of every value: its per-value box calc is most of
+    // a large page's render time, and the precomputed calcdata draws the same
+    // box (see plotly-box-statistics.js). Plotly's precomputed mode differs
+    // from its raw-value mode in two places, so those boxes are still computed
+    // by Plotly from the values, as is every violin: without points it reports
+    // the fences as the minimum and maximum, and with notches it widens the
+    // minimum and maximum to the notch. A box whose rounding put the median
+    // outside the quartiles is refused by precomputed mode altogether.
+    let boxStatistics = null;
+    if (type === 'box' && showPoints !== 'none' && !options.notched) {
+      const statistics = boxSummary ?? plotlyBoxSummary(numericValues, showPoints);
+      if (isPlotlyPrecomputable(statistics)) boxStatistics = statistics;
+    }
+    const valueAxis = isVertical ? 'y' : 'x';
+    const positionAxis = isVertical ? 'x' : 'y';
+
+    // A box or violin sits at its page name on the category axis. A raw-value
+    // trace states that once (`x0`/`y0`) rather than as a position array
+    // repeating the name for every value: Plotly fills the same positions
+    // from it and types the axis from the same name, without a per-value
+    // string array or its per-value category lookup.
     const trace = {
       type,
       name: safePageName,
-      [isVertical ? 'y' : 'x']: numericValues,
-      [isVertical ? 'x' : 'y']: new Array(numericValues.length).fill(safePageName),
+      ...(boxStatistics === null
+        ? { [`${positionAxis}0`]: safePageName }
+        : { [positionAxis]: [safePageName] }),
       marker: {
         color,
         size: markerSize,
@@ -479,12 +511,54 @@ export class PlotFactory {
       hoverlabel: COMMON_HOVER_STYLE
     };
 
+    if (violinInput !== null) {
+      // The same values in the order Plotly's calc sorts them, with the
+      // density it would sum for them (read back by the vendored makeKDE).
+      trace[valueAxis] = violinInput.sorted;
+      if (violinInput.kde !== null) trace._precomputedKDE = violinInput.kde;
+      // And the calcdata entry its box calc would build from them, which the
+      // vendored violin calc then takes instead of a record per value. Every
+      // value is still drawn when all points are shown, so that mode keeps
+      // Plotly's own calc.
+      if (showPoints !== 'all') {
+        const { pts, ...box } = violinInput.box;
+        trace._precomputedViolin = {
+          sorted: violinInput.sorted,
+          box,
+          // Plotly writes drawing state onto its point records: each trace
+          // gets its own.
+          pts: showPoints === 'outliers' ? pts.map(({ v, i }) => ({ v, i })) : []
+        };
+      }
+    } else if (boxStatistics === null) {
+      // Plotly's raw-value calc sorts the values through a comparator; handed
+      // them already in its own order (sortLikePlotly, linear time) that sort
+      // is one pass, and the statistics and drawn points are the same. A
+      // notched box concatenates its values, so they go as a plain array.
+      trace[valueAxis] = Array.from(sortLikePlotly(numericValues));
+    } else {
+      // Points ride as one row per box. An empty row would read as a 1-D
+      // array and hide the box, so a box with nothing to draw sends none.
+      const { points } = boxStatistics;
+      if (points.length > 0) trace[valueAxis] = [points];
+    }
+
     if (!isVertical) {
       trace.orientation = 'h';
     }
 
     // Box-specific options
     if (type === 'box') {
+      if (boxStatistics !== null) {
+        trace.q1 = [boxStatistics.q1];
+        trace.median = [boxStatistics.median];
+        trace.q3 = [boxStatistics.q3];
+        trace.lowerfence = [boxStatistics.lowerfence];
+        trace.upperfence = [boxStatistics.upperfence];
+        trace.mean = [boxStatistics.mean];
+        trace.sd = [boxStatistics.sd];
+        trace.notchspan = [boxStatistics.notchspan];
+      }
       trace.boxpoints = showPoints === 'none' ? false : showPoints;
       trace.jitter = jitterValue;
       trace.pointpos = 0;
@@ -812,7 +886,7 @@ export class PlotFactory {
     const columns = ['page', 'n', 'min', 'q1', 'median', 'q3', 'max', 'mean', 'std', 'iqr'];
 
     for (const pd of pageData) {
-      const values = BasePlot.filterNumeric(pd.values);
+      const values = finiteNumbers(pd.values);
 
       if (values.length === 0) {
         rows.push({
@@ -824,14 +898,17 @@ export class PlotFactory {
         continue;
       }
 
-      // Use centralized statistics utilities
-      const sorted = [...values].sort((a, b) => a - b);
-      const n = sorted.length;
-      const minVal = sorted[0];
-      const maxVal = sorted[n - 1];
-      const q1 = sorted[Math.floor(n * 0.25)];
-      const q3 = sorted[Math.floor(n * 0.75)];
-      const medianVal = median(values);
+      // Every order statistic — the median's two middle positions included —
+      // comes from one linear-time selection over the page.
+      const n = values.length;
+      const middle = Math.floor(n / 2);
+      const [minVal, q1, q3, maxVal, lowerMiddle, upperMiddle] = selectSorted(values, [
+        0, Math.floor(n * 0.25), Math.floor(n * 0.75), n - 1,
+        n % 2 === 0 ? middle - 1 : middle, middle
+      ]);
+      const medianVal = n % 2 === 0
+        ? (lowerMiddle + upperMiddle) / 2
+        : upperMiddle;
       const meanVal = mean(values);
       const stdVal = std(values);
       const iqr = q3 - q1;
@@ -875,13 +952,10 @@ export class PlotFactory {
 
     // If categories not provided, derive from data
     if (!categories) {
-      const globalCounts = new Map();
-      for (const pd of pageData) {
-        for (const value of pd.values) {
-          globalCounts.set(value, (globalCounts.get(value) || 0) + 1);
-        }
-      }
-      categories = PlotHelpers.sortCategories(globalCounts, options.sortBy || 'count');
+      categories = PlotHelpers.sortCategories(
+        PlotFactory.mergedCategoryCounts(pageData),
+        options.sortBy || 'count'
+      );
     }
 
     const rows = [];
@@ -951,7 +1025,7 @@ export class PlotFactory {
     const pageBins = new Map();
     for (const pd of pageData) {
       const bins = new Array(nbins).fill(0);
-      const numericValues = BasePlot.filterNumeric(pd.values);
+      const numericValues = finiteNumbers(pd.values);
 
       for (const v of numericValues) {
         let binIdx = Math.floor((v - globalMin) / binSize);
@@ -1013,13 +1087,24 @@ export class PlotFactory {
    * @returns {string[]} Sorted category array
    */
   static getSortedCategories(pageData, sortBy = 'count') {
+    return PlotHelpers.sortCategories(PlotFactory.mergedCategoryCounts(pageData), sortBy);
+  }
+
+  /**
+   * Category counts over every page, in first-occurrence order across the
+   * pages — merged from each page's counts, so no value is read twice.
+   *
+   * @param {Object[]} pageData - Page data array
+   * @returns {Map<string, number>}
+   */
+  static mergedCategoryCounts(pageData) {
     const globalCounts = new Map();
     for (const pd of pageData) {
-      for (const value of pd.values) {
-        globalCounts.set(value, (globalCounts.get(value) || 0) + 1);
+      for (const [value, count] of PlotHelpers.countCategories(pd.values)) {
+        globalCounts.set(value, (globalCounts.get(value) || 0) + count);
       }
     }
-    return PlotHelpers.sortCategories(globalCounts, sortBy);
+    return globalCounts;
   }
 
   /**
@@ -1073,176 +1158,8 @@ export class PlotFactory {
 }
 
 // =============================================================================
-// PLOT DEFINITION FACTORY
-// =============================================================================
-
-/**
- * Create a simple distribution plot definition (boxplot, violin, histogram)
- *
- * This factory function creates a complete plot definition with minimal code.
- * Use for plots that follow the standard pageData iteration pattern.
- *
- * @param {Object} config - Plot configuration
- * @param {string} config.id - Plot type ID
- * @param {string} config.name - Display name
- * @param {string} [config.description] - Description
- * @param {Object} config.defaultOptions - Default option values
- * @param {Object} config.optionSchema - Option schema for UI
- * @param {Function} config.buildTrace - (pd, color, index, options) => trace or traces
- * @param {Function} [config.customizeLayout] - (layout, pageData, options) => layout
- * @param {string} [config.exportType='distribution'] - 'distribution', 'categorical', 'histogram', or 'custom'
- * @param {Function} [config.customExportCSV] - Custom export function
- * @returns {Object} Complete plot definition
- */
-export function createDistributionPlotDefinition(config) {
-  const {
-    id,
-    name,
-    description = '',
-    defaultOptions = {},
-    optionSchema = {},
-    buildTrace,
-    customizeLayout,
-    exportType = 'distribution',
-    customExportCSV
-  } = config;
-
-  return {
-    id,
-    name,
-    description,
-    supportedTypes: ['continuous'],
-    supportedLayouts: ['side-by-side', 'grouped', 'overlay'],
-    defaultOptions,
-    optionSchema,
-
-    buildTraces(pageData, options, layoutEngine) {
-      return PlotFactory.createTraces({
-        pageData,
-        options,
-        layoutEngine,
-        traceBuilder: buildTrace,
-        filterNumeric: true,
-        minValues: 1
-      });
-    },
-
-    buildLayout(pageData, options, layoutEngine) {
-      const layout = PlotFactory.createLayout({ pageData, options });
-      PlotFactory.configureDistributionAxes(layout, { pageData, options });
-
-      if (customizeLayout) {
-        customizeLayout(layout, pageData, options, layoutEngine);
-      }
-
-      return layout;
-    },
-
-    async render(pageData, options, container, layoutEngine) {
-      return PlotFactory.render({
-        definition: this,
-        pageData,
-        options,
-        container,
-        layoutEngine
-      });
-    },
-
-    async update(figure, pageData, options, layoutEngine) {
-      return PlotFactory.update({
-        definition: this,
-        figure,
-        pageData,
-        options,
-        layoutEngine
-      });
-    },
-
-    exportCSV(pageData, options) {
-      if (customExportCSV) {
-        return customExportCSV(pageData, options);
-      }
-
-      switch (exportType) {
-        case 'categorical':
-          return PlotFactory.exportCategoricalCSV(pageData, { metadata: { plotType: id } });
-        case 'histogram':
-          return PlotFactory.exportHistogramCSV(pageData, { ...options, metadata: { plotType: id } });
-        case 'distribution':
-        default:
-          return PlotFactory.exportDistributionCSV(pageData, { metadata: { plotType: id } });
-      }
-    }
-  };
-}
-
-/**
- * Create a categorical plot definition (barplot, pieplot, heatmap)
- *
- * @param {Object} config - Plot configuration
- * @returns {Object} Complete plot definition
- */
-export function createCategoricalPlotDefinition(config) {
-  const {
-    id,
-    name,
-    description = '',
-    defaultOptions = {},
-    optionSchema = {},
-    buildTraces,
-    buildLayout,
-    customExportCSV
-  } = config;
-
-  return {
-    id,
-    name,
-    description,
-    supportedTypes: ['categorical'],
-    supportedLayouts: ['side-by-side', 'grouped', 'stacked', 'overlay'],
-    defaultOptions,
-    optionSchema,
-
-    buildTraces,
-    buildLayout,
-
-    async render(pageData, options, container, layoutEngine) {
-      return PlotFactory.render({
-        definition: this,
-        pageData,
-        options,
-        container,
-        layoutEngine
-      });
-    },
-
-    async update(figure, pageData, options, layoutEngine) {
-      return PlotFactory.update({
-        definition: this,
-        figure,
-        pageData,
-        options,
-        layoutEngine
-      });
-    },
-
-    exportCSV(pageData, options) {
-      if (customExportCSV) {
-        return customExportCSV(pageData, options);
-      }
-      return PlotFactory.exportCategoricalCSV(pageData, { metadata: { plotType: id } });
-    }
-  };
-}
-
-// =============================================================================
 // EXPORTS
 // =============================================================================
 
-export default PlotFactory;
-
 // Re-export commonly used items for convenience
-export { BasePlot, COMMON_HOVER_STYLE, createMinimalPlotly, getPlotlyConfig, PlotHelpers, getPageColor, PAGE_COLORS };
-
-// Re-export current trace contracts for centralized access.
-export { PLOTLY_2D_SCATTER_TRACE_TYPE, getHeatmapTraceType, requireWebGL2 };
+export { BasePlot, COMMON_HOVER_STYLE, createMinimalPlotly, getPlotlyConfig, PlotHelpers };

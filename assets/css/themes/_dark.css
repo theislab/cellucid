@@ -25,6 +25,7 @@
 
   /* Border colors. */
   --color-border-strong: var(--gray-50);
+  --color-border-control: var(--gray-500);
   --color-border-default: var(--gray-600);
   --color-border-light: var(--gray-700);
   --color-border-focus: var(--cyan-400);

@@ -11,6 +11,7 @@ import { viewContextCoreMethods } from './view-context-core.js';
 import { viewContextViewerSyncMethods } from './view-context-viewer-sync.js';
 import { getNotificationCenter } from '../../notification-center.js';
 import { isAnnDataActive } from '../../../data/anndata-provider.js';
+import { MappingLoadError } from '../../../data/data-mapping-candidates.js';
 
 const SUPPORTED_DIMENSIONS = new Set([1, 2, 3]);
 export const DATASET_VIEW_LOAD_SUPERSEDED_CODE =
@@ -30,19 +31,19 @@ function requireViewId(viewId) {
   return viewId;
 }
 
-function requireDimensionChangeOptions(options) {
+function requireRepresentationOptions(options) {
   if (
     options === null ||
     typeof options !== 'object' ||
     Array.isArray(options) ||
     Object.keys(options).length !== 1 ||
-    !Object.hasOwn(options, 'viewId')
+    typeof options.followsDefault !== 'boolean'
   ) {
     throw new TypeError(
-      'Dimension options must contain exactly one "viewId".'
+      'Representation options must contain exactly one boolean "followsDefault".'
     );
   }
-  return Object.freeze({ viewId: requireViewId(options.viewId) });
+  return Object.freeze({ followsDefault: options.followsDefault });
 }
 
 function requireMethod(owner, methodName, label) {
@@ -74,7 +75,7 @@ function createDatasetViewLoadSupersededError(operation) {
   return error;
 }
 
-export function isDatasetViewLoadSupersededError(error) {
+function isDatasetViewLoadSupersededError(error) {
   return error?.code === DATASET_VIEW_LOAD_SUPERSEDED_CODE;
 }
 
@@ -92,7 +93,8 @@ function assertCurrentDimensionLoadOwner(state, owner) {
     && owner.viewContexts.get(owner.targetViewId) === owner.context
     && state.pointCount === owner.pointCount
     && state.activeViewId === owner.activeViewId
-    && owner.context.dimensionLevel === owner.previousLevel
+    && owner.dimensionManager.getViewLayout(owner.targetViewId)
+      === owner.previousLayoutKey
     && !viewerIsTerminal(owner.viewer)
   );
   let currentField = null;
@@ -107,21 +109,25 @@ function assertCurrentDimensionLoadOwner(state, owner) {
   }
   if (!ownerIsCurrent || currentField !== owner.field) {
     throw createDatasetViewLoadSupersededError(
-      'Dimension coordinate loading'
+      'Representation coordinate loading'
     );
   }
 }
 
+function isCurrentVectorLoadOwner(state, owner) {
+  return (
+    readDatasetGeneration(state) === owner.datasetGeneration
+    && state.vectorFieldManager === owner.vectorFieldManager
+    && state.viewer === owner.viewer
+    && state.viewContexts === owner.viewContexts
+    && owner.viewContexts.get('live') === owner.liveContext
+    && state.pointCount === owner.pointCount
+    && !viewerIsTerminal(owner.viewer)
+  );
+}
+
 function assertCurrentVectorLoadOwner(state, owner) {
-  if (
-    readDatasetGeneration(state) !== owner.datasetGeneration
-    || state.vectorFieldManager !== owner.vectorFieldManager
-    || state.viewer !== owner.viewer
-    || state.viewContexts !== owner.viewContexts
-    || owner.viewContexts.get('live') !== owner.liveContext
-    || state.pointCount !== owner.pointCount
-    || viewerIsTerminal(owner.viewer)
-  ) {
+  if (!isCurrentVectorLoadOwner(state, owner)) {
     throw createDatasetViewLoadSupersededError(
       'Vector-field loading'
     );
@@ -202,7 +208,7 @@ export class DataStateViewMethods {
     this._batchDirty = { visibility: false, colors: false, affectedFields: new Set() };
   }
 
-  // --- Multi-dimensional embedding methods -----------------------------------
+  // --- Representations: the layout each view shows ---------------------------
 
   /**
    * Set the dimension manager instance
@@ -210,49 +216,29 @@ export class DataStateViewMethods {
    */
   setDimensionManager(manager) {
     for (const methodName of [
-      'getAvailableDimensions',
-      'getDefaultDimension',
-      'getPositions3D',
-      'hasDimension',
-      'setViewDimension',
+      'getDefaultLayoutKey',
+      'getEnabledLayoutKeys',
+      'getLayout',
+      'getPositions',
+      'getViewLayout',
+      'setViewLayout',
     ]) {
       requireMethod(manager, methodName, 'Dimension manager');
     }
-    const defaultDimension = requireDimensionLevel(
-      manager.getDefaultDimension(),
-      'Dimension manager default dimension'
-    );
-    const availableDimensions = manager.getAvailableDimensions();
-    if (!Array.isArray(availableDimensions)) {
-      throw new TypeError(
-        'Dimension manager available dimensions must be an array.'
-      );
-    }
-    let previousDimension = 0;
-    for (const dimension of availableDimensions) {
-      requireDimensionLevel(
-        dimension,
-        'Dimension manager available dimension'
-      );
-      if (dimension <= previousDimension) {
-        throw new TypeError(
-          'Dimension manager available dimensions must be strictly increasing.'
-        );
-      }
-      previousDimension = dimension;
-    }
-    if (
-      availableDimensions.length > 0 &&
-      !availableDimensions.includes(defaultDimension)
-    ) {
-      throw new RangeError(
-        'Dimension manager default dimension must be advertised as available.'
-      );
-    }
     this.dimensionManager = manager;
-    this.activeDimensionLevel = defaultDimension;
-    if (availableDimensions.includes(defaultDimension)) {
-      manager.setViewDimension('live', defaultDimension);
+    // Geometry the renderer keeps for representations no view shows is
+    // released with their CPU positions, and all of it under memory pressure.
+    if (typeof manager.setResidencyListener === 'function') {
+      manager.setResidencyListener({
+        onEvict: positions => this.viewer?.releaseRepresentationGeometry?.(positions),
+        onPressure: () => this.viewer?.releaseRetainedGeometry?.(),
+      });
+    }
+    const openingLayout = manager.getDefaultLayoutKey();
+    if (openingLayout !== null) {
+      manager.setViewLayout('live', openingLayout);
+      const liveContext = this.viewContexts?.get?.('live');
+      if (liveContext) liveContext.followsDefault = true;
     }
   }
 
@@ -273,15 +259,21 @@ export class DataStateViewMethods {
         typeof manager.getAvailableFields !== 'function' ||
         typeof manager.getDefaultFieldId !== 'function' ||
         typeof manager.hasField !== 'function' ||
-        typeof manager.hasFieldDimension !== 'function' ||
-        typeof manager.loadField !== 'function'
+        typeof manager.hasFieldLayout !== 'function' ||
+        typeof manager.loadField !== 'function' ||
+        typeof manager.dispose !== 'function'
       )
     ) {
       throw new TypeError(
         'setVectorFieldManager requires null or the exact vector-field manager interface.'
       );
     }
+    const previous = this.vectorFieldManager;
     this.vectorFieldManager = manager;
+    // The replaced manager's dataset is gone; stop its downloads.
+    if (previous !== null && previous !== manager) {
+      previous.dispose();
+    }
     this.emit(
       'vectorFields:changed',
       manager === null ? [] : manager.getAvailableFields()
@@ -299,7 +291,7 @@ export class DataStateViewMethods {
   }
 
   /**
-   * @returns {{ id: string, label: string, availableDimensions: number[], defaultDimension: number }[]}
+   * @returns {{ id: string, label: string, layoutKeys: string[] }[]}
    */
   getAvailableVectorFields() {
     return this.vectorFieldManager === null
@@ -325,32 +317,19 @@ export class DataStateViewMethods {
       : this.vectorFieldManager.hasField(fieldId);
   }
 
-  hasVectorFieldForDimension(fieldId, level) {
-    if (typeof fieldId !== 'string' || fieldId.length === 0) {
-      throw new TypeError('Vector field id must be a non-empty string.');
-    }
-    if (!Number.isInteger(level) || level < 1 || level > 3) {
-      throw new RangeError('Vector field dimension must be exactly 1, 2, or 3.');
-    }
-    return this.vectorFieldManager === null
-      ? false
-      : this.vectorFieldManager.hasFieldDimension(fieldId, level);
-  }
-
   /**
-   * Ensure vector field data is loaded and uploaded to the viewer for a dimension.
+   * Ensure vector field data is loaded and uploaded to the viewer for one
+   * representation (a layout some view shows). Each layout's data is loaded
+   * once and drawn by every view that shows that layout.
    *
    * @param {string} fieldId
-   * @param {number} level
+   * @param {string} layoutKey
    * @param {{ silent: boolean }} options
    * @returns {Promise<boolean>}
    */
-  async ensureVectorField(fieldId, level, options) {
+  async ensureVectorField(fieldId, layoutKey, options) {
     if (typeof fieldId !== 'string' || fieldId.length === 0) {
       throw new TypeError('Vector field id must be a non-empty string.');
-    }
-    if (!Number.isInteger(level) || level < 1 || level > 3) {
-      throw new RangeError('Vector field dimension must be exactly 1, 2, or 3.');
     }
     if (
       options === null ||
@@ -372,22 +351,24 @@ export class DataStateViewMethods {
     if (!vectorFieldManager.hasField(fieldId)) {
       throw new Error(`Unknown vector field "${fieldId}".`);
     }
-    if (!vectorFieldManager.hasFieldDimension(fieldId, level)) {
+    const layout = this.dimensionManager.getLayout(layoutKey);
+    const level = layout.dimension;
+    if (!vectorFieldManager.hasFieldLayout(fieldId, layout.layoutKey)) {
       throw new Error(
-        `Vector field "${fieldId}" does not declare ${level}D data.`
+        `Vector field "${fieldId}" has no data bound to ${layout.label}.`
       );
     }
     if (
       viewer === null ||
       typeof viewer !== 'object' ||
       typeof viewer.setVectorFieldData !== 'function' ||
-      typeof viewer.hasVectorFieldForDimension !== 'function'
+      typeof viewer.hasVectorFieldForLayout !== 'function'
     ) {
       throw new TypeError(
         'The active viewer must provide vector-field upload and query methods.'
       );
     }
-    if (viewer.hasVectorFieldForDimension(fieldId, level)) return true;
+    if (viewer.hasVectorFieldForLayout(fieldId, layoutKey)) return true;
     if (
       !(this.viewContexts instanceof Map) ||
       !this.viewContexts.has('live')
@@ -426,27 +407,37 @@ export class DataStateViewMethods {
     try {
       const fieldData = await vectorFieldManager.loadField(
         fieldId,
-        level,
+        layoutKey,
         { showProgress: !silent && !needsLocalNotif }
       );
       assertCurrentVectorLoadOwner(this, loadOwner);
-      viewer.setVectorFieldData(fieldId, level, fieldData);
+      viewer.setVectorFieldData(fieldId, layoutKey, fieldData);
       if (notifications !== null) {
         notifications.complete(notifId, `Loaded ${level}D ${descriptor.label}`);
       }
       return true;
     } catch (error) {
+      // A replaced manager aborts its downloads; a load whose owner is gone
+      // is superseded, whatever the aborted download rejected with.
+      const terminalError = isCurrentVectorLoadOwner(this, loadOwner)
+        ? error
+        : createDatasetViewLoadSupersededError('Vector-field loading');
+      // A vector array whose values cannot be drawn stays unusable, with the
+      // reason, in the data-mapping panel for the rest of this dataset.
+      if (terminalError instanceof MappingLoadError) {
+        this._markMappingChoiceUnusable('vectorFields', terminalError.key, terminalError.reason);
+      }
       if (notifications !== null) {
-        if (isDatasetViewLoadSupersededError(error)) {
+        if (isDatasetViewLoadSupersededError(terminalError)) {
           notifications.dismiss(notifId);
         } else {
-          const message = error instanceof Error
-            ? error.message
+          const message = terminalError instanceof Error
+            ? terminalError.message
             : `Vector field "${fieldId}" rejected with a non-Error value.`;
           notifications.fail(notifId, message);
         }
       }
-      throw error;
+      throw terminalError;
     }
   }
 
@@ -459,30 +450,62 @@ export class DataStateViewMethods {
   }
 
   /**
-   * Get current dimension level for the active view
+   * The dimension of the representation the active view shows.
    * @returns {number} Dimension level (1, 2, or 3)
    */
   getDimensionLevel() {
-    return requireDimensionLevel(
-      this.activeDimensionLevel,
-      'Active dimension'
-    );
+    return this.getViewDimensionLevel(requireViewId(this.activeViewId));
   }
 
   /**
-   * Get dimension level for a specific view
+   * The dimension of the representation one view shows: always the
+   * dimension of its layout, never a separately stored value.
    * @param {string} viewId - View identifier
    * @returns {number} Dimension level (1, 2, or 3)
    */
   getViewDimensionLevel(viewId) {
+    const targetViewId = this._requireKnownView(viewId);
+    requireMethod(this.dimensionManager, 'getViewLayout', 'Dimension manager');
+    return requireDimensionLevel(
+      this.dimensionManager.getLayout(
+        this.dimensionManager.getViewLayout(targetViewId)
+      ).dimension,
+      `View "${targetViewId}" dimension`
+    );
+  }
+
+  /**
+   * The layout key of the representation a view shows, as the dimension
+   * manager published it.
+   * @param {string} viewId - View identifier
+   * @returns {string}
+   */
+  getViewLayoutKey(viewId) {
+    const targetViewId = requireViewId(viewId);
+    requireMethod(
+      this.dimensionManager,
+      'getViewLayout',
+      'Dimension manager'
+    );
+    return this.dimensionManager.getViewLayout(targetViewId);
+  }
+
+  /**
+   * Whether a view shows its dimension's default because nothing else was
+   * chosen for it (it follows the default when the mapping changes it), as
+   * opposed to a representation the user picked.
+   * @param {string} viewId
+   * @returns {boolean}
+   */
+  viewFollowsDefault(viewId) {
+    const targetViewId = this._requireKnownView(viewId);
+    return this.viewContexts.get(targetViewId).followsDefault === true;
+  }
+
+  _requireKnownView(viewId) {
     const targetViewId = requireViewId(viewId);
     if (!(this.viewContexts instanceof Map)) {
-      throw new TypeError(
-        'View dimension lookup requires the exact view-context map.'
-      );
-    }
-    if (!this.viewContexts.has(targetViewId)) {
-      throw new RangeError(`View "${targetViewId}" does not exist.`);
+      throw new TypeError('View lookup requires the exact view-context map.');
     }
     const context = this.viewContexts.get(targetViewId);
     if (
@@ -491,28 +514,127 @@ export class DataStateViewMethods {
       Array.isArray(context) ||
       context.id !== targetViewId
     ) {
-      throw new TypeError(
-        `View "${targetViewId}" has an invalid dimension context.`
-      );
+      throw new RangeError(`View "${targetViewId}" does not exist.`);
     }
-    return requireDimensionLevel(
-      context.dimensionLevel,
-      `View "${targetViewId}" dimension`
-    );
+    return targetViewId;
   }
 
   /**
-   * Set one view to an available 1-D, 2-D, or 3-D embedding.
-   * @param {number} level - Exact dimension level
-   * @param {{ viewId: string }} options - Exact target view
+   * Show one dimension's default representation in a view (its first
+   * enabled representation when the mapping names no default for it). The
+   * view then follows that dimension's default.
+   *
+   * @param {string} viewId
+   * @param {number} level
+   * @returns {Promise<string>} The layout key now shown.
+   */
+  async showDefaultRepresentation(viewId, level) {
+    const dimension = requireDimensionLevel(level);
+    requireMethod(this.dimensionManager, 'getOpeningLayout', 'Dimension manager');
+    const layoutKey = this.dimensionManager.getOpeningLayout(dimension);
+    if (layoutKey === null) {
+      throw new RangeError(`No ${dimension}D representation is enabled for this dataset.`);
+    }
+    await this.setViewRepresentation(viewId, layoutKey, {
+      followsDefault: this.dimensionManager.getDefaultLayout(dimension) === layoutKey,
+    });
+    return layoutKey;
+  }
+
+  /**
+   * The keyboard gesture for one dimension: a view showing another dimension
+   * switches to this dimension's default; a view already showing this
+   * dimension moves to its next enabled representation, wrapping around.
+   *
+   * @param {string} viewId
+   * @param {number} level
+   * @returns {Promise<{layoutKey: string, position: number, count: number}>}
+   *   What the view shows now, and its 1-based place among the enabled
+   *   representations of that dimension.
+   */
+  async cycleRepresentation(viewId, level) {
+    const dimension = requireDimensionLevel(level);
+    const targetViewId = this._requireKnownView(viewId);
+    // The dimension's default first, then its other representations in the
+    // mapping's order: the order the picker lists them in.
+    const defaultLayout = this.dimensionManager.getDefaultLayout(dimension);
+    const choices = this.dimensionManager
+      .getEnabledLayoutsForDimension(dimension)
+      .map(layout => layout.layoutKey)
+      .sort((left, right) => (right === defaultLayout) - (left === defaultLayout));
+    if (choices.length === 0) {
+      throw new RangeError(`No ${dimension}D representation is enabled for this dataset.`);
+    }
+    const current = this.getViewLayoutKey(targetViewId);
+    let layoutKey;
+    if (this.getViewDimensionLevel(targetViewId) !== dimension) {
+      layoutKey = await this.showDefaultRepresentation(targetViewId, dimension);
+    } else {
+      const index = choices.indexOf(current);
+      layoutKey = choices[(index + 1) % choices.length];
+      await this.setViewRepresentation(targetViewId, layoutKey, {
+        followsDefault: this.dimensionManager.getDefaultLayout(dimension) === layoutKey,
+      });
+    }
+    return { layoutKey, position: choices.indexOf(layoutKey) + 1, count: choices.length };
+  }
+
+  /**
+   * Show the representation one embedding reference names in a view: an
+   * explicit choice, which the view keeps when the mapping's defaults
+   * change. The reference must name an enabled representation.
+   *
+   * @param {string} viewId
+   * @param {{key: string, columns: number[]|null}} ref
+   * @returns {Promise<string>} The layout key now shown.
+   */
+  async setViewEmbedding(viewId, ref) {
+    requireMethod(this.dimensionManager, 'resolveRepresentation', 'Dimension manager');
+    const layoutKey = this.dimensionManager.resolveRepresentation(ref);
+    await this.setViewRepresentation(viewId, layoutKey, { followsDefault: false });
+    return layoutKey;
+  }
+
+  /**
+   * Show the representation a saved session names in a view. A session
+   * records what each view showed, not whether it was chosen, so a view that
+   * shows its dimension's default follows that default again.
+   *
+   * @param {string} viewId
+   * @param {{key: string, columns: number[]|null}} ref
+   * @returns {Promise<string>} The layout key now shown.
+   */
+  async restoreViewEmbedding(viewId, ref) {
+    requireMethod(this.dimensionManager, 'resolveRepresentation', 'Dimension manager');
+    const layoutKey = this.dimensionManager.resolveRepresentation(ref);
+    const dimension = this.dimensionManager.getLayout(layoutKey).dimension;
+    await this.setViewRepresentation(viewId, layoutKey, {
+      followsDefault: this.dimensionManager.getDefaultLayout(dimension) === layoutKey,
+    });
+    return layoutKey;
+  }
+
+  /**
+   * Set the representation one view shows, as one transaction: coordinates
+   * and centroids are staged first, then the renderer, the dimension manager
+   * and the viewer publish the new layout, and any failure restores all of
+   * them. A request for the layout the view already shows only records
+   * whether it follows the default.
+   *
+   * Every view, active or not, announces a change with
+   * `view:representation-changed` `{viewId, layoutKey, dimension,
+   * previousLayoutKey}` once it is committed.
+   *
+   * @param {string} viewId - Exact target view
+   * @param {string} layoutKey - An enabled layout
+   * @param {{followsDefault: boolean}} options
    * @returns {Promise<void>}
    */
-  async setDimensionLevel(level, options) {
-    const nextLevel = requireDimensionLevel(level);
-    const { viewId: targetViewId } =
-      requireDimensionChangeOptions(options);
+  async setViewRepresentation(viewId, layoutKey, options) {
+    const targetViewId = requireViewId(viewId);
+    const { followsDefault } = requireRepresentationOptions(options);
 
-    // Serialize dimension transactions so their staged coordinates and
+    // Serialize layout transactions so their staged coordinates and
     // centroid buffers cannot overlap across an await boundary.
     while (this._dimensionChangeLock) {
       await this._dimensionChangeLock;
@@ -522,14 +644,18 @@ export class DataStateViewMethods {
     this._dimensionChangeLock = new Promise((resolve) => {
       unlockDimensionChange = resolve;
     });
+    let releaseLayoutPin = null;
 
     try {
       const dimensionManager = this.dimensionManager;
       const viewer = this.viewer;
       for (const methodName of [
-        'getPositions3D',
-        'hasDimension',
-        'setViewDimension',
+        'getLayout',
+        'getPositions',
+        'getViewLayout',
+        'isEnabled',
+        'pinLayout',
+        'setViewLayout',
       ]) {
         requireMethod(
           dimensionManager,
@@ -538,42 +664,28 @@ export class DataStateViewMethods {
         );
       }
       requireMethod(this, 'getFieldForView', 'DataState');
-      requireMethod(viewer, 'setViewDimension', 'Viewer');
-      if (!(this.viewContexts instanceof Map)) {
-        throw new TypeError(
-          'Dimension changes require the exact view-context map.'
-        );
-      }
-      if (!this.viewContexts.has(targetViewId)) {
-        throw new RangeError(`View "${targetViewId}" does not exist.`);
-      }
+      requireMethod(viewer, 'setViewEmbedding', 'Viewer');
+      this._requireKnownView(targetViewId);
       const context = this.viewContexts.get(targetViewId);
-      if (
-        context === null ||
-        typeof context !== 'object' ||
-        Array.isArray(context) ||
-        context.id !== targetViewId
-      ) {
-        throw new TypeError(
-          `View "${targetViewId}" has an invalid dimension context.`
+      const nextLayout = dimensionManager.getLayout(layoutKey);
+      const nextLayoutKey = nextLayout.layoutKey;
+      if (!dimensionManager.isEnabled(nextLayoutKey)) {
+        throw new RangeError(
+          `${nextLayout.label} is not enabled for this dataset. Enable it in Data mapping first.`
         );
       }
-      const previousLevel = this.getViewDimensionLevel(targetViewId);
+      const nextLevel = requireDimensionLevel(nextLayout.dimension);
+      const previousLayoutKey =
+        dimensionManager.getViewLayout(targetViewId);
+      const previousLevel = requireDimensionLevel(
+        dimensionManager.getLayout(previousLayoutKey).dimension
+      );
+      const previousFollowsDefault = context.followsDefault === true;
       const activeViewId = requireViewId(this.activeViewId);
       const isActiveView = targetViewId === activeViewId;
-      const previousActiveLevel = this.getDimensionLevel();
-      if (isActiveView && previousActiveLevel !== previousLevel) {
-        throw new Error(
-          `Active view "${targetViewId}" has inconsistent dimension state.`
-        );
-      }
-      if (previousLevel === nextLevel) {
+      if (nextLayoutKey === previousLayoutKey) {
+        context.followsDefault = followsDefault;
         return;
-      }
-      if (dimensionManager.hasDimension(nextLevel) !== true) {
-        throw new RangeError(
-          `Dimension ${nextLevel}D is not available in this dataset.`
-        );
       }
 
       const isLiveView = targetViewId === 'live';
@@ -602,7 +714,7 @@ export class DataStateViewMethods {
       if (hasCategoricalField) {
         requireMethod(
           this,
-          '_ensureUserDefinedCentroidsForDim',
+          '_ensureUserDefinedCentroidsForLayout',
           'DataState'
         );
         requireMethod(this, 'buildCentroidsForField', 'DataState');
@@ -615,7 +727,8 @@ export class DataStateViewMethods {
       }
 
       // Coordinates and derived centroid buffers are complete before any
-      // dimension owner publishes the new level.
+      // layout owner publishes the new layout. The pin keeps the staged
+      // coordinates resident while other loads run before publication.
       const loadOwner = Object.freeze({
         activeViewId,
         context,
@@ -623,21 +736,27 @@ export class DataStateViewMethods {
         dimensionManager,
         field,
         pointCount: this.pointCount,
-        previousLevel,
+        previousLayoutKey,
         targetViewId,
         viewer,
         viewContexts: this.viewContexts,
       });
-      const positions3D =
-        await dimensionManager.getPositions3D(nextLevel);
+      releaseLayoutPin = dimensionManager.pinLayout(nextLayoutKey);
+      const nextPositions =
+        await dimensionManager.getPositions(nextLayoutKey);
       assertCurrentDimensionLoadOwner(this, loadOwner);
       if (
-        !(positions3D instanceof Float32Array) ||
-        positions3D.length !== this.pointCount * 3
+        !(nextPositions instanceof Float32Array) ||
+        nextPositions.length !== this.pointCount * nextLevel
       ) {
         throw new TypeError(
           `${nextLevel}D positions must contain exactly ` +
-          `${this.pointCount * 3} Float32 values.`
+          `${this.pointCount * nextLevel} Float32 values.`
+        );
+      }
+      if (isLiveView && this.positionsDimension !== previousLevel) {
+        throw new Error(
+          'Live positions are not published in the live view dimension.'
         );
       }
       const previousPositions = isLiveView
@@ -645,7 +764,7 @@ export class DataStateViewMethods {
         : viewer.getViewPositions(targetViewId);
       if (
         !(previousPositions instanceof Float32Array) ||
-        previousPositions.length !== this.pointCount * 3
+        previousPositions.length !== this.pointCount * previousLevel
       ) {
         throw new TypeError(
           `Published positions for view "${targetViewId}" are incomplete.`
@@ -656,16 +775,21 @@ export class DataStateViewMethods {
       const previousContextCentroids = cloneCentroidState(context);
       let stagedCentroids = null;
       if (hasCategoricalField) {
-        this.activeDimensionLevel = nextLevel;
         try {
-          this._ensureUserDefinedCentroidsForDim(field, nextLevel);
-          this.buildCentroidsForField(field, { viewId: targetViewId });
+          this._ensureUserDefinedCentroidsForLayout(
+            field,
+            nextLayoutKey,
+            nextPositions
+          );
+          this.buildCentroidsForField(field, {
+            viewId: targetViewId,
+            layoutKey: nextLayoutKey,
+          });
           stagedCentroids = requireStagedCentroids(
             this,
             `View "${targetViewId}"`
           );
         } finally {
-          this.activeDimensionLevel = previousActiveLevel;
           this.centroidPositions = previousGlobalCentroids.positions;
           this.centroidColors = previousGlobalCentroids.colors;
           this.centroidOutliers = previousGlobalCentroids.outliers;
@@ -677,15 +801,15 @@ export class DataStateViewMethods {
       let positionPublicationAttempted = false;
       let centroidPublicationAttempted = false;
       let managerPublicationAttempted = false;
-      let viewerDimensionPublicationAttempted = false;
+      let viewerLayoutPublicationAttempted = false;
       try {
         positionPublicationAttempted = true;
         if (isLiveView) {
-          viewer.updatePositions(positions3D, nextLevel);
+          viewer.updatePositions(nextPositions, nextLevel);
         } else {
           viewer.setViewPositions(
             targetViewId,
-            positions3D,
+            nextPositions,
             nextLevel
           );
         }
@@ -710,17 +834,18 @@ export class DataStateViewMethods {
         }
 
         managerPublicationAttempted = true;
-        dimensionManager.setViewDimension(
-          targetViewId,
-          nextLevel
-        );
-        viewerDimensionPublicationAttempted = true;
-        viewer.setViewDimension(targetViewId, nextLevel);
+        dimensionManager.setViewLayout(targetViewId, nextLayoutKey);
+        viewerLayoutPublicationAttempted = true;
+        viewer.setViewEmbedding(targetViewId, {
+          dimension: nextLevel,
+          layoutKey: nextLayoutKey,
+        });
 
         if (isLiveView) {
-          this.positionsArray = positions3D;
+          this.positionsArray = nextPositions;
+          this.positionsDimension = nextLevel;
         }
-        context.dimensionLevel = nextLevel;
+        context.followsDefault = followsDefault;
         if (stagedCentroids !== null) {
           context.centroidPositions = stagedCentroids.positions;
           context.centroidColors = stagedCentroids.colors;
@@ -733,14 +858,11 @@ export class DataStateViewMethods {
             this.centroidLabels = stagedCentroids.labels;
           }
         }
-        if (isActiveView) {
-          this.activeDimensionLevel = nextLevel;
-        }
       } catch (error) {
-        context.dimensionLevel = previousLevel;
-        this.activeDimensionLevel = previousActiveLevel;
+        context.followsDefault = previousFollowsDefault;
         if (isLiveView) {
           this.positionsArray = previousPositions;
+          this.positionsDimension = previousLevel;
         }
         context.centroidPositions = previousContextCentroids.positions;
         context.centroidColors = previousContextCentroids.colors;
@@ -797,24 +919,24 @@ export class DataStateViewMethods {
         }
         if (managerPublicationAttempted) {
           restore(() => {
-            dimensionManager.setViewDimension(
+            dimensionManager.setViewLayout(
               targetViewId,
-              previousLevel
+              previousLayoutKey
             );
           });
         }
-        if (viewerDimensionPublicationAttempted) {
+        if (viewerLayoutPublicationAttempted) {
           restore(() => {
-            viewer.setViewDimension(
-              targetViewId,
-              previousLevel
-            );
+            viewer.setViewEmbedding(targetViewId, {
+              dimension: previousLevel,
+              layoutKey: previousLayoutKey,
+            });
           });
         }
         if (publicationErrors.length > 0) {
           throw new AggregateError(
             [error, ...publicationErrors],
-            `Dimension publication for view "${targetViewId}" failed ` +
+            `Representation publication for view "${targetViewId}" failed ` +
             'and state restoration was incomplete.'
           );
         }
@@ -822,11 +944,12 @@ export class DataStateViewMethods {
       }
       // Listeners observe an already committed generation. A listener failure
       // must not drive the reversible renderer/manager publication backward
-      // after another listener may already have observed the new level.
-      if (isActiveView) {
-        this._notifyDimensionChange();
-      }
+      // after another listener may already have observed the new layout.
+      this._notifyRepresentationChange(targetViewId, previousLayoutKey);
     } finally {
+      if (typeof releaseLayoutPin === 'function') {
+        releaseLayoutPin();
+      }
       if (typeof unlockDimensionChange === 'function') {
         unlockDimensionChange();
       }
@@ -835,12 +958,23 @@ export class DataStateViewMethods {
   }
 
   /**
-   * Notify listeners that the active view's dimension changed.
+   * Announce that the representation one view shows changed: a committed
+   * `setViewRepresentation`, or the active view moving to a view that shows
+   * another representation (`previousLayoutKey` is then the representation
+   * the previously active view showed).
+   *
+   * @param {string} viewId
+   * @param {string|null} previousLayoutKey
    * @private
    */
-  _notifyDimensionChange() {
-    const level = this.activeDimensionLevel;
-    this.emit('dimension:changed', level);
+  _notifyRepresentationChange(viewId, previousLayoutKey) {
+    const layoutKey = this.dimensionManager.getViewLayout(viewId);
+    this.emit('view:representation-changed', Object.freeze({
+      viewId,
+      layoutKey,
+      dimension: this.dimensionManager.getLayout(layoutKey).dimension,
+      previousLayoutKey,
+    }));
   }
 
   /**

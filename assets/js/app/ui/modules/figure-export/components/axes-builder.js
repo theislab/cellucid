@@ -10,7 +10,7 @@
  */
 
 import { niceNumbers, formatTick } from '../utils/tick-calculator.js';
-import { escapeHtml } from '../../../../utils/dom-utils.js';
+import { escapeXml } from '../../../../utils/dom-utils.js';
 
 /**
  * @typedef {object} AxisBounds
@@ -32,7 +32,7 @@ import { escapeHtml } from '../../../../utils/dom-utils.js';
  * @param {AxisBounds} bounds
  * @param {number} [targetTicks=5]
  */
-export function buildAxesModel(bounds, targetTicks = 5) {
+function buildAxesModel(bounds, targetTicks = 5) {
   const x = niceNumbers(bounds.minX, bounds.maxX, targetTicks);
   const y = niceNumbers(bounds.minY, bounds.maxY, targetTicks);
   return {
@@ -88,8 +88,8 @@ export function renderSvgAxes({
 
   const parts = [];
   parts.push(
-    `<g font-family="${escapeHtml(fontFamily)}" font-size="${tickSize}" ` +
-    `fill="${escapeHtml(axisColor)}" stroke="${escapeHtml(axisColor)}" stroke-width="1">`
+    `<g font-family="${escapeXml(fontFamily)}" font-size="${tickSize}" ` +
+    `fill="${escapeXml(axisColor)}" stroke="${escapeXml(axisColor)}" stroke-width="1">`
   );
 
   // Axis lines (bottom + left).
@@ -119,14 +119,14 @@ export function renderSvgAxes({
   // Axis labels.
   if (xLabelText) {
     parts.push(
-      `<text x="${(x0 + x1) / 2}" y="${axisY + tickLen + tickTextOffset + labelOffset}" text-anchor="middle" stroke="none" font-size="${labelSize}">${escapeHtml(xLabelText)}</text>`
+      `<text x="${(x0 + x1) / 2}" y="${axisY + tickLen + tickTextOffset + labelOffset}" text-anchor="middle" stroke="none" font-size="${labelSize}">${escapeXml(xLabelText)}</text>`
     );
   }
   if (yLabelText) {
     const lx = axisX - tickLen - tickTextOffset - labelOffset;
     const ly = (y0 + y1) / 2;
     parts.push(
-      `<text x="${lx}" y="${ly}" text-anchor="middle" stroke="none" font-size="${labelSize}" transform="rotate(-90 ${lx} ${ly})">${escapeHtml(yLabelText)}</text>`
+      `<text x="${lx}" y="${ly}" text-anchor="middle" stroke="none" font-size="${labelSize}" transform="rotate(-90 ${lx} ${ly})">${escapeXml(yLabelText)}</text>`
     );
   }
 

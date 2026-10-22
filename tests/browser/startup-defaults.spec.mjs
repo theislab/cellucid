@@ -19,8 +19,16 @@ test('every startup shows onboarding and adopts the catalog default with exact U
   );
   await expect(page.locator('#cinematic-camera-section')).not.toHaveAttribute('open', '');
   await expect(page.locator('#community-annotation-section')).not.toHaveAttribute('open', '');
-  await expect(page.locator('html')).toHaveAttribute('data-viewer-background', 'grid');
-  await expect(page.locator('#background-select')).toHaveValue('grid');
+  // Visualization, Navigation and Compare views start collapsed; Session,
+  // Coloring & filtering, Highlighting and Analysis start open.
+  for (const id of ['visualization-section', 'navigation-section', 'compare-views-section']) {
+    await expect(page.locator(`#${id}`)).not.toHaveAttribute('open', '');
+  }
+  for (const id of ['session-section', 'coloring-filtering-section', 'highlighted-cells-section', 'page-analysis-section']) {
+    await expect(page.locator(`#${id}`)).toHaveAttribute('open', '');
+  }
+  await expect(page.locator('html')).toHaveAttribute('data-viewer-background', 'studio');
+  await expect(page.locator('#background-select')).toHaveValue('studio');
   await expect(page.locator('#cinematic-autoplay')).not.toBeChecked();
 
   const buildIdentity = await page.evaluate(() => ({
@@ -38,7 +46,7 @@ test('every startup shows onboarding and adopts the catalog default with exact U
   await expect(page.locator('#welcome-modal')).toBeVisible();
 });
 
-test('the default light grid publishes stable light framebuffer pixels', async ({
+test('the default light studio publishes stable light framebuffer pixels', async ({
   page,
 }, testInfo) => {
   const browserErrors = [];
@@ -134,20 +142,21 @@ test('the default light grid publishes stable light framebuffer pixels', async (
     };
   });
 
-  await testInfo.attach('light-grid-framebuffer.json', {
+  await testInfo.attach('light-studio-framebuffer.json', {
     body: Buffer.from(`${JSON.stringify(evidence, null, 2)}\n`),
     contentType: 'application/json',
   });
 
   expect(evidence.ui).toEqual({
     theme: 'light',
-    background: 'grid',
-    rootBackground: 'grid',
+    background: 'studio',
+    rootBackground: 'studio',
   });
+  // Studio (light) clears to its surface colour, #ececec.
   expect(evidence.renderBackground).toEqual([
-    Math.fround(0.965),
-    Math.fround(0.965),
-    Math.fround(0.970),
+    Math.fround(236 / 255),
+    Math.fround(236 / 255),
+    Math.fround(236 / 255),
   ]);
   for (const frame of evidence.frames) {
     expect(frame.meanLuma).toBeGreaterThan(0.85);
@@ -158,9 +167,9 @@ test('the default light grid publishes stable light framebuffer pixels', async (
     expect(frame.sampleCount).toBe(64);
     expect(frame.lightPixelFraction).toBeGreaterThan(0.85);
     expect(frame.clearColor).toEqual([
-      Math.fround(0.965),
-      Math.fround(0.965),
-      Math.fround(0.970),
+      Math.fround(236 / 255),
+      Math.fround(236 / 255),
+      Math.fround(236 / 255),
       1,
     ]);
     expect(frame.framebufferIsDefault).toBe(true);

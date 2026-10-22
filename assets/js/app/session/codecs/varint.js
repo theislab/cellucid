@@ -36,17 +36,6 @@ export function pushUvarint(value, out) {
 }
 
 /**
- * Encode an unsigned varint into a compact Uint8Array.
- * @param {number} value
- * @returns {Uint8Array}
- */
-export function encodeUvarint(value) {
-  const bytes = [];
-  pushUvarint(value, bytes);
-  return new Uint8Array(bytes);
-}
-
-/**
  * Decode an unsigned varint from bytes starting at `offset`.
  * @param {Uint8Array} bytes
  * @param {number} [offset=0]

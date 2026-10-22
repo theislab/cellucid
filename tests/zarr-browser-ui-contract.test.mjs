@@ -5,6 +5,7 @@ import test from 'node:test';
 import {
   collectDOMReferences,
 } from '../assets/js/app/ui/core/dom-cache.js';
+import { infoTipText } from './helpers/info-tip-text.mjs';
 
 const indexHtml = await readFile(
   new URL('../index.html', import.meta.url),
@@ -109,21 +110,22 @@ test('the portable Zarr chooser exposes exact guidance through the compact infor
   assert.match(infoButton, /\baria-haspopup="dialog"/);
 
   const popover = indexHtml.match(
-    /<div\b[^>]*id="user-data-info-tooltip"[^>]*>[\s\S]*?<\/div>\s*<\/div>/
+    /<div\b[^>]*id="user-data-info-tooltip"[^>]*>/
   )?.[0];
   assert.ok(popover, 'local data information popover is required');
   assert.match(popover, /\brole="dialog"/);
   assert.match(popover, /\baria-labelledby="user-data-info-btn"/);
   assert.match(popover, /\btabindex="-1"/);
   assert.match(popover, /\bhidden\b/);
-  assert.match(popover, /\.zarr\.zip/i);
+  const tipText = infoTipText(indexHtml, 'user-data-info-tooltip');
+  assert.match(tipText, /\.zarr\.zip/i);
   for (const browser of [
     'Safari',
     'Chrome',
     'Edge',
     'Firefox',
   ]) {
-    assert.match(popover, new RegExp(browser, 'i'));
+    assert.match(tipText, new RegExp(browser, 'i'));
   }
 
   assert.doesNotMatch(indexHtml, /id="user-data-zarr-help"/);

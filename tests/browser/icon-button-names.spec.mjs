@@ -37,7 +37,7 @@ const FIELD_ACTION_GROUPS = Object.freeze([
 test('every field action button answers to exactly one name', async ({ page }) => {
   await page.goto(PREPARED_DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
-  await expect(page.locator('#filter-count')).toHaveText('Showing all 120 points');
+  await expect(page.locator('#filter-count')).toHaveText('Showing all 120 cells');
 
   for (const [id, name] of Object.entries(FIELD_ACTION_NAMES)) {
     await expect(page.locator(`#${id}`)).toHaveAccessibleName(name);

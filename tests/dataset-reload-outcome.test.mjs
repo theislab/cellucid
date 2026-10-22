@@ -1,3 +1,4 @@
+import './helpers/anndata-reader-in-process.mjs';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
@@ -5,11 +6,9 @@ import { gzipSync } from 'node:zlib';
 
 import { getNotificationCenter } from '../assets/js/app/notification-center.js';
 import { initDatasetConnections } from '../assets/js/app/ui/modules/dataset-connections.js';
-import { DATA_LOAD_METHODS } from '../assets/js/analytics/tracker.js';
-import {
-  loadLatentEmbeddings,
-  loadPointsBinary
-} from '../assets/js/data/data-loaders.js';
+import { createTestDatasetIntents } from './helpers/dataset-intents.mjs';
+import { DATA_LOAD_METHODS } from '../assets/js/app/data-load-methods.js';
+import { loadPointsBinary } from '../assets/js/data/data-loaders.js';
 import { getDataSourceManager } from '../assets/js/data/data-source-manager.js';
 import { DimensionManager } from '../assets/js/data/dimension-manager.js';
 import { debug } from '../assets/js/utils/debug.js';
@@ -18,6 +17,34 @@ const outcomeModuleUrl = new URL(
   '../assets/js/app/dataset-reload-outcome.js',
   import.meta.url
 );
+
+/**
+ * Version-3 `embeddings` metadata: one item per `[id, dimension]`, in the
+ * (dimension, id) item order, each on its exact producer path. Each dimension's
+ * default is its first item unless `defaults` names another.
+ */
+function embeddingsMetadata(entries, { defaults = {}, defaultDimension, gzip = false } = {}) {
+  const items = {};
+  const slots = {};
+  entries.forEach(([id, dimension], index) => {
+    items[id] = {
+      label: id,
+      dimension,
+      file: `embeddings/${index}_${dimension}d.bin${gzip ? '.gz' : ''}`,
+      source: {
+        key: id,
+        columns: Array.from({ length: dimension }, (_, column) => column),
+      },
+    };
+    slots[`${dimension}d`] ??= id;
+  });
+  const dimensions = entries.map(([, dimension]) => dimension);
+  return {
+    default_dimension: defaultDimension ?? Math.max(...dimensions),
+    defaults: { ...slots, ...defaults },
+    items,
+  };
+}
 
 function deferred() {
   let resolve;
@@ -28,202 +55,6 @@ function deferred() {
   });
   return { promise, resolve, reject };
 }
-
-test(
-  'latent embedding loads reject an unavailable dimension without substitution or fetch',
-  async t => {
-    captureDownloadNotifications(t);
-    const originalFetch = globalThis.fetch;
-    let fetchCalls = 0;
-    globalThis.fetch = async () => {
-      fetchCalls++;
-      throw new Error('unexpected embedding fetch');
-    };
-    t.after(() => {
-      globalThis.fetch = originalFetch;
-    });
-
-    await assert.rejects(
-      loadLatentEmbeddings({
-        baseUrl: 'https://cellucid.test/data/',
-        identity: {
-          embeddings: {
-            available_dimensions: [3],
-            default_dimension: 3,
-            files: { '3d': 'points_3d.bin' }
-          }
-        },
-        dimension: 2
-      }),
-      /2D.*not available.*3D|available.*3D.*2D/i
-    );
-    assert.equal(fetchCalls, 0);
-  }
-);
-
-test('latent embedding loading uses exactly the advertised file path', async t => {
-  captureDownloadNotifications(t);
-  const originalFetch = globalThis.fetch;
-  const requested = [];
-  globalThis.fetch = async input => {
-    requested.push(String(input));
-    return new Response(
-      new Float32Array([1, 2]).buffer,
-      { status: 200 }
-    );
-  };
-  t.after(() => {
-    globalThis.fetch = originalFetch;
-  });
-
-  const result = await loadLatentEmbeddings({
-    baseUrl: 'https://cellucid.test/data/',
-    identity: {
-      embeddings: {
-        available_dimensions: [2],
-        default_dimension: 2,
-        files: { '2d': 'advertised.bin' },
-      },
-    },
-    dimension: 2,
-  });
-
-  assert.deepEqual(requested, [
-    'https://cellucid.test/data/advertised.bin',
-  ]);
-  assert.deepEqual(Array.from(result.points), [1, 2]);
-});
-
-test('a truncated latent embedding is refused, never floored to fewer cells', async t => {
-  // Two peers divide the same payload by the same dimension: DimensionManager
-  // and loadLatentEmbeddings. A partial trailing coordinate must be a refusal in
-  // both, because flooring it hands analysis a cell count that disagrees with
-  // obs_manifest.json while looking entirely normal on screen.
-  captureDownloadNotifications(t);
-  const originalFetch = globalThis.fetch;
-  const truncated = new Float32Array([1, 2, 3]);
-  globalThis.fetch = async () => new Response(
-    truncated.buffer,
-    { status: 200 }
-  );
-  t.after(() => {
-    globalThis.fetch = originalFetch;
-  });
-
-  await assert.rejects(
-    loadLatentEmbeddings({
-      baseUrl: 'https://cellucid.test/data/',
-      identity: {
-        embeddings: {
-          available_dimensions: [2],
-          default_dimension: 2,
-          files: { '2d': 'points_2d.bin' },
-        },
-      },
-      dimension: 2,
-    }),
-    /not a whole number of 2-value cell coordinates/i
-  );
-});
-
-test('a latent embedding must carry the declared cell count', async t => {
-  captureDownloadNotifications(t);
-  const originalFetch = globalThis.fetch;
-  const shortPayload = new Float32Array([1, 2, 3, 4]);
-  globalThis.fetch = async () => new Response(
-    shortPayload.buffer,
-    { status: 200 }
-  );
-  t.after(() => {
-    globalThis.fetch = originalFetch;
-  });
-
-  // The declared axis is enforced at transport, so the payload is refused before
-  // its length can define a cell count of its own.
-  await assert.rejects(
-    loadLatentEmbeddings({
-      baseUrl: 'https://cellucid.test/data/',
-      identity: {
-        stats: { n_cells: 5 },
-        embeddings: {
-          available_dimensions: [2],
-          default_dimension: 2,
-          files: { '2d': 'points_2d.bin' },
-        },
-      },
-      dimension: 2,
-    }),
-    /expected .*40 bytes|carries 2 cells, but/i
-  );
-});
-
-test('latent embedding loading rejects a missing advertised path before fetch', async t => {
-  captureDownloadNotifications(t);
-  const originalFetch = globalThis.fetch;
-  let fetchCalls = 0;
-  globalThis.fetch = async () => {
-    fetchCalls++;
-    throw new Error('unexpected embedding fetch');
-  };
-  t.after(() => {
-    globalThis.fetch = originalFetch;
-  });
-
-  await assert.rejects(
-    loadLatentEmbeddings({
-      baseUrl: 'https://cellucid.test/data/',
-      identity: {
-        embeddings: {
-          available_dimensions: [2],
-          default_dimension: 2,
-          files: {},
-        },
-      },
-      dimension: 2,
-    }),
-    /2D.*file.*metadata|metadata.*2D.*file/i
-  );
-  assert.equal(fetchCalls, 0);
-});
-
-test('latent embedding loads preserve the exact advertised dimension and path', async t => {
-  captureDownloadNotifications(t);
-  const originalFetch = globalThis.fetch;
-  const source = new Float32Array([0, 1, 2, 3]);
-  const compressed = gzipSync(
-    new Uint8Array(source.buffer, source.byteOffset, source.byteLength)
-  );
-  const requestedUrls = [];
-  globalThis.fetch = async url => {
-    requestedUrls.push(String(url));
-    return new Response(compressed, {
-      status: 200,
-      headers: { 'Content-Length': String(compressed.byteLength) }
-    });
-  };
-  t.after(() => {
-    globalThis.fetch = originalFetch;
-  });
-
-  const result = await loadLatentEmbeddings({
-    baseUrl: 'https://cellucid.test/data/',
-    identity: {
-      embeddings: {
-        available_dimensions: [2],
-        default_dimension: 2,
-        files: { '2d': 'custom_2d.bin.gz' }
-      }
-    },
-    dimension: 2
-  });
-
-  assert.deepEqual(Array.from(result.points), [0, 1, 2, 3]);
-  assert.equal(result.dimension, 2);
-  assert.equal(result.cellCount, 2);
-  assert.deepEqual(requestedUrls, [
-    'https://cellucid.test/data/custom_2d.bin.gz'
-  ]);
-});
 
 function createFileInput() {
   const listeners = new Map();
@@ -383,23 +214,6 @@ function installActiveAnnDataAdapter(t, adapter, sourceType = 'h5ad') {
   });
 }
 
-function unreadPositionProxy(values, onCoordinateRead) {
-  const positions = new Float32Array(values);
-  return new Proxy(positions, {
-    get(target, property) {
-      if (
-        typeof property === 'string' &&
-        /^(?:0|[1-9]\d*)$/.test(property)
-      ) {
-        onCoordinateRead();
-        throw new Error('position coordinate touched before memory preflight');
-      }
-      const value = Reflect.get(target, property, target);
-      return typeof value === 'function' ? value.bind(target) : value;
-    }
-  });
-}
-
 async function runLocalSelection(t, { activateDataset }) {
   const browserState = installBrowserStubs(t);
   const notificationEvents = captureNotifications(t);
@@ -440,7 +254,7 @@ async function runLocalSelection(t, { activateDataset }) {
   let populateCalls = 0;
 
   initDatasetConnections({
-    activateDataset: async (
+    datasetIntents: createTestDatasetIntents(async (
       datasetId,
       sourceType,
       loadMethod,
@@ -454,7 +268,7 @@ async function runLocalSelection(t, { activateDataset }) {
       });
       if (ready === true) sources.set(sourceType, source);
       return ready;
-    },
+    }),
     clearDataset: async () => true,
     dom: {
       select: { focus() {} },
@@ -542,14 +356,9 @@ test('dataset positions must exactly match the canonical cell axis before public
     }),
     /8.*coordinates.*n_cells.*3.*exactly 6|exactly 6.*3.*2/i
   );
-  assert.throws(
-    () => validateDatasetPositionPayload({
-      positions: new Float32Array([0, 1, 2, Number.NaN, 4, 5]),
-      identity,
-      dimension: 2
-    }),
-    /non-finite.*index 3/i
-  );
+  // A non-finite coordinate never reaches this check: the decode boundary
+  // refuses it (tests/position-finiteness-contract.test.mjs), so it is not
+  // scanned a second and third time here.
   assert.throws(
     () => validateDatasetPositionPayload({
       positions: new Float64Array(6),
@@ -577,10 +386,11 @@ test('position staging rejects a misaligned raw payload before normalization or 
   let renderLoads = 0;
   const manager = {
     nCells: 4,
-    getDefaultDimension: () => 2,
-    loadDimension: async () => new Float32Array(8),
+    getDefaultLayoutKey: () => '2d',
+    getLayout: layoutKey => ({ layoutKey, dimension: 2 }),
+    loadLayout: async () => new Float32Array(8),
     clearCache() {},
-    async getPositions3D() {
+    async getPositions() {
       renderLoads++;
       return new Float32Array(12);
     }
@@ -598,7 +408,7 @@ test('position staging rejects a misaligned raw payload before normalization or 
   assert.equal(
     renderLoads,
     0,
-    'normalization/padding must not run for a misaligned raw cell axis'
+    'normalization must not run for a misaligned raw cell axis'
   );
 });
 
@@ -609,18 +419,21 @@ test('position staging validates raw and rendered buffers and is owner-abortable
   const calls = [];
   const manager = {
     nCells: 3,
-    getDefaultDimension: () => 2,
+    // The dataset opens on its 2D default, named by its embedding id.
+    getDefaultLayoutKey: () => 'X_umap',
+    getLayout: layoutKey => ({ layoutKey, dimension: 2 }),
     clearCache() {},
-    async loadDimension(dimension, options) {
-      calls.push(['raw', dimension, options]);
+    async loadLayout(layoutKey, options) {
+      calls.push(['raw', layoutKey, options]);
       return new Float32Array([0, 0, 1, 1, 2, 2]);
     },
-    async getPositions3D(dimension, options) {
-      calls.push(['render', dimension, options]);
+    async getPositions(layoutKey, options) {
+      calls.push(['render', layoutKey, options]);
+      // Rendered positions keep the embedding's two components per cell.
       return new Float32Array([
-        -1, -1, 0,
-        0, 0, 0,
-        1, 1, 0
+        -1, -1,
+        0, 0,
+        1, 1
       ]);
     }
   };
@@ -635,17 +448,32 @@ test('position staging validates raw and rendered buffers and is owner-abortable
     positions: staged.positions
   });
   assert.deepEqual(calls, [
-    ['raw', 2, { showProgress: true }],
-    ['render', 2, { showProgress: false }]
+    ['raw', 'X_umap', { showProgress: true }],
+    ['render', 'X_umap', { showProgress: false }]
   ]);
+  assert.equal(staged.positions.length, 6);
+
+  await assert.rejects(
+    stageDatasetPositionPayload({
+      generation: { identity: { stats: { n_cells: 3 } } },
+      dimensionManager: {
+        ...manager,
+        getPositions: async () => new Float32Array(9)
+      },
+      showProgress: false,
+      signal: new AbortController().signal
+    }),
+    /2D dataset positions contain 9 coordinates.*exactly 6/
+  );
 
   const pendingRaw = deferred();
   let clearCalls = 0;
   const abortingManager = {
     nCells: 0,
-    getDefaultDimension: () => 2,
-    loadDimension: () => pendingRaw.promise,
-    getPositions3D: async () => {
+    getDefaultLayoutKey: () => 'X_umap',
+    getLayout: layoutKey => ({ layoutKey, dimension: 2 }),
+    loadLayout: () => pendingRaw.promise,
+    getPositions: async () => {
       assert.fail('render positions must not run after owner cancellation');
     },
     clearCache() {
@@ -684,90 +512,16 @@ test('position staging validates raw and rendered buffers and is owner-abortable
       generation: { identity: { stats: { n_cells: 3 } } },
       dimensionManager: {
         nCells: 3,
-        getDefaultDimension: () => 2,
-        loadDimension: async () => new Float32Array(6),
-        getPositions3D: async () => new Float32Array(9)
+        getDefaultLayoutKey: () => '2d',
+        getLayout: layoutKey => ({ layoutKey, dimension: 2 }),
+        loadLayout: async () => new Float32Array(6),
+        getPositions: async () => new Float32Array(9)
       },
       showProgress: false,
       signal: new AbortController().signal
     }),
     /requires a DimensionManager/i
   );
-});
-
-test('validated local activation distinguishes a retained source from reload failure', async t => {
-  const { activateValidatedLocalDataset } = await import(outcomeModuleUrl);
-
-  await t.test('auto-switch failure retains the validated source', async () => {
-    const switchError = new Error('switch unavailable');
-    let reloadCalls = 0;
-
-    const outcome = await activateValidatedLocalDataset({
-      switchDataset: async () => {
-        throw switchError;
-      },
-      reloadDataset: async () => {
-        reloadCalls++;
-      }
-    });
-
-    assert.equal(outcome.status, 'validated-retained');
-    assert.equal(outcome.error, switchError);
-    assert.equal(reloadCalls, 0);
-  });
-
-  await t.test('post-switch reload failure rejects instead of becoming ready', async () => {
-    const reloadError = new Error('required reload failed');
-    let switchCalls = 0;
-
-    await assert.rejects(
-      activateValidatedLocalDataset({
-        switchDataset: async () => {
-          switchCalls++;
-        },
-        reloadDataset: async () => {
-          throw reloadError;
-        }
-      }),
-      error => error === reloadError
-    );
-
-    assert.equal(switchCalls, 1);
-  });
-
-  await t.test('successful switch and reload produce ready', async () => {
-    const events = [];
-
-    const outcome = await activateValidatedLocalDataset({
-      switchDataset: async () => {
-        events.push('switch');
-      },
-      reloadDataset: async () => {
-        events.push('reload');
-      }
-    });
-
-    assert.deepEqual(outcome, { status: 'ready' });
-    assert.deepEqual(events, ['switch', 'reload']);
-  });
-
-  await t.test('reload ownership cannot be omitted or substituted', async () => {
-    await assert.rejects(
-      activateValidatedLocalDataset({
-        switchDataset: async () => {},
-        reloadDataset: null
-      }),
-      /handlers must be functions/i
-    );
-    await assert.rejects(
-      activateValidatedLocalDataset({
-        switchDataset: async () => {},
-        reloadDataset: async () => {},
-        legacyReloadDataset: async () => {}
-      }),
-      /unexpected key.*legacyReloadDataset/i
-    );
-  });
 });
 
 test('dataset reload transactions reject stale commits across local selection epochs', async () => {
@@ -831,6 +585,101 @@ test('dataset reload transactions reject stale commits across local selection ep
   repeated.assertCurrent();
 });
 
+test('a dataset change supersedes the one in flight the moment it begins', async () => {
+  const { createLatestDatasetReloadCoordinator } =
+    await import(outcomeModuleUrl);
+  const changes = createLatestDatasetReloadCoordinator(() => ({
+    baseUrl: null,
+    datasetId: null,
+    selectionIdentity: null,
+    source: null
+  }));
+  assert.equal(changes.actionSequence, 0);
+  assert.equal(changes.settled, true);
+  await changes.whenSettled();
+
+  // The startup load is in flight; a file is chosen before it lands.
+  const startupLoad = changes.begin();
+  assert.equal(changes.settled, false);
+  const file = changes.begin();
+  assert.equal(startupLoad.signal.aborted, true);
+  assert.equal(startupLoad.isLatest(), false);
+  assert.equal(file.isLatest(), true);
+  assert.equal(file.generation, startupLoad.generation + 1);
+
+  // A superseded change no longer holds anything back; the newest one does
+  // until it finishes, and finishing twice is harmless.
+  let settled = false;
+  const waiting = changes.whenSettled().then(() => {
+    settled = true;
+  });
+  startupLoad.finish();
+  await Promise.resolve();
+  assert.equal(settled, false);
+  file.finish();
+  file.finish();
+  await waiting;
+  assert.equal(settled, true);
+  assert.equal(changes.settled, true);
+
+  // A waiter follows the newest change, even one begun while it waits.
+  const sample = changes.begin();
+  let followed = false;
+  const following = changes.whenSettled().then(() => {
+    followed = true;
+  });
+  const none = changes.begin();
+  sample.finish();
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(followed, false);
+  none.finish();
+  await following;
+  assert.equal(followed, true);
+});
+
+test('a change that may not touch the dataset never overrides a later action', async () => {
+  const { createLatestDatasetReloadCoordinator } =
+    await import(outcomeModuleUrl);
+  const changes = createLatestDatasetReloadCoordinator(() => ({
+    baseUrl: null,
+    datasetId: null,
+    selectionIdentity: null,
+    source: null
+  }));
+  const running = changes.begin();
+  // Connect is clicked while a load runs: it records the last action only.
+  const atClick = changes.actionSequence;
+  assert.equal(running.signal.aborted, false);
+
+  // Nothing newer happened: the one-dataset activation replaces the load
+  // that was running when Connect was clicked.
+  const activation = changes.beginIfNoActionSince(atClick);
+  assert.notEqual(activation, null);
+  assert.equal(running.signal.aborted, true);
+  activation.finish();
+
+  // A choice made after the click wins; the late activation is refused and
+  // the choice keeps running.
+  const secondClick = changes.actionSequence;
+  const laterChoice = changes.begin();
+  assert.equal(changes.beginIfNoActionSince(secondClick), null);
+  assert.equal(laterChoice.signal.aborted, false);
+  assert.equal(laterChoice.isLatest(), true);
+  laterChoice.finish();
+
+  // A session applied after the click is an action too: it begins no
+  // transaction and aborts nothing, yet the late activation is refused.
+  const thirdClick = changes.actionSequence;
+  const before = changes.actionSequence;
+  assert.equal(changes.recordAction(), before + 1);
+  assert.equal(laterChoice.isLatest(), true);
+  assert.equal(changes.settled, true);
+  assert.equal(changes.beginIfNoActionSince(thirdClick), null);
+
+  assert.throws(() => changes.beginIfNoActionSince(-1), TypeError);
+  assert.throws(() => changes.beginIfNoActionSince(1.5), TypeError);
+});
 test(
   'publication continuation remains current until a newer runtime actually publishes',
   async () => {
@@ -1140,7 +989,6 @@ test('published-state settlement gives superseded reloads one cancel and no succ
   const {
     createDatasetReloadSupersededError,
     isDatasetReloadSupersededError,
-    settleInitialPublishedDatasetStateOutcome,
     settlePublishedDatasetStateOutcome
   } = await import(outcomeModuleUrl);
 
@@ -1211,29 +1059,11 @@ test('published-state settlement gives superseded reloads one cancel and no succ
   assert.equal(cancellations, 0);
   assert.equal(completions, 2);
 
-  cancellations = 0;
-  completions = 0;
-  const initialOutcome =
-    await settleInitialPublishedDatasetStateOutcome({
-      outcome: { status: 'superseded' },
-      transaction: {
-        isCurrent: () => false,
-        assertCurrent() {
-          throw createDatasetReloadSupersededError(
-            'Dataset reload was superseded by a newer selection.'
-          );
-        }
-      },
-      cancel() {
-        cancellations += 1;
-      },
-      complete() {
-        completions += 1;
-      }
-    });
-  assert.deepEqual(initialOutcome, { status: 'superseded' });
-  assert.equal(cancellations, 1);
-  assert.equal(completions, 0);
+  assert.equal(
+    (await import(outcomeModuleUrl)).settleInitialPublishedDatasetStateOutcome,
+    undefined,
+    'startup settles its published state through the one reload path'
+  );
 });
 
 test('reload owner adopts one committed identity before published-state success', async () => {
@@ -1328,7 +1158,7 @@ test('manual session replacement is a ready state outcome without an error banne
     'utf8'
   );
   const restoreOwnerStart = mainSource.indexOf(
-    'async function restoreAdvertisedDatasetState({ signal })'
+    'async function restoreAdvertisedDatasetState({ requestStep, signal })'
   );
   const restoreOwnerEnd = mainSource.indexOf(
     '// -----------------------------------------------------------------------',
@@ -1552,108 +1382,101 @@ test(
 
 test('dimension cache invalidation rejects delayed positions without republishing', async () => {
   const manager = new DimensionManager({
-    embeddingsMetadata: {
-      available_dimensions: [2],
-      default_dimension: 2,
-      files: { '2d': 'first.bin' }
-    }
+    embeddingsMetadata: embeddingsMetadata([['X_umap', 2]])
   });
   const oldPayload = deferred();
-  manager.loadDimension = () => oldPayload.promise;
+  manager.loadLayout = () => oldPayload.promise;
 
-  const older = manager.getPositions3D(2, { showProgress: false });
+  const older = manager.getPositions('X_umap', { showProgress: false });
   manager.clearCache();
-  manager.initFromMetadata({
-    available_dimensions: [2],
-    default_dimension: 2,
-    files: { '2d': 'second.bin' }
-  });
+  // The replacement declares an embedding of the same id at another path;
+  // the delayed payload of the cleared generation still cannot land.
+  manager.initFromMetadata(
+    embeddingsMetadata([['X_pca', 2], ['X_umap', 2]])
+  );
   oldPayload.resolve(new Float32Array([0, 0, 1, 1]));
 
   await assert.rejects(older, /dimension.*(changed|superseded|cleared)/i);
-  assert.equal(manager.paddedPositionCache.size, 0);
+  assert.equal(manager.normalizedPositionCache.size, 0);
   assert.equal(manager.normTransformCache.size, 0);
   assert.equal(manager.nCells, 0);
 });
 
-test('dimension metadata accepts only exact advertised dimensions and paths', () => {
-  for (const metadata of [
-    {
-      available_dimensions: [2],
-      default_dimension: 2,
-    },
-    {
-      available_dimensions: [2, 2],
-      default_dimension: 2,
-      files: { '2d': 'points.bin' },
-    },
-    {
-      available_dimensions: [2.5],
-      default_dimension: 2,
-      files: { '2d': 'points.bin' },
-    },
-    {
-      available_dimensions: ['2'],
-      default_dimension: 2,
-      files: { '2d': 'points.bin' },
-    },
-    {
-      available_dimensions: [2],
-      default_dimension: 3,
-      files: { '2d': 'points.bin' },
-    },
-    {
-      available_dimensions: [2],
-      default_dimension: 2,
-      files: {},
-    },
-    {
-      available_dimensions: [2],
-      default_dimension: 2,
-      files: {
-        '2d': 'points.bin',
-        '3d': 'unadvertised.bin',
-      },
-    },
-  ]) {
+test('dimension metadata accepts only exact embedding items, defaults, and dimensions', () => {
+  const valid = () => embeddingsMetadata([['X_umap', 2], ['X_umap_3d', 3]]);
+  const rejected = [];
+  const mutate = (change) => {
+    const metadata = valid();
+    change(metadata);
+    rejected.push(metadata);
+  };
+  mutate(metadata => { delete metadata.defaults; });
+  mutate(metadata => { metadata.items = {}; });
+  mutate(metadata => { metadata.items.X_umap.dimension = 2.5; });
+  mutate(metadata => { metadata.items.X_umap.dimension = '2'; });
+  mutate(metadata => { metadata.items.X_umap.dimension = 4; });
+  mutate(metadata => { metadata.default_dimension = 1; });
+  mutate(metadata => { metadata.defaults = { '2d': 'X_umap' }; });
+  mutate(metadata => { metadata.defaults['1d'] = 'X_umap'; });
+  mutate(metadata => { metadata.defaults['2d'] = 'X_umap_3d'; });
+  mutate(metadata => { metadata.defaults['2d'] = 'X_missing'; });
+  mutate(metadata => { metadata.items.X_umap.file = ''; });
+  mutate(metadata => { metadata.items.X_umap.label = ''; });
+  mutate(metadata => { delete metadata.items.X_umap.source; });
+  mutate(metadata => { metadata.items.X_umap.source.columns = [0]; });
+  mutate(metadata => { metadata.items.X_umap.obsm_key = 'X_umap'; });
+  mutate(metadata => { metadata.files = { '2d': 'points_2d.bin' }; });
+  for (const metadata of rejected) {
     assert.throws(
       () => new DimensionManager({ embeddingsMetadata: metadata }),
-      /embedding|dimension|path/i
+      /embedding|dimension|default|item|label|path|source|provenance/i
     );
   }
 
+  // Neither version-2 path map is read any more.
+  for (const legacy of [
+    { available_dimensions: [2], default_dimension: 2, files: { '2d': 'points_2d.bin' } },
+    { available_dimensions: [2], default_dimension: 2, obsm_keys: { '2d': 'X_umap' } },
+  ]) {
+    assert.throws(
+      () => new DimensionManager({ embeddingsMetadata: legacy }),
+      /exactly default_dimension, defaults, and items/
+    );
+  }
+
+  // A direct AnnData identity is an ordinary version-3 identity: its layout
+  // reads the item's file and records the obsm array it was read from.
   const direct = new DimensionManager({
-    embeddingsMetadata: {
-      available_dimensions: [2],
-      default_dimension: 2,
-      obsm_keys: { '2d': 'X_umap' },
-    },
+    embeddingsMetadata: embeddingsMetadata([['X_umap', 2]]),
   });
-  assert.deepEqual(direct.dimensionFiles, { '2d': 'X_umap' });
+  assert.equal(direct.getLayout('X_umap').path, 'embeddings/0_2d.bin');
+  assert.deepEqual(
+    direct.getLayout('X_umap').provenance,
+    { key: 'X_umap', columns: [0, 1] }
+  );
 });
 
 test('dimension metadata replacement validates completely before mutation', () => {
   const manager = new DimensionManager({
-    embeddingsMetadata: {
-      available_dimensions: [3],
-      default_dimension: 3,
-      files: { '3d': 'working-3d.bin' },
-    },
+    embeddingsMetadata: embeddingsMetadata([['X_umap_3d', 3]]),
   });
 
+  // A complete candidate except that 2D has no default.
+  const candidate = embeddingsMetadata([['X_umap_1d', 1], ['X_umap', 2]]);
+  delete candidate.defaults['2d'];
   assert.throws(
-    () => manager.initFromMetadata({
-      available_dimensions: [1, 2],
-      default_dimension: 2,
-      files: { '1d': 'candidate-1d.bin' },
-    }),
-    /2d|path|embedding/i
+    () => manager.initFromMetadata(candidate),
+    /defaults must name exactly one embedding per dimension/i
   );
-  assert.deepEqual(manager.availableDimensions, [3]);
-  assert.equal(manager.defaultDimension, 3);
-  assert.deepEqual(manager.dimensionFiles, {
-    '3d': 'working-3d.bin',
-  });
+  assert.deepEqual(manager.getAvailableDimensions(), [3]);
+  assert.equal(manager.getDefaultDimension(), 3);
+  assert.deepEqual(manager.getEnabledLayoutKeys(), ['X_umap_3d']);
+  assert.equal(manager.getDefaultLayoutKey(), 'X_umap_3d');
+  assert.equal(manager.hasLayout('X_umap_1d'), false);
+  assert.deepEqual(
+    manager.getLayoutsForDimension(3).map(layout => layout.path),
+    ['embeddings/0_3d.bin'],
+  );
 });
 
 test('dimension cache invalidation aborts fetch and dismisses stale progress', async t => {
@@ -1685,14 +1508,10 @@ test('dimension cache invalidation aborts fetch and dismisses stale progress', a
 
   const manager = new DimensionManager({
     baseUrl: 'https://cellucid.test/data/',
-    embeddingsMetadata: {
-      available_dimensions: [2],
-      default_dimension: 2,
-      files: { '2d': 'points_2d.bin.gz' }
-    }
+    embeddingsMetadata: embeddingsMetadata([['X_umap', 2]], { gzip: true })
   });
 
-  const loading = manager.getPositions3D(2, { showProgress: true });
+  const loading = manager.getPositions('X_umap', { showProgress: true });
   await fetchStarted.promise;
   manager.clearCache();
 
@@ -1713,7 +1532,10 @@ test('dimension clear promptly rejects coalesced direct AnnData work without sta
   let decoderCalls = 0;
 
   installActiveAnnDataAdapter(t, {
-    getEmbedding() {
+    getEmbeddingPayload(path, dimension) {
+      // The layout's identity file and dimension name the payload.
+      assert.equal(path, 'embeddings/0_2d.bin');
+      assert.equal(dimension, 2);
       decoderCalls++;
       decoderStarted.resolve();
       return decoderPayload.promise.finally(() => decoderFinished.resolve());
@@ -1726,15 +1548,11 @@ test('dimension clear promptly rejects coalesced direct AnnData work without sta
   const events = captureDownloadNotifications(t);
   const manager = new DimensionManager({
     baseUrl: 'h5ad://pending-direct-anndata/',
-    embeddingsMetadata: {
-      available_dimensions: [2],
-      default_dimension: 2,
-      files: { '2d': 'points_2d.bin' }
-    }
+    embeddingsMetadata: embeddingsMetadata([['X_umap', 2]])
   });
 
-  const first = manager.getPositions3D(2, { showProgress: true });
-  const second = manager.getPositions3D(2, { showProgress: true });
+  const first = manager.getPositions('X_umap', { showProgress: true });
+  const second = manager.getPositions('X_umap', { showProgress: true });
   const observe = promise => promise.then(
     value => ({ status: 'fulfilled', value }),
     error => ({ error, status: 'rejected' })
@@ -1775,11 +1593,11 @@ test('dimension clear promptly rejects coalesced direct AnnData work without sta
     ['start', 'dismiss'],
     'late decoder completion must not publish success'
   );
-  assert.equal(manager.paddedPositionCache.size, 0);
+  assert.equal(manager.normalizedPositionCache.size, 0);
   assert.equal(manager.normTransformCache.size, 0);
 });
 
-test('concurrent 3D position callers share one padding and progress transaction', async t => {
+test('concurrent 2D position callers share one normalization and progress transaction', async t => {
   const events = captureDownloadNotifications(t);
   const rawPositions = deferred();
   const loadStarted = deferred();
@@ -1787,15 +1605,11 @@ test('concurrent 3D position callers share one padding and progress transaction'
   let loadCalls = 0;
 
   const manager = new DimensionManager({
-    embeddingsMetadata: {
-      available_dimensions: [2],
-      default_dimension: 2,
-      files: { '2d': 'points_2d.bin' }
-    }
+    embeddingsMetadata: embeddingsMetadata([['X_umap', 2]])
   });
-  manager.loadDimension = (dim, options) => {
+  manager.loadLayout = (layoutKey, options) => {
     loadCalls++;
-    loadOptions.push({ dim, options });
+    loadOptions.push({ layoutKey, options });
     loadStarted.resolve();
     return rawPositions.promise;
   };
@@ -1803,8 +1617,8 @@ test('concurrent 3D position callers share one padding and progress transaction'
     rawPositions.resolve(new Float32Array([0, 0, 2, 2]));
   });
 
-  const first = manager.getPositions3D(2, { showProgress: true });
-  const second = manager.getPositions3D(2, { showProgress: true });
+  const first = manager.getPositions('X_umap', { showProgress: true });
+  const second = manager.getPositions('X_umap', { showProgress: true });
   await loadStarted.promise;
   rawPositions.resolve(new Float32Array([0, 0, 2, 2]));
 
@@ -1813,9 +1627,9 @@ test('concurrent 3D position callers share one padding and progress transaction'
   assert.strictEqual(
     firstPositions,
     secondPositions,
-    'all callers must receive the one normalized/padded result'
+    'all callers must receive the one normalized result'
   );
-  assert.equal(loadOptions[0].dim, 2);
+  assert.equal(loadOptions[0].layoutKey, 'X_umap');
   assert.equal(loadOptions[0].options.showProgress, false);
   assert.equal(
     loadOptions[0].options.progressTrackerId,
@@ -1828,140 +1642,117 @@ test('concurrent 3D position callers share one padding and progress transaction'
   );
 });
 
-test('position padding preflights the exact combined working set before coordinate access', async () => {
-  const metadata = {
-    available_dimensions: [2, 3],
-    default_dimension: 2,
-    files: {
-      '2d': 'points_2d.bin',
-      '3d': 'points_3d.bin'
-    }
-  };
-  let coordinateReads = 0;
-  const rejected = new DimensionManager({
+test('position normalization admits every layout beyond the budget and keeps pinned ones', async () => {
+  const metadata = embeddingsMetadata(
+    [['X_umap', 2], ['X_umap_3d', 3]],
+    { defaultDimension: 2 }
+  );
+  // A pinned layout no view shows keeps its 24 bytes; 16 more exceed 31, and
+  // the budget is a residency policy: the second layout still loads.
+  const overBudget = new DimensionManager({
     embeddingsMetadata: metadata,
-    maxPositionBytes: 39
+    maxPositionBytes: 31
   });
-  rejected.loadDimension = async () => unreadPositionProxy(
-    [0, 0, 1, 1],
-    () => {
-      coordinateReads++;
-    }
+  overBudget.loadLayout = async layoutKey => (
+    layoutKey === 'X_umap_3d'
+      ? new Float32Array([0, 0, 0, 1, 1, 1])
+      : new Float32Array([0, 0, 1, 1])
   );
-
-  await assert.rejects(
-    rejected.getPositions3D(2, { showProgress: false }),
-    /2D position.*working set.*browser limit.*Cellucid server/i
-  );
+  overBudget.pinLayout('X_umap_3d');
+  await overBudget.getPositions('X_umap_3d', { showProgress: false });
   assert.equal(
-    coordinateReads,
-    0,
-    'the raw 16-byte input must reject before reading or allocating its 24-byte padded output'
+    (await overBudget.getPositions('X_umap', { showProgress: false })).byteLength,
+    16
   );
+  assert.ok(overBudget.getResidentPositions('X_umap_3d'), 'the pinned layout stays');
+
+  // What the views show, plus the layout being shown, is never refused --
+  // not even above the budget (a browser that reports little memory).
+  const shown = new DimensionManager({
+    embeddingsMetadata: metadata,
+    maxPositionBytes: 15
+  });
+  shown.loadLayout = async () => new Float32Array([0, 0, 1, 1]);
+  assert.equal((await shown.getPositions('X_umap', { showProgress: false })).byteLength, 16);
 
   const exact = new DimensionManager({
     embeddingsMetadata: metadata,
-    maxPositionBytes: 40
+    maxPositionBytes: 16
   });
-  exact.loadDimension = async () => new Float32Array([0, 0, 1, 1]);
-  assert.equal(
-    (await exact.getPositions3D(2, { showProgress: false })).byteLength,
-    24,
-    'raw plus padded bytes equal to the configured limit must remain valid'
+  const raw2D = new Float32Array([0, 0, 1, 1]);
+  exact.loadLayout = async () => raw2D;
+  const normalized2D = await exact.getPositions('X_umap', { showProgress: false });
+  assert.strictEqual(
+    normalized2D,
+    raw2D,
+    'a 2D embedding is normalized in place: no padded or second buffer exists'
   );
+  assert.equal(
+    normalized2D.byteLength,
+    16,
+    'raw bytes equal to the configured limit must remain valid'
+  );
+  assert.deepEqual([...normalized2D], [-1, -1, 1, 1]);
+  assert.deepEqual(exact.getNormTransform('X_umap'), { center: [0.5, 0.5, 0], scale: 2 });
 
   const shared3D = new Float32Array([0, 0, 0, 1, 1, 1]);
   const noCopy = new DimensionManager({
     embeddingsMetadata: metadata,
     maxPositionBytes: shared3D.byteLength
   });
-  noCopy.positionCache.set(3, shared3D);
-  noCopy.loadDimension = async () => shared3D;
+  noCopy.positionCache.set('X_umap_3d', shared3D);
+  noCopy.loadLayout = async () => shared3D;
   assert.strictEqual(
-    await noCopy.getPositions3D(3, { showProgress: false }),
+    await noCopy.getPositions('X_umap_3d', { showProgress: false }),
     shared3D,
     'in-place 3D normalization must count its shared raw/output buffer once'
   );
-
-  const copied3D = new DimensionManager({
-    embeddingsMetadata: metadata,
-    keepRawPositions: true,
-    maxPositionBytes: shared3D.byteLength * 2
-  });
-  copied3D.positionCache.set(3, shared3D);
-  copied3D.loadDimension = async () => shared3D;
-  assert.notStrictEqual(
-    await copied3D.getPositions3D(3, { showProgress: false }),
-    shared3D,
-    'keepRawPositions must reserve the exact additional 3D copy'
+  assert.equal(
+    noCopy.positionCache.has('X_umap_3d'),
+    false,
+    'no raw copy of a normalized layout stays resident'
   );
-
-  const rejectedCopy = new DimensionManager({
-    embeddingsMetadata: metadata,
-    keepRawPositions: true,
-    maxPositionBytes: shared3D.byteLength * 2 - 1
-  });
-  rejectedCopy.positionCache.set(3, shared3D);
-  rejectedCopy.loadDimension = async () => shared3D;
-  await assert.rejects(
-    rejectedCopy.getPositions3D(3, { showProgress: false }),
-    /3D position.*working set.*browser limit.*Cellucid server/i
-  );
+  assert.strictEqual(noCopy.getResidentPositions('X_umap_3d'), shared3D);
 });
 
-test('position padding evicts stale dimension buffers before exceeding the cumulative bound', async () => {
+test('position normalization evicts stale dimension buffers before exceeding the cumulative bound', async () => {
   const manager = new DimensionManager({
-    embeddingsMetadata: {
-      available_dimensions: [1, 2],
-      default_dimension: 2,
-      files: {
-        '1d': 'points_1d.bin',
-        '2d': 'points_2d.bin'
-      }
-    },
-    maxPositionBytes: 40
+    embeddingsMetadata: embeddingsMetadata([['X_umap_1d', 1], ['X_umap', 2]]),
+    maxPositionBytes: 20
   });
-  const rawByDimension = new Map([
-    [1, new Float32Array([0, 1])],
-    [2, new Float32Array([0, 0, 1, 1])]
+  const rawByLayout = new Map([
+    ['X_umap_1d', new Float32Array([0, 1])],
+    ['X_umap', new Float32Array([0, 0, 1, 1])]
   ]);
-  manager.loadDimension = async dim => rawByDimension.get(dim);
+  manager.loadLayout = async layoutKey => rawByLayout.get(layoutKey);
 
-  await manager.getPositions3D(1, { showProgress: false });
-  assert.deepEqual([...manager.paddedPositionCache.keys()], [1]);
+  await manager.getPositions('X_umap_1d', { showProgress: false });
+  assert.deepEqual([...manager.normalizedPositionCache.keys()], ['X_umap_1d']);
 
-  await manager.getPositions3D(2, { showProgress: false });
+  await manager.getPositions('X_umap', { showProgress: false });
   assert.deepEqual(
-    [...manager.paddedPositionCache.keys()],
-    [2],
-    'the stale 24-byte 1D cache must be evicted before the 16+24-byte 2D peak'
+    [...manager.normalizedPositionCache.keys()],
+    ['X_umap'],
+    'the stale 8-byte 1D cache must be evicted before the 16-byte 2D load exceeds 20 bytes'
   );
   assert.ok(
-    [...manager.paddedPositionCache.values()]
-      .reduce((bytes, positions) => bytes + positions.byteLength, 0) <= 40
+    [...manager.normalizedPositionCache.values()]
+      .reduce((bytes, positions) => bytes + positions.byteLength, 0) <= 20
   );
 
   const protectedManager = new DimensionManager({
-    embeddingsMetadata: {
-      available_dimensions: [1, 2],
-      default_dimension: 2,
-      files: {
-        '1d': 'points_1d.bin',
-        '2d': 'points_2d.bin'
-      }
-    },
-    maxPositionBytes: 40
+    embeddingsMetadata: embeddingsMetadata([['X_umap_1d', 1], ['X_umap', 2]]),
+    maxPositionBytes: 20
   });
-  protectedManager.loadDimension = async dim => rawByDimension.get(dim);
-  await protectedManager.getPositions3D(1, { showProgress: false });
-  protectedManager.setViewDimension('snapshot', 1);
-  await assert.rejects(
-    protectedManager.getPositions3D(2, { showProgress: false }),
-    /2D position.*working set.*browser limit.*Cellucid server/i
-  );
+  protectedManager.loadLayout = async layoutKey => rawByLayout.get(layoutKey);
+  await protectedManager.getPositions('X_umap_1d', { showProgress: false });
+  protectedManager.setViewLayout('snapshot', 'X_umap_1d');
+  // 24 bytes is over the 20-byte budget, but it is exactly what the views
+  // show plus the layout being shown, which the budget never refuses.
+  await protectedManager.getPositions('X_umap', { showProgress: false });
   assert.deepEqual(
-    [...protectedManager.paddedPositionCache.keys()],
-    [1],
+    [...protectedManager.normalizedPositionCache.keys()],
+    ['X_umap_1d', 'X_umap'],
     'a cache still assigned to a view must not be evicted as stale'
   );
 });
@@ -1981,8 +1772,8 @@ test('direct position loading fails before publishing success for malformed byte
 
   await assert.rejects(
     loadPointsBinary(
-      'https://cellucid.test/data/points_2d.bin.gz',
-      { expectedBytes: null, showProgress: true }
+      'https://cellucid.test/data/embeddings/0_2d.bin.gz',
+      { dimension: 2, expectedBytes: null, showProgress: true }
     ),
     /byte length|multiple of 4|Float32Array/i
   );
@@ -2010,8 +1801,8 @@ test('Fetch-decoded response progress never compares decoded bytes with encoded 
   });
 
   const points = await loadPointsBinary(
-    'https://cellucid.test/data/points_2d.bin',
-    { expectedBytes: null, showProgress: true }
+    'https://cellucid.test/data/embeddings/0_2d.bin',
+    { dimension: 2, expectedBytes: null, showProgress: true }
   );
 
   assert.deepEqual(Array.from(points), Array.from(decoded));
@@ -2062,11 +1853,39 @@ test('gzip loading requires its one native backend before any request', async t 
 
   await assert.rejects(
     loadPointsBinary(
-      'https://cellucid.test/data/points_2d.bin.gz',
-      { expectedBytes: null, showProgress: false }
+      'https://cellucid.test/data/embeddings/0_2d.bin.gz',
+      { dimension: 2, expectedBytes: null, showProgress: false }
     ),
     /gzip payload.*requires browser DecompressionStream support/i
   );
+  assert.equal(fetchCalls, 0);
+});
+
+test('position loading takes its dimension from the caller, never from the path', async t => {
+  const originalFetch = globalThis.fetch;
+  let fetchCalls = 0;
+  globalThis.fetch = async () => {
+    fetchCalls++;
+    throw new Error('a payload without a dimension must not be requested');
+  };
+  t.after(() => {
+    if (originalFetch === undefined) delete globalThis.fetch;
+    else globalThis.fetch = originalFetch;
+  });
+  // A path that names a dimension does not state it; only the caller does.
+  for (const url of [
+    'https://cellucid.test/data/points_3d.bin',
+    'https://cellucid.test/data/embeddings/0_2d.bin',
+  ]) {
+    for (const dimension of [undefined, 0, 4, '2', 2.5, null]) {
+      const options = { expectedBytes: null };
+      if (dimension !== undefined) options.dimension = dimension;
+      await assert.rejects(
+        loadPointsBinary(url, options),
+        /requires the payload dimension: exactly 1, 2, or 3/
+      );
+    }
+  }
   assert.equal(fetchCalls, 0);
 });
 
@@ -2118,34 +1937,30 @@ test('prepared gzip loaders expose one exact decompression backend', async () =>
   );
 });
 
-test('3D position padding owns one outer progress transaction', async t => {
+test('position normalization owns one outer progress transaction', async t => {
   const createManager = () => new DimensionManager({
-    embeddingsMetadata: {
-      available_dimensions: [2],
-      default_dimension: 2,
-      files: { '2d': 'points.bin' }
-    }
+    embeddingsMetadata: embeddingsMetadata([['X_umap', 2]])
   });
 
   const silentManager = createManager();
   const silentOptions = [];
-  silentManager.loadDimension = async (dim, options) => {
-    silentOptions.push({ dim, options });
+  silentManager.loadLayout = async (layoutKey, options) => {
+    silentOptions.push({ layoutKey, options });
     return new Float32Array([0, 0, 1, 1]);
   };
-  await silentManager.getPositions3D(2, { showProgress: false });
-  assert.equal(silentOptions[0].dim, 2);
+  await silentManager.getPositions('X_umap', { showProgress: false });
+  assert.equal(silentOptions[0].layoutKey, 'X_umap');
   assert.equal(silentOptions[0].options.showProgress, false);
   assert.equal(silentOptions[0].options.progressTrackerId, null);
 
   const events = captureDownloadNotifications(t);
   const directManager = createManager();
   const directOptions = [];
-  directManager.loadDimension = async (dim, options) => {
-    directOptions.push({ dim, options });
+  directManager.loadLayout = async (layoutKey, options) => {
+    directOptions.push({ layoutKey, options });
     return new Float32Array([0, 0, 1, 1]);
   };
-  await directManager.getPositions3D(2);
+  await directManager.getPositions('X_umap');
   assert.equal(directOptions[0].options.showProgress, false);
   assert.equal(
     directOptions[0].options.progressTrackerId,
@@ -2183,10 +1998,10 @@ test('in-place reload stages one generation before reversible publication', asyn
     'application staging must reject a non-directory source URL, not repair it'
   );
   const selectionStageIndex = reloadSource.indexOf(
-    'selectionStage = await dataSourceManager.stageDatasetSelection('
+    'dataSourceManager.stageDatasetSelection('
   );
   const urlStageIndex = reloadSource.indexOf(
-    'urlPublication = prepareUrlForDatasetSelection({'
+    'prepareUrlForDatasetSelection({'
   );
   const runtimeStageIndex = reloadSource.indexOf(
     'runtimeStage = await stageDatasetRuntime({'
@@ -2232,7 +2047,7 @@ test('in-place reload stages one generation before reversible publication', asyn
   );
   assert.match(
     reloadSource.slice(runtimeStageIndex, stagingCatch),
-    /baseUrl:\s*selectionStage\.baseUrl[\s\S]*candidateAnnDataBinding,[\s\S]*expectedIdentityId:\s*selectionStage\.identityId[\s\S]*showProgress:\s*false[\s\S]*signal:\s*reloadTransaction\.signal,[\s\S]*stagedSource/
+    /baseUrl:\s*selectionStage\.baseUrl[\s\S]*candidateAnnDataBinding,[\s\S]*expectedIdentityId:\s*selectionStage\.identityId[\s\S]*showProgress:\s*isStartupLoad[\s\S]*signal:\s*reloadTransaction\.signal,[\s\S]*stagedSource/
   );
   assert.match(stagingCatchSource, /if \(runtimeStage !== null\)/);
   assert.equal(
@@ -2271,7 +2086,7 @@ test('in-place reload stages one generation before reversible publication', asyn
     runtimeCommitIndex
   );
   const successIndex = reloadSource.indexOf(
-    'complete: () => completeDataLoadSuccess('
+    'complete: () => dataLoad.succeed({'
   );
   const uiSyncIndex = reloadSource.indexOf(
     'const synchronizationOutcome = await synchronizePublishedDatasetUi('
@@ -2408,7 +2223,7 @@ test(
 
     const uiSynchronization = slice(
       'async function synchronizePublishedDatasetUi',
-      'const hasInitialDataset ='
+      '// Startup publishes the empty runtime'
     );
     requireBefore(
       uiSynchronization,
@@ -2437,31 +2252,6 @@ test(
       /transaction\.(?:assertCurrent|isCurrent|signal)/
     );
 
-    const initialPublication = slice(
-      'if (hasInitialDataset) {',
-      '// Setup connectivity controls',
-      mainSource.indexOf('// Initialize Page Analysis / Comparison Module')
-    );
-    const initialSyncCheck = requireCheckAfter(
-      initialPublication,
-      'await synchronizePublishedDatasetUi(',
-      'assertCurrentDatasetPublication(initialPublication)'
-    );
-    requireCheckAfter(
-      initialPublication,
-      'await ui.activateField(-1)',
-      'assertCurrentDatasetPublication(initialPublication)',
-      initialSyncCheck + 1
-    );
-    assert.match(
-      initialPublication,
-      /restoreAdvertisedDatasetState\(\{\s*signal:\s*initialPublication\.signal/s
-    );
-    assert.match(
-      initialPublication,
-      /transaction:\s*initialPublication/
-    );
-
     const reload = slice(
       'async function reloadActiveDatasetInPlace',
       'async function clearActiveDatasetInPlace'
@@ -2481,9 +2271,11 @@ test(
       reloadUiCheck > reloadManagerFinalization,
       'live publication must finalize its prior source before a stale continuation exits'
     );
+    // Startup's sample-view requests are deadline-bound startup steps; both
+    // end with the publication that owns them.
     assert.match(
       reload,
-      /restoreAdvertisedDatasetState\(\{\s*signal:\s*publication\.signal/s
+      /restoreAdvertisedDatasetState\(\{\s*requestStep: isStartupLoad\s*\? \(url, operation\) => startup\.step\('session', url, operation\)\s*: \(_url, operation\) => operation\(publication\.signal\),\s*signal: publication\.signal/s
     );
     assert.match(
       reload,
@@ -2655,7 +2447,7 @@ test('scientific publication excludes fallible UI and global reset work', async 
     commitStart
   );
   const initialStart = mainSource.indexOf(
-    'const hasInitialDataset =',
+    '// Startup publishes the empty runtime',
     synchronizeStart
   );
   assert.ok(
@@ -2740,10 +2532,14 @@ test('connectivity edge publication has one abortable generation owner', async (
       ?.length,
     2
   );
+  // The graph in use is read from where its manifest was published: the
+  // dataset's own connectivity_manifest.json or a mapped graph's.
   assert.match(
     connectivitySource,
-    /loadEdges\(\s*getConnectivityManifestUrl\(owner\.exportBaseUrl\),\s*owner\.manifest,\s*\{ signal: owner\.controller\.signal \}/s
+    /loadEdges\(\s*owner\.manifestUrl,\s*owner\.manifest,\s*\{ signal: owner\.controller\.signal \}/s
   );
+  assert.match(connectivitySource, /manifestUrl: connectivityManifestUrl/);
+  assert.match(connectivitySource, /owner\.manifestUrl !== connectivityManifestUrl/);
   assert.match(
     connectivitySource,
     /publicationGeneration: datasetPublicationGeneration/
@@ -2766,10 +2562,9 @@ test('connectivity edge publication has one abortable generation owner', async (
     connectivitySource,
     /(?:sources|destinations|weights): edgeData\.\w+\.slice\(\)/
   );
-  assert.match(
-    connectivitySource,
-    /shuffleEdges\(\s*edgeData\.sources,\s*edgeData\.destinations,\s*edgeData\.weights\s*\)/s
-  );
+  // The shown order is computed, never stored: the loaded arrays are not
+  // reordered or copied.
+  assert.doesNotMatch(connectivitySource, /shuffle/i);
   assert.match(
     connectivitySource,
     /loadedEdgeData = publishedEdgeData/
@@ -2810,11 +2605,11 @@ test('connectivity edge publication has one abortable generation owner', async (
   assert.doesNotMatch(mainSource, /POINT_VISIBILITY_THRESHOLD/);
   assert.match(
     connectivitySource,
-    /viewer\.refreshEdgePrefixForView\(viewId\)/
+    /viewer\.refreshEdgeSelectionForView\(viewId\)/
   );
   assert.match(
     connectivitySource,
-    /viewer\.setEdgeVisibleTarget\(currentEdgeLimit\)/
+    /viewer\.setEdgeVisibleTarget\(\s*Math\.min\(currentEdgeLimit, getTotalEdges\(\)\)\s*\)/s
   );
   assert.match(connectivitySource, /viewer\.onLodChanged\(event =>/);
   assert.match(
@@ -2939,7 +2734,10 @@ test('isolated local dataset candidates publish one truthful terminal outcome', 
     assert.deepEqual(result.browserState.historyReplacements, []);
   });
 
-  await t.test('false activation outcome is a failure, never ready', async t => {
+  await t.test('false activation outcome is never ready and never announced twice', async t => {
+    // `false` is the dataset controls saying they have already explained the
+    // failure next to the dataset select, so the file's own progress entry is
+    // withdrawn rather than failed with a second message.
     const result = await runLocalSelection(t, {
       activateDataset: async () => false
     });
@@ -2947,11 +2745,11 @@ test('isolated local dataset candidates publish one truthful terminal outcome', 
     const terminal = result.notificationEvents.filter(
       event => event.kind === 'complete' || event.kind === 'fail'
     );
-    assert.deepEqual(
-      terminal.map(event => event.kind),
-      ['fail']
+    assert.deepEqual(terminal, []);
+    assert.equal(
+      result.notificationEvents.some(event => event.kind === 'dismiss'),
+      true
     );
-    assert.match(terminal[0].message, /did not publish one ready generation/i);
     assert.equal(result.candidate.disconnectCalls, 1);
     assert.equal(result.populateCalls, 0);
   });
@@ -3051,10 +2849,10 @@ test('local validation failures publish the validator error message exactly', as
   let activationCalls = 0;
 
   initDatasetConnections({
-    activateDataset: async () => {
+    datasetIntents: createTestDatasetIntents(async () => {
       activationCalls++;
       return true;
-    },
+    }),
     clearDataset: async () => true,
     dom: {
       select: { focus() {} },
@@ -3089,10 +2887,8 @@ test('local validation failures publish the validator error message exactly', as
 });
 
 test('connection analytics expose only exact current load methods', () => {
-  assert.equal(
-    DATA_LOAD_METHODS.LOCAL_ZARR_DIRECTORY,
-    'local-user-zarr-directory'
-  );
+  // The browser opens Zarr only as a ZIP archive; a directory method would
+  // name a load path that no longer exists.
   assert.equal(
     DATA_LOAD_METHODS.LOCAL_ZARR_ZIP,
     'local-user-zarr-zip'
@@ -3100,7 +2896,7 @@ test('connection analytics expose only exact current load methods', () => {
   assert.deepEqual(
     Object.keys(DATA_LOAD_METHODS)
       .filter(key => key.startsWith('LOCAL_ZARR')),
-    ['LOCAL_ZARR_DIRECTORY', 'LOCAL_ZARR_ZIP']
+    ['LOCAL_ZARR_ZIP']
   );
   assert.equal(
     Object.values(DATA_LOAD_METHODS)
@@ -3137,7 +2933,7 @@ test('disconnect controls clear only their connection and never choose science',
         textContent: '',
       });
       const disconnectButton = createButton();
-      const disconnectContainer = { style: {} };
+      const disconnectContainer = { hidden: false };
       const field = { disabled: false, value: '' };
       const dom = {
         select: { focus() {} },
@@ -3184,9 +2980,9 @@ test('disconnect controls clear only their connection and never choose science',
       let currentSourceType = connection.sourceType;
 
       initDatasetConnections({
-        activateDataset: async () => {
+        datasetIntents: createTestDatasetIntents(async () => {
           assert.fail('disconnect must not activate a dataset');
-        },
+        }),
         clearDataset: async () => {
           clearCalls++;
           currentSourceType = null;
@@ -3217,7 +3013,7 @@ test('disconnect controls clear only their connection and never choose science',
 
       assert.equal(disconnectCalls, 1);
       assert.equal(connectButton.textContent, 'Connect');
-      assert.equal(disconnectContainer.style.display, 'none');
+      assert.equal(disconnectContainer.hidden, true);
       assert.equal(field.disabled, false);
       assert.deepEqual(sourceLookups, [connection.sourceType]);
       assert.equal(clearCalls, 1);
@@ -3270,7 +3066,7 @@ test('dedicated Zarr ZIP control opens and activates the portable archive input'
   const sources = new Map([['local-user', registeredSource]]);
 
   initDatasetConnections({
-    activateDataset: async (
+    datasetIntents: createTestDatasetIntents(async (
       datasetId,
       sourceType,
       loadMethod,
@@ -3279,7 +3075,7 @@ test('dedicated Zarr ZIP control opens and activates the portable archive input'
       activation = { datasetId, loadMethod, source, sourceType };
       sources.set(sourceType, source);
       return true;
-    },
+    }),
     clearDataset: async () => true,
     dom: {
       select: { focus() {} },
@@ -3368,7 +3164,7 @@ test('browser local-data wiring invokes only portable current transports', async
   const sources = new Map([['local-user', createUserSource()]]);
 
   initDatasetConnections({
-    activateDataset: async (
+    datasetIntents: createTestDatasetIntents(async (
       datasetId,
       sourceType,
       loadMethod,
@@ -3382,7 +3178,7 @@ test('browser local-data wiring invokes only portable current transports', async
       });
       sources.set(sourceType, source);
       return true;
-    },
+    }),
     clearDataset: async () => true,
     dom: {
       select: { focus() {} },

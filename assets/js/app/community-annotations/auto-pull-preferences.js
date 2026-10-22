@@ -98,7 +98,7 @@ function assertPreferenceEntry(value, scopeKey) {
   };
 }
 
-export function assertAutoPullPreferences(value) {
+function assertAutoPullPreferences(value) {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
     throw new Error('Auto-pull preferences must be a JSON object');
   }

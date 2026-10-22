@@ -21,6 +21,9 @@ import {
   getDataSourceManager,
 } from '../assets/js/data/data-source-manager.js';
 import {
+  DimensionManager,
+} from '../assets/js/data/dimension-manager.js';
+import {
   InlineEditor,
 } from '../assets/js/app/ui/components/inline-editor.js';
 import {
@@ -193,9 +196,7 @@ test('inline field editors replace one exact target owner and clean up callback 
     parentNode: {
       insertBefore() {},
     },
-    style: {
-      display: '',
-    },
+    hidden: false,
   };
   let firstCancellations = 0;
   const first = InlineEditor.create(target, 'first', {
@@ -213,7 +214,8 @@ test('inline field editors replace one exact target owner and clean up callback 
 
   assert.equal(firstCancellations, 1);
   assert.equal(first.removed, true);
-  assert.equal(target.style.display, 'none');
+  // The label is hidden while its editor stands in for it.
+  assert.equal(target.hidden, true);
   second.value = 'changed';
   assert.throws(
     () => second.listeners.get('keydown')({
@@ -224,7 +226,7 @@ test('inline field editors replace one exact target owner and clean up callback 
   );
   assert.equal(second.removed, true);
   assert.equal(InlineEditor.cancel(second), false);
-  assert.equal(target.style.display, '');
+  assert.equal(target.hidden, false);
 });
 
 test('replacing a confirm dialog synchronously cancels its prior owner', t => {
@@ -775,7 +777,7 @@ test(
         },
         ensureFieldLoaded: () => load.promise,
         _userDefinedFields: {
-          computeCentroidsByDim() {},
+          computeCentroidsByLayout() {},
           createContinuousAlias() {
             registryMutations++;
             throw new Error('replacement registry was mutated');
@@ -1187,16 +1189,52 @@ test(
   },
 );
 
+const SESSION_DATA_MAPPING = Object.freeze({
+  kind: 'export',
+  embeddings: {
+    enabled: [{ key: 'X_umap_3d', columns: null }],
+    defaults: { '1d': null, '2d': null, '3d': { key: 'X_umap_3d', columns: null } },
+  },
+  geneNames: 'index',
+  vectorFields: [],
+});
+
+/**
+ * Give a DataState stub what a session fingerprint reads besides its arrays:
+ * the data mapping, the live view's layout key and the dimension manager
+ * that names that layout.
+ */
+function withFingerprintOwners(state, mapping = SESSION_DATA_MAPPING) {
+  const dimensionManager = new DimensionManager();
+  dimensionManager.registerLayouts([{
+    layoutKey: 'X_umap_3d',
+    dimension: 3,
+    label: 'UMAP 3D',
+    path: 'embeddings/0_3d.bin',
+    provenance: null,
+    origin: 'identity',
+  }]);
+  dimensionManager.setRepresentations(['X_umap_3d'], new Map([[3, 'X_umap_3d']]));
+  state.dimensionManager = dimensionManager;
+  state.dataMapping = mapping;
+  state.getDataMapping = () => state.dataMapping;
+  state.getViewLayoutKey = viewId => {
+    assert.equal(viewId, 'live');
+    return 'X_umap_3d';
+  };
+  return state;
+}
+
 function createSessionSerializer(contributor) {
   return new SessionSerializer({
-    state: {
+    state: withFingerprintOwners({
       getDatasetGeneration: () => 0,
       obsData: { fields: [] },
       pointCount: 0,
       getViewDimensionLevel: () => 3,
       positionsArray: new Float32Array(0),
       varData: { fields: [] },
-    },
+    }),
     viewer: {},
     sidebar: {},
     dataSourceManager: null,
@@ -1271,14 +1309,14 @@ test(
     const entered = deferred();
     const release = deferred();
     let generation = 1;
-    const state = {
+    const state = withFingerprintOwners({
       getDatasetGeneration: () => generation,
       obsData: { fields: [] },
       pointCount: 2,
       getViewDimensionLevel: () => 3,
       positionsArray: new Float32Array(6),
       varData: { fields: [{ key: 'GENE_A' }] },
-    };
+    });
     const serializer = new SessionSerializer({
       state,
       viewer: {},
@@ -1322,6 +1360,64 @@ test(
     await assert.rejects(
       capture,
       /dataset.*(?:changed|replaced|generation)/i,
+    );
+  },
+);
+
+test(
+  'session capture rejects a data mapping replaced between contributor awaits',
+  async () => {
+    const entered = deferred();
+    const release = deferred();
+    // Same generation, same arrays: only the mapping the dataset is shown
+    // with changes, which changes what every saved selection is bound to.
+    const state = withFingerprintOwners({
+      getDatasetGeneration: () => 1,
+      obsData: { fields: [] },
+      pointCount: 2,
+      getViewDimensionLevel: () => 3,
+      positionsArray: new Float32Array(6),
+      varData: { fields: [{ key: 'GENE_A' }] },
+    });
+    const serializer = new SessionSerializer({
+      state,
+      viewer: {},
+      sidebar: {},
+      dataSourceManager: null,
+      comparisonModule: null,
+      analysisWindowManager: null,
+      cinematicCamera: null,
+      contributors: [{
+        id: 'dataset-owned',
+        async capture() {
+          entered.resolve();
+          await release.promise;
+          return [{
+            id: 'dataset/owned',
+            contributorId: 'dataset-owned',
+            priority: 'eager',
+            kind: 'json',
+            codec: 'none',
+            label: 'Dataset-owned state',
+            datasetDependent: true,
+            payload: { capturedCount: state.pointCount },
+          }];
+        },
+        restore() {},
+      }],
+    });
+
+    const capture = serializer.createSessionBundle();
+    await entered.promise;
+    state.dataMapping = { ...SESSION_DATA_MAPPING, geneNames: 'column:gene_symbols' };
+    release.resolve();
+
+    await assert.rejects(
+      capture,
+      error => (
+        error.code === 'SESSION_CAPTURE_DATASET_CHANGED'
+        && /dataset.*(?:changed|replaced|generation)/i.test(error.message)
+      ),
     );
   },
 );

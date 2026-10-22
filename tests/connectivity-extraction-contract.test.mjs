@@ -1,7 +1,9 @@
+import './helpers/anndata-reader-in-process.mjs';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { BaseAnnDataAdapter } from '../assets/js/data/base-anndata-adapter.js';
+import { loaderMetadata, obsmColumnReader } from './helpers/anndata-mapping-mocks.mjs';
 import {
   loadConnectivityManifest,
   loadEdges,
@@ -14,6 +16,7 @@ import {
   extractConnectivityEdges,
 } from '../assets/js/data/sparse-utils.js';
 import { ZarrDataSource } from '../assets/js/data/zarr.js';
+import { connectivityEdgesOf } from '../assets/js/data/sparse-utils.js';
 
 function dense(values) {
   return {
@@ -237,45 +240,23 @@ function createDirectLoader(connectivity) {
     hasExpressionMatrix: false,
     varNames: [],
     obsKeys: [],
-    obsmKeys: ['X_umap_2d'],
     connectivityCalls: 0,
     async getDatasetMetadata() {
-      return {
-        version: 2,
-        name: 'private-loader-metadata',
-        description: '',
-        cellucid_data_version: 'private-loader',
-        stats: {
-          n_cells: 2,
-          n_genes: 0,
-          n_obs_fields: 0,
-          n_categorical_fields: 0,
-          n_continuous_fields: 0,
-          has_connectivity: true,
-          n_edges: null,
-        },
-        embeddings: {
-          available_dimensions: [2],
-          default_dimension: 2,
-          obsm_keys: { '2d': 'X_umap_2d' },
-          has_expression_matrix: false,
-        },
-        obs_fields: [],
-      };
+      return loaderMetadata({
+        nObs: 2,
+        obsm: { X_umap_2d: 2 },
+        // The loader lists obsp['connectivities'] exactly when it has one.
+        connectivities: connectivity !== null,
+        stats: { n_edges: null },
+      });
     },
-    async getEmbeddingShape(key) {
-      assert.equal(key, 'X_umap_2d');
-      return { nCells: 2, nDims: 2 };
+    readObsmColumns: obsmColumnReader({
+      X_umap_2d: { data: [0, 0, 1, 1], width: 2 },
+    }),
+    async getConnectivityEdges() {
+      return connectivityEdgesOf(await this.readConnectivityMatrix(), this.nObs);
     },
-    async getEmbedding(key) {
-      assert.equal(key, 'X_umap_2d');
-      return {
-        data: Float32Array.from([0, 0, 1, 1]),
-        nDims: 2,
-      };
-    },
-    releaseEmbedding() {},
-    async getConnectivities() {
+    async readConnectivityMatrix() {
       this.connectivityCalls++;
       return connectivity;
     },

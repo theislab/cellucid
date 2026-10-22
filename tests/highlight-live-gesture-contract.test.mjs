@@ -10,6 +10,7 @@ import {
   ANNOTATION_RANGE_DRAG_THRESHOLD_PX,
   annotationGestureType
 } from '../assets/js/app/ui/modules/highlight/annotation-cells.js';
+import { SELECTION_NOTICE } from '../assets/js/app/ui/modules/highlight/mode-copy.js';
 
 const CATEGORY_CODES = Uint8Array.from([0, 0, 1, 1, 2, 2]);
 const CATEGORY_FIELD = Object.freeze({
@@ -23,6 +24,7 @@ const CATEGORY_FIELD = Object.freeze({
 const CONTINUOUS_VALUES = Float32Array.from([0, 2, 4, 6, 6.3, 10]);
 const CONTINUOUS_FIELD = Object.freeze({
   kind: 'continuous',
+  values: CONTINUOUS_VALUES,
   _continuousStats: { min: 0, max: 10 }
 });
 
@@ -113,16 +115,19 @@ function withDocument(documentStub, callback) {
   }
 }
 
-function createState(field) {
+/**
+ * `field` is the focused view's field; `paneFields` maps other panes to the
+ * field each is colored by, as `DataState.getFieldForView` resolves them.
+ */
+function createState(field, paneFields = new Map()) {
   const previews = [];
+  const lookups = [];
   const stateListeners = new Map();
   return {
     previews,
+    lookups,
     state: {
       pointCount: CATEGORY_CODES.length,
-      activeFieldIndex: 0,
-      activeFieldSource: 'obs',
-      activeVarFieldIndex: -1,
       addHighlightDirect({ type, label, cellIndices }) {
         return {
           id: 'highlight_1',
@@ -139,26 +144,25 @@ function createState(field) {
       getActiveField() {
         return field;
       },
-      getCategoryForCell(cellIndex) {
-        return CATEGORY_CODES[cellIndex];
+      getFieldForView(viewId) {
+        return paneFields.has(viewId) ? paneFields.get(viewId) : field;
       },
-      getCellIndicesForCategory(_fieldIndex, categoryIndex) {
+      getCellIndicesForCategory(lookupField, categoryIndex, transparency) {
+        lookups.push({ field: lookupField, transparency });
         const indices = [];
-        for (let cell = 0; cell < CATEGORY_CODES.length; cell++) {
-          if (CATEGORY_CODES[cell] === categoryIndex) indices.push(cell);
+        for (let cell = 0; cell < lookupField.codes.length; cell++) {
+          if (lookupField.codes[cell] === categoryIndex) indices.push(cell);
         }
         return indices;
       },
-      getCellIndicesForRange(_fieldIndex, minVal, maxVal) {
+      getCellIndicesForRange(lookupField, minVal, maxVal, transparency) {
+        lookups.push({ field: lookupField, transparency });
         const indices = [];
-        for (let cell = 0; cell < CONTINUOUS_VALUES.length; cell++) {
-          const value = CONTINUOUS_VALUES[cell];
+        for (let cell = 0; cell < lookupField.values.length; cell++) {
+          const value = lookupField.values[cell];
           if (value >= minVal && value <= maxVal) indices.push(cell);
         }
         return indices;
-      },
-      getValueForCell(cellIndex) {
-        return CONTINUOUS_VALUES[cellIndex];
       },
       on(eventName, listener) {
         if (!stateListeners.has(eventName)) stateListeners.set(eventName, []);
@@ -186,13 +190,20 @@ function createState(field) {
 
 function createViewer() {
   const restoreCalls = [];
+  const transparencies = new Map();
   return {
     restoreCalls,
     viewer: {
       cancelAnnotationSelection() {},
       confirmAnnotationSelection() {},
-      getViewTransparency() {
-        return Float32Array.from(CATEGORY_CODES).fill(1);
+      getViewTransparency(viewId) {
+        if (!transparencies.has(viewId)) {
+          transparencies.set(viewId, new Uint8Array(CATEGORY_CODES.length).fill(1));
+        }
+        return transparencies.get(viewId);
+      },
+      onPresentedLayoutChange() {
+        return () => {};
       },
       restoreUnifiedState(candidates, step) {
         restoreCalls.push({ candidates: [...candidates], step });
@@ -237,9 +248,9 @@ function stepEvent(overrides) {
  * Build one annotation tool plus its drag preview over one shared selection
  * state, exactly the way `highlight-selection-tools.js` composes them.
  */
-function buildAnnotationTool(field) {
+function buildAnnotationTool(field, paneFields = new Map()) {
   const documentOwner = createDocumentStub();
-  const { state, previews } = createState(field);
+  const { state, previews, lookups } = createState(field, paneFields);
   const { viewer, restoreCalls } = createViewer();
   const selectionState = createHighlightSelectionState();
   const modeDescriptionEl = createElementStub('highlight-mode-description');
@@ -271,6 +282,8 @@ function buildAnnotationTool(field) {
   return {
     ...built,
     documentOwner,
+    lookups,
+    modeDescriptionEl,
     previews,
     rangeLabels,
     restoreCalls,
@@ -389,13 +402,98 @@ test('a continuous preview past the drag threshold matches the range it commits'
   );
 });
 
-test('the annotation preview requires an active field, not a continuous one', () => {
-  const tool = buildAnnotationTool(null);
-  assert.throws(
-    () => tool.run(() => {
-      tool.viewer.previewCallback(previewEvent({ cellIndex: 0 }));
-    }),
-    /requires an active field/i
+test('a gesture in a panel colored by no field previews and commits nothing', () => {
+  const tool = buildAnnotationTool(
+    CATEGORY_FIELD,
+    new Map([['snapshot_1', null]])
+  );
+  tool.run(() => {
+    tool.annotation.handleAnnotationStep(stepEvent({ cellIndex: 0 }));
+  });
+  tool.previews.length = 0;
+
+  tool.run(() => {
+    tool.viewer.previewCallback(
+      previewEvent({ cellIndex: 2, viewId: 'snapshot_1' })
+    );
+    tool.annotation.handleAnnotationStep(
+      stepEvent({ cellIndex: 2, viewId: 'snapshot_1' })
+    );
+  });
+
+  assert.deepEqual(
+    tool.previews,
+    [[0, 1], [0, 1]],
+    'the standing selection is all that the preview and the release show'
+  );
+  assert.deepEqual([...tool.selectionState.annotationCandidateSet], [0, 1]);
+  assert.equal(tool.selectionState.annotationStepCount, 1);
+  assert.ok(
+    tool.modeDescriptionEl.innerHTML.includes(SELECTION_NOTICE.noPanelField),
+    'the panel says the pressed panel has no field'
+  );
+});
+
+test('a gesture in an unfocused pane reads that pane\'s field and visibility', () => {
+  // The focused view is colored by a continuous field; the pane the gesture
+  // lands in is colored by a categorical one. Focus does not move on a
+  // selection gesture, so only the pane can say which field to read.
+  const categoricalPane = buildAnnotationTool(
+    CONTINUOUS_FIELD,
+    new Map([['snapshot_1', CATEGORY_FIELD]])
+  );
+  categoricalPane.run(() => {
+    categoricalPane.viewer.previewCallback(
+      previewEvent({ cellIndex: 2, viewId: 'snapshot_1' })
+    );
+    categoricalPane.annotation.handleAnnotationStep(
+      stepEvent({ cellIndex: 2, viewId: 'snapshot_1' })
+    );
+  });
+  assert.deepEqual(
+    categoricalPane.previews,
+    [[2, 3], [2, 3]],
+    'the preview and the commit select the clicked cell\'s category in the pane'
+  );
+  assert.deepEqual(
+    categoricalPane.rangeLabels.filter(label => label !== null),
+    [],
+    'a categorical pane publishes no value range'
+  );
+  const paneTransparency =
+    categoricalPane.viewer.getViewTransparency('snapshot_1');
+  assert.ok(
+    categoricalPane.lookups.length === 2
+      && categoricalPane.lookups.every(lookup => (
+        lookup.field === CATEGORY_FIELD
+        && lookup.transparency === paneTransparency
+      )),
+    'both lookups read the pane\'s field and the pane\'s transparency'
+  );
+
+  // And the other way round: a continuous pane beside a categorical focus.
+  const continuousPane = buildAnnotationTool(
+    CATEGORY_FIELD,
+    new Map([['snapshot_1', CONTINUOUS_FIELD]])
+  );
+  const dragDeltaY = -(ANNOTATION_RANGE_DRAG_THRESHOLD_PX + 200);
+  continuousPane.run(() => {
+    continuousPane.viewer.previewCallback(
+      previewEvent({ cellIndex: 1, dragDeltaY, viewId: 'snapshot_1' })
+    );
+    continuousPane.annotation.handleAnnotationStep(
+      stepEvent({ type: 'range', cellIndex: 1, dragDeltaY, viewId: 'snapshot_1' })
+    );
+  });
+  assert.deepEqual(
+    continuousPane.rangeLabels.find(label => label !== null),
+    { minVal: 2, maxVal: 10 },
+    'the range label reads the pane\'s continuous statistics'
+  );
+  assert.deepEqual(
+    continuousPane.previews,
+    [[1, 2, 3, 4, 5], [1, 2, 3, 4, 5]],
+    'the preview and the commit select the pane\'s value range'
   );
 });
 

@@ -252,7 +252,7 @@ test(
     };
     owner._modalPlotSlot = null;
     owner._pendingModalCloseTasks = new Set([modalRetirement.promise]);
-    owner._layoutEngine = {};
+    owner._committedView = null;
 
     const first = owner.destroy();
     const repeated = owner.destroy();
@@ -289,7 +289,7 @@ test(
     owner._previewPlotSlot = null;
     owner._modalPlotSlot = null;
     owner._pendingModalCloseTasks = new Set();
-    owner._layoutEngine = {};
+    owner._committedView = null;
     const requestId = owner._startAnalysisRequest();
     owner._registerAnalysisInvalidationCleanup(requestId, () => {
       throw sentinel;
@@ -338,7 +338,6 @@ test(
     quick._cache = new Map();
     quick._fieldPickers = { categorical: null, continuous: null };
     quick._pageSelector = null;
-    quick._detailsToggleListener = null;
     quick._container = null;
 
     const first = {

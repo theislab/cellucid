@@ -9,14 +9,17 @@
 // Generates Perlin-Worley and detail noise textures entirely on the GPU
 // Orders of magnitude faster than CPU/Web Worker generation
 
+import { contextLostError, requireCleanWebGLState } from '../gl-errors.js';
+import {
+  MAX_SMOKE_NOISE_RESOLUTION,
+  MIN_SMOKE_NOISE_RESOLUTION,
+} from './smoke-density-contract.js';
 import {
   NOISE_VS,
   SHAPE_NOISE_FS,
   DETAIL_NOISE_FS,
   BLUE_NOISE_FS
 } from '../shaders/noise-shaders.js';
-
-const pendingNoiseCleanupByContext = new WeakMap();
 
 function asError(value, fallbackMessage) {
   return value instanceof Error ? value : new Error(fallbackMessage);
@@ -35,109 +38,6 @@ function throwFailures(failures, message) {
   throw new AggregateError(failures, message);
 }
 
-function deleteTextures(gl, textures, failures) {
-  for (const texture of textures) {
-    if (!texture) continue;
-    attempt(
-      failures,
-      () => gl.deleteTexture(texture),
-      'GPU noise texture rollback failed with a non-Error value.'
-    );
-  }
-}
-
-function getPendingNoiseCleanup(gl, create = false) {
-  let pending = pendingNoiseCleanupByContext.get(gl);
-  if (!pending && create) {
-    pending = {
-      generators: new Set(),
-      textures: new Set(),
-    };
-    pendingNoiseCleanupByContext.set(gl, pending);
-  }
-  return pending ?? null;
-}
-
-function retainPendingNoiseGenerator(gl, generator) {
-  getPendingNoiseCleanup(gl, true).generators.add(generator);
-}
-
-function retireUnpublishedNoiseTextures(gl, textures, failures) {
-  const pending = getPendingNoiseCleanup(gl, true);
-  for (const texture of new Set(textures)) {
-    if (!texture) continue;
-    try {
-      gl.deleteTexture(texture);
-    } catch (error) {
-      pending.textures.add(texture);
-      failures.push(asError(
-        error,
-        'Unpublished GPU noise texture cleanup failed with a non-Error value.'
-      ));
-    }
-  }
-  if (
-    pending.generators.size === 0
-    && pending.textures.size === 0
-  ) {
-    pendingNoiseCleanupByContext.delete(gl);
-  }
-}
-
-export function disposePendingCloudNoiseGeneratorResources(gl) {
-  if (!gl || typeof gl !== 'object') {
-    throw new TypeError(
-      'Pending GPU noise disposal requires a WebGL2 rendering context.'
-    );
-  }
-  const pending = getPendingNoiseCleanup(gl);
-  if (!pending) return false;
-
-  const failures = [];
-  for (const generator of pending.generators) {
-    try {
-      generator.dispose();
-      pending.generators.delete(generator);
-    } catch (error) {
-      failures.push(asError(
-        error,
-        'Pending GPU noise generator disposal failed with a non-Error value.'
-      ));
-    }
-  }
-  for (const texture of pending.textures) {
-    try {
-      gl.deleteTexture(texture);
-      pending.textures.delete(texture);
-    } catch (error) {
-      failures.push(asError(
-        error,
-        'Pending GPU noise texture disposal failed with a non-Error value.'
-      ));
-    }
-  }
-
-  if (
-    pending.generators.size === 0
-    && pending.textures.size === 0
-  ) {
-    pendingNoiseCleanupByContext.delete(gl);
-  }
-  if (failures.length > 0) {
-    throwFailures(failures, 'Pending GPU noise disposal failed.');
-  }
-  return true;
-}
-
-export function invalidatePendingCloudNoiseGeneratorResources(gl) {
-  if (!gl || typeof gl !== 'object') {
-    throw new TypeError(
-      'Pending GPU noise invalidation requires a WebGL2 rendering context.'
-    );
-  }
-  return pendingNoiseCleanupByContext.delete(gl);
-}
-
 function noiseCapabilities(gl) {
   return [
     gl.BLEND,
@@ -154,26 +54,10 @@ function noiseCapabilities(gl) {
 
 function assertContextAvailable(gl, owner) {
   if (typeof gl.isContextLost === 'function' && gl.isContextLost()) {
-    throw new Error(`${owner} cannot run after WebGL context loss.`);
+    throw contextLostError(owner);
   }
 }
 
-function readWebGLErrors(gl, owner) {
-  const errors = [];
-  for (let index = 0; index < 32; index++) {
-    const code = gl.getError();
-    if (code === gl.NO_ERROR) break;
-    errors.push(code);
-    if (code === gl.CONTEXT_LOST_WEBGL) break;
-  }
-  if (errors.length > 0) {
-    throw new Error(
-      `${owner} encountered WebGL error${errors.length === 1 ? '' : 's'} `
-      + errors.map(code => `0x${code.toString(16)}`).join(', ')
-      + '.'
-    );
-  }
-}
 
 function captureGenerationState(gl) {
   const activeTexture = gl.getParameter(gl.ACTIVE_TEXTURE);
@@ -273,17 +157,15 @@ function restoreGenerationState(gl, state, failures) {
 }
 
 /**
- * GPU Noise Generator Class
- * Generates 3D noise textures using WebGL2 fragment shaders
+ * GPU noise generator resources: the linked noise programs, their uniform
+ * locations, and the full-screen quad that a cloud-noise generation
+ * transaction renders each slice with.
  */
 export class GPUNoiseGenerator {
-  constructor(gl) {
-    if (!gl || typeof gl !== 'object') {
-      throw new TypeError('GPUNoiseGenerator requires a WebGL2 rendering context.');
-    }
+  constructor(gl, programs, uniforms) {
     this.gl = gl;
-    this.programs = {};
-    this.uniforms = {};
+    this.programs = programs;
+    this.uniforms = uniforms;
     this.quadVAO = null;
     this.quadVBO = null;
     this._pendingProgramDeletes = new Set();
@@ -291,194 +173,6 @@ export class GPUNoiseGenerator {
     this._pendingBufferDeletes = new Set();
     this._disposeStarted = false;
     this._disposed = false;
-
-    try {
-      this._initShaders();
-      this._initQuad();
-    } catch (error) {
-      const failures = [
-        asError(
-          error,
-          'GPU noise construction failed with a non-Error value.'
-        )
-      ];
-      try {
-        this.dispose();
-      } catch (cleanupError) {
-        retainPendingNoiseGenerator(gl, this);
-        failures.push(asError(
-          cleanupError,
-          'GPU noise construction rollback failed with a non-Error value.'
-        ));
-      }
-      throwFailures(
-        failures,
-        'GPU noise construction and rollback failed.'
-      );
-    }
-  }
-
-  _compileShader(source, type) {
-    const gl = this.gl;
-    let shader = null;
-    try {
-      shader = gl.createShader(type);
-      if (!shader) {
-        throw new Error('GPU noise shader allocation failed.');
-      }
-      gl.shaderSource(shader, source);
-      gl.compileShader(shader);
-
-      if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
-        const log = gl.getShaderInfoLog(shader);
-        throw new Error(`GPU noise shader compilation failed: ${log}`);
-      }
-      return shader;
-    } catch (error) {
-      const failures = [
-        asError(error, 'GPU noise shader creation failed with a non-Error value.')
-      ];
-      if (shader) {
-        attempt(
-          failures,
-          () => gl.deleteShader(shader),
-          'GPU noise shader rollback failed with a non-Error value.'
-        );
-      }
-      throwFailures(failures, 'GPU noise shader creation and rollback failed.');
-    }
-  }
-
-  _createProgram(vsSource, fsSource) {
-    const gl = this.gl;
-    let vs = null;
-    let fs = null;
-    let program = null;
-    try {
-      vs = this._compileShader(vsSource, gl.VERTEX_SHADER);
-      fs = this._compileShader(fsSource, gl.FRAGMENT_SHADER);
-
-      program = gl.createProgram();
-      if (!program) {
-        throw new Error('GPU noise program allocation failed.');
-      }
-      gl.attachShader(program, vs);
-      gl.attachShader(program, fs);
-      gl.linkProgram(program);
-
-      if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
-        const log = gl.getProgramInfoLog(program);
-        throw new Error(`GPU noise program linking failed: ${log}`);
-      }
-
-      const cleanupFailures = [];
-      const ownedVs = vs;
-      vs = null;
-      attempt(
-        cleanupFailures,
-        () => gl.deleteShader(ownedVs),
-        'GPU noise vertex-shader cleanup failed with a non-Error value.'
-      );
-      const ownedFs = fs;
-      fs = null;
-      attempt(
-        cleanupFailures,
-        () => gl.deleteShader(ownedFs),
-        'GPU noise fragment-shader cleanup failed with a non-Error value.'
-      );
-      if (cleanupFailures.length > 0) {
-        const ownedProgram = program;
-        program = null;
-        attempt(
-          cleanupFailures,
-          () => gl.deleteProgram(ownedProgram),
-          'GPU noise program rollback failed with a non-Error value.'
-        );
-        throwFailures(
-          cleanupFailures,
-          'GPU noise shader cleanup failed after program linking.'
-        );
-      }
-      const result = program;
-      program = null;
-      return result;
-    } catch (error) {
-      const failures = [
-        asError(error, 'GPU noise program creation failed with a non-Error value.')
-      ];
-      if (program) {
-        attempt(
-          failures,
-          () => gl.deleteProgram(program),
-          'GPU noise program rollback failed with a non-Error value.'
-        );
-      }
-      if (fs) {
-        attempt(
-          failures,
-          () => gl.deleteShader(fs),
-          'GPU noise fragment-shader rollback failed with a non-Error value.'
-        );
-      }
-      if (vs) {
-        attempt(
-          failures,
-          () => gl.deleteShader(vs),
-          'GPU noise vertex-shader rollback failed with a non-Error value.'
-        );
-      }
-      throwFailures(
-        failures,
-        'GPU noise program creation and rollback failed.'
-      );
-    }
-  }
-
-  _initShaders() {
-    const programs = {};
-    try {
-      programs.shape = this._createProgram(NOISE_VS, SHAPE_NOISE_FS);
-      programs.detail = this._createProgram(NOISE_VS, DETAIL_NOISE_FS);
-      programs.blueNoise = this._createProgram(NOISE_VS, BLUE_NOISE_FS);
-
-      // Cache uniform locations.
-      const gl = this.gl;
-      const uniforms = {
-        shape: {
-          slice: gl.getUniformLocation(programs.shape, 'u_slice')
-        },
-        detail: {
-          slice: gl.getUniformLocation(programs.detail, 'u_slice')
-        },
-      };
-      for (const [name, ownedUniforms] of Object.entries(uniforms)) {
-        for (const [uniformName, location] of Object.entries(ownedUniforms)) {
-          if (location === null) {
-            throw new Error(
-              `GPU noise ${name} shader is missing required uniform ${uniformName}.`
-            );
-          }
-        }
-      }
-      this.programs = programs;
-      this.uniforms = uniforms;
-    } catch (error) {
-      const failures = [
-        asError(error, 'GPU noise shader initialization failed with a non-Error value.')
-      ];
-      for (const program of Object.values(programs)) {
-        if (!program) continue;
-        attempt(
-          failures,
-          () => this.gl.deleteProgram(program),
-          'GPU noise program rollback failed with a non-Error value.'
-        );
-      }
-      throwFailures(
-        failures,
-        'GPU noise shader initialization and rollback failed.'
-      );
-    }
   }
 
   _initQuad() {
@@ -555,298 +249,6 @@ export class GPUNoiseGenerator {
     }
     this.quadVAO = vertexArray;
     this.quadVBO = vertexBuffer;
-  }
-
-  /**
-   * Generate a 3D noise texture by rendering each Z-slice
-   */
-  _generate3DTexture(program, uniforms, size) {
-    const gl = this.gl;
-    const startTime = performance.now();
-
-    let texture = null;
-    let framebuffer = null;
-    try {
-      texture = gl.createTexture();
-      if (!texture) {
-        throw new Error('GPU noise 3D texture allocation failed.');
-      }
-      gl.bindTexture(gl.TEXTURE_3D, texture);
-      gl.texImage3D(
-        gl.TEXTURE_3D, 0, gl.RGBA8,
-        size, size, size, 0,
-        gl.RGBA, gl.UNSIGNED_BYTE, null
-      );
-
-      framebuffer = gl.createFramebuffer();
-      if (!framebuffer) {
-        throw new Error('GPU noise framebuffer allocation failed.');
-      }
-      gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
-      gl.framebufferTextureLayer(
-        gl.FRAMEBUFFER,
-        gl.COLOR_ATTACHMENT0,
-        texture,
-        0,
-        0
-      );
-      if (
-        gl.checkFramebufferStatus(gl.FRAMEBUFFER)
-        !== gl.FRAMEBUFFER_COMPLETE
-      ) {
-        throw new Error('GPU noise framebuffer is incomplete.');
-      }
-
-      gl.viewport(0, 0, size, size);
-      gl.useProgram(program);
-      gl.bindVertexArray(this.quadVAO);
-
-      for (let z = 0; z < size; z++) {
-        if (z > 0) {
-          gl.framebufferTextureLayer(
-            gl.FRAMEBUFFER,
-            gl.COLOR_ATTACHMENT0,
-            texture,
-            0,
-            z
-          );
-        }
-        gl.uniform1f(uniforms.slice, (z + 0.5) / size);
-        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-      }
-
-      gl.bindTexture(gl.TEXTURE_3D, texture);
-      gl.generateMipmap(gl.TEXTURE_3D);
-      gl.texParameteri(
-        gl.TEXTURE_3D,
-        gl.TEXTURE_MIN_FILTER,
-        gl.LINEAR_MIPMAP_LINEAR
-      );
-      gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-      gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_S, gl.REPEAT);
-      gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_T, gl.REPEAT);
-      gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_R, gl.REPEAT);
-
-      gl.deleteFramebuffer(framebuffer);
-      framebuffer = null;
-      const result = texture;
-      texture = null;
-
-      const elapsed = performance.now() - startTime;
-      console.log(`  Generated ${size}³ texture in ${elapsed.toFixed(1)}ms`);
-      return result;
-    } catch (error) {
-      const failures = [
-        asError(
-          error,
-          'GPU noise 3D texture generation failed with a non-Error value.'
-        )
-      ];
-      if (framebuffer) {
-        attempt(
-          failures,
-          () => gl.deleteFramebuffer(framebuffer),
-          'GPU noise framebuffer rollback failed with a non-Error value.'
-        );
-      }
-      if (texture) {
-        attempt(
-          failures,
-          () => gl.deleteTexture(texture),
-          'GPU noise 3D texture rollback failed with a non-Error value.'
-        );
-      }
-      throwFailures(
-        failures,
-        'GPU noise 3D texture generation and rollback failed.'
-      );
-    }
-  }
-
-  /**
-   * Generate 2D blue noise texture
-   */
-  _generateBlueNoise() {
-    const gl = this.gl;
-    const size = 128;
-    const startTime = performance.now();
-    let texture = null;
-    let framebuffer = null;
-    try {
-      texture = gl.createTexture();
-      if (!texture) {
-        throw new Error('GPU blue-noise texture allocation failed.');
-      }
-      gl.bindTexture(gl.TEXTURE_2D, texture);
-      gl.texImage2D(
-        gl.TEXTURE_2D,
-        0,
-        gl.RG8,
-        size,
-        size,
-        0,
-        gl.RG,
-        gl.UNSIGNED_BYTE,
-        null
-      );
-
-      framebuffer = gl.createFramebuffer();
-      if (!framebuffer) {
-        throw new Error('GPU blue-noise framebuffer allocation failed.');
-      }
-      gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
-      gl.framebufferTexture2D(
-        gl.FRAMEBUFFER,
-        gl.COLOR_ATTACHMENT0,
-        gl.TEXTURE_2D,
-        texture,
-        0
-      );
-      if (
-        gl.checkFramebufferStatus(gl.FRAMEBUFFER)
-        !== gl.FRAMEBUFFER_COMPLETE
-      ) {
-        throw new Error('GPU blue-noise framebuffer is incomplete.');
-      }
-
-      gl.viewport(0, 0, size, size);
-      gl.useProgram(this.programs.blueNoise);
-      gl.bindVertexArray(this.quadVAO);
-      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-
-      gl.bindTexture(gl.TEXTURE_2D, texture);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
-
-      gl.deleteFramebuffer(framebuffer);
-      framebuffer = null;
-      const result = texture;
-      texture = null;
-      const elapsed = performance.now() - startTime;
-      console.log(`  Generated blue noise in ${elapsed.toFixed(1)}ms`);
-      return { texture: result, size };
-    } catch (error) {
-      const failures = [
-        asError(
-          error,
-          'GPU blue-noise generation failed with a non-Error value.'
-        )
-      ];
-      if (framebuffer) {
-        attempt(
-          failures,
-          () => gl.deleteFramebuffer(framebuffer),
-          'GPU blue-noise framebuffer rollback failed with a non-Error value.'
-        );
-      }
-      if (texture) {
-        attempt(
-          failures,
-          () => gl.deleteTexture(texture),
-          'GPU blue-noise texture rollback failed with a non-Error value.'
-        );
-      }
-      throwFailures(
-        failures,
-        'GPU blue-noise generation and rollback failed.'
-      );
-    }
-  }
-
-  /**
-   * Generate all cloud noise textures on GPU
-   * Returns immediately with textures (synchronous, very fast)
-   */
-  generate(shapeSize = 128, detailSize = 32) {
-    if (this._disposeStarted) {
-      throw new Error(
-        'GPU noise generation cannot run after disposal has started.'
-      );
-    }
-    for (const [name, value] of [
-      ['shapeSize', shapeSize],
-      ['detailSize', detailSize]
-    ]) {
-      if (!Number.isInteger(value) || value < 32 || value > 256) {
-        throw new RangeError(
-          `GPU noise ${name} must be an integer between 32 and 256.`
-        );
-      }
-    }
-    console.log('=== Generating Cloud Noise Textures (GPU) ===');
-    const totalStart = performance.now();
-    const gl = this.gl;
-    assertContextAvailable(gl, 'GPU noise generation');
-    readWebGLErrors(gl, 'GPU noise generation preflight');
-    const previousState = captureGenerationState(gl);
-    const failures = [];
-    let shape = null;
-    let detail = null;
-    let blueNoiseResult = null;
-    try {
-      applyGenerationState(gl);
-
-      console.log(`Generating shape noise (${shapeSize}³)...`);
-      shape = this._generate3DTexture(
-        this.programs.shape,
-        this.uniforms.shape,
-        shapeSize
-      );
-
-      console.log(`Generating detail noise (${detailSize}³)...`);
-      detail = this._generate3DTexture(
-        this.programs.detail,
-        this.uniforms.detail,
-        detailSize
-      );
-
-      console.log('Generating blue noise (128²)...');
-      blueNoiseResult = this._generateBlueNoise();
-      assertContextAvailable(gl, 'GPU noise publication');
-      readWebGLErrors(gl, 'GPU noise publication');
-    } catch (error) {
-      failures.push(asError(
-        error,
-        'GPU noise generation failed with a non-Error value.'
-      ));
-    }
-    restoreGenerationState(gl, previousState, failures);
-    try {
-      readWebGLErrors(gl, 'GPU noise state restoration');
-    } catch (error) {
-      failures.push(asError(
-        error,
-        'GPU noise state restoration failed with a non-Error value.'
-      ));
-    }
-    if (failures.length > 0) {
-      deleteTextures(
-        gl,
-        [shape, detail, blueNoiseResult?.texture],
-        failures
-      );
-      throwFailures(
-        failures,
-        'GPU noise generation, restoration, or rollback failed.'
-      );
-    }
-
-    const totalElapsed = performance.now() - totalStart;
-    console.log(`=== GPU noise generation complete in ${totalElapsed.toFixed(1)}ms ===`);
-    console.log(`  Shape: ${shapeSize}³ RGBA (${(shapeSize ** 3 * 4 / 1024 / 1024).toFixed(1)}MB)`);
-    console.log(`  Detail: ${detailSize}³ RGBA (${(detailSize ** 3 * 4 / 1024 / 1024).toFixed(2)}MB)`);
-    console.log(`  Blue noise: ${blueNoiseResult.size}² RG`);
-
-    return {
-      shape,
-      detail,
-      blueNoise: blueNoiseResult.texture,
-      shapeSize,
-      detailSize,
-      blueNoiseSize: blueNoiseResult.size
-    };
   }
 
   /**
@@ -1073,9 +475,13 @@ function requirePositiveInteger(value, owner) {
 }
 
 function requireNoiseSize(value, owner) {
-  if (!Number.isInteger(value) || value < 32 || value > 256) {
+  if (
+    !Number.isInteger(value)
+    || value < MIN_SMOKE_NOISE_RESOLUTION
+    || value > MAX_SMOKE_NOISE_RESOLUTION
+  ) {
     throw new RangeError(
-      `${owner} must be an integer between 32 and 256.`
+      `${owner} must be an integer between ${MIN_SMOKE_NOISE_RESOLUTION} and ${MAX_SMOKE_NOISE_RESOLUTION}.`
     );
   }
   return value;
@@ -1314,17 +720,7 @@ class AsyncNoiseGeneratorBuilder {
       }
     }
 
-    const generator = Object.create(GPUNoiseGenerator.prototype);
-    generator.gl = this.gl;
-    generator.programs = this.programs;
-    generator.uniforms = uniforms;
-    generator.quadVAO = null;
-    generator.quadVBO = null;
-    generator._pendingProgramDeletes = new Set();
-    generator._pendingVertexArrayDeletes = new Set();
-    generator._pendingBufferDeletes = new Set();
-    generator._disposeStarted = false;
-    generator._disposed = false;
+    const generator = new GPUNoiseGenerator(this.gl, this.programs, uniforms);
     this.programs = {};
     this.generator = generator;
   }
@@ -1444,7 +840,7 @@ class AsyncNoiseGeneratorBuilder {
  * called, every candidate handle remains owned by this transaction and can be
  * synchronously cancelled.
  */
-export class GPUCloudNoiseGenerationTransaction {
+class GPUCloudNoiseGenerationTransaction {
   constructor(gl, shapeSize, detailSize, options = undefined) {
     if (!gl || typeof gl !== 'object') {
       throw new TypeError(
@@ -1487,8 +883,24 @@ export class GPUCloudNoiseGenerationTransaction {
     this.detail = null;
     this.blueNoise = null;
     this.framebuffer = null;
-    this._phase = 'pending-cleanup';
+    this._phase = 'initialize';
     this._slice = 0;
+    this._uncheckedSliceBatches = false;
+    // GPU pacing. A slice batch is bounded on the CPU by `batchBudgetMs`, but
+    // the noise shaders' cost lands on the GPU, after the batch returns. A
+    // software renderer can take seconds per batch; submitting the next one
+    // regardless queues them up, and every synchronous call behind them (a
+    // frame, `getError`, a screenshot) waits for the whole queue. Each batch
+    // therefore ends with a fence, the next waits for it, and the batch size
+    // adapts: doubled again (up to the caps) when the GPU finished a batch by
+    // the next scheduling turn, kept when it needed one turn more, and halved
+    // only when it outlasted two. A fence one turn late is the renderer's
+    // latency, not the batch's cost: where frames take seconds a batch of any
+    // size signals a turn late, and halving on that drove every batch to a
+    // single slice at two turns each.
+    this._gpuFence = null;
+    this._gpuFencePolls = 0;
+    this._adaptiveSliceCap = this.maxSlicesPerBatch;
     this._scheduledCancellation = null;
     this._state = 'pending';
     this._settled = false;
@@ -1519,6 +931,7 @@ export class GPUCloudNoiseGenerationTransaction {
       && this.blueNoise === null
       && this.framebuffer === null
       && this._scheduledCancellation === null
+      && this._gpuFence === null
     );
   }
 
@@ -1585,8 +998,13 @@ export class GPUCloudNoiseGenerationTransaction {
     const sliceStart = this._slice;
     const startedAt = this._now();
     let failed = false;
+    let waitedForGpu = false;
+    const phases = [];
     try {
-      this._advance();
+      // Nothing new is submitted while the GPU is still behind: the turn
+      // only asks again on the next one.
+      waitedForGpu = !this._lastBatchDrained();
+      if (!waitedForGpu) this._advanceWithinBudget(phases);
       if (this._state === 'running') {
         this._scheduleNextBatch();
       }
@@ -1613,16 +1031,88 @@ export class GPUCloudNoiseGenerationTransaction {
           duration,
           failed,
           phase,
+          // Every phase this turn ran, `phase` first; empty while waiting.
+          phases: Object.freeze(phases),
           sliceEnd: this._slice,
           sliceStart,
+          waitedForGpu,
         }));
       }
     }
   }
 
-  _withExactCallerState(owner, operation) {
+  /**
+   * Advance as many phases as one turn allows.
+   *
+   * Most phases are a few GL calls: a uniform setup, a framebuffer deletion,
+   * a program handed to the compiler. Giving each a turn of its own made a
+   * generation some twenty-five animation frames long, and where a frame
+   * takes seconds (a software renderer) that alone was well over a minute
+   * for a 32-cubed volume. A turn now runs its first phase and then keeps
+   * going while the phases after it fit in `batchBudgetMs`. The first phase
+   * is not counted against that budget: its error check waits for the GPU to
+   * finish the frame queued ahead of it, which is the renderer's time, not
+   * this generation's, and on a slow renderer that wait alone exceeds any
+   * budget. A turn still ends at a program that is compiling, before a slice
+   * batch (each batch is a turn of its own, closed by its fence), and at
+   * completion.
+   */
+  _advanceWithinBudget(phases) {
+    let phase = this._phase;
+    phases.push(phase);
+    this._advance();
+    const budgetStartedAt = this._now();
+    while (
+      this._state === 'running'
+      // A program still compiling stays in its phase until a later turn.
+      && this._phase !== phase
+      && this._gpuFence === null
+      && !this._phase.endsWith('-slices')
+      && (this._now() - budgetStartedAt) < this.batchBudgetMs
+    ) {
+      phase = this._phase;
+      phases.push(phase);
+      this._advance();
+    }
+  }
+
+  /**
+   * Whether the GPU has finished the last slice batch, adapting the next
+   * batch's size to how long it took. True when no batch is outstanding.
+   */
+  _lastBatchDrained() {
+    const fence = this._gpuFence;
+    if (fence === null) return true;
+    const gl = this.gl;
+    assertContextAvailable(gl, 'GPU cloud-noise batch fence');
+    if (gl.getSyncParameter(fence, gl.SYNC_STATUS) !== gl.SIGNALED) {
+      this._gpuFencePolls += 1;
+      if (this._gpuFencePolls === 2) {
+        this._adaptiveSliceCap = Math.max(1, Math.floor(this._adaptiveSliceCap / 2));
+      }
+      return false;
+    }
+    if (this._gpuFencePolls === 0) {
+      this._adaptiveSliceCap = Math.min(this.maxSlicesPerBatch, this._adaptiveSliceCap * 2);
+    }
+    this._gpuFence = null;
+    gl.deleteSync(fence);
+    return true;
+  }
+
+  /**
+   * Run one step under the generator's own GL state and restore the caller's.
+   *
+   * `verifyWebGLErrors` brackets the step with `getError()`. Each call drains
+   * the command stream to the GPU process and waits for the answer, which is
+   * the cost `batchBudgetMs` exists to bound, so slice batches pass false and
+   * their errors are read once, by the finalization that follows them.
+   */
+  _withExactCallerState(owner, operation, verifyWebGLErrors = true) {
     assertContextAvailable(this.gl, `${owner} preflight`);
-    readWebGLErrors(this.gl, `${owner} preflight`);
+    if (verifyWebGLErrors) {
+      requireCleanWebGLState(this.gl, `${owner} preflight`);
+    }
     const previousState = captureGenerationState(this.gl);
     const failures = [];
     let result;
@@ -1630,7 +1120,7 @@ export class GPUCloudNoiseGenerationTransaction {
       applyGenerationState(this.gl);
       result = operation();
       assertContextAvailable(this.gl, owner);
-      readWebGLErrors(this.gl, owner);
+      if (verifyWebGLErrors) requireCleanWebGLState(this.gl, owner);
     } catch (error) {
       failures.push(asError(
         error,
@@ -1638,13 +1128,15 @@ export class GPUCloudNoiseGenerationTransaction {
       ));
     }
     restoreGenerationState(this.gl, previousState, failures);
-    try {
-      readWebGLErrors(this.gl, `${owner} state restoration`);
-    } catch (error) {
-      failures.push(asError(
-        error,
-        `${owner} state restoration failed with a non-Error value.`
-      ));
+    if (verifyWebGLErrors) {
+      try {
+        requireCleanWebGLState(this.gl, `${owner} state restoration`);
+      } catch (error) {
+        failures.push(asError(
+          error,
+          `${owner} state restoration failed with a non-Error value.`
+        ));
+      }
     }
     if (failures.length > 0) {
       throwFailures(failures, `${owner} or state restoration failed.`);
@@ -1654,15 +1146,6 @@ export class GPUCloudNoiseGenerationTransaction {
 
   _advance() {
     switch (this._phase) {
-      case 'pending-cleanup':
-        this._withExactCallerState(
-          'GPU cloud-noise pending-resource cleanup',
-          () => {
-            disposePendingCloudNoiseGeneratorResources(this.gl);
-          }
-        );
-        this._phase = 'initialize';
-        return;
       case 'initialize':
         this._withExactCallerState(
           'GPU cloud-noise generator initialization',
@@ -1863,7 +1346,8 @@ export class GPUCloudNoiseGenerationTransaction {
         );
         const exactSliceCap = Math.min(
           this.maxSlicesPerBatch,
-          resolutionSliceCap
+          resolutionSliceCap,
+          this._adaptiveSliceCap
         );
         do {
           const z = this._slice;
@@ -1883,8 +1367,14 @@ export class GPUCloudNoiseGenerationTransaction {
           && batchSlices < exactSliceCap
           && (this._now() - batchStartedAt) < this.batchBudgetMs
         );
-      }
+      },
+      false
     );
+    this._uncheckedSliceBatches = true;
+    this._gpuFence = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+    this._gpuFencePolls = 0;
+    // Start the batch now, so the fence can signal by the next turn.
+    gl.flush();
   }
 
   _finalize3DTexture(kind) {
@@ -1895,6 +1385,12 @@ export class GPUCloudNoiseGenerationTransaction {
         `GPU cloud-noise ${kind} finalization has no owned texture.`
       );
     }
+    // The single error check every unverified slice batch of this texture
+    // defers to: any batch failure surfaces here, before the texture is
+    // finalized or published.
+    assertContextAvailable(gl, `GPU cloud-noise ${kind} slice batches`);
+    this._uncheckedSliceBatches = false;
+    requireCleanWebGLState(gl, `GPU cloud-noise ${kind} slice batches`);
     this._withExactCallerState(
       `GPU cloud-noise ${kind} finalization`,
       () => {
@@ -2060,7 +1556,32 @@ export class GPUCloudNoiseGenerationTransaction {
       this.blueNoise = null;
       this.framebuffer = null;
       this._scheduledCancellation = null;
+      this._gpuFence = null;
       return failures;
+    }
+
+    if (this._gpuFence !== null) {
+      try {
+        this.gl.deleteSync(this._gpuFence);
+        this._gpuFence = null;
+      } catch (error) {
+        failures.push(asError(
+          error,
+          'GPU cloud-noise batch fence cleanup failed.'
+        ));
+      }
+    }
+
+    if (this._uncheckedSliceBatches) {
+      // A transaction that ends between its slice batches and their
+      // finalization consumes the error flags those batches may have raised,
+      // so no later owner reads them as its own.
+      this._uncheckedSliceBatches = false;
+      for (
+        let flag = 0;
+        flag < 8 && this.gl.getError() !== this.gl.NO_ERROR;
+        flag++
+      );
     }
 
     if (
@@ -2162,9 +1683,6 @@ export class GPUCloudNoiseGenerationTransaction {
       contextLost ? null : skippedCleanupOwner,
       contextLost
     );
-    if (contextLost) {
-      invalidatePendingCloudNoiseGeneratorResources(this.gl);
-    }
     this._state = 'failed';
     this._settled = true;
     if (cleanupFailures.length === 0) {
@@ -2264,48 +1782,4 @@ export function startCloudNoiseGenerationGPU(
     detailSize,
     options
   ).start();
-}
-
-/**
- * Convenience function to generate cloud noise textures on GPU
- */
-export function generateCloudNoiseTexturesGPU(gl, shapeSize = 128, detailSize = 32) {
-  disposePendingCloudNoiseGeneratorResources(gl);
-  let generator = null;
-  let textures = null;
-  const failures = [];
-  try {
-    generator = new GPUNoiseGenerator(gl);
-    textures = generator.generate(shapeSize, detailSize);
-  } catch (error) {
-    failures.push(asError(
-      error,
-      'Cloud-noise generation failed with a non-Error value.'
-    ));
-  }
-  if (generator) {
-    try {
-      generator.dispose();
-    } catch (error) {
-      retainPendingNoiseGenerator(gl, generator);
-      failures.push(asError(
-        error,
-        'Cloud-noise generator disposal failed with a non-Error value.'
-      ));
-    }
-  }
-  if (failures.length > 0) {
-    if (textures) {
-      retireUnpublishedNoiseTextures(
-        gl,
-        [textures.shape, textures.detail, textures.blueNoise],
-        failures
-      );
-    }
-    throwFailures(
-      failures,
-      'Cloud-noise generation or disposal failed.'
-    );
-  }
-  return textures;
 }

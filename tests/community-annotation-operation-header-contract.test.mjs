@@ -4,6 +4,7 @@ import test from 'node:test';
 import worker from '../assets/js/app/community-annotations/_worker-code.js';
 import { CommunityAnnotationGitHubSync } from '../assets/js/app/community-annotations/github-sync.js';
 import { parseExactJson } from '../assets/js/app/community-annotations/wire-contract.js';
+import { WORKER_EXPOSED_RESPONSE_HEADERS } from './browser/helpers/worker-exposed-headers.mjs';
 
 const ENV = Object.freeze({
   ALLOWED_ORIGINS: 'https://app.example',
@@ -303,8 +304,10 @@ test(
       }), { status: 200 }),
       async () => {
         const response = await worker.fetch(contentsMutationRequest(), ENV);
+        const exposed =
+          commaSeparatedHeaderSet(response, 'Access-Control-Expose-Headers');
         assert.deepEqual(
-          commaSeparatedHeaderSet(response, 'Access-Control-Expose-Headers'),
+          exposed,
           new Set([
             'retry-after',
             'x-cellucid-operation-id',
@@ -312,6 +315,14 @@ test(
             'x-github-request-id',
             'x-ratelimit-reset',
           ]),
+        );
+        // The browser specs' stand-in worker must expose exactly the same
+        // headers, or the app cannot read the retry metadata they serve.
+        assert.deepEqual(
+          new Set(
+            WORKER_EXPOSED_RESPONSE_HEADERS.map(name => name.toLowerCase()),
+          ),
+          exposed,
         );
       },
     );

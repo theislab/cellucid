@@ -108,17 +108,38 @@ export async function closeContextWithApplicationRetirement(context) {
   }
 }
 
+async function annotateStartupPhases(context, testInfo) {
+  for (const page of context.pages()) {
+    if (page.isClosed()) continue;
+    const phase = await page.evaluate(
+      () => document.documentElement.dataset.startupPhase ?? null,
+    ).catch(() => 'unreadable');
+    const description = `${page.url()}: ${phase ?? 'not started'}`;
+    testInfo.annotations.push({ type: 'startup-phase', description });
+    console.log(`[startup-phase] ${testInfo.title} -> ${description}`);
+  }
+}
+
 export const test = playwrightTest.extend({
   // Override the lazy page fixture instead of installing an auto context
   // fixture. An auto fixture materializes an otherwise unused default context
   // in browser-only tests, and its teardown can run after Playwright has
   // already closed the base page. This boundary retires the application while
   // both its document and context are still live.
-  page: async ({ context, page }, use) => {
+  page: async ({ context, page }, use, testInfo) => {
     try {
       await use(page);
     } finally {
-      await retireContextApplications(context);
+      // A failed test names the startup phase each page stopped in, so a
+      // stalled bootstrap reports where it waited instead of only that the
+      // dataset name never appeared.
+      try {
+        if (testInfo.status !== testInfo.expectedStatus) {
+          await annotateStartupPhases(context, testInfo);
+        }
+      } finally {
+        await retireContextApplications(context);
+      }
     }
   },
 });

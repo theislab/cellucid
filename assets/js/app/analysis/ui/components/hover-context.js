@@ -445,19 +445,3 @@ export class HoverContext {
     }
   }
 }
-
-// =============================================================================
-// FACTORY FUNCTION
-// =============================================================================
-
-/**
- * Create a HoverContext instance
- *
- * @param {Object} options - Same options as HoverContext constructor
- * @returns {HoverContext}
- */
-export function createHoverContext(options) {
-  return new HoverContext(options);
-}
-
-export default HoverContext;

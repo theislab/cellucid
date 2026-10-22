@@ -4,11 +4,9 @@
  * A p-value clears a threshold when `p <= threshold`, never `p < threshold`.
  * That is the rule the Benjamini-Hochberg step-up implements — reject the k
  * smallest ordered p-values where k* = max{k : p(k) <= k*alpha/m}, so an
- * adjusted value of exactly alpha is a rejection — and it is what
- * `benjaminiHochberg().significant` and `bonferroniCorrection().significant`
- * have always reported. The marker, volcano and differential-expression filters
- * used `p < threshold`, so a gene sitting exactly on the threshold was
- * significant by one surface and not by another.
+ * adjusted value of exactly alpha is a rejection. The marker, volcano and
+ * differential-expression filters used `p < threshold`, so a gene sitting
+ * exactly on the threshold was significant by one surface and not by another.
  *
  * The boundary is not measure zero. Exact tests on discrete data land on it:
  *   scipy.stats.mannwhitneyu([100], list(range(39)), alternative='two-sided',
@@ -25,8 +23,7 @@ import { fileURLToPath } from 'node:url';
 
 import { mannWhitneyU as coreMannWhitneyU } from '../assets/js/app/analysis/compute/math-utils.js';
 import {
-  benjaminiHochberg,
-  bonferroniCorrection,
+  benjaminiHochbergAdjusted,
   mannWhitneyU,
 } from '../assets/js/app/analysis/stats/statistical-tests.js';
 import { MarkerDiscoveryEngine } from '../assets/js/app/analysis/genes-panel/marker-discovery-engine.js';
@@ -80,15 +77,9 @@ test('an exact rank test lands on the default threshold as a double', () => {
   assert.equal(mannWhitneyU([100], sample).pValue, BOUNDARY_ALPHA);
 });
 
-test('the step-up rule rejects a p-value that equals alpha', () => {
-  const bh = benjaminiHochberg([BOUNDARY_ALPHA], BOUNDARY_ALPHA);
+test('the step-up adjustment keeps a lone boundary p-value exactly on alpha', () => {
+  const bh = benjaminiHochbergAdjusted(Float64Array.of(BOUNDARY_ALPHA));
   assert.deepEqual(Array.from(bh.adjustedPValues), [BOUNDARY_ALPHA]);
-  assert.deepEqual(bh.significant, [true]);
-  assert.equal(bh.significantCount, 1);
-  assert.equal(bh.threshold, BOUNDARY_ALPHA);
-
-  const bonferroni = bonferroniCorrection([BOUNDARY_ALPHA], BOUNDARY_ALPHA);
-  assert.deepEqual(bonferroni.significant, [true]);
 });
 
 test('the volcano surfaces count a boundary gene as a discovery', () => {

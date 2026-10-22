@@ -37,23 +37,36 @@ test('consensus snapshot downloads once and reports the exact success', async ({
   await expect(page.locator('#dataset-name')).toHaveText(
     'Current UI prepared fixture',
   );
-  await page.getByText('Community Annotation', { exact: true }).click();
+  await page.getByText('Community annotation', { exact: true }).click();
   await page.getByRole('button', {
-    name: 'CONSENSUS SNAPSHOT + LOCAL CACHE',
+    name: 'Snapshot and cache',
+    exact: true,
   }).click();
 
-  const successNotice = page.getByText(
-    'Downloaded cellucid-consensus.json',
-    { exact: true },
-  );
+  // The product retires this success toast after 2.2 s. The proof is the
+  // notification the product posted, recorded the moment it enters the
+  // page, not whether a poll paced by screenshots and a download's disk I/O
+  // on a slow host happens to look while a 2.2 s card is on screen.
+  await page.evaluate(() => {
+    window.__noticeTexts = [];
+    const record = node => {
+      if (!(node instanceof Element)) return;
+      const messages = node.matches('.notification-message')
+        ? [node]
+        : node.querySelectorAll('.notification-message');
+      for (const element of messages) window.__noticeTexts.push(element.textContent.trim());
+    };
+    new MutationObserver(records => {
+      for (const mutation of records) mutation.addedNodes.forEach(record);
+    }).observe(document.body, { childList: true, subtree: true });
+  });
   const [download] = await Promise.all([
     page.waitForEvent('download'),
-    // The product intentionally retires this success toast after 2.2 s. Own
-    // its visible interval while the browser download is initiated instead of
-    // looking for it after runner-dependent disk I/O has completed.
-    expect(successNotice).toBeVisible(),
     page.getByRole('button', { name: 'Download', exact: true }).click(),
   ]);
+  await expect.poll(() => page.evaluate(() => window.__noticeTexts)).toContain(
+    'Downloaded cellucid-consensus.json',
+  );
   expect(download.suggestedFilename()).toBe('cellucid-consensus.json');
   const path = await download.path();
   expect(path).not.toBeNull();

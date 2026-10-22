@@ -4,7 +4,7 @@
  * `benchmark-harness.spec.mjs` exercises what the harness can measure; it
  * reaches the module by importing its URL directly from test code, which says
  * nothing about whether a person running the application can get to it. This
- * spec is the other half: open the Performance Benchmark panel the way a user
+ * spec is the other half: open the Benchmark panel the way a user
  * does, and prove the harness is then constructible against the live viewer
  * and the live canvas.
  *
@@ -42,7 +42,7 @@ test('opening the benchmark panel makes the harness constructible', PROCESS_INTE
 
   await page.goto(FIXTURE_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
-  await expect(page.locator('#filter-count')).toHaveText('Showing all 120 points');
+  await expect(page.locator('#filter-count')).toHaveText('Showing all 120 cells');
 
   // The harness is lazy: it must not be on the page before the panel is used.
   expect(

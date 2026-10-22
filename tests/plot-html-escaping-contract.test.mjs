@@ -130,7 +130,11 @@ test('distribution traces escape page names in the legend and on the category ax
     const traces = definition.buildTraces(pageData, definition.defaultOptions, null);
     assert.equal(traces.length, 1, `${definition.id} produced one trace`);
     assertEscaped(traces[0].name, HOSTILE_PAGE_ESCAPED, HOSTILE_PAGE);
-    for (const coordinate of traces[0].x) {
+    // A precomputed box carries its position as a one-element array; a
+    // raw-value trace states it once as `x0`.
+    const positions = 'x' in traces[0] ? traces[0].x : [traces[0].x0];
+    assert.ok(positions.length > 0, `${definition.id} states a position`);
+    for (const coordinate of positions) {
       assertEscaped(coordinate, HOSTILE_PAGE_ESCAPED, HOSTILE_PAGE);
     }
 

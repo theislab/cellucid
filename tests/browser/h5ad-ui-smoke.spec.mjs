@@ -3,6 +3,7 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { expect, test } from './helpers/test.mjs';
+import { chooseDirectory } from './helpers/directory-upload.mjs';
 import {
   readBundle,
 } from '../../assets/js/app/session/bundle/reader.js';
@@ -14,6 +15,7 @@ import {
 } from '../../assets/js/app/session/codecs/gzip.js';
 import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
+import { openCollapsedPanels } from './helpers/panels.mjs';
 
 const PUBLISHED_DEFAULT_CHUNK_IDS = Object.freeze([
   'core/field-overlays',
@@ -48,8 +50,8 @@ async function expectPlanarCurrentDataset(page, name) {
   await expect(page.locator('#dataset-name')).toHaveText(name);
   await expect(page.locator('#dataset-cells')).toHaveText('120');
   await expect(page.locator('#dataset-genes')).toHaveText('6');
-  await expect(page.locator('#filter-count')).toHaveText('Showing all 120 points');
-  await expect(page.locator('#dimension-select')).toHaveValue('2');
+  await expect(page.locator('#filter-count')).toHaveText('Showing all 120 cells');
+  await expect(page.locator('#view-representation-select option:checked')).toHaveText(/ · 2D$/);
   await expect(page.locator('#navigation-mode')).toHaveValue('planar');
   await expect(page.locator('.cinematic-transport-bar')).toHaveCount(0);
 }
@@ -181,10 +183,11 @@ test('loads the current H5AD contract with a planar 2-D camera and no playback',
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
+  await openCollapsedPanels(page);
 
   await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
-  await expect(page.locator('#filter-count')).toHaveText('Showing all 120 points');
-  await expect(page.locator('#dimension-select')).toHaveValue('2');
+  await expect(page.locator('#filter-count')).toHaveText('Showing all 120 cells');
+  await expect(page.locator('#view-representation-select option:checked')).toHaveText(/ · 2D$/);
   await expect(page.locator('#navigation-mode')).toHaveValue('planar');
   await expect(page.locator('.cinematic-transport-bar')).toHaveCount(0);
 
@@ -193,8 +196,8 @@ test('loads the current H5AD contract with a planar 2-D camera and no playback',
   await expect(page.locator('#dataset-name')).toHaveText('current-ui-smoke');
   await expect(page.locator('#dataset-cells')).toHaveText('120');
   await expect(page.locator('#dataset-genes')).toHaveText('6');
-  await expect(page.locator('#filter-count')).toHaveText('Showing all 120 points');
-  await expect(page.locator('#dimension-select')).toHaveValue('2');
+  await expect(page.locator('#filter-count')).toHaveText('Showing all 120 cells');
+  await expect(page.locator('#view-representation-select option:checked')).toHaveText(/ · 2D$/);
   await expect(page.locator('#navigation-mode')).toHaveValue('planar');
   await expect(page.locator('.cinematic-transport-bar')).toHaveCount(0);
 
@@ -220,6 +223,7 @@ test('replaces prepared, Zarr ZIP, and H5AD datasets through the visible control
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
+  await openCollapsedPanels(page);
   await expectPlanarCurrentDataset(page, 'Current UI prepared fixture');
 
   await expect(page.locator('#user-data-file-input')).toHaveAttribute('webkitdirectory', '');
@@ -275,7 +279,10 @@ test('replaces prepared, Zarr ZIP, and H5AD datasets through the visible control
     'true',
   );
 
-  await page.locator('#user-data-file-input').setInputFiles(preparedFixturePath);
+  await chooseDirectory(
+    page.locator('#user-data-file-input'),
+    preparedFixturePath,
+  );
   await expectFileInputCleared(page, '#user-data-file-input');
   await expectPlanarCurrentDataset(page, 'Current UI prepared fixture');
   await expect(page.locator('#notification-center .notification')).toHaveCount(0);
@@ -309,8 +316,9 @@ test('saves and restores the exact current UI state through one file-input contr
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
+  await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
-  await expect(page.locator('#dimension-select')).toHaveValue('2');
+  await expect(page.locator('#view-representation-select option:checked')).toHaveText(/ · 2D$/);
   await expect(page.locator('#navigation-mode')).toHaveValue('planar');
   await expect(page.locator('.cinematic-transport-bar')).toHaveCount(0);
 
@@ -342,11 +350,11 @@ test('saves and restores the exact current UI state through one file-input contr
   await chooser.setFiles(sessionPath);
 
   await expect(page.locator('#theme-select')).toHaveValue('light');
-  await expect(page.locator('#background-select')).toHaveValue('grid');
+  await expect(page.locator('#background-select')).toHaveValue('studio');
   await expect(page.locator('#point-size')).toHaveValue(savedPointSize);
   await expect(page.locator('#visualization-section')).toHaveAttribute('open', '');
   await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
-  await expect(page.locator('#dimension-select')).toHaveValue('2');
+  await expect(page.locator('#view-representation-select option:checked')).toHaveText(/ · 2D$/);
   await expect(page.locator('#navigation-mode')).toHaveValue('planar');
   await expect(page.locator('.cinematic-transport-bar')).toHaveCount(0);
 
@@ -371,6 +379,7 @@ test('session restore rebuilds saved smoke once after retiring current snapshots
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
+  await openCollapsedPanels(page);
   await expectPlanarCurrentDataset(page, 'Current UI prepared fixture');
   await page.locator('#smoke-grid').evaluate(input => {
     input.value = '0';
@@ -444,13 +453,14 @@ test('session restore catches a real control-owner failure and rolls back', asyn
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
+  await openCollapsedPanels(page);
   await expectPlanarCurrentDataset(page, 'Current UI prepared fixture');
 
   await page.locator('#cloud-resolution').evaluate(input => {
-    input.value = '43';
+    input.value = '100';
     input.dispatchEvent(new Event('input', { bubbles: true }));
   });
-  await expect(page.locator('#cloud-resolution')).toHaveValue('43');
+  await expect(page.locator('#cloud-resolution')).toHaveValue('100');
   await expect.poll(
     () => page.evaluate(
       () => window._cellucidViewer.getCloudResolutionScale(),
@@ -469,7 +479,8 @@ test('session restore catches a real control-owner failure and rolls back', asyn
     input.value = '15';
     input.dispatchEvent(new Event('input', { bubbles: true }));
   });
-  const rollbackScale = 0.25 + (15 / 100) * 1.75;
+  // Render resolution steps by twentieths from 0.25x: position 15 is 0.35x.
+  const rollbackScale = 0.35;
   await expect(page.locator('#cloud-resolution')).toHaveValue('15');
   await expect.poll(
     () => page.evaluate(
@@ -526,6 +537,7 @@ test(
       { waitUntil: 'domcontentloaded' },
     );
     await dismissWelcome(page);
+    await openCollapsedPanels(page);
     await expectPlanarCurrentDataset(
       page,
       'Current UI prepared fixture',
@@ -596,6 +608,7 @@ test('an advertised sample applies one verified static state without camera moti
     `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=published-state-ci`;
   await page.goto(applicationUrl, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
+  await openCollapsedPanels(page);
   await expectPlanarCurrentDataset(page, 'Current UI prepared fixture');
   await colorByCellType(page);
   await page.locator('#point-size').fill('31');
@@ -619,6 +632,7 @@ test('an advertised sample applies one verified static state without camera moti
   );
   catalog.datasets[0].state_manifest = 'state-snapshots.json';
   catalog.datasets[0].state_sha256 = stateSha256;
+  catalog.datasets[0].state_bytes = stateBytes.byteLength;
   let manifestRequests = 0;
   let stateRequests = 0;
   await page.route(
@@ -658,6 +672,7 @@ test('an advertised sample applies one verified static state without camera moti
 
   await page.reload({ waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
+  await openCollapsedPanels(page);
   await expectPlanarCurrentDataset(page, 'Current UI prepared fixture');
   await expect(
     page.locator('#categorical-field option:checked'),
@@ -700,6 +715,7 @@ test('a published no-vector sample replaces a prior vector-field select generati
     `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=vector-state-replacement-ci`;
   await page.goto(applicationUrl, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
+  await openCollapsedPanels(page);
   await expectPlanarCurrentDataset(page, 'Current UI prepared fixture');
 
   const downloadPromise = page.waitForEvent('download');
@@ -723,6 +739,7 @@ test('a published no-vector sample replaces a prior vector-field select generati
     ...catalog.datasets[0],
     state_manifest: 'state-snapshots.json',
     state_sha256: stateSha256,
+    state_bytes: stateBytes.byteLength,
   };
   const vectorEntry = {
     ...catalog.datasets[0],
@@ -746,11 +763,8 @@ test('a published no-vector sample replaces a prior vector-field select generati
     fields: {
       velocity_umap: {
         label: 'velocity_umap',
-        basis: 'umap',
-        available_dimensions: [2],
-        default_dimension: 2,
         files: {
-          '2d': 'vectors/0_2d.bin',
+          X_umap_2d: 'vectors/0_0.bin',
         },
       },
     },
@@ -774,7 +788,7 @@ test('a published no-vector sample replaces a prior vector-field select generati
   );
   for (const filename of [
     'obs_manifest.json',
-    'points_2d.bin',
+    'embeddings/0_2d.bin',
     'var_manifest.json',
   ]) {
     await page.route(
@@ -821,6 +835,7 @@ test('a published no-vector sample replaces a prior vector-field select generati
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
+  await openCollapsedPanels(page);
   await expectPlanarCurrentDataset(page, vectorEntry.name);
   await expect(page.locator('#velocity-field')).toHaveValue('velocity_umap');
   await expect(page.locator('#velocity-field option')).toHaveCount(1);
@@ -862,6 +877,7 @@ test('camera path state round-trips every owned control and commits autoplay', a
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
+  await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
   await page.locator('#cinematic-camera-section > summary').click();
   await page.locator('#cinematic-save-btn').click();
@@ -885,16 +901,16 @@ test('camera path state round-trips every owned control and commits autoplay', a
       element.checked = checked;
       element.dispatchEvent(new Event('change', { bubbles: true }));
     };
-    setRange('cinematic-orbit-key-speed', '73');
+    setRange('orbit-key-speed', '73');
     setRange('cinematic-default-speed', '47');
-    setCheckbox('cinematic-orbit-reverse', false);
-    setCheckbox('cinematic-show-orbit-anchor', false);
-    setRange('cinematic-planar-pan-speed', '61');
-    setCheckbox('cinematic-planar-zoom-to-cursor', false);
-    setCheckbox('cinematic-planar-invert-axes', true);
-    setRange('cinematic-look-sensitivity', '9');
-    setRange('cinematic-move-speed', '234');
-    setCheckbox('cinematic-invert-look', true);
+    setCheckbox('orbit-reverse', false);
+    setCheckbox('show-orbit-anchor', false);
+    setRange('planar-pan-speed', '61');
+    setCheckbox('planar-zoom-to-cursor', false);
+    setCheckbox('planar-invert-axes', true);
+    setRange('look-sensitivity', '9');
+    setRange('move-speed', '234');
+    setCheckbox('invert-look', true);
   });
   await page.locator('#cinematic-loop').check();
   await page.locator('#cinematic-autoplay').check();
@@ -910,28 +926,28 @@ test('camera path state round-trips every owned control and commits autoplay', a
   await page.locator('#cinematic-clear-btn').click();
   await page.locator('#cinematic-loop').uncheck();
   await page.locator('#cinematic-autoplay').uncheck();
-  await page.locator('#cinematic-nav-mode').selectOption('free');
+  await page.locator('#navigation-mode').selectOption('free');
   await page.locator('#cinematic-position-interp').selectOption('catmull-rom');
   await page.locator('#cinematic-rotation-interp').selectOption('slerp');
   await page.locator('#cinematic-easing').selectOption('linear');
   await page.evaluate(() => {
     for (const [id, value] of [
       ['cinematic-default-speed', '30'],
-      ['cinematic-orbit-key-speed', '40'],
-      ['cinematic-planar-pan-speed', '100'],
-      ['cinematic-look-sensitivity', '5'],
-      ['cinematic-move-speed', '100'],
+      ['orbit-key-speed', '40'],
+      ['planar-pan-speed', '100'],
+      ['look-sensitivity', '5'],
+      ['move-speed', '100'],
     ]) {
       const element = document.getElementById(id);
       element.value = value;
       element.dispatchEvent(new Event('input', { bubbles: true }));
     }
     for (const [id, checked] of [
-      ['cinematic-orbit-reverse', true],
-      ['cinematic-show-orbit-anchor', true],
-      ['cinematic-planar-zoom-to-cursor', true],
-      ['cinematic-planar-invert-axes', false],
-      ['cinematic-invert-look', false],
+      ['orbit-reverse', true],
+      ['show-orbit-anchor', true],
+      ['planar-zoom-to-cursor', true],
+      ['planar-invert-axes', false],
+      ['invert-look', false],
     ]) {
       const element = document.getElementById(id);
       element.checked = checked;
@@ -949,20 +965,20 @@ test('camera path state round-trips every owned control and commits autoplay', a
   await expect(page.locator('.cinematic-duration-input').first()).toHaveValue('10');
   await expect(page.locator('#cinematic-loop')).toBeChecked();
   await expect(page.locator('#cinematic-autoplay')).toBeChecked();
-  await expect(page.locator('#cinematic-nav-mode')).toHaveValue('planar');
+  await expect(page.locator('#navigation-mode')).toHaveValue('planar');
   await expect(page.locator('#cinematic-default-speed')).toHaveValue('47');
   await expect(page.locator('#cinematic-position-interp')).toHaveValue('linear');
   await expect(page.locator('#cinematic-rotation-interp')).toHaveValue('linear');
   await expect(page.locator('#cinematic-easing')).toHaveValue('ease-in-out');
-  await expect(page.locator('#cinematic-orbit-key-speed')).toHaveValue('73');
-  await expect(page.locator('#cinematic-orbit-reverse')).not.toBeChecked();
-  await expect(page.locator('#cinematic-show-orbit-anchor')).not.toBeChecked();
-  await expect(page.locator('#cinematic-planar-pan-speed')).toHaveValue('61');
-  await expect(page.locator('#cinematic-planar-zoom-to-cursor')).not.toBeChecked();
-  await expect(page.locator('#cinematic-planar-invert-axes')).toBeChecked();
-  await expect(page.locator('#cinematic-look-sensitivity')).toHaveValue('9');
-  await expect(page.locator('#cinematic-move-speed')).toHaveValue('234');
-  await expect(page.locator('#cinematic-invert-look')).toBeChecked();
+  await expect(page.locator('#orbit-key-speed')).toHaveValue('73');
+  await expect(page.locator('#orbit-reverse')).not.toBeChecked();
+  await expect(page.locator('#show-orbit-anchor')).not.toBeChecked();
+  await expect(page.locator('#planar-pan-speed')).toHaveValue('61');
+  await expect(page.locator('#planar-zoom-to-cursor')).not.toBeChecked();
+  await expect(page.locator('#planar-invert-axes')).toBeChecked();
+  await expect(page.locator('#look-sensitivity')).toHaveValue('9');
+  await expect(page.locator('#move-speed')).toHaveValue('234');
+  await expect(page.locator('#invert-look')).toBeChecked();
   await expect(page.locator('.cinematic-play-btn')).toHaveAttribute('title', 'Pause');
   await page.locator('[data-action="stop"]').click();
 
@@ -988,6 +1004,7 @@ test('viewer controls reject invalid values atomically and persist one exact bac
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
+  await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
 
   const outcome = await page.evaluate(() => {
@@ -1029,7 +1046,9 @@ test('viewer controls reject invalid values atomically and persist one exact bac
     };
   });
 
-  expect(outcome.failures.background).toMatch(/exactly.*grid.*grid-dark.*white.*black/i);
+  expect(outcome.failures.background).toMatch(
+    /exactly one of "white", "grid", "studio", "atelier", "abyss", "aurora", "black", "grid-dark", "studio-dark", "nebula", "abyss-dark", "aurora-dark"/i
+  );
   expect(outcome.failures.renderMode).toMatch(/exactly.*points.*smoke/i);
   expect(outcome.failures.pointSize).toMatch(/finite number/i);
   expect(outcome.failures.lighting).toMatch(/finite number/i);
@@ -1061,6 +1080,7 @@ test('viewer controls reject invalid values atomically and persist one exact bac
 
   await page.reload({ waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
+  await openCollapsedPanels(page);
   await expect(page.locator('#background-select')).toHaveValue('black');
   await expect.poll(() => page.evaluate(() => ({
     stored: localStorage.getItem('cellucid_viewer_background'),
@@ -1085,12 +1105,13 @@ test('viewer controls reject invalid values atomically and persist one exact bac
   expect(browserErrors).toEqual([]);
 });
 
-test('viewer owns snapshot atomicity, exact identity, capacity, and smoke exclusion', async ({ page }) => {
+test('viewer owns snapshot atomicity, exact identity, any number of snapshots, and smoke exclusion', async ({ page }) => {
   await page.goto(
     `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=viewer-snapshot-contract-ci`,
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
+  await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText('Current UI prepared fixture');
 
   const outcome = await page.evaluate(() => {
@@ -1132,7 +1153,7 @@ test('viewer owns snapshot atomicity, exact identity, capacity, and smoke exclus
     const countAfterInvalidSource = viewer.getSnapshotViews().length;
     viewer.clearSnapshotViews();
 
-    const invalidIdentity = attempt(() => viewer.setViewDimension(7, 2));
+    const invalidIdentity = attempt(() => viewer.setViewEmbedding(7, { dimension: 2, layoutKey: '2d' }));
     const invalidIdentityPublication = attempt(() => viewer.getViewDimension('7'));
 
     const created = [
@@ -1140,9 +1161,8 @@ test('viewer owns snapshot atomicity, exact identity, capacity, and smoke exclus
       viewer.createSnapshotView(makeConfig('live')),
       viewer.createSnapshotView(makeConfig('live')),
     ];
-    const overCapacity = attempt(
-      () => viewer.createSnapshotView(makeConfig('live')),
-    );
+    // No view-count ceiling: a fourth snapshot (a fifth view) is kept too.
+    created.push(viewer.createSnapshotView(makeConfig('live')));
     const smokeConflict = attempt(() => viewer.setRenderMode('smoke'));
 
     return {
@@ -1153,7 +1173,6 @@ test('viewer owns snapshot atomicity, exact identity, capacity, and smoke exclus
       invalidIdentity,
       invalidIdentityPublication,
       created,
-      overCapacity,
       smokeConflict,
       finalSnapshotCount: viewer.getSnapshotViews().length,
     };
@@ -1172,11 +1191,9 @@ test('viewer owns snapshot atomicity, exact identity, capacity, and smoke exclus
   expect(outcome.invalidIdentity.name).toBe('TypeError');
   expect(outcome.invalidIdentity.message).toMatch(/view id.*non-empty string/i);
   expect(outcome.invalidIdentityPublication.name).toBe('RangeError');
-  expect(outcome.created.map(({ id }) => id)).toEqual(['snap_1', 'snap_2', 'snap_3']);
-  expect(outcome.overCapacity.name).toBe('RangeError');
-  expect(outcome.overCapacity.message).toMatch(/maximum.*3.*snapshots/i);
+  expect(outcome.created.map(({ id }) => id)).toEqual(['snap_1', 'snap_2', 'snap_3', 'snap_4']);
   expect(outcome.smokeConflict.name).toBe('RangeError');
   expect(outcome.smokeConflict.message).toMatch(/smoke render mode.*snapshots/i);
-  expect(outcome.finalSnapshotCount).toBe(3);
+  expect(outcome.finalSnapshotCount).toBe(4);
   await expect(page.locator('#render-mode')).toHaveValue('points');
 });

@@ -19,7 +19,7 @@ test('README stays concise, marketing-focused, and delegates guidance to the doc
 
   const featuresStart = readme.indexOf('## Features');
   const documentationLink =
-    'https://cellucid.readthedocs.io/en/latest/';
+    'https://docs.cellucid.com/en/latest/';
   const documentationStart = readme.lastIndexOf(documentationLink);
   assert.ok(featuresStart >= 0);
   assert.ok(
@@ -28,7 +28,7 @@ test('README stays concise, marketing-focused, and delegates guidance to the doc
   );
   assert.match(
     readme,
-    /\]\(https:\/\/cellucid\.readthedocs\.io\/en\/latest\/\)\.\s*$/
+    /\]\(https:\/\/docs\.cellucid\.com\/en\/latest\/\)\.\s*$/
   );
 });
 

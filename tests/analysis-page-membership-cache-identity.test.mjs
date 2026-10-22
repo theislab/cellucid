@@ -374,3 +374,96 @@ test('bulk-gene results are not served for a page whose membership changed', asy
     'the stale-membership bulk entry must not be served; a fresh fetch is required',
   );
 });
+
+/** The membership definition, written out: union of enabled groups, sorted. */
+function referenceMembership(page) {
+  const union = new Set();
+  for (const group of page.highlightedGroups || []) {
+    if (group.enabled === false || !group.cellIndices) continue;
+    for (const index of group.cellIndices) union.add(index);
+  }
+  return Array.from(union).sort((a, b) => a - b);
+}
+
+function seededRandom(seed) {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+test('page membership equals the set-union definition for every group shape', t => {
+  const random = seededRandom(11);
+  const randomList = (count, { ascending }) => {
+    const list = Array.from({ length: count }, () => Math.floor(random() * POINT_COUNT));
+    if (ascending) return [...new Set(list)].sort((a, b) => a - b);
+    return list;
+  };
+  const pages = [{
+    id: 'page_1',
+    name: 'Page 1',
+    highlightedGroups: [
+      { id: 'g1', enabled: true, cellIndices: randomList(900, { ascending: true }) },
+      { id: 'g2', enabled: true, cellIndices: Uint32Array.from(randomList(700, { ascending: false })) },
+      { id: 'g3', enabled: false, cellIndices: randomList(400, { ascending: false }) },
+      { id: 'g4', enabled: true, cellIndices: randomList(50, { ascending: false }) },
+    ],
+  }];
+  const layer = makeLayer(pages);
+  t.after(() => layer.destroy());
+
+  const check = label => {
+    const expected = referenceMembership(pages[0]);
+    assert.deepEqual(layer.getCellIndicesForPage('page_1'), expected, label);
+    assert.equal(layer.getCellCountForPageId('page_1'), expected.length, label);
+  };
+  check('mixed ascending, unordered, typed and disabled groups');
+
+  pages[0].highlightedGroups = [pages[0].highlightedGroups[0]];
+  check('one ascending group');
+
+  pages[0].highlightedGroups.push({
+    id: 'g5', enabled: true, cellIndices: randomList(300, { ascending: false }),
+  });
+  check('a group pushed into the same list');
+
+  pages[0].highlightedGroups.splice(0, 1);
+  check('a group spliced out of the same list');
+
+  pages[0].highlightedGroups[0].enabled = false;
+  check('the only group disabled');
+});
+
+test('a reused page membership never outlives the structure it describes', t => {
+  const pages = singleGroupPages([5, 6, 7]);
+  const layer = makeLayer(pages);
+  t.after(() => layer.destroy());
+
+  const first = layer._getPageVersion('page_1');
+  layer.refreshPageVersions(['page_1']);
+  assert.equal(layer._getPageVersion('page_1'), first, 'unchanged pages keep their version');
+
+  // Every published edit replaces an array or a group, so each one is seen.
+  pages[0].highlightedGroups.push({ id: 'h2', enabled: true, cellIndices: [9], cellCount: 1 });
+  layer.refreshPageVersions(['page_1']);
+  const pushed = layer._getPageVersion('page_1');
+  assert.notEqual(pushed, first);
+  assert.deepEqual(layer.getCellIndicesForPage('page_1'), [5, 6, 7, 9]);
+
+  pages[0].name = 'Renamed';
+  layer.refreshPageVersions(['page_1']);
+  assert.notEqual(layer._getPageVersion('page_1'), pushed, 'the digest carries the page name');
+});
+
+test('indices outside the dataset are still reported, as before', t => {
+  // A page that outlived a dataset reload can carry indices past the new
+  // dataset's end; membership keeps them so the fetch rejects them loudly.
+  const pages = singleGroupPages([2, POINT_COUNT + 3, 1]);
+  const layer = makeLayer(pages);
+  t.after(() => layer.destroy());
+  assert.deepEqual(layer.getCellIndicesForPage('page_1'), [1, 2, POINT_COUNT + 3]);
+  assert.equal(layer.getCellCountForPageId('page_1'), 3);
+});

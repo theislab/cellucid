@@ -81,4 +81,4 @@ export function resolveFigureInk({ background, backgroundColor }) {
   return luma >= LIGHT_BACKGROUND_LUMA ? LIGHT_INK : DARK_INK;
 }
 
-export { LIGHT_INK, DARK_INK };
+export { LIGHT_INK };

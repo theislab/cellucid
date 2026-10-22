@@ -282,8 +282,9 @@ test('main awaits every published dataset UI settlement owner', async () => {
   ];
   assert.equal(
     synchronizationCalls.length,
-    3,
-    'the helper declaration and its two publication callers must stay exact'
+    2,
+    'the helper declaration and its one publication caller (the reload, ' +
+      'which also loads the startup selection) must stay exact'
   );
   for (const call of synchronizationCalls.slice(1)) {
     const lineStart = mainSource.lastIndexOf('\n', call.index) + 1;

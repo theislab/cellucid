@@ -7,23 +7,30 @@
  * datasets require an explicit enabled-selector choice.
  */
 
+import { formatCompactCount } from '../components/display-format.js';
 import {
-  formatCellCount as formatDataNumber,
   validateDatasetId,
   validateDatasetIdentity
 } from '../../../data/data-source.js';
+import {
+  INVALID_GITHUB_PATH_MESSAGE,
+  parseGitHubPath
+} from '../../../data/github-data-source.js';
+import { validateRemoteServerUrl } from '../../../data/remote-source.js';
 import { getNotificationCenter } from '../../notification-center.js';
-import { DATA_LOAD_METHODS } from '../../../analytics/tracker.js';
+import { DATA_LOAD_METHODS } from '../../data-load-methods.js';
+import { analytics } from '../../optional-analytics.js';
 import { debug } from '../../../utils/debug.js';
+import { initDatasetDrop } from './dataset-drop.js';
 import {
   createDatasetReloadSupersededError,
   isDatasetReloadSupersededError
 } from '../../dataset-reload-outcome.js';
 
 const CONNECTION_OPTION_KEYS = Object.freeze([
-  'activateDataset',
   'clearDataset',
   'dataSourceManager',
+  'datasetIntents',
   'dom',
   'noneDatasetValue',
   'populateDatasetDropdown'
@@ -324,10 +331,96 @@ export function reportDataSourceFailure(subject, verb, error) {
 }
 
 /**
+ * Why a typed remote server address cannot be tried, or null when it can.
+ *
+ * The source's own validator decides; this only turns its refusal into a
+ * sentence that says where the right address comes from.
+ *
+ * @param {string} value
+ * @returns {string|null}
+ */
+export function describeRemoteAddressProblem(value) {
+  try {
+    validateRemoteServerUrl(value);
+    return null;
+  } catch (error) {
+    if (!(error instanceof TypeError)) throw error;
+    const reason = error.message.charAt(0).toLowerCase() + error.message.slice(1);
+    return `The remote server address was not tried: ${reason}. Use the bare `
+      + 'address the server prints as Local URL.';
+  }
+}
+
+/**
+ * Why a typed GitHub repository path cannot be tried, or null when it can.
+ *
+ * @param {string} value
+ * @returns {string|null}
+ */
+export function describeGitHubPathProblem(value) {
+  return parseGitHubPath(value) === null ? INVALID_GITHUB_PATH_MESSAGE : null;
+}
+
+/**
+ * The three ways a local dataset is read. The file inputs and a drop onto the
+ * viewer share them, so a dropped file is read, validated, reported and
+ * superseded exactly as a picked one is.
+ */
+const LOCAL_LOADERS = Object.freeze({
+  h5ad: Object.freeze({
+    loadMethod: DATA_LOAD_METHODS.LOCAL_H5AD,
+    loadingMessage: 'Loading h5ad file...',
+    load: (source, files) =>
+      source.loadFromH5adFile(files.length === 1 ? files[0] : null)
+  }),
+  'zarr-zip': Object.freeze({
+    loadMethod: DATA_LOAD_METHODS.LOCAL_ZARR_ZIP,
+    loadingMessage: 'Loading Zarr ZIP archive...',
+    load: (source, files) =>
+      source.loadFromZarrArchive(files.length === 1 ? files[0] : null)
+  }),
+  prepared: Object.freeze({
+    loadMethod: DATA_LOAD_METHODS.LOCAL_PREPARED,
+    loadingMessage: 'Loading prepared dataset...',
+    load: (source, files) => source.loadFromPreparedDirectory(files)
+  })
+});
+
+/**
+ * What a local choice is called while it is being read: the file, or the
+ * folder a prepared export was chosen as.
+ *
+ * @param {FileList|File[]} files
+ * @returns {string}
+ */
+function describeLocalSelection(files) {
+  const first = files[0];
+  const relativePath = typeof first?.webkitRelativePath === 'string'
+    ? first.webkitRelativePath
+    : '';
+  if (relativePath.includes('/')) return relativePath.split('/')[0];
+  return typeof first?.name === 'string' && first.name.length > 0
+    ? first.name
+    : 'your data';
+}
+
+/**
  * @param {Object} options
- * @param {(datasetId: string, sourceType: string, loadMethod: string, source?: Object|null) => Promise<boolean>} options.activateDataset
  * @param {() => Promise<boolean>} options.clearDataset
  * @param {Object} options.dataSourceManager
+ * @param {{
+ *   activate: (intent: Object, datasetId: string, sourceType: string,
+ *     loadMethod: string, source: Object) => Promise<boolean>,
+ *   actionSequence: () => number,
+ *   begin: (pending: {value: string|null, label: string}) => Object,
+ *   beginIfNoActionSince: (sequence: number,
+ *     pending: {value: string|null, label: string}) => Object|null,
+ *   owns: (intent: Object) => boolean,
+ *   settle: (intent: Object) => void,
+ *   settled: () => boolean,
+ *   whenSettled: () => Promise<void>
+ * }} options.datasetIntents The dataset controls' intent owner: every
+ *   dataset change made here is one of its intents.
  * @param {Object} options.dom
  * @param {string} options.noneDatasetValue
  * @param {() => Promise<boolean>} options.populateDatasetDropdown
@@ -335,14 +428,28 @@ export function reportDataSourceFailure(subject, verb, error) {
 export function initDatasetConnections(options) {
   requireExactOptions(options);
   const {
-    activateDataset,
     clearDataset,
     dataSourceManager,
+    datasetIntents,
     dom,
     noneDatasetValue,
     populateDatasetDropdown
   } = options;
-  requireFunction(activateDataset, 'Dataset activation owner');
+  if (datasetIntents === null || typeof datasetIntents !== 'object') {
+    throw new TypeError('Dataset connections require the dataset intent owner.');
+  }
+  for (const method of [
+    'actionSequence',
+    'activate',
+    'begin',
+    'beginIfNoActionSince',
+    'owns',
+    'settle',
+    'settled',
+    'whenSettled'
+  ]) {
+    requireMethod(datasetIntents, method, 'Dataset intent owner');
+  }
   requireFunction(clearDataset, 'Dataset clear owner');
   requireFunction(
     populateDatasetDropdown,
@@ -509,24 +616,48 @@ export function initDatasetConnections(options) {
     );
   }
 
-  let localSelectionRevision = 0;
-  operationInvalidators.add(() => {
-    localSelectionRevision =
-      localSelectionRevision === Number.MAX_SAFE_INTEGER
-        ? 1
-        : localSelectionRevision + 1;
-  });
-  async function loadLocalUserSelection(
-    files,
+  /**
+   * A file or folder is a dataset change from the moment it is chosen. Its
+   * intent is begun before the file is read, so the load in flight stops at
+   * once, the select shows what is being opened, and a choice made while the
+   * file is still being read replaces it instead of being overwritten by it
+   * when the read finishes.
+   */
+  /**
+   * @param {{label: string, readFiles: () => Promise<ArrayLike<File>>}} selection
+   *   `label` names the choice while it is read; `readFiles` yields its files,
+   *   and runs under the choice's own intent (a dropped folder is listed
+   *   there).
+   * @param {{loadMethod: string, loadingMessage: string,
+   *   load: (source: Object, files: ArrayLike<File>) => Promise<Object>}} loader
+   */
+  async function loadLocalUserSelection(selection, loader) {
+    const intent = datasetIntents.begin({
+      label: `Opening ${selection.label}…`,
+      value: null
+    });
+    try {
+      await loadLocalUserSelectionForIntent(intent, selection, loader);
+    } finally {
+      datasetIntents.settle(intent);
+    }
+  }
+
+  /** A choice made with one of the file inputs. */
+  function pickedSelection(files) {
+    return Object.freeze({
+      label: describeLocalSelection(files),
+      readFiles: async () => files
+    });
+  }
+
+  async function loadLocalUserSelectionForIntent(
+    intent,
+    { readFiles },
     { loadMethod, loadingMessage, load }
   ) {
-    if (!files || files.length === 0) return;
-    const selectionRevision = ++localSelectionRevision;
     const assertCurrentSelection = () => {
-      if (
-        destroyed ||
-        selectionRevision !== localSelectionRevision
-      ) {
+      if (destroyed || !datasetIntents.owns(intent)) {
         throw createDatasetReloadSupersededError(
           'Local dataset selection was superseded.'
         );
@@ -563,25 +694,55 @@ export function initDatasetConnections(options) {
         'Local-user selection candidate must be one isolated local-user source.'
       );
     }
-
+    // The activation joins this request, so a file that cannot be read is
+    // reported as a failed load too, and the duration includes reading it.
+    const dataLoad = analytics.openDataLoad(loadMethod, 'local-user');
     const loadNotifId = beginLoadingNotification(loadingMessage, {
       category: 'data'
     });
+    // A newer dataset choice cancels the read itself, not only its result:
+    // the candidate's disconnect aborts a prepared folder mid-read and
+    // retires a parsed file instead of adopting it, and the read's progress
+    // leaves the screen at once rather than when the read gets round to
+    // noticing.
+    const cancelRead = () => {
+      userSource.disconnect();
+      if (destroyed) return;
+      activeLoadingNotifications.delete(loadNotifId);
+      notifications.dismiss(loadNotifId);
+    };
+    intent.transaction.signal.addEventListener('abort', cancelRead, {
+      once: true
+    });
     let candidatePublished = false;
     try {
-      const metadata = await load(userSource, files);
+      let metadata;
+      try {
+        const files = await readFiles();
+        assertCurrentSelection();
+        metadata = await load(userSource, files);
+      } finally {
+        intent.transaction.signal.removeEventListener('abort', cancelRead);
+      }
       assertCurrentSelection();
-      const ready = await activateDataset(
+      const ready = await datasetIntents.activate(
+        intent,
         userSource.datasetId,
         'local-user',
         loadMethod,
         userSource
       );
+      // The activation settled the request it joined; this closes it when the
+      // selection was already current and nothing was activated.
+      dataLoad.cancel();
       assertCurrentSelection();
       if (ready !== true) {
-        throw new Error(
-          'Validated user data did not publish one ready generation.'
-        );
+        // The activation has already explained its failure next to the
+        // dataset select; a second toast would repeat it.
+        userSource.disconnect();
+        activeLoadingNotifications.delete(loadNotifId);
+        notifications.dismiss(loadNotifId);
+        return;
       }
       if (dataSourceManager.getSource('local-user') !== userSource) {
         throw new Error(
@@ -594,21 +755,29 @@ export function initDatasetConnections(options) {
       settleLoadingNotification(
         'complete',
         loadNotifId,
-        `User data ready: ${formatDataNumber(metadata.stats.n_cells)} cells`
+        `User data ready: ${formatCompactCount(metadata.stats.n_cells)} cells`
       );
     } catch (error) {
       if (destroyed) {
+        dataLoad.cancel();
         const adopted =
           dataSourceManager.getSource('local-user') === userSource;
         if (!candidatePublished && !adopted) userSource.disconnect();
         return;
       }
       if (isDatasetReloadSupersededError(error)) {
-        if (!candidatePublished) userSource.disconnect();
+        dataLoad.cancel();
+        // A candidate the activation already registered is the live
+        // dataset's source until the newer choice replaces it, which retires
+        // it then.
+        const adopted =
+          dataSourceManager.getSource('local-user') === userSource;
+        if (!candidatePublished && !adopted) userSource.disconnect();
         activeLoadingNotifications.delete(loadNotifId);
         notifications.dismiss(loadNotifId);
         return;
       }
+      dataLoad.fail(error);
       if (!candidatePublished) userSource.disconnect();
       debug.error('[UI] Failed to load user data:', error);
       settleLoadingNotification(
@@ -643,12 +812,13 @@ export function initDatasetConnections(options) {
       () => userDataFileInput.click()
     );
     listen(userDataFileInput, 'change', event => {
+      const files = event.target.files;
+      if (!files || files.length === 0) return undefined;
       return launchOperation(async () => {
-        await loadLocalUserSelection(event.target.files, {
-          loadMethod: DATA_LOAD_METHODS.LOCAL_PREPARED,
-          loadingMessage: 'Loading prepared dataset...',
-          load: (source, files) => source.loadFromPreparedDirectory(files)
-        });
+        await loadLocalUserSelection(
+          pickedSelection(files),
+          LOCAL_LOADERS.prepared
+        );
         if (!destroyed) userDataFileInput.value = '';
       }, 'Prepared-directory selection failed');
     });
@@ -662,15 +832,13 @@ export function initDatasetConnections(options) {
       () => userDataH5adInput.click()
     );
     listen(userDataH5adInput, 'change', event => {
+      const files = event.target.files;
+      if (!files || files.length === 0) return undefined;
       return launchOperation(async () => {
-        await loadLocalUserSelection(event.target.files, {
-          loadMethod: DATA_LOAD_METHODS.LOCAL_H5AD,
-          loadingMessage: 'Loading h5ad file...',
-          load: (source, files) =>
-            source.loadFromH5adFile(
-              files.length === 1 ? files[0] : null
-            )
-        });
+        await loadLocalUserSelection(
+          pickedSelection(files),
+          LOCAL_LOADERS.h5ad
+        );
         if (!destroyed) userDataH5adInput.value = '';
       }, 'H5AD selection failed');
     });
@@ -687,27 +855,58 @@ export function initDatasetConnections(options) {
       () => userDataZarrArchiveInput.click()
     );
     listen(userDataZarrArchiveInput, 'change', event => {
+      const files = event.target.files;
+      if (!files || files.length === 0) return undefined;
       return launchOperation(async () => {
-        await loadLocalUserSelection(event.target.files, {
-          loadMethod: DATA_LOAD_METHODS.LOCAL_ZARR_ZIP,
-          loadingMessage: 'Loading Zarr ZIP archive...',
-          load: (source, files) =>
-            source.loadFromZarrArchive(
-              files.length === 1 ? files[0] : null
-            )
-        });
+        await loadLocalUserSelection(
+          pickedSelection(files),
+          LOCAL_LOADERS['zarr-zip']
+        );
         if (!destroyed) userDataZarrArchiveInput.value = '';
       }, 'Zarr ZIP selection failed');
     });
     admitControls(userDataZarrArchiveBtn, userDataZarrArchiveInput);
   }
 
+  // A file or folder dropped onto the viewer is one more way to make the same
+  // three local choices, so it goes through the same intent and reader.
+  const datasetDrop = requireControlGroup(
+    dom,
+    ['datasetDropOverlay'],
+    'Dataset drop'
+  );
+  const retireDatasetDrop = datasetDrop === null
+    ? null
+    : initDatasetDrop({
+        documentOwner: datasetSelect.ownerDocument,
+        overlay: datasetDrop.datasetDropOverlay,
+        openDataset: drop => {
+          if (destroyed) return;
+          void launchOperation(
+            () => loadLocalUserSelection(
+              { label: drop.label, readFiles: drop.readFiles },
+              LOCAL_LOADERS[drop.kind]
+            ),
+            'Dropped dataset failed'
+          );
+        },
+        refuse: message => {
+          if (destroyed) return;
+          notifications.error(message, {
+            category: 'data',
+            title: 'Cannot open the dropped item'
+          });
+        }
+      });
+
   function wireConnection(config) {
     const {
       connectButton,
       connectionInput,
+      describeInputProblem,
       disconnectButton,
       disconnectContainer,
+      emptyInputMessage,
       failureSubject,
       inputLabel,
       loadMethod,
@@ -761,7 +960,7 @@ export function initDatasetConnections(options) {
         );
       }
       connectButton.textContent = connected ? 'Reconnect' : 'Connect';
-      disconnectContainer.style.display = connected ? 'flex' : 'none';
+      disconnectContainer.hidden = !connected;
       connectionInput.disabled = connected || recoveryBlocked;
     }
 
@@ -827,15 +1026,43 @@ export function initDatasetConnections(options) {
       };
     }
 
-    async function recoverConnectionLoss(lostSource, error) {
+    async function recoverConnectionLoss(lostSource, error, notice) {
       if (dataSourceManager.getSource(sourceType) !== lostSource) return;
       const revision = ++operationRevision;
       connectButton.disabled = true;
       disconnectButton.disabled = true;
-      const wasActive =
-        dataSourceManager.getCurrentSourceType() === sourceType;
-      if (wasActive) {
-        const cleared = await clearDataset();
+      // Said at once: recovery may wait for a newer choice to settle, and the
+      // loss must not wait with it. The same notice is completed below.
+      notice.id = notifications.error(
+        `${inputLabel} connection was lost.`,
+        {
+          category: 'connectivity',
+          title: 'Connection lost',
+          duration: 0
+        }
+      );
+      // Recovery clears only the dataset it lost, and only once nothing the
+      // user chose is still loading: a newer choice in flight replaces the
+      // lost dataset itself, and clearing now would supersede that choice.
+      // Should the newer choice fail, the lost dataset is still on screen
+      // and is cleared then.
+      while (dataSourceManager.getCurrentSourceType() === sourceType) {
+        if (!datasetIntents.settled()) {
+          await datasetIntents.whenSettled();
+          assertCurrentOperation(revision);
+          continue;
+        }
+        let cleared;
+        try {
+          cleared = await clearDataset();
+        } catch (clearError) {
+          // A choice the user made while the clear ran owns the dataset now.
+          if (destroyed || !isDatasetReloadSupersededError(clearError)) {
+            throw clearError;
+          }
+          assertCurrentOperation(revision);
+          continue;
+        }
         assertCurrentOperation(revision);
         if (cleared !== true) {
           recoveryBlocked = true;
@@ -846,6 +1073,7 @@ export function initDatasetConnections(options) {
             `not be cleared safely. Reload the page before reconnecting. ` +
             `Cause: ${errorMessage(error)}`,
             {
+              id: notice.id,
               category: 'connectivity',
               duration: 0,
               title: 'Connection recovery blocked'
@@ -875,6 +1103,7 @@ export function initDatasetConnections(options) {
       notifications.error(
         `${inputLabel} connection was lost. Reconnect to continue.`,
         {
+          id: notice.id,
           category: 'connectivity',
           title: 'Connection lost',
           duration: 0
@@ -892,8 +1121,9 @@ export function initDatasetConnections(options) {
       );
       const handleConnectionLost = error => {
         launchOperation(async () => {
+          const notice = { id: undefined };
           try {
-            await recoverConnectionLoss(candidate, error);
+            await recoverConnectionLoss(candidate, error, notice);
           } catch (recoveryError) {
             if (
               destroyed ||
@@ -909,6 +1139,8 @@ export function initDatasetConnections(options) {
               `Remote connection recovery failed: ` +
               `${errorMessage(recoveryError)}. Reload the page before reconnecting.`,
               {
+                // Completes the loss notice when recovery got that far.
+                ...(notice.id === undefined ? {} : { id: notice.id }),
                 category: 'connectivity',
                 duration: 0,
                 title: 'Connection recovery blocked'
@@ -941,15 +1173,30 @@ export function initDatasetConnections(options) {
       }
       const inputValue = connectionInput.value;
       if (typeof inputValue !== 'string' || inputValue.trim().length === 0) {
-        notifications.error(
-          `Enter one ${inputLabel.toLowerCase()} before connecting.`,
-          { category: 'connectivity' }
-        );
+        notifications.error(emptyInputMessage, { category: 'connectivity' });
+        return;
+      }
+      // An address the source would refuse unread is a typing problem, not a
+      // connection failure: say what is wrong with it and do not start a
+      // connection whose failure would be reported as if the data were at
+      // fault ("not in a format Cellucid can read ... re-export it").
+      const inputProblem = describeInputProblem(inputValue);
+      if (inputProblem !== null) {
+        notifications.error(inputProblem, { category: 'connectivity' });
         return;
       }
 
       const priorSource = source;
       const revision = ++operationRevision;
+      // Connecting changes the dataset only if the server holds exactly one,
+      // which is not known until it answers. So the click begins no dataset
+      // change; it records the user's last action, and the activation later
+      // replaces only loads that were already running then — never a choice
+      // made or a session applied while it connected.
+      const clickAction = datasetIntents.actionSequence();
+      // A one-dataset connection's activation joins this request; a
+      // connection that only lists datasets loads none and is canceled.
+      const dataLoad = analytics.openDataLoad(loadMethod, sourceType);
       const connectNotifId = beginLoadingNotification(
         `Connecting to ${inputLabel}: ${inputValue}...`,
         { category: 'connectivity' }
@@ -996,6 +1243,7 @@ export function initDatasetConnections(options) {
         );
         assertCurrentOperation(revision);
         if (datasets.length === 0) {
+          dataLoad.cancel();
           const cleanupError = disconnectCandidateOnce();
           if (cleanupError !== null) throw cleanupError;
           updateConnectionUI(sourceConnected(priorSource));
@@ -1008,40 +1256,76 @@ export function initDatasetConnections(options) {
         }
 
         attachConnectionLoss(candidate);
-        if (datasets.length === 1) {
-          const ready = await activateDataset(
-            datasets[0].id,
-            sourceType,
-            loadMethod,
-            candidate
-          );
-          assertCurrentOperation(revision);
-          if (ready !== true) {
-            throw new Error(
-              `${inputLabel} dataset activation did not publish a ready generation.`
+        const activationIntent = datasets.length === 1
+          ? datasetIntents.beginIfNoActionSince(clickAction, {
+              label: `Loading ${datasets[0].name}…`,
+              value: null
+            })
+          : null;
+        if (activationIntent !== null) {
+          let ready = null;
+          try {
+            ready = await datasetIntents.activate(
+              activationIntent,
+              datasets[0].id,
+              sourceType,
+              loadMethod,
+              candidate
             );
+          } catch (error) {
+            // A choice made while the dataset loaded replaced it. The
+            // connection itself still succeeded and is kept below.
+            if (!isDatasetReloadSupersededError(error) || destroyed) {
+              throw error;
+            }
+          } finally {
+            datasetIntents.settle(activationIntent);
           }
-          // The activation transaction registered the candidate and finalized
-          // the displaced transport exactly once.
-          if (dataSourceManager.getSource(sourceType) !== candidate) {
+          // Settled by the activation that joined it; closed otherwise.
+          dataLoad.cancel();
+          assertCurrentOperation(revision);
+          if (ready === false) {
+            // The activation explained its failure next to the dataset
+            // select; the connection is not adopted and says nothing more.
+            disconnectCandidateOnce();
+            updateConnectionUI(sourceConnected(priorSource));
+            activeLoadingNotifications.delete(connectNotifId);
+            notifications.dismiss(connectNotifId);
+            return;
+          }
+          // Published — and possibly replaced since by a newer choice — so
+          // the activation transaction registered the candidate and
+          // finalized the displaced transport exactly once.
+          const published =
+            dataSourceManager.getSource(sourceType) === candidate;
+          if (ready === true && !published) {
             throw new Error(
               `${inputLabel} activation did not adopt its connection candidate.`
             );
           }
-          source = candidate;
-          updateConnectionUI(true);
-          candidatePublished = true;
-          detachConnectionLoss(priorSource);
-          await populate();
-          assertCurrentOperation(revision);
-          settleLoadingNotification(
-            'complete',
-            connectNotifId,
-            `Connected - dataset "${datasets[0].name}" loaded`
-          );
-          return;
+          if (published) {
+            source = candidate;
+            updateConnectionUI(true);
+            candidatePublished = true;
+            detachConnectionLoss(priorSource);
+            await populate();
+            assertCurrentOperation(revision);
+            settleLoadingNotification(
+              'complete',
+              connectNotifId,
+              ready === true
+                ? `Connected - dataset "${datasets[0].name}" loaded`
+                : `Connected - dataset "${datasets[0].name}" is available ` +
+                  `in Sample datasets.`
+            );
+            return;
+          }
         }
 
+        // A server listing several datasets — or one whose dataset another
+        // choice made during the connection now supersedes — is adopted as a
+        // catalog: its datasets are offered in the dataset select.
+        dataLoad.cancel();
         const adoption = await adoptMultipleCandidate(
           priorSource,
           candidate,
@@ -1062,10 +1346,15 @@ export function initDatasetConnections(options) {
         settleLoadingNotification(
           'complete',
           connectNotifId,
-          `Connected - ${adoption.count} datasets found. Choose one from Sample datasets.`
+          adoption.count === 1
+            ? `Connected - dataset "${datasets[0].name}" is available in ` +
+              `Sample datasets.`
+            : `Connected - ${adoption.count} datasets found. Choose one ` +
+              `from Sample datasets.`
         );
       } catch (error) {
         if (destroyed) {
+          dataLoad.cancel();
           if (
             candidate !== null &&
             dataSourceManager.getSource(sourceType) === candidate
@@ -1125,6 +1414,7 @@ export function initDatasetConnections(options) {
           isDatasetReloadSupersededError(error) &&
           failureErrors.length === 1
         ) {
+          dataLoad.cancel();
           activeLoadingNotifications.delete(connectNotifId);
           notifications.dismiss(connectNotifId);
           return;
@@ -1140,6 +1430,7 @@ export function initDatasetConnections(options) {
               failureErrors,
               `${inputLabel} connection recovery failed.`
             );
+        dataLoad.fail(exactError);
         settleLoadingNotification(
           'fail',
           connectNotifId,
@@ -1275,8 +1566,12 @@ export function initDatasetConnections(options) {
     wireConnection({
       connectButton: remote.remoteConnectBtn,
       connectionInput: remote.remoteServerUrl,
+      describeInputProblem: describeRemoteAddressProblem,
       disconnectButton: remote.remoteDisconnectBtn,
       disconnectContainer: remote.remoteDisconnectContainer,
+      emptyInputMessage:
+        'Enter a remote server address, such as http://localhost:8765, '
+        + 'before connecting.',
       failureSubject: 'The remote server',
       inputLabel: 'Remote server',
       loadMethod: DATA_LOAD_METHODS.REMOTE_CONNECT,
@@ -1298,8 +1593,12 @@ export function initDatasetConnections(options) {
     wireConnection({
       connectButton: github.githubConnectBtn,
       connectionInput: github.githubRepoUrl,
+      describeInputProblem: describeGitHubPathProblem,
       disconnectButton: github.githubDisconnectBtn,
       disconnectContainer: github.githubDisconnectContainer,
+      emptyInputMessage:
+        'Enter a GitHub repository path, such as owner/repo/exports, '
+        + 'before connecting.',
       failureSubject: 'The GitHub repository',
       inputLabel: 'GitHub repository',
       loadMethod: DATA_LOAD_METHODS.GITHUB_CONNECT,
@@ -1320,6 +1619,11 @@ export function initDatasetConnections(options) {
       // The listeners are gone, so the controls must stop offering the actions
       // those listeners would have carried out.
       retireAdmittedControls();
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+    try {
+      retireDatasetDrop?.();
     } catch (error) {
       cleanupErrors.push(error);
     }

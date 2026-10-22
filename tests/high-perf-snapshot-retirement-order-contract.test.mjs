@@ -108,7 +108,7 @@ function createFixture() {
   return { gl, positionBuffer, renderer, snapshot };
 }
 
-test('final snapshot retirement deletes every VAO before color and pooled position storage', () => {
+test('final snapshot retirement deletes its VAO before colour storage and retains the pooled positions', () => {
   const { gl, positionBuffer, renderer, snapshot } =
     createFixture();
 
@@ -119,14 +119,29 @@ test('final snapshot retirement deletes every VAO before color and pooled positi
     [
       { handle: snapshot.vao, kind: 'vertex-array' },
       { handle: snapshot.buffer, kind: 'buffer' },
-      { handle: positionBuffer, kind: 'buffer' },
     ],
     'the vertex owner must be gone before its referenced storage is deleted',
   );
   assert.equal(renderer._pendingSnapshotRetirements.size, 0);
-  assert.equal(renderer._snapshotGeometryPools.size, 0);
+  // No view shows the geometry now: it stays retained, within budget, so
+  // showing the representation again costs no upload.
+  assert.equal(renderer._snapshotGeometryPools.size, 1);
+  const retained = renderer._snapshotGeometryPools.get(7);
+  assert.equal(retained.refCount, 0);
+  assert.equal(retained.retained, true);
+  assert.equal(retained.positionBuffer, positionBuffer);
+  assert.equal(renderer.getRetainedGeometryBytes(), retained.positionBufferByteLength);
   assert.equal(gl._state.liveVertexArrays.size, 0);
+  assert.deepEqual([...gl._state.liveBuffers], [positionBuffer]);
+
+  // Evicting it deletes the storage, once, after every VAO that drew it.
+  const retainedBytes = retained.positionBufferByteLength;
+  assert.equal(renderer.evictRetainedGeometry(Infinity), retainedBytes);
+  assert.deepEqual(gl._state.events.at(-1), { handle: positionBuffer, kind: 'buffer' });
+  assert.equal(renderer._snapshotGeometryPools.size, 0);
+  assert.equal(renderer._pendingDataRetirements.size, 0);
   assert.equal(gl._state.liveBuffers.size, 0);
+  assert.equal(renderer.getRetainedGeometryBytes(), 0);
 });
 
 test('delete-then-throw snapshot handles settle through exact liveness checks', () => {
@@ -137,6 +152,9 @@ test('delete-then-throw snapshot handles settle through exact liveness checks', 
   gl._state.failures.buffers.set(positionBuffer, 'after');
 
   assert.doesNotThrow(() => renderer.deleteSnapshotBuffer(snapshot.id));
+  // The retained position storage is deleted on eviction, through the same
+  // liveness settlement.
+  assert.doesNotThrow(() => renderer.evictRetainedGeometry(Infinity));
 
   assert.deepEqual(
     gl._state.events,
@@ -147,12 +165,14 @@ test('delete-then-throw snapshot handles settle through exact liveness checks', 
     ],
   );
   assert.equal(renderer._pendingSnapshotRetirements.size, 0);
+  assert.equal(renderer._pendingDataRetirements.size, 0);
   assert.equal(renderer._snapshotGeometryPools.size, 0);
   assert.equal(gl._state.liveVertexArrays.size, 0);
   assert.equal(gl._state.liveBuffers.size, 0);
 
   // A settled delete-then-throw handle is never attempted a second time.
   renderer.deleteSnapshotBuffer(snapshot.id);
+  renderer.evictRetainedGeometry(Infinity);
   assert.equal(
     countIdentity(
       gl._state.events.map(event => event.handle),
@@ -214,6 +234,11 @@ test('pre-delete VAO failure retains every referenced owner behind the retry bar
   assert.doesNotThrow(() => renderer.deleteSnapshotBuffer(snapshot.id));
   assert.equal(renderer._pendingSnapshotRetirements.size, 0);
   assert.equal(gl._state.liveVertexArrays.size, 0);
+  // Only once the VAO is truly gone does the geometry become retained, and
+  // only eviction deletes it.
+  assert.equal(renderer._snapshotGeometryPools.get(7).refCount, 0);
+  assert.equal(gl._state.liveBuffers.has(positionBuffer), true);
+  renderer.evictRetainedGeometry(Infinity);
   assert.equal(
     countIdentity(
       gl._state.events.map(event => event.handle),
@@ -265,8 +290,68 @@ test('shared position storage retires only after the last referencing VAO', () =
     { handle: snapshot.buffer, kind: 'buffer' },
     { handle: second.vao, kind: 'vertex-array' },
     { handle: second.buffer, kind: 'buffer' },
-    { handle: positionBuffer, kind: 'buffer' },
   ]);
+  assert.equal(renderer._snapshotGeometryPools.get(7).refCount, 0);
+  assert.equal(gl._state.liveBuffers.has(positionBuffer), true);
+
+  renderer.evictRetainedGeometry(Infinity);
+  assert.deepEqual(gl._state.events.at(-1), { handle: positionBuffer, kind: 'buffer' });
   assert.equal(renderer._snapshotGeometryPools.size, 0);
   assert.equal(gl._state.liveBuffers.size, 0);
+});
+
+test('a retained geometry inside the budget survives; over the budget the least recently used goes first', () => {
+  const { gl, positionBuffer, renderer, snapshot } = createFixture();
+  renderer.deleteSnapshotBuffer(snapshot.id);
+  const older = renderer._snapshotGeometryPools.get(7);
+  older.lastUsed = 1;
+  // Within budget (at least 64 MiB), a budget pass keeps it.
+  assert.equal(renderer.evictRetainedGeometry(), 0);
+  assert.equal(gl._state.liveBuffers.has(positionBuffer), true);
+
+  const newerBuffer = gl.createBuffer();
+  renderer._snapshotGeometryPools.set(9, {
+    generation: 9,
+    dimension: 3,
+    positions: new Float32Array(6),
+    positionBuffer: newerBuffer,
+    positionBufferByteLength: 24,
+    borrowsLivePositionBuffer: false,
+    refCount: 0,
+    retained: true,
+    lastUsed: 2,
+    spatialIndices: new Map(),
+  });
+  // Asking for the whole budget as headroom leaves room for nothing retained:
+  // the oldest goes first, then the next.
+  const budget = renderer._geometryRetentionBudget();
+  const olderBytes = older.positionBufferByteLength;
+  assert.equal(renderer.evictRetainedGeometry(budget - 24), olderBytes);
+  assert.equal(gl._state.liveBuffers.has(positionBuffer), false);
+  assert.equal(gl._state.liveBuffers.has(newerBuffer), true);
+  assert.equal(renderer.evictRetainedGeometry(budget), 24);
+  assert.equal(gl._state.liveBuffers.has(newerBuffer), false);
+});
+
+test('releasing one evicted positions array drops only its retained geometry', () => {
+  const { gl, positionBuffer, renderer, snapshot } = createFixture();
+  renderer.deleteSnapshotBuffer(snapshot.id);
+  assert.equal(renderer.releaseRetainedGeometryFor(new Float32Array(6)), 0);
+  assert.equal(gl._state.liveBuffers.has(positionBuffer), true);
+  assert.equal(
+    renderer.releaseRetainedGeometryFor(snapshot.positions),
+    snapshot.positions.byteLength,
+  );
+  assert.equal(gl._state.liveBuffers.has(positionBuffer), false);
+  assert.equal(renderer._snapshotGeometryPools.size, 0);
+});
+
+test('a geometry the live view borrows is never deleted by eviction', () => {
+  const { gl, positionBuffer, renderer, snapshot } = createFixture();
+  renderer._snapshotGeometryPools.get(7).borrowsLivePositionBuffer = true;
+  renderer.deleteSnapshotBuffer(snapshot.id);
+  assert.equal(renderer.getRetainedGeometryBytes(), 0, 'live-owned storage is not retained storage');
+  renderer.evictRetainedGeometry(Infinity);
+  assert.equal(renderer._snapshotGeometryPools.size, 0);
+  assert.equal(gl._state.liveBuffers.has(positionBuffer), true);
 });

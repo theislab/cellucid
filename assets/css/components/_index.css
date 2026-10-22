@@ -2,10 +2,12 @@
 
 @import '_sidebar.css';
 @import '_accordion.css';
-@import '_forms.css';
+@import '_controls.css';
 @import '_buttons.css';
+@import '_forms.css';
 @import '_legend.css';
 @import '_filters.css';
+@import '_select-bar.css';
 @import '_field-operations.css';
 @import '_notifications.css';
 @import '_modals.css';
@@ -13,3 +15,5 @@
 @import '_analysis.css';
 @import '_figure-export.css';
 @import '_cinematic-camera.css';
+@import '_cell-info.css';
+@import '_dataset-drop.css';

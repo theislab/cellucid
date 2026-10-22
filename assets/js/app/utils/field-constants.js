@@ -36,21 +36,6 @@ export const OverlapStrategy = Object.freeze({
 });
 
 /**
- * How many categories one field may hold is not stated here. That ceiling is a
- * property of the on-disk code width and is derived once, in
- * `data/categorical-storage-contract.js`, alongside the missing-code sentinel
- * it is inseparable from. A copy in this file sat at 255 -- the uint8 ceiling
- * -- and so refused every operation on the uint16 categoricals both exporters
- * write and every reader accepts.
- */
-export const Limits = Object.freeze({
-  MAX_FIELD_KEY_LENGTH: 256,
-  MAX_CATEGORY_LABEL_LENGTH: 256,
-  MAX_USER_DEFINED_FIELDS: 20,
-  MAX_INTERSECTION_PAGES: 12
-});
-
-/**
  * Generate a stable composite identifier for a field.
  * Used for registries that must survive display renames.
  * @param {string} source - 'obs' | 'var'
@@ -59,22 +44,6 @@ export const Limits = Object.freeze({
  */
 export function makeFieldId(source, fieldKey) {
   return `${source}:${fieldKey}`;
-}
-
-/**
- * Parse a composite field identifier back into its parts.
- * @param {string} fieldId
- * @returns {{ source: string, fieldKey: string }}
- */
-export function parseFieldId(fieldId) {
-  const colonIndex = String(fieldId || '').indexOf(':');
-  if (colonIndex === -1) {
-    return { source: FieldSource.OBS, fieldKey: String(fieldId || '') };
-  }
-  return {
-    source: fieldId.slice(0, colonIndex),
-    fieldKey: fieldId.slice(colonIndex + 1)
-  };
 }
 
 let _idCounter = 0;

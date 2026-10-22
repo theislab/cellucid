@@ -7,6 +7,7 @@ import {
   findCellsInLasso,
   HighlightTools,
 } from '../assets/js/rendering/highlight-renderer.js';
+import { SELECT_MODE_OFF } from '../assets/js/rendering/select-mode.js';
 
 function identityMatrix() {
   const matrix = new Float32Array(16);
@@ -63,6 +64,9 @@ function createCanvas(width, height) {
       remove(name) {
         classes.delete(name);
       },
+      contains(name) {
+        return classes.has(name);
+      },
     },
     getBoundingClientRect() {
       return { left: 0, top: 0, width, height };
@@ -77,8 +81,15 @@ function createDrawingContext() {
   return {
     arcs: [],
     labels: [],
+    clips: [],
     beginPath() {},
     clearRect() {},
+    clip() {},
+    rect(x, y, width, height) {
+      this.clips.push({ x, y, width, height });
+    },
+    restore() {},
+    save() {},
     closePath() {},
     fill() {},
     fillText(text, x, y) {
@@ -106,6 +117,8 @@ function createViewport({
   localY = height / 2,
   projectionShift,
   projectionCenterNdcX = projectionShift,
+  visibleOffsetX = offsetX,
+  visibleWidth = width,
   cameraForward = Float32Array.from([0, 0, -1]),
   cameraTargetRadius = 10,
 }) {
@@ -119,6 +132,10 @@ function createViewport({
     vpOffsetY: offsetY,
     vpLocalX: localX,
     vpLocalY: localY,
+    visibleOffsetX,
+    visibleOffsetY: offsetY,
+    visibleWidth,
+    visibleHeight: height,
     vpAspect: width / height,
     projectionCenterNdcX,
     projectionMatrix,
@@ -212,6 +229,7 @@ for (const overlayCase of overlayCases) {
         viewMatrix: identityMatrix(),
         modelMatrix,
         viewPositions: Float32Array.from([0, 0, 0]),
+        dimensionLevel: 3,
       });
       assertClose(knnContext.arcs.at(-1).x, overlayCase.expectedCanvasX);
       assert.equal(knnContext.arcs.at(-1).y, 50);
@@ -230,8 +248,9 @@ for (const overlayCase of overlayCases) {
         },
         mat4,
         modelMatrix,
-        transparencyArray: Float32Array.from([1]),
+        transparencyArray: Uint8Array.from([1]),
         viewPositions: Float32Array.from([0, 0, 0]),
+        dimensionLevel: 3,
       });
       assert.deepEqual(selected, [0]);
     }
@@ -267,7 +286,7 @@ test('unlocked grid proximity owns the clicked pane plane and scale for the full
     modelMatrix: identityMatrix(),
   };
   const panePositions = Float32Array.from([0, 0, 0]);
-  const paneTransparency = Float32Array.of(1);
+  const paneTransparency = Uint8Array.of(1);
   const paneOwner = {
     viewId: 'non-focused-pane',
     positions: panePositions,
@@ -279,19 +298,16 @@ test('unlocked grid proximity owns the clicked pane plane and scale for the full
   const tools = Object.assign(Object.create(HighlightTools.prototype), {
     _unifiedCandidateSet: new Set([0]),
     _unifiedStepCount: 1,
+    altKeyDown: true,
+    selectMode: SELECT_MODE_OFF,
     canvas,
     cellSelectionEnabled: false,
     getRenderContext: () => focusedContext,
-    getViewPositions: viewId => {
-      assert.equal(viewId, 'non-focused-pane');
-      return panePositions;
-    },
     getSpatialQueryOwner: (viewId) => {
       assert.equal(viewId, 'non-focused-pane');
       return paneOwner;
     },
     getViewportInfoAtScreen: () => sourceViewport,
-    highlightMode: 'none',
     isProximityDragging: false,
     knnEnabled: false,
     lassoCtx,
@@ -311,7 +327,7 @@ test('unlocked grid proximity owns the clicked pane plane and scale for the full
   });
 
   let prevented = false;
-  const handled = tools.handleMouseDown({
+  const handled = tools.handlePointerDown({
     altKey: true,
     button: 0,
     clientX: 125,
@@ -349,7 +365,7 @@ test('unlocked grid proximity owns the clicked pane plane and scale for the full
   focusedContext.modelMatrix[12] = 0.5;
 
   assert.equal(
-    tools.handleMouseMove({
+    tools.handlePointerMove({
       clientX: 155,
       clientY: 90,
     }),
@@ -368,8 +384,8 @@ test('unlocked grid proximity owns the clicked pane plane and scale for the full
 test('a stale lasso retires with one empty preview and no selection callback', t => {
   installBrowserPixelRatio(t);
   const positions = Float32Array.from([0, 0, 0]);
-  const firstTransparency = Float32Array.of(1);
-  const nextTransparency = Float32Array.of(1);
+  const firstTransparency = Uint8Array.of(1);
+  const nextTransparency = Uint8Array.of(1);
   const firstOwner = {
     viewId: 'pane',
     positions,
@@ -390,6 +406,7 @@ test('a stale lasso retires with one empty preview and no selection callback', t
     _unifiedStepCount: 2,
     _lassoPreviewPublished: true,
     altKeyDown: true,
+    selectMode: SELECT_MODE_OFF,
     canvas,
     getRenderContext: () => ({
       viewMatrix: identityMatrix(),
@@ -403,7 +420,6 @@ test('a stale lasso retires with one empty preview and no selection callback', t
       assert.equal(viewId, 'pane');
       return nextOwner;
     },
-    highlightMode: 'none',
     highlightRenderer: {
       clearViewBuffer() {},
     },
@@ -438,7 +454,7 @@ test('a stale lasso retires with one empty preview and no selection callback', t
   });
 
   assert.equal(
-    tools.handleMouseMove({ clientX: 70, clientY: 70 }),
+    tools.handlePointerMove({ clientX: 70, clientY: 70 }),
     true,
   );
   assert.equal(tools.isLassoing, false);
@@ -454,7 +470,7 @@ test('a stale lasso retires with one empty preview and no selection callback', t
 test('snapshot proximity remains bound to its pane and retires only with that view', t => {
   installBrowserPixelRatio(t);
   const positions = Float32Array.from([0, 0, 0]);
-  const transparency = Float32Array.of(1);
+  const transparency = Uint8Array.of(1);
   const snapshotOwner = {
     viewId: 'snapshot',
     positions,
@@ -477,6 +493,7 @@ test('snapshot proximity remains bound to its pane and retires only with that vi
     _unifiedCandidateSet: null,
     _unifiedStepCount: 0,
     altKeyDown: true,
+    selectMode: SELECT_MODE_OFF,
     canvas: createCanvas(200, 100),
     getRenderContext: () => ({
       viewMatrix: identityMatrix(),
@@ -490,7 +507,6 @@ test('snapshot proximity remains bound to its pane and retires only with that vi
       assert.equal(viewId, 'snapshot');
       return snapshotOwner;
     },
-    highlightMode: 'none',
     highlightRenderer: {
       clearViewBuffer() {},
     },
@@ -523,7 +539,7 @@ test('snapshot proximity remains bound to its pane and retires only with that vi
   assert.equal(tools.retireSpatialInteractions('live'), false);
   assert.equal(tools.isProximityDragging, true);
   assert.equal(
-    tools.handleMouseMove({ clientX: 170, clientY: 50 }),
+    tools.handlePointerMove({ clientX: 170, clientY: 50 }),
     true,
   );
   assert.deepEqual(previewPayload.cellIndices, [0]);
@@ -590,7 +606,7 @@ test('highlight viewport interactions reject absent pane camera ownership', t =>
  */
 function createGestureRenderer({ pickCell, enabled = {} }) {
   const positions = Float32Array.from([0, 0, 0]);
-  const transparency = Float32Array.of(1);
+  const transparency = Uint8Array.of(1);
   const owner = {
     viewId: 'pane',
     positions,
@@ -608,6 +624,7 @@ function createGestureRenderer({ pickCell, enabled = {} }) {
     _unifiedCandidateSet: null,
     _unifiedStepCount: 0,
     altKeyDown: true,
+    selectMode: SELECT_MODE_OFF,
     canvas,
     cellSelectionEnabled: true,
     getNavigationState: () => ({
@@ -627,7 +644,13 @@ function createGestureRenderer({ pickCell, enabled = {} }) {
       projectionShift: 0,
     }),
     getViewTransparency: () => transparency,
-    highlightMode: 'categorical',
+    getViewFieldKind: () => 'categorical',
+    getViewIdAtCanvasPoint: () => 'pane',
+    _pointerClientX: Number.NaN,
+    _pointerClientY: Number.NaN,
+    _canvasOriginX: 0,
+    _canvasOriginY: 0,
+    _pointerPaneFieldKind: null,
     isKnnDragging: false,
     isLassoing: false,
     isProximityDragging: false,
@@ -683,7 +706,7 @@ test(
     const owner = createGestureRenderer({ pickCell: -1 });
     const down = altMouseDown();
 
-    const handled = owner.tools.handleMouseDown(down.event);
+    const handled = owner.tools.handlePointerDown(down.event);
 
     assert.equal(handled, false, 'a miss still leaves the drag to the camera');
     assert.equal(down.wasPrevented(), true);
@@ -709,7 +732,7 @@ for (const [mode, flag] of [['knn', 'knnEnabled'], ['proximity', 'proximityEnabl
         enabled: { [flag]: true },
       });
 
-      owner.tools.handleMouseDown(altMouseDown().event);
+      owner.tools.handlePointerDown(altMouseDown().event);
 
       assert.deepEqual(
         owner.published.map(entry => entry.tool),
@@ -756,7 +779,7 @@ test('a lasso that encloses no cells still publishes its step', t => {
   ]);
 
   assert.equal(
-    owner.tools.handleMouseUp({ target: owner.canvas }),
+    owner.tools.handlePointerUp(owner.canvas),
     true
   );
 
@@ -786,7 +809,7 @@ test(
     ]);
 
     assert.equal(
-      owner.tools.handleMouseUp({ target: { tagName: 'BUTTON' } }),
+      owner.tools.handlePointerUp({ tagName: 'BUTTON' }),
       true
     );
 
@@ -819,7 +842,7 @@ test('a release inside the render canvas still commits', t => {
     { x: 40, y: 60 },
   ]);
 
-  owner.tools.handleMouseUp({ target: owner.canvas });
+  owner.tools.handlePointerUp(owner.canvas);
 
   assert.deepEqual(owner.published, [{
     tool: 'lasso',
@@ -830,4 +853,286 @@ test('a release inside the render canvas still commits', t => {
       mode: 'intersect',
     },
   }]);
+});
+
+// ---------------------------------------------------------------------------
+// Select mode feeds the same press pipeline a held Alt does
+// ---------------------------------------------------------------------------
+
+function plainPress(modifiers = {}) {
+  return {
+    altKey: false,
+    button: 0,
+    clientX: 50,
+    clientY: 50,
+    ctrlKey: false,
+    metaKey: false,
+    shiftKey: false,
+    preventDefault() {},
+    ...modifiers,
+  };
+}
+
+test('with select mode on, a press with no Alt runs the active tool', t => {
+  installBrowserPixelRatio(t);
+  const owner = createGestureRenderer({
+    pickCell: 0,
+    enabled: { altKeyDown: false },
+  });
+  owner.tools.setSelectMode({ enabled: true, combine: 'intersect' });
+
+  assert.equal(owner.tools.handlePointerDown(plainPress()), true);
+  assert.equal(owner.tools.selectionDragStart.cellIndex, 0);
+  assert.equal(owner.tools.selectionDragStart.viewId, 'pane');
+  assert.equal(owner.tools.handlePointerUp(owner.canvas), true);
+
+  assert.deepEqual(owner.published.map(entry => entry.tool), ['annotation']);
+  assert.equal(owner.published[0].event.type, 'click');
+  assert.equal(owner.published[0].event.mode, 'intersect');
+  assert.equal(owner.published[0].event.viewId, 'pane');
+});
+
+test('with select mode off, a press with no Alt is left to the camera', t => {
+  installBrowserPixelRatio(t);
+  const owner = createGestureRenderer({
+    pickCell: 0,
+    enabled: { altKeyDown: false, lassoEnabled: true },
+  });
+
+  assert.equal(owner.tools.handlePointerDown(plainPress()), false);
+  assert.equal(owner.tools.selectionDragStart, null);
+  assert.equal(owner.tools.isLassoing, false);
+  assert.deepEqual(owner.published, []);
+});
+
+test('select mode combine stands in for Shift and Ctrl; a held key still wins', t => {
+  installBrowserPixelRatio(t);
+  const cases = [
+    [{ enabled: true, combine: 'union' }, {}, 'union'],
+    [{ enabled: true, combine: 'subtract' }, {}, 'subtract'],
+    [{ enabled: true, combine: 'union' }, { ctrlKey: true }, 'subtract'],
+    [{ enabled: true, combine: 'subtract' }, { shiftKey: true }, 'union'],
+    // Off, combine is never read: Alt alone intersects as it always has.
+    [{ enabled: false, combine: 'union' }, { altKey: true }, 'intersect'],
+  ];
+  for (const [selectMode, modifiers, expected] of cases) {
+    const owner = createGestureRenderer({
+      pickCell: 0,
+      enabled: { altKeyDown: false, lassoEnabled: true },
+    });
+    owner.tools.setSelectMode(selectMode);
+    assert.equal(owner.tools.handlePointerDown(plainPress(modifiers)), true);
+    assert.equal(
+      owner.tools.lassoMode,
+      expected,
+      `${JSON.stringify(selectMode)} + ${JSON.stringify(modifiers)}`
+    );
+  }
+});
+
+test('a lasso interrupted before release is abandoned, never committed', t => {
+  installBrowserPixelRatio(t);
+  const owner = createGestureRenderer({ pickCell: -1 });
+  armLasso(owner, [
+    { x: 40, y: 40 },
+    { x: 60, y: 40 },
+    { x: 60, y: 60 },
+    { x: 40, y: 60 },
+  ]);
+
+  assert.equal(owner.tools.interruptPointerGesture(), true);
+  assert.deepEqual(owner.published, [{
+    tool: 'lasso',
+    event: { abandoned: 'interrupted', step: 0, candidateCount: 0 },
+  }]);
+  assert.equal(owner.tools.isLassoing, false);
+  assert.equal(owner.tools.lassoCandidateSet, null);
+  assert.equal(owner.tools.lassoStepCount, 0);
+  assert.equal(
+    owner.tools.interruptPointerGesture(),
+    false,
+    'with nothing in flight there is nothing to interrupt'
+  );
+});
+
+test('select mode shows the active tool cursor the way a held Alt does', t => {
+  installBrowserPixelRatio(t);
+  const owner = createGestureRenderer({
+    pickCell: -1,
+    enabled: { altKeyDown: false, lassoEnabled: true },
+  });
+  owner.tools.updateSelectionCursor();
+  assert.equal(owner.canvas.style.cursor, 'grab');
+  owner.tools.setSelectMode({ enabled: true, combine: 'intersect' });
+  assert.equal(owner.canvas.style.cursor, 'crosshair');
+  owner.tools.setSelectMode({ enabled: false, combine: 'intersect' });
+  assert.equal(owner.canvas.style.cursor, 'grab');
+});
+
+// ---------------------------------------------------------------------------
+// An annotation press is gated, and its cursor drawn, by the pane under it
+// ---------------------------------------------------------------------------
+
+/** A grid of three panes side by side, 30 px each; past x = 90 is no pane. */
+const PANE_KINDS = Object.freeze({
+  continuousPane: 'continuous',
+  categoricalPane: 'categorical',
+  fieldlessPane: 'none',
+});
+
+function paneAtX(x) {
+  if (x < 30) return 'continuousPane';
+  if (x < 60) return 'categoricalPane';
+  if (x < 90) return 'fieldlessPane';
+  return null;
+}
+
+for (const [viewId, kind, cursor, canvasClass] of [
+  ['categoricalPane', 'categorical', 'cell', 'selecting'],
+  ['continuousPane', 'continuous', 'ns-resize', 'selecting-continuous'],
+]) {
+  test(
+    `an Alt press in a ${kind} pane starts there although the focused view `
+    + 'has no field',
+    t => {
+      installBrowserPixelRatio(t);
+      const owner = createGestureRenderer({
+        pickCell: 0,
+        enabled: {
+          // The focused view is colored by no field; only the pressed pane is.
+          getViewFieldKind: id => (id === viewId ? kind : 'none'),
+          getViewportInfoAtScreen: () => createViewport({
+            viewId,
+            width: 100,
+            height: 100,
+            offsetX: 0,
+            projectionShift: 0,
+          }),
+        },
+      });
+      const down = altMouseDown();
+
+      assert.equal(owner.tools.handlePointerDown(down.event), true);
+      assert.equal(down.wasPrevented(), true);
+      assert.equal(owner.tools.selectionDragStart.viewId, viewId);
+      assert.equal(owner.canvas.style.cursor, cursor);
+      assert.equal(owner.canvas.classList.contains(canvasClass), true);
+      assert.deepEqual(owner.published, []);
+    }
+  );
+}
+
+test(
+  'an Alt press in a pane colored by no field is consumed and reported, '
+  + 'whatever the focused view shows',
+  t => {
+    installBrowserPixelRatio(t);
+    let picks = 0;
+    const owner = createGestureRenderer({
+      pickCell: 0,
+      enabled: {
+        // Every other view has a field; the pressed one has none.
+        getViewFieldKind: id => (id === 'pane' ? 'none' : 'categorical'),
+        pickCellAtScreen: () => {
+          picks += 1;
+          return 0;
+        },
+      },
+    });
+    const down = altMouseDown();
+
+    assert.equal(
+      owner.tools.handlePointerDown(down.event),
+      true,
+      'the press is the selection tool\'s, so it neither rotates the camera '
+      + 'nor moves focus'
+    );
+    assert.equal(down.wasPrevented(), true);
+    assert.equal(owner.tools.selectionDragStart, null);
+    assert.equal(picks, 0, 'a pane with no field has nothing to pick for');
+    assert.deepEqual(owner.published, [{
+      tool: 'annotation',
+      event: { abandoned: 'no-field-in-pane', step: 0, candidateCount: 0 },
+    }]);
+  }
+);
+
+test('a pane field kind outside the renderer vocabulary is refused', t => {
+  installBrowserPixelRatio(t);
+  const owner = createGestureRenderer({
+    pickCell: 0,
+    enabled: { getViewFieldKind: () => 'category' },
+  });
+  assert.throws(
+    () => owner.tools.handlePointerDown(altMouseDown().event),
+    /Field kind of view "pane" must be exactly "none", "continuous", or "categorical"/
+  );
+  assert.throws(
+    () => owner.tools.setViewFieldKindSource('categorical'),
+    /View field kind source must be one function/
+  );
+});
+
+test('the armed annotation cursor follows the pane under the pointer', t => {
+  installBrowserPixelRatio(t);
+  const lookups = [];
+  const owner = createGestureRenderer({
+    pickCell: -1,
+    enabled: {
+      altKeyDown: false,
+      getViewFieldKind: viewId => PANE_KINDS[viewId],
+      getViewIdAtCanvasPoint: (x, y) => {
+        lookups.push([x, y]);
+        return paneAtX(x);
+      },
+    },
+  });
+  const cursorWrites = [];
+  let cursor = 'grab';
+  Object.defineProperty(owner.canvas.style, 'cursor', {
+    get: () => cursor,
+    set: value => {
+      cursor = value;
+      cursorWrites.push(value);
+    },
+  });
+  const move = clientX => {
+    assert.equal(
+      owner.tools.handlePointerMove({ clientX, clientY: 50 }),
+      false,
+      'an idle move belongs to the camera'
+    );
+  };
+
+  // Unarmed, a move costs no pane lookup and draws nothing.
+  move(10);
+  assert.deepEqual(lookups, []);
+  assert.deepEqual(cursorWrites, []);
+
+  owner.tools.handleAltKeyDown();
+  assert.equal(cursor, 'ns-resize');
+  move(20);
+  move(25);
+  assert.deepEqual(
+    cursorWrites,
+    ['ns-resize'],
+    'moving within one pane redraws nothing'
+  );
+  move(40);
+  assert.equal(cursor, 'cell');
+  move(70);
+  assert.equal(cursor, 'not-allowed');
+  move(95);
+  assert.equal(cursor, 'grab', 'off every pane a press would not select');
+  assert.deepEqual(
+    cursorWrites,
+    ['ns-resize', 'cell', 'not-allowed', 'grab']
+  );
+
+  owner.tools.handleAltKeyUp();
+  move(10);
+  assert.equal(cursor, 'grab');
+  const lookupsWhileUnarmed = lookups.length;
+  move(40);
+  assert.equal(lookups.length, lookupsWhileUnarmed);
 });

@@ -24,10 +24,11 @@
  *   pointerup and disarmed only by the click that followed. A cancelled pointer
  *   produces no click, so the flag survived to eat the user's next real one.
  *
- * The DOM here is a fake, but the two rules it models are copied from
- * `assets/css/components/_accordion.css`: a floating panel's box is
- * `--pos-x/y/width/height`, and `:not([open])` overrides the height to `auto`.
- * Everything else is the real module under test.
+ * The DOM here is a fake, but the rules it models are copied from
+ * `assets/css/components/_accordion.css`: a panel stands in a frame, a floating
+ * frame's box is `--pos-x/y/width/height`, a docked frame's box is its card's,
+ * and a frame whose `<details>` is `:not([open])` has its height overridden to
+ * `auto`. Everything else is the real module under test.
  */
 
 import assert from 'node:assert/strict';
@@ -286,6 +287,9 @@ class FakeHTMLElement {
 
   getBoundingClientRect() {
     this.ownerDocument.measurements.push(this);
+    const details = this.classList.contains('accordion-panel')
+      ? this.children.find(child => child.tagName === 'DETAILS') ?? null
+      : null;
     if (this.classList.contains('accordion-floating')) {
       const length = (name) => {
         const raw = this.style.getPropertyValue(name);
@@ -295,11 +299,15 @@ class FakeHTMLElement {
       const top = length('--pos-y');
       const width = length('--pos-width');
       // `_accordion.css`:
-      //   `.accordion-section.accordion-floating:not([open]) { height: auto }`
-      const height = this.open === false ? this.headerHeight : length('--pos-height');
+      //   `.accordion-panel.accordion-floating:has(> .accordion-section:not([open]))
+      //    { height: auto }`
+      const height = details?.open === false
+        ? details.headerHeight
+        : length('--pos-height');
       return { left, top, width, height, right: left + width, bottom: top + height };
     }
-    const rect = this.layoutRect;
+    // A docked frame is exactly as big as the card standing in it.
+    const rect = details === null ? this.layoutRect : details.layoutRect;
     return {
       ...rect,
       right: rect.left + rect.width,
@@ -483,14 +491,28 @@ function buildSidebar(doc, panelIds) {
   return { sidebar, accordion, panels };
 }
 
+/** The frame a registered panel stands in: the element that floats. */
+function frameOf(details) {
+  const frame = details.parentElement;
+  assert.ok(
+    frame?.classList.contains('accordion-panel'),
+    `panel "${details.id}" must stand in its frame`,
+  );
+  return frame;
+}
+
 function layerOf(details) {
-  const raw = details.style.getPropertyValue('--z-layer');
+  const raw = frameOf(details).style.getPropertyValue('--z-layer');
   return raw === '' ? null : Number(raw);
 }
 
 function pixels(details, property) {
-  const raw = details.style.getPropertyValue(property);
+  const raw = frameOf(details).style.getPropertyValue(property);
   return raw === '' ? null : Number.parseFloat(raw);
+}
+
+function isFloatingPanel(details) {
+  return frameOf(details).classList.contains('accordion-floating');
 }
 
 function panelPayload(id, { left, top, width, height, z, open = true }) {
@@ -528,7 +550,7 @@ test(
     const gamma = panels.get('gamma').details;
     dockable.undock(gamma);
 
-    assert.equal(gamma.classList.contains('accordion-floating'), true);
+    assert.equal(isFloatingPanel(gamma), true);
     assert.ok(
       layerOf(gamma) > 142,
       `a newly torn-off panel opened at layer ${layerOf(gamma)}, `
@@ -580,14 +602,15 @@ test(
     dockable.undock(panels.get('beta').details);
 
     const beta = panels.get('beta').details;
-    const before = beta.style.writes.filter(name => name === '--z-layer').length;
+    const betaFrame = frameOf(beta);
+    const before = betaFrame.style.writes.filter(name => name === '--z-layer').length;
     for (let press = 0; press < 20; press++) {
       dispatch(panels.get('beta').summary, 'pointerdown', {
         clientX: 700,
         clientY: 300,
       });
     }
-    const after = beta.style.writes.filter(name => name === '--z-layer').length;
+    const after = betaFrame.style.writes.filter(name => name === '--z-layer').length;
 
     assert.equal(
       after - before,
@@ -625,14 +648,14 @@ test(
     });
 
     const beta = panels.get('beta').details;
-    assert.equal(beta.parentElement, dockable.floatingRoot);
+    assert.equal(frameOf(beta).parentElement, dockable.floatingRoot);
 
     dockable.dock(beta);
 
     assert.deepEqual(
       accordion.children
-        .filter(child => child.classList.contains('accordion-section'))
-        .map(child => child.id),
+        .filter(child => child.classList.contains('accordion-panel'))
+        .map(child => child.querySelector(':scope > details.accordion-section').id),
       ['alpha', 'beta', 'gamma'],
       'docking a restored panel must return it to its own place in the sidebar',
     );
@@ -670,14 +693,16 @@ test(
       preferredSize: { width: 420, height: 320 },
     });
 
-    assert.equal(window_.parentElement, dockable.floatingRoot);
+    assert.equal(frameOf(window_).parentElement, dockable.floatingRoot);
     assert.equal(
       accordion.querySelector('.accordion-dock-placeholder'),
       null,
       'a window with no docked slot must not reserve one in the sidebar',
     );
     assert.equal(
-      doc.measurements.filter(element => element === window_).length,
+      doc.measurements
+        .filter(element => element === window_ || element === frameOf(window_))
+        .length,
       0,
       'a window told its position and its size, and with no slot to hold '
       + 'open, has nothing left to measure',
@@ -841,11 +866,11 @@ test(
     dispatch(summary, 'pointerup', { clientX: 900, clientY: 90 });
 
     assert.equal(
-      details.classList.contains('accordion-floating'),
+      isFloatingPanel(details),
       false,
       'a panel that was unregistered must not still tear off',
     );
-    assert.equal(details.parentElement?.className, 'accordion');
+    assert.equal(frameOf(details).parentElement?.className, 'accordion');
   },
 );
 
@@ -858,7 +883,7 @@ test(
 
     const alpha = panels.get('alpha').details;
     dockable.undock(alpha);
-    assert.equal(alpha.parentElement, dockable.floatingRoot);
+    assert.equal(frameOf(alpha).parentElement, dockable.floatingRoot);
 
     // Unregistering drops the record. Whether the panel is floating is on the
     // element, so dropping the record must not strand it in the floating root.
@@ -866,12 +891,12 @@ test(
     dockable.dock(alpha);
 
     assert.equal(
-      alpha.classList.contains('accordion-floating'),
+      isFloatingPanel(alpha),
       false,
       'a panel visibly floating must never refuse to dock because a private '
       + 'record of its state was dropped',
     );
-    assert.notEqual(alpha.parentElement, dockable.floatingRoot);
+    assert.notEqual(frameOf(alpha).parentElement, dockable.floatingRoot);
   },
 );
 
@@ -898,7 +923,7 @@ test(
     dispatch(summary, 'pointerdown', { clientX: 20, clientY: 40 });
     dispatch(summary, 'pointermove', { clientX: 900, clientY: 90 });
     dispatch(summary, 'pointerup', { clientX: 900, clientY: 90 });
-    assert.equal(details.classList.contains('accordion-floating'), true);
+    assert.equal(isFloatingPanel(details), true);
   },
 );
 
@@ -928,10 +953,14 @@ test(
       ],
     });
 
+    // A panel is measured through its card or its frame; both count.
     const perPanel = new Map();
     for (const element of doc.measurements) {
-      if (!panels.has(element.id)) continue;
-      perPanel.set(element.id, (perPanel.get(element.id) ?? 0) + 1);
+      const panelId = element.classList.contains('accordion-panel')
+        ? element.querySelector(':scope > details.accordion-section')?.id
+        : element.id;
+      if (!panels.has(panelId)) continue;
+      perPanel.set(panelId, (perPanel.get(panelId) ?? 0) + 1);
     }
 
     for (const [panelId, count] of perPanel) {
@@ -961,12 +990,8 @@ test(
     });
 
     const details = panels.get('alpha').details;
-    const readLeft = () => Number.parseFloat(
-      details.style.getPropertyValue('--pos-x')
-    );
-    const readTop = () => Number.parseFloat(
-      details.style.getPropertyValue('--pos-y')
-    );
+    const readLeft = () => pixels(details, '--pos-x');
+    const readTop = () => pixels(details, '--pos-y');
     assert.equal(readLeft(), 1200);
     assert.equal(readTop(), 500);
 
@@ -975,6 +1000,8 @@ test(
     // and the close button - cannot be reached at all, leaving no way back
     // except clearing the saved layout.
     doc.defaultView.resizeTo(800, 600);
+    // Panels are re-clamped once per frame after a resize.
+    for (const frame of doc.frames.splice(0)) frame();
 
     const left = readLeft();
     const top = readTop();
@@ -1009,13 +1036,98 @@ test(
 
     // Re-clamping must not become re-arranging: a panel the user placed
     // somewhere that is still legal stays exactly where they put it.
-    assert.equal(
-      Number.parseFloat(details.style.getPropertyValue('--pos-x')),
-      100
-    );
-    assert.equal(
-      Number.parseFloat(details.style.getPropertyValue('--pos-y')),
-      80
-    );
+    assert.equal(pixels(details, '--pos-x'), 100);
+    assert.equal(pixels(details, '--pos-y'), 80);
   }
+);
+
+/* ------------------------------------------------------------------ *
+ * A summary is the disclosure button; no control may sit inside it.   *
+ * ------------------------------------------------------------------ */
+
+test(
+  'a panel\'s window controls stand beside its summary, never inside it',
+  (t) => {
+    const doc = installDom(t);
+    const { sidebar, accordion, panels } = buildSidebar(doc, ['alpha', 'beta']);
+    const dockable = initDockableAccordions({ sidebar });
+
+    // Registration framed every panel in place, in sidebar order.
+    assert.deepEqual(
+      accordion.children.map(child => child.className),
+      ['accordion-panel', 'accordion-panel'],
+    );
+
+    const { details, summary } = panels.get('alpha');
+    const frame = frameOf(details);
+    assert.equal(dockable.panelFrame(details), frame);
+    const [actions, card] = frame.children;
+    assert.equal(actions.className, 'accordion-panel-actions');
+    assert.equal(card, details, 'the action bar precedes the card in Tab order');
+    assert.deepEqual(
+      summary.descendants().filter(node => node.tagName === 'BUTTON'),
+      [],
+      'a summary must contain no button',
+    );
+
+    const undock = actions.querySelector('.accordion-undock-btn');
+    const dockBack = actions.querySelector('.accordion-dock-btn');
+    assert.equal(undock.getAttribute('aria-label'), 'Undock alpha panel into a floating window');
+    assert.equal(dockBack.getAttribute('aria-label'), 'Dock alpha panel back into sidebar');
+
+    // Activating a control is not a press on the summary: the click's path
+    // runs from the button through the bar to the frame and never reaches the
+    // disclosure, so the panel's open state is untouched.
+    let summaryClicks = 0;
+    summary.addEventListener('click', () => { summaryClicks += 1; });
+    details.open = false;
+    dispatch(undock, 'click');
+    assert.equal(summaryClicks, 0);
+    assert.equal(isFloatingPanel(details), true);
+    assert.equal(frame.parentElement, dockable.floatingRoot);
+    assert.equal(doc.activeElement, dockBack, 'focus moves to the control that reverses the move');
+
+    dispatch(dockBack, 'click');
+    assert.equal(summaryClicks, 0);
+    assert.equal(isFloatingPanel(details), false);
+    assert.equal(frame.parentElement, accordion);
+    assert.equal(accordion.children[0], frame, 'the panel docks back into its own slot');
+    assert.equal(doc.activeElement, undock);
+
+    // Unregistering takes back the module's own controls and leaves the frame.
+    dockable.unregister(details);
+    assert.equal(frameOf(details), frame);
+    assert.deepEqual(actions.children, []);
+  },
+);
+
+test(
+  'a caller\'s own header controls are placed in the frame\'s action bar',
+  (t) => {
+    const doc = installDom(t);
+    const { sidebar } = buildSidebar(doc, ['alpha']);
+    const dockable = initDockableAccordions({ sidebar });
+
+    const window_ = new FakeHTMLDetailsElement(doc);
+    window_.className = 'accordion-section analysis-window-panel';
+    const summary = new FakeHTMLElement(doc, 'summary');
+    summary.textContent = 'Comparison';
+    window_.appendChild(summary);
+    dockable.floatingRoot.appendChild(window_);
+    const copy = new FakeHTMLElement(doc, 'button');
+    const close = new FakeHTMLElement(doc, 'button');
+
+    dockable.register(window_, { dockable: false, actions: [copy, close] });
+
+    const frame = frameOf(window_);
+    assert.equal(frame.parentElement, dockable.floatingRoot);
+    const actions = frame.querySelector(':scope > .accordion-panel-actions');
+    assert.deepEqual(actions.children, [copy, close]);
+    assert.equal(
+      actions.querySelector('.accordion-undock-btn'),
+      null,
+      'a window that cannot dock gets no dock controls',
+    );
+    assert.deepEqual(summary.children, []);
+  },
 );

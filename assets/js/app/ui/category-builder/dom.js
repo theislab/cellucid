@@ -7,30 +7,31 @@
  * @module ui/category-builder/dom
  */
 
+import { renderInfoTip } from '../components/info-tips.js';
+
 const TEMPLATE = `
-  <div class="analysis-accordion-item" id="cat-builder-accordion-item">
-    <button type="button" class="analysis-accordion-header" aria-expanded="false">
-      <span class="analysis-accordion-title">Create Categorical</span>
-      <span class="analysis-accordion-desc">Build a new categorical obs column from highlight pages.</span>
-      <span class="analysis-accordion-chevron" aria-hidden="true"></span>
-    </button>
+  <div class="disclosure" id="cat-builder-accordion-item">
+    <div class="disclosure-header-row">
+      <button type="button" class="disclosure-header" aria-expanded="false">
+        <span class="disclosure-title">Create categorical</span>
+        <span class="disclosure-chevron" aria-hidden="true"></span>
+      </button>
+      <button type="button" id="cat-builder-info-btn" class="info-btn" aria-label="About creating a categorical" aria-controls="cat-builder-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
+    </div>
+    <div id="cat-builder-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="cat-builder-info-btn" tabindex="-1" data-info-tip="create-categorical" hidden></div>
 
-    <div class="analysis-accordion-content">
+    <div class="disclosure-content" id="cat-builder-panel" hidden>
       <div class="cat-builder">
-        <p class="cat-builder-hint" id="cat-builder-hint">Drag highlight pages from above, or add them with the control below, to create category labels.</p>
-
-        <div class="cat-builder-dropzone" id="cat-builder-dropzone" role="group" aria-label="Category labels" aria-describedby="cat-builder-hint">
-          <div class="dropzone-placeholder" id="dropzone-placeholder">
-            <span>Drop pages here</span>
-          </div>
+        <div class="cat-builder-dropzone" id="cat-builder-dropzone" role="group" aria-label="Category labels">
+          <p class="empty-state" id="dropzone-placeholder">Drop pages here.</p>
           <div class="dropzone-items" id="dropzone-items" role="list" aria-label="Pages in the new column"></div>
         </div>
 
         <div class="cat-builder-section">
-          <label for="cat-builder-page-select">Add a highlight page:</label>
-          <div class="cat-builder-actions">
+          <label for="cat-builder-page-select">Add page</label>
+          <div class="cat-builder-add-row">
             <select class="obs-select" id="cat-builder-page-select"></select>
-            <button type="button" class="cat-builder-btn secondary" id="cat-builder-add-page">Add</button>
+            <button type="button" class="btn btn-compact" id="cat-builder-add-page">Add</button>
           </div>
         </div>
 
@@ -39,23 +40,21 @@ const TEMPLATE = `
             <span id="conflict-text">Overlapping cells detected</span>
           </div>
           <div class="section-content">
-            <label>Assign overlapping cells to:</label>
-            <div class="radio-group">
-              <label><input type="radio" name="overlap-strategy" value="first" checked> First page</label>
-              <label><input type="radio" name="overlap-strategy" value="last"> Last page</label>
-              <label><input type="radio" name="overlap-strategy" value="overlap-label"> New label</label>
-              <label><input type="radio" name="overlap-strategy" value="intersections"> Each intersection</label>
+            <div class="radio-group" role="radiogroup" aria-labelledby="overlap-strategy-title">
+              <h3 class="section-title" id="overlap-strategy-title">Overlapping cells</h3>
+              <label class="checkbox-inline"><input type="radio" name="overlap-strategy" value="first" checked>First page</label>
+              <label class="checkbox-inline"><input type="radio" name="overlap-strategy" value="last">Last page</label>
+              <label class="checkbox-inline"><input type="radio" name="overlap-strategy" value="overlap-label">New label</label>
+              <label class="checkbox-inline"><input type="radio" name="overlap-strategy" value="intersections">Each intersection</label>
             </div>
 
             <div class="cat-builder-overlap-extra" id="overlap-label-section" hidden>
-              <label for="overlap-label">Label for overlapping cells:</label>
-              <input type="text" id="overlap-label" value="Overlap" />
+              <label for="overlap-label">Label for overlapping cells</label>
+              <input type="text" class="obs-select" id="overlap-label" value="Overlap" />
             </div>
 
             <div class="cat-builder-overlap-extra" id="intersection-labels-section" hidden>
-              <div class="cat-builder-intersection-hint">
-                Name each overlap condition (e.g. A &amp; B, A &amp; B &amp; C).
-              </div>
+              <span class="field-label">Intersection labels</span>
               <div class="cat-builder-intersection-list" id="intersection-labels"></div>
             </div>
           </div>
@@ -66,22 +65,22 @@ const TEMPLATE = `
             <span><span id="uncovered-count">0</span> cells not in any page</span>
           </div>
           <div class="section-content">
-            <label for="uncovered-label">Label for uncovered cells:</label>
-            <input type="text" id="uncovered-label" value="Unassigned" />
+            <label for="uncovered-label">Label for uncovered cells</label>
+            <input type="text" class="obs-select" id="uncovered-label" value="Unassigned" />
           </div>
         </div>
 
         <div class="cat-builder-section">
-          <label for="cat-builder-name">Column name:</label>
-          <input type="text" id="cat-builder-name" placeholder="Custom Categories" />
+          <label for="cat-builder-name">Column name</label>
+          <input type="text" class="obs-select" id="cat-builder-name" placeholder="Custom categories" />
         </div>
 
         <div class="cat-builder-preview" id="cat-builder-preview"></div>
-        <p class="analysis-error" id="cat-builder-validation" role="status" aria-live="polite" hidden></p>
+        <p class="status-line" data-tone="danger" id="cat-builder-validation" role="status" aria-live="polite" hidden></p>
 
         <div class="cat-builder-actions">
-          <button type="button" class="cat-builder-btn secondary" id="cat-builder-cancel">Cancel</button>
-          <button type="button" class="cat-builder-btn secondary" id="cat-builder-confirm" disabled>Create</button>
+          <button type="button" class="btn" id="cat-builder-cancel">Cancel</button>
+          <button type="button" class="btn btn-primary" id="cat-builder-confirm" disabled>Create</button>
         </div>
       </div>
     </div>
@@ -118,14 +117,15 @@ export function renderCategoryBuilderDom(containerEl) {
   }
 
   const wrapper = ownerDocument.createElement('div');
-  wrapper.className = 'analysis-accordion cat-builder-wrapper';
+  wrapper.className = 'disclosure-list cat-builder-wrapper';
   wrapper.innerHTML = TEMPLATE;
+  renderInfoTip(wrapper.querySelector('#cat-builder-info-tooltip'), 'create-categorical');
 
   const elements = {
     wrapper,
     item: wrapper.querySelector('#cat-builder-accordion-item'),
-    toggle: wrapper.querySelector('.analysis-accordion-header'),
-    panel: wrapper.querySelector('.analysis-accordion-content'),
+    toggle: wrapper.querySelector('.disclosure-header'),
+    panel: wrapper.querySelector('.disclosure-content'),
     dropzone: wrapper.querySelector('#cat-builder-dropzone'),
     placeholder: wrapper.querySelector('#dropzone-placeholder'),
     items: wrapper.querySelector('#dropzone-items'),

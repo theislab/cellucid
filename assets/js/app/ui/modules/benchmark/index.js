@@ -13,6 +13,9 @@
  * 4. A full-window frame recorder whose percentiles are computed from every
  *    frame and withheld when the sample count cannot support them.
  *
+ * Scenario drivers add a fifth piece, `installRenderProbes`: per-pass draws
+ * and GPU time, frames drawn per cause, input-to-frame latency and long tasks.
+ *
  * Nothing here starts on import. The harness is created explicitly, against an
  * already-published viewer.
  *
@@ -47,15 +50,34 @@ import {
   SYNTHETIC_PATTERNS
 } from './generation-contract.js';
 import {
+  classifyScheduleSample,
+  createFrameCauseSampler,
+  SETTLE_CAUSE
+} from './frame-cause-sampler.js';
+import {
   instrumentGlUploads,
   INSTRUMENTED_METHOD_NAMES,
+  INSTRUMENTED_MULTI_DRAW_METHOD_NAMES,
   uploadCounterFields
 } from './gl-upload-counter.js';
 import {
+  createInputLatencyTracker,
+  TRACKED_INPUT_TYPES
+} from './input-latency.js';
+import {
+  createLongTaskProbe,
+  LONG_TASK_THRESHOLD_MS
+} from './long-task-probe.js';
+import {
+  classifyProgramUniforms,
+  createPassProfiler,
+  PASS_SIGNATURES
+} from './pass-profiler.js';
+import { installRenderProbes } from './render-probes.js';
+import {
   createBenchmarkMatrixRunner,
   expandMatrix,
-  LIVE_VIEW_ID,
-  MAX_BENCHMARK_VIEWS
+  LIVE_VIEW_ID
 } from './matrix-runner.js';
 import {
   assertBaselineEligibleRasterizer,
@@ -73,31 +95,42 @@ export {
   assertSyntheticPattern,
   BenchmarkCameraPath,
   CAMERA_REGIMES,
+  classifyProgramUniforms,
   classifyRasterizer,
+  classifyScheduleSample,
   createBenchmarkMatrixRunner,
+  createFrameCauseSampler,
+  createInputLatencyTracker,
+  createLongTaskProbe,
+  createPassProfiler,
   createMutableCameraState,
   createSeededUnitStream,
   expandMatrix,
   FETCHED_PATTERNS,
   FrameRecorder,
   generateSyntheticDataOffThread,
+  installRenderProbes,
   instrumentGlUploads,
   INSTRUMENTED_METHOD_NAMES,
+  INSTRUMENTED_MULTI_DRAW_METHOD_NAMES,
   JANK_MEDIAN_MULTIPLE,
   LIVE_VIEW_ID,
   LOD_FAR_DISTANCE_RATIO,
   LOD_NEAR_DISTANCE_RATIO,
-  MAX_BENCHMARK_VIEWS,
+  LONG_TASK_THRESHOLD_MS,
   MAX_SYNTHETIC_COUNT,
   MIN_SYNTHETIC_COUNT,
   MIN_TAIL_SAMPLES,
+  PASS_SIGNATURES,
   pathFrameForRegime,
   percentileOfSorted,
   readRendererIdentity,
   rendererBaselineKey,
   requiredSamplesForQuantile,
+  SETTLE_CAUSE,
   SOFTWARE_RASTERIZER_MARKERS,
   SYNTHETIC_PATTERNS,
+  TRACKED_INPUT_TYPES,
   uploadCounterFields
 };
 

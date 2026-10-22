@@ -19,10 +19,22 @@ test('browser CI shards every engine with bounded process generations', async ()
     workflow,
     /name: \$\{\{ matrix\.os \}\} \/ \$\{\{ matrix\.browser \}\} \/ shard \$\{\{ matrix\.shard \}\}/,
   );
+  // Pushes and pull requests shard every engine on Linux plus WebKit on
+  // macOS; the nightly schedule and manual dispatch shard every engine on
+  // every operating system.
+  assert.match(workflow, /schedule:\n\s+- cron: "[^"]+"\n\s+workflow_dispatch:/);
   assert.match(
     workflow,
-    /os: \[ubuntu-latest, macos-latest, windows-latest\]\n\s+browser: \[chromium, firefox, webkit\]\n\s+shard: \["1\/3", "2\/3", "3\/3"\]/,
+    /os: \$\{\{ fromJSON\(\(github\.event_name == 'schedule' \|\| github\.event_name == 'workflow_dispatch'\) && '\["ubuntu-latest", "macos-latest", "windows-latest"\]' \|\| '\["ubuntu-latest"\]'\) \}\}\n\s+browser: \[chromium, firefox, webkit\]\n\s+shard: \["1\/7", "2\/7", "3\/7", "4\/7", "5\/7", "6\/7", "7\/7"\]/,
   );
+  for (const shard of ['1/7', '2/7', '3/7', '4/7', '5/7', '6/7', '7/7']) {
+    assert.ok(
+      workflow.includes(
+        `- os: macos-latest\n            browser: webkit\n            shard: "${shard}"`,
+      ),
+      `every push must run macOS WebKit shard ${shard}`,
+    );
+  }
   assert.match(
     workflow,
     /browsers:[\s\S]*?timeout-minutes: 75[\s\S]*?strategy:\n\s+fail-fast: false/,
@@ -64,16 +76,26 @@ test('browser CI shards every engine with bounded process generations', async ()
 
   // The two full-suite conditions are a complete, disjoint partition: Linux
   // Firefox remains headed under Xvfb; every other cell is headless. Both
-  // use the same bounded process runner. The explicit WebGL probes run once
-  // rather than once per shard.
+  // use the same bounded process runner. The WebGL2 runtime is recorded
+  // once per engine and operating system (its log line names the GL
+  // implementation the cell ran on), not once per shard.
   assert.match(
     workflow,
-    /if: matrix\.browser == 'firefox' && runner\.os == 'Linux' && matrix\.shard == '1\/3'[\s\S]*?tests\/browser\/webgl2-runtime\.spec\.mjs/,
+    /if: matrix\.browser == 'firefox' && runner\.os == 'Linux' && matrix\.shard == '1\/7'\n\s+run: >-\n\s+xvfb-run --auto-servernum --\n\s+npm run test:browser --\n\s+--project=firefox\n\s+--headed\n\s+tests\/browser\/webgl2-runtime\.spec\.mjs/,
   );
   assert.match(
     workflow,
-    /if: matrix\.browser == 'firefox' && runner\.os != 'Linux' && matrix\.shard == '1\/3'[\s\S]*?tests\/browser\/webgl2-runtime\.spec\.mjs/,
+    /if: \(matrix\.browser != 'firefox' \|\| runner\.os != 'Linux'\) && matrix\.shard == '1\/7'\n\s+run: >-\n\s+npm run test:browser --\n\s+--project=\$\{\{ matrix\.browser \}\}\n\s+tests\/browser\/webgl2-runtime\.spec\.mjs/,
   );
+  // A red job keeps the host's picture beside Playwright's: the kernel log
+  // on Linux, sockets and memory on Windows, memory and graphics on macOS.
+  for (const os of ['Linux', 'Windows', 'macOS']) {
+    assert.match(
+      workflow,
+      new RegExp(`if: failure\\(\\) && runner\\.os == '${os}'`),
+      `a failed ${os} job records its host state`,
+    );
+  }
   assert.doesNotMatch(
     workflow,
     /run: npm run test:browser -- --project=/,

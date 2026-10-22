@@ -85,4 +85,14 @@
   /* Viewer background presets (used by WebGL background modes). */
   --viewer-bg-grid: #f6f6f7;
   --viewer-bg-grid-dark: #14161a;
+  /* Exactly STUDIO_PALETTES[*].surface in rendering/studio-backdrop.js. */
+  --viewer-bg-studio: #ececec;
+  --viewer-bg-studio-dark: #111111;
+  /* Exactly BACKDROP_LOOKS[*].surface in rendering/backdrops/backdrop-looks.js. */
+  --viewer-bg-atelier: #eeebe6;
+  --viewer-bg-abyss: #d6eaea;
+  --viewer-bg-aurora: #eceaec;
+  --viewer-bg-nebula: #07080e;
+  --viewer-bg-abyss-dark: #030e15;
+  --viewer-bg-aurora-dark: #060a16;
 }

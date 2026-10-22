@@ -101,10 +101,14 @@ function requireExactKeys(value, expectedKeys, label) {
 }
 
 /**
- * Validate one advertised embedding payload against the canonical cell axis.
- * This boundary intentionally runs on the raw, unpadded coordinates so a 2D
- * dataset cannot be accepted merely because a later render buffer has a
- * plausible multiple-of-three length.
+ * Validate one advertised embedding payload against the canonical cell axis:
+ * exactly `n_cells * dimension` coordinates, the layout every later owner
+ * holds (`rendering/position-layout.js`).
+ *
+ * Finiteness is not re-checked here: every coordinate is refused at the one
+ * decode boundary it enters through (`loadPointsBinary()` for fetched and
+ * staged payloads, the AnnData adapters for direct files, and the in-memory
+ * DimensionManager), before any normalization can see it.
  *
  * @param {object} options
  * @param {Float32Array} options.positions
@@ -153,14 +157,6 @@ export function validateDatasetPositionPayload(options) {
       `requires exactly ${expectedLength} (${nCells} × ${dimension}).`
     );
   }
-  for (let index = 0; index < positions.length; index++) {
-    if (!Number.isFinite(positions[index])) {
-      throw new Error(
-        `${dimension}D dataset positions contain a non-finite coordinate ` +
-        `at index ${index}.`
-      );
-    }
-  }
   return positions;
 }
 
@@ -197,9 +193,10 @@ export async function stageDatasetPositionPayload(options) {
     );
   }
   if (
-    typeof dimensionManager?.getDefaultDimension !== 'function' ||
-    typeof dimensionManager?.loadDimension !== 'function' ||
-    typeof dimensionManager?.getPositions3D !== 'function' ||
+    typeof dimensionManager?.getDefaultLayoutKey !== 'function' ||
+    typeof dimensionManager?.getLayout !== 'function' ||
+    typeof dimensionManager?.loadLayout !== 'function' ||
+    typeof dimensionManager?.getPositions !== 'function' ||
     typeof dimensionManager?.clearCache !== 'function'
   ) {
     throw new TypeError(
@@ -223,9 +220,13 @@ export async function stageDatasetPositionPayload(options) {
   signal.addEventListener('abort', abortStaging, { once: true });
 
   try {
-    const defaultDimension = dimensionManager.getDefaultDimension();
-    const rawPositions = await dimensionManager.loadDimension(
-      defaultDimension,
+    const defaultLayoutKey = dimensionManager.getDefaultLayoutKey();
+    if (defaultLayoutKey === null) {
+      throw new Error('The dataset names no opening representation to stage.');
+    }
+    const defaultDimension = dimensionManager.getLayout(defaultLayoutKey).dimension;
+    const rawPositions = await dimensionManager.loadLayout(
+      defaultLayoutKey,
       { showProgress }
     );
     if (signal.aborted) {
@@ -239,8 +240,8 @@ export async function stageDatasetPositionPayload(options) {
       dimension: defaultDimension
     });
 
-    const positions = await dimensionManager.getPositions3D(
-      defaultDimension,
+    const positions = await dimensionManager.getPositions(
+      defaultLayoutKey,
       { showProgress: false }
     );
     if (signal.aborted) {
@@ -251,7 +252,7 @@ export async function stageDatasetPositionPayload(options) {
     validateDatasetPositionPayload({
       positions,
       identity: generation.identity,
-      dimension: 3
+      dimension: defaultDimension
     });
     if (dimensionManager.nCells !== generation.identity.stats.n_cells) {
       throw new Error(
@@ -347,17 +348,48 @@ function reloadIdentitiesMatch(left, right) {
 }
 
 /**
- * Coordinate in-place dataset reloads. A transaction remains current only
- * while it is the newest reload and its captured source identity is unchanged.
+ * The one owner of "which dataset change does the user want". Every change of
+ * the displayed dataset — the startup selection, a sample pick, None, a local
+ * file or folder, a connection that opens its only dataset, the synthetic
+ * benchmark — begins one transaction here at the moment the user acts, before
+ * any of its own I/O. Beginning a transaction aborts the previous one, so the
+ * newest choice always wins and an older load can neither keep fetching nor
+ * publish late over it.
+ *
+ * A transaction remains current only while it is the newest one and its
+ * captured source identity is unchanged. Its owner calls `finish()` once its
+ * work has settled; `whenSettled()` resolves when the newest transaction has
+ * finished, which is how a session file chosen during a load waits for the
+ * dataset it will be applied to.
+ *
+ * Every user action that decides what the dataset should be advances one
+ * `actionSequence`: each transaction begun, and each action that settles the
+ * dataset without changing it — applying a session file — through
+ * `recordAction()`. A change that may or may not touch the dataset (a
+ * connection whose server turns out to list several datasets) reads
+ * `actionSequence` when the user acts and later calls
+ * `beginIfNoActionSince(sequence)`: it supersedes the loads that were already
+ * running then, but never anything the user did after it.
  *
  * @param {() => object} captureIdentity
- * @returns {{begin: () => {
+ * @returns {Readonly<{
+ *   readonly actionSequence: number,
+ *   readonly settled: boolean,
+ *   begin: () => DatasetChangeTransaction,
+ *   beginIfNoActionSince: (sequence: number) => DatasetChangeTransaction|null,
+ *   recordAction: () => number,
+ *   whenSettled: () => Promise<void>
+ * }>}
+ *
+ * @typedef {Readonly<{
  *   adoptCurrentIdentity: () => void,
+ *   generation: number,
  *   isLatest: () => boolean,
  *   isCurrent: () => boolean,
  *   assertCurrent: () => void,
+ *   finish: () => void,
  *   signal: AbortSignal
- * }}}
+ * }>} DatasetChangeTransaction
  */
 export function createLatestDatasetReloadCoordinator(captureIdentity) {
   if (typeof captureIdentity !== 'function') {
@@ -365,64 +397,132 @@ export function createLatestDatasetReloadCoordinator(captureIdentity) {
   }
 
   let latestGeneration = 0;
-  let latestController = null;
+  let actionSequence = 0;
+  let latest = null;
+
+  function advanceActionSequence() {
+    if (actionSequence >= Number.MAX_SAFE_INTEGER) {
+      throw new RangeError('Dataset action sequence is exhausted.');
+    }
+    actionSequence += 1;
+    return actionSequence;
+  }
+
+  function settle(record) {
+    if (record.settled) return;
+    record.settled = true;
+    record.resolveSettled();
+  }
+
+  function begin() {
+    let identity = captureReloadIdentity(captureIdentity);
+    if (latestGeneration >= Number.MAX_SAFE_INTEGER) {
+      throw new RangeError('Dataset change generation is exhausted.');
+    }
+    const previous = latest;
+    const controller = new AbortController();
+    const generation = ++latestGeneration;
+    advanceActionSequence();
+    let resolveSettled;
+    const settled = new Promise(resolve => {
+      resolveSettled = resolve;
+    });
+    const record = {
+      controller,
+      generation,
+      resolveSettled,
+      settled: false,
+      settledPromise: settled
+    };
+    latest = record;
+    // A superseded transaction can no longer publish anything, so nothing
+    // waits on it any more even while its own unwinding is still running.
+    if (previous !== null) {
+      previous.controller.abort();
+      settle(previous);
+    }
+    let publicationIdentityAdopted = false;
+
+    return Object.freeze({
+      generation,
+      adoptCurrentIdentity() {
+        if (
+          controller.signal.aborted
+          || generation !== latestGeneration
+        ) {
+          throw createDatasetReloadSupersededError(
+            RELOAD_SUPERSEDED_MESSAGE
+          );
+        }
+        if (publicationIdentityAdopted) {
+          throw new Error(
+            'Dataset reload publication identity was already adopted.'
+          );
+        }
+        identity = captureReloadIdentity(captureIdentity);
+        publicationIdentityAdopted = true;
+      },
+      signal: controller.signal,
+      isLatest() {
+        return generation === latestGeneration;
+      },
+      isCurrent() {
+        return (
+          !controller.signal.aborted &&
+          generation === latestGeneration &&
+          reloadIdentitiesMatch(
+            identity,
+            captureReloadIdentity(captureIdentity)
+          )
+        );
+      },
+      assertCurrent() {
+        if (
+          controller.signal.aborted ||
+          generation !== latestGeneration ||
+          !reloadIdentitiesMatch(
+            identity,
+            captureReloadIdentity(captureIdentity)
+          )
+        ) {
+          throw createDatasetReloadSupersededError(
+            RELOAD_SUPERSEDED_MESSAGE
+          );
+        }
+      },
+      finish() {
+        settle(record);
+      }
+    });
+  }
 
   return Object.freeze({
-    begin() {
-      let identity = captureReloadIdentity(captureIdentity);
-      latestController?.abort();
-      const controller = new AbortController();
-      latestController = controller;
-      const generation = ++latestGeneration;
-      let publicationIdentityAdopted = false;
-
-      return Object.freeze({
-        adoptCurrentIdentity() {
-          if (
-            controller.signal.aborted
-            || generation !== latestGeneration
-          ) {
-            throw createDatasetReloadSupersededError(
-              RELOAD_SUPERSEDED_MESSAGE
-            );
-          }
-          if (publicationIdentityAdopted) {
-            throw new Error(
-              'Dataset reload publication identity was already adopted.'
-            );
-          }
-          identity = captureReloadIdentity(captureIdentity);
-          publicationIdentityAdopted = true;
-        },
-        signal: controller.signal,
-        isLatest() {
-          return generation === latestGeneration;
-        },
-        isCurrent() {
-          return (
-            !controller.signal.aborted &&
-            generation === latestGeneration &&
-            reloadIdentitiesMatch(
-              identity,
-              captureReloadIdentity(captureIdentity)
-            )
-          );
-        },
-        assertCurrent() {
-          if (
-            controller.signal.aborted ||
-            generation !== latestGeneration ||
-            !reloadIdentitiesMatch(
-              identity,
-              captureReloadIdentity(captureIdentity)
-            )
-          ) {
-            throw createDatasetReloadSupersededError(
-              RELOAD_SUPERSEDED_MESSAGE
-            );
-          }
-        }
-      });
+    get actionSequence() {
+      return actionSequence;
+    },
+    /** True when no dataset change is in flight. */
+    get settled() {
+      return latest === null || latest.settled;
+    },
+    begin,
+    beginIfNoActionSince(sequence) {
+      if (!Number.isSafeInteger(sequence) || sequence < 0) {
+        throw new TypeError(
+          'Dataset action sequence must be a non-negative safe integer.'
+        );
+      }
+      return sequence === actionSequence ? begin() : null;
+    },
+    /**
+     * Record a user action that decides the dataset without changing it, so
+     * a slower change the user started earlier cannot override it. It begins
+     * no transaction and supersedes nothing that is loading.
+     */
+    recordAction: advanceActionSequence,
+    async whenSettled() {
+      while (latest !== null && !latest.settled) {
+        await latest.settledPromise;
+      }
     }
   });
 }
@@ -676,22 +776,6 @@ export async function settlePublishedDatasetStateOutcome(options) {
 }
 
 /**
- * Settle bootstrap analytics without converting an expected interactive
- * replacement into a terminal startup failure.
- *
- * @param {Parameters<typeof settlePublishedDatasetStateOutcome>[0]} options
- * @returns {Promise<object>}
- */
-export async function settleInitialPublishedDatasetStateOutcome(options) {
-  try {
-    return await settlePublishedDatasetStateOutcome(options);
-  } catch (error) {
-    if (!isDatasetReloadSupersededError(error)) throw error;
-    return Object.freeze({ status: 'superseded' });
-  }
-}
-
-/**
  * Synchronize non-scientific UI after a complete dataset has already been
  * published. Resource finalization runs exactly once after synchronization,
  * including when synchronization throws. Either error is reported as a ready
@@ -791,41 +875,4 @@ export function createDatasetRuntimeRetirementOwner() {
       return true;
     }
   });
-}
-
-/**
- * Activate validated local data while distinguishing a retained-source
- * auto-switch outcome from a required reload failure after the switch succeeds.
- *
- * @param {object} options
- * @param {() => Promise<void>|void} options.switchDataset
- * @param {() => Promise<void>|void} options.reloadDataset
- * @returns {Promise<
- *   {status: 'ready'} |
- *   {status: 'validated-retained', error: unknown}
- * >}
- */
-export async function activateValidatedLocalDataset(options) {
-  requireExactKeys(
-    options,
-    ['switchDataset', 'reloadDataset'],
-    'validated local dataset activation'
-  );
-  const { switchDataset, reloadDataset } = options;
-  if (
-    typeof switchDataset !== 'function' ||
-    typeof reloadDataset !== 'function'
-  ) {
-    throw new TypeError(
-      'Validated local dataset activation handlers must be functions.'
-    );
-  }
-  try {
-    await switchDataset();
-  } catch (error) {
-    return { status: 'validated-retained', error };
-  }
-
-  await reloadDataset();
-  return { status: 'ready' };
 }

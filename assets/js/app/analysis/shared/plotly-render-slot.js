@@ -369,5 +369,3 @@ export class PlotlyRenderSlot {
     }
   }
 }
-
-export default PlotlyRenderSlot;

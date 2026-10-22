@@ -5,14 +5,14 @@
  * axis synchronization, and responsive sizing.
  */
 
-import { getPageColor, PAGE_COLORS } from '../core/plugin-contract.js';
+import { PAGE_COLORS } from '../core/plugin-contract.js';
 import { getPlotTheme } from '../shared/plot-theme.js';
 import { escapeHtml } from '../../utils/dom-utils.js';
 
 /**
  * Layout mode definitions
  */
-export const LAYOUT_MODES = {
+const LAYOUT_MODES = {
   'side-by-side': {
     id: 'side-by-side',
     name: 'Side by Side',
@@ -503,5 +503,3 @@ export class LayoutEngine {
 export function createLayoutEngine(options) {
   return new LayoutEngine(options);
 }
-
-export { getPageColor };

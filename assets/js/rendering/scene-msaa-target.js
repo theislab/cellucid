@@ -77,6 +77,7 @@ function requireDrawingBufferExtent(value, label) {
  *   getSceneFramebuffer: () => WebGLFramebuffer|null,
  *   beginFrame: (width: number, height: number) => void,
  *   resolveFrame: (width: number, height: number) => void,
+ *   endFrameUnchanged: () => void,
  *   handleContextLost: () => void,
  *   dispose: () => void
  * }>}
@@ -228,6 +229,16 @@ export function createSceneMsaaTarget(gl) {
       return usable() && framebuffer !== null;
     },
 
+    /**
+     * Whether the frame in progress is being drawn into the multisampled
+     * target: true between a `beginFrame` that bound it and the matching
+     * `resolveFrame`. An allocation failure or a zero-sized canvas leaves the
+     * frame single-sampled even with antialiasing on.
+     */
+    isMultisampledThisFrame() {
+      return boundThisFrame;
+    },
+
     /** Samples per pixel, or 0 when the device cannot multisample. */
     getSampleCount() {
       return available ? sampleCount : 0;
@@ -304,6 +315,18 @@ export function createSceneMsaaTarget(gl) {
       }
       gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
       boundThisFrame = true;
+    },
+
+    /**
+     * End a frame that changed no pixel of the target: the default
+     * framebuffer (preserved between frames) already shows its resolve, so
+     * none is done; only the default framebuffer is rebound.
+     */
+    endFrameUnchanged() {
+      if (!boundThisFrame) return;
+      boundThisFrame = false;
+      if (contextLost || disposed) return;
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     },
 
     /**

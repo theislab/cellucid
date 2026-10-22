@@ -15,6 +15,7 @@ class FakeControl {
     open = false,
     summary = '',
     skipped = false,
+    afterEmbedding = false,
   }) {
     this.id = id;
     this.tagName = tagName;
@@ -25,12 +26,17 @@ class FakeControl {
     this.open = open;
     this.summary = summary;
     this.skipped = skipped;
+    this.afterEmbedding = afterEmbedding;
     this.events = [];
     this.dispatchFailure = null;
   }
 
   closest(selector) {
-    return selector === '[data-state-serializer-skip]' && this.skipped ? this : null;
+    if (selector === '[data-state-serializer-skip]') return this.skipped ? this : null;
+    if (selector === '[data-state-serializer-after-embedding]') {
+      return this.afterEmbedding ? this : null;
+    }
+    throw new Error(`FakeControl.closest() does not implement ${selector}`);
   }
 
   querySelector(selector) {
@@ -346,6 +352,112 @@ test('UI restore rejects a consumer that silently reverts an exact value', () =>
     );
     assert.equal(mode.value, 'points');
     assert.deepEqual(mode.events, ['change']);
+  } finally {
+    fixture.restore();
+  }
+});
+
+test('a control whose choices follow the embedding is checked and applied only once the embedding is back', () => {
+  // A vector field is bound to one embedding, so the select lists different
+  // fields per view layout. The session was saved while the active view
+  // showed an embedding with `velocity_tsne`; the page restoring it shows
+  // another, whose select lists `velocity_umap`. Checked against that page,
+  // the record was refused; applied to it, the value was lost when the
+  // embedding changed under it.
+  const enabled = new FakeControl({ id: 'velocity-overlay-enabled', type: 'checkbox', afterEmbedding: true });
+  const field = new FakeControl({
+    id: 'velocity-field',
+    tagName: 'SELECT',
+    value: 'velocity_umap',
+    options: ['velocity_umap'],
+    afterEmbedding: true,
+  });
+  const theme = new FakeControl({ id: 'theme-select', tagName: 'SELECT', value: 'light', options: ['light', 'dark'] });
+  const fixture = installDocument([enabled, field, theme]);
+  try {
+    const serializer = createUiControlSerializer({ sidebar: fixture.sidebar });
+    assert.deepEqual(serializer.embeddingDependentControlIds(), ['velocity-overlay-enabled', 'velocity-field']);
+    const controls = {
+      'velocity-overlay-enabled': { type: 'checkbox', checked: true },
+      'velocity-field': { type: 'select', value: 'velocity_tsne' },
+      'theme-select': { type: 'select', value: 'dark' },
+    };
+    // Shape is checked now; the value is not held against today's choices.
+    serializer.validateUIControls(controls);
+    assert.throws(
+      () => serializer.validateUIControls({ ...controls, 'velocity-field': { type: 'select', value: 3 } }),
+      /value must be a string/,
+    );
+
+    const restoreDeferred = serializer.restoreUIControls(controls);
+    assert.equal(theme.value, 'dark');
+    assert.equal(enabled.checked, false);
+    assert.equal(field.value, 'velocity_umap');
+    assert.deepEqual(field.events, []);
+
+    // The embedding came back and the select lists the saved field.
+    field.options = [{ value: 'velocity_tsne' }];
+    field.value = '';
+    restoreDeferred();
+    assert.equal(enabled.checked, true);
+    assert.equal(field.value, 'velocity_tsne');
+    assert.deepEqual(field.events, ['change']);
+  } finally {
+    fixture.restore();
+  }
+});
+
+test('a deferred value that the restored embedding does not offer is refused before any deferred control moves', () => {
+  const enabled = new FakeControl({ id: 'velocity-overlay-enabled', type: 'checkbox', afterEmbedding: true });
+  const field = new FakeControl({
+    id: 'velocity-field',
+    tagName: 'SELECT',
+    value: 'velocity_umap',
+    options: ['velocity_umap'],
+    afterEmbedding: true,
+  });
+  const fixture = installDocument([enabled, field]);
+  try {
+    const serializer = createUiControlSerializer({ sidebar: fixture.sidebar });
+    const restoreDeferred = serializer.restoreUIControls({
+      'velocity-overlay-enabled': { type: 'checkbox', checked: true },
+      'velocity-field': { type: 'select', value: 'velocity_tsne' },
+    });
+    assert.throws(restoreDeferred, /option "velocity_tsne" is not available in current control "velocity-field"/);
+    assert.equal(enabled.checked, false);
+    assert.deepEqual(enabled.events, []);
+    assert.deepEqual(field.events, []);
+  } finally {
+    fixture.restore();
+  }
+});
+
+test('a withheld control is checked, never applied, and cannot also be deferred', () => {
+  const mode = new FakeControl({ id: 'render-mode', tagName: 'SELECT', value: 'points', options: ['points', 'smoke'] });
+  const field = new FakeControl({ id: 'velocity-field', tagName: 'SELECT', value: '', options: [], afterEmbedding: true });
+  const fixture = installDocument([mode, field]);
+  try {
+    const serializer = createUiControlSerializer({ sidebar: fixture.sidebar });
+    const controls = {
+      'render-mode': { type: 'select', value: 'smoke' },
+      'velocity-field': { type: 'select', value: '' },
+    };
+    assert.throws(
+      () => serializer.restoreUIControls({ ...controls, 'render-mode': { type: 'select', value: 'volume' } }, { withholdControlIds: ['render-mode'] }),
+      /option "volume" is not available/,
+    );
+    const restoreDeferred = serializer.restoreUIControls(controls, { withholdControlIds: ['render-mode'] });
+    restoreDeferred();
+    assert.equal(mode.value, 'points');
+    assert.deepEqual(mode.events, []);
+    assert.throws(
+      () => serializer.restoreUIControls(controls, { deferControlIds: ['render-mode'], withholdControlIds: ['render-mode'] }),
+      /cannot be both deferred and withheld/,
+    );
+    assert.throws(
+      () => serializer.restoreUIControls(controls, { withholdControlIds: ['missing'] }),
+      /"missing" does not exist/,
+    );
   } finally {
     fixture.restore();
   }

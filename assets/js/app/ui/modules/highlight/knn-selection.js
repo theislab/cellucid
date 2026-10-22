@@ -14,9 +14,9 @@ import {
   SELECTION_NOTICE,
   selectionNoticeHtml
 } from './mode-copy.js';
-import { MAX_HISTORY_STEPS, selectionUnchanged } from './selection-state.js';
+import { pushHistoryStep, selectionUnchanged } from './selection-state.js';
 import { viewerNeedsUiRetirement } from '../../core/viewer-lifecycle.js';
-import { getStepControls, removeStepControls } from './step-controls.js';
+import { removeStepControls, showStepControls } from './step-controls.js';
 import {
   deliverSelectionToJupyter,
   showSelectionDeliveryFailure
@@ -36,6 +36,7 @@ import {
   requireSelectionStepEvent,
   requireUnifiedSelectionState
 } from './exact-contract.js';
+import { formatCount } from '../../components/display-format.js';
 
 /**
  * @param {object} options
@@ -120,7 +121,7 @@ export function initKnnSelection(options) {
     const stepsLabel = knnEvent.steps > 1 ? ` (${knnEvent.steps} selections)` : '';
     const savedGroup = state.addHighlightDirect({
       type: 'knn',
-      label: `KNN${stepsLabel} (${knnEvent.cellCount.toLocaleString()} cells)`,
+      label: `KNN${stepsLabel} (${formatCount(knnEvent.cellCount)} cells)`,
       cellIndices: knnEvent.cellIndices
     });
     requireSavedHighlightGroup(
@@ -197,13 +198,10 @@ export function initKnnSelection(options) {
     // The empty state before the first step is recorded like any other, so
     // Undo can reach it — the annotation tool has always done this, and a
     // greyed-out Undo immediately after dragging reads as a broken control.
-    selectionState.knnHistory.push({
+    pushHistoryStep(selectionState, 'knnHistory', {
       candidates: selectionState.lastKnnCandidates ? [...selectionState.lastKnnCandidates] : null,
       step: selectionState.lastKnnStep
     });
-    if (selectionState.knnHistory.length > MAX_HISTORY_STEPS) {
-      selectionState.knnHistory.shift();
-    }
     selectionState.knnRedoStack = [];
 
     selectionState.lastKnnCandidates = [...stepEvent.candidates];
@@ -302,8 +300,12 @@ export function initKnnSelection(options) {
     }
   }
 
-  function getKnnControls() {
-    return getStepControls({
+  /**
+   * Publish the step controls for a selection of `candidateCount` cells, on
+   * the panel and the selection bar alike.
+   */
+  function showKnnControls(candidateCount, notice) {
+    showStepControls({
       documentOwner,
       tool: 'knn',
       parent: highlightModeDescriptionEl.parentElement,
@@ -318,6 +320,12 @@ export function initKnnSelection(options) {
         cancel: () => {
           viewer.cancelKnnSelection();
         }
+      },
+      readout: {
+        candidateCount,
+        canUndo: selectionState.knnHistory.length > 0,
+        canRedo: selectionState.knnRedoStack.length > 0,
+        notice
       }
     });
   }
@@ -358,7 +366,8 @@ export function initKnnSelection(options) {
       removeStepControls(
         documentOwner,
         'knn',
-        highlightModeDescriptionEl.parentElement
+        highlightModeDescriptionEl.parentElement,
+        notice
       );
       return;
     }
@@ -367,10 +376,7 @@ export function initKnnSelection(options) {
       const stepInfo =
         '<strong>No selection</strong><br><small>Alt to intersect, Shift+Alt to add, Ctrl+Alt to subtract</small>';
 
-      const { undoButton, redoButton, confirmButton } = getKnnControls();
-      undoButton.disabled = selectionState.knnHistory.length === 0;
-      redoButton.disabled = selectionState.knnRedoStack.length === 0;
-      confirmButton.disabled = true;
+      showKnnControls(0, notice);
 
       highlightModeDescriptionEl.innerHTML = `${stepInfo}${noticeHtml}`;
       return;
@@ -390,12 +396,9 @@ export function initKnnSelection(options) {
       : stepEvent.degree === 0
         ? 'seed only'
         : `${stepEvent.degree}° neighbors`;
-    const stepInfo = `<strong>Step ${stepEvent.step}:</strong> ${stepEvent.candidateCount.toLocaleString()} cells (${degreeLabel})${modeLabel}<br><small>Alt to intersect, Shift+Alt to add, Ctrl+Alt to subtract</small>`;
+    const stepInfo = `<strong>Step ${stepEvent.step}:</strong> ${formatCount(stepEvent.candidateCount)} cells (${degreeLabel})${modeLabel}<br><small>Alt to intersect, Shift+Alt to add, Ctrl+Alt to subtract</small>`;
 
-    const { undoButton, redoButton, confirmButton } = getKnnControls();
-    undoButton.disabled = selectionState.knnHistory.length === 0;
-    redoButton.disabled = selectionState.knnRedoStack.length === 0;
-    confirmButton.disabled = stepEvent.candidateCount === 0;
+    showKnnControls(stepEvent.candidateCount, notice);
 
     highlightModeDescriptionEl.innerHTML = `${stepInfo}${noticeHtml}`;
   }

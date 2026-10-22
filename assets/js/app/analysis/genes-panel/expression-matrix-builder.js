@@ -474,19 +474,3 @@ export class ExpressionMatrixBuilder {
     return count > 0 ? (sum / count) : NaN;
   }
 }
-
-// =============================================================================
-// FACTORY FUNCTION
-// =============================================================================
-
-/**
- * Create an ExpressionMatrixBuilder instance
- *
- * @param {Object} options - Same options as ExpressionMatrixBuilder constructor
- * @returns {ExpressionMatrixBuilder}
- */
-export function createExpressionMatrixBuilder(options) {
-  return new ExpressionMatrixBuilder(options);
-}
-
-export default ExpressionMatrixBuilder;

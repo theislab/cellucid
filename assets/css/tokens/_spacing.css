@@ -30,6 +30,8 @@
   --sidebar-width: var(--sidebar-user-width, 280px);
   --sidebar-min-width: 200px;
   --sidebar-max-width: 450px;
+  --sidebar-toggle-width: 38px;
+  --sidebar-toggle-height: 34px;
   --header-height: 36px;
   --accordion-default-width: 320px;
   --accordion-default-height: 400px;

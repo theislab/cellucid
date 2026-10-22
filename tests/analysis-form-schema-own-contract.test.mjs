@@ -2,10 +2,6 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
-  generateOptionsUI,
-  parseOptionsFromForm,
-} from '../assets/js/app/analysis/core/transform-registry.js';
-import {
   mergeOptions,
   validateOptionSchema,
   validateOptionsAgainstSchema,
@@ -13,8 +9,6 @@ import {
 import {
   BasePluginRegistry,
   PlotPluginRegistry,
-  StatPluginRegistry,
-  TransformPluginRegistry,
 } from '../assets/js/app/analysis/core/plugin-contract.js';
 import {
   getTypedFormValues,
@@ -242,14 +236,6 @@ test('form schema consumers reject malformed definitions descriptively', () => {
   const emptyForm = { querySelector: () => null };
   for (const definition of [null, [], 'not-a-definition']) {
     assert.throws(
-      () => generateOptionsUI({ broken: definition }),
-      /Option broken definition must be an object/,
-    );
-    assert.throws(
-      () => parseOptionsFromForm(emptyForm, { broken: definition }),
-      /Option broken definition must be an object/,
-    );
-    assert.throws(
       () => getTypedFormValues(emptyForm, { broken: definition }),
       /Field broken configuration must be an object/,
     );
@@ -476,28 +462,7 @@ test('plugin registration rejects malformed schemas without storing a plugin', t
   );
 });
 
-test('specialized registries ignore inherited optional contract fields', () => {
-  const transformRegistry = new TransformPluginRegistry();
-  const transform = Object.create({
-    gpuMethod: 'inherited-gpu-method',
-    workerMethod: 'inherited-worker-method',
-  });
-  Object.assign(transform, {
-    defaultOptions: {},
-    execute() {},
-    id: 'inherited-transform-optionals',
-    name: 'Inherited transform optionals',
-    optionSchema: {},
-    supportedTypes: ['continuous'],
-  });
-  assert.equal(transformRegistry.register(transform), true);
-  const storedTransform = transformRegistry.get(transform.id);
-  assert.equal(storedTransform.gpuMethod, null);
-  assert.equal(storedTransform.workerMethod, null);
-  transformRegistry._gpuAvailable = true;
-  transformRegistry._workerAvailable = true;
-  assert.equal(transformRegistry.selectBackend(storedTransform), 'cpu');
-
+test('the plot registry ignores inherited optional contract fields', () => {
   const plotRegistry = new PlotPluginRegistry();
   const plot = Object.create({ supportedLayouts: ['inherited-layout'] });
   Object.assign(plot, {
@@ -513,129 +478,6 @@ test('specialized registries ignore inherited optional contract fields', () => {
     plotRegistry.get(plot.id).supportedLayouts,
     ['single'],
   );
-
-  const statRegistry = new StatPluginRegistry();
-  const stat = Object.create({
-    assumptions: ['inherited-assumption'],
-    testType: 'inherited-test-type',
-  });
-  Object.assign(stat, {
-    compute() {},
-    defaultOptions: {},
-    id: 'inherited-stat-optionals',
-    name: 'Inherited stat optionals',
-    optionSchema: {},
-    supportedTypes: ['continuous'],
-  });
-  assert.equal(statRegistry.register(stat), true);
-  const storedStat = statRegistry.get(stat.id);
-  assert.equal(storedStat.testType, 'generic');
-  assert.deepEqual(storedStat.assumptions, []);
-});
-
-test('generated option UI ignores inherited definition fields and keeps own fields', () => {
-  const inheritedDefinition = Object.create({
-    default: 'inherited-default',
-    description: 'Inherited description',
-    label: 'Inherited label',
-    max: 99,
-    min: 1,
-    options: [{ label: 'Inherited option', value: 'inherited-option' }],
-    showWhen: () => false,
-    step: 2,
-    type: 'select',
-  });
-  const inheritedValues = Object.create({
-    inheritedOnly: 'inherited-current-value',
-  });
-  const inheritedHTML = generateOptionsUI(
-    { inheritedOnly: inheritedDefinition },
-    inheritedValues,
-    'probe',
-  );
-
-  assert.match(
-    inheritedHTML,
-    /<label for="probe-inheritedOnly">inheritedOnly<\/label>/,
-  );
-  assert.doesNotMatch(inheritedHTML, /data-show-when=/);
-  assert.doesNotMatch(inheritedHTML, /<select|<input/);
-  assert.doesNotMatch(
-    inheritedHTML,
-    /Inherited|inherited-default|inherited-current-value/,
-  );
-
-  const ownDefinition = {
-    default: 'own-option',
-    description: 'Own description',
-    label: 'Own label',
-    options: [
-      { label: 'Own option', value: 'own-option' },
-      { label: 'Other option', value: 'other-option' },
-    ],
-    showWhen() {
-      return false;
-    },
-    type: 'select',
-  };
-  const ownHTML = generateOptionsUI(
-    { ownDefinition },
-    {},
-    'probe',
-  );
-
-  assert.match(ownHTML, /data-show-when="ownDefinition"/);
-  assert.match(ownHTML, /<label for="probe-ownDefinition">Own label<\/label>/);
-  assert.match(
-    ownHTML,
-    /<option value="own-option" selected>Own option<\/option>/,
-  );
-  assert.match(ownHTML, /<small class="form-help">Own description<\/small>/);
-});
-
-test('form option parsing ignores inherited definition types', () => {
-  const elements = new Map([
-    ['inheritedCheckbox', {
-      checked: true,
-      type: 'checkbox',
-      value: 'literal-checkbox-value',
-    }],
-    ['ownCheckbox', {
-      checked: true,
-      type: 'checkbox',
-      value: 'ignored-checkbox-value',
-    }],
-    ['inheritedNumber', {
-      type: 'number',
-      value: '4.5',
-    }],
-    ['ownNumber', {
-      type: 'number',
-      value: '4.5',
-    }],
-  ]);
-  const form = {
-    querySelector(selector) {
-      const match = /^\[data-key="([^"]+)"\]$/.exec(selector);
-      return match ? elements.get(match[1]) ?? null : null;
-    },
-  };
-  const inheritedCheckbox = Object.create({ type: 'checkbox' });
-  const inheritedNumber = Object.create({ type: 'number' });
-
-  const values = parseOptionsFromForm(form, {
-    inheritedCheckbox,
-    inheritedNumber,
-    ownCheckbox: { type: 'checkbox' },
-    ownNumber: { type: 'number' },
-  });
-
-  assert.deepEqual(values, {
-    inheritedCheckbox: 'literal-checkbox-value',
-    inheritedNumber: '4.5',
-    ownCheckbox: true,
-    ownNumber: 4.5,
-  });
 });
 
 test('typed form parsing ignores inherited config type and default values', () => {

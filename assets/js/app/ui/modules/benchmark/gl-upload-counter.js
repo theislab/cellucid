@@ -21,6 +21,10 @@
  *   element-array-buffer traffic is separated from vertex traffic.
  * - `bufferSubData` copies into an existing store. Same bytes, no realloc.
  * - `texImage2D` / `texSubImage2D` carry the overlay and alpha-texture traffic.
+ * - Every draw entry point, including the `WEBGL_multi_draw` extension's, is
+ *   one draw call. A multi-draw also counts its ranges, and every draw counts
+ *   the vertices and instances it submits, so a culled frame drawn as 256
+ *   ranges in one call is not mistaken for a frame that drew once.
  * - `getError`, `finish`, `flush`, `readPixels` and `getBufferSubData` are the
  *   synchronous points. On Chrome/ANGLE `getError` drains the command buffer
  *   to the GPU process; two of them per view per frame is a pipeline stall
@@ -49,6 +53,18 @@ export const INSTRUMENTED_METHOD_NAMES = Object.freeze([
   'getBufferSubData'
 ]);
 
+/**
+ * `WEBGL_multi_draw` entry points shadowed on the extension object. A context
+ * returns the same extension object on every `getExtension` call, so a renderer
+ * that fetched it before instrumentation still calls the counting wrapper.
+ */
+export const INSTRUMENTED_MULTI_DRAW_METHOD_NAMES = Object.freeze([
+  'multiDrawArraysWEBGL',
+  'multiDrawElementsWEBGL',
+  'multiDrawArraysInstancedWEBGL',
+  'multiDrawElementsInstancedWEBGL'
+]);
+
 const COUNTER_FIELDS = Object.freeze([
   'bufferStoreAllocations',
   'bufferStoreAllocationBytes',
@@ -62,6 +78,10 @@ const COUNTER_FIELDS = Object.freeze([
   'textureUploadBytes',
   'textureUploadsWithUnmeasuredBytes',
   'drawCalls',
+  'multiDrawCalls',
+  'multiDrawRanges',
+  'verticesSubmitted',
+  'instancesSubmitted',
   'syncStalls',
   'getErrorCalls',
   'finishCalls',
@@ -146,6 +166,43 @@ function bufferSourceBytes(
     return Math.max(0, elements) * bytesPerElement;
   }
   return typeof source.byteLength === 'number' ? source.byteLength : 0;
+}
+
+/**
+ * Sum `count` entries of a multi-draw list from `offset`. Lists are typed
+ * arrays or plain arrays; a malformed list is the driver's error to raise, so
+ * this only reads what is there.
+ *
+ * @param {ArrayLike<number>} list - Counts or instance counts.
+ * @param {number} offset - First entry read.
+ * @param {number} count - Entries read.
+ * @returns {number} Sum of the entries.
+ */
+function sumListRange(list, offset, count) {
+  if (list === null || list === undefined) return 0;
+  let sum = 0;
+  const end = offset + count;
+  for (let index = offset; index < end; index++) {
+    const value = list[index];
+    if (typeof value === 'number') sum += value;
+  }
+  return sum;
+}
+
+/**
+ * Sum of count × instance count over a multi-draw's ranges.
+ */
+function sumInstancedVertices(counts, countsOffset, instances, instancesOffset, drawcount) {
+  if (counts === null || counts === undefined) return 0;
+  let sum = 0;
+  for (let index = 0; index < drawcount; index++) {
+    const count = counts[countsOffset + index];
+    const instanceCount = instances?.[instancesOffset + index];
+    if (typeof count === 'number' && typeof instanceCount === 'number') {
+      sum += count * instanceCount;
+    }
+  }
+  return sum;
 }
 
 function enumName(gl, value, names) {
@@ -359,16 +416,20 @@ export function instrumentGlUploads(gl) {
 
     drawArrays(mode, first, count) {
       frame.drawCalls++;
+      frame.verticesSubmitted += count;
       return originals.drawArrays.call(gl, mode, first, count);
     },
 
     drawElements(mode, count, type, offset) {
       frame.drawCalls++;
+      frame.verticesSubmitted += count;
       return originals.drawElements.call(gl, mode, count, type, offset);
     },
 
     drawArraysInstanced(mode, first, count, instanceCount) {
       frame.drawCalls++;
+      frame.verticesSubmitted += count * instanceCount;
+      frame.instancesSubmitted += instanceCount;
       return originals.drawArraysInstanced.call(
         gl,
         mode,
@@ -380,6 +441,8 @@ export function instrumentGlUploads(gl) {
 
     drawElementsInstanced(mode, count, type, offset, instanceCount) {
       frame.drawCalls++;
+      frame.verticesSubmitted += count * instanceCount;
+      frame.instancesSubmitted += instanceCount;
       return originals.drawElementsInstanced.call(
         gl,
         mode,
@@ -447,6 +510,8 @@ export function instrumentGlUploads(gl) {
     });
   }
 
+  const multiDraw = instrumentMultiDraw(gl, frame);
+
   let installed = true;
 
   return {
@@ -457,6 +522,13 @@ export function instrumentGlUploads(gl) {
     /** @returns {boolean} True while the wrappers are installed. */
     get installed() {
       return installed;
+    },
+    /**
+     * @returns {boolean} True when the context exposes `WEBGL_multi_draw` and
+     *   its entry points are counted.
+     */
+    get multiDrawInstrumented() {
+      return multiDraw !== null;
     },
     /**
      * Fold the current frame into the totals and zero the frame counters.
@@ -490,7 +562,123 @@ export function instrumentGlUploads(gl) {
           );
         }
       }
+      if (multiDraw !== null) multiDraw.restore();
       installed = false;
+    }
+  };
+}
+
+/**
+ * Count the `WEBGL_multi_draw` entry points into `frame`.
+ *
+ * Asking for the extension enables it. On a WebGL2 context that adds entry
+ * points and changes nothing else, and a renderer that uses it has asked for
+ * it already, so the call is free of side effects either way.
+ *
+ * @param {WebGL2RenderingContext} gl - Instrumented context.
+ * @param {Object} frame - Live per-frame counters.
+ * @returns {{restore: () => void}|null} Handle, or null without the extension.
+ */
+function instrumentMultiDraw(gl, frame) {
+  if (typeof gl.getExtension !== 'function') return null;
+  const extension = gl.getExtension('WEBGL_multi_draw');
+  if (extension === null || typeof extension !== 'object') return null;
+
+  const previousDescriptors = new Map();
+  const originals = {};
+  for (const name of INSTRUMENTED_MULTI_DRAW_METHOD_NAMES) {
+    if (typeof extension[name] !== 'function') continue;
+    previousDescriptors.set(
+      name,
+      Object.getOwnPropertyDescriptor(extension, name) ?? null
+    );
+    originals[name] = extension[name];
+  }
+
+  const wrappers = {
+    multiDrawArraysWEBGL(mode, firsts, firstsOffset, counts, countsOffset, drawcount) {
+      frame.drawCalls++;
+      frame.multiDrawCalls++;
+      frame.multiDrawRanges += drawcount;
+      frame.verticesSubmitted += sumListRange(counts, countsOffset, drawcount);
+      return originals.multiDrawArraysWEBGL.call(
+        extension, mode, firsts, firstsOffset, counts, countsOffset, drawcount
+      );
+    },
+
+    multiDrawElementsWEBGL(mode, counts, countsOffset, type, offsets, offsetsOffset, drawcount) {
+      frame.drawCalls++;
+      frame.multiDrawCalls++;
+      frame.multiDrawRanges += drawcount;
+      frame.verticesSubmitted += sumListRange(counts, countsOffset, drawcount);
+      return originals.multiDrawElementsWEBGL.call(
+        extension, mode, counts, countsOffset, type, offsets, offsetsOffset, drawcount
+      );
+    },
+
+    multiDrawArraysInstancedWEBGL(
+      mode, firsts, firstsOffset, counts, countsOffset,
+      instanceCounts, instanceCountsOffset, drawcount
+    ) {
+      frame.drawCalls++;
+      frame.multiDrawCalls++;
+      frame.multiDrawRanges += drawcount;
+      frame.verticesSubmitted += sumInstancedVertices(
+        counts, countsOffset, instanceCounts, instanceCountsOffset, drawcount
+      );
+      frame.instancesSubmitted += sumListRange(
+        instanceCounts, instanceCountsOffset, drawcount
+      );
+      return originals.multiDrawArraysInstancedWEBGL.call(
+        extension, mode, firsts, firstsOffset, counts, countsOffset,
+        instanceCounts, instanceCountsOffset, drawcount
+      );
+    },
+
+    multiDrawElementsInstancedWEBGL(
+      mode, counts, countsOffset, type, offsets, offsetsOffset,
+      instanceCounts, instanceCountsOffset, drawcount
+    ) {
+      frame.drawCalls++;
+      frame.multiDrawCalls++;
+      frame.multiDrawRanges += drawcount;
+      frame.verticesSubmitted += sumInstancedVertices(
+        counts, countsOffset, instanceCounts, instanceCountsOffset, drawcount
+      );
+      frame.instancesSubmitted += sumListRange(
+        instanceCounts, instanceCountsOffset, drawcount
+      );
+      return originals.multiDrawElementsInstancedWEBGL.call(
+        extension, mode, counts, countsOffset, type, offsets, offsetsOffset,
+        instanceCounts, instanceCountsOffset, drawcount
+      );
+    }
+  };
+
+  for (const name of previousDescriptors.keys()) {
+    Object.defineProperty(extension, name, {
+      value: wrappers[name],
+      writable: true,
+      configurable: true,
+      enumerable: false
+    });
+  }
+
+  return {
+    restore() {
+      for (const [name, descriptor] of previousDescriptors) {
+        if (descriptor === null) {
+          delete extension[name];
+        } else {
+          Object.defineProperty(extension, name, descriptor);
+        }
+        if (extension[name] !== originals[name]) {
+          throw new Error(
+            `GL upload instrumentation could not restore extension method ${name}().`
+          );
+        }
+      }
+      previousDescriptors.clear();
     }
   };
 }

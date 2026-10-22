@@ -8,6 +8,8 @@
  * @module ui/modules/stats-display
  */
 
+import { formatCount } from '../components/display-format.js';
+
 /**
  * @typedef {object} FieldInfo
  * @property {object|null} field
@@ -26,11 +28,11 @@ export function initStatsDisplay({ dom }) {
     if (!statsEl || !fieldInfo) return;
     const { field, pointCount, centroidInfo } = fieldInfo;
     if (!field) {
-      statsEl.textContent = `Points: ${pointCount.toLocaleString()} • Field: None`;
+      statsEl.textContent = `Points: ${formatCount(pointCount)} • Field: None`;
       return;
     }
     statsEl.textContent =
-      `Points: ${pointCount.toLocaleString()} • Field: ${field.key} (${field.kind})${centroidInfo || ''}`;
+      `Points: ${formatCount(pointCount)} • Field: ${field.key} (${field.kind})${centroidInfo || ''}`;
   }
 
   return { updateStats };

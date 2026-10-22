@@ -37,13 +37,6 @@ export function collectDOMReferences(root) {
   };
 
   return {
-    sidebar: {
-      el: byId('sidebar'),
-      toggleBtn: byId('sidebar-toggle'),
-      resizeHandle: byId('sidebar-resize-handle'),
-      canvas: byId('glcanvas'),
-    },
-
     stats: {
       el: byId('stats'),
     },
@@ -67,6 +60,7 @@ export function collectDOMReferences(root) {
       userDataFileInput: byId('user-data-file-input'),
       userDataH5adInput: byId('user-data-h5ad-input'),
       userDataZarrArchiveInput: byId('user-data-zarr-archive-input'),
+      datasetDropOverlay: byId('dataset-drop-overlay'),
 
       remoteServerUrl: byId('remote-server-url'),
       remoteConnectBtn: byId('remote-connect-btn'),
@@ -127,14 +121,23 @@ export function collectDOMReferences(root) {
       activeFiltersEl: byId('active-filters'),
     },
 
+    // The Highlighting panel and the selection bar over the plot (#select-bar)
+    // show the same controls; every list below holds the panel's first.
     highlight: {
-      countEl: byId('highlight-count'),
+      countEls: [byId('highlight-count'), byId('select-bar-count')],
       groupsEl: byId('highlighted-groups-list'),
       pagesTabsEl: byId('highlight-pages-tabs'),
       addPageBtn: byId('add-highlight-page'),
-      clearAllBtn: byId('clear-all-highlights'),
+      clearButtons: [byId('clear-all-highlights'), byId('select-bar-clear')],
       modeButtons: $$('.highlight-mode-btn'),
       modeDescription: byId('highlight-mode-description'),
+      // Marked, not matched by class: `.switch` is a shared component and
+      // not every switch is Select mode.
+      selectModeSwitches: $$('[data-select-mode-switch]'),
+      selectCombineGroups: $$('.select-combine'),
+      selectCombineButtons: $$('.segmented-btn'),
+      selectBarSteps: byId('select-bar-steps'),
+      selectBarStepButtons: $$('#select-bar-steps [data-step-action]'),
     },
 
     communityAnnotation: {
@@ -149,6 +152,7 @@ export function collectDOMReferences(root) {
       depthControls: byId('depth-controls'),
       rendererControls: byId('renderer-controls'),
       pointsControls: byId('points-controls'),
+      pointsPerformanceControls: byId('points-performance-controls'),
       smokeControls: byId('smoke-controls'),
 
       pointSizeInput: byId('point-size'),
@@ -262,17 +266,30 @@ export function collectDOMReferences(root) {
       layoutModeSelect: byId('view-layout-mode'),
       badgesBox: byId('split-view-badges-box'),
       badgesList: byId('split-view-badges-list'),
-      badgesHint: $('.split-view-hint'),
+      layoutRow: byId('split-view-layout-row'),
+      navigationTarget: byId('navigation-view-target'),
+      navigationTargetBadge: byId('navigation-view-target-badge'),
     },
 
-    dimension: {
-      controls: byId('dimension-controls'),
-      select: byId('dimension-select'),
+    representation: {
+      controls: byId('representation-controls'),
+      label: byId('view-representation-label'),
+      select: byId('view-representation-select'),
+    },
+
+    dataMapping: {
+      root: byId('data-mapping-root'),
     },
 
     figureExport: {
       section: byId('figure-export-section'),
       controls: byId('figure-export-controls'),
+    },
+
+    cellInfo: {
+      toggle: byId('cell-info-toggle'),
+      categoriesToggle: byId('cell-info-categories-toggle'),
+      canvas: byId('glcanvas'),
     },
 
     camera: {
@@ -302,26 +319,6 @@ export function collectDOMReferences(root) {
     },
 
     cinematicCamera: {
-      // Navigation controls (mirrors Compare Views)
-      navModeSelect: byId('cinematic-nav-mode'),
-      orbitControls: byId('cinematic-orbit-controls'),
-      planarControls: byId('cinematic-planar-controls'),
-      freeflyControls: byId('cinematic-freefly-controls'),
-      orbitKeySpeedInput: byId('cinematic-orbit-key-speed'),
-      orbitKeySpeedDisplay: byId('cinematic-orbit-key-speed-display'),
-      orbitReverseCheckbox: byId('cinematic-orbit-reverse'),
-      showOrbitAnchorCheckbox: byId('cinematic-show-orbit-anchor'),
-      planarPanSpeedInput: byId('cinematic-planar-pan-speed'),
-      planarPanSpeedDisplay: byId('cinematic-planar-pan-speed-display'),
-      planarZoomToCursorCheckbox: byId('cinematic-planar-zoom-to-cursor'),
-      planarInvertAxesCheckbox: byId('cinematic-planar-invert-axes'),
-      lookSensitivityInput: byId('cinematic-look-sensitivity'),
-      lookSensitivityDisplay: byId('cinematic-look-sensitivity-display'),
-      moveSpeedInput: byId('cinematic-move-speed'),
-      moveSpeedDisplay: byId('cinematic-move-speed-display'),
-      invertLookCheckbox: byId('cinematic-invert-look'),
-      pointerLockCheckbox: byId('cinematic-pointer-lock'),
-
       // Keyframe controls
       saveBtn: byId('cinematic-save-btn'),
       keyframeList: byId('cinematic-keyframe-list'),

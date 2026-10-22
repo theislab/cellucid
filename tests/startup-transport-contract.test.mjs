@@ -12,11 +12,13 @@ import {
 } from '../assets/js/app/startup-url-intent.js';
 import {
   normalizeStartupError,
-  publishStartupFailure
+  publishStartupFailure,
+  STARTUP_TROUBLESHOOTING_URL
 } from '../assets/js/app/startup-failure.js';
 import {
-  createDataSourceManager
+  DataSourceManager
 } from '../assets/js/data/data-source-manager.js';
+import { selectDataset } from './helpers/dataset-selection.mjs';
 
 function createFakeDocument() {
   const elements = new Map();
@@ -46,6 +48,7 @@ function createFakeDocument() {
   const body = makeElement('body');
   return {
     body,
+    location: { pathname: '/', search: '?dataset=missing' },
     createElement: makeElement,
     getElementById(id) {
       return elements.get(id) ?? null;
@@ -323,6 +326,18 @@ test('terminal startup failure has one persistent accessible visible owner', () 
     'Startup failed: Remote health response is invalid.'
   );
   assert.equal(documentOwner.body.children.length, 1);
+  // Never a dead end: the launch settings can be dropped, and the
+  // troubleshooting guide is one click away.
+  const [card] = surface.children;
+  const links = card.children.at(-1).children;
+  assert.deepEqual(
+    links.map(link => [link.attributes.get('href'), link.textContent]),
+    [
+      ['/', 'Open Cellucid without this link\u2019s settings'],
+      [STARTUP_TROUBLESHOOTING_URL, 'Troubleshooting data loading']
+    ]
+  );
+  assert.match(STARTUP_TROUBLESHOOTING_URL, /^https:\/\/docs\.cellucid\.com\/en\/latest\//);
   assert.throws(
     () => publishStartupFailure({
       documentOwner,
@@ -354,13 +369,16 @@ test('main startup uses terminal source intent and one fatal surface', async () 
     source,
     /const remoteDatasetId = selectConnectedDatasetId\(/
   );
+  // Many server datasets: the user is told to choose one, and startup never
+  // activates the Sample dataset dropdown for them.
   assert.match(
     source,
-    /if \(remoteDatasetId === null\) \{\s*datasetSelectFocusRequested = true;/
+    /if \(remoteDatasetId === null\) \{\s*notifications\.info\(/
   );
+  assert.doesNotMatch(source, /datasetSelectFocusRequested|datasetSelect\.focus\(/);
   assert.doesNotMatch(
     source,
-    /switchToDataset\(\s*['"]remote['"]\s*,\s*datasets\[0\]/
+    /selectStartupDataset\(\s*['"]remote['"]\s*,\s*datasets\[0\]/
   );
   assert.match(source, /publishStartupFailure\(\{/);
   assert.doesNotMatch(
@@ -383,7 +401,7 @@ function createManagerSource(type, {
   const source = {
     async getMetadata(datasetId) {
       return {
-        version: 2,
+        version: 3,
         id: datasetId,
         name: datasetId,
         description: '',
@@ -398,9 +416,16 @@ function createManagerSource(type, {
           n_edges: null
         },
         embeddings: {
-          available_dimensions: [2],
           default_dimension: 2,
-          files: { '2d': 'points_2d.bin' }
+          defaults: { '2d': 'X_umap' },
+          items: {
+            X_umap: {
+              label: 'X_umap',
+              dimension: 2,
+              file: 'embeddings/0_2d.bin',
+              source: { key: 'X_umap', columns: [0, 1] }
+            }
+          }
         },
         obs_fields: []
       };
@@ -419,7 +444,7 @@ function createManagerSource(type, {
 }
 
 test('DataSourceManager publishes exact source identity and listener failure', async () => {
-  const manager = createDataSourceManager();
+  const manager = new DataSourceManager();
   manager.registerSource('alpha', createManagerSource('alpha'));
   const listenerFailure = new Error('dataset listener failed');
   const observed = [];
@@ -431,7 +456,7 @@ test('DataSourceManager publishes exact source identity and listener failure', a
   });
 
   await assert.rejects(
-    manager.switchToDataset('alpha', 'dataset-a'),
+    selectDataset(manager, 'alpha', 'dataset-a'),
     error => (
       error instanceof AggregateError &&
       error.errors.length === 1 &&
@@ -460,7 +485,7 @@ test('DataSourceManager publishes exact source identity and listener failure', a
 
 test('DataSourceManager cleanup failure retains the published new selection', async () => {
   const deactivationFailure = new Error('deactivation failed');
-  const manager = createDataSourceManager();
+  const manager = new DataSourceManager();
   manager.registerSource(
     'alpha',
     createManagerSource('alpha', {
@@ -470,10 +495,10 @@ test('DataSourceManager cleanup failure retains the published new selection', as
     })
   );
   manager.registerSource('beta', createManagerSource('beta'));
-  await manager.switchToDataset('alpha', 'dataset-a');
+  await selectDataset(manager, 'alpha', 'dataset-a');
 
   await assert.rejects(
-    manager.switchToDataset('beta', 'dataset-b'),
+    selectDataset(manager, 'beta', 'dataset-b'),
     error => error === deactivationFailure
   );
   assert.equal(manager.getCurrentSourceType(), 'beta');

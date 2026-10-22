@@ -43,18 +43,13 @@ export const MIN_SYNTHETIC_COUNT = 1;
  *
  * This is the point-count control's own advertised ceiling, made binding.
  *
- * It is a declared product limit, not the hardware's, and it is set to the
- * hardware's rather than below it. The device's true ceiling is
- * `MAX_TEXTURE_SIZE²` for the renderer's alpha texture: on a WebGL2 context
- * reporting the common 16,384 that is 268,435,456 points, and 250,000,000 sits
- * just inside it, so every point the generator can produce remains addressable
- * by the interaction-state texture. A context reporting a smaller
- * `MAX_TEXTURE_SIZE` has a lower true ceiling, and the renderer reports that
- * when publication exceeds it rather than failing silently.
+ * It is a declared limit of the generator, not of the renderer: per-point
+ * textures are layered, so the renderer addresses at least 2^34 points.
  *
  * Memory, not the texture, is what a request near this ceiling actually meets
- * first. The two source arrays scale as 16 bytes per point — Float32 XYZ plus
- * Uint8 RGBA — so 50,000,000 points is 800 MB, and 250,000,000 is 4 GB, before
+ * first. The two source arrays scale as at most 16 bytes per point — Float32
+ * positions (4 bytes per embedding axis, 12 for a 3-D pattern) plus Uint8
+ * RGBA — so 50,000,000 3-D points is 800 MB, and 250,000,000 is 4 GB, before
  * the state's per-point arrays or any GPU copy. A request that cannot be
  * allocated therefore fails as an allocation error, which is the honest outcome:
  * the ceiling that binds on a given machine is its memory, and clamping the
@@ -162,12 +157,18 @@ export function assertGenerationResponse(response, expectedCount) {
     throw new TypeError('Generation response must publish ok === true.');
   }
   assertSyntheticCount(expectedCount);
+  if (![1, 2, 3].includes(response.dimensionLevel)) {
+    throw new TypeError(
+      'Generation response dimension level must be exactly 1, 2, or 3.'
+    );
+  }
+  // Positions carry exactly dimensionLevel components per point.
   if (
     !(response.positions instanceof Float32Array) ||
-    response.positions.length !== expectedCount * 3
+    response.positions.length !== expectedCount * response.dimensionLevel
   ) {
     throw new TypeError(
-      `Generation response must carry ${expectedCount * 3} Float32 position ` +
+      `Generation response must carry ${expectedCount * response.dimensionLevel} Float32 position ` +
       'components.'
     );
   }
@@ -178,11 +179,6 @@ export function assertGenerationResponse(response, expectedCount) {
     throw new TypeError(
       `Generation response must carry ${expectedCount * 4} Uint8 colour ` +
       'components.'
-    );
-  }
-  if (![1, 2, 3].includes(response.dimensionLevel)) {
-    throw new TypeError(
-      'Generation response dimension level must be exactly 1, 2, or 3.'
     );
   }
   if (

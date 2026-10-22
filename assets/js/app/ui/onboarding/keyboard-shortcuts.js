@@ -9,7 +9,7 @@ let shortcutsCallbacks = {
   onResetCamera: null,
   onToggleFullscreen: null,
   onToggleSidebar: null,
-  onSetDimension: null,
+  onCycleRepresentation: null,
   onShowHelp: null,
   onClearHighlights: null,
   onSetNavigationMode: null
@@ -60,15 +60,15 @@ function handleGlobalKeyDown(e) {
       break;
     case '1':
       e.preventDefault();
-      if (shortcutsCallbacks.onSetDimension) shortcutsCallbacks.onSetDimension(1);
+      if (shortcutsCallbacks.onCycleRepresentation) shortcutsCallbacks.onCycleRepresentation(1);
       break;
     case '2':
       e.preventDefault();
-      if (shortcutsCallbacks.onSetDimension) shortcutsCallbacks.onSetDimension(2);
+      if (shortcutsCallbacks.onCycleRepresentation) shortcutsCallbacks.onCycleRepresentation(2);
       break;
     case '3':
       e.preventDefault();
-      if (shortcutsCallbacks.onSetDimension) shortcutsCallbacks.onSetDimension(3);
+      if (shortcutsCallbacks.onCycleRepresentation) shortcutsCallbacks.onCycleRepresentation(3);
       break;
     case '?':
       e.preventDefault();

@@ -3,8 +3,11 @@ import test from 'node:test';
 
 import {
   canvasToBlob,
-  downloadBlob,
 } from '../assets/js/app/ui/modules/figure-export/utils/export-helpers.js';
+import {
+  OBJECT_URL_RELEASE_DELAY_MS,
+  downloadBlob,
+} from '../assets/js/app/utils/download.js';
 
 test('canvas encoding aborts promptly and ignores its late native callback', async () => {
   let nativeCallback = null;
@@ -91,7 +94,8 @@ test('download abort between append and click cleans every staged browser owner'
   ]);
 });
 
-test('abort triggered by the download click cannot roll back the committed file', () => {
+test('abort triggered by the download click cannot roll back the committed file', t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
   const controller = new AbortController();
   const reason = new DOMException('teardown during click', 'AbortError');
   const calls = [];
@@ -148,6 +152,20 @@ test('abort triggered by the download click cannot roll back the committed file'
 
   assert.equal(controller.signal.aborted, true);
   assert.equal(controller.signal.reason, reason);
+  // A clicked download keeps its Object URL alive past the click's task:
+  // Firefox and WebKit read it after click() returns.
+  assert.deepEqual(calls, ['create-url', 'append', 'click', 'remove']);
+  URL.revokeObjectURL = (url) => {
+    assert.equal(url, 'blob:committed-fixture');
+    calls.push('revoke-url');
+  };
+  try {
+    t.mock.timers.tick(OBJECT_URL_RELEASE_DELAY_MS - 1);
+    assert.equal(calls.includes('revoke-url'), false);
+    t.mock.timers.tick(1);
+  } finally {
+    URL.revokeObjectURL = originalRevokeObjectURL;
+  }
   assert.deepEqual(calls, [
     'create-url',
     'append',
@@ -155,4 +173,19 @@ test('abort triggered by the download click cannot roll back the committed file'
     'remove',
     'revoke-url',
   ]);
+});
+
+test('every browser download goes through the one shared helper', async () => {
+  const { readFile, readdir } = await import('node:fs/promises');
+  const root = new URL('../assets/js/', import.meta.url);
+  const entries = await readdir(root, { recursive: true });
+  const owners = [];
+  for (const entry of entries.filter(name => name.endsWith('.js')).sort()) {
+    const source = await readFile(new URL(entry, root), 'utf8');
+    if (/\.download\s*=|setAttribute\(['"]download['"]/.test(source)) {
+      // `readdir` reports Windows paths with backslashes.
+      owners.push(entry.replaceAll('\\', '/'));
+    }
+  }
+  assert.deepEqual(owners, ['app/utils/download.js']);
 });

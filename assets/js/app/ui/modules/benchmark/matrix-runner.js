@@ -15,8 +15,8 @@
  * The view-count axis respects the viewer's own mechanics rather than fighting
  * them. Setting the layout to `grid` alone changes nothing: the viewer stays on
  * its single-viewport path until at least two views are published, and a view
- * beyond the live one exists only once a snapshot is created. Snapshots are
- * capped at three, so four views is the ceiling of this axis, not a choice.
+ * beyond the live one exists only once a snapshot is created. Any number of
+ * views can be published.
  * Snapshots are published through the application's own keep-view control so
  * the renderer, the data state and the dimension owner stay in agreement.
  *
@@ -34,24 +34,23 @@ import {
 } from './camera-path.js';
 import { FrameRecorder } from './frame-recorder.js';
 
-/**
- * Views this harness can drive: the live view plus the viewer's three-snapshot
- * ceiling. Mirrors `MAX_SNAPSHOTS` in the viewer; raising it there without
- * raising it here understates the axis rather than breaking.
- */
-export const MAX_BENCHMARK_VIEWS = 4;
-
 /** The live view's exact identifier. */
 export const LIVE_VIEW_ID = 'live';
 
 const DEFAULT_WARMUP_FRAMES = 120;
 const DEFAULT_MEASURE_FRAMES = 2400;
 const DEFAULT_SETTLE_FRAMES = 12;
+// Frames a configuration may wait for the trees its views now need to land
+// and be adopted: a tree with levels for a ten-million-cell view builds in
+// seconds in the worker, and a minute of frames at 60 Hz (longer on a slower
+// renderer) holds that with room. A build that never lands is reported.
+const GEOMETRY_SETTLE_FRAME_BUDGET = 3600;
 
 const REQUIRED_VIEWER_METHODS = Object.freeze([
   'getCameraState',
   'getCurrentLODLevel',
   'getSnapshotViews',
+  'isPresentedGeometrySettled',
   'getViewLayout',
   'setAdaptiveLOD',
   'setCameraState',
@@ -141,12 +140,6 @@ export function expandMatrix(axes) {
   }
   for (const value of viewCounts) {
     requirePositiveInteger(value, 'Matrix viewCount value');
-    if (value > MAX_BENCHMARK_VIEWS) {
-      throw new RangeError(
-        `Matrix viewCount value ${value} exceeds the viewer ceiling of ` +
-        `${MAX_BENCHMARK_VIEWS} views.`
-      );
-    }
   }
   for (const value of forceLodLevels) {
     if (!Number.isInteger(value) || value < -1) {
@@ -243,17 +236,11 @@ export function createBenchmarkMatrixRunner(options = {}) {
    * Bring the published view count to exactly `target` using the application's
    * own controls, then assert the viewer agrees.
    *
-   * @param {number} target - Desired view count, 1..MAX_BENCHMARK_VIEWS.
+   * @param {number} target - Desired view count, 1 or more.
    * @returns {Promise<Object>} Achieved layout description.
    */
   async function ensureViewCount(target) {
     requirePositiveInteger(target, 'Benchmark view count');
-    if (target > MAX_BENCHMARK_VIEWS) {
-      throw new RangeError(
-        `Benchmark view count ${target} exceeds the viewer ceiling of ` +
-        `${MAX_BENCHMARK_VIEWS}.`
-      );
-    }
     const keepViewButton = requireElement(
       ownerDocument,
       'split-keep-view-btn',
@@ -516,6 +503,18 @@ export function createBenchmarkMatrixRunner(options = {}) {
     viewer.setAdaptiveLOD(configuration.lod);
     viewer.setFrustumCulling(configuration.frustumCulling);
     viewer.setForceLOD(configuration.forceLodLevel);
+    // The first frame after a toggle asks for the trees the views now need.
+    // One built off the main thread lands in a later frame, and the store it
+    // serves then adopts its draw order on the GPU: uploads and error reads
+    // that belong to the transition, not to the configuration. On a slow
+    // host that landing fell inside the window's first frames. The window
+    // starts once every presented view draws from its final geometry.
+    await waitForFrames(1);
+    await waitUntil(
+      () => viewer.isPresentedGeometrySettled(),
+      'every presented view to draw from its final geometry',
+      GEOMETRY_SETTLE_FRAME_BUDGET
+    );
     await waitForFrames(DEFAULT_SETTLE_FRAMES);
     return layout;
   }
@@ -559,6 +558,14 @@ export function createBenchmarkMatrixRunner(options = {}) {
    */
   async function runMatrix(matrixOptions = {}) {
     const configurations = expandMatrix(matrixOptions.axes ?? {});
+    // Fit the path once, to the camera the sweep starts from. Each window
+    // leaves the camera wherever its path ended, so a path fitted per cell
+    // would anchor every cell on the previous cell's last pose and the cells
+    // would be measured at compounding, incomparable camera distances.
+    const path =
+      matrixOptions.path ??
+      createPathFromCurrentCamera(matrixOptions.pathOptions);
+    const cellOptions = { ...matrixOptions, path };
     const results = [];
     for (const configuration of configurations) {
       if (typeof matrixOptions.onProgress === 'function') {
@@ -568,7 +575,7 @@ export function createBenchmarkMatrixRunner(options = {}) {
           configuration
         });
       }
-      results.push(await runConfiguration(configuration, matrixOptions));
+      results.push(await runConfiguration(configuration, cellOptions));
     }
     return results;
   }

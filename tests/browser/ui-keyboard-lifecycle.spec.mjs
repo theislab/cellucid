@@ -1,9 +1,21 @@
 import { expect, test } from './helpers/test.mjs';
 import { ENCODED_EXPORTS_BASE_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
+import { openCollapsedPanels } from './helpers/panels.mjs';
+import {
+  ORCID_REQUEST_TIMEOUT_MS,
+  ORCID_SEARCH_DEBOUNCE_MS,
+  ORCID_SUGGESTION_HIDE_DELAY_MS,
+} from '../../assets/js/app/ui/modules/community-annotation/identity-profile-modal.js';
 
 const PREPARED_DATASET_URL =
   `/?exportsBaseUrl=${ENCODED_EXPORTS_BASE_URL}&dataset=current-ui-prepared&acceptance=ui-keyboard-lifecycle-ci`;
+
+// The ORCID timeout contract swaps the product's request deadline for this one
+// and blurs the combobox this long after the debounce would fire. The lead is
+// shorter than the shortened deadline, so the blur is always due first.
+const SHORTENED_ORCID_TIMEOUT_MS = 80;
+const TIMEOUT_BLUR_LEAD_MS = 20;
 
 function observeProductErrors(page) {
   const errors = [];
@@ -23,12 +35,35 @@ function observeProductErrors(page) {
   return errors;
 }
 
+/**
+ * Resolve once every page timer armed before this call with a delay of at most
+ * `delayMs` has run, together with the microtasks it queued.
+ *
+ * Engines run timers in deadline order, and a timer armed now with the same
+ * delay has a later deadline than any armed earlier, so this cannot return
+ * before the product's own debounce, hide, or timeout callback however late a
+ * loaded runner fires them. A wall-clock sleep of "the delay plus a margin"
+ * can: it measures the test's clock, not the page's timer queue.
+ */
+async function outlastPageTimers(page, delayMs) {
+  await page.evaluate(
+    milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds)),
+    delayMs
+  );
+}
+
+/** Let the page run one macrotask, draining every microtask queued before it. */
+async function yieldPageTask(page) {
+  await outlastPageTimers(page, 0);
+}
+
 test('highlight pages provide complete roving-tab keyboard workflows', async ({
   page
 }) => {
   const productErrors = observeProductErrors(page);
   await page.goto(PREPARED_DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
+  await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
     'Current UI prepared fixture'
   );
@@ -116,6 +151,7 @@ test('analysis modal owns focus and releases every active pointer interaction on
   const productErrors = observeProductErrors(page);
   await page.goto(PREPARED_DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
+  await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
     'Current UI prepared fixture'
   );
@@ -286,6 +322,7 @@ test('community profile modal owns focus, requests, timers, and global listeners
   });
   await page.goto(PREPARED_DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
+  await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
     'Current UI prepared fixture'
   );
@@ -302,7 +339,7 @@ test('community profile modal owns focus, requests, timers, and global listeners
     .getByRole('button', { name: 'Edit', exact: true });
   await expect(editProfile).toBeEnabled();
 
-  await page.evaluate(() => {
+  await page.evaluate(({ hideDelayMs, requestTimeoutMs }) => {
     const nativeAddEventListener = window.addEventListener;
     const nativeRemoveEventListener = window.removeEventListener;
     const nativeSetTimeout = window.setTimeout;
@@ -356,7 +393,10 @@ test('community profile modal owns focus, requests, timers, and global listeners
         return callback(...callbackArgs);
       };
       timerId = nativeSetTimeout.call(this, wrapped, delay, ...args);
-      if (probe.capture && (delay === 150 || delay === 6500)) {
+      if (
+        probe.capture &&
+        (delay === hideDelayMs || delay === requestTimeoutMs)
+      ) {
         timers.set(timerId, delay);
       }
       return timerId;
@@ -385,6 +425,9 @@ test('community profile modal owns focus, requests, timers, and global listeners
       });
     };
     window.__cellucidProfileModalProbe = probe;
+  }, {
+    hideDelayMs: ORCID_SUGGESTION_HIDE_DELAY_MS,
+    requestTimeoutMs: ORCID_REQUEST_TIMEOUT_MS,
   });
 
   for (const exit of ['close', 'cancel', 'escape', 'save']) {
@@ -441,7 +484,9 @@ test('community profile modal owns focus, requests, timers, and global listeners
     'Type a name or ORCID ID (auto-suggest)'
   );
   await orcidInput.fill('😀😀');
-  await page.waitForTimeout(350);
+  // Below the three-code-point threshold no lookup may start, not even once
+  // the debounce that a qualifying query would have armed has run out.
+  await outlastPageTimers(page, ORCID_SEARCH_DEBOUNCE_MS);
   expect(
     await page.evaluate(
       () => window.__cellucidProfileModalProbe.fetchStarts
@@ -549,6 +594,7 @@ test('ORCID combobox owns bounded superseded search and complete keyboard select
     waitUntil: 'domcontentloaded',
   });
   await dismissWelcome(page);
+  await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
     'Current UI prepared fixture'
   );
@@ -690,7 +736,7 @@ test('ORCID retry, blur, timeout, and Escape settlements stay with the focused c
   page
 }) => {
   const productErrors = observeProductErrors(page);
-  await page.addInitScript(() => {
+  await page.addInitScript(({ requestTimeoutMs, shortenedTimeoutMs }) => {
     window._simulate_repo_connected = true;
     window._author_mode = true;
     const nativeFetch = window.fetch;
@@ -714,10 +760,42 @@ test('ORCID retry, blur, timeout, and Escape settlements stay with the focused c
         headers: { 'content-type': 'application/json' },
       }
     );
+    // A late body the product either reads to its end or cancels. Either is
+    // the product's last asynchronous contact with the response; everything
+    // after it is promise continuations, so one page task later the product
+    // has published, or refused to publish, this result.
+    const observedResponse = (query, document) => {
+      const bytes = new TextEncoder().encode(JSON.stringify(document));
+      let pulls = 0;
+      const retire = () => {
+        probe.retiredBodies.push(query);
+      };
+      return new Response(
+        new ReadableStream({
+          pull(controller) {
+            pulls += 1;
+            if (pulls === 1) {
+              controller.enqueue(bytes);
+              return;
+            }
+            controller.close();
+            retire();
+          },
+          cancel() {
+            retire();
+          },
+        }, { highWaterMark: 0 }),
+        {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        }
+      );
+    };
     const probe = {
       aborts: 0,
       pending: new Map(),
       queries: [],
+      retiredBodies: [],
       retryAttempts: 0,
       shortenTimeout: false,
       settle(query, outcome) {
@@ -729,7 +807,7 @@ test('ORCID retry, blur, timeout, and Escape settlements stay with the focused c
         }
         this.pending.delete(query);
         if (outcome === 'empty') {
-          owner.resolve(response(emptyDocument));
+          owner.resolve(observedResponse(query, emptyDocument));
           return;
         }
         if (outcome === 'failure') {
@@ -745,8 +823,8 @@ test('ORCID retry, blur, timeout, and Escape settlements stay with the focused c
       ...args
     ) {
       const exactDelay =
-        probe.shortenTimeout && Number(delay) === 6500
-          ? 80
+        probe.shortenTimeout && Number(delay) === requestTimeoutMs
+          ? shortenedTimeoutMs
           : delay;
       return nativeSetTimeout.call(this, callback, exactDelay, ...args);
     };
@@ -806,11 +884,15 @@ test('ORCID retry, blur, timeout, and Escape settlements stay with the focused c
       return pendingRequest(query, options.signal);
     };
     window.__cellucidOrcidLifecycleProbe = probe;
+  }, {
+    requestTimeoutMs: ORCID_REQUEST_TIMEOUT_MS,
+    shortenedTimeoutMs: SHORTENED_ORCID_TIMEOUT_MS,
   });
   await page.goto(PREPARED_DATASET_URL, {
     waitUntil: 'domcontentloaded',
   });
   await dismissWelcome(page);
+  await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
     'Current UI prepared fixture'
   );
@@ -854,7 +936,8 @@ test('ORCID retry, blur, timeout, and Escape settlements stay with the focused c
     input.blur();
   }, 'Debounce blur query');
   await titleInput.focus();
-  await page.waitForTimeout(450);
+  // Had the blur left the debounce armed, its callback would have run by now.
+  await outlastPageTimers(page, ORCID_SEARCH_DEBOUNCE_MS);
   expect(
     await page.evaluate(
       () => window.__cellucidOrcidLifecycleProbe.queries
@@ -868,13 +951,15 @@ test('ORCID retry, blur, timeout, and Escape settlements stay with the focused c
     'No ORCID records matched the exact query.'
   );
   await titleInput.focus();
-  await page.waitForTimeout(180);
+  // A real blur: let the popup's hide affordance run out before returning.
+  await outlastPageTimers(page, ORCID_SUGGESTION_HIDE_DELAY_MS);
   await orcidInput.focus();
   await expect(status).toContainText(
     'Synthetic focused ORCID failure'
   );
   await titleInput.focus();
-  await page.waitForTimeout(180);
+  // A real blur: let the popup's hide affordance run out before returning.
+  await outlastPageTimers(page, ORCID_SUGGESTION_HIDE_DELAY_MS);
   await orcidInput.focus();
   await expect(listbox.getByRole('option')).toHaveCount(1);
   await expect(listbox).toBeVisible();
@@ -906,7 +991,12 @@ test('ORCID retry, blur, timeout, and Escape settlements stay with the focused c
       'empty'
     );
   });
-  await page.waitForTimeout(250);
+  await expect.poll(
+    () => page.evaluate(
+      () => window.__cellucidOrcidLifecycleProbe.retiredBodies
+    )
+  ).toContain('Deferred no-result query');
+  await yieldPageTask(page);
   await expect(status).not.toContainText(
     'No ORCID records matched the exact query.'
   );
@@ -927,41 +1017,46 @@ test('ORCID retry, blur, timeout, and Escape settlements stay with the focused c
       () => window.__cellucidOrcidLifecycleProbe.aborts
     )
   ).toBe(abortsBeforeDeferredFailure + 1);
-  await page.evaluate(() => {
+  // A rejected transport settles through promise continuations alone, so the
+  // task that follows the rejection observes the product's final decision.
+  await page.evaluate(async () => {
     window.__cellucidOrcidLifecycleProbe.settle(
       'Deferred failure query',
       'failure'
     );
+    await new Promise(resolve => setTimeout(resolve, 0));
   });
-  await page.waitForTimeout(250);
   await expect(status).not.toContainText(
     'Synthetic unfocused ORCID failure'
   );
   await expect(listbox).not.toBeVisible();
 
-  await page.evaluate(() => {
+  await page.evaluate(blurAfterMs => {
     const probe = window.__cellucidOrcidLifecycleProbe;
     probe.shortenTimeout = true;
     const dialogOwner = document.querySelector(
       '.community-annotation-modal-overlay'
     );
-    const orcid = dialogOwner.querySelector(
-      'input[aria-label="ORCID"]'
-    );
-    const title = dialogOwner.querySelector(
-      'input[aria-label="Affiliation / role"]'
-    );
+    // Each field is named by its visible <label for>.
+    const fieldLabelled = text => [...dialogOwner.querySelectorAll('label')]
+      .find(label => label.textContent.trim() === text).control;
+    const orcid = fieldLabelled('ORCID');
+    const title = fieldLabelled('Affiliation / role');
     orcid.focus();
     orcid.value = 'Deferred timeout query';
     orcid.dispatchEvent(new Event('input', { bubbles: true }));
-    setTimeout(() => title.focus(), 270);
-  });
+    // Deadline order makes this deterministic on any runner: the debounce
+    // fires first and arms the shortened request timeout, and this blur is
+    // due before that timeout can be.
+    setTimeout(() => title.focus(), blurAfterMs);
+  }, ORCID_SEARCH_DEBOUNCE_MS + TIMEOUT_BLUR_LEAD_MS);
   await expect.poll(
     () => page.evaluate(
       () => window.__cellucidOrcidLifecycleProbe.queries.at(-1)
     )
   ).toBe('Deferred timeout query');
-  await page.waitForTimeout(350);
+  // The request is in flight, so its shortened timeout is armed; outlast it.
+  await outlastPageTimers(page, SHORTENED_ORCID_TIMEOUT_MS);
   await expect(status).not.toContainText(
     'ORCID request timed out'
   );
@@ -1004,6 +1099,7 @@ test('community profile modal cannot outlive its controls owner', async ({
   });
   await page.goto(PREPARED_DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
+  await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
     'Current UI prepared fixture'
   );
@@ -1109,6 +1205,7 @@ test('pending community profile launch cannot cross controls teardown', async ({
   });
   await page.goto(PREPARED_DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
+  await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
     'Current UI prepared fixture'
   );
@@ -1191,6 +1288,7 @@ test('community profile publication survives reentrant focus lifecycle changes',
   });
   await page.goto(PREPARED_DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
+  await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
     'Current UI prepared fixture'
   );
@@ -1320,6 +1418,7 @@ test('community profile Save surfaces teardown failure after exact cleanup', asy
   });
   await page.goto(PREPARED_DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
+  await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
     'Current UI prepared fixture'
   );
@@ -1394,6 +1493,7 @@ test('community voting closes and aborts its pending field load at an exact cont
   });
   await page.goto(PREPARED_DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
+  await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
     'Current UI prepared fixture'
   );
@@ -1511,6 +1611,7 @@ test('community annotation legend and settings expose complete keyboard identiti
   });
   await page.goto(PREPARED_DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
+  await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
     'Current UI prepared fixture'
   );
@@ -1536,37 +1637,38 @@ test('community annotation legend and settings expose complete keyboard identiti
     }
     element.open = true;
   });
-  const manage = section.locator('.analysis-accordion-item').filter({
-    hasText: 'MANAGE ANNOTATION'
+  const manage = section.locator('.disclosure').filter({
+    has: page.locator('.disclosure-title', { hasText: /^Annotated columns$/i })
   });
   await manage
-    .getByRole('button', { name: /^MANAGE ANNOTATION/ })
+    .getByRole('button', { name: /^annotated columns/i })
     .click();
-  const fieldSelect = manage.locator('.field-select > select.obs-select');
+  const fieldSelect = manage.locator('.control-block > select.obs-select').first();
   await expect(fieldSelect).toHaveAccessibleName('Categorical obs');
   await fieldSelect.selectOption({ label: 'cell_type' });
   await manage.getByRole('button', { name: 'Add', exact: true }).click();
   expect(await readGlErrorAfterFrames()).toBe(0);
 
   const annotationSettings = manage.locator(
-    '.community-annotation-settings.relative'
+    '.community-annotation-annotatable-settings'
   );
   await expect(annotationSettings).toBeVisible();
+  await expect(annotationSettings).toHaveAttribute('role', 'group');
   await expect(
     annotationSettings.locator('input[type="range"]')
-  ).toHaveAccessibleName('Annotatable consensus threshold');
+  ).toHaveAccessibleName('Threshold');
   await expect(
     annotationSettings.locator('input[type="number"]')
-  ).toHaveAccessibleName('Annotatable min annotators');
+  ).toHaveAccessibleName('Min annotators');
 
-  const derived = section.locator('.analysis-accordion-item').filter({
-    hasText: 'DERIVED CONSENSUS COLUMN'
+  const derived = section.locator('.disclosure').filter({
+    has: page.locator('.disclosure-title', { hasText: /^Consensus column$/i })
   });
   await derived
-    .getByRole('button', { name: /^DERIVED CONSENSUS COLUMN/ })
+    .getByRole('button', { name: /^consensus column/i })
     .click();
   await expect(
-    derived.locator('.field-select.relative > select.obs-select')
+    derived.locator('.control-block > select.obs-select').first()
   ).toHaveAccessibleName('Annotatable column');
   await expect(
     derived.locator('input[type="text"]')
@@ -1621,7 +1723,7 @@ test('community annotation legend and settings expose complete keyboard identiti
     );
   });
   await expect(page.locator('#filter-count')).toHaveText(
-    'Showing 1 of 120 points'
+    'Showing 1 of 120 cells'
   );
   await expect(alphaRow).toHaveClass(/legend-item-disabled/);
   await expect(alphaRow.locator('.legend-vote-trigger')).toHaveCount(0);
@@ -1653,7 +1755,7 @@ test('community annotation legend and settings expose complete keyboard identiti
     state.resetContinuousFilter(scoreIndex);
   });
   await expect(page.locator('#filter-count')).toHaveText(
-    'Showing all 120 points'
+    'Showing all 120 cells'
   );
   await expect(alphaRow).not.toHaveClass(/legend-item-disabled/);
   await expect(
@@ -1748,6 +1850,7 @@ test('community annotation GitHub sync controls expose exact accessible identiti
   });
   await page.goto(PREPARED_DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
+  await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
     'Current UI prepared fixture'
   );
@@ -1783,13 +1886,17 @@ test('welcome modal owns focus, contains Tab, and returns it on close', async ({
 
   const modal = page.locator('#welcome-modal');
   const exploreButton = page.locator('#welcome-demo-btn');
-  const learnMore = modal.getByRole('link', { name: /Learn More/ });
+  const learnMore = modal.getByRole('link', { name: /Learn more/ });
   const canvas = page.locator('#glcanvas');
 
   // The modal is `aria-modal="true"`, so focus must enter it and stay inside.
+  // It lands on the dialog itself, so no choice opens looking pre-selected.
   await expect(modal).toBeVisible();
-  await expect(exploreButton).toBeFocused();
+  await expect(modal).toBeFocused();
+  await expect(exploreButton).not.toBeFocused();
 
+  await page.keyboard.press('Tab');
+  await expect(exploreButton).toBeFocused();
   await page.keyboard.press('Tab');
   await expect(learnMore).toBeFocused();
   await page.keyboard.press('Tab');
@@ -1811,6 +1918,7 @@ test('welcome modal owns focus, contains Tab, and returns it on close', async ({
   );
 
   // Reopened from a real invoker, closing must hand focus back to it.
+  await openCollapsedPanels(page);
   const resetCamera = page.locator('#reset-camera-btn');
   await resetCamera.focus();
   await page.evaluate(async () => {
@@ -1822,13 +1930,14 @@ test('welcome modal owns focus, contains Tab, and returns it on close', async ({
     }
   });
   await expect(modal).toBeVisible();
-  await expect(exploreButton).toBeFocused();
+  await expect(modal).toBeFocused();
   await page.keyboard.press('Escape');
   await expect(modal).toBeHidden();
   await expect(resetCamera).toBeFocused();
 
   // The explore action owns focus after it closes the modal, and the restored
-  // return target must not steal it back.
+  // return target must not steal it back. It leads to the Session panel; the
+  // Sample dataset dropdown is never activated for the user.
   await page.evaluate(async () => {
     const { showWelcomeModal } = await import(
       '/assets/js/app/ui/onboarding/welcome-modal.js'
@@ -1837,10 +1946,13 @@ test('welcome modal owns focus, contains Tab, and returns it on close', async ({
       throw new Error('Welcome modal did not reopen');
     }
   });
-  await expect(exploreButton).toBeFocused();
-  await exploreButton.click();
+  await expect(modal).toBeFocused();
+  // From the keyboard, focus lands on the Session panel heading.
+  await exploreButton.focus();
+  await page.keyboard.press('Enter');
   await expect(modal).toBeHidden();
-  await expect(page.locator('#dataset-select')).toBeFocused();
+  await expect(page.locator('#session-section > summary')).toBeFocused();
+  await expect(page.locator('#dataset-select')).not.toBeFocused();
 
   expect(productErrors).toEqual([]);
 });
@@ -1851,6 +1963,7 @@ test('licence modal owns focus, contains Tab, and returns it to its link', async
   const productErrors = observeProductErrors(page);
   await page.goto(PREPARED_DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
+  await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
     'Current UI prepared fixture'
   );

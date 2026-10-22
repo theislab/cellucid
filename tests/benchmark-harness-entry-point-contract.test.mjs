@@ -101,7 +101,7 @@ test('opening the benchmark panel publishes the harness module', () => {
     'the harness global must be published before the owner caches readiness'
   );
 
-  // The Performance Benchmark panel is what triggers the lazy load, so the
+  // The Benchmark panel is what triggers the lazy load, so the
   // entry point is only reachable while that panel exists.
   assert.match(indexHtml, /\bid="benchmark-section"/);
   const panelSynchronization = functionBody(

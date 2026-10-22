@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
+import { isContextLostError } from '../assets/js/rendering/gl-errors.js';
 import {
-  generateCloudNoiseTexturesGPU,
   startCloudNoiseGenerationGPU,
 } from '../assets/js/rendering/smoke-cloud/gpu-noise-generator.js';
 
@@ -61,6 +61,10 @@ function createNoiseGl() {
   let parallelCompilePollsPerProgram = 0;
   const parallelCompileChecks = new Map();
   let linkStatusChecks = 0;
+  // How many status polls a fence stays unsignaled: the GPU's lag behind the
+  // submitted batch, in scheduling turns.
+  let gpuLagPolls = 0;
+  const fences = new Map();
 
   const capabilities = new Map();
   const shaders = new Set();
@@ -114,8 +118,11 @@ function createNoiseGl() {
     SAMPLE_ALPHA_TO_COVERAGE: 0x809E,
     SAMPLE_COVERAGE: 0x80A0,
     SCISSOR_TEST: 0x0C11,
+    SIGNALED: 0x9119,
     STATIC_DRAW: 0x88E4,
     STENCIL_TEST: 0x0B90,
+    SYNC_GPU_COMMANDS_COMPLETE: 0x9117,
+    SYNC_STATUS: 0x9114,
     TEXTURE_2D: 0x0DE1,
     TEXTURE_3D: 0x806F,
     TEXTURE_BINDING_2D: 0x8069,
@@ -129,6 +136,7 @@ function createNoiseGl() {
     UNSIGNED_BYTE: 0x1401,
     VERTEX_ARRAY_BINDING: 0x85B5,
     VERTEX_SHADER: 0x8B31,
+    UNSIGNALED: 0x9118,
     VIEWPORT: 0x0BA2,
 
     activeTexture(value) {
@@ -245,6 +253,28 @@ function createNoiseGl() {
     },
     disable(capability) {
       capabilities.set(capability, false);
+    },
+    deleteSync(fence) {
+      assert.ok(fences.has(fence), 'only a live fence is deleted');
+      fences.delete(fence);
+    },
+    fenceSync(condition, flags) {
+      assert.equal(condition, gl.SYNC_GPU_COMMANDS_COMPLETE);
+      assert.equal(flags, 0);
+      const fence = { fence: nextId++ };
+      fences.set(fence, gpuLagPolls);
+      return fence;
+    },
+    flush() {},
+    getSyncParameter(fence, parameter) {
+      assert.equal(parameter, gl.SYNC_STATUS);
+      const remaining = fences.get(fence);
+      assert.notEqual(remaining, undefined, 'only a live fence is polled');
+      if (remaining > 0) {
+        fences.set(fence, remaining - 1);
+        return gl.UNSIGNALED;
+      }
+      return gl.SIGNALED;
     },
     drawArrays() {
       const attachment = framebufferAttachments.get(drawFramebuffer) ?? null;
@@ -390,6 +420,9 @@ function createNoiseGl() {
     _setInjectDrawError() {
       injectDrawError = true;
     },
+    _setGpuLagPolls(count) {
+      gpuLagPolls = count;
+    },
     _setParallelCompilePollsPerProgram(count) {
       parallelCompilePollsPerProgram = count;
     },
@@ -398,6 +431,7 @@ function createNoiseGl() {
       buffers,
       deletions,
       draws,
+      fences,
       framebuffers,
       mipmaps,
       get linkStatusChecks() {
@@ -505,11 +539,129 @@ test('GPU noise transaction yields before allocation and restores exact state pe
   assert.equal(gl._state.textures.size, 0);
 });
 
-test('GPU noise transaction scales the slice cap by submitted pixel work at 256 cubed', async () => {
+test('GPU noise transaction submits no slice batch while the GPU is still behind, and shrinks its batches', async () => {
+  const gl = createNoiseGl();
+  // Every batch takes the GPU three scheduling turns to finish.
+  gl._setGpuLagPolls(3);
+  const scheduler = createManualScheduler();
+  const transaction = startCloudNoiseGenerationGPU(gl, 32, 32, {
+    maxSlicesPerBatch: 8,
+    now: () => 0,
+    schedule: scheduler.schedule,
+  });
+  let outstandingSubmissions = 0;
+  while (transaction.running) {
+    const fencesBefore = [...gl._state.fences.keys()];
+    const drawsBefore = gl._state.draws.length;
+    assert.equal(scheduler.runNext(), true);
+    // A fence that was outstanding and still is: the turn must not draw.
+    const stillBehind = fencesBefore.some(fence => gl._state.fences.has(fence));
+    if (stillBehind && gl._state.draws.length !== drawsBefore) outstandingSubmissions++;
+  }
+  assert.equal(await transaction.completion, transaction);
+  assert.equal(outstandingSubmissions, 0, 'no batch is drawn behind an unfinished one');
+  assert.ok(
+    transaction.getTaskTimings().some(timing => timing.waitedForGpu),
+    'turns spent waiting on the GPU are recorded as such',
+  );
+  assert.equal(gl._state.fences.size, 0, 'every batch fence is deleted');
+
+  const shapeBatches = transaction.getTaskTimings()
+    .filter(timing => timing.phase === 'shape-slices' && !timing.waitedForGpu)
+    .map(timing => timing.sliceEnd - timing.sliceStart);
+  assert.equal(shapeBatches[0], 8, 'the first batch uses the full cap');
+  assert.equal(
+    shapeBatches.slice(-3).every(slices => slices === 1),
+    true,
+    `a GPU that never keeps up drives the batches down to one slice (${shapeBatches})`,
+  );
+  // Every slice is still drawn exactly once, in order.
+  const shapeDraws = gl._state.draws.filter(draw => draw.program === 1);
+  assert.deepEqual(shapeDraws.map(draw => draw.layer), [...Array(32).keys()]);
+  transaction.dispose();
+});
+
+test('GPU noise transaction keeps its batches when the GPU is one turn behind', async () => {
+  // A renderer whose frames are slow finishes a batch by the turn after the
+  // one that polled it: the fence is a turn late whatever the batch size, so
+  // a smaller batch would only add turns. On a software renderer at a frame
+  // every few seconds, halving on that first miss drove every batch to one
+  // slice and each slice to two turns: minutes for a 32-cubed volume.
+  const gl = createNoiseGl();
+  gl._setGpuLagPolls(1);
+  const scheduler = createManualScheduler();
+  const transaction = startCloudNoiseGenerationGPU(gl, 32, 32, {
+    maxSlicesPerBatch: 16,
+    now: () => 0,
+    schedule: scheduler.schedule,
+  });
+  let turns = 0;
+  while (transaction.running) {
+    assert.equal(scheduler.runNext(), true);
+    turns++;
+  }
+  assert.equal(await transaction.completion, transaction);
+  for (const phase of ['shape-slices', 'detail-slices']) {
+    const batches = transaction.getTaskTimings()
+      .filter(timing => timing.phase === phase && !timing.waitedForGpu)
+      .map(timing => timing.sliceEnd - timing.sliceStart);
+    assert.deepEqual(batches, [16, 16], `${phase} batches (${batches}) in ${turns} turns`);
+  }
+  transaction.dispose();
+});
+
+test('GPU noise transaction grows its batches back when the GPU keeps up', async () => {
+  const gl = createNoiseGl();
+  gl._setGpuLagPolls(2);
+  const scheduler = createManualScheduler();
+  const transaction = startCloudNoiseGenerationGPU(gl, 64, 32, {
+    maxSlicesPerBatch: 8,
+    now: () => 0,
+    schedule: scheduler.schedule,
+  });
+  // Slow through the first shape batches, then the GPU catches up.
+  let turns = 0;
+  while (transaction.running) {
+    assert.equal(scheduler.runNext(), true);
+    turns++;
+    if (turns === 12) gl._setGpuLagPolls(0);
+  }
+  assert.equal(await transaction.completion, transaction);
+  const shapeBatches = transaction.getTaskTimings()
+    .filter(timing => timing.phase === 'shape-slices' && !timing.waitedForGpu)
+    .map(timing => timing.sliceEnd - timing.sliceStart);
+  assert.ok(Math.min(...shapeBatches) < 8, `the batches shrank (${shapeBatches})`);
+  assert.equal(shapeBatches.at(-2), 8, `and grew back to the cap (${shapeBatches})`);
+  transaction.dispose();
+});
+
+test('cancelling GPU noise generation with a batch still on the GPU deletes its fence', async () => {
+  const gl = createNoiseGl();
+  gl._setGpuLagPolls(1000);
+  const scheduler = createManualScheduler();
+  const transaction = startCloudNoiseGenerationGPU(gl, 32, 32, {
+    maxSlicesPerBatch: 4,
+    now: () => 0,
+    schedule: scheduler.schedule,
+  });
+  while (gl._state.fences.size === 0) {
+    assert.equal(scheduler.runNext(), true);
+  }
+  const drawsAtFence = gl._state.draws.length;
+  for (let turn = 0; turn < 5; turn++) assert.equal(scheduler.runNext(), true);
+  assert.equal(gl._state.draws.length, drawsAtFence, 'waiting on the GPU draws nothing');
+  transaction.cancel();
+  await assert.rejects(transaction.completion);
+  assert.equal(gl._state.fences.size, 0);
+  assert.equal(transaction.cleanupComplete, true);
+  assert.equal(scheduler.pending, 0);
+});
+
+test('GPU noise transaction scales the slice cap by submitted pixel work at 128 cubed', async () => {
   const gl = createNoiseGl();
   const scheduler = createManualScheduler();
-  const transaction = startCloudNoiseGenerationGPU(gl, 256, 256, {
-    maxSlicesPerBatch: 16,
+  const transaction = startCloudNoiseGenerationGPU(gl, 128, 128, {
+    maxSlicesPerBatch: 32,
     now: () => 0,
     schedule: scheduler.schedule,
   });
@@ -523,10 +675,10 @@ test('GPU noise transaction scales the slice cap by submitted pixel work at 256 
     Math.max(...sliceTimings.map(
       timing => timing.sliceEnd - timing.sliceStart
     )),
-    4,
+    16,
   );
-  assert.equal(gl._state.draws.filter(draw => draw.program === 1).length, 256);
-  assert.equal(gl._state.draws.filter(draw => draw.program === 2).length, 256);
+  assert.equal(gl._state.draws.filter(draw => draw.program === 1).length, 128);
+  assert.equal(gl._state.draws.filter(draw => draw.program === 2).length, 128);
   transaction.cancel();
   assert.equal(transaction.cleanupComplete, true);
 });
@@ -543,18 +695,19 @@ test('GPU noise transaction polls parallel compilation without blocking on link 
   await transaction.completion;
   assert.equal(gl._state.parallelCompilePolls, 9);
   assert.equal(gl._state.linkStatusChecks, 3);
-  for (const phase of [
-    'shape-program-await',
-    'detail-program-await',
-    'blueNoise-program-await',
-  ]) {
-    assert.equal(
-      transaction.getTaskTimings().filter(
-        timing => timing.phase === phase
-      ).length,
-      3,
-    );
-  }
+  // A program still compiling ends the turn, so no turn polls one twice. The
+  // first poll shares the turn that created the program (creating one is
+  // cheap), and the other two each begin a turn of their own.
+  assert.deepEqual(
+    [
+      'shape-program-await',
+      'detail-program-await',
+      'blueNoise-program-await',
+    ].map(phase => transaction.getTaskTimings().filter(
+      timing => timing.phase === phase
+    ).length),
+    [2, 2, 2],
+  );
   transaction.cancel();
 });
 
@@ -605,6 +758,9 @@ test('GPU noise cancellation is synchronous, retry-owned, and settles once', asy
 
 test('GPU noise cancellation retains and retries a partially linked builder', async () => {
   const gl = createNoiseGl();
+  // The shape program is still compiling, so the transaction stops there with
+  // one program built; a turn otherwise runs straight past program creation.
+  gl._setParallelCompilePollsPerProgram(2);
   const scheduler = createManualScheduler();
   const transaction = startCloudNoiseGenerationGPU(gl, 32, 32, {
     now: () => 0,
@@ -712,7 +868,7 @@ test('GPU noise failure after context loss invalidates without issuing GL delete
   gl._setContextLost(true);
   assert.equal(scheduler.runNext(), true);
   const error = await settlement;
-  assert.match(error.message, /context loss/i);
+  assert.equal(isContextLostError(error), true);
   assert.equal(transaction.cleanupComplete, true);
   assert.equal(transaction.settled, true);
   assert.equal(gl._state.deletions.length, deletionCount);
@@ -732,9 +888,15 @@ test('GPU noise draw failure restores caller state and rolls back all live owner
   }
   const callerState = gl._captureState();
   gl._setInjectDrawError();
-  assert.equal(scheduler.runNext(), true);
+  // Slice batches defer their error check to the texture's finalization, so
+  // the failure is reported there, before anything is finalized or published.
+  while (transaction.running) {
+    assert.equal(scheduler.runNext(), true);
+    assert.deepEqual(gl._captureState(), callerState);
+  }
   const error = await settlement;
-  assert.match(error.message, /0x502/i);
+  assert.match(error.message, /shape slice batches.*0x502/i);
+  assert.equal(gl._state.mipmaps.length, 0, 'a failed texture is never finalized');
   assert.deepEqual(gl._captureState(), callerState);
   assert.equal(transaction.cleanupComplete, true);
   assert.equal(gl._state.textures.size, 0);
@@ -764,29 +926,6 @@ test('GPU noise absent-extension link failure reports shader diagnostics and lea
   assert.equal(gl._state.vertexArrays.size, 0);
   assert.equal(gl._state.framebuffers.size, 0);
   assert.equal(gl._state.textures.size, 0);
-});
-
-test('async GPU noise retries retained synchronous-generator cleanup before allocating', () => {
-  const gl = createNoiseGl();
-  gl._setFailDeleteProgram(1);
-  assert.throws(
-    () => generateCloudNoiseTexturesGPU(gl, 32, 32),
-    /synthetic program deletion failure/,
-  );
-  assert.equal(gl._state.programs.size, 1);
-  const allocationCount = gl._state.allocations.length;
-
-  const scheduler = createManualScheduler();
-  const transaction = startCloudNoiseGenerationGPU(gl, 32, 32, {
-    now: () => 0,
-    schedule: scheduler.schedule,
-  });
-  const settlement = transaction.completion.catch(() => {});
-  assert.equal(scheduler.runNext(), true);
-  assert.equal(gl._state.programs.size, 0);
-  assert.equal(gl._state.allocations.length, allocationCount);
-  transaction.cancel();
-  void settlement;
 });
 
 test('default GPU noise scheduling falls back when animation-frame cancellation is unavailable or the page is hidden', async () => {
@@ -820,7 +959,7 @@ test('default GPU noise scheduling falls back when animation-frame cancellation 
     const firstSettlement = first.completion.catch(() => {});
     await new Promise(resolve => setTimeout(resolve, 5));
     assert.equal(frameRequests, 0);
-    assert.notEqual(first._phase, 'pending-cleanup');
+    assert.notEqual(first._phase, 'initialize');
     first.cancel();
     await firstSettlement;
 
@@ -844,7 +983,7 @@ test('default GPU noise scheduling falls back when animation-frame cancellation 
     const secondSettlement = second.completion.catch(() => {});
     await new Promise(resolve => setTimeout(resolve, 5));
     assert.equal(frameRequests, 0);
-    assert.notEqual(second._phase, 'pending-cleanup');
+    assert.notEqual(second._phase, 'initialize');
     second.cancel();
     await secondSettlement;
   } finally {
@@ -915,13 +1054,13 @@ test('hidden fallback survives a throwing frame canceller and its stale frame st
       32,
     );
     const settlement = transaction.completion.catch(() => {});
-    assert.equal(transaction._phase, 'pending-cleanup');
+    assert.equal(transaction._phase, 'initialize');
     assert.equal(typeof visibilityListener, 'function');
     documentStub.hidden = true;
     assert.doesNotThrow(() => visibilityListener());
     await new Promise(resolve => setTimeout(resolve, 5));
     const phaseAfterTimeout = transaction._phase;
-    assert.notEqual(phaseAfterTimeout, 'pending-cleanup');
+    assert.notEqual(phaseAfterTimeout, 'initialize');
     frameCallback();
     assert.equal(transaction._phase, phaseAfterTimeout);
     assert.equal(frameCancellationAttempts, 1);
@@ -940,5 +1079,51 @@ test('hidden fallback survives a throwing frame canceller and its stale frame st
         Reflect.deleteProperty(globalThis, name);
       }
     }
+  }
+});
+
+test('GPU noise slice batches issue no getError and a cancelled transaction consumes their error', async () => {
+  const gl = createNoiseGl();
+  const scheduler = createManualScheduler();
+  const transaction = startCloudNoiseGenerationGPU(gl, 128, 32, {
+    now: () => 0,
+    schedule: scheduler.schedule,
+  });
+  const settlement = transaction.completion.catch(error => error);
+  while (transaction._phase !== 'shape-slices') {
+    assert.equal(scheduler.runNext(), true);
+  }
+  const originalGetError = gl.getError;
+  let getErrorCalls = 0;
+  gl.getError = function countedGetError() {
+    getErrorCalls++;
+    return originalGetError.call(this);
+  };
+  gl._setInjectDrawError();
+  assert.equal(scheduler.runNext(), true);
+  assert.equal(transaction._phase, 'shape-slices');
+  assert.equal(getErrorCalls, 0, 'a slice batch must not drain the GPU command stream');
+
+  transaction.cancel();
+  await settlement;
+  gl.getError = originalGetError;
+  assert.equal(
+    gl.getError(),
+    gl.NO_ERROR,
+    'an unchecked batch error must not surface to the next WebGL owner',
+  );
+});
+
+test('GPU noise generation refuses volumes above the 128 cubed ceiling before touching WebGL', () => {
+  const gl = new Proxy({}, {
+    get(_target, property) {
+      throw new Error(`WebGL must not be touched: ${String(property)}`);
+    },
+  });
+  for (const [shape, detail] of [[256, 128], [128, 192], [16, 32]]) {
+    assert.throws(
+      () => startCloudNoiseGenerationGPU(gl, shape, detail),
+      /must be an integer between 32 and 128/,
+    );
   }
 });

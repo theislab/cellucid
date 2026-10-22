@@ -58,97 +58,30 @@ export const DEFAULTS = {
 // =============================================================================
 
 /**
- * Top N options for marker selection
- */
-export const TOP_N_OPTIONS = [
-  { value: 5, label: '5 genes', description: 'Quick overview' },
-  { value: 10, label: '10 genes', description: 'Standard analysis' },
-  { value: 20, label: '20 genes', description: 'Detailed analysis' },
-  { value: 50, label: '50 genes', description: 'Comprehensive' },
-  { value: 100, label: '100 genes', description: 'Full panel' },
-  { value: 'all', label: 'All genes', description: 'Return all genes (slower, larger tables)', selected: true }
-];
-
-/**
- * Statistical method options
- */
-export const METHOD_OPTIONS = [
-  {
-    value: 'wilcox',
-    label: 'Wilcoxon',
-    description: 'Rank-based test, robust to outliers and non-normal distributions.',
-    selected: true
-  },
-  {
-    value: 'ttest',
-    label: 't-test',
-    description: 'Parametric test, assumes normally distributed expression data.'
-  }
-];
-
-/**
- * Transform options for heatmap display
- */
-export const TRANSFORM_OPTIONS = [
-  { value: 'zscore', label: 'Z-score', description: 'Row-wise standardization (mean=0, std=1)', selected: true },
-  { value: 'log1p', label: 'Log(1+x)', description: 'Log transform for visualization' },
-  { value: 'none', label: 'None', description: 'Raw expression values' }
-];
-
-/**
- * Colorscale options for heatmap
- */
-export const COLORSCALE_OPTIONS = [
-  { value: 'RdBu', label: 'Red-Blue', description: 'Diverging, good for z-scores', selected: true },
-  { value: 'Viridis', label: 'Viridis', description: 'Perceptually uniform, colorblind-safe' },
-  { value: 'Blues', label: 'Blues', description: 'Sequential blue gradient' },
-  { value: 'YlOrRd', label: 'Yellow-Red', description: 'Sequential warm gradient' },
-  { value: 'Greens', label: 'Greens', description: 'Sequential green gradient' }
-];
-
-/**
  * Distance metric options for clustering
  */
 export const DISTANCE_OPTIONS = [
-  { value: 'correlation', label: 'Correlation', description: '1 - Pearson r', selected: true },
-  { value: 'euclidean', label: 'Euclidean', description: 'Straight-line distance' },
-  { value: 'cosine', label: 'Cosine', description: 'Angular distance' }
+  { value: 'correlation', label: 'Correlation', selected: true },
+  { value: 'euclidean', label: 'Euclidean' },
+  { value: 'cosine', label: 'Cosine' }
 ];
 
 /**
  * Linkage method options for hierarchical clustering
  */
 export const LINKAGE_OPTIONS = [
-  { value: 'average', label: 'Average', description: 'UPGMA - balanced clusters', selected: true },
-  { value: 'complete', label: 'Complete', description: 'Maximum distance - compact clusters' },
-  { value: 'single', label: 'Single', description: 'Minimum distance - chained clusters' }
+  { value: 'average', label: 'Average', selected: true },
+  { value: 'complete', label: 'Complete' },
+  { value: 'single', label: 'Single' }
 ];
 
 /**
  * Display mode options
  */
 export const MODE_OPTIONS = [
-  { value: 'ranked', label: 'Ranked Genes', description: 'Show top markers sorted by significance' },
-  { value: 'clustered', label: 'Clustered', description: 'Hierarchically clustered heatmap' },
-  { value: 'custom', label: 'Custom Genes', description: 'User-defined gene list' }
-];
-
-// =============================================================================
-// P-VALUE THRESHOLDS
-// =============================================================================
-
-export const P_VALUE_THRESHOLDS = [
-  { value: 0.001, label: '0.001', description: 'Very stringent' },
-  { value: 0.01, label: '0.01', description: 'Stringent' },
-  { value: 0.05, label: '0.05', description: 'Standard', selected: true },
-  { value: 0.1, label: '0.1', description: 'Permissive' }
-];
-
-export const FOLD_CHANGE_THRESHOLDS = [
-  { value: 0.5, label: '0.5', description: '1.4x change' },
-  { value: 1.0, label: '1.0', description: '2x change', selected: true },
-  { value: 1.5, label: '1.5', description: '2.8x change' },
-  { value: 2.0, label: '2.0', description: '4x change' }
+  { value: 'ranked', label: 'Ranked Genes' },
+  { value: 'clustered', label: 'Clustered' },
+  { value: 'custom', label: 'Custom Genes' }
 ];
 
 // =============================================================================
@@ -348,20 +281,3 @@ export const CACHE_KEYS = {
  * @property {string} [message] - Status message
  * @property {number} [eta] - Estimated seconds remaining
  */
-
-export default {
-  DEFAULTS,
-  TOP_N_OPTIONS,
-  METHOD_OPTIONS,
-  TRANSFORM_OPTIONS,
-  COLORSCALE_OPTIONS,
-  DISTANCE_OPTIONS,
-  LINKAGE_OPTIONS,
-  MODE_OPTIONS,
-  P_VALUE_THRESHOLDS,
-  FOLD_CHANGE_THRESHOLDS,
-  ERROR_MESSAGES,
-  formatError,
-  ANALYSIS_PHASES,
-  CACHE_KEYS
-};

@@ -73,7 +73,7 @@ test('first smoke render allocates no noise and multiview renders share one sche
       };
 
       const phaseProgression = [];
-      for (let batch = 0; batch < 3; batch++) {
+      for (let batch = 0; batch < 2; batch++) {
         runNextFrame();
         for (let view = 0; view < 8; view++) {
           renderer.render({});
@@ -84,7 +84,6 @@ test('first smoke render allocates no noise and multiview renders share one sche
           sameTransaction:
             renderer._noiseGenerationTransaction === transaction,
           scheduleCalls,
-          textureAllocations,
         });
       }
       const disposeResult = renderer.dispose();
@@ -93,6 +92,19 @@ test('first smoke render allocates no noise and multiview renders share one sche
         cancellationCalls,
         disposeResult,
         firstRender,
+        phaseOrder: [
+          'initialize',
+          'shape-program-create',
+          'shape-program-await',
+          'detail-program-create',
+          'detail-program-await',
+          'blue-program-create',
+          'blueNoise-program-await',
+          'uniforms-initialize',
+          'quad-initialize',
+          'shape-allocate',
+          'shape-slices',
+        ],
         phaseProgression,
         scheduledAfterDispose: callbacks.size,
       };
@@ -106,35 +118,27 @@ test('first smoke render allocates no noise and multiview renders share one sche
   });
 
   expect(proof.firstRender).toEqual({
-    phase: 'pending-cleanup',
+    phase: 'initialize',
     scheduledCallbacks: 1,
     scheduleCalls: 1,
     textureAllocations: 0,
     transactionStarted: true,
   });
-  expect(proof.phaseProgression).toEqual([
-    {
-      phase: 'initialize',
-      sameTransaction: true,
-      scheduleCalls: 2,
-      scheduledCallbacks: 1,
-      textureAllocations: 0,
-    },
-    {
-      phase: 'shape-program-create',
-      sameTransaction: true,
-      scheduleCalls: 3,
-      scheduledCallbacks: 1,
-      textureAllocations: 0,
-    },
-    {
-      phase: 'shape-program-await',
-      sameTransaction: true,
-      scheduleCalls: 4,
-      scheduledCallbacks: 1,
-      textureAllocations: 0,
-    },
+  // Each turn advances the one transaction and leaves exactly one batch
+  // scheduled, however many views rendered in between. How far a turn gets
+  // depends on how fast this browser compiles the noise programs: a turn
+  // runs every cheap phase that fits its budget and stops at a program
+  // still compiling.
+  expect(proof.phaseProgression.map(({ phase, ...rest }) => rest)).toEqual([
+    { sameTransaction: true, scheduleCalls: 2, scheduledCallbacks: 1 },
+    { sameTransaction: true, scheduleCalls: 3, scheduledCallbacks: 1 },
   ]);
+  const order = proof.phaseOrder;
+  const [afterFirst, afterSecond] = proof.phaseProgression.map(
+    ({ phase }) => order.indexOf(phase),
+  );
+  expect(afterFirst).toBeGreaterThan(order.indexOf('initialize'));
+  expect(afterSecond).toBeGreaterThanOrEqual(afterFirst);
   expect(proof.disposeResult).toBe(true);
   expect(proof.cancellationCalls).toBe(1);
   expect(proof.scheduledAfterDispose).toBe(0);
@@ -339,7 +343,7 @@ test('frame-batched GPU noise restores fresh hostile state and settles exactly o
       === gl.FRAMEBUFFER_COMPLETE;
 
     const taskTimings = transaction.getTaskTimings();
-    const timingPhases = taskTimings.map(timing => timing.phase);
+    const timingPhases = taskTimings.flatMap(timing => timing.phases);
     transaction.cancel();
     transaction.invalidate();
     await Promise.resolve();
@@ -384,7 +388,6 @@ test('frame-batched GPU noise restores fresh hostile state and settles exactly o
   expect(proof.maximumPendingCallbacks).toBe(1);
   expect(proof.pendingCallbacks).toBe(0);
   expect(proof.callbackCount).toBe(proof.taskCount);
-  expect(proof.timingPhases).toContain('pending-cleanup');
   expect(proof.timingPhases).toContain('initialize');
   expect(proof.timingPhases).toContain('shape-finalize');
   expect(proof.timingPhases).toContain('detail-finalize');
@@ -460,10 +463,13 @@ test('GPU noise context loss between batches invalidates without deletion', asyn
       extension.loseContext();
       runNext();
       const error = await settlement;
+      const { isContextLostError } = await import(
+        '/assets/js/rendering/gl-errors.js'
+      );
       result = {
         cleanupComplete: transaction.cleanupComplete,
+        contextLost: isContextLostError(error),
         deletionCallsAfterLoss: deletionCalls - deletionCallsBeforeLoss,
-        errorMessage: error.message,
         pendingCallbacks: queue.filter(entry => entry.active).length,
         settled: transaction.settled,
         supported: true,
@@ -479,7 +485,7 @@ test('GPU noise context loss between batches invalidates without deletion', asyn
   expect(proof.supported).toBe(true);
   expect(proof.cleanupComplete).toBe(true);
   expect(proof.deletionCallsAfterLoss).toBe(0);
-  expect(proof.errorMessage).toMatch(/context loss/i);
+  expect(proof.contextLost).toBe(true);
   expect(proof.pendingCallbacks).toBe(0);
   expect(proof.settled).toBe(true);
 });
@@ -509,7 +515,15 @@ test('GPU noise scheduling safely uses timer fallback without a paired frame can
     try {
       const transaction = startCloudNoiseGenerationGPU(gl, 32, 32);
       const settlement = transaction.completion.catch(() => {});
-      await new Promise(resolve => setTimeout(resolve, 10));
+      // Wait for the timer-driven scheduler to advance, however late a
+      // loaded runner fires its first timer, rather than for a fixed interval.
+      const deadline = performance.now() + 10_000;
+      while (
+        transaction._phase === 'initialize' &&
+        performance.now() < deadline
+      ) {
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
       const phaseAfterTimer = transaction._phase;
       transaction.cancel();
       await settlement;
@@ -526,6 +540,6 @@ test('GPU noise scheduling safely uses timer fallback without a paired frame can
   });
 
   expect(proof.frameRequests).toBe(0);
-  expect(proof.phaseAfterTimer).not.toBe('pending-cleanup');
+  expect(proof.phaseAfterTimer).not.toBe('initialize');
   expect(proof.cleanupComplete).toBe(true);
 });

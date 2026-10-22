@@ -65,7 +65,10 @@ test('the browser fixture retires even a failed test through the stable owner', 
     source,
     /finally\s*\{[\s\S]*retireContextApplications\(context\)/,
   );
-  assert.match(source, /page:\s*async\s*\(\{\s*context,\s*page\s*\},\s*use\)/);
+  assert.match(
+    source,
+    /page:\s*async\s*\(\{\s*context,\s*page\s*\},\s*use,\s*testInfo\)/,
+  );
   assert.doesNotMatch(source, /applicationRetirement:[\s\S]*auto:\s*true/);
   assert.match(source, /window\._cellucidDispose/);
   assert.match(source, /secondTask\s*!==\s*firstTask/);
@@ -83,8 +86,9 @@ test('application retirement is installed before asynchronous bootstrap', async 
   const disposePublication = source.indexOf(
     'window._cellucidDispose = destroyApplication;',
   );
+  // The first bootstrap await is the sign-in step of the startup owner.
   const firstBootstrapAwait = source.indexOf(
-    'await githubAuthSession.completeSignInFromRedirect();',
+    "await startup.step(\n        'sign-in',",
   );
   assert.ok(disposePublication >= 0);
   assert.ok(firstBootstrapAwait >= 0);

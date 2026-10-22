@@ -16,7 +16,7 @@ export const LEGEND_DEFAULT_OPTIONS = Object.freeze({
   legendPosition: 'auto'
 });
 
-export const LEGEND_POSITION_OPTIONS = Object.freeze([
+const LEGEND_POSITION_OPTIONS = Object.freeze([
   { value: 'auto', label: 'Auto' },
   { value: 'none', label: 'None' },
   { value: 'upper_left', label: 'Upper left' },

@@ -18,6 +18,7 @@
  */
 
 import { getDataSourceManager } from './data-source-manager.js';
+import { parseMappingKnnManifestPath } from './data-mapping-candidates.js';
 import {
   getMetadataLoadSignal,
   throwIfMetadataAborted,
@@ -35,7 +36,7 @@ const candidateAnnDataBindings = new WeakMap();
  * Check if the current data source is an AnnData file (h5ad or zarr)
  * @returns {AnnDataFormat|null} The format type or null if not AnnData
  */
-export function getActiveAnnDataFormat() {
+function getActiveAnnDataFormat() {
   const manager = getDataSourceManager();
   const source = manager.activeSource;
 
@@ -57,22 +58,6 @@ export function getActiveAnnDataFormat() {
 }
 
 /**
- * Check if the current data source is an h5ad file
- * @returns {boolean}
- */
-export function isH5adActive() {
-  return getActiveAnnDataFormat() === 'h5ad';
-}
-
-/**
- * Check if the current data source is a zarr directory
- * @returns {boolean}
- */
-export function isZarrActive() {
-  return getActiveAnnDataFormat() === 'zarr';
-}
-
-/**
  * Check if any AnnData format is active (h5ad or zarr)
  * @returns {boolean}
  */
@@ -81,40 +66,10 @@ export function isAnnDataActive() {
 }
 
 /**
- * Get the active AnnData source adapter (works for both h5ad and zarr)
- * @returns {Object|null} AnnData adapter
- */
-export function getAnnDataAdapter() {
-  const manager = getDataSourceManager();
-  const source = manager.activeSource;
-
-  if (!source) return null;
-
-  const sourceType = source.getType?.();
-
-  // Direct source types
-  if (sourceType === 'h5ad' || sourceType === 'zarr') {
-    return source.getAdapter?.() || null;
-  }
-
-  // Local-user wrapper
-  if (sourceType === 'local-user') {
-    if (source.isH5adMode?.()) {
-      return source.getH5adSource?.()?.getAdapter?.() || null;
-    }
-    if (source.isZarrMode?.()) {
-      return source.getZarrSource?.()?.getAdapter?.() || null;
-    }
-  }
-
-  return null;
-}
-
-/**
  * Get the active AnnData source (works for both h5ad and zarr)
  * @returns {Object|null}
  */
-export function getAnnDataSource() {
+function getAnnDataSource() {
   const manager = getDataSourceManager();
   const source = manager.activeSource;
 
@@ -291,7 +246,9 @@ function getAnnDataBinding(url, candidateBinding) {
       'and dataset id.'
     );
   }
-  return owner;
+  // The owner was parsed from the binding's dataset base; the path a caller
+  // names belongs to the request, exactly as for an active binding.
+  return { adapter: owner.adapter, source: owner.source, parsed };
 }
 
 /**
@@ -353,9 +310,14 @@ export function getActiveAnnDataBinding(url) {
 // =========================================================================
 
 /**
- * Load points (embedding) from AnnData source
+ * Load one embedding payload from an AnnData source. The path below the
+ * dataset names the payload: an identity item (`embeddings/{i}_{d}d.bin`) or
+ * a mapped `obsm` array (`_cellucid/mapping/embeddings/{obsm}/{cols}.bin`).
+ * The bytes are the format's payload for that array, and the caller owns the
+ * returned array exactly as it owns a fetched one (`getEmbeddingPayload`).
+ *
  * @param {string} url - Explicit direct AnnData URL
- * @param {number} dim - Dimension (1, 2, or 3)
+ * @param {number} dim - The dimension the caller's layout declares (1, 2, or 3)
  * @returns {Promise<Float32Array>}
  */
 export async function anndataLoadPoints(
@@ -363,8 +325,46 @@ export async function anndataLoadPoints(
   dim,
   candidateBinding = null
 ) {
+  const { adapter, parsed } = getAnnDataBinding(url, candidateBinding);
+  return adapter.getEmbeddingPayload(parsed.path, dim);
+}
+
+/**
+ * Load one vector payload from an AnnData source, by its URL: the mapping
+ * route `_cellucid/mapping/vectors/{vector}/{vcols}/{embedding}/{ecols}.bin`.
+ *
+ * @param {string} url - Explicit direct AnnData URL of the vector payload
+ * @param {number} dim - The bound embedding's dimension (1, 2, or 3)
+ * @returns {Promise<Float32Array>}
+ */
+export async function anndataLoadVectors(
+  url,
+  dim,
+  candidateBinding = null
+) {
+  const { adapter, parsed } = getAnnDataBinding(url, candidateBinding);
+  return adapter.getVectorPayload(parsed.path, dim);
+}
+
+/**
+ * The data-mapping candidate catalog of an AnnData source.
+ *
+ * @param {string} url - Explicit direct AnnData URL
+ * @param {{signal?: AbortSignal|null}} [options]
+ * @returns {Object}
+ */
+export function anndataGetMappingCandidates(
+  url,
+  options = {},
+  candidateBinding = null
+) {
+  const signal = getMetadataLoadSignal(
+    options,
+    'Direct AnnData data-mapping catalog'
+  );
+  throwIfMetadataAborted(signal, 'Direct AnnData data-mapping catalog loading');
   const { adapter } = getAnnDataBinding(url, candidateBinding);
-  return adapter.getEmbedding(dim);
+  return adapter.getMappingCandidates();
 }
 
 /**
@@ -396,12 +396,14 @@ export function anndataGetObsManifest(
 }
 
 /**
- * Load var manifest from AnnData source
+ * Load one var manifest from an AnnData source: the file's own gene list
+ * (`var_manifest.json`) or a mapped one
+ * (`_cellucid/mapping/genes/{axis}/{names}/var_manifest.json`).
  * @param {string} url - Explicit direct AnnData URL
  * @param {{signal?: AbortSignal|null}} [options]
- * @returns {Object}
+ * @returns {Promise<Object>}
  */
-export function anndataGetVarManifest(
+export async function anndataGetVarManifest(
   url,
   options = {},
   candidateBinding = null
@@ -414,8 +416,12 @@ export function anndataGetVarManifest(
     signal,
     'Direct AnnData variable manifest loading'
   );
-  const { adapter } = getAnnDataBinding(url, candidateBinding);
-  const manifest = adapter.getVarManifest();
+  const { adapter, parsed } = getAnnDataBinding(url, candidateBinding);
+  const manifest = await waitForMetadata(
+    adapter.getVarManifest(parsed.path),
+    signal,
+    'Direct AnnData variable manifest loading'
+  );
   throwIfMetadataAborted(
     signal,
     'Direct AnnData variable manifest loading'
@@ -439,18 +445,40 @@ export async function anndataLoadObsField(
 }
 
 /**
- * Load gene expression from AnnData source
- * @param {string} url - Explicit direct AnnData URL
- * @param {string} geneName - Gene name
+ * Load one gene's values from an AnnData source, by its payload URL:
+ * `var/{g}.values.f32` under the file's own gene list or under a mapped one.
+ * @param {string} url - Explicit direct AnnData URL of the gene payload
  * @returns {Promise<Float32Array>}
  */
-export async function anndataLoadGeneExpression(
+export async function anndataLoadGeneValues(
   url,
-  geneName,
   candidateBinding = null
 ) {
-  const { adapter } = getAnnDataBinding(url, candidateBinding);
-  return adapter.getGeneExpression(geneName);
+  const { adapter, parsed } = getAnnDataBinding(url, candidateBinding);
+  return adapter.getGeneValues(parsed.path);
+}
+
+/**
+ * Compute the outlier quantiles of one categorical obs field in one latent
+ * space of an AnnData source, by its payload URL
+ * (`_cellucid/mapping/latent/{obsm}/obs/{field}.outliers.f32`).
+ * @param {string} url - Explicit direct AnnData URL of the outlier payload
+ * @returns {Promise<Float32Array>}
+ */
+export async function anndataLoadOutlierQuantiles(
+  url,
+  candidateBinding = null
+) {
+  const { adapter, parsed } = getAnnDataBinding(url, candidateBinding);
+  return adapter.getLatentOutlierQuantiles(parsed.path);
+}
+
+function requireMappedObspKey(adapter, obspIndex) {
+  const item = adapter.getMappingCandidates().obsp[obspIndex];
+  if (item === undefined) {
+    throw new RangeError(`This file has no obsp entry ${obspIndex}.`);
+  }
+  return item.key;
 }
 
 /**
@@ -477,14 +505,20 @@ export async function anndataLoadConnectivity(
     signal,
     'Direct AnnData connectivity payload loading'
   );
-  const { adapter } = getAnnDataBinding(url, candidateBinding);
+  const { adapter, parsed } = getAnnDataBinding(url, candidateBinding);
   if (typeof adapter.getConnectivityEdges !== 'function') {
     throw new TypeError(
       'Direct AnnData adapters are required to implement getConnectivityEdges()'
     );
   }
+  // A mapped graph's manifest names the obsp entry; the dataset's own
+  // manifest names the graph the file opens with.
+  const obspIndex = parseMappingKnnManifestPath(parsed.path);
+  const edgeOptions = obspIndex === null
+    ? { signal }
+    : { signal, key: requireMappedObspKey(adapter, obspIndex) };
   const edges = await waitForMetadata(
-    adapter.getConnectivityEdges({ signal }),
+    adapter.getConnectivityEdges(edgeOptions),
     signal,
     'Direct AnnData connectivity payload loading'
   );
@@ -514,7 +548,15 @@ export async function anndataGetConnectivityManifest(
     signal,
     'Direct AnnData connectivity manifest loading'
   );
-  const { source } = getAnnDataBinding(url, candidateBinding);
+  const { adapter, source, parsed } = getAnnDataBinding(url, candidateBinding);
+  const obspIndex = parseMappingKnnManifestPath(parsed.path);
+  if (obspIndex !== null) {
+    return waitForMetadata(
+      adapter.getMappedConnectivityManifest(obspIndex, { signal }),
+      signal,
+      'Direct AnnData connectivity manifest loading'
+    );
+  }
   if (typeof source.getConnectivityManifest !== 'function') {
     throw new TypeError(
       'Direct AnnData sources are required to implement getConnectivityManifest()'
@@ -573,7 +615,7 @@ export function anndataGetDatasetIdentity(
  * @param {string} url
  * @returns {boolean}
  */
-export function isH5adUrl(url) {
+function isH5adUrl(url) {
   return url?.startsWith('h5ad://');
 }
 
@@ -582,7 +624,7 @@ export function isH5adUrl(url) {
  * @param {string} url
  * @returns {boolean}
  */
-export function isZarrUrl(url) {
+function isZarrUrl(url) {
   return url?.startsWith('zarr://');
 }
 
@@ -600,7 +642,7 @@ export function isAnnDataUrl(url) {
  * @param {string} url
  * @returns {{protocol: string, datasetId: string, path: string}|null}
  */
-export function parseAnnDataUrl(url) {
+function parseAnnDataUrl(url) {
   if (typeof url !== 'string' || url.length === 0) return null;
 
   let protocol;

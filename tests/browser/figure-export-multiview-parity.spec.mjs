@@ -37,6 +37,20 @@ test('grid PNG and Hybrid SVG own per-pane scientific adornments', async ({
     });
     const renderState = () => ({
       antialias: true,
+      backdrop: {
+        centerY: 0,
+        extentX: 1,
+        extentY: 1,
+        extentZ: 1,
+        flat: false,
+        floorY: -1.12,
+        glowCenterX: 0,
+        look: null,
+        pixelRatio: 1,
+        planarity: 0,
+        stageX: 0,
+        stageZ: 0,
+      },
       bgColor: Float32Array.from([1, 1, 1]),
       cameraDistance: 3,
       cameraPosition: [0, 0, 3],
@@ -88,7 +102,7 @@ test('grid PNG and Hybrid SVG own per-pane scientific adornments', async ({
         colors: Uint8Array.from([255, 0, 0, 255]),
         pointCount: 1,
         positions: Float32Array.from([0, 0, 0]),
-        transparency: Float32Array.from([transparency]),
+        transparency: Uint8Array.from([transparency]),
       },
       id,
       label,
@@ -102,6 +116,7 @@ test('grid PNG and Hybrid SVG own per-pane scientific adornments', async ({
         geometryGeneration: 11,
         legendModel,
         lodMembership: null,
+        drawOrder: null,
         lodSizeMultiplier: 1,
         normTransform: {
           center: [0, 0, 0],

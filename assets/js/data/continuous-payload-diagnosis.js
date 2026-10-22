@@ -147,7 +147,7 @@ const REMEDY_BY_KIND = Object.freeze({
  * @param {NonFiniteTally} options.tally
  * @returns {string}
  */
-export function describeUndrawablePayload({ subject, tally }) {
+function describeUndrawablePayload({ subject, tally }) {
   const owner = requireSubject(subject);
   const noun = owner.kind === 'gene' ? 'Gene' : 'Field';
   const undrawable = tally.positiveInfinity + tally.negativeInfinity;
@@ -184,7 +184,7 @@ export function describeUndrawablePayload({ subject, tally }) {
  * @param {NonFiniteTally} options.tally
  * @returns {string}
  */
-export function describeEmptyPayload({ subject, tally }) {
+function describeEmptyPayload({ subject, tally }) {
   const owner = requireSubject(subject);
   const noun = owner.kind === 'gene' ? 'Gene' : 'Field';
   return [

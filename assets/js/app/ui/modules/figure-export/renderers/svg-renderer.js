@@ -45,7 +45,7 @@
  * @module ui/modules/figure-export/renderers/svg-renderer
  */
 
-import { escapeHtml } from '../../../../utils/dom-utils.js';
+import { escapeXml } from '../../../../utils/dom-utils.js';
 import { forEachProjectedPoint } from '../utils/point-projector.js';
 	import {
 	  computeSingleViewLayout,
@@ -63,13 +63,23 @@ import { forEachProjectedPoint } from '../utils/point-projector.js';
 	import {
 	  buildReferenceGridModel,
 	  renderSvgReferenceGrid,
-	  resolveReferenceGridSurfaceRgb,
+	  resolveReferenceGridSurface,
 	} from '../components/reference-grid.js';
+import {
+  figureDrawsBackdropLook,
+  renderBackdropLookForPlot,
+  renderSvgBackdropLookImage,
+} from '../components/backdrop-look-export.js';
 	import {
 	  computeVisibleCameraBounds,
 	  computeVisibleRealBounds,
 	} from '../utils/coordinate-mapper.js';
-	import { assertCropRect01, cropRect01ToPx } from '../utils/crop.js';
+	import {
+	  assertCropRect01,
+	  cropRect01ToPx,
+	  fitCropIntoRect,
+	  planCropRaster,
+	} from '../utils/crop.js';
 	import { reducePointsByDensity } from '../utils/density-reducer.js';
 	import {
 	  blobToDataUrl,
@@ -77,6 +87,7 @@ import { forEachProjectedPoint } from '../utils/point-projector.js';
 	} from '../utils/export-helpers.js';
 	import { hashStringToSeed } from '../utils/hash.js';
 import {
+  exportSpriteZoomLimit,
   rasterizePointsWebgl,
   releaseWebglRasterCanvas,
 } from '../utils/webgl-point-rasterizer.js';
@@ -149,6 +160,7 @@ const SELECTION_MUTED_RGB = 160;
 function createVectorPointShader({
   fog,
   positions,
+  dimension,
   highlightArray,
   emphasizeSelection,
   selectionMutedOpacity,
@@ -170,16 +182,19 @@ function createVectorPointShader({
       aa *= selectionMutedOpacity;
     }
     if (fog !== null) {
-      const base = index * 3;
+      const base = index * dimension;
       const transmittance = fog.transmittanceAt(
         positions[base],
-        positions[base + 1],
-        positions[base + 2]
+        dimension > 1 ? positions[base + 1] : 0,
+        dimension > 2 ? positions[base + 2] : 0
       );
-      rr = applyFogChannel(fog.fogR, rr, transmittance);
-      gg = applyFogChannel(fog.fogG, gg, transmittance);
-      bb = applyFogChannel(fog.fogB, bb, transmittance);
-      aa = applyFogAlpha(transmittance, aa);
+      if (fog.fadesAlpha) {
+        aa = applyFogAlpha(transmittance, aa);
+      } else {
+        rr = applyFogChannel(fog.fogR, rr, transmittance);
+        gg = applyFogChannel(fog.fogG, gg, transmittance);
+        bb = applyFogChannel(fog.fogB, bb, transmittance);
+      }
     }
     shaded[0] = rr;
     shaded[1] = gg;
@@ -191,9 +206,9 @@ function createVectorPointShader({
 
 function renderSvgSelectionBadge(badge, fontFamily, fontSize, ink) {
   return (
-    `<g font-family="${escapeHtml(fontFamily)}" font-size="${fontSize}" fill="${ink.surfaceInk}">` +
+    `<g font-family="${escapeXml(fontFamily)}" font-size="${fontSize}" fill="${ink.surfaceInk}">` +
     `<rect x="${badge.x}" y="${badge.y}" width="${badge.width}" height="${badge.height}" rx="4" fill="${ink.surface}" fill-opacity="0.85" stroke="${ink.frame}" stroke-width="1"/>` +
-    `<text x="${badge.textX}" y="${badge.textY}" stroke="none">${escapeHtml(badge.label)}</text>` +
+    `<text x="${badge.textX}" y="${badge.textY}" stroke="none">${escapeXml(badge.label)}</text>` +
     `</g>`
   );
 }
@@ -226,14 +241,14 @@ function highlightValueToAlpha01(value) {
     <rdf:Description rdf:about="">
       <dc:creator>Cellucid</dc:creator>
       <dc:publisher>cellucid.com</dc:publisher>
-      <dc:relation>${escapeHtml(website)}</dc:relation>
-      <dc:date>${escapeHtml(exportedAt)}</dc:date>
-      ${dataset ? `<dc:source>${escapeHtml(dataset)}</dc:source>` : ''}
-      ${meta?.datasetId ? `<dc:identifier>${escapeHtml(String(meta.datasetId))}</dc:identifier>` : ''}
-      ${description ? `<dc:description>${escapeHtml(description)}</dc:description>` : ''}
-      ${colorField ? `<cellucid:colorField>${escapeHtml(colorField)}</cellucid:colorField>` : ''}
-      ${sourceFile ? `<cellucid:sourceFile>${escapeHtml(String(sourceFile))}</cellucid:sourceFile>` : ''}
-      <cellucid:json>${escapeHtml(json)}</cellucid:json>
+      <dc:relation>${escapeXml(website)}</dc:relation>
+      <dc:date>${escapeXml(exportedAt)}</dc:date>
+      ${dataset ? `<dc:source>${escapeXml(dataset)}</dc:source>` : ''}
+      ${meta?.datasetId ? `<dc:identifier>${escapeXml(String(meta.datasetId))}</dc:identifier>` : ''}
+      ${description ? `<dc:description>${escapeXml(description)}</dc:description>` : ''}
+      ${colorField ? `<cellucid:colorField>${escapeXml(colorField)}</cellucid:colorField>` : ''}
+      ${sourceFile ? `<cellucid:sourceFile>${escapeXml(String(sourceFile))}</cellucid:sourceFile>` : ''}
+      <cellucid:json>${escapeXml(json)}</cellucid:json>
     </rdf:Description>
   </rdf:RDF>
 </metadata>`;
@@ -249,9 +264,11 @@ function highlightValueToAlpha01(value) {
  */
 async function rasterizePointsToDataUrl({
   positions,
+  dimension,
   colors,
   transparency,
   lodMembership = null,
+  drawOrder = null,
   renderState,
   plotRect,
   radiusPx,
@@ -298,7 +315,46 @@ async function rasterizePointsToDataUrl({
   ) {
     throw new TypeError('SVG Hybrid export requires positive render-state viewport dimensions');
   }
-  const viewportScale = computeLetterboxedRect({ srcWidth: srcViewportW, srcHeight: srcViewportH, dstWidth: pxW, dstHeight: pxH }).scale;
+  // Unframed, the raster is the whole plot and letterboxes the whole view.
+  // Framed, it is the crop's place in the plot, on whole raster pixels, and
+  // draws just the crop at those pixels (see png-renderer.js planPointRaster).
+  let rasterPlan;
+  if (crop01 === null) {
+    rasterPlan = {
+      x: 0,
+      y: 0,
+      width: pxW,
+      height: pxH,
+      zoom: computeLetterboxedRect({ srcWidth: srcViewportW, srcHeight: srcViewportH, dstWidth: pxW, dstHeight: pxH }).scale,
+      exact: true,
+    };
+  } else {
+    const fitted = fitCropIntoRect({
+      crop01,
+      viewportWidth: srcViewportW,
+      viewportHeight: srcViewportH,
+      destRect: { x: 0, y: 0, width: pxW, height: pxH },
+    });
+    const x = Math.round(fitted.x);
+    const y = Math.round(fitted.y);
+    const deviceRect = {
+      x,
+      y,
+      width: Math.max(1, Math.round(fitted.x + fitted.width) - x),
+      height: Math.max(1, Math.round(fitted.y + fitted.height) - y),
+    };
+    rasterPlan = {
+      ...deviceRect,
+      ...planCropRaster({
+        crop01,
+        viewportWidth: srcViewportW,
+        viewportHeight: srcViewportH,
+        deviceRect,
+        zoomLimit: exportSpriteZoomLimit(),
+      }),
+      deviceRect,
+    };
+  }
   const pointDiameterViewportPx = radiusPx * 2;
 
   const hasAnyOverlayInput =
@@ -318,15 +374,18 @@ async function rasterizePointsToDataUrl({
 
   const webglCanvas = rasterizePointsWebgl({
     positions,
+    dimension,
     colors,
     transparency,
     lodMembership,
+    drawOrder,
     renderState,
-    outputWidthPx: pxW,
-    outputHeightPx: pxH,
+    outputWidthPx: rasterPlan.width,
+    outputHeightPx: rasterPlan.height,
+    viewRect01: crop01,
     pointSizePx: scalePointDiameterToRaster(
       pointDiameterViewportPx,
-      viewportScale
+      rasterPlan.zoom
     ),
     overlayPoints: hasAnyOverlayInput
       ? {
@@ -334,7 +393,7 @@ async function rasterizePointsToDataUrl({
         colors: overlayColors,
         pointSizePx: scalePointDiameterToRaster(
           overlayPointDiameterViewportPx,
-          viewportScale
+          rasterPlan.zoom
         )
       }
       : null,
@@ -363,12 +422,16 @@ async function rasterizePointsToDataUrl({
     if (!ctx) {
       throw new Error('SVG Hybrid crop encoding requires a Canvas 2D context');
     }
-    const vp = computeLetterboxedRect({ srcWidth: srcViewportW, srcHeight: srcViewportH, dstWidth: pxW, dstHeight: pxH });
-    const sx = vp.x + crop01.x * vp.width;
-    const sy = vp.y + crop01.y * vp.height;
-    const sw = crop01.width * vp.width;
-    const sh = crop01.height * vp.height;
-    ctx.drawImage(webglCanvas, sx, sy, sw, sh, 0, 0, pxW, pxH);
+    // The PNG is stretched over the whole plot rectangle (pxW x pxH is the
+    // plot at rasterScale), so the crop's raster sits at its letterboxed
+    // place inside it: one to one, unless it was zoomed past the GPU's
+    // sprite range (`planCropRaster`).
+    const place = rasterPlan.deviceRect;
+    if (rasterPlan.exact) {
+      ctx.drawImage(webglCanvas, place.x, place.y);
+    } else {
+      ctx.drawImage(webglCanvas, place.x, place.y, place.width, place.height);
+    }
     const blob = await canvasToBlob(canvas, 'image/png', {
       signal,
       failureMessage: 'SVG Hybrid cropped point-pass PNG encoding failed',
@@ -451,7 +514,7 @@ export async function renderFigureToSvgBlob({ payload, signal = null }) {
   // The reference grid is a viewer-owned background layer: it sits behind the
   // points in every panel, exactly as `drawGrid()` does on screen.
   const referenceGrid = opts.referenceGrid;
-  const referenceGridSurfaceRgb = resolveReferenceGridSurfaceRgb({
+  const referenceGridSurface = resolveReferenceGridSurface({
     appearance: referenceGrid,
     background,
     backgroundColor,
@@ -516,7 +579,7 @@ export async function renderFigureToSvgBlob({ payload, signal = null }) {
   parts.push(buildSvgMetadata(meta, payload));
 
   if (background !== 'transparent') {
-    parts.push(`<rect x="0" y="0" width="${svgWidth}" height="${svgHeight}" fill="${escapeHtml(backgroundColor)}"/>`);
+    parts.push(`<rect x="0" y="0" width="${svgWidth}" height="${svgHeight}" fill="${escapeXml(backgroundColor)}"/>`);
   }
 
   if (singleView) {
@@ -537,6 +600,9 @@ export async function renderFigureToSvgBlob({ payload, signal = null }) {
     const shouldDepthSort = depthSort3d && dim > 2 && navMode !== 'planar';
 
     const lodMembership = view.scientificState.lodMembership;
+    // The order the pane draws at full detail (a reduced level draws a
+    // prefix of it, `lodMembership.indices`).
+    const drawOrder = view.scientificState.drawOrder;
     const pointDiameterViewportPx =
       renderState.pointSize * view.scientificState.lodSizeMultiplier;
     const pointRadiusViewportPx = pointDiameterViewportPx / 2;
@@ -544,10 +610,12 @@ export async function renderFigureToSvgBlob({ payload, signal = null }) {
     // Vector circles carry no shader, so the depth cue the viewer paints with
     // fog has to be reproduced here or the figure loses its depth axis.
     const shadeVectorPoint = createVectorPointShader({
+      // A sculpted point fogs toward the fog colour: here, the paper.
       fog: createFogEvaluator(
         applyExportBackgroundToRenderState(renderState, background, backgroundColor)
       ),
       positions,
+      dimension: dim,
       highlightArray,
       emphasizeSelection,
       selectionMutedOpacity,
@@ -568,7 +636,7 @@ export async function renderFigureToSvgBlob({ payload, signal = null }) {
       const titleSize = Math.max(14, titleFontSize);
       const tx = layout.titleRect ? (layout.titleRect.x + layout.titleRect.width / 2) : (layout.outerPadding + (layout.totalWidth - layout.outerPadding * 2) / 2);
       parts.push(
-        `<text x="${tx}" y="${(layout.titleRect?.y ?? layout.outerPadding) + titleSize}" text-anchor="middle" font-family="${escapeHtml(fontFamily)}" font-size="${titleSize}" fill="${ink.text}">${escapeHtml(title)}</text>`
+        `<text x="${tx}" y="${(layout.titleRect?.y ?? layout.outerPadding) + titleSize}" text-anchor="middle" font-family="${escapeXml(fontFamily)}" font-size="${titleSize}" fill="${ink.text}">${escapeXml(title)}</text>`
       );
     }
 
@@ -582,6 +650,7 @@ export async function renderFigureToSvgBlob({ payload, signal = null }) {
     const visibleBounds = useCameraAxes
       ? computeVisibleCameraBounds({
         positions,
+        dimension: dim,
         transparency,
         lodMembership,
         mvpMatrix: renderState.mvpMatrix,
@@ -592,6 +661,7 @@ export async function renderFigureToSvgBlob({ payload, signal = null }) {
       })
       : computeVisibleRealBounds({
         positions,
+        dimension: dim,
         transparency,
         lodMembership,
         mvpMatrix: renderState.mvpMatrix,
@@ -619,7 +689,7 @@ export async function renderFigureToSvgBlob({ payload, signal = null }) {
     }
 
     // Plot background + frame.
-    const plotFill = background === 'transparent' ? 'none' : escapeHtml(backgroundColor);
+    const plotFill = background === 'transparent' ? 'none' : escapeXml(backgroundColor);
     parts.push(`<rect x="${plotRect.x}" y="${plotRect.y}" width="${plotRect.width}" height="${plotRect.height}" fill="${plotFill}" stroke="${ink.frame}" stroke-width="1"/>`);
 
     // Points + centroid overlay (WYSIWYG).
@@ -630,8 +700,21 @@ export async function renderFigureToSvgBlob({ payload, signal = null }) {
       renderState,
       plotRect,
       crop,
-      surfaceRgb: referenceGridSurfaceRgb,
-    })));
+      surface: referenceGridSurface,
+    }), 'reference_layer'));
+    if (figureDrawsBackdropLook(referenceGrid, referenceGridSurface, renderState)) {
+      // The look is a raster at the hybrid point raster's density.
+      const lookRaster = await renderBackdropLookForPlot({
+        renderState,
+        plotRect,
+        crop,
+        width: Math.max(1, Math.round(plotRect.width * 2)),
+        height: Math.max(1, Math.round(plotRect.height * 2)),
+        signal,
+      });
+      throwIfFigureExportAborted(signal);
+      parts.push(renderSvgBackdropLookImage(lookRaster.toDataURL('image/png'), plotRect));
+    }
 
     const centroidPositions = data?.centroidPositions || null;
     const centroidColors = data?.centroidColors || null;
@@ -667,9 +750,11 @@ export async function renderFigureToSvgBlob({ payload, signal = null }) {
       const renderStateForPoints = applyExportBackgroundToRenderState(renderState, background, backgroundColor);
       const dataUrl = await rasterizePointsToDataUrl({
         positions,
+        dimension: dim,
         colors,
         transparency,
         lodMembership,
+        drawOrder,
         renderState: renderStateForPoints,
         plotRect,
         radiusPx: pointRadiusViewportPx,
@@ -691,6 +776,7 @@ export async function renderFigureToSvgBlob({ payload, signal = null }) {
       const seed = hashStringToSeed(meta?.datasetId || meta?.datasetName || viewId);
       const reduced = reducePointsByDensity({
         positions,
+        dimension: dim,
         colors,
         transparency,
         lodMembership,
@@ -748,9 +834,11 @@ export async function renderFigureToSvgBlob({ payload, signal = null }) {
       const radiusPlot = pointRadiusViewportPx * plotScale;
       forEachProjectedPoint({
         positions,
+        dimension: dim,
         colors,
         transparency,
         lodMembership,
+        drawOrder,
         renderState,
         plotRect,
         radiusPx: radiusPlot,
@@ -845,7 +933,7 @@ export async function renderFigureToSvgBlob({ payload, signal = null }) {
       parts.push(
         `<g clip-path="url(#${clipId})">` +
         `<text x="${plotRect.x + plotRect.width / 2}" y="${plotRect.y + plotRect.height / 2}" ` +
-        `text-anchor="middle" dominant-baseline="middle" font-family="${escapeHtml(fontFamily)}" ` +
+        `text-anchor="middle" dominant-baseline="middle" font-family="${escapeXml(fontFamily)}" ` +
         `font-size="${baseFontSize}" fill="${ink.mutedText}">No visible cells</text>` +
         `</g>`
       );
@@ -864,7 +952,7 @@ export async function renderFigureToSvgBlob({ payload, signal = null }) {
       const titleSize = Math.max(14, titleFontSize);
       const tx = outerPadding + contentW / 2;
       parts.push(
-        `<text x="${tx}" y="${outerPadding + titleSize}" text-anchor="middle" font-family="${escapeHtml(fontFamily)}" font-size="${titleSize}" fill="${ink.text}">${escapeHtml(title)}</text>`
+        `<text x="${tx}" y="${outerPadding + titleSize}" text-anchor="middle" font-family="${escapeXml(fontFamily)}" font-size="${titleSize}" fill="${ink.text}">${escapeXml(title)}</text>`
       );
     }
 
@@ -963,7 +1051,7 @@ export async function renderFigureToSvgBlob({ payload, signal = null }) {
         `<clipPath id="${panelClipId}"><rect x="${panelRect.x}" y="${panelRect.y}" width="${panelRect.width}" height="${panelRect.height}"/></clipPath>` +
         `</defs>`
       );
-      const cellFill = background === 'transparent' ? 'none' : escapeHtml(backgroundColor);
+      const cellFill = background === 'transparent' ? 'none' : escapeXml(backgroundColor);
       parts.push(`<rect x="${plotRect.x}" y="${plotRect.y}" width="${plotRect.width}" height="${plotRect.height}" fill="${cellFill}" stroke="${ink.frame}" stroke-width="1"/>`);
       parts.push(`<g clip-path="url(#${clipId})">`);
 
@@ -975,8 +1063,20 @@ export async function renderFigureToSvgBlob({ payload, signal = null }) {
         renderState,
         plotRect,
         crop,
-        surfaceRgb: referenceGridSurfaceRgb,
-      })));
+        surface: referenceGridSurface,
+      }), `reference_layer_${idx}`));
+      if (figureDrawsBackdropLook(referenceGrid, referenceGridSurface, renderState)) {
+        const lookRaster = await renderBackdropLookForPlot({
+          renderState,
+          plotRect,
+          crop,
+          width: Math.max(1, Math.round(plotRect.width * 2)),
+          height: Math.max(1, Math.round(plotRect.height * 2)),
+          signal,
+        });
+        throwIfFigureExportAborted(signal);
+        parts.push(renderSvgBackdropLookImage(lookRaster.toDataURL('image/png'), plotRect));
+      }
 
       const dim = view.scientificState.dimensionLevel;
       const cameraState = assertCameraState(
@@ -985,14 +1085,19 @@ export async function renderFigureToSvgBlob({ payload, signal = null }) {
       );
       const navMode = cameraState.navigationMode;
       const lodMembership = view.scientificState.lodMembership;
+      // The order the pane draws at full detail (a reduced level draws a
+      // prefix of it, `lodMembership.indices`).
+      const drawOrder = view.scientificState.drawOrder;
       const pointRadiusViewportPx =
         (renderState.pointSize * view.scientificState.lodSizeMultiplier) / 2;
       // Each panel carries its own fog anchors, so the evaluator is per panel.
       const shadeVectorPoint = createVectorPointShader({
+        // A sculpted point fogs toward the fog colour: here, the paper.
         fog: createFogEvaluator(
           applyExportBackgroundToRenderState(renderState, background, backgroundColor)
         ),
         positions,
+        dimension: dim,
         highlightArray,
         emphasizeSelection,
         selectionMutedOpacity,
@@ -1004,6 +1109,7 @@ export async function renderFigureToSvgBlob({ payload, signal = null }) {
       const visibleBounds = useCameraAxes
         ? computeVisibleCameraBounds({
           positions,
+          dimension: dim,
           transparency,
           lodMembership,
           mvpMatrix: renderState.mvpMatrix,
@@ -1014,6 +1120,7 @@ export async function renderFigureToSvgBlob({ payload, signal = null }) {
         })
         : computeVisibleRealBounds({
           positions,
+          dimension: dim,
           transparency,
           lodMembership,
           mvpMatrix: renderState.mvpMatrix,
@@ -1059,9 +1166,11 @@ export async function renderFigureToSvgBlob({ payload, signal = null }) {
         );
         const dataUrl = await rasterizePointsToDataUrl({
           positions,
+          dimension: dim,
           colors,
           transparency,
           lodMembership,
+          drawOrder,
           renderState: renderStateForPoints,
           plotRect,
           radiusPx: pointRadiusViewportPx,
@@ -1083,6 +1192,7 @@ export async function renderFigureToSvgBlob({ payload, signal = null }) {
         const seed = hashStringToSeed(meta?.datasetId || meta?.datasetName || viewId);
         const reduced = reducePointsByDensity({
           positions,
+          dimension: dim,
           colors,
           transparency,
           lodMembership,
@@ -1138,12 +1248,14 @@ export async function renderFigureToSvgBlob({ payload, signal = null }) {
       } else if (strategy === 'full-vector') {
         forEachProjectedPoint({
           positions,
+          dimension: dim,
           colors,
           transparency,
           renderState,
           plotRect,
           radiusPx: radiusPlot,
           lodMembership,
+          drawOrder,
           crop,
           sortByDepth: depthSort3d && dim > 2 && navMode !== 'planar',
           onPoint: (x, y, r, g, b, a, radius, index) => {
@@ -1241,7 +1353,7 @@ export async function renderFigureToSvgBlob({ payload, signal = null }) {
         parts.push(
           `<g clip-path="url(#${clipId})">` +
           `<text x="${plotRect.x + plotRect.width / 2}" y="${plotRect.y + plotRect.height / 2}" ` +
-          `text-anchor="middle" dominant-baseline="middle" font-family="${escapeHtml(fontFamily)}" ` +
+          `text-anchor="middle" dominant-baseline="middle" font-family="${escapeXml(fontFamily)}" ` +
           `font-size="${baseFontSize}" fill="${ink.mutedText}">No visible cells</text>` +
           `</g>`
         );
@@ -1292,8 +1404,8 @@ export async function renderFigureToSvgBlob({ payload, signal = null }) {
 
       parts.push(
         `<g clip-path="url(#${panelClipId})">` +
-        `<text x="${labelX}" y="${labelY}" font-family="${escapeHtml(fontFamily)}" ` +
-        `font-size="${baseFontSize}" fill="${ink.text}">${escapeHtml(panelLetter(idx))}. ${escapeHtml(viewLabel)}</text>` +
+        `<text x="${labelX}" y="${labelY}" font-family="${escapeXml(fontFamily)}" ` +
+        `font-size="${baseFontSize}" fill="${ink.text}">${escapeXml(panelLetter(idx))}. ${escapeXml(viewLabel)}</text>` +
         `</g>`
       );
     }

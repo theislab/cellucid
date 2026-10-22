@@ -2,16 +2,8 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
-  TransformPluginRegistry,
-} from '../assets/js/app/analysis/core/plugin-contract.js';
-import {
   DataLayer,
 } from '../assets/js/app/analysis/data/data-layer.js';
-import {
-  loadAnalysisBulkData,
-  loadAnalysisBulkObsData,
-  loadAnalysisSubset,
-} from '../assets/js/data/data-loaders.js';
 
 const PROTOTYPE_PROPERTY_NAMES =
   Object.getOwnPropertyNames(Object.prototype);
@@ -46,92 +38,6 @@ function deferred() {
   });
   return { promise, resolve };
 }
-
-function transformRegistry(execute, {
-  gpuAvailable = true,
-  gpuMethod = 'executeGPU',
-} = {}) {
-  const registry = new TransformPluginRegistry();
-  registry._gpuAvailable = gpuAvailable;
-  registry._plugins.set('probe', {
-    gpuMethod,
-    workerMethod: null,
-    execute,
-    defaultOptions: {},
-    optionSchema: {},
-  });
-  registry.getOptions = () => ({});
-  registry.validateOptions = () => ({ valid: true, errors: [] });
-  return registry;
-}
-
-test('a selected transform backend executes exactly once and propagates failure', async () => {
-  const injected = new Error('injected GPU execution failure');
-  const backends = [];
-  const registry = transformRegistry(async (_data, _options, context) => {
-    backends.push(context.backend);
-    throw injected;
-  });
-
-  await assert.rejects(
-    registry.execute(
-      'probe',
-      { values: Float32Array.of(1) },
-      {},
-      { preferredBackend: 'gpu' },
-    ),
-    error => error === injected,
-  );
-  assert.deepEqual(backends, ['gpu']);
-});
-
-test('an explicitly requested unavailable transform backend rejects before execution', async () => {
-  let executions = 0;
-  const registry = transformRegistry(async () => {
-    executions++;
-    return { values: Float32Array.of(1) };
-  }, {
-    gpuAvailable: false,
-  });
-
-  await assert.rejects(
-    registry.execute(
-      'probe',
-      { values: Float32Array.of(1) },
-      {},
-      { preferredBackend: 'gpu' },
-    ),
-    /requested transform backend "gpu" is unavailable/i,
-  );
-  assert.equal(executions, 0);
-});
-
-test('bulk gene loader failure is not converted into a sequential result', async () => {
-  const injected = new Error('injected bulk gene failure');
-  const varManifest = {};
-  Object.defineProperty(varManifest, 'fields', {
-    get() {
-      throw injected;
-    },
-  });
-  const layer = bareDataLayer({
-    manifestUrl: 'https://example.test/var_manifest.json',
-    varManifest,
-  });
-  let sequentialCalls = 0;
-  layer._loadGenesSequentially = async () => {
-    sequentialCalls++;
-  };
-
-  await assert.rejects(
-    layer.fetchAnalysisData({
-      pageIds: ['page-1'],
-      genes: ['Gene A'],
-    }),
-    error => error === injected,
-  );
-  assert.equal(sequentialCalls, 0);
-});
 
 test('dataset reset generation-isolates old cache and pending-request settlement', async t => {
   const layer = new DataLayer({}, {
@@ -330,30 +236,7 @@ test('observation fields load only through the DataState lease, never a second l
   assert.equal(result.stats.fieldsLoaded, 1);
 });
 
-test('sequential loaders propagate the first required scientific input failure', async t => {
-  await t.test('gene expression', async () => {
-    const injected = new Error('injected gene failure');
-    const layer = bareDataLayer();
-    layer.getDataForPages = async () => {
-      throw injected;
-    };
-    const result = {
-      genes: {},
-      stats: { genesLoaded: 0 },
-    };
-
-    await assert.rejects(
-      layer._loadGenesSequentially(
-        ['Gene A'],
-        ['page-1'],
-        result,
-      ),
-      error => error === injected,
-    );
-    assert.deepEqual(result.genes, {});
-    assert.equal(result.stats.genesLoaded, 0);
-  });
-
+test('observation loading propagates the first required scientific input failure', async t => {
   await t.test('observation field', async () => {
     const injected = new Error('injected observation failure');
     const layer = bareDataLayer();
@@ -377,215 +260,6 @@ test('sequential loaders propagate the first required scientific input failure',
     );
     assert.equal(publications, 0);
   });
-});
-
-test('requested latent data requires an adopted identity in both public aggregators', async t => {
-  for (const method of [
-    'fetchAnalysisData',
-    'fetchComprehensiveAnalysisData',
-  ]) {
-    await t.test(method, async () => {
-      const layer = bareDataLayer();
-      await assert.rejects(
-        layer[method]({
-          pageIds: ['page-1'],
-          genes: [],
-          obsFields: [],
-          includeLatent: true,
-          latentDimension: 2,
-        }),
-        /latent.*requires.*manifestUrl.*datasetIdentity/i,
-      );
-    });
-  }
-});
-
-test('bulk loaders reject every missing requested variable before I/O or progress', async t => {
-  await t.test('gene', async () => {
-    await assert.rejects(
-      loadAnalysisBulkData({
-        manifestUrl: 'https://example.test/var_manifest.json',
-        varManifest: { fields: [{ key: 'Gene A' }] },
-        geneList: ['Missing Gene'],
-        batchSize: 1,
-        suppressNotifications: true,
-      }),
-      /requested gene.*Missing Gene.*not declared/i,
-    );
-  });
-
-  await t.test('observation field', async () => {
-    await assert.rejects(
-      loadAnalysisBulkObsData({
-        manifestUrl: 'https://example.test/obs_manifest.json',
-        obsManifest: { fields: [{ key: 'score' }] },
-        fieldList: ['missing_field'],
-        batchSize: 1,
-        suppressNotifications: true,
-      }),
-      /requested observation field.*missing_field.*not declared/i,
-    );
-  });
-});
-
-test('bulk gene loading rejects the original payload failure without partial success', async t => {
-  const previousFetch = globalThis.fetch;
-  const injected = new Error('injected Gene B payload failure');
-  t.after(() => {
-    globalThis.fetch = previousFetch;
-  });
-
-  globalThis.fetch = async url => {
-    if (String(url).endsWith('/gene-b.bin')) {
-      throw injected;
-    }
-    return new Response(Float32Array.of(1, 2).buffer, {
-      status: 200,
-      headers: {
-        'Content-Type': 'application/octet-stream',
-        'Content-Length': '8',
-      },
-    });
-  };
-
-  await assert.rejects(
-    loadAnalysisBulkData({
-      manifestUrl: 'https://example.test/var_manifest.json',
-      varManifest: {
-        fields: [
-          {
-            key: 'Gene A',
-            kind: 'continuous',
-            valuesPath: 'gene-a.bin',
-            valuesDtype: 'float32',
-            quantized: false,
-          },
-          {
-            key: 'Gene B',
-            kind: 'continuous',
-            valuesPath: 'gene-b.bin',
-            valuesDtype: 'float32',
-            quantized: false,
-          },
-        ],
-      },
-      geneList: ['Gene A', 'Gene B'],
-      batchSize: 2,
-      suppressNotifications: true,
-    }),
-    error => error === injected,
-  );
-});
-
-test('all bulk analysis loaders preserve legal prototype-named variables exactly', async t => {
-  const previousFetch = globalThis.fetch;
-  const prototypeDescriptors = Object.getOwnPropertyDescriptors(
-    Object.prototype,
-  );
-  t.after(() => {
-    globalThis.fetch = previousFetch;
-  });
-
-  globalThis.fetch = async url => {
-    const indexMatch = /-(\d+)\.f32$/u.exec(String(url));
-    const value = indexMatch ? Number(indexMatch[1]) + 0.5 : 0.5;
-    return new Response(Float32Array.of(value).buffer, {
-      status: 200,
-      headers: {
-        'Content-Type': 'application/octet-stream',
-        'Content-Length': '4',
-      },
-    });
-  };
-
-  const varManifest = {
-    fields: PROTOTYPE_PROPERTY_NAMES.map((key, index) => ({
-      key,
-      kind: 'continuous',
-      valuesPath: `gene-${index}.f32`,
-      valuesDtype: 'float32',
-      quantized: false,
-    })),
-  };
-  const obsManifest = {
-    fields: PROTOTYPE_PROPERTY_NAMES.map((key, index) => ({
-      key,
-      kind: 'continuous',
-      valuesPath: `obs-${index}.f32`,
-      valuesDtype: 'float32',
-      quantized: false,
-      centroids: null,
-      outlierQuantilesPath: null,
-    })),
-  };
-
-  await t.test('bulk genes', async () => {
-    const result = await loadAnalysisBulkData({
-      manifestUrl: 'https://example.test/var_manifest.json',
-      varManifest,
-      geneList: PROTOTYPE_PROPERTY_NAMES,
-      batchSize: PROTOTYPE_PROPERTY_NAMES.length,
-      suppressNotifications: true,
-    });
-    assert.equal(result.loadedCount, PROTOTYPE_PROPERTY_NAMES.length);
-    assertExactOrdinaryRecord(result.genes, PROTOTYPE_PROPERTY_NAMES);
-    for (const values of Object.values(result.genes)) {
-      assert.equal(values instanceof Float32Array, true);
-    }
-  });
-
-  await t.test('gene subset', async () => {
-    const result = await loadAnalysisSubset({
-      manifestUrl: 'https://example.test/var_manifest.json',
-      varManifest,
-      geneList: PROTOTYPE_PROPERTY_NAMES,
-      cellIndices: [0],
-      batchSize: PROTOTYPE_PROPERTY_NAMES.length,
-      suppressNotifications: true,
-    });
-    assertExactOrdinaryRecord(result.genes, PROTOTYPE_PROPERTY_NAMES);
-    for (const entry of Object.values(result.genes)) {
-      assert.deepEqual(entry.indices, [0]);
-      assert.equal(entry.values instanceof Float32Array, true);
-    }
-  });
-
-  await t.test('bulk observation fields', async () => {
-    const result = await loadAnalysisBulkObsData({
-      manifestUrl: 'https://example.test/obs_manifest.json',
-      obsManifest,
-      fieldList: PROTOTYPE_PROPERTY_NAMES,
-      batchSize: PROTOTYPE_PROPERTY_NAMES.length,
-      suppressNotifications: true,
-    });
-    assert.equal(result.loadedCount, PROTOTYPE_PROPERTY_NAMES.length);
-    assertExactOrdinaryRecord(result.fields, PROTOTYPE_PROPERTY_NAMES);
-    for (const field of Object.values(result.fields)) {
-      assert.equal(field.kind, 'continuous');
-      assert.equal(field.values instanceof Float32Array, true);
-    }
-  });
-
-  await t.test('DataLayer bulk gene projection', async () => {
-    const layer = bareDataLayer({
-      manifestUrl: 'https://example.test/var_manifest.json',
-      varManifest,
-    });
-    const result = await layer.fetchAnalysisData({
-      pageIds: ['page-1'],
-      genes: PROTOTYPE_PROPERTY_NAMES,
-    });
-    assert.equal(result.stats.genesLoaded, PROTOTYPE_PROPERTY_NAMES.length);
-    assertExactOrdinaryRecord(result.genes, PROTOTYPE_PROPERTY_NAMES);
-    for (const gene of PROTOTYPE_PROPERTY_NAMES) {
-      assertExactOrdinaryRecord(result.genes[gene], ['page-1']);
-    }
-  });
-
-  assert.deepEqual(
-    Object.getOwnPropertyDescriptors(Object.prototype),
-    prototypeDescriptors,
-  );
 });
 
 test('DataLayer rejects unknown variable and page identities', async t => {
@@ -1006,30 +680,6 @@ test('all public DataLayer page records preserve prototype-named page identities
     return layer;
   };
 
-  await t.test('analysis genes and pageData', async () => {
-    const layer = createLayer();
-    layer.getDataForPages = async ({ pageIds }) => pageIds.map(pageId => ({
-      pageId,
-      pageName: pageId,
-      values: Float32Array.of(1),
-      cellIndices: layer.getCellIndicesForPage(pageId),
-      cellCount: 1,
-    }));
-    const result = await layer.fetchAnalysisData({
-      pageIds: PROTOTYPE_PROPERTY_NAMES,
-      genes: ['Gene A'],
-    });
-    assertExactOrdinaryRecord(
-      result.pageData,
-      PROTOTYPE_PROPERTY_NAMES,
-    );
-    assertExactOrdinaryRecord(result.genes, ['Gene A']);
-    assertExactOrdinaryRecord(
-      result.genes['Gene A'],
-      PROTOTYPE_PROPERTY_NAMES,
-    );
-  });
-
   await t.test('observation field pages and pageData', async () => {
     const layer = createLayer();
     layer.getAvailableVariables = type => (
@@ -1078,89 +728,6 @@ test('all public DataLayer page records preserve prototype-named page identities
     );
   });
 
-  await t.test('comprehensive pageData', async () => {
-    const layer = createLayer();
-    const result = await layer.fetchComprehensiveAnalysisData({
-      pageIds: PROTOTYPE_PROPERTY_NAMES,
-    });
-    assertExactOrdinaryRecord(
-      result.pageData,
-      PROTOTYPE_PROPERTY_NAMES,
-    );
-  });
-});
-
-test('analysis subset extraction is exact and rejects invalid membership', async t => {
-  const previousFetch = globalThis.fetch;
-  t.after(() => {
-    globalThis.fetch = previousFetch;
-  });
-
-  const options = cellIndices => ({
-    manifestUrl: 'https://example.test/var_manifest.json',
-    varManifest: {
-      fields: [{
-        key: 'Gene A',
-        kind: 'continuous',
-        valuesPath: 'gene-a.f32',
-        valuesDtype: 'float32',
-        quantized: false,
-      }],
-    },
-    geneList: ['Gene A'],
-    cellIndices,
-    suppressNotifications: true,
-  });
-
-  await t.test('valid ordered subset', async () => {
-    globalThis.fetch = async () => new Response(
-      Float32Array.of(1.25, 2.5, 5).buffer,
-      {
-        status: 200,
-        headers: {
-          'Content-Type': 'application/octet-stream',
-          'Content-Length': '12',
-        },
-      },
-    );
-    const result = await loadAnalysisSubset(options([2, 0]));
-    assert.deepEqual(result.cellIndices, [2, 0]);
-    assert.deepEqual(
-      Array.from(result.genes['Gene A'].values),
-      [5, 1.25],
-    );
-    assert.deepEqual(result.genes['Gene A'].indices, [2, 0]);
-  });
-
-  await t.test('duplicate membership rejects before I/O', async () => {
-    let fetchCount = 0;
-    globalThis.fetch = async () => {
-      fetchCount++;
-      return new Response(Float32Array.of(1).buffer);
-    };
-    await assert.rejects(
-      loadAnalysisSubset(options([0, 0])),
-      /cell index 0 is duplicated/i,
-    );
-    assert.equal(fetchCount, 0);
-  });
-
-  await t.test('out-of-range membership rejects instead of inserting NaN', async () => {
-    globalThis.fetch = async () => new Response(
-      Float32Array.of(1).buffer,
-      {
-        status: 200,
-        headers: {
-          'Content-Type': 'application/octet-stream',
-          'Content-Length': '4',
-        },
-      },
-    );
-    await assert.rejects(
-      loadAnalysisSubset(options([1])),
-      /cell index 1.*outside gene "Gene A".*length 1/i,
-    );
-  });
 });
 
 test('sequential observation loading publishes the same raw field contract', async () => {
@@ -1190,25 +757,7 @@ test('sequential observation loading publishes the same raw field contract', asy
   });
 });
 
-test('sequential DataLayer analysis preserves prototype-named genes, fields, and categories', async t => {
-  await t.test('genes', async () => {
-    const layer = bareDataLayer();
-    layer.getDataForPages = async ({ variableKey }) => [{
-      pageId: 'page-1',
-      pageName: 'Page 1',
-      values: Float32Array.of(PROTOTYPE_PROPERTY_NAMES.indexOf(variableKey)),
-      cellIndices: Uint32Array.of(0),
-      cellCount: 1,
-    }];
-
-    const result = await layer.fetchAnalysisData({
-      pageIds: ['page-1'],
-      genes: PROTOTYPE_PROPERTY_NAMES,
-    });
-    assert.equal(result.stats.genesLoaded, PROTOTYPE_PROPERTY_NAMES.length);
-    assertExactOrdinaryRecord(result.genes, PROTOTYPE_PROPERTY_NAMES);
-  });
-
+test('sequential DataLayer analysis preserves prototype-named fields and categories', async t => {
   await t.test('observation fields', async () => {
     const layer = bareDataLayer();
     layer.getAvailableVariables = type => (

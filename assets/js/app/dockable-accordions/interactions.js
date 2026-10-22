@@ -5,6 +5,10 @@ import { clampFloatingPosition } from './geometry.js';
  * Extracted from `dockable-accordions.js` so the main module can stay focused
  * on layout/state while drag/resize logic lives in a dedicated unit.
  *
+ * Every gesture starts on a panel's `<details>` (its summary, its width
+ * handle) and moves, measures and restyles the panel's frame, which is the box
+ * that floats (see `panelFrame` in `dockable-accordions.js`).
+ *
  * @module dockable-accordions/interactions
  */
 
@@ -19,11 +23,6 @@ function expandedRect(rect, paddingPx) {
 
 function pointInRect(x, y, rect) {
   return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
-}
-
-function isInteractiveTarget(target) {
-  if (!(target instanceof Element)) return false;
-  return !!target.closest('button, a, input, select, textarea, [role=\"button\"]');
 }
 
 function createGhost(StyleManager, title, width) {
@@ -71,6 +70,7 @@ export function createAccordionInteractions({
   StyleManager,
   isFiniteNumber,
   getState,
+  panelFrame,
   isFloating,
   raiseToTop,
   undock,
@@ -134,7 +134,7 @@ export function createAccordionInteractions({
   function syncWidthHandleValue(details, widthHandle, knownRect = null) {
     if (!isFloating(details)) return;
     const state = getState(details);
-    const rect = knownRect ?? details.getBoundingClientRect();
+    const rect = knownRect ?? panelFrame(details).getBoundingClientRect();
     const { minWidth, maxWidth } = widthBounds(details, state, rect);
     widthHandle.setAttribute('aria-valuemin', String(Math.round(minWidth)));
     widthHandle.setAttribute('aria-valuemax', String(Math.round(maxWidth)));
@@ -169,8 +169,9 @@ export function createAccordionInteractions({
 
       if (!isFloating(details)) return;
       const state = getState(details);
+      const frame = panelFrame(details);
 
-      const rect = details.getBoundingClientRect();
+      const rect = frame.getBoundingClientRect();
       const { minWidth, maxWidth } = widthBounds(details, state, rect);
       const step = e.shiftKey ? 64 : 16;
       let nextWidth = null;
@@ -182,24 +183,26 @@ export function createAccordionInteractions({
 
       e.preventDefault();
       e.stopPropagation();
-      StyleManager.setPosition(details, {
+      StyleManager.setPosition(frame, {
         width: Math.round(Math.min(Math.max(nextWidth, minWidth), maxWidth)),
       });
       syncWidthHandleValue(details, widthHandle);
     }, { signal });
 
+    // Touch resizes too: the handle declares `touch-action: none`, so the
+    // browser leaves the gesture to this handler instead of panning.
     widthHandle.addEventListener('pointerdown', (e) => {
       if (e.button !== 0) return;
-      if (e.pointerType === 'touch') return;
       e.preventDefault();
       e.stopPropagation();
 
       if (!isFloating(details)) return;
       const state = getState(details);
+      const frame = panelFrame(details);
 
       const pointerId = e.pointerId;
       const startX = e.clientX;
-      const rect = details.getBoundingClientRect();
+      const rect = frame.getBoundingClientRect();
       const startWidth = rect.width;
       const { minWidth } = widthBounds(details, state, rect);
       const maxWidthConstraint = state.widthConstraints?.max;
@@ -212,8 +215,8 @@ export function createAccordionInteractions({
       const startLeft = rect.left;
 
       setGlobalResizeState(true);
-      details.classList.add('resizing');
-      raiseToTop(details);
+      frame.classList.add('resizing');
+      raiseToTop(frame);
 
       try { widthHandle.setPointerCapture(pointerId); } catch {}
 
@@ -221,7 +224,7 @@ export function createAccordionInteractions({
       let pendingWidth = startWidth;
 
       function applyResize() {
-        StyleManager.setPosition(details, { width: Math.round(pendingWidth) });
+        StyleManager.setPosition(frame, { width: Math.round(pendingWidth) });
         rafId = null;
       }
 
@@ -243,7 +246,7 @@ export function createAccordionInteractions({
         if (rafId) { cancelAnimationFrame(rafId); applyResize(); }
         try { widthHandle.releasePointerCapture(pointerId); } catch {}
         setGlobalResizeState(false);
-        details.classList.remove('resizing');
+        frame.classList.remove('resizing');
         syncWidthHandleValue(details, widthHandle);
       }
 
@@ -271,11 +274,11 @@ export function createAccordionInteractions({
     summary.addEventListener('pointerdown', (e) => {
       if (e.button !== 0) return;
       if (e.pointerType === 'touch') return;
-      if (isInteractiveTarget(e.target)) return;
 
       if (isFloating(details)) return;
       const state = getState(details);
       if (!state.dockable) return;
+      const frame = panelFrame(details);
 
       e.preventDefault();
 
@@ -283,7 +286,7 @@ export function createAccordionInteractions({
       const startY = e.clientY;
       const pointerId = e.pointerId;
 
-      const preRect = details.getBoundingClientRect();
+      const preRect = frame.getBoundingClientRect();
       const title = summary.textContent?.trim() || 'Panel';
       const sidebarRect = sidebar.getBoundingClientRect();
 
@@ -307,7 +310,7 @@ export function createAccordionInteractions({
 
           setGlobalDragState(true);
           ghost = createGhost(StyleManager, title, preRect.width);
-          details.classList.add('drag-source');
+          frame.classList.add('drag-source');
         }
 
         positionGhost(ghost, ev.clientX, ev.clientY, offsetX, offsetY);
@@ -329,7 +332,7 @@ export function createAccordionInteractions({
         if (!didDrag) return;
 
         setGlobalDragState(false);
-        details.classList.remove('drag-source');
+        frame.classList.remove('drag-source');
         removeGhost(ghost);
 
         if (willDetach) {
@@ -346,16 +349,20 @@ export function createAccordionInteractions({
     }, { signal });
   }
 
-  // Drag handler for FLOATING panels (re-docking or repositioning)
+  // Drag handler for FLOATING panels (re-docking or repositioning). Unlike a
+  // docked header, which sits in the scrolling sidebar and must leave a touch
+  // drag to the scroll, a floating header has nothing to scroll: a finger moves
+  // the panel exactly as a mouse does (`touch-action: none` on the header), and
+  // a tap still opens or closes it because a drag shorter than the threshold
+  // is not a drag.
   function setupFloatingDrag(summary, details, signal) {
     summary.addEventListener('pointerdown', (e) => {
       if (e.button !== 0) return;
-      if (e.pointerType === 'touch') return;
-      if (isInteractiveTarget(e.target)) return;
 
       if (!isFloating(details)) return;
       const state = getState(details);
       const allowDock = !!state.dockable;
+      const frame = panelFrame(details);
 
       e.preventDefault();
 
@@ -363,7 +370,7 @@ export function createAccordionInteractions({
       const startY = e.clientY;
       const pointerId = e.pointerId;
 
-      const preRect = details.getBoundingClientRect();
+      const preRect = frame.getBoundingClientRect();
       const viewportWidth = window.innerWidth;
       const viewportHeight = window.innerHeight;
 
@@ -401,15 +408,15 @@ export function createAccordionInteractions({
         const newTransform = `translate3d(${tx}px, ${ty}px, 0)`;
         if (newTransform !== lastTransform) {
           lastTransform = newTransform;
-          details.style.transform = newTransform;
+          frame.style.transform = newTransform;
         }
         rafId = null;
       }
 
       function commitPosition() {
         const clamped = clamp(currentX, currentY);
-        details.style.transform = 'translateZ(0)';
-        StyleManager.setPosition(details, { x: clamped.x, y: clamped.y });
+        frame.style.transform = 'translateZ(0)';
+        StyleManager.setPosition(frame, { x: clamped.x, y: clamped.y });
         state.floatLeft = clamped.x;
         state.floatTop = clamped.y;
         lastTransform = '';
@@ -425,9 +432,9 @@ export function createAccordionInteractions({
           didDrag = true;
 
           setGlobalDragState(true);
-          raiseToTop(details);
-          details.classList.add('dragging');
-          details.style.willChange = 'transform';
+          raiseToTop(frame);
+          frame.classList.add('dragging');
+          frame.style.willChange = 'transform';
           cachedSidebarRect = sidebar.getBoundingClientRect();
 
           if (allowDock) setDockIndicator(true, false);
@@ -460,9 +467,9 @@ export function createAccordionInteractions({
 
         commitPosition();
 
-        details.style.willChange = '';
+        frame.style.willChange = '';
         setGlobalDragState(false);
-        details.classList.remove('dragging');
+        frame.classList.remove('dragging');
         if (allowDock) setDockIndicator(false, false);
         state.suppressNextClick = true;
 

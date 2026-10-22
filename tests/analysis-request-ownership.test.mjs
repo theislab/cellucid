@@ -25,6 +25,16 @@ function correlationForm(owner) {
   };
 }
 
+function signatureForm(owner) {
+  return {
+    owner,
+    genes: [`gene-${owner}`],
+    method: 'mean',
+    normalize: 'none',
+    plotType: 'violinplot',
+  };
+}
+
 function createAutoAnalysisHarness(UIClass, formValues) {
   const ui = new UIClass({
     comparisonModule: {},
@@ -62,10 +72,6 @@ class ManualFormHarness extends FormBasedAnalysisUI {
     return 'Manual';
   }
 
-  _getDescription() {
-    return 'Manual request harness';
-  }
-
   _renderFormControls() {}
 
   _getFormValues() {
@@ -84,7 +90,7 @@ for (const analysisCase of [
   {
     label: 'Gene Signature',
     UIClass: GeneSignatureUI,
-    forms: [{ owner: 'older' }, { owner: 'newer' }],
+    forms: [signatureForm('older'), signatureForm('newer')],
   },
 ]) {
   test(`${analysisCase.label} publishes only the newest out-of-order completion`, async () => {

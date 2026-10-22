@@ -13,8 +13,10 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { expect, test } from './helpers/test.mjs';
+import { chooseDirectory } from './helpers/directory-upload.mjs';
 import { APP_ORIGIN, appUrl, sampleUrl } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
+import { openCollapsedPanels } from './helpers/panels.mjs';
 
 const fixturesDirectory = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -86,10 +88,11 @@ async function expectRenderedDataset(page, dataset) {
   await expect(page.locator('#dataset-cells')).toHaveText(String(dataset.cells));
   await expect(page.locator('#dataset-genes')).toHaveText(String(dataset.genes));
   await expect(page.locator('#filter-count')).toHaveText(
-    `Showing all ${dataset.cells} points`,
+    `Showing all ${dataset.cells} cells`,
   );
-  await expect(page.locator('#dimension-select')).toHaveValue(
-    dataset.dimension,
+  // The representation the view opens on is of the dataset's default dimension.
+  await expect(page.locator('#view-representation-select option:checked')).toHaveText(
+    new RegExp(` · ${dataset.dimension}D$`),
   );
   await expect(page.locator('#navigation-mode')).toHaveValue(
     dataset.navigation,
@@ -115,6 +118,7 @@ for (const dataset of DEMO_DATASETS) {
       url.searchParams.set('dataset', dataset.id);
       await page.goto(url.toString(), { waitUntil: 'domcontentloaded' });
       await dismissWelcome(page);
+      await openCollapsedPanels(page);
 
       await expectRenderedDataset(page, dataset);
       expect(errors).toEqual([]);
@@ -132,6 +136,7 @@ test('a cross-origin prepared export catalog renders the same dataset', async ({
   url.searchParams.set('dataset', dataset.id);
   await page.goto(url.toString(), { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
+  await openCollapsedPanels(page);
 
   await expectRenderedDataset(page, dataset);
   expect(errors).toEqual([]);
@@ -148,6 +153,7 @@ test('the sample-dataset selector switches between prepared exports', async ({
   url.searchParams.set('dataset', first.id);
   await page.goto(url.toString(), { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
+  await openCollapsedPanels(page);
   await expectRenderedDataset(page, first);
 
   for (const candidate of DEMO_DATASETS) {
@@ -183,11 +189,13 @@ test('a prepared directory chosen in the browser renders without a server', asyn
   const dataset = DEMO_DATASETS[2];
   await page.goto(localCatalogUrl(), { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
+  await openCollapsedPanels(page);
   await expectRenderedDataset(page, DEMO_DATASETS[1]);
 
-  await page
-    .locator('#user-data-file-input')
-    .setInputFiles(path.join(demoExportsDirectory, dataset.id));
+  await chooseDirectory(
+    page.locator('#user-data-file-input'),
+    path.join(demoExportsDirectory, dataset.id),
+  );
 
   await expectRenderedDataset(page, dataset);
   expect(errors).toEqual([]);
@@ -197,6 +205,7 @@ test('a direct .h5ad file chosen in the browser renders', async ({ page }) => {
   const errors = observeProductErrors(page);
   await page.goto(localCatalogUrl(), { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
+  await openCollapsedPanels(page);
   await expectRenderedDataset(page, DEMO_DATASETS[1]);
 
   await page.locator('#user-data-h5ad-input').setInputFiles(h5adFixturePath);
@@ -205,7 +214,7 @@ test('a direct .h5ad file chosen in the browser renders', async ({ page }) => {
   await expect(page.locator('#dataset-cells')).toHaveText('120');
   await expect(page.locator('#dataset-genes')).toHaveText('6');
   await expect(page.locator('#filter-count')).toHaveText(
-    'Showing all 120 points',
+    'Showing all 120 cells',
   );
   await expect
     .poll(() => page.evaluate(
@@ -223,6 +232,7 @@ test('a portable Zarr ZIP archive chosen in the browser renders', async ({
   const errors = observeProductErrors(page);
   await page.goto(localCatalogUrl(), { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
+  await openCollapsedPanels(page);
   await expectRenderedDataset(page, DEMO_DATASETS[1]);
 
   await page

@@ -56,7 +56,7 @@ function categoricalEntry(payloadIndex, key, categoryCount) {
     categories,
     'uint8',
     255,
-    { '2': centroids },
+    { X_umap_2d: centroids },
   ];
 }
 

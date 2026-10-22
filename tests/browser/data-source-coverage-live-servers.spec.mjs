@@ -34,6 +34,11 @@
 import { expect, test } from './helpers/test.mjs';
 import { APP_ORIGIN as ORIGIN } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
+import { openCollapsedPanels } from './helpers/panels.mjs';
+import {
+  formatCompactCount,
+  formatCount,
+} from '../../assets/js/app/ui/components/display-format.js';
 
 const LOCAL_EXPORTS =
   `${ORIGIN}/tests/browser/fixtures/demo-custom-exports/`;
@@ -73,25 +78,19 @@ function observeProductErrors(page) {
   return errors;
 }
 
-/** Mirror of `formatCellCount` in assets/js/data/data-source.js. */
-function formatCellCount(n) {
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-  if (n >= 1_000) return `${(n / 1_000).toFixed(0)}K`;
-  return String(n);
-}
 
 async function expectRendered(page, { name, cells, genes, field, entries }) {
   await expect(page.locator('#dataset-name')).toHaveText(name, {
     timeout: 90_000,
   });
   await expect(page.locator('#dataset-cells')).toHaveText(
-    formatCellCount(cells),
+    formatCompactCount(cells),
   );
   await expect(page.locator('#dataset-genes')).toHaveText(
-    formatCellCount(genes),
+    formatCompactCount(genes),
   );
   await expect(page.locator('#filter-count')).toHaveText(
-    `Showing all ${cells.toLocaleString('en-US')} points`,
+    `Showing all ${formatCount(cells)} cells`,
   );
   await expect
     .poll(() => page.evaluate(
@@ -129,7 +128,7 @@ test('a prepared export streamed from a real Python server renders', async ({
     field: 'cell_type',
     entries: 8,
   });
-  await expect(page.locator('#dimension-select')).toHaveValue('3');
+  await expect(page.locator('#view-representation-select option:checked')).toHaveText(/ · 3D$/);
   expect(errors).toEqual([]);
 });
 
@@ -144,6 +143,7 @@ test('the sidebar Connect control adopts a real Python server', async ({
   url.searchParams.set('exportsBaseUrl', LOCAL_EXPORTS);
   await page.goto(url.toString(), { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
+  await openCollapsedPanels(page);
   // The sidebar connection controls are wired only after the startup dataset
   // publishes; clicking before that is silently discarded (see OBJ-7 report).
   await expect(page.locator('#dataset-name')).toHaveText(
@@ -172,24 +172,23 @@ test('a real .h5ad served in AnnData mode renders', async ({ page }) => {
     !(await reachable(`${ANNDATA_SERVER}/_cellucid/health`)),
     `No AnnData cellucid server on ${ANNDATA_SERVER}`,
   );
-  // Expected-to-fail while the reader rejects the identity its own writer
-  // emits. `cellucid serve <file>.h5ad` publishes
-  // export_settings.obs_categorical_dtype = "auto"
-  // (cellucid-python/src/cellucid/anndata_adapter.py:1583) and
-  // validateIdentityExportSettings accepts only "uint8"/"uint16"
-  // (assets/js/data/data-source.js:1140-1147) even though its own error text
-  // and the @property doc at data-source.js:36 both name "auto" as legal.
-  // Startup dies with:
-  //   Invalid dataset_identity.json: export_settings.obs_categorical_dtype
-  //   must be auto, uint8, or uint16
-  // Delete this marker when data-source.js accepts "auto".
-  test.fail();
+  // The server serves identity version 3 and publishes the data mapping it
+  // serves at _cellucid/mapping/candidates.json; the viewer reads that
+  // mapping, so a session saved here records the arrays this server chose.
   const url = new URL('/', ORIGIN);
   url.searchParams.set('source', 'remote');
   url.searchParams.set('remote', ANNDATA_SERVER);
   url.searchParams.set('anndata', 'true');
   url.searchParams.set('exportsBaseUrl', LOCAL_EXPORTS);
+  const catalogResponse = page.waitForResponse(
+    response => response.url() === `${ANNDATA_SERVER}/_cellucid/mapping/candidates.json`,
+  );
   await page.goto(url.toString(), { waitUntil: 'domcontentloaded' });
+
+  const catalog = await catalogResponse;
+  expect(catalog.status()).toBe(200);
+  const { defaults } = await catalog.json();
+  expect(defaults.kind).toBe('anndata');
 
   await expect(page.locator('#welcome-modal')).toBeHidden();
   await expectRendered(page, {
@@ -199,6 +198,10 @@ test('a real .h5ad served in AnnData mode renders', async ({ page }) => {
     field: 'cell_type',
     entries: 10,
   });
+  // The mapping the viewer adopted is the one the server published.
+  expect(
+    await page.evaluate(() => JSON.stringify(window._cellucidState.getDataMapping())),
+  ).toBe(JSON.stringify(defaults));
 });
 
 /* ------------------------------------------------------------------ *
@@ -242,6 +245,7 @@ test('the sidebar GitHub control loads a published repository', async ({
   url.searchParams.set('exportsBaseUrl', LOCAL_EXPORTS);
   await page.goto(url.toString(), { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
+  await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
     'Synthetic cell-type islands — 2D',
   );
@@ -304,7 +308,7 @@ test('an authenticated Jupyter bridge renders and delivers its ready event', asy
     field: 'lineage',
     entries: 2,
   });
-  await expect(page.locator('#dimension-select')).toHaveValue('3');
+  await expect(page.locator('#view-representation-select option:checked')).toHaveText(/ · 3D$/);
   await expect(page.locator('#navigation-mode')).toHaveValue('orbit');
 
   // The bridge must have completed the authenticated round trip.

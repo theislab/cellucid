@@ -1,4 +1,8 @@
-import { expect, test } from './helpers/test.mjs';
+import {
+  closeContextWithApplicationRetirement,
+  expect,
+  test,
+} from './helpers/test.mjs';
 
 const WEBGL_HARNESS = '/tests/browser/fixtures/webgl-harness.html';
 
@@ -53,6 +57,12 @@ test('canvas size tracker follows DPR generations without render-loop allocation
     Object.defineProperties(canvas, {
       clientHeight: { configurable: true, get: () => 10 },
       clientWidth: { configurable: true, get: () => 20 },
+      // The tracker sizes the buffer from the canvas's device-pixel-snapped
+      // edges, so the fake box reports the same 20x10 CSS px at the origin.
+      getBoundingClientRect: {
+        configurable: true,
+        value: () => ({ left: 0, top: 0, right: 20, bottom: 10, width: 20, height: 10 }),
+      },
     });
     document.body.appendChild(canvas);
     const tracker = createCanvasResizeObserver(canvas);
@@ -276,6 +286,12 @@ test('canvas size tracker fences callbacks and retries retained cleanup', async 
     Object.defineProperties(canvas, {
       clientHeight: { configurable: true, get: () => 10 },
       clientWidth: { configurable: true, get: () => 20 },
+      // The tracker sizes the buffer from the canvas's device-pixel-snapped
+      // edges, so the fake box reports the same 20x10 CSS px at the origin.
+      getBoundingClientRect: {
+        configurable: true,
+        value: () => ({ left: 0, top: 0, right: 20, bottom: 10, width: 20, height: 10 }),
+      },
     });
     const tracker = createCanvasResizeObserver(canvas);
     const retainedListener = listener;
@@ -323,4 +339,51 @@ test('canvas size tracker fences callbacks and retries retained cleanup', async 
     matchMediaCalls: 1,
     removeCalls: 2,
   });
+});
+
+test('the drawing buffer covers exactly the device pixels the canvas is composited onto', async ({
+  browser,
+}) => {
+  for (const deviceScaleFactor of [1, 2]) {
+    const context = await browser.newContext({ deviceScaleFactor, viewport: { width: 1100, height: 700 } });
+    const page = await context.newPage();
+    try {
+      await page.goto(WEBGL_HARNESS);
+      const measured = await page.evaluate(async () => {
+        const { createCanvasResizeObserver } = await import('/assets/js/rendering/gl-utils.js');
+        const dpr = window.devicePixelRatio;
+        const host = document.createElement('div');
+        // A fractional width and offset, as beside a sidebar: floor(width · dpr)
+        // would be a pixel short of what the canvas covers on screen.
+        host.style.cssText = 'position:absolute; left:290.3px; top:0.25px; width:809.45px; height:600.7px;';
+        const canvas = document.createElement('canvas');
+        canvas.style.cssText = 'width:100%; height:100%; display:block;';
+        host.appendChild(canvas);
+        document.body.appendChild(host);
+        const tracker = createCanvasResizeObserver(canvas);
+        await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        const size = tracker.getSize();
+        const rect = canvas.getBoundingClientRect();
+        const result = {
+          dpr,
+          width: size.width,
+          height: size.height,
+          canvasWidth: canvas.width,
+          canvasHeight: canvas.height,
+          expectedWidth: Math.round(rect.right * dpr) - Math.round(rect.left * dpr),
+          expectedHeight: Math.round(rect.bottom * dpr) - Math.round(rect.top * dpr),
+        };
+        tracker.disconnect();
+        host.remove();
+        return result;
+      });
+      expect(measured.dpr).toBe(deviceScaleFactor);
+      expect(measured.width, `width at dpr ${deviceScaleFactor}`).toBe(measured.expectedWidth);
+      expect(measured.height, `height at dpr ${deviceScaleFactor}`).toBe(measured.expectedHeight);
+      expect(measured.canvasWidth).toBe(measured.width);
+      expect(measured.canvasHeight).toBe(measured.height);
+    } finally {
+      await closeContextWithApplicationRetirement(context);
+    }
+  }
 });

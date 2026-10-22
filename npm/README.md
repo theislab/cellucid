@@ -39,7 +39,7 @@ appear here and this README will describe it.
 
 Installation, data preparation, every loading path, UI controls, examples, and
 troubleshooting are covered in the
-[complete Cellucid documentation](https://cellucid.readthedocs.io/en/latest/).
+[complete Cellucid documentation](https://docs.cellucid.com/en/latest/).
 
 ## Features
 
@@ -58,7 +58,7 @@ troubleshooting are covered in the
 | Resource | URL |
 |----------|-----|
 | Application | https://www.cellucid.com |
-| Documentation | https://cellucid.readthedocs.io/en/latest/ |
+| Documentation | https://docs.cellucid.com/en/latest/ |
 | Web app source | https://github.com/theislab/cellucid |
 | Python package | https://pypi.org/project/cellucid/ |
 | R package | https://github.com/theislab/cellucid-r |

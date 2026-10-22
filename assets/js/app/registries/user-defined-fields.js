@@ -3,7 +3,8 @@
  *
  * Responsibilities:
  * - Create a categorical codes array from highlight pages (with overlap strategy)
- * - Compute per-dimension centroids (raw space) with NO outlier filtering
+ * - Compute per-layout centroids from the normalized positions the viewer
+ *   draws, with NO outlier filtering
  * - Persist soft-deletes so derived columns are restorable
  *
  * Session bundles persist:
@@ -12,14 +13,23 @@
  */
 
 import { StateValidator } from '../utils/state-validator.js';
-import { FieldKind, FieldSource, Limits, OverlapStrategy, generateId } from '../utils/field-constants.js';
+import { FieldKind, FieldSource, OverlapStrategy, generateId } from '../utils/field-constants.js';
 import {
   categoricalStorageForCodes,
   categoricalStorageForCount,
   requireCategoricalCategoryCount
 } from '../../data/categorical-storage-contract.js';
 import { BaseRegistry } from './base-registry.js';
-import { computeAllDimensionCentroids, computeCentroidsForDimension } from './user-defined-fields/centroids.js';
+import {
+  compareIntersectionMasks,
+  intersectionMembership,
+  orderedMembership
+} from '../utils/page-membership.js';
+import {
+  computeAllLayoutCentroids,
+  computeCentroidsForDimension
+} from './user-defined-fields/centroids.js';
+import { isCategoricalCodes } from '../../data/categorical-storage-contract.js';
 
 function requireNonEmptyTrimmedString(value, context) {
   if (
@@ -82,7 +92,7 @@ function requireCategoryInventory(categories, context) {
  */
 export function requireCategoryCodes(codes, categories, expectedLength, context) {
   if (
-    (!(codes instanceof Uint8Array) && !(codes instanceof Uint16Array))
+    !isCategoricalCodes(codes)
     || codes.length !== expectedLength
   ) {
     throw new TypeError(`${context} codes must be an exact typed dataset-length array`);
@@ -102,32 +112,24 @@ export class UserDefinedFieldsRegistry extends BaseRegistry {
     this._fields = this._data; // id -> field definition
   }
 
-  _getActiveFieldCount() {
-    let count = 0;
-    for (const [id, field] of this._fields) {
-      if (!field || typeof field !== 'object') {
-        throw new TypeError(`User-defined field "${id}" must be an object`);
-      }
-      if (typeof field._isDeleted !== 'boolean') {
-        throw new TypeError(`User-defined field "${id}" requires exact deletion state`);
-      }
-      if (field._isDeleted) continue;
-      count++;
-    }
-    return count;
-  }
-
   /**
    * Public wrapper for centroid computation so other components can reuse
-   * the exact same multi-dimension centroid logic (DRY).
+   * the exact same per-layout centroid logic (DRY).
+   *
+   * Centroids exist for every layout whose normalized positions are resident,
+   * and every one of them is recorded in `normalizedLayouts`: a field takes
+   * both together.
    *
    * @param {Uint8Array|Uint16Array} codes
    * @param {(string|number|boolean)[]} categories
    * @param {object} state - DataState
-   * @returns {Record<string, Array<{category: string, position: number[], n_points: number}>>}
+   * @returns {{
+   *   centroidsByLayout: Map<string, Array<{category: string, position: number[], n_points: number}>>,
+   *   normalizedLayouts: Set<string>
+   * }}
    */
-  computeCentroidsByDim(codes, categories, state) {
-    return computeAllDimensionCentroids(codes, categories, state);
+  computeCentroidsByLayout(codes, categories, state) {
+    return computeAllLayoutCentroids(codes, categories, state);
   }
 
   /**
@@ -181,19 +183,16 @@ export class UserDefinedFieldsRegistry extends BaseRegistry {
       }
     }
 
-    if (this._getActiveFieldCount() >= Limits.MAX_USER_DEFINED_FIELDS) {
-      throw new Error(`Maximum ${Limits.MAX_USER_DEFINED_FIELDS} user-defined fields allowed`);
-    }
-
     const id = generateId('user_cat');
-    const centroidsByDim = computeAllDimensionCentroids(codes, categories, state);
+    const { centroidsByLayout, normalizedLayouts } =
+      computeAllLayoutCentroids(codes, categories, state);
 
     const field = {
       key,
       kind: FieldKind.CATEGORY,
       categories: [...categories],
       codes,
-      centroidsByDim,
+      centroidsByLayout,
       loaded: true,
 
       _isUserDefined: true,
@@ -201,7 +200,7 @@ export class UserDefinedFieldsRegistry extends BaseRegistry {
       _isPurged: false,
       _userDefinedId: id,
       _fieldSource: source,
-      _normalizedDims: new Set(),
+      _normalizedLayouts: normalizedLayouts,
       _sourceField: meta?._sourceField ?? null,
       _operation: meta?._operation ?? null,
       _sourcePages: [],
@@ -237,10 +236,6 @@ export class UserDefinedFieldsRegistry extends BaseRegistry {
     const { key, source, sourceField, meta } = options;
 
     StateValidator.validateFieldKey(key);
-
-    if (this._getActiveFieldCount() >= Limits.MAX_USER_DEFINED_FIELDS) {
-      throw new Error(`Maximum ${Limits.MAX_USER_DEFINED_FIELDS} user-defined fields allowed`);
-    }
 
     if (source !== FieldSource.OBS && source !== FieldSource.VAR) {
       throw new TypeError('Continuous field source must be exactly "obs" or "var"');
@@ -326,10 +321,6 @@ export class UserDefinedFieldsRegistry extends BaseRegistry {
       intersectionLabels
     } = options;
 
-    if (this._getActiveFieldCount() >= Limits.MAX_USER_DEFINED_FIELDS) {
-      throw new Error(`Maximum ${Limits.MAX_USER_DEFINED_FIELDS} user-defined fields allowed`);
-    }
-
     if (
       state === null
       || typeof state !== 'object'
@@ -380,11 +371,13 @@ export class UserDefinedFieldsRegistry extends BaseRegistry {
       };
     });
 
-    const getCellSetForPage = (page) => {
+    // Each page's enabled groups, validated as the membership is built.
+    const membershipPages = resolvedPages.map(({ page }) => {
       if (!Array.isArray(page.highlightedGroups)) {
         throw new TypeError(`Highlight page "${page.id}" requires a highlightedGroups array`);
       }
-      const cellSet = new Set();
+      const groups = [];
+      const groupIndices = [];
       for (let groupIndex = 0; groupIndex < page.highlightedGroups.length; groupIndex++) {
         const group = page.highlightedGroups[groupIndex];
         if (!group || typeof group !== 'object' || Array.isArray(group)) {
@@ -401,22 +394,16 @@ export class UserDefinedFieldsRegistry extends BaseRegistry {
           );
         }
         if (!group.enabled) continue;
-        for (const cellIdx of group.cellIndices) {
-          if (!Number.isSafeInteger(cellIdx) || cellIdx < 0 || cellIdx >= pointCount) {
-            throw new RangeError(
-              `Highlight page "${page.id}" group ${groupIndex} has an out-of-range cell index`
-            );
-          }
-          cellSet.add(cellIdx);
-        }
+        groups.push(group.cellIndices);
+        groupIndices.push(groupIndex);
       }
-      return cellSet;
-    };
+      return {
+        groups,
+        describeGroup: position => `Highlight page "${page.id}" group ${groupIndices[position]}`
+      };
+    });
 
     const pageLabels = pages.map(pageInfo => pageInfo.label);
-    const pageCellSets = resolvedPages.map(({ page }) => (
-      getCellSetForPage(page)
-    ));
     const hasUncovered = uncoveredLabel.length > 0;
     const strategy = overlapStrategy;
 
@@ -433,46 +420,9 @@ export class UserDefinedFieldsRegistry extends BaseRegistry {
     // Strategy: split overlaps into intersection categories
     // ---------------------------------------------------------------------
     if (strategy === OverlapStrategy.INTERSECTIONS) {
-      if (pages.length > Limits.MAX_INTERSECTION_PAGES) {
-        throw new Error(`Too many pages for intersections (max ${Limits.MAX_INTERSECTION_PAGES})`);
-      }
-
-      const membershipByCell = new Map(); // cellIdx -> bitmask
-
-      pageCellSets.forEach((cellSet, pageIndex) => {
-        const bit = 1 << pageIndex;
-        for (const cellIdx of cellSet) {
-          const prev = membershipByCell.has(cellIdx)
-            ? membershipByCell.get(cellIdx)
-            : 0;
-          membershipByCell.set(cellIdx, prev | bit);
-        }
-      });
-
-      const isPowerOfTwo = v => v > 0 && (v & (v - 1)) === 0;
-      const bitCount32 = (v) => {
-        let x = v >>> 0;
-        let c = 0;
-        while (x) { x &= (x - 1); c++; }
-        return c;
-      };
-
-      const maskCounts = new Map();
-      let overlapCount = 0;
-      for (const mask of membershipByCell.values()) {
-        const previousCount = maskCounts.has(mask)
-          ? maskCounts.get(mask)
-          : 0;
-        maskCounts.set(mask, previousCount + 1);
-        if (!isPowerOfTwo(mask)) overlapCount++;
-      }
-
-      const intersectionMasks = [...maskCounts.keys()]
-        .filter((mask) => !isPowerOfTwo(mask))
-        .sort((a, b) => {
-          const cardinality = bitCount32(a) - bitCount32(b);
-          return cardinality === 0 ? a - b : cardinality;
-        });
+      const membership = intersectionMembership(membershipPages, pointCount);
+      const intersectionMasks = [...membership.intersectionCounts.keys()]
+        .sort(compareIntersectionMasks);
       const expectedMaskKeys = intersectionMasks.map(mask => String(mask));
       const expectedMaskKeySet = new Set(expectedMaskKeys);
       const providedMaskKeys = Object.keys(intersectionLabels);
@@ -489,9 +439,8 @@ export class UserDefinedFieldsRegistry extends BaseRegistry {
       const intersectionIndexByMask = new Map();
 
       for (const mask of intersectionMasks) {
-        const maskKey = String(mask);
         intersectionIndexByMask.set(mask, categories.length);
-        categories.push(intersectionLabels[maskKey]);
+        categories.push(intersectionLabels[String(mask)]);
       }
 
       if (hasUncovered) {
@@ -509,30 +458,20 @@ export class UserDefinedFieldsRegistry extends BaseRegistry {
         ? (categories.length - 1)
         : storage.missingValue;
       codes = new storage.TypedArrayClass(pointCount);
-      codes.fill(uncoveredIndex);
-
-      for (const [cellIdx, mask] of membershipByCell) {
-        if (isPowerOfTwo(mask)) {
-          const pageIndex = Math.log2(mask);
-          codes[cellIdx] = pageIndex;
+      const { masks } = membership;
+      for (let cellIdx = 0; cellIdx < pointCount; cellIdx++) {
+        const mask = masks[cellIdx];
+        if (mask === 0) {
+          codes[cellIdx] = uncoveredIndex;
+        } else if ((mask & (mask - 1)) === 0) {
+          codes[cellIdx] = 31 - Math.clz32(mask);
         } else {
-          const idx = intersectionIndexByMask.get(mask);
-          if (!Number.isSafeInteger(idx)) {
-            throw new Error(
-              `Intersection mask ${mask} has no exact category index`
-            );
-          }
-          codes[cellIdx] = idx;
+          codes[cellIdx] = intersectionIndexByMask.get(mask);
         }
       }
 
-      conflictCount = overlapCount;
-      if (membershipByCell.size > pointCount) {
-        throw new RangeError(
-          'Intersection membership exceeds the current point count'
-        );
-      }
-      uncoveredCount = pointCount - membershipByCell.size;
+      conflictCount = membership.overlapCount;
+      uncoveredCount = pointCount - membership.coveredCount;
     } else {
       // -------------------------------------------------------------------
       // Strategies: first/last/overlap-label
@@ -566,42 +505,26 @@ export class UserDefinedFieldsRegistry extends BaseRegistry {
         ? (categories.length - 1)
         : storage.missingValue;
       codes = new storage.TypedArrayClass(pointCount);
-      codes.fill(unassigned);
 
-      const assignedCount = new Uint8Array(pointCount);
-      const conflictFlag = new Uint8Array(pointCount);
-      let assignedTotal = 0;
-
-      pageCellSets.forEach((cellSet, catIndex) => {
-        for (const cellIdx of cellSet) {
-          if (assignedCount[cellIdx] > 0) {
-            if (conflictFlag[cellIdx] === 0) {
-              conflictFlag[cellIdx] = 1;
-              conflictCount++;
-            }
-
-            if (strategy === OverlapStrategy.OVERLAP_LABEL && overlapCategoryIndex >= 0) {
-              codes[cellIdx] = overlapCategoryIndex;
-            } else if (strategy === OverlapStrategy.LAST) {
-              codes[cellIdx] = catIndex;
-            }
-          } else {
-            assignedTotal++;
-            codes[cellIdx] = catIndex;
-          }
-          assignedCount[cellIdx]++;
+      const membership = orderedMembership(membershipPages, pointCount);
+      const owner = strategy === OverlapStrategy.LAST ? membership.last : membership.first;
+      const { overlapping } = membership;
+      for (let cellIdx = 0; cellIdx < pointCount; cellIdx++) {
+        const page = owner[cellIdx];
+        if (page < 0) {
+          codes[cellIdx] = unassigned;
+        } else if (strategy === OverlapStrategy.OVERLAP_LABEL && overlapping[cellIdx] === 1) {
+          codes[cellIdx] = overlapCategoryIndex;
+        } else {
+          codes[cellIdx] = page;
         }
-      });
-
-      if (assignedTotal > pointCount) {
-        throw new RangeError(
-          'Assigned highlight membership exceeds the current point count'
-        );
       }
-      uncoveredCount = pointCount - assignedTotal;
+      conflictCount = membership.overlapCount;
+      uncoveredCount = pointCount - membership.coveredCount;
     }
 
-    const centroidsByDim = computeAllDimensionCentroids(codes, categories, state);
+    const { centroidsByLayout, normalizedLayouts } =
+      computeAllLayoutCentroids(codes, categories, state);
     const id = generateId('user_cat');
 
     const field = {
@@ -609,7 +532,7 @@ export class UserDefinedFieldsRegistry extends BaseRegistry {
       kind: FieldKind.CATEGORY,
       categories: [...categories],
       codes,
-      centroidsByDim,
+      centroidsByLayout,
       loaded: true,
 
       _isUserDefined: true,
@@ -617,7 +540,7 @@ export class UserDefinedFieldsRegistry extends BaseRegistry {
       _isPurged: false,
       _userDefinedId: id,
       _fieldSource: FieldSource.OBS,
-      _normalizedDims: new Set(),
+      _normalizedLayouts: normalizedLayouts,
       _sourceField: null,
       _operation: null,
       _sourcePages: pages.map((p) => ({ pageId: p.pageId, label: p.label })),
@@ -634,13 +557,16 @@ export class UserDefinedFieldsRegistry extends BaseRegistry {
   }
 
   /**
-   * Lazy centroid recomputation for a dimension that was not available at creation time.
-   * Called when the user switches to a dimension that just loaded.
+   * Lazy centroid computation for a layout that was not resident when the
+   * field's centroids were last computed. Called when a view switches to a
+   * layout, with the normalized positions that view is about to draw; the
+   * centroids are therefore normalized, and recorded as such.
    * @param {string} fieldId
-   * @param {number} dim
-   * @param {Float32Array} positions - raw positions with stride = dim
+   * @param {string} layoutKey
+   * @param {number} dim - The layout's dimension
+   * @param {Float32Array} positions - the layout's normalized positions, stride = dim
    */
-  recomputeCentroidsForDimension(fieldId, dim, positions) {
+  recomputeCentroidsForLayout(fieldId, layoutKey, dim, positions) {
     if (
       typeof fieldId !== 'string'
       || fieldId.length === 0
@@ -653,13 +579,18 @@ export class UserDefinedFieldsRegistry extends BaseRegistry {
       throw new Error(`User-defined field "${fieldId}" does not exist`);
     }
     if (
-      !field.centroidsByDim
-      || typeof field.centroidsByDim !== 'object'
-      || Array.isArray(field.centroidsByDim)
+      !(field.centroidsByLayout instanceof Map)
+      || !(field._normalizedLayouts instanceof Set)
     ) {
       throw new TypeError(`User-defined field "${fieldId}" has invalid centroid metadata`);
     }
-    field.centroidsByDim[String(dim)] = computeCentroidsForDimension(field.codes, field.categories, positions, dim);
+    if (typeof layoutKey !== 'string' || layoutKey.length === 0) {
+      throw new TypeError('Centroid layout key must be a non-empty string');
+    }
+    const centroids =
+      computeCentroidsForDimension(field.codes, field.categories, positions, dim);
+    field.centroidsByLayout.set(layoutKey, centroids);
+    field._normalizedLayouts.add(layoutKey);
   }
 
   getField(id) {
@@ -719,9 +650,9 @@ export class UserDefinedFieldsRegistry extends BaseRegistry {
     field.codes = null;
     field.values = null;
     field.categories = [];
-    field.centroidsByDim = {};
+    field.centroidsByLayout = new Map();
     field.loaded = false;
-    field._normalizedDims = new Set();
+    field._normalizedLayouts = new Set();
     field._sourcePages = [];
     field._intersectionLabels = null;
     return true;
@@ -739,11 +670,11 @@ export class UserDefinedFieldsRegistry extends BaseRegistry {
     const updateKeys = Object.keys(updates);
     const supportedKeys = new Set([
       'categories',
-      'centroidsByDim',
+      'centroidsByLayout',
       'codes',
       'isDeleted',
       'key',
-      'normalizedDims',
+      'normalizedLayouts',
       'operation',
       'sourceField'
     ]);
@@ -774,10 +705,7 @@ export class UserDefinedFieldsRegistry extends BaseRegistry {
       // codes chunk, because an unloaded field has no codes to walk.
       const inventoryResized = nextCategories.length !== field.categories.length;
       if (nextCodes !== field.codes || inventoryResized) {
-        const expectedLength = (
-          field.codes instanceof Uint8Array
-          || field.codes instanceof Uint16Array
-        )
+        const expectedLength = isCategoricalCodes(field.codes)
           ? field.codes.length
           : field._codesLengthHint;
         if (!Number.isSafeInteger(expectedLength) || expectedLength < 1) {
@@ -793,31 +721,27 @@ export class UserDefinedFieldsRegistry extends BaseRegistry {
     } else if (
       Object.hasOwn(updates, 'categories')
       || Object.hasOwn(updates, 'codes')
-      || Object.hasOwn(updates, 'centroidsByDim')
-      || Object.hasOwn(updates, 'normalizedDims')
+      || Object.hasOwn(updates, 'centroidsByLayout')
+      || Object.hasOwn(updates, 'normalizedLayouts')
     ) {
       throw new TypeError('Continuous user-defined fields cannot accept categorical updates');
     }
 
-    const nextCentroids = Object.hasOwn(updates, 'centroidsByDim')
-      ? updates.centroidsByDim
-      : field.centroidsByDim;
+    const nextCentroids = Object.hasOwn(updates, 'centroidsByLayout')
+      ? updates.centroidsByLayout
+      : field.centroidsByLayout;
     if (
       field.kind === FieldKind.CATEGORY
-      && (
-        !nextCentroids
-        || typeof nextCentroids !== 'object'
-        || Array.isArray(nextCentroids)
-      )
+      && !(nextCentroids instanceof Map)
     ) {
       throw new TypeError(`User-defined field "${id}" requires centroid metadata`);
     }
-    const nextNormalizedDims = Object.hasOwn(updates, 'normalizedDims')
-      ? updates.normalizedDims
-      : field._normalizedDims;
+    const nextNormalizedLayouts = Object.hasOwn(updates, 'normalizedLayouts')
+      ? updates.normalizedLayouts
+      : field._normalizedLayouts;
     if (
       field.kind === FieldKind.CATEGORY
-      && !(nextNormalizedDims instanceof Set)
+      && !(nextNormalizedLayouts instanceof Set)
     ) {
       throw new TypeError(`User-defined field "${id}" normalization state must be a Set`);
     }
@@ -843,8 +767,8 @@ export class UserDefinedFieldsRegistry extends BaseRegistry {
     if (field.kind === FieldKind.CATEGORY) {
       field.categories = nextCategories;
       field.codes = nextCodes;
-      field.centroidsByDim = nextCentroids;
-      field._normalizedDims = nextNormalizedDims;
+      field.centroidsByLayout = nextCentroids;
+      field._normalizedLayouts = nextNormalizedLayouts;
     }
     return true;
   }
@@ -859,6 +783,9 @@ export class UserDefinedFieldsRegistry extends BaseRegistry {
    * The session bundle stores user-defined field definitions in an eager JSON
    * chunk (key/categories/source refs), while the large categorical `codes`
    * arrays are stored separately as binary chunks and loaded lazily.
+   *
+   * Centroids are not part of the record: they are derived from the codes
+   * and each layout's positions, and recomputed when the codes are restored.
    *
    * @returns {any[]}
    */
@@ -931,7 +858,7 @@ export class UserDefinedFieldsRegistry extends BaseRegistry {
         field.categories,
         `User-defined field "${id}"`
       );
-      if (!(field.codes instanceof Uint8Array) && !(field.codes instanceof Uint16Array)) {
+      if (!isCategoricalCodes(field.codes)) {
         throw new TypeError(`User-defined field "${id}" requires exact typed codes`);
       }
       if (field.loaded !== true) {
@@ -948,10 +875,8 @@ export class UserDefinedFieldsRegistry extends BaseRegistry {
       const codesType = field.codes.constructor.name;
       const codesLength = field.codes.length;
       if (
-        !field.centroidsByDim
-        || typeof field.centroidsByDim !== 'object'
-        || Array.isArray(field.centroidsByDim)
-        || !(field._normalizedDims instanceof Set)
+        !(field.centroidsByLayout instanceof Map)
+        || !(field._normalizedLayouts instanceof Set)
         || !Array.isArray(field._sourcePages)
         || !Object.values(OverlapStrategy).includes(field._overlapStrategy)
       ) {
@@ -978,8 +903,6 @@ export class UserDefinedFieldsRegistry extends BaseRegistry {
         isPurged: field._isPurged,
         codesLength,
         codesType,
-        centroidsByDim: field.centroidsByDim,
-        normalizedDims: [...field._normalizedDims],
         sourceField: field._sourceField,
         operation: field._operation,
         sourcePages: field._sourcePages,
@@ -1046,7 +969,7 @@ export class UserDefinedFieldsRegistry extends BaseRegistry {
           values: null,
           codes: null,
           categories: [],
-          centroidsByDim: {},
+          centroidsByLayout: new Map(),
           loaded: false,
           _loadingPromise: null,
 
@@ -1055,7 +978,7 @@ export class UserDefinedFieldsRegistry extends BaseRegistry {
           _isPurged: true,
           _userDefinedId: item.id,
           _fieldSource: source,
-          _normalizedDims: new Set(),
+          _normalizedLayouts: new Set(),
           _sourceField: item.sourceField,
           _operation: item.operation,
           _sourcePages: [],
@@ -1095,6 +1018,7 @@ export class UserDefinedFieldsRegistry extends BaseRegistry {
       if (
         item.codesType !== 'Uint8Array'
         && item.codesType !== 'Uint16Array'
+        && item.codesType !== 'Uint32Array'
       ) {
         throw new TypeError(`User-defined session item ${itemIndex} has invalid codesType`);
       }
@@ -1104,10 +1028,6 @@ export class UserDefinedFieldsRegistry extends BaseRegistry {
       if (
         !Array.isArray(item.categories)
         || item.categories.length === 0
-        || !item.centroidsByDim
-        || typeof item.centroidsByDim !== 'object'
-        || Array.isArray(item.centroidsByDim)
-        || !Array.isArray(item.normalizedDims)
         || !Array.isArray(item.sourcePages)
         || !Object.values(OverlapStrategy).includes(item.overlapStrategy)
       ) {
@@ -1133,12 +1053,16 @@ export class UserDefinedFieldsRegistry extends BaseRegistry {
           `User-defined session item ${itemIndex} uncovered label`
         );
       }
+      // Centroids are not stored: they are derived from the codes and the
+      // positions of each layout, and computed once the codes are restored.
+      const centroidsByLayout = new Map();
+      const normalizedLayouts = new Set();
       const field = {
         key: item.key,
         kind: FieldKind.CATEGORY,
         categories: [...item.categories],
         codes: null,
-        centroidsByDim: item.centroidsByDim,
+        centroidsByLayout,
         loaded: false,
         _loadingPromise: null,
 
@@ -1155,7 +1079,7 @@ export class UserDefinedFieldsRegistry extends BaseRegistry {
         _intersectionLabels: item.intersectionLabels,
         _uncoveredLabel: item.uncoveredLabel,
         _createdAt: item.createdAt,
-        _normalizedDims: new Set(item.normalizedDims),
+        _normalizedLayouts: normalizedLayouts,
 
         // Hints used by session restore to validate incoming code payloads.
         _codesLengthHint: item.codesLength,

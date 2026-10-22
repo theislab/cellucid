@@ -17,9 +17,39 @@
  */
 
 import { getPerformanceConfig } from '../shared/performance-config.js';
-import { gatherFloat32, gatherComplementFloat32 } from '../shared/typed-array-utils.js';
+import {
+  complementGatherPlan,
+  gatherFloat32,
+  indexGatherPlan
+} from '../shared/typed-array-utils.js';
 import { getMemoryMonitor } from '../shared/memory-monitor.js';
 import { debug, debugWarn } from '../shared/debug-utils.js';
+import { formatDuration } from '../../notification-center/formatters.js';
+import { createSlicedYield } from '../shared/concurrency-utils.js';
+
+/** Payload downloads a run keeps in flight ahead of decoding, at first. */
+const PAYLOAD_WINDOW_MIN = 8;
+/**
+ * The most payload downloads in flight at once: about what one HTTP/2
+ * connection serves concurrently (servers typically allow 100 to 256 streams;
+ * the browser queues the rest).
+ */
+const PAYLOAD_WINDOW_MAX = 256;
+
+function createPayloadWindow() {
+  return {
+    size: PAYLOAD_WINDOW_MIN,
+    maxAhead: PAYLOAD_WINDOW_MIN,
+    inFlight: new Set(),
+    done: new Set(),
+    stopped: false,
+    bytes: 0,
+    completed: 0,
+    roundStart: 0,
+    roundTime: performance.now(),
+    lastRate: null
+  };
+}
 
 // =============================================================================
 // CONSTANTS
@@ -83,8 +113,12 @@ function requireIndexCollection(indices, owner, valueCount, { sorted = false } =
   ) {
     throw new TypeError(`${owner} must be an array-like index collection`);
   }
+  // Uniqueness of an unsorted collection is checked against a cell mask
+  // (one byte per cell, allocated only once an index arrives out of order),
+  // not a Set of every index: page index sets are ascending, so the common
+  // case costs one comparison per index.
   let previous = -1;
-  const seen = sorted ? null : new Set();
+  let seen = null;
   for (let index = 0; index < indices.length; index++) {
     const cellIndex = indices[index];
     if (
@@ -94,13 +128,19 @@ function requireIndexCollection(indices, owner, valueCount, { sorted = false } =
     ) {
       throw new RangeError(`${owner}[${index}] is outside the gene value range`);
     }
-    if (sorted && cellIndex <= previous) {
-      throw new TypeError(`${owner} must contain sorted unique cell indices`);
+    if (cellIndex <= previous && seen === null) {
+      if (sorted) {
+        throw new TypeError(`${owner} must contain sorted unique cell indices`);
+      }
+      seen = new Uint8Array(valueCount);
+      for (let prior = 0; prior < index; prior++) seen[indices[prior]] = 1;
     }
-    if (!sorted && seen.has(cellIndex)) {
-      throw new TypeError(`${owner} must contain unique cell indices`);
+    if (seen !== null) {
+      if (seen[cellIndex] === 1) {
+        throw new TypeError(`${owner} must contain unique cell indices`);
+      }
+      seen[cellIndex] = 1;
     }
-    seen?.add(cellIndex);
     previous = cellIndex;
   }
   return indices;
@@ -154,11 +194,12 @@ export class StreamingGeneLoader {
     if (
       !dataLayer ||
       typeof dataLayer.ensureGeneExpressionLoaded !== 'function' ||
+      typeof dataLayer.prefetchGenePayload !== 'function' ||
       typeof dataLayer.unloadGeneExpression !== 'function' ||
       typeof dataLayer.invalidateVariable !== 'function'
     ) {
       throw new TypeError(
-        '[StreamingGeneLoader] dataLayer must implement exact gene load, unload, and invalidation methods'
+        '[StreamingGeneLoader] dataLayer must implement exact gene load, payload prefetch, unload, and invalidation methods'
       );
     }
     if (!config || typeof config !== 'object' || Array.isArray(config)) {
@@ -242,6 +283,18 @@ export class StreamingGeneLoader {
     this._loadQueue = [];
     /** @type {boolean} Whether streaming has been aborted */
     this._aborted = false;
+    /**
+     * Ends the current run's gene downloads: those still waiting in the
+     * download scheduler never start, and those under way stop.
+     * @type {AbortController|null}
+     */
+    this._runDownloads = null;
+    /**
+     * Payload downloads ahead of decoding (see `_startPayloadPrefetch`): the
+     * genes whose bytes are kept or being downloaded, how many downloads may
+     * be in flight, and what the window measures to size itself.
+     */
+    this._payloads = createPayloadWindow();
     /** @type {number} Current effective buffer size (may reduce under pressure) */
     this._effectiveBufferSize = this._maxBufferSize;
     /** @type {number} Unique run ID to detect stale callbacks */
@@ -298,6 +351,14 @@ export class StreamingGeneLoader {
   */
   async *streamGenes(geneList, groupA, groupB) {
     requireGeneList(geneList);
+    // A group is the same cell set for every gene of the run, and every loaded
+    // gene is checked to hold exactly `_totalCells` values, so each group is
+    // validated against that length once here rather than once per gene. The
+    // per-gene check it replaces rebuilt a Set of every selected index for every
+    // gene — 2,000 genes over two 25,000-cell groups inserted 100 million
+    // entries, a third of a differential-expression run's main-thread time.
+    const gatherA = this._prepareGroupGather(groupA, 'groupA');
+    const gatherB = this._prepareGroupGather(groupB, 'groupB');
     if (geneList.length === 0) return;
     const currentRunId = this._beginRun(geneList, 'grouped');
     const abortSignal = this.signal;
@@ -313,14 +374,15 @@ export class StreamingGeneLoader {
     let primaryError;
     try {
       this._startPrefetch();
+      const yieldIfSliceSpent = createSlicedYield();
 
       for (let i = 0; i < geneList.length; i++) {
         this._throwIfAborted();
 
         const gene = geneList[i];
         const values = await this._waitForGene(gene);
-        const valuesA = this._gatherGroupValues(values, groupA, 'groupA');
-        const valuesB = this._gatherGroupValues(values, groupB, 'groupB');
+        const valuesA = gatherA(values);
+        const valuesB = gatherB(values);
 
         this._buffer.delete(gene);
         this._releaseGene(gene);
@@ -339,9 +401,9 @@ export class StreamingGeneLoader {
 
         this._startPrefetch();
 
-        if (i > 0 && i % 25 === 0) {
-          await new Promise(resolve => setTimeout(resolve, 0));
-        }
+        // Buffered genes resolve as microtasks, so a fast consumer would
+        // otherwise keep the main thread for the whole buffer.
+        await yieldIfSliceSpent();
       }
     } catch (error) {
       hasPrimaryError = true;
@@ -396,6 +458,7 @@ export class StreamingGeneLoader {
     let primaryError;
     try {
       this._startPrefetch();
+      const yieldIfSliceSpent = createSlicedYield();
 
       for (let i = 0; i < geneList.length; i++) {
         this._throwIfAborted();
@@ -420,9 +483,9 @@ export class StreamingGeneLoader {
 
         this._startPrefetch();
 
-        if (i > 0 && i % 25 === 0) {
-          await new Promise(resolve => setTimeout(resolve, 0));
-        }
+        // Buffered genes resolve as microtasks, so a fast consumer would
+        // otherwise keep the main thread for the whole buffer.
+        await yieldIfSliceSpent();
       }
     } catch (error) {
       hasPrimaryError = true;
@@ -457,7 +520,7 @@ export class StreamingGeneLoader {
     return {
       ...this._stats,
       durationMs: duration,
-      durationFormatted: this._formatDuration(duration),
+      durationFormatted: formatDuration(duration),
       genesPerSecond: duration > 0 ? (this._stats.genesLoaded / (duration / 1000)).toFixed(1) : null,
       bufferSize: this._buffer.size,
       loadingCount: this._loadingGenes.size,
@@ -506,6 +569,8 @@ export class StreamingGeneLoader {
     this._stats.endTime = null;
     this._aborted = false;
     this._abortReason = null;
+    this._runDownloads = new AbortController();
+    this._payloads = createPayloadWindow();
     this._buffer.clear();
     this._failures.clear();
     this._loadingGenes.clear();
@@ -549,6 +614,11 @@ export class StreamingGeneLoader {
     const errors = [];
     this._aborted = true;
     this._loadQueue = [];
+    // Nothing of this run is wanted any more.
+    this._runDownloads?.abort(
+      this._abortReason ?? new DOMException('Gene streaming run ended', 'AbortError')
+    );
+    this._runDownloads = null;
 
     if (abortSignal && abortHandler) {
       try {
@@ -621,13 +691,15 @@ export class StreamingGeneLoader {
   }
 
   /**
-   * @param {Float32Array} values
+   * Validate one group specification against the run's cell count and return
+   * the gather that extracts its values from a whole-gene vector.
+   *
    * @param {Object} group
    * @param {string} owner
-   * @returns {Float32Array}
+   * @returns {(values: Float32Array) => Float32Array}
    * @private
    */
-  _gatherGroupValues(values, group, owner) {
+  _prepareGroupGather(group, owner) {
     if (!group || typeof group !== 'object' || Array.isArray(group)) {
       throw new TypeError(`${owner} must be a group specification object`);
     }
@@ -643,10 +715,11 @@ export class StreamingGeneLoader {
       const excluded = requireIndexCollection(
         group.excludedCellIndices,
         `${owner}.excludedCellIndices`,
-        values.length,
+        this._totalCells,
         { sorted: true }
       );
-      return gatherComplementFloat32(values, excluded);
+      const plan = complementGatherPlan(excluded, this._totalCells);
+      return values => gatherFloat32(values, plan);
     }
     if (group.excludedCellIndices !== undefined) {
       throw new TypeError(
@@ -656,9 +729,10 @@ export class StreamingGeneLoader {
     const indices = requireIndexCollection(
       group.cellIndices,
       `${owner}.cellIndices`,
-      values.length
+      this._totalCells
     );
-    return gatherFloat32(values, indices);
+    const plan = indexGatherPlan(indices);
+    return values => gatherFloat32(values, plan);
   }
 
   /**
@@ -754,12 +828,119 @@ export class StreamingGeneLoader {
       }
     }
 
+    this._startPayloadPrefetch();
+
     // Log periodically to help diagnose performance issues
     if (this._stats.genesLoaded > 0 && this._stats.genesLoaded % 100 === 0) {
       const elapsed = (performance.now() - this._stats.startTime) / 1000;
       const rate = this._stats.genesLoaded / elapsed;
       debug('StreamingGeneLoader', `Progress: ${this._stats.genesLoaded} loaded (${rate.toFixed(1)}/s), loading=${this._loadingGenes.size}, buffered=${this._buffer.size}, queued=${this._loadQueue.length}`);
     }
+  }
+
+  /**
+   * Download the payloads of the next queued genes ahead of decoding them.
+   *
+   * A decoded gene is 4 bytes per cell, so the decode buffer holds tens of
+   * genes; a gene's download is often a few kilobytes and costs a round trip,
+   * so with a dozen decode loads in flight a run over thousands of genes was
+   * bound by round trips (3,753 genes at a 170 ms RTT: 56 s for 1.9 MB). The
+   * payloads are downloaded further ahead instead, into the dataset load's
+   * payload cache, which keeps them until they are decoded; the decode loads
+   * then find the bytes in memory.
+   *
+   * How many are in flight adapts to the link: the window starts at
+   * `PAYLOAD_WINDOW_MIN` and doubles after every round of downloads that ran
+   * faster than the last, and shrinks after one that ran slower, so it grows
+   * until the round trips are covered and the link is full. It never holds
+   * more bytes than half the payload cache, so a payload is never evicted
+   * before it is decoded. A gene already in memory is skipped. A source whose
+   * payloads are local (a file opened in the browser) or a cache already full
+   * stops it; the decode loads proceed as before.
+   *
+   * @private
+   */
+  _startPayloadPrefetch() {
+    const window = this._payloads;
+    if (window.stopped || this._aborted || this._runDownloads === null) return;
+    const signal = this._runDownloads.signal;
+    // Payloads downloaded and not decoded yet count against the bytes the
+    // window may hold, with those in flight.
+    let ahead = window.inFlight.size;
+    for (const gene of this._loadQueue) {
+      if (window.inFlight.size >= window.size || ahead >= window.maxAhead) break;
+      if (window.done.has(gene) || window.inFlight.has(gene)) {
+        if (window.done.has(gene)) ahead++;
+        continue;
+      }
+      if (
+        this._buffer.has(gene) ||
+        this._loadingGenes.has(gene) ||
+        this._failures.has(gene)
+      ) {
+        continue;
+      }
+      window.inFlight.add(gene);
+      ahead++;
+      void this.dataLayer.prefetchGenePayload(gene, { signal }).then(
+        result => {
+          window.inFlight.delete(gene);
+          window.done.add(gene);
+          if (result === null) {
+            // The source downloads nothing ahead.
+            window.stopped = true;
+            return;
+          }
+          if (result.resident === true) {
+            // This gene needed no download; the next ones may.
+            this._startPayloadPrefetch();
+            return;
+          }
+          if (!result.kept) window.stopped = true;
+          this._adaptPayloadWindow(result);
+          this._startPayloadPrefetch();
+        },
+        () => {
+          // An aborted or failed download ahead: the decode load of this gene
+          // downloads it again and reports any failure.
+          window.inFlight.delete(gene);
+          window.done.add(gene);
+        }
+      );
+    }
+  }
+
+  /**
+   * Size the payload window from the round of downloads just completed.
+   * @param {{byteLength: number, budget: number}} result
+   * @private
+   */
+  _adaptPayloadWindow({ byteLength, budget }) {
+    const window = this._payloads;
+    window.bytes += byteLength;
+    window.completed += 1;
+    // Half the payload cache, in payloads of the size seen so far: what the
+    // window may hold downloaded and not yet decoded.
+    window.maxAhead = Math.max(
+      1,
+      Math.floor((budget / 2) / Math.max(1, window.bytes / window.completed))
+    );
+    const byBytes = window.maxAhead;
+    if (window.completed - window.roundStart < window.size) {
+      window.size = Math.min(window.size, byBytes);
+      return;
+    }
+    const now = performance.now();
+    const rate = (window.completed - window.roundStart) / Math.max(1, now - window.roundTime);
+    if (window.lastRate === null || rate > window.lastRate * 1.1) {
+      window.size = Math.min(window.size * 2, PAYLOAD_WINDOW_MAX);
+    } else if (rate < window.lastRate * 0.9) {
+      window.size = Math.max(Math.min(PAYLOAD_WINDOW_MIN, byBytes), Math.floor(window.size * 0.75));
+    }
+    window.size = Math.min(window.size, byBytes);
+    window.lastRate = rate;
+    window.roundStart = window.completed;
+    window.roundTime = now;
   }
 
   /**
@@ -773,9 +954,10 @@ export class StreamingGeneLoader {
     this._loadingGenes.add(gene);
 
     try {
+      // One of a run's many downloads: the user's own gene loads go first.
       const result = await this.dataLayer.ensureGeneExpressionLoaded(
         gene,
-        { silent: true }
+        { silent: true, priority: 'bulk', signal: this._runDownloads.signal }
       );
       const values = result?.values;
       this._loadedGenes.add(gene);
@@ -1024,42 +1206,4 @@ export class StreamingGeneLoader {
       );
     }
   }
-
-  /**
-   * Format duration in human-readable form
-   * @param {number} ms - Duration in milliseconds
-   * @returns {string}
-   * @private
-   */
-  _formatDuration(ms) {
-    if (ms < 1000) return `${Math.round(ms)}ms`;
-    const seconds = Math.floor(ms / 1000);
-    if (seconds < 60) return `${seconds}s`;
-    const minutes = Math.floor(seconds / 60);
-    const secs = seconds % 60;
-    return `${minutes}m ${secs}s`;
-  }
 }
-
-// =============================================================================
-// FACTORY FUNCTION
-// =============================================================================
-
-/**
- * Create a StreamingGeneLoader instance
- *
- * @param {Object} options - Same options as StreamingGeneLoader constructor
- * @returns {StreamingGeneLoader}
- *
- * @example
- * const loader = createStreamingGeneLoader({
- *   dataLayer,
- *   config: { preloadCount: 100 },
- *   onProgress: (p) => console.log(`${p.loaded}/${p.total}`)
- * });
- */
-export function createStreamingGeneLoader(options) {
-  return new StreamingGeneLoader(options);
-}
-
-export default StreamingGeneLoader;

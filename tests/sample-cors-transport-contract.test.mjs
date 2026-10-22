@@ -4,10 +4,11 @@ import test from 'node:test';
 
 import {
   DATA_CONFIG,
+  DATASET_ARTIFACT_CACHE,
   fetchSampleArtifact,
 } from '../assets/js/data/data-source.js';
 import {
-  createDataSourceManager,
+  DataSourceManager,
 } from '../assets/js/data/data-source-manager.js';
 
 const SAMPLE_ROOT = 'https://samples.cellucid.test/exports/';
@@ -53,18 +54,17 @@ test('cross-origin sample artifacts use one direct CORS request and preserve str
 
   const controller = new AbortController();
   const response = await fetchSampleArtifact(
-    `${SAMPLE_ROOT}suo/points_2d.bin.gz`,
+    `${SAMPLE_ROOT}suo/embeddings/0_2d.bin.gz`,
     {
-      cache: 'force-cache',
       headers: { range: 'bytes=0-2' },
       signal: controller.signal,
     },
   );
 
   assert.equal(calls.length, 1);
-  assert.equal(calls[0].url, `${SAMPLE_ROOT}suo/points_2d.bin.gz`);
+  assert.equal(calls[0].url, `${SAMPLE_ROOT}suo/embeddings/0_2d.bin.gz`);
   assert.deepEqual(calls[0].init.headers, [['range', 'bytes=0-2']]);
-  assert.equal(calls[0].init.cache, 'force-cache');
+  assert.equal(calls[0].init.cache, 'no-cache');
   assert.equal(calls[0].init.credentials, 'omit');
   assert.equal(calls[0].init.method, 'GET');
   assert.equal(calls[0].init.mode, 'cors');
@@ -133,7 +133,7 @@ test('manager initialization registers the sample catalog without selecting scie
     globalThis.fetch = originalFetch;
   });
 
-  const manager = createDataSourceManager();
+  const manager = new DataSourceManager();
   await manager.initialize();
 
   assert.ok(manager.getSource('local-demo'));
@@ -145,7 +145,7 @@ test('manager initialization registers the sample catalog without selecting scie
 });
 
 test('manager initialization rejects every undeclared control', async () => {
-  const manager = createDataSourceManager();
+  const manager = new DataSourceManager();
   await assert.rejects(
     manager.initialize({ catalogPolicy: 'eager' }),
     /unsupported.*catalogPolicy/i,
@@ -166,7 +166,7 @@ test('a configured catalog transport failure is surfaced once and never retried 
     globalThis.fetch = originalFetch;
   });
 
-  const manager = createDataSourceManager();
+  const manager = new DataSourceManager();
   await manager.initialize();
 
   // The failure belongs to the catalog that produced it. Enumerating sources
@@ -210,4 +210,48 @@ test('sample catalog UI has no detached timeout race and declares direct HTTP', 
   assert.match(dataSource, /export async function fetchSampleArtifact/);
   assert.match(index, /Every sample artifact uses one direct HTTP request/);
   assert.match(controls, /Failed to load dataset catalog/);
+});
+
+test('every dataset artifact is revalidated, so a deploy is never half-seen', async t => {
+  // A re-export at the same URL renumbers payload paths: var/3.values.u8.gz
+  // can hold another gene with the same byte length. A cached copy reused
+  // without asking the origin would show it under the new manifest's name, so
+  // catalogs, manifests, payloads and presets are all fetched with no-cache,
+  // and a caller cannot choose another mode.
+  installSampleBrowser(t);
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url, init });
+    return new Response(new Uint8Array(0), { status: 200 });
+  };
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  await fetchSampleArtifact(`${SAMPLE_ROOT}suo/var/3.values.u8.gz`);
+  await fetchSampleArtifact('https://raw.githubusercontent.com/o/r/main/exports/a/obs/0.codes.u8.gz');
+  await fetchSampleArtifact(`${SAMPLE_ROOT}datasets.json`, { signal: new AbortController().signal });
+  assert.deepEqual(calls.map(call => call.init.cache), ['no-cache', 'no-cache', 'no-cache']);
+  assert.equal(DATASET_ARTIFACT_CACHE, 'no-cache');
+
+  for (const cache of ['force-cache', 'default', 'no-store', 'reload', 'no-cache']) {
+    await assert.rejects(
+      fetchSampleArtifact(`${SAMPLE_ROOT}suo/obs/0.values.f32`, { cache }),
+      /always revalidated/,
+      cache
+    );
+    await assert.rejects(
+      fetchSampleArtifact('https://example.test/exports/a/var/0.values.f32', { cache }),
+      /always revalidated/,
+      cache
+    );
+  }
+  assert.equal(calls.length, 3);
+
+  const { readFile } = await import('node:fs/promises');
+  for (const file of ['app/main.js', 'data/data-loaders.js', 'data/data-source.js']) {
+    const source = await readFile(new URL(`../assets/js/${file}`, import.meta.url), 'utf8');
+    assert.doesNotMatch(source, /cache: 'force-cache'/, file);
+  }
 });

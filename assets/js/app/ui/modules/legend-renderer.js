@@ -15,7 +15,62 @@
 import { StyleManager } from '../../../utils/style-manager.js';
 import { clamp } from '../../utils/number-utils.js';
 import { initCategoricalLegend } from './legend/categorical-legend.js';
-import { throttle } from '../../analysis/shared/dom-utils.js';
+import { createVisibilityGatedRender } from '../core/visibility-gate.js';
+import {
+  coalesceToFrame,
+  createButton,
+  createInfoRow,
+  createInfoTip,
+  createSliderField,
+  createSwitch
+} from '../components/controls.js';
+import { formatPercent } from '../components/display-format.js';
+
+let colormapMenuIdCounter = 0;
+
+/**
+ * A legend value: three significant figures, scientific notation outside
+ * 0.01 to 10,000.
+ */
+/**
+ * Whether a field's outlier quantiles hold at least one available value. An
+ * unavailable quantile is -1 (or NaN), and a field where no category reached
+ * `centroid_min_points` has nothing but those, so its control would filter
+ * nothing. Remembered per array: the scan stops at the first available value,
+ * and an all-unavailable array is scanned once.
+ */
+const outlierAvailability = new WeakMap();
+function hasAvailableOutlierQuantile(quantiles) {
+  if (!quantiles || quantiles.length === 0) return false;
+  let available = outlierAvailability.get(quantiles);
+  if (available === undefined) {
+    available = false;
+    for (let index = 0; index < quantiles.length; index++) {
+      if (quantiles[index] >= 0) {
+        available = true;
+        break;
+      }
+    }
+    outlierAvailability.set(quantiles, available);
+  }
+  return available;
+}
+
+function formatLegendNumber(value) {
+  if (value === null || value === undefined || !Number.isFinite(value)) return '—';
+  if (value === 0) return '0';
+  const abs = Math.abs(value);
+  const sign = value < 0 ? '-' : '';
+  if (abs >= 10000 || abs < 0.01) {
+    const exp = Math.floor(Math.log10(abs));
+    const mantissa = abs / Math.pow(10, exp);
+    const m = mantissa < 10 ? mantissa.toFixed(1).replace(/\.0$/, '') : Math.round(mantissa);
+    return `${sign}${m}e${exp}`;
+  }
+  if (abs >= 100) return sign + abs.toFixed(0);
+  if (abs >= 10) return sign + abs.toFixed(1);
+  return sign + abs.toFixed(2);
+}
 
 export function initLegendRenderer({ state, viewer, dom, dataSourceManager = null }) {
   const displayOptionsContainer = dom?.optionsContainer || null;
@@ -32,9 +87,13 @@ export function initLegendRenderer({ state, viewer, dom, dataSourceManager = nul
     renderCategoricalLegend,
     destroy: destroyCategoricalLegend
   } = initCategoricalLegend({ state, legendEl, dataSourceManager });
+  // Counts change on every visibility frame; while the legend's panel is
+  // collapsed (or the sidebar hidden) they are refreshed once it is shown.
+  // Created at the first refresh.
+  let countsGate = null;
   const lifecycleController = new AbortController();
   let renderLifecycleController = new AbortController();
-  let throttledStateUpdate = null;
+  let outlierFrame = null;
   let destroyed = false;
 
   function listen(
@@ -53,7 +112,7 @@ export function initLegendRenderer({ state, viewer, dom, dataSourceManager = nul
   function setDisplayOptionsVisibility(field) {
     if (destroyed) return;
     if (!displayOptionsContainer) return;
-    displayOptionsContainer.style.display = field ? 'block' : 'none';
+    displayOptionsContainer.hidden = !field;
   }
 
   function render(field) {
@@ -81,27 +140,11 @@ export function initLegendRenderer({ state, viewer, dom, dataSourceManager = nul
     }
     legendEl.replaceChildren();
 
-    function formatLegendNumber(value) {
-      if (value === null || value === undefined || !Number.isFinite(value)) return '—';
-      if (value === 0) return '0';
-      const abs = Math.abs(value);
-      const sign = value < 0 ? '-' : '';
-      if (abs >= 10000 || (abs > 0 && abs < 0.01)) {
-        const exp = Math.floor(Math.log10(abs));
-        const mantissa = abs / Math.pow(10, exp);
-        const m = mantissa < 10 ? mantissa.toFixed(1).replace(/\\.0$/, '') : Math.round(mantissa);
-        return `${sign}${m}e${exp}`;
-      }
-      if (abs >= 100) return sign + abs.toFixed(0);
-      if (abs >= 10) return sign + abs.toFixed(1);
-      return sign + abs.toFixed(2);
-    }
-
     if (model.kind === 'continuous') {
       const colorSection = document.createElement('div');
       colorSection.className = 'legend-section';
-      const colorHeader = document.createElement('div');
-      colorHeader.className = 'legend-section-title';
+      const colorHeader = document.createElement('h3');
+      colorHeader.className = 'section-title';
       const colormapLabel = model.colormap?.label || 'Viridis';
       colorHeader.textContent = `Color scale (${colormapLabel})`;
 
@@ -113,9 +156,17 @@ export function initLegendRenderer({ state, viewer, dom, dataSourceManager = nul
       gradientBar.className = 'colorbar-gradient';
       StyleManager.setVariable(gradientBar, '--colorbar-stops', model.colorStops.join(', '));
       gradientBar.title = 'Click to change color palette';
+      // The bar is a disclosure button for the palette menu below it.
+      gradientBar.setAttribute('aria-label', `Color palette: ${colormapLabel}`);
+      gradientBar.setAttribute('aria-expanded', 'false');
 
       const colormapMenu = document.createElement('div');
       colormapMenu.className = 'colormap-menu';
+      colormapMenu.id = `legend-colormap-menu-${++colormapMenuIdCounter}`;
+      colormapMenu.setAttribute('role', 'group');
+      colormapMenu.setAttribute('aria-label', 'Color palettes');
+      colormapMenu.hidden = true;
+      gradientBar.setAttribute('aria-controls', colormapMenu.id);
       const colormapOptions = state.getContinuousColormaps ? state.getContinuousColormaps() : [];
       function renderColormapMenu() {
         const activeId = model.colormap?.id;
@@ -124,6 +175,7 @@ export function initLegendRenderer({ state, viewer, dom, dataSourceManager = nul
           const option = document.createElement('button');
           option.type = 'button';
           option.className = 'colormap-option' + (cm.id === activeId ? ' active' : '');
+          option.setAttribute('aria-pressed', cm.id === activeId ? 'true' : 'false');
           const preview = document.createElement('div');
           preview.className = 'colormap-preview';
           StyleManager.setVariable(preview, '--colormap-stops', cm.cssStops.join(', '));
@@ -134,19 +186,25 @@ export function initLegendRenderer({ state, viewer, dom, dataSourceManager = nul
           option.appendChild(name);
           listen(option, 'click', (e) => {
             e.stopPropagation();
-            colormapMenu.classList.remove('visible');
-            if (cm.id !== activeId) {
-              state.setContinuousColormap(state.activeFieldIndex, cm.id);
-              render(state.getActiveField());
+            if (cm.id === activeId) {
+              closeColormapMenu({ restoreFocus: true });
+              return;
             }
+            closeColormapMenu({ restoreFocus: false });
+            state.setContinuousColormap(state.activeFieldIndex, cm.id);
+            render(state.getActiveField());
+            // The legend was rebuilt; keep focus on the new palette control.
+            legendEl.querySelector('.colorbar-gradient')?.focus();
           }, renderSignal);
           colormapMenu.appendChild(option);
         });
       }
       renderColormapMenu();
 
-      function closeColormapMenu() {
-        colormapMenu.classList.remove('visible');
+      function closeColormapMenu({ restoreFocus = false } = {}) {
+        colormapMenu.hidden = true;
+        gradientBar.setAttribute('aria-expanded', 'false');
+        if (restoreFocus) gradientBar.focus();
       }
       function handleOutsideClick(evt) {
         if (!colorBarWrapper.contains(evt.target)) closeColormapMenu();
@@ -154,9 +212,10 @@ export function initLegendRenderer({ state, viewer, dom, dataSourceManager = nul
 
       listen(gradientBar, 'click', (e) => {
         e.stopPropagation();
-        const willOpen = !colormapMenu.classList.contains('visible');
+        const willOpen = colormapMenu.hidden;
         if (willOpen) {
-          colormapMenu.classList.add('visible');
+          colormapMenu.hidden = false;
+          gradientBar.setAttribute('aria-expanded', 'true');
           listen(
             document,
             'click',
@@ -174,60 +233,53 @@ export function initLegendRenderer({ state, viewer, dom, dataSourceManager = nul
         (e) => e.stopPropagation(),
         renderSignal
       );
+      listen(colorBarWrapper, 'keydown', (e) => {
+        if (e.key !== 'Escape' || colormapMenu.hidden) {
+          return;
+        }
+        e.preventDefault();
+        e.stopPropagation();
+        closeColormapMenu({ restoreFocus: true });
+      }, renderSignal);
 
       colorBarWrapper.appendChild(gradientBar);
       colorBarWrapper.appendChild(colormapMenu);
 
-      const minMaxRow = document.createElement('div');
-      minMaxRow.style.display = 'flex';
-      minMaxRow.style.justifyContent = 'space-between';
-      minMaxRow.style.fontSize = '10px';
-      minMaxRow.style.marginTop = '2px';
-
+      const ticks = document.createElement('div');
+      ticks.className = 'colorbar-ticks';
       const colorbarMin = model.colorbar?.min ?? model.stats.min;
       const colorbarMax = model.colorbar?.max ?? model.stats.max;
       const minSpan = document.createElement('span');
       minSpan.textContent = formatLegendNumber(colorbarMin);
       const maxSpan = document.createElement('span');
       maxSpan.textContent = formatLegendNumber(colorbarMax);
-      minMaxRow.appendChild(minSpan);
-      minMaxRow.appendChild(maxSpan);
+      ticks.appendChild(minSpan);
+      ticks.appendChild(maxSpan);
 
-      const logRow = document.createElement('div');
-      logRow.className = 'legend-toggle-row';
-      const logLabel = document.createElement('span');
-      logLabel.className = 'legend-toggle-label';
-      logLabel.textContent = 'Log color scale';
-      const logToggle = document.createElement('button');
-      logToggle.type = 'button';
-      logToggle.className = 'toggle-switch';
-      logRow.appendChild(logLabel);
-      logRow.appendChild(logToggle);
+      const logSwitch = createSwitch({
+        label: 'Log color scale',
+        checked: Boolean(model.logEnabled),
+        onChange: next => {
+          state.setContinuousLogScale(state.activeFieldIndex, next);
+          refreshColorbarLabels();
+        }
+      });
+      logSwitch.root.classList.add('switch-compact');
 
-      const logHint = document.createElement('div');
-      logHint.className = 'legend-help';
-      logHint.textContent = 'Zero/negative/NaN values use the None color';
-
-      const rescaleRow = document.createElement('div');
-      rescaleRow.className = 'legend-toggle-row';
-      const rescaleLabel = document.createElement('span');
-      rescaleLabel.className = 'legend-toggle-label';
-      rescaleLabel.textContent = 'Rescale colorbar to slider range';
-      const rescaleToggle = document.createElement('button');
-      rescaleToggle.type = 'button';
-      rescaleToggle.className = 'toggle-switch';
-      rescaleRow.appendChild(rescaleLabel);
-      rescaleRow.appendChild(rescaleToggle);
-
-      function setRescaleToggle(enabled) {
-        rescaleToggle.setAttribute('aria-pressed', enabled ? 'true' : 'false');
-        rescaleToggle.textContent = enabled ? 'On' : 'Off';
-      }
-
-      function setLogToggle(enabled) {
-        logToggle.setAttribute('aria-pressed', enabled ? 'true' : 'false');
-        logToggle.textContent = enabled ? 'On' : 'Off';
-      }
+      const rescaleSwitch = createSwitch({
+        label: 'Rescale to range',
+        checked: Boolean(model.colorbar?.usingFilter),
+        onChange: next => {
+          state.setContinuousColorRescale(state.activeFieldIndex, next);
+          if (next) {
+            const { newMin, newMax } = getSliderValues();
+            state.setContinuousColorRange(state.activeFieldIndex, newMin, newMax);
+          }
+          refreshColorbarLabels();
+        }
+      });
+      rescaleSwitch.root.classList.add('switch-compact');
+      const isRescaling = () => rescaleSwitch.root.getAttribute('aria-checked') === 'true';
 
       function refreshColorbarLabels() {
         const activeModel = state.getLegendModel(state.getActiveField());
@@ -237,150 +289,117 @@ export function initLegendRenderer({ state, viewer, dom, dataSourceManager = nul
         minSpan.textContent = formatLegendNumber(cMin);
         maxSpan.textContent = formatLegendNumber(cMax);
         colorHeader.textContent = `Color scale (${activeModel.colormap?.label || 'Viridis'})`;
-        setLogToggle(Boolean(activeModel.logEnabled));
-        setRescaleToggle(Boolean(activeModel.colorbar?.usingFilter));
+        logSwitch.setChecked(Boolean(activeModel.logEnabled));
+        rescaleSwitch.setChecked(Boolean(activeModel.colorbar?.usingFilter));
       }
-
-      setLogToggle(Boolean(model.logEnabled));
-      setRescaleToggle(Boolean(model.colorbar?.usingFilter));
-      listen(logToggle, 'click', () => {
-        const next = logToggle.getAttribute('aria-pressed') !== 'true';
-        state.setContinuousLogScale(state.activeFieldIndex, next);
-        refreshColorbarLabels();
-      }, renderSignal);
-      listen(rescaleToggle, 'click', () => {
-        const next = rescaleToggle.getAttribute('aria-pressed') !== 'true';
-        state.setContinuousColorRescale(state.activeFieldIndex, next);
-        if (next) {
-          const { newMin, newMax } = getSliderValues();
-          state.setContinuousColorRange(state.activeFieldIndex, newMin, newMax);
-        }
-        refreshColorbarLabels();
-      }, renderSignal);
-
-      const rescaleHint = document.createElement('div');
-      rescaleHint.className = 'legend-help';
-      rescaleHint.textContent = 'On: colors track sliders; Off: full data range';
 
       colorSection.appendChild(colorHeader);
       colorSection.appendChild(colorBarWrapper);
-      colorSection.appendChild(minMaxRow);
-      colorSection.appendChild(logRow);
-      colorSection.appendChild(logHint);
-      colorSection.appendChild(rescaleRow);
-      colorSection.appendChild(rescaleHint);
+      colorSection.appendChild(ticks);
+      colorSection.appendChild(createInfoRow(
+        logSwitch.root,
+        createInfoTip({ tip: 'log-color-scale', label: 'About the log color scale' })
+      ));
+      colorSection.appendChild(createInfoRow(
+        rescaleSwitch.root,
+        createInfoTip({ tip: 'color-rescale', label: 'About rescaling colors' })
+      ));
 
-      const range = model.stats.max - model.stats.min || 1;
+      // A constant field has a zero-width range; every slider position then
+      // maps onto its one value instead of past the end of the data range.
+      const range = model.stats.max - model.stats.min;
       const filterSection = document.createElement('div');
       filterSection.className = 'legend-section legend-filter';
-      const filterHeader = document.createElement('div');
-      filterHeader.className = 'legend-section-title';
-      filterHeader.textContent = 'Filtering';
-      const filterTitle = document.createElement('div');
-      filterTitle.className = 'legend-subtitle';
-      filterTitle.textContent = 'Visible range';
-      const filterSubtext = document.createElement('div');
-      filterSubtext.className = 'legend-help';
-      filterSubtext.textContent = 'Adjust limits; click FILTER or enable Live filtering.';
+      const filterHeader = document.createElement('h3');
+      filterHeader.className = 'section-title';
+      filterHeader.textContent = 'Visible range';
       filterSection.appendChild(filterHeader);
-      filterSection.appendChild(filterTitle);
-      filterSection.appendChild(filterSubtext);
 
       let liveFilteringEnabled = true;
       let filterBtn = null;
+      const liveSwitch = createSwitch({
+        label: 'Live filtering',
+        checked: true,
+        onChange: next => {
+          setLiveFiltering(next);
+          if (next) applyFilterFromSliders();
+        }
+      });
+      liveSwitch.root.classList.add('switch-compact');
 
-      const liveRow = document.createElement('div');
-      liveRow.className = 'legend-toggle-row';
-      const liveLabel = document.createElement('span');
-      liveLabel.className = 'legend-toggle-label';
-      liveLabel.textContent = 'Live filtering';
-      const liveToggle = document.createElement('button');
-      liveToggle.type = 'button';
-      liveToggle.className = 'toggle-switch';
-      const liveHint = document.createElement('div');
-      liveHint.className = 'legend-help';
-      liveHint.textContent = 'Changes apply as you drag';
-
-      function setLiveToggleUI(enabled) {
+      function setLiveFiltering(enabled) {
         liveFilteringEnabled = enabled;
-        liveToggle.setAttribute('aria-pressed', enabled ? 'true' : 'false');
-        liveToggle.textContent = enabled ? 'On' : 'Off';
-        liveHint.textContent = enabled ? 'Changes apply as you drag' : 'Drag sliders, then click Filter';
+        liveSwitch.setChecked(enabled);
         if (filterBtn) {
           filterBtn.disabled = enabled;
-          filterBtn.classList.toggle('button-disabled', enabled);
           filterBtn.title = enabled
             ? 'Turn off Live filtering to use Filter'
             : 'Apply the current range';
         }
       }
 
-      listen(liveToggle, 'click', () => {
-        const next = liveToggle.getAttribute('aria-pressed') !== 'true';
-        setLiveToggleUI(next);
-        if (next) applyFilterFromSliders();
-      }, renderSignal);
+      filterSection.appendChild(createInfoRow(
+        liveSwitch.root,
+        createInfoTip({ tip: 'live-filtering', label: 'About live filtering' })
+      ));
 
-      liveRow.appendChild(liveLabel);
-      liveRow.appendChild(liveToggle);
-      filterSection.appendChild(liveRow);
-      filterSection.appendChild(liveHint);
+      const percentOf = value => (range > 0 ? ((value - model.stats.min) / range) * 100 : 0);
+      // The filter is applied before the colour range follows the sliders:
+      // filtering is in data units and never depends on the colour scale.
+      // Each slider's work runs at most once per frame (createSliderField),
+      // so a fast drag recomputes visibility once per frame, not per event.
+      const onRangeInput = moved => {
+        const other = moved === minField ? maxField : minField;
+        const minPct = Number(minField.input.value);
+        const maxPct = Number(maxField.input.value);
+        if (minPct > maxPct) other.setValue(moved === minField ? minPct : maxPct);
+        if (liveFilteringEnabled) applyFilterFromSliders();
+        updateDisplayFromSliders();
+      };
+      const minField = createSliderField({
+        label: 'Minimum',
+        min: 0,
+        max: 100,
+        step: 1,
+        value: Math.round(clamp(percentOf(model.filter.min), 0, 100)),
+        format: pct => formatLegendNumber(valueAtPercent(pct)),
+        onInput: () => onRangeInput(minField)
+      });
+      const maxField = createSliderField({
+        label: 'Maximum',
+        min: 0,
+        max: 100,
+        step: 1,
+        value: range > 0 ? Math.round(clamp(percentOf(model.filter.max), 0, 100)) : 100,
+        format: pct => formatLegendNumber(valueAtPercent(pct)),
+        onInput: () => onRangeInput(maxField)
+      });
+      const minSlider = minField.input;
+      const maxSlider = maxField.input;
+      filterSection.appendChild(minField.root);
+      filterSection.appendChild(maxField.root);
 
-      const minRow = document.createElement('div');
-      minRow.className = 'slider-row';
-      const minLabelEl = document.createElement('span');
-      minLabelEl.className = 'legend-subtitle';
-      minLabelEl.textContent = 'Min';
-      const minSlider = document.createElement('input');
-      minSlider.type = 'range';
-      minSlider.min = '0';
-      minSlider.max = '100';
-      minSlider.step = '1';
-
-      const maxRow = document.createElement('div');
-      maxRow.className = 'slider-row';
-      const maxLabelEl = document.createElement('span');
-      maxLabelEl.className = 'legend-subtitle';
-      maxLabelEl.textContent = 'Max';
-      const maxSlider = document.createElement('input');
-      maxSlider.type = 'range';
-      maxSlider.min = '0';
-      maxSlider.max = '100';
-      maxSlider.step = '1';
-
-      const minPctInit = ((model.filter.min - model.stats.min) / range) * 100;
-      const maxPctInit = ((model.filter.max - model.stats.min) / range) * 100;
-      minSlider.value = String(Math.round(clamp(minPctInit, 0, 100)));
-      maxSlider.value = String(Math.round(clamp(maxPctInit, 0, 100)));
-
-      const minValueEl = document.createElement('span');
-      minValueEl.className = 'slider-value';
-      const maxValueEl = document.createElement('span');
-      maxValueEl.className = 'slider-value';
-
-      minRow.appendChild(minLabelEl);
-      minRow.appendChild(minSlider);
-      minRow.appendChild(minValueEl);
-
-      maxRow.appendChild(maxLabelEl);
-      maxRow.appendChild(maxSlider);
-      maxRow.appendChild(maxValueEl);
-
-      filterSection.appendChild(minRow);
-      filterSection.appendChild(maxRow);
-
-      const resetRow = document.createElement('div');
-      resetRow.className = 'legend-actions compact';
-      const resetBtn = document.createElement('button');
-      resetBtn.type = 'button';
-      resetBtn.textContent = 'RESET';
-      filterBtn = document.createElement('button');
-      filterBtn.type = 'button';
-      filterBtn.textContent = 'FILTER';
-      filterBtn.className = 'primary';
-      resetRow.appendChild(filterBtn);
-      resetRow.appendChild(resetBtn);
-      filterSection.appendChild(resetRow);
+      const actions = document.createElement('div');
+      actions.className = 'legend-actions';
+      filterBtn = createButton({
+        label: 'Filter',
+        variant: 'primary',
+        className: 'btn-compact',
+        onClick: () => applyFilterFromSliders()
+      });
+      const resetBtn = createButton({
+        label: 'Reset',
+        className: 'btn-compact',
+        onClick: () => {
+          minField.setValue(0);
+          maxField.setValue(100);
+          state.resetContinuousFilter(state.activeFieldIndex);
+          updateDisplayFromSliders();
+        }
+      });
+      actions.appendChild(filterBtn);
+      actions.appendChild(resetBtn);
+      filterSection.appendChild(actions);
       legendEl.appendChild(colorSection);
       legendEl.appendChild(filterSection);
 
@@ -392,18 +411,35 @@ export function initLegendRenderer({ state, viewer, dom, dataSourceManager = nul
         if (minValPct > maxValPct) {
           minValPct = Math.min(minValPct, 100);
           maxValPct = minValPct;
-          maxSlider.value = String(Math.round(maxValPct));
+          maxField.setValue(Math.round(maxValPct));
         }
-        const newMin = model.stats.min + (minValPct / 100) * range;
-        const newMax = model.stats.min + (maxValPct / 100) * range;
-        return { newMin, newMax };
+        return {
+          newMin: valueAtPercent(minValPct),
+          newMax: valueAtPercent(maxValPct)
+        };
+      }
+
+      // The ends of the track are the data bounds exactly; interior positions
+      // are clamped so float rounding can never step outside the data range.
+      function valueAtPercent(pct) {
+        if (pct <= 0) return model.stats.min;
+        if (pct >= 100) return model.stats.max;
+        return clamp(
+          model.stats.min + (pct / 100) * range,
+          model.stats.min,
+          model.stats.max
+        );
+      }
+
+      function showRangeReadouts(min, max) {
+        minField.readout.textContent = formatLegendNumber(min);
+        maxField.readout.textContent = formatLegendNumber(max);
       }
 
       function updateDisplayFromSliders() {
         const { newMin, newMax } = getSliderValues();
-        minValueEl.textContent = formatLegendNumber(newMin);
-        maxValueEl.textContent = formatLegendNumber(newMax);
-        if (rescaleToggle.getAttribute('aria-pressed') === 'true') {
+        showRangeReadouts(newMin, newMax);
+        if (isRescaling()) {
           state.setContinuousColorRange(state.activeFieldIndex, newMin, newMax);
           refreshColorbarLabels();
         }
@@ -414,53 +450,29 @@ export function initLegendRenderer({ state, viewer, dom, dataSourceManager = nul
         state.applyContinuousFilter(state.activeFieldIndex, newMin, newMax);
       }
 
-      listen(minSlider, 'input', () => {
-        if (parseFloat(minSlider.value) > parseFloat(maxSlider.value)) {
-          maxSlider.value = minSlider.value;
-        }
-        updateDisplayFromSliders();
-        if (liveFilteringEnabled) applyFilterFromSliders();
-      }, renderSignal);
-      listen(maxSlider, 'input', () => {
-        if (parseFloat(maxSlider.value) < parseFloat(minSlider.value)) {
-          minSlider.value = maxSlider.value;
-        }
-        updateDisplayFromSliders();
-        if (liveFilteringEnabled) applyFilterFromSliders();
-      }, renderSignal);
-      listen(filterBtn, 'click', () => {
-        applyFilterFromSliders();
-      }, renderSignal);
-      listen(resetBtn, 'click', () => {
-        minSlider.value = '0';
-        maxSlider.value = '100';
-        updateDisplayFromSliders();
-        state.resetContinuousFilter(state.activeFieldIndex);
-        if (liveFilteringEnabled) applyFilterFromSliders();
-      }, renderSignal);
-      setLiveToggleUI(true);
-      updateDisplayFromSliders();
-      if (liveFilteringEnabled) applyFilterFromSliders();
+      setLiveFiltering(true);
+      // Rendering only reads state. Re-applying the slider positions here
+      // rounded a restored or programmatic filter to whole percent steps
+      // every time the legend was drawn.
+      showRangeReadouts(model.filter.min, model.filter.max);
     }
   }
 
   function handleOutlierUI(field) {
     if (destroyed) return;
-    const hasOutliers = field && field.outlierQuantiles && field.outlierQuantiles.length > 0;
+    const hasOutliers = Boolean(field) && hasAvailableOutlierQuantile(field.outlierQuantiles);
     if (outlierFilterContainer) {
+      outlierFilterContainer.hidden = !hasOutliers;
       if (hasOutliers) {
-        outlierFilterContainer.classList.add('visible');
         const pct = Math.round((field._outlierThreshold ?? 1.0) * 100);
         if (outlierFilterInput) outlierFilterInput.value = String(pct);
-        if (outlierFilterDisplay) outlierFilterDisplay.textContent = pct + '%';
-      } else {
-        outlierFilterContainer.classList.remove('visible');
+        if (outlierFilterDisplay) outlierFilterDisplay.textContent = formatPercent(pct);
       }
     }
 
     if (centroidControls) {
       const isCategorical = Boolean(field && field.kind === 'category');
-      centroidControls.classList.toggle('visible', isCategorical);
+      centroidControls.hidden = !isCategorical;
 
       // Sync checkbox state with viewer when centroid controls become visible
       if (isCategorical && viewer) {
@@ -477,26 +489,21 @@ export function initLegendRenderer({ state, viewer, dom, dataSourceManager = nul
   }
 
   if (outlierFilterInput) {
-    // Throttle the expensive state update (visibility recomputation) while keeping display update immediate
-    throttledStateUpdate = throttle((threshold) => {
+    // The visibility recomputation runs at most once per frame while the
+    // thumb moves, with the readout painted in the same frame; releasing the
+    // thumb commits the final value.
+    const applyOutlierThreshold = () => {
       if (destroyed) return;
-      state.setOutlierThresholdForActive(threshold);
-    }, 50); // ~20 updates/sec max
+      const pct = parseFloat(outlierFilterInput.value);
+      if (outlierFilterDisplay) outlierFilterDisplay.textContent = formatPercent(pct);
+      state.setOutlierThresholdForActive(pct / 100);
+    };
+    outlierFrame = coalesceToFrame(applyOutlierThreshold);
 
-    listen(outlierFilterInput, 'input', () => {
-      const sliderValue = parseFloat(outlierFilterInput.value);
-      const threshold = sliderValue / 100.0;
-      // Update display immediately for smooth visual feedback
-      if (outlierFilterDisplay) outlierFilterDisplay.textContent = Math.round(threshold * 100) + '%';
-      // Throttle the expensive state update
-      throttledStateUpdate(threshold);
-    });
-
-    // Ensure final value is applied when user releases slider
+    listen(outlierFilterInput, 'input', () => outlierFrame());
     listen(outlierFilterInput, 'change', () => {
-      const sliderValue = parseFloat(outlierFilterInput.value);
-      const threshold = sliderValue / 100.0;
-      state.setOutlierThresholdForActive(threshold);
+      outlierFrame.cancel();
+      applyOutlierThreshold();
     });
   }
 
@@ -527,8 +534,9 @@ export function initLegendRenderer({ state, viewer, dom, dataSourceManager = nul
       () => renderLifecycleController.abort(),
       () => lifecycleController.abort(),
       () => {
-        if (throttledStateUpdate !== null) throttledStateUpdate.cancel();
+        if (outlierFrame !== null) outlierFrame.cancel();
       },
+      () => countsGate?.destroy(),
       destroyCategoricalLegend
     ]) {
       try {
@@ -550,7 +558,15 @@ export function initLegendRenderer({ state, viewer, dom, dataSourceManager = nul
   return {
     render,
     refreshCategoryCounts: () => {
-      if (!destroyed) refreshCategoryCounts();
+      if (destroyed) return;
+      if (!legendEl) {
+        refreshCategoryCounts();
+        return;
+      }
+      countsGate ??= createVisibilityGatedRender(legendEl, () => {
+        if (!destroyed) refreshCategoryCounts();
+      });
+      countsGate.request();
     },
     handleOutlierUI,
     destroy,

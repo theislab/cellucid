@@ -7,9 +7,7 @@
  */
 
 import {
-  SessionSerializer,
-  isSessionRestoreCanceledError,
-  isSessionRestoreSupersededError
+  SessionSerializer
 } from './session-serializer.js';
 import * as fieldOverlays from './contributors/field-overlays.js';
 import * as userDefinedCodes from './contributors/user-defined-codes.js';
@@ -21,11 +19,6 @@ import * as highlightsCells from './contributors/highlights-cells.js';
 import * as analysisArtifacts from './contributors/analysis-artifacts.js';
 import * as cinematicCamera from './contributors/cinematic-camera.js';
 import { assertExactKeys } from './schema-contract.js';
-
-export {
-  isSessionRestoreCanceledError,
-  isSessionRestoreSupersededError
-};
 
 /**
  * Create the SessionSerializer.

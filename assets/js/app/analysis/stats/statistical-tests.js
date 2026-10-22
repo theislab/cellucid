@@ -8,21 +8,19 @@
  * All tests return p-values, test statistics, and effect sizes where applicable.
  */
 
-import { getStatRegistry } from '../core/plugin-contract.js';
-
 // Import mathematical functions from centralized math-utils (DRY principle)
 import {
   mean,
-  std,
   sampleMoments,
   chiSquaredPValue,
   fDistributionPValue,
   gammaLn,
-  computeRanks,
+  computeRanksWithTies,
   mannWhitneyU as computeMannWhitneyU,
   welchTTestFromMoments
 } from '../compute/math-utils.js';
 import { isFiniteNumber } from '../shared/number-utils.js';
+import { categoryCounts } from '../shared/category-counts.js';
 
 /**
  * @typedef {Object} StatisticalResult
@@ -79,13 +77,6 @@ function requireProbability(value, label) {
     throw new RangeError(`${label} must be finite and between 0 and 1`);
   }
   return value;
-}
-
-function requireAlpha(alpha) {
-  if (!Number.isFinite(alpha) || alpha <= 0 || alpha >= 1) {
-    throw new RangeError('Statistical alpha must be finite and strictly between 0 and 1');
-  }
-  return alpha;
 }
 
 function requireNumericArrayLike(values, label) {
@@ -190,6 +181,7 @@ function buildCategoricalTable(pageData) {
   if (!Array.isArray(pageData)) {
     throw new TypeError('Categorical statistical page data must be an array');
   }
+  const pageCounts = [];
   for (let groupIndex = 0; groupIndex < pageData.length; groupIndex++) {
     const page = pageData[groupIndex];
     if (
@@ -213,33 +205,40 @@ function buildCategoricalTable(pageData) {
         'pageName and array-like values'
       );
     }
-    for (let valueIndex = 0; valueIndex < page.values.length; valueIndex++) {
-      requireCategoricalValue(
-        page.values[valueIndex],
-        groupIndex,
-        valueIndex
-      );
+
+    // The page's counts (taken once per values array, usually by the data
+    // layer as it built the values). Every value is validated through its
+    // distinct value — an invalid value is a key of its page's counts — and
+    // only a page holding one is walked again, to name the first offending
+    // value exactly as a value-by-value check would.
+    const values = page.values;
+    const counts = categoryCounts(values);
+    for (const value of counts.keys()) {
+      try {
+        requireCategoricalValue(value);
+      } catch {
+        for (let valueIndex = 0; valueIndex < values.length; valueIndex++) {
+          requireCategoricalValue(values[valueIndex], groupIndex, valueIndex);
+        }
+      }
     }
+    pageCounts.push(counts);
   }
 
-  const nonEmptyPageData = pageData.filter(pd => pd.values.length > 0);
+  const nonEmptyPageIndices = [];
+  for (let index = 0; index < pageData.length; index++) {
+    if (pageData[index].values.length > 0) nonEmptyPageIndices.push(index);
+  }
   const categories = new Set();
-  for (const pd of nonEmptyPageData) {
-    for (const value of pd.values) categories.add(value);
+  for (const index of nonEmptyPageIndices) {
+    for (const value of pageCounts[index].keys()) categories.add(value);
   }
   const categoryValues = Array.from(categories).sort(compareCategoryValues);
-  const rowLabels = nonEmptyPageData.map(pd => pd.pageName);
+  const rowLabels = nonEmptyPageIndices.map(index => pageData[index].pageName);
 
-  const observed = nonEmptyPageData.map(pd => {
-    const counts = new Map(categoryValues.map(category => [category, 0]));
-    for (const value of pd.values) {
-      const currentCount = counts.get(value);
-      if (!Number.isSafeInteger(currentCount) || currentCount < 0) {
-        throw new Error('Categorical count map lost category ownership');
-      }
-      counts.set(value, currentCount + 1);
-    }
-    return categoryValues.map(category => counts.get(category));
+  const observed = nonEmptyPageIndices.map(index => {
+    const counts = pageCounts[index];
+    return categoryValues.map(category => counts.get(category) ?? 0);
   });
 
   const rowTotals = observed.map(row => row.reduce((sum, count) => sum + count, 0));
@@ -826,7 +825,10 @@ export function kruskalWallis(groups) {
     for (let j = 0; j < group.length; j++) values[write++] = group[j];
   }
 
-  const ranks = computeRanks(values);
+  // Ranks and the tie term come from one ranking of the pooled sample. The tie
+  // term is summed over the distinct values in first-occurrence order, as a
+  // value-keyed count map enumerates them.
+  const { ranks, tieTerm } = computeRanksWithTies(values);
 
   // Calculate rank sums for each group
   const rankSums = new Array(validGroups.length).fill(0);
@@ -849,15 +851,6 @@ export function kruskalWallis(groups) {
 
   // Correct H for tied ranks. This is essential for zero-inflated expression
   // and categorical-like continuous fields where repeated values are common.
-  const tieCounts = new Map();
-  for (const value of values) {
-    const currentCount = tieCounts.get(value);
-    tieCounts.set(value, currentCount === undefined ? 1 : currentCount + 1);
-  }
-  let tieTerm = 0;
-  for (const count of tieCounts.values()) {
-    if (count > 1) tieTerm += count ** 3 - count;
-  }
   const tieCorrection = 1 - tieTerm / (N ** 3 - N);
   if (!(tieCorrection > 0)) {
     return {
@@ -1116,62 +1109,6 @@ function benjaminiHochbergStepUp(entries, assign) {
 }
 
 /**
- * Benjamini-Hochberg procedure for FDR correction
- * Controls the false discovery rate at a specified level
- *
- * Every p-value must be present and testable: a non-finite entry is rejected
- * rather than skipped, because the caller declares the family it is correcting
- * by what it passes in.
- *
- * @param {number[]} pValues - Array of p-values
- * @param {number} [alpha=0.05] - Desired FDR level
- * @returns {Object} { adjustedPValues: number[], significant: boolean[], threshold: number|null, significantCount: number }
- */
-export function benjaminiHochberg(pValues, alpha = 0.05) {
-  requireNumericArrayLike(pValues, 'Benjamini-Hochberg p-values');
-  requireAlpha(alpha);
-
-  const m = pValues.length;
-  const entries = new Array(m);
-  for (let index = 0; index < m; index++) {
-    requireProbability(
-      pValues[index],
-      `Benjamini-Hochberg p-value ${index + 1}`
-    );
-    entries[index] = { index, pValue: pValues[index] };
-  }
-
-  const adjustedPValues = new Array(m).fill(null);
-  const significant = new Array(m).fill(false);
-  let significantCount = 0;
-
-  benjaminiHochbergStepUp(entries, (index, adjusted) => {
-    adjustedPValues[index] = adjusted;
-    if (adjusted <= alpha) {
-      significant[index] = true;
-      significantCount++;
-    }
-  });
-
-  // `entries` is sorted ascending by now: the BH threshold is the largest
-  // ordered p-value that still satisfies p(k) <= k * alpha / m.
-  let threshold = null;
-  for (let rank = 0; rank < m; rank++) {
-    const criticalValue = (rank + 1) * alpha / m;
-    if (entries[rank].pValue <= criticalValue) {
-      threshold = entries[rank].pValue;
-    }
-  }
-
-  return {
-    adjustedPValues,
-    significant,
-    threshold,
-    significantCount
-  };
-}
-
-/**
  * Select the members of the correcting family from a batch of p-values.
  *
  * A gene that never reached a test carries `NaN`. It is not a member of the
@@ -1262,459 +1199,3 @@ export function benjaminiHochbergTestable(pValues) {
     untestableCount: total - testedCount
   };
 }
-
-/**
- * Bonferroni correction (more conservative than BH)
- *
- * @param {number[]} pValues - Array of p-values
- * @param {number} [alpha=0.05] - Significance level
- * @returns {Object} { adjustedPValues: number[], significant: boolean[] }
- */
-export function bonferroniCorrection(pValues, alpha = 0.05) {
-  requireNumericArrayLike(pValues, 'Bonferroni p-values');
-  requireAlpha(alpha);
-  for (let index = 0; index < pValues.length; index++) {
-    requireProbability(pValues[index], `Bonferroni p-value ${index + 1}`);
-  }
-  if (pValues.length === 0) {
-    return {
-      adjustedPValues: [],
-      significant: [],
-      threshold: null,
-      significantCount: 0
-    };
-  }
-
-  const n = pValues.length;
-  const adjustedPValues = Array.from(
-    pValues,
-    p => Math.min(p * n, 1)
-  );
-
-  const significant = adjustedPValues.map(p => p <= alpha);
-
-  return {
-    adjustedPValues,
-    significant,
-    threshold: alpha / n,
-    significantCount: significant.filter(s => s).length
-  };
-}
-
-/**
- * Apply multiple testing correction to an array of results
- * Modifies results in place by adding adjustedPValue field
- *
- * @param {Object[]} results - Array of objects with pValue field
- * @param {string} [method='bh'] - 'bh' (Benjamini-Hochberg) or 'bonferroni'
- * @param {number} [alpha=0.05] - Significance level
- * @returns {Object[]} Results with adjustedPValue added
- */
-export function applyMultipleTestingCorrection(results, method = 'bh', alpha = 0.05) {
-  if (!Array.isArray(results)) {
-    throw new TypeError('Multiple-testing results must be an array');
-  }
-  if (method !== 'bh' && method !== 'bonferroni') {
-    throw new TypeError(
-      'Multiple-testing method must be exactly "bh" or "bonferroni"'
-    );
-  }
-  requireAlpha(alpha);
-  if (results.length === 0) return [];
-
-  const pValues = results.map((result, index) => {
-    requireRecord(result, `Multiple-testing result ${index + 1}`);
-    return requireProbability(
-      result.pValue,
-      `Multiple-testing result ${index + 1} p-value`
-    );
-  });
-
-  const correction = method === 'bonferroni'
-    ? bonferroniCorrection(pValues, alpha)
-    : benjaminiHochberg(pValues, alpha);
-
-  return results.map((r, i) => ({
-    ...r,
-    adjustedPValue: correction.adjustedPValues[i],
-    significantAfterCorrection: correction.significant[i]
-  }));
-}
-
-// ============================================================================
-// Additional Statistical Utilities
-// ============================================================================
-
-/**
- * Compute confidence interval for a mean
- *
- * @param {number[]} values - Sample values
- * @param {number} [confidenceLevel=0.95] - Confidence level (0-1)
- * @returns {Object} { mean, lower, upper, se, n }
- */
-export function confidenceInterval(values, confidenceLevel = 0.95) {
-  const validValues = finiteValues(values, 'Confidence-interval values');
-  if (
-    !Number.isFinite(confidenceLevel)
-    || confidenceLevel <= 0
-    || confidenceLevel >= 1
-  ) {
-    throw new RangeError(
-      'Confidence level must be finite and strictly between 0 and 1'
-    );
-  }
-  const n = validValues.length;
-
-  if (n < 2) {
-    return {
-      mean: n === 1 ? validValues[0] : NaN,
-      lower: NaN,
-      upper: NaN,
-      se: NaN,
-      n,
-      confidenceLevel
-    };
-  }
-
-  const m = mean(validValues);
-  const s = std(validValues, 1); // Sample std (ddof=1)
-  const se = s / Math.sqrt(n);
-
-  // Z-score for confidence level (using normal approximation for large n)
-  const alpha = 1 - confidenceLevel;
-  // Approximate z-score
-  const z = -normalCDFInverse(alpha / 2);
-
-  return {
-    mean: m,
-    lower: m - z * se,
-    upper: m + z * se,
-    se,
-    n,
-    confidenceLevel
-  };
-}
-
-/**
- * Inverse normal CDF (probit function) approximation
- */
-function normalCDFInverse(p) {
-  if (!Number.isFinite(p) || p <= 0 || p >= 1) {
-    throw new RangeError(
-      'Inverse normal probability must be finite and strictly between 0 and 1'
-    );
-  }
-  if (p === 0.5) return 0;
-
-  // Rational approximation
-  const a = [
-    -3.969683028665376e+01,
-    2.209460984245205e+02,
-    -2.759285104469687e+02,
-    1.383577518672690e+02,
-    -3.066479806614716e+01,
-    2.506628277459239e+00
-  ];
-  const b = [
-    -5.447609879822406e+01,
-    1.615858368580409e+02,
-    -1.556989798598866e+02,
-    6.680131188771972e+01,
-    -1.328068155288572e+01
-  ];
-  const c = [
-    -7.784894002430293e-03,
-    -3.223964580411365e-01,
-    -2.400758277161838e+00,
-    -2.549732539343734e+00,
-    4.374664141464968e+00,
-    2.938163982698783e+00
-  ];
-  const d = [
-    7.784695709041462e-03,
-    3.224671290700398e-01,
-    2.445134137142996e+00,
-    3.754408661907416e+00
-  ];
-
-  const pLow = 0.02425;
-  const pHigh = 1 - pLow;
-
-  let q, r;
-
-  if (p < pLow) {
-    q = Math.sqrt(-2 * Math.log(p));
-    return (((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5]) /
-           ((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1);
-  } else if (p <= pHigh) {
-    q = p - 0.5;
-    r = q * q;
-    return (((((a[0]*r+a[1])*r+a[2])*r+a[3])*r+a[4])*r+a[5])*q /
-           (((((b[0]*r+b[1])*r+b[2])*r+b[3])*r+b[4])*r+1);
-  } else {
-    q = Math.sqrt(-2 * Math.log(1 - p));
-    return -(((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5]) /
-            ((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1);
-  }
-}
-
-/**
- * Compute fold change and log2 fold change
- *
- * @param {number} meanA - Mean of group A
- * @param {number} meanB - Mean of group B
- * @param {number} [pseudocount=0.01] - Pseudocount to avoid log(0)
- * @returns {Object} { foldChange, log2FoldChange }
- */
-export function computeFoldChange(meanA, meanB, pseudocount = 0.01) {
-  if (!Number.isFinite(meanA) || meanA < 0) {
-    throw new RangeError('Fold-change meanA must be finite and non-negative');
-  }
-  if (!Number.isFinite(meanB) || meanB < 0) {
-    throw new RangeError('Fold-change meanB must be finite and non-negative');
-  }
-  if (!Number.isFinite(pseudocount) || pseudocount <= 0) {
-    throw new RangeError('Fold-change pseudocount must be finite and positive');
-  }
-  const adjA = meanA + pseudocount;
-  const adjB = meanB + pseudocount;
-
-  return {
-    foldChange: adjA / adjB,
-    log2FoldChange: Math.log2(adjA / adjB)
-  };
-}
-
-/**
- * Classify significance and effect size
- *
- * @param {number} pValue - P-value
- * @param {number} effectSize - Effect size (Cohen's d or similar)
- * @returns {Object} Classification
- */
-export function classifyResult(pValue, effectSize) {
-  requireProbability(pValue, 'Classification p-value');
-  if (!Number.isFinite(effectSize)) {
-    throw new RangeError('Classification effect size must be finite');
-  }
-  // Significance classification
-  let significanceLevel = 'ns';
-  if (pValue < 0.001) significanceLevel = '***';
-  else if (pValue < 0.01) significanceLevel = '**';
-  else if (pValue < 0.05) significanceLevel = '*';
-
-  // Effect size classification (Cohen's d conventions)
-  let effectSizeCategory = 'negligible';
-  const absEffect = Math.abs(effectSize);
-  if (absEffect >= 0.8) effectSizeCategory = 'large';
-  else if (absEffect >= 0.5) effectSizeCategory = 'medium';
-  else if (absEffect >= 0.2) effectSizeCategory = 'small';
-
-  return {
-    significanceLevel,
-    effectSizeCategory,
-    isSignificant: pValue < 0.05,
-    direction: effectSize > 0 ? 'positive' : effectSize < 0 ? 'negative' : 'none'
-  };
-}
-
-// =============================================================================
-// PLUGIN REGISTRATION
-// =============================================================================
-
-/**
- * Register statistical tests as plugins
- * This enables discovery and dynamic selection of tests.
- */
-let _statsRegistered = false;
-
-function requirePluginComputeInput(data, requiredKeys, label) {
-  requireRecord(data, `${label} input`);
-  const actualKeys = Object.keys(data).sort();
-  const expectedKeys = [...requiredKeys].sort();
-  if (
-    actualKeys.length !== expectedKeys.length
-    || actualKeys.some((key, index) => key !== expectedKeys[index])
-  ) {
-    throw new TypeError(
-      `${label} input must contain exactly ${expectedKeys.join(', ')}`
-    );
-  }
-  return data;
-}
-
-function requireEmptyPluginOptions(options, label) {
-  requireRecord(options, `${label} options`);
-  if (Object.keys(options).length !== 0) {
-    throw new TypeError(`${label} does not accept compute options`);
-  }
-}
-
-export function registerStatisticalTests() {
-  if (_statsRegistered) return;
-
-  const registry = getStatRegistry();
-  const register = plugin => {
-    if (registry.register(plugin) !== true) {
-      throw new Error(`Statistical plugin registration failed: ${plugin.id}`);
-    }
-  };
-
-  // Chi-squared test for categorical data
-  register({
-    id: 'chi-squared',
-    name: 'Chi-Squared Test',
-    description: 'Tests independence between categorical distributions',
-    testType: 'categorical',
-    supportedTypes: ['categorical'],
-    minGroups: 2,
-    maxGroups: null,
-    compute(data, options = {}) {
-      requireEmptyPluginOptions(options, 'Chi-squared plugin');
-      const input = requirePluginComputeInput(
-        data,
-        ['pageData'],
-        'Chi-squared plugin'
-      );
-      return chiSquaredTest(input.pageData);
-    }
-  });
-
-  // Fisher's exact test for sparse 2x2 categorical data
-  register({
-    id: 'fisher-exact',
-    name: "Fisher's Exact Test",
-    description: 'Tests association in a sparse 2x2 contingency table',
-    testType: 'categorical',
-    supportedTypes: ['categorical'],
-    minGroups: 2,
-    maxGroups: 2,
-    compute(data, options = {}) {
-      requireEmptyPluginOptions(options, "Fisher's exact plugin");
-      const input = requirePluginComputeInput(
-        data,
-        ['pageData'],
-        "Fisher's exact plugin"
-      );
-      return fisherExactTest(input.pageData);
-    }
-  });
-
-  // Welch's t-test for continuous data (2 groups)
-  register({
-    id: 't-test',
-    name: "Welch's t-test",
-    description: 'Compares means of two groups without assuming equal variances',
-    testType: 'parametric',
-    supportedTypes: ['continuous', 'gene_expression'],
-    minGroups: 2,
-    maxGroups: 2,
-    compute(data, options = {}) {
-      requireEmptyPluginOptions(options, "Welch's t-test plugin");
-      const input = requirePluginComputeInput(
-        data,
-        ['group1', 'group2'],
-        "Welch's t-test plugin"
-      );
-      return tTest(input.group1, input.group2);
-    }
-  });
-
-  // Mann-Whitney U test for continuous data (2 groups, non-parametric)
-  register({
-    id: 'mann-whitney',
-    name: 'Mann-Whitney U Test',
-    description: 'Compares distributions of two groups (non-parametric)',
-    testType: 'nonparametric',
-    supportedTypes: ['continuous', 'gene_expression'],
-    minGroups: 2,
-    maxGroups: 2,
-    compute(data, options = {}) {
-      requireEmptyPluginOptions(options, 'Mann-Whitney plugin');
-      const input = requirePluginComputeInput(
-        data,
-        ['group1', 'group2'],
-        'Mann-Whitney plugin'
-      );
-      return mannWhitneyU(input.group1, input.group2);
-    }
-  });
-
-  // One-way ANOVA for continuous data (multiple groups)
-  register({
-    id: 'anova',
-    name: 'One-way ANOVA',
-    description: 'Compares means across multiple groups (parametric)',
-    testType: 'parametric',
-    supportedTypes: ['continuous', 'gene_expression'],
-    minGroups: 2,
-    maxGroups: null,
-    compute(data, options = {}) {
-      requireEmptyPluginOptions(options, 'One-way ANOVA plugin');
-      const input = requirePluginComputeInput(
-        data,
-        ['groups'],
-        'One-way ANOVA plugin'
-      );
-      return oneWayANOVA(input.groups);
-    }
-  });
-
-  // Kruskal-Wallis test for continuous data (multiple groups, non-parametric)
-  register({
-    id: 'kruskal-wallis',
-    name: 'Kruskal-Wallis Test',
-    description: 'Compares distributions across multiple groups (non-parametric)',
-    testType: 'nonparametric',
-    supportedTypes: ['continuous', 'gene_expression'],
-    minGroups: 2,
-    maxGroups: null,
-    compute(data, options = {}) {
-      requireEmptyPluginOptions(options, 'Kruskal-Wallis plugin');
-      const input = requirePluginComputeInput(
-        data,
-        ['groups'],
-        'Kruskal-Wallis plugin'
-      );
-      return kruskalWallis(input.groups);
-    }
-  });
-
-  _statsRegistered = true;
-  console.log('[StatisticalTests] Registered 6 statistical tests as plugins');
-}
-
-/**
- * Get the StatPluginRegistry with tests registered
- * @returns {import('./plugin-contract.js').StatPluginRegistry}
- */
-export function getStatisticalTestRegistry() {
-  registerStatisticalTests();
-  return getStatRegistry();
-}
-
-// =============================================================================
-// DEFAULT EXPORT
-// =============================================================================
-
-export default {
-  runStatisticalTests,
-  formatStatisticalResult,
-  chiSquaredTest,
-  fisherExactTest,
-  tTest,
-  mannWhitneyU,
-  oneWayANOVA,
-  kruskalWallis,
-  benjaminiHochberg,
-  benjaminiHochbergAdjusted,
-  benjaminiHochbergTestable,
-  bonferroniCorrection,
-  applyMultipleTestingCorrection,
-  confidenceInterval,
-  computeFoldChange,
-  classifyResult,
-  // Plugin registration
-  registerStatisticalTests,
-  getStatisticalTestRegistry
-};

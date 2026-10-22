@@ -45,7 +45,15 @@ export default defineConfig({
     baseURL: origin,
     headless: true,
     screenshot: 'only-on-failure',
-    trace: 'off',
+    // A failed test keeps its action timeline, console, and network log --
+    // which request or step stalled -- without DOM snapshots or screenshots,
+    // whose capture cost would perturb timing-sensitive rendering specs.
+    trace: {
+      mode: 'retain-on-failure',
+      snapshots: false,
+      screenshots: false,
+      sources: false,
+    },
     video: 'off',
     viewport: { width: 1440, height: 1000 },
   },

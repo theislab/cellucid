@@ -4,16 +4,19 @@
  * UI components for exporting analysis results:
  * - Export toolbar with PNG, SVG, CSV buttons
  * - Expand button for popup view
+ *
+ * Both are built by the shared control kit, so they are the same buttons the
+ * rest of the sidebar draws.
  */
 
-import { createButton } from '../../shared/dom-utils.js';
+import { createButton } from '../../../ui/components/controls.js';
 
 // =============================================================================
 // EXPORT TOOLBAR
 // =============================================================================
 
 /**
- * Create export toolbar - compact style (for inline use)
+ * Create export toolbar - compact buttons (for inline use)
  * @param {Object} options
  * @param {Function} options.onExportPNG - Export PNG callback
  * @param {Function} options.onExportSVG - Export SVG callback
@@ -26,30 +29,17 @@ export function createExportToolbar(options = {}) {
   const container = document.createElement('div');
   container.className = 'analysis-export-toolbar';
 
-  if (onExportPNG) {
+  for (const [label, title, onClick] of [
+    ['PNG', 'Download as PNG', onExportPNG],
+    ['SVG', 'Download as SVG', onExportSVG],
+    ['CSV', 'Download data as CSV', onExportCSV]
+  ]) {
+    if (!onClick) continue;
     container.appendChild(createButton({
-      text: 'PNG',
-      className: 'btn-small',
-      title: 'Download as PNG',
-      onClick: onExportPNG
-    }));
-  }
-
-  if (onExportSVG) {
-    container.appendChild(createButton({
-      text: 'SVG',
-      className: 'btn-small',
-      title: 'Download as SVG',
-      onClick: onExportSVG
-    }));
-  }
-
-  if (onExportCSV) {
-    container.appendChild(createButton({
-      text: 'CSV',
-      className: 'btn-small',
-      title: 'Download data',
-      onClick: onExportCSV
+      label,
+      title,
+      className: 'btn-compact',
+      onClick
     }));
   }
 
@@ -61,25 +51,15 @@ export function createExportToolbar(options = {}) {
 // =============================================================================
 
 /**
- * Create "Open in Popup" button for expanding the analysis view
+ * Create the button that opens the analysis in its expanded window.
  * @param {Function} onClick - Click handler
  * @returns {HTMLButtonElement}
  */
 export function createExpandButton(onClick) {
-  const btn = document.createElement('button');
-  btn.type = 'button';
-  btn.className = 'btn-small analysis-expand-btn';
-  btn.textContent = '⤢ Expand';
-  btn.title = 'Open in popup for more options';
-  btn.addEventListener('click', onClick);
-  return btn;
+  return createButton({
+    label: 'Expand',
+    title: 'Open in a larger window with more options',
+    className: 'analysis-expand-btn',
+    onClick
+  });
 }
-
-// =============================================================================
-// EXPORTS
-// =============================================================================
-
-export default {
-  createExportToolbar,
-  createExpandButton
-};

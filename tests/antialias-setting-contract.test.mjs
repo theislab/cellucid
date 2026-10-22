@@ -36,8 +36,9 @@ import {
   ANTIALIAS_STORAGE_KEY,
   AUTOMATIC_ANTIALIAS_CELL_LIMIT,
   DEFAULT_ANTIALIAS_MODE,
+  AUTOMATIC_ANTIALIAS_CELL_LIMIT_FLAT,
   antialiasingInForce,
-  automaticAntialiasingForCellCount,
+  automaticAntialiasing,
   resolveAntialiasPreference,
   writeAntialiasPreference,
 } from '../assets/js/app/ui/core/antialias-preference.js';
@@ -50,6 +51,7 @@ import { initRenderControls } from '../assets/js/app/ui/modules/render-controls.
 import {
   POINT_SIZE_SLIDER_MINIMUM,
 } from '../assets/js/rendering/point-size-scale.js';
+import { infoTipText } from './helpers/info-tip-text.mjs';
 
 const MAIN_URL = new URL('../assets/js/app/main.js', import.meta.url);
 const VIEWER_URL = new URL('../assets/js/rendering/viewer.js', import.meta.url);
@@ -192,38 +194,50 @@ test('the preference refuses an unknown mode and a storage that is not one', () 
   );
 });
 
-test('the automatic answer turns over at five million cells', () => {
+test('the automatic answer turns over at five million cells in 3D', () => {
   // Multisampling multiplies the cost of every covered pixel, and a cloud this
   // large covers nearly every pixel it is drawn over.
   assert.equal(AUTOMATIC_ANTIALIAS_CELL_LIMIT, 5_000_000);
-  assert.equal(automaticAntialiasingForCellCount(1), true);
-  assert.equal(automaticAntialiasingForCellCount(561_947), true);
+  assert.equal(automaticAntialiasing(1, 3), true);
+  assert.equal(automaticAntialiasing(561_947, 3), true);
+  assert.equal(automaticAntialiasing(AUTOMATIC_ANTIALIAS_CELL_LIMIT - 1, 3), true);
   assert.equal(
-    automaticAntialiasingForCellCount(AUTOMATIC_ANTIALIAS_CELL_LIMIT - 1),
-    true
-  );
-  assert.equal(
-    automaticAntialiasingForCellCount(AUTOMATIC_ANTIALIAS_CELL_LIMIT),
+    automaticAntialiasing(AUTOMATIC_ANTIALIAS_CELL_LIMIT, 3),
     false,
     'the limit itself is at or above, so it is off'
   );
-  assert.equal(automaticAntialiasingForCellCount(18_142_044), false);
-  assert.throws(
-    () => automaticAntialiasingForCellCount(0),
-    /positive safe integer cell count/
-  );
+  assert.equal(automaticAntialiasing(18_142_044, 3), false);
+  assert.throws(() => automaticAntialiasing(0, 3), /positive safe integer cell count/);
+});
+
+test('a flat view turns automatic antialiasing over far earlier', () => {
+  // A 1D or 2D view draws without depth testing, so every overlapping point is
+  // blended, per sample under multisampling: orbiting 1M cells in 2D measured a
+  // GPU timer total of 25.5 ms a frame antialiased against 11.6 ms without.
+  assert.equal(AUTOMATIC_ANTIALIAS_CELL_LIMIT_FLAT, 200_000);
+  for (const dimension of [1, 2]) {
+    assert.equal(automaticAntialiasing(3_696, dimension), true);
+    assert.equal(automaticAntialiasing(AUTOMATIC_ANTIALIAS_CELL_LIMIT_FLAT - 1, dimension), true);
+    assert.equal(automaticAntialiasing(AUTOMATIC_ANTIALIAS_CELL_LIMIT_FLAT, dimension), false);
+    assert.equal(automaticAntialiasing(561_947, dimension), false);
+  }
+  // The same cell count in 3D stays antialiased.
+  assert.equal(automaticAntialiasing(561_947, 3), true);
+  assert.throws(() => automaticAntialiasing(1, 4), /dimension of 1, 2, or 3/);
+  assert.throws(() => automaticAntialiasing(1, null), /dimension of 1, 2, or 3/);
 });
 
 test('an explicit choice outranks the dataset, in both directions', () => {
   // A user who ticks the box on an eighteen-million-cell dataset means it, and a
   // user who unticks it on a small one means that too.
-  assert.equal(antialiasingInForce('on', 18_142_044), true);
-  assert.equal(antialiasingInForce('off', 3_696), false);
-  assert.equal(antialiasingInForce('auto', 3_696), true);
-  assert.equal(antialiasingInForce('auto', 18_142_044), false);
+  assert.equal(antialiasingInForce('on', 18_142_044, 2), true);
+  assert.equal(antialiasingInForce('off', 3_696, 3), false);
+  assert.equal(antialiasingInForce('auto', 3_696, 3), true);
+  assert.equal(antialiasingInForce('auto', 18_142_044, 3), false);
+  assert.equal(antialiasingInForce('auto', 561_947, 2), false);
   // No dataset: nothing to measure and nothing on screen to smooth.
-  assert.equal(antialiasingInForce('auto', null), true);
-  assert.throws(() => antialiasingInForce('maybe', 1), /exactly "auto"/);
+  assert.equal(antialiasingInForce('auto', null, null), true);
+  assert.throws(() => antialiasingInForce('maybe', 1, 3), /exactly "auto"/);
 });
 
 // ---------------------------------------------------------------------------
@@ -303,12 +317,12 @@ test('the dataset re-decides antialiasing on every publication', () => {
   // and now holds eighteen million has to answer for the eighteen million.
   assert.match(
     mainSource,
-    /ui\.applyDatasetRenderDefaults\(\s*publication\.stage\.generation\.identity\.stats\.n_cells/,
+    /ui\.applyDatasetRenderDefaults\(\s*publication\.stage\.generation\.identity\.stats\.n_cells,\s*publication\.stage\.generation\.identity\.embeddings\.default_dimension/,
     'the cell count must reach the render defaults'
   );
   assert.match(
     coordinatorSource,
-    /renderControls\.applyDatasetAntialiasing\(cellCount\)/
+    /renderControls\.applyDatasetAntialiasing\(cellCount, dimension\)/
   );
 });
 
@@ -434,6 +448,7 @@ function makeDom() {
     depthControls: new FakeElement(),
     rendererControls: new FakeElement(),
     pointsControls: new FakeElement(),
+    pointsPerformanceControls: new FakeElement(),
     smokeControls: new FakeElement(),
     hpLodEnabledCheckbox: new FakeElement({
       id: 'hp-lod-enabled', type: 'checkbox', checked: false,
@@ -443,7 +458,7 @@ function makeDom() {
     }),
     hpShaderQualitySelect: new FakeElement({
       id: 'hp-shader-quality', tagName: 'SELECT', value: 'full',
-      options: ['full', 'light', 'ultralight'],
+      options: ['full', 'sculpted', 'light', 'ultralight'],
     }),
     hpLodForceInput: new FakeElement({
       id: 'hp-lod-force', type: 'range', value: '-1', min: '-1', max: '17', step: '1',
@@ -476,7 +491,7 @@ function makeViewer({ available = true } = {}) {
     setSmokeParams: () => {},
     setCloudResolutionScale: () => {},
     setNoiseTextureResolution: () => {},
-    getAdaptiveScaleFactor: () => 1,
+    getSmokeSupport: () => ({ supported: true, reason: null, message: null, detail: null }),
     hasSnapshots: () => false,
     setShaderQuality: () => {},
     setAdaptiveLOD: () => {},
@@ -564,18 +579,37 @@ test('with nothing stored, the dataset decides and the box says so', t => {
   assert.match(dom.hpAntialiasStatus.textContent, /Chosen automatically/);
 
   // A large dataset turns it off with no reload and without storing anything.
-  assert.equal(controls.applyDatasetAntialiasing(18_142_044), false);
+  assert.equal(controls.applyDatasetAntialiasing(18_142_044, 3), false);
   assert.equal(dom.hpAntialiasCheckbox.checked, false);
   assert.match(
     dom.hpAntialiasStatus.textContent,
-    new RegExp(`${(18_142_044).toLocaleString()} cells`),
+    new RegExp(`${(18_142_044).toLocaleString()} cells in 3D`),
   );
   assert.equal(storage.getItem(ANTIALIAS_STORAGE_KEY), null);
 
   // Switching in place to a small one turns it back on.
-  assert.equal(controls.applyDatasetAntialiasing(3_696), true);
+  assert.equal(controls.applyDatasetAntialiasing(3_696, 3), true);
   assert.equal(dom.hpAntialiasCheckbox.checked, true);
   assert.deepEqual(viewer.published, [true, false, true]);
+});
+
+test('automatic antialiasing follows the active view between 2D and 3D', t => {
+  const storage = makeStorage();
+  t.after(installDocument(storage));
+
+  const { dom, controls } = bootstrap({ storage });
+  // 561,947 cells: antialiased in 3D, too costly in a flat view.
+  assert.equal(controls.applyDatasetAntialiasing(561_947, 3), true);
+  assert.equal(controls.applyViewDimensionAntialiasing(2), false);
+  assert.equal(dom.hpAntialiasCheckbox.checked, false);
+  assert.match(dom.hpAntialiasStatus.textContent, /cells in 2D\./);
+  assert.equal(controls.applyViewDimensionAntialiasing(3), true);
+  assert.equal(storage.getItem(ANTIALIAS_STORAGE_KEY), null);
+
+  // An explicit choice is not overridden by a dimension switch.
+  dom.hpAntialiasCheckbox.checked = true;
+  dom.hpAntialiasCheckbox.dispatchEvent({ type: 'change' });
+  assert.equal(controls.applyViewDimensionAntialiasing(2), true);
 });
 
 test('a stored choice is published and the dataset stops deciding', t => {
@@ -590,7 +624,7 @@ test('a stored choice is published and the dataset stops deciding', t => {
     'an explicit choice needs no explanation'
   );
 
-  assert.equal(controls.applyDatasetAntialiasing(3_696), false);
+  assert.equal(controls.applyDatasetAntialiasing(3_696, 3), false);
   assert.equal(
     dom.hpAntialiasCheckbox.checked,
     false,
@@ -603,7 +637,7 @@ test('clicking the box publishes it to the renderer and ends automatic', t => {
   t.after(installDocument(storage));
 
   const { dom, viewer, controls } = bootstrap({ storage });
-  controls.applyDatasetAntialiasing(18_142_044);
+  controls.applyDatasetAntialiasing(18_142_044, 3);
   assert.equal(dom.hpAntialiasCheckbox.checked, false);
 
   dom.hpAntialiasCheckbox.checked = true;
@@ -618,7 +652,7 @@ test('clicking the box publishes it to the renderer and ends automatic', t => {
   );
 
   // The dataset no longer gets a vote, in the direction the user chose.
-  assert.equal(controls.applyDatasetAntialiasing(18_142_044), true);
+  assert.equal(controls.applyDatasetAntialiasing(18_142_044, 3), true);
   assert.equal(dom.hpAntialiasCheckbox.checked, true);
 });
 
@@ -802,42 +836,44 @@ test('the render DOM inventory carries the control and its status line', () => {
   }
 });
 
-test('the control lives outside the block that smoke mode hides', () => {
-  // `render-controls.js` sets `#renderer-controls` to display:none in smoke
-  // mode. The drawing buffer is multisampled in both modes, so a setting that
-  // governs it must not disappear with the LOD controls.
-  const rendererControls = indexHtml.indexOf('id="renderer-controls"');
+test('the control closes the Performance group, outside every block smoke mode hides', () => {
+  // `render-controls.js` hides `#renderer-controls`, `#points-performance-controls`
+  // and `#points-controls` in smoke mode. The drawing buffer is multisampled in
+  // both modes, so the setting that governs it sits in the Performance group
+  // after level of detail and frustum culling, but outside their points-only
+  // wrapper, and the group itself is outside `#points-controls`.
+  const group = indexHtml.indexOf('id="render-performance-controls"');
+  const pointsOnly = indexHtml.indexOf('id="points-performance-controls"');
+  const frustum = indexHtml.indexOf('id="hp-frustum-culling"');
   const antialias = indexHtml.indexOf('id="hp-antialias"');
-  const smokeControls = indexHtml.indexOf('id="smoke-controls"');
-  assert.ok(rendererControls > 0 && antialias > 0 && smokeControls > 0);
-  assert.ok(
-    antialias > rendererControls && antialias < smokeControls,
-    'the control must sit between the renderer block and the smoke block'
+  const pointsControls = indexHtml.indexOf('id="points-controls"');
+  assert.ok(group > 0 && pointsOnly > group && frustum > pointsOnly && antialias > frustum);
+  assert.ok(antialias < pointsControls, 'the group must not sit inside #points-controls');
+  const wrapper = indexHtml.slice(
+    indexHtml.lastIndexOf('<div', pointsOnly),
+    indexHtml.indexOf('<div class="control-block" id="antialias-controls"')
+  );
+  assert.equal(
+    (wrapper.match(/<div\b/g) ?? []).length,
+    (wrapper.match(/<\/div>/g) ?? []).length,
+    'the points-only wrapper must close before the antialiasing control'
   );
   assert.ok(
     indexHtml.includes('id="antialias-controls"'),
-    'the control must have its own block rather than joining #renderer-controls'
+    'the control keeps its own block'
   );
 });
 
 test('the tooltip states both halves of the trade', () => {
   // A scientific viewer must not present this as a free speed-up. The measured
   // cost in pixels belongs where the user makes the choice.
-  const tooltip = indexHtml.slice(
-    indexHtml.indexOf('id="antialias-info-tooltip"'),
-    indexHtml.indexOf(
-      '</div>',
-      indexHtml.indexOf('info-tooltip-content', indexHtml.indexOf('id="antialias-info-tooltip"'))
-    )
-  );
+  const tooltip = infoTipText(indexHtml, 'antialias-info-tooltip');
   assert.match(tooltip, /faster/, 'the speed the user gains must be stated');
+  assert.match(tooltip, /pixels change/, 'the picture the user loses must be stated beside it');
   assert.match(
-    indexHtml.slice(
-      indexHtml.indexOf('id="antialias-info-tooltip"'),
-      indexHtml.indexOf('id="hp-antialias"')
-    ),
-    /pixels change/,
-    'the picture the user loses must be stated beside it'
+    tooltip,
+    /5,000,000 cells in a 3D view and below 200,000 in a 1D or 2D view/,
+    'the automatic rule must be the dimension-aware one the code applies'
   );
 });
 

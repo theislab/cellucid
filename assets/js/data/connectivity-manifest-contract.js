@@ -1,6 +1,5 @@
 const UINT32_CELL_CAPACITY = 0x1_0000_0000;
 const UINT16_CELL_CAPACITY = 0x1_0000;
-const MAX_CONNECTIVITY_WORKING_BYTES = 512 * 1024 * 1024;
 const UINT16_STORAGE = Object.freeze({
   dtype: 'uint16',
   bytes: Uint16Array.BYTES_PER_ELEMENT,
@@ -246,45 +245,6 @@ function validateDirectTransport(manifest, label) {
   }
 }
 
-function validateConnectivityWorkingSet(manifest, context, label) {
-  const edgeBytes =
-    BigInt(manifest.n_edges) * BigInt(Uint32Array.BYTES_PER_ELEMENT);
-  const canonicalWeightBytes =
-    BigInt(manifest.n_edges) * BigInt(Float64Array.BYTES_PER_ELEMENT);
-  const gpuWeightStagingBytes =
-    BigInt(manifest.n_edges) * BigInt(Float32Array.BYTES_PER_ELEMENT);
-  const degreeBytes =
-    BigInt(manifest.n_cells) * BigInt(Uint32Array.BYTES_PER_ELEMENT);
-  // Canonical arrays remain transport/adapter-owned. Rendering receives one
-  // synchronized topology/weight copy so visualization-only shuffling cannot
-  // mutate them, then stages one topology pack and normalized Float32 weights
-  // for the GPU.
-  const canonicalEdgeBytes = edgeBytes * 2n;
-  const renderOwnedEdgeBytes = edgeBytes * 2n;
-  const renderOwnedWeightBytes = canonicalWeightBytes;
-  const gpuTopologyStagingBytes = edgeBytes * 2n;
-  const rawFileBytes =
-    context === CONNECTIVITY_MANIFEST_CONTEXT.FILE &&
-    manifest.index_bytes !== Uint32Array.BYTES_PER_ELEMENT
-      ? BigInt(manifest.n_edges) * BigInt(manifest.index_bytes) * 2n
-      : 0n;
-  const workingBytes =
-    canonicalEdgeBytes +
-    canonicalWeightBytes +
-    renderOwnedEdgeBytes +
-    renderOwnedWeightBytes +
-    gpuTopologyStagingBytes +
-    gpuWeightStagingBytes +
-    rawFileBytes +
-    degreeBytes;
-  if (workingBytes > BigInt(MAX_CONNECTIVITY_WORKING_BYTES)) {
-    throw new Error(
-      `Invalid ${label}: edge validation requires more than the ` +
-      `${MAX_CONNECTIVITY_WORKING_BYTES}-byte browser working-set limit`
-    );
-  }
-}
-
 /**
  * Validate one connectivity manifest against the transport selected by its
  * explicit URL context. Only a direct source may represent absence as null.
@@ -323,7 +283,6 @@ export function validateConnectivityManifest(manifest, context) {
   } else {
     validateFileTransport(manifest, label);
   }
-  validateConnectivityWorkingSet(manifest, context, label);
   return manifest;
 }
 

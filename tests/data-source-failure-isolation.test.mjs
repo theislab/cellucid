@@ -8,7 +8,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
-  createDataSourceManager,
+  DataSourceManager,
 } from '../assets/js/data/data-source-manager.js';
 
 function createStubSource(type, behaviour) {
@@ -33,7 +33,7 @@ function datasetRecord(id) {
 }
 
 test('one failing source never fails the sibling sources', async () => {
-  const manager = createDataSourceManager();
+  const manager = new DataSourceManager();
   const catalogFailure = new Error('catalog host is unreachable');
 
   manager.registerSource(
@@ -82,7 +82,7 @@ test('one failing source never fails the sibling sources', async () => {
 });
 
 test('a source that rejects listDatasets is isolated exactly like a failing probe', async () => {
-  const manager = createDataSourceManager();
+  const manager = new DataSourceManager();
   const listFailure = new Error('catalog manifest is malformed');
 
   manager.registerSource(
@@ -117,7 +117,7 @@ test('a source that rejects listDatasets is isolated exactly like a failing prob
 });
 
 test('a source violating the probe contract is isolated, not propagated', async () => {
-  const manager = createDataSourceManager();
+  const manager = new DataSourceManager();
 
   manager.registerSource(
     'contract-violation',
@@ -153,7 +153,7 @@ test('a source violating the probe contract is isolated, not propagated', async 
 });
 
 test('unavailable sources stay omitted and carry no failure', async () => {
-  const manager = createDataSourceManager();
+  const manager = new DataSourceManager();
 
   manager.registerSource(
     'absent',
@@ -169,7 +169,7 @@ test('unavailable sources stay omitted and carry no failure', async () => {
 });
 
 test('an explicit refresh clears a cached source failure and never rejects', async () => {
-  const manager = createDataSourceManager();
+  const manager = new DataSourceManager();
   let failNext = true;
   let refreshCalls = 0;
 
@@ -229,7 +229,7 @@ test('an explicit refresh clears a cached source failure and never rejects', asy
 });
 
 test('getAllDatasets can clear cached failures in one pass', async () => {
-  const manager = createDataSourceManager();
+  const manager = new DataSourceManager();
   let failNext = true;
 
   manager.registerSource(
@@ -259,8 +259,59 @@ test('getAllDatasets can clear cached failures in one pass', async () => {
   );
 });
 
+test('a failed refresh is reported on its source, never as a reloaded list', async () => {
+  const manager = new DataSourceManager();
+  const refreshFailure = new Error('directory handles went stale');
+
+  manager.registerSource(
+    'local-user',
+    createStubSource('local-user', {
+      isAvailable: async () => true,
+      listDatasets: async () => [datasetRecord('kept-local')],
+      async refresh() {
+        throw refreshFailure;
+      },
+    })
+  );
+  manager.registerSource(
+    'gone',
+    createStubSource('gone', {
+      isAvailable: async () => false,
+      listDatasets: async () => [],
+      async refresh() {
+        throw new Error('connection lost');
+      },
+    })
+  );
+  manager.registerSource(
+    'healthy',
+    createStubSource('healthy', {
+      isAvailable: async () => true,
+      listDatasets: async () => [datasetRecord('remote')],
+    })
+  );
+
+  const results = await manager.getAllDatasets({ refresh: true });
+  const bySource = new Map(results.map(result => [result.sourceType, result]));
+
+  const local = bySource.get('local-user');
+  assert.strictEqual(local.error, refreshFailure);
+  assert.deepEqual(local.datasets.map(dataset => dataset.id), ['kept-local']);
+
+  // An unavailable source with a failed refresh still surfaces the failure.
+  assert.match(bySource.get('gone').error.message, /connection lost/);
+  assert.deepEqual(bySource.get('gone').datasets, []);
+
+  assert.equal(bySource.get('healthy').error, null);
+
+  // Without a refresh nothing is re-run, so no refresh failure is reported.
+  const listed = await manager.getAllDatasets();
+  assert.equal(listed.find(result => result.sourceType === 'local-user').error, null);
+  assert.equal(listed.some(result => result.sourceType === 'gone'), false);
+});
+
 test('getAllDatasets rejects unsupported option records', async () => {
-  const manager = createDataSourceManager();
+  const manager = new DataSourceManager();
   await assert.rejects(
     manager.getAllDatasets({ refreshEverything: true }),
     /supports only: refresh/i

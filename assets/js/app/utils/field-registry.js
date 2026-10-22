@@ -122,5 +122,3 @@ export function getFieldRegistry() {
   if (!_instance) _instance = new FieldRegistry();
   return _instance;
 }
-
-export { FieldRegistry };

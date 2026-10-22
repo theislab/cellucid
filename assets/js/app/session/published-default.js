@@ -52,12 +52,6 @@ import {
 } from './schema-contract.js';
 import { assertDatasetFingerprint } from './session-context.js';
 
-/** Transport ceiling for a published default, before decompression. */
-export const MAX_PUBLISHED_DEFAULT_STATE_BYTES = 32 * 1024;
-
-/** Ceiling for a published default's chunks, per chunk and in aggregate. */
-export const MAX_PUBLISHED_DEFAULT_UNCOMPRESSED_BYTES = 64 * 1024;
-
 /**
  * The complete profile a published default may carry, in the accepted order.
  *
@@ -113,7 +107,7 @@ export const PUBLISHED_DEFAULT_STATIC_CHUNK_PROFILE = Object.freeze([
   })
 ]);
 
-export const CINEMATIC_CAMERA_CHUNK_PROFILE = Object.freeze({
+const CINEMATIC_CAMERA_CHUNK_PROFILE = Object.freeze({
   id: 'cinematic/camera',
   contributorId: 'cinematic-camera',
   priority: 'eager',
@@ -287,8 +281,7 @@ function describeDroppedChunkLoss(payload, chunkId) {
 async function decodeJsonChunkPayload(chunk) {
   const uncompressedBytes = assertSafeInteger(
     chunk.meta.uncompressedBytes,
-    `Session chunk "${chunk.meta.id}" uncompressedBytes`,
-    { maximum: MAX_PUBLISHED_DEFAULT_UNCOMPRESSED_BYTES }
+    `Session chunk "${chunk.meta.id}" uncompressedBytes`
   );
   const raw = chunk.meta.codec === 'gzip'
     ? await gzipDecompress(chunk.bytes, {
@@ -326,12 +319,20 @@ const DATASET_DESCRIBING_FINGERPRINT_FIELDS = Object.freeze([
     label: 'gene count'
   }),
   Object.freeze({
+    read: fingerprint => JSON.stringify(fingerprint.cellOrder.embedding),
+    label: 'cell-order embedding'
+  }),
+  Object.freeze({
     read: fingerprint => fingerprint.cellOrder.dimension,
     label: 'embedding dimension'
   }),
   Object.freeze({
     read: fingerprint => fingerprint.cellOrder.digest,
     label: 'cell-order digest'
+  }),
+  Object.freeze({
+    read: fingerprint => JSON.stringify(fingerprint.dataMapping),
+    label: 'data mapping'
   })
 ]);
 
@@ -349,7 +350,7 @@ const DATASET_DESCRIBING_FINGERPRINT_FIELDS = Object.freeze([
  * sample is opened. Carrying the capture's identity through was how five
  * shipped presets came to refuse themselves.
  *
- * Renaming is safe only because the four describing fields are *verified*
+ * Renaming is safe only because the describing fields are *verified*
  * rather than replaced. A mismatch means the capture was taken against
  * different data, and stamping the published name onto it would assert an
  * identity the bytes do not have — so it is refused, naming the field.
@@ -357,7 +358,7 @@ const DATASET_DESCRIBING_FINGERPRINT_FIELDS = Object.freeze([
  * `cellOrder.digest` is carried from the capture rather than recomputed: this
  * module never sees coordinates. What proves it is the digest of the *published*
  * coordinates is the publishing repository's own step, which recomputes it from
- * the generation's point payload before calling here.
+ * the payload of the embedding `cellOrder.embedding` names before calling here.
  *
  * @param {any} captured - `manifest.datasetFingerprint` of the capture.
  * @param {any} published - The fingerprint the generation is served under.
@@ -400,9 +401,11 @@ export function rebindPublishedDefaultFingerprint(captured, published) {
     cellCount: captured.cellCount,
     varCount: captured.varCount,
     cellOrder: {
+      embedding: structuredClone(captured.cellOrder.embedding),
       dimension: captured.cellOrder.dimension,
       digest: captured.cellOrder.digest
-    }
+    },
+    dataMapping: structuredClone(captured.dataMapping)
   };
 }
 
@@ -439,16 +442,22 @@ export async function trimToPublishedDefault(source, publishedIdentity) {
     }
   }
 
-  const { manifest, chunkStream } = await readBundle(source, {
+  const bundle = await readBundle(source, {
     signal: null,
     onProgress: null
   });
-  assertPlainRecord(manifest, 'Session manifest');
-  assertArray(manifest.chunks, 'Session manifest chunks');
+  const { manifest, chunkStream } = bundle;
 
   /** @type {{ meta: any, bytes: Uint8Array }[]} */
   const chunks = [];
-  for await (const chunk of chunkStream) chunks.push(chunk);
+  try {
+    assertPlainRecord(manifest, 'Session manifest');
+    assertArray(manifest.chunks, 'Session manifest chunks');
+    for await (const chunk of chunkStream) chunks.push(chunk);
+  } catch (error) {
+    await bundle.cancel(error);
+    throw error;
+  }
 
   const keptById = new Map(
     PUBLISHED_DEFAULT_STATIC_CHUNK_PROFILE.map(profile => [profile.id, profile])
@@ -500,17 +509,10 @@ export async function trimToPublishedDefault(source, publishedIdentity) {
 
   assertPublishedDefaultChunkProfile(kept.map(chunk => chunk.meta));
 
-  let aggregateUncompressedBytes = 0;
   for (const chunk of kept) {
-    aggregateUncompressedBytes += assertSafeInteger(
+    assertSafeInteger(
       chunk.meta.uncompressedBytes,
-      `Published default chunk "${chunk.meta.id}" uncompressedBytes`,
-      { maximum: MAX_PUBLISHED_DEFAULT_UNCOMPRESSED_BYTES }
-    );
-  }
-  if (aggregateUncompressedBytes > MAX_PUBLISHED_DEFAULT_UNCOMPRESSED_BYTES) {
-    throw new RangeError(
-      'Published default session exceeds the 64 KiB aggregate uncompressed byte limit.'
+      `Published default chunk "${chunk.meta.id}" uncompressedBytes`
     );
   }
 
@@ -525,10 +527,5 @@ export async function trimToPublishedDefault(source, publishedIdentity) {
     },
     chunks: kept.map(chunk => chunk.bytes)
   });
-  if (trimmed.size > MAX_PUBLISHED_DEFAULT_STATE_BYTES) {
-    throw new RangeError(
-      'Published default session exceeds the 32 KiB byte limit.'
-    );
-  }
   return trimmed;
 }

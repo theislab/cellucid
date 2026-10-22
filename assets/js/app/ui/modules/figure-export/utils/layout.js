@@ -25,6 +25,7 @@ import {
   isCategoryHidden
 } from '../components/legend-builder.js';
 import { clamp } from '../../../../utils/number-utils.js';
+import { getPresentedGridColumns } from '../../../../../rendering/viewer/presented-view-layout.js';
 
 // ============================================================================
 // Layout Constants
@@ -221,7 +222,7 @@ function estimateLegendHeightBottom({
  * @param {number} [options.legendFontSizePx=12] - Legend font size (px, for sizing)
  * @returns {LayoutDimensions}
  */
-export function computeExpandedDimensions({
+function computeExpandedDimensions({
   desiredPlotWidth,
   desiredPlotHeight,
   hasTitle = false,
@@ -518,10 +519,10 @@ export function computeGridPaneLayout({
 }
 
 /**
- * Compute optimal grid dimensions (columns × rows) for multi-panel layouts.
+ * Grid dimensions (columns × rows) for multi-panel figures.
  *
- * Uses a square-ish layout that slightly favors more columns than rows
- * for typical landscape aspect ratios.
+ * The column rule is the viewer's own (`getPresentedGridColumns`), so an
+ * exported grid has the arrangement the on-screen grid has.
  *
  * @param {number} count - Number of panels to arrange
  * @returns {{ cols: number; rows: number }}
@@ -534,17 +535,8 @@ export function computeGridPaneLayout({
  */
 export function computeGridDims(count) {
   const n = Math.max(1, count);
-
-  // For 1-3 panels, use single row
-  if (n <= 3) {
-    return { cols: n, rows: 1 };
-  }
-
-  // For larger counts, aim for square-ish grid
-  const cols = Math.ceil(Math.sqrt(n));
-  const rows = Math.ceil(n / cols);
-
-  return { cols, rows };
+  const cols = getPresentedGridColumns(n);
+  return { cols, rows: Math.ceil(n / cols) };
 }
 
 // ============================================================================

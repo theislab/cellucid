@@ -8,12 +8,14 @@
  * bootstrap reaches their listener, and on a slow link much longer. A click in
  * that window is discarded without a request, a message or a record.
  *
- * The benchmark controls are wired at the very end of `main.js`, past the
- * initial dataset publication. The renderer controls are wired earlier, by
- * `initRenderControls` inside `initUI`, because a restored session publishes
- * them by dispatching their own events and cannot wait for the bootstrap tail
- * (CEL-0129) — but `initUI` still runs several awaits deep, so they too are
- * offered long before they do anything.
+ * The benchmark controls are wired near the end of `main.js`, after `initUI`,
+ * and are admitted before the startup dataset starts loading, so a benchmark
+ * run can replace that load like any other dataset choice. The renderer
+ * controls are wired earlier, by `initRenderControls` inside `initUI`, because
+ * a restored session publishes them by dispatching their own events and cannot
+ * wait for the bootstrap tail (CEL-0129) — but `initUI` still runs several
+ * awaits deep (sign-in, health, catalog), so they too are offered long before
+ * they do anything.
  *
  * For the renderer toggles the loss would be worse than silence:
  * `render-controls.js` seeds its rollback baseline — `acceptedShaderQuality`,

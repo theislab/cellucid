@@ -15,10 +15,11 @@ test('KNN absence uses the exact current warning notification API', () => {
   assert.doesNotMatch(mainSource, /notifications\.warn\(/);
 });
 
-test('KNN absence is announced once per dataset generation', () => {
+test('KNN absence is announced once per dataset and graph generation', () => {
   // The renderer calls back on every KNN mode entry and every Alt+drag, so the
   // absent-capability announcement must be latched, and the latch must be
-  // keyed to the publication generation so the next dataset arms it again.
+  // keyed to the publication and graph generations, so the next dataset, or a
+  // data mapping that changes the graph, arms it again.
   // Behaviour is covered by tests/browser/knn-missing-connectivity-warning
   // .spec.mjs; this keeps the fast suite from losing the structure silently.
   const guarded = mainSource.match(
@@ -28,8 +29,8 @@ test('KNN absence is announced once per dataset generation', () => {
   const branch = guarded[1];
   assert.match(
     branch,
-    /if \(\s*announcedMissingConnectivityGeneration !==\s*datasetPublicationGeneration\s*\) \{\s*announcedMissingConnectivityGeneration =\s*datasetPublicationGeneration;/,
-    'the absence branch must latch the publication generation before it warns'
+    /const graphGeneration =\s*`\$\{datasetPublicationGeneration\}:\$\{connectivityGraphGeneration\}`;\s*if \(announcedMissingConnectivityGeneration !== graphGeneration\) \{\s*announcedMissingConnectivityGeneration = graphGeneration;/,
+    'the absence branch must latch the publication and graph generation before it warns'
   );
   const latchIndex = branch.indexOf('announcedMissingConnectivityGeneration =');
   const warningIndex = branch.indexOf('notifications.warning(');

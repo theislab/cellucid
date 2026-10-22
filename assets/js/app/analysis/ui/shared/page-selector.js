@@ -38,11 +38,16 @@
  * pageSelector.destroy();
  */
 
-import { formatCount } from '../../shared/formatting.js';
+import { formatCells, formatCompactCount } from '../../../ui/components/display-format.js';
+import { createDomId } from '../../../ui/components/dom-id.js';
+import { createInfoTip } from '../../../ui/components/controls.js';
 import { StyleManager } from '../../../../utils/style-manager.js';
 import { expandPagesWithDerived } from '../../shared/page-derivation-utils.js';
 import { deriveRestOfColor } from '../../shared/color-utils.js';
 import { getPageColor } from '../../core/plugin-contract.js';
+
+/** What the Dynamic chip does: its hover title and part of its accessible name. */
+const DYNAMIC_MODE_DESCRIPTION = 'Follows the active highlight page.';
 
 /**
  * Page selection mode constants
@@ -79,18 +84,15 @@ function requireExactKeys(value, expectedKeys, label) {
 }
 
 /**
- * Make a page chip a real, announced toggle control.
+ * Announce a page chip's toggle state.
  *
- * The chips were plain `<div>`s carrying only a click listener, so choosing
- * which pages an analysis runs over — the first decision every analysis mode
- * asks for — could not be done without a mouse, and nothing announced a chip's
- * role, its selected state, or its cell count. They stay `<div>`s because the
- * chip also hosts the page's colour `<input type="color">`, which cannot live
- * inside a `<button>`; `role="button"` plus a roving-free tab stop matches the
- * pattern the surrounding analysis accordions already use and needs no new
- * styling (the shared `:focus-visible` ring applies to any focusable element).
+ * Each chip is a native `<button>` toggle, so click, Enter, and Space all
+ * reach the same click handler. The page's colour `<input type="color">` is a
+ * sibling of that button inside the chip wrapper, never nested in it: an
+ * interactive control inside a button is unreachable for assistive
+ * technology. The input is laid over the swatch the button draws.
  *
- * @param {HTMLElement} tab
+ * @param {HTMLButtonElement} tab
  * @param {Object} options
  * @param {Array<string|null>} options.label - Accessible name parts; empty
  *   parts are dropped.
@@ -103,22 +105,11 @@ function makeTabOperable(tab, { label, pressed, disabled }) {
   if (name.length === 0) {
     throw new TypeError('A page chip requires a non-empty accessible name');
   }
-  tab.setAttribute('role', 'button');
-  // The chip's own contents include the colour input's value, so the name is
-  // stated explicitly rather than computed from them.
+  tab.type = 'button';
   tab.setAttribute('aria-label', name);
   tab.setAttribute('aria-pressed', pressed ? 'true' : 'false');
   tab.setAttribute('aria-disabled', disabled ? 'true' : 'false');
   tab.tabIndex = disabled ? -1 : 0;
-  if (disabled) return;
-
-  tab.addEventListener('keydown', event => {
-    // The colour input inside the chip owns its own keys.
-    if (event.target !== tab) return;
-    if (event.key !== 'Enter' && event.key !== ' ') return;
-    event.preventDefault();
-    tab.click();
-  });
 }
 
 /**
@@ -137,7 +128,6 @@ export class PageSelectorComponent {
    * @param {boolean} [options.showCellCounts=true] - Whether to show cell counts
    * @param {boolean} [options.showSelectAll=true] - Whether to show select all button
    * @param {boolean} [options.showHeader=true] - Whether to show the header row (label + optional mode indicator)
-   * @param {boolean} [options.showHelpText=true] - Whether to show the help text under the header
    * @param {string[]} [options.initialSelection] - Initial page IDs to select (for manual mode)
    * @param {string} [options.emptyMessage] - Message when no pages available
    * @param {string} [options.label] - Label text for the selector
@@ -148,7 +138,6 @@ export class PageSelectorComponent {
    * @param {boolean} [options.initialDynamicMode=false] - Whether to start in dynamic mode
    * @param {Function} [options.onModeChange] - Callback when mode changes (receives mode: 'dynamic'|'manual', pageIds: string[])
    * @param {string} [options.dynamicLabel='Dynamic'] - Label for the dynamic tab
-   * @param {string} [options.dynamicHelpText] - Help text shown when dynamic mode is enabled
    * @param {boolean} [options.allowMultiSelect=true] - Whether multiple pages can be selected (manual mode only)
    */
   constructor(options) {
@@ -162,9 +151,11 @@ export class PageSelectorComponent {
     this.showCellCounts = options.showCellCounts ?? true;
     this.showSelectAll = options.showSelectAll ?? true;
     this.showHeader = options.showHeader ?? true;
-    this.showHelpText = options.showHelpText ?? true;
     this.emptyMessage = options.emptyMessage || 'Create highlight pages first using the Highlighted Cells section above.';
-    this.label = options.label ?? 'Compare pages:';
+    this.label = options.label ?? 'Compare pages';
+    if (typeof this.label !== 'string' || this.label.length === 0 || this.label.endsWith(':')) {
+      throw new TypeError('Page selector label must be non-empty text without a trailing colon');
+    }
     this.includeDerivedPages = options.includeDerivedPages ?? false;
     this.customColors = options.customColors || new Map();
     this.getCellCountForPageId = options.getCellCountForPageId || null;
@@ -173,7 +164,6 @@ export class PageSelectorComponent {
     this.supportsDynamicMode = options.supportsDynamicMode ?? false;
     this.onModeChange = options.onModeChange || null;
     this.dynamicLabel = options.dynamicLabel ?? 'Dynamic';
-    this.dynamicHelpText = options.dynamicHelpText ?? 'Follows the active highlight page';
     this.allowMultiSelect = options.allowMultiSelect ?? true;
 
     // State
@@ -194,10 +184,15 @@ export class PageSelectorComponent {
 
     // DOM references
     this._tabsContainer = null;
+    this._selectAllButton = null;
+    this._pagesById = null;
+    this._chipsById = null;
     this._labelEl = null;
-    this._helpEl = null;
     this._dynamicTabEl = null;
     this._modeIndicatorEl = null;
+    this._selectAllButton = null;
+    this._pagesById = null;
+    this._chipsById = null;
 
     // Render initial state
     this.render();
@@ -212,16 +207,23 @@ export class PageSelectorComponent {
     this.container.innerHTML = '';
     this.container.className = 'control-block analysis-page-selector';
 
+    // The chips are a group of toggle buttons, so the caption names the group
+    // (`aria-labelledby`); a `<label>` can only name one control.
+    let captionId = null;
     if (this.showHeader) {
-      // Label row with mode indicator
       const labelRow = document.createElement('div');
       labelRow.className = 'analysis-page-selector-header';
 
-      this._labelEl = document.createElement('label');
+      this._labelEl = document.createElement('span');
+      this._labelEl.className = 'field-label';
+      this._labelEl.id = createDomId('page-selector-caption');
       this._labelEl.textContent = this.label;
+      captionId = this._labelEl.id;
       labelRow.appendChild(this._labelEl);
+      // How to pick pages (and recolour them) is told by the (i), not a line.
+      const info = createInfoTip({ tip: 'compare-pages', label: 'About choosing pages' });
+      labelRow.appendChild(info.button);
 
-      // Mode indicator (only for dynamic mode support)
       if (this.supportsDynamicMode) {
         this._modeIndicatorEl = document.createElement('span');
         this._modeIndicatorEl.className = 'analysis-page-mode-indicator';
@@ -230,12 +232,12 @@ export class PageSelectorComponent {
       }
 
       this.container.appendChild(labelRow);
+      this.container.appendChild(info.popover);
     } else {
       this._labelEl = null;
       this._modeIndicatorEl = null;
     }
 
-    // Get pages from data layer
     const pages = this._getPages();
 
     if (pages.length === 0 && !this.supportsDynamicMode) {
@@ -243,32 +245,20 @@ export class PageSelectorComponent {
       return;
     }
 
-    // Help text
-    this._helpEl = null;
-    if (this.showHelpText) {
-      if (this.showColorPicker && !this.supportsDynamicMode) {
-        this._helpEl = document.createElement('div');
-        this._helpEl.className = 'legend-help';
-        this._helpEl.textContent = 'Click pages to select. Click color to customize.';
-        this.container.appendChild(this._helpEl);
-      } else if (this.supportsDynamicMode) {
-        this._helpEl = document.createElement('div');
-        this._helpEl.className = 'legend-help';
-        this._helpEl.textContent = this._isDynamicMode
-          ? this.dynamicHelpText
-          : (this.showColorPicker
-            ? 'Click pages to select. Click color to customize.'
-            : 'Click pages to select.');
-        this.container.appendChild(this._helpEl);
-      }
-    }
-
-    // Tabs container
     this._tabsContainer = document.createElement('div');
     this._tabsContainer.className = 'analysis-page-tabs';
+    this._tabsContainer.setAttribute('role', 'group');
+    if (captionId !== null) {
+      this._tabsContainer.setAttribute('aria-labelledby', captionId);
+    } else {
+      this._tabsContainer.setAttribute('aria-label', this.label);
+    }
+    // One listener per event type serves every chip: the chips are updated in
+    // place on a toggle, so nothing is re-bound per click.
+    this._tabsContainer.addEventListener('click', (event) => this._handleTabsClick(event));
+    this._tabsContainer.addEventListener('input', (event) => this._handleColorInput(event));
     this.container.appendChild(this._tabsContainer);
 
-    // Render page tabs (including Dynamic tab if supported)
     this._renderTabs(pages);
   }
 
@@ -276,20 +266,17 @@ export class PageSelectorComponent {
    * Render empty state when no pages available
    */
   _renderEmpty() {
-    const empty = document.createElement('div');
-    empty.className = 'legend-help';
+    const empty = document.createElement('p');
+    empty.className = 'empty-state';
     empty.textContent = this.emptyMessage;
     this.container.appendChild(empty);
   }
 
   /**
-   * Render page tabs
+   * Build every chip for `pages`. Called when the page set itself changes;
+   * a selection change only updates the existing chips (`_syncTabs`).
    */
   _renderTabs(pages) {
-    // Toggling a chip rebuilds every chip, which destroys the element the
-    // keyboard user is standing on. Remember where focus was and put it back on
-    // the equivalent chip, or on the Select All button, once the rebuild is
-    // done.
     const focused = this._tabsContainer.contains(document.activeElement)
       ? document.activeElement
       : null;
@@ -298,35 +285,68 @@ export class PageSelectorComponent {
       && focusedPageId === null
       && focused.closest('.analysis-page-actions') !== null;
 
-    this._tabsContainer.innerHTML = '';
+    // `render()` hands this a fresh, empty container, so the chips are only
+    // ever appended; a chip index replaces every later query for them.
+    this._pagesById = new Map(pages.map(page => [page.id, page]));
+    this._chipsById = new Map();
 
-    // Render Dynamic tab first if supported
     if (this.supportsDynamicMode) {
       const dynamicTab = this._createDynamicTab();
+      this._chipsById.set(PAGE_MODE.DYNAMIC, dynamicTab);
       this._tabsContainer.appendChild(dynamicTab);
     }
-
-    // Render regular page tabs
     pages.forEach((page, index) => {
-      const tab = this._createPageTab(page, index);
-      this._tabsContainer.appendChild(tab);
+      const { wrapper, tab } = this._createPageTab(page, index);
+      this._chipsById.set(page.id, tab);
+      this._tabsContainer.appendChild(wrapper);
     });
 
-    // Select All / Deselect All button (only for manual mode with multi-select)
-    if (this.showSelectAll && pages.length > 1 && this.allowMultiSelect && !this._isDynamicMode) {
+    this._selectAllButton = null;
+    if (this.showSelectAll && pages.length > 1 && this.allowMultiSelect) {
       this._renderSelectAllButton(pages);
     }
+    this._syncTabs(pages);
 
     if (focused === null) return;
     const replacement = focusedPageId !== null
-      ? [...this._tabsContainer.children].find(
-        child => child.dataset?.pageId === focusedPageId
-      ) ?? null
-      : (focusWasSelectAll
-        ? this._tabsContainer.querySelector('.analysis-page-actions button')
-        : null);
-    if (replacement !== null && replacement.tabIndex >= 0) {
+      ? this._findChip(focusedPageId)
+      : (focusWasSelectAll ? this._selectAllButton : null);
+    if (replacement !== null && !replacement.hidden && replacement.tabIndex >= 0) {
       replacement.focus({ preventScroll: true });
+    }
+  }
+
+  /**
+   * The chip button for one page id, or null.
+   * @param {string} pageId
+   * @returns {HTMLButtonElement|null}
+   */
+  _findChip(pageId) {
+    return this._chipsById?.get(pageId) ?? null;
+  }
+
+  /**
+   * Bring every chip's pressed state, the dynamic chip's label and the
+   * select-all button in line with the current selection, in place.
+   * @param {Array<Object>} pages
+   */
+  _syncTabs(pages) {
+    for (const [pageId, chip] of this._chipsById) {
+      if (pageId === PAGE_MODE.DYNAMIC) {
+        this._syncDynamicTab(chip);
+        continue;
+      }
+      const selectable = chip.dataset.selectable === 'true';
+      const pressed = selectable && !this._isDynamicMode && this._selectedPages.has(pageId);
+      chip.setAttribute('aria-pressed', pressed ? 'true' : 'false');
+    }
+    if (this._selectAllButton !== null) {
+      const candidates = this._getSelectionCandidates(pages);
+      const allSelected = candidates.length > 0
+        && candidates.every(id => this._selectedPages.has(id));
+      this._selectAllButton.hidden = this._isDynamicMode || candidates.length === 0;
+      this._selectAllButton.dataset.allSelected = allSelected ? 'true' : 'false';
+      this._selectAllButton.textContent = allSelected ? 'Deselect all' : 'Select all';
     }
   }
 
@@ -335,173 +355,189 @@ export class PageSelectorComponent {
    * @returns {HTMLElement}
    */
   _createDynamicTab() {
-    const tab = document.createElement('div');
-    tab.className = 'analysis-page-tab insights-dynamic-tab' +
-      (this._isDynamicMode ? ' selected' : '');
+    const tab = document.createElement('button');
+    tab.type = 'button';
+    tab.className = 'chip insights-dynamic-tab';
     tab.dataset.pageId = PAGE_MODE.DYNAMIC;
 
-    // Dynamic icon
     const icon = document.createElement('span');
     icon.className = 'insights-dynamic-icon';
-    icon.textContent = '⟳'; // Unicode refresh/sync symbol
+    icon.textContent = '⟳';
     icon.setAttribute('aria-hidden', 'true');
     tab.appendChild(icon);
 
-    // Dynamic label with active page name
     const nameSpan = document.createElement('span');
-    nameSpan.className = 'analysis-page-name';
-    if (this._isDynamicMode) {
-      const activePageName = this._getActivePageName();
-      nameSpan.textContent = activePageName ? `${this.dynamicLabel}: ${activePageName}` : this.dynamicLabel;
-    } else {
-      nameSpan.textContent = this.dynamicLabel;
-    }
-    nameSpan.title = this.dynamicHelpText;
+    nameSpan.className = 'chip-name';
+    nameSpan.title = DYNAMIC_MODE_DESCRIPTION;
     tab.appendChild(nameSpan);
 
-    // Cell count for active page in dynamic mode
-    let dynamicCellCount = null;
-    if (this.showCellCounts && this._isDynamicMode) {
-      const activePageId = this._getActivePageId();
-      if (activePageId) {
-        dynamicCellCount = this._getCellCount(activePageId);
-        const countSpan = document.createElement('span');
-        countSpan.className = 'analysis-page-count';
-        countSpan.textContent = dynamicCellCount > 0
-          ? formatCount(dynamicCellCount)
-          : '(0)';
-        tab.appendChild(countSpan);
-      }
+    if (this.showCellCounts) {
+      const countSpan = document.createElement('span');
+      countSpan.className = 'chip-count';
+      tab.appendChild(countSpan);
     }
-
-    makeTabOperable(tab, {
-      label: [
-        nameSpan.textContent,
-        dynamicCellCount === null
-          ? null
-          : `${dynamicCellCount.toLocaleString()} cells`,
-        this.dynamicHelpText
-      ],
-      pressed: this._isDynamicMode,
-      disabled: false
-    });
-
-    // Click to activate dynamic mode
-    tab.addEventListener('click', () => {
-      this._setDynamicModeInternal(true);
-    });
 
     this._dynamicTabEl = tab;
     return tab;
   }
 
   /**
-   * Create a single page tab element
+   * Update the dynamic chip's name, count and announced state.
+   * @param {HTMLButtonElement} tab
    */
-  _createPageTab(page, index) {
-    const cellCount = this._getCellCount(page.id);
-    const isSelectable = cellCount > 0;
-    const isSelected = isSelectable &&
-      !this._isDynamicMode &&
-      this._selectedPages.has(page.id);
+  _syncDynamicTab(tab) {
+    const nameSpan = tab.querySelector('.chip-name');
+    const activePageName = this._isDynamicMode ? this._getActivePageName() : '';
+    nameSpan.textContent = activePageName
+      ? `${this.dynamicLabel}: ${activePageName}`
+      : this.dynamicLabel;
+
+    let dynamicCellCount = null;
+    const countSpan = tab.querySelector('.chip-count');
+    if (countSpan !== null) {
+      const activePageId = this._isDynamicMode ? this._getActivePageId() : null;
+      dynamicCellCount = activePageId ? this._getCellCount(activePageId) : null;
+      countSpan.hidden = dynamicCellCount === null;
+      countSpan.textContent = dynamicCellCount === null
+        ? ''
+        : formatCompactCount(dynamicCellCount);
+    }
+
+    makeTabOperable(tab, {
+      label: [
+        nameSpan.textContent,
+        dynamicCellCount === null ? null : formatCells(dynamicCellCount),
+        DYNAMIC_MODE_DESCRIPTION
+      ],
+      pressed: this._isDynamicMode,
+      disabled: false
+    });
+  }
+
+  /**
+   * Resolve the colour a page is drawn in.
+   * @param {Object} page
+   * @param {number} index
+   * @returns {string}
+   */
+  _resolvePageColor(page, index) {
     const derived = page?._derived || null;
     const baseId = derived?.baseId || page.id;
-
-    // Find base page index for default color
     const baseIndex = this._basePages.findIndex(p => p.id === baseId);
     const effectiveIndex = baseIndex >= 0 ? baseIndex : index;
-
-    // Determine color: custom > dataLayer > page.color > default palette
     const basePage = this._basePages.find(p => p.id === baseId) || null;
     const baseColor = this.customColors.get(baseId)
       || (typeof this.dataLayer?.getPageColor === 'function' ? this.dataLayer.getPageColor(baseId) : null)
       || basePage?.color
       || getPageColor(effectiveIndex);
-
-    // For derived "rest of" pages, derive a lighter color
-    const currentColor = derived?.kind === 'rest_of'
+    return derived?.kind === 'rest_of'
       ? (this.customColors.get(page.id) || deriveRestOfColor(baseColor))
       : (this.customColors.get(page.id) || baseColor);
+  }
 
-    const tab = document.createElement('div');
-    tab.className = 'analysis-page-tab' +
-      (derived ? ' derived' : '') +
-      (!isSelectable ? ' disabled' : '') +
-      (isSelected ? ' selected' : '');
+  /**
+   * Create a single page chip: its toggle button plus, when colours are
+   * editable, the colour input laid over the swatch beside it.
+   * @returns {{ wrapper: HTMLDivElement, tab: HTMLButtonElement }}
+   */
+  _createPageTab(page, index) {
+    const cellCount = this._getCellCount(page.id);
+    const isSelectable = cellCount > 0;
+    const derived = page?._derived || null;
+    const currentColor = this._resolvePageColor(page, index);
+
+    const chip = document.createElement('div');
+    chip.className = 'analysis-page-chip';
+    const tab = document.createElement('button');
+    chip.appendChild(tab);
+    tab.className = derived ? 'chip chip-derived' : 'chip';
     tab.dataset.pageId = page.id;
+    tab.dataset.selectable = isSelectable ? 'true' : 'false';
     makeTabOperable(tab, {
       label: [
         page.name,
         derived ? 'derived page' : null,
-        isSelectable
-          ? `${cellCount.toLocaleString()} cells`
-          : 'no cells, cannot be selected'
+        isSelectable ? formatCells(cellCount) : 'no cells, cannot be selected'
       ],
-      pressed: isSelected,
+      pressed: false,
       disabled: !isSelectable
     });
     if (!isSelectable) {
       tab.title = `${page.name} has zero cells and cannot be selected`;
     }
 
-    // Color swatch
-    const colorIndicator = document.createElement('span');
-    colorIndicator.className = 'analysis-page-color';
-    StyleManager.setVariable(colorIndicator, '--analysis-page-color', currentColor);
+    const swatch = document.createElement('span');
+    swatch.className = 'color-swatch';
+    swatch.setAttribute('aria-hidden', 'true');
+    StyleManager.setVariable(swatch, '--swatch-color', currentColor);
+    tab.appendChild(swatch);
 
     if (this.showColorPicker && isSelectable) {
-      colorIndicator.title = `Colour for ${page.name}`;
-
-      // Color picker input
       const colorInput = document.createElement('input');
       colorInput.type = 'color';
-      colorInput.className = 'analysis-page-color-input';
+      colorInput.className = 'color-swatch-input';
+      colorInput.dataset.pageId = page.id;
       colorInput.value = currentColor;
-      // A shared "Click to change color" title told a screen-reader user which
-      // gesture to use but never which page they were about to recolour.
       colorInput.setAttribute('aria-label', `Colour for ${page.name}`);
       colorInput.title = `Colour for ${page.name}`;
-
-      colorInput.addEventListener('input', (e) => {
-        const newColor = e.target.value;
-        this.customColors.set(page.id, newColor);
-        StyleManager.setVariable(colorIndicator, '--analysis-page-color', newColor);
-        if (this.onColorChange) this.onColorChange(page.id, newColor);
-        else this.dataLayer?.setPageColor?.(page.id, newColor);
-      });
-
-      colorInput.addEventListener('click', (e) => {
-        e.stopPropagation();
-      });
-
-      colorIndicator.appendChild(colorInput);
+      chip.appendChild(colorInput);
     }
 
-    tab.appendChild(colorIndicator);
-
-    // Page name
     const nameSpan = document.createElement('span');
-    nameSpan.className = 'analysis-page-name';
+    nameSpan.className = 'chip-name';
     nameSpan.textContent = page.name;
     nameSpan.title = page.name;
     tab.appendChild(nameSpan);
 
-    // Cell count
     if (this.showCellCounts) {
       const countSpan = document.createElement('span');
-      countSpan.className = 'analysis-page-count';
-      countSpan.textContent = cellCount > 0 ? formatCount(cellCount) : '(0)';
+      countSpan.className = 'chip-count';
+      countSpan.textContent = formatCompactCount(cellCount);
       tab.appendChild(countSpan);
     }
 
-    if (isSelectable) {
-      // Click to toggle selection
-      tab.addEventListener('click', () => {
-        this._handlePageClick(page.id, page);
-      });
-    }
+    return { wrapper: chip, tab };
+  }
 
-    return tab;
+  /**
+   * Delegated click handler for the chips and the select-all button.
+   * @param {MouseEvent} event
+   */
+  _handleTabsClick(event) {
+    const target = event.target instanceof Element ? event.target : null;
+    if (target === null) return;
+    if (this._selectAllButton !== null && this._selectAllButton.contains(target)) {
+      event.stopPropagation();
+      this._handleSelectAll();
+      return;
+    }
+    const chip = target.closest('.chip[data-page-id]');
+    if (chip === null || this._findChip(chip.dataset.pageId) !== chip) return;
+    const pageId = chip.dataset.pageId;
+    if (pageId !== PAGE_MODE.DYNAMIC && chip.dataset.selectable !== 'true') return;
+    if (pageId === PAGE_MODE.DYNAMIC) {
+      this._setDynamicModeInternal(true);
+      return;
+    }
+    this._handlePageClick(pageId, this._pagesById.get(pageId));
+  }
+
+  /**
+   * Delegated colour-input handler: recolour the page's swatch and publish.
+   * @param {Event} event
+   */
+  _handleColorInput(event) {
+    const input = event.target;
+    if (!(input instanceof HTMLInputElement) || !input.classList.contains('color-swatch-input')) {
+      return;
+    }
+    const pageId = input.dataset.pageId;
+    const newColor = input.value;
+    this.customColors.set(pageId, newColor);
+    const swatch = this._findChip(pageId)?.querySelector('.color-swatch');
+    if (swatch) StyleManager.setVariable(swatch, '--swatch-color', newColor);
+    if (this.onColorChange) this.onColorChange(pageId, newColor);
+    else this.dataLayer?.setPageColor?.(pageId, newColor);
   }
 
   /**
@@ -535,10 +571,8 @@ export class PageSelectorComponent {
         return;
       }
 
-      // Re-render and notify
-      this._renderTabs(pages);
+      this._syncTabs(pages);
       this._updateModeIndicator();
-      this._updateHelpText();
       this._notifyModeChange();
       this._notifySelectionChange();
     } else {
@@ -589,11 +623,9 @@ export class PageSelectorComponent {
       this._selectedPages.clear();
     }
 
-    // Re-render and notify
     const pages = this._getPages();
-    this._renderTabs(pages);
+    this._syncTabs(pages);
     this._updateModeIndicator();
-    this._updateHelpText();
     this._notifyModeChange();
     this._notifySelectionChange();
   }
@@ -622,62 +654,37 @@ export class PageSelectorComponent {
   }
 
   /**
-   * Update help text based on current mode
+   * Render the select all / deselect all button. Only base pages (not
+   * derived) are toggled, to match expected behavior.
    */
-  _updateHelpText() {
-    if (!this._helpEl) return;
-
-    if (this._isDynamicMode) {
-      this._helpEl.textContent = this.dynamicHelpText;
-    } else {
-      this._helpEl.textContent = this.showColorPicker
-        ? 'Click pages to select. Click color to customize.'
-        : 'Click pages to select.';
-    }
+  _renderSelectAllButton(pages) {
+    if (this._getSelectionCandidates(pages).length === 0) return;
+    const actionsRow = document.createElement('div');
+    actionsRow.className = 'analysis-page-actions';
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'btn btn-compact';
+    actionsRow.appendChild(btn);
+    this._tabsContainer.appendChild(actionsRow);
+    this._selectAllButton = btn;
   }
 
   /**
-   * Render select all/deselect all button
-   * Only toggles base pages (not derived) to match expected behavior
+   * Select every base page, or clear the selection when all are selected.
    */
-  _renderSelectAllButton(pages) {
-    const actionsRow = document.createElement('div');
-    actionsRow.className = 'analysis-page-actions';
-
-    const selectionCandidates = this._getSelectionCandidates(pages);
-    if (selectionCandidates.length === 0) {
-      return;
-    }
-    const allCandidatesSelected = selectionCandidates.every(
-      id => this._selectedPages.has(id)
-    );
-
-    const btn = document.createElement('button');
-    btn.type = 'button';
-    btn.className = 'btn-small';
-    btn.textContent = allCandidatesSelected ? 'Deselect All' : 'Select All';
-
-    btn.addEventListener('click', (e) => {
-      e.stopPropagation();
-
-      if (allCandidatesSelected) {
-        // Deselect all (including any derived)
-        this._selectedPages.clear();
-        // If dynamic mode is supported and nothing selected, revert to dynamic
-        if (this.supportsDynamicMode) {
-          this._setDynamicModeInternal(true);
-          return;
-        }
-      } else {
-        selectionCandidates.forEach(id => this._selectedPages.add(id));
+  _handleSelectAll() {
+    const pages = this._getPages();
+    if (this._selectAllButton.dataset.allSelected === 'true') {
+      this._selectedPages.clear();
+      if (this.supportsDynamicMode) {
+        this._setDynamicModeInternal(true);
+        return;
       }
-
-      this._renderTabs(pages);
-      this._notifySelectionChange();
-    });
-
-    actionsRow.appendChild(btn);
-    this._tabsContainer.appendChild(actionsRow);
+    } else {
+      this._getSelectionCandidates(pages).forEach(id => this._selectedPages.add(id));
+    }
+    this._syncTabs(pages);
+    this._notifySelectionChange();
   }
 
   /**
@@ -705,9 +712,7 @@ export class PageSelectorComponent {
       this._selectedPages.add(pageId);
     }
 
-    // Re-render and notify
-    const pages = this._getPages();
-    this._renderTabs(pages);
+    this._syncTabs(this._getPages());
     this._notifySelectionChange();
   }
 
@@ -1030,7 +1035,49 @@ export class PageSelectorComponent {
    * Update cell counts display (call after highlights change)
    */
   updateCounts() {
-    this.refresh();
+    if (!this.container) return;
+    const pages = this._getPages();
+    const rendered = this._pagesById instanceof Map
+      && this._tabsContainer?.isConnected === true
+      && this._pagesById.size === pages.length
+      && pages.every(page => this._pagesById.get(page.id) !== undefined);
+    // A changed page set (or a selection the new counts invalidate) needs the
+    // full rebuild; otherwise only the counts and availability change, which
+    // are written into the existing chips.
+    const selectionStillValid = [...this._selectedPages].every(
+      pageId => this._getCellCount(pageId) > 0
+    );
+    if (!rendered || !selectionStillValid
+      || (this.supportsDynamicMode && !this._isDynamicMode && this._selectedPages.size === 0)) {
+      this.refresh();
+      return;
+    }
+    let availabilityChanged = false;
+    for (const page of pages) {
+      const chip = this._findChip(page.id);
+      if (chip === null) continue;
+      const cellCount = this._getCellCount(page.id);
+      const selectable = cellCount > 0;
+      if ((chip.dataset.selectable === 'true') !== selectable) {
+        availabilityChanged = true;
+        break;
+      }
+      const countSpan = chip.querySelector('.chip-count');
+      const text = formatCompactCount(cellCount);
+      if (countSpan !== null && countSpan.textContent !== text) countSpan.textContent = text;
+      const label = [
+        page.name,
+        page._derived ? 'derived page' : null,
+        selectable ? formatCells(cellCount) : 'no cells, cannot be selected'
+      ].filter(Boolean).join(', ');
+      chip.setAttribute('aria-label', label);
+    }
+    if (availabilityChanged) {
+      this.refresh();
+      return;
+    }
+    this._syncTabs(pages);
+    this._updateModeIndicator();
   }
 
   /**
@@ -1072,6 +1119,9 @@ export class PageSelectorComponent {
    * @param {string} label
    */
   setLabel(label) {
+    if (typeof label !== 'string' || label.length === 0 || label.endsWith(':')) {
+      throw new TypeError('Page selector label must be non-empty text without a trailing colon');
+    }
     this.label = label;
     if (this._labelEl) {
       this._labelEl.textContent = label;
@@ -1180,10 +1230,11 @@ export class PageSelectorComponent {
     this._selectedPages.clear();
     this._dynamicTabEl = null;
     this._modeIndicatorEl = null;
+    this._selectAllButton = null;
+    this._pagesById = null;
+    this._chipsById = null;
     if (this.container) {
       this.container.innerHTML = '';
     }
   }
 }
-
-export default PageSelectorComponent;

@@ -15,7 +15,7 @@
 export const app = "https://www.cellucid.com";
 
 /** Full documentation: installation, data preparation, UI reference. */
-export const docs = "https://cellucid.readthedocs.io/en/latest/";
+export const docs = "https://docs.cellucid.com/en/latest/";
 
 /** Source repository for the web application. */
 export const repository = "https://github.com/theislab/cellucid";

@@ -788,7 +788,7 @@ function buildVolcanoFigure(deResults, options, viewport) {
   layout.xaxis = {
     title: {
       text: 'log₂ Fold Change',
-      font: { family: 'Oswald, system-ui, sans-serif', size: 12, color: theme.text },
+      font: { family: theme.fontFamily, size: 12, color: theme.text },
       // Pinned so the title sits a known distance under the tick labels rather
       // than wherever the bottom margin leaves it. `resolveVolcanoAxisBand`
       // budgets the band from this same number, and the legend is placed below
@@ -808,7 +808,7 @@ function buildVolcanoFigure(deResults, options, viewport) {
   layout.yaxis = {
     title: {
       text: useAdjustedPValue ? '-log₁₀ (adjusted p-value)' : '-log₁₀ (p-value)',
-      font: { family: 'Oswald, system-ui, sans-serif', size: 12, color: theme.text }
+      font: { family: theme.fontFamily, size: 12, color: theme.text }
     },
     zeroline: false,
     range: yRange,

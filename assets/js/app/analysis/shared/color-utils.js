@@ -12,7 +12,7 @@
  * @param {string} hex
  * @returns {{r: number, g: number, b: number} | null}
  */
-export function parseHexColor(hex) {
+function parseHexColor(hex) {
   if (typeof hex !== 'string') return null;
   const match = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex.trim());
   if (!match) return null;
@@ -30,7 +30,7 @@ export function parseHexColor(hex) {
  * @param {number} b
  * @returns {string}
  */
-export function rgbToHex(r, g, b) {
+function rgbToHex(r, g, b) {
   const clamp = (v) => Math.max(0, Math.min(255, Math.round(v)));
   const toHex = (v) => clamp(v).toString(16).padStart(2, '0');
   return `#${toHex(r)}${toHex(g)}${toHex(b)}`;
@@ -43,7 +43,7 @@ export function rgbToHex(r, g, b) {
  * @param {number} t - 0..1, where 0 => A, 1 => B
  * @returns {string}
  */
-export function mixHex(hexA, hexB, t) {
+function mixHex(hexA, hexB, t) {
   const a = parseHexColor(hexA);
   const b = parseHexColor(hexB);
   if (!a || !b) return typeof hexA === 'string' ? hexA : '#888888';
@@ -72,7 +72,7 @@ export function deriveRestOfColor(baseHex, options = {}) {
  * Default qualitative color palette for categorical data.
  * Based on D3's category10/category20 for good visual distinction.
  */
-export const CATEGORY_PALETTE = [
+const CATEGORY_PALETTE = [
   '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
   '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf',
   '#aec7e8', '#ffbb78', '#98df8a', '#ff9896', '#c5b0d5'
@@ -97,13 +97,3 @@ export function generateCategoryColors(categories, options = {}) {
 
   return colorMap;
 }
-
-export default {
-  parseHexColor,
-  rgbToHex,
-  mixHex,
-  deriveRestOfColor,
-  CATEGORY_PALETTE,
-  generateCategoryColors
-};
-

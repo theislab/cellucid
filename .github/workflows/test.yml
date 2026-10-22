@@ -4,6 +4,9 @@ on:
   push:
     branches: ["main", "master"]
   pull_request:
+  # Every engine on every operating system, once a day and on demand.
+  schedule:
+    - cron: "17 3 * * *"
   workflow_dispatch:
 
 permissions:
@@ -19,10 +22,34 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
         node: ["20", "22", "24", "26"]
+    # The repository is checked out beside the two sibling repositories its
+    # cross-repository contracts read (`../cellucid-demo-custom-datasets`,
+    # `../cellucid-datasets`), so those contracts run here instead of skipping.
+    defaults:
+      run:
+        working-directory: cellucid
 
     steps:
       - name: Check out the exact source
         uses: actions/checkout@v7
+        with:
+          path: cellucid
+
+      - name: Check out the demo exports the browser fixture mirrors
+        uses: actions/checkout@v7
+        with:
+          repository: theislab/cellucid-demo-custom-datasets
+          path: cellucid-demo-custom-datasets
+
+      - name: Check out the published dataset session presets
+        uses: actions/checkout@v7
+        with:
+          repository: theislab/cellucid-datasets
+          path: cellucid-datasets
+          filter: blob:none
+          sparse-checkout: |
+            exports-v3/*/default.cellucid-session
+          sparse-checkout-cone-mode: false
 
       - name: Install Node.js
         uses: actions/setup-node@v7
@@ -49,10 +76,36 @@ jobs:
     timeout-minutes: 75
     strategy:
       fail-fast: false
+      # Pushes and pull requests run every engine on Linux plus WebKit on
+      # macOS; the nightly schedule and manual dispatch run every engine on
+      # every operating system. An `include` row that matches an existing
+      # combination adds nothing, so the full matrix holds no duplicates.
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["ubuntu-latest", "macos-latest", "windows-latest"]' || '["ubuntu-latest"]') }}
         browser: [chromium, firefox, webkit]
-        shard: ["1/3", "2/3", "3/3"]
+        shard: ["1/7", "2/7", "3/7", "4/7", "5/7", "6/7", "7/7"]
+        include:
+          - os: macos-latest
+            browser: webkit
+            shard: "1/7"
+          - os: macos-latest
+            browser: webkit
+            shard: "2/7"
+          - os: macos-latest
+            browser: webkit
+            shard: "3/7"
+          - os: macos-latest
+            browser: webkit
+            shard: "4/7"
+          - os: macos-latest
+            browser: webkit
+            shard: "5/7"
+          - os: macos-latest
+            browser: webkit
+            shard: "6/7"
+          - os: macos-latest
+            browser: webkit
+            shard: "7/7"
 
     steps:
       - name: Check out the exact source
@@ -67,6 +120,21 @@ jobs:
       - name: Install exact dependencies
         run: npm ci
 
+      # Windows: a browser context per test and hundreds of module requests
+      # per page load park closed loopback sockets in TIME_WAIT for minutes
+      # (the job-end evidence step counted 850 of them long after the batch),
+      # and the default 16,384 ephemeral ports run out: the next connection
+      # fails as `ERR_NO_BUFFER_SPACE` (Chromium) or "Could not connect to
+      # server" (WebKit) in a spec that has nothing to do with the cause. Give
+      # the host the whole unprivileged range.
+      - name: Widen the Windows ephemeral port range
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          netsh int ipv4 set dynamicport tcp start=1025 num=64510
+          netsh int ipv6 set dynamicport tcp start=1025 num=64510
+          netsh int ipv4 show dynamicport tcp
+
       - name: Install the selected browser engine and Linux libraries
         if: runner.os == 'Linux'
         run: npx playwright install --with-deps ${{ matrix.browser }}
@@ -75,8 +143,13 @@ jobs:
         if: runner.os != 'Linux'
         run: npx playwright install ${{ matrix.browser }}
 
-      - name: Verify Firefox WebGL2 through the Linux display server
-        if: matrix.browser == 'firefox' && runner.os == 'Linux' && matrix.shard == '1/3'
+      # Once per engine and operating system: the WebGL2 contract, and the
+      # log line naming the GL implementation the cell ran on (a hosted
+      # runner's software rasterizer explains a timing failure that no spec
+      # change would). Linux Firefox is verified through the display server
+      # the shard below runs under.
+      - name: Record the WebGL2 runtime through the Linux display server
+        if: matrix.browser == 'firefox' && runner.os == 'Linux' && matrix.shard == '1/7'
         run: >-
           xvfb-run --auto-servernum --
           npm run test:browser --
@@ -84,11 +157,11 @@ jobs:
           --headed
           tests/browser/webgl2-runtime.spec.mjs
 
-      - name: Verify Firefox WebGL2 on macOS and Windows
-        if: matrix.browser == 'firefox' && runner.os != 'Linux' && matrix.shard == '1/3'
+      - name: Record the WebGL2 runtime
+        if: (matrix.browser != 'firefox' || runner.os != 'Linux') && matrix.shard == '1/7'
         run: >-
           npm run test:browser --
-          --project=firefox
+          --project=${{ matrix.browser }}
           tests/browser/webgl2-runtime.spec.mjs
 
       # A process per whole shard retained native GPU state long enough to
@@ -103,7 +176,9 @@ jobs:
       # one workload proven to degrade the shared host GPU service in an
       # absolute-final singleton. Multiple host-terminal files are rejected so
       # future stress growth must use separate CI shards. Even those largest
-      # shards are capped at nine real browsers. Tests are neither retried nor
+      # shards are capped at nine real browsers. Seven shards keep every engine
+      # on every runner at eight or fewer: Playwright splits by test order, and
+      # the process-intensive files all fall into the first shard. Tests are neither retried nor
       # skipped, mocked, or given more time.
       - name: Run the selected headed Firefox shard in bounded processes
         if: matrix.browser == 'firefox' && runner.os == 'Linux'
@@ -120,3 +195,51 @@ jobs:
           npm run test:browser:bounded --
           --project=${{ matrix.browser }}
           --shard=${{ matrix.shard }}
+
+      # A browser process that crashes ("Page crashed", "Target crashed")
+      # leaves no trace in Playwright's report. When the kernel killed it for
+      # memory or a graphics driver faulted, the host's kernel log says so: a
+      # red Linux job keeps the tail of it, with the memory picture, beside the
+      # Playwright evidence.
+      - name: Record the host kernel log and memory
+        if: failure() && runner.os == 'Linux'
+        run: |
+          mkdir -p test-results
+          { free -m; echo; sudo dmesg --ctime | tail -n 400; echo; coredumpctl list 2>&1 | tail -n 20; } > test-results/host-kernel.log 2>&1
+
+      # A Windows job that fails on a network error (`ERR_NO_BUFFER_SPACE`
+      # loading a module from the loopback server) has run out of a host
+      # resource, not of the server: keep the dynamic port range, the number
+      # of sockets in each TCP state, and what holds the memory and handles.
+      - name: Record the host memory and sockets
+        if: failure() && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path test-results | Out-Null
+          & {
+            Get-CimInstance Win32_OperatingSystem | Format-List FreePhysicalMemory, TotalVisibleMemorySize, FreeVirtualMemory, TotalVirtualMemorySize
+            Get-CimInstance Win32_VideoController | Format-List Name, DriverVersion
+            netsh int ipv4 show dynamicport tcp
+            netstat -ano -p tcp | Select-Object -Skip 4 | ForEach-Object { ($_ -split '\s+')[4] } | Group-Object | Sort-Object Count -Descending | Format-Table Name, Count
+            Get-Process | Sort-Object WorkingSet64 -Descending | Select-Object -First 20 Name, Id, Handles, @{ Name = 'WorkingSetMB'; Expression = { [int]($_.WorkingSet64 / 1MB) } } | Format-Table
+          } *> test-results/host-windows.log
+
+      # A macOS job that fails on a timing contract keeps its memory, swap
+      # and graphics device beside the Playwright evidence.
+      - name: Record the host memory and graphics
+        if: failure() && runner.os == 'macOS'
+        run: |
+          mkdir -p test-results
+          { vm_stat; echo; sysctl vm.swapusage; echo; system_profiler SPDisplaysDataType; echo; top -l 1 -o mem -n 15 | tail -n 22; } > test-results/host-macos.log 2>&1
+
+      # Playwright writes a screenshot and an error-context page snapshot for
+      # every failed test under `test-results/<port>/`; a red job publishes
+      # them so the failure can be read without re-running it.
+      - name: Upload the failure evidence
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: playwright-failure-${{ strategy.job-index }}-${{ matrix.os }}-${{ matrix.browser }}
+          path: test-results/
+          if-no-files-found: ignore
+          retention-days: 14

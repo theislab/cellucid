@@ -14,6 +14,8 @@
  * SHADER QUALITY MATCHING:
  * The rasterizer respects the viewer's current shaderQuality setting:
  * - 'full': 3D sphere lighting, specular highlights, Beer-Lambert fog
+ * - 'sculpted': soft studio-lit spheres with fog, opaque, edges antialiased
+ *   as a multisample coverage mask when the export context multisamples
  * - 'light': Simplified lighting, circular point sprites
  * - 'ultralight': Flat shading, square points (fastest)
  *
@@ -43,29 +45,42 @@
 import {
   configureStraightAlphaBlending,
   createProgram,
+  drawPointsInSegments,
 } from '../../../../../rendering/gl-utils.js';
 import {
   HP_VS_FULL,
   HP_FS_FULL,
+  HP_FS_FULL_NO_DEPTH,
   HP_VS_LIGHT,
   HP_FS_LIGHT,
+  HP_FS_LIGHT_NO_DEPTH,
   HP_FS_ULTRALIGHT,
+  NO_DEPTH_MAX_DIMENSION,
+  HIGHLIGHT_STYLES_BY_QUALITY,
   HP_VS_HIGHLIGHT,
   HP_FS_HIGHLIGHT,
+  HP_FS_SCULPTED,
+  HP_FS_SCULPTED_NO_DEPTH,
+  highlightGlowAt,
+  writePointShaderFrame,
 } from '../../../../../rendering/shaders/high-perf-shaders.js';
+import { writeFogUniforms } from '../../../../../rendering/shaders/fog-shaders.js';
+import { enterOpaquePointBlending } from '../../../../../rendering/high-perf/gl-point-draw-state.js';
+import { assertCropRect01 } from './crop.js';
 import {
+  describeShaderQualities,
+  SHADER_QUALITY_TRAITS,
+} from '../../../../../rendering/shader-quality.js';
+import {
+  assertDrawOrder,
   assertLodMembership,
+  drawnSequence,
   MIN_VISIBLE_ALPHA_BYTE,
   POINT_VISIBILITY_THRESHOLD,
 } from './lod-membership.js';
 const DEFAULT_ALPHA_THRESHOLD = POINT_VISIBILITY_THRESHOLD;
 const DEFAULT_HIGHLIGHT_COLOR = [0.4, 0.85, 1.0];
 
-const HIGHLIGHT_STYLE_BY_QUALITY = {
-  full: { scale: 1.75, ringWidth: 0.42, haloStrength: 0.65, haloShape: 0.0, ringStyle: 0.0 },
-  light: { scale: 1.70, ringWidth: 0.44, haloStrength: 0.60, haloShape: 0.0, ringStyle: 1.0 },
-  ultralight: { scale: 1.65, ringWidth: 0.46, haloStrength: 0.55, haloShape: 0.35, ringStyle: 2.0 }
-};
 
 function highlightValueToAlphaByte(value) {
   if (!Number.isInteger(value) || value < 0 || value > 255) {
@@ -78,14 +93,16 @@ function highlightValueToAlphaByte(value) {
 
 function buildHighlightOverlayBuffers({
   positions,
+  dimension,
   highlightArray,
   transparency,
   lodMembership,
+  drawOrder,
   alphaThreshold
 }) {
   if (highlightArray === null) return null;
-  const n = positions.length / 3;
-  const admittedIndices = lodMembership?.indices ?? null;
+  const n = positions.length / dimension;
+  const admittedIndices = drawnSequence(lodMembership, drawOrder);
   const candidateCount = admittedIndices?.length ?? n;
 
   let count = 0;
@@ -105,7 +122,7 @@ function buildHighlightOverlayBuffers({
   }
   if (count <= 0) return null;
 
-  const outPos = new Float32Array(count * 3);
+  const outPos = new Float32Array(count * dimension);
   const outCol = new Uint8Array(count * 4);
 
   let cursor = 0;
@@ -122,11 +139,11 @@ function buildHighlightOverlayBuffers({
     const baseAlpha = transparency === null ? 1 : transparency[i];
     if (baseAlpha < alphaThreshold) continue;
 
-    const pi = i * 3;
-    const oi = cursor * 3;
-    outPos[oi] = positions[pi];
-    outPos[oi + 1] = positions[pi + 1];
-    outPos[oi + 2] = positions[pi + 2];
+    const pi = i * dimension;
+    const oi = cursor * dimension;
+    for (let axis = 0; axis < dimension; axis++) {
+      outPos[oi + axis] = positions[pi + axis];
+    }
 
     const cj = cursor * 4;
     outCol[cj] = 255;
@@ -137,7 +154,7 @@ function buildHighlightOverlayBuffers({
     cursor++;
   }
 
-  return { positions: outPos, colors: outCol, count };
+  return { positions: outPos, colors: outCol, count, dimension };
 }
 
 /**
@@ -182,7 +199,62 @@ function createRasterCanvas() {
   return canvas;
 }
 
+/**
+ * The export's WebGL2 contexts, kept for the page's lifetime and reused by
+ * every raster pass: one per antialiasing setting, plus one more for each
+ * pass that overlaps another (a canvas is leased from the rasterization that
+ * draws it until `releaseWebglRasterCanvas`). Creating and losing a context
+ * for every pass made WebKitGTK/WPE abort the web process on a GL call with no
+ * current context during the teardown, and costs a context creation and a
+ * shader compile per pass everywhere.
+ *
+ * @type {Array<{canvas: HTMLCanvasElement, gl: WebGL2RenderingContext, antialias: boolean, leased: boolean}>}
+ */
+const rasterContextPool = [];
 const rasterContextOwners = new WeakMap();
+
+/**
+ * Put a reused context back into the state a new context starts in, for every
+ * piece of state a pass relies on without setting (a pass that failed part
+ * way may have left any of these behind).
+ * @param {WebGL2RenderingContext} gl
+ */
+function resetRasterState(gl) {
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.bindVertexArray(null);
+  gl.bindBuffer(gl.ARRAY_BUFFER, null);
+  gl.useProgram(null);
+  gl.disable(gl.SCISSOR_TEST);
+  gl.disable(gl.SAMPLE_ALPHA_TO_COVERAGE);
+  gl.colorMask(true, true, true, true);
+  gl.depthMask(true);
+  for (const unit of [gl.TEXTURE0, gl.TEXTURE1]) {
+    gl.activeTexture(unit);
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, null);
+  }
+  gl.activeTexture(gl.TEXTURE0);
+}
+
+/**
+ * Lease a raster canvas and its context for one pass.
+ * @param {boolean} antialias
+ * @returns {{canvas: HTMLCanvasElement, gl: WebGL2RenderingContext}}
+ */
+function leaseRasterContext(antialias) {
+  for (const entry of rasterContextPool) {
+    if (entry.antialias === antialias && !entry.leased && !entry.gl.isContextLost()) {
+      entry.leased = true;
+      resetRasterState(entry.gl);
+      return entry;
+    }
+  }
+  const canvas = createRasterCanvas();
+  const gl = getWebgl2Context(canvas, antialias);
+  const entry = { canvas, gl, antialias, leased: true };
+  rasterContextPool.push(entry);
+  rasterContextOwners.set(canvas, entry);
+  return entry;
+}
 
 /**
  * @param {HTMLCanvasElement} canvas
@@ -217,29 +289,91 @@ function getWebgl2Context(canvas, antialias) {
   if (!gl) {
     throw new Error('Figure export requires WebGL2 rasterization support.');
   }
-  rasterContextOwners.set(canvas, gl);
   return gl;
 }
 
 /**
- * Release a transient raster context after its pixels have been copied.
- * Idempotence lets every renderer use this from a `finally` boundary.
+ * Return a raster canvas to the pool after its pixels have been copied: its
+ * drawing buffer shrinks to one pixel (an export-sized buffer is not kept)
+ * and its context stays for the next pass. Returns whether the canvas was
+ * leased; a second release of the same lease returns false.
  *
  * @param {HTMLCanvasElement} canvas
  * @returns {boolean}
  */
 export function releaseWebglRasterCanvas(canvas) {
-  const gl = rasterContextOwners.get(canvas);
-  if (gl === undefined) return false;
-  rasterContextOwners.delete(canvas);
-  const loseContext = gl.getExtension('WEBGL_lose_context');
-  if (loseContext !== null) {
-    loseContext.loseContext();
-  } else {
-    canvas.width = 1;
-    canvas.height = 1;
-  }
+  const entry = rasterContextOwners.get(canvas);
+  if (entry === undefined || !entry.leased) return false;
+  entry.leased = false;
+  canvas.width = 1;
+  canvas.height = 1;
   return true;
+}
+
+// Viewer sprites are clamped at this many pixels (HP_VS_*: u_pointSizeMax
+// is never below it).
+const VIEWER_POINT_SIZE_MAX = 128;
+
+let spriteZoomLimit = null;
+
+/**
+ * The largest raster scale (export pixels per viewer pixel) at which every
+ * sprite the viewer can draw still fits this GPU's point-size range
+ * (`ALIASED_POINT_SIZE_RANGE`): a 128-pixel viewer sprite drawn larger than
+ * the driver allows would be clamped smaller than the view it reproduces.
+ * Read once, from a pooled export context.
+ *
+ * @returns {number}
+ */
+export function exportSpriteZoomLimit() {
+  if (spriteZoomLimit !== null) return spriteZoomLimit;
+  const entry = leaseRasterContext(false);
+  try {
+    const range = entry.gl.getParameter(entry.gl.ALIASED_POINT_SIZE_RANGE);
+    const driverMax = Array.isArray(range) || ArrayBuffer.isView(range)
+      ? Number(range[1])
+      : Number.NaN;
+    spriteZoomLimit = Number.isFinite(driverMax) && driverMax > 0
+      ? Math.max(1, driverMax / VIEWER_POINT_SIZE_MAX)
+      : 1;
+  } finally {
+    releaseWebglRasterCanvas(entry.canvas);
+  }
+  return spriteZoomLimit;
+}
+
+/**
+ * Column-major clip-space transform that maps the viewport sub-rectangle
+ * `rect01` (normalized, top-left origin) onto the whole clip square.
+ *
+ * @param {{x: number, y: number, width: number, height: number}} rect01
+ * @returns {Float32Array}
+ */
+export function viewRectClipTransform(rect01) {
+  const sx = 1 / rect01.width;
+  const sy = 1 / rect01.height;
+  const centerX = 2 * (rect01.x + rect01.width / 2) - 1;
+  const centerY = 1 - 2 * (rect01.y + rect01.height / 2);
+  const out = new Float32Array(16);
+  out[0] = sx;
+  out[5] = sy;
+  out[10] = 1;
+  out[15] = 1;
+  out[12] = -centerX * sx;
+  out[13] = -centerY * sy;
+  return out;
+}
+
+function multiplyMat4(a, b) {
+  const out = new Float32Array(16);
+  for (let column = 0; column < 4; column++) {
+    for (let row = 0; row < 4; row++) {
+      let sum = 0;
+      for (let k = 0; k < 4; k++) sum += a[k * 4 + row] * b[column * 4 + k];
+      out[column * 4 + row] = sum;
+    }
+  }
+  return out;
 }
 
 function configureExactDrawingBuffer(gl, canvas, width, height) {
@@ -276,18 +410,42 @@ function configureExactDrawingBuffer(gl, canvas, width, height) {
   }
 }
 
-function pickShaderSources(shaderQuality) {
+/**
+ * The program the viewer draws this quality with at this dimension: a 1-D or
+ * 2-D pass draws without depth and with the quality's no-depth fragment
+ * shader (`NO_DEPTH_MAX_DIMENSION`), exactly as HighPerfRenderer does.
+ */
+function pickShaderSources(shaderQuality, dimension) {
+  const depth = dimension > NO_DEPTH_MAX_DIMENSION;
   if (shaderQuality === 'ultralight') {
-    return { vs: HP_VS_LIGHT, fs: HP_FS_ULTRALIGHT, quality: 'ultralight' };
+    return { vs: HP_VS_LIGHT, fs: HP_FS_ULTRALIGHT, quality: 'ultralight', depth };
   }
   if (shaderQuality === 'light') {
-    return { vs: HP_VS_LIGHT, fs: HP_FS_LIGHT, quality: 'light' };
+    return {
+      vs: HP_VS_LIGHT,
+      fs: depth ? HP_FS_LIGHT : HP_FS_LIGHT_NO_DEPTH,
+      quality: 'light',
+      depth,
+    };
   }
   if (shaderQuality === 'full') {
-    return { vs: HP_VS_FULL, fs: HP_FS_FULL, quality: 'full' };
+    return {
+      vs: HP_VS_FULL,
+      fs: depth ? HP_FS_FULL : HP_FS_FULL_NO_DEPTH,
+      quality: 'full',
+      depth,
+    };
+  }
+  if (shaderQuality === 'sculpted') {
+    return {
+      vs: HP_VS_FULL,
+      fs: depth ? HP_FS_SCULPTED : HP_FS_SCULPTED_NO_DEPTH,
+      quality: 'sculpted',
+      depth,
+    };
   }
   throw new RangeError(
-    'Figure-export shaderQuality must be full, light, or ultralight.'
+    `Figure-export shaderQuality must be ${describeShaderQualities()}.`
   );
 }
 
@@ -302,33 +460,39 @@ function pickShaderSources(shaderQuality) {
  * with snapshot bounds used by the interactive renderer.
  *
  * @param {object} options
- * @param {Float32Array} options.positions
+ * @param {Float32Array} options.positions - `dimension` values per point
+ * @param {1|2|3} options.dimension - Components per position; the packed
+ *   positions keep it, and the shader's vec3 input receives 0 for the rest.
  * @param {Uint8Array} options.colors
- * @param {Float32Array|null} options.transparency
+ * @param {Uint8Array|null} options.transparency
  * @param {import('./lod-membership.js').LodMembership|null} [options.lodMembership]
+ * @param {Uint32Array|null} [options.drawOrder] - The pane's full-detail draw
+ *   order (`drawnSequence`); null draws in source order.
  * @param {Uint8Array|Float32Array|null} options.highlightArray
  * @param {boolean} options.emphasizeSelection
  * @param {number} options.selectionMutedOpacity
  * @param {number} [options.alphaThreshold]
- * @returns {{ positions: Float32Array; colors: Uint8Array; count: number }}
+ * @returns {{ positions: Float32Array; colors: Uint8Array; count: number; dimension: number }}
  */
 function packBuffers({
   positions,
+  dimension,
   colors,
   transparency,
   lodMembership,
+  drawOrder,
   highlightArray,
   emphasizeSelection,
   selectionMutedOpacity,
   alphaThreshold,
 }) {
-  const n = positions.length / 3;
-  const admittedIndices = lodMembership?.indices ?? null;
+  const n = positions.length / dimension;
+  const admittedIndices = drawnSequence(lodMembership, drawOrder);
   const admittedCount = admittedIndices?.length ?? n;
 
   const outPositions = admittedIndices === null
     ? positions
-    : new Float32Array(admittedCount * 3);
+    : new Float32Array(admittedCount * dimension);
   const outColors = new Uint8Array(admittedCount * 4);
 
   const mutedAlpha = selectionMutedOpacity;
@@ -342,13 +506,10 @@ function packBuffers({
     const i = admittedIndices === null
       ? candidateIndex
       : admittedIndices[candidateIndex];
-    const pi = i * 3;
-    const x = positions[pi];
-    const y = positions[pi + 1];
-    const z = positions[pi + 2];
+    const pi = i * dimension;
 
     const ci = i * 4;
-    const outPi = cursor * 3;
+    const outPi = cursor * dimension;
     const outCi = cursor * 4;
     let r = colors[ci];
     let g = colors[ci + 1];
@@ -360,9 +521,9 @@ function packBuffers({
     let a = baseAlpha;
 
     if (admittedIndices !== null) {
-      outPositions[outPi] = x;
-      outPositions[outPi + 1] = y;
-      outPositions[outPi + 2] = z;
+      for (let axis = 0; axis < dimension; axis++) {
+        outPositions[outPi + axis] = positions[pi + axis];
+      }
     }
 
     if (
@@ -389,7 +550,8 @@ function packBuffers({
   return {
     positions: outPositions,
     colors: outColors,
-    count: admittedCount
+    count: admittedCount,
+    dimension
   };
 }
 
@@ -397,19 +559,28 @@ function packBuffers({
  * Render a point cloud into a WebGL2 canvas using viewer shader variants.
  *
  * @param {object} options
- * @param {Float32Array|null} options.positions
+ * @param {Float32Array|null} options.positions - `dimension` values per point
+ * @param {1|2|3} options.dimension - The view's dimension level
  * @param {Uint8Array|null} options.colors
- * @param {Float32Array|null} [options.transparency]
+ * @param {Uint8Array|null} [options.transparency]
  * @param {import('./lod-membership.js').LodMembership|null} [options.lodMembership]
+ * @param {Uint32Array|null} [options.drawOrder] - The pane's full-detail draw
+ *   order (`drawnSequence`); null draws in source order.
  * @param {RenderStateForWebgl|null} options.renderState
  * @param {number} options.outputWidthPx - target canvas width (pixels)
  * @param {number} options.outputHeightPx - target canvas height (pixels)
  * @param {number} options.pointSizePx - diameter in output pixels
- * @param {{ positions: Float32Array|null; colors: Uint8Array|null; transparency?: Float32Array|null; lodMembership?: import('./lod-membership.js').LodMembership|null; pointSizePx: number; alphaThreshold?: number } | null} [options.overlayPoints]
+ * @param {{ positions: Float32Array|null; colors: Uint8Array|null; transparency?: Uint8Array|null; lodMembership?: import('./lod-membership.js').LodMembership|null; pointSizePx: number; alphaThreshold?: number } | null} [options.overlayPoints]
  * @param {Uint8Array|Float32Array|null} [options.highlightArray]
  * @param {boolean} [options.emphasizeSelection=false]
  * @param {number} [options.selectionMutedOpacity=0.15]
  * @param {number} [options.alphaThreshold=0.01]
+ * @param {{x: number, y: number, width: number, height: number}|null} [options.viewRect01]
+ *   A sub-rectangle of the viewport (normalized, top-left origin) to draw
+ *   over the whole output, at the output's resolution -- a cropped figure
+ *   drawn at its own pixels rather than a magnified part of the whole view.
+ *   The caller sizes the output to the rectangle's aspect and scales point
+ *   sizes by the same zoom. Null draws the whole viewport, letterboxed.
  * @returns {HTMLCanvasElement}
  */
 /**
@@ -420,7 +591,6 @@ function packBuffers({
  * @returns {number}
  */
 function exportPointSizeMax(gl, rasterScale) {
-  const VIEWER_POINT_SIZE_MAX = 128;
   const scaled = VIEWER_POINT_SIZE_MAX * Math.max(1, rasterScale);
   const range = gl.getParameter(gl.ALIASED_POINT_SIZE_RANGE);
   const driverMax = Array.isArray(range) || ArrayBuffer.isView(range)
@@ -432,9 +602,11 @@ function exportPointSizeMax(gl, rasterScale) {
 
 export function rasterizePointsWebgl({
   positions,
+  dimension,
   colors,
   transparency = null,
   lodMembership = null,
+  drawOrder = null,
   renderState,
   outputWidthPx,
   outputHeightPx,
@@ -444,20 +616,30 @@ export function rasterizePointsWebgl({
   emphasizeSelection = false,
   selectionMutedOpacity = 0.15,
   alphaThreshold = DEFAULT_ALPHA_THRESHOLD,
+  viewRect01 = null,
 }) {
+  const viewRect = viewRect01 === null
+    ? null
+    : assertCropRect01({ enabled: true, ...viewRect01 });
   if (!renderState || typeof renderState !== 'object') {
     throw new TypeError('Figure-export renderState is required.');
   }
-  if (
-    !(positions instanceof Float32Array) ||
-    positions.length % 3 !== 0
-  ) {
-    throw new TypeError(
-      'Figure-export positions must be a Float32Array of XYZ triples.'
+  if (dimension !== 1 && dimension !== 2 && dimension !== 3) {
+    throw new RangeError(
+      'Figure-export position dimension must be exactly 1, 2, or 3.'
     );
   }
-  const pointCount = positions.length / 3;
+  if (
+    !(positions instanceof Float32Array) ||
+    positions.length % dimension !== 0
+  ) {
+    throw new TypeError(
+      'Figure-export positions must be a Float32Array with dimension values per point.'
+    );
+  }
+  const pointCount = positions.length / dimension;
   assertLodMembership(lodMembership, { pointCount });
+  assertDrawOrder(drawOrder, { pointCount });
   if (!(colors instanceof Uint8Array) || colors.length !== pointCount * 4) {
     throw new TypeError(
       'Figure-export colors must be a Uint8Array with exactly four values per point.'
@@ -465,10 +647,10 @@ export function rasterizePointsWebgl({
   }
   if (
     transparency !== null &&
-    (!(transparency instanceof Float32Array) || transparency.length !== pointCount)
+    (!(transparency instanceof Uint8Array) || transparency.length !== pointCount)
   ) {
     throw new TypeError(
-      'Figure-export transparency must be null or one Float32 value per point.'
+      'Figure-export transparency must be null or one Uint8 value per point.'
     );
   }
   if (
@@ -536,7 +718,7 @@ export function rasterizePointsWebgl({
       );
     }
   }
-  pickShaderSources(renderState.shaderQuality);
+  pickShaderSources(renderState.shaderQuality, dimension);
   for (const [name, value] of [
     ['outputWidthPx', outputWidthPx],
     ['outputHeightPx', outputHeightPx]
@@ -566,9 +748,11 @@ export function rasterizePointsWebgl({
 
   const packed = packBuffers({
     positions,
+    dimension,
     colors,
     transparency,
     lodMembership,
+    drawOrder,
     highlightArray,
     emphasizeSelection,
     selectionMutedOpacity,
@@ -576,8 +760,7 @@ export function rasterizePointsWebgl({
   });
   const outW = outputWidthPx;
   const outH = outputHeightPx;
-  const canvas = createRasterCanvas();
-  const gl = getWebgl2Context(canvas, renderState.antialias);
+  const { canvas, gl } = leaseRasterContext(renderState.antialias);
   try {
     configureExactDrawingBuffer(gl, canvas, outW, outH);
   } catch (error) {
@@ -592,7 +775,10 @@ export function rasterizePointsWebgl({
     throw error;
   }
 
-  const { vs, fs, quality } = pickShaderSources(renderState.shaderQuality);
+  const { vs, fs, quality, depth } = pickShaderSources(
+    renderState.shaderQuality,
+    dimension
+  );
 
   /** @type {WebGLProgram|null} */
   let program = null;
@@ -621,8 +807,13 @@ export function rasterizePointsWebgl({
     program = createProgram(gl, vs, fs);
     gl.useProgram(program);
 
-    // GL state matches HighPerfRenderer defaults.
-    gl.enable(gl.DEPTH_TEST);
+    // GL state matches HighPerfRenderer: depth for a 3-D pass, none for a
+    // 1-D or 2-D one.
+    if (depth) {
+      gl.enable(gl.DEPTH_TEST);
+    } else {
+      gl.disable(gl.DEPTH_TEST);
+    }
     gl.depthFunc(gl.LEQUAL);
     configureStraightAlphaBlending(gl);
 
@@ -632,14 +823,31 @@ export function rasterizePointsWebgl({
     const srcViewportW = renderState.viewportWidth;
     const srcViewportH = renderState.viewportHeight;
 
-    // Letterbox the on-screen viewport into the export canvas (preserves projection/aspect).
-    const s = Math.min(outW / srcViewportW, outH / srcViewportH);
-    const vpW = Math.max(1, Math.round(srcViewportW * s));
-    const vpH = Math.max(1, Math.round(srcViewportH * s));
-    const vpX = Math.floor((outW - vpW) / 2);
-    const vpY = Math.floor((outH - vpH) / 2);
-
-    gl.viewport(vpX, vpY, vpW, vpH);
+    // Export pixels per viewer pixel, and the projection that draws them.
+    let s;
+    let mvpMatrix = renderState.mvpMatrix;
+    let projectionMatrix = renderState.projectionMatrix;
+    if (viewRect === null) {
+      // Letterbox the on-screen viewport into the export canvas (preserves projection/aspect).
+      s = Math.min(outW / srcViewportW, outH / srcViewportH);
+      const vpW = Math.max(1, Math.round(srcViewportW * s));
+      const vpH = Math.max(1, Math.round(srcViewportH * s));
+      const vpX = Math.floor((outW - vpW) / 2);
+      const vpY = Math.floor((outH - vpH) / 2);
+      gl.viewport(vpX, vpY, vpW, vpH);
+    } else {
+      // The sub-rectangle fills the canvas: the projection is zoomed onto it
+      // in clip space, so every point is placed and drawn at this raster's
+      // own resolution.
+      s = Math.min(
+        outW / (viewRect.width * srcViewportW),
+        outH / (viewRect.height * srcViewportH)
+      );
+      const zoom = viewRectClipTransform(viewRect);
+      mvpMatrix = multiplyMat4(zoom, renderState.mvpMatrix);
+      projectionMatrix = multiplyMat4(zoom, renderState.projectionMatrix);
+      gl.viewport(0, 0, outW, outH);
+    }
 
     // Buffers (separate position + color to keep packing simple).
     positionBuffer = gl.createBuffer();
@@ -648,12 +856,15 @@ export function rasterizePointsWebgl({
       throw new Error('Figure-export point-buffer allocation failed.');
     }
 
-    const packedPositions = packed.positions.subarray(0, packed.count * 3);
+    const packedPositions = packed.positions.subarray(
+      0,
+      packed.count * packed.dimension
+    );
 
     gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
     gl.bufferData(gl.ARRAY_BUFFER, packedPositions, gl.STATIC_DRAW);
     gl.enableVertexAttribArray(0);
-    gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+    gl.vertexAttribPointer(0, packed.dimension, gl.FLOAT, false, 0, 0);
 
     gl.bindBuffer(gl.ARRAY_BUFFER, colorBuffer);
     gl.bufferData(gl.ARRAY_BUFFER, packed.colors, gl.STATIC_DRAW);
@@ -667,14 +878,31 @@ export function rasterizePointsWebgl({
     const setI1 = (loc, v) => { if (loc) gl.uniform1i(loc, v); };
     const setV3 = (loc, v) => { if (loc && v) gl.uniform3fv(loc, v); };
 
-    setMat4(u('u_mvpMatrix'), renderState.mvpMatrix);
-    setMat4(u('u_viewMatrix'), renderState.viewMatrix);
-    setMat4(u('u_modelMatrix'), renderState.modelMatrix);
-    setMat4(u('u_projectionMatrix'), renderState.projectionMatrix);
-
     const fov = renderState.fov;
     const sizeAttenuation = renderState.sizeAttenuation;
     const pointSize = pointSizePx;
+    // IMPORTANT: The point scale is derived from the SOURCE viewport height.
+    //
+    // We letterbox the source viewport into a differently-sized export canvas by
+    // changing gl.viewport(). To produce a *scaled copy* of what the user sees
+    // (WYSIWYG), we scale u_pointSize at the callsite and keep the projection
+    // factor consistent with the interactive viewer's original one.
+    const shaderFrame = {
+      modelView: new Float32Array(16),
+      halfDir: new Float32Array(3),
+    };
+    const pointScale = writePointShaderFrame(
+      shaderFrame,
+      renderState.viewMatrix,
+      renderState.modelMatrix,
+      renderState.lightDir,
+      srcViewportH,
+      fov
+    );
+
+    setMat4(u('u_mvpMatrix'), mvpMatrix);
+    setMat4(u('u_modelViewMatrix'), shaderFrame.modelView);
+    setMat4(u('u_projectionMatrix'), projectionMatrix);
 
     setF1(u('u_pointSize'), pointSize);
     // The shader caps a sprite at 128 pixels of whatever it is drawing into.
@@ -687,78 +915,74 @@ export function rasterizePointsWebgl({
     // than ALIASED_POINT_SIZE_RANGE allows is undefined rather than clamped.
     setF1(u('u_pointSizeMax'), exportPointSizeMax(gl, s));
     setF1(u('u_sizeAttenuation'), sizeAttenuation);
-    // IMPORTANT: Keep u_viewportHeight in the SOURCE viewport pixel units.
-    //
-    // We letterbox the source viewport into a differently-sized export canvas by
-    // changing gl.viewport(). To produce a *scaled copy* of what the user sees
-    // (WYSIWYG), we scale u_pointSize at the callsite and keep u_viewportHeight
-    // consistent with the interactive viewer's original projection factor.
-    setF1(u('u_viewportHeight'), srcViewportH);
-    setF1(u('u_fov'), fov);
+    setF1(u('u_pointScale'), pointScale);
 
     // Disable alpha texture paths for export; alpha is baked into vertex colors.
     // IMPORTANT: Even when disabled, we must bind dummy textures to avoid WebGL errors.
-    // The shader uses sampler2D (float) for u_alphaTex and usampler2D (uint) for u_lodIndexTex.
-    // If both samplers default to texture unit 0, WebGL throws:
+    // The shader uses sampler2DArray (float) for u_alphaTex and usampler2DArray (uint)
+    // for u_lodIndexTex. If both samplers default to texture unit 0, WebGL throws:
     // "Two textures of different types use the same sampler location"
     setI1(u('u_useAlphaTex'), 0);
-    setI1(u('u_alphaTexWidth'), 0);
-    setF1(u('u_invAlphaTexWidth'), 0);
     setI1(u('u_useLodIndexTex'), 0);
-    setI1(u('u_lodIndexTexWidth'), 0);
-    setF1(u('u_invLodIndexTexWidth'), 0);
 
     // Create and bind dummy textures to separate texture units to prevent type conflicts.
     // IMPORTANT: Configure filters/wraps so textures are "complete" (no mipmaps required),
     // otherwise some browsers will fail the draw even if the texture path is disabled.
     //
-    // Unit 0: dummy normalized texture for u_alphaTex (sampler2D)
+    // Unit 0: dummy normalized texture for u_alphaTex (sampler2DArray)
     dummyAlphaTex = gl.createTexture();
     if (!dummyAlphaTex) {
       throw new Error('Figure-export dummy alpha-texture allocation failed.');
     }
     gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, dummyAlphaTex);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([255, 255, 255, 255]));
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, dummyAlphaTex);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texImage3D(gl.TEXTURE_2D_ARRAY, 0, gl.R8, 1, 1, 1, 0, gl.RED, gl.UNSIGNED_BYTE, new Uint8Array([255]));
     const alphaTexLoc = u('u_alphaTex');
     if (alphaTexLoc) gl.uniform1i(alphaTexLoc, 0);
 
-    // Unit 1: dummy integer texture for u_lodIndexTex (usampler2D)
+    // Unit 1: dummy integer texture for u_lodIndexTex (usampler2DArray)
     dummyLodIndexTex = gl.createTexture();
     if (!dummyLodIndexTex) {
       throw new Error('Figure-export dummy LOD-texture allocation failed.');
     }
     gl.activeTexture(gl.TEXTURE1);
-    gl.bindTexture(gl.TEXTURE_2D, dummyLodIndexTex);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8UI, 1, 1, 0, gl.RED_INTEGER, gl.UNSIGNED_BYTE, new Uint8Array([0]));
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, dummyLodIndexTex);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texImage3D(gl.TEXTURE_2D_ARRAY, 0, gl.R32UI, 1, 1, 1, 0, gl.RED_INTEGER, gl.UNSIGNED_INT, new Uint32Array([0]));
     const lodIndexTexLoc = u('u_lodIndexTex');
     if (lodIndexTexLoc) gl.uniform1i(lodIndexTexLoc, 1);
 
     const fogNear = renderState.fogNear;
     const fogFar = renderState.fogFar;
     const fogDensity = renderState.fogDensity;
-    const fogColor = renderState.fogColor;
     const lightingStrength = renderState.lightingStrength;
     const lightDir = renderState.lightDir;
 
-    if (quality === 'full') {
+    if (SHADER_QUALITY_TRAITS[quality].sphere) {
       setF1(u('u_lightingStrength'), lightingStrength);
-      setF1(u('u_fogDensity'), fogDensity);
-      setF1(u('u_fogNear'), fogNear);
-      setF1(u('u_fogFar'), fogFar);
-      setV3(u('u_fogColor'), fogColor);
+      writeFogUniforms(gl, u('u_fogNear'), u('u_fogScale'), fogDensity, fogNear, fogFar);
       setV3(u('u_lightDir'), lightDir);
+      setV3(u('u_halfDir'), shaderFrame.halfDir);
+      setF1(u('u_invCenterShade'), shaderFrame.invCenterShade);
+      // Only an opaque (sculpted) point mixes toward the fog colour, which a
+      // figure sets to its paper.
+      setV3(u('u_fogColor'), renderState.fogColor);
     }
 
-    gl.drawArrays(gl.POINTS, 0, packed.count);
+    // An opaque program's depth pass draws without blending and, where the
+    // export context multisamples, turns its edge coverage into a sample mask,
+    // exactly as HighPerfRenderer does (`enterOpaquePointBlending`).
+    const opaquePass = quality === 'sculpted' && depth;
+    if (opaquePass) {
+      const multisampled = gl.getParameter(gl.SAMPLES) > 0;
+      enterOpaquePointBlending(gl, multisampled);
+      setF1(u('u_coverageFloor'), multisampled ? 0 : 0.5);
+    }
+
+    drawPointsInSegments(gl, 0, packed.count);
 
     // Optional overlay pass (e.g., centroid points rendered larger on top).
     if (overlayPoints !== null) {
@@ -784,8 +1008,10 @@ export function rasterizePointsWebgl({
       }
       const overlayLodMembership = overlayPoints.lodMembership ?? null;
       assertLodMembership(overlayLodMembership, { pointCount: overlayCount });
+      // Overlay points (centroids) are XYZ triples.
       const overlayPacked = packBuffers({
         positions: overlayPoints.positions,
+        dimension: 3,
         colors: overlayPoints.colors,
         transparency: overlayPoints.transparency ?? null,
         lodMembership: overlayLodMembership,
@@ -813,17 +1039,24 @@ export function rasterizePointsWebgl({
 
         setF1(u('u_pointSize'), overlayPoints.pointSizePx);
         setF1(u('u_pointSizeMax'), exportPointSizeMax(gl, s));
-        gl.drawArrays(gl.POINTS, 0, overlayPacked.count);
+        drawPointsInSegments(gl, 0, overlayPacked.count);
       }
+    }
+
+    if (opaquePass) {
+      gl.disable(gl.SAMPLE_ALPHA_TO_COVERAGE);
+      configureStraightAlphaBlending(gl);
     }
 
     // Optional highlight overlay (selection rings / continuous highlights).
     // Matches viewer behavior: depth test ON, but depth writes OFF so highlights appear on top.
     const highlightOverlay = buildHighlightOverlayBuffers({
       positions,
+      dimension,
       highlightArray,
       transparency,
       lodMembership,
+      drawOrder,
       alphaThreshold
     });
     if (highlightOverlay?.count) {
@@ -839,7 +1072,14 @@ export function rasterizePointsWebgl({
       gl.bindBuffer(gl.ARRAY_BUFFER, highlightPosBuffer);
       gl.bufferData(gl.ARRAY_BUFFER, highlightOverlay.positions, gl.STATIC_DRAW);
       gl.enableVertexAttribArray(0);
-      gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+      gl.vertexAttribPointer(
+        0,
+        highlightOverlay.dimension,
+        gl.FLOAT,
+        false,
+        0,
+        0
+      );
 
       gl.bindBuffer(gl.ARRAY_BUFFER, highlightColorBuffer);
       gl.bufferData(gl.ARRAY_BUFFER, highlightOverlay.colors, gl.STATIC_DRAW);
@@ -851,18 +1091,15 @@ export function rasterizePointsWebgl({
       const setHF1 = (loc, v) => { if (loc) gl.uniform1f(loc, v); };
       const setHV3 = (loc, v) => { if (loc && v) gl.uniform3fv(loc, v); };
 
-      setHMat4(hu('u_mvpMatrix'), renderState.mvpMatrix);
-      setHMat4(hu('u_viewMatrix'), renderState.viewMatrix);
-      setHMat4(hu('u_modelMatrix'), renderState.modelMatrix);
-      setHMat4(hu('u_projectionMatrix'), renderState.projectionMatrix);
+      setHMat4(hu('u_modelViewMatrix'), shaderFrame.modelView);
+      setHMat4(hu('u_projectionMatrix'), projectionMatrix);
 
       setHF1(hu('u_pointSize'), pointSize);
       setHF1(hu('u_pointSizeMax'), exportPointSizeMax(gl, s));
       setHF1(hu('u_sizeAttenuation'), sizeAttenuation);
-      setHF1(hu('u_viewportHeight'), srcViewportH);
-      setHF1(hu('u_fov'), fov);
+      setHF1(hu('u_pointScale'), pointScale);
 
-      const style = HIGHLIGHT_STYLE_BY_QUALITY[quality];
+      const style = HIGHLIGHT_STYLES_BY_QUALITY[quality];
       setHF1(hu('u_highlightScale'), style.scale);
       setHV3(hu('u_highlightColor'), DEFAULT_HIGHLIGHT_COLOR);
       setHF1(hu('u_ringWidth'), style.ringWidth);
@@ -870,19 +1107,18 @@ export function rasterizePointsWebgl({
       setHF1(hu('u_haloShape'), style.haloShape);
       setHF1(hu('u_ringStyle'), style.ringStyle);
       setHF1(hu('u_time'), 0.0);
+      setHF1(hu('u_glow'), highlightGlowAt(0.0));
 
-      setHF1(hu('u_fogDensity'), fogDensity);
-      setHF1(hu('u_fogNear'), fogNear);
-      setHF1(hu('u_fogFar'), fogFar);
-      setHV3(hu('u_fogColor'), fogColor);
+      writeFogUniforms(gl, hu('u_fogNear'), hu('u_fogScale'), fogDensity, fogNear, fogFar);
       setHF1(hu('u_lightingStrength'), lightingStrength);
       setHV3(hu('u_lightDir'), lightDir);
+      setHV3(hu('u_halfDir'), shaderFrame.halfDir);
 
       gl.enable(gl.DEPTH_TEST);
       configureStraightAlphaBlending(gl);
       try {
         gl.depthMask(false);
-        gl.drawArrays(gl.POINTS, 0, highlightOverlay.count);
+        drawPointsInSegments(gl, 0, highlightOverlay.count);
       } finally {
         gl.depthMask(true);
       }

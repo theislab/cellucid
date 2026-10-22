@@ -12,7 +12,7 @@
 
 import { formatTick } from '../utils/tick-calculator.js';
 import { LIGHT_INK } from '../utils/figure-ink.js';
-import { escapeHtml } from '../../../../utils/dom-utils.js';
+import { escapeXml } from '../../../../utils/dom-utils.js';
 import {
   areLegendModelsSemanticallyEqual,
 } from '../utils/legend-model-equality.js';
@@ -101,13 +101,20 @@ function truncateCanvasTextToWidth(ctx, text, maxWidthPx) {
 /**
  * Is this category excluded from the drawn points?
  *
+ * A category is absent from the figure when it is unticked, and also when it
+ * is ticked but other filters leave it no cells — the row the on-screen legend
+ * disables as "No cells available in this category after other filters".
+ *
  * @param {any} model
  * @param {number} index
  */
 export function isCategoryHidden(model, index) {
   const visible = model?.visible;
-  if (visible === null || typeof visible !== 'object') return false;
-  return visible[index] === false;
+  if (visible !== null && typeof visible === 'object' && visible[index] === false) {
+    return true;
+  }
+  const available = model?.counts?.available;
+  return Array.isArray(available) && available[index] === 0;
 }
 
 /**
@@ -125,7 +132,7 @@ export function isCategoryHidden(model, index) {
  * @param {(text: string, maxWidthPx: number) => string} options.fit
  * @param {(text: string) => number} options.measure
  */
-export function composeCategoryLabel({ name, hidden, maxWidthPx, fit, measure }) {
+function composeCategoryLabel({ name, hidden, maxWidthPx, fit, measure }) {
   const text = String(name ?? '');
   if (!hidden) return fit(text, maxWidthPx);
   const nameWidth = maxWidthPx - measure(HIDDEN_LEGEND_ENTRY_SUFFIX);
@@ -141,7 +148,7 @@ export function composeCategoryLabel({ name, hidden, maxWidthPx, fit, measure })
  *
  * @param {any} model
  */
-export function isLogColorScale(model) {
+function isLogColorScale(model) {
   return model?.logEnabled === true
     || model?.scale === 'log'
     || model?.colorbar?.scale === 'log';
@@ -249,13 +256,13 @@ export function renderSvgLegend({
   const defs = [];
 
   parts.push(
-    `<g font-family="${escapeHtml(fontFamily)}" font-size="${fontSize}" fill="${ink.text}">`
+    `<g font-family="${escapeXml(fontFamily)}" font-size="${fontSize}" fill="${ink.text}">`
   );
   const fill = backgroundFill === 'transparent' ? 'none' : backgroundFill;
-  parts.push(`<rect x="${x}" y="${y}" width="${w}" height="${h}" fill="${escapeHtml(fill)}" stroke="${ink.frame}" stroke-width="1"/>`);
+  parts.push(`<rect x="${x}" y="${y}" width="${w}" height="${h}" fill="${escapeXml(fill)}" stroke="${ink.frame}" stroke-width="1"/>`);
 
   const title = fieldKey ? String(fieldKey) : (model.kind === 'continuous' ? 'Color scale' : 'Legend');
-  parts.push(`<text x="${x + padding}" y="${y + padding + fontSize}" font-weight="600">${escapeHtml(title)}</text>`);
+  parts.push(`<text x="${x + padding}" y="${y + padding + fontSize}" font-weight="600">${escapeXml(title)}</text>`);
 
   let cursorY = y + padding + fontSize + 8;
 
@@ -296,7 +303,7 @@ export function renderSvgLegend({
       } else {
         parts.push(`<rect x="${itemX}" y="${itemY}" width="${swatch}" height="${swatch}" fill="${rgb01ToCss(colors[i])}" stroke="${ENTRY_INK}" stroke-width="0.25"/>`);
       }
-      parts.push(`<text x="${labelX}" y="${itemY + swatch}" fill="${hidden ? HIDDEN_ENTRY_INK : ENTRY_INK}" dominant-baseline="ideographic">${escapeHtml(label)}</text>`);
+      parts.push(`<text x="${labelX}" y="${itemY + swatch}" fill="${hidden ? HIDDEN_ENTRY_INK : ENTRY_INK}" dominant-baseline="ideographic">${escapeXml(label)}</text>`);
     }
   } else if (model.kind === 'continuous') {
     const gradId = `${idPrefix}_grad`;
@@ -322,7 +329,7 @@ export function renderSvgLegend({
     const note = buildColorScaleNote(model, min, max);
     if (note !== null) {
       const noteBaseline = cursorY + fontSize * 2 + SCALE_NOTE_GAP;
-      parts.push(`<text x="${x + padding}" y="${noteBaseline}" fill="${SCALE_NOTE_INK}">${escapeHtml(note)}</text>`);
+      parts.push(`<text x="${x + padding}" y="${noteBaseline}" fill="${SCALE_NOTE_INK}">${escapeXml(note)}</text>`);
     }
   }
 

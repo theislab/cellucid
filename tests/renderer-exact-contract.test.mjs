@@ -40,6 +40,7 @@ import {
   PerformanceTracker,
   SyntheticDataGenerator,
 } from '../assets/js/dev/benchmark.js';
+import { createCpuPermuter } from './helpers/cpu-permuter.mjs';
 
 const renderingRoot = new URL('../assets/js/rendering/', import.meta.url);
 const figureExportRoot = new URL(
@@ -77,8 +78,6 @@ test('spatial indices require an exact supported dimension contract', () => {
   ]);
   const options = {
     buildLOD: false,
-    buildLodNodeMappings: false,
-    computeNodeStats: false,
   };
 
   assert.throws(
@@ -97,6 +96,7 @@ test('renderer quality selection rejects unknown current-contract values', () =>
       full: { id: 'full' },
       light: { id: 'light' },
       ultralight: { id: 'ultralight' },
+      sculpted: { id: 'sculpted' },
     },
     gl: {
       useProgram() {},
@@ -104,7 +104,7 @@ test('renderer quality selection rejects unknown current-contract values', () =>
   });
   assert.throws(
     () => renderer.setQuality('cinematic'),
-    /quality.*full.*light.*ultralight/i
+    /quality.*full.*sculpted.*light.*ultralight/i
   );
 
   const highlight = Object.assign(Object.create(HighlightRenderer.prototype), {
@@ -112,11 +112,12 @@ test('renderer quality selection rejects unknown current-contract values', () =>
       full: {},
       light: {},
       ultralight: {},
+      sculpted: {},
     },
   });
   assert.throws(
     () => highlight.setQuality('cinematic'),
-    /quality.*full.*light.*ultralight/i
+    /quality.*full.*sculpted.*light.*ultralight/i
   );
 });
 
@@ -155,23 +156,26 @@ test('renderer statistics publish only after an exact per-view render update', (
   assert.equal(renderer.getStats('live').visiblePoints, 6);
 });
 
-test('per-view state rejects a null GPU index-buffer allocation before publication', () => {
+test('per-view state is CPU state: creating it touches no WebGL object', () => {
   const renderer = Object.assign(
     Object.create(HighPerfRenderer.prototype),
     {
-      gl: {
-        createBuffer() {
-          return null;
+      gl: new Proxy({}, {
+        get(_target, property) {
+          throw new Error(`per-view state must not reach gl.${String(property)}`);
         },
-      },
+      }),
       _perViewState: new Map(),
     },
   );
 
-  assert.throws(
-    () => renderer._getViewState('allocation-failure'),
-    /could not allocate.*per-view index buffer/i,
-  );
+  const viewState = renderer._getViewState('cpu-only');
+  assert.equal(renderer._perViewState.get('cpu-only'), viewState);
+  // Culling keeps leaf runs and draw ranges, never per-point indices.
+  assert.ok(viewState.cull.runs instanceof Uint32Array);
+  assert.ok(viewState.cull.starts instanceof Int32Array);
+  assert.equal(Object.hasOwn(viewState, 'indexBuffer'), false);
+  renderer.clearViewState('cpu-only');
   assert.equal(renderer._perViewState.size, 0);
 });
 
@@ -256,15 +260,18 @@ test('renderer frame timing remains owned by the view that produced it', () => {
   );
 });
 
-test('snapshot buffers publish owned bounds before live position identity can change', async () => {
+test('snapshot buffers publish owned bounds and adopt published positions without copying them', async () => {
   const rendererSource = await source('high-perf-renderer.js');
   assert.match(
     rendererSource,
-    /snapshotBounds\s*=\s*HighPerfRenderer\.computeBoundsFromPositions\(positions\)/
+    /snapshotBounds\s*=\s*HighPerfRenderer\.computeBoundsFromPositions\(\s*positions,\s*exactDimensionLevel\s*\)/
   );
-  assert.match(
+  // A published positions array is never written after publication, so a
+  // snapshot geometry is that array: a copy would duplicate every coordinate.
+  assert.match(rendererSource, /positions:\s*sourcePositions,/);
+  assert.doesNotMatch(
     rendererSource,
-    /positions:\s*new Float32Array\(sourcePositions\)/
+    /new Float32Array\(sourcePositions\)/
   );
   assert.match(rendererSource, /bounds:\s*snapshotBounds/);
   assert.doesNotMatch(
@@ -296,7 +303,7 @@ test('an exact empty scene publishes empty alpha state without a synthetic textu
     _useAlphaTexture: false,
     _currentAlphas: null,
   });
-  const alphas = new Float32Array();
+  const alphas = new Uint8Array();
 
   renderer.updateAlphas(alphas);
 
@@ -311,30 +318,74 @@ test('recoloring preserves the exact alpha generation through a position publica
     10, 20, 30, 255,
     40, 50, 60, 255,
   ]);
+  // Another representation of the same two cells, in 2D.
   const nextPositions = Float32Array.from([
-    -1, 0, 0,
-    1, 0, 0,
+    -1, 0,
+    1, 0,
   ]);
-  let published = null;
+  let nextId = 1;
+  const live = new Set();
+  const deleted = [];
+  const uploads = [];
+  let bound = null;
+  const gl = {
+    ARRAY_BUFFER: 0x8892,
+    FLOAT: 0x1406,
+    NO_ERROR: 0,
+    STATIC_DRAW: 0x88e4,
+    UNSIGNED_BYTE: 0x1401,
+    createBuffer() { const handle = { id: nextId++ }; live.add(handle); return handle; },
+    createVertexArray() { const handle = { id: nextId++, vao: true }; live.add(handle); return handle; },
+    bindBuffer(_target, buffer) { bound = buffer; },
+    bindVertexArray() {},
+    bufferData(_target, data) { uploads.push({ buffer: bound, data }); },
+    enableVertexAttribArray() {},
+    vertexAttribPointer() {},
+    getError() { return 0; },
+    deleteBuffer(handle) { live.delete(handle); deleted.push(handle); },
+    deleteVertexArray(handle) { live.delete(handle); deleted.push(handle); },
+    deleteTexture(handle) { live.delete(handle); deleted.push(handle); },
+  };
+  const colorBuffer = gl.createBuffer();
+  const positionBuffer = gl.createBuffer();
+  const vao = gl.createVertexArray();
+  const alphaTexture = { id: 'alpha-texture' };
+  const previousPositions = Float32Array.from([-1, 0, 0, 1, 0, 0]);
   const renderer = Object.assign(Object.create(HighPerfRenderer.prototype), {
+    gl,
     pointCount: 2,
+    vao,
+    buffers: { positions: positionBuffer, colors: colorBuffer },
+    _positionGpuByteLength: previousPositions.byteLength,
+    _colorGpuByteLength: 8,
+    _positions: previousPositions,
+    currentDimensionLevel: 3,
+    _liveGeometryGeneration: 1,
+    _nextGeometryGeneration: 2,
     _colors: Uint8Array.from([
       1, 2, 3, 255,
       4, 5, 6, 255,
     ]),
     _currentAlphas: alphas,
-    _alphaTexture: { id: 'alpha-texture' },
+    _alphaTexture: alphaTexture,
     _alphaTexWidth: 2,
+    _alphaTexHeight: 1,
     _useAlphaTexture: true,
-    _bufferDirty: false,
-    _dirtyLodDimensions: new Set(),
-    lodBuffersByDimension: new Map(),
+    _colorsDirty: false,
+    _liveOrder: null,
+    _liveColorOrder: null,
     spatialIndices: new Map(),
+    _perViewState: new Map(),
+    _snapshotGeometryPools: new Map(),
+    _pendingDataRetirements: new Set(),
+    _pendingSnapshotRetirements: new Set(),
+    snapshotBuffers: new Map(),
+    stats: { gpuMemoryMB: 0 },
     _needsSpatialIndex() {
       return false;
     },
-    loadData(positions, colors, options) {
-      published = { colors, options, positions };
+    loadData() {
+      assert.fail('a position publication keeps per-cell owners; it is not a dataset load');
     },
   });
 
@@ -343,259 +394,126 @@ test('recoloring preserves the exact alpha generation through a position publica
   assert.strictEqual(renderer.getCurrentAlphas(), alphas);
   assert.equal(renderer.isAlphaTextureActive(), true);
 
-  renderer.updatePositions(nextPositions, 3);
+  renderer.updatePositions(nextPositions, 2);
 
-  assert.strictEqual(published.positions, nextPositions);
-  assert.strictEqual(published.colors, nextColors);
-  assert.strictEqual(published.options.alphaValues, alphas);
-  assert.equal(published.options.dimensionLevel, 3);
+  // Colour, alpha and the pending recolor survive unchanged; only the
+  // position stream is new.
+  assert.strictEqual(renderer._colors, nextColors);
+  assert.strictEqual(renderer.buffers.colors, colorBuffer);
+  assert.strictEqual(renderer._alphaTexture, alphaTexture);
+  assert.strictEqual(renderer.getCurrentAlphas(), alphas);
+  assert.equal(renderer.isAlphaTextureActive(), true);
+  assert.equal(renderer._colorsDirty, true, 'the deferred recolor upload is still pending');
+  assert.strictEqual(renderer._positions, nextPositions);
+  assert.equal(renderer.currentDimensionLevel, 2);
+  assert.notEqual(renderer.buffers.positions, positionBuffer);
+  assert.deepEqual(uploads.map(upload => upload.data), [nextPositions]);
+  assert.equal(deleted.includes(colorBuffer), false);
+  assert.equal(deleted.includes(alphaTexture), false);
+  assert.equal(deleted.includes(vao), true);
+  // The 3D geometry the live view left is retained for reuse.
+  assert.equal(deleted.includes(positionBuffer), false);
+  const retained = renderer._snapshotGeometryPools.get(1);
+  assert.equal(retained.positions, previousPositions);
+  assert.equal(retained.positionBuffer, positionBuffer);
+  assert.equal(retained.refCount, 0);
 });
 
-test('a recolor flushes each resident dimension only when that dimension renders', () => {
+test('a recolor is gathered into the live draw order once, at its flush, retrying after a refusal', () => {
   let boundBuffer = null;
-  let rejectedBuffer = null;
-  let webglError = 0;
+  let rejectUpload = false;
+  let getErrorCalls = 0;
   const uploads = [];
   const gl = {
     ARRAY_BUFFER: 0x8892,
-    DYNAMIC_DRAW: 0x88e8,
     INVALID_OPERATION: 0x0502,
     NO_ERROR: 0,
     bindBuffer(target, buffer) {
       assert.equal(target, this.ARRAY_BUFFER);
       boundBuffer = buffer;
     },
-    bufferData(target, data, usage) {
+    bufferData() {
+      assert.fail('a recolor rewrites the accepted color store in place');
+    },
+    bufferSubData(target, offset, data, srcOffset, length) {
       assert.equal(target, this.ARRAY_BUFFER);
-      assert.equal(usage, this.DYNAMIC_DRAW);
-      if (boundBuffer === rejectedBuffer) {
-        webglError = this.INVALID_OPERATION;
-        return;
+      assert.equal(offset, 0);
+      assert.ok(data instanceof Uint32Array, 'gathered one RGBA8 word a point (the GPU pass, stood in for)');
+      if (rejectUpload) {
+        // A write into accepted storage fails synchronously or not at all.
+        throw new TypeError('WebGL rejected the colour upload.');
       }
-      const bytes = data instanceof ArrayBuffer
-        ? new Uint8Array(data)
-        : new Uint8Array(
-          data.buffer,
-          data.byteOffset,
-          data.byteLength,
-        );
-      const floats = new Float32Array(
-        bytes.buffer,
-        bytes.byteOffset,
-        bytes.byteLength / Float32Array.BYTES_PER_ELEMENT,
-      );
-      const positions = [];
+      const bytes = new Uint8Array(data.buffer, data.byteOffset + srcOffset * 4, length * 4);
       const rgba = [];
-      for (let index = 0; index < bytes.length / 16; index++) {
-        positions.push(Array.from(floats.subarray(index * 4, index * 4 + 3)));
-        const byteOffset = index * 16 + 12;
-        rgba.push(Array.from(bytes.subarray(byteOffset, byteOffset + 4)));
+      for (let index = 0; index < length; index++) {
+        rgba.push(Array.from(bytes.subarray(index * 4, index * 4 + 4)));
       }
-      uploads.push({ buffer: boundBuffer, positions, rgba });
+      uploads.push({ buffer: boundBuffer, rgba });
     },
     getError() {
-      const error = webglError;
-      webglError = this.NO_ERROR;
-      return error;
+      getErrorCalls += 1;
+      return this.NO_ERROR;
     },
+    isContextLost: () => false,
   };
   const colors = Uint8Array.from([
     10, 11, 12, 13,
     20, 21, 22, 23,
     30, 31, 32, 33,
   ]);
-  const makeLevel = indices => ({
-    indices: Uint32Array.from(indices),
-    isFullDetail: false,
-    pointCount: indices.length,
-  });
-  const positions = Float32Array.from([
-    2, 0, 0,
-    0, 0, 1,
-    -2, 0, 0,
-  ]);
-  const makeSpatialIndex = (dimensionLevel, indices) => {
-    const reduced = makeLevel(indices);
-    return {
-      dimensionLevel,
-      pointCount: 3,
-      positions,
-      lodLevels: [
-        reduced,
-        {
-          isFullDetail: true,
-          pointCount: 3,
-          positions,
-        },
-      ],
-    };
-  };
-  const buffer2d = { id: 'lod-2d' };
-  const buffer3d = { id: 'lod-3d' };
-  const vao2d = { id: 'vao-2d' };
-  const vao3d = { id: 'vao-3d' };
-  const ebo2d = { id: 'ebo-2d' };
-  const ebo3d = { id: 'ebo-3d' };
-  const spatial2d = makeSpatialIndex(2, [2, 0]);
-  const spatial3d = makeSpatialIndex(3, [1]);
-  const token2d = Object.freeze({});
-  const token3d = Object.freeze({});
-  const makeMetadata = (
-    spatialIndex,
-    buffer,
-    vao,
-    ebo,
-    generationToken,
-  ) => [
-    {
-      buffer,
-      generationToken,
-      isFullDetail: false,
-      originalIndexBuffer: ebo,
-      originalIndexCount:
-        spatialIndex.lodLevels[0].pointCount,
-      pointCount: spatialIndex.lodLevels[0].pointCount,
-      vao,
-    },
-    {
-      isFullDetail: true,
-      originalIndexBuffer: null,
-      originalIndexCount: 0,
-      pointCount: 3,
-    },
-  ];
-  const makeOwner = (
-    spatialIndex,
-    buffer,
-    vao,
-    ebo,
-    generationToken,
-  ) => ({
-    compactBuffer: buffer,
-    compactByteLength:
-      spatialIndex.lodLevels[0].pointCount * 16,
-    compactVao: vao,
-    generationToken,
-    gpuByteLength: 0,
-    liveGeometryGeneration: undefined,
-    maximumIndices: spatialIndex.lodLevels[0].indices,
-    pointCount: 3,
-    spatialIndex,
-    topologyOwner: {
-      originalIndexBuffer: ebo,
-    },
-  });
+  const drawOrder = Object.freeze({ indices: Uint32Array.from([2, 0, 1]), pointCount: 3 });
+  const colorBuffer = { id: 'live-colors' };
   const renderer = Object.assign(Object.create(HighPerfRenderer.prototype), {
     gl,
+    buffers: { colors: colorBuffer, positions: { id: 'live-positions' } },
     pointCount: 3,
     currentDimensionLevel: 3,
-    _positions: positions,
+    _colorGpuByteLength: colors.byteLength,
     _colors: new Uint8Array(colors.length),
-    _bufferDirty: false,
-    _dirtyLodDimensions: new Set(),
-    _lodArrayBuffers: null,
-    spatialIndices: new Map([
-      [2, spatial2d],
-      [3, spatial3d],
-    ]),
-    lodBuffersByDimension: new Map([
-      [2, makeMetadata(
-        spatial2d,
-        buffer2d,
-        vao2d,
-        ebo2d,
-        token2d,
-      )],
-      [3, makeMetadata(
-        spatial3d,
-        buffer3d,
-        vao3d,
-        ebo3d,
-        token3d,
-      )],
-    ]),
-    _lodResourceOwnersByDimension: new Map([
-      [2, makeOwner(
-        spatial2d,
-        buffer2d,
-        vao2d,
-        ebo2d,
-        token2d,
-      )],
-      [3, makeOwner(
-        spatial3d,
-        buffer3d,
-        vao3d,
-        ebo3d,
-        token3d,
-      )],
-    ]),
+    _colorsDirty: false,
+    _liveOrder: { drawOrder, texture: { id: 'live-order' }, width: 3, height: 1 },
+    _liveColorOrder: drawOrder,
+    spatialIndices: new Map(),
   });
+  renderer._permuter = createCpuPermuter(gl);
 
   renderer.updateColors(colors);
-  assert.deepEqual([...renderer._dirtyLodDimensions], [2, 3]);
-  assert.equal(renderer._bufferDirty, true);
-  // This contract isolates per-dimension LOD publication. The full-detail
-  // generation has an independent sticky-WebGL-error regression below.
-  renderer._bufferDirty = false;
-
-  rejectedBuffer = buffer2d;
-  assert.throws(
-    () => renderer.flushBufferUpdates(2),
-    /WebGL error 0x502/,
-  );
-  assert.equal(renderer._dirtyLodDimensions.has(2), true);
-  assert.equal(renderer._dirtyLodDimensions.has(3), true);
+  assert.equal(renderer._colorsDirty, true, 'the upload is deferred to the next render');
   assert.deepEqual(uploads, []);
 
-  rejectedBuffer = null;
+  // A dimension the live view does not show has nothing to flush.
   renderer.flushBufferUpdates(2);
+  assert.equal(renderer._colorsDirty, true);
 
-  assert.deepEqual(uploads, [
-    {
-      buffer: buffer2d,
-      positions: [
-        [-2, 0, 0],
-        [2, 0, 0],
-      ],
-      rgba: [
-        [30, 31, 32, 33],
-        [10, 11, 12, 13],
-      ],
-    },
-  ]);
-  assert.equal(renderer._dirtyLodDimensions.has(2), false);
-  assert.equal(renderer._dirtyLodDimensions.has(3), true);
+  rejectUpload = true;
+  assert.throws(() => renderer.flushBufferUpdates(3), /rejected the colour upload/);
+  assert.equal(renderer._colorsDirty, true, 'a rejected upload stays dirty');
+  assert.deepEqual(uploads, []);
 
+  rejectUpload = false;
   renderer.flushBufferUpdates(3);
+  assert.deepEqual(uploads, [{
+    buffer: colorBuffer,
+    rgba: [
+      [30, 31, 32, 33],
+      [10, 11, 12, 13],
+      [20, 21, 22, 23],
+    ],
+  }]);
+  assert.equal(renderer._colorsDirty, false);
+  assert.strictEqual(renderer._liveColorOrder, drawOrder);
 
-  assert.deepEqual(uploads, [
-    {
-      buffer: buffer2d,
-      positions: [
-        [-2, 0, 0],
-        [2, 0, 0],
-      ],
-      rgba: [
-        [30, 31, 32, 33],
-        [10, 11, 12, 13],
-      ],
-    },
-    {
-      buffer: buffer3d,
-      positions: [
-        [0, 0, 1],
-      ],
-      rgba: [
-        [20, 21, 22, 23],
-      ],
-    },
-  ]);
-  assert.equal(renderer._dirtyLodDimensions.size, 0);
+  // Already in order and clean: the next frame uploads nothing.
+  renderer._ensureLiveColorsInOrder();
+  assert.equal(uploads.length, 1);
+  // Rewriting an accepted store reads no WebGL error back.
+  assert.equal(getErrorCalls, 0);
 });
 
-test('full-detail recolor rejects sticky WebGL errors before O(N) packing', () => {
-  let bufferDataCalls = 0;
+test('full-detail recolor reads no error back, and a lost context refuses it before any upload', () => {
+  let uploads = 0;
+  let getErrorCalls = 0;
+  let lost = true;
   const gl = {
     ARRAY_BUFFER: 0x8892,
     DYNAMIC_DRAW: 0x88e8,
@@ -603,16 +521,26 @@ test('full-detail recolor rejects sticky WebGL errors before O(N) packing', () =
     NO_ERROR: 0,
     bindBuffer() {},
     bufferData() {
-      bufferDataCalls += 1;
+      uploads += 1;
+    },
+    bufferSubData() {
+      uploads += 1;
     },
     getError() {
-      return this.INVALID_OPERATION;
+      getErrorCalls += 1;
+      return this.NO_ERROR;
     },
+    isContextLost: () => lost,
   };
   const renderer = Object.assign(Object.create(HighPerfRenderer.prototype), {
     gl,
-    buffers: { interleaved: { id: 'full-detail' } },
+    buffers: {
+      colors: { id: 'full-detail-colors' },
+      positions: { id: 'full-detail-positions' },
+    },
     pointCount: 2,
+    _liveOrder: null,
+    _colorGpuByteLength: 8,
     _positions: Float32Array.from([
       -1, 0, 0,
       1, 0, 0,
@@ -621,31 +549,31 @@ test('full-detail recolor rejects sticky WebGL errors before O(N) packing', () =
       10, 11, 12, 13,
       20, 21, 22, 23,
     ]),
-    _interleavedArrayBuffer: null,
-    _interleavedPositionView: null,
-    _interleavedColorView: null,
   });
 
   assert.throws(
-    () => renderer._rebuildInterleavedBuffer(),
-    /WebGL error 0x502/,
+    () => renderer._publishLiveColors(),
+    error => error.name === 'WebGLContextLostError',
   );
-  assert.equal(renderer._interleavedArrayBuffer, null);
-  assert.equal(renderer._interleavedPositionView, null);
-  assert.equal(renderer._interleavedColorView, null);
-  assert.equal(bufferDataCalls, 0);
+  assert.equal(uploads, 0);
+  lost = false;
+  renderer._publishLiveColors();
+  assert.equal(uploads, 1);
+  assert.equal(getErrorCalls, 0);
 });
 
-test('lazily created LOD buffers sample the latest renderer color generation', () => {
+test('a draw order adopted after a recolor gathers the latest renderer color generation', () => {
+  // A GL double that keeps each buffer's bytes, so the test reads what the
+  // live stores hold once the adoption is published, however it is staged.
   let nextId = 1;
-  let boundArrayBuffer = null;
-  let boundTexture = null;
-  const reducedUploads = [];
+  const bound = new Map();
+  const stores = new Map();
   const gl = {
     ARRAY_BUFFER: 0x8892,
     CLAMP_TO_EDGE: 0x812f,
-    ELEMENT_ARRAY_BUFFER: 0x8893,
-    FLOAT: 0x1406,
+    COPY_READ_BUFFER: 0x8f36,
+    COPY_WRITE_BUFFER: 0x8f37,
+    DYNAMIC_DRAW: 0x88e8,
     MAX_TEXTURE_SIZE: 0x0d33,
     NEAREST: 0x2600,
     NO_ERROR: 0,
@@ -653,145 +581,112 @@ test('lazily created LOD buffers sample the latest renderer color generation', (
     RED_INTEGER: 0x8d94,
     STATIC_DRAW: 0x88e4,
     TEXTURE_2D: 0x0de1,
+    TEXTURE_2D_ARRAY: 0x8c1a,
     TEXTURE_MAG_FILTER: 0x2800,
     TEXTURE_MIN_FILTER: 0x2801,
     TEXTURE_WRAP_S: 0x2802,
     TEXTURE_WRAP_T: 0x2803,
-    UNSIGNED_BYTE: 0x1401,
     UNSIGNED_INT: 0x1405,
     bindBuffer(target, buffer) {
-      if (target === this.ARRAY_BUFFER) boundArrayBuffer = buffer;
+      bound.set(target, buffer);
     },
-    bindTexture(target, texture) {
-      assert.equal(target, this.TEXTURE_2D);
-      boundTexture = texture;
+    bindTexture() {},
+    bufferData(target, size) {
+      stores.set(bound.get(target), new Uint8Array(size));
     },
-    bindVertexArray() {},
-    bufferData(target, data) {
-      if (
-        target === this.ARRAY_BUFFER &&
-        (
-          data instanceof ArrayBuffer ||
-          ArrayBuffer.isView(data)
-        ) &&
-        boundArrayBuffer?.kind === 'reduced'
-      ) {
-        const sourceBuffer = data instanceof ArrayBuffer
-          ? data
-          : data.buffer;
-        const sourceOffset = data instanceof ArrayBuffer
-          ? 0
-          : data.byteOffset;
-        const sourceLength = data.byteLength;
-        const bytes = new Uint8Array(
-          sourceBuffer,
-          sourceOffset,
-          sourceLength,
-        );
-        const floats = new Float32Array(
-          sourceBuffer,
-          sourceOffset,
-          sourceLength / Float32Array.BYTES_PER_ELEMENT,
-        );
-        reducedUploads.push({
-          position: Array.from(floats.subarray(0, 3)),
-          rgba: Array.from(bytes.subarray(12, 16)),
-        });
-      }
+    bufferSubData(target, offset, data, srcOffset = 0, length) {
+      const count = length ?? data.length - srcOffset;
+      const bytes = new Uint8Array(
+        data.buffer,
+        data.byteOffset + srcOffset * data.BYTES_PER_ELEMENT,
+        count * data.BYTES_PER_ELEMENT,
+      );
+      stores.get(bound.get(target)).set(bytes, offset);
+    },
+    copyBufferSubData(readTarget, writeTarget, readOffset, writeOffset, size) {
+      const from = stores.get(bound.get(readTarget));
+      stores.get(bound.get(writeTarget)).set(from.subarray(readOffset, readOffset + size), writeOffset);
     },
     createBuffer() {
-      return { id: nextId++, kind: 'reduced' };
+      return { id: nextId++ };
     },
     createTexture() {
-      return { id: nextId++, kind: 'texture' };
-    },
-    createVertexArray() {
-      return { id: nextId++, kind: 'vao' };
+      return { id: 'draw-order' };
     },
     deleteBuffer() {},
     deleteTexture() {},
-    deleteVertexArray() {},
-    enableVertexAttribArray() {},
     getError() {
       return this.NO_ERROR;
     },
-    getParameter(parameter) {
-      assert.equal(parameter, this.MAX_TEXTURE_SIZE);
+    getParameter() {
       return 4096;
     },
-    texImage2D() {
-      assert.ok(boundTexture);
+    isBuffer() {
+      return false;
     },
-    texSubImage2D(
-      _target,
-      _level,
-      _x,
-      _y,
-      _width,
-      _height,
-      _format,
-      _type,
-      data,
-    ) {
-      assert.ok(boundTexture);
-      assert.ok(data instanceof Uint32Array);
+    isTexture() {
+      return false;
     },
+    texImage2D() {},
+    texStorage2D() {},
     texParameteri() {},
-    vertexAttribPointer() {},
+    texSubImage2D() {},
+    texStorage3D() {},
+    texSubImage3D() {},
   };
+  // A 2D embedding: two components per point.
   const positions = Float32Array.from([
-    -1, 0, 0,
-    7, 8, 9,
+    -1, 0,
+    7, 8,
   ]);
+  const positionBuffer = { id: 'main-positions' };
+  const colorBuffer = { id: 'main-colors' };
+  stores.set(positionBuffer, new Uint8Array(positions.byteLength));
+  stores.set(colorBuffer, new Uint8Array(8));
   const renderer = Object.assign(Object.create(HighPerfRenderer.prototype), {
     gl,
     pointCount: 2,
-    vao: { id: 'main-vao' },
-    buffers: {
-      interleaved: { id: 'main-buffer' },
-    },
+    currentDimensionLevel: 2,
+    buffers: { colors: colorBuffer, positions: positionBuffer },
+    _colorGpuByteLength: 8,
     _colors: Uint8Array.from([
       10, 11, 12, 13,
       20, 21, 22, 23,
     ]),
+    _colorsDirty: false,
+    _liveOrder: null,
+    _liveColorOrder: null,
     _positions: positions,
-    _dirtyLodDimensions: new Set(),
-    _lodArrayBuffers: null,
-    _lodIndexTexturesByDimension: new Map(),
     _pendingDataRetirements: new Set(),
     _pendingSnapshotRetirements: new Set(),
-    lodBuffersByDimension: new Map(),
+    _snapshotGeometryPools: new Map(),
+    snapshotBuffers: new Map(),
     spatialIndices: new Map(),
     stats: { gpuMemoryMB: 0 },
   });
-  const spatialIndex = {
-    dimensionLevel: 2,
-    pointCount: 2,
-    positions,
-    lodLevels: [
-      {
-        depth: 0,
-        indices: Uint32Array.from([1]),
-        isFullDetail: false,
-        pointCount: 1,
-        sizeMultiplier: 1,
-      },
-      {
-        depth: 1,
-        isFullDetail: true,
-        pointCount: 2,
-        positions,
-      },
-    ],
-  };
-  renderer.spatialIndices.set(2, spatialIndex);
+  renderer._permuter = createCpuPermuter(gl);
+  const drawOrder = Object.freeze({ indices: Uint32Array.from([1, 0]), pointCount: 2 });
+  const tree = { ensureDrawOrder: () => drawOrder };
 
-  renderer._createLODResourcesForDimension(2, spatialIndex);
+  renderer.updateColors(Uint8Array.from([
+    50, 51, 52, 53,
+    60, 61, 62, 63,
+  ]));
+  const record = renderer._ensureStoreDrawOrder({ kind: 'live' }, tree);
+  renderer._ensureLiveColorsInOrder();
 
-  assert.deepEqual(reducedUploads, [{
-    position: [7, 8, 9],
-    rgba: [20, 21, 22, 23],
-  }]);
+  assert.strictEqual(renderer._liveOrder, record);
+  assert.strictEqual(record.drawOrder, drawOrder);
+  assert.deepEqual(
+    Array.from(new Float32Array(stores.get(positionBuffer).buffer)),
+    [7, 8, -1, 0],
+  );
+  assert.deepEqual(
+    Array.from(stores.get(colorBuffer)),
+    [60, 61, 62, 63, 50, 51, 52, 53],
+  );
+  assert.strictEqual(renderer._liveColorOrder, drawOrder);
+  assert.equal(renderer._colorsDirty, false);
 });
 
 test('high-performance rendering has no legacy alpha or global-view path', async () => {
@@ -829,8 +724,9 @@ test('highlight rendering owns exact view inputs and one visibility API', async 
 });
 
 test('highlight LOD synchronization calls one exact per-view renderer contract', () => {
-  const positions = Float32Array.from([0, 0, 0]);
-  const transparency = Float32Array.from([1]);
+  // A 2D view: two position components per point.
+  const positions = Float32Array.from([0, 0]);
+  const transparency = Uint8Array.from([1]);
   const highlightData = Uint8Array.from([255]);
   const membership = Object.freeze({
     admissionLevels: Uint8Array.from([0]),
@@ -979,9 +875,6 @@ test('overlay contexts require exact per-view render state', () => {
     useAlphaTexture: false,
   };
   const hpRenderer = {
-    getAlphaTexture: () => null,
-    getAlphaTextureWidth: () => 0,
-    isAlphaTextureActive: () => false,
     getFogNear: () => 0,
     getFogFar: () => 10,
     getCurrentLODLevel: () => -1,
@@ -998,7 +891,7 @@ test('overlay contexts require exact per-view render state', () => {
       isSnapshot: false,
       hpRenderer,
       getViewPositions: () => new Float32Array(),
-      getViewTransparency: () => new Float32Array(),
+      getViewTransparency: () => new Uint8Array(),
     }),
     /dimensionLevel.*required/i
   );
@@ -1024,6 +917,7 @@ test('overlay retirement detaches before cleanup and remains retryable', () => {
     init() {},
     update() {},
     render() {},
+    needsContinuousFrames() { return false; },
     dispose() {
       disposeAttempts += 1;
       if (disposeAttempts === 1) {
@@ -1074,6 +968,7 @@ test('overlay manager disposal attempts every owner and retries only failures', 
       init() {},
       update() {},
       render() {},
+      needsContinuousFrames() { return false; },
       dispose() {
         const attempt = (attempts.get(id) ?? 0) + 1;
         attempts.set(id, attempt);
@@ -1145,6 +1040,7 @@ test('shader-accurate rasterization rejects incomplete export state', () => {
   assert.throws(
     () => rasterizePointsWebgl({
       positions: Float32Array.from([0, 0, 0]),
+      dimension: 3,
       colors: Uint8Array.from([255, 255, 255, 255]),
       renderState: null,
       outputWidthPx: 100,

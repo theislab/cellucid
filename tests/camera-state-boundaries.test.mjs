@@ -5,6 +5,7 @@ import test from 'node:test';
 const {
   assertCameraState,
   assertNavigationMode,
+  cameraStatesHaveSamePose,
   isExactCameraState
 } = await import('../assets/js/rendering/camera-state-contract.js');
 const {
@@ -52,7 +53,7 @@ function cameraState(navigationMode = 'orbit') {
   };
 }
 
-test('locked-camera session capture publishes one coherent current camera', t => {
+test('session capture publishes each view\'s camera as the viewer reports it', t => {
   const previousDocument = globalThis.document;
   globalThis.document = {
     getElementById() {
@@ -67,7 +68,10 @@ test('locked-camera session capture publishes one coherent current camera', t =>
   const currentCamera = cameraState();
   currentCamera.orbit.radius = 2.43;
   currentCamera.orbit.targetRadius = 2.43;
-  const staleLiveCamera = cameraState();
+  const liveEmbedding = Object.freeze({
+    key: 'X_pca',
+    columns: Object.freeze([0, 2, 1])
+  });
   const fields = [{
     key: 'cell_type',
     kind: 'category',
@@ -90,8 +94,14 @@ test('locked-camera session capture publishes one coherent current camera', t =>
     setActiveField() {
       return { field: fields[0], pointCount: 2, centroidInfo: '' };
     },
-    getViewDimensionLevel() {
-      return 3;
+    // The live view shows a 3D representation: columns 0, 2, 1 of an
+    // AnnData obsm array, named by provenance.
+    getViewEmbeddingRef(viewId) {
+      assert.equal(viewId, 'live');
+      return liveEmbedding;
+    },
+    getActiveViewId() {
+      return 'live';
     }
   };
   const [chunk] = captureCoreState({
@@ -113,9 +123,11 @@ test('locked-camera session capture publishes one coherent current camera', t =>
       getSnapshotViews() {
         return [];
       },
+      // The focused live view follows the current camera; the viewer, not
+      // the session, decides which views do.
       getViewCameraState(viewId) {
         assert.equal(viewId, 'live');
-        return staleLiveCamera;
+        return structuredClone(currentCamera);
       }
     },
     sidebar: {
@@ -127,6 +139,15 @@ test('locked-camera session capture publishes one coherent current camera', t =>
 
   assert.deepEqual(chunk.payload.camera, currentCamera);
   assert.deepEqual(chunk.payload.multiview.liveCameraState, currentCamera);
+  // The live view's geometry is one embedding reference, captured as a plain
+  // JSON copy; its dimension is the reference's and is not stored.
+  assert.equal(Object.hasOwn(chunk.payload, 'liveDimensionLevel'), false);
+  assert.deepEqual(chunk.payload.liveEmbedding, {
+    key: 'X_pca',
+    columns: [0, 2, 1]
+  });
+  assert.notStrictEqual(chunk.payload.liveEmbedding, liveEmbedding);
+  assert.equal(Object.isFrozen(chunk.payload.liveEmbedding.columns), false);
 });
 
 test('the current camera-state contract requires both synchronized representations', () => {
@@ -229,6 +250,7 @@ test('camera-path interpolation rejects incomplete state and unsupported setting
     id: 'first',
     label: 'First',
     ...cameraState('orbit'),
+    representation: null,
     transitionDuration: 1
   };
   const second = {
@@ -241,6 +263,7 @@ test('camera-path interpolation rejects incomplete state and unsupported setting
       targetRadius: 5,
       target: [2, 1, 0]
     },
+    representation: null,
     transitionDuration: 1
   };
   const options = {
@@ -319,6 +342,7 @@ test('camera-path interpolation rejects incomplete state and unsupported setting
       ...cameraState('orbit').freefly,
       position: [radius, 0, 0]
     },
+    representation: null,
     transitionDuration: 1
   }));
   const smoothZoom = interpolateCameraState(
@@ -350,6 +374,7 @@ test('camera-path interpolation rejects incomplete state and unsupported setting
       yaw: index === 0 ? Math.PI : 0,
       pitch: 0
     },
+    representation: null,
     transitionDuration: 1
   }));
   let previousPosition = null;
@@ -391,6 +416,7 @@ test('camera-path interpolation rejects incomplete state and unsupported setting
       ...cameraState('planar').freefly,
       position: [4, 2, 6]
     },
+    representation: null,
     transitionDuration: 1
   };
   const crossModePath = [first, planarEndpoint];
@@ -430,7 +456,7 @@ test('session, snapshot, and figure-export boundaries assert exact camera state'
   );
   assert.match(
     coreStateSource,
-    /state\.updateOutlierQuantiles\(\);\s*state\.computeGlobalVisibility\(\);/
+    /state\.computeGlobalVisibility\(\);\s*state\._pushColorsToViewer\(\);/
   );
   assert.match(
     byPath.get('../assets/js/app/state-serializer/multiview.js'),
@@ -443,5 +469,71 @@ test('session, snapshot, and figure-export boundaries assert exact camera state'
   assert.match(
     byPath.get('../assets/js/rendering/viewer.js'),
     /setViewCameraState\(viewId,\s*camState\)[\s\S]*?assertCameraState\(camState/
+  );
+});
+
+test('camera pose equality compares the half the navigation mode drives, exactly', () => {
+  const orbit = {
+    navigationMode: 'orbit',
+    orbit: {
+      radius: 2.353322246692734,
+      targetRadius: 2.353322246692734,
+      theta: 0.530398163397444,
+      phi: 1.4053981633974426,
+      target: [0, 0, 0]
+    },
+    freefly: {
+      position: [2.002285713714809, 0.38746291461474713, 1.1742444410048358],
+      yaw: -2.611194490192349,
+      // Derived by WebKit; Chromium and Firefox derive ...406.
+      pitch: -0.16539816339745403
+    }
+  };
+  const otherEngine = structuredClone(orbit);
+  otherEngine.freefly.pitch = -0.16539816339745406;
+  assert.equal(cameraStatesHaveSamePose(orbit, otherEngine), true);
+  assert.equal(
+    cameraStatesHaveSamePose(
+      { ...orbit, navigationMode: 'planar' },
+      { ...otherEngine, navigationMode: 'planar' }
+    ),
+    true
+  );
+
+  // One unit in the last place of each driven value is still a different pose.
+  const nextUp = value => value * (1 + Number.EPSILON);
+  for (const key of ['radius', 'targetRadius', 'theta', 'phi']) {
+    const moved = structuredClone(orbit);
+    moved.orbit[key] = nextUp(moved.orbit[key]);
+    assert.notEqual(moved.orbit[key], orbit.orbit[key], key);
+    assert.equal(cameraStatesHaveSamePose(orbit, moved), false, key);
+  }
+  const retargeted = structuredClone(orbit);
+  retargeted.orbit.target = [0, 0, Number.EPSILON];
+  assert.equal(cameraStatesHaveSamePose(orbit, retargeted), false);
+  assert.equal(
+    cameraStatesHaveSamePose(orbit, { ...orbit, navigationMode: 'free' }),
+    false
+  );
+
+  const free = { ...structuredClone(orbit), navigationMode: 'free' };
+  const freeOtherEngine = structuredClone(free);
+  for (const key of ['radius', 'targetRadius', 'theta', 'phi']) {
+    freeOtherEngine.orbit[key] = nextUp(freeOtherEngine.orbit[key]);
+  }
+  assert.equal(cameraStatesHaveSamePose(free, freeOtherEngine), true);
+  for (const mutate of [
+    camera => { camera.freefly.position[1] += 1e-12; },
+    camera => { camera.freefly.yaw += 1e-12; },
+    camera => { camera.freefly.pitch += 1e-12; },
+    camera => { camera.orbit.target = [1, 0, 0]; }
+  ]) {
+    const moved = structuredClone(free);
+    mutate(moved);
+    assert.equal(cameraStatesHaveSamePose(free, moved), false);
+  }
+  assert.throws(
+    () => cameraStatesHaveSamePose(orbit, { navigationMode: 'orbit' }),
+    TypeError
   );
 });

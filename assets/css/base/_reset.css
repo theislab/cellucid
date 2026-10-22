@@ -22,6 +22,17 @@ textarea {
   color: inherit;
 }
 
+/* A key cap is interface text: the browser's monospace default would be a
+   second face. Inline code (a shell command, a file name) is literally code
+   and keeps the system monospace face. */
+kbd {
+  font-family: inherit;
+}
+
+code {
+  font-family: var(--font-mono);
+}
+
 [hidden] {
   display: none !important;
 }

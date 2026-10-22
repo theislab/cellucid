@@ -3,7 +3,10 @@ import test from 'node:test';
 import * as codes from '../assets/js/app/session/contributors/user-defined-codes.js';
 import { UserDefinedFieldsRegistry } from '../assets/js/app/registries/user-defined-fields.js';
 
-const DIMS = { positionCache: new Map(), getAvailableDimensions: () => [2] };
+const DIMS = {
+  getResidentPositions: () => null,
+  getRegisteredLayouts: () => [{ layoutKey: '2d', dimension: 2 }],
+};
 
 test('restore refuses codes that name categories the field does not have', async () => {
   const registry = new UserDefinedFieldsRegistry();

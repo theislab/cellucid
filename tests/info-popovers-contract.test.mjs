@@ -34,14 +34,16 @@ const [
   datasetConnectionsSource,
   communityControlsSource,
   communityPanelSource,
-  uiCoordinatorSource
+  uiCoordinatorSource,
+  resetCss
 ] = await Promise.all([
   readFile(INDEX_URL, 'utf8'),
   readFile(BUTTONS_CSS_URL, 'utf8'),
   readFile(DATASET_CONNECTIONS_URL, 'utf8'),
   readFile(COMMUNITY_CONTROLS_URL, 'utf8'),
   readFile(COMMUNITY_PANEL_URL, 'utf8'),
-  readFile(UI_COORDINATOR_URL, 'utf8')
+  readFile(UI_COORDINATOR_URL, 'utf8'),
+  readFile(new URL('../assets/css/base/_reset.css', import.meta.url), 'utf8')
 ]);
 
 function attributeValue(attributes, name) {
@@ -128,11 +130,11 @@ test('static guidance is compact while live state remains directly visible', () 
   assert.doesNotMatch(indexHtml, /\buser-data-help\b/);
   assert.doesNotMatch(
     indexHtml,
-    /<div class="legend-help">\s*Save or load the application state/
+    /<div class="field-help">\s*Save or load the application state/
   );
   assert.doesNotMatch(
     indexHtml,
-    /<div class="legend-help">\s*Choose orbit for 3D exploration/
+    /<div class="field-help">\s*Choose orbit for 3D exploration/
   );
 
   for (const liveId of [
@@ -234,7 +236,10 @@ test('compact controls retain a small visual glyph with an expanded hit target',
     buttonsCss,
     /\.info-btn::before\s*\{[\s\S]*inset:\s*calc\(-1 \* var\(--space-1-5\)\)/
   );
-  assert.match(buttonsCss, /\.info-tooltip\[hidden\]\s*\{\s*display:\s*none/);
+  // A closed popover is hidden by the base reset's [hidden] rule, which no
+  // component display rule can override.
+  assert.match(resetCss, /\[hidden\]\s*\{\s*display:\s*none\s*!important/);
+  assert.doesNotMatch(buttonsCss, /\.info-tooltip\s*\{[^}]*display:/);
   assert.match(
     buttonsCss,
     /max-height:\s*calc\(100vh - var\(--space-4\)\)/

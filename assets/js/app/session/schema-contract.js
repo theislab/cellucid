@@ -97,6 +97,30 @@ export function describeCategory(value) {
   return typeof value === 'string' ? `"${value}"` : String(value);
 }
 
+/** Position recorded for a category name that a field lists more than once. */
+export const DUPLICATE_CATEGORY_POSITION = -2;
+
+/**
+ * Index one category inventory by name in a single pass, so resolving every
+ * saved category of a field costs one lookup each instead of a scan.
+ * A name listed more than once maps to {@link DUPLICATE_CATEGORY_POSITION};
+ * a name not listed is absent.
+ *
+ * @param {readonly (string|number|boolean)[]} categories
+ * @returns {Map<string|number|boolean, number>}
+ */
+export function indexCategoryPositions(categories) {
+  const positions = new Map();
+  for (let index = 0; index < categories.length; index++) {
+    const name = categories[index];
+    positions.set(
+      name,
+      positions.has(name) ? DUPLICATE_CATEGORY_POSITION : index
+    );
+  }
+  return positions;
+}
+
 export function assertFiniteNumber(value, context) {
   if (typeof value !== 'number' || !Number.isFinite(value)) {
     throw new TypeError(`${context} must be a finite number.`);

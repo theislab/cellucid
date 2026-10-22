@@ -162,11 +162,22 @@ function validateDemoManifestContract(manifest, source) {
     }
     const hasStateManifest = Object.hasOwn(entry, 'state_manifest');
     const hasStateSha256 = Object.hasOwn(entry, 'state_sha256');
-    if (hasStateManifest !== hasStateSha256) {
+    const hasStateBytes = Object.hasOwn(entry, 'state_bytes');
+    if (hasStateManifest !== hasStateSha256 || hasStateManifest !== hasStateBytes) {
       throw invalidDemoManifest(
-        `dataset '${entry.id}' state_manifest and state_sha256 must be declared together`,
+        `dataset '${entry.id}' state_manifest, state_sha256 and state_bytes must be declared together`,
         source,
         { id: entry.id }
+      );
+    }
+    if (
+      hasStateBytes
+      && (!Number.isSafeInteger(entry.state_bytes) || entry.state_bytes < 1)
+    ) {
+      throw invalidDemoManifest(
+        `dataset '${entry.id}' state_bytes must be the default state's exact positive byte length`,
+        source,
+        { id: entry.id, stateBytes: entry.state_bytes }
       );
     }
     if (
@@ -602,6 +613,7 @@ export class LocalDemoDataSource {
     if (!Object.hasOwn(entry, 'state_manifest')) return null;
     return {
       manifestUrl: resolveUrl(baseUrl, entry.state_manifest),
+      stateBytes: entry.state_bytes,
       stateSha256: entry.state_sha256,
     };
   }

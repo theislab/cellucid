@@ -6,8 +6,12 @@
   --border-width-1: 1px;
   --border-width-2: 2px;
 
-  /* Composite border tokens (depend on theme semantic colors). */
+  /* Composite border tokens (depend on theme semantic colors). `strong` is
+     ink, for a selected or emphasised edge; `control` outlines a field, a
+     button or a switch; `default` draws the edge of a surface (a panel, a
+     dialog, a menu, a card); `light` divides inside one. */
   --border-strong: var(--border-width-1) solid var(--color-border-strong);
+  --border-control: var(--border-width-1) solid var(--color-border-control);
   --border-default: var(--border-width-1) solid var(--color-border-default);
   --border-light: var(--border-width-1) solid var(--color-border-light);
 
